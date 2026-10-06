@@ -155,6 +155,46 @@ int hexkl_mm_u8i4_moe_layer_run(
   return AEE_SUCCESS;
 }
 
+/* [#225] hexkl_mm_u8i4_fc_m1_run's stand-in, the MoE one's way: records
+   its arguments and mixes every part's handle and the input into its
+   output, the parts side by side (the kernel itself is moe_layer_host_
+   check's FC WH cells). */
+typedef struct {
+  const void *tbl, *vtcm, *pool, *scratch;
+  uint32_t vtcm_size, config_off, K, n_parts, flags, n_calls;
+  uint32_t h[HTP_GRAPH_MAX_PARTS];
+} fc_args;
+static fc_args g_fc_last;
+
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  uint32_t p, c, o = 0;
+  fc_args *a = &g_fc_last;
+  a->tbl = tbl;
+  a->vtcm = vtcm_base;
+  a->pool = pool;
+  a->scratch = scratch;
+  a->vtcm_size = vtcm_size;
+  a->config_off = config_off;
+  a->K = K;
+  a->n_parts = n_parts;
+  a->flags = flags;
+  ++a->n_calls;
+  for (p = 0; p < n_parts; ++p) {
+    const uint32_t N = tbl->slots[h[p]].N;
+    a->h[p] = h[p];
+    for (c = 0; c < N; ++c)
+      out_f32[o + c] =
+        act_f32[(c * 7u + p) % K] * (float)(h[p] + 1u) + (float)c;
+    o += N;
+  }
+  return AEE_SUCCESS;
+}
+
 /* ---- shapes ------------------------------------------------------------ */
 static const char *const kLfm25Layers = "CCACCCACCCACCCACCCACCACC";
 static const htp_graph_lfm2_shape kLfm25 = {24, 2, 2048, 7168,   1792, 32,   4,
@@ -1672,9 +1712,9 @@ static void check_q4m1(void) {
     rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
     CHECK(rc == 0u, "native feed bit refused: %s", htp_graph_err_name(rc));
     err |= rc != 0u;
-    htp_graph_op_at(w, ffn)->feed = keep | (1u << 17);
+    htp_graph_op_at(w, ffn)->feed = keep | (1u << 18);
     rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
-    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "feed bit 17 taken: %s",
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "feed bit 18 taken: %s",
           htp_graph_err_name(rc));
     err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
     htp_graph_op_at(w, ffn)->feed = keep;
@@ -1714,7 +1754,7 @@ static void check_q4m1(void) {
     if (nerr == 0)
       printf("GRAPH Q4M1 NATIVE BIT-IDENTICAL: FC q|k|v DENSE_FFN "
              "RMSNORM+LM_HEAD with HTP_GRAPH_FEED_NATIVE vs "
-             "q4_gemv_native_det (bit 17 refused)\n");
+             "q4_gemv_native_det (bit 18 refused)\n");
   }
   g_native = 0;
   hexkl_graph_free(g);
@@ -1724,6 +1764,182 @@ static void check_q4m1(void) {
            "argmax first of a tie, LM_BAN skips its ids) vs q4_gemv_cpu_det / "
            "m1_swiglu_cpu_det / "
            "m1_argmax_first (hd64 shape, the real HVX kernel on hvx_emu)\n");
+}
+
+/* ---- [#225] FC and DENSE_FFN on WH handles (HTP_GRAPH_FEED_WH) -------- */
+/* The hd64 list with every kind resident, its FC and DENSE_FFN ops bound to
+   u8i4 handles of the session's table (the FC WH sidecar's on the device)
+   and the LM_HEAD left on Q4M1: the validator's bit rules, init's handle
+   checks, uses_handle / uses_q4m1, and that forward hands each kernel
+   exactly what the prefill path hands it -- an FC its parts in order on
+   one call, a DENSE_FFN its chunks as experts of weight 1 at M = 1 (the
+   kernels themselves are moe_layer_host_check's). */
+static void check_wh(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  htp_graph_lfm2_shape shape = kHd64;
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  static float x[HID], out[3u * HID], ref[3u * HID];
+  uint32_t n, n_v, rc, resume, i, fc_qkv, ffn, lm, h = 2u, seed = 0x225u;
+  htp_graph_op *op;
+  int err = 0;
+
+  shape.vocab = 64u;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  env.fc = host_fc;
+  env.moe_flags = 0x703e1u; /* the session default the E2E log prints */
+  n = build(w, cap, &shape, "CAC", HTP_GRAPH_KINDS_ALL);
+  bind_hd64(w);
+  fc_qkv = nth_op(w, HTP_OP_FC, 2);
+  ffn = nth_op(w, HTP_OP_DENSE_FFN, 0);
+  lm = nth_op(w, HTP_OP_LM_HEAD, 0);
+  /* WH handles 2..9 (the FC parts) sit in the Q4M1 slots' number range,
+     so uses_q4m1 below must skip WH ops, not just miss their numbers */
+  for (i = 0; i < w[3]; ++i) {
+    op = htp_graph_op_at(w, i);
+    if (op->kind != HTP_OP_FC)
+      continue;
+    op->feed = HTP_GRAPH_FEED_WH;
+    if (i == fc_qkv) {
+      register_weight(h, HID, 128u);
+      register_weight(h + 1u, HID, 64u);
+      register_weight(h + 2u, HID, 64u);
+      op->h_gu[0] = h;
+      op->h_gu[1] = h + 1u;
+      op->h_gu[2] = h + 2u;
+      op->n_experts = 3u;
+      h += 3u;
+    } else {
+      register_weight(h, op->K, op->N);
+      op->h_gu[0] = h++;
+      op->n_experts = 1u;
+    }
+  }
+  op = htp_graph_op_at(w, ffn); /* inter 64 in 2 chunks of 32 */
+  op->feed = HTP_GRAPH_FEED_WH;
+  for (i = 0; i < 2u; ++i) {
+    register_weight(100u + i, HID, 64u);
+    register_weight(102u + i, 32u, HID);
+    op->h_gu[i] = 100u + i;
+    op->h_dn[i] = 102u + i;
+  }
+  op->n_experts = 2u;
+  op = htp_graph_op_at(w, lm); /* stays Q4M1: slots 0, 1 */
+  q_register(0u, HID, 32u, &seed);
+  q_register(1u, HID, 32u, &seed);
+  op->h_gu[0] = 0u;
+  op->h_gu[1] = 1u;
+  op->n_experts = 2u;
+  CHECK(h == 10u, "hd64 WH FC parts %u", h - 2u);
+
+  /* the validator: WH on FC / DENSE_FFN, never on LM_HEAD */
+  rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+  CHECK(rc == 0u, "WH list: %s", htp_graph_err_name(rc));
+  err |= rc != 0u;
+  op->feed = HTP_GRAPH_FEED_WH;
+  rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+  CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "WH LM_HEAD: %s",
+        htp_graph_err_name(rc));
+  err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
+  op->feed = 0u;
+  /* init: a part of another K, parts short of N, a down of another shape,
+     no chunk, a free part handle */
+  op = htp_graph_op_at(w, fc_qkv);
+  register_weight(op->h_gu[1], 64u, 64u);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  register_weight(op->h_gu[1], HID, 64u);
+  op->n_experts = 2u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->n_experts = 3u;
+  op = htp_graph_op_at(w, ffn);
+  op->h_dn[1] = op->h_gu[1];
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->h_dn[1] = 103u;
+  op->n_experts = 0u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->n_experts = 2u;
+  g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 0;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE || g != NULL;
+  CHECK(err == 0, "WH init refusals");
+  g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 1;
+  htp_graph_op_at(w, fc_qkv)->feed |= HTP_GRAPH_FEED_L2; /* arena read */
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "WH init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(hexkl_graph_uses_handle(g, 3u) && hexkl_graph_uses_handle(g, 103u) &&
+          !hexkl_graph_uses_handle(g, 104u) && !hexkl_graph_uses_q4m1(g, 2u) &&
+          hexkl_graph_uses_q4m1(g, 1u),
+        "uses_handle / uses_q4m1 with WH ops");
+  err |= !hexkl_graph_uses_handle(g, 3u) || hexkl_graph_uses_q4m1(g, 2u);
+
+  /* [FC q|k|v] one call, the parts in order, the L2 bit as feed off */
+  fill(x, HID, &seed);
+  memset(&g_fc_last, 0, sizeof(g_fc_last));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fc_qkv, 1u, 0u, NULL, x, HID, out,
+                                     256u, &resume);
+  {
+    const fc_args got = g_fc_last; /* before the reference call below */
+    const uint32_t f =
+      (0x703e1u | HEXKL_MOE_FLAG_GEMV_FEED_SET) & ~HEXKL_MOE_FLAG_GEMV_FEED;
+    op = &g->ops[fc_qkv];
+    (void)hexkl_mm_u8i4_fc_m1_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, HID, 3u,
+                                  op->h_gu, x, ref, env.pool, &g_scratch, f);
+    const int ok = rc == 0u && resume == fc_qkv + 1u && got.n_calls == 1u &&
+                   got.K == HID && got.n_parts == 3u && got.h[0] == 2u + 2u &&
+                   got.h[2] == 2u + 4u && got.flags == f && got.tbl == &g_tbl &&
+                   got.vtcm == g_vtcm && got.scratch == &g_scratch &&
+                   memcmp(out, ref, 256u * sizeof(float)) == 0;
+    CHECK(ok, "[FC q|k|v WH]: %s calls %u parts %u flags 0x%x",
+          htp_graph_err_name(rc), got.n_calls, got.n_parts, got.flags);
+    err |= !ok;
+  }
+  /* [DENSE_FFN] the chunks as experts of weight 1, M = 1 */
+  {
+    const uint32_t idx[2] = {0u, 0u}, cnt[2] = {1u, 1u};
+    const float wt[2] = {1.0f, 1.0f};
+    memset(&g_last, 0, sizeof(g_last));
+    rc = (uint32_t)hexkl_graph_forward(g, &env, ffn, 1u, 0u, NULL, x, HID, out,
+                                       HID, &resume);
+    const moe_args got = g_last;
+    op = &g->ops[ffn];
+    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
+                                32u, HID, 2u, op->h_gu, op->h_dn, idx, cnt, wt,
+                                x, ref, env.pool, &g_scratch, 0x703e1u);
+    const int ok = rc == 0u && resume == ffn + 1u && got.M == 1u &&
+                   got.K == HID && got.inter == 32u && got.N_out == HID &&
+                   got.n_experts == 2u && got.h_gu[1] == 101u &&
+                   got.h_dn[1] == 103u && got.row_count[0] == 1u &&
+                   got.row_count[1] == 1u && got.flags == 0x703e1u &&
+                   memcmp(out, ref, HID * sizeof(float)) == 0;
+    CHECK(ok, "[DENSE_FFN WH]: %s M %u inter %u experts %u",
+          htp_graph_err_name(rc), got.M, got.inter, got.n_experts);
+    err |= !ok;
+  }
+  hexkl_graph_free(g);
+  for (i = 2u; i < 10u; ++i)
+    g_tbl.slots[i].in_use = 0;
+  for (i = 100u; i < 104u; ++i)
+    g_tbl.slots[i].in_use = 0;
+  if (err == 0)
+    printf("GRAPH FC WH OK: FC q|k|v (3 WH parts, one call, L2 bit = arena "
+           "read) and DENSE_FFN (2 chunks as experts of weight 1, M = 1) hand "
+           "the kernels the prefill's handles; WH LM_HEAD refused; init "
+           "refuses another K / short parts / a bad down / no chunk / a free "
+           "handle; uses_handle sees WH ops, uses_q4m1 skips them\n");
 }
 
 /* ---- [plan 201 S4] Gemma 4's attention shapes -------------------------- */
@@ -2455,6 +2671,7 @@ int main(void) {
   check_gemma_rope();
   check_gemma_attn();
   check_q4m1();
+  check_wh();
   check_gemma();
   check_gemma26_list();
   if (g_fail) {

@@ -440,8 +440,34 @@ static int graph_q4m1_parts(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
+/* [#225] A WH op's kernel flags: the session's MoE flags, with the VTCM
+   feed off under the op's L2 bit (the weights then stay in the arena). */
+_Static_assert(HEXKL_FC_M1_MAX_PARTS >= HTP_GRAPH_MAX_PARTS &&
+                 HTP_GRAPH_WH_DENSE_MAX_CHUNKS <= HEXKL_GRAPH_MISS_MAX,
+               "the WH ops' part and chunk limits drifted from the kernels'");
+static uint32_t graph_wh_flags(const htp_graph_op *op, uint32_t flags) {
+  if ((op->feed & HTP_GRAPH_FEED_L2) != 0u) {
+    flags = (flags | HEXKL_MOE_FLAG_GEMV_FEED_SET) & ~HEXKL_MOE_FLAG_GEMV_FEED;
+  }
+  return flags;
+}
+
+/* [#225] HTP_GRAPH_FEED_WH: the parts are the session's u8i4 handles (the
+   FC WH sidecar's), one u8 row quantization and the WH GEMV over them. */
+static int graph_op_fc_wh(const htp_graph_op *op, const graph_call *call,
+                          const float *in, float *out) {
+  const hexkl_graph_env *env = call->env;
+  return hexkl_mm_u8i4_fc_m1_run(env->tbl, env->vtcm_base, env->vtcm_size,
+                                 env->config_off, op->K, op->n_experts,
+                                 op->h_gu, in, out, env->pool, env->scratch,
+                                 graph_wh_flags(op, env->moe_flags));
+}
+
 static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
                        const float *in, float *out) {
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    return graph_op_fc_wh(op, call, in, out);
+  }
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
@@ -461,6 +487,26 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
                               graph_call *call, const float *in, float *out) {
   float *up = g->ffn, *gate = g->ffn + op->N, *act = g->ffn + 2u * op->N;
   int rc;
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    /* [#225] the n_experts chunks as experts of weight 1, the token's one
+       row each: the MoE kernel's M = 1 pair path, its VTCM feed, its
+       SwiGLU (GeGLU under the session's flag), the chunks' downs added in
+       chunk order */
+    const hexkl_graph_env *env = call->env;
+    uint32_t idx[HTP_GRAPH_MAX_PARTS], cnt[HTP_GRAPH_MAX_PARTS];
+    float w[HTP_GRAPH_MAX_PARTS];
+    uint32_t c;
+    for (c = 0; c < op->n_experts; ++c) {
+      idx[c] = 0u;
+      cnt[c] = 1u;
+      w[c] = 1.0f;
+    }
+    return hexkl_mm_u8i4_moe_layer_run(
+      env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K,
+      op->N / op->n_experts, op->N_out, op->n_experts, op->h_gu, op->h_dn, idx,
+      cnt, w, in, out, env->pool, env->scratch,
+      graph_wh_flags(op, env->moe_flags));
+  }
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
@@ -579,6 +625,41 @@ static int graph_check_q4m1(const htp_graph_op *op,
   return sum == op->N ? AEE_SUCCESS : AEE_EINVHANDLE;
 }
 
+/* [#225] A resident op's WH handles (HTP_GRAPH_FEED_WH) against the
+   session's table: an FC's parts K x N_p, N_p % 32, summing to N; a
+   DENSE_FFN's n_experts chunks (<= HTP_GRAPH_WH_DENSE_MAX_CHUNKS) gate |
+   up K x 2w and down w x N_out, w = N / n_experts. */
+static int graph_check_wh(const htp_graph_op *op,
+                          const hexkl_weight_u8i4_table *tbl) {
+  uint32_t p, sum = 0;
+  if (op->kind == HTP_OP_DENSE_FFN) {
+    const uint32_t n = op->n_experts, w = n != 0u ? op->N / n : 0u;
+    if (n == 0u || n > HTP_GRAPH_WH_DENSE_MAX_CHUNKS || w * n != op->N ||
+        w % 32u != 0u) {
+      return AEE_EINVHANDLE;
+    }
+    for (p = 0; p < n; ++p) {
+      if (graph_check_handle(tbl, op->h_gu[p], op->K, 2u * w) != AEE_SUCCESS ||
+          graph_check_handle(tbl, op->h_dn[p], w, op->N_out) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    }
+    return AEE_SUCCESS;
+  }
+  if (op->kind != HTP_OP_FC || op->n_experts == 0u) {
+    return AEE_EINVHANDLE;
+  }
+  for (p = 0; p < op->n_experts; ++p) {
+    const uint32_t h = op->h_gu[p];
+    if (h >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h].in_use ||
+        tbl->slots[h].K != op->K || tbl->slots[h].N % 32u != 0u) {
+      return AEE_EINVHANDLE;
+    }
+    sum += tbl->slots[h].N;
+  }
+  return sum == op->N ? AEE_SUCCESS : AEE_EINVHANDLE;
+}
+
 int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_weight_u8i4_table *tbl,
                      const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
@@ -600,7 +681,11 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     if (!op->resident) {
       continue;
     }
-    if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u) {
+    if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+      if (graph_check_wh(op, tbl) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    } else if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u) {
       if (q4m1 == NULL || graph_check_q4m1(op, q4m1, n_q4m1) != AEE_SUCCESS) {
         return AEE_EINVHANDLE;
       }
@@ -951,6 +1036,16 @@ int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
     return 0;
   }
   for (i = 0; i < g->n_ops; ++i) {
+    const htp_graph_op *op = &g->ops[i];
+    if (op->resident && (op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+      /* [#225] an FC's parts, a DENSE_FFN's chunk pairs */
+      for (e = 0; e < op->n_experts; ++e) {
+        if (op->h_gu[e] == handle ||
+            (op->kind == HTP_OP_DENSE_FFN && op->h_dn[e] == handle)) {
+          return 1;
+        }
+      }
+    }
     if (g->experts[i] == NULL) {
       continue;
     }
@@ -971,7 +1066,8 @@ int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle) {
   for (i = 0; i < g->n_ops; ++i) {
     const htp_graph_op *op = &g->ops[i];
     if (!op->resident ||
-        (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u) {
+        (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u ||
+        (op->feed & HTP_GRAPH_FEED_WH) != 0u) {
       continue;
     }
     if (op->kind == HTP_OP_DENSE_FFN) { /* up, gate, down */

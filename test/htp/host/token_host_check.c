@@ -80,6 +80,20 @@ static uint64_t fnv(const void *p, size_t n) {
   return h;
 }
 
+/* [#225] hexkl_graph.c's FC on WH handles: no op of this check's list
+   carries the WH bit (graph_host_check holds that path). */
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  (void)tbl, (void)vtcm_base, (void)vtcm_size, (void)config_off, (void)K;
+  (void)n_parts, (void)h, (void)act_f32, (void)out_f32, (void)pool;
+  (void)scratch, (void)flags;
+  return AEE_EUNSUPPORTED;
+}
+
 int hexkl_mm_u8i4_moe_layer_run(
   hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,

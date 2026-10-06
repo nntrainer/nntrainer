@@ -291,6 +291,18 @@ typedef struct {
 /** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
 #define HTP_GRAPH_FEED_L2 1u
 #define HTP_GRAPH_FEED_NATIVE (1u << 16)
+/** @brief [#225] FC and DENSE_FFN only (the validator refuses it on an
+ *  LM_HEAD, INVALIDFORMAT): h_gu / h_dn are u8i4 handles of the session's
+ *  weight table -- the prefill's, from the FC WH sidecar -- instead of Q4M1
+ *  slots. An FC's n_experts parts are K x N_p WH weights side by side
+ *  (hexkl_mm_u8i4_fc_m1_run); a DENSE_FFN's n_experts chunks are the MoE
+ *  kernel's expert pairs, h_gu[c] gate | up [K x 2 N / n_experts] and
+ *  h_dn[c] down [N / n_experts x N_out], run at M = 1 as experts of weight
+ *  1 (the prefill's invokeMoeLayer(kind 1)). */
+#define HTP_GRAPH_FEED_WH (1u << 17)
+/** @brief [#225] A WH DENSE_FFN's chunk limit: the M = 1 MoE path's expert
+ *  bound (MOE_M1_MAX_EXPERTS), checked by the ARM's bind and graph_init. */
+#define HTP_GRAPH_WH_DENSE_MAX_CHUNKS 16u
 #define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
 #define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
 /** @brief An RMSNORM's feed word: N1 (hvx_rmsnorm_n1_f32, plan 201 S4).
@@ -549,8 +561,9 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     }
     if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(k)) != 0u) {
       if (op->n_experts > HTP_GRAPH_MAX_PARTS ||
-          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u | HTP_GRAPH_FEED_NATIVE)) !=
-            0u ||
+          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u | HTP_GRAPH_FEED_NATIVE |
+                        HTP_GRAPH_FEED_WH)) != 0u ||
+          (k == HTP_OP_LM_HEAD && (op->feed & HTP_GRAPH_FEED_WH) != 0u) ||
           HTP_GRAPH_FEED_LANES_SMALL(op->feed) > 8u ||
           HTP_GRAPH_FEED_LANES_LARGE(op->feed) > 8u)
         return HTP_GRAPH_E_INVALIDFORMAT;

@@ -45,6 +45,13 @@
  * handles of the session's table bound in the op record before
  * graph_init (htp_graph_desc.h), checked there against the shapes the
  * caller passes.
+ *
+ * [#225] An FC or DENSE_FFN with HTP_GRAPH_FEED_WH reads WH handles of the
+ * session's u8i4 table instead (the prefill's, from the FC WH sidecar):
+ * the FC through hexkl_mm_u8i4_fc_m1_run, the DENSE_FFN through
+ * hexkl_mm_u8i4_moe_layer_run as its chunks at weight 1 -- the kernels
+ * the MOE op calls, so no fc runner is involved and the LM_HEAD alone
+ * stays Q4M1.
  */
 
 #ifndef __NNTRAINER_HEXKL_GRAPH_H__
@@ -255,7 +262,8 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
 int hexkl_graph_pool_set(hexkl_graph *g, uint32_t op, uint32_t e, uint32_t h_gu,
                          uint32_t h_dn);
 
-/** @brief Whether any MoE op's EXPERTS table names @a handle:
+/** @brief Whether any MoE op's EXPERTS table, or [#225] a WH op, names
+ *  @a handle:
  *  weight_release refuses such a handle with AEE_EBADSTATE while the graph
  *  lives. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);

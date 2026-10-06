@@ -316,6 +316,21 @@ for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
   fi
   echo "GRAPH GEMMA MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
+# [#225] The WH FC / DENSE_FFN ops, each mutant must fail GRAPH FC WH OK:
+# the dense chunks handed as one expert of the whole width, the op's L2 bit
+# not reaching the FC kernel as feed off.
+for mut in 's/      op->N \/ op->n_experts, op->N_out, op->n_experts,/      op->N, op->N_out, op->n_experts,/' \
+  's/  if ((op->feed \& HTP_GRAPH_FEED_L2) != 0u) {/  if (0) {/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
+  if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
+    echo "GRAPH FC WH MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$OUT/hexkl_graph_mutant.c" "$OUT/graph_mutant"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH FC WH MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
 
 # [#132 Part B E2, #211] The one-PD token driver (hmx/hexkl_token.c): one
 # session over the hd64 list with every kind resident, bit-identical to the
