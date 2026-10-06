@@ -191,15 +191,24 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // row stays on the CPU below for the reason every FC gate has
   // (accelerates_q4_0_at_m1): one row cannot amortize the call.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
+  const auto qs4cx = ml::train::TensorDim::DataType::QS4CX;
+  const auto wtype = up_w.getDataType();
   auto *ops = in_step.getOps();
-  if (rows > 1 && ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&
-      up_w.getDataType() == q4 && gate_w.getDataType() == q4 &&
-      down_w.getDataType() == q4) {
+  // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
+  // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
+  if (ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&
+      (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
+      (wtype == q4 || wtype == qs4cx) && gate_w.getDataType() == wtype &&
+      down_w.getDataType() == wtype) {
     // ... with the input and output norms folded into the same call.
+    const bool scaled = wtype == qs4cx;
     ops->gemm_q4_0_dense_ffn_fp32(
       up_w.getData<char>(), gate_w.getData<char>(), down_w.getData<char>(),
       in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N,
-      gelu, in_gamma, out_gamma, epsilon);
+      gelu, in_gamma, out_gamma, epsilon,
+      scaled ? up_w.getScale<float>() : nullptr,
+      scaled ? gate_w.getScale<float>() : nullptr,
+      scaled ? down_w.getScale<float>() : nullptr);
     return;
   }
 
