@@ -34,7 +34,7 @@ jobs:
       run: |
         echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
-    - name: restore gbs cache from main branch
+    - name: restore gbs RPM cache from main branch
       uses: actions/cache/restore@v4
       with:
         path: ~/GBS-ROOT/local/cache
@@ -46,7 +46,14 @@ jobs:
       run: |
         gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
 
-    - name: save gbs cache
+    - name: prune gbs RPM cache
+      # RPM cache includes packages which are necessary for gbs build.
+      # When these packages are newly updated, actions/cache/save saves both old and new packages which causes
+      # RPM cache size explosion.
+      # By running pruning script, let's save newest packages only.
+      run: bash .github/workflows/gbs-cache-prune.sh
+
+    - name: save gbs RPM cache
       uses: actions/cache/save@v4
       with:
         path: ~/GBS-ROOT/local/cache
