@@ -4,7 +4,7 @@
  *
  * @file   dense_ffn_layer.cpp
  * @date   21 September 2026
- * @brief  The dense SwiGLU FFN (up, gate, SwiGLU, down) as one layer
+ * @brief  The dense gated FFN (up, gate, SwiGLU or GeGLU, down) as one layer
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */
@@ -27,7 +27,9 @@ enum DenseFfnParams { UP, GATE, DOWN };
 enum DenseFfnTensors { UP_OUT, GATE_OUT, ACT };
 
 DenseFfnLayer::DenseFfnLayer() :
-  LayerImpl(), dense_props(nntrainer::props::Unit()) {
+  LayerImpl(),
+  dense_props(nntrainer::props::Unit(), props::GluActivation(),
+              props::GateFirst()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -48,6 +50,14 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
   const unsigned int inter =
     std::get<nntrainer::props::Unit>(dense_props).get();
+  const auto &act_prop = std::get<props::GluActivation>(dense_props);
+  gelu = !act_prop.empty() &&
+         act_prop.get() == nntrainer::ActivationType::ACT_TANH_GELU;
+  NNTR_THROW_IF(!act_prop.empty() && !gelu &&
+                  act_prop.get() != nntrainer::ActivationType::ACT_SWISH,
+                std::invalid_argument)
+    << "dense_ffn: glu_activation must be swish or tanh_gelu";
+  const bool gate_first = std::get<props::GateFirst>(dense_props).get();
 
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
@@ -61,18 +71,25 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   out_dim.setTensorType(act_type);
   context.setOutputDimensions({out_dim});
 
-  // The file's order: up, gate, down. Shapes as the three fully_connected
-  // layers request them ([in, unit]), so the same bytes load either way.
+  // The file's order: up, gate, down -- or gate, up, down under gate_first.
+  // Shapes as the three fully_connected layers request them ([in, unit]),
+  // so the same bytes load either way.
   nntrainer::TensorDim w_up(1, 1, hidden, inter,
                             nntrainer::TensorDim::TensorType(
                               context.getFormat(), context.getWeightDataType()),
                             0b0011);
-  weight_idx[UP] = context.requestWeight(
-    w_up, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "up", true);
-  weight_idx[GATE] = context.requestWeight(
-    w_up, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "gate", true);
+  auto request_proj = [&](const char *name) {
+    return context.requestWeight(w_up, weight_initializer, weight_regularizer,
+                                 weight_regularizer_constant, weight_decay,
+                                 name, true);
+  };
+  if (gate_first) {
+    weight_idx[GATE] = request_proj("gate");
+    weight_idx[UP] = request_proj("up");
+  } else {
+    weight_idx[UP] = request_proj("up");
+    weight_idx[GATE] = request_proj("gate");
+  }
   nntrainer::TensorDim w_down(
     1, 1, inter, hidden,
     nntrainer::TensorDim::TensorType(context.getFormat(),
@@ -147,13 +164,15 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       down_w.getDataType() == q4) {
     ops->gemm_q4_0_dense_ffn_fp32(
       up_w.getData<char>(), gate_w.getData<char>(), down_w.getData<char>(),
-      in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N);
+      in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N,
+      gelu);
     return;
   }
 
   // What Transformer::createMlp's three layers computed: up and gate dots,
   // silu(gate) * up (swiglu_det: the bit-identical NEON/scalar form the
-  // MoE layer's CPU path uses), then down.
+  // MoE layer's CPU path uses) -- or gelu_tanh(gate) * up through the same
+  // deterministic form the MoE layer's GeGLU experts use -- then down.
   nntrainer::TensorDim mid_step_dim =
     context.getTensor(tensor_idx[UP_OUT]).getDim();
   mid_step_dim.batch(1);
@@ -173,7 +192,12 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const float *up_p = up_out.getData<float>();
   auto one_row = [&](size_t r) {
     const size_t off = r * inter;
-    swiglu_det(inter, act_p + off, gate_p + off, up_p + off);
+    if (gelu) {
+      for (unsigned int j = 0; j < inter; ++j)
+        act_p[off + j] = geglu_det_one(gate_p[off + j], up_p[off + j]);
+    } else {
+      swiglu_det(inter, act_p + off, gate_p + off, up_p + off);
+    }
   };
   if (rows == 1) {
     one_row(0);

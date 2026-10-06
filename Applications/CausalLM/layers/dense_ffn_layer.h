@@ -28,8 +28,31 @@
 
 namespace causallm {
 
+namespace props {
+
+/** glu_activation: the gate's activation, swish (default) or tanh_gelu.
+ *  Its own key: "activation" belongs to the node and would append an
+ *  activation layer after the block instead. */
+class GluActivation final
+  : public nntrainer::EnumProperty<nntrainer::props::ActivationTypeInfo> {
+public:
+  using prop_tag = nntrainer::enum_class_prop_tag;
+  static constexpr const char *key = "glu_activation";
+};
+
+/** gate_first: the file holds gate, up, down (a converter that writes the
+ *  projections in that order) instead of the up, gate, down default. */
+class GateFirst : public nntrainer::Property<bool> {
+public:
+  GateFirst(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "gate_first";
+};
+
+} // namespace props
+
 /**
- * @brief The dense SwiGLU FFN as ONE layer, so an accelerator can take
+ * @brief The dense gated FFN (SwiGLU, or GeGLU with activation=tanh_gelu) as ONE layer, so an accelerator can take
  *        up, gate, SwiGLU and down in one call (docs/htp_attention/51).
  *
  * Holds the same three Q4_0 weights, in the same order and shapes, as the
@@ -66,8 +89,11 @@ public:
   inline static const std::string type = "dense_ffn";
 
 private:
-  /** unit = the intermediate size (the width of up and gate) */
-  std::tuple<nntrainer::props::Unit> dense_props;
+  /** unit = the intermediate size (the width of up and gate); activation
+   *  swish (default) or tanh_gelu; gate_first for the file's weight order */
+  std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst>
+    dense_props;
+  bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
   std::array<unsigned int, 3> weight_idx; /**< up, gate, down */
   std::array<unsigned int, 3> tensor_idx; /**< up_out, gate_out, act */
 };
