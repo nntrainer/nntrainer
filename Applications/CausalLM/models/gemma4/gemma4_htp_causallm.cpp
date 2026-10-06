@@ -23,6 +23,8 @@
 #include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
+#include <dense_ffn_layer.h>
+#include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
 #include <scalar_multiply.h>
 
@@ -693,104 +695,49 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   (void)seq_len;
   (void)head_dim;
 
-  const std::string Q = "layer" + std::to_string(layer_id) + "_wq";
-  const std::string Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
-  const std::string K = "layer" + std::to_string(layer_id) + "_wk";
-  const std::string K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
-  const std::string V = "layer" + std::to_string(layer_id) + "_wv";
-  const std::string V_norm = "layer" + std::to_string(layer_id) + "_v_norm";
+  const std::string QKV = "layer" + std::to_string(layer_id) + "_qkv";
   const std::string A = "layer" + std::to_string(layer_id) + "_attention";
   const std::string O = "layer" + std::to_string(layer_id) + "_attention_out";
-  const std::string Q_scaled = "layer" + std::to_string(layer_id) + "_q_scaled";
 
   const bool is_sliding = isSlidingAttentionLayer(layer_id);
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
   const int curr_head_dim = static_cast<int>(getAttentionHeadDim(layer_id));
   const int curr_kv_heads = static_cast<int>(getKVHeadCount(layer_id));
 
-  // Q layer [B, S, H] -> [B, S, Nq*Dh]
-  std::vector<std::string> q_params = {
-    withKey("name", Q),
-    withKey("unit", curr_head_dim * n_heads),
-    withKey("disable_bias", "true"),
-    withKey("weight_initializer", "ones"),
+  // q, k, v and their per-head norms as one layer (qkv_layer, doc 51
+  // section 2.21): the three projections share one activation, so an
+  // accelerator takes them as one call instead of three that each quantize
+  // and ship the same rows; on the CPU it is the same GEMMs and the same
+  // norm kernel. The weights stay in the file's order (q, q_norm, k,
+  // k_norm, v), so a model file is read identically. Folded in with them:
+  // the gamma-less v_norm, and the sqrt(head_dim) on q that cancels the
+  // attention core's 1/sqrt(head_dim) (this attention's scaling is 1.0).
+  // attention_k_eq_v: a full-attention layer has no v_proj and V is the
+  // raw K projection (before k_norm and RoPE), v_norm'ed like any V.
+  // (the one caller passes the same normed tensor as query, key and value)
+  (void)key;
+  (void)value;
+  std::vector<std::string> qkv_params = {
+    withKey("name", QKV),
+    withKey("q_unit", curr_head_dim * n_heads),
+    withKey("k_unit", curr_head_dim * curr_kv_heads),
+    withKey("v_unit", curr_head_dim * curr_kv_heads),
+    withKey("feature_size", std::to_string(curr_head_dim)),
+    withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("v_norm", "true"),
+    withKey("q_scale",
+            std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
     withKey("weight_dtype", FC_LAYER_DTYPE),
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
-  appendSkipPrefillIfNeeded(q_params, is_kv_shared_layer);
-  LayerHandle wq(createLayer("fully_connected", q_params));
-  Tensor q = wq(query);
-
-  // K layer [B, S, H] -> [B, S, Nk*Dh]
-  std::vector<std::string> k_params = {
-    withKey("name", K),
-    withKey("unit", curr_head_dim * curr_kv_heads),
-    withKey("disable_bias", "true"),
-    withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE),
-    withKey("engine",
-            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
-  appendSkipPrefillIfNeeded(k_params, is_kv_shared_layer);
-  LayerHandle wk(createLayer("fully_connected", k_params));
-  Tensor k = wk(key);
-
-  // V layer [B, S, H] -> [B, S, Nk*Dh]. attention_k_eq_v: a full-attention
-  // layer has no v_proj and V is the raw K projection (before k_norm and
-  // RoPE), v_norm'ed below like any V -- Gemma4TextAttention.forward.
-  Tensor v;
-  if (ATTENTION_K_EQ_V && !is_sliding) {
-    v = k;
-  } else {
-    std::vector<std::string> v_params = {
-      withKey("name", V),
-      withKey("unit", curr_head_dim * curr_kv_heads),
-      withKey("disable_bias", "true"),
-      withKey("weight_initializer", "ones"),
-      withKey("weight_dtype", FC_LAYER_DTYPE),
-      withKey("engine",
-              engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
-    appendSkipPrefillIfNeeded(v_params, is_kv_shared_layer);
-    LayerHandle wv(createLayer("fully_connected", v_params));
-    v = wv(value);
-  }
-
-  // q_norm on per-head projection [B, S, Nq*Dh]
-  std::vector<std::string> q_norm_params = {
-    withKey("name", Q_norm), withKey("packed", "false"),
-    withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
-  appendSkipPrefillIfNeeded(q_norm_params, is_kv_shared_layer);
-  LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_params));
-  Tensor q_normed = q_norm(q);
-
-  // Gemma4TextAttention uses scaling=1.0 after q_norm/k_norm.
-  // mha_core backend applies 1/sqrt(head_dim) to QK, so pre-scale Q by
-  // sqrt(head_dim) to preserve Gemma4 semantics.
-  LayerHandle q_scale(createLayer(
-    "scalar_multiply",
-    {withKey("name", Q_scaled), withKey("packed", "false"),
-     withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim))))}));
-  Tensor q_scaled = q_scale(q_normed);
-
-  // k_norm on per-head projection [B, S, Nk*Dh]
-  std::vector<std::string> k_norm_params = {
-    withKey("name", K_norm), withKey("packed", "false"),
-    withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
-  appendSkipPrefillIfNeeded(k_norm_params, is_kv_shared_layer);
-  LayerHandle k_norm(createLayer("reshaped_rms_norm", k_norm_params));
-  Tensor k_normed = k_norm(k);
-
-  // v_norm on per-head projection [B, S, Nk*Dh] (no learned scale)
-  std::vector<std::string> v_norm_params = {
-    withKey("name", V_norm), withKey("packed", "false"),
-    withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
-  v_norm_params.push_back(withKey("use_gamma", "false"));
-  appendSkipPrefillIfNeeded(v_norm_params, is_kv_shared_layer);
-  LayerHandle v_norm(createLayer("reshaped_rms_norm", v_norm_params));
-  Tensor v_normed = v_norm(v);
+  if (ATTENTION_K_EQ_V && !is_sliding)
+    qkv_params.push_back(withKey("v_from_k", "true"));
+  appendSkipPrefillIfNeeded(qkv_params, is_kv_shared_layer);
+  LayerHandle qkv(createLayer("qkv_layer", qkv_params));
+  Tensor qkv_out = qkv(query);
+  Tensor q_scaled = qkv_out.output(0);
+  Tensor k_normed = qkv_out.output(1);
+  Tensor v_normed = qkv_out.output(2);
 
   if (layer_id >= static_cast<int>(layer_k_norms.size())) {
     layer_k_norms.resize(layer_id + 1);
@@ -851,10 +798,25 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
   const int curr_hidden_dim =
     hidden_dim * ((USE_DOUBLE_WIDE_MLP && is_kv_shared_layer) ? 2 : 1);
-  // The three fully connected layers on dense_ffn_engine; GeGLU itself stays
-  // on the CPU between them.
   const std::string ffn_engine =
     engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id);
+
+  // gate, up, GeGLU and down as one layer (dense_ffn, doc 51), so an
+  // accelerator takes the block in one call with the GeGLU in its
+  // epilogue; the same three weights in the file's order (gate, up, down),
+  // so a model file is read identically, and on the CPU the same GEMMs.
+  // ponytail: a KV-shared layer keeps the three layers below, which carry
+  // skip_prefill; dense_ffn does not, and no model here has such a layer.
+  if (!is_kv_shared_layer) {
+    LayerHandle ffn(createLayer(
+      "dense_ffn",
+      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
+       withKey("unit", curr_hidden_dim), withKey("gate_first", "true"),
+       withKey("glu_activation", "tanh_gelu"),
+       withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", ffn_engine)}));
+    return ffn(input);
+  }
+
 
   std::vector<std::string> ffn_gate_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
@@ -922,6 +884,10 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  // the fused projections (Transformer::registerCustomLayers registers them
+  // too; this model's factory may be the only one called)
+  tryRegister(nntrainer::createLayer<causallm::QKVLayer>);
+  tryRegister(nntrainer::createLayer<causallm::DenseFfnLayer>);
   if (ENABLE_MOE_BLOCK)
     tryRegister(nntrainer::createLayer<causallm::Lfm2MoELayer>);
 }
