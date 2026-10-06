@@ -126,7 +126,7 @@ public:
                    Tensor input) override;
   /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
    *  on @a input, both already normed by the caller. */
-  Tensor createMoe(const int layer_id, Tensor input, Tensor router_input);
+  Tensor createMoe(const int layer_id, Tensor input);
 
   void registerCustomLayers() override;
 

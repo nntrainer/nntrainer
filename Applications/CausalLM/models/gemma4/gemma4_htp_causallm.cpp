@@ -371,12 +371,20 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // Gemma4TextRMSNorm scales by `weight` (initialized to ones), which matches
   // NNTrainer `rms_norm` behavior used here.
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
-  std::vector<std::string> attn_norm_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(attn_norm_props, is_kv_shared_layer);
-  LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
-  Tensor normed = attn_norm(input);
+  // The norms around the projections ride the fused layers (qkv_layer's
+  // in_norm, dense_ffn's in_norm / out_norm, the MoE layer's three), where
+  // one accelerator call covers norm and matmul (doc 57 section 5 step 4).
+  // A KV-shared layer keeps the separate norm layers: its attention and
+  // MLP are the older layers, which carry skip_prefill.
+  Tensor normed = input;
+  if (is_kv_shared_layer) {
+    std::vector<std::string> attn_norm_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+    appendSkipPrefillIfNeeded(attn_norm_props, is_kv_shared_layer);
+    LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
+    normed = attn_norm(input);
+  }
 
   int shared_kv_layer_id = -1;
 
@@ -421,12 +429,15 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     createLayer("addition", post_attention_add_props));
   Tensor post_attention = post_attention_add({input, post_normed});
 
-  std::vector<std::string> pre_ffn_norm_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(pre_ffn_norm_props, is_kv_shared_layer);
-  LayerHandle pre_ffn_norm(createLayer("rms_norm", pre_ffn_norm_props));
-  Tensor pre_ffn = pre_ffn_norm(post_attention);
+  Tensor pre_ffn = post_attention;
+  if (is_kv_shared_layer) {
+    std::vector<std::string> pre_ffn_norm_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm"),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+    appendSkipPrefillIfNeeded(pre_ffn_norm_props, is_kv_shared_layer);
+    LayerHandle pre_ffn_norm(createLayer("rms_norm", pre_ffn_norm_props));
+    pre_ffn = pre_ffn_norm(post_attention);
+  }
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
 
@@ -434,26 +445,15 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     // Gemma4TextDecoderLayer: norm_1(mlp) + norm_2(experts(norm(residual)))
     // with the router reading its own norm of the residual (doc 55 §6.2;
     // its scale and hidden^-0.5 are folded into that norm's gamma by the
-    // converter).
-    auto norm = [&](const char *suffix, Tensor in) {
-      std::vector<std::string> props = {
-        withKey("name", "layer" + std::to_string(layer_id) + suffix),
-        withKey("epsilon", std::to_string(NORM_EPS)),
-        withKey("packed", "false")};
-      appendSkipPrefillIfNeeded(props, is_kv_shared_layer);
-      return LayerHandle(createLayer("rms_norm", props))(in);
-    };
-    Tensor mlp_normed = norm("_post_ffn_norm_1", ffn_out);
-    Tensor router_in = norm("_router_norm", post_attention);
-    Tensor experts_in = norm("_pre_ffn_norm_2", post_attention);
-    Tensor moe_out = createMoe(layer_id, experts_in, router_in);
-    Tensor moe_normed = norm("_post_ffn_norm_2", moe_out);
+    // converter). norm_1 is the dense layer's out_norm; the MoE layer
+    // holds the other three (in_norm, router_norm, out_norm).
+    Tensor moe_out = createMoe(layer_id, post_attention);
 
     std::vector<std::string> ffn_sum_props = {
       withKey("name", "layer" + std::to_string(layer_id) + "_ffn_sum")};
     appendSkipPrefillIfNeeded(ffn_sum_props, is_kv_shared_layer);
     LayerHandle ffn_sum(createLayer("addition", ffn_sum_props));
-    ffn_out = ffn_sum({mlp_normed, moe_normed});
+    ffn_out = ffn_sum({ffn_out, moe_out});
   }
 
   std::vector<std::string> post_ffn_norm_props = {
@@ -556,8 +556,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   return layer_scalar(decoder_output);
 }
 
-Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
-                                    Tensor router_input) {
+Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
   const std::string engine =
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
                                                                : "cpu";
@@ -568,13 +567,17 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
     withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
     withKey("moe_activation", "tanh_gelu"),
     withKey("router_type", "softmax_scale"),
+    withKey("in_norm", "true"),
+    withKey("router_norm", "true"),
+    withKey("out_norm", "true"),
+    withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("weight_dtype", MOE_LAYER_DTYPE),
     withKey("engine", engine)};
   if (MOE_CACHE_EXPERTS != 0)
     props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
   appendSkipPrefillIfNeeded(props, isKVSharedLayer(layer_id));
   LayerHandle moe(createLayer("lfm2_moe", props));
-  return moe({input, router_input});
+  return moe(input);
 }
 
 Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
@@ -727,6 +730,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("v_norm", "true"),
     withKey("q_scale",
             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
+    withKey("in_norm", "true"),
     withKey("weight_dtype", FC_LAYER_DTYPE),
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
@@ -812,7 +816,9 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
       "dense_ffn",
       {withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
        withKey("unit", curr_hidden_dim), withKey("gate_first", "true"),
-       withKey("glu_activation", "tanh_gelu"),
+       withKey("glu_activation", "tanh_gelu"), withKey("in_norm", "true"),
+       withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
+       withKey("epsilon", std::to_string(NORM_EPS)),
        withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", ffn_engine)}));
     return ffn(input);
   }
