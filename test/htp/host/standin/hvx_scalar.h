@@ -46,6 +46,13 @@ void hvx_scalar_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                      const uint8_t *wh, uint32_t n_col, uint32_t nt,
                      int32_t *out);
 
+/** @brief [plan 229] hvx_scalar_gemv over QS2CX_WH codes (256-byte tiles)
+ *  read through @a table (hvx_expand_i2i4_table): the sum the u8i2 GEMV
+ *  must equal. */
+void hvx_scalar_gemv_i2(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                        const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                        const uint8_t *table, int32_t *out);
+
 /**
  * @brief A check's instrumentation of the GEMV entry points. NULL (the
  *        default) runs the plain sum; moe_layer_host_check.c installs its
@@ -60,6 +67,12 @@ typedef struct {
   void (*gemv)(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                const uint8_t *wh, uint32_t n_col, uint32_t nt, uint32_t rows1,
                int nopf, int32_t *out);
+  /** [plan 229] The same for hvx_gemm_u8i2_wh_col / _col_nopf (and each
+   *  column of _cols2_nopf), with the expansion table: the hook computes
+   *  @a out itself, normally through hvx_scalar_gemv_i2. */
+  void (*gemv2)(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                const uint8_t *wh, uint32_t n_col, uint32_t nt, uint32_t rows1,
+                int nopf, const uint8_t *table, int32_t *out);
   /** A buffer the stand-ins below read (@a write 0) or write (1): the
    *  GEMV's activation block, the quantizer's rows and row params, the
    *  pack's output, the dequant's row params and output, the SwiGLU's

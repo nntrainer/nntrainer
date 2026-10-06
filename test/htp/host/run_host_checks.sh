@@ -180,21 +180,33 @@ done
 # with one token changed must fail, or the check is not looking.
 LIBNATIVE="${DEFAULT_HEXAGON_TOOLS_ROOT:-}/Tools/libnative"
 if [ -f "$LIBNATIVE/lib/libnative.a" ]; then
+  # [plan 229] The u8i2 entries' spec is the expansion's scalar twin, so
+  # hvx_expand_i2i4.c links in plain (its HVX loop is __hexagon__ only),
+  # with the pool it can dispatch to.
+  for k in hvx_expand_i2i4 hvx_worker_pool; do
+    "$cc" -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter -pthread -c \
+      -I "$HERE/stub" -I "$BACKEND/hvx" -o "$OUT/native_$k.o" \
+      "$BACKEND/hvx/$k.c"
+  done
   gemv_native() { # gemv_native <kernel.c> <exe>
     "$cc" -std=gnu99 -O1 -fno-strict-aliasing -DHVX_UVector=HEXAGON_Vect1024 \
       -I "$LIBNATIVE/include" -I "$BACKEND/hvx" -c "$1" -o "$2.k.o"
     "$cc" -std=gnu99 -O1 -Wall -Wextra -I "$BACKEND/hvx" \
       -c "$HERE/gemv_native_check.c" -o "$2.c.o"
-    g++ -o "$2" "$2.c.o" "$2.k.o" "$LIBNATIVE/lib/libnative.a"
+    g++ -pthread -o "$2" "$2.c.o" "$2.k.o" "$OUT/native_hvx_expand_i2i4.o" \
+      "$OUT/native_hvx_worker_pool.o" "$LIBNATIVE/lib/libnative.a"
   }
   gemv_native "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" "$OUT/gemv_native_check"
   "$OUT/gemv_native_check"
   # One mutant per loop: the one-row loop's final shift (caught only on
   # the lone rows m = 1, 5, 9, 13, which is how this shows that loop runs)
   # and the four-row loop's. Sending m = 1 to the four-row loop is not a
-  # mutant: its row 0 is the same int32 by construction.
+  # mutant: its row 0 is the same int32 by construction. [plan 229] And the
+  # u8i2 loops' code split with the nibble mask #4410 shipped (0xF0: vlut32
+  # indices past 31 read zero), which only the spec comparison catches.
   for mut in 's/vasr_VwR(acc, 4)/vasr_VwR(acc, 3)/' \
-    's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/'; do
+    's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/' \
+    's/(int)0x0F0F0F0Fu/(int)0xF0F0F0F0u/'; do
     sed "$mut" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" > "$OUT/mutant.c"
     if cmp -s "$OUT/mutant.c" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c"; then
       echo "HVX GEMV MUTATION DID NOT APPLY: $mut"; exit 1
