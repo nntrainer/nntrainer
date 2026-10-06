@@ -30,9 +30,12 @@
  *         LFM2.5-8B-A1B resident in full (doc 45) is 22 MoE layers x 64 +
  *         2 dense x 2 + 18 conv x 2 + 6 attention x 4 = 1472, so 512 --
  *         which bounded the MoE work to 8 layers at a time -- is not
- *         enough for the whole model. The table is ~48 bytes per slot;
- *         2048 costs ~100 KB of static DSP memory. */
-#define HEXKL_MM_U8I4_MAX_WEIGHTS 2048
+ *         enough for the whole model. [plan 201 S1] Gemma-4-26B-A4B's
+ *         expert pool in one PD is about 1300 slots of 2 weights each
+ *         (plan 201 section 3.4), so 4096. The table is ~36 bytes per slot
+ *         on the DSP; 4096 costs ~150 KB of the session struct (DSP heap,
+ *         +75 KB over 2048). */
+#define HEXKL_MM_U8I4_MAX_WEIGHTS 4096
 
 /**
  * @brief One registered weight: WH-baked bytes plus its dequant constants,

@@ -149,7 +149,7 @@ static void ref_rmsnorm_f32(const float *x, const float *gamma, float *y,
   }
   const float r = 1.0f / sqrtf(sum / (float)chunk + eps);
   for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] = x[i] * r * gamma[i];
+    y[i] = x[i] * r * (gamma ? gamma[i] : 1.0f);
   }
 }
 static void ref_rmsnorm_f64(const float *x, const float *gamma, double *y,
@@ -160,14 +160,17 @@ static void ref_rmsnorm_f64(const float *x, const float *gamma, double *y,
   }
   const double r = 1.0 / sqrt(sum / (double)chunk + (double)eps);
   for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] = (double)x[i] * r * (double)gamma[i];
+    y[i] = (double)x[i] * r * (gamma ? (double)gamma[i] : 1.0);
   }
 }
 
 /** @brief One norm case: n floats in chunks; heads 0..2 of the row are the
  *         fixed kinds when there is more than one chunk, else the whole
- *         row cycles through the kinds. */
+ *         row cycles through the kinds. A name ending in "nogamma" runs the
+ *         gamma-free form (plan 201 S4). */
 static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
+  const size_t nl = strlen(name);
+  const int no_gamma = nl >= 7u && !strcmp(name + nl - 7u, "nogamma");
   const float eps = 1e-5f;
   const uint32_t nchunk = n / chunk;
   float *x = malloc(n * sizeof(float));
@@ -193,8 +196,8 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
     }
     memset(y_hvx, 0xA5, n * sizeof(float));
     memset(rs_hvx, 0xA5, nchunk * sizeof(float));
-    hvx_rmsnorm_f32(x, gamma, y_hvx, n, chunk, eps, rs_hvx);
-    m1_rmsnorm_det(x, gamma, y_det, n, chunk, eps, rs_det);
+    hvx_rmsnorm_f32(x, no_gamma ? NULL : gamma, y_hvx, n, chunk, eps, rs_hvx);
+    m1_rmsnorm_det(x, no_gamma ? NULL : gamma, y_det, n, chunk, eps, rs_det);
     for (uint32_t i = 0; i < n; ++i) {
       bad += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
     }
@@ -202,8 +205,10 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
       bad += memcmp(&rs_hvx[c], &rs_det[c], sizeof(float)) ? 1u : 0u;
     }
     for (uint32_t c = 0; c < nchunk; ++c) {
-      ref_rmsnorm_f32(x + c * chunk, gamma, y_f32 + c * chunk, chunk, eps);
-      ref_rmsnorm_f64(x + c * chunk, gamma, y_f64 + c * chunk, chunk, eps);
+      ref_rmsnorm_f32(x + c * chunk, no_gamma ? NULL : gamma, y_f32 + c * chunk,
+                      chunk, eps);
+      ref_rmsnorm_f64(x + c * chunk, no_gamma ? NULL : gamma, y_f64 + c * chunk,
+                      chunk, eps);
     }
     for (uint32_t i = 0; i < n; ++i) {
       const double u32 = ulp_dist(y_det[i], (double)y_f32[i]);
@@ -337,22 +342,24 @@ static uint32_t norm_row(const float *x, const float *gamma, float *y,
 
 static void check_norm_cpu_order(void) {
   enum { ROWS = 20000 };
-  static const uint32_t widths[2] = {2048u, 64u};
+  /* [plan 201 S4] 2816: Gemma's hidden, not a power of two -- the CPU
+     model's fdiv by W against the spec's cpu_det_div_rn */
+  static const uint32_t widths[3] = {2048u, 64u, 2816u};
   const float eps = 1e-5f;
-  float *x = malloc(2048u * sizeof(float));
-  float *g = malloc(2048u * sizeof(float));
-  float *y = malloc(2048u * sizeof(float));
+  float *x = malloc(2816u * sizeof(float));
+  float *g = malloc(2816u * sizeof(float));
+  float *y = malloc(2816u * sizeof(float));
   uint32_t caught[NORM_N_MUT] = {0, 0, 0, 0}, bad = 0, rows = 0;
-  fill_rand(g, 2048u, 0.5f, 1.5f);
-  for (int w = 0; w < 2; ++w) {
+  fill_rand(g, 2816u, 0.5f, 1.5f);
+  for (int w = 0; w < 3; ++w) {
     const uint32_t W = widths[w];
     for (int kind = 1; kind <= 3; ++kind, ++rows) {
       fill_row(x, W, kind);
       bad += norm_row(x, g, y, W, eps, caught);
     }
-    /* 2048: 2 000 rows; 64: 18 000 -- one magnitude 2^e, e in [-20, 20],
-       per row, elements +-[0.5, 1) 2^e */
-    const uint32_t n = w == 0 ? ROWS / 10 : ROWS - ROWS / 10;
+    /* 2048: 2 000 rows; 64: 18 000; 2816: 2 000 -- one magnitude 2^e, e in
+       [-20, 20], per row, elements +-[0.5, 1) 2^e */
+    const uint32_t n = w != 1 ? ROWS / 10 : ROWS - ROWS / 10;
     for (uint32_t k = 0; k < n; ++k, ++rows) {
       const int e = (int)(k % 41u) - 20;
       for (uint32_t i = 0; i < W; ++i) {
@@ -615,6 +622,94 @@ static void check_rope(void) {
   free(x);
   free(y_hvx);
   free(y_det);
+}
+
+/**
+ * @brief [plan 201 S4] Gemma 4's RoPE at head_dim 256 (sliding layers:
+ *        "default", theta 1e4) and 512 (full layers: "proportional",
+ *        partial_rotary_factor 0.25, theta 1e6), on its 16 q + kv heads.
+ *        The table is mha_core's (_compute_proportional_parameters: angles
+ *        theta^(-2i / hd) for i < 0.25 hd / 2, 0 above, the exponent over
+ *        the WHOLE head_dim; calc_trigonometric_vals_dup's cos | sin per
+ *        position) in double then rounded once, as the CPU's f32 table is.
+ *        The kernel must equal m1_rope_det bit for bit, the identity pairs
+ *        (zero angle) must pass x through, and the spec's SNR against the
+ *        rotation in double is printed. A kernel pairing (i, i + 32) per
+ *        64-lane chunk, LFM2's head reused, is run_host_checks.sh's mutant.
+ */
+static void check_rope_gemma(void) {
+  static const struct {
+    uint32_t hd, n_q, n_k;
+    double theta, partial;
+    const char *name;
+  } layers[2] = {
+    {256u, 16u, 8u, 1e4, 1.0, "sliding hd256 default 1e4"},
+    {512u, 16u, 2u, 1e6, 0.25, "full hd512 proportional 0.25 1e6"}};
+  static const uint32_t positions[] = {0u, 1u, 1023u, 1024u, 4095u};
+  for (int l = 0; l < 2; ++l) {
+    const uint32_t hd = layers[l].hd, h = hd / 2u,
+                   nh = layers[l].n_q + layers[l].n_k, n = nh * hd;
+    const uint32_t angles = (uint32_t)(layers[l].partial * hd / 2.0);
+    float *x = malloc(n * sizeof(float)), *y_hvx = malloc(n * sizeof(float));
+    float *y_det = malloc(n * sizeof(float)), *cs = malloc(hd * sizeof(float));
+    double *ang = malloc(h * sizeof(double));
+    uint32_t bad = 0, bad_pass = 0;
+    double sig = 0.0, err = 0.0;
+    for (uint32_t i = 0; i < nh; ++i) {
+      fill_row(x + i * hd, hd, i < 3u ? (int)i + 1 : 0);
+    }
+    for (size_t p = 0; p < sizeof(positions) / sizeof(positions[0]); ++p) {
+      for (uint32_t i = 0; i < h; ++i) {
+        ang[i] = i < angles ? (double)positions[p] *
+                                pow(layers[l].theta, -(2.0 * i) / (double)hd)
+                            : 0.0;
+        cs[i] = (float)cos(ang[i]);
+        cs[h + i] = (float)sin(ang[i]);
+      }
+      memcpy(y_hvx, x, n * sizeof(float));
+      memcpy(y_det, x, n * sizeof(float));
+      hvx_rope_f32(y_hvx, layers[l].n_q, y_hvx + layers[l].n_q * hd,
+                   layers[l].n_k, cs, hd);
+      for (uint32_t i = 0; i < nh; ++i) {
+        m1_rope_det(y_det + i * hd, hd, cs);
+      }
+      for (uint32_t i = 0; i < n; ++i) {
+        bad += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
+      }
+      for (uint32_t k = 0; k < nh; ++k) {
+        const float *xk = x + k * hd, *yk = y_det + k * hd;
+        for (uint32_t i = 0; i < h; ++i) {
+          const double a = xk[i], b = xk[h + i];
+          const double r0 = a * cos(ang[i]) - b * sin(ang[i]);
+          const double r1 = a * sin(ang[i]) + b * cos(ang[i]);
+          if (i >= angles) { /* by value: -0 may come out +0 (fsub) */
+            bad_pass += yk[i] != attn_m1_det_rne16(xk[i]);
+            bad_pass += yk[h + i] != attn_m1_det_rne16(xk[h + i]);
+          }
+          if (k >= 3u) { /* the random heads: zeros / subnormals / 1e4 are
+                            the bit checks' */
+            sig += r0 * r0 + r1 * r1;
+            err +=
+              (yk[i] - r0) * (yk[i] - r0) + (yk[h + i] - r1) * (yk[h + i] - r1);
+          }
+        }
+      }
+    }
+    const double snr = 10.0 * log10(sig / err);
+    printf("M1 OPS rope %s: heads=%u+%u x 5 positions bad=%u, pass-through "
+           "pairs %u..%u bad=%u, SNR vs f64 %.1f dB\n",
+           layers[l].name, layers[l].n_q, layers[l].n_k, bad, angles, h,
+           bad_pass, snr);
+    CHECK(bad == 0u, "rope %s: HVX differs from m1_rope_det", layers[l].name);
+    CHECK(bad_pass == 0u, "rope %s: a zero-angle pair is not x",
+          layers[l].name);
+    CHECK(snr > 60.0, "rope %s: SNR %.1f dB", layers[l].name, snr);
+    free(x);
+    free(y_hvx);
+    free(y_det);
+    free(cs);
+    free(ang);
+  }
 }
 
 /* ---- conv1d + gate ----------------------------------------------------- */
@@ -1205,6 +1300,240 @@ static void check_swiglu_argmax_kernels(void) {
   free(x);
 }
 
+/* ---- [plan 201 S4] helpers of the router and N1 checks ----------------- */
+
+/** @brief SNR in dB of a against the reference b over n values. */
+static double snr_db(const float *a, const double *b, uint32_t n) {
+  double sig = 0.0, err = 0.0;
+  for (uint32_t i = 0; i < n; ++i) {
+    sig += b[i] * b[i];
+    err += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+  }
+  return err == 0.0 ? 999.0 : 10.0 * log10(sig / err);
+}
+
+/** @brief Row kind 4 ("peaky"): random +-3 with every 97th element +-300,
+ *         a residual stream's massive activations; else fill_row's kinds. */
+static void fill_row_peaky(float *x, uint32_t n, int kind) {
+  fill_row(x, n, kind == 4 ? 0 : kind);
+  if (kind == 4) {
+    for (uint32_t i = 0; i < n; i += 97u) {
+      x[i] *= 100.0f;
+    }
+  }
+}
+
+/* ---- [plan 201 S4] Gemma 4's softmax router ---------------------------- */
+
+/** @brief #4296's router in double (Gemma4MoELayer::forwardTensors): RMS
+ *         norm without gamma, times router_scale[f] / sqrt(H), the dot,
+ *         softmax, top_k (stable: the lowest index first on a tie),
+ *         renormalised over the chosen, times the per-expert scale. */
+static void router_sm_f64(const float *h, const float *rs, const float *w,
+                          const float *pes, uint32_t H, uint32_t E,
+                          uint32_t top_k, float eps, double *logits,
+                          uint32_t *sel, double *weight) {
+  double ss = 0.0, m, sum = 0.0, t = 0.0, p[128];
+  uint8_t taken[128] = {0};
+  for (uint32_t k = 0; k < H; ++k) {
+    ss += (double)h[k] * h[k];
+  }
+  const double r = 1.0 / sqrt(ss / H + eps), hs = 1.0 / sqrt((double)H);
+  for (uint32_t e = 0; e < E; ++e) {
+    double acc = 0.0;
+    for (uint32_t k = 0; k < H; ++k) {
+      acc += (double)h[k] * r * rs[k] * hs * w[(size_t)k * E + e];
+    }
+    logits[e] = acc;
+  }
+  m = logits[0];
+  for (uint32_t e = 1; e < E; ++e) {
+    m = logits[e] > m ? logits[e] : m;
+  }
+  for (uint32_t e = 0; e < E; ++e) {
+    p[e] = exp(logits[e] - m);
+    sum += p[e];
+  }
+  for (uint32_t i = 0; i < top_k; ++i) {
+    uint32_t best = E;
+    for (uint32_t e = 0; e < E; ++e) {
+      if (!taken[e] && (best == E || p[e] > p[best])) {
+        best = e;
+      }
+    }
+    taken[best] = 1u;
+    sel[i] = best;
+    t += p[best] / sum;
+  }
+  for (uint32_t i = 0; i < top_k; ++i) {
+    weight[i] = p[sel[i]] / sum / t * pes[sel[i]];
+  }
+}
+
+/**
+ * @brief The Gemma router on hvx_emu: hvx_rmsnorm_f32 with g =
+ *        m1_router_input_scale_det, then hvx_router_softmax_topk_f32, by
+ *        memcmp against the spec (m1_rmsnorm_det + m1_router_softmax_det);
+ *        an exact tie (a duplicated weight column) must go to the lower
+ *        index; then the spec's logits and weights against #4296's formula
+ *        in double. run_host_checks.sh skips the renormalisation in the
+ *        spec and requires this to fail.
+ */
+static void check_router_softmax(void) {
+  static const uint32_t shapes[3][3] = {
+    {2816u, 128u, 8u}, {64u, 4u, 2u}, {2048u, 100u, 8u}};
+  enum { REPS = 12 };
+  const float eps = 1e-6f;
+  float *h = malloc(2816u * sizeof(float)), *rs = malloc(2816u * sizeof(float));
+  float *g = malloc(2816u * sizeof(float)), *xs = malloc(2816u * sizeof(float));
+  float *xk = malloc(2816u * sizeof(float));
+  float *w = malloc((size_t)2816u * 128u * sizeof(float));
+  float *wp = malloc((size_t)2816u * 128u * sizeof(float));
+  static float lg_l[REPS * 128], lg_w[REPS * 8];
+  static double rf_l[REPS * 128], rf_w[REPS * 8];
+  for (int sh = 0; sh < 3; ++sh) {
+    const uint32_t H = shapes[sh][0], E = shapes[sh][1], top_k = shapes[sh][2];
+    const uint32_t Ep = (E + 31u) / 32u * 32u;
+    float pes[128], lh[128], ld[128], wh[8], wd[8];
+    uint32_t sh_[8], sd[8], sf[8], bad = 0, sel_same = 0, ties_low = 0;
+    uint32_t nl = 0, nw = 0;
+    double l64[128], w64[8];
+    for (int rep = 0; rep < REPS + 2; ++rep) {
+      const int tie = rep >= REPS; /* the last two rows: an exact tie */
+      fill_row_peaky(h, H, rep % 3 == 2 ? 4 : 0);
+      fill_rand(rs, H, 0.5f, 1.5f);
+      fill_rand(pes, E, 0.5f, 1.5f);
+      fill_rand(w, H * E, -1.0f, 1.0f);
+      uint32_t e1 = 0, e2 = 0;
+      if (tie) {
+        /* e1 < e2 share a column: equal logits, equal p; with every other
+           column scaled down they are the top two, so top_k >= 2 takes
+           e1 first */
+        e1 = (g_seed >> 8) % (E - 1u);
+        e2 = e1 + 1u + (g_seed >> 16) % (E - 1u - e1);
+        for (uint32_t k = 0; k < H; ++k) {
+          for (uint32_t e = 0; e < E; ++e) {
+            w[(size_t)k * E + e] *= 0.01f;
+          }
+          w[(size_t)k * E + e1] = h[k] > 0.0f ? 1.0f : -1.0f;
+          w[(size_t)k * E + e2] = w[(size_t)k * E + e1];
+        }
+      }
+      for (uint32_t k = 0; k < H; ++k) {
+        for (uint32_t e = 0; e < Ep; ++e) {
+          wp[(size_t)k * Ep + e] = e < E ? w[(size_t)k * E + e] : 0.0f;
+        }
+      }
+      m1_router_input_scale_det(rs, H, g);
+      hvx_rmsnorm_f32(h, g, xk, H, H, eps, NULL);
+      memset(lh, 0xA5, sizeof(lh));
+      memset(wh, 0xA5, sizeof(wh));
+      hvx_router_softmax_topk_f32(xk, wp, pes, H, E, top_k, lh, sh_, wh, NULL);
+      m1_rmsnorm_det(h, g, xs, H, H, eps, NULL);
+      m1_router_softmax_det(xs, w, pes, H, E, top_k, ld, sd, wd);
+      bad += memcmp(xk, xs, H * sizeof(float)) != 0;
+      bad += memcmp(lh, ld, E * sizeof(float)) != 0;
+      bad += memcmp(sh_, sd, top_k * sizeof(uint32_t)) != 0;
+      bad += memcmp(wh, wd, top_k * sizeof(float)) != 0;
+      if (tie) {
+        ties_low += sd[0] == e1 && sd[1] == e2;
+        continue;
+      }
+      router_sm_f64(h, rs, w, pes, H, E, top_k, eps, l64, sf, w64);
+      int same = !memcmp(sd, sf, top_k * sizeof(uint32_t));
+      sel_same += (uint32_t)same;
+      for (uint32_t e = 0; e < E; ++e, ++nl) {
+        lg_l[nl] = ld[e];
+        rf_l[nl] = l64[e];
+      }
+      for (uint32_t i = 0; same && i < top_k; ++i, ++nw) {
+        lg_w[nw] = wd[i];
+        rf_w[nw] = w64[i];
+      }
+    }
+    const double snr_l = snr_db(lg_l, rf_l, nl), snr_w = snr_db(lg_w, rf_w, nw);
+    printf("ROUTER SOFTMAX H=%u E=%u top_k=%u rows=%d+2 ties: HVX == SPEC "
+           "bad=%u tie_to_lowest=%u/2; spec vs f64 (#4296's formula) "
+           "logits %.1f dB, weights %.1f dB, selection %u/%d\n",
+           H, E, top_k, REPS, bad, ties_low, snr_l, snr_w, sel_same, REPS);
+    CHECK(bad == 0u, "router softmax H=%u: HVX differs from the spec", H);
+    CHECK(ties_low == 2u, "router softmax H=%u: a tie left the lower index", H);
+    CHECK(snr_l >= 100.0 && snr_w >= 100.0 && sel_same == (uint32_t)REPS,
+          "router softmax H=%u: spec vs f64 %.1f / %.1f dB, sel %u", H, snr_l,
+          snr_w, sel_same);
+  }
+  free(h);
+  free(rs);
+  free(g);
+  free(xs);
+  free(xk);
+  free(w);
+  free(wp);
+}
+
+/* ---- [plan 201 S4] N1: the order-free integer norm (opt-in) ------------ */
+
+/** @brief hvx_rmsnorm_n1_f32 (hvx_emu) against m1_rmsnorm_n1_chunk_det by
+ *         memcmp at Gemma's, LFM's and the q/k widths, every row kind; then
+ *         the spec's SNR against f64 and against the f32 norm, reported. */
+static void check_rmsnorm_n1(void) {
+  /* 16640 = 520 vectors: the kernel's u32 lanes flush once mid-row */
+  enum { NW = 5, WMAX = 16640 };
+  static const uint32_t widths[NW] = {2816u, 2048u, 64u, 32u, WMAX};
+  const float eps = 1e-6f;
+  float *x = malloc(WMAX * sizeof(float)), *g = malloc(WMAX * sizeof(float));
+  float *yh = malloc(WMAX * sizeof(float)), *yd = malloc(WMAX * sizeof(float));
+  float *yf = malloc(WMAX * sizeof(float));
+  double *y64 = malloc(WMAX * sizeof(double));
+  uint32_t bad = 0, rows = 0;
+  fill_rand(g, WMAX, 0.5f, 1.5f);
+  for (int w = 0; w < NW; ++w) {
+    const uint32_t W = widths[w];
+    double snr64_min = 999.0, snr32_min = 999.0, f32_min = 999.0;
+    for (int kind = 0; kind <= 4; ++kind) {
+      for (int rep = 0; rep < (kind == 0 || kind == 4 ? 16 : 1); ++rep) {
+        float rh, rd;
+        fill_row_peaky(x, W, kind);
+        memset(yh, 0xA5, W * sizeof(float));
+        hvx_rmsnorm_n1_f32(x, g, yh, W, W, eps, &rh);
+        rd = m1_rmsnorm_n1_chunk_det(x, g, yd, W, eps);
+        bad += memcmp(yh, yd, W * sizeof(float)) != 0 ||
+               memcmp(&rh, &rd, sizeof(float)) != 0;
+        ++rows;
+        if (kind == 1 || kind == 2) {
+          continue; /* zeros / subnormals: y is 0 or below eps's reach */
+        }
+        m1_rmsnorm_det(x, g, yf, W, W, eps, NULL);
+        ref_rmsnorm_f64(x, g, y64, W, eps);
+        const double s64 = snr_db(yd, y64, W), s64f = snr_db(yf, y64, W);
+        double *yfd = y64; /* the f32 norm as the reference */
+        for (uint32_t i = 0; i < W; ++i) {
+          yfd[i] = (double)yf[i];
+        }
+        const double s32 = snr_db(yd, yfd, W);
+        snr64_min = s64 < snr64_min ? s64 : snr64_min;
+        snr32_min = s32 < snr32_min ? s32 : snr32_min;
+        f32_min = s64f < f32_min ? s64f : f32_min;
+      }
+    }
+    printf("N1 NORM W=%u SNR(min over rows): n1 vs f64 %.1f dB, n1 vs f32 "
+           "norm %.1f dB; f32 norm vs f64 %.1f dB (random, large, peaky)\n",
+           W, snr64_min, snr32_min, f32_min);
+    CHECK(snr64_min >= 120.0, "N1 W=%u: %.1f dB against f64", W, snr64_min);
+  }
+  printf("N1 NORM HVX == SPEC bit-exact rows=%u bad=%u (W 2816/2048/64/32/"
+         "16640; "
+         "zeros, subnormals, large, peaky)\n",
+         rows, bad);
+  CHECK(bad == 0u, "hvx_rmsnorm_n1_f32 differs from m1_rmsnorm_n1_chunk_det");
+  free(x);
+  free(g);
+  free(yh);
+  free(yd);
+  free(yf);
+  free(y64);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 5 && !strcmp(argv[1], "--replay")) {
     return replay(argc - 2, argv + 2);
@@ -1212,20 +1541,28 @@ int main(int argc, char **argv) {
   check_rmsnorm("rmsnorm", 2048u, 2048u);
   check_rmsnorm("qk_norm_q", 32u * 64u, 64u);
   check_rmsnorm("qk_norm_k", 8u * 64u, 64u);
+  check_rmsnorm("rmsnorm_2816", 2816u, 2816u);
+  check_rmsnorm("rmsnorm_2816_nogamma", 2816u, 2816u);
+  check_rmsnorm("v_norm_256_nogamma", 8u * 256u, 256u);
+  check_rmsnorm("rmsnorm_96", 96u, 96u);
   check_norm_cpu_order();
   check_sqrt_recip_rn();
   check_rope();
+  check_rope_gemma();
   check_conv();
   check_swiglu_argmax_kernels();
   check_router_kernel();
   check_router_vs_cpu();
   check_expf_port();
   check_swiglu_argmax();
+  check_rmsnorm_n1();
+  check_router_softmax();
   if (g_fail) {
     printf("M1 OPS CHECK FAILED\n");
     return 1;
   }
   printf("ROUTER TOPK BIT-IDENTICAL\n");
+  printf("ROUTER SOFTMAX BIT-IDENTICAL\n");
   printf("M1 OPS BIT-IDENTICAL\n");
   return 0;
 }
