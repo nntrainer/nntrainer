@@ -151,14 +151,21 @@ private:
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
-             nntrainer::props::Unit, props::MoEActivation>
+             nntrainer::props::Unit, props::MoEActivation, props::MoERouter,
+             nntrainer::props::Epsilon>
     moe_props;
 
   // weight indices
   std::vector<unsigned int> expert_gate_up_proj_indices;
   std::vector<unsigned int> expert_down_proj_indices;
   unsigned int gate_idx;
-  unsigned int expert_bias_idx;
+  unsigned int
+    expert_bias_idx; /**< the expert bias; [plan 201 S4] the
+                          per-expert scale under the softmax router */
+  /** [plan 201 S4] moe_router=softmax (Gemma 4): a second input, the
+   *  router's un-normed row, and its input scale (router_scale) */
+  bool softmax_router;
+  unsigned int router_scale_idx;
 
   /** [doc 52] Expert weights left virtual (never read by the loader) and
    *  streamed from the model file into accelerator-owned slots under an
@@ -202,6 +209,18 @@ private:
    *             same rule Lfm2CachedSlimMoELayer applies. The routing
    *             itself is unchanged by asking for it.
    */
+  /**
+   * @brief [plan 201 S4] Gemma 4's softmax routing of @a total_tokens rows
+   *        of @a router_in (gemma4_moe_layer.cpp's forwardTensors, the CPU
+   *        reference, step for step) into @a expert_assignments; with
+   *        @a extra_top_k the top-(k + EXTRA_TOPK) ids too (the LRU hint).
+   */
+  void routeSoftmax(
+    nntrainer::RunLayerContext &context, nntrainer::Tensor &router_in,
+    nntrainer::Tensor &router_logits, unsigned int total_tokens,
+    std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments,
+    std::vector<int> *extra_top_k);
+
   void buildExpertAssignments(
     const nntrainer::Tensor &router_logits,
     const nntrainer::Tensor &expert_bias, unsigned int total_tokens,
