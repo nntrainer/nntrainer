@@ -140,9 +140,11 @@ enum {
    *  came from the GEMV and not from a block loop that happened to be
    *  cheap. */
   HEXKL_PROBE_PATH,
-  /** NOT a time: 1 when the M=1 GEMV call staged its expert weights into
-   *  VTCM by DMA (#117, hexkl_moe_flags_feed and the budget check), 0
-   *  when it read the arena. The level-2 row's feed=n/calls. */
+  /** NOT a time: the number of DMA queues the M=1 GEMV call used to stage
+   *  its expert weights into VTCM (#117, hexkl_moe_flags_feed and the
+   *  budget check: 1; #177, hexkl_moe_flags_dma_q: 1..4), 0 when it read
+   *  the arena. The level-2 row's feed=n/calls counts the non-zero calls
+   *  and dmaq= averages the value over them. */
   HEXKL_PROBE_M1_FEED,
   HEXKL_PROBE_N
 };
