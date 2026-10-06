@@ -546,12 +546,14 @@ void Lfm2MoELayer::buildExpertAssignments(
  *  accelerator's slot pool, keyed by its two weight tensors. The dims are
  *  the kernel's: gate_up is [K, 2 * inter], down [inter, N_out]. */
 static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
-  if (gu.getDataType() != nntrainer::Tdatatype::QS4CX_WH ||
-      dn.getDataType() != nntrainer::Tdatatype::QS4CX_WH) {
+  const auto dt = gu.getDataType();
+  if ((dt != nntrainer::Tdatatype::QS4CX_WH &&
+       dt != nntrainer::Tdatatype::QS2CX_WH) ||
+      dn.getDataType() != dt) {
     throw std::runtime_error(
-      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH expert "
-      "weights (the file's bytes go to the DSP as they are); this model's "
-      "are not");
+      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH or "
+      "QS2CX_WH expert weights (the file's bytes go to the DSP as they are); "
+      "this model's are not");
   }
   return ExpertFileDesc{&gu,
                         &dn,
@@ -560,7 +562,8 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
                         dn.getFileOffset(),
                         static_cast<unsigned int>(gu.height()),
                         static_cast<unsigned int>(dn.height()),
-                        static_cast<unsigned int>(dn.width())};
+                        static_cast<unsigned int>(dn.width()),
+                        dt == nntrainer::Tdatatype::QS2CX_WH ? 2u : 4u};
 }
 
 static void loadVirtualExpert(nntrainer::ComputeOps *ops,
@@ -800,9 +803,10 @@ static bool tryMoeLayerOnAccelerator(
   // call takes one flag for the layer, and a model that mixed the two would
   // otherwise read half its weights with the wrong layout.
   const auto wh = nntrainer::Tdatatype::QS4CX_WH;
+  const auto wh2 = nntrainer::Tdatatype::QS2CX_WH;
   const auto plain = nntrainer::Tdatatype::QS4CX;
-  const bool weights_wh =
-    context.getWeight(gate_up_indices[0]).getDataType() == wh;
+  const auto dt0 = context.getWeight(gate_up_indices[0]).getDataType();
+  const unsigned int w_bits = (dt0 == wh) ? 4u : (dt0 == wh2) ? 2u : 0u;
 
   // Decode's single token normally stays on the ARM side: it cannot amortize
   // the kernel's 64-row pad, which is why the fused path has the same gate.
@@ -821,14 +825,14 @@ static bool tryMoeLayerOnAccelerator(
   // side in one run (doc 46 section 49). Measurement switch, not a default.
   static const bool htp_decode_forced =
     std::getenv("NNTR_MOE_HTP_DECODE") != nullptr;
-  if (total_tokens <= 1 && !weights_wh && !htp_decode_forced) {
+  if (total_tokens <= 1 && w_bits == 0u && !htp_decode_forced) {
     return false;
   }
 
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
-    const auto want = weights_wh ? wh : plain;
+    const auto want = (w_bits == 4u) ? wh : (w_bits == 2u) ? wh2 : plain;
     if (gu.getDataType() != want || dn.getDataType() != want) {
       return false;
     }
@@ -949,7 +953,7 @@ static bool tryMoeLayerOnAccelerator(
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
-      hidden_size, weights_wh);
+      hidden_size, w_bits);
   };
 
   // [doc 52 section 10.14] A layer call needs all of its routed experts
