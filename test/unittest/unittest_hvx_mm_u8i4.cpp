@@ -1237,220 +1237,205 @@ TEST_F(HmxMmU8I4Layer, GateUpSwigluPlusU8InMatchesTwoCallReference) {
  * its cross-expert weight prefetch actually turn on.
  */
 TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
-  // LFM2-8B-A1B's expert shape, and gemma-4-26B-A4B's (doc 55): K 2816 is
-  // 88 k-tiles, inter 704 is 22 n-tiles -- a batch of 16 pairs plus a
-  // 6-pair remainder, which the LFM2 shape (56 = 3 x 16 + 8) never makes.
-  struct Shape {
-    uint32_t K, I, N;
-    const char *name;
-  };
-  for (const Shape &sh : {Shape{2048u, 1792u, 2048u, "lfm2"},
-                          Shape{2816u, 704u, 2816u, "gemma4"}}) {
-    SCOPED_TRACE(sh.name);
-    const uint32_t K = sh.K, I = sh.I, N = sh.N, M = 200, NE = 4;
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 200, NE = 4;
 
-    std::vector<Weight> gu(NE), dn(NE);
-    std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  std::vector<Weight> gu(NE), dn(NE);
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xB0E00000u + e, gu[e]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xD0000000u + e, dn[e]));
+    h_gu[e] = gu[e].handle;
+    h_dn[e] = dn[e].handle;
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0007u);
+
+  // 70 spans two blocks, 0 exercises the compaction, 64 is the boundary.
+  const std::vector<uint32_t> row_count = {70u, 0u, 64u, 33u};
+  std::vector<uint32_t> row_index;
+  std::vector<float> row_weight;
+  {
+    uint32_t st = 0xC0FFEEu;
     for (uint32_t e = 0; e < NE; ++e) {
-      ASSERT_NO_FATAL_FAILURE(
-        MakeAndRegister(K, 2 * I, 0xB0E00000u + e, gu[e]));
-      ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xD0000000u + e, dn[e]));
-      h_gu[e] = gu[e].handle;
-      h_dn[e] = dn[e].handle;
-    }
-
-    std::vector<float> x(static_cast<size_t>(M) * K);
-    fill_deterministic(x, 0x5EED0007u);
-
-    // 70 spans two blocks, 0 exercises the compaction, 64 is the boundary.
-    const std::vector<uint32_t> row_count = {70u, 0u, 64u, 33u};
-    std::vector<uint32_t> row_index;
-    std::vector<float> row_weight;
-    {
-      uint32_t st = 0xC0FFEEu;
-      for (uint32_t e = 0; e < NE; ++e) {
-        // Top-k routing gives a token k DISTINCT experts, so one expert sees a
-        // given row at most once. moe_scatter_worker splits a block by row and
-        // relies on that: two entries in one block with the same row_index are
-        // two workers doing read-modify-write on one output row. Drawing with
-        // replacement here put 13 such pairs in expert 0 alone, which made this
-        // comparison a race against an input real routing never produces.
-        std::vector<bool> taken(M, false);
-        for (uint32_t i = 0; i < row_count[e]; ++i) {
-          uint32_t r;
-          do {
-            st = st * 1664525u + 1013904223u;
-            r = (st >> 8) % M;
-          } while (taken[r]);
-          taken[r] = true;
-          row_index.push_back(r);
+      // Top-k routing gives a token k DISTINCT experts, so one expert sees a
+      // given row at most once. moe_scatter_worker splits a block by row and
+      // relies on that: two entries in one block with the same row_index are
+      // two workers doing read-modify-write on one output row. Drawing with
+      // replacement here put 13 such pairs in expert 0 alone, which made this
+      // comparison a race against an input real routing never produces.
+      std::vector<bool> taken(M, false);
+      for (uint32_t i = 0; i < row_count[e]; ++i) {
+        uint32_t r;
+        do {
           st = st * 1664525u + 1013904223u;
-          row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
-        }
+          r = (st >> 8) % M;
+        } while (taken[r]);
+        taken[r] = true;
+        row_index.push_back(r);
+        st = st * 1664525u + 1013904223u;
+        row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
       }
     }
+  }
 
-    // Rows several experts land on are the ones where a reordered scatter shows
-    // up, since float addition is associative only for two terms. Counting them
-    // turns a bad_elems number into a place to look: confined to these rows
-    // means accumulation order, spread beyond them means the matmul or the
-    // quantizer.
-    std::vector<uint32_t> hits(M, 0);
-    for (uint32_t r : row_index) {
-      ++hits[r];
+  // Rows several experts land on are the ones where a reordered scatter shows
+  // up, since float addition is associative only for two terms. Counting them
+  // turns a bad_elems number into a place to look: confined to these rows means
+  // accumulation order, spread beyond them means the matmul or the quantizer.
+  std::vector<uint32_t> hits(M, 0);
+  for (uint32_t r : row_index) {
+    ++hits[r];
+  }
+  {
+    std::vector<uint32_t> hist(NE + 1, 0);
+    for (uint32_t h : hits) {
+      ++hist[h];
     }
-    {
-      std::vector<uint32_t> hist(NE + 1, 0);
-      for (uint32_t h : hits) {
-        ++hist[h];
-      }
-      for (uint32_t k = 2; k <= NE; ++k) {
-        std::cout << "U8I4_FIELD path=moe_layer field=rows_with_" << k
-                  << "_experts value=" << hist[k] << std::endl;
-      }
+    for (uint32_t k = 2; k <= NE; ++k) {
+      std::cout << "U8I4_FIELD path=moe_layer field=rows_with_" << k
+                << "_experts value=" << hist[k] << std::endl;
     }
+  }
 
-    // --- reference: the two calls per expert, and the routing multiply and
-    // scatter-add on the host, which is exactly what Lfm2MoELayer does today.
-    std::vector<float> want(static_cast<size_t>(M) * N, 0.0f);
-    {
-      uint32_t base = 0;
-      for (uint32_t e = 0; e < NE; ++e) {
-        const uint32_t n_e = row_count[e];
-        if (n_e == 0) {
-          continue;
-        }
-        std::vector<float> xe(static_cast<size_t>(n_e) * K);
-        for (uint32_t i = 0; i < n_e; ++i) {
-          std::memcpy(&xe[static_cast<size_t>(i) * K],
-                      &x[static_cast<size_t>(row_index[base + i]) * K],
-                      sizeof(float) * K);
-        }
-        const uint32_t m_pad = (n_e + 63) / 64 * 64;
-        std::vector<uint8_t> mid_ah(static_cast<size_t>(m_pad) * I, 0);
-        std::vector<float> mid_scale(m_pad, 1.0f);
-        std::vector<int32_t> mid_zp(m_pad, 0);
-        int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
-          handle_, n_e, K, h_gu[e], xe.data(), static_cast<int>(xe.size()),
-          mid_ah.data(), static_cast<int>(mid_ah.size()), mid_scale.data(),
-          static_cast<int>(mid_scale.size()), mid_zp.data(),
-          static_cast<int>(mid_zp.size()));
-        ASSERT_EQ(err, AEE_SUCCESS) << "reference gate_up_swiglu: " << hex(err);
-
-        std::vector<float> ye(static_cast<size_t>(n_e) * N, 0.0f);
-        const uint32_t dh[1] = {h_dn[e]};
-        err = nntr_hvx_mm_u8i4_layer_u8in(
-          handle_, n_e, I, dh, 1, mid_ah.data(),
-          static_cast<int>(mid_ah.size()), mid_scale.data(),
-          static_cast<int>(mid_scale.size()), mid_zp.data(),
-          static_cast<int>(mid_zp.size()), ye.data(),
-          static_cast<int>(ye.size()));
-        ASSERT_EQ(err, AEE_SUCCESS) << "reference layer_u8in: " << hex(err);
-
-        for (uint32_t i = 0; i < n_e; ++i) {
-          float *dst = &want[static_cast<size_t>(row_index[base + i]) * N];
-          const float *src = &ye[static_cast<size_t>(i) * N];
-          const float w = row_weight[base + i];
-          for (uint32_t c = 0; c < N; ++c) {
-            // Two statements, so the product is rounded before it is added.
-            // Written as one, clang contracts this to FMLA at the default
-            // -ffp-contract=on and rounds once, while hvx_scale_add_rows_f32
-            // on the DSP multiplies and adds separately. A row one expert
-            // wrote still matched -- dst is 0 there and fma(s, w, 0) rounds
-            // the same -- so the gap only opened on the second contribution,
-            // which is what made it look like the batching.
-            const float p = src[c] * w;
-            dst[c] = dst[c] + p;
-          }
-        }
-        base += n_e;
-      }
-    }
-
-    // --- the batched call
-    std::vector<float> got(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
-    int err = nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, 0u /* silu */, h_gu.data(),
-      static_cast<int>(h_gu.size()), h_dn.data(), static_cast<int>(h_dn.size()),
-      row_index.data(), static_cast<int>(row_index.size()), row_count.data(),
-      static_cast<int>(row_count.size()), row_weight.data(),
-      static_cast<int>(row_weight.size()), x.data(), static_cast<int>(x.size()),
-      got.data(), static_cast<int>(got.size()));
-    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_moe_layer failed: " << hex(err);
-
-    size_t bad = 0;
-    size_t first = got.size();
-    size_t bad_single = 0; // on a row exactly one expert wrote
-    uint32_t max_ulp = 0;
-    std::vector<uint32_t> bad_per_row(M, 0);
-    for (size_t i = 0; i < got.size(); ++i) {
-      if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
-        if (bad == 0) {
-          first = i;
-        }
-        ++bad;
-        ++bad_per_row[i / N];
-        if (hits[i / N] <= 1u) {
-          ++bad_single;
-        }
-        // Distance in representable steps. Same sign and both finite here, so
-        // the bit patterns as integers are monotone and subtracting them counts
-        // the floats in between: 1 is adjacent, which only reassociation does.
-        uint32_t a, b;
-        std::memcpy(&a, &got[i], sizeof a);
-        std::memcpy(&b, &want[i], sizeof b);
-        const uint32_t d = (a > b) ? (a - b) : (b - a);
-        if (d > max_ulp) {
-          max_ulp = d;
-        }
-      }
-    }
-    std::cout << "U8I4_FIELD path=moe_layer field=bad_elems value=" << bad
-              << " of " << got.size() << std::endl;
-    std::cout << "U8I4_FIELD path=moe_layer field=bad_on_single_expert_rows"
-                 " value="
-              << bad_single << std::endl;
-    std::cout << "U8I4_FIELD path=moe_layer field=max_ulp value=" << max_ulp
-              << std::endl;
-    // Spread decides where to look next. A mismatch sitting on a few rows is
-    // about those rows -- how their contributions were combined. One that
-    // touches most routed rows a little is the matmul or the quantizer, which
-    // every row goes through.
-    {
-      uint32_t bad_rows = 0, routed_rows = 0, worst = 0;
-      for (uint32_t r = 0; r < M; ++r) {
-        if (hits[r] != 0u) {
-          ++routed_rows;
-        }
-        if (bad_per_row[r] != 0u) {
-          ++bad_rows;
-          if (bad_per_row[r] > worst) {
-            worst = bad_per_row[r];
-          }
-        }
-      }
-      std::cout << "U8I4_FIELD path=moe_layer field=bad_rows value=" << bad_rows
-                << " of " << routed_rows << " routed" << std::endl;
-      std::cout << "U8I4_FIELD path=moe_layer field=worst_row_bad_cols value="
-                << worst << " of " << N << std::endl;
-      std::cout
-        << "U8I4_FIELD path=moe_layer field=first_bad_row_experts value="
-        << (first < got.size() ? hits[first / N] : 0u) << std::endl;
-    }
-    if (bad != 0) {
-      std::cout << "  first at " << first << " (row " << first / N << " col "
-                << first % N << "): got " << std::hexfloat << got[first]
-                << " want " << want[first] << std::defaultfloat << std::endl;
-    }
-    EXPECT_EQ(bad, 0u)
-      << "the batched MoE layer differs from the 64-call path it replaces; "
-         "same quantizer, same SwiGLU, same HMX kernel, so this is the "
-         "batching";
-
+  // --- reference: the two calls per expert, and the routing multiply and
+  // scatter-add on the host, which is exactly what Lfm2MoELayer does today.
+  std::vector<float> want(static_cast<size_t>(M) * N, 0.0f);
+  {
+    uint32_t base = 0;
     for (uint32_t e = 0; e < NE; ++e) {
-      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[e]), AEE_SUCCESS);
-      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[e]), AEE_SUCCESS);
+      const uint32_t n_e = row_count[e];
+      if (n_e == 0) {
+        continue;
+      }
+      std::vector<float> xe(static_cast<size_t>(n_e) * K);
+      for (uint32_t i = 0; i < n_e; ++i) {
+        std::memcpy(&xe[static_cast<size_t>(i) * K],
+                    &x[static_cast<size_t>(row_index[base + i]) * K],
+                    sizeof(float) * K);
+      }
+      const uint32_t m_pad = (n_e + 63) / 64 * 64;
+      std::vector<uint8_t> mid_ah(static_cast<size_t>(m_pad) * I, 0);
+      std::vector<float> mid_scale(m_pad, 1.0f);
+      std::vector<int32_t> mid_zp(m_pad, 0);
+      int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+        handle_, n_e, K, h_gu[e], xe.data(), static_cast<int>(xe.size()),
+        mid_ah.data(), static_cast<int>(mid_ah.size()), mid_scale.data(),
+        static_cast<int>(mid_scale.size()), mid_zp.data(),
+        static_cast<int>(mid_zp.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "reference gate_up_swiglu: " << hex(err);
+
+      std::vector<float> ye(static_cast<size_t>(n_e) * N, 0.0f);
+      const uint32_t dh[1] = {h_dn[e]};
+      err = nntr_hvx_mm_u8i4_layer_u8in(
+        handle_, n_e, I, dh, 1, mid_ah.data(), static_cast<int>(mid_ah.size()),
+        mid_scale.data(), static_cast<int>(mid_scale.size()), mid_zp.data(),
+        static_cast<int>(mid_zp.size()), ye.data(),
+        static_cast<int>(ye.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "reference layer_u8in: " << hex(err);
+
+      for (uint32_t i = 0; i < n_e; ++i) {
+        float *dst = &want[static_cast<size_t>(row_index[base + i]) * N];
+        const float *src = &ye[static_cast<size_t>(i) * N];
+        const float w = row_weight[base + i];
+        for (uint32_t c = 0; c < N; ++c) {
+          // Two statements, so the product is rounded before it is added.
+          // Written as one, clang contracts this to FMLA at the default
+          // -ffp-contract=on and rounds once, while hvx_scale_add_rows_f32
+          // on the DSP multiplies and adds separately. A row one expert
+          // wrote still matched -- dst is 0 there and fma(s, w, 0) rounds
+          // the same -- so the gap only opened on the second contribution,
+          // which is what made it look like the batching.
+          const float p = src[c] * w;
+          dst[c] = dst[c] + p;
+        }
+      }
+      base += n_e;
     }
+  }
+
+  // --- the batched call
+  std::vector<float> got(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
+  int err = nntr_hvx_mm_u8i4_moe_layer(
+    handle_, M, K, I, N, h_gu.data(), static_cast<int>(h_gu.size()),
+    h_dn.data(), static_cast<int>(h_dn.size()), row_index.data(),
+    static_cast<int>(row_index.size()), row_count.data(),
+    static_cast<int>(row_count.size()), row_weight.data(),
+    static_cast<int>(row_weight.size()), x.data(), static_cast<int>(x.size()),
+    got.data(), static_cast<int>(got.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_moe_layer failed: " << hex(err);
+
+  size_t bad = 0;
+  size_t first = got.size();
+  size_t bad_single = 0; // on a row exactly one expert wrote
+  uint32_t max_ulp = 0;
+  std::vector<uint32_t> bad_per_row(M, 0);
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+      if (bad == 0) {
+        first = i;
+      }
+      ++bad;
+      ++bad_per_row[i / N];
+      if (hits[i / N] <= 1u) {
+        ++bad_single;
+      }
+      // Distance in representable steps. Same sign and both finite here, so
+      // the bit patterns as integers are monotone and subtracting them counts
+      // the floats in between: 1 is adjacent, which only reassociation does.
+      uint32_t a, b;
+      std::memcpy(&a, &got[i], sizeof a);
+      std::memcpy(&b, &want[i], sizeof b);
+      const uint32_t d = (a > b) ? (a - b) : (b - a);
+      if (d > max_ulp) {
+        max_ulp = d;
+      }
+    }
+  }
+  std::cout << "U8I4_FIELD path=moe_layer field=bad_elems value=" << bad
+            << " of " << got.size() << std::endl;
+  std::cout << "U8I4_FIELD path=moe_layer field=bad_on_single_expert_rows"
+               " value="
+            << bad_single << std::endl;
+  std::cout << "U8I4_FIELD path=moe_layer field=max_ulp value=" << max_ulp
+            << std::endl;
+  // Spread decides where to look next. A mismatch sitting on a few rows is
+  // about those rows -- how their contributions were combined. One that
+  // touches most routed rows a little is the matmul or the quantizer, which
+  // every row goes through.
+  {
+    uint32_t bad_rows = 0, routed_rows = 0, worst = 0;
+    for (uint32_t r = 0; r < M; ++r) {
+      if (hits[r] != 0u) {
+        ++routed_rows;
+      }
+      if (bad_per_row[r] != 0u) {
+        ++bad_rows;
+        if (bad_per_row[r] > worst) {
+          worst = bad_per_row[r];
+        }
+      }
+    }
+    std::cout << "U8I4_FIELD path=moe_layer field=bad_rows value=" << bad_rows
+              << " of " << routed_rows << " routed" << std::endl;
+    std::cout << "U8I4_FIELD path=moe_layer field=worst_row_bad_cols value="
+              << worst << " of " << N << std::endl;
+    std::cout << "U8I4_FIELD path=moe_layer field=first_bad_row_experts value="
+              << (first < got.size() ? hits[first / N] : 0u) << std::endl;
+  }
+  if (bad != 0) {
+    std::cout << "  first at " << first << " (row " << first / N << " col "
+              << first % N << "): got " << std::hexfloat << got[first]
+              << " want " << want[first] << std::defaultfloat << std::endl;
+  }
+  EXPECT_EQ(bad, 0u)
+    << "the batched MoE layer differs from the 64-call path it replaces; "
+       "same quantizer, same SwiGLU, same HMX kernel, so this is the "
+       "batching";
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[e]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[e]), AEE_SUCCESS);
   }
 }
 
@@ -1519,12 +1504,11 @@ TEST_F(HmxMmU8I4Layer, MoeLayerSplitMatchesWhole) {
     }
     out.assign(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
     return nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, 0u /* silu */, hg.data(),
-      static_cast<int>(hg.size()), hd.data(), static_cast<int>(hd.size()),
-      ri.data(), static_cast<int>(ri.size()), rc.data(),
-      static_cast<int>(rc.size()), rw.data(), static_cast<int>(rw.size()),
-      x.data(), static_cast<int>(x.size()), out.data(),
-      static_cast<int>(out.size()));
+      handle_, M, K, I, N, hg.data(), static_cast<int>(hg.size()), hd.data(),
+      static_cast<int>(hd.size()), ri.data(), static_cast<int>(ri.size()),
+      rc.data(), static_cast<int>(rc.size()), rw.data(),
+      static_cast<int>(rw.size()), x.data(), static_cast<int>(x.size()),
+      out.data(), static_cast<int>(out.size()));
   };
 
   // Reference: each expert through the two calls, scatter-added on the host
@@ -1776,114 +1760,6 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
  *        trust either.
  */
 /**
- * @brief [doc 45 Gate 0] How much weight the DSP can hold resident.
- *
- * The whole-model plan needs every weight of LFM2.5-8B-A1B -- about 4.3 GB
- * at 4 bits -- resident on the DSP at once, because streaming a layer's
- * weights over FastRPC per forward (~180 MB, ~90 ms) would cost more than
- * the layer saves. Registered weights live in the DSP PD's own heap
- * (hexkl_mm_u8i4_dma.c bakes into VTCM and mallocs the resident copy), so
- * the question is whether that heap, and the PD's address space, reach
- * 4.3 GB. Nothing else in the plan matters if this does not, which is why
- * it is a gate and runs before any of it is built.
- *
- * Registers one gate_up-sized weight's bytes over and over -- the DSP
- * copies each into fresh heap, so the host needs only one buffer -- until
- * registration fails, and reports how far it got and why. The cap is
- * comfortably above the target so a device that can hold more still
- * terminates.
- */
-TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
-  const uint32_t K = 2048, N = 3584; // gate_up: the model's largest weight
-  Weight w;
-  MakeAndRegister(K, N, 0xC0FFEEu, w);
-  std::vector<uint32_t> handles = {w.handle};
-
-  const uint32_t k_tiles = K / 32u, n_tiles = N / 32u;
-  const double gb_per = k_tiles * n_tiles * 512.0 / 1e9; // WH bytes
-  const double target_gb = 4.3;
-  const size_t cap = static_cast<size_t>(6.0 / gb_per); // stop past 6 GB
-  int stop_err = AEE_SUCCESS;
-
-  const auto t0 = std::chrono::steady_clock::now();
-  while (handles.size() < cap) {
-    uint32_t h = 0xFFFFFFFFu;
-    const int err = nntr_hvx_weight_register_u8i4(
-      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()), w.d.data(),
-      static_cast<int>(w.d.size()), w.colsum.data(),
-      static_cast<int>(w.colsum.size()), w.bias.data(),
-      static_cast<int>(w.bias.size()), &h);
-    if (err != AEE_SUCCESS) {
-      stop_err = err;
-      break;
-    }
-    handles.push_back(h);
-  }
-  const double secs =
-    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-      .count();
-
-  const double gb = handles.size() * gb_per;
-  std::cout << "U8I4_FIELD path=registry field=weights_resident value="
-            << handles.size() << "\n"
-            << "U8I4_FIELD path=registry field=gb_resident value=" << gb << "\n"
-            << "U8I4_FIELD path=registry field=stop_reason value="
-            << (stop_err == AEE_SUCCESS ? std::string("cap") : hex(stop_err))
-            << "\n"
-            << "U8I4_FIELD path=registry field=register_ms_per_weight value="
-            << (handles.size() > 1 ? secs * 1e3 / (handles.size() - 1) : 0.0)
-            << std::endl;
-
-  // Releasing is only a fair check while the PD can still service a call.
-  // Registration stops here by running the PD out of memory (0x8000040d is
-  // raised before the registration function runs), and a PD in that state
-  // fails every call including this one -- which printed 516 identical
-  // failures and turned the suite red for the ceiling working as measured.
-  // The code they fail with says as much: 0x27, which is neither success nor
-  // the AEE_EBADPARM hexkl_weight_u8i4_release can return, so the call never
-  // reached it. So count them, and assert only in the case where the PD is
-  // healthy: stopping at our own cap means releases have no excuse.
-  size_t released = 0;
-  int first_release_err = AEE_SUCCESS;
-  for (uint32_t h : handles) {
-    const int rerr = nntr_hvx_weight_release_u8i4(handle_, h);
-    if (rerr == AEE_SUCCESS) {
-      ++released;
-    } else if (first_release_err == AEE_SUCCESS) {
-      first_release_err = rerr;
-    }
-  }
-  std::cout << "U8I4_FIELD path=registry field=released value=" << released
-            << " of " << handles.size() << "\n"
-            << "U8I4_FIELD path=registry field=first_release_err value="
-            << (first_release_err == AEE_SUCCESS ? std::string("none")
-                                                 : hex(first_release_err))
-            << std::endl;
-  if (stop_err == AEE_SUCCESS) {
-    EXPECT_EQ(released, handles.size())
-      << "registration stopped at the cap, so the PD was healthy and every "
-         "handle should have released; first error "
-      << hex(first_release_err);
-  }
-
-  // Reports; does not assert a target. It did assert >= 4.3 GB, which was
-  // right while that was an open question and wrong once it was answered:
-  // this path tops out at 1.89 GB on device (doc 45 section 8), the DSP heap
-  // alone reaches 3.75 and ION at least 6 (section 9), and the design moved
-  // the weights into an ION arena because of it. Asserting a target against
-  // a path that is being replaced turns every run red and teaches people to
-  // skim past failures.
-  //
-  // What would be a real regression is this number collapsing -- so that is
-  // what is checked, along with every handle releasing cleanly above.
-  (void)target_gb;
-  EXPECT_GT(handles.size(), 1u)
-    << "no weight registered at all; registration is broken, not merely "
-       "bounded. Stopped with "
-    << (stop_err == AEE_SUCCESS ? std::string("the cap") : hex(stop_err));
-}
-
-/**
  * @brief [doc 45 Gate 0b] Which of the two memory limits stopped Gate 0.
  *
  * Gate 0 registered 1.89 GB of the 4.10 the whole-model plan needs and
@@ -2004,7 +1880,7 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   // Which prot/flags pair the device accepted, and what the rejected ones
   // said -- two bits each, 1 null and 2 MAP_FAILED, in the order the DSP
   // tries them.
-  static const char *kTryName[] = {"none",       "rw|shared", "r|shared",
+  static const char *kTryName[] = {"none",      "rw|shared", "r|shared",
                                    "rw|private", "r|private", "rw|0",
                                    "mmap_get"};
   field("hap_mmap_accepted", res[6] < (sizeof(kTryName) / sizeof(kTryName[0]))
@@ -2519,7 +2395,7 @@ protected:
     auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
       out.assign(static_cast<size_t>(M) * N, 1.0f);
       return nntr_hvx_mm_u8i4_moe_layer(
-        handle_, M, K, I, N, 0u /* silu */, &hg, 1, &hd, 1, row_index.data(),
+        handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
         (int)row_index.size(), row_count.data(), (int)row_count.size(),
         row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
         out.data(), (int)out.size());
@@ -2736,8 +2612,8 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
                  const std::vector<uint32_t> &hd, std::vector<float> &out) {
     out.assign(static_cast<size_t>(M) * N, 1.0f);
     return nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, 0u /* silu */, hg.data(), (int)hg.size(), hd.data(),
-      (int)hd.size(), row_index.data(), (int)row_index.size(), row_count.data(),
+      handle_, M, K, I, N, hg.data(), (int)hg.size(), hd.data(), (int)hd.size(),
+      row_index.data(), (int)row_index.size(), row_count.data(),
       (int)row_count.size(), row_weight.data(), (int)row_weight.size(),
       x.data(), (int)x.size(), out.data(), (int)out.size());
   };
@@ -2855,8 +2731,8 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
       EXPECT_EQ(applied, flags) << "the skel did not keep the bits";
       out.assign(static_cast<size_t>(rt.M) * N, 1.0f);
       return nntr_hvx_mm_u8i4_moe_layer(
-        handle_, rt.M, K, I, N, 0u /* silu */, a_gu.data(), (int)a_gu.size(),
-        a_dn.data(), (int)a_dn.size(), rt.index.data(), (int)rt.index.size(),
+        handle_, rt.M, K, I, N, a_gu.data(), (int)a_gu.size(), a_dn.data(),
+        (int)a_dn.size(), rt.index.data(), (int)rt.index.size(),
         rt.count.data(), (int)rt.count.size(), weight.data(),
         (int)weight.size(), act.data(), (int)act.size(), out.data(),
         (int)out.size());
@@ -2996,8 +2872,8 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
       for (int rep = 0; rep <= kReps; ++rep) {
         std::fill(stage.begin(), stage.end(), 0u);
         ASSERT_EQ(nntr_hvx_mm_u8i4_moe_layer_timed(
-                    handle_, 1, K, c.inter, c.n_out, 0u /* silu */, c.gu.data(),
-                    (int)NE, c.dn.data(), (int)NE, row_index.data(), (int)NE,
+                    handle_, 1, K, c.inter, c.n_out, c.gu.data(), (int)NE,
+                    c.dn.data(), (int)NE, row_index.data(), (int)NE,
                     row_count.data(), (int)NE, row_weight.data(), (int)NE,
                     act.data(), (int)K, out.data(), (int)c.n_out, stage.data(),
                     kMoeStages),

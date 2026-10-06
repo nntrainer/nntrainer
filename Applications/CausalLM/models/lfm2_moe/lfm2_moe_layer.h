@@ -151,25 +151,8 @@ private:
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
-             nntrainer::props::Unit, props::MoEActivation, props::RouterType,
-             props::CacheExperts, props::InNorm, props::RouterNorm,
-             props::OutNorm, nntrainer::props::Epsilon>
+             nntrainer::props::Unit, props::MoEActivation>
     moe_props;
-  /** The block's norms folded into this layer (doc 57 section 5 step 4):
-   *  in_norm norms the input for the experts, router_norm norms it again
-   *  for the router, out_norm norms the output; the gammas are weights in
-   *  the file's order (in, router, ..., out). The output norm rides the
-   *  accelerator call at prefill and runs on the CPU otherwise. */
-  bool in_norm = false, router_norm = false, out_norm = false;
-  unsigned int in_gamma_idx = 0, router_gamma_idx = 0, out_gamma_idx = 0;
-  unsigned int experts_in_idx = 0, router_in_idx = 0; /**< the normed rows */
-  /** props::RouterType "softmax_scale": Gemma-4 routing, and the layer's
-   *  optional second input is what the router reads (Gemma-4 norms the
-   *  residual differently for the router and for the experts). */
-  bool softmax_router;
-  /** props::MoEActivation tanh_gelu (Gemma-4) rather than swish (LFM2):
-   *  the deterministic GeGLU on both the host and the DSP (doc 55). */
-  bool gelu_act;
 
   // weight indices
   std::vector<unsigned int> expert_gate_up_proj_indices;
@@ -207,16 +190,10 @@ private:
     nntrainer::Tensor *activation_output;
   };
 
-  /** @brief act(gate)*up for n elements into dst: swiglu_det or
-   *  geglu_det_one by gelu_act. */
-  void glu(unsigned int n, float *dst, const float *gate,
-           const float *up) const;
-
   /**
    * @brief Build the per-expert token assignments for LFM2 routing.
    * @param router_logits Raw router logits tensor [total_tokens, 1, 1, E]
-   * @param expert_bias Per-expert bias (or, for softmax_scale, scale)
-   *        tensor [1, 1, 1, E]
+   * @param expert_bias Per-expert bias tensor [1, 1, 1, E]
    * @param total_tokens number of tokens routed
    * @param[out] expert_assignments per-expert list of (token index, weight)
    * @param[out] extra_top_k when non-null, every token's top-(k + 5)

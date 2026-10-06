@@ -30,6 +30,7 @@
 #ifndef __NNTRAINER_HVX_SCALAR_STANDIN_H__
 #define __NNTRAINER_HVX_SCALAR_STANDIN_H__
 
+#include <stddef.h>
 #include <stdint.h>
 
 /** @brief One int4 value of a WH weight tile (htp_wh_layout.h's byte
@@ -59,6 +60,11 @@ typedef struct {
   void (*gemv)(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                const uint8_t *wh, uint32_t n_col, uint32_t nt, uint32_t rows1,
                int nopf, int32_t *out);
+  /** A buffer the stand-ins below read (@a write 0) or write (1): the
+   *  GEMV's activation block, the quantizer's rows and row params, the
+   *  pack's output, the dequant's row params and output, the SwiGLU's
+   *  output. moe_layer_host_check.c's dataflow scoreboard (#185). */
+  void (*buf)(const void *p, size_t bytes, int write);
 } hvx_scalar_hooks;
 
 extern hvx_scalar_hooks hvx_scalar_hook;
