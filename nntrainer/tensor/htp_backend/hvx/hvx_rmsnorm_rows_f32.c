@@ -96,3 +96,52 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
   hvx_worker_pool_run(pool, rows_worker, &c, M);
   return 0;
 }
+
+typedef struct {
+  float *out;
+  const float *x, *x2, *gamma;
+  uint32_t M, n;
+  float eps, scale;
+} add_ctx;
+
+static void add_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const add_ctx *c = (const add_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
+  const uint32_t nvec = c->n / LANES;
+  const HVX_Vector vs = hvx_splat_sf(c->scale);
+  for (uint32_t r = lo; r < hi; ++r) {
+    const HVX_UVector *vx = (const HVX_UVector *)(c->x + (size_t)r * c->n);
+    const HVX_UVector *vx2 =
+      c->x2 ? (const HVX_UVector *)(c->x2 + (size_t)r * c->n) : NULL;
+    HVX_UVector *vo = (HVX_UVector *)(c->out + (size_t)r * c->n);
+    /* Pass 1: the sum of squares of the summed addend, as norm_chunk. */
+    HVX_Vector acc = Q6_V_vzero();
+    for (uint32_t k = 0; k < nvec; ++k) {
+      const HVX_Vector a = vx2 ? Q6_Vsf_vadd_VsfVsf(vx[k], vx2[k]) : vx[k];
+      acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(a, a));
+    }
+    const float ss = lanes_sum(Q6_Vsf_equals_Vqf32(acc));
+    const HVX_Vector vr = hvx_splat_sf(1.0f / sqrtf(ss / (float)c->n + c->eps));
+    /* Pass 2: out = scale * (out + a * r * gamma). */
+    const HVX_UVector *vg = (const HVX_UVector *)c->gamma;
+    for (uint32_t k = 0; k < nvec; ++k) {
+      HVX_Vector a = vx2 ? Q6_Vsf_vadd_VsfVsf(vx[k], vx2[k]) : vx[k];
+      a = Q6_Vsf_vmpy_VsfVsf(a, vr);
+      if (vg)
+        a = Q6_Vsf_vmpy_VsfVsf(a, vg[k]);
+      vo[k] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vadd_VsfVsf(vo[k], a), vs);
+    }
+  }
+}
+
+int hvx_rmsnorm_add_f32(float *out, const float *x, const float *x2, uint32_t M,
+                        uint32_t n, const float *gamma, float eps, float scale,
+                        hvx_worker_pool *pool) {
+  if (!out || !x || M == 0u || n == 0u || n % LANES != 0u) {
+    return -1;
+  }
+  add_ctx c = {out, x, x2, gamma, M, n, eps, scale};
+  hvx_worker_pool_run(pool, add_worker, &c, M);
+  return 0;
+}
