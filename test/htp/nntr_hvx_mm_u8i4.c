@@ -30,6 +30,7 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_router_rows_f32.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -1325,6 +1326,40 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
     row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
     s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
+}
+
+int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
+                               uint32 E, float eps, const float *gamma,
+                               int gammaLen, const float *w, int wLen,
+                               const float *x, int xLen, float *logits,
+                               int logitsLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (M == 0u || K == 0u || E == 0u || E % 32u != 0u || E > 128u ||
+      (uint64_t)M * K > 0x7FFFFFFFu || (uint64_t)xLen != (uint64_t)M * K ||
+      (uint64_t)wLen != (uint64_t)K * E ||
+      (uint64_t)logitsLen != (uint64_t)M * E ||
+      (gammaLen != 0 && (uint32)gammaLen != K)) {
+    FARF(ERROR,
+         "router_logits_f32: bad shape (M=%u K=%u E=%u gamma=%d w=%d x=%d "
+         "logits=%d)",
+         (unsigned)M, (unsigned)K, (unsigned)E, gammaLen, wLen, xLen,
+         logitsLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  const float *rows = x;
+  if (gammaLen) {
+    rows = norm_rows_in(s, x, M, K, gamma, eps);
+    if (!rows) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  if (hvx_router_rows_f32(rows, w, logits, M, K, E, s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_norm(

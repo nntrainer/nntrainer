@@ -11,6 +11,7 @@
 #include "hvx_conv_gate_f32.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_router_rows_f32.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -269,4 +270,27 @@ int hexkl_micro_hmx_copy_32b_to_submatrix(uint8_t *b, uint32_t off,
                                           uint32_t N) {
   (void)b, (void)off, (void)dst, (void)rb, (void)nt, (void)m_pad, (void)N;
   abort();
+}
+
+/* The router logits the router_logits_f32 entry runs: plain f32 dots,
+   row by row. The entry's plumbing (the norm, which rows, where the
+   logits land) is what a skel-linking check verifies; the HVX arithmetic
+   is router_rows_host_check's on the lane emulation. */
+int hvx_router_rows_f32(const float *x, const float *w, float *logits,
+                        uint32_t M, uint32_t K, uint32_t E,
+                        hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % 32u != 0u ||
+      E > 128u) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    for (uint32_t e = 0; e < E; ++e) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        acc += x[(size_t)r * K + k] * w[(size_t)k * E + e];
+      logits[(size_t)r * E + e] = acc;
+    }
+  }
+  return 0;
 }
