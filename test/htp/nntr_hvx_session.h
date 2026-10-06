@@ -111,6 +111,10 @@ typedef struct {
                                  graph's FC kinds, freed in close() */
   uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
                        (2 MiB of DSP heap, first use), freed in close() */
+  float *norm_rows;    /**< the pre-normed activation of mm_u8i4_layer_norm /
+                            mm_u8i4_moe_layer_norm (M x K f32, DSP heap,
+                            grown on demand), freed in close() */
+  uint32_t norm_rows_n; /**< floats norm_rows holds */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
                        (nntr_hvx_token.c): the mailbox page and the role;
                        NULL = none. Stopped in close() after the dspq

@@ -10,6 +10,7 @@
 #include "hexkl_probe.h"
 #include "hvx_conv_gate_f32.h"
 #include "hvx_gather_ah_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -100,6 +101,34 @@ void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
                        hvx_worker_pool *pool) {
   (void)pool;
   memcpy(dst, src, (size_t)(k / 32u) * 2048u);
+}
+
+/* The row RMSNorm the *_norm layer entries fold in: plain f32, one row
+   at a time, the kernel's own operation order (sum of squares, sqrtf,
+   scale, gamma). What the checks that link the skel verify is the entry's
+   plumbing -- which rows, which gamma, in place -- not HVX arithmetic,
+   which rmsnorm_rows_host_check covers on the lane emulation. */
+int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                         uint32_t chunk, const float *gamma, float eps,
+                         hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !y || M == 0u || chunk == 0u || chunk % 32u != 0u ||
+      n % chunk != 0u) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    for (uint32_t c = 0; c < n; c += chunk) {
+      const float *xr = x + (size_t)r * n + c;
+      float *yr = y + (size_t)r * n + c;
+      float ss = 0.0f;
+      for (uint32_t j = 0; j < chunk; ++j)
+        ss += xr[j] * xr[j];
+      const float rs = 1.0f / sqrtf(ss / (float)chunk + eps);
+      for (uint32_t j = 0; j < chunk; ++j)
+        yr[j] = xr[j] * rs * (gamma ? gamma[j] : 1.0f);
+    }
+  }
+  return 0;
 }
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
