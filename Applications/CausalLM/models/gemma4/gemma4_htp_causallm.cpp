@@ -16,6 +16,7 @@
 #include <cmath>
 
 #include <app_context.h>
+#include <dense_ffn_layer.h>
 #include <engine.h>
 #include <lfm2_causallm.h>
 #include <lfm2_moe_layer.h>
@@ -23,9 +24,9 @@
 #include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
-#include <dense_ffn_layer.h>
 #include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
+#include <residual_add.h>
 #include <scalar_multiply.h>
 
 namespace causallm {
@@ -414,20 +415,18 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
                               normed, normed, normed);
   }
 
-  std::vector<std::string> post_attn_norm_props = {
+  // input + post_attention_norm(att_out): the norm's gamma lives on the
+  // add, so the two are one accelerator call (doc 57 section 5 step 4).
+  // The layer keeps the norm's name: the weight file's order is unchanged.
+  std::vector<std::string> post_attn_props = {
     withKey("name",
             "layer" + std::to_string(layer_id) + "_post_attention_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(post_attn_norm_props, is_kv_shared_layer);
-  LayerHandle post_attn_norm(createLayer("rms_norm", post_attn_norm_props));
-  Tensor post_normed = post_attn_norm(att_out);
-
-  std::vector<std::string> post_attention_add_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_post_attention")};
-  appendSkipPrefillIfNeeded(post_attention_add_props, is_kv_shared_layer);
-  LayerHandle post_attention_add(
-    createLayer("addition", post_attention_add_props));
-  Tensor post_attention = post_attention_add({input, post_normed});
+    withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
+  appendSkipPrefillIfNeeded(post_attn_props, is_kv_shared_layer);
+  LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
+  Tensor post_attention = post_attention_add({input, att_out});
 
   Tensor pre_ffn = post_attention;
   if (is_kv_shared_layer) {
@@ -441,35 +440,31 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
 
+  // post_attention + post_ffn_norm(ffn [+ moe]), then the layer scalar: one
+  // residual_add, so the sum, the norm, the add and the scalar are one
+  // accelerator call. With a per-layer input the scalar comes after that
+  // path instead and stays its own layer.
+  const bool fold_scalar = HIDDEN_SIZE_PER_LAYER_INPUT == 0;
+  std::vector<Tensor> ffn_terms = {post_attention, ffn_out};
   if (ENABLE_MOE_BLOCK) {
     // Gemma4TextDecoderLayer: norm_1(mlp) + norm_2(experts(norm(residual)))
     // with the router reading its own norm of the residual (doc 55 §6.2;
     // its scale and hidden^-0.5 are folded into that norm's gamma by the
     // converter). norm_1 is the dense layer's out_norm; the MoE layer
     // holds the other three (in_norm, router_norm, out_norm).
-    Tensor moe_out = createMoe(layer_id, post_attention);
-
-    std::vector<std::string> ffn_sum_props = {
-      withKey("name", "layer" + std::to_string(layer_id) + "_ffn_sum")};
-    appendSkipPrefillIfNeeded(ffn_sum_props, is_kv_shared_layer);
-    LayerHandle ffn_sum(createLayer("addition", ffn_sum_props));
-    ffn_out = ffn_sum({ffn_out, moe_out});
+    ffn_terms.push_back(createMoe(layer_id, post_attention));
   }
-
-  std::vector<std::string> post_ffn_norm_props = {
+  std::vector<std::string> post_ffn_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(post_ffn_norm_props, is_kv_shared_layer);
-  LayerHandle post_ffn_norm(createLayer("rms_norm", post_ffn_norm_props));
-  Tensor post_ffn = post_ffn_norm(ffn_out);
+    withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("use_weight", fold_scalar ? "true" : "false"),
+    withKey("engine", engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id))};
+  appendSkipPrefillIfNeeded(post_ffn_props, is_kv_shared_layer);
+  LayerHandle post_ffn_add(createLayer("residual_add", post_ffn_props));
+  Tensor decoder_output_base = post_ffn_add(ffn_terms);
 
-  std::vector<std::string> decoder_output_base_props = {withKey(
-    "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
-  appendSkipPrefillIfNeeded(decoder_output_base_props, is_kv_shared_layer);
-  LayerHandle decoder_output_base_layer(
-    createLayer("addition", decoder_output_base_props));
-  Tensor decoder_output_base =
-    decoder_output_base_layer({post_attention, post_ffn});
+  if (fold_scalar)
+    return decoder_output_base;
 
   std::vector<std::string> layer_scalar_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_layer_scalar"),
@@ -478,9 +473,6 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   };
   appendSkipPrefillIfNeeded(layer_scalar_props, is_kv_shared_layer);
   LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
-
-  if (HIDDEN_SIZE_PER_LAYER_INPUT == 0)
-    return layer_scalar(decoder_output_base);
 
   // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
   // [B, S, num_layers*hidden_size_per_layer_input]
@@ -894,6 +886,7 @@ void Gemma4Transformer::registerCustomLayers() {
   // too; this model's factory may be the only one called)
   tryRegister(nntrainer::createLayer<causallm::QKVLayer>);
   tryRegister(nntrainer::createLayer<causallm::DenseFfnLayer>);
+  tryRegister(nntrainer::createLayer<causallm::ResidualAddLayer>);
   if (ENABLE_MOE_BLOCK)
     tryRegister(nntrainer::createLayer<causallm::Lfm2MoELayer>);
 }
