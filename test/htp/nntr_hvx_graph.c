@@ -142,8 +142,17 @@ static int graph_check_args(const nntr_hvx_session *s, int row_indexLen,
  *  arena, so the call carries offsets only). */
 static int graph_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
                         uint32_t inter, uint32_t N_out, uint32_t arena,
-                        uint32_t off_gu, uint32_t off_dn, uint32_t *h_gu,
-                        uint32_t *h_dn) {
+                        uint32_t off_gu, uint32_t off_dn, const int8_t *pal_gu,
+                        const int8_t *pal_dn, uint32_t *h_gu, uint32_t *h_dn) {
+  if (pal_gu != NULL) { /* [plan 229] QS2CX_WH: the batch entry, n = 1 */
+    uint32_t done = 0;
+    int32_t err = AEE_SUCCESS;
+    const int rc = nntr_hvx_weight_swap_batch_u2i4_arena(
+      (remote_handle64)ctx, K, inter, N_out, &old_gu, 1, &old_dn, 1, &arena, 1,
+      &off_gu, 1, &off_dn, 1, pal_gu, 4, pal_dn, 4, h_gu, 1, h_dn, 1, &done,
+      &err);
+    return rc != AEE_SUCCESS ? rc : done == 1u ? AEE_SUCCESS : (int)err;
+  }
   return nntr_hvx_weight_swap_u8i4_arena(
     (remote_handle64)ctx, old_gu, old_dn, K, inter, N_out, arena, off_gu,
     off_dn, NULL, 0, NULL, 0, NULL, 0, NULL, 0, h_gu, h_dn);

@@ -121,14 +121,16 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
  *        bias zeroed. What an expert swap does when the retired pair has
  *        the new expert's shape -- no allocation, no free, no slot search.
  *        NULL @a w_scale and @a colsum_w take them from the arena after
- *        @a wh, as hexkl_weight_u8i4_register_arena does.
+ *        @a wh, as hexkl_weight_u8i4_register_arena does. A non-NULL
+ *        @a pal makes the slot 2-bit (QS2CX_WH codes at @a wh, the tail
+ *        after whBytes2), NULL makes it 4-bit.
  *
  * @return AEE_SUCCESS, or AEE_EBADPARM (changing nothing) for a free,
  *         owned or differently shaped slot, or an unaligned @a wh.
  */
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
-                                   const float *w_scale,
+                                   const int8_t *pal, const float *w_scale,
                                    const int32_t *colsum_w);
 
 /**

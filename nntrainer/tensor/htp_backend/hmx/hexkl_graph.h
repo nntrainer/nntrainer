@@ -84,14 +84,14 @@ struct hexkl_graph_s;
  *        arena at (@a arena, @a off_gu / @a off_dn) takes over the pair
  *        @a old_gu / @a old_dn (HTP_GRAPH_NO_HANDLE: a fresh pair), whose
  *        numbers come back in @a h_gu / @a h_dn
- *        (nntr_hvx_weight_swap_u8i4_arena).
+ *        (nntr_hvx_weight_swap_u8i4_arena). [plan 229] Non-NULL @a pal_gu /
+ *        @a pal_dn (four int4 codes each) make the pair QS2CX_WH
+ *        (nntr_hvx_weight_swap_batch_u2i4_arena).
  */
-typedef int (*hexkl_graph_rebind_fn)(void *ctx, uint32_t old_gu,
-                                     uint32_t old_dn, uint32_t K,
-                                     uint32_t inter, uint32_t N_out,
-                                     uint32_t arena, uint32_t off_gu,
-                                     uint32_t off_dn, uint32_t *h_gu,
-                                     uint32_t *h_dn);
+typedef int (*hexkl_graph_rebind_fn)(
+  void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K, uint32_t inter,
+  uint32_t N_out, uint32_t arena, uint32_t off_gu, uint32_t off_dn,
+  const int8_t *pal_gu, const int8_t *pal_dn, uint32_t *h_gu, uint32_t *h_dn);
 
 /**
  * @brief [plan 201 S1] The expert pool's miss round, which the token driver

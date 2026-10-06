@@ -419,10 +419,10 @@ static uint32_t pool_handle(uint32_t m, uint32_t slot, int dn) {
 /* The rebind stub: the pair stays (its bytes were rewritten in place). */
 static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t arena,
-                       uint32_t off_gu, uint32_t off_dn, uint32_t *h_gu,
-                       uint32_t *h_dn) {
+                       uint32_t off_gu, uint32_t off_dn, const int8_t *pal_gu,
+                       const int8_t *pal_dn, uint32_t *h_gu, uint32_t *h_dn) {
   (void)ctx, (void)K, (void)inter, (void)N_out, (void)arena, (void)off_gu;
-  (void)off_dn;
+  (void)off_dn, (void)pal_gu, (void)pal_dn;
   if (old_gu == HTP_GRAPH_NO_HANDLE)
     return AEE_EBADPARM;
   *h_gu = old_gu;

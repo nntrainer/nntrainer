@@ -127,6 +127,10 @@ typedef struct {
 typedef struct {
   uint32_t e, old_gu, old_dn, arena, off_gu, off_dn;
   uint32_t h_gu, h_dn;
+  /** [plan 229] 2: QS2CX_WH codes with these palettes; 4 (or 0): QS4CX_WH,
+   *  the palettes unused */
+  uint32_t bits;
+  int8_t pal_gu[4], pal_dn[4];
 } htp_miss_load;
 
 /** @brief The owner -> S1: every expert it evicted (MOE op, expert), then

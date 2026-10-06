@@ -299,7 +299,7 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
 
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
-                                   const float *w_scale,
+                                   const int8_t *pal, const float *w_scale,
                                    const int32_t *colsum_w) {
   hexkl_weight_u8i4 *w;
   if (!tbl || !wh || (!w_scale != !colsum_w) ||
@@ -312,14 +312,20 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
     return AEE_EBADPARM;
   }
   w->wh_bytes = (uint8_t *)wh;
+  /* The width moves with the bytes: a pool slot holds whatever expert the
+     host read into it last. */
+  w->bits = pal ? 2u : 4u;
+  if (pal) {
+    memcpy(w->pal, pal, sizeof(w->pal));
+  }
   if (w_scale) {
     memcpy(w->w_scale, w_scale, sizeof(float) * N);
     memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
     memset(w->bias, 0, sizeof(float) * N);
   } else {
-    hexkl_weight_u8i4_tail_from_arena(w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
-                                           (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
-                                           WEIGHT_TILE_BYTES_U8I4);
+    hexkl_weight_u8i4_tail_from_arena(
+      w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) * (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
+           WEIGHT_TILE_BYTES_U8I4 / (pal ? 2u : 1u));
   }
   return AEE_SUCCESS;
 }

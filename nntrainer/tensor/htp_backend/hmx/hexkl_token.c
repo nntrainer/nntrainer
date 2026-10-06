@@ -184,11 +184,12 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   for (i = 0; rc == AEE_SUCCESS && i < a->n_load; ++i) {
     htp_miss_load *l = &a->load[i];
     uint32_t hg = HTP_GRAPH_NO_HANDLE, hd = HTP_GRAPH_NO_HANDLE;
-    rc =
-      m->env->rebind == NULL
-        ? AEE_EBADSTATE
-        : m->env->rebind(m->env->rebind_ctx, l->old_gu, l->old_dn, o->K, o->N,
-                         o->N_out, l->arena, l->off_gu, l->off_dn, &hg, &hd);
+    rc = m->env->rebind == NULL
+           ? AEE_EBADSTATE
+           : m->env->rebind(m->env->rebind_ctx, l->old_gu, l->old_dn, o->K,
+                            o->N, o->N_out, l->arena, l->off_gu, l->off_dn,
+                            l->bits == 2u ? l->pal_gu : NULL,
+                            l->bits == 2u ? l->pal_dn : NULL, &hg, &hd);
     if (rc == AEE_SUCCESS) {
       rc = hexkl_graph_pool_set(g, op, l->e, hg, hd);
     }
