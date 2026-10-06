@@ -12,6 +12,7 @@
 #include <dense_ffn_layer.h>
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
@@ -23,13 +24,14 @@
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
-enum DenseFfnParams { UP, GATE, DOWN };
-enum DenseFfnTensors { UP_OUT, GATE_OUT, ACT };
+enum DenseFfnParams { UP, GATE, DOWN, IN_GAMMA, OUT_GAMMA };
+enum DenseFfnTensors { UP_OUT, GATE_OUT, ACT, NORMED };
 
 DenseFfnLayer::DenseFfnLayer() :
   LayerImpl(),
   dense_props(nntrainer::props::Unit(), props::GluActivation(),
-              props::GateFirst()) {
+              props::GateFirst(), props::InNorm(), props::OutNorm(),
+              nntrainer::props::Epsilon()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -58,6 +60,8 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
                 std::invalid_argument)
     << "dense_ffn: glu_activation must be swish or tanh_gelu";
   const bool gate_first = std::get<props::GateFirst>(dense_props).get();
+  in_norm = std::get<props::InNorm>(dense_props).get();
+  out_norm = std::get<props::OutNorm>(dense_props).get();
 
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
@@ -78,6 +82,19 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
                             nntrainer::TensorDim::TensorType(
                               context.getFormat(), context.getWeightDataType()),
                             0b0011);
+  // The norms' gammas where the file has them: the input's before the
+  // projections, the output's after them.
+  const nntrainer::TensorDim gamma_dim(
+    1, 1, 1, hidden,
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     nntrainer::TensorDim::DataType::FP32));
+  auto request_gamma = [&](const char *name) {
+    return context.requestWeight(
+      gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, name, true);
+  };
+  if (in_norm)
+    weight_idx[IN_GAMMA] = request_gamma("in_norm_gamma");
   auto request_proj = [&](const char *name) {
     return context.requestWeight(w_up, weight_initializer, weight_regularizer,
                                  weight_regularizer_constant, weight_decay,
@@ -98,6 +115,8 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   weight_idx[DOWN] = context.requestWeight(
     w_down, weight_initializer, weight_regularizer, weight_regularizer_constant,
     weight_decay, "down", true);
+  if (out_norm)
+    weight_idx[OUT_GAMMA] = request_gamma("out_norm_gamma");
 
   // The CPU path's intermediates, sized for the graph's input length and
   // sliced per step below; the fused call never touches them.
@@ -111,6 +130,14 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   tensor_idx[ACT] =
     context.requestTensor(mid, "act", nntrainer::Initializer::NONE, false,
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  // The CPU path's normed rows (the norm kernel is not in place): the
+  // input's before the projections, the output's after them -- one scratch,
+  // since both are hidden wide and never live at once.
+  if (in_norm || out_norm) {
+    tensor_idx[NORMED] = context.requestTensor(
+      out_dim, "normed", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  }
 }
 
 void DenseFfnLayer::exportTo(nntrainer::Exporter &exporter,
@@ -153,6 +180,12 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const unsigned int K = in_step_dim.width();
   const unsigned int inter = up_w.width();
   const unsigned int N = down_w.width();
+  const float epsilon = std::get<nntrainer::props::Epsilon>(dense_props).get();
+  const float *in_gamma =
+    in_norm ? context.getWeight(weight_idx[IN_GAMMA]).getData<float>() : nullptr;
+  const float *out_gamma =
+    out_norm ? context.getWeight(weight_idx[OUT_GAMMA]).getData<float>()
+             : nullptr;
 
   // The whole block as one accelerator call at prefill. Decode's single
   // row stays on the CPU below for the reason every FC gate has
@@ -162,12 +195,29 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   if (rows > 1 && ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&
       up_w.getDataType() == q4 && gate_w.getDataType() == q4 &&
       down_w.getDataType() == q4) {
+    // ... with the input and output norms folded into the same call.
     ops->gemm_q4_0_dense_ffn_fp32(
       up_w.getData<char>(), gate_w.getData<char>(), down_w.getData<char>(),
       in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N,
-      gelu);
+      gelu, in_gamma, out_gamma, epsilon);
     return;
   }
+
+  // The CPU's norms: the kernel is not in place, so they go through the
+  // scratch (and the output norm copies back).
+  auto norm_rows = [&](nntrainer::Tensor &src, unsigned int gamma_idx) {
+    NNTR_THROW_IF(src.getDataType() != ml::train::TensorDim::DataType::FP32,
+                  std::invalid_argument)
+      << "dense_ffn: in_norm / out_norm are FP32 only";
+    nntrainer::Tensor normed = context.getTensor(tensor_idx[NORMED])
+                                 .getSharedDataTensor(out_step_dim, 0, true);
+    nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+      src.getData<float>(), normed.getData<float>(), rows, N, epsilon);
+    normed.multiply_i(context.getWeight(gamma_idx));
+    return normed;
+  };
+  if (in_norm)
+    in_step = norm_rows(in_step, weight_idx[IN_GAMMA]);
 
   // What Transformer::createMlp's three layers computed: up and gate dots,
   // silu(gate) * up (swiglu_det: the bit-identical NEON/scalar form the
@@ -207,6 +257,8 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 
   act.dot(down_w, out_step, false, false);
+  if (out_norm)
+    out_step.copyData(norm_rows(out_step, weight_idx[OUT_GAMMA]));
 }
 
 void DenseFfnLayer::updateTensorsByInputDimensions(
@@ -219,6 +271,8 @@ void DenseFfnLayer::updateTensorsByInputDimensions(
   output_dim.height(input_dimensions[0].height());
   context.updateInput(SINGLE_INOUT_IDX, input_dim);
   context.updateOutput(SINGLE_INOUT_IDX, output_dim);
+  if (in_norm || out_norm)
+    context.updateTensor(tensor_idx[NORMED], output_dim);
 }
 
 } // namespace causallm

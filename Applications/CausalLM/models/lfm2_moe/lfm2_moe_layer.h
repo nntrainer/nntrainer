@@ -152,8 +152,17 @@ private:
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation, props::RouterType,
-             props::CacheExperts>
+             props::CacheExperts, props::InNorm, props::RouterNorm,
+             props::OutNorm, nntrainer::props::Epsilon>
     moe_props;
+  /** The block's norms folded into this layer (doc 57 section 5 step 4):
+   *  in_norm norms the input for the experts, router_norm norms it again
+   *  for the router, out_norm norms the output; the gammas are weights in
+   *  the file's order (in, router, ..., out). The output norm rides the
+   *  accelerator call at prefill and runs on the CPU otherwise. */
+  bool in_norm = false, router_norm = false, out_norm = false;
+  unsigned int in_gamma_idx = 0, router_gamma_idx = 0, out_gamma_idx = 0;
+  unsigned int experts_in_idx = 0, router_in_idx = 0; /**< the normed rows */
   /** props::RouterType "softmax_scale": Gemma-4 routing, and the layer's
    *  optional second input is what the router reads (Gemma-4 norms the
    *  residual differently for the router and for the experts). */

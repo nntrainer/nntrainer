@@ -23,6 +23,7 @@
 #include <array>
 #include <tuple>
 
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -91,11 +92,15 @@ public:
 private:
   /** unit = the intermediate size (the width of up and gate); activation
    *  swish (default) or tanh_gelu; gate_first for the file's weight order */
-  std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst>
+  std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst,
+             props::InNorm, props::OutNorm, nntrainer::props::Epsilon>
     dense_props;
   bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
-  std::array<unsigned int, 3> weight_idx; /**< up, gate, down */
-  std::array<unsigned int, 3> tensor_idx; /**< up_out, gate_out, act */
+  bool in_norm = false, out_norm = false;
+  std::array<unsigned int, 5>
+    weight_idx; /**< up, gate, down, [in_gamma, out_gamma] */
+  std::array<unsigned int, 4>
+    tensor_idx; /**< up_out, gate_out, act, the normed input/output */
 };
 
 } // namespace causallm
