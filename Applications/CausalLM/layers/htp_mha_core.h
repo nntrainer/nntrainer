@@ -36,6 +36,7 @@
 #include <unordered_map>
 
 #include <acti_func.h>
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <compute_ops.h>
 #include <cpu_backend.h>
@@ -100,15 +101,6 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
-/**
- * @brief RopeTheta
- */
-class RopeTheta : public nntrainer::Property<unsigned int> {
-public:
-  RopeTheta(unsigned int value = 500000) { set(value); };
-  static constexpr const char *key = "rope_theta"; /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
-};
 
 /**
  * @brief UseRope property
@@ -164,18 +156,6 @@ public:
 };
 
 /**
- * @brief RopeScalingType
- * - default
- * - yarn
- */
-class RopeScalingType : public nntrainer::Property<std::string> {
-public:
-  RopeScalingType(std::string value = "default") { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_type";                    /**< unique key to access */
-  using prop_tag = nntrainer::str_prop_tag; /**< property type */
-};
-/**
  * @brief RopeScalingFactor
  */
 class RopeScalingFactor : public nntrainer::Property<float> {
@@ -186,16 +166,6 @@ public:
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
-/**
- * @brief RopePartialRotaryFactor
- */
-class RopePartialRotaryFactor : public nntrainer::Property<float> {
-public:
-  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
-  static constexpr const char *key =
-    "rope_partial_rotary_factor";             /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
 
 /**
  * @brief RopeScalingMaxPositionEmbeddings
