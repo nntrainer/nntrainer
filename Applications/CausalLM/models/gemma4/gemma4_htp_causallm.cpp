@@ -176,6 +176,7 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
   }
 
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
+  LMHEAD_ENGINE = nntr_cfg.value("lmhead_engine", std::string("cpu"));
   ATTN_PROJ_HTP_LAYERS =
     parseLayerIdList(nntr_cfg.value("attn_proj_htp_layers", std::string("")));
   FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
@@ -298,6 +299,9 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   for (int i = 0; i < NUM_LAYERS; ++i) {
     h = createTransformerDecoderBlock(i, h);
   }
+
+  if (FOLD_OUTPUT_NORM)
+    return {x, h};
 
   std::vector<std::string> output_norm_props = {
     withKey("name", "output_norm"),
@@ -905,6 +909,9 @@ void Gemma4CausalLM::registerCustomLayers() {
 }
 
 std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
+  // A tied head takes the final norm and softcap (the gamma is read where
+  // the output_norm layer's was, so a model file reads as before).
+  FOLD_OUTPUT_NORM = TIE_WORD_EMBEDDINGS;
   auto [x, h] = Gemma4Transformer::constructModel();
 
   // create lm_head layer (using fully_connected option)
@@ -920,13 +927,19 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   };
   appendSkipPrefillIfNeeded(lmhead_prop, true);
 
-  if (TIE_WORD_EMBEDDINGS)
+  if (TIE_WORD_EMBEDDINGS) {
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+    lmhead_prop.emplace_back(withKey("in_norm", "true"));
+    lmhead_prop.emplace_back(withKey("epsilon", std::to_string(NORM_EPS)));
+    lmhead_prop.emplace_back(withKey(
+      "softcap", std::to_string(std::max(0.0f, FINAL_LOGIT_SOFTCAPPING))));
+    lmhead_prop.emplace_back(withKey("engine", LMHEAD_ENGINE));
+  }
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
   Tensor y = lmhead(h);
 
-  if (FINAL_LOGIT_SOFTCAPPING > 0.0f) {
+  if (!TIE_WORD_EMBEDDINGS && FINAL_LOGIT_SOFTCAPPING > 0.0f) {
     std::vector<std::string> final_softcap_props = {
       withKey("name", "output_of_causallm_softcapped"),
       withKey("activation_type", "tanh"), withKey("apply_rows", "1"),

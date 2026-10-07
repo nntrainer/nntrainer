@@ -81,6 +81,13 @@ protected:
    *  so decode keeps the CPU Q4_0 kernel on the same weight, which the Q4_0
    *  registration path leaves resident. An empty layer list means every
    *  layer. Default "cpu" leaves every existing run unchanged. */
+  /** @brief The tied lm_head takes the final norm and the logit softcap
+   *  (doc 57 section 9.7): constructModel then ends at the last block's
+   *  output and Gemma4CausalLM's lm_head norms it. */
+  bool FOLD_OUTPUT_NORM = false;
+  /** @brief lmhead_engine: "htp" runs the tied lm_head (norm, head,
+   *  softcap) as one NPU call; "cpu" (default) keeps it on the CPU. */
+  std::string LMHEAD_ENGINE = "cpu";
   std::string ATTN_PROJ_ENGINE = "cpu";
   std::set<int> ATTN_PROJ_HTP_LAYERS;
   std::string FFN_ENGINE = "cpu";
