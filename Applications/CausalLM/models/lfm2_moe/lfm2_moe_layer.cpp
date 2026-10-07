@@ -22,7 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <htp_wh_layout.h>
+#include <htp_wh_palette.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -833,24 +833,35 @@ static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
 }
 
 /**
- * @brief One QS4CX_WH weight from the model file, dequantized to f32
- *        row-major [K][N].
+ * @brief One QS4CX_WH or QS2CX_WH weight from the model file, dequantized
+ *        to f32 row-major [K][N].
  *
- * The file holds whBytes(K, N) nibbles, then N f32 scales, then N f32
- * column sums (the kernel's zero-point term, not needed here). A nibble is
- * the value plus 8, unsigned, where whSlot puts it.
+ * The file holds the codes -- whBytes(K, N) int4 nibbles, or whBytes2(K, N)
+ * 2-bit codes followed by the tensor's four-entry palette
+ * (QS2CX_WH_Tensor) -- then N f32 scales, then N f32 column sums (the
+ * kernel's zero-point term, not needed here).
  */
 static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
-                                std::vector<float> &out) {
-  const size_t nibbles = nntrainer::whBytes(K, N);
-  std::vector<uint8_t> packed(nibbles);
+                                unsigned int w_bits, std::vector<float> &out) {
+  const bool two = w_bits == 2u;
+  const size_t codes =
+    two ? nntrainer::whBytes2(K, N) + nntrainer::WH_PALETTE_LEVELS
+        : nntrainer::whBytes(K, N);
+  std::vector<uint8_t> packed(codes);
   std::vector<float> scale(N);
-  if (!moeReadAt(fd, packed.data(), nibbles, off) ||
-      !moeReadAt(fd, scale.data(), N * sizeof(float), off + nibbles)) {
+  if (!moeReadAt(fd, packed.data(), codes, off) ||
+      !moeReadAt(fd, scale.data(), N * sizeof(float), off + codes)) {
     return false;
   }
   std::vector<int8_t> q(static_cast<size_t>(K) * N);
-  nntrainer::whUnpack(packed.data(), K, N, q.data());
+  if (two)
+    nntrainer::whUnpack2(
+      packed.data(), K, N,
+      reinterpret_cast<const int8_t *>(packed.data() + codes -
+                                       nntrainer::WH_PALETTE_LEVELS),
+      q.data());
+  else
+    nntrainer::whUnpack(packed.data(), K, N, q.data());
   out.resize(q.size());
   auto &tm = nntrainer::ThreadManager::Global();
   tm.parallel_for(0, K, [&](size_t k) {
@@ -913,9 +924,9 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
       return;
     }
     if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
-                             w_gu) ||
+                             d.w_bits, w_gu) ||
         !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
-                             w_dn)) {
+                             d.w_bits, w_dn)) {
       std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
                    trace_layer, e);
       return;
