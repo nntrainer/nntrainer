@@ -675,14 +675,18 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
   // [plan 201 S4] any other head_dim when the hook asks for it (3), so a
   // CPU run of such a model keeps no table.
   auto build_rope_table = [&]() {
+    const unsigned int rows =
+      std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
     if (freqs_fp32 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       if (freqs_fp32 == nullptr)
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
+        precompute_freqs(head_dim, rows, theta, false);
     }
-    const unsigned int rows =
-      std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
     const unsigned int half = head_dim / 2;
+    // ponytail: the table is built once, at max_timestep rows. If
+    // resetInputDimension comes back (causal_lm.cpp) and grows max_timestep
+    // after that, this throws and the CPU RoPE below would index past the
+    // vector. Upgrade path: rebuild when cos.size() < max_timestep.
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
@@ -1324,7 +1328,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
 /**
  * @brief rotary embedding-related member function
- * @note seq_len -> max_position_embeddings
+ * @note seq_len is the layer's max_timestep (the KV cache length): no lookup
+ *       reaches a position past it, and row i does not depend on seq_len,
+ *       so a shorter table holds the same floats (#253).
  */
 void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
                                     float theta, bool is_fp16) {
@@ -1548,7 +1554,7 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     if (freqs_fp32 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       if (freqs_fp32 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
+        precompute_freqs(head_dim, max_timestep, theta, false);
       }
     }
     std::vector<float> *cos_ = nullptr;
@@ -1599,7 +1605,7 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     if (freqs_fp16 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       if (freqs_fp16 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, true);
+        precompute_freqs(head_dim, max_timestep, theta, true);
       }
     }
     std::vector<_FP16> *cos_ = nullptr;

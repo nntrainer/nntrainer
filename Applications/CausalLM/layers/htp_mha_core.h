@@ -518,7 +518,8 @@ private:
    * @brief pre_compute frequencies for Rotary Embedding.
    * @note it is expected to be called only once at the finalize.
    * @param[in] head_dim dimension of head
-   * @param[in] seq_len sequence length
+   * @param[in] seq_len table rows: the layer's max_timestep (KV cache
+   *            length), not max_position_embeddings (#253)
    * @param[in] theta base of theta (default = 10000)
    */
   void precompute_freqs(int head_dim, unsigned int seq_len,
