@@ -92,7 +92,67 @@ void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
   *scale = amax / fq;
 }
 
+void hexkl_kv_q_quant_k_row_fixed(const float *x, uint32_t hd, int32_t qmax,
+                                  float inv, int8_t *q, int32_t *colsum) {
+  const float fq = (float)qmax;
+  int32_t sum = 0;
+  for (uint32_t d = 0; d < hd; ++d) {
+    float r = rintf(x[d] * inv);
+    if (r > fq) {
+      r = fq;
+    } else if (r < -fq) {
+      r = -fq;
+    }
+    q[d] = (int8_t)r;
+    sum += (int32_t)r;
+  }
+  *colsum = sum;
+}
+
+void hexkl_kv_q_quant_v_row_fixed(const float *x, uint32_t hd, int32_t qmax,
+                                  const float *inv, int8_t *q) {
+  const float fq = (float)qmax;
+  for (uint32_t d = 0; d < hd; ++d) {
+    float r = rintf(x[d] * inv[d]);
+    if (r > fq) {
+      r = fq;
+    } else if (r < -fq) {
+      r = -fq;
+    }
+    q[d] = (int8_t)r;
+  }
+}
+
+int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
+                                const float *s_k, const float *s_v) {
+  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
+  if (!kv || !s_k || !s_v) {
+    return AEE_EBADPARM;
+  }
+  for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+    if (!(s_k[n] > 0.0f)) {
+      return AEE_EBADPARM;
+    }
+    for (uint32_t d = 0; d < kv->head_dim; ++d) {
+      if (!(s_v[(size_t)n * kv->head_dim + d] > 0.0f)) {
+        return AEE_EBADPARM;
+      }
+    }
+  }
+  memcpy(kv->fs_k, s_k, kv->n_head_kv * sizeof(float));
+  memcpy(kv->fs_v, s_v, (size_t)kv->n_head_kv * kv->head_dim * sizeof(float));
+  for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+    for (uint32_t row = 0; row < kv->max_rows; ++row) {
+      kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = s_k[n];
+    }
+  }
+  kv->fixed = 1;
+  return AEE_SUCCESS;
+}
+
 static void free_slot(hexkl_kv_q *kv) {
+  free(kv->fs_k);
+  free(kv->fs_v);
   free(kv->kt4);
   free(kv->v4);
   free(kv->s_k);
@@ -109,7 +169,7 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
                         uint32_t max_rows, uint32_t n_head_kv,
                         uint32_t head_dim, uint32_t *out_handle) {
   if (!tbl || !out_handle || max_rows == 0 || n_head_kv == 0 || head_dim == 0 ||
-      (head_dim % 32u) != 0 || head_dim > 256u ||
+      (head_dim % 32u) != 0 || head_dim > HEXKL_KV_Q_MAX_HEAD_DIM ||
       (kind != HEXKL_KV_Q8 && kind != HEXKL_KV_Q4)) {
     return AEE_EBADPARM;
   }
@@ -150,8 +210,10 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   kv->v = (uint8_t *)calloc(n_tiles, kv->tile_bytes);
   kv->stage_kt = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
   kv->stage_v = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
+  kv->fs_k = (float *)calloc(n_head_kv, sizeof(float));
+  kv->fs_v = (float *)calloc((size_t)n_head_kv * head_dim, sizeof(float));
   if (!kv->kt4 || !kv->v4 || !kv->s_k || !kv->colsum_k || !kv->s_v || !kv->kt ||
-      !kv->v || !kv->stage_kt || !kv->stage_v) {
+      !kv->v || !kv->stage_kt || !kv->stage_v || !kv->fs_k || !kv->fs_v) {
     free_slot(kv);
     return AEE_ENOMEMORY;
   }
@@ -332,10 +394,11 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
   const uint32_t hd = kv->head_dim;
   const uint32_t stride = kv->n_head_kv * hd;
 #ifndef __hexagon__
-  float x[256];
+  float x[HEXKL_KV_Q_MAX_HEAD_DIM];
 #endif
-  int8_t q[256];
-  int8_t qk_row[256];
+  float inv_v[HEXKL_KV_Q_MAX_HEAD_DIM];
+  int8_t q[HEXKL_KV_Q_MAX_HEAD_DIM];
+  int8_t qk_row[HEXKL_KV_Q_MAX_HEAD_DIM];
   float sv[8];
   int direct = 0;
 #ifdef __hexagon__
@@ -349,13 +412,29 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
     for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
       float sk;
       int32_t cs;
+      if (kv->fixed) {
+        sk = kv->fs_k[n];
+        for (uint32_t d = 0; d < hd; ++d) {
+          inv_v[d] = 1.0f / kv->fs_v[(size_t)n * hd + d];
+        }
+      }
 #ifdef __hexagon__
-      hvx_kv_quant_k_row(krow + (size_t)n * hd, hd, kv->qmax, qk_row, &sk, &cs);
+      if (kv->fixed) {
+        hvx_kv_quant_k_row_fixed(krow + (size_t)n * hd, hd, kv->qmax, 1.0f / sk,
+                                 qk_row, &cs);
+      } else {
+        hvx_kv_quant_k_row(krow + (size_t)n * hd, hd, kv->qmax, qk_row, &sk,
+                           &cs);
+      }
 #else
       for (uint32_t d = 0; d < hd; ++d) {
         x[d] = hexkl_kv_q_hf_to_f32(krow[(size_t)n * hd + d]);
       }
-      hexkl_kv_q_quant_k_row(x, hd, kv->qmax, qk_row, &sk, &cs);
+      if (kv->fixed) {
+        hexkl_kv_q_quant_k_row_fixed(x, hd, kv->qmax, 1.0f / sk, qk_row, &cs);
+      } else {
+        hexkl_kv_q_quant_k_row(x, hd, kv->qmax, qk_row, &sk, &cs);
+      }
 #endif
       kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = sk;
       kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs;
@@ -365,12 +444,22 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
       }
 
 #ifdef __hexagon__
-      hvx_kv_quant_v_row(vrow + (size_t)n * hd, hd, kv->qmax, q, sv);
+      if (kv->fixed) {
+        hvx_kv_quant_v_row_fixed(vrow + (size_t)n * hd, hd, kv->qmax, inv_v, q);
+        sv[0] = 1.0f;
+      } else {
+        hvx_kv_quant_v_row(vrow + (size_t)n * hd, hd, kv->qmax, q, sv);
+      }
 #else
       for (uint32_t d = 0; d < hd; ++d) {
         x[d] = hexkl_kv_q_hf_to_f32(vrow[(size_t)n * hd + d]);
       }
-      hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, sv);
+      if (kv->fixed) {
+        hexkl_kv_q_quant_v_row_fixed(x, hd, kv->qmax, inv_v, q);
+        sv[0] = 1.0f;
+      } else {
+        hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, sv);
+      }
 #endif
       kv->s_v[hexkl_kv_q_sv_index(kv, n, row)] = sv[0];
       for (uint32_t d = 0; d < hd; ++d) {

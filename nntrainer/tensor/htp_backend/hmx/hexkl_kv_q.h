@@ -53,6 +53,8 @@ extern "C" {
 #define HEXKL_KV_Q_MAX 128u
 /** @brief Extra s_v rows after the last head (the largest block size). */
 #define HEXKL_KV_Q_SV_PAD 256u
+/** @brief Largest head_dim: Gemma-4's global layers use 512. */
+#define HEXKL_KV_Q_MAX_HEAD_DIM 512u
 
 /** @brief Weight width of the cache: A8W8 or A8W4 in the FC layers' terms. */
 typedef enum {
@@ -67,7 +69,7 @@ typedef struct {
   uint32_t tile_bytes; /**< WH tile size for this kind */
   uint32_t max_rows;   /**< capacity in cache rows, multiple of 32 */
   uint32_t n_head_kv;
-  uint32_t head_dim;    /**< multiple of 32, at most 256 */
+  uint32_t head_dim;    /**< multiple of 32, at most HEXKL_KV_Q_MAX_HEAD_DIM */
   uint32_t n_col_tiles; /**< max_rows / 32 */
   uint32_t n_dot_tiles; /**< head_dim / 32 */
   uint8_t *kt4;         /**< [n_head_kv][head_dim/4][max_rows][4], q+128 */
@@ -88,6 +90,13 @@ typedef struct {
   uint8_t *v;           /**< V WH tiles, same order */
   int8_t *stage_kt;     /**< [head_dim][32] row-major bake source */
   int8_t *stage_v;      /**< [32][head_dim] row-major bake source */
+  int fixed;            /**< 1: appends quantize with fs_k / fs_v instead
+                             of per-row maxima (hexkl_kv_q_set_fixed_scales).
+                             The row-blocked kernel needs this: K's scale
+                             then sits in the softmax's residual and V's in
+                             the convert unit, neither per cache row */
+  float *fs_k;          /**< [n_head_kv] fixed K scale per head */
+  float *fs_v;          /**< [n_head_kv][head_dim] fixed V scale per dim */
 } hexkl_kv_q;
 
 typedef struct {
@@ -195,6 +204,32 @@ void hexkl_kv_q_quant_k_row(const float *x, uint32_t hd, int32_t qmax,
  */
 void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
                             int8_t *q, float *scale);
+
+/**
+ * @brief K row with a given scale: q = rint(x / scale) clamped, colsum.
+ *
+ * @param inv  1 / scale
+ */
+void hexkl_kv_q_quant_k_row_fixed(const float *x, uint32_t hd, int32_t qmax,
+                                  float inv, int8_t *q, int32_t *colsum);
+
+/**
+ * @brief V row with a given scale per dim: q[d] = rint(x[d] * inv[d])
+ *        clamped.
+ */
+void hexkl_kv_q_quant_v_row_fixed(const float *x, uint32_t hd, int32_t qmax,
+                                  const float *inv, int8_t *q);
+
+/**
+ * @brief Switches a cache to fixed scales: @a s_k [n_head_kv] for K and
+ *        @a s_v [n_head_kv][head_dim] for V, as a quantized model's
+ *        encodings give them (K per head after RoPE, V per head dim). From
+ *        then on appends quantize with them; s_k[row] is set to the head's
+ *        scale so colsum-based readers keep working, s_v[row] stays 1 and
+ *        is not meaningful. Call before the first append.
+ */
+int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
+                                const float *s_k, const float *s_v);
 
 /**
  * @brief Allocates a zeroed cache for up to @a max_rows rows.

@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -279,4 +280,68 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
       0);
     hexkl_kv_q_release(&tbl, h);
   }
+}
+
+/**
+ * Fixed scales (plan 23, R4a): K quantized with one scale per head, V with
+ * one per (head, dim), at the global layer's head_dim of 512. The dump must
+ * be rint(x / scale) clamped, with colsum the sum of what was stored.
+ */
+TEST(HexklKvQ, FixedScalesHeadDim512) {
+  hexkl_kv_q_table tbl{};
+  uint32_t h = 0;
+  const uint32_t n_kv = 2, hd = 512, rows = 70, width = n_kv * hd;
+  ASSERT_EQ(hexkl_kv_q_register(&tbl, HEXKL_KV_Q8, rows, n_kv, hd, &h), 0);
+  auto k = rows_hf(rows, width, 0x61u, 3.0f);
+  auto v = rows_hf(rows, width, 0x62u, 2.0f);
+  std::vector<float> s_k(n_kv), s_v(static_cast<size_t>(n_kv) * hd);
+  for (uint32_t n = 0; n < n_kv; ++n) {
+    s_k[n] = 0.02f + 0.01f * n; // |k| <= 3 -> some clamping at 127
+    for (uint32_t d = 0; d < hd; ++d) {
+      s_v[n * hd + d] = 0.01f + 0.00005f * d;
+    }
+  }
+  // Rejects non-positive scales, accepts proper ones.
+  std::vector<float> bad(s_k);
+  bad[1] = 0.0f;
+  EXPECT_NE(hexkl_kv_q_set_fixed_scales(&tbl, h, bad.data(), s_v.data()), 0);
+  ASSERT_EQ(hexkl_kv_q_set_fixed_scales(&tbl, h, s_k.data(), s_v.data()), 0);
+  ASSERT_EQ(
+    hexkl_kv_q_append(&tbl, h, 0, rows, k.data(), v.data(), nullptr, nullptr),
+    0);
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&tbl, h);
+  ASSERT_NE(kv, nullptr);
+  EXPECT_EQ(kv->fixed, 1);
+
+  std::vector<int8_t> kq(static_cast<size_t>(rows) * width), vq(kq.size());
+  std::vector<float> dsk(static_cast<size_t>(rows) * n_kv);
+  std::vector<int32_t> cs(dsk.size());
+  ASSERT_EQ(hexkl_kv_q_dump(kv, 0, rows, kq.data(), vq.data(), dsk.data(),
+                            cs.data(), nullptr),
+            0);
+  size_t clamped = 0;
+  for (uint32_t r = 0; r < rows; ++r) {
+    for (uint32_t n = 0; n < n_kv; ++n) {
+      int32_t sum = 0;
+      for (uint32_t d = 0; d < hd; ++d) {
+        const size_t at = static_cast<size_t>(r) * width + n * hd + d;
+        // The definition multiplies by the f32 reciprocal, as HVX does.
+        float wk = std::rint(hexkl_kv_q_hf_to_f32(k[at]) * (1.0f / s_k[n]));
+        wk = std::min(127.0f, std::max(-127.0f, wk));
+        clamped += std::fabs(wk) == 127.0f;
+        ASSERT_EQ(kq[at], static_cast<int8_t>(wk))
+          << "k row " << r << " d " << d;
+        sum += kq[at];
+        float wv =
+          std::rint(hexkl_kv_q_hf_to_f32(v[at]) * (1.0f / s_v[n * hd + d]));
+        wv = std::min(127.0f, std::max(-127.0f, wv));
+        ASSERT_EQ(vq[at], static_cast<int8_t>(wv))
+          << "v row " << r << " d " << d;
+      }
+      EXPECT_EQ(cs[r * n_kv + n], sum);
+      EXPECT_EQ(dsk[r * n_kv + n], s_k[n]);
+    }
+  }
+  EXPECT_GT(clamped, 0u) << "the test data should exercise the clamp";
+  EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
 }

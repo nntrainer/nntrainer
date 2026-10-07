@@ -26,7 +26,7 @@
 /**
  * @brief K row of one head: symmetric over @a hd fp16 values -> int8
  *        values in [-qmax, qmax], scale = amax / qmax (1 for an all-zero
- *        row), colsum = sum of the values. hd a multiple of 32, <= 256.
+ *        row), colsum = sum of the values. hd a multiple of 32, <= 512.
  */
 void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
                         int8_t *q, float *scale, int32_t *colsum);
@@ -38,5 +38,14 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
  */
 void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
                         int8_t *q, float *scale);
+
+/** @brief K row at a given scale: q = rne(x * inv) clamped, colsum. */
+void hvx_kv_quant_k_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                              float inv, int8_t *q, int32_t *colsum);
+
+/** @brief V row at a given scale per dim: q[d] = rne(x[d] * inv[d]) clamped.
+ *         @a inv is hd f32, 128-byte aligned or not (loaded unaligned). */
+void hvx_kv_quant_v_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                              const float *inv, int8_t *q);
 
 #endif /* __NNTRAINER_HVX_KV_QUANT_H__ */
