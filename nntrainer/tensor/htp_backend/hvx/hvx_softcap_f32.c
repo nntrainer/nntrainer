@@ -12,13 +12,13 @@
 
 #include "hvx_softcap_f32.h"
 
-#include <math.h>
-
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 
 #include "hvx_convert.h"
 #include "hvx_swiglu_det.h"
+
+#include "swiglu_det.h"
 
 /** @brief f32 lanes per HVX vector at 128B. */
 #define LANES 32u
@@ -49,9 +49,18 @@ int hvx_softcap_f32(float *y, uint32_t n, float cap) {
                          hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e)));
     v[i] = Q6_V_vor_VV(Q6_Vsf_vmpy_VsfVsf(t, vcap), sign);
   }
-  /* ponytail: a scalar tail; the vocabularies here are multiples of 32 */
+  /* The tail is the same specification in scalar form (swiglu_det.h), not
+     tanhf: the DSP image does not provide it. */
+  const float kf = -2.0f / cap;
   for (uint32_t i = nvec * LANES; i < n; ++i) {
-    y[i] = cap * tanhf(y[i] / cap);
+    const float x = y[i];
+    float a = (x < 0.0f ? -x : x) * kf;
+    if (a < -40.0f) {
+      a = -40.0f;
+    }
+    const float e = swiglu_det_exp(a);
+    const float t = (1.0f - e) * swiglu_det_recip(1.0f + e) * cap;
+    y[i] = x < 0.0f ? -t : t;
   }
   return 0;
 }
