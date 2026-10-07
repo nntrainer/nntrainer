@@ -976,6 +976,57 @@ void MHACoreLayer::release_quantized_cache() {
   }
   q_cache_handles.clear();
   q_cache_synced.clear();
+  q2_scales_set.clear();
+}
+
+/**
+ * @brief Scales for the fixed-scale int8 path from the rows at hand: K per
+ *        KV head and V per (KV head, dim) over fp16 cache rows [0, n_rows),
+ *        Q per query head over this step's f32 rows. max / 127, 1 for an
+ *        all-zero tensor.
+ */
+void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
+                                       const uint16_t *v_rows,
+                                       unsigned int n_rows,
+                                       unsigned int kv_stride, const float *q,
+                                       unsigned int q_stride,
+                                       unsigned int n_q) {
+  q2_scale_k.assign(num_heads_KV, 0.0f);
+  q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
+  q2_scale_q.assign(num_heads_Q, 0.0f);
+  for (unsigned int r = 0; r < n_rows; ++r) {
+    const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
+    const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
+    for (unsigned int n = 0; n < num_heads_KV; ++n) {
+      float &sk = q2_scale_k[n];
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        const unsigned int i = n * head_dim + d;
+        sk = std::max(sk, std::fabs(nntrainer::compute_fp16_to_fp32(kr[i])));
+        q2_scale_v[i] = std::max(
+          q2_scale_v[i], std::fabs(nntrainer::compute_fp16_to_fp32(vr[i])));
+      }
+    }
+  }
+  for (unsigned int r = 0; r < n_q; ++r) {
+    const float *qr = q + static_cast<size_t>(r) * q_stride;
+    for (unsigned int h = 0; h < num_heads_Q; ++h) {
+      float &sq = q2_scale_q[h];
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        sq = std::max(sq, std::fabs(qr[h * head_dim + d]));
+      }
+    }
+  }
+  auto finish = [](float &x) { x = x > 0.0f ? x / 127.0f : 1.0f; };
+  for (auto &x : q2_scale_k) {
+    finish(x);
+  }
+  for (auto &x : q2_scale_v) {
+    finish(x);
+  }
+  for (auto &x : q2_scale_q) {
+    finish(x);
+  }
+  q2_calibrated = true;
 }
 
 bool MHACoreLayer::try_quantized_attention(
@@ -1026,9 +1077,18 @@ bool MHACoreLayer::try_quantized_attention(
   if (q_cache_handles.size() <= batch) {
     q_cache_handles.resize(batch + 1, -1);
     q_cache_synced.resize(batch + 1, 0);
+    q2_scales_set.resize(batch + 1, 0);
   }
   int &handle = q_cache_handles[batch];
   unsigned int &synced = q_cache_synced[batch];
+  // int8 with the row-blocked kernel when the backend has it: fixed scales,
+  // no softcap, no sinks, head_dim up to 512.
+  const bool use_q2 = kv_cache_quant_kind == 0 &&
+                      compute_ops_->supports_kv_cache_q2() &&
+                      attn_logit_softcapping <= 0.0f && io.sinks == nullptr;
+  if (!use_q2 && head_dim > 256) {
+    return false;
+  }
   if (handle < 0) {
     handle = compute_ops_->kv_cache_q_register(
       static_cast<unsigned int>(kv_cache_quant_kind), max_rows, num_heads_KV,
@@ -1037,6 +1097,7 @@ bool MHACoreLayer::try_quantized_attention(
       return fail("register");
     }
     synced = 0;
+    q2_scales_set[batch] = 0;
   }
   // Rows past cache_from may have been rewritten (a rewound session, a
   // loaded cache); re-append from the first row that could differ.
@@ -1056,10 +1117,31 @@ bool MHACoreLayer::try_quantized_attention(
     (local_window_size == 0 || local_window_size >= cache_to)
       ? 0u
       : static_cast<unsigned int>(local_window_size);
-  if (!compute_ops_->sdpa_q_kvcache(
-        handle, append_row0, append_rows, width, k_base + off, v_base + off,
-        io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q, num_heads_KV,
-        head_dim, window, attn_logit_softcapping, io.sinks, io.out, q_stride)) {
+  if (use_q2) {
+    if (!q2_calibrated) {
+      // The rows about to be appended are the first this layer sees.
+      calibrate_q2_scales(k_base + off, v_base + off, append_rows, width, io.q,
+                          q_stride, n_q);
+    }
+    if (!q2_scales_set[batch]) {
+      if (!compute_ops_->kv_cache_q_set_fixed_scales(
+            handle, num_heads_KV, head_dim, q2_scale_k.data(),
+            q2_scale_v.data())) {
+        return fail("fixed scales");
+      }
+      q2_scales_set[batch] = 1;
+    }
+    if (!compute_ops_->sdpa_q2_kvcache(
+          handle, append_row0, append_rows, width, k_base + off, v_base + off,
+          io.q, q2_scale_q.data(), q_stride, n_q, cache_from, cache_to,
+          num_heads_Q, num_heads_KV, head_dim, window, io.out, q_stride)) {
+      return fail("attention");
+    }
+  } else if (!compute_ops_->sdpa_q_kvcache(
+               handle, append_row0, append_rows, width, k_base + off,
+               v_base + off, io.q, q_stride, n_q, cache_from, cache_to,
+               num_heads_Q, num_heads_KV, head_dim, window,
+               attn_logit_softcapping, io.sinks, io.out, q_stride)) {
     return fail("attention");
   }
   synced = cache_to;
@@ -1067,8 +1149,9 @@ bool MHACoreLayer::try_quantized_attention(
   if (!accel_logged_) {
     accel_logged_ = true;
     ml_logi("mha_core: attention over the %s quantized KV cache on the "
-            "accelerator",
-            kv_cache_quant_kind == 0 ? "int8" : "int4");
+            "accelerator%s",
+            kv_cache_quant_kind == 0 ? "int8" : "int4",
+            use_q2 ? " (row-blocked, fixed scales)" : "");
   }
   return true;
 }

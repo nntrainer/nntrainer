@@ -394,6 +394,17 @@ private:
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;
+  /**
+   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache) int8
+   *        path's scales: K per KV head, V per (KV head, dim), Q per query
+   *        head. A quantized model supplies these as encodings; this f32
+   *        model stands in for them by calibrating on the first rows it
+   *        sees (max / 127) and keeping them, so later steps pay nothing.
+   *        Values beyond them saturate, as they would under encodings.
+   */
+  std::vector<float> q2_scale_k, q2_scale_v, q2_scale_q;
+  bool q2_calibrated = false;
+  std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
                                    leaves the CPU, for run logs */
 
@@ -415,6 +426,12 @@ private:
 
   /** @brief Releases every quantized-cache handle. */
   void release_quantized_cache();
+
+  /** @brief Fills q2_scale_* from the first rows (see the members). */
+  void calibrate_q2_scales(const uint16_t *k_rows, const uint16_t *v_rows,
+                           unsigned int n_rows, unsigned int kv_stride,
+                           const float *q, unsigned int q_stride,
+                           unsigned int n_q);
 
   /**
    * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the

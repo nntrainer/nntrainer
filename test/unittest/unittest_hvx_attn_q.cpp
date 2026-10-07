@@ -353,10 +353,10 @@ protected:
   }
 };
 
-constexpr int kQ2StatCount = 9;
+constexpr int kQ2StatCount = 12;
 const char *const kQ2StatNames[kQ2StatCount] = {
-  "qprep",    "dma",      "qk",       "softmax", "pv",
-  "epilogue", "us_total", "n_blocks", "kcycles"};
+  "qprep",    "dma",      "qk",      "softmax",  "pv",         "epilogue",
+  "us_total", "n_blocks", "kcycles", "hmx_wait", "head_setup", "submit"};
 
 /**
  * @brief The row-blocked kernel (plan 23, R4) over a fixed-scale cache
@@ -422,11 +422,27 @@ protected:
                                static_cast<int>((s.cache_to - split) * width));
     ASSERT_EQ(err, AEE_SUCCESS) << "kv_append_q failed: " << hex(err);
 
+    // Per-head Q scales as a quantized model's encodings would give them.
+    std::vector<float> q_scale(s.n_head_q, 0.0f);
+    for (uint32_t r = 0; r < s.n_q; ++r) {
+      for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+        for (uint32_t d = 0; d < s.head_dim; ++d) {
+          q_scale[hh] = std::max(
+            q_scale[hh],
+            std::fabs(
+              q[(static_cast<size_t>(r) * s.n_head_q + hh) * s.head_dim + d]));
+        }
+      }
+    }
+    for (auto &x : q_scale) {
+      x = x > 0.0f ? x / 127.0f : 1.0f;
+    }
     std::vector<float> got(q_elems, 0.0f);
     std::vector<uint32_t> stats(kQ2StatCount, 0);
     err = nntr_hvx_attn_q2_prefill(
       handle_, h, s.n_q, s.cache_from, s.cache_to, s.n_head_q, s.window,
-      q.data(), static_cast<int>(q.size()), got.data(),
+      q.data(), static_cast<int>(q.size()), q_scale.data(),
+      static_cast<int>(q_scale.size()), got.data(),
       static_cast<int>(got.size()), stats.data(), kQ2StatCount);
     EXPECT_EQ(nntr_hvx_kv_release_q(handle_, h), AEE_SUCCESS);
     ASSERT_EQ(err, AEE_SUCCESS) << "attn_q2_prefill failed: " << hex(err);
@@ -909,12 +925,12 @@ TEST_F(HvxAttnQ, SoftmaxQMatchesReferenceBitExact) {
     std::vector<int32_t> rs_ref(HVX_SOFTMAX_Q_ROWSUM_WORDS, -1),
       rs_dsp(HVX_SOFTMAX_Q_ROWSUM_WORDS, -2);
     hvx_softmax_q_ref(&b, s.data(), corr.data(), p_ref.data(), rs_ref.data());
-    std::vector<uint32_t> st(1, 0);
+    std::vector<uint32_t> st(5, 0);
     const int err = nntr_hvx_probe_softmax_q(
       handle_, c.ct, c.col0, c.n_cols, c.row0, c.n_rows, c.window, rho, F,
       s.data(), static_cast<int>(s.size()), corr.data(),
       static_cast<int>(corr.size()), p_dsp.data(), static_cast<int>(n),
-      rs_dsp.data(), static_cast<int>(rs_dsp.size()), st.data(), 1);
+      rs_dsp.data(), static_cast<int>(rs_dsp.size()), st.data(), 5);
     ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
     size_t bad = 0, shown = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -940,6 +956,31 @@ TEST_F(HvxAttnQ, SoftmaxQMatchesReferenceBitExact) {
     EXPECT_EQ(bad, 0u) << "P' differs from the reference";
     EXPECT_EQ(bad_rs, 0u) << "row sums differ from the reference";
   }
+}
+
+TEST_F(HvxAttnQ, ReportHvxRate) {
+  std::vector<uint32_t> st(12, 0);
+  const int err = nntr_hvx_probe_hvx_rate(handle_, 100000, st.data(), 12);
+  ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
+  std::cout << "ATTN_Q_FIELD field=hvx_rate cycles_per_vadd=" << st[0]
+            << " cycles_per_vmpy_q15=" << st[1]
+            << " cycles_per_exp2_chain=" << st[2]
+            << " cycles_per_vtcm_load=" << st[3] << " stream_load_use=" << st[4]
+            << " stream_load_ahead=" << st[5] << " pass1_stride4k=" << st[6]
+            << " pass1_stride128=" << st[7] << " pass2_wmajor=" << st[8]
+            << " pass2_tilemajor=" << st[9] << " pass2_padded=" << st[10]
+            << " pass1_padded=" << st[11] << "\n";
+}
+
+TEST_F(HvxAttnQ, ReportWhI8Permutation) {
+  std::vector<uint16_t> pos(1024, 0);
+  const int err = nntr_hvx_probe_wh_i8_pos(handle_, pos.data(), 1024);
+  ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
+  std::cout << "ATTN_Q_FIELD field=wh_i8_pos";
+  for (uint32_t i = 0; i < 1024; ++i) {
+    std::cout << (i ? "," : " ") << pos[i];
+  }
+  std::cout << "\n";
 }
 
 TEST_F(HvxAttnQ, Int8CacheMatchesHostAndMultiplies) {
