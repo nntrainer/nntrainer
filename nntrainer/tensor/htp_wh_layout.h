@@ -100,6 +100,31 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
 }
 
 /**
+ * @brief Inverse of whPack: one sign-extended int4 per int8, K x N row-major.
+ *
+ * Bit-exact by construction (whPack of the result is @a wh again), which is
+ * what lets a WH weight that cannot stay in the arena go to the DSP heap
+ * through weight_register_u8i4 -- the DSP bakes the row-major values back
+ * into the same tiles -- without a second quantization.
+ */
+inline void whUnpack(const uint8_t *wh, uint32_t K, uint32_t N, int8_t *rm) {
+  const uint32_t k_tiles = K / WH_TILE, n_tiles = N / WH_TILE;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+      const uint8_t *tile = wh + ((size_t)kt * n_tiles + nt) * WH_TILE_BYTES;
+      for (uint32_t r = 0; r < WH_TILE; ++r) {
+        int8_t *row = rm + (size_t)(kt * WH_TILE + r) * N + nt * WH_TILE;
+        for (uint32_t c = 0; c < WH_TILE; ++c) {
+          const uint32_t sl = whSlot(r, c);
+          const int v = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0F;
+          row[c] = static_cast<int8_t>(v >= 8 ? v - 16 : v);
+        }
+      }
+    }
+  }
+}
+
+/**
  * @brief The whole pages of [src, src + len) -- what the arena copy can hand
  *        back to the OS once a weight's bytes are in the arena.
  *

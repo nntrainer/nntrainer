@@ -76,6 +76,17 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
   std::snprintf(what, sizeof what, "%s half the bytes", label);
   check(two.size() * 2 == four.size(), what);
 
+  /* The host readers (NNTR_MOE_DIFF's reference) give back the codes the
+     packers were handed: whUnpack at four bits, whUnpack2 at two. */
+  std::vector<int8_t> rm_back(rm.size(), 0x7F);
+  nntrainer::whUnpack(four.data(), K, N, rm_back.data());
+  std::snprintf(what, sizeof what, "%s whUnpack == source", label);
+  check(rm_back == rm, what);
+  std::fill(rm_back.begin(), rm_back.end(), int8_t{0x7F});
+  nntrainer::whUnpack2(two.data(), K, N, pal, rm_back.data());
+  std::snprintf(what, sizeof what, "%s whUnpack2 == source", label);
+  check(rm_back == rm, what);
+
   std::vector<uint8_t> back(nntrainer::whBytes(K, N), 0xAA);
   hvx_expand_i2i4(two.data(), static_cast<uint32_t>(two.size()), table.data(),
                   back.data());

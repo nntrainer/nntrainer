@@ -246,9 +246,10 @@ inline size_t whBytes2(uint32_t K, uint32_t N) {
  *            the check that catches it.
  * @param out whBytes2(K, N) bytes, zeroed by this function
  *
- * The inverse lives in the kernel, not here: hvx_expand_i2i4.c owns the
- * expansion for both the DSP and the host, so there is one definition of
- * what a code means. expand_i2i4_host_check ties the two together.
+ * The kernel's inverse is hvx_expand_i2i4 (codes -> whPack bytes, on the
+ * DSP and as its scalar twin on the host); whUnpack2 below is the host
+ * reader's (codes -> row-major int4). Both use whCodeByte2/whCodeShift2,
+ * and expand_i2i4_host_check round-trips each against this packer.
  */
 inline void whPack2(const int8_t *rm, uint32_t K, uint32_t N,
                     const int8_t pal[WH_PALETTE_LEVELS], uint8_t *out) {
@@ -273,6 +274,32 @@ inline void whPack2(const int8_t *rm, uint32_t K, uint32_t N,
           }
           tile[whCodeByte2(sl)] |=
             static_cast<uint8_t>(code << whCodeShift2(sl));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief whPack2's inverse: 2-bit WH codes back to one int4 code per int8,
+ *        K rows of N, row stride N
+ *
+ * whUnpack for QS2CX_WH: a host reference (NNTR_MOE_DIFF) reads the codes
+ * the file holds and names them through the tensor's palette, without the
+ * DSP. Same K, N contract as whPack2.
+ */
+inline void whUnpack2(const uint8_t *codes, uint32_t K, uint32_t N,
+                      const int8_t pal[WH_PALETTE_LEVELS], int8_t *rm) {
+  const uint32_t k_tiles = K / WH_TILE, n_tiles = N / WH_TILE;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+      const uint8_t *tile =
+        codes + ((size_t)kt * n_tiles + nt) * WH_TILE2_BYTES;
+      for (uint32_t r = 0; r < WH_TILE; ++r) {
+        int8_t *row = rm + (size_t)(kt * WH_TILE + r) * N + nt * WH_TILE;
+        for (uint32_t c = 0; c < WH_TILE; ++c) {
+          const uint32_t sl = whSlot(r, c);
+          row[c] = pal[(tile[whCodeByte2(sl)] >> whCodeShift2(sl)) & 3u];
         }
       }
     }
