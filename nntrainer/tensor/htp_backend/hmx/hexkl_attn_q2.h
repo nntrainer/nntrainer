@@ -19,11 +19,12 @@
  *   4. epilogue: int16 * s_v[d] / rowsum[r] -> f32 rows in DDR
  *
  * Q is quantized here, symmetric per query head (one scale for all rows of
- * the call), stored offset-binary; the zero-point term 128 * colsum_k is a
- * per-column int16 constant the softmax subtracts. The cache must be in
- * fixed-scale mode (hexkl_kv_q_set_fixed_scales): K's scale joins Q's in
- * the softmax's residual factor, V's per-dim scale is applied in the
- * epilogue. Logits are scaled by 1/sqrt(head_dim) as MHACoreLayer does.
+ * the call, given by the caller or measured), stored offset-binary; the
+ * zero-point term 128 * colsum_k is a per-column int16 constant the softmax
+ * subtracts. The cache must be in fixed-scale mode
+ * (hexkl_kv_q_set_fixed_scales): K's scale joins Q's in the softmax's residual
+ * factor, V's per-dim scale is applied in the epilogue. Logits are scaled by
+ * 1/sqrt(head_dim) as MHACoreLayer does.
  */
 
 #ifndef __NNTRAINER_HEXKL_ATTN_Q2_H__
@@ -38,19 +39,32 @@
 typedef struct {
   const float *q; /**< [n_q][q_stride] f32, head h at column h*hd */
   uint32_t q_stride;
-  float *out; /**< [n_q][out_stride] f32 */
+  const float *q_scale; /**< [n_head_q] Q quantization scale per head (a
+                             quantized model's encoding, or max|q|/127 as
+                             the caller measured it), or NULL to have the
+                             kernel measure it, which costs a pass over Q */
+  float *out;           /**< [n_q][out_stride] f32 */
   uint32_t out_stride;
   const hexkl_kv_q *kv; /**< fixed-scale int8 cache, >= cache_to rows */
 } hexkl_attn_q2_io;
 
-/** @brief On-DSP wall time per stage, microseconds, summed over the call. */
+/**
+ * @brief On-DSP time per stage, microseconds, summed over the call. The
+ *        worker stages (qprep, softmax, epi) are summed over the blocks as
+ *        the workers measured them and overlap each other and the HMX
+ *        stages; us_wait is what the HMX thread spent waiting for them,
+ *        i.e. the exposed HVX time.
+ */
 typedef struct {
-  uint64_t us_qprep;   /**< Q amax, quantization, tiles */
-  uint64_t us_dma;     /**< resident K^T / V tiles incl. the drain, corr */
+  uint64_t us_qprep;   /**< Q amax, quantization, tiles (workers) */
+  uint64_t us_dma;     /**< exposed DMA: drains the HMX thread waited on */
   uint64_t us_qk;      /**< HMX Q.K^T incl. converts and zips */
-  uint64_t us_softmax; /**< hvx_softmax_q */
+  uint64_t us_softmax; /**< hvx_softmax_q (workers) */
   uint64_t us_pv;      /**< HMX P'.V incl. converts and zips */
-  uint64_t us_epi;     /**< int16 -> f32 rows in DDR */
+  uint64_t us_epi;     /**< int16 -> f32 rows in DDR (workers) */
+  uint64_t us_wait;    /**< HMX thread waiting for the workers */
+  uint64_t us_head;    /**< per-head constants (HMX thread) */
+  uint64_t us_submit;  /**< handing jobs to the pool (HMX thread) */
   uint64_t us_total;
   uint64_t pcycles;
   uint32_t n_blocks; /**< (q head, row block) pairs run */
@@ -59,8 +73,9 @@ typedef struct {
 /**
  * @brief Runs causal (optionally windowed) attention for one step.
  *
- * Requires the HMX lock. @a pool is accepted for the threaded version and
- * ignored for now. @a st may be NULL.
+ * Requires the HMX lock. The calling thread runs the HMX stages; @a pool's
+ * workers run the rest (NULL or an empty pool runs everything inline).
+ * @a st may be NULL.
  *
  * @return AEE_SUCCESS, AEE_EBADPARM, AEE_ENOMEMORY
  */

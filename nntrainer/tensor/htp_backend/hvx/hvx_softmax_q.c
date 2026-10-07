@@ -42,8 +42,7 @@ int hvx_softmax_q_scale(float alpha, uint32_t frac_bits, int *k,
   return 0;
 }
 
-/* vmpy(Vh,Vh):<<1:rnd:sat and its scalar twin: (a*b*2 + 2^15) >> 16, saturated.
- */
+/** vmpy(Vh,Vh):<<1:rnd:sat as a scalar: (a*b*2 + 2^15) >> 16, saturated. */
 static inline int32_t q15_mul(int32_t a, int32_t b) {
   const int32_t v = (int32_t)(((int64_t)a * b * 2 + 32768) >> 16);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
@@ -144,6 +143,7 @@ void hvx_softmax_q_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
 
 #if defined(__hexagon__)
 
+#include <HAP_perf.h>
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 
@@ -234,14 +234,22 @@ static inline HVX_Vector exp2_q(HVX_Vector t, int rho_pair, int F,
   return Q6_Vh_vasr_VhVh(T, sh);
 }
 
+/**
+ * Loop order. Pass 1 runs one row-pair vector v over every tile with the
+ * running max in a register; pass 2 runs one 4-row group w over every
+ * tile with the two max vectors and the row-sum accumulator in registers,
+ * two tiles per iteration so the two exp2 chains overlap in the pipeline.
+ * The per-tile correction vectors are staged once in scratch.
+ */
 void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                    const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum,
                    void *scratch) {
   const uint32_t ct = b->n_col_tiles;
   const int F = b->frac_bits;
   const int rho_pair = ((int)b->rho_q15 << 16) | (int)b->rho_q15;
-  HVX_Vector *M = (HVX_Vector *)scratch;             /* [32] running max */
+  HVX_Vector *M = (HVX_Vector *)scratch;             /* [32] row max    */
   HVX_Vector *RS = (HVX_Vector *)scratch + 32;       /* [16] row sums   */
+  HVX_Vector *CV = (HVX_Vector *)scratch + 48;       /* [ct] corrections */
   const HVX_Vector *S = (const HVX_Vector *)s_tiles; /* [ct][32]        */
   HVX_Vector *P = (HVX_Vector *)p_tiles;             /* [ct][16]        */
 
@@ -252,39 +260,52 @@ void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
   const HVX_Vector rowbase = Q6_V_vmux_QVV(qlow, Q6_Vh_vsplat_R((int)b->row0),
                                            Q6_Vh_vsplat_R((int)b->row0 + 1));
 
-  uint8_t cls[256];
+  uint8_t cls[HVX_SOFTMAX_Q_MAX_TILES];
   for (uint32_t c = 0; c < ct; ++c) {
     cls[c] = (uint8_t)tile_class(b, c);
+    CV[c] = corr ? corr_vec(corr, c, qlow) : Q6_V_vzero();
   }
 
-  /* Pass 1: row max of the corrected, masked scores. */
-  for (uint32_t v = 0; v < 32u; ++v) {
-    M[v] = vmin;
-  }
-  for (uint32_t c = 0; c < ct; ++c) {
-    if (cls[c] == TILE_MASKED) {
-      continue;
-    }
-    const HVX_Vector cv = corr ? corr_vec(corr, c, qlow) : Q6_V_vzero();
-    const HVX_Vector *Sc = S + 32u * c;
-    if (cls[c] == TILE_FULL) {
-      for (uint32_t v = 0; v < 32u; ++v) {
-        M[v] = Q6_Vh_vmax_VhVh(M[v], Q6_Vh_vsub_VhVh(Sc[v], cv));
+  /** Pass 1: row max of the corrected, masked scores, four row-pair
+   * vectors per sweep over the tiles so the branches and the 4 KiB stride
+   * are paid once per four vectors. */
+  for (uint32_t v = 0; v < 32u; v += 4u) {
+    HVX_Vector m0 = vmin, m1 = vmin, m2 = vmin, m3 = vmin;
+    const HVX_Vector rowv0 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v));
+    const HVX_Vector rowv1 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v + 2));
+    const HVX_Vector rowv2 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v + 4));
+    const HVX_Vector rowv3 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v + 6));
+    for (uint32_t c = 0; c < ct; ++c) {
+      if (cls[c] == TILE_MASKED) {
+        continue;
       }
-    } else {
-      const HVX_Vector colv =
-        Q6_Vh_vadd_VhVh(colbase, Q6_Vh_vsplat_R(32 * (int)c));
-      for (uint32_t v = 0; v < 32u; ++v) {
-        const HVX_Vector rowv =
-          Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v));
-        const HVX_Vector s = Q6_Vh_vsub_VhVh(Sc[v], cv);
-        M[v] =
-          Q6_Vh_vmax_VhVh(M[v], Q6_V_vmux_QVV(mask_q(b, rowv, colv), vmin, s));
+      const HVX_Vector *Sc = S + 32u * c + v;
+      const HVX_Vector cv = CV[c];
+      HVX_Vector s0 = Q6_Vh_vsub_VhVh(Sc[0], cv);
+      HVX_Vector s1 = Q6_Vh_vsub_VhVh(Sc[1], cv);
+      HVX_Vector s2 = Q6_Vh_vsub_VhVh(Sc[2], cv);
+      HVX_Vector s3 = Q6_Vh_vsub_VhVh(Sc[3], cv);
+      if (cls[c] == TILE_PARTIAL) {
+        const HVX_Vector colv =
+          Q6_Vh_vadd_VhVh(colbase, Q6_Vh_vsplat_R(32 * (int)c));
+        s0 = Q6_V_vmux_QVV(mask_q(b, rowv0, colv), vmin, s0);
+        s1 = Q6_V_vmux_QVV(mask_q(b, rowv1, colv), vmin, s1);
+        s2 = Q6_V_vmux_QVV(mask_q(b, rowv2, colv), vmin, s2);
+        s3 = Q6_V_vmux_QVV(mask_q(b, rowv3, colv), vmin, s3);
       }
+      m0 = Q6_Vh_vmax_VhVh(m0, s0);
+      m1 = Q6_Vh_vmax_VhVh(m1, s1);
+      m2 = Q6_Vh_vmax_VhVh(m2, s2);
+      m3 = Q6_Vh_vmax_VhVh(m3, s3);
     }
-  }
-  for (uint32_t v = 0; v < 32u; ++v) {
-    M[v] = rowmax_bcast(M[v], qlow);
+    M[v] = rowmax_bcast(m0, qlow);
+    M[v + 1u] = rowmax_bcast(m1, qlow);
+    M[v + 2u] = rowmax_bcast(m2, qlow);
+    M[v + 3u] = rowmax_bcast(m3, qlow);
   }
 
   /* Pass 2: P' and row sums. */
@@ -295,40 +316,95 @@ void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
   const HVX_Vector v5 = Q6_Vh_vsplat_R(5);
   const HVX_Vector v15 = Q6_Vh_vsplat_R(15);
   const HVX_Vector one = Q6_Vh_vsplat_R(1);
+  const HVX_Vector zero = Q6_V_vzero();
+  /* One full tile for the 4-row group w: t -> q -> P' as 128 uint8. */
+#define SMX_TILE_FULL(Sc, cv, out_p8)                                          \
+  do {                                                                         \
+    const HVX_Vector t0_ =                                                     \
+      Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh((Sc)[v0], (cv)), m0);                \
+    const HVX_Vector t1_ =                                                     \
+      Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh((Sc)[v0 + 1u], (cv)), m1);           \
+    const HVX_Vector q0_ =                                                     \
+      exp2_q(t0_, rho_pair, F, fmask, vA, vB, v16384, v5, v15);                \
+    const HVX_Vector q1_ =                                                     \
+      exp2_q(t1_, rho_pair, F, fmask, vA, vB, v16384, v5, v15);                \
+    (out_p8) =                                                                 \
+      Q6_Vub_vpack_VhVh_sat(Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q1_, one), 1),      \
+                            Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0_, one), 1));     \
+  } while (0)
+
   for (uint32_t w = 0; w < 16u; ++w) {
-    RS[w] = Q6_V_vzero();
-  }
-  for (uint32_t c = 0; c < ct; ++c) {
-    HVX_Vector *Pc = P + 16u * c;
-    if (cls[c] == TILE_MASKED) {
-      for (uint32_t w = 0; w < 16u; ++w) {
-        Pc[w] = Q6_V_vzero();
+    const uint32_t v0 = 2u * w;
+    const HVX_Vector m0 = M[v0], m1 = M[v0 + 1u];
+    const HVX_Vector rowv0 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v0));
+    const HVX_Vector rowv1 =
+      Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v0 + 2));
+    HVX_Vector rs = zero;
+    uint32_t c = 0;
+    while (c < ct) {
+      /* Four full tiles: eight independent exp2 chains in flight. */
+      if (c + 4u <= ct && cls[c] == TILE_FULL && cls[c + 1u] == TILE_FULL &&
+          cls[c + 2u] == TILE_FULL && cls[c + 3u] == TILE_FULL) {
+        const HVX_Vector *Sa = S + 32u * c;
+        HVX_Vector pa, pb, pc, pd;
+        SMX_TILE_FULL(Sa, CV[c], pa);
+        SMX_TILE_FULL(Sa + 32u, CV[c + 1u], pb);
+        SMX_TILE_FULL(Sa + 64u, CV[c + 2u], pc);
+        SMX_TILE_FULL(Sa + 96u, CV[c + 3u], pd);
+        P[16u * c + w] = pa;
+        P[16u * (c + 1u) + w] = pb;
+        P[16u * (c + 2u) + w] = pc;
+        P[16u * (c + 3u) + w] = pd;
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pa, 0x01010101u);
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pb, 0x01010101u);
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pc, 0x01010101u);
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pd, 0x01010101u);
+        c += 4u;
+        continue;
       }
-      continue;
-    }
-    const HVX_Vector cv = corr ? corr_vec(corr, c, qlow) : Q6_V_vzero();
-    const HVX_Vector *Sc = S + 32u * c;
-    const HVX_Vector colv =
-      Q6_Vh_vadd_VhVh(colbase, Q6_Vh_vsplat_R(32 * (int)c));
-    for (uint32_t w = 0; w < 16u; ++w) {
-      HVX_Vector q[2];
-      for (uint32_t h = 0; h < 2u; ++h) {
-        const uint32_t v = 2u * w + h;
-        HVX_Vector t = Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(Sc[v], cv), M[v]);
-        if (cls[c] == TILE_PARTIAL) {
-          const HVX_Vector rowv =
-            Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(2 * (int)v));
-          t = Q6_V_vmux_QVV(mask_q(b, rowv, colv), vmin, t);
-        }
-        HVX_Vector qq = exp2_q(t, rho_pair, F, fmask, vA, vB, v16384, v5, v15);
-        q[h] = Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(qq, one), 1);
+      if (c + 2u <= ct && cls[c] == TILE_FULL && cls[c + 1u] == TILE_FULL) {
+        const HVX_Vector *Sa = S + 32u * c;
+        HVX_Vector pa, pb;
+        SMX_TILE_FULL(Sa, CV[c], pa);
+        SMX_TILE_FULL(Sa + 32u, CV[c + 1u], pb);
+        P[16u * c + w] = pa;
+        P[16u * (c + 1u) + w] = pb;
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pa, 0x01010101u);
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, pb, 0x01010101u);
+        c += 2u;
+        continue;
       }
-      /* Rows 4w..4w+3 as 128 uint8, saturating 256 -> 255. */
-      const HVX_Vector p8 = Q6_Vub_vpack_VhVh_sat(q[1], q[0]);
-      Pc[w] = p8;
-      RS[w] = Q6_Vuw_vrmpyacc_VuwVubRub(RS[w], p8, 0x01010101u);
+      if (cls[c] == TILE_MASKED) {
+        P[16u * c + w] = zero;
+        ++c;
+        continue;
+      }
+      /* One tile, full or partial. */
+      const HVX_Vector *Sc = S + 32u * c;
+      const HVX_Vector cv = CV[c];
+      HVX_Vector t0 = Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(Sc[v0], cv), m0);
+      HVX_Vector t1 = Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(Sc[v0 + 1u], cv), m1);
+      if (cls[c] == TILE_PARTIAL) {
+        const HVX_Vector colv =
+          Q6_Vh_vadd_VhVh(colbase, Q6_Vh_vsplat_R(32 * (int)c));
+        t0 = Q6_V_vmux_QVV(mask_q(b, rowv0, colv), vmin, t0);
+        t1 = Q6_V_vmux_QVV(mask_q(b, rowv1, colv), vmin, t1);
+      }
+      const HVX_Vector q0 =
+        exp2_q(t0, rho_pair, F, fmask, vA, vB, v16384, v5, v15);
+      const HVX_Vector q1 =
+        exp2_q(t1, rho_pair, F, fmask, vA, vB, v16384, v5, v15);
+      const HVX_Vector p8 =
+        Q6_Vub_vpack_VhVh_sat(Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q1, one), 1),
+                              Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0, one), 1));
+      P[16u * c + w] = p8;
+      rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, p8, 0x01010101u);
+      ++c;
     }
+    RS[w] = rs;
   }
+#undef SMX_TILE_FULL
   /* Lane 8k of RS[w] <- sum of lanes 8k..8k+7: row 4w + k. */
   HVX_Vector *out = (HVX_Vector *)rowsum;
   for (uint32_t w = 0; w < 16u; ++w) {
@@ -338,6 +414,258 @@ void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
     r = Q6_Vw_vadd_VwVw(r, Q6_V_vror_VR(r, 16));
     out[w] = r;
   }
+}
+
+void hvx_softmax_q_rate(uint32_t n, void *vtcm, void *vtcm_big,
+                        uint32_t out[12]) {
+  HVX_Vector *mem = (HVX_Vector *)vtcm;
+  HVX_Vector a0 = Q6_Vh_vsplat_R(1), a1 = Q6_Vh_vsplat_R(2),
+             a2 = Q6_Vh_vsplat_R(3), a3 = Q6_Vh_vsplat_R(4),
+             a4 = Q6_Vh_vsplat_R(5), a5 = Q6_Vh_vsplat_R(6),
+             a6 = Q6_Vh_vsplat_R(7), a7 = Q6_Vh_vsplat_R(8);
+  const HVX_Vector k = Q6_Vh_vsplat_R(3);
+  for (uint32_t i = 0; i < 8u; ++i) {
+    mem[i] = Q6_Vh_vsplat_R((int)i - 300);
+  }
+  /* 8 independent vadd chains. */
+  uint64_t c0 = HAP_perf_get_pcycles();
+  for (uint32_t i = 0; i < n; ++i) {
+    a0 = Q6_Vh_vadd_VhVh(a0, k);
+    a1 = Q6_Vh_vadd_VhVh(a1, k);
+    a2 = Q6_Vh_vadd_VhVh(a2, k);
+    a3 = Q6_Vh_vadd_VhVh(a3, k);
+    a4 = Q6_Vh_vadd_VhVh(a4, k);
+    a5 = Q6_Vh_vadd_VhVh(a5, k);
+    a6 = Q6_Vh_vadd_VhVh(a6, k);
+    a7 = Q6_Vh_vadd_VhVh(a7, k);
+  }
+  uint64_t c1 = HAP_perf_get_pcycles();
+  mem[8] = Q6_Vh_vadd_VhVh(
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a0, a1), Q6_Vh_vadd_VhVh(a2, a3)),
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a4, a5), Q6_Vh_vadd_VhVh(a6, a7)));
+  out[0] = (uint32_t)((c1 - c0) / (8u * (uint64_t)n));
+
+  /* 8 independent Q15 multiply chains. */
+  const HVX_Vector km = Q6_Vh_vsplat_R(30000);
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t i = 0; i < n; ++i) {
+    a0 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a0, km);
+    a1 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a1, km);
+    a2 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a2, km);
+    a3 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a3, km);
+    a4 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a4, km);
+    a5 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a5, km);
+    a6 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a6, km);
+    a7 = Q6_Vh_vmpy_VhVh_s1_rnd_sat(a7, km);
+  }
+  c1 = HAP_perf_get_pcycles();
+  mem[9] = Q6_Vh_vadd_VhVh(
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a0, a1), Q6_Vh_vadd_VhVh(a2, a3)),
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a4, a5), Q6_Vh_vadd_VhVh(a6, a7)));
+  out[1] = (uint32_t)((c1 - c0) / (8u * (uint64_t)n));
+
+  /* 4 independent exp2 chains, as pass 2 runs them. */
+  const HVX_Vector fmask = Q6_Vh_vsplat_R(255),
+                   vA = Q6_Vh_vsplat_R(HVX_SOFTMAX_Q_EXP2_A),
+                   vB = Q6_Vh_vsplat_R(HVX_SOFTMAX_Q_EXP2_B),
+                   v16384 = Q6_Vh_vsplat_R(16384), v5 = Q6_Vh_vsplat_R(5),
+                   v15 = Q6_Vh_vsplat_R(15);
+  const int rho = (30000 << 16) | 30000;
+  HVX_Vector t0 = mem[0], t1 = mem[1], t2 = mem[2], t3 = mem[3];
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t i = 0; i < n; ++i) {
+    t0 = Q6_Vh_vsub_VhVh(exp2_q(t0, rho, 8, fmask, vA, vB, v16384, v5, v15), k);
+    t1 = Q6_Vh_vsub_VhVh(exp2_q(t1, rho, 8, fmask, vA, vB, v16384, v5, v15), k);
+    t2 = Q6_Vh_vsub_VhVh(exp2_q(t2, rho, 8, fmask, vA, vB, v16384, v5, v15), k);
+    t3 = Q6_Vh_vsub_VhVh(exp2_q(t3, rho, 8, fmask, vA, vB, v16384, v5, v15), k);
+  }
+  c1 = HAP_perf_get_pcycles();
+  mem[10] = Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(t0, t1), Q6_Vh_vadd_VhVh(t2, t3));
+  out[2] = (uint32_t)((c1 - c0) / (4u * (uint64_t)n));
+
+  /* 8 VTCM loads per iteration, accumulated. */
+  a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = Q6_V_vzero();
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t i = 0; i < n; ++i) {
+    a0 = Q6_Vh_vadd_VhVh(a0, mem[0]);
+    a1 = Q6_Vh_vadd_VhVh(a1, mem[1]);
+    a2 = Q6_Vh_vadd_VhVh(a2, mem[2]);
+    a3 = Q6_Vh_vadd_VhVh(a3, mem[3]);
+    a4 = Q6_Vh_vadd_VhVh(a4, mem[4]);
+    a5 = Q6_Vh_vadd_VhVh(a5, mem[5]);
+    a6 = Q6_Vh_vadd_VhVh(a6, mem[6]);
+    a7 = Q6_Vh_vadd_VhVh(a7, mem[7]);
+    mem[11] = a0; /* keep the loads from being hoisted */
+  }
+  c1 = HAP_perf_get_pcycles();
+  mem[12] = Q6_Vh_vadd_VhVh(
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a0, a1), Q6_Vh_vadd_VhVh(a2, a3)),
+    Q6_Vh_vadd_VhVh(Q6_Vh_vadd_VhVh(a4, a5), Q6_Vh_vadd_VhVh(a6, a7)));
+  out[3] = (uint32_t)((c1 - c0) / (8u * (uint64_t)n));
+
+  /* Streaming over 512 KiB (4096 vectors): each load consumed at once. */
+  const HVX_Vector *big = (const HVX_Vector *)vtcm_big;
+  const uint32_t nb = 4096u;
+  const uint32_t reps = n / 64u + 1u;
+  a0 = Q6_V_vzero();
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t i = 0; i < nb; ++i) {
+      a0 = Q6_Vh_vmax_VhVh(a0, Q6_Vh_vsub_VhVh(big[i], k));
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  mem[13] = a0;
+  out[4] = (uint32_t)((c1 - c0) / ((uint64_t)nb * reps));
+
+  /* The same, loads issued one iteration ahead. */
+  a0 = Q6_V_vzero();
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    HVX_Vector nxt = big[0];
+    for (uint32_t i = 0; i + 1u < nb; ++i) {
+      const HVX_Vector curv = nxt;
+      nxt = big[i + 1u];
+      a0 = Q6_Vh_vmax_VhVh(a0, Q6_Vh_vsub_VhVh(curv, k));
+    }
+    a0 = Q6_Vh_vmax_VhVh(a0, Q6_Vh_vsub_VhVh(nxt, k));
+  }
+  c1 = HAP_perf_get_pcycles();
+  mem[14] = a0;
+  out[5] = (uint32_t)((c1 - c0) / ((uint64_t)nb * reps));
+
+  /** Pass-1 pattern: for each of 32 row-pair vectors, walk 128 tiles at a
+   * 4 KiB stride, subtract a per-tile vector, running max. No class
+   * checks. 4096 vector visits per rep. */
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t v = 0; v < 32u; ++v) {
+      HVX_Vector m = Q6_Vh_vsplat_R(-32768);
+      for (uint32_t c = 0; c < 128u; ++c) {
+        m = Q6_Vh_vmax_VhVh(m, Q6_Vh_vsub_VhVh(big[32u * c + v], mem[c & 7u]));
+      }
+      mem[16u + (v & 7u)] = m;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[6] = (uint32_t)((c1 - c0) / ((uint64_t)nb * reps));
+
+  /* The same visits in tile-major order (stride 128 B). */
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t c = 0; c < 128u; ++c) {
+      HVX_Vector m = Q6_Vh_vsplat_R(-32768);
+      const HVX_Vector cv = mem[c & 7u];
+      for (uint32_t v = 0; v < 32u; ++v) {
+        m = Q6_Vh_vmax_VhVh(m, Q6_Vh_vsub_VhVh(big[32u * c + v], cv));
+      }
+      mem[16u + (c & 7u)] = m;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[7] = (uint32_t)((c1 - c0) / ((uint64_t)nb * reps));
+
+  /** Pass-2 body, two row-pair vectors per visit, over 64 tiles (the P'
+   * store goes to the upper half of the region): w-major, 4 KiB stride. */
+  HVX_Vector *pst = (HVX_Vector *)vtcm_big + 2048u;
+  const uint32_t nt = 64u;
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t w = 0; w < 16u; ++w) {
+      const HVX_Vector m0 = mem[w & 7u], m1 = mem[(w + 1u) & 7u];
+      HVX_Vector rs = Q6_V_vzero();
+      for (uint32_t c = 0; c < nt; ++c) {
+        const HVX_Vector cv = mem[c & 7u];
+        const HVX_Vector t0 =
+          Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(big[32u * c + 2u * w], cv), m0);
+        const HVX_Vector t1 = Q6_Vh_vsub_VhVh_sat(
+          Q6_Vh_vsub_VhVh(big[32u * c + 2u * w + 1u], cv), m1);
+        const HVX_Vector q0 =
+          exp2_q(t0, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector q1 =
+          exp2_q(t1, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector p8 =
+          Q6_Vub_vpack_VhVh_sat(Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q1, k), 1),
+                                Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0, k), 1));
+        pst[16u * c + w] = p8;
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, p8, 0x01010101u);
+      }
+      mem[24u + (w & 7u)] = rs;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[8] = (uint32_t)((c1 - c0) / ((uint64_t)nt * 32u * reps));
+
+  /* The same body, tile-major (stride 128 B loads, 128 B stores). */
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t c = 0; c < nt; ++c) {
+      const HVX_Vector cv = mem[c & 7u];
+      HVX_Vector rs = Q6_V_vzero();
+      for (uint32_t w = 0; w < 16u; ++w) {
+        const HVX_Vector m0 = mem[w & 7u], m1 = mem[(w + 1u) & 7u];
+        const HVX_Vector t0 =
+          Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(big[32u * c + 2u * w], cv), m0);
+        const HVX_Vector t1 = Q6_Vh_vsub_VhVh_sat(
+          Q6_Vh_vsub_VhVh(big[32u * c + 2u * w + 1u], cv), m1);
+        const HVX_Vector q0 =
+          exp2_q(t0, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector q1 =
+          exp2_q(t1, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector p8 =
+          Q6_Vub_vpack_VhVh_sat(Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q1, k), 1),
+                                Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0, k), 1));
+        pst[16u * c + w] = p8;
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, p8, 0x01010101u);
+      }
+      mem[24u + (c & 7u)] = rs;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[9] = (uint32_t)((c1 - c0) / ((uint64_t)nt * 32u * reps));
+
+  /** w-major again with padded tile strides: 33 vectors between score
+   * tiles, 17 between P' tiles, so consecutive tiles change VTCM bank. */
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t w = 0; w < 16u; ++w) {
+      const HVX_Vector m0 = mem[w & 7u], m1 = mem[(w + 1u) & 7u];
+      HVX_Vector rs = Q6_V_vzero();
+      for (uint32_t c = 0; c < nt; ++c) {
+        const HVX_Vector cv = mem[c & 7u];
+        const HVX_Vector t0 =
+          Q6_Vh_vsub_VhVh_sat(Q6_Vh_vsub_VhVh(big[33u * c + 2u * w], cv), m0);
+        const HVX_Vector t1 = Q6_Vh_vsub_VhVh_sat(
+          Q6_Vh_vsub_VhVh(big[33u * c + 2u * w + 1u], cv), m1);
+        const HVX_Vector q0 =
+          exp2_q(t0, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector q1 =
+          exp2_q(t1, rho, 8, fmask, vA, vB, v16384, v5, v15);
+        const HVX_Vector p8 =
+          Q6_Vub_vpack_VhVh_sat(Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q1, k), 1),
+                                Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0, k), 1));
+        pst[17u * c + w] = p8;
+        rs = Q6_Vuw_vrmpyacc_VuwVubRub(rs, p8, 0x01010101u);
+      }
+      mem[24u + (w & 7u)] = rs;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[10] = (uint32_t)((c1 - c0) / ((uint64_t)nt * 32u * reps));
+
+  /* Pass-1 pattern at the padded stride. */
+  c0 = HAP_perf_get_pcycles();
+  for (uint32_t r = 0; r < reps; ++r) {
+    for (uint32_t v = 0; v < 32u; ++v) {
+      HVX_Vector m = Q6_Vh_vsplat_R(-32768);
+      for (uint32_t c = 0; c < 120u; ++c) {
+        m = Q6_Vh_vmax_VhVh(m, Q6_Vh_vsub_VhVh(big[33u * c + v], mem[c & 7u]));
+      }
+      mem[16u + (v & 7u)] = m;
+    }
+  }
+  c1 = HAP_perf_get_pcycles();
+  out[11] = (uint32_t)((c1 - c0) / ((uint64_t)120u * 32u * reps));
 }
 
 #endif /* __hexagon__ */

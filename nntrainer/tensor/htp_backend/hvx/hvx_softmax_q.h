@@ -89,9 +89,11 @@ static inline uint32_t hvx_softmax_q_rowsum_index(uint32_t r) {
   return (r >> 2) * 32u + (r & 3u) * 8u;
 }
 
-/** @brief Bytes of VTCM scratch hvx_softmax_q needs: the 32 running-max
- *         vectors and the 16 row-sum accumulators. */
-#define HVX_SOFTMAX_Q_SCRATCH_BYTES (48u * 128u)
+/** @brief Bytes of VTCM scratch hvx_softmax_q needs: the 32 row-max
+ *         vectors, the 16 row-sum accumulators and up to 128 staged
+ *         per-tile correction vectors. */
+#define HVX_SOFTMAX_Q_MAX_TILES 128u
+#define HVX_SOFTMAX_Q_SCRATCH_BYTES ((48u + HVX_SOFTMAX_Q_MAX_TILES) * 128u)
 
 /** @brief Geometry and scale of one block. */
 typedef struct {
@@ -134,6 +136,12 @@ void hvx_softmax_q_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                        const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum);
 
 #if defined(__hexagon__)
+/** @brief Micro-benchmark of the HVX primitives the softmax uses: cycles
+ *         per vadd, per Q15 vmpy, per exp2 chain, per VTCM vector load,
+ *         over @a n iterations. @a vtcm is 1 KiB of VTCM. */
+void hvx_softmax_q_rate(uint32_t n, void *vtcm, void *vtcm_big,
+                        uint32_t out[12]);
+
 /**
  * @brief The HVX implementation. All buffers in VTCM, 128-byte aligned;
  *        @a scratch is HVX_SOFTMAX_Q_SCRATCH_BYTES. Bit-exact with
