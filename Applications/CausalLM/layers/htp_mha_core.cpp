@@ -377,6 +377,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                              : (unsigned int)query.height();
   unsigned int from = cache_index;
   unsigned int to = cache_index + step_size;
+  // [#253] the cache and the RoPE table are max_timestep rows
+  NNTR_THROW_IF(to >
+                  std::get<nntrainer::props::MaxTimestep>(mha_core_props).get(),
+                std::invalid_argument)
+    << "mha_core: step [" << from << ", " << to << ") past max_timestep";
 
   auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -683,10 +688,11 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
         precompute_freqs(head_dim, rows, theta, false);
     }
     const unsigned int half = head_dim / 2;
-    // ponytail: the table is built once, at max_timestep rows. If
-    // resetInputDimension comes back (causal_lm.cpp) and grows max_timestep
-    // after that, this throws and the CPU RoPE below would index past the
-    // vector. Upgrade path: rebuild when cos.size() < max_timestep.
+    // ponytail: htp_rope_table_ is built once, at the max_timestep of the
+    // first decode row, like the DSP graph's KV cache; a later
+    // updateTensorsByInputDimensions that grows max_timestep rebuilds the
+    // CPU tables but not this one. Upgrade path: clear it there and
+    // re-bind the graph at the new length.
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
@@ -1328,9 +1334,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
 /**
  * @brief rotary embedding-related member function
- * @note seq_len is the layer's max_timestep (the KV cache length): no lookup
- *       reaches a position past it, and row i does not depend on seq_len,
- *       so a shorter table holds the same floats (#253).
+ * @note seq_len is the layer's max_timestep (the KV cache length): both
+ *       forwarding paths throw on a step past it, and row i does not depend
+ *       on seq_len, so a shorter table holds the same floats (#253).
  */
 void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
                                     float theta, bool is_fp16) {
@@ -1982,6 +1988,11 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   max_position_embeddings =
     std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
   max_timestep = height + max_new_tokens;
+  // [#253] the RoPE tables are max_timestep rows; rebuild them lazily
+  freqs_fp32 = nullptr;
+#ifdef ENABLE_FP16
+  freqs_fp16 = nullptr;
+#endif
 
   ml::train::TensorDim kv_dim = input_dimensions[0];
   kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));
