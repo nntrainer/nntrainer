@@ -441,6 +441,10 @@ static inline HVX_Vector Q6_Vhf_equals_Wqf32(HVX_VectorPair w) {
 HVX_EMU_QF_BINOP(Q6_Vqf32_vmpy_VsfVsf, *)
 HVX_EMU_QF_BINOP(Q6_Vqf32_vadd_VsfVsf, +)
 HVX_EMU_QF_BINOP(Q6_Vqf32_vsub_VsfVsf, -)
+HVX_EMU_QF_BINOP(Q6_Vqf32_vsub_Vqf32Vqf32, -)
+HVX_EMU_QF_BINOP(Q6_Vqf32_vmpy_Vqf32Vqf32, *)
+HVX_EMU_QF_BINOP(Q6_Vqf32_vadd_Vqf32Vsf, +)
+HVX_EMU_QF_BINOP(Q6_Vqf32_vsub_Vqf32Vsf, -)
 #undef HVX_EMU_QF_BINOP
 
 static inline HVX_Vector Q6_Vsf_equals_Vqf32(HVX_Vector a) { return a; }

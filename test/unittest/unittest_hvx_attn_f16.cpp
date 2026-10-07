@@ -311,6 +311,15 @@ TEST_F(HmxAttnF16, PrefillFromEmptyCacheGqaMultiBlock) {
   RunShape({128, 0, 128, 16, 4, 128, 0, 16, 64}, 40.0);
 }
 
+TEST_F(HmxAttnF16, PrefillWideHeadsTwoKvHeads) {
+  // 16 query heads over 2 KV heads at hd 512 (G=8, br=8 -> g_br=64): the
+  // dot loop chains 16 tiles into one accumulator and the landing rows are
+  // 1 KiB. And the hd 256 / G=2 shape with a window, as a sliding layer
+  // of the same model runs it.
+  RunShape({64, 0, 64, 16, 2, 512, 0, 8, 32}, 40.0);
+  RunShape({96, 0, 96, 16, 8, 256, 64, 32, 32}, 40.0);
+}
+
 TEST_F(HmxAttnF16, PrefillAppendedToExistingCacheMha) {
   // MHA (G=1), appended after 200 cached rows: fully visible blocks first,
   // then the diagonal region; br=32 fills a tile exactly.
