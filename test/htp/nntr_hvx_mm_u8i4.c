@@ -1384,7 +1384,8 @@ static int check_conv_block_args(const nntr_hvx_session *s, uint32 M, uint32 K,
     FARF(ERROR, "conv_block: h_in has %d handles, want 3 (a, b, c)", h_inLen);
     return AEE_EBADPARM;
   }
-  if ((uint32_t)conv_wLen != 3 * C) {
+  /* [#225] 5 x C: the taps, then the history rows of a prefill chunk */
+  if ((uint32_t)conv_wLen != 3 * C && (uint32_t)conv_wLen != 5 * C) {
     FARF(ERROR, "conv_block: bad conv_wLen %d (C=%u)", conv_wLen, (unsigned)C);
     return AEE_EBADPARM;
   }
@@ -1418,10 +1419,11 @@ int nntr_hvx_mm_u8i4_conv_block(remote_handle64 handle, uint32 M, uint32 K,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  return hexkl_conv_block_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                              s->config_off, M, K, C, N_out, h_in[0], h_in[1],
-                              h_in[2], h_out, conv_w, act_f32, out_f32,
-                              state_f32, s->quant_pool, &s->moe_scratch);
+  return hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
 }
 
 int nntr_hvx_mm_u8i4_conv_block_timed(
@@ -1444,10 +1446,11 @@ int nntr_hvx_mm_u8i4_conv_block_timed(
   }
   hexkl_probe_reset(1);
   t0 = hexkl_probe_now();
-  rc = hexkl_conv_block_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                            s->config_off, M, K, C, N_out, h_in[0], h_in[1],
-                            h_in[2], h_out, conv_w, act_f32, out_f32, state_f32,
-                            s->quant_pool, &s->moe_scratch);
+  rc = hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
   moe_fill_stage_us(stage_us, (uint32)(t1 - t0));

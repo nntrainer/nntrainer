@@ -121,6 +121,62 @@ int main(void) {
     fail |= (rc != AEE_ENOMEMORY);
   }
 
+  /* [#236] The chunker's shape: the qkv projection at P1024 (M = 1024,
+     K = 2048, N 2048 / 512 / 512) as one call vs two 512-row calls whose
+     per-handle blocks land at m0 * N[i] of each handle's whole block, as
+     gemm_q4_0_batch_fp32's dsts put them -- byte-equal, because every row's
+     quantization and epilogue are its own. The mutant (the second chunk
+     reading the first chunk's rows) must differ, so the compare can fail. */
+  {
+    const uint32_t CM = 1024, CK = 2048, CS = 512;
+    const uint32_t CN[3] = {2048, 512, 512};
+    const uint32_t ch[3] = {3, 4, 5};
+    W cw[3];
+    size_t cn = 0;
+    for (uint32_t i = 0; i < 3; ++i) {
+      make_weight(ch[i], CK, CN[i], &cw[i]);
+      cn += (size_t)CM * CN[i];
+    }
+    float *cx = (float *)malloc(sizeof(float) * CM * CK);
+    for (size_t i = 0; i < (size_t)CM * CK; ++i)
+      cx[i] = rndf();
+    float *whole = (float *)malloc(sizeof(float) * cn);
+    float *chunk = (float *)malloc(sizeof(float) * cn);
+    float *part = (float *)malloc(sizeof(float) * (cn / (CM / CS)));
+    int r = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, CM,
+                                    CK, ch, 3, cx, whole, NULL);
+    int same = 0, mutant_same = 1;
+    for (int mut = 0; mut < 2 && r == 0; ++mut) {
+      for (uint32_t m0 = 0; m0 < CM && r == 0; m0 += CS) {
+        const uint32_t src = mut ? 0 : m0;
+        r =
+          hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, CS,
+                                  CK, ch, 3, cx + (size_t)src * CK, part, NULL);
+        size_t off = 0, poff = 0;
+        for (uint32_t i = 0; i < 3; ++i) {
+          memcpy(chunk + off + (size_t)m0 * CN[i], part + poff,
+                 sizeof(float) * CS * CN[i]);
+          off += (size_t)CM * CN[i];
+          poff += (size_t)CS * CN[i];
+        }
+      }
+      const int eq = r == 0 && !memcmp(chunk, whole, sizeof(float) * cn);
+      if (mut)
+        mutant_same = eq;
+      else
+        same = eq;
+    }
+    printf("chunked 512+512   : %s\n",
+           same ? "FC LAYER CHUNKED BIT-IDENTICAL" : "DIFFERS");
+    printf("mutant (rows 0..) : %s\n",
+           mutant_same ? "SAME (compare is blind)" : "differs, as it must");
+    fail |= !same | mutant_same;
+    free(cx);
+    free(whole);
+    free(chunk);
+    free(part);
+  }
+
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
   return fail;
 }

@@ -125,6 +125,67 @@ inline void whUnpack(const uint8_t *wh, uint32_t K, uint32_t N, int8_t *rm) {
 }
 
 /**
+ * @brief The FC WH sidecar (#225): the Q4_0 model's FC weights quantized a
+ *        second time, from the same f32, as QS4CX_WH images, so the HTP
+ *        prefill reads them into the arena instead of re-quantizing the
+ *        Q4_0 bytes at load.
+ *
+ * File: FCWH_MAGIC, uint32 version (FCWH_VERSION), uint32 count, count
+ * FcWhEntry, zero padding to 4 KiB, then the images back to back, each a
+ * QS4CX_WH tensor as nntr_quantize_stream writes it: whBytes(K, N) of
+ * nibbles, N f32 scales, N f32 column sums. Little-endian, as written.
+ * The packer writes nntr_config.json's fc_wh_format = FCWH_FORMAT; a
+ * change to any of this bumps both.
+ */
+constexpr char FCWH_MAGIC[8] = {'N', 'N', 'T', 'R', 'F', 'C', 'W', 'H'};
+constexpr uint32_t FCWH_VERSION = 1u;
+constexpr const char *FCWH_FORMAT = "QS4CX_WH/1";
+
+/** @brief One sidecar index entry. */
+struct FcWhEntry {
+  char name[64];   /**< the packer's tensor name, NUL-padded */
+  uint32_t K, N;   /**< the weight as the matmul sees it, [K x N] */
+  uint64_t key;    /**< fcWhKey of the weight's Q4_0 bytes in the main file */
+  uint64_t q4_off; /**< where those Q4_0 bytes start in the main file */
+  uint64_t off;    /**< where the image starts in this file */
+  uint64_t bytes;  /**< the image's length */
+};
+static_assert(sizeof(FcWhEntry) == 104, "FcWhEntry is a file layout");
+
+/** @brief Byte offset of the first image: the index rounded up to 4 KiB. */
+inline uint64_t fcWhHeaderBytes(uint32_t count) {
+  const uint64_t raw = 16u + static_cast<uint64_t>(count) * sizeof(FcWhEntry);
+  return (raw + 4095u) & ~uint64_t(4095u);
+}
+
+/**
+ * @brief Names a Q4_0 weight by its bytes: FNV-1a 64 over the length and
+ *        the first and last 4 KiB.
+ *
+ * The loader finds a weight's image by this, with no layer or tensor names
+ * to agree on between the packer's walk and the four graph forms that hold
+ * an FC (fully_connected, qkv_layer, conv_block, dense_ffn), and a main
+ * file re-quantized without its sidecar misses every entry instead of
+ * loading another weight's image.
+ * ponytail: 8 KiB of a weight, not all of it -- enough to tell 66 weights
+ * and two quantizations apart; hashing all 255 MiB would cost the load
+ * ~0.1 s for no case this misses.
+ */
+inline uint64_t fcWhKey(const void *q4_0, size_t len) {
+  const uint8_t *p = static_cast<const uint8_t *>(q4_0);
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint8_t b) { h = (h ^ b) * 1099511628211ull; };
+  for (int i = 0; i < 8; ++i)
+    mix(static_cast<uint8_t>(static_cast<uint64_t>(len) >> (8 * i)));
+  const size_t head = len < 4096u ? len : 4096u;
+  for (size_t i = 0; i < head; ++i)
+    mix(p[i]);
+  for (size_t i = len - (len < 4096u ? len : 4096u); i < len; ++i)
+    mix(p[i]);
+  return h;
+}
+
+/**
  * @brief The whole pages of [src, src + len) -- what the arena copy can hand
  *        back to the OS once a weight's bytes are in the arena.
  *
