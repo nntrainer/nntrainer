@@ -192,8 +192,8 @@ static void decode_unit(const dec_ctx *c, uint32_t q, uint32_t h) {
       const HVX_Vector pm = hvx_attn_max32_sf(pp);
       const HVX_VectorPred pos = Q6_Q_vcmp_gt_VwVw(pm, zero);
       pscale = Q6_V_vmux_QVV(pos, Q6_Vsf_vmpy_VsfVsf(pm, inv255), one_sf);
-      const HVX_Vector pq = hvx_sf_to_w_rne(
-        Q6_Vsf_vmpy_VsfVsf(pp, hvx_attn_recip_pos_f32(pscale)));
+      const HVX_Vector pq =
+        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(pp, hvx_attn_recip_pos_f32(pscale)));
       pcorr = Q6_Vw_vasl_VwR(hvx_attn_sum32_w(pq), 7); /* 128 * sum */
       const HVX_Vector ph = Q6_Vh_vpack_VwVw_sat(pq, pq);
       hvx_tile_store_u(pbytes, Q6_Vub_vpack_VhVh_sat(ph, ph));
@@ -241,6 +241,9 @@ static void decode_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
 
 int hvx_attn_decode_q(const hexkl_attn_f16_shape *s, const hexkl_attn_q_io *io,
                       hvx_worker_pool *pool, uint64_t *us) {
+  if (io && io->kv && io->kv->plain_masters) {
+    return AEE_EBADPARM; /* row-major masters: the row-blocked kernel's cache */
+  }
   if (!s || !io || !io->q || !io->out || !io->kv) {
     return AEE_EBADPARM;
   }

@@ -95,8 +95,17 @@ typedef struct {
                              The row-blocked kernel needs this: K's scale
                              then sits in the softmax's residual and V's in
                              the convert unit, neither per cache row */
+  int plain_masters;    /**< 1 (fixed-scale int8): kt4 / v4 hold the masters
+                             row-major, [n_head_kv][max_rows][head_dim], so
+                             an appended row is one contiguous store and a
+                             full column tile is baked from 32 contiguous
+                             rows. The 4-interleaved layouts exist for the
+                             HVX decode kernel, which a fixed-scale cache
+                             never feeds (the row-blocked kernel takes its
+                             decode steps too) */
   float *fs_k;          /**< [n_head_kv] fixed K scale per head */
   float *fs_v;          /**< [n_head_kv][head_dim] fixed V scale per dim */
+  float *fs_v_inv;      /**< [n_head_kv][head_dim] 1 / fs_v, for the append */
 } hexkl_kv_q;
 
 typedef struct {
@@ -144,17 +153,25 @@ static inline uint32_t hexkl_kv_q_tile_bytes(hexkl_kv_q_kind kind) {
 /** @brief Offset-binary encoding of the masters. */
 #define HEXKL_KV_Q_BIAS 128
 
-/** @brief Master index of K[row][dim] for kv head n: 4-dim interleaved. */
+/** @brief Master index of K[row][dim] for kv head n: 4-dim interleaved,
+ *         or row-major when plain_masters. */
 static inline size_t hexkl_kv_q_kt4_index(const hexkl_kv_q *kv, uint32_t n,
                                           uint32_t row, uint32_t dim) {
+  if (kv->plain_masters) {
+    return ((size_t)n * kv->max_rows + row) * kv->head_dim + dim;
+  }
   return (((size_t)n * (kv->head_dim / 4u) + dim / 4u) * kv->max_rows + row) *
            4u +
          (dim & 3u);
 }
 
-/** @brief Master index of V[row][dim] for kv head n: 4-row interleaved. */
+/** @brief Master index of V[row][dim] for kv head n: 4-row interleaved, or
+ *         row-major when plain_masters. */
 static inline size_t hexkl_kv_q_v4_index(const hexkl_kv_q *kv, uint32_t n,
                                          uint32_t row, uint32_t dim) {
+  if (kv->plain_masters) {
+    return ((size_t)n * kv->max_rows + row) * kv->head_dim + dim;
+  }
   return (((size_t)n * (kv->max_rows / 4u) + row / 4u) * kv->head_dim + dim) *
            4u +
          (row & 3u);
@@ -226,10 +243,19 @@ void hexkl_kv_q_quant_v_row_fixed(const float *x, uint32_t hd, int32_t qmax,
  *        encodings give them (K per head after RoPE, V per head dim). From
  *        then on appends quantize with them; s_k[row] is set to the head's
  *        scale so colsum-based readers keep working, s_v[row] stays 1 and
- *        is not meaningful. Call before the first append.
+ *        is not meaningful. An int8 cache also switches to row-major
+ *        masters (plain_masters). Call before the first append.
  */
 int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
                                 const float *s_k, const float *s_v);
+
+/**
+ * @brief The int8 WH tile permutation the DSP derived from rm_to_wh_i8:
+ *        element (r, k) of a 32x32 row-major tile lands at byte pos[r*32+k].
+ *        DSP only (probes it on first use, clobbering 1 KiB at @a vtcm);
+ *        NULL when the part's layout is not usable.
+ */
+const uint16_t *hexkl_kv_q_wh_i8_pos(uint8_t *vtcm_base);
 
 /**
  * @brief Allocates a zeroed cache for up to @a max_rows rows.
