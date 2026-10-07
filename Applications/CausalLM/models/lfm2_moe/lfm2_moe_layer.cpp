@@ -782,10 +782,11 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
  * further than that. Near 0 dB or negative is a different computation, not
  * a quantization gap.
  *
- * 0 means every row. The cost is a full f32 MoE layer on the application
- * processor -- hidden * 2 * inter + inter * hidden MACs per routed token --
- * so the default of 8 rows keeps a prefill layer at seconds; every row is
- * minutes and is what NNTR_MOE_SHADOW needs.
+ * 0 (or any non-number) means every row. The cost is a full f32 MoE layer
+ * on the application processor -- hidden * 2 * inter + inter * hidden MACs
+ * per routed token -- so a few rows (8) keep a prefill layer at seconds;
+ * every row is minutes and is what NNTR_MOE_SHADOW needs. The time lands in
+ * the layer's M0 ffn stage: read no timing from a diff run.
  *
  * ponytail: virtual experts only (the layer's weights live in the file, not
  * in memory, which is what this reads). A resident-expert model has
@@ -823,6 +824,8 @@ static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
   auto *p = static_cast<uint8_t *>(dst);
   while (len != 0) {
     const ssize_t got = ::pread(fd, p, len, static_cast<off_t>(off));
+    if (got < 0 && errno == EINTR)
+      continue;
     if (got <= 0)
       return false;
     p += got;
@@ -885,18 +888,32 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const bool shadow = moeShadowEnabled();
   const int want = moeDiffRows();
   const unsigned int rows =
-    (shadow || want == 0)
+    (shadow || want <= 0)
       ? total_tokens
-      : std::min<unsigned int>(total_tokens, want < 0 ? 8u : (unsigned)want);
+      : std::min<unsigned int>(total_tokens, static_cast<unsigned>(want));
+  if (rows == 0)
+    return;
+  // A failed reference must not pass for a shadowed run: the text it gives
+  // would be read as "the MoE values are not the fault".
+  auto fail = [&](const char *why, size_t e) {
+    std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: %s\n", trace_layer, e,
+                 why);
+    if (shadow)
+      throw std::runtime_error("NNTR_MOE_SHADOW: no reference for this layer");
+  };
 
+  // The input statistics are of the rows compared, so one wild row among
+  // them is not diluted by the rest of a long prefill. !(a <= m) keeps a
+  // NaN in the maxima instead of dropping it.
   const float *in = input.getData<float>();
-  const size_t in_n = static_cast<size_t>(total_tokens) * hidden_size;
+  const size_t in_n = static_cast<size_t>(rows) * hidden_size;
   double sum = 0.0, sum2 = 0.0;
   float in_max = 0.0f;
   for (size_t i = 0; i < in_n; ++i) {
     sum += in[i];
     sum2 += static_cast<double>(in[i]) * in[i];
-    in_max = std::max(in_max, std::fabs(in[i]));
+    if (!(std::fabs(in[i]) <= in_max))
+      in_max = std::fabs(in[i]);
   }
   const double in_mean = sum / in_n;
   const double in_std =
@@ -917,18 +934,14 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
     const ExpertFileDesc d = expertDesc(context.getWeight(gate_up_indices[e]),
                                         context.getWeight(down_indices[e]));
     if (d.fd < 0) {
-      std::fprintf(stderr,
-                   "[MOE-DIFF] layer=%u expert=%zu has no file fd; "
-                   "NNTR_MOE_DIFF needs virtual experts\n",
-                   trace_layer, e);
+      fail("no file fd; NNTR_MOE_DIFF needs virtual experts", e);
       return;
     }
     if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
                              d.w_bits, w_gu) ||
         !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
                              d.w_bits, w_dn)) {
-      std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
-                   trace_layer, e);
+      fail("read failed", e);
       return;
     }
     ++experts_seen;
@@ -961,8 +974,10 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
     const double r = ref[i], diff = static_cast<double>(got[i]) - r;
     signal += r * r;
     noise += diff * diff;
+    const double g = std::fabs(static_cast<double>(got[i]));
     max_ref = std::max(max_ref, std::fabs(r));
-    max_got = std::max(max_got, std::fabs(static_cast<double>(got[i])));
+    if (!(g <= max_got))
+      max_got = g;
   }
   std::fprintf(stderr,
                "[MOE-DIFF] layer=%u M=%u rows=%u experts=%u snr=%.1fdB "
@@ -1286,10 +1301,20 @@ static bool tryMoeLayerOnAccelerator(
 #ifndef _WIN32
   // After the whole layer, split calls included: the reference is of the
   // layer, not of one call.
-  if (experts_virtual && (moeDiffRows() >= 0 || moeShadowEnabled())) {
-    moeDiff(input, output, expert_assignments, context, gate_up_indices,
-            down_indices, total_tokens, hidden_size, intermediate_size, gelu,
-            trace_layer);
+  if (moeDiffRows() >= 0 || moeShadowEnabled()) {
+    if (experts_virtual) {
+      moeDiff(input, output, expert_assignments, context, gate_up_indices,
+              down_indices, total_tokens, hidden_size, intermediate_size, gelu,
+              trace_layer);
+    } else if (moeShadowEnabled()) {
+      throw std::runtime_error("NNTR_MOE_SHADOW needs virtual experts "
+                               "(NNTR_MOE_CACHE_EXPERTS)");
+    } else {
+      static std::atomic<bool> said{false};
+      if (!said.exchange(true))
+        std::fprintf(stderr, "[MOE-DIFF] off: needs virtual experts "
+                             "(NNTR_MOE_CACHE_EXPERTS)\n");
+    }
   }
 #endif
 
