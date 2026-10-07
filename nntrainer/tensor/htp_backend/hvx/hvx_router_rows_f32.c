@@ -12,6 +12,8 @@
 
 #include "hvx_router_rows_f32.h"
 
+#include <stddef.h>
+
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 

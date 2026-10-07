@@ -11,6 +11,8 @@
 
 #include "hvx_rmsnorm_rows_f32.h"
 
+#include <stddef.h>
+
 #include <math.h>
 
 #include <hexagon_types.h>

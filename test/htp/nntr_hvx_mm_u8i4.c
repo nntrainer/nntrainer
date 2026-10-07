@@ -10,7 +10,6 @@
  * @bug    No known bugs except for NYI items
  */
 
-#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 
