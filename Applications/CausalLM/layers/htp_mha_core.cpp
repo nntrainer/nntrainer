@@ -21,8 +21,11 @@
 
 static std::mutex rope_init_mtx;
 
+#include <chrono>
+#include <cstdlib>
 #include <fp16.h>
 #include <layer_context.h>
+
 #include <mha_core.h>
 
 #include "htp_decode_hook.h"
@@ -1074,6 +1077,21 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                       cache_index * cache_value_dim.width(),
                                     true);
 
+  // NNTR_HTP_ATTN_TRACE: the host's own share of this node beside the
+  // accelerator call's (htp_compute_ops' attn trace), per step, to logcat.
+  // The profile build counted ~40 ms a sliding layer outside a 40 ms call
+  // at 1023 rows (doc 57 section 9.13).
+  static const bool host_trace = [] {
+    const char *e = std::getenv("NNTR_HTP_ATTN_TRACE");
+    return e && *e && *e != '0';
+  }();
+  auto now_us = [] {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+  };
+  const long long t_kv0 = host_trace ? now_us() : 0;
+
   // append kcache with or without rotary embedding
   apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
                              !use_rope);
@@ -1089,6 +1107,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
   }
+  const long long t_kv1 = host_trace ? now_us() : 0;
 
   unsigned int step_size = to - from;
   bool is_prefill = !from || step_size > 1;
@@ -1121,6 +1140,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       try_accelerated_attention(query_step, b_cached_key, b_cached_value,
                                 attention_output_step, cache_from, cache_to,
                                 nullptr)) {
+    if (host_trace && step_size > 1) {
+      ml_logi("mha_core trace: rows=%u kv_write_us=%lld accel_call_us=%lld",
+              step_size, t_kv1 - t_kv0, now_us() - t_kv1);
+    }
     return;
   }
 
