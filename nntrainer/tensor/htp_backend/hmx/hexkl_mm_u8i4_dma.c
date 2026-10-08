@@ -542,13 +542,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      hvx_quant_rows_u8_params(act_f32, M, m_pad, K, loc_scale, loc_zp,
-                               o->pool);
+      rc0 = hvx_quant_params_pack_u8_ah(act_f32, M, m_pad, K, loc_scale, loc_zp,
+                                        vtcm_base + act_off, o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
+    } else {
+      rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                                 vtcm_base + act_off, o->pool);
     }
-    rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                               vtcm_base + act_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
   }
   if (rc0 != AEE_SUCCESS) {

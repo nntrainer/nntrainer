@@ -358,3 +358,58 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
   }
   return AEE_SUCCESS;
 }
+
+typedef struct {
+  const float *x;
+  uint32_t n_groups, k;
+  float *scale;
+  int32_t *zp;
+  uint8_t *out_ah;
+} quant_params_pack_ctx;
+
+/** Row groups [lo, hi) of four: each group's parameters, then its pack,
+ *  while the four rows are still in the cache. */
+static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
+                                     void *ctx_) {
+  const quant_params_pack_ctx *c = (const quant_params_pack_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
+  for (uint32_t g = lo; g < hi; ++g) {
+    const uint32_t m = 4u * g;
+    for (uint32_t r = 0; r < 4u; ++r)
+      quant_row_params_one(c->x, m + r, c->k, c->scale, c->zp);
+    hvx_quant_pack_u8_ah_rows(c->x, NULL, m, m + 4u, c->k, c->scale, c->zp,
+                              c->out_ah);
+  }
+}
+
+int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
+                                uint32_t m_pad, uint32_t k, float *scale,
+                                int32_t *zp, uint8_t *out_ah,
+                                hvx_worker_pool *pool) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+  for (uint32_t m = m_valid; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  const uint32_t m_vec_end = (m_valid / 4u) * 4u;
+  if (m_vec_end > 0) {
+    quant_params_pack_ctx ctx = {x, m_vec_end / 4u, k, scale, zp, out_ah};
+    hvx_worker_pool_run(pool, quant_params_pack_worker, &ctx, m_vec_end / 4u);
+  }
+  for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    quant_row_params_one(x, m, k, scale, zp);
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r = m % TILE_ROW;
+    quant_pack_row_scalar(x + (size_t)m * k, n_ktiles,
+                          hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
+                          out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES +
+                            r * TILE_INNER,
+                          ACT_TILE_BYTES);
+  }
+  return AEE_SUCCESS;
+}
