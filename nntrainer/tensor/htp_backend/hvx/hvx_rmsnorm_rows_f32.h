@@ -60,4 +60,15 @@ int hvx_rmsnorm_add_f32(float *out, const float *x, const float *x2, uint32_t M,
                         uint32_t n, const float *gamma, float eps, float scale,
                         hvx_worker_pool *pool);
 
+/**
+ * @brief hvx_rmsnorm_add_f32 with the residual read from @a res instead of
+ *        @a out: out = scale * (res + rmsnorm(x [+ x2]) * gamma). @a res
+ *        NULL is hvx_rmsnorm_add_f32. @a res may be @a out; it must not
+ *        overlap it otherwise.
+ */
+int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
+                            const float *x2, uint32_t M, uint32_t n,
+                            const float *gamma, float eps, float scale,
+                            hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_RMSNORM_ROWS_F32_H__ */

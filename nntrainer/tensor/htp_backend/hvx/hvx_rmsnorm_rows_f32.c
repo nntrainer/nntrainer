@@ -101,6 +101,7 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
 
 typedef struct {
   float *out;
+  const float *res; /**< the residual, or NULL when it is out itself */
   const float *x, *x2, *gamma;
   uint32_t M, n;
   float eps, scale;
@@ -117,6 +118,8 @@ static void add_worker(uint32_t n_threads, uint32_t i, void *v) {
     const HVX_UVector *vx2 =
       c->x2 ? (const HVX_UVector *)(c->x2 + (size_t)r * c->n) : NULL;
     HVX_UVector *vo = (HVX_UVector *)(c->out + (size_t)r * c->n);
+    const HVX_UVector *vres =
+      c->res ? (const HVX_UVector *)(c->res + (size_t)r * c->n) : vo;
     /* Pass 1: the sum of squares of the summed addend, as norm_chunk. */
     HVX_Vector acc = Q6_V_vzero();
     for (uint32_t k = 0; k < nvec; ++k) {
@@ -132,7 +135,7 @@ static void add_worker(uint32_t n_threads, uint32_t i, void *v) {
       a = Q6_Vsf_vmpy_VsfVsf(a, vr);
       if (vg)
         a = Q6_Vsf_vmpy_VsfVsf(a, vg[k]);
-      vo[k] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vadd_VsfVsf(vo[k], a), vs);
+      vo[k] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vadd_VsfVsf(vres[k], a), vs);
     }
   }
 }
@@ -140,10 +143,18 @@ static void add_worker(uint32_t n_threads, uint32_t i, void *v) {
 int hvx_rmsnorm_add_f32(float *out, const float *x, const float *x2, uint32_t M,
                         uint32_t n, const float *gamma, float eps, float scale,
                         hvx_worker_pool *pool) {
+  return hvx_rmsnorm_add_res_f32(out, NULL, x, x2, M, n, gamma, eps, scale,
+                                 pool);
+}
+
+int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
+                            const float *x2, uint32_t M, uint32_t n,
+                            const float *gamma, float eps, float scale,
+                            hvx_worker_pool *pool) {
   if (!out || !x || M == 0u || n == 0u || n % LANES != 0u) {
     return -1;
   }
-  add_ctx c = {out, x, x2, gamma, M, n, eps, scale};
+  add_ctx c = {out, res, x, x2, gamma, M, n, eps, scale};
   hvx_worker_pool_run(pool, add_worker, &c, M);
   return 0;
 }

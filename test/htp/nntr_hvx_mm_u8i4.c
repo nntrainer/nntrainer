@@ -1440,6 +1440,54 @@ int nntr_hvx_mm_u8i4_moe_layer_norm(
   return rc;
 }
 
+int nntr_hvx_mm_u8i4_moe_layer_norm_add(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, float scale2, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const float *gamma2,
+  int gamma2Len, const uint32 *h_gate_up, int h_gate_upLen,
+  const uint32 *h_down, int h_downLen, const uint32 *row_index,
+  int row_indexLen, const uint32 *row_count, int row_countLen,
+  const float *row_weight, int row_weightLen, const float *act_f32,
+  int act_f32Len, const float *x2, int x2Len, float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const uint64_t n = (uint64_t)M * N_out;
+  /* The residual is the call's own input rows, so K == N_out. */
+  if (M == 0u || K != N_out || N_out % 32u != 0u || n > 0x7FFFFFFFu ||
+      (uint64_t)act_f32Len != n || (uint64_t)x2Len != n ||
+      (uint64_t)out_f32Len != n ||
+      (gamma2Len != 0 && (uint32_t)gamma2Len != N_out)) {
+    FARF(ERROR, "mm_u8i4_moe_layer_norm_add: bad shape (M=%u K=%u N=%u)",
+         (unsigned)M, (unsigned)K, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if (s->moe_res_n < n) {
+    free(s->moe_res);
+    s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+    if (!s->moe_res) {
+      FARF(ERROR, "moe_layer_norm_add: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = nntr_hvx_mm_u8i4_moe_layer_norm(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, s->moe_res, (int)n);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (hvx_rmsnorm_add_res_f32(out_f32, act_f32, s->moe_res, x2, M, N_out,
+                              gamma2Len ? gamma2 : NULL, eps, scale2,
+                              s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_mm_u8i4_moe_layer_timed(
   remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
   uint32 act, const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,
