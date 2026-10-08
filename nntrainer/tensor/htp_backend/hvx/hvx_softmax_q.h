@@ -89,11 +89,12 @@ static inline uint32_t hvx_softmax_q_rowsum_index(uint32_t r) {
   return (r >> 2) * 32u + (r & 3u) * 8u;
 }
 
-/** @brief Bytes of VTCM scratch hvx_softmax_q needs: the 32 row-max
- *         vectors, the 16 row-sum accumulators and up to 128 staged
+/** @brief Bytes of VTCM scratch hvx_softmax_q / hvx_softmax_q16 need: the
+ *         32 row-max vectors, 2 x 16 row-sum accumulators, 16 vectors of
+ *         per-row reciprocals (the row-sum layout) and up to 128 staged
  *         per-tile correction vectors. */
 #define HVX_SOFTMAX_Q_MAX_TILES 128u
-#define HVX_SOFTMAX_Q_SCRATCH_BYTES ((48u + HVX_SOFTMAX_Q_MAX_TILES) * 128u)
+#define HVX_SOFTMAX_Q_SCRATCH_BYTES ((80u + HVX_SOFTMAX_Q_MAX_TILES) * 128u)
 
 /** @brief Geometry and scale of one block. */
 typedef struct {
@@ -104,7 +105,8 @@ typedef struct {
   uint32_t n_rows;      /**< valid rows (<= 64); rows past it are padding */
   uint32_t window;      /**< sliding window, 0 = unlimited */
   uint16_t rho_q15;     /**< rho in (0.5, 1] times 32768, at most 32767 */
-  uint8_t frac_bits;    /**< F: fraction bits of the log2 logit, 1..8 */
+  uint8_t frac_bits;    /**< F: fraction bits of the log2 logit, 1..15 (9
+                             in the a16 kernel unless its k had to move) */
 } hvx_softmax_q_block;
 
 /**
@@ -118,6 +120,19 @@ typedef struct {
  */
 int hvx_softmax_q_scale(float alpha, uint32_t frac_bits, int *k,
                         uint16_t *rho_q15);
+
+/**
+ * @brief hvx_softmax_q_scale with k required to lie in [k_min, k_max]. The
+ *        a16 kernel reads a 16-bit activation in two sweeps whose converts
+ *        run at 2^(k+8), 2^k and 2^(k-8), so it needs k in [-6, 7] for
+ *        every scale to be an fp16 normal; every head of the Gemma-4 a16
+ *        checkpoint has k in [-5, -3] at F = 9.
+ *
+ * @return 0, or -1 when k falls outside [k_min, k_max] or the bounds are
+ *         outside fp16's normal range
+ */
+int hvx_softmax_q_scale_k(float alpha, uint32_t frac_bits, int k_min, int k_max,
+                          int *k, uint16_t *rho_q15);
 
 /** @brief 2^(f / 2^F) as Q14 by the fixed-point cubic, f in [0, 2^F). */
 uint16_t hvx_softmax_q_exp2_q14(uint32_t f, uint32_t frac_bits);
@@ -135,6 +150,44 @@ uint16_t hvx_softmax_q_exp2_q14(uint32_t f, uint32_t frac_bits);
 void hvx_softmax_q_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                        const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum);
 
+/** @brief The 16-bit P of the a16 contract: 65535 is 1.0. */
+#define HVX_SOFTMAX_Q16_ONE 65535u
+
+/** @brief Tile classes of hvx_softmax_q_tile_class: every lane visible to
+ *         every row, none, or lane-dependent (the masked edges). */
+#define HVX_SOFTMAX_Q_TILE_FULL 0
+#define HVX_SOFTMAX_Q_TILE_PARTIAL 1
+#define HVX_SOFTMAX_Q_TILE_MASKED 2
+
+/** @brief The class of column tile @a c of block @a b (a partial tile
+ *         costs the mask comparisons in every pass, about twice a full
+ *         one; a masked tile only its zero stores). */
+int hvx_softmax_q_tile_class(const hvx_softmax_q_block *b, uint32_t c);
+
+/**
+ * @brief Scalar definition of the block softmax with a normalized 16-bit
+ *        P, as the a16 model's Softmax output (plan 24).
+ *
+ * Pass 2 forms P' = 2^(t * rho / 2^F) * 65536 as u16 (65535 at t = 0,
+ * rounded, 0 below 2^-17) and the row sums of P'; pass 3 normalizes:
+ * P16 = round(P' * R / 65536) with R = rne(65535 * 65536 * recip(rowsum))
+ * clamped to 65535, so sum_j P16_j ~ 65535 per row and the PV accumulator
+ * is bounded by 127 * 65535. recip is three Newton steps in binary32 from
+ * the 0x7EF311C7 seed (hvx_softmax_q16_recip), identical in the scalar and
+ * the vector code so both sides agree bit for bit without a division.
+ * P16 leaves as two uint8 tiles, its low and high bytes, which are the HMX
+ * activation tiles of the two P.V sweeps. Masked entries and padding rows
+ * are 0 in both.
+ *
+ * @param p_lo    [n_col_tiles][64][32] uint8 out, P16 & 0xff
+ * @param p_hi    [n_col_tiles][64][32] uint8 out, P16 >> 8
+ * @param rowsum  HVX_SOFTMAX_Q_ROWSUM_WORDS int32 out (the P' sums, see
+ *                hvx_softmax_q_rowsum_index), or NULL
+ */
+void hvx_softmax_q16_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
+                         const int16_t *corr, uint8_t *p_lo, uint8_t *p_hi,
+                         int32_t *rowsum);
+
 #if defined(__hexagon__)
 /** @brief Micro-benchmark of the HVX primitives the softmax uses: cycles
  *         per vadd, per Q15 vmpy, per exp2 chain, per VTCM vector load,
@@ -150,6 +203,53 @@ void hvx_softmax_q_rate(uint32_t n, void *vtcm, void *vtcm_big,
 void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                    const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum,
                    void *scratch);
+
+/**
+ * @brief The HVX implementation of hvx_softmax_q16_ref, bit-exact with
+ *        it. Same buffer requirements as hvx_softmax_q; @a rowsum may be
+ *        NULL.
+ */
+void hvx_softmax_q16(const hvx_softmax_q_block *b, const int16_t *s_tiles,
+                     const int16_t *corr, uint8_t *p_lo, uint8_t *p_hi,
+                     int32_t *rowsum, void *scratch);
+
+/**
+ * The same softmax split over threads by column range, for a kernel that
+ * gives one block to several workers: each runs the three passes over
+ * its tiles [c0, c1) with its own scratch and, between passes, every
+ * worker merges the partial row maxima / row sums of all parts (each
+ * computes the merge for itself; the caller supplies the barriers).
+ * hvx_softmax_q16 is exactly part_max, merge_max, part_exp, merge_sum,
+ * part_norm with one part, so the results are bit-identical however the
+ * tiles are split.
+ */
+
+/** @brief Pass 1 over tiles [c0, c1): the partial row maxima into this
+ *         scratch (and the staged corrections the later passes reuse). */
+void hvx_softmax_q16_part_max(const hvx_softmax_q_block *b,
+                              const int16_t *s_tiles, const int16_t *corr,
+                              uint32_t c0, uint32_t c1, void *scratch);
+
+/** @brief This scratch's row maxima <- max over the @a n_parts scratches
+ *         (which include this one). */
+void hvx_softmax_q16_merge_max(void *scratch, void *const *parts,
+                               uint32_t n_parts);
+
+/** @brief Pass 2 over tiles [c0, c1): P' byte tiles and the partial row
+ *         sums into this scratch. */
+void hvx_softmax_q16_part_exp(const hvx_softmax_q_block *b,
+                              const int16_t *s_tiles, uint32_t c0, uint32_t c1,
+                              uint8_t *p_lo, uint8_t *p_hi, void *scratch);
+
+/** @brief This scratch's per-row reciprocals <- from the row sums of all
+ *         @a n_parts scratches; @a rowsum (optional) receives the sums. */
+void hvx_softmax_q16_merge_sum(void *scratch, void *const *parts,
+                               uint32_t n_parts, int32_t *rowsum);
+
+/** @brief Pass 3 over tiles [c0, c1): normalize the byte tiles in place. */
+void hvx_softmax_q16_part_norm(const hvx_softmax_q_block *b, uint32_t c0,
+                               uint32_t c1, uint8_t *p_lo, uint8_t *p_hi,
+                               void *scratch);
 #endif
 
 #ifdef __cplusplus
