@@ -18,7 +18,6 @@
  * This file provides portable C implementations that work on any platform.
  * For optimized SIMD implementations, use architecture-specific files:
  * - nntr_ggml_impl_neon.cpp for ARM NEON (armv8.2-a)
- * - nntr_ggml_impl_sve.cpp for ARM SVE (armv9.2-a)
  * - nntr_ggml_impl_avx.cpp for x86_64 AVX/AVX2
  */
 
