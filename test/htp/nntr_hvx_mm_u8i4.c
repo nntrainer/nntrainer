@@ -435,10 +435,11 @@ void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
  *  how big the mapping behind it is. Overflow-safe in 64-bit. */
 static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
                                       uint32 wh_off, uint32 K, uint32 N,
-                                      int tail) {
+                                      int tail, uint32 bits) {
   const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
-  const uint64_t bytes =
-    (uint64_t)(K / 32u) * (N / 32u) * 512u + (tail ? 8u * (uint64_t)N : 0u);
+  /* 512 bytes a 32x32 tile at four bits, 256 at two. */
+  const uint64_t bytes = (uint64_t)(K / 32u) * (N / 32u) * (bits * 128u) +
+                         (tail ? 8u * (uint64_t)N : 0u);
   if (!a) {
     return NULL;
   }
@@ -467,7 +468,7 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
          (unsigned)K, (unsigned)N);
     return AEE_EBADPARM;
   }
-  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0);
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0, 4u);
   if (!wh) {
     return AEE_EBADPARM;
   }
@@ -478,14 +479,21 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
 
 /** @brief One weight of a swap: registered from the arena with the given
  *  arrays, or, when @a w_scale is NULL, with the scales and column sums
- *  that follow it there and a zero bias. */
+ *  that follow it there and a zero bias. A non-NULL @a pal registers
+ *  QS2CX_WH codes (tail only). */
 static int swap_register_one(nntr_hvx_session *s, uint32 K, uint32 N,
-                             uint32 arena, uint32 wh_off, const float *w_scale,
-                             const int32 *colsum_w, const float *bias,
-                             uint32 *out) {
-  const uint8_t *wh = arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL);
+                             uint32 arena, uint32 wh_off, const int8 *pal,
+                             const float *w_scale, const int32 *colsum_w,
+                             const float *bias, uint32 *out) {
+  const uint8_t *wh =
+    arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL, pal ? 2u : 4u);
   if (!wh) {
     return AEE_EBADPARM;
+  }
+  if (pal) {
+    return hexkl_weight_u2i4_register_arena(&s->weights_u8i4, s->vtcm_size, K,
+                                            N, wh, (const int8_t *)pal, NULL,
+                                            NULL, NULL, out);
   }
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
                                           wh, w_scale, colsum_w, bias, out);
@@ -502,13 +510,19 @@ static int swap_releasable(const hexkl_weight_u8i4_table *tbl, uint32 h) {
          tbl->slots[h].borrowed;
 }
 
-int nntr_hvx_weight_swap_u8i4_arena(
-  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
-  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
-  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
-  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
-  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+/** @brief weight_swap_u8i4_arena's body; non-NULL @a pal_gu / @a pal_dn
+ *  (four int4 codes each, both or neither) make the pair QS2CX_WH, whose
+ *  scales and column sums are always in the arena. */
+static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
+                     uint32 K, uint32 inter, uint32 N_out, uint32 arena,
+                     uint32 off_gu, uint32 off_dn, const int8 *pal_gu,
+                     const int8 *pal_dn, const float *gu_scale, int gu_scaleLen,
+                     const int32 *gu_colsum, int gu_colsumLen,
+                     const float *dn_scale, int dn_scaleLen,
+                     const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
+                     uint32 *h_dn) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32 bits = pal_gu ? 2u : 4u;
   const uint32 n_gu = 2u * inter;
   const int release_old =
     !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
@@ -521,7 +535,7 @@ int nntr_hvx_weight_swap_u8i4_arena(
   float *bias = NULL;
   uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
   int rc;
-  if (!s || !h_gu || !h_dn) {
+  if (!s || !h_gu || !h_dn || !pal_gu != !pal_dn || (pal_gu && !tail)) {
     return AEE_EBADPARM;
   }
   if (!tail &&
@@ -553,8 +567,9 @@ int nntr_hvx_weight_swap_u8i4_arena(
       s->weights_u8i4.slots[old_gu].N == n_gu &&
       s->weights_u8i4.slots[old_dn].K == inter &&
       s->weights_u8i4.slots[old_dn].N == N_out) {
-    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu, tail);
-    const uint8_t *wd = arena_weight_at(s, arena, off_dn, inter, N_out, tail);
+    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu, tail, bits);
+    const uint8_t *wd =
+      arena_weight_at(s, arena, off_dn, inter, N_out, tail, bits);
     /* 512: the registry's WEIGHT_TILE_BYTES_U8I4, which rebind also checks
        -- checked here too so the second rebind cannot refuse after the
        first has landed. */
@@ -563,10 +578,12 @@ int nntr_hvx_weight_swap_u8i4_arena(
       return AEE_EBADPARM;
     }
     rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu, wg,
-                                        gu_scale, gu_colsum);
+                                        (const int8_t *)pal_gu, gu_scale,
+                                        gu_colsum);
     if (rc == AEE_SUCCESS) {
       rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
-                                          N_out, wd, dn_scale, dn_colsum);
+                                          N_out, wd, (const int8_t *)pal_dn,
+                                          dn_scale, dn_colsum);
     }
     if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
       return rc;
@@ -581,11 +598,11 @@ int nntr_hvx_weight_swap_u8i4_arena(
       return AEE_ENOMEMORY;
     }
   }
-  rc =
-    swap_register_one(s, K, n_gu, arena, off_gu, gu_scale, gu_colsum, bias, &g);
+  rc = swap_register_one(s, K, n_gu, arena, off_gu, pal_gu, gu_scale, gu_colsum,
+                         bias, &g);
   if (rc == AEE_SUCCESS) {
-    rc = swap_register_one(s, inter, N_out, arena, off_dn, dn_scale, dn_colsum,
-                           bias, &d);
+    rc = swap_register_one(s, inter, N_out, arena, off_dn, pal_dn, dn_scale,
+                           dn_colsum, bias, &d);
     if (rc != AEE_SUCCESS) {
       hexkl_weight_u8i4_release(&s->weights_u8i4, g);
     }
@@ -602,6 +619,18 @@ int nntr_hvx_weight_swap_u8i4_arena(
   *h_gu = g;
   *h_dn = d;
   return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_swap_u8i4_arena(
+  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
+  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
+  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
+  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
+  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+  return swap_pair(handle, old_gu, old_dn, K, inter, N_out, arena, off_gu,
+                   off_dn, NULL, NULL, gu_scale, gu_scaleLen, gu_colsum,
+                   gu_colsumLen, dn_scale, dn_scaleLen, dn_colsum, dn_colsumLen,
+                   h_gu, h_dn);
 }
 
 int nntr_hvx_weight_swap_batch_u8i4_arena(
@@ -653,6 +682,68 @@ int nntr_hvx_weight_swap_batch_u8i4_arena(
     *n_done = (uint32)(i + 1);
   }
   return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
+int nntr_hvx_weight_swap_batch_u2i4_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, const int8 *pal_gu, int pal_guLen,
+  const int8 *pal_dn, int pal_dnLen, uint32 *h_gu, int h_guLen, uint32 *h_dn,
+  int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  int i, rc = AEE_SUCCESS;
+  if (!handle || !n_done || !err) {
+    return AEE_EBADPARM;
+  }
+  *n_done = 0;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (int64_t)pal_guLen != 4 * (int64_t)n ||
+      (int64_t)pal_dnLen != 4 * (int64_t)n) {
+    FARF(ERROR, "weight_swap_batch_u2i4_arena: bad lengths (n=%d)", n);
+    return AEE_EBADPARM;
+  }
+  /* As the 4-bit batch: one expert at a time, stop at the first refusal. */
+  for (i = 0; i < n; ++i) {
+    rc = swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+                   off_gu[i], off_dn[i], pal_gu + 4 * i, pal_dn + 4 * i, NULL,
+                   0, NULL, 0, NULL, 0, NULL, 0, &h_gu[i], &h_dn[i]);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
+int nntr_hvx_weight_register_u2i4_arena(remote_handle64 handle, uint32 K,
+                                        uint32 N, uint32 arena, uint32 wh_off,
+                                        const int8 *pal, int palLen,
+                                        const float *w_scale, int w_scaleLen,
+                                        const int32 *colsum_w, int colsum_wLen,
+                                        const float *bias, int biasLen,
+                                        uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint8_t *wh;
+  if (!s || !w_handle || !pal) {
+    return AEE_EBADPARM;
+  }
+  if (palLen != 4 || (uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      (uint32_t)biasLen != N) {
+    FARF(ERROR, "weight_register_u2i4_arena: bad lengths (K=%u N=%u pal=%d)",
+         (unsigned)K, (unsigned)N, palLen);
+    return AEE_EBADPARM;
+  }
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0, 2u);
+  if (!wh) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u2i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          wh, (const int8_t *)pal, w_scale,
+                                          colsum_w, bias, w_handle);
 }
 
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
@@ -1232,7 +1323,8 @@ enum {
   MOE_T_DMA_FIRST_READY_US,
   MOE_T_DMA_LAST_ISSUE_US,
   MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
-  MOE_T_M1_FEED, /**< NOT us: 1 = the GEMV read VTCM slabs fed by DMA (#117) */
+  MOE_T_M1_FEED, /**< NOT us: the DMA queues that fed the GEMV's VTCM slabs
+                      (#117: 1; #177: 1..4), 0 = it read the arena */
   MOE_N_STAGES
 };
 
@@ -1504,7 +1596,8 @@ static int check_conv_block_args(const nntr_hvx_session *s, uint32 M, uint32 K,
     FARF(ERROR, "conv_block: h_in has %d handles, want 3 (a, b, c)", h_inLen);
     return AEE_EBADPARM;
   }
-  if ((uint32_t)conv_wLen != 3 * C) {
+  /* [#225] 5 x C: the taps, then the history rows of a prefill chunk */
+  if ((uint32_t)conv_wLen != 3 * C && (uint32_t)conv_wLen != 5 * C) {
     FARF(ERROR, "conv_block: bad conv_wLen %d (C=%u)", conv_wLen, (unsigned)C);
     return AEE_EBADPARM;
   }
@@ -1538,10 +1631,11 @@ int nntr_hvx_mm_u8i4_conv_block(remote_handle64 handle, uint32 M, uint32 K,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  return hexkl_conv_block_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                              s->config_off, M, K, C, N_out, h_in[0], h_in[1],
-                              h_in[2], h_out, conv_w, act_f32, out_f32,
-                              state_f32, s->quant_pool, &s->moe_scratch);
+  return hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
 }
 
 int nntr_hvx_mm_u8i4_conv_block_timed(
@@ -1564,10 +1658,11 @@ int nntr_hvx_mm_u8i4_conv_block_timed(
   }
   hexkl_probe_reset(1);
   t0 = hexkl_probe_now();
-  rc = hexkl_conv_block_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                            s->config_off, M, K, C, N_out, h_in[0], h_in[1],
-                            h_in[2], h_out, conv_w, act_f32, out_f32, state_f32,
-                            s->quant_pool, &s->moe_scratch);
+  rc = hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
   moe_fill_stage_us(stage_us, (uint32)(t1 - t0));

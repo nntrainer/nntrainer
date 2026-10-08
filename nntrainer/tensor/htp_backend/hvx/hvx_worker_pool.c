@@ -285,6 +285,10 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool) {
   free(pool);
 }
 
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
+  return pool ? pool->n_workers : 0u;
+}
+
 void hvx_worker_pool_wait(hvx_worker_pool *pool) {
   if (!pool || !pool->outstanding) {
     return;

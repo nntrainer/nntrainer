@@ -27,6 +27,13 @@
  * hexkl_graph_set_param (plan 130 section 3.1); forward refuses an op
  * whose parameter is missing with AEE_EBADSTATE.
  *
+ * [plan 201 S1] A MOE op's expert handles are its EXPERTS table, bound
+ * after init like a parameter and replaceable at any time: the expert
+ * pool's (layer, expert) -> handle map, HTP_GRAPH_NO_HANDLE for an expert
+ * that is not resident. forward hands the table to the kernel as its
+ * handle arrays (the kernel skips an expert with no rows before it reads
+ * its handle) and refuses a token that routes to a non-resident expert.
+ *
  * [#132 Part B] FC, DENSE_FFN and LM_HEAD: the Android CPU's M=1 Q4_0 FC
  * bit for bit (q4_gemv_cpu_det.h) -- hvx_q4m1_prep quantizes the op's
  * input once (hvx_intrin, = q8_0_quant_cpu_det) and the session's FC
@@ -38,6 +45,13 @@
  * handles of the session's table bound in the op record before
  * graph_init (htp_graph_desc.h), checked there against the shapes the
  * caller passes.
+ *
+ * [#225] An FC or DENSE_FFN with HTP_GRAPH_FEED_WH reads WH handles of the
+ * session's u8i4 table instead (the prefill's, from the FC WH sidecar):
+ * the FC through hexkl_mm_u8i4_fc_m1_run, the DENSE_FFN through
+ * hexkl_mm_u8i4_moe_layer_run as its chunks at weight 1 -- the kernels
+ * the MOE op calls, so no fc runner is involved and the LM_HEAD alone
+ * stays Q4M1.
  */
 
 #ifndef __NNTRAINER_HEXKL_GRAPH_H__
@@ -69,6 +83,38 @@ typedef struct {
   uint32_t K, N;
 } hexkl_graph_q4m1_shape;
 
+struct hexkl_graph_s;
+
+/**
+ * @brief [plan 201 S1] The session's in-place rebind of a pool slot (the
+ *        miss path): the expert whose bytes the ARM just read into the
+ *        arena at (@a arena, @a off_gu / @a off_dn) takes over the pair
+ *        @a old_gu / @a old_dn (HTP_GRAPH_NO_HANDLE: a fresh pair), whose
+ *        numbers come back in @a h_gu / @a h_dn
+ *        (nntr_hvx_weight_swap_u8i4_arena). [plan 229] Non-NULL @a pal_gu /
+ *        @a pal_dn (four int4 codes each) make the pair QS2CX_WH
+ *        (nntr_hvx_weight_swap_batch_u2i4_arena).
+ */
+typedef int (*hexkl_graph_rebind_fn)(
+  void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K, uint32_t inter,
+  uint32_t N_out, uint32_t arena, uint32_t off_gu, uint32_t off_dn,
+  const int8_t *pal_gu, const int8_t *pal_dn, uint32_t *h_gu, uint32_t *h_dn);
+
+/**
+ * @brief [plan 201 S1] The expert pool's miss round, which the token driver
+ *        provides (hexkl_token.c): @a post names MOE op @a op's routed
+ *        experts and the ones its EXPERTS table lacks and returns at once;
+ *        @a wait blocks until the pool's owner answers and applies the
+ *        answer to @a g's tables. The MOE op runs its present experts
+ *        between the two.
+ */
+typedef struct {
+  int (*post)(void *ctx, uint32_t op, const uint32_t *routed, uint32_t n_routed,
+              const uint32_t *miss, uint32_t n_miss);
+  int (*wait)(void *ctx, struct hexkl_graph_s *g, uint32_t op);
+  void *ctx;
+} hexkl_graph_miss;
+
 /** @brief What a kernel needs from the session, handed per call so the
  *  graph holds no pointer into the session. */
 typedef struct {
@@ -79,12 +125,22 @@ typedef struct {
   hvx_worker_pool *pool;
   hexkl_moe_scratch *scratch;
   uint32_t moe_flags;
-  hvx_attn_m1_ctx *attn_m1; /**< the session's m=1 KV cache (#81), borrowed;
-                                 NULL = none, and a resident ATTN_M1 op
-                                 fails with AEE_EBADSTATE */
-  hexkl_graph_fc_fn fc;     /**< [#132 Part B] the Q4M1 kinds' runner; NULL
-                                 = none, and they fail with AEE_EBADSTATE */
+  hvx_attn_m1_ctx *attn_m1;   /**< the session's m=1 KV cache (#81), borrowed;
+                                   NULL = none, and a resident ATTN_M1 op
+                                   fails with AEE_EBADSTATE */
+  hvx_attn_m1_ctx *attn_m1_b; /**< [plan 201 S4] a second cache of another
+                                   shape (Gemma 4's full layers beside its
+                                   sliding ones), borrowed; an ATTN_M1 op
+                                   reads the one of its (n_kv, gqa,
+                                   head_dim), NULL = none */
+  hexkl_graph_fc_fn fc;       /**< [#132 Part B] the Q4M1 kinds' runner; NULL
+                                   = none, and they fail with AEE_EBADSTATE */
   void *fc_ctx;
+  hexkl_graph_rebind_fn rebind; /**< [plan 201 S1] NULL = none */
+  void *rebind_ctx;
+  hexkl_graph_miss miss; /**< [plan 201 S1] post NULL = no miss path: a
+                              token routed to a non-resident expert fails
+                              with AEE_EBADSTATE */
 } hexkl_graph_env;
 
 /** @brief The MoE routing of this token, in mm_u8i4_moe_layer's layout:
@@ -99,19 +155,43 @@ typedef struct {
   uint32_t n_experts;
 } hexkl_graph_routing;
 
-typedef struct {
+/** @brief [plan 201 S1] The most experts one MOE op may route a token to
+ *  (the M = 1 path's MOE_M1_MAX_EXPERTS), what a miss round names. */
+#define HEXKL_GRAPH_MISS_MAX 16u
+
+/** @brief [plan 201 S1] The token's routed sets, S1's response carries
+ *  them to the pool's owner: per MOE op run, its count then its ids. */
+#define HEXKL_GRAPH_ROUTE_LOG 320u
+
+typedef struct hexkl_graph_s {
   uint32_t n_layers, n_ops, hidden, vocab, max_seq;
   uint32_t slot_words; /**< f32 per activation slot: the widest resident
                             op's in or out width */
   float *slots;        /**< HTP_GRAPH_N_SLOTS x slot_words, DSP heap */
-  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound */
+  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound;
+                            [plan 201 S4] a ROPE op with its own table
+                            (param[op], max_seq x head_dim) reads that */
   htp_graph_op ops[HTP_GRAPH_MAX_OPS];
   uint64_t op_pcycles[HTP_GRAPH_MAX_OPS]; /**< of the last forward */
   float *param[HTP_GRAPH_MAX_OPS];     /**< gamma or conv_w, NULL until bound */
   float *state[HTP_GRAPH_MAX_OPS];     /**< CONV1D_GATE: 3 x N (rows 0-1 the
                                             conv state, row 2 scratch) */
   uint32_t ordinal[HTP_GRAPH_MAX_OPS]; /**< ATTN_M1: the attention-layer
-                                            index the cache is keyed by */
+                                            index the cache is keyed by
+                                            ([plan 201 S4] counted within
+                                            its shape's cache) */
+  /** [plan 201 S1] MOE: the op's pool table, h_gu[0..E) then h_dn[0..E)
+   *  (HTP_GRAPH_PARAM_EXPERTS; HTP_GRAPH_NO_HANDLE = not resident), NULL
+   *  until bound */
+  uint32_t *experts[HTP_GRAPH_MAX_OPS];
+  /** the session's handle table graph_init checked against, which the
+   *  EXPERTS tables are checked against too */
+  const hexkl_weight_u8i4_table *tbl;
+  /** [plan 201 S1] a miss round's per-expert outputs, top_k x N_out f32
+   *  (the widest resident MOE op's), allocated at init */
+  float *moe_rows;
+  uint8_t route_log[HEXKL_GRAPH_ROUTE_LOG]; /**< cleared by the token driver */
+  uint32_t route_log_n;
   /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
    *  by every router op, read by the MOE op after it. */
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
@@ -137,12 +217,12 @@ typedef struct {
 uint32_t hexkl_graph_resident_kinds(void);
 
 /**
- * @brief Validates the words, checks every resident MoE op's handles
- *        against @a tbl (in use, gate_up K x 2N, down N x N_out) and every
- *        resident Q4M1 op's against @a q4m1 (#132 Part B: each part in
+ * @brief Validates the words, checks every resident Q4M1 op's handles
+ *        against @a q4m1 (#132 Part B: each part in
  *        range and in use, K the op's, an FC's or LM_HEAD's part widths
  *        multiples of 32 summing to N, a DENSE_FFN's up and gate K x N and
- *        down N x N_out), and keeps a copy.
+ *        down N x N_out), and keeps a copy and @a tbl (the MOE ops'
+ *        EXPERTS tables are checked against it when bound).
  * @param q4m1   the session's Q4M1 slot shapes (may be NULL when @a n_q4m1
  *               is 0: then a resident Q4M1 op is refused)
  * @return 0 or htp_graph_validate's code; HTP_GRAPH_E_INVHANDLE for a
@@ -164,13 +244,28 @@ void hexkl_graph_free(hexkl_graph *g);
  *        a second call replaces (CONV_STATE: re-seeds rows 0-1).
  * @return 0, AEE_EBADSTATE (no graph), HTP_GRAPH_E_BADITEM (op or which
  *         out of range), HTP_GRAPH_E_INVALIDFORMAT (the op's kind does
- *         not take @a which, or @a n is not its length), AEE_ENOMEMORY
+ *         not take @a which, or @a n is not its length),
+ *         HTP_GRAPH_E_INVHANDLE (an EXPERTS entry that is neither
+ *         HTP_GRAPH_NO_HANDLE nor a registered weight of the op's shape),
+ *         AEE_ENOMEMORY
  */
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
                           const float *data, uint32_t n);
 
-/** @brief Whether any resident MoE op names @a handle: weight_release
- *  refuses such a handle with AEE_EBADSTATE while the graph lives. */
+/**
+ * @brief [plan 201 S1] One EXPERTS entry: expert @a e of MOE op @a op to
+ *        the pair @a h_gu / @a h_dn (both HTP_GRAPH_NO_HANDLE: evicted).
+ * @return 0; AEE_EBADITEM (op or e out of range, not a MOE op);
+ *         AEE_EBADSTATE (no table bound); HTP_GRAPH_E_INVHANDLE (a handle
+ *         not registered at the op's shape)
+ */
+int hexkl_graph_pool_set(hexkl_graph *g, uint32_t op, uint32_t e, uint32_t h_gu,
+                         uint32_t h_dn);
+
+/** @brief Whether any MoE op's EXPERTS table, or [#225] a WH op, names
+ *  @a handle:
+ *  weight_release refuses such a handle with AEE_EBADSTATE while the graph
+ *  lives. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);
 
 /** @brief [#132 Part B] The same for a Q4M1 handle (q4m1_release). */
@@ -189,9 +284,12 @@ int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle);
  * untouched, *resume_at == start_op and every op_pcycles entry is 0.
  * @a routing is consumed by the first MoE op run; a second MoE op in the
  * same call, or a MoE op with no routing, fails with AEE_EBADSTATE.
- * @return 0, AEE_EBADSTATE (no graph, routing; a RMSNORM / QK_NORM /
+ * @return 0, AEE_EBADSTATE (no graph, routing; a MOE op with no EXPERTS
+ *         table or one whose routed expert is not resident; a RMSNORM /
+ *         QK_NORM /
  *         CONV1D_GATE / ROUTER_TOPK op with no parameter or state bound, a ROPE
- * op with no table, an ATTN_M1 op with no cache in @a env, a Q4M1 op with
+ * op with no table, an ATTN_M1 op with no cache of its shape in @a env, a
+ * Q4M1 op with
  * no fc runner in @a env, or the cache
  *         kernel's own hole), HTP_GRAPH_E_BADITEM (start_op past the
  *         list, pos >= max_seq), HTP_GRAPH_E_INVALIDFORMAT (an act length

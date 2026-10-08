@@ -24,6 +24,7 @@
  * and the four-row loop run, through the self-prefetching column call and
  * the one without its own l2fetch. Rows past m must stay untouched.
  */
+#include "hvx_expand_i2i4.h"
 #include "hvx_gemm_u8i4_wh.h"
 
 #include <stdio.h>
@@ -77,13 +78,58 @@ static uint32_t run_case(col_fn fn, const uint8_t *act, const uint8_t *wh,
   return bad;
 }
 
+/** [plan 229] The u8i2 GEMV against the same spec: the codes @a wh2
+ *  expanded by the expansion's scalar twin (hvx_expand_i2i4_scalar, the
+ *  definition of what a code means) into @a wh4, and the plain sum over
+ *  those nibbles -- so a pass is "the 4-bit path's int32 sums". @a f picks
+ *  the entry: 0 _col, 1 _col_nopf, 2 _cols2_nopf with columns nt and
+ *  n_col - 1 - nt (the second compared too). */
+static uint32_t run_i2_case(int f, const uint8_t *act, const uint8_t *wh2,
+                            const uint8_t *wh4, const uint8_t *table,
+                            uint32_t m, uint32_t k_tiles, uint32_t n_col,
+                            uint32_t nt, uint32_t rows1) {
+  int32_t out[2][(HVX_GEMM_U8I4_MAX_ROWS + 1u) * 32u];
+  const uint32_t nts[2] = {nt, n_col - 1u - nt};
+  for (uint32_t i = 0; i < sizeof out / sizeof out[0][0]; ++i)
+    out[i / (sizeof out[0] / sizeof out[0][0])]
+       [i % (sizeof out[0] / sizeof out[0][0])] = GUARD;
+  if (f == 0)
+    hvx_gemm_u8i2_wh_col(act, m, k_tiles, wh2, n_col, nt, rows1, table, out[0]);
+  else if (f == 1)
+    hvx_gemm_u8i2_wh_col_nopf(act, m, k_tiles, wh2, n_col, nt, rows1, table,
+                              out[0]);
+  else
+    hvx_gemm_u8i2_wh_cols2_nopf(act, m, k_tiles, wh2, n_col, nts[0], nts[1],
+                                rows1, table, out[0], out[1]);
+  uint32_t bad = 0;
+  for (uint32_t o = 0; o < (f == 2 ? 2u : 1u); ++o) {
+    for (uint32_t r = 0; r < m; ++r)
+      for (uint32_t c = 0; c < 32u; ++c) {
+        int32_t s = 0;
+        for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+          const uint8_t *tile = wh4 + ((size_t)kt * n_col + nts[o]) * 512u;
+          const uint8_t *arow = act + (size_t)kt * 2048u + r * 32u;
+          for (uint32_t k = 0; k < 32u; ++k)
+            s += (int32_t)arow[k] * wh_value(tile, k, c);
+        }
+        bad += out[o][r * 32u + c] != s;
+      }
+    for (uint32_t i = m * 32u; i < sizeof out[0] / sizeof out[0][0]; ++i)
+      bad += out[o][i] != GUARD;
+  }
+  return bad;
+}
+
 int main(void) {
   static const uint32_t kts[] = {1u, 56u, 64u};
   static const uint32_t ncs[] = {64u, 112u};
   const size_t act_bytes = 64u * 2048u, wh_max = 64u * 112u * 512u;
   uint8_t *act = (uint8_t *)malloc(act_bytes);
   uint8_t *wh = (uint8_t *)malloc(wh_max);
-  if (!act || !wh)
+  uint8_t *wh2 = (uint8_t *)malloc(wh_max / 2u);
+  uint8_t *wh4 = (uint8_t *)malloc(wh_max);
+  uint8_t table[HVX_EXPAND_TABLE_BYTES] __attribute__((aligned(128)));
+  if (!act || !wh || !wh2 || !wh4)
     return 2;
   uint32_t bad = 0, cases = 0;
   /* data 0: random bytes; data 1: the extremes, activation 255 against
@@ -113,11 +159,49 @@ int main(void) {
               }
       }
   }
+  /* [plan 229] The u8i2 entries over the same shapes, rows and loops:
+     random codes and the activation extremes, an asymmetric palette using
+     both ends of int4 and ternary's {-1, 0, +1} (one entry unused). */
+  static const int8_t pals[2][4] = {{-8, -2, 1, 7}, {-1, 0, 1, 1}};
+  uint32_t bad2 = 0, cases2 = 0;
+  for (int data = 0; data < 2; ++data) {
+    for (size_t i = 0; i < act_bytes; ++i)
+      act[i] = data ? 0xFFu : rnd8();
+    for (size_t i = 0; i < wh_max / 2u; ++i)
+      wh2[i] = rnd8();
+    hvx_expand_i2i4_table(pals[data], table);
+    hvx_expand_i2i4_scalar(wh2, (uint32_t)(wh_max / 2u), table, wh4);
+    for (size_t a = 0; a < sizeof kts / sizeof kts[0]; ++a)
+      for (size_t b = 0; b < sizeof ncs / sizeof ncs[0]; ++b) {
+        const uint32_t nts[] = {0u, 1u, ncs[b] - 1u};
+        for (size_t t = 0; t < 3; ++t)
+          for (uint32_t m = 1; m <= HVX_GEMM_U8I4_MAX_ROWS; ++m)
+            for (int f = 0; f < 3; ++f)
+              for (uint32_t rows1 = 0; rows1 < 2u; ++rows1) {
+                const uint32_t b1 = run_i2_case(f, act, wh2, wh4, table, m,
+                                                kts[a], ncs[b], nts[t], rows1);
+                bad2 += b1;
+                ++cases2;
+                if (b1)
+                  printf("HVX GEMV NATIVE u8i2 %s m=%u k_tiles=%u n_col=%u "
+                         "nt=%u rows1=%u data=%d bad=%u\n",
+                         f == 0   ? "col"
+                         : f == 1 ? "col_nopf"
+                                  : "cols2_nopf",
+                         m, kts[a], ncs[b], nts[t], rows1, data, b1);
+              }
+      }
+  }
+  printf("HVX GEMV NATIVE u8i2 cases=%u bad=%u\n", cases2, bad2);
+  bad += bad2;
+  cases += cases2;
   printf("HVX GEMV NATIVE cases=%u bad=%u\n", cases, bad);
   printf(
     bad ? "HVX GEMV NATIVE DIFFERS FROM THE SCALAR SPEC\n"
         : "HVX GEMV NATIVE BIT-IDENTICAL (libnative; m=1..16 x rows1=0,1)\n");
   free(act);
   free(wh);
+  free(wh2);
+  free(wh4);
   return bad ? 1 : 0;
 }
