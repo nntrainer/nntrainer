@@ -294,6 +294,10 @@ typedef struct {
   uint32_t tile_stride, nt0, nb, row_stride, m_count;
   const float *act_scale; /**< mid's row params for this block */
   const int32_t *act_zp;
+  /* Their copy for a background job, which can trail the next block's
+     requantization into the same parity (act_scale/act_zp point here). */
+  float act_scale_own[HEXKL_HMX_INT8_BLOCK_N_ROW];
+  int32_t act_zp_own[HEXKL_HMX_INT8_BLOCK_N_ROW];
   const int32_t *colsum_w;
   const float *w_scale;
   const float *bias;
@@ -318,10 +322,39 @@ typedef struct {
   uint8_t *mid; /**< the mid buffer it packs into */
 } moe_dn_ctx;
 
+/** @brief Down staging buffers at most (hexkl_moe_layout.dn_ring). */
+#define MOE_DN_RING 4u
 #define MOE_RQ_UNIT_ROWS 16u
 #define MOE_RQ_UNITS (HEXKL_HMX_INT8_BLOCK_N_ROW / MOE_RQ_UNIT_ROWS)
 
 static inline void moe_worker_probe_add(uint64_t t0);
+
+/** @brief Down tile @a j of a batch: dequant and scatter, the expert's tail
+ *         rows too. */
+static inline void moe_dn_tile(const moe_dn_ctx *c, uint32_t j) {
+  const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
+  const int32_t *tile =
+    (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+  hvx_dequant_acc_tile_scatter_f32(
+    tile, c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + c0,
+    c->w_scale + c0, c->bias + c0, c->out + c0, c->N_out, c->rows, c->weights);
+  for (uint32_t q = 0; q < c->n_rows_b; ++q) {
+    hvx_scale_add_rows_f32(c->out + (size_t)c->rows_b[q] * c->N_out + c0,
+                           c->res_b + (size_t)q * c->N_out + c0,
+                           c->weights_b[q], HEXKL_ACC_TILE_COLS);
+  }
+}
+
+/** @brief The down epilogue as a background job, a tile a unit: queued
+ *         behind the batch before it, so an output row still takes its
+ *         experts' contributions in block order. */
+static void moe_dn_unit(uint32_t n_units, uint32_t u, void *vctx) {
+  uint64_t t0 = 0;
+  HEXKL_PROBE_T0(t0);
+  (void)n_units;
+  moe_dn_tile((const moe_dn_ctx *)vctx, u);
+  moe_worker_probe_add(t0);
+}
 
 static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_dn_ctx *c = (moe_dn_ctx *)vctx;
@@ -353,18 +386,7 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     }
   }
   for (uint32_t j = i; j < c->nb; j += n_threads) {
-    const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
-    const int32_t *tile =
-      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-    hvx_dequant_acc_tile_scatter_f32(tile, c->row_stride, c->m_count,
-                                     c->act_scale, c->act_zp, c->colsum_w + c0,
-                                     c->w_scale + c0, c->bias + c0, c->out + c0,
-                                     c->N_out, c->rows, c->weights);
-    for (uint32_t q = 0; q < c->n_rows_b; ++q) {
-      hvx_scale_add_rows_f32(c->out + (size_t)c->rows_b[q] * c->N_out + c0,
-                             c->res_b + (size_t)q * c->N_out + c0,
-                             c->weights_b[q], HEXKL_ACC_TILE_COLS);
-    }
+    moe_dn_tile(c, j);
   }
   moe_worker_probe_add(t0);
 }
@@ -1022,11 +1044,21 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
       return AEE_ENOMEMORY;
     }
   }
-  L.res_f32_off = ROUND_UP_U32(L.result_off + 2u * L.acc_tiles * ACC_TILE_BYTES,
-                               HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  L.total = L.res_f32_off + res_bytes;
-  if (L.total > arena_bytes) {
-    return AEE_ENOMEMORY;
+  /* The down batches' own staging ring, where res_f32 was (the fused
+     dequant-and-scatter left nothing to stage in f32): as many buffers as
+     fit, up to MOE_DN_RING. acc_tiles above was sized with res_f32's bytes
+     still reserved, so the ring always has at least the room it had. */
+  {
+    const uint32_t buf = L.acc_tiles * ACC_TILE_BYTES;
+    L.dn_stage_off =
+      ROUND_UP_U32(L.result_off + 2u * buf, HEXKL_HMX_ACTIVATION_ALIGNMENT);
+    const uint32_t fits =
+      arena_bytes > L.dn_stage_off ? (arena_bytes - L.dn_stage_off) / buf : 0u;
+    L.dn_ring = fits < MOE_DN_RING ? fits : MOE_DN_RING;
+    if (L.dn_ring == 0u) {
+      return AEE_ENOMEMORY;
+    }
+    L.total = L.dn_stage_off + L.dn_ring * buf;
   }
 
   *out = L;
@@ -1279,7 +1311,13 @@ int hexkl_mm_u8i4_moe_layer_run(
      retires it, so they live here, not in the loop body: one per staging
      buffer for each epilogue, one for the first block's requantization. */
   hvx_dq_swiglu_job gu_job[2];
-  moe_dn_ctx dn_ctx[2], rq0;
+  moe_dn_ctx rq_ctx[2], rq0;
+  /* The down epilogues: background jobs over the layout's down staging
+     ring, a ctx, job and done bytes per slot. dn_seq counts down batches. */
+  moe_dn_ctx dn_ctx[MOE_DN_RING];
+  hvx_bg_job dn_job[MOE_DN_RING];
+  uint8_t dn_done[MOE_DN_RING][32];
+  uint32_t dn_seq = 0u;
   /* HEXKL_MOE_MM_BEGIN/END's state. See the macros in hexkl_mm_u8i4_moe.h
      for why the HMX issue loop is timed by difference. */
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
@@ -1867,8 +1905,16 @@ int hexkl_mm_u8i4_moe_layer_run(
            nt0 += L.acc_tiles, ++db) {
         const uint32_t nb =
           (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+        /* The ring slot's previous batch has to be dequantized before
+           this one lands in it. What the wait reads is the exposure. */
+        const uint32_t k = dn_seq % L.dn_ring;
+        if (dn_seq >= L.dn_ring) {
+          HEXKL_PROBE_T0(p0);
+          hvx_worker_pool_wait_bg(pool, &dn_job[k], UINT32_MAX);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
+        }
         const uint32_t stage_off =
-          L.result_off + (sb & 1u) * L.acc_tiles * ACC_TILE_BYTES;
+          L.dn_stage_off + k * L.acc_tiles * ACC_TILE_BYTES;
         if (pblk.first) {
           HEXKL_PROBE_T0(p0);
           if (hexkl_probe_on) {
@@ -1916,15 +1962,29 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
         HEXKL_MOE_MM_END();
 
-        /* db == 0 retires GU(n)'s last epilogue -- gate_off is complete,
-           which the requantization in this job needs -- and every later
-           wait the epilogue before it, the one carrying rq(n) included. */
-        HEXKL_PROBE_T0(p0);
-        hvx_worker_pool_wait(pool);
-        HEXKL_PROBE_ADD(db == 0u ? HEXKL_PROBE_DEQUANT : HEXKL_PROBE_REQUANT,
-                        p0);
+        /* db == 0 retires GU(n)'s last epilogue -- gate_off is complete --
+           and rq(n) goes out as the foreground job, GU(n+1)'s first batch
+           to hide behind. */
+        if (db == 0u && have_cur) {
+          HEXKL_PROBE_T0(p0);
+          hvx_worker_pool_wait(pool);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
+          moe_dn_ctx *q = &rq_ctx[n & 1u];
+          q->nb = 0u;
+          q->gate = gate;
+          q->rq_m_blk = blk.m_blk;
+          q->inter = inter;
+          q->rq_scale = rq_scale + (n & 1u) * BR;
+          q->rq_zp = rq_zp + (n & 1u) * BR;
+          q->mid = vtcm_base + L.mid_off + (n & 1u) * mid_bytes;
+          hvx_worker_pool_submit(pool, moe_dn_worker, q, MOE_RQ_UNITS);
+        }
+        /* The epilogue on the background lane, behind the batch before it:
+           the workers take its tiles whenever no foreground job needs
+           them, so it trails the HMX by up to the ring instead of being
+           retired one batch on. */
         {
-          moe_dn_ctx *c = &dn_ctx[sb & 1u];
+          moe_dn_ctx *c = &dn_ctx[k];
           c->tiles_base =
             (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                               acc->base);
@@ -1933,8 +1993,11 @@ int hexkl_mm_u8i4_moe_layer_run(
           c->nb = nb;
           c->row_stride = acc->row_stride;
           c->m_count = pblk.m_blk;
-          c->act_scale = rq_scale + pp * BR;
-          c->act_zp = rq_zp + pp * BR;
+          memcpy(c->act_scale_own, rq_scale + pp * BR,
+                 sizeof(float) * pblk.m_blk);
+          memcpy(c->act_zp_own, rq_zp + pp * BR, sizeof(int32_t) * pblk.m_blk);
+          c->act_scale = c->act_scale_own;
+          c->act_zp = c->act_zp_own;
           c->colsum_w = d->colsum_w;
           c->w_scale = d->w_scale;
           c->bias = d->bias;
@@ -1954,20 +2017,16 @@ int hexkl_mm_u8i4_moe_layer_run(
             c->weights_b = NULL;
             c->n_rows_b = 0u;
           }
-          if (db == 0u && have_cur) {
-            c->gate = gate;
-            c->rq_m_blk = blk.m_blk;
-            c->inter = inter;
-            c->rq_scale = rq_scale + (n & 1u) * BR;
-            c->rq_zp = rq_zp + (n & 1u) * BR;
-            c->mid = vtcm_base + L.mid_off + (n & 1u) * mid_bytes;
-          } else {
-            c->gate = NULL;
-          }
-          hvx_worker_pool_submit(pool, moe_dn_worker, c,
-                                 nb + (c->gate ? MOE_RQ_UNITS : 0u));
+          c->gate = NULL;
+          hvx_bg_job *dj = &dn_job[k];
+          dj->func = moe_dn_unit;
+          dj->ctx = c;
+          dj->n_units = nb;
+          dj->done = dn_done[k];
+          hvx_worker_pool_submit_bg(pool, dj);
+          last_job = dj;
         }
-        ++sb;
+        ++dn_seq;
       }
     }
 
@@ -1996,9 +2055,14 @@ int hexkl_mm_u8i4_moe_layer_run(
     have_cur = have_next;
   }
 
-  /* The last down epilogue. */
+  /* The last down epilogue, and every one before it (the lane completes
+     its jobs in order). */
   HEXKL_PROBE_T0(p0);
   hvx_worker_pool_wait(pool);
+  if (dn_seq != 0u) {
+    hvx_worker_pool_wait_bg(pool, &dn_job[(dn_seq - 1u) % L.dn_ring],
+                            UINT32_MAX);
+  }
   HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
 
   HEXKL_PROBE_T0(p0);
