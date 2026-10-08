@@ -2922,13 +2922,14 @@ TEST_F(HmxMmU8I4Layer, MoeLayerU8I2GemvMatchesI4Twin) {
     // compare equal and prove nothing about the u8i2 GEMV. Slot 30 is the
     // feed's DMA queue count (HEXKL_PROBE_M1_FEED), 0 on the arena read.
     std::vector<uint32_t> stage(31, 0xFFFFFFFFu);
+    // act 0: a GeGLU cell's bit 19 rides the session word (moe_set_opts)
     const int err = nntr_hvx_mm_u8i4_moe_layer_timed(
-      handle_, 1, K, I, N, gu[w].data(), (int)NE, dn[w].data(), (int)NE,
+      handle_, 1, K, I, N, 0u, gu[w].data(), (int)NE, dn[w].data(), (int)NE,
       index.data(), (int)NE, count.data(), (int)NE, weight.data(), (int)NE,
       act.data(), (int)K, out.data(), (int)N, stage.data(), 31);
     if (err == AEE_SUCCESS) {
       EXPECT_EQ(stage[29], flags & 1u) << "path, opts=0x" << std::hex << flags;
-      EXPECT_EQ(stage[30], (flags & 0x20000u) ? 1u + ((flags >> 19) & 3u) : 0u)
+      EXPECT_EQ(stage[30], (flags & 0x20000u) ? 1u + ((flags >> 22) & 3u) : 0u)
         << "feed, opts=0x" << std::hex << flags;
     }
     return err;
