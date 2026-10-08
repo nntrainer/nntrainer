@@ -189,15 +189,25 @@ static inline HVX_Vector hvx_swiglu_det_sf(HVX_Vector g, HVX_Vector u) {
   return Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(g, s), u);
 }
 
-/** @brief gelu_tanh(g)*u for every f32 lane: swiglu_det.h's geglu_det_one,
- *         operation for operation -- the sigmoid of
- *         w = -2 sqrt(2/pi) (g + 0.044715 g^3) on the same exp/recip. */
+/**
+ * @brief gelu_tanh(g)*u for every f32 lane, through the SAME exp_det and
+ *        recip_det as SwiGLU (doc 55 section 6.4, Gemma-4's experts).
+ * gelu_tanh(x) = 0.5 x (1 + tanh(y)), y = sqrt(2/pi) (x + 0.044715 x^3),
+ * and 0.5 (1 + tanh(y)) = sigmoid(2y), so this is x * sigmoid(t) with
+ * t = x (C0 + C1 x^2), C0 = 2 sqrt(2/pi), C1 = 0.044715 C0 -- three plain
+ * Vsf multiplies and one add in front of the silu pipeline, every one
+ * rounding on its own like the rest of this header. swiglu_det.h's
+ * geglu_det_one is the host twin, operation for operation.
+ */
+#define GEGLU_DET_C0 1.5957691216f
+#define GEGLU_DET_C1 0.0713548163f
 static inline HVX_Vector hvx_geglu_det_sf(HVX_Vector g, HVX_Vector u) {
-  const HVX_Vector cube = Q6_Vsf_vmpy_VsfVsf(g, Q6_Vsf_vmpy_VsfVsf(g, g));
-  const HVX_Vector inner =
-    Q6_Vsf_vadd_VsfVsf(g, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(0.044715f), cube));
-  const HVX_Vector e =
-    hvx_exp_det_sf(Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(-1.595769121f), inner));
+  const HVX_Vector g2 = Q6_Vsf_vmpy_VsfVsf(g, g);
+  const HVX_Vector poly =
+    Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(GEGLU_DET_C0),
+                       Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(GEGLU_DET_C1), g2));
+  const HVX_Vector t = Q6_Vsf_vmpy_VsfVsf(g, poly);
+  const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(Q6_V_vzero(), t));
   const HVX_Vector d = Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(1.0f), e);
   const HVX_Vector s = hvx_recip_det_sf(d);
   return Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(g, s), u);

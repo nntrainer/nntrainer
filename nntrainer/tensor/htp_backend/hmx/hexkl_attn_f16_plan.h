@@ -61,7 +61,9 @@ typedef struct {
   uint32_t cache_to;   /**< valid cache rows, > every query position */
   uint32_t n_head_q;
   uint32_t n_head_kv;
-  uint32_t head_dim; /**< multiple of 32, at most 256 */
+  uint32_t head_dim; /**< multiple of 32, at most 512: the dot loop chains
+                          hd/32 HMX tiles into one accumulator, and the
+                          layout scales with it */
   uint32_t window;   /**< sliding window length; 0 means unlimited */
   float softcap;     /**< > 0: logits become tanh(s/softcap)*softcap
                           (MHACoreLayer's attn_logit_softcapping); 0 off */
@@ -121,7 +123,7 @@ static inline uint32_t hexkl_attn_round_up(uint32_t v, uint32_t a) {
 static inline int hexkl_attn_f16_tiling_init_aligned(
   const hexkl_attn_f16_shape *s, hexkl_attn_f16_tiling *t, uint32_t row_align) {
   if (!s || !t || s->n_q == 0 || s->n_head_q == 0 || s->n_head_kv == 0 ||
-      s->head_dim == 0 || s->head_dim > 256u ||
+      s->head_dim == 0 || s->head_dim > 512u ||
       (s->head_dim % HEXKL_ATTN_TILE) != 0 ||
       (s->n_head_q % s->n_head_kv) != 0 ||
       s->cache_to < s->cache_from + s->n_q || row_align == 0) {

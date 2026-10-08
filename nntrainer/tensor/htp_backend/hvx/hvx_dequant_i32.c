@@ -229,7 +229,8 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
         dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
                   csu, vwu, vbu);
       ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] =
-        c->geglu ? hvx_geglu_det_sf(g, u) : hvx_swiglu_det_sf(g, u);
+        c->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(g, u)
+                                    : hvx_swiglu_det_sf(g, u);
     }
   }
 }
@@ -238,15 +239,15 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
   uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  uint32_t geglu, hvx_worker_pool *pool) {
+  const float *bias, uint32_t inter, uint32_t act, float *dst,
+  uint32_t dst_stride, hvx_worker_pool *pool) {
   if (!tiles_base || n_pairs == 0u || m_count == 0u) {
     return;
   }
   hvx_dq_swiglu_job c = {tiles_base, tile_stride, n_pairs,   g0,
                          row_stride, m_count,     act_scale, act_zp,
                          colsum_w,   w_scale,     bias,      inter,
-                         dst,        dst_stride,  geglu};
+                         dst,        dst_stride,  act};
   hvx_worker_pool_run(pool, hvx_dq_swiglu_worker, &c, n_pairs);
 }
 

@@ -13,11 +13,11 @@
  * @bug    No known bugs except for NYI items
  *
  * Plan docs/plans/141-dspq-moe.md sections 3.2-3.4; the packet is
- * htp_dspq_wire.h. [#132 Part B E2, #211] The same thread answers
- * HTP_DSPQ_OP_TOKEN, one decode token of the session's token driver
- * (nntr_hvx_token.c): it runs the token's graph and waits on the mailbox
- * page for the expert pool's miss answers -- the session's own thread,
- * not a pool lane. Same entry
+ * htp_dspq_wire.h. [#132 Part B E2] The same thread answers
+ * HTP_DSPQ_OP_TOKEN, one decode token of the session's token driver role
+ * (nntr_hvx_token.c): on S1 it waits for S2's rows on the mailbox page
+ * between its rounds, on S2 it runs the token's graph -- both sessions'
+ * own threads, not pool lanes (plan 132-part-b section 3.2). Same entry
  * function, same argument bytes, same session state, so the arithmetic is the
  * FastRPC path's bit for bit: the kernel resets its DMA ring per call and the
  * pool splits jobs by index, so which thread is lane 0 does not enter the
@@ -95,7 +95,7 @@ static int dspq_valid(const dspq_msg *m, uint32_t len, uint32_t nb,
                       const struct dspqueue_buffer *bufs) {
   const htp_dspq_req_hdr *h = &m->h;
   return len >= sizeof(*h) && h->op == HTP_DSPQ_OP_MOE &&
-         (h->flags & ~HTP_DSPQ_FLAG_TIMED) == 0 &&
+         (h->flags & ~(HTP_DSPQ_FLAG_TIMED | HTP_DSPQ_FLAG_GELU)) == 0 &&
          len == htp_dspq_req_bytes(h->n_experts, h->n_rows) && nb == 2 &&
          bufs[0].ptr != NULL && bufs[1].ptr != NULL &&
          bufs[0].size == (uint64_t)h->M * h->K * sizeof(float) &&
@@ -115,22 +115,23 @@ static int dspq_run(struct nntr_hvx_dspq *d, const dspq_msg *m,
   const float *row_weight = &m->f[o + 3 * ne + nr];
   const remote_handle64 hs = (remote_handle64)d->s;
   const int act_len = (int)(h->M * h->K), out_len = (int)(h->M * h->N_out);
+  const uint32_t act = (h->flags & HTP_DSPQ_FLAG_GELU) ? 1u : 0u;
   if (h->flags & HTP_DSPQ_FLAG_TIMED) {
     return nntr_hvx_mm_u8i4_moe_layer_timed(
-      hs, h->M, h->K, h->inter, h->N_out, h_gu, (int)ne, h_dn, (int)ne,
+      hs, h->M, h->K, h->inter, h->N_out, act, h_gu, (int)ne, h_dn, (int)ne,
       row_index, (int)nr, row_count, (int)ne, row_weight, (int)nr,
       (const float *)bufs[0].ptr, act_len, (float *)bufs[1].ptr, out_len,
       resp->stage_us, (int)HTP_DSPQ_STAGES);
   }
   return nntr_hvx_mm_u8i4_moe_layer(
-    hs, h->M, h->K, h->inter, h->N_out, h_gu, (int)ne, h_dn, (int)ne, row_index,
-    (int)nr, row_count, (int)ne, row_weight, (int)nr,
+    hs, h->M, h->K, h->inter, h->N_out, act, h_gu, (int)ne, h_dn, (int)ne,
+    row_index, (int)nr, row_count, (int)ne, row_weight, (int)nr,
     (const float *)bufs[0].ptr, act_len, (float *)bufs[1].ptr, out_len);
 }
 
 /** @brief [#132 Part B E2] Answers one HTP_DSPQ_OP_TOKEN packet: the
- *  session's token driver on the packet's buffers (0 the embedding row,
- *  1 the logits under HTP_DSPQ_TOKEN_LOGITS).
+ *  session's token driver role on the packet's buffers (S2: 0 the
+ *  embedding row, 1 the logits under HTP_DSPQ_TOKEN_LOGITS; S1: none).
  *  A malformed packet is answered AEE_EBADPARM, as a MoE packet is.
  *  @return dspqueue_write's code */
 static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
@@ -285,8 +286,8 @@ int nntr_hvx_dspq_start(remote_handle64 handle, uint64 queue_id,
   if (s == NULL || s->dspq != NULL) {
     return AEE_EBADSTATE;
   }
-  /* [#178] a lite session (no HMX) may take a queue too; its OP_MOE
-     packets get the MoE entry's AEE_EUNSUPPORTED */
+  /* [#178] a lite session (no HMX) takes a queue for OP_TOKEN (S2 in #132
+     Part B E3); its OP_MOE packets get the MoE entry's AEE_EUNSUPPORTED */
   if (nntr_hvx_moe_stage_count() != HTP_DSPQ_STAGES) {
     FARF(ERROR, "dspq: stage slots %u, wire header says %u",
          (unsigned)nntr_hvx_moe_stage_count(), (unsigned)HTP_DSPQ_STAGES);
