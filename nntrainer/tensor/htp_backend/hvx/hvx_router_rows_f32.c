@@ -143,19 +143,21 @@ static void topk_worker(uint32_t n_threads, uint32_t i, void *v) {
   for (uint32_t r = lo; r < hi; ++r) {
     const float *pr = c->p + (size_t)r * c->E;
     uint32_t *sr = c->sel + (size_t)r * c->n_sel;
-    uint32_t taken[4] = {0u, 0u, 0u, 0u}; /* E <= 128 */
-    /* n_sel passes of a first-maximum scan: strict > in index order is
-       the CPU comparator's tie rule (the lower index wins) */
-    for (uint32_t k = 0; k < c->n_sel; ++k) {
-      uint32_t best = c->E;
-      for (uint32_t e = 0; e < c->E; ++e) {
-        if (taken[e >> 5] & (1u << (e & 31u)))
-          continue;
-        if (best == c->E || pr[e] > pr[best])
-          best = e;
-      }
-      taken[best >> 5] |= 1u << (best & 31u);
-      sr[k] = best;
+    /* One pass keeping the n_sel largest sorted, instead of n_sel passes
+       of a first-maximum scan (2.7 ms of a 9 ms prefill router call on
+       device, doc 57 section 9.28). An index goes in after every kept
+       entry whose value is >= its own, so equal values stay in index
+       order: the CPU comparator's tie rule (the lower index wins), the
+       same selection the scans made. */
+    uint32_t n = 0;
+    for (uint32_t e = 0; e < c->E; ++e) {
+      const float v = pr[e];
+      if (n == c->n_sel && !(v > pr[sr[n - 1u]]))
+        continue;
+      uint32_t j = n < c->n_sel ? n++ : n - 1u;
+      for (; j > 0 && v > pr[sr[j - 1u]]; --j)
+        sr[j] = sr[j - 1u];
+      sr[j] = e;
     }
     float wsum = 0.0f;
     for (uint32_t k = 0; k < c->top_k; ++k)
