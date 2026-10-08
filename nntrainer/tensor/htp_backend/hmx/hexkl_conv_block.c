@@ -59,7 +59,7 @@
 
 typedef struct {
   float *z;            /**< this block's [64 x C] f32, VTCM */
-  const float *g;      /**< the whole conv input, heap */
+  const float *g;      /**< the conv input from its two history rows, heap */
   const float *conv_w; /**< [3 x C], VTCM */
   uint8_t *mid;        /**< this block's AH tiles, VTCM */
   float *rq_scale;     /**< this block's row params, 64 each */
@@ -91,8 +91,10 @@ static void cb_gate_unit(uint32_t n_units, uint32_t u, void *v) {
     (c->m_blk - r0 < CB_GATE_UNIT_ROWS) ? (c->m_blk - r0) : CB_GATE_UNIT_ROWS;
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
-  hvx_conv_gate_f32(c->z + (size_t)r0 * c->C, c->C, c->g, c->C, c->mb + r0, n,
-                    c->C, c->conv_w, NULL);
+  /* g's row 0 is the first history row, so block row mb is g row mb + 2
+     and every look-back reads a real row: the history, or zeros */
+  hvx_conv_gate_f32(c->z + (size_t)r0 * c->C, c->C, c->g, c->C, c->mb + 2u + r0,
+                    n, c->C, c->conv_w, NULL);
   cb_stage_probe_add(t0);
 }
 
@@ -222,8 +224,8 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                          uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                          uint32_t K, uint32_t C, uint32_t N_out, uint32_t h_a,
                          uint32_t h_b, uint32_t h_c, uint32_t h_out,
-                         const float *conv_w, const float *act_f32,
-                         float *out_f32, float *state_f32,
+                         const float *conv_w, const float *hist,
+                         const float *act_f32, float *out_f32, float *state_f32,
                          hvx_worker_pool *pool, hexkl_moe_scratch *scratch) {
   if (!tbl || !vtcm_base || !conv_w || !act_f32 || !out_f32 || !state_f32 ||
       !scratch || M == 0u) {
@@ -268,7 +270,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   const size_t sz_mpad_f32 = sizeof(float) * m_pad;
   const size_t sz_act_c = sizeof(float) * (size_t)m_pad * K;
   const size_t sz_act_ah = (size_t)m_pad * K;
-  const size_t sz_g = sizeof(float) * (size_t)M * C;
+  const size_t sz_g = sizeof(float) * (size_t)(M + 2u) * C;
   const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
   const size_t sz_pack_done = m_pad / HEXKL_MOE_PACK_UNIT_ROWS + 1u;
   const size_t sz_rq = sizeof(float) * BR;
@@ -291,7 +293,15 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_f32);
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
   uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_act_ah);
-  float *g = (float *)hexkl_moe_carve(&cur, sz_g);
+  /* g behind its two history rows (hist, else zeros -- what the gate
+     read for a row before 0 when the block always started a prompt) */
+  float *g_hist = (float *)hexkl_moe_carve(&cur, sz_g);
+  float *g = g_hist + 2u * C;
+  if (hist) {
+    memcpy(g_hist, hist, 2u * C * sizeof(float));
+  } else {
+    memset(g_hist, 0, 2u * C * sizeof(float));
+  }
   float *out_c = (float *)hexkl_moe_carve(&cur, sz_out_c);
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
   float *rq_scale[2], *zbuf[2];
@@ -458,15 +468,11 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   hvx_worker_pool_wait(pool);
   HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
 
-  /* The conv state the CPU decode path continues from: g's last two rows
-     (x_{t-2}, x_{t-1} in causal_conv1d_layer's order), zero-padded when M
-     is shorter. 16 KB, so a plain copy into the uncached buffer. */
-  if (M >= 2u) {
-    memcpy(state_f32, g + (size_t)(M - 2u) * C, 2u * C * sizeof(float));
-  } else {
-    memset(state_f32, 0, C * sizeof(float));
-    memcpy(state_f32 + C, g, C * sizeof(float));
-  }
+  /* The conv state the CPU decode path (or the next chunk) continues
+     from: g's last two rows (x_{t-2}, x_{t-1} in causal_conv1d_layer's
+     order), the history's where M is shorter. 16 KB, so a plain copy into
+     the uncached buffer. */
+  memcpy(state_f32, g_hist + (size_t)M * C, 2u * C * sizeof(float));
 
   /* ---- phase 2: out = (dq(x . W_b) * conv1d(g)) . W_out ---------------- */
   /* Both slots are dead (every HMX read of them returned). Block 0's
@@ -570,7 +576,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       {
         cb_stage_ctx *c = &stage_ctx[cur];
         c->z = zbuf[cur];
-        c->g = g;
+        c->g = g_hist;
         c->conv_w = conv_w_v;
         c->mid = midbuf[cur];
         c->rq_scale = rq_scale[cur];

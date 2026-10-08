@@ -24,7 +24,9 @@
  * norms' domain is m1_ops_det.h's (d >= eps, normal). The router is the
  * third exception (#132 PR 2): the Android CPU's order, E fused sffma
  * chains on the scalar core and the spec's own sigmoid and selection
- * (m1_router_cpu_sigmoid / _pick).
+ * (m1_router_cpu_sigmoid / _pick). Gemma's softmax router (plan 201 S4) is
+ * plain Vsf chains, 32 experts a vector, and the spec's own scalar
+ * softmax / top-k / renormalise (m1_router_softmax_pick).
  */
 
 #include "hvx_m1_ops_f32.h"
@@ -59,10 +61,61 @@ static inline float hvx_rmsnorm_scale(const float *x, uint32_t chunk,
   return m1_norm_scale_det(m1_norm_reduce_det(acc), chunk, eps);
 }
 
-void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
-                     uint32_t chunk, float eps, float *row_scale_out) {
-  if (!x || !gamma || !y || chunk == 0u || chunk % LANES != 0u ||
-      (chunk & (chunk - 1u)) != 0u || n % chunk != 0u) {
+/** @brief [plan 201 S4] N1's row scale: the largest |bits|, then q =
+ *         a 2^11 + b on 32 word lanes and the integer sums of a^2, a b and
+ *         b^2 (each term <= 2^22, so M1_N1_BLOCK_VECS of them fit a u32
+ *         lane), each block's lanes added into u64s: S = 2^22 A + 2^12 B +
+ *         C = sum q^2 exactly, so any lane count or order gives
+ *         m1_rmsnorm_n1_chunk_det's S. The rest is the spec's own scalar
+ *         m1_n1_norm_scale_det. */
+static inline float hvx_rmsnorm_n1_scale(const float *x, uint32_t chunk,
+                                         float eps) {
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  const uint32_t nvec = chunk / LANES;
+  const HVX_Vector mag = Q6_V_vsplat_R(0x7FFFFFFF);
+  const HVX_Vector magic = Q6_V_vsplat_R(0x4B400000);
+  const HVX_Vector lo11 = Q6_V_vsplat_R(0x7FF);
+  HVX_Vector vmax = Q6_V_vzero();
+  uint32_t amax = 0u;
+  uint64_t A = 0u, B = 0u, C = 0u;
+  for (uint32_t i = 0; i < nvec; ++i) {
+    vmax = Q6_Vw_vmax_VwVw(vmax, Q6_V_vand_VV(vx[i], mag));
+  }
+  const uint32_t *mw = (const uint32_t *)&vmax;
+  for (uint32_t l = 0; l < LANES; ++l) {
+    amax = mw[l] > amax ? mw[l] : amax;
+  }
+  const int k = m1_n1_shift_det(amax);
+  const HVX_Vector p = hvx_splat_sf(m1_n1_pow2_det(k));
+  for (uint32_t b0 = 0; b0 < nvec; b0 += M1_N1_BLOCK_VECS) {
+    const uint32_t e =
+      b0 + M1_N1_BLOCK_VECS < nvec ? b0 + M1_N1_BLOCK_VECS : nvec;
+    HVX_Vector va = Q6_V_vzero(), vb = Q6_V_vzero(), vc = Q6_V_vzero();
+    for (uint32_t i = b0; i < e; ++i) {
+      const HVX_Vector v = Q6_Vsf_vmpy_VsfVsf(Q6_V_vand_VV(vx[i], mag), p);
+      const HVX_Vector q = Q6_Vw_vsub_VwVw(Q6_Vsf_vadd_VsfVsf(v, magic), magic);
+      /* a, b <= 2^11 sit in the low halfword: w * w.uh is exact */
+      const HVX_Vector a = Q6_Vuw_vlsr_VuwR(q, 11);
+      const HVX_Vector lo = Q6_V_vand_VV(q, lo11);
+      va = Q6_Vw_vadd_VwVw(va, Q6_Vw_vmpyie_VwVuh(a, a));
+      vb = Q6_Vw_vadd_VwVw(vb, Q6_Vw_vmpyie_VwVuh(a, lo));
+      vc = Q6_Vw_vadd_VwVw(vc, Q6_Vw_vmpyie_VwVuh(lo, lo));
+    }
+    const uint32_t *aw = (const uint32_t *)&va, *bw = (const uint32_t *)&vb,
+                   *cw = (const uint32_t *)&vc;
+    for (uint32_t l = 0; l < LANES; ++l) {
+      A += aw[l];
+      B += bw[l];
+      C += cw[l];
+    }
+  }
+  return m1_n1_norm_scale_det((A << 22) + (B << 12) + C, k, chunk, eps);
+}
+
+static void rmsnorm_rows(const float *x, const float *gamma, float *y,
+                         uint32_t n, uint32_t chunk, float eps,
+                         float *row_scale_out, int n1) {
+  if (!x || !y || chunk == 0u || chunk % LANES != 0u || n % chunk != 0u) {
     return;
   }
   const uint32_t nvec = chunk / LANES;
@@ -72,45 +125,76 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
     const HVX_UVector *vg = (const HVX_UVector *)gamma;
     HVX_UVector *vy = (HVX_UVector *)(y + (size_t)c * chunk);
 
-    const float rs = hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
+    const float rs = n1
+                       ? hvx_rmsnorm_n1_scale(x + (size_t)c * chunk, chunk, eps)
+                       : hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
     if (row_scale_out) {
       row_scale_out[c] = rs;
     }
     const HVX_Vector r = hvx_splat_sf(rs);
-    for (uint32_t i = 0; i < nvec; ++i) {
-      vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
+    if (gamma) {
+      for (uint32_t i = 0; i < nvec; ++i) {
+        vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
+      }
+    } else {
+      for (uint32_t i = 0; i < nvec; ++i) {
+        vy[i] = Q6_Vsf_vmpy_VsfVsf(vx[i], r);
+      }
     }
   }
 }
 
-/** @brief One head in fp16 (m1_rope64_det): a | b halves rounded, then
- *         rne16(rne16(a*c) - rne16(b*s)) and rne16(rne16(a*s) + rne16(b*c)),
- *         the CPU's fmul / fsub / fadd .8h. */
-static inline void hvx_rope64_head(float *x, HVX_Vector c, HVX_Vector s) {
-  HVX_UVector *v = (HVX_UVector *)x;
-  const HVX_Vector a = hvx_rne16_sf(v[0]), b = hvx_rne16_sf(v[1]);
-  v[0] =
+void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
+                     uint32_t chunk, float eps, float *row_scale_out) {
+  rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 0);
+}
+
+void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
+                        uint32_t n, uint32_t chunk, float eps,
+                        float *row_scale_out) {
+  rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 1);
+}
+
+/** @brief 32 lanes of one head in fp16 (m1_rope_det): a | b halves
+ *         rounded, then rne16(rne16(a*c) - rne16(b*s)) and
+ *         rne16(rne16(a*s) + rne16(b*c)), the CPU's fmul / fsub / fadd .8h.
+ *         @a h is the half head in floats: b is a + h. */
+static inline void hvx_rope_lanes(float *x, uint32_t h, HVX_Vector c,
+                                  HVX_Vector s) {
+  HVX_UVector *va = (HVX_UVector *)x, *vb = (HVX_UVector *)(x + h);
+  const HVX_Vector a = hvx_rne16_sf(*va), b = hvx_rne16_sf(*vb);
+  *va =
     hvx_rne16_sf(Q6_Vsf_vsub_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, c)),
                                     hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, s))));
-  v[1] =
+  *vb =
     hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, s)),
                                     hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, c))));
 }
 
-void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
-                    const float *cs) {
-  if (!cs || (n_q && !q) || (n_k && !k)) {
+void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
+                  const float *cs, uint32_t head_dim) {
+  const uint32_t h = head_dim / 2u;
+  if (!cs || (n_q && !q) || (n_k && !k) || head_dim == 0u || h % LANES != 0u) {
     return;
   }
-  /* The CPU's table is (_FP16) of the same f32 values. */
-  const HVX_Vector c = hvx_rne16_sf(((const HVX_UVector *)cs)[0]);
-  const HVX_Vector s = hvx_rne16_sf(((const HVX_UVector *)cs)[1]);
-  for (uint32_t h = 0; h < n_q; ++h) {
-    hvx_rope64_head(q + (size_t)h * 2u * LANES, c, s);
+  /* One 32-lane chunk of the half head at a time: the table vectors are
+     loaded once per chunk for every head (the CPU's table is (_FP16) of
+     the same f32 values). */
+  for (uint32_t j = 0; j < h; j += LANES) {
+    const HVX_Vector c = hvx_rne16_sf(*(const HVX_UVector *)(cs + j));
+    const HVX_Vector s = hvx_rne16_sf(*(const HVX_UVector *)(cs + h + j));
+    for (uint32_t i = 0; i < n_q; ++i) {
+      hvx_rope_lanes(q + (size_t)i * head_dim + j, h, c, s);
+    }
+    for (uint32_t i = 0; i < n_k; ++i) {
+      hvx_rope_lanes(k + (size_t)i * head_dim + j, h, c, s);
+    }
   }
-  for (uint32_t h = 0; h < n_k; ++h) {
-    hvx_rope64_head(k + (size_t)h * 2u * LANES, c, s);
-  }
+}
+
+void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
+                    const float *cs) {
+  hvx_rope_f32(q, n_q, k, n_k, cs, 2u * LANES);
 }
 
 void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
@@ -272,6 +356,51 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 
+/* ---- [plan 201 S4] Gemma 4's softmax router ----------------------------- */
+
+typedef struct {
+  const float *x, *w;
+  uint32_t K, Ep;
+  float *acc;
+} router_sm_ctx;
+
+/** @brief Pool lane i: 32-expert blocks i, i + n, ... -- one Vsf chain
+ *         each over k in order, acc = acc + x[k] * W[k][block] (two
+ *         roundings, m1_router_softmax_det's order). */
+static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
+  const router_sm_ctx *c = (const router_sm_ctx *)v;
+  for (uint32_t b = i; b < c->Ep / LANES; b += n) {
+    const float *col = c->w + (size_t)b * LANES;
+    HVX_Vector acc = Q6_V_vzero();
+    for (uint32_t k = 0; k < c->K; ++k) {
+      acc = Q6_Vsf_vadd_VsfVsf(
+        acc,
+        Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]),
+                           *(const HVX_UVector *)(col + (size_t)k * c->Ep)));
+    }
+    *(HVX_UVector *)(c->acc + (size_t)b * LANES) = acc;
+  }
+}
+
+void hvx_router_softmax_topk_f32(const float *x, const float *wp,
+                                 const float *pes, uint32_t K, uint32_t E,
+                                 uint32_t top_k, float *logits, uint32_t *sel,
+                                 float *weight, hvx_worker_pool *pool) {
+  float acc[M1_DET_ROUTER_SM_MAX_E];
+  const uint32_t Ep = (E + LANES - 1u) / LANES * LANES;
+  if (!x || !wp || !pes || !logits || !sel || !weight || K == 0u || E == 0u ||
+      E > M1_DET_ROUTER_SM_MAX_E || top_k == 0u || top_k > E) {
+    return;
+  }
+  /* ponytail: f32 weights, 1.4 MiB a layer at Gemma's 2816 x 128 read once
+     a token (43 MiB over 30 layers); f16 / bf16 storage halves it when the
+     router shows in the stage timers. */
+  router_sm_ctx c = {x, wp, K, Ep, acc};
+  hvx_worker_pool_run(pool, router_sm_lane, &c, Ep / LANES);
+  memcpy(logits, acc, (size_t)E * sizeof(float));
+  m1_router_softmax_pick(acc, pes, E, top_k, sel, weight);
+}
+
 /* ---- [#132 Part B E5f] SwiGLU over the pool, argmax in one vector pass -- */
 
 typedef struct {
@@ -346,4 +475,67 @@ uint32_t hvx_argmax_first_f32(const float *x, uint32_t n) {
     }
   }
   return idx;
+}
+
+/* ---- [plan 201 S4] Gemma 4: the dense GeGLU, the logit soft-cap, x * s -- */
+
+void hvx_geglu_f32(const float *gate, const float *up, float *out, uint32_t n) {
+  uint32_t i = 0;
+  for (; i + LANES <= n; i += LANES) {
+    *(HVX_UVector *)(out + i) = hvx_geglu_det_sf(
+      *(const HVX_UVector *)(gate + i), *(const HVX_UVector *)(up + i));
+  }
+  for (; i < n; ++i) {
+    out[i] = geglu_det_one(gate[i], up[i]);
+  }
+}
+
+typedef struct {
+  float *x;
+  uint32_t n;
+  float inv, cap;
+} softcap_ctx;
+
+/* m1_softcap_one_det, operation for operation, on a lane's vectors */
+static void softcap_lane(uint32_t n_threads, uint32_t i, void *v) {
+  const softcap_ctx *c = (const softcap_ctx *)v;
+  const uint32_t nvec = c->n / LANES;
+  const uint32_t lo = (uint32_t)((uint64_t)nvec * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)nvec * (i + 1u) / n_threads);
+  const HVX_Vector inv = hvx_splat_sf(c->inv), cap = hvx_splat_sf(c->cap);
+  const HVX_Vector one = hvx_splat_sf(1.0f), two = hvx_splat_sf(2.0f);
+  const HVX_Vector m2 = hvx_splat_sf(-2.0f);
+  HVX_UVector *xv = (HVX_UVector *)c->x;
+  for (uint32_t b = lo; b < hi; ++b) {
+    const HVX_Vector a = Q6_Vsf_vmpy_VsfVsf(xv[b], inv);
+    const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vmpy_VsfVsf(m2, a));
+    const HVX_Vector s = hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e));
+    xv[b] = Q6_Vsf_vmpy_VsfVsf(
+      Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(two, s), one), cap);
+  }
+}
+
+void hvx_softcap_m1_f32(float *x, uint32_t n, float cap,
+                        hvx_worker_pool *pool) {
+  /* one IEEE RN divide, cpu_det_div_rn's result (hvx_swiglu_cpu_f32) */
+  volatile float inv = 1.0f / cap;
+  softcap_ctx c = {x, n, inv, cap};
+  const uint32_t nvec = n / LANES;
+  /* 256 vectors a lane at least: a fork / join is a few microseconds */
+  hvx_worker_pool_run(pool, softcap_lane, &c, nvec / 256u ? nvec / 256u : 1u);
+  for (uint32_t i = nvec * LANES; i < n; ++i) {
+    x[i] = m1_softcap_one_det(x[i], c.inv, cap);
+  }
+}
+
+void hvx_mul_scalar_f32(float *x, float s, uint32_t n) {
+  const HVX_Vector sv = hvx_splat_sf(s);
+  uint32_t i = 0;
+  for (; i + LANES <= n; i += LANES) {
+    *(HVX_UVector *)(x + i) =
+      Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + i), sv);
+  }
+  for (; i < n; ++i) {
+    x[i] = m1_det_mul(x[i], s);
+  }
 }
