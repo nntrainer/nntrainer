@@ -480,7 +480,7 @@ static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
    quantized, down. [#132 E5f] The SwiGLU over the pool with the scalar
    IEEE divide (hvx_swiglu_cpu_f32; E5d read DENSE_FFN at 5.6 ms/token
    with the spec's integer division on one thread). [plan 201 S4] Under
-   the session's HEXKL_MOE_FLAG_GEGLU (the model's activation, #209) it is
+   the session's HEXKL_MOE_FLAG_GELU_TANH (the model's activation, #209) it is
    gelu_tanh(gate) * up (geglu_det_one), Gemma 4's dense FFN (#4296
    gemma4_causallm.cpp:760-806: separate gate and up, tanh_gelu, multiply). */
 static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
@@ -523,7 +523,7 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if ((call->env->moe_flags & HEXKL_MOE_FLAG_GEGLU) != 0u) {
+  if ((call->env->moe_flags & HEXKL_MOE_FLAG_GELU_TANH) != 0u) {
     hvx_geglu_f32(gate, up, act, op->N);
   } else {
     hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
@@ -547,7 +547,7 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
   graph_prep(op, in, op->K, &g->act);
   rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
   if (rc == AEE_SUCCESS && op->eps_bits != 0u) {
-    hvx_softcap_f32(g->logits, op->N, graph_eps(op), call->env->pool);
+    hvx_softcap_m1_f32(g->logits, op->N, graph_eps(op), call->env->pool);
   }
   if (rc == AEE_SUCCESS) {
     /* [#132 Part B E3] the banned ids at -inf for the pick only (the

@@ -21,8 +21,8 @@
 #include "hvx_convert.h"
 #include "hvx_tile_f16.h"
 
-/** @brief Largest head_dim: 8 f32 vectors. */
-#define MAX_VECS 8u
+/** @brief Largest head_dim (512): 16 f32 vectors. */
+#define MAX_VECS 16u
 
 /**
  * @brief 64 fp16 (natural order) -> two f32 vectors in natural order: the
@@ -118,22 +118,57 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
 }
 
 void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                        int8_t *q, float *scales) {
+                        int8_t *q, float *scale) {
   HVX_Vector v[MAX_VECS];
   const uint32_t n = hd / 32u;
   load_row_f32(x_hf, hd, v);
+  const float amax = absmax_of(v, n);
+  if (amax == 0.0f) {
+    memset(q, 0, hd);
+    *scale = 1.0f;
+    return;
+  }
   const float fq = (float)qmax;
+  const HVX_Vector inv = hvx_splat_sf(fq / amax);
   const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
   HVX_Vector w[MAX_VECS];
   for (uint32_t g = 0; g < n; ++g) {
-    const float amax = absmax_of(&v[g], 1);
-    if (amax == 0.0f) {
-      w[g] = Q6_V_vzero();
-      scales[g] = 1.0f;
-      continue;
-    }
-    w[g] = quant_vec(v[g], hvx_splat_sf(fq / amax), lo, hi);
-    scales[g] = amax / fq;
+    w[g] = quant_vec(v[g], inv, lo, hi);
+  }
+  pack_bytes(w, hd, q);
+  *scale = amax / fq;
+}
+
+void hvx_kv_quant_k_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                              float inv_s, int8_t *q, int32_t *colsum) {
+  HVX_Vector v[MAX_VECS];
+  const uint32_t n = hd / 32u;
+  load_row_f32(x_hf, hd, v);
+  const HVX_Vector inv = hvx_splat_sf(inv_s);
+  const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
+  HVX_Vector w[MAX_VECS];
+  HVX_Vector sum = Q6_V_vzero();
+  for (uint32_t i = 0; i < n; ++i) {
+    w[i] = quant_vec(v[i], inv, lo, hi);
+    sum = Q6_Vw_vadd_VwVw(sum, w[i]);
+  }
+  for (int rot = 4; rot <= 64; rot <<= 1) {
+    sum = Q6_Vw_vadd_VwVw(sum, Q6_V_vror_VR(sum, rot));
+  }
+  pack_bytes(w, hd, q);
+  *colsum = (int32_t)hvx_attn_word0(sum);
+}
+
+void hvx_kv_quant_v_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                              const float *inv, int8_t *q) {
+  HVX_Vector v[MAX_VECS];
+  const uint32_t n = hd / 32u;
+  load_row_f32(x_hf, hd, v);
+  const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
+  HVX_Vector w[MAX_VECS];
+  for (uint32_t g = 0; g < n; ++g) {
+    const HVX_Vector iv = *(const HVX_UVector *)(inv + 32u * g);
+    w[g] = quant_vec(v[g], iv, lo, hi);
   }
   pack_bytes(w, hd, q);
 }

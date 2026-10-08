@@ -16,12 +16,21 @@
  * residual on the DSP; on 1 the layer writes nothing. The models use it
  * only under NNTR_HTP_FORWARD (Transformer::RESIDUAL_ADD_TYPE), so the
  * core addition layer and every other model stay as they are.
+ *
+ * With its options it is the block's whole epilogue (doc 57 section 5
+ * step 4): out = scale * (in0 + rmsnorm(in1 [+ in2]) * gamma). in_norm
+ * adds the gamma weight (the post-attention / post-FFN norm), use_weight
+ * the scalar weight after it (the block's layer scalar), a third input
+ * the second addend (the MoE output beside the dense one). At prefill the
+ * accelerator runs all of it as one call (ComputeOps::rmsnorm_add_fp32);
+ * a decode row and a backend without it run the three ops here.
  */
 
 #ifndef __CAUSALLM_RESIDUAL_ADD_H__
 #define __CAUSALLM_RESIDUAL_ADD_H__
 #ifdef __cplusplus
 
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <layer_context.h>
 #include <layer_devel.h>
@@ -30,7 +39,8 @@
 namespace causallm {
 
 /**
- * @brief out = residual + addend, with the HTP ADD hook at a decode row.
+ * @brief out = scale * (residual + [rmsnorm](addend [+ addend2]) * [gamma]),
+ *        with the HTP ADD hook at a plain decode row.
  */
 class ResidualAddLayer final : public nntrainer::Layer {
 public:
@@ -65,6 +75,21 @@ public:
   void setProperty(const std::vector<std::string> &values) override;
 
   inline static const std::string type = "residual_add";
+
+private:
+  /** @brief The rows [from, to) of every batch, decode hook first. */
+  void run(nntrainer::RunLayerContext &context, unsigned int from,
+           unsigned int to);
+
+  std::tuple<props::InNorm, props::UseWeight, nntrainer::props::Epsilon,
+             nntrainer::props::SkipPrefill>
+    props_;
+  unsigned int gamma_idx = 0;
+  unsigned int scale_idx = 0;
+  unsigned int sum_idx = 0; /**< the CPU path's summed, normed addend */
+  bool in_norm = false;
+  bool use_scale = false;
+  bool skip_prefill = false;
 };
 
 } // namespace causallm

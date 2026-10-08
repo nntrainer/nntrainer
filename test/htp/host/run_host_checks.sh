@@ -303,7 +303,7 @@ done
 # ignored (SwiGLU), the soft-cap skipped, layer_scalar dropped.
 for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);/    hvx_rmsnorm_f32(v, gamma + hd, out + n_q + n_k, n_k, hd, eps, NULL);/' \
   's/    (op->feed \& HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;/    0 ? in + n_q : in + n_q + n_k;/' \
-  's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GEGLU) != 0u) {/  if (0) {/' \
+  's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GELU_TANH) != 0u) {/  if (0) {/' \
   's/  if (rc == AEE_SUCCESS \&\& op->eps_bits != 0u) {/  if (0) {/' \
   's/    hvx_mul_scalar_f32(out, graph_eps(op), op->N);/    (void)0;/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
@@ -434,7 +434,7 @@ geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
 }
 geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
 "$OUT/geglu_host_check"
-mut='s/c->geglu ? hvx_geglu_det_sf(g, u)/c->geglu ? hvx_swiglu_det_sf(g, u)/'
+mut='s/c->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(g, u)/c->act == HVX_GLU_GELU_TANH ? hvx_swiglu_det_sf(g, u)/'
 sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
 if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
   echo "GEGLU MUTATION DID NOT APPLY: $mut"; exit 1
@@ -444,6 +444,57 @@ if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
   echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
 fi
 echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
+
+# The prefill-shape RMSNorm rows (doc 57 section 5 step 4): the real HVX
+# source on the lane emulation against a double reference, at the hidden
+# width, per head, gamma-less and in place (RMSNORM ROWS OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/rmsnorm_rows_host_check" \
+  "$HERE/rmsnorm_rows_host_check.c" "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" -lm
+
+"$OUT/rmsnorm_rows_host_check"
+
+# The prefill-shape router logits (doc 57 section 5 step 5): the real HVX
+# source on the lane emulation against a double reference, at the softmax
+# router's width, the sigmoid one's, and a K that is not a chunk multiple
+# (ROUTER ROWS OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/router_rows_host_check" \
+  "$HERE/router_rows_host_check.c" "$BACKEND/hvx/hvx_router_rows_f32.c" \
+  "$BACKEND/hvx/hvx_softmax_f32.c" -lm
+
+"$OUT/router_rows_host_check"
+
+# The prefill-shape RoPE (doc 57 section 5 step 4): the real HVX source on
+# the lane emulation against the CPU kernel's own operation order, bit for
+# bit, at head dims 256, 512 (partial rotary) and 64 (ROPE ROWS OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/rope_rows_host_check" \
+  "$HERE/rope_rows_host_check.c" "$BACKEND/hvx/hvx_rope_rows_f32.c" -lm
+
+"$OUT/rope_rows_host_check"
+
+# The final logit softcap the lm_head call applies (doc 57 section 9.7):
+# the real HVX source on the lane emulation against cap * tanh(x / cap) in
+# double over a 262 144-wide row with a scalar tail (SOFTCAP OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/softcap_host_check" \
+  "$HERE/softcap_host_check.c" "$BACKEND/hvx/hvx_softcap_f32.c" -lm
+
+"$OUT/softcap_host_check"
+
+# Attention's K^T tile builder (doc 57 section 9.10): the vshuff network
+# on the lane emulation against the word-transpose definition, bit for
+# bit, at the model's head dims (TILE F16 OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/tile_f16_host_check" "$HERE/tile_f16_host_check.c" -lm
+
+"$OUT/tile_f16_host_check"
 
 # The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
 # independent model of the Android CPU's quantizer and fused chain, six
@@ -527,3 +578,17 @@ python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
   "$HERE/hvx_scalar_stubs.c" "$HERE/standin/hvx_scalar.c" -lm
 
 "$OUT/swap_host_check"
+
+# The q2 attention calibration's abs-max (abs_max.h): natively, and on the
+# NEON path when an aarch64 g++ and qemu-aarch64 are installed (ABS MAX OK).
+ABS_SRCS="$HERE/abs_max_check.cpp $BACKEND/../../utils/fp16.cpp"
+ABS_INC="-I $BACKEND/../../../Applications/CausalLM/layers -I $BACKEND/../../utils -I $BACKEND/../.."
+g++ -std=c++17 -O2 $ABS_INC -o "$OUT/abs_max_check" $ABS_SRCS
+"$OUT/abs_max_check"
+if command -v aarch64-linux-gnu-g++ >/dev/null && command -v qemu-aarch64 >/dev/null; then
+  aarch64-linux-gnu-g++ -std=c++17 -O2 -static $ABS_INC \
+    -o "$OUT/abs_max_check_a64" $ABS_SRCS
+  qemu-aarch64 "$OUT/abs_max_check_a64"
+else
+  echo "abs_max: aarch64 g++ or qemu-aarch64 missing, NEON path not run"
+fi

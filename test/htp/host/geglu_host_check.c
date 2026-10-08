@@ -16,7 +16,7 @@
  *    3e38, where g^3 overflows) and subnormal g, no NaN anywhere.
  * 2. KERNEL. hvx_geglu_det_sf over the same values, and the skel's own
  *    hvx_dequant_swiglu_acc_tiles_to_f32 (hvx_dequant_i32.c, both values
- *    of the geglu field) over random int32 tile pairs, memcmp'd against
+ *    of the act field) over random int32 tile pairs, memcmp'd against
  *    the scalar dequant + spec. It rests on one Vsf op = one IEEE op
  *    (rule 24); whether the device's Vsf keeps subnormals is not checked
  *    here. run_host_checks.sh then swaps gelu for silu in the kernel and
@@ -134,9 +134,10 @@ int main(void) {
     az[m] = 100 + (int32_t)m;
   }
   for (uint32_t geglu = 0; geglu < 2u; ++geglu) {
-    hvx_dequant_swiglu_acc_tiles_to_f32((const uint8_t *)tiles, sizeof tiles[0],
-                                        NP, 0u, RS, ROWS, as, az, colsum, wsc,
-                                        bias, INTER, out, INTER, geglu, NULL);
+    hvx_dequant_swiglu_acc_tiles_to_f32(
+      (const uint8_t *)tiles, sizeof tiles[0], NP, 0u, RS, ROWS, as, az, colsum,
+      wsc, bias, INTER, geglu ? HVX_GLU_GELU_TANH : HVX_GLU_SILU, out, INTER,
+      NULL);
     uint32_t ok = 0;
     for (uint32_t m = 0; m < ROWS; ++m)
       for (uint32_t c = 0; c < INTER; ++c) {

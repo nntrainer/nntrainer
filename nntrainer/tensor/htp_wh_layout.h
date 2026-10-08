@@ -100,12 +100,14 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
 }
 
 /**
- * @brief Inverse of whPack: one sign-extended int4 per int8, K x N row-major.
+ * @brief whPack's inverse: WH bytes back to one sign-extended int4 per int8,
+ *        K rows of N, row stride N.
  *
- * Bit-exact by construction (whPack of the result is @a wh again), which is
- * what lets a WH weight that cannot stay in the arena go to the DSP heap
- * through weight_register_u8i4 -- the DSP bakes the row-major values back
- * into the same tiles -- without a second quantization.
+ * A host-side reader for the weights the model file keeps in tile order, so
+ * that a reference path (NNTR_MOE_DIFF) can dequantize the bytes the DSP is
+ * running without the DSP. Same K, N contract as whPack, and
+ * nntrainer_cpu_backend_standalone.wh_pack_unpacks_like_the_load_path is the
+ * round trip.
  */
 inline void whUnpack(const uint8_t *wh, uint32_t K, uint32_t N, int8_t *rm) {
   const uint32_t k_tiles = K / WH_TILE, n_tiles = N / WH_TILE;
@@ -116,8 +118,8 @@ inline void whUnpack(const uint8_t *wh, uint32_t K, uint32_t N, int8_t *rm) {
         int8_t *row = rm + (size_t)(kt * WH_TILE + r) * N + nt * WH_TILE;
         for (uint32_t c = 0; c < WH_TILE; ++c) {
           const uint32_t sl = whSlot(r, c);
-          const int v = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0F;
-          row[c] = static_cast<int8_t>(v >= 8 ? v - 16 : v);
+          const uint8_t nib = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0Fu;
+          row[c] = static_cast<int8_t>(nib > 7u ? (int)nib - 16 : (int)nib);
         }
       }
     }

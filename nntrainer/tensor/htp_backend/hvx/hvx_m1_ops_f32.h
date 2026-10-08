@@ -131,7 +131,7 @@ void hvx_geglu_f32(const float *gate, const float *up, float *out, uint32_t n);
  *        4's final logit soft-cap, cap a positive normal f32. n any (the
  *        tail scalar); pool may be NULL.
  */
-void hvx_softcap_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool);
+void hvx_softcap_m1_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool);
 
 /** @brief [plan 201 S4] x[i] = x[i] * s, one IEEE multiply each (Gemma 4's
  *         layer_scalar on the residual); n any. */

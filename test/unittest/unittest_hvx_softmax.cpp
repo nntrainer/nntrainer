@@ -144,8 +144,14 @@ namespace {
 inline float exp_det_ref(float x) { return swiglu_det_exp(x); }
 inline float recip_det_ref(float d) { return swiglu_det_recip(d); }
 inline float swiglu_det_ref(float g, float u) { return swiglu_det_one(g, u); }
+inline float geglu_det_ref(float g, float u) { return geglu_det_one(g, u); }
 inline float dadd(float a, float b) { return swiglu_det_add(a, b); }
 inline float dsub(float a, float b) { return swiglu_det_sub(a, b); }
+inline float dmul(float a, float b) { return swiglu_det_mul(a, b); }
+/** t = g (C0 + C1 g^2), as both geglu_det_one and the skel compute it */
+inline float geglu_t_ref(float g) {
+  return dmul(g, dadd(GEGLU_DET_C0, dmul(GEGLU_DET_C1, dmul(g, g))));
+}
 
 inline int32_t bits_of(float f) {
   int32_t i;
@@ -158,8 +164,8 @@ inline int32_t bits_of(float f) {
 TEST_F(HvxSwigluDet, RejectsNonVectorLength) {
   const int n = 33;
   std::vector<float> g(n, 1.0f), u(n, 1.0f), o(n), e(n), r(n);
-  int err = nntr_hvx_swiglu_det_f32(handle_, g.data(), n, u.data(), n, o.data(),
-                                    n, e.data(), n, r.data(), n);
+  int err = nntr_hvx_swiglu_det_f32(handle_, 0u, g.data(), n, u.data(), n,
+                                    o.data(), n, e.data(), n, r.data(), n);
   EXPECT_EQ(err, AEE_EBADPARM + kDspOffset)
     << "expected EBADPARM, got " << hex(err);
 }
@@ -198,8 +204,8 @@ TEST_F(HvxSwigluDet, MatchesScalarBitExact) {
     u[i] = small(rng);
   }
 
-  int err = nntr_hvx_swiglu_det_f32(handle_, g.data(), n, u.data(), n, o.data(),
-                                    n, e.data(), n, r.data(), n);
+  int err = nntr_hvx_swiglu_det_f32(handle_, 0u, g.data(), n, u.data(), n,
+                                    o.data(), n, e.data(), n, r.data(), n);
   ASSERT_EQ(err, AEE_SUCCESS) << "swiglu_det_f32 failed: " << hex(err);
 
   int bad_exp = 0, bad_recip = 0, bad_out = 0;
@@ -231,6 +237,58 @@ TEST_F(HvxSwigluDet, MatchesScalarBitExact) {
                            "HVX Vsf does not round like ARM f32";
   EXPECT_EQ(bad_recip, 0) << "hvx_recip_det_sf differs from the scalar spec";
   EXPECT_EQ(bad_out, 0) << "hvx_swiglu_det_sf differs from the scalar spec";
+}
+
+/**
+ * @brief The GeGLU twin of the gate above (doc 55: Gemma-4's experts):
+ *        hvx_geglu_det_sf against geglu_det_one, bit for bit, with the
+ *        exp and reciprocal of t = g (C0 + C1 g^2) reported the same way.
+ */
+TEST_F(HvxSwigluDet, GegluMatchesScalarBitExact) {
+  const int n = 8192;
+  std::vector<float> g(n), u(n), o(n, 0.0f), e(n, 0.0f), r(n, 0.0f);
+  std::mt19937 rng(0xB2B2B2B2u);
+  std::uniform_real_distribution<float> small(-8.0f, 8.0f);
+  for (int i = 0; i < n; ++i) {
+    if (i < 64) {
+      g[i] = -40.0f + 1.25f * static_cast<float>(i); // t through both clamps
+    } else {
+      g[i] = small(rng);
+    }
+    u[i] = small(rng);
+  }
+
+  int err = nntr_hvx_swiglu_det_f32(handle_, 1u, g.data(), n, u.data(), n,
+                                    o.data(), n, e.data(), n, r.data(), n);
+  ASSERT_EQ(err, AEE_SUCCESS) << "swiglu_det_f32(gelu) failed: " << hex(err);
+
+  int bad_exp = 0, bad_recip = 0, bad_out = 0, first_bad = -1;
+  for (int i = 0; i < n; ++i) {
+    const float t = geglu_t_ref(g[i]);
+    const float ref_e = exp_det_ref(dsub(0.0f, t));
+    const float ref_r = recip_det_ref(dadd(1.0f, ref_e));
+    const float ref_o = geglu_det_ref(g[i], u[i]);
+    const bool de = bits_of(e[i]) != bits_of(ref_e);
+    const bool dr = bits_of(r[i]) != bits_of(ref_r);
+    const bool dobad = bits_of(o[i]) != bits_of(ref_o);
+    bad_exp += de ? 1 : 0;
+    bad_recip += dr ? 1 : 0;
+    bad_out += dobad ? 1 : 0;
+    if (first_bad < 0 && (de || dr || dobad)) {
+      first_bad = i;
+      std::cout << "GEGLU_DET first mismatch i=" << i << " g=" << g[i]
+                << " u=" << u[i] << "\n  exp   dsp=" << std::hexfloat << e[i]
+                << " ref=" << ref_e << "\n  recip dsp=" << r[i]
+                << " ref=" << ref_r << "\n  out   dsp=" << o[i]
+                << " ref=" << ref_o << std::defaultfloat << std::endl;
+    }
+  }
+  std::cout << "GEGLU_DET_FIELD bad_exp=" << bad_exp
+            << " bad_recip=" << bad_recip << " bad_out=" << bad_out << " of "
+            << n << std::endl;
+  EXPECT_EQ(bad_exp, 0);
+  EXPECT_EQ(bad_recip, 0);
+  EXPECT_EQ(bad_out, 0);
 }
 
 /**

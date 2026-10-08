@@ -72,6 +72,8 @@
 #include "hexkl_probe.h"
 #include "hvx_m1_ops_f32.h"
 #include "hvx_q4_gemv_f32.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_softcap_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
 #include "nntr_hvx.h"
@@ -386,6 +388,69 @@ int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
     lanes = small ? FC_Q4_GRAPH_LANES_L2_SMALL_K : FC_Q4_GRAPH_LANES_L2;
   }
   return nntr_hvx_fc_q4m1_run(s, h, a, y, lanes, FC_Q4_FEED_L2 | native, NULL);
+}
+
+/** @brief The lm_head's normed input row (static like the rest of this
+ *  file's scratch: one call at a time). */
+static float g_xn[FC_Q4_MAX_K] __attribute__((aligned(128)));
+
+int nntr_hvx_lm_head_q4m1_f32(remote_handle64 handle, float eps,
+                              const float *gamma, int gammaLen, float softcap,
+                              const uint32 *h, int hLen, const float *x,
+                              int xLen, float *y, int yLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (hLen <= 0 || hLen > (int)NNTR_HVX_Q4M1_SLOTS || xLen <= 0 ||
+      (uint32_t)xLen > FC_Q4_MAX_K || xLen % 64 != 0 ||
+      (gammaLen != 0 && gammaLen != xLen) || softcap < 0.0f) {
+    FARF(ERROR, "lm_head_q4m1_f32: bad shape (h=%d x=%d gamma=%d)", hLen, xLen,
+         gammaLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  uint64_t n_total = 0;
+  for (int p = 0; p < hLen; ++p) {
+    if (h[p] >= NNTR_HVX_Q4M1_SLOTS || s->q4m1[h[p]].w == NULL) {
+      return AEE_EBADITEM;
+    }
+    if (s->q4m1[h[p]].K != (uint32_t)xLen) {
+      FARF(ERROR, "lm_head_q4m1_f32: slice %d has K %u, x is %d", p,
+           (unsigned)s->q4m1[h[p]].K, xLen);
+      return AEE_EINVALIDFORMAT;
+    }
+    n_total += s->q4m1[h[p]].N;
+  }
+  if (n_total != (uint64_t)yLen) {
+    FARF(ERROR, "lm_head_q4m1_f32: slices hold %u rows, y is %d",
+         (unsigned)n_total, yLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  /* the output norm, the activation quantized once (the CPU's Q4_0 FC
+     order, as the graph's LM_HEAD op), each slice's GEMV into its rows,
+     then the softcap over the whole row */
+  const float *in = x;
+  if (gammaLen != 0) {
+    if (hvx_rmsnorm_rows_f32(x, g_xn, 1u, (uint32_t)xLen, (uint32_t)xLen, gamma,
+                             eps, NULL) != 0) {
+      return AEE_EINVALIDFORMAT;
+    }
+    in = g_xn;
+  }
+  hvx_q4m1_act a = {g_q, g_s8, g_ma, g_ea, g_df, g_d};
+  hvx_q4m1_prep(in, (uint32_t)xLen, &a);
+  float *out = y;
+  for (int p = 0; p < hLen; ++p) {
+    const int rc = nntr_hvx_fc_q4m1_graph(s, h[p], 0u, &a, out);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    out += s->q4m1[h[p]].N;
+  }
+  if (softcap > 0.0f) {
+    hvx_softcap_f32(y, (uint32_t)yLen, softcap);
+  }
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,

@@ -2530,7 +2530,7 @@ static void check_gemma(void) {
   rc |= (uint32_t)hexkl_graph_set_param(
     g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, GM_HID + GM_E);
   CHECK(rc == 0u, "Gemma router params");
-  env.moe_flags = HEXKL_MOE_FLAG_GEGLU;
+  env.moe_flags = HEXKL_MOE_FLAG_GELU_TANH;
   fill(x, GM_HID, &seed);
   memset(&g_last, 0, sizeof(g_last));
   rc =
@@ -2562,13 +2562,13 @@ static void check_gemma(void) {
       r_idx[nr] = 0u;
       r_w[nr++] = by_e[e];
     }
-  CHECK(g_last.n_calls == 1u && g_last.flags == HEXKL_MOE_FLAG_GEGLU &&
+  CHECK(g_last.n_calls == 1u && g_last.flags == HEXKL_MOE_FLAG_GELU_TANH &&
           memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
         "Gemma MOE op: routing / flags");
   hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, GM_HID,
                               GM_INTER, GM_HID, GM_E, gu, dnh, r_idx, r_cnt,
                               r_w, sp, moe, env.pool, &g_scratch,
-                              HEXKL_MOE_FLAG_GEGLU);
+                              HEXKL_MOE_FLAG_GELU_TANH);
   m1_rmsnorm_det(moe, gam[1], S, GM_HID, GM_HID, fs.eps, NULL);
   for (i = 0; i < GM_HID; ++i)
     F[i] = m1_det_add(D[i], S[i]); /* combine_ffn */
@@ -2627,7 +2627,7 @@ static void check_gemma(void) {
     memcpy(ref, in, N * sizeof(float));
     memcpy(out, in, N * sizeof(float));
     m1_softcap_det(ref, N, 30.0f);
-    hvx_softcap_f32(out, N, 30.0f, real_pool());
+    hvx_softcap_m1_f32(out, N, 30.0f, real_pool());
     for (i = 0; i < N; ++i) {
       const double t = 30.0 * tanh((double)in[i] / 30.0);
       const double d = (double)ref[i] - t;
@@ -2644,7 +2644,7 @@ static void check_gemma(void) {
     /* about 5 ulp at 30: exp_det's and recip_det's ulps through 2 s - 1 */
     CHECK(nan == 0u && 10.0 * log10(num / den) > 120.0 && max_err < 2e-5,
           "softcap spec vs f64");
-    CHECK(same == N, "hvx_softcap_f32 differs from m1_softcap_det");
+    CHECK(same == N, "hvx_softcap_m1_f32 differs from m1_softcap_det");
     err |= nan != 0u || same != N || 10.0 * log10(num / den) <= 120.0 ||
            max_err >= 2e-5;
     /* the dense GeGLU row: gates over [-12, 12] with the clamps and a

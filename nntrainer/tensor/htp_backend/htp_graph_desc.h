@@ -261,7 +261,7 @@ enum {
  * layer_scalar, (h + ffn) * s as the CPU's scalar_multiply); an LM_HEAD's
  * eps_bits, when set, the final logit soft-cap (m1_softcap_det, before the
  * argmax, so the logits handed out are capped). A DENSE_FFN's activation
- * follows the session's MoE flags: HEXKL_MOE_FLAG_GEGLU (#209, the
+ * follows the session's MoE flags: HEXKL_MOE_FLAG_GELU_TANH (#209, the
  * model's one hidden_activation) makes it gelu_tanh(gate) * up
  * (geglu_det_one) in place of the CPU-order SwiGLU.
  */

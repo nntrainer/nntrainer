@@ -10,6 +10,9 @@
 #include "hexkl_probe.h"
 #include "hvx_conv_gate_f32.h"
 #include "hvx_gather_ah_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
+#include "hvx_router_rows_f32.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -118,6 +121,34 @@ void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
                        hvx_worker_pool *pool) {
   (void)pool;
   memcpy(dst, src, (size_t)(k / 32u) * 2048u);
+}
+
+/* The row RMSNorm the *_norm layer entries fold in: plain f32, one row
+   at a time, the kernel's own operation order (sum of squares, sqrtf,
+   scale, gamma). What the checks that link the skel verify is the entry's
+   plumbing -- which rows, which gamma, in place -- not HVX arithmetic,
+   which rmsnorm_rows_host_check covers on the lane emulation. */
+int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                         uint32_t chunk, const float *gamma, float eps,
+                         hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !y || M == 0u || chunk == 0u || chunk % 32u != 0u ||
+      n % chunk != 0u) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    for (uint32_t c = 0; c < n; c += chunk) {
+      const float *xr = x + (size_t)r * n + c;
+      float *yr = y + (size_t)r * n + c;
+      float ss = 0.0f;
+      for (uint32_t j = 0; j < chunk; ++j)
+        ss += xr[j] * xr[j];
+      const float rs = 1.0f / sqrtf(ss / (float)chunk + eps);
+      for (uint32_t j = 0; j < chunk; ++j)
+        yr[j] = xr[j] * rs * (gamma ? gamma[j] : 1.0f);
+    }
+  }
+  return 0;
 }
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
@@ -258,4 +289,93 @@ int hexkl_micro_hmx_copy_32b_to_submatrix(uint8_t *b, uint32_t off,
                                           uint32_t N) {
   (void)b, (void)off, (void)dst, (void)rb, (void)nt, (void)m_pad, (void)N;
   abort();
+}
+
+/* The router logits the router_logits_f32 entry runs: plain f32 dots,
+   row by row. The entry's plumbing (the norm, which rows, where the
+   logits land) is what a skel-linking check verifies; the HVX arithmetic
+   is router_rows_host_check's on the lane emulation. */
+int hvx_router_rows_f32(const float *x, const float *w, float *logits,
+                        uint32_t M, uint32_t K, uint32_t E,
+                        hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % 32u != 0u ||
+      E > 128u) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    for (uint32_t e = 0; e < E; ++e) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        acc += x[(size_t)r * K + k] * w[(size_t)k * E + e];
+      logits[(size_t)r * E + e] = acc;
+    }
+  }
+  return 0;
+}
+
+/* The router's selection (hvx_router_topk_rows_f32): plain f32 softmax
+   and the same first-maximum scan; the HVX softmax is
+   router_rows_host_check's. */
+int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
+                             float *weight, uint32_t M, uint32_t E,
+                             uint32_t top_k, uint32_t n_sel,
+                             hvx_worker_pool *pool) {
+  (void)pool;
+  if (!p || !scale || !sel || !weight || M == 0u || E == 0u || E % 32u != 0u ||
+      E > 128u || top_k == 0u || n_sel < top_k || n_sel > E) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    float *pr = p + (size_t)r * E;
+    float mx = pr[0], sum = 0.0f;
+    for (uint32_t e = 1; e < E; ++e)
+      mx = pr[e] > mx ? pr[e] : mx;
+    for (uint32_t e = 0; e < E; ++e)
+      sum += pr[e] = expf(pr[e] - mx);
+    for (uint32_t e = 0; e < E; ++e)
+      pr[e] /= sum;
+    uint32_t taken[4] = {0u, 0u, 0u, 0u};
+    for (uint32_t k = 0; k < n_sel; ++k) {
+      uint32_t best = E;
+      for (uint32_t e = 0; e < E; ++e)
+        if (!(taken[e >> 5] & (1u << (e & 31u))) &&
+            (best == E || pr[e] > pr[best]))
+          best = e;
+      taken[best >> 5] |= 1u << (best & 31u);
+      sel[(size_t)r * n_sel + k] = best;
+    }
+    float wsum = 0.0f;
+    for (uint32_t k = 0; k < top_k; ++k)
+      wsum += pr[sel[(size_t)r * n_sel + k]];
+    for (uint32_t k = 0; k < top_k; ++k) {
+      const uint32_t e = sel[(size_t)r * n_sel + k];
+      weight[(size_t)r * top_k + k] = pr[e] * (1.0f / wsum) * scale[e];
+    }
+  }
+  return 0;
+}
+
+/* The RoPE the *_norm layer entry folds in: the CPU kernel's pair order,
+   row by row; the HVX arithmetic is rope_rows_host_check's. */
+int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
+                      const float *cs, hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !cs || M == 0u || hd == 0u || (hd / 2u) % 32u != 0u || n == 0u ||
+      n % hd != 0u) {
+    return -1;
+  }
+  const uint32_t half = hd / 2u;
+  for (uint32_t r = 0; r < M; ++r) {
+    const float *c = cs + (size_t)r * 2u * hd, *s = c + hd;
+    for (uint32_t h = 0; h < n / hd; ++h) {
+      float *head = x + (size_t)r * n + (size_t)h * hd;
+      for (uint32_t j = 0; j < half; ++j) {
+        const float a = head[j], b = head[j + half];
+        head[j] = a * c[j] - b * s[j];
+        head[j + half] = a * s[j] + b * c[j];
+      }
+    }
+  }
+  return 0;
 }

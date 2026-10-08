@@ -62,11 +62,11 @@ static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
 }
 
 /** @brief hexkl_mm_u8i4_moe.h's DMA queue field restated (#177): bits
- *  [20:19] hold N - 1, the number of DMA queues (pool lanes) the M = 1
- *  feed splits each weight matrix over. The default N = 1 leaves the field
- *  0, so an unset run's word stays 0x703e1; N = 2 is 0xf03e1, N = 4
- *  0x1f03e1. */
-#define HTP_MOE_DMA_Q_SHIFT 19u
+ *  [23:22] (at [20:19] before #4415 took bit 19) hold N - 1, the number of
+ *  DMA queues (pool lanes) the M = 1 feed splits each weight matrix over.
+ *  The default N = 1 leaves the field 0, so an unset run's word stays
+ *  0x703e1; N = 2 is 0x4703e1, N = 4 0xc703e1. */
+#define HTP_MOE_DMA_Q_SHIFT 22u
 #define HTP_MOE_DMA_Q_BITS 3u
 #define HTP_MOE_DMA_QUEUES_DEFAULT 1u
 
@@ -90,14 +90,14 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
   return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
 }
 
-/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GEGLU restated (plan 201
- *  S4): bit 21 makes every expert's gate_up epilogue gelu_tanh(gate) * up
- *  instead of SwiGLU, on the M = 1 GEMV and the HMX loop alike. A model
- *  property: LFM never sets it, so its word stays 0x703e1.
- *  ponytail: nothing on the ARM side ORs it in yet; the Gemma load
- *  hand-over (plan 201 S4, a later slice) adds it to sendMoeOptsOnce's
- *  word, where the echo below already guards it. */
-#define HTP_MOE_FLAG_GEGLU 0x200000u
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GELU_TANH restated (#4415's
+ *  bit 19; plan 201 S4 had it at 21): every expert's gate_up epilogue
+ *  gelu_tanh(gate) * up instead of SwiGLU, on the M = 1 GEMV and the HMX
+ *  loop alike. #4415's prefill call ORs it in per call from its act
+ *  argument; set_moe_geglu puts it in the session word, which is what the
+ *  one-PD token's MOE and DENSE_FFN ops read. A model property: LFM never
+ *  sets it, so its word stays 0x703e1. */
+#define HTP_MOE_FLAG_GEGLU 0x80000u
 
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
  *  With the GEMV on, all of them. With it off, the tune bits mean nothing

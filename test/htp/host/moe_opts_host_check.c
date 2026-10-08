@@ -119,15 +119,15 @@ int main(void) {
   expect(htp_moe_opts_must_match(0x703e0u) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS),
          "opt-out with bypass: bit 0 and bit 18");
-  expect(htp_moe_opts_must_match(0x2003e0u) ==
+  expect(htp_moe_opts_must_match(0x803e0u) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEGLU),
-         "opt-out with GeGLU: bit 0 and bit 21");
+         "opt-out with GeGLU: bit 0 and bit 19");
   if (!g_fail)
     printf(
       "MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
       "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1, geglu echoed\n");
 
-  /* #177's queue field, bits [20:19] = N - 1: unset leaves the default
+  /* #177's queue field, bits [23:22] = N - 1: unset leaves the default
      word alone, 2 and 4 give the Q2 / Q4 words, and every other value is
      an error that leaves the output untouched. */
   {
@@ -140,22 +140,22 @@ int main(void) {
            "queues unset: 0x703e1, N = 1");
     expect(htp_moe_opts_dma_queues("1", &q) == 0 && (def | q) == 0x703e1u,
            "queues 1: 0x703e1");
-    expect(htp_moe_opts_dma_queues("2", &q) == 0 && (def | q) == 0xf03e1u &&
+    expect(htp_moe_opts_dma_queues("2", &q) == 0 && (def | q) == 0x4703e1u &&
              htp_moe_opts_dma_q(def | q) == 2u,
-           "queues 2: 0xf03e1");
-    expect(htp_moe_opts_dma_queues("3", &q) == 0 && (def | q) == 0x1703e1u,
-           "queues 3: 0x1703e1");
-    expect(htp_moe_opts_dma_queues("4", &q) == 0 && (def | q) == 0x1f03e1u &&
+           "queues 2: 0x4703e1");
+    expect(htp_moe_opts_dma_queues("3", &q) == 0 && (def | q) == 0x8703e1u,
+           "queues 3: 0x8703e1");
+    expect(htp_moe_opts_dma_queues("4", &q) == 0 && (def | q) == 0xc703e1u &&
              htp_moe_opts_dma_q(def | q) == 4u,
-           "queues 4: 0x1f03e1");
+           "queues 4: 0xc703e1");
     for (size_t i = 0; i < sizeof bad / sizeof *bad; ++i) {
       q = 0xdeadu;
       expect(htp_moe_opts_dma_queues(bad[i], &q) == -1 && q == 0xdeadu,
              "queues: an invalid value is an error");
     }
     if (!g_fail)
-      printf("MOE M1 GEMV OPTS dma_queues: unset=1(0x703e1) 2=0xf03e1 "
-             "4=0x1f03e1 invalid(0,5,x,'',...)=error\n");
+      printf("MOE M1 GEMV OPTS dma_queues: unset=1(0x703e1) 2=0x4703e1 "
+             "4=0xc703e1 invalid(0,5,x,'',...)=error\n");
   }
 
   /* C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named

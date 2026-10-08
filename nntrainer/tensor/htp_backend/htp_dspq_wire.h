@@ -34,6 +34,8 @@
  *  logits (vocab f32); S1's carries none. */
 #define HTP_DSPQ_OP_TOKEN 3u
 #define HTP_DSPQ_FLAG_TIMED 1u
+/** @brief OP_MOE: the call's act argument (gelu_tanh epilogue) is 1. */
+#define HTP_DSPQ_FLAG_GELU 2u
 /** @brief OP_TOKEN: S2 writes the logits into buffer 1 (NNTR_PPL_DECODE,
  *  the shadows); without it only the id travels. */
 #define HTP_DSPQ_TOKEN_LOGITS 1u

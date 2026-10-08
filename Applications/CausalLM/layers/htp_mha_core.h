@@ -36,6 +36,7 @@
 #include <unordered_map>
 
 #include <acti_func.h>
+#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <compute_ops.h>
 #include <cpu_backend.h>
@@ -100,15 +101,6 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
-/**
- * @brief RopeTheta
- */
-class RopeTheta : public nntrainer::Property<unsigned int> {
-public:
-  RopeTheta(unsigned int value = 500000) { set(value); };
-  static constexpr const char *key = "rope_theta"; /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
-};
 
 /**
  * @brief UseRope property
@@ -164,18 +156,6 @@ public:
 };
 
 /**
- * @brief RopeScalingType
- * - default
- * - yarn
- */
-class RopeScalingType : public nntrainer::Property<std::string> {
-public:
-  RopeScalingType(std::string value = "default") { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_type";                    /**< unique key to access */
-  using prop_tag = nntrainer::str_prop_tag; /**< property type */
-};
-/**
  * @brief RopeScalingFactor
  */
 class RopeScalingFactor : public nntrainer::Property<float> {
@@ -186,16 +166,6 @@ public:
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
-/**
- * @brief RopePartialRotaryFactor
- */
-class RopePartialRotaryFactor : public nntrainer::Property<float> {
-public:
-  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
-  static constexpr const char *key =
-    "rope_partial_rotary_factor";             /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
 
 /**
  * @brief RopeScalingMaxPositionEmbeddings
@@ -227,6 +197,17 @@ public:
  */
 WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
 public:
+  /**
+   * @brief Registers batch 0's quantized KV cache on the accelerator now
+   *        rather than inside the first attention call, where it cost the
+   *        first prefill 1.9 ms a layer (doc 57 section 9.24).
+   *        Called once at load after every weight is placed (the cache is
+   *        DSP heap: grown between two arena chunk mappings it would strand
+   *        address space, transformer.cpp). A refusal leaves the handle
+   *        unset, and the first call registers and falls back as before.
+   */
+  void registerQuantizedCache(nntrainer::RunLayerContext &context);
+
   /**
    * @brief Constructor of MhaCore Layer
    */
@@ -339,7 +320,20 @@ public:
    *        Must be called before forwarding() when use_external_cache is true.
    * @param[in] idx current write position in the KV cache
    */
-  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+  /**
+   * @brief Set the write position of the external KV cache. The host calls
+   *        this when it repositions the cache -- after a load, a rewind, a
+   *        session switch -- and any row of the fp16 cache may have been
+   *        rewritten by then, so the quantized mirror (props::KvCacheQuant)
+   *        is marked out of date in full and re-appended from row 0 on the
+   *        next step.
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) {
+    cache_index = idx;
+    for (auto &synced : q_cache_synced) {
+      synced = 0;
+    }
+  }
 
   /**
    * @brief Get the current cache index
@@ -411,6 +405,28 @@ private:
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;
+  /**
+   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache)
+   *        a16 / kv8 path's encodings: K per KV head and V per (KV head,
+   *        dim) as symmetric int8 scales, Q and the context output per
+   *        query head as 16-bit asymmetric (scale, zero point) pairs. A
+   *        quantized model supplies these as encodings; this f32 model
+   *        stands in for them by calibrating on the first rows it sees
+   *        (K/V max / 127, Q's range, the output's from V's range since the
+   *        context is a convex combination of V rows) and keeping them, so
+   *        later steps pay nothing. Values beyond them saturate, as they
+   *        would under encodings. The u16 Q and output of each step live in
+   *        the two staging buffers.
+   */
+  std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
+  /** The a16 path's u16 Q and output, one pair for every layer: per layer
+   *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
+   *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
+   *  MHACoreLayer instances, so layers must not run concurrently (they run
+   *  in graph order); a per-thread pair is the upgrade if they ever do. */
+  static std::vector<uint16_t> q2_q_u16, q2_out_u16;
+  bool q2_calibrated = false;
+  std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
                                    leaves the CPU, for run logs */
 
@@ -428,10 +444,16 @@ private:
                                const ml::train::TensorDim &cache_key_dim,
                                nntrainer::Tensor &attention_output_step,
                                unsigned int cache_from, unsigned int cache_to,
-                               const float *sinks);
+                               const nntrainer::Tensor *sink);
 
   /** @brief Releases every quantized-cache handle. */
   void release_quantized_cache();
+
+  /** @brief Fills q2_scale_* from the first rows (see the members). */
+  void calibrate_q2_scales(const uint16_t *k_rows, const uint16_t *v_rows,
+                           unsigned int n_rows, unsigned int kv_stride,
+                           const float *q, unsigned int q_stride,
+                           unsigned int n_q);
 
   /**
    * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the
@@ -446,7 +468,7 @@ private:
                                  nntrainer::Tensor &cached_value,
                                  nntrainer::Tensor &attention_output_step,
                                  unsigned int cache_from, unsigned int cache_to,
-                                 const float *sinks);
+                                 const nntrainer::Tensor *sink);
 
   enum INOUT_INDEX {
     /** input index */
@@ -518,8 +540,7 @@ private:
    * @brief pre_compute frequencies for Rotary Embedding.
    * @note it is expected to be called only once at the finalize.
    * @param[in] head_dim dimension of head
-   * @param[in] seq_len table rows: the layer's max_timestep (KV cache
-   *            length), not max_position_embeddings (#253)
+   * @param[in] seq_len sequence length
    * @param[in] theta base of theta (default = 10000)
    */
   void precompute_freqs(int head_dim, unsigned int seq_len,

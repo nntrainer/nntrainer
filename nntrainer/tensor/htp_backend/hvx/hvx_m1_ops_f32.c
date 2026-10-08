@@ -364,27 +364,6 @@ typedef struct {
   float *acc;
 } router_sm_ctx;
 
-/** @brief [#261 lever 1] l2fetch rows of one 32-expert block's column:
- *         `rows` lines of 128 B at a stride of Ep floats. Without it every
- *         k of the chain below reads a new line and waits for DDR (device:
- *         281 879 pcycles/op at 2816 x 128, 100 a step). A hint only: the
- *         chain and its bits do not depend on it; HVX loads bypass L1, so
- *         there is no dcfetch. ISS v79, one thread, cold 2816 x 128: 298 k
- *         pcycles without, 153 k with it (64 rows of lead 148 k, 256 166 k;
- *         ROUTER_PF_ROWS keeps the longer lead for the device's DDR). */
-static inline void router_sm_l2fetch(const float *p, uint32_t Ep,
-                                     uint32_t rows) {
-#if defined(__hexagon__)
-  /* Rtt: [47:32] stride, [31:16] width, [15:0] height */
-  Q6_l2fetch_AP((void *)p, ((uint64_t)(Ep * 4u) << 32) |
-                             ((uint64_t)(LANES * 4u) << 16) | (uint64_t)rows);
-#else
-  (void)p;
-  (void)Ep;
-  (void)rows;
-#endif
-}
-
 /** @brief Pool lane i: 32-expert blocks i, i + n, ... -- one Vsf chain
  *         each over k in order, acc = acc + x[k] * W[k][block] (two
  *         roundings, m1_router_softmax_det's order). */
@@ -393,23 +372,11 @@ static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
   for (uint32_t b = i; b < c->Ep / LANES; b += n) {
     const float *col = c->w + (size_t)b * LANES;
     HVX_Vector acc = Q6_V_vzero();
-    for (uint32_t k0 = 0; k0 < c->K; k0 += ROUTER_PF_ROWS) {
-      const uint32_t k1 =
-        k0 + ROUTER_PF_ROWS < c->K ? k0 + ROUTER_PF_ROWS : c->K;
-      if (k0 == 0u) {
-        router_sm_l2fetch(col, c->Ep, k1);
-      }
-      if (k1 < c->K) {
-        router_sm_l2fetch(col + (size_t)k1 * c->Ep, c->Ep,
-                          c->K - k1 < ROUTER_PF_ROWS ? c->K - k1
-                                                     : ROUTER_PF_ROWS);
-      }
-      for (uint32_t k = k0; k < k1; ++k) {
-        acc = Q6_Vsf_vadd_VsfVsf(
-          acc,
-          Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]),
-                             *(const HVX_UVector *)(col + (size_t)k * c->Ep)));
-      }
+    for (uint32_t k = 0; k < c->K; ++k) {
+      acc = Q6_Vsf_vadd_VsfVsf(
+        acc,
+        Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]),
+                           *(const HVX_UVector *)(col + (size_t)k * c->Ep)));
     }
     *(HVX_UVector *)(c->acc + (size_t)b * LANES) = acc;
   }
@@ -548,7 +515,8 @@ static void softcap_lane(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
-void hvx_softcap_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool) {
+void hvx_softcap_m1_f32(float *x, uint32_t n, float cap,
+                        hvx_worker_pool *pool) {
   /* one IEEE RN divide, cpu_det_div_rn's result (hvx_swiglu_cpu_f32) */
   volatile float inv = 1.0f / cap;
   softcap_ctx c = {x, n, inv, cap};

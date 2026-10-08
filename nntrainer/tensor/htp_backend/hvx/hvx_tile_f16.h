@@ -190,12 +190,22 @@ hvx_tile_f16_rows_f32_gather_to_tile(HVX_Vector *dst, const float *const *rows,
  * every K row: the transform is a 32x16 -> 16x32 transpose at word
  * granularity, and no element ever moves inside its word.
  *
- * Written as a word transpose through a stack buffer, then 16 vector
- * stores: correct first, and it keeps every VTCM write a full vector
- * (scalar stores into VTCM cost an L2 miss each -- llama.cpp's stated
- * reason for the same stack-then-copy pattern). The vscatter version
- * llama.cpp uses is the follow-up once the probe has confirmed this
- * layout on the device.
+ * A vshuff network, no stack and no scalar access: the 32 rows pair up
+ * at word granularity (rows 2j and 2j+1 interleaved: vector j holds word
+ * i of both rows at lanes 2i, 2i+1), then four butterfly stages at 8, 16,
+ * 32 and 64 bytes between vectors 1, 2, 4 and 8 apart bring every row's
+ * word i together. Each stage's lo/hi are the lower/upper halves of the
+ * pair, so vector k ends up holding word bitrev4(k): the final store
+ * undoes that. Derived and checked on the lane emulation against the
+ * word-transpose definition (tile_f16_host_check, bit for bit), and on
+ * the device by ProbeLayoutsMatchHexkl.
+ *
+ * It replaced a scalar word transpose through a stack buffer: 256 scalar
+ * loads and 512 scalar stores per tile, and the rows come from VTCM,
+ * where a scalar access costs an L2 miss each -- measured at 91 ms of a
+ * 93 ms attention call against 0.5 ms of HMX work (doc 20 section 1).
+ * The row loads here read a whole vector of which the row is the first
+ * 64 bytes, like hvx_tile_f16_rows_to_tile does.
  *
  * @param src         32 K rows of at least 32 fp16 (natural [kv][hd])
  * @param src_stride  elements between consecutive rows
@@ -203,16 +213,29 @@ hvx_tile_f16_rows_f32_gather_to_tile(HVX_Vector *dst, const float *const *rows,
 static inline void hvx_tile_f16_rows_to_tile_transposed(HVX_Vector *dst,
                                                         const uint16_t *src,
                                                         uint32_t src_stride) {
-  uint32_t buf[HVX_TILE_F16_VECS][32];
-  for (uint32_t r = 0; r < 32u; ++r) {
-    uint32_t words[16];
-    memcpy(words, src + r * src_stride, HVX_TILE_F16_ROW_BYTES);
-    for (uint32_t i = 0; i < HVX_TILE_F16_VECS; ++i) {
-      buf[i][r] = words[i];
-    }
+  HVX_Vector a[HVX_TILE_F16_VECS];
+  for (uint32_t j = 0; j < HVX_TILE_F16_VECS; ++j) {
+    const HVX_Vector r0 = hvx_tile_load_u(src + (2u * j) * src_stride);
+    const HVX_Vector r1 = hvx_tile_load_u(src + (2u * j + 1u) * src_stride);
+    a[j] = Q6_V_lo_W(Q6_W_vshuff_VVR(r1, r0, -4));
   }
-  for (uint32_t i = 0; i < HVX_TILE_F16_VECS; ++i) {
-    dst[i] = hvx_tile_load_u(buf[i]);
+#define HVX_TILE_F16_T_STAGE(g, d)                                             \
+  for (uint32_t p = 0; p < HVX_TILE_F16_VECS; ++p) {                           \
+    if ((p & (d)) == 0u) {                                                     \
+      const HVX_VectorPair w = Q6_W_vshuff_VVR(a[p + (d)], a[p], -(g));        \
+      a[p] = Q6_V_lo_W(w);                                                     \
+      a[p + (d)] = Q6_V_hi_W(w);                                               \
+    }                                                                          \
+  }
+  HVX_TILE_F16_T_STAGE(8, 1)
+  HVX_TILE_F16_T_STAGE(16, 2)
+  HVX_TILE_F16_T_STAGE(32, 4)
+  HVX_TILE_F16_T_STAGE(64, 8)
+#undef HVX_TILE_F16_T_STAGE
+  for (uint32_t k = 0; k < HVX_TILE_F16_VECS; ++k) {
+    const uint32_t i =
+      ((k & 1u) << 3) | ((k & 2u) << 1) | ((k & 4u) >> 1) | ((k & 8u) >> 3);
+    dst[i] = a[k];
   }
 }
 
