@@ -678,7 +678,9 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                         wq, htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
   if (r == 3) {
-    NNTR_THROW_IF(!use_rope || !htp_rope_table_.empty(), std::runtime_error)
+    // [#260] use_rope may be off here: qkv_layer rotates on the CPU path
+    // (#4415) with the table this layer's precompute_freqs also builds
+    NNTR_THROW_IF(!htp_rope_table_.empty(), std::runtime_error)
       << "mha_core: the HTP attention hook asked for a RoPE table it has";
     build_rope_table();
     r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
