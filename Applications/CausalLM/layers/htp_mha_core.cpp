@@ -1136,8 +1136,16 @@ bool MHACoreLayer::try_quantized_attention(
   if (use_q2) {
     if (!q2_calibrated) {
       // The rows about to be appended are the first this layer sees.
+      const auto t0 = std::chrono::steady_clock::now();
       calibrate_q2_scales(k_base + off, v_base + off, append_rows, width, io.q,
                           q_stride, n_q);
+      if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
+        ml_logi("mha_core trace: q2 calibration rows=%u us=%lld", append_rows,
+                static_cast<long long>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()));
+      }
     }
     if (!q2_scales_set[batch]) {
       if (!compute_ops_->kv_cache_q_set_fixed_scales(
