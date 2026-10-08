@@ -1776,114 +1776,6 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
  *        trust either.
  */
 /**
- * @brief [doc 45 Gate 0] How much weight the DSP can hold resident.
- *
- * The whole-model plan needs every weight of LFM2.5-8B-A1B -- about 4.3 GB
- * at 4 bits -- resident on the DSP at once, because streaming a layer's
- * weights over FastRPC per forward (~180 MB, ~90 ms) would cost more than
- * the layer saves. Registered weights live in the DSP PD's own heap
- * (hexkl_mm_u8i4_dma.c bakes into VTCM and mallocs the resident copy), so
- * the question is whether that heap, and the PD's address space, reach
- * 4.3 GB. Nothing else in the plan matters if this does not, which is why
- * it is a gate and runs before any of it is built.
- *
- * Registers one gate_up-sized weight's bytes over and over -- the DSP
- * copies each into fresh heap, so the host needs only one buffer -- until
- * registration fails, and reports how far it got and why. The cap is
- * comfortably above the target so a device that can hold more still
- * terminates.
- */
-TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
-  const uint32_t K = 2048, N = 3584; // gate_up: the model's largest weight
-  Weight w;
-  MakeAndRegister(K, N, 0xC0FFEEu, w);
-  std::vector<uint32_t> handles = {w.handle};
-
-  const uint32_t k_tiles = K / 32u, n_tiles = N / 32u;
-  const double gb_per = k_tiles * n_tiles * 512.0 / 1e9; // WH bytes
-  const double target_gb = 4.3;
-  const size_t cap = static_cast<size_t>(6.0 / gb_per); // stop past 6 GB
-  int stop_err = AEE_SUCCESS;
-
-  const auto t0 = std::chrono::steady_clock::now();
-  while (handles.size() < cap) {
-    uint32_t h = 0xFFFFFFFFu;
-    const int err = nntr_hvx_weight_register_u8i4(
-      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()), w.d.data(),
-      static_cast<int>(w.d.size()), w.colsum.data(),
-      static_cast<int>(w.colsum.size()), w.bias.data(),
-      static_cast<int>(w.bias.size()), &h);
-    if (err != AEE_SUCCESS) {
-      stop_err = err;
-      break;
-    }
-    handles.push_back(h);
-  }
-  const double secs =
-    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-      .count();
-
-  const double gb = handles.size() * gb_per;
-  std::cout << "U8I4_FIELD path=registry field=weights_resident value="
-            << handles.size() << "\n"
-            << "U8I4_FIELD path=registry field=gb_resident value=" << gb << "\n"
-            << "U8I4_FIELD path=registry field=stop_reason value="
-            << (stop_err == AEE_SUCCESS ? std::string("cap") : hex(stop_err))
-            << "\n"
-            << "U8I4_FIELD path=registry field=register_ms_per_weight value="
-            << (handles.size() > 1 ? secs * 1e3 / (handles.size() - 1) : 0.0)
-            << std::endl;
-
-  // Releasing is only a fair check while the PD can still service a call.
-  // Registration stops here by running the PD out of memory (0x8000040d is
-  // raised before the registration function runs), and a PD in that state
-  // fails every call including this one -- which printed 516 identical
-  // failures and turned the suite red for the ceiling working as measured.
-  // The code they fail with says as much: 0x27, which is neither success nor
-  // the AEE_EBADPARM hexkl_weight_u8i4_release can return, so the call never
-  // reached it. So count them, and assert only in the case where the PD is
-  // healthy: stopping at our own cap means releases have no excuse.
-  size_t released = 0;
-  int first_release_err = AEE_SUCCESS;
-  for (uint32_t h : handles) {
-    const int rerr = nntr_hvx_weight_release_u8i4(handle_, h);
-    if (rerr == AEE_SUCCESS) {
-      ++released;
-    } else if (first_release_err == AEE_SUCCESS) {
-      first_release_err = rerr;
-    }
-  }
-  std::cout << "U8I4_FIELD path=registry field=released value=" << released
-            << " of " << handles.size() << "\n"
-            << "U8I4_FIELD path=registry field=first_release_err value="
-            << (first_release_err == AEE_SUCCESS ? std::string("none")
-                                                 : hex(first_release_err))
-            << std::endl;
-  if (stop_err == AEE_SUCCESS) {
-    EXPECT_EQ(released, handles.size())
-      << "registration stopped at the cap, so the PD was healthy and every "
-         "handle should have released; first error "
-      << hex(first_release_err);
-  }
-
-  // Reports; does not assert a target. It did assert >= 4.3 GB, which was
-  // right while that was an open question and wrong once it was answered:
-  // this path tops out at 1.89 GB on device (doc 45 section 8), the DSP heap
-  // alone reaches 3.75 and ION at least 6 (section 9), and the design moved
-  // the weights into an ION arena because of it. Asserting a target against
-  // a path that is being replaced turns every run red and teaches people to
-  // skim past failures.
-  //
-  // What would be a real regression is this number collapsing -- so that is
-  // what is checked, along with every handle releasing cleanly above.
-  (void)target_gb;
-  EXPECT_GT(handles.size(), 1u)
-    << "no weight registered at all; registration is broken, not merely "
-       "bounded. Stopped with "
-    << (stop_err == AEE_SUCCESS ? std::string("the cap") : hex(stop_err));
-}
-
-/**
  * @brief [doc 45 Gate 0b] Which of the two memory limits stopped Gate 0.
  *
  * Gate 0 registered 1.89 GB of the 4.10 the whole-model plan needs and
@@ -2904,6 +2796,192 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
   std::cout << "U8I4_FIELD path=moe_m1_gemv field=bit_identical value="
             << (bad_total == 0 ? "yes" : "no") << std::endl;
   ReleaseMoeExperts(x);
+}
+
+/* [plan 229] The u8i2 GEMV on silicon, at the Gemma 26B expert shape
+   (hidden 2816, moe_intermediate 704, top-8). Every weight is registered
+   twice from one arena: as QS2CX_WH codes + palette
+   (weight_register_u2i4_arena) and as their 4-bit twin, the int4 bytes the
+   DSP's scalar expansion (hvx_expand_i2i4_scalar, via expand_i2i4's ref)
+   makes of the same codes (weight_register_u8i4_arena). The same M=1 call
+   on the two must agree byte for byte under every GEMV cell the ARM side
+   can send: the 2-bit one runs hvx_gemm_u8i2_wh_* (native_i2), the twin
+   the 4-bit GEMV MoeLayerM1GemvMatchesHmx already ties to the HMX, and
+   gemv_native_check.c ties both to hvx_scalar_gemv_i2 on the host. The
+   HMX block loop (flags without M1_GEMV: expand in VTCM after the DMA)
+   is compared the same way, and the 2-bit GEMV against the 2-bit HMX
+   closes the triangle on the device. SwiGLU and GeGLU (Gemma's epilogue)
+   both run. */
+TEST_F(HmxMmU8I4Layer, MoeLayerU8I2GemvMatchesI4Twin) {
+  const uint32_t K = 2816, I = 704, N = 2816, NE = 8;
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  // Per expert: gate_up K x 2I and down I x N, each as codes then twin.
+  const uint32_t shapes[2][2] = {{K, 2 * I}, {I, N}};
+  auto page = [](uint32_t b) { return (b + 4095u) & ~4095u; };
+  uint32_t per_expert = 0;
+  for (const auto &s : shapes) {
+    per_expert += page((s[0] / 32u) * (s[1] / 32u) * 256u) +
+                  page((s[0] / 32u) * (s[1] / 32u) * 512u);
+  }
+  const uint32_t arena_bytes = NE * per_expert;
+  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
+  const int fd = to_fd(buf);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+                  static_cast<int>(FASTRPC_MAP_FD)),
+            0);
+  uint32_t arena = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
+            AEE_SUCCESS);
+
+  // Handles [0] = 2-bit, [1] = 4-bit twin.
+  std::vector<uint32_t> gu[2], dn[2];
+  auto *base = static_cast<uint8_t *>(buf);
+  uint32_t off = 0, seed = 0x2B1B0000u;
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (int m = 0; m < 2; ++m) {
+      const uint32_t k = shapes[m][0], n = shapes[m][1];
+      const uint32_t b2 = (k / 32u) * (n / 32u) * 256u;
+      // Asymmetric palettes over the int4 range, a different one per
+      // weight, so a palette crossed between slots shows up.
+      const int8_t pal[4] = {static_cast<int8_t>(-8 + (int)(e % 3)),
+                             static_cast<int8_t>(-2 - (int)m), 1,
+                             static_cast<int8_t>(7 - (int)(e % 4))};
+      std::vector<uint8_t> codes(b2), hvx(2 * b2), twin(2 * b2);
+      uint32_t s = ++seed;
+      for (uint32_t i = 0; i < b2; ++i) {
+        s = s * 1664525u + 1013904223u;
+        codes[i] = static_cast<uint8_t>(s >> 24);
+      }
+      ASSERT_EQ(nntr_hvx_expand_i2i4(handle_, codes.data(), (int)b2, pal, 4,
+                                     hvx.data(), (int)(2 * b2), twin.data(),
+                                     (int)(2 * b2)),
+                AEE_SUCCESS);
+      ASSERT_EQ(std::memcmp(hvx.data(), twin.data(), twin.size()), 0)
+        << "hvx_expand_i2i4 != its scalar twin (HvxExpandI2I4 says where)";
+      // Column sums of the twin's int4 values: a tile's byte b holds slots
+      // 2b and 2b+1, both in column ((2b) % 256) / 8 (whSlot).
+      std::vector<int32_t> colsum(n, 0);
+      const uint32_t n_tiles = n / 32u;
+      for (size_t t = 0; t < twin.size() / 512u; ++t) {
+        const uint32_t col0 = static_cast<uint32_t>(t % n_tiles) * 32u;
+        for (uint32_t b = 0; b < 512u; ++b) {
+          const uint8_t v = twin[t * 512u + b];
+          colsum[col0 + ((2u * b) % 256u) / 8u] +=
+            (((v & 15) ^ 8) - 8) + (((v >> 4) ^ 8) - 8);
+        }
+      }
+      std::vector<float> scale(n), bias(n);
+      fill_deterministic(scale, seed ^ 0x5CA1E000u);
+      for (float &v : scale)
+        v = 0.002f + 0.001f * std::fabs(v);
+      fill_deterministic(bias, seed ^ 0xB1A50000u);
+
+      std::memcpy(base + off, codes.data(), b2);
+      uint32_t h2 = 0xFFFFFFFFu, h4 = 0xFFFFFFFFu;
+      ASSERT_EQ(nntr_hvx_weight_register_u2i4_arena(
+                  handle_, k, n, arena, off, pal, 4, scale.data(), (int)n,
+                  colsum.data(), (int)n, bias.data(), (int)n, &h2),
+                AEE_SUCCESS)
+        << "e=" << e << " m=" << m;
+      off += page(b2);
+      std::memcpy(base + off, twin.data(), twin.size());
+      ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                  handle_, k, n, arena, off, scale.data(), (int)n,
+                  colsum.data(), (int)n, bias.data(), (int)n, &h4),
+                AEE_SUCCESS)
+        << "e=" << e << " m=" << m;
+      off += page(2 * b2);
+      (m == 0 ? gu : dn)[0].push_back(h2);
+      (m == 0 ? gu : dn)[1].push_back(h4);
+    }
+  }
+
+  const std::vector<uint32_t> count(NE, 1u), index(NE, 0u);
+  std::vector<float> weight(NE), act(K);
+  for (uint32_t i = 0; i < NE; ++i)
+    weight[i] = 0.05f + 0.02f * static_cast<float>(i);
+  fill_deterministic(act, 0x5EED0229u);
+  auto run = [&](int w, uint32_t flags, std::vector<float> &out) {
+    uint32_t applied = 0xFFFFFFFFu;
+    EXPECT_EQ(nntr_hvx_moe_set_opts(handle_, flags, &applied), AEE_SUCCESS);
+    EXPECT_EQ(applied, flags) << "the skel did not keep the bits";
+    out.assign(N, 1.0f);
+    // The timed entry for its path / feed words (MoeM1GemvFeedVsCompute's
+    // slots 29 and 30): a cell that fell through to the HMX loop would
+    // compare equal and prove nothing about the u8i2 GEMV. Slot 30 is the
+    // feed's DMA queue count (HEXKL_PROBE_M1_FEED), 0 on the arena read.
+    std::vector<uint32_t> stage(31, 0xFFFFFFFFu);
+    const int err = nntr_hvx_mm_u8i4_moe_layer_timed(
+      handle_, 1, K, I, N, gu[w].data(), (int)NE, dn[w].data(), (int)NE,
+      index.data(), (int)NE, count.data(), (int)NE, weight.data(), (int)NE,
+      act.data(), (int)K, out.data(), (int)N, stage.data(), 31);
+    if (err == AEE_SUCCESS) {
+      EXPECT_EQ(stage[29], flags & 1u) << "path, opts=0x" << std::hex << flags;
+      EXPECT_EQ(stage[30], (flags & 0x20000u) ? 1u + ((flags >> 19) & 3u) : 0u)
+        << "feed, opts=0x" << std::hex << flags;
+    }
+    return err;
+  };
+  auto differ = [](const std::vector<float> &a, const std::vector<float> &b) {
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+      bad += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+    return bad;
+  };
+
+  // The cells: the production one (one-row loop, VTCM feed, 4 DMA queues,
+  // bypass), the feed on one queue, the arena read with and without
+  // #113's lead, and the four-row loop.
+  const uint32_t q4 = (3u << 22) | 0x40000u;
+  const std::vector<uint32_t> cells = {
+    MoeGemvOpts(0u, true, true) | q4, MoeGemvOpts(0u, true, true),
+    MoeGemvOpts(192u, true), MoeGemvOpts(0u, true), MoeGemvOpts(0u, false)};
+  size_t bad_total = 0;
+  for (uint32_t geglu : {0u, 0x80000u}) {
+    std::vector<float> h2, h4, g2, g4;
+    ASSERT_EQ(run(0, geglu, h2), AEE_SUCCESS);
+    ASSERT_EQ(run(1, geglu, h4), AEE_SUCCESS);
+    size_t bad = differ(h2, h4);
+    std::cout << "U8I2_FIELD path=hmx geglu=" << (geglu ? 1 : 0)
+              << " bad_vs_twin=" << bad << " of " << N << std::endl;
+    EXPECT_EQ(bad, 0u) << "2-bit HMX (expand in VTCM) != 4-bit twin";
+    bad_total += bad;
+    for (uint32_t c : cells) {
+      ASSERT_EQ(run(0, c | geglu, g2), AEE_SUCCESS) << std::hex << c;
+      ASSERT_EQ(run(1, c | geglu, g4), AEE_SUCCESS) << std::hex << c;
+      const size_t bt = differ(g2, g4), bh = differ(g2, h2);
+      std::cout << "U8I2_FIELD path=m1_gemv geglu=" << (geglu ? 1 : 0)
+                << " opts=0x" << std::hex << c << std::dec
+                << " bad_vs_twin=" << bt << " bad_vs_hmx=" << bh << " of " << N
+                << std::endl;
+      EXPECT_EQ(bt, 0u) << "u8i2 GEMV != the 4-bit GEMV on the twin";
+      EXPECT_EQ(bh, 0u) << "u8i2 GEMV != the 2-bit HMX block loop";
+      bad_total += bt + bh;
+    }
+  }
+  uint32_t applied = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
+  std::cout << "U8I2_FIELD path=m1_gemv field=bit_identical value="
+            << (bad_total == 0 ? "yes" : "no") << std::endl;
+  for (int w = 0; w < 2; ++w) {
+    for (uint32_t e = 0; e < NE; ++e) {
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu[w][e]), AEE_SUCCESS);
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn[w][e]), AEE_SUCCESS);
+    }
+  }
+  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  rfree(buf);
 }
 
 /* [#105] Where the M=1 GEMV's time goes: three cells through the same

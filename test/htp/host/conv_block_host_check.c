@@ -119,9 +119,9 @@ int main(void) {
   float *got = (float *)malloc(sizeof(float) * M * N_out);
   float *got_state = (float *)malloc(sizeof(float) * 2 * C);
   hexkl_moe_scratch scratch = {NULL, NULL, 0};
-  rc =
-    hexkl_conv_block_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, C, N_out,
-                         0, 1, 2, 3, conv_w, x, got, got_state, NULL, &scratch);
+  rc = hexkl_conv_block_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, C,
+                            N_out, 0, 1, 2, 3, conv_w, NULL, x, got, got_state,
+                            NULL, &scratch);
   printf("run rc=%d\n", rc);
   if (rc)
     return 1;
@@ -158,8 +158,8 @@ int main(void) {
     float *want1 = (float *)malloc(sizeof(float) * N_out);
     float *wst1 = (float *)malloc(sizeof(float) * 2 * C);
     int r = hexkl_conv_block_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K,
-                                 C, N_out, 0, 1, 2, 3, conv_w, x, got1, st1,
-                                 NULL, &scratch);
+                                 C, N_out, 0, 1, 2, 3, conv_w, NULL, x, got1,
+                                 st1, NULL, &scratch);
     ref_block(&wa, &wb, &wc, &wo, conv_w, x, 1, K, C, N_out, want1, wst1);
     int ok = (r == 0) && !compare("M=1 output", got1, want1, N_out) &&
              !compare("M=1 state", st1, wst1, 2u * C);
@@ -170,10 +170,34 @@ int main(void) {
     free(want1);
     free(wst1);
   }
+  /* [#225] The prefill in chunks -- 100 rows, then 49 and 1 continuing
+     from the state the previous chunk handed back as hist -- equals the
+     one call bit for bit: every row's quantization and epilogue are its
+     own, and the look-back crosses the chunk through hist. The one-row
+     last chunk is the history-only state copy. */
+  {
+    const uint32_t cut[4] = {0, 100, 149, M};
+    float *out_c = (float *)malloc(sizeof(float) * M * N_out);
+    float *st_c = (float *)malloc(sizeof(float) * 2 * C);
+    int r = 0;
+    for (int i = 0; i < 3 && r == 0; ++i) {
+      r = hexkl_conv_block_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, cut[i + 1] - cut[i], K, C,
+        N_out, 0, 1, 2, 3, conv_w, i ? st_c : NULL, x + (size_t)cut[i] * K,
+        out_c + (size_t)cut[i] * N_out, st_c, NULL, &scratch);
+    }
+    const int same = r == 0 && !memcmp(out_c, got, sizeof(float) * M * N_out) &&
+                     !memcmp(st_c, got_state, sizeof(float) * 2 * C);
+    printf("chunked 100+49+1  : %s\n",
+           same ? "CONV BLOCK CHUNKED BIT-IDENTICAL" : "DIFFERS");
+    fail |= !same;
+    free(out_c);
+    free(st_c);
+  }
   /* Edge: a wrong-shaped handle is refused before any work. */
   {
     int r = hexkl_conv_block_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
-                                 C, N_out, 0, 1, 3, 3, conv_w, x, got,
+                                 C, N_out, 0, 1, 3, 3, conv_w, NULL, x, got,
                                  got_state, NULL, &scratch);
     printf("bad handle shape  : rc=%d (want %d)\n", r, AEE_EBADPARM);
     fail |= (r != AEE_EBADPARM);
