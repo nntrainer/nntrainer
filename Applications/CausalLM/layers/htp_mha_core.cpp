@@ -135,6 +135,8 @@ MHACoreLayer::MHACoreLayer() :
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
+std::vector<uint16_t> MHACoreLayer::q2_q_u16, MHACoreLayer::q2_out_u16;
+
 MHACoreLayer::~MHACoreLayer() { release_quantized_cache(); }
 
 /************************************************************** */
@@ -643,12 +645,11 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
   std::memcpy(row.data(), query.getData<float>(), wq * sizeof(float));
   std::memcpy(row.data() + wq, key.getData<float>(), wk * sizeof(float));
   std::memcpy(row.data() + wq + wk, value.getData<float>(), wv * sizeof(float));
-  // The RoPE table, once per layer instance, in the ROPE op's shape:
-  // cos[i][0..hd/2) | sin[i][0..hd/2) per position, the CPU RoPE's own
-  // source (plan 82 section 3.4). Head_dim 64 builds it up front (LFM2);
-  // [plan 201 S4] any other head_dim when the hook asks for it (3), so a
-  // CPU run of such a model keeps no table.
-  auto build_rope_table = [&]() {
+  // The RoPE table, once per layer instance, in the ROPE op's shape
+  // (head_dim 64: cos[i][0..31] | sin[i][0..31], the CPU RoPE's own
+  // source, plan 82 section 3.4). At another head_dim the op cannot be
+  // resident (the validator refuses it), so no table is needed.
+  if (htp_rope_table_.empty() && use_rope && head_dim == 64) {
     const unsigned int rows =
       std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
     if (freqs_fp32 == nullptr) {
@@ -657,41 +658,20 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
         precompute_freqs(head_dim, std::min(max_position_embeddings, rows),
                          theta, false);
     }
-    const unsigned int half = head_dim / 2;
-    // ponytail: htp_rope_table_ is built once, at the max_timestep of the
-    // first decode row, like the DSP graph's KV cache; a later
-    // updateTensorsByInputDimensions that grows max_timestep rebuilds the
-    // CPU tables but not this one. Upgrade path: clear it there and
-    // re-bind the graph at the new length.
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
-    htp_rope_table_.resize(static_cast<size_t>(rows) * head_dim);
+    htp_rope_table_.resize(static_cast<size_t>(rows) * 64);
     for (unsigned int i = 0; i < rows; ++i) {
-      float *t = htp_rope_table_.data() + static_cast<size_t>(i) * head_dim;
-      std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
-      std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
+      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64,
+                  freqs_fp32->cos[i].data(), 32 * sizeof(float));
+      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64 + 32,
+                  freqs_fp32->sin[i].data(), 32 * sizeof(float));
     }
-  };
-  if (htp_rope_table_.empty() && use_rope && head_dim == 64)
-    build_rope_table();
+  }
   int r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
                         wq, htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
-  if (r == 3) {
-    // [#260] use_rope may be off here when the token runs the row: its
-    // q / k are the DSP's own, unrotated (qkv_layer rotates on the CPU
-    // path, #4415, with the table precompute_freqs also builds). A row the
-    // CPU projected arrives rotated already.
-    NNTR_THROW_IF(!htp_rope_table_.empty() ||
-                    (!use_rope && !htpDecodeRowResident(pos)),
-                  std::runtime_error)
-      << "mha_core: the HTP attention hook asked for a RoPE table it has";
-    build_rope_table();
-    r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                      wq, htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
-  }
   if (r == 2) {
     // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
     // every platform's cache (FP16 or UINT16 storage), f32 when it is.
@@ -1005,6 +985,32 @@ bool MHACoreLayer::try_accelerated_attention(
   return true;
 }
 
+void MHACoreLayer::registerQuantizedCache(nntrainer::RunLayerContext &context) {
+  compute_ops_ = context.getComputeOps();
+  if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
+      !compute_ops_->supports_kv_cache_q() || !is_causal ||
+      !q_cache_handles.empty())
+    return;
+  // try_quantized_attention's own gate for a layer the int8 kernels take
+  const bool q2 = kv_cache_quant_kind == 0 &&
+                  compute_ops_->supports_kv_cache_q2() &&
+                  attn_logit_softcapping <= 0.0f;
+  if (!q2 && head_dim > 256)
+    return;
+  const nntrainer::Tensor &ck =
+    use_external_cache
+      ? context.getInput(3)
+      : context.getTensor(tensor_idx[AttentionParams::cache_key]);
+  const int h = compute_ops_->kv_cache_q_register(
+    static_cast<unsigned int>(kv_cache_quant_kind), ck.getDim().height(),
+    num_heads_KV, head_dim);
+  if (h < 0)
+    return;
+  q_cache_handles.assign(1, h);
+  q_cache_synced.assign(1, 0);
+  q2_scales_set.assign(1, 0);
+}
+
 void MHACoreLayer::release_quantized_cache() {
   if (compute_ops_) {
     for (int h : q_cache_handles) {
@@ -1043,15 +1049,13 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     }
     causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, q2_scale_v.data());
   }
+  // Q's per-head range, NEON (min / max are order-free): scalar it was
+  // 11-22 ms a 1024-row layer (doc 59 section 2.2).
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
   for (unsigned int r = 0; r < n_q; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
-    for (unsigned int h = 0; h < num_heads_Q; ++h) {
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        q_lo[h] = std::min(q_lo[h], qr[h * head_dim + d]);
-        q_hi[h] = std::max(q_hi[h], qr[h * head_dim + d]);
-      }
-    }
+    for (unsigned int h = 0; h < num_heads_Q; ++h)
+      causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
   }
   const unsigned int G = num_heads_Q / num_heads_KV;
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
@@ -1085,10 +1089,14 @@ bool MHACoreLayer::try_quantized_attention(
       !compute_ops_->supports_kv_cache_q() || !is_causal) {
     return false;
   }
+  using clk = std::chrono::steady_clock;
+  const auto ts0 = clk::now();
   AccelF32Io io;
   if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
   }
+  const auto ts1 = clk::now();
+  clk::time_point ts2 = ts1, ts3 = ts1, ts4 = ts1, ts5 = ts1;
   const uint16_t *k_base = nullptr;
   const uint16_t *v_base = nullptr;
   switch (cache_key.getDataType()) {
@@ -1136,6 +1144,7 @@ bool MHACoreLayer::try_quantized_attention(
     return false;
   }
   if (handle < 0) {
+    ts2 = clk::now();
     handle = compute_ops_->kv_cache_q_register(
       static_cast<unsigned int>(kv_cache_quant_kind), max_rows, num_heads_KV,
       head_dim);
@@ -1144,6 +1153,7 @@ bool MHACoreLayer::try_quantized_attention(
     }
     synced = 0;
     q2_scales_set[batch] = 0;
+    ts3 = clk::now();
   }
   // Rows past cache_from may have been rewritten (a rewound session, a
   // loaded cache); re-append from the first row that could differ.
@@ -1177,6 +1187,7 @@ bool MHACoreLayer::try_quantized_attention(
                     .count()));
       }
     }
+    const auto ts_sc = clk::now();
     if (!q2_scales_set[batch]) {
       if (!compute_ops_->kv_cache_q_set_fixed_scales(
             handle, num_heads_KV, head_dim, q2_scale_k.data(),
@@ -1189,23 +1200,26 @@ bool MHACoreLayer::try_quantized_attention(
     // quantized graph both are the neighbouring layers' formats already;
     // here the f32 layer converts at its edges.
     const size_t q_elems = static_cast<size_t>(n_q) * q_stride;
-    q2_q_u16.resize(q_elems);
-    q2_out_u16.resize(q_elems);
+    ts4 = clk::now();
+    if (q2_q_u16.size() < q_elems) {
+      q2_q_u16.resize(q_elems);
+      q2_out_u16.resize(q_elems);
+    }
+    ts5 = clk::now();
+    // Both conversions NEON on this thread: scalar they were 8-13 ms a
+    // 1024-row layer (doc 59 section 2.2); NEON 1.0 / 1.1 ms, and split over
+    // 4 or 8 compute threads slower (doc 57 section 9.23).
+    static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
+    const auto tq0 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q; ++r) {
       const float *qr = io.q + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
-      for (unsigned int h = 0; h < num_heads_Q; ++h) {
-        const float inv = 1.0f / q2_q_enc[2 * h];
-        const float zp = q2_q_enc[2 * h + 1];
-        const float *src = qr + h * head_dim;
-        uint16_t *d = dst + h * head_dim;
-        for (unsigned int i = 0; i < head_dim; ++i) {
-          float v = src[i] * inv + zp + 0.5f;
-          v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
-          d[i] = static_cast<uint16_t>(v);
-        }
-      }
+      for (unsigned int h = 0; h < num_heads_Q; ++h)
+        causallm::quant_u16_f32(qr + h * head_dim, head_dim,
+                                1.0f / q2_q_enc[2 * h], q2_q_enc[2 * h + 1],
+                                dst + h * head_dim);
     }
+    const auto tq1 = std::chrono::steady_clock::now();
     if (!compute_ops_->sdpa_q2_kvcache(
           handle, append_row0, append_rows, width, k_base + off, v_base + off,
           q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
@@ -1213,19 +1227,29 @@ bool MHACoreLayer::try_quantized_attention(
           q2_out_enc.data(), q_stride)) {
       return fail("attention");
     }
+    const auto tq2 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q; ++r) {
       const uint16_t *src =
         q2_out_u16.data() + static_cast<size_t>(r) * q_stride;
       float *dst = io.out + static_cast<size_t>(r) * q_stride;
-      for (unsigned int h = 0; h < num_heads_Q; ++h) {
-        const float scale = q2_out_enc[2 * h];
-        const float zp = q2_out_enc[2 * h + 1];
-        const uint16_t *s = src + h * head_dim;
-        float *d = dst + h * head_dim;
-        for (unsigned int i = 0; i < head_dim; ++i) {
-          d[i] = (static_cast<float>(s[i]) - zp) * scale;
-        }
-      }
+      for (unsigned int h = 0; h < num_heads_Q; ++h)
+        causallm::dequant_u16_f32(src + h * head_dim, head_dim,
+                                  q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
+                                  dst + h * head_dim);
+    }
+    if (conv_trace && n_q > 1) {
+      const auto tq3 = std::chrono::steady_clock::now();
+      auto us = [](auto d) {
+        return static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+      };
+      ml_logi("mha_core trace: q2 setup rows=%u prepare_us=%lld "
+              "register_us=%lld fixed_scales_us=%lld resize_us=%lld",
+              n_q, us(ts1 - ts0), us(ts3 - ts2), us(ts4 - ts_sc),
+              us(ts5 - ts4));
+      ml_logi("mha_core trace: q2 convert rows=%u q_us=%lld call_us=%lld "
+              "out_us=%lld",
+              n_q, us(tq1 - tq0), us(tq2 - tq1), us(tq3 - tq2));
     }
   } else if (!compute_ops_->sdpa_q_kvcache(
                handle, append_row0, append_rows, width, k_base + off,

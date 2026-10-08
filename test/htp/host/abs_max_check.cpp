@@ -63,6 +63,47 @@ int main() {
       }
     }
   }
+  // min / max: exact. quant: the scalar loop mha_core had, within one
+  // code (the NEON multiply and add may round differently from a fused
+  // scalar under -ffast-math). dequant: exact.
+  int q_off1 = 0, q_bad = 0, mm_bad = 0, dq_bad = 0;
+  long q_n = 0;
+  for (unsigned n : {1u, 7u, 8u, 9u, 31u, 256u, 512u}) {
+    for (int t = 0; t < 200; ++t) {
+      std::vector<float> f(n);
+      for (unsigned i = 0; i < n; ++i)
+        f[i] = ((int)(rnd() % 20001) - 10000) * (0.0005f * (1 + t % 7));
+      float lo = 1e30f, hi = -1e30f, rlo = 1e30f, rhi = -1e30f;
+      causallm::min_max_f32(f.data(), n, lo, hi);
+      for (unsigned i = 0; i < n; ++i) {
+        rlo = std::min(rlo, f[i]);
+        rhi = std::max(rhi, f[i]);
+      }
+      mm_bad += lo != rlo || hi != rhi;
+      const float scale = std::max(rhi - rlo, 1e-6f) / 65535.0f;
+      const float zp = std::round(-rlo / scale), inv = 1.0f / scale;
+      std::vector<uint16_t> u(n);
+      causallm::quant_u16_f32(f.data(), n, inv, zp, u.data());
+      for (unsigned i = 0; i < n; ++i) {
+        float v = f[i] * inv + zp + 0.5f;
+        v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+        const int d = (int)u[i] - (int)static_cast<uint16_t>(v);
+        q_off1 += d != 0;
+        q_bad += d > 1 || d < -1;
+        ++q_n;
+      }
+      std::vector<float> o(n);
+      causallm::dequant_u16_f32(u.data(), n, scale, 32768.0f, o.data());
+      for (unsigned i = 0; i < n; ++i) {
+        const float r = (static_cast<float>(u[i]) - 32768.0f) * scale;
+        dq_bad += std::memcmp(&r, &o[i], 4) != 0;
+      }
+    }
+  }
+  printf("min_max bad %d, quant %ld values: %d off by one, %d worse, "
+         "dequant bad %d\n",
+         mm_bad, q_n, q_off1, q_bad, dq_bad);
+  bad += mm_bad + q_bad + dq_bad;
   printf("abs_max: %d cases, %d bad\n%s\n", cases, bad,
          bad ? "ABS MAX FAILED" : "ABS MAX OK");
   return bad != 0;

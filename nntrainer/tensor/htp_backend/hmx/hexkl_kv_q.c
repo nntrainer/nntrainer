@@ -20,6 +20,7 @@
 #include "hexkl_micro.h"
 #include "hvx_kv_quant.h"
 #include "hvx_tile_f16.h"
+#include "hvx_worker_pool.h"
 #include <AEEStdErr.h>
 #include <HAP_perf.h>
 #include <hexagon_types.h>
@@ -427,17 +428,27 @@ static void bake_tile_hvx(hexkl_kv_q *kv, uint32_t n, uint32_t c) {
   }
 }
 
-static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
-                           const uint16_t *k_rows, const uint16_t *v_rows,
-                           uint8_t *vtcm_base, hexkl_kv_q_append_stats *st) {
-  const uint64_t tq0 = kvq_now_us();
+typedef struct {
+  hexkl_kv_q *kv;
+  uint32_t row0, n_rows;
+  const uint16_t *k_rows, *v_rows;
+} quant_rows_ctx;
+
+/** Rows [lo, hi) of the append: the fixed-scale int8 quantization of each
+ *  row's K and V into its masters, scales and column sums. A worker's
+ *  rows touch no other worker's bytes. */
+static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const quant_rows_ctx *c = (const quant_rows_ctx *)v;
+  hexkl_kv_q *kv = c->kv;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
   const uint32_t hd = kv->head_dim;
   const uint32_t stride = kv->n_head_kv * hd;
   int8_t q[HEXKL_KV_Q_MAX_HEAD_DIM] __attribute__((aligned(128)));
-  for (uint32_t r = 0; r < n_rows; ++r) {
-    const uint32_t row = row0 + r;
-    const uint16_t *krow = k_rows + (size_t)r * stride;
-    const uint16_t *vrow = v_rows + (size_t)r * stride;
+  for (uint32_t r = lo; r < hi; ++r) {
+    const uint32_t row = c->row0 + r;
+    const uint16_t *krow = c->k_rows + (size_t)r * stride;
+    const uint16_t *vrow = c->v_rows + (size_t)r * stride;
     for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
       int32_t cs;
       hvx_kv_quant_k_row_fixed(krow + (size_t)n * hd, hd, kv->qmax,
@@ -453,6 +464,18 @@ static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
                  (const uint8_t *)q, hd);
     }
   }
+}
+
+static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
+                           const uint16_t *k_rows, const uint16_t *v_rows,
+                           uint8_t *vtcm_base, void *pool,
+                           hexkl_kv_q_append_stats *st) {
+  const uint64_t tq0 = kvq_now_us();
+  const uint32_t hd = kv->head_dim;
+  // The quantization alone was 6.2 ms of a 1024-row sliding layer on the
+  // HMX thread (doc 59 section 2.2); rows split over the workers.
+  quant_rows_ctx qc = {kv, row0, n_rows, k_rows, v_rows};
+  hvx_worker_pool_run((hvx_worker_pool *)pool, quant_rows_worker, &qc, n_rows);
   const uint64_t tq1 = kvq_now_us();
   if (st) {
     st->quant_us = (uint32_t)(tq1 - tq0);
@@ -597,6 +620,15 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
                       uint32_t n_rows, const uint16_t *k_rows,
                       const uint16_t *v_rows, uint8_t *vtcm_base,
                       hexkl_kv_q_append_stats *st) {
+  return hexkl_kv_q_append_pool(tbl, handle, row0, n_rows, k_rows, v_rows,
+                                vtcm_base, NULL, st);
+}
+
+int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
+                           uint32_t row0, uint32_t n_rows,
+                           const uint16_t *k_rows, const uint16_t *v_rows,
+                           uint8_t *vtcm_base, void *pool,
+                           hexkl_kv_q_append_stats *st) {
   hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
   if (!kv || !k_rows || !v_rows || n_rows == 0 ||
       row0 + n_rows > kv->max_rows || row0 + n_rows < row0) {
@@ -607,8 +639,11 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
   }
 #ifdef __hexagon__
   if (kv->plain_masters) {
-    return append_fixed_i8(kv, row0, n_rows, k_rows, v_rows, vtcm_base, st);
+    return append_fixed_i8(kv, row0, n_rows, k_rows, v_rows, vtcm_base, pool,
+                           st);
   }
+#else
+  (void)pool;
 #endif
   const uint64_t tq0 = kvq_now_us();
   const uint32_t hd = kv->head_dim;

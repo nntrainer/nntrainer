@@ -297,6 +297,19 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
                       hexkl_kv_q_append_stats *st);
 
 /**
+ * @brief hexkl_kv_q_append with the fixed-scale cache's row quantization
+ *        split over @a pool's workers (an hvx_worker_pool *, NULL = this
+ *        thread alone, which is what hexkl_kv_q_append does). Each row writes
+ *        only its own masters, scales and column sums, so rows split freely;
+ *        the bake after it stays on the caller (it holds the HMX lock).
+ */
+int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
+                           uint32_t row0, uint32_t n_rows,
+                           const uint16_t *k_rows, const uint16_t *v_rows,
+                           uint8_t *vtcm_base, void *pool,
+                           hexkl_kv_q_append_stats *st);
+
+/**
  * @brief Fills the row-major staging buffers with column tile @a c of head
  *        @a n from the masters (stage_kt as [head_dim][32], stage_v as
  *        [32][head_dim]). What the bake reads; exposed for the host test.

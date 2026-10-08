@@ -460,9 +460,9 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
     return AEE_EBADPARM;
   }
   if (k_rowsLen > 0) {
-    const int rc =
-      hexkl_kv_q_append(&s->kv_q, kv_handle, row0, (uint32_t)k_rowsLen / stride,
-                        k_rows, v_rows, s->vtcm_base, &ast);
+    const int rc = hexkl_kv_q_append_pool(
+      &s->kv_q, kv_handle, row0, (uint32_t)k_rowsLen / stride, k_rows, v_rows,
+      s->vtcm_base, s->quant_pool, &ast);
     if (rc != AEE_SUCCESS) {
       FARF(ERROR, "attn_q2_step: append failed: 0x%08x", rc);
       return rc;
