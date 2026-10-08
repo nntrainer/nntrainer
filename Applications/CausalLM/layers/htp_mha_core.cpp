@@ -1010,7 +1010,8 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
                                        unsigned int n_q) {
   q2_scale_k.assign(num_heads_KV, 0.0f);
   q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
-  q2_scale_q.assign(num_heads_Q, 0.0f);
+  q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
+  q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
   for (unsigned int r = 0; r < n_rows; ++r) {
     const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
     const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
@@ -1020,21 +1021,33 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     }
     causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, q2_scale_v.data());
   }
+  std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
   for (unsigned int r = 0; r < n_q; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
     for (unsigned int h = 0; h < num_heads_Q; ++h) {
-      q2_scale_q[h] =
-        causallm::abs_max_f32(qr + h * head_dim, head_dim, q2_scale_q[h]);
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        q_lo[h] = std::min(q_lo[h], qr[h * head_dim + d]);
+        q_hi[h] = std::max(q_hi[h], qr[h * head_dim + d]);
+      }
     }
+  }
+  const unsigned int G = num_heads_Q / num_heads_KV;
+  for (unsigned int h = 0; h < num_heads_Q; ++h) {
+    const float range = std::max(q_hi[h] - q_lo[h], 1e-6f);
+    q2_q_enc[2 * h] = range / 65535.0f;
+    q2_q_enc[2 * h + 1] = std::round(-q_lo[h] / q2_q_enc[2 * h]);
+    float vmax = 0.0f;
+    for (unsigned int d = 0; d < head_dim; ++d) {
+      vmax = std::max(vmax, q2_scale_v[(h / G) * head_dim + d]);
+    }
+    q2_out_enc[2 * h] = std::max(2.0f * vmax, 1e-6f) / 65535.0f;
+    q2_out_enc[2 * h + 1] = 32768.0f;
   }
   auto finish = [](float &x) { x = x > 0.0f ? x / 127.0f : 1.0f; };
   for (auto &x : q2_scale_k) {
     finish(x);
   }
   for (auto &x : q2_scale_v) {
-    finish(x);
-  }
-  for (auto &x : q2_scale_q) {
     finish(x);
   }
   q2_calibrated = true;
@@ -1150,11 +1163,47 @@ bool MHACoreLayer::try_quantized_attention(
       }
       q2_scales_set[batch] = 1;
     }
+    // Q as the model's u16 tensor and the output back from u16: in a
+    // quantized graph both are the neighbouring layers' formats already;
+    // here the f32 layer converts at its edges.
+    const size_t q_elems = static_cast<size_t>(n_q) * q_stride;
+    q2_q_u16.resize(q_elems);
+    q2_out_u16.resize(q_elems);
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const float *qr = io.q + static_cast<size_t>(r) * q_stride;
+      uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
+      for (unsigned int h = 0; h < num_heads_Q; ++h) {
+        const float inv = 1.0f / q2_q_enc[2 * h];
+        const float zp = q2_q_enc[2 * h + 1];
+        const float *src = qr + h * head_dim;
+        uint16_t *d = dst + h * head_dim;
+        for (unsigned int i = 0; i < head_dim; ++i) {
+          float v = src[i] * inv + zp + 0.5f;
+          v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+          d[i] = static_cast<uint16_t>(v);
+        }
+      }
+    }
     if (!compute_ops_->sdpa_q2_kvcache(
           handle, append_row0, append_rows, width, k_base + off, v_base + off,
-          io.q, q2_scale_q.data(), q_stride, n_q, cache_from, cache_to,
-          num_heads_Q, num_heads_KV, head_dim, window, io.out, q_stride)) {
+          q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
+          num_heads_Q, num_heads_KV, head_dim, window, q2_out_u16.data(),
+          q2_out_enc.data(), q_stride)) {
       return fail("attention");
+    }
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const uint16_t *src =
+        q2_out_u16.data() + static_cast<size_t>(r) * q_stride;
+      float *dst = io.out + static_cast<size_t>(r) * q_stride;
+      for (unsigned int h = 0; h < num_heads_Q; ++h) {
+        const float scale = q2_out_enc[2 * h];
+        const float zp = q2_out_enc[2 * h + 1];
+        const uint16_t *s = src + h * head_dim;
+        float *d = dst + h * head_dim;
+        for (unsigned int i = 0; i < head_dim; ++i) {
+          d[i] = (static_cast<float>(s[i]) - zp) * scale;
+        }
+      }
     }
   } else if (!compute_ops_->sdpa_q_kvcache(
                handle, append_row0, append_rows, width, k_base + off,

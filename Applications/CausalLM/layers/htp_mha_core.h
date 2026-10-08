@@ -395,14 +395,20 @@ private:
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;
   /**
-   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache) int8
-   *        path's scales: K per KV head, V per (KV head, dim), Q per query
-   *        head. A quantized model supplies these as encodings; this f32
-   *        model stands in for them by calibrating on the first rows it
-   *        sees (max / 127) and keeping them, so later steps pay nothing.
-   *        Values beyond them saturate, as they would under encodings.
+   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache)
+   *        a16 / kv8 path's encodings: K per KV head and V per (KV head,
+   *        dim) as symmetric int8 scales, Q and the context output per
+   *        query head as 16-bit asymmetric (scale, zero point) pairs. A
+   *        quantized model supplies these as encodings; this f32 model
+   *        stands in for them by calibrating on the first rows it sees
+   *        (K/V max / 127, Q's range, the output's from V's range since the
+   *        context is a convex combination of V rows) and keeping them, so
+   *        later steps pay nothing. Values beyond them saturate, as they
+   *        would under encodings. The u16 Q and output of each step live in
+   *        the two staging buffers.
    */
-  std::vector<float> q2_scale_k, q2_scale_v, q2_scale_q;
+  std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
+  std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention

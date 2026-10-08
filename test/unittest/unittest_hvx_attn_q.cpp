@@ -422,32 +422,72 @@ protected:
                                static_cast<int>((s.cache_to - split) * width));
     ASSERT_EQ(err, AEE_SUCCESS) << "kv_append_q failed: " << hex(err);
 
-    // Per-head Q scales as a quantized model's encodings would give them.
-    std::vector<float> q_scale(s.n_head_q, 0.0f);
+    // Q as the model's a16 tensor: per-head asymmetric u16 from the data's
+    // range, as a quantized model's encodings would give it.
+    std::vector<float> q_enc(2 * s.n_head_q, 0.0f);
+    {
+      std::vector<float> lo(s.n_head_q, 1e30f), hi(s.n_head_q, -1e30f);
+      for (uint32_t r = 0; r < s.n_q; ++r) {
+        for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+          for (uint32_t d = 0; d < s.head_dim; ++d) {
+            const float x =
+              q[(static_cast<size_t>(r) * s.n_head_q + hh) * s.head_dim + d];
+            lo[hh] = std::min(lo[hh], x);
+            hi[hh] = std::max(hi[hh], x);
+          }
+        }
+      }
+      for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+        const float scale = std::max(hi[hh] - lo[hh], 1e-6f) / 65535.0f;
+        q_enc[2 * hh] = scale;
+        q_enc[2 * hh + 1] = std::round(-lo[hh] / scale);
+      }
+    }
+    std::vector<uint16_t> q_u16(q_elems);
     for (uint32_t r = 0; r < s.n_q; ++r) {
       for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+        const float scale = q_enc[2 * hh], zp = q_enc[2 * hh + 1];
         for (uint32_t d = 0; d < s.head_dim; ++d) {
-          q_scale[hh] = std::max(
-            q_scale[hh],
-            std::fabs(
-              q[(static_cast<size_t>(r) * s.n_head_q + hh) * s.head_dim + d]));
+          const size_t at =
+            (static_cast<size_t>(r) * s.n_head_q + hh) * s.head_dim + d;
+          const float v = std::round(q[at] / scale + zp);
+          q_u16[at] =
+            static_cast<uint16_t>(std::min(65535.0f, std::max(0.0f, v)));
         }
       }
     }
-    for (auto &x : q_scale) {
-      x = x > 0.0f ? x / 127.0f : 1.0f;
+    // The output's encoding: the context is a convex combination of V
+    // rows, so V's range per KV head bounds it.
+    std::vector<float> out_enc(2 * s.n_head_q, 0.0f);
+    for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+      const uint32_t n = hh / (s.n_head_q / s.n_head_kv);
+      float vmax = 0.0f;
+      for (uint32_t d = 0; d < s.head_dim; ++d) {
+        vmax = std::max(vmax, s_v[n * s.head_dim + d] * 127.0f);
+      }
+      out_enc[2 * hh] = 2.0f * vmax / 65535.0f;
+      out_enc[2 * hh + 1] = 32768.0f;
     }
-    std::vector<float> got(q_elems, 0.0f);
+    std::vector<uint16_t> out_u16(q_elems, 0);
     std::vector<uint32_t> stats(kQ2StatCount, 0);
     err = nntr_hvx_attn_q2_prefill(
       handle_, h, s.n_q, s.cache_from, s.cache_to, s.n_head_q, s.window,
-      q.data(), static_cast<int>(q.size()), q_scale.data(),
-      static_cast<int>(q_scale.size()), got.data(),
-      static_cast<int>(got.size()), stats.data(), kQ2StatCount);
+      q_u16.data(), static_cast<int>(q_u16.size()), q_enc.data(),
+      static_cast<int>(q_enc.size()), out_enc.data(),
+      static_cast<int>(out_enc.size()), out_u16.data(),
+      static_cast<int>(out_u16.size()), stats.data(), kQ2StatCount);
     EXPECT_EQ(nntr_hvx_kv_release_q(handle_, h), AEE_SUCCESS);
     ASSERT_EQ(err, AEE_SUCCESS) << "attn_q2_prefill failed: " << hex(err);
-    for (size_t i = 0; i < got.size(); ++i) {
-      ASSERT_TRUE(std::isfinite(got[i])) << "non-finite output at " << i;
+    std::vector<float> got(q_elems, 0.0f);
+    for (uint32_t r = 0; r < s.n_q; ++r) {
+      for (uint32_t hh = 0; hh < s.n_head_q; ++hh) {
+        const float scale = out_enc[2 * hh], zp = out_enc[2 * hh + 1];
+        for (uint32_t d = 0; d < s.head_dim; ++d) {
+          const size_t at =
+            (static_cast<size_t>(r) * s.n_head_q + hh) * s.head_dim + d;
+          got[at] = (static_cast<float>(out_u16[at]) - zp) * scale;
+        }
+      }
     }
     const double snr = snr_db(want, got);
     std::cout << "ATTN_Q2_FIELD shape=" << s.n_q << "x" << s.cache_to << "x"
@@ -465,9 +505,9 @@ protected:
   }
 };
 
-/** @brief a8 P on a fixed 1/256 grid gives ~33 dB on synthetic data (the
- *         host softmax test); the int8 K/V/Q terms sit above that. */
-constexpr double kSnrQ2 = 28.0;
+/** @brief With Q and P at 16 bits the int8 K/V terms set the floor: the
+ *         suite measures 43-46 dB on this data (the a8 path gave 34-43). */
+constexpr double kSnrQ2 = 38.0;
 
 TEST_F(HvxAttnQ2, SmallCausal) {
   RunShape({128, 0, 128, 4, 2, 128, 0, 0, 0}, kSnrQ2);
@@ -885,6 +925,92 @@ struct SoftmaxCase {
   const char *name;
   uint32_t ct, col0, n_cols, row0, n_rows, window;
 };
+
+/**
+ * @brief hvx_softmax_q16 against its scalar definition: both byte tiles
+ *        and the P' row sums bit-exact, over the same four geometries,
+ *        at F = 9 and a zero point as large as the checkpoint's.
+ */
+TEST_F(HvxAttnQ, SoftmaxQ16MatchesReferenceBitExact) {
+  const SoftmaxCase cases[] = {
+    {"causal", 35, 0, 1120, 1000, 64, 0},
+    {"window", 36, 992, 1152, 2048, 64, 1024},
+    {"padding", 3, 0, 70, 30, 40, 0},
+    {"dense4096", 128, 0, 4096, 4032, 64, 0},
+  };
+  const uint32_t F = 9;
+  int k = 0;
+  uint16_t rho = 0;
+  ASSERT_EQ(hvx_softmax_q_scale_k(2.3e-7f, F, -6, 7, &k, &rho), 0);
+  uint32_t seed = 0x51f7u;
+  for (const SoftmaxCase &c : cases) {
+    SCOPED_TRACE(c.name);
+    const size_t n = static_cast<size_t>(c.ct) * HVX_SOFTMAX_Q_TILE;
+    std::vector<int16_t> s(n), corr(static_cast<size_t>(c.ct + 1) * 32, 0);
+    for (auto &x : s) {
+      seed = seed * 1664525u + 1013904223u;
+      // Mostly moderate scores, a few far above, so every shift occurs.
+      const int32_t v = static_cast<int32_t>(seed >> 16) - 32768;
+      x = static_cast<int16_t>((seed & 0x3f) == 0 ? v / 2 + 8000 : v / 8);
+    }
+    for (uint32_t i = 0; i < c.ct * 32; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      corr[i] = static_cast<int16_t>(static_cast<int32_t>(seed >> 20) - 2048);
+    }
+    hvx_softmax_q_block b{};
+    b.n_col_tiles = c.ct;
+    b.col0 = c.col0;
+    b.n_cols = c.n_cols;
+    b.row0 = c.row0;
+    b.n_rows = c.n_rows;
+    b.window = c.window;
+    b.rho_q15 = rho;
+    b.frac_bits = static_cast<uint8_t>(F);
+    std::vector<uint8_t> lo_ref(n, 0xAA), hi_ref(n, 0xAA), lo_dsp(n, 0x55),
+      hi_dsp(n, 0x55);
+    std::vector<int32_t> rs_ref(HVX_SOFTMAX_Q_ROWSUM_WORDS, -1),
+      rs_dsp(HVX_SOFTMAX_Q_ROWSUM_WORDS, -2);
+    hvx_softmax_q16_ref(&b, s.data(), corr.data(), lo_ref.data(), hi_ref.data(),
+                        rs_ref.data());
+    std::vector<uint32_t> st(5, 0);
+    const int err = nntr_hvx_probe_softmax_q16(
+      handle_, c.ct, c.col0, c.n_cols, c.row0, c.n_rows, c.window, rho, F,
+      s.data(), static_cast<int>(s.size()), corr.data(),
+      static_cast<int>(corr.size()), lo_dsp.data(), static_cast<int>(n),
+      hi_dsp.data(), static_cast<int>(n), rs_dsp.data(),
+      static_cast<int>(rs_dsp.size()), st.data(), 5);
+    ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
+    size_t bad = 0, shown = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const int ref = lo_ref[i] | (hi_ref[i] << 8);
+      const int dsp = lo_dsp[i] | (hi_dsp[i] << 8);
+      if (ref != dsp) {
+        ++bad;
+        if (shown++ < 4) {
+          std::cout << "  softmax16 mismatch tile " << i / HVX_SOFTMAX_Q_TILE
+                    << " row " << (i % HVX_SOFTMAX_Q_TILE) / 32 << " col "
+                    << i % 32 << " ref " << ref << " dsp " << dsp
+                    << " s=" << s[i] << "\n";
+        }
+      }
+    }
+    size_t bad_rs = 0;
+    for (uint32_t r = 0; r < 64; ++r) {
+      const uint32_t at = hvx_softmax_q_rowsum_index(r);
+      if (rs_ref[at] != rs_dsp[at]) {
+        ++bad_rs;
+        if (bad_rs <= 4) {
+          std::cout << "  rowsum16 mismatch row " << r << " ref " << rs_ref[at]
+                    << " dsp " << rs_dsp[at] << "\n";
+        }
+      }
+    }
+    EXPECT_EQ(bad, 0u) << "P16 entries differ";
+    EXPECT_EQ(bad_rs, 0u) << "row sums differ";
+    std::cout << "SOFTMAX_Q16_FIELD case=" << c.name << " tiles=" << c.ct
+              << " cycles=" << st[0] << " per_tile=" << st[0] / c.ct << "\n";
+  }
+}
 
 TEST_F(HvxAttnQ, SoftmaxQMatchesReferenceBitExact) {
   const SoftmaxCase cases[] = {
