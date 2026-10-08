@@ -75,6 +75,7 @@ enum {
   OFF_SM_CORR = OFF_SM_P + 128u * 2048u, /**< 129 x 64 B */
   OFF_SM_RS = OFF_SM_CORR + 0x4000,      /**< 2 KiB */
   OFF_SM_SCR = OFF_SM_RS + 0x1000,       /**< HVX_SOFTMAX_Q_SCRATCH_BYTES */
+  OFF_SM_PH = OFF_SM_SCR + 0x8000,       /**< 128 x 2 KiB, the high bytes */
 };
 
 int nntr_hvx_kv_register_q(remote_handle64 handle, uint32 kind, uint32 max_rows,
@@ -360,9 +361,11 @@ int nntr_hvx_probe_cvt(remote_handle64 handle, uint32 kv_handle, uint32 n,
 
 int nntr_hvx_attn_q2_prefill(remote_handle64 handle, uint32 kv_handle,
                              uint32 n_q, uint32 cache_from, uint32 cache_to,
-                             uint32 n_head_q, uint32 window, const float *q_f32,
-                             int q_f32Len, const float *q_scale, int q_scaleLen,
-                             float *out_f32, int out_f32Len, uint32 *stats_us,
+                             uint32 n_head_q, uint32 window,
+                             const uint16 *q_u16, int q_u16Len,
+                             const float *q_enc, int q_encLen,
+                             const float *out_enc, int out_encLen,
+                             uint16 *out_u16, int out_u16Len, uint32 *stats_us,
                              int stats_usLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
@@ -373,19 +376,21 @@ int nntr_hvx_attn_q2_prefill(remote_handle64 handle, uint32 kv_handle,
     return AEE_EBADPARM;
   }
   const uint64_t need = (uint64_t)n_q * n_head_q * kv->head_dim;
-  if ((uint64_t)q_f32Len != need || (uint64_t)out_f32Len != need ||
-      stats_usLen < 9 || (q_scaleLen != 0 && (uint32)q_scaleLen != n_head_q)) {
+  if ((uint64_t)q_u16Len != need || (uint64_t)out_u16Len != need ||
+      stats_usLen < 9 || (uint32)q_encLen != 2u * n_head_q ||
+      (uint32)out_encLen != 2u * n_head_q) {
     FARF(ERROR, "attn_q2_prefill: bad lengths");
     return AEE_EBADPARM;
   }
   hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
                                 kv->n_head_kv, kv->head_dim, window,   0.0f};
   hexkl_attn_q2_io io;
-  io.q = q_f32;
+  io.q = q_u16;
   io.q_stride = n_head_q * kv->head_dim;
-  io.q_scale = q_scaleLen ? q_scale : NULL;
-  io.out = out_f32;
+  io.q_enc = q_enc;
+  io.out = out_u16;
   io.out_stride = n_head_q * kv->head_dim;
+  io.out_enc = out_enc;
   io.kv = kv;
   hexkl_attn_q2_stats st;
   const int rc = hexkl_attn_q2_prefill(s->vtcm_base, s->config_off, &shape, &io,
@@ -430,17 +435,19 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
                           const uint16 *k_rows, int k_rowsLen,
                           const uint16 *v_rows, int v_rowsLen, uint32 n_q,
                           uint32 cache_from, uint32 cache_to, uint32 n_head_q,
-                          uint32 window, const float *q_f32, int q_f32Len,
-                          const float *q_scale, int q_scaleLen, float *out_f32,
-                          int out_f32Len, uint32 *stats_us, int stats_usLen) {
+                          uint32 window, const uint16 *q_u16, int q_u16Len,
+                          const float *q_enc, int q_encLen,
+                          const float *out_enc, int out_encLen, uint16 *out_u16,
+                          int out_u16Len, uint32 *stats_us, int stats_usLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
   }
   const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
   if (!kv || cache_to > kv->max_rows || stats_usLen < 8 ||
-      (uint32)q_scaleLen != n_head_q) {
-    FARF(ERROR, "attn_q2_step: bad handle, cache_to, scales or stats");
+      (uint32)q_encLen != 2u * n_head_q ||
+      (uint32)out_encLen != 2u * n_head_q) {
+    FARF(ERROR, "attn_q2_step: bad handle, cache_to, encodings or stats");
     return AEE_EBADPARM;
   }
   hexkl_kv_q_append_stats ast;
@@ -466,16 +473,17 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
   hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
                                 kv->n_head_kv, kv->head_dim, window,   0.0f};
   const uint64_t q_elems = (uint64_t)n_q * n_head_q * kv->head_dim;
-  if ((uint64_t)q_f32Len != q_elems || (uint64_t)out_f32Len != q_elems) {
+  if ((uint64_t)q_u16Len != q_elems || (uint64_t)out_u16Len != q_elems) {
     FARF(ERROR, "attn_q2_step: bad lengths");
     return AEE_EBADPARM;
   }
   hexkl_attn_q2_io io;
-  io.q = q_f32;
+  io.q = q_u16;
   io.q_stride = n_head_q * kv->head_dim;
-  io.q_scale = q_scale;
-  io.out = out_f32;
+  io.q_enc = q_enc;
+  io.out = out_u16;
   io.out_stride = n_head_q * kv->head_dim;
+  io.out_enc = out_enc;
   io.kv = kv;
   hexkl_attn_q2_stats st;
   const int res = hexkl_attn_q2_prefill(s->vtcm_base, s->config_off, &shape,
@@ -552,6 +560,54 @@ int nntr_hvx_probe_softmax_q(remote_handle64 handle, uint32 n_col_tiles,
                 (int32_t *)(vb + OFF_SM_RS), vb + OFF_SM_SCR);
   const uint64_t c1 = HAP_perf_get_pcycles();
   memcpy(p_tiles, vb + OFF_SM_P, (size_t)p_tilesLen);
+  memcpy(rowsum, vb + OFF_SM_RS, (size_t)rowsumLen * 4u);
+  stats[0] = (uint32)(c1 - c0);
+  for (int i = 1; i < statsLen && i < 5; ++i) {
+    stats[i] = 0;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_probe_softmax_q16(remote_handle64 handle, uint32 n_col_tiles,
+                               uint32 col0, uint32 n_cols, uint32 row0,
+                               uint32 n_rows, uint32 window, uint32 rho_q15,
+                               uint32 frac_bits, const int16 *s_tiles,
+                               int s_tilesLen, const int16 *corr, int corrLen,
+                               uint8 *p_lo, int p_loLen, uint8 *p_hi,
+                               int p_hiLen, int32 *rowsum, int rowsumLen,
+                               uint32 *stats, int statsLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || n_col_tiles == 0 || n_col_tiles > 128u || frac_bits == 0 ||
+      frac_bits > 9 || rho_q15 > 32767u) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)s_tilesLen != n_col_tiles * HVX_SOFTMAX_Q_TILE ||
+      (uint32_t)corrLen != (n_col_tiles + 1u) * 32u ||
+      (uint32_t)p_loLen != n_col_tiles * HVX_SOFTMAX_Q_TILE ||
+      (uint32_t)p_hiLen != n_col_tiles * HVX_SOFTMAX_Q_TILE ||
+      (uint32_t)rowsumLen != HVX_SOFTMAX_Q_ROWSUM_WORDS || statsLen < 1) {
+    FARF(ERROR, "probe_softmax_q16: bad lengths");
+    return AEE_EBADPARM;
+  }
+  uint8_t *vb = s->vtcm_base;
+  memcpy(vb + OFF_SM_S, s_tiles, (size_t)s_tilesLen * 2u);
+  memcpy(vb + OFF_SM_CORR, corr, (size_t)corrLen * 2u);
+  hvx_softmax_q_block b;
+  b.n_col_tiles = n_col_tiles;
+  b.col0 = col0;
+  b.n_cols = n_cols;
+  b.row0 = row0;
+  b.n_rows = n_rows;
+  b.window = window;
+  b.rho_q15 = (uint16_t)rho_q15;
+  b.frac_bits = (uint8_t)frac_bits;
+  const uint64_t c0 = HAP_perf_get_pcycles();
+  hvx_softmax_q16(&b, (const int16_t *)(vb + OFF_SM_S),
+                  (const int16_t *)(vb + OFF_SM_CORR), vb + OFF_SM_P,
+                  vb + OFF_SM_PH, (int32_t *)(vb + OFF_SM_RS), vb + OFF_SM_SCR);
+  const uint64_t c1 = HAP_perf_get_pcycles();
+  memcpy(p_lo, vb + OFF_SM_P, (size_t)p_loLen);
+  memcpy(p_hi, vb + OFF_SM_PH, (size_t)p_hiLen);
   memcpy(rowsum, vb + OFF_SM_RS, (size_t)rowsumLen * 4u);
   stats[0] = (uint32)(c1 - c0);
   for (int i = 1; i < statsLen && i < 5; ++i) {

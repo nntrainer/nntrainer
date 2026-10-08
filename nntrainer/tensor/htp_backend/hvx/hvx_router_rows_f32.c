@@ -41,8 +41,11 @@ typedef struct {
  * rows. The runtime-indexed acc[RB][EV_MAX] this replaces spilled to the
  * stack, which made every (k, row, e) step a load, a multiply-add and a
  * store (doc 57 section 9.10): 9.7 ms a call at 446 rows against the CPU
- * dot's 6. The operation order per (row, e) is unchanged: the k terms in
- * order, qf32, rounded to f32 at each KB chunk boundary. */
+ * dot's 6. The k terms go in order, each product and sum an IEEE sf op.
+ * They were qf32 with a sf round trip at each KB chunk boundary: the host
+ * lane emulation passed that, but on the V79 three rows of every four came
+ * back as 1e37 or NaN, and two variants moved which row survived (doc 57
+ * section 9.21). The sf ops agree with the CPU dot to 2.3e-5 on device. */
 #define ROUTER_ROWS_BLOCK(EV, NR)                                              \
   static void rows_block_##EV##x##NR(const float *x, const float *w,           \
                                      float *logits, uint32_t K, uint32_t E,    \
@@ -52,7 +55,7 @@ typedef struct {
     for (uint32_t r = 0; r < (NR); ++r) {                                      \
       const HVX_UVector *lr = (const HVX_UVector *)(logits + (size_t)r * E);   \
       for (uint32_t e = 0; e < (EV); ++e)                                      \
-        acc[r][e] = k0 ? Q6_Vqf32_vadd_VsfVsf(lr[e], zero) : zero;             \
+        acc[r][e] = k0 ? lr[e] : zero;                                         \
     }                                                                          \
     for (uint32_t k = k0; k < k1; ++k) {                                       \
       const HVX_UVector *wk = (const HVX_UVector *)(w + (size_t)k * E);        \
@@ -62,14 +65,14 @@ typedef struct {
       for (uint32_t r = 0; r < (NR); ++r) {                                    \
         const HVX_Vector xs = hvx_splat_sf(x[(size_t)r * K + k]);              \
         for (uint32_t e = 0; e < (EV); ++e)                                    \
-          acc[r][e] = Q6_Vqf32_vadd_Vqf32Vqf32(                                \
-            acc[r][e], Q6_Vqf32_vmpy_VsfVsf(xs, wv[e]));                       \
+          acc[r][e] =                                                          \
+            Q6_Vsf_vadd_VsfVsf(acc[r][e], Q6_Vsf_vmpy_VsfVsf(xs, wv[e]));      \
       }                                                                        \
     }                                                                          \
     for (uint32_t r = 0; r < (NR); ++r) {                                      \
       HVX_UVector *lr = (HVX_UVector *)(logits + (size_t)r * E);               \
       for (uint32_t e = 0; e < (EV); ++e)                                      \
-        lr[e] = Q6_Vsf_equals_Vqf32(acc[r][e]);                                \
+        lr[e] = acc[r][e];                                                     \
     }                                                                          \
   }
 #define ROUTER_ROWS_EV(EV)                                                     \

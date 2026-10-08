@@ -206,12 +206,117 @@ Snr run(const Case &c, std::mt19937 &rng, bool check_masks) {
   return out;
 }
 
+/** @brief What the 16-bit test measures for one block. */
+struct Snr16 {
+  double p;       /**< P16 / 65535 vs the exact softmax */
+  double p_ideal; /**< round(exact * 65535) / 65535 vs exact: the u16 grid */
+  double o;       /**< (P16 / 65535).V vs exact softmax(L).V */
+};
+
+/** @brief hvx_softmax_q16_ref on the same construction: P16 against the
+ *         exact softmax, plus the contract checks (masked entries 0, rows
+ *         summing to ~65535, rowsum = sum of P'). */
+Snr16 run16(const Case &c, std::mt19937 &rng, bool check_masks) {
+  Built b = build(c, rng);
+  hvx_softmax_q_block blk{};
+  blk.n_col_tiles = c.ct;
+  blk.col0 = c.col0;
+  blk.n_cols = c.n_cols;
+  blk.row0 = c.row0;
+  blk.n_rows = c.n_rows;
+  blk.window = c.window;
+  blk.rho_q15 = b.rho_q15;
+  blk.frac_bits = static_cast<uint8_t>(c.F);
+  std::vector<uint8_t> lo(b.s.size(), 0xAA), hi(b.s.size(), 0x55);
+  std::vector<int32_t> rowsum_v(HVX_SOFTMAX_Q_ROWSUM_WORDS, -1);
+  hvx_softmax_q16_ref(&blk, b.s.data(), b.corr.data(), lo.data(), hi.data(),
+                      rowsum_v.data());
+
+  constexpr uint32_t kDims = 16;
+  std::vector<float> V(static_cast<size_t>(c.ct) * 32 * kDims);
+  std::normal_distribution<float> vdist(0.0f, 1.0f);
+  for (auto &x : V) {
+    x = vdist(rng);
+  }
+  double sig = 0.0, err = 0.0, err_ideal = 0.0, o_sig = 0.0, o_err = 0.0;
+  for (uint32_t r = 0; r < kRows; ++r) {
+    double mx = -1e30;
+    uint32_t n_live = 0;
+    for (uint32_t t = 0; t < c.ct; ++t) {
+      for (uint32_t j = 0; j < 32; ++j) {
+        if (!masked(c, r, c.col0 + 32 * t + j)) {
+          mx = std::max(mx, static_cast<double>(b.L[t * kTile + r * 32 + j]));
+          ++n_live;
+        }
+      }
+    }
+    double sum = 0.0;
+    for (uint32_t t = 0; t < c.ct; ++t) {
+      for (uint32_t j = 0; j < 32; ++j) {
+        if (!masked(c, r, c.col0 + 32 * t + j)) {
+          sum += std::exp2(b.L[t * kTile + r * 32 + j] - mx);
+        }
+      }
+    }
+    const int32_t rowsum = rowsum_v[hvx_softmax_q_rowsum_index(r)];
+    if (r >= c.n_rows) {
+      EXPECT_EQ(rowsum, 0) << "padding row " << r;
+    } else {
+      EXPECT_GE(rowsum, 65535) << "row " << r << " holds its max at 65535";
+    }
+    uint64_t sum_p16 = 0;
+    std::vector<double> o_want(kDims, 0.0), o_got(kDims, 0.0);
+    for (uint32_t t = 0; t < c.ct; ++t) {
+      for (uint32_t j = 0; j < 32; ++j) {
+        const size_t at = t * kTile + r * 32 + j;
+        const bool m = masked(c, r, c.col0 + 32 * t + j);
+        const uint32_t p16 = lo[at] | (static_cast<uint32_t>(hi[at]) << 8);
+        if (check_masks && m) {
+          EXPECT_EQ(p16, 0u)
+            << "masked entry row " << r << " col " << c.col0 + 32 * t + j;
+        }
+        sum_p16 += p16;
+        if (m || sum <= 0.0) {
+          continue;
+        }
+        const double want = std::exp2(b.L[at] - mx) / sum;
+        const double got = p16 / 65535.0;
+        const double ideal = std::round(want * 65535.0) / 65535.0;
+        sig += want * want;
+        err += (want - got) * (want - got);
+        err_ideal += (want - ideal) * (want - ideal);
+        for (uint32_t d = 0; d < kDims; ++d) {
+          const double v = V[(t * 32 + j) * kDims + d];
+          o_want[d] += want * v;
+          o_got[d] += got * v;
+        }
+      }
+    }
+    if (r < c.n_rows) {
+      // Each P16 is rounded, so the row sums to 65535 within n_live / 2.
+      EXPECT_NEAR(static_cast<double>(sum_p16), 65535.0, n_live / 2.0 + 1.0)
+        << "row " << r;
+      for (uint32_t d = 0; d < kDims; ++d) {
+        o_sig += o_want[d] * o_want[d];
+        o_err += (o_want[d] - o_got[d]) * (o_want[d] - o_got[d]);
+      }
+    } else {
+      EXPECT_EQ(sum_p16, 0u) << "padding row " << r;
+    }
+  }
+  Snr16 out;
+  out.p = 10.0 * std::log10(sig / std::max(err, 1e-300));
+  out.p_ideal = 10.0 * std::log10(sig / std::max(err_ideal, 1e-300));
+  out.o = 10.0 * std::log10(o_sig / std::max(o_err, 1e-300));
+  return out;
+}
+
 } // namespace
 
 TEST(HvxSoftmaxQ, CubicIsExp2Within2e4) {
   // The Q15 cubic against 2^x * 16384: at most 3 Q14 units off (1.5e-4),
   // which is 0.04 of a P' step at the top of the grid.
-  for (uint32_t F = 7; F <= 8; ++F) {
+  for (uint32_t F = 7; F <= 9; ++F) {
     int max_err = 0;
     for (uint32_t f = 0; f < (1u << F); ++f) {
       const double want = std::exp2(f / static_cast<double>(1u << F)) * 16384.0;
@@ -229,7 +334,7 @@ TEST(HvxSoftmaxQ, ScalePutsRhoInHalfToOne) {
   const float alphas[] = {1e-4f,   3.3e-4f,          1e-3f,
                           2.5e-3f, 1.0f / 131072.0f, 0.05f};
   for (float a : alphas) {
-    for (uint32_t F = 7; F <= 8; ++F) {
+    for (uint32_t F = 7; F <= 9; ++F) {
       int k = 0;
       uint16_t rho = 0;
       ASSERT_EQ(hvx_softmax_q_scale(a, F, &k, &rho), 0) << a;
@@ -239,6 +344,92 @@ TEST(HvxSoftmaxQ, ScalePutsRhoInHalfToOne) {
       EXPECT_NEAR(rho / 32768.0, r, 1.0 / 32768.0 + 1e-9) << a;
     }
   }
+}
+
+TEST(HvxSoftmaxQ, ScaleKRejectsOutOfRange) {
+  // alpha = 2^-30 at F = 9: k is -12, fine for the a8 kernel's single
+  // convert pair, outside the a16 kernel's [-6, 7].
+  int k = 0;
+  uint16_t rho = 0;
+  ASSERT_EQ(hvx_softmax_q_scale(std::ldexp(1.0f, -30), 9, &k, &rho), 0);
+  EXPECT_EQ(k, -12);
+  EXPECT_EQ(rho, 32767);
+  EXPECT_EQ(hvx_softmax_q_scale_k(std::ldexp(1.0f, -30), 9, -6, 7, &k, &rho),
+            -1);
+  // The checkpoint's smallest alpha (layer 3 head 12: 9.47e-8) gives -5.
+  ASSERT_EQ(hvx_softmax_q_scale_k(9.47e-8f, 9, -6, 7, &k, &rho), 0);
+  EXPECT_EQ(k, -5);
+  EXPECT_EQ(hvx_softmax_q_scale_k(1.0f, 9, -6, 7, &k, &rho), -1);
+}
+
+/** @brief The u16 contract: the 16-bit P must sit on its own grid's bound
+ *         and well above the a8 path (plan 24). */
+TEST(HvxSoftmaxQ16, CausalBlockMatchesExactSoftmax) {
+  std::mt19937 rng(0x6a17);
+  Case c{35, 0, 1120, 1000, 64, 0, 1.0f / 1316.0f, 9, 30000};
+  const Snr16 r = run16(c, rng, true);
+  std::cout << "SOFTMAX_Q16_FIELD case=causal F=9 p_db=" << r.p
+            << " p_ideal_u16_db=" << r.p_ideal << " o_db=" << r.o << "\n";
+  // The score step at F = 9 (0.14% of P) is what bounds this, not the
+  // u16 grid; the a8 path sat at ~33 dB.
+  EXPECT_GT(r.p, 50.0);
+  EXPECT_GT(r.o, 50.0);
+}
+
+TEST(HvxSoftmaxQ16, WindowedBlockMasksBothEdges) {
+  std::mt19937 rng(0x6a18);
+  Case c{36, 992, 1152, 2048, 64, 1024, 1.0f / 2000.0f, 9, 30000};
+  const Snr16 r = run16(c, rng, true);
+  std::cout << "SOFTMAX_Q16_FIELD case=window F=9 p_db=" << r.p
+            << " p_ideal_u16_db=" << r.p_ideal << " o_db=" << r.o << "\n";
+  EXPECT_GT(r.p, 50.0);
+  EXPECT_GT(r.o, 50.0);
+}
+
+TEST(HvxSoftmaxQ16, PaddingRowsAndShortColumns) {
+  std::mt19937 rng(0x6a19);
+  Case c{3, 0, 70, 30, 40, 0, 1.0f / 1000.0f, 9, 0};
+  const Snr16 r = run16(c, rng, true);
+  std::cout << "SOFTMAX_Q16_FIELD case=padding F=9 p_db=" << r.p
+            << " p_ideal_u16_db=" << r.p_ideal << " o_db=" << r.o << "\n";
+  EXPECT_GT(r.p, 50.0);
+  EXPECT_GT(r.o, 50.0);
+}
+
+TEST(HvxSoftmaxQ16, FlatRowAndSingleColumn) {
+  // All logits equal over 1024 columns: P16 = round(65535 / 1024) = 64 for
+  // every column. One live column: P' = rowsum = 65535, R clamps to 65535
+  // and P16 = 65534 (one step under 1.0, the documented degenerate case).
+  hvx_softmax_q_block blk{};
+  blk.n_col_tiles = 32;
+  blk.col0 = 0;
+  blk.n_cols = 1024;
+  blk.row0 = 1023;
+  blk.n_rows = 2;
+  blk.window = 0;
+  blk.rho_q15 = 32767;
+  blk.frac_bits = 9;
+  std::vector<int16_t> s(32 * kTile, 1234);
+  std::vector<uint8_t> lo(s.size()), hi(s.size());
+  std::vector<int32_t> rowsum(HVX_SOFTMAX_Q_ROWSUM_WORDS);
+  hvx_softmax_q16_ref(&blk, s.data(), nullptr, lo.data(), hi.data(),
+                      rowsum.data());
+  EXPECT_EQ(rowsum[hvx_softmax_q_rowsum_index(0)], 65535 * 1024);
+  for (uint32_t t = 0; t < 32; ++t) {
+    EXPECT_EQ(lo[t * kTile] | (hi[t * kTile] << 8), 64) << "tile " << t;
+  }
+  // Row 1 is position 1024: it sees columns 0..1023 too (n_cols = 1024).
+  EXPECT_EQ(lo[32] | (hi[32] << 8), 64);
+  // A block at position 0 with one column.
+  blk.row0 = 0;
+  blk.n_rows = 1;
+  blk.n_col_tiles = 1;
+  blk.n_cols = 1;
+  hvx_softmax_q16_ref(&blk, s.data(), nullptr, lo.data(), hi.data(),
+                      rowsum.data());
+  EXPECT_EQ(rowsum[hvx_softmax_q_rowsum_index(0)], 65535);
+  EXPECT_EQ(lo[0] | (hi[0] << 8), 65534);
+  EXPECT_EQ(lo[1] | (hi[1] << 8), 0);
 }
 
 TEST(HvxSoftmaxQ, CausalBlockMatchesExactSoftmax) {

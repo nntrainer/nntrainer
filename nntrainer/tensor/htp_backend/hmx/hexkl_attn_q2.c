@@ -4,34 +4,49 @@
  *
  * @file   hexkl_attn_q2.c
  * @date   07 Oct 2026
- * @brief  Row-blocked A8W8 attention on HMX over a fixed-scale KV cache
+ * @brief  Row-blocked a16 / kv8 attention on HMX over a fixed-scale KV cache
  * @see    https://github.com/nntrainer/nntrainer
  * @author Haehun Yang <haehun.yang@ax.samsung.com>
  * @bug    No known bugs except for NYI items
  *
  * Pipeline. The work items are (query head, 64-row block) in order. The
  * calling thread owns HMX and the DMA queue and runs the two matmul
- * stages plus the Q quantization (a VTCM pass over rows the DMA staged);
- * the pool workers run the softmax and the epilogue. Iteration i:
+ * stages and the Q byte split (a VTCM pass over rows the DMA staged); the
+ * pool workers run the softmax (one block shared by all of them, split by
+ * column range) and the epilogue. Iteration i, with softmax(i) and QK(i+1)
+ * already done:
  *
- *   submit W(i) = { softmax(i), epilogue(i-1) rows 0-31, rows 32-63 }
- *   drain DMA; quantize Q(i+2) from its staging; push DMA for Q(i+3)
+ *   submit W(i) = { softmax(i+1), epilogue(i-1) rows 0-31, rows 32-63 }
+ *   drain DMA; PV(i); split Q(i+2) from its staging; push DMA for Q(i+3)
  *   and for the next KV head's K/V, a slice at a time
- *   QK(i+1)                                                   on HMX
+ *   QK(i+2)                                                   on HMX
  *   wait W(i)
- *   PV(i)                                                     on HMX
  *
- * Everything pushed to the DMA queue is consumed one iteration later, so
- * the drain never waits. Nothing is shared between a reader and a writer
- * in flight: Q tiles have three slots, Q staging two, scores, P', output
- * and row sums two, the per-head constants two by head parity. The next
- * KV head's K/V arrive under the current head when the plan found room
- * for a second buffer; otherwise the pipeline drains at the boundary.
+ * so a block's softmax overlaps the previous block's PV and the next
+ * block's QK, and the per-block time is the longer of the two sides, not
+ * their sum. Everything pushed to the DMA queue is consumed one iteration
+ * later, so the drain never waits. Nothing is shared between a reader and
+ * a writer in flight: Q tiles have three slots, Q staging two, scores, P
+ * and output two, the per-head constants two by head parity. The next KV
+ * head's K/V arrive under the current head when the plan found room for a
+ * second buffer; otherwise QK of the new head waits for the last PV of the
+ * old one (try_qk) and the pipeline drains at the boundary.
+ *
+ * 16-bit activations on a u8 x i8 array. A = 256 A_hi + A_lo, so
+ * A . W = 256 (A_hi . W) + (A_lo . W): two accumulations, each read out as
+ * int16 through two convert passes (exact at power-of-two scales, D9) and
+ * added modulo 2^16. The combined value is made to fit int16 by the choice
+ * of scale: for QK through 2^k from hvx_softmax_q_scale_k (k in [-6, 7] so
+ * 2^(k-8) is still an fp16 normal), for PV by the normalized P, whose row
+ * sum is at most 65535 + n/2, so |acc| <= 127 * 67584 and floor(acc / 512)
+ * stays below 2^15 with a factor of two to spare (2^kv = 2^0; 2^1 would
+ * give the output one more bit but overflow on a pathological row).
  */
 
 #include "hexkl_attn_q2.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,7 +65,12 @@
 #include "hvx_tile_f16.h"
 
 #define LOG2E 1.4426950408889634f
-#define FRAC_BITS 8u
+#define FRAC_BITS 9u
+/** QK convert exponent range: 2^(k-8) and 2^(k+8) must be fp16 normals. */
+#define QK_K_MIN (-6)
+#define QK_K_MAX 7
+/** PV convert exponent (see the file comment). */
+#define PV_KV 0
 
 static inline uint64_t now_us(void) { return HAP_perf_get_time_us(); }
 
@@ -61,17 +81,16 @@ typedef struct {
   uint32_t n_rows; /**< valid rows, <= 64 */
   uint32_t row0;   /**< absolute position of row 0 */
   hexkl_attn_q2_range blk;
-  uint32_t slot;  /**< i % 2: scores, P', output, row sums */
-  uint32_t qslot; /**< i % 3: Q tiles */
-  int kv_exp;     /**< PV convert exponent, set after the softmax */
+  uint32_t slot;                         /**< i % 2: scores, P, output */
+  uint32_t qslot;                        /**< i % 3: Q tiles */
   uint32_t us_qprep, us_softmax, us_epi; /**< worker times */
 } item_t;
 
-/** @brief Per query head. */
+/** @brief Per query head, by the HMX thread in setup_head. */
 typedef struct {
-  float s_q; /**< Q scale, by the worker preparing the head's first block */
-  int ready;
-  int k; /**< QK convert exponent, by the HMX thread */
+  int k;      /**< QK convert exponent, in [QK_K_MIN, QK_K_MAX] */
+  uint32_t F; /**< fraction bits of the log2 score, FRAC_BITS unless k had
+                   to be moved into range (one bit per step) */
   uint16_t rho;
 } head_t;
 
@@ -85,17 +104,35 @@ typedef struct {
   item_t *items;
   uint32_t n_items;
   head_t *heads;
-  int32_t *rs_heap[HEXKL_ATTN_Q2_SLOTS]; /**< row sums, cached copies */
-  uint32_t kv_next;   /**< kv head whose K/V slices are being pushed */
-  uint32_t kv_next_c; /**< resident tiles of it pushed so far */
-  uint32_t kv_slice;  /**< tiles per slice */
+  uint32_t kv_next;     /**< kv head whose K/V slices are being pushed */
+  uint32_t kv_next_c;   /**< resident tiles of it pushed so far */
+  uint32_t kv_slice;    /**< tiles per slice */
+  uint32_t kv_resident; /**< highest kv head whose K/V are all in VTCM */
+  uint32_t kv_in_use;   /**< lowest kv head a pending PV still reads */
   hexkl_attn_q2_stats st;
 } ctx;
 
+/** @brief One pool job: W(i), with the two barriers of the shared softmax
+ *         (reset by the HMX thread before each submit). */
+#define NO_ITEM 0xFFFFFFFFu
 typedef struct {
   ctx *c;
-  uint32_t i;
+  uint32_t smx_item; /**< softmax of this item, or NO_ITEM */
+  uint32_t epi_item; /**< epilogue of this item, or NO_ITEM */
+  atomic_uint bar[2];
 } job_t;
+
+/** @brief Waits until all @a n participants of job @a j reached barrier
+ *         @a k; the same SMT pause hint as the worker pool's spin. */
+static inline void job_barrier(job_t *j, uint32_t k, uint32_t n) {
+  if (n <= 1u) {
+    return;
+  }
+  atomic_fetch_add_explicit(&j->bar[k], 1u, memory_order_acq_rel);
+  while (atomic_load_explicit(&j->bar[k], memory_order_acquire) < n) {
+    asm volatile(" pause(#255)\n");
+  }
+}
 
 /* ---- small helpers ----------------------------------------------------- */
 
@@ -111,36 +148,48 @@ static void set_cvt_block(uint8_t *vtcm_block, uint16_t scale_hf) {
   }
 }
 
-/** @brief floor(log2(x)) for x >= 1. */
-static inline int ilog2_u32(uint32_t x) { return 31 - __builtin_clz(x); }
-
-static inline uint8_t *q_tiles(ctx *c, uint32_t qslot) {
-  return c->vb + c->L.q_ah + qslot * c->dt * HEXKL_ATTN_Q2_TILE;
+static inline uint16_t pow2_hf(int e) {
+  return hexkl_cvt_f32_to_hf(ldexpf(1.0f, e));
 }
-static inline float *q_stage(ctx *c, uint32_t i) {
-  return (float *)(c->vb + c->L.q_f32 +
-                   (i & 1u) * HEXKL_ATTN_Q2_ROWS * c->hd * 4u);
+
+/** @brief Q tiles of a slot: [2][dt], low bytes then high bytes. */
+static inline uint8_t *q_tiles_lo(ctx *c, uint32_t qslot) {
+  return c->vb + c->L.q_ah + qslot * 2u * c->dt * HEXKL_ATTN_Q2_TILE;
+}
+static inline uint8_t *q_tiles_hi(ctx *c, uint32_t qslot) {
+  return q_tiles_lo(c, qslot) + c->dt * HEXKL_ATTN_Q2_TILE;
+}
+static inline uint16_t *q_stage(ctx *c, uint32_t i) {
+  return (uint16_t *)(c->vb + c->L.q_u16 +
+                      (i & 1u) * HEXKL_ATTN_Q2_ROWS * c->hd * 2u);
 }
 static inline uint8_t *s16_tiles(ctx *c, uint32_t slot) {
   return c->vb + c->L.s16 + slot * c->L.n_blk * HEXKL_ATTN_Q2_TILE16;
 }
-static inline uint8_t *p_tiles(ctx *c, uint32_t slot) {
-  return c->vb + c->L.p_ah + slot * c->L.n_blk * HEXKL_ATTN_Q2_TILE;
+/** @brief P tiles of a slot: [2][n_blk], low bytes then high bytes. */
+static inline uint8_t *p_tiles_lo(ctx *c, uint32_t slot) {
+  return c->vb + c->L.p_ah + slot * 2u * c->L.n_blk * HEXKL_ATTN_Q2_TILE;
+}
+static inline uint8_t *p_tiles_hi(ctx *c, uint32_t slot) {
+  return p_tiles_lo(c, slot) + c->L.n_blk * HEXKL_ATTN_Q2_TILE;
 }
 static inline uint8_t *o16_tiles(ctx *c, uint32_t slot) {
   return c->vb + c->L.o16 + slot * c->dt * HEXKL_ATTN_Q2_TILE16;
 }
-static inline int32_t *rowsum_v(ctx *c, uint32_t slot) {
-  return (int32_t *)(c->vb + c->L.rowsum + slot * HEXKL_ATTN_Q2_TILE);
-}
 static inline int16_t *corr_v(ctx *c, uint32_t h) {
   return (int16_t *)(c->vb + c->L.corr + (h & 1u) * c->L.corr_bytes);
 }
+/** @brief The head's three QK bias blocks: 2^(k+8), 2^k, 2^(k-8). */
 static inline uint8_t *cvt_qk(ctx *c, uint32_t h) {
-  return c->vb + c->L.cvt + (h & 1u) * 2u * HEXKL_CVT_BLOCK_BYTES;
+  return c->vb + c->L.cvt + (h & 1u) * 3u * HEXKL_CVT_BLOCK_BYTES;
 }
+/** @brief The three PV bias blocks: 2^(kv+8), 2^kv, 2^(kv-8). */
 static inline uint8_t *cvt_pv(ctx *c) {
-  return c->vb + c->L.cvt + 4u * HEXKL_CVT_BLOCK_BYTES;
+  return c->vb + c->L.cvt + 6u * HEXKL_CVT_BLOCK_BYTES;
+}
+static inline uint8_t *planes(ctx *c) { return c->vb + c->L.planes; }
+static inline void *smx(ctx *c, uint32_t part) {
+  return c->vb + c->L.smx + part * HEXKL_ATTN_Q2_SMX_BYTES;
 }
 static inline uint8_t *kt_buf(ctx *c, uint32_t n) {
   return c->vb + c->L.kt_wh + (n % c->L.n_kv_bufs) * c->L.kv_bytes;
@@ -148,84 +197,81 @@ static inline uint8_t *kt_buf(ctx *c, uint32_t n) {
 static inline uint8_t *v_buf(ctx *c, uint32_t n) {
   return c->vb + c->L.v_wh + (n % c->L.n_kv_bufs) * c->L.kv_bytes;
 }
+static inline float q_scale_of(const ctx *c, uint32_t h) {
+  return c->io->q_enc[2u * h];
+}
+static inline uint32_t q_zp_of(const ctx *c, uint32_t h) {
+  const float zp = c->io->q_enc[2u * h + 1u];
+  return zp <= 0.0f ? 0u : zp >= 65535.0f ? 65535u : (uint32_t)(zp + 0.5f);
+}
 
 /* ---- worker stages ------------------------------------------------------- */
-
-/** @brief max |q| over the n_q rows of head h (only when the caller gave
- *         no scale: a pass over DDR). */
-static float q_amax(const ctx *c, uint32_t h) {
-  const HVX_Vector mask = Q6_V_vsplat_R(0x7FFFFFFF);
-  HVX_Vector m = Q6_V_vzero();
-  for (uint32_t r = 0; r < c->s->n_q; ++r) {
-    const float *row = c->io->q + (size_t)r * c->io->q_stride + h * c->hd;
-    for (uint32_t d = 0; d < c->dt; ++d) {
-      m = Q6_Vsf_vmax_VsfVsf(
-        m, Q6_V_vand_VV(hvx_tile_load_u(row + 32u * d), mask));
-    }
-  }
-  return hvx_attn_lane0_f32(hvx_attn_max32_sf(m));
-}
-
-static void head_scale(ctx *c, uint32_t h) {
-  head_t *hd = &c->heads[h];
-  if (hd->ready) {
-    return;
-  }
-  if (c->io->q_scale) {
-    hd->s_q = c->io->q_scale[h] > 0.0f ? c->io->q_scale[h] : 1.0f;
-  } else {
-    const float amax = q_amax(c, h);
-    hd->s_q = amax > 0.0f ? amax / 127.0f : 1.0f;
-  }
-  hd->ready = 1;
-}
 
 /** @brief Pushes the DMA of item i's Q rows into its staging half. */
 static void q_dma_push(ctx *c, uint32_t i) {
   const item_t *it = &c->items[i];
-  const float *src =
+  const uint16_t *src =
     c->io->q + (size_t)it->q0 * c->io->q_stride + it->h * c->hd;
-  hexkl_dma_ring_push2d(q_stage(c, i), src, c->hd * 4u, c->io->q_stride * 4u,
-                        c->hd * 4u, it->n_rows, 0, 1);
+  hexkl_dma_ring_push2d(q_stage(c, i), src, c->hd * 2u, c->io->q_stride * 2u,
+                        c->hd * 2u, it->n_rows, 0, 1);
 }
 
-/** @brief Stage 0: the staged f32 rows of item i -> uint8 tiles, offset
- *         binary at the head's scale; rows past n_rows read as 0 (128). */
+/**
+ * @brief Stage 0: the staged u16 rows of item i -> low-byte and high-byte
+ *        uint8 tiles. A vector of a row holds 64 u16 = two dim tiles;
+ *        vdeal(-1) over a row pair separates the bytes, vdeal(-32) over
+ *        two such pairs regroups four rows of one tile. Rows past n_rows
+ *        read as the zero point (they are masked anyway).
+ */
 static void stage_qprep(ctx *c, uint32_t i) {
   const uint64_t t0 = now_us();
   item_t *it = &c->items[i];
-  head_scale(c, it->h);
-  const HVX_Vector inv = hvx_splat_sf(1.0f / c->heads[it->h].s_q);
-  const HVX_Vector lo = Q6_V_vsplat_R(-127), hi = Q6_V_vsplat_R(127);
-  const HVX_Vector bias = Q6_V_vsplat_R(128);
-  const float *stage = q_stage(c, i);
-  uint8_t *qt = q_tiles(c, it->qslot);
-  for (uint32_t d = 0; d < c->dt; ++d) {
-    HVX_Vector *tile = (HVX_Vector *)(qt + d * HEXKL_ATTN_Q2_TILE);
+  const uint32_t zp = q_zp_of(c, it->h);
+  const HVX_Vector pad = Q6_Vh_vsplat_R((int)zp);
+  const uint16_t *stage = q_stage(c, i);
+  uint8_t *qlo = q_tiles_lo(c, it->qslot);
+  uint8_t *qhi = q_tiles_hi(c, it->qslot);
+  for (uint32_t d = 0; d < c->dt; d += 2u) {
+    const int two = d + 1u < c->dt;
+    HVX_Vector *tl0 = (HVX_Vector *)(qlo + d * HEXKL_ATTN_Q2_TILE);
+    HVX_Vector *th0 = (HVX_Vector *)(qhi + d * HEXKL_ATTN_Q2_TILE);
+    HVX_Vector *tl1 = tl0 + HEXKL_ATTN_Q2_TILE / 128u;
+    HVX_Vector *th1 = th0 + HEXKL_ATTN_Q2_TILE / 128u;
     for (uint32_t r = 0; r < HEXKL_ATTN_Q2_ROWS; r += 4u) {
-      HVX_Vector w[4];
+      HVX_Vector x[4];
       for (uint32_t k = 0; k < 4u; ++k) {
         const uint32_t rr = r + k;
-        if (rr < it->n_rows) {
-          const HVX_Vector x =
-            *(const HVX_Vector *)(stage + (size_t)rr * c->hd + 32u * d);
-          HVX_Vector q = hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(x, inv));
-          q = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(q, lo), hi);
-          w[k] = Q6_Vw_vadd_VwVw(q, bias);
-        } else {
-          w[k] = bias;
-        }
+        x[k] = rr < it->n_rows
+                 ? *(const HVX_UVector *)(stage + (size_t)rr * c->hd + 32u * d)
+                 : pad;
       }
-      const HVX_Vector h01 = Q6_Vh_vpack_VwVw_sat(w[1], w[0]);
-      const HVX_Vector h23 = Q6_Vh_vpack_VwVw_sat(w[3], w[2]);
-      tile[r / 4u] = Q6_Vub_vpack_VhVh_sat(h23, h01);
+      /* Bytes: even (low) to lo_W, odd (high) to hi_W; row k then k+1. */
+      const HVX_VectorPair b01 = Q6_W_vdeal_VVR(x[1], x[0], -1);
+      const HVX_VectorPair b23 = Q6_W_vdeal_VVR(x[3], x[2], -1);
+      /* 32-byte groups (row, tile): even -> tile d, odd -> tile d + 1. */
+      const HVX_VectorPair lo =
+        Q6_W_vdeal_VVR(Q6_V_lo_W(b23), Q6_V_lo_W(b01), -32);
+      const HVX_VectorPair hi =
+        Q6_W_vdeal_VVR(Q6_V_hi_W(b23), Q6_V_hi_W(b01), -32);
+      tl0[r / 4u] = Q6_V_lo_W(lo);
+      th0[r / 4u] = Q6_V_lo_W(hi);
+      if (two) {
+        tl1[r / 4u] = Q6_V_hi_W(lo);
+        th1[r / 4u] = Q6_V_hi_W(hi);
+      }
     }
   }
   it->us_qprep = (uint32_t)(now_us() - t0);
 }
 
-/** @brief Stage 2: the integer softmax over the block's score tiles. */
-static void stage_softmax(ctx *c, item_t *it) {
+/**
+ * @brief Stage 2: the integer softmax over the block's score tiles, shared
+ *        by the @a n participants of job @a j: part @a idx takes the
+ *        column tiles [ct idx / n, ct (idx + 1) / n), the two merges
+ *        happen behind the job's barriers.
+ */
+static void stage_softmax(ctx *c, item_t *it, job_t *j, uint32_t idx,
+                          uint32_t n) {
   const uint64_t t0 = now_us();
   const head_t *hd = &c->heads[it->h];
   hvx_softmax_q_block b;
@@ -236,50 +282,84 @@ static void stage_softmax(ctx *c, item_t *it) {
   b.n_rows = it->n_rows;
   b.window = c->s->window;
   b.rho_q15 = hd->rho;
-  b.frac_bits = FRAC_BITS;
-  hvx_softmax_q(&b, (const int16_t *)s16_tiles(c, it->slot),
-                corr_v(c, it->h) + (size_t)(it->blk.lo - c->res.lo) * 32u,
-                p_tiles(c, it->slot), rowsum_v(c, it->slot), c->vb + c->L.smx);
-  it->us_softmax = (uint32_t)(now_us() - t0);
+  b.frac_bits = (uint8_t)hd->F;
+  const int16_t *s16 = (const int16_t *)s16_tiles(c, it->slot);
+  const int16_t *corr =
+    corr_v(c, it->h) + (size_t)(it->blk.lo - c->res.lo) * 32u;
+  uint8_t *plo = p_tiles_lo(c, it->slot);
+  uint8_t *phi = p_tiles_hi(c, it->slot);
+  /** An even split by tile count; weighting partial tiles and the epilogue
+   * halves was tried and measured no better. */
+  const uint32_t c0 = it->blk.n * idx / n;
+  const uint32_t c1 = it->blk.n * (idx + 1u) / n;
+  void *parts[HEXKL_ATTN_Q2_SMX_PARTS];
+  for (uint32_t p = 0; p < n; ++p) {
+    parts[p] = smx(c, p);
+  }
+  void *mine = smx(c, idx);
+  hvx_softmax_q16_part_max(&b, s16, corr, c0, c1, mine);
+  job_barrier(j, 0, n);
+  hvx_softmax_q16_merge_max(mine, parts, n);
+  hvx_softmax_q16_part_exp(&b, s16, c0, c1, plo, phi, mine);
+  job_barrier(j, 1, n);
+  hvx_softmax_q16_merge_sum(mine, parts, n, NULL);
+  hvx_softmax_q16_part_norm(&b, c0, c1, plo, phi, mine);
+  if (idx == 0) {
+    it->us_softmax = (uint32_t)(now_us() - t0);
+  }
 }
 
-/** @brief Stage 4: o16 * (512 / 2^kv) * s_v[d] / rowsum[r] -> f32 rows,
- *         for rows [r_lo, r_hi) of the block. */
+/**
+ * @brief Stage 4: out = sat_u16(round(o16 * c[d] + zp_o)) with
+ *        c[d] = 512 / 2^kv * s_v[d] / (65535 * s_o), rows [r_lo, r_hi) of
+ *        the block, two dim tiles (64 u16, one vector) per store.
+ */
 static void stage_epilogue(ctx *c, item_t *it, uint32_t r_lo, uint32_t r_hi) {
   const uint64_t t0 = now_us();
-  // Each caller copies the row sums it needs; the two halves write
-  // disjoint words of the cached copy.
-  int32_t *rs = c->rs_heap[it->slot];
-  {
-    HVX_Vector *d = (HVX_Vector *)rs;
-    const HVX_Vector *v = (const HVX_Vector *)rowsum_v(c, it->slot);
-    for (uint32_t w = r_lo / 4u; w < (r_hi + 3u) / 4u; ++w) {
-      d[w] = v[w];
-    }
-  }
-  const float back = ldexpf(512.0f, -it->kv_exp);
+  const float s_o = c->io->out_enc[2u * it->h];
+  const float zp_o = c->io->out_enc[2u * it->h + 1u];
+  const float back =
+    ldexpf(512.0f, -PV_KV) / (65535.0f * (s_o > 0.0f ? s_o : 1.0f));
+  const HVX_Vector vback = hvx_splat_sf(back);
+  const HVX_Vector vzp = hvx_splat_sf(zp_o);
   const float *sv = c->io->kv->fs_v + (size_t)it->n * c->hd;
   const uint8_t *o16 = o16_tiles(c, it->slot);
-  for (uint32_t d = 0; d < c->dt; ++d) {
-    const HVX_Vector svv = hvx_tile_load_u(sv + 32u * d);
-    const HVX_Vector *o =
+  const uint32_t r_end = r_hi < it->n_rows ? r_hi : it->n_rows;
+  for (uint32_t d = 0; d < c->dt; d += 2u) {
+    const int two = d + 1u < c->dt;
+    const HVX_Vector c0 =
+      Q6_Vsf_vmpy_VsfVsf(hvx_tile_load_u(sv + 32u * d), vback);
+    const HVX_Vector c1 =
+      two ? Q6_Vsf_vmpy_VsfVsf(hvx_tile_load_u(sv + 32u * (d + 1u)), vback)
+          : c0;
+    const HVX_Vector *o0 =
       (const HVX_Vector *)(o16 + (size_t)d * HEXKL_ATTN_Q2_TILE16);
-    for (uint32_t v = r_lo / 2u; v < r_hi / 2u; ++v) {
+    const HVX_Vector *o1 = o0 + (two ? HEXKL_ATTN_Q2_TILE16 / 128u : 0u);
+    for (uint32_t v = r_lo / 2u; 2u * v < r_end; ++v) {
       const uint32_t r0 = 2u * v;
-      if (r0 >= it->n_rows) {
-        break;
-      }
-      const HVX_VectorPair w = Q6_Ww_vunpack_Vh(o[v]);
-      for (uint32_t i = 0; i < 2u && r0 + i < it->n_rows; ++i) {
-        const int32_t rsum = rs[hvx_softmax_q_rowsum_index(r0 + i)];
-        const float inv = rsum > 0 ? back / (float)rsum : 0.0f;
-        HVX_Vector f = Q6_Vsf_equals_Vw(i == 0 ? Q6_V_lo_W(w) : Q6_V_hi_W(w));
-        f = Q6_Vsf_vmpy_VsfVsf(f, hvx_splat_sf(inv));
-        f = Q6_Vsf_vmpy_VsfVsf(f, svv);
-        float *dst = c->io->out +
-                     (size_t)(it->q0 + r0 + i) * c->io->out_stride +
-                     it->h * c->hd + 32u * d;
-        hvx_tile_store_u(dst, f);
+      /* Row-pair vectors -> words by halves: lo_W row r0, hi_W row r0+1. */
+      const HVX_VectorPair w0 = Q6_Ww_vunpack_Vh(o0[v]);
+      const HVX_VectorPair w1 = Q6_Ww_vunpack_Vh(o1[v]);
+      for (uint32_t i = 0; i < 2u && r0 + i < r_end; ++i) {
+        HVX_Vector f0 =
+          Q6_Vsf_equals_Vw(i == 0 ? Q6_V_lo_W(w0) : Q6_V_hi_W(w0));
+        HVX_Vector f1 =
+          Q6_Vsf_equals_Vw(i == 0 ? Q6_V_lo_W(w1) : Q6_V_hi_W(w1));
+        f0 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f0, c0), vzp);
+        f1 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f1, c1), vzp);
+        const HVX_Vector u =
+          Q6_Vuh_vpack_VwVw_sat(hvx_sf_to_w_rne(f1), hvx_sf_to_w_rne(f0));
+        uint16_t *dst = c->io->out +
+                        (size_t)(it->q0 + r0 + i) * c->io->out_stride +
+                        it->h * c->hd + 32u * d;
+        if (two) {
+          *(HVX_UVector *)dst = u;
+        } else {
+          /* A lone last tile: its 32 values are the low half. */
+          HVX_Vector tmp[1] __attribute__((aligned(128)));
+          tmp[0] = u;
+          memcpy(dst, tmp, 64u);
+        }
       }
     }
   }
@@ -288,20 +368,21 @@ static void stage_epilogue(ctx *c, item_t *it, uint32_t r_lo, uint32_t r_hi) {
   }
 }
 
-/** @brief W(i): softmax(i) and the two halves of epilogue(i-1), spread
- *         over the workers by task index. */
+/** @brief One job: the softmax of smx_item shared by every participant,
+ *         then the two halves of epi_item's epilogue spread by index. */
 static void worker_job(uint32_t n_threads, uint32_t idx, void *arg) {
   job_t *j = (job_t *)arg;
   ctx *c = j->c;
-  const uint32_t i = j->i;
-  for (uint32_t task = idx; task < 3u; task += n_threads) {
-    if (task == 0u && i < c->n_items) {
-      stage_softmax(c, &c->items[i]);
-    } else if (task == 1u && i >= 1u) {
-      stage_epilogue(c, &c->items[i - 1u], 0u, HEXKL_ATTN_Q2_ROWS / 2u);
-    } else if (task == 2u && i >= 1u) {
-      stage_epilogue(c, &c->items[i - 1u], HEXKL_ATTN_Q2_ROWS / 2u,
-                     HEXKL_ATTN_Q2_ROWS);
+  const uint32_t n =
+    n_threads < HEXKL_ATTN_Q2_SMX_PARTS ? n_threads : HEXKL_ATTN_Q2_SMX_PARTS;
+  if (j->smx_item != NO_ITEM && idx < n) {
+    stage_softmax(c, &c->items[j->smx_item], j, idx, n);
+  }
+  if (j->epi_item != NO_ITEM) {
+    for (uint32_t task = idx; task < 2u; task += n_threads) {
+      stage_epilogue(c, &c->items[j->epi_item],
+                     task * (HEXKL_ATTN_Q2_ROWS / 2u),
+                     (task + 1u) * (HEXKL_ATTN_Q2_ROWS / 2u));
     }
   }
 }
@@ -344,137 +425,297 @@ static void kv_stream_step(ctx *c) {
   c->kv_next_c += n_tiles;
 }
 
-/** @brief Per-head constants once the head's Q scale is known: the QK
- *         convert blocks and the zero-point correction, into the head's
- *         parity slots. */
+/**
+ * @brief Per-head constants: the QK convert exponent and residual, the
+ *        three bias blocks and the zero-point correction, into the head's
+ *        parity slots.
+ *
+ * corr[c][j] = rint(zp * colsum_k[32c + j] * 2^k / 512) mod 2^16. The
+ * product zp * colsum reaches 2^32, so with zp = 256 zh + zl it is formed
+ * as 256 A + B, A = zh * colsum and B = zl * colsum (both within int32),
+ * then shifted right by sh = 9 - k (>= 2 for k <= 7): for sh >= 8,
+ * A / 2^(sh-8) = a1 + a0 / 2^(sh-8) with a0 = A mod 2^(sh-8), and
+ * corr = a1 + rint((256 a0 + B) / 2^sh), everything within int32; for
+ * sh < 8, corr = A * 2^(8-sh) + rint(B / 2^sh). Modular like the
+ * convert's truncation, no saturation.
+ */
 static int setup_head(ctx *c, uint32_t h) {
   head_t *hd = &c->heads[h];
   const uint32_t n = h / c->G;
   const hexkl_kv_q *kv = c->io->kv;
-  const float alpha = hd->s_q * kv->fs_k[n] * LOG2E / sqrtf((float)c->hd);
-  if (hvx_softmax_q_scale(alpha, FRAC_BITS, &hd->k, &hd->rho) != 0) {
+  const float s_q = q_scale_of(c, h);
+  if (!(s_q > 0.0f)) {
     return AEE_EBADPARM;
   }
+  const float alpha = s_q * kv->fs_k[n] * LOG2E / sqrtf((float)c->hd);
+  /** k moves one for one with F, so a k outside the fp16-normal window of
+   * the three converts is brought back by trading fraction bits: fewer
+   * for a large alpha (coarser P, as the a8 kernel had at F = 8), more for
+   * a tiny one (the scores are then small and the wider F cannot
+   * overflow them). The checkpoint's heads all sit at F = 9. */
+  const double target9 = (double)alpha * 512.0 * 512.0; /* 2^F * 512 at 9 */
+  const int k9 = target9 > 0.0 ? (int)ceil(log2(target9)) : -1000;
+  int F = (int)FRAC_BITS;
+  if (k9 > QK_K_MAX) {
+    F -= k9 - QK_K_MAX;
+  } else if (k9 < QK_K_MIN) {
+    F += QK_K_MIN - k9;
+  }
+  if (F < 1) {
+    return AEE_EBADPARM; /* scores would overflow int16 at any F */
+  }
+  if (F > 15) {
+    /** alpha below 2^-30: the logits are numerically zero (an all-zero
+     * Q or K, e.g. an uninitialized bench model). Any k gives a zero
+     * corrected score; take the smallest with rho = 0 -> uniform P. */
+    hd->F = 15;
+    hd->k = QK_K_MIN;
+    hd->rho = 0;
+  } else {
+    if (hvx_softmax_q_scale_k(alpha, (uint32_t)F, QK_K_MIN, QK_K_MAX, &hd->k,
+                              &hd->rho) != 0) {
+      return AEE_EBADPARM;
+    }
+    hd->F = (uint32_t)F;
+  }
   uint8_t *blk = cvt_qk(c, h);
-  set_cvt_block(blk, hexkl_cvt_f32_to_hf(ldexpf(1.0f, hd->k)));
-  set_cvt_block(blk + HEXKL_CVT_BLOCK_BYTES,
-                hexkl_cvt_f32_to_hf(ldexpf(1.0f, hd->k - 8)));
-  // corr[c][j] = rint(128 * colsum_k[32c + j] * 2^k / 512) mod 2^16
-  //            = colsum << (k - 2), or rounded >> (2 - k): one vector of
-  // 32 column sums per tile, packed to the low 16 bits (no saturation:
-  // the correction is modular like the convert's truncation).
-  const int sh = hd->k - 2;
+  set_cvt_block(blk, pow2_hf(hd->k + 8));
+  set_cvt_block(blk + HEXKL_CVT_BLOCK_BYTES, pow2_hf(hd->k));
+  set_cvt_block(blk + 2u * HEXKL_CVT_BLOCK_BYTES, pow2_hf(hd->k - 8));
+
+  const uint32_t zp = q_zp_of(c, h);
+  // vmpyi(Vw, Rub) picks a byte of the scalar per lane: replicate it.
+  const uint32_t zh4 = (zp >> 8) * 0x01010101u;
+  const uint32_t zl4 = (zp & 0xffu) * 0x01010101u;
+  const int sh = 9 - hd->k;
   const int32_t *cs =
     kv->colsum_k + hexkl_kv_q_sk_index(kv, n, 32u * c->res.lo);
   HVX_Vector *dst = (HVX_Vector *)corr_v(c, h);
   for (uint32_t t = 0; t < c->res.n; t += 2u) {
-    HVX_Vector a = hvx_tile_load_u(cs + 32u * t);
-    HVX_Vector b =
-      t + 1u < c->res.n ? hvx_tile_load_u(cs + 32u * (t + 1u)) : Q6_V_vzero();
-    if (sh >= 0) {
-      a = Q6_Vw_vasl_VwR(a, sh);
-      b = Q6_Vw_vasl_VwR(b, sh);
-    } else {
-      // rint(x / 2^-sh): add half, arithmetic shift (ties away from zero
-      // for positive, towards for negative; a one-step tie difference in a
-      // per-column constant is immaterial).
-      const HVX_Vector half = Q6_V_vsplat_R(1 << (-sh - 1));
-      a = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(a, half), -sh);
-      b = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(b, half), -sh);
+    HVX_Vector out[2];
+    for (uint32_t u = 0; u < 2u; ++u) {
+      if (t + u >= c->res.n) {
+        out[u] = Q6_V_vzero();
+        continue;
+      }
+      const HVX_Vector col = hvx_tile_load_u(cs + 32u * (t + u));
+      const HVX_Vector A = Q6_Vw_vmpyi_VwRub(col, zh4);
+      const HVX_Vector B = Q6_Vw_vmpyi_VwRub(col, zl4);
+      HVX_Vector r;
+      if (sh >= 8) {
+        const int m = sh - 8;
+        const HVX_Vector a1 = Q6_Vw_vasr_VwR(A, m);
+        const HVX_Vector a0 =
+          Q6_Vw_vsub_VwVw(A, Q6_Vw_vasl_VwR(a1, m)); /* A mod 2^m */
+        HVX_Vector s = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(a0, 8), B);
+        s = Q6_Vw_vadd_VwVw(s, Q6_V_vsplat_R(1 << (sh - 1)));
+        r = Q6_Vw_vadd_VwVw(a1, Q6_Vw_vasr_VwR(s, sh));
+      } else {
+        const HVX_Vector s = Q6_Vw_vadd_VwVw(B, Q6_V_vsplat_R(1 << (sh - 1)));
+        r = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(A, 8 - sh), Q6_Vw_vasr_VwR(s, sh));
+      }
+      out[u] = r;
     }
     // Low halves of 64 words -> 64 halfwords: tiles t and t+1.
-    dst[t / 2u] = Q6_Vh_vpacke_VwVw(b, a);
+    dst[t / 2u] = Q6_Vh_vpacke_VwVw(out[1], out[0]);
   }
   // The padding tile past the last one reads as zero.
   dst[(c->res.n + 1u) / 2u] = Q6_V_vzero();
   return AEE_SUCCESS;
 }
 
-/** @brief The current accumulator -> int16 tile @a dst through two convert
- *         blocks (scales s and s/256). */
-static inline void acc_to_i16(ctx *c, const uint8_t *blk_lo,
-                              const uint8_t *blk_hi, int16_t *dst) {
-  uint8_t *p0 = c->vb + c->L.planes;
-  uint8_t *p1 = p0 + HEXKL_CVT_PLANE_BYTES;
-  hexkl_cvt_issue(blk_lo, p0);
-  hexkl_cvt_issue(blk_hi, p1);
-  hexkl_cvt_zip_i16(p0, p1, dst);
+/**
+ * @brief Waits for the convert that wrote plane @a p: a load of its last
+ *        vector returns only once the unit has written it, i.e. after it
+ *        has read the accumulator, so the clear that follows is safe.
+ */
+static inline void cvt_fence(const uint8_t *p) {
+  const volatile HVX_Vector *v =
+    (const volatile HVX_Vector *)(p + HEXKL_CVT_PLANE_BYTES - 128u);
+  (void)*v;
 }
 
+/** @brief The accumulator -> two byte planes through the blocks @a blk_lo
+ *         (low byte: scale s) and @a blk_hi (high byte: s / 256). */
+static inline void acc_to_planes(const uint8_t *blk_lo, const uint8_t *blk_hi,
+                                 uint8_t *p_lo, uint8_t *p_hi) {
+  hexkl_cvt_issue(blk_lo, p_lo);
+  hexkl_cvt_issue(blk_hi, p_hi);
+}
+
+/** @brief dst (int16 tile) = zip(A) + zip(B) modulo 2^16: the two
+ *         sweeps' readouts combined. */
+static inline void zip_add_i16(const uint8_t *a_lo, const uint8_t *a_hi,
+                               const uint8_t *b_lo, const uint8_t *b_hi,
+                               int16_t *dst) {
+  const HVX_Vector *al = (const HVX_Vector *)a_lo;
+  const HVX_Vector *ah = (const HVX_Vector *)a_hi;
+  const HVX_Vector *bl = (const HVX_Vector *)b_lo;
+  const HVX_Vector *bh = (const HVX_Vector *)b_hi;
+  HVX_Vector *d = (HVX_Vector *)dst;
+  for (uint32_t i = 0; i < HEXKL_CVT_PLANE_BYTES / 128u; ++i) {
+    const HVX_VectorPair a = Q6_W_vshuff_VVR(ah[i], al[i], -1);
+    const HVX_VectorPair b = Q6_W_vshuff_VVR(bh[i], bl[i], -1);
+    d[2u * i] = Q6_Vh_vadd_VhVh(Q6_V_lo_W(a), Q6_V_lo_W(b));
+    d[2u * i + 1u] = Q6_Vh_vadd_VhVh(Q6_V_hi_W(a), Q6_V_hi_W(b));
+  }
+}
+
+/**
+ * @brief One int16 output tile from two u8 sweeps over @a n_pk packets:
+ *        activation tiles @a act_hi / @a act_lo (stride @a act_step),
+ *        weight tiles from @a wt (stride @a wt_step); blocks[0..2] are the
+ *        scales 2^(e+8), 2^e, 2^(e-8).
+ */
+static inline void two_sweeps(ctx *c, const uint8_t *act_hi,
+                              const uint8_t *act_lo, uint32_t act_step,
+                              const uint8_t *wt, uint32_t wt_step,
+                              uint32_t n_pk, const uint8_t *blocks,
+                              int16_t *dst) {
+  uint8_t *pl = planes(c);
+  uint8_t *a_lo = pl, *a_hi = pl + HEXKL_CVT_PLANE_BYTES;
+  uint8_t *b_lo = a_hi + HEXKL_CVT_PLANE_BYTES,
+          *b_hi = b_lo + HEXKL_CVT_PLANE_BYTES;
+  const uint8_t *blk8 = blocks;
+  const uint8_t *blk0 = blocks + HEXKL_CVT_BLOCK_BYTES;
+  const uint8_t *blkm8 = blocks + 2u * HEXKL_CVT_BLOCK_BYTES;
+  hexkl_micro_hmx_acc_clear_int32();
+  for (uint32_t p = 0; p < n_pk; ++p) {
+    hexkl_hmx_mm_u8i8(act_hi + (size_t)p * act_step, wt + (size_t)p * wt_step);
+  }
+  acc_to_planes(blk8, blk0, a_lo, a_hi);
+  cvt_fence(a_hi);
+  hexkl_micro_hmx_acc_clear_int32();
+  for (uint32_t p = 0; p < n_pk; ++p) {
+    hexkl_hmx_mm_u8i8(act_lo + (size_t)p * act_step, wt + (size_t)p * wt_step);
+  }
+  acc_to_planes(blk0, blkm8, b_lo, b_hi);
+  zip_add_i16(a_lo, a_hi, b_lo, b_hi, dst);
+}
+
+/** @brief Stage 1: the block's score tiles. Per column tile the packets
+ *         run over the dim tiles: Q tile d x K^T tile (col, d). */
 static void stage_qk(ctx *c, const item_t *it) {
   const uint64_t t0 = now_us();
-  const uint8_t *q_ah = q_tiles(c, it->qslot);
-  const uint8_t *blk_lo = cvt_qk(c, it->h);
-  const uint8_t *blk_hi = blk_lo + HEXKL_CVT_BLOCK_BYTES;
+  const uint8_t *q_lo = q_tiles_lo(c, it->qslot);
+  const uint8_t *q_hi = q_tiles_hi(c, it->qslot);
+  const uint8_t *blocks = cvt_qk(c, it->h);
   const uint8_t *kt0 = kt_buf(c, it->n);
   uint8_t *s16 = s16_tiles(c, it->slot);
   for (uint32_t t = 0; t < it->blk.n; ++t) {
     const uint32_t ri = it->blk.lo + t - c->res.lo;
     const uint8_t *kt = kt0 + (size_t)ri * c->dt * 1024u;
-    hexkl_micro_hmx_acc_clear_int32();
-    for (uint32_t d = 0; d < c->dt; ++d) {
-      hexkl_hmx_mm_u8i8(q_ah + d * HEXKL_ATTN_Q2_TILE, kt + d * 1024u);
-    }
-    acc_to_i16(c, blk_lo, blk_hi,
+    two_sweeps(c, q_hi, q_lo, HEXKL_ATTN_Q2_TILE, kt, 1024u, c->dt, blocks,
                (int16_t *)(s16 + (size_t)t * HEXKL_ATTN_Q2_TILE16));
   }
   c->st.us_qk += now_us() - t0;
 }
 
-/** @brief Largest row sum of the block, from the vector layout. */
-static uint32_t rowsum_max(ctx *c, uint32_t slot) {
-  const HVX_Vector *rs = (const HVX_Vector *)rowsum_v(c, slot);
-  HVX_Vector m = rs[0];
-  for (uint32_t w = 1; w < 16u; ++w) {
-    m = Q6_Vw_vmax_VwVw(m, rs[w]);
-  }
-  for (int rot = 4; rot <= 64; rot <<= 1) {
-    m = Q6_Vw_vmax_VwVw(m, Q6_V_vror_VR(m, rot));
-  }
-  return hvx_attn_word0(m);
-}
-
+/** @brief Stage 3: the block's output tiles. Per dim tile the packets run
+ *         over the column tiles: P tile t x V tile (t, d). */
 static void stage_pv(ctx *c, item_t *it) {
   const uint64_t t0 = now_us();
-  // 2^kv / 512 * 127 * rowsum_max <= 32767.
-  const uint32_t rsmax = rowsum_max(c, it->slot);
-  // 32767 * 512 / 127 = 132100.4: floor(log2(132100 / rsmax)).
-  it->kv_exp = rsmax > 0 ? ilog2_u32(132100u / rsmax) : 0;
-  uint8_t *blk_lo = cvt_pv(c);
-  uint8_t *blk_hi = blk_lo + HEXKL_CVT_BLOCK_BYTES;
-  set_cvt_block(blk_lo, hexkl_cvt_f32_to_hf(ldexpf(1.0f, it->kv_exp)));
-  set_cvt_block(blk_hi, hexkl_cvt_f32_to_hf(ldexpf(1.0f, it->kv_exp - 8)));
-  const uint8_t *p_ah = p_tiles(c, it->slot);
+  const uint8_t *p_lo = p_tiles_lo(c, it->slot);
+  const uint8_t *p_hi = p_tiles_hi(c, it->slot);
+  const uint8_t *blocks = cvt_pv(c);
   const uint8_t *v0 =
     v_buf(c, it->n) + (size_t)(it->blk.lo - c->res.lo) * c->dt * 1024u;
   uint8_t *o16 = o16_tiles(c, it->slot);
   for (uint32_t d = 0; d < c->dt; ++d) {
-    hexkl_micro_hmx_acc_clear_int32();
-    for (uint32_t t = 0; t < it->blk.n; ++t) {
-      hexkl_hmx_mm_u8i8(p_ah + t * HEXKL_ATTN_Q2_TILE,
-                        v0 + ((size_t)t * c->dt + d) * 1024u);
-    }
-    acc_to_i16(c, blk_lo, blk_hi,
+    two_sweeps(c, p_hi, p_lo, HEXKL_ATTN_Q2_TILE, v0 + d * 1024u, c->dt * 1024u,
+               it->blk.n, blocks,
                (int16_t *)(o16 + (size_t)d * HEXKL_ATTN_Q2_TILE16));
   }
   c->st.us_pv += now_us() - t0;
 }
 
-/* ---- the kernel ---------------------------------------------------------- */
-
 static void free_ctx(ctx *c) {
   free(c->items);
   free(c->heads);
-  for (uint32_t i = 0; i < HEXKL_ATTN_Q2_SLOTS; ++i) {
-    free(c->rs_heap[i]);
-  }
 }
 
+/**
+ * @brief Submits a job and returns whether one is in flight (nothing to
+ *        do: no submit, no wait).
+ */
+static int submit_job(ctx *c, hvx_worker_pool *pool, job_t *job,
+                      uint32_t smx_item, uint32_t epi_item) {
+  if (smx_item == NO_ITEM && epi_item == NO_ITEM) {
+    return 0;
+  }
+  job->c = c;
+  job->smx_item = smx_item;
+  job->epi_item = epi_item;
+  atomic_store_explicit(&job->bar[0], 0u, memory_order_relaxed);
+  atomic_store_explicit(&job->bar[1], 0u, memory_order_relaxed);
+  const uint64_t t0 = now_us();
+  // This branch's submit returns nothing: it runs the job inline when the
+  // pool has no workers, and wait is then a no-op, so a submitted job is
+  // always safe to wait for.
+  hvx_worker_pool_submit(pool, worker_job, job, 3u);
+  c->st.us_submit += now_us() - t0;
+  return 1;
+}
+
+/**
+ * @brief QK of item k on HMX, once its kv head's K/V are resident and its
+ *        head constants are set. The K/V buffer of head n is the one head
+ *        n - n_kv_bufs used; it is free once no pending PV reads that head
+ *        (kv_in_use past it). A head being streamed in slices is finished
+ *        synchronously; one not yet begun is fetched whole when its buffer
+ *        is free. Returns 0 when the buffer is still busy: the caller
+ *        retries after its PV.
+ */
+static int try_qk(ctx *c, uint32_t k, int *rc) {
+  const item_t *it = &c->items[k];
+  const uint32_t n = it->n;
+  if (n > c->kv_resident) {
+    uint64_t t0 = now_us();
+    if (c->kv_next == n && c->kv_next_c > 0u && c->kv_next_c <= c->res.n) {
+      while (c->kv_next_c < c->res.n) {
+        kv_stream_step(c);
+      }
+    } else {
+      const uint32_t prev = n - c->L.n_kv_bufs; /* n >= n_kv_bufs here? */
+      const int free_buf = n < c->L.n_kv_bufs || c->kv_in_use > prev;
+      if (!free_buf) {
+        return 0;
+      }
+      dma_push(c, n);
+      c->kv_next = n;
+      c->kv_next_c = c->res.n; /* nothing left to stream for it */
+    }
+    hexkl_dma_ring_drain();
+    c->kv_resident = n;
+    c->st.us_dma += now_us() - t0;
+  }
+  if (k == 0 || it->h != c->items[k - 1u].h) {
+    const uint64_t t0 = now_us();
+    *rc = setup_head(c, it->h);
+    c->st.us_head += now_us() - t0;
+    if (*rc != AEE_SUCCESS) {
+      return 1;
+    }
+  }
+  stage_qk(c, it);
+  return 1;
+}
+
+/**
+ * Schedule. At the top of iteration i the softmax of item i is done and
+ * QK(i+1) is done unless its kv head's buffer was busy. The job of
+ * iteration i is { softmax(i+1), epilogue(i-1) }; under it the HMX thread
+ * runs PV(i), the Q split of item i+2 and QK(i+2), so the softmax of one
+ * block overlaps the PV of the previous one and the QK of the next: the
+ * per-block critical path is the longer of the softmax span and the HMX
+ * work rather than their sum.
+ */
 int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
                           const hexkl_attn_f16_shape *s,
                           const hexkl_attn_q2_io *io, hvx_worker_pool *pool,
                           hexkl_attn_q2_stats *st) {
-  if (!vtcm_base || !s || !io || !io->q || !io->out || !io->kv) {
+  if (!vtcm_base || !s || !io || !io->q || !io->out || !io->kv || !io->q_enc ||
+      !io->out_enc) {
     return AEE_EBADPARM;
   }
   const hexkl_kv_q *kv = io->kv;
@@ -500,11 +741,7 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
   c.n_items = s->n_head_q * n_blocks;
   c.items = (item_t *)calloc(c.n_items, sizeof(item_t));
   c.heads = (head_t *)calloc(s->n_head_q, sizeof(head_t));
-  // 128-byte aligned: written with vector stores.
-  for (uint32_t i = 0; i < HEXKL_ATTN_Q2_SLOTS; ++i) {
-    c.rs_heap[i] = (int32_t *)memalign(128u, HVX_SOFTMAX_Q_ROWSUM_WORDS * 4u);
-  }
-  if (!c.items || !c.heads || !c.rs_heap[0] || !c.rs_heap[1]) {
+  if (!c.items || !c.heads) {
     free_ctx(&c);
     return AEE_ENOMEMORY;
   }
@@ -523,18 +760,25 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
       it->qslot = i % HEXKL_ATTN_Q2_Q_SLOTS;
     }
   }
+  // The PV blocks are constants of the kernel.
+  {
+    uint8_t *blk = cvt_pv(&c);
+    set_cvt_block(blk, pow2_hf(PV_KV + 8));
+    set_cvt_block(blk + HEXKL_CVT_BLOCK_BYTES, pow2_hf(PV_KV));
+    set_cvt_block(blk + 2u * HEXKL_CVT_BLOCK_BYTES, pow2_hf(PV_KV - 8));
+  }
 
   const uint64_t t_start = now_us();
   const uint64_t c_start = HAP_perf_get_pcycles();
   int rc = AEE_SUCCESS;
   const uint32_t N = c.n_items;
-  job_t job;
-  job.c = &c;
-
-  // Prologue: K/V of head 0, Q of blocks 0 and 1 staged and quantized,
-  // Q of block 2 in flight, head 0's constants, QK(0). With a second K/V
-  // buffer, head 1 starts streaming in slices.
   const uint32_t items_per_head = n_blocks * c.G;
+  job_t job;
+  memset(&job, 0, sizeof(job));
+
+  // Prologue: K/V of head 0, Q of items 0 and 1 staged and split, Q of
+  // item 2 in flight, QK(0), then softmax(0) with QK(1) under it. With a
+  // second K/V buffer, kv head 1 starts streaming in slices.
   hexkl_dma_ring_reset();
   uint64_t t0 = now_us();
   dma_push(&c, 0);
@@ -544,6 +788,10 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
   }
   hexkl_dma_ring_drain();
   c.st.us_dma += now_us() - t0;
+  c.kv_resident = 0;
+  c.kv_in_use = 0;
+  c.kv_next = 0;
+  c.kv_next_c = c.res.n; // head 0 is whole; nothing streaming yet
   stage_qprep(&c, 0);
   if (N > 1u) {
     stage_qprep(&c, 1);
@@ -551,85 +799,80 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
   if (N > 2u) {
     q_dma_push(&c, 2);
   }
-  c.kv_next_c = c.res.n; // nothing streaming yet
   if (c.L.n_kv_bufs == 2u && s->n_head_kv > 1u) {
     kv_stream_begin(&c, 1, items_per_head);
   }
-  rc = setup_head(&c, c.items[0].h);
+  uint32_t qk_done = 0; // items [0, qk_done) have their scores
+  if (try_qk(&c, 0, &rc)) {
+    qk_done = 1;
+  }
   if (rc == AEE_SUCCESS) {
-    stage_qk(&c, &c.items[0]);
+    const int in_flight = submit_job(&c, pool, &job, 0, NO_ITEM);
+    if (N > 1u && try_qk(&c, 1, &rc)) {
+      qk_done = 2;
+    }
+    t0 = now_us();
+    if (in_flight) {
+      hvx_worker_pool_wait(pool);
+    }
+    c.st.us_wait += now_us() - t0;
   }
 
   for (uint32_t i = 0; i < N && rc == AEE_SUCCESS; ++i) {
     item_t *it = &c.items[i];
-    job.i = i;
-    t0 = now_us();
-    // Inline when the pool has no workers; the wait below is then a no-op.
-    hvx_worker_pool_submit(pool, worker_job, &job, 3u);
-    c.st.us_submit += now_us() - t0;
+    const int deferred = (i + 1u < N) && qk_done == i + 1u;
+    const uint32_t next_kv = i + 1u < N ? c.items[i + 1u].n : it->n;
+
+    if (deferred) {
+      // QK(i+1) waits for this PV to release the single K/V buffer.
+      stage_pv(&c, it);
+      c.kv_in_use = next_kv;
+      if (try_qk(&c, i + 1u, &rc)) {
+        qk_done = i + 2u;
+      }
+      if (rc != AEE_SUCCESS) {
+        break;
+      }
+    }
+    const int in_flight =
+      submit_job(&c, pool, &job, i + 1u < N ? i + 1u : NO_ITEM,
+                 i >= 1u ? i - 1u : NO_ITEM);
 
     // Everything pushed last iteration has had an iteration to land.
     t0 = now_us();
     hexkl_dma_ring_drain();
     c.st.us_dma += now_us() - t0;
+
+    if (!deferred) {
+      stage_pv(&c, it);
+      if (next_kv != it->n) {
+        c.kv_in_use = next_kv;
+        // Head it->n is finished on HMX: with two buffers its buffer takes
+        // the head after next, streamed under the next head's items.
+        if (c.L.n_kv_bufs == 2u && next_kv + 1u < s->n_head_kv &&
+            c.kv_next < next_kv + 1u) {
+          kv_stream_begin(&c, next_kv + 1u, items_per_head);
+        }
+      }
+    }
     if (i + 2u < N) {
-      head_scale(&c, c.items[i + 2u].h);
       stage_qprep(&c, i + 2u);
     }
     if (i + 3u < N) {
       q_dma_push(&c, i + 3u);
     }
     kv_stream_step(&c);
-
-    // QK(i+1), unless it needs the single K/V buffer PV(i) still reads.
-    int defer_qk = 0;
-    if (i + 1u < N) {
-      item_t *nx = &c.items[i + 1u];
-      if (nx->h != it->h) {
-        t0 = now_us();
-        head_scale(&c, nx->h);
-        rc = setup_head(&c, nx->h);
-        c.st.us_head += now_us() - t0;
-      }
-      if (nx->n != it->n) {
-        if (c.L.n_kv_bufs == 2u) {
-          // Its slices were pushed over head it->n; the last one at least
-          // an iteration ago unless the head was very short.
-          t0 = now_us();
-          hexkl_dma_ring_drain();
-          c.st.us_dma += now_us() - t0;
-        } else {
-          defer_qk = 1;
-        }
-      }
-      if (rc == AEE_SUCCESS && !defer_qk) {
-        stage_qk(&c, nx);
+    if (i + 2u < N && qk_done == i + 2u) {
+      if (try_qk(&c, i + 2u, &rc)) {
+        qk_done = i + 3u;
       }
     }
 
     t0 = now_us();
-    hvx_worker_pool_wait(pool);
+    if (in_flight) {
+      hvx_worker_pool_wait(pool);
+    }
     c.st.us_wait += now_us() - t0;
-    if (rc != AEE_SUCCESS) {
-      break;
-    }
-    stage_pv(&c, it);
-
-    if (i + 1u < N) {
-      item_t *nx = &c.items[i + 1u];
-      if (nx->n != it->n) {
-        // Head it->n is finished on HMX: its buffer is free.
-        if (defer_qk) {
-          t0 = now_us();
-          dma_push(&c, nx->n);
-          hexkl_dma_ring_drain();
-          c.st.us_dma += now_us() - t0;
-          stage_qk(&c, nx);
-        } else if (nx->n + 1u < s->n_head_kv) {
-          kv_stream_begin(&c, nx->n + 1u, items_per_head);
-        }
-      }
-    }
   }
   if (rc == AEE_SUCCESS) {
     stage_epilogue(&c, &c.items[N - 1u], 0u, HEXKL_ATTN_Q2_ROWS);
