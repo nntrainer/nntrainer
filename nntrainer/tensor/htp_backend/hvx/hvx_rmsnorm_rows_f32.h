@@ -39,6 +39,16 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
                          uint32_t chunk, const float *gamma, float eps,
                          hvx_worker_pool *pool);
 
+/** @brief hvx_rmsnorm_rows_f32 over rows @a ld floats apart (ld >= n). */
+int hvx_rmsnorm_rows_ld_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                            uint32_t ld, uint32_t chunk, const float *gamma,
+                            float eps, hvx_worker_pool *pool);
+
+/** @brief One row of hvx_rmsnorm_rows_f32 with chunk = n, inline on the
+ *         caller: the same arithmetic, so the same floats. */
+void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
+                         uint32_t n, float eps);
+
 /**
  * @brief The decoder block's epilogue, streamed: out[r][j] = scale *
  *        (out[r][j] + (x[r][j] + x2[r][j]) * rs(r) * gamma[j]), with rs the
@@ -59,5 +69,28 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
 int hvx_rmsnorm_add_f32(float *out, const float *x, const float *x2, uint32_t M,
                         uint32_t n, const float *gamma, float eps, float scale,
                         hvx_worker_pool *pool);
+
+/**
+ * @brief hvx_rmsnorm_add_f32 with the residual read from @a res instead of
+ *        @a out: out = scale * (res + rmsnorm(x [+ x2]) * gamma). @a res
+ *        NULL is hvx_rmsnorm_add_f32. @a res may be @a out; it must not
+ *        overlap it otherwise.
+ */
+int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
+                            const float *x2, uint32_t M, uint32_t n,
+                            const float *gamma, float eps, float scale,
+                            hvx_worker_pool *pool);
+
+/**
+ * @brief hvx_rmsnorm_add_res_f32 with x given as column blocks: block b is
+ *        an M x cols[b] row-major matrix holding columns [sum of the
+ *        earlier cols, + cols[b]) -- the per-handle layout
+ *        hexkl_mm_u8i4_layer_run writes. Every cols[b] a multiple of 32;
+ *        out and res are M x sum(cols) row-major and must not overlap x.
+ */
+int hvx_rmsnorm_add_blocks_f32(float *out, const float *res,
+                               const float *const *xb, const uint32_t *cols,
+                               uint32_t n_blk, uint32_t M, const float *gamma,
+                               float eps, float scale, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_RMSNORM_ROWS_F32_H__ */

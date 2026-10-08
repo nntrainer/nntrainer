@@ -20,6 +20,7 @@
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_opts.h"
 #include "hvx_dequant_i32.h"
@@ -36,6 +37,21 @@
  *         by inspection. If HexKL ever exposes it from hexkl_micro.h, both
  *         files should switch to that instead of this comment. */
 #define WEIGHT_TILE_BYTES_U8I4 512u
+
+/** @brief One u8 x i4 tile multiply, the packet inline (hexkl_hmx_mm.h):
+ *  the library call wraps it in ~50 cycles for ~9 of array time (PR 4343,
+ *  a63aeac6), and a 1024-row qkv call issues hundreds of thousands. The two
+ *  alignment tests the library makes stay, here as two ANDs; a tile that
+ *  fails them takes the library call and its error code. */
+static inline int mm_u8i4_tile(uint8_t *vtcm_base, uint32_t act_off,
+                               uint32_t w_off) {
+  const uint8_t *a = vtcm_base + act_off, *w = vtcm_base + w_off;
+  if (hexkl_hmx_mm_aligned(a, w)) {
+    hexkl_hmx_mm_u8i4(a, w);
+    return AEE_SUCCESS;
+  }
+  return hexkl_micro_hmx_mm_u8i4(vtcm_base, act_off, w_off);
+}
 /** @brief Bytes in one int32 accumulator tile (64x32 values). */
 #define ACC_TILE_BYTES 8192u
 /** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
@@ -190,9 +206,6 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   } else {
     hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
   }
-  /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
-     sets 2 after this returns). */
-  h->bits = 4u;
   h->in_use = 1;
   return AEE_SUCCESS;
 }
@@ -299,7 +312,7 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
 
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
-                                   const int8_t *pal, const float *w_scale,
+                                   const float *w_scale,
                                    const int32_t *colsum_w) {
   hexkl_weight_u8i4 *w;
   if (!tbl || !wh || (!w_scale != !colsum_w) ||
@@ -312,65 +325,15 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
     return AEE_EBADPARM;
   }
   w->wh_bytes = (uint8_t *)wh;
-  /* The width moves with the bytes: a pool slot holds whatever expert the
-     host read into it last. */
-  w->bits = pal ? 2u : 4u;
-  if (pal) {
-    memcpy(w->pal, pal, sizeof(w->pal));
-  }
   if (w_scale) {
     memcpy(w->w_scale, w_scale, sizeof(float) * N);
     memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
     memset(w->bias, 0, sizeof(float) * N);
   } else {
-    hexkl_weight_u8i4_tail_from_arena(
-      w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) * (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
-           WEIGHT_TILE_BYTES_U8I4 / (pal ? 2u : 1u));
+    hexkl_weight_u8i4_tail_from_arena(w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+                                           (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
+                                           WEIGHT_TILE_BYTES_U8I4);
   }
-  return AEE_SUCCESS;
-}
-
-int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
-                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
-                                     const uint8_t *wh, const int8_t *pal,
-                                     const float *w_scale,
-                                     const int32_t *colsum_w, const float *bias,
-                                     uint32_t *out_handle) {
-  uint32_t wh_bytes = 0;
-  uint32_t slot;
-  int rc;
-
-  /* Either all three arrays or none, as for the 4-bit entry: none means
-     they follow the codes in the arena. */
-  if (!tbl || !wh || !pal || !out_handle || (!w_scale != !colsum_w) ||
-      (!w_scale != !bias)) {
-    return AEE_EBADPARM;
-  }
-  /* A whole tile, as for four bits: hexkl_weight_u8i4_rebind_arena (the
-     pool's swap) checks the same, so a slot registered here can always be
-     rebound. The host places weights on 4 KiB boundaries. */
-  if (((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
-    return AEE_EBADPARM;
-  }
-  /* The VTCM check is the 4-bit one on purpose: the HMX path expands the
-     codes in place into a full-width region, so what has to fit is the
-     expanded size. */
-  rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
-  if (rc != AEE_SUCCESS) {
-    return rc;
-  }
-  slot = hexkl_weight_u8i4_free_slot(tbl);
-  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
-    return AEE_ENOMEMORY;
-  }
-  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes / 2u, wh, w_scale,
-                                   colsum_w, bias, /*borrow=*/1);
-  if (rc != AEE_SUCCESS) {
-    return rc;
-  }
-  tbl->slots[slot].bits = 2u;
-  memcpy(tbl->slots[slot].pal, pal, sizeof(tbl->slots[slot].pal));
-  *out_handle = slot;
   return AEE_SUCCESS;
 }
 
@@ -400,8 +363,7 @@ int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
     return AEE_EBADPARM;
   }
   h = &tbl->slots[handle];
-  /* The bake cache holds int4 WH bytes; a 2-bit slot has none to give. */
-  if (!h->in_use || h->bits == 2u) {
+  if (!h->in_use) {
     return AEE_EBADPARM;
   }
   wh_bytes = (h->K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
@@ -444,6 +406,12 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
   if (o->act_ah_prepacked != NULL && o->act_scale == NULL) {
     return AEE_EBADPARM; // prepacked bytes need the caller's own scale/zp
+  }
+  if (o->pre_scratch != NULL && o->act_scale != NULL) {
+    return AEE_EBADPARM; // the pre norm rides on the params scan
+  }
+  if ((o->out_off == NULL) != (o->out_ld == NULL)) {
+    return AEE_EBADPARM;
   }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
@@ -520,6 +488,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     hexkl_acc_layout_get(vtcm_base, result_off);
   hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE] =
     acc_layout->usable ? acc_layout->row_stride : 0u;
+  if (o->out_off && !acc_layout->usable) {
+    return AEE_EUNSUPPORTED; // the fallback dequant writes packed blocks
+  }
 
   /** Caller-supplied params (o->act_scale) skip the min/max scan; loc_* are
    * only allocated for the dynamic path. */
@@ -580,13 +551,15 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      hvx_quant_rows_u8_params(act_f32, M, m_pad, K, loc_scale, loc_zp,
-                               o->pool);
+      rc0 = hvx_quant_params_pack_u8_ah(act_f32, M, m_pad, K, o->pre_gamma,
+                                        o->pre_eps, o->pre_scratch, loc_scale,
+                                        loc_zp, vtcm_base + act_off, o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
+    } else {
+      rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                                 vtcm_base + act_off, o->pool);
     }
-    rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                               vtcm_base + act_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
   }
   if (rc0 != AEE_SUCCESS) {
@@ -619,6 +592,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
     const uint32_t nt_n = h->N / HEXKL_HMX_INT8_BLOCK_N_COL;
     const uint32_t wcur = wbuf[i & 1u];
+    float *const out_h =
+      o->out_off ? out_cat + o->out_off[i] : out_cat + out_off;
+    const uint32_t ld_h = o->out_ld ? o->out_ld[i] : h->N;
 
     if (i + 1 < n_handles) {
       // Cross-matmul prefetch (doc13 §3a): while handle i computes below,
@@ -658,7 +634,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               act_off + (rb * k_tiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
             const uint32_t w_tile_off =
               wcur + (kt * nt_n + nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
-            rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+            rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
             if (rc != AEE_SUCCESS) {
               goto out;
             }
@@ -692,10 +668,10 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             jb->colsum_w = h->colsum_w;
             jb->w_scale = h->w_scale;
             jb->bias = h->bias;
-            jb->dst_a = out_cat + out_off + (size_t)m0 * h->N;
+            jb->dst_a = out_h + (size_t)m0 * ld_h;
             jb->dst_b = NULL;
             jb->split = h->N;
-            jb->dst_stride = h->N;
+            jb->dst_stride = ld_h;
             jb->n_tiles = nb;
             hvx_worker_pool_submit(o->pool, hvx_dq_tiles_worker, jb, nb);
           }
@@ -710,7 +686,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             hvx_dequant_acc_tile_to_f32(
               tile, acc_layout->row_stride, cnt, act_scale + m0, act_zp + m0,
               h->colsum_w + c0, h->w_scale + c0, h->bias + c0,
-              out_cat + out_off + (size_t)m0 * h->N + c0, h->N, o->accumulate);
+              out_h + (size_t)m0 * ld_h + c0, ld_h, o->accumulate);
             HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           }
         } else {
@@ -914,7 +890,7 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           act1_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w1_off + (kt * n1_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
@@ -974,7 +950,7 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           act2_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w2_off + (kt * n2_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
@@ -1162,7 +1138,7 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
           act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
         const uint32_t w_tile_off =
           w_off + (kt * n1_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }

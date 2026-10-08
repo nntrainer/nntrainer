@@ -153,7 +153,7 @@ private:
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation, props::RouterType,
              props::CacheExperts, props::InNorm, props::RouterNorm,
-             props::OutNorm, nntrainer::props::Epsilon>
+             props::OutNorm, props::OutAdd, nntrainer::props::Epsilon>
     moe_props;
   /** The block's norms folded into this layer (doc 57 section 5 step 4):
    *  in_norm norms the input for the experts, router_norm norms it again
@@ -162,6 +162,16 @@ private:
    *  accelerator call at prefill and runs on the CPU otherwise. */
   bool in_norm = false, router_norm = false, out_norm = false;
   unsigned int in_gamma_idx = 0, router_gamma_idx = 0, out_gamma_idx = 0;
+  /** out_add (doc 57 section 9.30): the post-FFN epilogue's gamma and the
+   *  block scalar, and whether the epilogue is on. */
+  unsigned int add_gamma_idx = 0, add_scale_idx = 0;
+  bool out_add = false;
+  /** @brief out = scalar * (raw + rmsnorm(out + x2) * gamma) on the CPU,
+   *  @a scratch a tensor of out's shape. */
+  void addEpilogue(nntrainer::RunLayerContext &context,
+                   const nntrainer::Tensor &raw, const nntrainer::Tensor &x2,
+                   nntrainer::Tensor &out, nntrainer::Tensor &scratch,
+                   float eps);
   unsigned int experts_in_idx = 0, router_in_idx = 0; /**< the normed rows */
   /** props::RouterType "softmax_scale": Gemma-4 routing, and the layer's
    *  optional second input is what the router reads (Gemma-4 norms the
