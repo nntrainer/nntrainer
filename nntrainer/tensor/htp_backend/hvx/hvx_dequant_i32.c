@@ -136,6 +136,53 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
   }
 }
 
+/** @brief Row @a i of the unrolled group's output row, loaded; then that
+ *         row plus the scaled dequant, stored: hvx_scale_add_rows_f32's two
+ *         operations. All four loads go before the first store -- the rows
+ *         are distinct (the caller's contract), and the compiler, which
+ *         cannot know that, otherwise serializes four DDR read-modify-writes
+ *         on their load latency. */
+#define DQ_SCATTER_LOAD(i)                                                     \
+  HVX_UVector *vo##i =                                                         \
+    (HVX_UVector *)(out + (size_t)rows[m + (i)] * out_stride);                 \
+  const HVX_Vector d##i = vo##i[0]
+#define DQ_SCATTER_STORE(i)                                                    \
+  vo##i[0] = Q6_Vsf_vadd_VsfVsf(                                               \
+    d##i, Q6_Vsf_vmpy_VsfVsf(r##i, hvx_splat_sf(weights[m + (i)])))
+
+void hvx_dequant_acc_tile_scatter_f32(
+  const int32_t *tile, uint32_t row_stride, uint32_t m_count,
+  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
+  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
+  const uint32_t *rows, const float *weights) {
+  const HVX_Vector csf = Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[0]);
+  const HVX_Vector vw = ((const HVX_UVector *)w_scale)[0];
+  const HVX_Vector vbias = ((const HVX_UVector *)bias)[0];
+
+  uint32_t m = 0;
+  for (; m + 4u <= m_count; m += 4u) {
+    DQ_TILE_ROW(0);
+    DQ_TILE_ROW(1);
+    DQ_TILE_ROW(2);
+    DQ_TILE_ROW(3);
+    DQ_SCATTER_LOAD(0);
+    DQ_SCATTER_LOAD(1);
+    DQ_SCATTER_LOAD(2);
+    DQ_SCATTER_LOAD(3);
+    DQ_SCATTER_STORE(0);
+    DQ_SCATTER_STORE(1);
+    DQ_SCATTER_STORE(2);
+    DQ_SCATTER_STORE(3);
+  }
+  for (; m < m_count; ++m) {
+    DQ_TILE_ROW(0);
+    DQ_SCATTER_LOAD(0);
+    DQ_SCATTER_STORE(0);
+  }
+}
+
+#undef DQ_SCATTER_LOAD
+#undef DQ_SCATTER_STORE
 #undef DQ_TILE_ROW
 #undef DQ_TILE_STORE
 
@@ -221,17 +268,54 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     const HVX_Vector vwu = ((const HVX_UVector *)(c->w_scale + cu))[0];
     const HVX_Vector vbu = ((const HVX_UVector *)(c->bias + cu))[0];
 
-    for (uint32_t m = 0; m < c->m_count; ++m) {
-      const HVX_Vector g =
-        dq_row_sf(gt + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
-                  csg, vwg, vbg);
-      const HVX_Vector u =
-        dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m], c->act_zp[m],
-                  csu, vwu, vbu);
-      ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] =
-        c->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(g, u)
-                                    : hvx_swiglu_det_sf(g, u);
+    /* Four rows an iteration: the GLU is ~50 dependent HVX ops a row, so
+       one row in flight stalls on latency the whole way (DQ_TILE_ROW's
+       reason); four independent chains in one block let them interleave.
+       Each row's operations are unchanged. */
+#define DQ_GLU_ROW(i)                                                          \
+  const HVX_Vector g##i =                                                      \
+    dq_row_sf(gt + (size_t)(m + (i)) * c->row_stride, c->act_scale[m + (i)],   \
+              c->act_zp[m + (i)], csg, vwg, vbg);                              \
+  const HVX_Vector u##i =                                                      \
+    dq_row_sf(ut + (size_t)(m + (i)) * c->row_stride, c->act_scale[m + (i)],   \
+              c->act_zp[m + (i)], csu, vwu, vbu)
+#define DQ_GLU_STORE(i, fn)                                                    \
+  ((HVX_UVector *)(c->dst + (size_t)(m + (i)) * c->dst_stride + cg))[0] =      \
+    fn(g##i, u##i)
+    uint32_t m = 0;
+    if (c->act == HVX_GLU_GELU_TANH) {
+      for (; m + 4u <= c->m_count; m += 4u) {
+        DQ_GLU_ROW(0);
+        DQ_GLU_ROW(1);
+        DQ_GLU_ROW(2);
+        DQ_GLU_ROW(3);
+        DQ_GLU_STORE(0, hvx_geglu_det_sf);
+        DQ_GLU_STORE(1, hvx_geglu_det_sf);
+        DQ_GLU_STORE(2, hvx_geglu_det_sf);
+        DQ_GLU_STORE(3, hvx_geglu_det_sf);
+      }
+      for (; m < c->m_count; ++m) {
+        DQ_GLU_ROW(0);
+        DQ_GLU_STORE(0, hvx_geglu_det_sf);
+      }
+    } else {
+      for (; m + 4u <= c->m_count; m += 4u) {
+        DQ_GLU_ROW(0);
+        DQ_GLU_ROW(1);
+        DQ_GLU_ROW(2);
+        DQ_GLU_ROW(3);
+        DQ_GLU_STORE(0, hvx_swiglu_det_sf);
+        DQ_GLU_STORE(1, hvx_swiglu_det_sf);
+        DQ_GLU_STORE(2, hvx_swiglu_det_sf);
+        DQ_GLU_STORE(3, hvx_swiglu_det_sf);
+      }
+      for (; m < c->m_count; ++m) {
+        DQ_GLU_ROW(0);
+        DQ_GLU_STORE(0, hvx_swiglu_det_sf);
+      }
     }
+#undef DQ_GLU_ROW
+#undef DQ_GLU_STORE
   }
 }
 

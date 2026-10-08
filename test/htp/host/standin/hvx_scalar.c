@@ -181,6 +181,19 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
         out[(size_t)r * ostride + c] = v;
     }
 }
+void hvx_dequant_acc_tile_scatter_f32(
+  const int32_t *tile, uint32_t stride, uint32_t m, const float *as,
+  const int32_t *az, const int32_t *cs, const float *ws, const float *bias,
+  float *out, uint32_t ostride, const uint32_t *rows, const float *weights) {
+  for (uint32_t r = 0; r < m; ++r)
+    for (uint32_t c = 0; c < 32; ++c) {
+      float v = ((float)(tile[(size_t)r * stride + c] - az[r] * cs[c])) *
+                  as[r] * ws[c] +
+                bias[c];
+      volatile float p = v * weights[r]; /* two operations, as the HVX */
+      out[(size_t)rows[r] * ostride + c] += p;
+    }
+}
 /* The DDR fallback's whole-matrix dequant (accumulator layout unusable):
    the same formula per element, row stride n. */
 void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,

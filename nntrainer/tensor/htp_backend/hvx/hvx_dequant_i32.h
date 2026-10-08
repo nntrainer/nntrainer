@@ -82,6 +82,19 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
                                  int accumulate);
 
 /**
+ * @brief hvx_dequant_acc_tile_to_f32 into registers, each row then added
+ *        into out row @a rows[m] times @a weights[m] (hvx_scale_add_rows_f32's
+ *        operations): the MoE down epilogue's dequant and scatter without the
+ *        f32 round trip through VTCM between them, so the same floats land.
+ *        @a rows must not repeat within the call (one expert's tokens).
+ */
+void hvx_dequant_acc_tile_scatter_f32(
+  const int32_t *tile, uint32_t row_stride, uint32_t m_count,
+  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
+  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
+  const uint32_t *rows, const float *weights);
+
+/**
  * @brief Dequantizes a RUN of accumulator tiles in one pooled pass.
  *
  * Same arithmetic as hvx_dequant_acc_tile_to_f32, tile for tile -- this

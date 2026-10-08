@@ -283,9 +283,10 @@ static uint32_t moe_push_act_block(uint8_t *vtcm_base, uint32_t act_off,
  * dealt round-robin over the workers so the few heavy requant units do
  * not all land on one.
  *
- * ponytail: the scatter is 64 one-vector calls per tile where the row
- * split made 64 calls of 64 vectors; a tile-shaped scale-add would trim
- * the call overhead if the DN epilogue ever shows above its batch.
+ * A tile's dequant and scatter are one pass in registers
+ * (hvx_dequant_acc_tile_scatter_f32): the DN epilogue did show above its
+ * batch, 7.1 ms of HMX-thread wait a 1024-row call (doc 57 section 9.34),
+ * and its f32 went through VTCM and 64 one-vector calls a tile.
  */
 typedef struct {
   /* the batch's tiles */
@@ -296,7 +297,6 @@ typedef struct {
   const int32_t *colsum_w;
   const float *w_scale;
   const float *bias;
-  float *res; /**< [64 x N_out] f32, VTCM */
   /* the scatter */
   float *out; /**< out_c, heap */
   const uint32_t *rows;
@@ -356,15 +356,10 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
     const int32_t *tile =
       (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-    float *res = c->res + c0;
-    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count, c->act_scale,
-                                c->act_zp, c->colsum_w + c0, c->w_scale + c0,
-                                c->bias + c0, res, c->N_out, 0);
-    for (uint32_t r = 0; r < c->m_count; ++r) {
-      hvx_scale_add_rows_f32(c->out + (size_t)c->rows[r] * c->N_out + c0,
-                             res + (size_t)r * c->N_out, c->weights[r],
-                             HEXKL_ACC_TILE_COLS);
-    }
+    hvx_dequant_acc_tile_scatter_f32(tile, c->row_stride, c->m_count,
+                                     c->act_scale, c->act_zp, c->colsum_w + c0,
+                                     c->w_scale + c0, c->bias + c0, c->out + c0,
+                                     c->N_out, c->rows, c->weights);
     for (uint32_t q = 0; q < c->n_rows_b; ++q) {
       hvx_scale_add_rows_f32(c->out + (size_t)c->rows_b[q] * c->N_out + c0,
                              c->res_b + (size_t)q * c->N_out + c0,
@@ -1943,7 +1938,6 @@ int hexkl_mm_u8i4_moe_layer_run(
           c->colsum_w = d->colsum_w;
           c->w_scale = d->w_scale;
           c->bias = d->bias;
-          c->res = (float *)(vtcm_base + L.res_f32_off);
           c->out = out_c;
           c->rows = rows;
           c->weights = weights;
