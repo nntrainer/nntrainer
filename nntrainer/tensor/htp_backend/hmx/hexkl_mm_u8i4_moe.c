@@ -1293,14 +1293,24 @@ int hexkl_mm_u8i4_moe_layer_run(
      hands each expert's gate_up transfer to its predecessor, so a skipped
      expert in the middle would break the chain; compacting first means the
      pipeline never has to think about empties. */
+  /* An expert whose rows are exactly the previous active expert's shares
+     its slots (packed once): the dense FFN's intermediate chunks all take
+     every row, and packed apart they quantized the same rows three times
+     (doc 57 section 9.34). Not on the M=1 path, which packs per expert. */
   {
     uint32_t base = 0u, slot = 0u;
     for (uint32_t e = 0; e < n_experts; ++e) {
       if (row_count[e] != 0u) {
+        const uint32_t p = n_active ? order[n_active - 1u] : 0u;
+        const int shared =
+          !use_m1 && n_active && row_count[p] == row_count[e] &&
+          memcmp(row_index + base_of[n_active - 1u], row_index + base,
+                 sizeof(uint32_t) * row_count[e]) == 0;
         base_of[n_active] = base;
-        slot_of[n_active] = slot;
+        slot_of[n_active] = shared ? slot_of[n_active - 1u] : slot;
         order[n_active++] = e;
-        slot += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
+        if (!shared)
+          slot += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
       }
       base += row_count[e];
     }
@@ -1359,6 +1369,8 @@ int hexkl_mm_u8i4_moe_layer_run(
     uint32_t d = 0u;
     for (uint32_t i = 0; i < n_active; ++i) {
       const uint32_t e = order[i];
+      if (slot_of[i] != d)
+        continue; /* shares the previous expert's slots */
       const uint32_t *rows_e = row_index + base_of[i];
       const uint32_t padded =
         ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
