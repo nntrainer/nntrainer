@@ -25,6 +25,7 @@
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i4_moe.h"
+#include "hexkl_mm_u8i8_dma.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
@@ -1455,6 +1456,52 @@ int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
   }
   if (hvx_router_rows_f32(rows, w, logits, M, K, E, s->quant_pool) != 0) {
     return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u &&
+      hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
+                               s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_router_logits_u8i8_f32(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 E, float eps,
+  const float *gamma, int gammaLen, uint32 w_handle, const float *x, int xLen,
+  uint32 top_k, uint32 n_sel, const float *scale, int scaleLen, float *logits,
+  int logitsLen, uint32 *sel, int selLen, float *weight, int weightLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !s->hmx_locked) {
+    return AEE_EBADPARM;
+  }
+  if (M == 0u || K == 0u || E == 0u || E % 32u != 0u || E > 128u ||
+      (uint64_t)M * K > 0x7FFFFFFFu || (uint64_t)xLen != (uint64_t)M * K ||
+      (uint64_t)logitsLen != (uint64_t)M * E ||
+      (gammaLen != 0 && (uint32)gammaLen != K) ||
+      w_handle >= HEXKL_MM_U8I8_MAX_WEIGHTS ||
+      !s->weights_u8i8.slots[w_handle].in_use ||
+      s->weights_u8i8.slots[w_handle].K != K ||
+      s->weights_u8i8.slots[w_handle].N != E) {
+    FARF(ERROR, "router_logits_u8i8_f32: bad shape or handle");
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u && (n_sel < top_k || n_sel > E || (uint32)scaleLen != E ||
+                      (uint64_t)selLen != (uint64_t)M * n_sel ||
+                      (uint64_t)weightLen != (uint64_t)M * top_k)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  const float *rows = x;
+  if (gammaLen) {
+    rows = norm_rows_in(s, x, M, K, gamma, eps);
+    if (!rows) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = hexkl_mm_u8i8_layer_run(
+    &s->weights_u8i8, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    &w_handle, 1u, rows, logits, &(const hexkl_mm_opts){.pool = s->quant_pool});
+  if (rc != AEE_SUCCESS) {
+    return rc;
   }
   if (top_k != 0u &&
       hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
