@@ -555,8 +555,7 @@ private:
    */
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
-  std::vector<float>
-    htp_rope_table_; /**< [max_timestep][cos hd/2 | sin hd/2] */
+  std::vector<float> htp_rope_table_; /**< [max_timestep][cos 32 | sin 32] */
   bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
                                            prompt are the DSP's, not this cache's */
 
