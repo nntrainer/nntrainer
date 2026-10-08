@@ -22,6 +22,7 @@
 #include "nntr_hvx_session.h"
 
 #include "hvx_exp_f32.h"
+#include "hvx_expand_i2i4.h"
 #include "hvx_softmax_blocked_f32.h"
 #include "hvx_softmax_f32.h"
 #include "hvx_swiglu_det.h"
@@ -113,6 +114,39 @@ int nntr_hvx_swiglu_det_f32(remote_handle64 handle, uint32 act,
     vo[i] =
       act == 1u ? hvx_geglu_det_sf(g, vu[i]) : hvx_swiglu_det_sf(g, vu[i]);
   }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_expand_i2i4(remote_handle64 handle, const uint8 *codes,
+                         int codesLen, const int8 *pal, int palLen, uint8 *hvx,
+                         int hvxLen, uint8 *ref, int refLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (palLen != 4) {
+    FARF(ERROR, "expand_i2i4: palLen=%d, want 4", palLen);
+    return AEE_EBADPARM;
+  }
+  if (codesLen <= 0 || (unsigned)codesLen % 128u != 0u) {
+    FARF(ERROR, "expand_i2i4: codesLen=%d, want a positive multiple of 128",
+         codesLen);
+    return AEE_EBADPARM;
+  }
+  if (hvxLen != 2 * codesLen || refLen != 2 * codesLen) {
+    FARF(ERROR, "expand_i2i4: hvxLen=%d refLen=%d, want %d", hvxLen, refLen,
+         2 * codesLen);
+    return AEE_EBADPARM;
+  }
+
+  // The table is built once here rather than inside each call so the two
+  // paths below are given byte-identical input: if they disagree it is the
+  // lookup, not the table.
+  uint8_t table[HVX_EXPAND_TABLE_BYTES] __attribute__((aligned(128)));
+  hvx_expand_i2i4_table(pal, table);
+
+  hvx_expand_i2i4(codes, (uint32_t)codesLen, table, hvx);
+  hvx_expand_i2i4_scalar(codes, (uint32_t)codesLen, table, ref);
   return AEE_SUCCESS;
 }
 

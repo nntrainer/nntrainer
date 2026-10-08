@@ -28,6 +28,7 @@
 #include "nntr_hvx_session.h"
 
 #include "attn_m1_det.h"
+#include "htp_graph_desc.h"
 #include "hvx_attn_m1_f32.h"
 
 int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
@@ -37,14 +38,22 @@ int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
   if (!s) {
     return AEE_EBADPARM;
   }
+  /* [plan 201 S4] a second register of another shape is the second cache
+     (Gemma 4's full layers beside its sliding ones); a third, or a second
+     of the first one's shape, is refused as before */
+  hvx_attn_m1_ctx **slot = &s->attn_m1;
   if (s->attn_m1) {
-    FARF(ERROR, "attn_m1_register: a cache is already registered");
-    return AEE_EBADSTATE;
+    if (s->attn_m1_b || (s->attn_m1->n_kv == n_kv && s->attn_m1->gqa == gqa &&
+                         s->attn_m1->head_dim == head_dim)) {
+      FARF(ERROR, "attn_m1_register: a cache is already registered");
+      return AEE_EBADSTATE;
+    }
+    slot = &s->attn_m1_b;
   }
   int err = AEE_SUCCESS;
-  s->attn_m1 = hvx_attn_m1_create(n_layers, n_kv, gqa, head_dim, max_seq,
-                                  s->quant_pool, &err);
-  if (!s->attn_m1) {
+  *slot = hvx_attn_m1_create(n_layers, n_kv, gqa, head_dim, max_seq,
+                             s->quant_pool, &err);
+  if (!*slot) {
     FARF(ERROR,
          "attn_m1_register: create failed 0x%08x (layers=%u kv=%u gqa=%u "
          "head_dim=%u max_seq=%u)",
@@ -57,7 +66,7 @@ int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
        "cache=%u KiB",
        (unsigned)n_layers, (unsigned)n_kv, (unsigned)gqa, (unsigned)head_dim,
        (unsigned)max_seq,
-       (unsigned)(s->attn_m1->cache_halves * 2u * sizeof(uint16_t) / 1024u));
+       (unsigned)((*slot)->cache_halves * 2u * sizeof(uint16_t) / 1024u));
   return AEE_SUCCESS;
 }
 
@@ -71,6 +80,8 @@ int nntr_hvx_attn_m1_release(remote_handle64 handle) {
   }
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
+  hvx_attn_m1_free(s->attn_m1_b);
+  s->attn_m1_b = NULL;
   FARF(HIGH, "attn_m1_release: cache freed");
   return AEE_SUCCESS;
 }
@@ -83,7 +94,10 @@ int nntr_hvx_attn_m1_kv_append(remote_handle64 handle, uint32 layer,
   if (!s) {
     return AEE_EBADPARM;
   }
-  const hvx_attn_m1_ctx *c = s->attn_m1;
+  /* [plan 201 S4] HTP_ATTN_KV_CACHE_B in layer names the second cache */
+  hvx_attn_m1_ctx *c =
+    (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
+  layer &= ~HTP_ATTN_KV_CACHE_B;
   if (!c) {
     return AEE_EBADSTATE;
   }
@@ -94,8 +108,7 @@ int nntr_hvx_attn_m1_kv_append(remote_handle64 handle, uint32 layer,
          (unsigned)n_rows, kLen, vLen, (unsigned)want);
     return AEE_EINVALIDFORMAT;
   }
-  return hvx_attn_m1_kv_append(s->attn_m1, layer, kv_from, n_rows, k_rows,
-                               v_rows);
+  return hvx_attn_m1_kv_append(c, layer, kv_from, n_rows, k_rows, v_rows);
 }
 
 int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
@@ -124,13 +137,13 @@ int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
     return AEE_EINVALIDFORMAT;
   }
   if ((uint32_t)statsLen != 2u * n_q + ATTN_M1_PROF_WORDS) {
-    return hvx_attn_m1_forward(s->attn_m1, layer, pos, scale, q, k, v, y,
+    return hvx_attn_m1_forward(s->attn_m1, layer, pos, 0u, scale, q, k, v, y,
                                statsLen ? stats : NULL);
   }
   /* The phase words (#146) follow the (m, l) pairs, bit-copied. */
   uint32_t prof[ATTN_M1_PROF_WORDS];
-  const int rc = hvx_attn_m1_forward_prof(s->attn_m1, layer, pos, scale, q, k,
-                                          v, y, stats, prof);
+  const int rc = hvx_attn_m1_forward_prof(s->attn_m1, layer, pos, 0u, scale, q,
+                                          k, v, y, stats, prof);
   if (rc == AEE_SUCCESS) {
     memcpy(stats + 2u * n_q, prof, sizeof(prof));
   }

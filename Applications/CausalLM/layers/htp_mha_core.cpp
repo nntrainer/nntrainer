@@ -645,11 +645,12 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
   std::memcpy(row.data(), query.getData<float>(), wq * sizeof(float));
   std::memcpy(row.data() + wq, key.getData<float>(), wk * sizeof(float));
   std::memcpy(row.data() + wq + wk, value.getData<float>(), wv * sizeof(float));
-  // The RoPE table, once per layer instance, in the ROPE op's shape
-  // (head_dim 64: cos[i][0..31] | sin[i][0..31], the CPU RoPE's own
-  // source, plan 82 section 3.4). At another head_dim the op cannot be
-  // resident (the validator refuses it), so no table is needed.
-  if (htp_rope_table_.empty() && use_rope && head_dim == 64) {
+  // The RoPE table, once per layer instance, in the ROPE op's shape:
+  // cos[i][0..hd/2) | sin[i][0..hd/2) per position, the CPU RoPE's own
+  // source (plan 82 section 3.4). Head_dim 64 builds it up front (LFM2);
+  // [plan 201 S4] any other head_dim when the hook asks for it (3), so a
+  // CPU run of such a model keeps no table.
+  auto build_rope_table = [&]() {
     const unsigned int rows =
       std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
     if (freqs_fp32 == nullptr) {
@@ -658,20 +659,41 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
         precompute_freqs(head_dim, std::min(max_position_embeddings, rows),
                          theta, false);
     }
+    const unsigned int half = head_dim / 2;
+    // ponytail: htp_rope_table_ is built once, at the max_timestep of the
+    // first decode row, like the DSP graph's KV cache; a later
+    // updateTensorsByInputDimensions that grows max_timestep rebuilds the
+    // CPU tables but not this one. Upgrade path: clear it there and
+    // re-bind the graph at the new length.
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
-    htp_rope_table_.resize(static_cast<size_t>(rows) * 64);
+    htp_rope_table_.resize(static_cast<size_t>(rows) * head_dim);
     for (unsigned int i = 0; i < rows; ++i) {
-      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64,
-                  freqs_fp32->cos[i].data(), 32 * sizeof(float));
-      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64 + 32,
-                  freqs_fp32->sin[i].data(), 32 * sizeof(float));
+      float *t = htp_rope_table_.data() + static_cast<size_t>(i) * head_dim;
+      std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
+      std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
     }
-  }
+  };
+  if (htp_rope_table_.empty() && use_rope && head_dim == 64)
+    build_rope_table();
   int r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
                         wq, htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
+  if (r == 3) {
+    // [#260] use_rope may be off here when the token runs the row: its
+    // q / k are the DSP's own, unrotated (qkv_layer rotates on the CPU
+    // path, #4415, with the table precompute_freqs also builds). A row the
+    // CPU projected arrives rotated already.
+    NNTR_THROW_IF(!htp_rope_table_.empty() ||
+                    (!use_rope && !htpDecodeRowResident(pos)),
+                  std::runtime_error)
+      << "mha_core: the HTP attention hook asked for a RoPE table it has";
+    build_rope_table();
+    r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
+                      wq, htp_rope_table_.data(),
+                      static_cast<unsigned>(htp_rope_table_.size()));
+  }
   if (r == 2) {
     // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
     // every platform's cache (FP16 or UINT16 storage), f32 when it is.

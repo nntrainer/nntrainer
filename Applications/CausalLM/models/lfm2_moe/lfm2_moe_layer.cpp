@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <thread_manager.h>
 #include <unordered_map>
+#include <unordered_set>
 
 /** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
     purpose -- every model on ARM uses it and nothing is wrong with it.
@@ -262,8 +263,7 @@ Lfm2MoELayer::Lfm2MoELayer() :
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
             nntrainer::props::Unit(), props::MoEActivation(),
             props::RouterType(), props::CacheExperts(), props::InNorm(),
-            props::RouterNorm(), props::OutNorm(), props::OutAdd(),
-            nntrainer::props::Epsilon()),
+            props::RouterNorm(), props::OutNorm(), nntrainer::props::Epsilon()),
   softmax_router(false),
   gelu_act(false),
   expert_gate_up_proj_indices({}),
@@ -294,10 +294,7 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   in_norm = std::get<props::InNorm>(moe_props).get();
   router_norm = std::get<props::RouterNorm>(moe_props).get();
   out_norm = std::get<props::OutNorm>(moe_props).get();
-  out_add = std::get<props::OutAdd>(moe_props).get();
-  NNTR_THROW_IF(out_add && context.getNumInputs() != 2, std::invalid_argument)
-    << "MoE layer: out_add takes the dense branch's output as input 1";
-  NNTR_THROW_IF(router_norm && !out_add && context.getNumInputs() == 2,
+  NNTR_THROW_IF(router_norm && context.getNumInputs() == 2,
                 std::invalid_argument)
     << "MoE layer: router_norm norms the input for the router itself; a "
        "second input is the other way to give the router its own rows";
@@ -447,21 +444,9 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (out_norm)
     out_gamma_idx = request_gamma("out_norm_gamma");
-  // the residual_add this replaces: its gamma, then the block scalar
-  if (out_add) {
-    add_gamma_idx = request_gamma("add_gamma");
-    add_scale_idx = context.requestWeight(
-      nntrainer::TensorDim(
-        1, 1, 1, 1,
-        nntrainer::TensorDim::TensorType(context.getFormat(),
-                                         nntrainer::TensorDim::DataType::FP32)),
-      nntrainer::props::InitializerInfo::Enum::NONE,
-      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "add_scalar", true);
-  }
   // The normed rows for the experts and the router (the norm kernel is not
-  // in place); the experts' scratch doubles as the output norm's and the
-  // epilogue's.
-  if (in_norm || out_norm || out_add) {
+  // in place); the experts' scratch doubles as the output norm's.
+  if (in_norm || out_norm) {
     experts_in_idx = context.requestTensor(
       in_dim, "experts_in", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
@@ -728,20 +713,6 @@ static void assignmentsFromRoute(
   }
 }
 
-void Lfm2MoELayer::addEpilogue(nntrainer::RunLayerContext &context,
-                               const nntrainer::Tensor &raw,
-                               const nntrainer::Tensor &x2,
-                               nntrainer::Tensor &out,
-                               nntrainer::Tensor &scratch, float eps) {
-  // residual_add's own CPU order: the sum, the norm into out, the gamma,
-  // the residual, the scalar
-  scratch.copyData(out);
-  scratch.add_i(x2);
-  normRows(scratch, out, context.getWeight(add_gamma_idx), eps);
-  out.add_i(raw);
-  out.multiply_i(context.getWeight(add_scale_idx).getValue<float>(0, 0, 0, 0));
-}
-
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   /** M0 (doc 43 §5): ARM-side wall timer around the whole layer -- this
@@ -760,10 +731,10 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   // normed copies of the input.
   nntrainer::Tensor &input =
     in_norm ? context.getTensor(experts_in_idx) : raw_input;
-  nntrainer::Tensor &router_in = router_norm ? context.getTensor(router_in_idx)
-                                 : (context.getNumInputs() == 2 && !out_add)
-                                   ? context.getInput(ROUTER_IN_IDX)
-                                   : input;
+  nntrainer::Tensor &router_in =
+    router_norm ? context.getTensor(router_in_idx)
+    : context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX)
+                                  : input;
   if (in_norm)
     normRows(raw_input, input, context.getWeight(in_gamma_idx), norm_eps);
 
@@ -887,9 +858,6 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
     normRows(output, scratch, context.getWeight(out_gamma_idx), norm_eps);
     output.copyData(scratch);
   }
-  if (out_add)
-    addEpilogue(context, raw_input, context.getInput(1), output,
-                context.getTensor(experts_in_idx), norm_eps);
 
   if (m0_profile && total_tokens > 1) {
     const auto m0_us = static_cast<uint64_t>(
@@ -1130,9 +1098,7 @@ static bool tryMoeLayerOnAccelerator(
   unsigned int hidden_size, unsigned int intermediate_size,
   bool experts_virtual, const std::vector<int> *extra_top_k,
   int expert_layer_slot, bool gelu, unsigned int trace_layer,
-  const float *pre_gamma, const float *post_gamma, float eps,
-  const float *add_x2 = nullptr, const float *add_gamma = nullptr,
-  float add_scale = 1.0f, bool *add_done = nullptr) {
+  const float *post_gamma, float eps) {
 
   auto *ops = input.getOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
@@ -1194,6 +1160,29 @@ static bool tryMoeLayerOnAccelerator(
     dn_data[e] = dn.getData<char>();
     gu_scale[e] = gu.getScale<float>();
     dn_scale[e] = dn.getScale<float>();
+  }
+
+  // [#260, plan 201 S1] A virtual layer hands all its experts and the
+  // LRU's policy to the backend at its first call (the first prefill runs
+  // the layers in order), for the one-PD token's miss path: the pool's
+  // slots are this LRU's, one set (lfm2_moe_pool_layer.cpp's hand-over).
+  if (experts_virtual) {
+    // ponytail: one model per process -- the set, like the backend's
+    // pool_descs_, is never cleared; a second model in the same process
+    // needs both reset with it.
+    static std::unordered_set<const void *> handed;
+    if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
+      std::vector<ExpertFileDesc> all;
+      for (size_t e = 0; e < n_experts; ++e)
+        all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
+                                 context.getWeight(down_indices[e])));
+      ops->set_decode_moe_experts(
+        all, [](const std::vector<const void *> &need,
+                const std::function<void(const void *)> &load,
+                const std::function<void(const void *)> &evict) {
+          g_expert_lru.acquire(need, load, evict);
+        });
+    }
   }
 
   // [doc 52] Virtual experts: the ones this call routes to are made
@@ -1281,14 +1270,11 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
   };
-  if (add_done)
-    *add_done = false;
-  auto call = [&](float *dst, bool with_add) {
+  auto call = [&](float *dst) {
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
-      hidden_size, weights_wh, gelu, pre_gamma, post_gamma, eps,
-      with_add ? add_x2 : nullptr, with_add ? add_gamma : nullptr, add_scale);
+      hidden_size, weights_wh, gelu, nullptr, post_gamma, eps);
   };
 
   // [doc 52 section 10.14] A layer call needs all of its routed experts
@@ -1318,9 +1304,9 @@ static bool tryMoeLayerOnAccelerator(
       const size_t g1 = std::min(active.size(), g0 + cap);
       stage(std::vector<size_t>(active.begin() + g0, active.begin() + g1));
       if (g0 == 0) {
-        call(out, false);
+        call(out);
       } else {
-        call(part.data(), false);
+        call(part.data());
         for (size_t i = 0; i < n_out; ++i)
           out[i] += part[i];
       }
@@ -1396,9 +1382,7 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
 
-    call(output.getData<float>(), add_x2 != nullptr);
-    if (add_done)
-      *add_done = add_x2 != nullptr;
+    call(output.getData<float>());
   }
 
 #ifndef _WIN32
@@ -1618,10 +1602,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // normed copies of the input (per batch, below).
   nntrainer::Tensor &input_ =
     in_norm ? context.getTensor(experts_in_idx) : raw_input_;
-  nntrainer::Tensor &router_in_ = router_norm ? context.getTensor(router_in_idx)
-                                  : (context.getNumInputs() == 2 && !out_add)
-                                    ? context.getInput(ROUTER_IN_IDX)
-                                    : input_;
+  nntrainer::Tensor &router_in_ =
+    router_norm ? context.getTensor(router_in_idx)
+    : context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX)
+                                  : input_;
 
   nntrainer::Tensor &router_logits_ = context.getTensor(router_logits_idx);
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
@@ -1639,6 +1623,11 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   output_step_dim.height(to - from);
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
+    // [#260] a decode row under the one-PD token (NNTR_HTP_E2E=1): the DSP
+    // runs the block's norms, router and experts in the list, so nothing
+    // here is read -- checked ahead of the folded norms below
+    if (to - from == 1 && input_.batch() == 1 && htpDecodeRowResident(from))
+      continue;
 
     auto input = input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
@@ -1646,22 +1635,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
     auto raw = raw_input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
-    // With out_add the experts' input norm rides the prefill MoE call (its
-    // pre_gamma), which then has the raw rows on the DSP for the
-    // epilogue's residual (doc 57 section 9.30). Alone it gained nothing
-    // (section 9.27), so only then; decode and the MoE diff / shadow
-    // instruments, which read the normed copy, keep the CPU norm.
-    auto *moe_ops = raw.getOps();
-    const bool norm_on_accel = out_add && in_norm && to - from > 1 &&
-                               moeDiffRows() < 0 && !moeShadowEnabled() &&
-                               moe_ops != nullptr &&
-                               moe_ops->supports_gemm_qs4cx_moe_layer_fp32();
-    if (in_norm && !norm_on_accel)
+    if (in_norm)
       normRows(raw, input, context.getWeight(in_gamma_idx), norm_eps);
-    nntrainer::Tensor x2;
-    if (out_add)
-      x2 = context.getInput(1).getSharedDataTensor(
-        input_step_dim, b * input_step_dim.getFeatureLen(), true);
     auto output = output_.getSharedDataTensor(
       output_step_dim, b * output_step_dim.getFeatureLen(), true);
     auto router_logits =
@@ -1706,7 +1681,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // fused call is the MoE wait, so it counts as ffn (#150); a continue
     // stops the timer through its destructor.
     M0Timer fused(&g_m0.ffn);
-    if (total_tokens == 1 && !out_add &&
+    if (total_tokens == 1 &&
         gate_weights.getDataType() == ml::train::TensorDim::DataType::FP32 &&
         htpDecodeRouter(from, input.getData<float>(), hidden_size,
                         gate_weights.getData<float>(), num_experts,
@@ -1776,28 +1751,19 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
        the call it was meant to wrap. */
     bool moe_layer_done = false;
     bool out_normed_on_accel = false;
-    bool add_done = false; // the epilogue rode the call
     {
       M0Timer t(&g_m0.ffn);
       // The output norm rides the prefill call; a decode row keeps its
       // dspqueue transport and norms on the CPU below.
       moe_layer_done = tryMoeLayerOnAccelerator(
-        norm_on_accel ? raw : input, output, expert_assignments, context,
-        expert_gate_up_proj_indices, expert_down_proj_indices, total_tokens,
-        hidden_size, std::get<nntrainer::props::Unit>(moe_props).get(),
-        experts_virtual, &extra_top_k, expert_layer_slot, gelu_act, trace_layer,
-        norm_on_accel ? context.getWeight(in_gamma_idx).getData<float>()
-                      : nullptr,
+        input, output, expert_assignments, context, expert_gate_up_proj_indices,
+        expert_down_proj_indices, total_tokens, hidden_size,
+        std::get<nntrainer::props::Unit>(moe_props).get(), experts_virtual,
+        &extra_top_k, expert_layer_slot, gelu_act, trace_layer,
         out_norm && total_tokens > 1
           ? context.getWeight(out_gamma_idx).getData<float>()
           : nullptr,
-        norm_eps, norm_on_accel ? x2.getData<float>() : nullptr,
-        norm_on_accel ? context.getWeight(add_gamma_idx).getData<float>()
-                      : nullptr,
-        norm_on_accel
-          ? context.getWeight(add_scale_idx).getValue<float>(0, 0, 0, 0)
-          : 1.0f,
-        &add_done);
+        norm_eps);
       out_normed_on_accel = moe_layer_done && out_norm && total_tokens > 1;
     }
 
@@ -1818,8 +1784,6 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       &context.getTensor(decode_activation_output_idx),
     };
     if (!moe_layer_done) {
-      if (norm_on_accel) // the CPU loops below read the normed copy
-        normRows(raw, input, context.getWeight(in_gamma_idx), norm_eps);
       {
         M0Timer t(&g_m0.setup);
         output.setZero();
@@ -1881,13 +1845,6 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                          true);
       normRows(output, scratch, context.getWeight(out_gamma_idx), norm_eps);
       output.copyData(scratch);
-    }
-    if (out_add && !add_done) {
-      auto scratch =
-        context.getTensor(experts_in_idx)
-          .getSharedDataTensor(output_step_dim,
-                               b * output_step_dim.getFeatureLen(), true);
-      addEpilogue(context, raw, x2, output, scratch, norm_eps);
     }
 
     if (m0_profile && total_tokens > 1) {

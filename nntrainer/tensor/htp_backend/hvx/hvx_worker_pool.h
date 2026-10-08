@@ -38,6 +38,10 @@ typedef struct hvx_worker_pool_s hvx_worker_pool;
  */
 hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers);
 
+/** @brief The pool's worker count (the calling thread not included); 0 for
+ *         NULL. A submitted job runs on at most this many lanes. */
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool);
+
 /** @brief Signals every worker to exit and joins them. Safe to call on NULL. */
 void hvx_worker_pool_destroy(hvx_worker_pool *pool);
 

@@ -23,8 +23,12 @@
  * seq = max_seq rounded up to 64. Every row is rounded to fp16 on append
  * (the CPU's seed rows already are), 128-byte aligned, zero-filled at
  * create so the lanes past the context in the last tile read finite values
- * (they are masked out of every reduction). head_dim is 64 only, n_kv *
- * gqa <= 64 (the sum vector's lanes).
+ * (they are masked out of every reduction). head_dim is 64 (LFM2) or,
+ * since plan 201 S4, any multiple of 64 up to 512 (Gemma 4's 256 and 512:
+ * a Kt tile is then head_dim vectors, a V row head_dim / 64), n_kv * gqa <=
+ * 64 (the sum vector's lanes). A sliding window (Gemma's sliding layers)
+ * is a forward argument: the cache keeps every position, the call reads
+ * the last min(L, window).
  *
  * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
  * The cache is n_layers * n_kv * head_dim * seq * 2 * 2 bytes: at the
@@ -38,7 +42,13 @@
  * 2 (37 KiB, #170 round 3) at LFM2.5 and 2048: about 426 KiB of the ~182
  * MiB heap (215 KiB less than round 2). No VTCM, no mapping, no DMA (the
  * l2fetch leads are hints). Growth policy: none; the size is fixed at
- * create.
+ * create. [plan 201 S4] At Gemma 4's shape the cache does not fit that
+ * heap: 25 sliding layers x 8 kv heads x 256 are 200 MiB per 1024 of
+ * max_seq (K and V), the 5 full layers x 2 x 512 another 20 MiB.
+ * ponytail: a ring of the window's 1024 positions would cap the sliding
+ * layers at 200 MiB whatever max_seq, and the cache must move into the
+ * session's arena either way (S5's load hand-over); this file only
+ * computes over it.
  *
  * THREADS. forward runs three pool runs (hvx_attn_m1_f32.c's header):
  * scores and exp by (kv head, 64-position tile), PV by a range of q-head
@@ -82,18 +92,19 @@ typedef struct {
   uint32_t n_layers;
   uint32_t n_kv;
   uint32_t gqa;
-  uint32_t head_dim;     /**< 64 */
-  uint32_t max_seq;      /**< a multiple of 32; the position bound */
-  uint32_t seq;          /**< max_seq rounded up to 64: the tile count * 64 */
-  uint32_t *kv_len;      /**< [n_layers] positions held, 0..max_seq */
-  uint16_t *kt;          /**< fp16 [n_layers][n_kv][seq/64][head_dim][64] */
-  uint16_t *v;           /**< fp16 [n_layers][n_kv][seq][head_dim] */
-  uint16_t *s;           /**< fp16 [n_kv * gqa][seq]: scores, then probs */
-  uint16_t *et;          /**< fp16 [seq][64]: the exps, q heads in lanes */
-  uint16_t *qs;          /**< fp16 [n_kv * gqa][64]: q, zipped for vlut16 */
-  uint16_t *kr;          /**< fp16 [n_kv][head_dim]: the new k rows */
-  uint16_t *exp_tab;     /**< fp16 [ATTN_M1_DET_EXP_N]: exp16 by index */
-  size_t cache_halves;   /**< fp16 values in kt, and in v */
+  uint32_t head_dim;   /**< 64, or a multiple of 64 up to 512 */
+  uint32_t max_seq;    /**< a multiple of 32; the position bound */
+  uint32_t seq;        /**< max_seq rounded up to 64: the tile count * 64 */
+  uint32_t *kv_len;    /**< [n_layers] positions held, 0..max_seq */
+  uint16_t *kt;        /**< fp16 [n_layers][n_kv][seq/64][head_dim][64] */
+  uint16_t *v;         /**< fp16 [n_layers][n_kv][seq][head_dim] */
+  uint16_t *s;         /**< fp16 [n_kv * gqa][seq]: scores, then probs */
+  uint16_t *et;        /**< fp16 [seq][64]: the exps, q heads in lanes */
+  uint16_t *qs;        /**< fp16 [n_kv * gqa][head_dim / 64][64]: q, zipped for
+                            vlut16 per 64-wide chunk */
+  uint16_t *kr;        /**< fp16 [n_kv][head_dim]: the new k rows */
+  uint16_t *exp_tab;   /**< fp16 [ATTN_M1_DET_EXP_N]: exp16 by index */
+  size_t cache_halves; /**< fp16 values in kt, and in v */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every unit on the caller */
 } hvx_attn_m1_ctx;
 
@@ -103,7 +114,7 @@ typedef struct {
  * @param n_layers  attention layers (the layer ordinal space), >= 1
  * @param n_kv      kv heads, >= 1
  * @param gqa       q heads per kv head, 1..8, with n_kv * gqa <= 64
- * @param head_dim  64 (the CPU order's 8 accumulators; the RoPE's head)
+ * @param head_dim  a multiple of 64 up to ATTN_M1_DET_MAX_HD (512)
  * @param max_seq   a multiple of 32; the position bound
  * @param pool      the session's worker pool, borrowed; may be NULL
  * @param err       receives AEE_SUCCESS, AEE_EINVALIDFORMAT (shape, or a
@@ -140,16 +151,22 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
  * pos <= kv_len[layer] is required: pos == kv_len appends, pos < kv_len
  * rewinds (the CPU's cache_index reset), pos > kv_len is a hole.
  *
+ * @param window [plan 201 S4] attend to the last min(pos + 1, window)
+ *               positions (attn_m1_det_lo); 0 = every position
+ * @param scale  the score scale, an fp16 value (0.125 at LFM2's head_dim
+ *               64; 1.0 for Gemma 4, whose q is not pre-scaled here)
  * @param q      [n_kv * gqa][head_dim], post-RoPE
  * @param k, v   [n_kv][head_dim], post-RoPE k
  * @param out    [n_kv * gqa][head_dim]
  * @param stats  2 * n_kv * gqa floats, (m, l) per q head, or NULL
- * @return AEE_SUCCESS; AEE_EINVALIDFORMAT if layer or pos is out of range;
- *         AEE_EBADSTATE for a hole or a NULL ctx
+ * @return AEE_SUCCESS; AEE_EINVALIDFORMAT if layer or pos is out of range
+ *         or scale is not an fp16 value; AEE_EBADSTATE for a hole or a NULL
+ *         ctx
  */
 int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
-                        float scale, const float *q, const float *k,
-                        const float *v, float *out, float *stats);
+                        uint32_t window, float scale, const float *q,
+                        const float *k, const float *v, float *out,
+                        float *stats);
 
 /**
  * @brief hvx_attn_m1_forward that also fills the phase words (#146).
@@ -161,8 +178,8 @@ int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
  *              and stats are byte-equal with and without them
  */
 int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
-                             float scale, const float *q, const float *k,
-                             const float *v, float *out, float *stats,
-                             uint32_t *prof);
+                             uint32_t window, float scale, const float *q,
+                             const float *k, const float *v, float *out,
+                             float *stats, uint32_t *prof);
 
 #endif /* __NNTRAINER_HVX_ATTN_M1_F32_H__ */

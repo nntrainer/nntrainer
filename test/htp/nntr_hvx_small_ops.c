@@ -43,8 +43,7 @@ int nntr_hvx_rmsnorm_det_f32(remote_handle64 handle, uint32 chunk, float eps,
     return AEE_EBADPARM;
   }
   if (xLen <= 0 || chunk == 0u || chunk % LANES != 0u ||
-      (chunk & (chunk - 1u)) != 0u || (uint32)xLen % chunk != 0u ||
-      (uint32)gammaLen != chunk || yLen != xLen ||
+      (uint32)xLen % chunk != 0u || (uint32)gammaLen != chunk || yLen != xLen ||
       (uint32)rsLen != (uint32)xLen / chunk) {
     FARF(ERROR,
          "rmsnorm_det_f32: bad shape (chunk=%u x=%d gamma=%d y=%d rs=%d)",
