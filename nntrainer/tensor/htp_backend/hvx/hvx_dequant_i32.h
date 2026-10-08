@@ -194,6 +194,7 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
  *                    the up half is found at inter + column
  * @param dst         the [rows x inter] SwiGLU output; column g0 * 32 of it
  *                    is where this run's first pair lands
+ * @param geglu       1: hvx_geglu_det_sf (gelu_tanh(gate) * up) instead
  */
 /**
  * @brief Fused dequant + elementwise product over tile PAIRS from two

@@ -34,7 +34,8 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const uint32_t nvec = half / LANES;
   const uint32_t n_heads = c->n / c->hd;
   for (uint32_t r = lo; r < hi; ++r) {
-    const HVX_UVector *vc = (const HVX_UVector *)(c->cs + (size_t)r * 2u * c->hd);
+    const HVX_UVector *vc =
+      (const HVX_UVector *)(c->cs + (size_t)r * 2u * c->hd);
     const HVX_UVector *vs =
       (const HVX_UVector *)(c->cs + (size_t)r * 2u * c->hd + c->hd);
     for (uint32_t h = 0; h < n_heads; ++h) {
@@ -56,8 +57,8 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
 
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
                       const float *cs, hvx_worker_pool *pool) {
-  if (!x || !cs || M == 0u || hd == 0u || (hd / 2u) % LANES != 0u ||
-      n == 0u || n % hd != 0u) {
+  if (!x || !cs || M == 0u || hd == 0u || (hd / 2u) % LANES != 0u || n == 0u ||
+      n % hd != 0u) {
     return -1;
   }
   rows_ctx c = {x, cs, M, n, hd};

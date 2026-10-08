@@ -113,7 +113,7 @@ TEST(HexklAttnF16Plan, TilingRejectsBadShapes) {
   t = tiling(16, 100); // bc not a tile multiple
   EXPECT_EQ(hexkl_attn_f16_tiling_init(&s, &t), HEXKL_ATTN_EBADPARM);
   t = tiling(16, 128);
-  s = shape(128, 0, 128, 16, 4, 288); // head_dim > 256
+  s = shape(128, 0, 128, 16, 4, 544); // head_dim > 512
   EXPECT_EQ(hexkl_attn_f16_tiling_init(&s, &t), HEXKL_ATTN_EBADPARM);
 }
 

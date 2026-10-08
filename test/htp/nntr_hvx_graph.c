@@ -12,6 +12,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <AEEStdErr.h>
@@ -35,15 +36,21 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return AEE_EBADSTATE;
   }
   {
-    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles */
-    hexkl_graph_q4m1_shape q4m1[NNTR_HVX_Q4M1_SLOTS];
+    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
+       [plan 201 S4] on the heap (2 KiB at 256 slots, init copies it) */
+    hexkl_graph_q4m1_shape *q4m1 = (hexkl_graph_q4m1_shape *)malloc(
+      NNTR_HVX_Q4M1_SLOTS * sizeof(hexkl_graph_q4m1_shape));
     uint32_t i;
+    if (q4m1 == NULL) {
+      return AEE_ENOMEMORY;
+    }
     for (i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
       q4m1[i].K = s->q4m1[i].w ? s->q4m1[i].K : 0u;
       q4m1[i].N = s->q4m1[i].w ? s->q4m1[i].N : 0u;
     }
     rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, q4m1,
                           NNTR_HVX_Q4M1_SLOTS, &s->graph);
+    free(q4m1);
   }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_init: %s (0x%08x), %d words", htp_graph_err_name(rc),
@@ -51,8 +58,8 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return rc;
   }
   if (!s->hmx_locked) {
-    /* [#178, #132 Part B E3] the lite open (S2) has no HMX: its graph may
-       hold every kind but MOE resident (HTP_GRAPH_KINDS_S2) */
+    /* [#178, #132 Part B E3] a lite open has no HMX: its graph may hold
+       every kind but MOE resident */
     uint32_t i;
     for (i = 0; i < s->graph->n_ops; ++i) {
       if (s->graph->ops[i].resident && s->graph->ops[i].kind == HTP_OP_MOE) {
@@ -130,6 +137,27 @@ static int graph_check_args(const nntr_hvx_session *s, int row_indexLen,
   return AEE_SUCCESS;
 }
 
+/** @brief [plan 201 S1] The miss path's rebind: the IDL's swap entry,
+ *  called in the PD (the scales and column sums follow the bytes in the
+ *  arena, so the call carries offsets only). */
+static int graph_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
+                        uint32_t inter, uint32_t N_out, uint32_t arena,
+                        uint32_t off_gu, uint32_t off_dn, const int8_t *pal_gu,
+                        const int8_t *pal_dn, uint32_t *h_gu, uint32_t *h_dn) {
+  if (pal_gu != NULL) { /* [plan 229] QS2CX_WH: the batch entry, n = 1 */
+    uint32_t done = 0;
+    int32_t err = AEE_SUCCESS;
+    const int rc = nntr_hvx_weight_swap_batch_u2i4_arena(
+      (remote_handle64)ctx, K, inter, N_out, &old_gu, 1, &old_dn, 1, &arena, 1,
+      &off_gu, 1, &off_dn, 1, pal_gu, 4, pal_dn, 4, h_gu, 1, h_dn, 1, &done,
+      &err);
+    return rc != AEE_SUCCESS ? rc : done == 1u ? AEE_SUCCESS : (int)err;
+  }
+  return nntr_hvx_weight_swap_u8i4_arena(
+    (remote_handle64)ctx, old_gu, old_dn, K, inter, N_out, arena, off_gu,
+    off_dn, NULL, 0, NULL, 0, NULL, 0, NULL, 0, h_gu, h_dn);
+}
+
 void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->tbl = (hexkl_weight_u8i4_table *)&s->weights_u8i4;
   env->vtcm_base = s->vtcm_base;
@@ -139,8 +167,14 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->scratch = (hexkl_moe_scratch *)&s->moe_scratch;
   env->moe_flags = s->moe_flags;
   env->attn_m1 = s->attn_m1;        /* [#130] borrowed; NULL until registered */
+  env->attn_m1_b = s->attn_m1_b;    /* [plan 201 S4] the second shape's */
   env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
   env->fc_ctx = (void *)s;
+  env->rebind = graph_rebind;
+  env->rebind_ctx = (void *)s;
+  env->miss.post = NULL; /* the token driver's (hexkl_token_main) */
+  env->miss.wait = NULL;
+  env->miss.ctx = NULL;
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables

@@ -435,8 +435,7 @@ static void pquant_unit(attn_ctx *c, uint32_t i32) {
     c->kv->s_v + hexkl_kv_q_sv_index(c->kv, c->w_n, c->w_kb * c->t->bc);
   const HVX_Vector *restrict s0 = s_tile(c, c->w_sbuf, i32, 0);
   uint8_t *restrict p0 = p_tile(c, i64, 0);
-  HVX_Vector *restrict ps =
-    c->p_scale + HEXKL_ATTN_Q_ROWS * i64 + rbase;
+  HVX_Vector *restrict ps = c->p_scale + HEXKL_ATTN_Q_ROWS * i64 + rbase;
   const HVX_Vector inv255 = hvx_splat_sf(1.0f / 255.0f);
   const HVX_Vector one_sf = hvx_splat_sf(1.0f);
 

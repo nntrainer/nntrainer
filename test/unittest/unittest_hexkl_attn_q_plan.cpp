@@ -60,7 +60,7 @@ regions(const hexkl_attn_q_layout &L, const hexkl_attn_f16_shape &s,
   r.push_back({L.acc, L.acc + HEXKL_ATTN_Q_ACC_BYTES});
   for (int i = 0; i < 2; ++i)
     r.push_back({L.s_hf[i], L.s_hf[i] + 2 * rt * ct * TB});
-  r.push_back({L.p_ah, L.p_ah + dt * rt * ct * TB});
+  r.push_back({L.p_ah, L.p_ah + rt * ct * TB}); // one set, every V group
   r.push_back({L.o_f32, L.o_f32 + t.g_br * s.head_dim * 4});
   r.push_back({L.qx_f32, L.qx_f32 + L.n_qb_chunk * t.g_br * s.head_dim * 4});
   return r;

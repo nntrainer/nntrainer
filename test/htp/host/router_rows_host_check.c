@@ -140,10 +140,10 @@ static int run_topk(uint32_t M, uint32_t E, uint32_t top_k, uint32_t n_sel,
 int main(void) {
   int fail = 0;
   const double tol = 2e-6; /* f32 partial sums every 256 of 2816 terms */
-  fail |= run(7, 2816, 128) > tol;  /* the softmax router: 7 rows, 3 lanes */
-  fail |= run(5, 2048, 32) > tol;   /* the sigmoid router's width */
-  fail |= run(9, 300, 64) > tol;    /* K not a multiple of the chunk */
-  fail |= run(1, 256, 128) > tol;   /* one row, one chunk */
+  fail |= run(7, 2816, 128) > tol; /* the softmax router: 7 rows, 3 lanes */
+  fail |= run(5, 2048, 32) > tol;  /* the sigmoid router's width */
+  fail |= run(9, 300, 64) > tol;   /* K not a multiple of the chunk */
+  fail |= run(1, 256, 128) > tol;  /* one row, one chunk */
   /* the softmax router's selection: top-8 plus the 5 prefetch hints */
   fail |= run_topk(7, 128, 8, 13, 0);
   fail |= run_topk(5, 128, 8, 8, 1); /* integer logits: exact ties */

@@ -50,7 +50,8 @@ static void table_row(float *cs, uint32_t hd, uint32_t rot, float theta,
 }
 
 /* mismatches against the CPU kernel's order: a*c - b*s, a*s + b*c */
-static int run(uint32_t M, uint32_t n, uint32_t hd, uint32_t rot, unsigned from) {
+static int run(uint32_t M, uint32_t n, uint32_t hd, uint32_t rot,
+               unsigned from) {
   const size_t len = (size_t)M * n;
   float *x = malloc(sizeof(float) * len), *ref = malloc(sizeof(float) * len);
   float *cs = malloc(sizeof(float) * M * 2u * hd);
@@ -105,8 +106,8 @@ int main(void) {
     const int r1 = hvx_rope_rows_f32(x, 1, 64, 48, cs, NULL);
     const int r2 = hvx_rope_rows_f32(x, 1, 96, 64, cs, NULL);
     const int r3 = hvx_rope_rows_f32(x, 0, 64, 64, cs, NULL);
-    printf("rejections: half%%32=%d n%%hd=%d M=0:%d untouched=%d\n", r1, r2,
-           r3, x[5] == 5.0f);
+    printf("rejections: half%%32=%d n%%hd=%d M=0:%d untouched=%d\n", r1, r2, r3,
+           x[5] == 5.0f);
     fail |= !(r1 == -1 && r2 == -1 && r3 == -1 && x[5] == 5.0f);
   }
   printf(fail ? "ROPE ROWS WRONG\n" : "ROPE ROWS OK\n");

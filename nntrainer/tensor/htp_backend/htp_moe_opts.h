@@ -61,15 +61,55 @@ static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
   return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
 }
 
+/** @brief hexkl_mm_u8i4_moe.h's DMA queue field restated (#177): bits
+ *  [23:22] (at [20:19] before #4415 took bit 19) hold N - 1, the number of
+ *  DMA queues (pool lanes) the M = 1 feed splits each weight matrix over.
+ *  The default N = 1 leaves the field 0, so an unset run's word stays
+ *  0x703e1; N = 2 is 0x4703e1, N = 4 0xc703e1. */
+#define HTP_MOE_DMA_Q_SHIFT 22u
+#define HTP_MOE_DMA_Q_BITS 3u
+#define HTP_MOE_DMA_QUEUES_DEFAULT 1u
+
+/** @brief The queue field for getenv("NNTR_MOE_DMA_QUEUES"): unset gives
+ *  HTP_MOE_DMA_QUEUES_DEFAULT, exactly "1".."4" gives N. Anything else is
+ *  an error (returns -1, *bits untouched): a mistyped variant must not run
+ *  as the reference. */
+static inline int htp_moe_opts_dma_queues(const char *env, uint32_t *bits) {
+  uint32_t n = HTP_MOE_DMA_QUEUES_DEFAULT;
+  if (env != NULL) {
+    if (env[0] < '1' || env[0] > '4' || env[1] != '\0')
+      return -1;
+    n = (uint32_t)(env[0] - '0');
+  }
+  *bits = (n - 1u) << HTP_MOE_DMA_Q_SHIFT;
+  return 0;
+}
+
+/** @brief N, the queue count a flags word names: its field + 1. */
+static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
+  return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
+}
+
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GELU_TANH restated (#4415's
+ *  bit 19; plan 201 S4 had it at 21): every expert's gate_up epilogue
+ *  gelu_tanh(gate) * up instead of SwiGLU, on the M = 1 GEMV and the HMX
+ *  loop alike. #4415's prefill call ORs it in per call from its act
+ *  argument; set_moe_geglu puts it in the session word, which is what the
+ *  one-PD token's MOE and DENSE_FFN ops read. A model property: LFM never
+ *  sets it, so its word stays 0x703e1. */
+#define HTP_MOE_FLAG_GEGLU 0x80000u
+
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
  *  With the GEMV on, all of them. With it off, the tune bits mean nothing
  *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
  *  for, because the HMX loop's weight DMA honours it (#158): a skel that
- *  predates it must fail the run, not measure the default. */
+ *  predates it must fail the run, not measure the default. Likewise the
+ *  GeGLU bit: a skel without it would run SwiGLU on a Gemma expert. */
 static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
   if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
     return ~0u;
-  return HTP_MOE_FLAG_M1_GEMV | (flags & HTP_MOE_FLAG_DMA_BYPASS);
+  return HTP_MOE_FLAG_M1_GEMV |
+         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU));
 }
 
 /**

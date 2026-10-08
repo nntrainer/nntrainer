@@ -45,6 +45,12 @@
  *               of a group sharing each V row load, the V rows l2fetched
  *               two 16 KiB blocks ahead; out = o widened to f32 as vectors.
  *
+ * [plan 201 S4] Gemma 4: a head_dim of 256 or 512 is head_dim / 64 chunks
+ * of the same vectors (P1 runs its chains on through the chunks' zipped q
+ * rows, P3 one pass per chunk), and a window starts every run at the tile
+ * of the first visible position, its lanes before that masked like the
+ * lanes past L (max, exp), the sum and PV chains from that position.
+ *
  * The phase words keep their meaning (attn_m1_det.h): APPEND = the
  * caller's rounding and stores, SCORES = P1 (with the k column merge),
  * SOFTMAX = P2 + the two caller steps + the divides, PV = P3's chains,
@@ -74,8 +80,10 @@
 #define TILE 64u
 /** @brief Vector length in bytes, the alignment of every buffer. */
 #define VLEN 128u
-/** @brief The one head_dim (#152): one hf vector per head row. */
-#define HD 64u
+/** @brief hf lanes per vector: one 64-wide chunk of a head row. head_dim
+ *         is a multiple of it (#152: 64; plan 201 S4: up to 512, Gemma 4's
+ *         256 and 512), head_dim / CH chunks a row. */
+#define CH 64u
 /** @brief Upper bound on q heads per kv head. */
 #define MAX_GQA 8u
 /** @brief q heads per call: the lanes of the sum vector. */
@@ -119,8 +127,8 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   int rc = AEE_SUCCESS;
   hvx_attn_m1_ctx *ctx = NULL;
   if (n_layers == 0u || n_kv == 0u || gqa == 0u || gqa > MAX_GQA ||
-      n_kv * gqa > MAX_NQ || head_dim != HD || max_seq == 0u ||
-      max_seq % 32u != 0u) {
+      n_kv * gqa > MAX_NQ || head_dim == 0u || head_dim % CH != 0u ||
+      head_dim > ATTN_M1_DET_MAX_HD || max_seq == 0u || max_seq % 32u != 0u) {
     rc = AEE_EINVALIDFORMAT;
     goto out;
   }
@@ -150,8 +158,9 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->v = (uint16_t *)memalign(VLEN, (size_t)halves * sizeof(uint16_t));
   ctx->s = (uint16_t *)memalign(VLEN, (size_t)n_q * seq * sizeof(uint16_t));
   ctx->et = (uint16_t *)memalign(VLEN, (size_t)seq * VLEN);
-  ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * VLEN);
-  ctx->kr = (uint16_t *)memalign(VLEN, (size_t)n_kv * HD * sizeof(uint16_t));
+  ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * (head_dim / CH) * VLEN);
+  ctx->kr =
+    (uint16_t *)memalign(VLEN, (size_t)n_kv * head_dim * sizeof(uint16_t));
   ctx->exp_tab = (uint16_t *)malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
   float *tmp = (float *)malloc(ATTN_M1_DET_EXP_N * sizeof(float));
   if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s || !ctx->et || !ctx->qs ||
@@ -194,13 +203,13 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
 static inline uint16_t *kt_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                 uint32_t h) {
-  return ctx->kt + ((size_t)layer * ctx->n_kv + h) * HD * ctx->seq;
+  return ctx->kt + ((size_t)layer * ctx->n_kv + h) * ctx->head_dim * ctx->seq;
 }
 
 /** @brief V of one (layer, kv head): [seq][head_dim] fp16. */
 static inline uint16_t *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h) {
-  return ctx->v + ((size_t)layer * ctx->n_kv + h) * ctx->seq * HD;
+  return ctx->v + ((size_t)layer * ctx->n_kv + h) * ctx->seq * ctx->head_dim;
 }
 
 /** @brief Spec steps 0-1 for one kv head of the prefill seed: k and v
@@ -210,10 +219,11 @@ static inline uint16_t *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
 static inline void append_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h, uint32_t pos, const float *k,
                                const float *v) {
+  const uint32_t hd = ctx->head_dim;
   uint16_t *kt =
-    kt_head(ctx, layer, h) + (size_t)(pos / TILE) * HD * TILE + pos % TILE;
-  uint16_t *vr = v_head(ctx, layer, h) + (size_t)pos * HD;
-  for (uint32_t d = 0; d < HD; ++d) {
+    kt_head(ctx, layer, h) + (size_t)(pos / TILE) * hd * TILE + pos % TILE;
+  uint16_t *vr = v_head(ctx, layer, h) + (size_t)pos * hd;
+  for (uint32_t d = 0; d < hd; ++d) {
     kt[(size_t)d * TILE] = hvx_hf_bits_rne(k[d]);
     vr[d] = hvx_hf_bits_rne(v[d]);
   }
@@ -281,10 +291,19 @@ static inline void l2fetch_rows(const void *p, uint32_t rows) {
                              (rows < 0xFFFFu ? rows : 0xFFFFu));
 }
 
+/** @brief l2fetch of @a rows rows of @a width bytes, @a width apart (a V
+ *         row is head_dim / 64 vectors). */
+static inline void l2fetch_box(const void *p, uint32_t width, uint32_t rows) {
+  Q6_l2fetch_AP((void *)p, ((uint64_t)width << 32) | ((uint64_t)width << 16) |
+                             (rows < 0xFFFFu ? rows : 0xFFFFu));
+}
+
 typedef struct {
   const hvx_attn_m1_ctx *ctx;
   uint32_t layer, L, ntl; /**< positions, and their tiles */
   uint32_t n_live;        /**< live lanes of the last tile, 1..64 */
+  uint32_t lo, tlo, ntt;  /**< [plan 201 S4] the first visible position (the
+                               window's), its tile, tiles tlo .. ntl - 1 */
   HVX_Vector scale;       /**< hf splat */
   uint16_t m[MAX_NQ];     /**< hf max per q head, + 0 (P2) */
   float l[MAX_NQ];        /**< the sums (P3) */
@@ -293,10 +312,29 @@ typedef struct {
   uint32_t units;
 } forward_job;
 
-/** @brief The Kt tile of P1 / P2 unit u. */
+/** @brief The Kt tile of P1 / P2 unit u: kv head u / ntt, tile tlo + u %
+ *         ntt (with no window tlo = 0 and ntt = ntl). */
 static inline HVX_Vector *unit_tile(const forward_job *job, uint32_t u) {
-  return (HVX_Vector *)(kt_head(job->ctx, job->layer, u / job->ntl) +
-                        (size_t)(u % job->ntl) * HD * TILE);
+  return (HVX_Vector *)(kt_head(job->ctx, job->layer, u / job->ntt) +
+                        (size_t)(job->tlo + u % job->ntt) * job->ctx->head_dim *
+                          TILE);
+}
+
+/** @brief The visible lanes of tile t, [a, b): the window's first position
+ *         in tile tlo, the last position in tile ntl - 1. @return 1 when
+ *         that is not the whole tile, with *q its predicate. */
+static inline int tile_live(const forward_job *job, uint32_t t,
+                            HVX_VectorPred *q) {
+  const uint32_t a = t == job->tlo ? job->lo % TILE : 0u;
+  const uint32_t b = t + 1u == job->ntl ? job->n_live : TILE;
+  if (a == 0u && b == TILE) {
+    return 0;
+  }
+  *q = Q6_Q_vsetq2_R((int)(2u * b));
+  if (a != 0u) {
+    *q = Q6_Q_and_QQn(*q, Q6_Q_vsetq2_R((int)(2u * a)));
+  }
+  return 1;
 }
 
 /** @brief P1 unit u: kv head u / ntl, tile u % ntl, every q head of it. The
@@ -304,7 +342,8 @@ static inline HVX_Vector *unit_tile(const forward_job *job, uint32_t u) {
  *         from the row the caller rounded. */
 static void p1_unit(const forward_job *job, uint32_t u) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
-  const uint32_t h = u / job->ntl, t = u % job->ntl;
+  const uint32_t h = u / job->ntt, t = job->tlo + u % job->ntt;
+  const uint32_t hd = ctx->head_dim, nch = hd / CH;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
   HVX_Vector *kt = unit_tile(job, u);
   if (t + 1u == job->ntl) { /* lane pos % 64 = n_live - 1 of each d row */
@@ -313,39 +352,44 @@ static void p1_unit(const forward_job *job, uint32_t u) {
     if (j) {
       lane = Q6_Q_and_QQn(lane, Q6_Q_vsetq2_R((int)(2u * j)));
     }
-    const uint16_t *kr = ctx->kr + (size_t)h * HD;
-    for (uint32_t d = 0; d < HD; ++d) {
+    const uint16_t *kr = ctx->kr + (size_t)h * hd;
+    for (uint32_t d = 0; d < hd; ++d) {
       kt[d] = Q6_V_vmux_QVV(lane, Q6_Vh_vsplat_R(kr[d]), kt[d]);
     }
   }
   const HVX_Vector b2 = Q6_Vb_vsplat_R(2), b8 = Q6_Vb_vsplat_R(8);
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
-    const HVX_Vector qrow = ((const HVX_Vector *)ctx->qs)[hq];
+    const HVX_Vector *qrows = (const HVX_Vector *)ctx->qs + (size_t)hq * nch;
     /* acc[l] sees only d = 8 k + l, so the eight chains run as two passes
        of four (the same operations per chain; eight chains at once spill
        on hexagon-clang 19). q[d], q[d + 1] are one vlut16 of the caller's
        zipped row with index bytes (d, d + 1), q[d + 2], q[d + 3] one more
-       at + 2, the next step + 8. */
+       at + 2, the next step + 8. [plan 201 S4] A head of more than 64 is
+       head_dim / 64 zipped rows: the chains run on through each in turn
+       (64 is a multiple of 8, so d % 8 is the chunk's own d % 8). */
     HVX_Vector a0, a1, a2, a3, a4, a5, a6, a7;
     for (uint32_t half = 0; half < 2u; ++half) {
-      const HVX_Vector *kp = kt + 4u * half;
       HVX_Vector c0 = Q6_V_vzero(), c1 = c0, c2 = c0, c3 = c0;
-      HVX_Vector i01 =
-        Q6_Vh_vsplat_R((int)((4u * half) | (4u * half + 1u) << 8));
+      for (uint32_t c = 0; c < nch; ++c) {
+        const HVX_Vector *kp = kt + (size_t)c * CH + 4u * half;
+        const HVX_Vector qrow = qrows[c];
+        HVX_Vector i01 =
+          Q6_Vh_vsplat_R((int)((4u * half) | (4u * half + 1u) << 8));
 #if defined(__hexagon__)
 #pragma unroll 1
 #endif
-      for (uint32_t d = 0; d < HD; d += ATTN_M1_DET_ACC) {
-        const int rt = (int)((d + 4u * half) >> 4); /* the same for all 4 */
-        const HVX_VectorPair q01 = hvx_hf_splat2_lut(i01, qrow, rt);
-        const HVX_VectorPair q23 =
-          hvx_hf_splat2_lut(Q6_Vb_vadd_VbVb(i01, b2), qrow, rt);
-        c0 = hvx_hf_fma(c0, Q6_V_lo_W(q01), kp[d], one);
-        c1 = hvx_hf_fma(c1, Q6_V_hi_W(q01), kp[d + 1u], one);
-        c2 = hvx_hf_fma(c2, Q6_V_lo_W(q23), kp[d + 2u], one);
-        c3 = hvx_hf_fma(c3, Q6_V_hi_W(q23), kp[d + 3u], one);
-        i01 = Q6_Vb_vadd_VbVb(i01, b8);
+        for (uint32_t d = 0; d < CH; d += ATTN_M1_DET_ACC) {
+          const int rt = (int)((d + 4u * half) >> 4); /* the same for all 4 */
+          const HVX_VectorPair q01 = hvx_hf_splat2_lut(i01, qrow, rt);
+          const HVX_VectorPair q23 =
+            hvx_hf_splat2_lut(Q6_Vb_vadd_VbVb(i01, b2), qrow, rt);
+          c0 = hvx_hf_fma(c0, Q6_V_lo_W(q01), kp[d], one);
+          c1 = hvx_hf_fma(c1, Q6_V_hi_W(q01), kp[d + 1u], one);
+          c2 = hvx_hf_fma(c2, Q6_V_lo_W(q23), kp[d + 2u], one);
+          c3 = hvx_hf_fma(c3, Q6_V_hi_W(q23), kp[d + 3u], one);
+          i01 = Q6_Vb_vadd_VbVb(i01, b8);
+        }
       }
       if (half == 0u) {
         a0 = c0, a1 = c1, a2 = c2, a3 = c3;
@@ -373,9 +417,11 @@ static void p1_unit(const forward_job *job, uint32_t u) {
  */
 static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
-  const uint32_t h = u / job->ntl, t = u % job->ntl;
+  const uint32_t h = u / job->ntt, t = job->tlo + u % job->ntt;
   const uint32_t live = t + 1u == job->ntl ? job->n_live : TILE;
-  const HVX_VectorPred mask = Q6_Q_vsetq2_R((int)(live * 2u));
+  /* the lanes past L, and [plan 201 S4] before the window's first */
+  HVX_VectorPred mask = Q6_Q_vsetq2_R((int)(live * 2u));
+  const int partial = tile_live(job, t, &mask);
   HVX_Vector e[MAX_GQA];
   for (uint32_t g = 0; g < MAX_GQA; ++g) {
     e[g] = Q6_V_vzero();
@@ -408,7 +454,7 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
     const uint32_t hq = h * ctx->gqa + g;
     HVX_Vector *row =
       (HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE);
-    e[g] = live < TILE ? Q6_V_vmux_QVV(mask, ev.v[g], Q6_V_vzero()) : ev.v[g];
+    e[g] = partial ? Q6_V_vmux_QVV(mask, ev.v[g], Q6_V_vzero()) : ev.v[g];
     *row = e[g];
   }
 #else
@@ -419,7 +465,7 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
       (HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE);
     const HVX_Vector d = Q6_Vhf_vsub_VhfVhf(*row, Q6_Vh_vsplat_R(job->m[hq]));
     e[g] = hvx_hf_exp16(d, one);
-    if (live < TILE) {
+    if (partial) {
       e[g] = Q6_V_vmux_QVV(mask, e[g], Q6_V_vzero());
     }
     *row = e[g];
@@ -466,11 +512,9 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
          prof_slot *ps, uint64_t *t) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
-  const uint32_t hq0 = h * ctx->gqa + g0, L = job->L;
+  const uint32_t hq0 = h * ctx->gqa + g0, L = job->L, lo = job->lo;
+  const uint32_t hd = ctx->head_dim, nch = hd / CH;
   const HVX_Vector *vr = (const HVX_Vector *)v_head(ctx, job->layer, h);
-#if ATTN_M1_PV_LEAD
-  l2fetch_rows(vr, L < 2u * PV_BLOCK ? L : 2u * PV_BLOCK);
-#endif
   const uint16_t *p[PV_GROUP];
   for (uint32_t g = 0; g < ng; ++g) {
     uint16_t *row = ctx->s + (size_t)(hq0 + g) * ctx->seq;
@@ -478,7 +522,7 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     const HVX_Vector rv = hvx_recip_det_sf(lv);
     const HVX_VectorPair lw = Q6_W_vcombine_VV(lv, lv);
     const HVX_VectorPair rw = Q6_W_vcombine_VV(rv, rv);
-    for (uint32_t b = 0; b < job->ntl; ++b) {
+    for (uint32_t b = job->tlo; b < job->ntl; ++b) {
       HVX_Vector *e = (HVX_Vector *)(row + (size_t)b * TILE);
       *e = hvx_hf_div16(*e, lw, rw, one);
     }
@@ -490,37 +534,51 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
-  HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
-  /* p ascending in blocks of PV_BLOCK; the chain loop is round 1's. */
-  for (uint32_t q0 = 0; q0 < L; q0 += PV_BLOCK) {
+  /* p ascending from the window's first in blocks of PV_BLOCK; the chain
+     loop is round 1's. [plan 201 S4] A V row of head_dim > 64 is nch
+     vectors: one pass of the chains per 64-wide chunk (each d its own
+     chain, so the passes are the spec's chains in another order of d).
+     ponytail: the passes re-walk the positions, nch x the V row loads of
+     one pass; the register file would hold 4 heads x 1 chunk or 1 head x
+     4 chunks -- plan 201 S6 measures which, on silicon. */
+  for (uint32_t c = 0; c < nch; ++c) {
+    const HVX_Vector *vc = vr + c;
 #if ATTN_M1_PV_LEAD
-    if (q0 + 2u * PV_BLOCK < L) {
-      const uint32_t rest = L - q0 - 2u * PV_BLOCK;
-      l2fetch_rows(vr + q0 + 2u * PV_BLOCK, rest < PV_BLOCK ? rest : PV_BLOCK);
-    }
+    l2fetch_box(vr + (size_t)lo * nch, nch * VLEN,
+                L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
 #endif
-    const HVX_Vector *vb = vr + q0;
-    const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
-                   *b2 = p[ng > 2u ? 2u : 0u] + q0,
-                   *b3 = p[ng > 3u ? 3u : 0u] + q0;
-    const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
-    for (uint32_t q = 0; q < nb; ++q) {
-      const HVX_Vector v = vb[q];
-      o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(b0[q]), v, one);
-      if (ng > 1u) {
-        o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(b1[q]), v, one);
+    HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
+    for (uint32_t q0 = lo; q0 < L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+      if (q0 + 2u * PV_BLOCK < L) {
+        const uint32_t rest = L - q0 - 2u * PV_BLOCK;
+        l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * nch, nch * VLEN,
+                    rest < PV_BLOCK ? rest : PV_BLOCK);
       }
-      if (ng > 2u) {
-        o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(b2[q]), v, one);
-      }
-      if (ng > 3u) {
-        o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(b3[q]), v, one);
+#endif
+      const HVX_Vector *vb = vc + (size_t)q0 * nch;
+      const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
+                     *b2 = p[ng > 2u ? 2u : 0u] + q0,
+                     *b3 = p[ng > 3u ? 3u : 0u] + q0;
+      const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
+      for (uint32_t q = 0; q < nb; ++q) {
+        const HVX_Vector v = vb[(size_t)q * nch];
+        o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(b0[q]), v, one);
+        if (ng > 1u) {
+          o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(b1[q]), v, one);
+        }
+        if (ng > 2u) {
+          o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(b2[q]), v, one);
+        }
+        if (ng > 3u) {
+          o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(b3[q]), v, one);
+        }
       }
     }
-  }
-  const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
-  for (uint32_t g = 0; g < ng; ++g) {
-    hvx_hf_store_sf(job->out + (size_t)(hq0 + g) * HD, o[g]);
+    const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
+    for (uint32_t g = 0; g < ng; ++g) {
+      hvx_hf_store_sf(job->out + (size_t)(hq0 + g) * hd + (size_t)c * CH, o[g]);
+    }
   }
   if (ps) {
     const uint64_t now = HAP_perf_get_pcycles();
@@ -537,7 +595,7 @@ static void run_p1(uint32_t n, uint32_t i, void *arg) {
   for (uint32_t u = i; u < job->units; u += n) {
 #if ATTN_M1_P1_LEAD
     if (u + n < job->units) {
-      l2fetch_rows(unit_tile(job, u + n), HD);
+      l2fetch_rows(unit_tile(job, u + n), job->ctx->head_dim);
     }
 #endif
     p1_unit(job, u);
@@ -605,16 +663,17 @@ static void run_p3(uint32_t n, uint32_t i, void *arg) {
 }
 
 int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
-                        float scale, const float *q, const float *k,
-                        const float *v, float *out, float *stats) {
-  return hvx_attn_m1_forward_prof(ctx, layer, pos, scale, q, k, v, out, stats,
-                                  NULL);
+                        uint32_t window, float scale, const float *q,
+                        const float *k, const float *v, float *out,
+                        float *stats) {
+  return hvx_attn_m1_forward_prof(ctx, layer, pos, window, scale, q, k, v, out,
+                                  stats, NULL);
 }
 
 int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
-                             float scale, const float *q, const float *k,
-                             const float *v, float *out, float *stats,
-                             uint32_t *prof) {
+                             uint32_t window, float scale, const float *q,
+                             const float *k, const float *v, float *out,
+                             float *stats, uint32_t *prof) {
   const uint64_t qt0 = prof ? HAP_perf_get_qtimer_count() : 0u;
   if (!ctx) {
     return AEE_EBADSTATE;
@@ -635,18 +694,18 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
      v into its row; k kept for P1, which writes the column into the tile
      it reads anyway; q as one zipped row per head, which P1 splats by
      vlut16. */
-  for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-    *(HVX_Vector *)(ctx->kr + (size_t)h * HD) =
-      hvx_hf_round_row(k + (size_t)h * HD);
-    *(HVX_Vector *)(v_head(ctx, layer, h) + (size_t)pos * HD) =
-      hvx_hf_round_row(v + (size_t)h * HD);
+  const uint32_t hd = ctx->head_dim;
+  for (uint32_t i = 0; i < ctx->n_kv * hd; i += CH) { /* kv head h = i / hd */
+    *(HVX_Vector *)(ctx->kr + i) = hvx_hf_round_row(k + i);
+    *(HVX_Vector *)(v_head(ctx, layer, i / hd) + (size_t)pos * hd + i % hd) =
+      hvx_hf_round_row(v + i);
   }
   ctx->kv_len[layer] = pos + 1u;
 
   const uint32_t n_q = ctx->n_kv * ctx->gqa, L = pos + 1u;
   HVX_Vector *qs = (HVX_Vector *)ctx->qs;
-  for (uint32_t hq = 0; hq < n_q; ++hq) {
-    qs[hq] = hvx_hf_round_row_lut(q + (size_t)hq * HD);
+  for (uint32_t i = 0; i < n_q * hd; i += CH) { /* q head i / hd's rows */
+    qs[i / CH] = hvx_hf_round_row_lut(q + i);
   }
   forward_job job;
   job.ctx = ctx;
@@ -654,6 +713,9 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.L = L;
   job.ntl = (L + TILE - 1u) / TILE;
   job.n_live = L - (job.ntl - 1u) * TILE;
+  job.lo = attn_m1_det_lo(L, window);
+  job.tlo = job.lo / TILE;
+  job.ntt = job.ntl - job.tlo;
   job.scale = Q6_Vh_vsplat_R(hvx_hf_bits_rne(scale));
   job.out = out;
   job.slots = prof ? slots : NULL;
@@ -666,21 +728,27 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     t0 = now;
   }
 
-  job.units = ctx->n_kv * job.ntl;
+  job.units = ctx->n_kv * job.ntt;
   hvx_worker_pool_run(ctx->pool, run_p1, &job, job.units);
 
-  /* m per q head: the hf max over its tiles, the last masked; + 0. */
+  /* m per q head: the hf max over its tiles, the last masked, then the
+     others ascending ([plan 201 S4] from the window's tile, its lanes
+     before the window masked); + 0. */
   uint64_t ts = prof ? HAP_perf_get_pcycles() : 0u;
   const HVX_Vector neg = Q6_Vh_vsplat_R(HF_NEG_MAX);
-  const HVX_VectorPred live = Q6_Q_vsetq2_R((int)(job.n_live * 2u));
+  HVX_VectorPred last_q = Q6_Q_vsetq2_R((int)(job.n_live * 2u)), first_q;
+  const int last_partial = tile_live(&job, job.ntl - 1u, &last_q);
+  const int first_partial =
+    job.tlo + 1u < job.ntl && tile_live(&job, job.tlo, &first_q);
   for (uint32_t hq = 0; hq < n_q; ++hq) {
     const HVX_Vector *row =
       (const HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq);
-    HVX_Vector mx = job.n_live < TILE
-                      ? Q6_V_vmux_QVV(live, row[job.ntl - 1u], neg)
-                      : row[job.ntl - 1u];
-    for (uint32_t b = 0; b + 1u < job.ntl; ++b) {
-      mx = Q6_Vhf_vmax_VhfVhf(mx, row[b]);
+    HVX_Vector mx = last_partial ? Q6_V_vmux_QVV(last_q, row[job.ntl - 1u], neg)
+                                 : row[job.ntl - 1u];
+    for (uint32_t b = job.tlo; b + 1u < job.ntl; ++b) {
+      mx = Q6_Vhf_vmax_VhfVhf(mx, (b == job.tlo && first_partial)
+                                    ? Q6_V_vmux_QVV(first_q, row[b], neg)
+                                    : row[b]);
     }
     for (uint32_t rot = VLEN / 2u; rot >= 2u; rot >>= 1) {
       mx = Q6_Vhf_vmax_VhfVhf(mx, Q6_V_vror_VR(mx, (int)rot));
@@ -703,7 +771,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   } lsum;
   lsum.v = Q6_V_vzero();
   const HVX_Vector *et = (const HVX_Vector *)ctx->et;
-  for (uint32_t p = 0; p < L; ++p) {
+  for (uint32_t p = job.lo; p < L; ++p) {
     lsum.v = Q6_Vhf_vadd_VhfVhf(lsum.v, et[p]);
   }
   for (uint32_t hq = 0; hq < n_q; ++hq) {

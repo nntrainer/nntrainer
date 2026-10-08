@@ -80,7 +80,8 @@ inline int htpDecodeConvGate(unsigned pos, const float *abc, float *y,
 
 /** @brief Decode attention of one token: qkv = q | k | v (len floats,
  *  post-projection, pre-norm when QK_NORM is resident, else normed),
- *  out (n_heads x head_dim), rope = cos[32] | sin[32] per position. */
+ *  out (n_heads x head_dim), rope = cos[hd / 2] | sin[hd / 2] per position
+ *  (may be empty: [plan 201 S4] the hook returns 3 when it needs it). */
 inline int htpDecodeAttn(unsigned pos, const float *qkv, unsigned len,
                          float *out, unsigned out_len, const float *rope,
                          unsigned rope_len) {

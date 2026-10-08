@@ -44,9 +44,8 @@ int hvx_softcap_f32(float *y, uint32_t n, float cap) {
     const HVX_Vector mag = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7FFFFFFF));
     const HVX_Vector a = Q6_Vsf_vmax_VsfVsf(Q6_Vsf_vmpy_VsfVsf(mag, k), lo);
     const HVX_Vector e = hvx_exp_det_sf(a);
-    const HVX_Vector t =
-      Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vsub_VsfVsf(one, e),
-                         hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e)));
+    const HVX_Vector t = Q6_Vsf_vmpy_VsfVsf(
+      Q6_Vsf_vsub_VsfVsf(one, e), hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e)));
     v[i] = Q6_V_vor_VV(Q6_Vsf_vmpy_VsfVsf(t, vcap), sign);
   }
   /* The tail is the same specification in scalar form (swiglu_det.h), not
