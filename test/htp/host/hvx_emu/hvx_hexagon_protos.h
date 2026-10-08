@@ -480,6 +480,28 @@ static inline HVX_VectorPair Q6_W_vshuff_VVR(HVX_Vector u, HVX_Vector v,
   return w;
 }
 
+/* vdeal: the inverse permutation of vshuff for the same Rt -- the same
+   swaps, largest offset first (each swap set is its own inverse). */
+static inline HVX_VectorPair Q6_W_vdeal_VVR(HVX_Vector u, HVX_Vector v,
+                                            int32_t rt) {
+  HVX_VectorPair w;
+  w.lo = v;
+  w.hi = u;
+  uint8_t *lo = (uint8_t *)w.lo.w, *hi = (uint8_t *)w.hi.w;
+  for (int off = 2 * HVX_EMU_LANES; off >= 1; off >>= 1) {
+    if (rt & off) {
+      for (int k = 0; k < 4 * HVX_EMU_LANES; ++k) {
+        if (!(k & off)) {
+          const uint8_t t = hi[k];
+          hi[k] = lo[k + off];
+          lo[k + off] = t;
+        }
+      }
+    }
+  }
+  return w;
+}
+
 static inline HVX_Vector Q6_Vh_vpacke_VwVw(HVX_Vector u, HVX_Vector v) {
   HVX_Vector r;
   for (int i = 0; i < HVX_EMU_LANES; ++i) {

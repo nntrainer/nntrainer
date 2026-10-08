@@ -323,6 +323,15 @@ done
 
 "$OUT/softcap_host_check"
 
+# Attention's K^T tile builder (doc 57 section 9.10): the vshuff network
+# on the lane emulation against the word-transpose definition, bit for
+# bit, at the model's head dims (TILE F16 OK).
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/tile_f16_host_check" "$HERE/tile_f16_host_check.c" -lm
+
+"$OUT/tile_f16_host_check"
+
 # The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
 # independent model of the Android CPU's quantizer and fused chain, six
 # mutants (Q4 GEMV CPU-ORDER OK), and the REAL DSP source hvx_q4_gemv_f32.c
