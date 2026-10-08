@@ -101,7 +101,6 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
-
 /**
  * @brief UseRope property
  */
@@ -165,7 +164,6 @@ public:
     "rope_scaling_factor";                    /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
-
 
 /**
  * @brief RopeScalingMaxPositionEmbeddings
