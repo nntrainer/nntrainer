@@ -564,7 +564,8 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     item_t *it = &c.items[i];
     job.i = i;
     t0 = now_us();
-    const int in_flight = hvx_worker_pool_submit(pool, worker_job, &job, 3u);
+    // Inline when the pool has no workers; the wait below is then a no-op.
+    hvx_worker_pool_submit(pool, worker_job, &job, 3u);
     c.st.us_submit += now_us() - t0;
 
     // Everything pushed last iteration has had an iteration to land.
@@ -607,9 +608,7 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     }
 
     t0 = now_us();
-    if (in_flight) {
-      hvx_worker_pool_wait(pool);
-    }
+    hvx_worker_pool_wait(pool);
     c.st.us_wait += now_us() - t0;
     if (rc != AEE_SUCCESS) {
       break;
