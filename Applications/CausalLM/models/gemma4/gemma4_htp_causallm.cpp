@@ -415,9 +415,15 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     att_out = createSharedAttention(layer_id, shared_kv_layer_id, INIT_SEQ_LEN,
                                     NUM_HEADS, HEAD_DIM, normed);
   } else {
+    fold_o_proj_ = !is_kv_shared_layer;
     att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
                               normed, normed, normed);
   }
+  // With the o-proj folded the add also holds its weight (first, as the
+  // file has it) and takes the attention core's output: one call that
+  // projects, norms, adds (doc 57 section 9.32).
+  const bool o_folded = fold_o_proj_;
+  fold_o_proj_ = false;
 
   // input + post_attention_norm(att_out): the norm's gamma lives on the
   // add, so the two are one accelerator call (doc 57 section 5 step 4).
@@ -428,6 +434,10 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
+  if (o_folded) {
+    post_attn_props.push_back(withKey("proj", "true"));
+    post_attn_props.push_back(withKey("weight_dtype", FC_LAYER_DTYPE));
+  }
   appendSkipPrefillIfNeeded(post_attn_props, is_kv_shared_layer);
   LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
   Tensor post_attention = post_attention_add({input, att_out});
@@ -807,6 +817,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
+  if (fold_o_proj_)
+    return a;
   LayerHandle wo(createLayer("fully_connected", o_params));
 
   return wo(a);

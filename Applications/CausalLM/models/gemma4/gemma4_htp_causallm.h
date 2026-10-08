@@ -121,6 +121,13 @@ public:
                                int seq_len, int n_heads, int head_dim,
                                Tensor query);
 
+private:
+  /** createAttention returns the attention core's output, leaving the
+   *  o-proj to the post-attention residual_add (proj, doc 57 section 9.32);
+   *  set by the block around its one call. */
+  bool fold_o_proj_ = false;
+
+public:
   Tensor createTransformerDecoderBlock(const int layer_id,
                                        Tensor input) override;
 
