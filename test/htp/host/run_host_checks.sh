@@ -40,9 +40,33 @@ cc=${CC:-gcc}
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" -lm
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
 
 "$OUT/moe_layer_host_check"
+# [#225] Two mutants of the decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run),
+# each of which must fail FC WH BIT-IDENTICAL: a lane computing a block it
+# never waited for, and the part's column offset dropped from the dequant's
+# column sums.
+for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/' \
+  's/        w->colsum_w + c0, w->w_scale + c0,/        w->colsum_w, w->w_scale + c0,/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" > "$OUT/moe_fc_mutant.c"
+  if cmp -s "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c"; then
+    echo "FC WH MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+    -DMOE_TAIL_MAX_ROWS=16u \
+    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$OUT/moe_fc_mutant" \
+    "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
+    "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+    "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
+  if MOE_CHECK_FC_WH_ONLY=1 "$OUT/moe_fc_mutant" > "$OUT/moe_fc_mutant.log"; then
+    echo "FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "FC WH MUTANT CAUGHT: $mut ($(grep -c 'FAIL$' "$OUT/moe_fc_mutant.log") failed cells)"
+done
 
 # The conv block kernel (doc 51 section 2) on the same stand-ins. It is
 # built on the MoE kernel's exported helpers, so that file links in too.
@@ -56,7 +80,7 @@ cc=${CC:-gcc}
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
   "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
-  "$BACKEND/hmx/hexkl_dma_trace.c" -lm
+  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
 
 "$OUT/conv_block_host_check"
 
@@ -82,6 +106,26 @@ cc=${CC:-gcc}
   "$HERE/worker_pool_host_check.c" "$BACKEND/hvx/hvx_worker_pool.c"
 
 "$OUT/worker_pool_host_check"
+
+# whPack2 (the quantizer, C++) against hvx_expand_i2i4 (the kernel, C).
+# Nothing else ties those two together -- different toolchains, no shared
+# code -- and if they drift a QS2CX_WH model holds different weights than
+# the QS4CX_WH model whose perplexity justified it. C++ because whPack2 is
+# a C++ header; the pool is real pthreads, as above.
+# The kernel halves stay C: hvx_worker_pool.c is C11 stdatomic, which a
+# C++ compiler will not take.
+cxx=${CXX:-g++}
+for k in hvx_expand_i2i4 hvx_worker_pool; do
+  "$cc" -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter -pthread -c \
+    -I "$HERE/stub" -I "$BACKEND/hvx" -o "$OUT/$k.o" "$BACKEND/hvx/$k.c"
+done
+"$cxx" -std=c++17 -O1 -Wall -Wextra -Wno-unused-parameter -pthread \
+  -I "$HERE/stub" -I "$BACKEND/hvx" -I "$BACKEND/.." \
+  -o "$OUT/expand_i2i4_host_check" \
+  "$HERE/expand_i2i4_host_check.cc" "$OUT/hvx_expand_i2i4.o" \
+  "$OUT/hvx_worker_pool.o"
+
+"$OUT/expand_i2i4_host_check"
 
 # The DMA probe's descriptor plan (test/htp/nntr_dma_probe_plan.h): the
 # skel runs the same header-only function, so the geometry checked here --
@@ -160,21 +204,33 @@ cc=${CC:-gcc}
 # with one token changed must fail, or the check is not looking.
 LIBNATIVE="${DEFAULT_HEXAGON_TOOLS_ROOT:-}/Tools/libnative"
 if [ -f "$LIBNATIVE/lib/libnative.a" ]; then
+  # [plan 229] The u8i2 entries' spec is the expansion's scalar twin, so
+  # hvx_expand_i2i4.c links in plain (its HVX loop is __hexagon__ only),
+  # with the pool it can dispatch to.
+  for k in hvx_expand_i2i4 hvx_worker_pool; do
+    "$cc" -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter -pthread -c \
+      -I "$HERE/stub" -I "$BACKEND/hvx" -o "$OUT/native_$k.o" \
+      "$BACKEND/hvx/$k.c"
+  done
   gemv_native() { # gemv_native <kernel.c> <exe>
     "$cc" -std=gnu99 -O1 -fno-strict-aliasing -DHVX_UVector=HEXAGON_Vect1024 \
       -I "$LIBNATIVE/include" -I "$BACKEND/hvx" -c "$1" -o "$2.k.o"
     "$cc" -std=gnu99 -O1 -Wall -Wextra -I "$BACKEND/hvx" \
       -c "$HERE/gemv_native_check.c" -o "$2.c.o"
-    g++ -o "$2" "$2.c.o" "$2.k.o" "$LIBNATIVE/lib/libnative.a"
+    g++ -pthread -o "$2" "$2.c.o" "$2.k.o" "$OUT/native_hvx_expand_i2i4.o" \
+      "$OUT/native_hvx_worker_pool.o" "$LIBNATIVE/lib/libnative.a"
   }
   gemv_native "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" "$OUT/gemv_native_check"
   "$OUT/gemv_native_check"
   # One mutant per loop: the one-row loop's final shift (caught only on
   # the lone rows m = 1, 5, 9, 13, which is how this shows that loop runs)
   # and the four-row loop's. Sending m = 1 to the four-row loop is not a
-  # mutant: its row 0 is the same int32 by construction.
+  # mutant: its row 0 is the same int32 by construction. [plan 229] And the
+  # u8i2 loops' code split with the nibble mask #4410 shipped (0xF0: vlut32
+  # indices past 31 read zero), which only the spec comparison catches.
   for mut in 's/vasr_VwR(acc, 4)/vasr_VwR(acc, 3)/' \
-    's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/'; do
+    's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/' \
+    's/(int)0x0F0F0F0Fu/(int)0xF0F0F0F0u/'; do
     sed "$mut" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" > "$OUT/mutant.c"
     if cmp -s "$OUT/mutant.c" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c"; then
       echo "HVX GEMV MUTATION DID NOT APPLY: $mut"; exit 1
@@ -217,11 +273,20 @@ graph_check() { # graph_check <hexkl_graph.c> <exe>
 graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
-# FFN input's quantization; the argmax over the first slice only
+# FFN input's quantization; the argmax over the first slice only; [plan 201
+# S1] the miss round's experts before the first miss dropped, and its later
+# rows added in reverse order; [plan 201 S4] the softmax router run as the
+# sigmoid one, an RMSNORM's N1 bit ignored, and an ATTN_M1's scale (Gemma's
+# 1.0 in eps_bits) ignored for 1/sqrt(head_dim)
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
-  's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/'; do
+  's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
+  's/  if (first != 0u) {/  if (0) {/' \
+  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
+  's/  if (op->eps_bits != 0u) {/  if (0) {/' \
+  's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/' \
+  's/op->eps_bits != 0u *? graph_eps(op)/0 ? graph_eps(op)/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -232,30 +297,67 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   fi
   echo "GRAPH Q4M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
+# [plan 201 S4] Gemma 4's kernels in hexkl_graph.c, each mutant must fail
+# the check's Gemma half: the v norm with k's gamma, attention_k_eq_v
+# ignored (v read from the row's v part), the dense FFN's GeGLU flag
+# ignored (SwiGLU), the soft-cap skipped, layer_scalar dropped.
+for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);/    hvx_rmsnorm_f32(v, gamma + hd, out + n_q + n_k, n_k, hd, eps, NULL);/' \
+  's/    (op->feed \& HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;/    0 ? in + n_q : in + n_q + n_k;/' \
+  's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GELU_TANH) != 0u) {/  if (0) {/' \
+  's/  if (rc == AEE_SUCCESS \&\& op->eps_bits != 0u) {/  if (0) {/' \
+  's/    hvx_mul_scalar_f32(out, graph_eps(op), op->N);/    (void)0;/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
+  if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
+    echo "GRAPH GEMMA MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$OUT/hexkl_graph_mutant.c" "$OUT/graph_mutant"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH GEMMA MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH GEMMA MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
+# [#225] The WH FC / DENSE_FFN ops, each mutant must fail GRAPH FC WH OK:
+# the dense chunks handed as one expert of the whole width, the op's L2 bit
+# not reaching the FC kernel as feed off.
+for mut in 's/      op->N \/ op->n_experts, op->N_out, op->n_experts,/      op->N, op->N_out, op->n_experts,/' \
+  's/  if ((op->feed \& HTP_GRAPH_FEED_L2) != 0u) {/  if (0) {/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
+  if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
+    echo "GRAPH FC WH MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$OUT/hexkl_graph_mutant.c" "$OUT/graph_mutant"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH FC WH MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
 
-# [#132 Part B E2] The two-session token driver (hmx/hexkl_token.c): S1 and
-# S2 on two pthreads over the hd64 list split by mask, every MoE row across
-# a malloc'd mailbox page, bit-identical to the one-session run for 10 000
-# tokens (TOKEN DRIVER BIT-IDENTICAL), then the lost-post, stale-read and
-# failed-side paths (TOKEN DRIVER FAILURE PATHS OK; ~3 s of timeouts).
-# Same kernels and flags as the graph check. Then two mutants of
-# hexkl_token.c, each of which must fail it: S2 reading its own row back
-# as the MoE output, and the trailer check gone.
-token_check() { # token_check <hexkl_token.c> <exe>
+# [#132 Part B E2, #211] The one-PD token driver (hmx/hexkl_token.c): one
+# session over the hd64 list with every kind resident, bit-identical to the
+# one-session forward for 10 000 tokens (TOKEN DRIVER BIT-IDENTICAL), the
+# pool's miss rounds against an owner pthread (TOKEN POOL BIT-IDENTICAL),
+# then the miss round's failure paths: no owner, a stale answer, the
+# owner's code (TOKEN DRIVER FAILURE PATHS OK; ~1 s of timeout). Same
+# kernels and flags as the graph check.
+token_check() { # token_check <hexkl_token.c> <exe> [hexkl_graph.c]
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -Wno-format-truncation -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" \
-    "$HERE/token_host_check.c" "$1" "$BACKEND/hmx/hexkl_graph.c" \
+    "$HERE/token_host_check.c" "$1" "${3:-$BACKEND/hmx/hexkl_graph.c}" \
     "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
     "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
     "$BACKEND/hvx/hvx_scale_add_f32.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
 }
 token_check "$BACKEND/hmx/hexkl_token.c" "$OUT/token_host_check"
 "$OUT/token_host_check"
-for mut in 's/    in = tk_row(theirs);/    in = tk_row(mine);/' \
-  's/  if (\*(const uint32_t \*)(slot + HEXKL_MBOX_LINE + row) != seq) {/  if (0) {/'; do
+# Two mutants of hexkl_token.c, each of which must fail it: [plan 201 S1]
+# the answer's evictions not cleared, so an evicted expert's table entry
+# names the bytes its pair now holds (TOKEN POOL BIT-IDENTICAL must fail);
+# [#211] the answer's seq2 check gone (the stale answer must be refused)
+for mut in 's/  for (i = 0; rc == AEE_SUCCESS \&\& i < a->n_evict; ++i) {/  for (i = 0; 0 \&\& i < a->n_evict; ++i) {/' \
+  's/  if (a->seq2 != seq || /  if (0 || /'; do
   sed "$mut" "$BACKEND/hmx/hexkl_token.c" > "$OUT/hexkl_token_mutant.c"
   if cmp -s "$OUT/hexkl_token_mutant.c" "$BACKEND/hmx/hexkl_token.c"; then
     echo "TOKEN MUTATION DID NOT APPLY: $mut"; exit 1
@@ -280,6 +382,68 @@ done
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+# [plan 201 S4] The softmax router's renormalisation skipped in the spec
+# (weight = p * per-expert scale): the kernel calls the same pick, so only
+# the check against #4296's formula in double can see it -- it must.
+mkdir -p "$OUT/mut_m1"
+mut='s/  inv = swiglu_det_recip(t);/  inv = 1.0f;/'
+sed "$mut" "$BACKEND/../m1_ops_det.h" > "$OUT/mut_m1/m1_ops_det.h"
+if cmp -s "$OUT/mut_m1/m1_ops_det.h" "$BACKEND/../m1_ops_det.h"; then
+  echo "ROUTER SOFTMAX MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$OUT/mut_m1" -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_mutant" \
+  "$HERE/m1_ops_host_check.c" "$BACKEND/hvx/hvx_m1_ops_f32.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_mutant" > "$OUT/m1_ops_mutant.log"; then
+  echo "ROUTER SOFTMAX MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROUTER SOFTMAX MUTANT CAUGHT: renormalise skipped ($(grep -c '^FAIL: router softmax' "$OUT/m1_ops_mutant.log") failed checks)"
+
+# [plan 201 S4] RoPE at Gemma 4's head_dim 256 / 512: the kernel pairing
+# (i, i + 32) inside each 64-lane chunk -- LFM2's head_dim 64 RoPE reused
+# per chunk, the same bytes at 64 -- must fail the hd256 / hd512 lines.
+mut='s/\*vb = (HVX_UVector \*)(x + h);/*vb = (HVX_UVector *)(x + LANES);/'
+sed "$mut" "$BACKEND/hvx/hvx_m1_ops_f32.c" > "$OUT/hvx_m1_ops_rope_mut.c"
+if cmp -s "$OUT/hvx_m1_ops_rope_mut.c" "$BACKEND/hvx/hvx_m1_ops_f32.c"; then
+  echo "ROPE MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_rope_mutant" \
+  "$HERE/m1_ops_host_check.c" "$OUT/hvx_m1_ops_rope_mut.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_rope_mutant" > "$OUT/m1_ops_rope_mutant.log"; then
+  echo "ROPE MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROPE MUTANT CAUGHT: hd64 pairing per chunk ($(grep -c '^FAIL: rope' "$OUT/m1_ops_rope_mutant.log") failed checks, rope64 lines $(grep -c 'rope64 pos=.* bad=0' "$OUT/m1_ops_rope_mutant.log")/5 still bad=0)"
+
+# [plan 201 S4] The MoE epilogue's GeGLU-tanh: geglu_det_one (swiglu_det.h)
+# against f64 incl. the tanh saturation ends and subnormals, then the REAL
+# hvx_dequant_i32.c epilogue on hvx_emu/ (geglu and swiglu) bit for bit
+# against the spec (GEGLU OK). Then gelu swapped for silu in the kernel,
+# which must fail it.
+geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -Wno-format-truncation -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$2" "$HERE/geglu_host_check.c" "$1" \
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+}
+geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
+"$OUT/geglu_host_check"
+mut='s/c->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(g, u)/c->act == HVX_GLU_GELU_TANH ? hvx_swiglu_det_sf(g, u)/'
+sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
+if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
+  echo "GEGLU MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+geglu_check "$OUT/hvx_dequant_i32.c" "$OUT/geglu_mutant"
+if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
+  echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
 
 # The prefill-shape RMSNorm rows (doc 57 section 5 step 4): the real HVX
 # source on the lane emulation against a double reference, at the hidden
@@ -364,7 +528,10 @@ done
 # (n_kv, gqa) = (8, 4),
 # (1, 2), (2, 3), (1, 8), head_dim 64, plus append-chain == bulk, the L = 1 case,
 # a division tie and the error codes; and the phase words (#146), which
-# must leave the output bytes alone (ATTN M1 PHASES OK).
+# must leave the output bytes alone (ATTN M1 PHASES OK). [plan 201 S4]
+# Gemma 4's (8, 2) x 256 with a 1024 window and (2, 8) x 512, scale 1.0,
+# L = 1, 65, 1023, 1024, 1025, 4096, against the spec and an f64 reference
+# (ATTN M1 GEMMA BIT-IDENTICAL, the SNR printed per line).
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
@@ -375,6 +542,27 @@ done
   "$BACKEND/hvx/hvx_worker_pool.c" -lm
 
 "$OUT/attn_m1_host_check"
+# [plan 201 S4] Two mutants of the kernel at Gemma 4's shapes, each of which
+# must fail it: the sliding window one position short (lo of L + 1), and V
+# taken from the k row -- attention_k_eq_v shares the projection only, the
+# cached K (k_norm with gamma, RoPE) and V (v_norm, no gamma) differ.
+for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L + 1u, window);/' \
+  's/      hvx_hf_round_row(v + i);/      hvx_hf_round_row(k + i);/'; do
+  sed "$mut" "$BACKEND/hvx/hvx_attn_m1_f32.c" > "$OUT/hvx_attn_m1_mut.c"
+  if cmp -s "$OUT/hvx_attn_m1_mut.c" "$BACKEND/hvx/hvx_attn_m1_f32.c"; then
+    echo "ATTN M1 MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -o "$OUT/attn_m1_mutant" \
+    "$HERE/attn_m1_host_check.c" "$OUT/hvx_attn_m1_mut.c" \
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  if "$OUT/attn_m1_mutant" > "$OUT/attn_m1_mutant.log"; then
+    echo "ATTN M1 MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "ATTN M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL: gemma' "$OUT/attn_m1_mutant.log") Gemma lines failed)"
+done
 
 # weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
 # over the real weight registry, the arena plain aligned memory. The header

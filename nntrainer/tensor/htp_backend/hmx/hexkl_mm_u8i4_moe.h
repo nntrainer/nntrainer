@@ -124,6 +124,16 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                      uint32_t k_tiles, uint32_t n_col,
                                      uint32_t nt0, uint32_t cn, int src_bypass);
 
+/**
+ * @brief Expands a 2-bit chunk in place after its DMA lands. No-op at 4.
+ * @see hexkl_mm_u8i4_moe.c -- must run between the wait and the first HMX
+ *      issue that reads the chunk.
+ */
+void hexkl_moe_expand_chunk(uint8_t *vtcm_base, uint32_t dst_off,
+                            const hexkl_weight_u8i4 *h, uint32_t k_tiles,
+                            uint32_t n_col, uint32_t nt0, uint32_t cn,
+                            hvx_worker_pool *pool);
+
 /** @brief Queues one 64-row AH activation block (rows [slot, slot+64) of
  *         a packed activation) heap -> VTCM. Push it AHEAD of the weights
  *         it will be computed against -- see the definition for why.
@@ -226,6 +236,39 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch, uint32_t flags);
+
+/**
+ * @brief [#225] One decode row through FC weights held as WH handles: the
+ *        u8 row quantization of the MoE M=1 path, then per output column
+ *        tile hvx_gemm_u8i4_wh_col and the dequant epilogue of its down
+ *        stage (moe_m1_down_worker's body), the parts' outputs side by
+ *        side (q | k | v, a conv in_proj's thirds).
+ *
+ * With the feed on (hexkl_moe_flags_feed, the MoE's) each pool lane
+ * double-buffers its own next block of columns into its own VTCM slice on
+ * its own DMA queue while it computes the current one -- the Q4M1 FC
+ * runner's feed (nntr_hvx_fc_q4.c) on the WH layout. Off, or a VTCM slice
+ * too small for two columns, reads the arena behind the GEMV's l2fetch.
+ * The output bytes are the same either way.
+ *
+ * @param[in] h        [n_parts] handles of K x N_p, N_p % 32 == 0
+ * @param[in] act_f32  [K], K % 32 == 0 (any heap or slot buffer)
+ * @param[out] out_f32 [sum N_p]
+ * @return AEE_SUCCESS; AEE_EBADITEM for a handle out of range, free, of
+ *         another K or 2-bit (QS2CX_WH: refused until plan 229 S2's u8i2
+ *         column branch); AEE_EINVALIDFORMAT for a shape; AEE_EFAILED when a
+ *         lane's DMA wait ran out of its guard (the output is void); the
+ *         scratch's AEE_ENOMEMORY
+ */
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags);
+
+/** @brief [#225] hexkl_mm_u8i4_fc_m1_run's part limit (HTP_GRAPH_MAX_PARTS). */
+#define HEXKL_FC_M1_MAX_PARTS 32u
 
 /**
  * @brief Take a call of at most 4 rows (M <= 4, at most 16 active experts)
@@ -360,6 +403,24 @@ int hexkl_mm_u8i4_moe_layer_run(
  *         word, so one session serves both kinds of expert. */
 #define HEXKL_MOE_FLAG_GELU_TANH 0x80000u
 
+/**
+ * @brief Bits [23:22] of the flags word (#177; at [20:19] before #4415 took
+ *        bit 19 for GELU_TANH): N - 1, where N is the number of DMA queues
+ *        the M=1 feed splits every weight matrix over. Only the M=1 feed
+ *        reads it; the layer kernel at prefill rows never does.
+ *        0 (N = 1) is #117's single dmlinked ring, unchanged. With N > 1
+ *        each matrix is cut by k-tile rows into min(N, pool lanes)
+ *        contiguous slices, and pool lane i issues slice i on its own
+ *        thread's queue and polls it done before its unit returns, so a
+ *        matrix is complete at the join of the run that carried it (the
+ *        M=1 section comment of hexkl_mm_u8i4_moe.c). No byte changes: the
+ *        same bytes land in the same place, only more engines move them.
+ *        The probe (S26, bypass on): 33.0 / 43.2 / 55.9 GB/s at 1 / 2 / 4
+ *        queues. No build default; the ARM side sends it.
+ */
+#define HEXKL_MOE_DMA_Q_SHIFT 22u
+#define HEXKL_MOE_DMA_Q_BITS 3u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
@@ -367,7 +428,13 @@ int hexkl_mm_u8i4_moe_layer_run(
    HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
-   HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH)
+   HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH |                      \
+   ((uint32_t)HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT))
+
+/** @brief The call's DMA queue count for the M=1 feed, 1..4. */
+static inline uint32_t hexkl_moe_flags_dma_q(uint32_t flags) {
+  return ((flags >> HEXKL_MOE_DMA_Q_SHIFT) & HEXKL_MOE_DMA_Q_BITS) + 1u;
+}
 
 /** @brief The call's l2fetch lead in KB: the flags word when the lead bit
  *         is set, else the build's default. */

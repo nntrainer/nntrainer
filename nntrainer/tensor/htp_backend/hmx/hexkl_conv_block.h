@@ -88,11 +88,14 @@ int hexkl_conv_block_layout_get(uint32_t K, uint32_t C, uint32_t N_out,
  *                       three registered weights, each K x C
  * @param h_out          out_proj, C x N_out
  * @param conv_w         [3 x C] f32: w0 (row t), w1 (t-1), w2 (t-2)
+ * @param hist           [2 x C] f32, the conv input's two rows before row
+ *                       0 -- the previous chunk's state_f32 when the host
+ *                       splits a prefill (#225) -- or NULL for zeros
  * @param act_f32        [M x K], the normed residual
  * @param[out] out_f32   [M x N_out]
- * @param[out] state_f32 [2 x C]: the conv input's rows M-2 and M-1 (zeros
- *                       where M is shorter), the state the CPU decode
- *                       path continues from
+ * @param[out] state_f32 [2 x C]: the conv input's rows M-2 and M-1 (the
+ *                       history's where M is shorter), the state the CPU
+ *                       decode path or the next chunk continues from
  * @param scratch        the session's MoE scratch; grown here as needed
  * @return AEE_SUCCESS, or the first failing stage's code
  */
@@ -100,8 +103,8 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                          uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                          uint32_t K, uint32_t C, uint32_t N_out, uint32_t h_a,
                          uint32_t h_b, uint32_t h_c, uint32_t h_out,
-                         const float *conv_w, const float *act_f32,
-                         float *out_f32, float *state_f32,
+                         const float *conv_w, const float *hist,
+                         const float *act_f32, float *out_f32, float *state_f32,
                          hvx_worker_pool *pool, hexkl_moe_scratch *scratch);
 
 #endif /* __NNTRAINER_HEXKL_CONV_BLOCK_H__ */

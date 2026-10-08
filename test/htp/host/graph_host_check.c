@@ -53,18 +53,30 @@
    m1_swiglu_cpu_det, m1_argmax_first); init's handle refusals; the feed
    word reaching the runner; and the two sessions' complementary masks on
    the LFM2.5 list (each validates, together they are every kind, and
-   their stretches alternate at the MoE hops). run_host_checks.sh then
+   their stretches alternate at the MoE hops).
+
+   [plan 201 S4] Gemma 4 through htp_graph_gemma_build: the 26B-A4B list
+   (30 layers, every kind resident) validates with each layer's record;
+   one layer in the 3-slot plan (htp_graph_desc.h's HTP_GRAPH_N_SLOTS
+   note): its record mutations; QK_NORM at head_dim 256
+   (v norm) and 512 (v norm, k = v) against m1_rmsnorm_det; the FFN stretch
+   (MoE branch on the stand-in, dense GeGLU branch on the REAL GEMV, the
+   branch sum, post norm, layer_scalar) against #4296's order; the
+   262144-row head soft-capped; the soft-cap spec against f64 and its HVX
+   form and the dense GeGLU row bit for bit. run_host_checks.sh then
    builds this file against mutants of hexkl_graph.c, each of which must
    fail it. */
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "attn_m1_det.h"
+#include "hvx_m1_ops_f32.h"
 #include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
@@ -139,6 +151,46 @@ int hexkl_mm_u8i4_moe_layer_run(
       for (c = 0; c < N_out; ++c)
         y[c] += row_weight[r] * (x[c % K] * wsum + (float)c);
     }
+  }
+  return AEE_SUCCESS;
+}
+
+/* [#225] hexkl_mm_u8i4_fc_m1_run's stand-in, the MoE one's way: records
+   its arguments and mixes every part's handle and the input into its
+   output, the parts side by side (the kernel itself is moe_layer_host_
+   check's FC WH cells). */
+typedef struct {
+  const void *tbl, *vtcm, *pool, *scratch;
+  uint32_t vtcm_size, config_off, K, n_parts, flags, n_calls;
+  uint32_t h[HTP_GRAPH_MAX_PARTS];
+} fc_args;
+static fc_args g_fc_last;
+
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  uint32_t p, c, o = 0;
+  fc_args *a = &g_fc_last;
+  a->tbl = tbl;
+  a->vtcm = vtcm_base;
+  a->pool = pool;
+  a->scratch = scratch;
+  a->vtcm_size = vtcm_size;
+  a->config_off = config_off;
+  a->K = K;
+  a->n_parts = n_parts;
+  a->flags = flags;
+  ++a->n_calls;
+  for (p = 0; p < n_parts; ++p) {
+    const uint32_t N = tbl->slots[h[p]].N;
+    a->h[p] = h[p];
+    for (c = 0; c < N; ++c)
+      out_f32[o + c] =
+        act_f32[(c * 7u + p) % K] * (float)(h[p] + 1u) + (float)c;
+    o += N;
   }
   return AEE_SUCCESS;
 }
@@ -246,6 +298,29 @@ static void mut_attn_head_dim_32(uint32_t *w, uint32_t *n) {
   op->gqa = 4u;
   (void)n;
 }
+/* [plan 201 S4] head_dim 128 is a kernel shape now (K = 3072 = (4 + 2) x 4
+   x 128, N = 2048 = 4 x 4 x 128), but 1/sqrt(128) is not an fp16 value:
+   without a scale in eps_bits it is refused; and a scale that is not one */
+static void mut_attn_hd128_no_scale(uint32_t *w, uint32_t *n) {
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  op = htp_graph_op_at(w, nth_op(w, HTP_OP_QK_NORM, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  (void)n;
+}
+static void mut_attn_scale_not_fp16(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2))->eps_bits =
+    0x3DCCCCCDu; /* 0.1f */
+  (void)n;
+}
 static void mut_qk_norm_head_dim_96(uint32_t *w, uint32_t *n) {
   /* K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
      chunk would not be a power of two */
@@ -258,11 +333,24 @@ static void mut_attn_without_rope(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 4))->resident = 0u;
   (void)n;
 }
-static void mut_rmsnorm_k_not_pow2(uint32_t *w, uint32_t *n) {
+static void mut_rmsnorm_k_not_32(uint32_t *w, uint32_t *n) {
   /* the final norm: K == hidden is not a validator rule for RMSNORM, so
-     only the kernel's power-of-two rule can refuse 2048 + 32 */
-  htp_graph_op_at(w, w[3] - 2u)->K = 2080u;
-  htp_graph_op_at(w, w[3] - 2u)->N = 2080u;
+     only the kernel's width rule can refuse 2048 + 24 (plan 201 S4: any
+     multiple of 32 is taken, 2080 included) */
+  htp_graph_op_at(w, w[3] - 2u)->K = 2072u;
+  htp_graph_op_at(w, w[3] - 2u)->N = 2072u;
+  (void)n;
+}
+/* [plan 201 S4] an RMSNORM feed bit other than N1; a softmax router (eps
+   set) norming over its own input slot */
+static void mut_rmsnorm_feed_2(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 2))->feed = 2u;
+  (void)n;
+}
+static void mut_softmax_router_in_is_out(uint32_t *w, uint32_t *n) {
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 1));
+  op->eps_bits = 0x358637BDu; /* 1e-6f */
+  op->out_slot = op->in_slot;
   (void)n;
 }
 /* #132: the residual add's and the router's rules */
@@ -275,7 +363,9 @@ static void mut_router_moe_cpu(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_add_out_slot_1(uint32_t *w, uint32_t *n) {
-  htp_graph_op_at(w, nth_op(w, HTP_OP_ADD, 3))->out_slot = 1u;
+  /* [plan 201 S4] any out slot but the in slot (Gemma's branch sum) */
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ADD, 3));
+  op->out_slot = op->in_slot;
   (void)n;
 }
 static void mut_truncated(uint32_t *w, uint32_t *n) {
@@ -326,12 +416,20 @@ static const struct {
    HTP_GRAPH_E_NOTALLOWED},
   {"QK_NORM resident at head_dim 96", mut_qk_norm_head_dim_96,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
-  {"RMSNORM resident at K 2080", mut_rmsnorm_k_not_pow2,
+  {"ATTN_M1 resident at head_dim 128, no scale", mut_attn_hd128_no_scale,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ATTN_M1 scale 0.1 (not fp16)", mut_attn_scale_not_fp16,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"RMSNORM resident at K 2072", mut_rmsnorm_k_not_32,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"RMSNORM feed 2 (only N1 is a norm bit)", mut_rmsnorm_feed_2,
+   HTP_GRAPH_E_INVALIDFORMAT},
+  {"softmax ROUTER_TOPK in_slot == out_slot", mut_softmax_router_in_is_out,
+   HTP_GRAPH_E_INVALIDFORMAT},
   {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
   {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,
    HTP_GRAPH_E_NOTALLOWED},
-  {"ADD out_slot 1", mut_add_out_slot_1, HTP_GRAPH_E_INVALIDFORMAT},
+  {"ADD out_slot == in_slot", mut_add_out_slot_1, HTP_GRAPH_E_INVALIDFORMAT},
 };
 
 static void check_validator(void) {
@@ -430,54 +528,6 @@ static void check_validator(void) {
         "error code values drifted from AEEStdErr.h");
   CHECK(hexkl_graph_resident_kinds() == HTP_GRAPH_KINDS_ALL,
         "kernel table: resident kinds 0x%x", hexkl_graph_resident_kinds());
-
-  /* #132 Part B: the same list for two sessions, complementary masks */
-  {
-    static uint32_t s1[sizeof(w) / sizeof(w[0])], s2[sizeof(w) / sizeof(w[0])];
-    uint32_t n_s1 = 0, n_s2 = 0, hops = 0, bad = 0;
-    n = build(w, cap, &kLfm25, kLfm25Layers, HTP_GRAPH_KINDS_ALL);
-    rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "LFM2.5 all kinds: %s", htp_graph_err_name(rc));
-    memcpy(s1, w, n * sizeof(uint32_t));
-    memcpy(s2, w, n * sizeof(uint32_t));
-    htp_graph_set_resident(s1, HTP_GRAPH_KINDS_S1);
-    htp_graph_set_resident(s2, HTP_GRAPH_KINDS_S2);
-    CHECK((HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KINDS_S2) == 0u &&
-            (HTP_GRAPH_KINDS_S1 | HTP_GRAPH_KINDS_S2) == HTP_GRAPH_KINDS_ALL,
-          "masks do not partition the kinds");
-    rc = htp_graph_validate(s1, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "S1 mask: %s", htp_graph_err_name(rc));
-    rc = htp_graph_validate(s2, n, HTP_GRAPH_KINDS_ALL, NULL);
-    CHECK(rc == 0u, "S2 mask: %s", htp_graph_err_name(rc));
-    /* every op resident in exactly one session; S1's stretches are
-       exactly [ROUTER_TOPK MOE] and each is a hop between two of S2's */
-    for (i = 0; i < n_ops; ++i) {
-      const htp_graph_op *a = htp_graph_op_cat(s1, i),
-                         *b = htp_graph_op_cat(s2, i);
-      const int starts_s1 =
-        a->resident && (i == 0u || !htp_graph_op_cat(s1, i - 1u)->resident);
-      const int starts_s2 =
-        b->resident && (i == 0u || !htp_graph_op_cat(s2, i - 1u)->resident);
-      bad += a->resident == b->resident;
-      if (starts_s1) {
-        ++n_s1;
-        bad += a->kind != HTP_OP_ROUTER_TOPK || i + 2u >= n_ops ||
-               htp_graph_op_cat(s1, i + 1u)->kind != HTP_OP_MOE ||
-               htp_graph_op_cat(s1, i + 2u)->resident;
-      }
-      n_s2 += starts_s2;
-      hops += (starts_s1 || starts_s2) && i != 0u;
-    }
-    CHECK(bad == 0u && n_s1 == 22u && n_s2 == 23u && hops == 44u &&
-            htp_graph_op_cat(s2, 0)->resident &&
-            htp_graph_op_cat(s2, n_ops - 1u)->resident,
-          "session split: bad=%u S1 stretches=%u S2 stretches=%u hops=%u", bad,
-          n_s1, n_s2, hops);
-    printf("GRAPH SESSION MASKS OK: S1=%s S2 = the other %u kinds; LFM2.5 "
-           "S2 stretches=%u S1 stretches=%u hops/token=%u\n",
-           htp_graph_kinds_str(HTP_GRAPH_KINDS_S1, names, sizeof(names)),
-           HTP_OP_KIND_N - 2u, n_s2, n_s1, hops);
-  }
 }
 
 /* ---- forward half ------------------------------------------------------ */
@@ -490,16 +540,26 @@ static void register_weight(uint32_t h, uint32_t K, uint32_t N) {
   g_tbl.slots[h].K = K;
   g_tbl.slots[h].N = N;
 }
+/** @brief [plan 201 S1] Binds MoE op @a op's EXPERTS table: h_gu[0..E)
+ *  then h_dn[0..E), as graph_set_param's f32 words. */
+static int set_experts(hexkl_graph *g, uint32_t op, const uint32_t *h_gu,
+                       const uint32_t *h_dn, uint32_t E) {
+  float t[2u * HTP_GRAPH_MAX_EXPERTS];
+  memcpy(t, h_gu, E * sizeof(uint32_t));
+  memcpy(t + E, h_dn, E * sizeof(uint32_t));
+  return hexkl_graph_set_param(g, op, HTP_GRAPH_PARAM_EXPERTS, t, 2u * E);
+}
+
 /* Layer l's expert e: gate_up handle 10 + 40 l + e, down 30 + 40 l + e. */
-static void bind_tiny(uint32_t *w) {
+static uint32_t g_tiny_gu[2][4], g_tiny_dn[2][4];
+static void bind_tiny(void) {
   uint32_t l, e;
   for (l = 0; l < 2u; ++l) {
-    htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, l));
     for (e = 0; e < 4u; ++e) {
-      op->h_gu[e] = 10u + 40u * l + e;
-      op->h_dn[e] = 30u + 40u * l + e;
-      register_weight(op->h_gu[e], 64u, 128u);
-      register_weight(op->h_dn[e], 64u, 64u);
+      g_tiny_gu[l][e] = 10u + 40u * l + e;
+      g_tiny_dn[l][e] = 30u + 40u * l + e;
+      register_weight(g_tiny_gu[l][e], 64u, 128u);
+      register_weight(g_tiny_dn[l][e], 64u, 64u);
     }
   }
 }
@@ -569,31 +629,51 @@ static void check_forward(void) {
   }
   printf("GRAPH FORWARD IDENTITY OK (22 start ops, no op resident)\n");
 
-  /* (2) MOE resident: init refuses a free or mis-shaped handle */
+  /* (2) MOE resident: the handles are each op's EXPERTS table (plan 201
+     S1), bound after init and checked there, not in the record */
   n = build(w, cap, &kTiny, "AC", resident_ok);
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE && g == NULL, "unbound handles: %s",
-        htp_graph_err_name(rc));
-  bind_tiny(w);
-  htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, 1))->h_dn[2] = 7u; /* free slot */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "free handle: %s", htp_graph_err_name(rc));
-  printf("  missing weight handle                     -> %s (0x%x)\n",
-         htp_graph_err_name(rc), rc);
-  bind_tiny(w);
-  g_tbl.slots[31].N = 96u; /* layer 0 expert 1's down: inter differs */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "mis-shaped handle: %s",
-        htp_graph_err_name(rc));
-  printf("  weight handle of another shape            -> %s (0x%x)\n",
-         htp_graph_err_name(rc), rc);
-  g_tbl.slots[31].N = 64u;
+  bind_tiny();
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "init (MOE resident): %s",
         htp_graph_err_name(rc));
   if (g == NULL)
     return;
   CHECK(g->slot_words == 64u, "slot_words %u", g->slot_words);
+  {
+    const uint32_t m0 = nth_op(w, HTP_OP_MOE, 0), m1 = nth_op(w, HTP_OP_MOE, 1);
+    rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act,
+                                       64u, out, 64u, &resume);
+    CHECK(rc == HTP_GRAPH_E_BADSTATE, "no EXPERTS table: %s",
+          htp_graph_err_name(rc));
+    printf("  MOE op with no EXPERTS table              -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tiny_dn[1][2] = 7u; /* a free slot */
+    rc = (uint32_t)set_experts(g, m1, g_tiny_gu[1], g_tiny_dn[1], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVHANDLE, "free handle: %s",
+          htp_graph_err_name(rc));
+    printf("  missing weight handle                     -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tiny_dn[1][2] = 72u;
+    g_tbl.slots[31].N = 96u; /* layer 0 expert 1's down: inter differs */
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVHANDLE, "mis-shaped handle: %s",
+          htp_graph_err_name(rc));
+    printf("  weight handle of another shape            -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tbl.slots[31].N = 64u;
+    CHECK(g->experts[m0] == NULL && g->experts[m1] == NULL,
+          "a refused table was stored");
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 3u);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "EXPERTS length: %s",
+          htp_graph_err_name(rc));
+    rc = (uint32_t)set_experts(g, nth_op(w, HTP_OP_RMSNORM, 0), g_tiny_gu[0],
+                               g_tiny_dn[0], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "EXPERTS on a norm: %s",
+          htp_graph_err_name(rc));
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 4u) |
+         (uint32_t)set_experts(g, m1, g_tiny_gu[1], g_tiny_dn[1], 4u);
+    CHECK(rc == 0u, "EXPERTS bind: %s", htp_graph_err_name(rc));
+  }
   CHECK(hexkl_graph_uses_handle(g, 10u) && hexkl_graph_uses_handle(g, 53u) &&
           !hexkl_graph_uses_handle(g, 7u) && !hexkl_graph_uses_handle(g, 99u),
         "uses_handle");
@@ -603,13 +683,12 @@ static void check_forward(void) {
     env.moe_flags = flag_cases[f];
     for (l = 0; l < 2u; ++l) {
       const uint32_t start = nth_op(w, HTP_OP_MOE, l);
-      const htp_graph_op *op = htp_graph_op_cat(w, start);
       moe_args direct;
       uint32_t j;
       hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
-                                  64u, 64u, 4u, op->h_gu, op->h_dn, row_index,
-                                  row_count, row_weight, act, ref, env.pool,
-                                  &g_scratch, env.moe_flags);
+                                  64u, 64u, 4u, g_tiny_gu[l], g_tiny_dn[l],
+                                  row_index, row_count, row_weight, act, ref,
+                                  env.pool, &g_scratch, env.moe_flags);
       direct = g_last;
       memset(out, 0, sizeof(out));
       memset(&g_last, 0, sizeof(g_last));
@@ -681,10 +760,199 @@ static void check_forward(void) {
     rc = (uint32_t)hexkl_graph_forward(g, &env, start - 1u, 1000u, 0u, &routing,
                                        act, 64u, out, 4u, &resume);
     CHECK(rc == 0u && resume == start - 1u, "router op is not resident");
+    /* [plan 201 S1] a pool that does not hold experts 0 and 2 still runs
+       a token routed to 1 and 3, with the full table's bits; one that
+       does not hold 3 refuses it */
+    {
+      uint32_t gu[4], dn[4];
+      memcpy(gu, g_tiny_gu[0], sizeof(gu));
+      memcpy(dn, g_tiny_dn[0], sizeof(dn));
+      gu[0] = dn[0] = gu[2] = dn[2] = HTP_GRAPH_NO_HANDLE;
+      rc = (uint32_t)set_experts(g, start, gu, dn, 4u);
+      CHECK(rc == 0u, "EXPERTS with holes: %s", htp_graph_err_name(rc));
+      env.moe_flags = 0u;
+      hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
+                                  64u, 64u, 4u, g_tiny_gu[0], g_tiny_dn[0],
+                                  row_index, row_count, row_weight, act, ref,
+                                  env.pool, &g_scratch, 0u);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, start, 1000u, 0u, &routing,
+                                         act, 64u, out, 64u, &resume);
+      CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0,
+            "holes on unrouted experts: %s", htp_graph_err_name(rc));
+      dn[3] = HTP_GRAPH_NO_HANDLE;
+      rc = (uint32_t)set_experts(g, start, gu, dn, 4u);
+      CHECK(rc == 0u, "EXPERTS with a routed hole: %s", htp_graph_err_name(rc));
+      rc = (uint32_t)hexkl_graph_forward(g, &env, start, 1000u, 0u, &routing,
+                                         act, 64u, out, 64u, &resume);
+      CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed to a non-resident expert: %s",
+            htp_graph_err_name(rc));
+      CHECK(!hexkl_graph_uses_handle(g, 10u) && hexkl_graph_uses_handle(g, 11u),
+            "uses_handle follows the table");
+    }
   }
   hexkl_graph_free(g);
   hexkl_graph_free(NULL);
   printf("GRAPH FORWARD REFUSALS OK\n");
+}
+
+/* ---- limits half (plan 201 S1): sized for Gemma-4-26B-A4B -------------- */
+/* A miss round answered at once: every missing odd expert e loaded on the
+   pair 3000 + e / 3200 + e, the order of events recorded. */
+typedef struct {
+  uint32_t posts, waits, kernel_calls_at_post;
+  uint32_t miss[HEXKL_GRAPH_MISS_MAX], n_miss;
+} fake_owner;
+static fake_owner g_owner;
+static int fake_post(void *ctx, uint32_t op, const uint32_t *routed,
+                     uint32_t n_routed, const uint32_t *miss, uint32_t n_miss) {
+  (void)ctx, (void)op, (void)routed, (void)n_routed;
+  ++g_owner.posts;
+  memcpy(g_owner.miss, miss, n_miss * sizeof(uint32_t));
+  g_owner.n_miss = n_miss;
+  return AEE_SUCCESS;
+}
+static int fake_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
+  uint32_t i;
+  int rc = AEE_SUCCESS;
+  (void)ctx;
+  ++g_owner.waits;
+  for (i = 0; rc == AEE_SUCCESS && i < g_owner.n_miss; ++i)
+    rc = hexkl_graph_pool_set(g, op, g_owner.miss[i], 3000u + g_owner.miss[i],
+                              3200u + g_owner.miss[i]);
+  return rc;
+}
+
+static void check_limits(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  /* 60 conv layers, 128 experts, top-8: 60 x 9 + 2 = 542 ops, over the
+     256 before; the handles at the top of the 4096-entry table */
+  static const htp_graph_lfm2_shape big = {60, 0, 64, 64, 64, 128,  8,
+                                           8,  4, 8,  32, 8,  1e-6f};
+  char layers[61];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  static const uint32_t routed[8] = {2u, 6u, 18u, 40u, 64u, 90u, 100u, 126u};
+  uint32_t gu[128], dn[128], row_count[128], row_index[8], e, n, rc, m0, resume,
+    seed = 201u;
+  float row_weight[8], act[64], out[64], ref[64];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  hexkl_graph_routing routing;
+
+  memset(layers, 'C', 60);
+  layers[60] = '\0';
+  n = build(w, cap, &big, layers, HTP_GRAPH_KIND_BIT(HTP_OP_MOE));
+  CHECK(n != 0u && w[3] == 542u, "60-layer build: %u words, %u ops", n, w[3]);
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == 0u, "542 ops x 128 experts: %s", htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 1u;
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == HTP_GRAPH_E_SCHEMENOTSUPPORTED,
+        "resident router over 128 experts: %s", htp_graph_err_name(rc));
+  /* [plan 201 S4] the softmax router (eps set) takes 128 */
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0x358637BDu;
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == 0u, "resident softmax router over 128 experts: %s",
+        htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0u;
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 0u;
+
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "init 542 ops: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  m0 = nth_op(w, HTP_OP_MOE, 0);
+  /* the pool holds the even experts only */
+  for (e = 0; e < 128u; ++e) {
+    gu[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3969u + e;
+    dn[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3840u + e;
+    if (!(e & 1u)) {
+      register_weight(gu[e], 64u, 128u);
+      register_weight(dn[e], 64u, 64u);
+    }
+    row_count[e] = 0u;
+  }
+  rc = (uint32_t)set_experts(g, m0, gu, dn, 128u);
+  CHECK(rc == 0u && gu[126] == HEXKL_MM_U8I4_MAX_WEIGHTS - 1u,
+        "EXPERTS 128 up to the last handle: %s", htp_graph_err_name(rc));
+  for (e = 0; e < 8u; ++e) {
+    row_count[routed[e]] = 1u;
+    row_index[e] = 0u;
+    row_weight[e] = 0.125f * (float)(e + 1u);
+  }
+  for (e = 0; e < 64u; ++e)
+    act[e] = frand(&seed);
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u, 64u,
+                              64u, 128u, gu, dn, row_index, row_count,
+                              row_weight, act, ref, env.pool, &g_scratch, 0u);
+  routing.row_index = row_index;
+  routing.row_count = row_count;
+  routing.row_weight = row_weight;
+  routing.n_rows = 8u;
+  routing.n_experts = 128u;
+  rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act, 64u,
+                                     out, 64u, &resume);
+  CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0 &&
+          g_last.n_experts == 128u,
+        "128 experts, top-8, half the pool: %s", htp_graph_err_name(rc));
+  row_count[routed[7]] = 0u;
+  row_count[127] = 1u; /* odd: not in the pool */
+  routing.n_experts = 128u;
+  rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act, 64u,
+                                     out, 64u, &resume);
+  CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed outside the pool: %s",
+        htp_graph_err_name(rc));
+  /* the miss round (plan 201 S1): top-8 over experts 2, 5, 6, 9, 40, 63,
+     64, 126 -- misses 5, 9, 63 after a hit, in the middle and late -- equals
+     the direct call on the loaded table bit for bit */
+  {
+    static const uint32_t rt[8] = {2u, 5u, 6u, 9u, 40u, 63u, 64u, 126u};
+    uint32_t full_gu[128], full_dn[128], k;
+    for (e = 0; e < 128u; ++e) {
+      row_count[e] = 0u;
+      if (e & 1u) {
+        register_weight(3000u + e, 64u, 128u);
+        register_weight(3200u + e, 64u, 64u);
+      }
+      full_gu[e] = (e & 1u) ? 3000u + e : gu[e];
+      full_dn[e] = (e & 1u) ? 3200u + e : dn[e];
+    }
+    for (k = 0; k < 8u; ++k)
+      row_count[rt[k]] = 1u;
+    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
+                                64u, 64u, 128u, full_gu, full_dn, row_index,
+                                row_count, row_weight, act, ref, env.pool,
+                                &g_scratch, 0u);
+    env.miss.post = fake_post;
+    env.miss.wait = fake_wait;
+    memset(&g_owner, 0, sizeof(g_owner));
+    routing.n_experts = 128u;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act,
+                                       64u, out, 64u, &resume);
+    CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0 &&
+            g_owner.posts == 1u && g_owner.waits == 1u && g_owner.n_miss == 3u,
+          "miss round: %s posts %u waits %u misses %u", htp_graph_err_name(rc),
+          g_owner.posts, g_owner.waits, g_owner.n_miss);
+    CHECK(g->experts[m0][5] == 3005u && g->experts[m0][128u + 63u] == 3263u,
+          "the answer did not reach the table");
+    CHECK(g->route_log_n >= 9u && g->route_log[g->route_log_n - 9u] == 8u &&
+            g->route_log[g->route_log_n - 1u] == 126u,
+          "route log");
+    env.miss.post = NULL;
+    env.miss.wait = NULL;
+  }
+  hexkl_graph_free(g);
+  printf("GRAPH LIMITS OK: 542 ops, 128 experts top-8, handles up to %u, a "
+         "pool of the even experts bit-identical to the direct call; a miss "
+         "round (3 of 8 routed missing) bit-identical to the loaded table\n",
+         gu[126]);
 }
 
 /* ---- stretch half (#130): the real kernels vs the scalar specs --------- */
@@ -843,7 +1111,9 @@ static void check_stretches(void) {
   fill(cs, MAX_SEQ * HD, &seed);
   rc = (uint32_t)hexkl_graph_set_param(g, op_qk, HTP_GRAPH_PARAM_ROPE_TABLE, cs,
                                        MAX_SEQ * HD);
-  CHECK(rc == (uint32_t)AEE_EBADITEM, "rope table on an op: %s",
+  /* [plan 201 S4] a ROPE op may hold its own table; any other kind takes
+     none, the length rule every other parameter has */
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "rope table on a QK_NORM op: %s",
         htp_graph_err_name(rc));
   rc = (uint32_t)hexkl_graph_set_param(
     g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, cs, MAX_SEQ * HD);
@@ -937,20 +1207,25 @@ static void check_stretches(void) {
 
 /* hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
    250 + 10 m + e (the tiny fixture's handles stay 10..73). */
+/* MoE op m's expert e: gate_up 200 + 10 m + e, down 250 + 10 m + e */
+static uint32_t g_hd64_gu[2][HD64_E], g_hd64_dn[2][HD64_E];
 static void bind_hd64(uint32_t *w) {
   uint32_t m, e;
+  (void)w;
   for (m = 0; m < 2u; ++m) {
-    htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, m));
     for (e = 0; e < HD64_E; ++e) {
-      op->h_gu[e] = 200u + 10u * m + e;
-      op->h_dn[e] = 250u + 10u * m + e;
-      register_weight(op->h_gu[e], HID, 2u * HD64_INTER);
-      register_weight(op->h_dn[e], HD64_INTER, HID);
+      g_hd64_gu[m][e] = 200u + 10u * m + e;
+      g_hd64_dn[m][e] = 250u + 10u * m + e;
+      register_weight(g_hd64_gu[m][e], HID, 2u * HD64_INTER);
+      register_weight(g_hd64_dn[m][e], HD64_INTER, HID);
     }
   }
 }
 
-static void check_add_router(void) {
+/* [plan 201 S4] gemma: the same stretch with the router op made Gemma's
+   softmax router (eps_bits set, ROUTER_BIAS = g | per-expert scale) and
+   the norm before it on N1 (feed HTP_GRAPH_NORM_N1). */
+static void check_add_router(int gemma) {
   static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
   const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
@@ -959,7 +1234,9 @@ static void check_add_router(void) {
   uint32_t n, rc, resume, seed = 132u, i, e, r, nr = 0;
   static float x[HID], a[HID], a2[HID], out[HID], ref[HID], h[HID], nrm[HID];
   static float gam[4][HID], rw[HID * HD64_E], moe[HID];
-  float rbias[HD64_E], lg[HD64_E], wt[HD64_TOP];
+  static float rbias[HID + HD64_E], rsc[HID];
+  float lg[HD64_E], wt[HD64_TOP];
+  const uint32_t n_bias = gemma ? HID + HD64_E : HD64_E;
   uint32_t sel[HD64_TOP], r_idx[HD64_TOP], r_cnt[HD64_E] = {0};
   float r_w[HD64_TOP], by_e[HD64_E];
   uint32_t op_norm[4], op_add0, op_add1, op_router;
@@ -976,10 +1253,20 @@ static void check_add_router(void) {
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);
+  if (gemma) {
+    memcpy(&htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits,
+           &kHd64.eps, sizeof(float));
+    htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 3))->feed = HTP_GRAPH_NORM_N1;
+  }
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
   if (g == NULL)
     return;
+  for (i = 0; i < 2u; ++i) {
+    rc = (uint32_t)set_experts(g, nth_op(w, HTP_OP_MOE, i), g_hd64_gu[i],
+                               g_hd64_dn[i], HD64_E);
+    CHECK(rc == 0u, "hd64 EXPERTS %u: %s", i, htp_graph_err_name(rc));
+  }
   /* layer 0's norms (0, 5), layer 1's ffn norm (15), layer 2's operator
      norm (19); layer 0's ffn-side ADD (4) and layer 1's first ADD (14) */
   op_norm[0] = nth_op(w, HTP_OP_RMSNORM, 0);
@@ -1007,6 +1294,11 @@ static void check_add_router(void) {
   fill(a2, HID, &seed);
   fill(rw, HID * HD64_E, &seed);
   fill(rbias, HD64_E, &seed);
+  if (gemma) { /* g from a router_scale, then the per-expert scale */
+    fill(rsc, HID, &seed);
+    m1_router_input_scale_det(rsc, HID, rbias);
+    fill(rbias + HID, HD64_E, &seed);
+  }
 
   /* (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
      ran first and moved slot 0; op 0 below re-seeds it) */
@@ -1028,7 +1320,7 @@ static void check_add_router(void) {
                                        rw, HID * HD64_E);
   CHECK(rc == 0u, "set router W: %s", htp_graph_err_name(rc));
   rc = (uint32_t)hexkl_graph_set_param(
-    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, HD64_E);
+    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, n_bias);
   CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
 
   /* (2) op 0 seeds slot 0 with the embedding row x */
@@ -1050,6 +1342,21 @@ static void check_add_router(void) {
   check_pcycles(g, op_add0, op_norm[1] + 1u, "[ADD RMSNORM]");
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
 
+  if (gemma) {
+    /* an a2 whose row N1 norms to another r than the f32 norm does, so the
+       stretch tells the two apart (they agree on many rows) */
+    static float t1[HID], t2[HID];
+    int differs = 0;
+    for (r = 0; r < 64u && !differs; ++r) {
+      fill(a2, HID, &seed);
+      for (i = 0; i < HID; ++i)
+        t1[i] = m1_det_add(h[i], a2[i]);
+      differs = m1_rmsnorm_n1_chunk_det(t1, gam[2], t2, HID, kHd64.eps) !=
+                m1_rmsnorm_chunk_det(t1, gam[2], t2, HID, kHd64.eps);
+    }
+    CHECK(differs, "no a2 in 64 rows tells N1 from the f32 norm");
+  }
+
   /* (4) [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM], slot 0 carried over:
      h = s0 + a2, n = rmsnorm(h), routing = router_topk_det(n),
      h2 = h + standin(n, routing), out = rmsnorm(h2) */
@@ -1060,8 +1367,16 @@ static void check_add_router(void) {
         htp_graph_err_name(rc), resume);
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], a2[i]);
-  m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
-  m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  if (gemma) {
+    static float xs[HID];
+    m1_rmsnorm_n1_chunk_det(h, gam[2], nrm, HID, kHd64.eps);
+    m1_rmsnorm_det(nrm, rbias, xs, HID, HID, kHd64.eps, NULL);
+    m1_router_softmax_det(xs, rw, rbias + HID, HID, HD64_E, HD64_TOP, lg, sel,
+                          wt);
+  } else {
+    m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
+    m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  }
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
     by_e[sel[r]] = wt[r];
@@ -1075,13 +1390,10 @@ static void check_add_router(void) {
   CHECK(g_last.n_calls == 1u &&
           memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
         "the MOE op did not get the router's routing");
-  {
-    const htp_graph_op *mo = &g->ops[op_router + 1u];
-    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
-                                HD64_INTER, HID, HD64_E, mo->h_gu, mo->h_dn,
-                                r_idx, r_cnt, r_w, nrm, moe, env.pool,
-                                &g_scratch, 0u);
-  }
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
+                              HD64_INTER, HID, HD64_E, g_hd64_gu[0],
+                              g_hd64_dn[0], r_idx, r_cnt, r_w, nrm, moe,
+                              env.pool, &g_scratch, 0u);
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], moe[i]);
   m1_rmsnorm_det(h, gam[3], ref, HID, HID, kHd64.eps, NULL);
@@ -1092,13 +1404,14 @@ static void check_add_router(void) {
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
   hexkl_graph_free(g);
   if (err == 0)
-    printf("GRAPH STRETCH BIT-IDENTICAL: ADD+RMSNORM "
+    printf("GRAPH STRETCH BIT-IDENTICAL%s: ADD+RMSNORM "
            "ADD+RMSNORM+ROUTER_TOPK+MOE+ADD+RMSNORM (hd64 shape, MOE on the "
-           "stand-in, slot 0 carried across calls, resume_at the next FC)\n");
+           "stand-in, slot 0 carried across calls, resume_at the next FC)\n",
+           gemma ? " (Gemma softmax router, N1 norm before it)" : "");
 }
 
 /* ---- #132 Part B: the Q4M1 kinds against the CPU-order specs ---------- */
-#define Q_SLOTS 16u
+#define Q_SLOTS 32u
 static uint8_t *g_qw[Q_SLOTS]; /* Q4M1 bytes the host runner reads */
 static uint8_t *g_qc[Q_SLOTS]; /* the same weight, canonical block_q4_0 */
 static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
@@ -1399,9 +1712,9 @@ static void check_q4m1(void) {
     rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
     CHECK(rc == 0u, "native feed bit refused: %s", htp_graph_err_name(rc));
     err |= rc != 0u;
-    htp_graph_op_at(w, ffn)->feed = keep | (1u << 17);
+    htp_graph_op_at(w, ffn)->feed = keep | (1u << 18);
     rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
-    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "feed bit 17 taken: %s",
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "feed bit 18 taken: %s",
           htp_graph_err_name(rc));
     err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
     htp_graph_op_at(w, ffn)->feed = keep;
@@ -1441,7 +1754,7 @@ static void check_q4m1(void) {
     if (nerr == 0)
       printf("GRAPH Q4M1 NATIVE BIT-IDENTICAL: FC q|k|v DENSE_FFN "
              "RMSNORM+LM_HEAD with HTP_GRAPH_FEED_NATIVE vs "
-             "q4_gemv_native_det (bit 17 refused)\n");
+             "q4_gemv_native_det (bit 18 refused)\n");
   }
   g_native = 0;
   hexkl_graph_free(g);
@@ -1453,12 +1766,924 @@ static void check_q4m1(void) {
            "m1_argmax_first (hd64 shape, the real HVX kernel on hvx_emu)\n");
 }
 
+/* ---- [#225] FC and DENSE_FFN on WH handles (HTP_GRAPH_FEED_WH) -------- */
+/* The hd64 list with every kind resident, its FC and DENSE_FFN ops bound to
+   u8i4 handles of the session's table (the FC WH sidecar's on the device)
+   and the LM_HEAD left on Q4M1: the validator's bit rules, init's handle
+   checks, uses_handle / uses_q4m1, and that forward hands each kernel
+   exactly what the prefill path hands it -- an FC its parts in order on
+   one call, a DENSE_FFN its chunks as experts of weight 1 at M = 1 (the
+   kernels themselves are moe_layer_host_check's). */
+static void check_wh(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  htp_graph_lfm2_shape shape = kHd64;
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  static float x[HID], out[3u * HID], ref[3u * HID];
+  uint32_t n, n_v, rc, resume, i, fc_qkv, ffn, lm, h = 2u, seed = 0x225u;
+  htp_graph_op *op;
+  int err = 0;
+
+  shape.vocab = 64u;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  env.fc = host_fc;
+  env.moe_flags = 0x703e1u; /* the session default the E2E log prints */
+  n = build(w, cap, &shape, "CAC", HTP_GRAPH_KINDS_ALL);
+  bind_hd64(w);
+  fc_qkv = nth_op(w, HTP_OP_FC, 2);
+  ffn = nth_op(w, HTP_OP_DENSE_FFN, 0);
+  lm = nth_op(w, HTP_OP_LM_HEAD, 0);
+  /* WH handles 2..9 (the FC parts) sit in the Q4M1 slots' number range,
+     so uses_q4m1 below must skip WH ops, not just miss their numbers */
+  for (i = 0; i < w[3]; ++i) {
+    op = htp_graph_op_at(w, i);
+    if (op->kind != HTP_OP_FC)
+      continue;
+    op->feed = HTP_GRAPH_FEED_WH;
+    if (i == fc_qkv) {
+      register_weight(h, HID, 128u);
+      register_weight(h + 1u, HID, 64u);
+      register_weight(h + 2u, HID, 64u);
+      op->h_gu[0] = h;
+      op->h_gu[1] = h + 1u;
+      op->h_gu[2] = h + 2u;
+      op->n_experts = 3u;
+      h += 3u;
+    } else {
+      register_weight(h, op->K, op->N);
+      op->h_gu[0] = h++;
+      op->n_experts = 1u;
+    }
+  }
+  op = htp_graph_op_at(w, ffn); /* inter 64 in 2 chunks of 32 */
+  op->feed = HTP_GRAPH_FEED_WH;
+  for (i = 0; i < 2u; ++i) {
+    register_weight(100u + i, HID, 64u);
+    register_weight(102u + i, 32u, HID);
+    op->h_gu[i] = 100u + i;
+    op->h_dn[i] = 102u + i;
+  }
+  op->n_experts = 2u;
+  op = htp_graph_op_at(w, lm); /* stays Q4M1: slots 0, 1 */
+  q_register(0u, HID, 32u, &seed);
+  q_register(1u, HID, 32u, &seed);
+  op->h_gu[0] = 0u;
+  op->h_gu[1] = 1u;
+  op->n_experts = 2u;
+  CHECK(h == 10u, "hd64 WH FC parts %u", h - 2u);
+
+  /* the validator: WH on FC / DENSE_FFN, never on LM_HEAD */
+  rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+  CHECK(rc == 0u, "WH list: %s", htp_graph_err_name(rc));
+  err |= rc != 0u;
+  op->feed = HTP_GRAPH_FEED_WH;
+  rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+  CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "WH LM_HEAD: %s",
+        htp_graph_err_name(rc));
+  err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
+  op->feed = 0u;
+  /* init: a part of another K, parts short of N, a down of another shape,
+     no chunk, a free part handle, a 2-bit part */
+  op = htp_graph_op_at(w, fc_qkv);
+  register_weight(op->h_gu[1], 64u, 64u);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  register_weight(op->h_gu[1], HID, 64u);
+  op->n_experts = 2u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->n_experts = 3u;
+  op = htp_graph_op_at(w, ffn);
+  op->h_dn[1] = op->h_gu[1];
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->h_dn[1] = 103u;
+  op->n_experts = 0u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE;
+  op->n_experts = 2u;
+  g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 0;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  err |= rc != HTP_GRAPH_E_INVHANDLE || g != NULL;
+  g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]].in_use = 1;
+  /* [#234 P4] a 2-bit FC part: the kernel refuses it, so init does */
+  {
+    hexkl_weight_u8i4 *s2 = &g_tbl.slots[htp_graph_op_cat(w, fc_qkv)->h_gu[2]];
+    const uint32_t bits = s2->bits;
+    s2->bits = 2u;
+    rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+    err |= rc != HTP_GRAPH_E_INVHANDLE || g != NULL;
+    s2->bits = bits;
+  }
+  CHECK(err == 0, "WH init refusals");
+  htp_graph_op_at(w, fc_qkv)->feed |= HTP_GRAPH_FEED_L2; /* arena read */
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "WH init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(hexkl_graph_uses_handle(g, 3u) && hexkl_graph_uses_handle(g, 103u) &&
+          !hexkl_graph_uses_handle(g, 104u) && !hexkl_graph_uses_q4m1(g, 2u) &&
+          hexkl_graph_uses_q4m1(g, 1u),
+        "uses_handle / uses_q4m1 with WH ops");
+  err |= !hexkl_graph_uses_handle(g, 3u) || hexkl_graph_uses_q4m1(g, 2u);
+
+  /* [FC q|k|v] one call, the parts in order, the L2 bit as feed off */
+  fill(x, HID, &seed);
+  memset(&g_fc_last, 0, sizeof(g_fc_last));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fc_qkv, 1u, 0u, NULL, x, HID, out,
+                                     256u, &resume);
+  {
+    const fc_args got = g_fc_last; /* before the reference call below */
+    const uint32_t f =
+      (0x703e1u | HEXKL_MOE_FLAG_GEMV_FEED_SET) & ~HEXKL_MOE_FLAG_GEMV_FEED;
+    op = &g->ops[fc_qkv];
+    (void)hexkl_mm_u8i4_fc_m1_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, HID, 3u,
+                                  op->h_gu, x, ref, env.pool, &g_scratch, f);
+    const int ok = rc == 0u && resume == fc_qkv + 1u && got.n_calls == 1u &&
+                   got.K == HID && got.n_parts == 3u && got.h[0] == 2u + 2u &&
+                   got.h[2] == 2u + 4u && got.flags == f && got.tbl == &g_tbl &&
+                   got.vtcm == g_vtcm && got.scratch == &g_scratch &&
+                   memcmp(out, ref, 256u * sizeof(float)) == 0;
+    CHECK(ok, "[FC q|k|v WH]: %s calls %u parts %u flags 0x%x",
+          htp_graph_err_name(rc), got.n_calls, got.n_parts, got.flags);
+    err |= !ok;
+  }
+  /* [DENSE_FFN] the chunks as experts of weight 1, M = 1 */
+  {
+    const uint32_t idx[2] = {0u, 0u}, cnt[2] = {1u, 1u};
+    const float wt[2] = {1.0f, 1.0f};
+    memset(&g_last, 0, sizeof(g_last));
+    rc = (uint32_t)hexkl_graph_forward(g, &env, ffn, 1u, 0u, NULL, x, HID, out,
+                                       HID, &resume);
+    const moe_args got = g_last;
+    op = &g->ops[ffn];
+    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
+                                32u, HID, 2u, op->h_gu, op->h_dn, idx, cnt, wt,
+                                x, ref, env.pool, &g_scratch, 0x703e1u);
+    const int ok = rc == 0u && resume == ffn + 1u && got.M == 1u &&
+                   got.K == HID && got.inter == 32u && got.N_out == HID &&
+                   got.n_experts == 2u && got.h_gu[1] == 101u &&
+                   got.h_dn[1] == 103u && got.row_count[0] == 1u &&
+                   got.row_count[1] == 1u && got.flags == 0x703e1u &&
+                   memcmp(out, ref, HID * sizeof(float)) == 0;
+    CHECK(ok, "[DENSE_FFN WH]: %s M %u inter %u experts %u",
+          htp_graph_err_name(rc), got.M, got.inter, got.n_experts);
+    err |= !ok;
+  }
+  hexkl_graph_free(g);
+  for (i = 2u; i < 10u; ++i)
+    g_tbl.slots[i].in_use = 0;
+  for (i = 100u; i < 104u; ++i)
+    g_tbl.slots[i].in_use = 0;
+  if (err == 0)
+    printf("GRAPH FC WH OK: FC q|k|v (3 WH parts, one call, L2 bit = arena "
+           "read) and DENSE_FFN (2 chunks as experts of weight 1, M = 1) hand "
+           "the kernels the prefill's handles; WH LM_HEAD refused; init "
+           "refuses another K / short parts / a bad down / no chunk / a free "
+           "handle / a 2-bit part; uses_handle sees WH ops, uses_q4m1 skips "
+           "them\n");
+}
+
+/* ---- [plan 201 S4] Gemma 4's attention shapes -------------------------- */
+
+/* google/gemma-4-26B-A4B: 16 q heads; sliding layers head_dim 256 over 8 kv
+   heads, full layers head_dim 512 over 2 (num_global_key_value_heads). Three
+   layers, sliding / full / sliding, at a max_seq of two 64-position tiles. */
+#define G4_HID 2816u
+#define G4_SEQ 128u
+/** @brief The sliding layers' window here: Gemma's 1024 does not fit
+ *  G4_SEQ, 48 crosses the first tile boundary mid-tile (attn_m1_host_check
+ *  runs 1024 itself). */
+#define G4_WIN 48u
+static const struct {
+  uint32_t n_kv, gqa, hd;
+} kG4[3] = {{8u, 2u, 256u}, {2u, 8u, 512u}, {8u, 2u, 256u}};
+
+static void g4_op(uint32_t *w, uint32_t i, uint32_t kind, uint32_t layer,
+                  uint32_t resident, uint32_t K, uint32_t N) {
+  htp_graph_op *op = htp_graph_op_at(w, i);
+  memset(op, 0, sizeof(*op));
+  op->kind = kind;
+  op->layer = layer;
+  op->resident = resident;
+  op->K = K;
+  op->N = N;
+  op->next_mm = HTP_GRAPH_NO_OP;
+  op->in_slot = 2u;
+  op->out_slot = kind == HTP_OP_ATTN_M1 ? 1u : 2u;
+  if (layer < 3u) {
+    op->n_kv = kG4[layer].n_kv;
+    op->gqa = kG4[layer].gqa;
+    op->head_dim = kG4[layer].hd;
+  }
+  if (kind == HTP_OP_QK_NORM || kind == HTP_OP_RMSNORM) {
+    op->eps_bits = 0x358637BDu; /* 1e-6f */
+  }
+}
+
+/** @brief [QK_NORM ROPE ATTN_M1] x 3 then [RMSNORM LM_HEAD]; ROPE resident,
+ *  QK_NORM and the tail not, ATTN_M1 as @a attn. @return the words. */
+static uint32_t g4_list(uint32_t *w, uint32_t attn) {
+  const uint32_t n_ops = 3u * 3u + 2u;
+  uint32_t l, i = 0;
+  w[0] = HTP_GRAPH_MAGIC;
+  w[1] = HTP_GRAPH_VERSION;
+  w[2] = 3u;
+  w[3] = n_ops;
+  w[4] = G4_HID;
+  w[5] = 256u;
+  w[6] = G4_SEQ;
+  for (l = 0; l < 3u; ++l) {
+    w[HTP_GRAPH_HEADER_WORDS + l] = HTP_GRAPH_LAYER_ATTN;
+    w[HTP_GRAPH_HEADER_WORDS + 3u + l] = HTP_GRAPH_FFN_DENSE;
+  }
+  for (l = 0; l < 3u; ++l) {
+    const uint32_t q = kG4[l].gqa * kG4[l].n_kv * kG4[l].hd;
+    const uint32_t K = q + 2u * kG4[l].n_kv * kG4[l].hd;
+    g4_op(w, i++, HTP_OP_QK_NORM, l, 0u, K, K);
+    g4_op(w, i++, HTP_OP_ROPE, l, 1u, K, K);
+    g4_op(w, i++, HTP_OP_ATTN_M1, l, attn, K, q);
+    /* scale 1.0 (Gemma4TextAttention's scaling), the window on sliding
+       layers only */
+    htp_graph_op_at(w, i - 1u)->eps_bits = 0x3F800000u;
+    htp_graph_op_at(w, i - 1u)->top_k = l == 1u ? 0u : G4_WIN;
+  }
+  g4_op(w, i++, HTP_OP_RMSNORM, 3u, 0u, G4_HID, G4_HID);
+  g4_op(w, i++, HTP_OP_LM_HEAD, 3u, 0u, G4_HID, 256u);
+  return htp_graph_words_for(3u, n_ops);
+}
+
+/** @brief Gemma's cos | sin table, max_seq x hd: mha_core's default (all
+ *  angles) or proportional (the first @a partial of them, 0 above). */
+static void g4_table(float *cs, uint32_t hd, double theta, double partial) {
+  const uint32_t h = hd / 2u, angles = (uint32_t)(partial * hd / 2.0);
+  uint32_t p, i;
+  for (p = 0; p < G4_SEQ; ++p) {
+    for (i = 0; i < h; ++i) {
+      const double a =
+        i < angles ? (double)p * pow(theta, -(2.0 * i) / (double)hd) : 0.0;
+      cs[(size_t)p * hd + i] = (float)cos(a);
+      cs[(size_t)p * hd + h + i] = (float)sin(a);
+    }
+  }
+}
+
+/* (1) The list validates with ROPE resident at head_dim 256 / 512; (2) a
+   ROPE op with no table of its own and no head_dim 64 -> EBADSTATE (the
+   shared hd64 table is not read at another head_dim); (3) tables bound per
+   op, the two sliding layers' equal ones shared and the full one apart, a
+   wrong length refused; (4) each ROPE op's forward == m1_rope_det on its
+   q and k heads with its own table, v untouched. */
+static void check_gemma_rope(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float cs_s[G4_SEQ * 256u], cs_f[G4_SEQ * 512u], cs64[G4_SEQ * 64u];
+  static float in[10240u], out[10240u], ref[10240u];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 4296u, l, i, p;
+  int err = 0;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  n = g4_list(w, 0u);
+  rc = htp_graph_validate(w, n, ALL_KINDS, NULL);
+  CHECK(rc == 0u, "gemma rope list: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "gemma rope init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  fill(in, 10240u, &seed);
+  fill(cs64, G4_SEQ * 64u, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(
+    g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, cs64, G4_SEQ * 64u);
+  CHECK(rc == 0u, "gemma: shared hd64 table: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, 1u, 1u, 5u, NULL, in, 8192u, out,
+                                     8192u, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "gemma ROPE hd256, no own table: %s",
+        htp_graph_err_name(rc));
+  g4_table(cs_s, 256u, 1e4, 1.0);
+  g4_table(cs_f, 512u, 1e6, 0.25);
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u - 1u);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "gemma: short table: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 4u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                        G4_SEQ * 512u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                        G4_SEQ * 256u);
+  CHECK(rc == 0u, "gemma: per-op tables: %s", htp_graph_err_name(rc));
+  CHECK(g->param[1] != NULL && g->param[1] == g->param[7] &&
+          g->param[4] != g->param[1],
+        "gemma: the sliding tables are not shared (or the full one is)");
+  /* re-binding a shared table with other bytes splits it, never writes the
+     other op's copy */
+  rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                       G4_SEQ * 256u);
+  CHECK(rc == 0u && g->param[7] != g->param[1] &&
+          memcmp(g->param[1], cs_s, sizeof(cs_s)) == 0,
+        "gemma: re-binding a shared table");
+  rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  CHECK(rc == 0u && g->param[7] == g->param[1], "gemma: re-sharing");
+  for (l = 0; l < 3u; ++l) {
+    const uint32_t hd = kG4[l].hd, nq = kG4[l].gqa * kG4[l].n_kv,
+                   nk = kG4[l].n_kv, K = (nq + 2u * nk) * hd;
+    const float *cs = l == 1u ? cs_f : cs_s;
+    for (p = 0; p < G4_SEQ; p += 37u) {
+      fill(in, K, &seed);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, 3u * l + 1u, 1000u, p, NULL,
+                                         in, K, out, K, &resume);
+      CHECK(rc == 0u && resume == 3u * l + 2u, "gemma ROPE l%u pos %u: %s", l,
+            p, htp_graph_err_name(rc));
+      memcpy(ref, in, K * sizeof(float));
+      for (i = 0; i < nq + nk; ++i)
+        m1_rope_det(ref + i * hd, hd, cs + (size_t)p * hd);
+      if (memcmp(out, ref, K * sizeof(float)) != 0) {
+        CHECK(0, "gemma ROPE l%u (hd %u) pos %u differs", l, hd, p);
+        err = 1;
+      }
+    }
+  }
+  hexkl_graph_free(g); /* the shared table freed once (ASan / valgrind) */
+  if (err == 0)
+    printf("GRAPH GEMMA ROPE BIT-IDENTICAL: hd256 default 1e4 (2 layers, one "
+           "shared table) and hd512 proportional 0.25 1e6, own tables, 4 "
+           "positions each, vs m1_rope_det\n");
+}
+
+/* [plan 201 S4] [ROPE ATTN_M1] resident on the three Gemma layers, a
+   sliding cache (8 x 256, two layers) and a full one (2 x 512) in the env:
+   (1) the ordinals count within each shape's cache; (2) a shape with no
+   cache -> EBADSTATE; (3) a chain of 100 tokens through every layer, each
+   output bit-identical to m1_rope_det -> attn_m1_det_forward_win with the
+   op's window (48 on the sliding layers) and scale 1.0. */
+static void check_gemma_attn(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float cs_s[G4_SEQ * 256u], cs_f[G4_SEQ * 512u];
+  static float in[10240u], out[8192u], ref[8192u], qk[10240u], e[G4_SEQ];
+  static float kt[3][8u * 256u * G4_SEQ], vv[3][8u * 256u * G4_SEQ];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 4296u, l, i, p;
+  int err = 0, cerr = 0;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  n = g4_list(w, 1u);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "gemma attn init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->ordinal[2] == 0u && g->ordinal[5] == 0u && g->ordinal[8] == 1u,
+        "gemma ordinals %u %u %u", g->ordinal[2], g->ordinal[5], g->ordinal[8]);
+  g4_table(cs_s, 256u, 1e4, 1.0);
+  g4_table(cs_f, 512u, 1e6, 0.25);
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 4u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                        G4_SEQ * 512u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                        G4_SEQ * 256u);
+  CHECK(rc == 0u, "gemma attn tables: %s", htp_graph_err_name(rc));
+  env.attn_m1 = hvx_attn_m1_create(2u, 8u, 2u, 256u, G4_SEQ, NULL, &cerr);
+  CHECK(env.attn_m1 != NULL, "sliding cache: %d", cerr);
+  fill(in, 10240u, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, 4u, 1000u, 0u, NULL, in, 10240u,
+                                     out, 8192u, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "full layer with no hd512 cache: %s",
+        htp_graph_err_name(rc));
+  printf("  ATTN_M1 hd512 with only an hd256 cache    -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  env.attn_m1_b = hvx_attn_m1_create(1u, 2u, 8u, 512u, G4_SEQ, NULL, &cerr);
+  CHECK(env.attn_m1_b != NULL, "full cache: %d", cerr);
+  if (env.attn_m1 == NULL || env.attn_m1_b == NULL) {
+    err = 1;
+    p = 100u;
+  } else {
+    p = 0u;
+  }
+  memset(kt, 0, sizeof(kt));
+  memset(vv, 0, sizeof(vv));
+  for (; p < 100u; ++p) {
+    for (l = 0; l < 3u; ++l) {
+      const uint32_t hd = kG4[l].hd, nk = kG4[l].n_kv, nq = kG4[l].gqa * nk;
+      const uint32_t K = (nq + 2u * nk) * hd, win = l == 1u ? 0u : G4_WIN;
+      const float *cs = (l == 1u ? cs_f : cs_s) + (size_t)p * hd;
+      fill(in, K, &seed);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, 3u * l + 1u, 1000u, p, NULL,
+                                         in, K, out, nq * hd, &resume);
+      if (rc != 0u || resume != 3u * l + 3u) {
+        CHECK(0, "gemma attn l%u pos %u: %s resume %u", l, p,
+              htp_graph_err_name(rc), resume);
+        err = 1;
+        continue;
+      }
+      /* the spec: RoPE on q then k heads, append k | v, attend */
+      memcpy(qk, in, K * sizeof(float));
+      for (i = 0; i < nq + nk; ++i)
+        m1_rope_det(qk + i * hd, hd, cs);
+      for (i = 0; i < nk; ++i)
+        attn_m1_det_append(kt[l] + (size_t)i * hd * G4_SEQ,
+                           vv[l] + (size_t)i * G4_SEQ * hd, hd, G4_SEQ, p,
+                           qk + (nq + i) * hd, in + (nq + nk + i) * hd);
+      attn_m1_det_forward_win(qk, kt[l], vv[l], nk, nq / nk, hd, G4_SEQ, p + 1u,
+                              win, 1.0f, e, ref, NULL);
+      if (memcmp(out, ref, nq * hd * sizeof(float)) != 0) {
+        CHECK(0, "gemma attn l%u (hd %u) pos %u differs", l, hd, p);
+        err = 1;
+      }
+    }
+  }
+  hvx_attn_m1_free(env.attn_m1);
+  hvx_attn_m1_free(env.attn_m1_b);
+  hexkl_graph_free(g);
+  if (err == 0)
+    printf("GRAPH GEMMA ATTN BIT-IDENTICAL: ROPE+ATTN_M1 on 3 layers (hd256 "
+           "window %u x 2 in one cache, hd512 full in a second), scale 1.0, "
+           "100 tokens, vs m1_rope_det -> attn_m1_det_forward_win\n",
+           G4_WIN);
+}
+
+/* ---- [plan 201 S4] Gemma 4: QK_NORM at 256 / 512 with the v norm, the
+   two-branch FFN, the soft-capped 262144-row head ---------------------- */
+
+/* One Gemma 4 decoder layer and the tail: htp_graph_gemma_build with
+   n_layers 1, its first or only layer full_attention as @a full. */
+static uint32_t build_gemma(uint32_t *w, uint32_t cap,
+                            const htp_graph_gemma_shape *s, uint8_t full,
+                            float layer_scalar, uint32_t mask) {
+  htp_graph_gemma_shape one = *s;
+  one.n_layers = 1u;
+  return htp_graph_gemma_build(w, cap, &one, &full, &layer_scalar, mask);
+}
+/* htp_graph_gemma_build's op indices in layer 0 and the tail */
+enum {
+  GM_QK = 2,
+  GM_ADD_ATTN = 7,
+  GM_PRE2 = 8,
+  GM_ROUTER = 9,
+  GM_MOE = 10,
+  GM_POST2 = 11,
+  GM_PRE = 12,
+  GM_DENSE = 13,
+  GM_POST1 = 14,
+  GM_ADD_BR = 15,
+  GM_POSTFFN = 16,
+  GM_ADD_RES = 17,
+  GM_FIN = 18,
+  GM_LM = 19
+};
+
+/* the record mutations of the Gemma list */
+static void gm_qk_feed_bit0(uint32_t *w) {
+  htp_graph_op_at(w, GM_QK)->feed |= 1u;
+}
+static void gm_qk_head_dim_1024(uint32_t *w) {
+  htp_graph_op *op = htp_graph_op_at(w, GM_QK);
+  op->head_dim = 1024u; /* a consistent record: (1 + 2) x 1 x 1024 */
+  op->n_kv = 1u;
+  op->gqa = 1u;
+  op->K = op->N = 3072u;
+}
+static void gm_add_in_is_out(uint32_t *w) {
+  htp_graph_op_at(w, GM_ADD_BR)->in_slot = 2u;
+}
+static void gm_add_scale_inf(uint32_t *w) {
+  htp_graph_op_at(w, GM_ADD_RES)->eps_bits = 0x7F800000u;
+}
+static void gm_softcap_negative(uint32_t *w) {
+  htp_graph_op_at(w, GM_LM)->eps_bits |= 0x80000000u;
+}
+static void gm_ffn_kind_3(uint32_t *w) { w[HTP_GRAPH_HEADER_WORDS + 1u] = 3u; }
+static void gm_ffn_kind_moe(uint32_t *w) {
+  w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_MOE;
+}
+static void gm_ffn_kind_dense(uint32_t *w) {
+  w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_DENSE;
+}
+
+/* The CPU's QK_NORM composition (#4296 gemma4_causallm.cpp:660-708): q and
+   k per head with their gammas, v (the raw k under K_EQ_V) with none. */
+static void spec_qk_norm(const float *in, const float *gamma, float *out,
+                         uint32_t hd, uint32_t gqa, uint32_t n_kv,
+                         uint32_t feed, float eps) {
+  const uint32_t n_q = gqa * n_kv * hd, n_k = n_kv * hd;
+  const float *v = (feed & HTP_GRAPH_QKNORM_K_EQ_V) ? in + n_q : in + n_q + n_k;
+  m1_rmsnorm_det(in, gamma, out, n_q, hd, eps, NULL);
+  m1_rmsnorm_det(in + n_q, gamma + hd, out + n_q, n_k, hd, eps, NULL);
+  if (feed & HTP_GRAPH_QKNORM_V)
+    m1_rmsnorm_det(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
+  else
+    memcpy(out + n_q + n_k, v, n_k * sizeof(float));
+}
+
+#define GM_HID 128u
+#define GM_E 8u
+#define GM_TOP 2u
+#define GM_INTER 32u
+#define GM_DENSE_N 64u
+#define GM_VOCAB 262144u
+#define GM_SLICE 16384u
+
+/* google/gemma-4-26B-A4B's text_config (plan 201 section 2.4); max_seq is
+   nntr_config's, 4096 here */
+static const htp_graph_gemma_shape kGemma26 = {
+  30u, 2816u, 2112u, 704u,  128u,    8u,    16u,   8u,   256u,
+  2u,  512u,  1u,    1024u, 262144u, 4096u, 1e-6f, 30.0f};
+
+/* [plan 201 S4] The model builder on the 26B-A4B shape: 30 layers of 5
+   sliding + 1 full, every kind resident. The list validates, fits
+   HTP_GRAPH_MAX_OPS, and each layer carries its own attention shape,
+   window, k = v, and layer_scalar; a cap one op short is refused. */
+static void check_gemma26_list(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t L = kGemma26.n_layers;
+  uint8_t full[HTP_GRAPH_MAX_LAYERS];
+  float scal[HTP_GRAPH_MAX_LAYERS];
+  uint32_t n, rc, n_ops = 0, l, bad = 0;
+  for (l = 0; l < L; ++l) {
+    full[l] = l % 6u == 5u;
+    scal[l] = 0.5f + (float)l / 64.0f;
+  }
+  n = htp_graph_gemma_build(w, (uint32_t)(sizeof(w) / sizeof(w[0])), &kGemma26,
+                            full, scal, HTP_GRAPH_KINDS_ALL);
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, &n_ops);
+  CHECK(n != 0u && rc == 0u && n_ops == 18u * L + 2u,
+        "Gemma 26B list: %u words, %s, %u ops", n, htp_graph_err_name(rc),
+        n_ops);
+  if (rc != 0u)
+    return;
+  CHECK(count_kind(w, HTP_OP_RMSNORM) == 7u * L + 1u &&
+          count_kind(w, HTP_OP_FC) == 2u * L &&
+          count_kind(w, HTP_OP_ADD) == 3u * L &&
+          count_kind(w, HTP_OP_MOE) == L &&
+          count_kind(w, HTP_OP_DENSE_FFN) == L &&
+          count_kind(w, HTP_OP_LM_HEAD) == 1u,
+        "Gemma 26B list: kind counts");
+  for (l = 0; l < L; ++l) {
+    const htp_graph_op *fc = htp_graph_op_cat(w, nth_op(w, HTP_OP_FC, 2u * l));
+    const htp_graph_op *qk = htp_graph_op_cat(w, nth_op(w, HTP_OP_QK_NORM, l));
+    const htp_graph_op *at = htp_graph_op_cat(w, nth_op(w, HTP_OP_ATTN_M1, l));
+    const htp_graph_op *o =
+      htp_graph_op_cat(w, nth_op(w, HTP_OP_FC, 2u * l + 1u));
+    const htp_graph_op *res =
+      htp_graph_op_cat(w, nth_op(w, HTP_OP_ADD, 3u * l + 2u));
+    uint32_t sbits;
+    memcpy(&sbits, &scal[l], 4u);
+    bad += full[l] ? fc->N != 9216u || qk->feed != 6u || at->head_dim != 512u ||
+                       at->n_kv != 2u || at->gqa != 8u || at->top_k != 0u
+                   : fc->N != 8192u || qk->feed != 2u || at->head_dim != 256u ||
+                       at->n_kv != 8u || at->gqa != 2u || at->top_k != 1024u;
+    bad += at->N != 16u * at->head_dim || o->K != at->N ||
+           at->eps_bits != 0x3F800000u || res->eps_bits != sbits ||
+           res->out_slot != 0u;
+  }
+  CHECK(bad == 0u, "Gemma 26B list: %u layers with a wrong record", bad);
+  CHECK(htp_graph_op_cat(w, n_ops - 1u)->eps_bits == 0x41F00000u,
+        "Gemma 26B list: soft-cap 30");
+  rc = htp_graph_gemma_build(w, htp_graph_words_for(L, 18u * L + 1u), &kGemma26,
+                             full, scal, HTP_GRAPH_KINDS_ALL);
+  CHECK(rc == 0u, "Gemma 26B list: a cap one op short wrote %u words", rc);
+  if (bad == 0u && rc == 0u)
+    printf("GRAPH GEMMA-4-26B-A4B LIST OK: %u ops (25 sliding layers hd 256 "
+           "window 1024, 5 full hd 512 k = v, layer_scalar per layer, "
+           "soft-cap 30), every kind resident, validates\n",
+           n_ops);
+}
+
+static void check_gemma(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static uint32_t m[sizeof(w) / sizeof(w[0])];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  const uint32_t ffn_mask =
+    HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KIND_BIT(HTP_OP_MOE) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_DENSE_FFN) | HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM);
+  /* the FFN stretch's shape: hidden 128, one head of 64 (attention is
+     not run here) */
+  const htp_graph_gemma_shape fs = {
+    1u, GM_HID, GM_DENSE_N, GM_INTER, GM_E,     GM_TOP, 2u,    2u,   64u,
+    2u, 64u,    1u,         0u,       GM_VOCAB, 64u,    1e-6f, 30.0f};
+  const float fs_scalar = 0.6875f;
+  static const struct {
+    const char *what;
+    void (*mutate)(uint32_t *);
+    uint32_t want;
+  } gm_muts[] = {
+    {"QK_NORM feed bit 0 (N1's, not taken)", gm_qk_feed_bit0,
+     HTP_GRAPH_E_INVALIDFORMAT},
+    {"QK_NORM resident at head_dim 1024", gm_qk_head_dim_1024,
+     HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+    {"ADD in_slot == out_slot", gm_add_in_is_out, HTP_GRAPH_E_INVALIDFORMAT},
+    {"ADD multiplier +inf", gm_add_scale_inf, HTP_GRAPH_E_INVALIDFORMAT},
+    {"LM_HEAD soft-cap -30", gm_softcap_negative, HTP_GRAPH_E_INVALIDFORMAT},
+    {"ffn kind 3", gm_ffn_kind_3, HTP_GRAPH_E_INVALIDFORMAT},
+    {"DENSE_FFN in a MoE-only layer", gm_ffn_kind_moe, HTP_GRAPH_E_INVALIDITEM},
+    {"ROUTER_TOPK in a dense-only layer", gm_ffn_kind_dense,
+     HTP_GRAPH_E_INVALIDITEM},
+  };
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 0x4296u, i, s, e, r, nr = 0, best;
+  static float in[10240], out[10240], ref[10240], qk_gam[1024];
+  static float x[GM_HID], gam[6][GM_HID], rw[GM_HID * GM_E],
+    rbias[GM_HID + GM_E], rsc[GM_HID];
+  static float hres[GM_HID], dn[GM_HID], up[GM_DENSE_N], gate[GM_DENSE_N],
+    act[GM_DENSE_N], dense[GM_HID], D[GM_HID], sp[GM_HID], xs[GM_HID],
+    moe[GM_HID], S[GM_HID], F[GM_HID], fo[GM_HID];
+  static float lg_ref[GM_VOCAB], lg_out[GM_VOCAB];
+  static uint32_t gu[GM_E], dnh[GM_E];
+  float lg[GM_E], wt[GM_TOP], r_w[GM_TOP], by_e[GM_E];
+  uint32_t sel[GM_TOP], r_idx[GM_TOP], r_cnt[GM_E] = {0};
+  int err = 0;
+
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  env.fc = host_fc;
+
+  /* (1) validator: the Gemma layer validates every kind it runs resident
+     here; each record mutation fails with its own code */
+  n = build_gemma(w, cap, &fs, 0u, fs_scalar, ffn_mask);
+  rc = htp_graph_validate(w, n, ffn_mask, NULL);
+  CHECK(n != 0u && rc == 0u && w[3] == 20u, "Gemma layer validate: %s",
+        htp_graph_err_name(rc));
+  err |= rc != 0u;
+  for (i = 0; i < sizeof(gm_muts) / sizeof(gm_muts[0]); ++i) {
+    memcpy(m, w, n * sizeof(uint32_t));
+    gm_muts[i].mutate(m);
+    rc = htp_graph_validate(m, n, ffn_mask, NULL);
+    CHECK(rc == gm_muts[i].want, "Gemma mutation '%s': %s, want %s",
+          gm_muts[i].what, htp_graph_err_name(rc),
+          htp_graph_err_name(gm_muts[i].want));
+    err |= rc != gm_muts[i].want;
+    printf("  Gemma %-36s -> %s\n", gm_muts[i].what, htp_graph_err_name(rc));
+  }
+
+  /* (2) [QK_NORM] at Gemma-4-26B-A4B's two attention shapes (a sliding
+     layer: 8 kv heads of 256; a full one: 2 of 512, k = v), in place on
+     slot 2 (the v norm must read the raw k before k is normed); the v part
+     of the input is garbage under K_EQ_V, which the op must not read */
+  for (s = 0; s < 2u; ++s) {
+    const htp_graph_op *rec;
+    uint32_t qkv;
+    n = build_gemma(w, cap, &kGemma26, (uint8_t)s, 1.0f,
+                    HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM));
+    rec = htp_graph_op_cat(w, GM_QK);
+    qkv = rec->K;
+    rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+    CHECK(rc == 0u && g != NULL, "QK_NORM hd %u init: %s", rec->head_dim,
+          htp_graph_err_name(rc));
+    if (g == NULL)
+      return;
+    fill(qk_gam, 2u * rec->head_dim, &seed);
+    rc = (uint32_t)hexkl_graph_set_param(g, GM_QK, HTP_GRAPH_PARAM_GAMMA,
+                                         qk_gam, 2u * rec->head_dim);
+    CHECK(rc == 0u, "QK_NORM gamma: %s", htp_graph_err_name(rc));
+    fill(in, qkv, &seed);
+    if (rec->feed & HTP_GRAPH_QKNORM_K_EQ_V)
+      for (i = qkv - rec->n_kv * rec->head_dim; i < qkv; ++i)
+        in[i] = NAN;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, GM_QK, 1u, 0u, NULL, in, qkv,
+                                       out, qkv, &resume);
+    spec_qk_norm(in, qk_gam, ref, rec->head_dim, rec->gqa, rec->n_kv, rec->feed,
+                 kGemma26.eps);
+    CHECK(rc == 0u && resume == GM_QK + 1u &&
+            memcmp(out, ref, qkv * sizeof(float)) == 0,
+          "[QK_NORM] hd %u gqa %u n_kv %u feed %u: %s, %s", rec->head_dim,
+          rec->gqa, rec->n_kv, rec->feed, htp_graph_err_name(rc),
+          memcmp(out, ref, qkv * sizeof(float)) ? "differs" : "equal");
+    err |= rc != 0u || memcmp(out, ref, qkv * sizeof(float)) != 0;
+    hexkl_graph_free(g);
+    g = NULL;
+  }
+
+  /* (3) the FFN stretch [RMSNORM ROUTER_TOPK MOE RMSNORM RMSNORM DENSE_FFN
+     RMSNORM ADD RMSNORM ADD] with the session's GeGLU flag, against the
+     CPU's order (dense branch first, D + S, (h + F) * layer_scalar) */
+  n = build_gemma(w, cap, &fs, 0u, fs_scalar, ffn_mask);
+  {
+    uint32_t hq = 0;
+    htp_graph_op *op = htp_graph_op_at(w, GM_DENSE); /* up, gate, down */
+    q_register(hq, GM_HID, GM_DENSE_N, &seed);
+    op->h_gu[0] = hq++;
+    q_register(hq, GM_HID, GM_DENSE_N, &seed);
+    op->h_gu[1] = hq++;
+    q_register(hq, GM_DENSE_N, GM_HID, &seed);
+    op->h_dn[0] = hq++;
+    op->n_experts = 3u;
+    op = htp_graph_op_at(w, GM_LM);
+    for (i = 0; i < GM_VOCAB / GM_SLICE; ++i) {
+      q_register(hq, GM_HID, GM_SLICE, &seed);
+      op->h_gu[i] = hq++;
+    }
+    op->n_experts = GM_VOCAB / GM_SLICE;
+    CHECK(hq <= Q_SLOTS && op->n_experts <= HTP_GRAPH_MAX_PARTS,
+          "Gemma Q4M1 slots %u", hq);
+  }
+  for (e = 0; e < GM_E; ++e) {
+    gu[e] = 400u + e;
+    dnh[e] = 450u + e;
+    register_weight(gu[e], GM_HID, 2u * GM_INTER);
+    register_weight(dnh[e], GM_INTER, GM_HID);
+  }
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "Gemma FFN init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->logits != NULL, "Gemma logits buffer");
+  rc = (uint32_t)set_experts(g, GM_MOE, gu, dnh, GM_E);
+  CHECK(rc == 0u, "Gemma EXPERTS: %s", htp_graph_err_name(rc));
+  {
+    const uint32_t norms[6] = {GM_PRE2,  GM_POST2,   GM_PRE,
+                               GM_POST1, GM_POSTFFN, GM_FIN};
+    for (i = 0; i < 6u; ++i) {
+      fill(gam[i], GM_HID, &seed);
+      rc = (uint32_t)hexkl_graph_set_param(g, norms[i], HTP_GRAPH_PARAM_GAMMA,
+                                           gam[i], GM_HID);
+      CHECK(rc == 0u, "Gemma gamma %u: %s", i, htp_graph_err_name(rc));
+    }
+  }
+  fill(rw, GM_HID * GM_E, &seed);
+  fill(rsc, GM_HID, &seed);
+  m1_router_input_scale_det(rsc, GM_HID, rbias);
+  fill(rbias + GM_HID, GM_E, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_W,
+                                       rw, GM_HID * GM_E);
+  rc |= (uint32_t)hexkl_graph_set_param(
+    g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, GM_HID + GM_E);
+  CHECK(rc == 0u, "Gemma router params");
+  env.moe_flags = HEXKL_MOE_FLAG_GELU_TANH;
+  fill(x, GM_HID, &seed);
+  memset(&g_last, 0, sizeof(g_last));
+  rc =
+    (uint32_t)hexkl_graph_forward(g, &env, GM_PRE2, GM_ADD_RES - GM_PRE2 + 1u,
+                                  0u, NULL, x, GM_HID, out, GM_HID, &resume);
+  CHECK(rc == 0u && resume == GM_ADD_RES + 1u,
+        "Gemma FFN stretch: %s resume %u", htp_graph_err_name(rc), resume);
+  /* the CPU's order: h = x; the dense branch */
+  memcpy(hres, x, sizeof(hres));
+  m1_rmsnorm_det(hres, gam[2], dn, GM_HID, GM_HID, fs.eps, NULL);
+  spec_fc(g->ops[GM_DENSE].h_gu[0], dn, up);
+  spec_fc(g->ops[GM_DENSE].h_gu[1], dn, gate);
+  for (i = 0; i < GM_DENSE_N; ++i)
+    act[i] = geglu_det_one(gate[i], up[i]);
+  spec_fc(g->ops[GM_DENSE].h_dn[0], act, dense);
+  m1_rmsnorm_det(dense, gam[3], D, GM_HID, GM_HID, fs.eps, NULL);
+  /* the sparse branch: experts on the pre_ffn_norm_2 row, the router on
+     the un-normed h */
+  m1_rmsnorm_det(hres, gam[0], sp, GM_HID, GM_HID, fs.eps, NULL);
+  m1_rmsnorm_det(hres, rbias, xs, GM_HID, GM_HID, fs.eps, NULL);
+  m1_router_softmax_det(xs, rw, rbias + GM_HID, GM_HID, GM_E, GM_TOP, lg, sel,
+                        wt);
+  for (r = 0; r < GM_TOP; ++r) {
+    r_cnt[sel[r]] = 1u;
+    by_e[sel[r]] = wt[r];
+  }
+  for (e = 0; e < GM_E; ++e)
+    if (r_cnt[e]) {
+      r_idx[nr] = 0u;
+      r_w[nr++] = by_e[e];
+    }
+  CHECK(g_last.n_calls == 1u && g_last.flags == HEXKL_MOE_FLAG_GELU_TANH &&
+          memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
+        "Gemma MOE op: routing / flags");
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, GM_HID,
+                              GM_INTER, GM_HID, GM_E, gu, dnh, r_idx, r_cnt,
+                              r_w, sp, moe, env.pool, &g_scratch,
+                              HEXKL_MOE_FLAG_GELU_TANH);
+  m1_rmsnorm_det(moe, gam[1], S, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_HID; ++i)
+    F[i] = m1_det_add(D[i], S[i]); /* combine_ffn */
+  m1_rmsnorm_det(F, gam[4], fo, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_HID; ++i) /* decoder_output, then layer_scalar */
+    ref[i] = m1_det_mul(m1_det_add(hres[i], fo[i]), fs_scalar);
+  CHECK(memcmp(out, ref, GM_HID * sizeof(float)) == 0 &&
+          memcmp(g->slots, ref, GM_HID * sizeof(float)) == 0,
+        "Gemma FFN stretch differs from the CPU-order composition");
+  err |= memcmp(out, ref, GM_HID * sizeof(float)) != 0 ||
+         memcmp(g->slots, ref, GM_HID * sizeof(float)) != 0;
+  check_pcycles(g, GM_PRE2, GM_ADD_RES + 1u, "Gemma FFN");
+
+  /* (4) [RMSNORM LM_HEAD]: 16 slices of 16384 rows, soft-capped at 30
+     before the pick; the raw logits would differ */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, GM_FIN, 2u, 0u, NULL, x, GM_HID,
+                                     lg_out, GM_VOCAB, &resume);
+  CHECK(rc == 0u && resume == GM_LM + 1u, "Gemma head: %s",
+        htp_graph_err_name(rc));
+  m1_rmsnorm_det(x, gam[5], dn, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_VOCAB / GM_SLICE; ++i)
+    spec_fc(g->ops[GM_LM].h_gu[i], dn, lg_ref + (size_t)i * GM_SLICE);
+  {
+    int capped_differs = memcmp(lg_out, lg_ref, sizeof(lg_ref)) != 0;
+    float mx = 0.0f;
+    for (i = 0; i < GM_VOCAB; ++i)
+      mx = fabsf(lg_ref[i]) > mx ? fabsf(lg_ref[i]) : mx;
+    m1_softcap_det(lg_ref, GM_VOCAB, fs.softcap);
+    best = m1_argmax_first(lg_ref, GM_VOCAB);
+    CHECK(capped_differs && memcmp(lg_out, lg_ref, sizeof(lg_ref)) == 0 &&
+            g->lm_id == best,
+          "Gemma head: soft-capped logits %s, lm_id %u want %u (raw %s)",
+          memcmp(lg_out, lg_ref, sizeof(lg_ref)) ? "differ" : "equal", g->lm_id,
+          best, capped_differs ? "differ" : "EQUAL");
+    err |= !capped_differs || memcmp(lg_out, lg_ref, sizeof(lg_ref)) != 0 ||
+           g->lm_id != best;
+    printf("  Gemma head: vocab %u in %u slices, max |raw logit| %.2f, "
+           "lm_id %u\n",
+           GM_VOCAB, GM_VOCAB / GM_SLICE, mx, g->lm_id);
+  }
+  hexkl_graph_free(g);
+  env.moe_flags = 0u;
+
+  /* (5) the soft-cap's spec against 30 tanh(x / 30) in double over
+     [-300, 300] and its HVX form lane for lane (and a scalar tail), the
+     dense GeGLU row likewise against geglu_det_one */
+  {
+    const uint32_t N = 8192u + 7u;
+    double num = 0.0, den = 0.0, max_err = 0.0;
+    uint32_t nan = 0, same = 0;
+    for (i = 0; i < N; ++i)
+      in[i] = -300.0f + 600.0f * (float)i / (float)(N - 1u);
+    in[0] = -3.0e38f; /* the clamps */
+    in[1] = 3.0e38f;
+    in[2] = 1.0e-40f; /* subnormal */
+    memcpy(ref, in, N * sizeof(float));
+    memcpy(out, in, N * sizeof(float));
+    m1_softcap_det(ref, N, 30.0f);
+    hvx_softcap_m1_f32(out, N, 30.0f, real_pool());
+    for (i = 0; i < N; ++i) {
+      const double t = 30.0 * tanh((double)in[i] / 30.0);
+      const double d = (double)ref[i] - t;
+      nan += ref[i] != ref[i];
+      same += memcmp(&out[i], &ref[i], sizeof(float)) == 0;
+      num += t * t;
+      den += d * d;
+      max_err = fabs(d) > max_err ? fabs(d) : max_err;
+    }
+    printf("SOFTCAP SPEC vs f64: snr=%.1f dB over [-300,300] n=%u; "
+           "max_abs_err=%.2e; nan=%u\n",
+           10.0 * log10(num / den), N, max_err, nan);
+    printf("SOFTCAP HVX == SPEC bit-exact %u/%u\n", same, N);
+    /* about 5 ulp at 30: exp_det's and recip_det's ulps through 2 s - 1 */
+    CHECK(nan == 0u && 10.0 * log10(num / den) > 120.0 && max_err < 2e-5,
+          "softcap spec vs f64");
+    CHECK(same == N, "hvx_softcap_m1_f32 differs from m1_softcap_det");
+    err |= nan != 0u || same != N || 10.0 * log10(num / den) <= 120.0 ||
+           max_err >= 2e-5;
+    /* the dense GeGLU row: gates over [-12, 12] with the clamps and a
+       subnormal, ups a permutation of them */
+    same = 0;
+    for (i = 0; i < N; ++i)
+      in[i] /= 25.0f;
+    for (i = 0; i < N; ++i) {
+      lg_ref[i] = in[(i * 7u) % N];
+      ref[i] = geglu_det_one(in[i], lg_ref[i]);
+    }
+    hvx_geglu_f32(in, lg_ref, out, N);
+    for (i = 0; i < N; ++i)
+      same += memcmp(&out[i], &ref[i], sizeof(float)) == 0;
+    printf("DENSE GEGLU HVX == SPEC bit-exact %u/%u\n", same, N);
+    CHECK(same == N, "hvx_geglu_f32 differs from geglu_det_one");
+    err |= same != N;
+  }
+  if (err == 0)
+    printf("GRAPH GEMMA BIT-IDENTICAL: QK_NORM hd 256 (v norm) and hd 512 "
+           "(v norm, k = v), the FFN stretch (MoE branch, dense GeGLU branch, "
+           "D + S, post norm, (h + F) * layer_scalar in 3 slots) and "
+           "RMSNORM+LM_HEAD (262144 rows, 16 slices, soft-cap 30) vs "
+           "m1_ops_det.h / geglu_det_one / q4_gemv_cpu_det\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
+  check_limits();
   check_stretches();
-  check_add_router();
+  check_add_router(0);
+  check_add_router(1);
+  check_gemma_rope();
+  check_gemma_attn();
   check_q4m1();
+  check_wh();
+  check_gemma();
+  check_gemma26_list();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;

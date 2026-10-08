@@ -198,17 +198,6 @@ public:
 WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
 public:
   /**
-   * @brief Registers batch 0's quantized KV cache on the accelerator now
-   *        rather than inside the first attention call, where it cost the
-   *        first prefill 1.9 ms a layer (doc 57 section 9.24).
-   *        Called once at load after every weight is placed (the cache is
-   *        DSP heap: grown between two arena chunk mappings it would strand
-   *        address space, transformer.cpp). A refusal leaves the handle
-   *        unset, and the first call registers and falls back as before.
-   */
-  void registerQuantizedCache(nntrainer::RunLayerContext &context);
-
-  /**
    * @brief Constructor of MhaCore Layer
    */
   WIN_EXPORT MHACoreLayer();
@@ -419,12 +408,7 @@ private:
    *        the two staging buffers.
    */
   std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
-  /** The a16 path's u16 Q and output, one pair for every layer: per layer
-   *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
-   *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
-   *  MHACoreLayer instances, so layers must not run concurrently (they run
-   *  in graph order); a per-thread pair is the upgrade if they ever do. */
-  static std::vector<uint16_t> q2_q_u16, q2_out_u16;
+  std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
@@ -555,7 +539,8 @@ private:
    */
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
-  std::vector<float> htp_rope_table_; /**< [max_timestep][cos 32 | sin 32] */
+  std::vector<float>
+    htp_rope_table_; /**< [max_timestep][cos hd/2 | sin hd/2] */
   bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
                                            prompt are the DSP's, not this cache's */
 

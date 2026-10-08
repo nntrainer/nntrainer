@@ -968,8 +968,8 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
   float *stats = malloc(2u * N_Q * sizeof(float));
   uint32_t w[ATTN_M1_PROF_WORDS];
   memset(w, 0xA5, sizeof(w));
-  const int rc =
-    hvx_attn_m1_forward_prof(ctx, LAYER, L - 1u, SCALE, q, k, v, out, stats, w);
+  const int rc = hvx_attn_m1_forward_prof(ctx, LAYER, L - 1u, 0u, SCALE, q, k,
+                                          v, out, stats, w);
   /* LANES is the score run's: one unit per (kv head, 64-position tile). */
   const uint32_t units = N_KV * ((L + 63u) / 64u);
   const uint32_t lanes =
@@ -1031,8 +1031,8 @@ static void check_length(uint32_t L, uint32_t max_seq,
     const size_t last = (size_t)(L - 1u) * N_KV * HD;
     int rc = hvx_attn_m1_kv_append(ctx, LAYER, 0u, L - 1u, k, v);
     CHECK(rc == AEE_SUCCESS, "L=%u kv_append rc=%d", L, rc);
-    rc = hvx_attn_m1_forward(ctx, LAYER, L - 1u, SCALE, q, k + last, v + last,
-                             out[p], stats[p]);
+    rc = hvx_attn_m1_forward(ctx, LAYER, L - 1u, 0u, SCALE, q, k + last,
+                             v + last, out[p], stats[p]);
     CHECK(rc == AEE_SUCCESS, "L=%u forward rc=%d", L, rc);
     CHECK(ctx->kv_len[LAYER] == L, "L=%u kv_len=%u", L, ctx->kv_len[LAYER]);
     prof_bad += check_phase_words(ctx, L, POOLS[p], q, k + last, v + last,
@@ -1097,14 +1097,14 @@ static void check_append_chain(uint32_t L, hvx_worker_pool *pool) {
      up in the cache compare if the layer offset were wrong. */
   for (uint32_t p = 0; p < L; ++p) {
     const size_t row = (size_t)p * N_KV * HD;
-    int rc =
-      hvx_attn_m1_forward(a, LAYER, p, SCALE, q, k + row, v + row, out_a, NULL);
+    int rc = hvx_attn_m1_forward(a, LAYER, p, 0u, SCALE, q, k + row, v + row,
+                                 out_a, NULL);
     CHECK(rc == AEE_SUCCESS, "chain pos=%u rc=%d", p, rc);
   }
   const size_t last = (size_t)(L - 1u) * N_KV * HD;
   int rc = hvx_attn_m1_kv_append(b, LAYER, 0u, L - 1u, k, v);
   CHECK(rc == AEE_SUCCESS, "bulk kv_append rc=%d", rc);
-  rc = hvx_attn_m1_forward(b, LAYER, L - 1u, SCALE, q, k + last, v + last,
+  rc = hvx_attn_m1_forward(b, LAYER, L - 1u, 0u, SCALE, q, k + last, v + last,
                            out_b, NULL);
   CHECK(rc == AEE_SUCCESS, "bulk forward rc=%d", rc);
   const int kt_eq =
@@ -1135,7 +1135,8 @@ static void check_identity(hvx_worker_pool *pool) {
   amc_fill_row(&g_rng, k, N_KV * HD, 0);
   amc_fill_row(&g_rng, v, N_KV * HD, 0);
   hvx_attn_m1_ctx *ctx = make_ctx(1024u, pool);
-  const int rc = hvx_attn_m1_forward(ctx, 0u, 0u, SCALE, q, k, v, out, stats);
+  const int rc =
+    hvx_attn_m1_forward(ctx, 0u, 0u, 0u, SCALE, q, k, v, out, stats);
   CHECK(rc == AEE_SUCCESS, "L=1 forward rc=%d", rc);
   uint32_t bad = 0, bad_l = 0;
   for (uint32_t hq = 0; hq < N_Q; ++hq) {
@@ -1168,7 +1169,7 @@ static void check_division_tie(hvx_worker_pool *pool) {
   amc_fill_row(&g_rng, v, 3u * N_KV * HD, 0);
   hvx_attn_m1_ctx *ctx = make_ctx(1024u, pool);
   int rc = hvx_attn_m1_kv_append(ctx, 0u, 0u, 2u, k, v);
-  rc |= hvx_attn_m1_forward(ctx, 0u, 2u, SCALE, q, k + 2u * N_KV * HD,
+  rc |= hvx_attn_m1_forward(ctx, 0u, 2u, 0u, SCALE, q, k + 2u * N_KV * HD,
                             v + 2u * N_KV * HD, out, stats);
   CHECK(rc == AEE_SUCCESS, "division tie: rc=%d", rc);
   spec_forward(q, k, v, N_KV, GQA, HD, 3u, 1024u, out_det, stats_det);
@@ -1190,9 +1191,9 @@ static void check_errors(hvx_worker_pool *pool) {
   hvx_attn_m1_ctx *bad = hvx_attn_m1_create(1, N_KV, GQA, HD, 100u, pool, &err);
   CHECK(!bad && err == AEE_EINVALIDFORMAT, "max_seq 100: ctx=%p err=%d",
         (void *)bad, err);
-  /* head_dim is 64 only (#152: the CPU order's 8 accumulators and the
-     RoPE's head size); 32, 48 and 128 register-time errors. */
-  static const uint32_t bad_hd[] = {32u, 48u, 128u};
+  /* head_dim is a multiple of 64 up to 512 (#152's 64; plan 201 S4:
+     Gemma's 256 and 512); 32, 48, 96 and 576 register-time errors. */
+  static const uint32_t bad_hd[] = {32u, 48u, 96u, 576u};
   for (size_t i = 0; i < sizeof(bad_hd) / sizeof(bad_hd[0]); ++i) {
     bad = hvx_attn_m1_create(1, N_KV, GQA, bad_hd[i], 1024u, pool, &err);
     CHECK(!bad && err == AEE_EINVALIDFORMAT, "head_dim %u: ctx=%p err=%d",
@@ -1208,31 +1209,215 @@ static void check_errors(hvx_worker_pool *pool) {
   amc_fill_row(&g_rng, k, N_KV * HD, 0);
   amc_fill_row(&g_rng, v, N_KV * HD, 0);
   hvx_attn_m1_ctx *ctx = make_ctx(64u, pool);
-  int rc = hvx_attn_m1_forward(ctx, 0u, 64u, SCALE, q, k, v, out, NULL);
+  int rc = hvx_attn_m1_forward(ctx, 0u, 64u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_EINVALIDFORMAT, "pos == max_seq: rc=%d", rc);
-  rc = hvx_attn_m1_forward(ctx, N_LAYERS, 0u, SCALE, q, k, v, out, NULL);
+  rc = hvx_attn_m1_forward(ctx, N_LAYERS, 0u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_EINVALIDFORMAT, "layer out of range: rc=%d", rc);
-  rc = hvx_attn_m1_forward(ctx, 0u, 1u, SCALE, q, k, v, out, NULL);
+  rc = hvx_attn_m1_forward(ctx, 0u, 1u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_EBADSTATE, "hole at pos 1 of an empty layer: rc=%d", rc);
   rc = hvx_attn_m1_kv_append(ctx, 0u, 1u, 1u, k, v);
   CHECK(rc == AEE_EBADSTATE, "kv_append hole: rc=%d", rc);
   rc = hvx_attn_m1_kv_append(ctx, 0u, 0u, 65u, k, v);
   CHECK(rc == AEE_EINVALIDFORMAT, "kv_append past max_seq: rc=%d", rc);
-  rc = hvx_attn_m1_forward(NULL, 0u, 0u, SCALE, q, k, v, out, NULL);
+  rc = hvx_attn_m1_forward(NULL, 0u, 0u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_EBADSTATE, "NULL ctx: rc=%d", rc);
   /* #170: the scale is one hf multiply, so it must be an fp16 value */
-  rc = hvx_attn_m1_forward(ctx, 0u, 0u, 0.1f, q, k, v, out, NULL);
+  rc = hvx_attn_m1_forward(ctx, 0u, 0u, 0u, 0.1f, q, k, v, out, NULL);
   CHECK(rc == AEE_EINVALIDFORMAT, "scale 0.1 (not fp16): rc=%d", rc);
   for (uint32_t p = 0; p < 5u; ++p) {
-    rc = hvx_attn_m1_forward(ctx, 0u, p, SCALE, q, k, v, out, NULL);
+    rc = hvx_attn_m1_forward(ctx, 0u, p, 0u, SCALE, q, k, v, out, NULL);
     CHECK(rc == AEE_SUCCESS, "pos %u rc=%d", p, rc);
   }
-  rc = hvx_attn_m1_forward(ctx, 0u, 2u, SCALE, q, k, v, out, NULL);
+  rc = hvx_attn_m1_forward(ctx, 0u, 2u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_SUCCESS && ctx->kv_len[0] == 3u, "rewind to 2: rc=%d len=%u",
         rc, ctx->kv_len[0]);
   CHECK(ctx->kv_len[1] == 0u, "layer 1 touched: len=%u", ctx->kv_len[1]);
   printf("ATTN M1 error codes and rewind OK\n");
   hvx_attn_m1_free(ctx);
+}
+
+/* ==== 4. [plan 201 S4] Gemma 4's shapes =================================== */
+
+/** @brief Gemma-4-26B-A4B: 16 q heads; sliding layers 8 kv x 256 with a
+ *         window of 1024, full layers 2 kv x 512 with none; scale 1.0
+ *         (attn_m1_det.h's GEMMA note). */
+static const struct {
+  uint32_t n_kv, gqa, hd, window;
+  const char *name;
+} G4[2] = {{8u, 2u, 256u, 1024u, "sliding"}, {2u, 8u, 512u, 0u, "full"}};
+#define G4_SEQ 4096u
+
+/** @brief Rows like the model's after its q / k norms: uniform with an RMS
+ *         near 1, v wider; and, past the window, two "sinks" per kv head: at
+ *         the last excluded position (L - window - 1) a key along its q
+ *         heads strong enough to be the call's maximum, at the first
+ *         included one a weaker one that still carries weight -- so a
+ *         window one longer or one shorter moves the softmax (a random
+ *         position there mostly has e = 0 in fp16). */
+static void g4_fill(amc_rng *r, float *q, float *k, float *v, uint32_t L,
+                    uint32_t n_kv, uint32_t gqa, uint32_t hd, uint32_t window) {
+  for (uint32_t i = 0; i < n_kv * gqa * hd; ++i) {
+    q[i] = amc_frand(r, -1.7f, 1.7f);
+  }
+  for (uint32_t i = 0; i < L * n_kv * hd; ++i) {
+    k[i] = amc_frand(r, -1.7f, 1.7f);
+    v[i] = amc_frand(r, -4.0f, 4.0f);
+  }
+  for (uint32_t j = 0; window != 0u && L > window && j < 2u; ++j) {
+    const uint32_t p = L - window - 1u + j; /* lo - 1, then lo */
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      for (uint32_t d = 0; d < hd; ++d) {
+        float s = 0.0f;
+        for (uint32_t g = 0; g < gqa; ++g) {
+          s += q[(h * gqa + g) * hd + d];
+        }
+        k[((size_t)p * n_kv + h) * hd + d] = s / (float)gqa * (j ? 0.3f : 0.5f);
+      }
+    }
+  }
+}
+
+/** @brief The same call in double from the fp16-rounded q / k / v: the
+ *         softmax over [lo, L), scale 1. @return the SNR of @a out (dB). */
+static double g4_snr(const float *q, const float *k, const float *v, uint32_t L,
+                     uint32_t n_kv, uint32_t gqa, uint32_t hd, uint32_t window,
+                     const float *out) {
+  const uint32_t lo = attn_m1_det_lo(L, window);
+  double sig = 0.0, err = 0.0;
+  double *sc = malloc((size_t)L * sizeof(double));
+  for (uint32_t hq = 0; hq < n_kv * gqa; ++hq) {
+    const uint32_t h = hq / gqa;
+    double m = -1e300, l = 0.0;
+    for (uint32_t p = lo; p < L; ++p) {
+      double t = 0.0;
+      for (uint32_t d = 0; d < hd; ++d) {
+        t += (double)attn_m1_det_rne16(q[hq * hd + d]) *
+             attn_m1_det_rne16(k[((size_t)p * n_kv + h) * hd + d]);
+      }
+      sc[p] = t;
+      m = t > m ? t : m;
+    }
+    for (uint32_t p = lo; p < L; ++p) {
+      sc[p] = exp(sc[p] - m);
+      l += sc[p];
+    }
+    for (uint32_t d = 0; d < hd; ++d) {
+      double o = 0.0;
+      for (uint32_t p = lo; p < L; ++p) {
+        o += sc[p] / l * attn_m1_det_rne16(v[((size_t)p * n_kv + h) * hd + d]);
+      }
+      sig += o * o;
+      err += (out[hq * hd + d] - o) * (out[hq * hd + d] - o);
+    }
+  }
+  free(sc);
+  return 10.0 * log10(sig / err);
+}
+
+/**
+ * @brief One Gemma shape at one length: kv_append of L - 1 rows and the
+ *        forward of the last at 0, 3 and 7 workers, with the shape's window
+ *        and scale 1.0, against attn_m1_det_forward_win (memcmp) and the
+ *        double reference (SNR). The same call with the window one shorter
+ *        and one longer must differ from it wherever L is past the window,
+ *        so the data can see an off-by-one. @return SNR in dB.
+ */
+static double g4_check(uint32_t s, uint32_t L,
+                       hvx_worker_pool *const pools[3]) {
+  const uint32_t n_kv = G4[s].n_kv, gqa = G4[s].gqa, hd = G4[s].hd;
+  const uint32_t win = G4[s].window, n_q = n_kv * gqa, nq = n_q * hd;
+  amc_rng r = {0x4296u + L * 7u + s};
+  float *q = malloc(nq * sizeof(float));
+  float *k = malloc((size_t)L * n_kv * hd * sizeof(float));
+  float *v = malloc((size_t)L * n_kv * hd * sizeof(float));
+  float *out = malloc(nq * sizeof(float)), *ref = malloc(nq * sizeof(float));
+  float *alt = malloc(nq * sizeof(float));
+  float stats[2u * 64u], stats_ref[2u * 64u];
+  float *kt = calloc((size_t)n_kv * hd * G4_SEQ, sizeof(float));
+  float *vv = calloc((size_t)n_kv * G4_SEQ * hd, sizeof(float));
+  float *e = malloc((size_t)L * sizeof(float));
+  uint32_t bad = 0, pool_bad = 0;
+  g4_fill(&r, q, k, v, L, n_kv, gqa, hd, win);
+  for (uint32_t p = 0; p < L; ++p) {
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      attn_m1_det_append(
+        kt + (size_t)h * hd * G4_SEQ, vv + (size_t)h * G4_SEQ * hd, hd, G4_SEQ,
+        p, k + ((size_t)p * n_kv + h) * hd, v + ((size_t)p * n_kv + h) * hd);
+    }
+  }
+  attn_m1_det_forward_win(q, kt, vv, n_kv, gqa, hd, G4_SEQ, L, win, 1.0f, e,
+                          ref, stats_ref);
+  for (int pi = 0; pi < 3; ++pi) {
+    int err = -1;
+    hvx_attn_m1_ctx *ctx =
+      hvx_attn_m1_create(N_LAYERS, n_kv, gqa, hd, G4_SEQ, pools[pi], &err);
+    CHECK(ctx && err == AEE_SUCCESS, "gemma %s create: %d", G4[s].name, err);
+    if (!ctx) {
+      break;
+    }
+    const size_t last = (size_t)(L - 1u) * n_kv * hd;
+    int rc = hvx_attn_m1_kv_append(ctx, LAYER, 0u, L - 1u, k, v);
+    rc |= hvx_attn_m1_forward(ctx, LAYER, L - 1u, win, 1.0f, q, k + last,
+                              v + last, out, stats);
+    CHECK(rc == AEE_SUCCESS, "gemma %s L=%u rc=%d", G4[s].name, L, rc);
+    const uint32_t b =
+      count_bad(out, ref, nq) + count_bad(stats, stats_ref, 2u * n_q);
+    if (pi == 0) {
+      bad = b;
+    } else {
+      pool_bad += b;
+    }
+    hvx_attn_m1_free(ctx);
+  }
+  /* the window seen by the data: one shorter / longer differs */
+  uint32_t seen = 1u;
+  if (win != 0u && L > win) {
+    attn_m1_det_forward_win(q, kt, vv, n_kv, gqa, hd, G4_SEQ, L, win - 1u, 1.0f,
+                            e, alt, NULL);
+    seen = count_bad(alt, ref, nq) != 0u;
+    attn_m1_det_forward_win(q, kt, vv, n_kv, gqa, hd, G4_SEQ, L, win + 1u, 1.0f,
+                            e, alt, NULL);
+    seen &= count_bad(alt, ref, nq) != 0u;
+  }
+  const double snr = g4_snr(q, k, v, L, n_kv, gqa, hd, win, ref);
+  printf("ATTN M1 GEMMA %s (%u,%u,%u) window=%u L=%u workers={0,3,7} bad=%u "
+         "pool_bad=%u window+-1_seen=%s SNR(spec vs f64)=%.1f dB\n",
+         G4[s].name, n_kv, gqa, hd, win, L, bad, pool_bad,
+         (win != 0u && L > win) ? (seen ? "yes" : "NO") : "n/a", snr);
+  CHECK(bad == 0u && pool_bad == 0u, "gemma %s L=%u: HVX differs from spec",
+        G4[s].name, L);
+  CHECK(seen, "gemma %s L=%u: the data cannot see a window off by one",
+        G4[s].name, L);
+  /* the fp16 CPU order's own distance from exact (#152: 41-52 dB at
+     LFM2's shape); a wrong scale or window lands far below */
+  CHECK(snr > 30.0, "gemma %s L=%u: SNR %.1f dB", G4[s].name, L, snr);
+  free(q);
+  free(k);
+  free(v);
+  free(out);
+  free(ref);
+  free(alt);
+  free(kt);
+  free(vv);
+  free(e);
+  return snr;
+}
+
+static void check_gemma(hvx_worker_pool *const pools[3]) {
+  static const uint32_t lengths[] = {1u, 65u, 1023u, 1024u, 1025u, 4096u};
+  double lo_snr = 1e9;
+  int fail0 = g_fail;
+  for (uint32_t s = 0; s < 2u; ++s) {
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+      const double snr = g4_check(s, lengths[i], pools);
+      lo_snr = snr < lo_snr ? snr : lo_snr;
+    }
+  }
+  if (g_fail == fail0) {
+    printf("ATTN M1 GEMMA BIT-IDENTICAL: hd256 window 1024 and hd512 full, "
+           "scale 1.0, L = 1 .. 4096, lowest SNR vs f64 %.1f dB\n",
+           lo_snr);
+  }
 }
 
 int main(void) {
@@ -1260,6 +1445,7 @@ int main(void) {
   check_identity(pools[2]);
   check_division_tie(pools[1]);
   check_errors(pools[1]);
+  check_gemma(pools);
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);

@@ -11,6 +11,7 @@
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_expand_i2i4.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_scalar.h"
@@ -22,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fc_wh_det.h"
 #include "nntr_moe_dma_plan.h"
 #include "swiglu_det.h"
 
@@ -62,17 +64,55 @@ static void gemv_log_reset(void) { g_gemv_n = 0; }
    only inside run_m1_case with the feed set (g_score_on): the HMX path's
    chunked pushes are read by the HMX stand-in, not by columns. */
 static uint32_t g_lane; /* set by the pool stand-in below */
+/* The device pool's lanes: 5 workers + the caller. */
+#define PF_LANES 6u
 #define SCORE_MAX 256u
+/* #177: a push may also be one lane's slice of a matrix (lane >= 0), issued
+   on that lane's own queue inside pool run `run`, with its descriptor. */
 typedef struct {
   const uint8_t *dst, *src;
   uint32_t bytes, row_size, nrows, idx, reads, waited;
+  int lane; /* -1: the ring */
+  uint32_t run;
+  const void *desc;
 } score_push;
 static score_push g_score[SCORE_MAX];
 static uint32_t g_score_n, g_score_on, g_score_bad, g_score_waits,
-  g_score_vtcm_reads;
+  g_score_vtcm_reads, g_lane_waits;
+/* Bumped by the pool stand-in at every run: a slice must be waited by the
+   lane that issued it inside the same run, and read only in a later one. */
+static uint32_t g_run;
+/* Set only by the timeout case in run_m1_cases. */
+static int g_lane_timeout;
+/* [#225] The FC cells: a lane reads the block it pushed and waited inside
+   the same run (its own double buffer); another lane's slice is still a
+   race. */
+static int g_own_slice_ok;
 static const uint8_t *g_vtcm_lo, *g_vtcm_hi;
+/* #185: the pool stand-ins' state. g_workers is the pool's worker count
+   (the caller is not one): a submitted job runs on min(n, g_workers) lanes,
+   a run on min(n, g_workers + 1). A submitted job is pending until the
+   wait; g_in_run is set while a run's or a job's lanes execute. */
+static uint32_t g_workers = PF_LANES - 1u, g_pending, g_in_run, g_submits;
+/* #185: the dataflow scoreboard. The stand-ins report every buffer they
+   read or write (hvx_scalar_hook.buf); inside one run or job, a read and a
+   write -- or two writes -- of overlapping bytes from two different lanes
+   are a race on the device, where the lanes run at once, and a silent pass
+   here, where they run one after another. Same-lane accesses of one kind
+   are merged, so a run's table stays a few entries per lane. */
+typedef struct {
+  const uint8_t *lo, *hi;
+  uint32_t lane;
+  int w;
+} df_access;
+#define DF_MAX 1024u
+static df_access g_df[DF_MAX];
+static uint32_t g_df_n, g_df_bad;
+static uint64_t g_df_seen;
 static void score_reset(int on, const uint8_t *vtcm, size_t vtcm_bytes) {
   g_score_n = g_score_bad = g_score_waits = g_score_vtcm_reads = 0;
+  g_lane_waits = 0;
+  g_pending = g_in_run = g_df_n = 0;
   g_score_on = on ? 1u : 0u;
   g_vtcm_lo = vtcm;
   g_vtcm_hi = vtcm + vtcm_bytes;
@@ -88,34 +128,62 @@ static score_push *score_find(const uint8_t *p) {
   return NULL;
 }
 
+/* @a table: NULL for a 4-bit column (512-byte tiles), the expansion table
+   of a 2-bit one (256-byte tiles of QS2CX_WH codes, plan 229). */
 static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                           const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                          int32_t *out) {
+                          const uint8_t *table, int32_t *out) {
+  const uint32_t tb = table ? 256u : 512u;
   /* rows1 picks between two HVX loops that compute the same int32 sums
      (hvx_gemm_u8i4_wh.c); the stand-in is that sum, so it is the same
      function either way and the caller only records which loop was
      asked for. */
   const uint8_t *src_wh = wh;
   if (g_score_on && in_vtcm(wh)) {
-    /* One whole matrix per push (f2): the column's last tile must be
-       inside it, and it must have been waited for. */
-    score_push *sp = score_find(wh);
-    const size_t need = ((size_t)(k_tiles - 1u) * n_col + nt + 1u) * 512u;
-    if (!sp || sp->dst != wh || !sp->waited || need > sp->bytes ||
-        sp->row_size != n_col * 512u || sp->nrows != k_tiles) {
+    /* Every k-tile row of the column must sit in a waited push of this
+       matrix's shape: on the ring one whole matrix (f2), under #177 the
+       slices of one, each waited in an earlier pool run than this read.
+       Each push the column touches counts one read. */
+    const uint32_t row = n_col * tb;
+    const uint8_t *origin = NULL;
+    const char *why = NULL;
+    score_push *prev = NULL;
+    for (uint32_t kt = 0; kt < k_tiles && !why; ++kt) {
+      const uint8_t *a = wh + (size_t)kt * row + (size_t)nt * tb;
+      score_push *sp = score_find(a);
+      if (!sp)
+        why = "no push";
+      else if (!sp->waited)
+        why = "push not waited";
+      else if (sp->lane >= 0 && sp->run >= g_run &&
+               !(g_own_slice_ok && sp->lane == (int)g_lane))
+        why = "slice read in the run that issued it";
+      else if (sp->row_size != row ||
+               (size_t)(a - sp->dst) % row != (size_t)nt * tb ||
+               (sp->lane < 0 && (sp->dst != wh || sp->nrows != k_tiles)))
+        why = "shape";
+      else if (origin && origin != sp->src - (sp->dst - wh))
+        why = "rows from two matrices";
+      else {
+        origin = sp->src - (sp->dst - wh);
+        if (sp != prev)
+          sp->reads += tb / 256u; /* 256 B units: 2 a 4-bit column, 1 a 2-bit */
+        prev = sp;
+      }
+    }
+    if (why) {
       if (g_score_bad++ < 4u)
         printf("FEED read not covered: lane=%u nt=%u n_col=%u %s\n", g_lane, nt,
-               n_col,
-               !sp           ? "no push"
-               : !sp->waited ? "push not waited"
-                             : "shape");
+               n_col, why);
     } else {
-      ++sp->reads;
       ++g_score_vtcm_reads;
-      src_wh = sp->src; /* the log names the expert by its arena bytes */
+      src_wh = origin; /* the log names the expert by its arena bytes */
     }
   }
-  hvx_scalar_gemv(act_ah, m, k_tiles, wh, n_col, nt, out);
+  if (table)
+    hvx_scalar_gemv_i2(act_ah, m, k_tiles, wh, n_col, nt, table, out);
+  else
+    hvx_scalar_gemv(act_ah, m, k_tiles, wh, n_col, nt, out);
   if (g_gemv_n == g_gemv_cap) {
     g_gemv_cap = g_gemv_cap ? 2u * g_gemv_cap : 1024u;
     g_gemv_log =
@@ -136,7 +204,6 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
    two blocks earlier, and fetched once. Every box must also sit inside its
    weight's columns, fit the l2fetch's 16-bit fields, and go out with at
    most two others still unread. */
-#define PF_LANES 6u
 #define PF_RING 4u
 typedef struct {
   const uint8_t *wh;
@@ -201,21 +268,22 @@ static void hook_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
 /* hvx_gemm_u8i4_wh_col (nopf = 0) and _col_nopf (nopf = 1), through the
    stand-in file's hook: the bookkeeping is this check's, the sum is the
    shared one. */
-static void hook_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
-                      const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                      uint32_t rows1, int nopf, int32_t *out) {
+static void hook_gemv_any(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, int nopf, const uint8_t *table,
+                          int32_t *out) {
   int found = 0;
   g_rows1_seen |= 1u << (rows1 != 0u);
   if (!nopf) {
     ++g_col_n;
-    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, table, out);
     return;
   }
   if (g_score_on && in_vtcm(wh)) {
     /* Under the feed no box covers a column; the scoreboard in
        gemv_stand_in holds the read instead. */
     ++g_nopf_n;
-    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, table, out);
     return;
   }
   for (uint32_t k = 0; k < PF_RING && !found; ++k) {
@@ -234,8 +302,57 @@ static void hook_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
     ++g_pf_bad;
   }
   ++g_nopf_n;
-  gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+  gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, table, out);
 }
+static void hook_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                      const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                      uint32_t rows1, int nopf, int32_t *out) {
+  hook_gemv_any(act_ah, m, k_tiles, wh, n_col, nt, rows1, nopf, NULL, out);
+}
+/* [plan 229] The u8i2 GEMV columns, through the same audit. */
+static void hook_gemv2(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                       const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                       uint32_t rows1, int nopf, const uint8_t *table,
+                       int32_t *out) {
+  hook_gemv_any(act_ah, m, k_tiles, wh, n_col, nt, rows1, nopf, table, out);
+}
+/* #185: the stand-ins' buffer hook (the dataflow scoreboard above). Only
+   on the feed cells and inside a run or job; the caller's own accesses
+   between runs are ordered by the joins. */
+static void hook_buf(const void *p, size_t bytes, int write) {
+  const uint8_t *lo = (const uint8_t *)p, *hi = lo + bytes;
+  if (!g_score_on || !g_in_run)
+    return;
+  ++g_df_seen;
+  for (uint32_t k = 0; k < g_df_n; ++k) {
+    const df_access *a = &g_df[k];
+    if (a->lane != g_lane && (a->w || write) && lo < a->hi && a->lo < hi) {
+      ++g_df_bad;
+      if (g_score_bad++ < 4u)
+        printf("FEED cross-lane RAW/WAR in run %u: lane %u %s +%zu B, lane %u "
+               "%s it\n",
+               g_run, g_lane, write ? "writes" : "reads", bytes, a->lane,
+               a->w ? "writes" : "reads");
+      return;
+    }
+  }
+  for (uint32_t k = 0; k < g_df_n; ++k) {
+    df_access *a = &g_df[k];
+    if (a->lane == g_lane && a->w == write && lo <= a->hi && a->lo <= hi) {
+      a->lo = lo < a->lo ? lo : a->lo;
+      a->hi = hi > a->hi ? hi : a->hi;
+      return;
+    }
+  }
+  if (g_df_n == DF_MAX) {
+    ++g_df_bad;
+    if (g_score_bad++ < 4u)
+      printf("FEED dataflow table full in run %u\n", g_run);
+    return;
+  }
+  g_df[g_df_n++] = (df_access){lo, hi, g_lane, write};
+}
+
 /* ---- DMA ring: completes immediately, so a push issued while the
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
@@ -270,8 +387,9 @@ int hexkl_dma_ring_is_done(uint32_t idx) {
    bytes of the arena-backed experts, so a bypassed activation block or a
    bypassed heap weight shows up as a surplus. */
 static uint64_t g_bypass_bytes, g_bypass_bad;
-void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
-                           uint32_t rs, uint32_t nrows, int sv, int dv) {
+static void score_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
+                         uint32_t rs, uint32_t nrows, int sv, int dv, int lane,
+                         const void *desc) {
   if (sv) {
     g_bypass_bytes += (uint64_t)rs * nrows;
     g_bypass_bad += dv == 0;
@@ -291,11 +409,11 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
     for (uint32_t k = 0; k < g_score_n; ++k) {
       const score_push *sp = &g_score[k];
       if (d0 < sp->dst + sp->bytes && sp->dst < d0 + bytes &&
-          sp->reads != sp->row_size / 512u) {
+          sp->reads != sp->row_size / 256u) {
         if (g_score_bad++ < 4u)
           printf("FEED push onto a live slab: +%td (previous matrix %u of %u "
-                 "columns read)\n",
-                 d0 - g_vtcm_lo, sp->reads, sp->row_size / 512u);
+                 "256-byte column units read)\n",
+                 d0 - g_vtcm_lo, sp->reads, sp->row_size / 256u);
         break;
       }
     }
@@ -306,53 +424,122 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
       sp->bytes = (uint32_t)bytes;
       sp->row_size = rs;
       sp->nrows = nrows;
-      sp->idx = g_stub_idx - 1u; /* next_idx was taken just before */
+      sp->idx = lane < 0 ? g_stub_idx - 1u /* next_idx was taken before */
+                         : ~0u;            /* never retired by the ring */
       sp->reads = 0u;
       sp->waited = 0u;
+      sp->lane = lane;
+      sp->run = g_run;
+      sp->desc = desc;
     }
   }
   for (uint32_t r = 0; r < nrows; ++r)
     memcpy((uint8_t *)dst + (size_t)r * ds,
            (const uint8_t *)src + (size_t)r * ss, rs);
 }
+void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
+                           uint32_t rs, uint32_t nrows, int sv, int dv) {
+  score_push2d(dst, src, ds, ss, rs, nrows, sv, dv, -1, NULL);
+}
+/* #177's lane queue: the slice lands at once, as on the ring, and is
+   recorded with the lane and run that issued it. A wait retires the
+   descriptor it names and every earlier slice of the same lane and run
+   (one dmlinked chain per lane); a wait on anything else is a bug. */
+void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
+                           void *dst, const void *src, uint32_t ds, uint32_t ss,
+                           uint32_t rs, uint32_t nrows, int sv, int dv) {
+  (void)prev;
+  score_push2d(dst, src, ds, ss, rs, nrows, sv, dv, (int)g_lane, d);
+}
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
+  uint32_t k = g_score_n;
+  ++g_lane_waits;
+  while (k-- > 0u) {
+    const score_push *sp = &g_score[k];
+    if (sp->desc == d && sp->lane == (int)g_lane && sp->run == g_run &&
+        !sp->waited)
+      break;
+  }
+  if (k == ~0u) {
+    if (g_score_on && g_score_bad++ < 4u)
+      printf("FEED lane %u waits on a descriptor it did not issue in run %u\n",
+             g_lane, g_run);
+    return 0;
+  }
+  for (uint32_t j = 0; j <= k; ++j)
+    if (g_score[j].lane == (int)g_lane && g_score[j].run == g_run)
+      g_score[j].waited = 1u;
+  /* A wait that ran out of its guard must fail the call: one case injects
+     it on lane 1 (g_lane_timeout) and expects AEE_EFAILED. */
+  return (g_lane_timeout && g_lane == 1u) ? -1 : 0;
+}
+/* After a run's join: every slice it issued was waited inside it. */
+static void score_run_end(void) {
+  for (uint32_t k = 0; k < g_score_n; ++k)
+    if (g_score[k].lane >= 0 && g_score[k].run == g_run && !g_score[k].waited) {
+      if (g_score_bad++ < 4u)
+        printf("FEED slice of lane %d not waited inside its run %u\n",
+               g_score[k].lane, g_run);
+    }
+}
 
-/* The pool runs everything on the caller, which is what its own NULL path
-   does for n_units <= 1. Doing it here rather than passing NULL keeps the
-   kernel's call sites exercised: the range arithmetic they hand the worker
-   is part of what this check is for. */
+/* The pool runs every lane on the caller, one after another. Doing it here
+   rather than passing NULL keeps the kernel's call sites exercised: the
+   range arithmetic they hand the worker is part of what this check is
+   for. On the feed cells a run or job started inside another, or while a
+   submitted job is still pending (#185: the kernel must join it first,
+   or the join is lost), is a schedule error. */
+static void pool_lanes(hvx_worker_pool_func func, void *ctx, uint32_t n) {
+  if (g_score_on && (g_in_run || g_pending) && g_score_bad++ < 4u)
+    printf(g_in_run ? "FEED nested pool run\n"
+                    : "FEED pool used while a submitted job is in flight\n");
+  g_pending = 0; /* the real run and submit wait for it first */
+  ++g_run;
+  g_df_n = 0;
+  g_in_run = 1;
+  /* The degenerate branch is func(1, 0): writing it the way the real
+     function's used to be -- func(n_units, 0, ctx) -- is what this check
+     caught first time out; that form means "worker 0 of n_units" and does
+     1/n_units of the work. */
+  for (uint32_t i = 0; i < (n > 1u ? n : 1u); ++i) {
+    g_lane = i;
+    func(n > 1u ? n : 1u, i, ctx);
+  }
+  g_lane = 0;
+  g_in_run = 0;
+  score_run_end();
+}
+/* The device's lane count, n = min(n_units, workers + 1), so each lane's
+   slice and its l2fetch boxes are checked as the device splits them. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   (void)pool;
-  /* The device's lane count, n = min(n_units, 6), one lane after another,
-     so each lane's slice and its l2fetch boxes are checked as the device
-     splits them. The degenerate branch is func(1, 0): writing it the way
-     the real function's used to be -- func(n_units, 0, ctx) -- is what this
-     check caught first time out; that form means "worker 0 of n_units"
-     and does 1/n_units of the work. */
-  const uint32_t n = n_units < PF_LANES ? n_units : PF_LANES;
-  if (n <= 1u) {
-    g_lane = 0;
-    func(1u, 0, ctx);
-    return;
-  }
-  for (uint32_t i = 0; i < n; ++i) {
-    g_lane = i;
-    func(n, i, ctx);
-  }
-  g_lane = 0;
+  pool_lanes(func, ctx, n_units < g_workers + 1u ? n_units : g_workers + 1u);
 }
-/* submit runs the job to completion on the spot and wait is a no-op: the
-   harness cannot exercise the overlap, only that every job is submitted
-   with the right buffer and retired before that buffer is reused -- which
-   a job that ran late would show as a wrong result on device and cannot
-   show here. The device tests are where the ordering is checked. */
+/* submit: the workers only, n = min(n_units, workers) -- lane i is worker
+   i + 1 on the device -- run to completion on the spot; the job then stays
+   pending until the wait. With no workers it runs inline, as the real one
+   does, and nothing is pending. The harness cannot exercise the overlap
+   with the caller, only that the job is joined before the pool is used
+   again and before its buffers are; the device tests check the timing. */
 void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
                             void *ctx, uint32_t n_units) {
   (void)pool;
-  if (n_units != 0u)
-    func(1u, 0, ctx);
+  if (n_units == 0u)
+    return;
+  pool_lanes(func, ctx,
+             g_workers ? (n_units < g_workers ? n_units : g_workers) : 1u);
+  g_pending = g_workers != 0u;
+  ++g_submits;
 }
-void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+void hvx_worker_pool_wait(hvx_worker_pool *pool) {
+  (void)pool;
+  g_pending = 0;
+}
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
+  (void)pool;
+  return g_workers;
+}
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
@@ -406,53 +593,20 @@ typedef struct {
 
 static void ref_mm(const W *w, const uint8_t *a_u8, float a_scale, int32_t a_zp,
                    float *out) {
-  const uint32_t kt_n = w->K / 32u, nt_n = w->N / 32u;
-  for (uint32_t nt = 0; nt < nt_n; ++nt)
-    for (uint32_t c = 0; c < 32; ++c) {
-      int32_t s = 0;
-      for (uint32_t kt = 0; kt < kt_n; ++kt)
-        for (uint32_t k = 0; k < 32; ++k)
-          s +=
-            (int32_t)a_u8[kt * 32 + k] *
-            wh_value((const uint8_t *)w->nib + (size_t)(kt * nt_n + nt) * 512u,
-                     k, c);
-      uint32_t col = nt * 32 + c;
-      out[col] =
-        ((float)(s - a_zp * w->cs[col])) * a_scale * w->ws[col] + w->bias[col];
-    }
+  for (uint32_t col = 0; col < w->N; ++col)
+    out[col] =
+      fc_wh_col_det(a_u8, a_scale, a_zp, (const uint8_t *)w->nib, w->K / 32u,
+                    w->N / 32u, col, w->cs[col], w->ws[col], w->bias[col]);
 }
 static void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
                       int32_t *zp) {
-  float lo = 0.f, hi = 0.f;
-  for (uint32_t j = 0; j < k; ++j) {
-    if (x[j] < lo)
-      lo = x[j];
-    if (x[j] > hi)
-      hi = x[j];
-  }
-  float s = (hi - lo) / 255.f;
-  if (s <= 0.f)
-    s = 1e-8f;
-  *scale = s;
-  long z = lrintf(-lo / s);
-  if (z < 0)
-    z = 0;
-  if (z > 255)
-    z = 255;
-  *zp = (int32_t)z;
-  for (uint32_t j = 0; j < k; ++j) {
-    long v = lrintf(x[j] / s) + *zp;
-    if (v < 0)
-      v = 0;
-    if (v > 255)
-      v = 255;
-    q[j] = (uint8_t)v;
-  }
+  fc_wh_quant_row_det(x, k, q, scale, zp);
 }
 
 /* The layer, one expert and one row at a time: quantize the row, gate_up,
-   SwiGLU, requantize, down, then the routing multiply and the add into the
-   token's output row -- in expert order, rows in order, like the kernel. */
+   SwiGLU (GeGLU-tanh under glu), requantize, down, then the routing
+   multiply and the add into the token's output row -- in expert order, rows in
+   order, like the kernel. */
 static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
                             uint32_t N_out, uint32_t NE, const W *wg,
                             const W *wd, const float *act, const uint32_t *ridx,
@@ -543,9 +697,53 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
   hexkl_weight_u8i4 *s = &g_tbl.slots[slot];
   s->in_use = 1;
   s->borrowed = 1; /* arena-backed, as every QS4CX_WH expert is */
+  s->bits = 4u;    /* [#234 P4] a slot a 2-bit cell left must not stay 2 */
   s->K = K;
   s->N = N;
   s->wh_bytes = (uint8_t *)w->nib;
+  s->w_scale = w->ws;
+  s->colsum_w = w->cs;
+  s->bias = w->bias;
+}
+
+/* The same weight in both widths: nibbles drawn only from pal, so the
+   4-bit slot and the 2-bit slot hold the same values and the kernel's two
+   paths have to agree byte for byte. Here rather than in the shared stubs
+   because make_weight, which it builds on, is this file's own since the
+   stand-in split. */
+static void make_weight_pal(uint32_t slot4, uint32_t slot2, uint32_t K,
+                            uint32_t N, const int8_t *pal, W *w) {
+  const uint32_t tiles = (K / 32u) * (N / 32u);
+  const uint32_t nib_bytes = tiles * 512u;
+  uint8_t *two = (uint8_t *)malloc(nib_bytes / 2u);
+  make_weight(slot4, K, N, w);
+  /* Redraw the values from the palette and encode the same choices twice:
+     nibble j of the 4-bit stream and code j of the 2-bit stream are the
+     same weight, which is exactly what hvx_expand_i2i4 assumes. */
+  memset(two, 0, nib_bytes / 2u);
+  for (uint32_t j = 0; j < nib_bytes; ++j) {
+    /* Nibble slots 2j and 2j+1 of tile j/512. The 2-bit side goes through
+       whCodeByte2/whCodeShift2 -- the kernel's own order -- rather than a
+       second encoder written here, which is what went wrong when this
+       function had one. */
+    const uint32_t tile = j / 512u;
+    const uint32_t sl0 = (j % 512u) * 2u, sl1 = sl0 + 1u;
+    const uint32_t c0 = rnd() & 3u, c1 = rnd() & 3u;
+    ((uint8_t *)w->nib)[j] =
+      (uint8_t)((pal[c0] & 0x0F) | ((pal[c1] & 0x0F) << 4));
+    two[tile * 256u + whCodeByte2(sl0)] |= (uint8_t)(c0 << whCodeShift2(sl0));
+    two[tile * 256u + whCodeByte2(sl1)] |= (uint8_t)(c1 << whCodeShift2(sl1));
+  }
+  hexkl_weight_u8i4 *s = &g_tbl.slots[slot2];
+  s->in_use = 1;
+  s->K = K;
+  s->N = N;
+  s->bits = 2u;
+  s->pal[0] = pal[0];
+  s->pal[1] = pal[1];
+  s->pal[2] = pal[2];
+  s->pal[3] = pal[3];
+  s->wh_bytes = two;
   s->w_scale = w->ws;
   s->colsum_w = w->cs;
   s->bias = w->bias;
@@ -566,6 +764,15 @@ static int g_feed_sched_ok = 1;
 static uint32_t g_bypass_cells; /**< [#158] cells run with the bypass bit */
 static uint64_t g_bypass_total; /**< bytes they bypassed, summed */
 static uint64_t g_feed_pushes, g_feed_waits;
+/* #177: the feed cells rerun at N = 2, 3, 4 queues. */
+static int g_q_ok = 1;
+static uint32_t g_q_cells;
+static uint64_t g_q_slices, g_q_lane_waits;
+static int g_last_rc; /* the M=1 call's return code, for the timeout case */
+/* #185: the N > 1 cells' run shape -- pool runs and submitted jobs per call
+   against the schedule's table (hexkl_mm_u8i4_moe.c, N DMA QUEUES). */
+static int g_ov_ok = 1;
+static uint32_t g_ov_cells;
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
                        const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
@@ -574,6 +781,9 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const uint32_t lead_kb = hexkl_moe_flags_lead_kb(gemv_flags);
   const uint32_t rows1 = hexkl_moe_flags_rows1(gemv_flags);
   const uint32_t feed = hexkl_moe_flags_feed(gemv_flags);
+  /* #177: the queues the feed splits over; the pool stand-in has PF_LANES
+     lanes, more than 4, so every asked-for queue gets one. */
+  const uint32_t nq = feed ? hexkl_moe_flags_dma_q(gemv_flags) : 1u;
   /* Same weights and activation for every configuration of a case, so the
      HMX reference above can be computed once and reused. */
   rnd_state = 12345u + 7919u * M + 104729u * (uint32_t)(shape[0] == 'r');
@@ -640,9 +850,11 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   pf_reset();
   score_reset(feed != 0u, vtcm, vtcm_bytes);
   g_bypass_bytes = g_bypass_bad = 0u;
+  const uint32_t run0 = g_run, sub0 = g_submits;
   r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K,
                                   inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
                                   out_m1, NULL, scratch, gemv_flags);
+  g_last_rc = r;
   const uint64_t blocks = hexkl_probe_us[HEXKL_PROBE_BLOCKS];
   const uint64_t dma_kb = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
   const uint64_t path = hexkl_probe_us[HEXKL_PROBE_PATH];
@@ -656,7 +868,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
       : 0u;
   const int same = memcmp(out_hmx, out_m1, sizeof(float) * M * N_out);
   fail |= (r != 0) || blocks != 0u || dma_kb != want_kb || path != 1u ||
-          fed != feed || same != 0;
+          fed != (feed ? nq : 0u) || same != 0;
   /* [#158] Under the bypass bit every feed push, and nothing else, reads
      around the L2: exactly the active experts' weight bytes. Without the
      feed there is no weight push, so nothing is bypassed either. */
@@ -706,10 +918,10 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
      active expert, every VTCM read covered by a waited push, every push
      inside the arena and onto a slab whose previous matrix was read whole
      (gemv_stand_in / push2d above), and nothing pushed and left unread. */
-  if (feed != 0u) {
+  if (feed != 0u && nq == 1u) {
     uint32_t unread = 0;
     for (uint32_t k = 0; k < g_score_n; ++k)
-      unread += g_score[k].reads != g_score[k].row_size / 512u;
+      unread += g_score[k].reads != g_score[k].row_size / 256u;
     const int sched_ok = g_score_bad == 0u && g_score_n == 2u * active &&
                          g_score_waits == 2u * active &&
                          g_score_vtcm_reads == cols && unread == 0u;
@@ -723,6 +935,49 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
     g_feed_sched_ok &= sched_ok;
     g_feed_pushes += g_score_n;
     g_feed_waits += g_score_waits;
+  } else if (feed != 0u) {
+    /* #177: every matrix as min(nq, rows) row slices, no ring wait at all,
+       each slice waited by its own lane inside the run that issued it and
+       read only in a later run (the stand-ins above), every read covered,
+       nothing left unread. The output is held against the HMX reference
+       above, which the N = 1 cell of the same flags also matched, so the
+       f32 memcmp is also the byte-compare against N = 1. */
+    uint32_t unread = 0;
+    for (uint32_t k = 0; k < g_score_n; ++k)
+      unread += g_score[k].reads != g_score[k].row_size / 256u;
+    const uint32_t kt = K / 32u, it = inter / 32u;
+    const uint32_t want = active * ((nq < kt ? nq : kt) + (nq < it ? nq : it));
+    const int q_ok = g_score_bad == 0u && g_score_n == want &&
+                     g_score_waits == 0u && g_lane_waits != 0u &&
+                     g_score_vtcm_reads == cols && unread == 0u;
+    if (!q_ok) {
+      printf("M1 GEMV shape=%s M=%u QUEUES=%u: slices=%u ring waits=%u "
+             "lane waits=%u vtcm reads=%u unread=%u bad=%u (want "
+             "%u/0/>0/%llu/0/0)\n",
+             shape, M, nq, g_score_n, g_score_waits, g_lane_waits,
+             g_score_vtcm_reads, unread, g_score_bad, want,
+             (unsigned long long)cols);
+      fail = 1;
+    }
+    /* #185: GU(0) is one submitted job when the pool has a worker per
+       queue, else a run; then n A runs, run B and n C runs. */
+    const uint32_t want_sub = g_workers >= nq ? 1u : 0u;
+    const uint32_t want_runs = (1u - want_sub) + active + 1u + active;
+    const int ov_ok =
+      g_submits - sub0 == want_sub && g_run - run0 == want_runs + want_sub;
+    if (!ov_ok) {
+      printf("M1 GEMV shape=%s M=%u QUEUES=%u n=%u: %u runs, %u jobs (want "
+             "%u runs, %u jobs)\n",
+             shape, M, nq, active, g_run - run0 - (g_submits - sub0),
+             g_submits - sub0, want_runs, want_sub);
+      fail = 1;
+    }
+    g_ov_ok &= ov_ok;
+    ++g_ov_cells;
+    g_q_ok &= q_ok && !fail;
+    ++g_q_cells;
+    g_q_slices += g_score_n;
+    g_q_lane_waits += g_lane_waits;
   }
 
   /* The logged gate_up tiles, row by row, against the routing's token row
@@ -777,14 +1032,15 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const uint32_t bad = count_mismatches(out_m1, want, M * N_out, &worst);
   fail |= (bad != 0u);
 
-  printf("M1 GEMV shape=%s M=%u lead=%u rows1=%u feed=%u bypass=%d f32 "
+  printf("M1 GEMV shape=%s M=%u lead=%u rows1=%u feed=%u q=%u bypass=%d f32 "
          "memcmp=%d i32 "
          "exact=%s blocks=%llu dma_kb=%llu (path=%llu, hmx blocks=%llu, "
          "gate_up tiles=%u, ref mismatches=%u worst_rel=%g)\n",
-         shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed, bypass,
-         same != 0, i32_bad == 0u ? "yes" : "NO", (unsigned long long)blocks,
-         (unsigned long long)dma_kb, (unsigned long long)path,
-         (unsigned long long)blocks_hmx, i32_seen, bad, worst);
+         shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed,
+         (unsigned)nq, bypass, same != 0, i32_bad == 0u ? "yes" : "NO",
+         (unsigned long long)blocks, (unsigned long long)dma_kb,
+         (unsigned long long)path, (unsigned long long)blocks_hmx, i32_seen,
+         bad, worst);
 
   for (uint32_t e = 0; e < NE; ++e) {
     if (rc_[e] == 0u)
@@ -818,17 +1074,17 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
    expert holds all four tokens, then 3, 2 and seven singles; then M=1 to
    three and to five experts, the odd counts the feed's slab schedule
    (#117) branches on: the slab whose last gate_up is expert n-2 takes its
-   downs first, and a fifth expert's down reuses a slot. The active
+   downs first, and a fifth expert's down reuses a slot; then M=1 to one
+   and to two experts (#185: n < 4, with and without a run B). The active
    experts are spread over the table with empties between them, at a
    stride coprime to the count so no two land on one slot. */
 static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
                         hexkl_moe_scratch *scratch) {
-  static const uint32_t counts[5][10] = {{1, 1, 1, 1},
-                                         {2, 2, 1, 1, 1, 1},
-                                         {4, 3, 2, 1, 1, 1, 1, 1, 1, 1},
-                                         {1, 1, 1},
-                                         {1, 1, 1, 1, 1}};
-  static const uint32_t Ms[5] = {1, 2, 4, 1, 1};
+  static const uint32_t counts[7][10] = {
+    {1, 1, 1, 1}, {2, 2, 1, 1, 1, 1}, {4, 3, 2, 1, 1, 1, 1, 1, 1, 1},
+    {1, 1, 1},    {1, 1, 1, 1, 1},    {1},
+    {1, 1}};
+  static const uint32_t Ms[7] = {1, 2, 4, 1, 1, 1, 1};
   /* #113's matrix, run inside one build: the five leads the device sweep
      measures x the two row loops, plus the build's own defaults (the tune
      bits clear), which is what a run that sets no env var gets; since
@@ -844,7 +1100,7 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
     const uint32_t K = shape ? 2048 : 64, inter = shape ? 1792 : 32,
                    N_out = shape ? 2048 : 64, NE = shape ? 32 : 12;
     uint32_t *rc_ = (uint32_t *)calloc(NE, sizeof(uint32_t));
-    for (int c = 0; c < 5; ++c) {
+    for (int c = 0; c < 7; ++c) {
       memset(rc_, 0, sizeof(uint32_t) * NE);
       for (uint32_t i = 0; i < 10 && counts[c][i] != 0u; ++i)
         rc_[(i * 5u) % NE] = counts[c][i];
@@ -869,9 +1125,16 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
           if ((i / 2u) % 2u)
             flags |= HEXKL_MOE_FLAG_DMA_BYPASS;
         }
-        fail |=
-          run_m1_case(shape ? "real" : "tiny", Ms[c], K, inter, N_out, NE, rc_,
-                      64u, vtcm, vtcm_bytes, scratch, flags, ref, cfg != 0u);
+        /* #177: the feed cells of the first two leads -- both loops, bypass
+           off and on; the lead means nothing under the feed -- again at
+           N = 2, 3, 4 queues. */
+        const uint32_t max_q =
+          (cfg > n_pairs && ((cfg - 1u) % n_pairs) / 2u < 2u) ? 4u : 1u;
+        for (uint32_t q = 1u; q <= max_q; ++q)
+          fail |= run_m1_case(shape ? "real" : "tiny", Ms[c], K, inter, N_out,
+                              NE, rc_, 64u, vtcm, vtcm_bytes, scratch,
+                              flags | ((q - 1u) << HEXKL_MOE_DMA_Q_SHIFT), ref,
+                              cfg != 0u);
       }
       free(ref);
     }
@@ -880,10 +1143,11 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
   if (fail)
     printf("M1 GEMV PATH DIFFERS FROM HMX PATH\n");
   else
-    printf("M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4, 3 and 5 experts; "
-           "tiny+real; "
-           "%u lead x loop configurations, feed=arena,vtcm)\n",
-           (unsigned)(1u + 2u * n_pairs));
+    printf(
+      "M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4, 1, 2, 3 and 5 experts; "
+      "tiny+real; "
+      "%u lead x loop configurations, feed=arena,vtcm)\n",
+      (unsigned)(1u + 2u * n_pairs));
   printf(g_pf_lead_ok
            ? "M1 GEMV PREFETCH LEAD COVERS EVERY COLUMN (lanes=%u; leads "
              "0/192/384/768/1536 KB x rows4,rows1; build default %u KB "
@@ -897,6 +1161,84 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
            "cells' weight bytes, 0 on the arena read and on heap copies; "
            "output bit-identical to the HMX path)\n",
            g_bypass_cells, (unsigned long long)g_bypass_total);
+  /* A lane wait that runs out of its guard (lane 1 of every run here) must
+     fail the call, not return a result: the call returns AEE_EFAILED. Its
+     other mismatches are expected, so its fail flag is not counted. */
+  {
+    static const uint32_t K = 64, inter = 32, N_out = 64, NE = 12;
+    uint32_t rc_[12] = {0};
+    float ref[64];
+    for (uint32_t i = 0; i < 4u; ++i)
+      rc_[(i * 5u) % NE] = 1u;
+    const int q_ok = g_q_ok, ov_ok = g_ov_ok;
+    const uint32_t q_cells = g_q_cells, ov_cells = g_ov_cells;
+    const uint64_t q_slices = g_q_slices, q_waits = g_q_lane_waits;
+    printf("-- injected lane timeout (the lines below are expected):\n");
+    g_lane_timeout = 1;
+    (void)run_m1_case(
+      "tiny", 1u, K, inter, N_out, NE, rc_, 64u, vtcm, vtcm_bytes, scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET |
+        HEXKL_MOE_FLAG_GEMV_FEED | (3u << HEXKL_MOE_DMA_Q_SHIFT),
+      ref, 0);
+    g_lane_timeout = 0;
+    g_q_ok = q_ok; /* the case's own mismatches are the expected ones */
+    g_ov_ok = ov_ok;
+    g_ov_cells = ov_cells;
+    g_q_cells = q_cells;
+    g_q_slices = q_slices;
+    g_q_lane_waits = q_waits;
+    if (g_last_rc == AEE_EFAILED) {
+      printf("M1 FEED QUEUES TIMEOUT OK (a lane wait past its guard fails "
+             "the call: AEE_EFAILED)\n");
+    } else {
+      printf("M1 FEED QUEUES TIMEOUT WRONG (rc=%d)\n", g_last_rc);
+      g_q_ok = 0;
+    }
+  }
+  /* #185: N = 4 queues on a pool of 3 workers, fewer than the queues: the
+     call must still use all four (a run's lanes include the caller) and
+     match the HMX path. */
+  {
+    static const uint32_t K = 64, inter = 32, N_out = 64, NE = 12;
+    uint32_t rc_[12] = {0};
+    float ref[64];
+    for (uint32_t i = 0; i < 4u; ++i)
+      rc_[(i * 5u) % NE] = 1u;
+    g_workers = 3u;
+    const int f = run_m1_case(
+      "tiny", 1u, K, inter, N_out, NE, rc_, 64u, vtcm, vtcm_bytes, scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET |
+        HEXKL_MOE_FLAG_GEMV_FEED | (3u << HEXKL_MOE_DMA_Q_SHIFT),
+      ref, 0);
+    g_workers = PF_LANES - 1u;
+    printf("M1 FEED QUEUES 3-WORKER POOL %s (N=4, fed=4, bit-identical)\n",
+           f ? "WRONG" : "OK");
+    fail |= f;
+  }
+  if (g_ov_ok && g_ov_cells != 0u)
+    printf("M1 FEED OVERLAP OK (%u cells; GU(0) job beside QUANT; run B "
+           "always)\n",
+           g_ov_cells);
+  else
+    printf("M1 FEED OVERLAP WRONG (%u cells)\n", g_ov_cells);
+  fail |= !g_ov_ok || g_ov_cells == 0u;
+  if (g_df_bad == 0u && g_df_seen != 0u)
+    printf("M1 FEED DATAFLOW OK (%llu buffer accesses in feed runs; no "
+           "cross-lane RAW/WAR/WAW inside a run)\n",
+           (unsigned long long)g_df_seen);
+  else
+    printf("M1 FEED DATAFLOW WRONG (%u races, %llu accesses)\n", g_df_bad,
+           (unsigned long long)g_df_seen);
+  fail |= g_df_bad != 0u || g_df_seen == 0u;
+  if (g_q_ok && g_q_cells != 0u)
+    printf("M1 FEED QUEUES OK (n=2,3,4; %u cells, %llu slices, %llu lane "
+           "waits; each slice waited by its lane in its run, read in a later "
+           "run; output bit-identical to N=1)\n",
+           g_q_cells, (unsigned long long)g_q_slices,
+           (unsigned long long)g_q_lane_waits);
+  else
+    printf("M1 FEED QUEUES WRONG (%u cells)\n", g_q_cells);
+  fail |= !g_q_ok || g_q_cells == 0u;
   printf(g_feed_sched_ok
            ? "M1 GEMV VTCM FEED SCHEDULE OK (%llu pushes, %llu waits over the "
              "cases; whole-matrix descriptors, every read after its wait, 2 "
@@ -909,11 +1251,198 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
   return fail;
 }
 
+/* ---- [#225] The decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run) -------
+   Its parts side by side against fc_wh_det.h, bit for bit, with the feed
+   off (the arena behind the GEMV's l2fetch) and on (each lane's own
+   double buffer), both row loops, the bypass bit, a VTCM too small for
+   two columns a lane (the arena read again), and on the feed cells the
+   scoreboard: every block read only after its own lane's wait, no push
+   onto a block not read whole, every push read whole by the end. Then a
+   lane wait past its guard must fail the call. */
+static int run_fc_wh_case(const char *name, uint32_t K, uint32_t n_parts,
+                          const uint32_t *Np, uint8_t *vtcm, size_t vtcm_bytes,
+                          hexkl_moe_scratch *scratch, uint32_t flags,
+                          int *pushed) {
+  W w[4];
+  uint32_t h[4], N = 0;
+  rnd_state = 4242u + K + 31u * n_parts;
+  for (uint32_t p = 0; p < n_parts; ++p) {
+    make_weight(200u + p, K, Np[p], &w[p]);
+    for (uint32_t c = 0; c < Np[p]; ++c)
+      w[p].cs[c] = (int32_t)(rnd() % 4001u) - 2000; /* the zp term on */
+    h[p] = 200u + p;
+    N += Np[p];
+  }
+  float *x = (float *)malloc(sizeof(float) * K);
+  float *got = (float *)malloc(sizeof(float) * N);
+  float *want = (float *)malloc(sizeof(float) * N);
+  uint8_t *q = (uint8_t *)malloc(K);
+  for (uint32_t k = 0; k < K; ++k)
+    x[k] = rndf() * (k % 7u == 0u ? 3.0f : 1.0f);
+  float as;
+  int32_t az;
+  fc_wh_quant_row_det(x, K, q, &as, &az);
+  for (uint32_t p = 0, o = 0; p < n_parts; o += Np[p++])
+    for (uint32_t c = 0; c < Np[p]; ++c)
+      want[o + c] =
+        fc_wh_col_det(q, as, az, (const uint8_t *)w[p].nib, K / 32u,
+                      Np[p] / 32u, c, w[p].cs[c], w[p].ws[c], w[p].bias[c]);
+  memset(got, 0xA5, sizeof(float) * N);
+  score_reset(1, vtcm, vtcm_bytes);
+  g_own_slice_ok = 1;
+  const int rc = hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, (uint32_t)vtcm_bytes,
+                                         (uint32_t)vtcm_bytes, K, n_parts, h, x,
+                                         got, NULL, scratch, flags);
+  g_own_slice_ok = 0;
+  uint32_t unread = 0;
+  for (uint32_t k = 0; k < g_score_n; ++k)
+    unread += g_score[k].reads != g_score[k].row_size / 256u; /* 256 B units */
+  const int same = memcmp(got, want, sizeof(float) * N) == 0;
+  const int fail = rc != AEE_SUCCESS || !same || g_score_bad != 0u || unread;
+  *pushed = (int)g_score_n;
+  printf("FC WH %s K=%u parts=%u N=%u flags=0x%x: rc=%d bit_identical=%d "
+         "pushes=%u lane_waits=%u vtcm_reads=%u unread=%u bad=%u%s\n",
+         name, K, n_parts, N, flags, rc, same, g_score_n, g_lane_waits,
+         g_score_vtcm_reads, unread, g_score_bad, fail ? "  FAIL" : "");
+  g_score_on = 0;
+  for (uint32_t p = 0; p < n_parts; ++p) {
+    free(w[p].nib);
+    free(w[p].ws);
+    free(w[p].cs);
+    free(w[p].bias);
+    g_tbl.slots[200u + p].in_use = 0;
+  }
+  free(x);
+  free(got);
+  free(want);
+  free(q);
+  return fail;
+}
+
+static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
+                           hexkl_moe_scratch *scratch) {
+  static const uint32_t qkv[3] = {2048, 512, 512},
+                        thirds[3] = {2048, 2048, 2048}, one[1] = {2048},
+                        tiny[2] = {32, 96};
+  const struct {
+    const char *name;
+    uint32_t K, n;
+    const uint32_t *N;
+  } shapes[4] = {{"q|k|v", 2048, 3, qkv},
+                 {"in_proj", 2048, 3, thirds},
+                 {"out_proj", 2048, 1, one},
+                 {"tiny", 64, 2, tiny}};
+  const uint32_t feed_on =
+    HEXKL_MOE_FLAG_GEMV_FEED_SET | HEXKL_MOE_FLAG_GEMV_FEED;
+  const uint32_t cfgs[5] = {
+    HEXKL_MOE_FLAG_GEMV_FEED_SET, /* arena */
+    HEXKL_MOE_FLAG_GEMV_FEED_SET | HEXKL_MOE_FLAG_GEMV_ROWS1_SET |
+      HEXKL_MOE_FLAG_GEMV_ROWS1,
+    feed_on,
+    feed_on | HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_ROWS1,
+    feed_on | HEXKL_MOE_FLAG_DMA_BYPASS};
+  int fail = 0, pushed = 0, fed_cells = 0, small_ok = 1, cells = 0;
+  for (uint32_t s = 0; s < 4u; ++s)
+    for (uint32_t c = 0; c < 5u; ++c) {
+      fail |=
+        run_fc_wh_case(shapes[s].name, shapes[s].K, shapes[s].n, shapes[s].N,
+                       vtcm, vtcm_bytes, scratch, cfgs[c], &pushed);
+      ++cells;
+      /* the feed cells must feed, the arena cells must not */
+      if ((c >= 2u) != (pushed != 0)) {
+        printf("FC WH %s cfg %u: pushes=%d, want %s\n", shapes[s].name, c,
+               pushed, c >= 2u ? ">0" : "0");
+        fail = 1;
+      }
+      fed_cells += pushed != 0;
+    }
+  /* VTCM for less than two columns a lane: the arena read, same bytes */
+  fail |= run_fc_wh_case("q|k|v small-vtcm", 2048, 3, qkv, vtcm,
+                         2u * 6u * 2048u * 16u - 1u, scratch, feed_on, &pushed);
+  small_ok = pushed == 0;
+  fail |= !small_ok;
+  ++cells;
+  printf("-- injected lane timeout (the line below is expected to fail):\n");
+  g_lane_timeout = 1;
+  {
+    W w;
+    uint32_t hh = 200u;
+    float x[64], y[64];
+    make_weight(200u, 64, 64, &w);
+    for (uint32_t k = 0; k < 64u; ++k)
+      x[k] = rndf();
+    score_reset(1, vtcm, vtcm_bytes);
+    g_own_slice_ok = 1;
+    const int rc = hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, (uint32_t)vtcm_bytes,
+                                           (uint32_t)vtcm_bytes, 64u, 1u, &hh,
+                                           x, y, NULL, scratch, feed_on);
+    g_own_slice_ok = 0;
+    g_score_on = 0;
+    g_tbl.slots[200].in_use = 0;
+    free(w.nib);
+    free(w.ws);
+    free(w.cs);
+    free(w.bias);
+    printf("FC WH lane timeout: rc=%d (want AEE_EFAILED %d)\n", rc,
+           AEE_EFAILED);
+    fail |= rc != AEE_EFAILED;
+  }
+  g_lane_timeout = 0;
+  /* a handle of another K and a free one */
+  {
+    W w;
+    uint32_t hh = 200u, free_h = 201u;
+    float x[64], y[64] = {0};
+    make_weight(200u, 64, 64, &w);
+    const int r1 = hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, (uint32_t)vtcm_bytes,
+                                           (uint32_t)vtcm_bytes, 128u, 1u, &hh,
+                                           x, y, NULL, scratch, 0u);
+    const int r2 = hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, (uint32_t)vtcm_bytes,
+                                           (uint32_t)vtcm_bytes, 64u, 1u,
+                                           &free_h, x, y, NULL, scratch, 0u);
+    /* [#234 P4] a 2-bit handle: refused until plan 229 S2 */
+    g_tbl.slots[200].bits = 2u;
+    const int r3 = hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, (uint32_t)vtcm_bytes,
+                                           (uint32_t)vtcm_bytes, 64u, 1u, &hh,
+                                           x, y, NULL, scratch, 0u);
+    g_tbl.slots[200].bits = 4u;
+    g_tbl.slots[200].in_use = 0;
+    free(w.nib);
+    free(w.ws);
+    free(w.cs);
+    free(w.bias);
+    printf("FC WH refusals: other K rc=%d, free handle rc=%d, 2-bit rc=%d "
+           "(want %d)\n",
+           r1, r2, r3, AEE_EBADITEM);
+    fail |= r1 != AEE_EBADITEM || r2 != AEE_EBADITEM || r3 != AEE_EBADITEM;
+  }
+  if (!fail)
+    printf("FC WH BIT-IDENTICAL: hexkl_mm_u8i4_fc_m1_run vs fc_wh_det.h, %d "
+           "cells (q|k|v, in_proj thirds, out_proj, tiny; arena x rows4/rows1, "
+           "VTCM feed x rows4/rows1/bypass, a VTCM too small to feed); %d fed "
+           "cells, every block read after its lane's wait and read whole; "
+           "lane timeout fails the call\n",
+           cells, fed_cells);
+  else
+    printf("FC WH DIFFERS FROM fc_wh_det.h\n");
+  return fail;
+}
+
 int main(void) {
   const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
   hvx_scalar_hook.prefetch = hook_prefetch;
   hvx_scalar_hook.gemv = hook_gemv;
+  hvx_scalar_hook.gemv2 = hook_gemv2;
+  hvx_scalar_hook.buf = hook_buf;
   static uint8_t vtcm[8u << 20];
+  /* [#225] the FC cells alone: run_host_checks.sh's mutants of
+     hexkl_mm_u8i4_fc_m1_run, which need nothing else */
+  if (getenv("MOE_CHECK_FC_WH_ONLY") != NULL) {
+    hexkl_moe_scratch fs = {NULL, NULL, 0};
+    const int f = run_fc_wh_cases(vtcm, sizeof vtcm, &fs);
+    hexkl_moe_scratch_free(&fs);
+    return f;
+  }
 
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, sizeof vtcm, &L);
@@ -1110,6 +1639,60 @@ int main(void) {
     free(want_g);
   }
 
+  /* [plan 201 S4] HEXKL_MOE_FLAG_GELU_TANH on every path of the call. M=37
+     (HMX blocks plus two HVX tails) against the reference run with
+     geglu_det_one, and unlike the SwiGLU output above; then one token
+     routed to four experts on the HMX loop, the M=1 GEMV with the VTCM
+     feed and the GEMV on the arena read: the reference again, and the
+     three byte-equal. The epilogue's arithmetic is the stand-in's here;
+     the real HVX one is geglu_host_check.c's. */
+  {
+    float *gg = (float *)malloc(sizeof(float) * M * N_out);
+    float *want_g = (float *)calloc(M * N_out, sizeof(float));
+    score_reset(0, vtcm, sizeof vtcm);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, gg, NULL, &scratch, HEXKL_MOE_FLAG_GELU_TANH);
+    reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want_g,
+                    HVX_GLU_GELU_TANH);
+    double w37 = 0.0;
+    const uint32_t bad37 = count_mismatches(gg, want_g, M * N_out, &w37);
+    const int differs = memcmp(gg, got, sizeof(float) * M * N_out) != 0;
+
+    const uint32_t rc1[8] = {1, 1, 0, 1, 1};
+    const uint32_t ridx1[4] = {0, 0, 0, 0};
+    const float rw1[4] = {0.4f, 0.3f, 0.2f, 0.1f};
+    static const uint32_t fl1[3] = {
+      HEXKL_MOE_FLAG_GELU_TANH,
+      HEXKL_MOE_FLAG_GELU_TANH | HEXKL_MOE_FLAG_M1_GEMV,
+      HEXKL_MOE_FLAG_GELU_TANH | HEXKL_MOE_FLAG_M1_GEMV |
+        HEXKL_MOE_FLAG_GEMV_FEED_SET};
+    static const uint64_t path1[3] = {0u, 1u, 1u};
+    float o1[3][64], want1[64];
+    reference_layer(1, K, inter, N_out, NE, wg, wd, act, ridx1, rc1, rw1, want1,
+                    HVX_GLU_GELU_TANH);
+    int ok1 = 1;
+    for (int f = 0; f < 3; ++f) {
+      memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+      r |= hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K, inter, N_out, NE, hg, hd,
+        ridx1, rc1, rw1, act, o1[f], NULL, &scratch, fl1[f]);
+      ok1 &= hexkl_probe_us[HEXKL_PROBE_PATH] == path1[f] &&
+             memcmp(o1[f], o1[0], sizeof o1[0]) == 0;
+    }
+    double w1 = 0.0;
+    const uint32_t bad1 = count_mismatches(o1[0], want1, N_out, &w1);
+    const int ok = r == 0 && bad37 == 0u && differs && bad1 == 0u && ok1;
+    printf("geglu M=37 bad=%u worst_rel=%g differs_from_swiglu=%d; M=1 "
+           "hmx/gemv-vtcm/gemv-arena bad=%u same_path_bytes=%d rc=%d\n",
+           bad37, w37, differs, bad1, ok1, r);
+    printf(ok ? "MOE GEGLU FLAG OK (HMX, tail, M=1 GEMV feed+arena)\n"
+              : "MOE GEGLU FLAG WRONG\n");
+    fail |= !ok;
+    free(gg);
+    free(want_g);
+  }
+
   /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
      the host, against the whole call. Only the fp32 addition order may
      differ, so the error is taken against the output's largest magnitude:
@@ -1137,6 +1720,226 @@ int main(void) {
     fail |= (r != 0 || w > 1e-5);
     free(a);
     free(b);
+  }
+
+  /* QS2CX_WH: the same weights at two bits, expanded in VTCM after their
+     DMA lands. The output must be BIT identical -- the expansion puts the
+     int4 lattice back exactly, so every stage after the matmul sees what
+     it saw before. A tolerance here would hide the one failure mode that
+     matters, an expansion that is nearly right. This also exercises the
+     in-place placement: the codes land in the top half of the slot they
+     expand into, so a chunk boundary off by one clobbers a live tile and
+     shows up as a wrong row. */
+  {
+    const int8_t pal[4] = {-6, -2, 1, 5};
+    W wg2[8], wd2[8];
+    uint32_t hg2[8], hd2[8];
+    for (uint32_t e = 0; e < NE; ++e) {
+      make_weight_pal(2u * NE + e, 4u * NE + e, K, 2 * inter, pal, &wg2[e]);
+      make_weight_pal(3u * NE + e, 5u * NE + e, inter, N_out, pal, &wd2[e]);
+      hg2[e] = 2u * NE + e;
+      hd2[e] = 3u * NE + e;
+    }
+    float *four = (float *)malloc(sizeof(float) * M * N_out);
+    float *two = (float *)malloc(sizeof(float) * M * N_out);
+    hexkl_moe_scratch sc2 = {NULL, NULL, 0};
+    const unsigned long long kb0 = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+    int r4 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                         M, K, inter, N_out, NE, hg2, hd2, ridx,
+                                         rc_, rw, act, four, NULL, &sc2, 0u);
+    const unsigned long long kb4 = hexkl_probe_us[HEXKL_PROBE_DMA_KB] - kb0;
+    for (uint32_t e = 0; e < NE; ++e) {
+      hg2[e] = 4u * NE + e;
+      hd2[e] = 5u * NE + e;
+    }
+    int r2 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                         M, K, inter, N_out, NE, hg2, hd2, ridx,
+                                         rc_, rw, act, two, NULL, &sc2, 0u);
+    const unsigned long long kb2 =
+      hexkl_probe_us[HEXKL_PROBE_DMA_KB] - kb0 - kb4;
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < M * N_out; ++i) {
+      if (memcmp(&four[i], &two[i], sizeof(float)) != 0)
+        ++nb;
+    }
+    printf("2-bit experts     : rc=%d/%d  bitwise mismatches=%u of %u\n", r4,
+           r2, nb, M * N_out);
+    /* The point of the whole format: half the bytes cross the bus. Asserted
+       rather than inspected, because a push that quietly kept the full
+       width would still give the right answer. The probe counts whole
+       kilobytes and this shape's chunks are smaller than that, so the
+       2-bit side reads 0 -- what the bound catches is the regression that
+       matters, a 2-bit weight pushed at full width (which would read the
+       same as the 4-bit side, not half of it). */
+    printf("2-bit weight DMA  : %llu KB vs %llu (want <= half)\n", kb2, kb4);
+    fail |= (r4 != 0) || (r2 != 0) || (nb != 0) || (kb4 == 0ull) ||
+            (kb2 * 2ull > kb4);
+    free(four);
+    free(two);
+  }
+
+  /* A shape with more than one chunk a weight, so the expansion's
+     background lane actually runs. The shape above has inter_ntiles = 1
+     and dn_ntiles = acc_tiles, so every chunk is the first one and the
+     lookahead never fires -- which would have shipped the pipeline
+     untested. inter 64 and N_out 128 give two chunks each way. */
+  {
+    /* inter must exceed 512 for gate_up to have more than one chunk:
+       half is acc_tiles/2 and acc_tiles is min(32, 2*inter/32), so below
+       that every chunk is the first one. The lookahead is two batches, so
+       the queued path only runs at three chunks or more: inter 1088 gives
+       inter_ntiles 34 against half 16, and N_out 2112 gives dn_ntiles 66
+       against acc_tiles 32 -- three each. The real model is 1792 and 2048,
+       four and two. */
+    const uint32_t K2 = 64, I2 = 1088, N2 = 2112, NE2 = 3;
+    const int8_t pal[4] = {-7, -2, 2, 6};
+    W wg3[4], wd3[4];
+    uint32_t hg3[4], hd3[4], hg3b[4], hd3b[4];
+    for (uint32_t e = 0; e < NE2; ++e) {
+      make_weight_pal(6u * NE + e, 6u * NE + 8u + e, K2, 2 * I2, pal, &wg3[e]);
+      make_weight_pal(6u * NE + 16u + e, 6u * NE + 24u + e, I2, N2, pal,
+                      &wd3[e]);
+      hg3[e] = 6u * NE + e;
+      hd3[e] = 6u * NE + 16u + e;
+      hg3b[e] = 6u * NE + 8u + e;
+      hd3b[e] = 6u * NE + 24u + e;
+    }
+    const uint32_t M2 = 40;
+    float *a2 = (float *)malloc(sizeof(float) * M2 * K2);
+    for (uint32_t i = 0; i < M2 * K2; ++i)
+      a2[i] = rndf();
+    uint32_t rc2[4] = {70, 1, 64};
+    uint32_t nr2 = 0;
+    for (uint32_t e = 0; e < NE2; ++e)
+      nr2 += rc2[e];
+    uint32_t *ri2 = (uint32_t *)malloc(sizeof(uint32_t) * nr2);
+    float *rw2 = (float *)malloc(sizeof(float) * nr2);
+    for (uint32_t i = 0; i < nr2; ++i) {
+      ri2[i] = rnd() % M2;
+      rw2[i] = 0.2f + 0.7f * ((float)(rnd() % 100u) / 100.f);
+    }
+    float *o4 = (float *)malloc(sizeof(float) * M2 * N2);
+    float *o2 = (float *)malloc(sizeof(float) * M2 * N2);
+    hexkl_moe_scratch sc3 = {NULL, NULL, 0};
+    int r4 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                         M2, K2, I2, N2, NE2, hg3, hd3, ri2,
+                                         rc2, rw2, a2, o4, NULL, &sc3, 0u);
+    int r2 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                         M2, K2, I2, N2, NE2, hg3b, hd3b, ri2,
+                                         rc2, rw2, a2, o2, NULL, &sc3, 0u);
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < M2 * N2; ++i) {
+      if (memcmp(&o4[i], &o2[i], sizeof(float)) != 0)
+        ++nb;
+    }
+    printf("2-bit multi-chunk : rc=%d/%d  bitwise mismatches=%u of %u "
+           "(chunks gu=%u dn=%u)\n",
+           r4, r2, nb, M2 * N2, (I2 / 32u + 15u) / 16u, (N2 / 32u + 31u) / 32u);
+    fail |= (r4 != 0) || (r2 != 0) || (nb != 0);
+    free(a2);
+    free(ri2);
+    free(rw2);
+    free(o4);
+    free(o2);
+  }
+
+  /* 2-bit on the M=1 GEMV path with the VTCM feed (#117): the feed pushes
+     half the bytes into packed-size slabs and the native LUT GEMV consumes
+     them without materializing int4. Bitwise identical or the format is not
+     usable on this path. The real
+     shape, because the feed only engages when two gate_up slabs and two
+     downs fit the arena -- the tiny shape would silently run the arena
+     read and prove nothing. */
+  {
+    const uint32_t K4 = 2048, I4 = 1792, N4 = 2048, NE4 = 4;
+    const int8_t pal[4] = {-6, -2, 1, 5};
+    const uint32_t S0 = 200u;
+    W wg4[4], wd4[4];
+    uint32_t hg4[4], hd4[4], hg4b[4], hd4b[4];
+    uint32_t rc4[4] = {1, 1, 1, 1};
+    uint32_t ri4[4] = {0, 0, 0, 0};
+    float rw4[4] = {0.3f, 0.7f, 0.5f, 0.9f};
+    for (uint32_t e = 0; e < NE4; ++e) {
+      make_weight_pal(S0 + 4u * e, S0 + 4u * e + 1u, K4, 2 * I4, pal, &wg4[e]);
+      make_weight_pal(S0 + 4u * e + 2u, S0 + 4u * e + 3u, I4, N4, pal, &wd4[e]);
+      hg4[e] = S0 + 4u * e;
+      hd4[e] = S0 + 4u * e + 2u;
+      hg4b[e] = S0 + 4u * e + 1u;
+      hd4b[e] = S0 + 4u * e + 3u;
+    }
+    float *a4 = (float *)malloc(sizeof(float) * K4);
+    for (uint32_t i = 0; i < K4; ++i)
+      a4[i] = rndf();
+    float *g4 = (float *)malloc(sizeof(float) * N4);
+    float *g2 = (float *)malloc(sizeof(float) * N4);
+    /* [plan 229] Every M=1 schedule htp_decode has: the arena read, the
+       VTCM feed on the ring and on four queues (#177 / #185), and the
+       GeGLU epilogue on the four-queue feed (#231). Each against its own
+       4-bit run; dma_kb only means something where the feed pushes. */
+    const uint32_t feed = HEXKL_MOE_FLAG_M1_GEMV |
+                          HEXKL_MOE_FLAG_GEMV_FEED_SET |
+                          HEXKL_MOE_FLAG_GEMV_FEED;
+    static const char *const name[4] = {"arena", "feed q=1", "feed q=4",
+                                        "feed q=4 geglu"};
+    const uint32_t fls[4] = {
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET, feed,
+      feed | (3u << HEXKL_MOE_DMA_Q_SHIFT),
+      feed | (3u << HEXKL_MOE_DMA_Q_SHIFT) | HEXKL_MOE_FLAG_GELU_TANH};
+    hexkl_moe_scratch sc4 = {NULL, NULL, 0};
+    for (uint32_t c = 0; c < 4u; ++c) {
+      const uint32_t fl = fls[c];
+      const uint64_t want_feed = c == 0u ? 0ull : c == 1u ? 1ull : 4ull;
+      /* Both runs under the audits run_m1_case applies: the lead's boxes,
+         and under the feed the scoreboard (every column read from a waited
+         push of its shape) and the cross-lane dataflow. */
+      const uint64_t cols2 = (uint64_t)NE4 * ((2u * I4 + N4) / 32u);
+      const uint32_t df0 = g_df_bad;
+      memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+      pf_reset();
+      score_reset(c != 0u, vtcm, sizeof vtcm);
+      int r4 = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K4, I4, N4, NE4, hg4, hd4,
+        ri4, rc4, rw4, a4, g4, NULL, &sc4, fl);
+      int audit = g_pf_bad == 0u && g_score_bad == 0u &&
+                  (c == 0u || g_score_vtcm_reads == cols2);
+      const uint64_t path4 = hexkl_probe_us[HEXKL_PROBE_PATH];
+      const uint64_t feed4 = hexkl_probe_us[HEXKL_PROBE_M1_FEED];
+      const uint64_t kb4 = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+      memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+      pf_reset();
+      score_reset(c != 0u, vtcm, sizeof vtcm);
+      int r2 = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K4, I4, N4, NE4, hg4b, hd4b,
+        ri4, rc4, rw4, a4, g2, NULL, &sc4, fl);
+      audit &= g_pf_bad == 0u && g_score_bad == 0u && g_df_bad == df0 &&
+               (c == 0u || g_score_vtcm_reads == cols2);
+      score_reset(0, vtcm, sizeof vtcm);
+      const uint64_t path2 = hexkl_probe_us[HEXKL_PROBE_PATH];
+      const uint64_t feed2 = hexkl_probe_us[HEXKL_PROBE_M1_FEED];
+      const uint64_t kb2 = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+      uint32_t nb = 0;
+      for (uint32_t i = 0; i < N4; ++i) {
+        if (memcmp(&g4[i], &g2[i], sizeof(float)) != 0)
+          ++nb;
+      }
+      printf("2-bit M1 GEMV %-14s: rc=%d/%d path=%llu/%llu feed=%llu/%llu "
+             "dma_kb=%llu vs %llu (want %s) audit=%d  bitwise mismatches=%u "
+             "of %u\n",
+             name[c], r4, r2, (unsigned long long)path4,
+             (unsigned long long)path2, (unsigned long long)feed4,
+             (unsigned long long)feed2, (unsigned long long)kb2,
+             (unsigned long long)kb4, c == 0u ? "0" : "half", audit, nb, N4);
+      fail |= (r4 != 0) || (r2 != 0) || (nb != 0) || !audit ||
+              (path4 != 1ull) || (path2 != 1ull) || (feed4 != want_feed) ||
+              (feed2 != want_feed) ||
+              (c == 0u ? (kb4 != 0ull || kb2 != 0ull)
+                       : (kb4 == 0ull || kb2 * 2ull != kb4));
+    }
+    for (uint32_t e = 0; e < 4u * NE4; ++e)
+      g_tbl.slots[S0 + e].in_use = 0;
+    free(a4);
+    free(g4);
+    free(g2);
   }
 
   /* --- edge cases the routing can actually produce --------------------- */
@@ -1300,6 +2103,7 @@ int main(void) {
   }
 
   fail |= run_m1_cases(vtcm, sizeof vtcm, &scratch);
+  fail |= run_fc_wh_cases(vtcm, sizeof vtcm, &scratch);
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
   free(g_gemv_log);
   hexkl_moe_scratch_free(&scratch);
