@@ -91,22 +91,30 @@ typedef struct {
   uint32_t v_wh;       /**< [n_kv_bufs][n_res][dt] V weight tiles */
   uint32_t kv_bytes;   /**< bytes of one K^T (or V) buffer */
   uint32_t n_kv_bufs;  /**< 2 when the next head's K/V fit alongside */
-  uint32_t q_f32;      /**< [2][64][hd] f32 Q rows staged by DMA */
-  uint32_t q_ah;       /**< [3][dt] uint8 Q tiles */
+  uint32_t q_u16;      /**< [2][64][hd] u16 Q rows staged by DMA */
+  uint32_t q_ah;       /**< [3][2][dt] uint8 Q tiles: low bytes, high bytes */
   uint32_t s16;        /**< [2][n_blk][64][32] int16 scores */
-  uint32_t planes;     /**< 2 convert planes, 2 KiB each (HMX thread only) */
-  uint32_t p_ah;       /**< [2][n_blk] uint8 P' tiles */
+  uint32_t planes;     /**< 4 convert planes, 2 KiB each (HMX thread only) */
+  uint32_t p_ah;       /**< [2][2][n_blk] uint8 P16 tiles: low, high bytes */
   uint32_t o16;        /**< [2][dt][64][32] int16 output */
   uint32_t corr;       /**< [2][n_res + 1][32] int16 zero-point correction */
   uint32_t corr_bytes; /**< bytes of one corr slot */
-  uint32_t cvt;        /**< 6 bias blocks: QK lo/hi x 2 slots, PV lo/hi */
-  uint32_t smx;        /**< softmax scratch */
-  uint32_t rowsum;     /**< [2] HVX_SOFTMAX_Q_ROWSUM_WORDS int32 */
+  uint32_t cvt;        /**< bias blocks: QK 2^(k+8), 2^k, 2^(k-8) x 2 slots,
+                            PV 2^9, 2^1, 2^-7 (HEXKL_ATTN_Q2_CVT_BLOCKS) */
+  uint32_t smx;        /**< [HEXKL_ATTN_Q2_SMX_PARTS] softmax scratches */
   uint32_t total;      /**< first byte past the last region */
   uint32_t n_res;      /**< resident column tiles */
   uint32_t n_blk;      /**< most column tiles one block sees */
   uint32_t dt;         /**< head_dim / 32 */
 } hexkl_attn_q2_layout;
+
+/** @brief Bias blocks in the cvt region: 3 QK blocks per head parity and
+ *         3 PV blocks, padded to a 2 KiB multiple. */
+#define HEXKL_ATTN_Q2_CVT_BLOCKS 10u
+/** @brief Softmax scratches: one per worker sharing a block's softmax. */
+#define HEXKL_ATTN_Q2_SMX_PARTS 3u
+#define HEXKL_ATTN_Q2_SMX_BYTES                                                \
+  hexkl_attn_round_up(HVX_SOFTMAX_Q_SCRATCH_BYTES, HEXKL_ATTN_Q2_TILE)
 
 /**
  * @brief Validates the shape for this kernel: head_dim up to 512, the
@@ -165,26 +173,24 @@ static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
     off += bufs * L->kv_bytes;
     L->v_wh = off;
     off += bufs * L->kv_bytes;
-    L->q_f32 = off;
-    off += 2u * HEXKL_ATTN_Q2_ROWS * s->head_dim * 4u;
+    L->q_u16 = off;
+    off += 2u * HEXKL_ATTN_Q2_ROWS * s->head_dim * 2u;
     L->q_ah = off;
-    off += HEXKL_ATTN_Q2_Q_SLOTS * dt * TB;
+    off += HEXKL_ATTN_Q2_Q_SLOTS * 2u * dt * TB;
     L->s16 = off;
     off += HEXKL_ATTN_Q2_SLOTS * n_blk * HEXKL_ATTN_Q2_TILE16;
     L->planes = off;
-    off += 2u * HEXKL_CVT_PLANE_BYTES;
+    off += 4u * HEXKL_CVT_PLANE_BYTES;
     L->p_ah = off;
-    off += HEXKL_ATTN_Q2_SLOTS * n_blk * TB;
+    off += HEXKL_ATTN_Q2_SLOTS * 2u * n_blk * TB;
     L->o16 = off;
     off += HEXKL_ATTN_Q2_SLOTS * dt * HEXKL_ATTN_Q2_TILE16;
     L->corr = off;
     off += 2u * L->corr_bytes;
     L->cvt = off;
-    off += 6u * HEXKL_CVT_BLOCK_BYTES;
+    off += HEXKL_ATTN_Q2_CVT_BLOCKS * HEXKL_CVT_BLOCK_BYTES;
     L->smx = off;
-    off += hexkl_attn_round_up(HVX_SOFTMAX_Q_SCRATCH_BYTES, TB);
-    L->rowsum = off;
-    off += HEXKL_ATTN_Q2_SLOTS * TB;
+    off += HEXKL_ATTN_Q2_SMX_PARTS * HEXKL_ATTN_Q2_SMX_BYTES;
     L->total = off;
     if (off <= arena_top) {
       return HEXKL_ATTN_OK;

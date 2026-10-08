@@ -395,14 +395,25 @@ private:
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;
   /**
-   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache) int8
-   *        path's scales: K per KV head, V per (KV head, dim), Q per query
-   *        head. A quantized model supplies these as encodings; this f32
-   *        model stands in for them by calibrating on the first rows it
-   *        sees (max / 127) and keeping them, so later steps pay nothing.
-   *        Values beyond them saturate, as they would under encodings.
+   * @brief The fixed-scale (row-blocked, ComputeOps::sdpa_q2_kvcache)
+   *        a16 / kv8 path's encodings: K per KV head and V per (KV head,
+   *        dim) as symmetric int8 scales, Q and the context output per
+   *        query head as 16-bit asymmetric (scale, zero point) pairs. A
+   *        quantized model supplies these as encodings; this f32 model
+   *        stands in for them by calibrating on the first rows it sees
+   *        (K/V max / 127, Q's range, the output's from V's range since the
+   *        context is a convex combination of V rows) and keeping them, so
+   *        later steps pay nothing. Values beyond them saturate, as they
+   *        would under encodings. The u16 Q and output of each step live in
+   *        the two staging buffers.
    */
-  std::vector<float> q2_scale_k, q2_scale_v, q2_scale_q;
+  std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
+  /** The a16 path's u16 Q and output, one pair for every layer: per layer
+   *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
+   *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
+   *  MHACoreLayer instances, so layers must not run concurrently (they run
+   *  in graph order); a per-thread pair is the upgrade if they ever do. */
+  static std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
@@ -533,8 +544,7 @@ private:
    */
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
-  std::vector<float>
-    htp_rope_table_; /**< [max_timestep][cos hd/2 | sin hd/2] */
+  std::vector<float> htp_rope_table_; /**< [max_timestep][cos 32 | sin 32] */
   bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
                                            prompt are the DSP's, not this cache's */
 
