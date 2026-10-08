@@ -14,6 +14,7 @@
 #define __GEMMA4_CAUSAL_LM_H__
 
 #include <causal_lm.h>
+#include <set>
 
 namespace causallm {
 
@@ -58,6 +59,40 @@ protected:
   bool USE_DOUBLE_WIDE_MLP = false;
   float EMBEDDING_PER_LAYER_SCALE = 1.0f;
 
+  /** MoE block beside the dense MLP (config enable_moe_block; doc 55). The
+   *  expert layer is the LFM2 MoE layer with router_type softmax_scale, so
+   *  the same nntr_config keys as LFM2 drive it: moe_layer_dtype,
+   *  moe_engine, moe_htp_layers, and moe_cache_experts (the per-layer expert
+   *  cache C; NNTR_MOE_CACHE_EXPERTS in the environment overrides it). */
+  bool ENABLE_MOE_BLOCK = false;
+  unsigned int NUM_EXPERTS = 0;
+  unsigned int NUM_EXPERTS_PER_TOK = 0;
+  unsigned int MOE_INTERMEDIATE_SIZE = 0;
+  std::string MOE_LAYER_DTYPE;
+  std::string MOE_ENGINE = "cpu";
+  std::set<int> MOE_HTP_LAYERS;
+  unsigned int MOE_CACHE_EXPERTS = 0;
+
+  /** Engines of the attention projections (q, k, v, o) and of the dense
+   *  MLP's three fully connected layers, under the nntr_config keys
+   *  Lfm2CausalLM reads (doc 50): attn_proj_engine / attn_proj_htp_layers
+   *  and dense_ffn_engine / dense_ffn_htp_layers. "htp" moves only their
+   *  prefill matmul to the accelerator -- FloatTensor::dot declines M == 1,
+   *  so decode keeps the CPU Q4_0 kernel on the same weight, which the Q4_0
+   *  registration path leaves resident. An empty layer list means every
+   *  layer. Default "cpu" leaves every existing run unchanged. */
+  /** @brief The tied lm_head takes the final norm and the logit softcap
+   *  (doc 57 section 9.7): constructModel then ends at the last block's
+   *  output and Gemma4CausalLM's lm_head norms it. */
+  bool FOLD_OUTPUT_NORM = false;
+  /** @brief lmhead_engine: "htp" runs the tied lm_head (norm, head,
+   *  softcap) as one NPU call; "cpu" (default) keeps it on the CPU. */
+  std::string LMHEAD_ENGINE = "cpu";
+  std::string ATTN_PROJ_ENGINE = "cpu";
+  std::set<int> ATTN_PROJ_HTP_LAYERS;
+  std::string FFN_ENGINE = "cpu";
+  std::set<int> FFN_HTP_LAYERS;
+
   std::string FULL_ATTENTION_ROPE_TYPE = "default";
   std::string SLIDING_ATTENTION_ROPE_TYPE = "default";
   float FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR = 1.0f;
@@ -72,11 +107,11 @@ protected:
   unsigned int getKVCacheWidth(int layer_id) const;
   void appendSkipPrefillIfNeeded(std::vector<std::string> &props,
                                  bool enable_skip) const;
-  virtual Tensor createFeedForwardBlock(const int layer_id,
-                                        Tensor post_attention,
-                                        bool is_kv_shared_layer);
   std::pair<Tensor, Tensor>
   createGemma4KVCachePlaceholders(const int layer_id, unsigned int kv_width);
+  /** The per-layer input embedding, projection and norm (hidden_size_per_
+   *  layer_input != 0); leaves the result in per_layer_input. */
+  void constructPerLayerInput(Tensor x, Tensor h);
 
 public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
@@ -96,6 +131,9 @@ public:
 
   Tensor createMlp(const int layer_id, int dim, int hidden_dim,
                    Tensor input) override;
+  /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
+   *  on @a input, both already normed by the caller. */
+  Tensor createMoe(const int layer_id, Tensor input);
 
   void registerCustomLayers() override;
 
