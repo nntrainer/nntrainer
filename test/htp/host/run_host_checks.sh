@@ -390,3 +390,17 @@ python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
   "$HERE/hvx_scalar_stubs.c" "$HERE/standin/hvx_scalar.c" -lm
 
 "$OUT/swap_host_check"
+
+# The q2 attention calibration's abs-max (abs_max.h): natively, and on the
+# NEON path when an aarch64 g++ and qemu-aarch64 are installed (ABS MAX OK).
+ABS_SRCS="$HERE/abs_max_check.cpp $BACKEND/../../utils/fp16.cpp"
+ABS_INC="-I $BACKEND/../../../Applications/CausalLM/layers -I $BACKEND/../../utils -I $BACKEND/../.."
+g++ -std=c++17 -O2 $ABS_INC -o "$OUT/abs_max_check" $ABS_SRCS
+"$OUT/abs_max_check"
+if command -v aarch64-linux-gnu-g++ >/dev/null && command -v qemu-aarch64 >/dev/null; then
+  aarch64-linux-gnu-g++ -std=c++17 -O2 -static $ABS_INC \
+    -o "$OUT/abs_max_check_a64" $ABS_SRCS
+  qemu-aarch64 "$OUT/abs_max_check_a64"
+else
+  echo "abs_max: aarch64 g++ or qemu-aarch64 missing, NEON path not run"
+fi

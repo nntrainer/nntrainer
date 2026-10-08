@@ -26,6 +26,7 @@ static std::mutex rope_init_mtx;
 #include <fp16.h>
 #include <layer_context.h>
 
+#include <abs_max.h>
 #include <mha_core.h>
 
 #include "htp_decode_hook.h"
@@ -1014,22 +1015,16 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
     const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
     for (unsigned int n = 0; n < num_heads_KV; ++n) {
-      float &sk = q2_scale_k[n];
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        const unsigned int i = n * head_dim + d;
-        sk = std::max(sk, std::fabs(nntrainer::compute_fp16_to_fp32(kr[i])));
-        q2_scale_v[i] = std::max(
-          q2_scale_v[i], std::fabs(nntrainer::compute_fp16_to_fp32(vr[i])));
-      }
+      q2_scale_k[n] =
+        causallm::abs_max_f16(kr + n * head_dim, head_dim, q2_scale_k[n]);
     }
+    causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, q2_scale_v.data());
   }
   for (unsigned int r = 0; r < n_q; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
     for (unsigned int h = 0; h < num_heads_Q; ++h) {
-      float &sq = q2_scale_q[h];
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        sq = std::max(sq, std::fabs(qr[h * head_dim + d]));
-      }
+      q2_scale_q[h] =
+        causallm::abs_max_f32(qr + h * head_dim, head_dim, q2_scale_q[h]);
     }
   }
   auto finish = [](float &x) { x = x > 0.0f ? x / 127.0f : 1.0f; };
