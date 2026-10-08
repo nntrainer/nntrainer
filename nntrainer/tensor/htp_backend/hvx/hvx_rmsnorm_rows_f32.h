@@ -71,4 +71,16 @@ int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
                             const float *gamma, float eps, float scale,
                             hvx_worker_pool *pool);
 
+/**
+ * @brief hvx_rmsnorm_add_res_f32 with x given as column blocks: block b is
+ *        an M x cols[b] row-major matrix holding columns [sum of the
+ *        earlier cols, + cols[b]) -- the per-handle layout
+ *        hexkl_mm_u8i4_layer_run writes. Every cols[b] a multiple of 32;
+ *        out and res are M x sum(cols) row-major and must not overlap x.
+ */
+int hvx_rmsnorm_add_blocks_f32(float *out, const float *res,
+                               const float *const *xb, const uint32_t *cols,
+                               uint32_t n_blk, uint32_t M, const float *gamma,
+                               float eps, float scale, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_RMSNORM_ROWS_F32_H__ */
