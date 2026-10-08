@@ -449,6 +449,13 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // accelerator call. With a per-layer input the scalar comes after that
   // path instead and stays its own layer.
   const bool fold_scalar = HIDDEN_SIZE_PER_LAYER_INPUT == 0;
+  // With the MoE block and the scalar folded, the MoE layer takes the whole
+  // epilogue (out_add): its input is the residual, so the DSP call that
+  // runs the experts adds the dense branch, norms, adds and scales, and the
+  // residual_add below is not built (one FastRPC call and three activation
+  // copies a layer, doc 57 section 9.30). Same weights in the same order.
+  if (ENABLE_MOE_BLOCK && fold_scalar && !is_kv_shared_layer)
+    return createMoe(layer_id, post_attention, &ffn_out);
   std::vector<Tensor> ffn_terms = {post_attention, ffn_out};
   if (ENABLE_MOE_BLOCK) {
     // Gemma4TextDecoderLayer: norm_1(mlp) + norm_2(experts(norm(residual)))
@@ -552,7 +559,8 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   return layer_scalar(decoder_output);
 }
 
-Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
+Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
+                                    const Tensor *dense_out) {
   const std::string engine =
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
                                                                : "cpu";
@@ -566,6 +574,7 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
     withKey("in_norm", "true"),
     withKey("router_norm", "true"),
     withKey("out_norm", "true"),
+    withKey("out_add", dense_out ? "true" : "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("weight_dtype", MOE_LAYER_DTYPE),
     withKey("engine", engine)};
@@ -573,6 +582,8 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
     props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
   appendSkipPrefillIfNeeded(props, isKVSharedLayer(layer_id));
   LayerHandle moe(createLayer("lfm2_moe", props));
+  if (dense_out)
+    return moe({input, *dense_out});
   return moe(input);
 }
 

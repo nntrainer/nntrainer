@@ -133,7 +133,11 @@ public:
                    Tensor input) override;
   /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
    *  on @a input, both already normed by the caller. */
-  Tensor createMoe(const int layer_id, Tensor input);
+  /** @param dense_out non-null: the layer also takes the post-FFN epilogue
+   *  with the dense branch's output (out_add, doc 57 section 9.30) and
+   *  returns the decoder block's output. */
+  Tensor createMoe(const int layer_id, Tensor input,
+                   const Tensor *dense_out = nullptr);
 
   void registerCustomLayers() override;
 
