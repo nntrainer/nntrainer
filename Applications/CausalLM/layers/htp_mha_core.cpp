@@ -985,6 +985,32 @@ bool MHACoreLayer::try_accelerated_attention(
   return true;
 }
 
+void MHACoreLayer::registerQuantizedCache(nntrainer::RunLayerContext &context) {
+  compute_ops_ = context.getComputeOps();
+  if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
+      !compute_ops_->supports_kv_cache_q() || !is_causal ||
+      !q_cache_handles.empty())
+    return;
+  // try_quantized_attention's own gate for a layer the int8 kernels take
+  const bool q2 = kv_cache_quant_kind == 0 &&
+                  compute_ops_->supports_kv_cache_q2() &&
+                  attn_logit_softcapping <= 0.0f;
+  if (!q2 && head_dim > 256)
+    return;
+  const nntrainer::Tensor &ck =
+    use_external_cache
+      ? context.getInput(3)
+      : context.getTensor(tensor_idx[AttentionParams::cache_key]);
+  const int h = compute_ops_->kv_cache_q_register(
+    static_cast<unsigned int>(kv_cache_quant_kind), ck.getDim().height(),
+    num_heads_KV, head_dim);
+  if (h < 0)
+    return;
+  q_cache_handles.assign(1, h);
+  q_cache_synced.assign(1, 0);
+  q2_scales_set.assign(1, 0);
+}
+
 void MHACoreLayer::release_quantized_cache() {
   if (compute_ops_) {
     for (int h : q_cache_handles) {

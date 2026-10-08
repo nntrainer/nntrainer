@@ -198,6 +198,17 @@ public:
 WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
 public:
   /**
+   * @brief Registers batch 0's quantized KV cache on the accelerator now
+   *        rather than inside the first attention call, where it cost the
+   *        first prefill 1.9 ms a layer (doc 57 section 9.24).
+   *        Called once at load after every weight is placed (the cache is
+   *        DSP heap: grown between two arena chunk mappings it would strand
+   *        address space, transformer.cpp). A refusal leaves the handle
+   *        unset, and the first call registers and falls back as before.
+   */
+  void registerQuantizedCache(nntrainer::RunLayerContext &context);
+
+  /**
    * @brief Constructor of MhaCore Layer
    */
   WIN_EXPORT MHACoreLayer();
