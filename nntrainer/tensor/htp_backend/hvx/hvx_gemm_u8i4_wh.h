@@ -88,4 +88,38 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
 void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
                                uint32_t n_tiles, uint32_t k_tiles);
 
+/**
+ * @brief Native packed-2-bit counterpart of hvx_gemm_u8i4_wh_col_nopf.
+ *
+ * @a wh contains QS2CX_WH codes in whPack2 order (256 bytes per 32x32
+ * tile), not expanded int4 WH bytes. @a table is the 128-byte, replicated
+ * code-pair LUT from hvx_expand_i2i4_table. It is loaded into an HVX
+ * register once and each lookup result feeds vrmpyacc directly; no expanded
+ * weight is written to VTCM.
+ */
+void hvx_gemm_u8i2_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, uint32_t rows1,
+                               const uint8_t *table, int32_t *out);
+
+/**
+ * @brief Compute two packed-2-bit columns while sharing activation loads,
+ *        splats and the register LUT. The optimized kernel is used for M=1;
+ *        larger M falls back to two exact single-column calls.
+ */
+void hvx_gemm_u8i2_wh_cols2_nopf(const uint8_t *act_ah, uint32_t m,
+                                 uint32_t k_tiles, const uint8_t *wh,
+                                 uint32_t n_col, uint32_t nt0, uint32_t nt1,
+                                 uint32_t rows1, const uint8_t *table,
+                                 int32_t *out0, int32_t *out1);
+
+/** @brief Native packed-2-bit GEMV with one packed-layout l2fetch. */
+void hvx_gemm_u8i2_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, const uint8_t *table, int32_t *out);
+
+/** @brief l2fetch for adjacent 256-byte packed-2-bit WH tiles. */
+void hvx_gemm_u8i2_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles);
+
 #endif /* __NNTRAINER_HVX_GEMM_U8I4_WH_H__ */

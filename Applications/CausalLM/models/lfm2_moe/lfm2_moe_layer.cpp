@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <thread_manager.h>
 #include <unordered_map>
+#include <unordered_set>
 
 /** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
     purpose -- every model on ARM uses it and nothing is wrong with it.
@@ -1161,6 +1162,29 @@ static bool tryMoeLayerOnAccelerator(
     dn_scale[e] = dn.getScale<float>();
   }
 
+  // [#260, plan 201 S1] A virtual layer hands all its experts and the
+  // LRU's policy to the backend at its first call (the first prefill runs
+  // the layers in order), for the one-PD token's miss path: the pool's
+  // slots are this LRU's, one set (lfm2_moe_pool_layer.cpp's hand-over).
+  if (experts_virtual) {
+    // ponytail: one model per process -- the set, like the backend's
+    // pool_descs_, is never cleared; a second model in the same process
+    // needs both reset with it.
+    static std::unordered_set<const void *> handed;
+    if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
+      std::vector<ExpertFileDesc> all;
+      for (size_t e = 0; e < n_experts; ++e)
+        all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
+                                 context.getWeight(down_indices[e])));
+      ops->set_decode_moe_experts(
+        all, [](const std::vector<const void *> &need,
+                const std::function<void(const void *)> &load,
+                const std::function<void(const void *)> &evict) {
+          g_expert_lru.acquire(need, load, evict);
+        });
+    }
+  }
+
   // [doc 52] Virtual experts: the ones this call routes to are made
   // resident through the shared LRU (a miss releases the least recently
   // used expert's slot and reads this one from the file into it), the
@@ -1599,6 +1623,11 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   output_step_dim.height(to - from);
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
+    // [#260] a decode row under the one-PD token (NNTR_HTP_E2E=1): the DSP
+    // runs the block's norms, router and experts in the list, so nothing
+    // here is read -- checked ahead of the folded norms below
+    if (to - from == 1 && input_.batch() == 1 && htpDecodeRowResident(from))
+      continue;
 
     auto input = input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);

@@ -109,6 +109,10 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
         htpDecodeAdd(from, in1_step.getData<float>(), out_step.getData<float>(),
                      W))
       continue;
+    // [#260] a fused epilogue's row under the one-PD token: its norm, add
+    // and scalar are the list's RMSNORM / ADD ops, run by the DSP
+    if (fused && rows == 1 && out.batch() == 1 && htpDecodeRowResident(from))
+      continue;
     if (!fused) {
       out_step.copy(in0_step);
       out_step.add_i(in1_step);

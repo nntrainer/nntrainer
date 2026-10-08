@@ -30,9 +30,12 @@
  *         LFM2.5-8B-A1B resident in full (doc 45) is 22 MoE layers x 64 +
  *         2 dense x 2 + 18 conv x 2 + 6 attention x 4 = 1472, so 512 --
  *         which bounded the MoE work to 8 layers at a time -- is not
- *         enough for the whole model. The table is ~48 bytes per slot;
- *         2048 costs ~100 KB of static DSP memory. */
-#define HEXKL_MM_U8I4_MAX_WEIGHTS 2048
+ *         enough for the whole model. [plan 201 S1] Gemma-4-26B-A4B's
+ *         expert pool in one PD is about 1300 slots of 2 weights each
+ *         (plan 201 section 3.4), so 4096. The table is ~36 bytes per slot
+ *         on the DSP; 4096 costs ~150 KB of the session struct (DSP heap,
+ *         +75 KB over 2048). */
+#define HEXKL_MM_U8I4_MAX_WEIGHTS 4096
 
 /**
  * @brief One registered weight: WH-baked bytes plus its dequant constants,
@@ -48,6 +51,13 @@ typedef struct {
   void *arrays;      /**< the one allocation the three arrays sit in */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
+  /** 4 (QS4CX_WH) or 2 (QS2CX_WH); 0 in a slot never filled reads as 4.
+      At 2, wh_bytes holds half as many bytes -- two bits a weight indexing
+      @a pal -- which the M=1 GEMV looks up in a register
+      (hvx_gemm_u8i2_wh_*) and the HMX path expands to int4 in VTCM
+      (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
+  uint32_t bits;
+  int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;
 
 typedef struct {
@@ -111,15 +121,34 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
  *        bias zeroed. What an expert swap does when the retired pair has
  *        the new expert's shape -- no allocation, no free, no slot search.
  *        NULL @a w_scale and @a colsum_w take them from the arena after
- *        @a wh, as hexkl_weight_u8i4_register_arena does.
+ *        @a wh, as hexkl_weight_u8i4_register_arena does. A non-NULL
+ *        @a pal makes the slot 2-bit (QS2CX_WH codes at @a wh, the tail
+ *        after whBytes2), NULL makes it 4-bit.
  *
  * @return AEE_SUCCESS, or AEE_EBADPARM (changing nothing) for a free,
  *         owned or differently shaped slot, or an unaligned @a wh.
  */
 int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
-                                   const float *w_scale,
+                                   const int8_t *pal, const float *w_scale,
                                    const int32_t *colsum_w);
+
+/**
+ * @brief hexkl_weight_u8i4_register_arena for QS2CX_WH: half the bytes,
+ *        plus the palette.
+ *
+ * @a wh is whBytes2(K, N) = K*N/4 bytes of 2-bit codes in whPack's nibble
+ * order, and @a pal the four int4 codes they index. NULL arrays take the
+ * scales and column sums from the arena after the codes. The HMX path
+ * expands a chunk in place after its DMA lands, so no VTCM is set aside for
+ * it -- see hexkl_moe_expand_chunk.
+ */
+int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
+                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
+                                     const uint8_t *wh, const int8_t *pal,
+                                     const float *w_scale,
+                                     const int32_t *colsum_w, const float *bias,
+                                     uint32_t *out_handle);
 
 /** @brief Whether any live slot borrows bytes inside [base, base+bytes). */
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,

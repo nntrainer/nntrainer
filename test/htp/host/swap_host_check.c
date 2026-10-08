@@ -310,6 +310,90 @@ int main(void) {
     }
   }
 
+  /* 8. [plan 229] QS2CX_WH through weight_swap_batch_u2i4_arena: the
+        codes are half a 4-bit weight's bytes and the tail follows them
+        there; the live 4-bit pair from 7 is rebound in place to 2 bits
+        (bits and palette move with the bytes), then back to 4; a fresh
+        2-bit pair registers; a palette length that disagrees is refused
+        whole. */
+  {
+    enum { GU2 = GU_BYTES / 2, DN2 = DN_BYTES / 2 };
+    const int8_t pg[4] = {-1, 0, 1, 1}, pd[4] = {-7, -2, 2, 6};
+    float *gt = (float *)(va + 0 + GU2);    /* gate_up's tail at 2 bits */
+    float *dt = (float *)(va + 4096 + DN2); /* down's */
+    for (int i = 0; i < NGU; ++i) {
+      gt[i] = 0.25f * (float)i;
+      ((int32_t *)gt)[NGU + i] = 50 - i;
+    }
+    for (int i = 0; i < NOUT; ++i) {
+      dt[i] = 9.0f + (float)i;
+      ((int32_t *)dt)[NOUT + i] = 2 * i;
+    }
+    uint32_t lg = NONE, ld = NONE;
+    for (unsigned i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
+      const hexkl_weight_u8i4 *w = &g_s.weights_u8i4.slots[i];
+      if (w->in_use && w->K == K && w->N == NGU)
+        lg = i;
+      if (w->in_use && w->K == INTER && w->N == NOUT)
+        ld = i;
+    }
+    CHECK(lg != NONE && ld != NONE && live() == 2);
+    uint32_t og[1] = {lg}, od[1] = {ld}, ar[1] = {0}, ofg[1] = {0},
+             ofd[1] = {4096}, hg[1] = {NONE}, hd[1] = {NONE}, done = 9;
+    int32_t err = 1;
+    CHECK(nntr_hvx_weight_swap_batch_u2i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 1, od, 1, ar,
+            1, ofg, 1, ofd, 1, pg, 4, pd, 4, hg, 1, hd, 1, &done,
+            &err) == AEE_SUCCESS);
+    CHECK(done == 1 && err == AEE_SUCCESS && hg[0] == lg && hd[0] == ld);
+    const hexkl_weight_u8i4 *w2g = &g_s.weights_u8i4.slots[lg];
+    const hexkl_weight_u8i4 *w2d = &g_s.weights_u8i4.slots[ld];
+    CHECK(w2g->bits == 2u && w2d->bits == 2u && live() == 2);
+    CHECK(memcmp(w2g->pal, pg, 4) == 0 && memcmp(w2d->pal, pd, 4) == 0);
+    CHECK(w2g->wh_bytes == va && w2d->wh_bytes == va + 4096);
+    CHECK(memcmp(w2g->w_scale, gt, sizeof(float) * NGU) == 0);
+    CHECK(memcmp(w2g->colsum_w, gt + NGU, sizeof(int32_t) * NGU) == 0);
+    CHECK(memcmp(w2d->w_scale, dt, sizeof(float) * NOUT) == 0);
+    CHECK(memcmp(w2d->colsum_w, dt + NOUT, sizeof(int32_t) * NOUT) == 0);
+    /* back to four bits by the 4-bit swap: the tag follows the bytes */
+    uint32_t g4 = NONE, d4 = NONE;
+    CHECK(nntr_hvx_weight_swap_u8i4_arena((remote_handle64)(uintptr_t)&g_s, lg,
+                                          ld, K, INTER, NOUT, 0, 8192, 12288,
+                                          NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                          &g4, &d4) == AEE_SUCCESS);
+    CHECK(g4 == lg && w2g->bits == 4u && w2d->bits == 4u);
+    /* a fresh 2-bit pair (register path): 2 bits from the first call */
+    og[0] = od[0] = NONE;
+    CHECK(nntr_hvx_weight_swap_batch_u2i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 1, od, 1, ar,
+            1, ofg, 1, ofd, 1, pg, 4, pd, 4, hg, 1, hd, 1, &done,
+            &err) == AEE_SUCCESS);
+    CHECK(done == 1 && live() == 4 && hg[0] != lg);
+    CHECK(g_s.weights_u8i4.slots[hg[0]].bits == 2u &&
+          g_s.weights_u8i4.slots[hd[0]].bits == 2u);
+    CHECK(memcmp(g_s.weights_u8i4.slots[hd[0]].colsum_w, dt + NOUT,
+                 sizeof(int32_t) * NOUT) == 0);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hg[0]);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd[0]);
+    CHECK(live() == 2);
+    /* the extent at two bits: down's codes + tail end exactly at the
+       arena's end, which the 4-bit extent would have refused */
+    og[0] = lg;
+    od[0] = ld;
+    ofd[0] = ARENA - DN2 - 8u * NOUT;
+    CHECK(nntr_hvx_weight_swap_batch_u2i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 1, od, 1, ar,
+            1, ofg, 1, ofd, 1, pg, 4, pd, 4, hg, 1, hd, 1, &done,
+            &err) == AEE_SUCCESS);
+    CHECK(done == 1 && w2d->wh_bytes == va + ofd[0] && w2d->bits == 2u);
+    /* three palette bytes for one expert: refused whole */
+    CHECK(nntr_hvx_weight_swap_batch_u2i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, og, 1, od, 1, ar,
+            1, ofg, 1, ofd, 1, pg, 3, pd, 4, hg, 1, hd, 1, &done,
+            &err) == AEE_EBADPARM);
+    CHECK(done == 0 && live() == 2);
+  }
+
   printf("WEIGHT SWAP OK\n");
   return 0;
 }
