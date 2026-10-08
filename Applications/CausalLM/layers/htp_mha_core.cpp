@@ -367,7 +367,18 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor output_step = output.getSharedDataTensor(
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
-    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    // The accelerated paths take the f32 query and write f32 output, and
+    // the cache write converts the f32 rows itself, so the fp16 staging
+    // below (four step-sized tensors and five element-wise conversions a
+    // layer) only costs: ~36 ms of a 1023-row step beside a 41 ms call
+    // (doc 57 section 9.16). If the call still fails, the CPU computes
+    // from the f32 query as the non-Android build always does.
+    const bool accelerated = compute_ops_ && is_causal &&
+                             (compute_ops_->supports_sdpa_fp16_kvcache() ||
+                              (kv_cache_quant_kind >= 0 && !q_cache_failed &&
+                               compute_ops_->supports_kv_cache_q()));
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        !accelerated) {
 #if ENABLE_FP16 && defined(__ANDROID__)
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
@@ -412,6 +423,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
           cache_value_dim, cache_value_step_dim);
       }
 #endif
+    } else if (use_sink) {
+      one_batch_incremental_forwarding(
+        batch, from, from, to, query_step, key_step, value_step, output_step,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+        cache_value_dim, cache_value_step_dim, sink);
     } else {
       one_batch_incremental_forwarding(
         batch, from, from, to, query_step, key_step, value_step, output_step,
