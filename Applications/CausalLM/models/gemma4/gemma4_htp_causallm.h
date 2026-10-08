@@ -121,6 +121,13 @@ public:
                                int seq_len, int n_heads, int head_dim,
                                Tensor query);
 
+private:
+  /** createAttention returns the attention core's output, leaving the
+   *  o-proj to the post-attention residual_add (proj, doc 57 section 9.32);
+   *  set by the block around its one call. */
+  bool fold_o_proj_ = false;
+
+public:
   Tensor createTransformerDecoderBlock(const int layer_id,
                                        Tensor input) override;
 
@@ -133,7 +140,11 @@ public:
                    Tensor input) override;
   /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
    *  on @a input, both already normed by the caller. */
-  Tensor createMoe(const int layer_id, Tensor input);
+  /** @param dense_out non-null: the layer also takes the post-FFN epilogue
+   *  with the dense branch's output (out_add, doc 57 section 9.30) and
+   *  returns the decoder block's output. */
+  Tensor createMoe(const int layer_id, Tensor input,
+                   const Tensor *dense_out = nullptr);
 
   void registerCustomLayers() override;
 

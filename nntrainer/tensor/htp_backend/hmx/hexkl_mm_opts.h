@@ -58,6 +58,14 @@ typedef struct {
       docs/htp_attention's u8-boundary task for the transport arithmetic
       this buys. */
   const uint8_t *act_ah_prepacked;
+
+  /** Non-NULL: act_f32's rows are RMS-normed (pre_gamma, NULL = 1, and
+      pre_eps) on their way into the quant pass, through this scratch of
+      M x K floats at most (hvx_quant_params_pack_u8_ah), instead of by a
+      separate pass writing all M normed rows out. Not with act_scale. */
+  float *pre_scratch;
+  const float *pre_gamma;
+  float pre_eps;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */
