@@ -46,17 +46,11 @@ void hexkl_dma_ring_reset(void) {
   g_started = 0;
 }
 
-void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
-                           uint32_t src_stride, uint32_t row_size,
-                           uint32_t nrows, int src_vtcm, int dst_vtcm) {
-  if (((g_push + 1) & (HEXKL_DMA_RING_N - 1)) == g_pop) {
-    // Ring full: the oldest transfer must have already finished by the time
-    // we have wrapped this far around, so reclaiming it is a formality, not
-    // a stall -- but wait for `done` explicitly rather than assume it.
-    hexkl_dma_ring_wait_idx_(g_pop);
-    g_pop = (g_pop + 1) & (HEXKL_DMA_RING_N - 1);
-  }
-  hexkl_dma_desc2d *d = &g_ring[g_push];
+/* One descriptor's fields, as every push of this file sets them. */
+static void hexkl_dma_desc_fill(hexkl_dma_desc2d *d, void *dst, const void *src,
+                                uint32_t dst_stride, uint32_t src_stride,
+                                uint32_t row_size, uint32_t nrows, int src_vtcm,
+                                int dst_vtcm) {
   d->next = 0;
   d->desc_size = 1;
   d->desc_type = 9;
@@ -78,6 +72,21 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
   d->nrows_hi = (nrows >> 8) & 0xffu;
   Q6_dccleaninva_A(
     (void *)d); // push the descriptor to memory for the DMA engine
+}
+
+void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
+                           uint32_t src_stride, uint32_t row_size,
+                           uint32_t nrows, int src_vtcm, int dst_vtcm) {
+  if (((g_push + 1) & (HEXKL_DMA_RING_N - 1)) == g_pop) {
+    // Ring full: the oldest transfer must have already finished by the time
+    // we have wrapped this far around, so reclaiming it is a formality, not
+    // a stall -- but wait for `done` explicitly rather than assume it.
+    hexkl_dma_ring_wait_idx_(g_pop);
+    g_pop = (g_pop + 1) & (HEXKL_DMA_RING_N - 1);
+  }
+  hexkl_dma_desc2d *d = &g_ring[g_push];
+  hexkl_dma_desc_fill(d, dst, src, dst_stride, src_stride, row_size, nrows,
+                      src_vtcm, dst_vtcm);
   if (!g_started) {
     hexkl_dma_start(d);
     g_started = 1;
@@ -125,4 +134,28 @@ void hexkl_dcache_inva(const void *p, uint32_t bytes) {
   (void)p;
   (void)bytes;
 #endif
+}
+
+void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
+                           void *dst, const void *src, uint32_t dst_stride,
+                           uint32_t src_stride, uint32_t row_size,
+                           uint32_t nrows, int src_bypass, int dst_vtcm) {
+  hexkl_dma_desc_fill(d, dst, src, dst_stride, src_stride, row_size, nrows,
+                      src_bypass, dst_vtcm);
+  if (prev == 0) {
+    hexkl_dma_start(d);
+  } else {
+    hexkl_dma_link(prev, d);
+  }
+}
+
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
+  long guard = 0;
+  while (!((volatile hexkl_dma_desc2d *)d)->done) {
+    if (guard++ >= 50000000L) {
+      return -1;
+    }
+    hexkl_dma_poll();
+  }
+  return 0;
 }

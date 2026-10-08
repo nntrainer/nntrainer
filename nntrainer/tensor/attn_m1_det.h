@@ -52,7 +52,7 @@
  *
  * Per call (L = pos + 1 positions, q head hq over kv head h = hq / gqa,
  * Kt[head_dim][max_seq] and V[max_seq][head_dim] per kv head, head_dim a
- * multiple of 8 -- 64 on the kernel):
+ * multiple of 8 -- a multiple of 64 up to 512 on the kernel):
  *
  *   0. round    q16 = rne16(q), k16 = rne16(k), v16 = rne16(v) (copyData)
  *   1. append   Kt[d][pos] = k16[d];  V[pos][d] = v16[d]
@@ -84,6 +84,33 @@
  * one was from the fp16 CPU (plan 152's table, the other way round), and
  * the host E2E's resident attention lines read against it (#152's
  * fwd-hd64 39.18 -> 37.17 dB).
+ *
+ * GEMMA 4 (plan 201 S4; nntrainer/nntrainer#4296 at d345c347). The same
+ * steps at head_dim 256 (sliding layers, 8 kv heads) and 512 (full layers,
+ * 2 kv heads), 16 q heads: the CPU's fp16 loops are head_dim-generic (one
+ * float16x8_t accumulator over d = 8 blk + l; one PV chain per d). Three
+ * differences, each a parameter here, none a new operation:
+ *   window  sliding layers see the last min(L, 1024) positions
+ *           (attn_m1_det_lo; mha_core's sliding_window, UINT_MAX for full
+ *           layers). The cache keeps every position, as the CPU's does.
+ *   scale   Gemma4TextAttention's scaling is 1.0: the CPU pre-multiplies q
+ *           by sqrt(head_dim) (scalar_multiply, gemma4_causallm.cpp) and
+ *           compute_kcaches divides by it again; the DSP runs scale 1.0 on
+ *           the un-multiplied q instead. At 256 the two are the same bits
+ *           (x 16 and / 16 are exact) up to fp16 subnormals and overflow; at
+ *           512 the CPU's two roundings by 22.627417f differ by an ulp at
+ *           times -- not the CPU's bits, which plan 201 D2 allows.
+ *           ponytail: a 64 K-entry fp16 table of rne16(t / sqrt(512)) would
+ *           give the CPU's bits at 512 if a text ever needs them.
+ *   K = V   attention_k_eq_v drops the v projection only: v = k before the
+ *           norms, then k_norm (gamma) + RoPE and v_norm (no gamma, no
+ *           RoPE), so the cached K and V rows differ and both are stored.
+ * No attention softcap: the 26B-A4B config has no attn_logit_softcapping,
+ * so mha_core's (attn_logit_softcapping > 0) branch never runs.
+ * ponytail: decode (m = 1) only. Gemma's prefill attention on the DSP --
+ * the HMX path (hexkl_attn_f16.c) at head_dim 256 / 512 with the window
+ * and the per-layer RoPE -- is not built; the CPU runs Gemma's prefill and
+ * seeds this cache (kv_append) until a step takes it on.
  *
  * DOMAIN. Every fp16 value finite: |q|, |k|, |v| < 65520 and no score, sum
  * or output past 65504 (the CPU's own softmax turns an overflow into NaN,
@@ -372,38 +399,70 @@ static inline void attn_m1_det_softmax(float *s, uint32_t L, float *m_out,
   }
 }
 
+/** @brief The largest head_dim the spec (and the kernel) takes: Gemma 4's
+ *         global_head_dim. */
+#define ATTN_M1_DET_MAX_HD 512u
+
 /**
- * @brief Steps 2-7 for one q head against one kv head's cache.
+ * @brief The first visible position of a call over L positions with a
+ *        sliding window (plan 201 S4): the CPU's start_row = num_rows <
+ *        local_window_size ? 0 : num_rows - local_window_size with
+ *        num_rows = L (neon_impl_fp16.cpp compute_kcaches and
+ *        compute_fp16vcache_transposed, the softmax's end_row likewise), so
+ *        the last min(L, window) positions, the new one included. window 0
+ *        is mha_core's UINT_MAX: every position.
+ */
+static inline uint32_t attn_m1_det_lo(uint32_t L, uint32_t window) {
+  return (window != 0u && L > window) ? L - window : 0u;
+}
+
+/**
+ * @brief Steps 2-7 for one q head against one kv head's cache, over the
+ *        positions [lo, L) (step 2's scores, 3-6's max / sum / divide and
+ *        7's PV chain all start at lo; a full causal call is lo = 0).
  *
- * @param q        [head_dim], this q head (post-RoPE), head_dim <= 128
+ * @param q        [head_dim], this q head (post-RoPE), head_dim <=
+ *                 ATTN_M1_DET_MAX_HD
  * @param Kt, V    the kv head's cache: Kt [head_dim][max_seq], V
  *                 [max_seq][head_dim]
- * @param L        positions in the cache, 1..max_seq
- * @param e        scratch of at least L floats (the probabilities)
+ * @param lo, L    the visible positions, lo < L <= max_seq
+ * @param e        scratch of at least L floats (the probabilities, at their
+ *                 positions)
  * @param out      [head_dim]
  * @param m_out, l_out  the max and the sum (the localising intermediates
  *                 the IDL's stats report); may be NULL
  */
+static inline void attn_m1_det_head_range(const float *q, const float *Kt,
+                                          const float *V, uint32_t head_dim,
+                                          uint32_t max_seq, uint32_t lo,
+                                          uint32_t L, float scale, float *e,
+                                          float *out, float *m_out,
+                                          float *l_out) {
+  float q16[ATTN_M1_DET_MAX_HD];
+  for (uint32_t d = 0; d < head_dim; ++d) {
+    q16[d] = attn_m1_det_rne16(q[d]);
+  }
+  for (uint32_t p = lo; p < L; ++p) {
+    e[p] = attn_m1_det_score(q16, Kt, head_dim, max_seq, p, scale);
+  }
+  attn_m1_det_softmax(e + lo, L - lo, m_out, l_out);
+  for (uint32_t d = 0; d < head_dim; ++d) {
+    float o = 0.0f;
+    for (uint32_t p = lo; p < L; ++p) {
+      o = attn_m1_det_fma16(o, e[p], V[(size_t)p * head_dim + d]);
+    }
+    out[d] = o;
+  }
+}
+
+/** @brief attn_m1_det_head_range over every position, [0, L). */
 static inline void attn_m1_det_head(const float *q, const float *Kt,
                                     const float *V, uint32_t head_dim,
                                     uint32_t max_seq, uint32_t L, float scale,
                                     float *e, float *out, float *m_out,
                                     float *l_out) {
-  float q16[128];
-  for (uint32_t d = 0; d < head_dim; ++d) {
-    q16[d] = attn_m1_det_rne16(q[d]);
-  }
-  for (uint32_t p = 0; p < L; ++p) {
-    e[p] = attn_m1_det_score(q16, Kt, head_dim, max_seq, p, scale);
-  }
-  attn_m1_det_softmax(e, L, m_out, l_out);
-  for (uint32_t d = 0; d < head_dim; ++d) {
-    float o = 0.0f;
-    for (uint32_t p = 0; p < L; ++p) {
-      o = attn_m1_det_fma16(o, e[p], V[(size_t)p * head_dim + d]);
-    }
-    out[d] = o;
-  }
+  attn_m1_det_head_range(q, Kt, V, head_dim, max_seq, 0u, L, scale, e, out,
+                         m_out, l_out);
 }
 
 /**
@@ -413,27 +472,39 @@ static inline void attn_m1_det_head(const float *q, const float *Kt,
  * @param q        [n_kv * gqa][head_dim]
  * @param Kt_layer [n_kv][head_dim][max_seq]
  * @param V_layer  [n_kv][max_seq][head_dim]
+ * @param window   [plan 201 S4] attend to the last min(L, window)
+ *                 positions (attn_m1_det_lo); 0 = all L
  * @param e        scratch of at least L floats
  * @param out      [n_kv * gqa][head_dim]
  * @param stats    2 * n_kv * gqa floats, (m, l) per q head; may be NULL
  */
+static inline void attn_m1_det_forward_win(
+  const float *q, const float *Kt_layer, const float *V_layer, uint32_t n_kv,
+  uint32_t gqa, uint32_t head_dim, uint32_t max_seq, uint32_t L,
+  uint32_t window, float scale, float *e, float *out, float *stats) {
+  const uint32_t lo = attn_m1_det_lo(L, window);
+  for (uint32_t h = 0; h < n_kv; ++h) {
+    const float *Kt = Kt_layer + (size_t)h * head_dim * max_seq;
+    const float *V = V_layer + (size_t)h * max_seq * head_dim;
+    for (uint32_t g = 0; g < gqa; ++g) {
+      const uint32_t hq = h * gqa + g;
+      attn_m1_det_head_range(
+        q + (size_t)hq * head_dim, Kt, V, head_dim, max_seq, lo, L, scale, e,
+        out + (size_t)hq * head_dim, stats ? stats + 2u * hq : (float *)0,
+        stats ? stats + 2u * hq + 1u : (float *)0);
+    }
+  }
+}
+
+/** @brief attn_m1_det_forward_win with no window (full causal). */
 static inline void attn_m1_det_forward(const float *q, const float *Kt_layer,
                                        const float *V_layer, uint32_t n_kv,
                                        uint32_t gqa, uint32_t head_dim,
                                        uint32_t max_seq, uint32_t L,
                                        float scale, float *e, float *out,
                                        float *stats) {
-  for (uint32_t h = 0; h < n_kv; ++h) {
-    const float *Kt = Kt_layer + (size_t)h * head_dim * max_seq;
-    const float *V = V_layer + (size_t)h * max_seq * head_dim;
-    for (uint32_t g = 0; g < gqa; ++g) {
-      const uint32_t hq = h * gqa + g;
-      attn_m1_det_head(q + (size_t)hq * head_dim, Kt, V, head_dim, max_seq, L,
-                       scale, e, out + (size_t)hq * head_dim,
-                       stats ? stats + 2u * hq : (float *)0,
-                       stats ? stats + 2u * hq + 1u : (float *)0);
-    }
-  }
+  attn_m1_det_forward_win(q, Kt_layer, V_layer, n_kv, gqa, head_dim, max_seq, L,
+                          0u, scale, e, out, stats);
 }
 
 #endif /* __NNTRAINER_ATTN_M1_DET_H__ */
