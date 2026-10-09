@@ -407,6 +407,7 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
   for (t = 0; t < TOKENS; ++t) {
     uint64_t t0;
     emb_row(t, x);
+    s.g->attn_prof_on = t % 3u == 0u; /* [#261] the words change no value */
     t0 = now_ns();
     rc = hexkl_token_main(s.g, &s.env, page, t, t % s.g->max_seq, x, HID,
                           t % 2u ? logits : NULL, VOCAB, SPIN_US, &st, &id);
@@ -431,6 +432,31 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
   CHECK(st.timeouts + st.stale + st.misses == 0u,
         "timeouts %u stale %u misses %u", st.timeouts, st.stale, st.misses);
   cover = check_kind_ns(&st, wall_ns, "resident");
+  {
+    /* [#261] one ATTN_M1 op per token, its words on every third token */
+    const uint64_t *w = s.g->attn_prof[0];
+    const uint32_t want = (TOKENS + 2u) / 3u;
+    CHECK(s.g->attn_prof_calls[0] == want && s.g->attn_prof_calls[1] == 0u,
+          "attn phase calls %u / %u, want %u / 0", s.g->attn_prof_calls[0],
+          s.g->attn_prof_calls[1], want);
+    CHECK(w[ATTN_M1_PROF_SCORES] > 0u && w[ATTN_M1_PROF_SOFTMAX] > 0u &&
+            w[ATTN_M1_PROF_PV] > 0u && w[ATTN_M1_PROF_POOL] > 0u &&
+            w[ATTN_M1_PROF_SOFTMAX] >=
+              w[ATTN_M1_PROF_EXP] + w[ATTN_M1_PROF_ET] + w[ATTN_M1_PROF_DIV],
+          "attn phase words scores %llu softmax %llu pv %llu pool %llu",
+          (unsigned long long)w[ATTN_M1_PROF_SCORES],
+          (unsigned long long)w[ATTN_M1_PROF_SOFTMAX],
+          (unsigned long long)w[ATTN_M1_PROF_PV],
+          (unsigned long long)w[ATTN_M1_PROF_POOL]);
+    if (g_fail == 0)
+      printf("TOKEN ATTN PHASES OK: %u calls with words (every third token), "
+             "logits unchanged; scores/softmax/pv = %.2f/%.2f/%.2f of pool "
+             "(host clock and hvx_emu: not a device split)\n",
+             s.g->attn_prof_calls[0],
+             (double)w[ATTN_M1_PROF_SCORES] / (double)w[ATTN_M1_PROF_POOL],
+             (double)w[ATTN_M1_PROF_SOFTMAX] / (double)w[ATTN_M1_PROF_POOL],
+             (double)w[ATTN_M1_PROF_PV] / (double)w[ATTN_M1_PROF_POOL]);
+  }
   if (g_fail == 0)
     printf("TOKEN DRIVER BIT-IDENTICAL: tokens %u/%u (%u distinct ids) "
            "logits bit_identical=1 "

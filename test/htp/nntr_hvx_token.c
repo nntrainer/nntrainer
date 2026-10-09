@@ -40,6 +40,8 @@
 
 typedef char
   token_route_fits[HTP_DSPQ_TOKEN_ROUTE == HEXKL_GRAPH_ROUTE_LOG ? 1 : -1];
+typedef char
+  token_attn_prof_fits[HTP_DSPQ_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS ? 1 : -1];
 
 /** @brief The session's driver: its page and its counters. */
 struct nntr_hvx_token {
@@ -142,6 +144,8 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
     return AEE_EINVALIDFORMAT;
   }
   nntr_hvx_graph_env(s, &env);
+  memset(s->graph->attn_prof_calls, 0, sizeof(s->graph->attn_prof_calls));
+  memset(s->graph->attn_prof, 0, sizeof(s->graph->attn_prof));
   rc = hexkl_token_main(s->graph, &env, t->page, tok, pos, act, act_len, logits,
                         logits_len, t->spin_us, &t->st, &id);
   r->wall_pcyc = (uint32_t)(HAP_perf_get_pcycles() - pc0);
@@ -162,6 +166,13 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
       (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);
     r->kind_us[k] = (uint32_t)HAP_perf_qtimer_count_to_us(t->st.kind_qt[k] -
                                                           before.kind_qt[k]);
+  }
+  for (k = 0; k < 2u; ++k) { /* [#261] zeros unless attn_prof_on */
+    uint32_t w;
+    r->attn_calls[k] = s->graph->attn_prof_calls[k];
+    for (w = 0; w < HTP_DSPQ_ATTN_PROF_WORDS; ++w) {
+      r->attn_prof[k][w] = (uint32_t)s->graph->attn_prof[k][w];
+    }
   }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "[token] tok=%u pos=%u: 0x%08x (timeouts %u stale %u)",

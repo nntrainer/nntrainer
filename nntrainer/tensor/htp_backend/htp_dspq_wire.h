@@ -39,6 +39,12 @@
 /** @brief OP_TOKEN: S2 writes the logits into buffer 1 (NNTR_PPL_DECODE,
  *  the shadows); without it only the id travels. */
 #define HTP_DSPQ_TOKEN_LOGITS 1u
+/** @brief [#261] OP_TOKEN: the ATTN_M1 ops run with their phase words
+ *  (htp_dspq_token_resp.attn_prof; NNTR_HTP_PROFILE on the ARM). */
+#define HTP_DSPQ_TOKEN_ATTN_PROF 2u
+/** @brief [#261] attn_m1_det.h's ATTN_M1_PROF_WORDS (the DSP side asserts
+ *  they agree). */
+#define HTP_DSPQ_ATTN_PROF_WORDS 14u
 /** @brief mm_u8i4_moe_layer_timed's slot count; both sides check theirs. */
 #define HTP_DSPQ_STAGES 31u
 #define HTP_DSPQ_MAX_MSG 4096u
@@ -105,6 +111,11 @@ typedef struct htp_dspq_token_resp_s {
                                            its guess at the next one's
                                            routing, count then ids, best
                                            first (hexkl_graph.h pred_log) */
+  /** [#261] under HTP_DSPQ_TOKEN_ATTN_PROF: the ATTN_M1 calls of the
+   *  token and their phase words summed, [0] the first KV cache's (LFM2,
+   *  Gemma's sliding layers), [1] the second's (Gemma's full layers) */
+  uint32_t attn_calls[2];
+  uint32_t attn_prof[2][HTP_DSPQ_ATTN_PROF_WORDS];
 } htp_dspq_token_resp;
 
 /** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):

@@ -59,6 +59,7 @@
 
 #include <stdint.h>
 
+#include "../../attn_m1_det.h" /* nntrainer/tensor/, not on every path */
 #include "../htp_graph_desc.h" /* beside hmx/, on every include path */
 #include "hexkl_mm_u8i4_moe.h"
 #include "hvx_attn_m1_f32.h"
@@ -221,6 +222,13 @@ typedef struct hexkl_graph_s {
                        LM_BAN ids skipped */
   uint32_t ban[HTP_GRAPH_MAX_BAN]; /**< [#132 Part B E3] LM_BAN's ids */
   uint32_t n_ban;
+  /** [#261] While attn_prof_on (the token driver sets it per token), each
+   *  ATTN_M1 op runs the kernel's _prof entry and adds its phase words
+   *  (attn_m1_det.h ATTN_M1_PROF_*) here: [0] env->attn_m1's calls,
+   *  [1] env->attn_m1_b's (Gemma's full layers). Off: no timestamp. */
+  uint32_t attn_prof_on;
+  uint32_t attn_prof_calls[2];
+  uint64_t attn_prof[2][ATTN_M1_PROF_WORDS];
 } hexkl_graph;
 
 /** @brief HTP_GRAPH_KIND_BIT mask of the kinds whose table slot is

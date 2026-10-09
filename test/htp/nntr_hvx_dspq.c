@@ -141,7 +141,8 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
   uint32_t i;
   const int logits = len == sizeof(*q) && (q->flags & HTP_DSPQ_TOKEN_LOGITS);
   const int valid =
-    len == sizeof(*q) && (q->flags & ~HTP_DSPQ_TOKEN_LOGITS) == 0u &&
+    len == sizeof(*q) &&
+    (q->flags & ~(HTP_DSPQ_TOKEN_LOGITS | HTP_DSPQ_TOKEN_ATTN_PROF)) == 0u &&
     nb <= 2u && (nb == 2u) == (logits != 0) &&
     (nb < 1u || (bufs[0].ptr != NULL && bufs[0].size % 4u == 0u)) &&
     (nb < 2u || (bufs[1].ptr != NULL && bufs[1].size % 4u == 0u));
@@ -149,6 +150,9 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
   resp.t_in_us = (uint32_t)dspq_now_us();
   resp.seq = len >= 8 ? m->u[1] : 0;
   if (valid) {
+    if (d->s->graph != NULL) { /* [#261] read by the ATTN_M1 ops */
+      d->s->graph->attn_prof_on = (q->flags & HTP_DSPQ_TOKEN_ATTN_PROF) != 0u;
+    }
     resp.rc = nntr_hvx_token_run(
       d->s, q->seq, q->pos, nb >= 1u ? (const float *)bufs[0].ptr : NULL,
       nb >= 1u ? (uint32_t)(bufs[0].size / 4u) : 0u,
