@@ -177,9 +177,40 @@ TEST(ExpertLru, HeldSlotsAreNotHandedOutUntilUnheld) {
     std::logic_error);
   // The reads land: unhold, then file them with no eviction.
   lru.unhold(2);
-  lru.acquire({key(8), key(9)}, [](ExpertLru::Key) {}, r.evict);
+  lru.acquire(
+    {key(8), key(9)}, [](ExpertLru::Key) {}, r.evict);
   EXPECT_EQ(r.evicted.size(), 2u);
   EXPECT_EQ(lru.size(), 6u);
+}
+
+TEST(ExpertLru, LrfuKeepsTheFrequentKeyWhereLruDropsIt) {
+  // A three times, then B, then C into a pool of 2: LRU drops A (least
+  // recent), LRFU drops B (one use against A's three, decayed by a long
+  // half-life) -- tools/moe_expert_cache_sim.py's lrfu on the same calls
+  for (const double h : {0.0, 32.0}) {
+    ExpertLru lru;
+    int layer;
+    lru.setLrfu(h);
+    lru.addLayer(&layer, 2);
+    Recorder r;
+    for (int e : {0, 0, 0, 1, 2})
+      lru.acquire({key(e)}, r.load, r.evict);
+    EXPECT_EQ(r.evicted, std::vector<int>{h > 0.0 ? 1 : 0}) << "h=" << h;
+  }
+}
+
+TEST(ExpertLru, LrfuForgetsOldUsesWithAShortHalfLife) {
+  // A used three times long ago, B four times since: with a half-life of
+  // one call A's score has decayed below B's, so C evicts A, not B
+  ExpertLru lru;
+  int layer;
+  lru.setLrfu(1.0);
+  lru.addLayer(&layer, 2);
+  Recorder r;
+  for (int e : {0, 0, 0, 1, 1, 1, 1})
+    lru.acquire({key(e)}, r.load, r.evict);
+  lru.acquire({key(2)}, r.load, r.evict);
+  EXPECT_EQ(r.evicted, std::vector<int>{0});
 }
 
 } // namespace

@@ -17,6 +17,12 @@
  * decides which key goes when, the same rule Lfm2CachedSlimMoELayer uses:
  * evict the least recently used, refresh recency from the routing's
  * extended top-k so the likely-next experts move to the back.
+ *
+ * [#289] NNTR_MOE_LRFU=<H> (tokens) evicts by LRFU instead: each key's
+ * score is its use count decayed by half every H tokens (H x layers
+ * acquire() calls), the lowest score goes, ties least recent first --
+ * tools/moe_expert_cache_sim.py's lrfu:H, which cuts the #266 p1024 trace's
+ * misses at C = 24 by 20 %. The score outlives the key's residency.
  */
 
 #ifndef __CAUSALLM_EXPERT_LRU_H__
@@ -24,6 +30,9 @@
 #ifdef __cplusplus
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -47,6 +56,10 @@ public:
     if (layers_.insert(layer).second)
       capacity_ += per_layer;
   }
+
+  /** @brief [#289] LRFU with a half-life of @a tokens (0: LRU); the
+   *  default is NNTR_MOE_LRFU's. Set before the first acquire(). */
+  void setLrfu(double tokens) { lrfu_ = tokens; }
 
   size_t capacity() const { return capacity_; }
   size_t size() const {
@@ -91,17 +104,7 @@ public:
     if (pinned_resident + n > cap)
       return false;
     size_t excess = order_.size() + n > cap ? order_.size() + n - cap : 0;
-    for (auto it = order_.begin(); excess != 0 && it != order_.end();) {
-      if (pin.count(*it) != 0) {
-        ++it;
-        continue;
-      }
-      Key victim = *it;
-      it = order_.erase(it);
-      pos_.erase(victim);
-      evict(victim);
-      --excess;
-    }
+    evictFor(excess, pin, evict);
     return true;
   }
 
@@ -133,6 +136,15 @@ public:
     }
     std::unordered_set<Key> pinned(need.begin(), need.end());
     std::vector<Key> misses;
+    const double half = halfLife();
+    if (half > 0.0) {
+      ++clock_;
+      for (Key k : need) {
+        Score &c = score_[k];
+        c.crf = 1.0 + decayed(c, half);
+        c.last = clock_;
+      }
+    }
     for (Key k : need) {
       auto it = pos_.find(k);
       if (it != pos_.end())
@@ -146,17 +158,7 @@ public:
     size_t excess = order_.size() + misses.size() > cap
                       ? order_.size() + misses.size() - cap
                       : 0;
-    for (auto it = order_.begin(); excess != 0 && it != order_.end();) {
-      if (pinned.count(*it) != 0) {
-        ++it;
-        continue;
-      }
-      Key victim = *it;
-      it = order_.erase(it);
-      pos_.erase(victim);
-      evict(victim);
-      --excess;
-    }
+    evictFor(excess, pinned, evict);
     for (Key k : misses) {
       load(k);
       order_.push_back(k);
@@ -182,8 +184,68 @@ public:
     return std::vector<Key>(order_.begin(), order_.end());
   }
 
+  /** @brief [#289] NNTR_MOE_LRFU's half-life in tokens; 0 (unset or "0")
+   *  is LRU. Read once per process. */
+  static double lrfuTokens() {
+    static const double h = [] {
+      const char *v = std::getenv("NNTR_MOE_LRFU");
+      if (v == nullptr || *v == '\0')
+        return 0.0;
+      char *end = nullptr;
+      const double x = std::strtod(v, &end);
+      if (*end != '\0' || !(x >= 0.0))
+        throw std::invalid_argument(std::string("NNTR_MOE_LRFU=") + v +
+                                    ": want a half-life in tokens");
+      return x;
+    }();
+    return h;
+  }
+
 private:
   using Order = std::list<Key>;
+
+  struct Score {
+    double crf = 0.0;  /**< decayed use count as of call last */
+    uint64_t last = 0; /**< acquire() call of the last use */
+  };
+
+  /** @brief The half-life in acquire() calls, 0 under LRU. */
+  double halfLife() const { return lrfu_ * layers_.size(); }
+
+  double decayed(const Score &c, double half) const {
+    return c.crf * std::exp2(-static_cast<double>(clock_ - c.last) / half);
+  }
+
+  /** @brief Evicts @a excess keys outside @a pin: under LRU from the front,
+   *  under LRFU the lowest score each time, the least recent on a tie. */
+  void evictFor(size_t excess, const std::unordered_set<Key> &pin,
+                const std::function<void(Key)> &evict) {
+    const double half = halfLife();
+    while (excess != 0) {
+      auto victim = order_.end();
+      double best = 0.0;
+      for (auto it = order_.begin(); it != order_.end(); ++it) {
+        if (pin.count(*it) != 0)
+          continue;
+        if (half <= 0.0) {
+          victim = it;
+          break;
+        }
+        const double v = decayed(score_[*it], half);
+        if (victim == order_.end() || v < best) {
+          victim = it;
+          best = v;
+        }
+      }
+      if (victim == order_.end())
+        return; // all pinned: the callers checked the room first
+      const Key k = *victim;
+      order_.erase(victim);
+      pos_.erase(k);
+      evict(k);
+      --excess;
+    }
+  }
 
   void touch(std::unordered_map<Key, Order::iterator>::iterator it) {
     order_.splice(order_.end(), order_, it->second);
@@ -196,6 +258,9 @@ private:
   std::set<const void *> layers_;
   Order order_; /**< front = least recently used */
   std::unordered_map<Key, Order::iterator> pos_;
+  double lrfu_ = lrfuTokens();           /**< [#289] half-life, tokens */
+  uint64_t clock_ = 0;                   /**< [#289] acquire() calls */
+  std::unordered_map<Key, Score> score_; /**< [#289] LRFU, every key seen */
 };
 
 } // namespace causallm
