@@ -1955,6 +1955,66 @@ int main(void) {
               (c == 0u ? (kb4 != 0ull || kb2 != 0ull)
                        : (kb4 == 0ull || kb2 * 2ull != kb4));
     }
+    /* [#267 L3] HEXKL_MOE_FLAG_ROWS_OUT on the decode schedule (the feed
+       on one queue, the bypass bit): one call over the four 4-bit experts
+       writes four rows, row i bit-identical to a call with expert i alone
+       (0 + w * res), under the same audits as the plain run (every column
+       from a waited push, cross-lane dataflow); at M = 2 refused
+       (AEE_EUNSUPPORTED) with nothing written. */
+    {
+      const uint32_t fl = feed | HEXKL_MOE_FLAG_DMA_BYPASS;
+      const uint64_t cols2 = (uint64_t)NE4 * ((2u * I4 + N4) / 32u);
+      float *rows = (float *)malloc(sizeof(float) * NE4 * N4);
+      float *one = (float *)malloc(sizeof(float) * N4);
+      float *a2 = (float *)calloc(2u * K4, sizeof(float));
+      uint32_t nb = 0, solo_bad = 0;
+      const uint32_t df0 = g_df_bad;
+      memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+      pf_reset();
+      score_reset(1, vtcm, sizeof vtcm);
+      int rr = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K4, I4, N4, NE4, hg4, hd4,
+        ri4, rc4, rw4, a4, rows, NULL, &sc4, fl | HEXKL_MOE_FLAG_ROWS_OUT);
+      const int audit = g_pf_bad == 0u && g_score_bad == 0u &&
+                        g_df_bad == df0 && g_score_vtcm_reads == cols2 &&
+                        hexkl_probe_us[HEXKL_PROBE_PATH] == 1u &&
+                        hexkl_probe_us[HEXKL_PROBE_M1_FEED] == 1u;
+      score_reset(0, vtcm, sizeof vtcm);
+      for (uint32_t e = 0; e < NE4; ++e) {
+        uint32_t c1[4] = {0, 0, 0, 0};
+        c1[e] = 1u;
+        solo_bad |= (uint32_t)hexkl_mm_u8i4_moe_layer_run(
+          &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K4, I4, N4, NE4, hg4, hd4,
+          ri4, c1, &rw4[e], a4, one, NULL, &sc4, fl);
+        for (uint32_t i = 0; i < N4; ++i)
+          nb += memcmp(&one[i], &rows[(size_t)e * N4 + i], sizeof(float)) != 0;
+      }
+      /* M = 2: two rows, experts 0 and 1 one each */
+      uint32_t rc2[4] = {1, 1, 0, 0}, ri2[2] = {0, 1};
+      memset(rows, 0xA5, sizeof(float) * NE4 * N4);
+      int rneg = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 2u, K4, I4, N4, NE4, hg4, hd4,
+        ri2, rc2, rw4, a2, rows, NULL, &sc4, fl | HEXKL_MOE_FLAG_ROWS_OUT);
+      uint32_t touched = 0;
+      for (uint32_t i = 0; i < NE4 * N4; ++i) {
+        uint32_t u;
+        memcpy(&u, &rows[i], 4);
+        touched += u != 0xA5A5A5A5u;
+      }
+      const int ok = rr == 0 && solo_bad == 0u && nb == 0u && audit &&
+                     rneg == AEE_EUNSUPPORTED && touched == 0u;
+      printf("M1 ROWS_OUT feed q=1 bypass: rc=%d audit=%d rows vs lone "
+             "calls: %u of %u bitwise mismatches; M=2 rc=%d (want %d) "
+             "touched=%u\n",
+             rr, audit, nb, NE4 * N4, rneg, AEE_EUNSUPPORTED, touched);
+      printf(ok ? "MOE M1 ROWS_OUT OK (one call, a row per expert, each "
+                  "bit-identical to its lone call; M > 1 refused)\n"
+                : "MOE M1 ROWS_OUT WRONG\n");
+      fail |= !ok;
+      free(rows);
+      free(one);
+      free(a2);
+    }
     for (uint32_t e = 0; e < 4u * NE4; ++e)
       g_tbl.slots[S0 + e].in_use = 0;
     free(a4);

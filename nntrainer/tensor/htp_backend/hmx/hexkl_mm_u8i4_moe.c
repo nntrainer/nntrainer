@@ -1542,6 +1542,12 @@ int hexkl_mm_u8i4_moe_layer_run(
      four-bit ones the i4 GEMV. A call that mixes the two widths takes the
      HMX path, which expands the 2-bit chunks in VTCM first. */
   const int use_m1 = m1_shape && (allow_tail || all_2bit);
+  /* [#267 L3] one row per active expert: only the M = 1 GEMV scatter
+     below knows how; refused before anything is written. */
+  const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
+  if (rows_out && (M != 1u || !use_m1)) {
+    return AEE_EUNSUPPORTED;
+  }
   hexkl_probe_us[HEXKL_PROBE_PATH] = use_m1 ? 1u : 0u;
 
   const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
@@ -2062,12 +2068,24 @@ int hexkl_mm_u8i4_moe_layer_run(
       const moe_m1_expert *x = &m1.ex[i];
       const uint32_t *rows = row_index + base_of[i];
       const float *weights = row_weight + base_of[i];
+      if (rows_out) {
+        /* [#267 L3] the same 0 + w * res a lone call writes (M = 1: one
+           row, rows[0] == 0), into row i of the caller's buffer */
+        float *y = out_f32 + (size_t)i * N_out;
+        memset(y, 0, sizeof(float) * N_out);
+        hvx_scale_add_rows_f32(y, x->res, weights[0], N_out);
+        continue;
+      }
       for (uint32_t r = 0; r < x->m; ++r) {
         hvx_scale_add_rows_f32(out_c + (size_t)rows[r] * N_out,
                                x->res + (size_t)r * N_out, weights[r], N_out);
       }
     }
     HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
+    if (rows_out) {
+      rc = m1q.timed_out ? AEE_EFAILED : AEE_SUCCESS;
+      goto out;
+    }
 
     HEXKL_PROBE_T0(p0);
     moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,

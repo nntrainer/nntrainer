@@ -425,6 +425,20 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
 #define HEXKL_MOE_DMA_Q_SHIFT 22u
 #define HEXKL_MOE_DMA_Q_BITS 3u
 
+/**
+ * @brief [#267 L3] Bit 25 of the flags word: at M = 1 on the GEMV path,
+ *        active expert i (ascending id) writes its own row
+ *        out_f32[i * N_out, (i + 1) * N_out) = 0 + w_i * res_i instead of
+ *        all of them accumulating into out_f32[0, N_out). The row is the
+ *        bits a call with expert i alone would write, so the graph's miss
+ *        path runs a set of experts in one call and still adds the rows in
+ *        its own order. out_f32 holds n_active rows. Refused
+ *        (AEE_EUNSUPPORTED, nothing written) at M > 1 or off the GEMV path.
+ *        Per call (hexkl_graph's miss path), never a session option: not
+ *        in HEXKL_MOE_FLAGS_KNOWN, so moe_set_opts drops it.
+ */
+#define HEXKL_MOE_FLAG_ROWS_OUT 0x2000000u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
