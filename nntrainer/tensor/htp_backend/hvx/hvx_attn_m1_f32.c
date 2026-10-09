@@ -279,6 +279,36 @@ static inline int8_t q8_of(float x, float inv) {
   return (int8_t)(int32_t)(r + (r >= 0.0f ? 0.5f : -0.5f));
 }
 
+/** [#289] A seed over the pool: the amax by 32-dim slices of the row, the
+ *  rows by (kv head, 64-row chunk). Each lane writes only its own dims or
+ *  positions, with the per-element code of the one-thread loops. */
+typedef struct {
+  hvx_attn_m1_ctx *ctx;
+  uint32_t layer, kv_from, n_rows, units;
+  const float *k_rows, *v_rows;
+} append_job;
+
+#define APPEND_ROWS 64u
+
+static void run_amax(uint32_t n, uint32_t i, void *arg) {
+  const append_job *job = (const append_job *)arg;
+  const size_t row = (size_t)job->ctx->n_kv * job->ctx->head_dim;
+  float *sk = job->ctx->sk + (size_t)job->layer * row;
+  float *sv = job->ctx->sv + (size_t)job->layer * row;
+  for (uint32_t u = i; u < job->units; u += n) {
+    const size_t lo = (size_t)u * 32u, hi = lo + 32u < row ? lo + 32u : row;
+    for (uint32_t r = 0; r < job->n_rows; ++r) {
+      const float *kr = job->k_rows + (size_t)r * row;
+      const float *vr = job->v_rows + (size_t)r * row;
+      for (size_t x = lo; x < hi; ++x) {
+        const float kk = fabsf(kr[x]), vv = fabsf(vr[x]);
+        sk[x] = kk > sk[x] ? kk : sk[x];
+        sv[x] = vv > sv[x] ? vv : sv[x];
+      }
+    }
+  }
+}
+
 /** @brief [#282 D] The layer's scales from @a n_rows rows [n][n_kv][hd]
  *         (amax x @a margin / 127; 1 for an all-zero head or dim). */
 static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
@@ -291,14 +321,10 @@ static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   /* amax per (kv head, dim), rows outer so every read is contiguous */
   memset(sk, 0, n * sizeof(float));
   memset(sv, 0, n * sizeof(float));
-  for (uint32_t r = 0; r < n_rows; ++r) {
-    const float *kr = k_rows + (size_t)r * n;
-    const float *vr = v_rows + (size_t)r * n;
-    for (size_t i = 0; i < n; ++i) {
-      const float kk = fabsf(kr[i]), vv = fabsf(vr[i]);
-      sk[i] = kk > sk[i] ? kk : sk[i];
-      sv[i] = vv > sv[i] ? vv : sv[i];
-    }
+  {
+    append_job job = {ctx,    layer, 0u, n_rows, (uint32_t)((n + 31u) / 32u),
+                      k_rows, v_rows};
+    hvx_worker_pool_run(ctx->pool, run_amax, &job, job.units);
   }
   float *ski = ctx->sk_inv + (size_t)layer * n;
   float *svi = ctx->sv_inv + (size_t)layer * n;
@@ -345,6 +371,23 @@ static inline void append_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
   }
 }
 
+static void run_append(uint32_t n, uint32_t i, void *arg) {
+  const append_job *job = (const append_job *)arg;
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const size_t row = (size_t)ctx->n_kv * ctx->head_dim;
+  for (uint32_t u = i; u < job->units; u += n) {
+    const uint32_t h = u % ctx->n_kv, r0 = (u / ctx->n_kv) * APPEND_ROWS;
+    const uint32_t r1 =
+      r0 + APPEND_ROWS < job->n_rows ? r0 + APPEND_ROWS : job->n_rows;
+    for (uint32_t r = r0; r < r1; ++r) {
+      (ctx->q8 ? append_head_q8 : append_head)(
+        ctx, job->layer, h, job->kv_from + r,
+        job->k_rows + r * row + (size_t)h * ctx->head_dim,
+        job->v_rows + r * row + (size_t)h * ctx->head_dim);
+    }
+  }
+}
+
 int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
                           uint32_t kv_from, uint32_t n_rows,
                           const float *k_rows, const float *v_rows) {
@@ -358,17 +401,18 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
   if (kv_from > ctx->kv_len[layer]) {
     return AEE_EBADSTATE;
   }
-  const size_t row = (size_t)ctx->n_kv * ctx->head_dim;
   if (ctx->q8 && n_rows != 0u && !ctx->scaled[layer]) { /* [#282 D] */
     q8_set_scales(ctx, layer, n_rows, k_rows, v_rows, HVX_ATTN_M1_Q8_MARGIN);
   }
-  for (uint32_t r = 0; r < n_rows; ++r) {
-    for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-      (ctx->q8 ? append_head_q8
-               : append_head)(ctx, layer, h, kv_from + r,
-                              k_rows + r * row + (size_t)h * ctx->head_dim,
-                              v_rows + r * row + (size_t)h * ctx->head_dim);
-    }
+  {
+    append_job job = {ctx,
+                      layer,
+                      kv_from,
+                      n_rows,
+                      ctx->n_kv * ((n_rows + APPEND_ROWS - 1u) / APPEND_ROWS),
+                      k_rows,
+                      v_rows};
+    hvx_worker_pool_run(ctx->pool, run_append, &job, job.units);
   }
   ctx->kv_len[layer] = kv_from + n_rows;
   return AEE_SUCCESS;

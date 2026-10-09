@@ -708,14 +708,18 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
     const size_t n = static_cast<size_t>(pos) * wk;
     std::vector<float> k_rows(n), v_rows(n);
-    auto rows_f32 = [n](const nntrainer::Tensor &c, float *dst) {
+    auto rows_f32 = [n, wk](const nntrainer::Tensor &c, float *dst) {
       if (c.getDataType() == ml::train::TensorDim::DataType::FP32) {
         std::memcpy(dst, c.getData<float>(), n * sizeof(float));
         return;
       }
+      // [#289] the same conversion per element, rows over the CPU pool
+      // (one thread read 0.5 s of the p1024 first token)
       const uint16_t *src = c.getData<uint16_t>();
-      for (size_t i = 0; i < n; ++i)
-        dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+      nntrainer::ThreadManager::Global().parallel_for(0, n / wk, [=](size_t r) {
+        for (size_t i = r * wk; i < (r + 1) * wk; ++i)
+          dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+      });
     };
     rows_f32(ck, k_rows.data());
     rows_f32(cv, v_rows.data());
