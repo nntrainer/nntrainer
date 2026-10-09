@@ -274,8 +274,9 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
 # FFN input's quantization; the argmax over the first slice only; [plan 201
-# S1] the miss round's experts before the first miss dropped, and its later
-# rows added in reverse order; [plan 201 S4] the softmax router run as the
+# S1] the miss round's experts before the first miss dropped, [#267 L3] its
+# later rows taken from the wrong set (present vs arrived), its sets run
+# without ROWS_OUT (accumulated into one row); [plan 201 S4] the softmax router run as the
 # sigmoid one, an RMSNORM's N1 bit ignored, and an ATTN_M1's scale (Gemma's
 # 1.0 in eps_bits) ignored for 1/sqrt(head_dim)
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
@@ -283,7 +284,8 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
   's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
   's/  if (first != 0u) {/  if (0) {/' \
-  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
+  's/                           was_miss\[i\] ? a_rows/                           !was_miss[i] ? a_rows/' \
+  's/    graph_moe_run(g, env, op, h, ids, w, n, HEXKL_MOE_FLAG_ROWS_OUT, in, rows);/    graph_moe_run(g, env, op, h, ids, w, n, 0u, in, rows);/' \
   's/  if (op->eps_bits != 0u) {/  if (0) {/' \
   's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/' \
   's/op->eps_bits != 0u *? graph_eps(op)/0 ? graph_eps(op)/'; do

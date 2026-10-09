@@ -229,6 +229,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
   menv.miss.ctx = &miss;
   g->route_log_n = 0u;
   g->pred_log_n = 0u; /* [#266 S2] */
+  g->moe_calls = g->moe_calls_1x = 0u;
   *id = 0u;
   if (g->n_ops == 0u || tk_stretch_end(g, 0u) != g->n_ops) {
     return AEE_EBADSTATE;

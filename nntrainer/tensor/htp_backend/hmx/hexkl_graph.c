@@ -99,19 +99,50 @@ typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
 /* ---- MOE: hexkl_mm_u8i4_moe_layer_run at M = 1, unchanged -------------- */
 
 /* The kernel over the n experts ids[] (ascending) with their weights w[],
-   the token's one row each: a whole layer, or one expert of a miss round. */
-static int graph_moe_run(const hexkl_graph_env *env, const htp_graph_op *op,
-                         const uint32_t *h, const uint32_t *ids, const float *w,
-                         uint32_t n, const float *in, float *out) {
+   the token's one row each: a whole layer, or a set of a miss round's
+   experts (@a extra = HEXKL_MOE_FLAG_ROWS_OUT: row i of out is expert
+   ids[i]'s term alone). */
+static int graph_moe_run(hexkl_graph *g, const hexkl_graph_env *env,
+                         const htp_graph_op *op, const uint32_t *h,
+                         const uint32_t *ids, const float *w, uint32_t n,
+                         uint32_t extra, const float *in, float *out) {
   uint32_t cnt[HTP_GRAPH_MAX_EXPERTS] = {0}, idx[HEXKL_GRAPH_MISS_MAX] = {0};
   uint32_t i;
   for (i = 0; i < n; ++i) {
     cnt[ids[i]] = 1u;
   }
+  ++g->moe_calls;
   return hexkl_mm_u8i4_moe_layer_run(
     env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K, op->N,
     op->N_out, op->n_experts, h, h + op->n_experts, idx, cnt, w, in, out,
-    env->pool, env->scratch, env->moe_flags);
+    env->pool, env->scratch, env->moe_flags | extra);
+}
+
+/* [#267 L3] The n experts ids[] / w[] (ascending), each into its own row
+   of rows: one call with HEXKL_MOE_FLAG_ROWS_OUT, or -- a call the kernel
+   refuses that way (off its M = 1 GEMV path), before writing anything --
+   one call each. Either way row i is 0 + w[i] * res(ids[i]). */
+static int graph_moe_rows(hexkl_graph *g, const hexkl_graph_env *env,
+                          const htp_graph_op *op, const uint32_t *h,
+                          const uint32_t *ids, const float *w, uint32_t n,
+                          const float *in, float *rows) {
+  uint32_t i;
+  int rc;
+  if (n == 0u) {
+    return AEE_SUCCESS;
+  }
+  rc =
+    graph_moe_run(g, env, op, h, ids, w, n, HEXKL_MOE_FLAG_ROWS_OUT, in, rows);
+  if (rc != AEE_EUNSUPPORTED) {
+    return rc;
+  }
+  --g->moe_calls; /* refused: not a call that ran */
+  rc = AEE_SUCCESS;
+  for (i = 0; rc == AEE_SUCCESS && i < n; ++i) {
+    rc = graph_moe_run(g, env, op, h, &ids[i], &w[i], 1u, 0u, in,
+                       rows + (size_t)i * op->N_out);
+  }
+  return rc;
 }
 
 /*
@@ -120,11 +151,12 @@ static int graph_moe_run(const hexkl_graph_env *env, const htp_graph_op *op,
  * then the rest run. The kernel adds each expert's weighted row into a
  * zeroed output in expert order (hvx_scale_add_rows_f32: out + w * res,
  * two roundings), so the all-resident bits are kept by running the experts
- * before the first miss as one call and every later one alone into its own
- * row (0 + w * res: that expert's term exactly), then adding those rows in
- * expert order at scale 1 (exact products). ponytail: a later expert costs
- * a call of its own (its weight feed no longer overlaps its neighbour's);
- * only a layer with a miss pays it.
+ * before the first miss as one call and every later one into its own row
+ * (0 + w * res: that expert's term exactly), then adding those rows in
+ * expert order at scale 1 (exact products). [#267 L3] The later present
+ * experts are one call and the arrived ones another (HEXKL_MOE_FLAG_ROWS_OUT:
+ * a row each, the same bits), so a miss layer makes at most three calls,
+ * not one per later expert: the weight feed overlaps across each set.
  */
 static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
                           graph_call *call, const uint32_t *h,
@@ -133,7 +165,11 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   const hexkl_graph_env *env = call->env;
   const uint32_t op_i = (uint32_t)(op - g->ops);
   uint32_t miss[HEXKL_GRAPH_MISS_MAX], was_miss[HEXKL_GRAPH_MISS_MAX];
-  uint32_t i, n_miss = 0, first = n;
+  /* the later experts split into the present (p) and the arrived (a) */
+  uint32_t p_ids[HEXKL_GRAPH_MISS_MAX], a_ids[HEXKL_GRAPH_MISS_MAX];
+  float p_w[HEXKL_GRAPH_MISS_MAX], a_w[HEXKL_GRAPH_MISS_MAX];
+  uint32_t i, n_miss = 0, first = n, n_p = 0, n_a = 0;
+  float *p_rows, *a_rows;
   int rc;
   for (i = 0; i < n; ++i) {
     was_miss[i] = h[ids[i]] == HTP_GRAPH_NO_HANDLE ||
@@ -146,20 +182,30 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   if (env->miss.post == NULL || g->moe_rows == NULL) {
     return AEE_EBADSTATE; /* no miss path: the one-session entry */
   }
+  for (i = first; i < n; ++i) {
+    if (was_miss[i]) {
+      a_ids[n_a] = ids[i];
+      a_w[n_a++] = w[i];
+    } else {
+      p_ids[n_p] = ids[i];
+      p_w[n_p++] = w[i];
+    }
+  }
+  /* n - first <= top_k rows: the present set's, then the arrived set's */
+  p_rows = g->moe_rows;
+  a_rows = g->moe_rows + (size_t)n_p * op->N_out;
+  g->moe_calls_1x += (first != 0u) + (n - first);
   rc = env->miss.post(env->miss.ctx, op_i, ids, n, miss, n_miss);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
   if (first != 0u) {
-    rc = graph_moe_run(env, op, h, ids, w, first, in, out);
+    rc = graph_moe_run(g, env, op, h, ids, w, first, 0u, in, out);
   } else {
     memset(out, 0, (size_t)op->N_out * sizeof(float));
   }
-  for (i = first; rc == AEE_SUCCESS && i < n; ++i) {
-    if (!was_miss[i]) {
-      rc = graph_moe_run(env, op, h, &ids[i], &w[i], 1u, in,
-                         g->moe_rows + (size_t)i * op->N_out);
-    }
+  if (rc == AEE_SUCCESS) {
+    rc = graph_moe_rows(g, env, op, h, p_ids, p_w, n_p, in, p_rows);
   }
   /* the wait comes even after a failure: the answer must not land on a
      later round's page */
@@ -167,19 +213,22 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
     const int wrc = env->miss.wait(env->miss.ctx, g, op_i);
     rc = rc != AEE_SUCCESS ? rc : wrc;
   }
-  for (i = first; rc == AEE_SUCCESS && i < n; ++i) {
-    if (was_miss[i]) {
-      if (h[ids[i]] == HTP_GRAPH_NO_HANDLE ||
-          h[op->n_experts + ids[i]] == HTP_GRAPH_NO_HANDLE) {
-        return AEE_EBADSTATE; /* the answer did not bring it */
-      }
-      rc = graph_moe_run(env, op, h, &ids[i], &w[i], 1u, in,
-                         g->moe_rows + (size_t)i * op->N_out);
+  for (i = 0; rc == AEE_SUCCESS && i < n_a; ++i) {
+    if (h[a_ids[i]] == HTP_GRAPH_NO_HANDLE ||
+        h[op->n_experts + a_ids[i]] == HTP_GRAPH_NO_HANDLE) {
+      return AEE_EBADSTATE; /* the answer did not bring it */
     }
   }
+  if (rc == AEE_SUCCESS) {
+    rc = graph_moe_rows(g, env, op, h, a_ids, a_w, n_a, in, a_rows);
+  }
+  /* in expert order, as before: both sets are ascending */
+  n_p = n_a = 0u;
   for (i = first; rc == AEE_SUCCESS && i < n; ++i) {
-    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i * op->N_out, 1.0f,
-                           op->N_out);
+    hvx_scale_add_rows_f32(out,
+                           was_miss[i] ? a_rows + (size_t)n_a++ * op->N_out
+                                       : p_rows + (size_t)n_p++ * op->N_out,
+                           1.0f, op->N_out);
   }
   return rc;
 }
@@ -237,6 +286,8 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
   if (n_miss != 0u) {
     return graph_moe_miss(g, op, call, h, ids, r->row_weight, sum, in, out);
   }
+  ++g->moe_calls;
+  ++g->moe_calls_1x;
   /* the table is the handle arrays: the kernel skips an expert with no
      rows before it reads its handle, so a NO_HANDLE there is never read */
   return hexkl_mm_u8i4_moe_layer_run(

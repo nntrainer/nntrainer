@@ -130,15 +130,21 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch, uint32_t flags) {
-  uint32_t e, c, r = 0;
+  uint32_t e, c, r = 0, k = 0;
+  /* [#267 L3] the rows-out bit: a row per active expert, M = 1 only */
+  const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
   (void)vtcm_base, (void)vtcm_size, (void)config_off, (void)pool;
-  (void)scratch, (void)flags, (void)inter, (void)h_down;
+  (void)scratch, (void)inter, (void)h_down;
+  if (rows_out && M != 1u)
+    return AEE_EUNSUPPORTED;
   memset(out_f32, 0, (size_t)M * N_out * sizeof(float));
   for (e = 0; e < n_experts; ++e) {
     uint32_t i;
+    if (rows_out && row_count[e] != 0u)
+      memset(out_f32 + (size_t)k * N_out, 0, N_out * sizeof(float));
     for (i = 0; i < row_count[e]; ++i, ++r) {
       const float *x = act_f32 + (size_t)row_index[r] * K;
-      float *y = out_f32 + (size_t)row_index[r] * N_out;
+      float *y = out_f32 + (size_t)(rows_out ? k : row_index[r]) * N_out;
       /* the expert is what its gate_up's bytes say, not its handle: the
          pool check moves experts between handles */
       const uint32_t id = *(const uint32_t *)tbl->slots[h_gate_up[e]].wh_bytes;
@@ -147,6 +153,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           row_weight[r] *
           (x[(c + 7u * e) % K] * (float)(id + 1u) * 0.125f + 0.01f * (float)c);
     }
+    k += row_count[e] != 0u;
   }
   if (g_moe_calls < g_moe_cap) {
     g_moe_log[2u * g_moe_calls] = fnv(act_f32, (size_t)K * sizeof(float));
@@ -604,7 +611,7 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   pool_owner o;
   pthread_t tho;
   hexkl_token_stats st;
-  uint32_t t, id, same_logits = 0, same_id = 0;
+  uint32_t t, id, same_logits = 0, same_id = 0, calls = 0, calls_1x = 0;
   uint64_t wall_ns = 0;
   double cover;
   int rc;
@@ -615,6 +622,7 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   o.page = new_page();
   set_pool(&s, &o, 2u); /* experts 0 and 1 of each layer */
   memset(&st, 0, sizeof(st));
+  g_moe_calls = 0;
   pthread_create(&tho, NULL, owner_thread, &o);
   for (t = 0; t < TOKENS; ++t) {
     uint64_t t0;
@@ -627,6 +635,8 @@ static void check_pool(const uint32_t *words, uint32_t n) {
       CHECK(0, "pool token %u: 0x%x", t, (unsigned)rc);
       break;
     }
+    calls += s.g->moe_calls;
+    calls_1x += s.g->moe_calls_1x;
     same_logits +=
       memcmp(s.g->logits, ref_logits[t], VOCAB * sizeof(float)) == 0;
     same_id += id == ref_id[t];
@@ -642,6 +652,11 @@ static void check_pool(const uint32_t *words, uint32_t n) {
         st.stale);
   CHECK(s.g->route_log_n == POOL_OPS * 3u, "route log %u bytes",
         s.g->route_log_n);
+  /* [#267 L3] the counters the ARM prints: every kernel call counted,
+     and the batched miss path under the one-at-a-time form's count */
+  CHECK(calls == g_moe_calls && calls < calls_1x,
+        "pool moe calls %u (kernel %u) one-at-a-time %u", calls, g_moe_calls,
+        calls_1x);
   cover = check_kind_ns(&st, wall_ns, "pool");
   /* the waits run inside the MOE ops' brackets */
   CHECK(st.kind_qt[HTP_OP_MOE] >= (uint64_t)st.miss_us * 1000u,
@@ -651,11 +666,13 @@ static void check_pool(const uint32_t *words, uint32_t n) {
     printf("TOKEN POOL BIT-IDENTICAL: tokens %u/%u logits bit_identical=1, a "
            "pool of %u of %u experts a layer, misses=%u (%.2f/token) in %u "
            "rounds, timeouts=0 stale=0 kind_ns/wall=%.3f MOE net of miss "
-           "wait %.1f us/token (the miss rounds against an owner pthread; vs "
-           "the one-session forward)\n",
+           "wait %.1f us/token, moe calls/token %.2f (one-at-a-time %.2f) "
+           "(the miss rounds against an owner pthread; vs the one-session "
+           "forward)\n",
            same_id, TOKENS, 2u, POOL_E, o.loads, (double)o.loads / TOKENS,
            o.served, cover,
-           ((double)st.kind_qt[HTP_OP_MOE] / 1000.0 - st.miss_us) / TOKENS);
+           ((double)st.kind_qt[HTP_OP_MOE] / 1000.0 - st.miss_us) / TOKENS,
+           (double)calls / TOKENS, (double)calls_1x / TOKENS);
   close_session(&s);
   free(o.page);
 }

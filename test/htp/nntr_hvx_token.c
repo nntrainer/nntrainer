@@ -156,6 +156,8 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   r->misses = t->st.misses - before.misses;
   r->miss_us = t->st.miss_us - before.miss_us;
   r->miss_pcyc = (uint32_t)(t->st.miss_pcyc - before.miss_pcyc);
+  r->moe_calls = s->graph->moe_calls;
+  r->moe_calls_1x = s->graph->moe_calls_1x;
   /* [plan 201 S1] the routed sets, for the pool */
   r->route_n = s->graph->route_log_n;
   memcpy(r->route, s->graph->route_log, r->route_n);

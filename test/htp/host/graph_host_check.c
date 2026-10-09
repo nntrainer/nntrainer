@@ -78,6 +78,7 @@
 #include "attn_m1_det.h"
 #include "hvx_m1_ops_f32.h"
 #include "hvx_q4_gemv_f32.h"
+#include "hvx_scale_add_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
 #include "q4_gemv_native_det.h"
@@ -112,6 +113,8 @@ typedef struct {
   uint32_t n_calls;
 } moe_args;
 static moe_args g_last;
+/* [#267 L3] every call the stand-in ran (refusals not counted) */
+static uint32_t g_kernel_runs;
 
 int hexkl_mm_u8i4_moe_layer_run(
   hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -120,8 +123,16 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch, uint32_t flags) {
-  uint32_t e, c, r = 0;
+  uint32_t e, c, r = 0, k = 0;
   moe_args *a = &g_last;
+  /* [#267 L3] the kernel's contract for the rows-out bit: M = 1 on the GEMV
+     path only (here: the M1_GEMV bit stands for that path), else refused
+     before anything is written; the bit itself is not in the math */
+  const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
+  if (rows_out && (M != 1u || (flags & HEXKL_MOE_FLAG_M1_GEMV) == 0u))
+    return AEE_EUNSUPPORTED;
+  flags &= ~HEXKL_MOE_FLAG_ROWS_OUT;
+  ++g_kernel_runs;
   memset(a, 0, sizeof(*a));
   a->tbl = tbl;
   a->vtcm = vtcm_base;
@@ -139,18 +150,23 @@ int hexkl_mm_u8i4_moe_layer_run(
   memcpy(a->h_dn, h_down, n_experts * sizeof(uint32_t));
   memcpy(a->row_count, row_count, n_experts * sizeof(uint32_t));
   a->n_calls = 1;
-  memset(out_f32, 0, (size_t)M * N_out * sizeof(float));
+  if (!rows_out)
+    memset(out_f32, 0, (size_t)M * N_out * sizeof(float));
   for (e = 0; e < n_experts; ++e) {
     uint32_t i;
+    if (rows_out && row_count[e] != 0u)
+      memset(out_f32 + (size_t)k * N_out, 0, N_out * sizeof(float));
     for (i = 0; i < row_count[e]; ++i, ++r) {
       const float *x = act_f32 + (size_t)row_index[r] * K;
-      float *y = out_f32 + (size_t)row_index[r] * N_out;
+      float *y = rows_out ? out_f32 + (size_t)k * N_out
+                          : out_f32 + (size_t)row_index[r] * N_out;
       const float wsum =
         (float)(tbl->slots[h_gate_up[e]].N + tbl->slots[h_down[e]].K +
                 7u * h_gate_up[e] + 3u * h_down[e] + flags + inter);
       for (c = 0; c < N_out; ++c)
         y[c] += row_weight[r] * (x[c % K] * wsum + (float)c);
     }
+    k += row_count[e] != 0u;
   }
   return AEE_SUCCESS;
 }
@@ -909,14 +925,24 @@ static void check_limits(void) {
                                      out, 64u, &resume);
   CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed outside the pool: %s",
         htp_graph_err_name(rc));
-  /* the miss round (plan 201 S1): top-8 over experts 2, 5, 6, 9, 40, 63,
-     64, 126 -- misses 5, 9, 63 after a hit, in the middle and late -- equals
-     the direct call on the loaded table bit for bit */
+  /* the miss round (plan 201 S1): top-8 with the misses (odd experts) at
+     positions {1, 3, 5} (after a hit, in the middle and late), {0}, {2, 5},
+     {7} and all eight. [#267 L3] Under the M1_GEMV bit the later present
+     experts and the arrived ones run as one ROWS_OUT call each; without it
+     the kernel refuses ROWS_OUT and the path falls back to one call each.
+     Either way the output equals, bit for bit, the one-at-a-time form (the
+     experts before the first miss as one call, every later one alone into
+     its own row, the rows added in expert order) and the direct call on
+     the loaded table. */
   {
-    static const uint32_t rt[8] = {2u, 5u, 6u, 9u, 40u, 63u, 64u, 126u};
-    uint32_t full_gu[128], full_dn[128], k;
+    static const uint32_t rts[5][8] = {{2u, 5u, 6u, 9u, 40u, 63u, 64u, 126u},
+                                       {1u, 2u, 4u, 6u, 8u, 10u, 12u, 14u},
+                                       {2u, 4u, 5u, 6u, 8u, 9u, 10u, 12u},
+                                       {2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u},
+                                       {1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u}};
+    static const uint32_t fls[2] = {HEXKL_MOE_FLAG_M1_GEMV, 0u};
+    uint32_t full_gu[128], full_dn[128], k, c, f, n_ok = 0;
     for (e = 0; e < 128u; ++e) {
-      row_count[e] = 0u;
       if (e & 1u) {
         register_weight(3000u + e, 64u, 128u);
         register_weight(3200u + e, 64u, 64u);
@@ -924,29 +950,95 @@ static void check_limits(void) {
       full_gu[e] = (e & 1u) ? 3000u + e : gu[e];
       full_dn[e] = (e & 1u) ? 3200u + e : dn[e];
     }
-    for (k = 0; k < 8u; ++k)
-      row_count[rt[k]] = 1u;
-    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
-                                64u, 64u, 128u, full_gu, full_dn, row_index,
-                                row_count, row_weight, act, ref, env.pool,
-                                &g_scratch, 0u);
     env.miss.post = fake_post;
     env.miss.wait = fake_wait;
-    memset(&g_owner, 0, sizeof(g_owner));
-    routing.n_experts = 128u;
-    rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act,
-                                       64u, out, 64u, &resume);
-    CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0 &&
-            g_owner.posts == 1u && g_owner.waits == 1u && g_owner.n_miss == 3u,
-          "miss round: %s posts %u waits %u misses %u", htp_graph_err_name(rc),
-          g_owner.posts, g_owner.waits, g_owner.n_miss);
-    CHECK(g->experts[m0][5] == 3005u && g->experts[m0][128u + 63u] == 3263u,
-          "the answer did not reach the table");
-    CHECK(g->route_log_n >= 9u && g->route_log[g->route_log_n - 9u] == 8u &&
-            g->route_log[g->route_log_n - 1u] == 126u,
-          "route log");
+    for (c = 0; c < 5u; ++c) {
+      for (f = 0; f < 2u; ++f) {
+        const uint32_t *rt = rts[c];
+        uint32_t first = 8u, n_miss = 0, n_p = 0, n_a = 0, want_calls;
+        float one[64], row[64];
+        for (e = 0; e < 128u; ++e)
+          row_count[e] = 0u;
+        for (k = 0; k < 8u; ++k) {
+          row_count[rt[k]] = 1u;
+          if (rt[k] & 1u) {
+            ++n_miss;
+            first = first < k ? first : k;
+          }
+        }
+        for (k = first; k < 8u; ++k) {
+          n_a += rt[k] & 1u;
+          n_p += !(rt[k] & 1u);
+        }
+        env.moe_flags = fls[f];
+        /* the direct call on the loaded table */
+        hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u,
+                                    64u, 64u, 64u, 128u, full_gu, full_dn,
+                                    row_index, row_count, row_weight, act, ref,
+                                    env.pool, &g_scratch, env.moe_flags);
+        /* the one-at-a-time form, spelled out */
+        memset(one, 0, sizeof(one));
+        if (first != 0u) {
+          uint32_t cnt[128] = {0};
+          for (k = 0; k < first; ++k)
+            cnt[rt[k]] = 1u;
+          hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u,
+                                      64u, 64u, 64u, 128u, full_gu, full_dn,
+                                      row_index, cnt, row_weight, act, one,
+                                      env.pool, &g_scratch, env.moe_flags);
+        }
+        for (k = first; k < 8u; ++k) {
+          uint32_t cnt[128] = {0};
+          cnt[rt[k]] = 1u;
+          hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u,
+                                      64u, 64u, 64u, 128u, full_gu, full_dn,
+                                      row_index, cnt, &row_weight[k], act, row,
+                                      env.pool, &g_scratch, env.moe_flags);
+          hvx_scale_add_rows_f32(one, row, 1.0f, 64u);
+        }
+        /* the pool back to the even experts */
+        rc = (uint32_t)set_experts(g, m0, gu, dn, 128u);
+        memset(&g_owner, 0, sizeof(g_owner));
+        g->moe_calls = g->moe_calls_1x = 0u;
+        g_kernel_runs = 0u;
+        routing.n_experts = 128u;
+        rc |= (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing,
+                                            act, 64u, out, 64u, &resume);
+        want_calls = fls[f] != 0u
+                       ? (uint32_t)(first != 0u) + (n_p != 0u) + (n_a != 0u)
+                       : (first != 0u) + n_p + n_a;
+        CHECK(rc == 0u && memcmp(out, one, sizeof(out)) == 0 &&
+                memcmp(out, ref, sizeof(out)) == 0 && g_owner.posts == 1u &&
+                g_owner.waits == 1u && g_owner.n_miss == n_miss,
+              "miss round case %u flags 0x%x: %s posts %u waits %u misses %u "
+              "(want %u) == one-at-a-time %d == loaded table %d",
+              c, fls[f], htp_graph_err_name(rc), g_owner.posts, g_owner.waits,
+              g_owner.n_miss, n_miss, memcmp(out, one, sizeof(out)) == 0,
+              memcmp(out, ref, sizeof(out)) == 0);
+        CHECK(g->moe_calls == want_calls && g_kernel_runs == want_calls &&
+                g->moe_calls_1x == (first != 0u) + (8u - first),
+              "miss round case %u flags 0x%x: calls %u runs %u (want %u), "
+              "one-at-a-time %u (want %u)",
+              c, fls[f], g->moe_calls, g_kernel_runs, want_calls,
+              g->moe_calls_1x, (first != 0u) + (8u - first));
+        CHECK(g->experts[m0][rt[first]] == 3000u + rt[first],
+              "the answer did not reach the table");
+        CHECK(g->route_log_n >= 9u && g->route_log[g->route_log_n - 9u] == 8u &&
+                g->route_log[g->route_log_n - 1u] == rt[7],
+              "route log");
+        n_ok += rc == 0u && memcmp(out, one, sizeof(out)) == 0 &&
+                g->moe_calls == want_calls;
+      }
+    }
+    CHECK(n_ok == 10u, "miss rounds: %u of 10 cells", n_ok);
+    printf("GRAPH MISS BATCH OK: misses at {1,3,5} {0} {2,5} {7} {all} x "
+           "(ROWS_OUT taken | refused -> one call each): %u cells "
+           "bit-identical to the one-at-a-time form and the loaded table, "
+           "<= 3 kernel calls a layer\n",
+           n_ok);
     env.miss.post = NULL;
     env.miss.wait = NULL;
+    env.moe_flags = 0u;
   }
   hexkl_graph_free(g);
   printf("GRAPH LIMITS OK: 542 ops, 128 experts top-8, handles up to %u, a "

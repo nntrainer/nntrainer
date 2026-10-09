@@ -207,6 +207,10 @@ typedef struct hexkl_graph_s {
    *  ids best first; cleared by the token driver like route_log */
   uint8_t pred_log[HEXKL_GRAPH_ROUTE_LOG];
   uint32_t pred_log_n;
+  /** [#267 L3] MOE kernel calls the MOE ops made, and the calls the miss
+   *  path's one-expert-at-a-time form would have made for the same misses;
+   *  cleared with route_log_n */
+  uint32_t moe_calls, moe_calls_1x;
   /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
    *  by every router op, read by the MOE op after it. */
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
