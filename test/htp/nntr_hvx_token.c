@@ -40,8 +40,8 @@
 
 typedef char
   token_route_fits[HTP_DSPQ_TOKEN_ROUTE == HEXKL_GRAPH_ROUTE_LOG ? 1 : -1];
-typedef char
-  token_attn_prof_fits[HTP_DSPQ_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS ? 1 : -1];
+typedef char token_attn_prof_fits
+  [HTP_DSPQ_ATTN_PROF_WORDS == HEXKL_GRAPH_ATTN_PROF_WORDS ? 1 : -1];
 
 /** @brief The session's driver: its page and its counters. */
 struct nntr_hvx_token {
@@ -171,7 +171,8 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
     uint32_t w;
     r->attn_calls[k] = s->graph->attn_prof_calls[k];
     for (w = 0; w < HTP_DSPQ_ATTN_PROF_WORDS; ++w) {
-      r->attn_prof[k][w] = (uint32_t)s->graph->attn_prof[k][w];
+      const uint64_t v = s->graph->attn_prof[k][w]; /* saturates */
+      r->attn_prof[k][w] = v > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)v;
     }
   }
   if (rc != AEE_SUCCESS) {

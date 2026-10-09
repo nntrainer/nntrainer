@@ -43,6 +43,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "attn_m1_det.h"
 #include "hvx_attn_m1_f32.h"
 #include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"

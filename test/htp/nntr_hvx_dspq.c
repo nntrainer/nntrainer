@@ -158,6 +158,9 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
       nb >= 1u ? (uint32_t)(bufs[0].size / 4u) : 0u,
       nb == 2u ? (float *)bufs[1].ptr : NULL,
       nb == 2u ? (uint32_t)(bufs[1].size / 4u) : 0u, &resp);
+    if (d->s->graph != NULL) {
+      d->s->graph->attn_prof_on = 0u; /* the request's, not the session's */
+    }
   } else {
     resp.rc = AEE_EBADPARM;
     ++d->bad;

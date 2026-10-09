@@ -43,6 +43,8 @@
 
 #include "hexkl_graph.h"
 
+#include "../../attn_m1_det.h" /* nntrainer/tensor/ */
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,6 +351,10 @@ static hvx_attn_m1_ctx *graph_attn_cache(const hexkl_graph_env *env,
   }
   return NULL;
 }
+
+typedef char
+  graph_attn_prof_fits[HEXKL_GRAPH_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS ? 1
+                                                                         : -1];
 
 /* [plan 201 S4] top_k is the sliding window (0: full causal, LFM2 and
    Gemma's full layers), eps_bits the scale (graph_attn_scale) */
