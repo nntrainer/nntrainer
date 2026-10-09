@@ -1009,6 +1009,13 @@ bool MHACoreLayer::try_accelerated_attention(
 
 void MHACoreLayer::registerQuantizedCache(nntrainer::RunLayerContext &context) {
   compute_ops_ = context.getComputeOps();
+  // [#282 D] with NNTR_HTP_E2E_FREE_KVQ the caches go at the first decode
+  // token anyway; registering them at the prefill's first call (the lazy
+  // path, try_quantized_attention) keeps them out of the address space the
+  // load's FC set and expert pool map into (p4096: 915 MiB at load)
+  static const bool lazy = std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr;
+  if (lazy)
+    return;
   if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
       !compute_ops_->supports_kv_cache_q() || !is_causal ||
       !q_cache_handles.empty())
