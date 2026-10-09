@@ -822,6 +822,64 @@ static void p1_unit_q8(const forward_job *job, uint32_t u) {
   }
 }
 
+/** @brief [#282 E] Two q heads' PV over a 256-wide int8 V row in one walk:
+ *         the row's two vectors unpacked to four hf chunks, eight chains.
+ *         noinline and no pipelining, as the fp16 pv_walk_* shapes. */
+static __attribute__((noinline)) void
+pv_walk_q8_2x2(const forward_job *job, const int8_t *vr,
+               const uint16_t *const *p, uint32_t hq0, const float *sv) {
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const uint32_t L = job->L, lo = job->lo, hd = 256u;
+  HVX_Vector a0 = Q6_V_vzero(), a1 = a0, a2 = a0, a3 = a0;
+  HVX_Vector b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+#if ATTN_M1_PV_LEAD
+  l2fetch_box(vr + (size_t)lo * hd, hd,
+              L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
+#endif
+  for (uint32_t q0 = lo; q0 < L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+    if (q0 + 2u * PV_BLOCK < L) {
+      const uint32_t rest = L - q0 - 2u * PV_BLOCK;
+      l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * hd, hd,
+                  rest < PV_BLOCK ? rest : PV_BLOCK);
+    }
+#endif
+    const uint16_t *pa = p[0] + q0, *pb = p[1] + q0;
+    const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
+#if defined(__hexagon__)
+#pragma clang loop pipeline(disable)
+#endif
+    for (uint32_t q = 0; q < nb; ++q) {
+      const HVX_Vector *row = (const HVX_Vector *)(vr + (size_t)(q0 + q) * hd);
+      const HVX_VectorPair w0 = Q6_Wh_vunpack_Vb(row[0]);
+      const HVX_VectorPair w1 = Q6_Wh_vunpack_Vb(row[1]);
+      const HVX_Vector v0 = Q6_Vhf_equals_Vh(Q6_V_lo_W(w0));
+      const HVX_Vector v1 = Q6_Vhf_equals_Vh(Q6_V_hi_W(w0));
+      const HVX_Vector v2 = Q6_Vhf_equals_Vh(Q6_V_lo_W(w1));
+      const HVX_Vector v3 = Q6_Vhf_equals_Vh(Q6_V_hi_W(w1));
+      const HVX_Vector sa = Q6_Vh_vsplat_R(pa[q]), sb = Q6_Vh_vsplat_R(pb[q]);
+      a0 = hvx_hf_fma(a0, sa, v0, one);
+      a1 = hvx_hf_fma(a1, sa, v1, one);
+      a2 = hvx_hf_fma(a2, sa, v2, one);
+      a3 = hvx_hf_fma(a3, sa, v3, one);
+      b0 = hvx_hf_fma(b0, sb, v0, one);
+      b1 = hvx_hf_fma(b1, sb, v1, one);
+      b2 = hvx_hf_fma(b2, sb, v2, one);
+      b3 = hvx_hf_fma(b3, sb, v3, one);
+    }
+  }
+  const HVX_Vector o[2][4] = {{a0, a1, a2, a3}, {b0, b1, b2, b3}};
+  for (uint32_t g = 0; g < 2u; ++g) {
+    float *dst = job->out + (size_t)(hq0 + g) * hd;
+    for (uint32_t c = 0; c < 4u; ++c) {
+      hvx_hf_store_sf(dst + (size_t)c * CH, o[g][c]);
+    }
+    for (uint32_t d = 0; d < hd; ++d) {
+      dst[d] *= sv[d];
+    }
+  }
+}
+
 /** @brief [#282 D] pv_group over the int8 cache: two 64-wide chunks a
  *         pass (one V vector is 128 dims of one position), V's per-dim
  *         scale applied to the f32 output after the chains. */
@@ -852,6 +910,18 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->softmax += (uint32_t)(now - *t);
     ps->div += (uint32_t)(now - *t);
     *t = now;
+  }
+  /* [#282 E] the PV single walk (760bcaf30) for the int8 cache: two q
+     heads x a 256-wide row (Gemma's sliding layers) are 8 chains, one walk
+     over the V rows instead of two */
+  if (ng == 2u && nv == 2u) {
+    pv_walk_q8_2x2(job, vr, p, hq0, sv);
+    if (ps) {
+      const uint64_t now = HAP_perf_get_pcycles();
+      ps->pv += (uint32_t)(now - *t);
+      *t = now;
+    }
+    return;
   }
   for (uint32_t c = 0; c < nv; ++c) { /* dims [128 c, 128 c + 128) */
 #if ATTN_M1_PV_LEAD
