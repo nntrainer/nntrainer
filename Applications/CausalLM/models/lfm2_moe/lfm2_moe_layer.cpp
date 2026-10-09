@@ -24,6 +24,7 @@
 #include <deque>
 #include <htp_decode_hook.h>
 #include <htp_wh_layout.h>
+#include <htp_wh_palette.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -580,12 +581,14 @@ void Lfm2MoELayer::buildExpertAssignments(
  *  accelerator's slot pool, keyed by its two weight tensors. The dims are
  *  the kernel's: gate_up is [K, 2 * inter], down [inter, N_out]. */
 static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
-  if (gu.getDataType() != nntrainer::Tdatatype::QS4CX_WH ||
-      dn.getDataType() != nntrainer::Tdatatype::QS4CX_WH) {
+  const auto dt = gu.getDataType();
+  if ((dt != nntrainer::Tdatatype::QS4CX_WH &&
+       dt != nntrainer::Tdatatype::QS2CX_WH) ||
+      dn.getDataType() != dt) {
     throw std::runtime_error(
-      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH expert "
-      "weights (the file's bytes go to the DSP as they are); this model's "
-      "are not");
+      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH or "
+      "QS2CX_WH expert weights (the file's bytes go to the DSP as they are); "
+      "this model's are not");
   }
   return ExpertFileDesc{&gu,
                         &dn,
@@ -594,7 +597,8 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
                         dn.getFileOffset(),
                         static_cast<unsigned int>(gu.height()),
                         static_cast<unsigned int>(dn.height()),
-                        static_cast<unsigned int>(dn.width())};
+                        static_cast<unsigned int>(dn.width()),
+                        dt == nntrainer::Tdatatype::QS2CX_WH ? 2u : 4u};
 }
 
 static void loadVirtualExpert(nntrainer::ComputeOps *ops,
@@ -977,24 +981,35 @@ static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
 }
 
 /**
- * @brief One QS4CX_WH weight from the model file, dequantized to f32
- *        row-major [K][N].
+ * @brief One QS4CX_WH or QS2CX_WH weight from the model file, dequantized
+ *        to f32 row-major [K][N].
  *
- * The file holds whBytes(K, N) nibbles, then N f32 scales, then N f32
- * column sums (the kernel's zero-point term, not needed here). A nibble is
- * the value plus 8, unsigned, where whSlot puts it.
+ * The file holds the codes -- whBytes(K, N) int4 nibbles, or whBytes2(K, N)
+ * 2-bit codes followed by the tensor's four-entry palette
+ * (QS2CX_WH_Tensor) -- then N f32 scales, then N f32 column sums (the
+ * kernel's zero-point term, not needed here).
  */
 static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
-                                std::vector<float> &out) {
-  const size_t nibbles = nntrainer::whBytes(K, N);
-  std::vector<uint8_t> packed(nibbles);
+                                unsigned int w_bits, std::vector<float> &out) {
+  const bool two = w_bits == 2u;
+  const size_t codes =
+    two ? nntrainer::whBytes2(K, N) + nntrainer::WH_PALETTE_LEVELS
+        : nntrainer::whBytes(K, N);
+  std::vector<uint8_t> packed(codes);
   std::vector<float> scale(N);
-  if (!moeReadAt(fd, packed.data(), nibbles, off) ||
-      !moeReadAt(fd, scale.data(), N * sizeof(float), off + nibbles)) {
+  if (!moeReadAt(fd, packed.data(), codes, off) ||
+      !moeReadAt(fd, scale.data(), N * sizeof(float), off + codes)) {
     return false;
   }
   std::vector<int8_t> q(static_cast<size_t>(K) * N);
-  nntrainer::whUnpack(packed.data(), K, N, q.data());
+  if (two)
+    nntrainer::whUnpack2(
+      packed.data(), K, N,
+      reinterpret_cast<const int8_t *>(packed.data() + codes -
+                                       nntrainer::WH_PALETTE_LEVELS),
+      q.data());
+  else
+    nntrainer::whUnpack(packed.data(), K, N, q.data());
   out.resize(q.size());
   auto &tm = nntrainer::ThreadManager::Global();
   tm.parallel_for(0, K, [&](size_t k) {
@@ -1057,9 +1072,9 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
       return;
     }
     if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
-                             w_gu) ||
+                             d.w_bits, w_gu) ||
         !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
-                             w_dn)) {
+                             d.w_bits, w_dn)) {
       std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
                    trace_layer, e);
       return;
@@ -1158,9 +1173,10 @@ static bool tryMoeLayerOnAccelerator(
   // call takes one flag for the layer, and a model that mixed the two would
   // otherwise read half its weights with the wrong layout.
   const auto wh = nntrainer::Tdatatype::QS4CX_WH;
+  const auto wh2 = nntrainer::Tdatatype::QS2CX_WH;
   const auto plain = nntrainer::Tdatatype::QS4CX;
-  const bool weights_wh =
-    context.getWeight(gate_up_indices[0]).getDataType() == wh;
+  const auto dt0 = context.getWeight(gate_up_indices[0]).getDataType();
+  const unsigned int w_bits = (dt0 == wh) ? 4u : (dt0 == wh2) ? 2u : 0u;
 
   // Decode's single token normally stays on the ARM side: it cannot amortize
   // the kernel's 64-row pad, which is why the fused path has the same gate.
@@ -1179,14 +1195,14 @@ static bool tryMoeLayerOnAccelerator(
   // side in one run (doc 46 section 49). Measurement switch, not a default.
   static const bool htp_decode_forced =
     std::getenv("NNTR_MOE_HTP_DECODE") != nullptr;
-  if (total_tokens <= 1 && !weights_wh && !htp_decode_forced) {
+  if (total_tokens <= 1 && w_bits == 0u && !htp_decode_forced) {
     return false;
   }
 
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
-    const auto want = weights_wh ? wh : plain;
+    const auto want = (w_bits == 4u) ? wh : (w_bits == 2u) ? wh2 : plain;
     if (gu.getDataType() != want || dn.getDataType() != want) {
       return false;
     }
@@ -1310,7 +1326,7 @@ static bool tryMoeLayerOnAccelerator(
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
-      hidden_size, weights_wh, gelu, pre_gamma, post_gamma, eps,
+      hidden_size, w_bits, gelu, pre_gamma, post_gamma, eps,
       with_add ? add_x2 : nullptr, with_add ? add_gamma : nullptr, add_scale);
   };
 
