@@ -705,6 +705,7 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       use_external_cache
         ? context.getInput(4)
         : context.getTensor(tensor_idx[AttentionParams::cache_value]);
+    const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
     const size_t n = static_cast<size_t>(pos) * wk;
     std::vector<float> k_rows(n), v_rows(n);
     auto rows_f32 = [n](const nntrainer::Tensor &c, float *dst) {
@@ -718,7 +719,17 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     };
     rows_f32(ck, k_rows.data());
     rows_f32(cv, v_rows.data());
+    const auto t_conv = std::chrono::steady_clock::now();
     htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
+    {
+      static double conv_ms = 0.0, all_ms = 0.0; // [#282 F] summed, logged
+      using ms = std::chrono::duration<double, std::milli>;
+      conv_ms += ms(t_conv - t_seed).count();
+      all_ms += ms(std::chrono::steady_clock::now() - t_seed).count();
+      ml_logi("mha_core: t1 seed pos=%u rows_convert_ms_sum=%.1f "
+              "seed_ms_sum=%.1f",
+              pos, conv_ms, all_ms);
+    }
     r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
                       wq, htp_rope_table_.data(),
                       static_cast<unsigned>(htp_rope_table_.size()));
