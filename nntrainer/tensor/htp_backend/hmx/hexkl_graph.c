@@ -494,6 +494,10 @@ static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
       nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
     graph_router(g, nx, call, in, out, sel, w);
     n = nx->top_k;
+    if (call->env->miss.hint != NULL) { /* [#282 B] the prefetch hint */
+      call->env->miss.hint(call->env->miss.ctx, (uint32_t)(nx - g->ops), sel,
+                           n);
+    }
   }
   /* ponytail: an entry that does not fit is dropped, as route_log does
      (Gemma's 29 x 9 + 1 B fit); a model past 320 B needs a bigger log */

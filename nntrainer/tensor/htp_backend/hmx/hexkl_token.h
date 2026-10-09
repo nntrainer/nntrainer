@@ -52,8 +52,8 @@
  *  each in its own lines. */
 #define HEXKL_MBOX_MISS_REQ HTP_MBOX_MISS_REQ
 #define HEXKL_MBOX_MISS_ANS HTP_MBOX_MISS_ANS
-/** @brief The page size the driver needs (18 432 B). */
-#define HEXKL_MBOX_BYTES (HTP_MBOX_MISS_ANS + HTP_MBOX_MISS_ANS_BYTES)
+/** @brief The page size the driver needs (18 560 B, [#282 B] the hint). */
+#define HEXKL_MBOX_BYTES (HTP_MBOX_HINT + HTP_MBOX_HINT_BYTES)
 /** @brief A wait gives up this long after its spin window. */
 #define HEXKL_TOKEN_TIMEOUT_US 1000000u
 /** @brief Poll period after the spin window: a sleep, so the waiting

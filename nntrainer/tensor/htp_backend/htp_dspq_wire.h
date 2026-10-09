@@ -170,6 +170,26 @@ typedef struct {
   uint32_t seq2;
 } htp_miss_ans;
 
+/** @brief [#282 B] S1 -> the pool's owner, mid-token and without a wait:
+ *  the next MoE layer's guessed routing (graph_predict), posted at ROUTER_TOPK
+ *  op @a op for the next ROUTER_TOPK op's layer. The owner may read the
+ *  guessed experts the pool lacks into the page cache while this layer
+ *  computes; S1 never waits on it and the real routing never reads it. One
+ *  slot, overwritten each layer: a hint the owner does not see in time is
+ *  lost, not queued. Body, then seq (word 0); seq2 repeats it. */
+#define HTP_MBOX_HINT (HTP_MBOX_MISS_ANS + HTP_MBOX_MISS_ANS_BYTES)
+#define HTP_MBOX_HINT_BYTES 128u
+typedef struct {
+  uint32_t seq; /**< tok * 256 + k + 1, k the token's k-th hint */
+  uint32_t op;  /**< the ROUTER_TOPK op the guess is for */
+  uint32_t n;
+  uint32_t ids[HTP_MBOX_MISS_MAX];
+  uint32_t seq2;
+} htp_pred_hint;
+
+typedef char
+  htp_pred_hint_fits[sizeof(htp_pred_hint) <= HTP_MBOX_HINT_BYTES ? 1 : -1];
+
 typedef char htp_dspq_token_resp_fits
   [sizeof(htp_dspq_token_resp) <= HTP_DSPQ_MAX_MSG ? 1 : -1];
 typedef char

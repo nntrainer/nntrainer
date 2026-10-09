@@ -175,6 +175,7 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->miss.post = NULL; /* the token driver's (hexkl_token_main) */
   env->miss.wait = NULL;
   env->miss.ctx = NULL;
+  env->miss.hint = NULL; /* [#282 B] the token driver's */
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables

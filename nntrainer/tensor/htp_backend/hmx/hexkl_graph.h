@@ -117,6 +117,9 @@ typedef struct {
               const uint32_t *miss, uint32_t n_miss);
   int (*wait)(void *ctx, struct hexkl_graph_s *g, uint32_t op);
   void *ctx;
+  /** [#282 B] graph_predict's guess for ROUTER_TOPK op @a op, posted
+   *  without a wait (htp_pred_hint); NULL = not posted */
+  void (*hint)(void *ctx, uint32_t op, const uint32_t *ids, uint32_t n);
 } hexkl_graph_miss;
 
 /** @brief What a kernel needs from the session, handed per call so the

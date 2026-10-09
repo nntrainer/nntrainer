@@ -125,7 +125,28 @@ typedef struct {
   uint8_t *mbox;
   uint32_t tok, k, spin_us;
   hexkl_token_stats *st;
+  uint32_t hk; /**< [#282 B] hints posted this token */
 } tk_miss;
+
+/** @brief [#282 B] graph_predict's guess to the page's hint slot: body,
+ *  then seq. Never waits; a full token's worth is 30 of 255. */
+static void tk_hint_post(void *ctx, uint32_t op, const uint32_t *ids,
+                         uint32_t n) {
+  tk_miss *m = (tk_miss *)ctx;
+  htp_pred_hint *h = (htp_pred_hint *)(m->mbox + HTP_MBOX_HINT);
+  const uint32_t seq = hexkl_token_seq(m->tok, m->hk);
+  if (m->hk >= HEXKL_TOKEN_MAX_ROUNDS || n > HTP_MBOX_MISS_MAX) {
+    return;
+  }
+  ++m->hk;
+  h->op = op;
+  h->n = n;
+  memcpy(h->ids, ids, n * sizeof(uint32_t));
+  h->seq2 = seq;
+  tk_clean(h, sizeof(*h));
+  *(volatile uint32_t *)&h->seq = seq;
+  tk_clean(h, 4u);
+}
 
 static int tk_miss_post(void *ctx, uint32_t op, const uint32_t *routed,
                         uint32_t n_routed, const uint32_t *miss,
@@ -219,7 +240,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
                      uint32_t act_len, float *logits, uint32_t logits_len,
                      uint32_t spin_us, hexkl_token_stats *st, uint32_t *id) {
   /* [plan 201 S1] the MOE ops' miss rounds go through the page */
-  tk_miss miss = {env, mbox, tok, 0u, spin_us, st};
+  tk_miss miss = {env, mbox, tok, 0u, spin_us, st, 0u};
   hexkl_graph_env menv = *env;
   const htp_graph_op *last;
   uint32_t resume;
@@ -227,6 +248,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
   menv.miss.post = tk_miss_post;
   menv.miss.wait = tk_miss_wait;
   menv.miss.ctx = &miss;
+  menv.miss.hint = tk_hint_post; /* [#282 B] posted only under predict */
   g->route_log_n = 0u;
   g->pred_log_n = 0u; /* [#266 S2] */
   g->moe_calls = g->moe_calls_1x = 0u;
