@@ -155,6 +155,8 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   /* [plan 201 S1] the routed sets, for the pool */
   r->route_n = s->graph->route_log_n;
   memcpy(r->route, s->graph->route_log, r->route_n);
+  r->pred_n = s->graph->pred_log_n; /* [#266 S2] */
+  memcpy(r->pred, s->graph->pred_log, r->pred_n);
   for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
     r->kind_pcyc[k] =
       (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);

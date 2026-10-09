@@ -180,7 +180,12 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  table, 2 x n_experts u32 handle words (h_gu[0..E) then h_dn[0..E)), each
  *  a registered weight of the op's shape or HTP_GRAPH_NO_HANDLE (not
  *  resident: forward refuses a token that routes to it); a later EXPERTS
- *  replaces the table. Append, never reorder. */
+ *  replaces the table. [#266 S2] PREDICT is one word (u32 bits) with op ==
+ *  HTP_GRAPH_NO_OP: 1 makes every ROUTER_TOPK op also run the next
+ *  ROUTER_TOPK op's router on its own input, a guess at the next MoE
+ *  layer's routing, logged per router op (hexkl_graph.h pred_log); 0 (the
+ *  default) turns it off. The real routing moves no bit either way.
+ *  Append, never reorder. */
 enum {
   HTP_GRAPH_PARAM_GAMMA = 0,
   HTP_GRAPH_PARAM_CONV_W,
@@ -190,6 +195,7 @@ enum {
   HTP_GRAPH_PARAM_ROUTER_BIAS,
   HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_EXPERTS,
+  HTP_GRAPH_PARAM_PREDICT,
   HTP_GRAPH_PARAM_N
 };
 /** @brief LM_BAN's longest list. */

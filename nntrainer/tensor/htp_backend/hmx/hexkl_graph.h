@@ -195,6 +195,14 @@ typedef struct hexkl_graph_s {
   float *moe_rows;
   uint8_t route_log[HEXKL_GRAPH_ROUTE_LOG]; /**< cleared by the token driver */
   uint32_t route_log_n;
+  /** [#266 S2] HTP_GRAPH_PARAM_PREDICT: 1 = each ROUTER_TOPK op also runs
+   *  the next ROUTER_TOPK op's router on its own input */
+  uint32_t predict;
+  /** [#266 S2] per ROUTER_TOPK op run with predict set, in list order: the
+   *  count (0: no next router, or its weights unbound), then the guessed
+   *  ids best first; cleared by the token driver like route_log */
+  uint8_t pred_log[HEXKL_GRAPH_ROUTE_LOG];
+  uint32_t pred_log_n;
   /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
    *  by every router op, read by the MOE op after it. */
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];

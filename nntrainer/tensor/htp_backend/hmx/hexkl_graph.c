@@ -33,6 +33,7 @@
  * at Gemma's 262144) and the slot shape
  * copy (8 B a slot) -- about 0.35 MiB of heap. The Q4M1 weights are the
  * session's (nntr_hvx_fc_q4.c's note), not the graph's.
+ * [#266 S2] The prediction log: 320 B in the graph record, no heap.
  * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
  * 11 KiB of scales, 1.4 MiB a layer, 43 MiB (the ponytail note in
  * hvx_router_softmax_topk_f32). Its RoPE: one max_seq x head_dim f32 table
@@ -387,14 +388,10 @@ static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
    [plan 201 S4] The softmax router (eps_bits set) norms its un-normed input
    into the out slot first (gamma = ROUTER_BIAS's g, the validator keeps
    in != out), then its logits overwrite it. */
-static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
-                                graph_call *call, const float *in, float *out) {
+static void graph_router(hexkl_graph *g, const htp_graph_op *op,
+                         graph_call *call, const float *in, float *out,
+                         uint32_t *sel, float *w) {
   const uint32_t i = (uint32_t)(op - g->ops);
-  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
-  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
-  if (g->param[i] == NULL || g->state[i] == NULL) {
-    return AEE_EBADSTATE;
-  }
   if (op->eps_bits != 0u) {
     hvx_rmsnorm_f32(in, g->state[i], out, op->K, op->K, graph_eps(op), NULL);
     hvx_router_softmax_topk_f32(out, g->param[i], g->state[i] + op->K, op->K,
@@ -404,6 +401,55 @@ static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
     hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
                         op->top_k, out, sel, w, call->env->pool);
   }
+}
+
+/* [#266 S2] The next ROUTER_TOPK op's router on this one's input: a guess
+   at the next MoE layer's routing (pre-gated MoE), logged best first. It
+   runs before this op's own router and writes only the out slot, which
+   that router rewrites, so the real routing moves no bit. */
+static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
+                          graph_call *call, const float *in, float *out) {
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], j, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS];
+  const htp_graph_op *nx = NULL;
+  for (j = (uint32_t)(op - g->ops) + 1u; j < g->n_ops && nx == NULL; ++j) {
+    if (g->ops[j].kind == HTP_OP_ROUTER_TOPK) {
+      nx = &g->ops[j];
+    }
+  }
+  /* in != out: the guess must not clobber this router's input (the
+     validator allows it for the sigmoid router); the same kind and width,
+     so the guess writes no more of the slot than this router does */
+  if (nx != NULL && g->param[nx - g->ops] != NULL &&
+      g->state[nx - g->ops] != NULL && in != out &&
+      nx->n_experts == op->n_experts &&
+      (nx->eps_bits != 0u) == (op->eps_bits != 0u) &&
+      nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
+    graph_router(g, nx, call, in, out, sel, w);
+    n = nx->top_k;
+  }
+  /* ponytail: an entry that does not fit is dropped, as route_log does
+     (Gemma's 29 x 9 + 1 B fit); a model past 320 B needs a bigger log */
+  if (g->pred_log_n + 1u + n <= HEXKL_GRAPH_ROUTE_LOG) {
+    g->pred_log[g->pred_log_n++] = (uint8_t)n;
+    for (r = 0; r < n; ++r) {
+      g->pred_log[g->pred_log_n++] = (uint8_t)sel[r];
+    }
+  }
+}
+
+static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
+                                graph_call *call, const float *in, float *out) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
+  if (g->param[i] == NULL || g->state[i] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (g->predict != 0u) {
+    graph_predict(g, op, call, in, out);
+  }
+  graph_router(g, op, call, in, out, sel, w);
   memset(g->route_cnt, 0, sizeof(g->route_cnt));
   for (r = 0; r < op->top_k; ++r) {
     g->route_cnt[sel[r]] = 1u;
@@ -936,6 +982,21 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
       g->ban[i] = id;
     }
     g->n_ban = n;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_PREDICT) {
+    uint32_t v;
+    if (op != HTP_GRAPH_NO_OP) {
+      return AEE_EBADITEM;
+    }
+    if (n != 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    memcpy(&v, data, sizeof(v));
+    if (v > 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    g->predict = v;
     return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_EXPERTS) {
