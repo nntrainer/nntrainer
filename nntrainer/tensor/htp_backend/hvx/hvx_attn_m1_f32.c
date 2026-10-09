@@ -43,13 +43,13 @@
  *               / 1: divide their rows by l (hvx_hf_div16), then o[g] =
  *               fma(o[g], splat(p[g][p]), V[p]) for p ascending, the chains
  *               of a group sharing each V row load, the V rows l2fetched
- *               two 16 KiB blocks ahead; out = o widened to f32 as vectors.
+ *               two PV_BLOCKs ahead; out = o widened to f32 as vectors.
  *
  * [plan 201 S4] Gemma 4: a head_dim of 256 or 512 is head_dim / 64 chunks
  * of the same vectors (P1 runs its chains on through the chunks' zipped q
- * rows, P3 one pass per chunk), and a window starts every run at the tile
- * of the first visible position, its lanes before that masked like the
- * lanes past L (max, exp), the sum and PV chains from that position.
+ * rows, P3 one walk per PV_CG(ng) chunks, #261), and a window starts every
+ * run at the tile of the first visible position, its lanes before that masked
+ * like the lanes past L (max, exp), the sum and PV chains from that position.
  *
  * The phase words keep their meaning (attn_m1_det.h): APPEND = the
  * caller's rounding and stores, SCORES = P1 (with the k column merge),
@@ -91,6 +91,10 @@
 #define MAX_NQ 64u
 /** @brief q heads per PV unit, the chains that share a V row load. */
 #define PV_GROUP 4u
+/** @brief PV chains (head x 64-wide chunk) one V walk keeps in registers. */
+#define PV_ACC 8u
+/** @brief 64-wide chunks per V walk for ng heads. */
+#define PV_CG(ng) (PV_ACC / (ng))
 /** @brief fp16 bits of -65504, the mask fill for the max. */
 #define HF_NEG_MAX 0xFBFF
 
@@ -624,17 +628,97 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   }
 }
 
+/** @brief One walk of P3 over the window's V rows for q heads hq0 .. hq0 +
+ *         ng - 1 of kv head h (rows @a vr) and the 64-wide chunks c0 .. c0 +
+ *         cg - 1 (ng, cg literal, ng x cg <= PV_ACC chains in registers):
+ *         p ascending from the window's first in blocks of PV_BLOCK, the
+ *         row's cg vectors loaded once for the ng heads, o[g][c] = fma(o,
+ *         splat(p[g][p]), V[p][c]). Each (head, d) chain is the spec's
+ *         sequence in p order, so the walk order over chunks moves no bit.
+ */
+static inline __attribute__((always_inline)) void
+pv_walk(const forward_job *job, const HVX_Vector *vr,
+        const uint16_t *p[PV_GROUP], uint32_t hq0, uint32_t c0,
+        const uint32_t ng, const uint32_t cg) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const uint32_t L = job->L, lo = job->lo;
+  const uint32_t hd = ctx->head_dim, nch = hd / CH;
+  const HVX_Vector *vc = vr + c0;
+#if ATTN_M1_PV_LEAD
+  l2fetch_box(vr + (size_t)lo * nch, nch * VLEN,
+              L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
+#endif
+  HVX_Vector o[PV_ACC];
+  for (uint32_t i = 0; i < ng * cg; ++i) {
+    o[i] = Q6_V_vzero();
+  }
+  for (uint32_t q0 = lo; q0 < L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+    if (q0 + 2u * PV_BLOCK < L) {
+      const uint32_t rest = L - q0 - 2u * PV_BLOCK;
+      l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * nch, nch * VLEN,
+                  rest < PV_BLOCK ? rest : PV_BLOCK);
+    }
+#endif
+    const HVX_Vector *vb = vc + (size_t)q0 * nch;
+    const uint16_t *b[PV_GROUP];
+    for (uint32_t g = 0; g < ng; ++g) {
+      b[g] = p[g] + q0;
+    }
+    const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
+    /* No software pipelining: with eight chains hexagon-clang 19's
+       pipeliner carries a product across the back edge as sf and back
+       (vadd(sf, 0)), the sequence S1 never measured on silicon; with it
+       off no pv_walk_* position loop has an .sf operand (objdump). */
+#pragma clang loop pipeline(disable)
+    for (uint32_t q = 0; q < nb; ++q) {
+      const HVX_Vector *vq = vb + (size_t)q * nch;
+      HVX_Vector sp[PV_GROUP];
+      for (uint32_t g = 0; g < ng; ++g) {
+        sp[g] = Q6_Vh_vsplat_R(b[g][q]);
+      }
+      for (uint32_t c = 0; c < cg; ++c) {
+        const HVX_Vector v = vq[c];
+        for (uint32_t g = 0; g < ng; ++g) {
+          o[g * cg + c] = hvx_hf_fma(o[g * cg + c], sp[g], v, one);
+        }
+      }
+    }
+  }
+  for (uint32_t g = 0; g < ng; ++g) {
+    for (uint32_t c = 0; c < cg; ++c) {
+      hvx_hf_store_sf(job->out + (size_t)(hq0 + g) * hd + (size_t)(c0 + c) * CH,
+                      o[g * cg + c]);
+    }
+  }
+}
+
+/* One function per (ng, cg), each walk's chains in their own register
+   allocation: inlined together into run_p3, hexagon-clang 19 spilled the
+   eight-chain loops' accumulators to the stack (bit-safe, but which loop
+   moved with unrelated edits). */
+#define PV_WALK_FN(NG, CG)                                                     \
+  static __attribute__((noinline)) void pv_walk_##NG##_##CG(                   \
+    const forward_job *job, const HVX_Vector *vr, const uint16_t *p[PV_GROUP], \
+    uint32_t hq0, uint32_t c0) {                                               \
+    pv_walk(job, vr, p, hq0, c0, NG##u, CG##u);                                \
+  }
+PV_WALK_FN(4, 2)
+PV_WALK_FN(4, 1)
+PV_WALK_FN(2, 4)
+PV_WALK_FN(2, 1)
+PV_WALK_FN(1, 1)
+
 /** @brief P3 for q heads g0 .. g0 + ng - 1 of kv head h (ng literal at the
  *         call sites, so the chains live in registers): the divides, then
- *         PV with the V row loaded once per position, the V rows fetched
- *         two 16 KiB blocks ahead of the chain. */
+ *         PV by pv_walk, nch / cg walks over the V rows. */
 static inline __attribute__((always_inline)) void
 pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
          prof_slot *ps, uint64_t *t) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
-  const uint32_t hq0 = h * ctx->gqa + g0, L = job->L, lo = job->lo;
-  const uint32_t hd = ctx->head_dim, nch = hd / CH;
+  const uint32_t hq0 = h * ctx->gqa + g0, nch = ctx->head_dim / CH;
   const HVX_Vector *vr = (const HVX_Vector *)v_head(ctx, job->layer, h);
   const uint16_t *p[PV_GROUP];
   for (uint32_t g = 0; g < ng; ++g) {
@@ -655,50 +739,24 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
-  /* p ascending from the window's first in blocks of PV_BLOCK; the chain
-     loop is round 1's. [plan 201 S4] A V row of head_dim > 64 is nch
-     vectors: one pass of the chains per 64-wide chunk (each d its own
-     chain, so the passes are the spec's chains in another order of d).
-     ponytail: the passes re-walk the positions, nch x the V row loads of
-     one pass; the register file would hold 4 heads x 1 chunk or 1 head x
-     4 chunks -- plan 201 S6 measures which, on silicon. */
-  for (uint32_t c = 0; c < nch; ++c) {
-    const HVX_Vector *vc = vr + c;
-#if ATTN_M1_PV_LEAD
-    l2fetch_box(vr + (size_t)lo * nch, nch * VLEN,
-                L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
-#endif
-    HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
-    for (uint32_t q0 = lo; q0 < L; q0 += PV_BLOCK) {
-#if ATTN_M1_PV_LEAD
-      if (q0 + 2u * PV_BLOCK < L) {
-        const uint32_t rest = L - q0 - 2u * PV_BLOCK;
-        l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * nch, nch * VLEN,
-                    rest < PV_BLOCK ? rest : PV_BLOCK);
-      }
-#endif
-      const HVX_Vector *vb = vc + (size_t)q0 * nch;
-      const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
-                     *b2 = p[ng > 2u ? 2u : 0u] + q0,
-                     *b3 = p[ng > 3u ? 3u : 0u] + q0;
-      const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
-      for (uint32_t q = 0; q < nb; ++q) {
-        const HVX_Vector v = vb[(size_t)q * nch];
-        o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(b0[q]), v, one);
-        if (ng > 1u) {
-          o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(b1[q]), v, one);
-        }
-        if (ng > 2u) {
-          o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(b2[q]), v, one);
-        }
-        if (ng > 3u) {
-          o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(b3[q]), v, one);
-        }
-      }
-    }
-    const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
-    for (uint32_t g = 0; g < ng; ++g) {
-      hvx_hf_store_sf(job->out + (size_t)(hq0 + g) * hd + (size_t)c * CH, o[g]);
+  /* [#261] Every chain of a walk takes the V row's vectors of its cg
+     chunks from one load of the row, so a V row of nch chunks is walked
+     nch / cg times instead of nch (the 261 sitting: PV at 64-71 lane
+     pcycles per FMA on silicon, 11.4 on the ISS). Gemma 4's sliding shape
+     (gqa 2, hd 256) walks once, the full one (gqa 8 in groups of 4, hd
+     512) four times, LFM's hd 64 once as before. ponytail: one head (odd
+     gqa only, no host case beyond hd 64) and an nch that PV_CG(ng) does
+     not divide (hd 128, 192, ...) walk per chunk as before; a pv_walk_1_8
+     and a halving cg, each with a host shape, when such a model comes. */
+  const int whole = ng > 1u && nch % PV_CG(ng) == 0u;
+  const uint32_t cg = whole ? PV_CG(ng) : 1u;
+  for (uint32_t c0 = 0; c0 < nch; c0 += cg) {
+    if (ng == 4u) {
+      (whole ? pv_walk_4_2 : pv_walk_4_1)(job, vr, p, hq0, c0);
+    } else if (ng == 2u) {
+      (whole ? pv_walk_2_4 : pv_walk_2_1)(job, vr, p, hq0, c0);
+    } else {
+      pv_walk_1_1(job, vr, p, hq0, c0);
     }
   }
   if (ps) {
