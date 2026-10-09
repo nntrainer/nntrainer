@@ -121,6 +121,9 @@ typedef struct {
                              mm_u8i4_moe_layer_norm (M x K f32, DSP heap,
                              grown on demand), freed in close() */
   uint32_t norm_rows_n; /**< floats norm_rows holds */
+  float *moe_res;       /**< mm_u8i4_moe_layer_norm_add's MoE output, before
+                             the epilogue writes the call's out (heap) */
+  uint32_t moe_res_n;   /**< floats moe_res holds */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq

@@ -41,4 +41,8 @@
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
                       const float *cs, hvx_worker_pool *pool);
 
+/** @brief hvx_rope_rows_f32 over rows @a ld floats apart (ld >= n). */
+int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                         uint32_t hd, const float *cs, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_ROPE_ROWS_F32_H__ */

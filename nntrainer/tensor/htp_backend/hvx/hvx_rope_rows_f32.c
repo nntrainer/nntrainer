@@ -23,7 +23,7 @@
 typedef struct {
   float *x;
   const float *cs;
-  uint32_t M, n, hd;
+  uint32_t M, n, ld, hd;
 } rows_ctx;
 
 static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
@@ -39,7 +39,7 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
     const HVX_UVector *vs =
       (const HVX_UVector *)(c->cs + (size_t)r * 2u * c->hd + c->hd);
     for (uint32_t h = 0; h < n_heads; ++h) {
-      float *head = c->x + (size_t)r * c->n + (size_t)h * c->hd;
+      float *head = c->x + (size_t)r * c->ld + (size_t)h * c->hd;
       HVX_UVector *va = (HVX_UVector *)head;
       HVX_UVector *vb = (HVX_UVector *)(head + half);
       for (uint32_t k = 0; k < nvec; ++k) {
@@ -57,11 +57,16 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
 
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
                       const float *cs, hvx_worker_pool *pool) {
+  return hvx_rope_rows_ld_f32(x, M, n, n, hd, cs, pool);
+}
+
+int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                         uint32_t hd, const float *cs, hvx_worker_pool *pool) {
   if (!x || !cs || M == 0u || hd == 0u || (hd / 2u) % LANES != 0u || n == 0u ||
-      n % hd != 0u) {
+      n % hd != 0u || ld < n) {
     return -1;
   }
-  rows_ctx c = {x, cs, M, n, hd};
+  rows_ctx c = {x, cs, M, n, ld, hd};
   hvx_worker_pool_run(pool, rows_worker, &c, M);
   return 0;
 }

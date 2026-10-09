@@ -31,9 +31,12 @@ void ResidualAddLayer::finalize(nntrainer::InitLayerContext &context) {
 
   in_norm = std::get<props::InNorm>(props_).get();
   use_scale = std::get<props::UseWeight>(props_).get();
+  proj = std::get<props::Proj>(props_).get();
+  NNTR_THROW_IF(proj && n_in != 2, std::invalid_argument)
+    << "ResidualAddLayer: proj takes (residual, the projection's input)";
   if (!std::get<nntrainer::props::SkipPrefill>(props_).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(props_).get();
-  const bool fused = in_norm || use_scale || n_in == 3;
+  const bool fused = in_norm || use_scale || n_in == 3 || proj;
   // ponytail: the folded forms are FP32 only (the one activation type the
   // model that uses them runs); the plain two-input add keeps every type.
   NNTR_THROW_IF(fused &&
@@ -43,7 +46,22 @@ void ResidualAddLayer::finalize(nntrainer::InitLayerContext &context) {
 
   const nntrainer::TensorDim::TensorType f32(
     context.getFormat(), ml::train::TensorDim::DataType::FP32);
-  // the file's order: the norm's gamma, then the block's scalar
+  // the file's order: the projection (FullyConnectedLayer's weight shape),
+  // the norm's gamma, then the block's scalar
+  if (proj) {
+    const bool is_nchw = context.getFormat() == nntrainer::Tformat::NCHW;
+    const unsigned int unit = dim[0].width();
+    proj_idx = context.requestWeight(
+      nntrainer::TensorDim(1, is_nchw ? 1 : unit, is_nchw ? dim[1].width() : 1,
+                           is_nchw ? unit : dim[1].channel(),
+                           nntrainer::TensorDim::TensorType(
+                             context.getFormat(), context.getWeightDataType()),
+                           is_nchw ? 0b0011 : 0b0101),
+      // ones, as the o-proj layer it replaces was built (a model file
+      // overwrites it; the tiny test models run on it)
+      nntrainer::props::InitializerInfo::Enum::ONES,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "weight", true);
+  }
   if (in_norm)
     gamma_idx = context.requestWeight(
       nntrainer::TensorDim(1, 1, 1, dim[0].width(), f32),
@@ -81,7 +99,7 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
   const nntrainer::Tensor &in0 = context.getInput(0);
   const nntrainer::Tensor &in1 = context.getInput(1);
   const bool two = context.getNumInputs() == 3;
-  const bool fused = in_norm || use_scale || two;
+  const bool fused = in_norm || use_scale || two || proj;
   const float eps = std::get<nntrainer::props::Epsilon>(props_).get();
   const float *gamma =
     in_norm ? context.getWeight(gamma_idx).getData<float>() : nullptr;
@@ -120,9 +138,24 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
     }
     const float *x2 =
       two ? step(context.getInput(2), b).getData<float>() : nullptr;
+    nntrainer::ComputeOps *ops = out_step.getOps();
+    if (proj) {
+      // The projection and the epilogue as one accelerator call at
+      // prefill; otherwise the projection here (an engine's FC through
+      // dot(), decode's row included) and the epilogue on its output.
+      nntrainer::Tensor &w = context.getWeight(proj_idx);
+      if (rows > 1 && ops != nullptr && W % 32 == 0 &&
+          w.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+          ops->gemm_qs4cx_res_add_fp32(
+            w.getData<char>(), w.getScale<float>(), in1_step.getData<float>(),
+            rows, in1_step.width(), W, in0_step.getData<float>(), gamma, eps,
+            scale, out_step.getData<float>()))
+        continue;
+      in1_step = step(context.getTensor(sum_idx), b);
+      step(in1, b).dot(w, in1_step, false, false);
+    }
     // The whole epilogue as one accelerator call at prefill; decode's one
     // row cannot amortize the call and stays here.
-    nntrainer::ComputeOps *ops = out_step.getOps();
     if (rows > 1 && ops != nullptr && ops->supports_rmsnorm_add_fp32() &&
         W % 32 == 0) {
       ops->rmsnorm_add_fp32(rows, W, in0_step.getData<float>(),

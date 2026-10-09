@@ -25,6 +25,7 @@
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i4_moe.h"
+#include "hexkl_mm_u8i8_dma.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
@@ -867,20 +868,89 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
                                  &(const hexkl_mm_opts){.pool = s->quant_pool});
 }
 
+int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
+                                   float eps, float scale, const float *gamma,
+                                   int gammaLen, const uint32 *w_handles,
+                                   int w_handlesLen, const float *act_f32,
+                                   int act_f32Len, const float *res, int resLen,
+                                   float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || w_handlesLen <= 0 || w_handlesLen > 8) {
+    return AEE_EBADPARM;
+  }
+  uint32_t N = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    N += s->weights_u8i4.slots[w_handles[i]].N;
+  }
+  const uint64_t n = (uint64_t)M * N;
+  int rc =
+    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, (int)n);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if ((uint64_t)resLen != n || (uint64_t)out_f32Len != n ||
+      (gammaLen != 0 && (uint32_t)gammaLen != N)) {
+    FARF(ERROR, "mm_u8i4_layer_res_add: bad lengths (M=%u N=%u)", (unsigned)M,
+         (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  if (s->moe_res_n < n) {
+    free(s->moe_res);
+    s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+    if (!s->moe_res) {
+      FARF(ERROR, "layer_res_add: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles,
+                               (uint32_t)w_handlesLen, act_f32, s->moe_res,
+                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* layer_run wrote one M x N_i block per handle, in handle order */
+  const float *xb[8];
+  uint32_t cols[8];
+  size_t off = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    cols[i] = s->weights_u8i4.slots[w_handles[i]].N;
+    xb[i] = s->moe_res + off;
+    off += (size_t)M * cols[i];
+  }
+  if (hvx_rmsnorm_add_blocks_f32(out_f32, res, xb, cols, (uint32_t)w_handlesLen,
+                                 M, gammaLen ? gamma : NULL, eps, scale,
+                                 s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
 /** @brief The activation rows normed into the session's scratch (grown to
  *  M x K floats), for the *_norm entries. NULL when the heap refuses. */
-static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
-                                 uint32 M, uint32 K, const float *gamma,
-                                 float eps) {
-  const size_t n = (size_t)M * K;
+static int norm_rows_reserve(nntr_hvx_session *s, size_t n) {
   if (s->norm_rows_n < n) {
     free(s->norm_rows);
     s->norm_rows = (float *)memalign(128, n * sizeof(float));
     s->norm_rows_n = s->norm_rows ? (uint32_t)n : 0u;
     if (!s->norm_rows) {
       FARF(ERROR, "norm_rows: no heap for %u floats", (unsigned)n);
-      return NULL;
+      return 0;
     }
+  }
+  return 1;
+}
+
+static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
+                                 uint32 M, uint32 K, const float *gamma,
+                                 float eps) {
+  if (!norm_rows_reserve(s, (size_t)M * K)) {
+    return NULL;
   }
   if (hvx_rmsnorm_rows_f32(act_f32, s->norm_rows, M, K, K, gamma, eps,
                            s->quant_pool) != 0) {
@@ -889,14 +959,18 @@ static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
   return s->norm_rows;
 }
 
-int nntr_hvx_mm_u8i4_layer_norm(
-  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
-  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
-  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
-  uint32 rope_handles, const float *rope_cs, int rope_csLen,
-  const uint32 *w_handles, int w_handlesLen, const float *act_f32,
-  int act_f32Len, float *out_cat, int out_catLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+/** @brief Both layer_norm entries; @a out_off / @a out_ld NULL for the
+ *  packed [M x N_i] blocks, else hexkl_mm_opts's per-handle placement. */
+static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
+                           const float *pre_gamma, int pre_gammaLen,
+                           const uint32 *post_chunk, int post_chunkLen,
+                           const float *post_gamma, int post_gammaLen,
+                           uint32 rope_hd, uint32 rope_handles,
+                           const float *rope_cs, int rope_csLen,
+                           const uint32 *w_handles, int w_handlesLen,
+                           const float *act_f32, int act_f32Len, float *out_cat,
+                           int out_catLen, const uint32 *out_off,
+                           const uint32 *out_ld) {
   int rc =
     check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
   if (rc != AEE_SUCCESS) {
@@ -945,41 +1019,98 @@ int nntr_hvx_mm_u8i4_layer_norm(
     }
   }
 
-  const float *act = act_f32;
+  /* The pre norm goes into the quant pass, rows normed four at a time into
+     a worker's slice of norm_rows: the normed rows stay in cache. */
+  hexkl_mm_opts opts = {
+    .pool = s->quant_pool, .out_off = out_off, .out_ld = out_ld};
   if (pre_gammaLen != 0) {
-    act = norm_rows_in(s, act_f32, M, K, pre_gamma, eps);
-    if (!act) {
+    if (!norm_rows_reserve(s, (size_t)M * K)) {
       return AEE_ENOMEMORY;
     }
+    opts.pre_scratch = s->norm_rows;
+    opts.pre_gamma = pre_gamma;
+    opts.pre_eps = eps;
   }
   rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
                                s->config_off, M, K, w_handles,
-                               (uint32_t)w_handlesLen, act, out_cat,
-                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+                               (uint32_t)w_handlesLen, act_f32, out_cat, &opts);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  /* The post norms, in place on each handle's [M x N_i] block. */
+  /* The post norms, in place on each handle's rows. */
   size_t off = 0;
   const float *g = post_gamma;
   for (i = 0; i < post_chunkLen; ++i) {
     const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
     const uint32_t c = post_chunk[i];
+    float *o_i = out_off ? out_cat + out_off[i] : out_cat + off;
     if (c != 0u) {
-      hvx_rmsnorm_rows_f32(out_cat + off, out_cat + off, M, n_i, c, g, eps,
-                           s->quant_pool);
+      hvx_rmsnorm_rows_ld_f32(o_i, o_i, M, n_i, out_ld ? out_ld[i] : n_i, c, g,
+                              eps, s->quant_pool);
       g += c;
     }
     off += (size_t)M * n_i;
   }
-  /* Then RoPE on the first rope_handles blocks, after their norms. */
+  /* Then RoPE on the first rope_handles handles' rows, after their norms. */
   off = 0;
   for (i = 0; rope_hd != 0u && i < (int)rope_handles; ++i) {
     const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
-    hvx_rope_rows_f32(out_cat + off, M, n_i, rope_hd, rope_cs, s->quant_pool);
+    hvx_rope_rows_ld_f32(out_off ? out_cat + out_off[i] : out_cat + off, M, n_i,
+                         out_ld ? out_ld[i] : n_i, rope_hd, rope_cs,
+                         s->quant_pool);
     off += (size_t)M * n_i;
   }
   return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_norm(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
+  return layer_norm_impl((nntr_hvx_session *)handle, M, K, eps, pre_gamma,
+                         pre_gammaLen, post_chunk, post_chunkLen, post_gamma,
+                         post_gammaLen, rope_hd, rope_handles, rope_cs,
+                         rope_csLen, w_handles, w_handlesLen, act_f32,
+                         act_f32Len, out_cat, out_catLen, NULL, NULL);
+}
+
+int nntr_hvx_mm_u8i4_layer_norm_ld(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const uint32 *out_off,
+  int out_offLen, const uint32 *out_ld, int out_ldLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || w_handlesLen <= 0 || out_offLen != w_handlesLen ||
+      out_ldLen != w_handlesLen || M == 0u) {
+    return AEE_EBADPARM;
+  }
+  /* Every handle's rows inside out_cat (the rectangles apart is the
+     caller's to keep; overlapping ones only garble its own output). */
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    if (out_ld[i] < n_i ||
+        (uint64_t)out_off[i] + (uint64_t)(M - 1u) * out_ld[i] + n_i >
+          (uint64_t)(uint32_t)out_catLen) {
+      FARF(ERROR, "mm_u8i4_layer_norm_ld: handle %d off %u ld %u N %u", i,
+           (unsigned)out_off[i], (unsigned)out_ld[i], (unsigned)n_i);
+      return AEE_EBADPARM;
+    }
+  }
+  return layer_norm_impl(s, M, K, eps, pre_gamma, pre_gammaLen, post_chunk,
+                         post_chunkLen, post_gamma, post_gammaLen, rope_hd,
+                         rope_handles, rope_cs, rope_csLen, w_handles,
+                         w_handlesLen, act_f32, act_f32Len, out_cat, out_catLen,
+                         out_off, out_ld);
 }
 
 int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
@@ -1493,6 +1624,52 @@ int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
   return AEE_SUCCESS;
 }
 
+int nntr_hvx_router_logits_u8i8_f32(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 E, float eps,
+  const float *gamma, int gammaLen, uint32 w_handle, const float *x, int xLen,
+  uint32 top_k, uint32 n_sel, const float *scale, int scaleLen, float *logits,
+  int logitsLen, uint32 *sel, int selLen, float *weight, int weightLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !s->hmx_locked) {
+    return AEE_EBADPARM;
+  }
+  if (M == 0u || K == 0u || E == 0u || E % 32u != 0u || E > 128u ||
+      (uint64_t)M * K > 0x7FFFFFFFu || (uint64_t)xLen != (uint64_t)M * K ||
+      (uint64_t)logitsLen != (uint64_t)M * E ||
+      (gammaLen != 0 && (uint32)gammaLen != K) ||
+      w_handle >= HEXKL_MM_U8I8_MAX_WEIGHTS ||
+      !s->weights_u8i8.slots[w_handle].in_use ||
+      s->weights_u8i8.slots[w_handle].K != K ||
+      s->weights_u8i8.slots[w_handle].N != E) {
+    FARF(ERROR, "router_logits_u8i8_f32: bad shape or handle");
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u && (n_sel < top_k || n_sel > E || (uint32)scaleLen != E ||
+                      (uint64_t)selLen != (uint64_t)M * n_sel ||
+                      (uint64_t)weightLen != (uint64_t)M * top_k)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  const float *rows = x;
+  if (gammaLen) {
+    rows = norm_rows_in(s, x, M, K, gamma, eps);
+    if (!rows) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = hexkl_mm_u8i8_layer_run(
+    &s->weights_u8i8, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    &w_handle, 1u, rows, logits, &(const hexkl_mm_opts){.pool = s->quant_pool});
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (top_k != 0u &&
+      hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
+                               s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_mm_u8i4_moe_layer_norm(
   remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
   uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
@@ -1530,6 +1707,54 @@ int nntr_hvx_mm_u8i4_moe_layer_norm(
                          s->quant_pool);
   }
   return rc;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm_add(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, float scale2, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const float *gamma2,
+  int gamma2Len, const uint32 *h_gate_up, int h_gate_upLen,
+  const uint32 *h_down, int h_downLen, const uint32 *row_index,
+  int row_indexLen, const uint32 *row_count, int row_countLen,
+  const float *row_weight, int row_weightLen, const float *act_f32,
+  int act_f32Len, const float *x2, int x2Len, float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const uint64_t n = (uint64_t)M * N_out;
+  /* The residual is the call's own input rows, so K == N_out. */
+  if (M == 0u || K != N_out || N_out % 32u != 0u || n > 0x7FFFFFFFu ||
+      (uint64_t)act_f32Len != n || (uint64_t)x2Len != n ||
+      (uint64_t)out_f32Len != n ||
+      (gamma2Len != 0 && (uint32_t)gamma2Len != N_out)) {
+    FARF(ERROR, "mm_u8i4_moe_layer_norm_add: bad shape (M=%u K=%u N=%u)",
+         (unsigned)M, (unsigned)K, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if (s->moe_res_n < n) {
+    free(s->moe_res);
+    s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+    if (!s->moe_res) {
+      FARF(ERROR, "moe_layer_norm_add: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = nntr_hvx_mm_u8i4_moe_layer_norm(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, s->moe_res, (int)n);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (hvx_rmsnorm_add_res_f32(out_f32, act_f32, s->moe_res, x2, M, N_out,
+                              gamma2Len ? gamma2 : NULL, eps, scale2,
+                              s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_timed(

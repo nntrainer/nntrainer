@@ -252,6 +252,49 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
                          hvx_worker_pool *p) {
   return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
 }
+/* [#260 r3] #4415's one-pass quant: per row the (optional) RMS norm,
+   its parameters and its pack, the same formulas as the two calls above;
+   pad rows get scale 1, zero point 0 and zero bytes, as the kernel's. */
+int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
+                                uint32_t m_pad, uint32_t k,
+                                const float *pre_gamma, float pre_eps,
+                                float *pre_scratch, float *scale, int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool) {
+  for (uint32_t m = m_valid; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / 64u) * 64u;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  for (uint32_t m = 0; m < m_valid; ++m) {
+    const float *row = x + (size_t)m * k;
+    if (pre_scratch) {
+      /* hvx_rmsnorm_row_f32's formula, scalar (lane order aside) */
+      float ss = 0.f;
+      for (uint32_t j = 0; j < k; ++j)
+        ss += row[j] * row[j];
+      const float rs = 1.0f / sqrtf(ss / (float)k + pre_eps);
+      for (uint32_t j = 0; j < k; ++j)
+        pre_scratch[j] = pre_gamma ? (row[j] * rs) * pre_gamma[j] : row[j] * rs;
+      row = pre_scratch;
+    }
+    hvx_quant_rows_u8_params(row, 1u, 1u, k, scale + m, zp + m, pool);
+    const uint32_t kt_n = k / 32u;
+    for (uint32_t kt = 0; kt < kt_n; ++kt)
+      for (uint32_t j = 0; j < 32; ++j) {
+        long q = lrintf(row[kt * 32 + j] / scale[m]) + zp[m];
+        if (q < 0)
+          q = 0;
+        if (q > 255)
+          q = 255;
+        out_ah[(size_t)(m / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
+               (size_t)(m % 64u) * 32u + j] = (uint8_t)q;
+      }
+  }
+  return 0;
+}
 
 /* The tile dequant without the buffer hook: the pooled workers below call
    it on their own stack tiles, which lanes run one after another on the
@@ -281,6 +324,19 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
   for (uint32_t r = 0; r < m; ++r)
     buf(out + (size_t)r * ostride, sizeof(float) * 32u, 1);
   dq_tile(tile, stride, m, as, az, cs, ws, bias, out, ostride, accumulate);
+}
+void hvx_dequant_acc_tile_scatter_f32(
+  const int32_t *tile, uint32_t stride, uint32_t m, const float *as,
+  const int32_t *az, const int32_t *cs, const float *ws, const float *bias,
+  float *out, uint32_t ostride, const uint32_t *rows, const float *weights) {
+  for (uint32_t r = 0; r < m; ++r)
+    for (uint32_t c = 0; c < 32; ++c) {
+      float v = ((float)(tile[(size_t)r * stride + c] - az[r] * cs[c])) *
+                  as[r] * ws[c] +
+                bias[c];
+      volatile float p = v * weights[r]; /* two operations, as the HVX */
+      out[(size_t)rows[r] * ostride + c] += p;
+    }
 }
 /* The DDR fallback's whole-matrix dequant (accumulator layout unusable):
    the same formula per element, row stride n. */

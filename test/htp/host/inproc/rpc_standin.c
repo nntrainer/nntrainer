@@ -265,3 +265,18 @@ EXPORT void HAP_debug_runtime(int level, const char *file, int line,
   fputc('\n', stderr);
   va_end(ap);
 }
+
+/* [#260 r3] #4415's router on u8 x i8 HMX (opt-in) registers its weight
+   through nntr_hvx_mm_u8i8.c, which this build leaves out (its kernels
+   need intrinsics hvx_emu lacks). Refused here, as a skel without it
+   would: the backend keeps the f32 router. */
+#include "nntr_hvx.h"
+EXPORT AEEResult nntr_hvx_weight_register_u8i8(
+  remote_handle64 _h, uint32 K, uint32 N, const int8 *w_i8_rm, int w_i8_rmLen,
+  const float *w_scale, int w_scaleLen, const int32 *colsum_w, int colsum_wLen,
+  const float *bias, int biasLen, uint32 *w_handle) {
+  (void)_h, (void)K, (void)N, (void)w_i8_rm, (void)w_i8_rmLen, (void)w_scale,
+    (void)w_scaleLen, (void)colsum_w, (void)colsum_wLen, (void)bias,
+    (void)biasLen, (void)w_handle;
+  return AEE_EUNSUPPORTED;
+}

@@ -415,9 +415,15 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     att_out = createSharedAttention(layer_id, shared_kv_layer_id, INIT_SEQ_LEN,
                                     NUM_HEADS, HEAD_DIM, normed);
   } else {
+    fold_o_proj_ = !is_kv_shared_layer;
     att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
                               normed, normed, normed);
   }
+  // With the o-proj folded the add also holds its weight (first, as the
+  // file has it) and takes the attention core's output: one call that
+  // projects, norms, adds (doc 57 section 9.32).
+  const bool o_folded = fold_o_proj_;
+  fold_o_proj_ = false;
 
   // input + post_attention_norm(att_out): the norm's gamma lives on the
   // add, so the two are one accelerator call (doc 57 section 5 step 4).
@@ -428,6 +434,10 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
+  if (o_folded) {
+    post_attn_props.push_back(withKey("proj", "true"));
+    post_attn_props.push_back(withKey("weight_dtype", FC_LAYER_DTYPE));
+  }
   appendSkipPrefillIfNeeded(post_attn_props, is_kv_shared_layer);
   LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
   Tensor post_attention = post_attention_add({input, att_out});
@@ -449,6 +459,13 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // accelerator call. With a per-layer input the scalar comes after that
   // path instead and stays its own layer.
   const bool fold_scalar = HIDDEN_SIZE_PER_LAYER_INPUT == 0;
+  // With the MoE block and the scalar folded, the MoE layer takes the whole
+  // epilogue (out_add): its input is the residual, so the DSP call that
+  // runs the experts adds the dense branch, norms, adds and scales, and the
+  // residual_add below is not built (one FastRPC call and three activation
+  // copies a layer, doc 57 section 9.30). Same weights in the same order.
+  if (ENABLE_MOE_BLOCK && fold_scalar && !is_kv_shared_layer)
+    return createMoe(layer_id, post_attention, &ffn_out);
   std::vector<Tensor> ffn_terms = {post_attention, ffn_out};
   if (ENABLE_MOE_BLOCK) {
     // Gemma4TextDecoderLayer: norm_1(mlp) + norm_2(experts(norm(residual)))
@@ -552,7 +569,8 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   return layer_scalar(decoder_output);
 }
 
-Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
+Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
+                                    const Tensor *dense_out) {
   const std::string engine =
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
                                                                : "cpu";
@@ -566,6 +584,7 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
     withKey("in_norm", "true"),
     withKey("router_norm", "true"),
     withKey("out_norm", "true"),
+    withKey("out_add", dense_out ? "true" : "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("weight_dtype", MOE_LAYER_DTYPE),
     withKey("engine", engine)};
@@ -573,6 +592,8 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input) {
     props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
   appendSkipPrefillIfNeeded(props, isKVSharedLayer(layer_id));
   LayerHandle moe(createLayer("lfm2_moe", props));
+  if (dense_out)
+    return moe({input, *dense_out});
   return moe(input);
 }
 
@@ -796,6 +817,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
+  if (fold_o_proj_)
+    return a;
   LayerHandle wo(createLayer("fully_connected", o_params));
 
   return wo(a);

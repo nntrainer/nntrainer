@@ -81,9 +81,11 @@ private:
   void run(nntrainer::RunLayerContext &context, unsigned int from,
            unsigned int to);
 
-  std::tuple<props::InNorm, props::UseWeight, nntrainer::props::Epsilon,
-             nntrainer::props::SkipPrefill>
+  std::tuple<props::InNorm, props::UseWeight, props::Proj,
+             nntrainer::props::Epsilon, nntrainer::props::SkipPrefill>
     props_;
+  unsigned int proj_idx = 0; /**< proj: the projection's weight */
+  bool proj = false;
   unsigned int gamma_idx = 0;
   unsigned int scale_idx = 0;
   unsigned int sum_idx = 0; /**< the CPU path's summed, normed addend */

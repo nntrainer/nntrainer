@@ -62,6 +62,26 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
                          uint8_t *out_ah, hvx_worker_pool *pool);
 
 /**
+ * @brief hvx_quant_rows_u8_params then hvx_quant_pack_u8_ah, row group by
+ *        row group: each four rows' parameters and then their pack while
+ *        they are still cached, the workers split by row groups, so the f32
+ *        rows are read from DDR once instead of twice (the k-tile split of
+ *        hvx_quant_pack_u8_ah also strides every row per worker). The same
+ *        per-row and per-group arithmetic, so the same bytes and parameters.
+ *
+ * @param pre_scratch  non-NULL: quantize hvx_rmsnorm_row_f32(row, pre_gamma,
+ *                     pre_eps) of every row instead of the row, normed into
+ *                     4 x k floats of this per worker (the pool's worker
+ *                     count + 1 slices; min(m_valid, that x 4) rows of k is
+ *                     always enough) so the normed rows stay in cache.
+ */
+int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
+                                uint32_t m_pad, uint32_t k,
+                                const float *pre_gamma, float pre_eps,
+                                float *pre_scratch, float *scale, int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool);
+
+/**
  * @brief Same pack, but destination row d takes its input from source row
  *        @a row_map[d].
  *

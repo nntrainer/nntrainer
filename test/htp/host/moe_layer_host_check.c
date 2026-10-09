@@ -1446,11 +1446,10 @@ int main(void) {
 
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, sizeof vtcm, &L);
-  printf(
-    "layout rc=%d total=%u (act %u gu %u dn %u gate %u mid %u stage %u res "
-    "%u)\n",
-    rc, L.total, L.act_off, L.w_gu_off, L.w_dn_off, L.gate_off, L.mid_off,
-    L.result_off, L.res_f32_off);
+  printf("layout rc=%d total=%u (act %u gu %u dn %u gate %u mid %u stage %u "
+         "dn stage %u x%u)\n",
+         rc, L.total, L.act_off, L.w_gu_off, L.w_dn_off, L.gate_off, L.mid_off,
+         L.result_off, L.dn_stage_off, L.dn_ring);
   if (rc)
     return 1;
 
