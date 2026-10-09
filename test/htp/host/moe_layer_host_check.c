@@ -1562,8 +1562,10 @@ int main(void) {
   /* [#158] The M > 1 HMX path under the bypass bit: the same bytes, and
      src_bypass on exactly the arena-backed weight chunks -- not on the
      activation blocks, not on the staging copies, and not on a heap slot
-     (expert 1's gate_up here, which the DSP would have memcpy'd). The two
-     runs above sent no bypass bit, so nothing may have been bypassed yet. */
+     the DSP memcpy'd and did not flush (expert 1's gate_up here, clean 0);
+     [#267 L1] a flushed heap image (clean 1) takes it like an arena slot.
+     The two runs above sent no bypass bit, so nothing may have been
+     bypassed yet. */
   {
     const uint64_t before = g_bypass_bytes;
     float *got_bp = (float *)malloc(sizeof(float) * M * N_out);
@@ -1579,17 +1581,36 @@ int main(void) {
       &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
       ridx, rc_, rw, act, got_bp, NULL, &scratch,
       HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_DMA_BYPASS);
+    /* [#267 L1] the same slot flushed: bypassed again, same bytes */
+    const uint64_t after_dirty = g_bypass_bytes;
+    const uint64_t one_gu = (uint64_t)(K / 32u) * ((2u * inter) / 32u) * 512u;
+    g_tbl.slots[hg[1]].clean = 1;
+    float *got_cl = (float *)malloc(sizeof(float) * M * N_out);
+    const int r_cl = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_cl, NULL, &scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_DMA_BYPASS);
+    const int clean_ok = r_cl == 0 &&
+                         g_bypass_bytes - after_dirty == want + one_gu &&
+                         memcmp(got, got_cl, sizeof(float) * M * N_out) == 0;
+    printf("M=37 clean heap   : rc=%d bypassed %llu B (want %llu) %s\n", r_cl,
+           (unsigned long long)(g_bypass_bytes - after_dirty),
+           (unsigned long long)(want + one_gu),
+           clean_ok ? "bit-identical" : "WRONG");
+    fail |= !clean_ok;
+    free(got_cl);
+    g_tbl.slots[hg[1]].clean = 0;
     g_tbl.slots[hg[1]].borrowed = 1;
     const int same = memcmp(got, got_bp, sizeof(float) * M * N_out);
     printf("M=37 dma bypass   : rc=%d bypassed %llu B (want %llu, before %llu, "
            "heap copies %llu) memcmp=%d\n",
-           r, (unsigned long long)g_bypass_bytes, (unsigned long long)want,
+           r, (unsigned long long)after_dirty, (unsigned long long)want,
            (unsigned long long)before, (unsigned long long)g_bypass_bad,
            same != 0);
-    const int ok = r == 0 && before == 0u && g_bypass_bytes == want &&
+    const int ok = r == 0 && before == 0u && after_dirty == want &&
                    g_bypass_bad == 0u && same == 0;
-    printf(ok ? "MOE HMX DMA BYPASS OK (weights only, arena slots only, "
-                "bit-identical)\n"
+    printf(ok ? "MOE HMX DMA BYPASS OK (weights only, arena slots and "
+                "flushed heap images only, bit-identical)\n"
               : "MOE HMX DMA BYPASS WRONG\n");
     fail |= !ok;
     free(got_bp);

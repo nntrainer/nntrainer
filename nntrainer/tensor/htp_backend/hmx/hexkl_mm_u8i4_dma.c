@@ -145,6 +145,22 @@ static void hexkl_weight_u8i4_tail_from_arena(hexkl_weight_u8i4 *h,
   memset(h->bias, 0, n4);
 }
 
+/** @brief [#267 L1] Writes [p, p + n) back to DDR (L1 and L2), keeping
+ *  the lines: a heap image's one write, made visible to a DMA that reads
+ *  around the L2 (hexkl_mm_u8i4_moe.h, HEXKL_MOE_FLAG_DMA_BYPASS).
+ *  @return 1 if the lines were written back */
+static int hexkl_weight_u8i4_flush(const void *p, size_t n) {
+#if defined(__hexagon__)
+  return qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)n,
+                              QURT_MEM_CACHE_FLUSH,
+                              QURT_MEM_DCACHE) == QURT_EOK;
+#else
+  (void)p; /* the host stand-in's transfers are memcpys: no cache */
+  (void)n;
+  return 1;
+#endif
+}
+
 /**
  * @brief Allocates a slot's arrays and copies the caller's bytes in.
  *
@@ -159,19 +175,6 @@ static void hexkl_weight_u8i4_tail_from_arena(hexkl_weight_u8i4 *h,
    them. A NULL w_scale with borrow set takes the scales and column sums
    from the arena too (hexkl_weight_u8i4_tail_from_arena). Everything else
    about the slot is the same either way. */
-/** @brief [#267 L1] Writes [p, p + n) back to DDR (L1 and L2), keeping
- *  the lines: a heap image's one write, made visible to a DMA that reads
- *  around the L2 (hexkl_mm_u8i4_moe.h, HEXKL_MOE_FLAG_DMA_BYPASS). */
-static void hexkl_weight_u8i4_flush(const void *p, size_t n) {
-#if defined(__hexagon__)
-  qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)n, QURT_MEM_CACHE_FLUSH,
-                       QURT_MEM_DCACHE);
-#else
-  (void)p; /* the host stand-in's transfers are memcpys: no cache */
-  (void)n;
-#endif
-}
-
 static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
                                        uint32_t slot, uint32_t K, uint32_t N,
                                        uint32_t wh_bytes, const uint8_t *wh_src,
@@ -211,10 +214,10 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   if (!borrow) {
     /* [#267 L1] Nothing on the DSP writes the image again (prefill and
        decode only read it, release frees it), so one flush here lets every
-       reader's DMA take src_bypass as for an arena slot. */
-    hexkl_weight_u8i4_flush(h->wh_bytes, wh_bytes);
-    hexkl_weight_u8i4_flush(h->arrays, 3u * n4 + 128u);
-    h->clean = 1;
+       reader's DMA take src_bypass as for an arena slot. Only wh_bytes:
+       the arrays are read by the core, never by a bypassing DMA. A failed
+       flush leaves the slot on the L2 path. */
+    h->clean = hexkl_weight_u8i4_flush(h->wh_bytes, wh_bytes);
   }
   /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
      sets 2 after this returns). */
