@@ -356,6 +356,16 @@ static inline HVX_Vector Q6_Vh_vsplat_R(int32_t x) {
     }                                                                          \
     return r;                                                                  \
   }
+/* [#282 D] int16 -> hf, numeric (each lane exact for |h| <= 2048; the
+   int8 attn_m1 cache's values are within [-127, 127]). */
+static inline HVX_Vector Q6_Vhf_equals_Vh(HVX_Vector a) {
+  HVX_Vector r;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    hvx_emu_set_h(&r, i, hvx_emu_f2h((float)(int16_t)hvx_emu_h(&a, i)));
+  }
+  return r;
+}
+
 HVX_EMU_HF_BINOP(Q6_Vhf_vadd_VhfVhf, +)
 HVX_EMU_HF_BINOP(Q6_Vhf_vsub_VhfVhf, -)
 HVX_EMU_HF_BINOP(Q6_Vhf_vmpy_VhfVhf, *)
@@ -662,6 +672,19 @@ static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
   for (int i = 0; i < HVX_EMU_LANES; ++i) {
     r.lo.w[i] = h[i];
     r.hi.w[i] = h[HVX_EMU_LANES + i];
+  }
+  return r;
+}
+
+/* [#282 D] Vdd.h = vunpack(Vu.b): sign-extended, in order -- lo gets bytes
+   0..63, hi 64..127, as Q6_Ww_vunpack_Vh above. */
+static inline HVX_VectorPair Q6_Wh_vunpack_Vb(HVX_Vector a) {
+  HVX_VectorPair r;
+  int8_t b[4 * HVX_EMU_LANES];
+  memcpy(b, a.w, sizeof(b));
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    hvx_emu_set_h(&r.lo, i, (uint16_t)(int16_t)b[i]);
+    hvx_emu_set_h(&r.hi, i, (uint16_t)(int16_t)b[2 * HVX_EMU_LANES + i]);
   }
   return r;
 }
