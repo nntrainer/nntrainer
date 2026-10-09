@@ -54,8 +54,17 @@
  *        require of every tile in a region.
  */
 static inline int hexkl_hmx_mm_aligned(const void *act, const void *wt) {
+#if defined(__hexagon__)
   return (((uintptr_t)act & (HEXKL_HMX_ACTIVATION_ALIGNMENT - 1u)) == 0u) &&
          (((uintptr_t)wt & (HEXKL_HMX_WEIGHTS_ALIGNMENT - 1u)) == 0u);
+#else
+  /* [#260 r3] Host builds (the in-process E2E, the host checks): the
+     inline multiplies below are no-ops there, so the kernels must keep the
+     library call, which the HMX stand-in implements. */
+  (void)act;
+  (void)wt;
+  return 0;
+#endif
 }
 
 #if defined(__hexagon__)
