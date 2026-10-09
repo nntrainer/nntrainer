@@ -125,8 +125,18 @@ typedef struct {
   uint8_t *mbox;
   uint32_t tok, k, spin_us;
   hexkl_token_stats *st;
-  uint32_t hk; /**< [#282 B] hints posted this token */
+  uint32_t hk;     /**< [#282 B] hints posted this token */
+  uint64_t t_post; /**< [#282 C] the last post's QTimer count */
 } tk_miss;
+
+/** @brief [#282 C] The QTimer count (19.2 MHz; the ARM's cntvct_el0). */
+static uint64_t tk_qt(void) {
+#if defined(__hexagon__)
+  return HAP_perf_get_qtimer_count();
+#else
+  return tk_now_us() * 192u / 10u;
+#endif
+}
 
 /** @brief [#282 B] graph_predict's guess to the page's hint slot: body,
  *  then seq. Never waits; a full token's worth is 30 of 255. */
@@ -163,6 +173,9 @@ static int tk_miss_post(void *ctx, uint32_t op, const uint32_t *routed,
   q->n_miss = n_miss;
   memcpy(q->routed, routed, n_routed * sizeof(uint32_t));
   memcpy(q->miss, miss, n_miss * sizeof(uint32_t));
+  m->t_post = tk_qt();
+  q->t_post[0] = (uint32_t)m->t_post;
+  q->t_post[1] = (uint32_t)(m->t_post >> 32);
   q->seq2 = seq;
   tk_clean(q, sizeof(*q));
   *(volatile uint32_t *)&q->seq = seq;
@@ -178,8 +191,11 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   const htp_graph_op *o = &g->ops[op];
   const uint64_t t0 = tk_now_us();
   const uint64_t pc0 = tk_pcyc();
+  const uint64_t q0 = tk_qt(); /* [#282 C] */
+  uint64_t q_seen;
   uint32_t i;
   int rc = AEE_SUCCESS;
+  m->st->miss_overlap_us += (q0 - m->t_post) * 10u / 192u;
   for (;;) {
     uint64_t dt;
     tk_refresh((void *)word, 4u);
@@ -201,7 +217,14 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   }
   m->st->miss_us += (uint32_t)(tk_now_us() - t0);
   m->st->miss_pcyc += tk_pcyc() - pc0;
+  q_seen = tk_qt();
   tk_refresh(a, sizeof(*a));
+  {
+    const uint64_t ta = (uint64_t)a->t_ans[0] | ((uint64_t)a->t_ans[1] << 32);
+    if (ta != 0u && ta <= q_seen) {
+      m->st->miss_anslat_us += (q_seen - ta) * 10u / 192u;
+    }
+  }
   if (a->seq2 != seq || a->n_evict > HEXKL_GRAPH_MISS_MAX ||
       a->n_load > HEXKL_GRAPH_MISS_MAX) {
     ++m->st->stale;
@@ -231,6 +254,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
     l->h_dn = hd;
     m->st->misses += rc == AEE_SUCCESS;
   }
+  m->st->miss_rebind_us += (tk_qt() - q_seen) * 10u / 192u; /* [#282 C] */
   tk_clean(a, sizeof(*a));
   return rc;
 }
@@ -240,7 +264,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
                      uint32_t act_len, float *logits, uint32_t logits_len,
                      uint32_t spin_us, hexkl_token_stats *st, uint32_t *id) {
   /* [plan 201 S1] the MOE ops' miss rounds go through the page */
-  tk_miss miss = {env, mbox, tok, 0u, spin_us, st, 0u};
+  tk_miss miss = {env, mbox, tok, 0u, spin_us, st, 0u, 0u};
   hexkl_graph_env menv = *env;
   const htp_graph_op *last;
   uint32_t resume;

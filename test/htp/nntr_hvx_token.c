@@ -156,6 +156,10 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   r->misses = t->st.misses - before.misses;
   r->miss_us = t->st.miss_us - before.miss_us;
   r->miss_pcyc = (uint32_t)(t->st.miss_pcyc - before.miss_pcyc);
+  r->miss_overlap_us =
+    (uint32_t)(t->st.miss_overlap_us - before.miss_overlap_us);
+  r->miss_anslat_us = (uint32_t)(t->st.miss_anslat_us - before.miss_anslat_us);
+  r->miss_rebind_us = (uint32_t)(t->st.miss_rebind_us - before.miss_rebind_us);
   r->moe_calls = s->graph->moe_calls;
   r->moe_calls_1x = s->graph->moe_calls_1x;
   /* [plan 201 S1] the routed sets, for the pool */

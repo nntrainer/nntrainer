@@ -83,6 +83,8 @@ typedef struct {
    *  MOE's hold its miss waits */
   uint64_t kind_qt[HTP_OP_KIND_N];
   uint64_t miss_pcyc; /**< [#267 L0] the pcycles over those waits */
+  /** [#282 C] htp_dspq_token_resp's miss_overlap / anslat / rebind */
+  uint64_t miss_overlap_us, miss_anslat_us, miss_rebind_us;
 } hexkl_token_stats;
 
 /** @brief The sequence value of round @a round of token @a tok. */

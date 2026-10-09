@@ -119,6 +119,11 @@ typedef struct htp_dspq_token_resp_s {
   /** [#267 L3] MOE kernel calls this token, and the calls the miss path's
    *  one-expert-at-a-time form would have made (hexkl_graph moe_calls*) */
   uint32_t moe_calls, moe_calls_1x;
+  /** [#282 C] the miss rounds' DSP-side parts, us summed over the token:
+   *  post -> wait start (the present experts computed meanwhile), the
+   *  owner's answer written -> S1 saw it (QTimer on both sides), and the
+   *  answer seen -> the rebinds done */
+  uint32_t miss_overlap_us, miss_anslat_us, miss_rebind_us;
 } htp_dspq_token_resp;
 
 /** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):
@@ -143,6 +148,9 @@ typedef struct {
   uint32_t n_routed, n_miss;
   uint32_t routed[HTP_MBOX_MISS_MAX]; /**< ascending: never evicted */
   uint32_t miss[HTP_MBOX_MISS_MAX];
+  /** [#282 C] the post's QTimer count (lo, hi): the owner's notice
+   *  latency is its own counter (cntvct_el0, the same clock) minus this */
+  uint32_t t_post[2];
   uint32_t seq2;
 } htp_miss_req;
 
@@ -167,6 +175,7 @@ typedef struct {
   uint32_t n_evict, n_load;
   uint32_t evict[HTP_MBOX_MISS_MAX][2];
   htp_miss_load load[HTP_MBOX_MISS_MAX];
+  uint32_t t_ans[2]; /**< [#282 C] the owner's counter as it wrote seq */
   uint32_t seq2;
 } htp_miss_ans;
 
