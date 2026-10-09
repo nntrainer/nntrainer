@@ -7,6 +7,7 @@
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_mm_u8i8_dma.h"
 #include "hexkl_probe.h"
 #include "hvx_conv_gate_f32.h"
 #include "hvx_gather_ah_u8.h"
@@ -378,4 +379,93 @@ int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
     }
   }
   return 0;
+}
+
+/* [#260 r3] #4415 @ 2db6cad59's skel entries (row-strided norm / RoPE,
+   the post-attention and post-FFN epilogues, the u8 x i8 router layer):
+   plain f32 for the checks that link the skel; their HVX arithmetic is
+   the rows host checks'. */
+int hvx_rmsnorm_rows_ld_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                            uint32_t ld, uint32_t chunk, const float *gamma,
+                            float eps, hvx_worker_pool *pool) {
+  if (ld < n)
+    return -1;
+  for (uint32_t r = 0; r < M; ++r)
+    if (hvx_rmsnorm_rows_f32(x + (size_t)r * ld, y + (size_t)r * ld, 1u, n,
+                             chunk, gamma, eps, pool) != 0)
+      return -1;
+  return 0;
+}
+
+int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                         uint32_t hd, const float *cs, hvx_worker_pool *pool) {
+  if (ld < n)
+    return -1;
+  for (uint32_t r = 0; r < M; ++r)
+    if (hvx_rope_rows_f32(x + (size_t)r * ld, 1u, n, hd,
+                          cs + (size_t)r * 2u * hd, pool) != 0)
+      return -1;
+  return 0;
+}
+
+/* out = scale * (res + rmsnorm(x [+ x2]) * gamma), one row at a time */
+static void norm_add_row(float *out, const float *res, const float *x,
+                         const float *x2, uint32_t n, const float *gamma,
+                         float eps, float scale) {
+  float ss = 0.0f;
+  for (uint32_t j = 0; j < n; ++j) {
+    const float v = x2 ? x[j] + x2[j] : x[j];
+    ss += v * v;
+  }
+  const float rs = 1.0f / sqrtf(ss / (float)n + eps);
+  for (uint32_t j = 0; j < n; ++j) {
+    const float v = x2 ? x[j] + x2[j] : x[j];
+    out[j] = scale * (res[j] + v * rs * (gamma ? gamma[j] : 1.0f));
+  }
+}
+
+int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
+                            const float *x2, uint32_t M, uint32_t n,
+                            const float *gamma, float eps, float scale,
+                            hvx_worker_pool *pool) {
+  (void)pool;
+  if (!out || !x || M == 0u || n % 32u != 0u)
+    return -1;
+  for (uint32_t r = 0; r < M; ++r)
+    norm_add_row(out + (size_t)r * n, (res ? res : out) + (size_t)r * n,
+                 x + (size_t)r * n, x2 ? x2 + (size_t)r * n : NULL, n, gamma,
+                 eps, scale);
+  return 0;
+}
+
+int hvx_rmsnorm_add_blocks_f32(float *out, const float *res,
+                               const float *const *xb, const uint32_t *cols,
+                               uint32_t n_blk, uint32_t M, const float *gamma,
+                               float eps, float scale, hvx_worker_pool *pool) {
+  (void)pool;
+  uint32_t n = 0;
+  for (uint32_t b = 0; b < n_blk; ++b)
+    n += cols[b];
+  float *row = (float *)malloc(sizeof(float) * n);
+  if (!row)
+    return -1;
+  for (uint32_t r = 0; r < M; ++r) {
+    for (uint32_t b = 0, c0 = 0; b < n_blk; c0 += cols[b++])
+      memcpy(row + c0, xb[b] + (size_t)r * cols[b], sizeof(float) * cols[b]);
+    norm_add_row(out + (size_t)r * n, (res ? res : out) + (size_t)r * n, row,
+                 NULL, n, gamma, eps, scale);
+  }
+  free(row);
+  return 0;
+}
+
+int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
+                            uint32_t vtcm_size, uint32_t config_off, uint32_t M,
+                            uint32_t K, const uint32_t *handles,
+                            uint32_t n_handles, const float *act_f32,
+                            float *out_cat, const hexkl_mm_opts *opts) {
+  (void)tbl, (void)vtcm_base, (void)vtcm_size, (void)config_off, (void)M,
+    (void)K, (void)handles, (void)n_handles, (void)act_f32, (void)out_cat,
+    (void)opts;
+  return AEE_EUNSUPPORTED;
 }
