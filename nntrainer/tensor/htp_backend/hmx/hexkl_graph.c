@@ -91,6 +91,7 @@ typedef struct {
   const hexkl_graph_env *env;
   hexkl_graph_routing routing; /**< n_experts 0 once consumed */
   uint32_t pos;                /**< the token position (ROPE, ATTN_M1) */
+  uint32_t end_op;             /**< [#289] this forward runs ops < end_op */
 } graph_call;
 
 typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
@@ -158,6 +159,8 @@ static int graph_moe_rows(hexkl_graph *g, const hexkl_graph_env *env,
  * a row each, the same bits), so a miss layer makes at most three calls,
  * not one per later expert: the weight feed overlaps across each set.
  */
+static int graph_dense_early(hexkl_graph *g, uint32_t op_i, graph_call *call);
+
 static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
                           graph_call *call, const uint32_t *h,
                           const uint32_t *ids, const float *w, uint32_t n,
@@ -206,6 +209,10 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   }
   if (rc == AEE_SUCCESS) {
     rc = graph_moe_rows(g, env, op, h, p_ids, p_w, n_p, in, p_rows);
+  }
+  /* [#289] the dense branch while the ARM reads */
+  if (rc == AEE_SUCCESS && g->dense_early != 0u) {
+    rc = graph_dense_early(g, op_i, call);
   }
   /* the wait comes even after a failure: the answer must not land on a
      later round's page */
@@ -714,6 +721,40 @@ static const graph_kernel kernels[HTP_OP_KIND_N] = {
   graph_op_lm_head,     /* LM_HEAD      #132 Part B */
 };
 
+/* [#289] Gemma's dense branch after MOE op op_i -- RMSNORM (the MoE
+   output's, in place), then RMSNORM from a slot the MoE does not write,
+   DENSE_FFN and RMSNORM in place -- run now into g->early: the same
+   kernels on the same input (the residual), so the same bits. A list of
+   another shape, or one this forward stops inside, is left as it is. */
+static int graph_dense_early(hexkl_graph *g, uint32_t op_i, graph_call *call) {
+  const htp_graph_op *m = &g->ops[op_i], *o = m + 1;
+  uint32_t j, s;
+  int rc;
+  if (g->early == NULL || op_i + 4u >= call->end_op || !o[0].resident ||
+      !o[1].resident || !o[2].resident || !o[3].resident ||
+      o[0].kind != HTP_OP_RMSNORM || o[0].in_slot != m->out_slot ||
+      o[0].out_slot != m->out_slot || o[1].kind != HTP_OP_RMSNORM ||
+      o[1].in_slot == m->out_slot || o[2].kind != HTP_OP_DENSE_FFN ||
+      o[2].in_slot != o[1].out_slot || o[2].out_slot != o[1].out_slot ||
+      o[3].kind != HTP_OP_RMSNORM || o[3].in_slot != o[1].out_slot ||
+      o[3].out_slot != o[1].out_slot ||
+      htp_graph_op_out_words(&o[3]) > g->slot_words) {
+    return AEE_SUCCESS;
+  }
+  s = o[1].in_slot;
+  for (j = 1u; j <= 3u; ++j) {
+    rc = kernels[o[j].kind](
+      g, &o[j], call, j == 1u ? g->slots + (size_t)s * g->slot_words : g->early,
+      g->early);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  g->early_from = op_i + 2u;
+  g->early_to = op_i + 4u;
+  return AEE_SUCCESS;
+}
+
 uint32_t hexkl_graph_resident_kinds(void) {
   uint32_t mask = 0, k;
   for (k = 0; k < HTP_OP_KIND_N; ++k) {
@@ -943,6 +984,7 @@ void hexkl_graph_free(hexkl_graph *g) {
   }
   free(g->rope_cs);
   free(g->moe_rows);
+  free(g->early);
   free(g->slots);
   free(g->act_buf);
   free(g->q4m1);
@@ -1068,6 +1110,28 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
       return AEE_EINVALIDFORMAT;
     }
     g->predict = v;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_DENSE_EARLY) {
+    uint32_t v;
+    if (op != HTP_GRAPH_NO_OP) {
+      return AEE_EBADITEM;
+    }
+    if (n != 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    memcpy(&v, data, sizeof(v));
+    if (v > 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    /* one slot of heap (slot_words f32, the hidden width on Gemma) */
+    if (v != 0u && g->early == NULL && g->slot_words != 0u) {
+      g->early = (float *)malloc((size_t)g->slot_words * sizeof(float));
+      if (g->early == NULL) {
+        return AEE_ENOMEMORY;
+      }
+    }
+    g->dense_early = v;
     return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_EXPERTS) {
@@ -1273,6 +1337,9 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
   n_run = 0;
   call.env = env;
   call.pos = pos;
+  call.end_op =
+    n_ops_limit >= g->n_ops - start_op ? g->n_ops : start_op + n_ops_limit;
+  g->early_from = g->early_to = 0u;
   if (routing != NULL) {
     call.routing = *routing;
   } else {
@@ -1297,7 +1364,17 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     }
     n0 = graph_now_qt();
     t0 = HAP_perf_get_pcycles();
-    rc = k(g, op, &call, in, out);
+    if (g->early_to != 0u && i >= g->early_from) {
+      /* [#289] run in the miss round: its result, at the branch's last op */
+      if (i == g->early_to) {
+        memcpy(out, g->early,
+               (size_t)htp_graph_op_out_words(op) * sizeof(float));
+        g->early_from = g->early_to = 0u;
+      }
+      rc = AEE_SUCCESS;
+    } else {
+      rc = k(g, op, &call, in, out);
+    }
     g->op_pcycles[i] = HAP_perf_get_pcycles() - t0;
     g->op_qt[i] = (uint32_t)(graph_now_qt() - n0);
     if (rc != AEE_SUCCESS) {

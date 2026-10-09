@@ -205,6 +205,14 @@ typedef struct hexkl_graph_s {
   /** [#266 S2] HTP_GRAPH_PARAM_PREDICT: 1 = each ROUTER_TOPK op also runs
    *  the next ROUTER_TOPK op's router on its own input */
   uint32_t predict;
+  /** [#289] HTP_GRAPH_PARAM_DENSE_EARLY: 1 = a MOE op's miss round runs
+   *  the dense branch after it (RMSNORM, DENSE_FFN, RMSNORM: it reads the
+   *  residual, not the MoE output) into @a early while the ARM reads, and
+   *  the forward skips those ops, copying @a early out at the last; the
+   *  ops in [early_from, early_to] are done (early_to 0: none) */
+  uint32_t dense_early;
+  float *early; /**< slot_words, allocated when dense_early is set */
+  uint32_t early_from, early_to;
   /** [#266 S2] per ROUTER_TOPK op run with predict set, in list order: the
    *  count (0: no next router, or its weights unbound), then the guessed
    *  ids best first; cleared by the token driver like route_log */

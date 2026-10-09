@@ -196,6 +196,7 @@ enum {
   HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_EXPERTS,
   HTP_GRAPH_PARAM_PREDICT,
+  HTP_GRAPH_PARAM_DENSE_EARLY, /**< [#289] 1 = see hexkl_graph.h dense_early */
   HTP_GRAPH_PARAM_N
 };
 /** @brief LM_BAN's longest list. */
