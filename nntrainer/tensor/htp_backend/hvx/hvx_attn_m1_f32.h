@@ -31,7 +31,8 @@
  * the last min(L, window).
  *
  * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
- * The cache is n_layers * n_kv * head_dim * seq * 2 * 2 bytes: at the
+ * The cache is n_layers * n_kv * head_dim * seq * 2 * 2 bytes, allocated
+ * per layer since #282 D: at the
  * LFM2.5 shape (6 attention layers, 8 kv heads, head_dim 64) 12 MiB per 1024
  * of max_seq, so 24 MiB at nntr_config.json's max_seq_len 2048 (48 MiB
  * with the f32 cache before #170). Scratch per cache: the scores /
@@ -92,12 +93,16 @@ typedef struct {
   uint32_t n_layers;
   uint32_t n_kv;
   uint32_t gqa;
-  uint32_t head_dim;   /**< 64, or a multiple of 64 up to 512 */
-  uint32_t max_seq;    /**< a multiple of 32; the position bound */
-  uint32_t seq;        /**< max_seq rounded up to 64: the tile count * 64 */
-  uint32_t *kv_len;    /**< [n_layers] positions held, 0..max_seq */
-  uint16_t *kt;        /**< fp16 [n_layers][n_kv][seq/64][head_dim][64] */
-  uint16_t *v;         /**< fp16 [n_layers][n_kv][seq][head_dim] */
+  uint32_t head_dim; /**< 64, or a multiple of 64 up to 512 */
+  uint32_t max_seq;  /**< a multiple of 32; the position bound */
+  uint32_t seq;      /**< max_seq rounded up to 64: the tile count * 64 */
+  uint32_t *kv_len;  /**< [n_layers] positions held, 0..max_seq */
+  /** [#282 D] fp16 [n_kv][seq/64][head_dim][64] per layer: one allocation
+   *  a layer, not one for the cache, so the heap can place it in the room
+   *  smaller blocks freed (the prefill's quantized caches, at Gemma's
+   *  shape a 16 MiB block a layer) -- a single 400 MiB block cannot */
+  uint16_t **kt;
+  uint16_t **v;        /**< fp16 [n_kv][seq][head_dim] per layer, as kt */
   uint16_t *s;         /**< fp16 [n_kv * gqa][seq]: scores, then probs */
   uint16_t *et;        /**< fp16 [seq][64]: the exps, q heads in lanes */
   uint16_t *qs;        /**< fp16 [n_kv * gqa][head_dim / 64][64]: q, zipped for

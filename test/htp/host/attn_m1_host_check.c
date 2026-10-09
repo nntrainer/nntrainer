@@ -1107,9 +1107,12 @@ static void check_append_chain(uint32_t L, hvx_worker_pool *pool) {
   rc = hvx_attn_m1_forward(b, LAYER, L - 1u, 0u, SCALE, q, k + last, v + last,
                            out_b, NULL);
   CHECK(rc == AEE_SUCCESS, "bulk forward rc=%d", rc);
-  const int kt_eq =
-    memcmp(a->kt, b->kt, a->cache_halves * sizeof(uint16_t)) == 0;
-  const int v_eq = memcmp(a->v, b->v, a->cache_halves * sizeof(uint16_t)) == 0;
+  const size_t per_layer = a->cache_halves / a->n_layers * sizeof(uint16_t);
+  int kt_eq = 1, v_eq = 1;
+  for (uint32_t l = 0; l < a->n_layers; ++l) {
+    kt_eq &= memcmp(a->kt[l], b->kt[l], per_layer) == 0;
+    v_eq &= memcmp(a->v[l], b->v[l], per_layer) == 0;
+  }
   const uint32_t bad = count_bad(out_a, out_b, (size_t)N_Q * HD);
   printf("ATTN M1 append-chain L=%u vs bulk: Kt_equal=%d V_equal=%d "
          "out_bad=%u kv_len=%u/%u\n",

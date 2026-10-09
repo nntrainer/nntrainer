@@ -154,8 +154,20 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->cache_halves = (size_t)halves;
   ctx->pool = pool;
   ctx->kv_len = (uint32_t *)calloc(n_layers, sizeof(uint32_t));
-  ctx->kt = (uint16_t *)memalign(VLEN, (size_t)halves * sizeof(uint16_t));
-  ctx->v = (uint16_t *)memalign(VLEN, (size_t)halves * sizeof(uint16_t));
+  const size_t per_layer = (size_t)(halves / n_layers) * sizeof(uint16_t);
+  ctx->kt = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
+  ctx->v = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
+  for (uint32_t l = 0; ctx->kt && ctx->v && l < n_layers; ++l) {
+    ctx->kt[l] = (uint16_t *)memalign(VLEN, per_layer);
+    ctx->v[l] = (uint16_t *)memalign(VLEN, per_layer);
+    if (!ctx->kt[l] || !ctx->v[l]) {
+      rc = AEE_ENOMEMORY;
+      break;
+    }
+    /* Finite zeros wherever a tile is read past the context */
+    memset(ctx->kt[l], 0, per_layer);
+    memset(ctx->v[l], 0, per_layer);
+  }
   ctx->s = (uint16_t *)memalign(VLEN, (size_t)n_q * seq * sizeof(uint16_t));
   ctx->et = (uint16_t *)memalign(VLEN, (size_t)seq * VLEN);
   ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * (head_dim / CH) * VLEN);
@@ -163,8 +175,8 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
     (uint16_t *)memalign(VLEN, (size_t)n_kv * head_dim * sizeof(uint16_t));
   ctx->exp_tab = (uint16_t *)malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
   float *tmp = (float *)malloc(ATTN_M1_DET_EXP_N * sizeof(float));
-  if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s || !ctx->et || !ctx->qs ||
-      !ctx->kr || !ctx->exp_tab || !tmp) {
+  if (rc != AEE_SUCCESS || !ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s ||
+      !ctx->et || !ctx->qs || !ctx->kr || !ctx->exp_tab || !tmp) {
     free(tmp);
     rc = AEE_ENOMEMORY;
     hvx_attn_m1_free(ctx);
@@ -173,10 +185,7 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   }
   hvx_hf_exp16_fill(ctx->exp_tab, tmp);
   free(tmp);
-  /* Finite zeros wherever a tile or a sum row is read past the context;
-     the lanes of ET past n_q stay 0 for good. */
-  memset(ctx->kt, 0, (size_t)halves * sizeof(uint16_t));
-  memset(ctx->v, 0, (size_t)halves * sizeof(uint16_t));
+  /* The lanes of ET past n_q stay 0 for good (the cache was zeroed above). */
   memset(ctx->et, 0, (size_t)seq * VLEN);
 out:
   if (err) {
@@ -194,6 +203,14 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx->qs);
   free(ctx->et);
   free(ctx->s);
+  for (uint32_t l = 0; l < ctx->n_layers; ++l) {
+    if (ctx->kt) {
+      free(ctx->kt[l]);
+    }
+    if (ctx->v) {
+      free(ctx->v[l]);
+    }
+  }
   free(ctx->v);
   free(ctx->kt);
   free(ctx->kv_len);
@@ -203,13 +220,13 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
 static inline uint16_t *kt_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                 uint32_t h) {
-  return ctx->kt + ((size_t)layer * ctx->n_kv + h) * ctx->head_dim * ctx->seq;
+  return ctx->kt[layer] + (size_t)h * ctx->head_dim * ctx->seq;
 }
 
 /** @brief V of one (layer, kv head): [seq][head_dim] fp16. */
 static inline uint16_t *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h) {
-  return ctx->v + ((size_t)layer * ctx->n_kv + h) * ctx->seq * ctx->head_dim;
+  return ctx->v[layer] + (size_t)h * ctx->seq * ctx->head_dim;
 }
 
 /** @brief Spec steps 0-1 for one kv head of the prefill seed: k and v
