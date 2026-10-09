@@ -55,6 +55,19 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
     memcpy((uint8_t *)dst + (size_t)r * ds,
            (const uint8_t *)src + (size_t)r * ss, rs);
 }
+/* #177's lane queue, likewise complete at once (the MoE file links here;
+   moe_layer_host_check holds its schedule). */
+void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
+                           void *dst, const void *src, uint32_t ds, uint32_t ss,
+                           uint32_t rs, uint32_t nrows, int sv, int dv) {
+  (void)d;
+  (void)prev;
+  hexkl_dma_ring_push2d(dst, src, ds, ss, rs, nrows, sv, dv);
+}
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
+  (void)d;
+  return 0;
+}
 
 /* The pool runs everything on the caller, which is what its own NULL path
    does for n_units <= 1. Doing it here rather than passing NULL keeps the
@@ -81,6 +94,11 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
     func(1u, 0, ctx);
 }
 void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+/* No workers: the MoE feed's GU(0) job (#185) takes its run fallback. */
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
+  (void)pool;
+  return 0u;
+}
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot

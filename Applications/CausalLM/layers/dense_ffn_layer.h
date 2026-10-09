@@ -53,8 +53,9 @@ public:
 } // namespace props
 
 /**
- * @brief The dense gated FFN (SwiGLU, or GeGLU with activation=tanh_gelu) as ONE layer, so an accelerator can take
- *        up, gate, SwiGLU and down in one call (docs/htp_attention/51).
+ * @brief The dense gated FFN (SwiGLU, or GeGLU with activation=tanh_gelu) as
+ * ONE layer, so an accelerator can take up, gate, SwiGLU and down in one call
+ * (docs/htp_attention/51).
  *
  * Holds the same three Q4_0 weights, in the same order and shapes, as the
  * three fully_connected layers Transformer::createMlp builds otherwise

@@ -52,8 +52,8 @@ static double run(uint32_t M, uint32_t n, uint32_t chunk, int with_gamma,
   memcpy(xcopy, x, sizeof(float) * M * n);
   if (in_place)
     dst = x;
-  const int rc = hvx_rmsnorm_rows_f32(src, dst, M, n, chunk, with_gamma ? g : NULL,
-                                      eps, NULL);
+  const int rc = hvx_rmsnorm_rows_f32(src, dst, M, n, chunk,
+                                      with_gamma ? g : NULL, eps, NULL);
   if (rc != 0) {
     printf("rmsnorm rows M=%u n=%u chunk=%u: rc=%d\n", M, n, chunk, rc);
     return 1e9;
@@ -138,12 +138,12 @@ static double run_add(uint32_t M, uint32_t n, int two, int with_gamma,
 int main(void) {
   int fail = 0;
   const double tol = 2e-6; /* f32 sum of squares over 2816 terms, sqrtf */
-  fail |= run(7, 2816, 2816, 1, 0, 1e-6f) > tol;  /* the hidden norm */
-  fail |= run(5, 2816, 2816, 1, 1, 1e-6f) > tol;  /* in place */
-  fail |= run(3, 4096, 256, 1, 0, 1e-6f) > tol;   /* per head, 16 x 256 */
-  fail |= run(3, 1024, 512, 1, 1, 1e-6f) > tol;   /* per head, 2 x 512 */
-  fail |= run(4, 2048, 256, 0, 0, 1e-6f) > tol;   /* gamma-less */
-  fail |= run(1, 64, 32, 1, 0, 1e-6f) > tol;      /* one vector a chunk */
+  fail |= run(7, 2816, 2816, 1, 0, 1e-6f) > tol; /* the hidden norm */
+  fail |= run(5, 2816, 2816, 1, 1, 1e-6f) > tol; /* in place */
+  fail |= run(3, 4096, 256, 1, 0, 1e-6f) > tol;  /* per head, 16 x 256 */
+  fail |= run(3, 1024, 512, 1, 1, 1e-6f) > tol;  /* per head, 2 x 512 */
+  fail |= run(4, 2048, 256, 0, 0, 1e-6f) > tol;  /* gamma-less */
+  fail |= run(1, 64, 32, 1, 0, 1e-6f) > tol;     /* one vector a chunk */
   /* the epilogue: post norm + residual (+ second addend, scalar) */
   fail |= run_add(7, 2816, 0, 1, 1.0f) > tol;  /* post_attention_norm */
   fail |= run_add(5, 2816, 1, 1, 0.75f) > tol; /* ffn + moe, layer scalar */
