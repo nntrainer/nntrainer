@@ -111,7 +111,26 @@ typedef struct {
   uint16_t *exp_tab;   /**< fp16 [ATTN_M1_DET_EXP_N]: exp16 by index */
   size_t cache_halves; /**< fp16 values in kt, and in v */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every unit on the caller */
+  /** [#282 D] HVX_ATTN_M1_Q8 at create: kt / v hold int8 in the same
+   *  layouts (a Kt row of a tile is 64 bytes, two rows a vector; a V row
+   *  head_dim bytes), quantized with fixed scales a (layer, kv head): K and V
+   *  one scale per dim (K folded into q) (applied to the output). The
+   *  scales are set by the layer's first kv_append (its prefill seed:
+   *  amax x HVX_ATTN_M1_Q8_MARGIN / 127), later rows are clamped. Half the
+   *  cache bytes; not the fp16 spec any more -- the gate is the model's */
+  uint32_t q8;
+  float *sk;       /**< [n_layers][n_kv][head_dim]: K's outliers are per
+                        dim, so per dim (folded into q all the same) */
+  float *sk_inv;   /**< 1 / sk, for the appends */
+  float *sv;       /**< [n_layers][n_kv][head_dim] */
+  float *sv_inv;   /**< 1 / sv, for the appends */
+  uint8_t *scaled; /**< [n_layers] 1 once the layer's scales are set */
 } hvx_attn_m1_ctx;
+
+/** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
+#define HVX_ATTN_M1_Q8 0x80000000u
+/** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
+#define HVX_ATTN_M1_Q8_MARGIN 1.0f
 
 /**
  * @brief Allocates and zero-fills the cache for a fixed shape.

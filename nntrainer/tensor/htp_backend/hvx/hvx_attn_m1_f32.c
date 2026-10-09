@@ -63,6 +63,7 @@
 
 #include "hvx_attn_m1_f32.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -126,6 +127,8 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
                                     int *err) {
   int rc = AEE_SUCCESS;
   hvx_attn_m1_ctx *ctx = NULL;
+  const uint32_t q8 = (max_seq & HVX_ATTN_M1_Q8) != 0u; /* [#282 D] */
+  max_seq &= ~HVX_ATTN_M1_Q8;
   if (n_layers == 0u || n_kv == 0u || gqa == 0u || gqa > MAX_GQA ||
       n_kv * gqa > MAX_NQ || head_dim == 0u || head_dim % CH != 0u ||
       head_dim > ATTN_M1_DET_MAX_HD || max_seq == 0u || max_seq % 32u != 0u) {
@@ -154,10 +157,27 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->cache_halves = (size_t)halves;
   ctx->pool = pool;
   ctx->kv_len = (uint32_t *)calloc(n_layers, sizeof(uint32_t));
-  const size_t per_layer = (size_t)(halves / n_layers) * sizeof(uint16_t);
+  const size_t per_layer =
+    (size_t)(halves / n_layers) * (q8 ? 1u : sizeof(uint16_t));
+  ctx->q8 = q8;
+  if (q8) {
+    ctx->sk =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    ctx->sv =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    ctx->sv_inv =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    ctx->sk_inv =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    ctx->scaled = (uint8_t *)calloc(n_layers, 1);
+    if (!ctx->sk || !ctx->sv || !ctx->sv_inv || !ctx->sk_inv || !ctx->scaled) {
+      rc = AEE_ENOMEMORY;
+    }
+  }
   ctx->kt = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
   ctx->v = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
-  for (uint32_t l = 0; ctx->kt && ctx->v && l < n_layers; ++l) {
+  for (uint32_t l = 0; rc == AEE_SUCCESS && ctx->kt && ctx->v && l < n_layers;
+       ++l) {
     ctx->kt[l] = (uint16_t *)memalign(VLEN, per_layer);
     ctx->v[l] = (uint16_t *)memalign(VLEN, per_layer);
     if (!ctx->kt[l] || !ctx->v[l]) {
@@ -213,6 +233,11 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   }
   free(ctx->v);
   free(ctx->kt);
+  free(ctx->sk);
+  free(ctx->sv);
+  free(ctx->sv_inv);
+  free(ctx->sk_inv);
+  free(ctx->scaled);
   free(ctx->kv_len);
   free(ctx);
 }
@@ -227,6 +252,76 @@ static inline uint16_t *kt_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
 static inline uint16_t *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h) {
   return ctx->v[layer] + (size_t)h * ctx->seq * ctx->head_dim;
+}
+
+/** @brief [#282 D] The int8 Kt of one (layer, kv head): [tiles][hd][64]. */
+static inline int8_t *kt8_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
+                               uint32_t h) {
+  return (int8_t *)ctx->kt[layer] + (size_t)h * ctx->head_dim * ctx->seq;
+}
+
+/** @brief [#282 D] The int8 V of one (layer, kv head): [seq][hd]. */
+static inline int8_t *v8_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t h) {
+  return (int8_t *)ctx->v[layer] + (size_t)h * ctx->seq * ctx->head_dim;
+}
+
+/** @brief [#282 D] x * inv rounded half away from zero, clamped to
+ *         [-127, 127] (no libm call: the seed quantizes a prompt's rows of
+ *         every layer at the first token, and rintf was ~10 s of it). */
+static inline int8_t q8_of(float x, float inv) {
+  float r = x * inv;
+  r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+  return (int8_t)(int32_t)(r + (r >= 0.0f ? 0.5f : -0.5f));
+}
+
+/** @brief [#282 D] The layer's scales from @a n_rows rows [n][n_kv][hd]
+ *         (amax x @a margin / 127; 1 for an all-zero head or dim). */
+static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
+                          const float *k_rows, const float *v_rows,
+                          float margin) {
+  const uint32_t hd = ctx->head_dim, nkv = ctx->n_kv;
+  const size_t n = (size_t)nkv * hd;
+  float *sk = ctx->sk + (size_t)layer * n;
+  float *sv = ctx->sv + (size_t)layer * n;
+  /* amax per (kv head, dim), rows outer so every read is contiguous */
+  memset(sk, 0, n * sizeof(float));
+  memset(sv, 0, n * sizeof(float));
+  for (uint32_t r = 0; r < n_rows; ++r) {
+    const float *kr = k_rows + (size_t)r * n;
+    const float *vr = v_rows + (size_t)r * n;
+    for (size_t i = 0; i < n; ++i) {
+      const float kk = fabsf(kr[i]), vv = fabsf(vr[i]);
+      sk[i] = kk > sk[i] ? kk : sk[i];
+      sv[i] = vv > sv[i] ? vv : sv[i];
+    }
+  }
+  float *ski = ctx->sk_inv + (size_t)layer * n;
+  float *svi = ctx->sv_inv + (size_t)layer * n;
+  for (size_t i = 0; i < n; ++i) {
+    sk[i] = sk[i] > 0.0f ? sk[i] * margin / 127.0f : 1.0f;
+    sv[i] = sv[i] > 0.0f ? sv[i] * margin / 127.0f : 1.0f;
+    ski[i] = 1.0f / sk[i];
+    svi[i] = 1.0f / sv[i];
+  }
+  ctx->scaled[layer] = 1u;
+}
+
+/** @brief [#282 D] One position of one (layer, kv head) into the int8
+ *         cache: k into its tile's column, v as the position's row. */
+static inline void append_head_q8(const hvx_attn_m1_ctx *ctx, uint32_t layer,
+                                  uint32_t h, uint32_t pos, const float *k,
+                                  const float *v) {
+  const uint32_t hd = ctx->head_dim;
+  int8_t *kt =
+    kt8_head(ctx, layer, h) + (size_t)(pos / TILE) * hd * TILE + pos % TILE;
+  int8_t *vr = v8_head(ctx, layer, h) + (size_t)pos * hd;
+  const float *ski = ctx->sk_inv + ((size_t)layer * ctx->n_kv + h) * hd;
+  const float *svi = ctx->sv_inv + ((size_t)layer * ctx->n_kv + h) * hd;
+  for (uint32_t d = 0; d < hd; ++d) {
+    kt[(size_t)d * TILE] = q8_of(k[d], ski[d]);
+    vr[d] = q8_of(v[d], svi[d]);
+  }
 }
 
 /** @brief Spec steps 0-1 for one kv head of the prefill seed: k and v
@@ -260,11 +355,15 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
     return AEE_EBADSTATE;
   }
   const size_t row = (size_t)ctx->n_kv * ctx->head_dim;
+  if (ctx->q8 && n_rows != 0u && !ctx->scaled[layer]) { /* [#282 D] */
+    q8_set_scales(ctx, layer, n_rows, k_rows, v_rows, HVX_ATTN_M1_Q8_MARGIN);
+  }
   for (uint32_t r = 0; r < n_rows; ++r) {
     for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-      append_head(ctx, layer, h, kv_from + r,
-                  k_rows + r * row + (size_t)h * ctx->head_dim,
-                  v_rows + r * row + (size_t)h * ctx->head_dim);
+      (ctx->q8 ? append_head_q8
+               : append_head)(ctx, layer, h, kv_from + r,
+                              k_rows + r * row + (size_t)h * ctx->head_dim,
+                              v_rows + r * row + (size_t)h * ctx->head_dim);
     }
   }
   ctx->kv_len[layer] = kv_from + n_rows;
@@ -332,6 +431,11 @@ typedef struct {
 /** @brief The Kt tile of P1 / P2 unit u: kv head u / ntt, tile tlo + u %
  *         ntt (with no window tlo = 0 and ntt = ntl). */
 static inline HVX_Vector *unit_tile(const forward_job *job, uint32_t u) {
+  if (job->ctx->q8) { /* [#282 D] the int8 tile: half the bytes */
+    return (HVX_Vector *)(kt8_head(job->ctx, job->layer, u / job->ntt) +
+                          (size_t)(job->tlo + u % job->ntt) *
+                            job->ctx->head_dim * TILE);
+  }
   return (HVX_Vector *)(kt_head(job->ctx, job->layer, u / job->ntt) +
                         (size_t)(job->tlo + u % job->ntt) * job->ctx->head_dim *
                           TILE);
@@ -604,6 +708,155 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
   }
 }
 
+/** @brief [#282 D] p1_unit over the int8 cache: the new k column is in the
+ *         tile already (forward wrote it), q carries K's scale. Rows d,
+ *         d + 1 of a tile are one vector: unpacked to halfwords and
+ *         converted to hf, then the fp16 path's chains. */
+static void p1_unit_q8(const forward_job *job, uint32_t u) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t h = u / job->ntt, t = job->tlo + u % job->ntt;
+  const uint32_t hd = ctx->head_dim, nch = hd / CH;
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const HVX_Vector *tv =
+    (const HVX_Vector *)(kt8_head(ctx, job->layer, h) + (size_t)t * hd * TILE);
+  const HVX_Vector b2 = Q6_Vb_vsplat_R(2), b8 = Q6_Vb_vsplat_R(8);
+  for (uint32_t g = 0; g < ctx->gqa; ++g) {
+    const uint32_t hq = h * ctx->gqa + g;
+    const HVX_Vector *qrows = (const HVX_Vector *)ctx->qs + (size_t)hq * nch;
+    HVX_Vector a0, a1, a2, a3, a4, a5, a6, a7;
+    for (uint32_t half = 0; half < 2u; ++half) {
+      HVX_Vector c0 = Q6_V_vzero(), c1 = c0, c2 = c0, c3 = c0;
+      for (uint32_t c = 0; c < nch; ++c) {
+        const HVX_Vector *kp = tv + ((size_t)c * CH + 4u * half) / 2u;
+        const HVX_Vector qrow = qrows[c];
+        HVX_Vector i01 =
+          Q6_Vh_vsplat_R((int)((4u * half) | (4u * half + 1u) << 8));
+#if defined(__hexagon__)
+#pragma unroll 1
+#endif
+        for (uint32_t d = 0; d < CH; d += ATTN_M1_DET_ACC) {
+          const int rt = (int)((d + 4u * half) >> 4);
+          const HVX_VectorPair q01 = hvx_hf_splat2_lut(i01, qrow, rt);
+          const HVX_VectorPair q23 =
+            hvx_hf_splat2_lut(Q6_Vb_vadd_VbVb(i01, b2), qrow, rt);
+          const HVX_VectorPair k01 = Q6_Wh_vunpack_Vb(kp[d / 2u]);
+          const HVX_VectorPair k23 = Q6_Wh_vunpack_Vb(kp[d / 2u + 1u]);
+          c0 = hvx_hf_fma(c0, Q6_V_lo_W(q01), Q6_Vhf_equals_Vh(Q6_V_lo_W(k01)),
+                          one);
+          c1 = hvx_hf_fma(c1, Q6_V_hi_W(q01), Q6_Vhf_equals_Vh(Q6_V_hi_W(k01)),
+                          one);
+          c2 = hvx_hf_fma(c2, Q6_V_lo_W(q23), Q6_Vhf_equals_Vh(Q6_V_lo_W(k23)),
+                          one);
+          c3 = hvx_hf_fma(c3, Q6_V_hi_W(q23), Q6_Vhf_equals_Vh(Q6_V_hi_W(k23)),
+                          one);
+          i01 = Q6_Vb_vadd_VbVb(i01, b8);
+        }
+      }
+      if (half == 0u) {
+        a0 = c0, a1 = c1, a2 = c2, a3 = c3;
+      } else {
+        a4 = c0, a5 = c1, a6 = c2, a7 = c3;
+      }
+    }
+    const HVX_Vector acc[ATTN_M1_DET_ACC] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    *(HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE) =
+      hvx_hf_score(acc, job->scale);
+  }
+}
+
+/** @brief [#282 D] pv_group over the int8 cache: two 64-wide chunks a
+ *         pass (one V vector is 128 dims of one position), V's per-dim
+ *         scale applied to the f32 output after the chains. */
+static inline __attribute__((always_inline)) void
+pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
+            prof_slot *ps, uint64_t *t) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const uint32_t hq0 = h * ctx->gqa + g0, L = job->L, lo = job->lo;
+  const uint32_t hd = ctx->head_dim, nv = hd / VLEN;
+  const int8_t *vr = v8_head(ctx, job->layer, h);
+  const float *sv = ctx->sv + ((size_t)job->layer * ctx->n_kv + h) * hd;
+  const uint16_t *p[PV_GROUP];
+  for (uint32_t g = 0; g < ng; ++g) {
+    uint16_t *row = ctx->s + (size_t)(hq0 + g) * ctx->seq;
+    const HVX_Vector lv = hvx_splat_sf(job->l[hq0 + g]);
+    const HVX_Vector rv = hvx_recip_det_sf(lv);
+    const HVX_VectorPair lw = Q6_W_vcombine_VV(lv, lv);
+    const HVX_VectorPair rw = Q6_W_vcombine_VV(rv, rv);
+    for (uint32_t b = job->tlo; b < job->ntl; ++b) {
+      HVX_Vector *e = (HVX_Vector *)(row + (size_t)b * TILE);
+      *e = hvx_hf_div16(*e, lw, rw, one);
+    }
+    p[g] = row;
+  }
+  if (ps) {
+    const uint64_t now = HAP_perf_get_pcycles();
+    ps->softmax += (uint32_t)(now - *t);
+    ps->div += (uint32_t)(now - *t);
+    *t = now;
+  }
+  for (uint32_t c = 0; c < nv; ++c) { /* dims [128 c, 128 c + 128) */
+#if ATTN_M1_PV_LEAD
+    l2fetch_box(vr + (size_t)lo * hd, hd,
+                L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
+#endif
+    HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
+    HVX_Vector r0 = o0, r1 = o0, r2 = o0, r3 = o0;
+    for (uint32_t q0 = lo; q0 < L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+      if (q0 + 2u * PV_BLOCK < L) {
+        const uint32_t rest = L - q0 - 2u * PV_BLOCK;
+        l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * hd, hd,
+                    rest < PV_BLOCK ? rest : PV_BLOCK);
+      }
+#endif
+      const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
+                     *b2 = p[ng > 2u ? 2u : 0u] + q0,
+                     *b3 = p[ng > 3u ? 3u : 0u] + q0;
+      const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
+      for (uint32_t q = 0; q < nb; ++q) {
+        const HVX_VectorPair w = Q6_Wh_vunpack_Vb(
+          *(const HVX_Vector *)(vr + (size_t)(q0 + q) * hd + (size_t)c * VLEN));
+        const HVX_Vector va = Q6_Vhf_equals_Vh(Q6_V_lo_W(w));
+        const HVX_Vector vb = Q6_Vhf_equals_Vh(Q6_V_hi_W(w));
+        const HVX_Vector s0 = Q6_Vh_vsplat_R(b0[q]);
+        o0 = hvx_hf_fma(o0, s0, va, one);
+        r0 = hvx_hf_fma(r0, s0, vb, one);
+        if (ng > 1u) {
+          const HVX_Vector s1 = Q6_Vh_vsplat_R(b1[q]);
+          o1 = hvx_hf_fma(o1, s1, va, one);
+          r1 = hvx_hf_fma(r1, s1, vb, one);
+        }
+        if (ng > 2u) {
+          const HVX_Vector s2 = Q6_Vh_vsplat_R(b2[q]);
+          o2 = hvx_hf_fma(o2, s2, va, one);
+          r2 = hvx_hf_fma(r2, s2, vb, one);
+        }
+        if (ng > 3u) {
+          const HVX_Vector s3 = Q6_Vh_vsplat_R(b3[q]);
+          o3 = hvx_hf_fma(o3, s3, va, one);
+          r3 = hvx_hf_fma(r3, s3, vb, one);
+        }
+      }
+    }
+    const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
+    const HVX_Vector r[PV_GROUP] = {r0, r1, r2, r3};
+    for (uint32_t g = 0; g < ng; ++g) {
+      float *dst = job->out + (size_t)(hq0 + g) * hd + (size_t)c * VLEN;
+      hvx_hf_store_sf(dst, o[g]);
+      hvx_hf_store_sf(dst + CH, r[g]);
+      for (uint32_t d = 0; d < VLEN; ++d) {
+        dst[d] *= sv[(size_t)c * VLEN + d];
+      }
+    }
+  }
+  if (ps) {
+    const uint64_t now = HAP_perf_get_pcycles();
+    ps->pv += (uint32_t)(now - *t);
+    *t = now;
+  }
+}
+
 /** @brief The P1 / P2 runs' pool lane i of n: units i, i + n, ... */
 static void run_p1(uint32_t n, uint32_t i, void *arg) {
   const forward_job *job = (const forward_job *)arg;
@@ -612,10 +865,15 @@ static void run_p1(uint32_t n, uint32_t i, void *arg) {
   for (uint32_t u = i; u < job->units; u += n) {
 #if ATTN_M1_P1_LEAD
     if (u + n < job->units) {
-      l2fetch_rows(unit_tile(job, u + n), job->ctx->head_dim);
+      l2fetch_rows(unit_tile(job, u + n),
+                   job->ctx->q8 ? job->ctx->head_dim / 2u : job->ctx->head_dim);
     }
 #endif
-    p1_unit(job, u);
+    if (job->ctx->q8) {
+      p1_unit_q8(job, u);
+    } else {
+      p1_unit(job, u);
+    }
   }
   if (ps) {
     const uint32_t dt = (uint32_t)(HAP_perf_get_pcycles() - t0);
@@ -664,13 +922,25 @@ static void run_p3(uint32_t n, uint32_t i, void *arg) {
     const uint32_t h = hq / gqa, g0 = hq % gqa, head_end = (h + 1u) * gqa;
     const uint32_t left = (end < head_end ? end : head_end) - hq;
     if (left >= 4u) {
-      pv_group(job, h, g0, 4u, ps, &t);
+      if (job->ctx->q8) {
+        pv_group_q8(job, h, g0, 4u, ps, &t);
+      } else {
+        pv_group(job, h, g0, 4u, ps, &t);
+      }
       hq += 4u;
     } else if (left >= 2u) {
-      pv_group(job, h, g0, 2u, ps, &t);
+      if (job->ctx->q8) {
+        pv_group_q8(job, h, g0, 2u, ps, &t);
+      } else {
+        pv_group(job, h, g0, 2u, ps, &t);
+      }
       hq += 2u;
     } else {
-      pv_group(job, h, g0, 1u, ps, &t);
+      if (job->ctx->q8) {
+        pv_group_q8(job, h, g0, 1u, ps, &t);
+      } else {
+        pv_group(job, h, g0, 1u, ps, &t);
+      }
       hq += 1u;
     }
   }
@@ -712,18 +982,38 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
      it reads anyway; q as one zipped row per head, which P1 splats by
      vlut16. */
   const uint32_t hd = ctx->head_dim;
-  for (uint32_t i = 0; i < ctx->n_kv * hd; i += CH) { /* kv head h = i / hd */
-    *(HVX_Vector *)(ctx->kr + i) = hvx_hf_round_row(k + i);
-    *(HVX_Vector *)(v_head(ctx, layer, i / hd) + (size_t)pos * hd + i % hd) =
-      hvx_hf_round_row(v + i);
-  }
-  ctx->kv_len[layer] = pos + 1u;
-
   const uint32_t n_q = ctx->n_kv * ctx->gqa, L = pos + 1u;
   HVX_Vector *qs = (HVX_Vector *)ctx->qs;
-  for (uint32_t i = 0; i < n_q * hd; i += CH) { /* q head i / hd's rows */
-    qs[i / CH] = hvx_hf_round_row_lut(q + i);
+  if (ctx->q8) { /* [#282 D] */
+    if (!ctx->scaled[layer]) {
+      /* ponytail: no prefill seed (a one-token prompt) -- the scales come
+         from this row with 4x headroom; a seed is the normal case */
+      q8_set_scales(ctx, layer, 1u, k, v, 4.0f);
+    }
+    for (uint32_t h = 0; h < ctx->n_kv; ++h) {
+      append_head_q8(ctx, layer, h, pos, k + (size_t)h * hd,
+                     v + (size_t)h * hd);
+    }
+    float tmp[CH] __attribute__((aligned(128)));
+    for (uint32_t i = 0; i < n_q * hd; i += CH) { /* q x K's scale */
+      const float *s =
+        ctx->sk + ((size_t)layer * ctx->n_kv + i / hd / ctx->gqa) * hd + i % hd;
+      for (uint32_t j = 0; j < CH; ++j) {
+        tmp[j] = q[i + j] * s[j];
+      }
+      qs[i / CH] = hvx_hf_round_row_lut(tmp);
+    }
+  } else {
+    for (uint32_t i = 0; i < ctx->n_kv * hd; i += CH) { /* kv head i / hd */
+      *(HVX_Vector *)(ctx->kr + i) = hvx_hf_round_row(k + i);
+      *(HVX_Vector *)(v_head(ctx, layer, i / hd) + (size_t)pos * hd + i % hd) =
+        hvx_hf_round_row(v + i);
+    }
+    for (uint32_t i = 0; i < n_q * hd; i += CH) { /* q head i / hd's rows */
+      qs[i / CH] = hvx_hf_round_row_lut(q + i);
+    }
   }
+  ctx->kv_len[layer] = pos + 1u;
   forward_job job;
   job.ctx = ctx;
   job.layer = layer;
