@@ -434,7 +434,7 @@ geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
 }
 geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
 "$OUT/geglu_host_check"
-mut='s/c->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(g, u)/c->act == HVX_GLU_GELU_TANH ? hvx_swiglu_det_sf(g, u)/'
+mut='s/DQ_GLU_STORE(\([0-3]\), hvx_geglu_det_sf)/DQ_GLU_STORE(\1, hvx_swiglu_det_sf)/'
 sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
 if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
   echo "GEGLU MUTATION DID NOT APPLY: $mut"; exit 1

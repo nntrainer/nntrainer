@@ -58,9 +58,11 @@ typedef struct {
   /** Accumulator tiles per staging buffer, given the arena. Even, at least
       2 (one gate/up pair); gate_up's n-tile count is the useful ceiling. */
   uint32_t acc_tiles;
-  uint32_t res_f32_off; /**< [64 x N_out] f32, down's dequantized block.
-                             Its own region: the scatter reads it while the
-                             next block's epilogue already writes gate_off */
+  uint32_t dn_stage_off; /**< dn_ring staging buffers of acc_tiles tiles for
+                              the down batches alone: their epilogues run on
+                              the pool's background lane and may trail the
+                              HMX by up to dn_ring batches */
+  uint32_t dn_ring;      /**< 1 .. MOE_DN_RING */
   uint32_t total;       /**< bytes needed; compared against the arena */
 } hexkl_moe_layout;
 

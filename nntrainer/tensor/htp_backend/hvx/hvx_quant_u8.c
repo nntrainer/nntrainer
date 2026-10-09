@@ -21,6 +21,7 @@
 
 #include "hvx_convert.h"
 #include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 
 /** @brief HMX activation tile geometry, mirrored from hexkl_micro.h. */
 #define TILE_ROW 64u
@@ -244,38 +245,43 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   }
 }
 
+/** One group of four rows, read from @a row, packed as rows m..m+3. */
+static void pack_group_rows(const float *const row[4], uint32_t m,
+                            uint32_t n_ktiles, const float *scale,
+                            const int32_t *zp, uint8_t *out_ah) {
+  const uint32_t rb = m / TILE_ROW;
+  const uint32_t r0 = m % TILE_ROW;
+  uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
+  const HVX_Vector vinv[4] = {
+    hvx_splat_sf(1.0f / scale[m + 0]), hvx_splat_sf(1.0f / scale[m + 1]),
+    hvx_splat_sf(1.0f / scale[m + 2]), hvx_splat_sf(1.0f / scale[m + 3])};
+  const HVX_Vector vz[4] = {Q6_V_vsplat_R(zp[m + 0]), Q6_V_vsplat_R(zp[m + 1]),
+                            Q6_V_vsplat_R(zp[m + 2]), Q6_V_vsplat_R(zp[m + 3])};
+  for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+    const float *const src[4] = {
+      row[0] + kt * TILE_INNER, row[1] + kt * TILE_INNER,
+      row[2] + kt * TILE_INNER, row[3] + kt * TILE_INNER};
+    quant_pack_group4(src, vinv, vz,
+                      blk + (size_t)kt * ACT_TILE_BYTES + r0 * TILE_INNER);
+  }
+}
+
 void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
                                uint32_t m0, uint32_t m1, uint32_t k,
                                const float *scale, const int32_t *zp,
                                uint8_t *out_ah) {
-  const uint32_t n_ktiles = k / TILE_INNER;
   /* Row-group outer, k-tile inner: the rows are this call's alone, so the
      k-tile split the pooled pack needs for disjoint stores is not needed,
      and the four rows' parameters are splatted once per group instead of
      once per (group, k-tile). Same group body, same bytes. */
   for (uint32_t m = m0; m < m1; m += 4u) {
-    const uint32_t rb = m / TILE_ROW;
-    const uint32_t r0 = m % TILE_ROW;
-    uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
     const float *const row[4] = {
       x + (size_t)(row_map ? row_map[m + 0] : (m + 0)) * k,
       x + (size_t)(row_map ? row_map[m + 1] : (m + 1)) * k,
       x + (size_t)(row_map ? row_map[m + 2] : (m + 2)) * k,
       x + (size_t)(row_map ? row_map[m + 3] : (m + 3)) * k,
     };
-    const HVX_Vector vinv[4] = {
-      hvx_splat_sf(1.0f / scale[m + 0]), hvx_splat_sf(1.0f / scale[m + 1]),
-      hvx_splat_sf(1.0f / scale[m + 2]), hvx_splat_sf(1.0f / scale[m + 3])};
-    const HVX_Vector vz[4] = {
-      Q6_V_vsplat_R(zp[m + 0]), Q6_V_vsplat_R(zp[m + 1]),
-      Q6_V_vsplat_R(zp[m + 2]), Q6_V_vsplat_R(zp[m + 3])};
-    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
-      const float *const src[4] = {
-        row[0] + kt * TILE_INNER, row[1] + kt * TILE_INNER,
-        row[2] + kt * TILE_INNER, row[3] + kt * TILE_INNER};
-      quant_pack_group4(src, vinv, vz,
-                        blk + (size_t)kt * ACT_TILE_BYTES + r0 * TILE_INNER);
-    }
+    pack_group_rows(row, m, k / TILE_INNER, scale, zp, out_ah);
   }
 }
 
@@ -355,6 +361,83 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
     quant_pack_row_scalar(x + (size_t)(row_map ? row_map[m] : m) * k, n_ktiles,
                           hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
                           dst_tile0, ACT_TILE_BYTES);
+  }
+  return AEE_SUCCESS;
+}
+
+typedef struct {
+  const float *x;
+  uint32_t n_groups, k;
+  float *scale;
+  int32_t *zp;
+  uint8_t *out_ah;
+  const float *gamma;
+  float eps;
+  float *scratch;
+} quant_params_pack_ctx;
+
+/** Row groups [lo, hi) of four: each group's parameters, then its pack,
+ *  while the four rows are still in the cache. With a scratch, each row is
+ *  RMS-normed into this worker's four scratch rows first and the group is
+ *  read from there: the normed rows never go out to DDR and back. */
+static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
+                                     void *ctx_) {
+  const quant_params_pack_ctx *c = (const quant_params_pack_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
+  float *sc = c->scratch ? c->scratch + (size_t)i * 4u * c->k : NULL;
+  for (uint32_t g = lo; g < hi; ++g) {
+    const uint32_t m = 4u * g;
+    if (!sc) {
+      for (uint32_t r = 0; r < 4u; ++r)
+        quant_row_params_one(c->x, m + r, c->k, c->scale, c->zp);
+      hvx_quant_pack_u8_ah_rows(c->x, NULL, m, m + 4u, c->k, c->scale, c->zp,
+                                c->out_ah);
+      continue;
+    }
+    for (uint32_t r = 0; r < 4u; ++r) {
+      hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
+                          c->gamma, c->k, c->eps);
+      quant_row_params_one(sc, r, c->k, c->scale + m, c->zp + m);
+    }
+    const float *const row[4] = {sc, sc + c->k, sc + 2u * c->k, sc + 3u * c->k};
+    pack_group_rows(row, m, c->k / TILE_INNER, c->scale, c->zp, c->out_ah);
+  }
+}
+
+int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
+                                uint32_t m_pad, uint32_t k,
+                                const float *pre_gamma, float pre_eps,
+                                float *pre_scratch, float *scale, int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+  for (uint32_t m = m_valid; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  const uint32_t m_vec_end = (m_valid / 4u) * 4u;
+  if (m_vec_end > 0) {
+    quant_params_pack_ctx ctx = {
+      x, m_vec_end / 4u, k, scale, zp, out_ah, pre_gamma, pre_eps, pre_scratch};
+    hvx_worker_pool_run(pool, quant_params_pack_worker, &ctx, m_vec_end / 4u);
+  }
+  for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    const float *row = x + (size_t)m * k;
+    if (pre_scratch) {
+      hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
+      row = pre_scratch;
+    }
+    quant_row_params_one(row, 0, k, scale + m, zp + m);
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r = m % TILE_ROW;
+    quant_pack_row_scalar(
+      row, n_ktiles, hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
+      out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER,
+      ACT_TILE_BYTES);
   }
   return AEE_SUCCESS;
 }
