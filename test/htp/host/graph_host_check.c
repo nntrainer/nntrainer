@@ -1235,6 +1235,7 @@ static void check_add_router(int gemma) {
   static float x[HID], a[HID], a2[HID], out[HID], ref[HID], h[HID], nrm[HID];
   static float gam[4][HID], rw[HID * HD64_E], moe[HID];
   static float rbias[HID + HD64_E], rsc[HID];
+  static float rw2[HID * HD64_E], rbias2[HID + HD64_E]; /* [#266 S2] */
   float lg[HD64_E], wt[HD64_TOP];
   const uint32_t n_bias = gemma ? HID + HD64_E : HD64_E;
   uint32_t sel[HD64_TOP], r_idx[HD64_TOP], r_cnt[HD64_E] = {0};
@@ -1255,6 +1256,8 @@ static void check_add_router(int gemma) {
   bind_hd64(w);
   if (gemma) {
     memcpy(&htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits,
+           &kHd64.eps, sizeof(float));
+    memcpy(&htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 1))->eps_bits,
            &kHd64.eps, sizeof(float));
     htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 3))->feed = HTP_GRAPH_NORM_N1;
   }
@@ -1322,6 +1325,43 @@ static void check_add_router(int gemma) {
   rc = (uint32_t)hexkl_graph_set_param(
     g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, n_bias);
   CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
+  /* [#266 S2] the second router's weights, and PREDICT: router 0 also
+     runs router 1 on its own input; the stretch below must keep its bits
+     and log that guess */
+  fill(rw2, HID * HD64_E, &seed);
+  fill(rbias2, HD64_E, &seed);
+  if (gemma) {
+    fill(rsc, HID, &seed);
+    m1_router_input_scale_det(rsc, HID, rbias2);
+    fill(rbias2 + HID, HD64_E, &seed);
+  }
+  rc = (uint32_t)hexkl_graph_set_param(g, nth_op(w, HTP_OP_ROUTER_TOPK, 1),
+                                       HTP_GRAPH_PARAM_ROUTER_W, rw2,
+                                       HID * HD64_E);
+  rc |= (uint32_t)hexkl_graph_set_param(g, nth_op(w, HTP_OP_ROUTER_TOPK, 1),
+                                        HTP_GRAPH_PARAM_ROUTER_BIAS, rbias2,
+                                        n_bias);
+  CHECK(rc == 0u, "set router 1: %s", htp_graph_err_name(rc));
+  {
+    uint32_t v = 2u;
+    float word;
+    memcpy(&word, &v, sizeof(word));
+    CHECK(hexkl_graph_set_param(g, op_router, HTP_GRAPH_PARAM_PREDICT, &word,
+                                1u) == AEE_EBADITEM,
+          "PREDICT on an op");
+    CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
+                                &word, 1u) == AEE_EINVALIDFORMAT,
+          "PREDICT 2");
+    CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
+                                &word, 0u) == AEE_EINVALIDFORMAT,
+          "PREDICT n 0");
+    v = 1u;
+    memcpy(&word, &v, sizeof(word));
+    CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
+                                &word, 1u) == 0 &&
+            g->predict == 1u,
+          "PREDICT 1");
+  }
 
   /* (2) op 0 seeds slot 0 with the embedding row x */
   rc = (uint32_t)hexkl_graph_forward(g, &env, op_norm[0], 1000u, 0u, NULL, x,
@@ -1361,6 +1401,7 @@ static void check_add_router(int gemma) {
      h = s0 + a2, n = rmsnorm(h), routing = router_topk_det(n),
      h2 = h + standin(n, routing), out = rmsnorm(h2) */
   memset(&g_last, 0, sizeof(g_last));
+  g->pred_log_n = 0u;
   rc = (uint32_t)hexkl_graph_forward(g, &env, op_add1, 1000u, 0u, NULL, a2, HID,
                                      out, HID, &resume);
   CHECK(rc == 0u && resume == op_norm[3] + 1u, "[ADD .. RMSNORM]: %s resume %u",
@@ -1376,6 +1417,23 @@ static void check_add_router(int gemma) {
   } else {
     m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
     m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  }
+  { /* [#266 S2] the guess: router 1's spec on router 0's input */
+    static float xs2[HID];
+    float lg2[HD64_E], wt2[HD64_TOP];
+    uint32_t sel2[HD64_TOP];
+    if (gemma) {
+      m1_rmsnorm_det(nrm, rbias2, xs2, HID, HID, kHd64.eps, NULL);
+      m1_router_softmax_det(xs2, rw2, rbias2 + HID, HID, HD64_E, HD64_TOP, lg2,
+                            sel2, wt2);
+    } else {
+      m1_router_cpu_det(nrm, rw2, rbias2, HID, HD64_E, HD64_TOP, lg2, sel2,
+                        wt2);
+    }
+    CHECK(g->pred_log_n == 1u + HD64_TOP && g->pred_log[0] == HD64_TOP &&
+            g->pred_log[1] == sel2[0] && g->pred_log[2] == sel2[1],
+          "PREDICT log %u bytes: %u %u %u, spec %u %u", g->pred_log_n,
+          g->pred_log[0], g->pred_log[1], g->pred_log[2], sel2[0], sel2[1]);
   }
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
@@ -1406,7 +1464,8 @@ static void check_add_router(int gemma) {
   if (err == 0)
     printf("GRAPH STRETCH BIT-IDENTICAL%s: ADD+RMSNORM "
            "ADD+RMSNORM+ROUTER_TOPK+MOE+ADD+RMSNORM (hd64 shape, MOE on the "
-           "stand-in, slot 0 carried across calls, resume_at the next FC)\n",
+           "stand-in, slot 0 carried across calls, resume_at the next FC; "
+           "PREDICT on, its guess == router 1's spec)\n",
            gemma ? " (Gemma softmax router, N1 norm before it)" : "");
 }
 

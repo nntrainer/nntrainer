@@ -100,6 +100,11 @@ typedef struct htp_dspq_token_resp_s {
   /** [#267 L0] the pcycles over the miss waits: the clock while computing
    *  is (wall_pcyc - miss_pcyc) / (wall_us - miss_us) */
   uint32_t miss_pcyc;
+  uint32_t pred_n; /**< [#266 S2] bytes of pred (0: PREDICT off) */
+  uint8_t pred[HTP_DSPQ_TOKEN_ROUTE]; /**< per ROUTER_TOPK op in list order:
+                                           its guess at the next one's
+                                           routing, count then ids, best
+                                           first (hexkl_graph.h pred_log) */
 } htp_dspq_token_resp;
 
 /** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):
@@ -151,6 +156,8 @@ typedef struct {
   uint32_t seq2;
 } htp_miss_ans;
 
+typedef char htp_dspq_token_resp_fits
+  [sizeof(htp_dspq_token_resp) <= HTP_DSPQ_MAX_MSG ? 1 : -1];
 typedef char
   htp_miss_req_fits[sizeof(htp_miss_req) <= HTP_MBOX_MISS_REQ_BYTES ? 1 : -1];
 typedef char
