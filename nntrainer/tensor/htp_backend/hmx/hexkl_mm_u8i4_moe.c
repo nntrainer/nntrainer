@@ -137,12 +137,12 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
 static int g_moe_src_bypass;
 
 /** @brief The src_bypass a weight's descriptor gets: the knob, and only for
- *         an arena-backed (borrowed) slot -- the CPU wrote those bytes and
- *         the DSP never does. A heap slot was memcpy'd by the DSP, so its
- *         lines may still be dirty in the L2 a bypassing read skips. */
+ *         a slot no DSP cache holds a dirty line of -- an arena-backed
+ *         (borrowed) slot, which the CPU wrote and the DSP never does, or
+ *         a heap image flushed after its one write ([#267 L1] clean). */
 static inline int moe_weight_src_bypass(const hexkl_weight_u8i4 *h,
                                         int src_bypass) {
-  return src_bypass && h->borrowed;
+  return src_bypass && (h->borrowed || h->clean);
 }
 
 uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,

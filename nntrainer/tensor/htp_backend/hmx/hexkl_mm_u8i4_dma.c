@@ -28,6 +28,11 @@
 
 #include "hexkl_probe.h"
 
+#if defined(__hexagon__)
+#include <qurt.h>
+#include <qurt_memory.h>
+#endif
+
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
 /** @brief Bytes in one packed i4 weight tile (32x32 values). Matches
@@ -154,6 +159,19 @@ static void hexkl_weight_u8i4_tail_from_arena(hexkl_weight_u8i4 *h,
    them. A NULL w_scale with borrow set takes the scales and column sums
    from the arena too (hexkl_weight_u8i4_tail_from_arena). Everything else
    about the slot is the same either way. */
+/** @brief [#267 L1] Writes [p, p + n) back to DDR (L1 and L2), keeping
+ *  the lines: a heap image's one write, made visible to a DMA that reads
+ *  around the L2 (hexkl_mm_u8i4_moe.h, HEXKL_MOE_FLAG_DMA_BYPASS). */
+static void hexkl_weight_u8i4_flush(const void *p, size_t n) {
+#if defined(__hexagon__)
+  qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)n, QURT_MEM_CACHE_FLUSH,
+                       QURT_MEM_DCACHE);
+#else
+  (void)p; /* the host stand-in's transfers are memcpys: no cache */
+  (void)n;
+#endif
+}
+
 static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
                                        uint32_t slot, uint32_t K, uint32_t N,
                                        uint32_t wh_bytes, const uint8_t *wh_src,
@@ -189,6 +207,14 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
     memcpy(h->bias, bias, n4);
   } else {
     hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
+  }
+  if (!borrow) {
+    /* [#267 L1] Nothing on the DSP writes the image again (prefill and
+       decode only read it, release frees it), so one flush here lets every
+       reader's DMA take src_bypass as for an arena slot. */
+    hexkl_weight_u8i4_flush(h->wh_bytes, wh_bytes);
+    hexkl_weight_u8i4_flush(h->arrays, 3u * n4 + 128u);
+    h->clean = 1;
   }
   /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
      sets 2 after this returns). */

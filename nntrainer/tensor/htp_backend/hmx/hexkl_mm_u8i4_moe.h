@@ -385,8 +385,9 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
  * The bit is set only for arena-backed (borrowed) slots: the CPU fills the
  * arena before it is attached and nothing on the DSP ever writes it (the
  * GEMV's arena read and l2fetch leave clean lines, which a bypassing read
- * may ignore). A heap slot was memcpy'd by the DSP, so it keeps
- * src_bypass = 0 under the knob too. The ARM side of
+ * may ignore). A heap slot was memcpy'd by the DSP; [#267 L1] it is
+ * flushed to DDR right after that one write (hexkl_weight_u8i4.clean), so
+ * it takes the bit too. The ARM side of
  * the same bytes is the CPU's business either way: an ARM cached mapping
  * (#157's plan) needs its clean per fill with or without this bit, since
  * the DSP L2 is not the ARM's cache. Activation blocks and the staging

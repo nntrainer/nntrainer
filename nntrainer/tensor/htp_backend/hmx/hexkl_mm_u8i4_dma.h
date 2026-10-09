@@ -51,6 +51,9 @@ typedef struct {
   void *arrays;      /**< the one allocation the three arrays sit in */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
+  int clean;    /**< [#267 L1] a heap image: written once at registration
+                     and flushed to DDR then, so no DSP cache holds a dirty
+                     line of it and a DMA may read it around the L2 */
   /** 4 (QS4CX_WH) or 2 (QS2CX_WH); 0 in a slot never filled reads as 4.
       At 2, wh_bytes holds half as many bytes -- two bits a weight indexing
       @a pal -- which the M=1 GEMV looks up in a register
