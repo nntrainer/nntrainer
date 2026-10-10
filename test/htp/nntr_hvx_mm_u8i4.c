@@ -889,7 +889,7 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
                               const uint16 *act_u16, const float *act_enc,
                               uint32 act_hd, int actLen, const float *res,
                               int resLen, float *out_f32, int out_f32Len) {
-  if (!s || w_handlesLen <= 0 || w_handlesLen > 8) {
+  if (!s || w_handlesLen <= 0 || w_handlesLen > 16) {
     return AEE_EBADPARM;
   }
   uint32_t N = 0;
@@ -937,8 +937,8 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
     return rc;
   }
   /* layer_run wrote one M x N_i block per handle, in handle order */
-  const float *xb[8];
-  uint32_t cols[8];
+  const float *xb[16];
+  uint32_t cols[16];
   size_t off = 0;
   for (int i = 0; i < w_handlesLen; ++i) {
     cols[i] = s->weights_u8i4.slots[w_handles[i]].N;
