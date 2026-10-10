@@ -131,8 +131,9 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
                                     int *err) {
   int rc = AEE_SUCCESS;
   hvx_attn_m1_ctx *ctx = NULL;
-  const uint32_t q8 = (max_seq & HVX_ATTN_M1_Q8) != 0u; /* [#282 D] */
-  max_seq &= ~HVX_ATTN_M1_Q8;
+  const uint32_t q8 = (max_seq & HVX_ATTN_M1_Q8) != 0u;     /* [#282 D] */
+  const uint32_t lazy = (max_seq & HVX_ATTN_M1_LAZY) != 0u; /* [#289] */
+  max_seq &= ~(HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY);
   if (n_layers == 0u || n_kv == 0u || gqa == 0u || gqa > MAX_GQA ||
       n_kv * gqa > MAX_NQ || head_dim == 0u || head_dim % CH != 0u ||
       head_dim > ATTN_M1_DET_MAX_HD || max_seq == 0u || max_seq % 32u != 0u) {
@@ -180,8 +181,9 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   }
   ctx->kt = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
   ctx->v = (uint16_t **)calloc(n_layers, sizeof(uint16_t *));
-  for (uint32_t l = 0; rc == AEE_SUCCESS && ctx->kt && ctx->v && l < n_layers;
-       ++l) {
+  ctx->layer_bytes = per_layer;
+  for (uint32_t l = 0;
+       !lazy && rc == AEE_SUCCESS && ctx->kt && ctx->v && l < n_layers; ++l) {
     ctx->kt[l] = (uint16_t *)memalign(VLEN, per_layer);
     ctx->v[l] = (uint16_t *)memalign(VLEN, per_layer);
     if (!ctx->kt[l] || !ctx->v[l]) {
@@ -244,6 +246,26 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx->scaled);
   free(ctx->kv_len);
   free(ctx);
+}
+
+/** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use;
+ *  a no-op for an allocated one. */
+static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  if (ctx->kt[l] && ctx->v[l]) {
+    return AEE_SUCCESS;
+  }
+  ctx->kt[l] = (uint16_t *)memalign(VLEN, ctx->layer_bytes);
+  ctx->v[l] = (uint16_t *)memalign(VLEN, ctx->layer_bytes);
+  if (!ctx->kt[l] || !ctx->v[l]) {
+    free(ctx->kt[l]);
+    free(ctx->v[l]);
+    ctx->kt[l] = NULL;
+    ctx->v[l] = NULL;
+    return AEE_ENOMEMORY;
+  }
+  memset(ctx->kt[l], 0, ctx->layer_bytes);
+  memset(ctx->v[l], 0, ctx->layer_bytes);
+  return AEE_SUCCESS;
 }
 
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
@@ -401,6 +423,9 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
   if (kv_from > ctx->kv_len[layer]) {
     return AEE_EBADSTATE;
   }
+  if (layer_alloc(ctx, layer) != AEE_SUCCESS) {
+    return AEE_ENOMEMORY;
+  }
   if (ctx->q8 && n_rows != 0u && !ctx->scaled[layer]) { /* [#282 D] */
     q8_set_scales(ctx, layer, n_rows, k_rows, v_rows, HVX_ATTN_M1_Q8_MARGIN);
   }
@@ -415,6 +440,93 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
     hvx_worker_pool_run(ctx->pool, run_append, &job, job.units);
   }
   ctx->kv_len[layer] = kv_from + n_rows;
+  return AEE_SUCCESS;
+}
+
+/** [#289] seed_q8 over the pool: units are (kv head, 64-row chunk) */
+typedef struct {
+  hvx_attn_m1_ctx *ctx;
+  uint32_t layer, n_rows, units;
+  const uint8_t *k8, *v8;
+  size_t head_stride, row_stride;
+  const float *k_rows; /**< non-NULL: K quantized from these instead */
+} seed_job;
+
+static void run_seed_q8(uint32_t n, uint32_t i, void *arg) {
+  const seed_job *job = (const seed_job *)arg;
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t hd = ctx->head_dim;
+  const float *ski_l = ctx->sk_inv + (size_t)job->layer * ctx->n_kv * hd;
+  for (uint32_t u = i; u < job->units; u += n) {
+    const uint32_t h = u % ctx->n_kv, r0 = (u / ctx->n_kv) * APPEND_ROWS;
+    const uint32_t r1 =
+      r0 + APPEND_ROWS < job->n_rows ? r0 + APPEND_ROWS : job->n_rows;
+    for (uint32_t r = r0; r < r1; ++r) {
+      const uint8_t *ks = job->k8 + h * job->head_stride + r * job->row_stride;
+      const uint8_t *vs = job->v8 + h * job->head_stride + r * job->row_stride;
+      int8_t *kt = kt8_head(ctx, job->layer, h) +
+                   (size_t)(r / TILE) * hd * TILE + r % TILE;
+      int8_t *vr = v8_head(ctx, job->layer, h) + (size_t)r * hd;
+      if (job->k_rows) { /* append_head_q8's K: the same bytes */
+        const float *k = job->k_rows + ((size_t)r * ctx->n_kv + h) * hd;
+        const float *ski = ski_l + (size_t)h * hd;
+        for (uint32_t d = 0; d < hd; ++d) {
+          kt[(size_t)d * TILE] = q8_of(k[d], ski[d]);
+        }
+      } else {
+        for (uint32_t d = 0; d < hd; ++d) {
+          kt[(size_t)d * TILE] = (int8_t)(ks[d] ^ 0x80u);
+        }
+      }
+      for (uint32_t d = 0; d < hd; ++d) {
+        vr[d] = (int8_t)(vs[d] ^ 0x80u);
+      }
+    }
+  }
+}
+
+int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
+                        const uint8_t *k8, const uint8_t *v8,
+                        size_t head_stride, size_t row_stride, const float *s_k,
+                        const float *s_v, const float *s_v_inv,
+                        const float *k_rows) {
+  if (!ctx || !ctx->q8 || layer >= ctx->n_layers || ctx->kv_len[layer] != 0u ||
+      !k8 || !v8 || !s_k || !s_v || !s_v_inv) {
+    return AEE_EBADSTATE;
+  }
+  if (n_rows == 0u || n_rows > ctx->max_seq) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (layer_alloc(ctx, layer) != AEE_SUCCESS) {
+    return AEE_ENOMEMORY;
+  }
+  const uint32_t hd = ctx->head_dim;
+  const size_t base = (size_t)layer * ctx->n_kv * hd;
+  if (k_rows) {
+    /* K's scales as kv_append makes them (the amax pass reads K for both
+       halves; sv is overwritten below) */
+    q8_set_scales(ctx, layer, n_rows, k_rows, k_rows, HVX_ATTN_M1_Q8_MARGIN);
+  }
+  for (uint32_t h = 0; h < ctx->n_kv; ++h) {
+    for (uint32_t d = 0; d < hd; ++d) {
+      const size_t x = base + (size_t)h * hd + d;
+      if (!k_rows) {
+        ctx->sk[x] = s_k[h];
+        ctx->sk_inv[x] = 1.0f / s_k[h]; /* the prefill append's inverse */
+      }
+      ctx->sv[x] = s_v[(size_t)h * hd + d];
+      ctx->sv_inv[x] = s_v_inv[(size_t)h * hd + d];
+    }
+  }
+  ctx->scaled[layer] = 1u;
+  seed_job job = {
+    ctx,         layer,
+    n_rows,      ctx->n_kv * ((n_rows + APPEND_ROWS - 1u) / APPEND_ROWS),
+    k8,          v8,
+    head_stride, row_stride,
+    k_rows};
+  hvx_worker_pool_run(ctx->pool, run_seed_q8, &job, job.units);
+  ctx->kv_len[layer] = n_rows;
   return AEE_SUCCESS;
 }
 
@@ -1146,6 +1258,9 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   }
   if (pos > ctx->kv_len[layer]) {
     return AEE_EBADSTATE;
+  }
+  if (layer_alloc(ctx, layer) != AEE_SUCCESS) {
+    return AEE_ENOMEMORY;
   }
   prof_slot slots[PROF_SLOTS];
   uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;

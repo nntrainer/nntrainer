@@ -166,6 +166,21 @@ inline bool htpDecodeTokenId(unsigned *id) {
 #endif
 }
 
+/** @brief [#289] The seed with V from the layer's quantized prefill
+ *  cache, K from @a k_rows. */
+inline bool htpDecodeKvSeedKvq(unsigned n_rows, int kv_handle,
+                               const float *k_rows) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_seed_kvq(n_rows, kv_handle,
+                                                      k_rows);
+#else
+  (void)n_rows;
+  (void)kv_handle;
+  (void)k_rows;
+  return false;
+#endif
+}
+
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
  *  [n_rows][n_kv x head_dim] f32 each. */
 inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,

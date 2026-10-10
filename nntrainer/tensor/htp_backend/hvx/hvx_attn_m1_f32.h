@@ -119,16 +119,21 @@ typedef struct {
    *  amax x HVX_ATTN_M1_Q8_MARGIN / 127), later rows are clamped. Half the
    *  cache bytes; not the fp16 spec any more -- the gate is the model's */
   uint32_t q8;
-  float *sk;       /**< [n_layers][n_kv][head_dim]: K's outliers are per
-                        dim, so per dim (folded into q all the same) */
-  float *sk_inv;   /**< 1 / sk, for the appends */
-  float *sv;       /**< [n_layers][n_kv][head_dim] */
-  float *sv_inv;   /**< 1 / sv, for the appends */
-  uint8_t *scaled; /**< [n_layers] 1 once the layer's scales are set */
+  float *sk;          /**< [n_layers][n_kv][head_dim]: K's outliers are per
+                           dim, so per dim (folded into q all the same) */
+  float *sk_inv;      /**< 1 / sk, for the appends */
+  float *sv;          /**< [n_layers][n_kv][head_dim] */
+  float *sv_inv;      /**< 1 / sv, for the appends */
+  uint8_t *scaled;    /**< [n_layers] 1 once the layer's scales are set */
+  size_t layer_bytes; /**< [#289] kt[l] / v[l] size, for a lazy layer */
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
 #define HVX_ATTN_M1_Q8 0x80000000u
+/** @brief [#289] Or-ed into create's max_seq: a layer's cache is allocated
+ *  at its first seed or forward, not at create, so a seed can free the
+ *  prefill's cache of that layer before the next layer's comes. */
+#define HVX_ATTN_M1_LAZY 0x40000000u
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 
@@ -167,6 +172,25 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx);
 int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
                           uint32_t kv_from, uint32_t n_rows,
                           const float *k_rows, const float *v_rows);
+
+/**
+ * @brief [#289] Seeds an int8 cache's @a layer with @a n_rows positions
+ *        already quantized: per kv head row-major masters stored as
+ *        q ^ 0x80 (@a k8 / @a v8, @a row_stride bytes between positions,
+ *        @a head_stride between heads), K at one scale a head (@a s_k), V
+ *        at one a (head, dim) (@a s_v, @a s_v_inv). The bytes move as they
+ *        are; the scales become the layer's. With @a k_rows
+ *        ([n_rows][n_kv][head_dim] f32) K is quantized from them instead,
+ *        at kv_append's per-dim scales (a head scale is too coarse for K).
+ * @return AEE_SUCCESS; AEE_EBADSTATE unless the cache is int8 and the
+ *         layer empty; AEE_EINVALIDFORMAT for a range past max_seq;
+ *         AEE_ENOMEMORY when a lazy layer cannot be allocated
+ */
+int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
+                        const uint8_t *k8, const uint8_t *v8,
+                        size_t head_stride, size_t row_stride, const float *s_k,
+                        const float *s_v, const float *s_v_inv,
+                        const float *k_rows);
 
 /**
  * @brief Appends position @a pos (k, v of the new token) to @a layer and

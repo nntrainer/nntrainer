@@ -705,26 +705,73 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       use_external_cache
         ? context.getInput(4)
         : context.getTensor(tensor_idx[AttentionParams::cache_value]);
-    const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
-    const size_t n = static_cast<size_t>(pos) * wk;
-    std::vector<float> k_rows(n), v_rows(n);
-    auto rows_f32 = [n, wk](const nntrainer::Tensor &c, float *dst) {
+    // [#289] NNTR_HTP_KV_DROP_CPU=1: once the DSP holds the rows, this
+    // layer's CPU cache (an rpcmem block, compute_ops alloc_shared) is freed:
+    // the decode row never reads it (it returns above) and a later prefill
+    // is refused (htp_owns_cache_). Not a shared block: nothing happens.
+    auto drop_cpu_cache = [&]() {
+      static const bool drop = [] {
+        const char *v = std::getenv("NNTR_HTP_KV_DROP_CPU");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+      }();
+      if (drop && compute_ops_)
+        for (nntrainer::Tensor *t : {&ck, &cv})
+          compute_ops_->drop_shared(
+            t->getDataType() == ml::train::TensorDim::DataType::FP32
+              ? static_cast<void *>(t->getData<float>())
+              : static_cast<void *>(t->getData<uint16_t>()));
+    };
+    // [#289] NNTR_HTP_KV_SEED_Q=1: from the layer's quantized prefill cache,
+    // without the rows leaving the DSP (the backend declines otherwise)
+    // K still comes from the CPU cache (the prefill's K scale is one a head,
+    // too coarse: decode nll +9.4 %), V from the DSP's int8 masters
+    // [#289] the CPU cache's rows [0, m) as f32, rows over the CPU pool (one
+    // thread read 0.5 s of the p1024 first token); the same conversion
+    auto rows_f32_of = [wk](const nntrainer::Tensor &c, float *dst, size_t m,
+                            size_t) {
       if (c.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        std::memcpy(dst, c.getData<float>(), n * sizeof(float));
+        std::memcpy(dst, c.getData<float>(), m * sizeof(float));
         return;
       }
-      // [#289] the same conversion per element, rows over the CPU pool
-      // (one thread read 0.5 s of the p1024 first token)
       const uint16_t *src = c.getData<uint16_t>();
-      nntrainer::ThreadManager::Global().parallel_for(0, n / wk, [=](size_t r) {
+      nntrainer::ThreadManager::Global().parallel_for(0, m / wk, [=](size_t r) {
         for (size_t i = r * wk; i < (r + 1) * wk; ++i)
           dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
       });
+    };
+    static const bool seed_q = [] {
+      const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
+      return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    std::vector<float> k_only;
+    if (seed_q && !q_cache_handles.empty() && q_cache_handles[0] >= 0 &&
+        q_cache_synced[0] == pos && q2_scales_set[0])
+      k_only.resize(static_cast<size_t>(pos) * wk);
+    if (!k_only.empty())
+      rows_f32_of(ck, k_only.data(), k_only.size(), wk);
+    if (!k_only.empty() &&
+        htpDecodeKvSeedKvq(pos, q_cache_handles[0], k_only.data())) {
+      q_cache_handles[0] = -1; // released on the DSP
+      drop_cpu_cache();
+      r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
+                        wq, htp_rope_table_.data(),
+                        static_cast<unsigned>(htp_rope_table_.size()));
+      NNTR_THROW_IF(r != 1, std::runtime_error)
+        << "mha_core: the HTP attention hook asked for a seed twice at pos "
+        << pos;
+      return true;
+    }
+    const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
+    const size_t n = static_cast<size_t>(pos) * wk;
+    std::vector<float> k_rows(n), v_rows(n);
+    auto rows_f32 = [&](const nntrainer::Tensor &c, float *dst) {
+      rows_f32_of(c, dst, n, wk);
     };
     rows_f32(ck, k_rows.data());
     rows_f32(cv, v_rows.data());
     const auto t_conv = std::chrono::steady_clock::now();
     htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
+    drop_cpu_cache();
     {
       static double conv_ms = 0.0, all_ms = 0.0; // [#282 F] summed, logged
       using ms = std::chrono::duration<double, std::milli>;

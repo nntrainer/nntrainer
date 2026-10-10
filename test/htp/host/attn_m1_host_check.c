@@ -1423,6 +1423,101 @@ static void check_gemma(hvx_worker_pool *const pools[3]) {
   }
 }
 
+/* [#289] seed_q8 on a lazy int8 cache: the q ^ 0x80 masters land in Kt's
+   tile columns and V's rows unchanged, K's head scale fills its dims, the
+   other layers stay unallocated, and a second seed of the layer is refused */
+static void check_seed_q8(hvx_worker_pool *pool) {
+  const uint32_t n_kv = 2u, hd = 256u, L = 130u, max_seq = 256u, layers = 3u;
+  int err = 0;
+  hvx_attn_m1_ctx *c =
+    hvx_attn_m1_create(layers, n_kv, 2u, hd,
+                       max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
+  CHECK(c && err == AEE_SUCCESS, "seed_q8: create");
+  if (!c) {
+    return;
+  }
+  CHECK(!c->kt[0] && !c->kt[1] && !c->kt[2], "seed_q8: lazy layers");
+  const size_t hs = (size_t)max_seq * hd; /* the registry's head stride */
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float s_k[2] = {0.03f, 0.5f}, s_v[2 * 256], s_vi[2 * 256];
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    v8[i] = (uint8_t)((i * 53u + 7u) & 0xFFu);
+  }
+  for (uint32_t i = 0; i < n_kv * hd; ++i) {
+    s_v[i] = 0.01f + 0.001f * (float)i;
+    s_vi[i] = 1.0f / s_v[i];
+  }
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
+          AEE_SUCCESS,
+        "seed_q8: seed");
+  CHECK(c->kt[1] && !c->kt[0] && !c->kt[2] && c->kv_len[1] == L && c->scaled[1],
+        "seed_q8: one layer allocated and filled");
+  const uint32_t seq = c->seq;
+  int bad = 0;
+  for (uint32_t h = 0; h < n_kv; ++h) {
+    const int8_t *kt = (const int8_t *)c->kt[1] + (size_t)h * hd * seq;
+    const int8_t *vv = (const int8_t *)c->v[1] + (size_t)h * seq * hd;
+    for (uint32_t r = 0; r < L; ++r) {
+      for (uint32_t d = 0; d < hd; ++d) {
+        const size_t m = h * hs + (size_t)r * hd + d;
+        bad += kt[(size_t)(r / 64u) * hd * 64u + (size_t)d * 64u + r % 64u] !=
+               (int8_t)(k8[m] ^ 0x80u);
+        bad += vv[(size_t)r * hd + d] != (int8_t)(v8[m] ^ 0x80u);
+      }
+    }
+    for (uint32_t d = 0; d < hd; ++d) {
+      const size_t x = ((size_t)1u * n_kv + h) * hd + d;
+      bad += c->sk[x] != s_k[h] || c->sk_inv[x] != 1.0f / s_k[h] ||
+             c->sv[x] != s_v[h * hd + d] || c->sv_inv[x] != s_vi[h * hd + d];
+    }
+  }
+  CHECK(bad == 0, "seed_q8: %d bytes or scales moved", bad);
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
+          AEE_EBADSTATE,
+        "seed_q8: a second seed of a layer is refused");
+  /* K from f32 rows: the same K bytes and scales as kv_append's */
+  float *kf = (float *)malloc((size_t)L * n_kv * hd * sizeof(float));
+  for (size_t i = 0; i < (size_t)L * n_kv * hd; ++i) {
+    kf[i] = (float)((int)((i * 2654435761u) % 2001u) - 1000) * 0.0137f *
+            (1.0f + (float)(i % hd) * 0.01f);
+  }
+  hvx_attn_m1_ctx *a =
+    hvx_attn_m1_create(layers, n_kv, 2u, hd,
+                       max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
+  hvx_attn_m1_ctx *b =
+    hvx_attn_m1_create(layers, n_kv, 2u, hd,
+                       max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
+  CHECK(a && b, "seed_q8: create the K pair");
+  if (a && b) {
+    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, s_k, s_v, s_vi, kf) ==
+            AEE_SUCCESS,
+          "seed_q8: seed with K rows");
+    CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, kf, kf) == AEE_SUCCESS,
+          "seed_q8: kv_append reference");
+    int kbad = 0;
+    for (size_t i = 0; i < c->layer_bytes; ++i) {
+      kbad += ((const int8_t *)a->kt[0])[i] != ((const int8_t *)b->kt[0])[i];
+    }
+    for (size_t i = 0; i < (size_t)n_kv * hd; ++i) {
+      kbad += a->sk[i] != b->sk[i] || a->sk_inv[i] != b->sk_inv[i] ||
+              a->sv[i] != s_v[i];
+    }
+    CHECK(kbad == 0, "seed_q8: K from rows differs from kv_append (%d)", kbad);
+    bad += kbad;
+  }
+  hvx_attn_m1_free(a);
+  hvx_attn_m1_free(b);
+  free(kf);
+  free(k8);
+  free(v8);
+  hvx_attn_m1_free(c);
+  if (bad == 0) {
+    printf("ATTN M1 SEED Q8 OK\n");
+  }
+}
+
 int main(void) {
   check_cpu_order();
   check_prim_rne16();
@@ -1449,6 +1544,7 @@ int main(void) {
   check_division_tie(pools[1]);
   check_errors(pools[1]);
   check_gemma(pools);
+  check_seed_q8(pools[2]);
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);
