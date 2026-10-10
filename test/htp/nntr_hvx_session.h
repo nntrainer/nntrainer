@@ -124,6 +124,9 @@ typedef struct {
   float *moe_res;       /**< mm_u8i4_moe_layer_norm_add's MoE output, before
                              the epilogue writes the call's out (heap) */
   uint32_t moe_res_n;   /**< floats moe_res holds */
+  uint16_t *attn_q16;   /**< attn_q2_step_fq's Q, converted to u16 by the
+                             pool before the kernel (heap), freed in close() */
+  uint32_t attn_q16_n;  /**< elements attn_q16 holds */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq

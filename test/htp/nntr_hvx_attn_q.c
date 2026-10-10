@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <AEEStdErr.h>
@@ -17,6 +18,7 @@
 #include <HAP_perf.h>
 #include <hexagon_protos.h>
 #include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
 #include <remote.h>
 
 #include "hexkl_acc_tile.h"
@@ -26,7 +28,9 @@
 #include "hexkl_kv_q.h"
 #include "hexkl_micro.h"
 #include "hvx_attn_decode_q.h"
+#include "hvx_convert.h"
 #include "hvx_softmax_q.h"
+#include "hvx_worker_pool.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -431,14 +435,85 @@ int nntr_hvx_probe_hvx_rate(remote_handle64 handle, uint32 n, uint32 *stats,
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
-                          const uint16 *k_rows, int k_rowsLen,
-                          const uint16 *v_rows, int v_rowsLen, uint32 n_q,
-                          uint32 cache_from, uint32 cache_to, uint32 n_head_q,
-                          uint32 window, const uint16 *q_u16, int q_u16Len,
-                          const float *q_enc, int q_encLen,
-                          const float *out_enc, int out_encLen, uint16 *out_u16,
-                          int out_u16Len, uint32 *stats_us, int stats_usLen) {
+typedef struct {
+  const float *x, *inv, *enc;
+  uint16_t *y;
+  uint32_t n_q, n_head, hd;
+  uint32_t bad; /**< NNTR_Q16_DIAG: lanes off the scalar reference */
+} q16_ctx;
+
+/* quant_u16_f32 (abs_max.h) over [n_q][n_head * hd], a row slice per lane:
+   x * inv[h] + (zp + 0.5), clamped to [0, 65535], truncated (Vw_equals_Vsf,
+   the numeric round-to-zero convert), 64 lanes a store. */
+static void q16_worker(uint32_t n_threads, uint32_t i, void *v) {
+  q16_ctx *c = (q16_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n_q * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n_q * (i + 1u)) / n_threads);
+  const uint32_t w = c->n_head * c->hd;
+  const HVX_Vector vlo = Q6_V_vzero(), vhi = hvx_splat_sf(65535.0f);
+#ifdef NNTR_Q16_DIAG
+  uint32_t bad = 0;
+#endif
+  /* Rows outer, heads inner: a lane walks its rows as whole 16 KiB lines
+     with the next row prefetched into L2, instead of 1 KiB head pieces at
+     a 16 KiB stride (head outer measured 1.6 ms a 1024-row layer, ~10 GB/s
+     from DDR). */
+  for (uint32_t r = lo; r < hi; ++r) {
+#if defined(__hexagon__)
+    if (r + 1u < hi) {
+      /* Rtt: [47:32] stride, [31:16] width, [15:0] height, bytes / lines */
+      Q6_l2fetch_AP((void *)(c->x + (size_t)(r + 1u) * w),
+                    ((uint64_t)(w * 4u) << 32) | ((uint64_t)(w * 4u) << 16) |
+                      1ull);
+    }
+#endif
+    for (uint32_t h = 0; h < c->n_head; ++h) {
+      const float inv = c->inv[h], zp05 = c->enc[2u * h + 1u] + 0.5f;
+      const HVX_Vector vinv = hvx_splat_sf(inv), vzp = hvx_splat_sf(zp05);
+      const float *x = c->x + (size_t)r * w + h * c->hd;
+      uint16_t *y = c->y + (size_t)r * w + h * c->hd;
+      for (uint32_t k = 0; k < c->hd; k += 64u) {
+        HVX_Vector a = Q6_Vsf_vadd_VsfVsf(
+          Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + k), vinv), vzp);
+        HVX_Vector b = Q6_Vsf_vadd_VsfVsf(
+          Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + k + 32u), vinv), vzp);
+        a = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(a, vlo), vhi);
+        b = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(b, vlo), vhi);
+        *(HVX_UVector *)(y + k) =
+          Q6_Vuh_vpack_VwVw_sat(Q6_Vw_equals_Vsf(b), Q6_Vw_equals_Vsf(a));
+#ifdef NNTR_Q16_DIAG
+        for (uint32_t j = 0; j < 64u; ++j) {
+          volatile float m = x[k + j] * inv;
+          float s = m + zp05;
+          s = s < 0.0f ? 0.0f : s > 65535.0f ? 65535.0f : s;
+          const uint16_t ref = (uint16_t)s;
+          if (ref != y[k + j]) {
+            if (bad++ == 0)
+              FARF(ALWAYS,
+                   "q16 diag: x=%a inv=%a zp05=%a x*inv=%a sum=%a ref=%u "
+                   "hvx=%u",
+                   (double)x[k + j], (double)inv, (double)zp05, (double)m,
+                   (double)(m + zp05), (unsigned)ref, (unsigned)y[k + j]);
+          }
+        }
+#endif
+      }
+    }
+  }
+#ifdef NNTR_Q16_DIAG
+  __atomic_fetch_add(&c->bad, bad, __ATOMIC_RELAXED);
+#endif
+}
+
+/* Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
+   converts), the lengths in elements. */
+static int attn_q2_step_impl(
+  remote_handle64 handle, uint32 kv_handle, uint32 row0, const uint16 *k_rows,
+  int k_rowsLen, const uint16 *v_rows, int v_rowsLen, uint32 n_q,
+  uint32 cache_from, uint32 cache_to, uint32 n_head_q, uint32 window,
+  const uint16 *q_u16, const float *q_f32, const float *q_inv, int qLen,
+  const float *q_enc, int q_encLen, const float *out_enc, int out_encLen,
+  uint16 *out_u16, int outLen, uint32 *stats_us, int stats_usLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
@@ -473,11 +548,34 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
   hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
                                 kv->n_head_kv, kv->head_dim, window,   0.0f};
   const uint64_t q_elems = (uint64_t)n_q * n_head_q * kv->head_dim;
-  if ((uint64_t)q_u16Len != q_elems || (uint64_t)out_u16Len != q_elems) {
+  if ((uint64_t)qLen != q_elems || (uint64_t)outLen != q_elems) {
     FARF(ERROR, "attn_q2_step: bad lengths");
     return AEE_EBADPARM;
   }
+  uint32_t q16_us = 0; /* the f32 entry's Q pass, stats[2] */
+  if (q_f32) {
+    if (s->attn_q16_n < q_elems) {
+      free(s->attn_q16);
+      s->attn_q16 = (uint16_t *)memalign(128, (size_t)q_elems * 2u);
+      s->attn_q16_n = s->attn_q16 ? (uint32_t)q_elems : 0u;
+      if (!s->attn_q16) {
+        FARF(ERROR, "attn_q2_step_fq: no heap for %u u16", (unsigned)q_elems);
+        return AEE_ENOMEMORY;
+      }
+    }
+    q16_ctx qc = {q_f32, q_inv,    q_enc,        s->attn_q16,
+                  n_q,   n_head_q, kv->head_dim, 0u};
+    const uint64_t tq = HAP_perf_get_time_us();
+    hvx_worker_pool_run(s->quant_pool, q16_worker, &qc, n_q);
+    q16_us = (uint32_t)(HAP_perf_get_time_us() - tq);
+#ifdef NNTR_Q16_DIAG
+    FARF(ALWAYS, "q16 diag: n_q=%u mismatches=%u of %u", (unsigned)n_q,
+         (unsigned)qc.bad, (unsigned)q_elems);
+#endif
+    q_u16 = s->attn_q16;
+  }
   hexkl_attn_q2_io io;
+  memset(&io, 0, sizeof(io));
   io.q = q_u16;
   io.q_stride = n_head_q * kv->head_dim;
   io.q_enc = q_enc;
@@ -495,7 +593,7 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
   const uint64_t t2 = HAP_perf_get_time_us();
   stats_us[0] = (uint32)(t1 - t0);
   stats_us[1] = (uint32)(t2 - t1);
-  stats_us[2] = 0u;
+  stats_us[2] = q16_us;
   stats_us[3] = (uint32)(t2 - t0);
   stats_us[4] = ast.quant_us;
   stats_us[5] = ast.stage_us;
@@ -508,6 +606,40 @@ int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
     stats_us[11] = (uint32)st.us_wait;
   }
   return AEE_SUCCESS;
+}
+
+int nntr_hvx_attn_q2_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
+                          const uint16 *k_rows, int k_rowsLen,
+                          const uint16 *v_rows, int v_rowsLen, uint32 n_q,
+                          uint32 cache_from, uint32 cache_to, uint32 n_head_q,
+                          uint32 window, const uint16 *q_u16, int q_u16Len,
+                          const float *q_enc, int q_encLen,
+                          const float *out_enc, int out_encLen, uint16 *out_u16,
+                          int out_u16Len, uint32 *stats_us, int stats_usLen) {
+  if (q_u16Len != out_u16Len) {
+    return AEE_EBADPARM;
+  }
+  return attn_q2_step_impl(
+    handle, kv_handle, row0, k_rows, k_rowsLen, v_rows, v_rowsLen, n_q,
+    cache_from, cache_to, n_head_q, window, q_u16, NULL, NULL, q_u16Len, q_enc,
+    q_encLen, out_enc, out_encLen, out_u16, out_u16Len, stats_us, stats_usLen);
+}
+
+int nntr_hvx_attn_q2_step_fq(
+  remote_handle64 handle, uint32 kv_handle, uint32 row0, const uint16 *k_rows,
+  int k_rowsLen, const uint16 *v_rows, int v_rowsLen, uint32 n_q,
+  uint32 cache_from, uint32 cache_to, uint32 n_head_q, uint32 window,
+  const float *q_f32, int q_f32Len, const float *q_inv, int q_invLen,
+  const float *q_enc, int q_encLen, const float *out_enc, int out_encLen,
+  uint16 *out_u16, int out_u16Len, uint32 *stats_us, int stats_usLen) {
+  if ((uint32)q_invLen != n_head_q || q_f32Len != out_u16Len) {
+    FARF(ERROR, "attn_q2_step_fq: bad q_inv or lengths");
+    return AEE_EBADPARM;
+  }
+  return attn_q2_step_impl(
+    handle, kv_handle, row0, k_rows, k_rowsLen, v_rows, v_rowsLen, n_q,
+    cache_from, cache_to, n_head_q, window, NULL, q_f32, q_inv, q_f32Len, q_enc,
+    q_encLen, out_enc, out_encLen, out_u16, out_u16Len, stats_us, stats_usLen);
 }
 
 int nntr_hvx_probe_wh_i8_pos(remote_handle64 handle, uint16 *pos, int posLen) {

@@ -145,6 +145,21 @@ public:
 };
 
 /**
+ * @brief AttnOutU16: the o-proj that consumes this layer's output runs on
+ *        the same accelerator as a block call (gemm_qs4cx_res_add_fp32), so
+ *        the quantized-cache attention may leave its u16 context there and
+ *        never write the f32 output tensor (ComputeOps::sdpa_q2_kvcache_f32).
+ *        The model builder sets it from the o-proj's engine; false (the
+ *        default) keeps the f32 output on the host.
+ */
+class AttnOutU16 final : public nntrainer::Property<bool> {
+public:
+  AttnOutU16(bool value = false) { set(value); }
+  static constexpr const char *key = "attn_out_u16";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief IsCausal property
  */
 class IsCausal : public nntrainer::Property<bool> {
@@ -351,7 +366,7 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal, props::KvCacheQuant>
+    props::IsCausal, props::KvCacheQuant, props::AttnOutU16>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -400,6 +415,7 @@ private:
    *        path for good: the CPU/fp16 result is always available.
    */
   int kv_cache_quant_kind = -1; /**< -1 off, 0 int8, 1 int4 */
+  bool attn_out_u16 = false;    /**< props::AttnOutU16 */
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;

@@ -803,6 +803,12 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
+  // The folded o-proj on the accelerator takes the attention's context from
+  // the accelerator's own buffer (mha_core's attn_out_u16); any other
+  // consumer needs the f32 tensor written.
+  if (fold_o_proj_ &&
+      engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
+    a_params.push_back(withKey("attn_out_u16", "true"));
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createAttentionCore(a_params));
   Tensor a = mha({q_scaled, k_normed, v_normed, cache_k, cache_v});

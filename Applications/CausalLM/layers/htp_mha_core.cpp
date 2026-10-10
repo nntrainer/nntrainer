@@ -124,7 +124,8 @@ MHACoreLayer::MHACoreLayer() :
     props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal(), props::KvCacheQuant()),
+    props::AttnLogitSoftcapping(), props::IsCausal(), props::KvCacheQuant(),
+    props::AttnOutU16()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -231,6 +232,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
+  attn_out_u16 = std::get<props::AttnOutU16>(mha_core_props).get();
   kv_cache_quant_kind = -1;
   if (!std::get<props::KvCacheQuant>(mha_core_props).empty()) {
     const std::string kind =
@@ -1300,12 +1302,76 @@ bool MHACoreLayer::try_quantized_attention(
       q2_out_u16.resize(q_elems);
     }
     ts5 = clk::now();
+    // No conversions on this thread when the o-proj is on the accelerator
+    // too (attn_out_u16): Q goes as the qkv call left it, the u16 context
+    // stays there for the o-proj. Else NEON on this thread below.
+    // NNTR_HTP_ATTN_F32=0 forces the NEON path; NNTR_HTP_ATTN_F32_CHECK=1
+    // runs both and compares the contexts (the u16 copied back, dequantized
+    // here), =2 runs the accelerator path twice (its own determinism).
+    static const bool f32_check = std::getenv("NNTR_HTP_ATTN_F32_CHECK");
+    static const int f32_check_mode =
+      f32_check ? std::atoi(std::getenv("NNTR_HTP_ATTN_F32_CHECK")) : 0;
+    static const bool f32_off = [] {
+      const char *v = std::getenv("NNTR_HTP_ATTN_F32");
+      return v != nullptr && std::strcmp(v, "0") == 0;
+    }();
+    std::vector<float> q_inv(num_heads_Q);
+    for (unsigned int h = 0; h < num_heads_Q; ++h)
+      q_inv[h] = 1.0f / q2_q_enc[2 * h];
+    std::vector<float> chk;
+    std::vector<uint16_t> chk16;
+    if (f32_check)
+      chk16.resize(q_elems);
+    const bool f32_ran =
+      attn_out_u16 && !f32_off &&
+      compute_ops_->sdpa_q2_kvcache_f32(
+        handle, append_row0, append_rows, width, k_base + off, v_base + off,
+        io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
+        cache_to, num_heads_Q, num_heads_KV, head_dim, window, io.out,
+        f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
+    bool again = false;
+    if (f32_ran && f32_check) {
+      // the first run's context in chk; mode 2 reruns into chk16 and the
+      // compare below is run vs run instead of accelerator vs NEON
+      chk.resize(q_elems);
+      for (unsigned int r = 0; r < n_q; ++r)
+        for (unsigned int h = 0; h < num_heads_Q; ++h)
+          causallm::dequant_u16_f32(
+            chk16.data() + static_cast<size_t>(r) * q_stride + h * head_dim,
+            head_dim, q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
+            chk.data() + static_cast<size_t>(r) * q_stride + h * head_dim);
+      again = f32_check_mode == 2 &&
+              compute_ops_->sdpa_q2_kvcache_f32(
+                handle, append_row0, append_rows, width, k_base + off,
+                v_base + off, io.q, q_inv.data(), q2_q_enc.data(), q_stride,
+                n_q, cache_from, cache_to, num_heads_Q, num_heads_KV, head_dim,
+                window, io.out, chk16.data(), q2_out_enc.data(), q_stride);
+      if (again)
+        for (unsigned int r = 0; r < n_q; ++r)
+          for (unsigned int h = 0; h < num_heads_Q; ++h)
+            causallm::dequant_u16_f32(
+              chk16.data() + static_cast<size_t>(r) * q_stride + h * head_dim,
+              head_dim, q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
+              io.out + static_cast<size_t>(r) * q_stride + h * head_dim);
+    }
+    if (f32_ran && !f32_check) {
+      // io.out is not written: the o-proj reads the context from the
+      // accelerator (the builder set attn_out_u16 only for that engine).
+      synced = cache_to;
+      if (!accel_logged_) {
+        accel_logged_ = true;
+        ml_logi("mha_core: attention over the int8 quantized KV cache on the "
+                "accelerator (row-blocked, fixed scales, u16 context handed "
+                "to the o-proj)");
+      }
+      return true;
+    }
     // Both conversions NEON on this thread: scalar they were 8-13 ms a
     // 1024-row layer (doc 59 section 2.2); NEON 1.0 / 1.1 ms, and split over
     // 4 or 8 compute threads slower (doc 57 section 9.23).
     static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
     const auto tq0 = std::chrono::steady_clock::now();
-    for (unsigned int r = 0; r < n_q; ++r) {
+    for (unsigned int r = 0; r < n_q && !again; ++r) {
       const float *qr = io.q + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
       for (unsigned int h = 0; h < num_heads_Q; ++h)
@@ -1314,7 +1380,8 @@ bool MHACoreLayer::try_quantized_attention(
                                 dst + h * head_dim);
     }
     const auto tq1 = std::chrono::steady_clock::now();
-    if (!compute_ops_->sdpa_q2_kvcache(
+    if (!again &&
+        !compute_ops_->sdpa_q2_kvcache(
           handle, append_row0, append_rows, width, k_base + off, v_base + off,
           q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
           num_heads_Q, num_heads_KV, head_dim, window, q2_out_u16.data(),
@@ -1322,7 +1389,7 @@ bool MHACoreLayer::try_quantized_attention(
       return fail("attention");
     }
     const auto tq2 = std::chrono::steady_clock::now();
-    for (unsigned int r = 0; r < n_q; ++r) {
+    for (unsigned int r = 0; r < n_q && !again; ++r) {
       const uint16_t *src =
         q2_out_u16.data() + static_cast<size_t>(r) * q_stride;
       float *dst = io.out + static_cast<size_t>(r) * q_stride;
@@ -1330,6 +1397,23 @@ bool MHACoreLayer::try_quantized_attention(
         causallm::dequant_u16_f32(src + h * head_dim, head_dim,
                                   q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
                                   dst + h * head_dim);
+    }
+    if (f32_check && !chk.empty()) {
+      size_t bad = 0, steps1 = 0;
+      double worst = 0.0;
+      for (size_t i = 0; i < q_elems; ++i) {
+        if (std::memcmp(&chk[i], &io.out[i], sizeof(float)) == 0)
+          continue;
+        ++bad;
+        const unsigned int h = (i % q_stride) / head_dim;
+        const double d =
+          std::fabs((double)chk[i] - io.out[i]) / q2_out_enc[2 * h];
+        worst = std::max(worst, d);
+        steps1 += d > 0.5;
+      }
+      ml_logi("mha_core f32 edge check: rows=%u from=%u mismatches=%zu of %zu "
+              "(>= one u16 step: %zu, worst %.4g steps)",
+              n_q, cache_from, bad, q_elems, steps1, worst);
     }
     if (conv_trace && n_q > 1) {
       const auto tq3 = std::chrono::steady_clock::now();
