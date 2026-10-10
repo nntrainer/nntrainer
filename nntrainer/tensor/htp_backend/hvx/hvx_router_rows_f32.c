@@ -18,6 +18,7 @@
 #include <hvx_hexagon_protos.h>
 
 #include "hvx_convert.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_softmax_f32.h"
 
 /** @brief f32 lanes per HVX vector at 128B. */
@@ -28,11 +29,14 @@
 #define KB 256u
 /** @brief Rows of x per pass: RB x EV_MAX accumulators, one w read each. */
 #define RB 4u
+/** @brief Rows whose norm scales a worker holds at once (the fused norm). */
+#define SEG 256u
 
 typedef struct {
-  const float *x, *w;
+  const float *x, *w, *gamma;
   float *logits;
   uint32_t M, K, E;
+  float eps;
 } rows_ctx;
 
 /* One (rows, logit-vectors) block over w rows [k0, k1): NR x EV
@@ -48,7 +52,7 @@ typedef struct {
  * section 9.21). The sf ops agree with the CPU dot to 2.3e-5 on device. */
 #define ROUTER_ROWS_BLOCK(EV, NR)                                              \
   static void rows_block_##EV##x##NR(const float *x, const float *w,           \
-                                     float *logits, uint32_t K, uint32_t E,    \
+                                     float *logits, uint32_t ld, uint32_t E,   \
                                      uint32_t k0, uint32_t k1) {               \
     const HVX_Vector zero = Q6_V_vzero();                                      \
     HVX_Vector acc[NR][EV];                                                    \
@@ -63,7 +67,7 @@ typedef struct {
       for (uint32_t e = 0; e < (EV); ++e)                                      \
         wv[e] = wk[e];                                                         \
       for (uint32_t r = 0; r < (NR); ++r) {                                    \
-        const HVX_Vector xs = hvx_splat_sf(x[(size_t)r * K + k]);              \
+        const HVX_Vector xs = hvx_splat_sf(x[(size_t)r * ld + (k - k0)]);      \
         for (uint32_t e = 0; e < (EV); ++e)                                    \
           acc[r][e] =                                                          \
             Q6_Vsf_vadd_VsfVsf(acc[r][e], Q6_Vsf_vmpy_VsfVsf(xs, wv[e]));      \
@@ -97,32 +101,66 @@ static const rows_block_fn kRowsBlock[EV_MAX][RB] = {
   {rows_block_4x1, rows_block_4x2, rows_block_4x3, rows_block_4x4},
 };
 
+/* With gamma, each RB x KB block of x is normalized into a 4 KiB scratch
+ * just before its dots -- hvx_rmsnorm_row_f32's two IEEE multiplies,
+ * (x * rs) * gamma, on the same lanes, so the same floats -- instead of the
+ * whole M x K normalized copy a separate norm pass writes and this reads
+ * back (2 x 11.5 MB at a 1024-row prefill). */
 static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const rows_ctx *c = (const rows_ctx *)v;
   const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
   const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
   const uint32_t ev = c->E / LANES;
-  for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
-    const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
-    for (uint32_t r0 = lo; r0 < hi; r0 += RB) {
-      const uint32_t nr = r0 + RB < hi ? RB : hi - r0;
-      kRowsBlock[ev - 1u][nr - 1u](c->x + (size_t)r0 * c->K, c->w,
-                                   c->logits + (size_t)r0 * c->E, c->K, c->E,
-                                   k0, k1);
+  float rs[SEG];
+  float nx[RB * KB] __attribute__((aligned(128)));
+  for (uint32_t s0 = lo; s0 < hi; s0 += SEG) {
+    const uint32_t s1 = s0 + SEG < hi ? s0 + SEG : hi;
+    if (c->gamma) {
+      for (uint32_t r = s0; r < s1; ++r)
+        rs[r - s0] = hvx_rmsnorm_rs_f32(c->x + (size_t)r * c->K, c->K, c->eps);
+    }
+    for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
+      const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
+      for (uint32_t r0 = s0; r0 < s1; r0 += RB) {
+        const uint32_t nr = r0 + RB < s1 ? RB : s1 - r0;
+        const float *xb = c->x + (size_t)r0 * c->K + k0;
+        uint32_t ld = c->K;
+        if (c->gamma) {
+          const HVX_UVector *vg = (const HVX_UVector *)(c->gamma + k0);
+          for (uint32_t r = 0; r < nr; ++r) {
+            const HVX_UVector *vx =
+              (const HVX_UVector *)(xb + (size_t)r * c->K);
+            HVX_Vector *vy = (HVX_Vector *)(nx + (size_t)r * KB);
+            const HVX_Vector vr = hvx_splat_sf(rs[r0 + r - s0]);
+            for (uint32_t j = 0; j < (k1 - k0) / LANES; ++j)
+              vy[j] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[j], vr), vg[j]);
+          }
+          xb = nx;
+          ld = KB;
+        }
+        kRowsBlock[ev - 1u][nr - 1u](xb, c->w, c->logits + (size_t)r0 * c->E,
+                                     ld, c->E, k0, k1);
+      }
     }
   }
+}
+
+int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
+                             const float *w, float *logits, uint32_t M,
+                             uint32_t K, uint32_t E, hvx_worker_pool *pool) {
+  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % LANES != 0u ||
+      E > EV_MAX * LANES || (gamma && K % LANES != 0u)) {
+    return -1;
+  }
+  rows_ctx c = {x, w, gamma, logits, M, K, E, eps};
+  hvx_worker_pool_run(pool, rows_worker, &c, M);
+  return 0;
 }
 
 int hvx_router_rows_f32(const float *x, const float *w, float *logits,
                         uint32_t M, uint32_t K, uint32_t E,
                         hvx_worker_pool *pool) {
-  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % LANES != 0u ||
-      E > EV_MAX * LANES) {
-    return -1;
-  }
-  rows_ctx c = {x, w, logits, M, K, E};
-  hvx_worker_pool_run(pool, rows_worker, &c, M);
-  return 0;
+  return hvx_router_rows_norm_f32(x, NULL, 0.0f, w, logits, M, K, E, pool);
 }
 
 typedef struct {

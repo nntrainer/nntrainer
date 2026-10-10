@@ -42,6 +42,16 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
                         hvx_worker_pool *pool);
 
 /**
+ * @brief hvx_router_rows_f32 over the RMSNorm of x: the logits of
+ *        hvx_rmsnorm_rows_f32(x, gamma, eps) with chunk = K, bit for bit,
+ *        without writing that M x K copy. gamma NULL = no norm.
+ * @param K a multiple of 32 when gamma is given
+ */
+int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
+                             const float *w, float *logits, uint32_t M,
+                             uint32_t K, uint32_t E, hvx_worker_pool *pool);
+
+/**
  * @brief The softmax router's selection over M rows of logits, in place:
  *        p = softmax(logits row) (hvx_softmax_rows_f32), the n_sel largest
  *        p in descending order with an exact tie going to the lower index

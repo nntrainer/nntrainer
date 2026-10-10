@@ -46,11 +46,9 @@ static inline float lanes_sum(HVX_Vector v) {
   return f;
 }
 
-static void norm_chunk(const float *x, float *y, const float *gamma,
-                       uint32_t chunk, float eps) {
+static inline float norm_rs(const float *x, uint32_t chunk, float eps) {
   const uint32_t nvec = chunk / LANES;
   const HVX_UVector *vx = (const HVX_UVector *)x;
-  HVX_UVector *vy = (HVX_UVector *)y;
   /* Sum of squares: per-lane accumulation in qf32 (one rounding per
      multiply-add), the lanes summed once at the end. */
   HVX_Vector acc = Q6_V_vzero();
@@ -58,8 +56,19 @@ static void norm_chunk(const float *x, float *y, const float *gamma,
     acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(vx[i], vx[i]));
   }
   const float ss = lanes_sum(Q6_Vsf_equals_Vqf32(acc));
-  const float rs = 1.0f / sqrtf(ss / (float)chunk + eps);
-  const HVX_Vector r = hvx_splat_sf(rs);
+  return 1.0f / sqrtf(ss / (float)chunk + eps);
+}
+
+float hvx_rmsnorm_rs_f32(const float *x, uint32_t n, float eps) {
+  return norm_rs(x, n, eps);
+}
+
+static void norm_chunk(const float *x, float *y, const float *gamma,
+                       uint32_t chunk, float eps) {
+  const uint32_t nvec = chunk / LANES;
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  HVX_UVector *vy = (HVX_UVector *)y;
+  const HVX_Vector r = hvx_splat_sf(norm_rs(x, chunk, eps));
   if (gamma) {
     const HVX_UVector *vg = (const HVX_UVector *)gamma;
     for (uint32_t i = 0; i < nvec; ++i) {

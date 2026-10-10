@@ -11,6 +11,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_router_rows_f32.h"
 
 #include <math.h>
@@ -137,6 +138,33 @@ static int run_topk(uint32_t M, uint32_t E, uint32_t top_k, uint32_t n_sel,
   return bad_sel != 0 || worst > 1e-5;
 }
 
+/* The fused norm against the two passes it replaces (hvx_rmsnorm_rows_f32
+   then hvx_router_rows_f32), bit for bit; x has a few outliers, the way
+   Gemma-4's activations do. */
+static int run_norm(uint32_t M, uint32_t K, uint32_t E) {
+  float *x = malloc(sizeof(float) * M * K), *n = malloc(sizeof(float) * M * K);
+  float *w = malloc(sizeof(float) * K * E), *g = malloc(sizeof(float) * K);
+  float *y1 = malloc(sizeof(float) * M * E),
+        *y2 = malloc(sizeof(float) * M * E);
+  unsigned seed = 11u + M + K + E;
+  for (uint32_t i = 0; i < M * K; ++i)
+    x[i] = frand(&seed) * ((i % 97u) == 5u ? 300.0f : 2.0f);
+  for (uint32_t i = 0; i < K * E; ++i)
+    w[i] = frand(&seed) * 0.05f;
+  for (uint32_t i = 0; i < K; ++i)
+    g[i] = 1.0f + frand(&seed) * 0.5f;
+  const float eps = 1e-6f;
+  const int r0 = hvx_rmsnorm_rows_f32(x, n, M, K, K, g, eps, NULL);
+  const int r1 = hvx_router_rows_f32(n, w, y1, M, K, E, NULL);
+  const int r2 = hvx_router_rows_norm_f32(x, g, eps, w, y2, M, K, E, NULL);
+  const int same =
+    r0 == 0 && r1 == 0 && r2 == 0 && memcmp(y1, y2, sizeof(float) * M * E) == 0;
+  printf("router rows fused norm M=%u K=%u E=%u: rc=%d/%d/%d %s\n", M, K, E, r0,
+         r1, r2, same ? "bit-identical" : "DIFFERENT");
+  free(x), free(n), free(w), free(g), free(y1), free(y2);
+  return !same;
+}
+
 int main(void) {
   int fail = 0;
   const double tol = 2e-6; /* f32 partial sums every 256 of 2816 terms */
@@ -144,6 +172,9 @@ int main(void) {
   fail |= run(5, 2048, 32) > tol;  /* the sigmoid router's width */
   fail |= run(9, 300, 64) > tol;   /* K not a multiple of the chunk */
   fail |= run(1, 256, 128) > tol;  /* one row, one chunk */
+  fail |= run_norm(900, 320, 128); /* 300 rows a lane: two segments */
+  fail |= run_norm(7, 2816, 128);  /* the Gemma-4 router */
+  fail |= run_norm(5, 2048, 32);
   /* the softmax router's selection: top-8 plus the 5 prefetch hints */
   fail |= run_topk(7, 128, 8, 13, 0);
   fail |= run_topk(5, 128, 8, 8, 1); /* integer logits: exact ties */

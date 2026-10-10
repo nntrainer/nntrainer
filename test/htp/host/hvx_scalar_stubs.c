@@ -315,6 +315,32 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
   return 0;
 }
 
+/* The fused-norm router entry: the scalar RMSNorm (hvx_rmsnorm_row_f32's
+   formula), then the dots above. */
+int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
+                             const float *w, float *logits, uint32_t M,
+                             uint32_t K, uint32_t E, hvx_worker_pool *pool) {
+  if (!gamma)
+    return hvx_router_rows_f32(x, w, logits, M, K, E, pool);
+  if (!x || M == 0u || K == 0u || K % 32u != 0u)
+    return -1;
+  float *n = (float *)malloc(sizeof(float) * (size_t)M * K);
+  if (!n)
+    return -1;
+  for (uint32_t r = 0; r < M; ++r) {
+    const float *xr = x + (size_t)r * K;
+    float ss = 0.0f;
+    for (uint32_t k = 0; k < K; ++k)
+      ss += xr[k] * xr[k];
+    const float rs = 1.0f / sqrtf(ss / (float)K + eps);
+    for (uint32_t k = 0; k < K; ++k)
+      n[(size_t)r * K + k] = xr[k] * rs * gamma[k];
+  }
+  const int rc = hvx_router_rows_f32(n, w, logits, M, K, E, pool);
+  free(n);
+  return rc;
+}
+
 /* The router's selection (hvx_router_topk_rows_f32): plain f32 softmax
    and the same first-maximum scan; the HVX softmax is
    router_rows_host_check's. */

@@ -49,6 +49,11 @@ int hvx_rmsnorm_rows_ld_f32(const float *x, float *y, uint32_t M, uint32_t n,
 void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
                          uint32_t n, float eps);
 
+/** @brief The scale one row of hvx_rmsnorm_row_f32 multiplies by,
+ *         1 / sqrt(mean(x^2) + eps): the same arithmetic, so the same float.
+ *         The fused consumers (the router logits) apply it themselves. */
+float hvx_rmsnorm_rs_f32(const float *x, uint32_t n, float eps);
+
 /**
  * @brief The decoder block's epilogue, streamed: out[r][j] = scale *
  *        (out[r][j] + (x[r][j] + x2[r][j]) * rs(r) * gamma[j]), with rs the
