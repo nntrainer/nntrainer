@@ -117,6 +117,12 @@ inline void min_max_f32(const float *x, unsigned int n, float &lo, float &hi) {
  *  path's Q quantization (truncation after the + 0.5 rounds to nearest). */
 inline void quant_u16_f32(const float *src, unsigned int n, float inv, float zp,
                           uint16_t *dst) {
+  // x * inv + (zp + 0.5) as two roundings, the formula below and the DSP's
+  // (nntr_hvx_attn_q.c q16_worker): the app builds with -ffast-math, whose
+  // fused multiply-add lands a step off on ~0.01% of the lanes.
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
   unsigned int i = 0;
 #if defined(__aarch64__)
   const float32x4_t vinv = vdupq_n_f32(inv), vzp = vdupq_n_f32(zp + 0.5f);
