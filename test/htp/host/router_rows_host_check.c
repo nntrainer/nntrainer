@@ -156,9 +156,16 @@ static int run_norm(uint32_t M, uint32_t K, uint32_t E) {
   const float eps = 1e-6f;
   const int r0 = hvx_rmsnorm_rows_f32(x, n, M, K, K, g, eps, NULL);
   const int r1 = hvx_router_rows_f32(n, w, y1, M, K, E, NULL);
-  const int r2 = hvx_router_rows_norm_f32(x, g, eps, w, y2, M, K, E, NULL);
-  const int same =
-    r0 == 0 && r1 == 0 && r2 == 0 && memcmp(y1, y2, sizeof(float) * M * E) == 0;
+  const int r2 =
+    hvx_router_rows_norm_f32(x, g, eps, w, NULL, y2, M, K, E, NULL);
+  /* and with w staged first (the VTCM copy of the skel entry) */
+  float *st = malloc(sizeof(float) * K * E),
+        *y3 = malloc(sizeof(float) * M * E);
+  const int r3 = hvx_router_rows_norm_f32(x, g, eps, w, st, y3, M, K, E, NULL);
+  const int same = r0 == 0 && r1 == 0 && r2 == 0 && r3 == 0 &&
+                   memcmp(y1, y2, sizeof(float) * M * E) == 0 &&
+                   memcmp(y1, y3, sizeof(float) * M * E) == 0;
+  free(st), free(y3);
   printf("router rows fused norm M=%u K=%u E=%u: rc=%d/%d/%d %s\n", M, K, E, r0,
          r1, r2, same ? "bit-identical" : "DIFFERENT");
   free(x), free(n), free(w), free(g), free(y1), free(y2);

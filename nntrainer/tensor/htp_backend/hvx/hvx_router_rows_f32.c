@@ -145,12 +145,32 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+typedef struct {
+  const float *src;
+  float *dst;
+  uint32_t n; /**< vectors */
+} wcopy_ctx;
+
+static void wcopy_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const wcopy_ctx *c = (const wcopy_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n * (i + 1u)) / n_threads);
+  for (uint32_t j = lo; j < hi; ++j)
+    ((HVX_UVector *)c->dst)[j] = ((const HVX_UVector *)c->src)[j];
+}
+
 int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
-                             const float *w, float *logits, uint32_t M,
-                             uint32_t K, uint32_t E, hvx_worker_pool *pool) {
+                             const float *w, float *w_stage, float *logits,
+                             uint32_t M, uint32_t K, uint32_t E,
+                             hvx_worker_pool *pool) {
   if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % LANES != 0u ||
       E > EV_MAX * LANES || (gamma && K % LANES != 0u)) {
     return -1;
+  }
+  if (w_stage) { /* K x E, E a multiple of 32: whole vectors */
+    wcopy_ctx wc = {w, w_stage, K * E / LANES};
+    hvx_worker_pool_run(pool, wcopy_worker, &wc, wc.n);
+    w = w_stage;
   }
   rows_ctx c = {x, w, gamma, logits, M, K, E, eps};
   hvx_worker_pool_run(pool, rows_worker, &c, M);
@@ -160,7 +180,8 @@ int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
 int hvx_router_rows_f32(const float *x, const float *w, float *logits,
                         uint32_t M, uint32_t K, uint32_t E,
                         hvx_worker_pool *pool) {
-  return hvx_router_rows_norm_f32(x, NULL, 0.0f, w, logits, M, K, E, pool);
+  return hvx_router_rows_norm_f32(x, NULL, 0.0f, w, NULL, logits, M, K, E,
+                                  pool);
 }
 
 typedef struct {

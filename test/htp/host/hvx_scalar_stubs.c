@@ -318,8 +318,10 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
 /* The fused-norm router entry: the scalar RMSNorm (hvx_rmsnorm_row_f32's
    formula), then the dots above. */
 int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
-                             const float *w, float *logits, uint32_t M,
-                             uint32_t K, uint32_t E, hvx_worker_pool *pool) {
+                             const float *w, float *w_stage, float *logits,
+                             uint32_t M, uint32_t K, uint32_t E,
+                             hvx_worker_pool *pool) {
+  (void)w_stage;
   if (!gamma)
     return hvx_router_rows_f32(x, w, logits, M, K, E, pool);
   if (!x || M == 0u || K == 0u || K % 32u != 0u)

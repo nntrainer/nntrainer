@@ -16,8 +16,6 @@
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
 #include <HAP_perf.h>
-#include <hexagon_types.h>
-#include <hvx_hexagon_protos.h>
 #include <remote.h>
 
 #include "hexkl_conv_block.h"
@@ -1574,20 +1572,6 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
     s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
 }
 
-typedef struct {
-  const HVX_Vector *src;
-  HVX_Vector *dst;
-  uint32_t n;
-} vcopy_ctx;
-
-static void vcopy_worker(uint32_t n_threads, uint32_t i, void *v) {
-  const vcopy_ctx *c = (const vcopy_ctx *)v;
-  const uint32_t lo = (uint32_t)(((uint64_t)c->n * i) / n_threads);
-  const uint32_t hi = (uint32_t)(((uint64_t)c->n * (i + 1u)) / n_threads);
-  for (uint32_t j = lo; j < hi; ++j)
-    c->dst[j] = ((const HVX_UVector *)c->src)[j];
-}
-
 int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
                                uint32 E, float eps, const float *gamma,
                                int gammaLen, const float *w, int wLen,
@@ -1620,20 +1604,13 @@ int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
          (unsigned)top_k, (unsigned)n_sel, scaleLen, selLen, weightLen);
     return AEE_EINVALIDFORMAT;
   }
-  /* w (K x E f32, 1.44 MB on Gemma-4) read from VTCM: every 4-row block of
-     every worker reads all of it, ~370 MB a 1024-row call, which from L2
-     held the logits at 5.1 ms against ~1.4 of arithmetic (S26 Ultra). The
-     same floats, so the same logits. */
+  /* the norm rides in the logits kernel, block by block (no M x K copy),
+     and w is read from VTCM */
   const size_t w_bytes = (size_t)K * E * sizeof(float);
-  if (s->vtcm_base && w_bytes <= s->vtcm_size && w_bytes % 128u == 0u) {
-    vcopy_ctx vc = {(const HVX_Vector *)w, (HVX_Vector *)s->vtcm_base,
-                    (uint32_t)(w_bytes / 128u)};
-    hvx_worker_pool_run(s->quant_pool, vcopy_worker, &vc, vc.n);
-    w = (const float *)s->vtcm_base;
-  }
-  /* the norm rides in the logits kernel, block by block (no M x K copy) */
-  if (hvx_router_rows_norm_f32(x, gammaLen ? gamma : NULL, eps, w, logits, M, K,
-                               E, s->quant_pool) != 0) {
+  float *w_stage =
+    s->vtcm_base && w_bytes <= s->vtcm_size ? (float *)s->vtcm_base : NULL;
+  if (hvx_router_rows_norm_f32(x, gammaLen ? gamma : NULL, eps, w, w_stage,
+                               logits, M, K, E, s->quant_pool) != 0) {
     return AEE_EINVALIDFORMAT;
   }
   if (top_k != 0u &&

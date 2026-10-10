@@ -45,11 +45,17 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
  * @brief hvx_router_rows_f32 over the RMSNorm of x: the logits of
  *        hvx_rmsnorm_rows_f32(x, gamma, eps) with chunk = K, bit for bit,
  *        without writing that M x K copy. gamma NULL = no norm.
- * @param K a multiple of 32 when gamma is given
+ * @param K       a multiple of 32 when gamma is given
+ * @param w_stage K x E floats of VTCM w is copied into first (the pool)
+ *                and read from, or NULL: every 4-row block of every worker
+ *                reads all of w, ~370 MB a 1024-row Gemma-4 call, which
+ *                from L2 held the logits at 5.1 ms against ~1.4 of
+ *                arithmetic (S26 Ultra). The same floats either way.
  */
 int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
-                             const float *w, float *logits, uint32_t M,
-                             uint32_t K, uint32_t E, hvx_worker_pool *pool);
+                             const float *w, float *w_stage, float *logits,
+                             uint32_t M, uint32_t K, uint32_t E,
+                             hvx_worker_pool *pool);
 
 /**
  * @brief The softmax router's selection over M rows of logits, in place:
