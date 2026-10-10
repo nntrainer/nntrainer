@@ -870,6 +870,16 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
 
 static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
 
+/** @brief Floats hexkl_mm_opts.pre_scratch needs: four rows of K a lane
+ *  (hvx_quant_params_pack_u8_ah), not the M x K the whole-copy norm takes
+ *  -- 23 MB of DSP heap at 2048 x 2816 against 0.4. */
+static size_t pre_scratch_floats(const nntr_hvx_session *s, uint32_t M,
+                                 uint32_t K) {
+  const size_t rows =
+    ((size_t)hvx_worker_pool_workers(s->quant_pool) + 1u) * 4u;
+  return (rows < M ? rows : (size_t)M) * K;
+}
+
 /* Both res_add entries: the activation f32, or u16 with act_enc / act_hd
    (dequantized inside the quant pass through the norm_rows scratch). */
 static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
@@ -903,9 +913,7 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
   }
   hexkl_mm_opts opts = {.pool = s->quant_pool};
   if (act_u16) {
-    /* hvx_quant_params_pack_u8_ah dequantizes 4 rows a worker into the
-       scratch; M x K is what the norm entries reserve, and plenty. */
-    if (!norm_rows_reserve(s, (size_t)M * K)) {
+    if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
       return AEE_ENOMEMORY;
     }
     opts.pre_scratch = s->norm_rows;
@@ -1067,7 +1075,7 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
   hexkl_mm_opts opts = {
     .pool = s->quant_pool, .out_off = out_off, .out_ld = out_ld};
   if (pre_gammaLen != 0) {
-    if (!norm_rows_reserve(s, (size_t)M * K)) {
+    if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
       return AEE_ENOMEMORY;
     }
     opts.pre_scratch = s->norm_rows;
