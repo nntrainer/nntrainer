@@ -1022,8 +1022,22 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
                            const float *act_f32, int act_f32Len, float *out_cat,
                            int out_catLen, const uint32 *out_off,
                            const uint32 *out_ld) {
+  /* With out_off / out_ld the rows land inside out_cat wherever the caller
+     says (the _ld entry checked every handle's rectangle), and out_cat may
+     be longer than this call's M rows: a row chunk of a bigger tensor
+     writes into the whole tensor's buffer. */
+  int out_need = out_catLen;
+  if (out_off && s) {
+    uint32_t n_all = 0;
+    for (int j = 0; j < w_handlesLen; ++j)
+      n_all += s->weights_u8i4.slots[w_handles[j]].N;
+    if ((uint64_t)M * n_all > (uint64_t)(uint32_t)out_catLen) {
+      return AEE_EBADPARM;
+    }
+    out_need = (int)(M * n_all);
+  }
   int rc =
-    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
+    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_need);
   if (rc != AEE_SUCCESS) {
     return rc;
   }

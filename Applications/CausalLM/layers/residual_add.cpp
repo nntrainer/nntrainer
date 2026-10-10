@@ -32,6 +32,7 @@ void ResidualAddLayer::finalize(nntrainer::InitLayerContext &context) {
   in_norm = std::get<props::InNorm>(props_).get();
   use_scale = std::get<props::UseWeight>(props_).get();
   proj = std::get<props::Proj>(props_).get();
+  out_to_host = std::get<props::OutToHost>(props_).get();
   NNTR_THROW_IF(proj && n_in != 2, std::invalid_argument)
     << "ResidualAddLayer: proj takes (residual, the projection's input)";
   if (!std::get<nntrainer::props::SkipPrefill>(props_).empty())
@@ -149,7 +150,7 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
           ops->gemm_qs4cx_res_add_fp32(
             w.getData<char>(), w.getScale<float>(), in1_step.getData<float>(),
             rows, in1_step.width(), W, in0_step.getData<float>(), gamma, eps,
-            scale, out_step.getData<float>()))
+            scale, out_step.getData<float>(), out_to_host))
         continue;
       in1_step = step(context.getTensor(sum_idx), b);
       step(in1, b).dot(w, in1_step, false, false);

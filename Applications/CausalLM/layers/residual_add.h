@@ -82,10 +82,12 @@ private:
            unsigned int to);
 
   std::tuple<props::InNorm, props::UseWeight, props::Proj,
-             nntrainer::props::Epsilon, nntrainer::props::SkipPrefill>
+             nntrainer::props::Epsilon, nntrainer::props::SkipPrefill,
+             props::OutToHost>
     props_;
   unsigned int proj_idx = 0; /**< proj: the projection's weight */
   bool proj = false;
+  bool out_to_host = true; /**< props::OutToHost */
   unsigned int gamma_idx = 0;
   unsigned int scale_idx = 0;
   unsigned int sum_idx = 0; /**< the CPU path's summed, normed addend */

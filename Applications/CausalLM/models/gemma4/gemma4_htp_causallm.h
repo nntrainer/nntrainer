@@ -126,6 +126,10 @@ private:
    *  o-proj to the post-attention residual_add (proj, doc 57 section 9.32);
    *  set by the block around its one call. */
   bool fold_o_proj_ = false;
+  /** The block's dense branch and its MoE layer's output stay on the
+   *  accelerator at prefill (their layers' out_to_host false): set by the
+   *  block before it builds them. */
+  bool keep_dense_out_ = false, keep_moe_out_ = false;
 
 public:
   Tensor createTransformerDecoderBlock(const int layer_id,

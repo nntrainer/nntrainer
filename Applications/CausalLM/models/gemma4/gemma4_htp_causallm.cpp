@@ -438,6 +438,28 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     post_attn_props.push_back(withKey("proj", "true"));
     post_attn_props.push_back(withKey("weight_dtype", FC_LAYER_DTYPE));
   }
+  // The block's three intermediate tensors go from one accelerator call to
+  // the next when the dense FFN, the MoE layer (with the epilogue folded
+  // into it) and the attention projections all run on the HTP: their calls
+  // keep them there instead of copying 11.5 MB a 1024-row tensor to the
+  // host and back (out_to_host). The last layer's output goes to the CPU's
+  // output norm.
+  const bool block_on_htp =
+    ENABLE_MOE_BLOCK && HIDDEN_SIZE_PER_LAYER_INPUT == 0 &&
+    !is_kv_shared_layer && o_folded &&
+    engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp" &&
+    engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id) == "htp" &&
+    (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) &&
+    MOE_ENGINE == "htp";
+  if (block_on_htp)
+    post_attn_props.push_back(withKey("out_to_host", "false"));
+  keep_dense_out_ = block_on_htp;
+  // ... and the layer's own output when the next layer's qkv and o-proj
+  // calls are the readers
+  keep_moe_out_ =
+    block_on_htp && layer_id + 1 < NUM_LAYERS &&
+    !isKVSharedLayer(layer_id + 1) &&
+    engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id + 1) == "htp";
   appendSkipPrefillIfNeeded(post_attn_props, is_kv_shared_layer);
   LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
   Tensor post_attention = post_attention_add({input, att_out});
@@ -590,6 +612,8 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
     withKey("engine", engine)};
   if (MOE_CACHE_EXPERTS != 0)
     props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
+  if (keep_moe_out_ && dense_out)
+    props.push_back(withKey("out_to_host", "false"));
   appendSkipPrefillIfNeeded(props, isKVSharedLayer(layer_id));
   LayerHandle moe(createLayer("lfm2_moe", props));
   if (dense_out)
@@ -768,6 +792,13 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   if (ATTENTION_K_EQ_V && !is_sliding)
     qkv_params.push_back(withKey("v_from_k", "true"));
+  // q, k and v go to the attention core alone: on the same accelerator it
+  // reads them where the projection call left them (host_view), so that
+  // call keeps them (33.5 MB a 1024-row sliding layer not copied out)
+  // (a KV-shared layer reads another layer's k and v: not with those)
+  if (ATTENTION_ENGINE == "htp" && NUM_KV_SHARED_LAYERS == 0 &&
+      engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
+    qkv_params.push_back(withKey("out_to_host", "false"));
   appendSkipPrefillIfNeeded(qkv_params, is_kv_shared_layer);
   LayerHandle qkv(createLayer("qkv_layer", qkv_params));
   Tensor qkv_out = qkv(query);
@@ -853,6 +884,7 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
        withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
        withKey("epsilon", std::to_string(NORM_EPS)),
        withKey("weight_dtype", FC_LAYER_DTYPE),
+       withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
        withKey("engine", ffn_engine)}));
     return ffn(input);
   }

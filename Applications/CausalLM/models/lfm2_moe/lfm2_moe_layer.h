@@ -153,7 +153,8 @@ private:
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation, props::RouterType,
              props::CacheExperts, props::InNorm, props::RouterNorm,
-             props::OutNorm, props::OutAdd, nntrainer::props::Epsilon>
+             props::OutNorm, props::OutAdd, nntrainer::props::Epsilon,
+             props::OutToHost>
     moe_props;
   /** The block's norms folded into this layer (doc 57 section 5 step 4):
    *  in_norm norms the input for the experts, router_norm norms it again
@@ -166,6 +167,7 @@ private:
    *  block scalar, and whether the epilogue is on. */
   unsigned int add_gamma_idx = 0, add_scale_idx = 0;
   bool out_add = false;
+  bool out_to_host = true; /**< props::OutToHost */
   /** @brief out = scalar * (raw + rmsnorm(out + x2) * gamma) on the CPU,
    *  @a scratch a tensor of out's shape. */
   void addEpilogue(nntrainer::RunLayerContext &context,

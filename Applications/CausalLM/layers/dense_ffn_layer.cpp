@@ -32,7 +32,7 @@ DenseFfnLayer::DenseFfnLayer() :
   LayerImpl(),
   dense_props(nntrainer::props::Unit(), props::GluActivation(),
               props::GateFirst(), props::InNorm(), props::OutNorm(),
-              nntrainer::props::Epsilon()) {
+              nntrainer::props::Epsilon(), props::OutToHost()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -63,6 +63,7 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   const bool gate_first = std::get<props::GateFirst>(dense_props).get();
   in_norm = std::get<props::InNorm>(dense_props).get();
   out_norm = std::get<props::OutNorm>(dense_props).get();
+  out_to_host = std::get<props::OutToHost>(dense_props).get();
 
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
@@ -215,7 +216,7 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       gelu, in_gamma, out_gamma, epsilon,
       scaled ? up_w.getScale<float>() : nullptr,
       scaled ? gate_w.getScale<float>() : nullptr,
-      scaled ? down_w.getScale<float>() : nullptr);
+      scaled ? down_w.getScale<float>() : nullptr, out_to_host || rows == 1);
     return;
   }
 

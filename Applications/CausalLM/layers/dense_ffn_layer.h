@@ -94,10 +94,12 @@ private:
   /** unit = the intermediate size (the width of up and gate); activation
    *  swish (default) or tanh_gelu; gate_first for the file's weight order */
   std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst,
-             props::InNorm, props::OutNorm, nntrainer::props::Epsilon>
+             props::InNorm, props::OutNorm, nntrainer::props::Epsilon,
+             props::OutToHost>
     dense_props;
   bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
   bool in_norm = false, out_norm = false;
+  bool out_to_host = true; /**< props::OutToHost */
   std::array<unsigned int, 5>
     weight_idx; /**< up, gate, down, [in_gamma, out_gamma] */
   std::array<unsigned int, 4>

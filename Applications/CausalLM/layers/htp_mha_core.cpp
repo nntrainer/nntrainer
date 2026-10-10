@@ -1191,6 +1191,12 @@ bool MHACoreLayer::try_quantized_attention(
   if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
   }
+  // Q for this thread's own reads (the calibration, the ARM conversion):
+  // where the engine has it when the projection call kept its rows
+  // (qkv_layer's out_to_host false). The engine's calls take io.q.
+  const float *q_view = static_cast<const float *>(
+    compute_ops_->host_view(io.q, static_cast<size_t>(cache_to - cache_from) *
+                                    num_heads_Q * head_dim * sizeof(float)));
   const auto ts1 = clk::now();
   clk::time_point ts2 = ts1, ts3 = ts1, ts4 = ts1, ts5 = ts1;
   const uint16_t *k_base = nullptr;
@@ -1273,8 +1279,8 @@ bool MHACoreLayer::try_quantized_attention(
     if (!q2_calibrated) {
       // The rows about to be appended are the first this layer sees.
       const auto t0 = std::chrono::steady_clock::now();
-      calibrate_q2_scales(k_base + off, v_base + off, append_rows, width, io.q,
-                          q_stride, n_q);
+      calibrate_q2_scales(k_base + off, v_base + off, append_rows, width,
+                          q_view, q_stride, n_q);
       if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
         ml_logi("mha_core trace: q2 calibration rows=%u us=%lld", append_rows,
                 static_cast<long long>(
@@ -1372,7 +1378,7 @@ bool MHACoreLayer::try_quantized_attention(
     static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
     const auto tq0 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q && !again; ++r) {
-      const float *qr = io.q + static_cast<size_t>(r) * q_stride;
+      const float *qr = q_view + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
       for (unsigned int h = 0; h < num_heads_Q; ++h)
         causallm::quant_u16_f32(qr + h * head_dim, head_dim,
@@ -1431,7 +1437,7 @@ bool MHACoreLayer::try_quantized_attention(
     }
   } else if (!compute_ops_->sdpa_q_kvcache(
                handle, append_row0, append_rows, width, k_base + off,
-               v_base + off, io.q, q_stride, n_q, cache_from, cache_to,
+               v_base + off, q_view, q_stride, n_q, cache_from, cache_to,
                num_heads_Q, num_heads_KV, head_dim, window,
                attn_logit_softcapping, io.sinks, io.out, q_stride)) {
     return fail("attention");
@@ -1494,13 +1500,30 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   };
   const long long t_kv0 = host_trace ? now_us() : 0;
 
+  // The projection call may have kept its K / V rows (qkv_layer's
+  // out_to_host false): then they are read where the engine has them.
+  auto viewed = [this](nntrainer::Tensor &t) {
+    if (!compute_ops_ ||
+        t.getDataType() != ml::train::TensorDim::DataType::FP32)
+      return t;
+    const size_t bytes = t.size() * sizeof(float);
+    const void *v = compute_ops_->host_view(t.getData<float>(), bytes);
+    return v == t.getData<float>()
+             ? t
+             : nntrainer::Tensor::Map(
+                 static_cast<float *>(const_cast<void *>(v)),
+                 static_cast<unsigned int>(bytes), t.getDim());
+  };
+  nntrainer::Tensor key_src = viewed(key_step);
+  nntrainer::Tensor value_src = viewed(value_step);
+
   // append kcache with or without rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
+  apply_rotary_emb_tensor_v2(key_src, b_cache_key_step, head_dim, cache_index,
                              !use_rope);
 
   // append vcache without rotary embedding
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+    apply_rotary_emb_tensor_v2(value_src, b_cache_value_step, head_dim,
                                cache_index, true);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -1536,12 +1559,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
-  if (try_quantized_attention(batch, query_step, cache_key, cache_value,
-                              cache_key_dim, attention_output_step, cache_from,
-                              cache_to, nullptr) ||
-      try_accelerated_attention(query_step, b_cached_key, b_cached_value,
-                                attention_output_step, cache_from, cache_to,
-                                nullptr)) {
+  bool done = try_quantized_attention(batch, query_step, cache_key, cache_value,
+                                      cache_key_dim, attention_output_step,
+                                      cache_from, cache_to, nullptr);
+  if (!done) {
+    // every path below reads Q in the host tensor
+    if (compute_ops_ &&
+        query_step.getDataType() == ml::train::TensorDim::DataType::FP32)
+      compute_ops_->sync_to_host(query_step.getData<float>(),
+                                 query_step.size() * sizeof(float));
+    done = try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                                     attention_output_step, cache_from,
+                                     cache_to, nullptr);
+  }
+  if (done) {
     if (host_trace && step_size > 1) {
       ml_logi("mha_core trace: rows=%u kv_write_us=%lld accel_call_us=%lld",
               step_size, t_kv1 - t_kv0, now_us() - t_kv1);

@@ -265,7 +265,7 @@ Lfm2MoELayer::Lfm2MoELayer() :
             nntrainer::props::Unit(), props::MoEActivation(),
             props::RouterType(), props::CacheExperts(), props::InNorm(),
             props::RouterNorm(), props::OutNorm(), props::OutAdd(),
-            nntrainer::props::Epsilon()),
+            nntrainer::props::Epsilon(), props::OutToHost()),
   softmax_router(false),
   gelu_act(false),
   expert_gate_up_proj_indices({}),
@@ -297,6 +297,7 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   router_norm = std::get<props::RouterNorm>(moe_props).get();
   out_norm = std::get<props::OutNorm>(moe_props).get();
   out_add = std::get<props::OutAdd>(moe_props).get();
+  out_to_host = std::get<props::OutToHost>(moe_props).get();
   NNTR_THROW_IF(out_add && context.getNumInputs() != 2, std::invalid_argument)
     << "MoE layer: out_add takes the dense branch's output as input 1";
   NNTR_THROW_IF(router_norm && !out_add && context.getNumInputs() == 2,
@@ -1147,7 +1148,7 @@ static bool tryMoeLayerOnAccelerator(
   int expert_layer_slot, bool gelu, unsigned int trace_layer,
   const float *pre_gamma, const float *post_gamma, float eps,
   const float *add_x2 = nullptr, const float *add_gamma = nullptr,
-  float add_scale = 1.0f, bool *add_done = nullptr) {
+  float add_scale = 1.0f, bool *add_done = nullptr, bool out_to_host = true) {
 
   auto *ops = input.getOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
@@ -1322,12 +1323,15 @@ static bool tryMoeLayerOnAccelerator(
   };
   if (add_done)
     *add_done = false;
+  // The layer's whole output (the epilogue in the call) may stay on the
+  // accelerator when the builder says so; a partial one is read here.
   auto call = [&](float *dst, bool with_add) {
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
       hidden_size, w_bits, gelu, pre_gamma, post_gamma, eps,
-      with_add ? add_x2 : nullptr, with_add ? add_gamma : nullptr, add_scale);
+      with_add ? add_x2 : nullptr, with_add ? add_gamma : nullptr, add_scale,
+      out_to_host || !with_add || total_tokens == 1);
   };
 
   // [doc 52 section 10.14] A layer call needs all of its routed experts
@@ -1350,6 +1354,13 @@ static bool tryMoeLayerOnAccelerator(
   const size_t cap = split_env ? std::min(split_env, g_expert_lru.capacity())
                                : g_expert_lru.capacity();
   if (experts_virtual && active.size() > cap) {
+    // the host adds the groups and runs the epilogue: it reads the input
+    // and the dense branch, which their calls may have kept (out_to_host)
+    const size_t in_bytes =
+      static_cast<size_t>(total_tokens) * hidden_size * sizeof(float);
+    ops->sync_to_host(const_cast<float *>(input.getData<float>()), in_bytes);
+    if (add_x2)
+      ops->sync_to_host(const_cast<float *>(add_x2), in_bytes);
     float *out = output.getData<float>();
     const size_t n_out = static_cast<size_t>(total_tokens) * hidden_size;
     std::vector<float> part(n_out);
@@ -1841,7 +1852,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         norm_on_accel
           ? context.getWeight(add_scale_idx).getValue<float>(0, 0, 0, 0)
           : 1.0f,
-        &add_done);
+        &add_done, out_to_host);
       out_normed_on_accel = moe_layer_done && out_norm && total_tokens > 1;
     }
 
@@ -1862,8 +1873,14 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       &context.getTensor(decode_activation_output_idx),
     };
     if (!moe_layer_done) {
-      if (norm_on_accel) // the CPU loops below read the normed copy
+      if (norm_on_accel) { // the CPU loops below read the normed copy
+        // ... of rows (and a dense branch) their calls may have kept
+        if (auto *o = raw.getOps()) {
+          o->sync_to_host(raw.getData<float>(), raw.size() * sizeof(float));
+          o->sync_to_host(x2.getData<float>(), x2.size() * sizeof(float));
+        }
         normRows(raw, input, context.getWeight(in_gamma_idx), norm_eps);
+      }
       {
         M0Timer t(&g_m0.setup);
         output.setZero();
