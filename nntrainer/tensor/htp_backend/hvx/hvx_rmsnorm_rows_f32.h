@@ -54,6 +54,11 @@ void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
  *         The fused consumers (the router logits) apply it themselves. */
 float hvx_rmsnorm_rs_f32(const float *x, uint32_t n, float eps);
 
+/** @brief One row of hvx_rmsnorm_rows_ld_f32: n floats normed @a chunk at a
+ *         time (the same norm_chunk per chunk), inline on the caller. */
+void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
+                                uint32_t n, uint32_t chunk, float eps);
+
 /**
  * @brief The decoder block's epilogue, streamed: out[r][j] = scale *
  *        (out[r][j] + (x[r][j] + x2[r][j]) * rs(r) * gamma[j]), with rs the

@@ -86,6 +86,12 @@ void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
   norm_chunk(x, y, gamma, n, eps);
 }
 
+void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
+                                uint32_t n, uint32_t chunk, float eps) {
+  for (uint32_t k = 0; k < n / chunk; ++k)
+    norm_chunk(x + (size_t)k * chunk, y + (size_t)k * chunk, gamma, chunk, eps);
+}
+
 static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const rows_ctx *c = (const rows_ctx *)v;
   const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);

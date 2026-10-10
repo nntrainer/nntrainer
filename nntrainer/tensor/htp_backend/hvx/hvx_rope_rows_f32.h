@@ -45,4 +45,14 @@ int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
 int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
                          uint32_t hd, const float *cs, hvx_worker_pool *pool);
 
+/**
+ * @brief hvx_rmsnorm_rows_ld_f32(x, x, M, n, ld, chunk, gamma, eps) then
+ *        hvx_rope_rows_ld_f32(x, M, n, ld, hd, cs), row by row in one pass:
+ *        the same floats as the two calls, without reading x twice.
+ */
+int hvx_norm_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                              uint32_t chunk, const float *gamma, float eps,
+                              uint32_t hd, const float *cs,
+                              hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_ROPE_ROWS_F32_H__ */

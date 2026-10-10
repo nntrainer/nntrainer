@@ -11,6 +11,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 
 #include <math.h>
@@ -92,12 +93,44 @@ static int run(uint32_t M, uint32_t n, uint32_t hd, uint32_t rot,
   return bad != 0;
 }
 
+/* The fused pass against hvx_rmsnorm_rows_ld_f32 then hvx_rope_rows_ld_f32,
+   bit for bit, over rows ld apart (the qkv slices' row-major placement). */
+static int run_fused(uint32_t M, uint32_t n, uint32_t ld, uint32_t chunk,
+                     uint32_t hd) {
+  const size_t len = (size_t)M * ld;
+  float *a = malloc(sizeof(float) * len), *b = malloc(sizeof(float) * len);
+  float *g = malloc(sizeof(float) * chunk),
+        *cs = malloc(sizeof(float) * M * 2u * hd);
+  unsigned s = 7u + M + n + chunk;
+  for (size_t i = 0; i < len; ++i) {
+    s = s * 1664525u + 1013904223u;
+    a[i] = b[i] = ((float)((s >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 8.0f;
+  }
+  for (uint32_t i = 0; i < chunk; ++i)
+    g[i] = 1.0f + (float)(i % 7u) * 0.01f;
+  for (uint32_t i = 0; i < M * 2u * hd; ++i)
+    cs[i] = cosf(0.37f * (float)i);
+  const int r0 = hvx_rmsnorm_rows_ld_f32(a, a, M, n, ld, chunk, g, 1e-6f, NULL);
+  const int r1 = hvx_rope_rows_ld_f32(a, M, n, ld, hd, cs, NULL);
+  const int r2 =
+    hvx_norm_rope_rows_ld_f32(b, M, n, ld, chunk, g, 1e-6f, hd, cs, NULL);
+  const int same =
+    r0 == 0 && r1 == 0 && r2 == 0 && memcmp(a, b, sizeof(float) * len) == 0;
+  printf("fused norm+rope M=%u n=%u ld=%u chunk=%u hd=%u: %s\n", M, n, ld,
+         chunk, hd, same ? "bit-identical" : "DIFFERENT");
+  free(a), free(b), free(g), free(cs);
+  return !same;
+}
+
 int main(void) {
   int fail = 0;
   fail |= run(7, 4096, 256, 256, 0);   /* sliding: 16 heads of 256 */
   fail |= run(5, 2048, 256, 256, 500); /* k: 8 heads, later positions */
   fail |= run(4, 1024, 512, 128, 3);   /* full: hd 512, partial 0.25 */
   fail |= run(3, 192, 64, 64, 1);      /* the decode graph's head dim */
+  fail |= run_fused(7, 4096, 8192, 256, 256); /* sliding q in the qkv rows */
+  fail |= run_fused(5, 2048, 8192, 256, 256); /* sliding k */
+  fail |= run_fused(4, 1024, 1024, 512, 512); /* full: norm 512, rope 512 */
   {
     float x[64], cs[128];
     memset(cs, 0, sizeof cs);

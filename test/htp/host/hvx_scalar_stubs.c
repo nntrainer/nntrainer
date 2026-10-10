@@ -434,6 +434,15 @@ int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
   return 0;
 }
 
+int hvx_norm_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
+                              uint32_t chunk, const float *gamma, float eps,
+                              uint32_t hd, const float *cs,
+                              hvx_worker_pool *pool) {
+  if (hvx_rmsnorm_rows_ld_f32(x, x, M, n, ld, chunk, gamma, eps, pool) != 0)
+    return -1;
+  return hvx_rope_rows_ld_f32(x, M, n, ld, hd, cs, pool);
+}
+
 /* out = scale * (res + rmsnorm(x [+ x2]) * gamma), one row at a time */
 static void norm_add_row(float *out, const float *res, const float *x,
                          const float *x2, uint32_t n, const float *gamma,

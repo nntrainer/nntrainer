@@ -475,7 +475,8 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
   -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
   -o "$OUT/rope_rows_host_check" \
-  "$HERE/rope_rows_host_check.c" "$BACKEND/hvx/hvx_rope_rows_f32.c" -lm
+  "$HERE/rope_rows_host_check.c" "$BACKEND/hvx/hvx_rope_rows_f32.c" \
+  "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" -lm
 
 "$OUT/rope_rows_host_check"
 

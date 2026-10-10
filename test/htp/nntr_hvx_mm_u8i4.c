@@ -1039,27 +1039,25 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  /* The post norms, in place on each handle's rows. */
-  size_t off = 0;
+  /* The post norms, in place on each handle's rows, and RoPE on the first
+     rope_handles after their norms -- one pass per handle that has both. */
   const float *g = post_gamma;
-  for (i = 0; i < post_chunkLen; ++i) {
+  size_t off = 0;
+  for (i = 0; i < w_handlesLen; ++i) {
     const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
-    const uint32_t c = post_chunk[i];
+    const uint32_t c = i < post_chunkLen ? post_chunk[i] : 0u;
+    const int rope = rope_hd != 0u && i < (int)rope_handles;
     float *o_i = out_off ? out_cat + out_off[i] : out_cat + off;
-    if (c != 0u) {
-      hvx_rmsnorm_rows_ld_f32(o_i, o_i, M, n_i, out_ld ? out_ld[i] : n_i, c, g,
-                              eps, s->quant_pool);
-      g += c;
+    const uint32_t ld_i = out_ld ? out_ld[i] : n_i;
+    if (c != 0u && rope) {
+      hvx_norm_rope_rows_ld_f32(o_i, M, n_i, ld_i, c, g, eps, rope_hd, rope_cs,
+                                s->quant_pool);
+    } else if (c != 0u) {
+      hvx_rmsnorm_rows_ld_f32(o_i, o_i, M, n_i, ld_i, c, g, eps, s->quant_pool);
+    } else if (rope) {
+      hvx_rope_rows_ld_f32(o_i, M, n_i, ld_i, rope_hd, rope_cs, s->quant_pool);
     }
-    off += (size_t)M * n_i;
-  }
-  /* Then RoPE on the first rope_handles handles' rows, after their norms. */
-  off = 0;
-  for (i = 0; rope_hd != 0u && i < (int)rope_handles; ++i) {
-    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
-    hvx_rope_rows_ld_f32(out_off ? out_cat + out_off[i] : out_cat + off, M, n_i,
-                         out_ld ? out_ld[i] : n_i, rope_hd, rope_cs,
-                         s->quant_pool);
+    g += c;
     off += (size_t)M * n_i;
   }
   return AEE_SUCCESS;
