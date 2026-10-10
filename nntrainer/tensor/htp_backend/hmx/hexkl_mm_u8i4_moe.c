@@ -472,6 +472,14 @@ static void moe_dn_unit(uint32_t n_units, uint32_t u, void *vctx) {
   moe_worker_probe_add(t0);
 }
 
+/** @brief A down batch's units on the foreground lane, the job as ctx. */
+static void moe_dn_fg_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const hvx_bg_job *j = (const hvx_bg_job *)vctx;
+  for (uint32_t u = i; u < j->n_units; u += n_threads) {
+    moe_dn_unit(j->n_units, u, j->ctx);
+  }
+}
+
 static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_dn_ctx *c = (moe_dn_ctx *)vctx;
   uint64_t t0 = 0;
@@ -2224,6 +2232,12 @@ int hexkl_mm_u8i4_moe_layer_run(
      hiding. This model is 4 and 2. */
   const int exp_bg = all_2bit && gu_chunks <= MOE_EXP_DN &&
                      dn_chunks <= (MOE_EXP_SLOTS - MOE_EXP_DN);
+  /* A 2-bit call's expansions take the background lane, whose jobs run in
+     submit order: a down epilogue queued there holds the next chunk's
+     expansion behind it, and the HMX thread waits on it (DRAIN 13.5 ->
+     4.4 ms a call on the S26 Ultra, p1024). So the down epilogue goes to
+     the foreground lane on those calls; four bits keep the background. */
+  const int dn_fg = exp_bg;
   /* Who queues which gate_up chunk. The down phase has dn_chunks batches
      to queue one chunk each in, so it takes [0, gu_bg0) and the gate_up
      phase takes the rest -- disjoint, or a chunk would be expanded twice
@@ -2533,7 +2547,7 @@ int hexkl_mm_u8i4_moe_layer_run(
         /* The ring slot's previous batch has to be dequantized before
            this one lands in it. What the wait reads is the exposure. */
         const uint32_t k = dn_seq % L.dn_ring;
-        if (dn_seq >= L.dn_ring) {
+        if (dn_seq >= L.dn_ring && !dn_fg) {
           HEXKL_PROBE_T0(p0);
           hvx_worker_pool_wait_bg(pool, &dn_job[k], UINT32_MAX);
           HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
@@ -2681,8 +2695,14 @@ int hexkl_mm_u8i4_moe_layer_run(
           dj->ctx = c;
           dj->n_units = nb;
           dj->done = dn_done[k];
-          hvx_worker_pool_submit_bg(pool, dj);
-          last_job = dj;
+          if (dn_fg) {
+            /* the ring slot is reused only after a later foreground
+               submit or wait has retired this one */
+            hvx_worker_pool_submit(pool, moe_dn_fg_worker, dj, nb);
+          } else {
+            hvx_worker_pool_submit_bg(pool, dj);
+            last_job = dj;
+          }
         }
         ++dn_seq;
       }
@@ -2717,7 +2737,7 @@ int hexkl_mm_u8i4_moe_layer_run(
      its jobs in order). */
   HEXKL_PROBE_T0(p0);
   hvx_worker_pool_wait(pool);
-  if (dn_seq != 0u) {
+  if (dn_seq != 0u && !dn_fg) {
     hvx_worker_pool_wait_bg(pool, &dn_job[(dn_seq - 1u) % L.dn_ring],
                             UINT32_MAX);
   }
