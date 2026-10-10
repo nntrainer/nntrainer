@@ -255,11 +255,15 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
 /* [#260 r3] #4415's one-pass quant: per row the (optional) RMS norm,
    its parameters and its pack, the same formulas as the two calls above;
    pad rows get scale 1, zero point 0 and zero bytes, as the kernel's. */
-int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
-                                uint32_t m_pad, uint32_t k,
+int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
+                                const float *x16_enc, uint32_t x16_hd,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
                                 const float *pre_gamma, float pre_eps,
                                 float *pre_scratch, float *scale, int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool) {
+  if (x16 && (!pre_scratch || pre_gamma || !x16_enc || x16_hd == 0u ||
+              x16_hd % 64u != 0u || k % x16_hd != 0u))
+    return -1;
   for (uint32_t m = m_valid; m < m_pad; ++m) {
     scale[m] = 1.0f;
     zp[m] = 0;
@@ -270,7 +274,14 @@ int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
   }
   for (uint32_t m = 0; m < m_valid; ++m) {
     const float *row = x + (size_t)m * k;
-    if (pre_scratch) {
+    if (x16) {
+      /* dequant16_row: (u - zp[h]) * scale[h] per head */
+      for (uint32_t j = 0; j < k; ++j)
+        pre_scratch[j] =
+          ((float)x16[(size_t)m * k + j] - x16_enc[2u * (j / x16_hd) + 1u]) *
+          x16_enc[2u * (j / x16_hd)];
+      row = pre_scratch;
+    } else if (pre_scratch) {
       /* hvx_rmsnorm_row_f32's formula, scalar (lane order aside) */
       float ss = 0.f;
       for (uint32_t j = 0; j < k; ++j)

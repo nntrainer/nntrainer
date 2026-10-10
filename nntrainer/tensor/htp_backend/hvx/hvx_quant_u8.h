@@ -74,9 +74,15 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
  *                     4 x k floats of this per worker (the pool's worker
  *                     count + 1 slices; min(m_valid, that x 4) rows of k is
  *                     always enough) so the normed rows stay in cache.
+ * @param x16          non-NULL (x then unused): the rows are u16 with a
+ *                     (scale, zp) per head of x16_hd columns in x16_enc,
+ *                     dequantized ((u - zp) * scale) into pre_scratch the
+ *                     same way instead of normed. Needs pre_scratch, no
+ *                     pre_gamma.
  */
-int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
-                                uint32_t m_pad, uint32_t k,
+int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
+                                const float *x16_enc, uint32_t x16_hd,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
                                 const float *pre_gamma, float pre_eps,
                                 float *pre_scratch, float *scale, int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool);

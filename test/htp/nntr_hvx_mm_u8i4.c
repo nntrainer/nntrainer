@@ -868,13 +868,17 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
                                  &(const hexkl_mm_opts){.pool = s->quant_pool});
 }
 
-int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
-                                   float eps, float scale, const float *gamma,
-                                   int gammaLen, const uint32 *w_handles,
-                                   int w_handlesLen, const float *act_f32,
-                                   int act_f32Len, const float *res, int resLen,
-                                   float *out_f32, int out_f32Len) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
+
+/* Both res_add entries: the activation f32, or u16 with act_enc / act_hd
+   (dequantized inside the quant pass through the norm_rows scratch). */
+static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
+                              float eps, float scale, const float *gamma,
+                              int gammaLen, const uint32 *w_handles,
+                              int w_handlesLen, const float *act_f32,
+                              const uint16 *act_u16, const float *act_enc,
+                              uint32 act_hd, int actLen, const float *res,
+                              int resLen, float *out_f32, int out_f32Len) {
   if (!s || w_handlesLen <= 0 || w_handlesLen > 8) {
     return AEE_EBADPARM;
   }
@@ -887,8 +891,7 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
     N += s->weights_u8i4.slots[w_handles[i]].N;
   }
   const uint64_t n = (uint64_t)M * N;
-  int rc =
-    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, (int)n);
+  int rc = check_layer_args(s, M, K, w_handles, w_handlesLen, actLen, (int)n);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -897,6 +900,18 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
     FARF(ERROR, "mm_u8i4_layer_res_add: bad lengths (M=%u N=%u)", (unsigned)M,
          (unsigned)N);
     return AEE_EBADPARM;
+  }
+  hexkl_mm_opts opts = {.pool = s->quant_pool};
+  if (act_u16) {
+    /* hvx_quant_params_pack_u8_ah dequantizes 4 rows a worker into the
+       scratch; M x K is what the norm entries reserve, and plenty. */
+    if (!norm_rows_reserve(s, (size_t)M * K)) {
+      return AEE_ENOMEMORY;
+    }
+    opts.pre_scratch = s->norm_rows;
+    opts.act_u16 = act_u16;
+    opts.act16_enc = act_enc;
+    opts.act16_hd = act_hd;
   }
   if (s->moe_res_n < n) {
     free(s->moe_res);
@@ -907,10 +922,9 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
       return AEE_ENOMEMORY;
     }
   }
-  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                               s->config_off, M, K, w_handles,
-                               (uint32_t)w_handlesLen, act_f32, s->moe_res,
-                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+  rc = hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, act_f32, s->moe_res, &opts);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -929,6 +943,35 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
     return AEE_EINVALIDFORMAT;
   }
   return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
+                                   float eps, float scale, const float *gamma,
+                                   int gammaLen, const uint32 *w_handles,
+                                   int w_handlesLen, const float *act_f32,
+                                   int act_f32Len, const float *res, int resLen,
+                                   float *out_f32, int out_f32Len) {
+  return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
+                            gammaLen, w_handles, w_handlesLen, act_f32, NULL,
+                            NULL, 0u, act_f32Len, res, resLen, out_f32,
+                            out_f32Len);
+}
+
+int nntr_hvx_mm_u8i4_layer_res_add_u16(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, float scale,
+  const float *gamma, int gammaLen, const uint32 *w_handles, int w_handlesLen,
+  const uint16 *act_u16, int act_u16Len, const float *act_enc, int act_encLen,
+  uint32 act_hd, const float *res, int resLen, float *out_f32, int out_f32Len) {
+  if (act_hd == 0u || K % act_hd != 0u ||
+      (uint32_t)act_encLen != 2u * (K / act_hd)) {
+    FARF(ERROR, "mm_u8i4_layer_res_add_u16: act_hd %u of K %u, enc %d",
+         (unsigned)act_hd, (unsigned)K, act_encLen);
+    return AEE_EBADPARM;
+  }
+  return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
+                            gammaLen, w_handles, w_handlesLen, NULL, act_u16,
+                            act_enc, act_hd, act_u16Len, res, resLen, out_f32,
+                            out_f32Len);
 }
 
 /** @brief The activation rows normed into the session's scratch (grown to

@@ -177,6 +177,60 @@ int main(void) {
     free(part);
   }
 
+  /* The u16 activation (the attention's context for the o-proj): rows
+     dequantized inside the quant pass, per head (scale, zp), must give
+     the same bytes as the f32 call on the dequantized rows. A mutant
+     encoding (the second head's scale) must differ. */
+  {
+    /* two heads of 64 (the pass takes a head per 64-lane vector) */
+    const uint32_t UK = 128u, HD = 64u, UN = 512u;
+    const uint32_t uh[1] = {6};
+    W uw;
+    make_weight(6, UK, UN, &uw);
+    const W *uws[1] = {&uw};
+    float enc[2 * 2] = {0.001f, 32768.0f, 0.0025f, 31000.0f};
+    uint16_t *x16 = (uint16_t *)malloc(sizeof(uint16_t) * M * UK);
+    float *xd = (float *)malloc(sizeof(float) * M * UK);
+    float *scratch = (float *)malloc(sizeof(float) * M * UK);
+    float *got16 = (float *)malloc(sizeof(float) * M * UN);
+    float *gotf = (float *)malloc(sizeof(float) * M * UN);
+    float *wantu = (float *)malloc(sizeof(float) * M * UN);
+    for (uint32_t i = 0; i < M * UK; ++i) {
+      x16[i] = (uint16_t)(20000u + (uint32_t)(i * 2654435761u) % 25000u);
+      const uint32_t h = (i % UK) / HD;
+      xd[i] = ((float)x16[i] - enc[2 * h + 1]) * enc[2 * h];
+    }
+    reference(uws, 1, xd, M, UK, wantu, 0.f);
+    hexkl_mm_opts o = {0};
+    o.pre_scratch = scratch;
+    o.act_u16 = x16;
+    o.act16_enc = enc;
+    o.act16_hd = HD;
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, UK,
+                                 uh, 1, NULL, got16, &o);
+    printf("u16 run rc=%d\n", rc);
+    fail |= (rc != 0) | compare("u16 activation", got16, wantu, M * UN);
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, UK,
+                                 uh, 1, xd, gotf, NULL);
+    const int same = rc == 0 && !memcmp(gotf, got16, sizeof(float) * M * UN);
+    printf("u16 vs f32 rows   : %s\n",
+           same ? "U16 ACTIVATION BIT-IDENTICAL" : "DIFFERENT");
+    enc[2] = 0.003f;
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, UK,
+                                 uh, 1, NULL, got16, &o);
+    const int mut_same =
+      rc == 0 && !memcmp(gotf, got16, sizeof(float) * M * UN);
+    printf("mutant enc        : %s\n",
+           mut_same ? "SAME (compare is blind)" : "differs, as it must");
+    fail |= (!same) | mut_same;
+    free(x16);
+    free(xd);
+    free(scratch);
+    free(got16);
+    free(gotf);
+    free(wantu);
+  }
+
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
   return fail;
 }

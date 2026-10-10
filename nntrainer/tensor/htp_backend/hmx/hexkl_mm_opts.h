@@ -67,6 +67,17 @@ typedef struct {
   const float *pre_gamma;
   float pre_eps;
 
+  /** Non-NULL: the activation is the attention's u16 output, M x K with a
+      (scale, zero point) per head of act16_hd columns in act16_enc[2h],
+      act16_enc[2h + 1]: a row is dequantized, (u - zp) * scale as the
+      CPU's dequant_u16_f32, into pre_scratch on its way into the quant
+      pass, where the pre norm would be, so the f32 never exists in DDR.
+      act_f32 may be NULL. Needs pre_scratch; not with pre_gamma or
+      act_scale. */
+  const uint16_t *act_u16;
+  const float *act16_enc;
+  uint32_t act16_hd;
+
   /** Both NULL, or both n_handles entries: handle i's row m goes to
       out_cat + out_off[i] + m * out_ld[i] instead of the packed [M x N_i]
       blocks, so the column slices of one weight land as its row-major

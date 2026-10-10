@@ -481,8 +481,15 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   const hexkl_mm_opts *o = opts ? opts : &kDefaults;
 
   if (!tbl || !vtcm_base || !handles || n_handles == 0 ||
-      (!act_f32 && !o->act_ah_prepacked) || !out_cat || M == 0 || K == 0) {
+      (!act_f32 && !o->act_ah_prepacked && !o->act_u16) || !out_cat || M == 0 ||
+      K == 0) {
     return AEE_EBADPARM;
+  }
+  if (o->act_u16 != NULL &&
+      (o->pre_scratch == NULL || o->pre_gamma != NULL || o->act_scale != NULL ||
+       o->act_ah_prepacked != NULL || o->act16_enc == NULL ||
+       o->act16_hd == 0 || K % o->act16_hd != 0)) {
+    return AEE_EBADPARM; // the u16 rows ride the pre-norm scratch alone
   }
   if ((o->act_scale == NULL) != (o->act_zp == NULL)) {
     return AEE_EBADPARM; // both or neither, per hexkl_mm_opts.h
@@ -634,7 +641,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      rc0 = hvx_quant_params_pack_u8_ah(act_f32, M, m_pad, K, o->pre_gamma,
+      rc0 = hvx_quant_params_pack_u8_ah(act_f32, o->act_u16, o->act16_enc,
+                                        o->act16_hd, M, m_pad, K, o->pre_gamma,
                                         o->pre_eps, o->pre_scratch, loc_scale,
                                         loc_zp, vtcm_base + act_off, o->pool);
       act_scale = loc_scale;

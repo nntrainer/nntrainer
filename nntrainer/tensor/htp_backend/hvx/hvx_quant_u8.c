@@ -367,6 +367,9 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
 
 typedef struct {
   const float *x;
+  const uint16_t *x16;
+  const float *x16_enc;
+  uint32_t x16_hd;
   uint32_t n_groups, k;
   float *scale;
   int32_t *zp;
@@ -375,6 +378,27 @@ typedef struct {
   float eps;
   float *scratch;
 } quant_params_pack_ctx;
+
+/** @brief One u16 row to f32: (u - zp[h]) * scale[h] per head of hd, the
+ *         CPU's dequant_u16_f32 and the attention epilogue's u16 read back
+ *         (64 lanes a vector, unpacked to two f32 vectors). */
+static void dequant16_row(const uint16_t *u, float *y, const float *enc,
+                          uint32_t hd, uint32_t k) {
+  for (uint32_t h = 0; h < k / hd; ++h) {
+    const HVX_Vector vs = hvx_splat_sf(enc[2u * h]);
+    const HVX_Vector vzp = hvx_splat_sf(enc[2u * h + 1u]);
+    const uint16_t *src = u + (size_t)h * hd;
+    float *dst = y + (size_t)h * hd;
+    for (uint32_t d = 0; d < hd; d += 2u * FLANES) {
+      const HVX_VectorPair w =
+        Q6_Wuw_vunpack_Vuh(*(const HVX_UVector *)(src + d));
+      *(HVX_UVector *)(dst + d) = Q6_Vsf_vmpy_VsfVsf(
+        Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_lo_W(w)), vzp), vs);
+      *(HVX_UVector *)(dst + d + FLANES) = Q6_Vsf_vmpy_VsfVsf(
+        Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_hi_W(w)), vzp), vs);
+    }
+  }
+}
 
 /** Row groups [lo, hi) of four: each group's parameters, then its pack,
  *  while the four rows are still in the cache. With a scratch, each row is
@@ -396,8 +420,12 @@ static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
       continue;
     }
     for (uint32_t r = 0; r < 4u; ++r) {
-      hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
-                          c->gamma, c->k, c->eps);
+      if (c->x16)
+        dequant16_row(c->x16 + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
+                      c->x16_enc, c->x16_hd, c->k);
+      else
+        hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k,
+                            sc + (size_t)r * c->k, c->gamma, c->k, c->eps);
       quant_row_params_one(sc, r, c->k, c->scale + m, c->zp + m);
     }
     const float *const row[4] = {sc, sc + c->k, sc + 2u * c->k, sc + 3u * c->k};
@@ -405,12 +433,17 @@ static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
   }
 }
 
-int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
-                                uint32_t m_pad, uint32_t k,
+int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
+                                const float *x16_enc, uint32_t x16_hd,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
                                 const float *pre_gamma, float pre_eps,
                                 float *pre_scratch, float *scale, int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool) {
   const uint32_t n_ktiles = k / TILE_INNER;
+  if (x16 && (!pre_scratch || pre_gamma || !x16_enc || x16_hd == 0u ||
+              x16_hd % (2u * FLANES) != 0u || k % x16_hd != 0u)) {
+    return AEE_EBADPARM;
+  }
   for (uint32_t m = m_valid; m < m_pad; ++m) {
     scale[m] = 1.0f;
     zp[m] = 0;
@@ -422,12 +455,16 @@ int hvx_quant_params_pack_u8_ah(const float *x, uint32_t m_valid,
   const uint32_t m_vec_end = (m_valid / 4u) * 4u;
   if (m_vec_end > 0) {
     quant_params_pack_ctx ctx = {
-      x, m_vec_end / 4u, k, scale, zp, out_ah, pre_gamma, pre_eps, pre_scratch};
+      x,     x16, x16_enc, x16_hd,    m_vec_end / 4u, k,
+      scale, zp,  out_ah,  pre_gamma, pre_eps,        pre_scratch};
     hvx_worker_pool_run(pool, quant_params_pack_worker, &ctx, m_vec_end / 4u);
   }
   for (uint32_t m = m_vec_end; m < m_valid; ++m) {
     const float *row = x + (size_t)m * k;
-    if (pre_scratch) {
+    if (x16) {
+      dequant16_row(x16 + (size_t)m * k, pre_scratch, x16_enc, x16_hd, k);
+      row = pre_scratch;
+    } else if (pre_scratch) {
       hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
       row = pre_scratch;
     }
