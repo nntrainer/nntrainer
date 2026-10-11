@@ -57,6 +57,7 @@
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scale_add_f32.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
@@ -1659,8 +1660,18 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_slot_u32 = sizeof(uint32_t) * n_slots_cap;
   const size_t sz_expert_u32 = sizeof(uint32_t) * n_experts;
   const size_t sz_mpad_u32 = sizeof(uint32_t) * m_pad;
-  const size_t sz_act_c = sizeof(float) * (size_t)M * K;
-  const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
+  /* ...unless the caller says otherwise (hexkl_moe_scratch): a row the
+     scan norms is read once, where it is, and a heap out_f32 needs no
+     copy to scatter into. */
+  const float *pre_gamma = scratch->pre_gamma;
+  const int act_direct = pre_gamma != NULL && !use_m1;
+  const int out_direct = scratch->out_heap && !use_m1;
+  const size_t sz_act_c = act_direct ? 0u : sizeof(float) * (size_t)M * K;
+  const size_t sz_out_c = out_direct ? 0u : sizeof(float) * (size_t)M * N_out;
+  const size_t sz_pre =
+    act_direct
+      ? sizeof(float) * ((size_t)hvx_worker_pool_workers(pool) + 1u) * K
+      : 0u;
   /* The rows quantized once, row-major, for the pack to gather from (the
      HMX path; MOE_U8_GUARD readable bytes either side, the gather's
      contract). */
@@ -1702,6 +1713,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       ROUND_UP_SZ(sz_act_c, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_u8, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_pre, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_jobs, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_done, MOE_SCRATCH_ALIGN) +
@@ -1733,7 +1745,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *scale_all = (float *)hexkl_moe_carve(&cur, sz_mpad_u32);
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_u32);
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
-  float *out_c = (float *)hexkl_moe_carve(&cur, sz_out_c);
+  float *out_c =
+    out_direct ? out_f32 : (float *)hexkl_moe_carve(&cur, sz_out_c);
+  float *pre_rows = (float *)hexkl_moe_carve(&cur, sz_pre);
   uint8_t *act_u8 =
     use_m1 ? NULL : (uint8_t *)hexkl_moe_carve(&cur, sz_act_u8) + MOE_U8_GUARD;
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
@@ -1804,13 +1818,25 @@ int hexkl_mm_u8i4_moe_layer_run(
   if (hexkl_probe_on) {
     hexkl_dma_trace_reset(hexkl_probe_now_ticks());
   }
-  moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0,
-               HEXKL_DMA_SITE_COPY_IN);
+  if (act_direct) {
+    /* the scan reads act_f32 */
+  } else if (pre_gamma) {
+    if (hvx_rmsnorm_rows_f32(act_f32, act_c, M, K, K, pre_gamma,
+                             scratch->pre_eps, pool) != 0) {
+      rc = AEE_EBADPARM;
+      goto out;
+    }
+  } else {
+    moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0,
+                 HEXKL_DMA_SITE_COPY_IN);
+  }
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
   if (n_active == 0u) {
-    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
-                 HEXKL_DMA_SITE_COPY_OUT);
+    if (!out_direct) {
+      moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
+                   HEXKL_DMA_SITE_COPY_OUT);
+    }
     rc = AEE_SUCCESS;
     goto out;
   }
@@ -1865,8 +1891,10 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* The scan is per source row and independent of where a row ends up, so
      it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
-  hvx_quant_rows_u8_params_rm(act_c, M, m_pad, K, scale_all, zp_all, act_u8,
-                              gu0_async ? NULL : pool);
+  hvx_quant_rows_u8_params_rm(act_direct ? act_f32 : act_c, M, m_pad, K,
+                              scale_all, zp_all, act_u8,
+                              act_direct ? pre_gamma : NULL, scratch->pre_eps,
+                              pre_rows, gu0_async ? NULL : pool);
 
   /* Slot order: every active expert's rows, each expert padded up to a
      whole 64-row block. Padding slots repeat row 0 -- their accumulator
@@ -2768,8 +2796,10 @@ int hexkl_mm_u8i4_moe_layer_run(
   HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
 
   HEXKL_PROBE_T0(p0);
-  moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
-               HEXKL_DMA_SITE_COPY_OUT);
+  if (!out_direct) {
+    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
+                 HEXKL_DMA_SITE_COPY_OUT);
+  }
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:

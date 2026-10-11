@@ -1732,14 +1732,21 @@ int nntr_hvx_router_logits_u8i8_f32(
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_mm_u8i4_moe_layer_norm(
+/* Both norm entries. The pre norm rides the kernel's scan and, when the
+   result is the session's own heap (out_heap: the add entry's moe_res), the
+   kernel accumulates straight into it: what used to be a pass that stored
+   the normed rows, a copy of them and a copy of the result (doc: the S26
+   Ultra handoff, section 8). The post norm reads the result where the
+   kernel left it. */
+static int moe_layer_norm_impl(
   remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
   uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
   const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
   int h_gate_upLen, const uint32 *h_down, int h_downLen,
   const uint32 *row_index, int row_indexLen, const uint32 *row_count,
   int row_countLen, const float *row_weight, int row_weightLen,
-  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len) {
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len,
+  int out_heap) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
@@ -1750,25 +1757,57 @@ int nntr_hvx_mm_u8i4_moe_layer_norm(
     FARF(ERROR, "mm_u8i4_moe_layer_norm: bad norm lengths");
     return AEE_EBADPARM;
   }
-  const float *in = act_f32;
-  if (pre_gammaLen != 0) {
-    if ((uint32_t)act_f32Len != M * K) {
+  if (pre_gammaLen != 0 && (uint32_t)act_f32Len != M * K) {
+    return AEE_EBADPARM;
+  }
+  /* A post norm of a caller's buffer: the kernel's result goes to moe_res
+     and the norm carries it over, instead of a copy and a norm in place. */
+  float *kout = out_f32;
+  if (!out_heap && post_gammaLen != 0) {
+    const uint64_t n = (uint64_t)M * N_out;
+    if ((uint64_t)out_f32Len != n) {
       return AEE_EBADPARM;
     }
-    in = norm_rows_in(s, act_f32, M, K, pre_gamma, eps);
-    if (!in) {
-      return AEE_ENOMEMORY;
+    if (s->moe_res_n < n) {
+      free(s->moe_res);
+      s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+      s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+      if (!s->moe_res) {
+        FARF(ERROR, "moe_layer_norm: no heap for %u floats", (unsigned)n);
+        return AEE_ENOMEMORY;
+      }
     }
+    kout = s->moe_res;
   }
+  s->moe_scratch.pre_gamma = pre_gammaLen != 0 ? pre_gamma : NULL;
+  s->moe_scratch.pre_eps = eps;
+  s->moe_scratch.out_heap = out_heap || kout != out_f32;
   const int rc = nntr_hvx_mm_u8i4_moe_layer(
     handle, M, K, inter, N_out, act, h_gate_up, h_gate_upLen, h_down, h_downLen,
     row_index, row_indexLen, row_count, row_countLen, row_weight, row_weightLen,
-    in, act_f32Len, out_f32, out_f32Len);
+    act_f32, act_f32Len, kout, out_f32Len);
+  s->moe_scratch.pre_gamma = NULL;
+  s->moe_scratch.out_heap = 0;
   if (rc == AEE_SUCCESS && post_gammaLen != 0) {
-    hvx_rmsnorm_rows_f32(out_f32, out_f32, M, N_out, N_out, post_gamma, eps,
+    hvx_rmsnorm_rows_f32(kout, out_f32, M, N_out, N_out, post_gamma, eps,
                          s->quant_pool);
   }
   return rc;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
+  int h_gate_upLen, const uint32 *h_down, int h_downLen,
+  const uint32 *row_index, int row_indexLen, const uint32 *row_count,
+  int row_countLen, const float *row_weight, int row_weightLen,
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len) {
+  return moe_layer_norm_impl(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, out_f32, out_f32Len, 0);
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_norm_add(
@@ -1803,11 +1842,11 @@ int nntr_hvx_mm_u8i4_moe_layer_norm_add(
       return AEE_ENOMEMORY;
     }
   }
-  const int rc = nntr_hvx_mm_u8i4_moe_layer_norm(
+  const int rc = moe_layer_norm_impl(
     handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
     post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
     row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
-    act_f32Len, s->moe_res, (int)n);
+    act_f32Len, s->moe_res, (int)n, 1);
   if (rc != AEE_SUCCESS) {
     return rc;
   }

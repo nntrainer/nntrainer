@@ -18,6 +18,7 @@
 #include "hvx_expand_i2i4.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_swiglu_f32.h"
 #include "swiglu_det.h"
 #include <math.h>
@@ -212,18 +213,43 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
    they cannot drift: the kernel's units are 16-row quarters of a block.
    Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
    passing more than 64 rows writes several row blocks. */
+/* hvx_rmsnorm_row_f32's formula, scalar (lane order aside) */
+void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
+                         uint32_t n, float eps) {
+  float ss = 0.f;
+  for (uint32_t j = 0; j < n; ++j)
+    ss += x[j] * x[j];
+  const float rs = 1.0f / sqrtf(ss / (float)n + eps);
+  for (uint32_t j = 0; j < n; ++j)
+    y[j] = gamma ? (x[j] * rs) * gamma[j] : x[j] * rs;
+}
 void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m, uint32_t mp,
                                  uint32_t k, float *scale, int32_t *zp,
-                                 uint8_t *out_rm, hvx_worker_pool *p) {
-  hvx_quant_rows_u8_params(x, m, mp, k, scale, zp, p);
-  if (!out_rm)
-    return;
-  buf(out_rm, (size_t)m * k, 1);
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t j = 0; j < k; ++j) {
-      long q = lrintf(x[(size_t)r * k + j] / scale[r]) + zp[r];
+                                 uint8_t *out_rm, const float *pre_gamma,
+                                 float pre_eps, float *pre_scratch,
+                                 hvx_worker_pool *p) {
+  if (!pre_gamma) {
+    hvx_quant_rows_u8_params(x, m, mp, k, scale, zp, p);
+  } else {
+    for (uint32_t r = m; r < mp; ++r) {
+      scale[r] = 1.0f;
+      zp[r] = 0;
+    }
+  }
+  if (out_rm)
+    buf(out_rm, (size_t)m * k, 1);
+  for (uint32_t r = 0; r < m; ++r) {
+    const float *row = x + (size_t)r * k;
+    if (pre_gamma) {
+      hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
+      row = pre_scratch;
+      hvx_quant_rows_u8_params(row, 1u, 1u, k, scale + r, zp + r, p);
+    }
+    for (uint32_t j = 0; out_rm && j < k; ++j) {
+      long q = lrintf(row[j] / scale[r]) + zp[r];
       out_rm[(size_t)r * k + j] = (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q);
     }
+  }
 }
 void hvx_gather_u8_ah_rows(const uint8_t *x_rm, const uint32_t *map,
                            uint32_t m0, uint32_t m1, uint32_t k, uint8_t *out) {
@@ -309,13 +335,7 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
           x16_enc[2u * (j / x16_hd)];
       row = pre_scratch;
     } else if (pre_scratch) {
-      /* hvx_rmsnorm_row_f32's formula, scalar (lane order aside) */
-      float ss = 0.f;
-      for (uint32_t j = 0; j < k; ++j)
-        ss += row[j] * row[j];
-      const float rs = 1.0f / sqrtf(ss / (float)k + pre_eps);
-      for (uint32_t j = 0; j < k; ++j)
-        pre_scratch[j] = pre_gamma ? (row[j] * rs) * pre_gamma[j] : row[j] * rs;
+      hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
       row = pre_scratch;
     }
     hvx_quant_rows_u8_params(row, 1u, 1u, k, scale + m, zp + m, pool);

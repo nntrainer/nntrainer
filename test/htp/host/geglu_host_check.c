@@ -31,6 +31,7 @@
 
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_swiglu_det.h"
 #include "swiglu_det.h"
 
@@ -216,7 +217,8 @@ int main(void) {
     int32_t qz[QM], sz[QS];
     for (uint32_t i = 0; i < QM * K; ++i)
       x[i] = 0.01f * ((float)(RND() % 4001u) - 1700.f);
-    hvx_quant_rows_u8_params_rm(x, QM, QM, K, qs, qz, rm + 128, NULL);
+    hvx_quant_rows_u8_params_rm(x, QM, QM, K, qs, qz, rm + 128, NULL, 0.0f,
+                                NULL, NULL);
     for (uint32_t s = 0; s < QS; ++s) {
       ss[s] = qs[map[s]];
       sz[s] = qz[map[s]];
@@ -229,6 +231,35 @@ int main(void) {
     printf("QUANT ONCE + GATHER hvx_quant_u8.c K=%u %s%s\n", K,
            same ? "bit-exact" : "DIFFERS", blind ? " (compare is blind)" : "");
     CHECK(same && !blind, "quantize-once gather differs from the pack");
+    /* ...and the pre norm inside that pass: the parameters and bytes of
+       the rows normed first */
+    {
+      float *gm = (float *)malloc(sizeof(float) * K);
+      float *xn = (float *)malloc(sizeof(float) * QM * K);
+      float *sc = (float *)malloc(sizeof(float) * K);
+      uint8_t *rm2 = (uint8_t *)calloc(1, (size_t)QM * K);
+      uint8_t *rm3 = (uint8_t *)calloc(1, (size_t)QM * K);
+      float ns[QM], ps[QM];
+      int32_t nz[QM], pz[QM];
+      for (uint32_t j = 0; j < K; ++j)
+        gm[j] = 0.5f + 0.01f * (float)(RND() % 100u);
+      hvx_rmsnorm_rows_f32(x, xn, QM, K, K, gm, 1e-6f, NULL);
+      hvx_quant_rows_u8_params_rm(xn, QM, QM, K, ns, nz, rm2, NULL, 0.0f, NULL,
+                                  NULL);
+      hvx_quant_rows_u8_params_rm(x, QM, QM, K, ps, pz, rm3, gm, 1e-6f, sc,
+                                  NULL);
+      const int nsame = !memcmp(rm2, rm3, (size_t)QM * K) &&
+                        !memcmp(ns, ps, sizeof ns) &&
+                        !memcmp(nz, pz, sizeof nz);
+      printf("PRE NORM IN THE QUANT PASS K=%u %s\n", K,
+             nsame ? "bit-exact" : "DIFFERS");
+      CHECK(nsame, "pre norm in the quant pass differs from norm, then quant");
+      free(gm);
+      free(xn);
+      free(sc);
+      free(rm2);
+      free(rm3);
+    }
     free(x);
     free(rm);
     free(ah);

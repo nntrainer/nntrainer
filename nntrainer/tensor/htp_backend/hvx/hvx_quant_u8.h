@@ -112,12 +112,17 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
 /**
  * @brief hvx_quant_rows_u8_params, and with @a out_rm each row quantized
  *        once while it is in the cache: row-major, m_valid x k bytes, the
- *        bytes hvx_quant_pack_u8_ah_rows writes for the row.
+ *        bytes hvx_quant_pack_u8_ah_rows writes for the row. With
+ *        @a pre_gamma each row is RMS-normed first (hvx_rmsnorm_row_f32)
+ *        into the lane's row of @a pre_scratch (a row of k floats a pool
+ *        lane, hvx_worker_pool_workers + 1 of them) and the parameters and
+ *        bytes are the normed row's: the normed rows are never stored.
  */
 void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m_valid,
                                  uint32_t m_pad, uint32_t k, float *scale,
                                  int32_t *zp, uint8_t *out_rm,
-                                 hvx_worker_pool *pool);
+                                 const float *pre_gamma, float pre_eps,
+                                 float *pre_scratch, hvx_worker_pool *pool);
 
 /**
  * @brief Rows [m0, m1) of the AH layout from row-major quantized rows

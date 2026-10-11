@@ -98,7 +98,10 @@ typedef struct {
   uint32_t m_valid, k;
   float *scale;
   int32_t *zp;
-  uint8_t *out_rm; /**< NULL: the parameters only */
+  uint8_t *out_rm;        /**< NULL: the parameters only */
+  const float *pre_gamma; /**< NULL: the rows as they are */
+  float pre_eps;
+  float *pre_scratch; /**< a row a lane */
 } quant_rows_ctx;
 
 static void quant_row_u8_rm(const float *row, uint32_t k, float scale,
@@ -108,31 +111,42 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   quant_rows_ctx *ctx = (quant_rows_ctx *)ctx_;
   const uint32_t lo = (uint32_t)((uint64_t)ctx->m_valid * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)ctx->m_valid * (i + 1) / n_threads);
+  float *sc = ctx->pre_gamma ? ctx->pre_scratch + (size_t)i * ctx->k : NULL;
   for (uint32_t m = lo; m < hi; ++m) {
-    quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp);
+    const float *row = ctx->x + (size_t)m * ctx->k;
+    if (sc) { /* the normed row never leaves this lane's cache */
+      hvx_rmsnorm_row_f32(row, sc, ctx->pre_gamma, ctx->k, ctx->pre_eps);
+      quant_row_params_one(sc, 0u, ctx->k, ctx->scale + m, ctx->zp + m);
+      row = sc;
+    } else {
+      quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp);
+    }
     if (ctx->out_rm)
-      quant_row_u8_rm(ctx->x + (size_t)m * ctx->k, ctx->k, ctx->scale[m],
-                      ctx->zp[m], ctx->out_rm + (size_t)m * ctx->k);
+      quant_row_u8_rm(row, ctx->k, ctx->scale[m], ctx->zp[m],
+                      ctx->out_rm + (size_t)m * ctx->k);
   }
 }
 
 void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m_valid,
                                  uint32_t m_pad, uint32_t k, float *scale,
                                  int32_t *zp, uint8_t *out_rm,
-                                 hvx_worker_pool *pool) {
+                                 const float *pre_gamma, float pre_eps,
+                                 float *pre_scratch, hvx_worker_pool *pool) {
   for (uint32_t m = 0; m < m_pad; ++m) {
     scale[m] = 1.0f;
     zp[m] = 0;
   }
 
-  quant_rows_ctx ctx = {x, m_valid, k, scale, zp, out_rm};
+  quant_rows_ctx ctx = {x,      m_valid,   k,       scale,      zp,
+                        out_rm, pre_gamma, pre_eps, pre_scratch};
   hvx_worker_pool_run(pool, quant_rows_worker, &ctx, m_valid);
 }
 
 void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
                               uint32_t k, float *scale, int32_t *zp,
                               hvx_worker_pool *pool) {
-  hvx_quant_rows_u8_params_rm(x, m_valid, m_pad, k, scale, zp, NULL, pool);
+  hvx_quant_rows_u8_params_rm(x, m_valid, m_pad, k, scale, zp, NULL, NULL, 0.0f,
+                              NULL, pool);
 }
 
 /**

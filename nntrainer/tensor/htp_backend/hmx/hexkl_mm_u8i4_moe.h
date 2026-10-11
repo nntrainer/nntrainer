@@ -94,6 +94,16 @@ typedef struct {
   void *raw;     /**< what malloc returned, for free() */
   uint8_t *base; /**< raw rounded up to 128 bytes */
   size_t cap;    /**< usable bytes from base */
+  /* Per call, set by the owner before hexkl_mm_u8i4_moe_layer_run and
+     cleared after it; zero is the call without them. */
+  const float *pre_gamma; /**< K floats: act_f32 is RMS-normed (whole row,
+                               this gamma, pre_eps) on its way in -- inside
+                               the scan on the HMX path, so the normed rows
+                               are never stored */
+  float pre_eps;
+  int out_heap; /**< out_f32 is cached heap the caller owns alone: the HMX
+                     path accumulates straight into it instead of into a
+                     copy it then moves */
 } hexkl_moe_scratch;
 
 /** @brief Releases the block. Safe on an empty scratch. */

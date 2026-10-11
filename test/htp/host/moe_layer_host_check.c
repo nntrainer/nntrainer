@@ -14,6 +14,7 @@
 #include "hvx_expand_i2i4.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
+#include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scalar.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
@@ -1428,6 +1429,19 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
   return fail;
 }
 
+/* The MoE kernel's M=1 path norms whole rows through this (the FC checks
+   have hvx_scalar_stubs.c's): hvx_rmsnorm_row_f32 a row. */
+int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
+                         uint32_t chunk, const float *gamma, float eps,
+                         hvx_worker_pool *pool) {
+  (void)pool;
+  if (chunk != n)
+    return -1;
+  for (uint32_t m = 0; m < M; ++m)
+    hvx_rmsnorm_row_f32(x + (size_t)m * n, y + (size_t)m * n, gamma, n, eps);
+  return 0;
+}
+
 int main(void) {
   const uint32_t M = 97, K = 64, inter = 32, N_out = 64, NE = 5;
   hvx_scalar_hook.prefetch = hook_prefetch;
@@ -1511,6 +1525,48 @@ int main(void) {
   printf("mismatches=%u of %u   worst_rel=%g\n", bad, M * N_out, worst);
   printf(bad == 0 ? "MOE KERNEL MATCHES REFERENCE\n" : "MOE KERNEL DIFFERS\n");
   int fail = (bad != 0);
+
+  /* hexkl_moe_scratch's per-call options: the pre norm inside the scan and
+     the result accumulated where the caller wants it must give the bytes
+     of the rows normed first and the result copied out. Then a wrong
+     gamma, which must not. */
+  {
+    uint64_t probe_was[HEXKL_PROBE_N]; /* the checks below read run one's */
+    memcpy(probe_was, hexkl_probe_us, sizeof probe_was);
+    float *g = (float *)malloc(sizeof(float) * K);
+    float *an = (float *)malloc(sizeof(float) * M * K);
+    float *o1 = (float *)malloc(sizeof(float) * M * N_out);
+    float *o2 = (float *)malloc(sizeof(float) * M * N_out);
+    for (uint32_t j = 0; j < K; ++j)
+      g[j] = 0.5f + (float)(rnd() % 100u) / 100.f;
+    hvx_rmsnorm_rows_f32(act, an, M, K, K, g, 1e-6f, NULL);
+    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                        M, K, inter, N_out, NE, hg, hd, ridx,
+                                        rc_, rw, an, o1, NULL, &scratch, 0u);
+    scratch.pre_gamma = g;
+    scratch.pre_eps = 1e-6f;
+    scratch.out_heap = 1;
+    r |= hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     K, inter, N_out, NE, hg, hd, ridx, rc_, rw,
+                                     act, o2, NULL, &scratch, 0u);
+    const int same = !memcmp(o1, o2, sizeof(float) * M * N_out);
+    g[3] += 0.25f;
+    r |= hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     K, inter, N_out, NE, hg, hd, ridx, rc_, rw,
+                                     act, o2, NULL, &scratch, 0u);
+    const int blind = !memcmp(o1, o2, sizeof(float) * M * N_out);
+    scratch.pre_gamma = NULL;
+    scratch.out_heap = 0;
+    memcpy(hexkl_probe_us, probe_was, sizeof probe_was);
+    printf("pre norm in scan  : rc=%d %s%s\n", r,
+           same ? "bit-identical to normed rows + copy" : "DIFFERS",
+           blind ? " (compare is blind)" : "");
+    fail |= (r != 0) | !same | blind;
+    free(g);
+    free(an);
+    free(o1);
+    free(o2);
+  }
 
   /* Every active expert's gate_up and down must have been pushed. The DMA
      stub here completes immediately, so a missing push cannot show up as a
