@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "hvx_dequant_i32.h"
+#include "hvx_quant_u8.h"
 #include "hvx_swiglu_det.h"
 #include "swiglu_det.h"
 
@@ -161,6 +162,77 @@ int main(void) {
            geglu ? "geglu" : "swiglu", ok, ROWS * INTER);
     CHECK(ok == ROWS * INTER, "epilogue (geglu=%u) differs from the spec",
           geglu);
+  }
+
+  /* 3. the MoE down epilogue, row-major over a run of tiles: every element
+     the spec's dequant, then out[rows[m]] += that * weights[m] */
+  {
+    enum { NT = 3, SM = 7, SN = NT * 32, OM = 11 };
+    static float sout[OM * SN], swant[OM * SN];
+    const uint32_t srows[SM] = {9, 2, 5, 0, 10, 3, 7};
+    float sw[SM], sas[SM];
+    int32_t saz[SM];
+    static int32_t stiles[NT][SM * RS];
+    for (uint32_t t = 0; t < NT; ++t)
+      for (uint32_t i = 0; i < SM * RS; ++i)
+        stiles[t][i] = (int32_t)(RND() % 200001u) - 100000;
+    for (uint32_t m = 0; m < SM; ++m) {
+      sw[m] = 0.05f * (float)(1u + RND() % 19u);
+      sas[m] = 0.002f + 0.001f * (float)m;
+      saz[m] = 90 + (int32_t)m;
+    }
+    for (uint32_t i = 0; i < OM * SN; ++i)
+      sout[i] = swant[i] = 0.01f * ((float)(RND() % 2001u) - 1000.f);
+    for (uint32_t m = 1; m < SM; ++m)
+      for (uint32_t c = 0; c < SN; ++c) {
+        const float v = (((float)stiles[c / 32u][m * RS + c % 32u] -
+                          (float)saz[m] * (float)colsum[c]) *
+                         sas[m]) *
+                          wsc[c] +
+                        bias[c];
+        const float p = v * sw[m];
+        swant[srows[m] * SN + c] += p;
+      }
+    hvx_dequant_acc_tiles_scatter_rows_f32(
+      (const uint8_t *)stiles, sizeof stiles[0], NT, RS, 1u, SM, sas, saz,
+      colsum, wsc, bias, sout, SN, srows, sw);
+    const int same = !memcmp(sout, swant, sizeof sout);
+    printf("DN SCATTER ROWS hvx_dequant_i32.c %s\n",
+           same ? "bit-exact" : "DIFFERS");
+    CHECK(same, "row-major dequant + scatter differs from the spec");
+  }
+
+  /* 4. the activation quantized once row-major, then gathered into AH
+     tiles: the bytes of quantizing every slot's row from f32. K = 160
+     leaves a 32-float run past the row's whole vectors. */
+  for (uint32_t K = 160u; K <= 256u; K += 96u) {
+    enum { QM = 6, QS = 8 };
+    const uint32_t map[QS] = {4, 0, 5, 5, 1, 3, 0, 2};
+    float *x = (float *)malloc(sizeof(float) * QM * K);
+    uint8_t *rm = (uint8_t *)calloc(1, (size_t)QM * K + 256u);
+    uint8_t *ah = (uint8_t *)calloc(1, (size_t)(K / 32u) * 2048u);
+    uint8_t *ref = (uint8_t *)calloc(1, (size_t)(K / 32u) * 2048u);
+    float qs[QM], ss[QS];
+    int32_t qz[QM], sz[QS];
+    for (uint32_t i = 0; i < QM * K; ++i)
+      x[i] = 0.01f * ((float)(RND() % 4001u) - 1700.f);
+    hvx_quant_rows_u8_params_rm(x, QM, QM, K, qs, qz, rm + 128, NULL);
+    for (uint32_t s = 0; s < QS; ++s) {
+      ss[s] = qs[map[s]];
+      sz[s] = qz[map[s]];
+    }
+    hvx_gather_u8_ah_rows(rm + 128, map, 0u, QS, K, ah);
+    hvx_quant_pack_u8_ah_rows(x, map, 0u, QS, K, ss, sz, ref);
+    const int same = !memcmp(ah, ref, (size_t)(K / 32u) * 2048u);
+    ++ah[5u * 32u + 3u]; /* row 5's byte 3 of k-tile 0 */
+    const int blind = !memcmp(ah, ref, (size_t)(K / 32u) * 2048u);
+    printf("QUANT ONCE + GATHER hvx_quant_u8.c K=%u %s%s\n", K,
+           same ? "bit-exact" : "DIFFERS", blind ? " (compare is blind)" : "");
+    CHECK(same && !blind, "quantize-once gather differs from the pack");
+    free(x);
+    free(rm);
+    free(ah);
+    free(ref);
   }
 
   printf(g_fail ? "GEGLU CHECK FAILED\n" : "GEGLU OK\n");

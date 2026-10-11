@@ -1024,7 +1024,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   fail |= (i32_bad != 0u);
 
   /* And the M=1 output against the f32 reference on its own, as the
-     37-row fixture is. */
+     97-row fixture is. */
   float *want = (float *)malloc(sizeof(float) * M * N_out);
   reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want,
                   HVX_GLU_SILU);
@@ -1429,7 +1429,7 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
 }
 
 int main(void) {
-  const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
+  const uint32_t M = 97, K = 64, inter = 32, N_out = 64, NE = 5;
   hvx_scalar_hook.prefetch = hook_prefetch;
   hvx_scalar_hook.gemv = hook_gemv;
   hvx_scalar_hook.gemv2 = hook_gemv2;
@@ -1479,9 +1479,15 @@ int main(void) {
     n_rows += rc_[e];
   uint32_t *ridx = (uint32_t *)malloc(sizeof(uint32_t) * n_rows);
   float *rw = (float *)malloc(sizeof(float) * n_rows);
-  for (uint32_t i = 0; i < n_rows; ++i) {
-    ridx[i] = rnd() % M;
-    rw[i] = 0.1f + 0.9f * ((float)(rnd() % 100u) / 100.f);
+  /* Distinct within an expert, the kernel's contract (a token picks an
+     expert once; the down epilogue's row units run side by side): a random
+     start and step over the prime M. */
+  for (uint32_t e = 0, i = 0; e < NE; ++e) {
+    const uint32_t s0 = rnd() % M, st = 1u + rnd() % (M - 1u);
+    for (uint32_t r = 0; r < rc_[e]; ++r, ++i) {
+      ridx[i] = (s0 + r * st) % M;
+      rw[i] = 0.1f + 0.9f * ((float)(rnd() % 100u) / 100.f);
+    }
   }
 
   float *got = (float *)malloc(sizeof(float) * M * N_out);
@@ -1546,7 +1552,7 @@ int main(void) {
       &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
       ridx, rc_, rw, act, got_on, NULL, &scratch, HEXKL_MOE_FLAG_M1_GEMV);
     const int same = memcmp(got, got_on, sizeof(float) * M * N_out);
-    printf("M=37 flag on      : rc=%d HMX blocks=%llu dma_kb=%llu (off %llu) "
+    printf("M=97 flag on      : rc=%d HMX blocks=%llu dma_kb=%llu (off %llu) "
            "path=%llu memcmp=%d\n",
            r, (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS],
            (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_KB],
@@ -1592,7 +1598,7 @@ int main(void) {
     const int clean_ok = r_cl == 0 &&
                          g_bypass_bytes - after_dirty == want + one_gu &&
                          memcmp(got, got_cl, sizeof(float) * M * N_out) == 0;
-    printf("M=37 clean heap   : rc=%d bypassed %llu B (want %llu) %s\n", r_cl,
+    printf("M=97 clean heap   : rc=%d bypassed %llu B (want %llu) %s\n", r_cl,
            (unsigned long long)(g_bypass_bytes - after_dirty),
            (unsigned long long)(want + one_gu),
            clean_ok ? "bit-identical" : "WRONG");
@@ -1601,7 +1607,7 @@ int main(void) {
     g_tbl.slots[hg[1]].clean = 0;
     g_tbl.slots[hg[1]].borrowed = 1;
     const int same = memcmp(got, got_bp, sizeof(float) * M * N_out);
-    printf("M=37 dma bypass   : rc=%d bypassed %llu B (want %llu, before %llu, "
+    printf("M=97 dma bypass   : rc=%d bypassed %llu B (want %llu, before %llu, "
            "heap copies %llu) memcmp=%d\n",
            r, (unsigned long long)after_dirty, (unsigned long long)want,
            (unsigned long long)before, (unsigned long long)g_bypass_bad,
@@ -1659,7 +1665,7 @@ int main(void) {
     free(want_g);
   }
 
-  /* [plan 201 S4] HEXKL_MOE_FLAG_GELU_TANH on every path of the call. M=37
+  /* [plan 201 S4] HEXKL_MOE_FLAG_GELU_TANH on every path of the call. M=97
      (HMX blocks plus two HVX tails) against the reference run with
      geglu_det_one, and unlike the SwiGLU output above; then one token
      routed to four experts on the HMX loop, the M=1 GEMV with the VTCM
@@ -1703,7 +1709,7 @@ int main(void) {
     double w1 = 0.0;
     const uint32_t bad1 = count_mismatches(o1[0], want1, N_out, &w1);
     const int ok = r == 0 && bad37 == 0u && differs && bad1 == 0u && ok1;
-    printf("geglu M=37 bad=%u worst_rel=%g differs_from_swiglu=%d; M=1 "
+    printf("geglu M=97 bad=%u worst_rel=%g differs_from_swiglu=%d; M=1 "
            "hmx/gemv-vtcm/gemv-arena bad=%u same_path_bytes=%d rc=%d\n",
            bad37, w37, differs, bad1, ok1, r);
     printf(ok ? "MOE GEGLU FLAG OK (HMX, tail, M=1 GEMV feed+arena)\n"
@@ -1824,7 +1830,7 @@ int main(void) {
       hg3b[e] = 6u * NE + 8u + e;
       hd3b[e] = 6u * NE + 24u + e;
     }
-    const uint32_t M2 = 40;
+    const uint32_t M2 = 97;
     float *a2 = (float *)malloc(sizeof(float) * M2 * K2);
     for (uint32_t i = 0; i < M2 * K2; ++i)
       a2[i] = rndf();
@@ -1834,9 +1840,12 @@ int main(void) {
       nr2 += rc2[e];
     uint32_t *ri2 = (uint32_t *)malloc(sizeof(uint32_t) * nr2);
     float *rw2 = (float *)malloc(sizeof(float) * nr2);
-    for (uint32_t i = 0; i < nr2; ++i) {
-      ri2[i] = rnd() % M2;
-      rw2[i] = 0.2f + 0.7f * ((float)(rnd() % 100u) / 100.f);
+    for (uint32_t e = 0, i = 0; e < NE2; ++e) { /* distinct within an expert */
+      const uint32_t s0 = rnd() % M2, st = 1u + rnd() % (M2 - 1u);
+      for (uint32_t r = 0; r < rc2[e]; ++r, ++i) {
+        ri2[i] = (s0 + r * st) % M2;
+        rw2[i] = 0.2f + 0.7f * ((float)(rnd() % 100u) / 100.f);
+      }
     }
     float *o4 = (float *)malloc(sizeof(float) * M2 * N2);
     float *o2 = (float *)malloc(sizeof(float) * M2 * N2);

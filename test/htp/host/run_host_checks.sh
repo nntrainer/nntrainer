@@ -432,6 +432,7 @@ geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" "$HERE/geglu_host_check.c" "$1" \
+    "$BACKEND/hvx/hvx_quant_u8.c" "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" \
     "$BACKEND/hvx/hvx_worker_pool.c" -lm
 }
 geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"

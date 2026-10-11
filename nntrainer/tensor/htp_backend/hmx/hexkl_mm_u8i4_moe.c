@@ -399,10 +399,11 @@ static uint32_t moe_push_act_block(uint8_t *vtcm_base, uint32_t act_off,
  * dealt round-robin over the workers so the few heavy requant units do
  * not all land on one.
  *
- * A tile's dequant and scatter are one pass in registers
- * (hvx_dequant_acc_tile_scatter_f32): the DN epilogue did show above its
- * batch, 7.1 ms of HMX-thread wait a 1024-row call (doc 57 section 9.34),
- * and its f32 went through VTCM and 64 one-vector calls a tile.
+ * The dequant and the scatter are one pass in registers, row-major over
+ * the batch's tiles (hvx_dequant_acc_tiles_scatter_rows_f32): the DN
+ * epilogue did show above its batch, 7.1 ms of HMX-thread wait a 1024-row
+ * call (doc 57 section 9.34), and its f32 went through VTCM and 64
+ * one-vector calls a tile.
  */
 typedef struct {
   /* the batch's tiles */
@@ -438,6 +439,9 @@ typedef struct {
   uint8_t *mid; /**< the mid buffer it packs into */
 } moe_dn_ctx;
 
+/** @brief Readable bytes either side of the row-major quantized rows
+ *         (hvx_gather_u8_ah_rows reads up to 96 outside a row). */
+#define MOE_U8_GUARD 128u
 /** @brief Down staging buffers at most (hexkl_moe_layout.dn_ring). */
 #define MOE_DN_RING 4u
 #define MOE_RQ_UNIT_ROWS 16u
@@ -445,39 +449,49 @@ typedef struct {
 
 static inline void moe_worker_probe_add(uint64_t t0);
 
-/** @brief Down tile @a j of a batch: dequant and scatter, the expert's tail
- *         rows too. */
-static inline void moe_dn_tile(const moe_dn_ctx *c, uint32_t j) {
-  const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
-  const int32_t *tile =
-    (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-  hvx_dequant_acc_tile_scatter_f32(
-    tile, c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + c0,
-    c->w_scale + c0, c->bias + c0, c->out + c0, c->N_out, c->rows, c->weights);
-  for (uint32_t q = 0; q < c->n_rows_b; ++q) {
+/** @brief Rows a down epilogue's background unit takes: 16 units a full
+ *         block. */
+#define MOE_DN_UNIT_ROWS 4u
+
+/** @brief Rows [m0, m1) of a down batch: every staged tile's, dequantized
+ *         and scattered; the expert's tail rows with row 0. */
+static inline void moe_dn_rows(const moe_dn_ctx *c, uint32_t m0, uint32_t m1) {
+  const uint32_t c0 = c->nt0 * HEXKL_ACC_TILE_COLS;
+  hvx_dequant_acc_tiles_scatter_rows_f32(
+    c->tiles_base, c->tile_stride, c->nb, c->row_stride, m0, m1, c->act_scale,
+    c->act_zp, c->colsum_w + c0, c->w_scale + c0, c->bias + c0, c->out + c0,
+    c->N_out, c->rows, c->weights);
+  for (uint32_t q = 0; m0 == 0u && q < c->n_rows_b; ++q) {
     hvx_scale_add_rows_f32(c->out + (size_t)c->rows_b[q] * c->N_out + c0,
                            c->res_b + (size_t)q * c->N_out + c0,
-                           c->weights_b[q], HEXKL_ACC_TILE_COLS);
+                           c->weights_b[q], c->nb * HEXKL_ACC_TILE_COLS);
   }
 }
 
-/** @brief The down epilogue as a background job, a tile a unit: queued
- *         behind the batch before it, so an output row still takes its
- *         experts' contributions in block order. */
+/** @brief The down epilogue as a background job, MOE_DN_UNIT_ROWS rows a
+ *         unit: queued behind the batch before it, so an output row still
+ *         takes its experts' contributions in block order. */
 static void moe_dn_unit(uint32_t n_units, uint32_t u, void *vctx) {
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
   (void)n_units;
-  moe_dn_tile((const moe_dn_ctx *)vctx, u);
+  const moe_dn_ctx *c = (const moe_dn_ctx *)vctx;
+  const uint32_t m0 = u * MOE_DN_UNIT_ROWS;
+  moe_dn_rows(c, m0,
+              (c->m_count - m0 < MOE_DN_UNIT_ROWS) ? c->m_count
+                                                   : m0 + MOE_DN_UNIT_ROWS);
   moe_worker_probe_add(t0);
 }
 
-/** @brief A down batch's units on the foreground lane, the job as ctx. */
+/** @brief A down batch on the foreground lane, the job as ctx: a lane
+ *         takes one run of rows, so its l2fetch lead carries across them. */
 static void moe_dn_fg_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   const hvx_bg_job *j = (const hvx_bg_job *)vctx;
-  for (uint32_t u = i; u < j->n_units; u += n_threads) {
-    moe_dn_unit(j->n_units, u, j->ctx);
-  }
+  const moe_dn_ctx *c = (const moe_dn_ctx *)j->ctx;
+  uint64_t t0 = 0;
+  HEXKL_PROBE_T0(t0);
+  moe_dn_rows(c, c->m_count * i / n_threads, c->m_count * (i + 1u) / n_threads);
+  moe_worker_probe_add(t0);
 }
 
 static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
@@ -508,9 +522,6 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
       hvx_quant_pack_u8_ah_rows(c->gate, NULL, r0, r1, c->inter, c->rq_scale,
                                 c->rq_zp, c->mid);
     }
-  }
-  for (uint32_t j = i; j < c->nb; j += n_threads) {
-    moe_dn_tile(c, j);
   }
   moe_worker_probe_add(t0);
 }
@@ -1311,6 +1322,11 @@ static inline void moe_m1_wait(uint32_t idx, uint32_t site) {
 void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
   (void)n_units;
   const hexkl_moe_pack_ctx *c = (const hexkl_moe_pack_ctx *)vctx;
+  if (c->act_u8) {
+    hvx_gather_u8_ah_rows(c->act_u8, c->slot_row, u * HEXKL_MOE_PACK_UNIT_ROWS,
+                          (u + 1u) * HEXKL_MOE_PACK_UNIT_ROWS, c->K, c->act_ah);
+    return;
+  }
   hvx_quant_pack_u8_ah_rows(c->act_c, c->slot_row, u * HEXKL_MOE_PACK_UNIT_ROWS,
                             (u + 1u) * HEXKL_MOE_PACK_UNIT_ROWS, c->K,
                             c->slot_scale, c->slot_zp, c->act_ah);
@@ -1645,6 +1661,10 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_mpad_u32 = sizeof(uint32_t) * m_pad;
   const size_t sz_act_c = sizeof(float) * (size_t)M * K;
   const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
+  /* The rows quantized once, row-major, for the pack to gather from (the
+     HMX path; MOE_U8_GUARD readable bytes either side, the gather's
+     contract). */
+  const size_t sz_act_u8 = use_m1 ? 0u : (size_t)M * K + 2u * MOE_U8_GUARD;
   /* One done byte per slot block for the background pack. */
   const size_t sz_pack_done = n_slots_cap / HEXKL_MOE_PACK_UNIT_ROWS + 1u;
   /* The tail path (moe_tail_*): jobs, done bytes and contexts for as many
@@ -1681,6 +1701,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       2u * ROUND_UP_SZ(sz_mpad_u32, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_c, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_act_u8, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_jobs, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_done, MOE_SCRATCH_ALIGN) +
@@ -1713,6 +1734,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_u32);
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
   float *out_c = (float *)hexkl_moe_carve(&cur, sz_out_c);
+  uint8_t *act_u8 =
+    use_m1 ? NULL : (uint8_t *)hexkl_moe_carve(&cur, sz_act_u8) + MOE_U8_GUARD;
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
   hvx_bg_job *jobs = (hvx_bg_job *)hexkl_moe_carve(&cur, sz_jobs);
   uint8_t *tail_done = (uint8_t *)hexkl_moe_carve(&cur, sz_tail_done);
@@ -1842,8 +1865,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* The scan is per source row and independent of where a row ends up, so
      it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
-  hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all,
-                           gu0_async ? NULL : pool);
+  hvx_quant_rows_u8_params_rm(act_c, M, m_pad, K, scale_all, zp_all, act_u8,
+                              gu0_async ? NULL : pool);
 
   /* Slot order: every active expert's rows, each expert padded up to a
      whole 64-row block. Padding slots repeat row 0 -- their accumulator
@@ -2110,6 +2133,7 @@ int hexkl_mm_u8i4_moe_layer_run(
      runs under the HMX. QUANT times the scan and those waits -- what stays
      exposed -- not the pack. */
   pack.act_c = act_c;
+  pack.act_u8 = act_u8;
   pack.slot_row = slot_row;
   pack.slot_scale = slot_scale;
   pack.slot_zp = slot_zp;
@@ -2693,12 +2717,12 @@ int hexkl_mm_u8i4_moe_layer_run(
           hvx_bg_job *dj = &dn_job[k];
           dj->func = moe_dn_unit;
           dj->ctx = c;
-          dj->n_units = nb;
+          dj->n_units = (pblk.m_blk + MOE_DN_UNIT_ROWS - 1u) / MOE_DN_UNIT_ROWS;
           dj->done = dn_done[k];
           if (dn_fg) {
             /* the ring slot is reused only after a later foreground
                submit or wait has retired this one */
-            hvx_worker_pool_submit(pool, moe_dn_fg_worker, dj, nb);
+            hvx_worker_pool_submit(pool, moe_dn_fg_worker, dj, pblk.m_blk);
           } else {
             hvx_worker_pool_submit_bg(pool, dj);
             last_job = dj;

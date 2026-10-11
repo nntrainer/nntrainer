@@ -82,17 +82,25 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
                                  int accumulate);
 
 /**
- * @brief hvx_dequant_acc_tile_to_f32 into registers, each row then added
- *        into out row @a rows[m] times @a weights[m] (hvx_scale_add_rows_f32's
- *        operations): the MoE down epilogue's dequant and scatter without the
- *        f32 round trip through VTCM between them, so the same floats land.
- *        @a rows must not repeat within the call (one expert's tokens).
+ * @brief Rows [m0, m1) of a run of @a n_tiles adjacent staged tiles,
+ *        dequantized (hvx_dequant_acc_tile_to_f32's operations) into
+ *        registers and added into out row @a rows[m] times @a weights[m]
+ *        (hvx_scale_add_rows_f32's operations): the MoE down epilogue's
+ *        dequant and scatter without the f32 round trip between them, so
+ *        the same floats land. Row-major -- an output row's n_tiles vectors
+ *        are one contiguous run behind an l2fetch -- because tile-major
+ *        every (row, tile) add was a DDR miss once the output outgrew the
+ *        L2: 128 of a 2048-row call's 226 ms of worker time on the S26
+ *        Ultra. colsum_w, w_scale, bias and out are offset to the first
+ *        tile's column. @a rows must not repeat within [m0, m1) nor across
+ *        concurrent calls (one expert's tokens).
  */
-void hvx_dequant_acc_tile_scatter_f32(
-  const int32_t *tile, uint32_t row_stride, uint32_t m_count,
-  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
-  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
-  const uint32_t *rows, const float *weights);
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights);
 
 /**
  * @brief Dequantizes a RUN of accumulator tiles in one pooled pass.

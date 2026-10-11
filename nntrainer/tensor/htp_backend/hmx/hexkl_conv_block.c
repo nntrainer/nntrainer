@@ -361,6 +361,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   HEXKL_PROBE_T0(p0);
   hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all, pool);
   pack.act_c = act_c;
+  pack.act_u8 = NULL;
   pack.slot_row = NULL;
   pack.slot_scale = scale_all;
   pack.slot_zp = zp_all;

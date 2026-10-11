@@ -259,6 +259,38 @@ static inline HVX_Vector Q6_V_vmux_QVV(HVX_VectorPred q, HVX_Vector a,
   return r;
 }
 
+/* vpack(Vu, Vv):sat: Vv's elements narrowed and saturated into the low
+   half of the result, Vu's into the high half, in order (hvx_quant_u8.c's
+   two-stage row pack). */
+static inline HVX_Vector Q6_Vh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  int16_t h[2 * HVX_EMU_LANES];
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const int32_t a = (int32_t)v.w[i], b = (int32_t)u.w[i];
+    h[i] = (int16_t)(a < -32768 ? -32768 : a > 32767 ? 32767 : a);
+    h[HVX_EMU_LANES + i] = (int16_t)(b < -32768  ? -32768
+                                     : b > 32767 ? 32767
+                                                 : b);
+  }
+  memcpy(r.w, h, sizeof h);
+  return r;
+}
+static inline HVX_Vector Q6_Vub_vpack_VhVh_sat(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  int16_t hu[2 * HVX_EMU_LANES], hv[2 * HVX_EMU_LANES];
+  uint8_t b[4 * HVX_EMU_LANES];
+  memcpy(hu, u.w, sizeof hu);
+  memcpy(hv, v.w, sizeof hv);
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    b[i] = (uint8_t)(hv[i] < 0 ? 0 : hv[i] > 255 ? 255 : hv[i]);
+    b[2 * HVX_EMU_LANES + i] = (uint8_t)(hu[i] < 0     ? 0
+                                         : hu[i] > 255 ? 255
+                                                       : hu[i]);
+  }
+  memcpy(r.w, b, sizeof b);
+  return r;
+}
+
 static inline HVX_Vector Q6_V_vror_VR(HVX_Vector a, int32_t bytes) {
   HVX_Vector r;
   const uint8_t *src = (const uint8_t *)a.w;

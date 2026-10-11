@@ -110,6 +110,28 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
                                 uint8_t *out_ah, hvx_worker_pool *pool);
 
 /**
+ * @brief hvx_quant_rows_u8_params, and with @a out_rm each row quantized
+ *        once while it is in the cache: row-major, m_valid x k bytes, the
+ *        bytes hvx_quant_pack_u8_ah_rows writes for the row.
+ */
+void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m_valid,
+                                 uint32_t m_pad, uint32_t k, float *scale,
+                                 int32_t *zp, uint8_t *out_rm,
+                                 hvx_worker_pool *pool);
+
+/**
+ * @brief Rows [m0, m1) of the AH layout from row-major quantized rows
+ *        (hvx_quant_rows_u8_params_rm's): hvx_quant_pack_u8_ah_rows's
+ *        bytes without quantizing a row once per slot it is routed to --
+ *        a 2048-row MoE call read its f32 activation 9 times over that way.
+ *        m0, m1 multiples of 4. @a x_rm needs 96 readable bytes before its
+ *        first row and after its last.
+ */
+void hvx_gather_u8_ah_rows(const uint8_t *x_rm, const uint32_t *row_map,
+                           uint32_t m0, uint32_t m1, uint32_t k,
+                           uint8_t *out_ah);
+
+/**
  * @brief The mapped pack for destination rows [m0, m1) only, on the
  *        calling thread. Same bytes as hvx_quant_pack_u8_ah_mapped would
  *        write for those rows. m0 and m1 are multiples of 4 (a row group).

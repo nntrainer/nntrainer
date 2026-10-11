@@ -153,6 +153,9 @@ void hexkl_moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
  *         order. */
 typedef struct {
   const float *act_c;
+  const uint8_t *act_u8; /**< NULL, or the rows already quantized row-major
+                              (hvx_quant_rows_u8_params_rm): the pack then
+                              gathers bytes; needs slot_row */
   const uint32_t *slot_row;
   const float *slot_scale;
   const int32_t *slot_zp;

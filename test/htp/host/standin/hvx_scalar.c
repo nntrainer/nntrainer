@@ -212,6 +212,33 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
    they cannot drift: the kernel's units are 16-row quarters of a block.
    Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
    passing more than 64 rows writes several row blocks. */
+void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m, uint32_t mp,
+                                 uint32_t k, float *scale, int32_t *zp,
+                                 uint8_t *out_rm, hvx_worker_pool *p) {
+  hvx_quant_rows_u8_params(x, m, mp, k, scale, zp, p);
+  if (!out_rm)
+    return;
+  buf(out_rm, (size_t)m * k, 1);
+  for (uint32_t r = 0; r < m; ++r)
+    for (uint32_t j = 0; j < k; ++j) {
+      long q = lrintf(x[(size_t)r * k + j] / scale[r]) + zp[r];
+      out_rm[(size_t)r * k + j] = (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q);
+    }
+}
+void hvx_gather_u8_ah_rows(const uint8_t *x_rm, const uint32_t *map,
+                           uint32_t m0, uint32_t m1, uint32_t k, uint8_t *out) {
+  const uint32_t kt_n = k / 32u;
+  if (m1 > m0)
+    buf(out + (size_t)(m0 / 64u) * kt_n * 2048u,
+        (size_t)((m1 + 63u) / 64u - m0 / 64u) * kt_n * 2048u, 1);
+  for (uint32_t r = m0; r < m1; ++r) {
+    buf(x_rm + (size_t)map[r] * k, k, 0);
+    for (uint32_t kt = 0; kt < kt_n; ++kt)
+      memcpy(out + (size_t)(r / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
+               (r % 64u) * 32u,
+             x_rm + (size_t)map[r] * k + kt * 32u, 32u);
+  }
+}
 void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *map, uint32_t m0,
                                uint32_t m1, uint32_t k, const float *scale,
                                const int32_t *zp, uint8_t *out) {
@@ -336,13 +363,16 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
     buf(out + (size_t)r * ostride, sizeof(float) * 32u, 1);
   dq_tile(tile, stride, m, as, az, cs, ws, bias, out, ostride, accumulate);
 }
-void hvx_dequant_acc_tile_scatter_f32(
-  const int32_t *tile, uint32_t stride, uint32_t m, const float *as,
-  const int32_t *az, const int32_t *cs, const float *ws, const float *bias,
-  float *out, uint32_t ostride, const uint32_t *rows, const float *weights) {
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t c = 0; c < 32; ++c) {
-      float v = ((float)(tile[(size_t)r * stride + c] - az[r] * cs[c])) *
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t stride, uint32_t m0, uint32_t m1, const float *as, const int32_t *az,
+  const int32_t *cs, const float *ws, const float *bias, float *out,
+  uint32_t ostride, const uint32_t *rows, const float *weights) {
+  for (uint32_t r = m0; r < m1; ++r)
+    for (uint32_t c = 0; c < 32 * n_tiles; ++c) {
+      const int32_t *tile =
+        (const int32_t *)(tiles_base + (size_t)(c / 32) * tile_stride);
+      float v = ((float)(tile[(size_t)r * stride + c % 32] - az[r] * cs[c])) *
                   as[r] * ws[c] +
                 bias[c];
       volatile float p = v * weights[r]; /* two operations, as the HVX */

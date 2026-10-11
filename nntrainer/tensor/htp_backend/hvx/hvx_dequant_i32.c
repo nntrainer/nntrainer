@@ -136,53 +136,44 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
   }
 }
 
-/** @brief Row @a i of the unrolled group's output row, loaded; then that
- *         row plus the scaled dequant, stored: hvx_scale_add_rows_f32's two
- *         operations. All four loads go before the first store -- the rows
- *         are distinct (the caller's contract), and the compiler, which
- *         cannot know that, otherwise serializes four DDR read-modify-writes
- *         on their load latency. */
-#define DQ_SCATTER_LOAD(i)                                                     \
-  HVX_UVector *vo##i =                                                         \
-    (HVX_UVector *)(out + (size_t)rows[m + (i)] * out_stride);                 \
-  const HVX_Vector d##i = vo##i[0]
-#define DQ_SCATTER_STORE(i)                                                    \
-  vo##i[0] = Q6_Vsf_vadd_VsfVsf(                                               \
-    d##i, Q6_Vsf_vmpy_VsfVsf(r##i, hvx_splat_sf(weights[m + (i)])))
-
-void hvx_dequant_acc_tile_scatter_f32(
-  const int32_t *tile, uint32_t row_stride, uint32_t m_count,
-  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
-  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
-  const uint32_t *rows, const float *weights) {
-  const HVX_Vector csf = Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[0]);
-  const HVX_Vector vw = ((const HVX_UVector *)w_scale)[0];
-  const HVX_Vector vbias = ((const HVX_UVector *)bias)[0];
-
-  uint32_t m = 0;
-  for (; m + 4u <= m_count; m += 4u) {
-    DQ_TILE_ROW(0);
-    DQ_TILE_ROW(1);
-    DQ_TILE_ROW(2);
-    DQ_TILE_ROW(3);
-    DQ_SCATTER_LOAD(0);
-    DQ_SCATTER_LOAD(1);
-    DQ_SCATTER_LOAD(2);
-    DQ_SCATTER_LOAD(3);
-    DQ_SCATTER_STORE(0);
-    DQ_SCATTER_STORE(1);
-    DQ_SCATTER_STORE(2);
-    DQ_SCATTER_STORE(3);
-  }
-  for (; m < m_count; ++m) {
-    DQ_TILE_ROW(0);
-    DQ_SCATTER_LOAD(0);
-    DQ_SCATTER_STORE(0);
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights) {
+  /* One output row's n_tiles vectors, [47:32] stride, [31:16] width, [15:0]
+     height. A hint: it moves no bits. Three rows ahead, the most a lane
+     can queue (the hardware stalls the thread on a fourth). */
+  const uint64_t box = ((uint64_t)(n_tiles * 128u) << 32) |
+                       ((uint64_t)(n_tiles * 128u) << 16) | 1u;
+  for (uint32_t m = m0; m < m1 && m < m0 + 3u; ++m)
+    Q6_l2fetch_AP((void *)(out + (size_t)rows[m] * out_stride), box);
+  for (uint32_t m = m0; m < m1; ++m) {
+    if (m + 3u < m1)
+      Q6_l2fetch_AP((void *)(out + (size_t)rows[m + 3u] * out_stride), box);
+    const HVX_Vector vs = hvx_splat_sf(act_scale[m]);
+    const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m]));
+    const HVX_Vector vwt = hvx_splat_sf(weights[m]);
+    HVX_UVector *vo = (HVX_UVector *)(out + (size_t)rows[m] * out_stride);
+    for (uint32_t j = 0; j < n_tiles; ++j) {
+      const int32_t *tile =
+        (const int32_t *)(tiles_base + (size_t)j * tile_stride);
+      const HVX_Vector af = Q6_Vsf_equals_Vw(
+        ((const HVX_UVector *)(tile + (size_t)m * row_stride))[0]);
+      const HVX_Vector csf =
+        Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[j]);
+      const HVX_Vector r = Q6_Vsf_vadd_VsfVsf(
+        Q6_Vsf_vmpy_VsfVsf(
+          Q6_Vsf_vmpy_VsfVsf(
+            Q6_Vsf_vsub_VsfVsf(af, Q6_Vsf_vmpy_VsfVsf(vz, csf)), vs),
+          ((const HVX_UVector *)w_scale)[j]),
+        ((const HVX_UVector *)bias)[j]);
+      vo[j] = Q6_Vsf_vadd_VsfVsf(vo[j], Q6_Vsf_vmpy_VsfVsf(r, vwt));
+    }
   }
 }
 
-#undef DQ_SCATTER_LOAD
-#undef DQ_SCATTER_STORE
 #undef DQ_TILE_ROW
 #undef DQ_TILE_STORE
 
