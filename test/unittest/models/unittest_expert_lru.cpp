@@ -199,6 +199,22 @@ TEST(ExpertLru, LrfuKeepsTheFrequentKeyWhereLruDropsIt) {
   }
 }
 
+TEST(ExpertLru, LrfuEvictsSeveralLowestFirstLeastRecentOnATie) {
+  // Uses: 0 x3, 1 x1, 2 x2, 3 x1 in a pool of 4. A call that brings three
+  // new keys in evicts three: the two single-use keys (a tie: 1 before 3,
+  // the least recent first), then 2 -- the order one victim at a time gave.
+  ExpertLru lru;
+  int layer;
+  lru.setLrfu(1000.0);
+  lru.addLayer(&layer, 4);
+  Recorder r;
+  for (int e : {0, 0, 0, 1, 2, 2, 3})
+    lru.acquire({key(e)}, r.load, r.evict);
+  lru.acquire({key(4), key(5), key(6)}, r.load, r.evict);
+  EXPECT_EQ(r.evicted, (std::vector<int>{1, 3, 2}));
+  EXPECT_EQ(ids(lru.order()), (std::vector<int>{0, 4, 5, 6}));
+}
+
 TEST(ExpertLru, LrfuForgetsOldUsesWithAShortHalfLife) {
   // A used three times long ago, B four times since: with a half-life of
   // one call A's score has decayed below B's, so C evicts A, not B

@@ -161,7 +161,7 @@ public:
     evictFor(excess, pinned, evict);
     for (Key k : misses) {
       load(k);
-      order_.push_back(k);
+      order_.emplace_back(k, &score_[k]);
       pos_[k] = std::prev(order_.end());
     }
     return misses.size();
@@ -181,7 +181,10 @@ public:
   /** @brief Front-to-back (least to most recent) snapshot, for tests. */
   std::vector<Key> order() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return std::vector<Key>(order_.begin(), order_.end());
+    std::vector<Key> keys;
+    for (const auto &e : order_)
+      keys.push_back(e.first);
+    return keys;
   }
 
   /** @brief [#289] NNTR_MOE_LRFU's half-life in tokens; "0" is LRU, unset
@@ -205,12 +208,13 @@ public:
   }
 
 private:
-  using Order = std::list<Key>;
-
   struct Score {
     double crf = 0.0;  /**< decayed use count as of call last */
     uint64_t last = 0; /**< acquire() call of the last use */
   };
+  /** A resident key and its score (score_'s element, which does not move):
+   *  the eviction pass reads it without a lookup. */
+  using Order = std::list<std::pair<Key, const Score *>>;
 
   /** @brief The half-life in acquire() calls, 0 under LRU. */
   double halfLife() const { return lrfu_ * layers_.size(); }
@@ -220,33 +224,42 @@ private:
   }
 
   /** @brief Evicts @a excess keys outside @a pin: under LRU from the front,
-   *  under LRFU the lowest score each time, the least recent on a tie. */
+   *  under LRFU the lowest scores, lowest first, the least recent on a tie.
+   *  The scores do not move within a call, so one pass reads them all (a
+   *  pass a victim cost the S26 Ultra's miss server 82 us a round). */
   void evictFor(size_t excess, const std::unordered_set<Key> &pin,
                 const std::function<void(Key)> &evict) {
     const double half = halfLife();
-    while (excess != 0) {
-      auto victim = order_.end();
-      double best = 0.0;
+    std::vector<Order::iterator> victims;
+    if (half <= 0.0) {
+      for (auto it = order_.begin();
+           it != order_.end() && victims.size() < excess; ++it)
+        if (pin.count(it->first) == 0)
+          victims.push_back(it);
+    } else if (excess != 0) {
+      // (score, place in the order): the place breaks a tie and keeps the
+      // iterators out of the comparison
+      std::vector<std::pair<double, size_t>> by_score;
+      std::vector<Order::iterator> at;
+      by_score.reserve(order_.size());
+      at.reserve(order_.size());
       for (auto it = order_.begin(); it != order_.end(); ++it) {
-        if (pin.count(*it) != 0)
+        if (pin.count(it->first) != 0)
           continue;
-        if (half <= 0.0) {
-          victim = it;
-          break;
-        }
-        const double v = decayed(score_[*it], half);
-        if (victim == order_.end() || v < best) {
-          victim = it;
-          best = v;
-        }
+        by_score.emplace_back(decayed(*it->second, half), at.size());
+        at.push_back(it);
       }
-      if (victim == order_.end())
-        return; // all pinned: the callers checked the room first
-      const Key k = *victim;
+      excess = std::min(excess, by_score.size());
+      std::partial_sort(by_score.begin(), by_score.begin() + excess,
+                        by_score.end());
+      for (size_t i = 0; i < excess; ++i)
+        victims.push_back(at[by_score[i].second]);
+    }
+    for (Order::iterator victim : victims) {
+      const Key k = victim->first;
       order_.erase(victim);
       pos_.erase(k);
       evict(k);
-      --excess;
     }
   }
 
