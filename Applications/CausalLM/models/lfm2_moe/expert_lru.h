@@ -184,13 +184,16 @@ public:
     return std::vector<Key>(order_.begin(), order_.end());
   }
 
-  /** @brief [#289] NNTR_MOE_LRFU's half-life in tokens; 0 (unset or "0")
-   *  is LRU. Read once per process. */
+  /** @brief [#289] NNTR_MOE_LRFU's half-life in tokens; "0" is LRU, unset
+   *  is 32 (S26 Ultra, Gemma-4 26B-A4B, C = 32, three runs each: the decode
+   *  miss wait 25.2-32.0 -> 24.1-27.4 ms a token at 1024 prompt tokens and
+   *  32.3-35.1 -> 25.8-28.6 at 2048, the text identical). Read once per
+   *  process. */
   static double lrfuTokens() {
     static const double h = [] {
       const char *v = std::getenv("NNTR_MOE_LRFU");
       if (v == nullptr || *v == '\0')
-        return 0.0;
+        return 32.0;
       char *end = nullptr;
       const double x = std::strtod(v, &end);
       if (*end != '\0' || !(x >= 0.0))
