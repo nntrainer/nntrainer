@@ -41,6 +41,10 @@
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
                       const float *cs, hvx_worker_pool *pool);
 
+/** @brief One row of hvx_rope_rows_f32, inline on the caller: @a cs_row is
+ *         the row's 2*hd table floats. The same arithmetic, the same floats. */
+void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs_row);
+
 /** @brief hvx_rope_rows_f32 over rows @a ld floats apart (ld >= n). */
 int hvx_rope_rows_ld_f32(float *x, uint32_t M, uint32_t n, uint32_t ld,
                          uint32_t hd, const float *cs, hvx_worker_pool *pool);

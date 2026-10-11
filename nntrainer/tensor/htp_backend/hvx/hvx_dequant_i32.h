@@ -164,6 +164,22 @@ typedef struct {
 /** @brief hvx_worker_pool_func over an hvx_dq_tiles_job. */
 void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *job);
 
+/** @brief An hvx_dq_tiles_job taken row-major (dst_a only): a lane takes a
+ *         run of rows and writes each row's n_tiles vectors as one
+ *         contiguous run, then hands the row to @a row_done while it is
+ *         still in the cache (a norm, a rotation: the FC call's per-head
+ *         passes). The floats are hvx_dq_tiles_worker's. Units for the
+ *         submit: m_count. */
+typedef struct {
+  hvx_dq_tiles_job t;
+  /** NULL, or called once per row with the row's first written element
+   *  and its index in [0, m_count) */
+  void (*row_done)(void *ctx, float *seg, uint32_t row);
+  void *ctx;
+} hvx_dq_rows_job;
+
+void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *job);
+
 /** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
  *         the submit: n_pairs. */
 typedef struct {

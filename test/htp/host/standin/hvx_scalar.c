@@ -19,6 +19,7 @@
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
 #include "hvx_swiglu_f32.h"
 #include "swiglu_det.h"
 #include <math.h>
@@ -444,6 +445,44 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vjob) {
                                 c->act_zp, c->colsum_w + c0, c->w_scale + c0,
                                 c->bias + c0, out, c->dst_stride, 0);
   }
+}
+/* The same job row-major: each row's tiles, then the row's hook. */
+void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const hvx_dq_rows_job *jb = (const hvx_dq_rows_job *)vjob;
+  const hvx_dq_tiles_job *c = &jb->t;
+  uint32_t lo, hi;
+  slice(c->m_count, n_threads, i, &lo, &hi);
+  for (uint32_t m = lo; m < hi; ++m) {
+    for (uint32_t j = 0; j < c->n_tiles; ++j) {
+      const uint32_t c0 = (c->nt0 + j) * 32u;
+      const int32_t *tile =
+        (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+      hvx_dequant_acc_tile_to_f32(
+        tile + (size_t)m * c->row_stride, c->row_stride, 1u, c->act_scale + m,
+        c->act_zp + m, c->colsum_w + c0, c->w_scale + c0, c->bias + c0,
+        c->dst_a + (size_t)m * c->dst_stride + c0, c->dst_stride, 0);
+    }
+    if (jb->row_done)
+      jb->row_done(jb->ctx, c->dst_a + (size_t)m * c->dst_stride + c->nt0 * 32u,
+                   m);
+  }
+}
+void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
+                                uint32_t n, uint32_t chunk, float eps) {
+  for (uint32_t c0 = 0; c0 < n; c0 += chunk)
+    hvx_rmsnorm_row_f32(x + c0, y + c0, gamma, chunk, eps);
+}
+/* hvx_rope_row_f32's formula: per head, a*cos - b*sin and a*sin + b*cos */
+void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs) {
+  const uint32_t half = hd / 2u;
+  for (uint32_t h = 0; h < n / hd; ++h)
+    for (uint32_t k = 0; k < half; ++k) {
+      float *a = x + (size_t)h * hd + k, *b = a + half;
+      volatile float ac = *a * cs[k], bs = *b * cs[hd + k];
+      volatile float as = *a * cs[hd + k], bc = *b * cs[k];
+      *a = ac - bs;
+      *b = as + bc;
+    }
 }
 void hvx_dequant_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,

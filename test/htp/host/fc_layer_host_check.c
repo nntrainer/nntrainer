@@ -9,6 +9,8 @@
 #include "hexkl_mm_opts.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_probe.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
 #include "hvx_scalar_stubs.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -89,6 +91,57 @@ int main(void) {
                                handles, 3, x, got, NULL);
   reference(ws, 3, x, 1, K, want, 0.f);
   fail |= (rc != 0) | compare("M=1", got, want, N[0] + N[1] + N[2]);
+
+  /* The per-head passes in the epilogue (hexkl_mm_opts.post_done): the
+     norm of handles 0 and 2 and the rotation of handle 0 must give the
+     bytes of the plain run with those passes made over it afterwards, and
+     the kernel must say it did them. Then a table row off by one, which
+     must not. */
+  {
+    const uint32_t HD = 32u, chunk[3] = {32u, 0u, 32u};
+    float gm[64], *cs = (float *)malloc(sizeof(float) * (M + 1u) * 2u * HD);
+    float *got2 = (float *)malloc(sizeof(float) * out_n);
+    for (uint32_t j = 0; j < 64u; ++j)
+      gm[j] = 0.5f + 0.01f * (float)j;
+    for (uint32_t j = 0; j < (M + 1u) * 2u * HD; ++j)
+      cs[j] = rndf();
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                 handles, 3, x, got, NULL);
+    size_t off = 0;
+    for (uint32_t i = 0; i < 3; ++i) {
+      for (uint32_t m = 0; m < M; ++m) {
+        float *row = got + off + (size_t)m * N[i];
+        if (chunk[i])
+          hvx_rmsnorm_row_chunks_f32(row, row, gm + (i ? 32 : 0), N[i],
+                                     chunk[i], 1e-6f);
+        if (i == 0)
+          hvx_rope_row_f32(row, N[i], HD, cs + (size_t)m * 2u * HD);
+      }
+      off += (size_t)M * N[i];
+    }
+    int done = 0;
+    hexkl_mm_opts o = {0};
+    o.post_done = &done;
+    o.post_chunk = chunk;
+    o.post_gamma = gm;
+    o.post_eps = 1e-6f;
+    o.rope_hd = HD;
+    o.rope_handles = 1u;
+    o.rope_cs = cs;
+    rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                  handles, 3, x, got2, &o);
+    const int same = !memcmp(got, got2, sizeof(float) * out_n);
+    o.rope_cs = cs + 2u * HD;
+    rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                  handles, 3, x, got2, &o);
+    const int blind = !memcmp(got, got2, sizeof(float) * out_n);
+    printf("post in epilogue  : rc=%d done=%d %s%s\n", rc, done,
+           same ? "bit-identical to the passes after" : "DIFFERS",
+           blind ? " (compare is blind)" : "");
+    fail |= (rc != 0) | !done | !same | blind;
+    free(cs);
+    free(got2);
+  }
 
   /* accumulate: the synchronous path, adding into what is there. */
   {

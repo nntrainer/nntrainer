@@ -29,7 +29,7 @@ typedef struct {
 } rows_ctx;
 
 /* One row's heads, in place; cs_row = cos[hd] then sin[hd]. */
-static void rope_row(float *x, uint32_t n, uint32_t hd, const float *cs_row) {
+void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs_row) {
   const uint32_t half = hd / 2u;
   const uint32_t nvec = half / LANES;
   const HVX_UVector *vc = (const HVX_UVector *)cs_row;
@@ -62,7 +62,7 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
     float *row = c->x + (size_t)r * c->ld;
     if (c->chunk)
       hvx_rmsnorm_row_chunks_f32(row, row, c->gamma, c->n, c->chunk, c->eps);
-    rope_row(row, c->n, c->hd, c->cs + (size_t)r * 2u * c->hd);
+    hvx_rope_row_f32(row, c->n, c->hd, c->cs + (size_t)r * 2u * c->hd);
   }
 }
 

@@ -201,6 +201,21 @@ int main(void) {
     printf("DN SCATTER ROWS hvx_dequant_i32.c %s\n",
            same ? "bit-exact" : "DIFFERS");
     CHECK(same, "row-major dequant + scatter differs from the spec");
+    /* the FC epilogue's row-major worker against the tile-major one */
+    static float ta[SM * SN], tb[SM * SN];
+    hvx_dq_rows_job rj = {{(const uint8_t *)stiles, sizeof stiles[0], 0u, RS,
+                           SM, sas, saz, colsum, wsc, bias, ta, NULL, SN, SN,
+                           NT},
+                          NULL,
+                          NULL};
+    hvx_dq_tiles_worker(1u, 0u, &rj.t);
+    rj.t.dst_a = tb;
+    hvx_dq_tiles_rows_worker(2u, 0u, &rj);
+    hvx_dq_tiles_rows_worker(2u, 1u, &rj);
+    const int rsame = !memcmp(ta, tb, sizeof ta);
+    printf("DQ TILES ROW-MAJOR hvx_dequant_i32.c %s\n",
+           rsame ? "bit-exact" : "DIFFERS");
+    CHECK(rsame, "row-major tile dequant differs from the tile-major one");
   }
 
   /* 4. the activation quantized once row-major, then gathered into AH

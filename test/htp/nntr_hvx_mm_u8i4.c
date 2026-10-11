@@ -875,8 +875,9 @@ static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
  *  -- 23 MB of DSP heap at 2048 x 2816 against 0.4. */
 /** @brief Rows one hexkl_mm_u8i4_layer_run call takes at this K and these
  *  handles: the rows' u8 tiles share VTCM with the widest handle's double
- *  buffer and the staging tiles (256 KiB kept for those, the budget the
- *  host's row chunks had). Whole 64-row blocks, at least one; 0 for a
+ *  buffer and the staging tiles (512 KiB kept for those: two batches of
+ *  24 or more, so a batch can be whole heads of 256 or 512 columns for the
+ *  per-head passes in the epilogue). Whole 64-row blocks, at least one; 0 for a
  *  handle that is not registered. The entries below walk a taller call in
  *  such chunks themselves: as separate calls each chunk had its buffers
  *  mapped and synced whole by the driver again (S26 Ultra: 4.3 ms a qkv
@@ -894,7 +895,7 @@ static uint32_t fc_rows_a_call(const nntr_hvx_session *s, uint32_t K,
   }
   const size_t arena =
     s->vtcm_size < s->config_off ? s->vtcm_size : s->config_off;
-  const size_t fixed = (size_t)K * n_max + ((size_t)256u << 10);
+  const size_t fixed = (size_t)K * n_max + ((size_t)512u << 10);
   if (K == 0u || arena < fixed + (size_t)64u * K) {
     return 64u;
   }
@@ -1147,8 +1148,26 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
 
   /* The pre norm goes into the quant pass, rows normed four at a time into
      a worker's slice of norm_rows: the normed rows stay in cache. */
-  hexkl_mm_opts opts = {
-    .pool = s->quant_pool, .out_off = out_off, .out_ld = out_ld};
+  /* The post norms and RoPE ride the dequant epilogue when the kernel can
+     (post_done); the loop below is for when it cannot. */
+  int post_done = 0;
+  uint32_t chunk_of[64];
+  if (w_handlesLen > 64) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < w_handlesLen; ++i) {
+    chunk_of[i] = i < post_chunkLen ? post_chunk[i] : 0u;
+  }
+  hexkl_mm_opts opts = {.pool = s->quant_pool,
+                        .out_off = out_off,
+                        .out_ld = out_ld,
+                        .post_done = &post_done,
+                        .post_chunk = chunk_of,
+                        .post_gamma = post_gamma,
+                        .post_eps = eps,
+                        .rope_hd = rope_hd,
+                        .rope_handles = rope_hd ? rope_handles : 0u,
+                        .rope_cs = rope_cs};
   if (pre_gammaLen != 0) {
     if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
       return AEE_ENOMEMORY;
@@ -1167,7 +1186,7 @@ static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
      rope_handles after their norms -- one pass per handle that has both. */
   const float *g = post_gamma;
   size_t off = 0;
-  for (i = 0; i < w_handlesLen; ++i) {
+  for (i = 0; !post_done && i < w_handlesLen; ++i) {
     const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
     const uint32_t c = i < post_chunkLen ? post_chunk[i] : 0u;
     const int rope = rope_hd != 0u && i < (int)rope_handles;

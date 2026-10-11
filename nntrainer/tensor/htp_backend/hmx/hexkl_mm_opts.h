@@ -86,6 +86,23 @@ typedef struct {
       handles' rectangles inside out_cat and apart. */
   const uint32_t *out_off;
   const uint32_t *out_ld;
+
+  /** post_done non-NULL asks for the per-head passes that follow the
+      matmul inside its dequant epilogue: handle i's rows RMS-normed
+      post_chunk[i] columns at a time (0: no norm; its gamma is the next
+      post_chunk[i] floats of post_gamma, post_eps) and, for the first
+      rope_handles handles, rotated (rope_hd, rope_cs[M][2 * rope_hd]) --
+      hvx_rmsnorm_row_chunks_f32 then hvx_rope_row_f32 on each row's
+      staged run of columns while it is in the cache, the floats of the
+      whole-tensor passes. *post_done is set to 1 when the kernel did all
+      of them and left at 0 when it did none (a staging batch that would
+      cut a head, or the unpipelined path): the caller then runs them. */
+  int *post_done;
+  const uint32_t *post_chunk;
+  const float *post_gamma;
+  float post_eps;
+  uint32_t rope_hd, rope_handles;
+  const float *rope_cs;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */
