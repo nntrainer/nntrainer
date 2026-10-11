@@ -873,6 +873,35 @@ static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
 /** @brief Floats hexkl_mm_opts.pre_scratch needs: four rows of K a lane
  *  (hvx_quant_params_pack_u8_ah), not the M x K the whole-copy norm takes
  *  -- 23 MB of DSP heap at 2048 x 2816 against 0.4. */
+/** @brief Rows one hexkl_mm_u8i4_layer_run call takes at this K and these
+ *  handles: the rows' u8 tiles share VTCM with the widest handle's double
+ *  buffer and the staging tiles (256 KiB kept for those, the budget the
+ *  host's row chunks had). Whole 64-row blocks, at least one; 0 for a
+ *  handle that is not registered. The entries below walk a taller call in
+ *  such chunks themselves: as separate calls each chunk had its buffers
+ *  mapped and synced whole by the driver again (S26 Ultra: 4.3 ms a qkv
+ *  call, 2.2 an o-proj call, two to four calls a 2048-row layer). */
+static uint32_t fc_rows_a_call(const nntr_hvx_session *s, uint32_t K,
+                               const uint32 *w_handles, int w_handlesLen) {
+  uint32_t n_max = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return 0u;
+    }
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    n_max = n_i > n_max ? n_i : n_max;
+  }
+  const size_t arena =
+    s->vtcm_size < s->config_off ? s->vtcm_size : s->config_off;
+  const size_t fixed = (size_t)K * n_max + ((size_t)256u << 10);
+  if (K == 0u || arena < fixed + (size_t)64u * K) {
+    return 64u;
+  }
+  const uint32_t rows = (uint32_t)((arena - fixed) / K);
+  return rows - rows % 64u;
+}
+
 static size_t pre_scratch_floats(const nntr_hvx_session *s, uint32_t M,
                                  uint32_t K) {
   const size_t rows =
@@ -882,13 +911,13 @@ static size_t pre_scratch_floats(const nntr_hvx_session *s, uint32_t M,
 
 /* Both res_add entries: the activation f32, or u16 with act_enc / act_hd
    (dequantized inside the quant pass through the norm_rows scratch). */
-static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
-                              float eps, float scale, const float *gamma,
-                              int gammaLen, const uint32 *w_handles,
-                              int w_handlesLen, const float *act_f32,
-                              const uint16 *act_u16, const float *act_enc,
-                              uint32 act_hd, int actLen, const float *res,
-                              int resLen, float *out_f32, int out_f32Len) {
+static int layer_res_add_chunk(nntr_hvx_session *s, uint32 M, uint32 K,
+                               float eps, float scale, const float *gamma,
+                               int gammaLen, const uint32 *w_handles,
+                               int w_handlesLen, const float *act_f32,
+                               const uint16 *act_u16, const float *act_enc,
+                               uint32 act_hd, int actLen, const float *res,
+                               int resLen, float *out_f32, int out_f32Len) {
   if (!s || w_handlesLen <= 0 || w_handlesLen > 16) {
     return AEE_EBADPARM;
   }
@@ -949,6 +978,38 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
                                  M, gammaLen ? gamma : NULL, eps, scale,
                                  s->quant_pool) != 0) {
     return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
+/* A call of any height, in fc_rows_a_call chunks of its rows. */
+static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
+                              float eps, float scale, const float *gamma,
+                              int gammaLen, const uint32 *w_handles,
+                              int w_handlesLen, const float *act_f32,
+                              const uint16 *act_u16, const float *act_enc,
+                              uint32 act_hd, int actLen, const float *res,
+                              int resLen, float *out_f32, int out_f32Len) {
+  if (!s || w_handlesLen <= 0 || M == 0u || K == 0u) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t step = fc_rows_a_call(s, K, w_handles, w_handlesLen);
+  if (step == 0u || (uint64_t)actLen != (uint64_t)M * K || resLen < 0 ||
+      (uint32_t)resLen % M != 0u || resLen != out_f32Len) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t N = (uint32_t)resLen / M;
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    const int rc = layer_res_add_chunk(
+      s, m, K, eps, scale, gamma, gammaLen, w_handles, w_handlesLen,
+      act_f32 ? act_f32 + (size_t)m0 * K : NULL,
+      act_u16 ? act_u16 + (size_t)m0 * K : NULL, act_enc, act_hd, (int)(m * K),
+      res + (size_t)m0 * N, (int)(m * N), out_f32 + (size_t)m0 * N,
+      (int)(m * N));
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
   }
   return AEE_SUCCESS;
 }
@@ -1169,11 +1230,31 @@ int nntr_hvx_mm_u8i4_layer_norm_ld(
       return AEE_EBADPARM;
     }
   }
-  return layer_norm_impl(s, M, K, eps, pre_gamma, pre_gammaLen, post_chunk,
-                         post_chunkLen, post_gamma, post_gammaLen, rope_hd,
-                         rope_handles, rope_cs, rope_csLen, w_handles,
-                         w_handlesLen, act_f32, act_f32Len, out_cat, out_catLen,
-                         out_off, out_ld);
+  /* Any height, in fc_rows_a_call chunks: every norm and the RoPE are per
+     row, and each chunk's rows land at their own rows of the rectangles. */
+  uint32_t off[64];
+  const uint32_t step = fc_rows_a_call(s, K, w_handles, w_handlesLen);
+  if (step == 0u || w_handlesLen > 64 ||
+      (uint64_t)act_f32Len != (uint64_t)M * K ||
+      (rope_hd != 0u && (uint64_t)rope_csLen != (uint64_t)M * 2u * rope_hd)) {
+    return AEE_EBADPARM;
+  }
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    for (int i = 0; i < w_handlesLen; ++i) {
+      off[i] = out_off[i] + m0 * out_ld[i];
+    }
+    const int rc = layer_norm_impl(
+      s, m, K, eps, pre_gamma, pre_gammaLen, post_chunk, post_chunkLen,
+      post_gamma, post_gammaLen, rope_hd, rope_handles,
+      rope_hd ? rope_cs + (size_t)m0 * 2u * rope_hd : rope_cs,
+      rope_hd ? (int)(m * 2u * rope_hd) : rope_csLen, w_handles, w_handlesLen,
+      act_f32 + (size_t)m0 * K, (int)(m * K), out_cat, out_catLen, off, out_ld);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
