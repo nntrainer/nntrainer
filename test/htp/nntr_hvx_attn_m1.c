@@ -111,6 +111,31 @@ int nntr_hvx_attn_m1_kv_append(remote_handle64 handle, uint32 layer,
   return hvx_attn_m1_kv_append(c, layer, kv_from, n_rows, k_rows, v_rows);
 }
 
+int nntr_hvx_attn_m1_kv_append_f16(remote_handle64 handle, uint32 layer,
+                                   uint32 kv_from, uint32 n_rows,
+                                   const uint16 *k_rows, int kLen,
+                                   const uint16 *v_rows, int vLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  hvx_attn_m1_ctx *c =
+    (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
+  layer &= ~HTP_ATTN_KV_CACHE_B;
+  if (!c) {
+    return AEE_EBADSTATE;
+  }
+  const uint64_t want = (uint64_t)n_rows * c->n_kv * c->head_dim;
+  if (kLen < 0 || vLen < 0 || (uint64_t)kLen != want ||
+      (uint64_t)vLen != want) {
+    FARF(ERROR,
+         "attn_m1_kv_append_f16: bad shape (n_rows=%u k=%d v=%d want=%u)",
+         (unsigned)n_rows, kLen, vLen, (unsigned)want);
+    return AEE_EINVALIDFORMAT;
+  }
+  return hvx_attn_m1_kv_append_f16(c, layer, kv_from, n_rows, k_rows, v_rows);
+}
+
 int nntr_hvx_attn_m1_seed_kvq(remote_handle64 handle, uint32 layer,
                               uint32 kv_handle, uint32 n_rows,
                               const float *k_rows, int k_rowsLen) {

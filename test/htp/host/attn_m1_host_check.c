@@ -1614,6 +1614,93 @@ static void check_seed_vec(hvx_worker_pool *pool) {
   }
 }
 
+/** [#4416 D6] kv_append_f16 against kv_append of the same values as f32:
+ *  the DSP's widening (sign, subnormals, the ties the forced scales make
+ *  visible) and both the vector tile and the scalar tail, at a shape whose
+ *  row is not a multiple of 128 (3 x 64: the amax pass's short unit). */
+static float host_hf_float(uint16_t h) {
+  const uint32_t e = (h >> 10) & 31u, m = h & 1023u;
+  const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t bits;
+  float f;
+  if (e == 0u) {
+    f = (float)m * (1.0f / 16777216.0f);
+    memcpy(&bits, &f, 4);
+    bits |= s;
+  } else {
+    bits = s | ((e + 112u) << 23) | (m << 13);
+  }
+  memcpy(&f, &bits, 4);
+  return f;
+}
+
+static void check_seed_f16(hvx_worker_pool *pool) {
+  static const uint32_t shapes[][2] = {{8u, 256u}, {2u, 512u}, {3u, 64u}};
+  const uint32_t L = 130u, max_seq = 256u;
+  int bad = 0;
+  for (size_t sh = 0; sh < sizeof(shapes) / sizeof(shapes[0]); ++sh) {
+    const uint32_t n_kv = shapes[sh][0], hd = shapes[sh][1];
+    const size_t row = (size_t)n_kv * hd, n = L * row;
+    uint16_t *k16 = (uint16_t *)malloc(n * 2), *v16 = (uint16_t *)malloc(n * 2);
+    float *k = (float *)malloc(n * 4), *v = (float *)malloc(n * 4);
+    for (size_t i = 0; i < n; ++i) {
+      /* every fp16 class: normals of both signs, subnormals, +-0, no inf/nan */
+      uint16_t a = (uint16_t)((i * 40503u + 17u) & 0xFFFFu);
+      uint16_t b = (uint16_t)((i * 2654435761u >> 7) & 0xFFFFu);
+      if ((a & 0x7C00u) == 0x7C00u) {
+        a &= 0xBFFFu;
+      }
+      if ((b & 0x7C00u) == 0x7C00u) {
+        b &= 0xBFFFu;
+      }
+      if (i % 97u == 0u) {
+        a &= 0x83FFu; /* a subnormal or zero */
+      }
+      k16[i] = a;
+      v16[i] = b;
+      k[i] = host_hf_float(a);
+      v[i] = host_hf_float(b);
+    }
+    int err = 0;
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      1u, n_kv, 1u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      1u, n_kv, 1u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    CHECK(a && b, "seed_f16: create");
+    if (!a || !b) {
+      return;
+    }
+    CHECK(hvx_attn_m1_kv_append_f16(a, 0u, 0u, L, k16, v16) == AEE_SUCCESS,
+          "seed_f16: kv_append_f16");
+    CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, k, v) == AEE_SUCCESS,
+          "seed_f16: kv_append reference");
+    int kbad = 0, sbad = 0;
+    for (size_t i = 0; i < a->layer_bytes; ++i) {
+      kbad += ((const int8_t *)a->kt[0])[i] != ((const int8_t *)b->kt[0])[i];
+      kbad += ((const int8_t *)a->v[0])[i] != ((const int8_t *)b->v[0])[i];
+    }
+    for (size_t i = 0; i < row; ++i) {
+      sbad += a->sk[i] != b->sk[i] || a->sv[i] != b->sv[i] ||
+              a->sk_inv[i] != b->sk_inv[i] || a->sv_inv[i] != b->sv_inv[i];
+    }
+    CHECK(kbad == 0 && sbad == 0,
+          "seed_f16 n_kv=%u hd=%u: %d bytes, %d scales differ from f32 rows",
+          n_kv, hd, kbad, sbad);
+    bad += kbad + sbad;
+    hvx_attn_m1_free(a);
+    hvx_attn_m1_free(b);
+    free(k16);
+    free(v16);
+    free(k);
+    free(v);
+  }
+  if (bad == 0) {
+    printf("ATTN M1 SEED F16 OK\n");
+  }
+}
+
 int main(void) {
   check_cpu_order();
   check_prim_rne16();
@@ -1643,6 +1730,8 @@ int main(void) {
   check_seed_q8(pools[2]);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
+  check_seed_f16(pools[2]);
+  check_seed_f16(NULL);
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);

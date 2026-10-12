@@ -765,14 +765,23 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     }
     const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
     const size_t n = static_cast<size_t>(pos) * wk;
-    std::vector<float> k_rows(n), v_rows(n);
-    auto rows_f32 = [&](const nntrainer::Tensor &c, float *dst) {
-      rows_f32_of(c, dst, n, wk);
-    };
-    rows_f32(ck, k_rows.data());
-    rows_f32(cv, v_rows.data());
-    const auto t_conv = std::chrono::steady_clock::now();
-    htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
+    auto t_conv = t_seed;
+    // [#4416 D6] an fp16 / UINT16 cache goes as its bits: the DSP widens
+    // them exactly (hvx_hf_bits_to_sf), nothing converted or copied here
+    const bool bits16 =
+      ck.getDataType() != ml::train::TensorDim::DataType::FP32 &&
+      cv.getDataType() != ml::train::TensorDim::DataType::FP32;
+    if (!bits16 || !htpDecodeKvSeedF16(pos, ck.getData<uint16_t>(),
+                                       cv.getData<uint16_t>())) {
+      std::vector<float> k_rows(n), v_rows(n);
+      auto rows_f32 = [&](const nntrainer::Tensor &c, float *dst) {
+        rows_f32_of(c, dst, n, wk);
+      };
+      rows_f32(ck, k_rows.data());
+      rows_f32(cv, v_rows.data());
+      t_conv = std::chrono::steady_clock::now();
+      htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
+    }
     drop_cpu_cache();
     {
       static double conv_ms = 0.0, all_ms = 0.0; // [#282 F] summed, logged

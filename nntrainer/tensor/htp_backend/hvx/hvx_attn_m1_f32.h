@@ -173,6 +173,13 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
                           uint32_t kv_from, uint32_t n_rows,
                           const float *k_rows, const float *v_rows);
 
+/** @brief [#4416 D6] kv_append from rows of fp16 bits (the CPU cache's
+ *         storage): each value widened exactly on the DSP (sign and
+ *         subnormals as compute_fp16_to_fp32), then as kv_append. */
+int hvx_attn_m1_kv_append_f16(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t kv_from, uint32_t n_rows,
+                              const uint16_t *k_rows, const uint16_t *v_rows);
+
 /**
  * @brief [#289] Seeds an int8 cache's @a layer with @a n_rows positions
  *        already quantized: per kv head row-major masters stored as

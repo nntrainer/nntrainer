@@ -195,6 +195,20 @@ inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,
 #endif
 }
 
+/** @brief [#4416 D6] The same rows as the cache's fp16 bits: the backend
+ *  widens them itself (no CPU conversion). False: seed with f32 rows. */
+inline bool htpDecodeKvSeedF16(unsigned n_rows, const uint16_t *k_rows,
+                               const uint16_t *v_rows) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_seed_f16(n_rows, k_rows, v_rows);
+#else
+  (void)n_rows;
+  (void)k_rows;
+  (void)v_rows;
+  return false;
+#endif
+}
+
 } // namespace causallm
 
 #endif /* __CAUSALLM_HTP_DECODE_HOOK_H__ */

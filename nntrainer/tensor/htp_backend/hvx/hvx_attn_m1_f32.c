@@ -308,7 +308,35 @@ typedef struct {
   hvx_attn_m1_ctx *ctx;
   uint32_t layer, kv_from, n_rows, units;
   const float *k_rows, *v_rows;
+  /** [#4416 D6] rows as fp16 bits instead (k_rows / v_rows NULL): the
+   *  CPU cache's own storage, widened here exactly (hvx_hf_bits_to_sf) */
+  const uint16_t *k16, *v16;
 } append_job;
+
+/** @brief Element size of the job's rows, for the row stride. */
+static inline size_t job_esz(const append_job *job) {
+  return job->k16 ? sizeof(uint16_t) : sizeof(float);
+}
+
+/** @brief @a nv x 32 values of a row (f32, or fp16 bits widened exactly:
+ *         sign and subnormals kept) as sf vectors in order; nv even when
+ *         f16 (an fp16 vector is 64 values; rows are multiples of 64). */
+static inline void row128_sf(const void *x, int f16, uint32_t nv,
+                             HVX_Vector out[4]) {
+  if (f16) {
+    const HVX_UVector *h = (const HVX_UVector *)x;
+    for (uint32_t j = 0; j < nv / 2u; ++j) {
+      const HVX_VectorPair w = Q6_Wuw_vunpack_Vuh(h[j]);
+      out[2u * j] = hvx_hf_bits_to_sf(Q6_V_lo_W(w));
+      out[2u * j + 1u] = hvx_hf_bits_to_sf(Q6_V_hi_W(w));
+    }
+  } else {
+    const HVX_UVector *v = (const HVX_UVector *)x;
+    for (uint32_t j = 0; j < nv; ++j) {
+      out[j] = v[j];
+    }
+  }
+}
 
 #define APPEND_ROWS 64u
 
@@ -326,20 +354,24 @@ static void run_amax(uint32_t n, uint32_t i, void *arg) {
   float *sk = job->ctx->sk + (size_t)job->layer * row;
   float *sv = job->ctx->sv + (size_t)job->layer * row;
   const HVX_Vector mask = Q6_V_vsplat_R(0x7FFFFFFF);
+  const int f16 = job->k16 != NULL;
+  const size_t esz = job_esz(job);
+  const uint8_t *kb =
+    f16 ? (const uint8_t *)job->k16 : (const uint8_t *)job->k_rows;
+  const uint8_t *vb =
+    f16 ? (const uint8_t *)job->v16 : (const uint8_t *)job->v_rows;
   for (uint32_t u = i; u < job->units; u += n) {
     const size_t lo = (size_t)u * AMAX_D;
     const uint32_t nv =
       (uint32_t)((row - lo < AMAX_D ? row - lo : AMAX_D) / 32u);
-    HVX_Vector mk[AMAX_D / 32u], mv[AMAX_D / 32u];
+    HVX_Vector mk[AMAX_D / 32u], mv[AMAX_D / 32u], kr[4], vr[4];
     for (uint32_t j = 0; j < nv; ++j) {
       mk[j] = Q6_V_vzero();
       mv[j] = Q6_V_vzero();
     }
     for (uint32_t r = 0; r < job->n_rows; ++r) {
-      const HVX_UVector *kr =
-        (const HVX_UVector *)(job->k_rows + (size_t)r * row + lo);
-      const HVX_UVector *vr =
-        (const HVX_UVector *)(job->v_rows + (size_t)r * row + lo);
+      row128_sf(kb + ((size_t)r * row + lo) * esz, f16, nv, kr);
+      row128_sf(vb + ((size_t)r * row + lo) * esz, f16, nv, vr);
       for (uint32_t j = 0; j < nv; ++j) {
         mk[j] = Q6_Vw_vmax_VwVw(mk[j], Q6_V_vand_VV(kr[j], mask));
         mv[j] = Q6_Vw_vmax_VwVw(mv[j], Q6_V_vand_VV(vr[j], mask));
@@ -354,9 +386,10 @@ static void run_amax(uint32_t n, uint32_t i, void *arg) {
 
 /** @brief [#282 D] The layer's scales from @a n_rows rows [n][n_kv][hd]
  *         (amax x @a margin / 127; 1 for an all-zero head or dim). */
-static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
-                          const float *k_rows, const float *v_rows,
-                          float margin) {
+static void q8_set_scales_rows(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                               uint32_t n_rows, const float *k_rows,
+                               const float *v_rows, const uint16_t *k16,
+                               const uint16_t *v16, float margin) {
   const uint32_t hd = ctx->head_dim, nkv = ctx->n_kv;
   const size_t n = (size_t)nkv * hd;
   float *sk = ctx->sk + (size_t)layer * n;
@@ -366,8 +399,8 @@ static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   memset(sv, 0, n * sizeof(float));
   {
     append_job job = {
-      ctx,    layer, 0u, n_rows, (uint32_t)((n + AMAX_D - 1u) / AMAX_D),
-      k_rows, v_rows};
+      ctx,    layer,  0u,  n_rows, (uint32_t)((n + AMAX_D - 1u) / AMAX_D),
+      k_rows, v_rows, k16, v16};
     hvx_worker_pool_run(ctx->pool, run_amax, &job, job.units);
   }
   float *ski = ctx->sk_inv + (size_t)layer * n;
@@ -379,6 +412,12 @@ static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
     svi[i] = 1.0f / sv[i];
   }
   ctx->scaled[layer] = 1u;
+}
+
+static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
+                          const float *k_rows, const float *v_rows,
+                          float margin) {
+  q8_set_scales_rows(ctx, layer, n_rows, k_rows, v_rows, NULL, NULL, margin);
 }
 
 /** @brief [#282 D] One position of one (layer, kv head) into the int8
@@ -437,9 +476,10 @@ static inline HVX_Vector q8_lanes(HVX_Vector x, HVX_Vector inv) {
 /** @brief 128 dims of one row quantized to a byte vector (lanes in order:
  *         the saturating word -> halfword pack keeps -127..127, the even-
  *         byte pack takes each halfword's value). */
-static inline HVX_Vector q8_row128(const float *x, const float *inv) {
-  const HVX_UVector *xv = (const HVX_UVector *)x;
+static inline HVX_Vector q8_row128(const void *x, int f16, const float *inv) {
   const HVX_UVector *iv = (const HVX_UVector *)inv;
+  HVX_Vector xv[4];
+  row128_sf(x, f16, 4u, xv);
   const HVX_Vector h01 =
     Q6_Vh_vpack_VwVw_sat(q8_lanes(xv[1], iv[1]), q8_lanes(xv[0], iv[0]));
   const HVX_Vector h23 =
@@ -456,8 +496,9 @@ static inline HVX_Vector q8_row128(const float *x, const float *inv) {
  *         one aligned store into the tile. Mapping read off the host
  *         emulation; attn_m1_host_check compares every byte. */
 static void append_tile_q8(const hvx_attn_m1_ctx *ctx, uint32_t layer,
-                           uint32_t h, uint32_t pos0, const float *k,
-                           const float *v, size_t stride) {
+                           uint32_t h, uint32_t pos0, const uint8_t *k,
+                           const uint8_t *v, size_t stride, int f16) {
+  const size_t esz = f16 ? sizeof(uint16_t) : sizeof(float);
   const uint32_t hd = ctx->head_dim;
   const float *ski = ctx->sk_inv + ((size_t)layer * ctx->n_kv + h) * hd;
   const float *svi = ctx->sv_inv + ((size_t)layer * ctx->n_kv + h) * hd;
@@ -468,8 +509,8 @@ static void append_tile_q8(const hvx_attn_m1_ctx *ctx, uint32_t layer,
     HVX_Vector a[TILE];
     for (uint32_t r = 0; r < TILE; ++r) {
       *(HVX_UVector *)(vr + (size_t)r * hd + d0) =
-        q8_row128(v + (size_t)r * stride + d0, svi + d0);
-      a[r] = q8_row128(k + (size_t)r * stride + d0, ski + d0);
+        q8_row128(v + ((size_t)r * stride + d0) * esz, f16, svi + d0);
+      a[r] = q8_row128(k + ((size_t)r * stride + d0) * esz, f16, ski + d0);
     }
 #define KT_STAGE(g, d)                                                         \
   for (uint32_t p = 0; p < TILE; ++p) {                                        \
@@ -502,12 +543,31 @@ static void run_append(uint32_t n, uint32_t i, void *arg) {
     const uint32_t h = u % ctx->n_kv, r0 = (u / ctx->n_kv) * APPEND_ROWS;
     const uint32_t r1 =
       r0 + APPEND_ROWS < job->n_rows ? r0 + APPEND_ROWS : job->n_rows;
+    const int f16 = job->k16 != NULL;
+    const size_t at = (size_t)r0 * row + (size_t)h * ctx->head_dim;
     if (ctx->q8 && r1 - r0 == TILE && (job->kv_from % TILE) == 0u &&
         (ctx->head_dim % 128u) == 0u) { /* a whole tile: vectors */
-      append_tile_q8(ctx, job->layer, h, job->kv_from + r0,
-                     job->k_rows + (size_t)r0 * row + (size_t)h * ctx->head_dim,
-                     job->v_rows + (size_t)r0 * row + (size_t)h * ctx->head_dim,
-                     row);
+      append_tile_q8(
+        ctx, job->layer, h, job->kv_from + r0,
+        (f16 ? (const uint8_t *)job->k16 : (const uint8_t *)job->k_rows) +
+          at * job_esz(job),
+        (f16 ? (const uint8_t *)job->v16 : (const uint8_t *)job->v_rows) +
+          at * job_esz(job),
+        row, f16);
+      continue;
+    }
+    if (f16) { /* the rows widened one position at a time */
+      float kf[512], vf[512];
+      for (uint32_t r = r0; r < r1; ++r) {
+        const uint16_t *k = job->k16 + r * row + (size_t)h * ctx->head_dim;
+        const uint16_t *v = job->v16 + r * row + (size_t)h * ctx->head_dim;
+        for (uint32_t d = 0; d < ctx->head_dim; ++d) {
+          kf[d] = hf_float(k[d]);
+          vf[d] = hf_float(v[d]);
+        }
+        (ctx->q8 ? append_head_q8 : append_head)(ctx, job->layer, h,
+                                                 job->kv_from + r, kf, vf);
+      }
       continue;
     }
     for (uint32_t r = r0; r < r1; ++r) {
@@ -519,14 +579,16 @@ static void run_append(uint32_t n, uint32_t i, void *arg) {
   }
 }
 
-int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
+static int kv_append_rows(hvx_attn_m1_ctx *ctx, uint32_t layer,
                           uint32_t kv_from, uint32_t n_rows,
-                          const float *k_rows, const float *v_rows) {
+                          const float *k_rows, const float *v_rows,
+                          const uint16_t *k16, const uint16_t *v16) {
   if (!ctx) {
     return AEE_EBADSTATE;
   }
   if (layer >= ctx->n_layers || kv_from > ctx->max_seq ||
-      n_rows > ctx->max_seq - kv_from || (n_rows && (!k_rows || !v_rows))) {
+      n_rows > ctx->max_seq - kv_from ||
+      (n_rows && !((k_rows && v_rows) || (k16 && v16)))) {
     return AEE_EINVALIDFORMAT;
   }
   if (kv_from > ctx->kv_len[layer]) {
@@ -536,7 +598,8 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
     return AEE_ENOMEMORY;
   }
   if (ctx->q8 && n_rows != 0u && !ctx->scaled[layer]) { /* [#282 D] */
-    q8_set_scales(ctx, layer, n_rows, k_rows, v_rows, HVX_ATTN_M1_Q8_MARGIN);
+    q8_set_scales_rows(ctx, layer, n_rows, k_rows, v_rows, k16, v16,
+                       HVX_ATTN_M1_Q8_MARGIN);
   }
   {
     append_job job = {ctx,
@@ -545,11 +608,27 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
                       n_rows,
                       ctx->n_kv * ((n_rows + APPEND_ROWS - 1u) / APPEND_ROWS),
                       k_rows,
-                      v_rows};
+                      v_rows,
+                      k16,
+                      v16};
     hvx_worker_pool_run(ctx->pool, run_append, &job, job.units);
   }
   ctx->kv_len[layer] = kv_from + n_rows;
   return AEE_SUCCESS;
+}
+
+int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                          uint32_t kv_from, uint32_t n_rows,
+                          const float *k_rows, const float *v_rows) {
+  return kv_append_rows(ctx, layer, kv_from, n_rows, k_rows, v_rows, NULL,
+                        NULL);
+}
+
+int hvx_attn_m1_kv_append_f16(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t kv_from, uint32_t n_rows,
+                              const uint16_t *k_rows, const uint16_t *v_rows) {
+  return kv_append_rows(ctx, layer, kv_from, n_rows, NULL, NULL, k_rows,
+                        v_rows);
 }
 
 /** [#289] seed_q8 over the pool: units are (kv head, 64-row chunk) */
