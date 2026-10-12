@@ -1423,6 +1423,71 @@ static void check_gemma(hvx_worker_pool *const pools[3]) {
   }
 }
 
+/** @brief [#4416 F] HVX_ATTN_M1_FAST at Gemma's shapes: not bit-identical,
+ *         so the SNR against the f64 reference is the whole check (the
+ *         spec's own is 35-50 dB; int8 K / V with per-dim scales and the
+ *         integer forward land a few dB under it; a layout or lane mistake
+ *         lands near 0), the pool count must not change the bytes, and the
+ *         stats must carry the f32 max and the P sum. */
+static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
+  static const uint32_t lengths[] = {1u, 65u, 1023u, 1024u, 1025u, 4096u};
+  double lo_snr = 1e9;
+  const int fail0 = g_fail;
+  for (uint32_t s = 0; s < 2u; ++s) {
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+      const uint32_t L = lengths[i];
+      const uint32_t n_kv = G4[s].n_kv, gqa = G4[s].gqa, hd = G4[s].hd;
+      const uint32_t win = G4[s].window, n_q = n_kv * gqa, nq = n_q * hd;
+      amc_rng r = {0x4296u + L * 7u + s};
+      float *q = malloc(nq * sizeof(float));
+      float *k = malloc((size_t)L * n_kv * hd * sizeof(float));
+      float *v = malloc((size_t)L * n_kv * hd * sizeof(float));
+      float *out = malloc(nq * sizeof(float)),
+            *out1 = malloc(nq * sizeof(float));
+      float stats[2u * 64u];
+      g4_fill(&r, q, k, v, L, n_kv, gqa, hd, win);
+      const size_t last = (size_t)(L - 1u) * n_kv * hd;
+      for (int pi = 0; pi < 3; ++pi) {
+        int err = -1;
+        hvx_attn_m1_ctx *ctx = hvx_attn_m1_create(
+          N_LAYERS, n_kv, gqa, hd,
+          G4_SEQ | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY | HVX_ATTN_M1_FAST,
+          pools[pi], &err);
+        CHECK(ctx && err == AEE_SUCCESS && ctx->fast, "fast %s create: %d",
+              G4[s].name, err);
+        if (!ctx) {
+          break;
+        }
+        int rc = hvx_attn_m1_kv_append(ctx, LAYER, 0u, L - 1u, k, v);
+        rc |= hvx_attn_m1_forward(ctx, LAYER, L - 1u, win, 1.0f, q, k + last,
+                                  v + last, pi ? out1 : out, stats);
+        CHECK(rc == AEE_SUCCESS, "fast %s L=%u rc=%d", G4[s].name, L, rc);
+        if (pi) {
+          CHECK(count_bad(out1, out, nq) == 0u, "fast %s L=%u: pool changes",
+                G4[s].name, L);
+        }
+        hvx_attn_m1_free(ctx);
+      }
+      const double snr = g4_snr(q, k, v, L, n_kv, gqa, hd, win, out);
+      lo_snr = snr < lo_snr ? snr : lo_snr;
+      printf("ATTN M1 FAST %s (%u,%u,%u) window=%u L=%u SNR(fast vs f64)=%.1f "
+             "dB m=%.3f l=%.0f\n",
+             G4[s].name, n_kv, gqa, hd, win, L, snr, stats[0], stats[1]);
+      CHECK(snr > 20.0, "fast %s L=%u: SNR %.1f dB", G4[s].name, L, snr);
+      CHECK(stats[1] >= 32767.0f, "fast %s L=%u: l=%f lacks the max's P",
+            G4[s].name, L, stats[1]);
+      free(q);
+      free(k);
+      free(v);
+      free(out);
+      free(out1);
+    }
+  }
+  if (g_fail == fail0) {
+    printf("ATTN M1 FAST OK: lowest SNR vs f64 %.1f dB\n", lo_snr);
+  }
+}
+
 /* [#289] seed_q8 on a lazy int8 cache: the q ^ 0x80 masters land in Kt's
    tile columns and V's rows unchanged, K's head scale fills its dims, the
    other layers stay unallocated, and a second seed of the layer is refused */
@@ -1727,6 +1792,7 @@ int main(void) {
   check_division_tie(pools[1]);
   check_errors(pools[1]);
   check_gemma(pools);
+  check_gemma_fast(pools);
   check_seed_q8(pools[2]);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);

@@ -126,6 +126,15 @@ typedef struct {
   float *sv_inv;      /**< 1 / sv, for the appends */
   uint8_t *scaled;    /**< [n_layers] 1 once the layer's scales are set */
   size_t layer_bytes; /**< [#289] kt[l] / v[l] size, for a lazy layer */
+  /** [#4416 F] HVX_ATTN_M1_FAST at create (needs q8, head_dim % 256 == 0):
+   *  the forward is NOT the fp16 spec. q is int16 a head (x K's per-dim
+   *  scale), the scores int32 by vmpyh over the int8 tiles -> f32; the
+   *  softmax f32 with P as 15-bit integers in s; PV int32 by vmpyh over
+   *  the int8 rows, flushed to f32 every 256 positions. Same cache bytes */
+  uint32_t fast;
+  float *sf;     /**< f32 [n_kv * gqa][seq]: the scores */
+  int16_t *q16;  /**< [n_kv * gqa][head_dim]: q quantized */
+  int32_t *psum; /**< [n_kv * gqa][seq / 64]: a tile's P sum */
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
@@ -134,6 +143,10 @@ typedef struct {
  *  at its first seed or forward, not at create, so a seed can free the
  *  prefill's cache of that layer before the next layer's comes. */
 #define HVX_ATTN_M1_LAZY 0x40000000u
+/** @brief [#4416 F] Or-ed into create's max_seq: the integer forward (not
+ *  bit-identical to the spec); refused without HVX_ATTN_M1_Q8, at a
+ *  head_dim that is not a multiple of 256, or a gqa not 1, 2, 4 or 8. */
+#define HVX_ATTN_M1_FAST 0x20000000u
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 

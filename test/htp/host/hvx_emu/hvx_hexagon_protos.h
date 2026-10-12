@@ -708,6 +708,21 @@ static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
   return r;
 }
 
+/* [#4416 F] Vxx.w += vmpy(Vu.h, Rt.h) (V79 HVX PRM): v[0].w[i] += Vu.w[i].
+   h[0] * Rt.h[0] (the even halfwords by Rt's low half), v[1].w[i] +=
+   Vu.w[i].h[1] * Rt.h[1] (the odd by its high half); wrapping. */
+static inline HVX_VectorPair Q6_Ww_vmpyacc_WwVhRh(HVX_VectorPair x,
+                                                  HVX_Vector u, int32_t rt) {
+  int16_t h[2 * HVX_EMU_LANES];
+  memcpy(h, u.w, sizeof(h));
+  const int32_t r0 = (int16_t)(rt & 0xFFFF), r1 = (int16_t)(rt >> 16);
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    x.lo.w[i] = (int32_t)((uint32_t)x.lo.w[i] + (uint32_t)(h[2 * i] * r0));
+    x.hi.w[i] = (int32_t)((uint32_t)x.hi.w[i] + (uint32_t)(h[2 * i + 1] * r1));
+  }
+  return x;
+}
+
 /* [#282 D] Vdd.h = vunpack(Vu.b): sign-extended, in order -- lo gets bytes
    0..63, hi 64..127, as Q6_Ww_vunpack_Vh above. */
 static inline HVX_VectorPair Q6_Wh_vunpack_Vb(HVX_Vector a) {
