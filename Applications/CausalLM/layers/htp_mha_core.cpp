@@ -695,6 +695,11 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
                       wq, htp_rope_table_.data(),
                       static_cast<unsigned>(htp_rope_table_.size()));
+    // [#4416 mem] bound: the DSP holds its copy and asks (3) again only
+    // after a new graph init, when build_rope_table makes it again. 30
+    // layers x 2.2-4.5 MB kept for nothing otherwise.
+    if (r != 3)
+      std::vector<float>().swap(htp_rope_table_);
   }
   if (r == 2) {
     // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
