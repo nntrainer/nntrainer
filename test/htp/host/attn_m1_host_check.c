@@ -1518,6 +1518,102 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   }
 }
 
+/** [#4416 D6] The vector seed (hvx_attn_m1_f32.c's run_amax / append_tile_q8)
+ *  against the per-element definition it replaced: amax = max |x| per dim,
+ *  byte = (int)(clamp(x * inv, +-127) +- 0.5). Two passes a shape: scales
+ *  forced to 1 so the rows are the products (ties at .5, 127.5, -0, huge,
+ *  tiny), then the real path (scales from the rows' amax), L = 130: two
+ *  whole tiles and a partial one (the scalar path). */
+static int8_t ref_q8(float x, float inv) {
+  float r = x * inv;
+  r = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+  return (int8_t)(int32_t)(r + (r >= 0.0f ? 0.5f : -0.5f));
+}
+
+static void check_seed_vec(hvx_worker_pool *pool) {
+  static const float edge[] = {
+    0.5f,   1.5f,   2.5f,        -0.5f,        -1.5f,   -2.5f,
+    126.5f, 127.5f, -127.5f,     200.0f,       -200.0f, 1e-9f,
+    -1e-9f, -0.0f,  0.0f,        126.9999f,    3.0f,    0.49999997f,
+    1e30f,  -1e30f, 0.50000006f, -0.50000006f, 64.5f,   -64.5f};
+  const uint32_t L = 130u, max_seq = 256u;
+  int bad = 0;
+  for (uint32_t hd = 256u; hd <= 512u; hd += 256u) {
+    const uint32_t n_kv = hd == 256u ? 8u : 2u;
+    const size_t row = (size_t)n_kv * hd;
+    float *k = (float *)malloc(L * row * sizeof(float));
+    float *v = (float *)malloc(L * row * sizeof(float));
+    for (size_t i = 0; i < L * row; ++i) {
+      k[i] = (float)((int)((i * 2654435761u) % 4001u) - 2000) * 0.071f;
+      v[i] = (float)((int)((i * 40503u + 7u) % 3001u) - 1500) * 0.013f;
+    }
+    for (int forced = 1; forced >= 0; --forced) {
+      int err = 0;
+      hvx_attn_m1_ctx *c = hvx_attn_m1_create(
+        1u, n_kv, 1u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+        &err);
+      CHECK(c && err == AEE_SUCCESS, "seed_vec: create hd=%u", hd);
+      if (!c) {
+        return;
+      }
+      if (forced) {
+        for (size_t i = 0; i < row; ++i) {
+          c->sk[i] = c->sv[i] = c->sk_inv[i] = c->sv_inv[i] = 1.0f;
+        }
+        c->scaled[0] = 1u;
+        for (size_t i = 0; i < L * row; ++i) {
+          k[i] = edge[(i * 7u) % (sizeof(edge) / sizeof(edge[0]))];
+          v[i] = edge[(i * 11u + 3u) % (sizeof(edge) / sizeof(edge[0]))];
+        }
+      }
+      CHECK(hvx_attn_m1_kv_append(c, 0u, 0u, L, k, v) == AEE_SUCCESS,
+            "seed_vec: kv_append hd=%u forced=%d", hd, forced);
+      int sbad = 0;
+      if (!forced) { /* the amax pass */
+        for (size_t x = 0; x < row; ++x) {
+          float mk = 0.0f, mv = 0.0f;
+          for (uint32_t r = 0; r < L; ++r) {
+            const float kk = fabsf(k[r * row + x]), vv = fabsf(v[r * row + x]);
+            mk = kk > mk ? kk : mk;
+            mv = vv > mv ? vv : mv;
+          }
+          const float ek =
+            mk > 0.0f ? mk * HVX_ATTN_M1_Q8_MARGIN / 127.0f : 1.0f;
+          const float ev =
+            mv > 0.0f ? mv * HVX_ATTN_M1_Q8_MARGIN / 127.0f : 1.0f;
+          sbad += c->sk[x] != ek || c->sv[x] != ev ||
+                  c->sk_inv[x] != 1.0f / ek || c->sv_inv[x] != 1.0f / ev;
+        }
+      }
+      int kbad = 0, vbad = 0;
+      for (uint32_t h = 0; h < n_kv; ++h) {
+        const int8_t *kt = (const int8_t *)c->kt[0] + (size_t)h * hd * c->seq;
+        const int8_t *vv = (const int8_t *)c->v[0] + (size_t)h * c->seq * hd;
+        for (uint32_t r = 0; r < L; ++r) {
+          for (uint32_t d = 0; d < hd; ++d) {
+            const size_t m = (size_t)r * row + (size_t)h * hd + d;
+            kbad +=
+              kt[(size_t)(r / 64u) * hd * 64u + (size_t)d * 64u + r % 64u] !=
+              ref_q8(k[m], c->sk_inv[(size_t)h * hd + d]);
+            vbad += vv[(size_t)r * hd + d] !=
+                    ref_q8(v[m], c->sv_inv[(size_t)h * hd + d]);
+          }
+        }
+      }
+      CHECK(sbad == 0 && kbad == 0 && vbad == 0,
+            "seed_vec hd=%u forced=%d: scales %d, K bytes %d, V bytes %d", hd,
+            forced, sbad, kbad, vbad);
+      bad += sbad + kbad + vbad;
+      hvx_attn_m1_free(c);
+    }
+    free(k);
+    free(v);
+  }
+  if (bad == 0) {
+    printf("ATTN M1 SEED VEC OK\n");
+  }
+}
+
 int main(void) {
   check_cpu_order();
   check_prim_rne16();
@@ -1545,6 +1641,8 @@ int main(void) {
   check_errors(pools[1]);
   check_gemma(pools);
   check_seed_q8(pools[2]);
+  check_seed_vec(pools[2]);
+  check_seed_vec(NULL);
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);
