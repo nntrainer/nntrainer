@@ -1233,6 +1233,7 @@ static bool tryMoeLayerOnAccelerator(
                 const std::function<void(const void *)> &evict) {
           g_expert_lru.acquire(need, load, evict);
         });
+      ops->set_decode_pool_grow([](size_t n) { g_expert_lru.addCapacity(n); });
     }
   }
 

@@ -57,6 +57,14 @@ public:
       capacity_ += per_layer;
   }
 
+  /** @brief [#4416] Raises the capacity by @a n keys at run time (the
+   *  backend, once the prefill's buffers are gone: the DSP's address
+   *  space has room for more expert slots then). */
+  void addCapacity(size_t n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    capacity_ += n;
+  }
+
   /** @brief [#289] LRFU with a half-life of @a tokens (0: LRU); the
    *  default is NNTR_MOE_LRFU's. Set before the first acquire(). */
   void setLrfu(double tokens) { lrfu_ = tokens; }
