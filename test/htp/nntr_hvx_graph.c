@@ -106,6 +106,26 @@ int nntr_hvx_graph_set_param(remote_handle64 handle, uint32 op, uint32 which,
   return rc;
 }
 
+int nntr_hvx_graph_share_param(remote_handle64 handle, uint32 op, uint32 which,
+                               uint32 src_op) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (s->graph == NULL) {
+    FARF(ERROR, "graph_share_param: no graph; call graph_init first");
+    return AEE_EBADSTATE;
+  }
+  rc = hexkl_graph_share_param(s->graph, op, which, src_op);
+  if (rc != AEE_SUCCESS) {
+    FARF(ERROR, "graph_share_param: op=%u which=%u src=%u: %s (0x%08x)",
+         (unsigned)op, (unsigned)which, (unsigned)src_op,
+         htp_graph_err_name(rc), (unsigned)rc);
+  }
+  return rc;
+}
+
 int nntr_hvx_graph_release(remote_handle64 handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {

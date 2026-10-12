@@ -1068,6 +1068,32 @@ static int graph_set_rope(hexkl_graph *g, uint32_t op, const float *data,
   return AEE_SUCCESS;
 }
 
+int hexkl_graph_share_param(hexkl_graph *g, uint32_t op, uint32_t which,
+                            uint32_t src) {
+  float *mine;
+  if (g == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (which != HTP_GRAPH_PARAM_ROPE_TABLE || op >= g->n_ops ||
+      src >= g->n_ops || op == src || g->ops[op].kind != HTP_OP_ROPE ||
+      g->ops[src].kind != HTP_OP_ROPE) {
+    return AEE_EBADITEM;
+  }
+  if (g->ops[op].head_dim != g->ops[src].head_dim) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (g->param[src] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  mine = g->param[op];
+  if (mine != NULL && mine != g->param[src] &&
+      graph_rope_users(g, mine, op) == 0u) {
+    free(mine);
+  }
+  g->param[op] = g->param[src];
+  return AEE_SUCCESS;
+}
+
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
                           const float *data, uint32_t n) {
   float **dst;

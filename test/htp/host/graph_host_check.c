@@ -2246,6 +2246,25 @@ static void check_gemma_rope(void) {
   rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
                                        G4_SEQ * 256u);
   CHECK(rc == 0u && g->param[7] == g->param[1], "gemma: re-sharing");
+  /* [#4416 D6] sharing by name: op 7 takes op 4's table (its own, shared
+     with op 1, stays op 1's); a mismatched head_dim, a non-ROPE op, a
+     source with no table and a non-table parameter are refused */
+  rc = (uint32_t)hexkl_graph_share_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, 4u);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "gemma share: hd 256 <- 512: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                       G4_SEQ * 256u);
+  CHECK(rc == 0u && g->param[7] != g->param[1], "gemma share: split first");
+  rc = (uint32_t)hexkl_graph_share_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, 1u);
+  CHECK(rc == 0u && g->param[7] == g->param[1] &&
+          memcmp(g->param[1], cs_s, sizeof(cs_s)) == 0,
+        "gemma share: 7 <- 1: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_share_param(g, 7u, HTP_GRAPH_PARAM_GAMMA, 1u);
+  CHECK(rc == (uint32_t)AEE_EBADITEM, "gemma share: gamma refused");
+  rc = (uint32_t)hexkl_graph_share_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, 2u);
+  CHECK(rc == (uint32_t)AEE_EBADITEM, "gemma share: a non-ROPE source");
+  rc = (uint32_t)hexkl_graph_share_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, 1u);
+  CHECK(rc == (uint32_t)AEE_EBADITEM, "gemma share: itself");
   for (l = 0; l < 3u; ++l) {
     const uint32_t hd = kG4[l].hd, nq = kG4[l].gqa * kG4[l].n_kv,
                    nk = kG4[l].n_kv, K = (nq + 2u * nk) * hd;

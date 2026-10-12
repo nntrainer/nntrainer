@@ -286,6 +286,17 @@ void hexkl_graph_free(hexkl_graph *g);
  *         HTP_GRAPH_NO_HANDLE nor a registered weight of the op's shape),
  *         AEE_ENOMEMORY
  */
+/**
+ * @brief [#4416 D6] ROPE op @a op takes the table ROPE op @a src holds
+ *        (shared, as set_param shares equal bytes) without the bytes
+ *        crossing: the host knows its layers' tables are equal.
+ * @return 0; AEE_EBADITEM (not two distinct ROPE ops, or which is not
+ *         ROPE_TABLE); AEE_EINVALIDFORMAT (head_dim differs);
+ *         AEE_EBADSTATE (no graph, or src has no table)
+ */
+int hexkl_graph_share_param(hexkl_graph *g, uint32_t op, uint32_t which,
+                            uint32_t src);
+
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
                           const float *data, uint32_t n);
 
