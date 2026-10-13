@@ -556,6 +556,212 @@ int nntr_hvx_attn_q2_step_fq(
     q_encLen, out_enc, out_encLen, out_u16, out_u16Len, stats_us, stats_usLen);
 }
 
+/* ---- [P2] the layer's calibration on the DSP ---------------------------- */
+
+#define Q2C_MAX_LANES 16u
+
+typedef struct {
+  const uint16_t *k, *v;
+  uint32_t n_rows, stride, n_kv, hd;
+  const float *q;
+  uint32_t n_q, n_hq, q_stride;
+  uint16_t *vmax;   /**< [lane][n_kv * hd] |V| max as fp16 bits */
+  uint16_t *kmax;   /**< [lane][n_kv] */
+  float *qlo, *qhi; /**< [lane][n_hq] */
+} q2c_ctx;
+
+/* |x| of fp16 bits is the bits with the sign cleared, and for finite
+   values their magnitude order is the unsigned order of those bits: the
+   maxima are taken as u16 and converted once, exactly, at the end. The
+   row split across lanes changes nothing: max is order-free. */
+static void q2c_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const q2c_ctx *c = (const q2c_ctx *)v;
+  const HVX_Vector mask = Q6_Vh_vsplat_R(0x7fff);
+  uint16_t *vmax = c->vmax + (size_t)i * c->n_kv * c->hd;
+  uint16_t *kmax = c->kmax + (size_t)i * c->n_kv;
+  float *qlo = c->qlo + (size_t)i * c->n_hq,
+        *qhi = c->qhi + (size_t)i * c->n_hq;
+  {
+    const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
+    const uint32_t hi =
+      (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
+    const uint32_t nvec = c->hd / 64u;
+    memset(vmax, 0, (size_t)c->n_kv * c->hd * sizeof(uint16_t));
+    for (uint32_t n = 0; n < c->n_kv; ++n) {
+      HVX_Vector acc = Q6_V_vzero();
+      for (uint32_t r = lo; r < hi; ++r) {
+        const HVX_UVector *kr =
+          (const HVX_UVector *)(c->k + (size_t)r * c->stride + n * c->hd);
+        const HVX_UVector *vr =
+          (const HVX_UVector *)(c->v + (size_t)r * c->stride + n * c->hd);
+        HVX_UVector *vm = (HVX_UVector *)(vmax + n * c->hd);
+        for (uint32_t j = 0; j < nvec; ++j) {
+          acc = Q6_Vuh_vmax_VuhVuh(acc, Q6_V_vand_VV(kr[j], mask));
+          vm[j] = Q6_Vuh_vmax_VuhVuh(vm[j], Q6_V_vand_VV(vr[j], mask));
+        }
+      }
+      uint16_t lanes[64] __attribute__((aligned(128)));
+      *(HVX_Vector *)lanes = acc;
+      uint16_t m = 0;
+      for (uint32_t j = 0; j < 64u; ++j)
+        m = lanes[j] > m ? lanes[j] : m;
+      kmax[n] = m;
+    }
+  }
+  {
+    const uint32_t lo = (uint32_t)(((uint64_t)c->n_q * i) / n_threads);
+    const uint32_t hi = (uint32_t)(((uint64_t)c->n_q * (i + 1u)) / n_threads);
+    const uint32_t nvec = c->hd / 32u;
+    for (uint32_t h = 0; h < c->n_hq; ++h) {
+      HVX_Vector vlo = hvx_splat_sf(1e30f), vhi = hvx_splat_sf(-1e30f);
+      for (uint32_t r = lo; r < hi; ++r) {
+        const HVX_UVector *qr =
+          (const HVX_UVector *)(c->q + (size_t)r * c->q_stride + h * c->hd);
+        for (uint32_t j = 0; j < nvec; ++j) {
+          vlo = Q6_Vsf_vmin_VsfVsf(vlo, qr[j]);
+          vhi = Q6_Vsf_vmax_VsfVsf(vhi, qr[j]);
+        }
+      }
+      float l[32] __attribute__((aligned(128)));
+      float u[32] __attribute__((aligned(128)));
+      *(HVX_Vector *)l = vlo;
+      *(HVX_Vector *)u = vhi;
+      float flo = 1e30f, fhi = -1e30f;
+      for (uint32_t j = 0; j < 32u; ++j) {
+        flo = l[j] < flo ? l[j] : flo;
+        fhi = u[j] > fhi ? u[j] : fhi;
+      }
+      qlo[h] = flo;
+      qhi[h] = fhi;
+    }
+  }
+}
+
+/* std::round: halves away from zero; the DSP image has no roundf. Below
+   2^23 trunc then the exact fraction compared with 0.5; above, integral. */
+static inline float q2c_roundf(float x) {
+  const float a = x < 0.0f ? -x : x;
+  if (a >= 8388608.0f) {
+    return x;
+  }
+  float r = (float)(int32_t)a; /* trunc; a - r is exact */
+  if (a - r >= 0.5f) {
+    r += 1.0f;
+  }
+  return x < 0.0f ? -r : r;
+}
+
+int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
+                              uint32 row0, const uint16 *k_rows, int k_rowsLen,
+                              const uint16 *v_rows, int v_rowsLen, uint32 n_q,
+                              uint32 cache_from, uint32 cache_to,
+                              uint32 n_head_q, uint32 window,
+                              const float *q_f32, int q_f32Len, float *calib,
+                              int calibLen, uint16 *out_u16, int out_u16Len,
+                              uint32 *stats_us, int stats_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
+  if (!kv || n_head_q == 0 || kv->n_head_kv == 0 ||
+      n_head_q % kv->n_head_kv != 0 || kv->head_dim % 64u != 0 ||
+      q_f32Len != out_u16Len || k_rowsLen != v_rowsLen ||
+      (uint32)calibLen !=
+        kv->n_head_kv + kv->n_head_kv * kv->head_dim + 4u * n_head_q) {
+    FARF(ERROR, "attn_q2_step_fqc: bad handle or lengths");
+    return AEE_EBADPARM;
+  }
+  const uint32_t n_kv = kv->n_head_kv, hd = kv->head_dim;
+  const uint32_t stride = n_kv * hd;
+  const uint32_t n_rows = (uint32_t)k_rowsLen / stride;
+  const uint32_t lanes = hvx_worker_pool_workers(s->quant_pool) + 1u;
+  if (lanes > Q2C_MAX_LANES || (uint32_t)k_rowsLen != n_rows * stride) {
+    return AEE_EBADPARM;
+  }
+  const uint64_t tc0 = HAP_perf_get_time_us();
+  uint16_t *vmax =
+    (uint16_t *)malloc((size_t)lanes * stride * sizeof(uint16_t));
+  uint16_t *kmax = (uint16_t *)malloc((size_t)lanes * n_kv * sizeof(uint16_t));
+  float *qlo = (float *)malloc((size_t)lanes * n_head_q * sizeof(float) * 2u);
+  float *s_k = calib, *s_v = calib + n_kv;
+  float *q_enc = s_v + stride, *out_enc = q_enc + 2u * n_head_q;
+  float q_inv[64];
+  if (!vmax || !kmax || !qlo || n_head_q > 64u) {
+    free(vmax);
+    free(kmax);
+    free(qlo);
+    return AEE_ENOMEMORY;
+  }
+  q2c_ctx c = {k_rows,   v_rows,
+               n_rows,   stride,
+               n_kv,     hd,
+               q_f32,    n_q,
+               n_head_q, n_head_q * hd,
+               vmax,     kmax,
+               qlo,      qlo + (size_t)lanes * n_head_q};
+  hvx_worker_pool_run(s->quant_pool, q2c_worker, &c,
+                      n_rows > n_q ? n_rows : n_q);
+  /* the lanes merged, the maxima to f32 (exact), the scales as
+     mha_core::calibrate_q2_scales derives them, in its order of operations */
+  for (uint32_t n = 0; n < n_kv; ++n) {
+    uint16_t m = 0;
+    for (uint32_t l = 0; l < lanes; ++l)
+      m = kmax[(size_t)l * n_kv + n] > m ? kmax[(size_t)l * n_kv + n] : m;
+    s_k[n] = hexkl_kv_q_hf_to_f32(m);
+  }
+  for (uint32_t e = 0; e < stride; ++e) {
+    uint16_t m = 0;
+    for (uint32_t l = 0; l < lanes; ++l)
+      m = vmax[(size_t)l * stride + e] > m ? vmax[(size_t)l * stride + e] : m;
+    s_v[e] = hexkl_kv_q_hf_to_f32(m);
+  }
+  const uint32_t G = n_head_q / n_kv;
+  for (uint32_t h = 0; h < n_head_q; ++h) {
+    float lo = 1e30f, hi = -1e30f;
+    for (uint32_t l = 0; l < lanes; ++l) {
+      const float a = c.qlo[(size_t)l * n_head_q + h];
+      const float b = c.qhi[(size_t)l * n_head_q + h];
+      lo = a < lo ? a : lo;
+      hi = b > hi ? b : hi;
+    }
+    const float range = (hi - lo) > 1e-6f ? (hi - lo) : 1e-6f;
+    q_enc[2u * h] = range / 65535.0f;
+    q_enc[2u * h + 1u] = q2c_roundf(-lo / q_enc[2u * h]);
+    float vm = 0.0f;
+    for (uint32_t d = 0; d < hd; ++d) {
+      const float x = s_v[(size_t)(h / G) * hd + d];
+      vm = x > vm ? x : vm;
+    }
+    const float two = 2.0f * vm;
+    out_enc[2u * h] = (two > 1e-6f ? two : 1e-6f) / 65535.0f;
+    out_enc[2u * h + 1u] = 32768.0f;
+    q_inv[h] = 1.0f / q_enc[2u * h];
+  }
+  for (uint32_t n = 0; n < n_kv; ++n)
+    s_k[n] = s_k[n] > 0.0f ? s_k[n] / 127.0f : 1.0f;
+  for (uint32_t e = 0; e < stride; ++e)
+    s_v[e] = s_v[e] > 0.0f ? s_v[e] / 127.0f : 1.0f;
+  free(vmax);
+  free(kmax);
+  free(qlo);
+  int rc = hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
+  if (rc != AEE_SUCCESS) {
+    FARF(ERROR, "attn_q2_step_fqc: fixed scales: 0x%08x", rc);
+    return rc;
+  }
+  const uint32_t calib_us = (uint32_t)(HAP_perf_get_time_us() - tc0);
+  rc = attn_q2_step_impl(handle, kv_handle, row0, k_rows, k_rowsLen, v_rows,
+                         v_rowsLen, n_q, cache_from, cache_to, n_head_q, window,
+                         NULL, q_f32, q_inv, q_f32Len, q_enc,
+                         (int)(2u * n_head_q), out_enc, (int)(2u * n_head_q),
+                         out_u16, out_u16Len, stats_us, stats_usLen);
+  if (rc == AEE_SUCCESS && stats_usLen > 2) {
+    stats_us[2] = calib_us; /* the slot the DDR Q pass used to report */
+  }
+  return rc;
+}
+
 int nntr_hvx_probe_wh_i8_pos(remote_handle64 handle, uint16 *pos, int posLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s || posLen != 1024) {
