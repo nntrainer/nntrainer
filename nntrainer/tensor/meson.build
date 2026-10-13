@@ -52,6 +52,7 @@ tensor_headers = [
   'q4_0_utils.h',
   'htp_q4_0_convert.h',
   'htp_wh_layout.h',
+  'htp_fixed_opts.h',
   'swiglu_det.h',
   'htp_act_quant.h',
   'qs4cx_tensor.h',

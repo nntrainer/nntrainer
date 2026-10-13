@@ -26,6 +26,7 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <htp_fixed_opts.h>
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
 #include <htp_wh_layout.h>
@@ -80,9 +81,8 @@ void Gemma4HtpTransformer::repack_weight() {
   std::vector<PendingFc> fc_pending;
   std::set<const void *> cpu_weight_sources;
   std::set<const void *> shared_heads;
-  const char *e2e = std::getenv("NNTR_HTP_E2E");
-  const bool discard_sources = nntrainer::weightPageCachePolicy() >= 0 && e2e &&
-                               std::strcmp(e2e, "1") == 0;
+  const bool discard_sources =
+    nntrainer::weightPageCachePolicy() >= 0 && nntrainer::htp_fixed::E2E;
   struct PendingDense {
     nntrainer::ComputeOps *ops;
     void *up, *gate, *down;

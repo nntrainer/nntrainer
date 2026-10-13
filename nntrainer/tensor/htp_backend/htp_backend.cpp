@@ -13,6 +13,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <htp_backend.h>
+#include <htp_fixed_opts.h>
 
 #include <nntrainer_log.h>
 
@@ -39,11 +40,8 @@ HtpBackend &HtpBackend::global() {
 }
 
 bool HtpBackend::e2eRequested() {
-  static const bool on = [] {
-    const char *e = std::getenv("NNTR_HTP_E2E");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return on;
+  // built in: the one-PD decode graph is the HTP path's configuration
+  return htp_fixed::E2E;
 }
 
 HtpBackend::HtpBackend() { open(); }

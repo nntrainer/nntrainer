@@ -250,16 +250,16 @@ for f in builddir_app/htp/nntr_causallm builddir_app/htp/libcausallm.so builddir
 adb shell chmod 755 $D/nntr_causallm
 
 adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D \
-  NNTR_HTP_E2E=1 NNTR_MOE_CACHE_EXPERTS=16 NNTR_HTP_E2E_FREE_KVQ=1 NNTR_HTP_KV_DROP_CPU=1 \
-  NNTR_HTP_DROP_HOST_FC=1 NNTR_HTP_ATTN_M1_Q8=2 NNTR_HTP_FC_IN_ARENA=1 \
   ./nntr_causallm /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32"
 ```
 
-The seven `NNTR_*` variables are the runtime options the app fixes through the
-C API (`Applications/CausalLM/api/htp_model_runtime.h`). The CLI does not set
-them for you; without them the decode loop takes a different path and the
-output degenerates after the first token. `ADSP_LIBRARY_PATH` must point at
-the directory holding `libnntr_hvx_skel.so`.
+`ADSP_LIBRARY_PATH` must point at the directory holding
+`libnntr_hvx_skel.so`. Nothing else has to be set: the runtime configuration
+the model was validated with (the resident decode graph, 16 resident experts
+per layer, the int8 decode attention, the dense projections in the DSP arena,
+the host copies dropped once the DSP holds them) is built into the library
+(`nntrainer/tensor/htp_fixed_opts.h`). The one knob left is
+`NNTR_HTP_PAGE_CACHE` (section 9.2): unset keeps the mmap loader.
 
 With no prompt argument the CLI uses `sample_input` from `nntr_config.json`.
 Pass your own prompt as the second argument; the chat template from the pack
@@ -370,7 +370,6 @@ change the arithmetic.
 
 | Symptom | Cause and fix |
 |---|---|
-| CLI prints the first word and then the same token forever | the seven runtime options of section 7 are not set |
 | `HTP native_lib_dir is missing libnntr_hvx_skel.so` | `ADSP_LIBRARY_PATH` / `nativeLibDir` does not contain the skel |
 | `Gemma4 HTP requires NPU / W4A32` | the app was asked for another backend or quantization |
 | `Load failed: [MODEL_LOAD_FAILED] Failed to open file ...` | the base path does not contain `gemma4-26b-a4b-htp-w4a32/` |

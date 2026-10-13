@@ -9,6 +9,7 @@
 #include <app_context.h>
 #include <engine.h>
 #include <gemma4_htp_moe_causallm.h>
+#include <htp_fixed_opts.h>
 #include <layer_context.h>
 #include <llm_util.hpp>
 #include <model.h>
@@ -79,16 +80,14 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   // in per call anyway)
   if (MOE_ENGINE == "htp")
     nntrainer::get_htp_ops()->set_moe_geglu(true);
-  // [plan 201 S4] NNTR_HTP_E2E=1: the whole decode token on the HTP, one
-  // call a token; the list is built after load (load_weight)
-  const char *e2e_env = std::getenv("NNTR_HTP_E2E");
-  htp_e2e =
-    e2e_env != nullptr && std::atoi(e2e_env) != 0 && MOE_ENGINE == "htp";
+  // [plan 201 S4] the whole decode token on the HTP, one call a token; the
+  // list is built after load (load_weight). Built in (htp_fixed::E2E).
+  htp_e2e = nntrainer::htp_fixed::E2E && MOE_ENGINE == "htp";
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
                 std::invalid_argument)
-    << "[Gemma4MoE] NNTR_HTP_E2E=1: the decode list has no per-layer input "
-       "(PLE) and no attention logit soft-cap";
+    << "[Gemma4MoE] the HTP decode list has no per-layer input (PLE) and no "
+       "attention logit soft-cap";
 #endif
 }
 

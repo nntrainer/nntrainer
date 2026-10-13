@@ -27,6 +27,7 @@ static std::mutex rope_init_mtx;
 #include <layer_context.h>
 
 #include <abs_max.h>
+#include <htp_fixed_opts.h>
 #include <htp_mha_core.h>
 
 #include "htp_decode_hook.h"
@@ -741,11 +742,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     // the decode row never reads it (it returns above) and a later prefill
     // is refused (htp_owns_cache_). Not a shared block: nothing happens.
     auto drop_cpu_cache = [&]() {
-      static const bool drop = [] {
-        const char *v = std::getenv("NNTR_HTP_KV_DROP_CPU");
-        return v != nullptr && std::strcmp(v, "1") == 0;
-      }();
-      if (drop && compute_ops_)
+      if (nntrainer::htp_fixed::KV_DROP_CPU && compute_ops_)
         for (nntrainer::Tensor *t : {&ck, &cv})
           compute_ops_->drop_shared(
             t->getDataType() == ml::train::TensorDim::DataType::FP32
@@ -1133,10 +1130,12 @@ void HtpMHACoreLayer::registerQuantizedCache(
   // load's FC set and expert pool map into (p4096: 915 MiB at load).
   // NNTR_HTP_FC_IN_ARENA moves the FC set off the heap, so the caches fit at
   // load again and the prefill skips their registration (124 ms at p1024).
-  static const bool lazy = std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr &&
-                           std::getenv("NNTR_HTP_FC_IN_ARENA") == nullptr;
-  if (lazy)
-    return;
+  // Built in: the quantized caches go at the first decode token
+  // (E2E_FREE_KVQ) and the FC set lives in the arena (FC_IN_ARENA), so they
+  // are registered here, at load, and the prefill skips it.
+  static_assert(nntrainer::htp_fixed::E2E_FREE_KVQ &&
+                  nntrainer::htp_fixed::FC_IN_ARENA,
+                "the lazy registration path assumed the FC set on the heap");
   if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
       !compute_ops_->supports_kv_cache_q() || !is_causal ||
       !q_cache_handles.empty())

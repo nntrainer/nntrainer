@@ -31,6 +31,7 @@
 #include <expert_lru.h>
 #include <htp_decode_hook.h>
 #include <iostream>
+#include <htp_fixed_opts.h>
 #include <lfm2_moe_pool_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>
@@ -232,20 +233,11 @@ static std::FILE *moeTrace() {
   return f;
 }
 
-/** @brief NNTR_MOE_CACHE_EXPERTS as a count, 0 when unset or unparsable
- *  (the resident path, unchanged). The same variable and the same parsing
- *  as Lfm2CachedSlimMoELayer, so one knob drives the CPU and HTP caches. */
+/** @brief Experts kept resident per layer: the built-in count
+ *  (htp_fixed::MOE_CACHE_EXPERTS, formerly the NNTR_MOE_CACHE_EXPERTS
+ *  option), capped by the layer's expert count. */
 static unsigned int expertCacheFromEnv(unsigned int num_experts) {
-  const char *value = std::getenv("NNTR_MOE_CACHE_EXPERTS");
-  if (value == nullptr || *value == '\0' || *value == '-')
-    return 0;
-  errno = 0;
-  char *end = nullptr;
-  const unsigned long parsed = std::strtoul(value, &end, 10);
-  if (errno == ERANGE || end == value || *end != '\0')
-    return 0;
-  return static_cast<unsigned int>(
-    std::min<unsigned long>(num_experts, parsed));
+  return std::min(num_experts, nntrainer::htp_fixed::MOE_CACHE_EXPERTS);
 }
 
 /** M0 (doc 43 §5): ordinal of prefill forwarding() calls, so each MoE layer
