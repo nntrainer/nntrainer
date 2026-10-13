@@ -1887,6 +1887,8 @@ public:
     const void *ion = ionAlias(host, bytes);
     if (!ion)
       ion = trueSource(host, bytes);
+    if (ion == host)
+      throwIfLost(host, bytes, __LINE__);
     if (ion && ion != host)
       stagedMemcpy(host, ion, bytes);
   }
@@ -4918,14 +4920,17 @@ private:
           sampledSame(src, fslot->data(), bytes)) {
         const bool kept = was->kept;
         // the buffer handed to from: a kept tensor of pool's class goes
-        // with it, so make that host tensor whole first (as stage does)
+        // with it. In a layer's own order that tensor has had its last
+        // reader (the previous dense output, the layer input, the o-proj
+        // output: 3 a layer, 11.5 MB each at 1024 rows), so it is not
+        // copied to the host; it is remembered as lost, and a later read of
+        // it throws instead of taking the windows-only host bytes.
         for (auto *m : {&pool.copied_out, &pool.holds}) {
           auto k = m->find(cls);
           if (k != m->end() && k->second.kept && slot &&
               k->second.first != src &&
               sampledSame(k->second.first, slot->data(), k->second.second))
-            stagedMemcpy(const_cast<void *>(k->second.first), slot->data(),
-                         k->second.second);
+            noteLost(k->second.first, k->second.second);
         }
         std::swap(slot, fslot);
         from->holds.erase(cls);
@@ -4956,10 +4961,55 @@ private:
                       rec.second.second);
           }
     }
+    if (from_buf == src)
+      throwIfLost(src, bytes, line);
     if (from_buf != slot->data())
       stagedMemcpy(slot->data(), from_buf, bytes, line);
     pool.holds[cls] = {src, bytes, false};
     return *slot;
+  }
+  /** @brief A kept host tensor whose staging buffer was handed on
+   *  (stageInput's swap) without the copy to the host: its range and the
+   *  windows sampledSame compares, as they were. */
+  struct Lost {
+    const void *host = nullptr;
+    size_t bytes = 0;
+    std::array<uint8_t, 33 * 64> win{};
+  };
+  std::array<Lost, 8> lost_{};
+  size_t lost_next_ = 0;
+  static void sampledPack(uint8_t *win, const void *src_, size_t bytes) {
+    const uint8_t *s = static_cast<const uint8_t *>(src_);
+    std::memcpy(win, s + bytes - 64, 64);
+    for (size_t i = 0; i < 32; ++i)
+      std::memcpy(win + 64 * (i + 1), s + (bytes - 64) / 32 * i, 64);
+  }
+  void noteLost(const void *host, size_t bytes) {
+    if (bytes < 64)
+      return;
+    Lost &l = lost_[lost_next_++ % lost_.size()];
+    l.host = host;
+    l.bytes = bytes;
+    sampledPack(l.win.data(), host, bytes);
+  }
+  /** @brief Throws when [src, src + bytes) is inside a lost tensor the host
+   *  has not rewritten since: those host bytes are only the windows.
+   *  ponytail: the last 8 lost tensors are remembered (3 are lost a layer);
+   *  a reader further behind than that is not caught. */
+  void throwIfLost(const void *src, size_t bytes, int line) const {
+    const char *s = static_cast<const char *>(src);
+    for (const Lost &l : lost_) {
+      const char *h = static_cast<const char *>(l.host);
+      if (!h || s < h || s + bytes > h + l.bytes)
+        continue;
+      std::array<uint8_t, 33 * 64> now;
+      sampledPack(now.data(), l.host, l.bytes);
+      if (now == l.win)
+        throw std::runtime_error(
+          "HTP stage: host read (line " + std::to_string(line) +
+          ") of a kept tensor whose staging buffer was reused; "
+          "NNTR_HTP_KEEP_OUT=0 copies every output to the host");
+    }
   }
   /** @brief Where [src, src + bytes) really is: inside a staging buffer
    *  that holds (by sampledSame over its whole tensor) a kept host tensor
