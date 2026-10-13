@@ -102,6 +102,14 @@ void checkedRead(ReadSource src, char *array, std::streamsize size,
     }
     (*f)->read(static_cast<char *>(array), static_cast<std::streamsize>(size));
     // checkFile((*f), error_msg);
+  } else if (auto fd = std::get_if<FileReadSource>(&src)) {
+    if (size < 0)
+      throw std::invalid_argument("negative file read size");
+    const int rc = weightPread(fd->fd, array, static_cast<size_t>(size),
+                               read_from_offset ? start_offset : 0);
+    if (rc)
+      throw std::runtime_error(std::string(error_msg) + ": " +
+                               std::strerror(rc));
   } else if (auto p = std::get_if<const char *>(&src)) {
     /// @todo use mmap instead memcpy to reduce peak memory
     if (read_from_offset) {

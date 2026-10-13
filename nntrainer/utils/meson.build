@@ -1,5 +1,6 @@
 util_sources = [
   'util_func.cpp',
+  'weight_file_reader.cpp',
   'profiler.cpp',
   'ini_wrapper.cpp',
   'node_exporter.cpp',
@@ -19,6 +20,7 @@ util_headers = [
   'env_compat.h',
   'node_exporter.h',
   'util_func.h',
+  'weight_file_reader.h',
   'profiler.h',
   'nntr_threads.h',
   'fp16.h',

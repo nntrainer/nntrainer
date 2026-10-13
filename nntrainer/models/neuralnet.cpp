@@ -1801,7 +1801,9 @@ void NeuralNetwork::load(const std::string &file_path,
       // to mmap their backing region on demand. Without it, virtual tensors
       // end up with fd=-1 and activate() returns MAP_FAILED, segfaulting on
       // first use (e.g. SlimMoE expert weights when MMAP_READ=true).
-      model_file_fd = open(f_path.c_str(), O_RDONLY);
+      model_file_fd = weightPageCachePolicy() >= 0
+                        ? openWeightFile(f_path.c_str())
+                        : open(f_path.c_str(), O_RDONLY);
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
@@ -1889,51 +1891,60 @@ void NeuralNetwork::load(const std::string &file_path,
       // workers' file reads -- not running several hook bodies at once.
       std::mutex load_hook_mtx;
 
+      std::exception_ptr load_error;
+      std::mutex load_error_mutex;
       auto load_worker = [&]() {
-        for (size_t idx =
-               next_load_index.fetch_add(1, std::memory_order_relaxed);
-             idx < num_load_nodes;
-             idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
-          auto node = load_nodes[idx];
+        try {
+          for (size_t idx =
+                 next_load_index.fetch_add(1, std::memory_order_relaxed);
+               idx < num_load_nodes;
+               idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
+            auto node = load_nodes[idx];
 
-          if (!MMAP_READ) {
-            auto local_model_file = checkedOpenStream<std::ifstream>(
-              (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
-            node->read(local_model_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-          } else {
+            if (weightPageCachePolicy() >= 0) {
+              node->read(FileReadSource{model_file_fd}, false, exec_mode,
+                         fsu_mode, std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } else if (!MMAP_READ) {
+              auto local_model_file = checkedOpenStream<std::ifstream>(
+                (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
+              node->read(local_model_file, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } else {
 #if defined(_WIN32)
-            // Map per-ask, then unmap immediately after: enables early release
-            // of pages
-            HANDLE hFile =
-              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
-              << "CreateFileA failed";
+              // Map per-ask, then unmap immediately after: enables early
+              // release of pages
+              HANDLE hFile =
+                CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+              NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+                << "CreateFileA failed";
 
-            HANDLE hMap =
-              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
-              << "CreateFileMapping failed";
+              HANDLE hMap =
+                CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+              NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+                << "CreateFileMapping failed";
 
-            char *view =
-              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            NNTR_THROW_IF((view == nullptr), std::runtime_error)
-              << "MapViewOfFile failed";
+              char *view = static_cast<char *>(
+                MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+              NNTR_THROW_IF((view == nullptr), std::runtime_error)
+                << "MapViewOfFile failed";
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
 
-            // Early unmap: let the OS reclaim the working set ASAP
-            UnmapViewOfFile(view);
-            CloseHandle(hMap);
-            CloseHandle(hFile);
+              // Early unmap: let the OS reclaim the working set ASAP
+              UnmapViewOfFile(view);
+              CloseHandle(hMap);
+              CloseHandle(hFile);
 #else
-            // POSIX: map per-task, advise kernel, drop pages, unmap
-            size_t f_size = 0;
-            void *mmap_ptr = nullptr;
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
+              // POSIX: map per-task, advise kernel, drop pages, unmap
+              size_t f_size = 0;
+              void *mmap_ptr = nullptr;
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
               int fd = ::open(f_path.c_str(), O_RDONLY);
               NNTR_THROW_IF((fd == -1), std::invalid_argument)
                 << "Cannot open file : " << f_path;
@@ -1942,103 +1953,108 @@ void NeuralNetwork::load(const std::string &file_path,
               NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
                 << "Cannot get file info (fstat): " << f_path;
 
-              f_size = static_cast<size_t>(st.st_size);
-              mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-              ::close(fd); // fd not needed after mmap
-              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-                << "mmap failed";
-            }
+                f_size = static_cast<size_t>(st.st_size);
+                mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                ::close(fd); // fd not needed after mmap
+                NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                  << "mmap failed";
+              }
 
-            // A node's weights are one contiguous run and the nodes are
-            // handed out by an atomic counter, so this walks the file front to
-            // back -- it is a streaming read, not a scattered one. RANDOM was
-            // the advice here, and it turns off BOTH kernel readahead AND
-            // fault-around, which makes every 4 KiB page its own synchronous
-            // flash trip at queue depth 1. Measured on Adreno 840 with a
-            // 3.17 GiB weight file: 830 803 major faults for 830 767 file
-            // pages (every page faulted exactly once, nothing re-read) moving
-            // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
-            // SEQUENTIAL restores the readahead window and adds drop-behind,
-            // which also bounds the page-cache footprint of the load.
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
-              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
-            }
+              // A node's weights are one contiguous run and the nodes are
+              // handed out by an atomic counter, so this walks the file front to
+              // back -- it is a streaming read, not a scattered one. RANDOM was
+              // the advice here, and it turns off BOTH kernel readahead AND
+              // fault-around, which makes every 4 KiB page its own synchronous
+              // flash trip at queue depth 1. Measured on Adreno 840 with a
+              // 3.17 GiB weight file: 830 803 major faults for 830 767 file
+              // pages (every page faulted exactly once, nothing re-read) moving
+              // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
+              // SEQUENTIAL restores the readahead window and adds drop-behind,
+              // which also bounds the page-cache footprint of the load.
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
+                (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+              }
 
-            // Publish the mapping to the reaper for the duration of the read.
-            if (reap_ms > 0) {
-              std::lock_guard<std::mutex> reap_lk(reap_mtx);
-              reap_live.emplace_back(mmap_ptr, f_size);
-            }
+              // Publish the mapping to the reaper for the duration of the read.
+              if (reap_ms > 0) {
+                std::lock_guard<std::mutex> reap_lk(reap_mtx);
+                reap_live.emplace_back(mmap_ptr, f_size);
+              }
 
-            char *view = static_cast<char *>(mmap_ptr);
-            {
-              nntrainer::load_trace::Scope _lt(
-                nntrainer::load_trace::NODE_READ);
-              node->read(view, false, exec_mode, fsu_mode,
-                         std::numeric_limits<size_t>::max(), true,
-                         model_file_fd);
-            }
+              char *view = static_cast<char *>(mmap_ptr);
+              {
+                nntrainer::load_trace::Scope _lt(
+                  nntrainer::load_trace::NODE_READ);
+                node->read(view, false, exec_mode, fsu_mode,
+                           std::numeric_limits<size_t>::max(), true,
+                           model_file_fd);
+              }
 
-            // Retract it BEFORE the unmap below, so the reaper can never
-            // advise a region this worker has already given back.
-            if (reap_ms > 0) {
-              std::lock_guard<std::mutex> reap_lk(reap_mtx);
-              for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
-                if (it->first == mmap_ptr) {
-                  reap_live.erase(it);
-                  break;
-                }
-            }
+              // Retract it BEFORE the unmap below, so the reaper can never
+              // advise a region this worker has already given back.
+              if (reap_ms > 0) {
+                std::lock_guard<std::mutex> reap_lk(reap_mtx);
+                for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
+                  if (it->first == mmap_ptr) {
+                    reap_live.erase(it);
+                    break;
+                  }
+              }
 
-            // Early drop: pages no longer needed; bounds peak RSS during the
-            // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
-            // NO-OP in glibc -- it validates its arguments and returns 0
-            // without freeing a page -- so the raw madvise is required for the
-            // drop to actually happen. The mapping is read-only MAP_PRIVATE,
-            // so dropped pages simply re-fault from the page cache if touched
-            // again: bytes read are identical either way.
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
-              (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
+              // Early drop: pages no longer needed; bounds peak RSS during the
+              // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
+              // NO-OP in glibc -- it validates its arguments and returns 0
+              // without freeing a page -- so the raw madvise is required for the
+              // drop to actually happen. The mapping is read-only MAP_PRIVATE,
+              // so dropped pages simply re-fault from the page cache if touched
+              // again: bytes read are identical either way.
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
+                (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
 
-              ::munmap(mmap_ptr, f_size);
-            }
+                ::munmap(mmap_ptr, f_size);
+              }
 #endif
-          }
+            }
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          if (cuda_wprefetch_load) {
-            for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
-              nntrainer::Tensor &wt = node->getWeight(wi);
-              if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
-                (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
-                  wt.getData<uint8_t>(), wt.width(), wt.height());
+  #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+            if (cuda_wprefetch_load) {
+              for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+                nntrainer::Tensor &wt = node->getWeight(wi);
+                if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+                  (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                    wt.getData<uint8_t>(), wt.width(), wt.height());
+              }
+            }
+  #endif
+
+            // [load-drop interleave] this node's weight bytes (payload + any
+            // trailing scales) are fully materialized in their final tensor
+            // storage -- on BOTH the stream and the mmap arm above: hand the
+            // node to the registered per-weight hook NOW, so derived-cache
+            // builds and plain-payload drops overlap the other workers' reads
+            // instead of waiting for the join. Failures are contained -- the
+            // application's post-load sweep is the fallback for anything the
+            // hook missed.
+            if (weight_load_hook) {
+              std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
+              try {
+                weight_load_hook(*node, node->getRunContext(),
+                                 weight_load_hook_data);
+              } catch (const std::exception &e) {
+                ml_logw("weight-load hook failed on node %s: %s",
+                        node->getName().c_str(), e.what());
+              } catch (...) {
+                ml_logw("weight-load hook failed on node %s (non-std exception)",
+                        node->getName().c_str());
+              }
             }
           }
-#endif
-
-          // [load-drop interleave] this node's weight bytes (payload + any
-          // trailing scales) are fully materialized in their final tensor
-          // storage -- on BOTH the stream and the mmap arm above: hand the
-          // node to the registered per-weight hook NOW, so derived-cache
-          // builds and plain-payload drops overlap the other workers' reads
-          // instead of waiting for the join. Failures are contained -- the
-          // application's post-load sweep is the fallback for anything the
-          // hook missed.
-          if (weight_load_hook) {
-            std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
-            try {
-              weight_load_hook(*node, node->getRunContext(),
-                               weight_load_hook_data);
-            } catch (const std::exception &e) {
-              ml_logw("weight-load hook failed on node %s: %s",
-                      node->getName().c_str(), e.what());
-            } catch (...) {
-              ml_logw("weight-load hook failed on node %s (non-std exception)",
-                      node->getName().c_str());
-            }
-          }
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(load_error_mutex);
+          if (!load_error)
+            load_error = std::current_exception();
         }
       };
 
@@ -2163,6 +2179,8 @@ void NeuralNetwork::load(const std::string &file_path,
 #endif
 
       nntrainer::load_trace::dump("model->load_weight");
+      if (load_error)
+        std::rethrow_exception(load_error);
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
