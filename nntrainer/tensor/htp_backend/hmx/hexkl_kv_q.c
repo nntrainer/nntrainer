@@ -466,6 +466,30 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+/* [P6] The full tiles' bake over the pool, one (head, tile) a unit: the
+   HMX thread baked them all serially after the pool had quantized the
+   rows (~2 ms a 1024-row layer). Every unit writes its own tiles of
+   kv->kt / kv->v and reads only the master rows, so the bytes are the
+   serial bake's. */
+typedef struct {
+  hexkl_kv_q *kv;
+  uint32_t c_lo, n_c, row0, n_rows;
+} bake_tiles_ctx;
+
+static void bake_tiles_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const bake_tiles_ctx *c = (const bake_tiles_ctx *)v;
+  const uint32_t total = c->kv->n_head_kv * c->n_c;
+  const uint32_t lo = (uint32_t)(((uint64_t)total * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)total * (i + 1u)) / n_threads);
+  for (uint32_t u = lo; u < hi; ++u) {
+    const uint32_t n = u / c->n_c, cc = c->c_lo + u % c->n_c;
+    const uint32_t t_lo = 32u * cc;
+    if (c->row0 <= t_lo && c->row0 + c->n_rows >= t_lo + 32u) {
+      bake_tile_hvx(c->kv, n, cc);
+    }
+  }
+}
+
 static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
                            const uint16_t *k_rows, const uint16_t *v_rows,
                            uint8_t *vtcm_base, void *pool,
@@ -488,6 +512,16 @@ static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
   const uint32_t c_hi = (row0 + n_rows - 1u) / 32u;
   const uint32_t tb = kv->tile_bytes;
   int8_t qk[HEXKL_KV_Q_MAX_HEAD_DIM], qv[HEXKL_KV_Q_MAX_HEAD_DIM];
+  const int bake_hvx = direct && (hd % 128u) == 0u;
+  if (bake_hvx) {
+    const uint64_t tb0 = kvq_now_us();
+    bake_tiles_ctx bc = {kv, c_lo, c_hi - c_lo + 1u, row0, n_rows};
+    hvx_worker_pool_run((hvx_worker_pool *)pool, bake_tiles_worker, &bc,
+                        kv->n_head_kv * bc.n_c);
+    if (st) {
+      st->bake_us += (uint32_t)(kvq_now_us() - tb0);
+    }
+  }
   for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
     for (uint32_t c = c_lo; c <= c_hi; ++c) {
       const uint32_t t_lo = 32u * c, t_hi = t_lo + 32u;
@@ -499,13 +533,8 @@ static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
       // single-row decode appends pay). rm_to_wh_i8 with its staging and
       // copies measured 84 us and is the fallback for a part without a
       // usable position table.
-      if (full && direct && (hd % 128u) == 0u) {
-        const uint64_t tb0 = kvq_now_us();
-        bake_tile_hvx(kv, n, c);
-        if (st) {
-          st->bake_us += (uint32_t)(kvq_now_us() - tb0);
-        }
-        continue;
+      if (full && bake_hvx) {
+        continue; /* baked over the pool above */
       }
       if (direct) {
         const uint32_t r_lo = row0 > t_lo ? row0 : t_lo;
