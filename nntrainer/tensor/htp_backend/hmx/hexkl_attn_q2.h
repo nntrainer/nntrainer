@@ -50,6 +50,14 @@ typedef struct {
   const float *out_enc; /**< [n_head_q][2]: scale, zero point of the
                              context output per head */
   const hexkl_kv_q *kv; /**< fixed-scale int8 cache, >= cache_to rows */
+  /** [P7] Non-NULL: Q as the model's f32 rows ([n_q][q_stride], head h at
+      column h*hd) instead of @a q (then NULL): the rows are DMA'd as they
+      are and quantized to u16 inside the Q staging, x * q_inv[h] + (zp +
+      0.5) clamped to [0, 65535] and truncated -- quant_u16_f32's floats,
+      the same HVX operations the DDR pass (q16_worker) made -- so no u16
+      copy of Q exists in DDR. */
+  const float *q_f32;
+  const float *q_inv; /**< [n_head_q] 1 / q_enc[2h] */
 } hexkl_attn_q2_io;
 
 /**

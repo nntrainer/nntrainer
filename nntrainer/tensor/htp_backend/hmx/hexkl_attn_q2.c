@@ -159,9 +159,10 @@ static inline uint8_t *q_tiles_lo(ctx *c, uint32_t qslot) {
 static inline uint8_t *q_tiles_hi(ctx *c, uint32_t qslot) {
   return q_tiles_lo(c, qslot) + c->dt * HEXKL_ATTN_Q2_TILE;
 }
-static inline uint16_t *q_stage(ctx *c, uint32_t i) {
-  return (uint16_t *)(c->vb + c->L.q_u16 +
-                      (i & 1u) * HEXKL_ATTN_Q2_ROWS * c->hd * 2u);
+/** @brief Q staging half of item i: u16 rows, or f32 rows (io->q_f32). */
+static inline uint8_t *q_stage(ctx *c, uint32_t i) {
+  const uint32_t esz = c->io->q_f32 ? 4u : 2u;
+  return c->vb + c->L.q_u16 + (i & 1u) * HEXKL_ATTN_Q2_ROWS * c->hd * esz;
 }
 static inline uint8_t *s16_tiles(ctx *c, uint32_t slot) {
   return c->vb + c->L.s16 + slot * c->L.n_blk * HEXKL_ATTN_Q2_TILE16;
@@ -210,10 +211,29 @@ static inline uint32_t q_zp_of(const ctx *c, uint32_t h) {
 /** @brief Pushes the DMA of item i's Q rows into its staging half. */
 static void q_dma_push(ctx *c, uint32_t i) {
   const item_t *it = &c->items[i];
-  const uint16_t *src =
-    c->io->q + (size_t)it->q0 * c->io->q_stride + it->h * c->hd;
-  hexkl_dma_ring_push2d(q_stage(c, i), src, c->hd * 2u, c->io->q_stride * 2u,
-                        c->hd * 2u, it->n_rows, 0, 1);
+  const size_t at = (size_t)it->q0 * c->io->q_stride + it->h * c->hd;
+  if (c->io->q_f32) {
+    hexkl_dma_ring_push2d(q_stage(c, i), c->io->q_f32 + at, c->hd * 4u,
+                          c->io->q_stride * 4u, c->hd * 4u, it->n_rows, 0, 1);
+    return;
+  }
+  hexkl_dma_ring_push2d(q_stage(c, i), c->io->q + at, c->hd * 2u,
+                        c->io->q_stride * 2u, c->hd * 2u, it->n_rows, 0, 1);
+}
+
+/** @brief [P7] 64 f32 of a staged row -> their u16 codes, quant_u16_f32's
+ *         floats in q16_worker's operation order: x * inv + (zp + 0.5),
+ *         clamped, truncated (Vw_equals_Vsf), the two halves packed. */
+static inline HVX_Vector q_f32_to_u16(const float *x, HVX_Vector vinv,
+                                      HVX_Vector vzp) {
+  const HVX_Vector vlo = Q6_V_vzero(), vhi = hvx_splat_sf(65535.0f);
+  HVX_Vector a =
+    Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)x, vinv), vzp);
+  HVX_Vector b = Q6_Vsf_vadd_VsfVsf(
+    Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + 32u), vinv), vzp);
+  a = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(a, vlo), vhi);
+  b = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(b, vlo), vhi);
+  return Q6_Vuh_vpack_VwVw_sat(Q6_Vw_equals_Vsf(b), Q6_Vw_equals_Vsf(a));
 }
 
 /**
@@ -228,7 +248,12 @@ static void stage_qprep(ctx *c, uint32_t i) {
   item_t *it = &c->items[i];
   const uint32_t zp = q_zp_of(c, it->h);
   const HVX_Vector pad = Q6_Vh_vsplat_R((int)zp);
-  const uint16_t *stage = q_stage(c, i);
+  const uint16_t *stage = (const uint16_t *)q_stage(c, i);
+  const float *stage32 = (const float *)q_stage(c, i);
+  const int f32 = c->io->q_f32 != NULL;
+  const HVX_Vector vinv = hvx_splat_sf(f32 ? c->io->q_inv[it->h] : 0.0f);
+  const HVX_Vector vzp =
+    hvx_splat_sf(f32 ? c->io->q_enc[2u * it->h + 1u] + 0.5f : 0.0f);
   uint8_t *qlo = q_tiles_lo(c, it->qslot);
   uint8_t *qhi = q_tiles_hi(c, it->qslot);
   for (uint32_t d = 0; d < c->dt; d += 2u) {
@@ -241,9 +266,11 @@ static void stage_qprep(ctx *c, uint32_t i) {
       HVX_Vector x[4];
       for (uint32_t k = 0; k < 4u; ++k) {
         const uint32_t rr = r + k;
-        x[k] = rr < it->n_rows
-                 ? *(const HVX_UVector *)(stage + (size_t)rr * c->hd + 32u * d)
-                 : pad;
+        x[k] =
+          rr >= it->n_rows ? pad
+          : f32
+            ? q_f32_to_u16(stage32 + (size_t)rr * c->hd + 32u * d, vinv, vzp)
+            : *(const HVX_UVector *)(stage + (size_t)rr * c->hd + 32u * d);
       }
       /* Bytes: even (low) to lo_W, odd (high) to hi_W; row k then k+1. */
       const HVX_VectorPair b01 = Q6_W_vdeal_VVR(x[1], x[0], -1);
@@ -714,7 +741,8 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
                           const hexkl_attn_f16_shape *s,
                           const hexkl_attn_q2_io *io, hvx_worker_pool *pool,
                           hexkl_attn_q2_stats *st) {
-  if (!vtcm_base || !s || !io || !io->q || !io->out || !io->kv || !io->q_enc ||
+  if (!vtcm_base || !s || !io || (!io->q && !io->q_f32) ||
+      (io->q_f32 && !io->q_inv) || !io->out || !io->kv || !io->q_enc ||
       !io->out_enc) {
     return AEE_EBADPARM;
   }
