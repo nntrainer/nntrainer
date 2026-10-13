@@ -363,6 +363,17 @@ public:
   sharedConstTensors inference(sharedConstTensors X, bool free_mem = false);
 
   /**
+   * @brief Discard CPU scratch after consuming all inference outputs.
+   * @note Call only between inference calls with no outstanding work. Previous
+   * output contents are invalidated; persistent state and weights are kept.
+   * Unsupported platforms and non-CPU pools return zero without changes.
+   * @return Bytes advised away, including pages that were already nonresident.
+   */
+  size_t releaseInferenceScratch() {
+    return model_graph.releaseInferenceScratch();
+  }
+
+  /**
    * @brief     Run NeuralNetwork inference
    * @param[in] X input tensor
    * @param[in] label label tensor

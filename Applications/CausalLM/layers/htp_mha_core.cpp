@@ -1108,6 +1108,8 @@ bool HtpMHACoreLayer::try_accelerated_attention(
 void HtpMHACoreLayer::registerQuantizedCache(
   nntrainer::RunLayerContext &context) {
   compute_ops_ = context.getComputeOps();
+  if (nntrainer::weightPageCachePolicy() >= 0)
+    return; // The memory profile allocates only the current layer's layout.
   // [#282 D] with NNTR_HTP_E2E_FREE_KVQ the caches go at the first decode
   // token anyway; registering them at the prefill's first call (the lazy
   // path, try_quantized_attention) keeps them out of the address space the
@@ -1220,6 +1222,20 @@ bool HtpMHACoreLayer::try_quantized_attention(
       !compute_ops_->supports_kv_cache_q() || !is_causal) {
     return false;
   }
+  // The fp16 cache is the authoritative history until decode takes ownership.
+  // Keep only this layer's temporary quantized layout during prefill. Reusing
+  // calibration and resetting the synced row count also supports chunked
+  // prefill: the next call rebuilds the layout from that history.
+  const char *seed_q = std::getenv("NNTR_HTP_KV_SEED_Q");
+  const bool release_prefill = nntrainer::weightPageCachePolicy() >= 0 &&
+                               cache_to - cache_from > 1 &&
+                               !(seed_q && std::strcmp(seed_q, "1") == 0);
+  auto release = [release_prefill](MHACoreLayer *layer) {
+    if (release_prefill)
+      layer->release_quantized_cache();
+  };
+  std::unique_ptr<MHACoreLayer, decltype(release)> cache_lifetime(this,
+                                                                  release);
   using clk = std::chrono::steady_clock;
   const auto ts0 = clk::now();
   AccelF32Io io;

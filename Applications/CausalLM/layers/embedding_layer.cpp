@@ -26,6 +26,7 @@
 #include <node_exporter.h>
 #include <thread_manager.h>
 #include <util_func.h>
+#include <weight_file_reader.h>
 
 #include <cstdio>
 #include <vector>
@@ -1002,7 +1003,10 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 
   weight_idx = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+    weight_decay, "Embedding", true,
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE &&
+      nntrainer::weightPageCachePolicy() >= 0 &&
+      context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0);
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -1388,10 +1392,17 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       ggml_lut && wt == nntrainer::TensorDim::DataType::QS4CX;
     NNTR_THROW_IF(ggml_lut && !row_quant && !qs4cx_lut, std::runtime_error)
       << "GGML sidecar LUT supports only Q4_0/Q6_K/QS4CX payloads";
+    // Under the weight page-cache policy the Q4_0 table stays virtual: its
+    // rows are read from the file on demand instead of being resident.
+    const bool virt_q4 = !ggml_lut &&
+                         wt == nntrainer::TensorDim::DataType::Q4_0 &&
+                         weight_p->isVirtual();
     const uint8_t *quant_table =
       (row_quant || qs4cx_lut)
-        ? (ggml_lut ? quant_lut->data() : weight_p->getData<uint8_t>())
+        ? (ggml_lut ? quant_lut->data()
+                    : (virt_q4 ? nullptr : weight_p->getData<uint8_t>()))
         : nullptr;
+    std::vector<uint8_t> virt_row;
     const size_t row_stride =
       qs4cx_lut ? quant_lut->row_bytes
                 : ((wt == nntrainer::TensorDim::DataType::Q6_K)
@@ -1478,7 +1489,18 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             weight_p->getData(),
                                             weight_p->getScale(), tmp.data());
           } else {
-            const void *row = quant_table + row_stride * embed_idx;
+            const void *row;
+            if (virt_q4) {
+              virt_row.resize(row_stride);
+              const int rc = nntrainer::weightPread(
+                weight_p->getFd(), virt_row.data(), virt_row.size(),
+                weight_p->getFileOffset() + row_stride * embed_idx);
+              NNTR_THROW_IF(rc != 0, std::runtime_error)
+                << "Embedding row read failed: " << std::strerror(rc);
+              row = virt_row.data();
+            } else {
+              row = quant_table + row_stride * embed_idx;
+            }
             if (wt == nntrainer::TensorDim::DataType::Q6_K)
               nntrainer::dequantize_row_q6_K(const_cast<void *>(row),
                                              tmp.data(), out_dim);

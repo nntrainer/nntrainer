@@ -418,6 +418,11 @@ public:
     tensor_manager->deallocateTensors(dealloc_weights);
   }
 
+  /** @brief Discard expired CPU forward scratch between inference calls. */
+  size_t releaseInferenceScratch() {
+    return tensor_manager->releaseInferenceScratch();
+  }
+
   /**
    * @brief Allocate memory for all the managed weights
    */

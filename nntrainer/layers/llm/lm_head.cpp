@@ -167,6 +167,15 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           hidden_step.getData<float>(), hidden_step.width()))
       continue;
 
+#ifdef ENABLE_HEXKL
+    if (!training && no_bias &&
+        input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        nntrainer::get_htp_ops()->lm_head_shared_fp32(
+          weight.getData(), input_step.width(), hidden_step.width(),
+          input_step.getData<float>(), hidden_step.getData<float>()))
+      continue;
+#endif
+
     input_step.dot(weight, hidden_step, false, false);
 
     if (!no_bias) {

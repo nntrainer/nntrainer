@@ -493,6 +493,19 @@ public:
     return false;
   }
 
+  /** Share an untied LM head with the complete decode graph. The caller has
+   * checked that no other CPU layer reads the source. The backend may release
+   * its host pages once registered; both prefill and decode use its handles. */
+  virtual void share_decode_lm_head(const void *w) { (void)w; }
+
+  /** Run a previously shared head, or return false without reading its weight.
+   */
+  virtual bool lm_head_shared_fp32(const void *w, unsigned K, unsigned N,
+                                   const float *x, float *y) {
+    (void)w, (void)K, (void)N, (void)x, (void)y;
+    return false;
+  }
+
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
@@ -779,6 +792,16 @@ public:
     (void)v_rows;
     return false;
   }
+  // The host's KV caches of the windowed (sliding) attention layers hold
+  // a window of the context: absolute position a is their row a - base and
+  // they have `rows` rows. Told before the first decode row, so the
+  // accelerator's own caches of those layers are that size and its
+  // attention reads row pos - base; the seed carries the rows from the
+  // base on. No-op where no decode graph is resident.
+  virtual void set_decode_kv_window(unsigned rows, unsigned base) {
+    (void)rows;
+    (void)base;
+  }
   // [#4416 D6] The same seed from the cache's fp16 bits, widened on the
   // accelerator (exactly, as compute_fp16_to_fp32): no CPU conversion.
   virtual bool decode_kv_seed_f16(unsigned n_rows, const uint16_t *k_rows,
@@ -798,6 +821,23 @@ public:
     (void)kv_handle;
     (void)k_rows;
     return false;
+  }
+
+  /** Whether the complete decode graph consumes this registered source.
+   * Per-op M=1 capability can be false when the whole token runs on device.
+   */
+  virtual bool uses_device_weight(const void *data) const {
+    (void)data;
+    return false;
+  }
+
+  /** Release an exclusively accelerated weight's host pages after registration.
+   * The caller guarantees that no CPU consumer or fallback reads this range.
+   * The address remains a registry key; its backing allocation still owns it.
+   */
+  virtual void discard_weight_source(void *data, size_t bytes) {
+    (void)data;
+    (void)bytes;
   }
 
   // Registers one K x N expert weight with the accelerator ahead of its
