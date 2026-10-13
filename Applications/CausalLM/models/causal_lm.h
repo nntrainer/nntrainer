@@ -477,6 +477,15 @@ protected:
   virtual void allocateAndBindKVCache();
 
   /**
+   * @brief Before a step at absolute position pos: the windowed layers of
+   *        kv_cache move their window to the front (KVCacheManager::compact)
+   *        and the HTP attention layers get the new row bases.
+   * @param[in] pos absolute position of the next row
+   * @param[in] force hand the bases over even when none moved (after a load)
+   */
+  void compactKVCache(unsigned int pos, bool force = false);
+
+  /**
    * @brief Per-layer KV geometry, read from the model's hooks.
    */
   struct KVCacheLayout {

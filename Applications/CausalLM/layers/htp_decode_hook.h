@@ -16,6 +16,7 @@ using nntrainer::htpDecodeHasTokenId;
 using nntrainer::htpDecodeKvSeed;
 using nntrainer::htpDecodeKvSeedF16;
 using nntrainer::htpDecodeKvSeedKvq;
+using nntrainer::htpDecodeKvWindow;
 using nntrainer::htpDecodeLmHead;
 using nntrainer::htpDecodeOp;
 using nntrainer::htpDecodeQkNorm;

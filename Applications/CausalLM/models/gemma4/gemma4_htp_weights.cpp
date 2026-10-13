@@ -139,7 +139,7 @@ void Gemma4HtpTransformer::repack_weight() {
         // Only the bias-free untied head opts into this. Another CPU consumer
         // of the same tensor still prevents release, irrespective of walk
         // order.
-        if (discard_sources && l.getType() == LmHeadLayer::type &&
+        if (discard_sources && l.getType() == nntrainer::LmHeadLayer::type &&
             context.getWeights().size() == 1 &&
             tensor.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
           shared_heads.insert(tensor.getData());

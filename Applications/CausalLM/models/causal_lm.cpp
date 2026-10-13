@@ -1008,6 +1008,22 @@ std::string CausalLM::kvCacheModelTag() const {
   return std::string(buf);
 }
 
+void CausalLM::compactKVCache(unsigned int pos, bool force) {
+  if (!kv_cache.compact(pos) && !force)
+    return;
+  // ponytail: the n-th HTP attention layer in graph order is attention
+  // layer n (the fused model builds them in that order); a model that shares
+  // or reorders them needs the layer's own index instead.
+  unsigned int n = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+      if (l.getType() == causallm::HtpMHACoreLayer::type &&
+          n < kv_cache.getNumLayers())
+        l.setProperty({"cache_base=" + std::to_string(kv_cache.getBase(n++))});
+    };
+  model->forEachLayer(fn, nullptr);
+}
+
 void CausalLM::save_kvcache(std::string path, int to_) {
   if (!kv_cache.isAllocated()) {
     throw std::runtime_error(
@@ -1070,6 +1086,8 @@ void CausalLM::load_kvcache(std::string path, int to_) {
   // mha_core layers each track their own cache_index; sync them all to the
   // newly-loaded position so the next forwarding() writes at the right slot.
   setKVCachePosition(loaded);
+  // a windowed layer's rows start at its base now
+  compactKVCache(loaded, true);
   retire_decode_capture();
 }
 
@@ -2159,6 +2177,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ? generation_begin +
           std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
       : generation_begin;
+
+  // The windowed layers' caches from here on: the window, then one row a
+  // generated token. The accelerator's decode caches of those layers are
+  // sized and based the same (before its first decode row).
+  // ponytail: one (rows, base) for all windowed layers -- they share one
+  // window and one DSP cache; per-layer values if a model ever mixes them.
+  compactKVCache(input_len + global_token_len);
+  for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
+    if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+      const unsigned int base = kv_cache.getBase(l);
+      htpDecodeKvWindow(input_len + global_token_len - base + NUM_TO_GENERATE,
+                        base);
+      break;
+    }
 
   struct HtpDecodeReset {
     bool active;

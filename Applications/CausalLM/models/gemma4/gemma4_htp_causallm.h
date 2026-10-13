@@ -111,6 +111,10 @@ protected:
   unsigned int getAttentionHeadDim(int layer_id) const;
   unsigned int getKVHeadCount(int layer_id) const;
   unsigned int getKVCacheWidth(int layer_id) const;
+
+  /** @brief Rows of a layer's KV cache: max_seq_len, or for a sliding layer
+   *         at a long max_seq_len its window plus one step. */
+  unsigned int getKVCacheRows(int layer_id) const;
   void appendSkipPrefillIfNeeded(std::vector<std::string> &props,
                                  bool enable_skip) const;
   std::pair<Tensor, Tensor>
