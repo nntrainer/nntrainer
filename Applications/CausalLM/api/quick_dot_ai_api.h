@@ -228,6 +228,14 @@ WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
 #endif /* __TRANSFORMER_H__ */
 
 /**
+ * @brief Diagnostic for the last loadModelHandleByName call on the calling
+ * thread.
+ * @return Borrowed string, valid until the next load on this thread.
+ *         Empty after a successful load. Copy it before crossing threads.
+ */
+WIN_EXPORT const char *getLastModelLoadError(void);
+
+/**
  * @brief Load model by string id (T4 catalog path).
  *
  * Looks up the descriptor from the registry by @p model_id, validates the

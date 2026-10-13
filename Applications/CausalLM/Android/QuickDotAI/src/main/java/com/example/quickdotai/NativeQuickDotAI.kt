@@ -32,7 +32,8 @@ class NativeQuickDotAI(
     override var architecture: String? = null
         private set
 
-    private var handle: Long = 0L
+    private val handleLock = Any()
+    @Volatile private var handle: Long = 0L
     private var loaded: Boolean = false
 
     // Image processor for multimodal inference
@@ -50,6 +51,10 @@ class NativeQuickDotAI(
             "load() entered: modelId=${req.modelId} backend=${req.backend} " +
                 "quant=${req.quantization}"
         )
+        if (req.modelId == ModelIds.GEMMA4_26B_A4B_HTP &&
+            (req.backend != BackendType.NPU || req.quantization != QuantizationType.W4A32)) {
+            return BackendResult.Err(QuickAiError.INVALID_PARAMETER, "Gemma4 HTP requires NPU / W4A32")
+        }
         if (loaded) {
             Log.i(TAG, "load(): already loaded, returning Ok")
             return BackendResult.Ok(Unit)
@@ -98,7 +103,9 @@ class NativeQuickDotAI(
                 Log.e(TAG, "load(): loadModelHandleByNameNative returned 0 for '${req.modelId}'")
                 BackendResult.Err(
                     QuickAiError.MODEL_LOAD_FAILED,
-                    "loadModelHandleByName failed for '${req.modelId}'"
+                    NativeCausalLm.lastModelLoadErrorNative().ifBlank {
+                        "loadModelHandleByName failed for '${req.modelId}'"
+                    }
                 )
             } else {
                 val sdResult = NativeCausalLm.configureSpeculativeDecodingNative(h, req.useSpeculativeDecoding)
@@ -315,13 +322,11 @@ class NativeQuickDotAI(
     }
 
     override fun cancel() {
-        Log.d(TAG, "cancel(): START, handle=0x${handle.toString(16)}")
-        if (handle != 0L) {
-            Log.d(TAG, "cancel(): calling NativeCausalLm.cancelModelHandleNative(handle=0x${handle.toString(16)})")
-            val result = NativeCausalLm.cancelModelHandleNative(handle)
-            Log.d(TAG, "cancel(): cancelModelHandleNative returned $result")
-        } else {
-            Log.w(TAG, "cancel(): no valid handle to cancel")
+        // The UI may cancel while the worker closes or replaces a model.
+        synchronized(handleLock) {
+            if (handle != 0L) {
+                NativeCausalLm.cancelModelHandleNative(handle)
+            }
         }
     }
 
@@ -544,13 +549,15 @@ class NativeQuickDotAI(
     override fun close() {
         activeSession?.close()
         activeSession = null
-        if (handle != 0L) {
-            try {
-                NativeCausalLm.destroyModelHandleNative(handle)
-            } catch (t: Throwable) {
-                Log.w(TAG, "destroyModelHandleNative threw", t)
+        synchronized(handleLock) {
+            if (handle != 0L) {
+                try {
+                    NativeCausalLm.destroyModelHandleNative(handle)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "destroyModelHandleNative threw", t)
+                }
+                handle = 0L
             }
-            handle = 0L
         }
         loaded = false
     }
