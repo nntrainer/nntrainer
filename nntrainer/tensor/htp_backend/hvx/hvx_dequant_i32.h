@@ -106,13 +106,19 @@ void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
  *        Ultra. colsum_w, w_scale, bias and out are offset to the first
  *        tile's column. @a rows must not repeat within [m0, m1) nor across
  *        concurrent calls (one expert's tokens).
+ *
+ *        @a seen, when not NULL, is one byte per out row for these columns:
+ *        a row whose byte is 0 is taken as zeros (0 + the product, the add
+ *        a zeroed row would have made) without reading it, and its byte is
+ *        set. The caller then need not clear @a out first, only the rows
+ *        whose byte is still 0 at the end.
  */
 void hvx_dequant_acc_tiles_scatter_rows_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
   const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
-  const float *weights);
+  const float *weights, uint8_t *seen);
 
 /**
  * @brief Dequantizes a RUN of accumulator tiles in one pooled pass.

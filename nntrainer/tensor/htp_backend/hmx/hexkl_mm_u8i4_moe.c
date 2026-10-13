@@ -426,6 +426,9 @@ typedef struct {
   const float *bias;
   /* the scatter */
   float *out; /**< out_c, heap */
+  /** [M] bytes for this batch's columns: the out rows written so far. out
+     is not cleared first; a row's first writer takes it as zeros. */
+  uint8_t *seen;
   const uint32_t *rows;
   const float *weights;
   uint32_t N_out;
@@ -466,8 +469,13 @@ static inline void moe_dn_rows(const moe_dn_ctx *c, uint32_t m0, uint32_t m1) {
   hvx_dequant_acc_tiles_scatter_rows_f32(
     c->tiles_base, c->tile_stride, c->nb, c->row_stride, m0, m1, c->act_scale,
     c->act_zp, c->colsum_w + c0, c->w_scale + c0, c->bias + c0, c->out + c0,
-    c->N_out, c->rows, c->weights);
+    c->N_out, c->rows, c->weights, c->seen);
   for (uint32_t q = 0; m0 == 0u && q < c->n_rows_b; ++q) {
+    if (!c->seen[c->rows_b[q]]) {
+      c->seen[c->rows_b[q]] = 1u;
+      memset(c->out + (size_t)c->rows_b[q] * c->N_out + c0, 0,
+             sizeof(float) * c->nb * HEXKL_ACC_TILE_COLS);
+    }
     hvx_scale_add_rows_f32(c->out + (size_t)c->rows_b[q] * c->N_out + c0,
                            c->res_b + (size_t)q * c->N_out + c0,
                            c->weights_b[q], c->nb * HEXKL_ACC_TILE_COLS);
@@ -1832,6 +1840,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_act_u8 = use_m1 ? 0u : (size_t)M * K + 2u * MOE_U8_GUARD;
   /* One done byte per slot block for the background pack. */
   const size_t sz_pack_done = n_slots_cap / HEXKL_MOE_PACK_UNIT_ROWS + 1u;
+  /** the down batches' out rows written so far, [MOE_MAX_CHUNKS][M] */
+  const size_t sz_seen = use_m1 ? 0u : (size_t)MOE_MAX_CHUNKS * M;
   /** The tail path (moe_tail_*): jobs, done bytes and contexts for as many
      tails as there are experts -- a bound, like n_slots_cap, so the block
      never regrows -- one shared staging set, and each tail's own result. */
@@ -1869,6 +1879,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       ROUND_UP_SZ(sz_act_u8, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_pre, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_seen, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_jobs, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_done, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_ctx, MOE_SCRATCH_ALIGN) +
@@ -1905,6 +1916,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint8_t *act_u8 =
     use_m1 ? NULL : (uint8_t *)hexkl_moe_carve(&cur, sz_act_u8) + MOE_U8_GUARD;
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
+  uint8_t *seen = (uint8_t *)hexkl_moe_carve(&cur, sz_seen);
   hvx_bg_job *jobs = (hvx_bg_job *)hexkl_moe_carve(&cur, sz_jobs);
   uint8_t *tail_done = (uint8_t *)hexkl_moe_carve(&cur, sz_tail_done);
   moe_tail_ctx *tails = (moe_tail_ctx *)hexkl_moe_carve(&cur, sz_tail_ctx);
@@ -1984,7 +1996,15 @@ int hexkl_mm_u8i4_moe_layer_run(
     moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0,
                  HEXKL_DMA_SITE_COPY_IN);
   }
-  memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
+  /** The HMX path does not clear out: a down batch's scatter takes a row
+     it is the first to write as zeros (seen), and the rows no expert
+     wrote are cleared at the end. The clear was 11.5 MB a 1024-row call,
+     written and then read back by every row's first add. */
+  if (use_m1 || n_active == 0u) {
+    memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
+  } else {
+    memset(seen, 0, sz_seen);
+  }
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
   if (n_active == 0u) {
     if (!out_direct) {
@@ -2909,6 +2929,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           c->w_scale = d->w_scale;
           c->bias = d->bias;
           c->out = out_c;
+          c->seen = seen + (size_t)(nt0 / L.acc_tiles) * M;
           c->rows = rows;
           c->weights = weights;
           c->N_out = N_out;
@@ -2975,6 +2996,18 @@ int hexkl_mm_u8i4_moe_layer_run(
   if (dn_seq != 0u && !dn_fg) {
     hvx_worker_pool_wait_bg(pool, &dn_job[(dn_seq - 1u) % L.dn_ring],
                             UINT32_MAX);
+  }
+  /* the rows no expert wrote, per down batch's columns */
+  for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
+    const uint32_t cn =
+      (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+    const uint8_t *sn = seen + (size_t)(nt0 / L.acc_tiles) * M;
+    for (uint32_t r = 0; r < M; ++r) {
+      if (!sn[r]) {
+        memset(out_c + (size_t)r * N_out + nt0 * HEXKL_ACC_TILE_COLS, 0,
+               sizeof(float) * cn * HEXKL_ACC_TILE_COLS);
+      }
+    }
   }
   HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
 

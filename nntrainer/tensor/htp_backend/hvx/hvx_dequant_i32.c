@@ -173,17 +173,22 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
   uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
   const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
-  const float *weights) {
+  const float *weights, uint8_t *seen) {
   /** One output row's n_tiles vectors, [47:32] stride, [31:16] width, [15:0]
      height. A hint: it moves no bits. Three rows ahead, the most a lane
      can queue (the hardware stalls the thread on a fourth). */
   const uint64_t box = ((uint64_t)(n_tiles * 128u) << 32) |
                        ((uint64_t)(n_tiles * 128u) << 16) | 1u;
   for (uint32_t m = m0; m < m1 && m < m0 + 3u; ++m)
-    Q6_l2fetch_AP((void *)(out + (size_t)rows[m] * out_stride), box);
+    if (!seen || seen[rows[m]])
+      Q6_l2fetch_AP((void *)(out + (size_t)rows[m] * out_stride), box);
   for (uint32_t m = m0; m < m1; ++m) {
-    if (m + 3u < m1)
+    if (m + 3u < m1 && (!seen || seen[rows[m + 3u]]))
       Q6_l2fetch_AP((void *)(out + (size_t)rows[m + 3u] * out_stride), box);
+    /* a row nobody has written yet: zeros, not its bytes */
+    const int first = seen && !seen[rows[m]];
+    if (first)
+      seen[rows[m]] = 1u;
     const HVX_Vector vs = hvx_splat_sf(act_scale[m]);
     const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m]));
     const HVX_Vector vwt = hvx_splat_sf(weights[m]);
@@ -201,7 +206,8 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
             Q6_Vsf_vsub_VsfVsf(af, Q6_Vsf_vmpy_VsfVsf(vz, csf)), vs),
           ((const HVX_UVector *)w_scale)[j]),
         ((const HVX_UVector *)bias)[j]);
-      vo[j] = Q6_Vsf_vadd_VsfVsf(vo[j], Q6_Vsf_vmpy_VsfVsf(r, vwt));
+      const HVX_Vector prev = first ? Q6_V_vzero() : vo[j];
+      vo[j] = Q6_Vsf_vadd_VsfVsf(prev, Q6_Vsf_vmpy_VsfVsf(r, vwt));
     }
   }
 }
