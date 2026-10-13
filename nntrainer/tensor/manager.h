@@ -409,6 +409,13 @@ public:
    */
   void deallocateTensors(bool dealloc_weights = false);
 
+  /** @brief Discard expired CPU forward scratch between inference calls. */
+  size_t releaseInferenceScratch() {
+    return exec_mode == ExecutionMode::INFERENCE
+             ? tensor_pool.releaseInferenceScratch()
+             : 0;
+  }
+
   /**
    * @brief Allocate memory for all the managed weights
    *

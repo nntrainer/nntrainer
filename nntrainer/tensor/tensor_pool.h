@@ -135,6 +135,15 @@ public:
   void deallocate();
 
   /**
+   * @brief Discard CPU pages used only during a forward call.
+   * @note Call between inference calls, after consuming their outputs and
+   * synchronizing all users. Persistent tensors and pages shared with them
+   * are preserved. Pointers remain valid; discarded contents become zero.
+   * @return Bytes advised away, or zero for unsupported allocators/platforms.
+   */
+  size_t releaseInferenceScratch();
+
+  /**
    * @brief     Get execution order for the given tensor
    *
    * @return The execution order of the tensor

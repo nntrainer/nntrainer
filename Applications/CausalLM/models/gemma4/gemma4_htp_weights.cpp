@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
+#include <cstring>
 
 #include <app_context.h>
 #include <engine.h>
@@ -27,10 +29,12 @@
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
 #include <htp_wh_layout.h>
+#include <lm_head.h>
 #include <lfm2_moe_layer.h>
 #include <lfm2_moe_pool_layer.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
+#include <weight_file_reader.h>
 #include <rms_norm.h>
 #include <swiglu_layer.h>
 
@@ -74,6 +78,11 @@ void Gemma4HtpTransformer::repack_weight() {
     unsigned int K, N;
   };
   std::vector<PendingFc> fc_pending;
+  std::set<const void *> cpu_weight_sources;
+  std::set<const void *> shared_heads;
+  const char *e2e = std::getenv("NNTR_HTP_E2E");
+  const bool discard_sources = nntrainer::weightPageCachePolicy() >= 0 && e2e &&
+                               std::strcmp(e2e, "1") == 0;
   struct PendingDense {
     nntrainer::ComputeOps *ops;
     void *up, *gate, *down;
@@ -119,9 +128,32 @@ void Gemma4HtpTransformer::repack_weight() {
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending,
-          &mha_pending](ml::train::Layer &l,
-                        nntrainer::RunLayerContext &context, void *) {
+          &mha_pending, &cpu_weight_sources, &shared_heads, discard_sources](
+           ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       // forEachLayer hands out LayerNodes.
+      auto *consumer = context.getComputeOps();
+      for (auto *w : context.getWeights()) {
+        auto &tensor = w->getVariableRef();
+        if (tensor.isVirtual())
+          continue;
+        // Only the bias-free untied head opts into this. Another CPU consumer
+        // of the same tensor still prevents release, irrespective of walk
+        // order.
+        if (discard_sources && l.getType() == LmHeadLayer::type &&
+            context.getWeights().size() == 1 &&
+            tensor.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+          shared_heads.insert(tensor.getData());
+          continue;
+        }
+        const bool accelerated =
+          consumer && ((l.getType() == "dense_ffn" &&
+                        consumer->supports_gemm_q4_0_dense_ffn_fp32()) ||
+                       (consumer->supports_gemm_qs4cx_accel_fp32() &&
+                        (consumer->accelerates_qs4cx_at_m1() ||
+                         consumer->uses_device_weight(tensor.getData()))));
+        if (!accelerated)
+          cpu_weight_sources.insert(tensor.getData());
+      }
       if (l.getType() == HtpMHACoreLayer::type) {
         if (auto *m = dynamic_cast<HtpMHACoreLayer *>(
               static_cast<nntrainer::LayerNode &>(l).getLayer()))
@@ -141,11 +173,9 @@ void Gemma4HtpTransformer::repack_weight() {
       // FloatTensor::dotQs4cx only needs a weight packed when it falls
       // through to the CPU KleidiAI path (getPackedData()); the HTP path
       // (gemm_qs4cx_accel_fp32) reads getData()/getScale() directly and
-      // never touches packed_data, so packing an HTP-dispatched expert's
-      // weight here is a harmless one-time no-op cost, not a correctness
-      // requirement -- but a CPU-dispatched MoE layer (any layer_id not in
-      // moe_htp_layers) throws "pack before run model" on its first token
-      // without this, because lfm2_moe was missing from this filter.
+      // never touches packed_data. Avoid retaining a CPU packed copy when
+      // both prefill and decode use the registered device weight. CPU and
+      // partially accelerated models still require their CPU packing.
       // A dense_ffn layer's three Q4_0 weights are registered as one
       // fused set (doc 51), after the walk like the FCs below -- not as
       // three FC weights, which the loop below would otherwise do.
@@ -171,11 +201,14 @@ void Gemma4HtpTransformer::repack_weight() {
           else if (ends_with(":down"))
             down_p = &w->getVariableRef();
         }
-        // A CPU-engine dense_ffn reads QS4CX through the KleidiAI pack, so
-        // pack as the FC branch below does (a CPU layer has ComputeOps too,
-        // so the engine cannot be told from them here).
+        // Only CPU execution needs a KleidiAI copy. The accelerated fused
+        // path owns its registered weights for both prefill and decode.
+        const auto *dense_ops = context.getComputeOps();
+        const bool cpu_dense =
+          !dense_ops || !dense_ops->supports_gemm_q4_0_dense_ffn_fp32();
         for (auto *p : {up_p, gate_p, down_p})
-          if (p && p->getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+          if (cpu_dense && p &&
+              p->getDataType() == ml::train::TensorDim::DataType::QS4CX &&
               !p->isVirtual())
             packCpuWeight(*p);
         if (up_p && gate_p && down_p && context.getComputeOps()) {
@@ -249,7 +282,13 @@ void Gemma4HtpTransformer::repack_weight() {
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
-        if (dtype == ml::train::TensorDim::DataType::QS4CX && !t.isVirtual()) {
+        auto *weight_ops = context.getComputeOps();
+        const bool cpu_pack = !weight_ops ||
+                              !weight_ops->supports_gemm_qs4cx_accel_fp32() ||
+                              (!weight_ops->accelerates_qs4cx_at_m1() &&
+                               !weight_ops->uses_device_weight(t.getData()));
+        if (cpu_pack && dtype == ml::train::TensorDim::DataType::QS4CX &&
+            !t.isVirtual()) {
           packCpuWeight(t);
         }
         // A QS4CX FC weight (quantized offline, no Q4_0 detour) is
@@ -337,6 +376,11 @@ void Gemma4HtpTransformer::repack_weight() {
     };
   try {
     model->forEachLayer(fn, nullptr);
+#ifdef ENABLE_HEXKL
+    for (const void *head : shared_heads)
+      if (!cpu_weight_sources.count(head))
+        nntrainer::get_htp_ops()->share_decode_lm_head(head);
+#endif
     // [#225] The FC WH sidecar, handed to every backend that registers a
     // pending FC before it registers any. A CPU-engine layer's ops are
     // pending too and answer false, so a model whose keys route no FC to
@@ -428,6 +472,9 @@ void Gemma4HtpTransformer::repack_weight() {
                                     p.K);
       ml_logd("FC HTP kernel warmed up at load (M=%u, K=%u, N=%u)", M, p.K,
               p.N);
+      if (qs4cx && discard_sources && !cpu_weight_sources.count(p.data))
+        p.ops->discard_weight_source(
+          p.data, static_cast<size_t>(p.K) * p.N / 2 + sizeof(float) * p.N);
     }
     // Same for the dense FFNs: the registration converts and packs three
     // weights into I / w expert pairs, and the one warm-up call grows the
@@ -437,6 +484,17 @@ void Gemma4HtpTransformer::repack_weight() {
       if (!p.ops->register_q4_0_dense_ffn(p.up, p.gate, p.down, p.K, p.I, p.N,
                                           p.up_s, p.gate_s, p.down_s))
         continue;
+      if (p.up_s && discard_sources) {
+        for (auto weight :
+             {std::make_pair(p.up, static_cast<size_t>(p.K) * p.I / 2 +
+                                     sizeof(float) * p.I),
+              std::make_pair(p.gate, static_cast<size_t>(p.K) * p.I / 2 +
+                                       sizeof(float) * p.I),
+              std::make_pair(p.down, static_cast<size_t>(p.I) * p.N / 2 +
+                                       sizeof(float) * p.N)})
+          if (!cpu_weight_sources.count(weight.first))
+            p.ops->discard_weight_source(weight.first, weight.second);
+      }
       if (dense_warmed || !p.ops->supports_gemm_q4_0_dense_ffn_fp32())
         continue;
       dense_warmed = true;

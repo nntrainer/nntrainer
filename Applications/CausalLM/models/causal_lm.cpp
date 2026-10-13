@@ -1450,6 +1450,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   unsigned int generation_cnt = 0;
   int64_t total_generation_duration = 0;
 
+  // Record generated IDs without requesting logits or forcing a continuation.
+  // This lets performance runs verify the normal DSP token-id path as well.
+  const char *generated_ids_path = std::getenv("NNTR_GENERATED_IDS");
+  std::vector<unsigned int> generated_ids;
+
   /**
    * INPUT PREPARATION
    */
@@ -2020,6 +2025,24 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   for (auto &out : output) {
     releaseLogitsBuf(out);
   }
+  if (generated_ids_path)
+    generated_ids.insert(generated_ids.end(), id_list.begin(), id_list.end());
+
+#ifdef ENABLE_HEXKL
+  // The resident decode graph only needs a row of the CPU prefill scratch.
+  // Outputs have been consumed above; KV placeholders and persistent tensors
+  // retain their pages. Keep this opt-in while measuring the memory profile.
+  if (const char *release = std::getenv("NNTR_HTP_RELEASE_PREFILL_SCRATCH")) {
+    if (std::strcmp(release, "1") == 0) {
+      if (auto *network =
+            dynamic_cast<nntrainer::NeuralNetwork *>(model.get())) {
+        const size_t bytes = network->releaseInferenceScratch();
+        std::cerr << "[HTP] CPU prefill scratch discarded: " << (bytes >> 20)
+                  << " MiB of virtual pages" << std::endl;
+      }
+    }
+  }
+#endif
 
   /** [perf-split] MEASUREMENT PATH ONLY. The host is here as soon as the last
    *  prefill chunk has been SUBMITTED; on both async backends the device is
@@ -2177,6 +2200,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
         static_cast<float>(ids_list[b]);
     }
+    if (generated_ids_path)
+      generated_ids.insert(generated_ids.end(), ids_list.begin(),
+                           ids_list.end());
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
@@ -2230,6 +2256,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   global_token_len += (generation_cnt + init_len);
 
+  if (generated_ids_path) {
+    std::ofstream ids_file(generated_ids_path);
+    for (unsigned int id : generated_ids)
+      ids_file << id << '\n';
+    if (!ids_file)
+      throw std::runtime_error(std::string("Cannot write generated IDs: ") +
+                               generated_ids_path);
+  }
   auto finish_generation = std::chrono::high_resolution_clock::now();
   auto generation_duration =
     std::chrono::duration_cast<std::chrono::milliseconds>(finish_generation -

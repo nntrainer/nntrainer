@@ -91,6 +91,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <weight_file_reader.h>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -1723,6 +1724,12 @@ public:
     const std::vector<uint32_t> *h = lmHeadHandles(w, session, K, N);
     if (h == nullptr)
       return false;
+    return invokeLmHead(session, *h, K, N, x, gamma, eps, softcap, y);
+  }
+
+  bool invokeLmHead(remote_handle64 session, const std::vector<uint32_t> &h,
+                    unsigned K, unsigned N, const float *x, const float *gamma,
+                    float eps, float softcap, float *y) {
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     float *act =
       reinterpret_cast<float *>(stage(act_pool_, K * sizeof(float)).data());
@@ -1731,8 +1738,8 @@ public:
     stagedMemcpy(act, x, K * sizeof(float));
     const uint64_t t0 = HtpProfile::nowUs();
     const int err = nntr_hvx_lm_head_q4m1_f32(
-      session, eps, gamma, gamma ? static_cast<int>(K) : 0, softcap, h->data(),
-      static_cast<int>(h->size()), act, static_cast<int>(K), out,
+      session, eps, gamma, gamma ? static_cast<int>(K) : 0, softcap, h.data(),
+      static_cast<int>(h.size()), act, static_cast<int>(K), out,
       static_cast<int>(N));
     const uint64_t elapsed = HtpProfile::nowUs() - t0;
     if (err != AEE_SUCCESS) {
@@ -1745,6 +1752,21 @@ public:
     if (profile.level())
       profile.addInvoke(1, K, N, elapsed, nullptr);
     return true;
+  }
+
+  void share_decode_lm_head(const void *w) override {
+    if (e2e_ && weightPageCachePolicy() >= 0)
+      shared_lm_heads_.emplace(w, SharedLmHead{});
+  }
+
+  bool lm_head_shared_fp32(const void *w, unsigned K, unsigned N,
+                           const float *x, float *y) override {
+    auto it = shared_lm_heads_.find(w);
+    if (it == shared_lm_heads_.end() || it->second.h.empty())
+      return false;
+    if (it->second.K != K || it->second.N != N)
+      throw std::invalid_argument("Shared LM head shape changed");
+    return invokeLmHead(e2e_st_->h1, it->second.h, K, N, x, nullptr, 0, 0, y);
   }
 
   bool lm_head_q4_0_prepare(const void *w, unsigned int K,
@@ -2504,6 +2526,7 @@ public:
   /** [#132 Part B] Frees every Q4M1 handle registered for the graph (after
    *  graph_release, or when bindQ4m1 / graph_init failed half-way). */
   void releaseQ4m1(remote_handle64 session) {
+    shared_lm_heads_.clear();
     for (uint32_t h : q4m1_handles_)
       nntr_hvx_q4m1_release(session, h);
     q4m1_handles_.clear();
@@ -2658,10 +2681,35 @@ public:
                                    0u, op->N_out);
         parts = 3u;
       } else if (op->kind == HTP_OP_LM_HEAD) {
-        const uint8_t *w = take(i, op->K, op->N);
-        for (uint32_t r0 = 0; r0 < op->N; r0 += kLmHeadSliceRows)
-          op->h_gu[parts++] = registerQ4m1(
-            session, w, op->K, r0, std::min(kLmHeadSliceRows, op->N - r0));
+        const Q4Pending &p = pending(i, op->K, op->N);
+        if (p.scale)
+          throw std::invalid_argument("LM_HEAD requires Q4_0 weights");
+        const size_t row_bytes =
+          static_cast<size_t>(op->K / 32u) * Q4_CPU_BLOCK_BYTES;
+        // Unpack one slice at a time; a full vocabulary-sized canonical copy
+        // would coexist with both the CPU weight and the DSP arena.
+        for (uint32_t r0 = 0; r0 < op->N; r0 += kLmHeadSliceRows) {
+          const uint32_t rows = std::min(kLmHeadSliceRows, op->N - r0);
+          const auto *w = static_cast<const uint8_t *>(p.data) + r0 * row_bytes;
+          if (!p.canonical) {
+            canon.resize(rows * row_bytes);
+            nntrainer::unpack_q4_0(w, canon.data(), canon.size(), rows, op->K);
+            w = canon.data();
+          }
+          op->h_gu[parts++] = registerQ4m1(session, w, op->K, 0u, rows);
+        }
+        auto shared = shared_lm_heads_.find(p.data);
+        if (!p.canonical && shared != shared_lm_heads_.end()) {
+          shared->second.K = op->K;
+          shared->second.N = op->N;
+          shared->second.h.assign(op->h_gu, op->h_gu + parts);
+          releaseArmSource(const_cast<void *>(p.data), op->N * row_bytes);
+          q4_pending_[next - 1].dropped = true;
+          std::fprintf(stderr,
+                       "[HTP] LM head shares %u DSP handles for "
+                       "prefill/decode; released %zu MiB host source\n",
+                       parts, (op->N * row_bytes) >> 20);
+        }
       } else {
         uint32_t sum = 0;
         while (sum < op->N && parts < HTP_GRAPH_MAX_PARTS) {
@@ -2867,12 +2915,14 @@ public:
       // The DSP cache must hold rows [0, pos): seed it from the layer's
       // copy after any jump (the first token after a prefill, a second
       // prompt). pos 0 needs nothing; the kernel rewinds.
-      if (pos != 0 && kv_len_[ord] != pos) {
+      // (rows from the layer's base on: set_decode_kv_window)
+      const uint32_t row = pos - rec->n_experts;
+      if (pos != 0 && kv_len_[ord] != row) {
         seed_ordinal_ = ord;
         --kind_next_[kind]; // the layer calls again for this same op
         return 2;
       }
-      kv_len_[ord] = pos + 1u;
+      kv_len_[ord] = row + 1u;
       break;
     }
     case HTP_OP_ADD:
@@ -2979,6 +3029,25 @@ public:
                     pending_op_ != HTP_GRAPH_NO_OP;
     cpu_fc_skipped_ += on;
     return on;
+  }
+
+  /** The sliding layers' caches as a window of the context: their DSP
+   *  cache is registered at `rows` rows and their ATTN_M1 records carry the
+   *  base (n_experts, unused by the kind), which graph_op_attn_m1 subtracts
+   *  from the token's position. Before the graph's init, which sends the
+   *  records and registers the caches. */
+  void set_decode_kv_window(unsigned rows, unsigned base) override {
+    if (graph_words_.empty())
+      return;
+    if (attn_registered_)
+      throw std::runtime_error(
+        "set_decode_kv_window: the decode attention caches are registered");
+    for (uint32_t op : kind_ops_[HTP_OP_ATTN_M1]) {
+      htp_graph_op *rec = htp_graph_op_at(graph_words_.data(), op);
+      if (rec->top_k != 0u) // a sliding layer (top_k: its window)
+        rec->n_experts = base;
+    }
+    attn_window_rows_ = (rows + 63u) / 64u * 64u;
   }
 
   bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
@@ -3170,7 +3239,14 @@ public:
     }();
     if (per_layer == 0u || !pool_grow_ || moe_ops_.empty())
       return;
-    pool_grow_(static_cast<size_t>(per_layer) * moe_ops_.size());
+    const size_t extra = static_cast<size_t>(per_layer) * moe_ops_.size();
+    pool_grow_(extra);
+    {
+      std::lock_guard<std::mutex> lock(handle_mutex_);
+      // The final arena chunk only needs the remaining slots. Otherwise a
+      // decode-only grow still allocates a full 256 MiB chunk at its tail.
+      expert_slots_wanted_ += extra;
+    }
     std::fprintf(stderr,
                  "[HTP] pool: +%u experts a layer from the second token\n",
                  per_layer);
@@ -3465,6 +3541,10 @@ public:
    *  a layer later preads DDR, not flash. The slots and S1's tables are
    *  untouched -- the ids cannot move. */
   static size_t prefetchThreads() {
+    const char *direct = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
+    if (weightPageCachePolicy() >= 0 &&
+        (!direct || std::strcmp(direct, "1") != 0))
+      return 0; // Only DMA-slot prefetch uses the selected bounded reader.
     static const size_t n = [] {
       const char *v = std::getenv("NNTR_MOE_PREFETCH");
       return v != nullptr ? std::strtoul(v, nullptr, 10) : size_t(0);
@@ -3905,7 +3985,10 @@ public:
       }
       if (rec == nullptr)
         continue;
-      const uint32_t max_seq = graph_words_[6];
+      // a windowed cache (set_decode_kv_window) holds that many rows
+      const uint32_t max_seq = rec->top_k != 0u && attn_window_rows_ != 0u
+                                 ? attn_window_rows_
+                                 : graph_words_[6];
       // [#282 D] NNTR_HTP_ATTN_M1_Q8: the int8 cache (half the bytes;
       // fixed scales from the prefill seed), HVX_ATTN_M1_Q8 in max_seq;
       // 1 = the first cache only (Gemma's sliding layers, 400 of its 440
@@ -4063,7 +4146,7 @@ public:
     fcwh_.clear();
     fcwh_arena_bytes_ = fcwh_heap_bytes_ = 0; // [#225] fcwhLeft's, the banner's
     const std::string where = std::string("fc_wh_file_name ") + path + ": ";
-    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    const int fd = openWeightFile(path);
     if (fd < 0)
       throw std::runtime_error(where + std::strerror(errno));
     std::unordered_map<uint64_t, FcWhEntry> index;
@@ -7395,24 +7478,19 @@ private:
     bool tl2 = false;
   };
 
-  /** @brief pread that finishes: 0, or the errno, or -1 at end of file.
+  /** @brief Read a complete range: 0 or errno (ENODATA at end of file).
    *  Does not throw, so a worker thread can call it. */
-  static int preadAll(int fd, void *dst, size_t len, uint64_t off) {
-    uint8_t *p = static_cast<uint8_t *>(dst);
-    while (len != 0) {
-      const ssize_t n = ::pread(fd, p, len, static_cast<off_t>(off));
-      if (n < 0) {
-        if (errno == EINTR)
-          continue;
-        return errno;
-      }
-      if (n == 0)
-        return -1;
-      p += n;
-      len -= static_cast<size_t>(n);
-      off += static_cast<uint64_t>(n);
+  static int preadAll(int fd, void *dst, size_t len, uint64_t off,
+                      void *tail = nullptr, size_t tail_bytes = 0) {
+    try {
+      return weightPreadSplit(fd, dst, len, tail, tail_bytes, off);
+    } catch (const std::bad_alloc &) {
+      return ENOMEM;
+    } catch (const std::invalid_argument &) {
+      return EINVAL;
+    } catch (...) {
+      return EIO;
     }
-    return 0;
   }
 
   /** @brief A short read into a weight is a wrong matmul, never a warning. */
@@ -7559,7 +7637,8 @@ private:
   };
   struct PredictionRouter {
     unsigned hidden = 0, experts = 0, top = 0;
-    std::vector<float> weights;
+    const float *weights = nullptr;
+    const float *gamma = nullptr;
   };
 
   static unsigned prefetchTop() {
@@ -7582,9 +7661,11 @@ private:
     });
   }
 
-  /** Approximate lookahead only. Gamma is folded into a private gate copy;
-   * RMS's positive scalar and softmax do not change the top-k order. The
-   * actual routing and mixture weights always come from the NPU router.
+  /** Approximate lookahead only. Borrow the model's gate and gamma instead of
+   * retaining another full gate copy. poolDisarm drains predictor jobs before
+   * inference returns, so none can outlive the model's parameter storage.
+   * RMS's positive scalar and softmax do not change the top-k order. Actual
+   * routing and mixture weights always come from the NPU router.
    */
   void initCpuPredictor(const std::vector<int> &cpus) {
     prediction_routers_.resize(moe_ops_.size());
@@ -7609,12 +7690,8 @@ private:
       r.hidden = op->K;
       r.experts = op->n_experts;
       r.top = std::min(op->top_k, prefetchTop());
-      r.weights.resize(static_cast<size_t>(r.hidden) * r.experts);
-      for (unsigned h = 0; h < r.hidden; ++h)
-        for (unsigned e = 0; e < r.experts; ++e) {
-          const size_t i = static_cast<size_t>(h) * r.experts + e;
-          r.weights[i] = gamma[h] * w[i];
-        }
+      r.weights = w;
+      r.gamma = gamma;
     }
     std::vector<PredictionJob> jobs(2);
     for (auto &j : jobs)
@@ -7658,8 +7735,10 @@ private:
           for (float candidate : {0.0f, 0.5f, 1.0f}) {
             residual->apply(job.layer, token, job.input.data(), candidate,
                             corrected.data());
-            const auto ranked = htpPredictExperts(
-              corrected.data(), r.weights.data(), r.hidden, r.experts, 8u);
+            for (unsigned h = 0; h < r.hidden; ++h)
+              corrected[h] *= r.gamma[h];
+            const auto ranked = htpPredictExperts(corrected.data(), r.weights,
+                                                  r.hidden, r.experts, 8u);
             std::fputs(" |", trace.get());
             for (unsigned e : ranked)
               std::fprintf(trace.get(), " %u", e);
@@ -7668,7 +7747,9 @@ private:
         }
         residual->apply(job.layer, token, job.input.data(), blend,
                         corrected.data());
-        const auto ids = htpPredictExperts(corrected.data(), r.weights.data(),
+        for (unsigned h = 0; h < r.hidden; ++h)
+          corrected[h] *= r.gamma[h];
+        const auto ids = htpPredictExperts(corrected.data(), r.weights,
                                            r.hidden, r.experts, r.top);
         std::lock_guard<std::mutex> lock(handle_mutex_);
         std::vector<bool> absent;
@@ -7692,6 +7773,10 @@ private:
       if (path && *path) {
         if (!e2e_)
           throw std::runtime_error("prepared TL2 requires NNTR_HTP_E2E=1");
+        if (weightPageCachePolicy() >= 0)
+          throw std::invalid_argument(
+            "NNTR_HTP_PAGE_CACHE does not support prepared TL2 artifacts; "
+            "unset NNTR_HTP_TL2_PREPARED_FILE");
         prepared_tl2_.reset(new PreparedTl2(path, d.fd));
         std::fprintf(stderr, "[HTP-TL2] prepared=%s receipt=%d\n", path,
                      prepared_tl2_->validatedReceipt());
@@ -7934,6 +8019,8 @@ private:
   }
 
   static int fadviseKnob() {
+    if (weightPageCachePolicy() >= 0)
+      return 0;
     static const int k = [] {
       const char *v = std::getenv("NNTR_MOE_FADVISE");
       return v != nullptr ? std::atoi(v) : 0;
@@ -7946,6 +8033,8 @@ private:
    *  Advice only -- a failure changes nothing a matmul reads, so it is not
    *  checked. */
   static void fadviseExpert(const ExpertFileDesc &d, bool willneed) {
+    if (weightPageCachePolicy() >= 0)
+      return;
 #if defined(__linux__)
     // One WILLNEED reads at most the device's read-ahead window (measured:
     // 1 MiB on the S25's 6.6 kernel, 128 KiB on the workstation) of its
@@ -8271,6 +8360,8 @@ private:
    *  cache is; swap aside). Once, at the first token's poolSync, so the
    *  cost lands in the first decode token and is logged as "pin:". */
   static int pinKnob() {
+    if (weightPageCachePolicy() >= 0)
+      return 0; // Pinning retains a second copy of every expert.
     static const int k = [] {
       const char *v = std::getenv("NNTR_MOE_PIN");
       return v != nullptr ? std::atoi(v) : 0;
@@ -8391,6 +8482,10 @@ private:
    *  an untied head can still run on the CPU. A CPU fallback for a dropped
    *  FC would require re-reading its weight from the model file. */
   void dropHostFc(bool qs4cx_only = false) {
+    // The memory profile releases sources individually after registration and
+    // an alias check in Transformer. Do not override a retained CPU consumer.
+    if (weightPageCachePolicy() >= 0)
+      return;
     static const bool on = std::getenv("NNTR_HTP_DROP_HOST_FC") != nullptr;
     if (!on || host_fc_dropped_ || !e2e_)
       return;
@@ -8461,6 +8556,8 @@ private:
     // slices, so no two threads write the same page; a worker cannot throw
     // across parallel_for, so each slice keeps its result.
     std::atomic<int> first_rc{0};
+    const size_t pal = paletteBytes(w_bits);
+    std::vector<uint8_t> after(pal + 2 * sizeof(float) * N);
     auto slice_read = [&](uint8_t *dst, size_t len, uint64_t at) {
       const int rc = preadAll(fd, dst, len, at);
       if (rc == 0)
@@ -8480,16 +8577,19 @@ private:
           slice_read(arena_dst + b, std::min(slice, nib - b), off + b);
       });
     } else {
-      slice_read(arena_dst, nib, off);
+      // Code and palette/scales are adjacent in the file. One IO avoids a
+      // second small direct read on every miss, using the same bounded scratch
+      // and separate destinations for uncached DMA and CPU metadata.
+      first_rc = preadAll(fd, arena_dst, nib, off, after.data(), after.size());
     }
     if (first_rc.load() != 0)
       return first_rc.load();
     // The palette (none at four bits) and the tail in one read
-    const size_t pal = paletteBytes(w_bits);
-    std::vector<uint8_t> after(pal + 2 * sizeof(float) * N);
-    const int rc = preadAll(fd, after.data(), after.size(), off + nib);
-    if (rc != 0)
-      return rc;
+    if (use_pool) {
+      const int rc = preadAll(fd, after.data(), after.size(), off + nib);
+      if (rc != 0)
+        return rc;
+    }
     e.pal.assign(after.begin(), after.begin() + pal);
     std::vector<float> tail(2 * static_cast<size_t>(N));
     std::memcpy(tail.data(), after.data() + pal, tail.size() * sizeof(float));
@@ -8503,6 +8603,20 @@ private:
     e.K = K;
     e.N = N;
     return 0;
+  }
+
+  bool uses_device_weight(const void *data) const override {
+    return e2e_ && std::any_of(q4_pending_.begin(), q4_pending_.end(),
+                               [data](const Q4Pending &p) {
+                                 return p.data == data && p.scale;
+                               });
+  }
+
+  void discard_weight_source(void *data, size_t bytes) override {
+    releaseArmSource(data, bytes);
+    for (auto &p : q4_pending_)
+      if (p.data == data)
+        p.dropped = true;
   }
 
   /**
@@ -9367,6 +9481,7 @@ private:
   std::vector<uint32_t> conv_next_pos_;
   std::vector<uint32_t> kv_len_;
   bool attn_registered_ = false;
+  uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
   /** [plan 201 S4] per attention ordinal its op, its session cache (0, or
    *  1 for the second attn_m1_register: another (n_kv, gqa, head_dim)) and
    *  its ordinal within that cache (hexkl_graph_init's) */
@@ -9405,6 +9520,12 @@ private:
     std::vector<uint32_t> h;
   };
   std::map<const void *, LmHeadSlices> lm_head_;
+  struct SharedLmHead {
+    unsigned K = 0, N = 0;
+    std::vector<uint32_t>
+      h; // Borrowed from e2e_st_->q4m1, never released twice.
+  };
+  std::map<const void *, SharedLmHead> shared_lm_heads_;
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */

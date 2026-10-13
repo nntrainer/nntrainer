@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file htp_router_predict.h
- * @brief Prediction-only top-k on Gemma router weights with gamma folded in.
+ * @brief Prediction-only top-k on Gemma router dot products.
  * @author NNTrainer contributors
  * @bug No known bugs
  */

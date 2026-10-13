@@ -467,9 +467,15 @@ static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
   if (c == NULL) {
     return AEE_EBADSTATE;
   }
+  /* n_experts: the absolute position of the cache's row 0 (a sliding
+     layer's cache holds a window of a long context; 0 otherwise) */
+  if (call->pos < op->n_experts) {
+    return AEE_EBADPARM;
+  }
   rc = hvx_attn_m1_forward_prof(
-    c, g->ordinal[op - g->ops], call->pos, op->top_k, graph_attn_scale(op), in,
-    in + n_q, in + n_q + n_k, out, NULL, g->attn_prof_on ? w : NULL);
+    c, g->ordinal[op - g->ops], call->pos - op->n_experts, op->top_k,
+    graph_attn_scale(op), in, in + n_q, in + n_q + n_k, out, NULL,
+    g->attn_prof_on ? w : NULL);
   if (rc == AEE_SUCCESS && g->attn_prof_on) { /* [#261] */
     const uint32_t b = c == call->env->attn_m1_b ? 1u : 0u;
     ++g->attn_prof_calls[b];
