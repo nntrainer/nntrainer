@@ -3349,7 +3349,7 @@ public:
         if (it->first > (size_t(16) << 20)) {
           pl->holds.erase(it->first);
           pl->copied_out.erase(it->first);
-          freed += it->first;
+          freed += it->second ? it->second->size() : 0;
           it = pl->by_class.erase(it);
         } else {
           ++it;
@@ -3952,7 +3952,7 @@ public:
     for (const StagingPool *pl : {&act_pool_, &out_pool_, &rope_pool_,
                                   &x2_pool_, &attn_q_pool_, &attn_out_pool_})
       for (const auto &kv : pl->by_class)
-        pools += kv.first;
+        pools += kv.second ? kv.second->size() : 0;
     std::fprintf(stderr,
                  "[HTP] mem %s: s1_heap_mib=%u staging_pools_mib=%zu "
                  "rss_mib=%zu mem_available_mib=%zu\n",
@@ -4843,7 +4843,26 @@ private:
       cls <<= 1;
     return cls;
   }
-  static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+  /** @brief @a slot made large enough for @a bytes. The class only names
+   *  the slot: the buffer is as large as the largest tensor it has held
+   *  (plus a page), not the class, because the driver's cache maintenance
+   *  covers the whole dma-buf on every call it rides (11.5 MB of rows rode
+   *  16 MiB, 23 MB rode 32 MiB). Growing drops the old buffer, so the
+   *  callers do it only where the old bytes are no longer wanted. */
+  void fit(std::unique_ptr<HtpRpcBuffer> &slot, size_t bytes) {
+    if (slot && slot->size() >= bytes)
+      return;
+    if (slot) {
+      const uint8_t *lo = slot->data(), *hi = lo + slot->size();
+      for (IonAlias &a : ion_alias_)
+        if (a.ion >= static_cast<const void *>(lo) &&
+            a.ion < static_cast<const void *>(hi))
+          a = IonAlias{};
+    }
+    slot = std::make_unique<HtpRpcBuffer>(
+      ((bytes + 4095) & ~static_cast<size_t>(4095)) + 4096);
+  }
+  HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     // A tensor a call kept in this buffer (copyOutOf's to_host false) has
@@ -4863,8 +4882,7 @@ private:
     }
     pool.holds.erase(cls);
     pool.copied_out.erase(cls);
-    if (!slot)
-      slot = std::make_unique<HtpRpcBuffer>(cls);
+    fit(slot, bytes);
     return *slot;
   }
   /** @brief Whether @a b still holds the copy of @a a: 32 spread 64-byte
@@ -4899,10 +4917,8 @@ private:
                            int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
-    if (!slot)
-      slot = std::make_unique<HtpRpcBuffer>(cls);
     auto it = pool.holds.find(cls);
-    if (it != pool.holds.end() && it->second.first == src &&
+    if (it != pool.holds.end() && slot && it->second.first == src &&
         it->second.second == bytes && sampledSame(src, slot->data(), bytes))
       return *slot;
     if (from) {
@@ -4963,6 +4979,8 @@ private:
     }
     if (from_buf == src)
       throwIfLost(src, bytes, line);
+    // a source inside this very buffer means it is large enough already
+    fit(slot, bytes);
     if (from_buf != slot->data())
       stagedMemcpy(slot->data(), from_buf, bytes, line);
     pool.holds[cls] = {src, bytes, false};
