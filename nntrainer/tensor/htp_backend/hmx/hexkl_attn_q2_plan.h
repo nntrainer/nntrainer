@@ -138,14 +138,16 @@ static inline int hexkl_attn_q2_check(const hexkl_attn_f16_shape *s) {
  *
  * @param arena_top  first byte NOT available
  */
+static inline int hexkl_attn_q2_plan_n(const hexkl_attn_f16_shape *s,
+                                       uint32_t arena_top, uint32_t n_res,
+                                       uint32_t n_blk, hexkl_attn_q2_layout *L);
+
 static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
                                      uint32_t arena_top,
                                      hexkl_attn_q2_layout *L) {
   if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK || !L) {
     return HEXKL_ATTN_EBADPARM;
   }
-  const uint32_t TB = HEXKL_ATTN_Q2_TILE;
-  const uint32_t dt = s->head_dim / 32u;
   const hexkl_attn_q2_range res = hexkl_attn_q2_cols(
     s->cache_from, s->cache_from + s->n_q - 1u, s->cache_to, s->window);
   uint32_t n_blk = 0;
@@ -157,14 +159,33 @@ static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
       n_blk = b.n;
     }
   }
+  return hexkl_attn_q2_plan_n(s, arena_top, res.n, n_blk, L);
+}
+
+/**
+ * @brief hexkl_attn_q2_plan for given tile counts: @a n_res column tiles
+ *        resident for the pass, at most @a n_blk of them seen by one
+ *        64-row block. The whole call's counts give the one-pass layout;
+ *        a column segment's (hexkl_attn_q2_seg_tiles) the layout of a pass
+ *        over that segment.
+ */
+static inline int hexkl_attn_q2_plan_n(const hexkl_attn_f16_shape *s,
+                                       uint32_t arena_top, uint32_t n_res,
+                                       uint32_t n_blk,
+                                       hexkl_attn_q2_layout *L) {
+  if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK || !L) {
+    return HEXKL_ATTN_EBADPARM;
+  }
+  const uint32_t TB = HEXKL_ATTN_Q2_TILE;
+  const uint32_t dt = s->head_dim / 32u;
   if (n_blk > HVX_SOFTMAX_Q_MAX_TILES) {
     return HEXKL_ATTN_EBADPARM;
   }
-  L->n_res = res.n;
+  L->n_res = n_res;
   L->n_blk = n_blk;
   L->dt = dt;
-  L->kv_bytes = hexkl_attn_round_up(res.n * dt * 1024u, TB);
-  L->corr_bytes = hexkl_attn_round_up((res.n + 1u) * 64u, TB);
+  L->kv_bytes = hexkl_attn_round_up(n_res * dt * 1024u, TB);
+  L->corr_bytes = hexkl_attn_round_up((n_res + 1u) * 64u, TB);
 
   for (uint32_t bufs = 2; bufs >= 1; --bufs) {
     uint32_t off = 0;
@@ -198,6 +219,26 @@ static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
     }
   }
   return HEXKL_ATTN_ENOMEM;
+}
+
+/**
+ * @brief Column tiles a pass may hold when the call's whole column range
+ *        does not fit (a full-attention layer past 4096 columns, or past
+ *        what VTCM takes of its K^T / V tiles): the largest power of two,
+ *        at most the softmax's HVX_SOFTMAX_Q_MAX_TILES, whose layout fits
+ *        the arena. The kernel then runs one pass a segment of that many
+ *        tiles and merges the segments' softmaxes. 0: not even one tile
+ *        fits.
+ */
+static inline uint32_t hexkl_attn_q2_seg_tiles(const hexkl_attn_f16_shape *s,
+                                               uint32_t arena_top) {
+  hexkl_attn_q2_layout L;
+  for (uint32_t n = HVX_SOFTMAX_Q_MAX_TILES; n >= 1u; n /= 2u) {
+    if (hexkl_attn_q2_plan_n(s, arena_top, n, n, &L) == HEXKL_ATTN_OK) {
+      return n;
+    }
+  }
+  return 0u;
 }
 
 #ifdef __cplusplus
