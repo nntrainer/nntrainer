@@ -81,6 +81,14 @@ struct hvx_worker_pool_s {
   _Atomic int killed;
   _Atomic int parked;    /**< [#132 Part B] hvx_worker_pool_park: skip the
                               post-job spin until the next publish */
+  /** [P9] workers in (or entering) qurt_futex_wait. A publish wakes only
+      when this is nonzero: between two submits of a call the workers are
+      still in their spin, and the wake was several microseconds paid at
+      every submit (~512 an attention call, ~800 a MoE call) for nobody.
+      Both sides are seq_cst so the worker's re-read of seqn after its
+      increment and the publisher's read of this after its bump cannot
+      both miss (Dekker). */
+  _Atomic uint32_t sleepers;
   hvx_worker_job job[2]; /**< job fg_id lives in job[fg_id & 1] */
   int outstanding;       /**< caller-side: a submit not yet waited for */
 
@@ -196,7 +204,11 @@ static void hvx_worker_pool_thread_entry(void *arg) {
       hvx_worker_pool_pause();
     }
     if (atomic_load_explicit(&pool->seqn, memory_order_acquire) == seqn) {
-      qurt_futex_wait(&pool->seqn, (int)seqn);
+      atomic_fetch_add_explicit(&pool->sleepers, 1u, memory_order_seq_cst);
+      if (atomic_load_explicit(&pool->seqn, memory_order_seq_cst) == seqn) {
+        qurt_futex_wait(&pool->seqn, (int)seqn);
+      }
+      atomic_fetch_sub_explicit(&pool->sleepers, 1u, memory_order_seq_cst);
     }
   }
 }
@@ -300,6 +312,16 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) {
   pool->outstanding = 0;
 }
 
+/** @brief [P9] The wake counter bumped, then the futex wake only when a
+ *         worker is asleep on it (sleepers): a worker still in its spin
+ *         sees the bump by itself. */
+static void hvx_worker_pool_bump(hvx_worker_pool *pool) {
+  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&pool->sleepers, memory_order_seq_cst) != 0u) {
+    qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+  }
+}
+
 /** @brief Fills the next job's slot; the caller's release increment of
  *         fg_id publishes it. The previous job is complete here (both
  *         callers wait first), so no worker still needs the other slot's
@@ -341,8 +363,7 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
   atomic_store_explicit(&pool->barrier, n, memory_order_relaxed);
   /* Publish, then wake everyone -- run() explains why everyone. */
   atomic_fetch_add_explicit(&pool->fg_id, 1, memory_order_release);
-  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
-  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+  hvx_worker_pool_bump(pool);
 }
 
 /** @brief Pops complete jobs off the head of the ring. Caller-side. */
@@ -398,8 +419,7 @@ void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
   /* The job and its slot are visible before the tail that announces it. */
   atomic_store_explicit(&pool->parked, 0, memory_order_relaxed);
   atomic_store_explicit(&pool->bg_tail, tail + 1u, memory_order_release);
-  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
-  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+  hvx_worker_pool_bump(pool);
 }
 
 void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
@@ -458,8 +478,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   // non-participant that wakes just rechecks its id against n_threads,
   // finds it doesn't apply, and goes back to sleep -- harmless.
   atomic_fetch_add_explicit(&pool->fg_id, 1, memory_order_release);
-  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
-  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+  hvx_worker_pool_bump(pool);
 
   func(n, 0, ctx); // the calling thread is worker 0
 
