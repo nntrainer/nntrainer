@@ -106,6 +106,17 @@ public:
     held_ -= std::min(n, held_);
   }
 
+  /** @brief How many keys makeRoom() can make room for with @a pinned. */
+  size_t room(const std::vector<Key> &pinned) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t cap = capacity_ - std::min(held_, capacity_);
+    std::unordered_set<Key> pin(pinned.begin(), pinned.end());
+    size_t pinned_resident = 0;
+    for (Key k : pin)
+      pinned_resident += pos_.count(k);
+    return cap - std::min(pinned_resident, cap);
+  }
+
   /**
    * @brief Evicts least recently used keys outside @a pinned until @a n more
    *        keys fit -- room for keys the caller will bring in itself and
