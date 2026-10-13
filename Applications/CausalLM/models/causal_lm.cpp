@@ -81,6 +81,7 @@ void clLaunchStatDump(const char *phase);
 #include <embedding_layer.h> // [lmhead-tie-lut] QuantLut / get_or_load_quant_lut
 #include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
 #include <htp_decode_hook.h>
+#include <htp_mha_core.h>
 #include <llm_util.hpp>
 #if !defined(_WIN32)
 #include <sys/mman.h> // [lmhead-tie-lut] madvise the uploaded LUT mmap away
@@ -1013,6 +1014,11 @@ void CausalLM::save_kvcache(std::string path, int to_) {
       "save_kvcache called before allocateAndBindKVCache()");
   }
   kv_cache.save(path, static_cast<unsigned int>(to_), kvCacheModelTag());
+  // the int8 attention's scales of this prefill, for the run that loads it
+  std::ofstream q2(path + ".q2", std::ios::binary);
+  causallm::HtpMHACoreLayer::saveQ2Calibration(q2);
+  if (!q2)
+    throw std::runtime_error("save_kvcache: cannot write " + path + ".q2");
 }
 
 /** Retire a captured decode graph. A capture describes the host decisions taken
@@ -1057,6 +1063,10 @@ void CausalLM::load_kvcache(std::string path, int to_) {
   }
   const unsigned int loaded =
     kv_cache.load(path, static_cast<unsigned int>(to_), kvCacheModelTag());
+  // absent (a dump of an older build, a CPU run): the layers calibrate on
+  // their first step as before
+  if (std::ifstream q2(path + ".q2", std::ios::binary); q2)
+    causallm::HtpMHACoreLayer::loadQ2Calibration(q2);
   // mha_core layers each track their own cache_index; sync them all to the
   // newly-loaded position so the next forwarding() writes at the right slot.
   setKVCachePosition(loaded);
@@ -1680,7 +1690,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   if (USE_KVCACHE) {
+    const auto t0 = std::chrono::steady_clock::now();
     load_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+    std::cerr << "[TIMING] kv_load_ms="
+              << std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count()
+              << " rows=" << SYS_PROMP_LEN << std::endl;
   } else {
     SYS_PROMP_LEN = 0;
   }
