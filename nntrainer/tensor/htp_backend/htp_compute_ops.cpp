@@ -1527,13 +1527,16 @@ public:
     norms.to_host = out_to_host || HtpProfile::global().level() >= 2;
     // The table rows through ION like the activation: a plain host pointer
     // is pinned and mapped by the driver every call (~155 MB/s, doc 34
-    // section 4 item F), 1-2 MB a prefill layer here.
+    // section 4 item F), 1-2 MB a prefill layer here. [P11] The table is
+    // one per (head_dim, theta), shared by the layers (qkv_layer's
+    // ropeTable), so the rows are the same pointer and bytes layer after
+    // layer: stageInput keeps the copy and skips the 4-8 MiB memcpy, the
+    // sliding and the global layers' tables in different size classes.
     norms.rope_cs = nullptr;
     if (rope_hd) {
       const size_t bytes = static_cast<size_t>(M) * 2 * rope_hd * sizeof(float);
-      float *cs = reinterpret_cast<float *>(stage(rope_pool_, bytes).data());
-      stagedMemcpy(cs, rope_cs, bytes);
-      norms.rope_cs = cs;
+      norms.rope_cs = reinterpret_cast<const float *>(
+        stageInput(rope_pool_, rope_cs, bytes).data());
     }
     invokeLayer(session, handles.data(), static_cast<int>(handles.size()),
                 matBdata, nullptr, M, n_total, K, nullptr, nullptr, &norms,
