@@ -1212,6 +1212,32 @@ public:
    *        out_stride) for a host check. false = not available, the caller
    *        converts.
    */
+  /**
+   * @brief [P2] sdpa_q2_kvcache_f32 with the layer's calibration folded
+   *        in: the accelerator scans this step's fp16 K / V rows and f32 Q
+   *        rows for the maxima, derives the fixed int8 scales and the u16
+   *        encodings exactly as the layer's calibrate_q2_scales does, sets
+   *        the scales on the cache and runs the step. s_k[n_head_kv],
+   *        s_v[n_head_kv * head_dim], q_enc[2 n_head_q], out_enc[2
+   *        n_head_q] receive them. false = not available, the caller
+   *        calibrates.
+   */
+  virtual bool sdpa_q2_kvcache_f32_calib(
+    int handle, unsigned int append_row0, unsigned int append_rows,
+    unsigned int kv_stride, const uint16_t *k_rows, const uint16_t *v_rows,
+    const float *q, unsigned int q_stride, unsigned int n_q,
+    unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
+    unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
+    float *out, float *s_k, float *s_v, float *q_enc, float *out_enc,
+    unsigned int out_stride) {
+    (void)handle, (void)append_row0, (void)append_rows, (void)kv_stride;
+    (void)k_rows, (void)v_rows, (void)q, (void)q_stride, (void)n_q;
+    (void)cache_from, (void)cache_to, (void)n_head_q, (void)n_head_kv;
+    (void)head_dim, (void)window, (void)out, (void)s_k, (void)s_v;
+    (void)q_enc, (void)out_enc, (void)out_stride;
+    return false;
+  }
+
   virtual bool sdpa_q2_kvcache_f32(
     int handle, unsigned int append_row0, unsigned int append_rows,
     unsigned int kv_stride, const uint16_t *k_rows, const uint16_t *v_rows,

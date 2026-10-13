@@ -1359,6 +1359,26 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<uint16> out_u16,
                              rout sequence<uint32> stats_us);
 
+   // [P2] attn_q2_step_fq with the layer's calibration folded in, for the
+   // first rows a layer sees: the DSP scans the fp16 K rows (|max| per KV
+   // head), V rows (|max| per KV head and dim) and the f32 Q rows (min /
+   // max per query head), derives the fixed int8 scales (max / 127, 1 for
+   // an all-zero tensor), the Q u16 encodings ((hi - lo) / 65535, zero
+   // point round(-lo / scale)) and the context encodings (2 * V max /
+   // 65535, zero point 32768) exactly as mha_core::calibrate_q2_scales
+   // does, sets the scales on the cache and runs the step. calib returns
+   // them: s_k[n_head_kv] | s_v[n_head_kv * head_dim] | q_enc[2 n_head_q]
+   // | out_enc[2 n_head_q].
+   AEEResult attn_q2_step_fqc(in uint32 kv_handle, in uint32 row0,
+                              in sequence<uint16> k_rows,
+                              in sequence<uint16> v_rows, in uint32 n_q,
+                              in uint32 cache_from, in uint32 cache_to,
+                              in uint32 n_head_q, in uint32 window,
+                              in sequence<float> q_f32,
+                              rout sequence<float> calib,
+                              rout sequence<uint16> out_u16,
+                              rout sequence<uint32> stats_us);
+
    // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
    // M x K with a (scale, zero point) per head of act_hd columns in act_enc
    // (the attention's out_enc), dequantized inside the quant pass (the

@@ -1311,6 +1311,49 @@ bool HtpMHACoreLayer::try_quantized_attention(
       ? 0u
       : static_cast<unsigned int>(local_window_size);
   if (use_q2) {
+    // [P2] The first rows a layer sees: the accelerator scans them for the
+    // scales (exact maxima, the same derivation) inside the step itself,
+    // so no pass over K / V / Q runs here. The checking paths and the
+    // NEON path keep the layer's own calibration.
+    static const bool dsp_calib = [] {
+      const char *v = std::getenv("NNTR_HTP_ATTN_DSP_CALIB");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    if (!q2_calibrated && attn_out_u16 && dsp_calib &&
+        !std::getenv("NNTR_HTP_ATTN_F32_CHECK") &&
+        !(std::getenv("NNTR_HTP_ATTN_F32") &&
+          std::strcmp(std::getenv("NNTR_HTP_ATTN_F32"), "0") == 0)) {
+      q2_scale_k.assign(num_heads_KV, 0.0f);
+      q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
+      q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
+      q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
+      const auto t0 = std::chrono::steady_clock::now();
+      if (compute_ops_->sdpa_q2_kvcache_f32_calib(
+            handle, append_row0, append_rows, width, k_base + off, v_base + off,
+            io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q,
+            num_heads_KV, head_dim, window, io.out, q2_scale_k.data(),
+            q2_scale_v.data(), q2_q_enc.data(), q2_out_enc.data(), q_stride)) {
+        q2_calibrated = true;
+        q2_scales_set[batch] = 1;
+        synced = cache_to;
+        if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
+          ml_logi("mha_core trace: q2 calibration on the accelerator rows=%u "
+                  "us=%lld",
+                  append_rows,
+                  static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count()));
+        }
+        if (!accel_logged_) {
+          accel_logged_ = true;
+          ml_logi("mha_core: attention over the int8 quantized KV cache on "
+                  "the accelerator (row-blocked, fixed scales calibrated "
+                  "there, u16 context handed to the o-proj)");
+        }
+        return true;
+      }
+    }
     if (!q2_calibrated) {
       // The rows about to be appended are the first this layer sees.
       const auto t0 = std::chrono::steady_clock::now();
