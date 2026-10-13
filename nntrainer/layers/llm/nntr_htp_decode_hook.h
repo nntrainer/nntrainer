@@ -19,21 +19,42 @@
  * byte-for-byte what they were.
  */
 
-#ifndef __CAUSALLM_HTP_DECODE_HOOK_H__
-#define __CAUSALLM_HTP_DECODE_HOOK_H__
+#ifndef NNTR_HTP_DECODE_HOOK_H
+#define NNTR_HTP_DECODE_HOOK_H
+
+#include <cstdint>
 
 #ifdef ENABLE_HEXKL
 #include <compute_ops.h>
 #include <htp_graph_desc.h>
 #endif
 
-namespace causallm {
+namespace nntrainer {
 
 #ifdef ENABLE_HEXKL
+/** The active model on this inference thread, shared across library boundaries.
+ */
+bool htpDecodeActive() noexcept;
+bool htpSetDecodeActive(bool active) noexcept;
+
+class HtpDecodeScope {
+public:
+  explicit HtpDecodeScope(bool active) :
+    previous_(htpSetDecodeActive(active)) {}
+  ~HtpDecodeScope() { htpSetDecodeActive(previous_); }
+  HtpDecodeScope(const HtpDecodeScope &) = delete;
+  HtpDecodeScope &operator=(const HtpDecodeScope &) = delete;
+
+private:
+  bool previous_;
+};
+
 inline int htpDecodeOp(unsigned kind, unsigned pos, const float *in,
                        unsigned in_len, float *out, unsigned out_len,
                        const float *param, unsigned param_len,
                        const float *state, unsigned state_len, float eps) {
+  if (!htpDecodeActive())
+    return 0;
   return nntrainer::get_htp_ops()->decode_op_fp32(kind, pos, in, in_len, out,
                                                   out_len, param, param_len,
                                                   state, state_len, eps);
@@ -125,7 +146,8 @@ inline int htpDecodeLmHead(unsigned pos, const float *x, unsigned K,
  *  are then discarded work and it skips them. False without HTP. */
 inline bool htpDecodeRowResident(unsigned pos) {
 #ifdef ENABLE_HEXKL
-  return nntrainer::get_htp_ops()->decode_row_resident(pos);
+  return htpDecodeActive() &&
+         nntrainer::get_htp_ops()->decode_row_resident(pos);
 #else
   (void)pos;
   return false;
@@ -170,7 +192,8 @@ inline bool htpDecodeTokenId(unsigned *id) {
  *  remains available to htpDecodeTokenId; false when CPU logits are used. */
 inline bool htpDecodeHasTokenId(unsigned pos) {
 #ifdef ENABLE_HEXKL
-  return nntrainer::get_htp_ops()->has_decode_token_id(pos);
+  return htpDecodeActive() &&
+         nntrainer::get_htp_ops()->has_decode_token_id(pos);
 #else
   (void)pos;
   return false;
@@ -220,6 +243,6 @@ inline bool htpDecodeKvSeedF16(unsigned n_rows, const uint16_t *k_rows,
 #endif
 }
 
-} // namespace causallm
+} // namespace nntrainer
 
-#endif /* __CAUSALLM_HTP_DECODE_HOOK_H__ */
+#endif /* NNTR_HTP_DECODE_HOOK_H */

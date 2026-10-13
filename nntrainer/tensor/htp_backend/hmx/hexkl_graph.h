@@ -230,7 +230,7 @@ typedef struct hexkl_graph_s {
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
   uint32_t route_cnt[HTP_GRAPH_MAX_EXPERTS];
   float route_w[HTP_GRAPH_MAX_EXPERTS];
-  /* [#132 Part B] the Q4M1 kinds' state, allocated at init only when one
+  /** [#132 Part B] the Q4M1 kinds' state, allocated at init only when one
      is resident: the part widths, the quantized activation, the dense
      FFN's up | gate | swiglu rows, the logits and their argmax */
   hexkl_graph_q4m1_shape *q4m1; /**< n_q4m1 slot shapes, copied at init */

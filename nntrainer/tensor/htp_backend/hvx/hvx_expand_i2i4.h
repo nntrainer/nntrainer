@@ -57,7 +57,7 @@
 
 #include <stdint.h>
 
-/* Forward declared rather than including hvx_worker_pool.h: that header
+/** Forward declared rather than including hvx_worker_pool.h: that header
    has _Atomic members, and expand_i2i4_host_check is C++. Same typedef,
    which C and C++ both allow to repeat. */
 typedef struct hvx_worker_pool_s hvx_worker_pool;

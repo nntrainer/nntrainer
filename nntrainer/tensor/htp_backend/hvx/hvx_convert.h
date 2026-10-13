@@ -167,7 +167,7 @@ static inline HVX_Vector hvx_div16_sf(HVX_Vector e, HVX_Vector lv,
   const HVX_Vector h15 = hvx_splat_sf(1.5f);
   const HVX_VectorPred even =
     Q6_Q_vcmp_eq_VwVw(Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vadd_VsfVsf(c0, h15), h15), c0);
-  /* e >= 0 and p_hi > 0, so the word compares are the float compares; a
+  /** e >= 0 and p_hi > 0, so the word compares are the float compares; a
      negative p_lo (c0 == 0) reads as a negative word, below every e. */
   const HVX_VectorPred up = Q6_Q_or_QQ(
     Q6_Q_vcmp_gt_VwVw(e, p_hi), Q6_Q_and_QQn(Q6_Q_vcmp_eq_VwVw(e, p_hi), even));

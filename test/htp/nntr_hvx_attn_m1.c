@@ -38,7 +38,7 @@ int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
   if (!s) {
     return AEE_EBADPARM;
   }
-  /* [plan 201 S4] a second register of another shape is the second cache
+  /** [plan 201 S4] a second register of another shape is the second cache
      (Gemma 4's full layers beside its sliding ones); a third, or a second
      of the first one's shape, is refused as before */
   hvx_attn_m1_ctx **slot = &s->attn_m1;

@@ -14,7 +14,7 @@
 
 #include "hvx_expand_i2i4.h"
 
-/* The header only forward-declares the pool type so a C++ check can include
+/** The header only forward-declares the pool type so a C++ check can include
    it; the pool call itself needs the real declaration. */
 #include "hvx_worker_pool.h"
 
@@ -34,7 +34,7 @@ void hvx_expand_i2i4_table(const int8_t *pal, uint8_t *table) {
   }
   for (uint32_t hi = 0; hi < 4u; ++hi) {
     for (uint32_t lo = 0; lo < 4u; ++lo) {
-      /* At 2 * index, not at index. V6_vlutvvb fetches entry 2*i for index
+      /** At 2 * index, not at index. V6_vlutvvb fetches entry 2*i for index
          i -- measured, EXPAND_I2I4_MAP (doc 54 5.8), after the obvious
          reading turned out to be wrong. Sixteen indices land on the even
          bytes 0..30 of a 32-byte block, one each, so undoing it is a
@@ -44,7 +44,7 @@ void hvx_expand_i2i4_table(const int8_t *pal, uint8_t *table) {
         (uint8_t)((pal[lo] & 0x0F) | ((pal[hi] & 0x0F) << 4));
     }
   }
-  /* The 32-byte block repeated, so the lookup is right whether the hardware
+  /** The 32-byte block repeated, so the lookup is right whether the hardware
      takes its table from the low bytes of the vector or from each 32-byte
      lane group -- the other half of the guess, which the map probe showed
      does not matter either way. The buffer is scratch: it is loaded into a
@@ -61,7 +61,7 @@ void hvx_expand_i2i4_table(const int8_t *pal, uint8_t *table) {
 
 void hvx_expand_i2i4_scalar(const uint8_t *src, uint32_t src_bytes,
                             const uint8_t *table, uint8_t *dst) {
-  /* A group of EXPAND_VEC codes becomes two contiguous runs of int4: the
+  /** A group of EXPAND_VEC codes becomes two contiguous runs of int4: the
      low halves first, then the high halves. That is the whole reason the
      HVX form needs no shuffle -- and why whPack2 stores the codes the way
      whCodeByte2 says. */
@@ -90,7 +90,7 @@ void hvx_expand_i2i4(const uint8_t *src, uint32_t src_bytes,
                      const uint8_t *table, uint8_t *dst) {
 #if defined(__hexagon__)
   const uint32_t vecs = src_bytes / EXPAND_VEC;
-  /* Both of these are loop-invariant and stay in vector registers for the
+  /** Both of these are loop-invariant and stay in vector registers for the
      whole call -- vlut32 takes its table as a register operand, so the
      lookup is not a memory access. That is the entire reason this costs
      three ops an output vector: one 128-byte load a call, not a gather a
@@ -100,19 +100,19 @@ void hvx_expand_i2i4(const uint8_t *src, uint32_t src_bytes,
 
   for (uint32_t v = 0; v < vecs; ++v) {
     const HVX_Vector s = *(const HVX_UVector *)(src + (size_t)v * EXPAND_VEC);
-    /* The two nibble planes are the two halves of every source byte, and
+    /** The two nibble planes are the two halves of every source byte, and
        each is already a complete table index -- no spreading, because
        whPack2 put the code pairs where the output byte pairs are. */
     const HVX_Vector lo = Q6_V_vand_VV(s, m0f);
     const HVX_Vector hi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(s, 4), m0f);
-    /* Straight out, no interleave: whPack2 already put the codes in the
+    /** Straight out, no interleave: whPack2 already put the codes in the
        order that makes each lookup a whole output vector (whCodeByte2).
        The shuffle this replaces was 26% of the time (doc 54 5.13). */
     HVX_UVector *d = (HVX_UVector *)(dst + (size_t)v * 2u * EXPAND_VEC);
     d[0] = Q6_Vb_vlut32_VbVbI(lo, tab, 0);
     d[1] = Q6_Vb_vlut32_VbVbI(hi, tab, 0);
   }
-  /* src_bytes is a multiple of 128 for every shape this is called with (a
+  /** src_bytes is a multiple of 128 for every shape this is called with (a
      WH tile is 256 code bytes); a tail would be a caller bug, so it is
      finished rather than ignored. */
   if (vecs * EXPAND_VEC != src_bytes) {
@@ -134,7 +134,7 @@ typedef struct {
 
 static void expand_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   const expand_ctx *c = (const expand_ctx *)vctx;
-  /* Whole vectors each, so no two workers produce bytes of the same
+  /** Whole vectors each, so no two workers produce bytes of the same
      shuffle. The last worker takes any remainder. */
   const uint32_t vecs = c->src_bytes / EXPAND_VEC;
   const uint32_t v0 = vecs * i / n_threads;
@@ -191,7 +191,7 @@ void hvx_expand_i2i4_pool(const uint8_t *src, uint32_t src_bytes,
     return;
   }
   expand_ctx ctx = {src, table, dst, src_bytes};
-  /* One unit a vector, so the pool caps at its own width and a transfer
+  /** One unit a vector, so the pool caps at its own width and a transfer
      too small to split runs inline. */
   hvx_worker_pool_run(pool, expand_worker, &ctx, src_bytes / EXPAND_VEC);
 }

@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file   gemma4_causallm.h
+ * @file   gemma4_htp_causallm.h
  * @brief  Gemma4 causal language model implementation.
  * @date   07 Apr 2026
  * @see    https://github.com/nnstreamer/nntrainer
@@ -10,8 +10,8 @@
  * @bug    No known bugs except for NYI items
  */
 
-#ifndef __GEMMA4_CAUSAL_LM_H__
-#define __GEMMA4_CAUSAL_LM_H__
+#ifndef __GEMMA4_HTP_CAUSAL_LM_H__
+#define __GEMMA4_HTP_CAUSAL_LM_H__
 
 #include <causal_lm.h>
 #include <set>
@@ -19,14 +19,14 @@
 namespace causallm {
 
 /**
- * @brief Gemma4Transformer class
+ * @brief Gemma4HtpTransformer class
  */
-class Gemma4Transformer : virtual public Transformer {
+class Gemma4HtpTransformer : virtual public Transformer {
 
 public:
-  static constexpr const char *architectures = "Gemma4Transformer";
+  static constexpr const char *architectures = "Gemma4HtpTransformer";
 
-  Gemma4Transformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  Gemma4HtpTransformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(sanitizeConfig(cfg),
                 sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg) {
     if (cfg.contains("layer_types")) {
@@ -37,9 +37,15 @@ public:
                     nntr_cfg); // call this after setting up)
   }
 
-  virtual ~Gemma4Transformer() = default;
+  virtual ~Gemma4HtpTransformer() = default;
+
+public:
+  void repack_weight() override;
+  LayerHandle createAttentionCore(const std::vector<std::string> &props) const;
 
 protected:
+  std::string ATTENTION_ENGINE, ATTENTION_KV_DTYPE;
+  std::string FC_WH_FILE_NAME, FC_WH_FORMAT, WEIGHT_DIR;
   static json &sanitizeConfig(json &cfg);
   static json &sanitizeGenerationConfig(json &gen_cfg, const json &cfg);
 
@@ -83,7 +89,7 @@ protected:
    *  layer. Default "cpu" leaves every existing run unchanged. */
   /** @brief The tied lm_head takes the final norm and the logit softcap
    *  (doc 57 section 9.7): constructModel then ends at the last block's
-   *  output and Gemma4CausalLM's lm_head norms it. */
+   *  output and Gemma4HtpCausalLM's lm_head norms it. */
   bool FOLD_OUTPUT_NORM = false;
   /** @brief lmhead_engine: "htp" runs the tied lm_head (norm, head,
    *  softcap) as one NPU call; "cpu" (default) keeps it on the CPU. */
@@ -159,29 +165,29 @@ protected:
 };
 
 /**
- * @brief Gemma4CausalLM class
+ * @brief Gemma4HtpCausalLM class
  */
-class Gemma4CausalLM : public CausalLM, public Gemma4Transformer {
+class Gemma4HtpCausalLM : public CausalLM, public Gemma4HtpTransformer {
 
 public:
   static constexpr const char *architectures = "Gemma4ForCausalLM";
 
-  Gemma4CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  Gemma4HtpCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(sanitizeConfig(cfg),
                 sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg,
                 ModelType::CAUSALLM),
     CausalLM(sanitizeConfig(cfg), sanitizeGenerationConfig(generation_cfg, cfg),
              nntr_cfg),
-    Gemma4Transformer(sanitizeConfig(cfg),
-                      sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg) {
-  }
+    Gemma4HtpTransformer(sanitizeConfig(cfg),
+                         sanitizeGenerationConfig(generation_cfg, cfg),
+                         nntr_cfg) {}
 
-  virtual ~Gemma4CausalLM() = default;
+  virtual ~Gemma4HtpCausalLM() = default;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override {
     CausalLM::setupParameters(cfg, generation_cfg, nntr_cfg);
-    Gemma4Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+    Gemma4HtpTransformer::setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
   std::pair<Tensor, Tensor> constructModel() override;
@@ -193,4 +199,4 @@ protected:
 };
 } // namespace causallm
 
-#endif /* __GEMMA4_CAUSAL_LM_H__ */
+#endif /* __GEMMA4_HTP_CAUSAL_LM_H__ */

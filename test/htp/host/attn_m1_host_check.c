@@ -557,7 +557,7 @@ static void check_prim_div16(void) {
       if (ef <= l && !last) {
         want[lane] = attn_m1_det_rne16(attn_m1_det_div(ef, l));
         const float c0 = attn_m1_det_rne16(attn_m1_det_mul(ef, r));
-        /* A tie: e / l exactly on an fp16 midpoint -- 1 + 12 bits with the
+        /** A tie: e / l exactly on an fp16 midpoint -- 1 + 12 bits with the
            last set above 2^-14, an odd multiple of 2^-25 below. */
         const double q = (double)ef / (double)l;
         const float qf = (float)q;
@@ -673,7 +673,7 @@ static void check_hf_prim(void) {
   CHECK(hz_adv > 0u, "the adversarial family reaches no hazard");
   CHECK(bad_adv + bad_zs + bad_rnd == 0u, "hvx_hf_fma differs from fma16");
 
-  /* hf add / sub / mul / max, * 0.125 and 0 + x: every finite fp16 a (both
+  /** hf add / sub / mul / max, * 0.125 and 0 + x: every finite fp16 a (both
      signs) against 4 random b (a quarter of them +-0). */
   uint32_t n_ops = 0, bad_op[6] = {0, 0, 0, 0, 0, 0};
   const HVX_Vector eighth = Q6_Vh_vsplat_R(0x3000), zero = Q6_V_vzero();
@@ -722,7 +722,7 @@ static void check_hf_prim(void) {
           0u,
         "an hf op differs from rne16(f32 op)");
 
-  /* hvx_hf_bits_rne and the kernel's vector form hvx_hf_round_row (#170
+  /** hvx_hf_bits_rne and the kernel's vector form hvx_hf_round_row (#170
      round 2) == fp16 bits of rne16 at every f32 below 65520 (the positive
      half exhaustively, the negative half every 61st pattern), 64 values
      per vector call. */
@@ -747,7 +747,7 @@ static void check_hf_prim(void) {
       }
     }
   }
-  /* ... and back: hvx_hf_store_sf == the f32 of every finite fp16 (the
+  /** ... and back: hvx_hf_store_sf == the f32 of every finite fp16 (the
      output widening; -0 and the subnormals included). */
   uint32_t n_wid = 0, bad_wid = 0;
   for (uint32_t base = 0; base < 0x10000u; base += 64u) {
@@ -773,7 +773,7 @@ static void check_hf_prim(void) {
         "hvx_hf_store_sf differs from the fp16 value (%u of %u)", bad_wid,
         n_wid);
 
-  /* P1's q operand (#170 round 3): for random rows (a quarter of the
+  /** P1's q operand (#170 round 3): for random rows (a quarter of the
      values +-0 or under 2^-14, so signed zeros and subnormals are in), the
      vlut16 pair of every even d of the zipped row == Q6_Vh_vsplat_R of the
      fp16 bits of rne16(x[d]) (lo) and of x[d + 1] (hi) in all 64 lanes. */
@@ -833,7 +833,7 @@ static void check_hf_prim(void) {
     }
   }
 
-  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF; since round 3
+  /** exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF; since round 3
      also the kernel's lookup there: hvx_hf_exp16_idx == the spec's index
      and the fp16 table at it == exp16's bits (-inf included: 0xFC00). */
   uint32_t n_exp = 0, bad_exp = 0, n_idx = 0, bad_idx = 0, bad_tab = 0;
@@ -987,7 +987,7 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
     bad += w[taken[i]] == 0u;
   }
   bad += w[ATTN_M1_PROF_POOL] < w[ATTN_M1_PROF_BUSY_MAX];
-  /* round 3's split: SOFTMAX holds its five pieces (the brackets nest in
+  /** round 3's split: SOFTMAX holds its five pieces (the brackets nest in
      SOFTMAX's, and the counter only grows) */
   bad += (uint64_t)w[ATTN_M1_PROF_SOFTMAX] <
          (uint64_t)w[ATTN_M1_PROF_EXP] + w[ATTN_M1_PROF_ET] +
@@ -1093,7 +1093,7 @@ static void check_append_chain(uint32_t L, hvx_worker_pool *pool) {
   amc_fill_q(&g_rng, q, N_Q, HD);
   amc_fill_kv(&g_rng, k, v, L, N_KV, GQA, HD);
   hvx_attn_m1_ctx *a = make_ctx(max_seq, pool), *b = make_ctx(max_seq, pool);
-  /* The chain touches layer 0 too, so an unwritten layer 0 in b would show
+  /** The chain touches layer 0 too, so an unwritten layer 0 in b would show
      up in the cache compare if the layer offset were wrong. */
   for (uint32_t p = 0; p < L; ++p) {
     const size_t row = (size_t)p * N_KV * HD;
@@ -1194,7 +1194,7 @@ static void check_errors(hvx_worker_pool *pool) {
   hvx_attn_m1_ctx *bad = hvx_attn_m1_create(1, N_KV, GQA, HD, 100u, pool, &err);
   CHECK(!bad && err == AEE_EINVALIDFORMAT, "max_seq 100: ctx=%p err=%d",
         (void *)bad, err);
-  /* head_dim is a multiple of 64 up to 512 (#152's 64; plan 201 S4:
+  /** head_dim is a multiple of 64 up to 512 (#152's 64; plan 201 S4:
      Gemma's 256 and 512); 32, 48, 96 and 576 register-time errors. */
   static const uint32_t bad_hd[] = {32u, 48u, 96u, 576u};
   for (size_t i = 0; i < sizeof(bad_hd) / sizeof(bad_hd[0]); ++i) {
@@ -1391,7 +1391,7 @@ static double g4_check(uint32_t s, uint32_t L,
         G4[s].name, L);
   CHECK(seen, "gemma %s L=%u: the data cannot see a window off by one",
         G4[s].name, L);
-  /* the fp16 CPU order's own distance from exact (#152: 41-52 dB at
+  /** the fp16 CPU order's own distance from exact (#152: 41-52 dB at
      LFM2's shape); a wrong scale or window lands far below */
   CHECK(snr > 30.0, "gemma %s L=%u: SNR %.1f dB", G4[s].name, L, snr);
   free(q);
@@ -1488,7 +1488,7 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
   }
 }
 
-/* [#289] seed_q8 on a lazy int8 cache: the q ^ 0x80 masters land in Kt's
+/** [#289] seed_q8 on a lazy int8 cache: the q ^ 0x80 masters land in Kt's
    tile columns and V's rows unchanged, K's head scale fills its dims, the
    other layers stay unallocated, and a second seed of the layer is refused */
 static void check_seed_q8(hvx_worker_pool *pool) {

@@ -41,7 +41,7 @@ void hvx_copy_ah_block(uint8_t *dst_ah, const uint8_t *src_ah, uint32_t k,
   if (!dst_ah || !src_ah || kt_n == 0u) {
     return;
   }
-  /* The whole block is one contiguous run now that the pack writes slot
+  /** The whole block is one contiguous run now that the pack writes slot
      order directly, so this is a flat copy split by bytes -- nothing to
      gather. The pass it replaces read 32 bytes at a time from addresses
      scattered across the entire activation and cost 3.2 ms a layer; doc 46

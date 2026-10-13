@@ -1,4 +1,10 @@
-/* Scalar stand-ins for every HMX/HVX/DMA/pool primitive the block
+/**
+ * @file hvx_scalar_stubs.h
+ * @brief hvx scalar stubs.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Scalar stand-ins for every HMX/HVX/DMA/pool primitive the block
    kernels call, plus the reference helpers the host checks share. See
    run_host_checks.sh for what this does and does not verify: the
    arithmetic is defined self-consistently on both sides, so what a check

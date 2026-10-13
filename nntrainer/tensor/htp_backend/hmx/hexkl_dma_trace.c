@@ -79,7 +79,7 @@ void hexkl_dma_trace_push(uint64_t now, uint32_t ring_idx, uint32_t kind,
 void hexkl_dma_trace_wait_begin(uint64_t now, uint32_t ring_idx,
                                 uint32_t site) {
   const uint32_t t = rel_(now);
-  /* Read the bit before the watermark moves so "blocked" is what the wait
+  /** Read the bit before the watermark moves so "blocked" is what the wait
      itself is about to see, not what the walk found. */
   const uint32_t blocked = hexkl_dma_ring_is_done(ring_idx) ? 0u : 1u;
   advance_(t);
@@ -144,7 +144,7 @@ static uint32_t union_(int hi) {
 void hexkl_dma_trace_finish(uint64_t now, hexkl_dma_trace_summary *out) {
   const uint32_t t = rel_(now);
   advance_(t);
-  /* Whatever is still open completed no earlier than the last point and no
+  /** Whatever is still open completed no earlier than the last point and no
      later than... unknown; the call is over, so close it at now. */
   for (uint32_t k = g_trace.seen_done; k < g_trace.n_push; ++k) {
     g_trace.push[k].t_done_lo = g_trace.t_last;
@@ -167,7 +167,7 @@ void hexkl_dma_trace_finish(uint64_t now, hexkl_dma_trace_summary *out) {
     }
   }
   if (g_trace.n_dropped != 0u) {
-    /* The union over a truncated table is not the call's busy time and
+    /** The union over a truncated table is not the call's busy time and
        dividing the call's bytes by it would overstate the engine. */
     return;
   }

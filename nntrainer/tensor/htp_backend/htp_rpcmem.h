@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/**
  * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
  *
  * @file   htp_rpcmem.h

@@ -38,6 +38,7 @@
 #include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
+#include "gemma4_htp_moe_causallm.h"
 #include "gemma4_moe_causallm.h"
 #if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
@@ -165,6 +166,23 @@ void registerAllModels() {
       });
     causallm::Factory::Instance().registerModel(
       "Gemma4ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+        const auto profile =
+          nntr_cfg.value("gemma4_execution_profile", std::string("main"));
+        if (profile == "htp_fused") {
+          return std::unique_ptr<causallm::Transformer>(
+            std::make_unique<causallm::Gemma4HtpMoECausalLM>(
+              cfg, generation_cfg, nntr_cfg));
+        }
+        bool htp_settings = nntr_cfg.contains("gemma4_weight_format") ||
+                            nntr_cfg.contains("attention_kv_dtype");
+        for (const char *key :
+             {"moe_engine", "attention_engine", "attn_proj_engine",
+              "dense_ffn_engine", "lmhead_engine"})
+          htp_settings |= nntr_cfg.value(key, std::string()) == "htp";
+        if (profile != "main" || htp_settings)
+          throw std::invalid_argument("Gemma4: invalid execution profile or "
+                                      "HTP weight format on main profile");
+
         const json &text_cfg =
           cfg.contains("text_config") && cfg["text_config"].is_object()
             ? cfg["text_config"]

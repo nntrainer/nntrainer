@@ -1640,7 +1640,7 @@ void Lfm2MoePoolLayer::incremental_forwarding(
     // The M > 1 gate that used to sit here moved inside: it does not apply to
     // QS4CX_WH weights, which have no ARM path to fall back to at M == 1.
     // Falls through to the per-expert loop below otherwise.
-    /* M0: the one stage that had no timer. With the whole-layer call the
+    /** M0: the one stage that had no timer. With the whole-layer call the
        ARM-side gather, route and scatter all read ~0 because the DSP does
        them, and this read 0 as well -- so nothing accounted for the layer's
        wall clock, and doc 46 section 18.1 had to quote the ARM remainder as

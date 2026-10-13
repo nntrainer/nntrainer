@@ -109,7 +109,7 @@ static uint64_t fnv(const void *p, size_t n) {
   return h;
 }
 
-/* [#225] hexkl_graph.c's FC on WH handles: no op of this check's list
+/** [#225] hexkl_graph.c's FC on WH handles: no op of this check's list
    carries the WH bit (graph_host_check holds that path). */
 int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
                             uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -145,7 +145,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     for (i = 0; i < row_count[e]; ++i, ++r) {
       const float *x = act_f32 + (size_t)row_index[r] * K;
       float *y = out_f32 + (size_t)(rows_out ? k : row_index[r]) * N_out;
-      /* the expert is what its gate_up's bytes say, not its handle: the
+      /** the expert is what its gate_up's bytes say, not its handle: the
          pool check moves experts between handles */
       const uint32_t id = *(const uint32_t *)tbl->slots[h_gate_up[e]].wh_bytes;
       for (c = 0; c < N_out; ++c)
@@ -223,7 +223,7 @@ static uint32_t build_words(uint32_t *w) {
   for (i = 0; i < w[3]; ++i) {
     htp_graph_op *op = htp_graph_op_at(w, i);
     if (op->kind == HTP_OP_MOE) {
-      /* MoE op m's expert e: gate_up 10 m + e, down 10 m + 5 + e, bound
+      /** MoE op m's expert e: gate_up 10 m + e, down 10 m + 5 + e, bound
          as its EXPERTS table (bind_params) */
       for (e = 0; e < op->n_experts; ++e) {
         g_wh[10u * m + e] = g_wh[10u * m + 5u + e] = 10u * m + e;
@@ -359,7 +359,7 @@ static uint8_t *new_page(void) {
   return p;
 }
 
-/* The one-session forward: every token's logits and id, and (when
+/** The one-session forward: every token's logits and id, and (when
    g_moe_log is set) its MoE calls' hashes. */
 static void reference(const uint32_t *words, uint32_t n,
                       float (*ref_logits)[VOCAB], uint32_t *ref_id) {
@@ -484,7 +484,7 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
 #define POOL_OPS 2u /* the hd64 list's MoE ops */
 #define POOL_E 4u   /* experts a layer; the pool holds half of them */
 
-/* The owner (the ARM's side, here a pthread): per MoE op, which expert
+/** The owner (the ARM's side, here a pthread): per MoE op, which expert
    each of its two slots holds and a recency stamp, and the op indices. */
 typedef struct {
   uint8_t *page;
@@ -513,7 +513,7 @@ static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
   return AEE_SUCCESS;
 }
 
-/* Every MoE op's EXPERTS table: experts [0, held) in slots 0.., the rest
+/** Every MoE op's EXPERTS table: experts [0, held) in slots 0.., the rest
    absent; the ops' indices into o. */
 static void set_pool(session *s, pool_owner *o, uint32_t held) {
   uint32_t m, t, e;
@@ -549,7 +549,7 @@ static void pool_serve(pool_owner *o, const htp_miss_req *q) {
     a->rc = AEE_EBADITEM;
     ++o->bad;
   } else {
-    /* the routed stay (they are touched first), the least recent other
+    /** the routed stay (they are touched first), the least recent other
        goes: the ARM's ExpertLru rule */
     for (i = 0; i < q->n_routed; ++i)
       for (s = 0; s < 2u; ++s)
@@ -652,7 +652,7 @@ static void check_pool(const uint32_t *words, uint32_t n) {
         st.stale);
   CHECK(s.g->route_log_n == POOL_OPS * 3u, "route log %u bytes",
         s.g->route_log_n);
-  /* [#267 L3] the counters the ARM prints: every kernel call counted,
+  /** [#267 L3] the counters the ARM prints: every kernel call counted,
      and the batched miss path under the one-at-a-time form's count */
   CHECK(calls == g_moe_calls && calls < calls_1x,
         "pool moe calls %u (kernel %u) one-at-a-time %u", calls, g_moe_calls,
@@ -710,7 +710,7 @@ static void check_failures(const uint32_t *words, uint32_t n) {
     "  no owner                -> AEE_EEXPIRED after %.2f s, timeouts=%u\n",
     dt / 1e6, st.timeouts);
 
-  /* (2) the answer word carries this round's seq over an earlier answer
+  /** (2) the answer word carries this round's seq over an earlier answer
      (its body's clean did not land): refused */
   seq = hexkl_token_seq(2u, 0u);
   memset(a, 0, sizeof(*a));

@@ -108,7 +108,7 @@ int main(void) {
     replay_stub_meter.pages = pages;
     replay_stub_meter.n_pages = arena_bytes >> 12;
 
-    /* 1 + 2: bytes landed and the distinct source pages of 24 calls (a
+    /** 1 + 2: bytes landed and the distinct source pages of 24 calls (a
        full rotation is n_regions / 4 calls). */
     uint32_t res[13] = {0};
     const uint32_t calls = 24u;

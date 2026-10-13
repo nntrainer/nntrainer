@@ -31,7 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The device's WH nibble layout (htp_wh_layout.h), the same function the
+/** The device's WH nibble layout (htp_wh_layout.h), the same function the
    moe_layer_host_check stand-ins read tiles through. */
 static int wh_value(const uint8_t *tile, uint32_t k, uint32_t c) {
   const uint32_t byte = (k / 8u) * 128u + c * 4u + (k % 4u);
@@ -50,7 +50,7 @@ static uint8_t rnd8(void) {
 typedef void (*col_fn)(const uint8_t *, uint32_t, uint32_t, const uint8_t *,
                        uint32_t, uint32_t, uint32_t, int32_t *);
 
-/* One (m, k_tiles, n_col, nt, rows1) case through one entry point: the
+/** One (m, k_tiles, n_col, nt, rows1) case through one entry point: the
    number of int32 that differ from the scalar spec plus the guard words
    written. rows1 picks gemm_row1 for a lone last row, so it is the axis
    #113 sweeps beside the lead and both loops must land on the same spec. */
@@ -192,7 +192,7 @@ int main(void) {
   if (!act || !wh || !wh2 || !wh4)
     return 2;
   uint32_t bad = fc_bad, cases = 0;
-  /* data 0: random bytes; data 1: the extremes, activation 255 against
+  /** data 0: random bytes; data 1: the extremes, activation 255 against
      nibble -8 everywhere -- the largest |sum| the header's bound allows. */
   for (int data = 0; data < 2; ++data) {
     for (size_t i = 0; i < act_bytes; ++i)
@@ -219,7 +219,7 @@ int main(void) {
               }
       }
   }
-  /* [plan 229] The u8i2 entries over the same shapes, rows and loops:
+  /** [plan 229] The u8i2 entries over the same shapes, rows and loops:
      random codes and the activation extremes, an asymmetric palette using
      both ends of int4 and ternary's {-1, 0, +1} (one entry unused). */
   static const int8_t pals[2][4] = {{-8, -2, 1, 7}, {-1, 0, 1, 1}};

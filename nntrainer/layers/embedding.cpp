@@ -11,6 +11,7 @@
  *
  */
 
+#include <cstdlib>
 #include <embedding.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
@@ -71,9 +72,22 @@ void EmbeddingLayer::finalize(InitLayerContext &context) {
   dim.width(out_dim);
   dim.batch(1);
 
+  // [#4416 mem] NNTR_EMBEDDING_MMAP=1: the table stays in the model file
+  // and is mapped read-only at the first forward (a virtual tensor, as the
+  // FSU experts); only the rows a token reads become resident instead of
+  // the whole table (Gemma-4 26B: 415 MB of Q4_0 on the host for one row a
+  // token). ponytail: an environment knob, not a layer property; the model
+  // builder is the upgrade path.
+  static const bool mmap_weight = std::getenv("NNTR_EMBEDDING_MMAP") != nullptr;
   weight_idx = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+    weight_decay, "Embedding", true, mmap_weight);
+}
+
+/** @brief Maps a virtual (file-backed) table once; a no-op otherwise. */
+static void ensureMapped(Tensor &weight) {
+  if (weight.isVirtual() && !weight.isActivated())
+    weight.activate();
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -87,6 +101,7 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int out_dim = std::get<props::OutDim>(embedding_props);
 
   Tensor &weight = context.getWeight(weight_idx);
+  ensureMapped(weight);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   TensorDim out_tensor_dim =
@@ -127,6 +142,7 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
   }
 
   Tensor &weight = context.getWeight(weight_idx);
+  ensureMapped(weight);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 

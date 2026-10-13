@@ -58,7 +58,7 @@ static double geglu_f64(double g, double u) {
 
 int main(void) {
   static float g[N_ALL], u[N_ALL], spec[N_ALL], hvx[N_ALL];
-  /* Each with both signs. 1e30, not FLT_MAX: exp_det's clamp at 85 floors
+  /** Each with both signs. 1e30, not FLT_MAX: exp_det's clamp at 85 floors
      the sigmoid at exp(-85) = 1.2e-37, so g = -FLT_MAX gives -41 where the
      answer is 0 -- swiglu_det_one's same floor, unreachable from a
      dequantized matmul output. */
@@ -112,7 +112,7 @@ int main(void) {
   printf("GEGLU HVX == SPEC bit-exact %u/%u\n", same, N_ALL);
   CHECK(same == N_ALL, "hvx_geglu_det_sf differs from geglu_det_one");
 
-  /* 2b. the epilogue the MoE kernel runs: n_pairs gate/up tile pairs of
+  /** 2b. the epilogue the MoE kernel runs: n_pairs gate/up tile pairs of
      m_count rows, dequantized and fed to the activation the job names */
   enum { NP = 6, ROWS = 4, RS = 32, INTER = NP * 32 };
   static int32_t tiles[2 * NP][ROWS * RS];
@@ -165,7 +165,7 @@ int main(void) {
           geglu);
   }
 
-  /* 3. the MoE down epilogue, row-major over a run of tiles: every element
+  /** 3. the MoE down epilogue, row-major over a run of tiles: every element
      the spec's dequant, then out[rows[m]] += that * weights[m] */
   {
     enum { NT = 3, SM = 7, SN = NT * 32, OM = 11 };
@@ -218,7 +218,7 @@ int main(void) {
     CHECK(rsame, "row-major tile dequant differs from the tile-major one");
   }
 
-  /* 4. the activation quantized once row-major, then gathered into AH
+  /** 4. the activation quantized once row-major, then gathered into AH
      tiles: the bytes of quantizing every slot's row from f32. K = 160
      leaves a 32-float run past the row's whole vectors. */
   for (uint32_t K = 160u; K <= 256u; K += 96u) {
@@ -246,7 +246,7 @@ int main(void) {
     printf("QUANT ONCE + GATHER hvx_quant_u8.c K=%u %s%s\n", K,
            same ? "bit-exact" : "DIFFERS", blind ? " (compare is blind)" : "");
     CHECK(same && !blind, "quantize-once gather differs from the pack");
-    /* ...and the pre norm inside that pass: the parameters and bytes of
+    /** ...and the pre norm inside that pass: the parameters and bytes of
        the rows normed first */
     {
       float *gm = (float *)malloc(sizeof(float) * K);

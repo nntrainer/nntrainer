@@ -1,4 +1,10 @@
-/* Host harness for hexkl_conv_block_run: the kernel on the scalar stand-ins
+/**
+ * @file conv_block_host_check.c
+ * @brief conv block host check.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Host harness for hexkl_conv_block_run: the kernel on the scalar stand-ins
    (hvx_scalar_stubs.c) against a row-at-a-time reference of the whole
    block. What it checks is the loop structure -- that a and c pair up at
    the same columns, that g's rows land where phase 2's two-row look-back
@@ -14,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The reference: one row of x at a time through in_proj's three slices,
+/** The reference: one row of x at a time through in_proj's three slices,
    the conv over the previous rows' gate values, out_proj. */
 static void ref_block(const W *wa, const W *wb, const W *wc, const W *wo,
                       const float *conv_w, const float *x, uint32_t M,
@@ -85,7 +91,7 @@ static int compare(const char *what, const float *got, const float *want,
 }
 
 int main(void) {
-  /* Shapes small enough to run in seconds and awkward on purpose: M is
+  /** Shapes small enough to run in seconds and awkward on purpose: M is
      three blocks with a short last one; C is 17 tiles, one more than the
      16 pairs a staging buffer holds, so phase 1 has a full batch and a
      one-pair batch and the second staging buffer is used; N_out is 33
@@ -133,7 +139,7 @@ int main(void) {
   fail |= compare("conv state", got_state, want_state, 2u * C);
   printf(fail ? "CONV BLOCK DIFFERS\n" : "CONV BLOCK MATCHES REFERENCE\n");
 
-  /* Every weight pushed exactly once: a, b, c (K x C) and out (C x N_out).
+  /** Every weight pushed exactly once: a, b, c (K x C) and out (C x N_out).
      The DMA stub completes at push, so a missing push cannot show as a
      wrong result -- only this counter catches it. */
   {
@@ -170,7 +176,7 @@ int main(void) {
     free(want1);
     free(wst1);
   }
-  /* [#225] The prefill in chunks -- 100 rows, then 49 and 1 continuing
+  /** [#225] The prefill in chunks -- 100 rows, then 49 and 1 continuing
      from the state the previous chunk handed back as hist -- equals the
      one call bit for bit: every row's quantization and epilogue are its
      own, and the look-back crosses the chunk through hist. The one-row

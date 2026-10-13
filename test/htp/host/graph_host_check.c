@@ -12,7 +12,7 @@
  * @bug    No known bugs except for NYI items
  */
 
-/* htp_graph_desc.h's validator and LFM2 builder, and hexkl_graph.c's init /
+/** htp_graph_desc.h's validator and LFM2 builder, and hexkl_graph.c's init /
    forward loop.
 
    Validator half: the LFM2.5-8B-A1B op list validates; each mutation of
@@ -125,7 +125,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   hexkl_moe_scratch *scratch, uint32_t flags) {
   uint32_t e, c, r = 0, k = 0;
   moe_args *a = &g_last;
-  /* [#267 L3] the kernel's contract for the rows-out bit: M = 1 on the GEMV
+  /** [#267 L3] the kernel's contract for the rows-out bit: M = 1 on the GEMV
      path only (here: the M1_GEMV bit stands for that path), else refused
      before anything is written; the bit itself is not in the math */
   const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
@@ -171,7 +171,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   return AEE_SUCCESS;
 }
 
-/* [#225] hexkl_mm_u8i4_fc_m1_run's stand-in, the MoE one's way: records
+/** [#225] hexkl_mm_u8i4_fc_m1_run's stand-in, the MoE one's way: records
    its arguments and mixes every part's handle and the input into its
    output, the parts side by side (the kernel itself is moe_layer_host_
    check's FC WH cells). */
@@ -218,7 +218,7 @@ static const htp_graph_lfm2_shape kLfm25 = {24, 2, 2048, 7168,   1792, 32,   4,
 /* unittest_causallm_lfm2_moe.cpp:85-113, layer_types [attention, conv] */
 static const htp_graph_lfm2_shape kTiny = {2, 0, 64, 64, 64, 4,    2,
                                            8, 4, 8,  32, 8,  1e-6f};
-/* lfm2_moe_tiny_hd64 (plan 130 section 3.4): what the attention kinds
+/** lfm2_moe_tiny_hd64 (plan 130 section 3.4): what the attention kinds
    need -- head_dim 64, a gqa of 2, max_seq a multiple of 32 */
 static const htp_graph_lfm2_shape kHd64 = {3, 1, 128, 64, 32, 4,    2,
                                            2, 1, 64,  32, 64, 1e-6f};
@@ -266,7 +266,7 @@ static void mut_kind(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_attn_in_conv(uint32_t *w, uint32_t *n) {
-  /* layer 0 is conv; its CONV1D_GATE has N == hidden, so only the layer
+  /** layer 0 is conv; its CONV1D_GATE has N == hidden, so only the layer
      check can refuse an ATTN_M1 there */
   htp_graph_op_at(w, nth_op(w, HTP_OP_CONV1D_GATE, 0))->kind = HTP_OP_ATTN_M1;
   (void)n;
@@ -289,7 +289,7 @@ static void mut_eps_zero(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_rope_before_qk_norm(uint32_t *w, uint32_t *n) {
-  /* the two records differ only in kind, so swapping the kinds is the
+  /** the two records differ only in kind, so swapping the kinds is the
      order mutation and nothing else */
   const uint32_t q = nth_op(w, HTP_OP_QK_NORM, 0);
   htp_graph_op_at(w, q)->kind = HTP_OP_ROPE;
@@ -297,7 +297,7 @@ static void mut_rope_before_qk_norm(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_rope_head_dim_32(uint32_t *w, uint32_t *n) {
-  /* K = 3072 = (6 + 2) x 12 x 32 keeps the record consistent, so only
+  /** K = 3072 = (6 + 2) x 12 x 32 keeps the record consistent, so only
      the kernel's head_dim 64 rule can refuse it */
   htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 2));
   op->head_dim = 32u;
@@ -306,7 +306,7 @@ static void mut_rope_head_dim_32(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_attn_head_dim_32(uint32_t *w, uint32_t *n) {
-  /* K = 3072 = (4 + 2) x 16 x 32 and N = 2048 = 4 x 16 x 32: consistent,
+  /** K = 3072 = (4 + 2) x 16 x 32 and N = 2048 = 4 x 16 x 32: consistent,
      so only #152's head_dim 64 rule (the fp16 CPU order) can refuse it */
   htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2));
   op->head_dim = 32u;
@@ -314,7 +314,7 @@ static void mut_attn_head_dim_32(uint32_t *w, uint32_t *n) {
   op->gqa = 4u;
   (void)n;
 }
-/* [plan 201 S4] head_dim 128 is a kernel shape now (K = 3072 = (4 + 2) x 4
+/** [plan 201 S4] head_dim 128 is a kernel shape now (K = 3072 = (4 + 2) x 4
    x 128, N = 2048 = 4 x 4 x 128), but 1/sqrt(128) is not an fp16 value:
    without a scale in eps_bits it is refused; and a scale that is not one */
 static void mut_attn_hd128_no_scale(uint32_t *w, uint32_t *n) {
@@ -338,7 +338,7 @@ static void mut_attn_scale_not_fp16(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_qk_norm_head_dim_96(uint32_t *w, uint32_t *n) {
-  /* K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
+  /** K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
      chunk would not be a power of two */
   htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_QK_NORM, 1));
   op->head_dim = 96u;
@@ -350,14 +350,14 @@ static void mut_attn_without_rope(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_rmsnorm_k_not_32(uint32_t *w, uint32_t *n) {
-  /* the final norm: K == hidden is not a validator rule for RMSNORM, so
+  /** the final norm: K == hidden is not a validator rule for RMSNORM, so
      only the kernel's width rule can refuse 2048 + 24 (plan 201 S4: any
      multiple of 32 is taken, 2080 included) */
   htp_graph_op_at(w, w[3] - 2u)->K = 2072u;
   htp_graph_op_at(w, w[3] - 2u)->N = 2072u;
   (void)n;
 }
-/* [plan 201 S4] an RMSNORM feed bit other than N1; a softmax router (eps
+/** [plan 201 S4] an RMSNORM feed bit other than N1; a softmax router (eps
    set) norming over its own input slot */
 static void mut_rmsnorm_feed_2(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 2))->feed = 2u;
@@ -397,7 +397,7 @@ static void mut_version(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_lm_head_not_last(uint32_t *w, uint32_t *n) {
-  /* every op after the last MoE names it as next_mm; those are dropped
+  /** every op after the last MoE names it as next_mm; those are dropped
      too, or BADITEM fires first */
   uint32_t i;
   htp_graph_op_at(w, w[3] - 1u)->kind = HTP_OP_RMSNORM;
@@ -505,7 +505,7 @@ static void check_validator(void) {
           htp_graph_kinds_parse("MOE,BOGUS") == 0u &&
           htp_graph_kinds_parse("") == 0u,
         "kinds parse (one, bad, empty)");
-  /* the hd8 fixture with the attention kinds resident: the kernels'
+  /** the hd8 fixture with the attention kinds resident: the kernels'
      head_dim rule, end to end through the validator */
   {
     static uint32_t t[sizeof(w) / sizeof(w[0])];
@@ -645,7 +645,7 @@ static void check_forward(void) {
   }
   printf("GRAPH FORWARD IDENTITY OK (22 start ops, no op resident)\n");
 
-  /* (2) MOE resident: the handles are each op's EXPERTS table (plan 201
+  /** (2) MOE resident: the handles are each op's EXPERTS table (plan 201
      S1), bound after init and checked there, not in the record */
   n = build(w, cap, &kTiny, "AC", resident_ok);
   bind_tiny();
@@ -717,7 +717,7 @@ static void check_forward(void) {
       CHECK(memcmp(out, ref, sizeof(out)) == 0,
             "output differs (flags=%u l=%u)", env.moe_flags, l);
       CHECK(g_last.n_calls == 1u, "kernel calls %u", g_last.n_calls);
-      /* the same arguments as the direct call, pointers included, except
+      /** the same arguments as the direct call, pointers included, except
          act/out, which are the graph's slots */
       CHECK(memcmp(&g_last, &direct, sizeof(direct)) == 0,
             "kernel arguments differ (flags=%u l=%u)", env.moe_flags, l);
@@ -776,7 +776,7 @@ static void check_forward(void) {
     rc = (uint32_t)hexkl_graph_forward(g, &env, start - 1u, 1000u, 0u, &routing,
                                        act, 64u, out, 4u, &resume);
     CHECK(rc == 0u && resume == start - 1u, "router op is not resident");
-    /* [plan 201 S1] a pool that does not hold experts 0 and 2 still runs
+    /** [plan 201 S1] a pool that does not hold experts 0 and 2 still runs
        a token routed to 1 and 3, with the full table's bits; one that
        does not hold 3 refuses it */
     {
@@ -812,7 +812,7 @@ static void check_forward(void) {
 }
 
 /* ---- limits half (plan 201 S1): sized for Gemma-4-26B-A4B -------------- */
-/* A miss round answered at once: every missing odd expert e loaded on the
+/** A miss round answered at once: every missing odd expert e loaded on the
    pair 3000 + e / 3200 + e, the order of events recorded. */
 typedef struct {
   uint32_t posts, waits, kernel_calls_at_post;
@@ -841,7 +841,7 @@ static int fake_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
 static void check_limits(void) {
   static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
-  /* 60 conv layers, 128 experts, top-8: 60 x 9 + 2 = 542 ops, over the
+  /** 60 conv layers, 128 experts, top-8: 60 x 9 + 2 = 542 ops, over the
      256 before; the handles at the top of the 4096-entry table */
   static const htp_graph_lfm2_shape big = {60, 0, 64, 64, 64, 128,  8,
                                            8,  4, 8,  32, 8,  1e-6f};
@@ -925,7 +925,7 @@ static void check_limits(void) {
                                      out, 64u, &resume);
   CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed outside the pool: %s",
         htp_graph_err_name(rc));
-  /* the miss round (plan 201 S1): top-8 with the misses (odd experts) at
+  /** the miss round (plan 201 S1): top-8 with the misses (odd experts) at
      positions {1, 3, 5} (after a hit, in the middle and late), {0}, {2, 5},
      {7} and all eight. [#267 L3] Under the M1_GEMV bit the later present
      experts and the arrived ones run as one ROWS_OUT call each; without it
@@ -1138,7 +1138,7 @@ static void check_stretches(void) {
   check_pcycles(g, op_rms, op_rms + 1u, "RMSNORM");
   err |= memcmp(out, ref, HID * sizeof(float)) != 0;
 
-  /* (2) [CONV1D_GATE]: no conv_w / state -> EBADSTATE; an 8-token chain
+  /** (2) [CONV1D_GATE]: no conv_w / state -> EBADSTATE; an 8-token chain
      from a seeded state; the state re-sent mid-chain */
   fill(in, 3u * HID, &seed);
   rc = (uint32_t)hexkl_graph_forward(g, &env, op_conv, 1000u, 0u, NULL, in,
@@ -1182,7 +1182,7 @@ static void check_stretches(void) {
   CHECK(memcmp(g->state[op_conv], state_ref, sizeof(state_ref)) == 0,
         "conv state after the chain");
 
-  /* (3) [QK_NORM ROPE ATTN_M1]: no gamma / table / cache -> EBADSTATE;
+  /** (3) [QK_NORM ROPE ATTN_M1]: no gamma / table / cache -> EBADSTATE;
      then, at four positions after a kv_append seed, bit-identical to
      rmsnorm_det -> rope64_det -> attn_m1_det */
   fill(in, (N_Q + 2u * N_KV) * HD, &seed);
@@ -1203,7 +1203,7 @@ static void check_stretches(void) {
   fill(cs, MAX_SEQ * HD, &seed);
   rc = (uint32_t)hexkl_graph_set_param(g, op_qk, HTP_GRAPH_PARAM_ROPE_TABLE, cs,
                                        MAX_SEQ * HD);
-  /* [plan 201 S4] a ROPE op may hold its own table; any other kind takes
+  /** [plan 201 S4] a ROPE op may hold its own table; any other kind takes
      none, the length rule every other parameter has */
   CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "rope table on a QK_NORM op: %s",
         htp_graph_err_name(rc));
@@ -1255,7 +1255,7 @@ static void check_stretches(void) {
     CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "attn pos %u differs",
           pos);
     err |= memcmp(out, ref, HID * sizeof(float)) != 0;
-    /* slot routing: QK_NORM and ROPE ran in place in slot 2 (the roped
+    /** slot routing: QK_NORM and ROPE ran in place in slot 2 (the roped
        q | k and the untouched v), ATTN_M1 wrote slot 1 */
     CHECK(memcmp(g->slots + 2u * g->slot_words, qn, N_Q * HD * sizeof(float)) ==
               0 &&
@@ -1309,7 +1309,7 @@ static void capture_arm_hint(void *ctx, uint32_t op, const float *input,
     memcpy(arm_hint_input, input, sizeof(arm_hint_input));
 }
 
-/* hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
+/** hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
    250 + 10 m + e (the tiny fixture's handles stay 10..73). */
 /* MoE op m's expert e: gate_up 200 + 10 m + e, down 250 + 10 m + e */
 static uint32_t g_hd64_gu[2][HD64_E], g_hd64_dn[2][HD64_E];
@@ -1326,7 +1326,7 @@ static void bind_hd64(uint32_t *w) {
   }
 }
 
-/* [plan 201 S4] gemma: the same stretch with the router op made Gemma's
+/** [plan 201 S4] gemma: the same stretch with the router op made Gemma's
    softmax router (eps_bits set, ROUTER_BIAS = g | per-expert scale) and
    the norm before it on N1 (feed HTP_GRAPH_NORM_N1). */
 static void check_add_router(int gemma) {
@@ -1374,7 +1374,7 @@ static void check_add_router(int gemma) {
                                g_hd64_dn[i], HD64_E);
     CHECK(rc == 0u, "hd64 EXPERTS %u: %s", i, htp_graph_err_name(rc));
   }
-  /* layer 0's norms (0, 5), layer 1's ffn norm (15), layer 2's operator
+  /** layer 0's norms (0, 5), layer 1's ffn norm (15), layer 2's operator
      norm (19); layer 0's ffn-side ADD (4) and layer 1's first ADD (14) */
   op_norm[0] = nth_op(w, HTP_OP_RMSNORM, 0);
   op_norm[1] = nth_op(w, HTP_OP_RMSNORM, 1);
@@ -1407,7 +1407,7 @@ static void check_add_router(int gemma) {
     fill(rbias + HID, HD64_E, &seed);
   }
 
-  /* (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
+  /** (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
      ran first and moved slot 0; op 0 below re-seeds it) */
   rc = (uint32_t)hexkl_graph_forward(g, &env, op_add1, 1000u, 0u, NULL, a, HID,
                                      out, HID, &resume);
@@ -1429,7 +1429,7 @@ static void check_add_router(int gemma) {
   rc = (uint32_t)hexkl_graph_set_param(
     g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, n_bias);
   CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
-  /* [#266 S2] the second router's weights, and PREDICT: router 0 also
+  /** [#266 S2] the second router's weights, and PREDICT: router 0 also
      runs router 1 on its own input; the stretch below must keep its bits
      and log that guess */
   fill(rw2, HID * HD64_E, &seed);
@@ -1487,7 +1487,7 @@ static void check_add_router(int gemma) {
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
 
   if (gemma) {
-    /* an a2 whose row N1 norms to another r than the f32 norm does, so the
+    /** an a2 whose row N1 norms to another r than the f32 norm does, so the
        stretch tells the two apart (they agree on many rows) */
     static float t1[HID], t2[HID];
     int differs = 0;
@@ -1501,7 +1501,7 @@ static void check_add_router(int gemma) {
     CHECK(differs, "no a2 in 64 rows tells N1 from the f32 norm");
   }
 
-  /* (4) [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM], slot 0 carried over:
+  /** (4) [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM], slot 0 carried over:
      h = s0 + a2, n = rmsnorm(h), routing = router_topk_det(n),
      h2 = h + standin(n, routing), out = rmsnorm(h2) */
   memset(&g_last, 0, sizeof(g_last));
@@ -1604,7 +1604,7 @@ static uint8_t *g_qc[Q_SLOTS]; /* the same weight, canonical block_q4_0 */
 static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
 static uint32_t g_fc_calls, g_fc_feed;
 
-/* The session runner's host twin: the real GEMV on the Q4M1 bytes, no
+/** The session runner's host twin: the real GEMV on the Q4M1 bytes, no
    feed (the DMA feed moves no bits; the in-process E2E runs the real
    runner on its DMA stand-in). */
 static int host_fc(void *ctx, uint32_t h, uint32_t feed, const hvx_q4m1_act *a,
@@ -1646,7 +1646,7 @@ static void q_register(uint32_t h, uint32_t K, uint32_t N, uint32_t *seed) {
   g_qs[h].N = N;
 }
 
-/* the CPU's FC of x: the Q8_0 quantizer, then the fused chain; with
+/** the CPU's FC of x: the Q8_0 quantizer, then the fused chain; with
    g_native [#194 L1] q4_gemv_native_det.h's pair instead */
 static int g_native;
 static void spec_fc(uint32_t h, const float *x, float *y) {
@@ -1731,7 +1731,7 @@ static void check_q4m1(void) {
     op->n_experts = 2u;
     CHECK(f == 5u && h <= Q_SLOTS, "hd64 FC count %u, slots %u", f, h);
   }
-  /* (2) init's shape refusals: a part of the wrong K, parts that do not
+  /** (2) init's shape refusals: a part of the wrong K, parts that do not
      sum to N, a down of the wrong shape, no shape table */
   op = htp_graph_op_at(w, fc_qkv);
   op->n_experts = 2u;
@@ -1766,7 +1766,7 @@ static void check_q4m1(void) {
     return;
   CHECK(g->logits != NULL && g->ffn != NULL && g->slot_words == 3u * HID,
         "Q4M1 buffers / slots %u", g->slot_words);
-  /* the dense FFN's h_gu[2] is 0 and names nothing: slot 0 is the first
+  /** the dense FFN's h_gu[2] is 0 and names nothing: slot 0 is the first
      FC's, so park that FC on another slot for this one probe */
   {
     const uint32_t fc0 = nth_op(w, HTP_OP_FC, 0), keep = g->ops[fc0].h_gu[0];
@@ -1816,7 +1816,7 @@ static void check_q4m1(void) {
   CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "[DENSE_FFN] differs");
   err |= memcmp(out, ref, HID * sizeof(float)) != 0;
 
-  /* (6) [RMSNORM LM_HEAD]: the final norm from slot 0, the two slices,
+  /** (6) [RMSNORM LM_HEAD]: the final norm from slot 0, the two slices,
      the logits as the stretch's output, the first maximum */
   fill(gam, HID, &seed);
   rc = (uint32_t)hexkl_graph_set_param(g, fin, HTP_GRAPH_PARAM_GAMMA, gam, HID);
@@ -1833,7 +1833,7 @@ static void check_q4m1(void) {
   CHECK(memcmp(out, ref, 64u * sizeof(float)) == 0 && g->lm_id == best,
         "[RMSNORM LM_HEAD] differs (lm_id %u, want %u)", g->lm_id, best);
   err |= memcmp(out, ref, 64u * sizeof(float)) != 0 || g->lm_id != best;
-  /* a tie: row best's weights copied into row r2 = best + 37 mod 64, so
+  /** a tie: row best's weights copied into row r2 = best + 37 mod 64, so
      the first of the two equal maxima must win, as std::max_element */
   r2 = (best + 37u) % 64u;
   {
@@ -1848,7 +1848,7 @@ static void check_q4m1(void) {
           g->lm_id == (best < r2 ? best : r2),
         "argmax tie: rows %u and %u, lm_id %u", best, r2, g->lm_id);
   err |= g->lm_id != (best < r2 ? best : r2);
-  /* [#132 Part B E3] LM_BAN: the pick skips the banned ids as the CPU's
+  /** [#132 Part B E3] LM_BAN: the pick skips the banned ids as the CPU's
      bad-words penalty (-inf) does, the logits stay raw, a repeated id is
      harmless; an id past N or a non-LM_HEAD op is refused */
   {
@@ -1888,7 +1888,7 @@ static void check_q4m1(void) {
           htp_graph_err_name(rc));
     err |= rc != HTP_GRAPH_E_BADITEM;
   }
-  /* (7) [#194 L1] the native bit on the three kinds' feed words: the
+  /** (7) [#194 L1] the native bit on the three kinds' feed words: the
      validator takes it (and still refuses an unknown bit), the runner
      sees it, and FC / DENSE_FFN / LM_HEAD equal the native specs */
   rc = (uint32_t)hexkl_graph_set_param(g, lm, HTP_GRAPH_PARAM_LM_BAN, x, 0u);
@@ -1954,7 +1954,7 @@ static void check_q4m1(void) {
 }
 
 /* ---- [#225] FC and DENSE_FFN on WH handles (HTP_GRAPH_FEED_WH) -------- */
-/* The hd64 list with every kind resident, its FC and DENSE_FFN ops bound to
+/** The hd64 list with every kind resident, its FC and DENSE_FFN ops bound to
    u8i4 handles of the session's table (the FC WH sidecar's on the device)
    and the LM_HEAD left on Q4M1: the validator's bit rules, init's handle
    checks, uses_handle / uses_q4m1, and that forward hands each kernel
@@ -1988,7 +1988,7 @@ static void check_wh(void) {
   fc_qkv = nth_op(w, HTP_OP_FC, 2);
   ffn = nth_op(w, HTP_OP_DENSE_FFN, 0);
   lm = nth_op(w, HTP_OP_LM_HEAD, 0);
-  /* WH handles 2..9 (the FC parts) sit in the Q4M1 slots' number range,
+  /** WH handles 2..9 (the FC parts) sit in the Q4M1 slots' number range,
      so uses_q4m1 below must skip WH ops, not just miss their numbers */
   for (i = 0; i < w[3]; ++i) {
     op = htp_graph_op_at(w, i);
@@ -2037,7 +2037,7 @@ static void check_wh(void) {
         htp_graph_err_name(rc));
   err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
   op->feed = 0u;
-  /* init: a part of another K, parts short of N, a down of another shape,
+  /** init: a part of another K, parts short of N, a down of another shape,
      no chunk, a free part handle, a 2-bit part */
   op = htp_graph_op_at(w, fc_qkv);
   register_weight(op->h_gu[1], 64u, 64u);
@@ -2141,7 +2141,7 @@ static void check_wh(void) {
 
 /* ---- [plan 201 S4] Gemma 4's attention shapes -------------------------- */
 
-/* google/gemma-4-26B-A4B: 16 q heads; sliding layers head_dim 256 over 8 kv
+/** google/gemma-4-26B-A4B: 16 q heads; sliding layers head_dim 256 over 8 kv
    heads, full layers head_dim 512 over 2 (num_global_key_value_heads). Three
    layers, sliding / full / sliding, at a max_seq of two 64-position tiles. */
 #define G4_HID 2816u
@@ -2198,7 +2198,7 @@ static uint32_t g4_list(uint32_t *w, uint32_t attn) {
     g4_op(w, i++, HTP_OP_QK_NORM, l, 0u, K, K);
     g4_op(w, i++, HTP_OP_ROPE, l, 1u, K, K);
     g4_op(w, i++, HTP_OP_ATTN_M1, l, attn, K, q);
-    /* scale 1.0 (Gemma4TextAttention's scaling), the window on sliding
+    /** scale 1.0 (Gemma4TextAttention's scaling), the window on sliding
        layers only */
     htp_graph_op_at(w, i - 1u)->eps_bits = 0x3F800000u;
     htp_graph_op_at(w, i - 1u)->top_k = l == 1u ? 0u : G4_WIN;
@@ -2223,7 +2223,7 @@ static void g4_table(float *cs, uint32_t hd, double theta, double partial) {
   }
 }
 
-/* (1) The list validates with ROPE resident at head_dim 256 / 512; (2) a
+/** (1) The list validates with ROPE resident at head_dim 256 / 512; (2) a
    ROPE op with no table of its own and no head_dim 64 -> EBADSTATE (the
    shared hd64 table is not read at another head_dim); (3) tables bound per
    op, the two sliding layers' equal ones shared and the full one apart, a
@@ -2272,7 +2272,7 @@ static void check_gemma_rope(void) {
   CHECK(g->param[1] != NULL && g->param[1] == g->param[7] &&
           g->param[4] != g->param[1],
         "gemma: the sliding tables are not shared (or the full one is)");
-  /* re-binding a shared table with other bytes splits it, never writes the
+  /** re-binding a shared table with other bytes splits it, never writes the
      other op's copy */
   rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
                                        G4_SEQ * 256u);
@@ -2282,7 +2282,7 @@ static void check_gemma_rope(void) {
   rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
                                        G4_SEQ * 256u);
   CHECK(rc == 0u && g->param[7] == g->param[1], "gemma: re-sharing");
-  /* [#4416 D6] sharing by name: op 7 takes op 4's table (its own, shared
+  /** [#4416 D6] sharing by name: op 7 takes op 4's table (its own, shared
      with op 1, stays op 1's); a mismatched head_dim, a non-ROPE op, a
      source with no table and a non-table parameter are refused */
   rc = (uint32_t)hexkl_graph_share_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, 4u);
@@ -2327,7 +2327,7 @@ static void check_gemma_rope(void) {
            "positions each, vs m1_rope_det\n");
 }
 
-/* [plan 201 S4] [ROPE ATTN_M1] resident on the three Gemma layers, a
+/** [plan 201 S4] [ROPE ATTN_M1] resident on the three Gemma layers, a
    sliding cache (8 x 256, two layers) and a full one (2 x 512) in the env:
    (1) the ordinals count within each shape's cache; (2) a shape with no
    cache -> EBADSTATE; (3) a chain of 100 tokens through every layer, each
@@ -2420,10 +2420,10 @@ static void check_gemma_attn(void) {
            G4_WIN);
 }
 
-/* ---- [plan 201 S4] Gemma 4: QK_NORM at 256 / 512 with the v norm, the
+/** ---- [plan 201 S4] Gemma 4: QK_NORM at 256 / 512 with the v norm, the
    two-branch FFN, the soft-capped 262144-row head ---------------------- */
 
-/* One Gemma 4 decoder layer and the tail: htp_graph_gemma_build with
+/** One Gemma 4 decoder layer and the tail: htp_graph_gemma_build with
    n_layers 1, its first or only layer full_attention as @a full. */
 static uint32_t build_gemma(uint32_t *w, uint32_t cap,
                             const htp_graph_gemma_shape *s, uint8_t full,
@@ -2478,7 +2478,7 @@ static void gm_ffn_kind_dense(uint32_t *w) {
   w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_DENSE;
 }
 
-/* The CPU's QK_NORM composition (#4296 gemma4_causallm.cpp:660-708): q and
+/** The CPU's QK_NORM composition (#4296 gemma4_causallm.cpp:660-708): q and
    k per head with their gammas, v (the raw k under K_EQ_V) with none. */
 static void spec_qk_norm(const float *in, const float *gamma, float *out,
                          uint32_t hd, uint32_t gqa, uint32_t n_kv,
@@ -2501,13 +2501,13 @@ static void spec_qk_norm(const float *in, const float *gamma, float *out,
 #define GM_VOCAB 262144u
 #define GM_SLICE 16384u
 
-/* google/gemma-4-26B-A4B's text_config (plan 201 section 2.4); max_seq is
+/** google/gemma-4-26B-A4B's text_config (plan 201 section 2.4); max_seq is
    nntr_config's, 4096 here */
 static const htp_graph_gemma_shape kGemma26 = {
   30u, 2816u, 2112u, 704u,  128u,    8u,    16u,   8u,   256u,
   2u,  512u,  1u,    1024u, 262144u, 4096u, 1e-6f, 30.0f};
 
-/* [plan 201 S4] The model builder on the 26B-A4B shape: 30 layers of 5
+/** [plan 201 S4] The model builder on the 26B-A4B shape: 30 layers of 5
    sliding + 1 full, every kind resident. The list validates, fits
    HTP_GRAPH_MAX_OPS, and each layer carries its own attention shape,
    window, k = v, and layer_scalar; a cap one op short is refused. */
@@ -2578,7 +2578,7 @@ static void check_gemma(void) {
     HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KIND_BIT(HTP_OP_MOE) |
     HTP_GRAPH_KIND_BIT(HTP_OP_DENSE_FFN) | HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD) |
     HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM);
-  /* the FFN stretch's shape: hidden 128, one head of 64 (attention is
+  /** the FFN stretch's shape: hidden 128, one head of 64 (attention is
      not run here) */
   const htp_graph_gemma_shape fs = {
     1u, GM_HID, GM_DENSE_N, GM_INTER, GM_E,     GM_TOP, 2u,    2u,   64u,
@@ -2625,7 +2625,7 @@ static void check_gemma(void) {
   env.scratch = &g_scratch;
   env.fc = host_fc;
 
-  /* (1) validator: the Gemma layer validates every kind it runs resident
+  /** (1) validator: the Gemma layer validates every kind it runs resident
      here; each record mutation fails with its own code */
   n = build_gemma(w, cap, &fs, 0u, fs_scalar, ffn_mask);
   rc = htp_graph_validate(w, n, ffn_mask, NULL);
@@ -2643,7 +2643,7 @@ static void check_gemma(void) {
     printf("  Gemma %-36s -> %s\n", gm_muts[i].what, htp_graph_err_name(rc));
   }
 
-  /* (2) [QK_NORM] at Gemma-4-26B-A4B's two attention shapes (a sliding
+  /** (2) [QK_NORM] at Gemma-4-26B-A4B's two attention shapes (a sliding
      layer: 8 kv heads of 256; a full one: 2 of 512, k = v), in place on
      slot 2 (the v norm must read the raw k before k is normed); the v part
      of the input is garbage under K_EQ_V, which the op must not read */
@@ -2681,7 +2681,7 @@ static void check_gemma(void) {
     g = NULL;
   }
 
-  /* (3) the FFN stretch [RMSNORM ROUTER_TOPK MOE RMSNORM RMSNORM DENSE_FFN
+  /** (3) the FFN stretch [RMSNORM ROUTER_TOPK MOE RMSNORM RMSNORM DENSE_FFN
      RMSNORM ADD RMSNORM ADD] with the session's GeGLU flag, against the
      CPU's order (dense branch first, D + S, (h + F) * layer_scalar) */
   n = build_gemma(w, cap, &fs, 0u, fs_scalar, ffn_mask);
@@ -2753,7 +2753,7 @@ static void check_gemma(void) {
     act[i] = geglu_det_one(gate[i], up[i]);
   spec_fc(g->ops[GM_DENSE].h_dn[0], act, dense);
   m1_rmsnorm_det(dense, gam[3], D, GM_HID, GM_HID, fs.eps, NULL);
-  /* the sparse branch: experts on the pre_ffn_norm_2 row, the router on
+  /** the sparse branch: experts on the pre_ffn_norm_2 row, the router on
      the un-normed h */
   m1_rmsnorm_det(hres, gam[0], sp, GM_HID, GM_HID, fs.eps, NULL);
   m1_rmsnorm_det(hres, rbias, xs, GM_HID, GM_HID, fs.eps, NULL);
@@ -2788,7 +2788,7 @@ static void check_gemma(void) {
          memcmp(g->slots, ref, GM_HID * sizeof(float)) != 0;
   check_pcycles(g, GM_PRE2, GM_ADD_RES + 1u, "Gemma FFN");
 
-  /* (4) [RMSNORM LM_HEAD]: 16 slices of 16384 rows, soft-capped at 30
+  /** (4) [RMSNORM LM_HEAD]: 16 slices of 16384 rows, soft-capped at 30
      before the pick; the raw logits would differ */
   rc = (uint32_t)hexkl_graph_forward(g, &env, GM_FIN, 2u, 0u, NULL, x, GM_HID,
                                      lg_out, GM_VOCAB, &resume);
@@ -2818,7 +2818,7 @@ static void check_gemma(void) {
   hexkl_graph_free(g);
   env.moe_flags = 0u;
 
-  /* (5) the soft-cap's spec against 30 tanh(x / 30) in double over
+  /** (5) the soft-cap's spec against 30 tanh(x / 30) in double over
      [-300, 300] and its HVX form lane for lane (and a scalar tail), the
      dense GeGLU row likewise against geglu_det_one */
   {
@@ -2853,7 +2853,7 @@ static void check_gemma(void) {
     CHECK(same == N, "hvx_softcap_m1_f32 differs from m1_softcap_det");
     err |= nan != 0u || same != N || 10.0 * log10(num / den) <= 120.0 ||
            max_err >= 2e-5;
-    /* the dense GeGLU row: gates over [-12, 12] with the clamps and a
+    /** the dense GeGLU row: gates over [-12, 12] with the clamps and a
        subnormal, ups a permutation of them */
     same = 0;
     for (i = 0; i < N; ++i)

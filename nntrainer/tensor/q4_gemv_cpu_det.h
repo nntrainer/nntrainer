@@ -162,7 +162,7 @@ static inline uint32_t cpu_det_pack(uint64_t m, int e, int mbits, int bias,
     }
     return (be << mbits) | (uint32_t)(r & ((1ull << mbits) - 1u));
   }
-  /* subnormal: quantum 2^(emin - mbits); r == 2^mbits is the smallest
+  /** subnormal: quantum 2^(emin - mbits); r == 2^mbits is the smallest
      normal, which the encoding gives for free */
   return (uint32_t)cpu_det_round_shift(m, (emin - mbits) - e);
 }
@@ -202,7 +202,7 @@ static inline float cpu_det_div_rn(float a, float b) {
     mb <<= 1;
     --xb;
   }
-  /* q has 40 or 41 bits; the remainder is a sticky bit below them, far
+  /** q has 40 or 41 bits; the remainder is a sticky bit below them, far
      under any rounding position (>= 16 bits are dropped) */
   const uint64_t num = ma << 40;
   const uint64_t q = ((num / mb) << 1) | (uint64_t)(num % mb != 0u);

@@ -45,7 +45,7 @@
 /** @brief Bounded chunk-index arrays; a shape needing more is refused. */
 #define CB_MAX_CHUNKS 16u
 
-/* ---- phase 2's background stage: z *= conv1d(g), then z -> mid (u8) ----
+/** ---- phase 2's background stage: z *= conv1d(g), then z -> mid (u8) ----
  *
  * One block's gate and requantization are ~100 us of HVX work that phase
  * 2 used to run synchronously between the b matmul and the out_proj
@@ -91,7 +91,7 @@ static void cb_gate_unit(uint32_t n_units, uint32_t u, void *v) {
     (c->m_blk - r0 < CB_GATE_UNIT_ROWS) ? (c->m_blk - r0) : CB_GATE_UNIT_ROWS;
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
-  /* g's row 0 is the first history row, so block row mb is g row mb + 2
+  /** g's row 0 is the first history row, so block row mb is g row mb + 2
      and every look-back reads a real row: the history, or zeros */
   hvx_conv_gate_f32(c->z + (size_t)r0 * c->C, c->C, c->g, c->C, c->mb + 2u + r0,
                     n, c->C, c->conv_w, NULL);
@@ -159,7 +159,7 @@ int hexkl_conv_block_layout_get(uint32_t K, uint32_t C, uint32_t N_out,
     ROUND_UP_U32(L.w_a_off + w_in_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   L.z_off =
     ROUND_UP_U32(L.w_b_off + slot_b_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  /* z and mid twice: phase 2 pipelines blocks (block b's gate and
+  /** z and mid twice: phase 2 pipelines blocks (block b's gate and
      requant run on the pool's background lane under block b+1's b matmul
      and block b's out_proj), so each has a live reader while the other
      is being written. */
@@ -170,7 +170,7 @@ int hexkl_conv_block_layout_get(uint32_t K, uint32_t C, uint32_t N_out,
   L.result_off =
     ROUND_UP_U32(L.conv_w_off + conv_w_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   {
-    /* Same cap and pairing rule as hexkl_mm_u8i4_moe_layout: 32 tiles a
+    /** Same cap and pairing rule as hexkl_mm_u8i4_moe_layout: 32 tiles a
        staging buffer, even, at least one pair. */
     uint32_t want = 2u * c_ntiles;
     uint32_t fits = 0u;
@@ -263,7 +263,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     return AEE_EUNSUPPORTED;
   }
 
-  /* Heap scratch, session-lifetime (hexkl_moe_scratch): the cached copy of
+  /** Heap scratch, session-lifetime (hexkl_moe_scratch): the cached copy of
      the activation -- m_pad rows, the padding rows zero, since the pack
      reads whole 64-row blocks -- its per-row quant params, its AH tiles,
      g, the cached output, and the pack's done bytes. */
@@ -293,7 +293,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_f32);
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
   uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_act_ah);
-  /* g behind its two history rows (hist, else zeros -- what the gate
+  /** g behind its two history rows (hist, else zeros -- what the gate
      read for a row before 0 when the block always started a prompt) */
   float *g_hist = (float *)hexkl_moe_carve(&cur, sz_g);
   float *g = g_hist + 2u * C;
@@ -321,7 +321,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   int pack_submitted = 0;
   hvx_dq_mul_job mul_job[2];
   hvx_dq_tiles_job dq_job[2];
-  /* Phase 2's background stage, two blocks in flight: jobs and their done
+  /** Phase 2's background stage, two blocks in flight: jobs and their done
      bytes live here because a job outlives its submit until the wait
      that retires it. */
   cb_stage_ctx stage_ctx[2];
@@ -332,7 +332,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   uint32_t act_idx;
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
 
-  /* In: the FastRPC buffers are uncached (see hexkl_mm_u8i4_moe.c on why
+  /** In: the FastRPC buffers are uncached (see hexkl_mm_u8i4_moe.c on why
      each is touched exactly once). conv_w goes to VTCM: phase 2 reads it
      once per row. */
   HEXKL_PROBE_T0(p0);
@@ -345,7 +345,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
-  /* Phase 1's weights go out before the quantization so the scan hides
+  /** Phase 1's weights go out before the quantization so the scan hides
      them: W_a and W_c in paired chunks -- chunk ci is a's n-tile columns
      [ci*half, +half) and c's opposite them, one index each (the c push's,
      the ring retires in order). */
@@ -425,7 +425,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       }
       HEXKL_MOE_MM_END();
 
-      /* Retire the epilogue that read this staging buffer's partner
+      /** Retire the epilogue that read this staging buffer's partner
          (batch ci-1), then launch this batch's straight into g. */
       HEXKL_PROBE_T0(p0);
       hvx_worker_pool_wait(pool);
@@ -453,7 +453,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         hvx_worker_pool_submit(pool, hvx_dq_mul_worker, jb, np);
       }
     }
-    /* The activation slot is free once the last acc_read returned; the
+    /** The activation slot is free once the last acc_read returned; the
        next block rides under this block's last epilogue. */
     if (mb + BR < M) {
       HEXKL_PROBE_T0(p0);
@@ -469,14 +469,14 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   hvx_worker_pool_wait(pool);
   HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
 
-  /* The conv state the CPU decode path (or the next chunk) continues
+  /** The conv state the CPU decode path (or the next chunk) continues
      from: g's last two rows (x_{t-2}, x_{t-1} in causal_conv1d_layer's
      order), the history's where M is shorter. 16 KB, so a plain copy into
      the uncached buffer. */
   memcpy(state_f32, g_hist + (size_t)M * C, 2u * C * sizeof(float));
 
   /* ---- phase 2: out = (dq(x . W_b) * conv1d(g)) . W_out ---------------- */
-  /* Both slots are dead (every HMX read of them returned). Block 0's
+  /** Both slots are dead (every HMX read of them returned). Block 0's
      activation first, then W_b into A and W_out into B, chunked so the
      first batch of each starts before the rest has landed. */
   act_idx =
@@ -488,7 +488,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   (void)n_b;
   (void)n_o;
 
-  /* The pipeline, one block ahead: block n's b matmul and dequant into
+  /** The pipeline, one block ahead: block n's b matmul and dequant into
      z[n&1], then its gate and requant submitted to the background lane;
      block n-1's out_proj from mid[(n-1)&1] issued while they run. Every
      buffer has one writer and one reader a block apart:
@@ -565,7 +565,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       hvx_worker_pool_wait(pool);
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
 
-      /* The activation slot is dead until the next b matmul; the next
+      /** The activation slot is dead until the next b matmul; the next
          block's DMA rides under this block's stage and the previous
          block's out_proj. */
       if (mb + BR < M) {
@@ -604,7 +604,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       const uint32_t pmb = mb - BR;
       const uint32_t prev = cur ^ 1u;
       const uint32_t pm_blk = (M - pmb < BR) ? (M - pmb) : BR;
-      /* Its requant is usually long done; what this wait reads is the
+      /** Its requant is usually long done; what this wait reads is the
          exposure, filed under REQUANT as the synchronous path's was. */
       HEXKL_PROBE_T0(p0);
       hvx_worker_pool_wait_bg(pool, &rq_job[prev], UINT32_MAX);
@@ -666,7 +666,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           hvx_worker_pool_submit(pool, hvx_dq_tiles_worker, jb, nb);
         }
       }
-      /* The last epilogue reads rq[prev], which block n+1's requant
+      /** The last epilogue reads rq[prev], which block n+1's requant
          rewrites; retire it here. */
       HEXKL_PROBE_T0(p0);
       hvx_worker_pool_wait(pool);

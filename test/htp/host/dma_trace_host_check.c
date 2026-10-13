@@ -42,7 +42,7 @@ int main(void) {
   hexkl_dma_trace_reset(1000); /* t0 = 1000 ticks: every time below is
                                   relative to that */
 
-  /* Timeline (ticks since t0):
+  /** Timeline (ticks since t0):
        0  push d0  gate e0  8 KiB x 64 @ 56 KiB     depth before: 0
       10  push d1  up   e0                         depth before: 1
       20  push d2  down e0                         depth before: 2
@@ -94,7 +94,7 @@ int main(void) {
   EXPECT_EQ("s.depth_max", s.depth_max, 3);
   EXPECT_EQ("s.wait", s.wait, 20);
   EXPECT_EQ("s.wait_act", s.wait_act, 0);
-  /* lo edges: [0,20] [10,30] [20,30] [60,60] -> [0,30] + [60,60] = 30.
+  /** lo edges: [0,20] [10,30] [20,30] [60,60] -> [0,30] + [60,60] = 30.
      hi edges: [0,30] [10,50] [20,50] [60,70] -> [0,50] + [60,70] = 60.
      The sum of the hi intervals would be 30+40+30+10 = 110: the union is
      what "engine busy" means. */
@@ -121,7 +121,7 @@ int main(void) {
     words[HEXKL_DMA_TRACE_HDR_WORDS + 4u * HEXKL_DMA_TRACE_PUSH_WORDS + 4u], 1);
   EXPECT_EQ("ser.too_small", hexkl_dma_trace_serialize(words, n - 1u), 0);
 
-  /* A push past the table is counted, never written, and the busy
+  /** A push past the table is counted, never written, and the busy
      numbers are refused. */
   hexkl_dma_trace_reset(0);
   for (uint32_t k = 0; k < HEXKL_DMA_TRACE_MAX_PUSH + 3u; ++k) {
@@ -134,7 +134,7 @@ int main(void) {
   EXPECT_EQ("overflow.busy_hi", s.busy_hi, 0);
   EXPECT_EQ("overflow.last_issue", s.last_issue, 0);
 
-  /* Past the ring size a record's slot is reused, so its done bit is no
+  /** Past the ring size a record's slot is reused, so its done bit is no
      longer its own: the watermark takes the ring's reclaim (push2d waits
      for the oldest before reusing) as completion. 300 pushes at t = k
      with every bit reading 0: record k is done at the push of k + 256. */

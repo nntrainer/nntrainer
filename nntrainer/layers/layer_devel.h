@@ -441,6 +441,16 @@ public:
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
               TensorDim dim = weight.getDim();
+              size_t K = dim.height();
+              size_t N = dim.width();
+              // Bias-like (height 1) tensors stay as they are, as the Q4_0
+              // branch above leaves them: a layer that holds a projection
+              // and a norm gamma (residual_add's proj) keeps the gamma.
+              if (K == 1) {
+                weight.save(file);
+                continue;
+              }
+              Tensor weight_t = weight.transpose("0:2:1");
 
               // Skip quantization for bias-like tensors (1D with height == 1),
               // as the Q4_0 branch above does. The reason here is not the

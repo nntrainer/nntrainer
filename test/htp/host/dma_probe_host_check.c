@@ -97,7 +97,7 @@ static void check_shape(const char *name, uint32_t bytes, uint32_t row_size,
     }
     CHECK(mx - mn <= 1u, "%s w=%u: unbalanced %u..%u", name, workers, mn, mx);
   }
-  /* Coverage: the payload fraction of the bands used is
+  /** Coverage: the payload fraction of the bands used is
      cols*row_size/src_stride; every whole band must have been used. */
   {
     const uint64_t band = (uint64_t)nrows * src_stride;

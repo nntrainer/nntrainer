@@ -1153,7 +1153,7 @@ TEST_F(HvxAttnM1, PerLayerCost) {
       ASSERT_EQ(err, AEE_SUCCESS)
         << "kv_append layer " << layer << ": " << hex(err);
     }
-    /* One round of 6 to put every layer's slab behind the other five, then
+    /** One round of 6 to put every layer's slab behind the other five, then
        10 timed calls, each on the least recently used layer. */
     std::vector<double> us;
     std::vector<std::vector<uint32_t>> calls;
@@ -1400,7 +1400,7 @@ TEST_F(HvxAttnM1Probe, Semantics) {
             << std::endl;
   EXPECT_EQ(bad_div, 0);
 
-  /* A length that is not a multiple of 64 is refused: the entry answers
+  /** A length that is not a multiple of 64 is refused: the entry answers
      AEE_EINVALIDFORMAT, but on silicon the FastRPC layer answers AEE_ERPC
      (0x80000600) before the entry runs (LEDGER rule 38, S1 2026-09-29).
      Either is a refusal; AEE_EBADPARM would be a stale skel. */

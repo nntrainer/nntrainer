@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/**
  * @file   swap_host_check.c
  * @brief  weight_swap_u8i4_arena (doc 52 section 10.12) on the host: the
  *         real entry point in nntr_hvx_mm_u8i4.c over the real weight
@@ -19,7 +23,7 @@
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
-/* Referenced by nntr_hvx_mm_u8i4.c's other entry points, none of which
+/** Referenced by nntr_hvx_mm_u8i4.c's other entry points, none of which
    this check calls. Declared without their headers on purpose: C links
    them by name, and reaching one is a bug in the check. */
 #define NOT_HERE(fn)                                                           \
@@ -31,7 +35,7 @@ NOT_HERE(hexkl_conv_block_run)
 NOT_HERE(hexkl_mm_u8i4_bake_weights)
 NOT_HERE(hexkl_mm_u8i4_plan)
 NOT_HERE(hexkl_mm_u8i4_run)
-/* These two are declared by headers the session struct pulls in, so they
+/** These two are declared by headers the session struct pulls in, so they
    get their real signatures. */
 int hexkl_mm_u8i4_moe_layer_run(
   hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -43,7 +47,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   fprintf(stderr, "swap_host_check: hexkl_mm_u8i4_moe_layer_run called\n");
   abort();
 }
-/* The skel asks these two before a release or a detach; this check has no
+/** The skel asks these two before a release or a detach; this check has no
    decode graph and no Q4M1 slot, so nothing is ever bound or borrowed. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
   (void)g;
@@ -128,7 +132,7 @@ int main(void) {
   for (int i = 0; i < NGU; ++i)
     CHECK(wg->bias[i] == 0.0f);
 
-  /* 2. The swap proper: new pair in, old pair out, in one call. Same shape,
+  /** 2. The swap proper: new pair in, old pair out, in one call. Same shape,
         so (doc 52 section 10.25) the handles are rebound in place: same
         numbers, same arrays, new bytes and scales, bias still zero. */
   const float *arr_g = g_s.weights_u8i4.slots[g].w_scale;
@@ -157,7 +161,7 @@ int main(void) {
   CHECK(live() == 2 && x == 1234 && y == 1234);
   CHECK(g_s.weights_u8i4.slots[g2].in_use && g_s.weights_u8i4.slots[d2].in_use);
 
-  /* 4. gate_up fits, down does not (past the arena): refused before
+  /** 4. gate_up fits, down does not (past the arena): refused before
         either handle is rebound, so the old pair is live and unchanged. */
   CHECK(swap(g2, d2, 0, ARENA - 512, &x, &y) != AEE_SUCCESS);
   CHECK(live() == 2);
@@ -170,21 +174,22 @@ int main(void) {
   CHECK(live() == 2);
   CHECK(g_s.weights_u8i4.slots[g2].wh_bytes == va + 8192);
 
-  /* 5b. A retired pair of another shape falls back to register + release:
+  /** 5b. A retired pair of another shape falls back to register + release:
          new handles, the old ones freed. */
   {
     enum { I2 = 64, NGU2 = 2 * I2 };
     static float s2[NGU2];
     static int32_t c2[NGU2];
     uint32_t og = NONE, od = NONE, ng = NONE, nd = NONE;
-    CHECK(nntr_hvx_weight_swap_u8i4_arena(
-            (remote_handle64)(uintptr_t)&g_s, NONE, NONE, K, I2, NOUT, 0, 0,
-            8192, s2, NGU2, c2, NGU2, dn_s, NOUT, dn_c, NOUT, &og,
-            &od) == AEE_SUCCESS);
+    CHECK(nntr_hvx_weight_swap_u8i4_arena((remote_handle64)(uintptr_t)&g_s,
+                                          NONE, NONE, K, I2, NOUT, 0, 0, 8192,
+                                          s2, NGU2, c2, NGU2, dn_s, NOUT, dn_c,
+                                          NOUT, &og, &od) == AEE_SUCCESS);
     CHECK(live() == 4);
     CHECK(swap(og, od, 0, 4096, &ng, &nd) == AEE_SUCCESS);
     CHECK(live() == 4);
-    CHECK(g_s.weights_u8i4.slots[ng].K == K && g_s.weights_u8i4.slots[ng].N == NGU);
+    CHECK(g_s.weights_u8i4.slots[ng].K == K &&
+          g_s.weights_u8i4.slots[ng].N == NGU);
     CHECK(g_s.weights_u8i4.slots[ng].wh_bytes == va);
     /* back to two: release the fallback's pair */
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, ng);
@@ -192,7 +197,7 @@ int main(void) {
     CHECK(live() == 2);
   }
 
-  /* 6. The batch (doc 52 section 10.23): expert 0 swaps out the live pair
+  /** 6. The batch (doc 52 section 10.23): expert 0 swaps out the live pair
         into 0/4096, expert 1 is a fresh pair past the arena. Expert 0 must
         land, expert 1 must not, and the call itself succeeds so the host
         hears which. */
@@ -225,7 +230,7 @@ int main(void) {
     CHECK(done == 0 && live() == 2);
   }
 
-  /* 7. [doc 52 section 10.30] Empty sequences: the scales and column sums
+  /** 7. [doc 52 section 10.30] Empty sequences: the scales and column sums
         come from the arena, right after each weight's WH bytes -- N f32
         then N i32 -- and the bias is zero. Rebind in place first, then
         the register path (a retired pair of another shape), then the
@@ -283,7 +288,7 @@ int main(void) {
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, x2);
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, y2);
     CHECK(live() == 2);
-    /* down's WH bytes fit the arena but its tail does not: refused, and
+    /** down's WH bytes fit the arena but its tail does not: refused, and
        gate_up (checked first) is untouched */
     CHECK(nntr_hvx_weight_swap_u8i4_arena(
             (remote_handle64)(uintptr_t)&g_s, g3, d3, K, INTER, NOUT, 0, 0,
@@ -310,7 +315,7 @@ int main(void) {
     }
   }
 
-  /* 8. [plan 229] QS2CX_WH through weight_swap_batch_u2i4_arena: the
+  /** 8. [plan 229] QS2CX_WH through weight_swap_batch_u2i4_arena: the
         codes are half a 4-bit weight's bytes and the tail follows them
         there; the live 4-bit pair from 7 is rebound in place to 2 bits
         (bits and palette move with the bytes), then back to 4; a fresh
@@ -376,7 +381,7 @@ int main(void) {
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, hg[0]);
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd[0]);
     CHECK(live() == 2);
-    /* the extent at two bits: down's codes + tail end exactly at the
+    /** the extent at two bits: down's codes + tail end exactly at the
        arena's end, which the 4-bit extent would have refused */
     og[0] = lg;
     od[0] = ld;

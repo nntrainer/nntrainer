@@ -27,7 +27,7 @@ int hvx_softcap_f32(float *y, uint32_t n, float cap) {
   if (!y || !(cap > 0.0f)) {
     return -1;
   }
-  /* tanh(|u|) = (1 - e) / (1 + e), e = exp(-2|u|), u = y / cap, the sign
+  /** tanh(|u|) = (1 - e) / (1 + e), e = exp(-2|u|), u = y / cap, the sign
      put back after: the exp and the reciprocal are the GLU epilogue's own
      (hvx_swiglu_det.h), e in (0, 1] keeps the reciprocal's operand in
      (1, 2]. |u| is clamped at 20, where tanh is 1 in f32 already. */
@@ -48,7 +48,7 @@ int hvx_softcap_f32(float *y, uint32_t n, float cap) {
       Q6_Vsf_vsub_VsfVsf(one, e), hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e)));
     v[i] = Q6_V_vor_VV(Q6_Vsf_vmpy_VsfVsf(t, vcap), sign);
   }
-  /* The tail is the same specification in scalar form (swiglu_det.h), not
+  /** The tail is the same specification in scalar form (swiglu_det.h), not
      tanhf: the DSP image does not provide it. */
   const float kf = -2.0f / cap;
   for (uint32_t i = nvec * LANES; i < n; ++i) {

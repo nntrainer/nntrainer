@@ -50,7 +50,7 @@ int hexkl_micro_hmx_setup_acc_read_int32(uint8_t *b, uint32_t cfg) {
   return AEE_SUCCESS;
 }
 
-/* The bake: tile (tr, tc) of a row-major int4-in-int8 matrix of N columns
+/** The bake: tile (tr, tc) of a row-major int4-in-int8 matrix of N columns
    into the 512-byte WH tile at b + off. The slot formula is
    htp_wh_layout.h's whSlot (the quantizer's, C++), restated here in C; it
    is the inverse of standin/hvx_scalar.c's wh_value, which every host
@@ -79,7 +79,7 @@ int hexkl_micro_hmx_mm_u8i8(uint8_t *b, uint32_t a, uint32_t w) {
   return AEE_EUNSUPPORTED;
 }
 
-/* The accumulator tile (64 x 32 int32, row stride 32 -- what
+/** The accumulator tile (64 x 32 int32, row stride 32 -- what
    hvx_scalar.c's acc_read writes, so hexkl_acc_tile.c's ramp probe finds
    base 0, stride 32) into output rows tile_row*64.. and columns
    tile_col*32.. of an output_rows x output_cols matrix. */

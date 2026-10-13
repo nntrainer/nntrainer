@@ -4,7 +4,7 @@
  *
  * @file   unittest_causallm_mha_core_dispatch.cpp
  * @date   30 Sep 2026
- * @brief  MHACoreLayer's dispatch of attention to ComputeOps, against a fake
+ * @brief  HtpMHACoreLayer's dispatch of attention to ComputeOps, against a fake
  * @see    https://github.com/nntrainer/nntrainer
  * @author Haehun Yang <haehun.yang@ax.samsung.com>
  * @bug    No known bugs except for NYI items
@@ -32,8 +32,8 @@
 
 #include <context_data.h>
 #include <cpu_ops_table.h>
+#include <htp_mha_core.h>
 #include <layer_context.h>
-#include <mha_core.h>
 #include <var_grad.h>
 #include <weight.h>
 
@@ -99,7 +99,7 @@ float uni(uint32_t &s, float amp) {
 }
 
 /**
- * @brief MHACoreLayer's attention, exactly: row q at position cache_from+q
+ * @brief HtpMHACoreLayer's attention, exactly: row q at position cache_from+q
  *        sees cache rows [max(0, pos+1-window), pos]; scores / sqrt(hd),
  *        then tanh(s/softcap)*softcap when softcap > 0; the sink logit
  *        joins the denominator.
@@ -288,13 +288,13 @@ struct Params {
 constexpr unsigned kMaxStep = 16;
 
 /**
- * @brief One MHACoreLayer in external-cache mode (inputs Q, K, V,
+ * @brief One HtpMHACoreLayer in external-cache mode (inputs Q, K, V,
  *        cache_key, cache_value) with its own tensors and a RunLayerContext
  *        whose ContextData carries @a ops (nullptr: the plain CPU path).
  */
 struct Rig {
   Params p;
-  causallm::MHACoreLayer layer;
+  causallm::HtpMHACoreLayer layer;
   std::vector<Weight> weights;
   std::vector<Var_Grad> ins, outs, tensors;
   std::shared_ptr<ContextData> cd;
@@ -436,7 +436,7 @@ void run_and_compare(Rig &cpu, Rig &acc, const char *what) {
 
 } // namespace
 
-TEST(MhaCoreDispatch, Fp16PathMatchesCpu) {
+TEST(HtpMhaCoreDispatch, Fp16PathMatchesCpu) {
   Params p;
   FakeOps ops;
   ops.fp16_supported = true;
@@ -450,7 +450,7 @@ TEST(MhaCoreDispatch, Fp16PathMatchesCpu) {
   EXPECT_EQ(ops.fp16_calls[0].window, 0u);
 }
 
-TEST(MhaCoreDispatch, Fp16WindowAndSoftcapMatchCpu) {
+TEST(HtpMhaCoreDispatch, Fp16WindowAndSoftcapMatchCpu) {
   Params p;
   p.window = 4;
   p.softcap = 5.0f;
@@ -464,7 +464,7 @@ TEST(MhaCoreDispatch, Fp16WindowAndSoftcapMatchCpu) {
   EXPECT_FLOAT_EQ(ops.fp16_calls.back().softcap, 5.0f);
 }
 
-TEST(MhaCoreDispatch, SinkWeightArrivesAsF32) {
+TEST(HtpMhaCoreDispatch, SinkWeightArrivesAsF32) {
   Params p;
   p.sink = true;
   FakeOps ops;
@@ -484,7 +484,7 @@ TEST(MhaCoreDispatch, SinkWeightArrivesAsF32) {
   }
 }
 
-TEST(MhaCoreDispatch, DeclinedFp16CallFallsBackToCpu) {
+TEST(HtpMhaCoreDispatch, DeclinedFp16CallFallsBackToCpu) {
   Params p;
   FakeOps ops;
   ops.fp16_supported = true;
@@ -495,7 +495,7 @@ TEST(MhaCoreDispatch, DeclinedFp16CallFallsBackToCpu) {
   EXPECT_EQ(ops.fp16_calls.size(), 3u);
 }
 
-TEST(MhaCoreDispatch, QuantizedMirrorAppendsOnlyNewRows) {
+TEST(HtpMhaCoreDispatch, QuantizedMirrorAppendsOnlyNewRows) {
   Params p;
   p.quant = "q8";
   FakeOps ops;
@@ -512,7 +512,7 @@ TEST(MhaCoreDispatch, QuantizedMirrorAppendsOnlyNewRows) {
   EXPECT_EQ(ops.q_calls[2].append_rows, 1u);
 }
 
-TEST(MhaCoreDispatch, QuantizedMirrorFollowsRewindAndRepositionedCache) {
+TEST(HtpMhaCoreDispatch, QuantizedMirrorFollowsRewindAndRepositionedCache) {
   Params p;
   p.quant = "q8";
   FakeOps ops;
@@ -556,7 +556,7 @@ TEST(MhaCoreDispatch, QuantizedMirrorFollowsRewindAndRepositionedCache) {
   }
 }
 
-TEST(MhaCoreDispatch, DeclinedQuantizedCallReleasesAndStaysOnCpu) {
+TEST(HtpMhaCoreDispatch, DeclinedQuantizedCallReleasesAndStaysOnCpu) {
   Params p;
   p.quant = "q8";
   FakeOps ops;

@@ -47,7 +47,7 @@ static void conv_gate_row(const conv_gate_ctx *c, uint32_t r) {
     const HVX_Vector k0 = ((const HVX_UVector *)(w0 + j))[0];
     const HVX_Vector k1 = ((const HVX_UVector *)(w1 + j))[0];
     const HVX_Vector k2 = ((const HVX_UVector *)(w2 + j))[0];
-    /* (w0*x0 + w1*x1) + w2*x2, then the gate: five separate operations,
+    /** (w0*x0 + w1*x1) + w2*x2, then the gate: five separate operations,
        the order the header promises. */
     HVX_Vector y = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(k0, x0),
                                       Q6_Vsf_vmpy_VsfVsf(k1, x1));

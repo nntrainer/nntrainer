@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -48,14 +49,46 @@ namespace causallm {
  */
 class KVCacheManager {
 public:
+  /** @brief Allocator for cache slabs that an accelerator reads in place
+   *         (ComputeOps::alloc_shared); nullptr means "heap for this slab". */
+  using SharedAlloc = std::function<void *(size_t bytes)>;
+  /** @brief Matching release (ComputeOps::free_shared). */
+  using SharedFree = std::function<void(void *block)>;
+
   KVCacheManager() = default;
-  ~KVCacheManager() = default;
+  ~KVCacheManager();
 
   // Non-copyable, movable
   KVCacheManager(const KVCacheManager &) = delete;
   KVCacheManager &operator=(const KVCacheManager &) = delete;
   KVCacheManager(KVCacheManager &&) = default;
-  KVCacheManager &operator=(KVCacheManager &&) = default;
+  KVCacheManager &operator=(KVCacheManager &&other) noexcept;
+
+  /**
+   * @brief Route every cache slab through an accelerator-visible allocator.
+   *
+   * Call before allocate(). Each layer's key and value slab is then one
+   * block from @a alloc, wrapped by the cache tensors without a copy, and
+   * handed back to @a release when the manager is destroyed or
+   * re-allocated. A nullptr from @a alloc puts that slab on the heap
+   * instead, so a backend with limited shared memory degrades to the
+   * per-call copy rather than failing. Views, save and load are unchanged.
+   *
+   * @param alloc   block allocator, e.g. ComputeOps::alloc_shared
+   * @param release block release, e.g. ComputeOps::free_shared
+   */
+  void setSharedAllocator(SharedAlloc alloc, SharedFree release);
+
+  /**
+   * @brief Whether at least one slab came from the shared allocator.
+   */
+  bool usesSharedMemory() const { return !shared_blocks_.empty(); }
+
+  /**
+   * @brief Whether setSharedAllocator installed an allocator (a backend
+   *        may still hand back nullptr and leave the slabs on the heap).
+   */
+  bool hasSharedAllocator() const { return static_cast<bool>(shared_alloc_); }
 
   /**
    * @brief Allocate KV cache for all layers
@@ -402,6 +435,21 @@ private:
    * (NNTR_CUDA_KV_UVM) allocator. Null on the host (CPU) path.
    */
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
+
+  /**
+   * @brief One cache slab: from the shared allocator when one is set and
+   *        it delivers, otherwise an ordinary allocation.
+   */
+  nntrainer::Tensor makeCacheTensor(const ml::train::TensorDim &dim);
+
+  /**
+   * @brief Hands every shared block back to the allocator.
+   */
+  void releaseShared();
+
+  SharedAlloc shared_alloc_;          /**< see setSharedAllocator */
+  SharedFree shared_free_;            /**< see setSharedAllocator */
+  std::vector<void *> shared_blocks_; /**< blocks owned via shared_alloc_ */
 
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */

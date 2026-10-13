@@ -36,7 +36,7 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return AEE_EBADSTATE;
   }
   {
-    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
+    /** [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
        [plan 201 S4] on the heap (2 KiB at 256 slots, init copies it) */
     hexkl_graph_q4m1_shape *q4m1 = (hexkl_graph_q4m1_shape *)malloc(
       NNTR_HVX_Q4M1_SLOTS * sizeof(hexkl_graph_q4m1_shape));
@@ -58,7 +58,7 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return rc;
   }
   if (!s->hmx_locked) {
-    /* [#178, #132 Part B E3] a lite open has no HMX: its graph may hold
+    /** [#178, #132 Part B E3] a lite open has no HMX: its graph may hold
        every kind but MOE resident */
     uint32_t i;
     for (i = 0; i < s->graph->n_ops; ++i) {
@@ -281,7 +281,7 @@ int nntr_hvx_forward_debug(remote_handle64 handle, uint32 start_op,
   }
   if (!stage_us || stage_usLen < 0 ||
       (uint32_t)stage_usLen != nntr_hvx_moe_stage_count()) {
-    /* The same stale-count symptom as moe_layer_timed, and the same
+    /** The same stale-count symptom as moe_layer_timed, and the same
        code, on purpose: the ARM side already names it. */
     FARF(ERROR, "forward_debug: stage_usLen %d, expected %u", stage_usLen,
          (unsigned)nntr_hvx_moe_stage_count());

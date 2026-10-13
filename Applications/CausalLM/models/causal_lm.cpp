@@ -80,6 +80,7 @@ void clLaunchStatDump(const char *phase);
 #include <causal_lm.h>
 #include <embedding_layer.h> // [lmhead-tie-lut] QuantLut / get_or_load_quant_lut
 #include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
+#include <htp_decode_hook.h>
 #include <llm_util.hpp>
 #if !defined(_WIN32)
 #include <sys/mman.h> // [lmhead-tie-lut] madvise the uploaded LUT mmap away
@@ -90,7 +91,7 @@ void clLaunchStatDump(const char *phase);
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_emb_gather.h> // [reload] gather LUT teardown
-#include <cuda_fc_qs4cx.h> // [lmhead-tie-lut] tied-head LUT registration
+#include <cuda_fc_qs4cx.h>   // [lmhead-tie-lut] tied-head LUT registration
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -604,6 +605,11 @@ void CausalLM::releaseLogitsBuf(float *buf) {
 std::vector<float *> CausalLM::incrementalInference(
   unsigned int batch_size, const std::vector<float *> &input,
   unsigned int init_seq_len, unsigned int from, unsigned int to) {
+#ifdef ENABLE_HEXKL
+  // Shared CPU layers may also appear in an HTP model. Only this model's
+  // inference may enter its resident DSP graph, even with other handles live.
+  nntrainer::HtpDecodeScope htp_scope(htp_execution_profile_);
+#endif
   // Same contract as NeuralNetwork::incremental_inference(float* ...), except
   // inputs whose raw pointer belongs to a KVCacheManager cache tensor are fed
   // as the REAL tensor (sharing its MemoryData, so isSVM() set by the SVM
@@ -1073,6 +1079,12 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              float repetition_penalty,
                                              unsigned int *input_ids,
                                              unsigned int NUM_INPUT_IDS) {
+  if (htp_execution_profile_ && !do_sample && BATCH_SIZE == 1 &&
+      repetition_penalty == 1 && logits_processor == nullptr) {
+    unsigned int id = 0;
+    if (htpDecodeTokenId(&id))
+      return {id};
+  }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
@@ -2109,6 +2121,21 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
       : generation_begin;
 
+  struct HtpDecodeReset {
+    bool active;
+    ~HtpDecodeReset() {
+      if (active) {
+        htpDecodeWantLogits(true);
+        htpDecodeBan(nullptr, 0);
+      }
+    }
+  } htp_reset{htp_execution_profile_};
+  if (htp_execution_profile_) {
+    htpDecodeWantLogits(do_sample || BATCH_SIZE != 1 ||
+                        logits_processor != nullptr ||
+                        REPETITION_PENALTY != 1.0f);
+    htpDecodeBan(BAD_WORD_IDS.data(), NUM_BADWORDS);
+  }
   for (unsigned int token_generation_idx = generation_begin;
        token_generation_idx < generation_end &&
        !stop_requested_.load(std::memory_order_acquire);
@@ -2285,6 +2312,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               << " gen_tok=" << generation_cnt
               << " e2e_ms=" << total_duration.count() << "\n";
     std::cout.flush();
+  }
+
+  if (htp_execution_profile_) {
+    if (const char *path = std::getenv("NNTR_HTP_TOKEN_TRACE")) {
+      json trace;
+      trace["input_ids"] = init_input;
+      const bool prefill_emitted = !SKIP_PREFILL && init_len < INIT_SEQ_LEN;
+      const size_t begin = input_len + (prefill_emitted ? 0u : 1u);
+      const size_t count = generation_cnt + (prefill_emitted ? 1u : 0u);
+      trace["output_ids"] = std::vector<unsigned int>(
+        ids_history + begin, ids_history + begin + count);
+      std::ofstream file(path);
+      if (!file)
+        throw std::runtime_error("Cannot open NNTR_HTP_TOKEN_TRACE");
+      file << trace.dump(2) << '\n';
+    }
   }
 
   has_run_ = true;

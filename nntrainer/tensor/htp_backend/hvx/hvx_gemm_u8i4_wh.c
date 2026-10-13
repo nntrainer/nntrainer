@@ -35,7 +35,7 @@
 void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
                                uint32_t n_tiles, uint32_t k_tiles) {
 #if defined(__hexagon__)
-  /* Rtt: [47:32] stride, [31:16] width, [15:0] height -- 16 bits each. The
+  /** Rtt: [47:32] stride, [31:16] width, [15:0] height -- 16 bits each. The
      callers' strides are 112*512 and 64*512; the width is n_tiles*512, so
      n_tiles must stay below 128 (128*512 = 65536 wraps the field to 0).
      The MoE caller clamps its lead to 127 units for exactly that
@@ -157,7 +157,7 @@ static inline void gemm_rows4(const uint8_t *act_ah, uint32_t r0, uint32_t rows,
   const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
   HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero(),
              acc3 = Q6_V_vzero();
-  /* Rows past the count read row r0's bytes and are never stored: the
+  /** Rows past the count read row r0's bytes and are never stored: the
      block's AH tile has 64 rows, so the reads are in range. */
   const uint32_t r1 = (rows > 1u) ? r0 + 1u : r0;
   const uint32_t r2 = (rows > 2u) ? r0 + 2u : r0;
@@ -238,7 +238,7 @@ static inline void gemm_i2_row1(const uint8_t *act_ah, uint32_t r0,
                                 uint32_t stride, const HVX_Vector tab,
                                 int32_t *out) {
   const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
-  /* The code split takes the low nibble of every byte: a vlut32 index is
+  /** The code split takes the low nibble of every byte: a vlut32 index is
      0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
   const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
   HVX_Vector acc = Q6_V_vzero();
@@ -272,7 +272,7 @@ static inline void gemm_i2_row1_cols2(const uint8_t *act_ah, uint32_t k_tiles,
                                       uint32_t stride, const HVX_Vector tab,
                                       int32_t *out0, int32_t *out1) {
   const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
-  /* The code split takes the low nibble of every byte: a vlut32 index is
+  /** The code split takes the low nibble of every byte: a vlut32 index is
      0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
   const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
   HVX_Vector acc0 = Q6_V_vzero();
@@ -317,7 +317,7 @@ static inline void gemm_i2_rows4(const uint8_t *act_ah, uint32_t r0,
                                  const uint8_t *col, uint32_t stride,
                                  const HVX_Vector tab, int32_t *out) {
   const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
-  /* The code split takes the low nibble of every byte: a vlut32 index is
+  /** The code split takes the low nibble of every byte: a vlut32 index is
      0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
   const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
   HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero(),

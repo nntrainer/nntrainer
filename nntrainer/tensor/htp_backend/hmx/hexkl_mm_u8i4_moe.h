@@ -45,16 +45,16 @@
  * 6 of a real run; this is that check, moved to before the work starts.
  */
 typedef struct {
-  uint32_t act_off;     /**< one 64-row activation block, AH tiles */
-  uint32_t w_gu_off;    /**< buffer A: gate_up's WH bytes */
-  uint32_t w_dn_off;    /**< buffer B: down's WH bytes */
-  uint32_t gate_off;    /**< [64 x inter] f32: silu(gate)*up, written by
-                             the fused gate_up epilogue */
-  uint32_t mid_off;     /**< requantized SwiGLU output, AH tiles */
-  uint32_t result_off;  /**< TWO staging buffers of acc_tiles accumulator
-                             tiles each, back to back: the HMX issues a
-                             batch into one while the pool dequantizes the
-                             other */
+  uint32_t act_off;    /**< one 64-row activation block, AH tiles */
+  uint32_t w_gu_off;   /**< buffer A: gate_up's WH bytes */
+  uint32_t w_dn_off;   /**< buffer B: down's WH bytes */
+  uint32_t gate_off;   /**< [64 x inter] f32: silu(gate)*up, written by
+                            the fused gate_up epilogue */
+  uint32_t mid_off;    /**< requantized SwiGLU output, AH tiles */
+  uint32_t result_off; /**< TWO staging buffers of acc_tiles accumulator
+                            tiles each, back to back: the HMX issues a
+                            batch into one while the pool dequantizes the
+                            other */
   /** Accumulator tiles per staging buffer, given the arena. Even, at least
       2 (one gate/up pair); gate_up's n-tile count is the useful ceiling. */
   uint32_t acc_tiles;
@@ -63,7 +63,7 @@ typedef struct {
                               the pool's background lane and may trail the
                               HMX by up to dn_ring batches */
   uint32_t dn_ring;      /**< 1 .. MOE_DN_RING */
-  uint32_t total;       /**< bytes needed; compared against the arena */
+  uint32_t total;        /**< bytes needed; compared against the arena */
 } hexkl_moe_layout;
 
 /**
@@ -94,7 +94,7 @@ typedef struct {
   void *raw;     /**< what malloc returned, for free() */
   uint8_t *base; /**< raw rounded up to 128 bytes */
   size_t cap;    /**< usable bytes from base */
-  /* Per call, set by the owner before hexkl_mm_u8i4_moe_layer_run and
+  /** Per call, set by the owner before hexkl_mm_u8i4_moe_layer_run and
      cleared after it; zero is the call without them. */
   const float *pre_gamma; /**< K floats: act_f32 is RMS-normed (whole row,
                                this gamma, pre_eps) on its way in -- inside
@@ -109,7 +109,7 @@ typedef struct {
 /** @brief Releases the block. Safe on an empty scratch. */
 void hexkl_moe_scratch_free(hexkl_moe_scratch *s);
 
-/* ---- Shared with hexkl_conv_block.c ------------------------------------
+/** ---- Shared with hexkl_conv_block.c ------------------------------------
  *
  * The conv block kernel (doc 51 section 2) is this kernel's loop with a
  * different block body: same scratch, same DMA ring pushes, same
@@ -218,7 +218,7 @@ void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx);
         (hexkl_probe_now() - mm_t0) -                                          \
         (hexkl_probe_us[HEXKL_PROBE_ACC_READ] - mm_acc0) -                     \
         (hexkl_probe_us[HEXKL_PROBE_DEQUANT] - mm_dq0);                        \
-      /* One #87 completion sample per HMX batch: the bracket on every         \
+      /** One #87 completion sample per HMX batch: the bracket on every        \
          descriptor is only as tight as the points that read its bit. */       \
       hexkl_dma_trace_sample(hexkl_probe_now_ticks());                         \
     }                                                                          \

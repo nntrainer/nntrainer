@@ -129,7 +129,7 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
     return AEE_EBADPARM;
   }
 
-  /* Workers get equal slices of the VTCM below the HMX config block;
+  /** Workers get equal slices of the VTCM below the HMX config block;
      nothing else of the session lives there between calls. Round-robin
      over the plan's workers, not the pool's, so a request for more
      threads than the pool has simply leaves some slices unused -- the
@@ -157,7 +157,7 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
       max_desc_bytes = b;
     }
   }
-  /* Zero what the checksum reads, so a stale slice from the previous cell
+  /** Zero what the checksum reads, so a stale slice from the previous cell
      cannot pass for a live transfer. */
   const uint32_t sum_bytes =
     max_desc_bytes < c.vtcm_per_worker ? max_desc_bytes : c.vtcm_per_worker;
@@ -171,7 +171,7 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
   for (uint32_t i = 0; i < sum_bytes; i += 64u) {
     sum += c.vtcm[i];
   }
-  /* Only descriptors whose worker actually ran moved bytes: the pool caps
+  /** Only descriptors whose worker actually ran moved bytes: the pool caps
      n_threads at its worker count + 1, and a request above that leaves
      the higher-numbered slices idle. Counting them would inflate GB/s. */
   uint32_t n_moved = 0;
@@ -195,7 +195,7 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
   return AEE_SUCCESS;
 }
 
-/* ======================================================================
+/** ======================================================================
  * [#87] dma_replay: the M=1 MoE chunk schedule with no compute between
  * ====================================================================== */
 
@@ -324,7 +324,7 @@ static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
            wait_ticks = 0u, n_blocked = 0u, r0 = 0u;
   for (uint32_t k = 0; k < c->n_items; ++k) {
     const replay_item *it = &g_items[k];
-    /* By the threads the pool actually gave, not the count asked for: a
+    /** By the threads the pool actually gave, not the count asked for: a
        capped pool must still issue everything. */
     if (it->op == NNTR_MOE_DMA_OP_PUSH) {
       const uint32_t rows = replay_rows(it, g_item_ord[k], i, n_threads, &r0);
@@ -382,7 +382,7 @@ static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
       wait_ticks += (uint32_t)(HAP_perf_get_qtimer_count() - t_in);
     }
   }
-  /* Nothing may still be moving into VTCM when the next call rewrites
+  /** Nothing may still be moving into VTCM when the next call rewrites
      the descriptors. */
   if (prev != NULL) {
     long guard = 0;
@@ -434,7 +434,7 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   memset(&c, 0, sizeof(c));
   c.arena = s->arenas[arena].va;
   c.region_bytes = region_bytes;
-  /* One region-sized slot past the rotation serves the activation and
+  /** One region-sized slot past the rotation serves the activation and
      copy pieces. */
   const uint32_t slots = s->arenas[arena].bytes / region_bytes;
   if (slots < 2u) {
@@ -450,7 +450,7 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   c.workers = workers;
   c.pace = pace;
   c.fresh = fresh;
-  /* [#178] a lite session may have less VTCM than the load's 1 MiB (or
+  /** [#178] a lite session may have less VTCM than the load's 1 MiB (or
      none): config_off - 1 MiB would wrap and pass every bound below */
   if (load == 2u && s->config_off < REPLAY_LOAD_VTCM_BYTES) {
     return AEE_EINVALIDFORMAT;
@@ -549,7 +549,7 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
      late, from a live one. */
   memset(c.vtcm + t_lo, 0, t_hi - t_lo);
 
-  /* The optional load: the pool's workers claim units while the caller
+  /** The optional load: the pool's workers claim units while the caller
      runs the replay; the stop flag turns the rest of the units into
      no-ops so wait_bg returns promptly. Heap only for the DDR variant,
      freed before return. */

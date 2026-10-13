@@ -46,7 +46,7 @@
 
 #include "htp_wh_layout.h"
 
-/* whCodeByte2/whCodeShift2: the code order, owned by the kernel that has
+/** whCodeByte2/whCodeShift2: the code order, owned by the kernel that has
    to read it back. One definition for the packer and the expansion. */
 extern "C" {
 #include "htp_backend/hvx/hvx_expand_i2i4.h"
@@ -90,7 +90,7 @@ namespace detail {
  */
 inline void whPaletteFitHist(const uint64_t hist[WH_PALETTE_CODES],
                              int8_t out[WH_PALETTE_LEVELS]) {
-  /* seg_cost[i][j]: best error representing codes i..j by one code, and the
+  /** seg_cost[i][j]: best error representing codes i..j by one code, and the
      code that does it. */
   double seg_cost[WH_PALETTE_CODES][WH_PALETTE_CODES];
   int seg_rep[WH_PALETTE_CODES][WH_PALETTE_CODES];
@@ -132,7 +132,7 @@ inline void whPaletteFitHist(const uint64_t hist[WH_PALETTE_CODES],
           best_i = i;
         }
       }
-      /* j < m: fewer codes than segments left. Reuse the m-1 answer; the
+      /** j < m: fewer codes than segments left. Reuse the m-1 answer; the
          spare levels land on duplicates, which the nearest-level apply
          below handles without caring. */
       dp[m][j] = (j >= m) ? best : dp[m - 1][j];
@@ -145,7 +145,7 @@ inline void whPaletteFitHist(const uint64_t hist[WH_PALETTE_CODES],
     const uint32_t i = cut[m][j];
     out[m] = (int8_t)((int)seg_rep[i][j] - 8);
     if (i == 0u) {
-      /* Segments left over on an under-populated histogram: pad with the
+      /** Segments left over on an under-populated histogram: pad with the
          same code so the palette always has four entries. */
       for (int mm = m - 1; mm >= 0; --mm) {
         out[mm] = out[m];
@@ -220,7 +220,7 @@ inline void whPaletteQuantize(int8_t *rm, uint32_t K, uint32_t N,
   }
 }
 
-/* ---------------------------------------------------------------------- *
+/** ---------------------------------------------------------------------- *
  * The 2-bit storage format itself
  * ---------------------------------------------------------------------- */
 

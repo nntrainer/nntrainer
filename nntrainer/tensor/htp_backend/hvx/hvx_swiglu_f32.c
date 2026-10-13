@@ -58,7 +58,7 @@ static void hvx_swiglu_row_f32(float *gate, const float *up, uint32_t n_out) {
     const HVX_Vector u = ((const HVX_UVector *)(up + j))[0];
     ((HVX_UVector *)(gate + j))[0] = hvx_swiglu_det_sf(g, u);
   }
-  /* The tail is the same specification in scalar form -- the shared header,
+  /** The tail is the same specification in scalar form -- the shared header,
      not expf. A tail computed by a different approximation would reintroduce
      exactly the divergence this path exists to remove, on whatever columns
      happen to fall in it. (This model's n_out is 1792 = 56*32, so the tail

@@ -157,7 +157,7 @@ int nntr_hvx_q4m1_register(remote_handle64 handle, uint32 K, uint32 N,
       }
       memcpy(p, w, (size_t)wLen);
 #if defined(__hexagon__)
-      /* the DMA feed reads around the DSP L2 (src_bypass): DDR must hold
+      /** the DMA feed reads around the DSP L2 (src_bypass): DDR must hold
          what this memcpy wrote (the in-process host build has no cache) */
       qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)wLen,
                            QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
@@ -189,7 +189,7 @@ int nntr_hvx_q4m1_attach(remote_handle64 handle, uint32 arena, uint32 off,
   }
   for (uint32_t i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
     if (s->q4m1[i].w == NULL) {
-      /* no copy and no cache maintenance: the ARM wrote the uncached
+      /** no copy and no cache maintenance: the ARM wrote the uncached
          arena before this call and the DSP never writes it, so no line
          of it is dirty here when the feed's DMA reads DDR around the L2 */
       s->q4m1[i].w = s->arenas[arena].va + off;
@@ -344,7 +344,7 @@ int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
   c.feed_vtcm = feed != 0u;
   c.dst_bypass = feed == FC_Q4_FEED_VTCM;
   if (feed == FC_Q4_FEED_VTCM) {
-    /* two groups per lane below the HMX config block; nothing of the
+    /** two groups per lane below the HMX config block; nothing of the
        session lives there between calls */
     c.vtcm = s->vtcm_base;
     c.vtcm_per_lane = (s->config_off / lanes) & ~127u;
@@ -433,7 +433,7 @@ int nntr_hvx_lm_head_q4m1_f32(remote_handle64 handle, float eps,
          (unsigned)n_total, yLen);
     return AEE_EINVALIDFORMAT;
   }
-  /* the output norm, the activation quantized once (the CPU's Q4_0 FC
+  /** the output norm, the activation quantized once (the CPU's Q4_0 FC
      order, as the graph's LM_HEAD op), each slice's GEMV into its rows,
      then the softcap over the whole row */
   const float *in = x;
@@ -540,7 +540,7 @@ int nntr_hvx_swiglu_cpu_f32(remote_handle64 handle, const float *y, int yLen,
   if (yLen <= 0 || zLen != yLen || outLen != yLen) {
     return AEE_EINVALIDFORMAT;
   }
-  /* [#132 E5f] the graph's kernel, so G1 (SmallOpsMatchSpec) holds it and
+  /** [#132 E5f] the graph's kernel, so G1 (SmallOpsMatchSpec) holds it and
      its scalar divide against the host's spec */
   hvx_swiglu_cpu_f32(y, z, out, (uint32_t)yLen, s->quant_pool);
   return AEE_SUCCESS;

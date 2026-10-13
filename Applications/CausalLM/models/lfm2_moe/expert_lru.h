@@ -49,6 +49,18 @@ class ExpertLru {
 public:
   using Key = const void *;
 
+  /** Forget an unloaded model after its readers and DSP slots are released. */
+  void reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    capacity_ = held_ = 0;
+    clock_ = 0;
+    pos_.clear();
+    order_.clear();
+    score_.clear();
+    layers_.clear();
+    lrfu_ = lrfuTokens();
+  }
+
   /** @brief Registers one layer's share of the pool. Idempotent per layer,
    *  so a layer finalized twice does not double its share. */
   void addLayer(const void *layer, size_t per_layer) {

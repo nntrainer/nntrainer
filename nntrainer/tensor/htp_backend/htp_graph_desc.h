@@ -536,7 +536,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->out_slot == op->in_slot)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
-    /* ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
+    /** ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
        projection's K: LFM2's 32 x 64 happens to be its hidden, Gemma 4's
        16 x 256 and 16 x 512 are not (plan 201 S4) */
     case HTP_OP_ROUTER_TOPK:
@@ -605,7 +605,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
             ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) &&
              (op->head_dim % 64u != 0u || op->head_dim > 512u)))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
-        /* [plan 201 S4] the kernel's scale is one hf multiply: eps_bits an
+        /** [plan 201 S4] the kernel's scale is one hf multiply: eps_bits an
            fp16 normal (sign clear, 13 low mantissa bits clear, 2^-14 ..
            65504), or 0 only where 1/sqrt(head_dim) is one (64, 256) */
         if (k == HTP_OP_ATTN_M1 &&
@@ -631,7 +631,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     if (k == HTP_OP_QK_NORM &&
         (op->feed & ~(HTP_GRAPH_QKNORM_V | HTP_GRAPH_QKNORM_K_EQ_V)) != 0u)
       return HTP_GRAPH_E_INVALIDFORMAT;
-    /* [plan 201 S4] ADD's multiplier: a normal f32 of either sign; the
+    /** [plan 201 S4] ADD's multiplier: a normal f32 of either sign; the
        soft-cap: a positive normal one (0: none) */
     if ((k == HTP_OP_ADD || k == HTP_OP_LM_HEAD) && op->eps_bits != 0u) {
       const uint32_t exp = op->eps_bits & 0x7F800000u;
@@ -801,7 +801,7 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
   htp_graph_lfm2_emit(w, &n, HTP_OP_LM_HEAD, s->n_layers, h, s->vocab, 1, 2,
                       resident_mask);
   w[3] = n;
-  /* next_mm: walk backwards, each op points at the nearest weight
+  /** next_mm: walk backwards, each op points at the nearest weight
      streamer after it. */
   last_mm = HTP_GRAPH_NO_OP;
   for (i = n; i-- > 0u;) {

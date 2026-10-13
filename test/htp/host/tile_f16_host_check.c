@@ -46,7 +46,7 @@ int main(void) {
   int bad = 0, cases = 0;
   for (size_t h = 0; h < sizeof(hds) / sizeof(hds[0]); ++h) {
     const uint32_t hd = hds[h];
-    /* 33 rows: the builder reads a whole vector per row, 64 bytes past the
+    /** 33 rows: the builder reads a whole vector per row, 64 bytes past the
        32 fp16 it uses, like the V builder; the extra row keeps that read
        inside the buffer, as the landing buffers' following region does. */
     const size_t n = (size_t)33u * hd;

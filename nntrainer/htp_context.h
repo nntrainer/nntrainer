@@ -44,6 +44,10 @@ public:
 
   std::string getName() override { return "htp"; }
 
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::HTP;
+  }
+
   std::unique_ptr<nntrainer::Layer>
   createLayerObject(const std::string &type,
                     const std::vector<std::string> &properties = {}) override;

@@ -66,7 +66,7 @@ int nntr_hvx_token_driver_start(remote_handle64 handle, int32 mbox_fd,
     FARF(ERROR, "token_driver_start: a driver is already running");
     return AEE_EBADSTATE;
   }
-  /* [#211] role 1 (the two-PD path's S1) is gone: an older lib asking for
+  /** [#211] role 1 (the two-PD path's S1) is gone: an older lib asking for
      it fails here, not with a silent timeout */
   if (role != 0u || mbox_bytes < HEXKL_MBOX_BYTES) {
     FARF(ERROR, "token_driver_start: role %u, page %u B (want >= %u)",

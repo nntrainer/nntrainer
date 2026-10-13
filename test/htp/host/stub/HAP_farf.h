@@ -1,3 +1,7 @@
+/**
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
 /* SPDX-License-Identifier: Apache-2.0 */
 /**
  * @file   HAP_farf.h

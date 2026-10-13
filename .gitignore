@@ -33,6 +33,7 @@ Applications/CausalLM/res/xlm_roberta/*
 !Applications/CausalLM/res/gemma4/
 Applications/CausalLM/res/gemma4/*
 !Applications/CausalLM/res/gemma4/weight_converter.py
+!Applications/CausalLM/res/gemma4/htp_weight_converter.py
 !Applications/CausalLM/res/gemma4/nntr_config.json
 !Applications/CausalLM/res/gemma4/test/
 Applications/CausalLM/res/gemma4/test/*

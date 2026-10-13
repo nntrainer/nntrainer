@@ -98,7 +98,7 @@
 /** @brief fp16 bits of -65504, the mask fill for the max. */
 #define HF_NEG_MAX 0xFBFF
 
-/* exp16 by the checked table (plan 170 round 3 section 3.1), the same bits
+/** exp16 by the checked table (plan 170 round 3 section 3.1), the same bits
    as hvx_hf_exp16. S4 (cold pos 1023, 6 lanes, lane-summed): the table's
    scalar gather read 387-389 k pcycles where hvx_hf_exp16 read 272 k (the
    v79 ISS: 124 k and 271 k -- it prices the compute, not six threads'
@@ -732,7 +732,7 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   const uint32_t hd = ctx->head_dim;
   const size_t base = (size_t)layer * ctx->n_kv * hd;
   if (k_rows) {
-    /* K's scales as kv_append makes them (the amax pass reads K for both
+    /** K's scales as kv_append makes them (the amax pass reads K for both
        halves; sv is overwritten below) */
     q8_set_scales(ctx, layer, n_rows, k_rows, k_rows, HVX_ATTN_M1_Q8_MARGIN);
   }
@@ -774,7 +774,7 @@ typedef struct {
  *         has 6 HVX contexts, the host check 8); widen the array then. */
 #define PROF_SLOTS 16u
 
-/* The l2fetch leads (plan 170 round 2 sections 3.1-3.3). A lead is a hint
+/** The l2fetch leads (plan 170 round 2 sections 3.1-3.3). A lead is a hint
    with no effect on any value; each is compiled out with -D<name>=0 if its
    probe cell reads slower than no lead (LEDGER rule 31). A lane keeps at
    most three boxes queued (the hardware stalls the thread on a fourth).
@@ -907,7 +907,7 @@ static void p1_unit(const forward_job *job, uint32_t u) {
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
     const HVX_Vector *qrows = (const HVX_Vector *)ctx->qs + (size_t)hq * nch;
-    /* acc[l] sees only d = 8 k + l, so the eight chains run as two passes
+    /** acc[l] sees only d = 8 k + l, so the eight chains run as two passes
        of four (the same operations per chain; eight chains at once spill
        on hexagon-clang 19). q[d], q[d + 1] are one vlut16 of the caller's
        zipped row with index bytes (d, d + 1), q[d + 2], q[d + 3] one more
@@ -974,7 +974,7 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   }
   const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
 #if ATTN_M1_EXP_TAB
-  /* The unit's index vectors are stored first and gathered in one scalar
+  /** The unit's index vectors are stored first and gathered in one scalar
      loop, then reloaded: the HVX-store -> scalar-load hazard is paid once
      per unit, not per head (the v79 ISS: 225 vs 325 pcycles per vector). */
   union {
@@ -1088,7 +1088,7 @@ pv_walk(const forward_job *job, const HVX_Vector *vr,
       b[g] = p[g] + q0;
     }
     const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
-    /* No software pipelining: with eight chains hexagon-clang 19's
+    /** No software pipelining: with eight chains hexagon-clang 19's
        pipeliner carries a product across the back edge as sf and back
        (vadd(sf, 0)), the sequence S1 never measured on silicon; with it
        off no pv_walk_* position loop has an .sf operand (objdump). */
@@ -1115,7 +1115,7 @@ pv_walk(const forward_job *job, const HVX_Vector *vr,
   }
 }
 
-/* One function per (ng, cg), each walk's chains in their own register
+/** One function per (ng, cg), each walk's chains in their own register
    allocation: inlined together into run_p3, hexagon-clang 19 spilled the
    eight-chain loops' accumulators to the stack (bit-safe, but which loop
    moved with unrelated edits). */
@@ -1160,7 +1160,7 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
-  /* [#261] Every chain of a walk takes the V row's vectors of its cg
+  /** [#261] Every chain of a walk takes the V row's vectors of its cg
      chunks from one load of the row, so a V row of nch chunks is walked
      nch / cg times instead of nch (the 261 sitting: PV at 64-71 lane
      pcycles per FMA on silicon, 11.4 on the ISS). Gemma 4's sliding shape
@@ -1472,7 +1472,7 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
-  /* [#282 E] the PV single walk (760bcaf30) for the int8 cache: two q
+  /** [#282 E] the PV single walk (760bcaf30) for the int8 cache: two q
      heads x a 256-wide row (Gemma's sliding layers) are 8 chains, one walk
      over the V rows instead of two */
   if (ng == 2u && nv == 2u) {
@@ -1543,7 +1543,7 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
   }
 }
 
-/* ==== [#4416 F] the integer forward (HVX_ATTN_M1_FAST) ===================
+/** ==== [#4416 F] the integer forward (HVX_ATTN_M1_FAST) ===================
  *
  * Not the spec. The int8 cache's bytes and layouts are the q8 path's; the
  * arithmetic over them is integer where the q8 path unpacked to fp16 and
@@ -1943,7 +1943,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   if (!ctx) {
     return AEE_EBADSTATE;
   }
-  /* scale must be an fp16 value: the spec's rne16(t * scale) is then the
+  /** scale must be an fp16 value: the spec's rne16(t * scale) is then the
      one hf multiply (the model's is 0.125). */
   if (layer >= ctx->n_layers || pos >= ctx->max_seq || !q || !k || !v || !out ||
       !(attn_m1_det_rne16(scale) == scale) ||
@@ -1958,7 +1958,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   }
   prof_slot slots[PROF_SLOTS];
   uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;
-  /* Steps 0-1, as vectors (hvx_hf_round_row is hvx_hf_bits_rne per lane):
+  /** Steps 0-1, as vectors (hvx_hf_round_row is hvx_hf_bits_rne per lane):
      v into its row; k kept for P1, which writes the column into the tile
      it reads anyway; q as one zipped row per head, which P1 splats by
      vlut16. */
@@ -1968,7 +1968,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   forward_job job;
   if (ctx->q8) { /* [#282 D] */
     if (!ctx->scaled[layer]) {
-      /* ponytail: no prefill seed (a one-token prompt) -- the scales come
+      /** ponytail: no prefill seed (a one-token prompt) -- the scales come
          from this row with 4x headroom; a seed is the normal case */
       q8_set_scales(ctx, layer, 1u, k, v, 4.0f);
     }
@@ -1977,7 +1977,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
         ctx, layer, h, pos, k + (size_t)h * hd, v + (size_t)h * hd);
     }
     for (uint32_t hq = 0; ctx->fast && hq < n_q; ++hq) { /* [#4416 F] */
-      /* q x sk as vectors; the amax is the int max of the sign-cleared
+      /** q x sk as vectors; the amax is the int max of the sign-cleared
          bits (run_amax); rne (hvx_sf_to_w_rne, |x| <= FAST_QMAX) and a
          saturating pack to int16 */
       const HVX_UVector *s =
@@ -2053,7 +2053,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.units = ctx->n_kv * job.ntt;
   hvx_worker_pool_run(ctx->pool, run_p1, &job, job.units);
 
-  /* m per q head: the hf max over its tiles, the last masked, then the
+  /** m per q head: the hf max over its tiles, the last masked, then the
      others ascending ([plan 201 S4] from the window's tile, its lanes
      before the window masked); + 0. */
   uint64_t ts = prof ? HAP_perf_get_pcycles() : 0u;
@@ -2103,7 +2103,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
 
   hvx_worker_pool_run(ctx->pool, run_p2, &job, job.units);
 
-  /* l: the sequential fp16 sum of every q head at once, one hf add per
+  /** l: the sequential fp16 sum of every q head at once, one hf add per
      position; lanes past n_q add zeros. */
   ts = prof ? HAP_perf_get_pcycles() : 0u;
   union {

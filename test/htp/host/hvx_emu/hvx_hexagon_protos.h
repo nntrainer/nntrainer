@@ -88,7 +88,7 @@ HVX_EMU_SF_BINOP(Q6_Vsf_vsub_VsfVsf, -)
 HVX_EMU_SF_BINOP(Q6_Vsf_vmpy_VsfVsf, *)
 #undef HVX_EMU_SF_BINOP
 
-/* max / min: exact on finite values (the kernels keep every lane finite;
+/** max / min: exact on finite values (the kernels keep every lane finite;
    the mask fill is -FLT_MAX, not -inf). Equal values are the same bits
    except +-0, which attn_m1_det.h shows cannot both occur in a score. */
 static inline HVX_Vector Q6_Vsf_vmax_VsfVsf(HVX_Vector a, HVX_Vector b) {
@@ -108,7 +108,7 @@ static inline HVX_Vector Q6_Vsf_vmin_VsfVsf(HVX_Vector a, HVX_Vector b) {
   return r;
 }
 
-/* int32 -> f32, numeric (hvx_convert.h: NOT a reinterpret on v79). Exact
+/** int32 -> f32, numeric (hvx_convert.h: NOT a reinterpret on v79). Exact
    for |w| <= 2^24; hvx_exp_det_sf's k is within [-127, 123]. */
 static inline HVX_Vector Q6_Vsf_equals_Vw(HVX_Vector a) {
   HVX_Vector r;
@@ -130,7 +130,7 @@ HVX_EMU_W_BINOP(Q6_Vw_vadd_VwVw, +)
 HVX_EMU_W_BINOP(Q6_Vw_vsub_VwVw, -)
 #undef HVX_EMU_W_BINOP
 
-/* Bitwise ops and signed word max / min / arithmetic shift (#152: the
+/** Bitwise ops and signed word max / min / arithmetic shift (#152: the
    fp16 rounding and the round-to-odd step); exact by definition. */
 #define HVX_EMU_V_BITOP(name, op)                                              \
   static inline HVX_Vector name(HVX_Vector a, HVX_Vector b) {                  \
@@ -236,7 +236,7 @@ static inline HVX_VectorPred Q6_Q_and_QQn(HVX_VectorPred a, HVX_VectorPred b) {
   return q;
 }
 
-/* vsetq2(Rt): bytes 0 .. ((Rt - 1) & 127) set, so 128 (and 0) set all --
+/** vsetq2(Rt): bytes 0 .. ((Rt - 1) & 127) set, so 128 (and 0) set all --
    unlike vsetq, whose Rt = 128 wraps to none. The kernels pass 4..128. */
 static inline HVX_VectorPred Q6_Q_vsetq2_R(int32_t n) {
   HVX_VectorPred q;
@@ -259,7 +259,7 @@ static inline HVX_Vector Q6_V_vmux_QVV(HVX_VectorPred q, HVX_Vector a,
   return r;
 }
 
-/* vpack(Vu, Vv):sat: Vv's elements narrowed and saturated into the low
+/** vpack(Vu, Vv):sat: Vv's elements narrowed and saturated into the low
    half of the result, Vu's into the high half, in order (hvx_quant_u8.c's
    two-stage row pack). */
 static inline HVX_Vector Q6_Vh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
@@ -308,7 +308,7 @@ static inline int32_t Q6_R_vextract_VR(HVX_Vector a, int32_t byte_off) {
   return w;
 }
 
-/* ==== fp16 lanes and qf32 (#170, plan 170 section 2) ====================
+/** ==== fp16 lanes and qf32 (#170, plan 170 section 2) ====================
  *
  * An hf vector is 64 fp16 lanes: lane i is bytes 2i, 2i + 1, so lane 2j is
  * the low half of word j. The widening multiply puts the even lanes in the
@@ -388,7 +388,7 @@ static inline HVX_Vector Q6_Vh_vsplat_R(int32_t x) {
     }                                                                          \
     return r;                                                                  \
   }
-/* [#282 D] int16 -> hf, numeric (each lane exact for |h| <= 2048; the
+/** [#282 D] int16 -> hf, numeric (each lane exact for |h| <= 2048; the
    int8 attn_m1 cache's values are within [-127, 127]). */
 static inline HVX_Vector Q6_Vhf_equals_Vh(HVX_Vector a) {
   HVX_Vector r;
@@ -403,7 +403,7 @@ HVX_EMU_HF_BINOP(Q6_Vhf_vsub_VhfVhf, -)
 HVX_EMU_HF_BINOP(Q6_Vhf_vmpy_VhfVhf, *)
 #undef HVX_EMU_HF_BINOP
 
-/* max on finite values: the larger value; of two equal values (+-0) the
+/** max on finite values: the larger value; of two equal values (+-0) the
    second operand, as the sf max above. */
 static inline HVX_Vector Q6_Vhf_vmax_VhfVhf(HVX_Vector a, HVX_Vector b) {
   HVX_Vector r;
@@ -437,7 +437,7 @@ static inline HVX_VectorPair Q6_Wqf32_vmpy_VhfVhf(HVX_Vector a, HVX_Vector b) {
   return w;
 }
 
-/* The exact sum rounded to odd at 24 bits: TwoSum's error term is exact
+/** The exact sum rounded to odd at 24 bits: TwoSum's error term is exact
    (Knuth; no overflow in any kernel's domain), and a nonzero one moves s
    one ulp toward the exact sum's side of it and sets the last bit. */
 static inline HVX_Vector Q6_Vqf32_vadd_Vqf32Vqf32(HVX_Vector a, HVX_Vector b) {
@@ -491,7 +491,7 @@ HVX_EMU_QF_BINOP(Q6_Vqf32_vsub_Vqf32Vsf, -)
 
 static inline HVX_Vector Q6_Vsf_equals_Vqf32(HVX_Vector a) { return a; }
 
-/* ==== moves, packs, masked stores, prefetch (#170 round 2) ===============
+/** ==== moves, packs, masked stores, prefetch (#170 round 2) ===============
  *
  * Bit moves only, written from the PRM's pseudocode: vshuff's swap network
  * (Vdd.v[0] = Vv, Vdd.v[1] = Vu, then for each offset bit set in Rt swap
@@ -522,7 +522,7 @@ static inline HVX_VectorPair Q6_W_vshuff_VVR(HVX_Vector u, HVX_Vector v,
   return w;
 }
 
-/* vdeal: the inverse permutation of vshuff for the same Rt -- the same
+/** vdeal: the inverse permutation of vshuff for the same Rt -- the same
    swaps, largest offset first (each swap set is its own inverse). */
 static inline HVX_VectorPair Q6_W_vdeal_VVR(HVX_Vector u, HVX_Vector v,
                                             int32_t rt) {
@@ -562,7 +562,7 @@ static inline HVX_VectorPair Q6_Wuw_vunpack_Vuh(HVX_Vector u) {
   return w;
 }
 
-/* if (Qv) vmem(Rt) = Vs: the bytes whose flag is set. The hardware drops
+/** if (Qv) vmem(Rt) = Vs: the bytes whose flag is set. The hardware drops
    the address's low 7 bits; a kernel that passes an unaligned one is wrong
    there, so the emulation stops. */
 static inline void Q6_vmem_QRIV(HVX_VectorPred q, HVX_Vector *addr,
@@ -584,7 +584,7 @@ static inline void Q6_l2fetch_AP(void *addr, uint64_t cfg) {
   (void)cfg;
 }
 
-/* ==== byte / halfword integer ops and vlut16 (#170 round 3) ===============
+/** ==== byte / halfword integer ops and vlut16 (#170 round 3) ===============
  *
  * Diffed against hexagon-sim -mv79 (128-byte mode) on iota and spread
  * inputs before use (plan 170 round 3 section 3.2). vlut16: output
@@ -695,7 +695,7 @@ static inline HVX_Vector Q6_Vw_vmpyie_VwVuh(HVX_Vector a, HVX_Vector b) {
   return r;
 }
 
-/* Vdd.w = vunpack(Vu.h): sign-extended, in order -- lo gets halfwords
+/** Vdd.w = vunpack(Vu.h): sign-extended, in order -- lo gets halfwords
    0..31, hi 32..63 (the prototype's d layout matched the v79 ISS so). */
 static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
   HVX_VectorPair r;
@@ -708,7 +708,7 @@ static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
   return r;
 }
 
-/* [#4416 F] Vxx.w += vmpy(Vu.h, Rt.h) (V79 HVX PRM): v[0].w[i] += Vu.w[i].
+/** [#4416 F] Vxx.w += vmpy(Vu.h, Rt.h) (V79 HVX PRM): v[0].w[i] += Vu.w[i].
    h[0] * Rt.h[0] (the even halfwords by Rt's low half), v[1].w[i] +=
    Vu.w[i].h[1] * Rt.h[1] (the odd by its high half); wrapping. */
 static inline HVX_VectorPair Q6_Ww_vmpyacc_WwVhRh(HVX_VectorPair x,
@@ -723,7 +723,7 @@ static inline HVX_VectorPair Q6_Ww_vmpyacc_WwVhRh(HVX_VectorPair x,
   return x;
 }
 
-/* [#282 D] Vdd.h = vunpack(Vu.b): sign-extended, in order -- lo gets bytes
+/** [#282 D] Vdd.h = vunpack(Vu.b): sign-extended, in order -- lo gets bytes
    0..63, hi 64..127, as Q6_Ww_vunpack_Vh above. */
 static inline HVX_VectorPair Q6_Wh_vunpack_Vb(HVX_Vector a) {
   HVX_VectorPair r;
@@ -736,7 +736,7 @@ static inline HVX_VectorPair Q6_Wh_vunpack_Vb(HVX_Vector a) {
   return r;
 }
 
-/* [#132 PR 2] the quantizer's byte pack, second stage: vpacke(u, v) of
+/** [#132 PR 2] the quantizer's byte pack, second stage: vpacke(u, v) of
    halfwords keeps each one's even (low) byte, v's into the low half of the
    result, u's into the high half (checked against the SDK's libnative);
    the word stage is #170's Q6_Vh_vpacke_VwVw above. */

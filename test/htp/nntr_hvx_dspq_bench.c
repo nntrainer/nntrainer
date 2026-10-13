@@ -49,7 +49,7 @@
 #define DSPQ_OP_QUIT 2u
 #define DSPQ_READ_TIMEOUT_US 100000u
 
-/* ponytail: one bench queue per PD in file-static state, so
+/** ponytail: one bench queue per PD in file-static state, so
  * nntr_hvx_session.h stays untouched; a thread leaked by a PD that dies
  * without stop dies with the PD. Step 2 of #141 moves this into the
  * session if dspqueue is adopted. */

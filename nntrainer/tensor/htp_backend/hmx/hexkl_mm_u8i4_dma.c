@@ -118,7 +118,7 @@ static int hexkl_weight_u8i4_check(uint32_t K, uint32_t N, uint32_t vtcm_size,
   }
   *out_bytes = (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
                (N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
-  /* The bake path stages through the VTCM arena, so a weight that does not
+  /** The bake path stages through the VTCM arena, so a weight that does not
      fit it cannot be registered that way. Checked for both paths so the two
      accept exactly the same set of weights -- a cache written by one and
      read by the other must not hit a shape the other rejects. */
@@ -188,7 +188,7 @@ static int hexkl_weight_u8i4_flush(const void *p, size_t n) {
  * arrays): the DMA that fills them from an arena wants aligned rows, and
  * one allocation frees as one.
  */
-/* borrow != 0 points the slot at wh_src instead of copying it: the bytes
+/** borrow != 0 points the slot at wh_src instead of copying it: the bytes
    live in a host arena the DSP has mapped, and release() must not free
    them. A NULL w_scale with borrow set takes the scales and column sums
    from the arena too (hexkl_weight_u8i4_tail_from_arena). Everything else
@@ -231,14 +231,14 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
     hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
   }
   if (!borrow) {
-    /* [#267 L1] Nothing on the DSP writes the image again (prefill and
+    /** [#267 L1] Nothing on the DSP writes the image again (prefill and
        decode only read it, release frees it), so one flush here lets every
        reader's DMA take src_bypass as for an arena slot. Only wh_bytes:
        the arrays are read by the core, never by a bypassing DMA. A failed
        flush leaves the slot on the L2 path. */
     h->clean = hexkl_weight_u8i4_flush(h->wh_bytes, wh_bytes);
   }
-  /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
+  /** Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
      sets 2 after this returns). */
   h->bits = 4u;
   h->in_use = 1;
@@ -319,7 +319,7 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
   uint32_t slot;
   int rc;
 
-  /* Either all three arrays or none: none means they follow wh in the
+  /** Either all three arrays or none: none means they follow wh in the
      arena (doc 52 section 10.30). */
   if (!tbl || !wh || !out_handle || (!w_scale != !colsum_w) ||
       (!w_scale != !bias)) {
@@ -360,7 +360,7 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
     return AEE_EBADPARM;
   }
   w->wh_bytes = (uint8_t *)wh;
-  /* The width moves with the bytes: a pool slot holds whatever expert the
+  /** The width moves with the bytes: a pool slot holds whatever expert the
      host read into it last. */
   w->tl2_bytes = NULL;
   w->bits = pal ? 2u : 4u;
@@ -389,19 +389,19 @@ int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
   uint32_t slot;
   int rc;
 
-  /* Either all three arrays or none, as for the 4-bit entry: none means
+  /** Either all three arrays or none, as for the 4-bit entry: none means
      they follow the codes in the arena. */
   if (!tbl || !wh || !pal || !out_handle || (!w_scale != !colsum_w) ||
       (!w_scale != !bias)) {
     return AEE_EBADPARM;
   }
-  /* A whole tile, as for four bits: hexkl_weight_u8i4_rebind_arena (the
+  /** A whole tile, as for four bits: hexkl_weight_u8i4_rebind_arena (the
      pool's swap) checks the same, so a slot registered here can always be
      rebound. The host places weights on 4 KiB boundaries. */
   if (((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
     return AEE_EBADPARM;
   }
-  /* The VTCM check is the 4-bit one on purpose: the HMX path expands the
+  /** The VTCM check is the 4-bit one on purpose: the HMX path expands the
      codes in place into a full-width region, so what has to fit is the
      expanded size. */
   rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
@@ -578,14 +578,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if (result_off + 2u * ACC_TILE_BYTES > arena) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
   }
-  /* Capped at 32 like the MoE kernel's: past the worker count a bigger
+  /** Capped at 32 like the MoE kernel's: past the worker count a bigger
      batch parallelises no better, and a smaller one exposes less at the
      end of each row block. */
   uint32_t acc_tiles = (arena - result_off) / (2u * ACC_TILE_BYTES);
   if (acc_tiles > 32u) {
     acc_tiles = 32u;
   }
-  /* With the per-head passes asked for (post_done), a batch of whole
+  /** With the per-head passes asked for (post_done), a batch of whole
      heads when the room allows one: the widest head's tiles divide it. */
   if (o->post_done != NULL) {
     uint32_t unit = 1u;
@@ -699,7 +699,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 
   int rc = AEE_SUCCESS;
   size_t out_off = 0;
-  /* The pooled epilogue: one job per staging buffer, each alive from its
+  /** The pooled epilogue: one job per staging buffer, each alive from its
      submit to the wait one batch later, and the staging parity runs across
      row blocks and handles. Not with accumulate (the attention paths add
      into out_cat and the job has no flag for it) nor without the in-place
@@ -708,7 +708,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   hvx_dq_rows_job dq_job[2];
   fc_post post[2];
   uint32_t sb = 0u;
-  /* The per-head passes in the epilogue: only when every staged batch of
+  /** The per-head passes in the epilogue: only when every staged batch of
      every handle that has one holds whole heads. */
   int fuse_post = pipelined && o->post_done != NULL;
   for (uint32_t i = 0; fuse_post && i < n_handles; ++i) {
@@ -767,7 +767,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         const uint32_t nb = (nt_n - nt0 < acc_tiles) ? (nt_n - nt0) : acc_tiles;
         const uint32_t stage_off =
           result_off + (sb & 1u) * acc_tiles * ACC_TILE_BYTES;
-        /* This staging buffer was last read by the job two batches back,
+        /** This staging buffer was last read by the job two batches back,
            retired when the last one was submitted. */
         for (uint32_t j = 0; j < nb; ++j) {
           hexkl_micro_hmx_acc_clear_int32();
@@ -790,7 +790,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           }
         }
         if (pipelined) {
-          /* Retire the previous batch's job -- what this wait reads is the
+          /** Retire the previous batch's job -- what this wait reads is the
              exposed part -- then hand this batch to the pool and go on
              issuing. */
           HEXKL_PROBE_T0(p0);
@@ -884,7 +884,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
 out:
-  /* The last batch's job, or one left in flight by an error path, reads
+  /** The last batch's job, or one left in flight by an error path, reads
      VTCM and the scale arrays freed below and writes out_cat: retire it
      before either goes away. */
   HEXKL_PROBE_T0(p0);

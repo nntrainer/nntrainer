@@ -1,4 +1,10 @@
-/* Host stand-in for the QuRT calls hvx_worker_pool.c makes, on pthreads:
+/**
+ * @file qurt.h
+ * @brief qurt.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Host stand-in for the QuRT calls hvx_worker_pool.c makes, on pthreads:
    enough to run the pool's protocol on a desktop, not a QuRT emulation.
    futex_wait/wake are a mutex and a condition variable with the value
    check under the mutex, which is the one property the pool relies on --
@@ -97,7 +103,7 @@ static inline int qurt_futex_wake(void *addr, int n) {
   return 0;
 }
 
-/* Bits 15:8 are the HVX context count. Four, as v79 has: nntr_hvx_open
+/** Bits 15:8 are the HVX context count. Four, as v79 has: nntr_hvx_open
    sizes its worker pool at units - 1 = 3, the class of
    hvx_add_f32.c's own decode. */
 static inline int qurt_hvx_get_units(void) { return 0x0400; }

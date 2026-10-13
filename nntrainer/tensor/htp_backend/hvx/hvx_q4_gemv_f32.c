@@ -39,7 +39,7 @@
 
 #define Q4M1_INLINE static inline __attribute__((always_inline))
 
-/* One f32 op per lane: the Q6_Vsf_* intrinsics, which the compiler
+/** One f32 op per lane: the Q6_Vsf_* intrinsics, which the compiler
    lowers to a qf32 op and a conversion. That pair is the IEEE op on
    silicon (the 2026-09-29 sitting: bit-identical on every G1 row); the
    inline-asm IEEE .sf instructions the ISS also accepts returned 0 on the
@@ -350,7 +350,7 @@ static void q4m1_group_hvx(const uint8_t *wg, uint32_t np,
       /* TwoSum(acc, uh) */
       const HVX_Vector th = sf_add(acc, uh);
       const HVX_Vector tl = two_sum_err(acc, uh, th);
-      /* w = RO(tl + ul): RN, then one ulp toward the error when inexact
+      /** w = RO(tl + ul): RN, then one ulp toward the error when inexact
          and even */
       const HVX_Vector w = sf_add(tl, ul);
       const HVX_Vector er = two_sum_err(tl, ul, w);

@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
+/** The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
    another on the caller, so the row split across lanes is exercised. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
@@ -35,7 +35,7 @@ static float frand(unsigned *s) {
   return ((float)((*s >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 4.0f;
 }
 
-/* The CPU table's rows (calc_trigonometric_vals_dup): cos and sin of
+/** The CPU table's rows (calc_trigonometric_vals_dup): cos and sin of
    pos * theta_j for j < half, each half duplicated; theta_j = 0 past
    rot/2 for a partial rotary (cos 1, sin 0: the pair is left alone). */
 static void table_row(float *cs, uint32_t hd, uint32_t rot, float theta,
@@ -93,7 +93,7 @@ static int run(uint32_t M, uint32_t n, uint32_t hd, uint32_t rot,
   return bad != 0;
 }
 
-/* The fused pass against hvx_rmsnorm_rows_ld_f32 then hvx_rope_rows_ld_f32,
+/** The fused pass against hvx_rmsnorm_rows_ld_f32 then hvx_rope_rows_ld_f32,
    bit for bit, over rows ld apart (the qkv slices' row-major placement). */
 static int run_fused(uint32_t M, uint32_t n, uint32_t ld, uint32_t chunk,
                      uint32_t hd) {
@@ -124,10 +124,10 @@ static int run_fused(uint32_t M, uint32_t n, uint32_t ld, uint32_t chunk,
 
 int main(void) {
   int fail = 0;
-  fail |= run(7, 4096, 256, 256, 0);   /* sliding: 16 heads of 256 */
-  fail |= run(5, 2048, 256, 256, 500); /* k: 8 heads, later positions */
-  fail |= run(4, 1024, 512, 128, 3);   /* full: hd 512, partial 0.25 */
-  fail |= run(3, 192, 64, 64, 1);      /* the decode graph's head dim */
+  fail |= run(7, 4096, 256, 256, 0);          /* sliding: 16 heads of 256 */
+  fail |= run(5, 2048, 256, 256, 500);        /* k: 8 heads, later positions */
+  fail |= run(4, 1024, 512, 128, 3);          /* full: hd 512, partial 0.25 */
+  fail |= run(3, 192, 64, 64, 1);             /* the decode graph's head dim */
   fail |= run_fused(7, 4096, 8192, 256, 256); /* sliding q in the qkv rows */
   fail |= run_fused(5, 2048, 8192, 256, 256); /* sliding k */
   fail |= run_fused(4, 1024, 1024, 512, 512); /* full: norm 512, rope 512 */

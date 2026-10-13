@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
+/** The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
    another on the caller, so the row split across lanes is exercised. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {

@@ -1,4 +1,10 @@
-/* Host harness for hexkl_mm_u8i4_layer_run (the FC / projection call) on
+/**
+ * @file fc_layer_host_check.c
+ * @brief fc layer host check.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Host harness for hexkl_mm_u8i4_layer_run (the FC / projection call) on
    the scalar stand-ins: several handles of different widths against one
    activation, as the attention q/k/v call makes it, checked row by row
    against the reference. What it checks is the batching added for the
@@ -55,7 +61,7 @@ static int compare(const char *what, const float *got, const float *want,
 }
 
 int main(void) {
-  /* Three row blocks with a short last one; the widest handle is 33
+  /** Three row blocks with a short last one; the widest handle is 33
      n-tiles, one more than a staging batch, so the first handle takes two
      batches per row block and the parity crosses handles unevenly. */
   const uint32_t M = 150, K = 64;
@@ -92,7 +98,7 @@ int main(void) {
   reference(ws, 3, x, 1, K, want, 0.f);
   fail |= (rc != 0) | compare("M=1", got, want, N[0] + N[1] + N[2]);
 
-  /* The per-head passes in the epilogue (hexkl_mm_opts.post_done): the
+  /** The per-head passes in the epilogue (hexkl_mm_opts.post_done): the
      norm of handles 0 and 2 and the rotation of handle 0 must give the
      bytes of the plain run with those passes made over it afterwards, and
      the kernel must say it did them. Then a table row off by one, which
@@ -155,7 +161,7 @@ int main(void) {
     fail |= (rc != 0) | compare("accumulate", got, want, out_n);
   }
 
-  /* An arena with room for exactly two staging tiles still runs (one
+  /** An arena with room for exactly two staging tiles still runs (one
      tile per batch); one tile short of that is refused. */
   {
     const uint32_t k_tiles = K / 32u, m_pad = 192u;
@@ -174,7 +180,7 @@ int main(void) {
     fail |= (rc != AEE_ENOMEMORY);
   }
 
-  /* [#236] The chunker's shape: the qkv projection at P1024 (M = 1024,
+  /** [#236] The chunker's shape: the qkv projection at P1024 (M = 1024,
      K = 2048, N 2048 / 512 / 512) as one call vs two 512-row calls whose
      per-handle blocks land at m0 * N[i] of each handle's whole block, as
      gemm_q4_0_batch_fp32's dsts put them -- byte-equal, because every row's
@@ -230,7 +236,7 @@ int main(void) {
     free(part);
   }
 
-  /* The u16 activation (the attention's context for the o-proj): rows
+  /** The u16 activation (the attention's context for the o-proj): rows
      dequantized inside the quant pass, per head (scale, zp), must give
      the same bytes as the f32 call on the dequantized rows. A mutant
      encoding (the second head's scale) must differ. */

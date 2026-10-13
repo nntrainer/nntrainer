@@ -25,7 +25,7 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
   const HVX_Vector wv = hvx_splat_sf(scale);
   uint32_t i = 0;
 
-  /* Unaligned vector types throughout: src is a VTCM block and dst is a row
+  /** Unaligned vector types throughout: src is a VTCM block and dst is a row
      of a heap allocation, and neither is promised 128-byte alignment. */
   for (; i + LANES <= n; i += LANES) {
     const HVX_Vector d = ((const HVX_UVector *)(dst + i))[0];
@@ -33,7 +33,7 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
     ((HVX_UVector *)(dst + i))[0] =
       Q6_Vsf_vadd_VsfVsf(d, Q6_Vsf_vmpy_VsfVsf(s, wv));
   }
-  /* Same two operations in the tail, so a row whose width is not a multiple
+  /** Same two operations in the tail, so a row whose width is not a multiple
      of 32 does not get different arithmetic in its last few columns. */
   for (; i < n; ++i) {
     const float p = src[i] * scale;

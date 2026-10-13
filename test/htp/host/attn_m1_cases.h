@@ -210,7 +210,7 @@ static inline uint32_t amc_plant_pv(const float *q, const float *k, float *v,
   }
   attn_m1_det_head(q + (size_t)AMC_PV_HEAD * hd, kt, vz, hd, L, L, 0.125f, pr,
                    out, NULL, NULL);
-  /* Candidates per position at o = 1.5 and at the odd 1.5 + 2^-10, with
+  /** Candidates per position at o = 1.5 and at the odd 1.5 + 2^-10, with
      |p v| small enough to keep o's binade. */
   for (uint32_t j = 3; j < last; ++j) {
     for (int ev = -14; ev <= 4 && n_hits[j] < MAX_HITS; ++ev) {
@@ -253,7 +253,7 @@ static inline uint32_t amc_plant_pv(const float *q, const float *k, float *v,
   return planted;
 }
 
-/*
+/**
  * fp16 FMA TRIPLES (#170): (c, a, b) as fp16 bits, for the one-rounding
  * FMA of hvx_attn_m1_hf.h (host check ATTN M1 HF PRIM, device probe
  * HvxAttnM1Probe.Semantics). Two families beside the real-data case file
@@ -311,7 +311,7 @@ static inline void amc_fma_adversarial(amc_rng *r, uint32_t n, uint16_t *c,
   int ec = 2 + (int)(amc_next(r) % 27u);
   const uint32_t cm = (amc_next(r) % 1024u) | (kind & 1u);
   const uint32_t sc = amc_next(r) & 1u, sp = kind == 2u ? !sc : sc;
-  /* a*b = ma*mb * 2^(ea+eb-50) ~ 2^(ea+eb-29) and half an ulp of c is
+  /** a*b = ma*mb * 2^(ea+eb-50) ~ 2^(ea+eb-29) and half an ulp of c is
      2^(ec-26): so ea + eb = ec + 3 */
   const int e_h = ec + 3;
   int ea = 1 + (int)(amc_next(r) % 30u), eb = e_h - ea;

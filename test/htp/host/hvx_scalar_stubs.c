@@ -1,4 +1,10 @@
-/* Scalar stand-ins shared by the block kernels' host checks. Pulled out of
+/**
+ * @file hvx_scalar_stubs.c
+ * @brief hvx scalar stubs.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Scalar stand-ins shared by the block kernels' host checks. Pulled out of
    moe_layer_host_check.c unchanged when the conv block check arrived; the
    comments are that file's. */
 #include "hvx_scalar_stubs.h"
@@ -28,11 +34,11 @@ const hexkl_acc_layout *hexkl_acc_layout_get(uint8_t *b, uint32_t off) {
   (void)off;
   return &g_layout;
 }
-/* ---- DMA ring: completes immediately, so a push issued while the
+/** ---- DMA ring: completes immediately, so a push issued while the
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
 void hexkl_dma_ring_drain(void) {}
-/* Indices are handed out and waited on for real shape, but every transfer
+/** Indices are handed out and waited on for real shape, but every transfer
    has already completed by the time push2d returns, so a wait is a no-op.
    That is the point: a chunk consumed before its push would read stale
    bytes on device and read correct ones here, so what this harness checks
@@ -56,7 +62,7 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
     memcpy((uint8_t *)dst + (size_t)r * ds,
            (const uint8_t *)src + (size_t)r * ss, rs);
 }
-/* #177's lane queue, likewise complete at once (the MoE file links here;
+/** #177's lane queue, likewise complete at once (the MoE file links here;
    moe_layer_host_check holds its schedule). */
 void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
                            void *dst, const void *src, uint32_t ds, uint32_t ss,
@@ -70,20 +76,20 @@ int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
   return 0;
 }
 
-/* The pool runs everything on the caller, which is what its own NULL path
+/** The pool runs everything on the caller, which is what its own NULL path
    does for n_units <= 1. Doing it here rather than passing NULL keeps the
    kernel's call sites exercised: the range arithmetic they hand the worker
    is part of what this check is for. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   (void)pool;
-  /* One slice covering everything. Writing this the way the real function's
+  /** One slice covering everything. Writing this the way the real function's
      degenerate branch used to be written -- func(n_units, 0, ctx) -- is what
      this check caught first time out: that form means "worker 0 of n_units"
      and does 1/n_units of the work. */
   func(1u, 0, ctx);
 }
-/* submit runs the job to completion on the spot and wait is a no-op: the
+/** submit runs the job to completion on the spot and wait is a no-op: the
    harness cannot exercise the overlap, only that every job is submitted
    with the right buffer and retired before that buffer is reused -- which
    a job that ran late would show as a wrong result on device and cannot
@@ -100,7 +106,7 @@ uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
   (void)pool;
   return 0u;
 }
-/* The background lane, likewise: every unit runs at submit, in order, and
+/** The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
    show here, and a wait for too many only as a hang on device. */
@@ -124,7 +130,7 @@ void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
   memcpy(dst, src, (size_t)(k / 32u) * 2048u);
 }
 
-/* The row RMSNorm the *_norm layer entries fold in: plain f32, one row
+/** The row RMSNorm the *_norm layer entries fold in: plain f32, one row
    at a time, the kernel's own operation order (sum of squares, sqrtf,
    scale, gamma). What the checks that link the skel verify is the entry's
    plumbing -- which rows, which gamma, in place -- not HVX arithmetic,
@@ -154,7 +160,7 @@ int hvx_rmsnorm_rows_f32(const float *x, float *y, uint32_t M, uint32_t n,
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
                             uint32_t n) {
-  /* Two operations, never one: HVX has no f32 fused multiply-add and the
+  /** Two operations, never one: HVX has no f32 fused multiply-add and the
      ARM path this has to agree with applies the routing weight with
      multiply_i and then accumulates with add_i. The volatile is what stops
      the host compiler contracting them and making this stub disagree with
@@ -165,12 +171,12 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
   }
 }
 uint64_t hexkl_probe_us[HEXKL_PROBE_N];
-/* On, so the counting probes (blocks, DMA bytes) run here too -- this
+/** On, so the counting probes (blocks, DMA bytes) run here too -- this
    harness is where a miscounted block or a push that never happens shows up
    without a device. The timers read the stub clock and are not checked. */
 int hexkl_probe_on = 1;
 
-/* Scalar stand-in for the conv gate: (w0*g[t] + w1*g[t-1]) + w2*g[t-2],
+/** Scalar stand-in for the conv gate: (w0*g[t] + w1*g[t-1]) + w2*g[t-2],
    each product and sum its own statement so the host compiler cannot
    contract them into the FMA the HVX does not have. */
 void hvx_conv_gate_f32(float *z, uint32_t z_stride, const float *g,
@@ -275,7 +281,7 @@ void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
   s->bias = w->bias;
 }
 
-/* Link-only stand-ins for the paths of hexkl_mm_u8i4_dma.c no host check
+/** Link-only stand-ins for the paths of hexkl_mm_u8i4_dma.c no host check
    takes: the registration bake (make_weight fills the table directly) and
    the DDR fallback's accumulator copy (the stub layout is always usable).
    Reaching one is a harness bug, not a kernel result. */
@@ -292,7 +298,7 @@ int hexkl_micro_hmx_copy_32b_to_submatrix(uint8_t *b, uint32_t off,
   abort();
 }
 
-/* The router logits the router_logits_f32 entry runs: plain f32 dots,
+/** The router logits the router_logits_f32 entry runs: plain f32 dots,
    row by row. The entry's plumbing (the norm, which rows, where the
    logits land) is what a skel-linking check verifies; the HVX arithmetic
    is router_rows_host_check's on the lane emulation. */
@@ -315,7 +321,7 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
   return 0;
 }
 
-/* The fused-norm router entry: the scalar RMSNorm (hvx_rmsnorm_row_f32's
+/** The fused-norm router entry: the scalar RMSNorm (hvx_rmsnorm_row_f32's
    formula), then the dots above. */
 int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
                              const float *w, float *w_stage, float *logits,
@@ -343,7 +349,7 @@ int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
   return rc;
 }
 
-/* The router's selection (hvx_router_topk_rows_f32): plain f32 softmax
+/** The router's selection (hvx_router_topk_rows_f32): plain f32 softmax
    and the same first-maximum scan; the HVX softmax is
    router_rows_host_check's. */
 int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
@@ -385,7 +391,7 @@ int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
   return 0;
 }
 
-/* The RoPE the *_norm layer entry folds in: the CPU kernel's pair order,
+/** The RoPE the *_norm layer entry folds in: the CPU kernel's pair order,
    row by row; the HVX arithmetic is rope_rows_host_check's. */
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
                       const float *cs, hvx_worker_pool *pool) {
@@ -409,7 +415,7 @@ int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
   return 0;
 }
 
-/* [#260 r3] #4415 @ 2db6cad59's skel entries (row-strided norm / RoPE,
+/** [#260 r3] #4415 @ 2db6cad59's skel entries (row-strided norm / RoPE,
    the post-attention and post-FFN epilogues, the u8 x i8 router layer):
    plain f32 for the checks that link the skel; their HVX arithmetic is
    the rows host checks'. */

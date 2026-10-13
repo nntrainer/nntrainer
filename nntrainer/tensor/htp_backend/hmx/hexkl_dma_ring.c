@@ -100,7 +100,7 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
 uint32_t hexkl_dma_ring_next_idx(void) { return g_push; }
 
 void hexkl_dma_ring_wait(uint32_t idx) {
-  /* Descriptors are dmlinked, so they retire in push order and waiting on
+  /** Descriptors are dmlinked, so they retire in push order and waiting on
      one implies every earlier one. g_pop is deliberately NOT advanced: the
      ring-full path in push2d reclaims, and leaving it alone keeps drain's
      "everything pending" meaning intact for the callers that still use it. */

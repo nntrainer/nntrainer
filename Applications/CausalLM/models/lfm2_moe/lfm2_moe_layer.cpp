@@ -218,6 +218,16 @@ static int expertPrefetchDepth() {
 static std::deque<std::pair<int, size_t>> g_prefetch_batches;
 /** The next layer slot to queue in the current prefill. */
 static int g_prefetch_next = 0;
+static std::unordered_set<const void *> g_handed_expert_layers;
+
+void resetLfm2HtpExpertPool() {
+  g_expert_lru.reset();
+  g_expert_layers.clear();
+  g_prefetch_batches.clear();
+  g_handed_expert_layers.clear();
+  g_prefetch_next = 0;
+  g_moe_layer_count.store(0);
+}
 
 /**
  * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
@@ -1218,11 +1228,8 @@ static bool tryMoeLayerOnAccelerator(
   // the layers in order), for the one-PD token's miss path: the pool's
   // slots are this LRU's, one set (lfm2_moe_pool_layer.cpp's hand-over).
   if (experts_virtual) {
-    // ponytail: one model per process -- the set, like the backend's
-    // pool_descs_, is never cleared; a second model in the same process
-    // needs both reset with it.
-    static std::unordered_set<const void *> handed;
-    if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
+    if (g_handed_expert_layers.insert(&context.getWeight(gate_up_indices[0]))
+          .second) {
       std::vector<ExpertFileDesc> all;
       for (size_t e = 0; e < n_experts; ++e)
         all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
@@ -1823,7 +1830,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // The M > 1 gate that used to sit here moved inside: it does not apply to
     // QS4CX_WH weights, which have no ARM path to fall back to at M == 1.
     // Falls through to the per-expert loop below otherwise.
-    /* M0: the one stage that had no timer. With the whole-layer call the
+    /** M0: the one stage that had no timer. With the whole-layer call the
        ARM-side gather, route and scatter all read ~0 because the DSP does
        them, and this read 0 as well -- so nothing accounted for the layer's
        wall clock, and doc 46 section 18.1 had to quote the ARM remainder as

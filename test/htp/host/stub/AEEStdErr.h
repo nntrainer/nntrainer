@@ -1,6 +1,12 @@
+/**
+ * @file AEEStdErr.h
+ * @brief AEEStdErr.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
 #ifndef AEESTDERR_H
 #define AEESTDERR_H
-/* The SDK's values on a non-Hexagon host (AEE_EOFFSET 0). The DSP adds
+/** The SDK's values on a non-Hexagon host (AEE_EOFFSET 0). The DSP adds
    0x80000400; htp_graph_desc.h mirrors that split. */
 #define AEE_SUCCESS 0
 #define AEE_EFAILED 1

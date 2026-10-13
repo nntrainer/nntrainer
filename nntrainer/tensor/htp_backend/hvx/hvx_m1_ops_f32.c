@@ -240,7 +240,7 @@ void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
   if (!cs || (n_q && !q) || (n_k && !k) || head_dim == 0u || h % LANES != 0u) {
     return;
   }
-  /* One 32-lane chunk of the half head at a time: the table vectors are
+  /** One 32-lane chunk of the half head at a time: the table vectors are
      loaded once per chunk for every head (the CPU's table is (_FP16) of
      the same f32 values). */
   for (uint32_t j = 0; j < h; j += LANES) {
@@ -275,7 +275,7 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
   const float *s0 = state3, *s1 = state3 + C;
   const uint32_t nvec = C / LANES;
 
-  /* [#132 E5c] The Android CPU's decode order (m1_conv_gate_det): g = a*c
+  /** [#132 E5c] The Android CPU's decode order (m1_conv_gate_det): g = a*c
      into row 2, y = w0*g (both one rounding each, as the vector multiply),
      then the two fused taps y = fma(w1, s1, y), y = fma(w2, s0, y) --
      HVX has no fused f32 multiply-add, so they are the scalar sffma, 2C of
@@ -285,7 +285,7 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
     vg[i] = Q6_Vsf_vmpy_VsfVsf(va[i], vc[i]);
     vo[i] = Q6_Vsf_vmpy_VsfVsf(vw0[i], vg[i]);
   }
-  /* the vector stores above and the scalar loads below alias out / state3
+  /** the vector stores above and the scalar loads below alias out / state3
      through different types: keep the compiler from reordering them */
   __asm__ volatile("" ::: "memory");
   for (uint32_t j = 0; j < C; ++j) {
@@ -297,7 +297,7 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
     vo[i] = Q6_Vsf_vmpy_VsfVsf(vb[i], vo[i]);
   }
 
-  /* state <- x_{t-1} | g. ponytail: two 8 KiB copies per token at C = 2048
+  /** state <- x_{t-1} | g. ponytail: two 8 KiB copies per token at C = 2048
      (x 18 conv layers, roughly 1-2 us); a ring of three row pointers
      removes them if #85's per-op pcycles ever show it. */
   memcpy(state3, state3 + C, (size_t)C * sizeof(float));
@@ -357,7 +357,7 @@ router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
                       (uint64_t)ROUTER_PF_ROWS);
     }
 #endif
-    /* rows up to kpf prefetch the row ROUTER_L1_AHEAD ahead into L1
+    /** rows up to kpf prefetch the row ROUTER_L1_AHEAD ahead into L1
        (each k reads a new line, and the loop was bound by that miss:
        #132 S3, 65528 pcycles/op); the last ROUTER_L1_AHEAD rows do not,
        so the hint never leaves the buffer and the loop has no test */
@@ -408,7 +408,7 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
       E > LANES || top_k == 0u || top_k > E) {
     return;
   }
-  /* [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order
+  /** [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order
      (m1_router_cpu_det), ROUTER_CHAINS of them per pool lane on the scalar
      cores; lanes >= E are the padding's zero columns, computed and dropped.
      The bits do not depend on the lane count. */
@@ -488,7 +488,7 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
       E > M1_DET_ROUTER_SM_MAX_E || top_k == 0u || top_k > E) {
     return;
   }
-  /* ponytail: f32 weights, 1.4 MiB a layer at Gemma's 2816 x 128 read once
+  /** ponytail: f32 weights, 1.4 MiB a layer at Gemma's 2816 x 128 read once
      a token (43 MiB over 30 layers); f16 / bf16 storage halves it when the
      router shows in the stage timers. */
   router_sm_ctx c = {x, wp, K, Ep, acc};

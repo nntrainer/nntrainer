@@ -1,4 +1,10 @@
-/* Host check for hvx_worker_pool's two lanes on pthreads (stub/qurt.h).
+/**
+ * @file worker_pool_host_check.c
+ * @brief worker pool host check.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/** Host check for hvx_worker_pool's two lanes on pthreads (stub/qurt.h).
    What it checks: every foreground job runs its slices exactly once while
    a background job is in flight; every background unit runs exactly once;
    wait_bg(n) returns only when units [0, n) are done; a background job
@@ -79,14 +85,14 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
       for (int s = 0; s < 8; ++s)
         atomic_init(&fg.slices[s], 0);
       hvx_worker_pool_submit(pool, fg_slice, &fg, 3u);
-      /* wait_bg between submit and wait: the caller helps with units while
+      /** wait_bg between submit and wait: the caller helps with units while
          a foreground job is outstanding, as the kernel does. */
       hvx_worker_pool_wait_bg(pool, &job, (uint32_t)(j * 3));
       for (uint32_t u = 0; u < (uint32_t)(j * 3) && u < n_units; ++u)
         CHECK(atomic_load(&bg->count[u]) == 1u,
               "wait_bg(%d) returned with unit %u not done", j * 3, u);
       hvx_worker_pool_wait(pool);
-      /* With no workers the pool runs ONE slice covering the whole range
+      /** With no workers the pool runs ONE slice covering the whole range
          (n_threads == 1); with workers, min(n_units, workers) slices. */
       const uint32_t want_fg = fg.n_threads_seen;
       CHECK(want_fg == 1u || want_fg == 3u, "fg n_threads %u", want_fg);
@@ -116,7 +122,7 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
   free(bg);
 }
 
-/* Gating: a job's units must only ever run once the job before it is
+/** Gating: a job's units must only ever run once the job before it is
    complete. Three jobs in a row; every unit of job k records whether job
    k-1 was complete when it started. */
 typedef struct {
@@ -173,7 +179,7 @@ static void gate_round(hvx_worker_pool *pool, uint8_t *done) {
   }
 }
 
-/* [#136] The job pickup race at a job boundary. A worker reads fg_id and
+/** [#136] The job pickup race at a job boundary. A worker reads fg_id and
    only then the job's fields; one that observed job J but was descheduled
    before reading them (it was not a participant of J, so J completed
    without it) resumes with J+1's fields, serves J+1 uncounted, decrements

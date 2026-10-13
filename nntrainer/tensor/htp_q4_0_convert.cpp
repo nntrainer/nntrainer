@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * @brief Convert Q4_0 weights for native HTP operations.
+ */
+/**
  * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
  *
  * @file   htp_q4_0_convert.cpp

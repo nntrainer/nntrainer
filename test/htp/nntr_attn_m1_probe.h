@@ -42,7 +42,7 @@
 #define ATTN_M1_PROBE_PV4 19u       /**< hf PV, four q heads per V row */
 #define ATTN_M1_PROBE_FETCH 20u     /**< stream a cold slab, no l2fetch */
 #define ATTN_M1_PROBE_FETCH_L2F 21u /**< the same with an l2fetch lead */
-/* #170 round 2: the kernel's leads on cold data (a slab per lane, evicted
+/** #170 round 2: the kernel's leads on cold data (a slab per lane, evicted
    between reps) and the splat source, each against its warm op above */
 #define ATTN_M1_PROBE_PV4_COLD 22u         /**< PV4 over cold V rows, no lead */
 #define ATTN_M1_PROBE_PV4_COLD_L2F 23u     /**< the same, 32 KiB window lead */

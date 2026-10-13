@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * @brief Quantize activations for native HTP operations.
+ */
+/**
  * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
  *
  * @file   htp_act_quant.cpp

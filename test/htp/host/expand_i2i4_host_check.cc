@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-/*
+/**
+ * @file expand_i2i4_host_check.cc
+ * @brief expand i2i4 host check.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
+/**
  * Ties the offline 2-bit packer to the kernel that expands it.
  *
  * whPack2 (htp_wh_palette.h, C++, runs in the quantizer) and
@@ -24,7 +30,7 @@
 
 extern "C" {
 #include "hvx_expand_i2i4.h"
-/* hvx_worker_pool.h itself is not includable from C++ (_Atomic members);
+/** hvx_worker_pool.h itself is not includable from C++ (_Atomic members);
    these two are all this check needs from it. */
 hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers);
 void hvx_worker_pool_destroy(hvx_worker_pool *pool);
@@ -76,7 +82,7 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
   std::snprintf(what, sizeof what, "%s half the bytes", label);
   check(two.size() * 2 == four.size(), what);
 
-  /* The host readers (NNTR_MOE_DIFF's reference) give back the codes the
+  /** The host readers (NNTR_MOE_DIFF's reference) give back the codes the
      packers were handed: whUnpack at four bits, whUnpack2 at two. */
   std::vector<int8_t> rm_back(rm.size(), 0x7F);
   nntrainer::whUnpack(four.data(), K, N, rm_back.data());
@@ -93,7 +99,7 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
   std::snprintf(what, sizeof what, "%s expand == whPack", label);
   check(back == four, what);
 
-  /* The pool split must not change a byte: workers take whole vectors, so
+  /** The pool split must not change a byte: workers take whole vectors, so
      a boundary that cut a shuffle in half would show up right here. */
   std::vector<uint8_t> pooled(nntrainer::whBytes(K, N), 0x55);
   hvx_expand_i2i4_pool(two.data(), static_cast<uint32_t>(two.size()),
@@ -105,18 +111,18 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
 } // namespace
 
 int main() {
-  /* Three workers plus the caller, the same shape worker_pool_host_check
+  /** Three workers plus the caller, the same shape worker_pool_host_check
      uses, so the split is exercised rather than assumed. */
   hvx_worker_pool *pool = hvx_worker_pool_create(4);
 
-  /* The real expert shapes, and one that is not square and not a multiple
+  /** The real expert shapes, and one that is not square and not a multiple
      of the vector in tiles. */
   roundTrip(2048, 3584, 1u, "gate_up 2048x3584", pool);
   roundTrip(1792, 2048, 2u, "down    1792x2048", pool);
   roundTrip(32, 32, 3u, "one tile   32x32  ", pool);
   roundTrip(96, 64, 4u, "small      96x64  ", pool);
 
-  /* IN PLACE. The 2-bit chunk is DMA'd into the TOP half of the int4 slot
+  /** IN PLACE. The 2-bit chunk is DMA'd into the TOP half of the int4 slot
      it expands into, so the expansion needs no VTCM of its own -- which is
      what makes it fit at all (doc 54 5.6). Safe because output byte
      2j+1 only reaches source byte j, so the write pointer never passes the
@@ -152,14 +158,14 @@ int main() {
     check(slot == four, "in place (codes in the top half)");
   }
 
-  /* A palette with duplicate entries: whPaletteFitHist pads that way when
+  /** A palette with duplicate entries: whPaletteFitHist pads that way when
      a group has fewer than four distinct codes, and the table has to stay
      well-formed. */
   {
     const int8_t pal[4] = {-3, -3, -3, -3};
     std::vector<uint8_t> table(HVX_EXPAND_TABLE_BYTES);
     hvx_expand_i2i4_table(pal, table.data());
-    /* Asserted on the output, not on the table bytes: the entries sit at
+    /** Asserted on the output, not on the table bytes: the entries sit at
        2*index now (hvx_expand_i2i4.c), so which byte holds what is the
        lookup's business and this check should not know. */
     std::vector<uint8_t> codes(128), out(256, 0);

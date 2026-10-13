@@ -68,6 +68,30 @@ TEST(ExpertLru, MissesLoadHitsDoNot) {
   EXPECT_FALSE(lru.resident(key(3)));
 }
 
+TEST(ExpertLru, ResetAllowsAnUnloadedModelToReuseLayerAndExpertAddresses) {
+  ExpertLru lru;
+  int layer;
+  Recorder first;
+  lru.addLayer(&layer, 4);
+  lru.setLrfu(8);
+  lru.acquire({key(0), key(1)}, first.load, first.evict);
+  lru.hold(2);
+  lru.reset();
+  EXPECT_EQ(lru.capacity(), 0u);
+  EXPECT_EQ(lru.size(), 0u);
+  EXPECT_FALSE(lru.resident(key(0)));
+
+  // A new model may use the same allocator addresses with a different pool.
+  lru.addLayer(&layer, 2);
+  Recorder second;
+  EXPECT_EQ(lru.capacity(), 2u);
+  EXPECT_EQ(lru.acquire({key(0), key(1)}, second.load, second.evict), 2u);
+  EXPECT_EQ(second.loaded, (std::vector<int>{0, 1}));
+  EXPECT_TRUE(second.evicted.empty());
+  EXPECT_EQ(lru.acquire({key(2)}, second.load, second.evict), 1u);
+  EXPECT_EQ(second.evicted, (std::vector<int>{0}));
+}
+
 TEST(ExpertLru, EvictsLeastRecentlyUsedNeverThisCallsExperts) {
   ExpertLru lru;
   int layer;

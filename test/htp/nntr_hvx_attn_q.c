@@ -442,7 +442,7 @@ typedef struct {
   uint32_t bad; /**< NNTR_Q16_DIAG: lanes off the scalar reference */
 } q16_ctx;
 
-/* quant_u16_f32 (abs_max.h) over [n_q][n_head * hd], a row slice per lane:
+/** quant_u16_f32 (abs_max.h) over [n_q][n_head * hd], a row slice per lane:
    x * inv[h] + (zp + 0.5), clamped to [0, 65535], truncated (Vw_equals_Vsf,
    the numeric round-to-zero convert), 64 lanes a store. */
 static void q16_worker(uint32_t n_threads, uint32_t i, void *v) {
@@ -454,7 +454,7 @@ static void q16_worker(uint32_t n_threads, uint32_t i, void *v) {
 #ifdef NNTR_Q16_DIAG
   uint32_t bad = 0;
 #endif
-  /* Rows outer, heads inner: a lane walks its rows as whole 16 KiB lines
+  /** Rows outer, heads inner: a lane walks its rows as whole 16 KiB lines
      with the next row prefetched into L2, instead of 1 KiB head pieces at
      a 16 KiB stride (head outer measured 1.6 ms a 1024-row layer, ~10 GB/s
      from DDR). */
@@ -505,7 +505,7 @@ static void q16_worker(uint32_t n_threads, uint32_t i, void *v) {
 #endif
 }
 
-/* Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
+/** Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
    converts), the lengths in elements. */
 static int attn_q2_step_impl(
   remote_handle64 handle, uint32 kv_handle, uint32 row0, const uint16 *k_rows,

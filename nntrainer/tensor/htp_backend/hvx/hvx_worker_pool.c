@@ -30,7 +30,7 @@
  *         same instruction ggml-hexagon's work-queue.c uses while a job is
  *         in flight. */
 static inline void hvx_worker_pool_pause(void) {
-  /* The host check (test/htp/host) builds this file with a pthread stand-in
+  /** The host check (test/htp/host) builds this file with a pthread stand-in
      for QuRT; a plain spin is fine there. */
 #if defined(__hexagon__)
   asm volatile(" pause(#255)\n");
@@ -148,7 +148,7 @@ static void hvx_worker_pool_thread_entry(void *arg) {
       qurt_thread_exit(0);
     }
 
-    /* seqn first: a publish between this read and the futex wait below
+    /** seqn first: a publish between this read and the futex wait below
        changes it, and qurt_futex_wait returns at once on a mismatch, so
        no wake is lost. */
     const uint32_t seqn =
@@ -157,7 +157,7 @@ static void hvx_worker_pool_thread_entry(void *arg) {
       atomic_load_explicit(&pool->fg_id, memory_order_acquire);
     if (fg != prev_fg) {
       const hvx_worker_job job = pool->job[fg & 1u];
-      /* The fields above are job fg's only if fg_id has not moved since
+      /** The fields above are job fg's only if fg_id has not moved since
          the acquire load: the caller writes a slot before its release
          increment, and rewrites this one only two jobs on (see
          hvx_worker_job). A moved fg_id means job fg completed without
@@ -176,12 +176,12 @@ static void hvx_worker_pool_thread_entry(void *arg) {
       // me->id >= n_threads: this job didn't need this worker.
       continue;
     }
-    /* One background unit, then back to the top: a foreground job that
+    /** One background unit, then back to the top: a foreground job that
        arrived meanwhile is served before the next unit. */
     if (hvx_worker_pool_bg_take_one(pool)) {
       continue;
     }
-    /* Spin before sleeping. The MoE kernel submits an epilogue every ~47
+    /** Spin before sleeping. The MoE kernel submits an epilogue every ~47
        us and runs a requant every block, and a futex wake is several
        microseconds a worker each time -- paid ~140 times a call, and
        what the profile reads in the DEQUANT and REQUANT columns after
@@ -380,7 +380,7 @@ void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
     return;
   }
   hvx_worker_pool_bg_pop(pool);
-  /* Ring full: the oldest job has to finish first. Helping while waiting
+  /** Ring full: the oldest job has to finish first. Helping while waiting
      is what makes that finish. */
   while (atomic_load_explicit(&pool->bg_tail, memory_order_relaxed) -
            atomic_load_explicit(&pool->bg_head, memory_order_relaxed) >=
@@ -430,7 +430,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   hvx_worker_pool_wait(pool);
   if (!pool || pool->n_workers == 0 || n_units <= 1) {
-    /* ONE slice, not n_units of them. func(n_units, 0, ctx) means "act as
+    /** ONE slice, not n_units of them. func(n_units, 0, ctx) means "act as
        worker 0 of n_units", so with no pool it ran 1/n_units of the work
        and silently dropped the rest -- doc 43 section 7's L1 correction is
        an entry about exactly that, where a test used NULL as a "serial

@@ -57,7 +57,7 @@
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h> // cuda::drain_if_async
-#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#include <cuda_fc_qs4cx.h>        // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
 
 #include <activation_realizer.h>
@@ -148,6 +148,117 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::NONE:
   default:
     return Tensor::Map<float>(buf, bytes, dim, 0);
+  }
+}
+
+/**
+ * @brief [#150] NNTR_OP_TIME=1: wall time of every node's decode call
+ *        (to - from == 1), one line per node at exit, for
+ *        tools/htp/op_time_report.py. Off, it costs one predicted branch
+ *        per node and never touches a tensor. Unlike the --profile build it
+ *        builds no string per call and starts no sampler thread, so it can
+ *        ride the TPS binary.
+ *
+ * ponytail: indexed by execution order, one process-wide table. Two models
+ * in one process would add into the same rows; the CausalLM app runs one.
+ */
+struct OpTimeTable {
+  struct Row {
+    std::string name, type;
+    uint64_t calls = 0, sum_ns = 0, min_ns = UINT64_MAX, max_ns = 0;
+    size_t wbytes = 0;
+  };
+  std::vector<Row> rows;
+
+  static bool on() {
+    static const bool v = [] {
+      const char *e = std::getenv("NNTR_OP_TIME");
+      return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+  }
+
+  void add(size_t f, LayerNode &node, uint64_t ns) {
+    if (f >= rows.size())
+      rows.resize(f + 1);
+    Row &r = rows[f];
+    if (r.calls++ == 0) {
+      r.name = node.getName();
+      r.type = node.getType();
+      for (unsigned int i = 0; i < node.getNumWeights(); ++i)
+        r.wbytes += node.getWeight(i).getMemoryBytes();
+    }
+    r.sum_ns += ns;
+    r.min_ns = std::min(r.min_ns, ns);
+    r.max_ns = std::max(r.max_ns, ns);
+  }
+
+  ~OpTimeTable() {
+    for (size_t f = 0; f < rows.size(); ++f) {
+      const Row &r = rows[f];
+      if (r.calls == 0)
+        continue;
+      std::fprintf(stderr,
+                   "[OP-TIME] node f=%zu name=%s type=%s calls=%llu "
+                   "sum_us=%.3f min_us=%.3f max_us=%.3f wbytes=%zu\n",
+                   f, r.name.c_str(), r.type.c_str(),
+                   static_cast<unsigned long long>(r.calls), r.sum_ns / 1e3,
+                   r.min_ns / 1e3, r.max_ns / 1e3, r.wbytes);
+    }
+  }
+};
+
+OpTimeTable g_op_time;
+
+/**
+ * @brief NNTR_ACT_STATS=1: after every node of the first prefill (from == 0,
+ *        to - from > 1), one stderr line per FP32 output -- NaN and Inf
+ *        counts, max |x| and rms over the rows that call wrote -- so an
+ *        all-NPU run diffed against the device's own CPU (NEON) run names
+ *        the first node whose output leaves it (doc 57 section 9.20).
+ *        Never in a tok/s run: a full read of every output.
+ */
+void actStats(LayerNode &node, unsigned int rows) {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_ACT_STATS");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  if (!on)
+    return;
+  for (unsigned int i = 0; i < node.getNumOutputs(); ++i) {
+    const Tensor &t = node.getOutput(i);
+    if (t.empty() || t.getDataType() != TensorDim::DataType::FP32)
+      continue;
+    const TensorDim &d = t.getDim();
+    const size_t n =
+      std::min<size_t>(rows, d.height()) * d.width() * d.channel();
+    const float *p = t.getData<float>();
+    // rms over the finite values and over the first row alone, so a CPU
+    // run and an accelerator run of the same prompt line up node by node
+    const size_t row = static_cast<size_t>(d.width()) * d.channel();
+    size_t nan = 0, inf = 0;
+    float mx = 0.0f;
+    double ss = 0.0, ss0 = 0.0;
+    for (size_t k = 0; k < n; ++k) {
+      const float v = p[k];
+      if (std::isnan(v)) {
+        ++nan;
+      } else if (std::isinf(v)) {
+        ++inf;
+      } else {
+        mx = std::max(mx, std::fabs(v));
+        ss += static_cast<double>(v) * v;
+        if (k < row)
+          ss0 += static_cast<double>(v) * v;
+      }
+    }
+    const size_t fin = n - nan - inf;
+    std::fprintf(stderr,
+                 "[ACT] %s out%u n=%zu nan=%zu inf=%zu maxabs=%g rms=%g "
+                 "rms_row0=%g\n",
+                 node.getName().c_str(), i, n, nan, inf, mx,
+                 fin ? std::sqrt(ss / fin) : 0.0,
+                 row ? std::sqrt(ss0 / std::min(row, n ? n : 1)) : 0.0);
   }
 }
 
@@ -732,9 +843,21 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
           end_layer - start_layer);
         std::cout << "LAYERPROF\t" << (to - from) << "\t" << node->getName()
                   << "\t" << duration_.count() << "\n";
+        if (to - from == 1 && OpTimeTable::on())
+          g_op_time.add(f, *node, duration_.count());
+      } else if (to - from == 1 && OpTimeTable::on()) {
+        model_graph.flushCacheExcept(f);
+        const auto t0 = std::chrono::steady_clock::now();
+        node->incremental_forwarding(from, to, training);
+        g_op_time.add(f, *node,
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count());
       } else {
         model_graph.flushCacheExcept(f);
         node->incremental_forwarding(from, to, training);
+        if (from == 0 && to - from > 1)
+          actStats(*node, to - from);
       }
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
       // Debug: NNTR_DUMP_ROWS_DIR=<dir> writes each node's output rows of the
@@ -1427,7 +1550,9 @@ void NeuralNetwork::load(const std::string &file_path,
             tensor_data_type != TensorDim::DataType::FP16 &&
             tensor_data_type != TensorDim::DataType::Q6_K &&
             tensor_data_type != TensorDim::DataType::Q4_0 &&
-            tensor_data_type != TensorDim::DataType::QS4CX) {
+            tensor_data_type != TensorDim::DataType::QS4CX &&
+            tensor_data_type != TensorDim::DataType::QS4CX_WH &&
+            tensor_data_type != TensorDim::DataType::QS2CX_WH) {
           // for tensor with qparam
           size += sizeof(uint16_t);
           // ... but only CharTensor, ShortTensor, UIntTensor (UINT8/16/32),
@@ -2157,6 +2282,26 @@ void NeuralNetwork::load(const std::string &file_path,
 
     // Parse header: name -> (offset_start, size_in_bytes)
     auto name_offset_map = safetensors::parseHeader(header_json);
+
+    // A Q4_0 tensor is repacked into an ISA-specific layout that is
+    // indistinguishable from the header alone (save() records which one at
+    // nntr_q4_0_isa, see above). Loading the wrong one is not an error at
+    // the repack/dequant call site -- it silently reads garbage. Refuse it
+    // here instead.
+    auto metadata = safetensors::parseMetadata(header_json);
+    auto isa_it = metadata.find("nntr_q4_0_isa");
+    if (isa_it != metadata.end()) {
+#if defined(__aarch64__) || defined(__arm__)
+      const char *expected_isa = "arm";
+#else
+      const char *expected_isa = "x86";
+#endif
+      NNTR_THROW_IF(isa_it->second != expected_isa, std::runtime_error)
+        << "safetensors file " << f_path << " has Q4_0 weights packed for '"
+        << isa_it->second << "' but this build expects '" << expected_isa
+        << "'. Re-quantize with --isa " << expected_isa
+        << " (nntr_quantize), or run on a matching target.";
+    }
 
     // Assign file offsets to each weight by name
     std::unordered_set<const Tensor *> visited_st;

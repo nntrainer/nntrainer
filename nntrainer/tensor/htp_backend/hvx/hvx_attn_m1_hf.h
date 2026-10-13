@@ -198,7 +198,7 @@ static inline HVX_Vector hvx_hf_exp16_sf(HVX_Vector x) {
   x = Q6_Vsf_vmax_VsfVsf(x, hvx_splat_sf(ATTN_M1_DET_EXP_LO));
   const HVX_Vector fx = hvx_hf_add_rn(
     hvx_hf_mul_rn(x, hvx_splat_sf(ATTN_M1_DET_LOG2EF)), hvx_splat_sf(0.5f));
-  /* floor(fx): the nearest integer, minus 1 where it is above fx (fx - r
+  /** floor(fx): the nearest integer, minus 1 where it is above fx (fx - r
      is exact and never -0: fx is not an integer near 0). */
   const HVX_Vector r = hvx_hf_sub_rn(hvx_hf_add_rn(fx, magic), magic);
   const HVX_VectorPred above =

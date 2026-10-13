@@ -186,7 +186,7 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
       act_bytes / act_rs, act_rs, 0u, vtcm_act);
   act_push = n - 1u;
 
-  /* Block i (one per expert at M=1): the activation wait, GU(i)'s chunk
+  /** Block i (one per expert at M=1): the activation wait, GU(i)'s chunk
      waits, the next block's activation and gate_up, DN(i-1)'s chunk waits,
      then down[i] into the buffer DN(i-1) has just finished reading. */
   uint32_t dn_n = 0u;

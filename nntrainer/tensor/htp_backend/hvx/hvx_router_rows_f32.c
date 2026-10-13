@@ -39,7 +39,7 @@ typedef struct {
   float eps;
 } rows_ctx;
 
-/* One (rows, logit-vectors) block over w rows [k0, k1): NR x EV
+/** One (rows, logit-vectors) block over w rows [k0, k1): NR x EV
  * accumulators and the EV vectors of one w row as compile-time constants,
  * so they live in registers and a w row is loaded once per k for all NR
  * rows. The runtime-indexed acc[RB][EV_MAX] this replaces spilled to the
@@ -101,7 +101,7 @@ static const rows_block_fn kRowsBlock[EV_MAX][RB] = {
   {rows_block_4x1, rows_block_4x2, rows_block_4x3, rows_block_4x4},
 };
 
-/* With gamma, each RB x KB block of x is normalized into a 4 KiB scratch
+/** With gamma, each RB x KB block of x is normalized into a 4 KiB scratch
  * just before its dots -- hvx_rmsnorm_row_f32's two IEEE multiplies,
  * (x * rs) * gamma, on the same lanes, so the same floats -- instead of the
  * whole M x K normalized copy a separate norm pass writes and this reads
@@ -202,7 +202,7 @@ static void topk_worker(uint32_t n_threads, uint32_t i, void *v) {
   for (uint32_t r = lo; r < hi; ++r) {
     const float *pr = c->p + (size_t)r * c->E;
     uint32_t *sr = c->sel + (size_t)r * c->n_sel;
-    /* One pass keeping the n_sel largest sorted, instead of n_sel passes
+    /** One pass keeping the n_sel largest sorted, instead of n_sel passes
        of a first-maximum scan (2.7 ms of a 9 ms prefill router call on
        device, doc 57 section 9.28). An index goes in after every kept
        entry whose value is >= its own, so equal values stay in index

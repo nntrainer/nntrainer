@@ -763,6 +763,21 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QS4CX:
     dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QS2CX_WH:
+    // Same as below, and one step further out of reach: the codes are two
+    // bits into a palette and have to be expanded in VTCM first.
+  case Tdatatype::QS4CX_WH:
+    // Reaching a CPU kernel at all is the error. These nibbles are in the
+    // HMX unit's weight-tile layout (htp_wh_layout.h), which no kernel here
+    // can read, so the weight has to go to the accelerator or not be built
+    // this way. Named rather than left to the default, because "unsupported
+    // datatype" says nothing about which of the two to change.
+    throw std::invalid_argument(
+      "QS4CX_WH / QS2CX_WH weights have no CPU kernel: they are pre-arranged "
+      "for the HTP. Either route this layer to the HTP (nntr_config.json: "
+      "\"moe_engine\": \"htp\", and every MoE layer listed in "
+      "\"moe_htp_layers\" -- an empty value means all of them), or "
+      "re-quantize with --moe_dtype QS4CX.");
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
@@ -776,9 +791,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
-  // Handle standard inputs. The batched fast path is Q4_0-only: int4 weights
-  // are QS4CX and go through the per-item dot above.
-  if (input_dtype != Tdatatype::Q4_0) {
+  // Group accelerator QS4CX projections that share the same activation.
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QS4CX) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -802,12 +816,32 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   // non-accel branch below therefore has to take it from the CPU table
   // explicitly rather than from this (possibly accelerator) tensor's ops.
   auto *cpu_o = nntrainer::getComputeOps();
-  if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
-    o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
-  } else {
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
-                            Ns[i]);
+  if (input_dtype == Tdatatype::Q4_0) {
+    if (o->supports_gemm_q4_0_batch_fp32() &&
+        (M > 1 || o->accelerates_q4_0_at_m1())) {
+      o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
+    } else {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                              Ns[i]);
+      }
+    }
+  } else if (input_dtype == Tdatatype::QS4CX) {
+    // Same shared-activation grouping as the Q4_0 branch above (decode's
+    // top-K experts' gate_up projections); without this branch these
+    // weights fell through to the "standard inputs" loop at the top of
+    // this function, i.e. one dot() -- one FastRPC call -- per expert.
+    if (o->supports_gemm_qs4cx_batch_fp32() &&
+        (M > 1 || o->accelerates_qs4cx_at_m1())) {
+      std::vector<float *> ascales;
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        ascales.push_back(input[i]->getScale<float>());
+      }
+      o->gemm_qs4cx_batch_fp32(mdatas, ascales, data, rdatas, M, Ns, K);
+    } else {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        dot(*input[i], *output[i], trans, trans_in, beta);
+      }
     }
   }
 }
@@ -981,7 +1015,8 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
+    if (o->supports_gemm_q4_0_accel_fp32() &&
+        (M > 1 || o->accelerates_q4_0_at_m1())) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
       // Scalar Q4_0 GEMM/GEMV is a CPU-table op (an accelerator ComputeOps
@@ -1046,6 +1081,21 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
+
+  // An accelerator that takes QS4CX directly skips the Q4_0 detour: the
+  // weight was quantized once, from FP32, and the int4 values on disk are
+  // already the ones the accelerator's registry wants. The M == 1 gate is
+  // the backend's own answer for this format: it may want decode's row
+  // too, rather than a CPU kernel on the same bytes.
+  auto *o = getOps();
+  if (o->supports_gemm_qs4cx_accel_fp32() &&
+      (M > 1 || o->accelerates_qs4cx_at_m1())) {
+    o->gemm_qs4cx_accel_fp32(input.getData<char>(), input.getScale<float>(),
+                             (float *)getData(), output.getData<float>(), M, N,
+                             K);
+    return output;
+  }
+
   // Every arm below reads the plain nibbles (directly, or through a pack that
   // was built from them). A weight whose payload a GPU backend released after
   // its device repack must be refused here, not multiplied as zeros.

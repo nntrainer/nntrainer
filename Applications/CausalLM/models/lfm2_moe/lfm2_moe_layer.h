@@ -37,6 +37,9 @@
 
 namespace causallm {
 
+/** Reset the HTP expert registry after workers and model layers are gone. */
+void resetLfm2HtpExpertPool();
+
 /**
  * @class   Lfm2MoELayer
  * @brief   Mixture-of-Experts layer for LFM2-MoE (sigmoid router + expert bias)

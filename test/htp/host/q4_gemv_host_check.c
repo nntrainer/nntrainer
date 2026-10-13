@@ -529,7 +529,7 @@ static void check_native_quant(native_stats *st) {
 }
 
 int main(void) {
-  /* the five FC shapes, then two with K % 128 == 64 (the quantizer's
+  /** the five FC shapes, then two with K % 128 == 64 (the quantizer's
      pair tail; the fixtures' dense down has K = 64, #132 Part B) */
   static const uint32_t shapes[7][2] = {
     {2048u, 6144u}, {2048u, 2048u}, {2048u, 512u}, {7168u, 2048u},

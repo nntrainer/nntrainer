@@ -278,10 +278,11 @@ TEST_F(HtpFc, LayerCostQwen3) {
       std::vector<float> bias(s.N);
       fill_deterministic(bias.data(), bias.size(), 0xFC000002u);
 
-      /** kGroupMax registrations of the same bytes, so a group call has distinct
-       * handles to prefetch across. init_us is the FIRST bake only: it is the
-       * per-weight one-time cost a graph prepare corresponds to, and averaging
-       * three of them would only measure the same work three times. */
+      /** kGroupMax registrations of the same bytes, so a group call has
+       * distinct handles to prefetch across. init_us is the FIRST bake only: it
+       * is the per-weight one-time cost a graph prepare corresponds to, and
+       * averaging three of them would only measure the same work three times.
+       */
       uint32_t handles[kGroupMax];
       double init_us = 0.0;
       for (uint32_t g = 0; g < kGroupMax; ++g) {
@@ -326,10 +327,11 @@ TEST_F(HtpFc, LayerCostQwen3) {
           std::cout << "FC_FIELD path=env field=ion_buffers value="
                     << ((abuf.ion && obuf.ion) ? 1 : 0) << std::endl;
 
-          /** PRODUCTION path: mm_u8i8_layer leaves the DSP's in-loop probes off,
-           * which is what a real caller pays and therefore what the headline
-           * reports. The instrumented runs below are for the breakdown, and the
-           * gap between them is published rather than folded in. */
+          /** PRODUCTION path: mm_u8i8_layer leaves the DSP's in-loop probes
+           * off, which is what a real caller pays and therefore what the
+           * headline reports. The instrumented runs below are for the
+           * breakdown, and the gap between them is published rather than folded
+           * in. */
           double iter[kIters];
           for (int r = 0; r < kIters; ++r) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -392,10 +394,10 @@ TEST_F(HtpFc, LayerCostQwen3) {
                              << M;
           const int timed_ok = (diff == 0) ? 1 : 0;
 
-          /** MEDIAN of the probe runs, not the min: wall clock on this device is
-           * bimodal at roughly +-25% run to run (DVFS residency, not our code),
-           * so the min publishes whichever run landed in the fast state. It
-           * stays a single measured run rather than a mean, so the stage
+          /** MEDIAN of the probe runs, not the min: wall clock on this device
+           * is bimodal at roughly +-25% run to run (DVFS residency, not our
+           * code), so the min publishes whichever run landed in the fast state.
+           * It stays a single measured run rather than a mean, so the stage
            * breakdown beside it comes from that same run and sums to its own
            * dsp_total. */
           int ord[kProbeRuns];

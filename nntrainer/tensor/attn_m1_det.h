@@ -140,7 +140,7 @@
 /** @brief The CPU's score accumulators: one float16x8_t over d = 8 blk + l. */
 #define ATTN_M1_DET_ACC 8u
 
-/*
+/**
  * THE PHASE WORDS (#146) -- a measurement channel, not arithmetic. A
  * caller that passes 2 * n_q + ATTN_M1_PROF_WORDS stats floats to the
  * attn_m1_forward entry receives the (m, l) pairs followed by these uint32
@@ -243,7 +243,7 @@ static inline float attn_m1_det_fma16(float c, float a, float b) {
   const uint32_t e = attn_m1_det_bits(err);
   uint32_t u = attn_m1_det_bits(s);
   if (e != 0u) {
-    /* Round to odd: one step toward zero when the exact sum is smaller in
+    /** Round to odd: one step toward zero when the exact sum is smaller in
        magnitude than s (err's sign differs), then the last bit set. err is
        never -0 (x - x is +0), and s is never 0 when err is not. */
     if ((e ^ u) & 0x80000000u) {
@@ -272,7 +272,7 @@ static inline float attn_m1_det_exp_ps(float x) {
                              (float)1.6666665459E-1, (float)5.0000001201E-1};
   x = (x < ATTN_M1_DET_EXP_HI) ? x : ATTN_M1_DET_EXP_HI;
   x = (x > ATTN_M1_DET_EXP_LO) ? x : ATTN_M1_DET_EXP_LO;
-  /* The fused x * LOG2EF + 0.5, rounded once: exact in double, then one
+  /** The fused x * LOG2EF + 0.5, rounded once: exact in double, then one
      rounding to f32. volatile keeps a host from evaluating it wider. */
   volatile double fxd = (double)x * (double)ATTN_M1_DET_LOG2EF + 0.5;
   float fx = (float)fxd;
@@ -305,7 +305,7 @@ static inline float attn_m1_det_exp16(float d) {
   return attn_m1_det_rne16(attn_m1_det_exp_ps(d));
 }
 
-/*
+/**
  * THE EXP TABLE (the kernel's form of exp16 for d <= 0). Index 0 holds
  * exp16(0) and serves every |d| < 2^-14 (fp16 zero and subnormals, where
  * exp16 is 1.0 too); index i >= 1 holds the fp16 magnitude whose f32 bits

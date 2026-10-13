@@ -118,7 +118,7 @@ static inline float swiglu_det_exp(float x) {
     x = SWIGLU_DET_EXP_MIN;
   }
 
-  /* nearbyintf under the default rounding mode is round-to-nearest-even,
+  /** nearbyintf under the default rounding mode is round-to-nearest-even,
      which is what the DSP's hvx_sf_to_w_rne and NEON's vcvtnq_s32_f32 both
      do. Nothing in nntrainer changes the mode. Rolling this by hand as a
      bias-and-truncate is a trap -- the obvious version sends -2.5 to -4. */
@@ -138,10 +138,10 @@ static inline float swiglu_det_exp(float x) {
   p = swiglu_det_add(swiglu_det_mul(p, r), 1.0f);
 
   const int32_t pb = swiglu_det_bits(p);
-  /* p is in [0.707, 1.414], so this is 126 or 127. Sign off, exponent
+  /** p is in [0.707, 1.414], so this is 126 or 127. Sign off, exponent
      down. */
   const int32_t p_exp = (int32_t)(((uint32_t)pb << 1) >> 24);
-  /* At or below zero the true result is subnormal or smaller and the bit
+  /** At or below zero the true result is subnormal or smaller and the bit
      add produced garbage rather than a small number: at x = -88 it yields
      3.5e-40 where the answer is 6.1e-39. Flush to zero, which is also
      where the host reference lands. `<=`, not `<` -- equality is the case

@@ -67,7 +67,7 @@
 #include "hvx_m1_ops_f32.h"
 #include "m1_ops_det.h"
 
-/* The pool, run in place of the pthread pool: min(n_units, 3) lanes called
+/** The pool, run in place of the pthread pool: min(n_units, 3) lanes called
    one after another on the caller -- lanes are independent by the pool's
    contract, and three lanes over the router's four chain groups give lane
    0 two groups, so the lane start and step (#132 PR 2) are exercised. */
@@ -240,7 +240,7 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
 
 /* ---- RMSNorm row scale vs the Android CPU (#164) ----------------------- */
 
-/* Written from the aarch64 disassembly of the shipped libnntrainer.so's
+/** Written from the aarch64 disassembly of the shipped libnntrainer.so's
    neon::rms_norm_wrt_width_fp32_intrinsic (plan 164 section 0), NOT from
    m1_ops_det.h: four float32x4 fmla accumulators, faddp twice per vector,
    the four in order, fdiv by W, fadd eps, fsqrt, fdiv 1 / q. Mutant 0 is
@@ -342,7 +342,7 @@ static uint32_t norm_row(const float *x, const float *gamma, float *y,
 
 static void check_norm_cpu_order(void) {
   enum { ROWS = 20000 };
-  /* [plan 201 S4] 2816: Gemma's hidden, not a power of two -- the CPU
+  /** [plan 201 S4] 2816: Gemma's hidden, not a power of two -- the CPU
      model's fdiv by W against the spec's cpu_det_div_rn */
   static const uint32_t widths[3] = {2048u, 64u, 2816u};
   const float eps = 1e-5f;
@@ -357,7 +357,7 @@ static void check_norm_cpu_order(void) {
       fill_row(x, W, kind);
       bad += norm_row(x, g, y, W, eps, caught);
     }
-    /* 2048: 2 000 rows; 64: 18 000; 2816: 2 000 -- one magnitude 2^e, e in
+    /** 2048: 2 000 rows; 64: 18 000; 2816: 2 000 -- one magnitude 2^e, e in
        [-20, 20], per row, elements +-[0.5, 1) 2^e */
     const uint32_t n = w != 1 ? ROWS / 10 : ROWS - ROWS / 10;
     for (uint32_t k = 0; k < n; ++k, ++rows) {
@@ -417,7 +417,7 @@ static void check_sqrt_recip_rn(void) {
   for (uint32_t u = 0x00800000u; u < 0x7f800000u; u += stride) {
     rn_one(u, &n, &bad_s, &bad_r);
   }
-  /* +-4 ulp around every power of two: the exponent edges, where the
+  /** +-4 ulp around every power of two: the exponent edges, where the
      mantissa wraps and the 2^24 rounding carry happens */
   for (uint32_t e = 1u; e < 255u; ++e) {
     for (int k = -4; k <= 4; ++k) {
@@ -585,7 +585,7 @@ static void check_rope(void) {
       bad_p += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
     }
     if (positions[p] == 0u) {
-      /* cos 1, sin 0: the fp16 input itself (by value: a -0 input and a
+      /** cos 1, sin 0: the fp16 input itself (by value: a -0 input and a
          negative b give +0, as the CPU's fsub does). */
       for (int i = 0; i < N; ++i) {
         bad_identity += y_det[i] != attn_m1_det_rne16(x[i]);
@@ -804,7 +804,7 @@ static void check_conv(void) {
 
   fill_rand(w, 3u * CONV_C, -1.0f, 1.0f);
   for (uint32_t r = 0; r < CONV_ROWS; ++r) {
-    /* Rows 1..3 of the first chain and 8..10 of the second are the fixed
+    /** Rows 1..3 of the first chain and 8..10 of the second are the fixed
        kinds; the fixed row's a | b | c all take the kind. */
     const int kind = (r >= 1u && r <= 3u)    ? (int)r
                      : (r >= 8u && r <= 10u) ? (int)r - 7
@@ -813,7 +813,7 @@ static void check_conv(void) {
   }
   conv_g_rows(abc, g, CONV_ROWS);
 
-  /* (1) M=1 chain from a zero state vs the spec, and the spec vs an
+  /** (1) M=1 chain from a zero state vs the spec, and the spec vs an
      independent model of the Android CPU's decode (neon
      causal_depthwise_conv1d_k3_decode: vmulq, then two vfmaq -- fmaf
      here -- then the gate). [#132 E5c] No longer against the prefill
@@ -838,7 +838,7 @@ static void check_conv(void) {
         "conv_gate_m1 (prefill state): differs from the CPU's fused order");
   (void)z;
 
-  /* (3) Tolerance of the spec, rows 7..14, against plain fp32 in the CPU
+  /** (3) Tolerance of the spec, rows 7..14, against plain fp32 in the CPU
      order and against double. */
   double max_rel32 = 0.0, max_rel64 = 0.0;
   for (uint32_t r = 0; r < CONV_CHAIN; ++r) {
@@ -1065,7 +1065,7 @@ static void check_router_vs_cpu(void) {
   router_inputs(x, w, w32, bias, K, E, top_k, 0);
   for (uint32_t row = 0; row < ROWS + TIE_ROWS; ++row) {
     if (row < ROWS) {
-      /* magnitudes 2^-20 .. 2^20 across rows: the chain's rounding at
+      /** magnitudes 2^-20 .. 2^20 across rows: the chain's rounding at
          every scale */
       const float m = ldexpf(1.0f, (int)(row % 41u) - 20);
       fill_rand(x, K, -2.0f * m, 2.0f * m);
@@ -1204,7 +1204,7 @@ static void check_swiglu_argmax(void) {
       }
     }
     if (row == 2) {
-      /* -y a few ulps either side of every floor boundary of fx,
+      /** -y a few ulps either side of every floor boundary of fx,
          (k - 0.5) / log2(e) */
       for (uint32_t i = 0; i < N; ++i) {
         const int k = (int)(i / 56u) - 127;
@@ -1406,7 +1406,7 @@ static void check_router_softmax(void) {
       fill_rand(w, H * E, -1.0f, 1.0f);
       uint32_t e1 = 0, e2 = 0;
       if (tie) {
-        /* e1 < e2 share a column: equal logits, equal p; with every other
+        /** e1 < e2 share a column: equal logits, equal p; with every other
            column scaled down they are the top two, so top_k >= 2 takes
            e1 first */
         e1 = (g_seed >> 8) % (E - 1u);

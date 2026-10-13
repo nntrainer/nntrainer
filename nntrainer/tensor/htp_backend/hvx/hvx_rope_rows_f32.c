@@ -40,7 +40,7 @@ void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs_row) {
     HVX_UVector *vb = (HVX_UVector *)(head + half);
     for (uint32_t k = 0; k < nvec; ++k) {
       const HVX_Vector a = va[k], b = vb[k];
-      /* a*cos - b*sin and a*sin + b*cos, each product rounded once as
+      /** a*cos - b*sin and a*sin + b*cos, each product rounded once as
          the CPU's (no fused multiply-add there either) */
       va[k] = Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(a, vc[k]),
                                  Q6_Vsf_vmpy_VsfVsf(b, vs[k]));
@@ -50,7 +50,7 @@ void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs_row) {
   }
 }
 
-/* chunk != 0: the row's RMSNorm first (hvx_rmsnorm_rows_ld_f32's, chunk by
+/** chunk != 0: the row's RMSNorm first (hvx_rmsnorm_rows_ld_f32's, chunk by
    chunk), then its RoPE while the row is still in cache -- one pass over
    the qkv output instead of two (doc: 63 + 55 ms of a 1024-row prefill on
    the S26 Ultra, more than the matmul's 87). */

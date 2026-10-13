@@ -174,7 +174,7 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
   const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
   const float *weights) {
-  /* One output row's n_tiles vectors, [47:32] stride, [31:16] width, [15:0]
+  /** One output row's n_tiles vectors, [47:32] stride, [31:16] width, [15:0]
      height. A hint: it moves no bits. Three rows ahead, the most a lane
      can queue (the hardware stalls the thread on a fourth). */
   const uint64_t box = ((uint64_t)(n_tiles * 128u) << 32) |
@@ -220,7 +220,7 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
     const int32_t *tile =
       (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-    /* Which half of a gate_up result this tile belongs to. A caller with one
+    /** Which half of a gate_up result this tile belongs to. A caller with one
        destination passes a split past the last column, so this always takes
        dst_a and never reads dst_b. */
     float *out =
@@ -316,7 +316,7 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     const int32_t *ut =
       (const int32_t *)(c->tiles_base +
                         (size_t)(c->n_pairs + j) * c->tile_stride);
-    /* Loop-invariant per tile, exactly as hvx_dequant_acc_tile_to_f32
+    /** Loop-invariant per tile, exactly as hvx_dequant_acc_tile_to_f32
        hoists them. */
     const HVX_Vector csg =
       Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_w + cg))[0]);
@@ -327,7 +327,7 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
     const HVX_Vector vwu = ((const HVX_UVector *)(c->w_scale + cu))[0];
     const HVX_Vector vbu = ((const HVX_UVector *)(c->bias + cu))[0];
 
-    /* Four rows an iteration: the GLU is ~50 dependent HVX ops a row, so
+    /** Four rows an iteration: the GLU is ~50 dependent HVX ops a row, so
        one row in flight stalls on latency the whole way (DQ_TILE_ROW's
        reason); four independent chains in one block let them interleave.
        Each row's operations are unchanged. */

@@ -507,6 +507,7 @@ if get_option('enable-test')
   causallm_fixture_tars = [
     meson.source_root() / 'packaging' / 'causallm_reference_generation.tar.gz',
     meson.source_root() / 'packaging' / 'causallm_reference_embedding.tar.gz',
+    meson.source_root() / 'packaging' / 'causallm_reference_gemma4_htp.tar.gz',
   ]
   # The tarballs already contain a top-level `causallm_reference/` directory, so
   # extract into models/ (NOT models/causallm_reference/, which would double the
@@ -564,6 +565,9 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_htp.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_slim_moe.cpp',

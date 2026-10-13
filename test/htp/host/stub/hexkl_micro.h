@@ -1,6 +1,12 @@
+/**
+ * @file hexkl_micro.h
+ * @brief hexkl micro.
+ * @author NNTrainer contributors
+ * @bug See the project issue tracker.
+ */
 #ifndef HEXKL_MICRO_H
 #define HEXKL_MICRO_H
-/* Host stand-in for HexKL's hexkl_micro.h: the constants the kernels lay
+/** Host stand-in for HexKL's hexkl_micro.h: the constants the kernels lay
    VTCM out with and the prototypes of every micro call the skel subset
    makes (hexkl_addon beta.2's signatures; hw_init is the three-argument
    form). The host checks define the tile calls (standin/hvx_scalar.c) and

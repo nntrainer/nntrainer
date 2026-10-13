@@ -33,7 +33,7 @@
 
 #define EXPORT __attribute__((visibility("default")))
 
-/* rpcmem.h's entries, as HtpRpcMemApi::get() casts them (the SDK header
+/** rpcmem.h's entries, as HtpRpcMemApi::get() casts them (the SDK header
    lives outside incs/, and nothing here needs more than these). */
 EXPORT void rpcmem_init(void);
 EXPORT void rpcmem_deinit(void);
@@ -52,14 +52,14 @@ typedef struct {
   int stale;  /**< a refused map the "driver" still holds (see below) */
   int refs;   /**< HAP_mmap_get minus HAP_mmap_put on the DSP side */
 } rpc_buf;
-/* [#132 Part B E5g] NNTR_INPROC_MMAP_CAP_MIB=<n>: refuse a map that takes
+/** [#132 Part B E5g] NNTR_INPROC_MMAP_CAP_MIB=<n>: refuse a map that takes
    a domain past n MiB (the device's AEE_EMMAP), and keep the fd's entry
    after the refusal until it is unmapped, as the device's driver did
    (a re-map of that fd number is AEE_EALREADY). 0 / unset: no cap. */
 static size_t g_mapped_by_dom[16];
 static rpc_buf g_bufs[RPC_MAX_BUFS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-/* [#132 Part B E5i] buffers rpcmem_free'd while still fastrpc_mmap'd:
+/** [#132 Part B E5i] buffers rpcmem_free'd while still fastrpc_mmap'd:
    E5f-E5h's lost 256 MiB windows came after runs that left the S1 arena
    mapped to process exit. Printed with what is still mapped at exit. */
 static unsigned g_freed_mapped;
@@ -182,7 +182,7 @@ EXPORT int fastrpc_munmap(int domain, int fd, void *addr, size_t length) {
   rpc_buf *b = buf_of_fd(fd);
   if (!b)
     return AEE_EBADPARM;
-  /* modelled: the DSP side still holds it (HAP_mmap_get without its put;
+  /** modelled: the DSP side still holds it (HAP_mmap_get without its put;
      an attached arena), so it is not the ARM side's to unmap yet */
   if (b->refs > 0)
     return AEE_EBADSTATE;
@@ -194,7 +194,7 @@ EXPORT int fastrpc_munmap(int domain, int fd, void *addr, size_t length) {
   return AEE_SUCCESS;
 }
 
-/* ---- HAP_mem.h: the DSP side of the same fds. An fd the ARM side has
+/** ---- HAP_mem.h: the DSP side of the same fds. An fd the ARM side has
    not fastrpc_mmap'd is refused, as the device refuses it, so a dropped
    or reordered mapping fails here and not on the phone. ---- */
 EXPORT int HAP_mmap_get(int fd, void **vaddr, uint64 *paddr) {
@@ -231,7 +231,7 @@ EXPORT int HAP_power_set(void *context, HAP_power_request_t *request) {
   return AEE_SUCCESS;
 }
 
-/* ---- HAP_debug.h: FARF's sink. Errors always reach stderr; the rest
+/** ---- HAP_debug.h: FARF's sink. Errors always reach stderr; the rest
    only with NNTR_HTP_FARF set, so a gate's output stays readable. ---- */
 static int farf_all(void) {
   static int on = -1;
@@ -266,7 +266,7 @@ EXPORT void HAP_debug_runtime(int level, const char *file, int line,
   va_end(ap);
 }
 
-/* [#260 r3] #4415's router on u8 x i8 HMX (opt-in) registers its weight
+/** [#260 r3] #4415's router on u8 x i8 HMX (opt-in) registers its weight
    through nntr_hvx_mm_u8i8.c, which this build leaves out (its kernels
    need intrinsics hvx_emu lacks). Refused here, as a skel without it
    would: the backend keeps the f32 router. */

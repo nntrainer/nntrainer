@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   mha_core.h
+ * @file   htp_mha_core.h
  * @date   02 September 2024
  * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
@@ -21,8 +21,8 @@
  *         which takes all input seqences at once.
  */
 
-#ifndef __MHA_CORE_H__
-#define __MHA_CORE_H__
+#ifndef __HTP_MHA_CORE_H__
+#define __HTP_MHA_CORE_H__
 
 #pragma once
 #ifdef _WIN32
@@ -51,7 +51,8 @@
 
 namespace causallm {
 
-namespace props {
+namespace htp_mha_props {
+using namespace causallm::props;
 
 /**
  * @brief NumHeads property, NumHeads is number of head in multi head attention
@@ -192,7 +193,7 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
-}; // namespace props
+}; // namespace htp_mha_props
 
 /**
  * @class MHA Core Layer
@@ -208,7 +209,7 @@ public:
  *             [ O ]
  *
  */
-WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
+WIN_EXPORT class HtpMHACoreLayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief Registers batch 0's quantized KV cache on the accelerator now
@@ -224,25 +225,25 @@ public:
   /**
    * @brief Constructor of MhaCore Layer
    */
-  WIN_EXPORT MHACoreLayer();
+  WIN_EXPORT HtpMHACoreLayer();
 
   /**
    * @brief Destructor of MhaPost Layer
    */
-  WIN_EXPORT ~MHACoreLayer();
+  WIN_EXPORT ~HtpMHACoreLayer();
 
   /**
    *  @brief  Move constructor of CustomMultiHeadAttentionLayer.
    *  @param[in] CustomMultiHeadAttentionLayer &&
    */
   WIN_EXPORT
-  MHACoreLayer(MHACoreLayer &&rhs) noexcept = default;
+  HtpMHACoreLayer(HtpMHACoreLayer &&rhs) noexcept = default;
 
   /**
    * @brief  Move assignment operator.
    * @parma[in] rhs CustomMultiHeadAttentionLayer to be moved.
    */
-  WIN_EXPORT MHACoreLayer &operator=(MHACoreLayer &&rhs) = default;
+  WIN_EXPORT HtpMHACoreLayer &operator=(HtpMHACoreLayer &&rhs) = default;
 
   /**
    * @brief Finalize funciton of MhaCore Layer
@@ -315,7 +316,7 @@ public:
    * @copydoc Layer::getType()
    */
   WIN_EXPORT const std::string getType() const override {
-    return MHACoreLayer::type;
+    return HtpMHACoreLayer::type;
   };
 
   /**
@@ -337,9 +338,9 @@ public:
    * @brief Set the write position of the external KV cache. The host calls
    *        this when it repositions the cache -- after a load, a rewind, a
    *        session switch -- and any row of the fp16 cache may have been
-   *        rewritten by then, so the quantized mirror (props::KvCacheQuant)
-   *        is marked out of date in full and re-appended from row 0 on the
-   *        next step.
+   *        rewritten by then, so the quantized mirror
+   * (htp_mha_props::KvCacheQuant) is marked out of date in full and re-appended
+   * from row 0 on the next step.
    */
   WIN_EXPORT void setCacheIndex(unsigned int idx) {
     cache_index = idx;
@@ -353,20 +354,26 @@ public:
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
 
-  inline static const std::string type = "mha_core";
+  /** Discard mirrors from the previous independent HTP prompt. */
+  WIN_EXPORT void beginHtpPrompt();
+
+  inline static const std::string type = "htp_mha_core";
 
 private:
   std::tuple<
-    nntrainer::props::NumHeads, props::NumHeads_KV,
+    nntrainer::props::NumHeads, htp_mha_props::NumHeads_KV,
     nntrainer::props::ProjectedKeyDim, nntrainer::props::ProjectedValueDim,
     nntrainer::props::OutputShape, nntrainer::props::DropOutRate,
     nntrainer::props::ReturnAttentionWeight,
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
-    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta, props::UseRope,
-    props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopePartialRotaryFactor,
-    props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal, props::KvCacheQuant, props::AttnOutU16>
+    htp_mha_props::SlidingWindow, htp_mha_props::MaxNewTokens,
+    htp_mha_props::RopeTheta, htp_mha_props::UseRope,
+    htp_mha_props::MaxPositionEmbeddings, htp_mha_props::UseSink,
+    htp_mha_props::RopeScalingType, htp_mha_props::RopeScalingFactor,
+    htp_mha_props::RopePartialRotaryFactor,
+    htp_mha_props::RopeScalingMaxPositionEmbeddings,
+    htp_mha_props::AttnLogitSoftcapping, htp_mha_props::IsCausal,
+    htp_mha_props::KvCacheQuant, htp_mha_props::AttnOutU16>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -408,14 +415,14 @@ private:
 
   /**
    * @brief The accelerator-resident quantized mirror of the KV cache
-   *        (props::KvCacheQuant). One handle per batch; q_cache_synced is
-   *        how many rows of that handle match the fp16 cache, so a rewind
-   *        or a cache load simply re-appends from there. One failure
-   *        anywhere releases everything and this layer stays on the fp16
-   *        path for good: the CPU/fp16 result is always available.
+   *        (htp_mha_props::KvCacheQuant). One handle per batch; q_cache_synced
+   * is how many rows of that handle match the fp16 cache, so a rewind or a
+   * cache load simply re-appends from there. One failure anywhere releases
+   * everything and this layer stays on the fp16 path for good: the CPU/fp16
+   * result is always available.
    */
   int kv_cache_quant_kind = -1; /**< -1 off, 0 int8, 1 int4 */
-  bool attn_out_u16 = false;    /**< props::AttnOutU16 */
+  bool attn_out_u16 = false;    /**< htp_mha_props::AttnOutU16 */
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;
@@ -436,7 +443,7 @@ private:
   /** The a16 path's u16 Q and output, one pair for every layer: per layer
    *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
    *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
-   *  MHACoreLayer instances, so layers must not run concurrently (they run
+   *  HtpMHACoreLayer instances, so layers must not run concurrently (they run
    *  in graph order); a per-thread pair is the upgrade if they ever do. */
   static std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
@@ -570,9 +577,9 @@ private:
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
   std::vector<float>
-    htp_rope_table_; /**< [max_timestep][cos hd/2 | sin hd/2] */
-  bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
-                                           prompt are the DSP's, not this cache's */
+    htp_rope_table_;            /**< [max_timestep][cos hd/2 | sin hd/2] */
+  bool htp_owns_cache_ = false; /**< a hook returned 1: rows past the
+                                     prompt are the DSP's, not this cache's */
 
   /**
    * @brief _compute frequency parameters for default ROPE
@@ -651,7 +658,7 @@ private:
    */
   size_t calc_windowed_attn_index(size_t i);
 
-}; // end of class MHACoreLayer
+}; // end of class HtpMHACoreLayer
 } // namespace causallm
 
 #endif

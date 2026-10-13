@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
+/** The pool, in place of the QuRT one: min(n_units, 3) lanes run one after
    another on the caller, so the row split across lanes is exercised. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
@@ -70,7 +70,7 @@ static double run(uint32_t M, uint32_t K, uint32_t E) {
   return worst;
 }
 
-/* The selection against the CPU layer's own (std::exp softmax in float,
+/** The selection against the CPU layer's own (std::exp softmax in float,
    partial_sort with the lower index winning a tie): the same experts in
    the same order, the weights within tol of the CPU's. */
 static int run_topk(uint32_t M, uint32_t E, uint32_t top_k, uint32_t n_sel,
@@ -138,7 +138,7 @@ static int run_topk(uint32_t M, uint32_t E, uint32_t top_k, uint32_t n_sel,
   return bad_sel != 0 || worst > 1e-5;
 }
 
-/* The fused norm against the two passes it replaces (hvx_rmsnorm_rows_f32
+/** The fused norm against the two passes it replaces (hvx_rmsnorm_rows_f32
    then hvx_router_rows_f32), bit for bit; x has a few outliers, the way
    Gemma-4's activations do. */
 static int run_norm(uint32_t M, uint32_t K, uint32_t E) {

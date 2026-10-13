@@ -86,6 +86,7 @@ public:
   static void releaseDeviceCaches();
 
 protected:
+  bool htp_execution_profile_ = false;
   /**
    * @brief One-shot CUDA prewarm guard, PER MODEL OBJECT. A function-local
    *        static was process-lifetime, so the second load of a load/destroy

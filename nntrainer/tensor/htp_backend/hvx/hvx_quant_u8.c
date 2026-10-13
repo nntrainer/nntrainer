@@ -266,11 +266,11 @@ void hvx_gather_u8_ah_rows(const uint8_t *x_rm, const uint32_t *row_map,
   const HVX_VectorPred q1 = Q6_Q_vsetq2_R(TILE_INNER);
   const HVX_VectorPred q2 = Q6_Q_vsetq2_R(2 * TILE_INNER);
   const HVX_VectorPred q3 = Q6_Q_vsetq2_R(3 * TILE_INNER);
-  /* One row behind an l2fetch ([47:32] stride, [31:16] width, [15:0]
+  /** One row behind an l2fetch ([47:32] stride, [31:16] width, [15:0]
      height): a hint, it moves no bits. */
   const uint64_t box = ((uint64_t)k << 32) | ((uint64_t)k << 16) | 1u;
   for (uint32_t m = m0; m < m1; m += 4u) {
-    /* Each row's vector read so that its 32 bytes of this k-tile sit where
+    /** Each row's vector read so that its 32 bytes of this k-tile sit where
        the group's 128-byte store wants them: row i at byte 32 * i. The
        reads run up to 96 bytes outside the row either way (x_rm's
        contract). */
@@ -315,7 +315,7 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
     for (uint32_t m = 0; m < ctx->m_vec_end; m += 4u) {
       const uint32_t rb = m / TILE_ROW;
       const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
-      /* The four rows of a group are four independent source pointers, so
+      /** The four rows of a group are four independent source pointers, so
          a row map costs one indirection each and nothing else -- the
          packing below still sees four rows and still lands them as one
          128-byte store. */
@@ -363,7 +363,7 @@ void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
                                uint32_t m0, uint32_t m1, uint32_t k,
                                const float *scale, const int32_t *zp,
                                uint8_t *out_ah) {
-  /* Row-group outer, k-tile inner: the rows are this call's alone, so the
+  /** Row-group outer, k-tile inner: the rows are this call's alone, so the
      k-tile split the pooled pack needs for disjoint stores is not needed,
      and the four rows' parameters are splatted once per group instead of
      once per (group, k-tile). Same group body, same bytes. */
@@ -408,7 +408,7 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
                                 uint8_t *out_ah, hvx_worker_pool *pool) {
   const uint32_t n_ktiles = k / TILE_INNER;
 
-  /* Every row below m_valid is written below, so only the padding rows
+  /** Every row below m_valid is written below, so only the padding rows
      need zeroing, and in the AH layout those share their 64-row block with
      the last valid rows: clearing that one block (at most 64 * k bytes)
      before the pack keeps every caller's bytes identical to clearing all

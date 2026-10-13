@@ -1,6 +1,9 @@
 gemma4_src = [
     meson.current_source_dir() / 'gemma4_causallm.cpp',
     meson.current_source_dir() / 'gemma4_moe_causallm.cpp',
+    meson.current_source_dir() / 'gemma4_htp_causallm.cpp',
+    meson.current_source_dir() / 'gemma4_htp_moe_causallm.cpp',
+    meson.current_source_dir() / 'gemma4_htp_weights.cpp',
 ]
 
 gemma4_inc = include_directories('.')
@@ -22,3 +25,11 @@ gemma4_moe_layer_dep = declare_dependency(
 causallm_src += gemma4_src
 causallm_inc += gemma4_inc
 causallm_layer_dependencies += [gemma4_moe_layer_dep]
+
+causallm_inc += include_directories('../lfm2_moe')
+causallm_src += files('../../layers/htp_mha_core.cpp',
+                      '../../layers/htp_qkv_layer.cpp',
+                      '../lfm2_moe/lfm2_moe_layer.cpp',
+                      '../lfm2_moe/lfm2_moe_pool_layer.cpp')
+causallm_layer_dependencies += [causallm_residual_add_dep,
+  causallm_dense_ffn_layer_dep, causallm_conv_block_layer_dep]

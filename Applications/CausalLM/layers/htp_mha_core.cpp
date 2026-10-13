@@ -27,7 +27,7 @@ static std::mutex rope_init_mtx;
 #include <layer_context.h>
 
 #include <abs_max.h>
-#include <mha_core.h>
+#include <htp_mha_core.h>
 
 #include "htp_decode_hook.h"
 #include <nntrainer_error.h>
@@ -111,21 +111,23 @@ static void compute_vcache_fp32_transposed_reference(
 /************************************************************** */
 
 /**
- * @brief constructor of MHACoreLayer
+ * @brief constructor of HtpMHACoreLayer
  */
-MHACoreLayer::MHACoreLayer() :
+HtpMHACoreLayer::HtpMHACoreLayer() :
   mha_core_props(
-    nntrainer::props::NumHeads(), props::NumHeads_KV(),
+    nntrainer::props::NumHeads(), htp_mha_props::NumHeads_KV(),
     nntrainer::props::ProjectedKeyDim(), nntrainer::props::ProjectedValueDim(),
     nntrainer::props::OutputShape(), nntrainer::props::DropOutRate(),
     nntrainer::props::ReturnAttentionWeight(),
     nntrainer::props::AverageAttentionWeight(), nntrainer::props::MaxTimestep(),
-    props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
-    props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
-    props::RopeScalingType(), props::RopeScalingFactor(),
-    props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal(), props::KvCacheQuant(),
-    props::AttnOutU16()),
+    htp_mha_props::SlidingWindow(), htp_mha_props::MaxNewTokens(),
+    htp_mha_props::RopeTheta(), htp_mha_props::UseRope(),
+    htp_mha_props::MaxPositionEmbeddings(), htp_mha_props::UseSink(),
+    htp_mha_props::RopeScalingType(), htp_mha_props::RopeScalingFactor(),
+    htp_mha_props::RopePartialRotaryFactor(),
+    htp_mha_props::RopeScalingMaxPositionEmbeddings(),
+    htp_mha_props::AttnLogitSoftcapping(), htp_mha_props::IsCausal(),
+    htp_mha_props::KvCacheQuant(), htp_mha_props::AttnOutU16()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -136,13 +138,22 @@ MHACoreLayer::MHACoreLayer() :
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
-std::vector<uint16_t> MHACoreLayer::q2_q_u16, MHACoreLayer::q2_out_u16;
+std::vector<uint16_t> HtpMHACoreLayer::q2_q_u16, HtpMHACoreLayer::q2_out_u16;
 
-MHACoreLayer::~MHACoreLayer() { release_quantized_cache(); }
+HtpMHACoreLayer::~HtpMHACoreLayer() { release_quantized_cache(); }
+
+void HtpMHACoreLayer::beginHtpPrompt() {
+  release_quantized_cache();
+  cache_index = 0;
+  htp_owns_cache_ = false;
+  q_cache_failed = false;
+  q2_calibrated = false;
+  htp_rope_table_.clear();
+}
 
 /************************************************************** */
 
-void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
+void HtpMHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
                 std::invalid_argument)
@@ -166,22 +177,25 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** max position embeddings */
   max_position_embeddings =
-    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
+    std::get<htp_mha_props::MaxPositionEmbeddings>(mha_core_props).get();
 
   /** local window size */
-  local_window_size = std::get<props::SlidingWindow>(mha_core_props).get();
+  local_window_size =
+    std::get<htp_mha_props::SlidingWindow>(mha_core_props).get();
 
   /** use rope */
-  use_rope = std::get<props::UseRope>(mha_core_props).get();
+  use_rope = std::get<htp_mha_props::UseRope>(mha_core_props).get();
 
   /** attention scaling computation */
-  rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
-  scale = std::get<props::RopeScalingFactor>(mha_core_props).get();
+  rope_scaling_type =
+    std::get<htp_mha_props::RopeScalingType>(mha_core_props).get();
+  scale = std::get<htp_mha_props::RopeScalingFactor>(mha_core_props).get();
   rope_partial_rotary_factor =
-    std::get<props::RopePartialRotaryFactor>(mha_core_props).get();
+    std::get<htp_mha_props::RopePartialRotaryFactor>(mha_core_props).get();
   if (rope_scaling_type == "yarn")
     original_max_position_embeddings =
-      std::get<props::RopeScalingMaxPositionEmbeddings>(mha_core_props).get();
+      std::get<htp_mha_props::RopeScalingMaxPositionEmbeddings>(mha_core_props)
+        .get();
 
   /** query_dim = (B, 1, seq_len, H_Q * Head_Dim ) */
   const unsigned int batch_size = query_dim.batch();
@@ -196,9 +210,10 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   num_heads_Q = static_cast<size_t>(
     std::get<nntrainer::props::NumHeads>(mha_core_props).get());
   num_heads_KV =
-    std::get<props::NumHeads_KV>(mha_core_props).empty()
+    std::get<htp_mha_props::NumHeads_KV>(mha_core_props).empty()
       ? num_heads_Q
-      : static_cast<size_t>(std::get<props::NumHeads_KV>(mha_core_props).get());
+      : static_cast<size_t>(
+          std::get<htp_mha_props::NumHeads_KV>(mha_core_props).get());
 
   // head_dim
   head_dim = static_cast<size_t>(query_width) / num_heads_Q;
@@ -208,7 +223,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
        "query / key / value";
 
   /** Weight for Sink */
-  use_sink = std::get<props::UseSink>(mha_core_props).get();
+  use_sink = std::get<htp_mha_props::UseSink>(mha_core_props).get();
   if (use_sink) {
 #if ENABLE_FP16 && defined(__ANDROID__)
     nntrainer::TensorDim sink_dim(
@@ -227,16 +242,16 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   }
 
   attn_logit_softcapping =
-    std::get<props::AttnLogitSoftcapping>(mha_core_props).get();
+    std::get<htp_mha_props::AttnLogitSoftcapping>(mha_core_props).get();
 
   /** Is Causal */
-  is_causal = std::get<props::IsCausal>(mha_core_props).get();
+  is_causal = std::get<htp_mha_props::IsCausal>(mha_core_props).get();
 
-  attn_out_u16 = std::get<props::AttnOutU16>(mha_core_props).get();
+  attn_out_u16 = std::get<htp_mha_props::AttnOutU16>(mha_core_props).get();
   kv_cache_quant_kind = -1;
-  if (!std::get<props::KvCacheQuant>(mha_core_props).empty()) {
+  if (!std::get<htp_mha_props::KvCacheQuant>(mha_core_props).empty()) {
     const std::string kind =
-      std::get<props::KvCacheQuant>(mha_core_props).get();
+      std::get<htp_mha_props::KvCacheQuant>(mha_core_props).get();
     if (kind == "q8") {
       kv_cache_quant_kind = 0;
     } else if (kind == "q4") {
@@ -279,7 +294,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       nntrainer::TensorLifespan::MAX_LIFESPAN);
   }
 
-  theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
+  theta = (float)std::get<htp_mha_props::RopeTheta>(mha_core_props).get();
 
   /** set Output dimension! - one output */
   std::vector<nntrainer::TensorDim> output_dims(1);
@@ -311,8 +326,8 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  *         input[3] = cache_key   (B, 1, max_seq_len, num_heads_KV * head_dim)
  *         input[4] = cache_value (B, 1, max_seq_len, num_heads_KV * head_dim)
  */
-void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {
+void HtpMHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
+                                 bool training) {
   if (!use_external_cache) {
     return;
   }
@@ -449,9 +464,9 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
  *       Please note that Transformer Decoder's MHA takes only one sequence at a
  * step. Incremental forwarding function is used for this.
  */
-void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                          unsigned int _from, unsigned int _to,
-                                          bool training) {
+void HtpMHACoreLayer::incremental_forwarding(
+  nntrainer::RunLayerContext &context, unsigned int _from, unsigned int _to,
+  bool training) {
   // Whatever ComputeOps this context resolves to (CPU, or HTP when the
   // model runs with engine="htp" and the DSP session opened) decides per
   // batch below whether attention leaves the CPU.
@@ -631,8 +646,8 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   cache_index += step_size;
 }
 
-bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
-                                      unsigned int pos) {
+bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
+                                         unsigned int pos) {
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
@@ -825,12 +840,10 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
  *            where Context_Len is usually the current timestep 'to'.
  *
  */
-void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
-                                   nntrainer::Tensor &cache,
-                                   nntrainer::Tensor &out, unsigned int from,
-                                   size_t sequence_len, unsigned int num_head,
-                                   unsigned int group_size,
-                                   unsigned int head_dim) {
+void HtpMHACoreLayer::compute_kcaches(
+  nntrainer::Tensor &in, nntrainer::Tensor &cache, nntrainer::Tensor &out,
+  unsigned int from, size_t sequence_len, unsigned int num_head,
+  unsigned int group_size, unsigned int head_dim) {
 
   // Dispatch based on data type (FP32 or FP16)
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -1034,7 +1047,7 @@ private:
 
 } // namespace
 
-bool MHACoreLayer::try_accelerated_attention(
+bool HtpMHACoreLayer::try_accelerated_attention(
   nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
   nntrainer::Tensor &cached_value, nntrainer::Tensor &attention_output_step,
   unsigned int cache_from, unsigned int cache_to,
@@ -1092,7 +1105,8 @@ bool MHACoreLayer::try_accelerated_attention(
   return true;
 }
 
-void MHACoreLayer::registerQuantizedCache(nntrainer::RunLayerContext &context) {
+void HtpMHACoreLayer::registerQuantizedCache(
+  nntrainer::RunLayerContext &context) {
   compute_ops_ = context.getComputeOps();
   // [#282 D] with NNTR_HTP_E2E_FREE_KVQ the caches go at the first decode
   // token anyway; registering them at the prefill's first call (the lazy
@@ -1128,7 +1142,7 @@ void MHACoreLayer::registerQuantizedCache(nntrainer::RunLayerContext &context) {
   q2_scales_set.assign(1, 0);
 }
 
-void MHACoreLayer::release_quantized_cache() {
+void HtpMHACoreLayer::release_quantized_cache() {
   if (compute_ops_) {
     for (int h : q_cache_handles) {
       if (h >= 0) {
@@ -1147,12 +1161,12 @@ void MHACoreLayer::release_quantized_cache() {
  *        Q per query head over this step's f32 rows. max / 127, 1 for an
  *        all-zero tensor.
  */
-void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
-                                       const uint16_t *v_rows,
-                                       unsigned int n_rows,
-                                       unsigned int kv_stride, const float *q,
-                                       unsigned int q_stride,
-                                       unsigned int n_q) {
+void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
+                                          const uint16_t *v_rows,
+                                          unsigned int n_rows,
+                                          unsigned int kv_stride,
+                                          const float *q, unsigned int q_stride,
+                                          unsigned int n_q) {
   q2_scale_k.assign(num_heads_KV, 0.0f);
   q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
@@ -1196,7 +1210,7 @@ void MHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
   q2_calibrated = true;
 }
 
-bool MHACoreLayer::try_quantized_attention(
+bool HtpMHACoreLayer::try_quantized_attention(
   unsigned int batch, nntrainer::Tensor &query_step,
   nntrainer::Tensor &cache_key, nntrainer::Tensor &cache_value,
   const ml::train::TensorDim &cache_key_dim,
@@ -1475,7 +1489,7 @@ bool MHACoreLayer::try_quantized_attention(
   return true;
 }
 
-void MHACoreLayer::one_batch_incremental_forwarding(
+void HtpMHACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
   const unsigned int to, nntrainer::Tensor &query_step,
   nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
@@ -1620,7 +1634,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                 cache_to);
 }
 
-void MHACoreLayer::one_batch_incremental_forwarding(
+void HtpMHACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
   const unsigned int to, nntrainer::Tensor &query_step,
   nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
@@ -1717,8 +1731,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
  * @brief rotary embedding-related member function
  * @note seq_len -> max_position_embeddings
  */
-void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
-                                    float theta, bool is_fp16) {
+void HtpMHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
+                                       float theta, bool is_fp16) {
   const std::string rope_cache_key = getRopeCacheKey(head_dim, seq_len, theta);
   thetas.clear();
   if (rope_scaling_type == "default")
@@ -1782,8 +1796,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
 #endif
 }
 
-std::string MHACoreLayer::getRopeCacheKey(int head_dim, unsigned int seq_len,
-                                          float theta) const {
+std::string HtpMHACoreLayer::getRopeCacheKey(int head_dim, unsigned int seq_len,
+                                             float theta) const {
   std::ostringstream ss;
   ss << rope_scaling_type << "|" << head_dim << "|" << seq_len << "|" << theta
      << "|" << scale << "|" << rope_partial_rotary_factor << "|"
@@ -1791,7 +1805,7 @@ std::string MHACoreLayer::getRopeCacheKey(int head_dim, unsigned int seq_len,
   return ss.str();
 }
 
-void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
+void HtpMHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
 
   // no attention scaling
   attention_scaling = 1.0f;
@@ -1805,7 +1819,8 @@ void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
   }
 }
 
-void MHACoreLayer::_compute_proportional_parameters(int head_dim, float theta) {
+void HtpMHACoreLayer::_compute_proportional_parameters(int head_dim,
+                                                       float theta) {
   attention_scaling = 1.0f;
   const int half_dim = static_cast<int>(head_dim / 2);
   const int rope_angles =
@@ -1826,7 +1841,7 @@ void MHACoreLayer::_compute_proportional_parameters(int head_dim, float theta) {
   }
 }
 
-void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
+void HtpMHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
 
   // Config parameters
   ///@todo partial_rotary_factor should be generalized to fully support
@@ -1920,11 +1935,11 @@ void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
   }
 }
 
-void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
-                                              nntrainer::Tensor &out,
-                                              unsigned int dim,
-                                              unsigned int from,
-                                              bool convert_only) {
+void HtpMHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
+                                                 nntrainer::Tensor &out,
+                                                 unsigned int dim,
+                                                 unsigned int from,
+                                                 bool convert_only) {
   if (!use_rope) {
     if (&in != &out) {
       out.copyData(in);
@@ -2029,8 +2044,8 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   }
 }
 
-void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
-                                    size_t num_head, unsigned int from) {
+void HtpMHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
+                                       size_t num_head, unsigned int from) {
   if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
     float *qk_out_ = qk_out.getData<float>();
 
@@ -2128,9 +2143,9 @@ void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
   }
 }
 
-void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
-                                    size_t num_head, unsigned int from,
-                                    nntrainer::Tensor &sink_step) {
+void HtpMHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
+                                       size_t num_head, unsigned int from,
+                                       nntrainer::Tensor &sink_step) {
   if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
     float *qk_out_ = qk_out.getData<float>();
 
@@ -2234,7 +2249,7 @@ void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
   }
 }
 
-void MHACoreLayer::compute_fp16vcache_transposed(
+void HtpMHACoreLayer::compute_fp16vcache_transposed(
   nntrainer::Tensor &in, nntrainer::Tensor &vcache, nntrainer::Tensor &output,
   int from, int num_cache_head, int gqa_size, int head_dim, int to) {
 
@@ -2350,8 +2365,8 @@ void MHACoreLayer::compute_fp16vcache_transposed(
   }
 }
 
-void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
-                            unsigned int batch) {
+void HtpMHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
+                               unsigned int batch) {
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
@@ -2363,16 +2378,16 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
   }
 }
 
-void MHACoreLayer::updateTensorsByInputDimensions(
+void HtpMHACoreLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
   unsigned int height = input_dimensions[0].height();
   unsigned int &max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
   unsigned int &max_new_tokens =
-    std::get<props::MaxNewTokens>(mha_core_props).get();
+    std::get<htp_mha_props::MaxNewTokens>(mha_core_props).get();
   max_position_embeddings =
-    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
+    std::get<htp_mha_props::MaxPositionEmbeddings>(mha_core_props).get();
   max_timestep = height + max_new_tokens;
 
   ml::train::TensorDim kv_dim = input_dimensions[0];
@@ -2395,17 +2410,17 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
 
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
+void HtpMHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
 
-void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+void HtpMHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
 
-void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
-                            const ml::train::ExportMethods &method) const {
+void HtpMHACoreLayer::exportTo(nntrainer::Exporter &exporter,
+                               const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(mha_core_props, method, this);
 }
 
-void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
+void HtpMHACoreLayer::setProperty(const std::vector<std::string> &values) {
   std::vector<std::string> props;
   props.reserve(values.size());
   for (const auto &value : values) {
@@ -2423,9 +2438,9 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
   LayerImpl::setProperty(remain_props);
 }
 
-size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
+size_t HtpMHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
 
-size_t MHACoreLayer::calc_windowed_attn_index(size_t i) {
+size_t HtpMHACoreLayer::calc_windowed_attn_index(size_t i) {
   // S(i) = sum_{k=0}^{i-1} min(k+1, W)
   // For i <= W:  S(i) = i*(i+1)/2   (same as full-attention triangular index)
   // For i >  W:  S(i) = W*(W+1)/2 + (i - W)*W
@@ -2442,7 +2457,7 @@ size_t MHACoreLayer::calc_windowed_attn_index(size_t i) {
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_mha_core_layer() {
-  auto layer = new MHACoreLayer();
+  auto layer = new HtpMHACoreLayer();
   return layer;
 }
 

@@ -49,7 +49,7 @@ static inline float lanes_sum(HVX_Vector v) {
 static inline float norm_rs(const float *x, uint32_t chunk, float eps) {
   const uint32_t nvec = chunk / LANES;
   const HVX_UVector *vx = (const HVX_UVector *)x;
-  /* Sum of squares: per-lane accumulation in qf32 (one rounding per
+  /** Sum of squares: per-lane accumulation in qf32 (one rounding per
      multiply-add), the lanes summed once at the end. */
   HVX_Vector acc = Q6_V_vzero();
   for (uint32_t i = 0; i < nvec; ++i) {
@@ -196,7 +196,7 @@ typedef struct {
   float eps, scale;
 } addb_ctx;
 
-/* add_worker over column blocks: the same squares summed in the same
+/** add_worker over column blocks: the same squares summed in the same
    column order, the same second pass, so the same values as a row-major
    x would give. */
 static void addb_worker(uint32_t n_threads, uint32_t i, void *v) {

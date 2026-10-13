@@ -115,8 +115,8 @@ typedef struct {
   nntr_hvx_q4m1_slot q4m1[NNTR_HVX_Q4M1_SLOTS]; /**< [#132 PR 2] the Q4M1
                                  weights of fc_q4m1_f32 and (Part B) the
                                  graph's FC kinds, freed in close() */
-  uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
-                       (2 MiB of DSP heap, first use), freed in close() */
+  uint8_t *fc_l2;       /**< [#132 Part B, #178] the FC runner's L2 feed scratch
+                             (2 MiB of DSP heap, first use), freed in close() */
   float *norm_rows;     /**< the pre-normed activation of mm_u8i4_layer_norm /
                              mm_u8i4_moe_layer_norm (M x K f32, DSP heap,
                              grown on demand), freed in close() */

@@ -145,7 +145,7 @@ int nntr_mailbox_loop(uint8_t *base, uint32_t bytes, uint32_t role, uint32_t n,
                       uint32_t payload, uint32_t spin_us, uint32_t res[5]) {
   const uint32_t words = payload / 4u;
   const uint32_t slot = (payload + 127u) & ~127u;
-  /* a payload is 0 or at least 3 words: the probe words (first, middle,
+  /** a payload is 0 or at least 3 words: the probe words (first, middle,
      last) must be distinct or each exchange reads as stale */
   if (role > 1u || payload % 4u != 0u || payload > MB_MAX_PAYLOAD ||
       (payload != 0u && payload < 12u) ||

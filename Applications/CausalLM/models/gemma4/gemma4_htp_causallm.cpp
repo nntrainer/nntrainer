@@ -10,7 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
-#include "gemma4_causallm.h"
+#include "gemma4_htp_causallm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,18 +18,43 @@
 #include <app_context.h>
 #include <dense_ffn_layer.h>
 #include <engine.h>
-#include <lfm2_causallm.h>
+#include <htp_mha_core.h>
+#include <htp_qkv_layer.h>
+#include <htp_tie_word_embedding.h>
 #include <lfm2_moe_layer.h>
 #include <llm_util.hpp>
 #include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
-#include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
 #include <residual_add.h>
 #include <scalar_multiply.h>
+#include <sstream>
 
 namespace causallm {
+namespace {
+std::set<int> parseLayerIdList(const std::string &csv) {
+  std::set<int> ids;
+  std::stringstream ss(csv);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (!tok.empty())
+      ids.insert(std::stoi(tok));
+  }
+  return ids;
+}
+
+} // namespace
+
+LayerHandle Gemma4HtpTransformer::createAttentionCore(
+  const std::vector<std::string> &properties) const {
+  auto props = properties;
+  if (!ATTENTION_ENGINE.empty())
+    props.push_back(withKey("engine", ATTENTION_ENGINE));
+  if (!ATTENTION_KV_DTYPE.empty())
+    props.push_back(withKey("kv_cache_quant", ATTENTION_KV_DTYPE));
+  return LayerHandle(createLayer("htp_mha_core", props));
+}
 
 namespace {
 /** @brief @a engine for @a layer_id when the layer is in @a ids or @a ids is
@@ -41,12 +66,12 @@ std::string engineFor(const std::string &engine, const std::set<int> &ids,
 }
 } // namespace
 
-bool Gemma4Transformer::isKVSharedLayer(int layer_id) const {
+bool Gemma4HtpTransformer::isKVSharedLayer(int layer_id) const {
   const int first_kv_shared_layer_idx = NUM_LAYERS - NUM_KV_SHARED_LAYERS;
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
 }
 
-bool Gemma4Transformer::isSlidingAttentionLayer(int layer_id) const {
+bool Gemma4HtpTransformer::isSlidingAttentionLayer(int layer_id) const {
   if (!layer_types.empty() && layer_id < static_cast<int>(layer_types.size())) {
     return layer_types[layer_id] == "sliding_attention";
   }
@@ -54,29 +79,29 @@ bool Gemma4Transformer::isSlidingAttentionLayer(int layer_id) const {
   return true;
 }
 
-unsigned int Gemma4Transformer::getAttentionHeadDim(int layer_id) const {
+unsigned int Gemma4HtpTransformer::getAttentionHeadDim(int layer_id) const {
   return isSlidingAttentionLayer(layer_id) ? static_cast<unsigned int>(HEAD_DIM)
                                            : GLOBAL_HEAD_DIM;
 }
 
-unsigned int Gemma4Transformer::getKVHeadCount(int layer_id) const {
+unsigned int Gemma4HtpTransformer::getKVHeadCount(int layer_id) const {
   const bool is_sliding = isSlidingAttentionLayer(layer_id);
   return (is_sliding || !ATTENTION_K_EQ_V) ? NUM_KEY_VALUE_HEADS
                                            : NUM_GLOBAL_KEY_VALUE_HEADS;
 }
 
-unsigned int Gemma4Transformer::getKVCacheWidth(int layer_id) const {
+unsigned int Gemma4HtpTransformer::getKVCacheWidth(int layer_id) const {
   return getAttentionHeadDim(layer_id) * getKVHeadCount(layer_id);
 }
 
-void Gemma4Transformer::appendSkipPrefillIfNeeded(
+void Gemma4HtpTransformer::appendSkipPrefillIfNeeded(
   std::vector<std::string> &props, bool enable_skip) const {
   if (enable_skip && ENABLE_SKIP_PREFILL_OPT) {
     props.emplace_back(withKey("skip_prefill", "true"));
   }
 }
 
-json &Gemma4Transformer::sanitizeConfig(json &cfg) {
+json &Gemma4HtpTransformer::sanitizeConfig(json &cfg) {
   if (cfg.contains("text_config") && cfg["text_config"].is_object()) {
     const auto &text_cfg = cfg["text_config"];
     for (auto it = text_cfg.begin(); it != text_cfg.end(); ++it) {
@@ -85,6 +110,10 @@ json &Gemma4Transformer::sanitizeConfig(json &cfg) {
       }
     }
   }
+
+  if (cfg.contains("use_bidirectional_attention") &&
+      !cfg["use_bidirectional_attention"].is_boolean())
+    cfg.erase("use_bidirectional_attention");
 
   if (!cfg.contains("tie_word_embeddings")) {
     cfg["tie_word_embeddings"] = true;
@@ -99,8 +128,8 @@ json &Gemma4Transformer::sanitizeConfig(json &cfg) {
   return cfg;
 }
 
-json &Gemma4Transformer::sanitizeGenerationConfig(json &gen_cfg,
-                                                  const json &cfg) {
+json &Gemma4HtpTransformer::sanitizeGenerationConfig(json &gen_cfg,
+                                                     const json &cfg) {
   if (!gen_cfg.contains("eos_token_id")) {
     if (cfg.contains("eos_token_id")) {
       auto eos = cfg["eos_token_id"];
@@ -122,9 +151,13 @@ json &Gemma4Transformer::sanitizeGenerationConfig(json &gen_cfg,
   return gen_cfg;
 }
 
-void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
-                                        json &nntr_cfg) {
+void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
+                                           json &nntr_cfg) {
   Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+  ATTENTION_ENGINE = nntr_cfg.value("attention_engine", std::string());
+  ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
+  FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
+  FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
 
   if (cfg.contains("layer_types")) {
     layer_types = cfg["layer_types"].get<std::vector<std::string>>();
@@ -245,8 +278,8 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
 }
 
 std::pair<Tensor, Tensor>
-Gemma4Transformer::createGemma4KVCachePlaceholders(const int layer_id,
-                                                   unsigned int kv_width) {
+Gemma4HtpTransformer::createGemma4KVCachePlaceholders(const int layer_id,
+                                                      unsigned int kv_width) {
   const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 #ifdef ENABLE_FP16
   ml::train::TensorDim cache_dim(
@@ -274,13 +307,13 @@ Gemma4Transformer::createGemma4KVCachePlaceholders(const int layer_id,
 #endif
 }
 
-std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
+std::pair<Tensor, Tensor> Gemma4HtpTransformer::constructModel() {
 
   Tensor x =
     Tensor({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
 
   const std::string embedding_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
+    TIE_WORD_EMBEDDINGS ? "htp_tie_word_embeddings" : "embedding_layer";
 
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
@@ -313,7 +346,7 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   return {x, h};
 }
 
-void Gemma4Transformer::constructPerLayerInput(Tensor x, Tensor h) {
+void Gemma4HtpTransformer::constructPerLayerInput(Tensor x, Tensor h) {
   const unsigned int per_layer_total_dim =
     NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT;
 
@@ -370,8 +403,8 @@ void Gemma4Transformer::constructPerLayerInput(Tensor x, Tensor h) {
   per_layer_input = per_layer_input_scale_layer(per_layer_sum_out);
 }
 
-Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
-                                                        Tensor input) {
+Tensor Gemma4HtpTransformer::createTransformerDecoderBlock(const int layer_id,
+                                                           Tensor input) {
 
   // Gemma4TextRMSNorm scales by `weight` (initialized to ones), which matches
   // NNTrainer `rms_norm` behavior used here.
@@ -591,8 +624,8 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   return layer_scalar(decoder_output);
 }
 
-Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
-                                    const Tensor *dense_out) {
+Tensor Gemma4HtpTransformer::createMoe(const int layer_id, Tensor input,
+                                       const Tensor *dense_out) {
   const std::string engine =
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
                                                                : "cpu";
@@ -621,10 +654,10 @@ Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
   return moe(input);
 }
 
-Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
-                                                const int shared_kv_layer_id,
-                                                int seq_len, int n_heads,
-                                                int head_dim, Tensor query) {
+Tensor Gemma4HtpTransformer::createSharedAttention(const int layer_id,
+                                                   const int shared_kv_layer_id,
+                                                   int seq_len, int n_heads,
+                                                   int head_dim, Tensor query) {
   (void)seq_len;
   (void)head_dim;
 
@@ -732,10 +765,10 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   return wo(a);
 }
 
-Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
-                                          int n_heads, int head_dim,
-                                          Tensor query, Tensor key,
-                                          Tensor value) {
+Tensor Gemma4HtpTransformer::createAttention(const int layer_id, int seq_len,
+                                             int n_heads, int head_dim,
+                                             Tensor query, Tensor key,
+                                             Tensor value) {
   (void)seq_len;
   (void)head_dim;
 
@@ -800,7 +833,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
       engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
     qkv_params.push_back(withKey("out_to_host", "false"));
   appendSkipPrefillIfNeeded(qkv_params, is_kv_shared_layer);
-  LayerHandle qkv(createLayer("qkv_layer", qkv_params));
+  LayerHandle qkv(createLayer("htp_qkv_layer", qkv_params));
   Tensor qkv_out = qkv(query);
   Tensor q_scaled = qkv_out.output(0);
   Tensor k_normed = qkv_out.output(1);
@@ -861,8 +894,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   return wo(a);
 }
 
-Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
-                                    Tensor input) {
+Tensor Gemma4HtpTransformer::createMlp(const int layer_id, int dim,
+                                       int hidden_dim, Tensor input) {
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
   const int curr_hidden_dim =
     hidden_dim * ((USE_DOUBLE_WIDE_MLP && is_kv_shared_layer) ? 2 : 1);
@@ -937,7 +970,7 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   return ffn_down(geglu);
 }
 
-void Gemma4Transformer::registerCustomLayers() {
+void Gemma4HtpTransformer::registerCustomLayers() {
   auto &ct_engine = nntrainer::Engine::Global();
   auto app_context =
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
@@ -951,33 +984,35 @@ void Gemma4Transformer::registerCustomLayers() {
     }
   };
 
+  tryRegister(nntrainer::createLayer<causallm::HtpMHACoreLayer>);
+  tryRegister(nntrainer::createLayer<nntrainer::HtpTieWordEmbedding>);
   tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-  tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  tryRegister(nntrainer::createLayer<nntrainer::ScalarMultiplyLayer>);
+  tryRegister(nntrainer::createLayer<nntrainer::LogitSoftCappingLayer>);
   // the fused projections (Transformer::registerCustomLayers registers them
   // too; this model's factory may be the only one called)
-  tryRegister(nntrainer::createLayer<causallm::QKVLayer>);
+  tryRegister(nntrainer::createLayer<causallm::HtpQKVLayer>);
   tryRegister(nntrainer::createLayer<causallm::DenseFfnLayer>);
   tryRegister(nntrainer::createLayer<causallm::ResidualAddLayer>);
   if (ENABLE_MOE_BLOCK)
     tryRegister(nntrainer::createLayer<causallm::Lfm2MoELayer>);
 }
 
-void Gemma4CausalLM::registerCustomLayers() {
+void Gemma4HtpCausalLM::registerCustomLayers() {
   CausalLM::registerCustomLayers();
-  Gemma4Transformer::registerCustomLayers();
+  Gemma4HtpTransformer::registerCustomLayers();
 }
 
-std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
+std::pair<Tensor, Tensor> Gemma4HtpCausalLM::constructModel() {
   // A tied head takes the final norm and softcap (the gamma is read where
   // the output_norm layer's was, so a model file reads as before).
   FOLD_OUTPUT_NORM = TIE_WORD_EMBEDDINGS;
-  auto [x, h] = Gemma4Transformer::constructModel();
+  auto [x, h] = Gemma4HtpTransformer::constructModel();
 
   // create lm_head layer (using fully_connected option)
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
+    TIE_WORD_EMBEDDINGS ? "htp_tie_word_embeddings" : "lm_head";
 
   // add lmhead
   std::vector<std::string> lmhead_prop = {
@@ -1014,7 +1049,7 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   return {x, y};
 }
 
-void Gemma4CausalLM::allocateAndBindKVCache() {
+void Gemma4HtpCausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
 #ifdef ENABLE_FP16
     const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
@@ -1027,7 +1062,14 @@ void Gemma4CausalLM::allocateAndBindKVCache() {
       kv_widths.push_back(getKVCacheWidth(i));
     }
 
-    installKVCacheSharedAllocator();
+#ifdef ENABLE_HEXKL
+    if (ATTENTION_ENGINE == "htp") {
+      auto *ops = nntrainer::get_htp_ops();
+      kv_cache.setSharedAllocator(
+        [ops](size_t bytes) { return ops->alloc_shared(bytes); },
+        [ops](void *ptr) { ops->free_shared(ptr); });
+    }
+#endif
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
                       cache_dtype);

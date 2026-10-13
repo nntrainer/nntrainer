@@ -64,7 +64,7 @@
 /** @brief An answer whose seq2 does not carry the expected seq. */
 #define HEXKL_TOKEN_E_STALE HTP_GRAPH_E_INCOMPLETEITEM
 
-/* [plan 201 S1] the miss lines' structs (htp_miss_req / _ans) are the
+/** [plan 201 S1] the miss lines' structs (htp_miss_req / _ans) are the
    ARM's too: htp_dspq_wire.h. [#211] Their offset is a skel / lib
    contract: a skel and a lib that disagree would time out silently. */
 typedef char hexkl_miss_at[HTP_MBOX_MISS_REQ == 17152u ? 1 : -1];

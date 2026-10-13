@@ -33,7 +33,7 @@ static void expect(int ok, const char *what) {
 }
 
 int main(void) {
-  /* The landed default: #113's D192 (bit 0 on, lead 3 x 64 KB in [15:8],
+  /** The landed default: #113's D192 (bit 0 on, lead 3 x 64 KB in [15:8],
      rows1 in bit 16) under #117's VTCM feed (bit 17), all three tune bits
      set = 0x303e1. FEED=0 is the D192 arena read, 0x103e1. */
   const uint32_t feed_set = HTP_MOE_FLAG_GEMV_LEAD_SET |
@@ -52,7 +52,7 @@ int main(void) {
   if (!g_fail)
     printf("MOE M1 GEMV OPTS: unset=on(0x303e1) 0=off 1=on\n");
 
-  /* #113's (loop, lead) fields. Each knob is overridden only by its own
+  /** #113's (loop, lead) fields. Each knob is overridden only by its own
      variable, so naming one leaves the others at the default instead of
      resetting them to zero; all three tune bits are always sent so the
      echo names the cell. */
@@ -75,7 +75,7 @@ int main(void) {
   expect(htp_moe_opts_flags("0", NULL, "1", NULL) ==
            (d192 & ~HTP_MOE_FLAG_M1_GEMV),
          "the opt-out keeps bit 0 clear and still carries the pair");
-  /* Rounding to the nearest unit, the >= 0 floor and the 127-unit clamp
+  /** Rounding to the nearest unit, the >= 0 floor and the 127-unit clamp
      the l2fetch width field imposes. */
   expect(htp_moe_gemv_lead_units(NULL) == 0u, "unset lead is 0");
   expect(htp_moe_gemv_lead_units("0") == 0u, "0 KB is 0 units");
@@ -88,7 +88,7 @@ int main(void) {
          "clamped to 127 units");
   expect((htp_moe_gemv_lead_units("999999") & ~HTP_MOE_GEMV_LEAD_BITS) == 0u,
          "the clamped field still fits bits [15:8]");
-  /* #117's feed knob, the default since its sitting: unset and FEED=1 are
+  /** #117's feed knob, the default since its sitting: unset and FEED=1 are
      0x303e1 (feed=vtcm), FEED=0 is 0x103e1 (feed=arena, the next
      sitting's A0). It touches neither of the other two knobs. */
   expect(htp_moe_opts_flags(NULL, NULL, NULL, "1") == 0x303e1u,
@@ -102,7 +102,7 @@ int main(void) {
   expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
            !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
          "feed names: vtcm / arena");
-  /* #158's bypass bit: on by default (unset or non-zero), so an unset run's
+  /** #158's bypass bit: on by default (unset or non-zero), so an unset run's
      word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 gives 0x303e1. The echo must
      carry it whether or not the GEMV is on (the HMX loop honours it too). */
   expect(htp_moe_opts_dma_bypass(NULL) == HTP_MOE_FLAG_DMA_BYPASS &&
@@ -127,7 +127,7 @@ int main(void) {
       "MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
       "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1, geglu echoed\n");
 
-  /* #177's queue field, bits [23:22] = N - 1: unset leaves the default
+  /** #177's queue field, bits [23:22] = N - 1: unset leaves the default
      word alone, 2 and 4 give the Q2 / Q4 words, and every other value is
      an error that leaves the output untouched. */
   {
@@ -158,17 +158,17 @@ int main(void) {
              "4=0xc703e1 invalid(0,5,x,'',...)=error\n");
   }
 
-  /* C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
+  /** C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
      stages (mm 974.7 among them) sum to 1044.0 + 5588.2 - 5601.2 = 1031.0;
      host 1792.2. */
   const double c_rest = htp_moe_row_rest_us(1044.0, 1031.0, 5601.2, 1);
   expect(c_rest >= 0.0 && c_rest <= 0.05 * 1792.2, "gemv rest in [0, 5%]");
   expect(fabs(c_rest - 13.0) < 0.1, "gemv rest = 13.0");
-  /* A: dsp 1414.0, swiglu 0.0, named 14.8+146.5+41.9+13.0+259.9+113.1+8.9
+  /** A: dsp 1414.0, swiglu 0.0, named 14.8+146.5+41.9+13.0+259.9+113.1+8.9
      +2.5+0.9+0.1+6.3+783.4 = 1391.3 -> rest 22.7, as printed. */
   const double a_rest = htp_moe_row_rest_us(1414.0, 1391.3, 0.0, 0);
   expect(fabs(a_rest - 22.7) < 0.1, "hmx rest unchanged");
-  /* An HMX row with a non-zero swiglu (the fused FFN buckets) still
+  /** An HMX row with a non-zero swiglu (the fused FFN buckets) still
      subtracts it. */
   expect(fabs(htp_moe_row_rest_us(100.0, 50.0, 30.0, 0) - 20.0) < 1e-9,
          "hmx row subtracts swiglu");
