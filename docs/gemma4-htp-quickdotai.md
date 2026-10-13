@@ -1,5 +1,10 @@
 # Gemma4 MoE on HTP through QuickDotAI
 
+New here? Start with the [user guide](gemma4-htp-user-guide.md) (build, model
+pack, app, command line, measured results) and the
+[code guide](gemma4-htp-code-guide.md) (how the HTP path is put together).
+This page is the setup and validation record of the integration.
+
 The native HTP preset runs Gemma4 26B A4B through the same QuickDotAI handle,
 JNI and Android sample interfaces as other native models. Select
 `gemma4-26b-a4b` / `NATIVE` / `NPU` in SampleTestAPP. Quantization is `W4A32`.
