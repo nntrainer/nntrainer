@@ -243,6 +243,12 @@ Java_com_example_quickdotai_NativeCausalLm_loadModelHandleByNameNative(
            : 0L;
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_quickdotai_NativeCausalLm_lastModelLoadErrorNative(
+  JNIEnv *env, jobject /*thiz*/) {
+  return env->NewStringUTF(getLastModelLoadError());
+}
+
 // ---- nativeQueryCatalog ---------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_quickdotai_NativeCausalLm_nativeQueryCatalog(

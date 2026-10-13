@@ -8,6 +8,7 @@
  *          It links against libquick_dot_ai_api.so.
  */
 
+#include "htp_lifecycle_test.h"
 #include "quick_dot_ai_api.h"
 
 #include <algorithm>
@@ -396,6 +397,7 @@ int main(int argc, char *argv[]) {
   bool use_by_name = false;
   bool is_embedding = false;
   bool is_vision = false;
+  const char *native_lib_dir = std::getenv("QUICKAI_NATIVE_LIB_DIR");
   // Backend for loadModelHandleByName. Most catalog models accept CPU; QNN-only
   // descriptors (e.g. vjepa2-qnn, backend_mask = B(NPU)) require NPU.
   BackendType load_backend = CAUSAL_LM_BACKEND_CPU;
@@ -436,6 +438,12 @@ int main(int argc, char *argv[]) {
                 "' requires QNN support. Rebuild with -Denable-qnn=true.");
     return 1;
 #endif
+  } else if (model_name_str == "gemma4-26b-a4b-htp") {
+    catalog_id = model_name_str;
+    use_by_name = true;
+    load_backend = CAUSAL_LM_BACKEND_NPU;
+    if (std::getenv("QDA_HTP_LIFECYCLE"))
+      return run_htp_lifecycle_test(prompt, model_base_path, native_lib_dir);
   } else {
     // Generic fallback: any name that doesn't match a known branch above is
     // treated as a full catalog id and loaded via loadModelHandleByName, so
@@ -469,11 +477,12 @@ int main(int argc, char *argv[]) {
     // Load
     CausalLmHandle cycle_handle = nullptr;
     if (use_by_name) {
-      err = loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
-                                  nullptr, model_base_path, &cycle_handle);
+      err =
+        loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
+                              native_lib_dir, model_base_path, &cycle_handle);
     } else {
       err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type,
-                            nullptr, model_base_path, &cycle_handle);
+                            native_lib_dir, model_base_path, &cycle_handle);
     }
     if (err != CAUSAL_LM_ERROR_NONE) {
       print_error("loadModel failed at cycle " + std::to_string(i + 1) +
@@ -508,10 +517,10 @@ int main(int argc, char *argv[]) {
   CausalLmHandle handle = nullptr;
   if (use_by_name) {
     err = loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
-                                nullptr, model_base_path, &handle);
+                                native_lib_dir, model_base_path, &handle);
   } else {
     err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type,
-                          nullptr, model_base_path, &handle);
+                          native_lib_dir, model_base_path, &handle);
   }
   if (err != CAUSAL_LM_ERROR_NONE) {
     print_error("Final loadModel failed (code " + std::to_string(err) + ")");

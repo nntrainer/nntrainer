@@ -70,6 +70,8 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = true
+        // This is a Hexagon ELF, not an ARM library. Preserve the DSP image.
+        jniLibs.keepDebugSymbols += setOf("**/libnntr_hvx_skel.so", "**/libQnnHtp*Skel.so")
     }
 
 
