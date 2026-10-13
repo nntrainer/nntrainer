@@ -30,7 +30,6 @@
 /** @brief Rows of x per pass: RB x EV_MAX accumulators, one w read each. */
 #define RB 4u
 /** @brief Rows whose norm scales a worker holds at once (the fused norm). */
-#define SEG 256u
 
 typedef struct {
   const float *x, *w, *gamma;
@@ -111,36 +110,39 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
   const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
   const uint32_t ev = c->E / LANES;
-  float rs[SEG];
+  float rs[RB];
   float nx[RB * KB] __attribute__((aligned(128)));
-  for (uint32_t s0 = lo; s0 < hi; s0 += SEG) {
-    const uint32_t s1 = s0 + SEG < hi ? s0 + SEG : hi;
+  /* [P10] rows outer, k blocks inner: a row block's rows (RB x K floats)
+     are read from DDR once for their rs and again from the cache for the
+     dots, where the k-outer order read the whole segment twice from DDR
+     (46 MB a 2048-row call). The same rows_block calls over the same
+     [k0, k1) blocks with the same stored logits between them, so the
+     same floats. */
+  for (uint32_t r0 = lo; r0 < hi; r0 += RB) {
+    const uint32_t nr = r0 + RB < hi ? RB : hi - r0;
     if (c->gamma) {
-      for (uint32_t r = s0; r < s1; ++r)
-        rs[r - s0] = hvx_rmsnorm_rs_f32(c->x + (size_t)r * c->K, c->K, c->eps);
+      for (uint32_t r = 0; r < nr; ++r)
+        rs[r] =
+          hvx_rmsnorm_rs_f32(c->x + (size_t)(r0 + r) * c->K, c->K, c->eps);
     }
     for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
       const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
-      for (uint32_t r0 = s0; r0 < s1; r0 += RB) {
-        const uint32_t nr = r0 + RB < s1 ? RB : s1 - r0;
-        const float *xb = c->x + (size_t)r0 * c->K + k0;
-        uint32_t ld = c->K;
-        if (c->gamma) {
-          const HVX_UVector *vg = (const HVX_UVector *)(c->gamma + k0);
-          for (uint32_t r = 0; r < nr; ++r) {
-            const HVX_UVector *vx =
-              (const HVX_UVector *)(xb + (size_t)r * c->K);
-            HVX_Vector *vy = (HVX_Vector *)(nx + (size_t)r * KB);
-            const HVX_Vector vr = hvx_splat_sf(rs[r0 + r - s0]);
-            for (uint32_t j = 0; j < (k1 - k0) / LANES; ++j)
-              vy[j] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[j], vr), vg[j]);
-          }
-          xb = nx;
-          ld = KB;
+      const float *xb = c->x + (size_t)r0 * c->K + k0;
+      uint32_t ld = c->K;
+      if (c->gamma) {
+        const HVX_UVector *vg = (const HVX_UVector *)(c->gamma + k0);
+        for (uint32_t r = 0; r < nr; ++r) {
+          const HVX_UVector *vx = (const HVX_UVector *)(xb + (size_t)r * c->K);
+          HVX_Vector *vy = (HVX_Vector *)(nx + (size_t)r * KB);
+          const HVX_Vector vr = hvx_splat_sf(rs[r]);
+          for (uint32_t j = 0; j < (k1 - k0) / LANES; ++j)
+            vy[j] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[j], vr), vg[j]);
         }
-        kRowsBlock[ev - 1u][nr - 1u](xb, c->w, c->logits + (size_t)r0 * c->E,
-                                     ld, c->E, k0, k1);
+        xb = nx;
+        ld = KB;
       }
+      kRowsBlock[ev - 1u][nr - 1u](xb, c->w, c->logits + (size_t)r0 * c->E, ld,
+                                   c->E, k0, k1);
     }
   }
 }
