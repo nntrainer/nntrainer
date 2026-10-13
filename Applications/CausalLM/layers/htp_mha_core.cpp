@@ -1912,6 +1912,12 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
     accel_out.assign(attention_output_step.getData<float>(),
                      attention_output_step.getData<float>() +
                        attention_output_step.size());
+    // the CPU reads Q in the host tensor (the quantized path left it on the
+    // accelerator when it succeeded)
+    if (compute_ops_ &&
+        query_step.getDataType() == ml::train::TensorDim::DataType::FP32)
+      compute_ops_->sync_to_host(query_step.getData<float>(),
+                                 query_step.size() * sizeof(float));
     done = false; // the CPU path below recomputes into the same tensor
   }
   if (done) {
