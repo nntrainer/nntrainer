@@ -42,6 +42,7 @@
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
+#include <map>
 #include <util_simd.h>
 
 #include <string>
@@ -353,6 +354,23 @@ public:
    * @brief Get the current cache index
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+  /**
+   * @brief The fixed-scale int8 attention's calibration (calibrate_q2_scales)
+   *        of every layer that has one, beside a saved KV cache: a run that
+   *        loads the cache then quantizes with the scales the saving run
+   *        used instead of calibrating again on its own (shorter) step, so
+   *        it computes what the uninterrupted prefill would have.
+   * @param[in] file stream to write: per layer the name and the floats
+   */
+  WIN_EXPORT static void saveQ2Calibration(std::ostream &file);
+
+  /**
+   * @brief Reads saveQ2Calibration's stream; a layer whose name and sizes
+   *        match takes its scales from it at its first quantized step.
+   * @param[in] file stream to read; a malformed one throws
+   */
+  WIN_EXPORT static void loadQ2Calibration(std::istream &file);
+
 
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
@@ -447,6 +465,12 @@ private:
    *  in graph order); a per-thread pair is the upgrade if they ever do. */
   static std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
+  /** Layer name -> q2_scale_k | q2_scale_v | q2_q_enc | q2_out_enc: every
+   *  calibration lands here (saveQ2Calibration), and loadQ2Calibration
+   *  fills it before the first step (q2_from_file_). */
+  inline static std::map<std::string, std::vector<float>> q2_store_;
+  inline static bool q2_from_file_ = false;
+  std::string q2_name_; /**< this layer's key in q2_store_ */
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
                                    leaves the CPU, for run logs */
@@ -475,6 +499,10 @@ private:
                            unsigned int n_rows, unsigned int kv_stride,
                            const float *q, unsigned int q_stride,
                            unsigned int n_q);
+
+  /** @brief This layer's scales from loadQ2Calibration's file, when it has
+   *         them at this layer's sizes; false leaves the layer to calibrate. */
+  bool take_q2_calibration();
 
   /**
    * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the
