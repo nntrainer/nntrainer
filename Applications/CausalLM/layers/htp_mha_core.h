@@ -476,6 +476,10 @@ private:
    *        the two staging buffers.
    */
   std::vector<float> q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc;
+  /** The raw |max| the scales derive from (K per KV head, V per (head,
+   *  dim)), kept across steps: a later step's rows past them would clip,
+   *  so the scales widen and the mirror is re-quantized (q2_grow). */
+  std::vector<float> q2_kmax, q2_vmax;
   /** The a16 path's u16 Q and output, one pair for every layer: per layer
    *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
    *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
@@ -521,6 +525,23 @@ private:
   /** @brief This layer's scales from loadQ2Calibration's file, when it has
    *         them at this layer's sizes; false leaves the layer to calibrate. */
   bool take_q2_calibration();
+
+  /** @brief q2_kmax / q2_vmax from scales that came from elsewhere (a
+   *         loaded calibration, the accelerator's own): scale x 127. */
+  void q2_maxima_from_scales();
+  /** @brief The layer's current calibration into q2_store_ (what
+   *         saveQ2Calibration writes). */
+  void q2_keep();
+  /** @brief K/V scales and the output encoding from q2_kmax / q2_vmax. */
+  void q2_derive_kv();
+  /** @brief This step's Q encoding (range, zero point per head) from its
+   *         own f32 rows: the kernel takes it per call, nothing is cached. */
+  void q2_derive_q(const float *q, unsigned int q_stride, unsigned int n_q);
+  /** @brief Rows about to join the cache against the scales: when their
+   *         |max| exceeds the scales' basis the maxima grow and the scales
+   *         are derived again. @return true when they changed. */
+  bool q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
+               unsigned int n_rows, unsigned int kv_stride);
 
   /**
    * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the

@@ -1070,6 +1070,15 @@ bool HtpMHACoreLayer::try_accelerated_attention(
   if (!is_causal) {
     return false;
   }
+  // NNTR_HTP_ATTN_F16=0: the CPU computes instead (a reference for the
+  // accelerator's fp16 attention; never set in a tok/s run)
+  static const bool f16_off = [] {
+    const char *v = std::getenv("NNTR_HTP_ATTN_F16");
+    return v != nullptr && std::strcmp(v, "0") == 0;
+  }();
+  if (f16_off) {
+    return false;
+  }
   AccelF32Io io;
   if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
@@ -1177,51 +1186,112 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
                                           unsigned int kv_stride,
                                           const float *q, unsigned int q_stride,
                                           unsigned int n_q) {
-  q2_scale_k.assign(num_heads_KV, 0.0f);
-  q2_scale_v.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
-  q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
-  q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
+  q2_kmax.assign(num_heads_KV, 0.0f);
+  q2_vmax.assign(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
+  q2_grow(k_rows, v_rows, n_rows, kv_stride);
+  q2_derive_q(q, q_stride, n_q);
+  q2_calibrated = true;
+}
+
+bool HtpMHACoreLayer::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
+                           unsigned int n_rows, unsigned int kv_stride) {
+  std::vector<float> kmax(num_heads_KV, 0.0f),
+    vmax(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   for (unsigned int r = 0; r < n_rows; ++r) {
     const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
     const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
     for (unsigned int n = 0; n < num_heads_KV; ++n) {
-      q2_scale_k[n] =
-        causallm::abs_max_f16(kr + n * head_dim, head_dim, q2_scale_k[n]);
+      kmax[n] = causallm::abs_max_f16(kr + n * head_dim, head_dim, kmax[n]);
     }
-    causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, q2_scale_v.data());
+    causallm::abs_max_f16_lanes(vr, num_heads_KV * head_dim, vmax.data());
   }
+  bool grew = false;
+  for (size_t i = 0; i < kmax.size(); ++i)
+    if (kmax[i] > q2_kmax[i]) {
+      q2_kmax[i] = kmax[i];
+      grew = true;
+    }
+  for (size_t i = 0; i < vmax.size(); ++i)
+    if (vmax[i] > q2_vmax[i]) {
+      q2_vmax[i] = vmax[i];
+      grew = true;
+    }
+  if (grew)
+    q2_derive_kv();
+  return grew;
+}
+
+void HtpMHACoreLayer::q2_derive_kv() {
+  // NNTR_HTP_Q2_MARGIN=<f>: headroom over the maxima (1.0 = none)
+  static const float margin = [] {
+    const char *v = std::getenv("NNTR_HTP_Q2_MARGIN");
+    const float m = v ? std::strtof(v, nullptr) : 1.0f;
+    return m > 0.0f ? m : 1.0f;
+  }();
+  q2_scale_k.resize(q2_kmax.size());
+  q2_scale_v.resize(q2_vmax.size());
+  for (size_t i = 0; i < q2_kmax.size(); ++i)
+    q2_scale_k[i] = q2_kmax[i] > 0.0f ? q2_kmax[i] * margin / 127.0f : 1.0f;
+  for (size_t i = 0; i < q2_vmax.size(); ++i)
+    q2_scale_v[i] = q2_vmax[i] > 0.0f ? q2_vmax[i] * margin / 127.0f : 1.0f;
+  // the context is a convex combination of V rows: its range is V's
+  const unsigned int G = num_heads_Q / num_heads_KV;
+  q2_out_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
+  for (unsigned int h = 0; h < num_heads_Q; ++h) {
+    float vmax = 0.0f;
+    for (unsigned int d = 0; d < head_dim; ++d)
+      vmax = std::max(vmax, q2_vmax[(h / G) * head_dim + d]);
+    q2_out_enc[2 * h] = std::max(2.0f * vmax * margin, 1e-6f) / 65535.0f;
+    q2_out_enc[2 * h + 1] = 32768.0f;
+  }
+  q2_keep();
+}
+
+void HtpMHACoreLayer::q2_derive_q(const float *q, unsigned int q_stride,
+                               unsigned int n_q) {
   // Q's per-head range, NEON (min / max are order-free): scalar it was
   // 11-22 ms a 1024-row layer (doc 59 section 2.2).
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
+  // The range so far (a loaded or accelerator calibration, earlier steps):
+  // like K / V the encoding only widens. A step with a narrow Q would
+  // otherwise shrink the softmax's alpha and move its fraction bits off
+  // the 9 every head of the checkpoint runs at.
+  if (q2_q_enc.size() == 2 * static_cast<size_t>(num_heads_Q))
+    for (unsigned int h = 0; h < num_heads_Q; ++h)
+      if (q2_q_enc[2 * h] > 0.0f) {
+        q_lo[h] = -q2_q_enc[2 * h + 1] * q2_q_enc[2 * h];
+        q_hi[h] = q_lo[h] + 65535.0f * q2_q_enc[2 * h];
+      }
   for (unsigned int r = 0; r < n_q; ++r) {
     const float *qr = q + static_cast<size_t>(r) * q_stride;
     for (unsigned int h = 0; h < num_heads_Q; ++h)
       causallm::min_max_f32(qr + h * head_dim, head_dim, q_lo[h], q_hi[h]);
   }
-  const unsigned int G = num_heads_Q / num_heads_KV;
+  q2_q_enc.assign(2 * static_cast<size_t>(num_heads_Q), 0.0f);
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
     const float range = std::max(q_hi[h] - q_lo[h], 1e-6f);
     q2_q_enc[2 * h] = range / 65535.0f;
     q2_q_enc[2 * h + 1] = std::round(-q_lo[h] / q2_q_enc[2 * h]);
-    float vmax = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) {
-      vmax = std::max(vmax, q2_scale_v[(h / G) * head_dim + d]);
-    }
-    q2_out_enc[2 * h] = std::max(2.0f * vmax, 1e-6f) / 65535.0f;
-    q2_out_enc[2 * h + 1] = 32768.0f;
   }
-  auto finish = [](float &x) { x = x > 0.0f ? x / 127.0f : 1.0f; };
-  for (auto &x : q2_scale_k) {
-    finish(x);
-  }
-  for (auto &x : q2_scale_v) {
-    finish(x);
-  }
-  q2_calibrated = true;
+  q2_keep();
+}
+
+void HtpMHACoreLayer::q2_keep() {
+  if (q2_scale_k.empty() || q2_q_enc.empty() || q2_out_enc.empty())
+    return; // not calibrated yet
   std::vector<float> &all = q2_store_[q2_name_];
   all.clear();
   for (const auto *v : {&q2_scale_k, &q2_scale_v, &q2_q_enc, &q2_out_enc})
     all.insert(all.end(), v->begin(), v->end());
+}
+
+void HtpMHACoreLayer::q2_maxima_from_scales() {
+  q2_kmax.resize(q2_scale_k.size());
+  q2_vmax.resize(q2_scale_v.size());
+  for (size_t i = 0; i < q2_scale_k.size(); ++i)
+    q2_kmax[i] = q2_scale_k[i] * 127.0f;
+  for (size_t i = 0; i < q2_scale_v.size(); ++i)
+    q2_vmax[i] = q2_scale_v[i] * 127.0f;
 }
 
 bool HtpMHACoreLayer::take_q2_calibration() {
@@ -1235,6 +1305,7 @@ bool HtpMHACoreLayer::take_q2_calibration() {
   q2_scale_v.assign(p + nk, p + nk + nv);
   q2_q_enc.assign(p + nk + nv, p + nk + nv + nq);
   q2_out_enc.assign(p + nk + nv + nq, p + nk + nv + 2 * nq);
+  q2_maxima_from_scales();
   return q2_calibrated = true;
 }
 
@@ -1353,7 +1424,13 @@ bool HtpMHACoreLayer::try_quantized_attention(
   unsigned int &synced = q_cache_synced[batch];
   // int8 with the row-blocked kernel when the backend has it: fixed scales,
   // no softcap, no sinks, head_dim up to 512.
-  const bool use_q2 = kv_cache_quant_kind == 0 &&
+  // NNTR_HTP_ATTN_Q2=0: the per-row-scale int8 kernel (sdpa_q_kvcache)
+  // instead of the fixed-scale row-blocked one (a precision reference)
+  static const bool q2_off = [] {
+    const char *v = std::getenv("NNTR_HTP_ATTN_Q2");
+    return v != nullptr && std::strcmp(v, "0") == 0;
+  }();
+  const bool use_q2 = kv_cache_quant_kind == 0 && !q2_off &&
                       compute_ops_->supports_kv_cache_q2() &&
                       attn_logit_softcapping <= 0.0f && io.sinks == nullptr;
   if (!use_q2 && head_dim > 256) {
@@ -1378,10 +1455,10 @@ bool HtpMHACoreLayer::try_quantized_attention(
   }
   // The missing rows -- normally just this step's -- ride along with the
   // attention call: one round trip per layer per step.
-  const unsigned int append_row0 = synced;
-  const unsigned int append_rows = cache_to - synced;
-  const size_t off = batch * cache_key_dim.getFeatureLen() +
-                     static_cast<size_t>(append_row0) * width;
+  unsigned int append_row0 = synced;
+  unsigned int append_rows = cache_to - synced;
+  size_t off = batch * cache_key_dim.getFeatureLen() +
+               static_cast<size_t>(append_row0) * width;
 
   const unsigned int n_q = cache_to - cache_from;
   const unsigned int q_stride = num_heads_Q * head_dim;
@@ -1420,11 +1497,10 @@ bool HtpMHACoreLayer::try_quantized_attention(
         q2_calibrated = true;
         q2_scales_set[batch] = 1;
         synced = cache_to;
-        // kept for saveQ2Calibration, as calibrate_q2_scales keeps its own
-        std::vector<float> &all = q2_store_[q2_name_];
-        all.clear();
-        for (const auto *v : {&q2_scale_k, &q2_scale_v, &q2_q_enc, &q2_out_enc})
-          all.insert(all.end(), v->begin(), v->end());
+        // the maxima later steps grow from (q2_grow), and the scales kept
+        // for saveQ2Calibration as calibrate_q2_scales keeps its own
+        q2_maxima_from_scales();
+        q2_keep();
         if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
           ml_logi("mha_core trace: q2 calibration on the accelerator rows=%u "
                   "us=%lld",
@@ -1455,6 +1531,74 @@ bool HtpMHACoreLayer::try_quantized_attention(
                     std::chrono::steady_clock::now() - t0)
                     .count()));
       }
+    } else {
+      // A later step's rows (a prefill chunk after the first, a prompt
+      // after a loaded cache) may exceed the maxima the scales came from
+      // and would clip at 127 (seen: V 2x at a third chunk). The scales
+      // widen to them and every row is re-quantized: the mirror takes rows
+      // [0, cache_to) again under the new scales.
+      if (append_rows != 0 &&
+          q2_grow(k_base + off, v_base + off, append_rows, width)) {
+        if (std::getenv("NNTR_HTP_ATTN_TRACE"))
+          ml_logi("mha_core trace: q2 scales grew at rows=%u from=%u; "
+                  "re-quantizing %u rows",
+                  append_rows, append_row0, cache_to);
+        q2_scales_set[batch] = 0;
+        synced = 0;
+        append_row0 = 0;
+        append_rows = cache_to;
+        off = batch * cache_key_dim.getFeatureLen();
+      }
+      // Q is not cached: its encoding follows this step's rows
+      q2_derive_q(q_view, q_stride, n_q);
+    }
+    // NNTR_HTP_ATTN_TRACE: how far this step's rows exceed the fixed int8
+    // scales (rows past the calibration's clip at 127)
+    if (std::getenv("NNTR_HTP_ATTN_TRACE") && append_rows != 0) {
+      float worst_k = 0.0f, worst_v = 0.0f;
+      size_t clip_k = 0, clip_v = 0;
+      for (unsigned int r = 0; r < append_rows; ++r) {
+        const uint16_t *kr = k_base + off + static_cast<size_t>(r) * width;
+        const uint16_t *vr = v_base + off + static_cast<size_t>(r) * width;
+        for (unsigned int n = 0; n < num_heads_KV; ++n)
+          for (unsigned int d = 0; d < head_dim; ++d) {
+            const float kq =
+              std::fabs(nntrainer::compute_fp16_to_fp32(kr[n * head_dim + d])) /
+              q2_scale_k[n];
+            const float vq =
+              std::fabs(nntrainer::compute_fp16_to_fp32(vr[n * head_dim + d])) /
+              q2_scale_v[n * head_dim + d];
+            worst_k = std::max(worst_k, kq);
+            worst_v = std::max(worst_v, vq);
+            clip_k += kq > 127.5f;
+            clip_v += vq > 127.5f;
+          }
+      }
+      // and this step's Q against its fixed u16 encoding (range, zero point
+      // from the calibration rows)
+      size_t clip_q = 0;
+      float worst_q = 0.0f;
+      for (unsigned int r = 0; r < n_q; ++r)
+        for (unsigned int h = 0; h < num_heads_Q; ++h) {
+          const float step = q2_q_enc[2 * h], zp = q2_q_enc[2 * h + 1];
+          const float *qr =
+            q_view + static_cast<size_t>(r) * q_stride + h * head_dim;
+          for (unsigned int d = 0; d < head_dim; ++d) {
+            const float code = qr[d] / step + zp; // 0 .. 65535 inside
+            const float over = code < 0.0f       ? -code
+                               : code > 65535.0f ? code - 65535.0f
+                                                 : 0.0f;
+            clip_q += over > 0.5f;
+            worst_q = std::max(worst_q, over / 65535.0f);
+          }
+        }
+      ml_logi("mha_core trace: q2 clip %s rows=%u from=%u k_max/127=%.2f "
+              "v_max/127=%.2f clipped k=%zu v=%zu of %zu | q over range "
+              "%.2f clipped q=%zu of %zu",
+              q2_name_.c_str(), append_rows, append_row0, worst_k / 127.0f,
+              worst_v / 127.0f, clip_k, clip_v,
+              static_cast<size_t>(append_rows) * width, worst_q, clip_q,
+              static_cast<size_t>(n_q) * q_stride);
     }
     const auto ts_sc = clk::now();
     if (!q2_scales_set[batch]) {
@@ -1503,6 +1647,14 @@ bool HtpMHACoreLayer::try_quantized_attention(
         cache_to, num_heads_Q, num_heads_KV, head_dim, window, io.out,
         f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
     bool again = false;
+    if (f32_ran && f32_check && std::getenv("NNTR_HTP_ATTN_TRACE")) {
+      // the u16 context's saturation against the fixed output encoding
+      size_t sat = 0;
+      for (size_t i = 0; i < q_elems; ++i)
+        sat += chk16[i] == 0u || chk16[i] == 65535u;
+      ml_logi("mha_core trace: u16 ctx saturated %s rows=%u from=%u %zu of %zu",
+              q2_name_.c_str(), n_q, cache_from, sat, q_elems);
+    }
     if (f32_ran && f32_check) {
       // the first run's context in chk; mode 2 reruns into chk16 and the
       // compare below is run vs run instead of accelerator vs NEON
@@ -1750,6 +1902,18 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
                                      attention_output_step, cache_from,
                                      cache_to, nullptr);
   }
+  // NNTR_HTP_ATTN_F16_CHECK=1: the accelerator's result against the CPU's
+  // from the same Q / K / V, per row (never set in a tok/s run)
+  static const bool f16_check = std::getenv("NNTR_HTP_ATTN_F16_CHECK");
+  std::vector<float> accel_out;
+  if (done && f16_check && step_size > 1 &&
+      attention_output_step.getDataType() ==
+        ml::train::TensorDim::DataType::FP32) {
+    accel_out.assign(attention_output_step.getData<float>(),
+                     attention_output_step.getData<float>() +
+                       attention_output_step.size());
+    done = false; // the CPU path below recomputes into the same tensor
+  }
   if (done) {
     if (host_trace && step_size > 1) {
       ml_logi("mha_core trace: rows=%u kv_write_us=%lld accel_call_us=%lld",
@@ -1775,6 +1939,33 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+  if (!accel_out.empty()) {
+    const float *cpu = attention_output_step.getData<float>();
+    const unsigned int w = num_heads_Q * head_dim;
+    double sd = 0.0, ss = 0.0;
+    unsigned int worst_row = 0;
+    double worst = 0.0;
+    for (unsigned int r = 0; r < step_size; ++r) {
+      double rd = 0.0, rs = 0.0;
+      for (unsigned int i = 0; i < w; ++i) {
+        const double d = accel_out[static_cast<size_t>(r) * w + i] -
+                         cpu[static_cast<size_t>(r) * w + i];
+        rd += d * d;
+        rs += static_cast<double>(cpu[static_cast<size_t>(r) * w + i]) *
+              cpu[static_cast<size_t>(r) * w + i];
+      }
+      sd += rd;
+      ss += rs;
+      if (rs > 0.0 && std::sqrt(rd / rs) > worst) {
+        worst = std::sqrt(rd / rs);
+        worst_row = r;
+      }
+    }
+    ml_logi("mha_core f16 check: %s rows=%u from=%u rel_rms=%.5f worst_row=%u "
+            "(%.4f)",
+            q2_name_.c_str(), step_size, cache_from,
+            ss > 0.0 ? std::sqrt(sd / ss) : 0.0, worst_row, worst);
+  }
 }
 
 void HtpMHACoreLayer::one_batch_incremental_forwarding(
