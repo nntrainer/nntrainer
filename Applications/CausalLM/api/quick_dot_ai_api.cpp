@@ -1727,11 +1727,10 @@ convertMessages(const CausalLMChatMessage *messages, size_t num_messages) {
 static std::string apply_chat_template_messages(
   const std::string &architecture, const std::vector<ChatMessage> &messages,
   bool add_generation_prompt, const std::string &model_dir = "") {
-  // If g_chat_template is not loaded but a model_dir is provided,
-  // try loading tokenizer_config.json from that directory at run time.
+  // Load an external template only when the pack actually provides one.
+  // A tokenizer_config.json without chat_template uses the built-in format.
   if (!g_chat_template && !model_dir.empty()) {
-    std::string tc_path = model_dir + "/tokenizer_config.json";
-    if (check_file_exists(tc_path)) {
+    if (causallm::ChatTemplate::Exists(model_dir)) {
       try {
         g_chat_template = causallm::ChatTemplate::Load(model_dir);
         if (g_chat_template) {
@@ -1747,8 +1746,8 @@ static std::string apply_chat_template_messages(
              model_dir.c_str(), e.what());
       }
     } else {
-      LOGE("[Warning] tokenizer_config.json not found in %s",
-           model_dir.c_str());
+      LOGD("No external chat template in %s; using the built-in %s format",
+           model_dir.c_str(), architecture.c_str());
     }
   }
 
