@@ -219,12 +219,16 @@ static int expertPrefetchDepth() {
 static std::deque<std::pair<int, size_t>> g_prefetch_batches;
 /** The next layer slot to queue in the current prefill. */
 static int g_prefetch_next = 0;
+/** The experts queued and not yet registered: a layer queued in part is
+ *  queued again for the rest, and these are not resident yet. */
+static std::unordered_set<causallm::ExpertLru::Key> g_prefetch_inflight;
 static std::unordered_set<const void *> g_handed_expert_layers;
 
 void resetLfm2HtpExpertPool() {
   g_expert_lru.reset();
   g_expert_layers.clear();
   g_prefetch_batches.clear();
+  g_prefetch_inflight.clear();
   g_handed_expert_layers.clear();
   g_prefetch_next = 0;
   g_moe_layer_count.store(0);
@@ -1397,8 +1401,12 @@ static bool tryMoeLayerOnAccelerator(
       const size_t held = g_prefetch_batches.front().second;
       g_prefetch_batches.pop_front();
       g_expert_lru.unhold(held);
+      const std::vector<causallm::ExpertLru::Key> got =
+        ops->prefetch_qs4cx_wh_experts_end();
+      for (causallm::ExpertLru::Key k : got)
+        g_prefetch_inflight.erase(k);
       g_expert_lru.acquire(
-        ops->prefetch_qs4cx_wh_experts_end(), [](causallm::ExpertLru::Key) {},
+        got, [](causallm::ExpertLru::Key) {},
         [](causallm::ExpertLru::Key) {
           throw std::logic_error("expert prefetch overfilled the LRU");
         });
@@ -1409,8 +1417,10 @@ static bool tryMoeLayerOnAccelerator(
              (expert_layer_slot == 0 ||
               g_prefetch_batches.front().first <= expert_layer_slot))
         take_batch();
-      if (expert_layer_slot == 0)
+      if (expert_layer_slot == 0) {
         g_prefetch_next = 1;
+        g_prefetch_inflight.clear(); // every batch was taken just above
+      }
     }
 
     stage(active);
@@ -1427,11 +1437,23 @@ static bool tryMoeLayerOnAccelerator(
               pinned.push_back(d.key_gu);
         std::vector<ExpertFileDesc> want;
         for (const ExpertFileDesc &d : g_expert_layers[g_prefetch_next])
-          if (!g_expert_lru.resident(d.key_gu))
+          if (!g_expert_lru.resident(d.key_gu) &&
+              g_prefetch_inflight.count(d.key_gu) == 0)
             want.push_back(d);
         if (want.empty())
           continue;
-        if (!g_expert_lru.makeRoom(want.size(), pinned, release))
+        // As many of the layer as the pool has room for now, the rest when
+        // a finished layer's slots free up: at 128 experts a layer and
+        // C = 12 the pool holds this layer, the next and 104 more, and a
+        // whole-layer batch left those 104 slots idle, so every layer's
+        // experts had one layer's time to be read in (exposed wait 5-141 ms
+        // a 1024-token prefill).
+        const size_t room = g_expert_lru.room(pinned);
+        const bool part = want.size() > room;
+        if (part)
+          want.resize(room);
+        if (want.empty() ||
+            !g_expert_lru.makeRoom(want.size(), pinned, release))
           break;
         g_expert_lru.hold(want.size());
         bool queued = false;
@@ -1441,10 +1463,15 @@ static bool tryMoeLayerOnAccelerator(
           g_expert_lru.unhold(want.size());
           throw;
         }
-        if (queued)
+        if (queued) {
           g_prefetch_batches.emplace_back(g_prefetch_next, want.size());
-        else
+          for (const ExpertFileDesc &d : want)
+            g_prefetch_inflight.insert(d.key_gu);
+        } else {
           g_expert_lru.unhold(want.size());
+        }
+        if (part)
+          break; // the rest of this layer first, a layer later
       }
     }
 

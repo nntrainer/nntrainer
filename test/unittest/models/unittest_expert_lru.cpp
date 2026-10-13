@@ -178,6 +178,21 @@ TEST(ExpertLru, MakeRoomRefusesWithoutEvictingWhenPinsFillThePool) {
   EXPECT_TRUE(r.evicted.empty());
 }
 
+TEST(ExpertLru, RoomIsWhatMakeRoomWillGrant) {
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 6);
+  Recorder r;
+  lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
+  // 2 pinned resident (9 is not), 1 held: 6 - 1 - 2 = 3.
+  lru.hold(1);
+  EXPECT_EQ(lru.room({key(0), key(1), key(9)}), 3u);
+  EXPECT_TRUE(lru.makeRoom(3, {key(0), key(1), key(9)}, r.evict));
+  EXPECT_EQ(r.evicted, (std::vector<int>{2, 3}));
+  EXPECT_EQ(lru.room({key(0), key(1)}), 3u);
+  EXPECT_FALSE(lru.makeRoom(4, {key(0), key(1)}, r.evict));
+}
+
 TEST(ExpertLru, HeldSlotsAreNotHandedOutUntilUnheld) {
   // Doc 52 section 10.20: read-ahead in flight owns its slots before its
   // keys are in the LRU, so a miss meanwhile must evict instead.
