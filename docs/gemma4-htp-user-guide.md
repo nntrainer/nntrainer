@@ -25,6 +25,11 @@ numbers describe this tree, not a plan.
 - The same binary still runs every other model on the CPU or the GPU exactly
   as before; the HTP path is selected only by two keys in the model's
   `nntr_config.json`.
+- The branch carries the HTP work of PR #4416 as its own history (553
+  commits) plus its 18 later commits: the DSP-side q2 calibration, the
+  selectable page-cache reader, resident-weight sharing, the windowed KV cache
+  of the sliding layers, growing int8 scales and int8 attention at any
+  context length.
 
 ## 2. What you need
 
@@ -336,12 +341,13 @@ match. On the host, the fused FP32 tiny model matches its reference logits and
 the CPU and GPU paths of the other models produce the same text as before the
 HTP series was merged.
 
-### 9.2 Where the source PR has moved since
+### 9.2 The later PR #4416 commits, measured on their source branch
 
-The HTP series continued after the revision this branch pins
-(`48a6bbb22`). Measured on the same phone model from the newer head
+The 18 commits after the pinned revision are part of this branch. Their
+authors measured them on the same phone model on the source branch
 (`docs/measurements/s26u-next-round-handoff.md` and
-`docs/measurements/pr4416-memory-87f8580/` in PR #4416), not in this branch:
+`docs/measurements/pr4416-memory-87f8580/` in PR #4416); the figures
+describe the code this branch now carries:
 
 | Prompt | Prefill | Decode, last 64 tokens |
 |---|---|---|
@@ -352,8 +358,13 @@ The HTP series continued after the revision this branch pins
 The newer head also bounds the model's page-cache use, measured with a
 2,048-token prompt: peak memory 8.4 GB (up to 3.5 GB of it the model's page
 cache) at 645 tok/s prefill and 9.9 tok/s decode, or 3.6 GB with the page
-cache bounded at 682 tok/s prefill and 7.0 tok/s decode. Those changes are
-candidates for a follow-up, not part of this PR.
+cache bounded at 682 tok/s prefill and 7.0 tok/s decode
+(`NNTR_HTP_PAGE_CACHE=0`). On this branch, built from the same head state,
+the summary prompt of section 9.1 gives 1,633 ms (630 tok/s) prefill and
+13.8 tok/s (99 tokens in 7.2 s) decode, and the 100 generated token ids are identical to a
+build of the PR #4416 head run with the same options; they differ from the
+pinned revision's 109 tokens at the third token, as the growing int8 scales
+change the arithmetic.
 
 ## 10. When something goes wrong
 

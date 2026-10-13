@@ -200,6 +200,11 @@ Diagnostics that are safe to set from the outside:
 | `NNTR_HTP_DUMP=<dir>` | dump layer inputs and outputs for comparison with the CPU |
 | `NNTR_HTP_ATTN_F32_CHECK=1` | compare the DSP attention with an fp32 CPU reference |
 | `NNTR_MOE_TRACE=1` | log expert hits and misses per layer |
+| `NNTR_HTP_PAGE_CACHE=0` or `1` | read the weight file through the bounded reader instead of mmap: 0 bypasses the page cache (direct IO), 1 bounds it; unset keeps the mmap loader |
+| `NNTR_HTP_RELEASE_PREFILL_SCRATCH=1` | drop the CPU prefill scratch once the resident decode graph owns the step |
+| `NNTR_GENERATED_IDS=<path>` | write the generated token ids, one per line, without asking the DSP for logits |
+| `NNTR_HTP_ATTN_DSP_CALIB=0` | calibrate the int8 attention scales on the CPU instead of inside the DSP step |
+| `NNTR_MOE_CACHE_GROW=<n>` | let the expert arena grow to n slots per layer after load |
 
 The rest of the `NNTR_HTP_*` and `NNTR_MOE_*` variables (about sixty) are
 tuning knobs for experiments; their readers are in `htp_compute_ops.cpp`,
