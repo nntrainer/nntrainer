@@ -2872,6 +2872,10 @@ out:
 #define FC_M1_MAX_LANES 8u
 /** @brief Blocks a lane cuts its slice into (fewer when VTCM is short). */
 #define FC_M1_BLOCKS 4u
+/** @brief Adjacent output tiles sharing each activation load and broadcast. */
+#ifndef HVX_FC_M1_COLS
+#define HVX_FC_M1_COLS 3u
+#endif
 
 typedef struct {
   const uint8_t *act_ah;
@@ -2880,7 +2884,6 @@ typedef struct {
   const hexkl_weight_u8i4 *w[HEXKL_FC_M1_MAX_PARTS];
   uint32_t t0[HEXKL_FC_M1_MAX_PARTS + 1u]; /**< part p's first unit */
   uint32_t n_parts, k_tiles, n_tiles;
-  int32_t *acc; /**< n_tiles x MOE_M1_TILE_I32 */
   float *out;
   uint8_t *vtcm; /**< NULL: no feed */
   uint32_t arena, rows1;
@@ -2961,23 +2964,45 @@ static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
     }
     const uint32_t p = fc_m1_part(c, b0);
     const hexkl_weight_u8i4 *w = c->w[p];
-    for (uint32_t t = b0; t < b1; ++t) {
+    for (uint32_t t = b0; t < b1;) {
+      /** The DMA slab is 128-byte aligned. Three neighboring column tiles
+         share the same activation broadcasts, with the same integer sum
+         in each lane. Only the live output rows need accumulator storage. */
+      int32_t tiles[3u * HEXKL_HMX_INT8_BLOCK_N_COL]
+        __attribute__((aligned(128)));
       const uint32_t nt = t - c->t0[p];
-      const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
-      int32_t *tile = c->acc + (size_t)t * MOE_M1_TILE_I32;
-      if (feed) {
+      uint32_t cols = 1u;
+      if (feed && c->rows1) {
+        if (HVX_FC_M1_COLS == 3u && b1 - t >= 3u) {
+          cols = 3u;
+          hvx_gemv_u8i4_wh_3col_nopf(c->act_ah, c->k_tiles, buf[cur],
+                                     WEIGHT_TILE_BYTES_U8I4, b1 - b0, t - b0,
+                                     tiles);
+        } else {
+          hvx_gemv_u8i4_wh_col_aligned_nopf(c->act_ah, c->k_tiles, buf[cur],
+                                            b1 - b0, t - b0, tiles);
+        }
+      } else if (feed) {
         hvx_gemm_u8i4_wh_col_nopf(c->act_ah, 1u, c->k_tiles, buf[cur], b1 - b0,
-                                  t - b0, c->rows1, tile);
+                                  t - b0, c->rows1, tiles);
       } else {
         hvx_gemm_u8i4_wh_col(c->act_ah, 1u, c->k_tiles, w->wh_bytes,
                              w->N / HEXKL_HMX_INT8_BLOCK_N_COL, nt, c->rows1,
-                             tile);
+                             tiles);
       }
-      hvx_dequant_acc_tile_to_f32(
-        tile, HEXKL_HMX_INT8_BLOCK_N_COL, 1u, c->act_scale, c->act_zp,
-        w->colsum_w + c0, w->w_scale + c0, w->bias + c0,
-        c->out + (size_t)t * HEXKL_HMX_INT8_BLOCK_N_COL,
-        c->n_tiles * HEXKL_HMX_INT8_BLOCK_N_COL, 0);
+      const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
+      float *out = c->out + (size_t)t * HEXKL_HMX_INT8_BLOCK_N_COL;
+      if (cols == 3u) {
+        hvx_dequant_acc_3tiles_m1_f32(tiles, c->act_scale[0], c->act_zp[0],
+                                      w->colsum_w + c0, w->w_scale + c0,
+                                      w->bias + c0, out);
+      } else {
+        hvx_dequant_acc_tile_to_f32(tiles, HEXKL_HMX_INT8_BLOCK_N_COL, 1u,
+                                    c->act_scale, c->act_zp, w->colsum_w + c0,
+                                    w->w_scale + c0, w->bias + c0, out,
+                                    c->n_tiles * HEXKL_HMX_INT8_BLOCK_N_COL, 0);
+      }
+      t += cols;
     }
     cur ^= 1u;
     b0 = n0;
@@ -2991,7 +3016,6 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
                             const uint32_t *h, const float *act_f32,
                             float *out_f32, hvx_worker_pool *pool,
                             hexkl_moe_scratch *scratch, uint32_t flags) {
-  static const uint32_t row0[4] = {0u, 0u, 0u, 0u};
   const uint32_t BR = HEXKL_HMX_INT8_BLOCK_N_ROW;
   fc_m1_ctx c;
   if (!tbl || !h || !act_f32 || !out_f32 || !scratch) {
@@ -3017,15 +3041,14 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
   }
   c.n_parts = n_parts;
   c.n_tiles = c.t0[n_parts];
-  /* The activation's one AH block, its row parameters (rows 1-3 repeat
-     row 0's, the M=1 path's padding rule), the accumulator tiles. */
+  /** The activation's one AH block and its row parameters (rows 1-3 repeat
+     row 0's, the M=1 path's padding rule). Accumulators stay on each worker's
+     stack instead of reserving four padded rows per output tile. */
   const size_t sz_ah = (size_t)c.k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const size_t sz_rq = sizeof(float) * BR;
-  const size_t sz_acc = (size_t)c.n_tiles * MOE_M1_TILE_BYTES;
   int rc = hexkl_moe_scratch_reserve(
     scratch, ROUND_UP_SZ(sz_ah, MOE_SCRATCH_ALIGN) +
-               2u * ROUND_UP_SZ(sz_rq, MOE_SCRATCH_ALIGN) +
-               ROUND_UP_SZ(sz_acc, MOE_SCRATCH_ALIGN));
+               2u * ROUND_UP_SZ(sz_rq, MOE_SCRATCH_ALIGN));
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -3033,13 +3056,12 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
   uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_ah);
   float *scale = (float *)hexkl_moe_carve(&cur, sz_rq);
   int32_t *zp = (int32_t *)hexkl_moe_carve(&cur, sz_rq);
-  c.acc = (int32_t *)hexkl_moe_carve(&cur, sz_acc);
   hvx_quant_rows_u8_params(act_f32, 1u, BR, K, scale, zp, NULL); /* 1 row */
   for (uint32_t r = 1; r < 4u; ++r) {
     scale[r] = scale[0];
     zp[r] = zp[0];
   }
-  hvx_quant_pack_u8_ah_rows(act_f32, row0, 0u, 4u, K, scale, zp, act_ah);
+  hvx_quant_pack_u8_ah_m1_repeat(act_f32, K, scale[0], zp[0], act_ah);
   c.act_ah = act_ah;
   c.act_scale = scale;
   c.act_zp = zp;

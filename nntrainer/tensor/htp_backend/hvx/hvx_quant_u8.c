@@ -378,6 +378,23 @@ void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
   }
 }
 
+void hvx_quant_pack_u8_ah_m1_repeat(const float *x, uint32_t k, float scale,
+                                    int32_t zp, uint8_t *out_ah) {
+  const HVX_Vector vinv = hvx_splat_sf(1.0f / scale);
+  const HVX_Vector vz = Q6_V_vsplat_R(zp);
+  const HVX_UVector *vin = (const HVX_UVector *)x;
+  for (uint32_t kt = 0; kt < k / TILE_INNER; ++kt) {
+    /** The FC tail's four rows are the same token. Quantize it once, then
+       repeat the integer lanes while narrowing to the existing AH layout.
+       The conversion and saturation are identical to quant_pack_group4. */
+    const HVX_Vector vq =
+      Q6_Vw_vadd_VwVw(hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin[kt], vinv)), vz);
+    const HVX_Vector vh = Q6_Vh_vpack_VwVw_sat(vq, vq);
+    *(HVX_UVector *)(out_ah + (size_t)kt * ACT_TILE_BYTES) =
+      Q6_Vub_vpack_VhVh_sat(vh, vh);
+  }
+}
+
 int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
                          uint32_t k, const float *scale, const int32_t *zp,
                          uint8_t *out_ah, hvx_worker_pool *pool) {

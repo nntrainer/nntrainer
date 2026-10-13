@@ -98,8 +98,15 @@
 /** @brief The graph's lanes per feed (#178 set3, L2-fed: 26 GB/s at K =
  *  7168 and 52 at K = 2048 with 3 lanes, the best of 1..6; VTCM-fed: 6,
  *  45.5 GB/s). ponytail: one count per feed, not per K; the upgrade is a
- *  per-shape table from the E sitting's profile lines. */
+ *  per-shape table from the E sitting's profile lines. The v81 VTCM feed
+ *  can use eight HVX contexts; older targets keep the measured six. */
+#ifndef FC_Q4_GRAPH_LANES_VTCM
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+#define FC_Q4_GRAPH_LANES_VTCM 8u
+#else
 #define FC_Q4_GRAPH_LANES_VTCM 6u
+#endif
+#endif
 #define FC_Q4_GRAPH_LANES_L2 3u
 /** @brief [#132 Part B E5f] The L2 feed's lanes for K <= 2048: #178's
  *  ladder read 52 GB/s at 6 lanes there (26 at K = 7168, whose best is

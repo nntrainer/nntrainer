@@ -136,6 +136,38 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
   }
 }
 
+void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *colsum_w,
+                                   const float *w_scale, const float *bias,
+                                   float *out) {
+  const HVX_Vector vs = hvx_splat_sf(act_scale);
+  const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp));
+  const HVX_UVector *va = (const HVX_UVector *)tiles;
+  const HVX_UVector *vc = (const HVX_UVector *)colsum_w;
+  const HVX_UVector *vw = (const HVX_UVector *)w_scale;
+  const HVX_UVector *vb = (const HVX_UVector *)bias;
+  HVX_UVector *vo = (HVX_UVector *)out;
+
+  /** Prefill interleaves independent rows; M=1 instead interleaves the
+     three neighboring output tiles. Keep each tile's exact conversion,
+     subtract, two multiplies and add from hvx_dequant_acc_tile_to_f32. */
+  const HVX_Vector c0 = Q6_Vsf_vsub_VsfVsf(
+    Q6_Vsf_equals_Vw(va[0]), Q6_Vsf_vmpy_VsfVsf(vz, Q6_Vsf_equals_Vw(vc[0])));
+  const HVX_Vector c1 = Q6_Vsf_vsub_VsfVsf(
+    Q6_Vsf_equals_Vw(va[1]), Q6_Vsf_vmpy_VsfVsf(vz, Q6_Vsf_equals_Vw(vc[1])));
+  const HVX_Vector c2 = Q6_Vsf_vsub_VsfVsf(
+    Q6_Vsf_equals_Vw(va[2]), Q6_Vsf_vmpy_VsfVsf(vz, Q6_Vsf_equals_Vw(vc[2])));
+  const HVX_Vector s0 = Q6_Vsf_vmpy_VsfVsf(c0, vs);
+  const HVX_Vector s1 = Q6_Vsf_vmpy_VsfVsf(c1, vs);
+  const HVX_Vector s2 = Q6_Vsf_vmpy_VsfVsf(c2, vs);
+  const HVX_Vector w0 = Q6_Vsf_vmpy_VsfVsf(s0, vw[0]);
+  const HVX_Vector w1 = Q6_Vsf_vmpy_VsfVsf(s1, vw[1]);
+  const HVX_Vector w2 = Q6_Vsf_vmpy_VsfVsf(s2, vw[2]);
+  vo[0] = Q6_Vsf_vadd_VsfVsf(w0, vb[0]);
+  vo[1] = Q6_Vsf_vadd_VsfVsf(w1, vb[1]);
+  vo[2] = Q6_Vsf_vadd_VsfVsf(w2, vb[2]);
+}
+
 void hvx_dequant_acc_tiles_scatter_rows_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,

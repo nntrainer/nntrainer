@@ -86,12 +86,20 @@ static uint64_t graph_now_qt(void) {
 #endif
 }
 
+/** @brief A scale belongs to an unchanged activation slot, width, epsilon
+ *  and reduction algorithm. width == 0 invalidates the entry. */
+typedef struct {
+  uint32_t width, eps_bits, n1;
+  float scale;
+} graph_norm_cache;
+
 /** @brief What one forward call carries to the kernels. */
 typedef struct {
   const hexkl_graph_env *env;
   hexkl_graph_routing routing; /**< n_experts 0 once consumed */
   uint32_t pos;                /**< the token position (ROPE, ATTN_M1) */
   uint32_t end_op;             /**< [#289] this forward runs ops < end_op */
+  graph_norm_cache norm[HTP_GRAPH_N_SLOTS]; /**< Never survives a forward. */
 } graph_call;
 
 typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
@@ -311,15 +319,57 @@ static float graph_eps(const htp_graph_op *op) {
   return eps;
 }
 
+/** @brief A graph slot can retain its scale only if this norm leaves the
+ *  input unchanged. In-place norms and the dense-early scratch cannot
+ *  populate a slot's cache. Every dispatch invalidates its output slot. */
+static graph_norm_cache *graph_norm_cache_for(hexkl_graph *g,
+                                              const htp_graph_op *op,
+                                              graph_call *call, const float *in,
+                                              float *out) {
+  if (in == out || in != g->slots + (size_t)op->in_slot * g->slot_words) {
+    return NULL;
+  }
+  return &call->norm[op->in_slot];
+}
+
+static int graph_norm_reuse(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out,
+                            const float *gamma, uint32_t n1) {
+  const graph_norm_cache *c = graph_norm_cache_for(g, op, call, in, out);
+  if (c == NULL || c->width != op->K || c->eps_bits != op->eps_bits ||
+      c->n1 != n1) {
+    return 0;
+  }
+  hvx_rmsnorm_apply_f32(in, gamma, out, op->K, c->scale);
+  return 1;
+}
+
+static void graph_norm_keep(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out,
+                            uint32_t n1, float scale) {
+  graph_norm_cache *c = graph_norm_cache_for(g, op, call, in, out);
+  if (c != NULL) {
+    c->width = op->K;
+    c->eps_bits = op->eps_bits;
+    c->n1 = n1;
+    c->scale = scale;
+  }
+}
+
 static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   const float *gamma = g->param[op - g->ops];
-  (void)call;
+  const uint32_t n1 = (op->feed & HTP_GRAPH_NORM_N1) != 0u;
+  float scale;
   if (gamma == NULL) {
     return AEE_EBADSTATE;
   }
+  if (graph_norm_reuse(g, op, call, in, out, gamma, n1)) {
+    return AEE_SUCCESS;
+  }
   ((op->feed & HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32 : hvx_rmsnorm_f32)(
-    in, gamma, out, op->K, op->K, graph_eps(op), NULL);
+    in, gamma, out, op->K, op->K, graph_eps(op), &scale);
+  graph_norm_keep(g, op, call, in, out, n1, scale);
   return AEE_SUCCESS;
 }
 
@@ -332,22 +382,13 @@ static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
 static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   const float *gamma = g->param[op - g->ops];
-  const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
-                 n_k = op->n_kv * hd;
-  const float eps = graph_eps(op);
-  const float *v =
-    (op->feed & HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;
-  (void)call;
   if (gamma == NULL) {
     return AEE_EBADSTATE;
   }
-  if ((op->feed & HTP_GRAPH_QKNORM_V) != 0u) {
-    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
-  } else if (v != out + n_q + n_k) {
-    memcpy(out + n_q + n_k, v, (size_t)n_k * sizeof(float));
-  }
-  hvx_rmsnorm_f32(in, gamma, out, n_q, hd, eps, NULL);
-  hvx_rmsnorm_f32(in + n_q, gamma + hd, out + n_q, n_k, hd, eps, NULL);
+  hvx_qkv_rmsnorm_f32(
+    in, gamma, out, op->gqa * op->n_kv, op->n_kv, op->head_dim, graph_eps(op),
+    (op->feed & HTP_GRAPH_QKNORM_V) != 0u,
+    (op->feed & HTP_GRAPH_QKNORM_K_EQ_V) != 0u, call->env->pool);
   return AEE_SUCCESS;
 }
 
@@ -467,7 +508,12 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
                          uint32_t *sel, float *w) {
   const uint32_t i = (uint32_t)(op - g->ops);
   if (op->eps_bits != 0u) {
-    hvx_rmsnorm_f32(in, g->state[i], out, op->K, op->K, graph_eps(op), NULL);
+    if (!graph_norm_reuse(g, op, call, in, out, g->state[i], 0u)) {
+      float scale;
+      hvx_rmsnorm_f32(in, g->state[i], out, op->K, op->K, graph_eps(op),
+                      &scale);
+      graph_norm_keep(g, op, call, in, out, 0u, scale);
+    }
     hvx_router_softmax_topk_f32(out, g->param[i], g->state[i] + op->K, op->K,
                                 op->n_experts, op->top_k, out, sel, w,
                                 call->env->pool);
@@ -1365,6 +1411,7 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
   call.pos = pos;
   call.end_op =
     n_ops_limit >= g->n_ops - start_op ? g->n_ops : start_op + n_ops_limit;
+  memset(call.norm, 0, sizeof(call.norm));
   g->early_from = g->early_to = 0u;
   if (routing != NULL) {
     call.routing = *routing;
@@ -1390,6 +1437,10 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     }
     n0 = graph_now_qt();
     t0 = HAP_perf_get_pcycles();
+    /** Even a partial slot write invalidates its previous scale. Clearing
+       before dispatch also covers in-place operators and skipped early
+       ops; a resumed forward starts with an entirely empty cache. */
+    call.norm[op->out_slot].width = 0u;
     if (g->early_to != 0u && i >= g->early_from) {
       /* [#289] run in the miss round: its result, at the branch's last op */
       if (i == g->early_to) {

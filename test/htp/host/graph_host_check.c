@@ -2841,6 +2841,95 @@ static void check_gemma(void) {
            "m1_ops_det.h / geglu_det_one / q4_gemv_cpu_det\n");
 }
 
+/** @brief A scale can be reused across gamma changes, but a slot write,
+ *  a different width/epsilon/algorithm, or another forward must recompute
+ *  it. Check every prefix and then the same graph resumed one op at a time. */
+static void check_norm_scale_reuse(void) {
+  enum { W = 128, N = 11 };
+  uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u + (N + 1u) * HTP_GRAPH_OP_WORDS] =
+    {0};
+  const uint32_t norm_mask =
+    HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD);
+  uint32_t n = 0, seed = 0x4e4f524du, resume, rc;
+  float gamma[N][W], x[W], input[W], output[W];
+  float ref[HTP_GRAPH_N_SLOTS][W];
+  hexkl_graph *g = NULL;
+  hexkl_graph_env env = {0};
+  words[0] = HTP_GRAPH_MAGIC;
+  words[1] = HTP_GRAPH_VERSION;
+  words[2] = 1u;
+  words[4] = W;
+  words[5] = 32u;
+  words[6] = 32u;
+  for (uint32_t i = 0; i < N; ++i) {
+    const uint32_t width = i == 4u || i == 8u ? W / 2u : W;
+    const uint32_t kind = i == 2u ? HTP_OP_ADD : HTP_OP_RMSNORM;
+    const uint32_t in_slot = i == 2u ? 1u : 0u;
+    const uint32_t out_slot =
+      i == 2u || i == 8u ? 0u : (i % 2u == 0u ? 1u : 2u);
+    htp_graph_op *op = htp_graph_lfm2_emit(words, &n, kind, 0u, width, width,
+                                           in_slot, out_slot, norm_mask);
+    if (kind == HTP_OP_RMSNORM) {
+      const float eps = i == 6u ? 0.25f : 1e-6f;
+      memcpy(&op->eps_bits, &eps, sizeof(eps));
+      op->feed = i == 7u ? HTP_GRAPH_NORM_N1 : 0u;
+    }
+    fill(gamma[i], W, &seed);
+  }
+  htp_graph_lfm2_emit(words, &n, HTP_OP_LM_HEAD, 1u, W, 32u, 1u, 2u, 0u);
+  words[3] = n;
+  rc =
+    hexkl_graph_init(words, htp_graph_words_for(1u, n), &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "norm reuse graph init: %s",
+        htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  for (uint32_t i = 0; i < N; ++i) {
+    if (g->ops[i].kind == HTP_OP_RMSNORM) {
+      rc = hexkl_graph_set_param(g, i, HTP_GRAPH_PARAM_GAMMA, gamma[i],
+                                 g->ops[i].K);
+      CHECK(rc == 0u, "norm reuse gamma %u: %s", i, htp_graph_err_name(rc));
+    }
+  }
+  fill(x, W, &seed);
+  for (uint32_t resumed = 0; resumed < 2u; ++resumed) {
+    for (uint32_t end = 0; end < N; ++end) {
+      const uint32_t start = resumed ? end : 0u;
+      if (!resumed || end == 0u) {
+        memset(g->slots, 0, HTP_GRAPH_N_SLOTS * g->slot_words * sizeof(float));
+        memset(ref, 0, sizeof(ref));
+        memcpy(ref[0], x, sizeof(x));
+      }
+      memcpy(input, ref[g->ops[start].in_slot],
+             g->ops[start].K * sizeof(float));
+      rc = hexkl_graph_forward(g, &env, start, end - start + 1u, resumed, NULL,
+                               input, g->ops[start].K, output, g->ops[end].N,
+                               &resume);
+      for (uint32_t i = start; i <= end; ++i) {
+        const htp_graph_op *op = &g->ops[i];
+        float *src = ref[op->in_slot], *dst = ref[op->out_slot], eps;
+        memcpy(&eps, &op->eps_bits, sizeof(eps));
+        if (op->kind == HTP_OP_ADD) {
+          for (uint32_t j = 0; j < op->N; ++j)
+            dst[j] = m1_det_add(dst[j], src[j]);
+        } else if (op->feed & HTP_GRAPH_NORM_N1) {
+          m1_rmsnorm_n1_chunk_det(src, gamma[i], dst, op->K, eps);
+        } else {
+          m1_rmsnorm_det(src, gamma[i], dst, op->K, op->K, eps, NULL);
+        }
+      }
+      CHECK(rc == 0u && resume == end + 1u, "norm reuse forward %u/%u: %s",
+            resumed, end, htp_graph_err_name(rc));
+      for (uint32_t slot = 0; slot < HTP_GRAPH_N_SLOTS; ++slot)
+        CHECK(memcmp(g->slots + slot * g->slot_words, ref[slot], W * 4u) == 0,
+              "norm reuse mode %u op %u slot %u differs", resumed, end, slot);
+    }
+  }
+  hexkl_graph_free(g);
+  printf("GRAPH NORM REUSE: gamma, slot writes, width, epsilon, N1, "
+         "in-place partial writes and resumed forwards checked\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
@@ -2854,6 +2943,7 @@ int main(void) {
   check_wh();
   check_gemma();
   check_gemma26_list();
+  check_norm_scale_reuse();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;

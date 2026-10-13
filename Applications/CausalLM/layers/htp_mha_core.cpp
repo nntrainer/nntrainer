@@ -643,10 +643,17 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
   // The row is q | k | v of the step (row 0 of batch 0 on every path).
   const unsigned int wq = query.width(), wk = key.width(), wv = value.width();
   static thread_local std::vector<float> row;
-  row.resize(wq + wk + wv);
-  std::memcpy(row.data(), query.getData<float>(), wq * sizeof(float));
-  std::memcpy(row.data() + wq, key.getData<float>(), wk * sizeof(float));
-  std::memcpy(row.data() + wq + wk, value.getData<float>(), wv * sizeof(float));
+  // A whole resident row uses the DSP's projections. This hook still binds
+  // RoPE and seeds KV when needed, but its stale CPU q/k/v are never read.
+  const bool resident = htpDecodeRowResident(pos);
+  if (!resident) {
+    row.resize(wq + wk + wv);
+    std::memcpy(row.data(), query.getData<float>(), wq * sizeof(float));
+    std::memcpy(row.data() + wq, key.getData<float>(), wk * sizeof(float));
+    std::memcpy(row.data() + wq + wk, value.getData<float>(),
+                wv * sizeof(float));
+  }
+  const float *qkv = resident ? nullptr : row.data();
   // The RoPE table, once per layer instance, in the ROPE op's shape:
   // cos[i][0..hd/2) | sin[i][0..hd/2) per position, the CPU RoPE's own
   // source (plan 82 section 3.4). Head_dim 64 builds it up front (LFM2);
@@ -679,8 +686,8 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
   };
   if (htp_rope_table_.empty() && use_rope && head_dim == 64)
     build_rope_table();
-  int r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                        wq, htp_rope_table_.data(),
+  int r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
+                        htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
   if (r == 3) {
     // [#260] use_rope may be off here when the token runs the row: its
@@ -692,8 +699,8 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                   std::runtime_error)
       << "mha_core: the HTP attention hook asked for a RoPE table it has";
     build_rope_table();
-    r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                      wq, htp_rope_table_.data(),
+    r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
+                      htp_rope_table_.data(),
                       static_cast<unsigned>(htp_rope_table_.size()));
     // [#4416 mem] bound: the DSP holds its copy and asks (3) again only
     // after a new graph init, when build_rope_table makes it again. 30
@@ -760,8 +767,8 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
         htpDecodeKvSeedKvq(pos, q_cache_handles[0], k_only.data())) {
       q_cache_handles[0] = -1; // released on the DSP
       drop_cpu_cache();
-      r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                        wq, htp_rope_table_.data(),
+      r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
+                        htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
       NNTR_THROW_IF(r != 1, std::runtime_error)
         << "mha_core: the HTP attention hook asked for a seed twice at pos "
@@ -797,8 +804,8 @@ bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
               "seed_ms_sum=%.1f",
               pos, conv_ms, all_ms);
     }
-    r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                      wq, htp_rope_table_.data(),
+    r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
+                      htp_rope_table_.data(),
                       static_cast<unsigned>(htp_rope_table_.size()));
     NNTR_THROW_IF(r != 1, std::runtime_error)
       << "mha_core: the HTP attention hook asked for a seed twice at pos "

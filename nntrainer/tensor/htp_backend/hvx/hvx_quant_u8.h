@@ -155,4 +155,15 @@ void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
                                const float *scale, const int32_t *zp,
                                uint8_t *out_ah);
 
+/**
+ * @brief Quantizes one FC token once and repeats it in AH rows 0..3.
+ *
+ * Same bytes as hvx_quant_pack_u8_ah_rows with four source row zeros and
+ * identical scale/zp. Only the first 128 bytes of each 2048-byte tile are
+ * written; the rest of the 64-row block is untouched. @a k is a multiple
+ * of 32 and @a out_ah has 64 * k bytes, as for the M=1 FC fallback.
+ */
+void hvx_quant_pack_u8_ah_m1_repeat(const float *x, uint32_t k, float scale,
+                                    int32_t zp, uint8_t *out_ah);
+
 #endif /* __NNTRAINER_HVX_QUANT_U8_H__ */

@@ -76,6 +76,23 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
                                uint32_t n_col, uint32_t nt, uint32_t rows1,
                                int32_t *out);
 
+/** @brief One M=1 projection without prefetch, with 128-byte aligned wh/out.
+ * The caller provides an aligned VTCM weight slab and output tiles. */
+void hvx_gemv_u8i4_wh_col_aligned_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                       const uint8_t *wh, uint32_t n_col,
+                                       uint32_t nt, int32_t *out);
+
+/** @brief Three M=1 projections sharing one activation row. The WH planes
+ * are plane_bytes apart and use the same column stride. Reuses activation
+ * loads/broadcasts while preserving each projection's integer sum order.
+ * Output is three consecutive 32-column int32 tiles; no prefetch is issued.
+ * wh and out must be 128-byte aligned; plane_bytes must be a multiple of 512.
+ * Adjacent output tiles use plane_bytes = 512; separate planes may also be
+ * used. */
+void hvx_gemv_u8i4_wh_3col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out);
+
 /**
  * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)
  *        over all @a k_tiles: n_tiles*512 bytes every n_col*512, k_tiles

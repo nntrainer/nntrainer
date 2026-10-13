@@ -166,6 +166,17 @@ inline bool htpDecodeTokenId(unsigned *id) {
 #endif
 }
 
+/** @brief Whether this completed row returned only its token id. The id
+ *  remains available to htpDecodeTokenId; false when CPU logits are used. */
+inline bool htpDecodeHasTokenId(unsigned pos) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->has_decode_token_id(pos);
+#else
+  (void)pos;
+  return false;
+#endif
+}
+
 /** @brief [#289] The seed with V from the layer's quantized prefill
  *  cache, K from @a k_rows. */
 inline bool htpDecodeKvSeedKvq(unsigned n_rows, int kv_handle,

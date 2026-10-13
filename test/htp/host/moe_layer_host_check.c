@@ -1324,15 +1324,17 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
                            hexkl_moe_scratch *scratch) {
   static const uint32_t qkv[3] = {2048, 512, 512},
                         thirds[3] = {2048, 2048, 2048}, one[1] = {2048},
-                        tiny[2] = {32, 96};
+                        tiny[2] = {32, 96}, gemma_qkv[3] = {4096, 2048, 2048},
+                        gemma_qk[2] = {8192, 1024}, gemma_o[1] = {2816};
   const struct {
     const char *name;
     uint32_t K, n;
     const uint32_t *N;
-  } shapes[4] = {{"q|k|v", 2048, 3, qkv},
-                 {"in_proj", 2048, 3, thirds},
-                 {"out_proj", 2048, 1, one},
-                 {"tiny", 64, 2, tiny}};
+  } shapes[] = {
+    {"q|k|v", 2048, 3, qkv},           {"in_proj", 2048, 3, thirds},
+    {"out_proj", 2048, 1, one},        {"tiny", 64, 2, tiny},
+    {"gemma-qkv", 2816, 3, gemma_qkv}, {"gemma-qk", 2816, 2, gemma_qk},
+    {"gemma-o", 8192, 1, gemma_o}};
   const uint32_t feed_on =
     HEXKL_MOE_FLAG_GEMV_FEED_SET | HEXKL_MOE_FLAG_GEMV_FEED;
   const uint32_t cfgs[5] = {
@@ -1343,7 +1345,7 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
     feed_on | HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_ROWS1,
     feed_on | HEXKL_MOE_FLAG_DMA_BYPASS};
   int fail = 0, pushed = 0, fed_cells = 0, small_ok = 1, cells = 0;
-  for (uint32_t s = 0; s < 4u; ++s)
+  for (uint32_t s = 0; s < sizeof shapes / sizeof shapes[0]; ++s)
     for (uint32_t c = 0; c < 5u; ++c) {
       fail |=
         run_fc_wh_case(shapes[s].name, shapes[s].K, shapes[s].n, shapes[s].N,
@@ -1419,7 +1421,8 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
   }
   if (!fail)
     printf("FC WH BIT-IDENTICAL: hexkl_mm_u8i4_fc_m1_run vs fc_wh_det.h, %d "
-           "cells (q|k|v, in_proj thirds, out_proj, tiny; arena x rows4/rows1, "
+           "cells (q|k|v, in_proj thirds, out_proj, tiny, Gemma qkv/qk/o; "
+           "arena x rows4/rows1, "
            "VTCM feed x rows4/rows1/bypass, a VTCM too small to feed); %d fed "
            "cells, every block read after its lane's wait and read whole; "
            "lane timeout fails the call\n",

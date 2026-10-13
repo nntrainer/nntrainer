@@ -550,12 +550,13 @@ static void append_tile_q8(const hvx_attn_m1_ctx *ctx, uint32_t layer,
   }
 }
 
-/** @brief [#4416 F] append_head_q8 as vectors (the fast path's forward):
+/** @brief append_head_q8 as vectors for heads divisible by 128:
  *         v's row by q8_row128, k's bytes by q8_row128 into a row and then
  *         scattered into the tile's column. */
-static inline void append_head_fast(const hvx_attn_m1_ctx *ctx, uint32_t layer,
-                                    uint32_t h, uint32_t pos, const float *k,
-                                    const float *v) {
+static inline void append_head_q8_vector(const hvx_attn_m1_ctx *ctx,
+                                         uint32_t layer, uint32_t h,
+                                         uint32_t pos, const float *k,
+                                         const float *v) {
   const uint32_t hd = ctx->head_dim;
   int8_t *kt =
     kt8_head(ctx, layer, h) + (size_t)(pos / TILE) * hd * TILE + pos % TILE;
@@ -785,6 +786,23 @@ typedef struct {
 #ifndef ATTN_M1_PV_LEAD
 #define ATTN_M1_PV_LEAD 1 /**< P3: the V rows two 16 KiB blocks ahead */
 #endif
+/** @brief Prefetch only the current int8 V chunk on the measured v81 path. */
+#ifndef NNTR_ATTN_Q8_NARROW_PREFETCH
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+#define NNTR_ATTN_Q8_NARROW_PREFETCH 1
+#else
+#define NNTR_ATTN_Q8_NARROW_PREFETCH 0
+#endif
+#endif
+/** @brief Full-attention PV: eight Q heads reuse each V chunk. Enabled on
+ *  the measured v81 target; override with 0 for an ablation. */
+#ifndef NNTR_ATTN_Q8_GQA8_REUSE
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ == 81
+#define NNTR_ATTN_Q8_GQA8_REUSE 1
+#else
+#define NNTR_ATTN_Q8_GQA8_REUSE 0
+#endif
+#endif
 /** @brief V rows per PV fetch block (16 KiB), S1's FETCH_L2F shape. */
 #define PV_BLOCK 128u
 
@@ -800,6 +818,23 @@ static inline void l2fetch_rows(const void *p, uint32_t rows) {
 static inline void l2fetch_box(const void *p, uint32_t width, uint32_t rows) {
   Q6_l2fetch_AP((void *)p, ((uint64_t)width << 32) | ((uint64_t)width << 16) |
                              (rows < 0xFFFFu ? rows : 0xFFFFu));
+}
+
+/** @brief A Q8 PV walk uses one 128-byte chunk of each head row. Prefetch
+ *         that chunk at the full row stride when requested; fetching the
+ *         complete row repeats the other chunks on every pass (four passes
+ *         for Gemma's 512-dimension full-attention heads). This changes only
+ *         cache hints, not loads, arithmetic or the worker ownership. */
+static inline void l2fetch_q8_chunk(const int8_t *p, uint32_t head_dim,
+                                    uint32_t chunk, uint32_t rows) {
+#if NNTR_ATTN_Q8_NARROW_PREFETCH
+  Q6_l2fetch_AP((void *)(p + (size_t)chunk * VLEN),
+                ((uint64_t)head_dim << 32) | ((uint64_t)VLEN << 16) |
+                  (rows < 0xFFFFu ? rows : 0xFFFFu));
+#else
+  (void)chunk;
+  l2fetch_box(p, head_dim, rows);
+#endif
 }
 
 typedef struct {
@@ -1208,6 +1243,149 @@ static void p1_unit_q8(const forward_job *job, uint32_t u) {
   }
 }
 
+/** @brief Widen one fp16 vector, apply V's per-dimension scale and store.
+ *         Each lane keeps the scalar output's single f32 multiply, without
+ *         writing and rereading the intermediate unscaled output row. */
+static inline void store_scaled_q8(float *out, HVX_Vector x,
+                                   const float *scale) {
+  const HVX_VectorPair w = Q6_Wuw_vunpack_Vuh(x);
+  *(HVX_UVector *)out = Q6_Vsf_vmpy_VsfVsf(hvx_hf_bits_to_sf(Q6_V_lo_W(w)),
+                                           *(const HVX_UVector *)scale);
+  *(HVX_UVector *)(out + 32u) = Q6_Vsf_vmpy_VsfVsf(
+    hvx_hf_bits_to_sf(Q6_V_hi_W(w)), *(const HVX_UVector *)(scale + 32u));
+}
+
+#if NNTR_ATTN_Q8_GQA8_REUSE
+/** @brief Normalize one Q head's probability row once, in place. */
+static inline void p3_divide_q8(const forward_job *job, uint32_t hq) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  uint16_t *row = ctx->s + (size_t)hq * ctx->seq;
+  const HVX_Vector lv = hvx_splat_sf(job->l[hq]);
+  const HVX_Vector rv = hvx_recip_det_sf(lv);
+  const HVX_VectorPair lw = Q6_W_vcombine_VV(lv, lv);
+  const HVX_VectorPair rw = Q6_W_vcombine_VV(rv, rv);
+  for (uint32_t b = job->tlo; b < job->ntl; ++b) {
+    HVX_Vector *e = (HVX_Vector *)(row + (size_t)b * TILE);
+    *e = hvx_hf_div16(*e, lw, rw, one);
+  }
+}
+
+/** @brief Divide before dimension workers share P. Each row has one owner;
+ *         the join completes all writes before any PV worker reads it. */
+static void run_p3_q8_divide(uint32_t n, uint32_t i, void *arg) {
+  const forward_job *job = (const forward_job *)arg;
+  const uint32_t n_q = job->ctx->n_kv * job->ctx->gqa;
+  prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
+  const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
+  for (uint32_t hq = i; hq < n_q; hq += n) {
+    p3_divide_q8(job, hq);
+  }
+  if (ps) {
+    const uint32_t dt = (uint32_t)(HAP_perf_get_pcycles() - t0);
+    ps->softmax += dt;
+    ps->div += dt;
+    ps->busy += dt;
+  }
+}
+
+/** @brief One 64-dimensional chunk and all eight Q heads of a KV head.
+ *         Eight independent accumulators keep each head's original FMA
+ *         sequence in ascending position order. A 128-byte V load feeds
+ *         all eight heads; adjacent chunks share a cache line but never
+ *         write overlapping output. This halves V loads from the old four
+ *         head-pair walks, while retaining eight accumulators per worker.
+ */
+static __attribute__((noinline)) void
+pv_walk_q8_8x1(const forward_job *job, uint32_t h, uint32_t chunk) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t hd = ctx->head_dim, hq = h * 8u;
+  const uint32_t byte_chunk = chunk / 2u;
+  const int8_t *vr = v8_head(ctx, job->layer, h);
+  const uint16_t *p0 = ctx->s + (size_t)hq * ctx->seq;
+  const uint16_t *p1 = p0 + ctx->seq, *p2 = p1 + ctx->seq;
+  const uint16_t *p3 = p2 + ctx->seq, *p4 = p3 + ctx->seq;
+  const uint16_t *p5 = p4 + ctx->seq, *p6 = p5 + ctx->seq;
+  const uint16_t *p7 = p6 + ctx->seq;
+  HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  HVX_Vector a0 = Q6_V_vzero(), a1 = a0, a2 = a0, a3 = a0;
+  HVX_Vector a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+#if ATTN_M1_PV_LEAD
+  l2fetch_q8_chunk(vr + (size_t)job->lo * hd, hd, byte_chunk,
+                   job->L - job->lo < 2u * PV_BLOCK ? job->L - job->lo
+                                                    : 2u * PV_BLOCK);
+#endif
+  for (uint32_t q0 = job->lo; q0 < job->L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+    if (q0 + 2u * PV_BLOCK < job->L) {
+      const uint32_t rest = job->L - q0 - 2u * PV_BLOCK;
+      l2fetch_q8_chunk(vr + (size_t)(q0 + 2u * PV_BLOCK) * hd, hd, byte_chunk,
+                       rest < PV_BLOCK ? rest : PV_BLOCK);
+    }
+#endif
+    const uint32_t end = job->L - q0 < PV_BLOCK ? job->L : q0 + PV_BLOCK;
+#if defined(__hexagon__)
+#pragma clang loop pipeline(disable)
+#endif
+    for (uint32_t q = q0; q < end; ++q) {
+      const HVX_VectorPair w = Q6_Wh_vunpack_Vb(
+        *(const HVX_Vector *)(vr + (size_t)q * hd + (size_t)byte_chunk * VLEN));
+      HVX_Vector v =
+        Q6_Vhf_equals_Vh((chunk & 1u) != 0u ? Q6_V_hi_W(w) : Q6_V_lo_W(w));
+      a0 = hvx_hf_fma(a0, Q6_Vh_vsplat_R(p0[q]), v, one);
+      a1 = hvx_hf_fma(a1, Q6_Vh_vsplat_R(p1[q]), v, one);
+      a2 = hvx_hf_fma(a2, Q6_Vh_vsplat_R(p2[q]), v, one);
+      a3 = hvx_hf_fma(a3, Q6_Vh_vsplat_R(p3[q]), v, one);
+#if defined(__hexagon__)
+      /** Keep four FMAs' qf32 temporaries live at a time. Both operands
+         passed to the next group depend on the completed hf results. */
+      __asm__ volatile(""
+                       : "+v"(v), "+v"(one)
+                       : "v"(a0), "v"(a1), "v"(a2), "v"(a3)
+                       : "memory");
+#endif
+      a4 = hvx_hf_fma(a4, Q6_Vh_vsplat_R(p4[q]), v, one);
+      a5 = hvx_hf_fma(a5, Q6_Vh_vsplat_R(p5[q]), v, one);
+      a6 = hvx_hf_fma(a6, Q6_Vh_vsplat_R(p6[q]), v, one);
+      a7 = hvx_hf_fma(a7, Q6_Vh_vsplat_R(p7[q]), v, one);
+#if defined(__hexagon__)
+      /** Finish narrowing before the next V row and P scalars load. The
+         empty asm preserves every operand and emits no instruction. */
+      __asm__ volatile(""
+                       : "+v"(one)
+                       : "v"(a0), "v"(a1), "v"(a2), "v"(a3), "v"(a4), "v"(a5),
+                         "v"(a6), "v"(a7)
+                       : "memory");
+#endif
+    }
+  }
+  const HVX_Vector out[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+  const float *sv =
+    ctx->sv + ((size_t)job->layer * ctx->n_kv + h) * hd + chunk * CH;
+  for (uint32_t g = 0; g < 8u; ++g) {
+    store_scaled_q8(job->out + (size_t)(hq + g) * hd + chunk * CH, out[g], sv);
+  }
+}
+
+/** @brief The full-attention shape has 2 KV heads x 8 dimension chunks,
+ *         enough independent jobs for every lane of an eight-lane pool. */
+static void run_p3_q8_gqa8(uint32_t n, uint32_t i, void *arg) {
+  const forward_job *job = (const forward_job *)arg;
+  const uint32_t chunks = job->ctx->head_dim / CH;
+  const uint32_t units = job->ctx->n_kv * chunks;
+  prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
+  const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
+  for (uint32_t u = i; u < units; u += n) {
+    pv_walk_q8_8x1(job, u / chunks, u % chunks);
+  }
+  if (ps) {
+    const uint32_t dt = (uint32_t)(HAP_perf_get_pcycles() - t0);
+    ps->pv += dt;
+    ps->busy += dt;
+  }
+}
+#endif
+
 /** @brief [#282 E] Two q heads' PV over a 256-wide int8 V row in one walk:
  *         the row's two vectors unpacked to four hf chunks, eight chains.
  *         noinline and no pipelining, as the fp16 pv_walk_* shapes. */
@@ -1258,10 +1436,7 @@ pv_walk_q8_2x2(const forward_job *job, const int8_t *vr,
   for (uint32_t g = 0; g < 2u; ++g) {
     float *dst = job->out + (size_t)(hq0 + g) * hd;
     for (uint32_t c = 0; c < 4u; ++c) {
-      hvx_hf_store_sf(dst + (size_t)c * CH, o[g][c]);
-    }
-    for (uint32_t d = 0; d < hd; ++d) {
-      dst[d] *= sv[d];
+      store_scaled_q8(dst + (size_t)c * CH, o[g][c], sv + (size_t)c * CH);
     }
   }
 }
@@ -1311,8 +1486,8 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
   }
   for (uint32_t c = 0; c < nv; ++c) { /* dims [128 c, 128 c + 128) */
 #if ATTN_M1_PV_LEAD
-    l2fetch_box(vr + (size_t)lo * hd, hd,
-                L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
+    l2fetch_q8_chunk(vr + (size_t)lo * hd, hd, c,
+                     L - lo < 2u * PV_BLOCK ? L - lo : 2u * PV_BLOCK);
 #endif
     HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
     HVX_Vector r0 = o0, r1 = o0, r2 = o0, r3 = o0;
@@ -1320,8 +1495,8 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
 #if ATTN_M1_PV_LEAD
       if (q0 + 2u * PV_BLOCK < L) {
         const uint32_t rest = L - q0 - 2u * PV_BLOCK;
-        l2fetch_box(vr + (size_t)(q0 + 2u * PV_BLOCK) * hd, hd,
-                    rest < PV_BLOCK ? rest : PV_BLOCK);
+        l2fetch_q8_chunk(vr + (size_t)(q0 + 2u * PV_BLOCK) * hd, hd, c,
+                         rest < PV_BLOCK ? rest : PV_BLOCK);
       }
 #endif
       const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
@@ -1357,11 +1532,8 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     const HVX_Vector r[PV_GROUP] = {r0, r1, r2, r3};
     for (uint32_t g = 0; g < ng; ++g) {
       float *dst = job->out + (size_t)(hq0 + g) * hd + (size_t)c * VLEN;
-      hvx_hf_store_sf(dst, o[g]);
-      hvx_hf_store_sf(dst + CH, r[g]);
-      for (uint32_t d = 0; d < VLEN; ++d) {
-        dst[d] *= sv[(size_t)c * VLEN + d];
-      }
+      store_scaled_q8(dst, o[g], sv + (size_t)c * VLEN);
+      store_scaled_q8(dst + CH, r[g], sv + (size_t)c * VLEN + CH);
     }
   }
   if (ps) {
@@ -1801,10 +1973,9 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
       q8_set_scales(ctx, layer, 1u, k, v, 4.0f);
     }
     for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-      (ctx->fast ? append_head_fast : append_head_q8)(
+      (hd % VLEN == 0u ? append_head_q8_vector : append_head_q8)(
         ctx, layer, h, pos, k + (size_t)h * hd, v + (size_t)h * hd);
     }
-    float tmp[CH] __attribute__((aligned(128)));
     for (uint32_t hq = 0; ctx->fast && hq < n_q; ++hq) { /* [#4416 F] */
       /* q x sk as vectors; the amax is the int max of the sign-cleared
          bits (run_amax); rne (hvx_sf_to_w_rne, |x| <= FAST_QMAX) and a
@@ -1841,10 +2012,12 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
          i += CH) { /* q x K's scale */
       const float *s =
         ctx->sk + ((size_t)layer * ctx->n_kv + i / hd / ctx->gqa) * hd + i % hd;
-      for (uint32_t j = 0; j < CH; ++j) {
-        tmp[j] = q[i + j] * s[j];
-      }
-      qs[i / CH] = hvx_hf_round_row_lut(tmp);
+      const HVX_Vector q0 = Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(q + i),
+                                               *(const HVX_UVector *)s);
+      const HVX_Vector q1 = Q6_Vsf_vmpy_VsfVsf(
+        *(const HVX_UVector *)(q + i + 32u), *(const HVX_UVector *)(s + 32u));
+      qs[i / CH] =
+        Q6_Vh_vshuffe_VhVh(hvx_hf_bits_rne_w(q1), hvx_hf_bits_rne_w(q0));
     }
   } else {
     for (uint32_t i = 0; i < ctx->n_kv * hd; i += CH) { /* kv head i / hd */
@@ -1958,7 +2131,16 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     sum_pc = (uint32_t)(HAP_perf_get_pcycles() - ts);
   }
 
-  hvx_worker_pool_run(ctx->pool, run_p3, &job, n_q);
+#if NNTR_ATTN_Q8_GQA8_REUSE
+  if (ctx->q8 && !ctx->fast && ctx->gqa == 8u && ctx->n_kv == 2u &&
+      hd == 512u) {
+    hvx_worker_pool_run(ctx->pool, run_p3_q8_divide, &job, n_q);
+    hvx_worker_pool_run(ctx->pool, run_p3_q8_gqa8, &job, ctx->n_kv * (hd / CH));
+  } else
+#endif
+  {
+    hvx_worker_pool_run(ctx->pool, run_p3, &job, n_q);
+  }
 
   if (stats) {
     for (uint32_t hq = 0; hq < n_q; ++hq) {

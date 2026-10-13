@@ -15,8 +15,9 @@
  * The specification, its operation order and its domain live in
  * m1_ops_det.h; this file implements it in plain Vsf (no qf32, no sf FMA --
  * HVX has none), except the RMSNorm row scale: scalar-core sffma and the
- * spec's integer sqrt / reciprocal (#164). All four run on the calling
- * thread: no worker pool, no VTCM, no DMA, no heap. Every load and store
+ * spec's integer sqrt / reciprocal (#164). Independent wide query heads
+ * can use the worker pool; the other norm forms run on the calling thread.
+ * The small ops use no VTCM, DMA or heap. Every load and store
  * goes through HVX_UVector, because the FastRPC buffers the test entries
  * hand in, and the per-token entry's activation slots, carry no 128-byte
  * alignment.
@@ -56,6 +57,32 @@
  */
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
                      uint32_t chunk, float eps, float *row_scale_out);
+
+/**
+ * @brief Apply a previously computed row scale, y = (x * scale) * gamma,
+ *        with the same two IEEE roundings as hvx_rmsnorm_f32. gamma may be
+ *        NULL and x may alias y. n must be a multiple of 32. The caller
+ *        must ensure that x and the normalization epsilon are unchanged
+ *        since the scale was computed; gamma may differ.
+ */
+void hvx_rmsnorm_apply_f32(const float *x, const float *gamma, float *y,
+                           uint32_t n, float scale);
+
+/**
+ * @brief RMSNorm of q | k | v, using the worker pool for eight or more
+ *        query-head / KV-pair jobs of at least 256 floats. Each head keeps
+ *        hvx_rmsnorm_f32's exact reduction order. x and y may alias.
+ * @param gamma q gamma then k gamma, each head_dim floats
+ * @param n_q, n_kv number of query and KV heads
+ * @param norm_v normalize V without gamma; otherwise copy V unchanged
+ * @param k_eq_v V reads raw K; each job reads V before writing normed K,
+ *               including when x == y
+ * @param pool NULL for serial execution
+ */
+void hvx_qkv_rmsnorm_f32(const float *x, const float *gamma, float *y,
+                         uint32_t n_q, uint32_t n_kv, uint32_t head_dim,
+                         float eps, int norm_v, int k_eq_v,
+                         hvx_worker_pool *pool);
 
 /**
  * @brief [plan 201 S4] N1, opt-in: hvx_rmsnorm_f32's shape and output form,

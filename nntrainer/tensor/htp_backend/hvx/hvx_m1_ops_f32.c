@@ -112,41 +112,104 @@ static inline float hvx_rmsnorm_n1_scale(const float *x, uint32_t chunk,
   return m1_n1_norm_scale_det((A << 22) + (B << 12) + C, k, chunk, eps);
 }
 
+static inline void rmsnorm_apply(const float *x, const float *gamma, float *y,
+                                 uint32_t n, float scale) {
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  const HVX_UVector *vg = (const HVX_UVector *)gamma;
+  HVX_UVector *vy = (HVX_UVector *)y;
+  const HVX_Vector r = hvx_splat_sf(scale);
+  const uint32_t nvec = n / LANES;
+  if (gamma) {
+    for (uint32_t i = 0; i < nvec; ++i) {
+      vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
+    }
+  } else {
+    for (uint32_t i = 0; i < nvec; ++i) {
+      vy[i] = Q6_Vsf_vmpy_VsfVsf(vx[i], r);
+    }
+  }
+}
+
+void hvx_rmsnorm_apply_f32(const float *x, const float *gamma, float *y,
+                           uint32_t n, float scale) {
+  if (!x || !y || n % LANES != 0u) {
+    return;
+  }
+  rmsnorm_apply(x, gamma, y, n, scale);
+}
+
 static void rmsnorm_rows(const float *x, const float *gamma, float *y,
                          uint32_t n, uint32_t chunk, float eps,
                          float *row_scale_out, int n1) {
   if (!x || !y || chunk == 0u || chunk % LANES != 0u || n % chunk != 0u) {
     return;
   }
-  const uint32_t nvec = chunk / LANES;
-
   for (uint32_t c = 0; c < n / chunk; ++c) {
-    const HVX_UVector *vx = (const HVX_UVector *)(x + (size_t)c * chunk);
-    const HVX_UVector *vg = (const HVX_UVector *)gamma;
-    HVX_UVector *vy = (HVX_UVector *)(y + (size_t)c * chunk);
-
     const float rs = n1
                        ? hvx_rmsnorm_n1_scale(x + (size_t)c * chunk, chunk, eps)
                        : hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
     if (row_scale_out) {
       row_scale_out[c] = rs;
     }
-    const HVX_Vector r = hvx_splat_sf(rs);
-    if (gamma) {
-      for (uint32_t i = 0; i < nvec; ++i) {
-        vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
-      }
-    } else {
-      for (uint32_t i = 0; i < nvec; ++i) {
-        vy[i] = Q6_Vsf_vmpy_VsfVsf(vx[i], r);
-      }
-    }
+    rmsnorm_apply(x + (size_t)c * chunk, gamma, y + (size_t)c * chunk, chunk,
+                  rs);
   }
 }
 
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
                      uint32_t chunk, float eps, float *row_scale_out) {
   rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 0);
+}
+
+typedef struct {
+  const float *x, *gamma;
+  float *y;
+  uint32_t n_q, n_kv, head_dim;
+  float eps;
+  int norm_v, k_eq_v;
+} qkv_rmsnorm_ctx;
+
+/** @brief One query head or one KV pair per job. A pair reads V before
+ *  normalizing K, so K==V is safe even in place. Round-robin assignment
+ *  balances Gemma's 16 query heads and 8 KV pairs across eight lanes. */
+static void qkv_rmsnorm_lane(uint32_t n_threads, uint32_t i, void *v) {
+  const qkv_rmsnorm_ctx *c = (const qkv_rmsnorm_ctx *)v;
+  const uint32_t hd = c->head_dim;
+  for (uint32_t h = i; h < c->n_q + c->n_kv; h += n_threads) {
+    const size_t offset = (size_t)h * hd;
+    if (h < c->n_q) {
+      rmsnorm_rows(c->x + offset, c->gamma, c->y + offset, hd, hd, c->eps, NULL,
+                   0);
+      continue;
+    }
+    const float *v_in = c->x + offset + (c->k_eq_v ? 0u : (size_t)c->n_kv * hd);
+    float *v_out = c->y + offset + (size_t)c->n_kv * hd;
+    if (c->norm_v) {
+      rmsnorm_rows(v_in, NULL, v_out, hd, hd, c->eps, NULL, 0);
+    } else if (v_in != v_out) {
+      memcpy(v_out, v_in, (size_t)hd * sizeof(float));
+    }
+    rmsnorm_rows(c->x + offset, c->gamma + hd, c->y + offset, hd, hd, c->eps,
+                 NULL, 0);
+  }
+}
+
+void hvx_qkv_rmsnorm_f32(const float *x, const float *gamma, float *y,
+                         uint32_t n_q, uint32_t n_kv, uint32_t head_dim,
+                         float eps, int norm_v, int k_eq_v,
+                         hvx_worker_pool *pool) {
+  if (!x || !gamma || !y || head_dim == 0u || head_dim % LANES != 0u) {
+    return;
+  }
+  qkv_rmsnorm_ctx c = {x, gamma, y, n_q, n_kv, head_dim, eps, norm_v, k_eq_v};
+  const uint32_t units = n_q + n_kv;
+  /** A few narrow heads do not amortize the pool's fork/join. Gemma's
+     sixteen query heads have 256 or 512 elements each. */
+  if (pool == NULL || units < 8u || head_dim < 256u) {
+    qkv_rmsnorm_lane(1u, 0u, &c);
+    return;
+  }
+  hvx_worker_pool_run(pool, qkv_rmsnorm_lane, &c, units);
 }
 
 void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,

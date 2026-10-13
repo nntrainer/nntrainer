@@ -104,6 +104,18 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
   else
     hvx_scalar_gemv(act_ah, m, k_tiles, wh, n_col, nt, out);
 }
+void hvx_gemv_u8i4_wh_col_aligned_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                       const uint8_t *wh, uint32_t n_col,
+                                       uint32_t nt, int32_t *out) {
+  hvx_gemm_u8i4_wh_col_nopf(act_ah, 1u, k_tiles, wh, n_col, nt, 1u, out);
+}
+void hvx_gemv_u8i4_wh_3col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out) {
+  for (uint32_t j = 0; j < 3u; ++j)
+    hvx_gemm_u8i4_wh_col_nopf(act_ah, 1u, k_tiles, wh, n_col,
+                              nt + j * (plane_bytes / 512u), 1u, out + 32u * j);
+}
 void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                           const uint8_t *wh, uint32_t n_col, uint32_t nt,
                           uint32_t rows1, int32_t *out) {
@@ -292,6 +304,13 @@ void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *map, uint32_t m0,
             (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
       }
 }
+void hvx_quant_pack_u8_ah_m1_repeat(const float *x, uint32_t k, float scale,
+                                    int32_t zp, uint8_t *out) {
+  const uint32_t map[4] = {0u, 0u, 0u, 0u};
+  const float scales[4] = {scale, scale, scale, scale};
+  const int32_t zps[4] = {zp, zp, zp, zp};
+  hvx_quant_pack_u8_ah_rows(x, map, 0u, 4u, k, scales, zps, out);
+}
 int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *map, uint32_t m,
                                 uint32_t mp, uint32_t k, const float *scale,
                                 const int32_t *zp, uint8_t *out,
@@ -383,6 +402,16 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
   for (uint32_t r = 0; r < m; ++r)
     buf(out + (size_t)r * ostride, sizeof(float) * 32u, 1);
   dq_tile(tile, stride, m, as, az, cs, ws, bias, out, ostride, accumulate);
+}
+void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *cs,
+                                   const float *ws, const float *bias,
+                                   float *out) {
+  for (uint32_t j = 0; j < 3u; ++j) {
+    buf(out + j * 32u, sizeof(float) * 32u, 1);
+    dq_tile(tiles + j * 32u, 32u, 1u, &act_scale, &act_zp, cs + j * 32u,
+            ws + j * 32u, bias + j * 32u, out + j * 32u, 96u, 0);
+  }
 }
 void hvx_dequant_acc_tiles_scatter_rows_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,

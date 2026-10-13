@@ -49,7 +49,7 @@ cc=${CC:-gcc}
 # never waited for, and the part's column offset dropped from the dequant's
 # column sums.
 for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/' \
-  's/        w->colsum_w + c0, w->w_scale + c0,/        w->colsum_w, w->w_scale + c0,/'; do
+  's/w->colsum_w + c0,/w->colsum_w,/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" > "$OUT/moe_fc_mutant.c"
   if cmp -s "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c"; then
     echo "FC WH MUTATION DID NOT APPLY: $mut"; exit 1
@@ -259,14 +259,14 @@ fi
 # Since #132 Part B also the Q4M1 kinds (FC, DENSE_FFN, LM_HEAD) on the
 # REAL hvx_q4_gemv_f32.c against the CPU-order specs, then four mutants
 # of hexkl_graph.c's Q4M1 kernels, each of which must fail the check.
-graph_check() { # graph_check <hexkl_graph.c> <exe>
+graph_check() { # graph_check <hexkl_graph.c> <exe> [hvx_m1_ops_f32.c]
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -Wno-format-truncation -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" \
     "$HERE/graph_host_check.c" "$1" \
-    "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
+    "${3:-$BACKEND/hvx/hvx_m1_ops_f32.c}" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
     "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
     "$BACKEND/hvx/hvx_scale_add_f32.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
 }
@@ -299,13 +299,25 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   fi
   echo "GRAPH Q4M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
-# [plan 201 S4] Gemma 4's kernels in hexkl_graph.c, each mutant must fail
-# the check's Gemma half: the v norm with k's gamma, attention_k_eq_v
-# ignored (v read from the row's v part), the dense FFN's GeGLU flag
-# ignored (SwiGLU), the soft-cap skipped, layer_scalar dropped.
-for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);/    hvx_rmsnorm_f32(v, gamma + hd, out + n_q + n_k, n_k, hd, eps, NULL);/' \
-  's/    (op->feed \& HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;/    0 ? in + n_q : in + n_q + n_k;/' \
-  's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GELU_TANH) != 0u) {/  if (0) {/' \
+# [plan 201 S4] QK_NORM now delegates to hvx_qkv_rmsnorm_f32. Mutate
+# that helper and keep the real graph call: v norm with k's gamma, then
+# attention_k_eq_v ignored (v read from the row's v part). Each must fail
+# the graph check's Gemma half.
+for mut in 's/rmsnorm_rows(v_in, NULL, v_out,/rmsnorm_rows(v_in, c->gamma + hd, v_out,/' \
+  's/c->k_eq_v ? 0u/0 ? 0u/'; do
+  sed "$mut" "$BACKEND/hvx/hvx_m1_ops_f32.c" > "$OUT/hvx_m1_ops_mutant.c"
+  if cmp -s "$OUT/hvx_m1_ops_mutant.c" "$BACKEND/hvx/hvx_m1_ops_f32.c"; then
+    echo "GRAPH QKV MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_mutant" "$OUT/hvx_m1_ops_mutant.c"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH QKV MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH QKV MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
+# Gemma 4's remaining graph mutants: the dense FFN's GeGLU flag ignored
+# (SwiGLU), the soft-cap skipped, layer_scalar dropped.
+for mut in 's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GELU_TANH) != 0u) {/  if (0) {/' \
   's/  if (rc == AEE_SUCCESS \&\& op->eps_bits != 0u) {/  if (0) {/' \
   's/    hvx_mul_scalar_f32(out, graph_eps(op), op->N);/    (void)0;/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
@@ -447,6 +459,19 @@ if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
   echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
 fi
 echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
+
+# Decode FC: repeat one quantized row instead of quantizing it four times,
+# and dequantize three column tiles together. Both real HVX sources must
+# match the old entry points and independent float-operation references,
+# including AH padding, output canaries, ties and unaligned vectors.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -Wno-format-truncation -pthread -include malloc.h \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/fc_m1_epilogue_host_check" "$HERE/fc_m1_epilogue_host_check.c" \
+  "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_quant_u8.c" \
+  "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
+"$OUT/fc_m1_epilogue_host_check"
 
 # The prefill-shape RMSNorm rows (doc 57 section 5 step 4): the real HVX
 # source on the lane emulation against a double reference, at the hidden

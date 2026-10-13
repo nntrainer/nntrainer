@@ -120,7 +120,67 @@ static uint32_t run_i2_case(int f, const uint8_t *act, const uint8_t *wh2,
   return bad;
 }
 
+/** The FC-only aligned entries, including Gemma's K=2816/8192 and the
+   one/two-column tails around a group of three output tiles. */
+static uint32_t check_fc_aligned(void) {
+  static const uint32_t kts[] = {1u, 22u, 88u, 256u};
+  static const uint32_t nts[] = {0u, 1u, 4u};
+  const uint32_t n_col = 7u;
+  const size_t act_bytes = 256u * 2048u;
+  const size_t wh_bytes = 256u * n_col * 512u;
+  uint8_t *act = malloc(act_bytes);
+  uint8_t *storage = malloc(wh_bytes + 127u);
+  if (!act || !storage) {
+    free(act);
+    free(storage);
+    return 1u;
+  }
+  uint8_t *wh = (uint8_t *)(((uintptr_t)storage + 127u) & ~(uintptr_t)127u);
+  uint32_t bad = 0u, cases = 0u;
+  for (uint32_t data = 0; data < 2u; ++data) {
+    for (size_t i = 0; i < act_bytes; ++i)
+      act[i] = data ? 255u : rnd8();
+    for (size_t i = 0; i < wh_bytes; ++i)
+      wh[i] = data ? 0x88u : rnd8();
+    for (uint32_t a = 0; a < sizeof kts / sizeof kts[0]; ++a)
+      for (uint32_t t = 0; t < sizeof nts / sizeof nts[0]; ++t)
+        for (uint32_t cols = 1u; cols <= 3u; cols += 2u) {
+          int32_t out[5u * 32u] __attribute__((aligned(128)));
+          for (uint32_t i = 0; i < 5u * 32u; ++i)
+            out[i] = GUARD;
+          if (cols == 1u)
+            hvx_gemv_u8i4_wh_col_aligned_nopf(act, kts[a], wh, n_col, nts[t],
+                                              out + 32u);
+          else
+            hvx_gemv_u8i4_wh_3col_nopf(act, kts[a], wh, 512u, n_col, nts[t],
+                                       out + 32u);
+          for (uint32_t j = 0; j < cols; ++j)
+            for (uint32_t c = 0; c < 32u; ++c) {
+              int32_t sum = 0;
+              for (uint32_t kt = 0; kt < kts[a]; ++kt)
+                for (uint32_t k = 0; k < 32u; ++k)
+                  sum += (int32_t)act[(size_t)kt * 2048u + k] *
+                         wh_value(wh + ((size_t)kt * n_col + nts[t] + j) * 512u,
+                                  k, c);
+              bad += out[(j + 1u) * 32u + c] != sum;
+            }
+          for (uint32_t i = 0; i < 32u; ++i)
+            bad += out[i] != GUARD;
+          for (uint32_t i = (cols + 1u) * 32u; i < 5u * 32u; ++i)
+            bad += out[i] != GUARD;
+          ++cases;
+        }
+  }
+  printf("HVX FC ALIGNED cases=%u bad=%u\n", cases, bad);
+  free(act);
+  free(storage);
+  return bad;
+}
+
 int main(void) {
+  const uint32_t fc_bad = check_fc_aligned();
+  if (getenv("HVX_GEMV_FC_ONLY"))
+    return fc_bad ? 1 : 0;
   static const uint32_t kts[] = {1u, 56u, 64u};
   static const uint32_t ncs[] = {64u, 112u};
   const size_t act_bytes = 64u * 2048u, wh_max = 64u * 112u * 512u;
@@ -131,7 +191,7 @@ int main(void) {
   uint8_t table[HVX_EXPAND_TABLE_BYTES] __attribute__((aligned(128)));
   if (!act || !wh || !wh2 || !wh4)
     return 2;
-  uint32_t bad = 0, cases = 0;
+  uint32_t bad = fc_bad, cases = 0;
   /* data 0: random bytes; data 1: the extremes, activation 255 against
      nibble -8 everywhere -- the largest |sum| the header's bound allows. */
   for (int data = 0; data < 2; ++data) {

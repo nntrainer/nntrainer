@@ -82,6 +82,18 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
                                  int accumulate);
 
 /**
+ * @brief Dequantizes three adjacent 32-column FC tiles of one token.
+ *
+ * Each input and output contains 96 elements. The float operation order
+ * matches three non-accumulating hvx_dequant_acc_tile_to_f32 calls, with
+ * shared activation parameters and independent column dependency chains.
+ */
+void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *colsum_w,
+                                   const float *w_scale, const float *bias,
+                                   float *out);
+
+/**
  * @brief Rows [m0, m1) of a run of @a n_tiles adjacent staged tiles,
  *        dequantized (hvx_dequant_acc_tile_to_f32's operations) into
  *        registers and added into out row @a rows[m] times @a weights[m]
