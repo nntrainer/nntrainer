@@ -18,6 +18,7 @@
 #include <HAP_perf.h>
 #include <remote.h>
 
+#include "../htp_tl2_opts.h"
 #include "hexkl_conv_block.h"
 #include "hexkl_dma_ring.h"
 #include "hexkl_dma_trace.h"
@@ -2177,4 +2178,27 @@ int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
   stage_us[GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
   stage_us[GU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
+}
+
+int nntr_hvx_weights_tl2(remote_handle64 handle, const uint32 *handles,
+                         int handlesLen, uint32 native) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || handlesLen < 0 || (handlesLen && !handles) || native > 1u)
+    return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i) {
+    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS)
+      return AEE_EBADPARM;
+    const hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    if (!w->in_use || !w->borrowed || w->bits != 2u ||
+        htp_tl2_native_bytes(w->K, w->N) > (uint64_t)w->K * w->N / 4u)
+      return AEE_EBADPARM;
+    for (unsigned j = 0; j < 4u; ++j)
+      if (w->pal[j] != -7 && w->pal[j] != 0 && w->pal[j] != 7)
+        return AEE_EBADPARM;
+  }
+  for (int i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    w->tl2_bytes = native ? w->wh_bytes : NULL;
+  }
+  return AEE_SUCCESS;
 }

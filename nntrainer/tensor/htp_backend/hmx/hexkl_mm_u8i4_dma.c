@@ -203,6 +203,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   const size_t n4 = sizeof(float) * N; /* N is a multiple of 32: n4 of 128 */
   uintptr_t a;
   h->wh_bytes = borrow ? (uint8_t *)wh_src : (uint8_t *)malloc(wh_bytes);
+  h->tl2_bytes = NULL;
   h->arrays = malloc(3u * n4 + 128u);
   if (!h->wh_bytes || !h->arrays) {
     if (!borrow) {
@@ -361,6 +362,7 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
   w->wh_bytes = (uint8_t *)wh;
   /* The width moves with the bytes: a pool slot holds whatever expert the
      host read into it last. */
+  w->tl2_bytes = NULL;
   w->bits = pal ? 2u : 4u;
   if (pal) {
     memcpy(w->pal, pal, sizeof(w->pal));

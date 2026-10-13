@@ -59,6 +59,7 @@ typedef struct {
       @a pal -- which the M=1 GEMV looks up in a register
       (hvx_gemm_u8i2_wh_*) and the HMX path expands to int4 in VTCM
       (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
+  const uint8_t *tl2_bytes; /**< Native TL2; NULL for ordinary WH. */
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;

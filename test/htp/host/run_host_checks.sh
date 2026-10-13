@@ -24,6 +24,26 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+"$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
+  "$HERE/tl2_lut_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  -o "$OUT/tl2_lut_check"
+"$OUT/tl2_lut_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  "$HERE/tl2_native_packing_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  -o "$OUT/tl2_native_packing_check"
+"$OUT/tl2_native_packing_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
+  "$HERE/../../../tools/prepare_tl2.cpp" -o "$OUT/prepare_tl2"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/hvx" \
+  "$HERE/tl2_prepared_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  -o "$OUT/tl2_prepared_check"
+"$OUT/tl2_prepared_check" --fixture "$OUT/tl2-source.bin"
+echo '0 256 256' > "$OUT/tl2-weights.tsv"
+"$OUT/prepare_tl2" "$OUT/tl2-source.bin" "$OUT/tl2-weights.tsv" "$OUT/tl2-prepared.bin"
+"$OUT/tl2_prepared_check" "$OUT/tl2-source.bin" "$OUT/tl2-prepared.bin"
+
 # -O2: the M=1 cases run the HMX stand-in at the real shape (64 rows a
 # tile, scalar); about half a minute at -O2 and several at -O1, since the
 # HMX reference is computed once per (shape, M) and reused. One build since
@@ -41,9 +61,16 @@ cc=${CC:-gcc}
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-  "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/moe_layer_host_check"
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_moe_host_check" \
+  "$HERE/tl2_moe_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+"$OUT/tl2_moe_host_check"
 # [#225] Two mutants of the decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run),
 # each of which must fail FC WH BIT-IDENTICAL: a lane computing a block it
 # never waited for, and the part's column offset dropped from the dequant's
@@ -61,7 +88,7 @@ for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/'
     -o "$OUT/moe_fc_mutant" \
     "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
     "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-    "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
+    "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
   if MOE_CHECK_FC_WH_ONLY=1 "$OUT/moe_fc_mutant" > "$OUT/moe_fc_mutant.log"; then
     echo "FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
   fi
@@ -80,7 +107,7 @@ done
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
   "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
-  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
+  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/conv_block_host_check"
 

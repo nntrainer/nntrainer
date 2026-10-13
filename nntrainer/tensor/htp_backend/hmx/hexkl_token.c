@@ -22,6 +22,7 @@
 #endif
 
 #include "hexkl_token.h"
+#include "../htp_tl2_opts.h"
 
 #include <string.h>
 
@@ -243,10 +244,29 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
     uint32_t hg = HTP_GRAPH_NO_HANDLE, hd = HTP_GRAPH_NO_HANDLE;
     rc = m->env->rebind == NULL
            ? AEE_EBADSTATE
-           : m->env->rebind(m->env->rebind_ctx, l->old_gu, l->old_dn, o->K,
-                            o->N, o->N_out, l->arena, l->off_gu, l->off_dn,
-                            l->bits == 2u ? l->pal_gu : NULL,
-                            l->bits == 2u ? l->pal_dn : NULL, &hg, &hd);
+           : m->env->rebind(
+               m->env->rebind_ctx, l->old_gu, l->old_dn, o->K, o->N, o->N_out,
+               l->arena, l->off_gu, l->off_dn,
+               (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_gu
+                                                                 : NULL,
+               (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_dn
+                                                                 : NULL,
+               &hg, &hd);
+    if (rc == AEE_SUCCESS && l->bits == HTP_TL2_WEIGHT_BITS) {
+      hexkl_weight_u8i4 *wg = &m->env->tbl->slots[hg];
+      hexkl_weight_u8i4 *wd = &m->env->tbl->slots[hd];
+      if (htp_tl2_native_bytes(wg->K, wg->N) > (uint64_t)wg->K * wg->N / 4u ||
+          htp_tl2_native_bytes(wd->K, wd->N) > (uint64_t)wd->K * wd->N / 4u)
+        rc = AEE_EBADPARM;
+      for (unsigned j = 0; j < 4u; ++j)
+        if ((wg->pal[j] != -7 && wg->pal[j] != 0 && wg->pal[j] != 7) ||
+            (wd->pal[j] != -7 && wd->pal[j] != 0 && wd->pal[j] != 7))
+          rc = AEE_EBADPARM;
+      if (rc == AEE_SUCCESS) {
+        wg->tl2_bytes = wg->wh_bytes;
+        wd->tl2_bytes = wd->wh_bytes;
+      }
+    }
     if (rc == AEE_SUCCESS) {
       rc = hexkl_graph_pool_set(g, op, l->e, hg, hd);
     }
