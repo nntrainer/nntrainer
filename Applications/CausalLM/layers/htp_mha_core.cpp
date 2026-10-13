@@ -775,8 +775,8 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       return v != nullptr && std::strcmp(v, "1") == 0;
     }();
     std::vector<float> k_only;
-    if (seed_q && !q_cache_handles.empty() && q_cache_handles[0] >= 0 &&
-        q_cache_synced[0] == pos && q2_scales_set[0])
+    if (seed_q && cache_base == 0 && !q_cache_handles.empty() &&
+        q_cache_handles[0] >= 0 && q_cache_synced[0] == pos && q2_scales_set[0])
       k_only.resize(static_cast<size_t>(pos) * wk);
     if (!k_only.empty())
       rows_f32_of(ck, k_only.data(), k_only.size(), wk);
@@ -793,14 +793,20 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       return true;
     }
     const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
-    const size_t n = static_cast<size_t>(pos) * wk;
+    // the cache's rows [0, pos - cache_base): a windowed cache seeds its
+    // window, the DSP's attention subtracts the same base
+    NNTR_THROW_IF(pos < cache_base, std::runtime_error)
+      << "mha_core: decode at " << pos << " before the KV cache base "
+      << cache_base;
+    const unsigned int seed_rows = pos - cache_base;
+    const size_t n = static_cast<size_t>(seed_rows) * wk;
     auto t_conv = t_seed;
     // [#4416 D6] an fp16 / UINT16 cache goes as its bits: the DSP widens
     // them exactly (hvx_hf_bits_to_sf), nothing converted or copied here
     const bool bits16 =
       ck.getDataType() != ml::train::TensorDim::DataType::FP32 &&
       cv.getDataType() != ml::train::TensorDim::DataType::FP32;
-    if (!bits16 || !htpDecodeKvSeedF16(pos, ck.getData<uint16_t>(),
+    if (!bits16 || !htpDecodeKvSeedF16(seed_rows, ck.getData<uint16_t>(),
                                        cv.getData<uint16_t>())) {
       std::vector<float> k_rows(n), v_rows(n);
       auto rows_f32 = [&](const nntrainer::Tensor &c, float *dst) {
@@ -809,7 +815,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       rows_f32(ck, k_rows.data());
       rows_f32(cv, v_rows.data());
       t_conv = std::chrono::steady_clock::now();
-      htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
+      htpDecodeKvSeed(seed_rows, k_rows.data(), v_rows.data());
     }
     drop_cpu_cache();
     {
@@ -1218,7 +1224,7 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
     all.insert(all.end(), v->begin(), v->end());
 }
 
-bool MHACoreLayer::take_q2_calibration() {
+bool HtpMHACoreLayer::take_q2_calibration() {
   const auto it = q2_store_.find(q2_name_);
   const size_t nk = num_heads_KV, nv = nk * head_dim, nq = 2 * num_heads_Q;
   if (!q2_from_file_ || it == q2_store_.end() ||
@@ -1232,7 +1238,7 @@ bool MHACoreLayer::take_q2_calibration() {
   return q2_calibrated = true;
 }
 
-void MHACoreLayer::saveQ2Calibration(std::ostream &file) {
+void HtpMHACoreLayer::saveQ2Calibration(std::ostream &file) {
   auto put = [&](uint32_t v) {
     file.write(reinterpret_cast<const char *>(&v), sizeof(v));
   };
@@ -1246,7 +1252,7 @@ void MHACoreLayer::saveQ2Calibration(std::ostream &file) {
   }
 }
 
-void MHACoreLayer::loadQ2Calibration(std::istream &file) {
+void HtpMHACoreLayer::loadQ2Calibration(std::istream &file) {
   auto get = [&]() {
     uint32_t v = 0;
     file.read(reinterpret_cast<char *>(&v), sizeof(v));
@@ -1287,11 +1293,11 @@ bool HtpMHACoreLayer::try_quantized_attention(
   const bool release_prefill = nntrainer::weightPageCachePolicy() >= 0 &&
                                cache_to - cache_from > 1 &&
                                !(seed_q && std::strcmp(seed_q, "1") == 0);
-  auto release = [release_prefill](MHACoreLayer *layer) {
+  auto release = [release_prefill](HtpMHACoreLayer *layer) {
     if (release_prefill)
       layer->release_quantized_cache();
   };
-  std::unique_ptr<MHACoreLayer, decltype(release)> cache_lifetime(this,
+  std::unique_ptr<HtpMHACoreLayer, decltype(release)> cache_lifetime(this,
                                                                   release);
   using clk = std::chrono::steady_clock;
   const auto ts0 = clk::now();
@@ -1635,15 +1641,26 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
+  // The step's first row in the cache (setCacheBase): cache_index itself
+  // unless the cache holds a window of the context.
+  NNTR_THROW_IF(cache_index < cache_base ||
+                  cache_index - cache_base + (to - from) >
+                    cache_key_dim.height(),
+                std::runtime_error)
+    << "mha_core: rows [" << cache_index << ", " << cache_index + (to - from)
+    << ") do not fit a KV cache of " << cache_key_dim.height()
+    << " rows based at " << cache_base;
+  const unsigned int cache_row = cache_index - cache_base;
+
   // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
+    batch * cache_key_dim.getFeatureLen() + cache_row * cache_key_dim.width(),
     true);
   nntrainer::Tensor b_cache_value_step =
     cache_value.getSharedDataTensor(cache_value_step_dim,
                                     batch * cache_value_dim.getFeatureLen() +
-                                      cache_index * cache_value_dim.width(),
+                                      cache_row * cache_value_dim.width(),
                                     true);
 
   // NNTR_HTP_ATTN_TRACE: the host's own share of this node beside the
@@ -1707,7 +1724,7 @@ void HtpMHACoreLayer::one_batch_incremental_forwarding(
   }
 
   /// @todo replace step_size into input height
-  unsigned int cache_from = cache_index;
+  unsigned int cache_from = cache_row;
   unsigned int cache_to = cache_from + step_size;
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
@@ -2555,6 +2572,8 @@ void HtpMHACoreLayer::setProperty(const std::vector<std::string> &values) {
     if (nntrainer::getKeyValue(value, key, parsed_value) == ML_ERROR_NONE &&
         key == "cache_index") {
       setCacheIndex(static_cast<unsigned int>(std::stoul(parsed_value)));
+    } else if (key == "cache_base") {
+      setCacheBase(static_cast<unsigned int>(std::stoul(parsed_value)));
     } else {
       props.push_back(value);
     }

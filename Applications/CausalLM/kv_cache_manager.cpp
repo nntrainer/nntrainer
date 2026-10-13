@@ -53,6 +53,8 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     kv_widths_ = std::move(other.kv_widths_);
     layer_kv_sources_ = std::move(other.layer_kv_sources_);
     layer_caps_ = std::move(other.layer_caps_);
+    keep_ = std::move(other.keep_);
+    bases_ = std::move(other.bases_);
     dtype_ = other.dtype_;
     format_ = other.format_;
     shared_alloc_ = std::move(other.shared_alloc_);
@@ -125,11 +127,34 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
                               const std::vector<unsigned int> &kv_widths,
                               ml::train::TensorDim::DataType dtype,
-                              ml::train::TensorDim::Format format) {
+                              ml::train::TensorDim::Format format,
+                              const std::vector<unsigned int> &rows,
+                              const std::vector<unsigned int> &keep) {
   if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
-      kv_widths.size() != num_layers) {
+      kv_widths.size() != num_layers ||
+      (!rows.empty() &&
+       (rows.size() != num_layers || keep.size() != num_layers))) {
     throw std::invalid_argument(
       "KVCacheManager::allocate: invalid layer, batch, or KV width count");
+  }
+
+  // [HTP window] rows / keep: a layer with fewer rows than max_seq_len keeps
+  // its last keep rows contiguous at the front (compact()); the physical
+  // capacity goes through the same per-layer cap the ring uses.
+  keep_.assign(num_layers, 0u);
+  bases_.assign(num_layers, 0u);
+  if (!rows.empty()) {
+    layer_caps_.assign(num_layers, 0u);
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      if (rows[i] == 0 || rows[i] >= max_seq_len)
+        continue;
+      // a step must fit behind the window it attends to
+      if (keep[i] == 0 || keep[i] >= rows[i])
+        throw std::invalid_argument(
+          "KVCacheManager::allocate: a windowed layer needs 0 < keep < rows");
+      layer_caps_[i] = rows[i];
+      keep_[i] = keep[i];
+    }
   }
 
   for (auto kv_width : kv_widths) {
@@ -512,7 +537,38 @@ void KVCacheManager::advance(unsigned int step_size) {
   cache_pos_ += step_size;
 }
 
-void KVCacheManager::reset() { cache_pos_ = 0; }
+void KVCacheManager::reset() {
+  cache_pos_ = 0;
+  bases_.assign(bases_.size(), 0u);
+}
+
+bool KVCacheManager::compact(unsigned int pos) {
+  bool changed = false;
+  for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
+    if (!windowed(l) || isLayerKVAliased(l))
+      continue;
+    const unsigned int from = liveFrom(l, pos);
+    if (from <= bases_[l])
+      continue;
+    const size_t w = kv_widths_[l];
+    const unsigned int rows = getLayerCap(l);
+    const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;
+    for (auto *t : {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
+      const auto md = t->getMemoryData();
+      if (md && !md->isHostAddressable())
+        throw std::runtime_error("KVCacheManager::compact: a windowed layer's "
+                                 "cache must be host addressable");
+      for (unsigned int b = 0; b < batch_size_; ++b) {
+        // fp16 bits on every build (FP16 or UINT16 storage)
+        uint16_t *d = t->getData<uint16_t>() + b * static_cast<size_t>(rows) * w;
+        std::memmove(d, d + skip, live * sizeof(uint16_t));
+      }
+    }
+    bases_[l] = from;
+    changed = true;
+  }
+  return changed;
+}
 
 nntrainer::Tensor &KVCacheManager::getKeyCache(unsigned int layer_idx) {
   if (layer_idx >= layer_caches_.size()) {
@@ -695,6 +751,7 @@ unsigned int KVCacheManager::geometryDigest() const {
   for (unsigned int i = 0; i < n; ++i) {
     mix(i < kv_widths_.size() ? kv_widths_[i] : 0u);
     mix(getLayerCap(i));
+    mix(windowed(i) ? keep_[i] : 0u);
     mix(static_cast<unsigned int>(getLayerKVSource(i) + 1));
   }
   return hash;
@@ -793,11 +850,24 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len,
     // re-derive which row is which. A full layer is unchanged: rowsToPersist ==
     // seq_len.
     save_dim.height(rowsToPersist(li, seq_len));
+    // [HTP window] a windowed layer's live rows start at liveFrom - base
+    size_t save_off = 0;
+    if (windowed(li)) {
+      const unsigned int from = liveFrom(li, seq_len);
+      if (from < bases_[li] || seq_len - bases_[li] > getLayerCap(li))
+        throw std::out_of_range("KVCacheManager::save: layer " +
+                                std::to_string(li) + " does not hold rows [" +
+                                std::to_string(from) + ", " +
+                                std::to_string(seq_len) + ")");
+      save_off = static_cast<size_t>(from - bases_[li]) * kv_widths_[li];
+    }
 
-    nntrainer::Tensor k_slice = const_cast<nntrainer::Tensor &>(lc.key_cache)
-                                  .getSharedDataTensor(save_dim, 0, true);
-    nntrainer::Tensor v_slice = const_cast<nntrainer::Tensor &>(lc.value_cache)
-                                  .getSharedDataTensor(save_dim, 0, true);
+    nntrainer::Tensor k_slice =
+      const_cast<nntrainer::Tensor &>(lc.key_cache)
+        .getSharedDataTensor(save_dim, save_off, true);
+    nntrainer::Tensor v_slice =
+      const_cast<nntrainer::Tensor &>(lc.value_cache)
+        .getSharedDataTensor(save_dim, save_off, true);
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // Device-only KV: Tensor::save reads on the host -- stage D2H first.
@@ -932,6 +1002,10 @@ unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
     auto &lc = layer_caches_[i];
     ml::train::TensorDim load_dim = lc.key_cache.getDim();
     load_dim.height(versioned ? rowsToPersist(i, seq_len) : seq_len);
+    // [HTP window] the loaded rows land at row 0; the base says which
+    // absolute position that is
+    if (windowed(i))
+      bases_[i] = liveFrom(i, seq_len);
 
     nntrainer::Tensor k_slice =
       lc.key_cache.getSharedDataTensor(load_dim, 0, true);

@@ -71,6 +71,21 @@ bool Gemma4HtpTransformer::isKVSharedLayer(int layer_id) const {
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
 }
 
+unsigned int Gemma4HtpTransformer::getKVCacheRows(int layer_id) const {
+  // A sliding layer reads its window and writes one prefill chunk or the
+  // generated tokens behind it: at a long max_seq_len (23k: 5 GB of fp16
+  // rows over 25 layers otherwise) that is all its cache holds, and
+  // KVCacheManager::compact moves the window to the front between steps.
+  const unsigned int max_rows = static_cast<unsigned int>(MAX_SEQ_LEN);
+  if (!isSlidingAttentionLayer(layer_id) || SLIDING_WINDOW >= max_rows)
+    return max_rows;
+  const unsigned int rows =
+    (SLIDING_WINDOW + std::max<unsigned int>(INIT_SEQ_LEN, NUM_TO_GENERATE) +
+     63u) /
+    64u * 64u;
+  return std::min(rows, max_rows);
+}
+
 bool Gemma4HtpTransformer::isSlidingAttentionLayer(int layer_id) const {
   if (!layer_types.empty() && layer_id < static_cast<int>(layer_types.size())) {
     return layer_types[layer_id] == "sliding_attention";
@@ -280,7 +295,7 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
 std::pair<Tensor, Tensor>
 Gemma4HtpTransformer::createGemma4KVCachePlaceholders(const int layer_id,
                                                       unsigned int kv_width) {
-  const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+  const unsigned int max_timestep = getKVCacheRows(layer_id);
 #ifdef ENABLE_FP16
   ml::train::TensorDim cache_dim(
     {BATCH_SIZE, 1, max_timestep, kv_width},
@@ -1056,10 +1071,12 @@ void Gemma4HtpCausalLM::allocateAndBindKVCache() {
 #else
     const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
 #endif
-    std::vector<unsigned int> kv_widths;
+    std::vector<unsigned int> kv_widths, rows, keep;
     kv_widths.reserve(static_cast<size_t>(NUM_LAYERS));
     for (int i = 0; i < NUM_LAYERS; ++i) {
       kv_widths.push_back(getKVCacheWidth(i));
+      rows.push_back(getKVCacheRows(i));
+      keep.push_back(isSlidingAttentionLayer(i) ? SLIDING_WINDOW : 0u);
     }
 
 #ifdef ENABLE_HEXKL
@@ -1072,7 +1089,8 @@ void Gemma4HtpCausalLM::allocateAndBindKVCache() {
 #endif
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
-                      cache_dtype);
+                      cache_dtype, ml::train::TensorDim::Format::NCHW, rows,
+                      keep);
     kv_cache_bound = false;
   }
 

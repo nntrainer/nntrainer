@@ -243,6 +243,18 @@ inline bool htpDecodeKvSeedF16(unsigned n_rows, const uint16_t *k_rows,
 #endif
 }
 
+/** @brief The windowed attention layers' KV caches hold `rows` rows from
+ *  absolute position `base` (ComputeOps::set_decode_kv_window); before the
+ *  first decode row. */
+inline void htpDecodeKvWindow(unsigned rows, unsigned base) {
+#ifdef ENABLE_HEXKL
+  nntrainer::get_htp_ops()->set_decode_kv_window(rows, base);
+#else
+  (void)rows;
+  (void)base;
+#endif
+}
+
 } // namespace nntrainer
 
 #endif /* NNTR_HTP_DECODE_HOOK_H */

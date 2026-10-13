@@ -351,6 +351,23 @@ public:
   }
 
   /**
+   * @brief The absolute position of the external KV cache's row 0. A
+   *        sliding layer's cache at a long context holds only its window
+   *        and the step behind it (KVCacheManager::compact): the host moved
+   *        the rows, so the quantized mirror is re-appended in full, like
+   *        after setCacheIndex. Positions (cache_index, RoPE) stay absolute;
+   *        only row numbers subtract the base.
+   */
+  WIN_EXPORT void setCacheBase(unsigned int base) {
+    if (base == cache_base)
+      return;
+    cache_base = base;
+    for (auto &synced : q_cache_synced) {
+      synced = 0;
+    }
+  }
+
+  /**
    * @brief Get the current cache index
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
@@ -399,6 +416,7 @@ private:
 
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
+  unsigned int cache_base = 0; /**< see setCacheBase */
 
   /**
    * @brief Whether to use externally provided cache tensors
