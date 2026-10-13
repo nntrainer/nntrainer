@@ -453,17 +453,20 @@ static inline void router_sm_l2fetch(const float *p, uint32_t Ep,
  *         roundings, m1_router_softmax_det's order). */
 static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
   const router_sm_ctx *c = (const router_sm_ctx *)v;
+  /* [D3] block-major weight (hvx_router_sm_pack_f32): block b is one
+     contiguous K x 128 B run, so the l2fetch is a plain stream of lines
+     and the lead is 2 x ROUTER_PF_ROWS. */
   for (uint32_t b = i; b < c->Ep / LANES; b += n) {
-    const float *col = c->w + (size_t)b * LANES;
+    const float *col = c->w + (size_t)b * c->K * LANES;
     HVX_Vector acc = Q6_V_vzero();
     for (uint32_t k0 = 0; k0 < c->K; k0 += ROUTER_PF_ROWS) {
       const uint32_t k1 =
         k0 + ROUTER_PF_ROWS < c->K ? k0 + ROUTER_PF_ROWS : c->K;
       if (k0 == 0u) {
-        router_sm_l2fetch(col, c->Ep, k1);
-      }
-      if (k1 < c->K) {
-        router_sm_l2fetch(col + (size_t)k1 * c->Ep, c->Ep,
+        router_sm_l2fetch(
+          col, LANES, c->K < 2u * ROUTER_PF_ROWS ? c->K : 2u * ROUTER_PF_ROWS);
+      } else if (k1 < c->K) {
+        router_sm_l2fetch(col + (size_t)k1 * LANES, LANES,
                           c->K - k1 < ROUTER_PF_ROWS ? c->K - k1
                                                      : ROUTER_PF_ROWS);
       }
@@ -471,10 +474,24 @@ static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
         acc = Q6_Vsf_vadd_VsfVsf(
           acc,
           Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]),
-                             *(const HVX_UVector *)(col + (size_t)k * c->Ep)));
+                             *(const HVX_UVector *)(col + (size_t)k * LANES)));
       }
     }
     *(HVX_UVector *)(c->acc + (size_t)b * LANES) = acc;
+  }
+}
+
+void hvx_router_sm_pack_f32(float *dst, const float *w, uint32_t K,
+                            uint32_t E) {
+  const uint32_t Ep = (E + LANES - 1u) / LANES * LANES;
+  for (uint32_t b = 0; b < Ep / LANES; ++b) {
+    for (uint32_t k = 0; k < K; ++k) {
+      float *d = dst + ((size_t)b * K + k) * LANES;
+      for (uint32_t j = 0; j < LANES; ++j) {
+        const uint32_t e = b * LANES + j;
+        d[j] = e < E ? w[(size_t)k * E + e] : 0.0f;
+      }
+    }
   }
 }
 
@@ -488,9 +505,10 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
       E > M1_DET_ROUTER_SM_MAX_E || top_k == 0u || top_k > E) {
     return;
   }
-  /** ponytail: f32 weights, 1.4 MiB a layer at Gemma's 2816 x 128 read once
-     a token (43 MiB over 30 layers); f16 / bf16 storage halves it when the
-     router shows in the stage timers. */
+  /** wp is block-major (hvx_router_sm_pack_f32). ponytail: f32 weights,
+     1.4 MiB a layer at Gemma's 2816 x 128 read once a token (43 MiB over
+     30 layers); f16 / bf16 storage halves it when the router shows in the
+     stage timers. */
   router_sm_ctx c = {x, wp, K, Ep, acc};
   hvx_worker_pool_run(pool, router_sm_lane, &c, Ep / LANES);
   memcpy(logits, acc, (size_t)E * sizeof(float));

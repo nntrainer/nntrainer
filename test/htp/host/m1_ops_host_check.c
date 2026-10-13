@@ -1419,11 +1419,7 @@ static void check_router_softmax(void) {
           w[(size_t)k * E + e2] = w[(size_t)k * E + e1];
         }
       }
-      for (uint32_t k = 0; k < H; ++k) {
-        for (uint32_t e = 0; e < Ep; ++e) {
-          wp[(size_t)k * Ep + e] = e < E ? w[(size_t)k * E + e] : 0.0f;
-        }
-      }
+      hvx_router_sm_pack_f32(wp, w, H, E);
       m1_router_input_scale_det(rs, H, g);
       hvx_rmsnorm_f32(h, g, xk, H, H, eps, NULL);
       memset(lh, 0xA5, sizeof(lh));

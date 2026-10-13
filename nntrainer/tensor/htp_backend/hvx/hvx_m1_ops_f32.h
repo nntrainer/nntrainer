@@ -200,8 +200,8 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
  *        tie, renormalised, times the per-expert scale).
  *
  * @param x       K floats: rmsnorm(h) * m1_router_input_scale_det's g
- * @param wp      K x Ep floats: [K][E] padded to Ep = E rounded up to 32
- *                columns (lanes >= E are read and ignored)
+ * @param wp      K x Ep floats, block-major [Ep / 32][K][32] as
+ *                hvx_router_sm_pack_f32 lays it (lanes >= E zero, ignored)
  * @param pes     E floats, the per-expert scale
  * @param E       1..128
  * @param top_k   1..E
@@ -214,5 +214,14 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
                                  const float *pes, uint32_t K, uint32_t E,
                                  uint32_t top_k, float *logits, uint32_t *sel,
                                  float *weight, hvx_worker_pool *pool);
+
+/**
+ * @brief [D3] The softmax router's weight as hvx_router_softmax_topk_f32
+ *        reads it: block-major [Ep / 32][K][32] from the model's row-major
+ *        [K][E], the lanes past E zero. A lane's chain then streams one
+ *        contiguous K x 128 B run instead of 128 B every 4 x 128 B.
+ *        @a dst holds K * Ep floats, Ep = E rounded up to 32.
+ */
+void hvx_router_sm_pack_f32(float *dst, const float *w, uint32_t K, uint32_t E);
 
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */
