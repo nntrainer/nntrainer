@@ -37,11 +37,12 @@ public:
       throw std::invalid_argument(
         "HTP native_lib_dir is missing libnntr_hvx_skel.so");
 
+    // The HTP runtime configuration is built into the library
+    // (nntrainer/tensor/htp_backend/htp_fixed_opts.h); only the DSP library
+    // path is set here, and the weight page-cache policy
+    // (NNTR_HTP_PAGE_CACHE) is left to the environment.
     const std::vector<std::pair<std::string, std::string>> options = {
-      {"ADSP_LIBRARY_PATH", dir.string()}, {"NNTR_HTP_E2E", "1"},
-      {"NNTR_MOE_CACHE_EXPERTS", "16"},    {"NNTR_HTP_E2E_FREE_KVQ", "1"},
-      {"NNTR_HTP_KV_DROP_CPU", "1"},       {"NNTR_HTP_DROP_HOST_FC", "1"},
-      {"NNTR_HTP_ATTN_M1_Q8", "2"},        {"NNTR_HTP_FC_IN_ARENA", "1"},
+      {"ADSP_LIBRARY_PATH", dir.string()},
     };
     if (!options_.empty() && options_ != options)
       throw std::invalid_argument(

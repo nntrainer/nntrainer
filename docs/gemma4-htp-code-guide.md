@@ -112,7 +112,7 @@ keeps the KV cache it wrote. Prefill of 1,028 tokens takes about 1.8 s on
 the S26 Ultra.
 
 **Decode** (one token at a time) does not go through the layers at all once
-the first token is out. With `NNTR_HTP_E2E=1` the backend compiles the whole
+the first token is out. The backend compiles the whole
 decode step into a resident DSP graph (`graph_init`, 542 ops for the 26B
 model: `RMSNORM`, `FC`, `QK_NORM`, `ROPE`, `ATTN_M1`, `ADD`, `ROUTER_TOPK`,
 `MOE`, `DENSE_FFN`, `LM_HEAD`) and starts the **token driver**
@@ -174,22 +174,29 @@ column sums. The scalar references of the same arithmetic live next to the
 kernels (`*_det.h` under `nntrainer/tensor/`) and are what the host checks
 compare against.
 
-## 7. Runtime options
+## 7. Runtime configuration and options
 
-The C API fixes seven options for every HTP model
-(`Applications/CausalLM/api/htp_model_runtime.h`); the CLI needs them in the
-environment. They are read once per process, which is why the API refuses to
-change them between handles.
+The configuration the model was validated with is built into the library,
+in `nntrainer/tensor/htp_fixed_opts.h`; neither the app nor the CLI sets
+it, and it is not an option any more:
 
-| Variable | Fixed value | Effect |
+| Setting | Value | Effect |
 |---|---|---|
-| `NNTR_HTP_E2E` | 1 | compile the decode step into the resident DSP graph and run the token driver |
-| `NNTR_MOE_CACHE_EXPERTS` | 16 | experts kept resident per layer in the arena |
-| `NNTR_HTP_E2E_FREE_KVQ` | 1 | free the host copies of the quantized KV caches once the DSP holds them |
-| `NNTR_HTP_KV_DROP_CPU` | 1 | drop the CPU KV cache mirror after prefill |
-| `NNTR_HTP_DROP_HOST_FC` | 1 | unmap the host copy of the dense projections once registered in the arena |
-| `NNTR_HTP_ATTN_M1_Q8` | 2 | decode attention over the int8 KV cache with fixed per-dimension scales |
-| `NNTR_HTP_FC_IN_ARENA` | 1 | dense projections live in the DSP arena, not in staging buffers |
+| `htp_fixed::E2E` | on | compile the decode step into the resident DSP graph and run the token driver |
+| `htp_fixed::MOE_CACHE_EXPERTS` | 16 | experts kept resident per layer in the arena (a model's `moe_cache_experts` still names its own count) |
+| `htp_fixed::E2E_FREE_KVQ` | on | free the host copies of the quantized KV caches once the DSP holds them |
+| `htp_fixed::KV_DROP_CPU` | on | drop the CPU KV cache mirror after prefill |
+| `htp_fixed::DROP_HOST_FC` | on | unmap the host copy of the dense projections once registered in the arena |
+| `htp_fixed::ATTN_M1_Q8` | 2 | decode attention over the int8 KV cache with fixed per-dimension scales, on every layer |
+| `htp_fixed::FC_IN_ARENA` | on | dense projections live in the DSP arena, not in staging buffers |
+
+The C API (`Applications/CausalLM/api/htp_model_runtime.h`) only sets
+`ADSP_LIBRARY_PATH` for the DSP skel. The weight page-cache policy is the
+one runtime option left to the environment:
+
+| Variable | Effect |
+|---|---|
+| `NNTR_HTP_PAGE_CACHE=0` or `1` | read the weight file through the bounded reader instead of mmap: 0 bypasses the page cache (direct IO), 1 bounds it; unset keeps the mmap loader |
 
 Diagnostics that are safe to set from the outside:
 
@@ -200,7 +207,6 @@ Diagnostics that are safe to set from the outside:
 | `NNTR_HTP_DUMP=<dir>` | dump layer inputs and outputs for comparison with the CPU |
 | `NNTR_HTP_ATTN_F32_CHECK=1` | compare the DSP attention with an fp32 CPU reference |
 | `NNTR_MOE_TRACE=1` | log expert hits and misses per layer |
-| `NNTR_HTP_PAGE_CACHE=0` or `1` | read the weight file through the bounded reader instead of mmap: 0 bypasses the page cache (direct IO), 1 bounds it; unset keeps the mmap loader |
 | `NNTR_HTP_RELEASE_PREFILL_SCRATCH=1` | drop the CPU prefill scratch once the resident decode graph owns the step |
 | `NNTR_GENERATED_IDS=<path>` | write the generated token ids, one per line, without asking the DSP for logits |
 | `NNTR_HTP_ATTN_DSP_CALIB=0` | calibrate the int8 attention scales on the CPU instead of inside the DSP step |

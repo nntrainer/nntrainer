@@ -49,6 +49,7 @@
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
 #include <htp_backend.h>
+#include <htp_fixed_opts.h>
 #include <htp_context.h>
 #include <htp_dspq_wire.h>
 #include <htp_expert_prefetch.h>
@@ -3379,7 +3380,7 @@ public:
     if (!t1_printed_) { // [#282 F]
       t1_printed_ = true;
       size_t left = 0;
-      if (kvSeedQ() && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr) {
+      if (kvSeedQ() && htp_fixed::E2E_FREE_KVQ) {
         // [#289] a layer the DSP seed did not take keeps its cache till here
         std::lock_guard<std::mutex> lock(kvq_mutex_);
         left = kvq_handles_.size();
@@ -4009,7 +4010,7 @@ public:
     // token never reads them. ponytail: a later prefill on a layer whose
     // handle is gone fails its append and takes mha_core's CPU attention
     // -- single-prompt runs; the upgrade is mha_core re-registering.
-    if (e2e_ && std::getenv("NNTR_HTP_E2E_FREE_KVQ") != nullptr &&
+    if (e2e_ && htp_fixed::E2E_FREE_KVQ &&
         !kvSeedQ()) { // [#289] the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
@@ -4041,10 +4042,7 @@ public:
       // fixed scales from the prefill seed), HVX_ATTN_M1_Q8 in max_seq;
       // 1 = the first cache only (Gemma's sliding layers, 400 of its 440
       // MiB at max_seq 2048), 2 = both (the full layers too)
-      static const int q8_knob = [] {
-        const char *v = std::getenv("NNTR_HTP_ATTN_M1_Q8");
-        return v != nullptr ? std::atoi(v) : 0;
-      }();
+      constexpr int q8_knob = htp_fixed::ATTN_M1_Q8; // built in: 2
       const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
       // [#4416 F] NNTR_HTP_ATTN_M1_FAST=1: the integer forward over the
       // int8 cache (HVX_ATTN_M1_FAST; not bit-identical to the CPU)
@@ -7301,7 +7299,7 @@ private:
     // out, so the FC set (~880 MiB on Gemma 4) stays off the DSP heap. The
     // heap's growth stops near 1.7 GiB on the S25, and a 4k prompt's
     // quantized KV caches (~950 MiB) are heap allocations.
-    static const bool fc_in_arena = std::getenv("NNTR_HTP_FC_IN_ARENA");
+    constexpr bool fc_in_arena = htp_fixed::FC_IN_ARENA; // built in
     if (ensureArena(session) &&
         (fc_in_arena ? place(session, wh_len, size_t(256) << 20, &chunk, &off)
                      : placeExisting(wh_len, &chunk, &off))) {
@@ -8617,8 +8615,7 @@ private:
     // an alias check in Transformer. Do not override a retained CPU consumer.
     if (weightPageCachePolicy() >= 0)
       return;
-    static const bool on = std::getenv("NNTR_HTP_DROP_HOST_FC") != nullptr;
-    if (!on || host_fc_dropped_ || !e2e_)
+    if (!htp_fixed::DROP_HOST_FC || host_fc_dropped_ || !e2e_)
       return;
     host_fc_dropped_ = !qs4cx_only;
     const size_t before = memAvailableMib();
