@@ -1525,7 +1525,14 @@ public:
     // once in chunks of its own (fc_rows_a_call), so the activation and
     // the outputs cross once, and the outputs may stay in that one buffer
     // (the reader takes them by host_view).
-    norms.to_host = out_to_host || HtpProfile::global().level() >= 2;
+    // NNTR_HTP_QKV_TO_HOST=1: the qkv outputs copied to the host whole (a
+    // reference for the kept path; never set in a tok/s run)
+    static const bool qkv_to_host = [] {
+      const char *v = std::getenv("NNTR_HTP_QKV_TO_HOST");
+      return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    norms.to_host =
+      out_to_host || qkv_to_host || HtpProfile::global().level() >= 2;
     // The table rows through ION like the activation: a plain host pointer
     // is pinned and mapped by the driver every call (~155 MB/s, doc 34
     // section 4 item F), 1-2 MB a prefill layer here. [P11] The table is
@@ -1895,8 +1902,31 @@ public:
     const FcHandles &fh = get_or_register_fc(w, session, K, N, w_scale);
     // the attention's u16 context, still in its staging buffer: the DSP
     // dequantizes it inside the quant pass, nothing is copied or converted
-    const bool u16_in = attn_out16_.host == act && attn_out16_.rows == M &&
-                        attn_out16_.width == K;
+    bool u16_in = attn_out16_.host == act && attn_out16_.rows == M &&
+                  attn_out16_.width == K;
+    // NNTR_HTP_OPROJ_U16=0: the u16 context dequantized here into the host
+    // tensor and staged as f32, instead of the DSP's u16 input path (a
+    // reference for that path; never set in a tok/s run)
+    static const bool u16_off = [] {
+      const char *v = std::getenv("NNTR_HTP_OPROJ_U16");
+      return v != nullptr && std::strcmp(v, "0") == 0;
+    }();
+    if (u16_in && u16_off) {
+      float *dst = const_cast<float *>(act);
+      const unsigned int hd = attn_out16_.head_dim;
+      for (unsigned int r = 0; r < M; ++r)
+        for (unsigned int h = 0; h < K / hd; ++h) {
+          const float sc = attn_out16_.enc[2 * h],
+                      zp = attn_out16_.enc[2 * h + 1];
+          const uint16_t *u =
+            attn_out16_.ion + static_cast<size_t>(r) * K + h * hd;
+          float *d = dst + static_cast<size_t>(r) * K + h * hd;
+          for (unsigned int i = 0; i < hd; ++i)
+            d[i] = (static_cast<float>(u[i]) - zp) * sc;
+        }
+      attn_out16_.host = nullptr;
+      u16_in = false;
+    }
     // The residual, the output (and an f32 activation) staged whole, and
     // one call: the skel walks the row chunks VTCM asks for.
     const size_t o_all = static_cast<size_t>(M) * N * sizeof(float);
@@ -1939,6 +1969,24 @@ public:
     copyOutOf(out_pool_, out, o_all, out_to_host);
     if (u16_in)
       attn_out16_.host = nullptr;
+    // NNTR_HTP_DUMP=<dir>: this call's act (the attention's context, as the
+    // host has it), res and out as fc_<call>_{act,res,out}.f32; valid with
+    // NNTR_HTP_KEEP_OUT=0 (and NNTR_HTP_OPROJ_U16=0 for the u16 context)
+    if (const char *dir = std::getenv("NNTR_HTP_DUMP")) {
+      static unsigned int call = 0;
+      char name[32];
+      std::snprintf(name, sizeof(name), "/fc_%05u_", call++);
+      const std::string base = std::string(dir) + name;
+      dumpAllFile(base + "act.f32", act, static_cast<size_t>(M) * K);
+      dumpAllFile(base + "res.f32", res, static_cast<size_t>(M) * N);
+      dumpAllFile(base + "out.f32", out, static_cast<size_t>(M) * N);
+      FILE *m = std::fopen((std::string(dir) + "/fc_manifest.txt").c_str(),
+                           call == 1 ? "w" : "a");
+      if (m) {
+        std::fprintf(m, "%s %u %u %u\n", name + 1, M, K, N);
+        std::fclose(m);
+      }
+    }
     return true;
   }
 
@@ -4738,9 +4786,24 @@ private:
   }
   static HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
     const size_t cls = stageClass(bytes);
+    auto &slot = pool.by_class[cls];
+    // A tensor a call kept in this buffer (copyOutOf's to_host false) has
+    // only its windows on the host; once the buffer is reused nobody can
+    // find its bytes any more (trueSource / ionAlias see the new bytes),
+    // and a later reader of the host tensor would take the stale rows. So
+    // the host tensor is made whole first -- when its windows still match
+    // the buffer, i.e. the host has not rewritten it since. Only a step
+    // whose sizes collide in one class pays (a 441-row chunk after 2048-row
+    // ones: 2048 rows put every tensor in its own class).
+    for (auto *m : {&pool.copied_out, &pool.holds}) {
+      auto it = m->find(cls);
+      if (it != m->end() && it->second.kept && slot &&
+          sampledSame(it->second.first, slot->data(), it->second.second))
+        stagedMemcpy(const_cast<void *>(it->second.first), slot->data(),
+                     it->second.second);
+    }
     pool.holds.erase(cls);
     pool.copied_out.erase(cls);
-    auto &slot = pool.by_class[cls];
     if (!slot)
       slot = std::make_unique<HtpRpcBuffer>(cls);
     return *slot;
@@ -4797,6 +4860,16 @@ private:
       if (was && was->first == src && was->second == bytes && fslot &&
           sampledSame(src, fslot->data(), bytes)) {
         const bool kept = was->kept;
+        // the buffer handed to from: a kept tensor of pool's class goes
+        // with it, so make that host tensor whole first (as stage does)
+        for (auto *m : {&pool.copied_out, &pool.holds}) {
+          auto k = m->find(cls);
+          if (k != m->end() && k->second.kept && slot &&
+              k->second.first != src &&
+              sampledSame(k->second.first, slot->data(), k->second.second))
+            stagedMemcpy(const_cast<void *>(k->second.first), slot->data(),
+                         k->second.second);
+        }
         std::swap(slot, fslot);
         from->holds.erase(cls);
         from->copied_out.erase(cls);
@@ -4809,6 +4882,23 @@ private:
     // buffer of): from where the bytes really are -- a tensor a call kept
     // (copyOutOf's to_host false) has only its windows on the host.
     const void *from_buf = trueSource(src, bytes);
+    static const bool stage_debug = std::getenv("NNTR_HTP_STAGE_DEBUG");
+    if (stage_debug && from_buf == src) {
+      // a host range that a kept record covers, whose buffer no longer
+      // matches: the host bytes are the stale windows-only copy
+      for (StagingPool *pl : {&out_pool_, &act_pool_, &x2_pool_})
+        for (auto *m : {&pl->copied_out, &pl->holds})
+          for (const auto &rec : *m) {
+            const char *h = static_cast<const char *>(rec.second.first);
+            const char *sc = static_cast<const char *>(src);
+            if (rec.second.kept && h && sc >= h &&
+                sc + bytes <= h + rec.second.second)
+              ml_logw("HTP stage: STALE host read of %zu B at line %d (kept "
+                      "record pool=%p cls=%zu bytes=%zu)",
+                      bytes, line, static_cast<void *>(pl), rec.first,
+                      rec.second.second);
+          }
+    }
     if (from_buf != slot->data())
       stagedMemcpy(slot->data(), from_buf, bytes, line);
     pool.holds[cls] = {src, bytes, false};
@@ -4867,7 +4957,13 @@ private:
                         bool to_host = true, int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     const void *buf = pool.by_class[cls]->data();
-    bool kept = !to_host && HtpProfile::global().level() < 2;
+    // NNTR_HTP_KEEP_OUT=0: every output copied to the host whole (a
+    // reference for the kept path; never set in a tok/s run)
+    static const bool keep_off = [] {
+      const char *v = std::getenv("NNTR_HTP_KEEP_OUT");
+      return v != nullptr && std::strcmp(v, "0") == 0;
+    }();
+    bool kept = !to_host && !keep_off && HtpProfile::global().level() < 2;
     if (kept) {
       sampledCopy(dst, buf, bytes);
       // the windows must be what sampledSame compares, or the readers
@@ -6421,8 +6517,29 @@ private:
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
-    const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
-                              !via_dspq && pre_gamma != nullptr;
+    // NNTR_HTP_HOST_NORMS=1: the MoE call's norms and epilogue on the host
+    // around the plain entry, as NNTR_HTP_PROFILE=2 does without its timing;
+    // NNTR_HTP_MOE_HOST=<mask> picks them one at a time (1 pre-norm, 2
+    // post-norm, 4 epilogue; the DSP's fused epilogue needs its pre-norm, so
+    // a host pre-norm takes the epilogue with it). References for the fused
+    // entry; never set in a tok/s run. Both need NNTR_HTP_KEEP_OUT=0: the
+    // host reads act whole.
+    static const unsigned host_mask = [] {
+      const char *v = std::getenv("NNTR_HTP_HOST_NORMS");
+      if (v != nullptr && std::strcmp(v, "1") == 0)
+        return 7u;
+      const char *m = std::getenv("NNTR_HTP_MOE_HOST");
+      return m != nullptr ? static_cast<unsigned>(std::atoi(m)) : 0u;
+    }();
+    const unsigned host_bits =
+      HtpProfile::global().level() >= 2 ? 7u : host_mask;
+    const bool host_prenorm =
+      (host_bits & 1u) && with_norms && !via_dspq && pre_gamma != nullptr;
+    const bool host_post_norm =
+      (host_bits & 2u) && with_norms && !via_dspq && post_gamma != nullptr;
+    const bool host_epilogue =
+      add_x2 != nullptr && !via_dspq &&
+      ((host_bits & 4u) || host_prenorm || host_post_norm);
     // from out_pool_: the post-attention rows the res_add call left there
     // (the dense call), or the dense output the MoE call takes as act
     HtpRpcBuffer &act_stage =
@@ -6444,13 +6561,27 @@ private:
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
+    // NNTR_HTP_MOE_DEBUG=1 (with NNTR_HTP_KEEP_OUT=0 so the host tensors
+    // are whole): the staged act / x2 against the host's bytes
+    static const bool moe_dbg = std::getenv("NNTR_HTP_MOE_DEBUG") != nullptr;
+    if (moe_dbg && !via_dspq) {
+      static unsigned call_no = 0;
+      ++call_no;
+      const bool a_ok =
+        host_prenorm || std::memcmp(act_f32, act, act_bytes) == 0;
+      const bool x_ok =
+        x2_f32 == nullptr || std::memcmp(x2_f32, add_x2, out_bytes) == 0;
+      if (!a_ok || !x_ok)
+        ml_logw("HTP moe staging #%u M=%u: act %s x2 %s", call_no, M,
+                a_ok ? "ok" : "DIFFERS", x_ok ? "ok" : "DIFFERS");
+    }
     // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
     // (stage breakdown) and the norms on the host around it, so the prefill
     // MoE and dense calls, which always carry them, have stages too (doc 57
     // section 9.26), the post-FFN epilogue too (section 9.34). Measurement
     // only; the norms' and the epilogue's time is outside the call.
-    const bool host_norms =
-      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
+    const float *pre_gamma_dsp = host_prenorm ? nullptr : pre_gamma;
+    const float *post_gamma_dsp = host_post_norm ? nullptr : post_gamma;
     if (host_prenorm) {
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
       for (unsigned int r = 0; r < M; ++r)
@@ -6469,8 +6600,8 @@ private:
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
     const bool timed = profile.level() >= 2;
-    const bool host_post_norm = host_norms && post_gamma != nullptr;
-    const bool norm_entry = with_norms && !host_norms;
+    const bool norm_entry =
+      pre_gamma_dsp != nullptr || post_gamma_dsp != nullptr;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
     // keeps the fastest. Two runs with no functional change between them
     // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
@@ -6489,7 +6620,7 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
-            : add_x2 != nullptr && !host_norms
+            : add_x2 != nullptr && !host_epilogue
               ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
                   session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
                   static_cast<int>(K), post_gamma,
@@ -6503,9 +6634,9 @@ private:
                   out_len, out_f32, out_len)
             : norm_entry
               ? nntr_hvx_mm_u8i4_moe_layer_norm(
-                  session, M, K, inter, N_out, glu, eps, pre_gamma,
-                  pre_gamma ? static_cast<int>(K) : 0, post_gamma,
-                  post_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+                  session, M, K, inter, N_out, glu, eps, pre_gamma_dsp,
+                  pre_gamma_dsp ? static_cast<int>(K) : 0, post_gamma_dsp,
+                  post_gamma_dsp ? static_cast<int>(N_out) : 0, h_gu.data(),
                   static_cast<int>(h_gu.size()), h_dn.data(),
                   static_cast<int>(h_dn.size()), row_index.data(),
                   static_cast<int>(row_index.size()), row_count.data(),
@@ -6572,7 +6703,7 @@ private:
         for (unsigned int n = 0; n < N_out; ++n)
           out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
     }
-    if (host_norms && add_x2) {
+    if (host_epilogue) {
       // out = scale * (act + rmsnorm(out + x2) * gamma), as the epilogue.
       for (unsigned int r = 0; r < M; ++r) {
         float *o = out + static_cast<size_t>(r) * N_out;

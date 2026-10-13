@@ -1813,8 +1813,13 @@ int hexkl_mm_u8i4_moe_layer_run(
      scan norms is read once, where it is, and a heap out_f32 needs no
      copy to scatter into. */
   const float *pre_gamma = scratch->pre_gamma;
+#ifdef HEXKL_MOE_NO_DIRECT /* diagnosis: the copied paths for every call */
+  const int act_direct = 0;
+  const int out_direct = 0;
+#else
   const int act_direct = pre_gamma != NULL && !use_m1;
   const int out_direct = scratch->out_heap && !use_m1;
+#endif
   const size_t sz_act_c = act_direct ? 0u : sizeof(float) * (size_t)M * K;
   const size_t sz_out_c = out_direct ? 0u : sizeof(float) * (size_t)M * N_out;
   const size_t sz_pre =
