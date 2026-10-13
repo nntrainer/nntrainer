@@ -62,6 +62,12 @@ public:
   void allocate() override;
 
   /**
+   * @brief May allocate() leave this payload uninitialized (a load-destined
+   *        heap-bypass weight, filled in full by its reader)?
+   */
+  bool allocUninitialized() const;
+
+  /**
    * @copydoc Tensor::deallocate()
    */
   void deallocate() override {
@@ -433,6 +439,25 @@ bool qs4cxHeapBypassOn();
  * disagree. Read once; the first call latches the answer for the process.
  */
 bool qs4cxDropPlainOn();
+
+/**
+ * @brief The heap-bypass decision for an int4 FC weight of type @a dt.
+ *
+ * QS4CX: qs4cxHeapBypassOn(). QS4ACX: NNTR_QS4CX_HEAP_BYPASS when set, else
+ * ON on every platform -- a QS4ACX weight is read by the v8c device repack
+ * only (the host GEMM is its correctness reference), so a pool slice of it is
+ * a second copy of every such weight for the life of the process. Any other
+ * type: false.
+ */
+bool int4HeapBypassOn(ml::train::TensorDim::DataType dt);
+
+/**
+ * @brief The drop-after-repack decision for an int4 FC weight of type @a dt.
+ *
+ * QS4CX: qs4cxDropPlainOn(). QS4ACX: NNTR_V8C_DROP_PLAIN when set, else ON
+ * (see int4HeapBypassOn). Any other type: false.
+ */
+bool int4DropPlainOn(ml::train::TensorDim::DataType dt);
 
 } // namespace nntrainer
 

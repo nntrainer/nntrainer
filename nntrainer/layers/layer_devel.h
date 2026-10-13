@@ -476,6 +476,10 @@ public:
                   ->quantize(weight, dtype)
                   .save(file);
               }
+            } else if (dtype == TensorDim::DataType::QS4ACX) {
+              NNTR_THROW_IF(true, std::runtime_error)
+                << "quantizing weight '" << weight.getName()
+                << "' to QS4ACX on save is not supported yet";
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
