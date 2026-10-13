@@ -196,7 +196,7 @@ int main(void) {
       }
     hvx_dequant_acc_tiles_scatter_rows_f32(
       (const uint8_t *)stiles, sizeof stiles[0], NT, RS, 1u, SM, sas, saz,
-      colsum, wsc, bias, sout, SN, srows, sw);
+      colsum, wsc, bias, sout, SN, srows, sw, NULL);
     const int same = !memcmp(sout, swant, sizeof sout);
     printf("DN SCATTER ROWS hvx_dequant_i32.c %s\n",
            same ? "bit-exact" : "DIFFERS");
