@@ -623,6 +623,17 @@ void hvx_softmax_q16_merge_max(void *scratch, void *const *parts,
   }
 }
 
+void hvx_softmax_q16_row_max(const void *scratch,
+                             int16_t max[HVX_SOFTMAX_Q_ROWS]) {
+  /* M[v]: row 2v's maximum in lanes 0..31, row 2v + 1's in lanes 32..63 */
+  const HVX_Vector *M = (const HVX_Vector *)scratch + SMX_M;
+  for (uint32_t v = 0; v < 32u; ++v) {
+    const int16_t *m = (const int16_t *)&M[v];
+    max[2u * v] = m[0];
+    max[2u * v + 1u] = m[32];
+  }
+}
+
 void hvx_softmax_q16_part_exp(const hvx_softmax_q_block *b,
                               const int16_t *s_tiles, uint32_t c0, uint32_t c1,
                               uint8_t *p_lo, uint8_t *p_hi, void *scratch) {

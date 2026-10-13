@@ -94,10 +94,30 @@ typedef struct {
   uint16_t rho;
 } head_t;
 
+/**
+ * @brief One pass over a column segment, when the call's whole column range
+ *        does not fit one pass (hexkl_attn_q2_seg_tiles). A pass is the
+ *        kernel as it is over the column tiles [lo, hi): its softmax is the
+ *        segment's own, and the segments are merged by their weight. With
+ *        the segment's row maximum m (corrected int16 score) and the row
+ *        sum S of P' (65536 at the maximum), the row's log2-sum-exp is
+ *        l = m rho / 2^F + log2(S / 65536), and the context over segments
+ *        A and B is (2^lA ctxA + 2^lB ctxB) / (2^lA + 2^lB): exactly the
+ *        softmax over both. The merge runs in the epilogue, on the u16
+ *        output rows: out <- wa (out - zp) + wb ctx + zp, with the running
+ *        l per (query head, row) in lse.
+ */
+typedef struct {
+  uint32_t lo, hi; /**< column tiles of this pass, [lo, hi) */
+  float *lse;      /**< [n_head_q][n_q] running log2-sum-exp, -inf: none */
+  float *wa, *wb;  /**< [item][64] this pass's weights: old rows, new */
+} seg_t;
+
 typedef struct {
   uint8_t *vb;
   const hexkl_attn_f16_shape *s;
   const hexkl_attn_q2_io *io;
+  const seg_t *seg; /**< NULL: the whole column range in one pass */
   hexkl_attn_q2_layout L;
   hexkl_attn_q2_range res; /**< resident column tiles */
   uint32_t hd, dt, G;
@@ -291,6 +311,73 @@ static void stage_qprep(ctx *c, uint32_t i) {
   it->us_qprep = (uint32_t)(now_us() - t0);
 }
 
+/** @brief 2^d for |d| <= 30 from the softmax's own cubic (relative error
+ *         1.5e-4): the DSP image has no exp. */
+static inline float exp2_small(float d) {
+  int n = (int)d;
+  if ((float)n > d) {
+    --n; /* floor */
+  }
+  uint32_t f = (uint32_t)((d - (float)n) * 32768.0f);
+  if (f > 32767u) {
+    f = 32767u;
+  }
+  return ldexpf((float)hvx_softmax_q_exp2_q14(f, 15u), n - 14);
+}
+
+/**
+ * @brief The merge weights of item @a it's rows for this pass, from the
+ *        segment's row maxima and row sums, and the running log2-sum-exp
+ *        updated. A row that sees no column of the segment (sum 0) keeps
+ *        what it has: wb = 0. One item a pass owns its rows of lse, so the
+ *        worker that runs this is their only writer.
+ */
+static void seg_weights(ctx *c, const item_t *it, const int16_t *rmax,
+                        const int32_t *rsum) {
+  const seg_t *g = c->seg;
+  const head_t *hd = &c->heads[it->h];
+  const float unit =
+    ldexpf((float)hd->rho / 32768.0f, -(int)hd->F); /* log2 a score step */
+  const size_t i = (size_t)(it - c->items) * HEXKL_ATTN_Q2_ROWS;
+  float *run = g->lse + (size_t)it->h * c->s->n_q + it->q0;
+  const uint32_t col_end =
+    32u * g->hi < c->s->cache_to ? 32u * g->hi : c->s->cache_to;
+  for (uint32_t r = 0; r < HEXKL_ATTN_Q2_ROWS; ++r) {
+    /* the columns row r sees of this segment, by position: [lo, row] cut
+       to the segment (and to the window), as the softmax masks them */
+    const uint32_t row = it->row0 + r;
+    uint32_t lo = 32u * g->lo;
+    if (c->s->window != 0u && row + 1u > c->s->window &&
+        row + 1u - c->s->window > lo) {
+      lo = row + 1u - c->s->window;
+    }
+    const int sees = r < it->n_rows && lo <= row && lo < col_end;
+    const int32_t sum = sees ? rsum[hvx_softmax_q_rowsum_index(r)] : 0;
+    if (sum <= 0) {
+      g->wa[i + r] = 1.0f;
+      g->wb[i + r] = 0.0f;
+      continue;
+    }
+    /* log2 in double: what the DSP image's libc provides (_Log) */
+    const float l = (float)rmax[r] * unit + (float)log2((double)sum) - 16.0f;
+    const float d = run[r] - l; /* old - new, in log2; -inf: no old */
+    if (!(d > -30.0f)) {
+      g->wa[i + r] = 0.0f;
+      g->wb[i + r] = 1.0f;
+      run[r] = l;
+    } else if (d > 30.0f) {
+      g->wa[i + r] = 1.0f; /* below a u16 step of the old rows */
+      g->wb[i + r] = 0.0f;
+    } else {
+      const float e = exp2_small(d);
+      const float wb = 1.0f / (1.0f + e);
+      g->wa[i + r] = e * wb;
+      g->wb[i + r] = wb;
+      run[r] = l + (float)log2(1.0 + (double)e);
+    }
+  }
+}
+
 /**
  * @brief Stage 2: the integer softmax over the block's score tiles, shared
  *        by the @a n participants of job @a j: part @a idx takes the
@@ -305,6 +392,9 @@ static void stage_softmax(ctx *c, item_t *it, job_t *j, uint32_t idx,
   b.n_col_tiles = it->blk.n;
   b.col0 = 32u * it->blk.lo;
   b.n_cols = c->s->cache_to - 32u * it->blk.lo;
+  if (c->seg && 32u * c->seg->hi < c->s->cache_to) {
+    b.n_cols = 32u * c->seg->hi - 32u * it->blk.lo; /* the segment's end */
+  }
   b.row0 = it->row0;
   b.n_rows = it->n_rows;
   b.window = c->s->window;
@@ -327,10 +417,19 @@ static void stage_softmax(ctx *c, item_t *it, job_t *j, uint32_t idx,
   hvx_softmax_q16_part_max(&b, s16, corr, c0, c1, mine);
   job_barrier(j, 0, n);
   hvx_softmax_q16_merge_max(mine, parts, n);
+  const int stats = c->seg != NULL && idx == 0;
+  int16_t rmax[HVX_SOFTMAX_Q_ROWS];
+  int32_t rsum[HVX_SOFTMAX_Q_ROWSUM_WORDS] __attribute__((aligned(128)));
+  if (stats) {
+    hvx_softmax_q16_row_max(mine, rmax); /* merge_sum reuses the vectors */
+  }
   hvx_softmax_q16_part_exp(&b, s16, c0, c1, plo, phi, mine);
   job_barrier(j, 1, n);
-  hvx_softmax_q16_merge_sum(mine, parts, n, NULL);
+  hvx_softmax_q16_merge_sum(mine, parts, n, stats ? rsum : NULL);
   hvx_softmax_q16_part_norm(&b, c0, c1, plo, phi, mine);
+  if (stats) {
+    seg_weights(c, it, rmax, rsum);
+  }
   if (idx == 0) {
     it->us_softmax = (uint32_t)(now_us() - t0);
   }
@@ -395,6 +494,106 @@ static void stage_epilogue(ctx *c, item_t *it, uint32_t r_lo, uint32_t r_hi) {
   }
 }
 
+/**
+ * @brief stage_epilogue for a pass over a column segment: the segment's
+ *        context merged into the output rows by the pass's weights,
+ *        out <- sat_u16(round(wb ctx + wa (out - zp_o) + zp_o)) with ctx =
+ *        o16 * c[d] as stage_epilogue forms it. A row with wb = 0 is left
+ *        alone; one with wa = 0 (its first segment) is written without
+ *        reading what the buffer holds.
+ */
+static void stage_epilogue_seg(ctx *c, item_t *it, uint32_t r_lo,
+                               uint32_t r_hi) {
+  const uint64_t t0 = now_us();
+  const float s_o = c->io->out_enc[2u * it->h];
+  const float zp_o = c->io->out_enc[2u * it->h + 1u];
+  const float back =
+    ldexpf(512.0f, -PV_KV) / (65535.0f * (s_o > 0.0f ? s_o : 1.0f));
+  const HVX_Vector vback = hvx_splat_sf(back);
+  const HVX_Vector vzp = hvx_splat_sf(zp_o);
+  const float *sv = c->io->kv->fs_v + (size_t)it->n * c->hd;
+  const uint8_t *o16 = o16_tiles(c, it->slot);
+  const uint32_t r_end = r_hi < it->n_rows ? r_hi : it->n_rows;
+  const size_t wi = (size_t)(it - c->items) * HEXKL_ATTN_Q2_ROWS;
+  for (uint32_t d = 0; d < c->dt; d += 2u) {
+    const int two = d + 1u < c->dt;
+    const HVX_Vector c0 =
+      Q6_Vsf_vmpy_VsfVsf(hvx_tile_load_u(sv + 32u * d), vback);
+    const HVX_Vector c1 =
+      two ? Q6_Vsf_vmpy_VsfVsf(hvx_tile_load_u(sv + 32u * (d + 1u)), vback)
+          : c0;
+    const HVX_Vector *o0 =
+      (const HVX_Vector *)(o16 + (size_t)d * HEXKL_ATTN_Q2_TILE16);
+    const HVX_Vector *o1 = o0 + (two ? HEXKL_ATTN_Q2_TILE16 / 128u : 0u);
+    for (uint32_t v = r_lo / 2u; 2u * v < r_end; ++v) {
+      const uint32_t r0 = 2u * v;
+      const HVX_VectorPair w0 = Q6_Ww_vunpack_Vh(o0[v]);
+      const HVX_VectorPair w1 = Q6_Ww_vunpack_Vh(o1[v]);
+      for (uint32_t i = 0; i < 2u && r0 + i < r_end; ++i) {
+        const float wa = c->seg->wa[wi + r0 + i];
+        const float wb = c->seg->wb[wi + r0 + i];
+        if (wb == 0.0f) {
+          continue;
+        }
+        uint16_t *dst = c->io->out +
+                        (size_t)(it->q0 + r0 + i) * c->io->out_stride +
+                        it->h * c->hd + 32u * d;
+        const HVX_Vector vb = hvx_splat_sf(wb);
+        HVX_Vector f0 =
+          Q6_Vsf_equals_Vw(i == 0 ? Q6_V_lo_W(w0) : Q6_V_hi_W(w0));
+        HVX_Vector f1 =
+          Q6_Vsf_equals_Vw(i == 0 ? Q6_V_lo_W(w1) : Q6_V_hi_W(w1));
+        f0 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f0, c0), vb);
+        f1 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f1, c1), vb);
+        if (wa != 0.0f) {
+          /* the rows the earlier segments left: 64 u16, tile d then d + 1 */
+          HVX_Vector old[1] __attribute__((aligned(128)));
+          if (two) {
+            old[0] = *(const HVX_UVector *)dst;
+          } else {
+            old[0] = Q6_V_vzero();
+            memcpy(old, dst, 64u);
+          }
+          const HVX_VectorPair ow = Q6_Wuw_vunpack_Vuh(old[0]);
+          const HVX_Vector va = hvx_splat_sf(wa);
+          f0 = Q6_Vsf_vadd_VsfVsf(
+            f0,
+            Q6_Vsf_vmpy_VsfVsf(
+              Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_lo_W(ow)), vzp), va));
+          f1 = Q6_Vsf_vadd_VsfVsf(
+            f1,
+            Q6_Vsf_vmpy_VsfVsf(
+              Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_hi_W(ow)), vzp), va));
+        }
+        f0 = Q6_Vsf_vadd_VsfVsf(f0, vzp);
+        f1 = Q6_Vsf_vadd_VsfVsf(f1, vzp);
+        const HVX_Vector u =
+          Q6_Vuh_vpack_VwVw_sat(hvx_sf_to_w_rne(f1), hvx_sf_to_w_rne(f0));
+        if (two) {
+          *(HVX_UVector *)dst = u;
+        } else {
+          HVX_Vector tmp[1] __attribute__((aligned(128)));
+          tmp[0] = u;
+          memcpy(dst, tmp, 64u);
+        }
+      }
+    }
+  }
+  if (r_lo == 0) {
+    it->us_epi = (uint32_t)(now_us() - t0);
+  }
+}
+
+/** @brief The epilogue of an item: the plain one, or a segment's merge. */
+static inline void run_epilogue(ctx *c, item_t *it, uint32_t r_lo,
+                                uint32_t r_hi) {
+  if (c->seg) {
+    stage_epilogue_seg(c, it, r_lo, r_hi);
+  } else {
+    stage_epilogue(c, it, r_lo, r_hi);
+  }
+}
+
 /** @brief One job: the softmax of smx_item shared by every participant,
  *         then the two halves of epi_item's epilogue spread by index. */
 static void worker_job(uint32_t n_threads, uint32_t idx, void *arg) {
@@ -407,9 +606,8 @@ static void worker_job(uint32_t n_threads, uint32_t idx, void *arg) {
   }
   if (j->epi_item != NO_ITEM) {
     for (uint32_t task = idx; task < 2u; task += n_threads) {
-      stage_epilogue(c, &c->items[j->epi_item],
-                     task * (HEXKL_ATTN_Q2_ROWS / 2u),
-                     (task + 1u) * (HEXKL_ATTN_Q2_ROWS / 2u));
+      run_epilogue(c, &c->items[j->epi_item], task * (HEXKL_ATTN_Q2_ROWS / 2u),
+                   (task + 1u) * (HEXKL_ATTN_Q2_ROWS / 2u));
     }
   }
 }
@@ -728,7 +926,29 @@ static int try_qk(ctx *c, uint32_t k, int *rc) {
   return 1;
 }
 
+/** @brief A column tile range within the pass's segment (all of it without
+ *         one). */
+static inline hexkl_attn_q2_range seg_clamp(hexkl_attn_q2_range r,
+                                            const seg_t *g) {
+  if (!g || r.n == 0u) {
+    return r;
+  }
+  if (r.lo < g->lo) {
+    r.lo = g->lo;
+  }
+  if (r.hi >= g->hi) {
+    r.hi = g->hi - 1u; /* g->hi > g->lo >= 0, so no wrap */
+  }
+  r.n = (g->hi > r.lo && r.hi >= r.lo) ? r.hi - r.lo + 1u : 0u;
+  return r;
+}
+
 /**
+ * @brief One pass of the kernel: over the call's whole column range
+ *        (@a seg NULL: hexkl_attn_q2_prefill as it always was), or over the
+ *        column tiles of @a seg with its softmax merged into the output
+ *        rows. A block that sees no tile of the segment has no item.
+ *
  * Schedule. At the top of iteration i the softmax of item i is done and
  * QK(i+1) is done unless its kv head's buffer was busy. The job of
  * iteration i is { softmax(i+1), epilogue(i-1) }; under it the HMX thread
@@ -737,56 +957,69 @@ static int try_qk(ctx *c, uint32_t k, int *rc) {
  * per-block critical path is the longer of the softmax span and the HMX
  * work rather than their sum.
  */
-int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
-                          const hexkl_attn_f16_shape *s,
-                          const hexkl_attn_q2_io *io, hvx_worker_pool *pool,
-                          hexkl_attn_q2_stats *st) {
-  if (!vtcm_base || !s || !io || (!io->q && !io->q_f32) ||
-      (io->q_f32 && !io->q_inv) || !io->out || !io->kv || !io->q_enc ||
-      !io->out_enc) {
-    return AEE_EBADPARM;
-  }
-  const hexkl_kv_q *kv = io->kv;
-  if (!kv->fixed || kv->kind != HEXKL_KV_Q8 || kv->head_dim != s->head_dim ||
-      kv->n_head_kv != s->n_head_kv || s->cache_to > kv->max_rows) {
-    return AEE_EBADPARM;
-  }
+static int q2_pass(uint8_t *vtcm_base, uint32_t arena_top,
+                   const hexkl_attn_f16_shape *s, const hexkl_attn_q2_io *io,
+                   hvx_worker_pool *pool, hexkl_attn_q2_stats *st,
+                   const seg_t *seg) {
   ctx c;
   memset(&c, 0, sizeof(c));
   c.vb = vtcm_base;
   c.s = s;
   c.io = io;
-  if (hexkl_attn_q2_plan(s, arena_top, &c.L) != HEXKL_ATTN_OK) {
+  c.seg = seg;
+  if ((seg ? hexkl_attn_q2_plan_n(s, arena_top, seg->hi - seg->lo,
+                                  seg->hi - seg->lo, &c.L)
+           : hexkl_attn_q2_plan(s, arena_top, &c.L)) != HEXKL_ATTN_OK) {
     return AEE_ENOMEMORY;
   }
   c.hd = s->head_dim;
   c.dt = c.hd / 32u;
   c.G = s->n_head_q / s->n_head_kv;
-  c.res = hexkl_attn_q2_cols(s->cache_from, s->cache_from + s->n_q - 1u,
-                             s->cache_to, s->window);
-  const uint32_t n_blocks =
+  c.res =
+    seg_clamp(hexkl_attn_q2_cols(s->cache_from, s->cache_from + s->n_q - 1u,
+                                 s->cache_to, s->window),
+              seg);
+  const uint32_t all_blocks =
     (s->n_q + HEXKL_ATTN_Q2_ROWS - 1u) / HEXKL_ATTN_Q2_ROWS;
-  c.n_items = s->n_head_q * n_blocks;
-  c.items = (item_t *)calloc(c.n_items, sizeof(item_t));
+  c.items = (item_t *)calloc((size_t)s->n_head_q * all_blocks, sizeof(item_t));
   c.heads = (head_t *)calloc(s->n_head_q, sizeof(head_t));
   if (!c.items || !c.heads) {
     free_ctx(&c);
     return AEE_ENOMEMORY;
   }
+  uint32_t n_blocks = 0; /* blocks with an item, the same for every head */
   for (uint32_t h = 0, i = 0; h < s->n_head_q; ++h) {
-    for (uint32_t b = 0; b < n_blocks; ++b, ++i) {
+    n_blocks = 0;
+    for (uint32_t b = 0; b < all_blocks; ++b) {
+      const uint32_t row0 = s->cache_from + b * HEXKL_ATTN_Q2_ROWS;
+      const hexkl_attn_q2_range blk =
+        seg_clamp(hexkl_attn_q2_cols(row0, row0 + HEXKL_ATTN_Q2_ROWS - 1u,
+                                     s->cache_to, s->window),
+                  seg);
+      if (seg && blk.n == 0u) {
+        continue; /* the block sees nothing of this segment */
+      }
       item_t *it = &c.items[i];
       it->n = h / c.G;
       it->h = h;
       it->q0 = b * HEXKL_ATTN_Q2_ROWS;
       it->n_rows = s->n_q - it->q0 < HEXKL_ATTN_Q2_ROWS ? s->n_q - it->q0
                                                         : HEXKL_ATTN_Q2_ROWS;
-      it->row0 = s->cache_from + it->q0;
-      it->blk = hexkl_attn_q2_cols(it->row0, it->row0 + HEXKL_ATTN_Q2_ROWS - 1u,
-                                   s->cache_to, s->window);
+      it->row0 = row0;
+      it->blk = blk;
       it->slot = i % HEXKL_ATTN_Q2_SLOTS;
       it->qslot = i % HEXKL_ATTN_Q2_Q_SLOTS;
+      ++i;
+      ++n_blocks;
     }
+    c.n_items = i;
+  }
+  if (c.n_items == 0u) {
+    if (st) {
+      memset(st, 0, sizeof(*st));
+    }
+    free_ctx(&c);
+    return AEE_SUCCESS;
   }
   // The PV blocks are constants of the kernel.
   {
@@ -903,7 +1136,7 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     c.st.us_wait += now_us() - t0;
   }
   if (rc == AEE_SUCCESS) {
-    stage_epilogue(&c, &c.items[N - 1u], 0u, HEXKL_ATTN_Q2_ROWS);
+    run_epilogue(&c, &c.items[N - 1u], 0u, HEXKL_ATTN_Q2_ROWS);
   }
 
   c.st.us_total = now_us() - t_start;
@@ -918,5 +1151,100 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     *st = c.st;
   }
   free_ctx(&c);
+  return rc;
+}
+
+int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
+                          const hexkl_attn_f16_shape *s,
+                          const hexkl_attn_q2_io *io, hvx_worker_pool *pool,
+                          hexkl_attn_q2_stats *st) {
+  if (!vtcm_base || !s || !io || (!io->q && !io->q_f32) ||
+      (io->q_f32 && !io->q_inv) || !io->out || !io->kv || !io->q_enc ||
+      !io->out_enc) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_kv_q *kv = io->kv;
+  if (!kv->fixed || kv->kind != HEXKL_KV_Q8 || kv->head_dim != s->head_dim ||
+      kv->n_head_kv != s->n_head_kv || s->cache_to > kv->max_rows) {
+    return AEE_EBADPARM;
+  }
+  if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK) {
+    return AEE_ENOMEMORY; /* as the plan answered it */
+  }
+  /* The softmax compares rows and columns as int16 lanes (mask_q): past
+     position 32767 its masks are wrong. One pass never got there (4096
+     columns); segments would. Refused like a shape that does not fit, so
+     the caller's other kernel takes the step. */
+  if (s->cache_to > 32768u) {
+    return AEE_ENOMEMORY;
+  }
+  const hexkl_attn_q2_range res = hexkl_attn_q2_cols(
+    s->cache_from, s->cache_from + s->n_q - 1u, s->cache_to, s->window);
+  hexkl_attn_q2_layout whole;
+#ifdef HEXKL_ATTN_Q2_SEG_TILES
+  /* diagnosis: segments of this many tiles wherever the call has more, so
+     the merge can be compared with the one pass on the same inputs */
+  if (res.n <= HEXKL_ATTN_Q2_SEG_TILES)
+#endif
+    if (hexkl_attn_q2_plan(s, arena_top, &whole) == HEXKL_ATTN_OK) {
+      return q2_pass(vtcm_base, arena_top, s, io, pool, st, NULL);
+    }
+    /* The column range does not fit one pass (more than the softmax's 128
+       tiles a block, or K^T / V past VTCM): a pass a segment, merged. Every
+       segment's rows are whole softmaxes of at most seg_n tiles, so a
+       context of any length runs here. */
+#ifdef HEXKL_ATTN_Q2_SEG_TILES
+  const uint32_t seg_n = HEXKL_ATTN_Q2_SEG_TILES;
+#else
+  const uint32_t seg_n = hexkl_attn_q2_seg_tiles(s, arena_top);
+#endif
+  if (seg_n == 0u) {
+    return AEE_ENOMEMORY;
+  }
+  const uint32_t all_blocks =
+    (s->n_q + HEXKL_ATTN_Q2_ROWS - 1u) / HEXKL_ATTN_Q2_ROWS;
+  const size_t n_w = (size_t)s->n_head_q * all_blocks * HEXKL_ATTN_Q2_ROWS;
+  const size_t n_l = (size_t)s->n_head_q * s->n_q;
+  seg_t g;
+  g.lse = (float *)malloc(n_l * sizeof(float));
+  g.wa = (float *)malloc(n_w * sizeof(float));
+  g.wb = (float *)malloc(n_w * sizeof(float));
+  if (!g.lse || !g.wa || !g.wb) {
+    free(g.lse);
+    free(g.wa);
+    free(g.wb);
+    return AEE_ENOMEMORY;
+  }
+  for (size_t i = 0; i < n_l; ++i) {
+    g.lse[i] = -INFINITY;
+  }
+  hexkl_attn_q2_stats sum;
+  memset(&sum, 0, sizeof(sum));
+  int rc = AEE_SUCCESS;
+  for (uint32_t lo = res.lo; lo <= res.hi && rc == AEE_SUCCESS; lo += seg_n) {
+    g.lo = lo;
+    g.hi = lo + seg_n <= res.hi ? lo + seg_n : res.hi + 1u;
+    hexkl_attn_q2_stats one;
+    memset(&one, 0, sizeof(one));
+    rc = q2_pass(vtcm_base, arena_top, s, io, pool, &one, &g);
+    sum.us_qprep += one.us_qprep;
+    sum.us_dma += one.us_dma;
+    sum.us_qk += one.us_qk;
+    sum.us_softmax += one.us_softmax;
+    sum.us_pv += one.us_pv;
+    sum.us_epi += one.us_epi;
+    sum.us_wait += one.us_wait;
+    sum.us_head += one.us_head;
+    sum.us_submit += one.us_submit;
+    sum.us_total += one.us_total;
+    sum.pcycles += one.pcycles;
+    sum.n_blocks += one.n_blocks;
+  }
+  free(g.lse);
+  free(g.wa);
+  free(g.wb);
+  if (st) {
+    *st = sum;
+  }
   return rc;
 }

@@ -235,6 +235,15 @@ void hvx_softmax_q16_part_max(const hvx_softmax_q_block *b,
 void hvx_softmax_q16_merge_max(void *scratch, void *const *parts,
                                uint32_t n_parts);
 
+/** @brief The 64 row maxima (corrected int16 scores; -32768 for a row with
+ *         no visible column) of a scratch after hvx_softmax_q16_merge_max
+ *         and before hvx_softmax_q16_merge_sum, which reuses their vectors.
+ *         With the row sum of P' they give the row's log2-sum-exp,
+ *         max * rho / 2^F + log2(rowsum / 65536): what a kernel needs to
+ *         merge the softmaxes of column segments. */
+void hvx_softmax_q16_row_max(const void *scratch,
+                             int16_t max[HVX_SOFTMAX_Q_ROWS]);
+
 /** @brief Pass 2 over tiles [c0, c1): P' byte tiles and the partial row
  *         sums into this scratch. */
 void hvx_softmax_q16_part_exp(const hvx_softmax_q_block *b,
