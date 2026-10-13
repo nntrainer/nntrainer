@@ -150,9 +150,37 @@ static void tk_hint_post(void *ctx, uint32_t op, const uint32_t *ids,
     return;
   }
   ++m->hk;
+  *(volatile uint32_t *)&h->seq = 0u;
+  tk_clean(h, 4u);
+  h->width = 0u;
   h->op = op;
   h->n = n;
   memcpy(h->ids, ids, n * sizeof(uint32_t));
+  h->seq2 = seq;
+  tk_clean(h, sizeof(*h));
+  *(volatile uint32_t *)&h->seq = seq;
+  tk_clean(h, 4u);
+}
+
+/** Copy the current router's raw input for a host prediction of the next.
+ * seq is invalidated before either payload changes; the host checks it again
+ * after copying the row. Prediction failure only discards this optional hint.
+ */
+static void tk_input_hint_post(void *ctx, uint32_t op, const float *input,
+                               uint32_t width) {
+  tk_miss *m = (tk_miss *)ctx;
+  htp_pred_hint *h = (htp_pred_hint *)(m->mbox + HTP_MBOX_HINT);
+  const uint32_t seq = hexkl_token_seq(m->tok, m->hk);
+  if (m->hk >= HEXKL_TOKEN_MAX_ROUNDS || width > HTP_MBOX_PRED_MAX_WIDTH)
+    return;
+  ++m->hk;
+  *(volatile uint32_t *)&h->seq = 0u;
+  tk_clean(h, 4u);
+  memcpy(m->mbox + HTP_MBOX_PRED_INPUT, input, width * sizeof(float));
+  tk_clean(m->mbox + HTP_MBOX_PRED_INPUT, width * sizeof(float));
+  h->op = op;
+  h->n = 0u;
+  h->width = width;
   h->seq2 = seq;
   tk_clean(h, sizeof(*h));
   *(volatile uint32_t *)&h->seq = seq;
@@ -292,6 +320,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
   menv.miss.post = tk_miss_post;
   menv.miss.wait = tk_miss_wait;
   menv.miss.ctx = &miss;
+  menv.miss.input_hint = tk_input_hint_post;
   menv.miss.hint = tk_hint_post; /* [#282 B] posted only under predict */
   g->route_log_n = 0u;
   g->pred_log_n = 0u; /* [#266 S2] */

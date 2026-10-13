@@ -120,6 +120,9 @@ typedef struct {
   /** [#282 B] graph_predict's guess for ROUTER_TOPK op @a op, posted
    *  without a wait (htp_pred_hint); NULL = not posted */
   void (*hint)(void *ctx, uint32_t op, const uint32_t *ids, uint32_t n);
+  /** Optional ARM lookahead: publish a read-only copy, never block the DSP. */
+  void (*input_hint)(void *ctx, uint32_t op, const float *input,
+                     uint32_t width);
 } hexkl_graph_miss;
 
 /** @brief What a kernel needs from the session, handed per call so the

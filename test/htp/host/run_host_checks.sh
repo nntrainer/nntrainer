@@ -24,6 +24,9 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
+  "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
+"$OUT/expert_prefetch_check"
 "$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
   "$HERE/tl2_lut_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_lut_check"

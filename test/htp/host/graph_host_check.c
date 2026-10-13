@@ -1297,6 +1297,18 @@ static void check_stretches(void) {
 #define HD64_TOP 2u
 #define HD64_INTER 32u
 
+static float arm_hint_input[HID];
+static uint32_t arm_hint_op, arm_hint_width, arm_hint_calls;
+static void capture_arm_hint(void *ctx, uint32_t op, const float *input,
+                             uint32_t width) {
+  (void)ctx;
+  arm_hint_op = op;
+  arm_hint_width = width;
+  ++arm_hint_calls;
+  if (width == HID)
+    memcpy(arm_hint_input, input, sizeof(arm_hint_input));
+}
+
 /* hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
    250 + 10 m + e (the tiny fixture's handles stay 10..73). */
 /* MoE op m's expert e: gate_up 200 + 10 m + e, down 250 + 10 m + e */
@@ -1435,7 +1447,7 @@ static void check_add_router(int gemma) {
                                         n_bias);
   CHECK(rc == 0u, "set router 1: %s", htp_graph_err_name(rc));
   {
-    uint32_t v = 2u;
+    uint32_t v = 3u;
     float word;
     memcpy(&word, &v, sizeof(word));
     CHECK(hexkl_graph_set_param(g, op_router, HTP_GRAPH_PARAM_PREDICT, &word,
@@ -1443,7 +1455,7 @@ static void check_add_router(int gemma) {
           "PREDICT on an op");
     CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
                                 &word, 1u) == AEE_EINVALIDFORMAT,
-          "PREDICT 2");
+          "PREDICT 3");
     CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
                                 &word, 0u) == AEE_EINVALIDFORMAT,
           "PREDICT n 0");
@@ -1552,6 +1564,30 @@ static void check_add_router(int gemma) {
   CHECK(memcmp(g->slots, h, sizeof(h)) == 0, "slot 0 != h2");
   check_pcycles(g, op_add1, op_norm[3] + 1u, "[ADD .. RMSNORM]");
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
+  if (gemma) {
+    uint32_t mode = 2u;
+    float word, logits[HD64_E];
+    memcpy(&word, &mode, sizeof(word));
+    CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
+                                &word, 1u) == 0,
+          "ARM predictor accepted");
+    arm_hint_calls = 0u;
+    env.miss.input_hint = capture_arm_hint;
+    rc = hexkl_graph_forward(g, &env, op_router, 1u, 0u, NULL, nrm, HID, logits,
+                             HD64_E, &resume);
+    CHECK(rc == 0u && resume == op_router + 1u, "ARM hint router forward");
+    CHECK(arm_hint_calls == 1u && arm_hint_width == HID &&
+            arm_hint_op == nth_op(w, HTP_OP_ROUTER_TOPK, 1) &&
+            memcmp(arm_hint_input, nrm, sizeof(nrm)) == 0,
+          "ARM hint must contain the current raw input and next router op");
+    CHECK(memcmp(g->route_cnt, r_cnt, sizeof(r_cnt)) == 0 &&
+            memcmp(g->route_w, r_w, nr * sizeof(float)) == 0,
+          "ARM hint must not alter actual routing or mixture weights");
+    CHECK(memcmp(g->slots + (size_t)g->ops[op_router].in_slot * g->slot_words,
+                 nrm, sizeof(nrm)) == 0,
+          "ARM hint must preserve its input");
+    puts("ARM PREDICTION HINT: INPUT AND ROUTING BIT-IDENTICAL");
+  }
   hexkl_graph_free(g);
   if (err == 0)
     printf("GRAPH STRETCH BIT-IDENTICAL%s: ADD+RMSNORM "

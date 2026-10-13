@@ -194,7 +194,13 @@ typedef struct {
   uint32_t n;
   uint32_t ids[HTP_MBOX_MISS_MAX];
   uint32_t seq2;
+  /** Zero for DSP top-k hints; otherwise raw router input floats at INPUT. */
+  uint32_t width;
 } htp_pred_hint;
+
+#define HTP_MBOX_PRED_INPUT (HTP_MBOX_HINT + HTP_MBOX_HINT_BYTES)
+#define HTP_MBOX_PRED_MAX_WIDTH 8192u
+#define HTP_MBOX_PRED_BYTES (HTP_MBOX_PRED_MAX_WIDTH * 4u)
 
 typedef char
   htp_pred_hint_fits[sizeof(htp_pred_hint) <= HTP_MBOX_HINT_BYTES ? 1 : -1];

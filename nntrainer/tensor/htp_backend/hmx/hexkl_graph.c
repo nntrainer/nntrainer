@@ -545,6 +545,13 @@ static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
       nx->n_experts == op->n_experts &&
       (nx->eps_bits != 0u) == (op->eps_bits != 0u) &&
       nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
+    if (g->predict == 2u) {
+      if (nx->K == op->K && nx->eps_bits != 0u &&
+          call->env->miss.input_hint != NULL)
+        call->env->miss.input_hint(call->env->miss.ctx, (uint32_t)(nx - g->ops),
+                                   in, op->K);
+      return;
+    }
     graph_router(g, nx, call, in, out, sel, w);
     n = nx->top_k;
     if (call->env->miss.hint != NULL) { /* [#282 B] the prefetch hint */
@@ -1178,7 +1185,7 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
       return AEE_EINVALIDFORMAT;
     }
     memcpy(&v, data, sizeof(v));
-    if (v > 1u) {
+    if (v > 2u) {
       return AEE_EINVALIDFORMAT;
     }
     g->predict = v;
