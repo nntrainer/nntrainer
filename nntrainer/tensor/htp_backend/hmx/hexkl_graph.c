@@ -1287,6 +1287,11 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
         return AEE_ENOMEMORY;
       }
     }
+    if (g->ops[op].eps_bits != 0u) {
+      /* [D3] the softmax router's lanes stream block-major */
+      hvx_router_sm_pack_f32(*dst, data, K, E);
+      return AEE_SUCCESS;
+    }
     memset(*dst, 0, (size_t)K * W * sizeof(float));
     for (k = 0; k < K; ++k) {
       memcpy(*dst + (size_t)k * W, data + (size_t)k * E,
