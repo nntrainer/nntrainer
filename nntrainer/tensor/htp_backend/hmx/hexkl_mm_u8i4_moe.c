@@ -2644,10 +2644,18 @@ int hexkl_mm_u8i4_moe_layer_run(
            exposed -- dn_ntiles / acc_tiles is 2 here, so the old
            "db + 2 < dn_chunks" lookahead never fired once (doc 54
            5.16.3). */
-        if (exp_bg && n > 0u && pblk.first && gb >= dn_bg0 &&
-            gb - dn_bg0 < dn_chunks) {
+        /* [P8] The last gate_up batch queues every down chunk left: with
+           two gate_up batches and three down chunks the third was never
+           queued here and was expanded in front of its batch, 128 times
+           a call. */
+        const uint32_t db_hi = (gb + 1u == gu_chunks) ? dn_chunks
+                               : (gb >= dn_bg0)       ? gb - dn_bg0 + 1u
+                                                      : 0u;
+        for (uint32_t db = gb >= dn_bg0 ? gb - dn_bg0 : 0u;
+             exp_bg && n > 0u && pblk.first && db < db_hi && db < dn_chunks &&
+             !exp_live[MOE_EXP_DN + db];
+             ++db) {
           const hexkl_weight_u8i4 *pd = &tbl->slots[h_down[pblk.e]];
-          const uint32_t db = gb - dn_bg0;
           const uint32_t dnt0 = db * L.acc_tiles;
           const uint32_t dnb =
             (dn_ntiles - dnt0 < L.acc_tiles) ? (dn_ntiles - dnt0) : L.acc_tiles;
