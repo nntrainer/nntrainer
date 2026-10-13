@@ -91,7 +91,7 @@ typedef struct {
   uint32_t v_wh;       /**< [n_kv_bufs][n_res][dt] V weight tiles */
   uint32_t kv_bytes;   /**< bytes of one K^T (or V) buffer */
   uint32_t n_kv_bufs;  /**< 2 when the next head's K/V fit alongside */
-  uint32_t q_u16;      /**< [2][64][hd] u16 Q rows staged by DMA */
+  uint32_t q_u16;      /**< [2][64][hd] Q rows staged by DMA, u16 or f32 */
   uint32_t q_ah;       /**< [3][2][dt] uint8 Q tiles: low bytes, high bytes */
   uint32_t s16;        /**< [2][n_blk][64][32] int16 scores */
   uint32_t planes;     /**< 4 convert planes, 2 KiB each (HMX thread only) */
@@ -174,7 +174,8 @@ static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
     L->v_wh = off;
     off += bufs * L->kv_bytes;
     L->q_u16 = off;
-    off += 2u * HEXKL_ATTN_Q2_ROWS * s->head_dim * 2u;
+    /* [P7] sized for f32 rows (the u16 entry uses half of it) */
+    off += 2u * HEXKL_ATTN_Q2_ROWS * s->head_dim * 4u;
     L->q_ah = off;
     off += HEXKL_ATTN_Q2_Q_SLOTS * 2u * dt * TB;
     L->s16 = off;
