@@ -149,6 +149,53 @@ int main(void) {
     free(got2);
   }
 
+  /* [P3] The whole-row residual epilogue (hexkl_mm_opts.post_res): the
+     three handles row-major in one [M x N], each row's norm + residual add
+     done as its column batches land, must give the bytes of the plain
+     run with hvx_rmsnorm_add_blocks_f32 made over its blocks afterwards,
+     and the kernel must say it did them. The first handle's 33 tiles
+     cross a batch, so a row's lane sums are carried between batches and
+     across handles. Then a residual row off by one, which must not. */
+  {
+    const uint32_t NT = N[0] + N[1] + N[2];
+    float gm[2080];
+    float *res = (float *)malloc(sizeof(float) * (M + 1u) * NT);
+    float *got2 = (float *)malloc(sizeof(float) * out_n);
+    for (uint32_t j = 0; j < NT; ++j)
+      gm[j] = 0.5f + 0.001f * (float)j;
+    for (uint32_t j = 0; j < (M + 1u) * NT; ++j)
+      res[j] = rndf();
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                 handles, 3, x, got, NULL);
+    const float *xb[3] = {got, got + (size_t)M * N[0],
+                          got + (size_t)M * (N[0] + N[1])};
+    rc |= hvx_rmsnorm_add_blocks_f32(want, res, xb, N, 3u, M, gm, 1e-6f, 2.5f,
+                                     NULL);
+    int done = 0;
+    const uint32_t off[3] = {0u, N[0], N[0] + N[1]}, ld[3] = {NT, NT, NT};
+    hexkl_mm_opts o = {0};
+    o.out_off = off;
+    o.out_ld = ld;
+    o.post_done = &done;
+    o.post_res = res;
+    o.post_res_gamma = gm;
+    o.post_res_eps = 1e-6f;
+    o.post_res_scale = 2.5f;
+    rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                  handles, 3, x, got2, &o);
+    const int same = !memcmp(want, got2, sizeof(float) * (size_t)M * NT);
+    o.post_res = res + NT;
+    rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                  handles, 3, x, got2, &o);
+    const int blind = !memcmp(want, got2, sizeof(float) * (size_t)M * NT);
+    printf("res add in epilogue: rc=%d done=%d %s%s\n", rc, done,
+           same ? "bit-identical to the pass after" : "DIFFERS",
+           blind ? " (compare is blind)" : "");
+    fail |= (rc != 0) | !done | !same | blind;
+    free(res);
+    free(got2);
+  }
+
   /* accumulate: the synchronous path, adding into what is there. */
   {
     hexkl_mm_opts o = {0};
