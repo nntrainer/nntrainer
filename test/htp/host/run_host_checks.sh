@@ -24,6 +24,9 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
+  "$HERE/weight_file_reader_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" -o "$OUT/weight_file_reader_check"
+"$OUT/weight_file_reader_check"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
