@@ -151,6 +151,14 @@ public:
   virtual void load_weight(const std::string &weight_path);
 
   /**
+   * @brief Whether load_weight() also builds the state the first run() needs
+   *        (the KV cache), so the request does not pay for it.
+   * @param on false for a caller that loads weights without running them
+   *        (the quantizer); default true.
+   */
+  void setPrepareRunAtLoad(bool on) { prepare_run_at_load_ = on; }
+
+  /**
    * @brief Repack all QS4CX weights after loading
    * @note load_weight() already calls it; calling it again is a no-op, since
    * every weight packs at most once.
@@ -214,6 +222,15 @@ public:
    * (all allocated lazily at or after the first forward) do not exist yet.
    */
   bool growPrefillPlane(unsigned int prompt_tokens);
+
+  /**
+   * @brief Whether growPrefillPlane() could rebuild the graph for SOME prompt.
+   * @details The prompt-independent half of growPrefillPlane()'s refusals.
+   * When it is false the plane is final once the weights are loaded, so
+   * everything sized from it (the KV cache) can be built at load time instead
+   * of inside the first request.
+   */
+  bool prefillPlaneCanGrow() const;
 
   /**
    * @brief Save the weight to a file
@@ -443,8 +460,13 @@ public:
    *        validated. Others keep the single-block bound, and a prompt cut by
    *        it is reported through
    *        TransformerPerformanceMetrics::prompt_truncated_tokens.
+   *        NNTR_KV_WINDOW_RING=0 (causallm::kvRingOptedOut()) withdraws it
+   *        together with the ring, so the opt-out is the pre-ring behaviour;
+   *        NNTR_PREFILL_CHUNK still chunks explicitly.
    */
-  virtual bool chunkLongPrompts() const { return kvRingByDefault(); }
+  virtual bool chunkLongPrompts() const {
+    return kvRingByDefault() && !kvRingOptedOut();
+  }
 
   /**
    * @brief Whether this model wants the sliding-window KV ring (and the
@@ -763,6 +785,8 @@ protected:
   /** NNTR_INIT_SEQ_LEN pinned the plane -> never grow it behind the user's
    *  back (the override exists to A/B exactly this number). */
   bool plane_pinned_ = false;
+  /** See setPrepareRunAtLoad(). */
+  bool prepare_run_at_load_ = true;
   /** The argument load_weight() was given, so growPrefillPlane() can replay the
    *  load after rebuilding the graph. Empty = no recorded load, no growth. */
   std::string weight_path_;
