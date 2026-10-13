@@ -252,3 +252,45 @@ int hvx_rmsnorm_add_blocks_f32(float *out, const float *res,
   hvx_worker_pool_run(pool, addb_worker, &c, M);
   return 0;
 }
+
+void hvx_rmsnorm_add_row_acc_f32(float *acc, const float *seg, uint32_t n,
+                                 int block_start, int block_end, int first) {
+  const HVX_UVector *vx = (const HVX_UVector *)seg;
+  HVX_UVector *va = (HVX_UVector *)acc;
+  HVX_Vector a;
+  uint32_t k = 0;
+  if (block_start) {
+    /* addb_worker as compiled: the accumulator crosses a block boundary
+       as sf (zero before the first block) and the block's first product
+       is added to that sf (vadd.qf32 of a qf32 and an sf) */
+    const HVX_Vector a_sf = first ? Q6_V_vzero() : va[0];
+    a = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(vx[0], vx[0]), a_sf);
+    k = 1;
+  } else {
+    a = va[0];
+  }
+  for (; k < n / LANES; ++k)
+    a = Q6_Vqf32_vadd_Vqf32Vqf32(a, Q6_Vqf32_vmpy_VsfVsf(vx[k], vx[k]));
+  /* the store is what keeps the block-end rounding: a convert the
+     compiler can follow to its use is dropped */
+  va[0] = block_end ? Q6_Vsf_equals_Vqf32(a) : a;
+}
+
+void hvx_rmsnorm_add_row_finish_f32(float *out, const float *res,
+                                    const float *x, const float *gamma,
+                                    uint32_t n, float eps, float scale,
+                                    const float *acc) {
+  const float ss = lanes_sum(((const HVX_UVector *)acc)[0]);
+  const HVX_Vector vr = hvx_splat_sf(1.0f / sqrtf(ss / (float)n + eps));
+  const HVX_Vector vs = hvx_splat_sf(scale);
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  const HVX_UVector *vres = (const HVX_UVector *)res;
+  const HVX_UVector *vg = gamma ? (const HVX_UVector *)gamma : NULL;
+  HVX_UVector *vo = (HVX_UVector *)out;
+  for (uint32_t k = 0; k < n / LANES; ++k) {
+    HVX_Vector a = Q6_Vsf_vmpy_VsfVsf(vx[k], vr);
+    if (vg)
+      a = Q6_Vsf_vmpy_VsfVsf(a, vg[k]);
+    vo[k] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vadd_VsfVsf(vres[k], a), vs);
+  }
+}

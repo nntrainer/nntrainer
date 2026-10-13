@@ -103,6 +103,20 @@ typedef struct {
   float post_eps;
   uint32_t rope_hd, rope_handles;
   const float *rope_cs;
+
+  /** [P3] post_res non-NULL asks for the whole-row residual epilogue in
+      the same dequant epilogue, needs post_done and out_off/out_ld laying
+      every handle row-major in one [M x N] (N the handles' widths summed):
+      row r of out_cat becomes (post_res[r] + rmsnorm(x[r]) * post_res_gamma
+      (NULL = 1, post_res_eps)) * post_res_scale in place, the floats of
+      hvx_rmsnorm_add_blocks_f32 over the row's column batches as they
+      land (the squares summed per lane in column order across batches
+      and handles, the finish on the last batch). *post_done says whether
+      it happened, as for the per-head passes; when not, the caller runs
+      hvx_rmsnorm_add_blocks_f32 over the row-major rows itself. */
+  const float *post_res;
+  const float *post_res_gamma;
+  float post_res_eps, post_res_scale;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

@@ -483,6 +483,16 @@ typedef struct {
   const float *cs;    /**< the table row of the batch's row 0, or NULL */
   uint32_t n, chunk, hd;
   float eps;
+  /* [P3] the whole-row residual epilogue (hexkl_mm_opts.post_res): NULL
+     res = none. off is seg's column in its row-major row, so seg - off is
+     the row; racc / res are the row block's (row 0 of the batch). */
+  const float *res;    /**< the row block's residual rows, N wide */
+  const float *rgamma; /**< N floats or NULL */
+  float *racc;         /**< the row block's per-row lane sums, 32 a row */
+  uint32_t off, rn;    /**< column of seg in its row; the row width N */
+  int first, last;     /**< the row's first / last batch over all handles */
+  int bstart, bend;    /**< the handle's first / last batch */
+  float reps, rscale;
 } fc_post;
 
 static void fc_row_post(void *v, float *seg, uint32_t row) {
@@ -492,6 +502,15 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
   }
   if (p->cs != NULL) {
     hvx_rope_row_f32(seg, p->n, p->hd, p->cs + (size_t)row * 2u * p->hd);
+  }
+  if (p->res != NULL) {
+    float *acc = p->racc + (size_t)row * 32u;
+    hvx_rmsnorm_add_row_acc_f32(acc, seg, p->n, p->bstart, p->bend, p->first);
+    if (p->last) {
+      float *x = seg - p->off;
+      hvx_rmsnorm_add_row_finish_f32(x, p->res + (size_t)row * p->rn, x,
+                                     p->rgamma, p->rn, p->reps, p->rscale, acc);
+    }
   }
 }
 
@@ -525,6 +544,26 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
   if ((o->out_off == NULL) != (o->out_ld == NULL)) {
     return AEE_EBADPARM;
+  }
+  /* [P3] the residual epilogue walks row-major rows: one [M x N] of the
+     handles side by side, N their widths summed, and a post_done to say
+     whether it ran. */
+  uint32_t res_n = 0;
+  if (o->post_res != NULL) {
+    if (o->out_off == NULL || o->post_done == NULL) {
+      return AEE_EBADPARM;
+    }
+    for (uint32_t i = 0; i < n_handles; ++i) {
+      if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS || o->out_off[i] != res_n) {
+        return AEE_EBADPARM;
+      }
+      res_n += tbl->slots[handles[i]].N;
+    }
+    for (uint32_t i = 0; i < n_handles; ++i) {
+      if (o->out_ld[i] != res_n) {
+        return AEE_EBADPARM;
+      }
+    }
   }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
@@ -632,11 +671,17 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     loc_scale = (float *)malloc(sizeof(float) * m_pad);
     loc_zp = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   }
+  /* [P3] a row's lane sums carried from one column batch to the next */
+  float *racc = (o->post_res != NULL && acc_layout->usable)
+                  ? (float *)malloc(sizeof(float) * 32u * m_pad)
+                  : NULL;
   if ((!acc_layout->usable && !acc_scratch) ||
-      (o->act_scale == NULL && (!loc_scale || !loc_zp))) {
+      (o->act_scale == NULL && (!loc_scale || !loc_zp)) ||
+      (o->post_res != NULL && acc_layout->usable && !racc)) {
     free(loc_scale);
     free(loc_zp);
     free(acc_scratch);
+    free(racc);
     return AEE_ENOMEMORY;
   }
   uint64_t p0 = 0;
@@ -694,6 +739,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     free(loc_scale);
     free(loc_zp);
     free(acc_scratch);
+    free(racc);
     return rc0;
   }
 
@@ -717,6 +763,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     const uint32_t cols = acc_tiles * HEXKL_ACC_TILE_COLS;
     fuse_post = (c == 0u || cols % c == 0u) && (hd == 0u || cols % hd == 0u);
   }
+  /* [P3] the residual epilogue rides the same pipelined epilogue */
+  const int fuse_res = fuse_post && o->post_res != NULL;
   if (fuse_post) {
     *o->post_done = 1;
   }
@@ -808,7 +856,19 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                        ? o->rope_cs + (size_t)m0 * 2u * o->rope_hd
                        : NULL;
             pp->n = nb * HEXKL_ACC_TILE_COLS;
-            rj->row_done = (pp->chunk != 0u || pp->cs) ? fc_row_post : NULL;
+            pp->res = fuse_res ? o->post_res + (size_t)m0 * res_n : NULL;
+            pp->rgamma = o->post_res_gamma;
+            pp->racc = fuse_res ? racc + (size_t)m0 * 32u : NULL;
+            pp->off = fuse_res ? o->out_off[i] + nt0 * HEXKL_ACC_TILE_COLS : 0u;
+            pp->rn = res_n;
+            pp->first = (i == 0u && nt0 == 0u);
+            pp->bstart = (nt0 == 0u);
+            pp->bend = (nt0 + nb == nt_n);
+            pp->last = (i + 1u == n_handles && nt0 + nb == nt_n);
+            pp->reps = o->post_res_eps;
+            pp->rscale = o->post_res_scale;
+            rj->row_done =
+              (pp->chunk != 0u || pp->cs || pp->res) ? fc_row_post : NULL;
             rj->ctx = pp;
             jb->tiles_base =
               (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
@@ -893,6 +953,7 @@ out:
   free(loc_scale);
   free(loc_zp);
   free(acc_scratch);
+  free(racc);
   return rc;
 }
 

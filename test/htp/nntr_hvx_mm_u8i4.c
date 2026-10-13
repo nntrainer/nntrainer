@@ -952,6 +952,48 @@ static int layer_res_add_chunk(nntr_hvx_session *s, uint32 M, uint32 K,
     opts.act16_enc = act_enc;
     opts.act16_hd = act_hd;
   }
+  /* [P3] the handles land row-major in out_f32 and the norm + residual
+     add runs in the kernel's epilogue while each row is in the cache
+     (hexkl_mm_opts.post_res). Without the in-place accumulator layout the
+     kernel refuses row-major output (AEE_EUNSUPPORTED): the packed blocks
+     through the heap scratch and the whole-tensor pass, as before. */
+  uint32_t out_off[16], out_ld[16];
+  for (int i = 0; i < w_handlesLen; ++i) {
+    out_off[i] =
+      i ? out_off[i - 1] + s->weights_u8i4.slots[w_handles[i - 1]].N : 0u;
+    out_ld[i] = N;
+  }
+  int post_done = 0;
+  opts.out_off = out_off;
+  opts.out_ld = out_ld;
+  opts.post_done = &post_done;
+  opts.post_res = res;
+  opts.post_res_gamma = gammaLen ? gamma : NULL;
+  opts.post_res_eps = eps;
+  opts.post_res_scale = scale;
+  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles,
+                               (uint32_t)w_handlesLen, act_f32, out_f32, &opts);
+  if (rc == AEE_SUCCESS && post_done) {
+    return AEE_SUCCESS;
+  }
+  if (rc == AEE_SUCCESS) {
+    /* row-major rows, the pass over them in place */
+    const float *xb1 = out_f32;
+    if (hvx_rmsnorm_add_blocks_f32(out_f32, res, &xb1, &N, 1u, M,
+                                   gammaLen ? gamma : NULL, eps, scale,
+                                   s->quant_pool) != 0) {
+      return AEE_EINVALIDFORMAT;
+    }
+    return AEE_SUCCESS;
+  }
+  if (rc != AEE_EUNSUPPORTED) {
+    return rc;
+  }
+  opts.out_off = NULL;
+  opts.out_ld = NULL;
+  opts.post_done = NULL;
+  opts.post_res = NULL;
   if (s->moe_res_n < n) {
     free(s->moe_res);
     s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));

@@ -467,6 +467,30 @@ static void norm_add_row(float *out, const float *res, const float *x,
   }
 }
 
+/* [P3] norm_add_row split over the FC epilogue's column batches: the
+   running sum of squares in acc[0] (the same sequential float adds),
+   the finish norm_add_row's second loop. So the whole-row pass and the
+   batched one give the same floats here, which is what
+   fc_layer_host_check's "res add in epilogue" compares. */
+void hvx_rmsnorm_add_row_acc_f32(float *acc, const float *seg, uint32_t n,
+                                 int block_start, int block_end, int first) {
+  (void)block_start; /* the scalar sum has no qf32 to round */
+  (void)block_end;
+  float ss = first ? 0.0f : acc[0];
+  for (uint32_t j = 0; j < n; ++j)
+    ss += seg[j] * seg[j];
+  acc[0] = ss;
+}
+
+void hvx_rmsnorm_add_row_finish_f32(float *out, const float *res,
+                                    const float *x, const float *gamma,
+                                    uint32_t n, float eps, float scale,
+                                    const float *acc) {
+  const float rs = 1.0f / sqrtf(acc[0] / (float)n + eps);
+  for (uint32_t j = 0; j < n; ++j)
+    out[j] = scale * (res[j] + x[j] * rs * (gamma ? gamma[j] : 1.0f));
+}
+
 int hvx_rmsnorm_add_res_f32(float *out, const float *res, const float *x,
                             const float *x2, uint32_t M, uint32_t n,
                             const float *gamma, float eps, float scale,

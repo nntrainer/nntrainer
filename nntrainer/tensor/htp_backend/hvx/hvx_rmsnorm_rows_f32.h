@@ -103,4 +103,32 @@ int hvx_rmsnorm_add_blocks_f32(float *out, const float *res,
                                uint32_t n_blk, uint32_t M, const float *gamma,
                                float eps, float scale, hvx_worker_pool *pool);
 
+/**
+ * @brief [P3] hvx_rmsnorm_add_blocks_f32's row split over the column
+ *        batches of the FC epilogue: the squares of @a seg's @a n columns
+ *        added lane-wise into @a acc (32 floats, one HVX vector of qf32
+ *        bits; @a first starts it at zero), in the column order the
+ *        whole-row pass uses, so the finish below reads the same sum.
+ *        @a block_start / @a block_end mark the first / last run of a
+ *        column block (a handle): the compiled whole-row pass carries the
+ *        accumulator between its blocks as sf (one rounding) and adds the
+ *        block's first product to that sf, and this reproduces exactly
+ *        that, bit for bit -- @a acc holds sf bits at a block boundary
+ *        and qf32 bits inside a block (the compiler drops a convert it
+ *        can see, so the rounding is forced through the store).
+ */
+void hvx_rmsnorm_add_row_acc_f32(float *acc, const float *seg, uint32_t n,
+                                 int block_start, int block_end, int first);
+
+/**
+ * @brief [P3] The finish of that row: out = (res + x * rs * gamma) * scale
+ *        over @a n columns with rs from @a acc (sf bits: after a
+ *        block_end), hvx_rmsnorm_add_blocks_f32's second pass. @a out may
+ *        be @a x (in place).
+ */
+void hvx_rmsnorm_add_row_finish_f32(float *out, const float *res,
+                                    const float *x, const float *gamma,
+                                    uint32_t n, float eps, float scale,
+                                    const float *acc);
+
 #endif /* __NNTRAINER_HVX_RMSNORM_ROWS_F32_H__ */
