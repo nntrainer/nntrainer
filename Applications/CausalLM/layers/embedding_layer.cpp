@@ -1402,7 +1402,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         ? (ggml_lut ? quant_lut->data()
                     : (virt_q4 ? nullptr : weight_p->getData<uint8_t>()))
         : nullptr;
-    std::vector<uint8_t> virt_row;
     const size_t row_stride =
       qs4cx_lut ? quant_lut->row_bytes
                 : ((wt == nntrainer::TensorDim::DataType::Q6_K)
@@ -1454,6 +1453,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       const size_t chunk_begin = t * total / njobs;
       const size_t chunk_end = (t + 1) * total / njobs;
       std::vector<float> tmp;
+      // One on-demand Q4_0 row per worker: shared across the workers it
+      // was torn by concurrent reads (page-cache policy, prefill).
+      std::vector<uint8_t> virt_row;
       if (row_quant || qs4cx_w || qs4cx_lut)
         tmp.resize(out_dim);
       for (size_t i = chunk_begin; i < chunk_end; ++i) {
