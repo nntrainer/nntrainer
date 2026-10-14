@@ -259,7 +259,9 @@ the model was validated with (the resident decode graph, 16 resident experts
 per layer, the int8 decode attention, the dense projections in the DSP arena,
 the host copies dropped once the DSP holds them, four DMA queues for the
 expert feed, the ARM's next-layer expert prediction with its read-ahead, and
-the prefill scratch released after the first token) is built into the library
+the prefill scratch released after the first token, and the expert pool grown
+to 34 experts a layer after the first token where the DSP's address space
+allows) is built into the library
 (`nntrainer/tensor/htp_fixed_opts.h`). The one knob left is
 `NNTR_HTP_PAGE_CACHE` (section 9.2): unset keeps the mmap loader.
 

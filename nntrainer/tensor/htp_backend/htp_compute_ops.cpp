@@ -3282,11 +3282,42 @@ public:
    *  held. At load the same C would not fit: S26 Ultra p2048, C 40 fails
    *  the prefill's FC call for DSP heap, C 44 the load. */
   void growPool() {
-    static const unsigned per_layer = [] {
-      const char *v = std::getenv("NNTR_MOE_CACHE_GROW");
-      return v != nullptr ? static_cast<unsigned>(std::atoi(v)) : 0u;
-    }();
-    if (per_layer == 0u || !pool_grow_ || moe_ops_.empty())
+    if (!pool_grow_ || moe_ops_.empty() || pool_descs_.empty() ||
+        pool_descs_[0].empty())
+      return;
+    unsigned per_layer;
+    if (const char *v = std::getenv("NNTR_MOE_CACHE_GROW")) {
+      per_layer = static_cast<unsigned>(std::atoi(v));
+    } else {
+      // Built in: towards htp_fixed::MOE_POOL_TARGET a layer, bounded by the
+      // room left under the PD's mapping ceiling (a run past it dies with
+      // fastrpc_mmap on a later miss, not here).
+      const size_t layers = moe_ops_.size();
+      const size_t have = expert_slots_wanted_ / layers;
+      const unsigned want =
+        have < htp_fixed::MOE_POOL_TARGET
+          ? static_cast<unsigned>(htp_fixed::MOE_POOL_TARGET - have)
+          : 0u;
+      uint32_t info1[7] = {0};
+      nntr_hvx_session_info(e2e_st_->h1, info1, 7);
+      size_t mapped = arenaBytes() + (static_cast<size_t>(info1[4]) << 10);
+      for (const ArenaChunk &c : e2e_st_->arena)
+        mapped += c.buf->size();
+      const size_t ceiling = size_t(htp_fixed::PD_MAP_CEILING_MIB) << 20,
+                   margin = size_t(htp_fixed::PD_MAP_MARGIN_MIB) << 20;
+      const size_t room =
+        mapped + margin < ceiling ? ceiling - mapped - margin : 0;
+      const auto &d = pool_descs_[0][0];
+      const size_t slot = expertStride(d.K, 2 * d.inter, d.w_bits) +
+                          expertStride(d.inter, d.N_out, d.w_bits);
+      const size_t fit = room / (slot * layers);
+      per_layer = static_cast<unsigned>(std::min<size_t>(want, fit));
+      std::fprintf(stderr,
+                   "[HTP] pool: %zu a layer, target %u, mapped %zu MiB, room "
+                   "for %zu more a layer\n",
+                   have, htp_fixed::MOE_POOL_TARGET, mapped >> 20, fit);
+    }
+    if (per_layer == 0u)
       return;
     const size_t extra = static_cast<size_t>(per_layer) * moe_ops_.size();
     pool_grow_(extra);
