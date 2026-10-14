@@ -149,7 +149,7 @@ int main(void) {
     free(got2);
   }
 
-  /* [P3] The whole-row residual epilogue (hexkl_mm_opts.post_res): the
+  /** [P3] The whole-row residual epilogue (hexkl_mm_opts.post_res): the
      three handles row-major in one [M x N], each row's norm + residual add
      done as its column batches land, must give the bytes of the plain
      run with hvx_rmsnorm_add_blocks_f32 made over its blocks afterwards,

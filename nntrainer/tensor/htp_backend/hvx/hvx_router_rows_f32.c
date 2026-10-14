@@ -112,7 +112,7 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   const uint32_t ev = c->E / LANES;
   float rs[RB];
   float nx[RB * KB] __attribute__((aligned(128)));
-  /* [P10] rows outer, k blocks inner: a row block's rows (RB x K floats)
+  /** [P10] rows outer, k blocks inner: a row block's rows (RB x K floats)
      are read from DDR once for their rs and again from the cache for the
      dots, where the k-outer order read the whole segment twice from DDR
      (46 MB a 2048-row call). The same rows_block calls over the same

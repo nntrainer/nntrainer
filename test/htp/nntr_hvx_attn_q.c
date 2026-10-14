@@ -436,7 +436,7 @@ int nntr_hvx_probe_hvx_rate(remote_handle64 handle, uint32 n, uint32 *stats,
   return AEE_SUCCESS;
 }
 
-/* Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
+/** Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
    converts), the lengths in elements. */
 static int attn_q2_step_impl(
   remote_handle64 handle, uint32 kv_handle, uint32 row0, const uint16 *k_rows,
@@ -483,7 +483,7 @@ static int attn_q2_step_impl(
     FARF(ERROR, "attn_q2_step: bad lengths");
     return AEE_EBADPARM;
   }
-  /* [P7] the f32 entry's Q rows go to the kernel as they are and are
+  /** [P7] the f32 entry's Q rows go to the kernel as they are and are
      quantized inside its Q staging (hexkl_attn_q2_io.q_f32); the DDR u16
      pass this entry used to run (stats[2]) is gone. */
   hexkl_attn_q2_io io;
@@ -570,7 +570,7 @@ typedef struct {
   float *qlo, *qhi; /**< [lane][n_hq] */
 } q2c_ctx;
 
-/* |x| of fp16 bits is the bits with the sign cleared, and for finite
+/** |x| of fp16 bits is the bits with the sign cleared, and for finite
    values their magnitude order is the unsigned order of those bits: the
    maxima are taken as u16 and converted once, exactly, at the end. The
    row split across lanes changes nothing: max is order-free. */
@@ -637,7 +637,7 @@ static void q2c_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
-/* std::round: halves away from zero; the DSP image has no roundf. Below
+/** std::round: halves away from zero; the DSP image has no roundf. Below
    2^23 trunc then the exact fraction compared with 0.5; above, integral. */
 static inline float q2c_roundf(float x) {
   const float a = x < 0.0f ? -x : x;
@@ -702,7 +702,7 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
                qlo,      qlo + (size_t)lanes * n_head_q};
   hvx_worker_pool_run(s->quant_pool, q2c_worker, &c,
                       n_rows > n_q ? n_rows : n_q);
-  /* the lanes merged, the maxima to f32 (exact), the scales as
+  /** the lanes merged, the maxima to f32 (exact), the scales as
      mha_core::calibrate_q2_scales derives them, in its order of operations */
   for (uint32_t n = 0; n < n_kv; ++n) {
     uint16_t m = 0;

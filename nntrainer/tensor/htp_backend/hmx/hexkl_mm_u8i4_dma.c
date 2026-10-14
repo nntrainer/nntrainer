@@ -483,7 +483,7 @@ typedef struct {
   const float *cs;    /**< the table row of the batch's row 0, or NULL */
   uint32_t n, chunk, hd;
   float eps;
-  /* [P3] the whole-row residual epilogue (hexkl_mm_opts.post_res): NULL
+  /** [P3] the whole-row residual epilogue (hexkl_mm_opts.post_res): NULL
      res = none. off is seg's column in its row-major row, so seg - off is
      the row; racc / res are the row block's (row 0 of the batch). */
   const float *res;    /**< the row block's residual rows, N wide */
@@ -545,7 +545,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if ((o->out_off == NULL) != (o->out_ld == NULL)) {
     return AEE_EBADPARM;
   }
-  /* [P3] the residual epilogue walks row-major rows: one [M x N] of the
+  /** [P3] the residual epilogue walks row-major rows: one [M x N] of the
      handles side by side, N their widths summed, and a post_done to say
      whether it ran. */
   uint32_t res_n = 0;

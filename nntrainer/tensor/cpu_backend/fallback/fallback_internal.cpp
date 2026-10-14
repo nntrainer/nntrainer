@@ -211,7 +211,7 @@ void __fallback_sgemm(const unsigned int TStorageOrder, bool TransA,
         float a, b;
         a = ((TransA == true) ? A[k * lda + m] : A[m * lda + k]);
         b = ((TransB == true) ? B[n * ldb + k] : B[k * ldb + n]);
-        c += a * b;
+        c += static_cast<double>(a) * b;
       }
       C[m * ldc + n] = alpha * c;
       if (beta != 0.0f) {

@@ -4,6 +4,7 @@
  * @file weight_file_reader.cpp
  * @brief Bounded file reads for accelerator weights, including unaligned direct
  * IO.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */
 

@@ -19,8 +19,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <random>
 #include <vector>
 
@@ -30,6 +32,26 @@ namespace {
 
 constexpr uint32_t kRows = HVX_SOFTMAX_Q_ROWS;
 constexpr uint32_t kTile = HVX_SOFTMAX_Q_TILE;
+
+/** @brief Draws that are the same on every platform. std::mt19937 is
+ *         specified bit for bit, the standard distributions are not:
+ *         libstdc++, libc++ and the MSVC STL each consume the engine
+ *         differently, and the Windows ARM64 CI then runs data the Linux
+ *         CI never saw. */
+float uniform01(std::mt19937 &rng) {
+  return static_cast<float>(rng() >> 8) * (1.0f / 16777216.0f);
+}
+
+int uniform_int(std::mt19937 &rng, int lo, int hi) {
+  return lo + static_cast<int>(rng() % static_cast<uint32_t>(hi - lo + 1));
+}
+
+/** @brief Box-Muller normal of the given sigma. */
+float normal(std::mt19937 &rng, float sigma) {
+  const float u1 = std::max(uniform01(rng), 1.0f / 16777216.0f);
+  const float u2 = uniform01(rng);
+  return sigma * std::sqrt(-2.0f * std::log(u1)) * std::cos(6.283185307f * u2);
+}
 
 struct Case {
   uint32_t ct, col0, n_cols, row0, n_rows, window;
@@ -50,22 +72,25 @@ Built build(const Case &c, std::mt19937 &rng) {
   Built b;
   EXPECT_EQ(hvx_softmax_q_scale(c.alpha, c.F, &b.k, &b.rho_q15), 0);
   const double cvt = std::ldexp(1.0, b.k) / 512.0;
-  std::normal_distribution<float> logit(0.0f, 4.0f);
-  std::uniform_int_distribution<int> colsum(-4000, 4000);
   b.s.assign(static_cast<size_t>(c.ct) * kTile, 0);
   b.corr.assign(static_cast<size_t>(c.ct) * 32, 0);
   b.L.assign(b.s.size(), 0.0f);
   for (uint32_t t = 0; t < c.ct; ++t) {
     for (uint32_t j = 0; j < 32; ++j) {
-      const int cs = colsum(rng);
+      const int cs = uniform_int(rng, -4000, 4000);
       const double zp = static_cast<double>(c.zq) * cs;
       b.corr[t * 32 + j] = static_cast<int16_t>(static_cast<uint16_t>(
         static_cast<int64_t>(std::lround(zp * cvt)) & 0xffff));
       for (uint32_t r = 0; r < kRows; ++r) {
-        float Lv = logit(rng);
+        float Lv = normal(rng, 4.0f);
         if ((r * 7 + j) % 53 == 0) {
           Lv += 20.0f; // an outlier the row max must track
         }
+        // The kernel's contract: a corrected score fits int16, at alpha =
+        // 1/2000 that is |L| < 32.7. A 3.2 sigma draw under the outlier
+        // crossed it on the Windows ARM64 CI, wrapped, and that row's max
+        // was another column's.
+        Lv = std::min(std::max(Lv, -30.0f), 30.0f);
         const int32_t acc = static_cast<int32_t>(std::lround(Lv / c.alpha));
         // The logit the integer path can represent: acc * alpha exactly.
         b.L[t * kTile + r * 32 + j] =
@@ -119,9 +144,8 @@ Snr run(const Case &c, std::mt19937 &rng, bool check_masks) {
   // comparison: O = sum_c P[c] V[c].
   constexpr uint32_t kDims = 16;
   std::vector<float> V(static_cast<size_t>(c.ct) * 32 * kDims);
-  std::normal_distribution<float> vdist(0.0f, 1.0f);
   for (auto &x : V) {
-    x = vdist(rng);
+    x = normal(rng, 1.0f);
   }
   double sig = 0.0, err = 0.0, err_ideal = 0.0, o_sig = 0.0, o_err = 0.0;
   for (uint32_t r = 0; r < kRows; ++r) {
@@ -234,9 +258,8 @@ Snr16 run16(const Case &c, std::mt19937 &rng, bool check_masks) {
 
   constexpr uint32_t kDims = 16;
   std::vector<float> V(static_cast<size_t>(c.ct) * 32 * kDims);
-  std::normal_distribution<float> vdist(0.0f, 1.0f);
   for (auto &x : V) {
-    x = vdist(rng);
+    x = normal(rng, 1.0f);
   }
   double sig = 0.0, err = 0.0, err_ideal = 0.0, o_sig = 0.0, o_err = 0.0;
   for (uint32_t r = 0; r < kRows; ++r) {
@@ -313,18 +336,68 @@ Snr16 run16(const Case &c, std::mt19937 &rng, bool check_masks) {
 
 } // namespace
 
+/** @brief The cubic of hvx_softmax_q_exp2_q14, written out here in the
+ *         same Q15 steps, so that a disagreement with the C definition
+ *         separates the arithmetic from the call across the C boundary. */
+int exp2_q14_here(uint32_t f, uint32_t F) {
+  auto q15 = [](int64_t a, int64_t b) {
+    const int64_t v = (a * b * 2 + 32768) >> 16;
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+  };
+  auto sat = [](int64_t v) {
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+  };
+  const int64_t x = static_cast<int64_t>(f) << (15u - F);
+  int64_t p = sat(q15(x, HVX_SOFTMAX_Q_EXP2_C) + HVX_SOFTMAX_Q_EXP2_B);
+  p = sat(q15(p, x) + HVX_SOFTMAX_Q_EXP2_A);
+  return static_cast<int>(16384 + (q15(p, x) >> 1));
+}
+
+TEST(HvxSoftmaxQ, CubicCrossesTheCBoundary) {
+  // The Windows x64 CI (MSVC cl) read 0 from hvx_softmax_q_exp2_q14 for
+  // every input while clang-cl, clang and GCC read the cubic. Print what
+  // the C definition returns next to the same arithmetic done here, so a
+  // failing log says which side differs.
+  std::printf("EXP2_Q14 sizeof(long)=%u sizeof(block)=%u\n",
+              static_cast<unsigned>(sizeof(long)),
+              static_cast<unsigned>(sizeof(hvx_softmax_q_block)));
+  const uint32_t probes[][2] = {{0, 8}, {1, 7}, {2, 7}, {100, 9}, {511, 9}};
+  for (const auto &pr : probes) {
+    const int c = hvx_softmax_q_exp2_q14(pr[0], pr[1]);
+    const int here = exp2_q14_here(pr[0], pr[1]);
+    std::printf("EXP2_Q14 f=%u F=%u c=%d here=%d\n", pr[0], pr[1], c, here);
+    EXPECT_EQ(c, here) << "f=" << pr[0] << " F=" << pr[1];
+  }
+  int k = 0;
+  uint16_t rho = 0;
+  const int rc = hvx_softmax_q_scale(1.0f / 2000.0f, 9, &k, &rho);
+  std::printf("EXP2_Q14 scale rc=%d k=%d rho=%u\n", rc, k, rho);
+  EXPECT_EQ(rc, 0);
+  EXPECT_EQ(k, 8);
+  EXPECT_EQ(rho, 16777);
+}
+
 TEST(HvxSoftmaxQ, CubicIsExp2Within2e4) {
   // The Q15 cubic against 2^x * 16384: at most 3 Q14 units off (1.5e-4),
   // which is 0.04 of a P' step at the top of the grid.
   for (uint32_t F = 7; F <= 9; ++F) {
     int max_err = 0;
+    unsigned out_of_range = 0;
+    uint32_t first_bad = 0;
+    int first_bad_got = 0;
     for (uint32_t f = 0; f < (1u << F); ++f) {
       const double want = std::exp2(f / static_cast<double>(1u << F)) * 16384.0;
       const int got = hvx_softmax_q_exp2_q14(f, F);
       max_err = std::max(max_err, static_cast<int>(std::abs(got - want)));
-      EXPECT_GE(got, 16384);
-      EXPECT_LE(got, 32767);
+      if (got < 16384 || got > 32767) {
+        if (out_of_range++ == 0) {
+          first_bad = f;
+          first_bad_got = got;
+        }
+      }
     }
+    EXPECT_EQ(out_of_range, 0u)
+      << "F=" << F << ": first at f=" << first_bad << " got=" << first_bad_got;
     EXPECT_LE(max_err, 3) << "F=" << F;
   }
   EXPECT_EQ(hvx_softmax_q_exp2_q14(0, 8), 16384);

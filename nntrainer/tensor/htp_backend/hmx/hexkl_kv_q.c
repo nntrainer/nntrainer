@@ -466,7 +466,7 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
-/* [P6] The full tiles' bake over the pool, one (head, tile) a unit: the
+/** [P6] The full tiles' bake over the pool, one (head, tile) a unit: the
    HMX thread baked them all serially after the pool had quantized the
    rows (~2 ms a 1024-row layer). Every unit writes its own tiles of
    kv->kt / kv->v and reads only the master rows, so the bytes are the

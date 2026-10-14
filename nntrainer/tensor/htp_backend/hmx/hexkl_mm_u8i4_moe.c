@@ -2649,7 +2649,7 @@ int hexkl_mm_u8i4_moe_layer_run(
            exposed -- dn_ntiles / acc_tiles is 2 here, so the old
            "db + 2 < dn_chunks" lookahead never fired once (doc 54
            5.16.3). */
-        /* [P8] The last gate_up batch queues every down chunk left: with
+        /** [P8] The last gate_up batch queues every down chunk left: with
            two gate_up batches and three down chunks the third was never
            queued here and was expanded in front of its batch, 128 times
            a call. */

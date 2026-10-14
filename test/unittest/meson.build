@@ -158,9 +158,12 @@ foreach target: test_target
     install: get_option('enable-test'),
     install_dir: application_install_dir
   )
+  # The ternary GEMM suite runs 55 to 90 s on the CI runners (the host
+  # takes 5 s) and the CPU backend suite 60 to 70 s; against the default
+  # 90 s both time out on a busy runner.
   test(target[0], exe,
     args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), target[0])],
-    timeout: test_timeout,
+    timeout: (target[0] == 'unittest_nntrainer_tensor_ternary' or target[0] == 'unittest_nntrainer_cpu_backend') ? test_timeout * 3 : test_timeout,
     suite: 'unittests'
   )
 endforeach
@@ -252,7 +255,6 @@ unittest_hexkl_kv_tiles_f16_exe = executable(
   include_directories: include_directories(
     '../../nntrainer/tensor/htp_backend/hmx'),
   dependencies: nntrainer_test_main_deps,
-  c_args: ['-Wno-missing-include-dirs'],
   # The DSP sources are C11 (hexagon-clang builds them so); the project's
   # default C standard predates for-loop declarations.
   override_options: ['c_std=c11'],
@@ -275,7 +277,6 @@ unittest_hexkl_kv_q_exe = executable(
   include_directories: include_directories(
     '../../nntrainer/tensor/htp_backend/hmx'),
   dependencies: nntrainer_test_main_deps,
-  c_args: ['-Wno-missing-include-dirs'],
   override_options: ['c_std=c11'],
   install: get_option('enable-test'),
   install_dir: application_install_dir

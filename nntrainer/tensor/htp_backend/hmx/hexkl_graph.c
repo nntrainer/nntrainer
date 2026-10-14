@@ -467,7 +467,7 @@ static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
   if (c == NULL) {
     return AEE_EBADSTATE;
   }
-  /* n_experts: the absolute position of the cache's row 0 (a sliding
+  /** n_experts: the absolute position of the cache's row 0 (a sliding
      layer's cache holds a window of a long context; 0 otherwise) */
   if (call->pos < op->n_experts) {
     return AEE_EBADPARM;

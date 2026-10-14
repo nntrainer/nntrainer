@@ -343,7 +343,7 @@ static void seg_weights(ctx *c, const item_t *it, const int16_t *rmax,
   const uint32_t col_end =
     32u * g->hi < c->s->cache_to ? 32u * g->hi : c->s->cache_to;
   for (uint32_t r = 0; r < HEXKL_ATTN_Q2_ROWS; ++r) {
-    /* the columns row r sees of this segment, by position: [lo, row] cut
+    /** the columns row r sees of this segment, by position: [lo, row] cut
        to the segment (and to the window), as the softmax masks them */
     const uint32_t row = it->row0 + r;
     uint32_t lo = 32u * g->lo;
@@ -1171,7 +1171,7 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
   if (hexkl_attn_q2_check(s) != HEXKL_ATTN_OK) {
     return AEE_ENOMEMORY; /* as the plan answered it */
   }
-  /* The softmax compares rows and columns as int16 lanes (mask_q): past
+  /** The softmax compares rows and columns as int16 lanes (mask_q): past
      position 32767 its masks are wrong. One pass never got there (4096
      columns); segments would. Refused like a shape that does not fit, so
      the caller's other kernel takes the step. */
@@ -1182,14 +1182,14 @@ int hexkl_attn_q2_prefill(uint8_t *vtcm_base, uint32_t arena_top,
     s->cache_from, s->cache_from + s->n_q - 1u, s->cache_to, s->window);
   hexkl_attn_q2_layout whole;
 #ifdef HEXKL_ATTN_Q2_SEG_TILES
-  /* diagnosis: segments of this many tiles wherever the call has more, so
+  /** diagnosis: segments of this many tiles wherever the call has more, so
      the merge can be compared with the one pass on the same inputs */
   if (res.n <= HEXKL_ATTN_Q2_SEG_TILES)
 #endif
     if (hexkl_attn_q2_plan(s, arena_top, &whole) == HEXKL_ATTN_OK) {
       return q2_pass(vtcm_base, arena_top, s, io, pool, st, NULL);
     }
-    /* The column range does not fit one pass (more than the softmax's 128
+    /** The column range does not fit one pass (more than the softmax's 128
        tiles a block, or K^T / V past VTCM): a pass a segment, merged. Every
        segment's rows are whole softmaxes of at most seg_n tiles, so a
        context of any length runs here. */

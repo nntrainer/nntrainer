@@ -18,6 +18,12 @@
 /usr/include/nntrainer/ternary_tensor.h
 /usr/include/nntrainer/moe_route_det.h
 /usr/include/nntrainer/tq2cx_layout.h
+/usr/include/nntrainer/cpu_kv_q_attention.h
+/usr/include/nntrainer/htp_act_quant.h
+/usr/include/nntrainer/htp_fixed_opts.h
+/usr/include/nntrainer/htp_q4_0_convert.h
+/usr/include/nntrainer/htp_wh_layout.h
+/usr/include/nntrainer/swiglu_det.h
 /usr/include/nntrainer/qs4acx_tensor.h
 /usr/include/nntrainer/int4_utils.h
 /usr/include/nntrainer/uint4_tensor.h
@@ -75,6 +81,7 @@
 /usr/include/nntrainer/thread_manager.h
 /usr/include/nntrainer/thread_manager_util.h
 /usr/include/nntrainer/safetensors_util.h
+/usr/include/nntrainer/weight_file_reader.h
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
 /usr/include/nntrainer/dynamic_library_loader.h

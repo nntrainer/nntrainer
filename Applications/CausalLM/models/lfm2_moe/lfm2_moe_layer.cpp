@@ -29,8 +29,8 @@
 #include <unistd.h>
 #endif
 #include <expert_lru.h>
-#include <iostream>
 #include <htp_fixed_opts.h>
+#include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>

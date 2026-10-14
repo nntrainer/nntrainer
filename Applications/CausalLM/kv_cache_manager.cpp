@@ -553,14 +553,16 @@ bool KVCacheManager::compact(unsigned int pos) {
     const size_t w = kv_widths_[l];
     const unsigned int rows = getLayerCap(l);
     const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;
-    for (auto *t : {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
+    for (auto *t :
+         {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
       const auto md = t->getMemoryData();
       if (md && !md->isHostAddressable())
         throw std::runtime_error("KVCacheManager::compact: a windowed layer's "
                                  "cache must be host addressable");
       for (unsigned int b = 0; b < batch_size_; ++b) {
         // fp16 bits on every build (FP16 or UINT16 storage)
-        uint16_t *d = t->getData<uint16_t>() + b * static_cast<size_t>(rows) * w;
+        uint16_t *d =
+          t->getData<uint16_t>() + b * static_cast<size_t>(rows) * w;
         std::memmove(d, d + skip, live * sizeof(uint16_t));
       }
     }

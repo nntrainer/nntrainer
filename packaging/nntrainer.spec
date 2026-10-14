@@ -575,6 +575,12 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/ternary_tensor.h
 %{_includedir}/nntrainer/moe_route_det.h
 %{_includedir}/nntrainer/tq2cx_layout.h
+%{_includedir}/nntrainer/cpu_kv_q_attention.h
+%{_includedir}/nntrainer/htp_act_quant.h
+%{_includedir}/nntrainer/htp_fixed_opts.h
+%{_includedir}/nntrainer/htp_q4_0_convert.h
+%{_includedir}/nntrainer/htp_wh_layout.h
+%{_includedir}/nntrainer/swiglu_det.h
 %{_includedir}/nntrainer/qs4acx_tensor.h
 %{_includedir}/nntrainer/int4_utils.h
 %{_includedir}/nntrainer/uint4_tensor.h
@@ -609,6 +615,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/thread_manager.h
 %{_includedir}/nntrainer/thread_manager_util.h
 %{_includedir}/nntrainer/safetensors_util.h
+%{_includedir}/nntrainer/weight_file_reader.h
 %ifarch %{ix86} x86_64
 %{_includedir}/nntrainer/x86_compute_backend.h
 %{_includedir}/nntrainer/avx2_impl.h

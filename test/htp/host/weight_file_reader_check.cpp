@@ -4,6 +4,7 @@
  * @file weight_file_reader_check.cpp
  * @brief Direct-IO model reads: unaligned ranges, EOF, concurrency and
  * residency.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */
 #include <cassert>

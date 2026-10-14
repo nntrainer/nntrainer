@@ -260,7 +260,7 @@ void hvx_rmsnorm_add_row_acc_f32(float *acc, const float *seg, uint32_t n,
   HVX_Vector a;
   uint32_t k = 0;
   if (block_start) {
-    /* addb_worker as compiled: the accumulator crosses a block boundary
+    /** addb_worker as compiled: the accumulator crosses a block boundary
        as sf (zero before the first block) and the block's first product
        is added to that sf (vadd.qf32 of a qf32 and an sf) */
     const HVX_Vector a_sf = first ? Q6_V_vzero() : va[0];
@@ -271,7 +271,7 @@ void hvx_rmsnorm_add_row_acc_f32(float *acc, const float *seg, uint32_t n,
   }
   for (; k < n / LANES; ++k)
     a = Q6_Vqf32_vadd_Vqf32Vqf32(a, Q6_Vqf32_vmpy_VsfVsf(vx[k], vx[k]));
-  /* the store is what keeps the block-end rounding: a convert the
+  /** the store is what keeps the block-end rounding: a convert the
      compiler can follow to its use is dropped */
   va[0] = block_end ? Q6_Vsf_equals_Vqf32(a) : a;
 }

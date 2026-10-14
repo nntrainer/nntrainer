@@ -79,8 +79,8 @@ struct hvx_worker_pool_s {
                                  worker has not served yet */
   _Atomic uint32_t barrier; /**< participating workers still running */
   _Atomic int killed;
-  _Atomic int parked;    /**< [#132 Part B] hvx_worker_pool_park: skip the
-                              post-job spin until the next publish */
+  _Atomic int parked; /**< [#132 Part B] hvx_worker_pool_park: skip the
+                           post-job spin until the next publish */
   /** [P9] workers in (or entering) qurt_futex_wait. A publish wakes only
       when this is nonzero: between two submits of a call the workers are
       still in their spin, and the wake was several microseconds paid at

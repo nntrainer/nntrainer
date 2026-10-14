@@ -1945,25 +1945,26 @@ void NeuralNetwork::load(const std::string &file_path,
               void *mmap_ptr = nullptr;
               {
                 nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
-              int fd = ::open(f_path.c_str(), O_RDONLY);
-              NNTR_THROW_IF((fd == -1), std::invalid_argument)
-                << "Cannot open file : " << f_path;
+                int fd = ::open(f_path.c_str(), O_RDONLY);
+                NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                  << "Cannot open file : " << f_path;
 
-              struct stat st {};
-              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-                << "Cannot get file info (fstat): " << f_path;
+                struct stat st {};
+                NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                  << "Cannot get file info (fstat): " << f_path;
 
                 f_size = static_cast<size_t>(st.st_size);
-                mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                mmap_ptr =
+                  ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
                 ::close(fd); // fd not needed after mmap
                 NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
                   << "mmap failed";
               }
 
               // A node's weights are one contiguous run and the nodes are
-              // handed out by an atomic counter, so this walks the file front to
-              // back -- it is a streaming read, not a scattered one. RANDOM was
-              // the advice here, and it turns off BOTH kernel readahead AND
+              // handed out by an atomic counter, so this walks the file front
+              // to back -- it is a streaming read, not a scattered one. RANDOM
+              // was the advice here, and it turns off BOTH kernel readahead AND
               // fault-around, which makes every 4 KiB page its own synchronous
               // flash trip at queue depth 1. Measured on Adreno 840 with a
               // 3.17 GiB weight file: 830 803 major faults for 830 767 file
@@ -2003,12 +2004,13 @@ void NeuralNetwork::load(const std::string &file_path,
               }
 
               // Early drop: pages no longer needed; bounds peak RSS during the
-              // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
-              // NO-OP in glibc -- it validates its arguments and returns 0
-              // without freeing a page -- so the raw madvise is required for the
-              // drop to actually happen. The mapping is read-only MAP_PRIVATE,
-              // so dropped pages simply re-fault from the page cache if touched
-              // again: bytes read are identical either way.
+              // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a
+              // documented NO-OP in glibc -- it validates its arguments and
+              // returns 0 without freeing a page -- so the raw madvise is
+              // required for the drop to actually happen. The mapping is
+              // read-only MAP_PRIVATE, so dropped pages simply re-fault from
+              // the page cache if touched again: bytes read are identical
+              // either way.
               {
                 nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
                 (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
@@ -2018,7 +2020,7 @@ void NeuralNetwork::load(const std::string &file_path,
 #endif
             }
 
-  #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
             if (cuda_wprefetch_load) {
               for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
                 nntrainer::Tensor &wt = node->getWeight(wi);
@@ -2027,7 +2029,7 @@ void NeuralNetwork::load(const std::string &file_path,
                     wt.getData<uint8_t>(), wt.width(), wt.height());
               }
             }
-  #endif
+#endif
 
             // [load-drop interleave] this node's weight bytes (payload + any
             // trailing scales) are fully materialized in their final tensor
@@ -2046,8 +2048,9 @@ void NeuralNetwork::load(const std::string &file_path,
                 ml_logw("weight-load hook failed on node %s: %s",
                         node->getName().c_str(), e.what());
               } catch (...) {
-                ml_logw("weight-load hook failed on node %s (non-std exception)",
-                        node->getName().c_str());
+                ml_logw(
+                  "weight-load hook failed on node %s (non-std exception)",
+                  node->getName().c_str());
               }
             }
           }
