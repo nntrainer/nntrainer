@@ -189,6 +189,10 @@ it, and it is not an option any more:
 | `htp_fixed::DROP_HOST_FC` | on | unmap the host copy of the dense projections once registered in the arena |
 | `htp_fixed::ATTN_M1_Q8` | 2 | decode attention over the int8 KV cache with fixed per-dimension scales, on every layer |
 | `htp_fixed::FC_IN_ARENA` | on | dense projections live in the DSP arena, not in staging buffers |
+| `htp_fixed::MOE_DMA_QUEUES` | 4 | the M = 1 MoE feed splits each expert matrix over four DMA queues |
+| `htp_fixed::PREDICT` | 2 | the ARM predicts the next MoE layer's experts from the router's input row (Gemma's softmax routers only; `NNTR_HTP_PREDICT=0` turns it off) |
+| `htp_fixed::PREFETCH_READERS` / `PREFETCH_SLOTS` / `PREFETCH_RESIDUAL` | 4 / 32 / 0.5 | the predicted experts are read into spare DMA slots ahead of their layer |
+| `htp_fixed::RELEASE_PREFILL_SCRATCH` | on | the CPU prefill scratch is discarded once the first token is out |
 
 The C API (`Applications/CausalLM/api/htp_model_runtime.h`) only sets
 `ADSP_LIBRARY_PATH` for the DSP skel. The weight page-cache policy is the
@@ -210,7 +214,7 @@ Diagnostics that are safe to set from the outside:
 | `NNTR_HTP_RELEASE_PREFILL_SCRATCH=1` | drop the CPU prefill scratch once the resident decode graph owns the step |
 | `NNTR_GENERATED_IDS=<path>` | write the generated token ids, one per line, without asking the DSP for logits |
 | `NNTR_HTP_ATTN_DSP_CALIB=0` | calibrate the int8 attention scales on the CPU instead of inside the DSP step |
-| `NNTR_MOE_CACHE_GROW=<n>` | let the expert arena grow to n slots per layer after load |
+| `NNTR_MOE_CACHE_GROW=<n>` | let the expert arena grow by n slots per layer after the first token (S26 Ultra, page cache off, C16: +22 takes the decode from 10.1 to 13.9 tok/s for 1 GB of arena; the DSP maps at most about 34 slots a layer) |
 
 The rest of the `NNTR_HTP_*` and `NNTR_MOE_*` variables (about sixty) are
 tuning knobs for experiments; their readers are in `htp_compute_ops.cpp`,

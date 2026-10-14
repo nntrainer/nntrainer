@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <htp_fixed_opts.h>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -2066,8 +2067,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // The resident decode graph only needs a row of the CPU prefill scratch.
   // Outputs have been consumed above; KV placeholders and persistent tensors
   // retain their pages. Keep this opt-in while measuring the memory profile.
-  if (const char *release = std::getenv("NNTR_HTP_RELEASE_PREFILL_SCRATCH")) {
-    if (std::strcmp(release, "1") == 0) {
+  // Built in for the HTP profile (htp_fixed::RELEASE_PREFILL_SCRATCH);
+  // NNTR_HTP_RELEASE_PREFILL_SCRATCH=0 keeps the scratch.
+  const char *release = std::getenv("NNTR_HTP_RELEASE_PREFILL_SCRATCH");
+  if (release != nullptr || (htp_execution_profile_ &&
+                             nntrainer::htp_fixed::RELEASE_PREFILL_SCRATCH)) {
+    if (release == nullptr || std::strcmp(release, "1") == 0) {
       if (auto *network =
             dynamic_cast<nntrainer::NeuralNetwork *>(model.get())) {
         const size_t bytes = network->releaseInferenceScratch();

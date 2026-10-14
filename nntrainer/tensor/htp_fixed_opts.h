@@ -51,6 +51,34 @@ constexpr int ATTN_M1_Q8 = 2;
  *  the DSP heap (formerly NNTR_HTP_FC_IN_ARENA=1). */
 constexpr bool FC_IN_ARENA = true;
 
+/** The decode-fast environment of #4416's run_gemma4_memory.sh, measured on
+ * the S26 Ultra (2026-10-14, page cache off, C16 p1024 g128): with it the
+ * decode goes 9.8 -> 10.1 tok/s and the misses' exposed wait 46 -> 40 ms a
+ * token, at the same arena. The pool growth it also set (NNTR_MOE_CACHE_GROW)
+ * stays an option: it is what takes the decode to 13.9 tok/s, for 1 GB of
+ * arena. */
+
+/** The M = 1 MoE feed's DMA queues (formerly NNTR_MOE_DMA_QUEUES=4; one
+ *  queue reads 28-34 GB/s on the v81 engine, four 62 GB/s). */
+constexpr unsigned int MOE_DMA_QUEUES = 4u;
+
+/** The next MoE layer's experts predicted on the ARM from the router's
+ *  input row (formerly NNTR_HTP_PREDICT=2), when every router is Gemma's
+ *  softmax router; the DSP's routing is never changed by it. */
+constexpr unsigned int PREDICT = 2u;
+
+/** The predicted experts read into spare DMA slots ahead of their layer
+ *  (formerly NNTR_MOE_PREFETCH_DIRECT=1 with NNTR_MOE_PREFETCH=4,
+ *  NNTR_MOE_PREFETCH_READERS=4, NNTR_MOE_PREFETCH_SLOTS=32,
+ *  NNTR_MOE_PREFETCH_RESIDUAL=0.5). */
+constexpr unsigned int PREFETCH_READERS = 4u;
+constexpr unsigned int PREFETCH_SLOTS = 32u;
+constexpr float PREFETCH_RESIDUAL = 0.5f;
+
+/** The CPU prefill scratch is discarded once the first token is out
+ *  (formerly NNTR_HTP_RELEASE_PREFILL_SCRATCH=1). */
+constexpr bool RELEASE_PREFILL_SCRATCH = true;
+
 } // namespace htp_fixed
 } // namespace nntrainer
 

@@ -3589,16 +3589,46 @@ public:
    *  pull a hinted expert the pool lacks into the page cache, so its miss
    *  a layer later preads DDR, not flash. The slots and S1's tables are
    *  untouched -- the ids cannot move. */
-  static size_t prefetchThreads() {
-    const char *direct = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
-    if (weightPageCachePolicy() >= 0 &&
-        (!direct || std::strcmp(direct, "1") != 0))
+  /** @brief Every MoE layer's router is Gemma's softmax router (eps_bits
+   *  set): what the ARM predictor needs. False without a graph description. */
+  bool routersSoftmax() const {
+    if (moe_ops_.empty())
+      return false;
+    for (uint32_t op : moe_ops_) {
+      const htp_graph_op *r = op == 0u ? nullptr : graphOp(op - 1u);
+      if (r == nullptr || r->kind != HTP_OP_ROUTER_TOPK || r->eps_bits == 0u)
+        return false;
+    }
+    return true;
+  }
+
+  /** @brief NNTR_HTP_PREDICT: 0 off, 1 the DSP's guess, 2 the ARM's; unset
+   *  is htp_fixed::PREDICT when the routers are Gemma's, else off. */
+  uint32_t predictMode() const {
+    const char *v = std::getenv("NNTR_HTP_PREDICT");
+    if (v == nullptr)
+      return routersSoftmax() ? htp_fixed::PREDICT : 0u;
+    if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0 &&
+        std::strcmp(v, "2") != 0)
+      throw std::runtime_error(std::string("NNTR_HTP_PREDICT=") + v +
+                               ": want 0 (off), 1 (DSP), or 2 (ARM)");
+    return static_cast<uint32_t>(v[0] - '0');
+  }
+
+  /** @brief NNTR_MOE_PREFETCH_DIRECT=1: the predicted experts read into
+   *  spare DMA slots; unset follows the ARM prediction (built in). */
+  bool directPrefetch() const {
+    const char *v = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
+    return v != nullptr ? std::strcmp(v, "1") == 0 : predictMode() == 2u;
+  }
+
+  size_t prefetchThreads() const {
+    if (weightPageCachePolicy() >= 0 && !directPrefetch())
       return 0; // Only DMA-slot prefetch uses the selected bounded reader.
-    static const size_t n = [] {
-      const char *v = std::getenv("NNTR_MOE_PREFETCH");
-      return v != nullptr ? std::strtoul(v, nullptr, 10) : size_t(0);
-    }();
-    return n;
+    const char *v = std::getenv("NNTR_MOE_PREFETCH");
+    if (v != nullptr)
+      return std::strtoul(v, nullptr, 10);
+    return directPrefetch() ? htp_fixed::PREFETCH_READERS : 0u;
   }
 
   /** @brief [#282 B] The hint slot, if S1 posted a newer one this token
@@ -3951,18 +3981,10 @@ public:
         setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
       // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
-      if (const char *v = std::getenv("NNTR_HTP_PREDICT")) {
-        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0 &&
-            std::strcmp(v, "2") != 0)
-          throw std::runtime_error(std::string("NNTR_HTP_PREDICT=") + v +
-                                   ": want 0 (off), 1 (DSP), or 2 (ARM)");
-        const uint32_t on = static_cast<uint32_t>(v[0] - '0');
-        if (on == 2u) {
-          const char *direct = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
-          if (!direct || std::strcmp(direct, "1") != 0 || !prefetchThreads())
-            throw std::invalid_argument(
-              "ARM prediction requires direct prefetch and readers");
-        }
+      if (const uint32_t on = predictMode()) {
+        if (on == 2u && (!directPrefetch() || !prefetchThreads()))
+          throw std::invalid_argument(
+            "ARM prediction requires direct prefetch and readers");
         float word;
         std::memcpy(&word, &on, sizeof(word));
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT, &word, 1u,
@@ -4096,7 +4118,13 @@ public:
       // the reference under the variant's name, so it throws.
       const char *queues_env = std::getenv("NNTR_MOE_DMA_QUEUES");
       uint32_t queue_bits = 0;
-      if (htp_moe_opts_dma_queues(queues_env, &queue_bits) != 0) {
+      static_assert(htp_fixed::MOE_DMA_QUEUES >= 1u &&
+                      htp_fixed::MOE_DMA_QUEUES <= 4u,
+                    "the feed splits a matrix over 1..4 queues");
+      const char queues_fixed[] = {
+        static_cast<char>('0' + htp_fixed::MOE_DMA_QUEUES), '\0'};
+      if (htp_moe_opts_dma_queues(queues_env ? queues_env : queues_fixed,
+                                  &queue_bits) != 0) {
         throw std::runtime_error(std::string("NNTR_MOE_DMA_QUEUES=") +
                                  queues_env +
                                  " is not one of 1, 2, 3, 4 (unset = 1)");
@@ -6102,9 +6130,7 @@ private:
                      e.rt_overlap_us / rr, static_cast<double>(e.miss_us) / rr,
                      e.rt_anslat_us / rr, e.rt_rebind_us / rr);
       }
-      const char *direct_prefetch = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
-      if (prefetchThreads() != 0 &&
-          (!direct_prefetch || std::strcmp(direct_prefetch, "1") != 0))
+      if (pf_hints_ != 0 || pf_issued_ != 0) // the hint path ran
         std::fprintf(stderr,
                      "[HTP] token driver: prefetch hints/token=%.2f "
                      "issued/token=%.2f done=%llu useful/token=%.2f\n",
@@ -7656,24 +7682,24 @@ private:
    * DSP miss answer rebinds a consumed slot without a registration RPC.
    */
   void initPoolPrefetch() {
-    const char *enabled = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
-    if (!enabled || std::strcmp(enabled, "1") != 0 || pool_prefetch_)
+    if (!directPrefetch() || pool_prefetch_)
       return;
-    const char *predict = std::getenv("NNTR_HTP_PREDICT");
-    if (!predict ||
-        (std::strcmp(predict, "1") != 0 && std::strcmp(predict, "2") != 0) ||
-        !prefetchThreads())
+    const uint32_t predict = predictMode();
+    if (predict == 0u || !prefetchThreads())
       throw std::invalid_argument(
         "NNTR_MOE_PREFETCH_DIRECT requires NNTR_HTP_PREDICT=1 or 2 and "
         "NNTR_MOE_PREFETCH > 0");
-    if (pool_descs_.empty() || pool_descs_[0].empty())
-      throw std::invalid_argument("Direct prefetch requires virtual experts");
+    if (pool_descs_.empty() || pool_descs_[0].empty()) {
+      if (std::getenv("NNTR_MOE_PREFETCH_DIRECT") != nullptr)
+        throw std::invalid_argument("Direct prefetch requires virtual experts");
+      return; // built-in default on a model without the expert pool
+    }
     // Keep decode worker tuning independent of prefill lookahead.
     size_t readers = prefetchThreads();
     if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
       readers =
         std::max<size_t>(1, std::min<size_t>(8, std::strtoul(v, nullptr, 10)));
-    size_t count = 16;
+    size_t count = htp_fixed::PREFETCH_SLOTS;
     if (const char *v = std::getenv("NNTR_MOE_PREFETCH_SLOTS"))
       count =
         std::max<size_t>(1, std::min<size_t>(32, std::strtoul(v, nullptr, 10)));
@@ -7729,7 +7755,7 @@ private:
         return st.rc == 0;
       });
     pool_prefetch_ = queue;
-    if (std::strcmp(predict, "2") == 0)
+    if (predict == 2u)
       initCpuPredictor(cpus);
     auto predictor = cpu_predictor_;
     // atClose runs before atCloseLast unmaps the arena. Keep the queue alive
@@ -7834,7 +7860,8 @@ private:
           new HtpPrefetchConfidence(prediction_routers_.size(), threshold));
     }
     const char *blend_env = std::getenv("NNTR_MOE_PREFETCH_RESIDUAL");
-    const float blend = blend_env ? std::strtof(blend_env, nullptr) : 0.0f;
+    const float blend = blend_env ? std::strtof(blend_env, nullptr)
+                                  : htp_fixed::PREFETCH_RESIDUAL;
     if (!std::isfinite(blend) || blend < 0 || blend > 1)
       throw std::invalid_argument("Prefetch residual must be in [0, 1]");
     std::shared_ptr<FILE> trace;
