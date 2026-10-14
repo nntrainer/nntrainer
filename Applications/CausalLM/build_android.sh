@@ -34,7 +34,7 @@ ENABLE_QNN=false
 ENABLE_HTP=false
 INSTALL=false
 BUILD_APP=false
-NNTR_THREADS="${NNTR_THREADS:-7}"
+NNTR_THREADS="${NNTR_THREADS:-}"
 ENGINE_ARGS=()
 
 deprecated_option() {
@@ -93,6 +93,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# The HTP path was measured at 8 compute threads (its miss readers and the
+# prefill's CPU stages); the other variants keep 7.
+if [[ -z "$NNTR_THREADS" ]]; then
+    if [[ "$ENABLE_HTP" == true ]]; then NNTR_THREADS=8; else NNTR_THREADS=7; fi
+fi
 if ! [[ "$NNTR_THREADS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --nntr-threads must be a positive integer." >&2
     exit 2
