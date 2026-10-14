@@ -20,6 +20,7 @@
 #include "hvx_expand_i2i4.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
+#include "hvx_hadamard_f32.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scalar.h"
 #include "hvx_scale_add_f32.h"
@@ -624,6 +625,7 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
   float *gu = (float *)malloc(sizeof(float) * 2 * inter);
   float *dn = (float *)malloc(sizeof(float) * N_out);
   float *mid = (float *)malloc(sizeof(float) * inter);
+  float *rotated = (float *)malloc(sizeof(float) * K);
   uint32_t base = 0;
   memset(want, 0, sizeof(float) * M * N_out);
   for (uint32_t e = 0; e < NE; ++e) {
@@ -631,16 +633,26 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
       uint32_t row = ridx[base + i];
       float as;
       int32_t az;
-      quant_row(act + (size_t)row * K, K, aq, &as, &az);
+      const float *src = act + (size_t)row * K;
+      if (glu & HEXKL_MOE_FLAG_HAD_UP) {
+        memcpy(rotated, src, sizeof(float) * K);
+        if (hvx_hadamard_f32(rotated, K, 1u))
+          abort();
+        src = rotated;
+      }
+      quant_row(src, K, aq, &as, &az);
       ref_mm(&wg[e], aq, as, az, gu);
       /** swiglu_det.h: the spec the HVX SwiGLU matches bit for bit, and
          what standin/hvx_scalar.c runs, so the two agree to the bit. */
       for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = glu == HVX_GLU_GELU_TANH
+        mid[j] = (glu & 1u) == HVX_GLU_GELU_TANH
                    ? geglu_det_one(gu[j], gu[inter + j])
                    : swiglu_det_one(gu[j], gu[inter + j]);
       float ms;
       int32_t mz;
+      if (glu & HEXKL_MOE_FLAG_HAD_DOWN)
+        if (hvx_hadamard_f32(mid, inter, 1u))
+          abort();
       quant_row(mid, inter, mq, &ms, &mz);
       ref_mm(&wd[e], mq, ms, mz, dn);
       for (uint32_t c = 0; c < N_out; ++c) {
@@ -657,6 +669,7 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
   free(gu);
   free(dn);
   free(mid);
+  free(rotated);
 }
 
 /* Elements of got outside 1e-5 relative of want; worst gets the largest. */
@@ -1833,7 +1846,104 @@ int main(void) {
     free(want_g);
   }
 
-  /** Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
+  /* Rotation placement, routing reuse, padding, HMX, tails and GEMV.
+   * The reference rotates each expert row independently, intentionally
+   * unlike the shared pre-gather implementation. */
+  /* Prefetch/DMA scheduling is tested above. Disable its diagnostic hook
+   * while comparing the arithmetic on both weight-feed choices. */
+  hvx_scalar_hook.prefetch = NULL;
+  hvx_scalar_hook.gemv = NULL;
+  hvx_scalar_hook.gemv2 = NULL;
+  float *had_gamma = malloc(sizeof(float) * K);
+  float *had_normed = malloc(sizeof(float) * M * K);
+  float *had_original = malloc(sizeof(float) * M * K);
+  memcpy(had_original, act, sizeof(float) * M * K);
+  for (uint32_t j = 0; j < K; ++j)
+    had_gamma[j] = 0.5f + (float)(j % 13u) / 13.0f;
+  hvx_rmsnorm_rows_f32(act, had_normed, M, K, K, had_gamma, 1e-6f, NULL);
+  for (uint32_t norm = 0; norm < 2; ++norm) {
+    scratch.pre_gamma = norm ? had_gamma : NULL;
+    scratch.pre_eps = 1e-6f;
+    const float *had_input = norm ? had_normed : act;
+    for (uint32_t mask = 1u; mask <= 3u; ++mask) {
+      const uint32_t rotation = ((mask & 1u) ? HEXKL_MOE_FLAG_HAD_UP : 0u) |
+                                ((mask & 2u) ? HEXKL_MOE_FLAG_HAD_DOWN : 0u);
+      float *rot_got = malloc(sizeof(float) * M * N_out);
+      float *rot_want = malloc(sizeof(float) * M * N_out);
+      reference_layer(M, K, inter, N_out, NE, wg, wd, had_input, ridx, rc_, rw,
+                      rot_want, HVX_GLU_GELU_TANH | rotation);
+      const int r = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+        ridx, rc_, rw, act, rot_got, NULL, &scratch,
+        HEXKL_MOE_FLAG_GELU_TANH | rotation);
+      double worst_h = 0;
+      uint32_t bad = count_mismatches(rot_got, rot_want, M * N_out, &worst_h);
+      fail |= r != 0 || bad != 0;
+      printf("HADAMARD HMX+TAIL norm=%u mask=%u rc=%d bad=%u worst=%g\n", norm,
+             mask, r, bad, worst_h);
+      const uint32_t rc1[5] = {1, 1, 0, 1, 1};
+      const uint32_t ridx1[4] = {0, 0, 0, 0};
+      const float rw1[4] = {.4f, .3f, .2f, .1f};
+      reference_layer(1, K, inter, N_out, NE, wg, wd, had_input, ridx1, rc1,
+                      rw1, rot_want, HVX_GLU_GELU_TANH | rotation);
+      for (uint32_t feed = 0; feed < 2; ++feed) {
+        const uint32_t flags =
+          HEXKL_MOE_FLAG_GELU_TANH | rotation | HEXKL_MOE_FLAG_M1_GEMV |
+          HEXKL_MOE_FLAG_GEMV_FEED_SET | (feed ? HEXKL_MOE_FLAG_GEMV_FEED : 0u);
+        const int rr = hexkl_mm_u8i4_moe_layer_run(
+          &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K, inter, N_out, NE, hg,
+          hd, ridx1, rc1, rw1, act, rot_got, NULL, &scratch, flags);
+        bad = count_mismatches(rot_got, rot_want, N_out, &worst_h);
+        fail |= rr != 0 || bad != 0;
+        printf("HADAMARD GEMV norm=%u mask=%u feed=%u rc=%d bad=%u\n", norm,
+               mask, feed, rr, bad);
+      }
+      free(rot_got);
+      free(rot_want);
+    }
+    /* A shared 4-bit FFN must retain its original output even when its
+       dimensions are unsupported by the requested HMX rotation. */
+    float *plain = malloc(sizeof(float) * M * N_out);
+    float *scoped = malloc(sizeof(float) * M * N_out);
+    const uint32_t scope_flags =
+      HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN | HEXKL_MOE_FLAG_HAD_HMX |
+      HEXKL_MOE_FLAG_HAD_2BIT_ONLY;
+    const uint32_t one_count[5] = {1, 1, 0, 1, 1};
+    const uint32_t one_index[4] = {0, 0, 0, 0};
+    for (unsigned decode = 0; decode < 2; ++decode) {
+      const uint32_t rows = decode ? 1u : M;
+      const uint32_t *count = decode ? one_count : rc_;
+      const uint32_t *index = decode ? one_index : ridx;
+      const uint32_t flags =
+        HEXKL_MOE_FLAG_GELU_TANH | (decode ? HEXKL_MOE_FLAG_M1_GEMV : 0u);
+      int r = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, rows, K, inter, N_out, NE, hg,
+        hd, index, count, rw, act, plain, NULL, &scratch, flags);
+      r |= hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, rows, K, inter, N_out, NE, hg,
+        hd, index, count, rw, act, scoped, NULL, &scratch, flags | scope_flags);
+      const int same = memcmp(plain, scoped, sizeof(float) * rows * N_out) == 0;
+      fail |= r != 0 || !same;
+      printf("HADAMARD 2bit scope skips 4bit norm=%u M=%u rc=%d same=%d\n",
+             norm, rows, r, same);
+    }
+    free(plain);
+    free(scoped);
+  }
+  scratch.pre_gamma = NULL;
+  fail |= memcmp(had_original, act, sizeof(float) * M * K) != 0;
+  free(had_original);
+  free(had_normed);
+  free(had_gamma);
+  hvx_scalar_hook.prefetch = hook_prefetch;
+  hvx_scalar_hook.gemv = hook_gemv;
+  hvx_scalar_hook.gemv2 = hook_gemv2;
+  if (getenv("MOE_CHECK_HADAMARD_ONLY")) {
+    hexkl_moe_scratch_free(&scratch);
+    return fail;
+  }
+
+  /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
      the host, against the whole call. Only the fp32 addition order may
      differ, so the error is taken against the output's largest magnitude:
      per element, a sum that cancels to near zero reads 3.5e-5 here. */
@@ -1914,6 +2024,88 @@ int main(void) {
     printf("2-bit weight DMA  : %llu KB vs %llu (want <= half)\n", kb2, kb4);
     fail |= (r4 != 0) || (r2 != 0) || (nb != 0) || (kb4 == 0ull) ||
             (kb2 * 2ull > kb4);
+    const uint32_t rotation = HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN;
+    r4 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     K, inter, N_out, NE, hg2, hd2, ridx, rc_,
+                                     rw, act, four, NULL, &sc2, rotation);
+    const int changed = memcmp(four, two, sizeof(float) * M * N_out) != 0;
+    r2 = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     K, inter, N_out, NE, hg2, hd2, ridx, rc_,
+                                     rw, act, two, NULL, &sc2,
+                                     rotation | HEXKL_MOE_FLAG_HAD_2BIT_ONLY);
+    const int same = memcmp(four, two, sizeof(float) * M * N_out) == 0;
+    hg2[0] = 2u * NE; /* A live pair with different bit widths is invalid. */
+    const int mixed = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg2, hd2,
+      ridx, rc_, rw, act, two, NULL, &sc2,
+      rotation | HEXKL_MOE_FLAG_HAD_2BIT_ONLY);
+    fail |= r4 != 0 || r2 != 0 || !changed || !same ||
+            mixed != AEE_EUNSUPPORTED ||
+            memcmp(four, two, sizeof(float) * M * N_out) != 0;
+    printf("HADAMARD 2bit scope rotates experts rc=%d/%d changed=%d same=%d "
+           "mixed=%d\n",
+           r4, r2, changed, same, mixed);
+    hg2[0] = 4u * NE;
+    /* A cache miss splits one token across several kernel calls. Compare
+       each part with a fresh rotation while unrelated calls reuse the
+       ordinary heap scratch. Then change the token at the same address. */
+    {
+      float storage[64 + 31], input[64], original[64], gamma[64];
+      float expected[64], actual[64];
+      hexkl_moe_rotated_input rotated = {0};
+      rotated.row = (float *)(((uintptr_t)storage + 127u) & ~(uintptr_t)127u);
+      rotated.capacity = K;
+      const uint32_t idx[1] = {0};
+      const float weight[1] = {0.75f};
+      const uint32_t flags =
+        rotation | HEXKL_MOE_FLAG_HAD_2BIT_ONLY | HEXKL_MOE_FLAG_M1_GEMV;
+      int reuse_ok = 1;
+      for (uint32_t j = 0; j < K; ++j) {
+        input[j] = act[j];
+        gamma[j] = 0.5f + (float)(j % 13u) / 13.0f;
+      }
+      for (uint32_t token = 0; token < 2u; ++token) {
+        input[0] += 0.25f;
+        memcpy(original, input, sizeof input);
+        rotated.valid = 0u; /* required even when the address is unchanged */
+        for (uint32_t part = 0; part < NE; ++part) {
+          uint32_t cnt[5] = {0};
+          cnt[part] = 1u;
+          /* This intervening call is allowed to overwrite all raw scratch. */
+          sc2.rotated_input = NULL;
+          int r = hexkl_mm_u8i4_moe_layer_run(
+            &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K, inter, N_out, NE,
+            hg2, hd2, idx, cnt, weight, input, expected, NULL, &sc2, flags);
+          sc2.rotated_input = &rotated;
+          r |= hexkl_mm_u8i4_moe_layer_run(
+            &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K, inter, N_out, NE,
+            hg2, hd2, idx, cnt, weight, input, actual, NULL, &sc2, flags);
+          reuse_ok &= r == 0 && rotated.valid &&
+                      memcmp(expected, actual, sizeof actual) == 0 &&
+                      memcmp(original, input, sizeof input) == 0;
+        }
+      }
+      /* Fused RMSNorm must ignore a previously prepared unnormalized row. */
+      const uint32_t cnt[5] = {1, 0, 0, 0, 0};
+      sc2.pre_gamma = gamma;
+      sc2.pre_eps = 1e-6f;
+      sc2.rotated_input = NULL;
+      int r = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K, inter, N_out, NE, hg2,
+        hd2, idx, cnt, weight, input, expected, NULL, &sc2, flags);
+      sc2.rotated_input = &rotated;
+      r |= hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K, inter, N_out, NE, hg2,
+        hd2, idx, cnt, weight, input, actual, NULL, &sc2, flags);
+      reuse_ok &= r == 0 && memcmp(expected, actual, sizeof actual) == 0;
+      sc2.rotated_input = NULL;
+      sc2.pre_gamma = NULL;
+      fail |= !reuse_ok;
+      printf("HADAMARD split-input reuse exact, scratch overwrite, next token, "
+             "RMSNorm bypass: %s\n",
+             reuse_ok ? "PASS" : "FAIL");
+    }
+    hexkl_moe_scratch_free(&sc2);
     free(four);
     free(two);
   }

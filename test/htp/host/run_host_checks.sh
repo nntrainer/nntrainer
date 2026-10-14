@@ -24,6 +24,10 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+"$cc" -std=c99 -O2 -Wall -Wextra -Werror -I "$BACKEND/hvx" \
+  "$HERE/hadamard_check.c" "$BACKEND/hvx/hvx_hadamard_f32.c" -lm \
+  -o "$OUT/hadamard_check"
+"$OUT/hadamard_check"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
   "$HERE/weight_file_reader_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" -o "$OUT/weight_file_reader_check"
 "$OUT/weight_file_reader_check"
@@ -86,7 +90,7 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/moe_layer_host_check"
@@ -94,14 +98,15 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_moe_host_check" \
   "$HERE/tl2_moe_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_moe_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_prefill_host_check" \
   "$HERE/tl2_prefill_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
+  "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_prefill_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
@@ -111,7 +116,8 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/wh_affine_host_check" \
   "$HERE/wh_affine_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" \
   "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" \
   "$BACKEND/hvx/hvx_gemv_u8tl2.c" -Wl,--gc-sections -lm
 "$OUT/wh_affine_host_check"
@@ -134,7 +140,7 @@ for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/'
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$OUT/moe_fc_mutant" \
     "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
-    "$OUT/moe_fc_mutant.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+    "$OUT/moe_fc_mutant.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
     "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
   if MOE_CHECK_FC_WH_ONLY=1 "$OUT/moe_fc_mutant" > "$OUT/moe_fc_mutant.log"; then
     echo "FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
@@ -153,7 +159,7 @@ done
   -o "$OUT/conv_block_host_check" \
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
   "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
+  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
   "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/conv_block_host_check"

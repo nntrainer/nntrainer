@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_M1_GEMV restated for the ARM
  *  side (the DSP header does not compile there): the moe_set_opts bit that
@@ -99,6 +100,58 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
  *  sets it, so its word stays 0x703e1. */
 #define HTP_MOE_FLAG_GEGLU 0x80000u
 
+/** Opt-in online rotations, matching hexkl_mm_u8i4_moe.h. These rotate
+ * activations only: ordinary checkpoints are useful for timing, but their
+ * outputs are not valid until weights have the matching offline rotation.
+ * The app defaults to 2-bit experts; the shared FFN stays unchanged. */
+#define HTP_MOE_FLAG_HAD_UP 0x04000000u
+#define HTP_MOE_FLAG_HAD_DOWN 0x08000000u
+#define HTP_MOE_FLAG_HAD_SCALAR 0x10000000u
+#define HTP_MOE_FLAG_HAD_HMX 0x20000000u
+#define HTP_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
+#define HTP_MOE_FLAG_HAD_MASK 0x7c000000u
+
+/** NNTR_MOE_HADAMARD: unset/off, up, down, both, both_scalar,
+ * up_hmx, down_hmx, both_hmx. HMX uses full-width FP16 on prefill;
+ * calls of at most four tokens and HVX expert tails keep FP32.
+ * Invalid values leave the output untouched and fail instead of silently
+ * benchmarking the baseline. */
+static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
+  if (env == NULL || strcmp(env, "off") == 0)
+    *bits = 0u;
+  else if (strcmp(env, "up") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP;
+  else if (strcmp(env, "down") == 0)
+    *bits = HTP_MOE_FLAG_HAD_DOWN;
+  else if (strcmp(env, "both") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN;
+  else if (strcmp(env, "both_scalar") == 0)
+    *bits =
+      HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_SCALAR;
+  else if (strcmp(env, "up_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_HMX;
+  else if (strcmp(env, "down_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_HMX;
+  else if (strcmp(env, "both_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_HMX;
+  else
+    return -1;
+  return 0;
+}
+
+/** NNTR_MOE_HADAMARD_SCOPE: default/2bit rotates only 2-bit pairs.
+ * all is for kernel experiments; every active width must then be supported.
+ * In particular, PR #4416's shared FFN uses unsupported 1056-wide chunks. */
+static inline int htp_moe_opts_hadamard_scope(const char *env, uint32_t *bits) {
+  if (env == NULL || strcmp(env, "2bit") == 0)
+    *bits = HTP_MOE_FLAG_HAD_2BIT_ONLY;
+  else if (strcmp(env, "all") == 0)
+    *bits = 0u;
+  else
+    return -1;
+  return 0;
+}
+
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
  *  With the GEMV on, all of them. With it off, the tune bits mean nothing
  *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
@@ -109,7 +162,8 @@ static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
   if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
     return ~0u;
   return HTP_MOE_FLAG_M1_GEMV |
-         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU));
+         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU |
+                   HTP_MOE_FLAG_HAD_MASK));
 }
 
 /**

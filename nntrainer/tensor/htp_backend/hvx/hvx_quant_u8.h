@@ -17,6 +17,12 @@
 
 #include "hvx_worker_pool.h"
 
+/** Quantize a row with parameters already computed by a fused epilogue.
+ * k is a positive multiple of 32. dst owns k bytes; pointers may be unaligned.
+ * Uses the same round-to-nearest-even conversion as the AH pack. */
+void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
+                         uint8_t *dst);
+
 /**
  * @brief Computes the per-row scale and zero point (K1).
  *

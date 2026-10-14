@@ -78,6 +78,19 @@ typedef struct {
 int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
                              uint32_t arena_bytes, hexkl_moe_layout *out);
 
+/** @brief One rotated decode input shared by the parts of a single MoE op.
+ * The owner supplies a 128-byte-aligned row of capacity floats, keeps the
+ * source immutable, and clears valid before every logical op/token. This
+ * storage must be independent of hexkl_moe_scratch's growable block. */
+typedef struct {
+  float *row;
+  uint32_t capacity;
+  const float *source;
+  uint32_t width, mode, valid;
+  float scale;
+  int32_t zp;
+} hexkl_moe_rotated_input;
+
 /**
  * @brief The layer call's heap scratch, kept across calls.
  *
@@ -104,6 +117,8 @@ typedef struct {
   int out_heap; /**< out_f32 is cached heap the caller owns alone: the HMX
                      path accumulates straight into it instead of into a
                      copy it then moves */
+  hexkl_moe_rotated_input *rotated_input; /**< borrowed for this call only;
+                                             NULL disables input reuse */
 } hexkl_moe_scratch;
 
 /** @brief Releases the block. Safe on an empty scratch. */
@@ -455,11 +470,28 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
  */
 #define HEXKL_MOE_FLAG_ROWS_OUT 0x2000000u
 
+/** Benchmark-only online rotations: enable only with fixed routing for
+ * timing, or with correspondingly rotated weights. Off by default.
+ * Dense FFN chunks rotate independently; they do not implement a full
+ * rotation across the original, unsplit dense intermediate dimension. */
+#define HEXKL_MOE_FLAG_HAD_UP 0x04000000u
+#define HEXKL_MOE_FLAG_HAD_DOWN 0x08000000u
+#define HEXKL_MOE_FLAG_HAD_SCALAR 0x10000000u
+/** Full-width FP16 HMX on 2816/704 prefill. M <= 4 and HVX expert tails
+ * use full-width FP32; scalar and HMX selectors are mutually exclusive. */
+#define HEXKL_MOE_FLAG_HAD_HMX 0x20000000u
+/** Restrict online rotations to calls consisting of 2-bit weight pairs.
+ * Non-2-bit calls retain their original path; mixed calls are rejected. */
+#define HEXKL_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
-  (HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_LEAD_SET |                     \
-   HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
+  (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |                           \
+   HEXKL_MOE_FLAG_HAD_SCALAR | HEXKL_MOE_FLAG_HAD_HMX |                        \
+   HEXKL_MOE_FLAG_HAD_2BIT_ONLY | HEXKL_MOE_FLAG_M1_GEMV |                     \
+   HEXKL_MOE_FLAG_GEMV_LEAD_SET | HEXKL_MOE_FLAG_GEMV_ROWS1_SET |              \
+   HEXKL_MOE_FLAG_GEMV_FEED_SET |                                              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
    HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH |                      \

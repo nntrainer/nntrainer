@@ -115,6 +115,7 @@ typedef struct {
 static moe_args g_last;
 /* [#267 L3] every call the stand-in ran (refusals not counted) */
 static uint32_t g_kernel_runs;
+static uint32_t g_rotated_fresh, g_rotated_reused;
 
 int hexkl_mm_u8i4_moe_layer_run(
   hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -131,6 +132,22 @@ int hexkl_mm_u8i4_moe_layer_run(
   const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
   if (rows_out && (M != 1u || (flags & HEXKL_MOE_FLAG_M1_GEMV) == 0u))
     return AEE_EUNSUPPORTED;
+  if (scratch && scratch->rotated_input) {
+    hexkl_moe_rotated_input *r = scratch->rotated_input;
+    CHECK(r->row && ((uintptr_t)r->row & 127u) == 0u && r->capacity >= K,
+          "miss round input storage capacity/alignment");
+    if (r->valid) {
+      ++g_rotated_reused;
+      CHECK(r->source == act_f32 && r->width == K && r->row[0] == act_f32[0],
+            "rotated input survived only within this logical MoE op");
+    } else {
+      ++g_rotated_fresh;
+      r->source = act_f32;
+      r->width = K;
+      r->row[0] = act_f32[0];
+      r->valid = 1u;
+    }
+  }
   flags &= ~HEXKL_MOE_FLAG_ROWS_OUT;
   ++g_kernel_runs;
   memset(a, 0, sizeof(*a));
@@ -831,6 +848,8 @@ static int fake_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   uint32_t i;
   int rc = AEE_SUCCESS;
   (void)ctx;
+  CHECK(g_scratch.rotated_input == NULL,
+        "borrowed rotated input escaped a kernel call into the miss wait");
   ++g_owner.waits;
   for (i = 0; rc == AEE_SUCCESS && i < g_owner.n_miss; ++i)
     rc = hexkl_graph_pool_set(g, op, g_owner.miss[i], 3000u + g_owner.miss[i],
@@ -1001,6 +1020,10 @@ static void check_limits(void) {
         memset(&g_owner, 0, sizeof(g_owner));
         g->moe_calls = g->moe_calls_1x = 0u;
         g_kernel_runs = 0u;
+        g_rotated_fresh = g_rotated_reused = 0u;
+        /* Poison the previous logical op's entry at the same slot address. */
+        g->moe_rotated_input.valid = 1u;
+        g->moe_rotated_input.source = NULL;
         routing.n_experts = 128u;
         rc |= (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing,
                                             act, 64u, out, 64u, &resume);
@@ -1012,6 +1035,11 @@ static void check_limits(void) {
                        ? (uint32_t)(first != 0u) + (n_p != 0u) + (n_a != 0u)
                        : (first != 0u) + n_p + n_a;
 #endif
+        CHECK(g_rotated_fresh == 1u && g_rotated_reused == want_calls - 1u &&
+                g_scratch.rotated_input == NULL,
+              "one input preparation per logical MoE op, scoped borrow: "
+              "fresh=%u reused=%u calls=%u",
+              g_rotated_fresh, g_rotated_reused, want_calls);
         CHECK(rc == 0u && memcmp(out, one, sizeof(out)) == 0 &&
                 memcmp(out, ref, sizeof(out)) == 0 && g_owner.posts == 1u &&
                 g_owner.waits == 1u && g_owner.n_miss == n_miss,

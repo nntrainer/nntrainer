@@ -204,6 +204,9 @@ typedef struct hexkl_graph_s {
   /** [plan 201 S1] a miss round's per-expert outputs, top_k x N_out f32
    *  (the widest resident MOE op's), allocated at init */
   float *moe_rows;
+  /** Up/Gate rotation shared across one miss round's kernel calls. Its row
+   * is aligned storage after moe_rows, never retained across MoE ops. */
+  hexkl_moe_rotated_input moe_rotated_input;
   uint8_t route_log[HEXKL_GRAPH_ROUTE_LOG]; /**< cleared by the token driver */
   uint32_t route_log_n;
   /** [#266 S2] HTP_GRAPH_PARAM_PREDICT: 1 = each ROUTER_TOPK op also runs

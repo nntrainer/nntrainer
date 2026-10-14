@@ -86,6 +86,7 @@ if get_option('htp-inproc')
     'hmx/hexkl_mm_u8i4.c',
     'hmx/hexkl_mm_u8i4_dma.c',
     'hmx/hexkl_mm_u8i4_moe.c',
+    'hvx/hvx_hadamard_f32.c',
     'hmx/hexkl_mm_u8i8_dma.c',
     'hmx/hexkl_conv_block.c',
     'hmx/hexkl_graph.c',

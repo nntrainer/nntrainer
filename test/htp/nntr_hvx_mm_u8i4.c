@@ -2218,7 +2218,14 @@ int nntr_hvx_moe_set_opts(remote_handle64 handle, uint32 flags,
   if (!s || !applied) {
     return AEE_EBADPARM;
   }
-  /** Only the bits this skel knows are kept; the echo is how the ARM side
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) &&
+      ((flags & HEXKL_MOE_FLAG_HAD_SCALAR) ||
+       !(flags & (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN))))
+    return AEE_EBADPARM;
+  /* A requested precision must never silently become a different benchmark. */
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) && (!s->hmx_locked || !s->hmx_fp16_rate))
+    return AEE_EUNSUPPORTED;
+  /* Only the bits this skel knows are kept; the echo is how the ARM side
      tells "took" from "ignored by an older skel". Since #113 that covers
      the tune bit and the (lead, rows1) field beside it, so a skel without
      them echoes a different word and the ARM side throws rather than
@@ -2346,4 +2353,29 @@ int nntr_hvx_lm_head_wh_f32(remote_handle64 handle, const uint32 *h, int hLen,
   return hexkl_mm_u8i4_fc_m1_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, (uint32_t)xLen,
     (uint32_t)hLen, h, x, y, s->quant_pool, &s->moe_scratch, s->moe_flags);
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm_timed(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
+  int h_gate_upLen, const uint32 *h_down, int h_downLen,
+  const uint32 *row_index, int row_indexLen, const uint32 *row_count,
+  int row_countLen, const float *row_weight, int row_weightLen,
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len,
+  uint32 *stage_us, int stage_usLen) {
+  if (!stage_us || stage_usLen != MOE_N_STAGES)
+    return AEE_EBADPARM;
+  memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+  hexkl_probe_on = 1;
+  const uint64_t start = hexkl_probe_now();
+  const int rc = moe_layer_norm_impl(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, out_f32, out_f32Len, 0);
+  const uint64_t elapsed = hexkl_probe_now() - start;
+  hexkl_probe_on = 0;
+  moe_fill_stage_us(stage_us, (uint32)elapsed);
+  return rc;
 }

@@ -33,6 +33,39 @@ static void expect(int ok, const char *what) {
 }
 
 int main(void) {
+  {
+    uint32_t scope = 0u;
+    expect(htp_moe_opts_hadamard_scope(NULL, &scope) == 0 &&
+             scope == 0x40000000u &&
+             (htp_moe_opts_must_match(scope) & scope) == scope,
+           "default Hadamard scope is 2-bit and must be echoed");
+    expect(htp_moe_opts_hadamard_scope("2bit", &scope) == 0 &&
+             scope == 0x40000000u,
+           "explicit 2-bit scope");
+    expect(htp_moe_opts_hadamard_scope("all", &scope) == 0 && scope == 0u,
+           "all-weight scope");
+    expect(htp_moe_opts_hadamard_scope("", &scope) == -1 && scope == 0u,
+           "invalid scope is rejected without changing output");
+    const char *names[] = {NULL,     "off",      "up",
+                           "down",   "both",     "both_scalar",
+                           "up_hmx", "down_hmx", "both_hmx"};
+    const uint32_t words[] = {0u,          0u,          0x04000000u,
+                              0x08000000u, 0x0c000000u, 0x1c000000u,
+                              0x24000000u, 0x28000000u, 0x2c000000u};
+    for (size_t i = 0; i < sizeof words / sizeof *words; ++i) {
+      uint32_t bits = 0xdeadu;
+      expect(htp_moe_opts_hadamard(names[i], &bits) == 0 && bits == words[i],
+             "Hadamard option maps to DSP flags");
+      expect((htp_moe_opts_must_match(bits) & bits) == bits,
+             "Hadamard must be echoed even without GEMV");
+    }
+    const char *invalid[] = {"", "0", "1", "Both", "both ", "both-scalar"};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; ++i) {
+      uint32_t bits = 0xdeadu;
+      expect(htp_moe_opts_hadamard(invalid[i], &bits) == -1 && bits == 0xdeadu,
+             "invalid Hadamard option fails without changing flags");
+    }
+  }
   /** The landed default: #113's D192 (bit 0 on, lead 3 x 64 KB in [15:8],
      rows1 in bit 16) under #117's VTCM feed (bit 17), all three tune bits
      set = 0x303e1. FEED=0 is the D192 arena read, 0x103e1. */
