@@ -577,6 +577,8 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/htp_fixed_opts.h
 %{_includedir}/nntrainer/htp_q4_0_convert.h
 %{_includedir}/nntrainer/htp_wh_layout.h
+%{_includedir}/nntrainer/htp_wh_palette.h
+%{_includedir}/nntrainer/htp_backend/hvx/hvx_expand_i2i4.h
 %{_includedir}/nntrainer/swiglu_det.h
 %{_includedir}/nntrainer/int4_utils.h
 %{_includedir}/nntrainer/uint4_tensor.h
@@ -691,6 +693,8 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/context.h
 %{_includedir}/nntrainer/model_features.h
 %{_includedir}/nntrainer/layer_prof.h
+%{_includedir}/nntrainer/fused_llm_properties.h
+%{_includedir}/nntrainer/nntr_htp_decode_hook.h
 %{_includedir}/nntrainer/residency_policy.h
 %{_includedir}/nntrainer/env_compat.h
 %{_includedir}/nntrainer/engine.h
