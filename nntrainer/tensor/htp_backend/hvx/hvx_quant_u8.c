@@ -104,9 +104,6 @@ typedef struct {
   float *pre_scratch; /**< a row a lane */
 } quant_rows_ctx;
 
-static void quant_row_u8_rm(const float *row, uint32_t k, float scale,
-                            int32_t zp, uint8_t *dst);
-
 static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   quant_rows_ctx *ctx = (quant_rows_ctx *)ctx_;
   const uint32_t lo = (uint32_t)((uint64_t)ctx->m_valid * i / n_threads);
@@ -122,8 +119,8 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
       quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp);
     }
     if (ctx->out_rm)
-      quant_row_u8_rm(row, ctx->k, ctx->scale[m], ctx->zp[m],
-                      ctx->out_rm + (size_t)m * ctx->k);
+      hvx_quant_row_u8_rm(row, ctx->k, ctx->scale[m], ctx->zp[m],
+                          ctx->out_rm + (size_t)m * ctx->k);
   }
 }
 
@@ -235,8 +232,8 @@ static inline void quant_pack_group4(const float *const src[4],
 /** @brief One row quantized row-major: quant_pack_group4 over four
  *         consecutive 32-float runs of the row instead of one run of four
  *         rows, so each element is the byte the AH pack writes for it. */
-static void quant_row_u8_rm(const float *row, uint32_t k, float scale,
-                            int32_t zp, uint8_t *dst) {
+void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
+                         uint8_t *dst) {
   const HVX_Vector v1 = hvx_splat_sf(1.0f / scale);
   const HVX_Vector z1 = Q6_V_vsplat_R(zp);
   const HVX_Vector vinv[4] = {v1, v1, v1, v1};

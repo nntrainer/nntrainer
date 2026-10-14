@@ -4526,10 +4526,25 @@ public:
                                  queues_env +
                                  " is not one of 1, 2, 3, 4 (unset = 1)");
       }
+      const char *had_env = std::getenv("NNTR_MOE_HADAMARD");
+      const char *had_scope = std::getenv("NNTR_MOE_HADAMARD_SCOPE");
+      uint32_t had_scope_bits = 0;
+      if (htp_moe_opts_hadamard_scope(had_scope, &had_scope_bits) != 0)
+        throw std::runtime_error(std::string("NNTR_MOE_HADAMARD_SCOPE=") +
+                                 had_scope + " is not 2bit or all");
+      uint32_t had_bits = 0;
+      if (htp_moe_opts_hadamard(had_env, &had_bits) != 0) {
+        throw std::runtime_error(
+          std::string("NNTR_MOE_HADAMARD=") + had_env +
+          " is not off, up, down, both, both_scalar, up_hmx, "
+          "down_hmx, both_hmx");
+      }
+      if (had_bits)
+        had_bits |= had_scope_bits;
       const uint32_t flags =
         htp_moe_opts_flags(env, lead_env, rows1_env, feed_env) |
         htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS")) |
-        queue_bits | (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
+        queue_bits | had_bits | (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
       const char *source = env != nullptr ? "env" : "default";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
@@ -4556,8 +4571,9 @@ public:
                       static_cast<unsigned>(err), flags, applied);
         throw std::runtime_error(
           std::string(buf) +
-          " (libnntr_hvx_skel.so on the device predates moe_set_opts; "
-          "rebuild it: test/htp/build.sh, then push libnntr_hvx_skel.so)");
+          " (DSP skel or hardware did not accept the requested options; "
+          "rebuild/push libnntr_hvx_skel.so with test/htp/build.sh and "
+          "check FP16 HMX support when requesting *_hmx)");
       }
       // The measured (loop, lead, feed) cell, in the same line. All three
       // knobs are always sent (htp_moe_opts_flags: the env's value or the
@@ -4577,6 +4593,12 @@ public:
         htp_moe_opts_feed_name(flags),
         (applied & HTP_MOE_FLAG_DMA_BYPASS) != 0u ? 1u : 0u,
         htp_moe_opts_dma_q(applied), source);
+      if (had_bits)
+        std::fprintf(stderr,
+                     "[HTP] online Hadamard=%s scope=%s applied=0x%x; matching "
+                     "offline weight rotation required for valid outputs\n",
+                     had_env, had_scope ? had_scope : "2bit",
+                     applied & HTP_MOE_FLAG_HAD_MASK);
     });
   }
 

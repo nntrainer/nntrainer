@@ -64,6 +64,10 @@
 #include "hvx_expand_i2i4.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
+#include "hvx_hadamard_f32.h"
+#if defined(__hexagon__)
+#include "hexkl_hadamard_f16.h"
+#endif
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scale_add_f32.h"
@@ -660,7 +664,8 @@ typedef struct {
   uint32_t n_rows_b;
   /* the next block's requantization; gate NULL when there is none */
   float *gate; /**< [64 x inter] f32, VTCM */
-  uint32_t rq_m_blk, inter;
+  uint32_t rq_m_blk, inter, had_down;
+  uint8_t *had_vb;
   float *rq_scale; /**< 64 each, the params the next down dequantizes with */
   int32_t *rq_zp;
   uint8_t *mid; /**< the mid buffer it packs into */
@@ -727,6 +732,14 @@ static void moe_dn_unit(uint32_t n_units, uint32_t u, void *vctx) {
   moe_worker_probe_add(t0);
 }
 
+/** Rotate complete rows after GeGLU, before scale/zero-point selection.
+ * Already on the owning worker: no extra dispatch, allocation or RPC. */
+static void moe_rotate_rows(float *x, uint32_t rows, uint32_t width,
+                            uint32_t mode) {
+  if (mode)
+    (void)hvx_hadamard_rows_f32(x, rows, width, mode == 3u ? 2u : mode);
+}
+
 /** @brief Requantize independent row groups into the next block's mid. */
 static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_dn_ctx *c = (moe_dn_ctx *)vctx;
@@ -751,10 +764,32 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
         memset(x + (size_t)valid * c->inter, 0,
                sizeof(float) * (size_t)(r1 - r0 - valid) * c->inter);
       }
-      hvx_quant_rows_u8_params(x, valid, r1 - r0, c->inter, c->rq_scale + r0,
-                               c->rq_zp + r0, NULL);
+#if defined(__hexagon__)
+      if (c->had_down == 3u) {
+        had_hmx_ctx hc = {
+          c->had_vb, c->gate,     c->rq_m_blk, 704u, (c->rq_m_blk + 1u) / 2u,
+          1u,        c->rq_scale, c->rq_zp,    NULL, 0u,
+          NULL,      0.0f,        c->gate};
+        for (uint32_t g = r0 / 2u; g < (r0 + valid + 1u) / 2u; ++g)
+          had_hmx_store_group(&hc, g, c->gate + (size_t)g * 2u * 704u);
+      } else
+#endif
+        moe_rotate_rows(x, valid, c->inter, c->had_down);
+      if (c->had_down != 3u)
+        hvx_quant_rows_u8_params(x, valid, r1 - r0, c->inter, c->rq_scale + r0,
+                                 c->rq_zp + r0, NULL);
+      else
+        for (uint32_t r = r0 + valid; r < r1; ++r) {
+          c->rq_scale[r] = 1.0f;
+          c->rq_zp[r] = 0;
+        }
       hvx_quant_pack_u8_ah_rows(c->gate, NULL, r0, r1, c->inter, c->rq_scale,
                                 c->rq_zp, c->mid);
+#if defined(__hexagon__)
+      if (c->had_down == 3u)
+        for (uint32_t r = r0; r < r0 + valid; ++r)
+          c->rq_scale[r] *= HAD_HMX_POST_SCALE;
+#endif
     }
   }
   moe_worker_probe_add(t0);
@@ -783,6 +818,8 @@ typedef struct {
   uint32_t acc_i24; /**< Three byte planes in this job's ring tiles. */
   const int32_t *affine_offset;
   int32_t affine_sums[HEXKL_HMX_INT8_BLOCK_N_ROW];
+  uint8_t *had_vb; /**< set: pack this slice's GeGLU rows as the HMX
+                        Hadamard's fp16 input (had_down == 3) */
 } moe_gu_ctx;
 
 static void moe_gu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
@@ -796,6 +833,36 @@ static void moe_gu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
                          c->affine_sums);
   else
     hvx_dq_swiglu_worker(n_threads, i, &c->dq);
+#if defined(__hexagon__)
+  if (c->had_vb) {
+    const hvx_dq_swiglu_job *dq = &c->dq;
+    const uint32_t lo = dq->n_pairs * i / n_threads,
+                   hi = dq->n_pairs * (i + 1) / n_threads;
+    const HVX_VectorPred low = Q6_Q_vsetq_R(64);
+    const HVX_Vector one = hvx_splat_sf(1.0f);
+    for (uint32_t j = lo; j < hi; ++j) {
+      const uint32_t col = dq->g0 + j;
+      for (uint32_t m = 0; m < dq->m_count; m += 2) {
+        const HVX_Vector a =
+          hvx_tile_load_u(dq->dst + (size_t)m * dq->inter + col * 32u);
+        const HVX_Vector b =
+          m + 1 < dq->m_count
+            ? hvx_tile_load_u(dq->dst + (size_t)(m + 1) * dq->inter + col * 32u)
+            : Q6_V_vzero();
+        const HVX_Vector e = Q6_V_vmux_QVV(low, a, Q6_V_vror_VR(b, 64));
+        const HVX_Vector o = Q6_V_vmux_QVV(low, Q6_V_vror_VR(a, 64), b);
+        HVX_Vector *dst = (HVX_Vector *)(c->had_vb + HAD_HMX_DATA +
+                                         (m / 2) * 4096 + (col / 16) * 2048);
+        const HVX_Vector q0 = Q6_Vqf32_vmpy_VsfVsf(e, one),
+                         q1 = Q6_Vqf32_vmpy_VsfVsf(o, one);
+        dst[col % 16] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
+        if (col == 21u)
+          for (uint32_t z = 6; z < 16; ++z)
+            dst[z] = Q6_V_vzero();
+      }
+    }
+  }
+#endif
   moe_worker_probe_add(t0);
 }
 
@@ -852,7 +919,7 @@ typedef struct {
   const int32_t *act_zp;
   float *res; /**< this tail's m x N_out, read by its expert's scatter */
   uint32_t m, k_tiles, inter, inter_ktiles, inter_ntiles, gu_ntiles, dn_ntiles,
-    N_out, act;
+    N_out, act, had_down;
 } moe_tail_ctx;
 
 /** @brief Worker time spent inside this kernel's pool jobs -- the gate_up
@@ -914,6 +981,7 @@ static void moe_tail_requant_unit(uint32_t n_units, uint32_t u, void *v) {
     memset(sh->gate_f32 + (size_t)t->m * t->inter, 0,
            sizeof(float) * (size_t)(m4 - t->m) * t->inter);
   }
+  moe_rotate_rows(sh->gate_f32, t->m, t->inter, t->had_down);
   hvx_quant_rows_u8_params(sh->gate_f32, t->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
                            t->inter, sh->rq_scale, sh->rq_zp, NULL);
   hvx_quant_pack_u8_ah_rows(sh->gate_f32, NULL, 0u, m4, t->inter, sh->rq_scale,
@@ -1132,6 +1200,7 @@ typedef struct {
       join. Unit numbering stays global (expert = u / per). */
   uint32_t u_lo, u_hi;
   uint32_t act; /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
+  uint32_t had_down;
 } moe_m1_ctx;
 
 /** Pure ternary already has the source magnitude; only legacy int4 needs 7. */
@@ -1393,6 +1462,7 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
       memset(e->gate_f32 + (size_t)e->m * c->inter, 0,
              sizeof(float) * (size_t)(m4 - e->m) * c->inter);
     }
+    moe_rotate_rows(e->gate_f32, e->m, c->inter, c->had_down);
     hvx_quant_rows_u8_params(e->gate_f32, e->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
                              c->inter, e->rq_scale, e->rq_zp, NULL);
     hvx_quant_pack_u8_ah_rows(e->gate_f32, NULL, 0u, m4, c->inter, e->rq_scale,
@@ -1890,6 +1960,37 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
   return AEE_SUCCESS;
 }
 
+/** Input rotation is per token, before expert gathering. Prefill fuses
+ * RMSNorm, rotation, min/max and quantization on the same worker scratch.
+ * Decode keeps the rotated row for the existing AH pack and shares it
+ * across all experts in this call. */
+typedef struct {
+  const float *x, *gamma;
+  float *cached, *scratch, *scale;
+  int32_t *zp;
+  uint8_t *u8;
+  uint32_t M, K, mode;
+  float eps;
+} moe_rotate_input_ctx;
+
+static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
+  const moe_rotate_input_ctx *c = v;
+  for (uint32_t m = c->M * id / threads; m < c->M * (id + 1u) / threads; ++m) {
+    const float *src = c->x + (size_t)m * c->K;
+    float *row = c->scratch ? c->scratch + (size_t)id * c->K
+                            : c->cached + (size_t)m * c->K;
+    if (c->gamma)
+      hvx_rmsnorm_row_f32(src, row, c->gamma, c->K, c->eps);
+    else if (row != src)
+      memcpy(row, src, (size_t)c->K * sizeof(float));
+    if (c->mode)
+      (void)hvx_hadamard_f32(row, c->K, c->mode);
+    hvx_quant_rows_u8_params_rm(row, 1u, 1u, c->K, c->scale + m, c->zp + m,
+                                c->u8 ? c->u8 + (size_t)m * c->K : NULL, NULL,
+                                0.0f, NULL, NULL);
+  }
+}
+
 int hexkl_mm_u8i4_moe_layer_run(
   hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
@@ -1905,8 +2006,67 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t act =
     (flags & HEXKL_MOE_FLAG_GELU_TANH) != 0u ? HVX_GLU_GELU_TANH : HVX_GLU_SILU;
 
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) &&
+      ((flags & HEXKL_MOE_FLAG_HAD_SCALAR) ||
+       !(flags & (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN))))
+    return AEE_EBADPARM;
+
+  /* Shared FFNs use this same entry, including their load-time warm-up.
+     Resolve the explicit scope before width checks and VTCM reservation.
+     Inspect only live pairs: graph tables include inactive/missing handles. */
+  if (flags & HEXKL_MOE_FLAG_HAD_2BIT_ONLY) {
+    uint32_t have_2bit = 0u, have_other = 0u;
+    for (uint32_t e = 0; e < n_experts; ++e) {
+      if (!row_count[e])
+        continue;
+      if (h_gate_up[e] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+          h_down[e] >= HEXKL_MM_U8I4_MAX_WEIGHTS)
+        return AEE_EBADPARM;
+      const hexkl_weight_u8i4 *g = &tbl->slots[h_gate_up[e]];
+      const hexkl_weight_u8i4 *d = &tbl->slots[h_down[e]];
+      if (!g->in_use || !d->in_use)
+        return AEE_EBADPARM;
+      if (g->bits == 2u && d->bits == 2u)
+        have_2bit = 1u;
+      else if (g->bits != 2u && d->bits != 2u)
+        have_other = 1u;
+      else
+        return AEE_EUNSUPPORTED;
+    }
+    if (have_2bit && have_other)
+      return AEE_EUNSUPPORTED;
+    if (!have_2bit)
+      flags &= ~(HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |
+                 HEXKL_MOE_FLAG_HAD_SCALAR | HEXKL_MOE_FLAG_HAD_HMX);
+  }
+
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) && (K != 2816u || inter != 704u))
+    return AEE_EUNSUPPORTED;
+  int use_had_hmx = 0;
+#if defined(__hexagon__)
+  use_had_hmx =
+    (flags & HEXKL_MOE_FLAG_HAD_HMX) && M > 4u && K == 2816u && inter == 704u;
+#endif
+  const uint32_t had_mode = (flags & HEXKL_MOE_FLAG_HAD_SCALAR) ? 1u
+                            : use_had_hmx                       ? 3u
+                                                                : 2u;
+  const uint32_t had_up = (flags & HEXKL_MOE_FLAG_HAD_UP) ? had_mode : 0u;
+  const uint32_t had_down = (flags & HEXKL_MOE_FLAG_HAD_DOWN) ? had_mode : 0u;
+  if ((had_up && !hvx_hadamard_supported(K)) ||
+      (had_down && !hvx_hadamard_supported(inter)))
+    return AEE_EUNSUPPORTED;
+
   g_moe_src_bypass = (flags & HEXKL_MOE_FLAG_DMA_BYPASS) != 0u;
-  const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
+  uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
+#if defined(__hexagon__)
+  uint8_t *had_vb = NULL;
+  if (use_had_hmx) {
+    if (arena < HAD_HMX_SPACE)
+      return AEE_ENOMEMORY;
+    arena = (arena - HAD_HMX_SPACE) & ~2047u;
+    had_vb = vtcm_base + arena;
+  }
+#endif
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, arena, &L);
   if (rc != AEE_SUCCESS) {
@@ -2149,11 +2309,23 @@ int hexkl_mm_u8i4_moe_layer_run(
      scan norms is read once, where it is, and a heap out_f32 needs no
      copy to scatter into. */
   const float *pre_gamma = scratch->pre_gamma;
+  hexkl_moe_rotated_input *rotated = scratch->rotated_input;
+  /* The native TL2 GEMV takes its dense u8 row from the scan (act_ah), which
+     a reused rotation skips: such a call rotates again (one HVX row, the
+     same bytes) instead of carrying the row over. */
+  if (!use_m1 || M != 1u || !had_up || pre_gamma != NULL || rotated == NULL ||
+      rotated->row == NULL || rotated->capacity < K || use_tl2) {
+    rotated = NULL;
+  }
+  const int reuse_rotated = rotated && rotated->valid &&
+                            rotated->source == act_f32 && rotated->width == K &&
+                            rotated->mode == had_up;
 #ifdef HEXKL_MOE_NO_DIRECT /* diagnosis: the copied paths for every call */
   const int act_direct = 0;
   const int out_direct = 0;
 #else
-  const int act_direct = pre_gamma != NULL && !use_m1;
+  const int act_direct =
+    (pre_gamma != NULL && !use_m1) || (use_had_hmx && had_up);
   const int out_direct = scratch->out_heap && !use_m1;
 #endif
   const size_t sz_act_c = act_direct ? 0u : sizeof(float) * (size_t)M * K;
@@ -2238,6 +2410,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *scale_all = (float *)hexkl_moe_carve(&cur, sz_mpad_u32);
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_u32);
   float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
+  if (rotated)
+    act_c = rotated->row;
   float *out_c =
     out_direct ? out_f32 : (float *)hexkl_moe_carve(&cur, sz_out_c);
   float *pre_rows = (float *)hexkl_moe_carve(&cur, sz_pre);
@@ -2313,8 +2487,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   if (hexkl_probe_on) {
     hexkl_dma_trace_reset(hexkl_probe_now_ticks());
   }
-  if (act_direct) {
-    /* the scan reads act_f32 */
+  if (act_direct || reuse_rotated) {
+    /* The scan reads act_f32, or this op already rotated the same row. */
   } else if (pre_gamma) {
     if (hvx_rmsnorm_rows_f32(act_f32, act_c, M, K, K, pre_gamma,
                              scratch->pre_eps, pool) != 0) {
@@ -2344,6 +2518,13 @@ int hexkl_mm_u8i4_moe_layer_run(
     goto out;
   }
 
+#if defined(__hexagon__)
+  if (use_had_hmx) {
+    rc = had_hmx_init(had_vb);
+    if (rc != 0)
+      goto out;
+  }
+#endif
   /** The first expert's gate_up goes out before the quantization, not after
      it: nothing in the scan or the pack needs VTCM's weight region, and a
      3.5 MB transfer that used to be the one wait with nothing to hide
@@ -2394,10 +2575,52 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** The scan is per source row and independent of where a row ends up, so
      it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
-  hvx_quant_rows_u8_params_rm(act_direct ? act_f32 : act_c, M, m_pad, K,
-                              scale_all, zp_all, use_tl2 ? act_ah : act_u8,
-                              act_direct ? pre_gamma : NULL, scratch->pre_eps,
-                              pre_rows, gu0_async ? NULL : pool);
+  if (reuse_rotated) {
+    scale_all[0] = rotated->scale;
+    zp_all[0] = rotated->zp;
+    for (uint32_t m = M; m < m_pad; ++m) {
+      scale_all[m] = 1.0f;
+      zp_all[m] = 0;
+    }
+  } else if (had_up) {
+#if defined(__hexagon__)
+    if (had_up == 3u)
+      had_hmx_rows(had_vb, act_f32, M, K, pool, scale_all, zp_all,
+                   use_tl2 ? act_ah : act_u8, pre_gamma, scratch->pre_eps,
+                   NULL);
+#endif
+    for (uint32_t m = M; m < m_pad; ++m) {
+      scale_all[m] = 1.0f;
+      zp_all[m] = 0;
+    }
+    moe_rotate_input_ctx ctx = {act_direct ? act_f32 : act_c,
+                                act_direct ? pre_gamma : NULL,
+                                act_c,
+                                act_direct ? pre_rows : NULL,
+                                scale_all,
+                                zp_all,
+                                use_tl2 ? act_ah : act_u8,
+                                M,
+                                K,
+                                had_up == 3u ? 0u : had_up,
+                                scratch->pre_eps};
+    if (had_up != 3u)
+      hvx_worker_pool_run(gu0_async ? NULL : pool, moe_rotate_input_worker,
+                          &ctx, M);
+    if (rotated) {
+      rotated->source = act_f32;
+      rotated->width = K;
+      rotated->mode = had_up;
+      rotated->scale = scale_all[0];
+      rotated->zp = zp_all[0];
+      rotated->valid = 1u;
+    }
+  } else {
+    hvx_quant_rows_u8_params_rm(act_direct ? act_f32 : act_c, M, m_pad, K,
+                                scale_all, zp_all, use_tl2 ? act_ah : act_u8,
+                                act_direct ? pre_gamma : NULL, scratch->pre_eps,
+                                pre_rows, gu0_async ? NULL : pool);
+  }
 
   /** Slot order: every active expert's rows, each expert padded up to a
      whole 64-row block. Padding slots repeat row 0 -- their accumulator
@@ -2469,6 +2692,11 @@ int hexkl_mm_u8i4_moe_layer_run(
           hvx_quant_pack_u8_ah_m1_repeat(act_c, K, slot_scale[sb], slot_zp[sb],
                                          act_ah);
         x->act_ah = act_ah;
+      } else if (i != 0u && M == 1u && widest == 1u) {
+        /* With one token, every live expert consumes the same quantized
+           input (rotated or not): share expert 0's read-only AH tile.
+           Multi-token calls keep the gather for distinct rows. */
+        x->act_ah = m1.ex[0].act_ah;
       } else {
         hvx_quant_pack_u8_ah_rows(act_c, slot_row + sb, 0u, row_count[e], K,
                                   slot_scale + sb, slot_zp + sb,
@@ -2536,6 +2764,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     m1.rows1 = hexkl_moe_flags_rows1(flags);
     m1.feed = m1_feed ? 1u : 0u;
     m1.act = act;
+    m1.had_down = had_down;
     HEXKL_PROBE_COUNT(HEXKL_PROBE_M1_FEED, m1_feed ? m1q.nq_used : 0u);
 
     /** MM is the wall of the two GEMV stages on the caller; SWIGLU their
@@ -2751,6 +2980,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     tc->dn_ntiles = dn_ntiles;
     tc->N_out = N_out;
     tc->act = act;
+    tc->had_down = had_down;
     hvx_bg_job *jb = &jobs[1u + 3u * t];
     uint8_t *dn = tail_done + (size_t)t * (inter_ntiles + 1u + dn_ntiles);
     jb[0].func = moe_tail_pair_unit;
@@ -3081,6 +3311,11 @@ int hexkl_mm_u8i4_moe_layer_run(
           if (g->w_offset)
             memcpy(gj->affine_sums, gu_affine_sums,
                    blk.m_blk * sizeof(int32_t));
+          gj->had_vb = NULL;
+#if defined(__hexagon__)
+          if (had_down == 3u)
+            gj->had_vb = had_vb;
+#endif
           jb->tiles_base =
             (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                               acc->base);
@@ -3142,9 +3377,20 @@ int hexkl_mm_u8i4_moe_layer_run(
       rq0.gate = gate;
       rq0.rq_m_blk = blk.m_blk;
       rq0.inter = inter;
+      rq0.had_down = had_down;
       rq0.rq_scale = rq_scale;
       rq0.rq_zp = rq_zp;
       rq0.mid = vtcm_base + L.mid_off;
+#if defined(__hexagon__)
+      if (had_down == 3u) {
+        had_hmx_ctx hc = {had_vb, gate, blk.m_blk, 704u, (blk.m_blk + 1u) / 2u,
+                          0u,     NULL, NULL,      NULL, 0u,
+                          NULL,   0.0f, gate};
+        for (uint32_t g = 0; g < hc.groups; ++g)
+          had_hmx_compute_group(&hc, g);
+        rq0.had_vb = had_vb;
+      }
+#endif
       hvx_worker_pool_submit(pool, moe_dn_worker, &rq0, MOE_RQ_UNITS);
     } else {
       /* --- down of block n-1 ------------------------------------------ */
@@ -3282,9 +3528,21 @@ int hexkl_mm_u8i4_moe_layer_run(
           q->gate = gate;
           q->rq_m_blk = blk.m_blk;
           q->inter = inter;
+          q->had_down = had_down;
           q->rq_scale = rq_scale + (n & 1u) * BR;
           q->rq_zp = rq_zp + (n & 1u) * BR;
           q->mid = vtcm_base + L.mid_off + (n & 1u) * mid_bytes;
+#if defined(__hexagon__)
+          if (had_down == 3u) {
+            had_hmx_ctx hc = {
+              had_vb, gate, blk.m_blk, 704u, (blk.m_blk + 1u) / 2u,
+              0u,     NULL, NULL,      NULL, 0u,
+              NULL,   0.0f, gate};
+            for (uint32_t g = 0; g < hc.groups; ++g)
+              had_hmx_compute_group(&hc, g);
+            q->had_vb = had_vb;
+          }
+#endif
           if (!fuse_dn_rq)
             hvx_worker_pool_submit(pool, moe_dn_worker, q, MOE_RQ_UNITS);
         }

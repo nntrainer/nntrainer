@@ -132,11 +132,18 @@ static int graph_moe_run(hexkl_graph *g, const hexkl_graph_env *env,
   for (i = 0; i < n; ++i) {
     cnt[ids[i]] = 1u;
   }
+  if (env->scratch == NULL) {
+    return AEE_EBADPARM;
+  }
   ++g->moe_calls;
-  return hexkl_mm_u8i4_moe_layer_run(
+  hexkl_moe_rotated_input *saved = env->scratch->rotated_input;
+  env->scratch->rotated_input = &g->moe_rotated_input;
+  const int rc = hexkl_mm_u8i4_moe_layer_run(
     env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K, op->N,
     op->N_out, op->n_experts, h, h + op->n_experts, idx, cnt, w, in, out,
     env->pool, env->scratch, env->moe_flags | extra);
+  env->scratch->rotated_input = saved;
+  return rc;
 }
 
 /** [#267 L3] The n experts ids[] / w[] (ascending), each into its own row
@@ -302,6 +309,9 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
     }
   }
   call->routing.n_experts = 0u; /* consumed */
+  /* A graph slot can keep its address while its contents change. Never
+     carry a rotated row to another MoE op or token, even at that address. */
+  g->moe_rotated_input.valid = 0u;
   /* [plan 201 S1] the token's routed set, for the pool's recency */
   if (g->route_log_n + 1u + sum <= HEXKL_GRAPH_ROUTE_LOG) {
     g->route_log[g->route_log_n++] = (uint8_t)sum;
@@ -922,7 +932,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
                      hexkl_graph **out) {
   uint32_t n_ops = 0, i, slot_words = 0, ffn_n = 0;
-  uint32_t q4m1_ops = 0, vocab_out = 0, moe_rows = 0;
+  uint32_t q4m1_ops = 0, vocab_out = 0, moe_rows = 0, moe_input = 0;
   hexkl_graph *g;
   int rc;
   if (out == NULL || tbl == NULL) {
@@ -954,6 +964,9 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     if (op->kind == HTP_OP_MOE && op->top_k * op->N_out > moe_rows) {
       moe_rows = op->top_k * op->N_out; /* the miss round's rows */
     }
+    if (op->kind == HTP_OP_MOE && op->K > moe_input) {
+      moe_input = op->K;
+    }
     if (htp_graph_op_in_words(op) > slot_words) {
       slot_words = htp_graph_op_in_words(op);
     }
@@ -970,11 +983,16 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   }
   g->tbl = tbl;
   if (moe_rows != 0u) {
-    g->moe_rows = (float *)malloc((size_t)moe_rows * sizeof(float));
+    g->moe_rows =
+      (float *)malloc(((size_t)moe_rows + 31u + moe_input) * sizeof(float));
     if (g->moe_rows == NULL) {
       free(g);
       return AEE_ENOMEMORY;
     }
+    g->moe_rotated_input.row =
+      (float *)(((uintptr_t)(g->moe_rows + moe_rows) + 127u) &
+                ~(uintptr_t)127u);
+    g->moe_rotated_input.capacity = moe_input;
   }
   g->n_layers = words[2];
   g->n_ops = n_ops;

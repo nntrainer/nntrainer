@@ -1423,4 +1423,25 @@ interface nntr_hvx : remote_handle64 {
       in sequence<uint32> arena, in sequence<uint32> off_gu,
       in sequence<uint32> off_dn, rout sequence<uint32> h_gu,
       rout sequence<uint32> h_dn, rout uint32 n_done, rout int32 err);
+   // Debug-only full normalized Hadamard (1 scalar, 2 HVX FP32, 3 HMX FP16).
+   // Mode 3 requires FP16 HMX and width 704 or 2816.
+   // stats is the total 19.2-MHz ticks, low/high words; copies excluded.
+   AEEResult hadamard_probe(in uint32 rows, in uint32 width, in uint32 mode,
+                            in uint32 passes, in sequence<float> input,
+                            rout sequence<float> output,
+                            rout sequence<uint32> stats);
+   // Timing companion for the fused pre/post RMSNorm MoE path.
+   AEEResult mm_u8i4_moe_layer_norm_timed(in uint32 M, in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 act,
+                                    in float eps,
+                                    in sequence<float> pre_gamma,
+                                    in sequence<float> post_gamma,
+                                    in sequence<uint32> h_gate_up,
+                                    in sequence<uint32> h_down,
+                                    in sequence<uint32> row_index,
+                                    in sequence<uint32> row_count,
+                                    in sequence<float> row_weight,
+                                    in sequence<float> act_f32,
+                                    rout sequence<float> out_f32,
+                                    rout sequence<uint32> stage_us);
 };
