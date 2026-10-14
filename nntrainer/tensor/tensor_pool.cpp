@@ -14,9 +14,9 @@
  * @todo   check before allocate that finalize is done
  */
 
-#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
 #include <residency_planner.h>

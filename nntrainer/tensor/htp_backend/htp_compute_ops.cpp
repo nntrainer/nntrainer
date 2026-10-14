@@ -49,10 +49,10 @@
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
 #include <htp_backend.h>
-#include <htp_fixed_opts.h>
 #include <htp_context.h>
 #include <htp_dspq_wire.h>
 #include <htp_expert_prefetch.h>
+#include <htp_fixed_opts.h>
 #include <htp_graph_desc.h>
 #include <htp_moe_opts.h>
 #include <htp_prepared_tl2.h>

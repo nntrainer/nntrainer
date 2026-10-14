@@ -10,11 +10,11 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <set>
-#include <cstring>
 
 #include <app_context.h>
 #include <engine.h>
@@ -30,14 +30,14 @@
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
 #include <htp_wh_layout.h>
-#include <lm_head.h>
 #include <lfm2_moe_layer.h>
 #include <lfm2_moe_pool_layer.h>
+#include <lm_head.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
-#include <weight_file_reader.h>
 #include <rms_norm.h>
 #include <swiglu_layer.h>
+#include <weight_file_reader.h>
 
 namespace causallm {
 namespace {

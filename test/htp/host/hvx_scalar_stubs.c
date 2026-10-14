@@ -467,7 +467,7 @@ static void norm_add_row(float *out, const float *res, const float *x,
   }
 }
 
-/* [P3] norm_add_row split over the FC epilogue's column batches: the
+/** [P3] norm_add_row split over the FC epilogue's column batches: the
    running sum of squares in acc[0] (the same sequential float adds),
    the finish norm_add_row's second loop. So the whole-row pass and the
    batched one give the same floats here, which is what

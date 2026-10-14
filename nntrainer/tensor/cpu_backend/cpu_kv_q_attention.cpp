@@ -42,6 +42,17 @@
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
 #define CPU_KV_Q_UDOT 1
+#if defined(__GNUC__) && !defined(__clang__)
+/** meson.build defines __ARM_FEATURE_DOTPROD on every non-Android aarch64
+ * build (the KleidiAI kernels require it; they encode their instructions
+ * with .inst). A packaging environment can still hand GCC a generic
+ * -march after the project's (Tizen GBS: armv8-a), and then GCC's
+ * arm_neon.h refuses to inline vdotq_laneq_u32 ("target specific option
+ * mismatch"). Compile this file for armv8-a+dotprod regardless of the
+ * global -march: like the KleidiAI kernels, it is dispatched on the
+ * assumption that the aarch64 device runs dot-product instructions. */
+#pragma GCC target("+dotprod")
+#endif
 #endif
 
 namespace nntrainer {

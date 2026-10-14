@@ -2673,8 +2673,12 @@ TEST(SwigluCpuOrder, MatchesNeon) {
  *        copy of buildExpertAssignments' code (bionic expf, divides).
  */
 TEST(SgemvNCpuOrder, MatchesRouter) {
-#if !defined(__aarch64__)
-  GTEST_SKIP() << "the spec is the aarch64 order";
+#if !defined(__aarch64__) || defined(_WIN32)
+  // The spec is the order of the Android aarch64 OpenBLAS sgemv_n. The
+  // Windows ARM64 build links another OpenBLAS build (nntrainer-windows-
+  // resource) that sums in another order: on that CI every logit differed
+  // in its bits while every selection matched.
+  GTEST_SKIP() << "the spec is the aarch64 order of the Android OpenBLAS";
 #else
   const unsigned K = 2048u, E = 32u, top_k = 4u, rows = g0_rows();
   std::mt19937 rng(0x13232u);
@@ -2728,8 +2732,10 @@ TEST(SgemvNCpuOrder, MatchesRouter) {
  *        printed: the plan's stop rule reads them.
  */
 TEST(ExpfBionic, AllInputs) {
-#if !defined(__aarch64__)
-  GTEST_SKIP() << "pins the port to bionic";
+#if !defined(__aarch64__) || defined(_WIN32)
+  // Windows links the UCRT, not bionic, and its ARM64 runner does not get
+  // through the 2^32 inputs in the test's 90 s.
+  GTEST_SKIP() << "pins the port to bionic (Android's libm)";
 #else
   float (*volatile libm_expf)(float) = expf;
   const unsigned T = 8u;

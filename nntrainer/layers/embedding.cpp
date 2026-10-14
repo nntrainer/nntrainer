@@ -118,10 +118,10 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * i);
+      Tensor cur_weight = weight.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * embed_idx);
+      Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * i);
       out_tensor.copyData(cur_weight);
     }
   }
@@ -160,11 +160,11 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      Tensor cur_weight = weight.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * embed_idx);
 
       Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
-        out_tensor_dim, out_dim * (i - from));
+        out_tensor_dim, static_cast<size_t>(out_dim) * (i - from));
 
       out_tensor.copyData(cur_weight);
     }
@@ -210,7 +210,8 @@ void EmbeddingLayer::calcGradient(RunLayerContext &context) {
 
         float *djdw_data = djdw.getAddress<float>(embed_idx * out_dim);
         const float *grad_data = derivative_.getAddress<float>(
-          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+          b * derivative_.getDim().getFeatureLen() +
+          static_cast<size_t>(i) * out_dim);
 
         std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
                        std::plus<float>());
@@ -226,7 +227,8 @@ void EmbeddingLayer::calcGradient(RunLayerContext &context) {
 
         _FP16 *djdw_data = djdw.getAddress<_FP16>(embed_idx * out_dim);
         const _FP16 *grad_data = derivative_.getAddress<_FP16>(
-          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+          b * derivative_.getDim().getFeatureLen() +
+          static_cast<size_t>(i) * out_dim);
 
         std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
                        std::plus<_FP16>());

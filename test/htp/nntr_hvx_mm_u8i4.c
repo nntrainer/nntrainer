@@ -952,7 +952,7 @@ static int layer_res_add_chunk(nntr_hvx_session *s, uint32 M, uint32 K,
     opts.act16_enc = act_enc;
     opts.act16_hd = act_hd;
   }
-  /* [P3] the handles land row-major in out_f32 and the norm + residual
+  /** [P3] the handles land row-major in out_f32 and the norm + residual
      add runs in the kernel's epilogue while each row is in the cache
      (hexkl_mm_opts.post_res). Without the in-place accumulator layout the
      kernel refuses row-major output (AEE_EUNSUPPORTED): the packed blocks

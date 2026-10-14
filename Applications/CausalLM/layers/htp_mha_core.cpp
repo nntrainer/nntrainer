@@ -1193,7 +1193,7 @@ void HtpMHACoreLayer::calibrate_q2_scales(const uint16_t *k_rows,
 }
 
 bool HtpMHACoreLayer::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
-                           unsigned int n_rows, unsigned int kv_stride) {
+                              unsigned int n_rows, unsigned int kv_stride) {
   std::vector<float> kmax(num_heads_KV, 0.0f),
     vmax(static_cast<size_t>(num_heads_KV) * head_dim, 0.0f);
   for (unsigned int r = 0; r < n_rows; ++r) {
@@ -1247,7 +1247,7 @@ void HtpMHACoreLayer::q2_derive_kv() {
 }
 
 void HtpMHACoreLayer::q2_derive_q(const float *q, unsigned int q_stride,
-                               unsigned int n_q) {
+                                  unsigned int n_q) {
   // Q's per-head range, NEON (min / max are order-free): scalar it was
   // 11-22 ms a 1024-row layer (doc 59 section 2.2).
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
@@ -1368,7 +1368,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
       layer->release_quantized_cache();
   };
   std::unique_ptr<HtpMHACoreLayer, decltype(release)> cache_lifetime(this,
-                                                                  release);
+                                                                     release);
   using clk = std::chrono::steady_clock;
   const auto ts0 = clk::now();
   AccelF32Io io;

@@ -388,7 +388,6 @@ public:
    */
   WIN_EXPORT static void loadQ2Calibration(std::istream &file);
 
-
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
 
@@ -414,8 +413,8 @@ private:
   /** softmax activation operation */
   nntrainer::ActiFunc sm;
 
-  float epsilon;            /** to avoid overflow */
-  unsigned int cache_index; /** idx of kv cache */
+  float epsilon;               /** to avoid overflow */
+  unsigned int cache_index;    /** idx of kv cache */
   unsigned int cache_base = 0; /**< see setCacheBase */
 
   /**

@@ -114,14 +114,16 @@ void ref_attention(const Shape &s, const std::vector<float> &q,
     const unsigned lo = (s.window && hi > s.window) ? hi - s.window : 0;
     for (unsigned h = 0; h < s.n_head_q; ++h) {
       const unsigned n = h / G;
-      const float *qr = &q[static_cast<size_t>(qi) * qs + h * s.head_dim];
+      const float *qr =
+        &q[static_cast<size_t>(qi) * qs + static_cast<size_t>(h) * s.head_dim];
       sc.assign(hi - lo, 0.0);
       double mx = -1e300;
       for (unsigned r = lo; r < hi; ++r) {
         double a = 0.0;
         for (unsigned d = 0; d < s.head_dim; ++d) {
           a += static_cast<double>(qr[d]) *
-               hf_to_f32(k[static_cast<size_t>(r) * ks + n * s.head_dim + d]);
+               hf_to_f32(k[static_cast<size_t>(r) * ks +
+                           static_cast<size_t>(n) * s.head_dim + d]);
         }
         a *= inv_sqrt;
         if (s.softcap > 0.0f) {
@@ -139,12 +141,14 @@ void ref_attention(const Shape &s, const std::vector<float> &q,
         sc[r - lo] = std::exp(sc[r - lo] - mx);
         den += sc[r - lo];
       }
-      float *o = &out[static_cast<size_t>(qi) * qs + h * s.head_dim];
+      float *o = &out[static_cast<size_t>(qi) * qs +
+                      static_cast<size_t>(h) * s.head_dim];
       for (unsigned d = 0; d < s.head_dim; ++d) {
         double a = 0.0;
         for (unsigned r = lo; r < hi; ++r) {
-          a += sc[r - lo] *
-               hf_to_f32(v[static_cast<size_t>(r) * ks + n * s.head_dim + d]);
+          a +=
+            sc[r - lo] * hf_to_f32(v[static_cast<size_t>(r) * ks +
+                                     static_cast<size_t>(n) * s.head_dim + d]);
         }
         o[d] = static_cast<float>(a / den);
       }

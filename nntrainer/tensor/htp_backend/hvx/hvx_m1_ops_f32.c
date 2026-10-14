@@ -453,7 +453,7 @@ static inline void router_sm_l2fetch(const float *p, uint32_t Ep,
  *         roundings, m1_router_softmax_det's order). */
 static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
   const router_sm_ctx *c = (const router_sm_ctx *)v;
-  /* [D3] block-major weight (hvx_router_sm_pack_f32): block b is one
+  /** [D3] block-major weight (hvx_router_sm_pack_f32): block b is one
      contiguous K x 128 B run, so the l2fetch is a plain stream of lines
      and the lead is 2 x ROUTER_PF_ROWS. */
   for (uint32_t b = i; b < c->Ep / LANES; b += n) {

@@ -198,7 +198,9 @@ static inline float geglu_det_one(float g, float u) {
   return swiglu_det_mul(swiglu_det_mul(g, s), u);
 }
 
-#if defined(__ARM_NEON)
+/** AArch64 only: vcvtnq_s32_f32 (round to nearest even) has no ARMv7 NEON
+ * form, so the 32-bit ARM build (Tizen armv7l) takes the scalar form. */
+#if defined(__aarch64__)
 #include <arm_neon.h>
 #define SWIGLU_DET_HAS_NEON 1
 
@@ -285,7 +287,7 @@ static inline float32x4_t swiglu_det_neon(float32x4_t g, float32x4_t u) {
     swiglu_det_recip_neon(swiglu_det_vadd(vdupq_n_f32(1.0f), e));
   return swiglu_det_vmul(swiglu_det_vmul(g, s), u);
 }
-#endif /* __ARM_NEON */
+#endif /* __aarch64__ */
 
 /**
  * @brief X[i] = silu(Y[i]) * Z[i], the drop-in shape of nntrainer::swiglu.
