@@ -452,7 +452,7 @@ inline void tq2q_row_params(const float fmn, const float fmx,
 
 #pragma OPENCL FP_CONTRACT OFF
 
-/* the min / max tree, the row parameters and the row-sum tree of
+/** the min / max tree, the row parameters and the row-sum tree of
  * v8c_act_quant_f32_par around a value source LOAD(k) */
 #define TQ2Q_ROW(LOAD, PASS1_STORE)                                            \
   const int row = get_group_id(0);                                             \

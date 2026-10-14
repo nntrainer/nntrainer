@@ -205,8 +205,6 @@ TEST(attention_kernels, rotary_emb_kernel_FP16_case2) {
 
 #endif
 
-#ifdef ENABLE_FP16
-
 /**
  * @brief Convert one IEEE binary16 bit pattern to float, without relying on a
  *        compiler half type: this test has to read the kernel's raw fp16
@@ -261,6 +259,8 @@ static uint16_t floatToHalfBits(float f) {
     return (uint16_t)(h + 1);
   return h;
 }
+
+#ifdef ENABLE_FP16
 
 /**
  * @brief The flash-attention prefill kernel must agree with a CPU reference.
