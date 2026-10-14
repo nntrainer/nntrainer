@@ -367,6 +367,7 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   pack.slot_zp = zp_all;
   pack.act_ah = act_ah;
   pack.K = K;
+  pack.skip = NULL;
   pack_job.func = hexkl_moe_pack_bg_worker;
   pack_job.ctx = &pack;
   pack_job.n_units = m_pad / HEXKL_MOE_PACK_UNIT_ROWS;
