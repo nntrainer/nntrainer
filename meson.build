@@ -392,7 +392,18 @@ elif get_option('enable-htp')
     hexagon_sdk_root / 'ipc' / 'fastrpc' / 'incs',
     hexagon_sdk_root / 'ipc' / 'fastrpc' / 'rpcmem' / 'inc',
     is_system: true)
-  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  # package_android.sh configures the Android engine with the host compiler
+  # (no cross file; ndk-build compiles afterwards), and meson >= 1.x link-tests
+  # find_library() candidates with that compiler, which rejects the aarch64
+  # libsdkl.so. Check the file and hand the linker the path instead there.
+  if get_option('platform') == 'android'
+    if not fs.is_file(hexkl_lib_dir / 'libsdkl.so')
+      error('libsdkl.so not found in ' + hexkl_lib_dir)
+    endif
+    libsdkl = declare_dependency(link_args: ['-L' + hexkl_lib_dir, '-lsdkl'])
+  else
+    libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  endif
   hexkl_dep = declare_dependency(
     dependencies: libsdkl,
     include_directories: hexkl_inc)

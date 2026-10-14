@@ -52,6 +52,7 @@ tensor_headers = [
   'q4_0_utils.h',
   'htp_q4_0_convert.h',
   'htp_wh_layout.h',
+  'htp_wh_palette.h',
   'htp_fixed_opts.h',
   'swiglu_det.h',
   'htp_act_quant.h',
@@ -76,6 +77,12 @@ tensor_headers = [
   'swap_device.h',
   'task.h'
 ]
+
+# htp_wh_palette.h includes "htp_backend/hvx/hvx_expand_i2i4.h" (stdint only).
+# Installed headers are flat, so install it under htp_backend/hvx/ next to them
+# to make that relative include resolve for out-of-tree consumers.
+install_headers('htp_backend/hvx/hvx_expand_i2i4.h',
+  install_dir: nntrainer_includedir / 'htp_backend' / 'hvx')
 
 subdir('cpu_backend')
 nntrainer_inc += include_directories('cpu_backend')
