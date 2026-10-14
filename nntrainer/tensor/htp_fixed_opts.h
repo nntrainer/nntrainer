@@ -79,6 +79,16 @@ constexpr float PREFETCH_RESIDUAL = 0.5f;
  *  (formerly NNTR_HTP_RELEASE_PREFILL_SCRATCH=1). */
 constexpr bool RELEASE_PREFILL_SCRATCH = true;
 
+/** After the first token the expert pool grows towards this many experts a
+ *  layer (formerly NNTR_MOE_CACHE_GROW=22 over C=12), as far as the PD's
+ *  address space allows: the growth is the part of PD_MAP_CEILING_MIB left
+ *  above what is mapped (expert and FC arenas, the DSP heap) and
+ *  PD_MAP_MARGIN_MIB. S26 Ultra, page cache off, C16 p1024: 10.1 -> 13.9
+ *  tok/s for about 1 GB of arena; C32 + 22 did not map (fastrpc_mmap). */
+constexpr unsigned int MOE_POOL_TARGET = 34u;
+constexpr unsigned int PD_MAP_CEILING_MIB = 3840u;
+constexpr unsigned int PD_MAP_MARGIN_MIB = 256u;
+
 } // namespace htp_fixed
 } // namespace nntrainer
 
