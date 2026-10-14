@@ -1465,6 +1465,9 @@ static inline void moe_m1_wait(uint32_t idx, uint32_t site) {
 void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
   (void)n_units;
   const hexkl_moe_pack_ctx *c = (const hexkl_moe_pack_ctx *)vctx;
+  if (c->skip && c->skip[u]) {
+    return;
+  }
   if (c->act_u8) {
     hvx_gather_u8_ah_rows(c->act_u8, c->slot_row, u * HEXKL_MOE_PACK_UNIT_ROWS,
                           (u + 1u) * HEXKL_MOE_PACK_UNIT_ROWS, c->K, c->act_ah);
@@ -1878,7 +1881,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_u8, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_pre, MOE_SCRATCH_ALIGN) +
-                      ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN) +
+                      2u * ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_seen, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_jobs, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_done, MOE_SCRATCH_ALIGN) +
@@ -1916,6 +1919,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint8_t *act_u8 =
     use_m1 ? NULL : (uint8_t *)hexkl_moe_carve(&cur, sz_act_u8) + MOE_U8_GUARD;
   uint8_t *pack_done = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
+  uint8_t *pack_skip = (uint8_t *)hexkl_moe_carve(&cur, sz_pack_done);
   uint8_t *seen = (uint8_t *)hexkl_moe_carve(&cur, sz_seen);
   hvx_bg_job *jobs = (hvx_bg_job *)hexkl_moe_carve(&cur, sz_jobs);
   uint8_t *tail_done = (uint8_t *)hexkl_moe_carve(&cur, sz_tail_done);
@@ -2083,6 +2087,15 @@ int hexkl_mm_u8i4_moe_layer_run(
       const uint32_t *rows_e = row_index + base_of[i];
       const uint32_t padded =
         ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
+      /** The pack units past the expert's last row hold padding only and
+         are not packed: at a 1024-row prefill 128 experts' 4096 rows pad
+         to ~12,700 slots, and packing the padding was two thirds of the
+         pack's bytes (24 MB of 36 a call). Whole units, so the unit with
+         the last rows still packs its row groups whole. */
+      for (uint32_t u = d / HEXKL_MOE_PACK_UNIT_ROWS;
+           u < (d + padded) / HEXKL_MOE_PACK_UNIT_ROWS; ++u) {
+        pack_skip[u] = u * HEXKL_MOE_PACK_UNIT_ROWS >= d + row_count[e];
+      }
       for (uint32_t r = 0; r < padded; ++r, ++d) {
         const uint32_t src = (r < row_count[e]) ? rows_e[r] : 0u;
         slot_row[d] = src;
@@ -2362,6 +2375,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   pack.slot_zp = slot_zp;
   pack.act_ah = act_ah;
   pack.K = K;
+  pack.skip = pack_skip;
   pack_job->func = hexkl_moe_pack_bg_worker;
   pack_job->ctx = &pack;
   pack_job->n_units = n_slots / HEXKL_MOE_PACK_UNIT_ROWS;

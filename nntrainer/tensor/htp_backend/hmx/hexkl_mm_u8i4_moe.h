@@ -171,6 +171,9 @@ typedef struct {
   const int32_t *slot_zp;
   uint8_t *act_ah;
   uint32_t K;
+  /** NULL, or one byte a unit: nonzero for a unit of padding slots only,
+      which is not packed (its rows' accumulator output is never read). */
+  const uint8_t *skip;
 } hexkl_moe_pack_ctx;
 
 /** @brief Rows per background unit: a quarter block. A worker mid-unit
