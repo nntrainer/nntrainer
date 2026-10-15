@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-/** Verify affine WH correction on a real DSP against equivalent int4
- * weights, through the generated FastRPC interface. */
+/** @file wh_affine_device_check.cpp
+ * @brief Verify affine WH correction on a real DSP against equivalent int4
+ * weights, through the generated FastRPC interface.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ */
 #include <AEEStdErr.h>
 #include <remote.h>
 

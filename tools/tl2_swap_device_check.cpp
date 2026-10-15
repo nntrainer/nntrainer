@@ -2,8 +2,10 @@
 /** @file tl2_swap_device_check.cpp
  * @brief Diagnostic native TL2 expert registration, M=1 and arena swap.
  * No arguments: small shape; "real": Gemma shape; "real fast": also
- * apply the model's 0xcf03e1 MoE options. The fast case is not yet device
- * validated. See docs/gemma4-tl2-affine-handoff.md before using it.
+ * apply the model's 0xcf03e1 MoE options. Device validation is recorded in
+ * docs/gemma4-tl2-affine-handoff.md.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
  */
 #include "hvx_gemv_u8tl2.h"
 #include <chrono>

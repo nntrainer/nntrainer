@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-/** Affine FC and dense FFN must equal independently packed q+offset
+/** @file wh_affine_host_check.c
+ * @brief Affine FC and dense FFN must equal independently packed q+offset
  * weights. Nonzero offsets, real column sums, row permutations, row-block
- * boundaries, gate/up before GELU and down after GELU are all exercised. */
+ * boundaries, gate/up before GELU and down after GELU are all exercised.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ */
 #define main nntr_existing_moe_check_main
 #include "moe_layer_host_check.c"
 #undef main

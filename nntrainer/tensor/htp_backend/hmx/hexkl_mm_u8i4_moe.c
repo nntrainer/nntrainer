@@ -165,7 +165,7 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
   uint64_t pt = 0;
   uint32_t idx;
   if (h->tl2_bytes) {
-    /* A native panel's K=96 group is four TL2 blocks and three HMX rows.
+    /** A native panel's K=96 group is four TL2 blocks and three HMX rows.
        Land two blocks in each of the first two rows of its own panel.
        Expansion copies these 2560 bytes before writing the three rows, so
        neither other panels nor other K groups can be overwritten. */
@@ -176,7 +176,7 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
     }
     const uint32_t blocks = (h->K + 23u) / 24u;
     const uint32_t groups = h->K / 96u, remaining = blocks - groups * 4u;
-    /* Preserve the gate/up paired chunk order so HMX can start while the
+    /** Preserve the gate/up paired chunk order so HMX can start while the
        remaining panels arrive. Shared boundary panels are transferred once. */
     for (uint32_t p = nt0 / 4u; p < (nt0 + cn + 3u) / 4u; ++p) {
       const uint64_t bit = UINT64_C(1) << p;
@@ -283,7 +283,7 @@ static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
         const uint32_t rows = c->native_K - g * 96u;
         const uint32_t count = ((rows < 96u ? rows : 96u) + 23u) / 24u;
 #if defined(__hexagon__)
-        /* Snapshot the packed panel before expansion overwrites it. Scalar
+        /** Snapshot the packed panel before expansion overwrites it. Scalar
          * loads from VTCM serialize; copy complete 128-byte vectors here. */
         for (uint32_t v = 0; v < (count < 2u ? count : 2u) * 5u; ++v)
           ((HVX_Vector *)source)[v] = ((const HVX_Vector *)dst)[v];
@@ -312,7 +312,7 @@ static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
   }
 }
 
-/* Called only by the issuing thread, before background workers can run.
+/** Called only by the issuing thread, before background workers can run.
    A gate/up boundary may split a 128-column native panel; reserve the whole
    panel once so overlapping chunk requests never decode overwritten bytes. */
 static void moe_expand_native(moe_expand_ctx *ctx, uint8_t *base,
@@ -2647,7 +2647,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Falls back to expanding in front of the batch when a shape needs more
      chunks than there are slots -- correctness never depends on the
      hiding. This model is 4 and 2. */
-  /* Native TL2 reserves complete panels before submitting a job. Background
+  /** Native TL2 reserves complete panels before submitting a job. Background
      jobs retire in order, so a later chunk sharing a panel observes its
      completed expansion, even when that later job has no panels of its own. */
   const int exp_bg = all_2bit && gu_chunks <= MOE_EXP_DN &&
