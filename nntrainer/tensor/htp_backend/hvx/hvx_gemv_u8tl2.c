@@ -56,8 +56,77 @@ static void digits(unsigned m, int *a, int *b, int *c) {
   *c = (int)((m + 13u) % 3u) - 1;
 }
 
+#if defined(__hexagon__)
+/* VLUT32 reads byte 2*m for magnitude m. Repeat each 32-byte lookup in
+ * every lane group, as in hvx_expand_i2i4. Invalid magnitudes stay zero. */
+#define TL2_REPEAT4(...)                                                       \
+  { __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__ }
+static const int8_t tl2_expand_digits[3][128] __attribute__((aligned(128))) = {
+  TL2_REPEAT4(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+              1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
+  TL2_REPEAT4(0, 0, 0, 0, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0,
+              0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
+  TL2_REPEAT4(0, 0, 1, 1, -1, -1, 0, 0, 1, 1, -1, -1, 0, 0, 1, 1, -1, -1, 0, 0,
+              1, 1, -1, -1, 0, 0, 1, 1, 0, 0, 0, 0)};
+#undef TL2_REPEAT4
+
+static inline HVX_Vector tl2_expand_row(const uint8_t *src, uint32_t k,
+                                        int magnitude) {
+  const uint32_t group = k % 24u / 3u;
+  const uint8_t *block = src + k / 24u * 640u;
+  const HVX_Vector mask = Q6_V_vsplat_R(0x0f0f0f0f);
+  HVX_Vector code = *(const HVX_UVector *)(block + group / 2u * 128u);
+  code = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(code, 4u * (group % 2u)), mask);
+  const HVX_Vector table = *(const HVX_Vector *)tl2_expand_digits[k % 3u];
+  HVX_Vector q = Q6_Vb_vlut32_VbVbI(code, table, 0);
+  const HVX_Vector signs = *(const HVX_UVector *)(block + 512u);
+  q = Q6_V_vmux_QVV(Q6_Q_vand_VR(signs, 0x01010101u << group),
+                    Q6_Vb_vsub_VbVb(Q6_V_vzero(), q), q);
+  q = Q6_V_vand_VV(q, mask);
+  if (magnitude == 7)
+    /* q is a nibble: shifting by three cannot carry into the next byte.
+     * Modulo 16, 7*q also maps -1 (15) to -7 (9). */
+    q = Q6_V_vand_VV(Q6_Vb_vsub_VbVb(Q6_Vh_vasl_VhR(q, 3), q), mask);
+  return q;
+}
+#endif
+
 void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
                          uint32_t row_stride, int magnitude, uint8_t *dst) {
+#if defined(__hexagon__)
+  if (magnitude == 1 || magnitude == 7) {
+    /* Constant row indices eliminate division and lookup-address work from
+     * the inner loop, and keep the four transpose inputs in registers. */
+#pragma unroll(12)
+    for (uint32_t k = 0; k < 96u; k += 8u) {
+      if (k >= rows / 32u * 32u)
+        break;
+      HVX_Vector bytes[4];
+#pragma unroll(4)
+      for (uint32_t r = 0; r < 4u; ++r) {
+        const HVX_Vector lo = tl2_expand_row(src, k + r, magnitude);
+        const HVX_Vector hi = tl2_expand_row(src, k + r + 4u, magnitude);
+        bytes[r] = Q6_V_vor_VV(lo, Q6_Vh_vasl_VhR(hi, 4));
+      }
+      /* Native byte j = 4*c + tile. Exchange the two tile bits with
+       * the row bits in the four registers, leaving c in place. Each
+       * result is one complete WH vector: byte 4*c + row. */
+      const HVX_VectorPair a = Q6_W_vshuff_VVR(bytes[1], bytes[0], 1);
+      const HVX_VectorPair b = Q6_W_vshuff_VVR(bytes[3], bytes[2], 1);
+      const HVX_VectorPair even =
+        Q6_W_vshuff_VVR(Q6_V_lo_W(b), Q6_V_lo_W(a), 2);
+      const HVX_VectorPair odd = Q6_W_vshuff_VVR(Q6_V_hi_W(b), Q6_V_hi_W(a), 2);
+      const HVX_Vector tiles[4] = {Q6_V_lo_W(even), Q6_V_lo_W(odd),
+                                   Q6_V_hi_W(even), Q6_V_hi_W(odd)};
+      uint8_t *out = dst + (size_t)(k / 32u) * row_stride + k % 32u / 8u * 128u;
+#pragma unroll(4)
+      for (uint32_t nt = 0; nt < 4u; ++nt)
+        if (nt < columns / 32u)
+          *(HVX_UVector *)(out + nt * 512u) = tiles[nt];
+    }
+    return;
+  }
+#endif
   /* Each magnitude names a balanced-base-three triple. This small inverse
      table also keeps integer division out of the weight loop. */
   static const int8_t trits[16][3] = {

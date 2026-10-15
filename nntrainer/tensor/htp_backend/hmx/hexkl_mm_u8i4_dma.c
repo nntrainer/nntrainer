@@ -530,6 +530,28 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
   }
 }
 
+/** Affine correction belongs to the same rows as dequantization. Keep a
+ * private copy of their sums until this staged batch's workers retire. */
+typedef struct {
+  hvx_dq_rows_job rows;
+  const int32_t *offset;
+  int32_t sums[HEXKL_ACC_TILE_ROWS];
+} fc_affine_job;
+
+static void fc_affine_worker(uint32_t n_threads, uint32_t i, void *v) {
+  fc_affine_job *job = (fc_affine_job *)v;
+  const hvx_dq_tiles_job *t = &job->rows.t;
+  const uint32_t lo = (uint32_t)((uint64_t)t->m_count * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)t->m_count * (i + 1u) / n_threads);
+  for (uint32_t j = 0; j < t->n_tiles; ++j)
+    hexkl_wh_affine_acc(
+      (int32_t *)(t->tiles_base + (size_t)j * t->tile_stride) +
+        (size_t)lo * t->row_stride,
+      t->row_stride, hi - lo, HEXKL_ACC_TILE_COLS,
+      job->offset + (t->nt0 + j) * HEXKL_ACC_TILE_COLS, job->sums + lo);
+  hvx_dq_tiles_rows_worker(n_threads, i, &job->rows);
+}
+
 int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
@@ -767,7 +789,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
      into out_cat and the job has no flag for it) nor without the in-place
      tile layout; those keep the synchronous tile-at-a-time path. */
   const int pipelined = acc_layout->usable && !o->accumulate;
-  hvx_dq_rows_job dq_job[2];
+  fc_affine_job dq_job[2];
   fc_post post[2];
   uint32_t sb = 0u;
   /** The per-head passes in the epilogue: only when every staged batch of
@@ -859,7 +881,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             goto out;
           }
         }
-        if (h->w_offset && acc_layout->usable)
+        if (h->w_offset && acc_layout->usable && !pipelined)
           for (uint32_t j = 0; j < nb; ++j)
             hexkl_wh_affine_acc(
               (int32_t *)(vtcm_base + stage_off + j * ACC_TILE_BYTES) +
@@ -874,7 +896,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           hvx_worker_pool_wait(o->pool);
           HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           if (cnt != 0u) {
-            hvx_dq_rows_job *rj = &dq_job[sb & 1u];
+            fc_affine_job *aj = &dq_job[sb & 1u];
+            hvx_dq_rows_job *rj = &aj->rows;
             hvx_dq_tiles_job *jb = &rj->t;
             fc_post *pp = &post[sb & 1u];
             pp->chunk = fuse_post && o->post_chunk ? o->post_chunk[i] : 0u;
@@ -916,7 +939,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             jb->split = h->N;
             jb->dst_stride = ld_h;
             jb->n_tiles = nb;
-            hvx_worker_pool_submit(o->pool, hvx_dq_tiles_rows_worker, rj, cnt);
+            if (h->w_offset) {
+              aj->offset = h->w_offset;
+              memcpy(aj->sums, affine_sums, cnt * sizeof(int32_t));
+              hvx_worker_pool_submit(o->pool, fc_affine_worker, aj, cnt);
+            } else {
+              hvx_worker_pool_submit(o->pool, hvx_dq_tiles_rows_worker, rj,
+                                     cnt);
+            }
           }
         } else if (acc_layout->usable) {
           /* Dequantize each tile where it is, on this thread. */

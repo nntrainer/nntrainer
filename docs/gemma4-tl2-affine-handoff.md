@@ -1,5 +1,8 @@
 # Gemma4 native TL2 / affine WH 작업 인수인계
 
+**Prefill 최적화 후속 검증은 [9절](#9-2048토큰-prefill-최적화-후속-검증)을
+참조한다.** 1~8절은 최적화 전 체크포인트이며, 전체 decode 문제는 별도 미해결이다.
+
 작성: 2026-10-15, Asia/Seoul. 이 문서는 **작동 완료 보고가 아닌 중간 작업
 체크포인트**다. 다음 세션에서는 먼저 이 문서를 읽고, 전체 모델을 반복 실행하기
 전에 작은 재현 프로그램으로 decode 다운 원인을 좁혀야 한다.
@@ -343,3 +346,113 @@ python3 test/htp/host/wh_affine_conversion_check.py
 일부 로그/설정은 ignored model directory의 `validation/`에도 복사했다.
 이 문서 옆의 [요약 JSON](validation/gemma4-tl2-s26-20261015.json)은 커밋에 포함한다.
 원시 Android logcat 전체에는 unrelated device 정보가 있어 커밋하지 않는다.
+
+## 9. 2048토큰 prefill 최적화 후속 검증
+
+PR #4428의 `a97d383a4ef1fe94bf3b6d53f47e50b9c6624530`을 기준으로
+S26 Ultra에서 측정했다. 기존 작업 디렉터리의 미커밋 변경을 보존하기 위해
+`codex/pr4428-tl2-prefill-20261015` 브랜치와 별도 worktree를 사용했다.
+모델 파일과 ARM runtime은 체크포인트 그대로이며 DSP 커널을 변경했다.
+실제 모델 dtype은 expert `TL2CX_WH`, FC/head `QS4CX_WH_AFFINE`이다.
+
+### 측정 조건
+
+- 입력 **2048토큰**, cache **16 experts/layer**, `NNTR_HTP_PAGE_CACHE=0`.
+  이 옵션은 expert miss 읽기에 `O_DIRECT`를 사용한다.
+- `init_seq_len=2048`, `max_seq_len=2304`, `skip_prefill=false`,
+  `num_to_generate=1`, `NNTR_NUM_THREADS=8`, `NNTR_MOE_CACHE_GROW=0`.
+- [고정 UTF-8 입력](validation/gemma4-tl2-prefill-p2048.txt)은 기존 Ardley
+  벤치마크 문장을 2048토큰으로 늘렸다. Tokenizer와 실제 API 양쪽에서
+  2048토큰을 확인했다. `use_chat_template=false`로 중복 template을 막는다.
+- `tools/gemma4_prefill_device_check.cpp`가 공개 API로 prefill과 마지막 행
+  affine LM head까지 실행한다. 주기적인 취소 요청은 generation loop에서
+  처리되어 decode forward를 시작하지 않는다. 모든 측정의
+  `decode_tokens=0`을 확인한다. `num_to_generate=1`만으로는 decode가 생기므로
+  기존 CLI를 그대로 사용하면 이 측정과 다르다.
+- TPS는 API의 `prefill_tokens / prefill_duration`이다. 모델 로딩 시간은
+  제외한다. 취소된 streaming의 `ttft_ms=0`은 TTFT 측정값으로 사용하지 않는다.
+- 최종 반복 측정은 `NNTR_LAYER_PROFILE`, `NNTR_HTP_PROFILE`을 설정하지 않는다.
+  병목 분석은 profile 1로 수행했다. Profile 2는 host norm 경로와 복사량도
+  바꾸므로 최종 속도 비교에서 제외한다.
+
+### 원인과 수정
+
+1. Native TL2→WH 변환은 가중치마다 scalar lookup/bit packing을 수행했다.
+   HVX lookup, sign 처리, WH transpose로 바꾸고 96행 블록의 고정 인덱스를
+   전개해 반복적인 나눗셈과 임시 vector 저장을 없앴다. Magnitude 1/7과
+   부분 K/N 타일의 값은 유지한다.
+2. In-place 변환 전 packed 패널을 복사하는 `memcpy`도 VTCM의 scalar 읽기를
+   발생시켰다. 정렬된 HVX vector 복사로 변경했다.
+3. Native staging은 첫 chunk에서 전체 expert를 기다렸고, background 변환도
+   꺼져 있었다. Gate/up chunk 순서로 DMA를 발행하고 공유되는 128열 패널은
+   한 번만 전송·변환한다. FIFO background job으로 변환과 HMX를 겹친다.
+4. Affine activation 합계와 accumulator offset 보정이 VTCM을 scalar로
+   읽고 썼다. HVX row sum과 정수 multiply-accumulate로 바꿨다. 등록 시
+   검증되는 `[-15,15]` offset을 signed halfword로 곱하되 합계는 int32로
+   유지한다. 보정은 FC/FFN 후처리 worker의 담당 행/타일에서 수행한다.
+   비동기 job이 끝날 때까지 합계를 자체 보관해 다음 블록과 겹치지 않는다.
+
+TL2 변환만 벡터화한 상태에서도 2048토큰은 **159.669초 / 12.827 TPS**였다.
+이때 QKV 56.692초, output projection을 포함한 post-attention norm
+61.699초, dense FFN 35.348초가 소요되어 affine 경로가 다음 병목임을 확인했다.
+Affine 벡터화 후 6.969초, VTCM 복사 개선 후 3.965초로 줄었다.
+이는 같은 고정 입력을 사용한 중간 단계 측정이며 최종 결과와 구분한다.
+
+### 최종 결과
+
+| 상태 | Prefill 시간 | TPS |
+|---|---:|---:|
+| PR head, 수정 전 (profile 1) | 310.313초 | 6.60 |
+| 최종 빌드, 계측 off 5회 중앙값 | 3.191초 | 641.81 |
+| 최종 빌드, 계측 off 5회 평균 TPS | — | 630.00 |
+
+최종 5회는 3507 / 3187 / 3189 / 3203 / 3191ms였다. 첫 회
+583.97 TPS를 제외하지 않았으며, 나머지 4회는 639.40~642.61 TPS였다.
+중앙값 기준으로 최신 PR의 회귀 상태보다 약 97.25배 빨라졌다.
+과거 600+ TPS 기록과는 weight pack이 다르므로 과거 모든 pack보다
+빠르다고 해석하지 않는다. 같은 입력의 첫 prefill 출력 ID는 수정 전후
+모두 `818`이며, 전체 decode를 실행한 결과는 아니다.
+
+최종 반복 측정, artifact hash와 검증 범위는
+[prefill 결과 JSON](validation/gemma4-tl2-prefill-s26-20261015.json)에 기록한다.
+원시 로그는 `/tmp/pr4428-tl2-prefill-20261015/`, 격리된 device runtime은
+`/data/local/tmp/nntr_tl2_prefill_20261015/`에 보관한다.
+
+### 재현
+
+검사 도구는 NDK clang++의 C++17로 다음 include/library를 사용해 빌드한다.
+`--allow-shlib-undefined`는 Android 실행 시 함께 로드되는 runtime 의존성용이다.
+
+```sh
+"$NDK/aarch64-linux-android28-clang++" -std=c++17 -O2 -Wall -Wextra -Werror \
+  -IApplications/CausalLM/api \
+  -IApplications/CausalLM/Android/QuickDotAI/src/main/cpp/include \
+  tools/gemma4_prefill_device_check.cpp -L"$RUNTIME" \
+  -lquick_dot_ai_api -Wl,--allow-shlib-undefined -o gemma4_prefill_device_check
+```
+
+Device의 `$BENCH/gemma4-26b-a4b-htp-w4a32/`에 위 조건의 설정과 모델을
+배치한다. `$RUNTIME`은 일치하는 ARM 라이브러리와 빌드한 v81 skel이 있는
+디렉터리다. 고정 입력 파일도 device에 복사한 뒤 실행한다.
+
+```sh
+LD_LIBRARY_PATH="$RUNTIME" ADSP_LIBRARY_PATH="$RUNTIME" \
+NNTR_NUM_THREADS=8 NNTR_HTP_PAGE_CACHE=0 NNTR_MOE_CACHE_GROW=0 \
+./gemma4_prefill_device_check "$BENCH" "$RUNTIME" gemma4-tl2-prefill-p2048.txt
+```
+
+Native TL2 prefill은 실제 DSP에서 독립 int4 reference와 bit-identical이다:
+작은/실제 Gemma shape, magnitude 1/7, expert 1/3개, M=2/23/65/129,
+각 3회 반복, gather/scatter와 공유 패널 경계를 포함한다. Affine FC는
+M=1/2/64/65/128, affine FFN은 M=2/64/65/129, 작은/실제 shape에서 같은
+검증을 통과했다. V79/V81 simulator에서도 TL2 layout 192 case와 affine
+sum/correction 210 case가 정확히 일치한다.
+
+`CC=gcc bash test/htp/host/run_host_checks.sh` 전체 실행도 exit 0으로
+완료했다. 선택적인 libnative 및 AArch64/qemu 검사는 환경 도구 부재로
+skip되었고, 실제 HVX 경로는 위 simulator와 device 검증으로 별도 확인했다.
+ASan/UBSan, v79/v81 DSP 빌드, clang-format 14 변경 줄 검사도 통과했다.
+Expert swap의 `real fast` 옵션도 실제 기기에서 4회 교체 결과가 일치했다.
+
+Prefill 첫 출력 ID의 일치는 전체 생성 품질 검증이 아니다. 전체 decode,
+원본 checkpoint 대비 PPL, 모든 CI platform은 이번 속도 검증 범위 밖이다.

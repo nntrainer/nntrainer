@@ -62,6 +62,7 @@ typedef struct {
       (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
   const uint8_t *tl2_bytes; /**< Native TL2; NULL for ordinary WH. */
   uint64_t tl2_expanded; /**< Prefill panels reserved for in-place expansion. */
+  uint64_t tl2_pushed;   /**< Native panels queued for the current staging. */
   uint32_t tl2_dma_idx;  /**< Last DMA of the native prefill staging. */
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
