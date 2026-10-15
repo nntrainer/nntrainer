@@ -30,6 +30,23 @@ int openWeightFile(const char *path);
  * scratch; it never silently falls back to buffered IO. */
 int weightPread(int fd, void *dst, size_t bytes, uint64_t offset);
 
+/** Direct IO scratch bounds, also used to select one-request expert reads. */
+constexpr size_t WEIGHT_DIRECT_ALIGNMENT = 4096;
+constexpr size_t WEIGHT_DIRECT_WINDOW_BYTES = size_t(2) << 20;
+
+/** One destination for an adjacent part of a file range. */
+struct WeightReadSlice {
+  void *data;
+  size_t bytes;
+};
+
+/** Scatter one contiguous file range into one to four destinations. Empty
+ * slices are allowed. The same bounded scratch is reused across direct reads;
+ * metadata can go to CPU memory without reading back an uncached DMA mapping.
+ * Returns errno, including EOVERFLOW, EINVAL or ENODATA for invalid ranges. */
+int weightPreadScatter(int fd, const WeightReadSlice *slices, size_t count,
+                       uint64_t offset);
+
 /** Read adjacent file ranges into separate code and metadata destinations.
  * Combines their IO without retaining another copy of the weight. */
 int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,

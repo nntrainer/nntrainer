@@ -7,6 +7,7 @@
  * @author Jungwon-Lee <jungone.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -75,6 +76,43 @@ int main(int argc, char **argv) {
                                      size - 16) == ENODATA);
   assert(nntrainer::weightPreadSplit(direct, tail, 16, tail + 16, SIZE_MAX,
                                      0) == EOVERFLOW);
+  // Four scatter destinations mirror native TL2 GU/code, GU/metadata,
+  // DN/code and DN/metadata. Guards also cover empty middle slices.
+  auto verifyScatter = [&](int input, size_t offset,
+                           const std::array<size_t, 4> &sizes) {
+    std::array<std::vector<unsigned char>, 4> data;
+    nntrainer::WeightReadSlice parts[4];
+    size_t at = offset;
+    for (size_t i = 0; i < data.size(); ++i) {
+      data[i].assign(sizes[i] + 2, static_cast<unsigned char>(0xe0 + i));
+      parts[i] = {sizes[i] ? data[i].data() + 1 : nullptr, sizes[i]};
+    }
+    assert(nntrainer::weightPreadScatter(input, parts, 4, offset) == 0);
+    for (size_t i = 0; i < data.size(); ++i) {
+      assert(data[i].front() == 0xe0 + i && data[i].back() == 0xe0 + i);
+      assert(std::memcmp(data[i].data() + 1, original.data() + at, sizes[i]) ==
+             0);
+      at += sizes[i];
+    }
+  };
+  verifyScatter(direct, 4093, {830720, 11264, 422400, 22528});
+  verifyScatter(direct, 3, {1u << 20, 4096, 1u << 20, 1003});
+  verifyScatter(direct, size - 17, {8, 0, 9, 0});
+  // Invalid ranges never become partial-success expert loads.
+  nntrainer::WeightReadSlice parts[4] = {
+    {tail, 8}, {tail + 8, 8}, {tail + 16, 8}, {tail + 24, 8}};
+  assert(nntrainer::weightPreadScatter(direct, parts, 4, size - 16) == ENODATA);
+  assert(nntrainer::weightPreadScatter(direct, parts, 4, UINT64_MAX) ==
+         EOVERFLOW);
+  assert(nntrainer::weightPreadScatter(direct, nullptr, 4, 0) == EINVAL);
+  assert(nntrainer::weightPreadScatter(direct, parts, 5, 0) == EINVAL);
+  assert(nntrainer::weightPreadScatter(direct, parts, 0, 0) == EINVAL);
+  assert(nntrainer::weightPreadScatter(fd, parts, 4, 0) == EINVAL);
+  assert(nntrainer::weightPreadScatter(-1, parts, 4, 0) == EBADF);
+  parts[1] = {nullptr, 1};
+  assert(nntrainer::weightPreadScatter(direct, parts, 4, 0) == EINVAL);
+  parts[1] = {tail, SIZE_MAX};
+  assert(nntrainer::weightPreadScatter(direct, parts, 4, 0) == EOVERFLOW);
   const size_t page = sysconf(_SC_PAGESIZE);
   std::vector<unsigned char> pages((size + page - 1) / page);
   void *mapping = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
@@ -83,6 +121,8 @@ int main(int argc, char **argv) {
   for (auto p : pages)
     assert((p & 1) == 0);
   setenv("NNTR_HTP_PAGE_CACHE", "1", 1);
+  verifyScatter(fd, 4093, {830720, 11264, 422400, 22528});
+  verifyScatter(fd, 3, {1u << 20, 4096, 1u << 20, 1003});
   verifySplit(fd, 3, 1002500, 11268);
   verifySplit(fd, 3, 2 * (1u << 20), size - 3 - 2 * (1u << 20));
   verifySplit(fd, size - 17, 0, 17);

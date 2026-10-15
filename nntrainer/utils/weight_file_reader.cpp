@@ -137,20 +137,29 @@ public:
  * errno, or ENODATA for a short file. No buffered fallback: callers must not
  * silently enable the page cache.
  */
-int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,
-                     size_t tail_bytes, uint64_t offset) {
-  if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-      bytes >
-        static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - offset ||
-      tail_bytes > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
-                     offset - bytes)
+int weightPreadScatter(int fd, const WeightReadSlice *slices, size_t count,
+                       uint64_t offset) {
+  constexpr size_t max_slices = 4;
+  if (!slices || !count || count > max_slices)
+    return EINVAL;
+  const uint64_t max_offset = std::numeric_limits<off_t>::max();
+  if (offset > max_offset)
     return EOVERFLOW;
+  size_t bytes = 0;
+  iovec parts[max_slices];
+  for (size_t i = 0; i < count; ++i) {
+    if (slices[i].bytes > std::numeric_limits<size_t>::max() - bytes ||
+        slices[i].bytes > max_offset - offset - bytes)
+      return EOVERFLOW;
+    if (!slices[i].data && slices[i].bytes)
+      return EINVAL;
+    parts[i] = {slices[i].data, slices[i].bytes};
+    bytes += slices[i].bytes;
+  }
   int flags = ::fcntl(fd, F_GETFL);
   if (flags < 0)
     return errno;
-  iovec parts[2] = {{dst, bytes}, {tail, tail_bytes}};
   size_t part = 0;
-  bytes += tail_bytes;
   // Advance both destinations after a buffered read, or scatter the direct
   // read's scratch buffer. Metadata never has to be read back from DMA memory.
   auto consume = [&](const uint8_t *source, size_t count) {
@@ -172,17 +181,17 @@ int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,
     if (weightPageCachePolicy() == 0)
       return EINVAL;
     while (bytes) {
-      iovec batch[2];
-      int count = 0;
+      iovec batch[max_slices];
+      int batch_count = 0;
       size_t left = std::min(bytes, size_t(1) << 20);
-      for (size_t i = part; i < 2 && left; ++i) {
+      for (size_t i = part; i < count && left; ++i) {
         const size_t take = std::min(left, parts[i].iov_len);
         if (take) {
-          batch[count++] = {parts[i].iov_base, take};
+          batch[batch_count++] = {parts[i].iov_base, take};
           left -= take;
         }
       }
-      ssize_t got = ::preadv(fd, batch, count, offset);
+      ssize_t got = ::preadv(fd, batch, batch_count, offset);
       if (got < 0) {
         if (errno == EINTR)
           continue;
@@ -200,9 +209,10 @@ int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,
   }
   // 4 KiB meets the block-device and filesystem direct-IO alignment used by
   // Android. Larger VM page sizes do not change the on-disk sector alignment.
-  // A 2 MiB window holds a Gemma expert's complete gate/up weight plus its
-  // metadata, avoiding an extra synchronous IO for every cache miss.
-  constexpr size_t alignment = 4096, capacity = size_t(2) << 20;
+  // A 2 MiB window also holds a native TL2 expert's adjacent gate/up and
+  // down records, including metadata, so confirmed misses need only one IO.
+  constexpr size_t alignment = WEIGHT_DIRECT_ALIGNMENT;
+  constexpr size_t capacity = WEIGHT_DIRECT_WINDOW_BYTES;
   struct Scratch {
     void *data = nullptr;
     ~Scratch() { std::free(data); }
@@ -240,10 +250,16 @@ int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,
 int openWeightFile(const char *) {
   throw std::runtime_error("NNTR_HTP_PAGE_CACHE requires Linux/Android");
 }
-int weightPreadSplit(int, void *, size_t, void *, size_t, uint64_t) {
+int weightPreadScatter(int, const WeightReadSlice *, size_t, uint64_t) {
   return ENOSYS;
 }
 #endif
+
+int weightPreadSplit(int fd, void *dst, size_t bytes, void *tail,
+                     size_t tail_bytes, uint64_t offset) {
+  const WeightReadSlice slices[] = {{dst, bytes}, {tail, tail_bytes}};
+  return weightPreadScatter(fd, slices, 2, offset);
+}
 
 int weightPread(int fd, void *dst, size_t bytes, uint64_t offset) {
   return weightPreadSplit(fd, dst, bytes, nullptr, 0, offset);

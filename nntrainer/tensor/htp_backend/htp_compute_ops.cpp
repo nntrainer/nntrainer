@@ -6519,6 +6519,9 @@ private:
                      e.rt_overlap_us / rr, static_cast<double>(e.miss_us) / rr,
                      e.rt_anslat_us / rr, e.rt_rebind_us / rr);
       }
+      if (e.pool_pair_reads)
+        std::fprintf(stderr, "[HTP] token driver: expert_pair_reads=%llu\n",
+                     (unsigned long long)e.pool_pair_reads);
       if (pf_hints_ != 0 || pf_issued_ != 0) // the hint path ran
         std::fprintf(stderr,
                      "[HTP] token driver: prefetch hints/token=%.2f "
@@ -8116,6 +8119,10 @@ private:
     }
     // Keep decode worker tuning independent of prefill lookahead.
     size_t readers = prefetchThreads();
+    if (std::getenv("NNTR_MOE_PREFETCH") == nullptr &&
+        weightPageCachePolicy() == 0 &&
+        pool_descs_[0][0].w_bits == HTP_TL2_WEIGHT_BITS)
+      readers = htp_fixed::TL2_DIRECT_PREFETCH_READERS;
     if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
       readers =
         std::max<size_t>(1, std::min<size_t>(8, std::strtoul(v, nullptr, 10)));
@@ -8162,8 +8169,10 @@ private:
         if ((caller & (1u << c)) == 0)
           cpus.push_back(c);
     }
-    auto queue = std::make_shared<HtpExpertPrefetch<StagedExpert>>(
-      std::move(slots), readers, [this, cpus](StagedExpert &st) {
+    using Prefetch = HtpExpertPrefetch<StagedExpert>;
+    auto queue = std::make_shared<Prefetch>(
+      std::move(slots), readers,
+      [this, cpus](StagedExpert &st, const Prefetch::CancelCheck &cancelled) {
         // ThreadManager pins the caller; readers must not inherit that
         // single core and delay the mailbox server on every expert read.
         thread_local bool pinned = false;
@@ -8171,8 +8180,18 @@ private:
           pinToCpus(cpus);
           pinned = true;
         }
-        st.rc = readExpert(st, false, false);
-        return st.rc == 0;
+        st.rc = readExpertWeight(st, false, false);
+        if (st.rc != 0)
+          return Prefetch::ReadResult::Failed;
+        // A real miss claims its read before expiry, so only a retired guess
+        // can skip down. The worker still owns its slot until it returns.
+        if (st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
+            weightPageCachePolicy() == 0 && cancelStaleExpertReads() &&
+            cancelled())
+          return Prefetch::ReadResult::Cancelled;
+        st.rc = readExpertWeight(st, true, false);
+        return st.rc == 0 ? Prefetch::ReadResult::Complete
+                          : Prefetch::ReadResult::Failed;
       });
     pool_prefetch_ = queue;
     if (predict == 2u)
@@ -8196,11 +8215,13 @@ private:
       std::fprintf(
         stderr,
         "[HTP-PREFETCH] submitted=%llu completed=%llu used=%llu late=%llu "
-        "discarded=%llu failed=%llu full=%llu joined=%llu registration_rpc=0\n",
+        "discarded=%llu failed=%llu full=%llu joined=%llu cancelled=%llu "
+        "registration_rpc=0\n",
         (unsigned long long)s.submitted, (unsigned long long)s.completed,
         (unsigned long long)s.used, (unsigned long long)s.late,
         (unsigned long long)s.discarded, (unsigned long long)s.failed,
-        (unsigned long long)s.full, (unsigned long long)s.joined);
+        (unsigned long long)s.full, (unsigned long long)s.joined,
+        (unsigned long long)s.cancelled);
     });
   }
 
@@ -8483,6 +8504,72 @@ private:
                            e, use_pool);
   }
 
+  /** Diagnostic opt-outs keep both changes independently measurable. */
+  static bool coalesceExpertReads() {
+    static const bool enabled = [] {
+      const char *v = std::getenv("NNTR_MOE_COALESCE_READ");
+      return !v || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+  }
+
+  static bool cancelStaleExpertReads() {
+    static const bool enabled = [] {
+      const char *v = std::getenv("NNTR_MOE_CANCEL_STALE_READ");
+      return !v || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+  }
+
+  static bool validNativeTl2Shape(uint32_t K, uint32_t N) {
+    return K && N && K <= 8192u && N <= 8192u && K % 32u == 0 &&
+           N % 128u == 0 && htp_tl2_native_bytes(K, N) <= whBytes2(K, N);
+  }
+
+  /** Only adjacent native TL2 records that fit one aligned direct read.
+   * Invalid shapes fall through to the regular reader's error handling. */
+  static bool canReadExpertTogether(const ExpertFileDesc &d) {
+    if (!coalesceExpertReads() || weightPageCachePolicy() != 0 ||
+        d.w_bits != HTP_TL2_WEIGHT_BITS || !d.inter || d.inter > 4096u ||
+        !validNativeTl2Shape(d.K, 2u * d.inter) ||
+        !validNativeTl2Shape(d.inter, d.N_out))
+      return false;
+    const size_t gu_bytes =
+      htp_tl2_native_bytes(d.K, 2u * d.inter) + 8u * (2u * d.inter);
+    const size_t dn_bytes =
+      htp_tl2_native_bytes(d.inter, d.N_out) + 8u * d.N_out;
+    if (d.off_dn < d.off_gu || d.off_dn - d.off_gu != gu_bytes ||
+        d.off_dn > UINT64_MAX - dn_bytes)
+      return false;
+    return gu_bytes + dn_bytes <=
+           WEIGHT_DIRECT_WINDOW_BYTES - d.off_gu % WEIGHT_DIRECT_ALIGNMENT;
+  }
+
+  /** Demand only: read the two payloads and metadata tails through the same
+   * bounded scratch, without an intermediate full expert copy. */
+  int readExpertTogether(StagedExpert &st) {
+    const ExpertFileDesc &d = st.d;
+    const uint32_t gu_n = 2u * d.inter;
+    const uint32_t gu_stride = expertStride(d.K, gu_n, d.w_bits);
+    std::vector<float> gu_tail(2u * gu_n), dn_tail(2u * d.N_out);
+    const WeightReadSlice parts[] = {
+      {st.base, htp_tl2_native_bytes(d.K, gu_n)},
+      {gu_tail.data(), gu_tail.size() * sizeof(float)},
+      {st.base + gu_stride, htp_tl2_native_bytes(d.inter, d.N_out)},
+      {dn_tail.data(), dn_tail.size() * sizeof(float)}};
+    const int rc = weightPreadScatter(d.fd, parts, 4, d.off_gu);
+    if (rc)
+      return rc;
+    st.gu.chunk = st.dn.chunk = st.slot.chunk;
+    st.gu.off = st.slot.off;
+    st.dn.off = st.slot.off + gu_stride;
+    const int gu_rc =
+      finishTl2Weight(d.K, gu_n, gu_tail.data(), st.base, st.gu);
+    return gu_rc ? gu_rc
+                 : finishTl2Weight(d.inter, d.N_out, dn_tail.data(),
+                                   st.base + gu_stride, st.dn);
+  }
+
   /** Move a filled spare into a retired DSP pair without a copy or RPC. */
   static void adoptPrefetch(StagedExpert &st, StagedExpert &ready) {
     ready.slot.h_gu = st.slot.h_gu;
@@ -8493,8 +8580,9 @@ private:
     st.prefetch_claimed = false;
   }
 
-  /** @brief [#266] A miss round's reads, all at once: one job per weight
-   *  (two per expert), NNTR_MOE_MISS_READERS threads of the ThreadManager
+  /** @brief [#266] A miss round's reads, all at once: one job per weight,
+   *  or per adjacent native TL2 pair that fits one direct read.
+   *  NNTR_MOE_MISS_READERS threads of the ThreadManager
    *  taking them in turn, each job one whole-range pread plus its tail.
    *  The S25 probe (docs/measurements/266-miss-readers.md): rounds of 3
    *  experts into ION read 3.1 GiB/s this way at 4 readers, 1.8 GiB/s as
@@ -8506,10 +8594,16 @@ private:
 
   void readMisses(std::vector<StagedExpert> &st) {
     std::vector<size_t> jobs;
+    std::vector<bool> together(st.size(), false);
+    size_t pair_reads = 0;
     for (size_t i = 0; i < st.size(); ++i)
       if (!st[i].prefetched && !st[i].prefetch_claimed) {
+        together[i] = canReadExpertTogether(st[i].d);
         jobs.push_back(2 * i);
-        jobs.push_back(2 * i + 1);
+        if (together[i])
+          ++pair_reads;
+        else
+          jobs.push_back(2 * i + 1);
       }
     const size_t n_jobs = jobs.size();
     std::vector<int> rc(2 * st.size(), 0);
@@ -8519,7 +8613,9 @@ private:
         0, std::min(missReaders(), n_jobs), [&](size_t) {
           for (size_t j; (j = next.fetch_add(1)) < n_jobs;) {
             const size_t part = jobs[j];
-            rc[part] = readExpertWeight(st[part / 2], part % 2 != 0, false);
+            rc[part] = together[part / 2]
+                         ? readExpertTogether(st[part / 2])
+                         : readExpertWeight(st[part / 2], part % 2 != 0, false);
           }
         });
     for (size_t i = 0; i < st.size(); ++i) {
@@ -8530,10 +8626,18 @@ private:
           expert.d.key_gu,
           [&expert](StagedExpert &ready) { adoptPrefetch(expert, ready); });
         expert.prefetch_claimed = false;
-        if (!ok)
-          expert.rc = readExpert(expert, false, false);
+        if (!ok) {
+          if (canReadExpertTogether(expert.d)) {
+            ++pair_reads;
+            expert.rc = readExpertTogether(expert);
+          } else {
+            expert.rc = readExpert(expert, false, false);
+          }
+        }
       }
     }
+    if (e2e_st_)
+      e2e_st_->pool_pair_reads += pair_reads;
   }
 
   /** @brief [#266] NNTR_MOE_MISS_READERS: the miss round's reader count
@@ -9106,34 +9210,39 @@ private:
     return nullptr;
   }
 
+  /** Native file tails are FP32; arena metadata follows QS2 capacity. */
+  static int finishTl2Weight(uint32_t K, uint32_t N, const float *tail,
+                             uint8_t *arena_dst, ArenaEntry &e) {
+    const size_t capacity = whBytes2(K, N);
+    std::vector<int32_t> sums(N);
+    for (uint32_t n = 0; n < N; ++n) {
+      if (!std::isfinite(tail[n]) || tail[n] < 0.0f ||
+          !std::isfinite(tail[N + n]) ||
+          std::abs(tail[N + n]) > static_cast<float>(K))
+        return EINVAL;
+      sums[n] = static_cast<int32_t>(tail[N + n]);
+    }
+    std::memcpy(arena_dst + capacity, tail, N * sizeof(float));
+    std::memcpy(arena_dst + capacity + N * sizeof(float), sums.data(),
+                N * sizeof(int32_t));
+    e.pal = {-1, 0, 1, 1};
+    e.K = K;
+    e.N = N;
+    return 0;
+  }
+
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N, uint32_t w_bits,
                  uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
     const size_t nib = codeBytes(K, N, w_bits);
     if (w_bits == HTP_TL2_WEIGHT_BITS) {
-      const size_t capacity = whBytes2(K, N);
-      if (!K || !N || K % 32u || N % 128u || K > 8192u || N > 8192u ||
-          nib > capacity)
+      if (!validNativeTl2Shape(K, N))
         return EINVAL;
       std::vector<float> tail(2u * N);
       const int rc = preadAll(fd, arena_dst, nib, off, tail.data(),
                               tail.size() * sizeof(float));
       if (rc)
         return rc;
-      std::vector<int32_t> sums(N);
-      for (uint32_t n = 0; n < N; ++n) {
-        if (!std::isfinite(tail[n]) || tail[n] < 0.0f ||
-            !std::isfinite(tail[N + n]) ||
-            std::abs(tail[N + n]) > static_cast<float>(K))
-          return EINVAL;
-        sums[n] = static_cast<int32_t>(tail[N + n]);
-      }
-      std::memcpy(arena_dst + capacity, tail.data(), N * sizeof(float));
-      std::memcpy(arena_dst + capacity + N * sizeof(float), sums.data(),
-                  N * sizeof(int32_t));
-      e.pal = {-1, 0, 1, 1};
-      e.K = K;
-      e.N = N;
-      return 0;
+      return finishTl2Weight(K, N, tail.data(), arena_dst, e);
     }
     // [#282] a pinned expert is a DDR copy, never a file read
     const size_t pal0 = paletteBytes(w_bits);
@@ -10199,6 +10308,8 @@ private:
     /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
     uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
+    uint64_t pool_pair_reads =
+      0; /**< adjacent TL2 demand pairs read together */
     /** [#282 C] a miss round's parts, us summed: post -> the server
      *  noticed it, its work before the reads, the reads, S1's present
      *  experts computed meanwhile, the answer written -> S1 saw it, S1's
