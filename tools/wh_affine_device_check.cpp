@@ -55,7 +55,7 @@ static void check_moe(remote_handle64 session, unsigned K, unsigned I,
             wn, reference_sums.data(), wn, bias.data(), wn, handles + 2 + h),
           "reference MoE registration");
   }
-  for (unsigned M : {2u, 64u, 65u, 129u}) {
+  for (unsigned M : {1u, 2u, 3u, 4u, 64u, 65u, 129u}) {
     std::vector<float> input(M * K), actual(M * N), expected(M * N);
     std::vector<uint32_t> rows(M);
     std::vector<float> routing(M);
@@ -163,8 +163,14 @@ int main() {
     for (auto h : handles)
       check(nntr_hvx_weight_release_u8i4(session, h), "release");
   }
-  check_moe(session, 96, 192, 128);
-  check_moe(session, 2816, 704, 2816);
+  for (uint32_t flags : {0u, 0x21u, 0xcf03e1u}) {
+    uint32_t applied = 0;
+    check(nntr_hvx_moe_set_opts(session, flags, &applied), "MoE options");
+    check(applied != flags, "MoE options mismatch");
+    std::printf("MOE_FLAGS 0x%x\n", applied);
+    check_moe(session, 96, 192, 128);
+    check_moe(session, 2816, 704, 2816);
+  }
   check(nntr_hvx_close(session), "close");
   std::puts("AFFINE_DSP_PASS");
 }
