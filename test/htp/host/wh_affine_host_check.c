@@ -114,7 +114,9 @@ int main(void) {
       input[r * K + k] = rndf();
   }
   hexkl_moe_scratch scratch = {0};
-  for (uint32_t M = 1u; M <= 65u; M = M == 1u ? 2u : M == 2u ? 64u : M + 1u) {
+  for (uint32_t M = 1u; M <= 65u; M = M < 4u    ? M + 1u
+                                      : M == 4u ? 64u
+                                                : M + 1u) {
     for (uint32_t r = 0; r < M; ++r)
       rows[r] = M - 1u - r;
     for (uint32_t workers = 0; workers <= 3u; workers += 3u) {
@@ -129,6 +131,23 @@ int main(void) {
       }
       assert(memcmp(want, got, (size_t)M * N * sizeof(float)) == 0);
       printf("Affine WH dense FFN exact M=%u workers=%u\n", M, workers);
+      if (M <= 4u) {
+        const uint32_t flags[] = {
+          HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET, 0xcf03e1u};
+        for (uint32_t f = 0; f < sizeof(flags) / sizeof(flags[0]); ++f) {
+          uint32_t gu = 0u, dn = 1u;
+          assert(hexkl_mm_u8i4_moe_layer_run(
+                   &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, I, N, 1u, &gu,
+                   &dn, rows, &M, routing, input, got, NULL, &scratch,
+                   flags[f] | HEXKL_MOE_FLAG_GELU_TANH) == 0);
+          /** Affine decode must use GEMV, including on the DSP queue thread
+           * that does not own the FastRPC caller's HMX lock. */
+          assert(hexkl_probe_us[HEXKL_PROBE_PATH] == 1u);
+          assert(memcmp(want, got, (size_t)M * N * sizeof(float)) == 0);
+          printf("Affine WH GEMV equals HMX M=%u workers=%u flags=0x%x\n", M,
+                 workers, flags[f]);
+        }
+      }
       for (uint32_t mode = 0; mode < 2u; ++mode) {
         uint32_t h = mode ? 0u : 2u;
         hexkl_mm_opts opts = {0};

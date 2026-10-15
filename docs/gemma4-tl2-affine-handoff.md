@@ -454,5 +454,64 @@ skip되었고, 실제 HVX 경로는 위 simulator와 device 검증으로 별도 
 ASan/UBSan, v79/v81 DSP 빌드, clang-format 14 변경 줄 검사도 통과했다.
 Expert swap의 `real fast` 옵션도 실제 기기에서 4회 교체 결과가 일치했다.
 
-Prefill 첫 출력 ID의 일치는 전체 생성 품질 검증이 아니다. 전체 decode,
-원본 checkpoint 대비 PPL, 모든 CI platform은 이번 속도 검증 범위 밖이다.
+Prefill 첫 출력 ID의 일치는 전체 생성 품질 검증이 아니다. 이 절의 속도
+검증은 decode를 제외한다. 이후의 전체 생성 검증은 아래 10절에 기록한다.
+원본 checkpoint 대비 PPL과 모든 CI platform은 이번 검증 범위 밖이다.
+
+## 10. Affine FFN decode 수정과 전체 생성 확인
+
+`62fdb7145760e37b4f58e54c38b10d77af26993e`에서 전체 생성을 실행하면 첫
+decode의 `nntr_dspq` thread가 `hexkl_micro_hmx_acc_clear_int32`에서 DSP
+exception을 일으켰다. Host에는 이후 `S1 did not rebind a pool load`가
+보고됐다. Affine weight를 M=1 GEMV에서 제외하는 조건 때문에 dense FFN이
+FastRPC caller의 HMX 경로로 들어간 것이 문제였다.
+
+Gate/up과 requantized down activation의 `sum(u-zp)`를 expert별로 보관하고,
+GEMV의 int32 accumulator에 `offset * sum(u-zp)`를 더한 뒤 기존 dequant를
+실행하도록 수정했다. Affine weight도 기존 M=1~4 GEMV 경로를 사용한다.
+큰 M의 affine tail 경로 제한과 prefill 산술은 유지한다.
+
+### 검증
+
+- Host: M=1/2/3/4, worker 0/3, VTCM feed off/on에서 독립 int4 HMX
+  reference와 bit-identical. GEMV 경로 선택도 assert해 HMX fallback을 잡는다.
+- S26 Ultra: 작은 shape `K=96,I=192,N=128`과 실제 Gemma shape
+  `K=2816,I=704,N=2816`, M=1/2/3/4/64/65/129, flags
+  `0x0`(HMX), `0x21`(GEMV feed off), `0xcf03e1`(운영 옵션)을 각 3회 실행해
+  모든 affine FFN 출력이 독립 int4 reference와 bit-identical이다.
+  기존 affine FC와 마지막 행 LM head 검사도 통과했다.
+- 전체 HTP host suite가 exit 0으로 완료됐다. 선택 항목인 libnative 및
+  AArch64/qemu 검사는 도구 부재로 skip됐다. Affine ASan/UBSan, v79/v81
+  DSP 빌드, clang-format 14 변경 줄 검사, Doxygen 검사도 통과했다.
+
+2048토큰 고정 입력, C=16, page cache off, `num_to_generate=128`로 CLI 전체
+생성을 실행했다. 수정 직후 profile 1 실행과 최종 빌드의 계측 off 실행 모두
+prefill ID `818`과 decode 101개를 포함한 **102개 출력 ID가 완전히 일치**하고
+EOS에서 끝났다. 최종 실행의 로그와 artifact hash, ID 전체는
+[생성 로그](validation/gemma4-tl2-affine-decode-s26-20261015.log)와
+[검증 JSON](validation/gemma4-tl2-affine-decode-s26-20261015.json)에 보관한다.
+CLI의 decode 출력은 공백으로 시작하며, prefill 출력 ID는 별도 ID 파일에
+포함된다. 생성 문장은 그대로 보관했다. 저장소의 whitespace 검사를 위해
+e2e 측정 줄의 끝 공백 한 글자만 제거했고, 원본과 보관본 hash는 JSON에
+각각 기록했다.
+
+| 전체 생성 실행 | Prefill | Decode |
+|---|---:|---:|
+| 수정 직후, profile 1 | 3693ms / 554.563 TPS | 101토큰 / 11.7101 TPS |
+| 최종 빌드, 계측 off | 3296ms / 621.359 TPS | 101토큰 / 11.6939 TPS |
+
+생성된 3문장은 원문의 어업·농업, 역사, lifeboat와 공동체를 일관되게
+요약한다. 이는 한 prompt의 정상 생성 확인이며 일반적인 품질이나 PPL
+검증을 의미하지 않는다. **700 TPS 목표는 아직 달성하지 못했다.** 9절의
+641.81 TPS는 이전 커밋의 prefill-only 5회 중앙값이며 위 단일 전체 생성
+실행과 합쳐서 집계하지 않는다.
+
+LM head는 prefill의 마지막 행 하나에 대해 NPU GEMV를 수행한다.
+262144개 출력을 4096열씩 64개 WH slice로 처리하며, 8개 lane과 lane별
+double-buffer DMA를 사용한다. 기존 641.81 TPS 측정에도 포함된 경로다.
+최종 decode의 LM head 평균은 6.354ms/token이며 prefill 전체의 주 병목은
+별도로 분석해야 한다.
+
+라우터의 cached scratch 실험은 profile 1 비교에서 3293ms → 3299ms로,
+전체 prefill 개선을 확인하지 못했다. 이 실험은 후속 검토용 패치로 보관하고
+이번 수정에는 포함하지 않았다.

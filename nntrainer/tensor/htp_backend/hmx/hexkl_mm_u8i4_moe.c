@@ -999,6 +999,8 @@ typedef struct {
   float *rq_scale; /**< 64: the requantization's row params */
   int32_t *rq_zp;
   float *res; /**< m x N_out, read by the scatter */
+  int32_t gu_affine_sums[MOE_M1_MAX_ROWS];
+  int32_t dn_affine_sums[MOE_M1_MAX_ROWS];
   /** Register LUT source for native packed-2-bit GEMV.  Kept per weight:
       gate_up and down have independent palettes. */
   uint8_t g_lut[HVX_EXPAND_TABLE_BYTES] __attribute__((aligned(128)));
@@ -1256,6 +1258,13 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
           e->act_ah, e->m, c->k_tiles, e->gu_wh, c->gu_ntiles,
           c->inter_ntiles + j, c->rows1, tiles + MOE_M1_TILE_I32);
       }
+      if (e->g->w_offset) {
+        hexkl_wh_affine_acc(tiles, 32u, e->m, 32u, e->g->w_offset + j * 32u,
+                            e->gu_affine_sums);
+        hexkl_wh_affine_acc(tiles + MOE_M1_TILE_I32, 32u, e->m, 32u,
+                            e->g->w_offset + c->inter + j * 32u,
+                            e->gu_affine_sums);
+      }
       hvx_dequant_swiglu_acc_tiles_to_f32(
         (const uint8_t *)tiles, MOE_M1_TILE_BYTES, 1u, j,
         HEXKL_HMX_INT8_BLOCK_N_COL, e->m, e->act_scale, e->act_zp,
@@ -1268,11 +1277,11 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
 
 /** @brief Stage B. One expert per unit: moe_tail_requant_unit's body. */
 static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
-  const moe_m1_ctx *c = (const moe_m1_ctx *)v;
+  moe_m1_ctx *c = (moe_m1_ctx *)v;
   uint32_t lo, hi;
   moe_m1_slice(0u, c->n_active, n_lanes, i, &lo, &hi);
   for (uint32_t u = lo; u < hi; ++u) {
-    const moe_m1_expert *e = &c->ex[u];
+    moe_m1_expert *e = &c->ex[u];
     if (e->g->tl2_bytes && c->tl2_fused)
       moe_tl2_gate_epilogue(c, u * c->inter_ntiles, (u + 1u) * c->inter_ntiles);
     const uint32_t m4 = ROUND_UP_U32(e->m, 4u);
@@ -1284,6 +1293,9 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
                              c->inter, e->rq_scale, e->rq_zp, NULL);
     hvx_quant_pack_u8_ah_rows(e->gate_f32, NULL, 0u, m4, c->inter, e->rq_scale,
                               e->rq_zp, e->mid_ah);
+    if (e->d->w_offset)
+      hexkl_wh_affine_sums(e->mid_ah, e->m, c->inter, e->rq_zp,
+                           e->dn_affine_sums);
     if (e->d->tl2_bytes)
       moe_tl2_prepare_ah(e->mid_ah, c->inter, e->tl2_down);
   }
@@ -1349,6 +1361,9 @@ static void moe_m1_down_worker(uint32_t n_lanes, uint32_t i, void *v) {
           e->mid_ah, e->m, c->inter_ktiles, e->dn_wh, c->dn_ntiles, nt,
           c->rows1, tile);
       }
+      if (e->d->w_offset)
+        hexkl_wh_affine_acc(tile, 32u, e->m, 32u, e->d->w_offset + c0,
+                            e->dn_affine_sums);
       hvx_dequant_acc_tile_to_f32(tile, HEXKL_HMX_INT8_BLOCK_N_COL, e->m,
                                   e->rq_scale, e->rq_zp, e->d->colsum_w + c0,
                                   e->d->w_scale + c0, e->d->bias + c0,
@@ -1846,8 +1861,9 @@ int hexkl_mm_u8i4_moe_layer_run(
 
   /** Decided once for the call, after the handles are validated; gates both
      HVX paths (moe_all_4bit). */
-  const int allow_tail =
-    !n_affine && moe_all_4bit(tbl, n_experts, h_gate_up, h_down, row_count);
+  const int all_4bit =
+    moe_all_4bit(tbl, n_experts, h_gate_up, h_down, row_count);
+  const int allow_tail = !n_affine && all_4bit;
   const int all_2bit =
     moe_all_2bit(tbl, n_experts, h_gate_up, h_down, row_count);
   /** The HMX path's queued 2-bit expansions (exp_ctx below). Here, ahead of
@@ -1871,8 +1887,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Packed 2-bit weights take the native LUT GEMV (hvx_gemm_u8i2_wh_*);
      four-bit ones the i4 GEMV. A call that mixes the two widths takes the
      HMX path, which expands the 2-bit chunks in VTCM first. */
-  const int use_m1 =
-    !n_affine && m1_shape && (allow_tail || all_2bit) && (!n_tl2 || M == 1u);
+  const int use_m1 = m1_shape && (all_4bit || all_2bit) && (!n_tl2 || M == 1u);
   /** [#267 L3] one row per active expert: only the M = 1 GEMV scatter
      below knows how; refused before anything is written. */
   const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
@@ -2322,6 +2337,8 @@ int hexkl_mm_u8i4_moe_layer_run(
       x->tl2_down =
         (int16_t *)((uint8_t *)m1.tl2_gate + tl2_gu_tables + i * tl2_dn_tables);
       x->m = row_count[e];
+      if (x->g->w_offset)
+        hexkl_wh_affine_sums(x->act_ah, x->m, K, x->act_zp, x->gu_affine_sums);
       if (use_tl2 && i == 0u)
         moe_tl2_prepare_ah(x->act_ah, K, m1.tl2_gate);
     }
