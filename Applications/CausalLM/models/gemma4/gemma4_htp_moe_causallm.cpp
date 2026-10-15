@@ -269,16 +269,18 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
   // q | k (| v), o; up, gate, down; the tied table.
   // [#260] an FC / dense weight may be QS4CX (fc_layer_dtype QS4CX): it
   // binds the WH handles the prefill registers from the same bytes
-  // The LM_HEAD is Q4M1, so Q4_0 only (tied: the embedding's own bytes).
+  // The LM_HEAD: Q4_0 as Q4M1 slices (tied: the embedding's own bytes), or
+  // an untied QS4CX head (lmhead_dtype QS4CX) as WH slices like an FC, the
+  // same handles serving the prefill's last row (lm_head_shared_fp32).
   auto q4 = [&weight, ops](const std::string &name, bool tied,
                            bool lm_head = false) {
     nntrainer::Tensor &t = weight(name);
     const auto dt = t.getDataType();
-    const bool qs4cx = !lm_head && dt == ml::train::TensorDim::DataType::QS4CX;
+    const bool qs4cx = dt == ml::train::TensorDim::DataType::QS4CX;
     if (dt != ml::train::TensorDim::DataType::Q4_0 && !qs4cx)
-      throw std::runtime_error(
-        "[Gemma4MoE] NNTR_HTP_E2E: " + name + " is not " +
-        (lm_head ? "Q4_0, the LM_HEAD's type" : "Q4_0 or QS4CX, the FC types"));
+      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + name +
+                               " is not Q4_0 or QS4CX, the " +
+                               (lm_head ? "LM_HEAD's" : "FC") + " types");
     const unsigned K = tied ? t.width() : t.height();
     const unsigned N = tied ? t.height() : t.width();
     if (qs4cx ? !ops->add_decode_graph_qs4cx(t.getData<char>(),

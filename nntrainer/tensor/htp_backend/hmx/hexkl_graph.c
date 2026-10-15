@@ -737,11 +737,17 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   int rc;
   (void)out;
-  if (call->env->fc == NULL) {
-    return AEE_EBADSTATE;
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    /** an untied head's QS4CX slices as WH handles: the FC's one call (its
+       own u8 row quantization) straight into the logits */
+    rc = graph_op_fc_wh(op, call, in, g->logits);
+  } else {
+    if (call->env->fc == NULL) {
+      return AEE_EBADSTATE;
+    }
+    graph_prep(op, in, op->K, &g->act);
+    rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
   }
-  graph_prep(op, in, op->K, &g->act);
-  rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
   if (rc == AEE_SUCCESS && op->eps_bits != 0u) {
     hvx_softcap_m1_f32(g->logits, op->N, graph_eps(op), call->env->pool);
   }
@@ -861,7 +867,8 @@ static int graph_check_q4m1(const htp_graph_op *op,
 }
 
 /** [#225] A resident op's WH handles (HTP_GRAPH_FEED_WH) against the
-   session's table: an FC's parts K x N_p, N_p % 32, summing to N; a
+   session's table: an FC's (or an untied LM_HEAD's) parts K x N_p,
+   N_p % 32, summing to N; a
    DENSE_FFN's n_experts chunks (<= HTP_GRAPH_WH_DENSE_MAX_CHUNKS) gate |
    up K x 2w and down w x N_out, w = N / n_experts. */
 static int graph_check_wh(const htp_graph_op *op,
@@ -881,7 +888,8 @@ static int graph_check_wh(const htp_graph_op *op,
     }
     return AEE_SUCCESS;
   }
-  if (op->kind != HTP_OP_FC || op->n_experts == 0u) {
+  if ((op->kind != HTP_OP_FC && op->kind != HTP_OP_LM_HEAD) ||
+      op->n_experts == 0u) {
     return AEE_EINVHANDLE;
   }
   for (p = 0; p < op->n_experts; ++p) {
@@ -972,6 +980,13 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
       return AEE_ENOMEMORY;
     }
   }
+  /* the logits: an LM_HEAD's output whichever feed it has */
+  g->logits =
+    vocab_out ? (float *)malloc((size_t)vocab_out * sizeof(float)) : NULL;
+  if (vocab_out && g->logits == NULL) {
+    hexkl_graph_free(g);
+    return AEE_ENOMEMORY;
+  }
   if (q4m1_ops != 0u) {
     /* q (K bytes, 128-aligned) then s8 / ma / ea / df / d per block */
     const size_t nb = HEXKL_GRAPH_Q4M1_MAX_K / 32u;
@@ -979,10 +994,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     g->q4m1 =
       (hexkl_graph_q4m1_shape *)malloc((size_t)n_q4m1 * sizeof(*g->q4m1));
     g->ffn = ffn_n ? (float *)malloc((size_t)3u * ffn_n * sizeof(float)) : NULL;
-    g->logits =
-      vocab_out ? (float *)malloc((size_t)vocab_out * sizeof(float)) : NULL;
-    if (g->act_buf == NULL || g->q4m1 == NULL || (ffn_n && g->ffn == NULL) ||
-        (vocab_out && g->logits == NULL)) {
+    if (g->act_buf == NULL || g->q4m1 == NULL || (ffn_n && g->ffn == NULL)) {
       hexkl_graph_free(g);
       return AEE_ENOMEMORY;
     }

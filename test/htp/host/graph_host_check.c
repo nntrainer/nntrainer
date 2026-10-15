@@ -458,7 +458,7 @@ static void check_validator(void) {
   uint32_t n_ops = 0, i, rc;
   char names[128];
   CHECK(n != 0u, "LFM2.5 build refused");
-  CHECK(HTP_GRAPH_OP_WORDS == 80u && HTP_GRAPH_VERSION == 2u, "wire v2");
+  CHECK(HTP_GRAPH_OP_WORDS == 144u && HTP_GRAPH_VERSION == 3u, "wire v3");
   rc = htp_graph_validate(w, n, resident_ok, &n_ops);
   CHECK(rc == 0u, "LFM2.5 validate: %s", htp_graph_err_name(rc));
   CHECK(n_ops == 228u, "LFM2.5 n_ops %u (want 228)", n_ops);
@@ -2027,15 +2027,14 @@ static void check_wh(void) {
   op->n_experts = 2u;
   CHECK(h == 10u, "hd64 WH FC parts %u", h - 2u);
 
-  /* the validator: WH on FC / DENSE_FFN, never on LM_HEAD */
+  /* the validator: WH on FC / DENSE_FFN, and on LM_HEAD (an untied head) */
   rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
   CHECK(rc == 0u, "WH list: %s", htp_graph_err_name(rc));
   err |= rc != 0u;
   op->feed = HTP_GRAPH_FEED_WH;
   rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
-  CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "WH LM_HEAD: %s",
-        htp_graph_err_name(rc));
-  err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
+  CHECK(rc == 0u, "WH LM_HEAD: %s", htp_graph_err_name(rc));
+  err |= rc != 0u;
   op->feed = 0u;
   /** init: a part of another K, parts short of N, a down of another shape,
      no chunk, a free part handle, a 2-bit part */
@@ -2126,14 +2125,56 @@ static void check_wh(void) {
     err |= !ok;
   }
   hexkl_graph_free(g);
-  for (i = 2u; i < 10u; ++i)
+  g = NULL;
+  /** the LM_HEAD on WH slices (an untied QS4CX head): no Q4M1 kind left,
+     init still allocates the logits; forward is the FC call into them and
+     the argmax over them; uses_handle sees the slices, uses_q4m1 nothing */
+  op = htp_graph_op_at(w, lm);
+  op->feed = HTP_GRAPH_FEED_WH;
+  register_weight(10u, HID, 32u);
+  register_weight(11u, HID, 32u);
+  op->h_gu[0] = 10u;
+  op->h_gu[1] = 11u;
+  op->n_experts = 2u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "WH LM_HEAD init: %s", htp_graph_err_name(rc));
+  err |= rc != 0u;
+  if (g != NULL) {
+    static float lg[64], lref[64];
+    uint32_t best = 0, j;
+    fill(x, HID, &seed);
+    memset(&g_fc_last, 0, sizeof(g_fc_last));
+    rc = (uint32_t)hexkl_graph_forward(g, &env, lm, 1u, 0u, NULL, x, HID, lg,
+                                       64u, &resume);
+    {
+      const fc_args got = g_fc_last;
+      int ok;
+      (void)hexkl_mm_u8i4_fc_m1_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, HID,
+                                    2u, g->ops[lm].h_gu, x, lref, env.pool,
+                                    &g_scratch, 0x703e1u);
+      for (j = 1u; j < 64u; ++j)
+        if (lref[j] > lref[best])
+          best = j;
+      ok = rc == 0u && resume == lm + 1u && got.n_calls == 1u &&
+           got.n_parts == 2u && got.h[0] == 10u && got.h[1] == 11u &&
+           got.K == HID && memcmp(lg, lref, sizeof(lg)) == 0 &&
+           g->lm_id == best && hexkl_graph_uses_handle(g, 11u) &&
+           !hexkl_graph_uses_q4m1(g, 1u);
+      CHECK(ok, "[LM_HEAD WH]: %s parts %u lm_id %u want %u",
+            htp_graph_err_name(rc), got.n_parts, g->lm_id, best);
+      err |= !ok;
+    }
+    hexkl_graph_free(g);
+  }
+  for (i = 2u; i < 12u; ++i)
     g_tbl.slots[i].in_use = 0;
   for (i = 100u; i < 104u; ++i)
     g_tbl.slots[i].in_use = 0;
   if (err == 0)
     printf("GRAPH FC WH OK: FC q|k|v (3 WH parts, one call, L2 bit = arena "
            "read) and DENSE_FFN (2 chunks as experts of weight 1, M = 1) hand "
-           "the kernels the prefill's handles; WH LM_HEAD refused; init "
+           "the kernels the prefill's handles; a WH LM_HEAD runs the FC "
+           "call into the logits and picks the argmax; init "
            "refuses another K / short parts / a bad down / no chunk / a free "
            "handle / a 2-bit part; uses_handle sees WH ops, uses_q4m1 skips "
            "them\n");

@@ -184,10 +184,10 @@ that matter:
 | `gemma4_execution_profile` | `htp_fused` | selects the fused HTP model instead of the default Gemma4 model |
 | `gemma4_weight_format` | `htp_fused_v1` | the only layout the loader accepts |
 | `moe_layer_dtype` / `fc_layer_dtype` | `QS2CX_WH` / `QS4CX` | expert and dense weight formats |
-| `embedding_dtype` / `lmhead_dtype` | `Q4_0` | embedding table and head |
+| `embedding_dtype` / `lmhead_dtype` | `Q4_0` | embedding table and head; an untied head (`tie_word_embeddings: false` in `config.json`) may be `QS4CX`, and then runs on the DSP as WH slices for both the prefill's last row and decode |
 | `attention_kv_dtype` | `q8` | int8 KV cache (required) |
 | `moe_engine`, `attention_engine`, `attn_proj_engine`, `dense_ffn_engine` | `htp` | which blocks run on the DSP |
-| `lmhead_engine` | `cpu` | the head stays split between DSP and CPU |
+| `lmhead_engine` | `cpu` | the tied Q4_0 head stays split: the DSP runs decode, the CPU the prefill's last row; a `QS4CX` untied head ignores this key and runs on the DSP throughout |
 | `moe_cache_experts` | `16` | experts kept resident per layer |
 | `init_seq_len` / `max_seq_len` | `1280` | context |
 | `num_to_generate` | `127` | generation budget per call |
