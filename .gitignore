@@ -119,3 +119,6 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+gemma4-26b-*
+hexkl-1.0-beta.2/
+lfm2-24ba2b*

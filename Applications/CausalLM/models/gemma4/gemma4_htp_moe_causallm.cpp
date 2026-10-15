@@ -51,17 +51,26 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
       ATTENTION_ENGINE != "htp")
     throw std::invalid_argument(
       "Gemma4 htp_fused has an unsupported attention_engine");
-  if ((MOE_LAYER_DTYPE == "QS2CX_WH" || MOE_LAYER_DTYPE == "QS4CX_WH") &&
+  if ((MOE_LAYER_DTYPE == "QS2CX_WH" || MOE_LAYER_DTYPE == "QS4CX_WH" ||
+       MOE_LAYER_DTYPE == "TL2CX_WH") &&
       (MOE_ENGINE != "htp" || !MOE_HTP_LAYERS.empty()))
     throw std::invalid_argument(
       "HTP WH expert weights require every expert layer on HTP");
   if (MOE_LAYER_DTYPE != "FP32" && MOE_LAYER_DTYPE != "Q4_0" &&
       MOE_LAYER_DTYPE != "QS4CX" && MOE_LAYER_DTYPE != "QS2CX_WH" &&
-      MOE_LAYER_DTYPE != "QS4CX_WH")
+      MOE_LAYER_DTYPE != "QS4CX_WH" && MOE_LAYER_DTYPE != "TL2CX_WH")
     throw std::invalid_argument("Unsupported Gemma4 htp_fused expert dtype");
   for (const auto &dtype : {EMBEDDING_DTYPE, FC_LAYER_DTYPE, LMHEAD_DTYPE})
-    if (dtype != "FP32" && dtype != "Q4_0" && dtype != "QS4CX")
+    if (dtype != "FP32" && dtype != "Q4_0" && dtype != "QS4CX" &&
+        dtype != "QS4CX_WH" && dtype != "QS4CX_WH_AFFINE")
       throw std::invalid_argument("Unsupported Gemma4 htp_fused weight dtype");
+  if (((FC_LAYER_DTYPE == "QS4CX_WH" || FC_LAYER_DTYPE == "QS4CX_WH_AFFINE") &&
+       (ATTN_PROJ_ENGINE != "htp" || FFN_ENGINE != "htp")) ||
+      ((LMHEAD_DTYPE == "QS4CX_WH" || LMHEAD_DTYPE == "QS4CX_WH_AFFINE") &&
+       LMHEAD_ENGINE != "htp") ||
+      (EMBEDDING_DTYPE == "QS4CX_WH" || EMBEDDING_DTYPE == "QS4CX_WH_AFFINE"))
+    throw std::invalid_argument(
+      "Gemma4 WH FC/head weights require HTP; embedding uses Q4_0 or FP32");
   const auto tensor_type =
     nntr_cfg.value("model_tensor_type", std::string("FP32-FP32"));
   if (tensor_type.substr(tensor_type.find_last_of('-') + 1) != "FP32")
@@ -278,13 +287,21 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
                            bool lm_head = false) {
     nntrainer::Tensor &t = weight(name);
     const auto dt = t.getDataType();
-    const bool qs4cx = dt == ml::train::TensorDim::DataType::QS4CX;
+    const bool wh = dt == ml::train::TensorDim::DataType::QS4CX_WH ||
+                    dt == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
+    const bool qs4cx = wh || dt == ml::train::TensorDim::DataType::QS4CX;
     if (dt != ml::train::TensorDim::DataType::Q4_0 && !qs4cx)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + name +
-                               " is not Q4_0 or QS4CX, the " +
-                               (lm_head ? "LM_HEAD's" : "FC") + " types");
+      throw std::runtime_error(
+        "[Gemma4MoE] NNTR_HTP_E2E: " + name + " is not " +
+        (lm_head ? "Q4_0 or QS4CX_WH, the LM_HEAD types"
+                 : "Q4_0, QS4CX or QS4CX_WH, the FC types"));
     const unsigned K = tied ? t.width() : t.height();
     const unsigned N = tied ? t.height() : t.width();
+    if (wh &&
+        (tied || !ops->set_fc_wh_source(
+                   t.getData(), K, N,
+                   dt == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE)))
+      throw std::runtime_error("Gemma4: WH decode weight registration failed");
     if (qs4cx ? !ops->add_decode_graph_qs4cx(t.getData<char>(),
                                              t.getScale<float>(), K, N)
               : !ops->add_decode_graph_q4_0(t.getData<char>(), K, N, tied))

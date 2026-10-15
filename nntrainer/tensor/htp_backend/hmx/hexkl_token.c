@@ -286,10 +286,9 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
       if (htp_tl2_native_bytes(wg->K, wg->N) > (uint64_t)wg->K * wg->N / 4u ||
           htp_tl2_native_bytes(wd->K, wd->N) > (uint64_t)wd->K * wd->N / 4u)
         rc = AEE_EBADPARM;
-      for (unsigned j = 0; j < 4u; ++j)
-        if ((wg->pal[j] != -7 && wg->pal[j] != 0 && wg->pal[j] != 7) ||
-            (wd->pal[j] != -7 && wd->pal[j] != 0 && wd->pal[j] != 7))
-          rc = AEE_EBADPARM;
+      if (!htp_tl2_palette_magnitude(wg->pal) ||
+          !htp_tl2_palette_magnitude(wd->pal))
+        rc = AEE_EBADPARM;
       if (rc == AEE_SUCCESS) {
         wg->tl2_bytes = wg->wh_bytes;
         wd->tl2_bytes = wd->wh_bytes;

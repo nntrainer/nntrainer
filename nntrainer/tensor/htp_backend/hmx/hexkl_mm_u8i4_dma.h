@@ -48,7 +48,8 @@ typedef struct {
   float *w_scale;    /**< N entries */
   int32_t *colsum_w; /**< N entries */
   float *bias;       /**< N entries */
-  void *arrays;      /**< the one allocation the three arrays sit in */
+  int32_t *w_offset; /**< NULL: symmetric; otherwise N affine integer offsets */
+  void *arrays;      /**< scales, sums, bias, and optional affine offsets */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
   int clean;    /**< [#267 L1] a heap image: written once at registration
@@ -60,9 +61,16 @@ typedef struct {
       (hvx_gemm_u8i2_wh_*) and the HMX path expands to int4 in VTCM
       (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
   const uint8_t *tl2_bytes; /**< Native TL2; NULL for ordinary WH. */
+  uint64_t tl2_expanded; /**< Prefill panels reserved for in-place expansion. */
+  uint32_t tl2_dma_idx;  /**< Last DMA of the native prefill staging. */
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;
+
+/** Set integer offsets sent in the second N entries of registration bias.
+ * The first N entries retain their ordinary bias meaning. */
+int hexkl_weight_u8i4_set_offsets(hexkl_weight_u8i4 *weight,
+                                  const float *offsets);
 
 typedef struct {
   hexkl_weight_u8i4 slots[HEXKL_MM_U8I4_MAX_WEIGHTS];

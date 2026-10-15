@@ -9,17 +9,18 @@
 #undef main
 #include "hvx_gemv_u8tl2.h"
 
-int main(void) {
+static int check(int gu_magnitude, int dn_magnitude) {
   const uint32_t K = 2816u, I = 704u, N = 2816u, E = 8u;
   static uint8_t vtcm[8u << 20] __attribute__((aligned(128)));
   W weights[16];
   uint8_t *qs2[16], *tl2[16];
   uint32_t hg[8], hd[8], ri[8] = {0}, count[8];
   float rw[8], input[2816], ref[2816], got[2816];
-  const int8_t pal[4] = {-7, -7, 0, 7};
   uint8_t lut[128];
-  hvx_expand_i2i4_table(pal, lut);
   for (uint32_t h = 0; h < 2u * E; ++h) {
+    const int magnitude = h < E ? gu_magnitude : dn_magnitude;
+    const int8_t pal[4] = {-magnitude, -magnitude, 0, magnitude};
+    hvx_expand_i2i4_table(pal, lut);
     make_weight(h, h < E ? K : I, h < E ? 2u * I : N, &weights[h]);
     hexkl_weight_u8i4 *w = &g_tbl.slots[h];
     size_t bytes = (size_t)w->K * w->N / 4u;
@@ -38,7 +39,7 @@ int main(void) {
         int val = (w->wh_bytes[at] >> (4u * (row / 4u % 2u))) & 15u;
         val = val >= 8 ? val - 16 : val;
         sum += val;
-        dense[(size_t)k * w->N + n] = val / 7;
+        dense[(size_t)k * w->N + n] = val / magnitude;
       }
       w->colsum_w[n] = sum;
     }
@@ -104,3 +105,5 @@ int main(void) {
   }
   return fail;
 }
+
+int main(void) { return check(1, 1) | check(7, 7) | check(1, 7) | check(7, 1); }

@@ -13,9 +13,9 @@
 #include <vector>
 
 namespace nntrainer {
-/** Deliberately discard palette asymmetry. Both compared paths retain the
- * original scales and use {-7,0,7}; native TL2 dots are multiplied by seven
- * before the common integer-to-float epilogue. Model files are not changed.
+/** Preserve pure {-1,0,1} palettes and their original scales. Other int4
+ * palettes retain the legacy symmetric {-7,0,7} approximation. Native TL2
+ * stores signs; the epilogue restores the magnitude recorded in the palette.
  * packed: QS2 file record [codes][palette][scales][float column sums].
  * native may be null for the symmetric QS2 reference. */
 inline void prepareSymmetricTl2(uint8_t *packed, uint32_t K, uint32_t N,
@@ -25,10 +25,14 @@ inline void prepareSymmetricTl2(uint8_t *packed, uint32_t K, uint32_t N,
   const size_t codes = static_cast<size_t>(K) * N / 4u;
   int8_t pal[4];
   std::memcpy(pal, packed + codes, 4u);
+  bool unit = true;
+  for (const auto value : pal)
+    unit = unit && value >= -1 && value <= 1;
   for (auto &value : pal) {
     if (value < -8 || value > 7)
       throw std::invalid_argument("symmetric TL2: invalid palette");
-    value = value < 0 ? -7 : value > 0 ? 7 : 0;
+    if (!unit)
+      value = value < 0 ? -7 : value > 0 ? 7 : 0;
   }
   std::vector<int32_t> sums(N, 0);
   for (uint32_t kt = 0; kt < K / 32u; ++kt)
@@ -66,7 +70,9 @@ inline void prepareSymmetricTl2(uint8_t *packed, uint32_t K, uint32_t N,
               const size_t at =
                 (static_cast<size_t>(k / 32u) * (N / 32u) + n / 32u) * 256u +
                 (r / 16u) * 128u + (n % 32u) * 4u + r % 4u;
-              w = pal[(packed[at] >> (2u * ((r / 4u) % 4u))) & 3u] / 7;
+              const int level =
+                pal[(packed[at] >> (2u * ((r / 4u) % 4u))) & 3u];
+              w = level < 0 ? -1 : level > 0 ? 1 : 0;
             }
             value = value * 3 + w;
           }

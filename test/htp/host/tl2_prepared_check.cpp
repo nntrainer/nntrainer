@@ -32,12 +32,16 @@ template <class F> static void reject(F f) {
 }
 int main(int argc, char **argv) {
   assert(argc == 3);
-  if (std::string(argv[1]) == "--fixture") {
+  if (std::string(argv[1]) == "--fixture" ||
+      std::string(argv[1]) == "--unit-fixture") {
+    const bool unit = std::string(argv[1]) == "--unit-fixture";
     std::vector<uint8_t> data(bytes, 0);
     for (uint32_t k = 0; k < K; ++k)
       for (uint32_t n = 0; n < N; ++n)
         data[at(k, n)] |= code(k, n) << (2 * ((k % 32 / 4) % 4));
-    const int8_t pal[4] = {-8, -7, 0, 7};
+    const int8_t pal[4] = {static_cast<int8_t>(unit ? -1 : -8),
+                           static_cast<int8_t>(unit ? -1 : -7), 0,
+                           static_cast<int8_t>(unit ? 1 : 7)};
     std::memcpy(data.data() + codes, pal, 4);
     for (uint32_t n = 0; n < N; ++n) {
       float scale = float(n + 1) / 1024, sum = 0;
@@ -52,6 +56,9 @@ int main(int argc, char **argv) {
   }
   const int src = open(argv[1], O_RDWR), dst = open(argv[2], O_RDWR);
   assert(src >= 0 && dst >= 0);
+  int8_t source_palette[4];
+  assert(pread(src, source_palette, 4, codes) == 4);
+  const int magnitude = source_palette[0] == -1 ? 1 : 7;
   std::vector<uint8_t> arena(bytes + 128, 0xa5);
   std::vector<int8_t> dense(size_t(K) * N);
   {
@@ -69,7 +76,7 @@ int main(int argc, char **argv) {
           else
             assert(((arena[at(k, n)] >> (2 * ((k % 32 / 4) % 4))) & 3) ==
                    code(k, n));
-          sum += 7 * weight(k, n);
+          sum += magnitude * weight(k, n);
         }
         float scale;
         int32_t got;
@@ -88,8 +95,8 @@ int main(int argc, char **argv) {
       assert(std::memcmp(compact.data(), arena.data(), weight_bytes) == 0);
       assert(
         std::memcmp(compact.data() + codes, arena.data() + codes, 8u * N) == 0);
-      assert(palette[0] == -7 && palette[1] == -7 && palette[2] == 0 &&
-             palette[3] == 7);
+      assert(palette[0] == -magnitude && palette[1] == -magnitude &&
+             palette[2] == 0 && palette[3] == magnitude);
       for (size_t i = bytes - 4u; i < compact.size(); ++i)
         assert(compact[i] == 0xa5);
       reader.discardAsync(!native);

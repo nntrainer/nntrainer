@@ -1,0 +1,106 @@
+{
+  "date": "2026-10-15",
+  "device": {
+    "serial": "R3CY70LV96T",
+    "model": "SM-S948U",
+    "chipset": "SM8850",
+    "dsp_arch": "v81"
+  },
+  "upstream_pr": 4428,
+  "upstream_commits": [
+    "ffcbb7a5a",
+    "887aedc2c",
+    "21893b185"
+  ],
+  "upstream_document": "docs/gemma4-htp-lmhead-npu.md",
+  "status": "partial: full generation not completed",
+  "model_sha256": "c7e978a68c026b9bd54f7e84594701fe63dd3be5b4a62348d2a6afc3a9b9514b",
+  "device_model_sha256_verified": true,
+  "device_root": "/data/local/tmp/nntr_gemma4_tl2_check",
+  "builds": {
+    "arm_core": "passed",
+    "arm_app": "passed",
+    "v81_dsp": "passed, undefined symbol and architecture checks passed"
+  },
+  "checks": {
+    "affine_fc_device": "M=1,2,64,65 K=96 N=128 bit-identical to equivalent int4 reference",
+    "affine_lm_head_rpc_device": "K=96 N=128 bit-identical to FC result",
+    "head_full_model_registration": "262144 x 2816, 64 WH slices of 4096, 352 MiB, 61 ms on initial load",
+    "host_graph": "passed, v3 64 parts, WH head logits/softcap/argmax",
+    "host_token": "passed, 10000-token identity and pool/failure paths",
+    "host_swap": "passed",
+    "host_affine_conversion": "passed",
+    "native_tl2_gemv_device": "passed: K=96,N=128; K=2816,N=1408; K=704,N=2816; modes 0/3/512; workers 1/8; exact integer reference",
+    "expert_swap_default_device": "passed: small and real Gemma shapes, initial M=1 and 4 swaps bit-identical; model MoE options not set"
+  },
+  "smoke": {
+    "prompt": "What is 1+1? Answer briefly.",
+    "sampling": "greedy",
+    "requested_tokens": 32,
+    "skip_prefill": true,
+    "prefill_input_tokens": 23,
+    "prefill_completed": true,
+    "prefill_sum_layer_ms": 69986.722943,
+    "prefill_moe_sum_layer_ms": 68004.288985,
+    "prefill_timing_method": "sum of NNTR_LAYER_PROFILE rows, not the end-of-run prefill timer",
+    "generated_tokens_verified": 0,
+    "failure": "token driver: S1 did not rebind a pool load; FastRPC AEE_ERPC (0x200); ADB connection subsequently absent",
+    "cause": "unresolved: device unavailable before DSP logs could be collected",
+    "lmhead_prefill_last_row_full_model": "not exercised because skip_prefill=true; standalone LM head RPC passed"
+  },
+  "fixes_during_test": [
+    "untied LM head engine property now applied",
+    "WH QKV M=1 uses decode preparation hooks before fused projection path"
+  ],
+  "not_verified": [
+    "full-model generated text",
+    "full-model prefill last-row LM head RPC",
+    "PPL or accuracy against original checkpoint",
+    "expert swap with model MoE options 0xcf03e1"
+  ],
+  "runtime_artifacts": {
+    "builddir/android_build_result/lib/arm64-v8a/libnntrainer.so": {
+      "bytes": 6063800,
+      "sha256": "23f80b3883909397a3b61f8dfff9a074f14aef979915be2513a516a52681c802"
+    },
+    "builddir_app/htp/libcausallm.so": {
+      "bytes": 21296952,
+      "sha256": "75ea26971edd5addb34363879f6508bfdfc27770362e329519904ec80dae8d91"
+    },
+    "test/htp/build/libnntr_hvx_skel.so": {
+      "bytes": 678800,
+      "sha256": "f28cb418943b5b6db02368c4cc375476ef5bb051495d55b7c8931d4eb08751b7"
+    }
+  },
+  "resume_steps": [
+    "Read docs/gemma4-tl2-affine-handoff.md",
+    "Do not blindly repeat full-model runs: device down reproduced",
+    "Build and deploy updated small swap checker; compare default with real fast",
+    "Separate DSPQ/first miss/rebind/native feed; collect DSP/driver logs before failure",
+    "Measure clean decode TPS and prefill last-row head only after stable generation"
+  ],
+  "diagnostic_prefill": {
+    "run": "s26_tps_baseline.log",
+    "input_rows": 23,
+    "sum_layer_ms": 70444.364144,
+    "tps_from_layer_sum": 0.3264987948927209,
+    "moe_ms": 68517.154508,
+    "moe_percent": 97.26421033191461,
+    "qkv_ms": 717.239321,
+    "dense_ffn_ms": 437.953592,
+    "attention_ms": 39.954688,
+    "timing_limit": "instrumented per-layer sum, excludes load; profile=2 changes host norm path; not production throughput",
+    "decode_tps": null,
+    "generated_tokens_verified": 0,
+    "failure": "first decode interrupted by device down / ADB disconnect; user restarted phone"
+  },
+  "pending_swap_fast_case": {
+    "source": "tools/tl2_swap_device_check.cpp",
+    "arguments": [
+      "real",
+      "fast"
+    ],
+    "moe_flags": "0xcf03e1",
+    "state": "source updated and binary compiled in /tmp; push/run not confirmed because interrupted"
+  }
+}

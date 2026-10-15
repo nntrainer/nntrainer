@@ -3007,6 +3007,56 @@ static void check_norm_scale_reuse(void) {
          "in-place partial writes and resumed forwards checked\n");
 }
 
+static void check_wh_lm_head(void) {
+  static uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                        HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float input[HID], output[2048], expected[2048];
+  htp_graph_lfm2_shape shape = kHd64;
+  shape.vocab = 2048u;
+  const uint32_t n = build(words, sizeof(words) / sizeof(words[0]), &shape,
+                           "CAC", HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD));
+  const uint32_t lm = nth_op(words, HTP_OP_LM_HEAD, 0u);
+  htp_graph_op *op = htp_graph_op_at(words, lm);
+  op->feed = HTP_GRAPH_FEED_WH;
+  op->n_experts = 64u;
+  for (uint32_t p = 0; p < op->n_experts; ++p) {
+    op->h_gu[p] = 3500u + p;
+    register_weight(op->h_gu[p], HID, 32u);
+  }
+  float cap = 30.0f;
+  memcpy(&op->eps_bits, &cap, sizeof(cap));
+  hexkl_graph *g = NULL;
+  uint32_t rc = hexkl_graph_init(words, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "WH LM head with no Q4M1 handles init: %s",
+        htp_graph_err_name(rc));
+  if (!g)
+    return;
+  CHECK(g->logits != NULL && g->act_buf == NULL && g->n_q4m1 == 0u,
+        "WH-only head allocates logits independently of Q4M1 scratch");
+  hexkl_graph_env env = {0};
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.scratch = &g_scratch;
+  uint32_t seed = 71u, resume = 0u;
+  fill(input, HID, &seed);
+  rc = hexkl_graph_forward(g, &env, lm, 1u, 0u, NULL, input, HID, output, 2048u,
+                           &resume);
+  hexkl_mm_u8i4_fc_m1_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, HID,
+                          op->n_experts, op->h_gu, input, expected, NULL,
+                          &g_scratch, 0u);
+  m1_softcap_det(expected, 2048u, cap);
+  CHECK(rc == 0u && resume == lm + 1u &&
+          memcmp(output, expected, sizeof(output)) == 0 &&
+          g->lm_id == m1_argmax_first(expected, 2048u),
+        "WH LM head 64 parts: logits, softcap, argmax");
+  CHECK(hexkl_graph_uses_handle(g, 3500u + 63u),
+        "WH last LM head handle retained");
+  hexkl_graph_free(g);
+  printf("GRAPH WH LM HEAD: 64 parts, no Q4M1, softcap and argmax checked\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
@@ -3021,6 +3071,7 @@ int main(void) {
   check_gemma();
   check_gemma26_list();
   check_norm_scale_reuse();
+  check_wh_lm_head();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;

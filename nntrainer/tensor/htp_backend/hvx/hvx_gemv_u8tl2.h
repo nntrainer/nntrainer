@@ -35,6 +35,12 @@ uint32_t hvx_tl2_k_splits(uint32_t K, uint32_t N, uint32_t workers);
 int hvx_tl2_pack(const int8_t *kn, uint32_t K, uint32_t N, uint8_t *packed);
 int hvx_tl2_unpack(const uint8_t *packed, uint32_t K, uint32_t N, int8_t *kn);
 
+/** Restore at most 96x128 weights (four native blocks) directly to HMX WH.
+ * src contains ceil(rows/24)*640 bytes, dst has row_stride bytes per 32 K
+ * rows. Source and destination must not overlap. No scales are changed. */
+void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
+                         uint32_t row_stride, int magnitude, uint8_t *dst);
+
 /** Exact int16 LUTs, 512 bytes per 24 input rows. The u8 activation is
  * contiguous and has K bytes; the last block is read with bounds checks.
  * Workers partition [block_begin,block_end) of ceil(K/24). Tables depend only

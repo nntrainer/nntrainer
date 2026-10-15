@@ -1342,10 +1342,16 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
           cfg.value("hidden_size", 0) != 2816 ||
           cfg.value("num_hidden_layers", 0) != 30 ||
           cfg.value("num_experts", 0) != 128 ||
-          nntr_cfg.value("moe_layer_dtype", std::string()) != "QS2CX_WH" ||
-          nntr_cfg.value("fc_layer_dtype", std::string()) != "QS4CX" ||
+          !((nntr_cfg.value("moe_layer_dtype", std::string()) == "QS2CX_WH" &&
+             nntr_cfg.value("fc_layer_dtype", std::string()) == "QS4CX" &&
+             nntr_cfg.value("lmhead_dtype", std::string()) == "Q4_0") ||
+            (nntr_cfg.value("moe_layer_dtype", std::string()) == "TL2CX_WH" &&
+             nntr_cfg.value("fc_layer_dtype", std::string()) ==
+               "QS4CX_WH_AFFINE" &&
+             nntr_cfg.value("lmhead_dtype", std::string()) ==
+               "QS4CX_WH_AFFINE" &&
+             nntr_cfg.value("lmhead_engine", std::string()) == "htp")) ||
           nntr_cfg.value("embedding_dtype", std::string()) != "Q4_0" ||
-          nntr_cfg.value("lmhead_dtype", std::string()) != "Q4_0" ||
           nntr_cfg.value("use_kvcache", false) ||
           nntr_cfg.value("save_kvcache", false))
         throw std::invalid_argument(

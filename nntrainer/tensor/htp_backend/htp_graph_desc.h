@@ -28,6 +28,8 @@
  * head_dim for the attention kinds and eps_bits for the norms -- and the
  * kernel shape rules of #81 / #82 to the validator. A v1 skel refuses a
  * v2 list with AEE_EUNSUPPORTED, never AEE_EBADPARM.
+ * Version 3 widens the handle arrays to 256 parts for WH LM heads. The
+ * version check rejects older layouts before interpreting an op record.
  *
  * The list carries every op of the decode step with its real kind, so the
  * validator can check layer consistency, and a per-op resident bit says
@@ -48,7 +50,7 @@
 /** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build),
  *  Gemma-4-26B-A4B 542 (htp_graph_gemma_build: 18 a layer x 30); the table
  *  is HTP_GRAPH_OP_WORDS x 4 B per op, so 1024 is 320 KiB of DSP heap at
- *  graph_init (address-space note in hexkl_graph.c). */
+ *  graph_init for v2; v3 uses about 576 KiB for the same 1024-op table. */
 #define HTP_GRAPH_MAX_OPS 1024u
 #define HTP_GRAPH_MAX_LAYERS 64u
 /** @brief A MOE / ROUTER_TOPK op's expert count (Gemma: 128). A MOE op's

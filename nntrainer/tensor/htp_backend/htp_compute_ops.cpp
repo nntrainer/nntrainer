@@ -2636,6 +2636,24 @@ public:
     return true;
   }
 
+  bool set_fc_wh_source(const void *data, unsigned K, unsigned N,
+                        bool affine = false) override {
+    if (!data || K == 0 || N == 0 || K % WH_TILE || N % WH_TILE)
+      throw std::invalid_argument("QS4CX_WH FC requires complete WH tiles");
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    FcWhEntry entry{};
+    entry.K = K;
+    entry.N = N;
+    entry.key = reinterpret_cast<uintptr_t>(data);
+    entry.bytes = whBytes(K, N) + (affine ? 12u : 8u) * size_t(N);
+    auto inserted = direct_wh_.emplace(data, entry);
+    if (!inserted.second &&
+        (inserted.first->second.K != K || inserted.first->second.N != N ||
+         inserted.first->second.bytes != entry.bytes))
+      throw std::invalid_argument("QS4CX_WH FC source shape changed");
+    return true;
+  }
+
   /** [#260] compute_ops.h: a QS4CX FC / DENSE_FFN weight of the decode
    *  list, bound (bindQ4m1) to the WH handles get_or_register_fc /
    *  get_or_register_dense make from its codes and scales -- the ones the
@@ -2959,8 +2977,18 @@ public:
             ") needs more than " + std::to_string(HTP_GRAPH_MAX_PARTS) +
             " WH slices of " + std::to_string(cols) + " columns");
         const uint64_t t0 = HtpProfile::nowUs();
-        bindLmHeadWh(session, p.data, p.scale, op->K, op->N, cols, op->h_gu,
-                     &parts);
+        if (const FcWhEntry *image = fcwhFind(p.data, op->K, op->N)) {
+          std::lock_guard<std::mutex> lock(handle_mutex_);
+          for (uint32_t c0 = 0; c0 < op->N; c0 += cols) {
+            const uint32_t cn = std::min(cols, op->N - c0);
+            op->h_gu[parts++] =
+              registerFcWh(static_cast<char *>(key(p)) + c0, session,
+                           {{image, c0, cn}}, 0, op->K);
+          }
+        } else {
+          bindLmHeadWh(session, p.data, p.scale, op->K, op->N, cols, op->h_gu,
+                       &parts);
+        }
         op->feed |= HTP_GRAPH_FEED_WH;
         wh_handles += parts;
         SharedLmHead &sh = shared_lm_heads_[p.data];
@@ -7497,6 +7525,12 @@ private:
    *  or has it at another shape is a main file re-quantized without its
    *  sidecar, refused rather than re-quantized around. */
   const FcWhEntry *fcwhFind(const void *q4, uint32_t K, uint32_t N) const {
+    const auto direct = direct_wh_.find(q4);
+    if (direct != direct_wh_.end()) {
+      if (direct->second.K != K || direct->second.N != N)
+        throw std::invalid_argument("QS4CX_WH FC source shape mismatch");
+      return &direct->second;
+    }
     if (fcwh_fd_ < 0)
       return nullptr;
     const size_t len = static_cast<size_t>(N) * (K / 32u) * Q4_CPU_BLOCK_BYTES;
@@ -7509,6 +7543,20 @@ private:
         "nntr_quantize_stream --fc_wh_sidecar wrote with this model file");
     }
     return &it->second;
+  }
+
+  void fcwhRead(const FcWhEntry *entry, void *dst, size_t bytes,
+                uint64_t offset) const {
+    const auto direct = direct_wh_.find(
+      reinterpret_cast<const void *>(static_cast<uintptr_t>(entry->key)));
+    if (direct != direct_wh_.end() && &direct->second == entry) {
+      if (offset > entry->bytes || bytes > entry->bytes - offset)
+        throw std::out_of_range("QS4CX_WH FC source read outside record");
+      std::memcpy(dst, static_cast<const uint8_t *>(direct->first) + offset,
+                  bytes);
+    } else {
+      throwPread(preadAll(fcwh_fd_, dst, bytes, offset), "fc wh image");
+    }
   }
 
   /** @brief [#225] Columns [c0, c0 + cn) of one sidecar image. */
@@ -7546,11 +7594,9 @@ private:
     auto read_tiles = [&](uint8_t *dst) {
       if (parts.size() == 1 && parts[0].cn == parts[0].w->N) {
         // every column: the k-tile rows are one contiguous run
-        throwPread(preadAll(fcwh_fd_, dst, len,
-                            parts[0].w->off + static_cast<uint64_t>(k0) /
-                                                WH_TILE * (cn / WH_TILE) *
-                                                WH_TILE_BYTES),
-                   "fc wh image");
+        fcwhRead(parts[0].w, dst, len,
+                 parts[0].w->off + static_cast<uint64_t>(k0) / WH_TILE *
+                                     (cn / WH_TILE) * WH_TILE_BYTES);
         return;
       }
       for (uint32_t kt = 0; kt < kn / WH_TILE; ++kt) {
@@ -7562,22 +7608,34 @@ private:
             ((k0 / WH_TILE + kt) * n_tiles + p.c0 / WH_TILE) * WH_TILE_BYTES;
           const size_t bytes =
             static_cast<size_t>(p.cn / WH_TILE) * WH_TILE_BYTES;
-          throwPread(preadAll(fcwh_fd_, dst + at, bytes, src), "fc wh image");
+          fcwhRead(p.w, dst + at, bytes, src);
           at += bytes;
         }
       }
     };
     std::vector<float> ws(cn), cs_f(cn);
     std::vector<int32_t> cs(cn);
+    bool affine = false;
+    for (const auto &p : parts)
+      affine |= p.w->bytes == whBytes(p.w->K, p.w->N) + 12u * size_t(p.w->N);
+    std::vector<float> bias(affine ? 2u * cn : cn, 0.0f);
     for (size_t i = 0, at = 0; i < parts.size(); at += parts[i++].cn) {
       const WhPart &p = parts[i];
       const uint64_t tail = p.w->off + whBytes(p.w->K, p.w->N);
-      throwPread(preadAll(fcwh_fd_, ws.data() + at, sizeof(float) * p.cn,
-                          tail + sizeof(float) * p.c0),
-                 "fc wh scales");
-      throwPread(preadAll(fcwh_fd_, cs_f.data() + at, sizeof(float) * p.cn,
-                          tail + sizeof(float) * (p.w->N + p.c0)),
-                 "fc wh column sums");
+      fcwhRead(p.w, ws.data() + at, sizeof(float) * p.cn,
+               tail + sizeof(float) * p.c0);
+      fcwhRead(p.w, cs_f.data() + at, sizeof(float) * p.cn,
+               tail + sizeof(float) * (p.w->N + p.c0));
+      if (p.w->bytes == whBytes(p.w->K, p.w->N) + 12u * size_t(p.w->N)) {
+        std::vector<int32_t> offsets(p.cn);
+        fcwhRead(p.w, offsets.data(), sizeof(int32_t) * p.cn,
+                 tail + sizeof(float) * 2u * p.w->N + sizeof(int32_t) * p.c0);
+        for (uint32_t c = 0; c < p.cn; ++c) {
+          if (offsets[c] < -15 || offsets[c] > 15)
+            throw std::invalid_argument("Invalid WH affine offset");
+          bias[cn + at + c] = static_cast<float>(offsets[c]);
+        }
+      }
     }
     std::vector<uint8_t> host;
     auto load_host = [&] {
@@ -7624,7 +7682,7 @@ private:
       e.N = cn;
       e.w_scale = ws;
       e.colsum_w = cs;
-      e.bias.assign(cn, 0.0f);
+      e.bias = bias;
       const uint32_t handle = registerFromArena(session, e, kn, cn, t_begin);
       if (handle != kNoHandle) {
         handle_cache_.emplace(key, handle);
@@ -7640,7 +7698,8 @@ private:
     HtpRpcBuffer buf(rm.size());
     std::memcpy(buf.data(), rm.data(), rm.size());
     fcwh_heap_bytes_ += len;
-    return register_locked(key, session, kn, cn, buf, ws, cs, t_begin, 0);
+    return register_locked(key, session, kn, cn, buf, ws, cs, t_begin, 0,
+                           &bias);
   }
 
   /** @brief Registers one row-major int8 [K x N] weight (values in [-8, 7],
@@ -8153,7 +8212,7 @@ private:
       st.gu = {};
       st.dn = {};
       st.rc = 0;
-      st.tl2 = native && d.w_bits == 2u;
+      st.tl2 = d.w_bits == HTP_TL2_WEIGHT_BITS || (native && d.w_bits == 2u);
       st.prefetched = false;
       st.prefetch_claimed = false;
     });
@@ -8288,7 +8347,8 @@ private:
                         {},
                         {},
                         0,
-                        tl2_decode_ && d.w_bits == 2u};
+                        d.w_bits == HTP_TL2_WEIGHT_BITS ||
+                          (tl2_decode_ && d.w_bits == 2u)};
   }
 
   /** @brief A free slot, or a new one bumped into a chunk (the load, and
@@ -8344,13 +8404,16 @@ private:
    *  them from here, so a swap carries offsets and nothing else), rounded
    *  to a page. +44 KB on a 5.25 MB expert. */
   static uint32_t expertStride(uint32_t K, uint32_t N, uint32_t w_bits) {
-    return (static_cast<uint32_t>(codeBytes(K, N, w_bits)) + 8u * N + 4095u) &
-           ~4095u;
+    const auto capacity =
+      w_bits == HTP_TL2_WEIGHT_BITS ? whBytes2(K, N) : codeBytes(K, N, w_bits);
+    return (static_cast<uint32_t>(capacity) + 8u * N + 4095u) & ~4095u;
   }
 
   /** @brief [plan 229] A weight's WH code bytes: whBytes at four bits,
    *  whBytes2 at two (QS2CX_WH). */
   static size_t codeBytes(uint32_t K, uint32_t N, uint32_t w_bits) {
+    if (w_bits == HTP_TL2_WEIGHT_BITS)
+      return htp_tl2_native_bytes(K, N);
     return w_bits == 2u ? whBytes2(K, N) : whBytes(K, N);
   }
 
@@ -8632,7 +8695,7 @@ private:
    *  goes back to the free list and this throws.
    *  @note Call with handle_mutex_ held. */
   void registerStaged(remote_handle64 session, StagedExpert &st) {
-    if (st.d.w_bits == 2u) { // [plan 229] QS2CX_WH swaps by the batch entry
+    if (st.d.w_bits == 2u || st.d.w_bits == HTP_TL2_WEIGHT_BITS) {
       std::vector<StagedExpert> one{st};
       registerStagedBatch(session, one);
       return;
@@ -8732,7 +8795,7 @@ private:
       const int ni = static_cast<int>(n);
       uint32_t done = 0;
       int32_t err = AEE_SUCCESS;
-      const bool two = d0.w_bits == 2u;
+      const bool two = d0.w_bits == 2u || d0.w_bits == HTP_TL2_WEIGHT_BITS;
       const int rc =
         two ? nntr_hvx_weight_swap_batch_u2i4_arena(
                 session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(), ni,
@@ -9028,6 +9091,32 @@ private:
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N, uint32_t w_bits,
                  uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
     const size_t nib = codeBytes(K, N, w_bits);
+    if (w_bits == HTP_TL2_WEIGHT_BITS) {
+      const size_t capacity = whBytes2(K, N);
+      if (!K || !N || K % 32u || N % 128u || K > 8192u || N > 8192u ||
+          nib > capacity)
+        return EINVAL;
+      std::vector<float> tail(2u * N);
+      const int rc = preadAll(fd, arena_dst, nib, off, tail.data(),
+                              tail.size() * sizeof(float));
+      if (rc)
+        return rc;
+      std::vector<int32_t> sums(N);
+      for (uint32_t n = 0; n < N; ++n) {
+        if (!std::isfinite(tail[n]) || tail[n] < 0.0f ||
+            !std::isfinite(tail[N + n]) ||
+            std::abs(tail[N + n]) > static_cast<float>(K))
+          return EINVAL;
+        sums[n] = static_cast<int32_t>(tail[N + n]);
+      }
+      std::memcpy(arena_dst + capacity, tail.data(), N * sizeof(float));
+      std::memcpy(arena_dst + capacity + N * sizeof(float), sums.data(),
+                  N * sizeof(int32_t));
+      e.pal = {-1, 0, 1, 1};
+      e.K = K;
+      e.N = N;
+      return 0;
+    }
     // [#282] a pinned expert is a DDR copy, never a file read
     const size_t pal0 = paletteBytes(w_bits);
     if (const uint8_t *pin =
@@ -9640,7 +9729,8 @@ private:
         ? nntr_hvx_weight_register_u8i4_arena(
             session, K, N, arena_chunks_[e.chunk].dsp_id, e.off,
             e.w_scale.data(), static_cast<int>(N), e.colsum_w.data(),
-            static_cast<int>(N), e.bias.data(), static_cast<int>(N), &handle)
+            static_cast<int>(N), e.bias.data(), static_cast<int>(e.bias.size()),
+            &handle)
         : nntr_hvx_weight_register_u2i4_arena(
             session, K, N, arena_chunks_[e.chunk].dsp_id, e.off, e.pal.data(),
             4, e.w_scale.data(), static_cast<int>(N), e.colsum_w.data(),
@@ -9665,16 +9755,18 @@ private:
                            uint32_t N, HtpRpcBuffer &q_w4_i8,
                            std::vector<float> &w_scale,
                            std::vector<int32_t> &colsum_w, uint64_t t_begin,
-                           uint64_t convert_us) {
-    std::vector<float> bias(N, 0.0f); // FC weights carry no bias tensor
+                           uint64_t convert_us,
+                           const std::vector<float> *bias_override = nullptr) {
+    std::vector<float> bias =
+      bias_override ? *bias_override : std::vector<float>(N, 0.0f);
 
     uint32_t handle = 0;
     const uint64_t t_rpc = HtpProfile::nowUs();
     const int err = nntr_hvx_weight_register_u8i4(
       session, K, N, reinterpret_cast<int8_t *>(q_w4_i8.data()),
       static_cast<int>(q_w4_i8.size()), w_scale.data(), static_cast<int>(N),
-      colsum_w.data(), static_cast<int>(N), bias.data(), static_cast<int>(N),
-      &handle);
+      colsum_w.data(), static_cast<int>(N), bias.data(),
+      static_cast<int>(bias.size()), &handle);
     const uint64_t rpc_us = HtpProfile::nowUs() - t_rpc;
     if (err != AEE_SUCCESS) {
       throw std::runtime_error("nntr_hvx_weight_register_u8i4 failed: err=" +
@@ -9708,6 +9800,8 @@ private:
   int fcwh_fd_ = -1;
   std::string fcwh_name_;
   std::unordered_map<uint64_t, FcWhEntry> fcwh_;
+  /** Main-file WH records keyed by their tensor data pointer. */
+  std::unordered_map<const void *, FcWhEntry> direct_wh_;
   size_t fcwh_arena_bytes_ = 0, fcwh_heap_bytes_ = 0;
   /** [#225 PR 2] WH bytes of the sidecar's images not registered yet, plus
    *  placeExistingOn's 4 KiB alignment for four handles an image (its most:
@@ -9716,6 +9810,12 @@ private:
     size_t all = 0;
     for (const auto &e : fcwh_)
       all += whBytes(e.second.K, e.second.N) + 4u * 4096u;
+    for (const auto &e : direct_wh_)
+      all +=
+        whBytes(e.second.K, e.second.N) +
+        ((e.second.N + fcSliceCols(e.second.K) - 1u) / fcSliceCols(e.second.K) +
+         4u) *
+          4096u;
     const size_t done = fcwh_arena_bytes_ + fcwh_heap_bytes_;
     return all > done ? all - done : 0u;
   }

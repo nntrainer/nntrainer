@@ -45,10 +45,17 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/hvx" \
   "$HERE/tl2_prepared_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_prepared_check"
-"$OUT/tl2_prepared_check" --fixture "$OUT/tl2-source.bin"
 echo '0 256 256' > "$OUT/tl2-weights.tsv"
-"$OUT/prepare_tl2" "$OUT/tl2-source.bin" "$OUT/tl2-weights.tsv" "$OUT/tl2-prepared.bin"
-"$OUT/tl2_prepared_check" "$OUT/tl2-source.bin" "$OUT/tl2-prepared.bin"
+for fixture in fixture unit-fixture; do
+  "$OUT/tl2_prepared_check" "--$fixture" "$OUT/tl2-source-$fixture.bin"
+  "$OUT/prepare_tl2" "$OUT/tl2-source-$fixture.bin" "$OUT/tl2-weights.tsv" "$OUT/tl2-prepared-$fixture.bin"
+  "$OUT/tl2_prepared_check" "$OUT/tl2-source-$fixture.bin" "$OUT/tl2-prepared-$fixture.bin"
+done
+
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
+  -I "$BACKEND/hvx" "$HERE/../../../tools/convert_tl2_model.cpp" \
+  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -o "$OUT/convert_tl2_model"
+python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 
 # -O2: the M=1 cases run the HMX stand-in at the real shape (64 rows a
 # tile, scalar); about half a minute at -O2 and several at -O1, since the
@@ -77,6 +84,22 @@ echo '0 256 256' > "$OUT/tl2-weights.tsv"
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_moe_host_check"
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_prefill_host_check" \
+  "$HERE/tl2_prefill_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+"$OUT/tl2_prefill_host_check"
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+  -ffunction-sections -fdata-sections -DMOE_TAIL_MAX_ROWS=16u \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/wh_affine_host_check" \
+  "$HERE/wh_affine_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" \
+  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" \
+  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -Wl,--gc-sections -lm
+"$OUT/wh_affine_host_check"
 # [#225] Two mutants of the decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run),
 # each of which must fail FC WH BIT-IDENTICAL: a lane computing a block it
 # never waited for, and the part's column offset dropped from the dequant's

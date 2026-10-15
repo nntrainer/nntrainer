@@ -385,6 +385,10 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // a copy and a norm on the CPU.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
   const auto qs4cx = ml::train::TensorDim::DataType::QS4CX;
+  const bool wh =
+    Qweight.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH ||
+    Qweight.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
+  const bool scaled = wh || Qweight.getDataType() == qs4cx;
   const auto wtype = Qweight.getDataType();
   auto *ops = input_step.getOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
@@ -393,14 +397,14 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   if ((in_norm || (feature_size && norm_in_call)) && ops != nullptr &&
       ops->supports_gemm_q4_0_batch_norm_fp32() &&
       (!rope || (feature_size / 2) % 32 == 0) &&
-      (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
+      (rows > 1 || (scaled && ops->accelerates_qs4cx_at_m1())) &&
       input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
-      (wtype == q4 || wtype == qs4cx) && Kweight.getDataType() == wtype &&
+      (wtype == q4 || scaled) && Kweight.getDataType() == wtype &&
       (v_from_k || context.getWeight(weight_idx[WV]).getDataType() == wtype)) {
     std::vector<void *> wdata = {Qweight.getData<char>(),
                                  Kweight.getData<char>()};
     std::vector<float *> wscale;
-    if (wtype == qs4cx)
+    if (scaled)
       wscale = {Qweight.getScale<float>(), Kweight.getScale<float>()};
     std::vector<unsigned int> widths = {
       static_cast<unsigned int>(Qhidden_step_dim.width()),
@@ -425,7 +429,7 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor &Vweight =
       context.getWeight(weight_idx[v_from_k ? WK : WV]);
     wdata.push_back(Vweight.getData<char>());
-    if (wtype == qs4cx)
+    if (scaled)
       wscale.push_back(Vweight.getScale<float>());
     widths.push_back(static_cast<unsigned int>(Vhidden_step_dim.width()));
     dsts.push_back(context.getOutput(QKVParams::V).getData<float>());

@@ -56,6 +56,34 @@ static void digits(unsigned m, int *a, int *b, int *c) {
   *c = (int)((m + 13u) % 3u) - 1;
 }
 
+void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
+                         uint32_t row_stride, int magnitude, uint8_t *dst) {
+  /* Each magnitude names a balanced-base-three triple. This small inverse
+     table also keeps integer division out of the weight loop. */
+  static const int8_t trits[16][3] = {
+    {0, 0, 0},   {0, 0, 1},  {0, 1, -1}, {0, 1, 0},  {0, 1, 1},
+    {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0},
+    {1, 0, 1},   {1, 1, -1}, {1, 1, 0},  {1, 1, 1}};
+  for (uint32_t kt = 0; kt < rows / 32u; ++kt)
+    for (uint32_t nt = 0; nt < columns / 32u; ++nt) {
+      uint8_t *tile = dst + (size_t)kt * row_stride + nt * 512u;
+      memset(tile, 0, 512u);
+      for (uint32_t r = 0; r < 32u; ++r) {
+        const uint32_t k = kt * 32u + r, group = k % 24u / 3u;
+        const uint8_t *block = src + k / 24u * 640u;
+        for (uint32_t c = 0; c < 32u; ++c) {
+          const uint32_t j = c * 4u + nt;
+          const unsigned m =
+            (block[group / 2u * 128u + j] >> (4u * (group % 2u))) & 15u;
+          const int sign = (block[512u + j] >> group) & 1u;
+          const int q = (sign ? -magnitude : magnitude) * trits[m][k % 3u];
+          tile[r / 8u * 128u + c * 4u + r % 4u] |= (uint8_t)(q & 15)
+                                                   << (4u * (r / 4u % 2u));
+        }
+      }
+    }
+}
+
 int hvx_tl2_pack(const int8_t *kn, uint32_t K, uint32_t N, uint8_t *packed) {
   const size_t bytes = hvx_tl2_weight_bytes(K, N);
   if (!kn || !packed || !bytes || (size_t)K > SIZE_MAX / N)

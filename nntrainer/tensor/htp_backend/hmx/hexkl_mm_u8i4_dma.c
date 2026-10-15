@@ -23,6 +23,7 @@
 #include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_opts.h"
+#include "hexkl_wh_affine.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
@@ -110,6 +111,19 @@ static void hexkl_bake_u8i4_worker(uint32_t n_threads, uint32_t i, void *vctx) {
  * @return AEE_SUCCESS with *out_bytes set, or the same rejection either
  *         entry point would have made on its own.
  */
+int hexkl_weight_u8i4_set_offsets(hexkl_weight_u8i4 *w, const float *offsets) {
+  if (!w || !w->in_use || !offsets || !w->arrays || w->bits == 2u)
+    return AEE_EBADPARM;
+  for (uint32_t c = 0; c < w->N; ++c)
+    if (!(offsets[c] >= -15.0f && offsets[c] <= 15.0f) ||
+        offsets[c] != (float)(int32_t)offsets[c])
+      return AEE_EBADPARM;
+  w->w_offset = (int32_t *)((uintptr_t)w->w_scale + 3u * sizeof(float) * w->N);
+  for (uint32_t c = 0; c < w->N; ++c)
+    w->w_offset[c] = (int32_t)offsets[c];
+  return AEE_SUCCESS;
+}
+
 static int hexkl_weight_u8i4_check(uint32_t K, uint32_t N, uint32_t vtcm_size,
                                    uint32_t *out_bytes) {
   if (K == 0 || N == 0 || (K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0 ||
@@ -204,7 +218,8 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   uintptr_t a;
   h->wh_bytes = borrow ? (uint8_t *)wh_src : (uint8_t *)malloc(wh_bytes);
   h->tl2_bytes = NULL;
-  h->arrays = malloc(3u * n4 + 128u);
+  h->w_offset = NULL;
+  h->arrays = malloc(4u * n4 + 128u);
   if (!h->wh_bytes || !h->arrays) {
     if (!borrow) {
       free(h->wh_bytes);
@@ -363,6 +378,7 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
   /** The width moves with the bytes: a pool slot holds whatever expert the
      host read into it last. */
   w->tl2_bytes = NULL;
+  w->w_offset = NULL;
   w->bits = pal ? 2u : 4u;
   if (pal) {
     memcpy(w->pal, pal, sizeof(w->pal));
@@ -811,6 +827,12 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         (m0 >= M)
           ? 0u
           : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0) : HEXKL_ACC_TILE_ROWS);
+      int32_t affine_sums[HEXKL_ACC_TILE_ROWS];
+      if (h->w_offset)
+        hexkl_wh_affine_sums(vtcm_base + act_off +
+                               (size_t)rb * k_tiles *
+                                 HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                             cnt, K, act_zp + m0, affine_sums);
       for (uint32_t nt0 = 0; nt0 < nt_n; nt0 += acc_tiles) {
         const uint32_t nb = (nt_n - nt0 < acc_tiles) ? (nt_n - nt0) : acc_tiles;
         const uint32_t stage_off =
@@ -837,6 +859,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             goto out;
           }
         }
+        if (h->w_offset && acc_layout->usable)
+          for (uint32_t j = 0; j < nb; ++j)
+            hexkl_wh_affine_acc(
+              (int32_t *)(vtcm_base + stage_off + j * ACC_TILE_BYTES) +
+                acc_layout->base,
+              acc_layout->row_stride, cnt, HEXKL_ACC_TILE_COLS,
+              h->w_offset + (nt0 + j) * HEXKL_ACC_TILE_COLS, affine_sums);
         if (pipelined) {
           /** Retire the previous batch's job -- what this wait reads is the
              exposed part -- then hand this batch to the pool and go on
@@ -932,6 +961,18 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 
     if (!acc_layout->usable) {
       HEXKL_PROBE_T0(p0);
+      if (h->w_offset)
+        for (uint32_t m0 = 0; m0 < M; m0 += HEXKL_ACC_TILE_ROWS) {
+          const uint32_t cnt =
+            M - m0 < HEXKL_ACC_TILE_ROWS ? M - m0 : HEXKL_ACC_TILE_ROWS;
+          int32_t sums[HEXKL_ACC_TILE_ROWS];
+          hexkl_wh_affine_sums(vtcm_base + act_off +
+                                 (size_t)(m0 / HEXKL_ACC_TILE_ROWS) * k_tiles *
+                                   HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                               cnt, K, act_zp + m0, sums);
+          hexkl_wh_affine_acc(acc_scratch + (size_t)m0 * h->N, h->N, cnt, h->N,
+                              h->w_offset, sums);
+        }
       hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,
                              h->colsum_w, h->w_scale, h->bias,
                              out_cat + out_off, o->accumulate);
