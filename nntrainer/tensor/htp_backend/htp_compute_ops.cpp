@@ -1806,27 +1806,168 @@ public:
     return true;
   }
 
-  /** @brief One WH slice of an untied QS4CX head: columns [c0, c0 + n) --
-   *  a column is K / 2 contiguous bytes on disk, so the slice is a pointer
-   *  offset -- converted (htp_qs4cx_from_packed) and placed as an FC slice
-   *  is (registerRm), keyed by its first byte so a re-bind finds it. */
-  uint32_t registerLmHeadWhSlice(remote_handle64 session, const void *data,
-                                 const float *scale, uint32_t K, uint32_t c0,
-                                 uint32_t n) {
+  void set_lm_head_wh_cache(const char *path) override {
+    lmhead_wh_path_ = path ? path : "";
+  }
+
+  /** @brief The cache file's header (set_lm_head_wh_cache): the slicing
+   *  and a hash of the N scales, then per slice WH bytes | f32 scales |
+   *  i32 column sums, slices in column order. ponytail: codes requantized
+   *  to the same scales pass the match; delete the file by hand then. */
+  struct LmHeadWhHeader {
+    char magic[8];
+    uint32_t version, K, N, cols;
+    uint64_t scale_hash;
+  };
+
+  /** @brief The whole buffer at @a off, or false (errno set). */
+  static bool pwriteAll(int fd, const void *src, size_t len, uint64_t off) {
+    const auto *p = static_cast<const uint8_t *>(src);
+    while (len != 0) {
+      const ssize_t n = ::pwrite(fd, p, len, static_cast<off_t>(off));
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return false;
+      len -= static_cast<size_t>(n);
+      off += static_cast<uint64_t>(n);
+      p += n;
+    }
+    return true;
+  }
+
+  /** @brief The untied QS4CX head's WH slices, columns [c0, c0 + cols) each
+   *  (a column is K / 2 contiguous bytes, so a slice is a pointer offset
+   *  into the codes), placed in the arena and registered as an FC slice is.
+   *  With a matching cache file each slice is one pread straight into its
+   *  arena room; without one the slice is converted here
+   *  (htp_qs4cx_from_packed, whPack) and the cache written beside the model
+   *  for the next load (a temporary renamed at the end, so a half-written
+   *  file never matches). Keyed by the slice's first byte so a re-bind
+   *  finds the handles. */
+  void bindLmHeadWh(remote_handle64 session, const void *codes,
+                    const float *scale, uint32_t K, uint32_t N, uint32_t cols,
+                    uint32_t *h, uint32_t *parts) {
     std::lock_guard<std::mutex> lock(handle_mutex_);
-    void *key = static_cast<uint8_t *>(const_cast<void *>(data)) +
-                static_cast<size_t>(c0) * (K / 2u);
-    auto it = handle_cache_.find(key);
-    if (it != handle_cache_.end())
-      return it->second;
-    const uint64_t t0 = HtpProfile::nowUs();
-    std::vector<int8_t> rm(static_cast<size_t>(K) * n);
-    std::vector<float> ws(n);
-    std::vector<int32_t> cs(n);
-    htp_qs4cx_from_packed(key, scale + c0, K, n, rm.data(), ws.data(),
-                          cs.data());
-    const uint64_t convert_us = HtpProfile::nowUs() - t0;
-    return registerRm(key, session, rm.data(), K, n, ws, cs, t0, convert_us);
+    LmHeadWhHeader want{};
+    std::memcpy(want.magic, "NNTRLMWH", 8);
+    want.version = 1u;
+    want.K = K;
+    want.N = N;
+    want.cols = cols;
+    want.scale_hash = fcWhKey(scale, sizeof(float) * N);
+    int rfd = -1, wfd = -1;
+    std::string tmp;
+    if (!lmhead_wh_path_.empty()) {
+      rfd = ::open(lmhead_wh_path_.c_str(), O_RDONLY | O_CLOEXEC);
+      LmHeadWhHeader have{};
+      if (rfd >= 0 && (preadAll(rfd, &have, sizeof(have), 0) != 0 ||
+                       std::memcmp(&have, &want, sizeof(want)) != 0)) {
+        std::fprintf(stderr, "[HTP] lm_head WH cache %s: stale, rebuilt\n",
+                     lmhead_wh_path_.c_str());
+        ::close(rfd);
+        rfd = -1;
+      }
+      if (rfd < 0) {
+        tmp = lmhead_wh_path_ + ".tmp";
+        wfd =
+          ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+        if (wfd >= 0 && !pwriteAll(wfd, &want, sizeof(want), 0)) {
+          ::close(wfd);
+          ::unlink(tmp.c_str());
+          wfd = -1;
+        }
+        if (wfd < 0)
+          std::fprintf(stderr, "[HTP] lm_head WH cache %s: not written (%s)\n",
+                       lmhead_wh_path_.c_str(), std::strerror(errno));
+      }
+    }
+    uint64_t off = sizeof(want);
+    for (uint32_t c0 = 0; c0 < N; c0 += cols) {
+      const uint32_t n = std::min(cols, N - c0);
+      const size_t len = whBytes(K, n);
+      void *key = static_cast<uint8_t *>(const_cast<void *>(codes)) +
+                  static_cast<size_t>(c0) * (K / 2u);
+      auto it = handle_cache_.find(key);
+      if (it != handle_cache_.end()) {
+        h[(*parts)++] = it->second;
+        off += len + 8u * n;
+        continue;
+      }
+      const uint64_t t0 = HtpProfile::nowUs();
+      ArenaEntry e;
+      e.K = K;
+      e.N = n;
+      e.w_scale.resize(n);
+      e.colsum_w.resize(n);
+      e.bias.assign(n, 0.0f);
+      uint32_t handle = kNoHandle;
+      if (ensureArena(session) && place(session, static_cast<uint32_t>(len),
+                                        size_t(256) << 20, &e.chunk, &e.off)) {
+        uint8_t *dst = arena_chunks_[e.chunk].buf->data() + e.off;
+        if (rfd >= 0) {
+          throwPread(preadAll(rfd, dst, len, off), "lm_head wh cache");
+          throwPread(
+            preadAll(rfd, e.w_scale.data(), sizeof(float) * n, off + len),
+            "lm_head wh cache scales");
+          throwPread(preadAll(rfd, e.colsum_w.data(), sizeof(int32_t) * n,
+                              off + len + sizeof(float) * n),
+                     "lm_head wh cache column sums");
+        } else {
+          std::vector<int8_t> rm(static_cast<size_t>(K) * n);
+          htp_qs4cx_from_packed(key, scale + c0, K, n, rm.data(),
+                                e.w_scale.data(), e.colsum_w.data());
+          whPack(rm.data(), K, n, dst);
+          if (wfd >= 0 &&
+              !(pwriteAll(wfd, dst, len, off) &&
+                pwriteAll(wfd, e.w_scale.data(), sizeof(float) * n,
+                          off + len) &&
+                pwriteAll(wfd, e.colsum_w.data(), sizeof(int32_t) * n,
+                          off + len + sizeof(float) * n))) {
+            std::fprintf(stderr,
+                         "[HTP] lm_head WH cache %s: write failed (%s), "
+                         "dropped\n",
+                         lmhead_wh_path_.c_str(), std::strerror(errno));
+            ::close(wfd);
+            ::unlink(tmp.c_str());
+            wfd = -1;
+          }
+        }
+        handle = registerFromArena(session, e, K, n, t0);
+      }
+      if (handle == kNoHandle) {
+        if (rfd >= 0)
+          ::close(rfd);
+        if (wfd >= 0) {
+          ::close(wfd);
+          ::unlink(tmp.c_str());
+        }
+        throw std::runtime_error(
+          "set_decode_graph_desc: the lm_head's WH slice at column " +
+          std::to_string(c0) + " (" + std::to_string(K) + " x " +
+          std::to_string(n) + ") found no arena room (" + arena_fail_ + ")");
+      }
+      handle_cache_.emplace(key, handle);
+      h[(*parts)++] = handle;
+      off += len + 8u * n;
+    }
+    if (rfd >= 0) {
+      ::close(rfd);
+      std::fprintf(stderr, "[HTP] lm_head WH cache %s: read\n",
+                   lmhead_wh_path_.c_str());
+    }
+    if (wfd >= 0) {
+      ::close(wfd);
+      if (::rename(tmp.c_str(), lmhead_wh_path_.c_str()) != 0) {
+        std::fprintf(stderr, "[HTP] lm_head WH cache %s: rename failed (%s)\n",
+                     lmhead_wh_path_.c_str(), std::strerror(errno));
+        ::unlink(tmp.c_str());
+      } else {
+        std::fprintf(stderr, "[HTP] lm_head WH cache %s: written, %.1f MiB\n",
+                     lmhead_wh_path_.c_str(),
+                     static_cast<double>(off) / (1u << 20));
+      }
+    }
   }
 
   bool lm_head_q4_0_prepare(const void *w, unsigned int K,
@@ -2818,9 +2959,8 @@ public:
             ") needs more than " + std::to_string(HTP_GRAPH_MAX_PARTS) +
             " WH slices of " + std::to_string(cols) + " columns");
         const uint64_t t0 = HtpProfile::nowUs();
-        for (uint32_t c0 = 0; c0 < op->N; c0 += cols)
-          op->h_gu[parts++] = registerLmHeadWhSlice(
-            session, p.data, p.scale, p.K, c0, std::min(cols, op->N - c0));
+        bindLmHeadWh(session, p.data, p.scale, op->K, op->N, cols, op->h_gu,
+                     &parts);
         op->feed |= HTP_GRAPH_FEED_WH;
         wh_handles += parts;
         SharedLmHead &sh = shared_lm_heads_[p.data];
@@ -9885,6 +10025,7 @@ private:
       h; // Borrowed from e2e_st_->q4m1, never released twice.
   };
   std::map<const void *, SharedLmHead> shared_lm_heads_;
+  std::string lmhead_wh_path_; /**< set_lm_head_wh_cache; empty: no cache */
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
