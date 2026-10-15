@@ -1690,7 +1690,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
+    // a prompt past the activation plane goes in plane-height chunks, a
+    // windowed layer's window moved to the front before each
+    const unsigned int save_chunk = prefillDriveChunk();
+    for (unsigned int o = 0, step = 0; o < input_len; o += step) {
+      step = save_chunk ? std::min(save_chunk, input_len - o) : input_len - o;
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        for (unsigned int j = 0; j < step; ++j)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+            static_cast<float>(init_input[o + j]);
+      compactKVCache(o);
+      for (auto &so : output)
+        releaseLogitsBuf(so);
+      output = incrementalInference(BATCH_SIZE, input, step, o, o + step);
+    }
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -1994,6 +2007,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
             static_cast<float>(init_input[o + j]);
       const unsigned int cf = from_pos + o;
+      // a windowed (sliding) layer keeps its window in front of the chunk
+      compactKVCache(cf);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
         for (auto &oo : so)
