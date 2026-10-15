@@ -24,18 +24,33 @@ namespace nntrainer {
 /** Workers own a buffer until its read completes, even after cancellation.
  * Submission and consumption serialize metadata. A caller may exchange a ready
  * buffer with a retired demand buffer; no payload copy or DSP operation is
- * needed. Reader returns false on failure; failed guesses fall back to demand
- * I/O.
+ * needed. Readers may stop between I/O operations when their cancellation
+ * check is true; failed or canceled guesses fall back to demand I/O.
  */
 template <typename Buffer> class HtpExpertPrefetch {
 public:
   struct Stats {
     uint64_t submitted = 0, completed = 0, used = 0, late = 0;
     uint64_t discarded = 0, failed = 0, full = 0, joined = 0;
+    uint64_t cancelled = 0; /**< Aborted callbacks, excluded from completed. */
   };
+  enum class ReadResult { Complete, Cancelled, Failed };
   using Reader = std::function<bool(Buffer &)>;
+  /** Valid only during its reader callback; do not retain or call it later. */
+  using CancelCheck = std::function<bool()>;
+  using CancellableReader =
+    std::function<ReadResult(Buffer &, const CancelCheck &)>;
 
+  /** Retain the original reader API for work that cannot stop partway. */
   HtpExpertPrefetch(std::vector<Buffer> buffers, size_t readers, Reader read) :
+    HtpExpertPrefetch(
+      std::move(buffers), readers,
+      [read = std::move(read)](Buffer &buffer, const CancelCheck &) {
+        return read(buffer) ? ReadResult::Complete : ReadResult::Failed;
+      }) {}
+
+  HtpExpertPrefetch(std::vector<Buffer> buffers, size_t readers,
+                    CancellableReader read) :
     read_(std::move(read)) {
     if (buffers.empty() || readers == 0)
       throw std::invalid_argument("Expert prefetch needs buffers and readers");
@@ -212,23 +227,33 @@ private:
         queue_.pop_front();
         slots_[i].state = Reading;
       }
-      bool ok = false;
+      ReadResult result = ReadResult::Failed;
       try {
-        ok = read_(slots_[i].buffer);
+        const CancelCheck cancelled = [this, i] {
+          std::lock_guard<std::mutex> lock(mutex_);
+          // Expiry protects claimed demand, even when its epoch is old.
+          // Reading slots cannot be reused until this callback returns.
+          return stop_ || slots_[i].retired;
+        };
+        result = read_(slots_[i].buffer, cancelled);
       } catch (...) {
         // Speculation is optional; the synchronous path reports I/O errors.
       }
       {
         std::lock_guard<std::mutex> lock(mutex_);
         auto &s = slots_[i];
-        ++stats_.completed;
-        stats_.failed += !ok;
+        if (result == ReadResult::Cancelled)
+          ++stats_.cancelled;
+        else
+          ++stats_.completed;
+        stats_.failed += result == ReadResult::Failed;
+        const bool ok = result == ReadResult::Complete;
         s.state = s.retired ? Free : ok ? Ready : s.claimed ? Failed : Free;
       }
       done_.notify_all();
     }
   }
-  Reader read_;
+  CancellableReader read_;
   std::vector<Slot> slots_;
   std::deque<size_t> queue_;
   std::vector<std::thread> workers_;

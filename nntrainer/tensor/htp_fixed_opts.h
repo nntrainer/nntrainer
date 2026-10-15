@@ -72,6 +72,10 @@ constexpr unsigned int PREDICT = 2u;
  *  NNTR_MOE_PREFETCH_READERS=4, NNTR_MOE_PREFETCH_SLOTS=32,
  *  NNTR_MOE_PREFETCH_RESIDUAL=0.5). */
 constexpr unsigned int PREFETCH_READERS = 4u;
+/** Already-native TL2 experts with page cache bypass: two decode readers
+ *  reduced exposed miss wait on S26 Ultra at C16, p2048. Prefill lookahead
+ *  and other file/cache formats retain their existing reader defaults. */
+constexpr unsigned int TL2_DIRECT_PREFETCH_READERS = 2u;
 constexpr unsigned int PREFETCH_SLOTS = 32u;
 constexpr float PREFETCH_RESIDUAL = 0.5f;
 

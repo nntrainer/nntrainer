@@ -8,6 +8,7 @@
 #include "htp_expert_prefetch.h"
 #include "htp_router_predict.h"
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -31,7 +32,166 @@ static void completed(Queue &q, uint64_t count) {
   }
 }
 
+/** Wait for a controlled reader checkpoint instead of relying on sleeps. */
+static void checkpoint(std::future<void> &event) {
+  assert(event.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+}
+
+/** A stale read skips its second half but retains its slot until it exits. */
+static void cooperativeCancellation_p() {
+  int keys[2]{};
+  auto data = std::make_shared<std::array<unsigned, 1024>>();
+  data->fill(99);
+  std::promise<void> gu_done, check_release, cancel_seen, exit_release;
+  auto gu_ready = gu_done.get_future();
+  auto check_allowed = check_release.get_future().share();
+  auto cancel_ready = cancel_seen.get_future();
+  auto exit_allowed = exit_release.get_future().share();
+  std::atomic<unsigned> down_reads{0};
+  Queue q({{data}}, 1, [&](Buffer &b, const Queue::CancelCheck &cancelled) {
+    auto middle = b.data->begin() + b.data->size() / 2;
+    std::fill(b.data->begin(), middle, b.value);
+    if (b.value == 1) {
+      gu_done.set_value();
+      check_allowed.wait();
+    }
+    if (cancelled()) {
+      cancel_seen.set_value();
+      exit_allowed.wait();
+      return Queue::ReadResult::Cancelled;
+    }
+    ++down_reads;
+    std::fill(middle, b.data->end(), b.value);
+    return Queue::ReadResult::Complete;
+  });
+  assert(q.submit(keys, 1, [](Buffer &b) { b.value = 1; }));
+  checkpoint(gu_ready);
+  q.expireBefore(2);
+  check_release.set_value();
+  checkpoint(cancel_ready);
+  // The canceled callback still owns the buffer, including its partial data.
+  assert(!q.claim(keys));
+  assert(!q.take(keys, [](Buffer &) { assert(false); }));
+  assert(!q.submit(keys + 1, 2, [](Buffer &) { assert(false); }));
+  assert(q.stats().completed == 0 && q.stats().cancelled == 0);
+  assert(down_reads == 0);
+  for (size_t i = 0; i < data->size(); ++i)
+    assert((*data)[i] == (i < data->size() / 2 ? 1u : 99u));
+  exit_release.set_value();
+  q.drain();
+  assert(q.stats().cancelled == 1 && q.stats().failed == 0 &&
+         q.stats().completed == 0 && q.stats().discarded == 1);
+  assert(!q.take(keys, [](Buffer &) { assert(false); }));
+  assert(q.submit(keys + 1, 2, [&](Buffer &b) {
+    assert(b.data == data);
+    b.value = 2;
+  }));
+  completed(q, 1);
+  assert(q.take(keys + 1, [](Buffer &b) {
+    for (unsigned value : *b.data)
+      assert(value == 2);
+  }));
+  assert(down_reads == 1 && q.stats().used == 1 && q.stats().cancelled == 1);
+}
+
+/** Claimed in-flight and queued reads survive expiry and finish both halves. */
+static void claimedCancellationGuard_p() {
+  int keys[2]{};
+  std::vector<Buffer> buffers;
+  for (unsigned i = 0; i < 2; ++i)
+    buffers.push_back({std::make_shared<std::array<unsigned, 1024>>()});
+  std::promise<void> gu_done, release;
+  auto gu_ready = gu_done.get_future();
+  auto released = release.get_future().share();
+  std::atomic<unsigned> down_reads{0};
+  Queue q(std::move(buffers), 1,
+          [&](Buffer &b, const Queue::CancelCheck &cancelled) {
+            auto middle = b.data->begin() + b.data->size() / 2;
+            std::fill(b.data->begin(), middle, b.value);
+            if (b.value == 1) {
+              gu_done.set_value();
+              released.wait();
+            }
+            assert(!cancelled());
+            ++down_reads;
+            std::fill(middle, b.data->end(), b.value);
+            return Queue::ReadResult::Complete;
+          });
+  assert(q.submit(keys, 1, [](Buffer &b) { b.value = 1; }));
+  checkpoint(gu_ready);
+  assert(q.submit(keys + 1, 1, [](Buffer &b) { b.value = 2; }));
+  assert(q.claim(keys) && q.claim(keys + 1));
+  q.expireBefore(2);
+  release.set_value();
+  assert(q.takeClaimed(keys + 1, [](Buffer &b) {
+    for (unsigned value : *b.data)
+      assert(value == 2);
+  }));
+  assert(q.takeClaimed(keys, [](Buffer &b) {
+    for (unsigned value : *b.data)
+      assert(value == 1);
+  }));
+  assert(down_reads == 2 && q.stats().completed == 2 && q.stats().used == 2 &&
+         q.stats().cancelled == 0 && q.stats().discarded == 0 &&
+         q.stats().joined == 2);
+}
+
+/** Expiry after the last cancel check must still prevent stale adoption. */
+static void lateCompletion_n() {
+  int key{};
+  auto data = std::make_shared<std::array<unsigned, 1024>>();
+  std::promise<void> checked, release;
+  auto checked_ready = checked.get_future();
+  auto released = release.get_future().share();
+  Queue q({{data}}, 1, [&](Buffer &b, const Queue::CancelCheck &cancelled) {
+    assert(!cancelled());
+    checked.set_value();
+    released.wait();
+    b.data->fill(1);
+    return Queue::ReadResult::Complete;
+  });
+  assert(q.submit(&key, 1, [](Buffer &) {}));
+  checkpoint(checked_ready);
+  q.expireBefore(2);
+  release.set_value();
+  q.drain();
+  assert(!q.take(&key, [](Buffer &) { assert(false); }));
+  assert(q.stats().completed == 1 && q.stats().cancelled == 0 &&
+         q.stats().failed == 0 && q.stats().discarded == 1);
+}
+
+/** Read errors and exceptions wake a claimed demand and remain failures. */
+static void cancellableFailures_n() {
+  int key{};
+  for (bool throws : {false, true}) {
+    auto data = std::make_shared<std::array<unsigned, 1024>>();
+    std::promise<void> entered, release;
+    auto entered_ready = entered.get_future();
+    auto released = release.get_future().share();
+    Queue q({{data}}, 1, [&](Buffer &, const Queue::CancelCheck &cancelled) {
+      entered.set_value();
+      released.wait();
+      assert(!cancelled());
+      if (throws)
+        throw std::runtime_error("cancellable read failure");
+      return Queue::ReadResult::Failed;
+    });
+    assert(q.submit(&key, 1, [](Buffer &) {}));
+    checkpoint(entered_ready);
+    assert(q.claim(&key));
+    q.expireBefore(2);
+    release.set_value();
+    assert(!q.takeClaimed(&key, [](Buffer &) { assert(false); }));
+    assert(q.stats().completed == 1 && q.stats().failed == 1 &&
+           q.stats().cancelled == 0 && q.stats().used == 0);
+  }
+}
+
 int main() {
+  cooperativeCancellation_p();
+  claimedCancellationGuard_p();
+  lateCompletion_n();
+  cancellableFailures_n();
   int keys[8]{};
   std::promise<void> entered, release;
   auto released = release.get_future().share();
