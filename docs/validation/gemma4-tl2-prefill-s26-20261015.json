@@ -1,0 +1,265 @@
+{
+  "date": "2026-10-15",
+  "upstream_pr": 4428,
+  "base_commit": "a97d383a4ef1fe94bf3b6d53f47e50b9c6624530",
+  "status": "prefill optimized; full-model decode remains outside this validation",
+  "device": {
+    "serial": "R3CY70LV96T",
+    "model": "SM-S948U",
+    "dsp_arch": "v81"
+  },
+  "conditions": {
+    "input_tokens": 2048,
+    "moe_cache_experts": 16,
+    "init_seq_len": 2048,
+    "max_seq_len": 2304,
+    "skip_prefill": false,
+    "num_to_generate": 1,
+    "use_chat_template": false,
+    "attention_kv_dtype": "q8",
+    "execution_profile": "htp_fused",
+    "environment": {
+      "NNTR_NUM_THREADS": "8",
+      "NNTR_HTP_PAGE_CACHE": "0",
+      "NNTR_MOE_CACHE_GROW": "0"
+    },
+    "page_cache_off_scope": "expert miss reads use O_DIRECT",
+    "measurement": "Public API prefill_duration_ms; includes final prefill row and affine WH LM head; excludes model loading",
+    "decode_exclusion": "Cancellation during prefill is honored at the generation loop; all runs report decode_tokens=0",
+    "ttft_note": "Canceled streaming reports ttft_ms=0; this is not a TTFT measurement",
+    "final_profile": "NNTR_LAYER_PROFILE and NNTR_HTP_PROFILE unset",
+    "diagnostic_profile": "NNTR_LAYER_PROFILE=1, NNTR_HTP_PROFILE=1; profile=2 excluded"
+  },
+  "model": {
+    "sha256": "c7e978a68c026b9bd54f7e84594701fe63dd3be5b4a62348d2a6afc3a9b9514b",
+    "expert_dtype": "TL2CX_WH",
+    "fc_dtype": "QS4CX_WH_AFFINE",
+    "head_dtype": "QS4CX_WH_AFFINE",
+    "embedding_dtype": "Q4_0",
+    "repacked_or_requantized": false
+  },
+  "prompt": {
+    "file": "docs/validation/gemma4-tl2-prefill-p2048.txt",
+    "bytes": 9960,
+    "sha256": "9af6c70fa776dbfc2c813c08a43dcced97da63ffeeafeac3eae7f794a12ea4a5",
+    "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "token_count_verified_by": [
+      "tokenizers 0.23.3",
+      "CausalLM API performance metrics"
+    ]
+  },
+  "baseline": {
+    "log": "p2048-baseline-profile.log",
+    "tokens": 2048,
+    "prefill_ms": 310313.0,
+    "tps": 6.5997879560314905,
+    "decode_tokens": 0
+  },
+  "baseline_layer_ms": {
+    "qkv": 56674.338469,
+    "attention": 818.321511,
+    "post_attention_norm": 61690.279298,
+    "ffn": 35356.893687,
+    "sparse_moe": 155690.968745
+  },
+  "final_runs": [
+    {
+      "log": "p2048-final-clean-1.log",
+      "tokens": 2048,
+      "prefill_ms": 3507.0,
+      "tps": 583.9749073282007,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-final-clean-2.log",
+      "tokens": 2048,
+      "prefill_ms": 3187.0,
+      "tps": 642.6106055851899,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-final-clean-3.log",
+      "tokens": 2048,
+      "prefill_ms": 3189.0,
+      "tps": 642.2075885857636,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-final-clean-4.log",
+      "tokens": 2048,
+      "prefill_ms": 3203.0,
+      "tps": 639.4005619731502,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-final-clean-5.log",
+      "tokens": 2048,
+      "prefill_ms": 3191.0,
+      "tps": 641.8050767784393,
+      "decode_tokens": 0
+    }
+  ],
+  "final_summary": {
+    "runs": 5,
+    "excluded_runs": 0,
+    "median_prefill_ms": 3191.0,
+    "median_tps": 641.8050767784393,
+    "mean_tps": 629.9997480501487,
+    "range_tps": [
+      583.9749073282007,
+      642.6106055851899
+    ],
+    "speedup_vs_pr_head_prefill_ms": 97.24631776872454,
+    "note": "First run was slower; retained in every summary. Earlier 600+ TPS results used a different weight pack, so this does not establish a speedup over every earlier pack."
+  },
+  "profiled_candidate": {
+    "result": {
+      "log": "p2048-pipeline-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3205.0,
+      "tps": 639.0015600624025,
+      "decode_tokens": 0
+    },
+    "layer_ms": {
+      "qkv": 342.172089,
+      "attention": 606.385471,
+      "post_attention_norm": 301.672394,
+      "ffn": 271.083538,
+      "sparse_moe": 1615.692135
+    },
+    "skel_sha256_measured": "6ac1061d176e842d015eafbf7617d5c9fb1745037e260579b3abea6cbdb5688e"
+  },
+  "earlier_candidate_clean_runs": [
+    {
+      "log": "p2048-pipeline-clean-1.log",
+      "tokens": 2048,
+      "prefill_ms": 3491.0,
+      "tps": 586.6513892867373,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-pipeline-clean-2.log",
+      "tokens": 2048,
+      "prefill_ms": 3188.0,
+      "tps": 642.409033877039,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-pipeline-clean-3.log",
+      "tokens": 2048,
+      "prefill_ms": 3188.0,
+      "tps": 642.409033877039,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-pipeline-clean-4.log",
+      "tokens": 2048,
+      "prefill_ms": 3194.0,
+      "tps": 641.202254226675,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-pipeline-clean-5.log",
+      "tokens": 2048,
+      "prefill_ms": 3199.0,
+      "tps": 640.2000625195374,
+      "decode_tokens": 0
+    }
+  ],
+  "intermediate_runs": [
+    {
+      "log": "p2048-vector-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 159669.0,
+      "tps": 12.82653489406209,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-affine-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 6969.0,
+      "tps": 293.8728655474243,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-copy-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3965.0,
+      "tps": 516.5195460277428,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-chunk-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3978.0,
+      "tps": 514.831573655103,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-unroll-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3998.0,
+      "tps": 512.256128064032,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-background-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3622.0,
+      "tps": 565.4334621755936,
+      "decode_tokens": 0
+    },
+    {
+      "log": "p2048-mac-profile.log",
+      "tokens": 2048,
+      "prefill_ms": 3381.0,
+      "tps": 605.7379473528542,
+      "decode_tokens": 0
+    }
+  ],
+  "correctness": {
+    "first_prefill_id": 818,
+    "first_prefill_id_file_sha256": "7fe2bd7ea2be37bebc39bf7c41d491a7964d3ad1fa48367761b9ab2870644012",
+    "baseline_and_optimized_first_id_identical": true,
+    "device_native_prefill": "32 shape/magnitude/expert/row combinations, 3 repetitions, bit-identical to independently registered int4; M=2,23,65,129; E=1,3; magnitude=1,7; small and Gemma shapes",
+    "device_affine_fc": "10 cases M=1,2,64,65,128, small and K=N=2816; bit-identical to equivalent signed int4; WH LM head M=1 also identical",
+    "device_affine_moe": "8 cases, M=2,64,65,129, 3 repetitions, small and K=2816,I=704,N=2816; bit-identical",
+    "device_native_gemv": "K,N=(96,128),(2816,1408),(704,2816), modes 0/3/512, workers 1/8, zero mismatches",
+    "device_swap": "small/default, real/default, real/fast 0xcf03e1: initial result and 4 arena swaps bit-identical",
+    "simulator": "v79 and v81: TL2 expansion 192 cases and affine sums/correction 210 cases, exact with guards",
+    "host_sanitizers": "ASan+UBSan pass for TL2 expansion and affine sums/correction",
+    "host_suite": "CC=gcc bash test/htp/host/run_host_checks.sh completed with exit 0; optional libnative and AArch64/qemu checks skipped because tools are unavailable"
+  },
+  "builds": {
+    "dsp_v79": "passed",
+    "dsp_v81": "passed",
+    "device_checkers_android_aarch64": "passed",
+    "c_cpp_format": "clang-format 14.0.6 on changed lines, new files fully formatted; git diff --check passed"
+  },
+  "runtime_artifacts": {
+    "baseline_skel": {
+      "sha256": "97f0fc8a616a1b6470f9bc78d137f930a3d2b9cfd2414b3c1882aa609847f540",
+      "bytes": 678832
+    },
+    "final_skel": {
+      "sha256": "5146389d0e4228525750af0c284ccb32287fcdb94521fdfe37308cda643e098b",
+      "bytes": 680316
+    },
+    "arm_core": {
+      "sha256": "23f80b3883909397a3b61f8dfff9a074f14aef979915be2513a516a52681c802",
+      "bytes": 6063800
+    },
+    "arm_app": {
+      "sha256": "75ea26971edd5addb34363879f6508bfdfc27770362e329519904ec80dae8d91",
+      "bytes": 21296952
+    }
+  },
+  "not_verified": [
+    "Full-model decode and its previously reported DSPQ/pool rebind failure",
+    "Perplexity or generated text quality against original BF16 checkpoint",
+    "All CI platforms; optional host libnative and AArch64/qemu checks unavailable"
+  ],
+  "evidence_root": "/tmp/pr4428-tl2-prefill-20261015",
+  "device_root": "/data/local/tmp/nntr_tl2_prefill_20261015",
+  "device_final_runtime": "/data/local/tmp/nntr_tl2_prefill_20261015/final"
+}

@@ -35,6 +35,11 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
   -o "$OUT/tl2_lut_check"
 "$OUT/tl2_lut_check"
 
+"$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
+  "$HERE/tl2_expand_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  -o "$OUT/tl2_expand_check"
+"$OUT/tl2_expand_check"
+
 g++ -std=c++17 -O2 -Wall -Wextra -I "$BACKEND/.." -I "$BACKEND/hvx" \
   "$HERE/tl2_native_packing_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_native_packing_check"
@@ -100,6 +105,9 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" \
   "$BACKEND/hvx/hvx_gemv_u8tl2.c" -Wl,--gc-sections -lm
 "$OUT/wh_affine_host_check"
+"$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hmx" \
+  "$HERE/wh_affine_vector_check.c" -o "$OUT/wh_affine_vector_check"
+"$OUT/wh_affine_vector_check"
 # [#225] Two mutants of the decode FC on WH weights (hexkl_mm_u8i4_fc_m1_run),
 # each of which must fail FC WH BIT-IDENTICAL: a lane computing a block it
 # never waited for, and the part's column offset dropped from the dequant's
