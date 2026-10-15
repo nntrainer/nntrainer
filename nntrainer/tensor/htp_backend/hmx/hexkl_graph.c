@@ -980,7 +980,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
       return AEE_ENOMEMORY;
     }
   }
-  /* the logits: an LM_HEAD's output whichever feed it has */
+  /** the logits: an LM_HEAD's output whichever feed it has */
   g->logits =
     vocab_out ? (float *)malloc((size_t)vocab_out * sizeof(float)) : NULL;
   if (vocab_out && g->logits == NULL) {

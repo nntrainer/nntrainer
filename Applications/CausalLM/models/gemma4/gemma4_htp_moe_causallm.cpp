@@ -200,6 +200,8 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
                              "does not fit HTP_GRAPH_MAX_OPS");
   words.resize(n_words);
   auto *ops = nntrainer::get_htp_ops();
+  if (!TIE_WORD_EMBEDDINGS && LMHEAD_DTYPE == "QS4CX")
+    ops->set_lm_head_wh_cache((weight_path + ".lmhead_wh").c_str());
   if (!ops->set_decode_graph_desc(words))
     throw std::runtime_error(
       "[Gemma4MoE] NNTR_HTP_E2E: the HTP backend has no per-token entry");

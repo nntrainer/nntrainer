@@ -700,6 +700,12 @@ public:
     return false;
   }
 
+  // The untied QS4CX lm_head's WH slices as a file beside the model
+  // (<model file>.lmhead_wh): read straight into the accelerator's arena at
+  // load when it matches the weight, written after the first conversion
+  // otherwise, so no later load converts the head. No-op without HTP.
+  virtual void set_lm_head_wh_cache(const char *path) { (void)path; }
+
   // [plan 201 S4] One f32 parameter of the decode list's op @a op (which:
   // HTP_GRAPH_PARAM_*, n floats), handed by the model at load by the
   // weight's name instead of by its layer's hook order (Gemma 4 runs its
