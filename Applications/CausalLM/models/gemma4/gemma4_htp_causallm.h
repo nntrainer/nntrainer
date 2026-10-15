@@ -115,6 +115,9 @@ protected:
   /** @brief Rows of a layer's KV cache: max_seq_len, or for a sliding layer
    *         at a long max_seq_len its window plus one step. */
   unsigned int getKVCacheRows(int layer_id) const;
+  /** @brief A prompt past init_seq_len is fed in init_seq_len-row chunks:
+   *         the windowed sliding cache is sized for exactly that. */
+  bool chunkLongPrompts() const override { return true; }
   void appendSkipPrefillIfNeeded(std::vector<std::string> &props,
                                  bool enable_skip) const;
   std::pair<Tensor, Tensor>
