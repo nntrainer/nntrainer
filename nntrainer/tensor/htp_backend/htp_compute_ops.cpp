@@ -1774,7 +1774,59 @@ public:
       return false;
     if (it->second.K != K || it->second.N != N)
       throw std::invalid_argument("Shared LM head shape changed");
+    if (it->second.wh)
+      return invokeLmHeadWh(e2e_st_->h1, it->second.h, K, N, x, y);
     return invokeLmHead(e2e_st_->h1, it->second.h, K, N, x, nullptr, 0, 0, y);
+  }
+
+  /** @brief The untied QS4CX head's one row on its WH slices: the graph's
+   *  LM_HEAD kernel outside the token driver (the prefill's last row). */
+  bool invokeLmHeadWh(remote_handle64 session, const std::vector<uint32_t> &h,
+                      unsigned K, unsigned N, const float *x, float *y) {
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    float *act =
+      reinterpret_cast<float *>(stage(act_pool_, K * sizeof(float)).data());
+    float *out = reinterpret_cast<float *>(
+      stage(out_pool_, static_cast<size_t>(N) * sizeof(float)).data());
+    stagedMemcpy(act, x, K * sizeof(float));
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_lm_head_wh_f32(
+      session, h.data(), static_cast<int>(h.size()), act, static_cast<int>(K),
+      out, static_cast<int>(N));
+    const uint64_t elapsed = HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_lm_head_wh_f32 failed: err=" + std::to_string(err) +
+        " (K=" + std::to_string(K) + " N=" + std::to_string(N) + ")");
+    }
+    stagedMemcpy(y, out, static_cast<size_t>(N) * sizeof(float));
+    HtpProfile &profile = HtpProfile::global();
+    if (profile.level())
+      profile.addInvoke(1, K, N, elapsed, nullptr);
+    return true;
+  }
+
+  /** @brief One WH slice of an untied QS4CX head: columns [c0, c0 + n) --
+   *  a column is K / 2 contiguous bytes on disk, so the slice is a pointer
+   *  offset -- converted (htp_qs4cx_from_packed) and placed as an FC slice
+   *  is (registerRm), keyed by its first byte so a re-bind finds it. */
+  uint32_t registerLmHeadWhSlice(remote_handle64 session, const void *data,
+                                 const float *scale, uint32_t K, uint32_t c0,
+                                 uint32_t n) {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    void *key = static_cast<uint8_t *>(const_cast<void *>(data)) +
+                static_cast<size_t>(c0) * (K / 2u);
+    auto it = handle_cache_.find(key);
+    if (it != handle_cache_.end())
+      return it->second;
+    const uint64_t t0 = HtpProfile::nowUs();
+    std::vector<int8_t> rm(static_cast<size_t>(K) * n);
+    std::vector<float> ws(n);
+    std::vector<int32_t> cs(n);
+    htp_qs4cx_from_packed(key, scale + c0, K, n, rm.data(), ws.data(),
+                          cs.data());
+    const uint64_t convert_us = HtpProfile::nowUs() - t0;
+    return registerRm(key, session, rm.data(), K, n, ws, cs, t0, convert_us);
   }
 
   bool lm_head_q4_0_prepare(const void *w, unsigned int K,
@@ -2615,11 +2667,12 @@ public:
       for (const Q4Pending &p : q4_pending_)
         if (p.scale == nullptr) // [#260] a QS4CX weight binds WH handles
           q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
-    } else { // [#225] the LM_HEAD's slices only
+    } else { // [#225] the LM_HEAD's slices only (a QS4CX head binds WH)
       for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size());
            ++i) {
         const htp_graph_op *op = graphOp(i);
-        if (op->resident && op->kind == HTP_OP_LM_HEAD)
+        if (op->resident && op->kind == HTP_OP_LM_HEAD &&
+            !(q4_pending_.size() && q4_pending_.back().scale != nullptr))
           q4m1_left_ +=
             q4m1_bytes(op->K, op->N) +
             4096u * ((op->N + kLmHeadSliceRows - 1u) / kLmHeadSliceRows);
@@ -2635,9 +2688,10 @@ public:
                                  "(the model handed " +
                                  std::to_string(q4_pending_.size()) + ")");
       Q4Pending &p = q4_pending_[next++];
-      // The untied head still runs on the CPU during every prefill. Decode
-      // residency alone does not make its host weight disposable.
-      p.keep_host = graphOp(op)->kind == HTP_OP_LM_HEAD;
+      // The untied Q4_0 head still runs on the CPU during every prefill.
+      // Decode residency alone does not make its host weight disposable. A
+      // QS4CX head's prefill row runs on its WH slices (lm_head_shared_fp32).
+      p.keep_host = graphOp(op)->kind == HTP_OP_LM_HEAD && p.scale == nullptr;
       if (p.K != K || (N != 0u && p.N != N))
         throw std::runtime_error(
           "set_decode_graph_desc: op " + std::to_string(op) + " wants a " +
@@ -2731,6 +2785,56 @@ public:
         op->h_dn[0] = registerQ4m1(session, take(i, op->N, op->N_out), op->N,
                                    0u, op->N_out);
         parts = 3u;
+      } else if (op->kind == HTP_OP_LM_HEAD && qs4cx_op) {
+        // An untied QS4CX head (lmhead_dtype QS4CX): its columns in at most
+        // HTP_GRAPH_MAX_PARTS WH slices (4448 columns at a 262144 vocabulary),
+        // each converted and placed as an FC slice is (registerRm, the arena),
+        // bound to the op on HTP_GRAPH_FEED_WH. The same handles serve the
+        // prefill's last row (lm_head_shared_fp32), so the host copy is
+        // released with the FC set below (keep_host false).
+        const Q4Pending &p = pending(i, op->K, op->N);
+        if (op->N % 32u != 0u)
+          throw std::runtime_error("set_decode_graph_desc: LM_HEAD op " +
+                                   std::to_string(i) +
+                                   " is N=" + std::to_string(op->N) +
+                                   ", not a multiple "
+                                   "of 32");
+        // A registered handle must fit VTCM (hexkl_weight_u8i4_check: its
+        // bake stages there), so a slice is at most 6 MiB of WH bytes --
+        // 4448 columns at K = 2816, 59 slices -- and HTP_GRAPH_MAX_PARTS
+        // bounds the count. ponytail: 6 MiB assumes the 8 MiB VTCM of v79 /
+        // v81; a smaller VTCM wants the session's size here.
+        const uint32_t fit = std::max(
+          32u,
+          static_cast<uint32_t>((size_t(6) << 20) / (op->K / 2u)) / 32u * 32u);
+        const uint32_t cols =
+          std::min(fit, ((op->N / 32u + HTP_GRAPH_MAX_PARTS - 1u) /
+                         HTP_GRAPH_MAX_PARTS) *
+                          32u);
+        if ((op->N + cols - 1u) / cols > HTP_GRAPH_MAX_PARTS)
+          throw std::runtime_error(
+            "set_decode_graph_desc: LM_HEAD op " + std::to_string(i) + " (" +
+            std::to_string(op->K) + " x " + std::to_string(op->N) +
+            ") needs more than " + std::to_string(HTP_GRAPH_MAX_PARTS) +
+            " WH slices of " + std::to_string(cols) + " columns");
+        const uint64_t t0 = HtpProfile::nowUs();
+        for (uint32_t c0 = 0; c0 < op->N; c0 += cols)
+          op->h_gu[parts++] = registerLmHeadWhSlice(
+            session, p.data, p.scale, p.K, c0, std::min(cols, op->N - c0));
+        op->feed |= HTP_GRAPH_FEED_WH;
+        wh_handles += parts;
+        SharedLmHead &sh = shared_lm_heads_[p.data];
+        sh.K = op->K;
+        sh.N = op->N;
+        sh.wh = true;
+        sh.h.assign(op->h_gu, op->h_gu + parts);
+        std::fprintf(stderr,
+                     "[HTP] lm_head on the NPU: %u x %u QS4CX as %u WH slices "
+                     "of %u (prefill row and decode), %.1f MiB, placed in "
+                     "%.0f ms\n",
+                     op->N, op->K, parts, cols,
+                     static_cast<double>(op->K) * op->N / 2 / (1u << 20),
+                     static_cast<double>(HtpProfile::nowUs() - t0) / 1000.0);
       } else if (op->kind == HTP_OP_LM_HEAD) {
         const Q4Pending &p = pending(i, op->K, op->N);
         if (p.scale)
@@ -9776,6 +9880,7 @@ private:
   std::map<const void *, LmHeadSlices> lm_head_;
   struct SharedLmHead {
     unsigned K = 0, N = 0;
+    bool wh = false; /**< h are u8i4 WH handles (a QS4CX head), else Q4M1 */
     std::vector<uint32_t>
       h; // Borrowed from e2e_st_->q4m1, never released twice.
   };

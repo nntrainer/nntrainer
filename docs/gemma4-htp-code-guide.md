@@ -93,6 +93,10 @@ flowchart TB
 - `nntrainer/layers/llm/` holds `lm_head`, `logit_softcapping` and the HTP
   tied-embedding head; the head is split so the DSP computes the argmax of
   the logits it holds and the CPU only sees logits when sampling needs them.
+  An untied `QS4CX` head is bound to the decode list's `LM_HEAD` op as WH
+  slices (`HTP_GRAPH_FEED_WH`, the FC's M = 1 kernel into the logits) and
+  the prefill's last row runs on the same slices (`lm_head_shared_fp32`,
+  skel entry `lm_head_wh_f32`), so no CPU copy of the head stays resident.
 - The per-layer-embedding path of Gemma4 (`per_layer_slice`,
   `per_layer_input_sum`, `scalar_multiply`) is built from standard layers.
 

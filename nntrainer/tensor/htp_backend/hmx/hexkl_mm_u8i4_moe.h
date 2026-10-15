@@ -286,7 +286,7 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
                             hexkl_moe_scratch *scratch, uint32_t flags);
 
 /** @brief [#225] hexkl_mm_u8i4_fc_m1_run's part limit (HTP_GRAPH_MAX_PARTS). */
-#define HEXKL_FC_M1_MAX_PARTS 32u
+#define HEXKL_FC_M1_MAX_PARTS 64u
 
 /**
  * @brief Take a call of at most 4 rows (M <= 4, at most 16 active experts)

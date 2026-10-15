@@ -2244,3 +2244,45 @@ int nntr_hvx_weights_tl2(remote_handle64 handle, const uint32 *handles,
   }
   return AEE_SUCCESS;
 }
+
+/** An untied head's row on its WH slices outside the token driver (the
+   prefill's last row): the graph's LM_HEAD op on HTP_GRAPH_FEED_WH, the
+   same kernel (hexkl_mm_u8i4_fc_m1_run) on the same handles, the parts'
+   outputs side by side in y. No norm and no soft-cap here: an untied
+   model keeps those in their own layers. */
+int nntr_hvx_lm_head_wh_f32(remote_handle64 handle, const uint32 *h, int hLen,
+                            const float *x, int xLen, float *y, int yLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t n_total = 0;
+  int p;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (hLen <= 0 || hLen > (int)HEXKL_FC_M1_MAX_PARTS || xLen <= 0 ||
+      xLen % 32 != 0 || yLen <= 0) {
+    FARF(ERROR, "lm_head_wh_f32: bad shape (h=%d x=%d y=%d)", hLen, xLen, yLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  for (p = 0; p < hLen; ++p) {
+    const hexkl_weight_u8i4 *w;
+    if (h[p] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[h[p]].in_use) {
+      return AEE_EBADITEM;
+    }
+    w = &s->weights_u8i4.slots[h[p]];
+    if (w->K != (uint32_t)xLen || w->N % 32u != 0u) {
+      FARF(ERROR, "lm_head_wh_f32: slice %d is %u x %u, x is %d", p,
+           (unsigned)w->K, (unsigned)w->N, xLen);
+      return AEE_EINVALIDFORMAT;
+    }
+    n_total += w->N;
+  }
+  if (n_total != (uint64_t)yLen) {
+    FARF(ERROR, "lm_head_wh_f32: slices hold %u columns, y is %d",
+         (unsigned)n_total, yLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  return hexkl_mm_u8i4_fc_m1_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, (uint32_t)xLen,
+    (uint32_t)hLen, h, x, y, s->quant_pool, &s->moe_scratch, s->moe_flags);
+}
