@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file hexkl_wh_affine.h
+ * @brief Exact affine WH activation sums and accumulator correction.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ */
 #ifndef NNTR_HEXKL_WH_AFFINE_H
 #define NNTR_HEXKL_WH_AFFINE_H
 
@@ -25,7 +31,7 @@ static inline void hexkl_wh_affine_sums(const uint8_t *ah, uint32_t rows,
         *(const HVX_UVector *)(ah + (size_t)kt * 2048u + r * 32u);
       sum = Q6_Vuw_vrmpyacc_VuwVubRub(sum, a, 0x01010101);
     }
-    /* Each AH vector contains four rows. Reduce its eight word sums per
+    /** Each AH vector contains four rows. Reduce its eight word sums per
      * row; only lanes 0, 8, 16 and 24 are used, so no row boundary wraps. */
     sum = Q6_Vw_vadd_VwVw(sum, Q6_V_vror_VR(sum, 4));
     sum = Q6_Vw_vadd_VwVw(sum, Q6_V_vror_VR(sum, 8));
@@ -59,7 +65,7 @@ static inline void hexkl_wh_affine_acc(int32_t *acc, uint32_t stride,
     for (uint32_t r = 0; r < rows; ++r) {
       const HVX_Vector sum = Q6_V_vsplat_R(sums[r]);
       HVX_UVector *dst = (HVX_UVector *)(acc + (size_t)r * stride + c);
-      /* Registration validates offsets in [-15, 15], so the signed low
+      /** Registration validates offsets in [-15, 15], so the signed low
        * halfword is exact; the row sum remains a full 32-bit integer. */
       *dst = Q6_Vw_vmpyieacc_VwVwVh(*dst, sum, off);
     }

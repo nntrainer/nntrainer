@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file tl2_device_check.cpp
+ * @brief Compare native TL2 GEMV modes and worker counts on the DSP.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ */
 #include "hvx_gemv_u8tl2.h"
 #include <AEEStdErr.h>
 #include <cstdio>

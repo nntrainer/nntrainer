@@ -4,6 +4,8 @@
  * Arguments: model base directory, native library directory, prompt file.
  * The base must contain gemma4-26b-a4b-htp-w4a32/ with the desired config.
  * Use skip_prefill=false to include all prompt tokens and the WH head.
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
  */
 #include "quick_dot_ai_api.h"
 #include <atomic>
@@ -47,7 +49,7 @@ int main(int argc, char **argv) {
                               CAUSAL_LM_QUANTIZATION_W4A32, argv[2], argv[1],
                               &handle),
         "load");
-  /* Cancellation is checked by the generation loop, not the prefill
+  /** Cancellation is checked by the generation loop, not the prefill
    * forward pass. Keep it set even if the first token has no text delta. */
   std::atomic<bool> done{false};
   std::thread stop([&] {

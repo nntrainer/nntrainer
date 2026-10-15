@@ -57,7 +57,7 @@ static void digits(unsigned m, int *a, int *b, int *c) {
 }
 
 #if defined(__hexagon__)
-/* VLUT32 reads byte 2*m for magnitude m. Repeat each 32-byte lookup in
+/** VLUT32 reads byte 2*m for magnitude m. Repeat each 32-byte lookup in
  * every lane group, as in hvx_expand_i2i4. Invalid magnitudes stay zero. */
 #define TL2_REPEAT4(...)                                                       \
   { __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__ }
@@ -84,7 +84,7 @@ static inline HVX_Vector tl2_expand_row(const uint8_t *src, uint32_t k,
                     Q6_Vb_vsub_VbVb(Q6_V_vzero(), q), q);
   q = Q6_V_vand_VV(q, mask);
   if (magnitude == 7)
-    /* q is a nibble: shifting by three cannot carry into the next byte.
+    /** q is a nibble: shifting by three cannot carry into the next byte.
      * Modulo 16, 7*q also maps -1 (15) to -7 (9). */
     q = Q6_V_vand_VV(Q6_Vb_vsub_VbVb(Q6_Vh_vasl_VhR(q, 3), q), mask);
   return q;
@@ -95,7 +95,7 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
                          uint32_t row_stride, int magnitude, uint8_t *dst) {
 #if defined(__hexagon__)
   if (magnitude == 1 || magnitude == 7) {
-    /* Constant row indices eliminate division and lookup-address work from
+    /** Constant row indices eliminate division and lookup-address work from
      * the inner loop, and keep the four transpose inputs in registers. */
 #pragma unroll(12)
     for (uint32_t k = 0; k < 96u; k += 8u) {
@@ -108,7 +108,7 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
         const HVX_Vector hi = tl2_expand_row(src, k + r + 4u, magnitude);
         bytes[r] = Q6_V_vor_VV(lo, Q6_Vh_vasl_VhR(hi, 4));
       }
-      /* Native byte j = 4*c + tile. Exchange the two tile bits with
+      /** Native byte j = 4*c + tile. Exchange the two tile bits with
        * the row bits in the four registers, leaving c in place. Each
        * result is one complete WH vector: byte 4*c + row. */
       const HVX_VectorPair a = Q6_W_vshuff_VVR(bytes[1], bytes[0], 1);
@@ -127,7 +127,7 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
     return;
   }
 #endif
-  /* Each magnitude names a balanced-base-three triple. This small inverse
+  /** Each magnitude names a balanced-base-three triple. This small inverse
      table also keeps integer division out of the weight loop. */
   static const int8_t trits[16][3] = {
     {0, 0, 0},   {0, 0, 1},  {0, 1, -1}, {0, 1, 0},  {0, 1, 1},
