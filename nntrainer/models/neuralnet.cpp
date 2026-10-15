@@ -2081,7 +2081,10 @@ void NeuralNetwork::load(const std::string &file_path,
       // reading it ahead of the workers (see WeightFileReadAhead). FSU keeps
       // the file as its weight store and reads only what it needs.
       std::optional<WeightFileReadAhead> read_ahead;
-      if (MMAP_READ && !fsu_mode)
+      // Explicit cache policies use FileReadSource, not the mapped loader.
+      // WILLNEED still populates the kernel cache on an O_DIRECT descriptor
+      // and also escapes the bounded-cache reader's accounting.
+      if (MMAP_READ && !fsu_mode && weightPageCachePolicy() < 0)
         read_ahead.emplace(model_file_fd);
       const auto _lt_fanout_t0 = std::chrono::steady_clock::now();
       for (size_t t = 0; t < num_load_threads; ++t) {

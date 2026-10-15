@@ -916,7 +916,15 @@ public:
   // fixed chunk. Advisory; call before the first register. Doc 52 section
   // 10.14: at NNTR_MOE_CACHE_EXPERTS=1 the pool is 116 MiB, and a 256 MiB
   // chunk would hide the saving.
-  virtual void reserve_qs4cx_wh_expert_slots(size_t n) { (void)n; }
+  // Supplying a shape also allocates the slots, without reading weights or
+  // registering experts. This keeps arena mapping out of the first prefill
+  // even when the caller chooses a smaller load-time preload budget.
+  virtual void
+  reserve_qs4cx_wh_expert_slots(size_t n,
+                                const ExpertFileDesc *shape = nullptr) {
+    (void)n;
+    (void)shape;
+  }
 
   // Reads one expert from the model file into a slot the backend owns and
   // registers it. Idempotent for a key already resident. at_load says
