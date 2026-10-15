@@ -187,7 +187,13 @@ public:
              nntr_cfg),
     Gemma4HtpTransformer(sanitizeConfig(cfg),
                          sanitizeGenerationConfig(generation_cfg, cfg),
-                         nntr_cfg) {}
+                         nntr_cfg) {
+    // CausalLM::load_weight()'s early KV build (on in OpenCL builds) is the
+    // generic one: max_seq_len rows a layer in host/SVM memory. This model
+    // sizes a sliding layer to its window plus one chunk, in the DSP's shared
+    // heap, in allocateAndBindKVCache(), and skips that once a cache exists.
+    setPrepareRunAtLoad(false);
+  }
 
   virtual ~Gemma4HtpCausalLM() = default;
 
