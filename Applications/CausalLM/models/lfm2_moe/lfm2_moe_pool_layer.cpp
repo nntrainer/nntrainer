@@ -29,6 +29,7 @@
 #include <unistd.h>
 #endif
 #include <expert_lru.h>
+#include <expert_preload.h>
 #include <htp_decode_hook.h>
 #include <htp_fixed_opts.h>
 #include <iostream>
@@ -581,20 +582,21 @@ bool Lfm2MoePoolLayer::preloadExperts(nntrainer::RunLayerContext &context) {
     throw std::runtime_error("virtual MoE experts need the layer's engine to "
                              "provide ComputeOps; none is registered");
   }
-  // Every virtual layer has finalized by now, so the pool's capacity is
-  // final: size the backend's slot memory to it, once.
-  static bool reserved = false;
-  if (!reserved) {
-    ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity());
-    reserved = true;
-  }
-
   std::vector<ExpertFileDesc> descs;
   descs.reserve(num_experts);
   for (unsigned int e = 0; e < num_experts; ++e)
     descs.push_back(
       expertDesc(context.getWeight(expert_gate_up_proj_indices[e]),
                  context.getWeight(expert_down_proj_indices[e])));
+  const char *preload = std::getenv("NNTR_MOE_PRELOAD_EXPERTS");
+  const size_t limit = expertPreloadLimit(g_expert_lru.capacity(), preload);
+  // Map all slots before FC registration, independently of weight reads.
+  if (g_expert_layers.empty()) {
+    ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity(),
+                                       descs.empty() ? nullptr : &descs[0]);
+    std::fprintf(stderr, "[MoE] preload_experts=%zu cache_slots=%zu\n", limit,
+                 g_expert_lru.capacity());
+  }
   if (expert_layer_slot < 0) {
     expert_layer_slot = static_cast<int>(g_expert_layers.size());
     g_expert_layers.push_back(descs);
@@ -602,7 +604,8 @@ bool Lfm2MoePoolLayer::preloadExperts(nntrainer::RunLayerContext &context) {
 
   std::vector<causallm::ExpertLru::Key> need;
   std::unordered_map<causallm::ExpertLru::Key, unsigned int> expert_of;
-  const size_t room = g_expert_lru.capacity() - g_expert_lru.size();
+  const size_t room =
+    limit > g_expert_lru.size() ? limit - g_expert_lru.size() : 0;
   for (unsigned int e = 0; e < num_experts && need.size() < room; ++e) {
     need.push_back(descs[e].key_gu);
     expert_of[descs[e].key_gu] = e;

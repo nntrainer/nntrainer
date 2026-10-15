@@ -16,12 +16,35 @@
 #include <gtest/gtest.h>
 
 #include <expert_lru.h>
+#include <expert_preload.h>
 
 #include <vector>
 
 namespace {
 
 using causallm::ExpertLru;
+
+TEST(ExpertPreload, BudgetDoesNotChangeCacheCapacity_p) {
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 480);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), nullptr), 128u);
+  EXPECT_EQ(causallm::expertPreloadLimit(0, nullptr), 0u);
+  EXPECT_EQ(causallm::expertPreloadLimit(64, nullptr), 64u);
+  EXPECT_EQ(causallm::expertPreloadLimit(128, nullptr), 128u);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), "0"), 0u);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), "64"), 64u);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), "128"), 128u);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), "480"), 480u);
+  EXPECT_EQ(causallm::expertPreloadLimit(lru.capacity(), "999"), 480u);
+  EXPECT_EQ(lru.capacity(), 480u);
+}
+
+TEST(ExpertPreload, RejectsMalformedBudget_n) {
+  for (const char *bad : {"", "-1", "+1", "1x", " 1", "1 ", "1.5", "0x80",
+                          "184467440737095516160"})
+    EXPECT_THROW(causallm::expertPreloadLimit(480, bad), std::invalid_argument);
+}
 
 /** Keys are opaque addresses; these are as good as any. */
 static const char kExperts[64] = {};

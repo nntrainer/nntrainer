@@ -4724,9 +4724,27 @@ public:
     return keys;
   }
 
-  void reserve_qs4cx_wh_expert_slots(size_t n) override {
+  void reserve_qs4cx_wh_expert_slots(
+    size_t n, const ExpertFileDesc *shape = nullptr) override {
     std::lock_guard<std::mutex> lock(handle_mutex_);
     expert_slots_wanted_ = n;
+    if (!shape || expert_slots_placed_ >= n)
+      return;
+    const auto session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    // Keep existing free slots aside so takeExpertSlot must place new ones.
+    // Restore every allocated slot on failure as well as on success.
+    auto available = std::move(free_expert_slots_);
+    free_expert_slots_.clear();
+    try {
+      available.reserve(available.size() + n - expert_slots_placed_);
+      while (expert_slots_placed_ < n)
+        available.push_back(takeExpertSlot(session, *shape));
+    } catch (...) {
+      free_expert_slots_ = std::move(available);
+      throw;
+    }
+    free_expert_slots_ = std::move(available);
   }
 
   /**
