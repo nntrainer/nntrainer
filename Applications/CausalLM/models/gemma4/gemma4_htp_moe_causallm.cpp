@@ -364,7 +364,12 @@ void Gemma4HtpMoECausalLM::run(const WSTR prompt, bool do_sample,
       kv_cache = KVCacheManager{};
       kv_cache_bound = false;
     }
-    setSessionTokenPosition(0);
+    // a precomputed cache (system_prompt.kvcache) stays on: the run saves
+    // or loads it at position 0
+    if (USE_KVCACHE)
+      setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+    else
+      setSessionTokenPosition(0);
 #endif
     htp_run_started_ = true;
   }
