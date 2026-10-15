@@ -691,6 +691,17 @@ public:
   // The backend binds the handles its prefill registers from the same bytes
   // (one image set); no Q4M1 or CPU fallback. Returns false when it takes
   // none.
+  // Register an in-file QS4CX_WH record as the source for FC/dense kernels.
+  // The pointer remains valid until the backend has placed its handles.
+  virtual bool set_fc_wh_source(const void *data, unsigned K, unsigned N,
+                                bool affine = false) {
+    (void)data;
+    (void)K;
+    (void)N;
+    (void)affine;
+    return false;
+  }
+
   virtual bool add_decode_graph_qs4cx(const void *data, const float *scale,
                                       unsigned K, unsigned N) {
     (void)data;

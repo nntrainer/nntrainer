@@ -200,16 +200,19 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // (accelerates_q4_0_at_m1): one row cannot amortize the call.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
   const auto qs4cx = ml::train::TensorDim::DataType::QS4CX;
+  const bool wh =
+    up_w.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH ||
+    up_w.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
+  const bool scaled = wh || up_w.getDataType() == qs4cx;
   const auto wtype = up_w.getDataType();
   auto *ops = in_step.getOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
   // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
   if (ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&
-      (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
-      (wtype == q4 || wtype == qs4cx) && gate_w.getDataType() == wtype &&
+      (rows > 1 || wh || (scaled && ops->accelerates_qs4cx_at_m1())) &&
+      (wtype == q4 || scaled) && gate_w.getDataType() == wtype &&
       down_w.getDataType() == wtype) {
     // ... with the input and output norms folded into the same call.
-    const bool scaled = wtype == qs4cx;
     ops->gemm_q4_0_dense_ffn_fp32(
       up_w.getData<char>(), gate_w.getData<char>(), down_w.getData<char>(),
       in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N,

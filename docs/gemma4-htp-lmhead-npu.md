@@ -175,3 +175,21 @@ Lines to read on stderr:
 | `test/htp/nntr_hvx.idl`, `test/htp/nntr_hvx_mm_u8i4.c` | skel entry `lm_head_wh_f32` |
 | `test/htp/host/graph_host_check.c` | the WH `LM_HEAD` case; wire v3 |
 | `docs/gemma4-htp-user-guide.md`, `docs/gemma4-htp-code-guide.md` | the keys and the path |
+
+## 7. Unified native TL2 and affine WH pack
+
+The original-preserving ternary pack uses `TL2CX_WH` experts and
+`QS4CX_WH_AFFINE` FC / untied head records in one model file. An affine
+record stores WH int4 codes, channel scales, code sums and integer channel
+offsets: `w = scale * (q + offset)`. BF16 rounding reconstructs the
+original checkpoint values; no symmetric int4 re-quantization is needed.
+
+The head bind gathers each vocabulary slice directly from the model's WH
+tile rows with `registerFcWh`, including its offsets. It uses the same
+64-part v3 graph ABI and the same `lm_head_wh_f32` entry described above.
+Both prefill's last row and decode therefore use those registered slices.
+This pack needs no `.lmhead_wh` conversion cache and no expert sidecar.
+Prefill expands native TL2 expert panels to WH int4 in DSP scratch;
+decode reads native TL2. The expert palette is {-1, 0, 1}, without a
+7-fold scale adjustment. Rebuild both ARM client and DSP skel for the
+extended affine weight registration and the new LM head RPC entry.

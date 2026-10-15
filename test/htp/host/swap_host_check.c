@@ -47,6 +47,16 @@ int hexkl_mm_u8i4_moe_layer_run(
   fprintf(stderr, "swap_host_check: hexkl_mm_u8i4_moe_layer_run called\n");
   abort();
 }
+/** The standalone WH head RPC is not exercised by this registry check. */
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  fprintf(stderr, "swap_host_check: hexkl_mm_u8i4_fc_m1_run called\n");
+  abort();
+}
 /** The skel asks these two before a release or a detach; this check has no
    decode graph and no Q4M1 slot, so nothing is ever bound or borrowed. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {

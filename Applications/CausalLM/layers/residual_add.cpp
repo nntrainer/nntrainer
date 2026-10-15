@@ -146,7 +146,10 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
       // dot(), decode's row included) and the epilogue on its output.
       nntrainer::Tensor &w = context.getWeight(proj_idx);
       if (rows > 1 && ops != nullptr && W % 32 == 0 &&
-          w.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+          (w.getDataType() == ml::train::TensorDim::DataType::QS4CX ||
+           w.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH ||
+           w.getDataType() ==
+             ml::train::TensorDim::DataType::QS4CX_WH_AFFINE) &&
           ops->gemm_qs4cx_res_add_fp32(
             w.getData<char>(), w.getScale<float>(), in1_step.getData<float>(),
             rows, in1_step.width(), W, in0_step.getData<float>(), gamma, eps,

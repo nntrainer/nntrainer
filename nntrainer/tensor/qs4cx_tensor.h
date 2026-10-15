@@ -534,6 +534,40 @@ public:
   std::string getStringDataType() const override { return "QS4CX_WH"; }
 };
 
+/** WH int4 with an integer affine offset per output channel.
+ * W[k,n] = scale[n] * (q[k,n] + offset[n]). The offset tail is explicit
+ * so a symmetric WH reader cannot silently misinterpret this record. */
+class QS4CX_WH_AFFINE_Tensor : public QS4CX_WH_Tensor {
+public:
+  QS4CX_WH_AFFINE_Tensor(std::string name = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_WH_Tensor(name, fm) {}
+  QS4CX_WH_AFFINE_Tensor(const TensorDim &d, bool alloc_now,
+                         Initializer init = Initializer::NONE,
+                         std::string name = "") :
+    QS4CX_WH_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+  QS4CX_WH_AFFINE_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    QS4CX_WH_AFFINE_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() != 0 && buf)
+      copy_qs4cx(buf);
+  }
+  QS4CX_WH_AFFINE_Tensor(TensorBase &rhs) : QS4CX_WH_Tensor(rhs) {}
+  size_t size() const override {
+    // WH records contain whole tiles and never QS4CX's legacy row padding.
+    return height() * width() / 2 + 3 * width() * sizeof(uint32_t);
+  }
+  size_t getMemoryBytes() const override { return size(); }
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    return static_cast<uint8_t *>(getData()) + height() * width() / 2;
+  }
+  std::string getStringDataType() const override { return "QS4CX_WH_AFFINE"; }
+};
+
 /**
  * @class QS2CX_WH_Tensor
  * @brief QS4CX_WH at two bits a weight
@@ -628,6 +662,40 @@ public:
    * @return std::string of tensor data type (QS2CX_WH)
    */
   std::string getStringDataType() const override { return "QS2CX_WH"; }
+};
+
+/** Native ternary TL2 payload followed by N fp32 scales and N fp32 sums.
+ * The palette is implicitly {-1,0,1}; there is no QS2 companion on disk. */
+class TL2CX_WH_Tensor : public QS4CX_WH_Tensor {
+public:
+  TL2CX_WH_Tensor(std::string name = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_WH_Tensor(name, fm) {}
+  TL2CX_WH_Tensor(const TensorDim &d, bool alloc_now,
+                  Initializer init = Initializer::NONE, std::string name = "") :
+    QS4CX_WH_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+  TL2CX_WH_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    TL2CX_WH_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() && buf)
+      copy_qs4cx(buf);
+  }
+  TL2CX_WH_Tensor(TensorBase &rhs) : QS4CX_WH_Tensor(rhs) {}
+  static size_t codeBytes(size_t K, size_t N) {
+    return ((K + 23) / 24) * ((N + 127) / 128) * 640;
+  }
+  size_t size() const override {
+    return codeBytes(height(), width()) + 2 * width() * sizeof(float);
+  }
+  size_t getMemoryBytes() const override { return size(); }
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    return static_cast<uint8_t *>(getData()) + codeBytes(height(), width());
+  }
+  std::string getStringDataType() const override { return "TL2CX_WH"; }
 };
 
 } // namespace nntrainer

@@ -87,6 +87,9 @@ public:
                   back to the int4 lattice in VTCM before the matmul
                   (htp_wh_palette.h). Half the bytes of QS4CX_WH, same
                   arithmetic downstream, and equally unreadable on the CPU. */
+    TL2CX_WH, /** Pure ternary native TL2 codes, fp32 channel scales and sums.
+                  One representation serves HVX decode and HMX prefill. */
+    QS4CX_WH_AFFINE, /** WH int4, N f32 scales, N f32 sums, N i32 offsets. */
   };
 
   /**

@@ -39,6 +39,7 @@
  */
 
 #include "hexkl_mm_u8i4_moe.h"
+#include "../htp_tl2_opts.h"
 #include "hvx_gemv_u8tl2.h"
 #if defined(__hexagon__)
 #include <hexagon_types.h>
@@ -57,6 +58,7 @@
 #include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hexkl_probe.h"
+#include "hexkl_wh_affine.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_expand_i2i4.h"
 #include "hvx_gather_ah_u8.h"
@@ -162,6 +164,44 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
   const uint32_t off = nt0 * WEIGHT_TILE_BYTES_U8I4;
   uint64_t pt = 0;
   uint32_t idx;
+  if (h->tl2_bytes) {
+    /* A native panel's K=96 group is four TL2 blocks and three HMX rows.
+       Land two blocks in each of the first two rows of its own panel.
+       Expansion copies these 2560 bytes before writing the three rows, so
+       neither other panels nor other K groups can be overwritten. */
+    hexkl_weight_u8i4 *state = (hexkl_weight_u8i4 *)h;
+    if (nt0 != 0u)
+      return state->tl2_dma_idx;
+    state->tl2_expanded = 0;
+    const uint32_t blocks = (h->K + 23u) / 24u;
+    const uint32_t groups = h->K / 96u, remaining = blocks - groups * 4u;
+    for (uint32_t p = 0; p < (h->N + 127u) / 128u; ++p) {
+      const uint8_t *src = h->tl2_bytes + (size_t)p * blocks * 640u;
+      uint8_t *dst = vtcm_base + dst_off + p * 2048u;
+      const uint32_t cols = h->N - p * 128u;
+      /* The arena and expanded slab require complete 128-column panels. */
+      (void)cols;
+      for (uint32_t half = 0; half < 2u; ++half) {
+        if (groups) {
+          idx = hexkl_dma_ring_next_idx();
+          hexkl_dma_ring_push2d(dst + half * stride, src + half * 1280u,
+                                3u * stride, 2560u, 1280u, groups,
+                                moe_weight_src_bypass(h, src_bypass), 1);
+          state->tl2_dma_idx = idx;
+        }
+        if (remaining > 2u * half) {
+          const uint32_t count = remaining - 2u * half;
+          idx = hexkl_dma_ring_next_idx();
+          hexkl_dma_ring_push2d(dst + (groups * 3u + half) * stride,
+                                src + (size_t)groups * 2560u + half * 1280u,
+                                stride, 1280u, (count < 2u ? count : 2u) * 640u,
+                                1u, moe_weight_src_bypass(h, src_bypass), 1);
+          state->tl2_dma_idx = idx;
+        }
+      }
+    }
+    return state->tl2_dma_idx;
+  }
   if (h->bits == 2u) {
     /** Half the bytes, landed in the TOP half of the int4 slot they will
        expand into, so the expansion needs no VTCM of its own: output byte
@@ -211,10 +251,41 @@ typedef struct {
   uint32_t src_bytes; /**< half a row: where the codes landed */
   uint32_t nrows;
   uint8_t lut[HVX_EXPAND_TABLE_BYTES];
+  uint8_t *native_base;
+  uint64_t native_panels;
+  uint32_t native_K, native_N;
+  int native_magnitude;
 } moe_expand_ctx;
 
 static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
   moe_expand_ctx *c = (moe_expand_ctx *)vctx;
+  if (c->native_base) {
+    const uint32_t groups = (c->native_K + 95u) / 96u;
+    uint32_t total = 0u;
+    for (uint32_t p = 0; p < (c->native_N + 127u) / 128u; ++p)
+      if ((c->native_panels >> p) & 1u)
+        total += groups;
+    const uint32_t lo = total * u / n_units, hi = total * (u + 1u) / n_units;
+    uint32_t job = 0u;
+    uint8_t source[2560] __attribute__((aligned(128)));
+    for (uint32_t p = 0; p < (c->native_N + 127u) / 128u; ++p) {
+      if (!((c->native_panels >> p) & 1u))
+        continue;
+      for (uint32_t g = 0; g < groups; ++g, ++job) {
+        if (job < lo || job >= hi)
+          continue;
+        uint8_t *dst = c->native_base + (size_t)g * 3u * c->stride + p * 2048u;
+        const uint32_t rows = c->native_K - g * 96u;
+        const uint32_t count = ((rows < 96u ? rows : 96u) + 23u) / 24u;
+        memcpy(source, dst, (count < 2u ? count : 2u) * 640u);
+        if (count > 2u)
+          memcpy(source + 1280u, dst + c->stride, (count - 2u) * 640u);
+        hvx_tl2_expand_wh96(source, rows < 96u ? rows : 96u, 128u, c->stride,
+                            c->native_magnitude, dst);
+      }
+    }
+    return;
+  }
   const uint32_t total = c->nbase * c->nrows;
   const uint32_t i0 = total * u / n_units;
   const uint32_t i1 = total * (u + 1u) / n_units;
@@ -223,6 +294,28 @@ static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
     uint8_t *dst = c->base[i / c->nrows] + (size_t)(i % c->nrows) * c->stride;
     hvx_expand_i2i4(dst + c->src_bytes, c->src_bytes, c->lut, dst);
   }
+}
+
+/* Called only by the issuing thread, before background workers can run.
+   A gate/up boundary may split a 128-column native panel; reserve the whole
+   panel once so overlapping chunk requests never decode overwritten bytes. */
+static void moe_expand_native(moe_expand_ctx *ctx, uint8_t *base,
+                              const hexkl_weight_u8i4 *h, uint32_t nt0,
+                              uint32_t nt1, uint32_t cn) {
+  hexkl_weight_u8i4 *state = (hexkl_weight_u8i4 *)h;
+  uint64_t mask = 0;
+  for (uint32_t run = 0; run < (nt1 == UINT32_MAX ? 1u : 2u); ++run) {
+    const uint32_t nt = run ? nt1 : nt0;
+    for (uint32_t p = nt / 4u; p < (nt + cn + 3u) / 4u; ++p)
+      mask |= UINT64_C(1) << p;
+  }
+  ctx->native_base = base;
+  ctx->native_panels = mask & ~state->tl2_expanded;
+  ctx->native_K = h->K;
+  ctx->native_N = h->N;
+  ctx->native_magnitude = htp_tl2_palette_magnitude(h->pal);
+  ctx->stride = h->N / 32u * 512u;
+  state->tl2_expanded |= mask;
 }
 
 /**
@@ -242,6 +335,7 @@ static void moe_expand_submit(hvx_worker_pool *pool, hvx_bg_job *job,
                               uint32_t n_col, uint32_t nt0, uint32_t nt1,
                               uint32_t cn) {
   const uint32_t row = cn * WEIGHT_TILE_BYTES_U8I4;
+  ctx->native_base = NULL;
   ctx->stride = n_col * WEIGHT_TILE_BYTES_U8I4;
   ctx->src_bytes = row / 2u;
   ctx->nrows = k_tiles;
@@ -252,6 +346,8 @@ static void moe_expand_submit(hvx_worker_pool *pool, hvx_bg_job *job,
     ctx->nbase = 2u;
   }
   hvx_expand_i2i4_table(h->pal, ctx->lut);
+  if (h->tl2_bytes)
+    moe_expand_native(ctx, vtcm_base + dst_off, h, nt0, nt1, cn);
   job->func = moe_expand_unit;
   job->ctx = ctx;
   job->n_units = MOE_EXPAND_UNITS;
@@ -274,6 +370,12 @@ void hexkl_moe_expand_chunk(uint8_t *vtcm_base, uint32_t dst_off,
   const uint32_t row = cn * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t stride = n_col * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t off = nt0 * WEIGHT_TILE_BYTES_U8I4;
+  if (h->tl2_bytes) {
+    moe_expand_ctx ctx;
+    moe_expand_native(&ctx, vtcm_base + dst_off, h, nt0, UINT32_MAX, cn);
+    hvx_worker_pool_run(pool, moe_expand_unit, &ctx, MOE_EXPAND_UNITS);
+    return;
+  }
   if (h->bits != 2u) {
     return;
   }
@@ -891,7 +993,10 @@ static void moe_tl2_prepare_ah(const uint8_t *ah, uint32_t K, int16_t *tables) {
   hvx_tl2_prepare(dense, K, 0u, (K + 23u) / 24u, tables);
 }
 
-static void moe_tl2_times7(int32_t *a) {
+/** Pure ternary already has the source magnitude; only legacy int4 needs 7. */
+static void moe_tl2_restore_magnitude(int32_t *a, const int8_t palette[4]) {
+  if (htp_tl2_palette_magnitude(palette) != 7u)
+    return;
 #if defined(__hexagon__)
   HVX_Vector v = *(HVX_Vector *)a;
   *(HVX_Vector *)a = Q6_Vw_vsub_VwVw(Q6_Vw_vasl_VwR(v, 3), v);
@@ -948,7 +1053,7 @@ static void moe_tl2_gate_epilogue(const moe_m1_ctx *c, uint32_t lo,
         acc[half * 32u + j] = val;
       }
 #endif
-      moe_tl2_times7(acc + half * 32u);
+      moe_tl2_restore_magnitude(acc + half * 32u, e->g->pal);
     }
     hvx_dequant_swiglu_acc_tiles_to_f32(
       (const uint8_t *)acc, 128u, 1u, col / 32u, 32u, 1u, e->act_scale,
@@ -982,7 +1087,7 @@ static void moe_tl2_down_worker(uint32_t threads, uint32_t id, void *v) {
                          e->tl2_down, acc);
     for (uint32_t j = 0; j < 128u && panel * 128u + j < c->N_out; j += 32u) {
       const uint32_t col = panel * 128u + j;
-      moe_tl2_times7(acc + j);
+      moe_tl2_restore_magnitude(acc + j, e->d->pal);
       hvx_dequant_acc_tile_to_f32(acc + j, 32u, 1u, e->rq_scale, e->rq_zp,
                                   e->d->colsum_w + col, e->d->w_scale + col,
                                   e->d->bias + col, e->res + col, c->N_out, 0);
@@ -1649,7 +1754,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Validate every handle and its shape before any work: a bad handle
      found halfway through would leave out_f32 partly written, and the
      caller cannot tell that from a correct result. */
-  uint32_t n_rows = 0u, n_with_rows = 0u, widest = 0u, n_tl2 = 0u;
+  uint32_t n_rows = 0u, n_with_rows = 0u, widest = 0u, n_tl2 = 0u,
+           n_affine = 0u;
   for (uint32_t e = 0; e < n_experts; ++e) {
     if (row_count[e] == 0u) {
       continue;
@@ -1669,8 +1775,12 @@ int hexkl_mm_u8i4_moe_layer_run(
     if (g->tl2_bytes || d->tl2_bytes) {
       if (!g->tl2_bytes || !d->tl2_bytes || g->bits != 2u || d->bits != 2u)
         return AEE_EBADPARM;
+      if (g->N % 128u || d->N % 128u || g->K > 8192u || d->K > 8192u ||
+          g->N > 8192u || d->N > 8192u)
+        return AEE_EBADPARM;
       ++n_tl2;
     }
+    n_affine += g->w_offset != NULL || d->w_offset != NULL;
     n_rows += row_count[e];
   }
   /** Bounds are checked because out_f32 is indexed by these; distinctness
@@ -1692,7 +1802,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Decided once for the call, after the handles are validated; gates both
      HVX paths (moe_all_4bit). */
   const int allow_tail =
-    moe_all_4bit(tbl, n_experts, h_gate_up, h_down, row_count);
+    !n_affine && moe_all_4bit(tbl, n_experts, h_gate_up, h_down, row_count);
   const int all_2bit =
     moe_all_2bit(tbl, n_experts, h_gate_up, h_down, row_count);
   /** The HMX path's queued 2-bit expansions (exp_ctx below). Here, ahead of
@@ -1716,7 +1826,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Packed 2-bit weights take the native LUT GEMV (hvx_gemm_u8i2_wh_*);
      four-bit ones the i4 GEMV. A call that mixes the two widths takes the
      HMX path, which expands the 2-bit chunks in VTCM first. */
-  const int use_m1 = m1_shape && (allow_tail || all_2bit);
+  const int use_m1 =
+    !n_affine && m1_shape && (allow_tail || all_2bit) && (!n_tl2 || M == 1u);
   /** [#267 L3] one row per active expert: only the M = 1 GEMV scatter
      below knows how; refused before anything is written. */
   const int rows_out = (flags & HEXKL_MOE_FLAG_ROWS_OUT) != 0u;
@@ -1747,7 +1858,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       2u * (uint64_t)feed_dn_bytes <= feed_gu_bytes;
   const size_t tl2_gu_tables = hvx_tl2_table_bytes(K);
   const size_t tl2_dn_tables = hvx_tl2_table_bytes(inter);
-  const uint32_t use_tl2 = n_tl2 != 0u;
+  const uint32_t use_tl2 = use_m1 && n_tl2 != 0u;
   if (use_tl2 && (M != 1u || !m1_feed || K > 8192u || inter > 8192u ||
                   2u * (uint64_t)feed_gu_bytes + tl2_gu_tables +
                       n_with_rows * tl2_dn_tables >
@@ -2491,7 +2602,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /** Falls back to expanding in front of the batch when a shape needs more
      chunks than there are slots -- correctness never depends on the
      hiding. This model is 4 and 2. */
-  const int exp_bg = all_2bit && gu_chunks <= MOE_EXP_DN &&
+  const int exp_bg = all_2bit && !n_tl2 && gu_chunks <= MOE_EXP_DN &&
                      dn_chunks <= (MOE_EXP_SLOTS - MOE_EXP_DN);
   /** A 2-bit call's expansions take the background lane, whose jobs run in
      submit order: a down epilogue queued there holds the next chunk's
@@ -2561,6 +2672,10 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
+      int32_t gu_affine_sums[HEXKL_HMX_INT8_BLOCK_N_ROW];
+      if (g->w_offset)
+        hexkl_wh_affine_sums(vtcm_base + L.act_off, blk.m_blk, K, act_zp,
+                             gu_affine_sums);
       /* --- gate_up ------------------------------------------------- */
       /** Matmul a batch of gate/up PAIRS -- gate tiles g0.. into staged
          slots [0, np) of one staging buffer, the up tiles opposite them
@@ -2649,6 +2764,15 @@ int hexkl_mm_u8i4_moe_layer_run(
             goto out;
           }
         }
+        if (g->w_offset)
+          for (uint32_t j = 0; j < 2u * np; ++j) {
+            const uint32_t col = j < np ? g0 + j : inter_ntiles + g0 + j - np;
+            hexkl_wh_affine_acc(
+              (int32_t *)(vtcm_base + stage_off + j * ACC_TILE_BYTES) +
+                acc->base,
+              acc->row_stride, blk.m_blk, 32u, g->w_offset + col * 32u,
+              gu_affine_sums);
+          }
         HEXKL_MOE_MM_END();
 
         /** Queue the next chunk's expansion now that this batch is issued:
@@ -2809,6 +2933,10 @@ int hexkl_mm_u8i4_moe_layer_run(
                                 UINT32_MAX);
         HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
       }
+      int32_t dn_affine_sums[HEXKL_HMX_INT8_BLOCK_N_ROW];
+      if (d->w_offset)
+        hexkl_wh_affine_sums(vtcm_base + L.mid_off + pp * mid_bytes, pblk.m_blk,
+                             inter, rq_zp + pp * BR, dn_affine_sums);
       for (uint32_t nt0 = 0, db = 0; nt0 < dn_ntiles;
            nt0 += L.acc_tiles, ++db) {
         const uint32_t nb =
@@ -2880,6 +3008,13 @@ int hexkl_mm_u8i4_moe_layer_run(
             goto out;
           }
         }
+        if (d->w_offset)
+          for (uint32_t j = 0; j < nb; ++j)
+            hexkl_wh_affine_acc(
+              (int32_t *)(vtcm_base + stage_off + j * ACC_TILE_BYTES) +
+                acc->base,
+              acc->row_stride, pblk.m_blk, 32u, d->w_offset + (nt0 + j) * 32u,
+              dn_affine_sums);
         HEXKL_MOE_MM_END();
 
         /** The NEXT expert's gate_up chunk db, pushed a few lines above
@@ -3114,6 +3249,7 @@ typedef struct {
   const hexkl_weight_u8i4 *w[HEXKL_FC_M1_MAX_PARTS];
   uint32_t t0[HEXKL_FC_M1_MAX_PARTS + 1u]; /**< part p's first unit */
   uint32_t n_parts, k_tiles, n_tiles;
+  int32_t affine_sum;
   float *out;
   uint8_t *vtcm; /**< NULL: no feed */
   uint32_t arena, rows1;
@@ -3221,6 +3357,9 @@ static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
                              tiles);
       }
       const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
+      if (w->w_offset)
+        hexkl_wh_affine_acc(tiles, cols * 32u, 1u, cols * 32u, w->w_offset + c0,
+                            &c->affine_sum);
       float *out = c->out + (size_t)t * HEXKL_HMX_INT8_BLOCK_N_COL;
       if (cols == 3u) {
         hvx_dequant_acc_3tiles_m1_f32(tiles, c->act_scale[0], c->act_zp[0],
@@ -3292,6 +3431,11 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
     zp[r] = zp[0];
   }
   hvx_quant_pack_u8_ah_m1_repeat(act_f32, K, scale[0], zp[0], act_ah);
+  for (uint32_t p = 0; p < n_parts; ++p)
+    if (c.w[p]->w_offset) {
+      hexkl_wh_affine_sums(act_ah, 1u, K, zp, &c.affine_sum);
+      break;
+    }
   c.act_ah = act_ah;
   c.act_scale = scale;
   c.act_zp = zp;

@@ -18,7 +18,8 @@
 namespace nntrainer {
 #if defined(__ANDROID__) || defined(__linux__)
 /** NNTRTL21: 64-byte header followed by 48-byte entries, little endian.
- * Both payloads have arena-ready scales, integer sums and {-7,0,7} palette.
+ * Both payloads have arena-ready scales, integer sums and a symmetric
+ * {-1,0,1} or legacy {-7,0,7} palette, which records the dot-product magnitude.
  * Without a deployment receipt, source CRCs are checked on first use and
  * payload CRCs on every read. Receipts bind full validation to unchanged
  * files. The model and artifact must remain immutable during a run.

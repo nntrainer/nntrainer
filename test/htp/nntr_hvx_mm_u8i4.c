@@ -113,6 +113,18 @@ int nntr_hvx_mm_u8i4_from_f32(
  * @brief Bakes a K x N int4 weight once and keeps it resident until
  *        weight_release_u8i4 -- see hexkl_mm_u8i4_dma.h.
  */
+static int finish_affine_registration(nntr_hvx_session *s, int rc,
+                                      const float *bias, uint32_t N,
+                                      int bias_len, uint32_t *handle) {
+  if (rc == AEE_SUCCESS && (uint32_t)bias_len == 2u * N) {
+    rc =
+      hexkl_weight_u8i4_set_offsets(&s->weights_u8i4.slots[*handle], bias + N);
+    if (rc != AEE_SUCCESS)
+      hexkl_weight_u8i4_release(&s->weights_u8i4, *handle);
+  }
+  return rc;
+}
+
 int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
                                   const int8 *w_i4_rm, int w_i4_rmLen,
                                   const float *w_scale, int w_scaleLen,
@@ -124,14 +136,16 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
     return AEE_EBADPARM;
   }
   if ((uint32_t)w_i4_rmLen != K * N || (uint32_t)w_scaleLen != N ||
-      (uint32_t)colsum_wLen != N || (uint32_t)biasLen != N) {
+      (uint32_t)colsum_wLen != N ||
+      ((uint32_t)biasLen != N && (uint32_t)biasLen != 2u * N)) {
     FARF(ERROR, "weight_register_u8i4: bad lengths (K=%u N=%u)", (unsigned)K,
          (unsigned)N);
     return AEE_EBADPARM;
   }
-  return hexkl_weight_u8i4_register(&s->weights_u8i4, s->vtcm_base,
-                                    s->vtcm_size, K, N, w_i4_rm, w_scale,
-                                    colsum_w, bias, s->quant_pool, w_handle);
+  const int rc = hexkl_weight_u8i4_register(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, K, N, w_i4_rm, w_scale,
+    colsum_w, bias, s->quant_pool, w_handle);
+  return finish_affine_registration(s, rc, bias, N, biasLen, w_handle);
 }
 
 int nntr_hvx_weight_bake_export(remote_handle64 handle, uint32 w_handle,
@@ -465,7 +479,7 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
     return AEE_EBADPARM;
   }
   if ((uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
-      (uint32_t)biasLen != N) {
+      ((uint32_t)biasLen != N && (uint32_t)biasLen != 2u * N)) {
     FARF(ERROR, "weight_register_u8i4_arena: bad lengths (K=%u N=%u)",
          (unsigned)K, (unsigned)N);
     return AEE_EBADPARM;
@@ -474,9 +488,10 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
   if (!wh) {
     return AEE_EBADPARM;
   }
-  return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
-                                          wh, w_scale, colsum_w, bias,
-                                          w_handle);
+  const int rc =
+    hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N, wh,
+                                     w_scale, colsum_w, bias, w_handle);
+  return finish_affine_registration(s, rc, bias, N, biasLen, w_handle);
 }
 
 /** @brief One weight of a swap: registered from the arena with the given
@@ -2234,9 +2249,8 @@ int nntr_hvx_weights_tl2(remote_handle64 handle, const uint32 *handles,
     if (!w->in_use || !w->borrowed || w->bits != 2u ||
         htp_tl2_native_bytes(w->K, w->N) > (uint64_t)w->K * w->N / 4u)
       return AEE_EBADPARM;
-    for (unsigned j = 0; j < 4u; ++j)
-      if (w->pal[j] != -7 && w->pal[j] != 0 && w->pal[j] != 7)
-        return AEE_EBADPARM;
+    if (!htp_tl2_palette_magnitude(w->pal))
+      return AEE_EBADPARM;
   }
   for (int i = 0; i < handlesLen; ++i) {
     hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];

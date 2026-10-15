@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <htp_backend/htp_tl2_opts.h>
 #include <htp_decode_hook.h>
 #include <htp_wh_layout.h>
 #include <htp_wh_palette.h>
@@ -592,7 +593,8 @@ void Lfm2MoELayer::buildExpertAssignments(
 static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
   const auto dt = gu.getDataType();
   if ((dt != nntrainer::Tdatatype::QS4CX_WH &&
-       dt != nntrainer::Tdatatype::QS2CX_WH) ||
+       dt != nntrainer::Tdatatype::QS2CX_WH &&
+       dt != nntrainer::Tdatatype::TL2CX_WH) ||
       dn.getDataType() != dt) {
     throw std::runtime_error(
       "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH or "
@@ -607,7 +609,10 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
                         static_cast<unsigned int>(gu.height()),
                         static_cast<unsigned int>(dn.height()),
                         static_cast<unsigned int>(dn.width()),
-                        dt == nntrainer::Tdatatype::QS2CX_WH ? 2u : 4u};
+                        dt == nntrainer::Tdatatype::TL2CX_WH
+                          ? HTP_TL2_WEIGHT_BITS
+                        : dt == nntrainer::Tdatatype::QS2CX_WH ? 2u
+                                                               : 4u};
 }
 
 static void loadVirtualExpert(nntrainer::ComputeOps *ops,
@@ -1183,9 +1188,13 @@ static bool tryMoeLayerOnAccelerator(
   // otherwise read half its weights with the wrong layout.
   const auto wh = nntrainer::Tdatatype::QS4CX_WH;
   const auto wh2 = nntrainer::Tdatatype::QS2CX_WH;
+  const auto tl2 = nntrainer::Tdatatype::TL2CX_WH;
   const auto plain = nntrainer::Tdatatype::QS4CX;
   const auto dt0 = context.getWeight(gate_up_indices[0]).getDataType();
-  const unsigned int w_bits = (dt0 == wh) ? 4u : (dt0 == wh2) ? 2u : 0u;
+  const unsigned int w_bits = dt0 == tl2     ? HTP_TL2_WEIGHT_BITS
+                              : (dt0 == wh)  ? 4u
+                              : (dt0 == wh2) ? 2u
+                                             : 0u;
 
   // Decode's single token normally stays on the ARM side: it cannot amortize
   // the kernel's 64-row pad, which is why the fused path has the same gate.
@@ -1211,7 +1220,10 @@ static bool tryMoeLayerOnAccelerator(
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
-    const auto want = (w_bits == 4u) ? wh : (w_bits == 2u) ? wh2 : plain;
+    const auto want = w_bits == HTP_TL2_WEIGHT_BITS ? tl2
+                      : (w_bits == 4u)              ? wh
+                      : (w_bits == 2u)              ? wh2
+                                                    : plain;
     if (gu.getDataType() != want || dn.getDataType() != want) {
       return false;
     }

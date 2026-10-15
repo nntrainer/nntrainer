@@ -1007,6 +1007,13 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     g->act.df = (float *)(g->act.ea + nb);
     g->act.d = (uint16_t *)(g->act.df + nb);
   }
+  if (vocab_out != 0u) {
+    g->logits = (float *)malloc((size_t)vocab_out * sizeof(float));
+    if (g->logits == NULL) {
+      hexkl_graph_free(g);
+      return AEE_ENOMEMORY;
+    }
+  }
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
     if (g->ops[i].kind == HTP_OP_ATTN_M1) {

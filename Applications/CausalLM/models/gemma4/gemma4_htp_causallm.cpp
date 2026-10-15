@@ -1035,6 +1035,7 @@ std::pair<Tensor, Tensor> Gemma4HtpCausalLM::constructModel() {
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
+    withKey("engine", LMHEAD_ENGINE),
   };
   appendSkipPrefillIfNeeded(lmhead_prop, true);
 
@@ -1044,7 +1045,6 @@ std::pair<Tensor, Tensor> Gemma4HtpCausalLM::constructModel() {
     lmhead_prop.emplace_back(withKey("epsilon", std::to_string(NORM_EPS)));
     lmhead_prop.emplace_back(withKey(
       "softcap", std::to_string(std::max(0.0f, FINAL_LOGIT_SOFTCAPPING))));
-    lmhead_prop.emplace_back(withKey("engine", LMHEAD_ENGINE));
   }
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));

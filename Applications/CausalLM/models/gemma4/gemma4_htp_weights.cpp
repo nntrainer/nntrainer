@@ -26,6 +26,7 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <htp_backend/htp_tl2_opts.h>
 #include <htp_fixed_opts.h>
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
@@ -141,7 +142,11 @@ void Gemma4HtpTransformer::repack_weight() {
         // order.
         if (discard_sources && l.getType() == nntrainer::LmHeadLayer::type &&
             context.getWeights().size() == 1 &&
-            tensor.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+            (tensor.getDataType() == ml::train::TensorDim::DataType::Q4_0 ||
+             tensor.getDataType() == ml::train::TensorDim::DataType::QS4CX ||
+             tensor.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH ||
+             tensor.getDataType() ==
+               ml::train::TensorDim::DataType::QS4CX_WH_AFFINE)) {
           shared_heads.insert(tensor.getData());
           continue;
         }
@@ -216,9 +221,19 @@ void Gemma4HtpTransformer::repack_weight() {
           auto &gate = *gate_p;
           auto &down = *down_p;
           const auto wtype = up.getDataType();
-          const bool qs4cx = wtype == ml::train::TensorDim::DataType::QS4CX;
+          const bool wh =
+            (wtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+             wtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE);
+          const bool qs4cx =
+            wh || wtype == ml::train::TensorDim::DataType::QS4CX;
           if ((wtype == ml::train::TensorDim::DataType::Q4_0 || qs4cx) &&
               gate.getDataType() == wtype && down.getDataType() == wtype) {
+            if (wh)
+              for (auto *tensor : {&up, &gate, &down})
+                if (!context.getComputeOps()->set_fc_wh_source(
+                      tensor->getData(), tensor->height(), tensor->width(),
+                      wtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE))
+                  throw std::runtime_error("WH dense FFN requires HTP");
             dense_pending.push_back({context.getComputeOps(),
                                      up.getData<char>(), gate.getData<char>(),
                                      down.getData<char>(),
@@ -257,6 +272,7 @@ void Gemma4HtpTransformer::repack_weight() {
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected" &&
           l.getType() != "htp_qkv_layer" && !isMoeLayer(l) &&
+          l.getType() != nntrainer::LmHeadLayer::type &&
           l.getType() != "residual_add")
         return;
 
@@ -294,21 +310,39 @@ void Gemma4HtpTransformer::repack_weight() {
         // A QS4CX FC weight (quantized offline, no Q4_0 detour) is
         // registered here too, through the key gemm_qs4cx_accel_fp32 looks
         // up: the weight's own data pointer and scales.
-        if (fc_ops && (dtype == ml::train::TensorDim::DataType::Q4_0 ||
-                       (dtype == ml::train::TensorDim::DataType::QS4CX &&
-                        !t.isVirtual()))) {
-          const bool qs4cx = dtype == ml::train::TensorDim::DataType::QS4CX;
-          fc_pending.push_back({fc_ops, t.getData<char>(),
-                                qs4cx ? t.getScale<float>() : nullptr,
-                                static_cast<unsigned int>(t.height()),
-                                static_cast<unsigned int>(t.width())});
+        if (fc_ops &&
+            (dtype == ml::train::TensorDim::DataType::Q4_0 ||
+             ((dtype == ml::train::TensorDim::DataType::QS4CX ||
+               dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+               dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE) &&
+              !t.isVirtual()))) {
+          const bool wh =
+            dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+            dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
+          const bool qs4cx =
+            wh || dtype == ml::train::TensorDim::DataType::QS4CX;
+          if (wh && !fc_ops->set_fc_wh_source(
+                      t.getData(), t.height(), t.width(),
+                      dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE))
+            throw std::runtime_error("WH FC/head requires HTP: " +
+                                     w->getName());
+          // The head binds its wider vocabulary slices with the decode
+          // list; the same handles serve the prefill's last row.
+          if (l.getType() != nntrainer::LmHeadLayer::type)
+            fc_pending.push_back({fc_ops, t.getData<char>(),
+                                  qs4cx ? t.getScale<float>() : nullptr,
+                                  static_cast<unsigned int>(t.height()),
+                                  static_cast<unsigned int>(t.width())});
         }
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
                     dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
-                    dtype == ml::train::TensorDim::DataType::QS2CX_WH)) {
+                    dtype == ml::train::TensorDim::DataType::QS2CX_WH ||
+                    dtype == ml::train::TensorDim::DataType::TL2CX_WH)) {
           const auto h = static_cast<unsigned int>(t.height());
           const auto wd = static_cast<unsigned int>(t.width());
-          w_bits = dtype == ml::train::TensorDim::DataType::QS4CX_WH   ? 4u
+          w_bits = dtype == ml::train::TensorDim::DataType::TL2CX_WH
+                     ? HTP_TL2_WEIGHT_BITS
+                   : dtype == ml::train::TensorDim::DataType::QS4CX_WH ? 4u
                    : dtype == ml::train::TensorDim::DataType::QS2CX_WH ? 2u
                                                                        : 0u;
           // [doc 52] A virtual expert has no bytes here: preloadExperts
@@ -460,7 +494,7 @@ void Gemma4HtpTransformer::repack_weight() {
         continue;
       if (!qs4cx && !p.ops->supports_gemm_q4_0_accel_fp32())
         continue;
-      const unsigned int M = fc_warmed ? 64 : 512;
+      const unsigned int M = p.N > 65536 ? 1 : (fc_warmed ? 64 : 512);
       fc_warmed = true;
       std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
       std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);

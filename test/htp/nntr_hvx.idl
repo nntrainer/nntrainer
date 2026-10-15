@@ -31,6 +31,9 @@ interface nntr_hvx : remote_handle64 {
    // to WH layout once and keeps it DSP-resident, along with its dequant
    // constants, until weight_release_u8i4. hw_init and the HMX lock happen
    // once in nntr_hvx_open, not per call -- see nntr_hvx_session.h.
+   // bias has N entries for symmetric weights, or 2*N entries for affine
+   // weights: N ordinary biases followed by N integer channel offsets.
+   // Older DSPs reject the extended length instead of ignoring offsets.
    AEEResult weight_register_u8i4(in uint32 K, in uint32 N,
                                   in sequence<int8> w_i4_rm,
                                   in sequence<float> w_scale,
@@ -63,6 +66,7 @@ interface nntr_hvx : remote_handle64 {
    // 1.89 GB ceiling Gate 0 hit. The host owns the bytes and keeps them
    // unchanged while the handle lives. wh_off must be tile-aligned (512)
    // and the (K/32)*(N/32)*512 bytes must lie inside the arena.
+   // Same N / 2*N bias contract as weight_register_u8i4.
    AEEResult weight_register_u8i4_arena(in uint32 K, in uint32 N,
                                         in uint32 arena, in uint32 wh_off,
                                         in sequence<float> w_scale,

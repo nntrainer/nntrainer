@@ -34,8 +34,28 @@ static void writeAt(int fd, const void *data, size_t bytes, uint64_t off) {
   }
 }
 int main(int argc, char **argv) {
+  if (argc == 4 && std::string(argv[1]) == "--validate") {
+    const int src = open(argv[2], O_RDONLY | O_CLOEXEC);
+    if (src < 0) {
+      std::cerr << "Cannot open source\n";
+      return 1;
+    }
+    try {
+      PreparedTl2 prepared(argv[3], src, false);
+      const size_t count =
+        prepared.validate(src, std::string(argv[3]) + ".validated");
+      close(src);
+      std::cout << "Validated " << count << " weights\n";
+      return 0;
+    } catch (const std::exception &e) {
+      close(src);
+      std::cerr << e.what() << '\n';
+      return 1;
+    }
+  }
   if (argc != 4) {
     std::cerr << "Usage: prepare_tl2 SOURCE MODEL_WEIGHTS.tsv OUTPUT\n"
+                 "       prepare_tl2 --validate SOURCE OUTPUT\n"
                  "TSV columns: original_offset K N. OUTPUT must not exist.\n";
     return 2;
   }

@@ -765,6 +765,19 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QS4CX:
     dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QS4CX_WH_AFFINE:
+  case Tdatatype::QS4CX_WH: {
+    auto *ops = getOps();
+    if (trans || trans_in || beta != 0.0f ||
+        !ops->supports_gemm_qs4cx_accel_fp32() ||
+        !ops->set_fc_wh_source(input.getData(), input.height(), input.width(),
+                               input.getDataType() ==
+                                 Tdatatype::QS4CX_WH_AFFINE))
+      throw std::invalid_argument(
+        "QS4CX_WH dot requires the HTP FC kernel with no transpose or beta");
+    dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
+    break;
+  }
   case Tdatatype::TQ2CX:
     dotTernary(input, output, trans, trans_in, beta);
     break;
@@ -772,9 +785,9 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
     dotQs4acx(input, output, trans, trans_in, beta);
     break;
   case Tdatatype::QS2CX_WH:
+  case Tdatatype::TL2CX_WH:
     // Same as below, and one step further out of reach: the codes are two
     // bits into a palette and have to be expanded in VTCM first.
-  case Tdatatype::QS4CX_WH:
     // Reaching a CPU kernel at all is the error. These nibbles are in the
     // HMX unit's weight-tile layout (htp_wh_layout.h), which no kernel here
     // can read, so the weight has to go to the accelerator or not be built
@@ -1097,7 +1110,9 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   // too, rather than a CPU kernel on the same bytes.
   auto *o = getOps();
   if (o->supports_gemm_qs4cx_accel_fp32() &&
-      (M > 1 || o->accelerates_qs4cx_at_m1())) {
+      (M > 1 || o->accelerates_qs4cx_at_m1() ||
+       input.getDataType() == Tdatatype::QS4CX_WH ||
+       input.getDataType() == Tdatatype::QS4CX_WH_AFFINE)) {
     o->gemm_qs4cx_accel_fp32(input.getData<char>(), input.getScale<float>(),
                              (float *)getData(), output.getData<float>(), M, N,
                              K);
