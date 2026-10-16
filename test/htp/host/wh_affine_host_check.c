@@ -160,6 +160,23 @@ int main(void) {
       printf("Affine WH FC prefill exact M=%u workers=%u\n", M, workers);
     }
   }
+  {
+    /** Shared activation sums span both row blocks and survive across
+     * handles. A non-affine handle between two affine ones uses the same
+     * activation without an offset correction. */
+    static float multi_want[3u * 65u * 384u], multi_got[3u * 65u * 384u];
+    const uint32_t ref_handles[] = {2u, 2u, 2u};
+    const uint32_t handles[] = {0u, 2u, 0u};
+    hexkl_mm_opts opts = {0};
+    assert(hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 65u,
+                                   K, ref_handles, 3u, input, multi_want,
+                                   &opts) == 0);
+    assert(hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 65u,
+                                   K, handles, 3u, input, multi_got,
+                                   &opts) == 0);
+    assert(!memcmp(multi_want, multi_got, sizeof multi_want));
+    printf("Affine WH FC mixed handles exact M=65 handles=3\n");
+  }
   for (uint32_t feed = 0; feed < 2u; ++feed) {
     for (uint32_t mode = 0; mode < 2u; ++mode) {
       uint32_t h = mode ? 0u : 2u;

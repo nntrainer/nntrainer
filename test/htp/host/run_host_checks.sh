@@ -524,6 +524,24 @@ if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
 fi
 echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
 
+# Signed24 extraction: full signed lanes, separate positive/negative range
+# guards, runtime layout refusal, and scratch versus native-source bounds.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hmx" \
+  "$HERE/acc_i24_host_check.c" -o "$OUT/acc_i24_host_check"
+"$OUT/acc_i24_host_check"
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
+  -DHEXKL_ACC_I24_HVX_EMU -I "$HERE/hvx_emu" -I "$BACKEND/hmx" \
+  "$HERE/acc_i24_host_check.c" -o "$OUT/acc_i24_vector_check"
+"$OUT/acc_i24_vector_check"
+# The real GU/DN vector source, including partial worker ranges and repeated
+# scatter, must match its full-int32 entry points before float conversion.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -ffunction-sections -fdata-sections -I "$HERE/hvx_emu" -I "$BACKEND/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  "$HERE/acc_i24_epilogue_check.c" "$BACKEND/hvx/hvx_dequant_i32.c" \
+  -Wl,--gc-sections -lm -o "$OUT/acc_i24_epilogue_check"
+"$OUT/acc_i24_epilogue_check"
+
 # Decode FC: repeat one quantized row instead of quantizing it four times,
 # and dequantize three column tiles together. Both real HVX sources must
 # match the old entry points and independent float-operation references,

@@ -413,11 +413,12 @@ void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
             ws + j * 32u, bias + j * 32u, out + j * 32u, 96u, 0);
   }
 }
-void hvx_dequant_acc_tiles_scatter_rows_f32(
+void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t stride, uint32_t m0, uint32_t m1, const float *as, const int32_t *az,
   const int32_t *cs, const float *ws, const float *bias, float *out,
-  uint32_t ostride, const uint32_t *rows, const float *weights, uint8_t *seen) {
+  uint32_t ostride, const uint32_t *rows, const float *weights, uint8_t *seen,
+  const int32_t *offset, const int32_t *sums) {
   for (uint32_t r = m0; r < m1; ++r) {
     if (seen && !seen[rows[r]]) {
       seen[rows[r]] = 1u;
@@ -426,10 +427,46 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
     for (uint32_t c = 0; c < 32 * n_tiles; ++c) {
       const int32_t *tile =
         (const int32_t *)(tiles_base + (size_t)(c / 32) * tile_stride);
-      float v = ((float)(tile[(size_t)r * stride + c % 32] - az[r] * cs[c])) *
-                  as[r] * ws[c] +
-                bias[c];
+      const int32_t acc =
+        tile[(size_t)r * stride + c % 32] + (offset ? sums[r] * offset[c] : 0);
+      float v = ((float)(acc - az[r] * cs[c])) * as[r] * ws[c] + bias[c];
       volatile float p = v * weights[r]; /* two operations, as the HVX */
+      out[(size_t)rows[r] * ostride + c] += p;
+    }
+  }
+}
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t stride, uint32_t m0, uint32_t m1, const float *as, const int32_t *az,
+  const int32_t *cs, const float *ws, const float *bias, float *out,
+  uint32_t ostride, const uint32_t *rows, const float *weights, uint8_t *seen) {
+  hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+    tiles_base, tile_stride, n_tiles, stride, m0, m1, as, az, cs, ws, bias, out,
+    ostride, rows, weights, seen, NULL, NULL);
+}
+
+static int32_t scalar_i24_at(const uint8_t *tile, uint32_t r, uint32_t c) {
+  const uint32_t p = r * 32u + c;
+  const uint32_t low = (uint32_t)tile[p] | ((uint32_t)tile[p + 2048u] << 8) |
+                       ((uint32_t)tile[p + 4096u] << 16);
+  return low < 0x800000u ? (int32_t)low : (int32_t)low - 16777216;
+}
+
+void hvx_dequant_i24_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t m0, uint32_t m1, const float *as, const int32_t *az,
+  const int32_t *cs, const float *ws, const float *bias, float *out,
+  uint32_t ostride, const uint32_t *rows, const float *weights, uint8_t *seen) {
+  for (uint32_t r = m0; r < m1; ++r) {
+    if (seen && !seen[rows[r]]) {
+      seen[rows[r]] = 1u;
+      memset(out + (size_t)rows[r] * ostride, 0, sizeof(float) * 32 * n_tiles);
+    }
+    for (uint32_t c = 0; c < 32u * n_tiles; ++c) {
+      const int32_t acc =
+        scalar_i24_at(tiles_base + (size_t)(c / 32u) * tile_stride, r, c % 32u);
+      const float v = ((float)(acc - az[r] * cs[c])) * as[r] * ws[c] + bias[c];
+      volatile float p = v * weights[r];
       out[(size_t)rows[r] * ostride + c] += p;
     }
   }
@@ -481,8 +518,9 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   }
 }
 /* The same job row-major: each row's tiles, then the row's hook. */
-void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
-  const hvx_dq_rows_job *jb = (const hvx_dq_rows_job *)vjob;
+void hvx_dq_tiles_rows_affine(uint32_t n_threads, uint32_t i,
+                              const hvx_dq_rows_job *jb, const int32_t *offset,
+                              const int32_t *sums) {
   const hvx_dq_tiles_job *c = &jb->t;
   uint32_t lo, hi;
   slice(c->m_count, n_threads, i, &lo, &hi);
@@ -491,15 +529,26 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
       const uint32_t c0 = (c->nt0 + j) * 32u;
       const int32_t *tile =
         (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+      const int32_t *row = tile + (size_t)m * c->row_stride;
+      int32_t corrected[32];
+      if (offset) {
+        for (uint32_t k = 0; k < 32u; ++k)
+          corrected[k] = row[k] + sums[m] * offset[c0 + k];
+        row = corrected;
+      }
       hvx_dequant_acc_tile_to_f32(
-        tile + (size_t)m * c->row_stride, c->row_stride, 1u, c->act_scale + m,
-        c->act_zp + m, c->colsum_w + c0, c->w_scale + c0, c->bias + c0,
+        row, c->row_stride, 1u, c->act_scale + m, c->act_zp + m,
+        c->colsum_w + c0, c->w_scale + c0, c->bias + c0,
         c->dst_a + (size_t)m * c->dst_stride + c0, c->dst_stride, 0);
     }
     if (jb->row_done)
       jb->row_done(jb->ctx, c->dst_a + (size_t)m * c->dst_stride + c->nt0 * 32u,
                    m);
   }
+}
+void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  hvx_dq_tiles_rows_affine(n_threads, i, (const hvx_dq_rows_job *)vjob, NULL,
+                           NULL);
 }
 void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
                                 uint32_t n, uint32_t chunk, float eps) {
@@ -537,8 +586,9 @@ void hvx_dequant_acc_tiles_to_f32(
    slot n_pairs + j the up column opposite it. The SwiGLU itself is
    swiglu_det.h, which the HVX kernel matches bit for bit (rule 24); with
    the job's geglu set, geglu_det_one (plan 201 S4). */
-void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
-  const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vjob;
+void hvx_dq_swiglu_affine(uint32_t n_threads, uint32_t i,
+                          const hvx_dq_swiglu_job *c, const int32_t *offset,
+                          const int32_t *sums) {
   float gt[64 * 32], ut[64 * 32];
   uint32_t lo, hi;
   slice(c->n_pairs, n_threads, i, &lo, &hi);
@@ -551,19 +601,60 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   }
   for (uint32_t j = lo; j < hi; ++j) {
     const uint32_t cg = (c->g0 + j) * 32u, cu = c->inter + cg;
-    dq_tile((const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
-            c->row_stride, c->m_count, c->act_scale, c->act_zp,
-            c->colsum_w + cg, c->w_scale + cg, c->bias + cg, gt, 32u, 0);
-    dq_tile((const int32_t *)(c->tiles_base +
-                              (size_t)(c->n_pairs + j) * c->tile_stride),
-            c->row_stride, c->m_count, c->act_scale, c->act_zp,
-            c->colsum_w + cu, c->w_scale + cu, c->bias + cu, ut, 32u, 0);
+    for (uint32_t r = 0; r < c->m_count; ++r) {
+      int32_t corrected[2][32];
+      const int32_t *gr =
+        (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride) +
+        (size_t)r * c->row_stride;
+      const int32_t *ur =
+        (const int32_t *)(c->tiles_base +
+                          (size_t)(c->n_pairs + j) * c->tile_stride) +
+        (size_t)r * c->row_stride;
+      if (offset) {
+        for (uint32_t k = 0; k < 32u; ++k) {
+          corrected[0][k] = gr[k] + sums[r] * offset[cg + k];
+          corrected[1][k] = ur[k] + sums[r] * offset[cu + k];
+        }
+        gr = corrected[0];
+        ur = corrected[1];
+      }
+      dq_tile(gr, 32u, 1u, c->act_scale + r, c->act_zp + r, c->colsum_w + cg,
+              c->w_scale + cg, c->bias + cg, gt + r * 32u, 32u, 0);
+      dq_tile(ur, 32u, 1u, c->act_scale + r, c->act_zp + r, c->colsum_w + cu,
+              c->w_scale + cu, c->bias + cu, ut + r * 32u, 32u, 0);
+    }
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k)
         c->dst[(size_t)r * c->dst_stride + cg + k] =
           c->act == HVX_GLU_GELU_TANH
             ? geglu_det_one(gt[r * 32u + k], ut[r * 32u + k])
             : swiglu_det_one(gt[r * 32u + k], ut[r * 32u + k]);
+  }
+}
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  hvx_dq_swiglu_affine(n_threads, i, (const hvx_dq_swiglu_job *)vjob, NULL,
+                       NULL);
+}
+
+void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
+                       const hvx_dq_swiglu_job *c) {
+  uint32_t lo, hi;
+  slice(c->n_pairs, n_threads, i, &lo, &hi);
+  for (uint32_t j = lo; j < hi; ++j) {
+    int32_t tiles[2][2048];
+    for (uint32_t p = 0; p < 2u; ++p)
+      for (uint32_t r = 0; r < c->m_count; ++r)
+        for (uint32_t n = 0; n < 32u; ++n)
+          tiles[p][r * 32u + n] = scalar_i24_at(
+            c->tiles_base + (size_t)(p * c->n_pairs + j) * c->tile_stride, r,
+            n);
+    hvx_dq_swiglu_job one = *c;
+    one.tiles_base = (const uint8_t *)tiles;
+    one.tile_stride = sizeof tiles[0];
+    one.n_pairs = 1u;
+    one.g0 += j;
+    one.row_stride = 32u;
+    hvx_dq_swiglu_worker(1u, 0u, &one);
   }
 }
 /** The tail path calls the pooled pair function directly (pool NULL, one

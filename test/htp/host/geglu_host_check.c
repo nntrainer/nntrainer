@@ -165,6 +165,69 @@ int main(void) {
           geglu);
   }
 
+  /** The affine GU helper retains the float dequant and GLU order for
+   * full and partial four-row groups, nonzero gate offsets, and empty
+   * worker slices. Offset products deliberately cross the float integer
+   * precision boundary; the accumulator input must remain read-only. */
+  {
+    int32_t offsets[2u * INTER], sums[ROWS];
+    int32_t original[2 * NP][ROWS * RS];
+    float want[ROWS * INTER];
+    memcpy(original, tiles, sizeof original);
+    for (uint32_t c = 0; c < 2u * INTER; ++c)
+      offsets[c] = (int32_t)(c % 31u) - 15;
+    for (uint32_t m = 0; m < ROWS; ++m)
+      sums[m] = (m & 1u) ? -2000001 : 2000003;
+    for (uint32_t count = 1u; count <= ROWS; ++count)
+      for (uint32_t geglu = 0; geglu < 2u; ++geglu) {
+        hvx_dq_swiglu_job job = {(const uint8_t *)tiles,
+                                 sizeof tiles[0],
+                                 NP - 1u,
+                                 1u,
+                                 RS,
+                                 count,
+                                 as,
+                                 az,
+                                 colsum,
+                                 wsc,
+                                 bias,
+                                 INTER,
+                                 out,
+                                 INTER,
+                                 geglu ? HVX_GLU_GELU_TANH : HVX_GLU_SILU};
+        for (uint32_t k = 0; k < ROWS * INTER; ++k)
+          want[k] = -12345.f;
+        for (uint32_t m = 0; m < count; ++m)
+          for (uint32_t c = 32u; c < INTER; ++c) {
+            const uint32_t j = c / 32u - 1u, k = c % 32u, cu = INTER + c;
+            const int32_t ga = tiles[j][m * RS + k] + sums[m] * offsets[c];
+            const int32_t ua =
+              tiles[NP - 1u + j][m * RS + k] + sums[m] * offsets[cu];
+            const float gq =
+              (((float)ga - (float)az[m] * (float)colsum[c]) * as[m]) * wsc[c] +
+              bias[c];
+            const float uq =
+              (((float)ua - (float)az[m] * (float)colsum[cu]) * as[m]) *
+                wsc[cu] +
+              bias[cu];
+            want[m * INTER + c] =
+              geglu ? geglu_det_one(gq, uq) : swiglu_det_one(gq, uq);
+          }
+        for (uint32_t workers = 1u; workers <= 8u; ++workers) {
+          for (uint32_t k = 0; k < ROWS * INTER; ++k)
+            out[k] = -12345.f;
+          for (uint32_t lane = 0; lane < workers; ++lane)
+            hvx_dq_swiglu_affine(workers, lane, &job, offsets, sums);
+          CHECK(!memcmp(want, out, sizeof want),
+                "affine GLU differs rows=%u geglu=%u workers=%u", count, geglu,
+                workers);
+          CHECK(!memcmp(original, tiles, sizeof original),
+                "affine GLU changed its accumulator input");
+        }
+      }
+    printf("AFFINE GLU int32-first reference and read-only tiles OK\n");
+  }
+
   /** 3. the MoE down epilogue, row-major over a run of tiles: every element
      the spec's dequant, then out[rows[m]] += that * weights[m] */
   {
@@ -216,6 +279,79 @@ int main(void) {
     printf("DQ TILES ROW-MAJOR hvx_dequant_i32.c %s\n",
            rsame ? "bit-exact" : "DIFFERS");
     CHECK(rsame, "row-major tile dequant differs from the tile-major one");
+
+    /** Affine correction must precede conversion to float, including sums
+     * whose products exceed 2^24. Nonzero nt0 checks column indexing, and
+     * the input tiles must stay unchanged across repeated worker calls. */
+    int32_t offsets[SN], sums[SM], original[NT][SM * RS];
+    memcpy(original, stiles, sizeof original);
+    for (uint32_t c = 0; c < SN; ++c)
+      offsets[c] = (int32_t)(c % 31u) - 15;
+    for (uint32_t m = 0; m < SM; ++m)
+      sums[m] = (m & 1u) ? -2000001 : 2000003;
+    rj.t.nt0 = 1u;
+    rj.t.n_tiles = NT - 1u;
+    for (uint32_t m = 0; m < SM; ++m)
+      for (uint32_t c = 0; c < SN; ++c) {
+        ta[m * SN + c] = -12345.f;
+        if (c >= 32u) {
+          const int32_t corrected =
+            stiles[c / 32u - 1u][m * RS + c % 32u] + sums[m] * offsets[c];
+          ta[m * SN + c] =
+            (((float)corrected - (float)saz[m] * (float)colsum[c]) * sas[m]) *
+              wsc[c] +
+            bias[c];
+        }
+      }
+    for (uint32_t workers = 1u; workers <= 8u; ++workers) {
+      for (uint32_t k = 0; k < SM * SN; ++k)
+        tb[k] = -12345.f;
+      for (uint32_t lane = 0; lane < workers; ++lane)
+        hvx_dq_tiles_rows_affine(workers, lane, &rj, offsets, sums);
+      CHECK(!memcmp(ta, tb, sizeof ta),
+            "affine row dequant differs from int32-first reference workers=%u",
+            workers);
+      CHECK(!memcmp(original, stiles, sizeof original),
+            "affine row dequant changed its accumulator input");
+    }
+    printf("AFFINE ROW DEQUANT int32-first reference and read-only tiles OK\n");
+
+    for (uint32_t use_seen = 0u; use_seen < 2u; ++use_seen) {
+      uint8_t seen[OM] = {0}, want_seen[OM] = {0};
+      for (uint32_t k = 0; k < OM * SN; ++k)
+        sout[k] = swant[k] = .125f * (float)k;
+      for (uint32_t pass = 0u; pass < 2u; ++pass) {
+        for (uint32_t m = 1u; m < SM; ++m) {
+          const int first = use_seen && !want_seen[srows[m]];
+          want_seen[srows[m]] = 1u;
+          for (uint32_t c = 0; c < SN; ++c) {
+            const int32_t corrected =
+              stiles[c / 32u][m * RS + c % 32u] + sums[m] * offsets[c];
+            const float v =
+              (((float)corrected - (float)saz[m] * (float)colsum[c]) * sas[m]) *
+                wsc[c] +
+              bias[c];
+            const float prev = first ? 0.f : swant[srows[m] * SN + c];
+            swant[srows[m] * SN + c] = prev + v * sw[m];
+          }
+        }
+        hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+          (const uint8_t *)stiles, sizeof stiles[0], NT, RS, 1u, 4u, sas, saz,
+          colsum, wsc, bias, sout, SN, srows, sw, use_seen ? seen : NULL,
+          offsets, sums);
+        hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+          (const uint8_t *)stiles, sizeof stiles[0], NT, RS, 4u, SM, sas, saz,
+          colsum, wsc, bias, sout, SN, srows, sw, use_seen ? seen : NULL,
+          offsets, sums);
+        CHECK(!memcmp(sout, swant, sizeof sout),
+              "affine scatter differs seen=%u pass=%u", use_seen, pass);
+        CHECK(!use_seen || !memcmp(seen, want_seen, sizeof seen),
+              "affine scatter row tracking differs");
+        CHECK(!memcmp(original, stiles, sizeof original),
+              "affine scatter changed its accumulator input");
+      }
+    }
+    printf("AFFINE DN SCATTER int32-first reference and read-only tiles OK\n");
   }
 
   /** 4. the activation quantized once row-major, then gathered into AH

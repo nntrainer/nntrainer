@@ -25,6 +25,41 @@
 /** @brief f32 or int32 lanes per HVX vector. */
 #define LANES (VLEN / 4u)
 
+/** Four contiguous rows of one signed24 tile, reconstructed in registers. */
+typedef struct {
+  HVX_Vector v0, v1, v2, v3;
+} i24_rows4;
+
+static inline i24_rows4 i24_unpack4(HVX_Vector lo, HVX_Vector mid,
+                                    HVX_Vector hi) {
+  const HVX_VectorPair low16 = Q6_W_vshuff_VVR(mid, lo, -1);
+  const HVX_VectorPair high16 = Q6_Wh_vunpack_Vb(hi);
+  const HVX_VectorPair a =
+    Q6_W_vshuff_VVR(Q6_V_lo_W(high16), Q6_V_lo_W(low16), -2);
+  const HVX_VectorPair b =
+    Q6_W_vshuff_VVR(Q6_V_hi_W(high16), Q6_V_hi_W(low16), -2);
+  const i24_rows4 result = {Q6_V_lo_W(a), Q6_V_hi_W(a), Q6_V_lo_W(b),
+                            Q6_V_hi_W(b)};
+  return result;
+}
+
+/** m is a multiple of four, so the three loads are aligned. */
+static inline i24_rows4 i24_load4(const uint8_t *tile, uint32_t m) {
+  const uint8_t *p = tile + m * 32u;
+  return i24_unpack4(*(const HVX_Vector *)p, *(const HVX_Vector *)(p + 2048u),
+                     *(const HVX_Vector *)(p + 4096u));
+}
+
+/** A partial worker range or the last 1..3 rows. Unaligned loads may read
+ * 96 bytes past a plane, still inside the tile's original 8 KiB ring slot.
+ * Only the first 32 lanes are used; unused adjacent rows cannot affect them. */
+static inline HVX_Vector i24_load_row(const uint8_t *tile, uint32_t m) {
+  const uint8_t *p = tile + m * 32u;
+  return i24_unpack4(*(const HVX_UVector *)p, *(const HVX_UVector *)(p + 2048u),
+                     *(const HVX_UVector *)(p + 4096u))
+    .v0;
+}
+
 void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
                             uint32_t m_pad, uint32_t n, const float *act_scale,
                             const int32_t *act_zp, const int32_t *colsum_w,
@@ -168,12 +203,13 @@ void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
   vo[2] = Q6_Vsf_vadd_VsfVsf(w2, vb[2]);
 }
 
-void hvx_dequant_acc_tiles_scatter_rows_f32(
+static inline void dq_acc_tiles_scatter_rows(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
   const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
-  const float *weights, uint8_t *seen) {
+  const float *weights, uint8_t *seen, const int32_t *offset,
+  const int32_t *sums) {
   /** One output row's n_tiles vectors, [47:32] stride, [31:16] width, [15:0]
      height. A hint: it moves no bits. Three rows ahead, the most a lane
      can queue (the hardware stalls the thread on a fourth). */
@@ -192,12 +228,17 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
     const HVX_Vector vs = hvx_splat_sf(act_scale[m]);
     const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m]));
     const HVX_Vector vwt = hvx_splat_sf(weights[m]);
+    const HVX_Vector sum = offset ? Q6_V_vsplat_R(sums[m]) : Q6_V_vzero();
     HVX_UVector *vo = (HVX_UVector *)(out + (size_t)rows[m] * out_stride);
     for (uint32_t j = 0; j < n_tiles; ++j) {
       const int32_t *tile =
         (const int32_t *)(tiles_base + (size_t)j * tile_stride);
-      const HVX_Vector af = Q6_Vsf_equals_Vw(
-        ((const HVX_UVector *)(tile + (size_t)m * row_stride))[0]);
+      HVX_Vector acc =
+        ((const HVX_UVector *)(tile + (size_t)m * row_stride))[0];
+      if (offset)
+        acc =
+          Q6_Vw_vmpyieacc_VwVwVh(acc, sum, ((const HVX_UVector *)offset)[j]);
+      const HVX_Vector af = Q6_Vsf_equals_Vw(acc);
       const HVX_Vector csf =
         Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[j]);
       const HVX_Vector r = Q6_Vsf_vadd_VsfVsf(
@@ -210,6 +251,29 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
       vo[j] = Q6_Vsf_vadd_VsfVsf(prev, Q6_Vsf_vmpy_VsfVsf(r, vwt));
     }
   }
+}
+
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights, uint8_t *seen) {
+  dq_acc_tiles_scatter_rows(tiles_base, tile_stride, n_tiles, row_stride, m0,
+                            m1, act_scale, act_zp, colsum_w, w_scale, bias, out,
+                            out_stride, rows, weights, seen, NULL, NULL);
+}
+
+void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights, uint8_t *seen, const int32_t *offset,
+  const int32_t *sums) {
+  dq_acc_tiles_scatter_rows(tiles_base, tile_stride, n_tiles, row_stride, m0,
+                            m1, act_scale, act_zp, colsum_w, w_scale, bias, out,
+                            out_stride, rows, weights, seen, offset, sums);
 }
 
 #undef DQ_TILE_ROW
@@ -238,8 +302,9 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   }
 }
 
-void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
-  const hvx_dq_rows_job *jb = (const hvx_dq_rows_job *)vjob;
+static inline void dq_tiles_rows(uint32_t n_threads, uint32_t i,
+                                 const hvx_dq_rows_job *jb,
+                                 const int32_t *offset, const int32_t *sums) {
   const hvx_dq_tiles_job *c = &jb->t;
   const uint32_t lo = (uint32_t)((uint64_t)c->m_count * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->m_count * (i + 1) / n_threads);
@@ -247,17 +312,25 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const HVX_UVector *cs = (const HVX_UVector *)(c->colsum_w + c0);
   const HVX_UVector *ws = (const HVX_UVector *)(c->w_scale + c0);
   const HVX_UVector *bs = (const HVX_UVector *)(c->bias + c0);
+  const HVX_UVector *off = offset ? (const HVX_UVector *)(offset + c0) : NULL;
 
   for (uint32_t m = lo; m < hi; ++m) {
     const HVX_Vector vs = hvx_splat_sf(c->act_scale[m]);
     const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m]));
+    const HVX_Vector sum = offset ? Q6_V_vsplat_R(sums[m]) : Q6_V_vzero();
     float *seg = c->dst_a + (size_t)m * c->dst_stride + c0;
     HVX_UVector *vo = (HVX_UVector *)seg;
     for (uint32_t j = 0; j < c->n_tiles; ++j) {
       const int32_t *tile =
         (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-      const HVX_Vector af = Q6_Vsf_equals_Vw(
-        ((const HVX_UVector *)(tile + (size_t)m * c->row_stride))[0]);
+      HVX_Vector acc =
+        ((const HVX_UVector *)(tile + (size_t)m * c->row_stride))[0];
+      /** The offset is a signed low halfword, while the sum and accumulator
+       * remain int32. Correct before conversion: a float correction would
+       * round differently when the integer result exceeds 2^24. */
+      if (offset)
+        acc = Q6_Vw_vmpyieacc_VwVwVh(acc, sum, off[j]);
+      const HVX_Vector af = Q6_Vsf_equals_Vw(acc);
       /* DQ_TILE_ROW's operations, in its order */
       vo[j] = Q6_Vsf_vadd_VsfVsf(
         Q6_Vsf_vmpy_VsfVsf(
@@ -272,6 +345,16 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
       jb->row_done(jb->ctx, seg, m);
     }
   }
+}
+
+void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  dq_tiles_rows(n_threads, i, (const hvx_dq_rows_job *)vjob, NULL, NULL);
+}
+
+void hvx_dq_tiles_rows_affine(uint32_t n_threads, uint32_t i,
+                              const hvx_dq_rows_job *job, const int32_t *offset,
+                              const int32_t *sums) {
+  dq_tiles_rows(n_threads, i, job, offset, sums);
 }
 
 void hvx_dequant_acc_tiles_to_f32(
@@ -295,10 +378,10 @@ void hvx_dequant_acc_tiles_to_f32(
  * @brief One row of one tile, dequantized -- DQ_TILE_ROW's operations in
  *        the same order, as a function so two of them can feed SwiGLU.
  */
-static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
+static inline HVX_Vector dq_acc_sf(HVX_Vector acc, float act_scale,
                                    int32_t act_zp, HVX_Vector csf,
                                    HVX_Vector vw, HVX_Vector vbias) {
-  const HVX_Vector af = Q6_Vsf_equals_Vw(((const HVX_UVector *)row)[0]);
+  const HVX_Vector af = Q6_Vsf_equals_Vw(acc);
   const HVX_Vector vs = hvx_splat_sf(act_scale);
   const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp));
   return Q6_Vsf_vadd_VsfVsf(
@@ -309,8 +392,93 @@ static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
     vbias);
 }
 
-void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vctx;
+static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
+                                   int32_t act_zp, HVX_Vector csf,
+                                   HVX_Vector vw, HVX_Vector vbias) {
+  return dq_acc_sf(((const HVX_UVector *)row)[0], act_scale, act_zp, csf, vw,
+                   vbias);
+}
+
+void hvx_dequant_i24_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t m0, uint32_t m1, const float *act_scale, const int32_t *act_zp,
+  const int32_t *colsum_w, const float *w_scale, const float *bias, float *out,
+  uint32_t out_stride, const uint32_t *rows, const float *weights,
+  uint8_t *seen) {
+  const uint64_t box = ((uint64_t)(n_tiles * 128u) << 32) |
+                       ((uint64_t)(n_tiles * 128u) << 16) | 1u;
+  uint32_t m = m0;
+  while (m < m1) {
+    if (m % 4u || m1 - m < 4u) {
+      const int first = seen && !seen[rows[m]];
+      if (first)
+        seen[rows[m]] = 1u;
+      if (!first)
+        Q6_l2fetch_AP((void *)(out + (size_t)rows[m] * out_stride), box);
+      const HVX_Vector wt = hvx_splat_sf(weights[m]);
+      HVX_UVector *vo = (HVX_UVector *)(out + (size_t)rows[m] * out_stride);
+      for (uint32_t j = 0; j < n_tiles; ++j) {
+        const HVX_Vector acc =
+          i24_load_row(tiles_base + (size_t)j * tile_stride, m);
+        const HVX_Vector r = dq_acc_sf(
+          acc, act_scale[m], act_zp[m],
+          Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[j]),
+          ((const HVX_UVector *)w_scale)[j], ((const HVX_UVector *)bias)[j]);
+        const HVX_Vector prev = first ? Q6_V_vzero() : vo[j];
+        vo[j] = Q6_Vsf_vadd_VsfVsf(prev, Q6_Vsf_vmpy_VsfVsf(r, wt));
+      }
+      ++m;
+      continue;
+    }
+#define I24_SCATTER_PREP(i)                                                    \
+  const int first##i = seen && !seen[rows[m + (i)]];                           \
+  if (first##i)                                                                \
+    seen[rows[m + (i)]] = 1u;                                                  \
+  HVX_UVector *vo##i =                                                         \
+    (HVX_UVector *)(out + (size_t)rows[m + (i)] * out_stride);                 \
+  if (!first##i)                                                               \
+    Q6_l2fetch_AP(vo##i, box);                                                 \
+  const HVX_Vector vs##i = hvx_splat_sf(act_scale[m + (i)]);                   \
+  const HVX_Vector vz##i = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m + (i)]));   \
+  const HVX_Vector wt##i = hvx_splat_sf(weights[m + (i)])
+    I24_SCATTER_PREP(0);
+    I24_SCATTER_PREP(1);
+    I24_SCATTER_PREP(2);
+    I24_SCATTER_PREP(3);
+    for (uint32_t j = 0; j < n_tiles; ++j) {
+      const i24_rows4 acc = i24_load4(tiles_base + (size_t)j * tile_stride, m);
+      const HVX_Vector csf =
+        Q6_Vsf_equals_Vw(((const HVX_UVector *)colsum_w)[j]);
+      const HVX_Vector ws = ((const HVX_UVector *)w_scale)[j];
+      const HVX_Vector bs = ((const HVX_UVector *)bias)[j];
+#define I24_SCATTER_STORE(i)                                                   \
+  do {                                                                         \
+    const HVX_Vector af = Q6_Vsf_equals_Vw(acc.v##i);                          \
+    const HVX_Vector r = Q6_Vsf_vadd_VsfVsf(                                   \
+      Q6_Vsf_vmpy_VsfVsf(                                                      \
+        Q6_Vsf_vmpy_VsfVsf(                                                    \
+          Q6_Vsf_vsub_VsfVsf(af, Q6_Vsf_vmpy_VsfVsf(vz##i, csf)), vs##i),      \
+        ws),                                                                   \
+      bs);                                                                     \
+    const HVX_Vector prev = first##i ? Q6_V_vzero() : vo##i[j];                \
+    vo##i[j] = Q6_Vsf_vadd_VsfVsf(prev, Q6_Vsf_vmpy_VsfVsf(r, wt##i));         \
+  } while (0)
+      I24_SCATTER_STORE(0);
+      I24_SCATTER_STORE(1);
+      I24_SCATTER_STORE(2);
+      I24_SCATTER_STORE(3);
+    }
+    m += 4u;
+#undef I24_SCATTER_PREP
+#undef I24_SCATTER_STORE
+  }
+}
+
+/** Specialize the legacy entry point at NULL offset: its hot loops must
+ * not inherit affine branches for every native TL2 expert tile. */
+static inline __attribute__((always_inline)) void
+dq_swiglu(uint32_t n_threads, uint32_t i, const hvx_dq_swiglu_job *c,
+          const int32_t *offset, const int32_t *sums, int planar) {
   const uint32_t lo = (uint32_t)((uint64_t)c->n_pairs * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->n_pairs * (i + 1) / n_threads);
 
@@ -332,24 +500,52 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
       Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_w + cu))[0]);
     const HVX_Vector vwu = ((const HVX_UVector *)(c->w_scale + cu))[0];
     const HVX_Vector vbu = ((const HVX_UVector *)(c->bias + cu))[0];
+    const HVX_Vector offg =
+      offset ? ((const HVX_UVector *)(offset + cg))[0] : Q6_V_vzero();
+    const HVX_Vector offu =
+      offset ? ((const HVX_UVector *)(offset + cu))[0] : Q6_V_vzero();
 
     /** Four rows an iteration: the GLU is ~50 dependent HVX ops a row, so
        one row in flight stalls on latency the whole way (DQ_TILE_ROW's
        reason); four independent chains in one block let them interleave.
        Each row's operations are unchanged. */
 #define DQ_GLU_ROW(i)                                                          \
-  const HVX_Vector g##i =                                                      \
-    dq_row_sf(gt + (size_t)(m + (i)) * c->row_stride, c->act_scale[m + (i)],   \
-              c->act_zp[m + (i)], csg, vwg, vbg);                              \
+  HVX_Vector ga##i =                                                           \
+    planar                                                                     \
+      ? g24.v##i                                                               \
+      : ((const HVX_UVector *)(gt + (size_t)(m + (i)) * c->row_stride))[0];    \
+  HVX_Vector ua##i =                                                           \
+    planar                                                                     \
+      ? u24.v##i                                                               \
+      : ((const HVX_UVector *)(ut + (size_t)(m + (i)) * c->row_stride))[0];    \
+  if (offset) {                                                                \
+    const HVX_Vector sum##i = Q6_V_vsplat_R(sums[m + (i)]);                    \
+    ga##i = Q6_Vw_vmpyieacc_VwVwVh(ga##i, sum##i, offg);                       \
+    ua##i = Q6_Vw_vmpyieacc_VwVwVh(ua##i, sum##i, offu);                       \
+  }                                                                            \
+  const HVX_Vector g##i = dq_acc_sf(ga##i, c->act_scale[m + (i)],              \
+                                    c->act_zp[m + (i)], csg, vwg, vbg);        \
   const HVX_Vector u##i =                                                      \
-    dq_row_sf(ut + (size_t)(m + (i)) * c->row_stride, c->act_scale[m + (i)],   \
-              c->act_zp[m + (i)], csu, vwu, vbu)
+    dq_acc_sf(ua##i, c->act_scale[m + (i)], c->act_zp[m + (i)], csu, vwu, vbu)
 #define DQ_GLU_STORE(i, fn)                                                    \
   ((HVX_UVector *)(c->dst + (size_t)(m + (i)) * c->dst_stride + cg))[0] =      \
     fn(g##i, u##i)
+#define DQ_GLU_PREP4()                                                         \
+  i24_rows4 g24, u24;                                                          \
+  if (planar) {                                                                \
+    g24 = i24_load4((const uint8_t *)gt, m);                                   \
+    u24 = i24_load4((const uint8_t *)ut, m);                                   \
+  }
+#define DQ_GLU_PREP1()                                                         \
+  i24_rows4 g24, u24;                                                          \
+  if (planar) {                                                                \
+    g24.v0 = i24_load_row((const uint8_t *)gt, m);                             \
+    u24.v0 = i24_load_row((const uint8_t *)ut, m);                             \
+  }
     uint32_t m = 0;
     if (c->act == HVX_GLU_GELU_TANH) {
       for (; m + 4u <= c->m_count; m += 4u) {
+        DQ_GLU_PREP4();
         DQ_GLU_ROW(0);
         DQ_GLU_ROW(1);
         DQ_GLU_ROW(2);
@@ -360,11 +556,13 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
         DQ_GLU_STORE(3, hvx_geglu_det_sf);
       }
       for (; m < c->m_count; ++m) {
+        DQ_GLU_PREP1();
         DQ_GLU_ROW(0);
         DQ_GLU_STORE(0, hvx_geglu_det_sf);
       }
     } else {
       for (; m + 4u <= c->m_count; m += 4u) {
+        DQ_GLU_PREP4();
         DQ_GLU_ROW(0);
         DQ_GLU_ROW(1);
         DQ_GLU_ROW(2);
@@ -375,13 +573,31 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
         DQ_GLU_STORE(3, hvx_swiglu_det_sf);
       }
       for (; m < c->m_count; ++m) {
+        DQ_GLU_PREP1();
         DQ_GLU_ROW(0);
         DQ_GLU_STORE(0, hvx_swiglu_det_sf);
       }
     }
 #undef DQ_GLU_ROW
 #undef DQ_GLU_STORE
+#undef DQ_GLU_PREP4
+#undef DQ_GLU_PREP1
   }
+}
+
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  dq_swiglu(n_threads, i, (const hvx_dq_swiglu_job *)vctx, NULL, NULL, 0);
+}
+
+void hvx_dq_swiglu_affine(uint32_t n_threads, uint32_t i,
+                          const hvx_dq_swiglu_job *job, const int32_t *offset,
+                          const int32_t *sums) {
+  dq_swiglu(n_threads, i, job, offset, sums, 0);
+}
+
+void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
+                       const hvx_dq_swiglu_job *job) {
+  dq_swiglu(n_threads, i, job, NULL, NULL, 1);
 }
 
 void hvx_dequant_swiglu_acc_tiles_to_f32(
