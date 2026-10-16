@@ -2,7 +2,7 @@
 /** @file lfm2_htp_moe_causallm.h
  * @brief LFM2 hybrid MoE using the shared Gemma4 HTP weight backend.
  * @author NNTrainer contributors
- * @bug One prompt per handle; chunked prefill is not supported.
+ * @bug Chunked prefill is not supported.
  */
 #ifndef __LFM2_HTP_MOE_CAUSALLM_H__
 #define __LFM2_HTP_MOE_CAUSALLM_H__
