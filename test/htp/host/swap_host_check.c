@@ -36,6 +36,14 @@ NOT_HERE(hexkl_conv_block_run)
 NOT_HERE(hexkl_mm_u8i4_bake_weights)
 NOT_HERE(hexkl_mm_u8i4_plan)
 NOT_HERE(hexkl_mm_u8i4_run)
+/** [PR 4428] moe_set_hadamard_signs hands the kernel its masks; nothing
+   here reads them back. */
+static const uint32_t *g_sign_in, *g_sign_down;
+void hexkl_moe_set_hadamard_signs(const uint32_t *mask_in, uint32_t n_in,
+                                  const uint32_t *mask_down, uint32_t n_down) {
+  g_sign_in = n_in ? mask_in : NULL;
+  g_sign_down = n_down ? mask_down : NULL;
+}
 /** These two are declared by headers the session struct pulls in, so they
    get their real signatures. */
 int hexkl_mm_u8i4_moe_layer_run(
