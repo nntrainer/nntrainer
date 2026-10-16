@@ -2132,7 +2132,7 @@ head_pipeline_pv(forward_job *job, uint32_t h, prof_slot *ps) {
 /** @brief Complete independent attention heads in one pool invocation. */
 static void run_q8_head_pipeline(uint32_t n, uint32_t i, void *arg) {
   forward_job *shared = (forward_job *)arg;
-  /* Other workers publish only their own m/l entries to shared. Copy
+  /** Other workers publish only their own m/l entries to shared. Copy
      only immutable fields, never read their entries before the join. */
   forward_job job;
   job.ctx = shared->ctx;
@@ -2299,7 +2299,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.head_prep = 0u;
   job.head_pipeline = 0u;
 #if NNTR_ATTN_Q8_HEAD_PREP
-  /* The eight sliding KV heads provide one independent head per v81
+  /** The eight sliding KV heads provide one independent head per v81
      worker. That worker prepares and consumes every Q/K row of its head;
      no extra dispatch or cross-worker synchronization is needed. */
   job.head_prep =

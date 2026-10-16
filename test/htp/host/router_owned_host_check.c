@@ -4,6 +4,8 @@
  *
  * @file router_owned_host_check.c
  * @brief Lossless router storage against the existing FP32 kernel and spec.
+ * @author NNTrainer contributors
+ * @bug See the repository issue tracker for known issues.
  */
 
 #include <math.h>
@@ -146,7 +148,7 @@ static void check_synthetic(hvx_worker_pool *const pools[3]) {
   }
 }
 
-/* Optional actual-model replay: TSV has 256 expert offsets per layer;
+/** Optional actual-model replay: TSV has 256 expert offsets per layer;
    the router and per-expert scales immediately precede the first expert. */
 static void check_model(const char *model, const char *index,
                         hvx_worker_pool *const pools[3]) {
