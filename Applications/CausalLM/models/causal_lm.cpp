@@ -1536,8 +1536,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // (covers both Encode calls below and every later Decode this run).
   ensureTokenizer();
 
+  // the length the SAVE run prefilled: its Encode added the special tokens
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
-    SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
+    SYS_PROMP_LEN = tokenizer->Encode(system_prompt, true).size();
 
   ///@note add_special_tokens=true lets each model's OWN tokenizer decide
   /// whether
@@ -1550,7 +1551,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
   /// processor, add_bos_token=false) are byte-identical to the old behavior, so
   /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
-  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
+  /// A prompt continued from a loaded cache is the middle of a sequence:
+  /// a tokenizer that prepends a BOS (LFM2's <|startoftext|>) must not put
+  /// one there. Byte-identical for a tokenizer that adds none (Gemma4).
+  auto _input = tokenizer->Encode(
+    prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE));
 
   // [prefill-plane] Now that the prompt's real token count is known, give this
   // request the activation plane (== prefill block) it can use, and no more: a
