@@ -390,7 +390,10 @@ TL2 팩 `both_hmx`/`scope=all` 실행 OK. host check 전체 통과(`SET OFFSETS 
 후보 (효과 큰 순; A는 컨버터만 바꾸면 되고 런타임 변경이 없다):
 
 A. 컨버터 쪽
-1. **28/29를 TL2CX_WH로 저장** (값이 ternary, offset 0 → 무손실). arena −832 MiB; 프리필 두
+1. **28/29를 TL2CX_WH로 저장** (값이 ternary, offset 0 → 가중치 자체는 비트 동일; 달라지는 것은
+   4-bit HMX 경로 대신 TL2 LUT 경로의 누적 순서뿐으로, 레이어 0–27이 이미 그 경로다. 컨버터
+   재실행 없이도 가능: `tools/prepare_tl2.cpp`의 prepared TL2 companion을 4-bit affine ternary
+   입력까지 받게 넓히면 런타임이 28/29를 TL2로 읽는다 — 1–2시간 작업, 미착수). arena −832 MiB; 프리필 두
    레이어 DMA −~90 ms(2.3배 바이트); 디코드 miss 0.23→0.18 ms, 4-bit GEMV 제거(디코드 +6.4 ms
    중 ~4 ms 회복); direct prefetch가 전 레이어에 적용(지금은 첫 레이어 크기만). B의 코드는
    남아도 무해하지만 더는 필요 없다.
@@ -406,9 +409,9 @@ A. 컨버터 쪽
 B. 런타임, 회전
 5. (2가 안 되면) HMX fp16 회전 경로에 부호 적용: `had_hmx_rows`/`had_hmx_store_group`의 출력
    열에 fp16 부호 xor. 2보다 비싸고 얻는 것은 같다.
-6. 디코드 down 회전 배치화/융합: M=1에서 expert마다 704폭 행 1개씩 `hvx_hadamard_f32`
-   (`hvx_hadamard_rows_f32`의 2행 HVX 경로는 짝수 행에만) → 8 expert 행을 모아 한 번에,
-   또는 GeGLU 에필로그(`hvx_dq_swiglu`)에 융합. 디코드 MoE pcyc/op +18% 중 일부 회수.
+6. 디코드 down 회전 배치화: M=1에서 expert마다 704폭 1행씩 `hvx_hadamard_f32`. expert별
+   `gate_f32`가 따로 carve돼 있어(`MOE_M1_MAX_ROWS*inter` 간격) 복사 없이는 2행 HVX 경로를 못 쓴다;
+   예상 이득 ≤ 1 ms/token이라 복사 비용과 상쇄될 수 있음. 보류.
 7. 입력 회전은 op당 1회 공유(`rotated_input`)라 이미 최소.
 
 C. 런타임, 4-bit affine expert (1이 안 될 때)
@@ -417,11 +420,16 @@ C. 런타임, 4-bit affine expert (1이 안 될 때)
 9. direct prefetch spare 슬롯을 크기별 두 풀로.
 
 D. 공통(포맷과 무관하나 이번에 드러남)
-10. **디코드 miss 대기 8–11.6 ms/token (토큰의 15–19 %)**: `prefetch hints/token=29,
-    issued/token=0` — 예측 prefetch가 발행되지 않는다(두 팩 모두). `NNTR_HTP_PREDICT`/direct
-    prefetch 설정을 확인하고 켜서 측정할 것. 가장 큰 디코드 항목.
-11. 프리필 `K=2816 N=128 M>1 FC` 30회 261 ms(dsp=0, 전부 transport) = 프리필의 8 %: 호스트 경로로
-    도는 프로젝션. 포맷과 무관, 별도 조사 가치.
+10. 디코드 miss 대기 8–11.6 ms/token (토큰의 15–19 %). 예측 prefetch는 **켜져 있다**(ARM 예측,
+    `[HTP-PREFETCH] used 4574/7080`; `issued/token=0`은 DSP 힌트 경로의 카운터). 새 팩은 late가
+    435→843건: 3 MB expert 읽기가 늦는다. `NNTR_MOE_PREFETCH_READERS=8` 시험(22:33–22:41, 번갈아
+    3회): 새 팩 base 9.6 / 8.5 / 5.6 ms, r8 6.0 / 8.6 / 8.3 ms — 같은 설정끼리의 편차(±2 ms)가
+    차이보다 커서 **효과 없음, 적용 안 함**(ids는 모두 동일). 4-bit 레이어는 제 크기 게이팅으로
+    direct prefetch에서 빠져 있어 그 miss는 매번 전부 기다린다 → 두 크기의 spare 풀(C9)로 일부
+    회수 가능하나 +96 MB(슬롯 32×3 MB, 마지막 chunk의 여유에 들어가면 매핑 증가 없음 — 확인 필요).
+11. 프리필 `K=2816 N=128 M>1 FC` 30회 261 ms(프리필의 8 %)는 **DSP의 f32 라우터**
+    (`nntr_hvx_router_logits_f32`, 2048행에 8.7 ms = 85 GFLOP/s). 빠른 u8i8 라우터 entry가 이미
+    있으나(`router_logits_u8i8_f32`) 라우팅 수치가 바뀐다. f32 커널 자체의 개선만이 수치 보존.
 12. static activation scale(D): quant 단계 1.3 ms/call 중 min/max 스캔은 일부 → 프리필 ≤ 1–2 %.
     가치는 속도가 아니라 양자화 팀의 정확도 제어.
 13. Expert 파일 읽기 1.6–1.7 s/프리필은 호출 밑에 숨음(exposed wait 0) — 손댈 것 없음.
