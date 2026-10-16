@@ -8,7 +8,6 @@ test_target = [
   'unittest_memory_planner.cpp',
   'unittest_memory_pool.cpp',
   'unittest_cache_loader.cpp',
-  'unittest_cache_pool.cpp',
   'unittest_cache_pool_fsu.cpp'
 ]
 

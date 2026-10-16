@@ -216,6 +216,22 @@ test('unittest_memory_pool', unittest_memory_pool_exe,
   suite: 'unittests'
 )
 
+if host_machine.system() != 'windows'
+  unittest_cache_pool_exe = executable(
+    'unittest_cache_pool',
+    'memory' / 'unittest_cache_pool.cpp',
+    include_directories: include_directories('models', 'memory'),
+    dependencies: nntrainer_test_main_deps,
+    install: get_option('enable-test'),
+    install_dir: application_install_dir
+  )
+  test('unittest_cache_pool', unittest_cache_pool_exe,
+    args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cache_pool')],
+    timeout: test_timeout,
+    suite: 'unittests'
+  )
+endif
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
