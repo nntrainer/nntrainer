@@ -914,6 +914,9 @@ public:
     size_t off_gu, off_dn;
     unsigned int K, inter, N_out;
     unsigned int w_bits = 4; /**< [plan 229] 4 QS4CX_WH, 2 QS2CX_WH */
+    /** [PR 4428] QS4CX_WH_AFFINE: 4-bit codes with N i32 offsets after the
+     *  scales and sums; the file's values go to the DSP as they are. */
+    bool affine = false;
   };
 
   // How many expert slots the caller will ever hold at once (the LRU's

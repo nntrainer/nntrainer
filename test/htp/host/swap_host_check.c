@@ -485,6 +485,76 @@ int main(void) {
       "COMPACT TL2 SWAP OK: metadata, rebind, bounds, legacy transition\n");
   }
 
+  /** 9. [PR 4428] weight_set_offsets_batch: a swapped-in 4-bit pair takes
+        its affine offsets by handle, N each; a 2-bit handle, a dead
+        handle, a width or a length that disagrees and a non-integer value
+        are refused, the handles before the bad one keeping theirs; the
+        next swap into the slot clears them. */
+  {
+    uint32_t og = NONE, od = NONE, hg = NONE, hd = NONE, done = 0;
+    int32_t err = 0;
+    static float offs[NGU + NOUT];
+    for (int i = 0; i < NGU + NOUT; ++i)
+      offs[i] = (float)(i % 7) - 3.f;
+    uint32_t ofg = 0, ofd = 4096, ar = 0;
+    const int before = live();
+    CHECK(nntr_hvx_weight_swap_batch_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, &og, 1, &od, 1,
+            &ar, 1, &ofg, 1, &ofd, 1, gu_s, NGU, gu_c, NGU, dn_s, NOUT, dn_c,
+            NOUT, &hg, 1, &hd, 1, &done, &err) == AEE_SUCCESS &&
+          done == 1);
+    hexkl_weight_u8i4 *g = &g_s.weights_u8i4.slots[hg];
+    hexkl_weight_u8i4 *d = &g_s.weights_u8i4.slots[hd];
+    CHECK(g->w_offset == NULL && d->w_offset == NULL);
+    uint32_t hs[2] = {hg, hd}, ns[2] = {NGU, NOUT};
+    CHECK(nntr_hvx_weight_set_offsets_batch((remote_handle64)(uintptr_t)&g_s,
+                                            hs, 2, ns, 2, offs,
+                                            NGU + NOUT) == AEE_SUCCESS);
+    CHECK(g->w_offset && d->w_offset && g->w_offset[0] == -3 &&
+          g->w_offset[NGU - 1] == (int32_t)offs[NGU - 1] &&
+          d->w_offset[0] == (int32_t)offs[NGU] &&
+          d->w_offset[NOUT - 1] == (int32_t)offs[NGU + NOUT - 1]);
+    /* length mismatch: refused whole */
+    g->w_offset = NULL;
+    CHECK(nntr_hvx_weight_set_offsets_batch((remote_handle64)(uintptr_t)&g_s,
+                                            hs, 2, ns, 2, offs,
+                                            NGU + NOUT - 1) == AEE_EBADPARM);
+    CHECK(g->w_offset == NULL);
+    /* a width that disagrees on the second handle: the first keeps its */
+    ns[1] = NOUT + 32u;
+    CHECK(nntr_hvx_weight_set_offsets_batch((remote_handle64)(uintptr_t)&g_s,
+                                            hs, 2, ns, 2, offs,
+                                            NGU + NOUT + 32) == AEE_EBADPARM);
+    CHECK(g->w_offset != NULL);
+    ns[1] = NOUT;
+    /* a non-integer value */
+    offs[NGU] = 0.5f;
+    CHECK(nntr_hvx_weight_set_offsets_batch((remote_handle64)(uintptr_t)&g_s,
+                                            hs, 2, ns, 2, offs,
+                                            NGU + NOUT) == AEE_EBADPARM);
+    offs[NGU] = 0.f;
+    /* a dead handle */
+    hs[1] = 2000u;
+    CHECK(nntr_hvx_weight_set_offsets_batch((remote_handle64)(uintptr_t)&g_s,
+                                            hs, 2, ns, 2, offs,
+                                            NGU + NOUT) == AEE_EBADPARM);
+    hs[1] = hd;
+    /* the next swap into the slot clears the offsets */
+    og = hg;
+    od = hd;
+    CHECK(nntr_hvx_weight_swap_batch_u8i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, K, INTER, NOUT, &og, 1, &od, 1,
+            &ar, 1, &ofg, 1, &ofd, 1, gu_s, NGU, gu_c, NGU, dn_s, NOUT, dn_c,
+            NOUT, &hg, 1, &hd, 1, &done, &err) == AEE_SUCCESS &&
+          done == 1);
+    CHECK(g_s.weights_u8i4.slots[hg].w_offset == NULL &&
+          g_s.weights_u8i4.slots[hd].w_offset == NULL);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hg);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd);
+    CHECK(live() == before);
+    printf("SET OFFSETS BATCH OK: by handle, refusals, cleared by swap\n");
+  }
+
   printf("WEIGHT SWAP OK\n");
   return 0;
 }

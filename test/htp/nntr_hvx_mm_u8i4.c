@@ -666,6 +666,42 @@ int nntr_hvx_weight_swap_u8i4_arena(
                    h_gu, h_dn, 0);
 }
 
+/** [PR 4428] weight_set_offsets_batch: hexkl_weight_u8i4_set_offsets on
+ *  each swapped-in affine expert handle; see the IDL. */
+int nntr_hvx_weight_set_offsets_batch(remote_handle64 handle,
+                                      const uint32 *handles, int handlesLen,
+                                      const uint32 *n_per, int n_perLen,
+                                      const float *offsets, int offsetsLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t total = 0;
+  int i;
+  if (!s || handlesLen < 0 || n_perLen != handlesLen || offsetsLen < 0 ||
+      (handlesLen > 0 && (!handles || !n_per || !offsets))) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < handlesLen; ++i) {
+    total += n_per[i];
+  }
+  if (total != (uint64_t)offsetsLen) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = handles[i] < HEXKL_MM_U8I4_MAX_WEIGHTS
+                             ? &s->weights_u8i4.slots[handles[i]]
+                             : NULL;
+    int rc;
+    if (!w || !w->in_use || w->N != n_per[i]) {
+      return AEE_EBADPARM;
+    }
+    rc = hexkl_weight_u8i4_set_offsets(w, offsets);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    offsets += n_per[i];
+  }
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_weight_swap_batch_u8i4_arena(
   remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
   const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
