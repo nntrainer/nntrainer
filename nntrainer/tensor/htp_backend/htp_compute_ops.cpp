@@ -10120,12 +10120,12 @@ private:
    *        no progress while the layer call runs and the call's host side
    *        grows by 7 ms; section 10.19 traced that to the readers
    *        sharing the caller's core. Not defaults.
-   *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (4)
+   *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (6)
    *  - NNTR_MOE_PREFETCH_CPUS=<a,b,..>: pin the readers to these cores
    *    (default: every core but the caller's)
    */
   struct PrefetchKnobs {
-    size_t readers = 4;
+    size_t readers = 6;
     std::vector<int> cpus;
   };
   static const PrefetchKnobs &prefetchKnobs() {
