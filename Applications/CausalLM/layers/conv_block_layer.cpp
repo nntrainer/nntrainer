@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace causallm {
 
@@ -266,15 +267,33 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       gate_post(0);
     }
   } else {
-    // ponytail: the same refusal as mha_core's -- a second prompt's
-    // prefill would convolve from a state the DSP moved on from
+    // ponytail: the same refusal as mha_core's -- a prefill appended to a
+    // decoded context would convolve from a state the DSP moved on from;
+    // a new prompt goes through beginPrompt() first
     NNTR_THROW_IF(htp_owns_state_ && from > 0, std::runtime_error)
       << "conv_block: a multi-row forwarding at " << from
-      << " after the HTP decode hook took over the conv state "
-         "(NNTR_HTP_FORWARD=1 supports one prompt per process)";
+      << " after the HTP decode hook took over the conv state";
     nntrainer::ThreadManager::Global().parallel_for(
       0, static_cast<size_t>(rows), gate_pre);
-    nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
+    if (from == 0) {
+      nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
+    } else {
+      // Rows continued from a position (a prefill chunk after the first, a
+      // prompt after a loaded KV snapshot) convolve with the two rows the
+      // state holds in front of them: the kernel starts every call from a
+      // zero history, so it runs on [state; rows] and the first two outputs
+      // are dropped. The same recurrence the single block computes.
+      const size_t hist = static_cast<size_t>(KERNEL_SIZE - 1) * C;
+      std::vector<float> x(hist + static_cast<size_t>(rows) * C);
+      std::vector<float> yx(x.size());
+      std::memcpy(x.data(), state, hist * sizeof(float));
+      std::memcpy(x.data() + hist, g,
+                  static_cast<size_t>(rows) * C * sizeof(float));
+      nntrainer::causal_depthwise_conv1d_k3(x.data(), w_ptr, nullptr, yx.data(),
+                                            1, rows + KERNEL_SIZE - 1, C);
+      std::memcpy(y, yx.data() + hist,
+                  static_cast<size_t>(rows) * C * sizeof(float));
+    }
     std::memcpy(state, g + static_cast<size_t>(rows - 2) * C,
                 C * sizeof(float));
     std::memcpy(state + C, g + static_cast<size_t>(rows - 1) * C,
@@ -310,6 +329,16 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       std::memcpy(state, h_state.data(), h_state.size() * sizeof(float));
     }
   }
+}
+
+void ConvBlockLayer::beginPrompt(nntrainer::RunLayerContext &context) {
+  htp_owns_state_ = false;
+  context.getTensor(tensor_idx[STATE]).setZero();
+}
+
+nntrainer::Tensor &
+ConvBlockLayer::convState(nntrainer::RunLayerContext &context) {
+  return context.getTensor(tensor_idx[STATE]);
 }
 
 void ConvBlockLayer::updateTensorsByInputDimensions(
