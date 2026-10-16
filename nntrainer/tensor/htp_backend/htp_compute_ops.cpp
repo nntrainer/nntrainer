@@ -1278,6 +1278,9 @@ public:
       attn_registered_ = false;
     }
     std::fill(kv_len_.begin(), kv_len_.end(), 0u);
+    // A conv op's DSP state belongs to the last prompt: re-seed it at the
+    // next prompt's first decode row even if that row number matches.
+    std::fill(conv_next_pos_.begin(), conv_next_pos_.end(), HTP_GRAPH_NO_OP);
     std::fill(std::begin(kind_next_), std::end(kind_next_), 0u);
     cur_pos_ = HTP_GRAPH_NO_OP;
     pending_op_ = HTP_GRAPH_NO_OP;

@@ -2,7 +2,7 @@
 /** @file lfm2_htp_moe_causallm.cpp
  * @brief LFM2 hybrid MoE graph with TL2 experts and affine WH projections.
  * @author NNTrainer contributors
- * @bug One prompt per handle; chunked prefill is not supported.
+ * @bug Chunked prefill is not supported.
  */
 #include "lfm2_htp_moe_causallm.h"
 #include <algorithm>
@@ -229,8 +229,26 @@ void Lfm2HtpMoECausalLM::repack_weight() {
 
 void Lfm2HtpMoECausalLM::run(const WSTR prompt, bool sample, const WSTR system,
                              const WSTR tail, bool log) {
-  if (ran_)
-    throw std::logic_error("LFM2 HTP currently supports one prompt per handle");
+#ifdef ENABLE_HEXKL
+  // Each prompt starts from position 0, as Gemma4HtpMoECausalLM::run does:
+  // the DSP's decode state (attention caches, conv states) and the host KV
+  // slabs decode may have dropped are reset. The conv layers need nothing:
+  // a prefill from position 0 does not read their state.
+  if (ran_) {
+    nntrainer::htp_begin_prompt();
+    model->forEachLayer(
+      [](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+        if (node)
+          if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
+            mha->beginHtpPrompt();
+      },
+      nullptr);
+    kv_cache = KVCacheManager{};
+    kv_cache_bound = false;
+  }
+  setSessionTokenPosition(0);
+#endif
   ran_ = true;
   CausalLM::run(prompt, sample, system, tail, log);
 }

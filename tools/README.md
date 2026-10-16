@@ -70,8 +70,9 @@ Rebuild both ARM libraries and the v81 DSP library: the LFM2 profile adds
 64-wide INT8 decode attention. Prefill uses `attention_kv_dtype=q8_row`
 for LFM2's unnormalized values; the fixed-scale Gemma path is unchanged.
 Provide that matching DSP library just as for the Gemma4 HTP descriptor.
-The current LFM2 profile supports one prompt per handle, a single prefill
-block (default 512 tokens), and a 2048-token context. Raise `init_seq_len`
+The current LFM2 profile runs each prompt from position 0 (a handle takes
+any number of independent prompts), with a single prefill block (default
+512 tokens) and a 2048-token context. Raise `init_seq_len`
 within `max_seq_len` before loading for longer prompts; chunked prefill,
 weight reload and KV snapshots are refused. Conversion and host checks do
 not establish device inference accuracy or throughput.
