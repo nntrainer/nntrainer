@@ -985,12 +985,11 @@ void Manager::flushCacheExcept(unsigned int order) {
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
   if (enable_optimizations) {
-    if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
-      //@todo change V3 and validate
-      pool.finalize(OptimizedV1Planner(), start, end);
-    } else {
-      pool.finalize(OptimizedV1Planner(), start, end);
-    }
+    // QNN and FSU allocate separate buffers for distinct offsets. Splitting
+    // free gaps only reduces the allocation for a contiguous inference pool.
+    const bool reuse_gaps = exec_mode == ExecutionMode::INFERENCE &&
+                            !enable_fsu && pool.supportsGapReuse();
+    pool.finalize(OptimizedV1Planner(reuse_gaps), start, end);
   } else {
     pool.finalize(BasicPlanner(), start, end);
   }

@@ -1598,6 +1598,38 @@ public:
   // ION copy made on its first call and kept by the weight's address --
   // as a plain pointer it was pinned and mapped every call (doc 57
   // section 9.10: 9.7 ms a call against the CPU dot's 6).
+  void release_prefill_scratch() override {
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    // KEEP_OUT can leave only sampled windows in the host tensor. Publish
+    // its complete value while the caller still owns the prefill tensors.
+    for (StagingPool *pool : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
+                              &attn_q_pool_, &attn_out_pool_}) {
+      for (auto *records : {&pool->holds, &pool->copied_out}) {
+        for (const auto &record : *records) {
+          const Held &held = record.second;
+          auto slot = pool->by_class.find(record.first);
+          if (held.kept && slot != pool->by_class.end() && slot->second &&
+              sampledSame(held.first, slot->second->data(), held.second))
+            stagedMemcpy(const_cast<void *>(held.first), slot->second->data(),
+                         held.second);
+        }
+      }
+    }
+    if (attn_out16_.host) {
+      const auto &a = attn_out16_;
+      float *dst = const_cast<float *>(a.host);
+      for (unsigned r = 0; r < a.rows; ++r)
+        for (unsigned h = 0; h < a.width / a.head_dim; ++h) {
+          const size_t base = static_cast<size_t>(r) * a.width + h * a.head_dim;
+          for (unsigned i = 0; i < a.head_dim; ++i)
+            dst[base + i] =
+              (static_cast<float>(a.ion[base + i]) - a.enc[2 * h + 1]) *
+              a.enc[2 * h];
+        }
+    }
+    releasePrefillStaging();
+  }
+
   bool supports_router_logits_fp32() const override { return true; }
 
   const float *routerWeightShared(const float *w, size_t bytes) {
@@ -3612,26 +3644,37 @@ public:
   /** [plan 201 S1] Re-sends S1's EXPERTS tables when a prefill touched the
    *  pool since the last token: each expert's pair as the ARM files it
    *  (handle_cache_), HTP_GRAPH_NO_HANDLE for one the pool does not hold. */
-  /** [#4416 mem] The prefill's staging buffers (its 23 MB rows in 32 MiB
-   *  classes, six pools: 370 MiB of ION at p2048) outlive it; the token
-   *  stages rows of a few KB and the first token's seed 8 MiB (p2048).
-   *  Released once the second token has begun, classes above 16 MiB. */
+  /** Release prefill/seed temporaries between completed synchronous calls.
+   * The public phase-boundary hook publishes kept outputs first. The token
+   * driver calls here after the seed's last reader has completed. */
   void releasePrefillStaging() {
+    constexpr size_t keep_bytes = size_t(64) << 10;
     size_t freed = 0;
-    for (StagingPool *pl : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
-                            &attn_q_pool_, &attn_out_pool_})
-      for (auto it = pl->by_class.begin(); it != pl->by_class.end();)
-        if (it->first > (size_t(16) << 20)) {
-          pl->holds.erase(it->first);
-          pl->copied_out.erase(it->first);
-          freed += it->second ? it->second->size() : 0;
-          it = pl->by_class.erase(it);
-        } else {
-          ++it;
-        }
-    if (freed != 0)
-      std::fprintf(stderr, "[HTP] staging: prefill classes released mib=%zu\n",
-                   freed >> 20);
+    for (StagingPool *pool : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
+                              &attn_q_pool_, &attn_out_pool_}) {
+      for (auto it = pool->by_class.upper_bound(keep_bytes);
+           it != pool->by_class.end();) {
+        freed += it->second ? it->second->size() : 0;
+        it = pool->by_class.erase(it);
+      }
+      pool->holds.clear();
+      pool->copied_out.clear();
+    }
+    // These aliases can point inside the allocations just returned above.
+    ion_alias_ = {};
+    ion_alias_next_ = 0;
+    lost_ = {};
+    lost_next_ = 0;
+    attn_out16_ = {};
+    if (act_ah_buf_ && act_ah_buf_->size() > keep_bytes) {
+      freed += act_ah_buf_->size();
+      act_ah_buf_.reset();
+      std::vector<float>().swap(act_scale_scratch_);
+      std::vector<int32_t>().swap(act_zp_scratch_);
+    }
+    if (freed)
+      std::fprintf(stderr, "[HTP-MEM] released_prefill_scratch_bytes=%zu\n",
+                   freed);
   }
 
   void poolSync() {

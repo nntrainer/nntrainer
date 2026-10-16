@@ -216,6 +216,7 @@ test('unittest_ddtree', unittest_ddtree_exe,
 unittest_memory_pool_exe = executable(
   'unittest_memory_pool',
   'memory' / 'unittest_memory_pool.cpp',
+  'memory' / 'unittest_memory_planner.cpp',
   include_directories: include_directories('models', 'memory'),
   dependencies: nntrainer_test_main_deps,
   install: get_option('enable-test'),

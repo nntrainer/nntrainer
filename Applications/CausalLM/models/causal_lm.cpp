@@ -34,6 +34,7 @@
 #include <iterator>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2161,6 +2162,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
   }
 
+  // HTP inference has completed; release prompt-sized staging before the
+  // first decode step allocates its graph and expert cache.
+  std::unordered_set<nntrainer::ComputeOps *> prefill_backends;
+  model->forEachLayer(
+    [&prefill_backends](ml::train::Layer &, nntrainer::RunLayerContext &context,
+                        void *) {
+      if (auto *ops = context.getComputeOps())
+        prefill_backends.insert(ops);
+    },
+    nullptr);
+  for (auto *ops : prefill_backends)
+    ops->release_prefill_scratch();
   auto finish_prefill = std::chrono::high_resolution_clock::now();
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);

@@ -108,6 +108,14 @@ public:
   }
 
   /**
+   * @brief Whether this pool supports compact host/HTP gap reuse.
+   */
+  bool supportsGapReuse() const {
+    const auto name = allocator_->getName();
+    return cache_loader == nullptr && (name == "cpu" || name == "htp-rpcmem");
+  }
+
+  /**
    * @brief finalize the requested tensors
    * @param planner planner to layout the tensor memories
    * @param start_order start value for the order_exec (inclusive)

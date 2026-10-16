@@ -253,6 +253,12 @@ void HtpQKVLayer::finalize(nntrainer::InitLayerContext &context) {
       weight_regularizer_constant, weight_decay, "vweight", true);
   }
 
+  lazy_scratch =
+    context.getComputeEngineType() == ml::train::HTP &&
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE;
+  if (lazy_scratch)
+    return;
+
   // The norm kernel is not in-place (its pointers are __restrict), so the
   // projections land here first and the outputs hold the normed rows.
   if (feature_size) {
@@ -332,20 +338,6 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &Qweight = context.getWeight(weight_idx[WQ]);
   nntrainer::Tensor &Kweight = context.getWeight(weight_idx[WK]);
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  // With the norm folded in, the projections go to q_raw / k_raw and the
-  // outputs receive the normed rows below.
-  nntrainer::Tensor &Qhidden_ = feature_size
-                                  ? context.getTensor(tensor_idx[QKVParams::Q])
-                                  : context.getOutput(QKVParams::Q);
-  nntrainer::Tensor &Khidden_ = feature_size
-                                  ? context.getTensor(tensor_idx[QKVParams::K])
-                                  : context.getOutput(QKVParams::K);
-  // v likewise goes to v_raw when it is normed; with v_from_k nothing is
-  // projected into it at all (it is computed from k_raw below).
-  nntrainer::Tensor &Vhidden_ = (v_norm && !v_from_k)
-                                  ? context.getTensor(tensor_idx[QKVParams::V])
-                                  : context.getOutput(QKVParams::V);
-
   nntrainer::TensorDim input_dim = input_.getDim();
   nntrainer::TensorDim input_step_dim = input_dim;
   input_step_dim.batch(1);
@@ -356,26 +348,15 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const float epsilon = std::get<nntrainer::props::Epsilon>(qkv_props).get();
   const unsigned int rows = to - from;
 
-  nntrainer::TensorDim Qhidden_dim = Qhidden_.getDim();
-  nntrainer::TensorDim Qhidden_step_dim = Qhidden_.getDim();
-  Qhidden_step_dim.batch(1);
-  Qhidden_step_dim.height(to - from);
-  nntrainer::Tensor Qhidden_step =
-    Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
-
-  nntrainer::TensorDim Khidden_dim = Khidden_.getDim();
-  nntrainer::TensorDim Khidden_step_dim = Khidden_.getDim();
-  Khidden_step_dim.batch(1);
-  Khidden_step_dim.height(to - from);
-  nntrainer::Tensor Khidden_step =
-    Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
-
-  nntrainer::TensorDim Vhidden_dim = Vhidden_.getDim();
-  nntrainer::TensorDim Vhidden_step_dim = Vhidden_.getDim();
-  Vhidden_step_dim.batch(1);
-  Vhidden_step_dim.height(to - from);
-  nntrainer::Tensor Vhidden_step =
-    Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
+  auto step_dim = [&](unsigned index) {
+    nntrainer::TensorDim dim = context.getOutput(index).getDim();
+    dim.batch(1);
+    dim.height(rows);
+    return dim;
+  };
+  const auto Qhidden_step_dim = step_dim(QKVParams::Q);
+  const auto Khidden_step_dim = step_dim(QKVParams::K);
+  const auto Vhidden_step_dim = step_dim(QKVParams::V);
 
   // Every norm of the block in the projection call (doc 57 section 5 step
   // 4): the input norm before the quantizer, the per-head norms (q's gamma
@@ -454,6 +435,29 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     return;
   }
 
+  // Only the unfused path needs raw projection/norm buffers. HTP layers
+  // allocate these locally on fallback; CPU layers retain pooled scratch.
+  auto scratch = [&](unsigned index, const nntrainer::TensorDim &dim) {
+    return lazy_scratch
+             ? nntrainer::Tensor(dim, true)
+             : context.getTensor(index).getSharedDataTensor(dim, 0, true);
+  };
+  nntrainer::Tensor Qhidden_ =
+    feature_size ? scratch(tensor_idx[QKVParams::Q], Qhidden_step_dim)
+                 : context.getOutput(QKVParams::Q);
+  nntrainer::Tensor Khidden_ =
+    feature_size ? scratch(tensor_idx[QKVParams::K], Khidden_step_dim)
+                 : context.getOutput(QKVParams::K);
+  nntrainer::Tensor Vhidden_ =
+    v_norm && !v_from_k ? scratch(tensor_idx[QKVParams::V], Vhidden_step_dim)
+                        : context.getOutput(QKVParams::V);
+  nntrainer::Tensor Qhidden_step =
+    Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
+  nntrainer::Tensor Khidden_step =
+    Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
+  nntrainer::Tensor Vhidden_step =
+    Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
+
   // The CPU: the input norm first, into its scratch (the kernel is not in
   // place), then the projections read the normed rows.
   if (in_norm) {
@@ -461,8 +465,7 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                     ml::train::TensorDim::DataType::FP32,
                   std::invalid_argument)
       << "qkv_layer: in_norm is FP32 only";
-    nntrainer::Tensor normed = context.getTensor(tensor_idx[T_IN])
-                                 .getSharedDataTensor(input_step_dim, 0, true);
+    nntrainer::Tensor normed = scratch(tensor_idx[T_IN], input_step_dim);
     // [#260] one decode row: the input norm is the layer's RMSNORM op (the
     // token's first op at layer 0); once the row is resident the DSP runs
     // the whole token -- norms, projections, RoPE -- and nothing below is
@@ -578,13 +581,13 @@ void HtpQKVLayer::updateTensorsByInputDimensions(
   context.updateOutput(QKVParams::Q, Qoutput_dim);
   context.updateOutput(QKVParams::K, Koutput_dim);
   context.updateOutput(QKVParams::V, Voutput_dim);
-  if (feature_size) {
+  if (!lazy_scratch && feature_size) {
     context.updateTensor(tensor_idx[QKVParams::Q], Qoutput_dim);
     context.updateTensor(tensor_idx[QKVParams::K], Koutput_dim);
     if (v_norm && !v_from_k)
       context.updateTensor(tensor_idx[QKVParams::V], Voutput_dim);
   }
-  if (in_norm)
+  if (!lazy_scratch && in_norm)
     context.updateTensor(tensor_idx[T_IN], input_dim);
 }
 } // namespace causallm

@@ -44,10 +44,12 @@ namespace nntrainer {
 class OptimizedV1Planner : public MemoryPlanner {
 public:
   /**
-   * @brief OptimizedV1Planner destructor
-   *
+   * @brief Create a planner, optionally reusing gaps of different sizes.
+   * @param reuse_gaps Enable only for a contiguous memory pool. Pools that
+   * allocate independently per offset do not benefit from split gaps.
    */
-  OptimizedV1Planner() = default;
+  explicit OptimizedV1Planner(bool reuse_gaps = false) :
+    reuse_gaps_(reuse_gaps) {}
 
   /**
    * @copydoc MemoryPlanner::planLayout(
@@ -70,6 +72,10 @@ public:
   const std::string getType() const { return type; }
 
   static constexpr const char *type = "optimized_v1_planner";
+
+private:
+  bool
+    reuse_gaps_; /**< Try compact gap reuse in addition to exact-size reuse */
 };
 
 } // namespace nntrainer

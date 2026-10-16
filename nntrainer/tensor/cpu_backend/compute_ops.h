@@ -234,6 +234,11 @@ class ComputeOps {
 public:
   virtual ~ComputeOps() = default;
 
+  /** Release temporary prefill storage between completed graph traversals.
+   * The caller keeps tensors alive until this returns; backend-only outputs
+   * are materialized before their temporary storage is released. */
+  virtual void release_prefill_scratch() {}
+
   // ===========================================================================
   // FP32 BLAS
   // ===========================================================================
