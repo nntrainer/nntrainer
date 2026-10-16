@@ -4510,7 +4510,7 @@ public:
    *  the proof of which path a run took when no profile is on;
    *  [HTP-PROFILE]'s m1_gemv= and blocks= are the per-call proof. */
   void sendMoeOptsOnce(remote_handle64 session) {
-    std::call_once(moe_opts_once_, [session]() {
+    std::call_once(moe_opts_once_, [this, session]() {
       moeOptsSent().store(true);
       const char *env = std::getenv("NNTR_MOE_HTP_M1_GEMV");
       const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
@@ -4605,7 +4605,45 @@ public:
                      "offline weight rotation required for valid outputs\n",
                      had_env, had_scope ? had_scope : "2bit",
                      applied & HTP_MOE_FLAG_HAD_MASK);
+      moe_opts_sent_ = true;
+      sendHadamardSigns(session);
     });
+  }
+
+  /** [PR 4428] The rotation signs to the session, once they and the MoE
+   *  word are both known (set_moe_hadamard_signs, sendMoeOptsOnce). */
+  void sendHadamardSigns(remote_handle64 session) {
+    std::lock_guard<std::mutex> lock(had_signs_mutex_);
+    if (had_signs_in_.empty() && had_signs_down_.empty())
+      return;
+    const int rc = nntr_hvx_moe_set_hadamard_signs(
+      session, had_signs_in_.data(), static_cast<int>(had_signs_in_.size()),
+      had_signs_down_.data(), static_cast<int>(had_signs_down_.size()));
+    if (rc != AEE_SUCCESS) {
+      char code[16];
+      std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(rc));
+      throw std::runtime_error(
+        std::string("nntr_hvx_moe_set_hadamard_signs failed: err=") + code +
+        " (widths " + std::to_string(had_signs_in_.size()) + " / " +
+        std::to_string(had_signs_down_.size()) +
+        "; a skel older than test/htp/nntr_hvx.idl answers this call with an "
+        "error: rebuild and push libnntr_hvx_skel.so)");
+    }
+    std::fprintf(stderr, "[HTP] Hadamard signs: in=%zu down=%zu\n",
+                 had_signs_in_.size(), had_signs_down_.size());
+  }
+
+  bool set_moe_hadamard_signs(const std::vector<float> &in,
+                              const std::vector<float> &down) override {
+    {
+      std::lock_guard<std::mutex> lock(had_signs_mutex_);
+      had_signs_in_ = in;
+      had_signs_down_ = down;
+    }
+    if (moe_opts_sent_)
+      sendHadamardSigns(
+        static_cast<remote_handle64>(HtpBackend::global().handle()));
+    return true;
   }
 
   /** Same registration the layer call above does on first use, keyed by
@@ -10317,6 +10355,10 @@ private:
   // same mutex that serializes every call into the one HTP session.
   std::mutex invoke_mutex_;
   std::once_flag moe_opts_once_; /**< sendMoeOptsOnce */
+  std::atomic<bool> moe_opts_sent_{false};
+  /** [PR 4428] set_moe_hadamard_signs's vectors until the session has them */
+  std::mutex had_signs_mutex_;
+  std::vector<float> had_signs_in_, had_signs_down_;
   // [#85] The decode op list from set_decode_graph_desc, its MoE ops in
   // list order, how many have their handles bound (first-pass call order),
   // the op each layer's first gate_up handle belongs to, and whether

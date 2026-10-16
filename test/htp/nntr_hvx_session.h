@@ -98,6 +98,10 @@ typedef struct {
                                       grown on demand, freed in close() */
   uint32_t moe_flags;       /**< HEXKL_MOE_FLAG_* bits from moe_set_opts; the
                                  session is calloc'd, so 0 = the HMX loop */
+  /** [PR 4428] moe_set_hadamard_signs's masks (hexkl_moe_set_hadamard_signs)
+     and their widths; freed in close() */
+  uint32_t *had_sign_in, *had_sign_down;
+  uint32_t had_sign_in_n, had_sign_down_n;
   hexkl_graph *graph;       /**< [#85] the decode op table from graph_init; NULL
                                  = none. Freed in close() before the weight
                                  tables, since its MoE ops name their handles */

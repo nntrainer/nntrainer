@@ -615,6 +615,10 @@ static void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
    SwiGLU (GeGLU-tanh under glu), requantize, down, then the routing
    multiply and the add into the token's output row -- in expert order, rows in
    order, like the kernel. */
+/** [PR 4428] the reference's rotation signs (hexkl_moe_set_hadamard_signs's
+ *  masks), NULL for none */
+static const uint32_t *g_ref_sign_in, *g_ref_sign_down;
+
 static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
                             uint32_t N_out, uint32_t NE, const W *wg,
                             const W *wd, const float *act, const uint32_t *ridx,
@@ -638,6 +642,9 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
         memcpy(rotated, src, sizeof(float) * K);
         if (hvx_hadamard_f32(rotated, K, 1u))
           abort();
+        if (g_ref_sign_in)
+          for (uint32_t k = 0; k < K; ++k)
+            ((uint32_t *)rotated)[k] ^= g_ref_sign_in[k];
         src = rotated;
       }
       quant_row(src, K, aq, &as, &az);
@@ -650,9 +657,13 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
                    : swiglu_det_one(gu[j], gu[inter + j]);
       float ms;
       int32_t mz;
-      if (glu & HEXKL_MOE_FLAG_HAD_DOWN)
+      if (glu & HEXKL_MOE_FLAG_HAD_DOWN) {
         if (hvx_hadamard_f32(mid, inter, 1u))
           abort();
+        if (g_ref_sign_down)
+          for (uint32_t k = 0; k < inter; ++k)
+            ((uint32_t *)mid)[k] ^= g_ref_sign_down[k];
+      }
       quant_row(mid, inter, mq, &ms, &mz);
       ref_mm(&wd[e], mq, ms, mz, dn);
       for (uint32_t c = 0; c < N_out; ++c) {
@@ -1900,6 +1911,46 @@ int main(void) {
       }
       free(rot_got);
       free(rot_want);
+    }
+    /* [PR 4428] The checkpoint's signs after the Hadamard: the kernel with
+       hexkl_moe_set_hadamard_signs equals the reference with the same +-1
+       per dimension (HVX path, up and down); signs of another width are
+       refused. */
+    {
+      uint32_t *sin = malloc(sizeof(uint32_t) * K);
+      uint32_t *sdn = malloc(sizeof(uint32_t) * inter);
+      float *sg = malloc(sizeof(float) * M * N_out);
+      float *sw = malloc(sizeof(float) * M * N_out);
+      const uint32_t sflags = HEXKL_MOE_FLAG_GELU_TANH | HEXKL_MOE_FLAG_HAD_UP |
+                              HEXKL_MOE_FLAG_HAD_DOWN;
+      for (uint32_t k = 0; k < K; ++k)
+        sin[k] = ((k * 7u) % 3u == 0u) ? 0x80000000u : 0u;
+      for (uint32_t k = 0; k < inter; ++k)
+        sdn[k] = ((k * 5u) % 4u == 1u) ? 0x80000000u : 0u;
+      g_ref_sign_in = sin;
+      g_ref_sign_down = sdn;
+      reference_layer(
+        M, K, inter, N_out, NE, wg, wd, had_input, ridx, rc_, rw, sw,
+        HVX_GLU_GELU_TANH | HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN);
+      hexkl_moe_set_hadamard_signs(sin, K, sdn, inter);
+      const int rs = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+        ridx, rc_, rw, act, sg, NULL, &scratch, sflags);
+      double worst_s = 0;
+      const uint32_t bad_s = count_mismatches(sg, sw, M * N_out, &worst_s);
+      hexkl_moe_set_hadamard_signs(sin, K + 32u, sdn, inter);
+      const int rbad = hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+        ridx, rc_, rw, act, sg, NULL, &scratch, sflags);
+      hexkl_moe_set_hadamard_signs(NULL, 0u, NULL, 0u);
+      g_ref_sign_in = g_ref_sign_down = NULL;
+      fail |= rs != 0 || bad_s != 0 || rbad != AEE_EUNSUPPORTED;
+      printf("HADAMARD SIGNS norm=%u rc=%d bad=%u worst=%g other-width rc=%d\n",
+             norm, rs, bad_s, worst_s, rbad);
+      free(sg);
+      free(sw);
+      free(sin);
+      free(sdn);
     }
     /* A shared 4-bit FFN must retain its original output even when its
        dimensions are unsupported by the requested HMX rotation. */

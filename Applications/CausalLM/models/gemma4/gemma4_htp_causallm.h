@@ -80,6 +80,9 @@ protected:
    *  overrides moe_layer_dtype for the listed layers (the rotated ternary
    *  checkpoint keeps its last two MoE layers in the 4-bit container). */
   std::map<int, std::string> MOE_LAYER_DTYPE_PER_LAYER;
+  /** nntr_config moe_hadamard_signs: the rotated checkpoint's +-1 per input
+   *  dimension after the Hadamard (a JSON beside the model, "in" / "down") */
+  std::string MOE_HADAMARD_SIGNS_FILE;
   std::string moeLayerDtype(int layer_id) const {
     const auto it = MOE_LAYER_DTYPE_PER_LAYER.find(layer_id);
     return it == MOE_LAYER_DTYPE_PER_LAYER.end() ? MOE_LAYER_DTYPE : it->second;

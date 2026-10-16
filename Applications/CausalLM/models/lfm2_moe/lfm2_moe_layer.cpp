@@ -673,6 +673,17 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
                  context.getWeight(expert_down_proj_indices[e])));
   const char *preload = std::getenv("NNTR_MOE_PRELOAD_EXPERTS");
   const size_t limit = expertPreloadLimit(g_expert_lru.capacity(), preload);
+  // [PR 4428] NNTR_MOE_DESC_TRACE=1: where each layer's first experts sit in
+  // the file, for tools/htp/recover_hadamard_signs.py
+  if (std::getenv("NNTR_MOE_DESC_TRACE") && !descs.empty())
+    for (unsigned int e = 0; e < std::min<unsigned int>(2u, num_experts); ++e)
+      std::fprintf(stderr,
+                   "[MoE-DESC] layer=%u expert=%u K=%u inter=%u N_out=%u "
+                   "w_bits=%u affine=%d off_gu=%llu off_dn=%llu\n",
+                   trace_layer, e, descs[e].K, descs[e].inter, descs[e].N_out,
+                   descs[e].w_bits, descs[e].affine ? 1 : 0,
+                   (unsigned long long)descs[e].off_gu,
+                   (unsigned long long)descs[e].off_dn);
   // Map all slots before FC registration, independently of weight reads:
   // the first layer of each slot size reserves that size's share.
   if (!descs.empty() &&
