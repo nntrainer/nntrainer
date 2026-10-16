@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "htp_tl2_opts.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -407,6 +408,81 @@ int main(void) {
             1, ofg, 1, ofd, 1, pg, 3, pd, 4, hg, 1, hd, 1, &done,
             &err) == AEE_EBADPARM);
     CHECK(done == 0 && live() == 2);
+  }
+
+  /* Compact native metadata lives before the legacy WH2 tail. Fresh and
+     reused slots must agree, and a truncated down span must leave GU intact. */
+  {
+    enum { CK = 256, CI = 128, CN = 256, CAP = 32768 };
+    static uint8_t compact[CAP] __attribute__((aligned(4096)));
+    const size_t gb = htp_tl2_native_bytes(CK, 2 * CI);
+    const size_t db = htp_tl2_native_bytes(CI, CN);
+    const uint32_t down = 16384u;
+    const unsigned before = live();
+    g_s.arenas[1].va = compact;
+    g_s.arenas[1].bytes = down + db + 8u * CN;
+    float *gs = (float *)(compact + gb);
+    float *ds = (float *)(compact + down + db);
+    for (unsigned i = 0; i < CN; ++i) {
+      gs[i] = 0.5f + i;
+      ds[i] = 0.25f + i;
+      ((int32_t *)gs)[CN + i] = (int32_t)i - 17;
+      ((int32_t *)ds)[CN + i] = 19 - (int32_t)i;
+    }
+    uint32_t og = NONE, od = NONE, ar = 1, ofg = 0, ofd = down;
+    uint32_t hg = NONE, hd = NONE, done = 99;
+    int32_t err = 99;
+#define COMPACT_SWAP()                                                         \
+  nntr_hvx_weight_swap_batch_tl2_compact_arena(                                \
+    (remote_handle64)(uintptr_t)&g_s, CK, CI, CN, &og, 1, &od, 1, &ar, 1,      \
+    &ofg, 1, &ofd, 1, &hg, 1, &hd, 1, &done, &err)
+    CHECK(COMPACT_SWAP() == AEE_SUCCESS && done == 1 && err == AEE_SUCCESS);
+    CHECK(live() == before + 2);
+    hexkl_weight_u8i4 *g = &g_s.weights_u8i4.slots[hg];
+    hexkl_weight_u8i4 *d = &g_s.weights_u8i4.slots[hd];
+    CHECK(g->tl2_compact && d->tl2_compact && g->bits == 2 && d->bits == 2);
+    CHECK(g->tl2_bytes == compact && d->tl2_bytes == compact + down);
+    CHECK(memcmp(g->w_scale, gs, CN * 4u) == 0);
+    CHECK(memcmp(d->colsum_w, ds + CN, CN * 4u) == 0);
+    CHECK(nntr_hvx_weights_tl2((remote_handle64)(uintptr_t)&g_s, &hg, 1, 0) ==
+          AEE_EBADPARM);
+    og = hg;
+    od = hd;
+    const void *arrays = g->arrays;
+    gs[0] = 77.0f;
+    ds[0] = 88.0f;
+    CHECK(COMPACT_SWAP() == AEE_SUCCESS && done == 1 && hg == og && hd == od);
+    CHECK(g->arrays == arrays && g->w_scale[0] == 77.0f &&
+          d->w_scale[0] == 88.0f);
+    --g_s.arenas[1].bytes;
+    gs[0] = 99.0f;
+    CHECK(COMPACT_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    CHECK(g->w_scale[0] == 77.0f && live() == before + 2);
+    ++g_s.arenas[1].bytes;
+    ofd = UINT32_MAX - 255u;
+    CHECK(COMPACT_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    ofd = down + 1u;
+    CHECK(COMPACT_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    ofd = down;
+    CHECK(nntr_hvx_weight_swap_batch_tl2_compact_arena(
+            (remote_handle64)(uintptr_t)&g_s, CK, CI, CN, &og, 1, &od, 0, &ar,
+            1, &ofg, 1, &ofd, 1, &hg, 1, &hd, 1, &done, &err) == AEE_EBADPARM);
+    CHECK(done == 0 && live() == before + 2);
+    /* Legacy registration restores the original padded format explicitly. */
+    const int8_t palette[4] = {-1, 0, 1, 1};
+    g_s.arenas[1].bytes = CAP;
+    CHECK(nntr_hvx_weight_swap_batch_u2i4_arena(
+            (remote_handle64)(uintptr_t)&g_s, CK, CI, CN, &og, 1, &od, 1, &ar,
+            1, &ofg, 1, &ofd, 1, palette, 4, palette, 4, &hg, 1, &hd, 1, &done,
+            &err) == AEE_SUCCESS &&
+          done == 1);
+    CHECK(!g->tl2_compact && !d->tl2_compact && !g->tl2_bytes && !d->tl2_bytes);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hg);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd);
+    CHECK(live() == before);
+#undef COMPACT_SWAP
+    printf(
+      "COMPACT TL2 SWAP OK: metadata, rebind, bounds, legacy transition\n");
   }
 
   printf("WEIGHT SWAP OK\n");

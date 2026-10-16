@@ -3900,7 +3900,11 @@ public:
         l.off_gu = st.gu.off;
         l.off_dn = st.dn.off;
         // [plan 229] QS2CX_WH: the width and the palettes ride the answer
-        l.bits = st.tl2 ? HTP_TL2_WEIGHT_BITS : x.w_bits;
+        // Native files use compact slots; prepared QS2 companions retain
+        // their padded layout when switching between prefill and decode.
+        l.bits = x.w_bits == HTP_TL2_WEIGHT_BITS ? HTP_TL2_COMPACT_WEIGHT_BITS
+                 : st.tl2                        ? HTP_TL2_WEIGHT_BITS
+                                                 : x.w_bits;
         std::memset(l.pal_gu, 0, sizeof(l.pal_gu));
         std::memset(l.pal_dn, 0, sizeof(l.pal_dn));
         std::copy(st.gu.pal.begin(), st.gu.pal.end(), l.pal_gu);
@@ -8527,8 +8531,7 @@ private:
    *  them from here, so a swap carries offsets and nothing else), rounded
    *  to a page. +44 KB on a 5.25 MB expert. */
   static uint32_t expertStride(uint32_t K, uint32_t N, uint32_t w_bits) {
-    const auto capacity =
-      w_bits == HTP_TL2_WEIGHT_BITS ? whBytes2(K, N) : codeBytes(K, N, w_bits);
+    const auto capacity = codeBytes(K, N, w_bits);
     return (static_cast<uint32_t>(capacity) + 8u * N + 4095u) & ~4095u;
   }
 
@@ -9024,26 +9027,32 @@ private:
       uint32_t done = 0;
       int32_t err = AEE_SUCCESS;
       const bool two = d0.w_bits == 2u || d0.w_bits == HTP_TL2_WEIGHT_BITS;
+      const bool compact_tl2 = d0.w_bits == HTP_TL2_WEIGHT_BITS;
       const int rc =
-        two ? nntr_hvx_weight_swap_batch_u2i4_arena(
-                session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(), ni,
-                ar.data(), ni, ofg.data(), ni, ofd.data(), ni, pg.data(),
-                static_cast<int>(pg.size()), pd.data(),
-                static_cast<int>(pd.size()), hg.data(), ni, hd.data(), ni,
-                &done, &err)
-            : nntr_hvx_weight_swap_batch_u8i4_arena(
-                session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(), ni,
-                ar.data(), ni, ofg.data(), ni, ofd.data(), ni, gs.data(),
-                static_cast<int>(gs.size()), gc.data(),
-                static_cast<int>(gc.size()), ds.data(),
-                static_cast<int>(ds.size()), dc.data(),
-                static_cast<int>(dc.size()), hg.data(), ni, hd.data(), ni,
-                &done, &err);
+        compact_tl2
+          ? nntr_hvx_weight_swap_batch_tl2_compact_arena(
+              session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(), ni,
+              ar.data(), ni, ofg.data(), ni, ofd.data(), ni, hg.data(), ni,
+              hd.data(), ni, &done, &err)
+        : two ? nntr_hvx_weight_swap_batch_u2i4_arena(
+                  session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(),
+                  ni, ar.data(), ni, ofg.data(), ni, ofd.data(), ni, pg.data(),
+                  static_cast<int>(pg.size()), pd.data(),
+                  static_cast<int>(pd.size()), hg.data(), ni, hd.data(), ni,
+                  &done, &err)
+              : nntr_hvx_weight_swap_batch_u8i4_arena(
+                  session, d0.K, d0.inter, d0.N_out, og.data(), ni, od.data(),
+                  ni, ar.data(), ni, ofg.data(), ni, ofd.data(), ni, gs.data(),
+                  static_cast<int>(gs.size()), gc.data(),
+                  static_cast<int>(gc.size()), ds.data(),
+                  static_cast<int>(ds.size()), dc.data(),
+                  static_cast<int>(dc.size()), hg.data(), ni, hd.data(), ni,
+                  &done, &err);
       if (rc != AEE_SUCCESS) { // refused whole: the DSP changed nothing
         done = 0;
         err = rc;
       }
-      if (done && ok[0]->tl2) {
+      if (done && ok[0]->tl2 && !compact_tl2) {
         std::vector<uint32_t> handles;
         for (uint32_t i = 0; i < done; ++i) {
           handles.push_back(hg[i]);
@@ -9062,8 +9071,10 @@ private:
         char code[16];
         std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(err));
         first = std::make_exception_ptr(std::runtime_error(
-          std::string(two ? "nntr_hvx_weight_swap_batch_u2i4_arena"
-                          : "nntr_hvx_weight_swap_batch_u8i4_arena") +
+          std::string(compact_tl2
+                        ? "nntr_hvx_weight_swap_batch_tl2_compact_arena"
+                      : two ? "nntr_hvx_weight_swap_batch_u2i4_arena"
+                            : "nntr_hvx_weight_swap_batch_u8i4_arena") +
           " failed: err=" + code + " at expert " + std::to_string(done) +
           " of " + std::to_string(n) +
           " (a skel older than test/htp/nntr_hvx.idl answers this call with "
@@ -9316,10 +9327,11 @@ private:
     return nullptr;
   }
 
-  /** Native file tails are FP32; arena metadata follows QS2 capacity. */
+  /** Native file tails are FP32; compact arena metadata follows native codes.
+   */
   static int finishTl2Weight(uint32_t K, uint32_t N, const float *tail,
                              uint8_t *arena_dst, ArenaEntry &e) {
-    const size_t capacity = whBytes2(K, N);
+    const size_t capacity = htp_tl2_native_bytes(K, N);
     std::vector<int32_t> sums(N);
     for (uint32_t n = 0; n < N; ++n) {
       if (!std::isfinite(tail[n]) || tail[n] < 0.0f ||

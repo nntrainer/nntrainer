@@ -11,6 +11,7 @@
  */
 
 #include "hexkl_mm_u8i4_dma.h"
+#include "../htp_tl2_opts.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -218,6 +219,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   uintptr_t a;
   h->wh_bytes = borrow ? (uint8_t *)wh_src : (uint8_t *)malloc(wh_bytes);
   h->tl2_bytes = NULL;
+  h->tl2_compact = 0;
   h->w_offset = NULL;
   h->arrays = malloc(4u * n4 + 128u);
   if (!h->wh_bytes || !h->arrays) {
@@ -378,6 +380,7 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
   /** The width moves with the bytes: a pool slot holds whatever expert the
      host read into it last. */
   w->tl2_bytes = NULL;
+  w->tl2_compact = 0;
   w->w_offset = NULL;
   w->bits = pal ? 2u : 4u;
   if (pal) {
@@ -436,6 +439,61 @@ int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
   tbl->slots[slot].bits = 2u;
   memcpy(tbl->slots[slot].pal, pal, sizeof(tbl->slots[slot].pal));
   *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
+/** Native-only slots keep metadata immediately after their packed codes.
+ * Legacy QS2/TL2 slots retain their original WH2 metadata offset. */
+static int compact_tl2_shape(uint32_t K, uint32_t N) {
+  return K && N && K <= 8192u && N <= 8192u && K % 32u == 0u && N % 128u == 0u;
+}
+
+int hexkl_weight_tl2_compact_register_arena(hexkl_weight_u8i4_table *tbl,
+                                            uint32_t vtcm_size, uint32_t K,
+                                            uint32_t N, const uint8_t *codes,
+                                            uint32_t *out_handle) {
+  uint32_t expanded = 0u;
+  if (!tbl || !codes || !out_handle || !compact_tl2_shape(K, N) ||
+      (uintptr_t)codes % WEIGHT_TILE_BYTES_U8I4)
+    return AEE_EBADPARM;
+  int rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &expanded);
+  if (rc != AEE_SUCCESS)
+    return rc;
+  const uint32_t slot = hexkl_weight_u8i4_free_slot(tbl);
+  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS)
+    return AEE_ENOMEMORY;
+  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N,
+                                   (uint32_t)htp_tl2_native_bytes(K, N), codes,
+                                   NULL, NULL, NULL, 1);
+  if (rc != AEE_SUCCESS)
+    return rc;
+  hexkl_weight_u8i4 *w = &tbl->slots[slot];
+  const int8_t palette[4] = {-1, 0, 1, 1};
+  memcpy(w->pal, palette, sizeof(palette));
+  w->bits = 2u;
+  w->tl2_bytes = w->wh_bytes;
+  w->tl2_compact = 1;
+  *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
+int hexkl_weight_tl2_compact_rebind_arena(hexkl_weight_u8i4_table *tbl,
+                                          uint32_t h, uint32_t K, uint32_t N,
+                                          const uint8_t *codes) {
+  if (!tbl || !codes || h >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !compact_tl2_shape(K, N) || (uintptr_t)codes % WEIGHT_TILE_BYTES_U8I4)
+    return AEE_EBADPARM;
+  hexkl_weight_u8i4 *w = &tbl->slots[h];
+  if (!w->in_use || !w->borrowed || w->K != K || w->N != N)
+    return AEE_EBADPARM;
+  const int8_t palette[4] = {-1, 0, 1, 1};
+  w->wh_bytes = (uint8_t *)codes;
+  w->tl2_bytes = codes;
+  w->tl2_compact = 1;
+  w->w_offset = NULL;
+  w->bits = 2u;
+  memcpy(w->pal, palette, sizeof(palette));
+  hexkl_weight_u8i4_tail_from_arena(w, (uint32_t)htp_tl2_native_bytes(K, N));
   return AEE_SUCCESS;
 }
 

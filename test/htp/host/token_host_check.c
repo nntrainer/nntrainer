@@ -1,3 +1,4 @@
+#include "htp_tl2_opts.h"
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
@@ -498,6 +499,7 @@ typedef struct {
   uint32_t holder[POOL_OPS][2]; /* expert in slot s */
   uint32_t used[POOL_OPS][2];   /* recency */
   uint32_t clock, served, loads, bad;
+  uint32_t format;
   volatile int stop;
 } pool_owner;
 
@@ -519,11 +521,23 @@ static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
   return AEE_SUCCESS;
 }
 
+static unsigned compact_rebind_calls;
+static int host_rebind_compact(void *ctx, uint32_t old_gu, uint32_t old_dn,
+                               uint32_t K, uint32_t inter, uint32_t N_out,
+                               uint32_t arena, uint32_t off_gu, uint32_t off_dn,
+                               const int8_t *pal_gu, const int8_t *pal_dn,
+                               uint32_t *h_gu, uint32_t *h_dn) {
+  ++compact_rebind_calls;
+  return host_rebind(ctx, old_gu, old_dn, K, inter, N_out, arena, off_gu,
+                     off_dn, pal_gu, pal_dn, h_gu, h_dn);
+}
+
 /** Every MoE op's EXPERTS table: experts [0, held) in slots 0.., the rest
    absent; the ops' indices into o. */
 static void set_pool(session *s, pool_owner *o, uint32_t held) {
   uint32_t m, t, e;
   s->env.rebind = host_rebind;
+  s->env.rebind_compact = host_rebind_compact;
   for (m = 0; m < POOL_OPS; ++m) {
     float tab[2u * POOL_E];
     uint32_t h;
@@ -580,6 +594,7 @@ static void pool_serve(pool_owner *o, const htp_miss_req *q) {
       /* "pread": the slot's bytes become expert e's */
       g_wh[pool_handle(m, v, 0)] = g_wh[pool_handle(m, v, 1)] = 10u * m + e;
       a->load[a->n_load].e = e;
+      a->load[a->n_load].bits = o->format;
       a->load[a->n_load].old_gu = pool_handle(m, v, 0);
       a->load[a->n_load].old_dn = pool_handle(m, v, 1);
       a->load[a->n_load].h_gu = a->load[a->n_load].h_dn = HTP_GRAPH_NO_HANDLE;
@@ -610,7 +625,7 @@ static void *owner_thread(void *arg) {
   return NULL;
 }
 
-static void check_pool(const uint32_t *words, uint32_t n) {
+static void check_pool(const uint32_t *words, uint32_t n, int compact) {
   static float ref_logits[TOKENS][VOCAB], x[HID];
   static uint32_t ref_id[TOKENS];
   session s;
@@ -622,12 +637,18 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   double cover;
   int rc;
 
+  /* A previous pool run rewrites these synthetic resident expert ids. */
+  for (uint32_t m = 0; m < POOL_OPS; ++m)
+    for (uint32_t e = 0; e < POOL_E; ++e)
+      g_wh[pool_handle(m, e, 0)] = g_wh[pool_handle(m, e, 1)] = 10u * m + e;
   reference(words, n, ref_logits, ref_id);
   open_session(&s, words, n);
   /* This fixture checks every miss wait against its enclosing op timer. */
   s.g->attn_prof_on = 1u;
   memset(&o, 0, sizeof(o));
   o.page = new_page();
+  o.format = compact ? HTP_TL2_COMPACT_WEIGHT_BITS : 4u;
+  compact_rebind_calls = 0u;
   set_pool(&s, &o, 2u); /* experts 0 and 1 of each layer */
   memset(&st, 0, sizeof(st));
   g_moe_calls = 0;
@@ -651,6 +672,8 @@ static void check_pool(const uint32_t *words, uint32_t n) {
   }
   o.stop = 1;
   pthread_join(tho, NULL);
+  CHECK(compact_rebind_calls == (compact ? o.loads : 0u),
+        "compact callback calls %u / loads %u", compact_rebind_calls, o.loads);
   CHECK(st.tokens == TOKENS, "pool tokens %u", st.tokens);
   CHECK(same_logits == TOKENS && same_id == TOKENS,
         "pool logits %u / ids %u of %u", same_logits, same_id, TOKENS);
@@ -760,7 +783,8 @@ int main(void) {
   static uint32_t words[MAXW];
   const uint32_t n = build_words(words);
   check_bit_identical(words, n);
-  check_pool(words, n);
+  check_pool(words, n, 0);
+  check_pool(words, n, 1);
   check_failures(words, n);
   if (g_fail) {
     printf("TOKEN CHECKS FAILED (%d)\n", g_fail);

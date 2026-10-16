@@ -11,6 +11,8 @@
 #define HTP_TL2_FLAG 0x2u
 /** Miss protocol format: QS2 arena span with native TL2 codes. */
 #define HTP_TL2_WEIGHT_BITS 0x102u
+/** Native-only codes followed immediately by scales and integer sums. */
+#define HTP_TL2_COMPACT_WEIGHT_BITS 0x202u
 
 /** Magnitude shared by all nonzero palette entries; zero means unsupported.
  * Pure ternary uses one, and legacy symmetric int4 artifacts use seven. */

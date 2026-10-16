@@ -178,6 +178,22 @@ static int graph_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
     off_dn, NULL, 0, NULL, 0, NULL, 0, NULL, 0, h_gu, h_dn);
 }
 
+static int graph_rebind_compact(void *ctx, uint32_t old_gu, uint32_t old_dn,
+                                uint32_t K, uint32_t inter, uint32_t N_out,
+                                uint32_t arena, uint32_t off_gu,
+                                uint32_t off_dn, const int8_t *pal_gu,
+                                const int8_t *pal_dn, uint32_t *h_gu,
+                                uint32_t *h_dn) {
+  (void)pal_gu;
+  (void)pal_dn;
+  uint32_t done = 0u;
+  int32_t err = AEE_SUCCESS;
+  const int rc = nntr_hvx_weight_swap_batch_tl2_compact_arena(
+    (remote_handle64)ctx, K, inter, N_out, &old_gu, 1, &old_dn, 1, &arena, 1,
+    &off_gu, 1, &off_dn, 1, h_gu, 1, h_dn, 1, &done, &err);
+  return rc != AEE_SUCCESS ? rc : done == 1u ? AEE_SUCCESS : (int)err;
+}
+
 void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->tbl = (hexkl_weight_u8i4_table *)&s->weights_u8i4;
   env->vtcm_base = s->vtcm_base;
@@ -191,6 +207,7 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
   env->fc_ctx = (void *)s;
   env->rebind = graph_rebind;
+  env->rebind_compact = graph_rebind_compact;
   env->rebind_ctx = (void *)s;
   env->miss.post = NULL; /* the token driver's (hexkl_token_main) */
   env->miss.wait = NULL;

@@ -61,6 +61,7 @@ typedef struct {
       (hvx_gemm_u8i2_wh_*) and the HMX path expands to int4 in VTCM
       (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
   const uint8_t *tl2_bytes; /**< Native TL2; NULL for ordinary WH. */
+  int tl2_compact;       /**< Native-only arena, cannot retag as padded QS2. */
   uint64_t tl2_expanded; /**< Prefill panels reserved for in-place expansion. */
   uint64_t tl2_pushed;   /**< Native panels queued for the current staging. */
   uint32_t tl2_dma_idx;  /**< Last DMA of the native prefill staging. */
@@ -164,6 +165,15 @@ int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t *out_handle);
 
 /** @brief Whether any live slot borrows bytes inside [base, base+bytes). */
+/** Register/rebind native-only TL2 codes with a compact arena metadata tail. */
+int hexkl_weight_tl2_compact_register_arena(hexkl_weight_u8i4_table *tbl,
+                                            uint32_t vtcm_size, uint32_t K,
+                                            uint32_t N, const uint8_t *codes,
+                                            uint32_t *out_handle);
+int hexkl_weight_tl2_compact_rebind_arena(hexkl_weight_u8i4_table *tbl,
+                                          uint32_t h, uint32_t K, uint32_t N,
+                                          const uint8_t *codes);
+
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,
                               const uint8_t *base, uint32_t bytes);
 
