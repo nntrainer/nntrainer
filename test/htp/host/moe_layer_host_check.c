@@ -1270,8 +1270,8 @@ static int run_fc_wh_case(const char *name, uint32_t K, uint32_t n_parts,
                           const uint32_t *Np, uint8_t *vtcm, size_t vtcm_bytes,
                           hexkl_moe_scratch *scratch, uint32_t flags,
                           int *pushed) {
-  W w[4];
-  uint32_t h[4], N = 0;
+  W w[HEXKL_FC_M1_MAX_PARTS];
+  uint32_t h[HEXKL_FC_M1_MAX_PARTS], N = 0;
   rnd_state = 4242u + K + 31u * n_parts;
   for (uint32_t p = 0; p < n_parts; ++p) {
     make_weight(200u + p, K, Np[p], &w[p]);
@@ -1371,6 +1371,55 @@ static int run_fc_wh_cases(uint8_t *vtcm, size_t vtcm_bytes,
   small_ok = pushed == 0;
   fail |= !small_ok;
   ++cells;
+  {
+    /** S26 has eight lanes. O projection must exercise fit=1..4 (including
+     * the three-tile fallback); LM-head slices exercise capacity-limited
+     * blocks, part boundaries, and four-column groups within one pool run. */
+    static const uint32_t head[4] = {4096u, 4096u, 4096u, 4096u};
+    const uint32_t saved_workers = g_workers;
+    const uint32_t flags =
+      feed_on | HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_ROWS1;
+    g_workers = 7u;
+    for (uint32_t fit = 1u; fit <= 4u; ++fit) {
+      fail |=
+        run_fc_wh_case("gemma-o eight-lane capacity", 8192u, 1u, gemma_o, vtcm,
+                       2u * 8u * 8192u * 16u * fit, scratch, flags, &pushed);
+      fail |= pushed == 0;
+      fed_cells += pushed != 0;
+      ++cells;
+    }
+    fail |= run_fc_wh_case("gemma-head eight-lane slices", 2816u, 4u, head,
+                           vtcm, vtcm_bytes, scratch, flags, &pushed);
+    fail |= pushed == 0;
+    fed_cells += pushed != 0;
+    ++cells;
+    /** Production registration further slices FC weights: K=2816 has
+     * 1024-column handles, K=4096 has 512, and K=8192 has 256. */
+    static const uint32_t qkv_slices[8] = {1024, 1024, 1024, 1024,
+                                           1024, 1024, 1024, 1024};
+    static const uint32_t qk_slices[9] = {1024, 1024, 1024, 1024, 1024,
+                                          1024, 1024, 1024, 1024};
+    static const uint32_t o_slices[11] = {256, 256, 256, 256, 256, 256,
+                                          256, 256, 256, 256, 256};
+    static const uint32_t os_slices[6] = {512, 512, 512, 512, 512, 256};
+    const struct {
+      const char *name;
+      uint32_t K, parts;
+      const uint32_t *N;
+    } sliced[] = {{"qkv registered slices", 2816, 8, qkv_slices},
+                  {"qk registered slices", 2816, 9, qk_slices},
+                  {"o registered slices", 8192, 11, o_slices},
+                  {"o-sliding registered slices", 4096, 6, os_slices}};
+    for (uint32_t s = 0; s < sizeof sliced / sizeof sliced[0]; ++s) {
+      fail |= run_fc_wh_case(sliced[s].name, sliced[s].K, sliced[s].parts,
+                             sliced[s].N, vtcm, vtcm_bytes - 128u, scratch,
+                             flags, &pushed);
+      fail |= pushed == 0;
+      fed_cells += pushed != 0;
+      ++cells;
+    }
+    g_workers = saved_workers;
+  }
   printf("-- injected lane timeout (the line below is expected to fail):\n");
   g_lane_timeout = 1;
   {

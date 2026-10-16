@@ -60,9 +60,7 @@ static int check(int gu_magnitude, int dn_magnitude) {
     input[k] = rndf();
   hexkl_moe_scratch scratch = {0};
   int fail = 0;
-  for (uint32_t active = 1; active <= E; active = active == 1   ? 3
-                                                  : active == 3 ? 8
-                                                                : E + 1) {
+  for (uint32_t active = 1; active <= E; ++active) {
     for (uint32_t e = 0; e < E; ++e)
       count[e] = e < active;
     for (uint32_t workers = 0; workers <= 7;
@@ -75,9 +73,12 @@ static int check(int gu_magnitude, int dn_magnitude) {
         const uint32_t opts =
           (flags & ~(HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT)) |
           ((nq - 1u) << HEXKL_MOE_DMA_Q_SHIFT);
-        for (uint32_t mode = 0; mode < 3; ++mode) {
+        for (uint32_t mode = 0; mode < 4; ++mode) {
           for (uint32_t h = 0; h < 2u * E; ++h) {
-            const int native = mode == 1u || (mode == 2u && h % E % 2u == 0u);
+            /** Exercise either first expert in a mixed call: the shared
+             * dense LUT must be ready before QS2 overwrites its AH buffer. */
+            const int native = mode == 1u || (mode == 2u && h % E % 2u == 0u) ||
+                               (mode == 3u && h % E % 2u == 1u);
             g_tbl.slots[h].wh_bytes = native ? tl2[h] : qs2[h];
             g_tbl.slots[h].tl2_bytes = native ? tl2[h] : NULL;
           }

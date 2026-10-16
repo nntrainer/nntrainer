@@ -30,6 +30,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
+  "$HERE/expert_read_pool_check.cpp" -o "$OUT/expert_read_pool_check"
+"$OUT/expert_read_pool_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
+  "$HERE/token_completion_check.cpp" -o "$OUT/token_completion_check"
+"$OUT/token_completion_check"
 "$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
   "$HERE/tl2_lut_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_lut_check"
@@ -71,9 +77,11 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 # defaults, instead of this loop compiling one configuration at a time;
 # since #117 that matrix twice, with the arena read and with the VTCM
 # feed, whose push/wait schedule the check's scoreboard holds
-# (M1 GEMV VTCM FEED SCHEDULE OK).
+# (M1 GEMV VTCM FEED SCHEDULE OK). Exercise the v81 four-column FC
+# kernel and aligned DMA blocks against the same references and fallbacks.
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
-  -DMOE_TAIL_MAX_ROWS=16u \
+  -DMOE_TAIL_MAX_ROWS=16u -DHVX_FC_M1_COLS=4 \
+  -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
@@ -98,6 +106,8 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 "$OUT/tl2_prefill_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -ffunction-sections -fdata-sections -DMOE_TAIL_MAX_ROWS=16u \
+  -DHVX_FC_M1_COLS=4 \
+  -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/wh_affine_host_check" \
   "$HERE/wh_affine_host_check.c" "$HERE/standin/hvx_scalar.c" \
@@ -286,6 +296,21 @@ if [ -f "$LIBNATIVE/lib/libnative.a" ]; then
   }
   gemv_native "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" "$OUT/gemv_native_check"
   "$OUT/gemv_native_check"
+  # Native TL2 consumes dense u8 instead of the former repeated AH row.
+  # Check the production HVX quantizers, including rounding ties and tails.
+  for k in hvx_quant_u8 hvx_rmsnorm_rows_f32; do
+    "$cc" -std=gnu11 -O1 -fno-strict-aliasing -ffp-contract=off \
+      -DHVX_UVector=HEXAGON_Vect1024 -include malloc.h \
+      -I "$LIBNATIVE/include" -I "$HERE/stub" -I "$BACKEND/hvx" \
+      -c "$BACKEND/hvx/$k.c" -o "$OUT/native_$k.o"
+  done
+  "$cc" -std=gnu11 -O1 -Wall -Wextra -Werror -I "$BACKEND/hvx" \
+    -c "$HERE/tl2_quant_native_check.c" -o "$OUT/tl2_quant_native_check.o"
+  g++ -pthread -o "$OUT/tl2_quant_native_check" \
+    "$OUT/tl2_quant_native_check.o" "$OUT/native_hvx_quant_u8.o" \
+    "$OUT/native_hvx_rmsnorm_rows_f32.o" "$OUT/native_hvx_worker_pool.o" \
+    "$LIBNATIVE/lib/libnative.a" -lm
+  "$OUT/tl2_quant_native_check"
   # One mutant per loop: the one-row loop's final shift (caught only on
   # the lone rows m = 1, 5, 9, 13, which is how this shows that loop runs)
   # and the four-row loop's. Sending m = 1 to the four-row loop is not a
@@ -323,8 +348,10 @@ fi
 # Since #132 Part B also the Q4M1 kinds (FC, DENSE_FFN, LM_HEAD) on the
 # REAL hvx_q4_gemv_f32.c against the CPU-order specs, then four mutants
 # of hexkl_graph.c's Q4M1 kernels, each of which must fail the check.
-graph_check() { # graph_check <hexkl_graph.c> <exe> [hvx_m1_ops_f32.c]
+graph_check() { # graph_check <graph.c> <exe> [m1_ops.c] [profile_on_demand]
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -DNNTR_ROUTER_BF16_IF_EXACT=1 \
+    -DNNTR_GRAPH_PROFILE_ON_DEMAND="${4:-1}" \
     -Wno-format-truncation -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
@@ -336,9 +363,12 @@ graph_check() { # graph_check <hexkl_graph.c> <exe> [hvx_m1_ops_f32.c]
 }
 graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 "$OUT/graph_host_check"
+graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_always_profile_host_check" \
+  "$BACKEND/hvx/hvx_m1_ops_f32.c" 0
+"$OUT/graph_always_profile_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
 # FFN input's quantization; the argmax over the first slice only; [plan 201
-# S1] the miss round's experts before the first miss dropped, [#267 L3] its
+# S1] the miss round's resident expert batch dropped, [#267 L3] its
 # later rows taken from the wrong set (present vs arrived), its sets run
 # without ROWS_OUT (accumulated into one row); [plan 201 S4] the softmax router run as the
 # sigmoid one, an RMSNORM's N1 bit ignored, and an ATTN_M1's scale (Gemma's
@@ -347,7 +377,7 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
   's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
-  's/  if (first != 0u) {/  if (0) {/' \
+  's/rc = graph_moe_rows(g, env, op, h, p_ids, p_w, n_p, in, p_rows);/rc = graph_moe_rows(g, env, op, h, p_ids, p_w, 0u, in, p_rows);/' \
   's/                           was_miss\[i\] ? a_rows/                           !was_miss[i] ? a_rows/' \
   's/    graph_moe_run(g, env, op, h, ids, w, n, HEXKL_MOE_FLAG_ROWS_OUT, in, rows);/    graph_moe_run(g, env, op, h, ids, w, n, 0u, in, rows);/' \
   's/  if (op->eps_bits != 0u) {/  if (0) {/' \
@@ -460,6 +490,20 @@ done
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+# Lossless BF16 router storage and the original FP32 fallback: real source
+# on hvx_emu's host lane arithmetic and pthread worker stubs, not Qualcomm
+# libnative or device validation. Compare logits, selected IDs and weights
+# against the old kernel and scalar spec, including odd K and padding;
+# inexact/nonfinite weights check the lossless FP32 storage fallback.
+for bf16 in 0 1; do
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -Wno-format-truncation -pthread -include malloc.h \
+    -DNNTR_ROUTER_BF16_IF_EXACT="$bf16" \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -o "$OUT/router_owned_host_check_$bf16" "$HERE/router_owned_host_check.c" \
+    "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$OUT/router_owned_host_check_$bf16"
+done
 # [plan 201 S4] The softmax router's renormalisation skipped in the spec
 # (weight = p * per-expert scale): the kernel calls the same pick, so only
 # the check against #4296's formula in double can see it -- it must.
@@ -653,6 +697,23 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
   "$BACKEND/hvx/hvx_worker_pool.c" -lm
 
 "$OUT/attn_m1_host_check"
+# The host default leaves the architecture-specific options off. Exercise
+# the v81 defaults explicitly on hvx_emu as well; this is host lane
+# emulation, not libnative or hardware validation. HEAD_PREP must be on for
+# HEAD_PIPELINE to run. check_gemma_q8 covers both Gemma shapes, partial
+# tiles, the sliding-window boundary and L=2176 at 0, 3 and 7 workers,
+# comparing output, max/sum statistics and output canaries with the spec.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -pthread -include malloc.h \
+  -DNNTR_ATTN_Q8_HEAD_PREP=1 -DNNTR_ATTN_Q8_HEAD_PIPELINE=1 \
+  -DNNTR_ATTN_Q8_QK_PAIR=1 -DNNTR_ATTN_Q8_GQA8_REUSE=1 \
+  -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/attn_m1_v81_host_check" \
+  "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
+  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+
+"$OUT/attn_m1_v81_host_check"
 # [plan 201 S4] Two mutants of the kernel at Gemma 4's shapes, each of which
 # must fail it: the sliding window one position short (lo of L + 1), and V
 # taken from the k row -- attention_k_eq_v shares the projection only, the

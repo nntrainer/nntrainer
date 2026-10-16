@@ -1004,9 +1004,14 @@ static void check_limits(void) {
         routing.n_experts = 128u;
         rc |= (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing,
                                             act, 64u, out, 64u, &resume);
+#if !defined(NNTR_MOE_MERGE_HITS) || NNTR_MOE_MERGE_HITS
+        want_calls = fls[f] != 0u ? (uint32_t)(n_miss < 8u) + (n_miss != 0u)
+                                  : (first != 0u) + n_p + n_a;
+#else
         want_calls = fls[f] != 0u
                        ? (uint32_t)(first != 0u) + (n_p != 0u) + (n_a != 0u)
                        : (first != 0u) + n_p + n_a;
+#endif
         CHECK(rc == 0u && memcmp(out, one, sizeof(out)) == 0 &&
                 memcmp(out, ref, sizeof(out)) == 0 && g_owner.posts == 1u &&
                 g_owner.waits == 1u && g_owner.n_miss == n_miss,
@@ -1034,7 +1039,7 @@ static void check_limits(void) {
     printf("GRAPH MISS BATCH OK: misses at {1,3,5} {0} {2,5} {7} {all} x "
            "(ROWS_OUT taken | refused -> one call each): %u cells "
            "bit-identical to the one-at-a-time form and the loaded table, "
-           "<= 3 kernel calls a layer\n",
+           "batched resident and arrived experts\n",
            n_ok);
     env.miss.post = NULL;
     env.miss.wait = NULL;
@@ -2769,14 +2774,41 @@ static void check_gemma(void) {
     }
   }
   fill(rw, GM_HID * GM_E, &seed);
+  for (i = 0; i < GM_HID * GM_E; ++i) {
+    uint32_t bits;
+    memcpy(&bits, rw + i, sizeof(bits));
+    bits &= 0xFFFF0000u;
+    memcpy(rw + i, &bits, sizeof(bits));
+  }
   fill(rsc, GM_HID, &seed);
   m1_router_input_scale_det(rsc, GM_HID, rbias);
   fill(rbias + GM_HID, GM_E, &seed);
+  {
+    uint32_t bits;
+    memcpy(&bits, rw, sizeof(bits));
+    ++bits;
+    memcpy(rw, &bits, sizeof(bits));
+    rc = (uint32_t)hexkl_graph_set_param(g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_W,
+                                         rw, GM_HID * GM_E);
+    CHECK(rc == 0u && !((hvx_router_sm_weights *)g->param[GM_ROUTER])->bf16,
+          "Gemma inexact router retains FP32");
+    float *old = g->param[GM_ROUTER];
+    rc = (uint32_t)hexkl_graph_set_param(g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_W,
+                                         rw, GM_HID * GM_E - 1u);
+    CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT && old == g->param[GM_ROUTER],
+          "Gemma bad router length keeps owned buffer");
+    --bits;
+    memcpy(rw, &bits, sizeof(bits));
+  }
   rc = (uint32_t)hexkl_graph_set_param(g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_W,
                                        rw, GM_HID * GM_E);
   rc |= (uint32_t)hexkl_graph_set_param(
     g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, GM_HID + GM_E);
   CHECK(rc == 0u, "Gemma router params");
+#if defined(NNTR_ROUTER_BF16_IF_EXACT) && NNTR_ROUTER_BF16_IF_EXACT
+  CHECK(((hvx_router_sm_weights *)g->param[GM_ROUTER])->bf16,
+        "Gemma exact router replaces FP32 with BF16");
+#endif
   env.moe_flags = HEXKL_MOE_FLAG_GELU_TANH;
   fill(x, GM_HID, &seed);
   memset(&g_last, 0, sizeof(g_last));
@@ -3007,6 +3039,63 @@ static void check_norm_scale_reuse(void) {
          "in-place partial writes and resumed forwards checked\n");
 }
 
+/** @brief Token profiling may be disabled without stale counters or changed
+ *  outputs. Regular/debug forwards always retain their counters.
+ */
+static void check_profile_on_demand(void) {
+  uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                 HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t n = build(words, sizeof(words) / sizeof(words[0]), &kHd64, "C",
+                           HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM));
+  const uint32_t op = nth_op(words, HTP_OP_RMSNORM, 0u);
+  hexkl_graph *g = NULL;
+  uint32_t rc = hexkl_graph_init(words, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "profile graph init");
+  if (!g)
+    return;
+  float gamma[HID], input[HID], output[HID], expected[HID];
+  uint32_t seed = 0x50524f46u, resume;
+  fill(gamma, HID, &seed);
+  fill(input, HID, &seed);
+  rc = hexkl_graph_set_param(g, op, HTP_GRAPH_PARAM_GAMMA, gamma, HID);
+  CHECK(rc == 0u, "profile graph gamma");
+  m1_rmsnorm_det(input, gamma, expected, HID, HID, kHd64.eps, NULL);
+  hexkl_graph_env env = {0};
+  for (uint32_t token = 0u; token < 2u; ++token) {
+    env.miss.post = token ? fake_post : NULL;
+    for (uint32_t step = 0u; step < 4u; ++step) {
+      g->attn_prof_on = 1u - step % 2u;
+      memset(g->op_pcycles, 0x5a, sizeof(g->op_pcycles));
+      memset(g->op_qt, 0x5a, sizeof(g->op_qt));
+      rc = hexkl_graph_forward(g, &env, op, 1u, 0u, NULL, input, HID, output,
+                               HID, &resume);
+      int timed = 1;
+#if !defined(NNTR_GRAPH_PROFILE_ON_DEMAND) || NNTR_GRAPH_PROFILE_ON_DEMAND
+      timed = !token || g->attn_prof_on != 0u;
+#endif
+      CHECK(rc == 0u && resume == op + 1u &&
+              memcmp(output, expected, sizeof(output)) == 0,
+            "profile graph output token %u step %u", token, step);
+      for (uint32_t j = 0u; j < HTP_GRAPH_MAX_OPS; ++j) {
+        CHECK((g->op_pcycles[j] != 0u) == (timed && j == op) &&
+                (g->op_qt[j] != 0u) == (timed && j == op),
+              "profile counters token %u step %u op %u", token, step, j);
+      }
+    }
+  }
+  memset(g->op_pcycles, 0x5a, sizeof(g->op_pcycles));
+  memset(g->op_qt, 0x5a, sizeof(g->op_qt));
+  rc = hexkl_graph_forward(g, &env, op, 1u, 0u, NULL, input, HID - 1u, output,
+                           HID, &resume);
+  CHECK(rc == AEE_EINVALIDFORMAT, "profile graph rejects bad input");
+  for (uint32_t j = 0u; j < HTP_GRAPH_MAX_OPS; ++j)
+    CHECK(g->op_pcycles[j] == 0u && g->op_qt[j] == 0u,
+          "failed profile graph clears op %u", j);
+  hexkl_graph_free(g);
+  printf("GRAPH PROFILE: token on/off, regular forward, stale counters and "
+         "failure checked\n");
+}
+
 static void check_wh_lm_head(void) {
   static uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                         HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
@@ -3071,6 +3160,7 @@ int main(void) {
   check_gemma();
   check_gemma26_list();
   check_norm_scale_reuse();
+  check_profile_on_demand();
   check_wh_lm_head();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);

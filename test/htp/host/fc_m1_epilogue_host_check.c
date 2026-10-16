@@ -4,7 +4,7 @@
  *
  * @file   fc_m1_epilogue_host_check.c
  * @date   12 Oct 2026
- * @brief  Decode FC packing and three-column epilogue parity on real HVX
+ * @brief  Decode M=1 packing and three/four-column epilogue parity on real HVX
  *         sources with host instruction emulation
  * @author NNTrainer contributors
  * @bug    No known bugs
@@ -21,7 +21,7 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 
-enum { GUARD = 128, DQ_N = 96 };
+enum { GUARD = 128, DQ_N = 128 };
 static uint32_t rng = 17u;
 static unsigned failures;
 
@@ -54,7 +54,7 @@ static void check_pack(uint32_t k, uint32_t mode, uint32_t offset) {
   const size_t bytes = GUARD + offset + span + GUARD;
   uint8_t *got = alloc_bytes(bytes), *old = alloc_bytes(bytes);
   uint8_t *spec = alloc_bytes(bytes);
-  float *storage = alloc_bytes(((size_t)k + 64u) * sizeof(float));
+  float *storage = alloc_bytes((4u * (size_t)k + 64u) * sizeof(float));
   float *x = storage + offset / sizeof(float);
   float scale[4] = {1.f, 1.f, 1.f, 1.f};
   int32_t zp[4] = {0, 0, 0, 0};
@@ -107,6 +107,19 @@ static void check_pack(uint32_t k, uint32_t mode, uint32_t offset) {
   check_equal(got, old, bytes, "pack vs four-row HVX", k, mode, offset);
   check_equal(got, spec, bytes, "pack bytes, padding and guards", k, mode,
               offset);
+  /** The dense FFN's former pack zeroed three padded float rows. Its live
+   * row must also equal the repeat pack; padded rows are never consumed. */
+  memset(x + k, 0, (size_t)3u * k * sizeof(float));
+  for (uint32_t r = 1u; r < 4u; ++r) {
+    scale[r] = 1.f;
+    zp[r] = 0;
+  }
+  hvx_quant_pack_u8_ah_rows(x, NULL, 0u, 4u, k, scale, zp,
+                            old + GUARD + offset);
+  for (uint32_t kt = 0u; kt < k / 32u; ++kt)
+    check_equal(got + GUARD + offset + (size_t)kt * 2048u,
+                old + GUARD + offset + (size_t)kt * 2048u, 32u,
+                "live row vs zero-padded HVX", k, mode, offset);
   free(storage);
   free(spec);
   free(old);
@@ -124,8 +137,9 @@ static float dequant_spec(int32_t a, float scale, int32_t zp, int32_t cs,
   return weighted + bias;
 }
 
-static void check_dequant(uint32_t mode, uint32_t offset) {
-  const size_t bytes = GUARD + offset + DQ_N * sizeof(float) + GUARD;
+static void check_dequant(uint32_t mode, uint32_t offset, uint32_t tiles) {
+  const uint32_t n = tiles * 32u;
+  const size_t bytes = GUARD + offset + n * sizeof(float) + GUARD;
   uint8_t *got = alloc_bytes(bytes), *old = alloc_bytes(bytes);
   uint8_t *spec = alloc_bytes(bytes);
   int32_t acc_buf[DQ_N + 32], cs_buf[DQ_N + 32];
@@ -134,7 +148,7 @@ static void check_dequant(uint32_t mode, uint32_t offset) {
   float *ws = ws_buf + offset / 4u, *bias = bias_buf + offset / 4u;
   float as = mode == 3u ? FLT_MIN : mode == 4u ? 0.f : 0.013713f;
   int32_t az = mode == 0u ? 0 : mode == 1u ? 127 : 255;
-  for (uint32_t j = 0; j < DQ_N; ++j) {
+  for (uint32_t j = 0; j < n; ++j) {
     acc[j] = (int32_t)(next_u32() % 33423361u) - 16711680;
     cs[j] = (int32_t)(next_u32() % 131073u) - 65536;
     ws[j] = (float)((int32_t)(next_u32() % 8193u) - 4096) / 7919.f;
@@ -160,17 +174,19 @@ static void check_dequant(uint32_t mode, uint32_t offset) {
   float *gout = (float *)(got + GUARD + offset);
   float *oout = (float *)(old + GUARD + offset);
   float *sout = (float *)(spec + GUARD + offset);
-  hvx_dequant_acc_3tiles_m1_f32(acc, as, az, cs, ws, bias, gout);
-  for (uint32_t j = 0; j < 3u; ++j)
+  if (tiles == 3u)
+    hvx_dequant_acc_3tiles_m1_f32(acc, as, az, cs, ws, bias, gout);
+  else
+    hvx_dequant_acc_4tiles_m1_f32(acc, as, az, cs, ws, bias, gout);
+  for (uint32_t j = 0; j < tiles; ++j)
     hvx_dequant_acc_tile_to_f32(acc + j * 32u, 32u, 1u, &as, &az, cs + j * 32u,
                                 ws + j * 32u, bias + j * 32u, oout + j * 32u,
                                 DQ_N, 0);
-  for (uint32_t j = 0; j < DQ_N; ++j)
+  for (uint32_t j = 0; j < n; ++j)
     sout[j] = dequant_spec(acc[j], as, az, cs[j], ws[j], bias[j]);
-  check_equal(got, old, bytes, "dequant vs three HVX calls", DQ_N, mode,
+  check_equal(got, old, bytes, "dequant vs separate HVX calls", n, mode,
               offset);
-  check_equal(got, spec, bytes, "dequant values and guards", DQ_N, mode,
-              offset);
+  check_equal(got, spec, bytes, "dequant values and guards", n, mode, offset);
   free(spec);
   free(old);
   free(got);
@@ -191,8 +207,9 @@ int main(void) {
       }
     }
     for (uint32_t mode = 0; mode < 6u; ++mode) {
-      check_dequant(mode, offsets[oi]);
-      ++epilogues;
+      check_dequant(mode, offsets[oi], 3u);
+      check_dequant(mode, offsets[oi], 4u);
+      epilogues += 2u;
     }
   }
   printf("FC M1 EPILOGUE: pack_cases=%u dequant_cases=%u failures=%u\n", packs,

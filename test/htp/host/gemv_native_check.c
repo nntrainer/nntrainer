@@ -120,12 +120,12 @@ static uint32_t run_i2_case(int f, const uint8_t *act, const uint8_t *wh2,
   return bad;
 }
 
-/** The FC-only aligned entries, including Gemma's K=2816/8192 and the
-   one/two-column tails around a group of three output tiles. */
+/** The FC-only aligned entries, including Gemma's K=2816/8192 and
+   tails around groups of three/four adjacent output tiles. */
 static uint32_t check_fc_aligned(void) {
   static const uint32_t kts[] = {1u, 22u, 88u, 256u};
   static const uint32_t nts[] = {0u, 1u, 4u};
-  const uint32_t n_col = 7u;
+  const uint32_t n_col = 8u;
   const size_t act_bytes = 256u * 2048u;
   const size_t wh_bytes = 256u * n_col * 512u;
   uint8_t *act = malloc(act_bytes);
@@ -144,15 +144,18 @@ static uint32_t check_fc_aligned(void) {
       wh[i] = data ? 0x88u : rnd8();
     for (uint32_t a = 0; a < sizeof kts / sizeof kts[0]; ++a)
       for (uint32_t t = 0; t < sizeof nts / sizeof nts[0]; ++t)
-        for (uint32_t cols = 1u; cols <= 3u; cols += 2u) {
-          int32_t out[5u * 32u] __attribute__((aligned(128)));
-          for (uint32_t i = 0; i < 5u * 32u; ++i)
+        for (uint32_t cols = 1u; cols <= 4u; cols += cols == 1u ? 2u : 1u) {
+          int32_t out[6u * 32u] __attribute__((aligned(128)));
+          for (uint32_t i = 0; i < 6u * 32u; ++i)
             out[i] = GUARD;
           if (cols == 1u)
             hvx_gemv_u8i4_wh_col_aligned_nopf(act, kts[a], wh, n_col, nts[t],
                                               out + 32u);
-          else
+          else if (cols == 3u)
             hvx_gemv_u8i4_wh_3col_nopf(act, kts[a], wh, 512u, n_col, nts[t],
+                                       out + 32u);
+          else
+            hvx_gemv_u8i4_wh_4col_nopf(act, kts[a], wh, 512u, n_col, nts[t],
                                        out + 32u);
           for (uint32_t j = 0; j < cols; ++j)
             for (uint32_t c = 0; c < 32u; ++c) {
@@ -166,7 +169,7 @@ static uint32_t check_fc_aligned(void) {
             }
           for (uint32_t i = 0; i < 32u; ++i)
             bad += out[i] != GUARD;
-          for (uint32_t i = (cols + 1u) * 32u; i < 5u * 32u; ++i)
+          for (uint32_t i = (cols + 1u) * 32u; i < 6u * 32u; ++i)
             bad += out[i] != GUARD;
           ++cases;
         }
