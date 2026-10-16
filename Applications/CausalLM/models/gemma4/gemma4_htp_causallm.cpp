@@ -217,6 +217,10 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
     MOE_INTERMEDIATE_SIZE = cfg.at("moe_intermediate_size").get<unsigned int>();
     // Same keys and defaults as Lfm2MoeCausalLM::setupParameters.
     MOE_LAYER_DTYPE = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
+    if (nntr_cfg.contains("moe_layer_dtype_per_layer"))
+      for (const auto &[layer, dtype] :
+           nntr_cfg.at("moe_layer_dtype_per_layer").items())
+        MOE_LAYER_DTYPE_PER_LAYER[std::stoi(layer)] = dtype.get<std::string>();
     MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
     MOE_HTP_LAYERS =
       parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
@@ -656,7 +660,7 @@ Tensor Gemma4HtpTransformer::createMoe(const int layer_id, Tensor input,
     withKey("out_norm", "true"),
     withKey("out_add", dense_out ? "true" : "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("weight_dtype", MOE_LAYER_DTYPE),
+    withKey("weight_dtype", moeLayerDtype(layer_id)),
     withKey("engine", engine)};
   if (MOE_CACHE_EXPERTS != 0)
     props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
