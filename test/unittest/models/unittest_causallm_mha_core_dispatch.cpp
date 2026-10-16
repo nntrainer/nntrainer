@@ -28,11 +28,14 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <context_data.h>
 #include <cpu_ops_table.h>
+#include <dense_ffn_layer.h>
 #include <htp_mha_core.h>
+#include <htp_qkv_layer.h>
 #include <layer_context.h>
 #include <var_grad.h>
 #include <weight.h>
@@ -567,4 +570,103 @@ TEST(HtpMhaCoreDispatch, DeclinedQuantizedCallReleasesAndStaysOnCpu) {
   // One attempt, then the handle is released and the layer never asks again.
   EXPECT_EQ(ops.q_calls.size(), 1u);
   EXPECT_EQ(ops.releases, 1u);
+}
+
+namespace {
+/** Exercise an HTP-marked layer with FP32 weights, forcing CPU fallback. */
+template <typename Layer>
+std::vector<std::vector<float>>
+runFallbackScratch(const std::vector<std::string> &properties, unsigned outputs,
+                   ml::train::LayerComputeEngine engine, unsigned from,
+                   unsigned to) {
+  Layer layer;
+  layer.setProperty(properties);
+  const nntrainer::TensorDim::TensorType f32(
+    ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP32);
+  InitLayerContext ic({nntrainer::TensorDim({1, 1, 8, 64}, f32)},
+                      std::vector<bool>(outputs, true), false, "scratch", "",
+                      0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+                      ml::train::ExecutionMode::INFERENCE, engine);
+  layer.finalize(ic);
+  if (engine == ml::train::HTP)
+    EXPECT_TRUE(ic.getTensorsSpec().empty());
+  else
+    EXPECT_FALSE(ic.getTensorsSpec().empty());
+
+  std::vector<Weight> weights;
+  std::vector<Var_Grad> ins, outs, tensors;
+  uint32_t state = 761;
+  for (auto spec : ic.getWeightsSpec()) {
+    std::get<2>(spec) = nntrainer::Initializer::ZEROS;
+    weights.emplace_back(spec, true);
+    auto &w = weights.back().getVariableRef();
+    for (size_t i = 0; i < w.size(); ++i)
+      w.getData<float>()[i] = uni(state, .2f);
+  }
+  for (const auto &dim : ic.getInputDimensions())
+    ins.emplace_back(dim, nntrainer::Initializer::NONE, false, true, "in");
+  for (const auto &spec : ic.getOutSpecs())
+    outs.emplace_back(spec.variable_spec.dim, nntrainer::Initializer::NONE,
+                      false, true, "out");
+  for (const auto &spec : ic.getTensorsSpec())
+    tensors.emplace_back(spec, true);
+  auto &input = ins[0].getVariableRef();
+  for (size_t i = 0; i < input.size(); ++i)
+    input.getData<float>()[i] = uni(state, 1.0f);
+  auto view = [](auto &v) {
+    std::vector<std::remove_reference_t<decltype(v[0])> *> result;
+    for (auto &x : v)
+      result.push_back(&x);
+    return result;
+  };
+  RunLayerContext rc("scratch", false, 0.0f, false, 1.0f, nullptr, false,
+                     view(weights), view(ins), view(outs), view(tensors));
+  layer.incremental_forwarding(rc, from, to, false);
+  std::vector<std::vector<float>> result;
+  for (unsigned i = 0; i < outputs; ++i) {
+    const auto &out = rc.getOutput(i);
+    result.emplace_back(out.getData<float>(),
+                        out.getData<float>() + (to - from) * out.width());
+  }
+  return result;
+}
+} // namespace
+
+TEST(CausalLMFallbackScratch, qkv_prefill_and_decode) {
+  for (bool share_k : {false, true}) {
+    std::vector<std::string> properties{"q_unit=128",
+                                        "k_unit=64",
+                                        "v_unit=64",
+                                        "feature_size=64",
+                                        "in_norm=true",
+                                        "v_norm=true",
+                                        "rope=true",
+                                        "max_timestep=16",
+                                        "epsilon=0.00001",
+                                        "q_scale=8",
+                                        std::string("v_from_k=") +
+                                          (share_k ? "true" : "false")};
+    for (auto bounds : {std::pair<unsigned, unsigned>{0, 7}, {7, 8}}) {
+      auto reference = runFallbackScratch<causallm::HtpQKVLayer>(
+        properties, 3, ml::train::CPU, bounds.first, bounds.second);
+      auto lazy = runFallbackScratch<causallm::HtpQKVLayer>(
+        properties, 3, ml::train::HTP, bounds.first, bounds.second);
+      EXPECT_EQ(reference, lazy);
+    }
+  }
+}
+
+TEST(CausalLMFallbackScratch, dense_ffn_prefill_and_decode) {
+  for (const char *activation : {"swish", "tanh_gelu"}) {
+    const std::vector<std::string> properties{
+      "unit=128", "in_norm=true", "out_norm=true", "epsilon=0.00001",
+      std::string("glu_activation=") + activation};
+    for (auto bounds : {std::pair<unsigned, unsigned>{0, 7}, {7, 8}}) {
+      auto reference = runFallbackScratch<causallm::DenseFfnLayer>(
+        properties, 1, ml::train::CPU, bounds.first, bounds.second);
+      auto lazy = runFallbackScratch<causallm::DenseFfnLayer>(
+        properties, 1, ml::train::HTP, bounds.first, bounds.second);
+      EXPECT_EQ(reference, lazy);
+    }
+  }
 }

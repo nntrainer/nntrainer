@@ -120,6 +120,14 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   if (out_norm)
     weight_idx[OUT_GAMMA] = request_gamma("out_norm_gamma");
 
+  // A fused HTP call owns its intermediates. Keep CPU fallback storage out
+  // of the persistent activation pool and allocate it only if needed below.
+  lazy_scratch =
+    context.getComputeEngineType() == ml::train::HTP &&
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE;
+  if (lazy_scratch)
+    return;
+
   // The CPU path's intermediates, sized for the graph's input length and
   // sliced per step below; the fused call never touches them.
   nntrainer::TensorDim mid(in_dim.batch(), 1, in_dim.height(), inter, act_type);
@@ -223,14 +231,22 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     return;
   }
 
+  auto scratch = [&](unsigned int index, const nntrainer::TensorDim &dim) {
+    return lazy_scratch
+             ? nntrainer::Tensor(dim, true)
+             : context.getTensor(index).getSharedDataTensor(dim, 0, true);
+  };
+  nntrainer::Tensor norm_scratch;
+  if (in_norm || out_norm)
+    norm_scratch = scratch(tensor_idx[NORMED], out_step_dim);
+
   // The CPU's norms: the kernel is not in place, so they go through the
   // scratch (and the output norm copies back).
   auto norm_rows = [&](nntrainer::Tensor &src, unsigned int gamma_idx) {
     NNTR_THROW_IF(src.getDataType() != ml::train::TensorDim::DataType::FP32,
                   std::invalid_argument)
       << "dense_ffn: in_norm / out_norm are FP32 only";
-    nntrainer::Tensor normed = context.getTensor(tensor_idx[NORMED])
-                                 .getSharedDataTensor(out_step_dim, 0, true);
+    nntrainer::Tensor normed = norm_scratch;
     nntrainer::rms_norm_wrt_width_fp32_intrinsic(
       src.getData<float>(), normed.getData<float>(), rows, N, epsilon);
     normed.multiply_i(context.getWeight(gamma_idx));
@@ -243,16 +259,11 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // silu(gate) * up (swiglu_det: the bit-identical NEON/scalar form the
   // MoE layer's CPU path uses) -- or gelu_tanh(gate) * up through the same
   // deterministic form the MoE layer's GeGLU experts use -- then down.
-  nntrainer::TensorDim mid_step_dim =
-    context.getTensor(tensor_idx[UP_OUT]).getDim();
-  mid_step_dim.batch(1);
-  mid_step_dim.height(rows);
-  nntrainer::Tensor up_out = context.getTensor(tensor_idx[UP_OUT])
-                               .getSharedDataTensor(mid_step_dim, 0, true);
-  nntrainer::Tensor gate_out = context.getTensor(tensor_idx[GATE_OUT])
-                                 .getSharedDataTensor(mid_step_dim, 0, true);
-  nntrainer::Tensor act = context.getTensor(tensor_idx[ACT])
-                            .getSharedDataTensor(mid_step_dim, 0, true);
+  nntrainer::TensorDim mid_step_dim = out_step_dim;
+  mid_step_dim.width(inter);
+  nntrainer::Tensor up_out = scratch(tensor_idx[UP_OUT], mid_step_dim);
+  nntrainer::Tensor gate_out = scratch(tensor_idx[GATE_OUT], mid_step_dim);
+  nntrainer::Tensor act = scratch(tensor_idx[ACT], mid_step_dim);
 
   in_step.dot(up_w, up_out, false, false);
   in_step.dot(gate_w, gate_out, false, false);
@@ -291,7 +302,7 @@ void DenseFfnLayer::updateTensorsByInputDimensions(
   output_dim.height(input_dimensions[0].height());
   context.updateInput(SINGLE_INOUT_IDX, input_dim);
   context.updateOutput(SINGLE_INOUT_IDX, output_dim);
-  if (in_norm || out_norm)
+  if (!lazy_scratch && (in_norm || out_norm))
     context.updateTensor(tensor_idx[NORMED], output_dim);
 }
 

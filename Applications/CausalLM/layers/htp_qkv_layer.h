@@ -218,8 +218,9 @@ private:
   std::array<unsigned int, 4>
     tensor_idx; /**< q, k (and v) before the norm; the normed input */
   bool in_norm = false;
-  bool norm_in_call = true; /**< props::NormInCall */
-  bool out_to_host = true;  /**< props::OutToHost */
+  bool lazy_scratch = false; /**< Allocate HTP fallback scratch only on use */
+  bool norm_in_call = true;  /**< props::NormInCall */
+  bool out_to_host = true;   /**< props::OutToHost */
   unsigned int feature_size = 0;
   bool v_norm = false;
   bool v_from_k = false;
