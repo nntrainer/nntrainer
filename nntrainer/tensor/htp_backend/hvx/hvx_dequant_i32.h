@@ -120,6 +120,29 @@ void hvx_dequant_acc_tiles_scatter_rows_f32(
   const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
   const float *weights, uint8_t *seen);
 
+/** @brief The scatter epilogue with int32 offset[n] * sums[m] fused before
+ * conversion to float. Offsets are relative to the first staged tile,
+ * while sums use the same row indices as act_zp. Input tiles stay read-only.
+ * NULL offset is equivalent to hvx_dequant_acc_tiles_scatter_rows_f32. */
+void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights, uint8_t *seen, const int32_t *offset,
+  const int32_t *sums);
+
+/** @brief Native signed24 planes directly to the scatter epilogue. Every
+ * ring tile contains low/middle/high byte planes of 2048 bytes each. The
+ * complete signed int32 is reconstructed before the original float math.
+ * Row layout is fixed at 64x32; there are no affine offsets. */
+void hvx_dequant_i24_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t m0, uint32_t m1, const float *act_scale, const int32_t *act_zp,
+  const int32_t *colsum_w, const float *w_scale, const float *bias, float *out,
+  uint32_t out_stride, const uint32_t *rows, const float *weights,
+  uint8_t *seen);
+
 /**
  * @brief Dequantizes a RUN of accumulator tiles in one pooled pass.
  *
@@ -198,6 +221,19 @@ typedef struct {
 
 void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *job);
 
+/**
+ * @brief Row-major dequant with an exact affine correction in registers.
+ *
+ * Adds offset[n] * sums[m] to the int32 accumulator before the existing
+ * float conversion and dequant operations. The staged tiles are read-only.
+ * Offsets use full output-column indices, and sums use this job's row
+ * indices. Offsets must be in [-15, 15], as checked at registration.
+ * NULL offset retains the ordinary row-major worker's behavior.
+ */
+void hvx_dq_tiles_rows_affine(uint32_t n_threads, uint32_t i,
+                              const hvx_dq_rows_job *job, const int32_t *offset,
+                              const int32_t *sums);
+
 /** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
  *         the submit: n_pairs. */
 typedef struct {
@@ -226,6 +262,20 @@ typedef struct {
 
 /** @brief hvx_worker_pool_func over an hvx_dq_swiglu_job. */
 void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/** @brief The gate/up epilogue with int32 affine correction before float
+ * conversion. Offsets index the full gate/up width, sums the job's rows.
+ * NULL offset retains hvx_dq_swiglu_worker's behavior. The input tiles stay
+ * read-only, and each row's floating-point operation order is unchanged. */
+void hvx_dq_swiglu_affine(uint32_t n_threads, uint32_t i,
+                          const hvx_dq_swiglu_job *job, const int32_t *offset,
+                          const int32_t *sums);
+
+/** @brief Native signed24 planes to the gate/up epilogue. Each tile holds
+ * three 2048-byte planes, while tile_stride still names its full ring slot.
+ * Reconstructs signed int32 before the original float math. */
+void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
+                       const hvx_dq_swiglu_job *job);
 
 /**
  * @brief Dequantizes gate/up tile PAIRS and applies SwiGLU before anything

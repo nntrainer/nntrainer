@@ -695,6 +695,16 @@ static inline HVX_Vector Q6_Vw_vmpyie_VwVuh(HVX_Vector a, HVX_Vector b) {
   return r;
 }
 
+/* Vx.w[i] += Vu.w[i] * Vv.h[2i], signed even halfword, low 32 bits. */
+static inline HVX_Vector Q6_Vw_vmpyieacc_VwVwVh(HVX_Vector x, HVX_Vector a,
+                                                HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i)
+    r.w[i] = (int32_t)((uint32_t)x.w[i] +
+                       (uint32_t)((int64_t)a.w[i] * (int16_t)b.w[i]));
+  return r;
+}
+
 /** Vdd.w = vunpack(Vu.h): sign-extended, in order -- lo gets halfwords
    0..31, hi 32..63 (the prototype's d layout matched the v79 ISS so). */
 static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {

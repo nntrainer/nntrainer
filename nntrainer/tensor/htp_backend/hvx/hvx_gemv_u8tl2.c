@@ -57,37 +57,42 @@ static void digits(unsigned m, int *a, int *b, int *c) {
 }
 
 #if defined(__hexagon__)
-/** VLUT32 reads byte 2*m for magnitude m. Repeat each 32-byte lookup in
- * every lane group, as in hvx_expand_i2i4. Invalid magnitudes stay zero. */
-#define TL2_REPEAT4(...)                                                       \
-  { __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__ }
-static const int8_t tl2_expand_digits[3][128] __attribute__((aligned(128))) = {
-  TL2_REPEAT4(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-              1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
-  TL2_REPEAT4(0, 0, 0, 0, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0,
-              0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
-  TL2_REPEAT4(0, 0, 1, 1, -1, -1, 0, 0, 1, 1, -1, -1, 0, 0, 1, 1, -1, -1, 0, 0,
-              1, 1, -1, -1, 0, 0, 1, 1, 0, 0, 0, 0)};
-#undef TL2_REPEAT4
+/** VLUT32 reads byte 2*i for index i. The low four index bits hold the
+ * magnitude and bit four holds the sign, so the lookup produces the final
+ * signed int4 nibble directly. Invalid magnitudes remain zero. */
+#define TL2_DIGIT0(p, n)                                                       \
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p,   \
+    p, p, p, 0, 0, 0, 0
+#define TL2_DIGIT1(p, n)                                                       \
+  0, 0, 0, 0, p, p, p, p, p, p, n, n, n, n, n, n, 0, 0, 0, 0, 0, 0, p, p, p,   \
+    p, p, p, 0, 0, 0, 0
+#define TL2_DIGIT2(p, n)                                                       \
+  0, 0, p, p, n, n, 0, 0, p, p, n, n, 0, 0, p, p, n, n, 0, 0, p, p, n, n, 0,   \
+    0, p, p, 0, 0, 0, 0
+#define TL2_SIGNED_LUT(digit, p, n)                                            \
+  { digit(p, n), digit(n, p), digit(p, n), digit(n, p) }
+static const uint8_t tl2_expand_nibbles[2][3][128]
+  __attribute__((aligned(128))) = {
+    {TL2_SIGNED_LUT(TL2_DIGIT0, 1, 15), TL2_SIGNED_LUT(TL2_DIGIT1, 1, 15),
+     TL2_SIGNED_LUT(TL2_DIGIT2, 1, 15)},
+    {TL2_SIGNED_LUT(TL2_DIGIT0, 7, 9), TL2_SIGNED_LUT(TL2_DIGIT1, 7, 9),
+     TL2_SIGNED_LUT(TL2_DIGIT2, 7, 9)}};
+#undef TL2_SIGNED_LUT
+#undef TL2_DIGIT2
+#undef TL2_DIGIT1
+#undef TL2_DIGIT0
 
-static inline HVX_Vector tl2_expand_row(const uint8_t *src, uint32_t k,
-                                        int magnitude) {
+static inline HVX_Vector tl2_expand_index(const uint8_t *src, uint32_t k) {
   const uint32_t group = k % 24u / 3u;
   const uint8_t *block = src + k / 24u * 640u;
-  const HVX_Vector mask = Q6_V_vsplat_R(0x0f0f0f0f);
+  const HVX_Vector code_mask = Q6_V_vsplat_R(0x0f0f0f0f);
   HVX_Vector code = *(const HVX_UVector *)(block + group / 2u * 128u);
-  code = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(code, 4u * (group % 2u)), mask);
-  const HVX_Vector table = *(const HVX_Vector *)tl2_expand_digits[k % 3u];
-  HVX_Vector q = Q6_Vb_vlut32_VbVbI(code, table, 0);
+  if (group % 2u)
+    code = Q6_Vuh_vlsr_VuhR(code, 4);
+  code = Q6_V_vand_VV(code, code_mask);
   const HVX_Vector signs = *(const HVX_UVector *)(block + 512u);
-  q = Q6_V_vmux_QVV(Q6_Q_vand_VR(signs, 0x01010101u << group),
-                    Q6_Vb_vsub_VbVb(Q6_V_vzero(), q), q);
-  q = Q6_V_vand_VV(q, mask);
-  if (magnitude == 7)
-    /** q is a nibble: shifting by three cannot carry into the next byte.
-     * Modulo 16, 7*q also maps -1 (15) to -7 (9). */
-    q = Q6_V_vand_VV(Q6_Vb_vsub_VbVb(Q6_Vh_vasl_VhR(q, 3), q), mask);
-  return q;
+  return Q6_V_vandor_VQR(code, Q6_Q_vand_VR(signs, 0x01010101u << group),
+                         0x10101010);
 }
 #endif
 
@@ -95,6 +100,15 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
                          uint32_t row_stride, int magnitude, uint8_t *dst) {
 #if defined(__hexagon__)
   if (magnitude == 1 || magnitude == 7) {
+    const uint8_t(*table)[128] = tl2_expand_nibbles[magnitude == 7];
+    const HVX_Vector low[3] = {*(const HVX_Vector *)table[0],
+                               *(const HVX_Vector *)table[1],
+                               *(const HVX_Vector *)table[2]};
+    /** Shift the tables once and merge each high-nibble lookup with VLUT's
+     * OR accumulator, instead of shifting and ORing every decoded row. */
+    const HVX_Vector high[3] = {Q6_Vh_vasl_VhR(low[0], 4),
+                                Q6_Vh_vasl_VhR(low[1], 4),
+                                Q6_Vh_vasl_VhR(low[2], 4)};
     /** Constant row indices eliminate division and lookup-address work from
      * the inner loop, and keep the four transpose inputs in registers. */
 #pragma unroll(12)
@@ -104,9 +118,10 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
       HVX_Vector bytes[4];
 #pragma unroll(4)
       for (uint32_t r = 0; r < 4u; ++r) {
-        const HVX_Vector lo = tl2_expand_row(src, k + r, magnitude);
-        const HVX_Vector hi = tl2_expand_row(src, k + r + 4u, magnitude);
-        bytes[r] = Q6_V_vor_VV(lo, Q6_Vh_vasl_VhR(hi, 4));
+        const HVX_Vector lo = Q6_Vb_vlut32_VbVbI(tl2_expand_index(src, k + r),
+                                                 low[(k + r) % 3u], 0);
+        bytes[r] = Q6_Vb_vlut32or_VbVbVbI(lo, tl2_expand_index(src, k + r + 4u),
+                                          high[(k + r + 4u) % 3u], 0);
       }
       /** Native byte j = 4*c + tile. Exchange the two tile bits with
        * the row bits in the four registers, leaving c in place. Each
@@ -232,6 +247,37 @@ void hvx_tl2_prepare(const uint8_t *act, uint32_t K, uint32_t begin,
   const HVX_Vector y = *(const HVX_Vector *)tl2_digits[1];
   const HVX_Vector z = *(const HVX_Vector *)tl2_digits[2];
   const HVX_VectorPred lower = Q6_Q_vsetq_R(64);
+  /** VLUT32 broadcasts each activation into the required halfword lanes.
+   * Even index bytes select its low byte; odd indices start at 32, outside
+   * this lookup's range, and therefore produce zero high bytes. One bounded
+   * vector load supplies all four tables. Keep the scalar tail below when
+   * fewer than 128 source bytes remain, including partitioned calls. */
+  const uint32_t load_end = K < 128u ? 0u : (K - 128u) / 24u + 1u;
+  const uint32_t vector_end = end < load_end ? end : load_end;
+  if (begin < vector_end) {
+    const HVX_Vector idx0 = Q6_V_vmux_QVV(lower, Q6_V_vsplat_R(0x20002000),
+                                          Q6_V_vsplat_R(0x20032003));
+    const HVX_Vector idx1 = Q6_Vb_vadd_VbVb(idx0, Q6_V_vsplat_R(0x01010101));
+    const HVX_Vector idx2 = Q6_Vb_vadd_VbVb(idx0, Q6_V_vsplat_R(0x02020202));
+    do {
+      const HVX_Vector actv = Q6_V_lo_W(
+        Q6_Wuh_vunpack_Vub(*(const HVX_UVector *)(act + begin * 24u)));
+#pragma clang loop unroll(full)
+      for (uint32_t pair = 0; pair < 4u; ++pair) {
+        const HVX_Vector off = Q6_V_vsplat_R(0x06060606u * pair);
+        const HVX_Vector va =
+          Q6_Vb_vlut32_VbVbI(Q6_Vb_vadd_VbVb(idx0, off), actv, 0);
+        const HVX_Vector vb =
+          Q6_Vb_vlut32_VbVbI(Q6_Vb_vadd_VbVb(idx1, off), actv, 0);
+        const HVX_Vector vc =
+          Q6_Vb_vlut32_VbVbI(Q6_Vb_vadd_VbVb(idx2, off), actv, 0);
+        *(HVX_Vector *)(tables + ((size_t)begin * 4u + pair) * 64u) =
+          Q6_Vh_vmpyiacc_VhVhVh(
+            Q6_Vh_vmpyiacc_VhVhVh(Q6_Vh_vmpyi_VhVh(va, x), vb, y), vc, z);
+      }
+      ++begin;
+    } while (begin < vector_end);
+  }
 #endif
   for (uint32_t kb = begin; kb < end; ++kb)
     for (uint32_t pair = 0; pair < 4u; ++pair) {

@@ -40,6 +40,59 @@ static void *buffer(size_t bytes) {
   return p;
 }
 
+/** Check every LUT entry independently of GEMV, including unaligned inputs,
+ * the bounded vector-load transition, and disjoint worker partitions. */
+static void check_prepare(void) {
+  unsigned cases = 0;
+  for (uint32_t shape = 1; shape <= 148u; ++shape) {
+    const uint32_t K = shape <= 145u   ? shape
+                       : shape == 146u ? 704u
+                       : shape == 147u ? 2816u
+                                       : 8192u;
+    const uint32_t blocks = (K + 23u) / 24u;
+    const size_t bytes = hvx_tl2_table_bytes(K) + 256u;
+    uint8_t *source = buffer(K + 1u);
+    int16_t *got = buffer(bytes), *want = buffer(bytes);
+    for (uint32_t k = 0; k <= K; ++k)
+      source[k] = (uint8_t)(k * 37u + 19u);
+    for (uint32_t unaligned = 0; unaligned < 2u; ++unaligned)
+      for (uint32_t partition = 0; partition < 2u; ++partition) {
+        const uint32_t end = partition ? blocks - 1u : blocks;
+        const uint32_t begin = partition && end ? 1u : 0u;
+        const uint8_t *a = source + unaligned;
+        memset(got, 0xa5, bytes);
+        memset(want, 0xa5, bytes);
+        for (uint32_t kb = begin; kb < end; ++kb) {
+          int16_t *table = want + 64u + kb * 256u;
+          memset(table, 0, 512u);
+          for (uint32_t group = 0; group < 8u; ++group) {
+            const uint32_t k = kb * 24u + group * 3u;
+            const int a0 = k < K ? a[k] : 0;
+            const int a1 = k + 1u < K ? a[k + 1u] : 0;
+            const int a2 = k + 2u < K ? a[k + 2u] : 0;
+            for (int x = -1; x <= 1; ++x)
+              for (int y = -1; y <= 1; ++y)
+                for (int z = -1; z <= 1; ++z) {
+                  const int magnitude = 9 * x + 3 * y + z;
+                  if (magnitude < 0)
+                    continue;
+                  const uint32_t index = group * 32u + 2u * magnitude;
+                  table[index] = table[index + 1u] =
+                    (int16_t)(a0 * x + a1 * y + a2 * z);
+                }
+          }
+        }
+        hvx_tl2_prepare(a, K, begin, end, got + 64u);
+        assert(!memcmp(got, want, bytes));
+        ++cases;
+      }
+    free(source);
+    free(got);
+    free(want);
+  }
+  printf("TL2 prepare: %u exact LUT/partition/guard cases passed\n", cases);
+}
+
 #ifdef NNTR_TL2_DEVICE
 static void check_rpc_validation(void) {
   uint8_t a = 17, packed[640] = {0};
@@ -167,6 +220,7 @@ static void check(uint32_t K, uint32_t N, uint32_t pattern, uint32_t passes) {
 
 int main(int argc, char **argv) {
   const unsigned passes = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 20u;
+  check_prepare();
 #ifdef NNTR_TL2_DEVICE
   struct remote_rpc_control_unsigned_module u = {CDSP_DOMAIN_ID, 1};
   assert(remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &u,
