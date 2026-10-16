@@ -927,6 +927,17 @@ public:
   // Supplying a shape also allocates the slots, without reading weights or
   // registering experts. This keeps arena mapping out of the first prefill
   // even when the caller chooses a smaller load-time preload budget.
+  /** [PR 4428] The checkpoint's rotation signs: one +-1 per gate_up input
+   *  dimension and one per down input dimension, applied after the online
+   *  Hadamard (NNTR_MOE_HADAMARD) and before the quantization. The CPU
+   *  backend has no rotation: false. */
+  virtual bool set_moe_hadamard_signs(const std::vector<float> &in,
+                                      const std::vector<float> &down) {
+    (void)in;
+    (void)down;
+    return false;
+  }
+
   virtual void
   reserve_qs4cx_wh_expert_slots(size_t n,
                                 const ExpertFileDesc *shape = nullptr) {

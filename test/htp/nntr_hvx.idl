@@ -1456,4 +1456,13 @@ interface nntr_hvx : remote_handle64 {
    AEEResult weight_set_offsets_batch(in sequence<uint32> handles,
                                       in sequence<uint32> n_per,
                                       in sequence<float> offsets);
+
+   // [PR 4428] The checkpoint's rotation signs (hexkl_moe_set_hadamard_signs):
+   // s_in has one +-1 per gate_up input dimension (K), s_down one per down
+   // input dimension (inter); the kernel flips the sign of the rotated
+   // activation's element before it quantizes. Any other value is refused
+   // whole; two empty sequences clear them. Kept for the session. Appended
+   // last.
+   AEEResult moe_set_hadamard_signs(in sequence<float> s_in,
+                                    in sequence<float> s_down);
 };

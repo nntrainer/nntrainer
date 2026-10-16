@@ -666,6 +666,59 @@ int nntr_hvx_weight_swap_u8i4_arena(
                    h_gu, h_dn, 0);
 }
 
+/** [PR 4428] A +-1 sequence as the kernel's sign-bit masks, or NULL. */
+static uint32_t *had_sign_masks(const float *s, int n, int *ok) {
+  uint32_t *m = NULL;
+  int i;
+  if (n == 0) {
+    return NULL;
+  }
+  m = (uint32_t *)malloc((size_t)n * sizeof(uint32_t) + 128u);
+  if (!m) {
+    *ok = 0;
+    return NULL;
+  }
+  for (i = 0; i < n; ++i) {
+    if (s[i] != 1.0f && s[i] != -1.0f) {
+      free(m);
+      *ok = 0;
+      return NULL;
+    }
+    m[i] = s[i] < 0.0f ? 0x80000000u : 0u;
+  }
+  return m;
+}
+
+int nntr_hvx_moe_set_hadamard_signs(remote_handle64 handle, const float *s_in,
+                                    int s_inLen, const float *s_down,
+                                    int s_downLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint32_t *in, *down;
+  int ok = 1;
+  if (!s || s_inLen < 0 || s_downLen < 0 || (s_inLen % 32) != 0 ||
+      (s_downLen % 32) != 0 || (s_inLen > 0 && !s_in) ||
+      (s_downLen > 0 && !s_down)) {
+    return AEE_EBADPARM;
+  }
+  in = had_sign_masks(s_in, s_inLen, &ok);
+  down = ok ? had_sign_masks(s_down, s_downLen, &ok) : NULL;
+  if (!ok) {
+    free(in);
+    free(down);
+    return AEE_EBADPARM;
+  }
+  hexkl_moe_set_hadamard_signs(NULL, 0u, NULL, 0u);
+  free(s->had_sign_in);
+  free(s->had_sign_down);
+  s->had_sign_in = in;
+  s->had_sign_down = down;
+  s->had_sign_in_n = (uint32_t)s_inLen;
+  s->had_sign_down_n = (uint32_t)s_downLen;
+  hexkl_moe_set_hadamard_signs(in, (uint32_t)s_inLen, down,
+                               (uint32_t)s_downLen);
+  return AEE_SUCCESS;
+}
+
 /** [PR 4428] weight_set_offsets_batch: hexkl_weight_u8i4_set_offsets on
  *  each swapped-in affine expert handle; see the IDL. */
 int nntr_hvx_weight_set_offsets_batch(remote_handle64 handle,

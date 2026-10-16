@@ -245,6 +245,8 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
           std::pair{"moe_hadamard_scope", "NNTR_MOE_HADAMARD_SCOPE"}})
       if (nntr_cfg.contains(key))
         setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
+    MOE_HADAMARD_SIGNS_FILE =
+      nntr_cfg.value("moe_hadamard_signs", std::string());
   }
 
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));

@@ -124,6 +124,17 @@ typedef struct {
 /** @brief Releases the block. Safe on an empty scratch. */
 void hexkl_moe_scratch_free(hexkl_moe_scratch *s);
 
+/** [PR 4428] The checkpoint's rotation carries one sign per input
+ *  dimension after the Hadamard (its seed): x <- (x H) * s before the
+ *  gate_up quantization, a <- (a H) * s' before the down one. The masks
+ *  hold 0x80000000 where the sign is -1 and 0 where it is +1 (an xor of
+ *  the f32 sign bit, exact); n_in is the gate_up input width K, n_down the
+ *  down input width inter. The arrays stay the caller's until the next
+ *  call; NULL / 0 clears. The HMX fp16 rotation has no sign step, so a set
+ *  sign vector keeps the rotation on the HVX f32 path. */
+void hexkl_moe_set_hadamard_signs(const uint32_t *mask_in, uint32_t n_in,
+                                  const uint32_t *mask_down, uint32_t n_down);
+
 /** ---- Shared with hexkl_conv_block.c ------------------------------------
  *
  * The conv block kernel (doc 51 section 2) is this kernel's loop with a

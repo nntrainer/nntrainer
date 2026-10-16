@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 
@@ -116,6 +117,37 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
     throw std::logic_error(
       "Gemma4 HTP weight reload requires a new model handle");
   WEIGHT_DIR = std::filesystem::path(weight_path).parent_path().string();
+#ifdef ENABLE_HEXKL
+  // [PR 4428] The rotated checkpoint's signs (nntr_config moe_hadamard_signs,
+  // a JSON beside the model: "in" K and "down" inter values of +-1), to the
+  // HTP backend before the first MoE call.
+  if (MOE_ENGINE == "htp" && !MOE_HADAMARD_SIGNS_FILE.empty()) {
+    std::filesystem::path p(MOE_HADAMARD_SIGNS_FILE);
+    if (p.is_relative())
+      p = std::filesystem::path(WEIGHT_DIR) / p;
+    std::ifstream f(p);
+    if (!f)
+      throw std::runtime_error("[Gemma4MoE] moe_hadamard_signs: cannot open " +
+                               p.string());
+    const auto j = nlohmann::json::parse(f);
+    if (j.value("format", std::string()) != "nntr_hadamard_signs_v1" ||
+        !j.contains("in") || !j.contains("down"))
+      throw std::runtime_error(
+        "[Gemma4MoE] moe_hadamard_signs: not an nntr_hadamard_signs_v1 file "
+        "with \"in\" and \"down\": " +
+        p.string());
+    const auto in = j.at("in").get<std::vector<float>>();
+    const auto down = j.at("down").get<std::vector<float>>();
+    if (in.size() != DIM || down.size() != MOE_INTERMEDIATE_SIZE)
+      throw std::runtime_error(
+        "[Gemma4MoE] moe_hadamard_signs: " + std::to_string(in.size()) + " / " +
+        std::to_string(down.size()) + " signs for widths " +
+        std::to_string(DIM) + " / " + std::to_string(MOE_INTERMEDIATE_SIZE));
+    if (!nntrainer::get_htp_ops()->set_moe_hadamard_signs(in, down))
+      throw std::runtime_error(
+        "[Gemma4MoE] moe_hadamard_signs: the HTP backend took no signs");
+  }
+#endif
   weights_prepared_ = false;
   loading_weights_ = true;
   try {

@@ -164,6 +164,32 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
  *         hexkl_mm_u8i4_moe_layer_run before its first push. File state like
  *         the ring itself: one DSP thread drives both. */
 static int g_moe_src_bypass;
+/** [PR 4428] hexkl_moe_set_hadamard_signs's masks (hexkl_mm_u8i4_moe.h) */
+static const uint32_t *g_moe_had_sign_in, *g_moe_had_sign_down;
+static uint32_t g_moe_had_sign_in_n, g_moe_had_sign_down_n;
+
+void hexkl_moe_set_hadamard_signs(const uint32_t *mask_in, uint32_t n_in,
+                                  const uint32_t *mask_down, uint32_t n_down) {
+  g_moe_had_sign_in = n_in ? mask_in : NULL;
+  g_moe_had_sign_in_n = mask_in ? n_in : 0u;
+  g_moe_had_sign_down = n_down ? mask_down : NULL;
+  g_moe_had_sign_down_n = mask_down ? n_down : 0u;
+}
+
+/** @brief x[i] ^= mask[i] over n floats (n a multiple of 32): the rotation's
+ *  signs as a flip of the f32 sign bit. */
+static void moe_xor_row(float *x, const uint32_t *mask, uint32_t n) {
+#if defined(__hexagon__)
+  HVX_UVector *v = (HVX_UVector *)x;
+  const HVX_UVector *m = (const HVX_UVector *)mask;
+  for (uint32_t i = 0; i < n / 32u; ++i)
+    v[i] = Q6_V_vxor_VV(v[i], m[i]);
+#else
+  uint32_t *u = (uint32_t *)x;
+  for (uint32_t i = 0; i < n; ++i)
+    u[i] ^= mask[i];
+#endif
+}
 
 /** @brief The src_bypass a weight's descriptor gets: the knob, and only for
  *         a slot no DSP cache holds a dirty line of -- an arena-backed
@@ -738,6 +764,9 @@ static void moe_rotate_rows(float *x, uint32_t rows, uint32_t width,
                             uint32_t mode) {
   if (mode)
     (void)hvx_hadamard_rows_f32(x, rows, width, mode == 3u ? 2u : mode);
+  if (mode && g_moe_had_sign_down && g_moe_had_sign_down_n == width)
+    for (uint32_t r = 0; r < rows; ++r)
+      moe_xor_row(x + (size_t)r * width, g_moe_had_sign_down, width);
 }
 
 /** @brief Requantize independent row groups into the next block's mid. */
@@ -1987,8 +2016,11 @@ static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
       hvx_rmsnorm_row_f32(src, row, c->gamma, c->K, c->eps);
     else if (row != src)
       memcpy(row, src, (size_t)c->K * sizeof(float));
-    if (c->mode)
+    if (c->mode) {
       (void)hvx_hadamard_f32(row, c->K, c->mode);
+      if (g_moe_had_sign_in && g_moe_had_sign_in_n == c->K)
+        moe_xor_row(row, g_moe_had_sign_in, c->K);
+    }
     hvx_quant_rows_u8_params_rm(row, 1u, 1u, c->K, c->scale + m, c->zp + m,
                                 c->u8 ? c->u8 + (size_t)m * c->K : NULL, NULL,
                                 0.0f, NULL, NULL);
@@ -2047,9 +2079,21 @@ int hexkl_mm_u8i4_moe_layer_run(
   if ((flags & HEXKL_MOE_FLAG_HAD_HMX) && (K != 2816u || inter != 704u))
     return AEE_EUNSUPPORTED;
   int use_had_hmx = 0;
+  /* [PR 4428] a sign vector set for this width rides the HVX rotation; one
+     set for another width is a configuration error, not something to skip */
+  const int had_signs =
+    g_moe_had_sign_in != NULL || g_moe_had_sign_down != NULL;
+  if ((flags & HEXKL_MOE_FLAG_HAD_UP) && g_moe_had_sign_in &&
+      g_moe_had_sign_in_n != K)
+    return AEE_EUNSUPPORTED;
+  if ((flags & HEXKL_MOE_FLAG_HAD_DOWN) && g_moe_had_sign_down &&
+      g_moe_had_sign_down_n != inter)
+    return AEE_EUNSUPPORTED;
 #if defined(__hexagon__)
-  use_had_hmx =
-    (flags & HEXKL_MOE_FLAG_HAD_HMX) && M > 4u && K == 2816u && inter == 704u;
+  use_had_hmx = (flags & HEXKL_MOE_FLAG_HAD_HMX) && M > 4u && K == 2816u &&
+                inter == 704u && !had_signs;
+#else
+  (void)had_signs;
 #endif
   const uint32_t had_mode = (flags & HEXKL_MOE_FLAG_HAD_SCALAR) ? 1u
                             : use_had_hmx                       ? 3u

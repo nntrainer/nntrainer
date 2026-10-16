@@ -315,6 +315,10 @@ int nntr_hvx_close(remote_handle64 handle) {
   /* [#132 Part B E5i] a no-op when the ARM side ran it before its munmaps */
   (void)nntr_hvx_arenas_release(handle, &n);
   hexkl_moe_scratch_free(&s->moe_scratch);
+  hexkl_moe_set_hadamard_signs(NULL, 0u, NULL, 0u);
+  free(s->had_sign_in);
+  free(s->had_sign_down);
+  s->had_sign_in = s->had_sign_down = NULL;
   /* [#81] The attention cache borrows the pool, so it goes first. */
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
