@@ -1444,4 +1444,16 @@ interface nntr_hvx : remote_handle64 {
                                     in sequence<float> act_f32,
                                     rout sequence<float> out_f32,
                                     rout sequence<uint32> stage_us);
+   // [PR 4428] Per-output-channel integer offsets for QS4CX_WH_AFFINE
+   // experts already swapped into the arena: handles[i] takes the next
+   // n_per[i] (= its N) entries of offsets, the values weight_register_u8i4
+   // reads from the second half of a 2N bias. Integer-valued, |offset| <=
+   // 15. A handle whose offsets are all zero needs no call: the symmetric
+   // registration computes the same bytes. Rejected whole on a length
+   // mismatch; on a bad handle or value the handles before it keep their
+   // offsets, the rest are untouched. The next swap into the slot clears
+   // them. Appended last.
+   AEEResult weight_set_offsets_batch(in sequence<uint32> handles,
+                                      in sequence<uint32> n_per,
+                                      in sequence<float> offsets);
 };

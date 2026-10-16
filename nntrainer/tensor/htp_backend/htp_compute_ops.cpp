@@ -3619,9 +3619,7 @@ public:
                    margin = size_t(htp_fixed::PD_MAP_MARGIN_MIB) << 20;
       const size_t room =
         mapped + margin < ceiling ? ceiling - mapped - margin : 0;
-      const auto &d = pool_descs_[0][0];
-      const size_t slot = expertStride(d.K, 2 * d.inter, d.w_bits) +
-                          expertStride(d.inter, d.N_out, d.w_bits);
+      const size_t slot = expertSlotBytes(pool_descs_[0][0]);
       const size_t fit = room / (slot * layers);
       per_layer = static_cast<unsigned>(std::min<size_t>(want, fit));
       std::fprintf(stderr,
@@ -3895,6 +3893,14 @@ public:
         const ExpertFileDesc &x = d[r.miss[i]];
         const StagedExpert &st = p.pending[i];
         throwPread(st.rc, "expert weight (miss)");
+        // ponytail: the DSP rebinds a decode miss on its own from this
+        // answer, which carries no offsets; an affine expert whose offsets
+        // are all zero (the rotated ternary checkpoint's) is exact as a
+        // symmetric one. Offsets in the answer are the upgrade.
+        if (!st.gu.offsets.empty() || !st.dn.offsets.empty())
+          throw std::runtime_error(
+            "QS4CX_WH_AFFINE expert with non-zero offsets on the decode miss "
+            "path: not supported");
         htp_miss_load &l = a.load[a.n_load++];
         l.e = r.miss[i];
         l.old_gu = st.slot.h_gu;
@@ -4084,10 +4090,10 @@ public:
               pf_q_.pop_front();
             }
             const uint64_t pal = paletteBytes(d.w_bits);
-            const size_t gu =
-              codeBytes(d.K, 2 * d.inter, d.w_bits) + pal + 8ull * 2 * d.inter;
-            const size_t dn =
-              codeBytes(d.inter, d.N_out, d.w_bits) + pal + 8ull * d.N_out;
+            const size_t gu = codeBytes(d.K, 2 * d.inter, d.w_bits) + pal +
+                              tailPerCol(d) * 2 * d.inter;
+            const size_t dn = codeBytes(d.inter, d.N_out, d.w_bits) + pal +
+                              tailPerCol(d) * d.N_out;
             buf.resize(std::max(gu, dn));
             (void)preadAll(d.fd, buf.data(), gu, d.off_gu);
             (void)preadAll(d.fd, buf.data(), dn, d.off_dn);
@@ -8157,6 +8163,10 @@ private:
     std::vector<float> bias;
     /** Four int4 codes when this is a QS2CX_WH weight, empty at 4 bits. */
     std::vector<int8_t> pal;
+    /** [PR 4428] A QS4CX_WH_AFFINE expert's per-column integer offsets,
+     *  kept only when one of them is not zero: all-zero offsets register
+     *  symmetric, which the kernel computes bit-identically and faster. */
+    std::vector<int32_t> offsets;
   };
 
   /** @brief One expert's place in the arena: gate_up at off, down at
@@ -8164,6 +8174,10 @@ private:
   struct ExpertSlot {
     uint32_t chunk = 0;
     uint32_t off = 0;
+    /** Its span (expertSlotBytes): the pool holds one size per expert
+     *  dtype, 1.33 MB native TL2 beside 3.0 MB 4-bit on the rotated
+     *  ternary Gemma4, and a free slot is reused only by its own size. */
+    uint32_t bytes = 0;
     /** The retired expert's handles, still registered on the DSP until the
      *  next load into this slot swaps them out; kNoHandle when none. */
     uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
@@ -8256,16 +8270,19 @@ private:
     {
       std::lock_guard<std::mutex> lock(handle_mutex_);
       const auto &d = pool_descs_[0][0];
-      const size_t bytes = expertStride(d.K, 2 * d.inter, d.w_bits) +
-                           expertStride(d.inter, d.N_out, d.w_bits);
+      const size_t bytes = expertSlotBytes(d);
+      // The spare slots are the first layer's size; a layer whose experts
+      // are another size (the rotated ternary's 4-bit tail) is not
+      // prefetched (queueDirectPrefetch) and misses as before.
       for (const auto &layer : pool_descs_)
         for (const auto &x : layer)
-          if (x.K != d.K || x.inter != d.inter || x.N_out != d.N_out ||
-              x.w_bits != d.w_bits)
+          if (x.K != d.K || x.inter != d.inter || x.N_out != d.N_out)
             throw std::invalid_argument(
               "Direct prefetch requires uniform expert shapes");
+      prefetch_slot_bytes_ = static_cast<uint32_t>(bytes);
       for (size_t i = 0; i < count; ++i) {
         ExpertSlot slot;
+        slot.bytes = static_cast<uint32_t>(bytes);
         if (!place(session, bytes, count * bytes, &slot.chunk, &slot.off))
           throw std::runtime_error("Cannot allocate direct prefetch slots: " +
                                    arena_fail_);
@@ -8359,6 +8376,8 @@ private:
 
   bool queueDirectPrefetch(const ExpertFileDesc &d, uint64_t epoch,
                            bool native) {
+    if (expertSlotBytes(d) != prefetch_slot_bytes_)
+      return false;
     return pool_prefetch_->submit(d.key_gu, epoch, [&](StagedExpert &st) {
       st.d = d;
       st.gu = {};
@@ -8503,9 +8522,15 @@ private:
                           (tl2_decode_ && d.w_bits == 2u)};
   }
 
-  /** @brief A free slot, or a new one bumped into a chunk (the load, and
-   *  the first prefill before the pool is full). One expert shape per
-   *  process: a released slot is reused as is.
+  /** @brief A free slot of this expert's size, or a new one bumped into a
+   *  chunk (the load, and the first prefill before the pool is full). The
+   *  free list holds every size the model's experts come in; the LRU is
+   *  shared across them, so a layer whose experts are larger than its
+   *  reserved share grows the arena by the difference.
+   *  ponytail: with one LRU over two slot sizes, the 4-bit layers can hold
+   *  more experts than were reserved for them while same-count smaller
+   *  slots idle; bounded by those two layers' expert count. A per-size LRU
+   *  is the upgrade if the arena growth shows in the memory numbers.
    *  @note Call with handle_mutex_ held. */
   ExpertSlot takeExpertSlot(remote_handle64 session, const ExpertFileDesc &d) {
     if (d.fd < 0) {
@@ -8517,15 +8542,9 @@ private:
         "QS4CX_WH weights need the DSP arena, which this device did not "
         "provide (no rpcmem_to_fd or no fastrpc_mmap).");
     }
-    const uint32_t slot_bytes = expertStride(d.K, 2 * d.inter, d.w_bits) +
-                                expertStride(d.inter, d.N_out, d.w_bits);
-    if (expert_slot_bytes_ == 0) {
-      expert_slot_bytes_ = slot_bytes;
-    } else if (expert_slot_bytes_ != slot_bytes) {
-      throw std::runtime_error("register_qs4cx_wh_expert_file: expert shape "
-                               "differs from the pool's");
-    }
+    const uint32_t slot_bytes = expertSlotBytes(d);
     ExpertSlot slot;
+    slot.bytes = slot_bytes;
     // A new chunk is sized to the slots still to come when the caller said
     // how many there will be (reserve_qs4cx_wh_expert_slots), else a full
     // chunk as before. newChunk rounds up to its 64 MiB grain.
@@ -8534,9 +8553,12 @@ private:
                           : 0;
     const size_t want =
       left != 0 ? std::min(kArenaChunkMax, left * slot_bytes) : kArenaChunkMax;
-    if (!free_expert_slots_.empty()) {
-      slot = free_expert_slots_.back();
-      free_expert_slots_.pop_back();
+    const auto free_it = std::find_if(
+      free_expert_slots_.rbegin(), free_expert_slots_.rend(),
+      [slot_bytes](const ExpertSlot &f) { return f.bytes == slot_bytes; });
+    if (free_it != free_expert_slots_.rend()) {
+      slot = *free_it;
+      free_expert_slots_.erase(std::next(free_it).base());
     } else if (place(session, slot_bytes, want, &slot.chunk, &slot.off)) {
       ++expert_slots_placed_;
     } else {
@@ -8558,6 +8580,20 @@ private:
   static uint32_t expertStride(uint32_t K, uint32_t N, uint32_t w_bits) {
     const auto capacity = codeBytes(K, N, w_bits);
     return (static_cast<uint32_t>(capacity) + 8u * N + 4095u) & ~4095u;
+  }
+
+  /** @brief One expert's slot: gate_up's stride then down's. An affine
+   *  expert's offsets travel by RPC (weight_set_offsets_batch), not in
+   *  the slot, so its stride is the symmetric 4-bit one. */
+  static uint32_t expertSlotBytes(const ExpertFileDesc &d) {
+    return expertStride(d.K, 2 * d.inter, d.w_bits) +
+           expertStride(d.inter, d.N_out, d.w_bits);
+  }
+
+  /** @brief Bytes a column adds after the codes in the file: f32 scale and
+   *  f32 column sum, plus an i32 offset for QS4CX_WH_AFFINE. */
+  static uint64_t tailPerCol(const ExpertFileDesc &d) {
+    return d.affine ? 12u : 8u;
   }
 
   /** @brief [plan 229] A weight's WH code bytes: whBytes at four bits,
@@ -8610,10 +8646,10 @@ private:
         return EINVAL;
       }
     }
-    return dn ? readWeight(d.fd, d.off_dn, d.inter, d.N_out, d.w_bits,
+    return dn ? readWeight(d.fd, d.off_dn, d.inter, d.N_out, d.w_bits, d.affine,
                            st.base + gu_stride, e, use_pool)
-              : readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, d.w_bits, st.base,
-                           e, use_pool);
+              : readWeight(d.fd, d.off_gu, d.K, 2 * d.inter, d.w_bits, d.affine,
+                           st.base, e, use_pool);
   }
 
   /** Diagnostic opt-outs keep both changes independently measurable. */
@@ -8867,9 +8903,10 @@ private:
     };
     const uint32_t n_gu = 2 * d.inter;
     const uint64_t pal = paletteBytes(d.w_bits);
-    advise(d.off_gu, codeBytes(d.K, n_gu, d.w_bits) + pal + 8ull * n_gu);
-    advise(d.off_dn,
-           codeBytes(d.inter, d.N_out, d.w_bits) + pal + 8ull * d.N_out);
+    advise(d.off_gu,
+           codeBytes(d.K, n_gu, d.w_bits) + pal + tailPerCol(d) * n_gu);
+    advise(d.off_dn, codeBytes(d.inter, d.N_out, d.w_bits) + pal +
+                       tailPerCol(d) * d.N_out);
 #else
     (void)d;
     (void)willneed;
@@ -9092,6 +9129,36 @@ private:
         else
           free_expert_slots_.push_back(ok[i]->slot);
       }
+      // [PR 4428] The affine experts' non-zero offsets, one call for the
+      // batch: the swap registered them symmetric, and a handle whose
+      // offsets are all zero stays that way (bit-identical, faster).
+      std::vector<uint32_t> oh, on;
+      std::vector<float> ov;
+      for (size_t i = 0; i < done; ++i)
+        for (const auto &[h, e] :
+             {std::pair<uint32_t, const ArenaEntry *>{hg[i], &ok[i]->gu},
+              std::pair<uint32_t, const ArenaEntry *>{hd[i], &ok[i]->dn}})
+          if (!e->offsets.empty()) {
+            oh.push_back(h);
+            on.push_back(e->N);
+            ov.insert(ov.end(), e->offsets.begin(), e->offsets.end());
+          }
+      if (!oh.empty()) {
+        const int rc_off = nntr_hvx_weight_set_offsets_batch(
+          session, oh.data(), static_cast<int>(oh.size()), on.data(),
+          static_cast<int>(on.size()), ov.data(), static_cast<int>(ov.size()));
+        if (rc_off != AEE_SUCCESS) {
+          char code[16];
+          std::snprintf(code, sizeof(code), "0x%08x",
+                        static_cast<unsigned>(rc_off));
+          throw std::runtime_error(
+            std::string("nntr_hvx_weight_set_offsets_batch failed: err=") +
+            code +
+            " (an affine expert's offsets did not reach the DSP; a "
+            "skel older than test/htp/nntr_hvx.idl answers this call "
+            "with an error: rebuild and push libnntr_hvx_skel.so)");
+        }
+      }
       if (done < n && !first) {
         char code[16];
         std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(err));
@@ -9212,9 +9279,9 @@ private:
         hi = std::max<uint64_t>(
           hi,
           std::max<uint64_t>(x.off_gu + codeBytes(x.K, 2 * x.inter, x.w_bits) +
-                               pal + 8ull * 2 * x.inter,
+                               pal + tailPerCol(x) * 2 * x.inter,
                              x.off_dn + codeBytes(x.inter, x.N_out, x.w_bits) +
-                               pal + 8ull * x.N_out));
+                               pal + tailPerCol(x) * x.N_out));
       }
       const uint64_t page = 4096, a = lo & ~(page - 1), len = hi - a;
       // Mode 2 on the S25 with all 30 layers (5.6 GB anonymous beside the
@@ -9374,9 +9441,37 @@ private:
     return 0;
   }
 
+  /** @brief The record's tail after the codes and palette: N f32 scales, N
+   *  f32 column sums and, for QS4CX_WH_AFFINE, N i32 offsets. The scales
+   *  and the sums (as i32) go after the codes in the slot, where the DSP
+   *  takes them from; offsets that are not all zero stay in @a e for the
+   *  weight_set_offsets_batch call after the swap. */
+  static void finishWhTail(const uint8_t *tail, uint32_t N, bool affine,
+                           uint8_t *arena_dst, size_t nib, ArenaEntry &e) {
+    const float *f = reinterpret_cast<const float *>(tail);
+    std::vector<int32_t> colsum(N);
+    for (uint32_t i = 0; i < N; ++i)
+      colsum[i] = static_cast<int32_t>(f[N + i]);
+    // Two sequential stores into the uncached mapping, never a read back.
+    std::memcpy(arena_dst + nib, f, sizeof(float) * N);
+    std::memcpy(arena_dst + nib + sizeof(float) * N, colsum.data(),
+                sizeof(int32_t) * N);
+    e.offsets.clear();
+    if (affine) {
+      const int32_t *o = reinterpret_cast<const int32_t *>(f + 2 * N);
+      for (uint32_t i = 0; i < N; ++i)
+        if (o[i] != 0) {
+          e.offsets.assign(o, o + N);
+          break;
+        }
+    }
+  }
+
   int readWeight(int fd, uint64_t off, uint32_t K, uint32_t N, uint32_t w_bits,
-                 uint8_t *arena_dst, ArenaEntry &e, bool use_pool) {
+                 bool affine, uint8_t *arena_dst, ArenaEntry &e,
+                 bool use_pool) {
     const size_t nib = codeBytes(K, N, w_bits);
+    const size_t tail_bytes = (affine ? 12u : 8u) * size_t(N);
     if (w_bits == HTP_TL2_WEIGHT_BITS) {
       if (!validNativeTl2Shape(K, N))
         return EINVAL;
@@ -9389,17 +9484,10 @@ private:
     }
     // [#282] a pinned expert is a DDR copy, never a file read
     const size_t pal0 = paletteBytes(w_bits);
-    if (const uint8_t *pin =
-          pinnedAt(fd, off, nib + pal0 + 2 * sizeof(float) * N)) {
+    if (const uint8_t *pin = pinnedAt(fd, off, nib + pal0 + tail_bytes)) {
       std::memcpy(arena_dst, pin, nib);
       e.pal.assign(pin + nib, pin + nib + pal0);
-      const float *tail = reinterpret_cast<const float *>(pin + nib + pal0);
-      std::vector<int32_t> colsum(N);
-      for (uint32_t i = 0; i < N; ++i)
-        colsum[i] = static_cast<int32_t>(tail[N + i]);
-      std::memcpy(arena_dst + nib, tail, sizeof(float) * N);
-      std::memcpy(arena_dst + nib + sizeof(float) * N, colsum.data(),
-                  sizeof(int32_t) * N);
+      finishWhTail(pin + nib + pal0, N, affine, arena_dst, nib, e);
       e.K = K;
       e.N = N;
       return 0;
@@ -9414,7 +9502,7 @@ private:
     // across parallel_for, so each slice keeps its result.
     std::atomic<int> first_rc{0};
     const size_t pal = paletteBytes(w_bits);
-    std::vector<uint8_t> after(pal + 2 * sizeof(float) * N);
+    std::vector<uint8_t> after(pal + tail_bytes);
     auto slice_read = [&](uint8_t *dst, size_t len, uint64_t at) {
       const int rc = preadAll(fd, dst, len, at);
       if (rc == 0)
@@ -9448,15 +9536,7 @@ private:
         return rc;
     }
     e.pal.assign(after.begin(), after.begin() + pal);
-    std::vector<float> tail(2 * static_cast<size_t>(N));
-    std::memcpy(tail.data(), after.data() + pal, tail.size() * sizeof(float));
-    std::vector<int32_t> colsum(N);
-    for (uint32_t i = 0; i < N; ++i)
-      colsum[i] = static_cast<int32_t>(tail[N + i]);
-    // Two sequential stores into the uncached mapping, never a read back.
-    std::memcpy(arena_dst + nib, tail.data(), sizeof(float) * N);
-    std::memcpy(arena_dst + nib + sizeof(float) * N, colsum.data(),
-                sizeof(int32_t) * N);
+    finishWhTail(after.data() + pal, N, affine, arena_dst, nib, e);
     e.K = K;
     e.N = N;
     return 0;
@@ -10107,12 +10187,13 @@ private:
   std::shared_ptr<std::vector<ArenaChunk>> s1_arena_ =
     std::make_shared<std::vector<ArenaChunk>>();
   std::vector<ArenaChunk> &arena_chunks_ = *s1_arena_;
-  /** Expert slots given back by release_qs4cx_wh_expert, all of
-   *  expert_slot_bytes_; a miss takes one of these before it bumps a
-   *  chunk, so after the load the chunk count never moves. */
+  /** Expert slots given back by release_qs4cx_wh_expert, each of its
+   *  expert's size; a miss takes one of its size before it bumps a chunk,
+   *  so after the load the chunk count moves only when a size runs out. */
   std::vector<ExpertSlot> free_expert_slots_;
   std::unordered_map<const void *, ExpertResident> experts_;
-  size_t expert_slot_bytes_ = 0;
+  /** The direct prefetch's spare slots' size (initPoolPrefetch). */
+  uint32_t prefetch_slot_bytes_ = 0;
   /** reserve_qs4cx_wh_expert_slots's count, and slots placed so far. */
   size_t expert_slots_wanted_ = 0, expert_slots_placed_ = 0;
   /** Slices of one expert weight's file read: 3.5 MiB over 8 is 448 KiB a

@@ -355,12 +355,15 @@ void Gemma4HtpTransformer::repack_weight() {
         if (ops && (dtype == ml::train::TensorDim::DataType::QS4CX ||
                     dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
                     dtype == ml::train::TensorDim::DataType::QS2CX_WH ||
-                    dtype == ml::train::TensorDim::DataType::TL2CX_WH)) {
+                    dtype == ml::train::TensorDim::DataType::TL2CX_WH ||
+                    dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE)) {
           const auto h = static_cast<unsigned int>(t.height());
           const auto wd = static_cast<unsigned int>(t.width());
           w_bits = dtype == ml::train::TensorDim::DataType::TL2CX_WH
                      ? HTP_TL2_WEIGHT_BITS
-                   : dtype == ml::train::TensorDim::DataType::QS4CX_WH ? 4u
+                   : (dtype == ml::train::TensorDim::DataType::QS4CX_WH ||
+                      dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE)
+                     ? 4u
                    : dtype == ml::train::TensorDim::DataType::QS2CX_WH ? 2u
                                                                        : 0u;
           // [doc 52] A virtual expert has no bytes here: preloadExperts

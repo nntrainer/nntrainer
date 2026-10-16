@@ -12,6 +12,7 @@
 
 #include <acti_func.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -26,6 +27,8 @@
 #include <htp_decode_hook.h>
 #include <htp_wh_layout.h>
 #include <htp_wh_palette.h>
+#include <map>
+#include <set>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -195,6 +198,19 @@ using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
  *  needs them to read one from the file, in layer order (preloadExperts is
  *  called in graph order). Row i + 1 is what layer i reads ahead. */
 static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
+/** [PR 4428] The pool's slot sizes: the experts of one (K, inter, N_out,
+ *  dtype) share a size, and the rotated ternary Gemma4 has two (native
+ *  TL2 in layers 0-27, 4-bit affine in 28-29). Each layer adds its share
+ *  at finalize, so the first preload of each size can reserve all of
+ *  that size's slots at load, as the one-size pool always did. */
+using ExpertSlotClass = std::array<unsigned int, 4>;
+static std::map<ExpertSlotClass, size_t> g_expert_class_cap;
+static std::set<ExpertSlotClass> g_expert_class_reserved;
+static size_t g_expert_slots_reserved = 0;
+
+static ExpertSlotClass expertSlotClass(const ExpertFileDesc &d) {
+  return {d.K, d.inter, d.N_out, d.w_bits * 2u + (d.affine ? 1u : 0u)};
+}
 
 /** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
 static std::atomic<unsigned> g_moe_layer_count{0};
@@ -228,6 +244,9 @@ static std::unordered_set<const void *> g_handed_expert_layers;
 
 void resetLfm2HtpExpertPool() {
   g_expert_lru.reset();
+  g_expert_class_cap.clear();
+  g_expert_class_reserved.clear();
+  g_expert_slots_reserved = 0;
   g_expert_layers.clear();
   g_prefetch_batches.clear();
   g_prefetch_inflight.clear();
@@ -357,6 +376,17 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
   const unsigned int hidden_size = in_dim.width(); // Feature dimension
+  if (experts_virtual) {
+    const auto wdt = context.getWeightDataType();
+    ExpertFileDesc shape{};
+    shape.K = shape.N_out = hidden_size;
+    shape.inter = intermediate_size;
+    shape.w_bits = wdt == nntrainer::Tdatatype::TL2CX_WH   ? HTP_TL2_WEIGHT_BITS
+                   : wdt == nntrainer::Tdatatype::QS2CX_WH ? 2u
+                                                           : 4u;
+    shape.affine = wdt == nntrainer::Tdatatype::QS4CX_WH_AFFINE;
+    g_expert_class_cap[expertSlotClass(shape)] += cache_per_layer;
+  }
 
   // activation function
   if (std::get<props::MoEActivation>(moe_props).empty()) {
@@ -595,12 +625,13 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
   const auto dt = gu.getDataType();
   if ((dt != nntrainer::Tdatatype::QS4CX_WH &&
        dt != nntrainer::Tdatatype::QS2CX_WH &&
-       dt != nntrainer::Tdatatype::TL2CX_WH) ||
+       dt != nntrainer::Tdatatype::TL2CX_WH &&
+       dt != nntrainer::Tdatatype::QS4CX_WH_AFFINE) ||
       dn.getDataType() != dt) {
     throw std::runtime_error(
-      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH or "
-      "QS2CX_WH expert weights (the file's bytes go to the DSP as they are); "
-      "this model's are not");
+      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH, "
+      "QS2CX_WH, TL2CX_WH or QS4CX_WH_AFFINE expert weights (the file's "
+      "bytes go to the DSP as they are); this model's are not");
   }
   return ExpertFileDesc{&gu,
                         &dn,
@@ -613,7 +644,8 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
                         dt == nntrainer::Tdatatype::TL2CX_WH
                           ? HTP_TL2_WEIGHT_BITS
                         : dt == nntrainer::Tdatatype::QS2CX_WH ? 2u
-                                                               : 4u};
+                                                               : 4u,
+                        dt == nntrainer::Tdatatype::QS4CX_WH_AFFINE};
 }
 
 static void loadVirtualExpert(nntrainer::ComputeOps *ops,
@@ -641,10 +673,16 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
                  context.getWeight(expert_down_proj_indices[e])));
   const char *preload = std::getenv("NNTR_MOE_PRELOAD_EXPERTS");
   const size_t limit = expertPreloadLimit(g_expert_lru.capacity(), preload);
-  // Map all slots before FC registration, independently of weight reads.
+  // Map all slots before FC registration, independently of weight reads:
+  // the first layer of each slot size reserves that size's share.
+  if (!descs.empty() &&
+      g_expert_class_reserved.insert(expertSlotClass(descs[0])).second) {
+    g_expert_slots_reserved += g_expert_class_cap[expertSlotClass(descs[0])];
+    ops->reserve_qs4cx_wh_expert_slots(g_expert_slots_reserved, &descs[0]);
+  }
   if (g_expert_layers.empty()) {
-    ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity(),
-                                       descs.empty() ? nullptr : &descs[0]);
+    if (descs.empty())
+      ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity(), nullptr);
     std::fprintf(stderr, "[MoE] preload_experts=%zu cache_slots=%zu\n", limit,
                  g_expert_lru.capacity());
   }
@@ -998,24 +1036,29 @@ static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
 }
 
 /**
- * @brief One QS4CX_WH or QS2CX_WH weight from the model file, dequantized
- *        to f32 row-major [K][N].
+ * @brief One QS4CX_WH, QS2CX_WH or QS4CX_WH_AFFINE weight from the model
+ *        file, dequantized to f32 row-major [K][N].
  *
  * The file holds the codes -- whBytes(K, N) int4 nibbles, or whBytes2(K, N)
  * 2-bit codes followed by the tensor's four-entry palette
  * (QS2CX_WH_Tensor) -- then N f32 scales, then N f32 column sums (the
- * kernel's zero-point term, not needed here).
+ * kernel's zero-point term, not needed here), then, when @a affine, N i32
+ * offsets: W[k][n] = scale[n] * (q[k][n] + offset[n]).
  */
 static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
-                                unsigned int w_bits, std::vector<float> &out) {
+                                unsigned int w_bits, bool affine,
+                                std::vector<float> &out) {
   const bool two = w_bits == 2u;
   const size_t codes =
     two ? nntrainer::whBytes2(K, N) + nntrainer::WH_PALETTE_LEVELS
         : nntrainer::whBytes(K, N);
   std::vector<uint8_t> packed(codes);
   std::vector<float> scale(N);
+  std::vector<int32_t> offset(N, 0);
   if (!moeReadAt(fd, packed.data(), codes, off) ||
-      !moeReadAt(fd, scale.data(), N * sizeof(float), off + codes)) {
+      !moeReadAt(fd, scale.data(), N * sizeof(float), off + codes) ||
+      (affine && !moeReadAt(fd, offset.data(), N * sizeof(int32_t),
+                            off + codes + 2u * N * sizeof(float)))) {
     return false;
   }
   std::vector<int8_t> q(static_cast<size_t>(K) * N);
@@ -1032,7 +1075,7 @@ static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
   tm.parallel_for(0, K, [&](size_t k) {
     const size_t row = k * N;
     for (uint32_t n = 0; n < N; ++n)
-      out[row + n] = static_cast<float>(q[row + n]) * scale[n];
+      out[row + n] = static_cast<float>(q[row + n] + offset[n]) * scale[n];
   });
   return true;
 }
@@ -1089,9 +1132,9 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
       return;
     }
     if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
-                             d.w_bits, w_gu) ||
+                             d.w_bits, d.affine, w_gu) ||
         !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
-                             d.w_bits, w_dn)) {
+                             d.w_bits, d.affine, w_dn)) {
       std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
                    trace_layer, e);
       return;
@@ -1192,12 +1235,13 @@ static bool tryMoeLayerOnAccelerator(
   const auto wh = nntrainer::Tdatatype::QS4CX_WH;
   const auto wh2 = nntrainer::Tdatatype::QS2CX_WH;
   const auto tl2 = nntrainer::Tdatatype::TL2CX_WH;
+  const auto whaff = nntrainer::Tdatatype::QS4CX_WH_AFFINE;
   const auto plain = nntrainer::Tdatatype::QS4CX;
   const auto dt0 = context.getWeight(gate_up_indices[0]).getDataType();
-  const unsigned int w_bits = dt0 == tl2     ? HTP_TL2_WEIGHT_BITS
-                              : (dt0 == wh)  ? 4u
-                              : (dt0 == wh2) ? 2u
-                                             : 0u;
+  const unsigned int w_bits = dt0 == tl2 ? HTP_TL2_WEIGHT_BITS
+                              : (dt0 == wh || dt0 == whaff) ? 4u
+                              : (dt0 == wh2)                ? 2u
+                                                            : 0u;
 
   // Decode's single token normally stays on the ARM side: it cannot amortize
   // the kernel's 64-row pad, which is why the fused path has the same gate.
@@ -1223,10 +1267,7 @@ static bool tryMoeLayerOnAccelerator(
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
-    const auto want = w_bits == HTP_TL2_WEIGHT_BITS ? tl2
-                      : (w_bits == 4u)              ? wh
-                      : (w_bits == 2u)              ? wh2
-                                                    : plain;
+    const auto want = w_bits == 0u ? plain : dt0;
     if (gu.getDataType() != want || dn.getDataType() != want) {
       return false;
     }
