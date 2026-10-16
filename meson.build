@@ -95,9 +95,12 @@ warning_cxx_flags = [
   '-Wdefaulted-function-deleted'
 ]
 
+# No -Wmissing-include-dirs for C: a cmake subproject's include dirs (e.g.
+# iniparser's __CMake_build) are absent on builds that take the system
+# package, and with -Werror the first C source in libnntrainer
+# (hexkl_kv_q.c, #4415) stopped the build there.
 warning_c_flags = [
   '-Wmissing-declarations',
-  '-Wmissing-include-dirs',
   '-Wmissing-prototypes',
   '-Wnested-externs',
   '-Wold-style-definition'
@@ -338,22 +341,69 @@ endif
 # there is no x86 build of it. Default off, so x86/CI builds are unaffected.
 # hexkl_dep is referenced only under this guard (mirrors how the OpenCL wiring
 # is referenced only when enable-opencl).
-if get_option('enable-htp')
+if get_option('enable-htp') and get_option('htp-inproc')
+  # The in-process variant (#84): the Hexagon SDK's headers only. No
+  # libsdkl (nothing under htp_backend/ calls it, htp_backend.h records
+  # its removal) and no HexKL: the skel sources are compiled for the host
+  # against the stand-ins in test/htp/host/, see htp_backend/meson.build.
+  hexagon_sdk_root = get_option('hexagon-sdk-root')
+  if hexagon_sdk_root == '' or not fs.is_dir(hexagon_sdk_root / 'incs')
+    error('htp-inproc=true requires -Dhexagon-sdk-root=<path to ' +
+          'Hexagon_SDK/<version>> (its incs/ holds remote.h, AEEStdErr.h ' +
+          'and the HAP_*.h the skel sources include)')
+  endif
+  hexkl_inc = include_directories(
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    is_system: true)
+  hexkl_dep = declare_dependency(include_directories: hexkl_inc)
+  extra_defines += '-DENABLE_HEXKL=1'
+  extra_defines += '-DNNTR_HTP_INPROC=1'
+  message('HTP backend enabled IN-PROCESS (host stand-ins, no device)')
+elif get_option('enable-htp')
   hexkl_root = get_option('hexkl-sdk-root')
   if hexkl_root == ''
     error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
   endif
   hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
-  # Derive the Hexagon SDK root from the addon path (two levels up).
   # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
   # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
-  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  #
+  # Two levels up from the addon is the SDK only when the addon sits in
+  # Hexagon_SDK/<ver>/addons/hexkl_addon. The beta2 drop this project uses
+  # unpacks somewhere of its own, and the derivation then points at the
+  # parent of the checkout and fails on a missing incs/ with no hint about
+  # which path it meant. Keep the derivation as the default, since it is
+  # right for an SDK-resident addon, and take the explicit option first.
+  hexagon_sdk_root = get_option('hexagon-sdk-root')
+  if hexagon_sdk_root == ''
+    hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  endif
+  if not fs.is_dir(hexagon_sdk_root / 'incs')
+    error('No incs/ under Hexagon SDK root "' + hexagon_sdk_root +
+          '". Pass -Dhexagon-sdk-root=<path to Hexagon_SDK/<version>> ' +
+          '(it is derived as two levels up from hexkl-sdk-root, which only ' +
+          'holds when the addon lives in the SDK tree).')
+  endif
   hexkl_inc = include_directories(
     hexkl_root / 'include',
     hexagon_sdk_root / 'incs',
     hexagon_sdk_root / 'incs' / 'stddef',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'incs',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'rpcmem' / 'inc',
     is_system: true)
-  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  # package_android.sh configures the Android engine with the host compiler
+  # (no cross file; ndk-build compiles afterwards), and meson >= 1.x link-tests
+  # find_library() candidates with that compiler, which rejects the aarch64
+  # libsdkl.so. Check the file and hand the linker the path instead there.
+  if get_option('platform') == 'android'
+    if not fs.is_file(hexkl_lib_dir / 'libsdkl.so')
+      error('libsdkl.so not found in ' + hexkl_lib_dir)
+    endif
+    libsdkl = declare_dependency(link_args: ['-L' + hexkl_lib_dir, '-lsdkl'])
+  else
+    libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  endif
   hexkl_dep = declare_dependency(
     dependencies: libsdkl,
     include_directories: hexkl_inc)

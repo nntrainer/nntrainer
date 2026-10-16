@@ -1,0 +1,49 @@
+이번 변경은 expert cache 용량을 늘리지 않고, decode의 불필요한 변환·메모리 접근·스레드 경쟁을 줄이는 데 집중했다. 최종 TPS는 냉각 후 같은 조건에서 수행하는 최종 A/B 결과로 별도 제시한다.
+
+기준선에 이미 있던 기능
+인접 native TL2 gate/up·down 레코드의 read 결합과 stale speculative read 취소는 latest PR e0c1 기준선에 이미 구현되어 있었다. 이번 검토에서 유지한 기존 기능이며, 새로 구현한 최적화나 이번 작업의 성능 개선분으로 계산하지 않는다.
+
+채택한 변경
+- Native TL2 decode가 dense u8 activation을 직접 소비하도록 연결해 AH packing과 이를 다시 dense로 꺼내는 복사를 제거했다. 혼합 표현 및 지원하지 않는 shape에는 기존 경로를 유지했다.
+- v81 FC/LM head는 activation load를 네 출력 tile에서 재사용하고 DMA block 경계를 정렬한다. Attention은 Q/K 및 V 재사용과 head 단위 작업 결합으로 중복 접근과 worker 호출을 줄인다.
+- Router weight는 모든 값이 정확히 BF16으로 표현되는 경우에만 BF16 bit로 보관한다. 연산은 기존 FP32 순서를 유지하며, 조건을 만족하지 않으면 FP32를 사용한다. 중복 logits 할당도 제거했다.
+- 일반 decode의 불필요한 op별 timer 계측을 줄이고, profiling 요청 및 기존 debug forward 계측은 유지한다.
+- Demand expert read는 호출 스레드와 대기형 worker를 사용하는 전용 pool을 기본 사용한다. 작은 작업 때문에 전체 compute worker가 깨어나 계속 spin하는 비용을 줄인다. 작업 완료·예외 처리는 모두 join한 뒤 반환한다.
+- Mailbox polling의 prefetch 설정 확인은 token마다 한 번만 수행한다. DSP 완료 hint를 사용하면 서버가 DSPQ 응답 수신 전에 대기 상태로 들어가 호출 스레드의 CPU를 비워 준다. 이 기능은 아직 명시적 opt-in이다.
+- 완료 hint는 기존 mailbox의 예약 영역을 사용한다. token 번호와 보수값으로 초기값·이전 token·찢어진 기록을 거부하고, 같은 token에 polling을 재시작하지 않는다. 실패 시에도 hint를 게시하며, 성공 여부와 출력은 계속 DSPQ 응답으로 검증한다. 구 skeleton에서는 기존 disarm 경로로 동작한다.
+- HTP greedy ID-only 출력에서 읽지 않는 vocabulary 크기의 FP32 복사를 생략했다. Sampling·penalty·logits 소비 경로는 유지했다. KV 입력용 임시 pointer hash를 첫 일치 순서를 보존하는 지연 검색으로 바꾸고, pool recency 갱신의 임시 vector를 재사용한다.
+
+제외한 host 실험
+- Polling 중 64/256회 간격 scheduler yield: 성능이 나빠져 제거했다.
+- 서버를 호출 스레드와 다른 CPU로 이동: 응답 수신 지연은 줄었지만 DSP 계산 구간이 느려지는 상쇄 효과가 있어 제거했다. 최종 코드는 기존처럼 호출자의 CPU affinity를 상속한다.
+- 완료 hint를 32/64회마다 확인: 일관된 이득이 없어 제거했다. 활성화 시 empty poll마다 확인한다.
+
+HVX/HMX 검토
+현재 native TL2 decode는 HVX LUT GEMV와 DMA를 사용한다. Prefill에는 이미 HVX의 TL2→WH 변환과 HMX 계산을 겹치는 경로가 있다. 기존 HMX kernel의 출력 tile은 64×32이므로 M=1에서는 63행의 추가 계산·출력 처리가 생기며, native TL2는 HMX가 소비할 WH int4로 먼저 펼쳐야 한다. 이전 전체 모델 검증에는 DSPQ decode thread가 HMX fallback으로 진입했을 때 accumulator-clear 예외가 발생한 기록도 있다. 따라서 HMX fallback을 단순히 켜는 방식은 채택하지 않았다.
+Shared Q4 FFN을 HMX에서, native TL2를 HVX에서 동시에 계산하는 방향은 검토 가치가 있다. Q4 weight 확장을 피하면서 정수 누산과 affine 보정을 유지할 수 있지만, DSPQ에서의 올바른 HMX 실행 권한과 공유 VTCM/scratch의 비중첩 배치를 먼저 해결해야 한다. 이번 변경에 검증된 무추가메모리 구현이나 성능 향상으로 포함하지 않는다.
+
+메모리 조건
+Expert cache는 C=16, 30개 layer 합계 480 slots를 유지하고, cache grow와 모델 page cache를 꺼 둔 조건으로 비교한다. DSP에서는 정확한 BF16 router 저장과 중복 logits 제거로 약 21.62 MiB를 줄였다. Demand read pool은 현재 4 readers 설정에서 ARM worker 3개를 추가하므로 thread stack 등의 소량 메모리는 늘어난다. Stack의 가상 예약량을 실제 RSS와 같다고 해석하지 않으며, 최종 메모리 수치는 별도 측정 결과를 따른다. 완료 hint는 기존 64 KiB mailbox 내 예약 cache line을 사용해 추가 mailbox/weight buffer를 만들지 않는다.
+
+검증 범위와 남은 한계
+- Demand pool: 1/2/4/8 readers와 여러 작업 수를 조합한 6,000회 재사용, 동시 실행 한도, 예외 후 join·재사용, 호출 직렬화를 확인했다.
+- Completion: stale/torn/zero/wrap, 구 skeleton fallback, 같은 token 재진입 방지, 다음 token 진행 및 500회 완료/disarm race를 확인했다. Worker 시작을 기다리지 않는 별도 200,000회 stress도 통과했다.
+- 실제 token wrapper를 host stub과 연결해 잘못된 session/graph/activation, 정상 완료, timeout, 실행 오류, 종료 경로를 확인했다. KV pointer 검색은 실제 새 lambda를 이전 hash 동작과 70,720건 비교했다. 관련 ASan/UBSan 검사도 통과했다.
+- TSan 실행은 환경의 unexpected memory mapping 오류로 시작하지 못했다. Host 검사는 실제 Hexagon cache visibility나 모든 하드웨어 산술을 증명하지 않는다. Framework 전체 suite와 기기 최종 검증은 소스 freeze 이후의 별도 결과를 따른다.
+- 첫 DONE=1 실행은 생성 도중 로그가 끝났고 원래 benchmark가 application 종료 코드를 보존하지 않아 원인이 확정되지 않았다. 이후 반복 실행에서 정상 종료와 baseline token ID 일치를 확인했지만, 이를 근거로 첫 중단 원인이 해결됐다고 주장하지 않는다. 다른 작업의 동일 기기 사용도 나중에 확인했으나 첫 중단과의 시간 중첩은 입증되지 않았다. 이 때문에 완료 hint는 기본 비활성으로 남겼다.
+- 원본 checkpoint 대비 PPL, 다양한 prompt, 모든 OS/컴파일러 조합은 이 host 검토 범위 밖이다.
+
+최종 소스 옵션 요약
+런타임:
+  NNTR_MOE_DEMAND_POOL        기본 on; 0으로 기존 ThreadManager 사용.
+  NNTR_MOE_COALESCE_READ      기본 on; 0으로 인접 expert read 결합 해제. 기준선의 기존 기능.
+  NNTR_MOE_CANCEL_STALE_READ  기본 on; 0으로 stale speculative read 취소 해제. 기준선의 기존 기능.
+  NNTR_MOE_SERVER_DONE        기본 off; 1로 완료 hint 사용. 최종 실행 wrapper에서 명시적으로 1 설정.
+  NNTR_HTP_PROFILE            profiling 요청 시 상세 계측 사용. 일반 속도 측정은 unset.
+  NNTR_MOE_SERVER_AFFINITY / NNTR_MOE_DONE_POLL_INTERVAL / NNTR_MOE_SERVER_YIELD 실험 코드는 제거.
+컴파일 시:
+  NNTR_GRAPH_PROFILE_ON_DEMAND=1 기본; 0은 기존 상시 token 계측 비교용.
+  NNTR_ROUTER_BF16_IF_EXACT=1은 v81 기본이며 다른 target은 기존 FP32 기본.
+  HVX_FC_M1_COLS=4 및 NNTR_FC_M1_ALIGN_BLOCKS=1은 HVX v81 이상 기본.
+  NNTR_ATTN_Q8_GQA8_REUSE/QK_PAIR/HEAD_PREP/HEAD_PIPELINE=1은 v81 기본.
+  NNTR_ATTN_Q8_NARROW_PREFETCH=1은 Hexagon v81 이상 기본.

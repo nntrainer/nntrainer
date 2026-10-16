@@ -19,7 +19,9 @@
 #include <float_tensor.h>
 #include <int4_utils.h>
 #include <q4_0_utils.h>
+#include <qs4acx_tensor.h>
 #include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
+#include <ternary_tensor.h>
 #include <thread_manager.h>
 
 #include <tensor.h>
@@ -763,6 +765,40 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QS4CX:
     dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QS4CX_WH_AFFINE:
+  case Tdatatype::QS4CX_WH: {
+    auto *ops = getOps();
+    if (trans || trans_in || beta != 0.0f ||
+        !ops->supports_gemm_qs4cx_accel_fp32() ||
+        !ops->set_fc_wh_source(input.getData(), input.height(), input.width(),
+                               input.getDataType() ==
+                                 Tdatatype::QS4CX_WH_AFFINE))
+      throw std::invalid_argument(
+        "QS4CX_WH dot requires the HTP FC kernel with no transpose or beta");
+    dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
+    break;
+  }
+  case Tdatatype::TQ2CX:
+    dotTernary(input, output, trans, trans_in, beta);
+    break;
+  case Tdatatype::QS4ACX:
+    dotQs4acx(input, output, trans, trans_in, beta);
+    break;
+  case Tdatatype::QS2CX_WH:
+  case Tdatatype::TL2CX_WH:
+    // Same as below, and one step further out of reach: the codes are two
+    // bits into a palette and have to be expanded in VTCM first.
+    // Reaching a CPU kernel at all is the error. These nibbles are in the
+    // HMX unit's weight-tile layout (htp_wh_layout.h), which no kernel here
+    // can read, so the weight has to go to the accelerator or not be built
+    // this way. Named rather than left to the default, because "unsupported
+    // datatype" says nothing about which of the two to change.
+    throw std::invalid_argument(
+      "QS4CX_WH / QS2CX_WH weights have no CPU kernel: they are pre-arranged "
+      "for the HTP. Either route this layer to the HTP (nntr_config.json: "
+      "\"moe_engine\": \"htp\", and every MoE layer listed in "
+      "\"moe_htp_layers\" -- an empty value means all of them), or "
+      "re-quantize with --moe_dtype QS4CX.");
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
@@ -776,9 +812,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
-  // Handle standard inputs. The batched fast path is Q4_0-only: int4 weights
-  // are QS4CX and go through the per-item dot above.
-  if (input_dtype != Tdatatype::Q4_0) {
+  // Group accelerator QS4CX projections that share the same activation.
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QS4CX) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -802,12 +837,32 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   // non-accel branch below therefore has to take it from the CPU table
   // explicitly rather than from this (possibly accelerator) tensor's ops.
   auto *cpu_o = nntrainer::getComputeOps();
-  if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
-    o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
-  } else {
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
-                            Ns[i]);
+  if (input_dtype == Tdatatype::Q4_0) {
+    if (o->supports_gemm_q4_0_batch_fp32() &&
+        (M > 1 || o->accelerates_q4_0_at_m1())) {
+      o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
+    } else {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                              Ns[i]);
+      }
+    }
+  } else if (input_dtype == Tdatatype::QS4CX) {
+    // Same shared-activation grouping as the Q4_0 branch above (decode's
+    // top-K experts' gate_up projections); without this branch these
+    // weights fell through to the "standard inputs" loop at the top of
+    // this function, i.e. one dot() -- one FastRPC call -- per expert.
+    if (o->supports_gemm_qs4cx_batch_fp32() &&
+        (M > 1 || o->accelerates_qs4cx_at_m1())) {
+      std::vector<float *> ascales;
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        ascales.push_back(input[i]->getScale<float>());
+      }
+      o->gemm_qs4cx_batch_fp32(mdatas, ascales, data, rdatas, M, Ns, K);
+    } else {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        dot(*input[i], *output[i], trans, trans_in, beta);
+      }
     }
   }
 }
@@ -981,7 +1036,8 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
+    if (o->supports_gemm_q4_0_accel_fp32() &&
+        (M > 1 || o->accelerates_q4_0_at_m1())) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
       // Scalar Q4_0 GEMM/GEMV is a CPU-table op (an accelerator ComputeOps
@@ -1046,6 +1102,23 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
+
+  // An accelerator that takes QS4CX directly skips the Q4_0 detour: the
+  // weight was quantized once, from FP32, and the int4 values on disk are
+  // already the ones the accelerator's registry wants. The M == 1 gate is
+  // the backend's own answer for this format: it may want decode's row
+  // too, rather than a CPU kernel on the same bytes.
+  auto *o = getOps();
+  if (o->supports_gemm_qs4cx_accel_fp32() &&
+      (M > 1 || o->accelerates_qs4cx_at_m1() ||
+       input.getDataType() == Tdatatype::QS4CX_WH ||
+       input.getDataType() == Tdatatype::QS4CX_WH_AFFINE)) {
+    o->gemm_qs4cx_accel_fp32(input.getData<char>(), input.getScale<float>(),
+                             (float *)getData(), output.getData<float>(), M, N,
+                             K);
+    return output;
+  }
+
   // Every arm below reads the plain nibbles (directly, or through a pack that
   // was built from them). A weight whose payload a GPU backend released after
   // its device repack must be refused here, not multiplied as zeros.
@@ -1120,6 +1193,74 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
                                     opt_kernel_idx, true);
 #endif
 
+  return output;
+}
+
+Tensor &FloatTensor::dotTernary(Tensor const &input, Tensor &output, bool trans,
+                                bool trans_in, float beta) const {
+  // The TQ2CX record is the canonical [OUT, IN] weight, i.e. an already
+  // transposed rhs, so there is no operand left for trans / trans_in.
+  NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
+    << "[FloatTensor::dotTernary] a TQ2CX weight cannot be transposed";
+  NNTR_THROW_IF(input.getDim().channel() != 1, std::invalid_argument)
+    << "[FloatTensor::dotTernary] a stacked (E > 1) TQ2CX weight has no "
+       "single operand; route one expert record at a time";
+  NNTR_THROW_IF(output.getDataType() != Tdatatype::FP32, std::invalid_argument)
+    << "[FloatTensor::dotTernary] TQ2CX dot writes FP32 output only";
+
+  // the weight is (K, N); every leading dimension of the activation is
+  // folded into the rows
+  const size_t K = getDim().width();
+  const size_t M = getDim().getDataLen() / K;
+  const size_t N = input.getDim().width();
+  NNTR_THROW_IF(input.getDim().height() != K, std::invalid_argument)
+    << "[FloatTensor::dotTernary] weight IN " << input.getDim().height()
+    << " != activation width " << K;
+  NNTR_THROW_IF(output.getDim().getDataLen() != M * N, std::invalid_argument)
+    << "[FloatTensor::dotTernary] output size mismatch";
+
+  refuseIfTq2cxPayloadReleased(input.getData(), "FloatTensor::dotTernary");
+  auto *o = getOps();
+  if (beta == 0.0f && o->supports_gemm_tq2cx_batch_fp32()) {
+    std::vector<void *> weights = {(void *)input.getData<uint8_t>()};
+    std::vector<float *> outputs = {output.getData<float>()};
+    o->gemm_tq2cx_batch_fp32(
+      weights, (float *)getData(), outputs, static_cast<unsigned int>(M),
+      {static_cast<unsigned int>(N)}, static_cast<unsigned int>(K));
+  } else {
+    // accumulation into the output: scalar reference
+    tq2cx_gemm_ref_fp32(M, N, K, (const float *)getData(), K, input.getData(),
+                        output.getData<float>(), N, beta);
+  }
+  return output;
+}
+
+Tensor &FloatTensor::dotQs4acx(Tensor const &input, Tensor &output, bool trans,
+                               bool trans_in, float beta) const {
+  NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
+    << "[FloatTensor::dotQs4acx] a QS4ACX weight cannot be transposed";
+  NNTR_THROW_IF(beta != 0.0f, std::invalid_argument)
+    << "[FloatTensor::dotQs4acx] accumulation (beta) is not supported";
+  NNTR_THROW_IF(output.getDataType() != Tdatatype::FP32, std::invalid_argument)
+    << "[FloatTensor::dotQs4acx] QS4ACX dot writes FP32 output only";
+
+  const size_t K = getDim().width();
+  const size_t M = getDim().getDataLen() / K;
+  const size_t N = input.getDim().width();
+  NNTR_THROW_IF(input.getDim().height() != K, std::invalid_argument)
+    << "[FloatTensor::dotQs4acx] weight IN " << input.getDim().height()
+    << " != activation width " << K;
+  NNTR_THROW_IF(output.getDim().getDataLen() != M * N, std::invalid_argument)
+    << "[FloatTensor::dotQs4acx] output size mismatch";
+
+  refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
+                              "FloatTensor::dotQs4acx");
+  // Reference path (correctness only): fp32 activations, no ISA kernel. An
+  // optimized lane runs the QS4CX kernel on the record prefix and adds
+  // corr x rowsum(x) in its epilogue.
+  qs4acx_gemm_ref_fp32(M, N, K, (const float *)getData(), K,
+                       input.getData<uint8_t>(), nullptr,
+                       output.getData<float>(), N);
   return output;
 }
 

@@ -208,9 +208,20 @@ TEST(KVRing, model_default_and_env_precedence) {
   }
   {
     ScopedEnv ring("NNTR_KV_WINDOW_RING", "0");
+    EXPECT_TRUE(causallm::kvRingOptedOut());
     EXPECT_FALSE(causallm::kvRingEnabled(true));
     EXPECT_EQ(causallm::requestedPrefillChunk(true), 0u);
     EXPECT_EQ(causallm::kvRingCap(512, 32768, 1024, true), 0u);
+  }
+  {
+    // only an explicit, non-truthy value is the opt-out (it also withdraws
+    // Transformer::chunkLongPrompts()); unset or truthy is not
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", nullptr);
+    EXPECT_FALSE(causallm::kvRingOptedOut());
+  }
+  {
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
+    EXPECT_FALSE(causallm::kvRingOptedOut());
   }
   {
     ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
@@ -227,10 +238,11 @@ TEST(KVRing, model_default_and_env_precedence) {
 
 /**
  * @brief The capacity formula, pinned value by value.
- * @details cap = (W / C + 2) * C, or 0 when that would not shrink max_seq.
- * Any reimplementation of the rule (a kernel-side copy, a future refactor) must
- * reproduce this table exactly; the two consumers sizing and indexing the same
- * buffer differently is a heap overwrite.
+ * @details cap = the smallest multiple of C that is >= W + C (W, C on the
+ * 64-row grid; (W / C + 2) * C off it), or 0 when that would not shrink
+ * max_seq. Any reimplementation of the rule (a kernel-side copy, a future
+ * refactor) must reproduce this table exactly; the two consumers sizing and
+ * indexing the same buffer differently is a heap overwrite.
  */
 TEST(KVRing, capacity_table) {
   RingOn on;
@@ -241,17 +253,21 @@ TEST(KVRing, capacity_table) {
     unsigned int expected;
   };
   const std::vector<Row> table = {
-    // W      max_seq    C      expected = (W / C + 2) * C, or 0
+    // W      max_seq    C      expected = ceil(W / C) * C + C, or 0
     {512, 32768, 4096, 8192},   // W < C   -> 2C
-    {1024, 32768, 1024, 3072},  // W == C  -> 3C
-    {4096, 32768, 1024, 6144},  // W == 4C -> 6C
-    {512, 32768, 512, 1536},    //
+    {1024, 32768, 1024, 2048},  // W == C  -> 2C
+    {1024, 2560, 1024, 2048},   // the Gemma4 MoE pack at plane 1024
+    {1024, 2560, 512, 1536},    // ... and at plane 512
+    {4096, 32768, 1024, 5120},  // W == 4C -> 5C
+    {512, 32768, 512, 1024},    //
     {512, 32768, 1024, 2048},   //
     {2048, 32768, 4096, 8192},  //
-    {8192, 65536, 4096, 16384}, // W == 2C -> 4C
-    {4096, 16384, 4096, 12288}, // 3C < max_seq -> shrinks, keep it
+    {8192, 65536, 4096, 12288}, // W == 2C -> 3C
+    {4096, 16384, 4096, 8192},  // 2C < max_seq -> shrinks, keep it
     {1024, 8192, 4096, 0},      // 2C == max_seq -> no benefit
     {1024, 8193, 4096, 8192},   // one row of benefit is still benefit
+    {1000, 32768, 1024, 2048},  // W off the 64 grid -> (W / C + 2) * C
+    {1024, 32768, 1000, 3000},  // C off the 64 grid -> (W / C + 2) * C
   };
   for (const auto &r : table)
     EXPECT_EQ(causallm::kvRingCap(r.W, r.max_seq, r.C), r.expected)
@@ -501,11 +517,12 @@ TEST(KVRing, mirror_rows_table) {
     // W     C      max_seq   expected mirror rows (ring cap in the comment)
     {512, 4096, 32768, 4672},   // cap 8192  -> 4672  (the 0.3B/1.5B model cell)
     {512, 1024, 32768, 1600},   // cap 2048  -> 1600
-    {512, 512, 32768, 1088},    // cap 1536  -> 1088
-    {1024, 1024, 32768, 2112},  // cap 3072  -> 2112
-    {4096, 1024, 32768, 5184},  // cap 6144  -> 5184
+    {512, 512, 32768, 1024},    // cap 1024  -> 1024 (Wcap-bounded)
+    {1024, 1024, 32768, 2048},  // cap 2048  -> 2048 (Wcap-bounded)
+    {1024, 512, 2560, 1536},    // cap 1536  -> 1536 (Gemma4 MoE, plane 512)
+    {4096, 1024, 32768, 5120},  // cap 5120  -> 5120 (Wcap-bounded)
     {2048, 4096, 32768, 6208},  // cap 8192  -> 6208
-    {8192, 4096, 65536, 12352}, // cap 16384 -> 12352
+    {8192, 4096, 65536, 12288}, // cap 12288 -> 12288 (Wcap-bounded)
   };
   for (const auto &r : table) {
     const unsigned int cap = causallm::kvRingCap(r.W, r.max_seq, r.C);
@@ -547,9 +564,24 @@ TEST(KVRing, mirror_rows_holds_one_launch) {
         const unsigned int rows = causallm::kvMirrorRows(cap, W, C);
         ASSERT_LE(rows, cap) << "W=" << W << " C=" << C;
         ASSERT_GE(rows, W + C) << "W=" << W << " C=" << C; // the exact floor
-        if (rows == cap)
-          continue; // Wcap-bounded: the 64-aligned base may not fit, and
-                    // mha_core takes the exact floor there
+        if (rows == cap) {
+          // Wcap-bounded. Off the 64 grid the 64-aligned base may not fit and
+          // mha_core takes the exact floor there. On it, a launch the producer
+          // phases on the C grid (it never crosses a multiple of C) still fits
+          // with the 64-floored base, which is what keeps ring on == ring off
+          // bit for bit on the Adreno image arm.
+          if ((W % 64u) != 0u || (C % 64u) != 0u)
+            continue;
+          for (unsigned int phase : {0u, 1u, 63u, 64u, C / 2u, C - 1u}) {
+            const unsigned int f = 8u * C + phase;
+            const unsigned int S = C - phase; // up to the next C boundary
+            const unsigned int need_lo = f + 1u > W ? f + 1u - W : 0u;
+            const unsigned int base = need_lo & ~63u;
+            ASSERT_LE(f + S - base, rows)
+              << "W=" << W << " C=" << C << " phase=" << phase;
+          }
+          continue;
+        }
         // the worst launch: f is 1 past a 64 boundary, S == C
         for (unsigned int phase : {0u, 1u, 32u, 63u}) {
           const unsigned int f = 8u * C + phase;
@@ -648,13 +680,16 @@ TEST(KVRing, decode_capacity_is_independent_of_the_prefill_block) {
     EXPECT_EQ(cap % C, 0u) << "C=" << C;
     EXPECT_GE(cap, W + C) << "C=" << C;
     EXPECT_GE(rows, W + C) << "C=" << C;
-    // decode side: one answer for every block, and always the smaller one
+    // decode side: one answer for every block, and never the larger one
+    // (at C == W the tight ring is W + C rows, which is exactly W + slack)
     EXPECT_EQ(dec, 1024u) << "C=" << C;
-    EXPECT_LT(dec, cap) << "C=" << C;
+    EXPECT_LE(dec, cap) << "C=" << C;
     EXPECT_LE(dec, rows) << "C=" << C;
     // the eager-slide fallback agrees wherever the mirror is the taller of the
-    // two (it is only consulted when the mirror was not resized)
-    EXPECT_EQ(causallm::kvDecodeMirrorSpan(W, rows), dec) << "C=" << C;
+    // two (it is only consulted when the mirror was not resized), and has
+    // nothing to bound where the mirror is already that tight
+    EXPECT_EQ(causallm::kvDecodeMirrorSpan(W, rows), dec < rows ? dec : 0u)
+      << "C=" << C;
   }
   // and the ring cap really does move with the block, so the invariance above
   // is a decoupling rather than a constant on both sides
@@ -761,9 +796,15 @@ TEST(KVRing, slab_sync_segments_stay_inside_both_allocations) {
  * now and reproducibility is one env away. The per-layer predicate stays, and
  * stays pinned, because the bound is one env away too.
  *
- * Pinned here because the whole contract is "no environment = the fast arm,
- * NNTR_DETERMINISTIC=1 = no layer on the image path", and both halves are
- * one-line predicates that a later refactor could invert without any test
+ * On the Android gpu engine the unset default is the reproducible arm (with
+ * the Adreno flash decode and GPU prefill attention, which made it the faster
+ * arm there); nntr_deterministic_default_on() is the one place that is
+ * decided, and off Android it stays the fast arm.
+ *
+ * Pinned here because the whole contract is "no environment = the platform
+ * default (the fast arm off Android), NNTR_DETERMINISTIC=0 = the fast arm,
+ * NNTR_DETERMINISTIC=1 = no layer on the image path", and each part is a
+ * one-line predicate that a later refactor could invert without any test
  * noticing.
  */
 TEST(KVRing, det_arm_per_layer_rule) {
@@ -773,10 +814,24 @@ TEST(KVRing, det_arm_per_layer_rule) {
   ScopedEnv allow("NNTR_ALLOW_NONDETERMINISTIC", nullptr);
   ScopedEnv wmax("NNTR_DET_IMG_WINDOW_MAX", nullptr);
   causallm::packAllowsNondeterministic() = false;
+  // The unset default: the reproducible arm on the Android gpu engine, the
+  // fast arm everywhere else (x86 / Intel, CUDA, the cpu engine).
+  const causallm::DetArm kDefault = nntr_deterministic_default_on()
+                                      ? causallm::DetArm::kPerLayer
+                                      : causallm::DetArm::kFast;
+#if !defined(__ANDROID__)
+  EXPECT_EQ(kDefault, causallm::DetArm::kFast);
+#endif
+  {
+    ScopedEnv cpu("NNTR_ENGINE", "cpu"); // never the default on a cpu engine
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+    ScopedEnv cuda("NNTR_ENGINE", "cuda"); // nor on a cuda one
+    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+  }
 
   { // the image bundle is not in play at all -> no layer takes it, any arm
     ScopedEnv img("NNTR_KV_IMG_ATTN", nullptr);
-    EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
+    EXPECT_EQ(causallm::detArm(), kDefault);
     EXPECT_FALSE(causallm::imageAttnRequested());
     EXPECT_FALSE(causallm::imageAttnLayer(512, MAXT));
     EXPECT_FALSE(causallm::imageAttnLayer(kFull, MAXT));
@@ -791,9 +846,12 @@ TEST(KVRing, det_arm_per_layer_rule) {
   }
 
   ScopedEnv img("NNTR_KV_IMG_ATTN", "1");
+  EXPECT_EQ(causallm::detArm(), kDefault); // no environment
 
-  // THE DEFAULT, no environment: the fast arm, EVERY layer on the image path
-  // (windowed, full, however the window is spelled).
+  // THE FAST ARM (the default off Android, NNTR_DETERMINISTIC=0 on it): EVERY
+  // layer on the image path (windowed, full, however the window is spelled).
+  ScopedEnv fast("NNTR_DETERMINISTIC",
+                 kDefault == causallm::DetArm::kFast ? nullptr : "0");
   EXPECT_EQ(causallm::detArm(), causallm::DetArm::kFast);
   EXPECT_FALSE(causallm::determinismFirst());
   EXPECT_TRUE(causallm::imageAttnRequested());
@@ -912,7 +970,7 @@ TEST(KVRing, ring_survives_both_arms) {
   const bool ring_arm = false; // no OpenCL arm to serve the gpu engine
 #endif
   {
-    ScopedEnv det("NNTR_DETERMINISTIC", nullptr); // the fast default
+    ScopedEnv det("NNTR_DETERMINISTIC", nullptr); // the platform default arm
     EXPECT_EQ(causallm::kvRingArmAvailable(), ring_arm);
     // a windowed layer is ringed; a full-attention one never is, on any arm
     EXPECT_EQ(causallm::kvRingCap(512, 16896, 4096, true) > 0u, ring_arm);

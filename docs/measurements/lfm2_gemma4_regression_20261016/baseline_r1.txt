@@ -1,0 +1,81 @@
+/data/local/tmp/nntr_lfm2_gemma_regression_20261016/model
+/data/local/tmp/nntr_lfm2_gemma_regression_20261016/model/nntr_gemma4_ternary_tl2_qs4cx_wh_affine.bin
+[HTP] ppl levers=0x0 L1=exact
+[HTP] graph: description n_ops=542 resident=RMSNORM|FC|QK_NORM|ROPE|ATTN_M1|ADD|ROUTER_TOPK|MOE|DENSE_FFN|LM_HEAD moe_ops=30
+[HTP] gemma: list n_ops=542 layers=30 params=60 by name
+[MoE] preload_experts=128 cache_slots=480
+[HTP] moe m1 gemv: on (applied=0xcf03e1) lead=192KB rows1=1 feed=vtcm dma_bypass=1 dma_q=4 source=default
+[HTP] lm_head on the NPU: 262144 x 2816 QS4CX as 64 WH slices of 4096 (prefill row and decode), 352.0 MiB, placed in 47 ms
+[HTP] graph: q4m1 weights=206 handles=0 feed=vtcm wh_handles=634
+[HTP] e2e: fc arena weights=206 handles=0 attach_mib=0.0 chunks=0 mapped_mib=0 feed=vtcm load_ms=46.6 lanes=6,3 s1_arena_mib=1408 s1_heap_kib=90699
+<bos><|turn>user
+Read the following notes about planning a community garden.
+
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test the soil, arrange a reliable water supply, and divide the space into accessible beds. Volunteers share tools, keep a planting calendar, make compost, and check the plants regularly. Clear responsibilities and regular meetings help the project continue throughout the year.
+A community garden provides fresh vegetables and a place for neighbors to work together. The organizers choose a sunny site, test Additional note.
+Using these notes, write a detailed practical guide of at least 150 words for starting and maintaining the garden.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>
+[HTP] CPU prefill scratch discarded: 87 MiB of virtual pages
+[HTP-MEM] released_prefill_scratch_bytes=162861056
+[HTP] mem t1 before graph init (= prefill end): s1_heap_mib=127 staging_pools_mib=0 rss_mib=614 mem_available_mib=3847
+[HTP] mem t1 after graph init: s1_heap_mib=152 staging_pools_mib=0 rss_mib=614 mem_available_mib=3921
+[HTP] graph: init n_ops=542 resident=RMSNORM|FC|QK_NORM|ROPE|ATTN_M1|ADD|ROUTER_TOPK|MOE|DENSE_FFN|LM_HEAD moe_ops=30
+[HTP] e2e: freed 0 quantized KV caches
+[HTP] attn_m1: registered layers=25 kv=8 gqa=2 head_dim=256 max_seq=2048 cache=204800 KiB int8
+[HTP] attn_m1: registered layers=5 kv=2 gqa=8 head_dim=512 max_seq=2048 cache=20480 KiB int8
+[HTP] dspq: on queue=0xab8400000000 dsp_spin_us=0 arm_spin_us=5000 buffers=65536+1048576 ion=y domain=3
+[HTP] token driver: on mbox=65536 spin_us=0 moe_ops=30 logits_buf=1048576 fadvise=0
+[HTP] t1: graph_init_ms=106.5
+[HTP-PREFETCH] direct slots=32 bytes=41287680 readers=2
+[HTP] t1: pool_sync_ms=2.2 (drop_host_fc+pin 0.3) kv_seed_rpc_ms=80.2 seeds=30 (dsp 0, kvq freed late 0) rss_mib=633.8 mem_available_mib=4025.1
+[HTP] demand read pool: readers=4
+[HTP] token driver: first token pos=1024 id=61286 us=167183 logits=0
+ Practical Guide: Starting and Maintaining a Community Garden
+
+A community garden is more than just a source of fresh vegetables; it is a vital social hub that fosters cooperation and community building among neighbors. To ensure the project’s success and longevity, the following guide outlines the essential steps for planning and maintenance.
+
+#### Phase
+
+=================[ LLM with NNTrainer ]===================
+prefill: 1024 tokens, 1597 ms, 641.202 TPS
+generation: 64 tokens, 5032 ms, 12.7186 TPS
+total: 6678 ms
+peak memory: 3355884 KB
+  (honest RssAnon+accel: 3355884 KB, ru_maxrss: 1732228 KB)
+==========================================================
+[PERF-SPLIT] prefill_tok=1024 prefill_ms=1597 drain_ms=0 ttft_ms=2046.19 first_token_ms=400.063 steady_ms=71.9178 steady_tok=63 gen_tok=64 e2e_ms=6678
+[e2e time]: 7879 ms
+Max Resident Set Size: 1732228 KB
+[HTP] dspq: close calls=64 served=64 bad=0 empty_polls=0 dsp_spin_us=0 stop_err=0x0
+[HTP] graph: tokens=64 pcyc/token=0 wait_us/token=0.0
+[HTP] graph per-kind pcyc/token: | wall_ms/token=71.842 mhz=1799 spin_us=0
+[HTP] graph per-kind us/token: | ops/wall=0.0000 compute_mhz=2112
+[HTP] token driver: L0 wake us/token disp=34.7 pkt=8.2 ret=1910.5 clk_resid=-0.1
+[HTP] token driver: L0 us/token rt=73795.6 dsp_wall=71842.2 wake=1953.4 hop_us=0.0 arm_fwd=74321.8 arm_us=713.1 arm_n=63
+[HTP] token driver: pool finish us/token idle=9.2 predictor=0.2 prefetch=0.1
+[HTP] token driver: pool misses=6189 misses/token=96.70 miss_wait_us/token=26584.5 rounds=1855 arm_ms/round=1.248 pgpgin_mib=9444.0 rss_mib=184.7 mem_available_mib=4481.7
+[HTP] token driver: round us: notice=0 pre=17 read=1230 answer=1248 (arm total) | dsp overlap=404 wait=917 anslat=73 rebind=29
+[HTP] token driver: expert_pair_reads=2162
+[HTP] token driver: prefetch hints/token=29.00 issued/token=0.00 done=0 useful/token=0.00
+[HTP] token driver: moe calls/token=58.33 (one-at-a-time 206.97)
+[HTP] token driver: close tokens=64 hops/token=0.00 served=64 timeouts=0 stale=0 id_checked=0 id_mismatch=0 stop_err=0x0
+[HTP] e2e: close mapped_mib=1.12 unmap_fail=0 detach_fail=0 heap_used_kib=389227 (info rc 0x0)
+[HTP-PREDICT] arm submitted=1856 completed=1856 failed=0 full=0
+[HTP-PREFETCH] submitted=6593 completed=5125 used=4027 late=2221 discarded=2566 failed=0 full=0 joined=2221 cancelled=559 registration_rpc=0
+[HTP] arena: chunks unmapped 8/8 mib=1792 (release rc=0x0 put=8)
+[HTP] graph: forward calls=64 tokens=64 calls/token=1.00
+[HTP] graph: cpu fc skipped=9630

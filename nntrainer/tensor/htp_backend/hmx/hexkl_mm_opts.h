@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
+ * @file   hexkl_mm_opts.h
+ * @date   08 Aug 2026
+ * @brief  Optional behaviors of hexkl_mm_u8iX_layer_run, as one parameter
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * Three callers want three different extras from layer_run -- the FC path
+ * wants the quant worker pool, attention's P.V wants that plus caller-known
+ * quantization params and accumulate-into-output -- and growing the
+ * signature once per extra had it at twelve positional arguments. One
+ * struct, NULL meaning "all defaults", ends that; the next extra is a field,
+ * not a churn through every caller.
+ */
+
+#ifndef __NNTRAINER_HEXKL_MM_OPTS_H__
+#define __NNTRAINER_HEXKL_MM_OPTS_H__
+
+#include <stdint.h>
+
+#include "hvx_worker_pool.h"
+
+typedef struct {
+  /** Splits the quant passes by row/k-tile. NULL runs them single-threaded. */
+  hvx_worker_pool *pool;
+
+  /** Both NULL, or both m_pad = ROUND_UP(M, 64) entries: per-row activation
+      quant params to use INSTEAD of scanning act_f32 for min/max. Only valid
+      when the caller can produce exactly what the scan would -- attention's
+      P.V does, because the blocked softmax already computed each (row, block)
+      maximum while storing P, and p >= 0 pins rmin at 0. Anything short of
+      exact reproduction is an accuracy change, not an optimization
+      (hexkl_attn_u8.h records the constant-params version of that mistake). */
+  const float *act_scale;
+  const int32_t *act_zp;
+
+  /** Nonzero: out_cat += result instead of =. The adds land per element in
+      the same per-call order either way, so accumulating here is bitwise
+      identical to staging into a scratch and adding afterwards -- which is
+      the caller loop this flag deletes. */
+  int accumulate;
+
+  /** Non-NULL: the caller already quantized AND AH-tile-packed the
+      activation on the ARM side (nntrainer/tensor/htp_act_quant.h's
+      htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
+      hvx_quant_pack_u8_ah below), m_pad(M)*K bytes where m_pad is the same
+      64-row rounding every caller of layer_run already computes. act_f32
+      may be NULL in this case -- there is nothing left to quantize -- and
+      act_scale/act_zp must be the caller's own (not a DSP-side scan's),
+      required alongside this field. Lets the DSP skip the whole quant
+      pass (not just its scan, which act_scale/act_zp alone already skip)
+      and DMA the bytes into VTCM the way a weight tile lands there,
+      instead of re-quantizing f32 that was never sent -- see
+      docs/htp_attention's u8-boundary task for the transport arithmetic
+      this buys. */
+  const uint8_t *act_ah_prepacked;
+
+  /** Non-NULL: act_f32's rows are RMS-normed (pre_gamma, NULL = 1, and
+      pre_eps) on their way into the quant pass, through this scratch of
+      M x K floats at most (hvx_quant_params_pack_u8_ah), instead of by a
+      separate pass writing all M normed rows out. Not with act_scale. */
+  float *pre_scratch;
+  const float *pre_gamma;
+  float pre_eps;
+
+  /** Non-NULL: the activation is the attention's u16 output, M x K with a
+      (scale, zero point) per head of act16_hd columns in act16_enc[2h],
+      act16_enc[2h + 1]: a row is dequantized, (u - zp) * scale as the
+      CPU's dequant_u16_f32, into pre_scratch on its way into the quant
+      pass, where the pre norm would be, so the f32 never exists in DDR.
+      act_f32 may be NULL. Needs pre_scratch; not with pre_gamma or
+      act_scale. */
+  const uint16_t *act_u16;
+  const float *act16_enc;
+  uint32_t act16_hd;
+
+  /** Both NULL, or both n_handles entries: handle i's row m goes to
+      out_cat + out_off[i] + m * out_ld[i] instead of the packed [M x N_i]
+      blocks, so the column slices of one weight land as its row-major
+      [M x N] and the host copies it out whole. Needs the in-place
+      accumulator layout (AEE_EUNSUPPORTED otherwise); the caller keeps the
+      handles' rectangles inside out_cat and apart. */
+  const uint32_t *out_off;
+  const uint32_t *out_ld;
+
+  /** post_done non-NULL asks for the per-head passes that follow the
+      matmul inside its dequant epilogue: handle i's rows RMS-normed
+      post_chunk[i] columns at a time (0: no norm; its gamma is the next
+      post_chunk[i] floats of post_gamma, post_eps) and, for the first
+      rope_handles handles, rotated (rope_hd, rope_cs[M][2 * rope_hd]) --
+      hvx_rmsnorm_row_chunks_f32 then hvx_rope_row_f32 on each row's
+      staged run of columns while it is in the cache, the floats of the
+      whole-tensor passes. *post_done is set to 1 when the kernel did all
+      of them and left at 0 when it did none (a staging batch that would
+      cut a head, or the unpipelined path): the caller then runs them. */
+  int *post_done;
+  const uint32_t *post_chunk;
+  const float *post_gamma;
+  float post_eps;
+  uint32_t rope_hd, rope_handles;
+  const float *rope_cs;
+
+  /** [P3] post_res non-NULL asks for the whole-row residual epilogue in
+      the same dequant epilogue, needs post_done and out_off/out_ld laying
+      every handle row-major in one [M x N] (N the handles' widths summed):
+      row r of out_cat becomes (post_res[r] + rmsnorm(x[r]) * post_res_gamma
+      (NULL = 1, post_res_eps)) * post_res_scale in place, the floats of
+      hvx_rmsnorm_add_blocks_f32 over the row's column batches as they
+      land (the squares summed per lane in column order across batches
+      and handles, the finish on the last batch). *post_done says whether
+      it happened, as for the per-head passes; when not, the caller runs
+      hvx_rmsnorm_add_blocks_f32 over the row-major rows itself. */
+  const float *post_res;
+  const float *post_res_gamma;
+  float post_res_eps, post_res_scale;
+} hexkl_mm_opts;
+
+#endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

@@ -53,28 +53,43 @@ public:
   /**
    * @brief Tensor Data Type.
    * Currently support QINT4, QINT8, QINT16, BCQ, Q4_K, UINT8, UINT16, UINT32,
-   * FP16 & FP32
+   * QS4CX, TQ2CX, QS4ACX, FP16 & FP32
    */
   enum class DataType {
-    QINT4,  /** [DEPRECATED - use QS4CX] per-channel int4 held in the
-               KleidiAI qsi4cxp packed layout. QS4CX is the canonical int4
-               weight format; QINT4 is kept read-only so existing files still
-               load, and is transcoded to QS4CX on read. */
-    QINT8,  /** quantized int 8*/
-    QINT16, /** quantized int 16*/
-    BCQ,    /** binary-code-based quantized*/
-    Q4_K,   /** Q4_K quantized*/
-    Q6_K,   /** q6 k quantized */
-    Q4_0,   /** Q4_0 k quantized */
-    QS4CX,  /** per-channel int4, the canonical int4 weight format: plain
-               row-major nibbles plus one fp32 scale per output channel. */
-    UINT4,  /** quantized unsigned int 4*/
-    UINT8,  /** unsigned int 8 bit */
-    UINT16, /** unsigned int 16 bit */
-    UINT32, /** unsigned int 32 bit */
-    FP16,   /** half precision */
-    FP32,   /** single precision */
-    NONE,   /** not specified */
+    QINT4,    /** [DEPRECATED - use QS4CX] per-channel int4 held in the
+                 KleidiAI qsi4cxp packed layout. QS4CX is the canonical int4
+                 weight format; QINT4 is kept read-only so existing files still
+                 load, and is transcoded to QS4CX on read. */
+    QINT8,    /** quantized int 8*/
+    QINT16,   /** quantized int 16*/
+    BCQ,      /** binary-code-based quantized*/
+    Q4_K,     /** Q4_K quantized*/
+    Q6_K,     /** q6 k quantized */
+    Q4_0,     /** Q4_0 k quantized */
+    QS4CX,    /** per-channel int4, the canonical int4 weight format: plain
+                 row-major nibbles plus one fp32 scale per output channel. */
+    TQ2CX,    /** ternary {-1, 0, +1} as two bit planes, fp32 scale per
+                 output channel */
+    QS4ACX,   /** QS4CX record + fp32 zero point per output channel */
+    UINT4,    /** quantized unsigned int 4*/
+    UINT8,    /** unsigned int 8 bit */
+    UINT16,   /** unsigned int 16 bit */
+    UINT32,   /** unsigned int 32 bit */
+    FP16,     /** half precision */
+    FP32,     /** single precision */
+    NONE,     /** not specified */
+    QS4CX_WH, /** QS4CX whose nibbles are in the HMX WH tile layout, with a
+                  per-output-channel column sum after the scales. Built
+                  offline (htp_wh_layout.h); the HTP backend registers it
+                  without converting, and no CPU kernel can read it. */
+    QS2CX_WH, /** QS4CX_WH at two bits: each code indexes one of four int4
+                  values held in a per-tensor palette, and the DSP expands
+                  back to the int4 lattice in VTCM before the matmul
+                  (htp_wh_palette.h). Half the bytes of QS4CX_WH, same
+                  arithmetic downstream, and equally unreadable on the CPU. */
+    TL2CX_WH, /** Pure ternary native TL2 codes, fp32 channel scales and sums.
+                  One representation serves HVX decode and HMX prefill. */
+    QS4CX_WH_AFFINE, /** WH int4, N f32 scales, N f32 sums, N i32 offsets. */
   };
 
   /**

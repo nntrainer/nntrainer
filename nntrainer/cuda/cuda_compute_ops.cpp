@@ -449,13 +449,19 @@ public:
     // its pointer, so the payload is never copied. Default on; the host
     // Tensor::dot fallback below is a slow CPU reference for this dtype (and
     // dereferences the activation, which a device-only pool forbids).
-    if (wt == DT::QS4CX && (at == DT::FP32 || at == DT::FP16) && M > 0 &&
-        N > 0 && K > 0) {
+    if ((wt == DT::QS4CX || wt == DT::QS4ACX) &&
+        (at == DT::FP32 || at == DT::FP16) && M > 0 && N > 0 && K > 0) {
       static const bool qs4cx_enabled = []() {
         const char *e = std::getenv("NNTR_FC_CUDA_QS4CX");
         return !(e != nullptr && e[0] == '0');
       }();
       const uint8_t *W = weight.getData<uint8_t>();
+      // QS4ACX = the QS4CX record + one fp32 zero point per channel after the
+      // scales: register those once (first call, outside any capture) and the
+      // QS4CX kernels fold them into their epilogue.
+      if (wt == DT::QS4ACX && !cuda::cuda_fc_qs4cx_has_weight_zero_points(W))
+        (void)cuda::cuda_fc_qs4cx_set_weight_zero_points(
+          W, weight.getScale<float>() + N, (unsigned)N);
 #ifdef ENABLE_FP16
       // [lmhead-tie-lut] Re-tied head: the lm_head's weight IS the embedding
       // sidecar LUT, resident in VRAM since load, and W is a pure routing key

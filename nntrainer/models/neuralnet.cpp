@@ -57,7 +57,7 @@
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h> // cuda::drain_if_async
-#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#include <cuda_fc_qs4cx.h>        // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
 
 #include <activation_realizer.h>
@@ -65,6 +65,7 @@
 #include <common_properties.h>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fp16.h>
 #include <fusion_realizer.h>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
@@ -85,6 +86,7 @@
 #include <remap_realizer.h>
 #include <safetensors_util.h>
 #include <slice_realizer.h>
+#include <tq2cx_layout.h>
 #include <util_func.h>
 
 #ifdef ENABLE_TFLITE_INTERPRETER
@@ -138,6 +140,8 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
+  case TensorDim::DataType::TQ2CX:
+  case TensorDim::DataType::QS4ACX:
     return Tensor::Map<uint8_t>(reinterpret_cast<uint8_t *>(buf), bytes, dim,
                                 0);
   case TensorDim::DataType::UINT32:
@@ -148,6 +152,127 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::NONE:
   default:
     return Tensor::Map<float>(buf, bytes, dim, 0);
+  }
+}
+
+/**
+ * @brief [#150] NNTR_OP_TIME=1: wall time of every node's decode call
+ *        (to - from == 1), one line per node at exit, for
+ *        tools/htp/op_time_report.py. Off, it costs one predicted branch
+ *        per node and never touches a tensor. Unlike the --profile build it
+ *        builds no string per call and starts no sampler thread, so it can
+ *        ride the TPS binary.
+ *
+ * ponytail: indexed by execution order, one process-wide table. Two models
+ * in one process would add into the same rows; the CausalLM app runs one.
+ */
+struct OpTimeTable {
+  struct Row {
+    std::string name, type;
+    uint64_t calls = 0, sum_ns = 0, min_ns = UINT64_MAX, max_ns = 0;
+    size_t wbytes = 0;
+  };
+  std::vector<Row> rows;
+
+  static bool on() {
+    static const bool v = [] {
+      const char *e = std::getenv("NNTR_OP_TIME");
+      return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+  }
+
+  void add(size_t f, LayerNode &node, uint64_t ns) {
+    if (f >= rows.size())
+      rows.resize(f + 1);
+    Row &r = rows[f];
+    if (r.calls++ == 0) {
+      r.name = node.getName();
+      r.type = node.getType();
+      for (unsigned int i = 0; i < node.getNumWeights(); ++i)
+        r.wbytes += node.getWeight(i).getMemoryBytes();
+    }
+    r.sum_ns += ns;
+    r.min_ns = std::min(r.min_ns, ns);
+    r.max_ns = std::max(r.max_ns, ns);
+  }
+
+  ~OpTimeTable() {
+    for (size_t f = 0; f < rows.size(); ++f) {
+      const Row &r = rows[f];
+      if (r.calls == 0)
+        continue;
+      std::fprintf(stderr,
+                   "[OP-TIME] node f=%zu name=%s type=%s calls=%llu "
+                   "sum_us=%.3f min_us=%.3f max_us=%.3f wbytes=%zu\n",
+                   f, r.name.c_str(), r.type.c_str(),
+                   static_cast<unsigned long long>(r.calls), r.sum_ns / 1e3,
+                   r.min_ns / 1e3, r.max_ns / 1e3, r.wbytes);
+    }
+  }
+};
+
+OpTimeTable g_op_time;
+
+/**
+ * @brief NNTR_ACT_STATS=1: after every node of the first prefill (from == 0,
+ *        to - from > 1), one stderr line per FP32 output -- NaN and Inf
+ *        counts, max |x| and rms over the rows that call wrote -- so an
+ *        all-NPU run diffed against the device's own CPU (NEON) run names
+ *        the first node whose output leaves it (doc 57 section 9.20).
+ *        Never in a tok/s run: a full read of every output.
+ */
+void actStats(LayerNode &node, unsigned int rows) {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_ACT_STATS");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  if (!on)
+    return;
+  for (unsigned int i = 0; i < node.getNumOutputs(); ++i) {
+    const Tensor &t = node.getOutput(i);
+    if (t.empty() || t.getDataType() != TensorDim::DataType::FP32)
+      continue;
+    const TensorDim &d = t.getDim();
+    const size_t n =
+      std::min<size_t>(rows, d.height()) * d.width() * d.channel();
+    const float *p = t.getData<float>();
+    if (const char *dir = std::getenv("NNTR_ACT_DUMP")) {
+      const auto path = std::filesystem::path(dir) /
+                        (node.getName() + "_out" + std::to_string(i) + ".f32");
+      std::filesystem::create_directories(path.parent_path());
+      std::ofstream stream(path, std::ios::binary);
+      stream.write(reinterpret_cast<const char *>(p), n * sizeof(float));
+      if (!stream)
+        throw std::runtime_error("Cannot write activation dump: " +
+                                 path.string());
+    }
+    // rms over the finite values and over the first row alone, so a CPU
+    // run and an accelerator run of the same prompt line up node by node
+    const size_t row = static_cast<size_t>(d.width()) * d.channel();
+    size_t nan = 0, inf = 0;
+    float mx = 0.0f;
+    double ss = 0.0, ss0 = 0.0;
+    for (size_t k = 0; k < n; ++k) {
+      const float v = p[k];
+      if (std::isnan(v)) {
+        ++nan;
+      } else if (std::isinf(v)) {
+        ++inf;
+      } else {
+        mx = std::max(mx, std::fabs(v));
+        ss += static_cast<double>(v) * v;
+        if (k < row)
+          ss0 += static_cast<double>(v) * v;
+      }
+    }
+    const size_t fin = n - nan - inf;
+    std::fprintf(stderr,
+                 "[ACT] %s out%u n=%zu nan=%zu inf=%zu maxabs=%g rms=%g "
+                 "rms_row0=%g\n",
+                 node.getName().c_str(), i, n, nan, inf, mx,
+                 fin ? std::sqrt(ss / fin) : 0.0,
+                 row ? std::sqrt(ss0 / std::min(row, n ? n : 1)) : 0.0);
   }
 }
 
@@ -732,9 +857,21 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
           end_layer - start_layer);
         std::cout << "LAYERPROF\t" << (to - from) << "\t" << node->getName()
                   << "\t" << duration_.count() << "\n";
+        if (to - from == 1 && OpTimeTable::on())
+          g_op_time.add(f, *node, duration_.count());
+      } else if (to - from == 1 && OpTimeTable::on()) {
+        model_graph.flushCacheExcept(f);
+        const auto t0 = std::chrono::steady_clock::now();
+        node->incremental_forwarding(from, to, training);
+        g_op_time.add(f, *node,
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count());
       } else {
         model_graph.flushCacheExcept(f);
         node->incremental_forwarding(from, to, training);
+        if (from == 0 && to - from > 1)
+          actStats(*node, to - from);
       }
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
       // Debug: NNTR_DUMP_ROWS_DIR=<dir> writes each node's output rows of the
@@ -1427,7 +1564,13 @@ void NeuralNetwork::load(const std::string &file_path,
             tensor_data_type != TensorDim::DataType::FP16 &&
             tensor_data_type != TensorDim::DataType::Q6_K &&
             tensor_data_type != TensorDim::DataType::Q4_0 &&
-            tensor_data_type != TensorDim::DataType::QS4CX) {
+            tensor_data_type != TensorDim::DataType::QS4CX &&
+            tensor_data_type != TensorDim::DataType::TQ2CX &&
+            tensor_data_type != TensorDim::DataType::QS4ACX &&
+            tensor_data_type != TensorDim::DataType::QS4CX_WH &&
+            tensor_data_type != TensorDim::DataType::QS2CX_WH &&
+            tensor_data_type != TensorDim::DataType::TL2CX_WH &&
+            tensor_data_type != TensorDim::DataType::QS4CX_WH_AFFINE) {
           // for tensor with qparam
           size += sizeof(uint16_t);
           // ... but only CharTensor, ShortTensor, UIntTensor (UINT8/16/32),
@@ -1670,7 +1813,9 @@ void NeuralNetwork::load(const std::string &file_path,
       // to mmap their backing region on demand. Without it, virtual tensors
       // end up with fd=-1 and activate() returns MAP_FAILED, segfaulting on
       // first use (e.g. SlimMoE expert weights when MMAP_READ=true).
-      model_file_fd = open(f_path.c_str(), O_RDONLY);
+      model_file_fd = weightPageCachePolicy() >= 0
+                        ? openWeightFile(f_path.c_str())
+                        : open(f_path.c_str(), O_RDONLY);
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
@@ -1758,156 +1903,173 @@ void NeuralNetwork::load(const std::string &file_path,
       // workers' file reads -- not running several hook bodies at once.
       std::mutex load_hook_mtx;
 
+      std::exception_ptr load_error;
+      std::mutex load_error_mutex;
       auto load_worker = [&]() {
-        for (size_t idx =
-               next_load_index.fetch_add(1, std::memory_order_relaxed);
-             idx < num_load_nodes;
-             idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
-          auto node = load_nodes[idx];
+        try {
+          for (size_t idx =
+                 next_load_index.fetch_add(1, std::memory_order_relaxed);
+               idx < num_load_nodes;
+               idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
+            auto node = load_nodes[idx];
 
-          if (!MMAP_READ) {
-            auto local_model_file = checkedOpenStream<std::ifstream>(
-              (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
-            node->read(local_model_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-          } else {
+            if (weightPageCachePolicy() >= 0) {
+              node->read(FileReadSource{model_file_fd}, false, exec_mode,
+                         fsu_mode, std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } else if (!MMAP_READ) {
+              auto local_model_file = checkedOpenStream<std::ifstream>(
+                (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
+              node->read(local_model_file, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } else {
 #if defined(_WIN32)
-            // Map per-ask, then unmap immediately after: enables early release
-            // of pages
-            HANDLE hFile =
-              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
-              << "CreateFileA failed";
+              // Map per-ask, then unmap immediately after: enables early
+              // release of pages
+              HANDLE hFile =
+                CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+              NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+                << "CreateFileA failed";
 
-            HANDLE hMap =
-              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
-              << "CreateFileMapping failed";
+              HANDLE hMap =
+                CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+              NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+                << "CreateFileMapping failed";
 
-            char *view =
-              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            NNTR_THROW_IF((view == nullptr), std::runtime_error)
-              << "MapViewOfFile failed";
+              char *view = static_cast<char *>(
+                MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+              NNTR_THROW_IF((view == nullptr), std::runtime_error)
+                << "MapViewOfFile failed";
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-
-            // Early unmap: let the OS reclaim the working set ASAP
-            UnmapViewOfFile(view);
-            CloseHandle(hMap);
-            CloseHandle(hFile);
-#else
-            // POSIX: map per-task, advise kernel, drop pages, unmap
-            size_t f_size = 0;
-            void *mmap_ptr = nullptr;
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
-              int fd = ::open(f_path.c_str(), O_RDONLY);
-              NNTR_THROW_IF((fd == -1), std::invalid_argument)
-                << "Cannot open file : " << f_path;
-
-              struct stat st {};
-              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-                << "Cannot get file info (fstat): " << f_path;
-
-              f_size = static_cast<size_t>(st.st_size);
-              mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-              ::close(fd); // fd not needed after mmap
-              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-                << "mmap failed";
-            }
-
-            // A node's weights are one contiguous run and the nodes are
-            // handed out by an atomic counter, so this walks the file front to
-            // back -- it is a streaming read, not a scattered one. RANDOM was
-            // the advice here, and it turns off BOTH kernel readahead AND
-            // fault-around, which makes every 4 KiB page its own synchronous
-            // flash trip at queue depth 1. Measured on Adreno 840 with a
-            // 3.17 GiB weight file: 830 803 major faults for 830 767 file
-            // pages (every page faulted exactly once, nothing re-read) moving
-            // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
-            // SEQUENTIAL restores the readahead window and adds drop-behind,
-            // which also bounds the page-cache footprint of the load.
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
-              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
-            }
-
-            // Publish the mapping to the reaper for the duration of the read.
-            if (reap_ms > 0) {
-              std::lock_guard<std::mutex> reap_lk(reap_mtx);
-              reap_live.emplace_back(mmap_ptr, f_size);
-            }
-
-            char *view = static_cast<char *>(mmap_ptr);
-            {
-              nntrainer::load_trace::Scope _lt(
-                nntrainer::load_trace::NODE_READ);
               node->read(view, false, exec_mode, fsu_mode,
                          std::numeric_limits<size_t>::max(), true,
                          model_file_fd);
-            }
 
-            // Retract it BEFORE the unmap below, so the reaper can never
-            // advise a region this worker has already given back.
-            if (reap_ms > 0) {
-              std::lock_guard<std::mutex> reap_lk(reap_mtx);
-              for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
-                if (it->first == mmap_ptr) {
-                  reap_live.erase(it);
-                  break;
-                }
-            }
+              // Early unmap: let the OS reclaim the working set ASAP
+              UnmapViewOfFile(view);
+              CloseHandle(hMap);
+              CloseHandle(hFile);
+#else
+              // POSIX: map per-task, advise kernel, drop pages, unmap
+              size_t f_size = 0;
+              void *mmap_ptr = nullptr;
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
+                int fd = ::open(f_path.c_str(), O_RDONLY);
+                NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                  << "Cannot open file : " << f_path;
 
-            // Early drop: pages no longer needed; bounds peak RSS during the
-            // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
-            // NO-OP in glibc -- it validates its arguments and returns 0
-            // without freeing a page -- so the raw madvise is required for the
-            // drop to actually happen. The mapping is read-only MAP_PRIVATE,
-            // so dropped pages simply re-fault from the page cache if touched
-            // again: bytes read are identical either way.
-            {
-              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
-              (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
+                struct stat st {};
+                NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                  << "Cannot get file info (fstat): " << f_path;
 
-              ::munmap(mmap_ptr, f_size);
-            }
+                f_size = static_cast<size_t>(st.st_size);
+                mmap_ptr =
+                  ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                ::close(fd); // fd not needed after mmap
+                NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                  << "mmap failed";
+              }
+
+              // A node's weights are one contiguous run and the nodes are
+              // handed out by an atomic counter, so this walks the file front
+              // to back -- it is a streaming read, not a scattered one. RANDOM
+              // was the advice here, and it turns off BOTH kernel readahead AND
+              // fault-around, which makes every 4 KiB page its own synchronous
+              // flash trip at queue depth 1. Measured on Adreno 840 with a
+              // 3.17 GiB weight file: 830 803 major faults for 830 767 file
+              // pages (every page faulted exactly once, nothing re-read) moving
+              // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
+              // SEQUENTIAL restores the readahead window and adds drop-behind,
+              // which also bounds the page-cache footprint of the load.
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
+                (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+              }
+
+              // Publish the mapping to the reaper for the duration of the read.
+              if (reap_ms > 0) {
+                std::lock_guard<std::mutex> reap_lk(reap_mtx);
+                reap_live.emplace_back(mmap_ptr, f_size);
+              }
+
+              char *view = static_cast<char *>(mmap_ptr);
+              {
+                nntrainer::load_trace::Scope _lt(
+                  nntrainer::load_trace::NODE_READ);
+                node->read(view, false, exec_mode, fsu_mode,
+                           std::numeric_limits<size_t>::max(), true,
+                           model_file_fd);
+              }
+
+              // Retract it BEFORE the unmap below, so the reaper can never
+              // advise a region this worker has already given back.
+              if (reap_ms > 0) {
+                std::lock_guard<std::mutex> reap_lk(reap_mtx);
+                for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
+                  if (it->first == mmap_ptr) {
+                    reap_live.erase(it);
+                    break;
+                  }
+              }
+
+              // Early drop: pages no longer needed; bounds peak RSS during the
+              // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a
+              // documented NO-OP in glibc -- it validates its arguments and
+              // returns 0 without freeing a page -- so the raw madvise is
+              // required for the drop to actually happen. The mapping is
+              // read-only MAP_PRIVATE, so dropped pages simply re-fault from
+              // the page cache if touched again: bytes read are identical
+              // either way.
+              {
+                nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
+                (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
+
+                ::munmap(mmap_ptr, f_size);
+              }
 #endif
-          }
+            }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          if (cuda_wprefetch_load) {
-            for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
-              nntrainer::Tensor &wt = node->getWeight(wi);
-              if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
-                (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
-                  wt.getData<uint8_t>(), wt.width(), wt.height());
+            if (cuda_wprefetch_load) {
+              for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+                nntrainer::Tensor &wt = node->getWeight(wi);
+                if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+                  (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                    wt.getData<uint8_t>(), wt.width(), wt.height());
+              }
             }
-          }
 #endif
 
-          // [load-drop interleave] this node's weight bytes (payload + any
-          // trailing scales) are fully materialized in their final tensor
-          // storage -- on BOTH the stream and the mmap arm above: hand the
-          // node to the registered per-weight hook NOW, so derived-cache
-          // builds and plain-payload drops overlap the other workers' reads
-          // instead of waiting for the join. Failures are contained -- the
-          // application's post-load sweep is the fallback for anything the
-          // hook missed.
-          if (weight_load_hook) {
-            std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
-            try {
-              weight_load_hook(*node, node->getRunContext(),
-                               weight_load_hook_data);
-            } catch (const std::exception &e) {
-              ml_logw("weight-load hook failed on node %s: %s",
-                      node->getName().c_str(), e.what());
-            } catch (...) {
-              ml_logw("weight-load hook failed on node %s (non-std exception)",
-                      node->getName().c_str());
+            // [load-drop interleave] this node's weight bytes (payload + any
+            // trailing scales) are fully materialized in their final tensor
+            // storage -- on BOTH the stream and the mmap arm above: hand the
+            // node to the registered per-weight hook NOW, so derived-cache
+            // builds and plain-payload drops overlap the other workers' reads
+            // instead of waiting for the join. Failures are contained -- the
+            // application's post-load sweep is the fallback for anything the
+            // hook missed.
+            if (weight_load_hook) {
+              std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
+              try {
+                weight_load_hook(*node, node->getRunContext(),
+                                 weight_load_hook_data);
+              } catch (const std::exception &e) {
+                ml_logw("weight-load hook failed on node %s: %s",
+                        node->getName().c_str(), e.what());
+              } catch (...) {
+                ml_logw(
+                  "weight-load hook failed on node %s (non-std exception)",
+                  node->getName().c_str());
+              }
             }
           }
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(load_error_mutex);
+          if (!load_error)
+            load_error = std::current_exception();
         }
       };
 
@@ -1929,7 +2091,10 @@ void NeuralNetwork::load(const std::string &file_path,
       // reading it ahead of the workers (see WeightFileReadAhead). FSU keeps
       // the file as its weight store and reads only what it needs.
       std::optional<WeightFileReadAhead> read_ahead;
-      if (MMAP_READ && !fsu_mode)
+      // Explicit cache policies use FileReadSource, not the mapped loader.
+      // WILLNEED still populates the kernel cache on an O_DIRECT descriptor
+      // and also escapes the bounded-cache reader's accounting.
+      if (MMAP_READ && !fsu_mode && weightPageCachePolicy() < 0)
         read_ahead.emplace(model_file_fd);
       const auto _lt_fanout_t0 = std::chrono::steady_clock::now();
       for (size_t t = 0; t < num_load_threads; ++t) {
@@ -2032,6 +2197,8 @@ void NeuralNetwork::load(const std::string &file_path,
 #endif
 
       nntrainer::load_trace::dump("model->load_weight");
+      if (load_error)
+        std::rethrow_exception(load_error);
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -2155,8 +2322,76 @@ void NeuralNetwork::load(const std::string &file_path,
     const size_t data_base =
       sizeof(uint64_t) + static_cast<size_t>(header_size);
 
-    // Parse header: name -> (offset_start, size_in_bytes)
-    auto name_offset_map = safetensors::parseHeader(header_json);
+    // Parse header: name -> entry (dtype, data offsets)
+    const auto entries = safetensors::parseHeaderEntries(header_json);
+    std::unordered_map<std::string, const safetensors::TensorEntry *> by_name;
+    size_t data_size = 0;
+    for (const auto &e : entries) {
+      by_name.emplace(e.name, &e);
+      data_size = std::max(data_size, static_cast<size_t>(e.offset_end));
+    }
+
+    /**
+     * A tensor stored as F16 / BF16 for a weight requested in FP32 (e.g. a
+     * norm gamma under FP32 activations) is converted on load instead of
+     * being read as raw bytes of the wrong size. Such a weight is pointed at
+     * the start of the data section for the bulk read below (any in-bounds
+     * bytes) and filled with the converted values afterwards.
+     */
+    struct HalfToFloat {
+      Tensor *var;
+      size_t file_off;
+      size_t count;
+      bool bf16;
+    };
+    std::vector<HalfToFloat> half_to_float;
+    std::vector<std::string> missing;
+
+    // TQ2CX records are stored in the layout the header names (absent: the
+    // row-major "rm"); the weights were sized and every kernel indexes them
+    // in the process's stored layout, so the two must agree.
+    std::string pack_tq2cx_layout;
+    bool pack_tq2cx_layout_read = false;
+    auto check_tq2cx_layout = [&](const std::string &name) {
+      if (!pack_tq2cx_layout_read) {
+        const auto meta = safetensors::parseMetadata(header_json);
+        auto m = meta.find(TQ2CX_LAYOUT_META_KEY);
+        pack_tq2cx_layout = m == meta.end() ? "rm" : m->second;
+        pack_tq2cx_layout_read = true;
+      }
+      Tq2cxLayout pack;
+      NNTR_THROW_IF(!tq2cxLayoutFromName(pack_tq2cx_layout, pack),
+                    std::invalid_argument)
+        << "safetensors: " << f_path << " stores TQ2CX in layout '"
+        << pack_tq2cx_layout << "', which this build does not implement";
+      const Tq2cxLayout kernel = tq2cxStoredLayout();
+      NNTR_THROW_IF(pack != kernel, std::invalid_argument)
+        << "safetensors: '" << name << "': pack layout "
+        << tq2cxLayoutName(pack) << ", kernel layout "
+        << tq2cxLayoutName(kernel) << " (the layout is set from the header's "
+        << TQ2CX_LAYOUT_META_KEY << " / the nntr_config "
+        << TQ2CX_LAYOUT_CONFIG_KEY << " before the model is initialized)";
+    };
+
+    // A Q4_0 tensor is repacked into an ISA-specific layout that is
+    // indistinguishable from the header alone (save() records which one at
+    // nntr_q4_0_isa, see above). Loading the wrong one is not an error at
+    // the repack/dequant call site -- it silently reads garbage. Refuse it
+    // here instead.
+    auto metadata = safetensors::parseMetadata(header_json);
+    auto isa_it = metadata.find("nntr_q4_0_isa");
+    if (isa_it != metadata.end()) {
+#if defined(__aarch64__) || defined(__arm__)
+      const char *expected_isa = "arm";
+#else
+      const char *expected_isa = "x86";
+#endif
+      NNTR_THROW_IF(isa_it->second != expected_isa, std::runtime_error)
+        << "safetensors file " << f_path << " has Q4_0 weights packed for '"
+        << isa_it->second << "' but this build expects '" << expected_isa
+        << "'. Re-quantize with --isa " << expected_isa
+        << " (nntr_quantize), or run on a matching target.";
+    }
 
     // Assign file offsets to each weight by name
     std::unordered_set<const Tensor *> visited_st;
@@ -2166,11 +2401,17 @@ void NeuralNetwork::load(const std::string &file_path,
         if (!visited_st.insert(&weight->getVariableRef()).second)
           continue;
         const std::string &name = weight->getName();
-        auto it = name_offset_map.find(name);
-        if (it == name_offset_map.end())
+        auto it = by_name.find(name);
+        if (it == by_name.end()) {
+          missing.push_back(name);
           continue;
-        const size_t file_off = data_base + it->second.first;
-        weight->getVariableRef().setFileOffset(file_off);
+        }
+        const safetensors::TensorEntry &e = *it->second;
+        Tensor &var = weight->getVariableRef();
+        const size_t file_off = data_base + e.offset_start;
+        if (var.getDataType() == TensorDim::DataType::TQ2CX)
+          check_tq2cx_layout(name);
+        const size_t stored = e.offset_end - e.offset_start;
 
         // Resolve the QS4CX record stride from the header, which is the one
         // place a stride is written down: the .bin has to infer it (from the
@@ -2180,88 +2421,160 @@ void NeuralNetwork::load(const std::string &file_path,
         // inference and no per-file assumption here -- ask the record that was
         // actually written. A weight whose extent matches neither stride is
         // left alone; the read below reports it far better than a guess would.
-        if (weight->getDim().getDataType() == TensorDim::DataType::QS4CX &&
+        if (var.getDataType() == TensorDim::DataType::QS4CX &&
             !legacy_int4_model) {
-          const TensorDim &d = weight->getDim();
-          const size_t declared = it->second.second;
-          if (declared ==
-              QS4CX_Tensor::recordBytes(d.height(), d.width(), false))
-            weight->getVariableRef().setQs4cxRecordPadded(false);
-          else if (declared ==
+          const TensorDim &d = var.getDim();
+          if (stored == QS4CX_Tensor::recordBytes(d.height(), d.width(), false))
+            var.setQs4cxRecordPadded(false);
+          else if (stored ==
                    QS4CX_Tensor::recordBytes(d.height(), d.width(), true))
-            weight->getVariableRef().setQs4cxRecordPadded(true);
+            var.setQs4cxRecordPadded(true);
         }
+
+        const size_t needed = var.getMemoryBytes();
+        // A legacy QINT4 record is transcoded on read and has its own size
+        // rule (see the .bin walk); take its extent as written.
+        if (stored == needed || legacy_int4_model) {
+          var.setFileOffset(file_off);
+          continue;
+        }
+        const bool half = e.dtype == "F16" || e.dtype == "BF16";
+        NNTR_THROW_IF(!half || var.getDataType() != TensorDim::DataType::FP32 ||
+                        stored * 2 != needed || var.isVirtual(),
+                      std::invalid_argument)
+          << "safetensors: '" << name << "' is stored as " << e.dtype << " ("
+          << stored << " bytes) but the weight is " << var.getDim() << " ("
+          << needed << " bytes)";
+        NNTR_THROW_IF(needed > data_size, std::invalid_argument)
+          << "safetensors: data section too small to stage '" << name << "'";
+        var.setFileOffset(data_base);
+        half_to_float.push_back(
+          {&var, file_off, stored / 2, e.dtype == "BF16"});
       }
     }
+    if (!missing.empty()) {
+      std::ostringstream names;
+      for (size_t i = 0; i < missing.size() && i < 8; ++i)
+        names << (i ? ", " : "") << missing[i];
+      ml_logw("safetensors: %zu weight(s) not found in %s, left as "
+              "initialized: %s%s",
+              missing.size(), f_path.c_str(), names.str().c_str(),
+              missing.size() > 8 ? ", ..." : "");
+    }
+    NNTR_THROW_IF(!half_to_float.empty() &&
+                    exec_mode != ml::train::ExecutionMode::INFERENCE,
+                  std::invalid_argument)
+      << "safetensors: F16/BF16 to FP32 conversion on load is inference only";
+
+    auto convert_half_weights = [&]() {
+      std::ifstream in(f_path, std::ios::in | std::ios::binary);
+      NNTR_THROW_IF(!in.is_open(), std::runtime_error)
+        << "Cannot open safetensors file: " << f_path;
+      std::vector<uint16_t> buf;
+      for (const auto &h : half_to_float) {
+        buf.resize(h.count);
+        in.seekg(static_cast<std::streamoff>(h.file_off));
+        in.read(reinterpret_cast<char *>(buf.data()),
+                static_cast<std::streamsize>(h.count * sizeof(uint16_t)));
+        NNTR_THROW_IF(!in, std::runtime_error)
+          << "safetensors: failed to read " << h.var->getName();
+        float *dst = h.var->getData<float>();
+        for (size_t i = 0; i < h.count; ++i) {
+          if (h.bf16) {
+            const uint32_t bits = static_cast<uint32_t>(buf[i]) << 16;
+            std::memcpy(dst + i, &bits, sizeof(float));
+          } else {
+            dst[i] = compute_fp16_to_fp32(buf[i]);
+          }
+        }
+      }
+    };
 
     if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
       model_file_fd = ::open(f_path.c_str(), O_RDONLY);
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open safetensors file: " << f_path;
 
+      // A bounded pool of workers takes the nodes in graph order, as the .bin
+      // loader does. One thread per node used to map the whole file once per
+      // node AT THE SAME TIME: a 7 GiB file times a hundred-odd nodes exceeds
+      // the 39-bit user address space of an arm64 Android process, and mmap
+      // fails there. The worker count bounds the live mappings.
+      constexpr size_t MAX_ST_LOAD_THREADS = 8;
+      std::vector<std::shared_ptr<LayerNode>> st_nodes(model_graph.cbegin(),
+                                                       model_graph.cend());
+      std::atomic<size_t> st_next{0};
       std::vector<std::thread> threads;
-      threads.reserve(model_graph.size());
-      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
-           ++iter) {
-        auto node = *iter;
-        threads.emplace_back([&, node]() {
-          if (!MMAP_READ) {
-            auto local_file = checkedOpenStream<std::ifstream>(
-              f_path, std::ios::in | std::ios::binary);
-            node->read(local_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-          } else {
+      const size_t st_workers =
+        std::min<size_t>(st_nodes.size(), MAX_ST_LOAD_THREADS);
+      threads.reserve(st_workers);
+      for (size_t w = 0; w < st_workers; ++w) {
+        threads.emplace_back([&]() {
+          for (size_t idx = st_next.fetch_add(1, std::memory_order_relaxed);
+               idx < st_nodes.size();
+               idx = st_next.fetch_add(1, std::memory_order_relaxed)) {
+            auto node = st_nodes[idx];
+            if (!MMAP_READ) {
+              auto local_file = checkedOpenStream<std::ifstream>(
+                f_path, std::ios::in | std::ios::binary);
+              node->read(local_file, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } else {
 #if defined(_WIN32)
-            HANDLE hFile =
-              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
-              << "CreateFileA failed for safetensors file: " << f_path;
+              HANDLE hFile =
+                CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+              NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+                << "CreateFileA failed for safetensors file: " << f_path;
 
-            HANDLE hMap =
-              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
-              << "CreateFileMapping failed for safetensors file: " << f_path;
+              HANDLE hMap =
+                CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+              NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+                << "CreateFileMapping failed for safetensors file: " << f_path;
 
-            char *view =
-              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            NNTR_THROW_IF((view == nullptr), std::runtime_error)
-              << "MapViewOfFile failed for safetensors file: " << f_path;
+              char *view = static_cast<char *>(
+                MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+              NNTR_THROW_IF((view == nullptr), std::runtime_error)
+                << "MapViewOfFile failed for safetensors file: " << f_path;
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
 
-            UnmapViewOfFile(view);
-            CloseHandle(hMap);
-            CloseHandle(hFile);
+              UnmapViewOfFile(view);
+              CloseHandle(hMap);
+              CloseHandle(hFile);
 #else
-            int fd = ::open(f_path.c_str(), O_RDONLY);
-            NNTR_THROW_IF((fd == -1), std::invalid_argument)
-              << "Cannot open safetensors file: " << f_path;
+              int fd = ::open(f_path.c_str(), O_RDONLY);
+              NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                << "Cannot open safetensors file: " << f_path;
 
-            struct stat st {};
-            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-              << "Cannot stat safetensors file: " << f_path;
+              struct stat st {};
+              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                << "Cannot stat safetensors file: " << f_path;
 
-            const size_t f_size = static_cast<size_t>(st.st_size);
-            void *mmap_ptr =
-              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd);
-            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-              << "mmap failed for safetensors file: " << f_path;
+              const size_t f_size = static_cast<size_t>(st.st_size);
+              void *mmap_ptr =
+                ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              ::close(fd);
+              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                << "mmap failed for safetensors file: " << f_path;
 
-            // Streaming read, not a scattered one -- see the sibling site
-            // in the positional .bin arm above for the fault census that
-            // retired POSIX_MADV_RANDOM here.
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+              // Streaming read, not a scattered one -- see the sibling site
+              // in the positional .bin arm above for the fault census that
+              // retired POSIX_MADV_RANDOM here.
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
 
-            char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+              char *view = static_cast<char *>(mmap_ptr);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
 
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
-            ::munmap(mmap_ptr, f_size);
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+              ::munmap(mmap_ptr, f_size);
 #endif
+            }
           }
         });
       }
@@ -2269,6 +2582,7 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+      convert_half_weights();
     } else {
       // TRAINING mode: sequential read
       std::ifstream st_in(f_path, std::ios::in | std::ios::binary);

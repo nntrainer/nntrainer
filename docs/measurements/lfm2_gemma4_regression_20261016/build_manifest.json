@@ -1,0 +1,64 @@
+{
+  "baseline_commit": "c8ca04c9567c3c37dcc40e1d52b61534b0099b82",
+  "candidate_commit": "14a2bccbcced415c97b39c3b212b071b5e680325",
+  "candidate_artifacts": {
+    "nntr_causallm": {
+      "bytes": 387928,
+      "sha256": "4e97661fd10d96f03b79b2423241ea943ed919e7ff0761ce50be198530e93748"
+    },
+    "libnntr_hvx_skel.so": {
+      "bytes": 721296,
+      "sha256": "1e12c77ad4604a5fe0a1851976e0bcac6531c68a079dc17dffe1c2b2e4b69d38"
+    },
+    "libsdkl.so": {
+      "bytes": 152240,
+      "sha256": "63c9b0db89064d92166a9211b95c7153380bd5385cec402e66910c05f940e5fe"
+    },
+    "libnntrainer.so": {
+      "bytes": 6112032,
+      "sha256": "06c658e5427ed6f714346e78f1745cfed0f7652d664260e634c382bf0d3b9990"
+    },
+    "libc++_shared.so": {
+      "bytes": 1822720,
+      "sha256": "8dfbd800f0d4b8ff2b664b0e5012a4a5f08794668dccfaa29b8b1c2cdcdc18b3"
+    },
+    "libcausallm.so": {
+      "bytes": 21398176,
+      "sha256": "2bb266610c204e35a7337b92a76121b360dcc9ade5e976111590f383be2bf6e3"
+    },
+    "libccapi-nntrainer.so": {
+      "bytes": 254848,
+      "sha256": "2ba65e29f6e742c163f78727e2740aa1d394396b759284f17b792a84a1ee054c"
+    }
+  },
+  "baseline_artifacts": {
+    "nntr_causallm": {
+      "bytes": 388008,
+      "sha256": "b23fe9f24917ee503454fc8c2f182b577571f31e831642a9befafc7b58116b5a"
+    },
+    "libnntr_hvx_skel.so": {
+      "bytes": 717200,
+      "sha256": "5b09f0a72abce84cda3b538ad121cb571ac9e2b032a469b220fcfe0fba0c179c"
+    },
+    "libsdkl.so": {
+      "bytes": 152240,
+      "sha256": "63c9b0db89064d92166a9211b95c7153380bd5385cec402e66910c05f940e5fe"
+    },
+    "libnntrainer.so": {
+      "bytes": 6109904,
+      "sha256": "2a4f99005cde77579b5a1d6f3e6e47d304bd1f1bb702df5f2d3f7c32c2064eb4"
+    },
+    "libc++_shared.so": {
+      "bytes": 1822720,
+      "sha256": "8dfbd800f0d4b8ff2b664b0e5012a4a5f08794668dccfaa29b8b1c2cdcdc18b3"
+    },
+    "libcausallm.so": {
+      "bytes": 21303880,
+      "sha256": "54c555098c2d7c14c7a97fc6caeab562a7f6d9feee0f8c461adbf8d3ef730071"
+    },
+    "libccapi-nntrainer.so": {
+      "bytes": 254848,
+      "sha256": "bd8c9deaa3ec4d90d939a9497a4ed732f89c941ef6ab182563c4fda71ac67392"
+    }
+  }
+}

@@ -7,6 +7,14 @@ cpu_backend_headers = [
 nntrainer_sources += meson.current_source_dir() / 'compute_ops.cpp'
 nntrainer_sources += meson.current_source_dir() / 'cpu_ops_table.cpp'
 
+# The int8 KV cache registry (plain C, shared with the HTP skel) and the
+# CPU attention over it: the CPU side of attention_kv_dtype.
+nntrainer_sources += meson.current_source_dir() / 'cpu_kv_q_attention.cpp'
+nntrainer_sources += meson.current_source_dir() / '../htp_backend/hmx/hexkl_kv_q.c'
+nntrainer_inc += include_directories('../htp_backend/hmx')
+nntrainer_inc_abs += meson.current_source_dir() / '../htp_backend/hmx'
+cpu_backend_headers += 'cpu_kv_q_attention.h'
+
 subdir('fallback')
 nntrainer_inc += include_directories('fallback')
 nntrainer_inc_abs += meson.current_source_dir() / 'fallback'

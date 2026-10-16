@@ -8,20 +8,37 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "../htp/host/q4_gemv_cases.h"
+#include "htp_act_quant.h"
+#include "htp_q4_0_convert.h"
+#include "htp_wh_layout.h"
+#include "htp_wh_palette.h"
 #include "int4_utils.h"
+#include "m1_ops_det.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
 #include <cfloat>
+#include <cmath>
 #include <cpu_backend.h>
 #include <cstring>
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <gtest/gtest.h>
+#include <limits>
+#include <nntr_ggml_impl.h>
 #include <numeric>
 #include <random>
+#include <set>
+#include <string>
+#include <tensor.h>
+#include <thread>
 #include <vector>
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
@@ -399,6 +416,113 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_quantization) {
   EXPECT_NEAR(max_differ, 0., eps * K * N);
 }
 
+TEST(nntrainer_cpu_backend_standalone, q4_0_rowwise_gemv) {
+  nntrainer::init_backend();
+
+  // N deliberately does not align to the q4_0x4/q4_0x8 packed kernels. The
+  // row-wise path must support arbitrary vocabulary sizes.
+  const unsigned int N = 37;
+  const unsigned int K = 256;
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+  std::vector<float> activation = generate_random_vector<float>(K);
+
+  const size_t weight_size =
+    static_cast<size_t>(N) * K / QK4_0 * sizeof(block_q4_0_testonly);
+  std::vector<char> q4_weight(weight_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+
+  std::vector<char> q8_activation(nntrainer::q4_0_gemv_activation_size(K));
+  nntrainer::quantize_q4_0_gemv_activation(K, activation.data(),
+                                           q8_activation.data());
+
+  std::vector<float> output(N);
+  const unsigned int row_split = 17;
+  nntrainer::gemv_q4_0_rowwise_range(0, row_split, K, q8_activation.data(),
+                                     q4_weight.data(), output.data());
+  nntrainer::gemv_q4_0_rowwise_range(row_split, N, K, q8_activation.data(),
+                                     q4_weight.data(), output.data());
+
+  std::vector<float> dequant_activation(K);
+  nntr_dequantize_row_q8_0(q8_activation.data(), dequant_activation.data(), K);
+
+  std::vector<float> dequant_weight(K);
+  const size_t weight_row_size = weight_size / N;
+  for (unsigned int row = 0; row < N; ++row) {
+    nntrainer::dequantize_row_q4_0(q4_weight.data() + row * weight_row_size,
+                                   dequant_weight.data(), K);
+    const float expected = nntrainer::sdot(K, dequant_weight.data(), 1,
+                                           dequant_activation.data(), 1);
+    EXPECT_NEAR(output[row], expected, 1.0e-3f) << "row=" << row;
+  }
+}
+
+/**
+ * @brief The lm_head's two paths agree
+ *
+ * A tied model stores one canonical Q4_0 weight so the embedding lookup can
+ * address a token's row, which leaves the lm_head on the per-row vec_dot at
+ * 2.9 GB/s against 22 for a repacked FC (doc 46 sections 44 and 45).
+ * TieWordEmbedding fixes that by keeping a blocked twin and calling the same
+ * gemm_q4_0 the fully_connected layers use.
+ *
+ * This is that substitution, on the shape of the real lm_head's inner
+ * dimension: repack the canonical rows with nrow = vocabulary and k =
+ * hidden, then check gemm_q4_0 against gemv_q4_0_rowwise_range on the same
+ * bytes. Nothing downstream would catch a disagreement -- the layer has no
+ * fallback to compare against at runtime, and wrong logits read as
+ * plausible-but-wrong text, not as a failure.
+ */
+TEST(nntrainer_cpu_backend_standalone, q4_0_blocked_lmhead_matches_rowwise) {
+  nntrainer::init_backend();
+
+  // vocab % 4 and hidden % 32, which is what the layer checks before it
+  // builds the twin; hidden is the model's real 2048.
+  const unsigned int vocab = 512;
+  const unsigned int hidden = 2048;
+  std::vector<float> weight = generate_random_vector<float>(vocab * hidden);
+  std::vector<float> activation = generate_random_vector<float>(hidden);
+
+  const size_t weight_size =
+    static_cast<size_t>(vocab) * hidden / QK4_0 * sizeof(block_q4_0_testonly);
+  std::vector<char> canonical(weight_size);
+  nntrainer::quantize_q4_0(weight.data(), canonical.data(), vocab, hidden,
+                           nullptr);
+
+  // The row-wise path, as the layer ran it before.
+  std::vector<char> q8_activation(nntrainer::q4_0_gemv_activation_size(hidden));
+  nntrainer::quantize_q4_0_gemv_activation(hidden, activation.data(),
+                                           q8_activation.data());
+  std::vector<float> want(vocab, 0.0f);
+  nntrainer::gemv_q4_0_rowwise_range(0, vocab, hidden, q8_activation.data(),
+                                     canonical.data(), want.data());
+
+  // The blocked path. Same argument order the layer uses: nrow is the
+  // vocabulary, k is the hidden size, and nothing is transposed because the
+  // tied weight is already [vocab, hidden].
+  std::vector<char> blocked(weight_size);
+  nntrainer::repack_q4_0(blocked.data(), canonical.data(), weight_size, vocab,
+                         hidden);
+  std::vector<float> got(vocab, 0.0f);
+  nntrainer::gemm_q4_0<float>(1, vocab, hidden, activation.data(), hidden,
+                              blocked.data(), vocab, got.data(), vocab);
+
+  // Both quantize the activation to Q8_0 and reduce in int32, so they differ
+  // only in the order the per-block f32 scales accumulate.
+  size_t bad = 0;
+  for (unsigned int v = 0; v < vocab; ++v) {
+    const float tol = 1.0e-3f * std::max(1.0f, std::fabs(want[v]));
+    if (std::fabs(got[v] - want[v]) > tol) {
+      if (bad < 4)
+        ADD_FAILURE() << "logit " << v << ": blocked " << got[v]
+                      << " vs rowwise " << want[v];
+      ++bad;
+    }
+  }
+  EXPECT_EQ(bad, 0u) << bad << " of " << vocab << " logits disagree -- the "
+                     << "repack argument order or the gemm leading "
+                     << "dimensions are wrong";
+}
+
 /**
  * @brief Test quantize -> repack -> unpack -> dequantize pipeline.
  *
@@ -563,6 +687,482 @@ TEST(nntrainer_cpu_backend_standalone, qs4cx_kai_rhs_rows_match_two_step) {
       nntrainer::Int4Utils::packPlainToKaiRhsPackedRows(
         plain.data(), scales.data(), N, K, sr - 3, sr, pieces.data());
     EXPECT_EQ(pieces, ref) << "split fill mismatch N=" << N << " K=" << K;
+  }
+}
+
+/**
+ * @brief htp_qs4cx_from_q4_0x4 against the weight it was requantized from.
+ *
+ * This is a real requantization (Q4_0's per-32-block scale down to qs4cx's
+ * one-scale-per-column), not a bit reshuffle, so some accuracy loss beyond
+ * Q4_0's own is expected and is what this test measures rather than
+ * assumes -- see htp_q4_0_convert.h. Forces the ARM (q4_0x4) repack layout
+ * explicitly rather than relying on this host's default, because that is
+ * the only layout htp_qs4cx_from_q4_0x4 understands (ENABLE_HEXKL only
+ * ever builds for Android/ARM64); q4_0_utils.cpp's dequantizeQ4_0x4 is
+ * portable, so this is fully host-testable without a device.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_q4_0x4_accuracy) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 768; // must be a multiple of 32 (Q4_0 block size)
+  const unsigned int N = 512;
+
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  int64_t q4_0_type_size = sizeof(block_q4_0_testonly);
+  size_t data_size = (static_cast<size_t>(K) * N / QK4_0) * q4_0_type_size;
+
+  std::vector<char> q4_weight(data_size);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+
+  std::vector<char> repacked(data_size);
+  nntrainer::repack_q4_0(repacked.data(), q4_weight.data(), data_size, N, K,
+                         ml::train::ISA::ARM);
+
+  std::vector<int8_t> q_w4_i8(static_cast<size_t>(K) * N);
+  std::vector<float> w_scale(N);
+  std::vector<int32_t> colsum_w(N);
+  nntrainer::htp_qs4cx_from_q4_0x4(repacked.data(), K, N, q_w4_i8.data(),
+                                   w_scale.data(), colsum_w.data());
+
+  // colsum_w must match a direct sum over the emitted int4 values -- this
+  // is the term HexKL's dequant uses to correct for unsigned activations,
+  // so a mismatch here is a silent wrong-answer bug, not a rounding one.
+  for (unsigned int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (unsigned int k = 0; k < K; ++k)
+      sum += q_w4_i8[static_cast<size_t>(k) * N + n];
+    EXPECT_EQ(sum, colsum_w[n]) << "colsum mismatch at n=" << n;
+  }
+
+  // Reconstruct and compare against the ORIGINAL fp32 weight (not Q4_0's own
+  // dequant) so the printed number is the whole double-quantization cost,
+  // the number that actually reaches the matmul.
+  float max_abs_err = 0.0f, sum_abs_err = 0.0f;
+  for (unsigned int n = 0; n < N; ++n) {
+    for (unsigned int k = 0; k < K; ++k) {
+      const float approx = q_w4_i8[static_cast<size_t>(k) * N + n] * w_scale[n];
+      const float err =
+        std::fabs(approx - weight[static_cast<size_t>(n) * K + k]);
+      max_abs_err = std::max(max_abs_err, err);
+      sum_abs_err += err;
+    }
+  }
+  const float mean_abs_err = sum_abs_err / (static_cast<float>(N) * K);
+  std::cout << "htp_qs4cx_from_q4_0x4: max_abs_err=" << max_abs_err
+            << " mean_abs_err=" << mean_abs_err << std::endl;
+
+  // generate_random_vector's range is the implicit full scale here; a 4-bit
+  // per-channel quantizer's own noise floor is ~1/30 of a channel's range,
+  // and Q4_0's is comparable, so bound generously above their sum rather
+  // than pin an exact number -- this is a smoke bound against a layout or
+  // sign bug, not a tight accuracy contract.
+  EXPECT_LT(max_abs_err, 0.5f);
+  EXPECT_LT(mean_abs_err, 0.1f);
+}
+
+/**
+ * @brief The offline WH packer sees the same values the load path does
+ *
+ * quantize_stream's QS4CX_WH branch unpacks quant_qs4cx_f32's nibbles itself
+ * -- q + 8 stored unsigned, even k in the low half -- and sums them per
+ * output channel before calling whPack. htp_qs4cx_from_packed does the same
+ * unpacking at load time and is device-verified, so it is the reference: if
+ * the two disagree, a model quantized to QS4CX_WH holds different weights
+ * than the same model quantized to QS4CX, and nothing downstream would say
+ * so. whPack itself is checked against the DSP's own bake by
+ * unittest_hvx_mm_u8i4's WhPackReferenceMatchesDspBake.
+ */
+TEST(nntrainer_cpu_backend_standalone, wh_pack_unpacks_like_the_load_path) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 64, N = 96; // not square, both multiples of 32
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  const size_t nibble_bytes = static_cast<size_t>(N) * ((K + 1) / 2);
+  std::vector<uint8_t> qs4cx(nibble_bytes + N * sizeof(float));
+  float *scales = reinterpret_cast<float *>(qs4cx.data() + nibble_bytes);
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), qs4cx.data(), scales, true);
+
+  std::vector<int8_t> want_rm(static_cast<size_t>(K) * N);
+  std::vector<float> want_scale(N);
+  std::vector<int32_t> want_colsum(N);
+  nntrainer::htp_qs4cx_from_packed(qs4cx.data(), scales, K, N, want_rm.data(),
+                                   want_scale.data(), want_colsum.data());
+
+  // The quantizer's own unpack, character for character with what it writes.
+  std::vector<int8_t> rm(static_cast<size_t>(K) * N);
+  std::vector<int32_t> colsum(N, 0);
+  const size_t stride = (K + 1) / 2;
+  for (size_t n = 0; n < N; ++n) {
+    const uint8_t *row = qs4cx.data() + n * stride;
+    int32_t sum = 0;
+    for (size_t k = 0; k < K; ++k) {
+      const uint8_t byte = row[k >> 1];
+      const uint8_t nibble = (k & 1u) ? (byte >> 4) : (byte & 0x0Fu);
+      const int8_t q = static_cast<int8_t>(static_cast<int32_t>(nibble) - 8);
+      rm[k * N + n] = q;
+      sum += q;
+    }
+    colsum[n] = sum;
+  }
+  EXPECT_EQ(rm, want_rm);
+  EXPECT_EQ(colsum, want_colsum);
+
+  // A column sum is at most K values in [-8, 7], so f32 carries it exactly --
+  // which is what lets it travel in the file beside the scales.
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_EQ(static_cast<int32_t>(static_cast<float>(colsum[n])), colsum[n]);
+  }
+
+  // And the packing is reversible: every value lands where whSlot says, so
+  // reading it back gives the weight again. whUnpack is that read, and the
+  // reference path NNTR_MOE_DIFF dequantizes a whole expert through it, so
+  // the round trip is what says those reference values mean anything.
+  std::vector<uint8_t> wh(nntrainer::whBytes(K, N));
+  nntrainer::whPack(rm.data(), K, N, wh.data());
+  EXPECT_EQ(wh.size(), nibble_bytes);
+
+  std::vector<int8_t> back(static_cast<size_t>(K) * N);
+  nntrainer::whUnpack(wh.data(), K, N, back.data());
+  EXPECT_EQ(back, rm) << "whPack and whUnpack disagree about where values go";
+}
+
+/**
+ * @brief QS4CX multiplication respects the platform's packing contract.
+ *
+ * ARM kernels consume a packed RHS. The x86 fallback rejects packing and
+ * multiplies the original nibbles and scales. Check both contracts before
+ * comparing the product against dequantized weights. Activation quantization
+ * requires an SNR bound rather than equality.
+ */
+TEST(nntrainer_cpu_backend_standalone, qs4cx_tensor_packs_and_dots) {
+  nntrainer::init_backend();
+
+  const unsigned int M = 4, K = 64, N = 96;
+  std::vector<float> w_nk = generate_random_vector<float>(N * K); // [N][K]
+  nntrainer::TensorDim wdim(1, 1, K, N,
+                            {ml::train::TensorDim::Format::NCHW,
+                             ml::train::TensorDim::DataType::QS4CX});
+  nntrainer::Tensor w(wdim, true);
+  nntrainer::quant_qs4cx_f32(N, K, w_nk.data(), w.getData<uint8_t>(),
+                             w.getScale<float>(), true);
+#if defined(__aarch64__) || defined(_M_ARM64)
+  ASSERT_NO_THROW(w.pack());
+#else
+  EXPECT_THROW(w.pack(), std::runtime_error);
+  EXPECT_FALSE(w.isPacked());
+#endif
+
+  std::vector<float> deq(static_cast<size_t>(N) * K);
+  nntrainer::dequant_qs4cx_f32(N, K, w.getData<uint8_t>(), w.getScale<float>(),
+                               deq.data(), true);
+
+  nntrainer::Tensor x(1, 1, M, K);
+  std::vector<float> xv = generate_random_vector<float>(M * K);
+  std::copy(xv.begin(), xv.end(), x.getData<float>());
+  nntrainer::Tensor y(1, 1, M, N);
+  x.dot(w, y);
+
+  double signal = 0.0, noise = 0.0;
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      double ref = 0.0;
+      for (unsigned int k = 0; k < K; ++k)
+        ref += (double)xv[m * K + k] * deq[static_cast<size_t>(n) * K + k];
+      const double d = (double)y.getData<float>()[m * N + n] - ref;
+      signal += ref * ref;
+      noise += d * d;
+    }
+  }
+  EXPECT_GT(10.0 * std::log10(signal / noise), 30.0);
+}
+
+/**
+ * @brief The 2-bit palette really is the best four codes, not a good guess
+ *
+ * whPaletteQuantize decides what a 2-bit expert weighs, and the whole 2-bit
+ * effort is gated on one perplexity number measured with it. A k-means that
+ * settled into a local minimum would make that number an argument about the
+ * fitter rather than about 2 bits, so this checks the claim the header makes:
+ * with sixteen candidate codes the nearest-level partition is contiguous, so
+ * the DP is exact. Brute force over all 1820 four-subsets says whether it is.
+ */
+TEST(nntrainer_cpu_backend_standalone, wh_palette_is_optimal_and_restricts) {
+  const unsigned int K = 128, N = 64;
+  const unsigned int group_k = 32;
+
+  // Codes shaped like a real quantized weight: bell-shaped over [-8, 7].
+  std::mt19937 rng(20260923u);
+  std::normal_distribution<float> bell(0.0f, 3.0f);
+  std::vector<int8_t> rm(static_cast<size_t>(K) * N);
+  for (auto &v : rm) {
+    int q = static_cast<int>(std::lround(bell(rng)));
+    v = static_cast<int8_t>(q < -8 ? -8 : (q > 7 ? 7 : q));
+  }
+  const std::vector<int8_t> original = rm;
+
+  std::vector<int8_t> pal(
+    nntrainer::whPaletteEntries(K, N, group_k, /*per_column=*/false));
+  nntrainer::whPaletteQuantize(rm.data(), K, N, group_k, /*per_column=*/false,
+                               pal.data());
+
+  const unsigned int groups = nntrainer::whPaletteGroups(K, group_k);
+  ASSERT_EQ(pal.size(), groups * nntrainer::WH_PALETTE_LEVELS);
+
+  for (unsigned int g = 0; g < groups; ++g) {
+    const int8_t *entry = pal.data() + g * nntrainer::WH_PALETTE_LEVELS;
+
+    // Every value in the group is one of the four, and the nearest one.
+    uint64_t hist[nntrainer::WH_PALETTE_CODES] = {0};
+    for (unsigned int k = g * group_k; k < (g + 1) * group_k; ++k) {
+      for (unsigned int n = 0; n < N; ++n) {
+        const size_t i = static_cast<size_t>(k) * N + n;
+        ++hist[original[i] + 8];
+        EXPECT_EQ(rm[i],
+                  nntrainer::detail::whPaletteNearest(original[i], entry));
+      }
+    }
+
+    const auto error = [&hist](const int8_t p[nntrainer::WH_PALETTE_LEVELS]) {
+      double e = 0.0;
+      for (int v = 0; v < (int)nntrainer::WH_PALETTE_CODES; ++v) {
+        if (!hist[v])
+          continue;
+        const int8_t q = static_cast<int8_t>(v - 8);
+        const double d = q - nntrainer::detail::whPaletteNearest(q, p);
+        e += static_cast<double>(hist[v]) * d * d;
+      }
+      return e;
+    };
+
+    double best = std::numeric_limits<double>::max();
+    for (int a = 0; a < 16; ++a)
+      for (int b = a + 1; b < 16; ++b)
+        for (int c = b + 1; c < 16; ++c)
+          for (int d = c + 1; d < 16; ++d) {
+            const int8_t p[4] = {
+              static_cast<int8_t>(a - 8), static_cast<int8_t>(b - 8),
+              static_cast<int8_t>(c - 8), static_cast<int8_t>(d - 8)};
+            best = std::min(best, error(p));
+          }
+    EXPECT_LE(error(entry), best + 1e-9) << "group " << g << " is not optimal";
+  }
+
+  // And the point of all this: two bits an entry is enough to name them.
+  std::set<int8_t> used(rm.begin(), rm.end());
+  EXPECT_LE(used.size(), groups * nntrainer::WH_PALETTE_LEVELS);
+}
+
+/**
+ * @brief whSourcePageRange never hands back a byte it was not given
+ *
+ * The HTP arena drops a weight's pages once the bytes are copied in, and
+ * every weight is a slice of ONE pool allocation shared with its neighbours.
+ * An off-by-one page here is not a crash, it is the neighbouring weight
+ * reading as zeros -- a silently wrong matmul. So the property under test is
+ * containment, checked on the shapes this model actually registers plus the
+ * degenerate ones.
+ */
+TEST(nntrainer_cpu_backend_standalone, wh_source_page_range_stays_inside) {
+  const size_t ps = 4096;
+  // A pool slice can start anywhere; 512 is the DSP's weight alignment and
+  // the smallest offset a real weight is likely to sit at.
+  const uintptr_t bases[] = {0x10000000u, 0x10000200u, 0x10000fffu};
+  const size_t lens[] = {
+    0u,       1u, ps - 1u, ps, ps + 1u,
+    1835008u, // 1792x2048 down, whBytes
+    3670016u  // 2048x3584 gate_up, the model's largest
+  };
+
+  for (uintptr_t base : bases) {
+    for (size_t len : lens) {
+      const void *src = reinterpret_cast<const void *>(base);
+      uintptr_t begin = 0;
+      size_t span = 0;
+      nntrainer::whSourcePageRange(src, len, ps, &begin, &span);
+      if (span == 0)
+        continue;
+      EXPECT_GE(begin, base) << "released below the weight";
+      EXPECT_LE(begin + span, base + len) << "released past the weight";
+      EXPECT_EQ(begin % ps, 0u) << "madvise needs a page-aligned start";
+      EXPECT_EQ(span % ps, 0u) << "madvise needs a whole number of pages";
+      // Whatever is dropped, at most one page at each end is not.
+      EXPECT_LE(len - span, 2u * ps) << "gave up more than the two end pages";
+    }
+  }
+
+  // A weight smaller than a page, or one that covers no whole page, releases
+  // nothing at all rather than guessing.
+  uintptr_t begin = 0;
+  size_t span = 0;
+  nntrainer::whSourcePageRange(reinterpret_cast<const void *>(0x10000200u),
+                               ps - 1u, ps, &begin, &span);
+  EXPECT_EQ(span, 0u);
+}
+
+/**
+ * @brief htp_qs4cx_from_packed rearranges, it does not requantize
+ *
+ * A weight quantized once from FP32 straight into QS4CX and then handed to
+ * HexKL must be at least as accurate as the same weight routed through
+ * Q4_0 first, because the second route quantizes twice. This test pins
+ * that ordering rather than just checking the new path runs.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_packed_accuracy) {
+  nntrainer::init_backend();
+
+  const unsigned int K = 768; // multiple of 32 so the Q4_0 comparison is legal
+  const unsigned int N = 512;
+
+  // [N][K] row-major: one output channel per row, which is what both
+  // quantize_q4_0(.., N, K, ..) and quant_qs4cx_f32(N, K, .., is_nxk=true)
+  // expect, so the same buffer feeds both routes.
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+
+  // --- Route A: FP32 -> QS4CX (one quantization), then rearrange ---
+  const size_t nibble_bytes = static_cast<size_t>(N) * ((K + 1) / 2);
+  std::vector<uint8_t> qs4cx(nibble_bytes + N * sizeof(float));
+  float *qs4cx_scales = reinterpret_cast<float *>(qs4cx.data() + nibble_bytes);
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), qs4cx.data(), qs4cx_scales,
+                             true);
+
+  std::vector<int8_t> q_direct(static_cast<size_t>(K) * N);
+  std::vector<float> scale_direct(N);
+  std::vector<int32_t> colsum_direct(N);
+  nntrainer::htp_qs4cx_from_packed(qs4cx.data(), qs4cx_scales, K, N,
+                                   q_direct.data(), scale_direct.data(),
+                                   colsum_direct.data());
+
+  // colsum is HexKL's correction term for unsigned activations; a wrong one
+  // is a silent wrong answer, so recompute it independently.
+  for (unsigned int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (unsigned int k = 0; k < K; ++k)
+      sum += q_direct[static_cast<size_t>(k) * N + n];
+    EXPECT_EQ(sum, colsum_direct[n]) << "colsum mismatch at n=" << n;
+  }
+
+  // Every emitted value must be a legal int4.
+  for (size_t i = 0; i < q_direct.size(); ++i) {
+    ASSERT_GE(q_direct[i], -8);
+    ASSERT_LE(q_direct[i], 7);
+  }
+
+  // --- Route B: FP32 -> Q4_0 -> qs4cx (two quantizations) ---
+  const size_t q4_0_bytes =
+    (static_cast<size_t>(K) * N / QK4_0) * sizeof(block_q4_0_testonly);
+  std::vector<char> q4_weight(q4_0_bytes);
+  nntrainer::quantize_q4_0(weight.data(), q4_weight.data(), N, K, nullptr);
+  std::vector<char> repacked(q4_0_bytes);
+  nntrainer::repack_q4_0(repacked.data(), q4_weight.data(), q4_0_bytes, N, K,
+                         ml::train::ISA::ARM);
+
+  std::vector<int8_t> q_hop(static_cast<size_t>(K) * N);
+  std::vector<float> scale_hop(N);
+  std::vector<int32_t> colsum_hop(N);
+  nntrainer::htp_qs4cx_from_q4_0x4(repacked.data(), K, N, q_hop.data(),
+                                   scale_hop.data(), colsum_hop.data());
+
+  // --- Compare both reconstructions against the ORIGINAL fp32 ---
+  auto mean_abs_err = [&](const std::vector<int8_t> &q,
+                          const std::vector<float> &scale) {
+    double sum_abs_err = 0.0;
+    for (unsigned int n = 0; n < N; ++n) {
+      for (unsigned int k = 0; k < K; ++k) {
+        const float approx = q[static_cast<size_t>(k) * N + n] * scale[n];
+        sum_abs_err +=
+          std::fabs(approx - weight[static_cast<size_t>(n) * K + k]);
+      }
+    }
+    return static_cast<float>(sum_abs_err / (static_cast<double>(N) * K));
+  };
+
+  const float err_direct = mean_abs_err(q_direct, scale_direct);
+  const float err_hop = mean_abs_err(q_hop, scale_hop);
+  std::cout << "htp_qs4cx_from_packed: mean_abs_err=" << err_direct
+            << " (direct)  vs " << err_hop << " (via Q4_0)" << std::endl;
+
+  // The whole reason for quantizing the FFN straight to QS4CX: one
+  // quantization must beat two. Strict, because the comparison is on the
+  // same weight with the same per-channel scheme -- the only difference is
+  // the extra Q4_0 hop.
+  EXPECT_LT(err_direct, err_hop);
+}
+
+/**
+ * @brief htp_quant_pack_u8_ah's own math, checked in isolation.
+ *
+ * This cannot compare against the real HVX path bit-for-bit -- that only
+ * exists on-device (nntr_hvx_mm_u8i4_from_f32 returns act_u8_ah/act_scale/
+ * act_zp for exactly that comparison; see docs/htp_attention's u8-boundary
+ * task for the device-side differential gate). What this test can check
+ * without a device: every invariant the DSP path's own contract states --
+ * per-row scale/zp bounds, the AH tile addressing formula, padding rows
+ * zeroed, and that dequantizing the packed bytes reproduces the input
+ * within one quantization step's error.
+ */
+TEST(nntrainer_cpu_backend_standalone, htp_quant_pack_u8_ah_accuracy) {
+  const uint32_t M = 37; // deliberately not a multiple of HTP_ACT_TILE_ROW
+  const uint32_t K = 128;
+
+  std::vector<float> x = generate_random_vector<float>(M * K);
+
+  const uint32_t m_pad = nntrainer::htp_act_m_pad(M);
+  ASSERT_EQ(m_pad, 64u);
+
+  std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * K);
+  std::vector<float> act_scale(m_pad);
+  std::vector<int32_t> act_zp(m_pad);
+  nntrainer::htp_quant_pack_u8_ah(x.data(), M, K, out_ah.data(),
+                                  act_scale.data(), act_zp.data());
+
+  const uint32_t n_ktiles = K / nntrainer::HTP_ACT_TILE_INNER;
+  float max_abs_err = 0.0f;
+  for (uint32_t m = 0; m < M; ++m) {
+    ASSERT_GE(act_zp[m], 0) << "m=" << m;
+    ASSERT_LE(act_zp[m], 255) << "m=" << m;
+    ASSERT_GT(act_scale[m], 0.0f) << "m=" << m;
+
+    const uint32_t rb = m / nntrainer::HTP_ACT_TILE_ROW;
+    const uint32_t r = m % nntrainer::HTP_ACT_TILE_ROW;
+    for (uint32_t k = 0; k < K; ++k) {
+      const uint32_t kt = k / nntrainer::HTP_ACT_TILE_INNER;
+      const uint32_t c = k % nntrainer::HTP_ACT_TILE_INNER;
+      const size_t idx =
+        (static_cast<size_t>(rb) * n_ktiles + kt) *
+          nntrainer::HTP_ACT_TILE_BYTES +
+        static_cast<size_t>(r) * nntrainer::HTP_ACT_TILE_INNER + c;
+      const uint8_t q = out_ah[idx];
+      const float approx = act_scale[m] * (static_cast<float>(q) - act_zp[m]);
+      const float err = std::fabs(approx - x[static_cast<size_t>(m) * K + k]);
+      max_abs_err = std::max(max_abs_err, err);
+    }
+  }
+  std::cout << "htp_quant_pack_u8_ah: max_abs_err=" << max_abs_err << std::endl;
+  // One quantization step is scale (range/255); generate_random_vector's
+  // range makes this a loose smoke bound against a layout or rounding bug,
+  // not a tight accuracy contract -- same spirit as the qs4cx tests above.
+  EXPECT_LT(max_abs_err, 0.5f);
+
+  // Padding rows (M..m_pad) must be exactly zero -- the DSP dequant path
+  // never reads them, but a stray nonzero byte here would mean the tile
+  // addressing formula overlapped a real row into padding space.
+  for (uint32_t m = M; m < m_pad; ++m) {
+    EXPECT_FLOAT_EQ(act_scale[m], 1.0f) << "m=" << m;
+    EXPECT_EQ(act_zp[m], 0) << "m=" << m;
+    const uint32_t rb = m / nntrainer::HTP_ACT_TILE_ROW;
+    const uint32_t r = m % nntrainer::HTP_ACT_TILE_ROW;
+    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+      const size_t base =
+        (static_cast<size_t>(rb) * n_ktiles + kt) *
+          nntrainer::HTP_ACT_TILE_BYTES +
+        static_cast<size_t>(r) * nntrainer::HTP_ACT_TILE_INNER;
+      for (uint32_t c = 0; c < nntrainer::HTP_ACT_TILE_INNER; ++c) {
+        EXPECT_EQ(out_ah[base + c], 0) << "m=" << m << " k=" << (kt * 32 + c);
+      }
+    }
   }
 }
 
@@ -1789,6 +2389,397 @@ TEST(nntrainer_cpu_backend_standalone, qs4cx_fp16_gemm_vs_reference) {
 }
 #endif
 #endif
+
+/* ---- [#164] the HTP RMSNorm spec equals the shipped CPU RMSNorm --------- */
+
+#if defined(__aarch64__)
+/**
+ * @brief The Android CPU's decode norm, call for call: the exported
+ *        rms_norm_wrt_width_fp32_intrinsic over @a rows rows of @a W, then
+ *        Tensor::multiply_i with a 1 x W gamma (RMSNormLayer at W = 2048,
+ *        QKVLayer's headNorm at W = 64).
+ */
+static void cpu_rmsnorm_rows(const float *x, const float *g, float *y,
+                             unsigned rows, unsigned W, float eps) {
+  nntrainer::Tensor out(1, 1, rows, W);
+  nntrainer::Tensor gamma(1, 1, 1, W);
+  std::memcpy(gamma.getData<float>(), g, W * sizeof(float));
+  nntrainer::rms_norm_wrt_width_fp32_intrinsic(x, out.getData<float>(), rows, W,
+                                               eps);
+  out.multiply_i(gamma);
+  std::memcpy(y, out.getData<float>(), (size_t)rows * W * sizeof(float));
+}
+
+/** @brief Elements of @a n rows that differ between the CPU and
+ *         m1_rmsnorm_det (chunk = W, one gamma). */
+static unsigned rmsnorm_cpu_vs_spec(const float *x, const float *g,
+                                    unsigned rows, unsigned W, float eps) {
+  std::vector<float> yc((size_t)rows * W), ys((size_t)rows * W);
+  cpu_rmsnorm_rows(x, g, yc.data(), rows, W, eps);
+  m1_rmsnorm_det(x, g, ys.data(), rows * W, W, eps, nullptr);
+  unsigned bad = 0;
+  for (size_t i = 0; i < yc.size(); ++i)
+    bad += std::memcmp(&yc[i], &ys[i], sizeof(float)) != 0;
+  return bad;
+}
+#endif
+
+/**
+ * @brief G0 of plan 164: m1_ops_det.h's RMSNorm (the HTP kernel's spec) is
+ *        bit-identical to the CPU function in this libnntrainer.so, at
+ *        W = 2048 (1 row a call) and W = 64 (40 rows a call), on 20 000
+ *        random rows whose magnitudes span 2^-20 .. 2^20 and the +-1e-39
+ *        row. The spec is the aarch64 order; the host's AVX2 order is not.
+ */
+TEST(RmsNormCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 NEON order";
+#else
+  const float eps = 1e-5f;
+  std::mt19937 rng(0x164u);
+  std::uniform_real_distribution<float> mant(0.5f, 1.0f), gd(0.5f, 1.5f);
+  std::vector<float> g(2048), x(2048 * 40);
+  for (auto &v : g)
+    v = gd(rng);
+  unsigned rows = 0, bad = 0;
+  const unsigned shapes[2][2] = {{2048u, 1u}, {64u, 40u}};
+  for (const auto &sh : shapes) {
+    const unsigned W = sh[0], R = sh[1];
+    /* 1 000 calls of each shape: 1 000 + 40 000 rows */
+    for (unsigned call = 0; call < 1000u; ++call, rows += R) {
+      for (unsigned r = 0; r < R; ++r) {
+        const int e = (int)((call * R + r) % 41u) - 20;
+        for (unsigned i = 0; i < W; ++i) {
+          const float m = mant(rng);
+          x[r * W + i] = std::ldexp((rng() & 1u) ? -m : m, e);
+        }
+      }
+      bad += rmsnorm_cpu_vs_spec(x.data(), g.data(), R, W, eps);
+    }
+    for (unsigned i = 0; i < W * R; ++i)
+      x[i] = (i & 1u) ? -1e-39f : 1e-39f;
+    const unsigned bad_sub = rmsnorm_cpu_vs_spec(x.data(), g.data(), R, W, eps);
+    std::printf("RmsNormCpuOrder W=%u rows/call=%u subnormal(+-1e-39) bad=%u\n",
+                W, R, bad_sub);
+    bad += bad_sub;
+    rows += R;
+  }
+  std::printf("RmsNormCpuOrder rows=%u bad=%u\n", rows, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief G0's replay: NNTR_NORM_REPLAY=<norm.bin> (a dev/norm-shadow dump)
+ *        with gamma_rms.f32 (49 x 2048) and gamma_qk.f32 (6 x (q 64 | k 64))
+ *        in the same directory; every record's input through the CPU and
+ *        the spec, bit for bit. Skipped when unset.
+ */
+TEST(RmsNormCpuOrder, ReplayNormShadow) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 NEON order";
+#else
+  const char *path = std::getenv("NNTR_NORM_REPLAY");
+  if (!path)
+    GTEST_SKIP() << "NNTR_NORM_REPLAY not set";
+  const std::string file(path);
+  const std::string dir = file.substr(0, file.find_last_of('/') + 1);
+  auto load = [](const std::string &p, size_t n) {
+    std::vector<float> v(n);
+    std::FILE *f = std::fopen(p.c_str(), "rb");
+    const size_t got = f ? std::fread(v.data(), sizeof(float), n, f) : 0;
+    if (f)
+      std::fclose(f);
+    return got == n ? v : std::vector<float>();
+  };
+  const std::vector<float> grms = load(dir + "gamma_rms.f32", 49u * 2048u);
+  const std::vector<float> gqk = load(dir + "gamma_qk.f32", 6u * 128u);
+  ASSERT_FALSE(grms.empty() || gqk.empty()) << "gammas next to " << file;
+  std::FILE *f = std::fopen(path, "rb");
+  ASSERT_NE(f, nullptr) << file;
+  const float eps = 1e-5f;
+  unsigned h[4], k_rms = 0, k_qk = 0, n_rms = 0, bad_rms = 0, n_qk = 0,
+                 bad_qk = 0;
+  std::vector<float> in(8192), cpu(8192), other(8192);
+  while (std::fread(h, sizeof(unsigned), 4, f) == 4) {
+    ASSERT_TRUE(h[2] <= 8192u && h[3] <= 8192u && h[3] <= h[2] &&
+                std::fread(in.data(), 4, h[2], f) == h[2] &&
+                std::fread(cpu.data(), 4, h[3], f) == h[3] &&
+                std::fread(other.data(), 4, h[3], f) == h[3]);
+    if (h[0] != 1u) {
+      ASSERT_EQ(h[2], 2048u);
+      ++n_rms;
+      bad_rms +=
+        rmsnorm_cpu_vs_spec(in.data(), grms.data() + (k_rms++ % 49u) * 2048u, 1,
+                            2048u, eps) != 0;
+    } else {
+      const unsigned wk = h[2] - h[3], wq = h[3] - wk;
+      ASSERT_TRUE(wk > 0u && wk <= h[3] - wk && wq % 64u == 0u &&
+                  wk % 64u == 0u)
+        << "QK_NORM record of " << h[2] << " / " << h[3];
+      const float *gq = gqk.data() + (k_qk++ % 6u) * 128u;
+      n_qk += h[3] / 64u;
+      bad_qk += rmsnorm_cpu_vs_spec(in.data(), gq, wq / 64u, 64u, eps) != 0;
+      bad_qk +=
+        rmsnorm_cpu_vs_spec(in.data() + wq, gq + 64, wk / 64u, 64u, eps) != 0;
+    }
+  }
+  std::fclose(f);
+  std::printf("RmsNormCpuOrder replay %s rms=%u bad=%u qk_heads=%u "
+              "bad_calls=%u\n",
+              path, n_rms, bad_rms, n_qk, bad_qk);
+  EXPECT_EQ(bad_rms + bad_qk, 0u);
+  EXPECT_GT(n_rms + n_qk, 0u);
+#endif
+}
+
+/* ---- [#132 PR 2] G0: the CPU-order specs equal the shipped CPU ---------- */
+
+#if defined(__aarch64__)
+/** @brief Rows per G0 shape: NNTR_G0_ROWS, default 2000 (plan 132 G0). */
+static unsigned g0_rows(unsigned dflt = 2000u) {
+  const char *e = std::getenv("NNTR_G0_ROWS");
+  return e ? static_cast<unsigned>(std::atoi(e)) : dflt;
+}
+#endif
+
+/**
+ * @brief nntr_quantize_row_q8_0 (this libnntrainer.so) against
+ *        q8_0_quant_cpu_det, block for block: the stored f16 d and the 32
+ *        quants, on q4_gemv_cases.h's rows (block magnitudes 2^-20 ..
+ *        2^20, zero, tiny and quantizer-rounding blocks).
+ */
+TEST(Q8QuantCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned rows = g0_rows();
+  unsigned bad = 0, n = 0;
+  for (unsigned K : {2048u, 7168u}) {
+    std::vector<float> x(K);
+    std::vector<uint8_t> qb((K / 32u) * 34u);
+    std::vector<int8_t> q(K);
+    std::vector<uint16_t> d(K / 32u);
+    for (unsigned r = 0; r < rows; ++r, ++n) {
+      make_row(x.data(), K, static_cast<int>(r % 4u), static_cast<int>(r));
+      nntr_quantize_row_q8_0(x.data(), qb.data(), K);
+      q8_0_quant_cpu_det(x.data(), K, q.data(), d.data());
+      for (unsigned b = 0; b < K / 32u; ++b) {
+        const uint8_t *blk = qb.data() + b * 34u;
+        bad += std::memcmp(blk, &d[b], 2) != 0 ||
+               std::memcmp(blk + 2, q.data() + b * 32u, 32) != 0;
+      }
+    }
+  }
+  std::printf("Q8QuantCpuOrder rows=%u bad_blocks=%u\n", n, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief gemm_q4_0<float> at M = 1 (the decode FC and lm_head) against
+ *        q4_gemv_cpu_det on the same canonical weight, repacked by this
+ *        library's repack_q4_0: the five FC shapes, NNTR_G0_ROWS rows each.
+ *        Also q4_0_from_q4_0x4 inverts the repack (the shadow's reorder).
+ */
+TEST(Q4GemvCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned rows = g0_rows();
+  const unsigned shapes[5][2] = {{2048u, 6144u},
+                                 {2048u, 2048u},
+                                 {2048u, 512u},
+                                 {7168u, 2048u},
+                                 {2048u, 7168u}};
+  unsigned bad_total = 0;
+  for (const auto &sh : shapes) {
+    const unsigned K = sh[0], N = sh[1], nb = K / 32u;
+    const size_t bytes = static_cast<size_t>(N) * nb * 18u;
+    std::vector<uint8_t> w(bytes), x4(bytes), back(bytes);
+    make_weights(w.data(), K, N);
+    std::memcpy(x4.data(), w.data(), bytes);
+    nntrainer::repack_q4_0(x4.data(), w.data(), bytes, N, K);
+    q4_0_from_q4_0x4(x4.data(), K, N, back.data());
+    const bool layout_ok = std::memcmp(back.data(), w.data(), bytes) == 0;
+    std::vector<float> x(K), yc(N), ys(N);
+    std::vector<int8_t> q(K);
+    std::vector<uint16_t> d(nb);
+    unsigned bad = 0;
+    for (unsigned r = 0; r < rows; ++r) {
+      make_row(x.data(), K, static_cast<int>(r % 4u), static_cast<int>(r));
+      nntrainer::gemm_q4_0<float>(1, N, K, x.data(), K, x4.data(), N, yc.data(),
+                                  N);
+      q8_0_quant_cpu_det(x.data(), K, q.data(), d.data());
+      q4_gemv_cpu_det(w.data(), q.data(), d.data(), K, N, ys.data());
+      for (unsigned n = 0; n < N; ++n)
+        bad += std::memcmp(&yc[n], &ys[n], 4) != 0;
+    }
+    std::printf("Q4GemvCpuOrder K=%u N=%u rows=%u bad=%u layout=%s\n", K, N,
+                rows, bad, layout_ok ? "ok" : "BAD");
+    EXPECT_TRUE(layout_ok) << "q4_0_from_q4_0x4 does not invert repack_q4_0";
+    bad_total += bad;
+  }
+  EXPECT_EQ(bad_total, 0u);
+#endif
+}
+
+/**
+ * @brief nntrainer::swiglu (neon::swiglu, exp_ps) against
+ *        m1_swiglu_cpu_det at n = 7168 (the dense FFN), gate values over
+ *        the FFN range, the clamp, far tails, subnormals and every floor
+ *        boundary of exp_ps's fx.
+ */
+TEST(SwigluCpuOrder, MatchesNeon) {
+#if !defined(__aarch64__)
+  GTEST_SKIP() << "the spec is the aarch64 order";
+#else
+  const unsigned N = 7168u, rows = g0_rows();
+  std::mt19937 rng(0x132u);
+  std::vector<float> y(N), z(N), oc(N), os(N);
+  unsigned bad = 0;
+  for (unsigned r = 0; r < rows; ++r) {
+    const float span = r % 3u == 0u ? 8.0f : r % 3u == 1u ? 100.0f : 1e4f;
+    std::uniform_real_distribution<float> yd(-span, span), zd(-4.0f, 4.0f);
+    for (unsigned i = 0; i < N; ++i) {
+      y[i] = yd(rng);
+      z[i] = zd(rng);
+    }
+    if (r == 1u)
+      for (unsigned i = 0; i < N; ++i)
+        y[i] = (i & 1u) ? -1e-39f : 1e-39f;
+    if (r == 2u)
+      for (unsigned i = 0; i < N; ++i) {
+        const int k = static_cast<int>(i / 56u) - 127;
+        const float x0 = static_cast<float>((static_cast<double>(k) - 0.5) /
+                                            1.4426950408889634);
+        y[i] = -cpu_det_float(cpu_det_bits(x0) + (i % 56u) - 28u);
+      }
+    nntrainer::swiglu(N, oc.data(), y.data(), z.data());
+    m1_swiglu_cpu_det(y.data(), z.data(), os.data(), N);
+    for (unsigned i = 0; i < N; ++i)
+      bad += std::memcmp(&oc[i], &os[i], 4) != 0;
+  }
+  std::printf("SwigluCpuOrder n=%u rows=%u bad=%u\n", N, rows, bad);
+  EXPECT_EQ(bad, 0u);
+#endif
+}
+
+/**
+ * @brief The router's logits: Tensor::dot of a 1 x 2048 row with the
+ *        2048 x 32 gate (Lfm2MoELayer's input.dot(gate_weights), OpenBLAS
+ *        sgemv_n) against m1_router_cpu_det's fused chains, magnitudes
+ *        2^-20 .. 2^20; and the selection of the same logits against a
+ *        copy of buildExpertAssignments' code (bionic expf, divides).
+ */
+TEST(SgemvNCpuOrder, MatchesRouter) {
+#if !defined(__aarch64__) || defined(_WIN32)
+  // The spec is the order of the Android aarch64 OpenBLAS sgemv_n. The
+  // Windows ARM64 build links another OpenBLAS build (nntrainer-windows-
+  // resource) that sums in another order: on that CI every logit differed
+  // in its bits while every selection matched.
+  GTEST_SKIP() << "the spec is the aarch64 order of the Android OpenBLAS";
+#else
+  const unsigned K = 2048u, E = 32u, top_k = 4u, rows = g0_rows();
+  std::mt19937 rng(0x13232u);
+  std::uniform_real_distribution<float> wd(-0.05f, 0.05f), bd(-0.01f, 0.01f),
+    md(-2.0f, 2.0f);
+  nntrainer::Tensor in(1, 1, 1, K), gate(1, 1, K, E), out(1, 1, 1, E);
+  float *wp = gate.getData<float>();
+  for (unsigned i = 0; i < K * E; ++i)
+    wp[i] = wd(rng);
+  std::vector<float> bias(E), lg(E);
+  for (auto &b : bias)
+    b = bd(rng);
+  std::vector<uint32_t> sel(top_k);
+  std::vector<float> wt(top_k);
+  unsigned bad_logit = 0, bad_sel = 0;
+  for (unsigned r = 0; r < rows; ++r) {
+    float *x = in.getData<float>();
+    for (unsigned k = 0; k < K; ++k)
+      x[k] = std::ldexp(md(rng), static_cast<int>(r % 41u) - 20);
+    in.dot(gate, out);
+    m1_router_cpu_det(x, wp, bias.data(), K, E, top_k, lg.data(), sel.data(),
+                      wt.data());
+    const float *lc = out.getData<float>();
+    bad_logit += std::memcmp(lc, lg.data(), E * 4) != 0;
+    // buildExpertAssignments on the CPU's own logits
+    std::vector<std::pair<float, int>> sc(E);
+    for (unsigned e = 0; e < E; ++e) {
+      const float s = 1.0f / (1.0f + std::exp(-lc[e]));
+      sc[e] = {s + bias[e], static_cast<int>(e)};
+    }
+    std::partial_sort(
+      sc.begin(), sc.begin() + top_k, sc.end(),
+      [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+      });
+    for (unsigned k = 0; k < top_k; ++k)
+      bad_sel += sel[k] != static_cast<uint32_t>(sc[k].second);
+  }
+  std::printf("SgemvNCpuOrder K=%u E=%u rows=%u bad_logits=%u bad_sel=%u "
+              "(the weights' -ffast-math sum lives in libcausallm_core.so: "
+              "G2's router records hold it)\n",
+              K, E, rows, bad_logit, bad_sel);
+  EXPECT_EQ(bad_logit, 0u);
+  EXPECT_EQ(bad_sel, 0u);
+#endif
+}
+
+/**
+ * @brief m1_expf_bionic_det against this device's libm expf on all 2^32
+ *        inputs (NaNs skipped), eight threads. The first 16 differences are
+ *        printed: the plan's stop rule reads them.
+ */
+TEST(ExpfBionic, AllInputs) {
+#if !defined(__aarch64__) || defined(_WIN32)
+  // Windows links the UCRT, not bionic, and its ARM64 runner does not get
+  // through the 2^32 inputs in the test's 90 s.
+  GTEST_SKIP() << "pins the port to bionic (Android's libm)";
+#else
+  float (*volatile libm_expf)(float) = expf;
+  const unsigned T = 8u;
+  std::vector<uint64_t> bad(T, 0), n(T, 0);
+  std::vector<std::vector<uint32_t>> first(T);
+  std::vector<std::thread> th;
+  for (unsigned t = 0; t < T; ++t) {
+    th.emplace_back([&, t] {
+      const uint64_t lo = (1ull << 32) / T * t, hi = (1ull << 32) / T * (t + 1);
+      for (uint64_t u = lo; u < hi; ++u) {
+        const float x = cpu_det_float(static_cast<uint32_t>(u));
+        if (x != x)
+          continue;
+        const float a = m1_expf_bionic_det(x), b = libm_expf(x);
+        ++n[t];
+        if (std::memcmp(&a, &b, 4) != 0) {
+          ++bad[t];
+          if (first[t].size() < 16u)
+            first[t].push_back(static_cast<uint32_t>(u));
+        }
+      }
+    });
+  }
+  for (auto &t : th)
+    t.join();
+  uint64_t nb = 0, nn = 0;
+  for (unsigned t = 0; t < T; ++t) {
+    nb += bad[t];
+    nn += n[t];
+    for (uint32_t u : first[t]) {
+      if (u == 0u)
+        continue;
+      const float x = cpu_det_float(u);
+      std::printf("ExpfBionic diff x=%08x port=%08x libm=%08x\n", u,
+                  cpu_det_bits(m1_expf_bionic_det(x)),
+                  cpu_det_bits(libm_expf(x)));
+    }
+  }
+  std::printf("ExpfBionic inputs=%llu bad=%llu\n",
+              static_cast<unsigned long long>(nn),
+              static_cast<unsigned long long>(nb));
+  EXPECT_EQ(nb, 0u);
+#endif
+}
 
 int main(int argc, char **argv) {
   int result = -1;

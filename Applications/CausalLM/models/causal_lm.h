@@ -86,6 +86,7 @@ public:
   static void releaseDeviceCaches();
 
 protected:
+  bool htp_execution_profile_ = false;
   /**
    * @brief One-shot CUDA prewarm guard, PER MODEL OBJECT. A function-local
    *        static was process-lifetime, so the second load of a load/destroy
@@ -113,6 +114,18 @@ public:
     for (auto &kv : logits_pool_sizes_)
       delete[] kv.first;
   }
+
+  /**
+   * @brief Load the weights, and build the KV cache while they load.
+   * @details The KV cache used to be allocated and bound inside the first
+   * run(), i.e. inside TTFT. Its size does not depend on the prompt unless the
+   * prefill plane can still grow (prefillPlaneCanGrow()), so in every other
+   * case it is allocated here, on a side thread that overlaps the weight load,
+   * and bound once the load is done. NNTR_KV_EARLY=0 (or
+   * setPrepareRunAtLoad(false)) restores the lazy allocation in run();
+   * NNTR_KV_EARLY=sync allocates after the load on the calling thread.
+   */
+  void load_weight(const std::string &weight_path) override;
 
   /**
    * @brief run the CausalLM model
@@ -462,6 +475,35 @@ protected:
    *        Idempotent — safe to call once after initialize().
    */
   virtual void allocateAndBindKVCache();
+
+  /**
+   * @brief Before a step at absolute position pos: the windowed layers of
+   *        kv_cache move their window to the front (KVCacheManager::compact)
+   *        and the HTP attention layers get the new row bases.
+   * @param[in] pos absolute position of the next row
+   * @param[in] force hand the bases over even when none moved (after a load)
+   */
+  void compactKVCache(unsigned int pos, bool force = false);
+
+  /**
+   * @brief Per-layer KV geometry, read from the model's hooks.
+   */
+  struct KVCacheLayout {
+    std::vector<unsigned int> widths; /**< per-layer K/V row width */
+    unsigned int max_timestep = 0;    /**< MAX_SEQ_LEN */
+  };
+
+  /**
+   * @brief Read the KV geometry hooks and declare the per-layer row caps and
+   *        the KV-sharing map on kv_cache. Model-side only, no allocation.
+   */
+  KVCacheLayout planKVCache();
+
+  /**
+   * @brief Allocate (and zero) kv_cache for @a layout. Touches only kv_cache,
+   *        so load_weight() can run it on a side thread.
+   */
+  void allocateKVCacheStorage(const KVCacheLayout &layout);
 
   /**
    * @brief incremental_inference wrapper that feeds the REAL KV-cache tensors

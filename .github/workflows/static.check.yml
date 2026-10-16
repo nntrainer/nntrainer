@@ -30,7 +30,11 @@ jobs:
         run: |
           tmpfile_pre=$(mktemp)
           tmpfile=$(mktemp)
-          git show --pretty="format:" --name-only --diff-filter=AMRC ${{ github.event.pull_request.head.sha}} -${{ github.event.pull_request.commits }} > ${tmpfile_pre}
+          # One entry per file: "git show -N" names a file once per commit
+          # that touches it, and every checker below walks the list (a
+          # 600-commit PR listed 6,259 entries for 487 files and ran
+          # cppcheck for hours).
+          git show --pretty="format:" --name-only --diff-filter=AMRC ${{ github.event.pull_request.head.sha}} -${{ github.event.pull_request.commits }} | sort -u > ${tmpfile_pre}
 
           ####### Screen out deleted files from the file list!!!
 

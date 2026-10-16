@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   htp_moe_opts.h
+ * @date   22 Sep 2026
+ * @brief  The MoE layer call's option resolver and its profile-row residue,
+ *         as pure functions a host check can run (#101, #102)
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * C99 and header-only so test/htp/host/moe_opts_host_check.c compiles it
+ * with gcc -std=c99 like the other host checks, and htp_compute_ops.cpp
+ * includes the same definitions.
+ */
+#ifndef __HTP_MOE_OPTS_H__
+#define __HTP_MOE_OPTS_H__
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_M1_GEMV restated for the ARM
+ *  side (the DSP header does not compile there): the moe_set_opts bit that
+ *  lets a call of at most 4 rows take the HVX GEMV path. */
+#define HTP_MOE_FLAG_M1_GEMV 1u
+
+/** @brief hexkl_mm_u8i4_moe.h's two tune bits and their fields, restated
+ *  for the ARM side (#113). Bit 7 says the DSP takes the l2fetch lead from
+ *  bits [15:8], in units of HTP_MOE_GEMV_LEAD_KB_UNIT KB, instead of from
+ *  its build default; bit 6 says the same of the row loop in bit 16. They
+ *  are separate so that naming one knob leaves the other at the build's
+ *  value rather than silently resetting it to zero. */
+#define HTP_MOE_FLAG_GEMV_LEAD_SET 0x80u
+#define HTP_MOE_FLAG_GEMV_ROWS1_SET 0x40u
+#define HTP_MOE_GEMV_LEAD_SHIFT 8u
+#define HTP_MOE_GEMV_LEAD_BITS 0xFFu
+#define HTP_MOE_GEMV_LEAD_KB_UNIT 64u
+#define HTP_MOE_GEMV_LEAD_MAX_UNITS 127u
+#define HTP_MOE_FLAG_GEMV_ROWS1 0x10000u
+
+/** @brief hexkl_mm_u8i4_moe.h's third tune bit and its field (#117): bit 5
+ *  says the DSP takes the weight feed from bit 17 (1 = each expert's
+ *  weights staged into VTCM by DMA, 0 = read from the arena) instead of
+ *  from its build default. Always sent, like the pair above: an unset
+ *  run prints applied=0x303e1 (feed=vtcm), NNTR_MOE_HTP_GEMV_FEED=0
+ *  0x103e1 (feed=arena, the D192 arena read = #117's A). */
+#define HTP_MOE_FLAG_GEMV_FEED_SET 0x20u
+#define HTP_MOE_FLAG_GEMV_FEED 0x20000u
+
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_DMA_BYPASS restated (#158):
+ *  bit 18 sets src_bypass on every arena expert weight descriptor, M = 1
+ *  feed and M > 1 HMX path alike. On by default since the #158 sitting
+ *  (user, 2026-09-29: decode +31..35 %, MoE dumps bit-identical), so an
+ *  unset run's word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 clears it (0x303e1). */
+#define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
+
+/** @brief HTP_MOE_FLAG_DMA_BYPASS for getenv("NNTR_MOE_DMA_BYPASS"): set
+ *  when unset or a non-zero number, clear for "0". */
+static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
+  return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
+}
+
+/** @brief hexkl_mm_u8i4_moe.h's DMA queue field restated (#177): bits
+ *  [23:22] (at [20:19] before #4415 took bit 19) hold N - 1, the number of
+ *  DMA queues (pool lanes) the M = 1 feed splits each weight matrix over.
+ *  The default N = 1 leaves the field 0, so an unset run's word stays
+ *  0x703e1; N = 2 is 0x4703e1, N = 4 0xc703e1. */
+#define HTP_MOE_DMA_Q_SHIFT 22u
+#define HTP_MOE_DMA_Q_BITS 3u
+#define HTP_MOE_DMA_QUEUES_DEFAULT 1u
+
+/** @brief The queue field for getenv("NNTR_MOE_DMA_QUEUES"): unset gives
+ *  HTP_MOE_DMA_QUEUES_DEFAULT, exactly "1".."4" gives N. Anything else is
+ *  an error (returns -1, *bits untouched): a mistyped variant must not run
+ *  as the reference. */
+static inline int htp_moe_opts_dma_queues(const char *env, uint32_t *bits) {
+  uint32_t n = HTP_MOE_DMA_QUEUES_DEFAULT;
+  if (env != NULL) {
+    if (env[0] < '1' || env[0] > '4' || env[1] != '\0')
+      return -1;
+    n = (uint32_t)(env[0] - '0');
+  }
+  *bits = (n - 1u) << HTP_MOE_DMA_Q_SHIFT;
+  return 0;
+}
+
+/** @brief N, the queue count a flags word names: its field + 1. */
+static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
+  return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
+}
+
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GELU_TANH restated (#4415's
+ *  bit 19; plan 201 S4 had it at 21): every expert's gate_up epilogue
+ *  gelu_tanh(gate) * up instead of SwiGLU, on the M = 1 GEMV and the HMX
+ *  loop alike. #4415's prefill call ORs it in per call from its act
+ *  argument; set_moe_geglu puts it in the session word, which is what the
+ *  one-PD token's MOE and DENSE_FFN ops read. A model property: LFM never
+ *  sets it, so its word stays 0x703e1. */
+#define HTP_MOE_FLAG_GEGLU 0x80000u
+
+/** Opt-in online rotations, matching hexkl_mm_u8i4_moe.h. These rotate
+ * activations only: ordinary checkpoints are useful for timing, but their
+ * outputs are not valid until weights have the matching offline rotation.
+ * The app defaults to 2-bit experts; the shared FFN stays unchanged. */
+#define HTP_MOE_FLAG_HAD_UP 0x04000000u
+#define HTP_MOE_FLAG_HAD_DOWN 0x08000000u
+#define HTP_MOE_FLAG_HAD_SCALAR 0x10000000u
+#define HTP_MOE_FLAG_HAD_HMX 0x20000000u
+#define HTP_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
+#define HTP_MOE_FLAG_HAD_MASK 0x7c000000u
+
+/** NNTR_MOE_HADAMARD: unset/off, up, down, both, both_scalar,
+ * up_hmx, down_hmx, both_hmx. HMX uses full-width FP16 on prefill;
+ * calls of at most four tokens and HVX expert tails keep FP32.
+ * Invalid values leave the output untouched and fail instead of silently
+ * benchmarking the baseline. */
+static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
+  if (env == NULL || strcmp(env, "off") == 0)
+    *bits = 0u;
+  else if (strcmp(env, "up") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP;
+  else if (strcmp(env, "down") == 0)
+    *bits = HTP_MOE_FLAG_HAD_DOWN;
+  else if (strcmp(env, "both") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN;
+  else if (strcmp(env, "both_scalar") == 0)
+    *bits =
+      HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_SCALAR;
+  else if (strcmp(env, "up_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_HMX;
+  else if (strcmp(env, "down_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_HMX;
+  else if (strcmp(env, "both_hmx") == 0)
+    *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_HMX;
+  else
+    return -1;
+  return 0;
+}
+
+/** NNTR_MOE_HADAMARD_SCOPE: default/2bit rotates only 2-bit pairs.
+ * all is for kernel experiments; every active width must then be supported.
+ * In particular, PR #4416's shared FFN uses unsupported 1056-wide chunks. */
+static inline int htp_moe_opts_hadamard_scope(const char *env, uint32_t *bits) {
+  if (env == NULL || strcmp(env, "2bit") == 0)
+    *bits = HTP_MOE_FLAG_HAD_2BIT_ONLY;
+  else if (strcmp(env, "all") == 0)
+    *bits = 0u;
+  else
+    return -1;
+  return 0;
+}
+
+/** @brief The bits of moe_set_opts' echo that must equal what was sent.
+ *  With the GEMV on, all of them. With it off, the tune bits mean nothing
+ *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
+ *  for, because the HMX loop's weight DMA honours it (#158): a skel that
+ *  predates it must fail the run, not measure the default. Likewise the
+ *  GeGLU bit: a skel without it would run SwiGLU on a Gemma expert. */
+static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
+  if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
+    return ~0u;
+  return HTP_MOE_FLAG_M1_GEMV |
+         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU |
+                   HTP_MOE_FLAG_HAD_MASK));
+}
+
+/**
+ * @brief The lead field for a requested lead in KB: rounded to the nearest
+ *        multiple of HTP_MOE_GEMV_LEAD_KB_UNIT and clamped to
+ *        HTP_MOE_GEMV_LEAD_MAX_UNITS.
+ *
+ * The clamp is the l2fetch width field's 16 bits: a box is at most 127
+ * tiles of 512 B (hvx_gemm_u8i4_wh.h), and at the decode shape a stage-A
+ * unit is exactly 64 KB, so one field unit is one unit of weight there.
+ * A negative or unparsable value reads as 0, which is "every column
+ * fetches itself".
+ */
+static inline uint32_t htp_moe_gemv_lead_units(const char *env) {
+  long kb;
+  unsigned long u;
+  if (env == NULL)
+    return 0u;
+  kb = atol(env);
+  if (kb <= 0)
+    return 0u;
+  u = ((unsigned long)kb + HTP_MOE_GEMV_LEAD_KB_UNIT / 2u) /
+      HTP_MOE_GEMV_LEAD_KB_UNIT;
+  if (u > HTP_MOE_GEMV_LEAD_MAX_UNITS)
+    u = HTP_MOE_GEMV_LEAD_MAX_UNITS;
+  return (uint32_t)u;
+}
+
+/** @brief The (loop, lead, feed) cell an unset run asks for: #113's D192
+ *  under #117's VTCM feed, the same values as hexkl_mm_u8i4_moe.h's
+ *  HVX_GEMV_M1_ROWS1, HVX_GEMV_PF_LEAD_KB and HVX_GEMV_M1_FEED. Restated
+ *  here because the DSP header does not compile on the ARM side; keep the
+ *  two in step. Sent explicitly rather than left to the skel's default so
+ *  that every log's echo names its cell (LEDGER rule 21): an unset run
+ *  prints applied=0x303e1, NNTR_MOE_HTP_GEMV_FEED=0 prints 0x103e1 (the
+ *  D192 arena read), and LEAD_KB=0 ROWS1=0 FEED=0 (the pre-#115 four-row,
+ *  no-lead cell) prints 0xe1. */
+#define HTP_MOE_GEMV_LEAD_KB_DEFAULT 192u
+#define HTP_MOE_GEMV_ROWS1_DEFAULT 1u
+#define HTP_MOE_GEMV_FEED_DEFAULT 1u
+
+/**
+ * @brief moe_set_opts flags for NNTR_MOE_HTP_M1_GEMV and, since #113, the
+ *        GEMV tuning variables.
+ * @param env       getenv("NNTR_MOE_HTP_M1_GEMV"), NULL when unset
+ * @param lead_env  getenv("NNTR_MOE_HTP_GEMV_LEAD_KB"), NULL when unset
+ * @param rows1_env getenv("NNTR_MOE_HTP_GEMV_ROWS1"), NULL when unset
+ * @param feed_env  getenv("NNTR_MOE_HTP_GEMV_FEED"), NULL when unset (#117)
+ * @return HTP_MOE_FLAG_M1_GEMV when @a env is unset (the default since
+ *         #101) or set to a non-zero number, 0 for "0" (the opt-out); plus
+ *         all three tune bits, each field from its own variable when set
+ *         and from the *_DEFAULT above when not
+ *
+ * Each knob is overridden only by its own variable: setting the lead
+ * leaves the row loop at the default and vice versa, so naming one knob
+ * cannot silently reset the other to zero.
+ */
+static inline uint32_t htp_moe_opts_flags(const char *env, const char *lead_env,
+                                          const char *rows1_env,
+                                          const char *feed_env) {
+  uint32_t flags = HTP_MOE_FLAG_GEMV_LEAD_SET | HTP_MOE_FLAG_GEMV_ROWS1_SET |
+                   HTP_MOE_FLAG_GEMV_FEED_SET;
+  if (env == NULL || atoi(env) != 0)
+    flags |= HTP_MOE_FLAG_M1_GEMV;
+  flags |= (lead_env != NULL
+              ? htp_moe_gemv_lead_units(lead_env)
+              : HTP_MOE_GEMV_LEAD_KB_DEFAULT / HTP_MOE_GEMV_LEAD_KB_UNIT)
+           << HTP_MOE_GEMV_LEAD_SHIFT;
+  if (rows1_env != NULL ? atoi(rows1_env) != 0
+                        : HTP_MOE_GEMV_ROWS1_DEFAULT != 0u)
+    flags |= HTP_MOE_FLAG_GEMV_ROWS1;
+  if (feed_env != NULL ? atoi(feed_env) != 0 : HTP_MOE_GEMV_FEED_DEFAULT != 0u)
+    flags |= HTP_MOE_FLAG_GEMV_FEED;
+  return flags;
+}
+
+/** @brief The banner's name for the feed cell a flags word asks for:
+ *  "vtcm" or "arena". */
+static inline const char *htp_moe_opts_feed_name(uint32_t flags) {
+  return (flags & HTP_MOE_FLAG_GEMV_FEED) != 0u ? "vtcm" : "arena";
+}
+
+/**
+ * @brief The profile row's rest: the DSP clock minus every named stage.
+ * @param dsp per-call DSP time
+ * @param named_sum_wo_swiglu per-call sum of every named stage but swiglu
+ * @param swiglu per-call swiglu slot
+ * @param gemv_row non-zero when any call in the row took the M=1 GEMV path
+ * @return the residue
+ *
+ * On the GEMV path the swiglu slot is the sum of every worker lane's wall
+ * time inside the two GEMV stages (hexkl_mm_u8i4_moe.c moe_tail_probe_add),
+ * not a stage on the caller's clock, so it is left out of the subtraction;
+ * swiglu / mm then reads as the number of lanes busy over mm (#102).
+ */
+static inline double htp_moe_row_rest_us(double dsp, double named_sum_wo_swiglu,
+                                         double swiglu, int gemv_row) {
+  return dsp - named_sum_wo_swiglu - (gemv_row ? 0.0 : swiglu);
+}
+
+#endif /* __HTP_MOE_OPTS_H__ */

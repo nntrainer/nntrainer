@@ -279,6 +279,27 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
                       const unsigned int K, const T *A, const unsigned int lda,
                       const void *B, const unsigned int ldb, T *C,
                       const unsigned int ldc);
+
+size_t __ggml_q4_0_gemv_activation_size(const unsigned int K);
+
+void __ggml_quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                          void *quantized_A);
+
+/**
+ * @brief Thread-free Q4_0/Q8_0 row-major matrix-vector multiplication
+ *
+ * @param row_begin First Q4_0 weight row to compute
+ * @param row_end One-past-last Q4_0 weight row to compute
+ * @param K Number of elements in each row
+ * @param quantized_A Activation vector in Q8_0 format
+ * @param B Q4_0 weight rows in canonical block_q4_0 layout
+ * @param C FP32 output vector
+ */
+void __ggml_gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                                    const unsigned int row_end,
+                                    const unsigned int K,
+                                    const void *quantized_A, const void *B,
+                                    float *C);
 /**
  * @brief (1xK)*(Kx1) dot product for q6_K and q8_K vectors
  *

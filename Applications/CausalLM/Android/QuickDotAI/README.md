@@ -41,6 +41,35 @@ native tools and libraries, and installs SampleTestAPP only when combined with
 `--app`. `--cache` reuses a compatible engine when available and rebuilds it
 on a cache miss.
 
+### Gemma4 MoE HTP
+
+`build_android.sh --htp --app` assembles the native Hexagon variant. Set
+`HEX_ARCH=v81`, `HEXAGON_SDK_ROOT`, `DEFAULT_HEXAGON_TOOLS_ROOT`, `HEXKL_ROOT`,
+and `HEXKL_SDK_VER` for the matching DSP/ARM SDK libraries. HTP and `--qnn`
+are separate builds. The HTP package includes `libsdkl.so` and the byte-exact
+`libnntr_hvx_skel.so`; `libcdsprpc.so` comes from the device vendor namespace.
+
+Keep `jniLibs.useLegacyPackaging = true` and
+`jniLibs.keepDebugSymbols += "**/libnntr_hvx_skel.so"` in the consuming app.
+Pass `applicationInfo.nativeLibraryDir` in `LoadModelRequest.nativeLibDir`.
+Select `ModelIds.GEMMA4_26B_A4B_HTP`, `BackendType.NPU` and
+`QuantizationType.W4A32`. The model folder must be
+`<modelBasePath>/gemma4-26b-a4b-htp-w4a32`; use the validated HTP pack, not a
+CPU or QNN pack. Run text through `runModelHandleWithMessagesStreaming`.
+
+The current HexKL `libsdkl.so` has 4 KB LOAD alignment. The tested Android 16
+4 KB device runs the app, but displays a debug 16 KB compatibility warning
+that also lists the DSP ELF in the native library directory. This build is
+not certified for a 16 KB device. See the
+[device validation](../../../../docs/gemma4-htp-quickdotai.md#validation).
+
+Gemma4 MoE selection fills the OpenAI and Chat inputs with the tested summary
+prompt. For Chat, use the [HTP chat preset](../../res/gemma4/htp_chat/) in the
+model pack: it supplies the 26B template with an empty thought channel, real EOS
+tokens and enough context for the full default prompt. The fixed-length benchmark
+configuration is not suitable for interactive responses. See the
+[Chat configuration and validation](../../../../docs/gemma4-htp-quickdotai.md#chat-and-the-default-prompt).
+
 ## 🧭 API Surface
 
 Package: `com.example.quickdotai`

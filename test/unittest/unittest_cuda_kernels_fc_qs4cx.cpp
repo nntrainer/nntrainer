@@ -378,6 +378,193 @@ TEST(cuda_kernels, fc_qs4cx_dp4a_ragged_k) {
   }
 }
 
+namespace {
+
+/**
+ * @brief A per-channel ASYMMETRIC int4 weight w = s*(q - z), q in [0, 15],
+ *        z in [3, 12], in the plain QS4CX layout (nibble q = signed code
+ *        q - 8, fp16 scale s) plus its integer zero points z[n].
+ */
+struct AsymWeight {
+  std::vector<unsigned char> plain;
+  std::vector<unsigned short> scales;
+  std::vector<float> scales32, zp;
+  std::vector<float> dense; ///< [N][K] asymmetric weight
+};
+
+static AsymWeight makeAsymWeight(unsigned int N, unsigned int K,
+                                 unsigned seed) {
+  const unsigned int Kh = (K + 1u) / 2u;
+  AsymWeight w;
+  w.plain.assign((size_t)N * Kh, 0);
+  w.scales.resize(N);
+  w.scales32.resize(N);
+  w.zp.resize(N);
+  w.dense.assign((size_t)N * K, 0.f);
+  unsigned int rng = seed | 1u;
+  auto next = [&rng]() {
+    rng = rng * 1664525u + 1013904223u;
+    return (rng >> 16) & 0xFFFFu;
+  };
+  for (unsigned int n = 0; n < N; ++n) {
+    w.scales[n] = f2h(0.002f + 0.0001f * (float)(n % 17));
+    const float s = h2f(w.scales[n]);
+    const int z = 3 + (int)(next() % 10u);
+    w.scales32[n] = s;
+    w.zp[n] = (float)z;
+    for (unsigned int k = 0; k < K; ++k) {
+      const int q = (int)(next() % 16u);
+      unsigned char &b = w.plain[(size_t)n * Kh + (k >> 1)];
+      if (k & 1u)
+        b = (unsigned char)((b & 0x0Fu) | ((unsigned)q << 4));
+      else
+        b = (unsigned char)((b & 0xF0u) | (unsigned)q);
+      w.dense[(size_t)n * K + k] = (float)(q - z) * s;
+    }
+  }
+  return w;
+}
+
+enum class Route { DP4A, CUBLAS, FPACT };
+
+/**
+ * @brief Run one route on an asymmetric weight before and after registering
+ *        its zero points. Without them the output must miss the asymmetric
+ *        reference by far more than the w4a8 band; with them land inside it.
+ * @return false when the route is unavailable (skip).
+ */
+static bool runAsym(Route r, unsigned int M, unsigned int N, unsigned int K,
+                    unsigned seed) {
+  const AsymWeight w = makeAsymWeight(N, K, seed);
+  const std::vector<float> hx = makeActivation(M, K, seed + 5u);
+  std::vector<float> hxq(hx.size());
+  for (size_t i = 0; i < hx.size(); ++i)
+    hxq[i] = h2f(f2h(hx[i]));
+  const std::vector<double> ref = refGemm(hxq, w.dense, M, N, K);
+
+  unsigned short *X = nullptr, *Y = nullptr, *S = nullptr;
+  unsigned char *W = nullptr;
+  float *S32 = nullptr;
+  EXPECT_EQ(cudaMallocManaged(&X, hx.size() * sizeof(unsigned short)),
+            cudaSuccess);
+  EXPECT_EQ(cudaMallocManaged(&Y, (size_t)M * N * sizeof(unsigned short)),
+            cudaSuccess);
+  EXPECT_EQ(cudaMallocManaged(&W, w.plain.size()), cudaSuccess);
+  EXPECT_EQ(cudaMallocManaged(&S, (size_t)N * sizeof(unsigned short)),
+            cudaSuccess);
+  EXPECT_EQ(cudaMallocManaged(&S32, (size_t)N * sizeof(float)), cudaSuccess);
+  for (size_t i = 0; i < hx.size(); ++i)
+    X[i] = f2h(hx[i]);
+  std::memcpy(W, w.plain.data(), w.plain.size());
+  std::memcpy(S, w.scales.data(), (size_t)N * sizeof(unsigned short));
+  std::memcpy(S32, w.scales32.data(), (size_t)N * sizeof(float));
+
+  auto run = [&]() {
+    std::memset(Y, 0, (size_t)M * N * sizeof(unsigned short));
+    bool ok = false;
+    switch (r) {
+    case Route::DP4A:
+      ok = nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(X, W, S, Y, M, N, K);
+      break;
+    case Route::CUBLAS:
+      ok =
+        nntrainer::cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(X, W, S, Y, M, N, K);
+      break;
+    case Route::FPACT:
+      ok = nntrainer::cuda::cuda_fc_qs4cx_fpact_gemv_fp16(X, W, S32, Y, N, K);
+      break;
+    }
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    double e = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i)
+      e = std::max(e, std::fabs((double)h2f(Y[i]) - ref[i]));
+    return ok ? e / refScale(ref) : -1.0;
+  };
+
+  const double before = run();
+  if (before < 0.0)
+    return false;
+  if (r == Route::FPACT) {
+    // The loader-side form, c[n] = s[n] * (8 - z[n]).
+    std::vector<float> c(N);
+    for (unsigned int n = 0; n < N; ++n)
+      c[n] = w.scales32[n] * (8.0f - w.zp[n]);
+    EXPECT_TRUE(nntrainer::cuda::cuda_fc_qs4cx_set_zero_point_correction(
+      W, w.scales32.data(), c.data(), N));
+  } else {
+    EXPECT_TRUE(
+      nntrainer::cuda::cuda_fc_qs4cx_set_weight_zero_points(W, w.zp.data(), N));
+  }
+  const double after = run();
+  printf("CUDA QS4CX asym route %d %ux%ux%u rel error: without zp %e "
+         "with zp %e\n",
+         (int)r, M, N, K, before, after);
+  EXPECT_GT(before, 0.1);
+  EXPECT_LT(after, r == Route::FPACT ? 1e-2 : 3e-2);
+  return true;
+}
+
+} // namespace
+
+TEST(cuda_kernels, fc_qs4cx_asym_zero_point_dp4a) {
+  if (!cudaAvailable())
+    GTEST_SKIP() << "no CUDA device";
+  // A symmetric weight's output is recorded before any zero points exist and
+  // again after: registering them turns on the quantisers' row-sum output,
+  // which must not move a byte of a symmetric FC.
+  const TestWeight sw = makeWeight(64, 256, 0xA11CEu);
+  const std::vector<float> hx = makeActivation(4, 256, 0x5EEDu);
+  // One activation buffer per row count: the staged-quant handoff is keyed
+  // by (pointer, K), so two row counts on one pointer would share a quant.
+  unsigned short *Xs[2] = {nullptr, nullptr}, *Y = nullptr, *S = nullptr;
+  unsigned char *W = nullptr;
+  for (auto &X : Xs) {
+    ASSERT_EQ(cudaMallocManaged(&X, hx.size() * sizeof(unsigned short)),
+              cudaSuccess);
+    for (size_t i = 0; i < hx.size(); ++i)
+      X[i] = f2h(hx[i]);
+  }
+  ASSERT_EQ(cudaMallocManaged(&Y, 4 * 64 * sizeof(unsigned short)),
+            cudaSuccess);
+  ASSERT_EQ(cudaMallocManaged(&W, sw.plain.size()), cudaSuccess);
+  ASSERT_EQ(cudaMallocManaged(&S, sw.scales.size() * sizeof(unsigned short)),
+            cudaSuccess);
+  std::memcpy(W, sw.plain.data(), sw.plain.size());
+  std::memcpy(S, sw.scales.data(), sw.scales.size() * sizeof(unsigned short));
+  std::vector<unsigned short> sym_before[2];
+  for (unsigned M : {1u, 4u}) {
+    ASSERT_TRUE(nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(Xs[M == 4], W, S,
+                                                              Y, M, 64, 256));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    sym_before[M == 4].assign(Y, Y + M * 64);
+  }
+
+  for (const Shape &s : kShapes)
+    ASSERT_TRUE(runAsym(Route::DP4A, s.M, s.N, s.K, 0xA5A5u + s.N));
+
+  for (unsigned M : {1u, 4u}) {
+    ASSERT_TRUE(nntrainer::cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(Xs[M == 4], W, S,
+                                                              Y, M, 64, 256));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(0, std::memcmp(Y, sym_before[M == 4].data(),
+                             M * 64 * sizeof(unsigned short)))
+      << "symmetric M=" << M << " output changed";
+  }
+}
+
+TEST(cuda_kernels, fc_qs4cx_asym_zero_point_cublas_i8) {
+  if (!cudaAvailable())
+    GTEST_SKIP() << "no CUDA device";
+  if (!runAsym(Route::CUBLAS, 32, 128, 512, 0xB0B0u))
+    GTEST_SKIP() << "cuBLAS int8 route unavailable on this device";
+}
+
+TEST(cuda_kernels, fc_qs4cx_asym_zero_point_fpact_gemv) {
+  if (!cudaAvailable())
+    GTEST_SKIP() << "no CUDA device";
+  ASSERT_TRUE(runAsym(Route::FPACT, 1, 256, 512, 0xC0C0u));
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   int result = -1;
 

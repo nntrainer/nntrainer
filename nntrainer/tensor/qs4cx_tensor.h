@@ -62,6 +62,12 @@ public:
   void allocate() override;
 
   /**
+   * @brief May allocate() leave this payload uninitialized (a load-destined
+   *        heap-bypass weight, filled in full by its reader)?
+   */
+  bool allocUninitialized() const;
+
+  /**
    * @copydoc Tensor::deallocate()
    */
   void deallocate() override {
@@ -297,10 +303,12 @@ public:
   void read(ReadSource src, size_t start_offset = 0,
             bool read_from_offset = false) override;
 
-private:
+protected:
   /**
-   * @brief copy a buffer to @a this, the caller has to ensure that @a this is
-   * initialized otherwise undefined behavior
+   * @brief copy a buffer to @a this -- protected rather than private because
+   * QS4CX_WH_Tensor has the same buffer layout below its extra column sums
+   * and fills itself the same way. The caller has to ensure that @a this is
+   * initialized, otherwise undefined behavior
    *
    * @param buf buffer to copy from
    */
@@ -433,6 +441,262 @@ bool qs4cxHeapBypassOn();
  * disagree. Read once; the first call latches the answer for the process.
  */
 bool qs4cxDropPlainOn();
+
+/**
+ * @brief The heap-bypass decision for an int4 FC weight of type @a dt.
+ *
+ * QS4CX: qs4cxHeapBypassOn(). QS4ACX: NNTR_QS4CX_HEAP_BYPASS when set, else
+ * ON on every platform -- a QS4ACX weight is read by the v8c device repack
+ * only (the host GEMM is its correctness reference), so a pool slice of it is
+ * a second copy of every such weight for the life of the process. Any other
+ * type: false.
+ */
+bool int4HeapBypassOn(ml::train::TensorDim::DataType dt);
+
+/**
+ * @brief The drop-after-repack decision for an int4 FC weight of type @a dt.
+ *
+ * QS4CX: qs4cxDropPlainOn(). QS4ACX: NNTR_V8C_DROP_PLAIN when set, else ON
+ * (see int4HeapBypassOn). Any other type: false.
+ */
+bool int4DropPlainOn(ml::train::TensorDim::DataType dt);
+
+/**
+ * @class   QS4CX_WH_Tensor
+ * @brief   QS4CX whose nibbles are already in the HMX WH tile layout.
+ *
+ * Same values, same per-output-channel scales, same number of nibble bytes --
+ * a WH tile is 32x32 i4 in 512 bytes, so the packing costs nothing over
+ * row-major. Two things differ:
+ *
+ *  - the nibbles are arranged as htp_wh_layout.h describes, which is what the
+ *    HTP backend registers directly instead of converting and baking on the
+ *    DSP (doc 46 section 35);
+ *  - a per-output-channel column sum follows the scales, because the matmul
+ *    needs it to correct for the activation zero point and recomputing it
+ *    from the packed nibbles costs about 20 seconds across this model.
+ *
+ * So the only layout difference is the extra N floats, which is why getData
+ * and getScale are inherited unchanged. Nothing on the CPU can read this
+ * tensor: the layout is the accelerator's, and a CPU kernel handed one would
+ * compute a wrong answer rather than fail, so loading a model with these
+ * weights commits it to the HTP path.
+ */
+class QS4CX_WH_Tensor : public QS4CX_Tensor {
+public:
+  /** @brief Basic constructor */
+  QS4CX_WH_Tensor(std::string name_ = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_Tensor(name_, fm) {}
+
+  /**
+   * @brief Construct a new QS4CX_WH_Tensor
+   *
+   * Allocation is deferred out of the base constructor and done here.
+   * QS4CX_Tensor::allocate() sizes the buffer with size(), and a virtual call
+   * from a base constructor runs the BASE override -- which would quietly
+   * allocate N floats too few and leave every column sum reading past the end.
+   */
+  QS4CX_WH_Tensor(const TensorDim &d, bool alloc_now,
+                  Initializer init = Initializer::NONE, std::string name = "") :
+    QS4CX_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+
+  /** @brief Construct from a buffer */
+  QS4CX_WH_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    QS4CX_WH_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() != 0 && buf != nullptr)
+      copy_qs4cx(buf);
+  }
+
+  /** @brief Copy constructor from TensorBase */
+  QS4CX_WH_Tensor(TensorBase &rhs) : QS4CX_Tensor(rhs) {}
+
+  /**
+   * @copydoc Tensor::size()
+   * @note The nibble half matches QS4CX exactly; the extra N floats are the
+   *       column sums.
+   */
+  size_t size() const override {
+    return QS4CX_Tensor::size() + width() * sizeof(float);
+  }
+
+  /**
+   * @copydoc Tensor::getMemoryBytes()
+   */
+  size_t getMemoryBytes() const override { return size() * sizeof(uint8_t); }
+
+  /**
+   * @brief  Get the Data Type String object
+   * @return std::string of tensor data type (QS4CX_WH)
+   */
+  std::string getStringDataType() const override { return "QS4CX_WH"; }
+};
+
+/** WH int4 with an integer affine offset per output channel.
+ * W[k,n] = scale[n] * (q[k,n] + offset[n]). The offset tail is explicit
+ * so a symmetric WH reader cannot silently misinterpret this record. */
+class QS4CX_WH_AFFINE_Tensor : public QS4CX_WH_Tensor {
+public:
+  QS4CX_WH_AFFINE_Tensor(std::string name = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_WH_Tensor(name, fm) {}
+  QS4CX_WH_AFFINE_Tensor(const TensorDim &d, bool alloc_now,
+                         Initializer init = Initializer::NONE,
+                         std::string name = "") :
+    QS4CX_WH_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+  QS4CX_WH_AFFINE_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    QS4CX_WH_AFFINE_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() != 0 && buf)
+      copy_qs4cx(buf);
+  }
+  QS4CX_WH_AFFINE_Tensor(TensorBase &rhs) : QS4CX_WH_Tensor(rhs) {}
+  size_t size() const override {
+    // WH records contain whole tiles and never QS4CX's legacy row padding.
+    return height() * width() / 2 + 3 * width() * sizeof(uint32_t);
+  }
+  size_t getMemoryBytes() const override { return size(); }
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    return static_cast<uint8_t *>(getData()) + height() * width() / 2;
+  }
+  std::string getStringDataType() const override { return "QS4CX_WH_AFFINE"; }
+};
+
+/**
+ * @class QS2CX_WH_Tensor
+ * @brief QS4CX_WH at two bits a weight
+ *
+ * Same tile order, same per-output-channel scale, same column sums -- only
+ * the codes are narrower. Each code indexes one of four int4 values in a
+ * palette that covers the whole tensor, and the HTP expands the codes back
+ * to the int4 lattice in VTCM before the matmul, so everything downstream
+ * of the matmul is bit-identical to QS4CX_WH (htp_wh_palette.h).
+ *
+ * Layout: [K*N/4 codes][4 palette bytes][N f32 scales][N f32 column sums].
+ *
+ * The palette is per tensor rather than per k-group because doc 54 5.3
+ * measured group size against the real checkpoint and it changed the SNR by
+ * nothing -- the code histogram has the same shape everywhere, so the fit
+ * picks the same four levels. A recipe that makes groups differ (GPTQ would)
+ * needs a group axis here; this one does not, and carrying an axis nothing
+ * varies along would be carried into the DSP expansion as a table swap.
+ */
+class QS2CX_WH_Tensor : public QS4CX_WH_Tensor {
+public:
+  /** @brief Palette entries stored after the codes */
+  static constexpr size_t PALETTE_BYTES = 4;
+
+  /** @brief Basic constructor */
+  QS2CX_WH_Tensor(std::string name_ = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_WH_Tensor(name_, fm) {}
+
+  /**
+   * @brief Construct a new QS2CX_WH_Tensor
+   * @note Allocation is deferred for the reason QS4CX_WH_Tensor documents:
+   *       a virtual size() called from a base constructor runs the base
+   *       override and under-allocates.
+   */
+  QS2CX_WH_Tensor(const TensorDim &d, bool alloc_now,
+                  Initializer init = Initializer::NONE, std::string name = "") :
+    QS4CX_WH_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+
+  /** @brief Construct from a buffer */
+  QS2CX_WH_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    QS2CX_WH_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() != 0 && buf != nullptr)
+      copy_qs4cx(buf);
+  }
+
+  /** @brief Copy constructor from TensorBase */
+  QS2CX_WH_Tensor(TensorBase &rhs) : QS4CX_WH_Tensor(rhs) {}
+
+  /**
+   * @copydoc Tensor::size()
+   */
+  size_t size() const override {
+    const size_t K = height();
+    const size_t N = width();
+    return N * ((K + 3) / 4) + PALETTE_BYTES + 2 * width() * sizeof(float);
+  }
+
+  /**
+   * @copydoc Tensor::getMemoryBytes()
+   */
+  size_t getMemoryBytes() const override { return size() * sizeof(uint8_t); }
+
+  /**
+   * @copydoc QS4CX_Tensor::getScale()
+   * @note The palette sits between the codes and the scales, so the base
+   *       class's offset would land four bytes short.
+   */
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    const size_t K = height();
+    const size_t N = width();
+    return ((int8_t *)getData()) + N * ((K + 3) / 4) + PALETTE_BYTES;
+  }
+
+  /** @brief The four int4 codes the 2-bit indices name, ascending */
+  const int8_t *getPalette() const {
+    if (!data)
+      return nullptr;
+    data->validate();
+    const size_t K = height();
+    const size_t N = width();
+    return ((const int8_t *)getData()) + N * ((K + 3) / 4);
+  }
+
+  /**
+   * @brief  Get the Data Type String object
+   * @return std::string of tensor data type (QS2CX_WH)
+   */
+  std::string getStringDataType() const override { return "QS2CX_WH"; }
+};
+
+/** Native ternary TL2 payload followed by N fp32 scales and N fp32 sums.
+ * The palette is implicitly {-1,0,1}; there is no QS2 companion on disk. */
+class TL2CX_WH_Tensor : public QS4CX_WH_Tensor {
+public:
+  TL2CX_WH_Tensor(std::string name = "", Tformat fm = Tformat::NCHW) :
+    QS4CX_WH_Tensor(name, fm) {}
+  TL2CX_WH_Tensor(const TensorDim &d, bool alloc_now,
+                  Initializer init = Initializer::NONE, std::string name = "") :
+    QS4CX_WH_Tensor(d, false, init, name) {
+    if (alloc_now)
+      allocate();
+  }
+  TL2CX_WH_Tensor(const TensorDim &d, const void *buf = nullptr) :
+    TL2CX_WH_Tensor(d, true, Initializer::NONE, "") {
+    if (d.getDataLen() && buf)
+      copy_qs4cx(buf);
+  }
+  TL2CX_WH_Tensor(TensorBase &rhs) : QS4CX_WH_Tensor(rhs) {}
+  static size_t codeBytes(size_t K, size_t N) {
+    return ((K + 23) / 24) * ((N + 127) / 128) * 640;
+  }
+  size_t size() const override {
+    return codeBytes(height(), width()) + 2 * width() * sizeof(float);
+  }
+  size_t getMemoryBytes() const override { return size(); }
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    return static_cast<uint8_t *>(getData()) + codeBytes(height(), width());
+  }
+  std::string getStringDataType() const override { return "TL2CX_WH"; }
+};
 
 } // namespace nntrainer
 

@@ -1,0 +1,287 @@
+{
+  "scope": "Read-only sibling artifact audit. No source edits, ports, cache changes, device runs or new tests.",
+  "decision": "Do not port or increase cache for this checkpoint: useful real memory savings exist, but combined steady/peak budget and 16 TPS are unproven.",
+  "root_checkpoint": {
+    "baseline_median_tps": 12.4661,
+    "candidate_median_tps": 13.2563,
+    "runs_each": 3,
+    "cache_per_layer": 16,
+    "full_frozen_suite": "Root reports 2 passes"
+  },
+  "measurement_method": {
+    "steady_window_seconds": [
+      6,
+      9
+    ],
+    "statistic": "median of external samples during active decode; never use teardown last sample",
+    "external_total": "ARM smaps RSS + process-owned unique dma-buf FD sizes - DMA-mapped RSS overlap",
+    "limitations": [
+      "DSP heap is separately logged and not explicitly joined/deduplicated in these JSON totals. Complete ARM+DMA+DSP budget cannot be asserted from this audit.",
+      "External samples are sparse; internal peak and file-RSS allowance also provided where available.",
+      "Different kernels, thermal states and cache counts prevent multiplying TPS gains across tasks."
+    ]
+  },
+  "memory_rows": [
+    {
+      "tag": "latest-base-c16-mem10",
+      "source": "/tmp/nntr-gemma4-memory-20261015/latest-base-c16-mem10.json",
+      "source_sha256": "6fe2f96992498276b0d7e7e9e6e5385a608cd977158341da480d1993979d103e",
+      "cache_slots": 480,
+      "tps": 12.2811,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 11,
+      "steady_median_MiB": {
+        "total_kib": 3173.253906,
+        "dma_kib": 2524.972656,
+        "rss_kib": 648.28125,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3752.34765625,
+      "internal_peak_MiB": 3758.4140625,
+      "conservative_peak_MiB": 3841.3203125,
+      "DSP_heap_after_graph_init_logged_MiB": 211
+    },
+    {
+      "tag": "latest-candidate-c16",
+      "source": "/tmp/nntr-gemma4-memory-20261015/latest-candidate-c16.json",
+      "source_sha256": "93cbe83c065b76b431bf278b002ad4fb654ec49c43777bee0d7b74f2afc14f13",
+      "cache_slots": 480,
+      "tps": 12.3457,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 11,
+      "steady_median_MiB": {
+        "total_kib": 3124.421875,
+        "dma_kib": 2476.679688,
+        "rss_kib": 647.742188,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3490.64453125,
+      "internal_peak_MiB": null,
+      "conservative_peak_MiB": null,
+      "DSP_heap_after_graph_init_logged_MiB": 211
+    },
+    {
+      "tag": "latest-candidate-c20",
+      "source": "/tmp/nntr-gemma4-memory-20261015/latest-candidate-c20.json",
+      "source_sha256": "c0705e7d76b054782342ef5e2fa2a12d1458f0286a2ebd6db8909d68f20288ad",
+      "cache_slots": 600,
+      "tps": 12.814,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 11,
+      "steady_median_MiB": {
+        "total_kib": 3327.066406,
+        "dma_kib": 2678.679688,
+        "rss_kib": 648.386719,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3718.1640625,
+      "internal_peak_MiB": null,
+      "conservative_peak_MiB": null,
+      "DSP_heap_after_graph_init_logged_MiB": 218
+    },
+    {
+      "tag": "latest-candidate-c20-mem10",
+      "source": "/tmp/nntr-gemma4-memory-20261015/latest-candidate-c20-mem10.json",
+      "source_sha256": "832521ec69e51dd3a08aa0d2f25fb57a24b2aa1cd136c8ed1dc6138b21457dbd",
+      "cache_slots": 600,
+      "tps": 12.7913,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 11,
+      "steady_median_MiB": {
+        "total_kib": 3326.867188,
+        "dma_kib": 2678.679688,
+        "rss_kib": 648.1875,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3699.9375,
+      "internal_peak_MiB": 3676.75,
+      "conservative_peak_MiB": 3775.1484375,
+      "DSP_heap_after_graph_init_logged_MiB": 218
+    },
+    {
+      "tag": "stage-only-c20",
+      "source": "/tmp/nntr-gemma4-memory-20261015/stage-only-c20.json",
+      "source_sha256": "69bf7b826825752326891724a9eaeb67ca2ce31b645215868f23ca90615870bb",
+      "cache_slots": 600,
+      "tps": 13.1135,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 11,
+      "steady_median_MiB": {
+        "total_kib": 3327.15625,
+        "dma_kib": 2678.679688,
+        "rss_kib": 648.476562,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3702.72265625,
+      "internal_peak_MiB": 3684.2109375,
+      "conservative_peak_MiB": 3778.03515625,
+      "DSP_heap_after_graph_init_logged_MiB": 218
+    },
+    {
+      "tag": "latest-candidate-c24",
+      "source": "/tmp/nntr-gemma4-memory-20261015/latest-candidate-c24.json",
+      "source_sha256": "794ec1a341a8eae9c4321be72827ab7a652101deb6a5a1853bbe654cf4bfc48c",
+      "cache_slots": 720,
+      "tps": 13.0508,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 10,
+      "steady_median_MiB": {
+        "total_kib": 3459.488281,
+        "dma_kib": 2811.679688,
+        "rss_kib": 647.808594,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3886.12890625,
+      "internal_peak_MiB": null,
+      "conservative_peak_MiB": null,
+      "DSP_heap_after_graph_init_logged_MiB": 226
+    },
+    {
+      "tag": "compact-c24-mem1",
+      "source": "/tmp/nntr-gemma4-memory-20261015/compact-c24-mem1.json",
+      "source_sha256": "21163ec8ab42d3ce936991c5151b711ea5844d37a3bfc7df307bc2ffb69d1812",
+      "cache_slots": 720,
+      "tps": 14.0122,
+      "ids_equal": true,
+      "cache_pages": 0,
+      "steady_sample_count": 10,
+      "steady_median_MiB": {
+        "total_kib": 3332.222656,
+        "dma_kib": 2683.679688,
+        "rss_kib": 648.542969,
+        "dma_mapped_rss_kib": 0.0
+      },
+      "external_sampled_peak_MiB": 3751.84765625,
+      "internal_peak_MiB": 3691.796875,
+      "conservative_peak_MiB": 3760.3828125,
+      "DSP_heap_after_graph_init_logged_MiB": 226
+    }
+  ],
+  "C20_timing": {
+    "stage_only_repeat_tps": [
+      12.545,
+      12.4722,
+      11.9569
+    ],
+    "median_tps": 12.4722,
+    "source_glob": "/tmp/nntr-gemma4-memory-20261015/stage20-time-r*.json",
+    "compact_C20_measured": false
+  },
+  "staging": {
+    "sources": [
+      "/tmp/nntr-gemma4-memory-20261015/memory-backend.patch",
+      "/tmp/nntr-gemma4-memory-20261015/graph-memory-production.patch",
+      "/tmp/nntr-gemma4-memory-20261015/device-source/nntrainer/tensor/cpu_backend/compute_ops.h"
+    ],
+    "minimal_production_files": [
+      "nntrainer/tensor/htp_backend/htp_compute_ops.cpp",
+      "nntrainer/tensor/cpu_backend/compute_ops.h",
+      "Applications/CausalLM/models/causal_lm.cpp"
+    ],
+    "hunks": [
+      "default no-op ComputeOps::release_prefill_scratch virtual",
+      "HTP override publishes held/quantized outputs under invoke_mutex then frees pools",
+      "releasePrefillStaging keeps <=64 KiB rather than <=16 MiB; clears aliases and act-AH scratch",
+      "CausalLM prefill completion calls each distinct backend once before first decode"
+    ],
+    "measured_fixed_C16_total_saving_MiB": 48.832031,
+    "measured_fixed_C16_DMA_saving_MiB": 48.292968,
+    "bandwidth": "Reclaims persistent idle allocations; no demonstrated substantial steady decode speedup. Full candidate C16 TPS12.3457 vs baseline12.2811 is too small/uncontrolled to establish benefit.",
+    "not_needed_for_steady": [
+      "gap-reuse planner",
+      "lazy CPU fallback scratch: prefill arena already discarded"
+    ]
+  },
+  "compact": {
+    "sources_root": "/tmp/nntr-gemma4-memory-20261015/device-source",
+    "before_root": "/tmp/nntr-gemma4-memory-20261015/before-compact",
+    "host_before": "/tmp/nntr-gemma4-memory-20261015/beforecompact-htp_compute_ops.cpp",
+    "production_hunks": {
+      "nntrainer/tensor/htp_backend/htp_compute_ops.cpp": [
+        "pool miss load.bits dispatch to HTP_TL2_COMPACT_WEIGHT_BITS",
+        "expertStride uses codeBytes for native TL2",
+        "registerStaged calls new compact RPC and skips legacy retag",
+        "finishTl2Weight metadata follows native bytes"
+      ],
+      "nntrainer/tensor/htp_backend/htp_tl2_opts.h": [
+        "new HTP_TL2_COMPACT_WEIGHT_BITS = 0x202"
+      ],
+      "nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_dma.c": [
+        "initialize/clear tl2_compact state",
+        "compact register/rebind and native metadata offset"
+      ],
+      "nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_dma.h": [
+        "tl2_compact field; compact register/rebind declarations"
+      ],
+      "nntrainer/tensor/htp_backend/hmx/hexkl_graph.h": [
+        "rebind_compact callback"
+      ],
+      "nntrainer/tensor/htp_backend/hmx/hexkl_token.c": [
+        "compact callback dispatch from mailbox format"
+      ],
+      "test/htp/nntr_hvx.idl": [
+        "append weight_swap_batch_tl2_compact_arena method"
+      ],
+      "test/htp/nntr_hvx_mm_u8i4.c": [
+        "compact arena bounds; compact swap RPC; reject compact-to-QS2 retag"
+      ],
+      "test/htp/nntr_hvx_graph.c": [
+        "compact rebind adapter and environment callback"
+      ]
+    },
+    "source_sha256": {
+      "nntrainer/tensor/htp_backend/htp_compute_ops.cpp": "dba0daf0a0236002f73b1a659b96d9efe4e1b07edfa488b4e1570bcce46e0360",
+      "nntrainer/tensor/htp_backend/htp_tl2_opts.h": "db52b9524de2db0ec6ba141afb59233b6c0079193658d65978456a3b550b49ac",
+      "nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_dma.c": "a17effe118c5b51c84e7bf9bc66c14673eb11444c2fba62929dbe8e83f001e11",
+      "nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_dma.h": "d2433e4cecba88ca78b0eece8e03369511fca47059f9732fdfa42d7d2dbb03a9",
+      "nntrainer/tensor/htp_backend/hmx/hexkl_graph.h": "d0de893ffbc2a1f46cd1be7650a31a1a9e398b49e32ee3a237747b3962fedfa0",
+      "nntrainer/tensor/htp_backend/hmx/hexkl_token.c": "7bc99d4feff53e61c5ad5f322d7ba3bb99fc9cd0bd561365355bb5031264ae0e",
+      "test/htp/nntr_hvx.idl": "c593d3e47bd27d6b09d5bcf5fbf8678fdd6ded6f44b2cbfb8266a459149be7ea",
+      "test/htp/nntr_hvx_mm_u8i4.c": "ce91d9f500f96fd6708c71827ca56ab5d32a352f331311f889df0504b6b8b7d6",
+      "test/htp/nntr_hvx_graph.c": "75e79466e3073b6566ed911a05c784912273fe3e5addf87dfd3227824f10e38c"
+    },
+    "slot_bytes": {
+      "old_GU": 1003520,
+      "compact_GU": 843776,
+      "old_DN": 520192,
+      "compact_DN": 446464,
+      "old_expert": 1523712,
+      "compact_expert": 1290240,
+      "saved_per_expert": 233472
+    },
+    "logical_payload_saving_MiB": {
+      "C16_480_slots": 106.875,
+      "C20_600_slots": 133.59375,
+      "C24_720_slots": 160.3125
+    },
+    "measured_fixed_C24_DMA_saving_MiB": 128.0,
+    "compact_C24_vs_old_C16_steady_increase_MiB": 158.96875,
+    "compact_C20_payload_vs_old_C16_increase_MiB": 40.78125,
+    "budget_caveat": "64 MiB arena chunking, mixed static/expert placement, spare prefetch slots, DSP per-handle metadata and worker memory require direct same-runtime steady and peak measurement. Logical bytes are not actual allocated bytes.",
+    "bandwidth": "Current baseline already reads only native TL2 code bytes and does not memset padded holes. Compacting removes retained unused address capacity, not per-miss code I/O or arithmetic. At fixed cache capacity no isolated TPS gain is measured.",
+    "compatibility": [
+      "Requires rebuilt matching ARM library, generated IDL stub and DSP skeleton. New RPC and graph callback cannot be ported host-only.",
+      "Native file format remains unchanged; legacy QS2 and prepared-convertible TL2 stay padded.",
+      "Explicit tl2_compact guard rejects retagging compact native storage as QS2.",
+      "Our completion and compute changes touch overlapping files: merge hunks, then full frozen suite and device output/prefill validation required."
+    ],
+    "existing_validation": {
+      "swap_asan": "/tmp/nntr-gemma4-memory-20261015/compact-tests/swap-asan.log",
+      "kernel_log": "/tmp/nntr-gemma4-memory-20261015/compact-tests/kernels.log",
+      "host_layout_check_source": "/tmp/nntr-gemma4-memory-20261015/compact-arm-layout-check.cpp",
+      "coverage": "compact scale/sum metadata, register/rebind, bounds, legacy transition, compact token dispatch; native TL2 decode/prefill parity; real-shape ARM stride/tail ASAN check",
+      "device": "compact C24 one completed run:14.0122TPS,101 IDs exact,model page cache0. No compact C16/C20 or combined-runtime validation."
+    }
+  },
+  "unneeded_or_unsafe_to_copy_wholesale": [
+    "graph-memory-production.patch includes planner/layer changes unnecessary for steady savings; select only stage hook if pursued later.",
+    "original-checkout-memory-only.patch targets another baseline and contains unrelated changes.",
+    "moe-virtual-scratch-not-shipped.patch is explicitly unshipped."
+  ]
+}

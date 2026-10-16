@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
+ * @file   hvx_router_rows_f32.c
+ * @date   6 October 2026
+ * @brief  The MoE router's logits over M rows of f32 on HVX
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#include "hvx_router_rows_f32.h"
+
+#include <stddef.h>
+
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+
+#include "hvx_convert.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_softmax_f32.h"
+
+/** @brief f32 lanes per HVX vector at 128B. */
+#define LANES 32u
+/** @brief Vectors a row of logits spans at the widest E taken. */
+#define EV_MAX 4u
+/** @brief Rows of w per pass: 256 x 128 floats is 128 KiB, L2-resident. */
+#define KB 256u
+/** @brief Rows of x per pass: RB x EV_MAX accumulators, one w read each. */
+#define RB 4u
+/** @brief Rows whose norm scales a worker holds at once (the fused norm). */
+
+typedef struct {
+  const float *x, *w, *gamma;
+  float *logits;
+  uint32_t M, K, E;
+  float eps;
+} rows_ctx;
+
+/** One (rows, logit-vectors) block over w rows [k0, k1): NR x EV
+ * accumulators and the EV vectors of one w row as compile-time constants,
+ * so they live in registers and a w row is loaded once per k for all NR
+ * rows. The runtime-indexed acc[RB][EV_MAX] this replaces spilled to the
+ * stack, which made every (k, row, e) step a load, a multiply-add and a
+ * store (doc 57 section 9.10): 9.7 ms a call at 446 rows against the CPU
+ * dot's 6. The k terms go in order, each product and sum an IEEE sf op.
+ * They were qf32 with a sf round trip at each KB chunk boundary: the host
+ * lane emulation passed that, but on the V79 three rows of every four came
+ * back as 1e37 or NaN, and two variants moved which row survived (doc 57
+ * section 9.21). The sf ops agree with the CPU dot to 2.3e-5 on device. */
+#define ROUTER_ROWS_BLOCK(EV, NR)                                              \
+  static void rows_block_##EV##x##NR(const float *x, const float *w,           \
+                                     float *logits, uint32_t ld, uint32_t E,   \
+                                     uint32_t k0, uint32_t k1) {               \
+    const HVX_Vector zero = Q6_V_vzero();                                      \
+    HVX_Vector acc[NR][EV];                                                    \
+    for (uint32_t r = 0; r < (NR); ++r) {                                      \
+      const HVX_UVector *lr = (const HVX_UVector *)(logits + (size_t)r * E);   \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        acc[r][e] = k0 ? lr[e] : zero;                                         \
+    }                                                                          \
+    for (uint32_t k = k0; k < k1; ++k) {                                       \
+      const HVX_UVector *wk = (const HVX_UVector *)(w + (size_t)k * E);        \
+      HVX_Vector wv[EV];                                                       \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        wv[e] = wk[e];                                                         \
+      for (uint32_t r = 0; r < (NR); ++r) {                                    \
+        const HVX_Vector xs = hvx_splat_sf(x[(size_t)r * ld + (k - k0)]);      \
+        for (uint32_t e = 0; e < (EV); ++e)                                    \
+          acc[r][e] =                                                          \
+            Q6_Vsf_vadd_VsfVsf(acc[r][e], Q6_Vsf_vmpy_VsfVsf(xs, wv[e]));      \
+      }                                                                        \
+    }                                                                          \
+    for (uint32_t r = 0; r < (NR); ++r) {                                      \
+      HVX_UVector *lr = (HVX_UVector *)(logits + (size_t)r * E);               \
+      for (uint32_t e = 0; e < (EV); ++e)                                      \
+        lr[e] = acc[r][e];                                                     \
+    }                                                                          \
+  }
+#define ROUTER_ROWS_EV(EV)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 1)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 2)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 3)                                                     \
+  ROUTER_ROWS_BLOCK(EV, 4)
+ROUTER_ROWS_EV(1)
+ROUTER_ROWS_EV(2)
+ROUTER_ROWS_EV(3)
+ROUTER_ROWS_EV(4)
+#undef ROUTER_ROWS_EV
+#undef ROUTER_ROWS_BLOCK
+
+typedef void (*rows_block_fn)(const float *, const float *, float *, uint32_t,
+                              uint32_t, uint32_t, uint32_t);
+/** [ev - 1][nr - 1] */
+static const rows_block_fn kRowsBlock[EV_MAX][RB] = {
+  {rows_block_1x1, rows_block_1x2, rows_block_1x3, rows_block_1x4},
+  {rows_block_2x1, rows_block_2x2, rows_block_2x3, rows_block_2x4},
+  {rows_block_3x1, rows_block_3x2, rows_block_3x3, rows_block_3x4},
+  {rows_block_4x1, rows_block_4x2, rows_block_4x3, rows_block_4x4},
+};
+
+/** With gamma, each RB x KB block of x is normalized into a 4 KiB scratch
+ * just before its dots -- hvx_rmsnorm_row_f32's two IEEE multiplies,
+ * (x * rs) * gamma, on the same lanes, so the same floats -- instead of the
+ * whole M x K normalized copy a separate norm pass writes and this reads
+ * back (2 x 11.5 MB at a 1024-row prefill). */
+static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const rows_ctx *c = (const rows_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
+  const uint32_t ev = c->E / LANES;
+  float rs[RB];
+  float nx[RB * KB] __attribute__((aligned(128)));
+  /** [P10] rows outer, k blocks inner: a row block's rows (RB x K floats)
+     are read from DDR once for their rs and again from the cache for the
+     dots, where the k-outer order read the whole segment twice from DDR
+     (46 MB a 2048-row call). The same rows_block calls over the same
+     [k0, k1) blocks with the same stored logits between them, so the
+     same floats. */
+  for (uint32_t r0 = lo; r0 < hi; r0 += RB) {
+    const uint32_t nr = r0 + RB < hi ? RB : hi - r0;
+    if (c->gamma) {
+      for (uint32_t r = 0; r < nr; ++r)
+        rs[r] =
+          hvx_rmsnorm_rs_f32(c->x + (size_t)(r0 + r) * c->K, c->K, c->eps);
+    }
+    for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
+      const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
+      const float *xb = c->x + (size_t)r0 * c->K + k0;
+      uint32_t ld = c->K;
+      if (c->gamma) {
+        const HVX_UVector *vg = (const HVX_UVector *)(c->gamma + k0);
+        for (uint32_t r = 0; r < nr; ++r) {
+          const HVX_UVector *vx = (const HVX_UVector *)(xb + (size_t)r * c->K);
+          HVX_Vector *vy = (HVX_Vector *)(nx + (size_t)r * KB);
+          const HVX_Vector vr = hvx_splat_sf(rs[r]);
+          for (uint32_t j = 0; j < (k1 - k0) / LANES; ++j)
+            vy[j] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[j], vr), vg[j]);
+        }
+        xb = nx;
+        ld = KB;
+      }
+      kRowsBlock[ev - 1u][nr - 1u](xb, c->w, c->logits + (size_t)r0 * c->E, ld,
+                                   c->E, k0, k1);
+    }
+  }
+}
+
+typedef struct {
+  const float *src;
+  float *dst;
+  uint32_t n; /**< vectors */
+} wcopy_ctx;
+
+static void wcopy_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const wcopy_ctx *c = (const wcopy_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n * (i + 1u)) / n_threads);
+  for (uint32_t j = lo; j < hi; ++j)
+    ((HVX_UVector *)c->dst)[j] = ((const HVX_UVector *)c->src)[j];
+}
+
+int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
+                             const float *w, float *w_stage, float *logits,
+                             uint32_t M, uint32_t K, uint32_t E,
+                             hvx_worker_pool *pool) {
+  if (!x || !w || !logits || M == 0u || K == 0u || E == 0u || E % LANES != 0u ||
+      E > EV_MAX * LANES || (gamma && K % LANES != 0u)) {
+    return -1;
+  }
+  if (w_stage) { /* K x E, E a multiple of 32: whole vectors */
+    wcopy_ctx wc = {w, w_stage, K * E / LANES};
+    hvx_worker_pool_run(pool, wcopy_worker, &wc, wc.n);
+    w = w_stage;
+  }
+  rows_ctx c = {x, w, gamma, logits, M, K, E, eps};
+  hvx_worker_pool_run(pool, rows_worker, &c, M);
+  return 0;
+}
+
+int hvx_router_rows_f32(const float *x, const float *w, float *logits,
+                        uint32_t M, uint32_t K, uint32_t E,
+                        hvx_worker_pool *pool) {
+  return hvx_router_rows_norm_f32(x, NULL, 0.0f, w, NULL, logits, M, K, E,
+                                  pool);
+}
+
+typedef struct {
+  float *p;
+  const float *scale;
+  uint32_t *sel;
+  float *weight;
+  uint32_t M, E, top_k, n_sel;
+} topk_ctx;
+
+static void topk_worker(uint32_t n_threads, uint32_t i, void *v) {
+  const topk_ctx *c = (const topk_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
+  if (lo >= hi)
+    return;
+  hvx_softmax_rows_f32(c->p, c->p, lo, hi, c->E, 1.0f);
+  for (uint32_t r = lo; r < hi; ++r) {
+    const float *pr = c->p + (size_t)r * c->E;
+    uint32_t *sr = c->sel + (size_t)r * c->n_sel;
+    /** One pass keeping the n_sel largest sorted, instead of n_sel passes
+       of a first-maximum scan (2.7 ms of a 9 ms prefill router call on
+       device, doc 57 section 9.28). An index goes in after every kept
+       entry whose value is >= its own, so equal values stay in index
+       order: the CPU comparator's tie rule (the lower index wins), the
+       same selection the scans made. */
+    uint32_t n = 0;
+    for (uint32_t e = 0; e < c->E; ++e) {
+      const float v = pr[e];
+      if (n == c->n_sel && !(v > pr[sr[n - 1u]]))
+        continue;
+      uint32_t j = n < c->n_sel ? n++ : n - 1u;
+      for (; j > 0 && v > pr[sr[j - 1u]]; --j)
+        sr[j] = sr[j - 1u];
+      sr[j] = e;
+    }
+    float wsum = 0.0f;
+    for (uint32_t k = 0; k < c->top_k; ++k)
+      wsum += pr[sr[k]];
+    const float inv = 1.0f / wsum;
+    float *wr = c->weight + (size_t)r * c->top_k;
+    for (uint32_t k = 0; k < c->top_k; ++k)
+      wr[k] = pr[sr[k]] * inv * c->scale[sr[k]];
+  }
+}
+
+int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
+                             float *weight, uint32_t M, uint32_t E,
+                             uint32_t top_k, uint32_t n_sel,
+                             hvx_worker_pool *pool) {
+  if (!p || !scale || !sel || !weight || M == 0u || E == 0u ||
+      E % LANES != 0u || E > EV_MAX * LANES || top_k == 0u || n_sel < top_k ||
+      n_sel > E) {
+    return -1;
+  }
+  topk_ctx c = {p, scale, sel, weight, M, E, top_k, n_sel};
+  hvx_worker_pool_run(pool, topk_worker, &c, M);
+  return 0;
+}

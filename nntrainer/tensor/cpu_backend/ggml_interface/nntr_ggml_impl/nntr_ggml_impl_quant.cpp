@@ -492,6 +492,96 @@ void nntr_dequantize_row_q4_0(const void *__restrict x, float *__restrict y,
   dequantize_row_q4_0_impl((const block_q4_0 *)x, y, k);
 }
 
+void nntr_vec_dot_q4_0_q8_0(int n, float *__restrict s,
+                            const void *__restrict vx,
+                            const void *__restrict vy) {
+  assert(n % QK4_0 == 0);
+  static_assert(QK4_0 == QK8_0, "Q4_0 and Q8_0 block sizes must match");
+
+  const int nb = n / QK4_0;
+  const block_q4_0 *x = static_cast<const block_q4_0 *>(vx);
+  const block_q8_0 *y = static_cast<const block_q8_0 *>(vy);
+
+#if defined(__ARM_NEON) && (!ARMV7)
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  const uint8x16_t low_mask = vdupq_n_u8(0x0f);
+  const uint8x16_t offset = vdupq_n_u8(8);
+
+  for (int i = 0; i < nb; ++i) {
+    const uint8x16_t packed = vld1q_u8(x[i].qs);
+    const int8x16_t q4_low =
+      vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, low_mask), offset));
+    const int8x16_t q4_high =
+      vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(packed, 4), offset));
+    const int8x16_t q8_low = vld1q_s8(y[i].qs);
+    const int8x16_t q8_high = vld1q_s8(y[i].qs + 16);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t sumi = vdotq_s32(vdupq_n_s32(0), q4_low, q8_low);
+    sumi = vdotq_s32(sumi, q4_high, q8_high);
+#else
+    int32x4_t sumi =
+      vpaddlq_s16(vmull_s8(vget_low_s8(q4_low), vget_low_s8(q8_low)));
+    sumi = vaddq_s32(
+      sumi, vpaddlq_s16(vmull_s8(vget_high_s8(q4_low), vget_high_s8(q8_low))));
+    sumi = vaddq_s32(
+      sumi, vpaddlq_s16(vmull_s8(vget_low_s8(q4_high), vget_low_s8(q8_high))));
+    sumi = vaddq_s32(sumi, vpaddlq_s16(vmull_s8(vget_high_s8(q4_high),
+                                                vget_high_s8(q8_high))));
+#endif
+
+    const float d =
+      nntr_compute_fp16_to_fp32(x[i].d) * nntr_compute_fp16_to_fp32(y[i].d);
+    acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sumi), d);
+  }
+
+  *s = vaddvq_f32(acc);
+#elif defined(__AVX2__)
+  __m256 acc = _mm256_setzero_ps();
+  const __m128i low_mask = _mm_set1_epi8(0x0f);
+  const __m128i offset = _mm_set1_epi8(8);
+
+  for (int i = 0; i < nb; ++i) {
+    const __m128i packed =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(x[i].qs));
+    const __m128i q4_low =
+      _mm_sub_epi8(_mm_and_si128(packed, low_mask), offset);
+    const __m128i q4_high =
+      _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(packed, 4), low_mask), offset);
+    const __m128i q8_low =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs));
+    const __m128i q8_high =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs + 16));
+
+    __m256i sumi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(q4_low),
+                                     _mm256_cvtepi8_epi16(q8_low));
+    sumi =
+      _mm256_add_epi32(sumi, _mm256_madd_epi16(_mm256_cvtepi8_epi16(q4_high),
+                                               _mm256_cvtepi8_epi16(q8_high)));
+
+    const float d =
+      nntr_compute_fp16_to_fp32(x[i].d) * nntr_compute_fp16_to_fp32(y[i].d);
+    acc = _mm256_add_ps(
+      acc, _mm256_mul_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(d)));
+  }
+
+  *s = hsum_float_8(acc);
+#else
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    int sumi = 0;
+    for (int j = 0; j < QK4_0 / 2; ++j) {
+      const int q4_low = (x[i].qs[j] & 0x0f) - 8;
+      const int q4_high = (x[i].qs[j] >> 4) - 8;
+      sumi += q4_low * y[i].qs[j] + q4_high * y[i].qs[j + QK4_0 / 2];
+    }
+    sumf += static_cast<float>(sumi) * nntr_compute_fp16_to_fp32(x[i].d) *
+            nntr_compute_fp16_to_fp32(y[i].d);
+  }
+  *s = sumf;
+#endif
+}
+
 // -------- Q8_0 -----------------
 
 void quantize_row_q8_0_ref(const float *__restrict x, block_q8_0 *__restrict y,

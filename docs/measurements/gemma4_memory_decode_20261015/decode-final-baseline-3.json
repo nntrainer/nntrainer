@@ -1,0 +1,23 @@
+{
+  "preload_experts": 128,
+  "cache_slots": 480,
+  "model_cache_pages": 0,
+  "init_to_loaded_ms": null,
+  "variant": "baseline",
+  "tag": "final-baseline-3",
+  "profile": null,
+  "extra_environment": {},
+  "prefill_tokens": 2048,
+  "prefill_ms": 3095.0,
+  "prefill_tps": 661.712,
+  "decode_tokens": 101,
+  "decode_ms": 8112.0,
+  "decode_tps": 12.4507,
+  "ids_sha256": "6e6ac3677d2f11bfc6b40d7c271d031e1e831427fe6ab29da00a574801e24d60",
+  "baseline_ids_equal": true,
+  "observed_model_pids": [
+    "16643"
+  ],
+  "wall_seconds": 12.67960000038147,
+  "e2e_ms": 12418
+}

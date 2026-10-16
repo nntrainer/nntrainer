@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   moe_opts_host_check.c
+ * @date   22 Sep 2026
+ * @brief  The M=1 GEMV default word (D192 since #113) and the MoE
+ *         profile row's rest (#101, #102)
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * The two rows are #94 sitting 2's level-2 M==1 rows
+ * (docs/htp_moe/BENCHMARK.md "C proof run"): A on the HMX loop printed
+ * rest<=22.7; C on the GEMV path printed rest<=-5588.2 because its swiglu
+ * slot (5601.2) is lane-time, not a stage. The expected values are hand
+ * arithmetic from those printed numbers.
+ */
+
+#include "htp_moe_opts.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+static int g_fail;
+
+static void expect(int ok, const char *what) {
+  if (!ok) {
+    printf("FAIL: %s\n", what);
+    g_fail = 1;
+  }
+}
+
+int main(void) {
+  {
+    uint32_t scope = 0u;
+    expect(htp_moe_opts_hadamard_scope(NULL, &scope) == 0 &&
+             scope == 0x40000000u &&
+             (htp_moe_opts_must_match(scope) & scope) == scope,
+           "default Hadamard scope is 2-bit and must be echoed");
+    expect(htp_moe_opts_hadamard_scope("2bit", &scope) == 0 &&
+             scope == 0x40000000u,
+           "explicit 2-bit scope");
+    expect(htp_moe_opts_hadamard_scope("all", &scope) == 0 && scope == 0u,
+           "all-weight scope");
+    expect(htp_moe_opts_hadamard_scope("", &scope) == -1 && scope == 0u,
+           "invalid scope is rejected without changing output");
+    const char *names[] = {NULL,     "off",      "up",
+                           "down",   "both",     "both_scalar",
+                           "up_hmx", "down_hmx", "both_hmx"};
+    const uint32_t words[] = {0u,          0u,          0x04000000u,
+                              0x08000000u, 0x0c000000u, 0x1c000000u,
+                              0x24000000u, 0x28000000u, 0x2c000000u};
+    for (size_t i = 0; i < sizeof words / sizeof *words; ++i) {
+      uint32_t bits = 0xdeadu;
+      expect(htp_moe_opts_hadamard(names[i], &bits) == 0 && bits == words[i],
+             "Hadamard option maps to DSP flags");
+      expect((htp_moe_opts_must_match(bits) & bits) == bits,
+             "Hadamard must be echoed even without GEMV");
+    }
+    const char *invalid[] = {"", "0", "1", "Both", "both ", "both-scalar"};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; ++i) {
+      uint32_t bits = 0xdeadu;
+      expect(htp_moe_opts_hadamard(invalid[i], &bits) == -1 && bits == 0xdeadu,
+             "invalid Hadamard option fails without changing flags");
+    }
+  }
+  /** The landed default: #113's D192 (bit 0 on, lead 3 x 64 KB in [15:8],
+     rows1 in bit 16) under #117's VTCM feed (bit 17), all three tune bits
+     set = 0x303e1. FEED=0 is the D192 arena read, 0x103e1. */
+  const uint32_t feed_set = HTP_MOE_FLAG_GEMV_LEAD_SET |
+                            HTP_MOE_FLAG_GEMV_ROWS1_SET |
+                            HTP_MOE_FLAG_GEMV_FEED_SET;
+  const uint32_t d192 = HTP_MOE_FLAG_M1_GEMV | feed_set |
+                        (3u << HTP_MOE_GEMV_LEAD_SHIFT) |
+                        HTP_MOE_FLAG_GEMV_ROWS1 | HTP_MOE_FLAG_GEMV_FEED;
+  expect(d192 == 0x303e1u, "D192 + feed is 0x303e1");
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, NULL) == d192,
+         "unset is on, D192 + feed");
+  expect(htp_moe_opts_flags("0", NULL, NULL, NULL) ==
+           (d192 & ~HTP_MOE_FLAG_M1_GEMV),
+         "0 is off");
+  expect(htp_moe_opts_flags("1", NULL, NULL, NULL) == d192, "1 is on");
+  if (!g_fail)
+    printf("MOE M1 GEMV OPTS: unset=on(0x303e1) 0=off 1=on\n");
+
+  /** #113's (loop, lead) fields. Each knob is overridden only by its own
+     variable, so naming one leaves the others at the default instead of
+     resetting them to zero; all three tune bits are always sent so the
+     echo names the cell. */
+  expect(htp_moe_opts_flags(NULL, "0", "0", "0") ==
+           (HTP_MOE_FLAG_M1_GEMV | feed_set),
+         "LEAD_KB=0 ROWS1=0 FEED=0 is the pre-#115 four-row, no-lead cell");
+  expect(htp_moe_opts_flags(NULL, "0", "0", "0") == 0xe1u,
+         "pre-#115 word is 0xe1");
+  expect(htp_moe_opts_flags(NULL, "192", NULL, NULL) == d192,
+         "192 KB is 3 units of 64 KB, and the loop stays at the default");
+  expect(htp_moe_opts_flags(NULL, "1536", "1", NULL) ==
+           (HTP_MOE_FLAG_M1_GEMV | feed_set | (24u << HTP_MOE_GEMV_LEAD_SHIFT) |
+            HTP_MOE_FLAG_GEMV_ROWS1 | HTP_MOE_FLAG_GEMV_FEED),
+         "1536 KB + rows1");
+  expect(htp_moe_opts_flags(NULL, NULL, "1", NULL) == d192,
+         "rows1 alone does not force the lead to 0");
+  expect(htp_moe_opts_flags(NULL, NULL, "0", NULL) ==
+           (d192 & ~HTP_MOE_FLAG_GEMV_ROWS1),
+         "rows1=0 is an explicit four-row loop at the default lead");
+  expect(htp_moe_opts_flags("0", NULL, "1", NULL) ==
+           (d192 & ~HTP_MOE_FLAG_M1_GEMV),
+         "the opt-out keeps bit 0 clear and still carries the pair");
+  /** Rounding to the nearest unit, the >= 0 floor and the 127-unit clamp
+     the l2fetch width field imposes. */
+  expect(htp_moe_gemv_lead_units(NULL) == 0u, "unset lead is 0");
+  expect(htp_moe_gemv_lead_units("0") == 0u, "0 KB is 0 units");
+  expect(htp_moe_gemv_lead_units("-64") == 0u, "a negative lead is 0");
+  expect(htp_moe_gemv_lead_units("31") == 0u, "31 KB rounds down to 0");
+  expect(htp_moe_gemv_lead_units("32") == 1u, "32 KB rounds up to 1");
+  expect(htp_moe_gemv_lead_units("64") == 1u, "64 KB is 1 unit");
+  expect(htp_moe_gemv_lead_units("100") == 2u, "100 KB rounds to 2 units");
+  expect(htp_moe_gemv_lead_units("999999") == HTP_MOE_GEMV_LEAD_MAX_UNITS,
+         "clamped to 127 units");
+  expect((htp_moe_gemv_lead_units("999999") & ~HTP_MOE_GEMV_LEAD_BITS) == 0u,
+         "the clamped field still fits bits [15:8]");
+  /** #117's feed knob, the default since its sitting: unset and FEED=1 are
+     0x303e1 (feed=vtcm), FEED=0 is 0x103e1 (feed=arena, the next
+     sitting's A0). It touches neither of the other two knobs. */
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, "1") == 0x303e1u,
+         "FEED=1 on D192 is 0x303e1, the unset word");
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, "0") == 0x103e1u,
+         "FEED=0 on D192 is 0x103e1");
+  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) == 0x200e1u,
+         "LEAD_KB=0 ROWS1=0 keeps the feed: 0x200e1");
+  expect(htp_moe_opts_flags("0", NULL, NULL, NULL) == 0x303e0u,
+         "the opt-out keeps bit 0 clear and still carries the feed");
+  expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
+           !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
+         "feed names: vtcm / arena");
+  /** #158's bypass bit: on by default (unset or non-zero), so an unset run's
+     word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 gives 0x303e1. The echo must
+     carry it whether or not the GEMV is on (the HMX loop honours it too). */
+  expect(htp_moe_opts_dma_bypass(NULL) == HTP_MOE_FLAG_DMA_BYPASS &&
+           htp_moe_opts_dma_bypass("1") == HTP_MOE_FLAG_DMA_BYPASS &&
+           htp_moe_opts_dma_bypass("0") == 0u,
+         "bypass unset / 1 is set, 0 is clear");
+  expect((htp_moe_opts_flags(NULL, NULL, NULL, NULL) |
+          htp_moe_opts_dma_bypass("1")) == 0x703e1u,
+         "BYPASS=1 on the default word is 0x703e1");
+  expect(htp_moe_opts_must_match(0x703e1u) == ~0u,
+         "GEMV on: the whole echo must match");
+  expect(htp_moe_opts_must_match(0x303e0u) == HTP_MOE_FLAG_M1_GEMV,
+         "opt-out without bypass: only bit 0");
+  expect(htp_moe_opts_must_match(0x703e0u) ==
+           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS),
+         "opt-out with bypass: bit 0 and bit 18");
+  expect(htp_moe_opts_must_match(0x803e0u) ==
+           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEGLU),
+         "opt-out with GeGLU: bit 0 and bit 19");
+  if (!g_fail)
+    printf(
+      "MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
+      "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1, geglu echoed\n");
+
+  /** #177's queue field, bits [23:22] = N - 1: unset leaves the default
+     word alone, 2 and 4 give the Q2 / Q4 words, and every other value is
+     an error that leaves the output untouched. */
+  {
+    const uint32_t def = htp_moe_opts_flags(NULL, NULL, NULL, NULL) |
+                         htp_moe_opts_dma_bypass(NULL);
+    static const char *const bad[] = {"0", "5", "x", "", "2 ", "12", "-1"};
+    uint32_t q = 0xdeadu;
+    expect(htp_moe_opts_dma_queues(NULL, &q) == 0 && (def | q) == 0x703e1u &&
+             htp_moe_opts_dma_q(def | q) == 1u,
+           "queues unset: 0x703e1, N = 1");
+    expect(htp_moe_opts_dma_queues("1", &q) == 0 && (def | q) == 0x703e1u,
+           "queues 1: 0x703e1");
+    expect(htp_moe_opts_dma_queues("2", &q) == 0 && (def | q) == 0x4703e1u &&
+             htp_moe_opts_dma_q(def | q) == 2u,
+           "queues 2: 0x4703e1");
+    expect(htp_moe_opts_dma_queues("3", &q) == 0 && (def | q) == 0x8703e1u,
+           "queues 3: 0x8703e1");
+    expect(htp_moe_opts_dma_queues("4", &q) == 0 && (def | q) == 0xc703e1u &&
+             htp_moe_opts_dma_q(def | q) == 4u,
+           "queues 4: 0xc703e1");
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; ++i) {
+      q = 0xdeadu;
+      expect(htp_moe_opts_dma_queues(bad[i], &q) == -1 && q == 0xdeadu,
+             "queues: an invalid value is an error");
+    }
+    if (!g_fail)
+      printf("MOE M1 GEMV OPTS dma_queues: unset=1(0x703e1) 2=0x4703e1 "
+             "4=0xc703e1 invalid(0,5,x,'',...)=error\n");
+  }
+
+  /** C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
+     stages (mm 974.7 among them) sum to 1044.0 + 5588.2 - 5601.2 = 1031.0;
+     host 1792.2. */
+  const double c_rest = htp_moe_row_rest_us(1044.0, 1031.0, 5601.2, 1);
+  expect(c_rest >= 0.0 && c_rest <= 0.05 * 1792.2, "gemv rest in [0, 5%]");
+  expect(fabs(c_rest - 13.0) < 0.1, "gemv rest = 13.0");
+  /** A: dsp 1414.0, swiglu 0.0, named 14.8+146.5+41.9+13.0+259.9+113.1+8.9
+     +2.5+0.9+0.1+6.3+783.4 = 1391.3 -> rest 22.7, as printed. */
+  const double a_rest = htp_moe_row_rest_us(1414.0, 1391.3, 0.0, 0);
+  expect(fabs(a_rest - 22.7) < 0.1, "hmx rest unchanged");
+  /** An HMX row with a non-zero swiglu (the fused FFN buckets) still
+     subtracts it. */
+  expect(fabs(htp_moe_row_rest_us(100.0, 50.0, 30.0, 0) - 20.0) < 1e-9,
+         "hmx row subtracts swiglu");
+  if (g_fail)
+    return 1;
+  printf("MOE PROFILE ROW: gemv rest>=0 hmx unchanged\n");
+  return 0;
+}

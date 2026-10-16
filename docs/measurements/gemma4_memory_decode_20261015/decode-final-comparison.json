@@ -1,0 +1,23 @@
+{
+  "baseline": {
+    "tps": [
+      12.5031,
+      12.4661,
+      12.4507
+    ],
+    "median_tps": 12.4661,
+    "median_decode_ms": 8102.0
+  },
+  "candidate": {
+    "tps": [
+      13.0931,
+      13.2633,
+      13.2563
+    ],
+    "median_tps": 13.2563,
+    "median_decode_ms": 7619.0
+  },
+  "gain_percent": 6.338790800651362,
+  "saved_ms_per_token": 4.782178217821782,
+  "target_remaining_ms_per_token": 12.93564356435644
+}

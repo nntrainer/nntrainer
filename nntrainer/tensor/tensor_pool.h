@@ -108,6 +108,14 @@ public:
   }
 
   /**
+   * @brief Whether this pool supports compact host/HTP gap reuse.
+   */
+  bool supportsGapReuse() const {
+    const auto name = allocator_->getName();
+    return cache_loader == nullptr && (name == "cpu" || name == "htp-rpcmem");
+  }
+
+  /**
    * @brief finalize the requested tensors
    * @param planner planner to layout the tensor memories
    * @param start_order start value for the order_exec (inclusive)
@@ -133,6 +141,15 @@ public:
    * @brief Deallocate memory for all the managed tensors
    */
   void deallocate();
+
+  /**
+   * @brief Discard CPU pages used only during a forward call.
+   * @note Call between inference calls, after consuming their outputs and
+   * synchronizing all users. Persistent tensors and pages shared with them
+   * are preserved. Pointers remain valid; discarded contents become zero.
+   * @return Bytes advised away, or zero for unsupported allocators/platforms.
+   */
+  size_t releaseInferenceScratch();
 
   /**
    * @brief     Get execution order for the given tensor

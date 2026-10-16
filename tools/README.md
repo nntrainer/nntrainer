@@ -32,3 +32,50 @@ $ cd /data/local/tmp/nntr_android_test/
 $ export LD_LIBRARY_PATH=.
 $ ./unittest_nntrainer_tensor
 ```
+
+
+## LFM2 ternary MoE for HTP
+
+Convert a local BF16-dequantized LFM2 checkpoint directly to the Gemma4 HTP
+record layouts, without an intermediate FP32 model:
+
+```bash
+python tools/convert_lfm2_htp.py lfm2-24ba2b-expert-ternary-2bit \
+  --output lfm2-24ba2b-ternary-tl2-npu \
+  --tokenizer-source lfm2-24ba2b
+python test/htp/host/lfm2_conversion_check.py
+```
+
+Requires NumPy and a host C compiler. The output contains
+`nntr_lfm2_tl2_affine.bin`, `nntr_config.json`, tokenizer files and
+`conversion_report.json` with every tensor's name, shape, byte offset and
+verification metrics. Existing destinations are refused. Source files are
+read only. Every source tensor must be consumed exactly once.
+
+Experts preserve their per-output-channel ternary values exactly in native
+`TL2CX_WH` records, with gate/up fused per expert. FCs, attention and conv
+projections, and the LM head use `QS4CX_WH_AFFINE`, recovering the original
+INT4 grids without min/max requantization. BF16 round trips are exact;
+execution uses the recovered FP32 grid, whose small difference from BF16 is
+reported separately. Short-conv taps are preserved as FP32 in newest-first
+order. Embedding, norms and router values are also preserved as FP32.
+Embedding scale is 1; routing is sigmoid plus expert bias; FFNs use SwiGLU.
+
+The HTP build registers `Lfm2MoeForCausalLM` with
+`lfm2_execution_profile=htp_fused` and `lfm2_weight_format=htp_fused_v1`.
+The QuickDotAI catalog id is `lfm2-24ba2b-htp`, backend NPU, quantization
+W4A32; its API directory is `<model_base_path>/lfm2-24ba2b-htp-w4a32`.
+Rebuild both ARM libraries and the v81 DSP library: the LFM2 profile adds
+64-expert sigmoid routing, WH dense FFNs wider than 8192 channels, and
+64-wide INT8 decode attention. Prefill uses `attention_kv_dtype=q8_row`
+for LFM2's unnormalized values; the fixed-scale Gemma path is unchanged.
+Provide that matching DSP library just as for the Gemma4 HTP descriptor.
+The LFM2 profile runs each prompt from position 0 (a handle takes any
+number of independent prompts). A prompt longer than `init_seq_len` is
+prefilled in `init_seq_len`-row chunks up to `max_seq_len`, as Gemma4 HTP
+does. A KV snapshot (`system_prompt.kvcache.pre_computed_cache_path`, or
+`setPrecomputedKVCache()`) saves the attention caches as every model does
+plus the conv blocks' states in `<path>.conv`; loading refuses a snapshot
+without that file or of another geometry or position. Weight reload is
+refused. Conversion and host checks do not establish device inference
+accuracy or throughput.

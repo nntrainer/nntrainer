@@ -1,0 +1,27 @@
+{
+  "changes": [
+    "Omit pooled CPU fallback scratch for HTP inference QKV and dense FFN; allocate temporary buffers only when unfused fallback executes",
+    "Add gap-reusing compact layout candidate, retain old layout if candidate is not smaller; enable only CPU/HTP contiguous inference pools, no FSU",
+    "Release prefill backend staging after output processing and prefetch worker join where applicable, before first decode allocation"
+  ],
+  "reservations_avoided_mib_at_2048_rows": {
+    "dense_ffn_3_intermediate_plus_norm": 71.5,
+    "global_qkv_raw_q_k_input_norm": 94.0
+  },
+  "reservation_note": "These are overlapping phase-specific arena reservations, not additive process-memory savings.",
+  "audit_already_optimized": [
+    "LM-head logits height is already 1",
+    "RoPE tables already shared and bounded by configured sequence length",
+    "Tied LM-head duplicate blocked CPU weight not active in device untied HTP profile"
+  ],
+  "retained": [
+    "External FP16 KV plus resident quantized mirror is necessary for existing fallback/cache replay semantics"
+  ],
+  "validation": {
+    "planner_gtests": "20/20 passed via moe_memory",
+    "planner_asan_ubsan": "10,000 random layouts checked against HEAD; no overlap/overflow and allocation never larger; 9,309 smaller",
+    "fallback_parity": "15/15 passed: CausalLMFallbackScratch.*, MhaCoreDispatch.*, Gemma4Moe including HF reference; fallback-tests.log",
+    "production_C16": "Root reports exact 102 IDs and zero model page cache; combined initial memory peak 3726 -> 3489 MiB"
+  },
+  "patch": "graph-memory-production.patch"
+}

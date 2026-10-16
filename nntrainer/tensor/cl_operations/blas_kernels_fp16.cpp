@@ -699,6 +699,15 @@ void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
   const int gws = ((ni + lws - 1) / lws) * lws;
   const int wgc[3] = {gws, 1, 1};
   const int wgs[3] = {lws, 1, 1};
+  // Declare the one device-plane buffer this writes for the dispatch write
+  // log. Undeclared, the dispatch counts as UNKNOWN and voids every
+  // outstanding quant handoff: in a Gemma-4 decoder the query scale runs
+  // between the q and k projections, which read the same input-norm row, so
+  // k (and v through it) re-quantised a row whose int8 was already in the
+  // scratch -- one extra quant launch per layer. A shared-plane output stays
+  // undeclared: the log tracks device buffers only.
+  if (to_clmem)
+    opencl::Kernel::noteDispatchWrites(out_cl);
   if (!blas_cc->command_queue_inst_.DispatchCommand(kp, wgc, wgs))
     return;
 

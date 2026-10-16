@@ -47,24 +47,12 @@ void HtpContext::initialize() noexcept {
   if (!cd)
     return;
 
-  // Wrap the NPU ops installation in try/catch so that a late exception from
-  // HtpBackend::global() or get_htp_ops() (e.g., missing skel, driver error)
-  // degrades to CPU rather than propagating out of this noexcept function
-  // and hitting std::terminate.  Pattern mirrors ClContext::initialize().
+  // Bind the ops table lazily. A CPU-only API handle must not open the DSP
+  // before a later HTP load supplies its library directory and fixed options.
+  // The accelerated operations themselves check HtpBackend::enabled().
   try {
-    // NPU up -> HTP ops (shgemm on NPU, rest delegated to CPU via
-    // inheritance). NPU down -> plain CPU ops, so an engine="htp" model
-    // still runs, transparently, on the CPU.
-    if (HtpBackend::global().enabled()) {
-      cd->setComputeOps(get_htp_ops());
-      // Model tensors (weights, activations) keep the default CPU allocator.
-      // The kernels stage into NPU-accessible buffers per call via
-      // sdkl_npu_alloc; routing every model tensor through an NPU allocator
-      // exhausts the DMA pool on a full transformer model.
-    } else
-      cd->setComputeOps(get_cpu_ops());
+    cd->setComputeOps(get_htp_ops());
   } catch (...) {
-    // HtpBackend::global() or get_htp_ops() threw — degrade to CPU.
     cd->setComputeOps(get_cpu_ops());
   }
 }

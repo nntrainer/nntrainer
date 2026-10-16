@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -48,14 +49,46 @@ namespace causallm {
  */
 class KVCacheManager {
 public:
+  /** @brief Allocator for cache slabs that an accelerator reads in place
+   *         (ComputeOps::alloc_shared); nullptr means "heap for this slab". */
+  using SharedAlloc = std::function<void *(size_t bytes)>;
+  /** @brief Matching release (ComputeOps::free_shared). */
+  using SharedFree = std::function<void(void *block)>;
+
   KVCacheManager() = default;
-  ~KVCacheManager() = default;
+  ~KVCacheManager();
 
   // Non-copyable, movable
   KVCacheManager(const KVCacheManager &) = delete;
   KVCacheManager &operator=(const KVCacheManager &) = delete;
   KVCacheManager(KVCacheManager &&) = default;
-  KVCacheManager &operator=(KVCacheManager &&) = default;
+  KVCacheManager &operator=(KVCacheManager &&other) noexcept;
+
+  /**
+   * @brief Route every cache slab through an accelerator-visible allocator.
+   *
+   * Call before allocate(). Each layer's key and value slab is then one
+   * block from @a alloc, wrapped by the cache tensors without a copy, and
+   * handed back to @a release when the manager is destroyed or
+   * re-allocated. A nullptr from @a alloc puts that slab on the heap
+   * instead, so a backend with limited shared memory degrades to the
+   * per-call copy rather than failing. Views, save and load are unchanged.
+   *
+   * @param alloc   block allocator, e.g. ComputeOps::alloc_shared
+   * @param release block release, e.g. ComputeOps::free_shared
+   */
+  void setSharedAllocator(SharedAlloc alloc, SharedFree release);
+
+  /**
+   * @brief Whether at least one slab came from the shared allocator.
+   */
+  bool usesSharedMemory() const { return !shared_blocks_.empty(); }
+
+  /**
+   * @brief Whether setSharedAllocator installed an allocator (a backend
+   *        may still hand back nullptr and leave the slabs on the heap).
+   */
+  bool hasSharedAllocator() const { return static_cast<bool>(shared_alloc_); }
 
   /**
    * @brief Allocate KV cache for all layers
@@ -86,7 +119,40 @@ public:
     unsigned int num_layers, unsigned int batch_size, unsigned int max_seq_len,
     const std::vector<unsigned int> &kv_widths,
     ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::FP16,
-    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW);
+    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW,
+    const std::vector<unsigned int> &rows = {},
+    const std::vector<unsigned int> &keep = {});
+
+  /**
+   * @brief [HTP window] A windowed layer -- one allocated with fewer rows
+   *        than max_seq_len through allocate()'s rows / keep -- holds
+   *        absolute position a at row a - getBase(): a sliding-window
+   *        attention never reads past its window, so only the last keep rows
+   *        before the step have to stay. Unlike the ring (setLayerCaps), the
+   *        rows are contiguous and compact() moves the window to the front.
+   * @param[in] layer_idx attention layer index
+   * @return absolute position of the layer's row 0 (0 for a full layer)
+   */
+  unsigned int getBase(unsigned int layer_idx) const {
+    return layer_idx < bases_.size() ? bases_[layer_idx] : 0u;
+  }
+
+  /**
+   * @brief Rows a layer's cache was allocated with.
+   */
+  unsigned int getRows(unsigned int layer_idx) const {
+    return getLayerCap(layer_idx);
+  }
+
+  /**
+   * @brief Before a step that starts at absolute position pos: every
+   *        windowed layer moves its last keep rows to the front and its
+   *        base to pos - keep. The caller hands the new bases to the
+   *        attention layers (they index and mirror the rows).
+   * @param[in] pos absolute position of the next row to be written
+   * @return true when a base changed
+   */
+  bool compact(unsigned int pos);
 
   /**
    * @brief Check if the manager has been allocated
@@ -342,6 +408,9 @@ public:
    */
   unsigned int rowsToPersist(unsigned int layer_idx,
                              unsigned int seq_len) const {
+    // [HTP window] a windowed (compacting) layer saves its last keep rows
+    if (windowed(layer_idx))
+      return seq_len - liveFrom(layer_idx, seq_len);
     const unsigned int cap = getLayerCap(layer_idx);
     return seq_len < cap ? seq_len : cap;
   }
@@ -403,6 +472,21 @@ private:
    */
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
 
+  /**
+   * @brief One cache slab: from the shared allocator when one is set and
+   *        it delivers, otherwise an ordinary allocation.
+   */
+  nntrainer::Tensor makeCacheTensor(const ml::train::TensorDim &dim);
+
+  /**
+   * @brief Hands every shared block back to the allocator.
+   */
+  void releaseShared();
+
+  SharedAlloc shared_alloc_;          /**< see setSharedAllocator */
+  SharedFree shared_free_;            /**< see setSharedAllocator */
+  std::vector<void *> shared_blocks_; /**< blocks owned via shared_alloc_ */
+
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */
   unsigned int max_seq_len_ = 0;  /**< max sequence length */
@@ -414,6 +498,21 @@ private:
   std::vector<int> layer_kv_sources_;
   /** [kv-window-ring] per-layer physical row capacity (0 = full max_seq_len) */
   std::vector<unsigned int> layer_caps_;
+  /** [HTP window] per-layer window of a compacting layer (0 = ring or full) */
+  std::vector<unsigned int> keep_;
+  /** [HTP window] per-layer absolute position of row 0 */
+  std::vector<unsigned int> bases_;
+
+  /** @brief Whether the layer compacts a window (allocate()'s rows / keep). */
+  bool windowed(unsigned int l) const {
+    return l < keep_.size() && keep_[l] > 0;
+  }
+
+  /** @brief First absolute position a dump of rows [.., pos) holds for the
+   *         layer: a windowed layer's last keep rows, else all of them. */
+  unsigned int liveFrom(unsigned int l, unsigned int pos) const {
+    return windowed(l) && pos > keep_[l] ? pos - keep_[l] : 0u;
+  }
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;

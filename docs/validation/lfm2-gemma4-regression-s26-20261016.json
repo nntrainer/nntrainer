@@ -1,0 +1,216 @@
+{
+  "date": "2026-10-16",
+  "timezone": "Asia/Seoul",
+  "status": "passed",
+  "baseline_commit": "c8ca04c9567c3c37dcc40e1d52b61534b0099b82",
+  "candidate_commit": "14a2bccbcced415c97b39c3b212b071b5e680325",
+  "device": {
+    "model": "Galaxy S26 Ultra SM-S948U",
+    "soc": "SM8850",
+    "dsp_arch": "v81"
+  },
+  "model": "Gemma4 26B A4B native TL2 experts / affine WH FC",
+  "model_sha256": "c7e978a68c026b9bd54f7e84594701fe63dd3be5b4a62348d2a6afc3a9b9514b",
+  "method": {
+    "input_tokens": 1024,
+    "decode_steps": 64,
+    "batch_size": 1,
+    "max_context": 2048,
+    "initial_expert_cache_per_layer": 16,
+    "cache_growth": false,
+    "arm_threads": 8,
+    "greedy": true,
+    "model_page_cache_pages": 0,
+    "diagnostics_enabled": false,
+    "warmup_runs_per_variant": 1,
+    "order": [
+      "baseline_r1",
+      "candidate_r1",
+      "candidate_r2",
+      "baseline_r2",
+      "baseline_r3",
+      "candidate_r3"
+    ],
+    "shared_model_directory": "/data/local/tmp/nntr_lfm2_gemma_regression_20261016/model",
+    "baseline_build": "Independent worktree at baseline commit, same NDK settings, unchanged prebuilt tokenizer and SDK inputs",
+    "candidate_build": "Current commit core/app and v81 DSP",
+    "toolchain": {
+      "android_ndk": "26.3.11579264",
+      "hexagon_sdk": "6.4.0.1",
+      "hexagon_tools": "19.0.04",
+      "hexkl_sdk": "6.4.0.2"
+    }
+  },
+  "variants": {
+    "baseline": {
+      "runs": [
+        {
+          "tag": "baseline_r1",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1597,
+          "prefill_tps": 641.202,
+          "decode_steps": 64,
+          "decode_ms": 5032,
+          "decode_tps": 12.7186,
+          "ttft_ms": 2046.19,
+          "inference_ms": 6678.0,
+          "peak_memory_kib": 3355884,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "64869dc62b34627fca33bffcf2984c33d2be95b65932d3acfab30f46d3c15b6c",
+          "log_file": "baseline_r1.txt",
+          "ids_file": "baseline_r1.ids",
+          "raw_log_sha256": "3d451b9b378b337fc1eb581cc7feef76e7c3092deeee608c5d92d742b879714c"
+        },
+        {
+          "tag": "baseline_r2",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1701,
+          "prefill_tps": 601.999,
+          "decode_steps": 64,
+          "decode_ms": 5089,
+          "decode_tps": 12.5761,
+          "ttft_ms": 2144.51,
+          "inference_ms": 6831.0,
+          "peak_memory_kib": 3331088,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "04046b5cd34dc34d20a6db66f915fe1b1bbd612f354b9a883f4df13518c2b44a",
+          "log_file": "baseline_r2.txt",
+          "ids_file": "baseline_r2.ids",
+          "raw_log_sha256": "c71f72928a7084ecf5596777bd8e2bcc7d62b2ddb454a83ba0fd06b135a115b8"
+        },
+        {
+          "tag": "baseline_r3",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1713,
+          "prefill_tps": 597.782,
+          "decode_steps": 64,
+          "decode_ms": 5207,
+          "decode_tps": 12.2911,
+          "ttft_ms": 2193.63,
+          "inference_ms": 6965.0,
+          "peak_memory_kib": 3331720,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "c492ce44f55a03c0c2605960e533747142106544f935b10fe33903f77a047f9d",
+          "log_file": "baseline_r3.txt",
+          "ids_file": "baseline_r3.ids",
+          "raw_log_sha256": "0d64195329499bed97f822cdbcf963998b8a5b1f3ac8356c719eea707eb698e2"
+        }
+      ],
+      "mean": {
+        "prefill_tps": 613.6610000000001,
+        "decode_tps": 12.5286,
+        "prefill_ms": 1670.3333333333333,
+        "decode_ms": 5109.333333333333,
+        "ttft_ms": 2128.11,
+        "inference_ms": 6824.666666666667,
+        "peak_memory_kib": 3339564
+      },
+      "median": {
+        "prefill_tps": 601.999,
+        "decode_tps": 12.5761
+      }
+    },
+    "candidate": {
+      "runs": [
+        {
+          "tag": "candidate_r1",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1650,
+          "prefill_tps": 620.606,
+          "decode_steps": 64,
+          "decode_ms": 5028,
+          "decode_tps": 12.7287,
+          "ttft_ms": 2085.73,
+          "inference_ms": 6718.0,
+          "peak_memory_kib": 3331036,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "fb9f3cf054fb4d1b054b98cad60e71502d948f69a112e014140c41ee5703f926",
+          "log_file": "candidate_r1.txt",
+          "ids_file": "candidate_r1.ids",
+          "raw_log_sha256": "f8426b96b404ca1b933e10c8b416a8676ae1fde83d115c82b2993c97e4ea3664"
+        },
+        {
+          "tag": "candidate_r2",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1608,
+          "prefill_tps": 636.816,
+          "decode_steps": 64,
+          "decode_ms": 5043,
+          "decode_tps": 12.6909,
+          "ttft_ms": 2063.83,
+          "inference_ms": 6692.0,
+          "peak_memory_kib": 3322400,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "edddc9250f52809c675b528c84c7a811c775565e3e18b78f38dad43f48afcf51",
+          "log_file": "candidate_r2.txt",
+          "ids_file": "candidate_r2.ids",
+          "raw_log_sha256": "b5dc98a064d55e6e14d20695d2fc0ea13ef887067d25d5d09cae9a71eabdd89d"
+        },
+        {
+          "tag": "candidate_r3",
+          "exit_code": 0,
+          "prefill_tokens": 1024,
+          "prefill_ms": 1653,
+          "prefill_tps": 619.48,
+          "decode_steps": 64,
+          "decode_ms": 5281,
+          "decode_tps": 12.1189,
+          "ttft_ms": 2142.6,
+          "inference_ms": 6986.0,
+          "peak_memory_kib": 3366032,
+          "generated_id_count": 65,
+          "ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+          "log_sha256": "328e50858d47520fe696d8e7f5a56a6615eeeed38f4659d45bfa305b376ca4e2",
+          "log_file": "candidate_r3.txt",
+          "ids_file": "candidate_r3.ids",
+          "raw_log_sha256": "c0ad0794d82809da7444d14850d8e5076c5f619e03aa94f7f816e4f725fd160f"
+        }
+      ],
+      "mean": {
+        "prefill_tps": 625.634,
+        "decode_tps": 12.512833333333333,
+        "prefill_ms": 1637,
+        "decode_ms": 5117.333333333333,
+        "ttft_ms": 2097.3866666666668,
+        "inference_ms": 6798.666666666667,
+        "peak_memory_kib": 3339822.6666666665
+      },
+      "median": {
+        "prefill_tps": 620.606,
+        "decode_tps": 12.6909
+      }
+    }
+  },
+  "mean_change_percent": {
+    "prefill_tps": 1.9510772234181406,
+    "decode_tps": -0.12584539906029812,
+    "peak_memory_kib": 0.007745522070146116
+  },
+  "all_six_generated_id_files_identical": true,
+  "generated_ids_sha256": "d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3",
+  "token_count_note": "Each run performs 64 decode steps; ID files also include the prefill-selected first output token, for 65 IDs total.",
+  "evidence_directory": "../measurements/lfm2_gemma4_regression_20261016",
+  "source_review": [
+    "Gemma4 retains attention_kv_dtype=q8; q8_row is selected only by the LFM2 profile.",
+    "The new INT8 PV branch requires head_dim=64; Gemma4 uses 256 and 512.",
+    "Gemma4 softmax router still pads expert weights to round_up(E,32).",
+    "Affine conv projection registration applies only to conv_block layers."
+  ],
+  "conclusion": "No throughput regression observed in this matched test: mean decode -0.13%, prefill +1.95%, mean peak memory +0.008%; output IDs are exact.",
+  "limitations": [
+    "One 1024-token prompt and 64 decode steps, three measured runs per variant; not a broad performance or PPL evaluation.",
+    "No controlled clock/temperature experiment; run-to-run variation exceeds the small mean decode difference.",
+    "Peak memory is the runtime RssAnon+accelerator estimate, not a separate total system memory audit."
+  ],
+  "log_normalization": "Trailing whitespace removed from archived text logs; raw log hashes are retained separately."
+}

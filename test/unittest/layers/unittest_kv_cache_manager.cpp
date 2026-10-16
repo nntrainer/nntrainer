@@ -10,7 +10,9 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
@@ -428,7 +430,118 @@ TEST(KVCacheManagerShare, no_declaration_means_no_aliasing) {
             m.getKeyCache(2).getData<float>());
 }
 
+/**
+ * Shared-memory allocator (the accelerator-visible KV cache): every slab is
+ * one block from the allocator, the cache tensors and their views resolve
+ * into those blocks with no copy, and each block goes back exactly once
+ * when the manager is destroyed.
+ */
+TEST(KVCacheManagerSharedMemory, slabs_come_from_allocator_and_return) {
+  std::vector<void *> blocks;
+  std::vector<size_t> sizes;
+  std::vector<void *> released;
+  {
+    causallm::KVCacheManager m;
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        void *p = std::malloc(bytes);
+        blocks.push_back(p);
+        sizes.push_back(bytes);
+        return p;
+      },
+      [&](void *p) {
+        released.push_back(p);
+        std::free(p);
+      });
+    m.allocate(3, 1, 64, 2, 8, ml::train::TensorDim::DataType::FP32);
+
+    EXPECT_TRUE(m.usesSharedMemory());
+    ASSERT_EQ(blocks.size(), 6u); // key and value per layer
+    for (size_t b : sizes) {
+      EXPECT_EQ(b, 64u * 16u * sizeof(float));
+    }
+    for (unsigned int l = 0; l < 3; ++l) {
+      EXPECT_EQ(m.getKeyCache(l).getData<float>(), blocks[2 * l]);
+      EXPECT_EQ(m.getValueCache(l).getData<float>(), blocks[2 * l + 1]);
+    }
+
+    // A write view at position 5 lands at row 5 of the value block.
+    m.setPosition(5);
+    auto view = m.getValueCacheWriteView(1, 0, 1);
+    float *vd = view.getData<float>();
+    EXPECT_EQ(vd, static_cast<float *>(blocks[3]) + 5 * 16);
+    vd[3] = 42.0f;
+    EXPECT_FLOAT_EQ(static_cast<float *>(blocks[3])[5 * 16 + 3], 42.0f);
+    EXPECT_TRUE(released.empty());
+  }
+  ASSERT_EQ(released.size(), 6u);
+  for (size_t i = 0; i < 6; ++i) {
+    EXPECT_NE(std::find(blocks.begin(), blocks.end(), released[i]),
+              blocks.end());
+  }
+}
+
+TEST(KVCacheManagerSharedMemory, nullptr_from_allocator_means_heap) {
+  int releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setSharedAllocator([](size_t) -> void * { return nullptr; },
+                         [&](void *) { ++releases; });
+    m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+    EXPECT_TRUE(m.isAllocated());
+    EXPECT_FALSE(m.usesSharedMemory());
+    EXPECT_NE(m.getKeyCache(0).getData<float>(), nullptr);
+  }
+  EXPECT_EQ(releases, 0);
+}
+
+TEST(KVCacheManagerSharedMemory, allocator_must_be_set_before_allocate) {
+  causallm::KVCacheManager m;
+  m.allocate(1, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_THROW(m.setSharedAllocator([](size_t) -> void * { return nullptr; },
+                                    [](void *) {}),
+               std::logic_error);
+  causallm::KVCacheManager n;
+  EXPECT_THROW(
+    n.setSharedAllocator([](size_t) -> void * { return nullptr; }, nullptr),
+    std::invalid_argument);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST(KVCacheManagerShared, MovePreservesGeometryAndReleasesEachAllocationOnce) {
+  unsigned int allocated = 0, released = 0;
+  auto alloc = [&](size_t bytes) -> void * {
+    ++allocated;
+    return std::malloc(bytes);
+  };
+  auto free = [&](void *p) {
+    ++released;
+    std::free(p);
+  };
+  {
+    causallm::KVCacheManager source, destination;
+    source.setSharedAllocator(alloc, free);
+    source.setLayerCaps({4, 4});
+    source.setLayerKVSources({-1, 0});
+    source.allocate(2, 1, 8, std::vector<unsigned int>{16, 16},
+                    ml::train::TensorDim::DataType::FP32);
+    source.setPosition(3);
+    auto *key = source.getKeyCache(0).getData<float>();
+    key[0] = 7.0f;
+    destination.setSharedAllocator(alloc, free);
+    destination.allocate(1, 1, 8, 1, 16, ml::train::TensorDim::DataType::FP32);
+    EXPECT_EQ(allocated, 4u);
+    destination = std::move(source);
+    EXPECT_EQ(released, 2u);
+    EXPECT_EQ(destination.getPosition(), 3u);
+    EXPECT_EQ(destination.getLayerCap(1), 4u);
+    EXPECT_EQ(destination.getLayerKVSource(1), 0);
+    EXPECT_EQ(destination.getKeyCache(1).getData<float>(), key);
+    EXPECT_FLOAT_EQ(destination.getKeyCache(0).getData<float>()[0], 7.0f);
+  }
+  EXPECT_EQ(released, allocated);
 }

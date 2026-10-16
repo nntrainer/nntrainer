@@ -1,0 +1,587 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   hvx_quant_u8.c
+ * @date   03 Aug 2026
+ * @brief  Per-row asymmetric uint8 dynamic activation quantization
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <AEEStdErr.h>
+
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+
+#include "hvx_convert.h"
+#include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
+
+/** @brief HMX activation tile geometry, mirrored from hexkl_micro.h. */
+#define TILE_ROW 64u
+#define TILE_INNER 32u
+#define ACT_TILE_BYTES 2048u
+/** @brief HVX vector width in bytes (128B mode). */
+#define VLEN 128u
+/** @brief f32 lanes per HVX vector. */
+#define FLANES (VLEN / 4u)
+
+/** @brief One row of K1: scale[m]/zp[m] from x's m-th row. Independent of
+ *         every other row, which is what makes splitting this by row
+ *         range across worker threads safe. */
+static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
+                                 float *scale, int32_t *zp) {
+  const float *row = x + (size_t)m * k;
+  const uint32_t n_vec = k / FLANES;
+  float min0 = row[0];
+  float max0 = row[0];
+
+  if (n_vec > 0) {
+    // FastRPC buffers carry no vector alignment guarantee, so the
+    // unaligned vector type is what keeps this from faulting.
+    const HVX_UVector *vrow = (const HVX_UVector *)row;
+    HVX_Vector vmin = vrow[0];
+    HVX_Vector vmax = vrow[0];
+    for (uint32_t i = 1; i < n_vec; ++i) {
+      vmin = Q6_Vsf_vmin_VsfVsf(vmin, vrow[i]);
+      vmax = Q6_Vsf_vmax_VsfVsf(vmax, vrow[i]);
+    }
+    // Fold 32 lanes down to 1 by rotating half the remaining width each
+    // step: 64, 32, 16, 8, 4 bytes.
+    for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
+      vmin = Q6_Vsf_vmin_VsfVsf(vmin, Q6_V_vror_VR(vmin, (int)rot));
+      vmax = Q6_Vsf_vmax_VsfVsf(vmax, Q6_V_vror_VR(vmax, (int)rot));
+    }
+    float lane_min[FLANES];
+    float lane_max[FLANES];
+    *(HVX_UVector *)lane_min = vmin;
+    *(HVX_UVector *)lane_max = vmax;
+    min0 = lane_min[0];
+    max0 = lane_max[0];
+  }
+
+  for (uint32_t i = n_vec * FLANES; i < k; ++i) {
+    if (row[i] < min0) {
+      min0 = row[i];
+    }
+    if (row[i] > max0) {
+      max0 = row[i];
+    }
+  }
+  const float rmin = min0 < 0.0f ? min0 : 0.0f;
+  const float rmax = max0 > 0.0f ? max0 : 0.0f;
+  if (rmin == rmax) {
+    return; /* leaves scale 1, zp 0 */
+  }
+  const float s = (rmax - rmin) / 255.0f;
+  /** nearbyintf, not roundf: the vectorized path rounds to nearest even
+     and the host reference is written to match. */
+  int32_t z = (int32_t)nearbyintf(-rmin / s);
+  if (z < 0) {
+    z = 0;
+  }
+  if (z > 255) {
+    z = 255;
+  }
+  scale[m] = s;
+  zp[m] = z;
+}
+
+typedef struct {
+  const float *x;
+  uint32_t m_valid, k;
+  float *scale;
+  int32_t *zp;
+  uint8_t *out_rm;        /**< NULL: the parameters only */
+  const float *pre_gamma; /**< NULL: the rows as they are */
+  float pre_eps;
+  float *pre_scratch; /**< a row a lane */
+} quant_rows_ctx;
+
+static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
+  quant_rows_ctx *ctx = (quant_rows_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)ctx->m_valid * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)ctx->m_valid * (i + 1) / n_threads);
+  float *sc = ctx->pre_gamma ? ctx->pre_scratch + (size_t)i * ctx->k : NULL;
+  for (uint32_t m = lo; m < hi; ++m) {
+    const float *row = ctx->x + (size_t)m * ctx->k;
+    if (sc) { /* the normed row never leaves this lane's cache */
+      hvx_rmsnorm_row_f32(row, sc, ctx->pre_gamma, ctx->k, ctx->pre_eps);
+      quant_row_params_one(sc, 0u, ctx->k, ctx->scale + m, ctx->zp + m);
+      row = sc;
+    } else {
+      quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp);
+    }
+    if (ctx->out_rm)
+      hvx_quant_row_u8_rm(row, ctx->k, ctx->scale[m], ctx->zp[m],
+                          ctx->out_rm + (size_t)m * ctx->k);
+  }
+}
+
+void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m_valid,
+                                 uint32_t m_pad, uint32_t k, float *scale,
+                                 int32_t *zp, uint8_t *out_rm,
+                                 const float *pre_gamma, float pre_eps,
+                                 float *pre_scratch, hvx_worker_pool *pool) {
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+
+  quant_rows_ctx ctx = {x,      m_valid,   k,       scale,      zp,
+                        out_rm, pre_gamma, pre_eps, pre_scratch};
+  hvx_worker_pool_run(pool, quant_rows_worker, &ctx, m_valid);
+}
+
+void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
+                              uint32_t k, float *scale, int32_t *zp,
+                              hvx_worker_pool *pool) {
+  hvx_quant_rows_u8_params_rm(x, m_valid, m_pad, k, scale, zp, NULL, NULL, 0.0f,
+                              NULL, pool);
+}
+
+/**
+ * @brief One row's worth of K2, unvectorized -- used only for the 0-3 rows
+ *        left over when m_valid is not a multiple of 4.
+ */
+static void quant_pack_row_scalar(const float *row, uint32_t n_ktiles,
+                                  HVX_Vector vinv, HVX_Vector vz,
+                                  uint8_t *dst_tile0, uint32_t tile_stride) {
+  const HVX_Vector vlo = Q6_V_vzero();
+  const HVX_Vector vhi = Q6_V_vsplat_R(255);
+  for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+    const HVX_UVector *vin = (const HVX_UVector *)(row + kt * TILE_INNER);
+    HVX_Vector vq = hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin[0], vinv));
+    vq = Q6_Vw_vadd_VwVw(vq, vz);
+    vq = Q6_Vw_vmax_VwVw(vq, vlo);
+    vq = Q6_Vw_vmin_VwVw(vq, vhi);
+
+    // Only the low 32 lanes carry data, so stage the vector and copy the
+    // 32 bytes we want. A packed store would need three quarters of the
+    // vector to be live.
+    int32_t lane[FLANES];
+    *(HVX_UVector *)lane = vq;
+    uint8_t *dst = dst_tile0 + (size_t)kt * tile_stride;
+    for (uint32_t c = 0; c < TILE_INNER; ++c) {
+      dst[c] = (uint8_t)lane[c];
+    }
+  }
+}
+
+typedef struct {
+  const float *x;
+  /** Source row for each destination row, or NULL for "row m from row m".
+      A MoE layer builds one that lists every expert's rows in expert order,
+      padded to 64, so the pack writes each block ready to use and the
+      separate gather pass disappears. A token routed to four experts
+      appears four times, which is why this is a map and not a permutation:
+      it is read-only on the source side. */
+  const uint32_t *row_map;
+  uint32_t m_vec_end, k, n_ktiles;
+  const HVX_UVector *vinv; /**< m_vec_end entries, precomputed once --
+                               malloc'd, so unaligned: see the two heap
+                               HVX_UVector arrays below. */
+  const HVX_UVector *vz;   /**< m_vec_end entries, precomputed once */
+  uint8_t *out_ah;
+} quant_pack_ctx;
+
+/**
+ * @brief Four consecutive rows of one k-tile: quantize, narrow, and land
+ *        them as ONE 128-byte store. The body both entries below share, so
+ *        the per-block pack and the k-tile-split pack produce the same
+ *        bytes by construction.
+ *
+ * @param src   the four rows' k-tile slices (row + kt*32 each)
+ * @param dst   out_ah + (rb*n_ktiles+kt)*ACT_TILE_BYTES + r0*32
+ */
+static inline void quant_pack_group4(const float *const src[4],
+                                     const HVX_Vector vinv[4],
+                                     const HVX_Vector vz[4], uint8_t *dst) {
+  const HVX_UVector *vin0 = (const HVX_UVector *)src[0];
+  const HVX_UVector *vin1 = (const HVX_UVector *)src[1];
+  const HVX_UVector *vin2 = (const HVX_UVector *)src[2];
+  const HVX_UVector *vin3 = (const HVX_UVector *)src[3];
+
+  const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], vinv[0])), vz[0]);
+  const HVX_Vector vq1 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin1[0], vinv[1])), vz[1]);
+  const HVX_Vector vq2 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin2[0], vinv[2])), vz[2]);
+  const HVX_Vector vq3 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin3[0], vinv[3])), vz[3]);
+
+  // vpack(Vu, Vv):sat places Vv's (narrowed, saturated) elements in the
+  // low half of the result and Vu's in the high half, in order --
+  // same convention as vpacke/vpacko (V79 HVX Programmer Reference
+  // Manual, "Pack"). Vv first each time keeps row order intact:
+  // vh01 = [row0(32), row1(32)], vh23 = [row2(32), row3(32)],
+  // vb = [row0, row1, row2, row3] (128 bytes).
+  const HVX_Vector vh01 = Q6_Vh_vpack_VwVw_sat(vq1, vq0);
+  const HVX_Vector vh23 = Q6_Vh_vpack_VwVw_sat(vq3, vq2);
+  const HVX_Vector vb = Q6_Vub_vpack_VhVh_sat(vh23, vh01);
+  *(HVX_UVector *)dst = vb;
+}
+
+/** @brief One row quantized row-major: quant_pack_group4 over four
+ *         consecutive 32-float runs of the row instead of one run of four
+ *         rows, so each element is the byte the AH pack writes for it. */
+void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
+                         uint8_t *dst) {
+  const HVX_Vector v1 = hvx_splat_sf(1.0f / scale);
+  const HVX_Vector z1 = Q6_V_vsplat_R(zp);
+  const HVX_Vector vinv[4] = {v1, v1, v1, v1};
+  const HVX_Vector vz[4] = {z1, z1, z1, z1};
+  uint32_t c = 0;
+  for (; c + VLEN <= k; c += VLEN) {
+    const float *const src[4] = {row + c, row + c + TILE_INNER,
+                                 row + c + 2u * TILE_INNER,
+                                 row + c + 3u * TILE_INNER};
+    quant_pack_group4(src, vinv, vz, dst + c);
+  }
+  if (c < k) { /* one to three runs left: the last one repeated, then cut */
+    const uint32_t last = (k - c) / TILE_INNER - 1u;
+    uint8_t tmp[VLEN];
+    const float *src[4];
+    for (uint32_t i = 0; i < 4u; ++i)
+      src[i] = row + c + (i < last ? i : last) * TILE_INNER;
+    quant_pack_group4(src, vinv, vz, tmp);
+    memcpy(dst + c, tmp, k - c);
+  }
+}
+
+void hvx_gather_u8_ah_rows(const uint8_t *x_rm, const uint32_t *row_map,
+                           uint32_t m0, uint32_t m1, uint32_t k,
+                           uint8_t *out_ah) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+  const HVX_VectorPred q1 = Q6_Q_vsetq2_R(TILE_INNER);
+  const HVX_VectorPred q2 = Q6_Q_vsetq2_R(2 * TILE_INNER);
+  const HVX_VectorPred q3 = Q6_Q_vsetq2_R(3 * TILE_INNER);
+  /** One row behind an l2fetch ([47:32] stride, [31:16] width, [15:0]
+     height): a hint, it moves no bits. */
+  const uint64_t box = ((uint64_t)k << 32) | ((uint64_t)k << 16) | 1u;
+  for (uint32_t m = m0; m < m1; m += 4u) {
+    /** Each row's vector read so that its 32 bytes of this k-tile sit where
+       the group's 128-byte store wants them: row i at byte 32 * i. The
+       reads run up to 96 bytes outside the row either way (x_rm's
+       contract). */
+    const uint8_t *r0 = x_rm + (size_t)row_map[m + 0] * k;
+    const uint8_t *r1 = x_rm + (size_t)row_map[m + 1] * k - TILE_INNER;
+    const uint8_t *r2 = x_rm + (size_t)row_map[m + 2] * k - 2u * TILE_INNER;
+    const uint8_t *r3 = x_rm + (size_t)row_map[m + 3] * k - 3u * TILE_INNER;
+    uint8_t *blk = out_ah + (size_t)(m / TILE_ROW) * n_ktiles * ACT_TILE_BYTES +
+                   (m % TILE_ROW) * TILE_INNER;
+    if (m + 4u < m1) { /* three queued at most; the fourth at mid-row */
+      for (uint32_t i = 0; i < 3u; ++i)
+        Q6_l2fetch_AP((void *)(x_rm + (size_t)row_map[m + 4u + i] * k), box);
+    }
+    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+      const uint32_t off = kt * TILE_INNER;
+      if (kt == n_ktiles / 2u && m + 4u < m1)
+        Q6_l2fetch_AP((void *)(x_rm + (size_t)row_map[m + 7u] * k), box);
+      *(HVX_UVector *)(blk + (size_t)kt * ACT_TILE_BYTES) = Q6_V_vmux_QVV(
+        q1, *(const HVX_UVector *)(r0 + off),
+        Q6_V_vmux_QVV(q2, *(const HVX_UVector *)(r1 + off),
+                      Q6_V_vmux_QVV(q3, *(const HVX_UVector *)(r2 + off),
+                                    *(const HVX_UVector *)(r3 + off))));
+    }
+  }
+}
+
+/**
+ * @brief One k-tile's worth of K2, every row-group in it.
+ *
+ * A k-tile's destination bytes ((rb*n_ktiles+kt)*ACT_TILE_BYTES + r0*32,
+ * for every rb/r0) never overlap another k-tile's, so splitting by k-tile
+ * (not by row) is what lets workers write without touching each other's
+ * memory -- and it keeps every row-group's four rows on one worker, which
+ * is what the vectorized store below needs.
+ */
+static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
+  quant_pack_ctx *ctx = (quant_pack_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)ctx->n_ktiles * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)ctx->n_ktiles * (i + 1) / n_threads);
+
+  for (uint32_t kt = lo; kt < hi; ++kt) {
+    for (uint32_t m = 0; m < ctx->m_vec_end; m += 4u) {
+      const uint32_t rb = m / TILE_ROW;
+      const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
+      /** The four rows of a group are four independent source pointers, so
+         a row map costs one indirection each and nothing else -- the
+         packing below still sees four rows and still lands them as one
+         128-byte store. */
+      const uint32_t *mp = ctx->row_map;
+      const float *const src[4] = {
+        ctx->x + (size_t)(mp ? mp[m + 0] : (m + 0)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 1] : (m + 1)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 2] : (m + 2)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 3] : (m + 3)) * ctx->k + kt * TILE_INNER,
+      };
+      const HVX_Vector vinv[4] = {ctx->vinv[m + 0], ctx->vinv[m + 1],
+                                  ctx->vinv[m + 2], ctx->vinv[m + 3]};
+      const HVX_Vector vz[4] = {ctx->vz[m + 0], ctx->vz[m + 1], ctx->vz[m + 2],
+                                ctx->vz[m + 3]};
+      uint8_t *dst = ctx->out_ah +
+                     (size_t)(rb * ctx->n_ktiles + kt) * ACT_TILE_BYTES +
+                     r0 * TILE_INNER;
+      quant_pack_group4(src, vinv, vz, dst);
+    }
+  }
+}
+
+/** One group of four rows, read from @a row, packed as rows m..m+3. */
+static void pack_group_rows(const float *const row[4], uint32_t m,
+                            uint32_t n_ktiles, const float *scale,
+                            const int32_t *zp, uint8_t *out_ah) {
+  const uint32_t rb = m / TILE_ROW;
+  const uint32_t r0 = m % TILE_ROW;
+  uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
+  const HVX_Vector vinv[4] = {
+    hvx_splat_sf(1.0f / scale[m + 0]), hvx_splat_sf(1.0f / scale[m + 1]),
+    hvx_splat_sf(1.0f / scale[m + 2]), hvx_splat_sf(1.0f / scale[m + 3])};
+  const HVX_Vector vz[4] = {Q6_V_vsplat_R(zp[m + 0]), Q6_V_vsplat_R(zp[m + 1]),
+                            Q6_V_vsplat_R(zp[m + 2]), Q6_V_vsplat_R(zp[m + 3])};
+  for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+    const float *const src[4] = {
+      row[0] + kt * TILE_INNER, row[1] + kt * TILE_INNER,
+      row[2] + kt * TILE_INNER, row[3] + kt * TILE_INNER};
+    quant_pack_group4(src, vinv, vz,
+                      blk + (size_t)kt * ACT_TILE_BYTES + r0 * TILE_INNER);
+  }
+}
+
+void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
+                               uint32_t m0, uint32_t m1, uint32_t k,
+                               const float *scale, const int32_t *zp,
+                               uint8_t *out_ah) {
+  /** Row-group outer, k-tile inner: the rows are this call's alone, so the
+     k-tile split the pooled pack needs for disjoint stores is not needed,
+     and the four rows' parameters are splatted once per group instead of
+     once per (group, k-tile). Same group body, same bytes. */
+  for (uint32_t m = m0; m < m1; m += 4u) {
+    const float *const row[4] = {
+      x + (size_t)(row_map ? row_map[m + 0] : (m + 0)) * k,
+      x + (size_t)(row_map ? row_map[m + 1] : (m + 1)) * k,
+      x + (size_t)(row_map ? row_map[m + 2] : (m + 2)) * k,
+      x + (size_t)(row_map ? row_map[m + 3] : (m + 3)) * k,
+    };
+    pack_group_rows(row, m, k / TILE_INNER, scale, zp, out_ah);
+  }
+}
+
+void hvx_quant_pack_u8_ah_m1_repeat(const float *x, uint32_t k, float scale,
+                                    int32_t zp, uint8_t *out_ah) {
+  const HVX_Vector vinv = hvx_splat_sf(1.0f / scale);
+  const HVX_Vector vz = Q6_V_vsplat_R(zp);
+  const HVX_UVector *vin = (const HVX_UVector *)x;
+  for (uint32_t kt = 0; kt < k / TILE_INNER; ++kt) {
+    /** The FC tail's four rows are the same token. Quantize it once, then
+       repeat the integer lanes while narrowing to the existing AH layout.
+       The conversion and saturation are identical to quant_pack_group4. */
+    const HVX_Vector vq =
+      Q6_Vw_vadd_VwVw(hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin[kt], vinv)), vz);
+    const HVX_Vector vh = Q6_Vh_vpack_VwVw_sat(vq, vq);
+    *(HVX_UVector *)(out_ah + (size_t)kt * ACT_TILE_BYTES) =
+      Q6_Vub_vpack_VhVh_sat(vh, vh);
+  }
+}
+
+int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
+                         uint32_t k, const float *scale, const int32_t *zp,
+                         uint8_t *out_ah, hvx_worker_pool *pool) {
+  return hvx_quant_pack_u8_ah_mapped(x, NULL, m_valid, m_pad, k, scale, zp,
+                                     out_ah, pool);
+}
+
+int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                const float *scale, const int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+
+  /** Every row below m_valid is written below, so only the padding rows
+     need zeroing, and in the AH layout those share their 64-row block with
+     the last valid rows: clearing that one block (at most 64 * k bytes)
+     before the pack keeps every caller's bytes identical to clearing all
+     of it. The MoE layer passes m_valid == m_pad (a whole number of
+     blocks), so it clears nothing -- the 6 MB memset it paid per prefill
+     call (doc 47) is gone. */
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+
+  // Four rows at a time: TILE_ROW (64) is a multiple of 4, so a group of 4
+  // consecutive rows never straddles a row-block boundary, and the group's
+  // 4*32=128 destination bytes are exactly one HVX vector -- one store
+  // replaces the 32 scalar byte stores (per row, per k-tile) the row-at-a-
+  // time version needed, measured at 92% of hvx_quant_pack_u8_ah's own time
+  // relative to a full layer call (P2_QUANT_AND_WORKER_POOL.md §1).
+  //
+  // Q6_Vub_vpack_VhVh_sat's saturation to [0,255] is byte-identical to the
+  // Vw_vmax/Vw_vmin clamp it replaces for every input, not just the common
+  // case: [0,255] sits inside int16's range, so the first narrowing pack
+  // (int32->int16) never saturates a value this clamp would have kept, and
+  // any int32 value the clamp WOULD have clipped saturates the same way at
+  // the int16->uint8 stage (V79 HVX Programmer Reference Manual, "Pack").
+  const uint32_t m_vec_end = (m_valid / 4u) * 4u;
+  if (m_vec_end > 0) {
+    // Splitting the work below by k-tile means every k-tile's worker needs
+    // every row's vinv/vz -- computed here, once, instead of once per
+    // (k-tile, row) the way splitting by k-tile would otherwise force.
+    // HVX_UVector, not HVX_Vector: malloc gives no 128-byte alignment
+    // guarantee, and HVX_Vector's aligned load/store faults the moment it
+    // isn't (found on-device -- this crashed the DSP process the first
+    // time M was big enough to take this path).
+    HVX_UVector *vinv = (HVX_UVector *)malloc(sizeof(HVX_UVector) * m_vec_end);
+    HVX_UVector *vz = (HVX_UVector *)malloc(sizeof(HVX_UVector) * m_vec_end);
+    if (!vinv || !vz) {
+      free(vinv);
+      free(vz);
+      return AEE_ENOMEMORY;
+    }
+    for (uint32_t m = 0; m < m_vec_end; ++m) {
+      vinv[m] = hvx_splat_sf(1.0f / scale[m]);
+      vz[m] = Q6_V_vsplat_R(zp[m]);
+    }
+
+    quant_pack_ctx ctx = {x, row_map, m_vec_end, k, n_ktiles, vinv, vz, out_ah};
+    hvx_worker_pool_run(pool, quant_pack_worker, &ctx, n_ktiles);
+
+    free(vinv);
+    free(vz);
+  }
+
+  // Tail: 0-3 rows that didn't fit a group of 4 (e.g. every row when
+  // m_valid == 1, the decode case). Unvectorized, same as before.
+  for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r = m % TILE_ROW;
+    uint8_t *dst_tile0 =
+      out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER;
+    quant_pack_row_scalar(x + (size_t)(row_map ? row_map[m] : m) * k, n_ktiles,
+                          hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
+                          dst_tile0, ACT_TILE_BYTES);
+  }
+  return AEE_SUCCESS;
+}
+
+typedef struct {
+  const float *x;
+  const uint16_t *x16;
+  const float *x16_enc;
+  uint32_t x16_hd;
+  uint32_t n_groups, k;
+  float *scale;
+  int32_t *zp;
+  uint8_t *out_ah;
+  const float *gamma;
+  float eps;
+  float *scratch;
+} quant_params_pack_ctx;
+
+/** @brief One u16 row to f32: (u - zp[h]) * scale[h] per head of hd, the
+ *         CPU's dequant_u16_f32 and the attention epilogue's u16 read back
+ *         (64 lanes a vector, unpacked to two f32 vectors). */
+static void dequant16_row(const uint16_t *u, float *y, const float *enc,
+                          uint32_t hd, uint32_t k) {
+  for (uint32_t h = 0; h < k / hd; ++h) {
+    const HVX_Vector vs = hvx_splat_sf(enc[2u * h]);
+    const HVX_Vector vzp = hvx_splat_sf(enc[2u * h + 1u]);
+    const uint16_t *src = u + (size_t)h * hd;
+    float *dst = y + (size_t)h * hd;
+    for (uint32_t d = 0; d < hd; d += 2u * FLANES) {
+      const HVX_VectorPair w =
+        Q6_Wuw_vunpack_Vuh(*(const HVX_UVector *)(src + d));
+      *(HVX_UVector *)(dst + d) = Q6_Vsf_vmpy_VsfVsf(
+        Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_lo_W(w)), vzp), vs);
+      *(HVX_UVector *)(dst + d + FLANES) = Q6_Vsf_vmpy_VsfVsf(
+        Q6_Vsf_vsub_VsfVsf(Q6_Vsf_equals_Vw(Q6_V_hi_W(w)), vzp), vs);
+    }
+  }
+}
+
+/** Row groups [lo, hi) of four: each group's parameters, then its pack,
+ *  while the four rows are still in the cache. With a scratch, each row is
+ *  RMS-normed into this worker's four scratch rows first and the group is
+ *  read from there: the normed rows never go out to DDR and back. */
+static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
+                                     void *ctx_) {
+  const quant_params_pack_ctx *c = (const quant_params_pack_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
+  float *sc = c->scratch ? c->scratch + (size_t)i * 4u * c->k : NULL;
+  for (uint32_t g = lo; g < hi; ++g) {
+    const uint32_t m = 4u * g;
+    if (!sc) {
+      for (uint32_t r = 0; r < 4u; ++r)
+        quant_row_params_one(c->x, m + r, c->k, c->scale, c->zp);
+      hvx_quant_pack_u8_ah_rows(c->x, NULL, m, m + 4u, c->k, c->scale, c->zp,
+                                c->out_ah);
+      continue;
+    }
+    for (uint32_t r = 0; r < 4u; ++r) {
+      if (c->x16)
+        dequant16_row(c->x16 + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
+                      c->x16_enc, c->x16_hd, c->k);
+      else
+        hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k,
+                            sc + (size_t)r * c->k, c->gamma, c->k, c->eps);
+      quant_row_params_one(sc, r, c->k, c->scale + m, c->zp + m);
+    }
+    const float *const row[4] = {sc, sc + c->k, sc + 2u * c->k, sc + 3u * c->k};
+    pack_group_rows(row, m, c->k / TILE_INNER, c->scale, c->zp, c->out_ah);
+  }
+}
+
+int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
+                                const float *x16_enc, uint32_t x16_hd,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                const float *pre_gamma, float pre_eps,
+                                float *pre_scratch, float *scale, int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+  if (x16 && (!pre_scratch || pre_gamma || !x16_enc || x16_hd == 0u ||
+              x16_hd % (2u * FLANES) != 0u || k % x16_hd != 0u)) {
+    return AEE_EBADPARM;
+  }
+  for (uint32_t m = m_valid; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  const uint32_t m_vec_end = (m_valid / 4u) * 4u;
+  if (m_vec_end > 0) {
+    quant_params_pack_ctx ctx = {
+      x,     x16, x16_enc, x16_hd,    m_vec_end / 4u, k,
+      scale, zp,  out_ah,  pre_gamma, pre_eps,        pre_scratch};
+    hvx_worker_pool_run(pool, quant_params_pack_worker, &ctx, m_vec_end / 4u);
+  }
+  for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    const float *row = x + (size_t)m * k;
+    if (x16) {
+      dequant16_row(x16 + (size_t)m * k, pre_scratch, x16_enc, x16_hd, k);
+      row = pre_scratch;
+    } else if (pre_scratch) {
+      hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
+      row = pre_scratch;
+    }
+    quant_row_params_one(row, 0, k, scale + m, zp + m);
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r = m % TILE_ROW;
+    quant_pack_row_scalar(
+      row, n_ktiles, hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
+      out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER,
+      ACT_TILE_BYTES);
+  }
+  return AEE_SUCCESS;
+}

@@ -156,6 +156,12 @@ bool DeviceInfo::read(const cl_device_id device_id) {
     return false;
   }
 
+  // CL_DEVICE_SINGLE_FP_CONFIG (optional: a failed query leaves it 0)
+  if (CL_SUCCESS != clGetDeviceInfo(device_id, CL_DEVICE_SINGLE_FP_CONFIG,
+                                    sizeof(cl_device_fp_config),
+                                    &device_single_fp_config_, nullptr))
+    device_single_fp_config_ = 0;
+
   return true;
 }
 

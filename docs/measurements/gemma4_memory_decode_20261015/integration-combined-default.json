@@ -1,0 +1,23 @@
+{
+  "preload_experts": 128,
+  "cache_slots": 480,
+  "model_cache_pages": 0,
+  "init_to_loaded_ms": null,
+  "variant": "combined",
+  "tag": "combined-default",
+  "profile": null,
+  "extra_environment": {},
+  "prefill_tokens": 2048,
+  "prefill_ms": 3057.0,
+  "prefill_tps": 669.938,
+  "decode_tokens": 101,
+  "decode_ms": 7657.0,
+  "decode_tps": 13.1905,
+  "ids_sha256": "6e6ac3677d2f11bfc6b40d7c271d031e1e831427fe6ab29da00a574801e24d60",
+  "baseline_ids_equal": true,
+  "observed_model_pids": [
+    "26508"
+  ],
+  "wall_seconds": 12.14689588546753,
+  "e2e_ms": 11952
+}

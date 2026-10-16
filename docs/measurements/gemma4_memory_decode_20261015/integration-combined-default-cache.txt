@@ -1,0 +1,7 @@
+ordinary got=2097152 errno=0 flags=0x30000
+rpcmem flags=0 fd=9 aligned=1 bytes=4096 got=-1 errno=14 message=Bad address equal=0
+rpcmem flags=0 fd=9 aligned=1 bytes=2097152 got=-1 errno=14 message=Bad address equal=0
+rpcmem flags=1 fd=9 aligned=1 bytes=4096 got=-1 errno=14 message=Bad address equal=0
+rpcmem flags=1 fd=9 aligned=1 bytes=2097152 got=-1 errno=14 message=Bad address equal=0
+model_page_cache resident_pages=0 total_pages=1612442 page_bytes=4096
+cached_ranges=0

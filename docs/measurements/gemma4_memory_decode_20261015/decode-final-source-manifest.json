@@ -1,0 +1,33 @@
+{
+  "base_commit": "e0c1c5efda22343ccab7907dd4057d473dead730",
+  "branch": "codex/gemma4-decode16-20261015",
+  "files": {
+    "Applications/CausalLM/models/causal_lm.cpp": "4ecab05714079e1800fb1fe975d72527409a6c1ecdcc26e1500e7241f37d822a",
+    "nntrainer/tensor/htp_backend/hmx/hexkl_graph.c": "e87f0aae5f6c63ba17be1db9ac875f699c8f5612323cf7d78a5e902ed6bb1cf4",
+    "nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c": "c939391cfac14f0bb83e0a27b4f0b98c242f501ba60f629a5b691199158dc022",
+    "nntrainer/tensor/htp_backend/htp_compute_ops.cpp": "96f225e35411fb98a516064e9b7a6ae5666a6d35bc1334268a852acd7d195500",
+    "nntrainer/tensor/htp_backend/htp_dspq_wire.h": "9be4de759d135e6966aa3b8d9417dd5e96b96ec1df2320679142a679a598fc56",
+    "nntrainer/tensor/htp_backend/hvx/hvx_attn_m1_f32.c": "4a1d1e74e7222883a56863107ff48c49114bac6f0ea69005cdf1219c64bd5001",
+    "nntrainer/tensor/htp_backend/hvx/hvx_dequant_i32.c": "2c4fed50f3e84cdd53124a15405eb563694c6e3c739271b354f21ffc1708b3b6",
+    "nntrainer/tensor/htp_backend/hvx/hvx_dequant_i32.h": "deeb3896cca09390bac07fa00ca75ac64b972b885af865824bade021b1a44262",
+    "nntrainer/tensor/htp_backend/hvx/hvx_gemm_u8i4_wh.c": "cc366ed4c51080600fc97d2e366fdd54e95f7642795ed7e86bbf7bfff23158f5",
+    "nntrainer/tensor/htp_backend/hvx/hvx_gemm_u8i4_wh.h": "a56b2ebf4ebb988f038732b1779563c7ba49f87bd78f7dfa6ebce852c77bac8f",
+    "nntrainer/tensor/htp_backend/hvx/hvx_m1_ops_f32.c": "1b050b1cb549b999a7a1a6fb5433af02ff09cdf680831e6f7218fab2c63116ca",
+    "nntrainer/tensor/htp_backend/hvx/hvx_m1_ops_f32.h": "800fda8b6e9d6bc9de5bf0a9bdd9ca5e723ee1220a5d9b59682eae1082b320fb",
+    "test/htp/host/fc_m1_epilogue_host_check.c": "4aed3b77c44d1f20daa57d772f732c6058ed494c48342e76e028682a1305e694",
+    "test/htp/host/gemv_native_check.c": "88860010f12c85c34c134ed49f10f6889b308ad00cee02bb0c20a39adf023865",
+    "test/htp/host/graph_host_check.c": "103a1348b1aeab8539384e86981fc20c5b8fdc14d1ec546143f509890dee2e3b",
+    "test/htp/host/moe_layer_host_check.c": "0e4508bca7b166400e521f3aba53cbbfd70c27863d462d491c9256184eb08be3",
+    "test/htp/host/run_host_checks.sh": "bba860b38f67f5afa399a9bda7ff28e20d0cb98ad125dddb6fa8f3d24be495ab",
+    "test/htp/host/standin/hvx_scalar.c": "a22631331ca15af91361b8066bc88c133aaec4050e146af75df0eedb6f273fed",
+    "test/htp/host/tl2_moe_host_check.c": "9e287c7507aab3076ddfa39d478fbd3847ae5a7b3921512a043c427420be0a04",
+    "test/htp/host/token_host_check.c": "8687dad651f61abc8af9b27d9010179d5654c5256ca92c644592f5294e26b796",
+    "test/htp/nntr_hvx_token.c": "7a93bbcd6b967fd218697328a96c2567d6336e9112d6801ed37a9628ae9aca1a",
+    "nntrainer/tensor/htp_backend/htp_expert_read_pool.h": "fd692224c43e80a3f548a87d7af9f01aeb796618b95b62ead8ba66ed37f45b08",
+    "nntrainer/tensor/htp_backend/htp_token_completion.h": "ef0c1a58dfcc80821a6571eb7f42a590d1dbb4616f268827d7cb35a55a236247",
+    "test/htp/host/expert_read_pool_check.cpp": "81f152b58664d6988ee06f08532794174bf4aa7a6cb05dd4c886112fa5c82271",
+    "test/htp/host/router_owned_host_check.c": "30ed505cc69707ac078381d96972236e55fe937cb603638d18f9a2c192763fa0",
+    "test/htp/host/tl2_quant_native_check.c": "57a74c8d3720274892bd0ab481dd93e76882017546a9d8f9e118f01cabf168f9",
+    "test/htp/host/token_completion_check.cpp": "fbcfd00295eef352234c8115db8564e8ecc34fc6ccc149002568601ead349552"
+  }
+}

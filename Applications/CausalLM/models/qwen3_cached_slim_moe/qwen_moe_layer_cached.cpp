@@ -293,7 +293,8 @@ void CachedSlimMoELayer::incremental_forwarding(
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
 
     // get extra topK
-    auto extra_topk_result = router_logits.topK(topk + 5);
+    const unsigned extra_k = topk + 5;
+    auto extra_topk_result = router_logits.topK(extra_k);
     auto extra_topk_values = std::get<0>(extra_topk_result);
     auto extra_topk_indices = std::get<1>(extra_topk_result);
     std::deque<int> extra_top_k = {};
@@ -302,8 +303,9 @@ void CachedSlimMoELayer::incremental_forwarding(
 
     // get extra topk
     for (int i = static_cast<int>(total_tokens) - 1; i >= 0; --i) {
-      for (int k = 0; k < static_cast<int>(topk + 5); ++k) {
-        unsigned expert_idx = extra_indices_data[i * topk + k];
+      // each token row of the top-(k+5) result holds extra_k indices
+      for (int k = 0; k < static_cast<int>(extra_k); ++k) {
+        unsigned expert_idx = extra_indices_data[i * extra_k + k];
         extra_top_k.push_back(expert_idx);
       }
     }
