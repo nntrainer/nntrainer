@@ -1450,7 +1450,11 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
     if (e->d->tl2_bytes) {
       /** Native TL2 consumes one dense row. Reuse its idle AH allocation
        * for that row and prepare the LUT on the same worker, avoiding AH
-       * expansion and the copy back from its strided first row. */
+       * expansion and the copy back from its strided first row. The down
+       * rotation comes first here as on the other paths (PR 4428: the port
+       * left this branch unrotated, and decode's TL2 layers computed
+       * against rotated down weights from an unrotated row). */
+      moe_rotate_rows(e->gate_f32, 1u, c->inter, c->had_down);
       hvx_quant_rows_u8_params_rm(e->gate_f32, 1u, 1u, c->inter, e->rq_scale,
                                   e->rq_zp, e->mid_ah, NULL, 0.0f, NULL, NULL);
       hvx_tl2_prepare(e->mid_ah, c->inter, 0u, (c->inter + 23u) / 24u,
