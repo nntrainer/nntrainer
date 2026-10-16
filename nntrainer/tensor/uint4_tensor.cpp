@@ -631,7 +631,8 @@ void Uint4QTensor::copy(const void *buf) {
 
   // copy zero points
   unsigned int *zps =
-    (unsigned int *)((float *)(((uint8_t *)buf) + size()) + scale_size());
+    (unsigned int *)((float *)(((uint8_t *)buf) + (size() + 1) / 2) +
+                     scale_size());
 
   memcpy(getZeroPoint(), zps, scale_size() * sizeof(unsigned int));
 }
