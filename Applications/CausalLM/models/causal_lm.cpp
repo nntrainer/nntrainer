@@ -2073,7 +2073,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
 
-    if (init_len < INIT_SEQ_LEN) {
+    // The bound is ids_history's row stride (MAX_SEQ_LEN), not the prefill
+    // block height: a chunked prefill runs prompts longer than INIT_SEQ_LEN.
+    if (init_len < MAX_SEQ_LEN) {
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
       /** [perf-split] Without skip_prefill the FIRST token the caller sees
        *  is the one prefill's own logits produced, before the boundary below
@@ -2458,7 +2460,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (const char *path = std::getenv("NNTR_HTP_TOKEN_TRACE")) {
       json trace;
       trace["input_ids"] = init_input;
-      const bool prefill_emitted = !SKIP_PREFILL && init_len < INIT_SEQ_LEN;
+      const bool prefill_emitted = !SKIP_PREFILL && init_len < MAX_SEQ_LEN;
       const size_t begin = input_len + (prefill_emitted ? 0u : 1u);
       const size_t count = generation_cnt + (prefill_emitted ? 1u : 0u);
       trace["output_ids"] = std::vector<unsigned int>(
