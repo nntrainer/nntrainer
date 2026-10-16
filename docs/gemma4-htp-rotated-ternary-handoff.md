@@ -13,11 +13,10 @@
 
 새 Gemma4-26B-A4B 체크포인트(Hadamard로 사전 회전된 ternary, 마지막 두 MoE
 레이어만 4-bit)를 다른 세션이 변환해 기기에 올린다. 그 전에 런타임이 그 파일을
-그대로 돌릴 수 있어야 한다. 필요한 런타임 작업은 네 가지이고, 이 중
-**온라인 Hadamard 회전 포팅(A)만 끝났다.** 나머지(B 레이어별 expert dtype과
-affine 4-bit expert, C 혼합 모델에서의 회전 범위, D static activation scale)는
-설계까지만 되어 있고 코드는 손대지 않았다. 회전 방향 규약(E)은 수식으로
-정리했고 컨버터 쪽과 맞춰야 한다.
+그대로 돌릴 수 있어야 한다. 필요한 런타임 작업은 네 가지이고,
+**2026-10-16 밤 세션에서 A, B, C, E가 끝나 새 체크포인트가 기기에서 정상 텍스트를 낸다
+(7절).** D(static activation scale)만 사이드카 값이 없어 미착수다. 체크포인트 쪽에는
+고칠 것이 둘 있다(7.2절: config.json의 두 키, 28/29의 TL2 저장).
 
 ## 1. 배경: PR #4428 코멘트와 사용자 결정
 
@@ -59,12 +58,12 @@ affine 4-bit expert, C 혼합 모델에서의 회전 범위, D static activation
 
 | # | 작업 | 상태 | 재개 지점 |
 |---|---|---|---|
-| A | Hadamard 회전 포팅 | **완료**: 커밋, host check 통과, v81 skel + ARM 빌드 (4.1절) | 기기에서 4.1절 검증 셀만 남음 |
-| B | 레이어별 expert dtype + `QS4CX_WH_AFFINE` expert | 미착수, 설계 4.2절 | 4.2절 1단계부터 |
-| C | 혼합 모델의 회전 범위(dense FFN 제외, 4-bit expert 포함) | 미착수, 설계 4.3절 | B 뒤에 |
-| D | static activation scale (사이드카 로딩 + 커널 고정 scale) | 미착수, 설계 4.4절 | 포맷을 양자화 부서와 합의한 뒤 |
-| E | 회전 규약 문서/검증 | 수식 정리됨 4.5절, 컨버터와 대조 필요 | `rotation_meta.json` 입수 후 |
-| F | 기기 검증 | 절차 4.6절 | 각 단계 뒤 |
+| A | Hadamard 회전 포팅 | **완료**, 기기 검증 완료 (4.6절 세 셀 통과) + 디코드 TL2 down 회전 누락 수정 `5d366e5cb` | — |
+| B | 레이어별 expert dtype + `QS4CX_WH_AFFINE` expert | **완료** `d0e32095b`, `59825043b` (슬롯 크기별 free list, offset RPC `weight_set_offsets_batch`) | 7절의 메모리 주의 |
+| C | 혼합 모델의 회전 범위 | **완료** `2d9057fb5` (dense FFN 마스킹, `scope=all` = expert 전부; `moe_hadamard`/`moe_hadamard_scope` 설정 키) | — |
+| D | static activation scale | **미착수** (사이드카 값이 아직 없음; 설계 4.4절) | 포맷 합의 뒤 |
+| E | 회전 규약 | **확정** (7절): 런타임 방향 맞음 + 체크포인트의 입력 차원별 ±1 부호 벡터(seed 42)를 사이드카로 적용 `2edf1c76f` | — |
+| F | 기기 검증 | 7절의 표 | — |
 
 ## 4. 상세
 
@@ -309,15 +308,88 @@ adb -s R5KL309ALRK shell "sh $D/claude_lfm2kv/run2.sh $D/claude_had/bin $D/claud
 petcare sub/main 시나리오가 돈다. 회전된 가중치 + 회전 on에서만 텍스트가 의미 있다.
 AI Studio 앱이 떠 있으면 DSP arena를 잡고 있어 CLI가 `AEE_ENOMEMORY`로 실패한다(앱 종료).
 
+## 7. 2026-10-16 밤 세션 결과 (워크스테이션 `shsh1004-lee`, 워크트리 `~/nntrainer-4428-had`)
+
+커밋(모두 `htp/4428-hadamard`, `Seunghui98/nntrainer`에 push됨; `Jungwon-Lee/nntrainer`에는
+이 계정에 push 권한이 없어 올리지 못함 — `integrate/pr4416-quickdotai`로는 권한 있는 쪽에서
+`git push git@github.com:Jungwon-Lee/nntrainer.git htp/4428-hadamard:integrate/pr4416-quickdotai`):
+
+| 커밋 | 내용 |
+|---|---|
+| `d0e32095b` | `[CausalLM/Gemma4]` `moe_layer_dtype_per_layer` 키 (B-1) |
+| `59825043b` | `[HTP]` affine 4-bit expert: 슬롯 크기별 free list, 12N 꼬리, `weight_set_offsets_batch` IDL, direct prefetch는 첫 레이어 크기만 (B-2..6) |
+| `2d9057fb5` | `[HTP]` `scope=all`은 expert만 회전, dense FFN은 act bit 1 / 그래프 마스크 (C) |
+| `5d366e5cb` | `[HTP]` 디코드 M=1 native TL2 down 분기에 빠져 있던 `moe_rotate_rows` (포팅 버그) |
+| `2edf1c76f` | `[HTP]` 회전 부호 사이드카 `moe_hadamard_signs` + `moe_set_hadamard_signs` IDL + `tools/htp/recover_hadamard_signs.py` (E) |
+
+### 7.1 회전 규약 (E) — 확정
+
+두 팩의 같은 expert(레이어 28 expert 0 등)를 디코드해 비교: W_new 와 (H44⊗Hp)·W_tl2/√n 의
+행 상관은 |r| 평균 0.76(모든 행 > 0.3), 그 중 절반(gate_up 1395/2816, down 358/704)이 음수.
+즉 런타임의 H44⊗Hp 방향은 맞고, 체크포인트는 그 뒤에 **입력 차원별 ±1 부호**(seed 42)를
+곱한다: `x ← (x H) ⊙ s_in`, `a ← (a H) ⊙ s_down`. 부호 벡터는 expert 0/1, 30개 레이어 전부
+동일. (H44ᵀ⊗Hp 후보의 |r| 0.725는 H44ᵀ = 2I − H44 에 의한 반상관으로 설명됨; Hp⊗H44
+순서는 r ≈ 0.) 복원 도구: `tools/htp/recover_hadamard_signs.py` (두 팩의 .bin과
+`NNTR_MOE_DESC_TRACE=1` 로그로부터 사이드카 생성). 기기 사이드카:
+`/data/local/tmp/nntrainer/causallm/claude_had/rotation_signs.json`.
+**컨버터 팀에 요청**: `rotation_meta.json`의 부호 벡터(또는 생성 코드)를 팩에 함께 싣고
+`nntr_config.json`에 `"moe_hadamard": "both", "moe_hadamard_scope": "all",
+"moe_hadamard_signs": "rotation_signs.json"` 을 넣을 것. 데이터 복원본과 일치해야 한다.
+
+### 7.2 체크포인트(바이너리) 쪽 문제 두 가지
+
+1. `config.json`에 `global_head_dim: 512`, `num_global_key_value_heads: 2` 가 없어
+   (per_layer_config만 있음) 런타임이 `set_decode_graph_desc: AEE_EINVALIDFORMAT`로 즉시
+   실패한다. 기기 설정 복사본(`claude_had/cfg/g4new_*/config.json`)에 두 키를 넣어 우회.
+   컨버터가 TL2 팩의 config.json처럼 두 키를 써야 한다.
+2. 레이어 28/29를 4-bit 컨테이너에 넣은 값은 ternary다(10:21 코멘트, 디코드로도 확인:
+   레벨 {-1,0,1}, offset 전부 0). **TL2CX_WH로 저장하면** B의 모든 런타임 분기가 필요 없고
+   메모리도 TL2 팩과 같아진다. 지금은 4-bit 슬롯(3.0 MB)이 프리필 read-ahead 때문에
+   28·29 두 레이어분 256개(768 MB)까지 깔려 arena가 8→12 chunk(1792→2624 MiB)다.
+   (공유 LRU에 "같은 클래스 먼저 비우기"를 넣어 봤으나 피크는 read-ahead가 결정해 효과 없음,
+   디코드에서 대량 eviction 부작용이 있어 되돌림.)
+
+### 7.3 기기 결과 (S26 Ultra R5KL309ALRK, C=16, 바이너리 `claude_had/bin11`)
+
+새 체크포인트, `both` / `scope=all` / 부호 사이드카, 텍스트는 네 셀 모두 Ardley 요약문
+(EOS로 82–104 토큰에서 끝남; 512 budget은 채우지 않음):
+
+| 셀 | prefill tok/s | decode tok/s | MemAvailable drop (MiB) | 앱 peak memory (MB) | arena |
+|---|---|---|---|---|---|
+| p1024 g128 | 520 | 12.6 | 4858 | 4477 | 12 chunk 2624 MiB |
+| p2048 g128 | 614 | 12.6 | 4820 | 4969 | 〃 |
+| p4096 g128 | 561 | 11.9 | 5344 | 5479 | 〃 |
+| p2048 g512 | 573 | 12.4 | 5004 | 4803 | 〃 |
+
+위 표는 연속 측정이라 발열 영향이 있다. 식힌 뒤 두 팩을 번갈아 2회 돌린 p2048 g128
+(`bin11`, 60 s 휴식): TL2 팩 704 / 696 prefill, 16.6 / 16.7 decode; 새 팩 654 / 668 prefill,
+15.4 / 15.1 decode — 새 팩이 prefill ~6 %, decode ~8 % 느리다(4-bit 슬롯의 28/29 레이어와,
+부호 때문에 HVX로 도는 회전). 메모리: TL2 팩 MemAvailable drop 3887 / 4422 MiB (p2048 /
+p4096), 앱 peak 4140 / 4176 MB; 새 팩은 arena +832 MiB(7.2절 2).
+
+회귀: 모든 커밋 뒤 TL2 팩(회전 off) 2048 토큰 id가 PR head와 바이트 동일, LFM2 2k id 동일,
+TL2 팩 `both_hmx`/`scope=all` 실행 OK. host check 전체 통과(`SET OFFSETS BATCH`,
+`HADAMARD SIGNS` 셀 포함).
+
+### 7.4 D (static activation scale) — 미착수, 설계 메모
+
+4.4절 그대로. 구현 시 carrier는 `hexkl_moe_scratch`의 per-call 필드(부호 벡터처럼 세션
+전역이 아니라 레이어별 값이므로): prefill은 레이어 호출 전 `moe_act_scale_set` RPC 한 줄,
+디코드는 MOE op param. 커널의 스캔 지점은 4.4절 표. HMX fp16 회전 경로(had_mode 3)는
+양자화가 융합돼 있어 static scale도 그 안에서 적용해야 한다(부호 적용 때는 HVX로 우회했음).
+
 ## 5. 열린 질문
 
-1. 체크포인트의 R_in/R_down이 고정 H44⊗Hp인지, seed 42가 sign flip을 뜻하는지(4.5절).
-2. 레이어 28/29가 정말 4-bit로 남는지(10:21 코멘트는 값이 ternary라고 함). ternary면
-   TL2로 저장하는 편이 런타임 변경(B 전체)을 없앤다 — 컨버터 쪽 결정.
+1. ~~체크포인트의 R_in/R_down이 고정 H44⊗Hp인지, seed 42가 sign flip을 뜻하는지(4.5절).~~
+   → 7.1절: H44⊗Hp + 입력 차원별 ±1 부호(seed 42). 컨버터의 `rotation_meta.json`과 대조 필요.
+2. 레이어 28/29가 정말 4-bit로 남는지 — 값은 ternary(확인). TL2로 저장하면 B 전체와
+   +832 MiB가 사라진다 — 컨버터 쪽 결정(7.2절).
 3. activation scale 사이드카 포맷(4.4절)과 산출 조건(회전 뒤, per-tensor).
 4. LFM2 27k 프롬프트 텍스트 퇴화, Gemma4 chunk-2 q2 커널 문제(오늘 별도 분석)는 이 작업과 무관하게 남아 있다.
 
 ## 6. 다음 세션 시작 프롬프트
+
+(2026-10-16 밤 이후: A–C, E 완료. 남은 것은 D와 컨버터 쪽 7.2절. 아래는 그 전의 프롬프트.)
 
 ```
 ~/nntrainer-4428-had (브랜치 htp/4428-hadamard, PR #4428 head 위)에서
