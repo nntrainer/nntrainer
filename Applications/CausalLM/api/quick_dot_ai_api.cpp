@@ -1163,9 +1163,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
            top_nntr.contains("model_dirs"), top_nntr["model_dirs"].is_array(),
            top_nntr["architectures"].size(), top_nntr["model_dirs"].size());
 
-      if (is_multi && input_name_upper == "GEMMA4-26B-A4B-HTP")
-        throw std::invalid_argument(
-          "Gemma4 HTP supports a single model per handle");
+      if (is_multi && (input_name_upper == "GEMMA4-26B-A4B-HTP" ||
+                       input_name_upper == "LFM2-24BA2B-HTP"))
+        throw std::invalid_argument("HTP supports a single model per handle");
       if (is_multi) {
         // ----------------------------------------------------------------
         // Multi-model branch.
@@ -1231,7 +1231,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
           }
 
           if (sub_nntr.value("gemma4_execution_profile", std::string()) ==
-              "htp_fused")
+                "htp_fused" ||
+              sub_nntr.value("lfm2_execution_profile", std::string()) ==
+                "htp_fused")
             throw std::invalid_argument(
               "HTP profile requires its dedicated descriptor");
           auto m = causallm::Factory::Instance().create(arch_i, sub_cfg,
@@ -1320,6 +1322,29 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       }
     }
 
+    const bool lfm2_htp_model = input_name_upper == "LFM2-24BA2B-HTP";
+    const bool lfm2_htp_profile =
+      nntr_cfg.value("lfm2_execution_profile", std::string()) == "htp_fused";
+    if (lfm2_htp_model || lfm2_htp_profile) {
+#ifndef ENABLE_HEXKL
+      throw std::invalid_argument("LFM2 HTP requires an HTP build");
+#else
+      if (!lfm2_htp_model || !lfm2_htp_profile ||
+          compute != CAUSAL_LM_BACKEND_NPU ||
+          quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
+          cfg.value("architectures", std::vector<std::string>{}) !=
+            std::vector<std::string>{"Lfm2MoeForCausalLM"} ||
+          nntr_cfg.value("lfm2_weight_format", std::string()) !=
+            "htp_fused_v1" ||
+          nntr_cfg.value("use_kvcache", false) ||
+          nntr_cfg.value("save_kvcache", false))
+        throw std::invalid_argument(
+          "LFM2 HTP requires the NPU/W4A32 fused pack");
+      fix_paths(nntr_cfg, abs_model_dir);
+      h.htp_runtime =
+        std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);
+#endif
+    }
     const bool htp_model = input_name_upper == "GEMMA4-26B-A4B-HTP";
     const bool htp_profile =
       nntr_cfg.value("gemma4_execution_profile", std::string()) == "htp_fused";
@@ -1462,7 +1487,8 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       h.models.push_back(std::move(m));
     }
     LOGD("[DEBUG] load_into_handle: Calling model->initialize()...");
-    if (!htp_model && native_lib_dir != nullptr && strlen(native_lib_dir) > 0) {
+    if (!htp_model && !lfm2_htp_model && native_lib_dir != nullptr &&
+        strlen(native_lib_dir) > 0) {
       setenv("ADSP_LIBRARY_PATH", native_lib_dir, 1);
     }
     model_to_load->initialize();

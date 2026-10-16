@@ -213,6 +213,7 @@ causallm_htp_src = [
   causallm_root / 'models' / 'gemma4' / 'gemma4_htp_moe_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_htp_weights.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_layer.cpp',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_htp_moe_causallm.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_pool_layer.cpp',
   causallm_root / 'layers' / 'htp_mha_core.cpp',
   causallm_root / 'layers' / 'htp_qkv_layer.cpp',

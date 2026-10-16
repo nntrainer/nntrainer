@@ -337,15 +337,15 @@ _Static_assert(32u % ROUTER_CHAINS == 0u && ROUTER_CHAINS % 2u == 0u,
   do {                                                                         \
     const float xk_ = x[(k)];                                                  \
     const float *row_ = (const float *)__builtin_assume_aligned(               \
-      w32 + (size_t)(k)*LANES + e0, 8);                                        \
+      w32 + (size_t)(k)*stride + e0, 8);                                       \
     for (uint32_t j_ = 0; j_ < ROUTER_CHAINS; ++j_) {                          \
       acc[j_] = Q6_R_sfmpyacc_RR(acc[j_], xk_, row_[j_]);                      \
     }                                                                          \
   } while (0)
 
 static inline __attribute__((always_inline)) void
-router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
-              float *out) {
+router_chains(const float *x, const float *w32, uint32_t K, uint32_t stride,
+              uint32_t e0, float *out) {
   float acc[ROUTER_CHAINS];
   for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
     acc[j] = 0.0f;
@@ -355,9 +355,9 @@ router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
 #if defined(__hexagon__)
     if (e0 == 0u && k1 < K) {
       /* the next 16 KiB; Rtt: [47:32] stride, [31:16] width, [15:0] height */
-      Q6_l2fetch_AP((void *)(w32 + (size_t)k1 * LANES),
-                    ((uint64_t)(LANES * 4u) << 32) |
-                      ((uint64_t)(LANES * 4u) << 16) |
+      Q6_l2fetch_AP((void *)(w32 + (size_t)k1 * stride),
+                    ((uint64_t)(stride * 4u) << 32) |
+                      ((uint64_t)(stride * 4u) << 16) |
                       (uint64_t)ROUTER_PF_ROWS);
     }
 #endif
@@ -372,7 +372,7 @@ router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
     uint32_t k = k0;
     for (; k < kpf; ++k) {
 #if defined(__hexagon__)
-      Q6_dcfetch_A((void *)(w32 + (size_t)(k + ROUTER_L1_AHEAD) * LANES + e0));
+      Q6_dcfetch_A((void *)(w32 + (size_t)(k + ROUTER_L1_AHEAD) * stride + e0));
 #endif
       ROUTER_STEP(k);
     }
@@ -397,7 +397,8 @@ typedef struct {
 static void router_lane(uint32_t n, uint32_t i, void *v) {
   const router_ctx *c = (const router_ctx *)v;
   for (uint32_t e0 = i * ROUTER_CHAINS; e0 < c->E; e0 += n * ROUTER_CHAINS) {
-    router_chains(c->x, c->w32, c->K, e0, c->acc + e0);
+    router_chains(c->x, c->w32, c->K, (c->E + 31u) / 32u * 32u, e0,
+                  c->acc + e0);
     for (uint32_t e = e0; e < e0 + ROUTER_CHAINS && e < c->E; ++e) {
       m1_router_cpu_sigmoid(c->acc[e], c->bias[e], &c->sig[e], &c->score[e]);
     }
@@ -407,9 +408,10 @@ static void router_lane(uint32_t n, uint32_t i, void *v) {
 void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                          uint32_t K, uint32_t E, uint32_t top_k, float *logits,
                          uint32_t *sel, float *weight, hvx_worker_pool *pool) {
-  float acc[LANES], sig[LANES], score[LANES];
+  float acc[M1_DET_ROUTER_MAX_E], sig[M1_DET_ROUTER_MAX_E],
+    score[M1_DET_ROUTER_MAX_E];
   if (!x || !w32 || !bias || !logits || !sel || !weight || K == 0u || E == 0u ||
-      E > LANES || top_k == 0u || top_k > E) {
+      E > M1_DET_ROUTER_MAX_E || top_k == 0u || top_k > E) {
     return;
   }
   /** [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order

@@ -36,6 +36,7 @@ causallm_inc += include_directories('../lfm2_moe')
 causallm_src += files('../../layers/htp_mha_core.cpp',
                       '../../layers/htp_qkv_layer.cpp',
                       '../lfm2_moe/lfm2_moe_layer.cpp',
+                      '../lfm2_moe/lfm2_htp_moe_causallm.cpp',
                       '../lfm2_moe/lfm2_moe_pool_layer.cpp')
 causallm_layer_dependencies += [causallm_residual_add_dep,
   causallm_dense_ffn_layer_dep, causallm_conv_block_layer_dep]

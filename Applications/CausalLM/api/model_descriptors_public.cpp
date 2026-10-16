@@ -42,6 +42,9 @@ __attribute__((constructor)) static void register_public_descriptors() {
      "GEMMA4_CPU", /* get_model_name_from_type(CAUSAL_LM_MODEL_GEMMA4_CPU) */
      "Gemma4ForCausalLM" /* Factory registration pending */},
 #ifdef ENABLE_HEXKL
+    {"lfm2-24ba2b-htp", "lfm2", "LFM2 24B A2B MoE (HTP)", QDA_RUNTIME_NATIVE,
+     B(2), QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API, "LFM2-24BA2B-HTP",
+     "Lfm2MoeForCausalLM"},
     {"gemma4-26b-a4b-htp", "gemma4-26b-a4b", "Gemma4 26B A4B MoE (HTP)",
      QDA_RUNTIME_NATIVE, B(2), QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API,
      "GEMMA4-26B-A4B-HTP", "Gemma4ForCausalLM"},

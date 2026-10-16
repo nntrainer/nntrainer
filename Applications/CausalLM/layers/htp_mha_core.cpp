@@ -250,16 +250,18 @@ void HtpMHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   attn_out_u16 = std::get<htp_mha_props::AttnOutU16>(mha_core_props).get();
   kv_cache_quant_kind = -1;
+  kv_cache_fixed_scales = true;
   if (!std::get<htp_mha_props::KvCacheQuant>(mha_core_props).empty()) {
     const std::string kind =
       std::get<htp_mha_props::KvCacheQuant>(mha_core_props).get();
-    if (kind == "q8") {
+    if (kind == "q8" || kind == "q8_row") {
       kv_cache_quant_kind = 0;
+      kv_cache_fixed_scales = kind != "q8_row";
     } else if (kind == "q4") {
       kv_cache_quant_kind = 1;
     } else if (!kind.empty()) {
       throw std::invalid_argument("mha_core: kv_cache_quant must be \"\", "
-                                  "\"q8\" or \"q4\", got \"" +
+                                  "\"q8\", \"q8_row\" or \"q4\", got \"" +
                                   kind + "\"");
     }
   }
@@ -1141,7 +1143,7 @@ void HtpMHACoreLayer::registerQuantizedCache(
       !q_cache_handles.empty())
     return;
   // try_quantized_attention's own gate for a layer the int8 kernels take
-  const bool q2 = kv_cache_quant_kind == 0 &&
+  const bool q2 = kv_cache_quant_kind == 0 && kv_cache_fixed_scales &&
                   compute_ops_->supports_kv_cache_q2() &&
                   attn_logit_softcapping <= 0.0f;
   if (!q2 && head_dim > 256)
@@ -1429,8 +1431,8 @@ bool HtpMHACoreLayer::try_quantized_attention(
     const char *v = std::getenv("NNTR_HTP_ATTN_Q2");
     return v != nullptr && std::strcmp(v, "0") == 0;
   }();
-  const bool use_q2 = kv_cache_quant_kind == 0 && !q2_off &&
-                      compute_ops_->supports_kv_cache_q2() &&
+  const bool use_q2 = kv_cache_quant_kind == 0 && kv_cache_fixed_scales &&
+                      !q2_off && compute_ops_->supports_kv_cache_q2() &&
                       attn_logit_softcapping <= 0.0f && io.sinks == nullptr;
   if (!use_q2 && head_dim > 256) {
     return false;

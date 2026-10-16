@@ -251,6 +251,24 @@ void Gemma4HtpTransformer::repack_weight() {
       // section 2): the conv weight is FP32 and rides with each call.
       if (l.getType() == "conv_block") {
         auto weights = context.getWeights();
+        if (weights.size() == 3 && context.getComputeOps() &&
+            weights[0]->getVariableRef().getDataType() ==
+              ml::train::TensorDim::DataType::QS4CX_WH_AFFINE) {
+          auto *ops = context.getComputeOps();
+          for (auto index : {0u, 2u}) {
+            auto &t = weights[index]->getVariableRef();
+            if (t.getDataType() !=
+                  ml::train::TensorDim::DataType::QS4CX_WH_AFFINE ||
+                !ops->set_fc_wh_source(t.getData(), t.height(), t.width(),
+                                       true))
+              throw std::runtime_error(
+                "Affine WH conv projections require HTP");
+            fc_pending.push_back({ops, t.getData(), t.getScale<float>(),
+                                  static_cast<unsigned>(t.height()),
+                                  static_cast<unsigned>(t.width())});
+          }
+          return;
+        }
         if (weights.size() == 3 && context.getComputeOps()) {
           auto &in_proj = weights[0]->getVariableRef();
           auto &conv = weights[1]->getVariableRef();

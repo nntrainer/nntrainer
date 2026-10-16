@@ -237,6 +237,16 @@ void actStats(LayerNode &node, unsigned int rows) {
     const size_t n =
       std::min<size_t>(rows, d.height()) * d.width() * d.channel();
     const float *p = t.getData<float>();
+    if (const char *dir = std::getenv("NNTR_ACT_DUMP")) {
+      const auto path = std::filesystem::path(dir) /
+                        (node.getName() + "_out" + std::to_string(i) + ".f32");
+      std::filesystem::create_directories(path.parent_path());
+      std::ofstream stream(path, std::ios::binary);
+      stream.write(reinterpret_cast<const char *>(p), n * sizeof(float));
+      if (!stream)
+        throw std::runtime_error("Cannot write activation dump: " +
+                                 path.string());
+    }
     // rms over the finite values and over the first row alone, so a CPU
     // run and an accelerator run of the same prompt line up node by node
     const size_t row = static_cast<size_t>(d.width()) * d.channel();

@@ -477,8 +477,8 @@ static inline void m1_conv_gate_det(const float *abc, float *state,
   }
 }
 
-/** @brief Router width limit: one HVX vector of f32 lanes per weight row. */
-#define M1_DET_ROUTER_MAX_E M1_DET_LANES
+/** @brief Router width limit: up to two HVX vectors per weight row. */
+#define M1_DET_ROUTER_MAX_E 64u
 
 /**
  * @brief expf as the phone's bionic libm computes it: the Arm
@@ -561,7 +561,7 @@ static inline void m1_router_cpu_sigmoid(float logit, float bias, float *sig,
  *        a tie), the -ffast-math weight sum, a true divide, the weights.
  *        Shared by the spec and the DSP kernel.
  *
- * @param sig     E sigmoids (1..32), m1_router_cpu_sigmoid's
+ * @param sig     E sigmoids (1..64), m1_router_cpu_sigmoid's
  * @param score   E selection scores, the same
  * @param top_k   1..E
  * @param sel     top_k expert indices out, in selection order
@@ -570,16 +570,18 @@ static inline void m1_router_cpu_sigmoid(float logit, float bias, float *sig,
 static inline void m1_router_cpu_pick(const float *sig, const float *score,
                                       uint32_t E, uint32_t top_k, uint32_t *sel,
                                       float *weight) {
-  uint32_t taken = 0u, e, r;
+  uint64_t taken = 0u;
+  uint32_t e, r;
   float a0 = 0.0f, a1 = 0.0f, wsum, inv;
   for (r = 0; r < top_k; ++r) {
     uint32_t best = E;
     for (e = 0; e < E; ++e) {
-      if (!(taken & (1u << e)) && (best == E || score[e] > score[best])) {
+      if (!(taken & (UINT64_C(1) << e)) &&
+          (best == E || score[e] > score[best])) {
         best = e;
       }
     }
-    taken |= 1u << best;
+    taken |= UINT64_C(1) << best;
     sel[r] = best;
   }
   for (r = 0; r + 1u < top_k; r += 2u) {
@@ -602,7 +604,7 @@ static inline void m1_router_cpu_pick(const float *sig, const float *score,
  * @param x       K floats, the ffn-normed row
  * @param w       K x E floats, row-major [K][E] (the gate weight's layout)
  * @param bias    E floats, added for the selection only
- * @param E       1..32
+ * @param E       1..64
  * @param top_k   1..E
  * @param logits  E floats out
  * @param sel     top_k expert indices out, in selection order
