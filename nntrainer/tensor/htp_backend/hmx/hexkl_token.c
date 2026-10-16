@@ -270,16 +270,19 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   for (i = 0; rc == AEE_SUCCESS && i < a->n_load; ++i) {
     htp_miss_load *l = &a->load[i];
     uint32_t hg = HTP_GRAPH_NO_HANDLE, hd = HTP_GRAPH_NO_HANDLE;
-    rc = m->env->rebind == NULL
-           ? AEE_EBADSTATE
-           : m->env->rebind(
-               m->env->rebind_ctx, l->old_gu, l->old_dn, o->K, o->N, o->N_out,
-               l->arena, l->off_gu, l->off_dn,
-               (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_gu
-                                                                 : NULL,
-               (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_dn
-                                                                 : NULL,
-               &hg, &hd);
+    const hexkl_graph_rebind_fn rebind = l->bits == HTP_TL2_COMPACT_WEIGHT_BITS
+                                           ? m->env->rebind_compact
+                                           : m->env->rebind;
+    rc =
+      rebind == NULL
+        ? AEE_EBADSTATE
+        : rebind(m->env->rebind_ctx, l->old_gu, l->old_dn, o->K, o->N, o->N_out,
+                 l->arena, l->off_gu, l->off_dn,
+                 (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_gu
+                                                                   : NULL,
+                 (l->bits == 2u || l->bits == HTP_TL2_WEIGHT_BITS) ? l->pal_dn
+                                                                   : NULL,
+                 &hg, &hd);
     if (rc == AEE_SUCCESS && l->bits == HTP_TL2_WEIGHT_BITS) {
       hexkl_weight_u8i4 *wg = &m->env->tbl->slots[hg];
       hexkl_weight_u8i4 *wd = &m->env->tbl->slots[hd];

@@ -146,7 +146,8 @@ typedef struct {
   hexkl_graph_fc_fn fc;       /**< [#132 Part B] the Q4M1 kinds' runner; NULL
                                    = none, and they fail with AEE_EBADSTATE */
   void *fc_ctx;
-  hexkl_graph_rebind_fn rebind; /**< [plan 201 S1] NULL = none */
+  hexkl_graph_rebind_fn rebind;         /**< [plan 201 S1] NULL = none */
+  hexkl_graph_rebind_fn rebind_compact; /**< Native-only compact TL2. */
   void *rebind_ctx;
   hexkl_graph_miss miss; /**< [plan 201 S1] post NULL = no miss path: a
                               token routed to a non-resident expert fails

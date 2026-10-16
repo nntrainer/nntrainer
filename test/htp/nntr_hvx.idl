@@ -1415,4 +1415,12 @@ interface nntr_hvx : remote_handle64 {
                            in uint32 workers, in uint32 passes,
                            in sequence<uint8> act, in sequence<uint8> weight,
                            rout sequence<int32> result, rout sequence<uint32> stats);
+   // Native-only TL2: codes then N FP32 scales and N int32 column sums.
+   // Legacy QS2 and convertible TL2 continue using the existing entries.
+   AEEResult weight_swap_batch_tl2_compact_arena(
+      in uint32 K, in uint32 inter, in uint32 N_out,
+      in sequence<uint32> old_gu, in sequence<uint32> old_dn,
+      in sequence<uint32> arena, in sequence<uint32> off_gu,
+      in sequence<uint32> off_dn, rout sequence<uint32> h_gu,
+      rout sequence<uint32> h_dn, rout uint32 n_done, rout int32 err);
 };

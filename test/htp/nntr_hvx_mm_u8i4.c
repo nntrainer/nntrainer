@@ -454,8 +454,10 @@ static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
                                       int tail, uint32 bits) {
   const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
   /* 512 bytes a 32x32 tile at four bits, 256 at two. */
-  const uint64_t bytes = (uint64_t)(K / 32u) * (N / 32u) * (bits * 128u) +
-                         (tail ? 8u * (uint64_t)N : 0u);
+  const uint64_t codes = bits == HTP_TL2_COMPACT_WEIGHT_BITS
+                           ? htp_tl2_native_bytes(K, N)
+                           : (uint64_t)(K / 32u) * (N / 32u) * (bits * 128u);
+  const uint64_t bytes = codes + (tail ? 8u * (uint64_t)N : 0u);
   if (!a) {
     return NULL;
   }
@@ -501,12 +503,17 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
 static int swap_register_one(nntr_hvx_session *s, uint32 K, uint32 N,
                              uint32 arena, uint32 wh_off, const int8 *pal,
                              const float *w_scale, const int32 *colsum_w,
-                             const float *bias, uint32 *out) {
-  const uint8_t *wh =
-    arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL, pal ? 2u : 4u);
+                             const float *bias, uint32 *out, int compact) {
+  const uint8_t *wh = arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL,
+                                      compact ? HTP_TL2_COMPACT_WEIGHT_BITS
+                                      : pal   ? 2u
+                                              : 4u);
   if (!wh) {
     return AEE_EBADPARM;
   }
+  if (compact)
+    return hexkl_weight_tl2_compact_register_arena(&s->weights_u8i4,
+                                                   s->vtcm_size, K, N, wh, out);
   if (pal) {
     return hexkl_weight_u2i4_register_arena(&s->weights_u8i4, s->vtcm_size, K,
                                             N, wh, (const int8_t *)pal, NULL,
@@ -537,9 +544,9 @@ static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
                      const int32 *gu_colsum, int gu_colsumLen,
                      const float *dn_scale, int dn_scaleLen,
                      const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
-                     uint32 *h_dn) {
+                     uint32 *h_dn, int compact) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  const uint32 bits = pal_gu ? 2u : 4u;
+  const uint32 bits = compact ? HTP_TL2_COMPACT_WEIGHT_BITS : pal_gu ? 2u : 4u;
   const uint32 n_gu = 2u * inter;
   const int release_old =
     !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
@@ -552,6 +559,9 @@ static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
   float *bias = NULL;
   uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
   int rc;
+  if (compact && (!K || !inter || !N_out || K > 8192u || inter > 4096u ||
+                  N_out > 8192u || K % 32u || inter % 64u || N_out % 128u))
+    return AEE_EBADPARM;
   if (!s || !h_gu || !h_dn || !pal_gu != !pal_dn || (pal_gu && !tail)) {
     return AEE_EBADPARM;
   }
@@ -594,13 +604,19 @@ static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
         ((uintptr_t)wd % 512u) != 0u) {
       return AEE_EBADPARM;
     }
-    rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu, wg,
-                                        (const int8_t *)pal_gu, gu_scale,
-                                        gu_colsum);
+    rc = compact
+           ? hexkl_weight_tl2_compact_rebind_arena(&s->weights_u8i4, old_gu, K,
+                                                   n_gu, wg)
+           : hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu,
+                                            wg, (const int8_t *)pal_gu,
+                                            gu_scale, gu_colsum);
     if (rc == AEE_SUCCESS) {
-      rc = hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
-                                          N_out, wd, (const int8_t *)pal_dn,
-                                          dn_scale, dn_colsum);
+      rc = compact
+             ? hexkl_weight_tl2_compact_rebind_arena(&s->weights_u8i4, old_dn,
+                                                     inter, N_out, wd)
+             : hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
+                                              N_out, wd, (const int8_t *)pal_dn,
+                                              dn_scale, dn_colsum);
     }
     if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
       return rc;
@@ -616,10 +632,10 @@ static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
     }
   }
   rc = swap_register_one(s, K, n_gu, arena, off_gu, pal_gu, gu_scale, gu_colsum,
-                         bias, &g);
+                         bias, &g, compact);
   if (rc == AEE_SUCCESS) {
     rc = swap_register_one(s, inter, N_out, arena, off_dn, pal_dn, dn_scale,
-                           dn_colsum, bias, &d);
+                           dn_colsum, bias, &d, compact);
     if (rc != AEE_SUCCESS) {
       hexkl_weight_u8i4_release(&s->weights_u8i4, g);
     }
@@ -647,7 +663,7 @@ int nntr_hvx_weight_swap_u8i4_arena(
   return swap_pair(handle, old_gu, old_dn, K, inter, N_out, arena, off_gu,
                    off_dn, NULL, NULL, gu_scale, gu_scaleLen, gu_colsum,
                    gu_colsumLen, dn_scale, dn_scaleLen, dn_colsum, dn_colsumLen,
-                   h_gu, h_dn);
+                   h_gu, h_dn, 0);
 }
 
 int nntr_hvx_weight_swap_batch_u8i4_arena(
@@ -726,7 +742,7 @@ int nntr_hvx_weight_swap_batch_u2i4_arena(
   for (i = 0; i < n; ++i) {
     rc = swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
                    off_gu[i], off_dn[i], pal_gu + 4 * i, pal_dn + 4 * i, NULL,
-                   0, NULL, 0, NULL, 0, NULL, 0, &h_gu[i], &h_dn[i]);
+                   0, NULL, 0, NULL, 0, NULL, 0, &h_gu[i], &h_dn[i], 0);
     if (rc != AEE_SUCCESS) {
       *err = rc;
       break;
@@ -734,6 +750,36 @@ int nntr_hvx_weight_swap_batch_u2i4_arena(
     *n_done = (uint32)(i + 1);
   }
   return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
+int nntr_hvx_weight_swap_batch_tl2_compact_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, uint32 *h_gu, int h_guLen, uint32 *h_dn,
+  int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  if (!handle || !n_done || !err)
+    return AEE_EBADPARM;
+  *n_done = 0u;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (n &&
+       (!old_gu || !old_dn || !arena || !off_gu || !off_dn || !h_gu || !h_dn)))
+    return AEE_EBADPARM;
+  for (int i = 0; i < n; ++i) {
+    const int rc =
+      swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+                off_gu[i], off_dn[i], NULL, NULL, NULL, 0, NULL, 0, NULL, 0,
+                NULL, 0, &h_gu[i], &h_dn[i], 1);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_weight_register_u2i4_arena(remote_handle64 handle, uint32 K,
@@ -2247,6 +2293,7 @@ int nntr_hvx_weights_tl2(remote_handle64 handle, const uint32 *handles,
       return AEE_EBADPARM;
     const hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
     if (!w->in_use || !w->borrowed || w->bits != 2u ||
+        (w->tl2_compact && !native) ||
         htp_tl2_native_bytes(w->K, w->N) > (uint64_t)w->K * w->N / 4u)
       return AEE_EBADPARM;
     if (!htp_tl2_palette_magnitude(w->pal))
