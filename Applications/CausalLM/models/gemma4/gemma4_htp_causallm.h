@@ -14,6 +14,7 @@
 #define __GEMMA4_HTP_CAUSAL_LM_H__
 
 #include <causal_lm.h>
+#include <map>
 #include <set>
 
 namespace causallm {
@@ -75,6 +76,14 @@ protected:
   unsigned int NUM_EXPERTS_PER_TOK = 0;
   unsigned int MOE_INTERMEDIATE_SIZE = 0;
   std::string MOE_LAYER_DTYPE;
+  /** nntr_config moe_layer_dtype_per_layer: {"28": "QS4CX_WH_AFFINE", ...}
+   *  overrides moe_layer_dtype for the listed layers (the rotated ternary
+   *  checkpoint keeps its last two MoE layers in the 4-bit container). */
+  std::map<int, std::string> MOE_LAYER_DTYPE_PER_LAYER;
+  std::string moeLayerDtype(int layer_id) const {
+    const auto it = MOE_LAYER_DTYPE_PER_LAYER.find(layer_id);
+    return it == MOE_LAYER_DTYPE_PER_LAYER.end() ? MOE_LAYER_DTYPE : it->second;
+  }
   std::string MOE_ENGINE = "cpu";
   std::set<int> MOE_HTP_LAYERS;
   unsigned int MOE_CACHE_EXPERTS = 0;

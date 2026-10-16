@@ -51,15 +51,24 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
       ATTENTION_ENGINE != "htp")
     throw std::invalid_argument(
       "Gemma4 htp_fused has an unsupported attention_engine");
-  if ((MOE_LAYER_DTYPE == "QS2CX_WH" || MOE_LAYER_DTYPE == "QS4CX_WH" ||
-       MOE_LAYER_DTYPE == "TL2CX_WH") &&
-      (MOE_ENGINE != "htp" || !MOE_HTP_LAYERS.empty()))
-    throw std::invalid_argument(
-      "HTP WH expert weights require every expert layer on HTP");
-  if (MOE_LAYER_DTYPE != "FP32" && MOE_LAYER_DTYPE != "Q4_0" &&
-      MOE_LAYER_DTYPE != "QS4CX" && MOE_LAYER_DTYPE != "QS2CX_WH" &&
-      MOE_LAYER_DTYPE != "QS4CX_WH" && MOE_LAYER_DTYPE != "TL2CX_WH")
-    throw std::invalid_argument("Unsupported Gemma4 htp_fused expert dtype");
+  std::set<std::string> moe_dtypes = {MOE_LAYER_DTYPE};
+  for (const auto &[layer, dtype] : MOE_LAYER_DTYPE_PER_LAYER) {
+    if (layer < 0 || layer >= static_cast<int>(NUM_LAYERS))
+      throw std::invalid_argument(
+        "moe_layer_dtype_per_layer names a layer outside the model");
+    moe_dtypes.insert(dtype);
+  }
+  for (const auto &dtype : moe_dtypes) {
+    if ((dtype == "QS2CX_WH" || dtype == "QS4CX_WH" || dtype == "TL2CX_WH" ||
+         dtype == "QS4CX_WH_AFFINE") &&
+        (MOE_ENGINE != "htp" || !MOE_HTP_LAYERS.empty()))
+      throw std::invalid_argument(
+        "HTP WH expert weights require every expert layer on HTP");
+    if (dtype != "FP32" && dtype != "Q4_0" && dtype != "QS4CX" &&
+        dtype != "QS2CX_WH" && dtype != "QS4CX_WH" && dtype != "TL2CX_WH" &&
+        dtype != "QS4CX_WH_AFFINE")
+      throw std::invalid_argument("Unsupported Gemma4 htp_fused expert dtype");
+  }
   for (const auto &dtype : {EMBEDDING_DTYPE, FC_LAYER_DTYPE, LMHEAD_DTYPE})
     if (dtype != "FP32" && dtype != "Q4_0" && dtype != "QS4CX" &&
         dtype != "QS4CX_WH" && dtype != "QS4CX_WH_AFFINE")

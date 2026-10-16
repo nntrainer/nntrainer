@@ -184,6 +184,7 @@ that matter:
 | `gemma4_execution_profile` | `htp_fused` | selects the fused HTP model instead of the default Gemma4 model |
 | `gemma4_weight_format` | `htp_fused_v1` | the only layout the loader accepts |
 | `moe_layer_dtype` / `fc_layer_dtype` | `QS2CX_WH` / `QS4CX` | expert and dense weight formats |
+| `moe_layer_dtype_per_layer` | `{"28": "QS4CX_WH_AFFINE", "29": "QS4CX_WH_AFFINE"}` | optional; overrides `moe_layer_dtype` for the listed MoE layers (the rotated ternary checkpoint keeps layers 28 and 29 in the 4-bit affine container, the rest `TL2CX_WH`) |
 | `embedding_dtype` / `lmhead_dtype` | `Q4_0` | embedding table and head; an untied head (`tie_word_embeddings: false` in `config.json`) may be `QS4CX`, and then runs on the DSP as WH slices for both the prefill's last row and decode; the slices are cached beside the model as `<model file>.lmhead_wh` after the first load (delete it after re-quantizing the head) |
 | `attention_kv_dtype` | `q8` | int8 KV cache (required) |
 | `moe_engine`, `attention_engine`, `attn_proj_engine`, `dense_ffn_engine` | `htp` | which blocks run on the DSP |
