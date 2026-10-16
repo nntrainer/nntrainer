@@ -742,7 +742,7 @@ done
 # definitions are checked against the IDL too -- a mismatch fails here.
 python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
-  -I "$OUT" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/swap_host_check" \
   "$HERE/swap_host_check.c" "$HERE/../nntr_hvx_mm_u8i4.c" \

@@ -519,7 +519,7 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
   m1_router_softmax_pick(acc, pes, E, top_k, sel, weight);
 }
 
-/* Storage only: every arithmetic step below remains FP32. Enabled on the
+/** Storage only: every arithmetic step below remains FP32. Enabled on the
    measured v81 target; other targets retain FP32 unless opted in. */
 #ifndef NNTR_ROUTER_BF16_IF_EXACT
 #if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ == 81
@@ -546,7 +546,7 @@ hvx_router_sm_weights *hvx_router_sm_weights_create(const float *w, uint32_t K,
   }
   uint32_t bf16 = 0u;
 #if NNTR_ROUTER_BF16_IF_EXACT
-  /* Check raw bits in vectors: neither eligibility nor packing performs
+  /** Check raw bits in vectors: neither eligibility nor packing performs
      a floating-point conversion. Avoid a scalar scan of every weight on
      the first decode token, when all router matrices are registered. */
   const HVX_Vector low = Q6_V_vsplat_R(0xFFFF);
@@ -637,7 +637,7 @@ static void router_sm_bf16_lane(uint32_t n, uint32_t i, void *v) {
   const uint32_t block_rows = 2u * ROUTER_PF_ROWS;
   HVX_Vector identity = Q6_V_vsplat_R(-1);
 #if defined(__hexagon__)
-  /* Make this integer identity opaque once, outside the hot loop. Its
+  /** Make this integer identity opaque once, outside the hot loop. Its
      AND below requires FP32 bits between the pair's two terms, so the
      compiler cannot keep that intermediate in qf32. */
   __asm__("" : "+v"(identity));

@@ -166,7 +166,7 @@ static int graph_moe_rows(hexkl_graph *g, const hexkl_graph_env *env,
   return rc;
 }
 
-/*
+/**
  * Post the miss, compute the resident experts while the owner reads the
  * rest, then compute the arrived experts. Each set writes one weighted
  * row per expert (0 + w * res). Adding these rows at scale 1 in the original
@@ -233,7 +233,7 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   if (rc == AEE_SUCCESS && g->dense_early != 0u) {
     rc = graph_dense_early(g, op_i, call);
   }
-  /* the wait comes even after a failure: the answer must not land on a
+  /** the wait comes even after a failure: the answer must not land on a
      later round's page */
   {
     const int wrc = env->miss.wait(env->miss.ctx, g, op_i);
@@ -1311,7 +1311,7 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
       return AEE_ESCHEMENOTSUPPORTED;
     }
     if (g->ops[op].eps_bits != 0u) {
-      /* Construct before replacing: a failed allocation leaves the old
+      /** Construct before replacing: a failed allocation leaves the old
          router valid. The owned header and payload share one free. */
       hvx_router_sm_weights *packed = hvx_router_sm_weights_create(data, K, E);
       if (packed == NULL) {
@@ -1435,7 +1435,7 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
   }
   const int timed = !NNTR_GRAPH_PROFILE_ON_DEMAND || g->attn_prof_on != 0u ||
                     env->miss.post == NULL;
-  /* Also clear after a profiled token: disabled, skipped and failed ops
+  /** Also clear after a profiled token: disabled, skipped and failed ops
      must never report the previous forward's measurements. */
   memset(g->op_pcycles, 0, sizeof(g->op_pcycles));
   memset(g->op_qt, 0, sizeof(g->op_qt));

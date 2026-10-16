@@ -410,7 +410,7 @@ int main(void) {
     CHECK(done == 0 && live() == 2);
   }
 
-  /* Compact native metadata lives before the legacy WH2 tail. Fresh and
+  /** Compact native metadata lives before the legacy WH2 tail. Fresh and
      reused slots must agree, and a truncated down span must leave GU intact. */
   {
     enum { CK = 256, CI = 128, CN = 256, CAP = 32768 };

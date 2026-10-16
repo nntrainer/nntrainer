@@ -1,4 +1,3 @@
-#include "htp_tl2_opts.h"
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
@@ -35,6 +34,7 @@
 #include "hexkl_graph.h"
 #include "hexkl_token.h"
 #include "htp_graph_desc.h"
+#include "htp_tl2_opts.h"
 #include <AEEStdErr.h>
 #include <pthread.h>
 #include <sched.h>
@@ -421,7 +421,7 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
     rc = hexkl_token_main(s.g, &s.env, page, t, t % s.g->max_seq, x, HID,
                           t % 2u ? logits : NULL, VOCAB, SPIN_US, &st, &id);
     const uint64_t elapsed_ns = now_ns() - t0;
-    /* Per-op counters cover only requested tokens in the default build.
+    /** Per-op counters cover only requested tokens in the default build.
        Keep alternating profiling so its output invariance stays tested. */
 #if !defined(NNTR_GRAPH_PROFILE_ON_DEMAND) || NNTR_GRAPH_PROFILE_ON_DEMAND
     if (s.g->attn_prof_on)
