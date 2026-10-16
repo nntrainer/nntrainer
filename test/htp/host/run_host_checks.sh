@@ -362,6 +362,13 @@ graph_check() { # graph_check <graph.c> <exe> [m1_ops.c] [profile_on_demand]
     "$BACKEND/hvx/hvx_scale_add_f32.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
 }
 graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
+  -Wno-format-truncation -ffp-contract=off -pthread \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+  -I "$BACKEND/hvx" "$HERE/lfm2_router_check.c" \
+  "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
+  -lm -o "$OUT/lfm2_router_check"
+"$OUT/lfm2_router_check"
 "$OUT/graph_host_check"
 graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_always_profile_host_check" \
   "$BACKEND/hvx/hvx_m1_ops_f32.c" 0

@@ -57,10 +57,10 @@
  *  handles are not in its record: they are its HTP_GRAPH_PARAM_EXPERTS
  *  table (plan 201 S1, the expert pool's table). */
 #define HTP_GRAPH_MAX_EXPERTS 128u
-/** @brief A resident sigmoid ROUTER_TOPK's expert count: one vector of
+/** @brief A resident sigmoid ROUTER_TOPK's expert count: up to two vectors of
  *  lanes (hvx_router_topk_f32, LFM2). The softmax router (eps_bits set,
  *  plan 201 S4) takes HTP_GRAPH_MAX_EXPERTS. */
-#define HTP_GRAPH_ROUTER_MAX_EXPERTS 32u
+#define HTP_GRAPH_ROUTER_MAX_EXPERTS 64u
 /** @brief The op record's handle arrays: the Q4M1 kinds' parts. */
 #define HTP_GRAPH_MAX_PARTS                                                    \
   64u /**< 64: an untied lm_head's WH slices (vocab                            \
@@ -451,17 +451,28 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         the routing has no other consumer). #132 Part B's rules for
  *         the Q4M1 kinds: n_experts (the part count) at most 32 and feed
  *         0 or 1 (INVALIDFORMAT); [plan 201 S1] a resident sigmoid
- *         ROUTER_TOPK over more than 32 experts (SCHEMENOTSUPPORTED: its
+ *         ROUTER_TOPK over more than 64 experts (SCHEMENOTSUPPORTED: its
  *         vector width; [plan 201 S4] the softmax router takes 128, needs
  *         a valid eps and in_slot != out_slot, INVALIDFORMAT: it norms
  *         into its out slot); a resident Q4M1 kind needs K % 64 == 0 and K
  *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
- *         N <= 8192 -- the Q4M1 layout's pair and the quantizer's scratch
+ *         N <= 8192 (WH instead permits intermediate slices within its chunk
+ *         limit) -- the Q4M1 layout's pair and the quantizer's scratch
  *         (SCHEMENOTSUPPORTED). [plan 201 S4] INVALIDFORMAT for an ffn
  *         kind past DENSE_MOE, a QK_NORM feed bit other than V / K_EQ_V,
  *         an ADD multiplier or LM_HEAD soft-cap that is not a normal f32
  *         (the soft-cap also positive)
  */
+/** WH dense FFNs are split into equal intermediate slices by the host.
+ * Q4M1 keeps its single down projection and its 8192-column bound. */
+static inline int htp_graph_wh_dense_supported(uint32_t n) {
+  uint32_t width = n < 1792u ? n : 1792u;
+  for (; width >= 32u; width -= 32u)
+    if (n % width == 0u)
+      return n / width <= HTP_GRAPH_WH_DENSE_MAX_CHUNKS;
+  return 0;
+}
+
 static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
                                           uint32_t resident_ok,
                                           uint32_t *n_ops_out) {
@@ -581,7 +592,10 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
         return HTP_GRAPH_E_INVALIDFORMAT;
       if (op->resident != 0u &&
           (op->K % 64u != 0u || op->K > 8192u ||
-           (k == HTP_OP_DENSE_FFN && (op->N % 64u != 0u || op->N > 8192u))))
+           (k == HTP_OP_DENSE_FFN &&
+            (op->N % 64u != 0u || ((op->feed & HTP_GRAPH_FEED_WH) != 0u
+                                     ? !htp_graph_wh_dense_supported(op->N)
+                                     : op->N > 8192u)))))
         return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     }
     /* v2: the attention record, its in-layer order and the norm epsilon */

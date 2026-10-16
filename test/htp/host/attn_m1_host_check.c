@@ -1596,17 +1596,21 @@ static int8_t ref_q8(float x, float inv) {
 }
 
 /** @brief The ordinary int8-cache decode against scalar quantization and
- *         the fp16 attention specification. Cover both Gemma shapes, a
- *         partial tile, the sliding-window boundary and a 2048-token prompt.
- *         This catches rounding changes in Q scaling, decode KV append and
- *         the final per-dimension V scale, at all worker counts. Full GQA8
+ *         the fp16 attention specification. Cover both Gemma shapes and LFM2's
+ * 64-wide GQA4 heads, a partial tile, the sliding-window boundary and a
+ * 2048-token prompt. This catches rounding changes in Q scaling, decode KV
+ * append and the final per-dimension V scale, at all worker counts. Full GQA8
  *         also repeats the profiled call: its shared normalized P must be
  *         rebuilt, and dimension workers must stay within the output row. */
 static void check_gemma_q8(hvx_worker_pool *const pools[3]) {
   static const uint32_t lengths[] = {1u, 65u, 1024u, 1025u, 2176u};
   const int fail0 = g_fail;
-  for (uint32_t sh = 0; sh < 2u; ++sh) {
-    const uint32_t nk = G4[sh].n_kv, gqa = G4[sh].gqa, hd = G4[sh].hd;
+  for (uint32_t sh = 0; sh < 3u; ++sh) {
+    const uint32_t nk = sh == 2u ? 8u : G4[sh].n_kv;
+    const uint32_t gqa = sh == 2u ? 4u : G4[sh].gqa;
+    const uint32_t hd = sh == 2u ? 64u : G4[sh].hd;
+    const uint32_t window = sh == 2u ? 0u : G4[sh].window;
+    const float scale = sh == 2u ? 0.125f : 1.0f;
     const uint32_t nq = nk * gqa, row = nk * hd, qrow = nq * hd;
     for (size_t li = 0; li < sizeof(lengths) / sizeof(lengths[0]); ++li) {
       const uint32_t L = lengths[li];
@@ -1625,7 +1629,7 @@ static void check_gemma_q8(hvx_worker_pool *const pools[3]) {
       uint32_t bad = 0u;
       out[-1] = 37.25f;
       out[qrow] = -53.125f;
-      g4_fill(&rng, q, k, v, L, nk, gqa, hd, G4[sh].window);
+      g4_fill(&rng, q, k, v, L, nk, gqa, hd, window);
       for (uint32_t pi = 0; pi < 3u; ++pi) {
         int err = 0;
         hvx_attn_m1_ctx *ctx = hvx_attn_m1_create(
@@ -1637,8 +1641,8 @@ static void check_gemma_q8(hvx_worker_pool *const pools[3]) {
         }
         const size_t last = (size_t)(L - 1u) * row;
         int rc = hvx_attn_m1_kv_append(ctx, 0u, 0u, L - 1u, k, v);
-        rc |= hvx_attn_m1_forward(ctx, 0u, L - 1u, G4[sh].window, 1.0f, q,
-                                  k + last, v + last, out, stats);
+        rc |= hvx_attn_m1_forward(ctx, 0u, L - 1u, window, scale, q, k + last,
+                                  v + last, out, stats);
         CHECK(rc == AEE_SUCCESS, "q8 decode hd=%u L=%u rc=%d", hd, L, rc);
         if (pi == 0u) {
           for (uint32_t h = 0; h < nk; ++h) {
@@ -1658,8 +1662,8 @@ static void check_gemma_q8(hvx_worker_pool *const pools[3]) {
                 q[(size_t)hq * hd + d] * ctx->sk[(size_t)(hq / gqa) * hd + d];
             }
           }
-          attn_m1_det_forward_win(qr, kt, vv, nk, gqa, hd, G4_SEQ, L,
-                                  G4[sh].window, 1.0f, exps, ref, stats_ref);
+          attn_m1_det_forward_win(qr, kt, vv, nk, gqa, hd, G4_SEQ, L, window,
+                                  scale, exps, ref, stats_ref);
           for (uint32_t hq = 0; hq < nq; ++hq) {
             for (uint32_t d = 0; d < hd; ++d) {
               ref[(size_t)hq * hd + d] *= ctx->sv[(size_t)(hq / gqa) * hd + d];
@@ -1669,7 +1673,7 @@ static void check_gemma_q8(hvx_worker_pool *const pools[3]) {
         bad += count_bad(out, ref, qrow) + count_bad(stats, stats_ref, 2u * nq);
         if (sh == 1u) {
           uint32_t prof[ATTN_M1_PROF_WORDS];
-          rc = hvx_attn_m1_forward_prof(ctx, 0u, L - 1u, G4[sh].window, 1.0f, q,
+          rc = hvx_attn_m1_forward_prof(ctx, 0u, L - 1u, window, scale, q,
                                         k + last, v + last, out, stats, prof);
           CHECK(rc == AEE_SUCCESS, "q8 repeat hd=%u L=%u rc=%d", hd, L, rc);
           bad +=

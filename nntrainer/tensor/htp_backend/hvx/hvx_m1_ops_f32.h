@@ -171,17 +171,17 @@ void hvx_mul_scalar_f32(float *x, float s, uint32_t n);
  *        weights.
  *
  * The logits are E fused chains over k in order, run on the scalar cores
- * with sffma, 8 register-resident chains per pool lane (so up to 4 lanes
- * at E = 32); the rest is the spec's own m1_router_cpu_sigmoid (in the lanes)
+ * with sffma, 8 register-resident chains per pool lane (so up to 8 lanes
+ * at E = 64); the rest is the spec's own m1_router_cpu_sigmoid (in the lanes)
  * and m1_router_cpu_pick. The weight read (K x 128 B, 256 KiB at LFM2.5) keeps
  * an l2fetch of the next 16 KiB ahead -- a hint that moves no bits.
  *
  * @param x       K floats
- * @param w32     K x 32 floats: the [K][E] gate weight padded to 32 columns
+ * @param w32     K x round_up(E,32) floats: the padded [K][E] gate weight
  *                (lanes >= E are read and ignored), 8-byte aligned
  * @param bias    E floats
  * @param K       >= 1
- * @param E       1..32
+ * @param E       1..64
  * @param top_k   1..E
  * @param logits  E floats out
  * @param sel     top_k expert indices out, in selection order

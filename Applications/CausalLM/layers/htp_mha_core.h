@@ -135,10 +135,11 @@ public:
 };
 
 /**
- * @brief KvCacheQuant: "" (off), "q8" or "q4". Keep an int8 / int4 mirror
- *        of this layer's KV cache on the accelerator and run attention
- *        over it (ComputeOps::sdpa_q_kvcache) instead of over the fp16
- *        cache. The fp16 cache stays the source of truth.
+ * @brief KvCacheQuant: "" (off), "q8", "q8_row" or "q4". Keep an int8 / int4
+ * mirror of this layer's KV cache on the accelerator and run attention over it
+ * (ComputeOps::sdpa_q_kvcache) instead of over the fp16 cache. q8_row selects
+ * per-row scales for prefill rather than the fixed-scale row-blocked kernel.
+ * The fp16 cache stays the source of truth.
  */
 class KvCacheQuant final : public nntrainer::Property<std::string> {
 public:
@@ -456,8 +457,9 @@ private:
    * everything and this layer stays on the fp16 path for good: the CPU/fp16
    * result is always available.
    */
-  int kv_cache_quant_kind = -1; /**< -1 off, 0 int8, 1 int4 */
-  bool attn_out_u16 = false;    /**< htp_mha_props::AttnOutU16 */
+  int kv_cache_quant_kind = -1;      /**< -1 off, 0 int8, 1 int4 */
+  bool kv_cache_fixed_scales = true; /**< q8_row uses per-row scales */
+  bool attn_out_u16 = false;         /**< htp_mha_props::AttnOutU16 */
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;
   bool q_cache_failed = false;

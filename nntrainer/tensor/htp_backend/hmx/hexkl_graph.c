@@ -1301,11 +1301,10 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     return AEE_EINVALIDFORMAT;
   }
   if (which == HTP_GRAPH_PARAM_ROUTER_W) {
-    /** [K][E] padded to [K][W], zero lanes: one vector a row for the
-       sigmoid router, E rounded up to 32 for the softmax one */
+    /** [K][E] padded to [K][W], zero lanes, with E rounded up to
+       32 for either sigmoid or softmax routing */
     const uint32_t K = g->ops[op].K, E = g->ops[op].n_experts;
-    const uint32_t W = g->ops[op].eps_bits != 0u ? (E + 31u) / 32u * 32u
-                                                 : HTP_GRAPH_ROUTER_MAX_EXPERTS;
+    const uint32_t W = (E + 31u) / 32u * 32u;
     uint32_t k;
     if (E > W) { /* the sigmoid router's width (htp_graph_desc.h) */
       return AEE_ESCHEMENOTSUPPORTED;

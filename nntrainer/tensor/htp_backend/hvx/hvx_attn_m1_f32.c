@@ -1598,6 +1598,33 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
+  /* LFM2's 64-wide heads occupy half an int8 vector. Load only that
+     half, and keep the same fp16 probability/value arithmetic as the
+     full-vector path. hd / VLEN is zero for this geometry. */
+  if (hd == CH) {
+    HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
+    for (uint32_t r = lo; r < L; ++r) {
+      HVX_Vector bytes = Q6_V_vzero();
+      memcpy(&bytes, vr + (size_t)r * hd, CH);
+      const HVX_Vector v = Q6_Vhf_equals_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(bytes)));
+      o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(p[0][r]), v, one);
+      if (ng > 1u)
+        o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(p[1][r]), v, one);
+      if (ng > 2u)
+        o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(p[2][r]), v, one);
+      if (ng > 3u)
+        o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(p[3][r]), v, one);
+    }
+    const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
+    for (uint32_t g = 0; g < ng; ++g)
+      store_scaled_q8(job->out + (size_t)(hq0 + g) * hd, o[g], sv);
+    if (ps) {
+      const uint64_t now = HAP_perf_get_pcycles();
+      ps->pv += (uint32_t)(now - *t);
+      *t = now;
+    }
+    return;
+  }
   /** [#282 E] the PV single walk (760bcaf30) for the int8 cache: two q
      heads x a 256-wide row (Gemma's sliding layers) are 8 chains, one walk
      over the V rows instead of two */
