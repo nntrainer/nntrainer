@@ -216,6 +216,21 @@ test('unittest_memory_pool', unittest_memory_pool_exe,
   suite: 'unittests'
 )
 
+# qnn_graph_buffer.h is SDK-free, so this runs without enable-npu.
+unittest_qnn_graph_buffer_exe = executable(
+  'unittest_qnn_graph_buffer',
+  'unittest_qnn_graph_buffer.cpp',
+  include_directories: include_directories('..' / '..' / 'nntrainer' / 'qnn' / 'jni'),
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_qnn_graph_buffer', unittest_qnn_graph_buffer_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_qnn_graph_buffer')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
