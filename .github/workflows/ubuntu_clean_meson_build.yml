@@ -27,6 +27,10 @@ jobs:
         # off by default and was otherwise only compiled by the nightly
         # build, so a regression there was invisible to PR CI).
         meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true", "-Denable-fp16=true -Dfp16-impl=wrapper", "-Denable-fp16=false -Denable-fsu=true" ]
+        include:
+          # Native aarch64: the only leg that executes the ARM NEON FP16 kernels.
+          - os: ubuntu-22.04-arm
+            meson_options: "-Denable-fp16=true"
 
     steps:
     - uses: actions/checkout@v4
@@ -75,7 +79,7 @@ jobs:
           --buildtype=plain \
           --prefix=/usr \
           --sysconfdir=/etc \
-          --libdir=lib/x86_64-linux-gnu \
+          --libdir=lib/$(gcc -dumpmachine) \
           --bindir=lib/nntrainer/bin \
           --includedir=include \
           -Dinstall-app=true \

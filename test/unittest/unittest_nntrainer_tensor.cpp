@@ -705,6 +705,91 @@ TEST(nntrainer_Tensor, QS4CXQuantizer_04_n) {
   EXPECT_THROW(quantizer->dequantize(input, nntrainer::Tdatatype::FP32),
                std::invalid_argument);
 }
+
+/**
+ * @brief An FP32 activation times a QS4CX weight accumulates into the output:
+ *        beta scales what the output already held, element by element, and
+ *        with beta = 0 the output is not read at all.
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp32_activation_beta_p) {
+  const unsigned int K = 16;
+  const unsigned int N = 8;
+  const float beta = 0.5f;
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxSource(K, N), nntrainer::Tdatatype::QS4CX);
+
+  // M == 1 takes the GEMV kernel on Arm and M > 1 the GEMM one.
+  for (unsigned int M : {1u, 2u}) {
+    nntrainer::Tensor a(1, 1, M, K);
+    for (unsigned int m = 0; m < M; ++m)
+      for (unsigned int k = 0; k < K; ++k)
+        a.setValue(0, 0, m, k,
+                   0.5f + 0.5f * std::sin(0.9f * static_cast<float>(k) +
+                                          2.3f * static_cast<float>(m)));
+
+    nntrainer::Tensor plain(1, 1, M, N);
+    plain.setValue(std::numeric_limits<float>::quiet_NaN());
+    a.dot(q, plain, false, false, 0.0f);
+
+    auto previous = [](unsigned int m, unsigned int n) {
+      return 0.25f * static_cast<float>(m * N + n) - 1.0f;
+    };
+    nntrainer::Tensor accumulated(1, 1, M, N);
+    for (unsigned int m = 0; m < M; ++m)
+      for (unsigned int n = 0; n < N; ++n)
+        accumulated.setValue(0, 0, m, n, previous(m, n));
+    a.dot(q, accumulated, false, false, beta);
+
+    bool any_nonzero = false;
+    for (unsigned int m = 0; m < M; ++m) {
+      for (unsigned int n = 0; n < N; ++n) {
+        const float base = plain.getValue<float>(0, 0, m, n);
+        const float expected = base + beta * previous(m, n);
+        ASSERT_TRUE(std::isfinite(base))
+          << " at M=" << M << ", m=" << m << ", n=" << n;
+        any_nonzero = any_nonzero || base != 0.0f;
+        EXPECT_NEAR(accumulated.getValue<float>(0, 0, m, n), expected,
+                    1e-5f * (1.0f + std::fabs(expected)))
+          << " at M=" << M << ", m=" << m << ", n=" << n;
+      }
+    }
+    EXPECT_TRUE(any_nonzero) << " at M=" << M;
+  }
+}
+
+/**
+ * @brief A QS4CX weight whose payload was dropped is refused, and the output
+ *        to accumulate into is left as it was.
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp32_activation_dropped_payload_n) {
+  const unsigned int M = 2;
+  const unsigned int K = 16;
+  const unsigned int N = 8;
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxSource(K, N), nntrainer::Tdatatype::QS4CX);
+
+  nntrainer::Tensor a(1, 1, M, K);
+  a.setValue(1.0f);
+  nntrainer::Tensor out(1, 1, M, N);
+  out.setValue(3.0f);
+
+  const uint8_t *base = q.getData<uint8_t>();
+  nntrainer::markQs4cxPayloadDropped(base, q.bytes());
+  EXPECT_THROW(a.dot(q, out, false, false, 1.0f), std::runtime_error);
+  nntrainer::unmarkQs4cxPayloadDropped(base);
+
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int n = 0; n < N; ++n)
+      EXPECT_EQ(out.getValue<float>(0, 0, m, n), 3.0f)
+        << " at m=" << m << ", n=" << n;
+}
+
 /**
  * @brief Per Tensor Quantized Tensor (unsigned 32-bit integer)
  */
