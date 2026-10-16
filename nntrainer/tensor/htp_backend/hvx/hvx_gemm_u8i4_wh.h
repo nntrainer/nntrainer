@@ -93,6 +93,12 @@ void hvx_gemv_u8i4_wh_3col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
                                 const uint8_t *wh, uint32_t plane_bytes,
                                 uint32_t n_col, uint32_t nt, int32_t *out);
 
+/** @brief Four M=1 projections with the same layout and alignment contract
+ * as hvx_gemv_u8i4_wh_3col_nopf. Writes four 32-column int32 tiles. */
+void hvx_gemv_u8i4_wh_4col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out);
+
 /**
  * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)
  *        over all @a k_tiles: n_tiles*512 bytes every n_col*512, k_tiles

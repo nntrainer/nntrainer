@@ -419,7 +419,13 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
     t0 = now_ns();
     rc = hexkl_token_main(s.g, &s.env, page, t, t % s.g->max_seq, x, HID,
                           t % 2u ? logits : NULL, VOCAB, SPIN_US, &st, &id);
-    wall_ns += now_ns() - t0;
+    const uint64_t elapsed_ns = now_ns() - t0;
+    /* Per-op counters cover only requested tokens in the default build.
+       Keep alternating profiling so its output invariance stays tested. */
+#if !defined(NNTR_GRAPH_PROFILE_ON_DEMAND) || NNTR_GRAPH_PROFILE_ON_DEMAND
+    if (s.g->attn_prof_on)
+#endif
+      wall_ns += elapsed_ns;
     if (rc != AEE_SUCCESS) {
       CHECK(0, "token %u: 0x%x", t, (unsigned)rc);
       break;
@@ -618,6 +624,8 @@ static void check_pool(const uint32_t *words, uint32_t n) {
 
   reference(words, n, ref_logits, ref_id);
   open_session(&s, words, n);
+  /* This fixture checks every miss wait against its enclosing op timer. */
+  s.g->attn_prof_on = 1u;
   memset(&o, 0, sizeof(o));
   o.page = new_page();
   set_pool(&s, &o, 2u); /* experts 0 and 1 of each layer */

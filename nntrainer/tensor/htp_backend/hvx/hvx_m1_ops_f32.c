@@ -31,7 +31,11 @@
 
 #include "hvx_m1_ops_f32.h"
 
+#include <stdlib.h>
 #include <string.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
@@ -513,6 +517,190 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
   hvx_worker_pool_run(pool, router_sm_lane, &c, Ep / LANES);
   memcpy(logits, acc, (size_t)E * sizeof(float));
   m1_router_softmax_pick(acc, pes, E, top_k, sel, weight);
+}
+
+/* Storage only: every arithmetic step below remains FP32. Enabled on the
+   measured v81 target; other targets retain FP32 unless opted in. */
+#ifndef NNTR_ROUTER_BF16_IF_EXACT
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ == 81
+#define NNTR_ROUTER_BF16_IF_EXACT 1
+#else
+#define NNTR_ROUTER_BF16_IF_EXACT 0
+#endif
+#endif
+
+_Static_assert(sizeof(hvx_router_sm_weights) == 128u,
+               "router weight payload must remain vector aligned");
+
+hvx_router_sm_weights *hvx_router_sm_weights_create(const float *w, uint32_t K,
+                                                    uint32_t E) {
+  if (!w || K == 0u || E == 0u || E > M1_DET_ROUTER_SM_MAX_E ||
+      K == UINT32_MAX) {
+    return NULL;
+  }
+  const uint32_t Ep = (E + LANES - 1u) / LANES * LANES;
+  const uint32_t Kp = (K + 1u) & ~1u;
+  const uint64_t count = (uint64_t)K * E;
+  if (count > SIZE_MAX / sizeof(float)) {
+    return NULL;
+  }
+  uint32_t bf16 = 0u;
+#if NNTR_ROUTER_BF16_IF_EXACT
+  /* Check raw bits in vectors: neither eligibility nor packing performs
+     a floating-point conversion. Avoid a scalar scan of every weight on
+     the first decode token, when all router matrices are registered. */
+  const HVX_Vector low = Q6_V_vsplat_R(0xFFFF);
+  const HVX_Vector exponent = Q6_V_vsplat_R(0x7F800000);
+  const HVX_Vector zero = Q6_V_vzero();
+  HVX_Vector bad = zero;
+  size_t i = 0;
+  for (; i + LANES <= (size_t)count; i += LANES) {
+    const HVX_Vector bits = *(const HVX_UVector *)(w + i);
+    const HVX_VectorPred nonfinite =
+      Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(bits, exponent), exponent);
+    bad = Q6_V_vor_VV(bad, Q6_V_vand_VV(bits, low));
+    bad = Q6_V_vor_VV(bad, Q6_V_vmux_QVV(nonfinite, low, zero));
+  }
+  for (uint32_t rot = 64u; rot >= 4u; rot >>= 1u)
+    bad = Q6_V_vor_VV(bad, Q6_V_vror_VR(bad, (int)rot));
+  bf16 = Q6_R_vextract_VR(bad, 0) == 0;
+  for (; bf16 && i < (size_t)count; ++i) {
+    uint32_t bits;
+    memcpy(&bits, w + i, sizeof(bits));
+    if ((bits & 0xFFFFu) != 0u || (bits & 0x7F800000u) == 0x7F800000u)
+      bf16 = 0u;
+  }
+#endif
+  const uint64_t bytes = sizeof(hvx_router_sm_weights) +
+                         (uint64_t)(bf16 ? Kp : K) * Ep * (bf16 ? 2u : 4u);
+  if (bytes > SIZE_MAX) {
+    return NULL;
+  }
+  hvx_router_sm_weights *dst =
+    (hvx_router_sm_weights *)memalign(128, (size_t)bytes);
+  if (!dst) {
+    return NULL;
+  }
+  memset(dst, 0, sizeof(*dst));
+  dst->K = K;
+  dst->E = E;
+  dst->Ep = Ep;
+  dst->Kp = Kp;
+  dst->bf16 = bf16;
+  if (!bf16) {
+    hvx_router_sm_pack_f32((float *)(dst + 1), w, K, E);
+    return dst;
+  }
+  uint16_t *data = (uint16_t *)(dst + 1);
+  for (uint32_t b = 0; b < Ep / LANES; ++b) {
+    if (E - b * LANES >= LANES) {
+      for (uint32_t k = 0; k < Kp; k += 2u) {
+        const HVX_Vector row0 =
+          *(const HVX_UVector *)(w + (size_t)k * E + b * LANES);
+        const HVX_Vector row1 =
+          k + 1u < K
+            ? *(const HVX_UVector *)(w + (size_t)(k + 1u) * E + b * LANES)
+            : Q6_V_vzero();
+        *(HVX_Vector *)(data + ((size_t)b * Kp + k) * LANES) =
+          Q6_Vh_vpacke_VwVw(Q6_Vuw_vlsr_VuwR(row1, 16),
+                            Q6_Vuw_vlsr_VuwR(row0, 16));
+      }
+      continue;
+    }
+    for (uint32_t k = 0; k < Kp; ++k) {
+      for (uint32_t j = 0; j < LANES; ++j) {
+        const uint32_t e = b * LANES + j;
+        uint32_t bits = 0u;
+        if (k < K && e < E) {
+          memcpy(&bits, w + (size_t)k * E + e, sizeof(bits));
+        }
+        data[((size_t)b * Kp + k) * LANES + j] = (uint16_t)(bits >> 16);
+      }
+    }
+  }
+  return dst;
+}
+
+typedef struct {
+  const float *x;
+  const hvx_router_sm_weights *w;
+  float *acc;
+} router_sm_bf16_ctx;
+
+/** @brief Two adjacent K rows share one aligned 128-byte BF16 load.
+ *  Interleaving zero halfwords reconstructs the original FP32 bits. Each expert
+ *  retains its k-ascending, separately rounded multiply/add chain. */
+static void router_sm_bf16_lane(uint32_t n, uint32_t i, void *v) {
+  const router_sm_bf16_ctx *c = (const router_sm_bf16_ctx *)v;
+  const hvx_router_sm_weights *w = c->w;
+  const uint16_t *data = (const uint16_t *)(w + 1);
+  const uint32_t block_rows = 2u * ROUTER_PF_ROWS;
+  HVX_Vector identity = Q6_V_vsplat_R(-1);
+#if defined(__hexagon__)
+  /* Make this integer identity opaque once, outside the hot loop. Its
+     AND below requires FP32 bits between the pair's two terms, so the
+     compiler cannot keep that intermediate in qf32. */
+  __asm__("" : "+v"(identity));
+#endif
+  for (uint32_t b = i; b < w->Ep / LANES; b += n) {
+    const uint16_t *col = data + (size_t)b * w->Kp * LANES;
+    HVX_Vector acc = Q6_V_vzero();
+    const uint32_t initial_rows =
+      w->Kp < 2u * block_rows ? w->Kp : 2u * block_rows;
+    router_sm_l2fetch((const float *)col, LANES, initial_rows / 2u);
+    for (uint32_t k0 = 0; k0 < w->K; k0 += block_rows) {
+      const uint32_t k1 = k0 + block_rows < w->K ? k0 + block_rows : w->K;
+      if (k0 != 0u && k1 < w->K) {
+        const uint32_t rows = w->Kp - k1 < block_rows ? w->Kp - k1 : block_rows;
+        router_sm_l2fetch((const float *)(col + (size_t)k1 * LANES), LANES,
+                          rows / 2u);
+      }
+      const uint32_t pairs = (k1 - k0) / 2u;
+      for (uint32_t p = 0; p < pairs; ++p) {
+        const uint32_t k = k0 + 2u * p;
+        const HVX_VectorPair pair = Q6_W_vshuff_VVR(
+          *(const HVX_Vector *)(col + (size_t)k * LANES), Q6_V_vzero(), -2);
+        acc = Q6_Vsf_vadd_VsfVsf(
+          acc, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]), Q6_V_lo_W(pair)));
+        acc = Q6_V_vand_VV(acc, identity);
+        HVX_Vector product =
+          Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k + 1u]), Q6_V_hi_W(pair));
+        product = Q6_V_vand_VV(product, identity);
+        acc = Q6_Vsf_vadd_VsfVsf(acc, product);
+      }
+      const uint32_t k = k0 + 2u * pairs;
+      if (k < k1) {
+        const HVX_VectorPair pair = Q6_W_vshuff_VVR(
+          *(const HVX_Vector *)(col + (size_t)k * LANES), Q6_V_vzero(), -2);
+        acc = Q6_Vsf_vadd_VsfVsf(
+          acc, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]), Q6_V_lo_W(pair)));
+      }
+    }
+    *(HVX_UVector *)(c->acc + (size_t)b * LANES) = acc;
+  }
+}
+
+void hvx_router_softmax_topk_owned_f32(const float *x,
+                                       const hvx_router_sm_weights *w,
+                                       const float *pes, uint32_t top_k,
+                                       float *logits, uint32_t *sel,
+                                       float *weight, hvx_worker_pool *pool) {
+  if (!w) {
+    return;
+  }
+  if (!w->bf16) {
+    hvx_router_softmax_topk_f32(x, (const float *)(w + 1), pes, w->K, w->E,
+                                top_k, logits, sel, weight, pool);
+    return;
+  }
+  if (!x || !pes || !logits || !sel || !weight || top_k == 0u || top_k > w->E) {
+    return;
+  }
+  float acc[M1_DET_ROUTER_SM_MAX_E];
+  router_sm_bf16_ctx c = {x, w, acc};
+  hvx_worker_pool_run(pool, router_sm_bf16_lane, &c, w->Ep / LANES);
+  memcpy(logits, acc, (size_t)w->E * sizeof(float));
+  m1_router_softmax_pick(acc, pes, w->E, top_k, sel, weight);
 }
 
 /* ---- [#132 Part B E5f] SwiGLU over the pool, argmax in one vector pass -- */

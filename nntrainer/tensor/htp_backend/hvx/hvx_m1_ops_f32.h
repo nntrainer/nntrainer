@@ -224,4 +224,28 @@ void hvx_router_softmax_topk_f32(const float *x, const float *wp,
  */
 void hvx_router_sm_pack_f32(float *dst, const float *w, uint32_t K, uint32_t E);
 
+/** @brief Owned softmax-router weight: a 128-byte header followed by
+ *  block-major data. bf16 is set only when every source value is finite
+ *  and has zero low 16 bits. Kp pads BF16 rows to an even count. One free
+ *  releases the header and payload; no source pointer is retained. */
+typedef struct {
+  uint32_t K, E, Ep, Kp;
+  uint32_t bf16;
+  uint32_t reserved[27];
+} hvx_router_sm_weights;
+
+/** @brief Allocate and pack a router weight, or return NULL. The optional
+ *  NNTR_ROUTER_BF16_IF_EXACT path stores exact BF16 bits and retains the
+ *  FP32 payload otherwise. Registration still accepts K x E FP32 values. */
+hvx_router_sm_weights *hvx_router_sm_weights_create(const float *w, uint32_t K,
+                                                    uint32_t E);
+
+/** @brief The same FP32 multiply/add chains and selection as the original
+ *  router, using the owned weight's lossless storage format. */
+void hvx_router_softmax_topk_owned_f32(const float *x,
+                                       const hvx_router_sm_weights *w,
+                                       const float *pes, uint32_t top_k,
+                                       float *logits, uint32_t *sel,
+                                       float *weight, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */

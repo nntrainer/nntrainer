@@ -52,6 +52,7 @@
 #include <htp_context.h>
 #include <htp_dspq_wire.h>
 #include <htp_expert_prefetch.h>
+#include <htp_expert_read_pool.h>
 #include <htp_fixed_opts.h>
 #include <htp_graph_desc.h>
 #include <htp_moe_opts.h>
@@ -59,6 +60,7 @@
 #include <htp_q4_0_convert.h>
 #include <htp_router_predict.h>
 #include <htp_rpcmem.h>
+#include <htp_token_completion.h>
 #include <htp_wh_layout.h>
 #include <htp_wh_palette.h>
 #include <m1_ops_det.h>
@@ -1212,6 +1214,7 @@ public:
       pool_prefetch_->drain();
     cpu_predictor_.reset();
     pool_prefetch_.reset();
+    demand_read_pool_.reset();
     {
       std::lock_guard<std::mutex> lock(prefetch_mutex_);
       prefetch_stop_ = true;
@@ -4048,31 +4051,50 @@ public:
     pf_cv_.notify_all();
   }
 
-  /** [plan 201 S1] The pool server: a thread that, while a token is in
-   *  flight, polls the page's request word and answers each miss round.
-   *  ponytail: it spins (with a yield) on one ARM core for the whole token,
-   *  ~20 ms at LFM's rate, whether or not a miss comes; a sleep between
-   *  polls is the upgrade if a reading says the core is wanted. */
+  /** @brief A completion hint is optional: older skeletons leave it zero. */
+  static bool serverDoneEnabled() {
+    static const bool enabled = [] {
+      const char *v = std::getenv("NNTR_MOE_SERVER_DONE");
+      return v && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  /** [plan 201 S1] Answer miss rounds until the DSP finishes the token.
+   *  The optional completion hint parks the server before DSPQ reception,
+   *  so a server on the caller's core cannot delay the caller's wakeup. */
   void poolServe() {
     PoolServer &p = *pool_srv_;
     uint8_t *page = e2e_st_->mbox->data();
     const volatile htp_miss_req *q =
       reinterpret_cast<const volatile htp_miss_req *>(page + HTP_MBOX_MISS_REQ);
+    const volatile htp_token_done *done =
+      reinterpret_cast<const volatile htp_token_done *>(page +
+                                                        HTP_MBOX_TOKEN_DONE);
+    const bool done_enabled = serverDoneEnabled();
+    HtpTokenPollState poll_state;
     for (;;) {
       uint32_t tok;
       {
         std::unique_lock<std::mutex> lock(p.mu);
         p.idle = true;
         p.cv.notify_all();
-        p.cv.wait(lock, [&p] { return p.active.load() || p.stop; });
+        p.cv.wait(lock, [&p, &poll_state] {
+          return p.stop || poll_state.canStart(p.active.load(), p.tok);
+        });
         if (p.stop)
           return;
         p.idle = false;
         tok = p.tok;
+        poll_state.begin(tok);
       }
+      // The graph and prefetch configuration are fixed for this token.
+      // Resolving them on every mailbox poll repeats getenv and walks all
+      // router nodes while no request is available.
+      const bool hints = prefetchThreads() != 0;
       uint32_t hint_seq = tok * 256u; // [#282 B] the last hint taken
       for (uint32_t k = 0; k < 255u;) {
-        if (prefetchThreads() != 0)
+        if (hints)
           hint_seq = takeHint(page, tok, hint_seq);
         const uint32_t seq = tok * 256u + k + 1u; // hexkl_token_seq
         if (q->seq == seq) {
@@ -4085,11 +4107,15 @@ public:
             continue;
           }
         }
-        if (!p.active.load())
+        if (!p.active.load() ||
+            (done_enabled && HtpTokenPollState::isDone(tok, [done](unsigned w) {
+               return w == 0u ? done->seq : done->inverse;
+             }))) {
           break;
-          // A pause, not a yield: with sched_yield the request was noticed
-          // 86-150 us after the DSP posted it on the S26 Ultra (1 us on the
-          // S25), 17 rounds a token.
+        }
+        // A pause, not a yield: with sched_yield the request was noticed
+        // 86-150 us after the DSP posted it on the S26 Ultra (1 us on the
+        // S25), 17 rounds a token.
 #if defined(__aarch64__)
         __asm__ volatile("yield");
 #else
@@ -4105,21 +4131,33 @@ public:
   void poolArm(uint32_t tok) {
     if (!pool_srv_) {
       pool_srv_ = std::make_unique<PoolServer>();
+      // Retain the caller's affinity, as the original server did. The
+      // completion hint can park polling before DSPQ wakes the caller.
       pool_srv_->th = std::thread([this] { poolServe(); });
     }
     std::lock_guard<std::mutex> lock(pool_srv_->mu);
     pf_issued_keys_.clear(); // [#282 B] per token: the server is idle here
+    // The mailbox is uncached on ARM. Clear before sending the next token;
+    // no old completion, including a wrapped sequence, may stop its server.
+    auto *done = reinterpret_cast<volatile htp_token_done *>(
+      e2e_st_->mbox->data() + HTP_MBOX_TOKEN_DONE);
+    done->seq = 0u;
+    done->inverse = 0u;
+    std::atomic_thread_fence(std::memory_order_release);
     pool_srv_->tok = tok;
     pool_srv_->active = true;
     pool_srv_->cv.notify_all();
   }
   void poolDisarm() {
     PoolServer &p = *pool_srv_;
+    const uint64_t start = HtpProfile::nowUs();
     {
       std::unique_lock<std::mutex> lock(p.mu);
       p.active = false;
       p.cv.wait(lock, [&p] { return p.idle; });
     }
+    const uint64_t idle = HtpProfile::nowUs();
+    e2e_st_->pool_idle_us += idle - start;
     // the round's own error first: a failed answer leaves its loads unfiled
     std::exception_ptr err = p.err;
     p.err = nullptr;
@@ -4131,8 +4169,11 @@ public:
     // The final projection normally leaves ample time for reads to finish.
     if (cpu_predictor_)
       cpu_predictor_->drain();
+    const uint64_t predicted = HtpProfile::nowUs();
+    e2e_st_->pool_predict_drain_us += predicted - idle;
     if (pool_prefetch_)
       pool_prefetch_->drain();
+    e2e_st_->pool_prefetch_drain_us += HtpProfile::nowUs() - predicted;
     if (err) {
       std::lock_guard<std::mutex> lock(handle_mutex_);
       for (StagedExpert &st : p.pending)
@@ -4187,9 +4228,10 @@ public:
     if (!lrfuOn())
       answered.clear();
     size_t at = 0;
+    std::vector<const void *> need;
     for (size_t m = 0; m < pool_descs_.size() && at < s1r.route_n; ++m) {
       const uint32_t n = s1r.route[at++];
-      std::vector<const void *> need;
+      need.clear();
       {
         // a later layer's miss may have evicted an earlier layer's routed
         // expert within the token: only the resident ones are touched
@@ -6495,6 +6537,12 @@ private:
         (static_cast<double>(e.token_us) - static_cast<double>(e.wall_us)) / n,
         static_cast<double>(e.hop_us) / n, static_cast<double>(e.fwd_us) / n,
         static_cast<double>(e.arm_us) / an, (unsigned long long)e.arm_n);
+      std::fprintf(stderr,
+                   "[HTP] token driver: pool finish us/token idle=%.1f "
+                   "predictor=%.1f prefetch=%.1f\n",
+                   static_cast<double>(e.pool_idle_us) / n,
+                   static_cast<double>(e.pool_predict_drain_us) / n,
+                   static_cast<double>(e.pool_prefetch_drain_us) / n);
       if (e.pool_rounds != 0 || e.misses != 0)
         std::fprintf(
           stderr,
@@ -8161,14 +8209,7 @@ private:
                    "[HTP-PREFETCH] direct slots=%zu bytes=%zu readers=%zu\n",
                    count, count * bytes, readers);
     }
-    auto cpus = prefetchKnobs().cpus;
-    const uint32_t caller = cpuBit();
-    if (cpus.empty() && caller) {
-      const long n = sysconf(_SC_NPROCESSORS_CONF);
-      for (int c = 0; c < n && c < 32; ++c)
-        if ((caller & (1u << c)) == 0)
-          cpus.push_back(c);
-    }
+    auto cpus = backgroundCpus(cpuBit());
     using Prefetch = HtpExpertPrefetch<StagedExpert>;
     auto queue = std::make_shared<Prefetch>(
       std::move(slots), readers,
@@ -8607,17 +8648,39 @@ private:
       }
     const size_t n_jobs = jobs.size();
     std::vector<int> rc(2 * st.size(), 0);
-    std::atomic<size_t> next{0};
-    if (n_jobs)
-      ThreadManager::Global().parallel_for(
-        0, std::min(missReaders(), n_jobs), [&](size_t) {
-          for (size_t j; (j = next.fetch_add(1)) < n_jobs;) {
-            const size_t part = jobs[j];
-            rc[part] = together[part / 2]
-                         ? readExpertTogether(st[part / 2])
-                         : readExpertWeight(st[part / 2], part % 2 != 0, false);
-          }
-        });
+    if (n_jobs) {
+      const auto read = [&](size_t j) {
+        const size_t part = jobs[j];
+        rc[part] = together[part / 2]
+                     ? readExpertTogether(st[part / 2])
+                     : readExpertWeight(st[part / 2], part % 2 != 0, false);
+      };
+      // A small miss batch need not wake every compute worker and leave
+      // them spinning between I/O rounds. Zero restores the compute pool.
+      static const bool dedicated = [] {
+        const char *v = std::getenv("NNTR_MOE_DEMAND_POOL");
+        return !v || std::strcmp(v, "0") != 0;
+      }();
+      if (dedicated) {
+        if (!demand_read_pool_) {
+          const size_t readers = std::min<size_t>(
+            missReaders(), ThreadManager::Global().getComputeThreadCount());
+          auto cpus = backgroundCpus(cpuBit());
+          demand_read_pool_.reset(
+            new HtpExpertReadPool(readers, [cpus] { pinToCpus(cpus); }));
+          std::fprintf(stderr, "[HTP] demand read pool: readers=%zu\n",
+                       readers);
+        }
+        demand_read_pool_->run(n_jobs, read);
+      } else {
+        std::atomic<size_t> next{0};
+        ThreadManager::Global().parallel_for(
+          0, std::min(missReaders(), n_jobs), [&](size_t) {
+            for (size_t j; (j = next.fetch_add(1)) < n_jobs;)
+              read(j);
+          });
+      }
+    }
     for (size_t i = 0; i < st.size(); ++i) {
       auto &expert = st[i];
       expert.rc = rc[2 * i] != 0 ? rc[2 * i] : rc[2 * i + 1];
@@ -10030,6 +10093,22 @@ private:
     }();
     return k;
   }
+  /** Match the prefetch worker policy without inheriting a caller pinned
+   *  to a single compute core. An explicit prefetch CPU list is retained. */
+  static std::vector<int> backgroundCpus(uint32_t caller) {
+    auto cpus = prefetchKnobs().cpus;
+#if defined(__linux__)
+    if (cpus.empty() && caller) {
+      const long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (int c = 0; c < n && c < 32; ++c)
+        if ((caller & (1u << c)) == 0)
+          cpus.push_back(c);
+    }
+#else
+    (void)caller;
+#endif
+    return cpus;
+  }
   /** @brief This thread's core as a bit, 0 where that is not known. */
   static uint32_t cpuBit() {
 #if defined(__linux__)
@@ -10119,6 +10198,7 @@ private:
                                              this token (handle_mutex_) */
   bool pool_dirty_ = true;
   std::shared_ptr<HtpExpertPrefetch<StagedExpert>> pool_prefetch_;
+  std::unique_ptr<HtpExpertReadPool> demand_read_pool_;
   std::shared_ptr<HtpExpertPrefetch<PredictionJob>> cpu_predictor_;
   std::vector<PredictionRouter> prediction_routers_;
   std::unique_ptr<HtpPrefetchConfidence> prediction_confidence_;
@@ -10291,6 +10371,8 @@ private:
      *  end and the next one's start (the layer walk, sampler, tokenizer,
      *  print; arm_n intervals) */
     uint64_t hop_us = 0, fwd_us = 0, arm_us = 0, arm_n = 0, last_exit_us = 0;
+    uint64_t pool_idle_us = 0, pool_predict_drain_us = 0,
+             pool_prefetch_drain_us = 0;
     /** [#194 L0] wake split on the shared system counter: the ARM's post to
      *  the DSP thread's read, the DSP's write to the ARM's read, the DSP's
      *  packet handling around its token (out - in) */

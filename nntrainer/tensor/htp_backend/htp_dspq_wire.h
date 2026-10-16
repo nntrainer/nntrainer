@@ -126,6 +126,20 @@ typedef struct htp_dspq_token_resp_s {
   uint32_t miss_overlap_us, miss_anslat_us, miss_rebind_us;
 } htp_dspq_token_resp;
 
+/** @brief DSP -> ARM completion hint, in the retired ping/pong area.
+ *  The DSP writes {tok, ~tok} and flushes this private cache line after
+ *  its last miss round, also on token failure. ARM clears both words before
+ *  arming each token. Zero, stale and torn records are ignored. This only
+ *  stops mailbox polling: the DSPQ response still supplies status/results.
+ *  Older skeletons leave the line untouched; DSPQ-driven disarm still works.
+ *  Existing request, answer and prediction offsets remain unchanged. */
+#define HTP_MBOX_TOKEN_DONE 0u
+#define HTP_MBOX_TOKEN_DONE_BYTES 128u
+typedef struct {
+  uint32_t seq;
+  uint32_t inverse;
+} htp_token_done;
+
 /** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):
  *  after its two row slots, the expert pool's miss round (protocol P-A):
  *  S1's request and the pool owner's (the ARM's) answer, each in its own
@@ -201,6 +215,13 @@ typedef struct {
 #define HTP_MBOX_PRED_INPUT (HTP_MBOX_HINT + HTP_MBOX_HINT_BYTES)
 #define HTP_MBOX_PRED_MAX_WIDTH 8192u
 #define HTP_MBOX_PRED_BYTES (HTP_MBOX_PRED_MAX_WIDTH * 4u)
+
+typedef char
+  htp_token_done_fits[sizeof(htp_token_done) <= HTP_MBOX_TOKEN_DONE_BYTES &&
+                          HTP_MBOX_TOKEN_DONE + HTP_MBOX_TOKEN_DONE_BYTES <=
+                            HTP_MBOX_MISS_REQ
+                        ? 1
+                        : -1];
 
 typedef char
   htp_pred_hint_fits[sizeof(htp_pred_hint) <= HTP_MBOX_HINT_BYTES ? 1 : -1];

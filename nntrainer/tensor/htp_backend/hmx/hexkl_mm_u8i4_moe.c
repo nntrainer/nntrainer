@@ -1134,15 +1134,6 @@ typedef struct {
   uint32_t act; /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
 } moe_m1_ctx;
 
-/** Read the single AH row into a small dense scratch, then prepare its LUT.
- * Called by the existing quantization stages, so no extra pool join is paid. */
-static void moe_tl2_prepare_ah(const uint8_t *ah, uint32_t K, int16_t *tables) {
-  uint8_t dense[8192] __attribute__((aligned(128)));
-  for (uint32_t k = 0; k < K; k += 32u)
-    memcpy(dense + k, ah + (size_t)(k / 32u) * 2048u, 32u);
-  hvx_tl2_prepare(dense, K, 0u, (K + 23u) / 24u, tables);
-}
-
 /** Pure ternary already has the source magnitude; only legacy int4 needs 7. */
 static void moe_tl2_restore_magnitude(int32_t *a, const int8_t palette[4]) {
   if (htp_tl2_palette_magnitude(palette) != 7u)
@@ -1387,27 +1378,28 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
     moe_m1_expert *e = &c->ex[u];
     if (e->g->tl2_bytes && c->tl2_fused)
       moe_tl2_gate_epilogue(c, u * c->inter_ntiles, (u + 1u) * c->inter_ntiles);
+    if (e->d->tl2_bytes) {
+      /** Native TL2 consumes one dense row. Reuse its idle AH allocation
+       * for that row and prepare the LUT on the same worker, avoiding AH
+       * expansion and the copy back from its strided first row. */
+      hvx_quant_rows_u8_params_rm(e->gate_f32, 1u, 1u, c->inter, e->rq_scale,
+                                  e->rq_zp, e->mid_ah, NULL, 0.0f, NULL, NULL);
+      hvx_tl2_prepare(e->mid_ah, c->inter, 0u, (c->inter + 23u) / 24u,
+                      e->tl2_down);
+      continue;
+    }
     const uint32_t m4 = ROUND_UP_U32(e->m, 4u);
-    if (!e->d->tl2_bytes && m4 > e->m) {
+    if (m4 > e->m) {
       memset(e->gate_f32 + (size_t)e->m * c->inter, 0,
              sizeof(float) * (size_t)(m4 - e->m) * c->inter);
     }
     hvx_quant_rows_u8_params(e->gate_f32, e->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
                              c->inter, e->rq_scale, e->rq_zp, NULL);
-    if (e->d->tl2_bytes) {
-      /** Native TL2 consumes only row zero. Repeat that row while packing,
-       * as in the M=1 FC path, instead of quantizing three padding rows. */
-      hvx_quant_pack_u8_ah_m1_repeat(e->gate_f32, c->inter, e->rq_scale[0],
-                                     e->rq_zp[0], e->mid_ah);
-    } else {
-      hvx_quant_pack_u8_ah_rows(e->gate_f32, NULL, 0u, m4, c->inter,
-                                e->rq_scale, e->rq_zp, e->mid_ah);
-    }
+    hvx_quant_pack_u8_ah_rows(e->gate_f32, NULL, 0u, m4, c->inter, e->rq_scale,
+                              e->rq_zp, e->mid_ah);
     if (e->d->w_offset)
       hexkl_wh_affine_sums(e->mid_ah, e->m, c->inter, e->rq_zp,
                            e->dn_affine_sums);
-    if (e->d->tl2_bytes)
-      moe_tl2_prepare_ah(e->mid_ah, c->inter, e->tl2_down);
   }
 }
 
@@ -2403,7 +2395,7 @@ int hexkl_mm_u8i4_moe_layer_run(
      it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
   hvx_quant_rows_u8_params_rm(act_direct ? act_f32 : act_c, M, m_pad, K,
-                              scale_all, zp_all, act_u8,
+                              scale_all, zp_all, use_tl2 ? act_ah : act_u8,
                               act_direct ? pre_gamma : NULL, scratch->pre_eps,
                               pre_rows, gu0_async ? NULL : pool);
 
@@ -2460,15 +2452,20 @@ int hexkl_mm_u8i4_moe_layer_run(
       rc = AEE_EBADPARM;
       goto out;
     }
+    /** Consume the shared dense activation before a mixed QS2/TL2 call
+     * overwrites this temporary storage with its shared AH row. The LUT
+     * lives separately in VTCM until all native gate products finish. */
+    if (use_tl2)
+      hvx_tl2_prepare(act_ah, K, 0u, (K + 23u) / 24u, m1.tl2_gate);
     for (uint32_t i = 0; i < n_active; ++i) {
       const uint32_t e = order[i];
       const uint32_t sb = slot_of[i];
       uint8_t *xb = m1_base + (size_t)i * sz_m1_expert;
       moe_m1_expert *x = &m1.ex[i];
       if (use_tl2) {
-        /** Native TL2 is restricted to M=1: every expert uses the same
-         * token and quantization parameters. Pack it once and share it. */
-        if (i == 0u)
+        /** Mixed calls still need one shared AH row for their QS2 experts.
+         * All-native calls already have the LUT and require no AH pack. */
+        if (i == 0u && n_tl2 != n_with_rows)
           hvx_quant_pack_u8_ah_m1_repeat(act_c, K, slot_scale[sb], slot_zp[sb],
                                          act_ah);
         x->act_ah = act_ah;
@@ -2510,8 +2507,6 @@ int hexkl_mm_u8i4_moe_layer_run(
       x->m = row_count[e];
       if (x->g->w_offset)
         hexkl_wh_affine_sums(x->act_ah, x->m, K, x->act_zp, x->gu_affine_sums);
-      if (use_tl2 && i == 0u)
-        moe_tl2_prepare_ah(x->act_ah, K, m1.tl2_gate);
     }
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (gu0_async) {
@@ -3484,7 +3479,19 @@ out:
 #define FC_M1_BLOCKS 4u
 /** @brief Adjacent output tiles sharing each activation load and broadcast. */
 #ifndef HVX_FC_M1_COLS
+#if defined(__HVX_ARCH__) && __HVX_ARCH__ >= 81
+#define HVX_FC_M1_COLS 4u
+#else
 #define HVX_FC_M1_COLS 3u
+#endif
+#endif
+/** Keep DMA blocks on four-tile boundaries when the existing arena fits. */
+#ifndef NNTR_FC_M1_ALIGN_BLOCKS
+#if defined(__HVX_ARCH__) && __HVX_ARCH__ >= 81
+#define NNTR_FC_M1_ALIGN_BLOCKS 1
+#else
+#define NNTR_FC_M1_ALIGN_BLOCKS 0
+#endif
 #endif
 
 typedef struct {
@@ -3555,6 +3562,13 @@ static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
   if (feed) {
     nb = (hi - lo + FC_M1_BLOCKS - 1u) / FC_M1_BLOCKS;
     nb = nb < fit ? nb : fit;
+    if (NNTR_FC_M1_ALIGN_BLOCKS && HVX_FC_M1_COLS == 4u && c->rows1 &&
+        fit >= 4u) {
+      /** Round up when both buffers still fit; otherwise round down.
+       * Part and lane boundaries still clamp each individual transfer. */
+      const uint32_t rounded = (nb + 3u) & ~3u;
+      nb = rounded <= fit ? rounded : nb & ~3u;
+    }
     buf[0] = c->vtcm + (size_t)i * per_lane;
     buf[1] = buf[0] + (size_t)nb * col_bytes;
   }
@@ -3576,15 +3590,20 @@ static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
     const uint32_t p = fc_m1_part(c, b0);
     const hexkl_weight_u8i4 *w = c->w[p];
     for (uint32_t t = b0; t < b1;) {
-      /** The DMA slab is 128-byte aligned. Three neighboring column tiles
+      /** The DMA slab is 128-byte aligned. Neighboring column tiles
          share the same activation broadcasts, with the same integer sum
          in each lane. Only the live output rows need accumulator storage. */
-      int32_t tiles[3u * HEXKL_HMX_INT8_BLOCK_N_COL]
-        __attribute__((aligned(128)));
+      int32_t tiles[(HVX_FC_M1_COLS == 4u ? 4u : 3u) *
+                    HEXKL_HMX_INT8_BLOCK_N_COL] __attribute__((aligned(128)));
       const uint32_t nt = t - c->t0[p];
       uint32_t cols = 1u;
       if (feed && c->rows1) {
-        if (HVX_FC_M1_COLS == 3u && b1 - t >= 3u) {
+        if (HVX_FC_M1_COLS == 4u && b1 - t >= 4u) {
+          cols = 4u;
+          hvx_gemv_u8i4_wh_4col_nopf(c->act_ah, c->k_tiles, buf[cur],
+                                     WEIGHT_TILE_BYTES_U8I4, b1 - b0, t - b0,
+                                     tiles);
+        } else if (HVX_FC_M1_COLS >= 3u && b1 - t >= 3u) {
           cols = 3u;
           hvx_gemv_u8i4_wh_3col_nopf(c->act_ah, c->k_tiles, buf[cur],
                                      WEIGHT_TILE_BYTES_U8I4, b1 - b0, t - b0,
@@ -3606,7 +3625,11 @@ static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
         hexkl_wh_affine_acc(tiles, cols * 32u, 1u, cols * 32u, w->w_offset + c0,
                             &c->affine_sum);
       float *out = c->out + (size_t)t * HEXKL_HMX_INT8_BLOCK_N_COL;
-      if (cols == 3u) {
+      if (cols == 4u) {
+        hvx_dequant_acc_4tiles_m1_f32(tiles, c->act_scale[0], c->act_zp[0],
+                                      w->colsum_w + c0, w->w_scale + c0,
+                                      w->bias + c0, out);
+      } else if (cols == 3u) {
         hvx_dequant_acc_3tiles_m1_f32(tiles, c->act_scale[0], c->act_zp[0],
                                       w->colsum_w + c0, w->w_scale + c0,
                                       w->bias + c0, out);

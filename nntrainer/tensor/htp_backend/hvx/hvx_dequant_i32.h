@@ -93,6 +93,13 @@ void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
                                    const float *w_scale, const float *bias,
                                    float *out);
 
+/** @brief Four-tile counterpart of hvx_dequant_acc_3tiles_m1_f32, with 128
+ * input/output elements and the same floating-point operation order. */
+void hvx_dequant_acc_4tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *colsum_w,
+                                   const float *w_scale, const float *bias,
+                                   float *out);
+
 /**
  * @brief Rows [m0, m1) of a run of @a n_tiles adjacent staged tiles,
  *        dequantized (hvx_dequant_acc_tile_to_f32's operations) into

@@ -621,15 +621,23 @@ std::vector<float *> CausalLM::incrementalInference(
   // would clobber the SVM flag and drop attention to the host path.
   auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
 
-  std::unordered_map<const void *, nntrainer::Tensor *> cache_by_ptr;
-  if (kv_cache.isAllocated()) {
+  // Named KV inputs below normally resolve without a pointer lookup. A
+  // linear fallback avoids rebuilding a hash table for every decode token;
+  // key then value in layer order preserves the old map's first-match rule
+  // when two cache views share the same address.
+  auto cache_by_ptr = [&](const void *ptr) -> nntrainer::Tensor * {
+    if (!kv_cache.isAllocated())
+      return nullptr;
     for (unsigned int i = 0; i < kv_cache.getNumLayers(); ++i) {
       auto &kc = kv_cache.getKeyCache(i);
+      if (ptr == reinterpret_cast<const void *>(kc.getData()))
+        return &kc;
       auto &vc = kv_cache.getValueCache(i);
-      cache_by_ptr.emplace(reinterpret_cast<const void *>(kc.getData()), &kc);
-      cache_by_ptr.emplace(reinterpret_cast<const void *>(vc.getData()), &vc);
+      if (ptr == reinterpret_cast<const void *>(vc.getData()))
+        return &vc;
     }
-  }
+    return nullptr;
+  };
 
   auto in_dim = nn->getInputDimension();
   NNTR_THROW_IF(input.size() < in_dim.size(), std::invalid_argument)
@@ -674,10 +682,9 @@ std::vector<float *> CausalLM::incrementalInference(
         continue;
       }
     }
-    auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
-    if (it != cache_by_ptr.end()) {
+    if (auto *cached = cache_by_ptr(input[idx])) {
       // shallow copy: shares the cache's MemoryData (isSVM intact)
-      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*it->second));
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*cached));
     } else {
       in_dim[idx].batch(batch_size);
       input_tensors.emplace_back(MAKE_SHARED_TENSOR(nntrainer::Tensor::Map(
@@ -717,6 +724,19 @@ std::vector<float *> CausalLM::incrementalInference(
     // path); the pool recycles the row instead. Contents are as uninitialized
     // as a fresh new[] -- everything below either fills it or defers it.
     float *last_out_buf_data = acquireLogitsBuf(buf_size);
+
+    // The completed HTP greedy row returned its token ID, so its CPU logits
+    // are stale and generate() consumes only the ID. Preserve the pooled
+    // buffer's ownership without copying a vocabulary-sized unused row.
+    // Sampling, penalties and logit consumers request logits from the DSP;
+    // the non-consuming completed-row check is false for all of those paths.
+    if (htp_execution_profile_ && batch_size == 1u && to - from == 1u &&
+        output_tensors.size() == 1u && buf_size == NUM_VOCAB &&
+        out->getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        htpDecodeHasTokenId(from)) {
+      output.push_back(last_out_buf_data);
+      continue;
+    }
 
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16

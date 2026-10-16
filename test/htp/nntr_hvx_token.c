@@ -31,6 +31,10 @@
 #include <HAP_farf.h>
 #include <HAP_mem.h>
 #include <HAP_perf.h>
+#if defined(__hexagon__)
+#include <qurt.h>
+#include <qurt_memory.h>
+#endif
 #include <remote.h>
 
 #include "hexkl_token.h"
@@ -127,6 +131,22 @@ void nntr_hvx_token_shutdown(nntr_hvx_session *s) {
   }
 }
 
+/** @brief Wake the ARM receiver by allowing its polling server to park.
+ *  The hint publishes completion only, never success or valid logits. */
+static void token_publish_done(struct nntr_hvx_token *t, uint32_t tok) {
+  volatile htp_token_done *done =
+    (volatile htp_token_done *)(t->page + HTP_MBOX_TOKEN_DONE);
+  done->inverse = ~tok;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  done->seq = tok;
+#if defined(__hexagon__)
+  qurt_mem_cache_clean((qurt_addr_t)done, HTP_MBOX_TOKEN_DONE_BYTES,
+                       QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+#else
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
 int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
                        const float *act, uint32_t act_len, float *logits,
                        uint32_t logits_len, struct htp_dspq_token_resp_s *r) {
@@ -134,13 +154,18 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   hexkl_graph_env env;
   uint32_t id = 0, k;
   int rc;
-  if (t == NULL || s->graph == NULL) {
+  if (t == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (s->graph == NULL) {
+    token_publish_done(t, tok);
     return AEE_EBADSTATE;
   }
   const hexkl_token_stats before = t->st;
   const uint64_t us0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
   const uint64_t pc0 = HAP_perf_get_pcycles();
   if (act == NULL) {
+    token_publish_done(t, tok);
     return AEE_EINVALIDFORMAT;
   }
   nntr_hvx_graph_env(s, &env);
@@ -148,6 +173,7 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   memset(s->graph->attn_prof, 0, sizeof(s->graph->attn_prof));
   rc = hexkl_token_main(s->graph, &env, t->page, tok, pos, act, act_len, logits,
                         logits_len, t->spin_us, &t->st, &id);
+  token_publish_done(t, tok);
   r->wall_pcyc = (uint32_t)(HAP_perf_get_pcycles() - pc0);
   r->wall_us =
     (uint32_t)(HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count()) - us0);

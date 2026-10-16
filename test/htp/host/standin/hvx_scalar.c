@@ -125,6 +125,14 @@ void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
     hvx_scalar_gemv(act_ah, m, k_tiles, wh, n_col, nt, out);
 }
 
+void hvx_gemv_u8i4_wh_4col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out) {
+  for (uint32_t j = 0; j < 4u; ++j)
+    hvx_gemm_u8i4_wh_col_nopf(act_ah, 1u, k_tiles, wh, n_col,
+                              nt + j * (plane_bytes / 512u), 1u, out + 32u * j);
+}
+
 static int wh2_value(const uint8_t *tile, uint32_t k, uint32_t c,
                      const uint8_t *table) {
   const uint32_t slot =
@@ -413,6 +421,17 @@ void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
             ws + j * 32u, bias + j * 32u, out + j * 32u, 96u, 0);
   }
 }
+void hvx_dequant_acc_4tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *cs,
+                                   const float *ws, const float *bias,
+                                   float *out) {
+  for (uint32_t j = 0; j < 4u; ++j) {
+    buf(out + j * 32u, sizeof(float) * 32u, 1);
+    dq_tile(tiles + j * 32u, 32u, 1u, &act_scale, &act_zp, cs + j * 32u,
+            ws + j * 32u, bias + j * 32u, out + j * 32u, 128u, 0);
+  }
+}
+
 void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t stride, uint32_t m0, uint32_t m1, const float *as, const int32_t *az,

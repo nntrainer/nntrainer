@@ -86,6 +86,14 @@ static uint64_t graph_now_qt(void) {
 #endif
 }
 
+/** The token request already selects profiling through
+ *  attn_prof_on. Keep regular/debug forward timing, whose callers have no
+ *  token miss callbacks and may explicitly request the per-op counters.
+ *  Define 0 to retain unconditional token instrumentation for comparison. */
+#ifndef NNTR_GRAPH_PROFILE_ON_DEMAND
+#define NNTR_GRAPH_PROFILE_ON_DEMAND 1
+#endif
+
 /** @brief A scale belongs to an unchanged activation slot, width, epsilon
  *  and reduction algorithm. width == 0 invalidates the entry. */
 typedef struct {
@@ -106,6 +114,10 @@ typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out);
 
 /* ---- MOE: hexkl_mm_u8i4_moe_layer_run at M = 1, unchanged -------------- */
+
+#ifndef NNTR_MOE_MERGE_HITS
+#define NNTR_MOE_MERGE_HITS 1
+#endif
 
 /** The kernel over the n experts ids[] (ascending) with their weights w[],
    the token's one row each: a whole layer, or a set of a miss round's
@@ -154,18 +166,14 @@ static int graph_moe_rows(hexkl_graph *g, const hexkl_graph_env *env,
   return rc;
 }
 
-/**
- * [plan 201 S1] A token routed to experts the pool does not hold: the miss
- * is posted, the present experts run while the pool's owner reads the rest,
- * then the rest run. The kernel adds each expert's weighted row into a
- * zeroed output in expert order (hvx_scale_add_rows_f32: out + w * res,
- * two roundings), so the all-resident bits are kept by running the experts
- * before the first miss as one call and every later one into its own row
- * (0 + w * res: that expert's term exactly), then adding those rows in
- * expert order at scale 1 (exact products). [#267 L3] The later present
- * experts are one call and the arrived ones another (HEXKL_MOE_FLAG_ROWS_OUT:
- * a row each, the same bits), so a miss layer makes at most three calls,
- * not one per later expert: the weight feed overlaps across each set.
+/*
+ * Post the miss, compute the resident experts while the owner reads the
+ * rest, then compute the arrived experts. Each set writes one weighted
+ * row per expert (0 + w * res). Adding these rows at scale 1 in the original
+ * expert order preserves the all-resident multiply/add roundings. Keeping
+ * every resident expert in the same batch also shares its quantization and
+ * weight DMA pipeline across hits before and after the first miss.
+ * NNTR_MOE_MERGE_HITS=0 retains the earlier three-call schedule for diagnosis.
  */
 static int graph_dense_early(hexkl_graph *g, uint32_t op_i, graph_call *call);
 
@@ -193,7 +201,10 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   if (env->miss.post == NULL || g->moe_rows == NULL) {
     return AEE_EBADSTATE; /* no miss path: the one-session entry */
   }
-  for (i = first; i < n; ++i) {
+  const uint32_t begin =
+    NNTR_MOE_MERGE_HITS && (env->moe_flags & HEXKL_MOE_FLAG_M1_GEMV) ? 0u
+                                                                     : first;
+  for (i = begin; i < n; ++i) {
     if (was_miss[i]) {
       a_ids[n_a] = ids[i];
       a_w[n_a++] = w[i];
@@ -202,7 +213,7 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
       p_w[n_p++] = w[i];
     }
   }
-  /* n - first <= top_k rows: the present set's, then the arrived set's */
+  /* n - begin <= top_k rows: the present set's, then the arrived set's */
   p_rows = g->moe_rows;
   a_rows = g->moe_rows + (size_t)n_p * op->N_out;
   g->moe_calls_1x += (first != 0u) + (n - first);
@@ -210,7 +221,7 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (first != 0u) {
+  if (begin != 0u) {
     rc = graph_moe_run(g, env, op, h, ids, w, first, 0u, in, out);
   } else {
     memset(out, 0, (size_t)op->N_out * sizeof(float));
@@ -222,7 +233,7 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   if (rc == AEE_SUCCESS && g->dense_early != 0u) {
     rc = graph_dense_early(g, op_i, call);
   }
-  /** the wait comes even after a failure: the answer must not land on a
+  /* the wait comes even after a failure: the answer must not land on a
      later round's page */
   {
     const int wrc = env->miss.wait(env->miss.ctx, g, op_i);
@@ -239,7 +250,7 @@ static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
   }
   /* in expert order, as before: both sets are ascending */
   n_p = n_a = 0u;
-  for (i = first; rc == AEE_SUCCESS && i < n; ++i) {
+  for (i = begin; rc == AEE_SUCCESS && i < n; ++i) {
     hvx_scale_add_rows_f32(out,
                            was_miss[i] ? a_rows + (size_t)n_a++ * op->N_out
                                        : p_rows + (size_t)n_p++ * op->N_out,
@@ -520,9 +531,9 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
                       &scale);
       graph_norm_keep(g, op, call, in, out, 0u, scale);
     }
-    hvx_router_softmax_topk_f32(out, g->param[i], g->state[i] + op->K, op->K,
-                                op->n_experts, op->top_k, out, sel, w,
-                                call->env->pool);
+    hvx_router_softmax_topk_owned_f32(
+      out, (const hvx_router_sm_weights *)g->param[i], g->state[i] + op->K,
+      op->top_k, out, sel, w, call->env->pool);
   } else {
     hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
                         op->top_k, out, sel, w, call->env->pool);
@@ -1007,13 +1018,6 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     g->act.df = (float *)(g->act.ea + nb);
     g->act.d = (uint16_t *)(g->act.df + nb);
   }
-  if (vocab_out != 0u) {
-    g->logits = (float *)malloc((size_t)vocab_out * sizeof(float));
-    if (g->logits == NULL) {
-      hexkl_graph_free(g);
-      return AEE_ENOMEMORY;
-    }
-  }
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
     if (g->ops[i].kind == HTP_OP_ATTN_M1) {
@@ -1306,16 +1310,22 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     if (E > W) { /* the sigmoid router's width (htp_graph_desc.h) */
       return AEE_ESCHEMENOTSUPPORTED;
     }
+    if (g->ops[op].eps_bits != 0u) {
+      /* Construct before replacing: a failed allocation leaves the old
+         router valid. The owned header and payload share one free. */
+      hvx_router_sm_weights *packed = hvx_router_sm_weights_create(data, K, E);
+      if (packed == NULL) {
+        return AEE_ENOMEMORY;
+      }
+      free(*dst);
+      *dst = (float *)packed;
+      return AEE_SUCCESS;
+    }
     if (*dst == NULL) {
       *dst = (float *)memalign(128, (size_t)K * W * sizeof(float));
       if (*dst == NULL) {
         return AEE_ENOMEMORY;
       }
-    }
-    if (g->ops[op].eps_bits != 0u) {
-      /* [D3] the softmax router's lanes stream block-major */
-      hvx_router_sm_pack_f32(*dst, data, K, E);
-      return AEE_SUCCESS;
     }
     memset(*dst, 0, (size_t)K * W * sizeof(float));
     for (k = 0; k < K; ++k) {
@@ -1423,6 +1433,10 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
   if (g == NULL || env == NULL || resume_at == NULL) {
     return AEE_EBADSTATE;
   }
+  const int timed = !NNTR_GRAPH_PROFILE_ON_DEMAND || g->attn_prof_on != 0u ||
+                    env->miss.post == NULL;
+  /* Also clear after a profiled token: disabled, skipped and failed ops
+     must never report the previous forward's measurements. */
   memset(g->op_pcycles, 0, sizeof(g->op_pcycles));
   memset(g->op_qt, 0, sizeof(g->op_qt));
   if (start_op >= g->n_ops || pos >= g->max_seq) {
@@ -1472,8 +1486,8 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     if (n_run == 0u) {
       memcpy(in, act_in, (size_t)act_in_len * sizeof(float));
     }
-    n0 = graph_now_qt();
-    t0 = HAP_perf_get_pcycles();
+    n0 = timed ? graph_now_qt() : 0u;
+    t0 = timed ? HAP_perf_get_pcycles() : 0u;
     /** Even a partial slot write invalidates its previous scale. Clearing
        before dispatch also covers in-place operators and skipped early
        ops; a resumed forward starts with an entirely empty cache. */
@@ -1489,8 +1503,10 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     } else {
       rc = k(g, op, &call, in, out);
     }
-    g->op_pcycles[i] = HAP_perf_get_pcycles() - t0;
-    g->op_qt[i] = (uint32_t)(graph_now_qt() - n0);
+    if (timed) {
+      g->op_pcycles[i] = HAP_perf_get_pcycles() - t0;
+      g->op_qt[i] = (uint32_t)(graph_now_qt() - n0);
+    }
     if (rc != AEE_SUCCESS) {
       return rc;
     }
