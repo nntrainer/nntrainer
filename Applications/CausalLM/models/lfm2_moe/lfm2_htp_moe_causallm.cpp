@@ -2,13 +2,15 @@
 /** @file lfm2_htp_moe_causallm.cpp
  * @brief LFM2 hybrid MoE graph with TL2 experts and affine WH projections.
  * @author NNTrainer contributors
- * @bug Chunked prefill is not supported.
+ * @bug No known bugs except for NYI items
  */
 #include "lfm2_htp_moe_causallm.h"
 #include <algorithm>
 #include <app_context.h>
 #include <conv_block_layer.h>
+#include <cstring>
 #include <engine.h>
+#include <fstream>
 #include <htp_mha_core.h>
 #include <layer_context.h>
 #include <layer_node.h>
@@ -227,30 +229,117 @@ void Lfm2HtpMoECausalLM::repack_weight() {
   weight_repacked_ = true;
 }
 
+void Lfm2HtpMoECausalLM::forEachConvBlock(
+  const std::function<void(ConvBlockLayer &, nntrainer::RunLayerContext &)>
+    &fn) {
+  model->forEachLayer(
+    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+      if (node)
+        if (auto *conv = dynamic_cast<ConvBlockLayer *>(node->getLayer()))
+          fn(*conv, rc);
+    },
+    nullptr);
+}
+
 void Lfm2HtpMoECausalLM::run(const WSTR prompt, bool sample, const WSTR system,
                              const WSTR tail, bool log) {
 #ifdef ENABLE_HEXKL
-  // Each prompt starts from position 0, as Gemma4HtpMoECausalLM::run does:
-  // the DSP's decode state (attention caches, conv states) and the host KV
-  // slabs decode may have dropped are reset. The conv layers need nothing:
-  // a prefill from position 0 does not read their state.
+  // Each prompt is independent, as Gemma4HtpMoECausalLM::run does it: the
+  // DSP's decode state (attention caches, conv states), the host conv states
+  // and the host KV slabs decode may have dropped are reset.
   if (ran_) {
     nntrainer::htp_begin_prompt();
     model->forEachLayer(
-      [](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+      [](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
         auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
-        if (node)
-          if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
-            mha->beginHtpPrompt();
+        if (!node)
+          return;
+        if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
+          mha->beginHtpPrompt();
+        else if (auto *conv = dynamic_cast<ConvBlockLayer *>(node->getLayer()))
+          conv->beginPrompt(rc);
       },
       nullptr);
     kv_cache = KVCacheManager{};
     kv_cache_bound = false;
   }
-  setSessionTokenPosition(0);
+  // a precomputed cache (system_prompt.kvcache) stays on: the run saves
+  // or loads it at position 0
+  if (USE_KVCACHE)
+    setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+  else
+    setSessionTokenPosition(0);
 #endif
   ran_ = true;
   CausalLM::run(prompt, sample, system, tail, log);
+}
+
+namespace {
+/** <path>.conv: this header, then each conv block's state ([2, C] FP32) in
+ *  layer order. A snapshot of another geometry or position is refused. */
+struct ConvSnapshotHeader {
+  char magic[8];
+  uint32_t version, layers, width, pos;
+};
+constexpr char kConvMagic[8] = {'N', 'N', 'T', 'R', 'C', 'O', 'N', 'V'};
+constexpr uint32_t kConvVersion = 1;
+} // namespace
+
+void Lfm2HtpMoECausalLM::save_kvcache(std::string path, int to) {
+  CausalLM::save_kvcache(path, to);
+  std::vector<nntrainer::Tensor *> states;
+  forEachConvBlock([&](ConvBlockLayer &conv, nntrainer::RunLayerContext &rc) {
+    states.push_back(&conv.convState(rc));
+  });
+  if (states.empty())
+    return;
+  const std::string conv_path = path + ".conv";
+  std::ofstream f(conv_path, std::ios::binary);
+  ConvSnapshotHeader h{};
+  std::memcpy(h.magic, kConvMagic, sizeof(h.magic));
+  h.version = kConvVersion;
+  h.layers = static_cast<uint32_t>(states.size());
+  h.width = states.front()->width();
+  h.pos = static_cast<uint32_t>(to);
+  f.write(reinterpret_cast<const char *>(&h), sizeof(h));
+  for (auto *t : states)
+    f.write(t->getData<char>(), t->bytes());
+  if (!f)
+    throw std::runtime_error("save_kvcache: cannot write " + conv_path);
+}
+
+void Lfm2HtpMoECausalLM::load_kvcache(std::string path, int to) {
+  CausalLM::load_kvcache(path, to);
+  std::vector<nntrainer::Tensor *> states;
+  forEachConvBlock([&](ConvBlockLayer &conv, nntrainer::RunLayerContext &rc) {
+    states.push_back(&conv.convState(rc));
+  });
+  if (states.empty())
+    return;
+  // Without the conv states the loaded position is wrong: refused, as a
+  // KV file of another model is.
+  const std::string conv_path = path + ".conv";
+  std::ifstream f(conv_path, std::ios::binary);
+  ConvSnapshotHeader h{};
+  f.read(reinterpret_cast<char *>(&h), sizeof(h));
+  if (!f || std::memcmp(h.magic, kConvMagic, sizeof(h.magic)) != 0 ||
+      h.version != kConvVersion)
+    throw std::runtime_error("load_kvcache: " + conv_path +
+                             " is missing or not an LFM2 conv snapshot; "
+                             "save the KV cache again with this build");
+  if (h.layers != states.size() || h.width != states.front()->width() ||
+      h.pos != static_cast<uint32_t>(to))
+    throw std::runtime_error(
+      "load_kvcache: " + conv_path + " holds " + std::to_string(h.layers) +
+      " layers x " + std::to_string(h.width) + " at position " +
+      std::to_string(h.pos) + ", this model wants " +
+      std::to_string(states.size()) + " x " +
+      std::to_string(states.front()->width()) + " at " + std::to_string(to));
+  for (auto *t : states)
+    f.read(t->getData<char>(), t->bytes());
+  if (!f)
+    throw std::runtime_error("load_kvcache: " + conv_path + " is truncated");
 }
 
 void Lfm2HtpMoECausalLM::prepareDecodeGraph() {

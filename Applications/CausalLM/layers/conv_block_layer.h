@@ -71,6 +71,21 @@ public:
 
   static constexpr unsigned int KERNEL_SIZE = 3;
 
+  /**
+   * @brief A new prompt on this handle: the DSP's conv state belongs to the
+   *        last prompt (it is re-seeded from the host copy at the next
+   *        decode row) and the host state is zeroed, so a one-token prompt
+   *        at position 0 does not convolve with the last prompt's rows.
+   */
+  void beginPrompt(nntrainer::RunLayerContext &context);
+
+  /**
+   * @brief The conv state [x_{t-2}, x_{t-1}] ([B, 1, 2, C] FP32) a KV
+   *        snapshot saves with the attention caches and restores before a
+   *        prefill continues from the saved position.
+   */
+  nntrainer::Tensor &convState(nntrainer::RunLayerContext &context);
+
 private:
   /** unit = the conv width C (in_proj is 3C wide) */
   std::tuple<nntrainer::props::Unit> conv_props;
