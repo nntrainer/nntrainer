@@ -33,6 +33,16 @@
 
 namespace causallm {
 namespace {
+/** @brief Sets @a name to @a value unless the environment already has it. */
+static void setEnvDefault(const char *name, const std::string &value) {
+#ifdef _WIN32
+  if (std::getenv(name) == nullptr)
+    _putenv_s(name, value.c_str());
+#else
+  setenv(name, value.c_str(), 0);
+#endif
+}
+
 std::set<int> parseLayerIdList(const std::string &csv) {
   std::set<int> ids;
   std::stringstream ss(csv);
@@ -225,6 +235,16 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
     MOE_HTP_LAYERS =
       parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
     MOE_CACHE_EXPERTS = nntr_cfg.value("moe_cache_experts", 0u);
+    // The checkpoint's online rotation (PR 4428: Hadamard before the expert
+    // input quantization, matching the converter's weight rotation), as the
+    // words of NNTR_MOE_HADAMARD / NNTR_MOE_HADAMARD_SCOPE, which win when
+    // set. ponytail: the backend reads the environment once at its first
+    // MoE call, so the pack's choice travels as an environment default.
+    for (const auto &[key, env] :
+         {std::pair{"moe_hadamard", "NNTR_MOE_HADAMARD"},
+          std::pair{"moe_hadamard_scope", "NNTR_MOE_HADAMARD_SCOPE"}})
+      if (nntr_cfg.contains(key))
+        setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
   }
 
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));

@@ -718,11 +718,14 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
       cnt[c] = 1u;
       w[c] = 1.0f;
     }
+    /** [PR 4428] The dense FFN's weights are never rotated and its 1056-wide
+       chunks have no Hadamard anyway: the session's rotation selectors
+       (NNTR_MOE_HADAMARD_SCOPE=all) apply to the experts only. */
     return hexkl_mm_u8i4_moe_layer_run(
       env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K,
       op->N / op->n_experts, op->N_out, op->n_experts, op->h_gu, op->h_dn, idx,
       cnt, w, in, out, env->pool, env->scratch,
-      graph_wh_flags(op, env->moe_flags));
+      graph_wh_flags(op, env->moe_flags) & ~HEXKL_MOE_FLAG_HAD_MASK);
   }
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
