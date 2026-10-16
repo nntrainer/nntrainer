@@ -1847,6 +1847,18 @@ static int check_moe_row_totals(const uint32 *row_count, int n_experts,
   return AEE_SUCCESS;
 }
 
+/** @brief The MoE layer entries' act argument: bit 0 the gelu_tanh
+ *  epilogue, bit 1 [PR 4428] "these weights were never rotated" -- the
+ *  dense FFN's chunks through this entry -- which drops the session's
+ *  online rotation selectors (NNTR_MOE_HADAMARD_SCOPE=all) for this call. */
+static uint32_t moe_call_flags(const nntr_hvx_session *s, uint32 act) {
+  uint32_t flags = s->moe_flags | ((act & 1u) ? HEXKL_MOE_FLAG_GELU_TANH : 0u);
+  if (act & 2u) {
+    flags &= ~HEXKL_MOE_FLAG_HAD_MASK;
+  }
+  return flags;
+}
+
 int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
                                uint32 inter, uint32 N_out, uint32 act,
                                const uint32 *h_gate_up, int h_gate_upLen,
@@ -1867,14 +1879,14 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (act > 1u) {
+  if (act > 3u) {
     return AEE_EBADPARM;
   }
   return hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
     row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
-    s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
+    moe_call_flags(s, act));
 }
 
 int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
@@ -2129,7 +2141,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
     row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
-    s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
+    moe_call_flags(s, act));
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
   return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);

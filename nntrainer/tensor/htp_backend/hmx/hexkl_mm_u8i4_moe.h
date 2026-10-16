@@ -483,6 +483,13 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
 /** Restrict online rotations to calls consisting of 2-bit weight pairs.
  * Non-2-bit calls retain their original path; mixed calls are rejected. */
 #define HEXKL_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
+/** The rotation selectors together: a caller whose weights were never
+ * rotated (the dense FFN's chunks, PR 4428) clears them from the session's
+ * flags before the MoE kernel. */
+#define HEXKL_MOE_FLAG_HAD_MASK                                                \
+  (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |                           \
+   HEXKL_MOE_FLAG_HAD_SCALAR | HEXKL_MOE_FLAG_HAD_HMX |                        \
+   HEXKL_MOE_FLAG_HAD_2BIT_ONLY)
 
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */

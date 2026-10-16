@@ -7041,6 +7041,11 @@ private:
                       bool out_to_host = true) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
+    // [PR 4428] act bit 1: the dense FFN's chunks were never rotated, so
+    // the session's online rotation (NNTR_MOE_HADAMARD_SCOPE=all) skips
+    // this call; the experts' calls keep it.
+    if (kind == 1)
+      glu |= 2u;
     const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
 
     const size_t act_bytes = static_cast<size_t>(act_len) * sizeof(float);
