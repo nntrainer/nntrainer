@@ -115,6 +115,15 @@ endif
 if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_fp16', []]]
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
+  # The only test that reaches the ARM NEON FP16 kernels: on aarch64
+  # nntrainer::sgemv dispatches to neon::hgemv, while on x86 it resolves to the
+  # x86/fallback backend and the NEON path is never entered. It also includes
+  # kleidiai_interface.h, whose include directory and nntr_kai_* symbols exist
+  # only off armv7 (see nntrainer/tensor/cpu_backend/arm/meson.build). So gate
+  # it on aarch64 rather than building a test that cannot exercise its target.
+  if host_machine.cpu_family() == 'aarch64'
+    test_target += [['unittest_nntrainer_cpu_backend_fp16', []]]
+  endif
   # Compares nntrainer::Half against the compiler's own half type. That needs a
   # native half to compare against, which is exactly what the wrapper exists to
   # replace, so build it only where both are available -- which is every

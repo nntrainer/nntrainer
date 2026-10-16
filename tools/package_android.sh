@@ -32,7 +32,8 @@ for arg in "$@"; do
     fi
 done
 
-# If --arm-arch specified, read configuration from JSON file
+# The ARM architecture config is always read; --arm-arch only selects which
+# one. Without it, default to armv8.2-a.
 if [[ -z "$arm_arch" ]]; then
     arm_arch="armv8.2-a"
 fi
