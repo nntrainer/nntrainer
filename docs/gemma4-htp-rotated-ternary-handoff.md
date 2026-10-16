@@ -371,6 +371,61 @@ p4096), 앱 peak 4140 / 4176 MB; 새 팩은 arena +832 MiB(7.2절 2).
 TL2 팩 `both_hmx`/`scope=all` 실행 OK. host check 전체 통과(`SET OFFSETS BATCH`,
 `HADAMARD SIGNS` 셀 포함).
 
+### 7.5 새 가중치 포맷에서의 최적화 후보 (프로파일 근거, 2026-10-16 21:40)
+
+측정: `NNTR_HTP_PROFILE=1/2`, p2048 g128, 같은 바이너리(`bin11`), 식힌 기기. TL2 팩 → 새 팩.
+
+| 항목 | TL2 팩 | 새 팩 | 차이의 원인 |
+|---|---|---|---|
+| 프리필 MoE 호출 (31회) dsp us/call | 33,304 | 38,074 | 아래 quant/requant/acc + 4-bit 두 레이어 DMA |
+| 그 중 quant | 1,308 | 2,922 | 입력 회전이 HMX fp16 대신 HVX f32 (부호 때문) |
+| requant | 11 | 320 | down 입력의 HVX 회전 (행마다) |
+| acc | 1,568 | 2,059 | 4-bit affine 레이어의 에필로그 |
+| rest (미귀속) | 12,308 | 15,598 | 4-bit expert DMA (3 MB/expert, 3.9 GB/s) |
+| 디코드 MoE us/token (miss 대기 제외) | 18,404 | 19,969 | 회전 + 4-bit GEMV 2레이어 (moe pcyc/op 0.825→0.973 ms) |
+| 디코드 miss 대기 us/token | 8,008 | 11,601 | 0.18→0.23 ms/miss (4-bit expert 읽기) |
+| 디코드 arm token ms | 55.5 | 61.9 | |
+| arena | 1792 MiB | 2624 MiB | 28·29의 3 MB 슬롯 256개 (read-ahead 동시 상주) |
+
+후보 (효과 큰 순; A는 컨버터만 바꾸면 되고 런타임 변경이 없다):
+
+A. 컨버터 쪽
+1. **28/29를 TL2CX_WH로 저장** (값이 ternary, offset 0 → 무손실). arena −832 MiB; 프리필 두
+   레이어 DMA −~90 ms(2.3배 바이트); 디코드 miss 0.23→0.18 ms, 4-bit GEMV 제거(디코드 +6.4 ms
+   중 ~4 ms 회복); direct prefetch가 전 레이어에 적용(지금은 첫 레이어 크기만). B의 코드는
+   남아도 무해하지만 더는 필요 없다.
+2. **부호를 가중치에 접기**: 런타임의 `x ← (xH)⊙s` 는 W' = D·HᵀW 와 짝이고, D·W' = HᵀW 로 저장하면
+   부호가 사라진다. 행 부호 뒤집기라 ternary 값·출력열 스케일이 그대로(무손실, affine은 offset 0일
+   때). 효과: 사이드카 불필요, HMX fp16 회전 경로 복귀 → quant −~1.6 ms/call(−50 ms/2k 프리필),
+   requant 대부분 회수, 디코드 xor 제거. 부호 없이 `both_hmx`로 돈 측정(21:03, 텍스트는 당시
+   디코드 버그로 깨짐)에서 프리필 624–658, 디코드 13.9였음 — 식힌 A/B로 재확인할 것.
+3. `config.json`의 두 attention 키 (7.2절 1).
+4. `rotation_meta.json`에 실제 R(또는 부호 벡터)을 적어 `tools/htp/recover_hadamard_signs.py`
+   결과와 대조.
+
+B. 런타임, 회전
+5. (2가 안 되면) HMX fp16 회전 경로에 부호 적용: `had_hmx_rows`/`had_hmx_store_group`의 출력
+   열에 fp16 부호 xor. 2보다 비싸고 얻는 것은 같다.
+6. 디코드 down 회전 배치화/융합: M=1에서 expert마다 704폭 행 1개씩 `hvx_hadamard_f32`
+   (`hvx_hadamard_rows_f32`의 2행 HVX 경로는 짝수 행에만) → 8 expert 행을 모아 한 번에,
+   또는 GeGLU 에필로그(`hvx_dq_swiglu`)에 융합. 디코드 MoE pcyc/op +18% 중 일부 회수.
+7. 입력 회전은 op당 1회 공유(`rotated_input`)라 이미 최소.
+
+C. 런타임, 4-bit affine expert (1이 안 될 때)
+8. 28·29 연속 affine 레이어의 read-ahead 동시 상주 제한(클래스 share 또는 128 슬롯 고정):
+   피크 −384 MiB, 대가는 29의 prefetch 상실(+~50 ms 프리필). (LRU 클래스 규칙은 피크를 못 줄였음.)
+9. direct prefetch spare 슬롯을 크기별 두 풀로.
+
+D. 공통(포맷과 무관하나 이번에 드러남)
+10. **디코드 miss 대기 8–11.6 ms/token (토큰의 15–19 %)**: `prefetch hints/token=29,
+    issued/token=0` — 예측 prefetch가 발행되지 않는다(두 팩 모두). `NNTR_HTP_PREDICT`/direct
+    prefetch 설정을 확인하고 켜서 측정할 것. 가장 큰 디코드 항목.
+11. 프리필 `K=2816 N=128 M>1 FC` 30회 261 ms(dsp=0, 전부 transport) = 프리필의 8 %: 호스트 경로로
+    도는 프로젝션. 포맷과 무관, 별도 조사 가치.
+12. static activation scale(D): quant 단계 1.3 ms/call 중 min/max 스캔은 일부 → 프리필 ≤ 1–2 %.
+    가치는 속도가 아니라 양자화 팀의 정확도 제어.
+13. Expert 파일 읽기 1.6–1.7 s/프리필은 호출 밑에 숨음(exposed wait 0) — 손댈 것 없음.
+
 ### 7.4 D (static activation scale) — 미착수, 설계 메모
 
 4.4절 그대로. 구현 시 carrier는 `hexkl_moe_scratch`의 per-call 필드(부호 벡터처럼 세션
