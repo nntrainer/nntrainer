@@ -39,6 +39,7 @@
 #include <lfm2_moe_layer.h>
 #include <lfm2_router_arm.h>
 #include <node_exporter.h>
+#include <rms_norm_rows.h>
 #include <stdexcept>
 #include <thread_manager.h>
 #include <unordered_map>
@@ -644,59 +645,86 @@ void Lfm2MoELayer::buildExpertAssignments(
   const unsigned extended =
     extra_top_k ? std::min<unsigned>(topk + EXTRA_TOPK, num_experts) : topk;
 
-  // Reusable scratch buffers (per token).
-  std::vector<float> sig(num_experts);
-  std::vector<std::pair<float, int>> scored(num_experts);
+  // Compute each token independently, then append in token order so every
+  // expert's rows and scatter accumulation order remain unchanged.
+  const bool parallel = total_tokens >= 128;
+  std::vector<int> selected(parallel ? size_t(total_tokens) * extended : 0);
+  std::vector<float> weights(parallel ? size_t(total_tokens) * topk : 0);
+  const auto route = [&](unsigned begin, unsigned end) {
+    std::vector<float> sig(num_experts);
+    std::vector<std::pair<float, int>> scored(num_experts);
+    for (unsigned int i = begin; i < end; ++i) {
+      const float *lrow = logits + static_cast<size_t>(i) * num_experts;
 
-  for (unsigned int i = 0; i < total_tokens; ++i) {
-    const float *lrow = logits + static_cast<size_t>(i) * num_experts;
+      if (softmax_router) {
+        // softmax_scale (Gemma-4): softmax in f32, selection and weights from
+        // the same scores; the [E] weight scales the top-k weights below.
+        const float mx = *std::max_element(lrow, lrow + num_experts);
+        float sum = 0.0f;
+        for (unsigned int e = 0; e < num_experts; ++e)
+          sum += sig[e] = std::exp(lrow[e] - mx);
+        for (unsigned int e = 0; e < num_experts; ++e)
+          scored[e] = {sig[e] /= sum, static_cast<int>(e)};
+      } else {
+        // sigmoid scores (bias-free) and biased scores used only for selection
+        for (unsigned int e = 0; e < num_experts; ++e) {
+          const float s = 1.0f / (1.0f + std::exp(-lrow[e]));
+          sig[e] = s;
+          scored[e] = {s + bias[e], static_cast<int>(e)};
+        }
+      }
 
-    if (softmax_router) {
-      // softmax_scale (Gemma-4): softmax in f32, selection and weights from
-      // the same scores; the [E] weight scales the top-k weights below.
-      const float mx = *std::max_element(lrow, lrow + num_experts);
-      float sum = 0.0f;
-      for (unsigned int e = 0; e < num_experts; ++e)
-        sum += sig[e] = std::exp(lrow[e] - mx);
-      for (unsigned int e = 0; e < num_experts; ++e)
-        scored[e] = {sig[e] /= sum, static_cast<int>(e)};
-    } else {
-      // sigmoid scores (bias-free) and biased scores used only for selection
-      for (unsigned int e = 0; e < num_experts; ++e) {
-        const float s = 1.0f / (1.0f + std::exp(-lrow[e]));
-        sig[e] = s;
-        scored[e] = {s + bias[e], static_cast<int>(e)};
+      // top-k experts by (sigmoid + bias); an exact tie goes to the lower
+      // index -- a total order, so the selection does not depend on the
+      // library's partial_sort, and the HTP router's rule (m1_ops_det.h)
+      std::partial_sort(
+        scored.begin(), scored.begin() + extended, scored.end(),
+        [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+          return a.first > b.first ||
+                 (a.first == b.first && a.second < b.second);
+        });
+
+      // routing weights come from the bias-free sigmoid scores
+      float wsum = 0.0f;
+      for (unsigned int k = 0; k < topk; ++k)
+        wsum += sig[scored[k].second];
+
+      const float inv = softmax_router   ? 1.0f / wsum
+                        : NORM_TOPK_PROB ? (1.0f / (wsum + 1e-6f))
+                                         : 1.0f;
+      for (unsigned int k = 0; k < topk; ++k) {
+        const int expert_idx = scored[k].second;
+        const float weight =
+          sig[expert_idx] * inv *
+          (softmax_router ? bias[expert_idx] : ROUTED_SCALING_FACTOR);
+        if (parallel)
+          weights[size_t(i) * topk + k] = weight;
+        else
+          expert_assignments[expert_idx].emplace_back(i, weight);
+      }
+      if (parallel) {
+        for (unsigned int k = 0; k < extended; ++k)
+          selected[size_t(i) * extended + k] = scored[k].second;
+      } else if (extra_top_k) {
+        for (unsigned int k = 0; k < extended; ++k)
+          extra_top_k->push_back(scored[k].second);
       }
     }
-
-    // top-k experts by (sigmoid + bias); an exact tie goes to the lower
-    // index -- a total order, so the selection does not depend on the
-    // library's partial_sort, and the HTP router's rule (m1_ops_det.h)
-    std::partial_sort(
-      scored.begin(), scored.begin() + extended, scored.end(),
-      [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
-        return a.first > b.first || (a.first == b.first && a.second < b.second);
-      });
-
-    // routing weights come from the bias-free sigmoid scores
-    float wsum = 0.0f;
-    for (unsigned int k = 0; k < topk; ++k)
-      wsum += sig[scored[k].second];
-
-    const float inv = softmax_router   ? 1.0f / wsum
-                      : NORM_TOPK_PROB ? (1.0f / (wsum + 1e-6f))
-                                       : 1.0f;
-    for (unsigned int k = 0; k < topk; ++k) {
-      const int expert_idx = scored[k].second;
-      const float weight =
-        sig[expert_idx] * inv *
-        (softmax_router ? bias[expert_idx] : ROUTED_SCALING_FACTOR);
-      expert_assignments[expert_idx].emplace_back(i, weight);
-    }
-    if (extra_top_k) {
-      for (unsigned int k = 0; k < extended; ++k)
-        extra_top_k->push_back(scored[k].second);
-    }
+  };
+  if (parallel) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    const unsigned jobs = std::min(total_tokens, tm.getComputeThreadCount());
+    tm.parallel_for(0, jobs, [&](size_t job) {
+      route(total_tokens * job / jobs, total_tokens * (job + 1) / jobs);
+    });
+    for (unsigned i = 0; i < total_tokens; ++i)
+      for (unsigned k = 0; k < topk; ++k)
+        expert_assignments[selected[size_t(i) * extended + k]].emplace_back(
+          i, weights[size_t(i) * topk + k]);
+    if (extra_top_k)
+      extra_top_k->insert(extra_top_k->end(), selected.begin(), selected.end());
+  } else {
+    route(0, total_tokens);
   }
 }
 
@@ -828,6 +856,8 @@ static void normRows(const nntrainer::Tensor &src, nntrainer::Tensor &dst,
                 std::invalid_argument)
     << "MoE layer: in_norm / router_norm / out_norm are FP32 only";
   const unsigned int width = src.width();
+  if (parallelRmsNormRows(src, dst, gamma, eps))
+    return;
   nntrainer::rms_norm_wrt_width_fp32_intrinsic(
     src.getData<float>(), dst.getData<float>(), src.size() / width, width, eps);
   dst.multiply_i(gamma);

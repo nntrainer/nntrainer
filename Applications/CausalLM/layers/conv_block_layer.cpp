@@ -136,6 +136,82 @@ static bool lfmConvPostGatePrefill(const float *gated, const float *weights,
 #endif
 }
 
+/** Fuse the pre-gate with convolution in independent row stripes. Each stripe
+ * reconstructs its two boundary rows from the immutable projection, then reads
+ * its own freshly written gated rows. Arithmetic and saved history are
+ * unchanged.
+ */
+static bool lfmConvFusedGatePrefill(const float *projection,
+                                    const float *weights, float *gated,
+                                    float *output, unsigned rows,
+                                    unsigned channels) {
+#if defined(__aarch64__)
+  if (!projection || !weights || !gated || !output || rows < 16 ||
+      channels != 2048)
+    return false;
+  const size_t bytes = size_t(rows) * channels * sizeof(float);
+  const auto disjoint = [](const void *a, size_t an, const void *b, size_t bn) {
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x >= an : x - y >= bn;
+  };
+  for (const float *dst : {gated, output})
+    if (!disjoint(dst, bytes, projection, 3u * bytes) ||
+        !disjoint(dst, bytes, weights, 3u * channels * sizeof(float)))
+      return false;
+  if (!disjoint(gated, bytes, output, bytes))
+    return false;
+  constexpr unsigned stripe = 64;
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, (rows + stripe - 1u) / stripe, [&](size_t job) {
+#if defined(__clang__)
+#pragma clang fp exceptions(strict)
+#endif
+      const unsigned first = unsigned(job) * stripe;
+      const unsigned last = std::min(rows, first + stripe);
+      const float32x4_t zero = vdupq_n_f32(0.0f);
+      for (unsigned r = first; r < last; ++r) {
+        const float *p = projection + size_t(r) * 3u * channels;
+        float *g = gated + size_t(r) * channels;
+        float *out = output + size_t(r) * channels;
+        for (unsigned c = 0; c < channels; c += 4) {
+          const float32x4_t cur =
+            vmulq_f32(vld1q_f32(p + 2u * channels + c), vld1q_f32(p + c));
+          vst1q_f32(g + c, cur);
+          float32x4_t prev1 = zero, prev2 = zero;
+          if (r > first)
+            prev1 = vld1q_f32(g - channels + c);
+          else if (r) {
+            const float *q = p - 3u * channels;
+            prev1 =
+              vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
+          }
+          if (r >= first + 2u)
+            prev2 = vld1q_f32(g - 2u * channels + c);
+          else if (r >= 2u) {
+            const float *q = p - 6u * channels;
+            prev2 =
+              vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
+          }
+          float32x4_t v = vmulq_f32(cur, vld1q_f32(weights + c));
+          v = vfmaq_f32(v, prev1, vld1q_f32(weights + channels + c));
+          v = vfmaq_f32(v, prev2, vld1q_f32(weights + 2u * channels + c));
+          vst1q_f32(out + c, vmulq_f32(v, vld1q_f32(p + channels + c)));
+        }
+      }
+    });
+  return true;
+#else
+  (void)projection;
+  (void)weights;
+  (void)gated;
+  (void)output;
+  (void)rows;
+  (void)channels;
+  return false;
+#endif
+}
+
 #if defined(__aarch64__)
 // Chunk-local projection rows use the global gated history. The full helper
 // above stays separate so existing prompts keep their original row callback.
@@ -612,10 +688,14 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     NNTR_THROW_IF(htp_owns_state_ && from > 0, std::runtime_error)
       << "conv_block: a multi-row forwarding at " << from
       << " after the HTP decode hook took over the conv state";
-    nntrainer::ThreadManager::Global().parallel_for(
-      0, static_cast<size_t>(rows), gate_pre);
-    const bool post_gated = from == 0 && lfm_prefill &&
-                            lfmConvPostGatePrefill(g, w_ptr, p, y, rows, C);
+    const bool fused_gate = from == 0 && lfm_prefill &&
+                            lfmConvFusedGatePrefill(p, w_ptr, g, y, rows, C);
+    if (!fused_gate)
+      nntrainer::ThreadManager::Global().parallel_for(
+        0, static_cast<size_t>(rows), gate_pre);
+    const bool post_gated =
+      fused_gate || (from == 0 && lfm_prefill &&
+                     lfmConvPostGatePrefill(g, w_ptr, p, y, rows, C));
     if (from == 0) {
       if (!post_gated)
         nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
