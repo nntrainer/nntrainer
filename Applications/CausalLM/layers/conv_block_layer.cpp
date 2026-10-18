@@ -108,6 +108,10 @@ void ConvBlockLayer::finalize(nntrainer::InitLayerContext &context) {
     w_in, weight_initializer, weight_regularizer, weight_regularizer_constant,
     weight_decay, "in_proj", true);
   nntrainer::TensorDim w_conv({1, 1, KERNEL_SIZE, C}, f32_type);
+  // DW3_INT4 is an opaque 10*C byte record in an aligned FP32 carrier.
+  // The carrier is never used as floating-point weight data.
+  if (packed_short_conv_)
+    w_conv = nntrainer::TensorDim({1, 1, 5, C / 2}, f32_type);
   weight_idx[CONV_W] = context.requestWeight(
     w_conv, nntrainer::Initializer::NONE, nntrainer::WeightRegularizer::NONE,
     0.0f, 0.0f, "conv", false);
@@ -144,7 +148,14 @@ void ConvBlockLayer::exportTo(nntrainer::Exporter &exporter,
 }
 
 void ConvBlockLayer::setProperty(const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, conv_props);
+  std::vector<std::string> filtered;
+  for (const auto &v : values) {
+    if (v == "short_conv_dtype=DW3_INT4")
+      packed_short_conv_ = true;
+    else
+      filtered.push_back(v);
+  }
+  auto remain_props = loadProperties(filtered, conv_props);
   LayerImpl::setProperty(remain_props);
 }
 
@@ -180,9 +191,30 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     output_.getSharedDataTensor(out_step_dim, 0, true);
 
   const unsigned int K = in_step_dim.width();
-  const unsigned int C = conv_w.width();
+  const unsigned int C = std::get<nntrainer::props::Unit>(conv_props).get();
   const unsigned int N = out_w.width();
   const float *w_ptr = conv_w.getData<float>();
+  if (packed_short_conv_) {
+    if (decoded_short_conv_.empty()) {
+      decoded_short_conv_.resize(3 * C);
+      const auto *raw = reinterpret_cast<const unsigned char *>(w_ptr);
+      for (unsigned c = 0; c < C; ++c) {
+        float scale;
+        int32_t offset;
+        std::memcpy(&scale, raw + 2 * C + 4 * c, 4);
+        std::memcpy(&offset, raw + 6 * C + 4 * c, 4);
+        for (unsigned t = 0; t < 3; ++t) {
+          const unsigned code = (raw[2 * c + t / 2] >> (4 * (t % 2))) & 15;
+          float value = (int32_t(code) + offset) * scale;
+          uint32_t bits;
+          std::memcpy(&bits, &value, 4);
+          bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+          std::memcpy(&decoded_short_conv_[t * C + c], &bits, 4);
+        }
+      }
+    }
+    w_ptr = decoded_short_conv_.data();
+  }
   float *state = state_t.getData<float>();
 
   // The whole block as one accelerator call at prefill; it hands back the
@@ -190,7 +222,18 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // CPU for the reason every FC gate has (accelerates_q4_0_at_m1): one
   // row cannot amortize the call.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
-  auto *ops = in_step.getOps();
+  auto *ops = context.getComputeOps();
+  const auto affine = ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
+  const bool packed_fc =
+    in_w.getDataType() == affine && out_w.getDataType() == affine;
+  if (packed_fc && !ops)
+    throw std::runtime_error("Packed conv projections require an HTP engine");
+  if (packed_fc) {
+    if (!ops->set_fc_wh_source(in_w.getData(), K, 3 * C, true) ||
+        !ops->set_fc_wh_source(out_w.getData(), C, N, true))
+      throw std::runtime_error(
+        "Packed conv projections require HTP FC support");
+  }
   const bool use_htp = rows > 1 && ops != nullptr &&
                        ops->supports_gemm_q4_0_conv_block_fp32() &&
                        in_w.getDataType() == q4 && out_w.getDataType() == q4;
@@ -236,7 +279,14 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                 in_w.getData<char>(), 3 * C,
                                 proj.getData<float>(), 3 * C);
   } else if (!row_resident) {
-    in_step.dot(in_w, proj, false, false);
+    if (packed_fc) {
+      ops->gemm_qs4cx_accel_fp32(in_w.getData<char>(), in_w.getScale<float>(),
+                                 in_step.getData<float>(),
+                                 proj.getData<float>(), rows, 3 * C, K);
+      ops->sync_to_host(proj.getData(), rows * 3 * C * sizeof(float));
+    } else {
+      in_step.dot(in_w, proj, false, false);
+    }
   }
 
   const float *p = proj.getData<float>();
@@ -306,7 +356,14 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::gemm_q4_0<float>(rows, N, C, y, C, out_w.getData<char>(), N,
                                 out_step.getData<float>(), N);
   } else if (!row_resident) {
-    conv_out.dot(out_w, out_step, false, false);
+    if (packed_fc) {
+      ops->gemm_qs4cx_accel_fp32(out_w.getData<char>(), out_w.getScale<float>(),
+                                 conv_out.getData<float>(),
+                                 out_step.getData<float>(), rows, N, C);
+      ops->sync_to_host(out_step.getData(), rows * N * sizeof(float));
+    } else {
+      conv_out.dot(out_w, out_step, false, false);
+    }
   }
 
   if (compare) {

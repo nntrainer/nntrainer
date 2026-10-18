@@ -316,6 +316,18 @@ void Gemma4HtpTransformer::repack_weight() {
       for (auto &w : weights) {
         auto &t = w->getVariableRef();
         const auto dtype = t.getDataType();
+        if (ops && dtype == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE &&
+            w->getName().size() >= 5 &&
+            w->getName().compare(w->getName().size() - 5, 5, ":gate") == 0) {
+          if (!ops->set_fc_wh_source(t.getData(), t.height(), t.width(), true))
+            throw std::runtime_error("INT4 router requires the HTP backend");
+          fc_pending.push_back({ops, t.getData<char>(), t.getScale<float>(),
+                                static_cast<unsigned>(t.height()),
+                                static_cast<unsigned>(t.width())});
+          // The graph borrows this packed record until its first invocation.
+          cpu_weight_sources.insert(t.getData());
+          continue;
+        }
         auto *weight_ops = context.getComputeOps();
         const bool cpu_pack = !weight_ops ||
                               !weight_ops->supports_gemm_qs4cx_accel_fp32() ||

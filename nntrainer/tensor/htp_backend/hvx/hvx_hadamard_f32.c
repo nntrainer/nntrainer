@@ -62,7 +62,46 @@ int hvx_hadamard_supported(uint32_t n) {
     return 0;
   if ((n & (n - 1u)) == 0u)
     return 1;
+  if (n == 1536u)
+    return 1;
   return n % 44u == 0u && ((n / 44u) & (n / 44u - 1u)) == 0u;
+}
+
+/* LFM2 SR15's dephased H12. Rows of x multiply H12 on the right;
+ * it is not symmetric. The output signs are supplied by the checkpoint. */
+static const int8_t lfm_h12[12][12] = {
+  {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+  {1, -1, -1, 1, -1, -1, -1, 1, 1, 1, -1, 1},
+  {1, 1, -1, -1, 1, -1, -1, -1, 1, 1, 1, -1},
+  {1, -1, 1, -1, -1, 1, -1, -1, -1, 1, 1, 1},
+  {1, 1, -1, 1, -1, -1, 1, -1, -1, -1, 1, 1},
+  {1, 1, 1, -1, 1, -1, -1, 1, -1, -1, -1, 1},
+  {1, 1, 1, 1, -1, 1, -1, -1, 1, -1, -1, -1},
+  {1, -1, 1, 1, 1, -1, 1, -1, -1, 1, -1, -1},
+  {1, -1, -1, 1, 1, 1, -1, 1, -1, -1, 1, -1},
+  {1, -1, -1, -1, 1, 1, 1, -1, 1, -1, -1, 1},
+  {1, 1, -1, -1, -1, 1, 1, 1, -1, 1, -1, -1},
+  {1, -1, 1, -1, -1, -1, 1, 1, 1, -1, 1, -1}};
+
+static void hadamard_lfm1536(float *x) {
+  for (uint32_t step = 1; step < 128; step *= 2)
+    for (uint32_t base = 0; base < 1536; base += 2 * step)
+      for (uint32_t j = 0; j < step; ++j) {
+        const float a = x[base + j], b = x[base + j + step];
+        x[base + j] = a + b;
+        x[base + j + step] = a - b;
+      }
+  for (uint32_t k = 0; k < 128; ++k) {
+    float v[12];
+    for (uint32_t i = 0; i < 12; ++i)
+      v[i] = x[i * 128 + k];
+    for (uint32_t j = 0; j < 12; ++j) {
+      float sum = 0;
+      for (uint32_t i = 0; i < 12; ++i)
+        sum += lfm_h12[i][j] * v[i];
+      x[j * 128 + k] = sum * 0.025515519082546234f;
+    }
+  }
 }
 
 static void hadamard_scalar(float *x, uint32_t n, uint32_t p) {
@@ -280,6 +319,10 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
 int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
   if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u))
     return -1;
+  if (n == 1536u) {
+    hadamard_lfm1536(x);
+    return 0;
+  }
   const uint32_t p = (n & (n - 1u)) == 0u ? n : n / 44u;
 #if defined(__hexagon__)
   if (mode == 2u && n % 32u == 0u && p >= 16u) {

@@ -433,12 +433,14 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   if (router_norm)
     router_gamma_idx = request_gamma("router_norm_gamma");
 
-  // 4. Initialize gate layer (router). Always kept FP32.
+  // 4. Initialize gate layer; SR15 keeps its affine INT4 grid packed.
   nntrainer::TensorDim gate_dim(
     1, is_nchw ? 1 : num_experts, is_nchw ? hidden_size : 1,
     is_nchw ? num_experts : hidden_size,
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     nntrainer::TensorDim::DataType::FP32),
+    nntrainer::TensorDim::TensorType(
+      context.getFormat(), router_q4_
+                             ? nntrainer::TensorDim::DataType::QS4CX_WH_AFFINE
+                             : nntrainer::TensorDim::DataType::FP32),
     is_nchw ? 0b0011 : 0b0101);
 
   gate_idx = context.requestWeight(
@@ -779,6 +781,26 @@ static bool routerLogitsOnAccelerator(
   return true;
 }
 
+/** @brief Route packed router weights through the layer's accelerator.
+ * Router scratch tensors can have CPU context even in an HTP MoE layer. */
+static void routerDot(nntrainer::RunLayerContext &context,
+                      nntrainer::Tensor &rows, nntrainer::Tensor &weight,
+                      nntrainer::Tensor &logits, unsigned tokens,
+                      unsigned hidden, unsigned experts) {
+  if (weight.getDataType() != nntrainer::Tdatatype::QS4CX_WH_AFFINE) {
+    rows.dot(weight, logits);
+    return;
+  }
+  auto *ops = context.getComputeOps();
+  if (!ops || !ops->supports_gemm_qs4cx_accel_fp32() ||
+      !ops->set_fc_wh_source(weight.getData(), hidden, experts, true))
+    throw std::runtime_error("Packed LFM2 router requires HTP FC support");
+  ops->gemm_qs4cx_accel_fp32(weight.getData<char>(), weight.getScale<float>(),
+                             rows.getData<float>(), logits.getData<float>(),
+                             tokens, experts, hidden);
+  ops->sync_to_host(logits.getData(), tokens * experts * sizeof(float));
+}
+
 /** @brief buildExpertAssignments' output from the accelerator's selection:
  *  token by token, its top_k experts in selection order with their
  *  weights, and the n_sel-long ranking as the prefetch hint. */
@@ -877,7 +899,8 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &expert_bias = context.getWeight(expert_bias_idx);
   if (!router_on_accel) {
     M0Timer t(&g_m0.router);
-    router_in.dot(gate_weights, router_logits);
+    routerDot(context, router_in, gate_weights, router_logits, total_tokens,
+              hidden_size, num_experts);
   }
 
   std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
@@ -1220,7 +1243,7 @@ static bool tryMoeLayerOnAccelerator(
   const float *add_x2 = nullptr, const float *add_gamma = nullptr,
   float add_scale = 1.0f, bool *add_done = nullptr, bool out_to_host = true) {
 
-  auto *ops = input.getOps();
+  auto *ops = context.getComputeOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
     if (experts_virtual) {
       throw std::runtime_error("virtual MoE experts (NNTR_MOE_CACHE_EXPERTS) "
@@ -1802,7 +1825,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // epilogue's residual (doc 57 section 9.30). Alone it gained nothing
     // (section 9.27), so only then; decode and the MoE diff / shadow
     // instruments, which read the normed copy, keep the CPU norm.
-    auto *moe_ops = raw.getOps();
+    auto *moe_ops = context.getComputeOps();
     const bool norm_on_accel = out_add && in_norm && to - from > 1 &&
                                moeDiffRows() < 0 && !moeShadowEnabled() &&
                                moe_ops != nullptr &&
@@ -1870,7 +1893,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing, part two: the dot the accelerator did not do
     if (!router_on_accel) {
       M0Timer t(&g_m0.router);
-      router_in.dot(gate_weights, router_logits);
+      routerDot(context, router_in, gate_weights, router_logits, total_tokens,
+                hidden_size, num_experts);
     }
 
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
@@ -2219,7 +2243,14 @@ void Lfm2MoELayer::save(std::ofstream &file,
 }
 
 void Lfm2MoELayer::setProperty(const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, moe_props);
+  std::vector<std::string> filtered;
+  for (const auto &v : values) {
+    if (v == "router_dtype=QS4CX_WH_AFFINE")
+      router_q4_ = true;
+    else
+      filtered.push_back(v);
+  }
+  auto remain_props = loadProperties(filtered, moe_props);
   nntrainer::LayerImpl::setProperty(remain_props);
 }
 

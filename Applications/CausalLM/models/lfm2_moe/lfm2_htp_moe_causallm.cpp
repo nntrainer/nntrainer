@@ -7,6 +7,7 @@
 #include "lfm2_htp_moe_causallm.h"
 #include <algorithm>
 #include <app_context.h>
+#include <cmath>
 #include <conv_block_layer.h>
 #include <cstring>
 #include <engine.h>
@@ -34,10 +35,16 @@ Lfm2HtpMoECausalLM::Lfm2HtpMoECausalLM(json &cfg, json &gen, json &nntr) :
 
 void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
   Gemma4HtpCausalLM::setupParameters(cfg, gen, nntr);
-  if (nntr.value("lfm2_weight_format", std::string()) != "htp_fused_v1" ||
+  sr15_ = nntr.value("lfm2_weight_format", std::string()) == "sr15_v2";
+  if (nntr.value("activation_quantization", std::string("dynamic")) !=
+      "dynamic")
+    throw std::invalid_argument(
+      "LFM2 HTP currently supports dynamic activation quantization");
+  if ((!sr15_ &&
+       nntr.value("lfm2_weight_format", std::string()) != "htp_fused_v1") ||
       cfg.value("model_type", std::string()) != "lfm2_moe")
     throw std::invalid_argument(
-      "LFM2 MoE requires lfm2_weight_format=htp_fused_v1");
+      "LFM2 MoE requires lfm2_weight_format=htp_fused_v1 or sr15_v2");
   dense_layers_ = cfg.at("num_dense_layers").get<unsigned>();
   NUM_EXPERTS = cfg.at("num_experts").get<unsigned>();
   NUM_EXPERTS_PER_TOK = cfg.at("num_experts_per_tok").get<unsigned>();
@@ -71,11 +78,17 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
     if (engine != "htp")
       throw std::invalid_argument(
         "LFM2 fused profile requires all HTP engines");
-  if (MOE_LAYER_DTYPE != "TL2CX_WH" || FC_LAYER_DTYPE != "QS4CX_WH_AFFINE" ||
-      LMHEAD_DTYPE != "QS4CX_WH_AFFINE" || EMBEDDING_DTYPE != "FP32" ||
-      nntr.value("short_conv_dtype", std::string()) != "FP32")
-    throw std::invalid_argument("LFM2 fused profile requires TL2, affine WH, "
-                                "FP32 embedding and FP32 conv");
+  if ((sr15_ &&
+       nntr.value("router_dtype", std::string()) != "QS4CX_WH_AFFINE") ||
+      MOE_LAYER_DTYPE != "TL2CX_WH" || FC_LAYER_DTYPE != "QS4CX_WH_AFFINE" ||
+      LMHEAD_DTYPE != "QS4CX_WH_AFFINE" ||
+      EMBEDDING_DTYPE != (sr15_ ? "Q4_0" : "FP32") ||
+      nntr.value("short_conv_dtype", std::string()) !=
+        (sr15_ ? "DW3_INT4" : "FP32"))
+    throw std::invalid_argument("LFM2 fused profile dtype mismatch: use TL2 "
+                                "experts and affine WH projections; "
+                                "sr15_v2 additionally requires Q4_0 embedding, "
+                                "affine WH router and DW3_INT4 conv");
 #ifdef ENABLE_HEXKL
   nntrainer::get_htp_ops()->set_moe_geglu(false);
 #else
@@ -131,9 +144,10 @@ Tensor Lfm2HtpMoECausalLM::attentionBlock(unsigned l, Tensor input) {
 
 std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
   Tensor x({1, 1, 1, static_cast<unsigned>(INIT_SEQ_LEN)}, "input0");
-  LayerHandle embedding(createLayer(
-    "embedding_layer", buildEmbeddingLayerProperties("embedding0", NUM_VOCAB,
-                                                     DIM, "FP32", 1.0f, "")));
+  LayerHandle embedding(
+    createLayer("embedding_layer",
+                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
+                                              EMBEDDING_DTYPE, 1.0f, "")));
   Tensor h = embedding(x);
   for (unsigned l = 0; l < unsigned(NUM_LAYERS); ++l) {
     const std::string p = "layer" + std::to_string(l);
@@ -143,10 +157,12 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         createLayer("rms_norm", {withKey("name", p + "_conv_norm"),
                                  withKey("epsilon", std::to_string(NORM_EPS)),
                                  withKey("packed", "false")}));
-      LayerHandle conv(createLayer(
-        "conv_block",
-        {withKey("name", p + "_conv"), withKey("unit", DIM),
-         withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "htp")}));
+      std::vector<std::string> conv_props = {
+        withKey("name", p + "_conv"), withKey("unit", DIM),
+        withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "htp")};
+      if (sr15_)
+        conv_props.push_back("short_conv_dtype=DW3_INT4");
+      LayerHandle conv(createLayer("conv_block", conv_props));
       branch = conv(norm(h));
     } else {
       branch = attentionBlock(l, h);
@@ -178,6 +194,8 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         withKey("engine", "htp")};
       if (MOE_CACHE_EXPERTS)
         props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
+      if (sr15_)
+        props.push_back("router_dtype=QS4CX_WH_AFFINE");
       LayerHandle moe(createLayer("lfm2_moe", props));
       branch = moe(h);
     }
@@ -206,6 +224,69 @@ void Lfm2HtpMoECausalLM::allocateAndBindKVCache() {
 void Lfm2HtpMoECausalLM::load_weight(const std::string &path) {
   if (prepared_)
     throw std::logic_error("Create a new LFM2 handle to reload weights");
+#ifdef ENABLE_HEXKL
+  if (sr15_) {
+    const auto dir = std::filesystem::path(path).parent_path();
+    std::ifstream mf(dir / "conversion_report.json");
+    if (!mf)
+      throw std::runtime_error("Missing SR15 manifest");
+    const auto manifest = json::parse(mf);
+    if (manifest.at("format") != "nntr_lfm2_sr15_v2" ||
+        std::filesystem::file_size(path) !=
+          manifest.at("bytes").get<uint64_t>())
+      throw std::runtime_error("Invalid SR15 manifest or weight length");
+    std::ifstream weights(path, std::ios::binary);
+    std::vector<float> signs[2];
+    if (manifest.at("rotations").size() != 2)
+      throw std::runtime_error("SR15 requires two rotation records");
+    for (const auto &r : manifest.at("rotations")) {
+      const auto name = r.at("name").get<std::string>();
+      if (name != "R_in" && name != "R_down")
+        throw std::runtime_error("Unknown SR15 rotation");
+      const unsigned which = name == "R_in" ? 0 : 1;
+      if (!signs[which].empty())
+        throw std::runtime_error("Duplicate SR15 rotation");
+      const unsigned width = which == 0 ? DIM : MOE_INTERMEDIATE_SIZE;
+      if (r.at("shape")[0] != width || r.at("shape")[1] != width ||
+          r.at("sylvester_width") != (which == 0 ? 2048 : 128))
+        throw std::runtime_error("Unsupported SR15 rotation geometry");
+      const unsigned basis_width = which == 0 ? 1 : 12;
+      const unsigned basis_bytes = basis_width * basis_width;
+      const uint64_t offset = r.at("offset").get<uint64_t>();
+      const uint64_t size = manifest.at("bytes").get<uint64_t>();
+      if (r.at("basis_width") != basis_width ||
+          r.at("bytes") != width + basis_bytes || offset > size ||
+          width + basis_bytes > size - offset ||
+          r.at("magnitude").get<float>() != float(1.0 / std::sqrt(width)))
+        throw std::runtime_error("Invalid SR15 rotation record");
+      std::vector<int8_t> values(width);
+      weights.seekg(r.at("offset").get<uint64_t>());
+      weights.read(reinterpret_cast<char *>(values.data()), width);
+      if (!weights)
+        throw std::runtime_error("Truncated SR15 rotation");
+      for (auto v : values) {
+        if (v != 1 && v != -1)
+          throw std::runtime_error("Invalid rotation sign");
+        signs[which].push_back(v);
+      }
+      // H12 is the dephased circulant basis used by the DSP kernel.
+      constexpr int8_t seed[11] = {-1, -1, 1, -1, -1, -1, 1, 1, 1, -1, 1};
+      for (unsigned row = 0; row < basis_width; ++row)
+        for (unsigned col = 0; col < basis_width; ++col) {
+          int8_t actual = 0;
+          weights.read(reinterpret_cast<char *>(&actual), 1);
+          const int8_t expected =
+            row == 0 || col == 0 ? 1 : seed[(col + 11 - row) % 11];
+          if (!weights || actual != expected)
+            throw std::runtime_error(
+              "SR15 Hadamard basis differs from DSP basis");
+        }
+    }
+    if (signs[0].size() != DIM || signs[1].size() != MOE_INTERMEDIATE_SIZE ||
+        !nntrainer::get_htp_ops()->set_moe_hadamard_signs(signs[0], signs[1]))
+      throw std::runtime_error("SR15 rotation signs rejected");
+  }
+#endif
   loading_ = true;
   try {
     CausalLM::load_weight(path);
@@ -441,8 +522,16 @@ void Lfm2HtpMoECausalLM::prepareDecodeGraph() {
       break;
     }
     case HTP_OP_ROUTER_TOPK:
-      hand(i, HTP_GRAPH_PARAM_ROUTER_W,
-           f32(p + "_sparse_moe:gate", DIM * NUM_EXPERTS), DIM * NUM_EXPERTS);
+      if (sr15_) {
+        auto &t = weight(p + "_sparse_moe:gate");
+        if (!ops->set_fc_wh_source(t.getData(), DIM, NUM_EXPERTS, true))
+          throw std::runtime_error("HTP rejected INT4 router");
+        hand(i, HTP_GRAPH_PARAM_ROUTER_WH,
+             reinterpret_cast<const float *>(t.getData<char>()), t.bytes() / 4);
+      } else {
+        hand(i, HTP_GRAPH_PARAM_ROUTER_W,
+             f32(p + "_sparse_moe:gate", DIM * NUM_EXPERTS), DIM * NUM_EXPERTS);
+      }
       hand(i, HTP_GRAPH_PARAM_ROUTER_BIAS,
            f32(p + "_sparse_moe:expert_bias", NUM_EXPERTS), NUM_EXPERTS);
       break;

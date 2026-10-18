@@ -87,6 +87,8 @@ public:
   nntrainer::Tensor &convState(nntrainer::RunLayerContext &context);
 
 private:
+  bool packed_short_conv_ = false;
+  std::vector<float> decoded_short_conv_;
   /** unit = the conv width C (in_proj is 3C wide) */
   std::tuple<nntrainer::props::Unit> conv_props;
   std::array<unsigned int, 3> weight_idx; /**< in_proj, conv, out_proj */

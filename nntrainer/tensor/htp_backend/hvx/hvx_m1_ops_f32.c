@@ -425,6 +425,29 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 
+void hvx_router_topk_wh(const float *x, const uint8_t *w, const float *bias,
+                        uint32_t K, uint32_t E, uint32_t top_k, float *logits,
+                        uint32_t *sel, float *weight) {
+  float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
+  const float *scale = (const float *)(w + (size_t)K * E / 2u);
+  const int32_t *offset = (const int32_t *)(scale + 2u * E);
+  for (uint32_t e = 0; e < E; ++e) {
+    float sum = 0;
+    for (uint32_t k = 0; k < K; ++k) {
+      const uint32_t r = k % 32u, c = e % 32u;
+      const size_t tile = ((size_t)(k / 32u) * (E / 32u) + e / 32u) * 512u;
+      const uint32_t byte = (r / 8u) * 128u + c * 4u + r % 4u;
+      int q = (w[tile + byte] >> (4u * ((r / 4u) % 2u))) & 15u;
+      if (q >= 8)
+        q -= 16;
+      sum += x[k] * (float)(q + offset[e]);
+    }
+    logits[e] = sum * scale[e];
+    m1_router_cpu_sigmoid(logits[e], bias[e], &sig[e], &score[e]);
+  }
+  m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
+}
+
 /* ---- [plan 201 S4] Gemma 4's softmax router ----------------------------- */
 
 typedef struct {

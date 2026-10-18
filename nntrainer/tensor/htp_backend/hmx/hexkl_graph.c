@@ -545,8 +545,12 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
       out, (const hvx_router_sm_weights *)g->param[i], g->state[i] + op->K,
       op->top_k, out, sel, w, call->env->pool);
   } else {
-    hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
-                        op->top_k, out, sel, w, call->env->pool);
+    if (g->router_wh[i])
+      hvx_router_topk_wh(in, (const uint8_t *)g->param[i], g->state[i], op->K,
+                         op->n_experts, op->top_k, out, sel, w);
+    else
+      hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
+                          op->top_k, out, sel, w, call->env->pool);
   }
 }
 
@@ -1111,6 +1115,10 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which,
     return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
   case HTP_GRAPH_PARAM_ROUTER_W:
     return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_WH:
+    return op->kind == HTP_OP_ROUTER_TOPK && op->eps_bits == 0u
+             ? op->K * op->n_experts / 8u + 3u * op->n_experts
+             : 0u;
   case HTP_GRAPH_PARAM_ROPE_TABLE: /* [plan 201 S4] the op's own */
     return op->kind == HTP_OP_ROPE ? op->head_dim * max_seq : 0u;
   case HTP_GRAPH_PARAM_ROUTER_BIAS: /* softmax: g[K] | per-expert scale */
@@ -1320,6 +1328,16 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
   }
   if (n != want) {
     return AEE_EINVALIDFORMAT;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_WH) {
+    float *packed = (float *)memalign(128, (size_t)n * sizeof(float));
+    if (!packed)
+      return AEE_ENOMEMORY;
+    memcpy(packed, data, (size_t)n * sizeof(float));
+    free(*dst);
+    *dst = packed;
+    g->router_wh[op] = 1u;
+    return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_ROUTER_W) {
     /** [K][E] padded to [K][W], zero lanes, with E rounded up to

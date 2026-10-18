@@ -2736,6 +2736,11 @@ public:
     case HTP_GRAPH_PARAM_ROUTER_W:
       want = rec->kind == HTP_OP_ROUTER_TOPK ? rec->K * rec->n_experts : 0u;
       break;
+    case HTP_GRAPH_PARAM_ROUTER_WH:
+      want = rec->kind == HTP_OP_ROUTER_TOPK && rec->eps_bits == 0u
+               ? rec->K * rec->n_experts / 8u + 3u * rec->n_experts
+               : 0u;
+      break;
     case HTP_GRAPH_PARAM_ROUTER_BIAS:
       want = rec->kind != HTP_OP_ROUTER_TOPK ? 0u
              : rec->eps_bits != 0u           ? rec->K + rec->n_experts
@@ -7718,7 +7723,11 @@ private:
     const auto direct = direct_wh_.find(q4);
     if (direct != direct_wh_.end()) {
       if (direct->second.K != K || direct->second.N != N)
-        throw std::invalid_argument("QS4CX_WH FC source shape mismatch");
+        throw std::invalid_argument(
+          "QS4CX_WH FC source shape mismatch: requested " + std::to_string(K) +
+          "x" + std::to_string(N) + " registered " +
+          std::to_string(direct->second.K) + "x" +
+          std::to_string(direct->second.N));
       return &direct->second;
     }
     if (fcwh_fd_ < 0)
@@ -10162,8 +10171,9 @@ private:
       static_cast<int>(bias.size()), &handle);
     const uint64_t rpc_us = HtpProfile::nowUs() - t_rpc;
     if (err != AEE_SUCCESS) {
-      throw std::runtime_error("nntr_hvx_weight_register_u8i4 failed: err=" +
-                               std::to_string(err));
+      throw std::runtime_error(
+        "nntr_hvx_weight_register_u8i4 failed: " + std::to_string(K) + "x" +
+        std::to_string(N) + " err=" + std::to_string(err));
     }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) {
