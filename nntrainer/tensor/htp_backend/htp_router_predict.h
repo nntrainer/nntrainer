@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <htp_wh_layout.h>
 #include <numeric>
 #include <vector>
 namespace nntrainer {
@@ -111,15 +112,9 @@ public:
  * all expert IDs and mixture weights.
  */
 inline std::vector<unsigned>
-htpPredictExperts(const float *input, const float *weights, unsigned hidden,
-                  unsigned experts, unsigned top,
-                  const float *sigmoid_bias = nullptr) {
-  if (!input || !weights || !hidden || !experts || !top)
-    return {};
-  std::vector<float> scores(experts, 0.0f);
-  for (unsigned h = 0; h < hidden; ++h)
-    for (unsigned e = 0; e < experts; ++e)
-      scores[e] += input[h] * weights[static_cast<size_t>(h) * experts + e];
+htpRankPredictedExperts(std::vector<float> &scores, unsigned top,
+                        const float *sigmoid_bias) {
+  const unsigned experts = scores.size();
   for (float score : scores)
     if (!std::isfinite(score))
       return {};
@@ -142,5 +137,54 @@ htpPredictExperts(const float *input, const float *weights, unsigned hidden,
   ids.resize(top);
   return ids;
 }
+/** Rank a borrowed row-major FP32 gate; no expanded model copy is retained. */
+inline std::vector<unsigned>
+htpPredictExperts(const float *input, const float *weights, unsigned hidden,
+                  unsigned experts, unsigned top,
+                  const float *sigmoid_bias = nullptr) {
+  if (!input || !weights || !hidden || !experts || !top)
+    return {};
+  std::vector<float> scores(experts, 0.0f);
+  for (unsigned h = 0; h < hidden; ++h)
+    for (unsigned e = 0; e < experts; ++e)
+      scores[e] += input[h] * weights[static_cast<size_t>(h) * experts + e];
+  return htpRankPredictedExperts(scores, top, sigmoid_bias);
+}
+
+/** Prediction-only dot directly from the affine WH image. Keep the small
+ * packed router borrowed; do not retain an FP32 expansion per layer. The
+ * exact DSP router still selects all experts used for inference. */
+inline std::vector<unsigned>
+htpPredictExpertsWh(const float *input, const void *weights, unsigned hidden,
+                    unsigned experts, unsigned top,
+                    const float *sigmoid_bias = nullptr) {
+  if (!input || !weights || !hidden || !experts || !top || hidden % WH_TILE ||
+      experts % WH_TILE)
+    return {};
+  const auto *packed = static_cast<const uint8_t *>(weights);
+  const auto *scale =
+    reinterpret_cast<const float *>(packed + whBytes(hidden, experts));
+  const float *offset = scale + 2 * experts;
+  std::vector<float> scores(experts, 0.0f);
+  for (unsigned h = 0; h < hidden; ++h) {
+    const unsigned shift = ((h / 4u) % 2u) * 4u;
+    for (unsigned block = 0; block < experts; block += WH_TILE) {
+      const uint8_t *row =
+        packed +
+        ((size_t)(h / WH_TILE) * (experts / WH_TILE) + block / WH_TILE) *
+          WH_TILE_BYTES +
+        (h % WH_TILE / 8u) * 128u + h % 4u;
+      for (unsigned e = 0; e < WH_TILE; ++e) {
+        const unsigned nibble = (row[e * 4u] >> shift) & 15u;
+        const int q = nibble < 8u ? (int)nibble : (int)nibble - 16;
+        scores[block + e] += input[h] * (q + offset[block + e]);
+      }
+    }
+  }
+  for (unsigned e = 0; e < experts; ++e)
+    scores[e] *= scale[e];
+  return htpRankPredictedExperts(scores, top, sigmoid_bias);
+}
+
 } // namespace nntrainer
 #endif

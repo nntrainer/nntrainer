@@ -484,5 +484,46 @@ int main() {
           std::vector<unsigned>{0, 2, 1, 3}));
   const float bad_bias[] = {0, std::numeric_limits<float>::infinity(), 0, 0};
   assert(nntrainer::htpPredictExperts(input, gate, 3, 4, 2, bad_bias).empty());
+  for (unsigned hidden : {32u, 96u, 2048u})
+    for (unsigned experts : {32u, 64u})
+      for (unsigned pattern = 0; pattern < 7; ++pattern) {
+        std::vector<float> x(hidden), dense(hidden * experts), bias(experts);
+        const size_t bytes = nntrainer::whBytes(hidden, experts);
+        std::vector<float> image(bytes / sizeof(float) + 3 * experts);
+        auto *packed = reinterpret_cast<uint8_t *>(image.data());
+        float *scale = image.data() + bytes / sizeof(float);
+        float *offset = scale + 2 * experts;
+        std::vector<int8_t> codes(hidden * experts);
+        for (unsigned e = 0; e < experts; ++e) {
+          scale[e] = (1u + e % 7u) / 128.0f;
+          offset[e] = (int(e % 11u) - 5) * 0.25f;
+          bias[e] = (int(e % 5u) - 2) * 0.015625f;
+        }
+        for (unsigned h = 0; h < hidden; ++h) {
+          x[h] = pattern ? (int((h * 13u + pattern) % 53u) - 26) / 64.0f : 0;
+          for (unsigned e = 0; e < experts; ++e) {
+            const size_t at = size_t(h) * experts + e;
+            codes[at] = int8_t((h * 3u + e * 7u + pattern * 5u) % 16u - 8);
+            dense[at] = (codes[at] + offset[e]) * scale[e];
+          }
+        }
+        nntrainer::whPack(codes.data(), hidden, experts, packed);
+        for (unsigned top : {1u, 4u, 8u, experts, experts + 1u}) {
+          const auto ref = nntrainer::htpPredictExperts(
+            x.data(), dense.data(), hidden, experts, top, bias.data());
+          assert(nntrainer::htpPredictExpertsWh(
+                   x.data(), packed, hidden, experts, top, bias.data()) == ref);
+        }
+        x[hidden / 2] = std::numeric_limits<float>::quiet_NaN();
+        assert(nntrainer::htpPredictExpertsWh(x.data(), packed, hidden, experts,
+                                              4, bias.data())
+                 .empty());
+        assert(nntrainer::htpPredictExpertsWh(x.data(), packed, hidden - 1,
+                                              experts, 4)
+                 .empty());
+        assert(nntrainer::htpPredictExpertsWh(x.data(), packed, hidden,
+                                              experts - 1, 4)
+                 .empty());
+      }
   std::puts("EXPERT PREFETCH OWNERSHIP / CANCELLATION / REBIND / PREDICTOR OK");
 }
