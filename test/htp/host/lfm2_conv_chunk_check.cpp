@@ -23,6 +23,7 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #else
+#define CONV_SIMDE_FIXTURE 1
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #include <simde/arm/neon.h>
 // Set only after system/SIMDe headers select the real host architecture.
@@ -582,6 +583,90 @@ static void unchanged_and_ranges() {
         "range partition loses global history or gate offset");
   ++cases;
 }
+
+static void fused_gate_stripes() {
+  for (unsigned lanes : {1u, 3u, 8u})
+    for (unsigned pattern : {0u, 1u, 2u, 3u}) {
+      nntrainer::ThreadManager::lanes = lanes;
+      Fixture f;
+      f.prepare(pattern == 1 ? 1 : 0, pattern);
+      if (pattern == 2) {
+        std::fill(f.truth.begin(), f.truth.end(), 0.0f);
+        for (unsigned r : {0u, 1u, 62u, 63u, 64u, 65u, 126u, 127u, 128u})
+          for (unsigned c = 0; c < N; ++c)
+            f.truth[size_t(r) * N + c] = float(int(c % 13) - 6) / 7.0f;
+      }
+      if (pattern == 3) {
+        // SR15's decoded convolution weights lie on the BF16 grid.
+        for (float &v : f.weights) {
+          uint32_t bits;
+          std::memcpy(&bits, &v, 4);
+          bits &= 0xffff0000u;
+          std::memcpy(&v, &bits, 4);
+        }
+      }
+      for (unsigned rows : {16u, 63u, 64u, 65u, 127u, 128u, 129u, 1024u}) {
+        std::fill(f.refg.begin(), f.refg.end(), -9876);
+        std::fill(f.refout.begin(), f.refout.end(), -9876);
+        std::fill(f.g.begin(), f.g.end(), -9876);
+        std::fill(f.out.begin(), f.out.end(), -9876);
+        for (unsigned r = 0; r < rows; ++r)
+          for (unsigned c = 0; c < C; ++c)
+            f.refg[size_t(r) * C + c] =
+              f.truth[size_t(r) * N + c] * f.truth[size_t(r) * N + 2u * C + c];
+        check(baseline::lfmConvPostGatePrefill(f.refg.data(), f.weights.data(),
+                                               f.truth.data(), f.refout.data(),
+                                               rows, C),
+              "fused reference rejected");
+        check(candidate::lfmConvFusedGatePrefill(f.truth.data(),
+                                                 f.weights.data(), f.g.data(),
+                                                 f.out.data(), rows, C),
+              "fused stripe rejected");
+        check(std::memcmp(f.g.data(), f.refg.data(), f.g.size() * 4) == 0,
+              "fused pre-gate/history/canary differs");
+        for (size_t i = 0; i < f.out.size(); ++i) {
+          uint32_t got, want;
+          std::memcpy(&got, &f.out[i], 4);
+          std::memcpy(&want, &f.refout[i], 4);
+#ifdef CONV_SIMDE_FIXTURE
+          // x86 FMA lowering may choose another input NaN's payload. Keep
+          // every finite/infinite/zero bit exact; native ARM checks all bits.
+          const bool nan_pair = (got & 0x7fffffffu) > 0x7f800000u &&
+                                (want & 0x7fffffffu) > 0x7f800000u;
+          if (nan_pair)
+            continue;
+#endif
+          check(got == want, "fused stripe output/canary differs");
+        }
+        ++cases;
+      }
+      for (unsigned reason = 0; reason < 8; ++reason) {
+        const float *p = f.truth.data(), *w = f.weights.data();
+        float *g = f.g.data(), *y = f.out.data();
+        unsigned rows = 128, channels = C;
+        if (reason == 0)
+          p = nullptr;
+        if (reason == 1)
+          w = nullptr;
+        if (reason == 2)
+          g = nullptr;
+        if (reason == 3)
+          y = g;
+        if (reason == 4)
+          g = f.truth.data() + 1;
+        if (reason == 5)
+          y = f.weights.data();
+        if (reason == 6)
+          rows = 15;
+        if (reason == 7)
+          channels = 1024;
+        check(!candidate::lfmConvFusedGatePrefill(p, w, g, y, rows, channels),
+              "fused overlap/shape guard accepted");
+        ++cases;
+      }
+    }
+}
+
 int main() {
   try {
     numeric();
@@ -590,6 +675,7 @@ int main() {
     failure();
     app_guards();
     unchanged_and_ranges();
+    fused_gate_stripes();
     std::printf("CONV_CHUNK %u cases PASS\n", cases);
     return 0;
   } catch (const std::exception &e) {
