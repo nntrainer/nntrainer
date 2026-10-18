@@ -11131,10 +11131,26 @@ public:
     const bool trace = attn_trace_enabled();
     uint32_t stats[20] = {0};
     const int64_t t0 = now_us();
+    // Large heap tensors incur a second FastRPC transport copy. Reuse the
+    // prefill ION pools, which are released at the decode transition.
+    const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
+    const bool staged = n_q >= 128;
+    const float *q_rpc = q;
+    float *out_rpc = out;
+    if (staged) {
+      float *q_ion =
+        reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+      out_rpc =
+        reinterpret_cast<float *>(stage(attn_out_pool_, q_bytes).data());
+      stagedMemcpy(q_ion, q, q_bytes);
+      q_rpc = q_ion;
+    }
     const int err = nntr_hvx_attn_q_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-      rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q, q_len,
-      sinks, sinks_len, out, q_len, stats, trace ? 20 : 8);
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
+      q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
+    if (staged && err == AEE_SUCCESS)
+      stagedMemcpy(out, out_rpc, q_bytes);
     if (trace) {
       ml_logi("HTP attn trace q: handle=%d n_q=%u cache=%u..%u append=%u "
               "err=0x%x wall_us=%lld dsp_us=%u append_us=%u attn_us=%u "

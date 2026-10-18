@@ -165,7 +165,7 @@ static int hexkl_micro_hmx_acc_read_int32(uint8_t *vb, uint32_t cfg,
     return AEE_EFAILED;
   const uint32_t i = raw_tile / c->L.n_col_tiles;
   const uint32_t col = raw_tile % c->L.n_col_tiles;
-  const uint32_t want = qx_dequant_available(c) && raw_kb > 0u
+  const uint32_t want = qx_dequant_available(c)
                           ? c->L.qx_f32 + raw_tile * HEXKL_ATTN_Q_ACC_BYTES
                           : c->L.acc;
   assert(off == want && off % TB == 0u);
@@ -251,7 +251,7 @@ static void check_guard(attn_ctx *c) {
     a.pool = c->pool;
     switch (i) {
     case 0:
-      s.n_q = 1024u;
+      s.n_q = 512u;
       s.cache_to = s.n_q;
       break;
     case 1:
@@ -363,7 +363,7 @@ static void check_case(uint32_t rows, uint32_t qb, uint32_t qi,
     c.q_scale[i] = scales[(i / 16u + pattern) % 8u];
     c.q_zp[i] = (int32_t)((i + pattern * 64u) & 255u);
   }
-  const int enabled = rows >= 2048u && rows % 128u == 0u && workers && !fixed;
+  const int enabled = rows >= 1024u && rows % 128u == 0u && workers && !fixed;
   assert(qx_dequant_available(&c) == enabled);
   if (enabled)
     check_guard(&c);

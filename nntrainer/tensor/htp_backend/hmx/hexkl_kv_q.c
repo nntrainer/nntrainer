@@ -745,6 +745,21 @@ typedef struct {
 
 static void dynamic_heads_worker(uint32_t n_threads, uint32_t i, void *arg) {
   const dynamic_heads_ctx *c = (const dynamic_heads_ctx *)arg;
+  if ((c->row0 | c->n_rows) % 32u == 0u) {
+    // Whole column tiles are independent, including their packed WH bytes.
+    // More than one unit per head balances eight heads over six HVX lanes.
+    const uint32_t blocks = c->n_rows / 32u;
+    const uint32_t units = c->kv->n_head_kv * blocks;
+    const uint32_t stride = c->kv->n_head_kv * c->kv->head_dim;
+    for (uint32_t u = units * i / n_threads; u < units * (i + 1u) / n_threads;
+         ++u) {
+      const uint32_t head = u / blocks, row = 32u * (u % blocks);
+      append_dynamic_heads(
+        c->kv, c->row0 + row, 32u, c->k_rows + (size_t)row * stride,
+        c->v_rows + (size_t)row * stride, c->direct, head, head + 1u);
+    }
+    return;
+  }
   const uint32_t lo = c->kv->n_head_kv * i / n_threads;
   const uint32_t hi = c->kv->n_head_kv * (i + 1u) / n_threads;
   append_dynamic_heads(c->kv, c->row0, c->n_rows, c->k_rows, c->v_rows,
@@ -789,7 +804,8 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
       kv->head_dim == 64u) {
     dynamic_heads_ctx ctx = {kv, row0, n_rows, k_rows, v_rows, direct};
     hvx_worker_pool_run((hvx_worker_pool *)pool, dynamic_heads_worker, &ctx,
-                        kv->n_head_kv);
+                        kv->n_head_kv *
+                          ((row0 | n_rows) % 32u == 0u ? n_rows / 32u : 1u));
   } else
 #endif
   {

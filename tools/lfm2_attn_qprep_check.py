@@ -57,8 +57,12 @@ def main():
 #define TB HEXKL_ATTN_TILE_BYTES
 typedef struct unused_acc_layout hexkl_acc_layout;
 """ + function(tile, "hvx_tile_load_u") + "\n" + source[begin:end] + "\n"
-    for name in ("q_tile", "qx_row"):
+    for name in ("q_tile", "qx_row", "unit_range"):
         header += function(source, name) + "\n"
+    gather_begin = source.index("typedef struct {\n  attn_ctx *c;")
+    gather_end = source.index("} qprep_ctx;", gather_begin) + len("} qprep_ctx;")
+    header += source[gather_begin:gather_end] + "\n"
+    header += function(source, "qprep_gather_worker") + "\n"
     header += """#define hvx_quant_rows_u8_params checked_params
 #define hvx_quant_pack_u8_ah checked_pack
 #define hvx_quant_params_pack_u8_ah checked_fused

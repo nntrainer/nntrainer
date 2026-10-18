@@ -61,6 +61,7 @@ struct HtpProfile {
 };
 static int direct_rpc_failure;
 static unsigned direct_rpc_calls;
+static const float *direct_q_input;
 struct HtpBackend {
   static HtpBackend &global() {
     static HtpBackend h;
@@ -85,6 +86,7 @@ static int direct_rpc(Args... args) {
   return direct_rpc_failure;
 }
 template <typename... Args> static int nntr_hvx_attn_q_step(Args... args) {
+  direct_q_input = std::get<13>(std::make_tuple(args...));
   return direct_rpc<17>(args...);
 }
 template <typename... Args> static int nntr_hvx_attn_f16_decode(Args... args) {
@@ -107,7 +109,7 @@ struct Backend {
 #include "ion_alias.inc"
 #include "sync.inc"
   // clang-format on
-  StagingPool act_pool_, out_pool_, x2_pool_;
+  StagingPool act_pool_, out_pool_, x2_pool_, attn_q_pool_, attn_out_pool_;
   bool have_id_ = false;
   unsigned pending_id_ = 17;
   enum { AEE_SUCCESS = 0 };
@@ -669,6 +671,40 @@ static void direct_writer_checks() {
     ++tests;
   }
 }
+static void quant_attention_staging_checks() {
+  for (unsigned rows : {1u, 127u, 128u, 129u, 1024u}) {
+    Backend b;
+    const size_t count = size_t(rows) * 32, bytes = count * sizeof(float);
+    std::vector<float> q(count), out(count, -1.0f);
+    for (size_t i = 0; i < count; ++i)
+      q[i] = float(i % 47) / 13.0f;
+    const unsigned alloc_before = ion_allocs;
+    for (unsigned pass = 0; pass < 3; ++pass) {
+      const bool fail = pass == 2;
+      direct_rpc_failure = fail ? 1 : 0;
+      std::fill(out.begin(), out.end(), -1.0f);
+      const size_t copied = ion_copy_bytes;
+      check(b.sdpa_q_kvcache(1, 0, 0, 32, nullptr, nullptr, q.data(), 32, rows,
+                             0, rows, 1, 1, 32, 0, 0, nullptr, out.data(),
+                             32) == !fail,
+            "quant attention staging return");
+      check(!std::memcmp(direct_q_input, q.data(), bytes),
+            "quant attention input copy differs");
+      check((direct_q_input != q.data()) == (rows >= 128),
+            "quant attention staging threshold");
+      check(ion_allocs == alloc_before + (rows >= 128 ? 2u : 0u),
+            "quant attention repeated staging allocated again");
+      check(ion_copy_bytes - copied ==
+              (rows >= 128 ? bytes * (fail ? 1 : 2) : 0),
+            "quant attention input/output copy count");
+      for (size_t i = 0; i < count; ++i)
+        check(out[i] == (fail && rows >= 128 ? -1.0f : 7.25f + float(i % 13)),
+              "quant attention output/failure copy differs");
+      ++tests;
+    }
+    direct_rpc_failure = 0;
+  }
+}
 static void sync_ion_checks() {
   for (unsigned M : {128u, 1024u}) {
     DspFixture f(M);
@@ -821,6 +857,7 @@ int main() {
   direct_ion_checks();
   sync_ion_checks();
   direct_writer_checks();
+  quant_attention_staging_checks();
 #if defined(__linux__)
   remapped_ion_checks();
 #endif

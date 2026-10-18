@@ -184,6 +184,33 @@ static inline uint32_t resident_cols(const attn_ctx *c, uint32_t kb) {
 
 /* --- phases ----------------------------------------------------------- */
 
+/** @brief Disjoint gathered Q rows for a head and a chunk of query blocks. */
+typedef struct {
+  attn_ctx *c;
+  uint32_t n, qb0, rows;
+} qprep_ctx;
+
+static void qprep_gather_worker(uint32_t threads, uint32_t id, void *arg) {
+  const qprep_ctx *job = arg;
+  attn_ctx *c = job->c;
+  uint32_t lo, hi;
+  unit_range(job->rows, threads, id, &lo, &hi);
+  for (uint32_t row = lo; row < hi; ++row) {
+    uint32_t q, g;
+    HVX_Vector *restrict dst = (HVX_Vector *)qx_row(c, row);
+    if (hexkl_attn_f16_tile_row_to_qg(c->s, c->t, job->qb0 + row / c->t->g_br,
+                                      row % c->t->g_br, &q, &g)) {
+      const float *src = c->io->q + (size_t)q * c->io->q_stride +
+                         (size_t)(job->n * c->t->g + g) * c->s->head_dim;
+      for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d)
+        dst[d] = hvx_tile_load_u(src + 32u * d);
+    } else {
+      for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d)
+        dst[d] = Q6_V_vzero();
+    }
+  }
+}
+
 /**
  * @brief Q rows of kv head n for q blocks [qb0, qb0 + n_qb) -> uint8 AH
  *        tiles with per-row scale and zero point, one quantizer pass.
@@ -195,26 +222,10 @@ static inline uint32_t resident_cols(const attn_ctx *c, uint32_t kb) {
  */
 static int phase_qprep(attn_ctx *c, uint32_t n, uint32_t qb0, uint32_t n_qb) {
   const uint32_t hd = c->s->head_dim;
-  const uint32_t g_br = c->t->g_br;
-  const uint32_t rows = n_qb * g_br;
-  const uint32_t dt = c->L.n_dot_tiles;
-  for (uint32_t qi = 0; qi < n_qb; ++qi) {
-    for (uint32_t r = 0; r < g_br; ++r) {
-      uint32_t q, g;
-      HVX_Vector *restrict dst = (HVX_Vector *)qx_row(c, qi * g_br + r);
-      if (hexkl_attn_f16_tile_row_to_qg(c->s, c->t, qb0 + qi, r, &q, &g)) {
-        const float *src = c->io->q + (size_t)q * c->io->q_stride +
-                           (size_t)(n * c->t->g + g) * hd;
-        for (uint32_t d = 0; d < dt; ++d) {
-          dst[d] = hvx_tile_load_u(src + 32u * d);
-        }
-      } else {
-        for (uint32_t d = 0; d < dt; ++d) {
-          dst[d] = Q6_V_vzero();
-        }
-      }
-    }
-  }
+  const uint32_t rows = n_qb * c->t->g_br;
+  qprep_ctx job = {c, n, qb0, rows};
+  hvx_worker_pool_run(rows >= 128u ? c->pool : NULL, qprep_gather_worker, &job,
+                      rows);
   int rc;
   if (c->kv->kind == HEXKL_KV_Q8 && !c->kv->fixed && c->s->n_head_q == 32u &&
       c->s->n_head_kv == 8u && hd == 64u && c->s->n_q >= 128u &&
@@ -368,7 +379,7 @@ static int qx_dequant_available(const attn_ctx *c) {
   const uint64_t qx_bytes =
     (uint64_t)c->L.n_qb_chunk * c->t->g_br * c->s->head_dim * sizeof(float);
   return hvx_worker_pool_workers(c->pool) > 0u && c->kv->kind == HEXKL_KV_Q8 &&
-         !c->kv->fixed && c->s->n_q >= 2048u && c->s->n_q % 128u == 0u &&
+         !c->kv->fixed && c->s->n_q >= 1024u && c->s->n_q % 128u == 0u &&
          c->s->cache_from == 0u && c->s->cache_to == c->s->n_q &&
          c->s->n_head_q == 32u && c->s->n_head_kv == 8u &&
          c->s->head_dim == 64u && c->s->window == 0u && c->s->softcap == 0.0f &&
@@ -713,9 +724,18 @@ static int run_q_block(attn_ctx *c, uint32_t n, uint32_t qb) {
   dma_issue(c, n, kb_lo, kb_lo & 1u);
   dma_land(c, kb_lo, kb_lo & 1u);
   st->us_dma += now_us() - t0;
-  int rc = phase_qk(c, n, kb_lo, kb_lo & 1u, 0, 0);
+  int rc = phase_qk(c, n, kb_lo, kb_lo & 1u, 0, deferred);
   if (rc != AEE_SUCCESS) {
     return rc;
+  }
+  if (deferred) {
+    // The first block has no preceding PV to overlap. Convert all its
+    // independent readouts together before softmax consumes the S bank.
+    dequant_job job = {c, n, kb_lo, 0};
+    t0 = now_us();
+    hvx_worker_pool_run(c->pool, dequant_worker, &job,
+                        c->L.n_row_tiles * c->L.n_col_tiles);
+    st->us_dequant += now_us() - t0;
   }
 
   int first = 1;
