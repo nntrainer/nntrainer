@@ -35,10 +35,23 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
+namespace nntrainer {
+class ComputeOps;
+}
+
 namespace causallm {
 
 /** Reset the HTP expert registry after workers and model layers are gone. */
 void resetLfm2HtpExpertPool();
+
+/** Start first-pass native TL2 reads inside the prefill timer. Keeps the
+ * initial two resident layers and queues only full layers in existing slots.
+ * Returns the number queued, or zero when this is not a fresh eligible pool. */
+size_t beginLfm2HtpExpertPrefill(nntrainer::ComputeOps *ops);
+
+/** Mark an interrupted early kickoff as a previous pass. Its held batches
+ * remain owned until the existing layer-zero drain or backend teardown. */
+void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops);
 
 /**
  * @class   Lfm2MoELayer

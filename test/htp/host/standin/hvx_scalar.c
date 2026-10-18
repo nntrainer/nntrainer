@@ -14,6 +14,7 @@
 #include "hvx_scalar.h"
 
 #include "hexkl_micro.h"
+#include "hexkl_mm_u8i4_dma.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_expand_i2i4.h"
 #include "hvx_gemm_u8i4_wh.h"
@@ -24,9 +25,28 @@
 #include "swiglu_det.h"
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 hvx_scalar_hooks hvx_scalar_hook = {NULL, NULL, NULL, NULL};
+
+/** Host stand-ins share coherent ordinary memory. Device cache visibility
+ * is checked separately by the stable-slot device fixture. Checks that
+ * supply their own DMA implementation may override this no-op. */
+__attribute__((weak)) void hexkl_dcache_inva(const void *p, uint32_t bytes) {
+  (void)p;
+  (void)bytes;
+}
+
+/** Kernel-only checks synthesize handles without the registry. The swap
+ * check and in-process backend link the real, strong implementation. */
+__attribute__((weak)) int hexkl_weight_tl2_refresh_pair(hexkl_weight_u8i4 *g,
+                                                        hexkl_weight_u8i4 *d) {
+  (void)d;
+  if (g->tl2_generation)
+    abort();
+  return 0;
+}
 
 /** @brief Reports a buffer access to a check's hook, if any. */
 static void buf(const void *p, size_t bytes, int write) {

@@ -264,11 +264,9 @@ void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
   hvx_rope_f32(q, n_q, k, n_k, cs, 2u * LANES);
 }
 
-void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
-                          float *out, uint32_t C) {
-  if (!abc || !state3 || !conv_w || !out || C == 0u || C % LANES != 0u) {
-    return;
-  }
+static void conv_gate_m1_range(const float *abc, float *state3,
+                               const float *conv_w, float *out, uint32_t C,
+                               uint32_t lo, uint32_t hi) {
   const HVX_UVector *va = (const HVX_UVector *)abc;
   const HVX_UVector *vb = (const HVX_UVector *)(abc + C);
   const HVX_UVector *vc = (const HVX_UVector *)(abc + 2u * C);
@@ -277,7 +275,6 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
   HVX_UVector *vo = (HVX_UVector *)out;
   const float *w1 = conv_w + C, *w2 = conv_w + 2u * C;
   const float *s0 = state3, *s1 = state3 + C;
-  const uint32_t nvec = C / LANES;
 
   /** [#132 E5c] The Android CPU's decode order (m1_conv_gate_det): g = a*c
      into row 2, y = w0*g (both one rounding each, as the vector multiply),
@@ -285,27 +282,59 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
      HVX has no fused f32 multiply-add, so they are the scalar sffma, 2C of
      them -- and out = b*y. The unfused prefill kernel (hvx_conv_gate_f32)
      it used before is not the CPU's order. */
-  for (uint32_t i = 0; i < nvec; ++i) {
+  for (uint32_t i = lo / LANES; i < hi / LANES; ++i) {
     vg[i] = Q6_Vsf_vmpy_VsfVsf(va[i], vc[i]);
     vo[i] = Q6_Vsf_vmpy_VsfVsf(vw0[i], vg[i]);
   }
   /** the vector stores above and the scalar loads below alias out / state3
      through different types: keep the compiler from reordering them */
   __asm__ volatile("" ::: "memory");
-  for (uint32_t j = 0; j < C; ++j) {
+  for (uint32_t j = lo; j < hi; ++j) {
     float y = Q6_R_sfmpyacc_RR(out[j], w1[j], s1[j]);
     out[j] = Q6_R_sfmpyacc_RR(y, w2[j], s0[j]);
   }
   __asm__ volatile("" ::: "memory");
-  for (uint32_t i = 0; i < nvec; ++i) {
+  for (uint32_t i = lo / LANES; i < hi / LANES; ++i) {
     vo[i] = Q6_Vsf_vmpy_VsfVsf(vb[i], vo[i]);
   }
 
-  /** state <- x_{t-1} | g. ponytail: two 8 KiB copies per token at C = 2048
-     (x 18 conv layers, roughly 1-2 us); a ring of three row pointers
-     removes them if #85's per-op pcycles ever show it. */
-  memcpy(state3, state3 + C, (size_t)C * sizeof(float));
-  memcpy(state3 + C, state3 + 2u * C, (size_t)C * sizeof(float));
+  /** Every channel owns its three state entries, so workers can shift
+     their disjoint column ranges after the same two fused taps. */
+  const size_t bytes = (size_t)(hi - lo) * sizeof(float);
+  memcpy(state3 + lo, state3 + C + lo, bytes);
+  memcpy(state3 + C + lo, state3 + 2u * C + lo, bytes);
+}
+
+void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
+                          float *out, uint32_t C) {
+  if (!abc || !state3 || !conv_w || !out || C == 0u || C % LANES != 0u) {
+    return;
+  }
+  conv_gate_m1_range(abc, state3, conv_w, out, C, 0u, C);
+}
+
+typedef struct {
+  const float *abc, *conv_w;
+  float *state3, *out;
+  uint32_t C;
+} conv_gate_m1_ctx;
+
+static void conv_gate_m1_lane(uint32_t n_threads, uint32_t i, void *v) {
+  const conv_gate_m1_ctx *c = (const conv_gate_m1_ctx *)v;
+  const uint32_t nvec = c->C / LANES;
+  const uint32_t lo = (uint32_t)((uint64_t)nvec * i / n_threads) * LANES;
+  const uint32_t hi = (uint32_t)((uint64_t)nvec * (i + 1u) / n_threads) * LANES;
+  conv_gate_m1_range(c->abc, c->state3, c->conv_w, c->out, c->C, lo, hi);
+}
+
+void hvx_conv_gate_m1_f32_parallel(const float *abc, float *state3,
+                                   const float *conv_w, float *out, uint32_t C,
+                                   hvx_worker_pool *pool) {
+  if (!abc || !state3 || !conv_w || !out || C == 0u || C % LANES != 0u) {
+    return;
+  }
+  conv_gate_m1_ctx c = {abc, conv_w, state3, out, C};
+  hvx_worker_pool_run(pool, conv_gate_m1_lane, &c, C / LANES);
 }
 
 /** @brief l2fetch of the next weight block: 128 rows of 128 B (16 KiB) at

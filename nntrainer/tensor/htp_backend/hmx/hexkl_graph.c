@@ -309,7 +309,7 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
     }
   }
   call->routing.n_experts = 0u; /* consumed */
-  /* A graph slot can keep its address while its contents change. Never
+  /** A graph slot can keep its address while its contents change. Never
      carry a rotated row to another MoE op or token, even at that address. */
   g->moe_rotated_input.valid = 0u;
   /* [plan 201 S1] the token's routed set, for the pool's recency */
@@ -437,11 +437,15 @@ static int graph_op_rope(hexkl_graph *g, const htp_graph_op *op,
 static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
                                 graph_call *call, const float *in, float *out) {
   const uint32_t i = (uint32_t)(op - g->ops);
-  (void)call;
   if (g->param[i] == NULL || g->state[i] == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_conv_gate_m1_f32(in, g->state[i], g->param[i], out, op->N);
+  if (op->N == 2048u) {
+    hvx_conv_gate_m1_f32_parallel(in, g->state[i], g->param[i], out, op->N,
+                                  call->env->pool);
+  } else {
+    hvx_conv_gate_m1_f32(in, g->state[i], g->param[i], out, op->N);
+  }
   return AEE_SUCCESS;
 }
 
@@ -577,7 +581,9 @@ static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
       (nx->eps_bits != 0u) == (op->eps_bits != 0u) &&
       nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
     if (g->predict == 2u) {
-      if (nx->K == op->K && nx->eps_bits != 0u &&
+      const int lfm2 = nx->eps_bits == 0u && nx->K == 2048u &&
+                       nx->n_experts == 64u && nx->top_k == 4u;
+      if (nx->K == op->K && (nx->eps_bits != 0u || lfm2) &&
           call->env->miss.input_hint != NULL)
         call->env->miss.input_hint(call->env->miss.ctx, (uint32_t)(nx - g->ops),
                                    in, op->K);

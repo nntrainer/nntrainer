@@ -44,6 +44,24 @@ void hexkl_moe_set_hadamard_signs(const uint32_t *mask_in, uint32_t n_in,
   g_sign_in = n_in ? mask_in : NULL;
   g_sign_down = n_down ? mask_down : NULL;
 }
+/** Router-only cached staging is outside this registry check. Keep these
+ * typed stubs so linking the complete RPC translation unit remains checked. */
+int hexkl_moe_scratch_reserve(hexkl_moe_scratch *scratch, size_t bytes) {
+  (void)scratch;
+  (void)bytes;
+  fprintf(stderr, "swap_host_check: hexkl_moe_scratch_reserve called\n");
+  abort();
+}
+void hexkl_moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
+                        int dst_vtcm) {
+  (void)dst;
+  (void)src;
+  (void)bytes;
+  (void)src_vtcm;
+  (void)dst_vtcm;
+  fprintf(stderr, "swap_host_check: hexkl_moe_dma_copy called\n");
+  abort();
+}
 /** These two are declared by headers the session struct pulls in, so they
    get their real signatures. */
 int hexkl_mm_u8i4_moe_layer_run(
@@ -561,6 +579,109 @@ int main(void) {
     hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd);
     CHECK(live() == before);
     printf("SET OFFSETS BATCH OK: by handle, refusals, cleared by swap\n");
+  }
+  {
+    enum { CK = 2048, CI = 1536, CN = 2048 };
+    const uint32_t gb = htp_tl2_native_bytes(CK, 2u * CI);
+    const uint32_t db = htp_tl2_native_bytes(CI, CN);
+    const uint32_t end = gb + 16u * CI;
+    const uint32_t down = (end + 4095u) & ~4095u;
+    const uint32_t cap = down + db + 8u * CN;
+    CHECK(end % 128u == 0u && end + 128u <= down);
+    uint8_t *native = memalign(4096u, cap);
+    CHECK(native != NULL);
+    memset(native, 0, cap);
+    g_s.arenas[2].va = native;
+    g_s.arenas[2].bytes = cap;
+    float *gs = (float *)(native + gb);
+    float *ds = (float *)(native + down + db);
+    uint32_t *generation = (uint32_t *)(native + end);
+    uint32_t og = NONE, od = NONE, ar = 2, ofg = 0, ofd = down;
+    uint32_t hg = NONE, hd = NONE, done = 99;
+    int32_t err = 99;
+#define STABLE_SWAP_SHAPE(k, i, n)                                             \
+  nntr_hvx_weight_swap_batch_tl2_stable_arena(                                 \
+    (remote_handle64)(uintptr_t)&g_s, k, i, n, &og, 1, &od, 1, &ar, 1, &ofg,   \
+    1, &ofd, 1, &hg, 1, &hd, 1, &done, &err)
+#define STABLE_SWAP() STABLE_SWAP_SHAPE(CK, CI, CN)
+    const unsigned before = live();
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 1 && err == AEE_SUCCESS);
+    hexkl_weight_u8i4 *g = &g_s.weights_u8i4.slots[hg];
+    hexkl_weight_u8i4 *d = &g_s.weights_u8i4.slots[hd];
+    const void *g_arrays = g->arrays;
+    const void *d_arrays = d->arrays;
+    CHECK(g->tl2_generation == generation && g->tl2_generation_seen == 0u);
+    og = hg;
+    od = hd;
+    for (uint32_t gen = 1u; gen <= 3u; ++gen) {
+      const float old_g = g->w_scale[0], old_d = d->w_scale[0];
+      for (unsigned i = 0; i < 2u * CI; ++i) {
+        gs[i] = 0.5f + i + gen;
+        ((int32_t *)gs)[2u * CI + i] = (int32_t)i - 17 * (int32_t)gen;
+      }
+      for (unsigned i = 0; i < CN; ++i) {
+        ds[i] = 0.25f + i + 2u * gen;
+        ((int32_t *)ds)[CN + i] = 19 * (int32_t)gen - (int32_t)i;
+      }
+      /* Unpublished bytes must not trigger a metadata transfer. */
+      CHECK(hexkl_weight_tl2_refresh_pair(g, d) == AEE_SUCCESS);
+      CHECK(g->w_scale[0] == old_g && d->w_scale[0] == old_d);
+      CHECK(g->tl2_generation_seen == gen - 1u);
+      *generation = gen;
+      CHECK(hexkl_weight_tl2_refresh_pair(g, d) == AEE_SUCCESS);
+      CHECK(g->tl2_generation_seen == gen);
+      CHECK(memcmp(g->w_scale, gs, 16u * CI) == 0);
+      CHECK(memcmp(d->w_scale, ds, 8u * CN) == 0);
+      CHECK(g->arrays == g_arrays && d->arrays == d_arrays);
+      CHECK(live() == before + 2u && hg == og && hd == od);
+    }
+    CHECK(STABLE_SWAP_SHAPE(CK + 128u, CI, CN) == AEE_EBADPARM && done == 0);
+    CHECK(STABLE_SWAP_SHAPE(CK, CI + 64u, CN) == AEE_EBADPARM && done == 0);
+    CHECK(STABLE_SWAP_SHAPE(CK, CI, CN + 128u) == AEE_EBADPARM && done == 0);
+    /* Gemma keeps ordinary registration; the LFM-only stable RPC rejects it. */
+    CHECK(STABLE_SWAP_SHAPE(2816u, 704u, 2816u) == AEE_EBADPARM && done == 0);
+    CHECK(live() == before + 2u && hg == og && hd == od);
+    printf("STABLE TL2 GEMMA REJECT OK: no handle mutation\n");
+    /* Both the generation cache line and the full DN tail must fit. */
+    g_s.arenas[2].bytes = end + 127u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    g_s.arenas[2].bytes = cap - 1u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    g_s.arenas[2].bytes = cap;
+    ofd = down - 512u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    ofg = 1u;
+    ofd = down + 1u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    ofg = UINT32_MAX - 127u;
+    ofd = down - 128u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 0 && err == AEE_EBADPARM);
+    ofg = 0u;
+    ofd = down;
+    CHECK(g->arrays == g_arrays && d->arrays == d_arrays &&
+          live() == before + 2u && hg == og && hd == od);
+    CHECK(memcmp(g->w_scale, gs, 16u * CI) == 0);
+    CHECK(memcmp(d->w_scale, ds, 8u * CN) == 0);
+    /* A malformed pair cannot be refreshed under a valid GU generation. */
+    g->N -= 128u;
+    CHECK(hexkl_weight_tl2_refresh_pair(g, d) == AEE_EBADPARM);
+    g->N += 128u;
+    d->N -= 128u;
+    CHECK(hexkl_weight_tl2_refresh_pair(g, d) == AEE_EBADPARM);
+    d->N += 128u;
+    CHECK(STABLE_SWAP() == AEE_SUCCESS && done == 1 && hg == og && hd == od);
+    CHECK(g->arrays == g_arrays && d->arrays == d_arrays &&
+          g->tl2_generation == generation && g->tl2_generation_seen == 3u);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hg);
+    hexkl_weight_u8i4_release(&g_s.weights_u8i4, hd);
+    CHECK(live() == before);
+    free(native);
+    g_s.arenas[2].va = NULL;
+#undef STABLE_SWAP
+#undef STABLE_SWAP_SHAPE
+    printf("STABLE TL2 SWAP OK: K=%u I=%u N=%u, 3 metadata generations, "
+           "same handles, negative shape/extent/offset/pair guards\n",
+           CK, CI, CN);
   }
 
   printf("WEIGHT SWAP OK\n");

@@ -31,6 +31,15 @@ cc=${CC:-gcc}
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
   "$HERE/weight_file_reader_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" -o "$OUT/weight_file_reader_check"
 "$OUT/weight_file_reader_check"
+# Native LFM2/Gemma4 pairs use the production direct reader and real queues.
+# The fixture explicitly skips its Linux-only I/O checks on other platforms.
+"$cc" -std=c11 -O2 -Wall -Wextra -Werror -I "$BACKEND/hvx" -c \
+  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -o "$OUT/tl2_pair_pack.o"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
+  -I "$BACKEND" -I "$BACKEND/hvx" -I "$BACKEND/../../utils" \
+  "$HERE/tl2_pair_read_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
+  "$OUT/tl2_pair_pack.o" -o "$OUT/tl2_pair_read_check"
+"$OUT/tl2_pair_read_check" "$OUT"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
@@ -592,12 +601,14 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
 "$OUT/acc_i24_vector_check"
 # The real GU/DN vector source, including partial worker ranges and repeated
 # scatter, must match its full-int32 entry points before float conversion.
-"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
-  -ffunction-sections -fdata-sections -I "$HERE/hvx_emu" -I "$BACKEND/.." \
-  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
-  "$HERE/acc_i24_epilogue_check.c" "$BACKEND/hvx/hvx_dequant_i32.c" \
-  -Wl,--gc-sections -lm -o "$OUT/acc_i24_epilogue_check"
-"$OUT/acc_i24_epilogue_check"
+for bytes in 8192 6144; do
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -DACC_I24_TILE_BYTES="$bytes" -ffunction-sections -fdata-sections \
+    -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    "$HERE/acc_i24_epilogue_check.c" "$BACKEND/hvx/hvx_dequant_i32.c" \
+    -Wl,--gc-sections -lm -o "$OUT/acc_i24_epilogue_check"
+  "$OUT/acc_i24_epilogue_check"
+done
 
 # Decode FC: repeat one quantized row instead of quantizing it four times,
 # and dequantize three column tiles together. Both real HVX sources must
@@ -611,6 +622,17 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
   "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_quant_u8.c" \
   "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
 "$OUT/fc_m1_epilogue_host_check"
+
+# The production native TL2 down worker uses the exact four-tile epilogue
+# only for LFM2 M=1. Compare its real GEMV/dequant sources and dispatch guards.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -Wno-format-truncation -ffunction-sections -fdata-sections -include malloc.h \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/tl2_dn_dequant_check" "$HERE/tl2_dn_dequant_check.c" \
+  "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  -Wl,--gc-sections -lm
+"$OUT/tl2_dn_dequant_check"
 
 # The prefill-shape RMSNorm rows (doc 57 section 5 step 4): the real HVX
 # source on the lane emulation against a double reference, at the hidden
@@ -754,7 +776,7 @@ done
 # qaic would generate is written from the IDL, so the entry points'
 # definitions are checked against the IDL too -- a mismatch fails here.
 python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -include malloc.h \
   -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/swap_host_check" \
@@ -763,6 +785,25 @@ python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
   "$HERE/hvx_scalar_stubs.c" "$HERE/standin/hvx_scalar.c" -lm
 
 "$OUT/swap_host_check"
+
+# Source ownership and scratch reuse across distinct FastRPC input mappings.
+python3 "$HERE/lfm2_router_handoff_check.py" --repo "$HERE/../../.." \
+  --output "$OUT/router_handoff" --cxx "${CXX:-g++}"
+
+# Deferred DMA checks the real native registry refresh's publication order.
+# This fixture includes the registry C file and drops unrelated compute
+# functions with the ELF linker, so it is deliberately a Linux host check.
+if [ "$(uname -s)" = "Linux" ]; then
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
+    -ffunction-sections -fdata-sections -include malloc.h \
+    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." \
+    -I "$BACKEND" -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    "$HERE/tl2_refresh_pair_check.c" -Wl,--gc-sections -lm \
+    -o "$OUT/tl2_refresh_pair_check"
+  "$OUT/tl2_refresh_pair_check"
+else
+  echo "TL2 refresh pair: Linux ELF fixture skipped on this platform"
+fi
 
 # The q2 attention calibration's abs-max (abs_max.h): natively, and on the
 # NEON path when an aarch64 g++ and qemu-aarch64 are installed (ABS MAX OK).

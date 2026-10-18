@@ -87,6 +87,9 @@ ROUTER_ROWS_EV(1)
 ROUTER_ROWS_EV(2)
 ROUTER_ROWS_EV(3)
 ROUTER_ROWS_EV(4)
+/** The LFM2 router has two output vectors. Eight rows use the same sixteen
+ * accumulators as the existing four-row, four-vector Gemma router. */
+ROUTER_ROWS_BLOCK(2, 8)
 #undef ROUTER_ROWS_EV
 #undef ROUTER_ROWS_BLOCK
 
@@ -147,6 +150,27 @@ static void rows_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+/** Reuse each weight vector across eight LFM2 prefill rows. The K loop and
+ * the stored partial sums at each KB boundary are unchanged, so every dot
+ * retains its original floating-point operation order. */
+static void rows_worker_lfm2_prefill(uint32_t n_threads, uint32_t i, void *v) {
+  const rows_ctx *c = (const rows_ctx *)v;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->M * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
+  for (uint32_t r0 = lo; r0 < hi;) {
+    const uint32_t remaining = hi - r0;
+    const uint32_t nr = remaining >= 8u ? 8u : remaining >= RB ? RB : remaining;
+    const rows_block_fn block =
+      nr == 8u ? rows_block_2x8 : kRowsBlock[1][nr - 1u];
+    for (uint32_t k0 = 0; k0 < c->K; k0 += KB) {
+      const uint32_t k1 = k0 + KB < c->K ? k0 + KB : c->K;
+      block(c->x + (size_t)r0 * c->K + k0, c->w, c->logits + (size_t)r0 * c->E,
+            c->K, c->E, k0, k1);
+    }
+    r0 += nr;
+  }
+}
+
 typedef struct {
   const float *src;
   float *dst;
@@ -175,7 +199,11 @@ int hvx_router_rows_norm_f32(const float *x, const float *gamma, float eps,
     w = w_stage;
   }
   rows_ctx c = {x, w, gamma, logits, M, K, E, eps};
-  hvx_worker_pool_run(pool, rows_worker, &c, M);
+  hvx_worker_pool_run(pool,
+                      !gamma && M >= 128u && K == 2048u && E == 64u
+                        ? rows_worker_lfm2_prefill
+                        : rows_worker,
+                      &c, M);
   return 0;
 }
 

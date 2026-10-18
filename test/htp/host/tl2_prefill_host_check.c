@@ -28,6 +28,9 @@ static void check_dma(size_t bytes, uint32_t descriptors, int packed) {
       assert(p->row_size == p->src_stride);
   }
   assert(transferred == bytes);
+  if (count != descriptors)
+    fprintf(stderr, "native DMA descriptors: got %u expected %u\n", count,
+            descriptors);
   assert(count == descriptors);
   assert(hexkl_probe_us[HEXKL_PROBE_DMA_KB] > 0u);
   assert(hexkl_probe_us[HEXKL_PROBE_DMA_KB] <= bytes / 1024u);
@@ -37,8 +40,9 @@ static void check_dma(size_t bytes, uint32_t descriptors, int packed) {
 static void check_shape(uint32_t K, uint32_t I, uint32_t N, uint32_t experts,
                         int8_t magnitude, uint32_t packed_desc,
                         uint32_t inplace_desc) {
-  static uint8_t vtcm[(8u << 20) + 128u] __attribute__((aligned(128)));
+  static uint8_t vtcm[(9u << 20) + 128u] __attribute__((aligned(128)));
   const uint32_t arena_bytes = sizeof vtcm - 128u;
+  const int lfm2 = K == 2048u && I == 1536u && N == 2048u;
   const uint32_t nweights = 2u * experts;
   W weights[6];
   uint8_t *native[6];
@@ -95,8 +99,13 @@ static void check_shape(uint32_t K, uint32_t I, uint32_t N, uint32_t experts,
   assert(layout.total + packed_bytes < arena_bytes);
   /** Exact fit, one vector too small, and no spare bytes. Keep the layout
    * and accumulator ring unchanged so only native staging can differ. */
-  const uint32_t arenas[] = {arena_bytes, layout.total + packed_bytes,
-                             layout.total + packed_bytes - 128u, layout.total};
+  const uint32_t arenas[] = {arena_bytes,
+                             layout.total + packed_bytes,
+                             layout.total + packed_bytes - 128u,
+                             layout.total,
+                             8u << 20,
+                             layout.total + hvx_tl2_weight_bytes(K, 2u * I) -
+                               128u};
   hexkl_moe_scratch scratch = {0};
   for (uint32_t M = 2u; M <= 65u; M = M == 2u ? 64u : M + 1u) {
     uint32_t gu[3], dn[3], counts[3];
@@ -109,7 +118,7 @@ static void check_shape(uint32_t K, uint32_t I, uint32_t N, uint32_t experts,
     }
     for (uint32_t workers = 0; workers <= 3u; workers += 3u) {
       g_workers = workers;
-      for (uint32_t mode = 0; mode <= 4u; ++mode) {
+      for (uint32_t mode = 0; mode <= (lfm2 ? 6u : 4u); ++mode) {
         for (uint32_t e = 0; e < experts; ++e) {
           gu[e] = 2u * e + (mode ? nweights : 0u);
           dn[e] = gu[e] + 1u;
@@ -124,15 +133,20 @@ static void check_shape(uint32_t K, uint32_t I, uint32_t N, uint32_t experts,
         const int rc = hexkl_mm_u8i4_moe_layer_run(
           &g_tbl, vtcm, arena_bytes, arena, M, K, I, N, experts, gu, dn, rows,
           counts, routing, input, mode ? actual : expected, NULL, &scratch,
-          0xf03e1u | HEXKL_MOE_FLAG_GELU_TANH);
+          (0xf03e1u & ~HEXKL_MOE_FLAG_GELU_TANH) |
+            (lfm2 ? 0u : HEXKL_MOE_FLAG_GELU_TANH));
         assert(rc == 0);
         for (uint32_t b = arena; b < sizeof vtcm; ++b)
           assert(vtcm[b] == 0xa5);
         if (mode) {
           const int packed = mode <= 2u;
           assert(memcmp(expected, actual, (size_t)M * N * sizeof(float)) == 0);
+          const int gu_only = lfm2 && (mode == 3u || mode == 5u);
           check_dma(experts * packed_bytes,
-                    experts * (packed ? packed_desc : inplace_desc), packed);
+                    experts * (packed    ? packed_desc
+                               : gu_only ? 38u
+                                         : inplace_desc),
+                    packed);
           assert(g_bypass_bytes - bypass_before == experts * packed_bytes);
           printf("Native-only TL2 prefill exact K=%u I=%u N=%u M=%u "
                  "experts=%u magnitude=%d workers=%u arena=%u packed=%d\n",
@@ -160,5 +174,7 @@ int main(void) {
   check_shape(96u, 192u, 128u, 3u, 1, 3u, 8u);
   check_shape(128u, 576u, 256u, 2u, 7, 3u, 31u);
   check_shape(2816u, 704u, 2816u, 1u, 1, 7u, 99u);
+  /* LFM2 keeps gate/up packed when both native sources exceed 8 MiB. */
+  check_shape(2048u, 1536u, 2048u, 2u, 1, 8u, 104u);
   return 0;
 }

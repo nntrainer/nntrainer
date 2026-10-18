@@ -96,6 +96,9 @@ static inline int moe_acc_read(uint8_t *base, uint32_t config_off,
 
 void hexkl_moe_scratch_free(hexkl_moe_scratch *s) {
   if (s) {
+    htp_router_handoff_scratch_invalidate(&s->router_handoff);
+    s->router_act = NULL;
+    s->router_used = 0;
     free(s->raw);
     s->raw = NULL;
     s->base = NULL;
@@ -106,6 +109,9 @@ void hexkl_moe_scratch_free(hexkl_moe_scratch *s) {
 /** @brief Grows the scratch to @a bytes; a no-op once it is big enough,
  *         which after the first prefill call is every call. */
 int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {
+  htp_router_handoff_scratch_invalidate(&s->router_handoff);
+  s->router_act = NULL;
+  s->router_used = 0;
   if (s->cap >= bytes) {
     return AEE_SUCCESS;
   }
@@ -357,6 +363,11 @@ typedef struct {
 static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
   moe_expand_ctx *c = (moe_expand_ctx *)vctx;
   if (c->native_base) {
+    const int disjoint_lfm2 =
+      c->native_packed && ((c->native_K == 2048u && c->native_npanels == 24u &&
+                            c->stride == 96u * 512u) ||
+                           (c->native_K == 1536u && c->native_npanels == 16u &&
+                            c->stride == 64u * 512u));
     const uint32_t groups = c->native_groups;
     const uint32_t lo = c->native_jobs * u / n_units;
     const uint32_t hi = c->native_jobs * (u + 1u) / n_units;
@@ -397,8 +408,15 @@ static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
             memcpy(source + 1280u, dst + c->stride, (count - 2u) * 640u);
 #endif
         }
-        hvx_tl2_expand_wh96(src, rows < 96u ? rows : 96u, 128u, c->stride,
-                            c->native_magnitude, dst);
+        /** Only LFM's existing packed slabs are disjoint from the WH
+         * destination by construction. Leave other shapes and in-place
+         * staging's snapshot on the original expansion entry. */
+        if (disjoint_lfm2)
+          hvx_tl2_expand_wh96_disjoint(src, rows < 96u ? rows : 96u, 128u,
+                                       c->stride, c->native_magnitude, dst);
+        else
+          hvx_tl2_expand_wh96(src, rows < 96u ? rows : 96u, 128u, c->stride,
+                              c->native_magnitude, dst);
       }
     }
     return;
@@ -1301,10 +1319,45 @@ static void moe_tl2_gate_epilogue(const moe_m1_ctx *c, uint32_t lo,
   }
 }
 
+/** The unsplit native LFM accumulator already holds contiguous gate/up
+ * planes. Preserve the existing dequant/SwiGLU worker and its tile partition,
+ * without copying every pair through a stack tile and a serial pool wrapper. */
+static int moe_tl2_gate_direct(const moe_m1_ctx *c, uint32_t expert,
+                               uint32_t threads, uint32_t id) {
+  const moe_m1_expert *e = &c->ex[expert];
+  if (!c->native_tl2 || c->k_tiles != 64u || c->inter != 1536u ||
+      c->inter_ntiles != 48u || c->N_out != 2048u || c->tl2_splits != 1u ||
+      c->act != HVX_GLU_SILU || e->m != 1u || !e->g->tl2_bytes ||
+      !e->d->tl2_bytes || htp_tl2_palette_magnitude(e->g->pal) != 1u ||
+      htp_tl2_palette_magnitude(e->d->pal) != 1u)
+    return 0;
+  hvx_dq_swiglu_job job = {(const uint8_t *)e->acc_gu,
+                           32u * sizeof(int32_t),
+                           c->inter_ntiles,
+                           0u,
+                           32u,
+                           1u,
+                           e->act_scale,
+                           e->act_zp,
+                           e->g->colsum_w,
+                           e->g->w_scale,
+                           e->g->bias,
+                           c->inter,
+                           e->gate_f32,
+                           c->inter,
+                           c->act};
+  hvx_dq_swiglu_worker(threads, id, &job);
+  return 1;
+}
+
 static void moe_tl2_gate_epilogue_worker(uint32_t threads, uint32_t id,
                                          void *v) {
   const moe_m1_ctx *c = v;
   const uint32_t jobs = c->u_hi - c->u_lo;
+  if (c->inter_ntiles == 48u && jobs == c->inter_ntiles &&
+      c->u_lo % c->inter_ntiles == 0u &&
+      moe_tl2_gate_direct(c, c->u_lo / c->inter_ntiles, threads, id))
+    return;
   moe_tl2_gate_epilogue(c, c->u_lo + jobs * id / threads,
                         c->u_lo + jobs * (id + 1u) / threads);
 }
@@ -1324,6 +1377,19 @@ static void moe_tl2_down_worker(uint32_t threads, uint32_t id, void *v) {
     const uint32_t panel = u % panels;
     hvx_gemv_u8tl2_panel(e->dn_wh + (size_t)panel * blocks * 640u, c->inter,
                          e->tl2_down, acc);
+    if (c->native_tl2 && c->k_tiles == 64u && c->inter == 1536u &&
+        c->N_out == 2048u && e->m == 1u &&
+        htp_tl2_palette_magnitude(e->g->pal) == 1u &&
+        htp_tl2_palette_magnitude(e->d->pal) == 1u) {
+      /** LFM2's native panel contains four full tiles. Preserve each
+       * column's FP32 operations while sharing the row parameter broadcasts
+       * and scheduling four independent dequantization chains together. */
+      const uint32_t col = panel * 128u;
+      hvx_dequant_acc_4tiles_m1_f32(acc, e->rq_scale[0], e->rq_zp[0],
+                                    e->d->colsum_w + col, e->d->w_scale + col,
+                                    e->d->bias + col, e->res + col);
+      continue;
+    }
     for (uint32_t j = 0; j < 128u && panel * 128u + j < c->N_out; j += 32u) {
       const uint32_t col = panel * 128u + j;
       moe_tl2_restore_magnitude(acc + j, e->d->pal);
@@ -1474,7 +1540,7 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
   moe_m1_slice(0u, c->n_active, n_lanes, i, &lo, &hi);
   for (uint32_t u = lo; u < hi; ++u) {
     moe_m1_expert *e = &c->ex[u];
-    if (e->g->tl2_bytes && c->tl2_fused)
+    if (e->g->tl2_bytes && c->tl2_fused && !moe_tl2_gate_direct(c, u, 1u, 0u))
       moe_tl2_gate_epilogue(c, u * c->inter_ntiles, (u + 1u) * c->inter_ntiles);
     if (e->d->tl2_bytes) {
       /** Native TL2 consumes one dense row. Reuse its idle AH allocation
@@ -2034,6 +2100,12 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch, uint32_t flags) {
+  const float *router_act = scratch ? scratch->router_act : NULL;
+  if (scratch) {
+    htp_router_handoff_scratch_invalidate(&scratch->router_handoff);
+    scratch->router_act = NULL;
+    scratch->router_used = 0;
+  }
   if (!tbl || !vtcm_base || !h_gate_up || !h_down || !row_index || !row_count ||
       !row_weight || !act_f32 || !out_f32 || !scratch || M == 0u ||
       n_experts == 0u) {
@@ -2047,7 +2119,7 @@ int hexkl_mm_u8i4_moe_layer_run(
        !(flags & (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN))))
     return AEE_EBADPARM;
 
-  /* Shared FFNs use this same entry, including their load-time warm-up.
+  /** Shared FFNs use this same entry, including their load-time warm-up.
      Resolve the explicit scope before width checks and VTCM reservation.
      Inspect only live pairs: graph tables include inactive/missing handles. */
   if (flags & HEXKL_MOE_FLAG_HAD_2BIT_ONLY) {
@@ -2079,7 +2151,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   if ((flags & HEXKL_MOE_FLAG_HAD_HMX) && (K != 2816u || inter != 704u))
     return AEE_EUNSUPPORTED;
   int use_had_hmx = 0;
-  /* [PR 4428] a sign vector set for this width rides the HVX rotation; one
+  /** [PR 4428] a sign vector set for this width rides the HVX rotation; one
      set for another width is a configuration error, not something to skip */
   const int had_signs =
     g_moe_had_sign_in != NULL || g_moe_had_sign_down != NULL;
@@ -2125,7 +2197,7 @@ int hexkl_mm_u8i4_moe_layer_run(
      found halfway through would leave out_f32 partly written, and the
      caller cannot tell that from a correct result. */
   uint32_t n_rows = 0u, n_with_rows = 0u, widest = 0u, n_tl2 = 0u,
-           n_affine = 0u;
+           n_affine = 0u, n_compact_tl2 = 0u;
   for (uint32_t e = 0; e < n_experts; ++e) {
     if (row_count[e] == 0u) {
       continue;
@@ -2149,6 +2221,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           g->N > 8192u || d->N > 8192u)
         return AEE_EBADPARM;
       ++n_tl2;
+      n_compact_tl2 += g->tl2_compact && d->tl2_compact;
     }
     n_affine += g->w_offset != NULL || d->w_offset != NULL;
     n_rows += row_count[e];
@@ -2166,6 +2239,19 @@ int hexkl_mm_u8i4_moe_layer_run(
   for (uint32_t i = 0; i < n_rows; ++i) {
     if (row_index[i] >= M) {
       return AEE_EBADPARM;
+    }
+  }
+
+  /** Stable native arena handles keep their addresses across file reads.
+   * Refresh only changed metadata, before this call starts any DMA. */
+  if (K == 2048u && inter == 1536u && N_out == 2048u && n_tl2 != 0u) {
+    for (uint32_t e = 0; e < n_experts; ++e) {
+      if (row_count[e] == 0u)
+        continue;
+      rc = hexkl_weight_tl2_refresh_pair(&tbl->slots[h_gate_up[e]],
+                                         &tbl->slots[h_down[e]]);
+      if (rc != AEE_SUCCESS)
+        return rc;
     }
   }
 
@@ -2210,19 +2296,18 @@ int hexkl_mm_u8i4_moe_layer_run(
     if (gu_packed + dn_packed <= arena - L.total) {
       native_gu = vtcm_base + L.total;
       native_dn = native_gu + gu_packed;
+    } else if (act == HVX_GLU_SILU && K == 2048u && inter == 1536u &&
+               N_out == 2048u && gu_packed <= arena - L.total) {
+      /** At the LFM2 shape, both packed sources need more than 8 MiB with
+       * the accumulator rings, but gate/up alone fits. Keep its native
+       * panels contiguous and let down retain its in-place expansion. */
+      native_gu = vtcm_base + L.total;
     }
   }
   uint8_t *gu_i24_scratch = NULL, *dn_i24_scratch = NULL;
+  uint32_t acc_tile_bytes = ACC_TILE_BYTES;
 #if defined(__hexagon__)
   if (!use_m1 && !n_affine && n_tl2 && n_tl2 == n_with_rows) {
-    /** Scratch follows both packed sources as well as every ring. Reserving
-     * from arena's end also leaves HexKL's config completely untouched. */
-    const uint32_t occupied_end =
-      native_dn
-        ? (uint32_t)(native_dn - vtcm_base + hvx_tl2_weight_bytes(inter, N_out))
-        : L.total;
-    const uint32_t scratch_off =
-      hexkl_acc_i24_scratch_offset(arena, occupied_end);
     int32_t gu_magnitude = 0, dn_magnitude = 0;
     for (uint32_t e = 0; e < n_experts; ++e) {
       if (!row_count[e])
@@ -2239,11 +2324,43 @@ int hexkl_mm_u8i4_moe_layer_run(
       if (dm > dn_magnitude)
         dn_magnitude = dm;
     }
+    const int gu_i24 =
+      hexkl_acc_i24_usable(K, -gu_magnitude, gu_magnitude, acc);
+    const int dn_i24 =
+      hexkl_acc_i24_usable(inter, -dn_magnitude, dn_magnitude, acc);
+    if (!native_dn && M > 1u && act == HVX_GLU_SILU && K == 2048u &&
+        inter == 1536u && N_out == 2048u && L.acc_tiles == 32u && gu_i24 &&
+        dn_i24) {
+      const uint32_t gu_bytes = (uint32_t)hvx_tl2_weight_bytes(K, 2u * inter);
+      const uint32_t dn_bytes = (uint32_t)hvx_tl2_weight_bytes(inter, N_out);
+      uint32_t down, end;
+      if (hexkl_acc_i24_banks(arena, L.result_off, L.acc_tiles,
+                              gu_bytes + dn_bytes, &down, &end)) {
+        /** This native shape uses foreground down epilogues: submitting
+         * the next job retires the previous one, so two banks suffice.
+         * Three-plane tiles free room for both contiguous native sources. */
+        acc_tile_bytes = 3u * HEXKL_CVT_PLANE_BYTES;
+        L.dn_stage_off = down;
+        L.dn_ring = 2u;
+        L.total = end;
+        native_gu = vtcm_base + end;
+        native_dn = native_gu + gu_bytes;
+      }
+    }
+    /** Scratch follows both packed sources as well as every ring. Reserving
+     * from arena's end also leaves HexKL's config completely untouched. */
+    uint32_t native_end = L.total;
+    if (native_gu)
+      native_end += (uint32_t)hvx_tl2_weight_bytes(K, 2u * inter);
+    if (native_dn)
+      native_end += (uint32_t)hvx_tl2_weight_bytes(inter, N_out);
+    const uint32_t scratch_off =
+      hexkl_acc_i24_scratch_offset(arena, native_end);
     if (scratch_off != UINT32_MAX) {
       uint8_t *scratch = vtcm_base + scratch_off;
-      if (hexkl_acc_i24_usable(K, -gu_magnitude, gu_magnitude, acc))
+      if (gu_i24)
         gu_i24_scratch = scratch;
-      if (hexkl_acc_i24_usable(inter, -dn_magnitude, dn_magnitude, acc))
+      if (dn_i24)
         dn_i24_scratch = scratch;
       if (gu_i24_scratch || dn_i24_scratch)
         hexkl_acc_i24_prepare(scratch);
@@ -2281,6 +2398,13 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t tl2_gu_tables = hvx_tl2_table_bytes(K);
   const size_t tl2_dn_tables = hvx_tl2_table_bytes(inter);
   const uint32_t use_tl2 = use_m1 && n_tl2 != 0u;
+  /** Only row zero is consumed by the native LFM M1 workers. Keep the
+   * scratch layout, but leave HMX-only padding and the unused rows_out
+   * accumulator untouched. Repeated rows and mixed formats keep their setup. */
+  const int lfm_m1_setup =
+    use_tl2 && K == 2048u && inter == 1536u && N_out == 2048u &&
+    n_experts == 64u && n_with_rows <= 4u && widest == 1u &&
+    n_tl2 == n_with_rows && !n_affine && act == HVX_GLU_SILU;
   if (use_tl2 && (M != 1u || !m1_feed || K > 8192u || inter > 8192u ||
                   2u * (uint64_t)feed_gu_bytes + tl2_gu_tables +
                       n_with_rows * tl2_dn_tables >
@@ -2358,7 +2482,7 @@ int hexkl_mm_u8i4_moe_layer_run(
      copy to scatter into. */
   const float *pre_gamma = scratch->pre_gamma;
   hexkl_moe_rotated_input *rotated = scratch->rotated_input;
-  /* The native TL2 GEMV takes its dense u8 row from the scan (act_ah), which
+  /** The native TL2 GEMV takes its dense u8 row from the scan (act_ah), which
      a reused rotation skips: such a call rotates again (one HVX row, the
      same bytes) instead of carrying the row over. */
   if (!use_m1 || M != 1u || !had_up || pre_gamma != NULL || rotated == NULL ||
@@ -2438,6 +2562,16 @@ int hexkl_mm_u8i4_moe_layer_run(
                       2u * ROUND_UP_SZ(sz_tail_rq, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_res, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_expert_u32, MOE_SCRATCH_ALIGN) + sz_m1;
+  /** The router's exact input is at base. Only a consumed owner ticket may
+   * reuse it, and only if this reserve cannot replace that allocation. */
+  const int router_reuse =
+#ifdef HEXKL_MOE_NO_DIRECT
+    0 && /* Keep the diagnostic build's forced copies. */
+#endif
+    router_act && router_act == (const float *)scratch->base &&
+    htp_router_handoff_shape(M, K) && inter == 1536u && N_out == 2048u &&
+    act == HVX_GLU_SILU && !use_m1 && !pre_gamma && !out_direct &&
+    n_with_rows && n_compact_tl2 == n_with_rows && need <= scratch->cap;
   uint64_t p_alloc = 0;
   HEXKL_PROBE_T0(p_alloc);
   rc = hexkl_moe_scratch_reserve(scratch, need);
@@ -2445,7 +2579,10 @@ int hexkl_mm_u8i4_moe_layer_run(
   if (rc != AEE_SUCCESS) {
     return rc;
   }
+  scratch->router_used = router_reuse;
   uint8_t *cur = scratch->base;
+  /* Keep the producer's prefix before slot/order metadata overwrites it. */
+  float *act_c = router_reuse ? (float *)hexkl_moe_carve(&cur, sz_act_c) : NULL;
   float *rq_scale = (float *)hexkl_moe_carve(&cur, sz_scale);
   int32_t *rq_zp = (int32_t *)hexkl_moe_carve(&cur, sz_zp);
   uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_act_ah);
@@ -2457,7 +2594,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t *base_of = (uint32_t *)hexkl_moe_carve(&cur, sz_expert_u32);
   float *scale_all = (float *)hexkl_moe_carve(&cur, sz_mpad_u32);
   int32_t *zp_all = (int32_t *)hexkl_moe_carve(&cur, sz_mpad_u32);
-  float *act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
+  if (!router_reuse)
+    act_c = (float *)hexkl_moe_carve(&cur, sz_act_c);
   if (rotated)
     act_c = rotated->row;
   float *out_c =
@@ -2535,7 +2673,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   if (hexkl_probe_on) {
     hexkl_dma_trace_reset(hexkl_probe_now_ticks());
   }
-  if (act_direct || reuse_rotated) {
+  if (router_reuse) {
+    /** Exact bytes retained by the immediately preceding router. */
+  } else if (act_direct || reuse_rotated) {
     /* The scan reads act_f32, or this op already rotated the same row. */
   } else if (pre_gamma) {
     if (hvx_rmsnorm_rows_f32(act_f32, act_c, M, K, K, pre_gamma,
@@ -2552,7 +2692,8 @@ int hexkl_mm_u8i4_moe_layer_run(
      wrote are cleared at the end. The clear was 11.5 MB a 1024-row call,
      written and then read back by every row's first add. */
   if (use_m1 || n_active == 0u) {
-    memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
+    if (!lfm_m1_setup || !rows_out)
+      memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   } else {
     memset(seen, 0, sz_seen);
   }
@@ -2664,10 +2805,10 @@ int hexkl_mm_u8i4_moe_layer_run(
       rotated->valid = 1u;
     }
   } else {
-    hvx_quant_rows_u8_params_rm(act_direct ? act_f32 : act_c, M, m_pad, K,
-                                scale_all, zp_all, use_tl2 ? act_ah : act_u8,
-                                act_direct ? pre_gamma : NULL, scratch->pre_eps,
-                                pre_rows, gu0_async ? NULL : pool);
+    hvx_quant_rows_u8_params_rm(
+      act_direct ? act_f32 : act_c, M, lfm_m1_setup ? 1u : m_pad, K, scale_all,
+      zp_all, use_tl2 ? act_ah : act_u8, act_direct ? pre_gamma : NULL,
+      scratch->pre_eps, pre_rows, gu0_async ? NULL : pool);
   }
 
   /** Slot order: every active expert's rows, each expert padded up to a
@@ -2683,6 +2824,12 @@ int hexkl_mm_u8i4_moe_layer_run(
       const uint32_t *rows_e = row_index + base_of[i];
       const uint32_t padded =
         ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
+      if (lfm_m1_setup) {
+        slot_scale[d] = scale_all[0];
+        slot_zp[d] = zp_all[0];
+        d += padded;
+        continue;
+      }
       /** The pack units past the expert's last row hold padding only and
          are not packed: at a 1024-row prefill 128 experts' 4096 rows pad
          to ~12,700 slots, and packing the padding was two thirds of the
@@ -2741,7 +2888,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                                          act_ah);
         x->act_ah = act_ah;
       } else if (i != 0u && M == 1u && widest == 1u) {
-        /* With one token, every live expert consumes the same quantized
+        /** With one token, every live expert consumes the same quantized
            input (rotated or not): share expert 0's read-only AH tile.
            Multi-token calls keep the gather for distinct rows. */
         x->act_ah = m1.ex[0].act_ah;
@@ -3200,7 +3347,7 @@ int hexkl_mm_u8i4_moe_layer_run(
         const uint32_t np =
           (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
         const uint32_t stage_off =
-          L.result_off + (sb & 1u) * L.acc_tiles * ACC_TILE_BYTES;
+          L.result_off + (sb & 1u) * L.acc_tiles * acc_tile_bytes;
         /** Only the first block of an expert waits: by the second the whole
            weight is resident. n == 0 && gb == 0 is the one wait that cannot
            hide behind anything, which is what DMA_FIRST records. */
@@ -3276,7 +3423,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           }
           HEXKL_PROBE_T0(p0);
           rc = moe_acc_read(vtcm_base, config_off,
-                            stage_off + j * ACC_TILE_BYTES, gu_i24_scratch);
+                            stage_off + j * acc_tile_bytes, gu_i24_scratch);
           HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
@@ -3367,7 +3514,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->tiles_base =
             (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                               acc->base);
-          jb->tile_stride = ACC_TILE_BYTES;
+          jb->tile_stride = acc_tile_bytes;
           jb->n_pairs = np;
           jb->g0 = g0;
           jb->row_stride = acc->row_stride;
@@ -3482,7 +3629,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
         }
         const uint32_t stage_off =
-          L.dn_stage_off + k * L.acc_tiles * ACC_TILE_BYTES;
+          L.dn_stage_off + k * L.acc_tiles * acc_tile_bytes;
         /** exp_bg first, as for gate_up: a 4-bit call's down chunks can
            run past exp_live (db = 8 on the lfm25 dense FFN at M = 512),
            and the stack word read there sent the wait to a job that was
@@ -3534,7 +3681,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           }
           HEXKL_PROBE_T0(p0);
           rc = moe_acc_read(vtcm_base, config_off,
-                            stage_off + j * ACC_TILE_BYTES, dn_i24_scratch);
+                            stage_off + j * acc_tile_bytes, dn_i24_scratch);
           HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
@@ -3608,7 +3755,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           c->tiles_base =
             (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                               acc->base);
-          c->tile_stride = ACC_TILE_BYTES;
+          c->tile_stride = acc_tile_bytes;
           c->nt0 = nt0;
           c->nb = nb;
           c->row_stride = acc->row_stride;

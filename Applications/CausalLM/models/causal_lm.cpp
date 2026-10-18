@@ -1728,6 +1728,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       compactKVCache(o);
       for (auto &so : output)
         releaseLogitsBuf(so);
+      beforePrefillBlock(o, o + step);
       output = incrementalInference(BATCH_SIZE, input, step, o, o + step);
     }
 
@@ -2017,9 +2018,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // Single block (default) when chunking is off or the prompt fits one chunk.
     const bool one_block_on_grid =
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
-    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid))
+    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
+      beforePrefillBlock(from_pos, from_pos + n_tok);
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
+    }
     // Chunked forward prefill.
     std::vector<float *> out;
     unsigned int clen = 0;
@@ -2035,6 +2038,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       const unsigned int cf = from_pos + o;
       // a windowed (sliding) layer keeps its window in front of the chunk
       compactKVCache(cf);
+      beforePrefillBlock(cf, cf + clen);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
         for (auto &oo : so)

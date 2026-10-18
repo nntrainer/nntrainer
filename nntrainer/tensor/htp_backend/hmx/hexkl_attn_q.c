@@ -32,6 +32,9 @@
  * lands block k+1's tiles, runs its Q.K^T and dequantizes into S[(k+1)&1];
  * then P' quantization on the pool, and P'.V plus the f32 O update on the
  * calling thread. Q is quantized once per kv head for a chunk of q blocks.
+ * Full LFM Q8 prefill can reuse the gathered Q rows after quantization:
+ * next-block int32 scores land there, then their dequant runs on the pool
+ * beside the current P'.V. That job joins before the next softmax starts.
  *
  * VTCM is fast for vectors and slow for the scalar unit: a scalar load or
  * store into VTCM costs tens of cycles and does not pipeline, and the
@@ -70,7 +73,7 @@
 #define TB HEXKL_ATTN_TILE_BYTES
 #define LOG2E 1.4426950408889634f
 /** @brief Row cap; bounds the lane-mask arithmetic, not any buffer. */
-#define MAX_G_BR 256u
+#define MAX_G_BR 512u
 /** @brief Vectors per 2 KiB tile. */
 #define TILE_VECS (TB / sizeof(HVX_Vector))
 /** @brief VTCM the Q staging (f32 rows + uint8 tiles) may take per head
@@ -212,10 +215,30 @@ static int phase_qprep(attn_ctx *c, uint32_t n, uint32_t qb0, uint32_t n_qb) {
       }
     }
   }
-  hvx_quant_rows_u8_params(qx_row(c, 0), rows, rows, hd, c->q_scale, c->q_zp,
-                           c->pool);
-  int rc = hvx_quant_pack_u8_ah(qx_row(c, 0), rows, rows, hd, c->q_scale,
-                                c->q_zp, q_tile(c, 0, 0, 0), c->pool);
+  int rc;
+  if (c->kv->kind == HEXKL_KV_Q8 && !c->kv->fixed && c->s->n_head_q == 32u &&
+      c->s->n_head_kv == 8u && hd == 64u && c->s->n_q >= 128u &&
+      c->s->n_q % 128u == 0u && c->s->cache_from == 0u &&
+      c->s->cache_to == c->s->n_q && c->s->window == 0u &&
+      c->s->softcap == 0.0f) {
+    // LFM2's two column tiles underfill the separate pack's worker split.
+    // Keep the same quantizer and four-row pack, but distribute row groups
+    // in one pass without the pack's per-row splat-vector allocations.
+    // The fused helper leaves zero rows' parameters alone, including rows
+    // zero-padded by the gather above: preserve the separate pass's defaults.
+    for (uint32_t r = 0; r < rows; ++r) {
+      c->q_scale[r] = 1.0f;
+      c->q_zp[r] = 0;
+    }
+    rc = hvx_quant_params_pack_u8_ah(qx_row(c, 0), NULL, NULL, 0u, rows, rows,
+                                     hd, NULL, 0.0f, NULL, c->q_scale, c->q_zp,
+                                     q_tile(c, 0, 0, 0), c->pool);
+  } else {
+    hvx_quant_rows_u8_params(qx_row(c, 0), rows, rows, hd, c->q_scale, c->q_zp,
+                             c->pool);
+    rc = hvx_quant_pack_u8_ah(qx_row(c, 0), rows, rows, hd, c->q_scale, c->q_zp,
+                              q_tile(c, 0, 0, 0), c->pool);
+  }
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -290,9 +313,10 @@ static void dma_land(attn_ctx *c, uint32_t kb, uint32_t buf) {
  * narrow (low vector -> even lanes), as the fp16 tile builders do; four
  * rows -- two output vectors -- per iteration.
  */
-static void dequant_s(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t i,
-                      uint32_t col, uint32_t sbuf) {
-  const HVX_Vector *restrict acc = acc_rows(c);
+static void dequant_s_at(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t i,
+                         uint32_t col, uint32_t sbuf, uint32_t acc_off) {
+  const HVX_Vector *restrict acc =
+    (const HVX_Vector *)(c->vb + acc_off) + c->acc_layout->base / 32u;
   const uint32_t rs = c->acc_layout->row_stride / 32u; /* vectors per row */
   const uint32_t k0 = kb * c->t->bc + 32u * col;
   const float *restrict qs =
@@ -331,9 +355,49 @@ static void dequant_s(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t i,
   }
 }
 
-/** @brief S[sbuf] = Q.K^T for the block in @a buf, dequantized. */
+static void dequant_s(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t i,
+                      uint32_t col, uint32_t sbuf) {
+  dequant_s_at(c, n, kb, i, col, sbuf, c->L.acc);
+}
+
+/** Qx is dead after the whole chunk has been packed into q_ah. Borrow one
+ * block of it for next-QK readouts; the current PV keeps using L.acc. */
+static int qx_dequant_available(const attn_ctx *c) {
+  const uint64_t raw_bytes =
+    (uint64_t)c->L.n_row_tiles * c->L.n_col_tiles * HEXKL_ATTN_Q_ACC_BYTES;
+  const uint64_t qx_bytes =
+    (uint64_t)c->L.n_qb_chunk * c->t->g_br * c->s->head_dim * sizeof(float);
+  return hvx_worker_pool_workers(c->pool) > 0u && c->kv->kind == HEXKL_KV_Q8 &&
+         !c->kv->fixed && c->s->n_q >= 2048u && c->s->n_q % 128u == 0u &&
+         c->s->cache_from == 0u && c->s->cache_to == c->s->n_q &&
+         c->s->n_head_q == 32u && c->s->n_head_kv == 8u &&
+         c->s->head_dim == 64u && c->s->window == 0u && c->s->softcap == 0.0f &&
+         !c->io->sinks && c->t->br == 128u && c->t->bc == 256u &&
+         c->t->g_br == 512u && raw_bytes <= qx_bytes &&
+         c->L.qx_f32 <= c->L.total && c->L.total <= c->cfg &&
+         raw_bytes <= (uint64_t)c->L.total - c->L.qx_f32;
+}
+
+typedef struct {
+  attn_ctx *c;
+  uint32_t n, kb, sbuf;
+} dequant_job;
+
+/** Independent score tiles retain the serial converter's arithmetic. */
+static void dequant_worker(uint32_t threads, uint32_t id, void *ctx_) {
+  const dequant_job *job = (const dequant_job *)ctx_;
+  attn_ctx *c = job->c;
+  uint32_t lo, hi;
+  unit_range(c->L.n_row_tiles * c->L.n_col_tiles, threads, id, &lo, &hi);
+  for (uint32_t u = lo; u < hi; ++u) {
+    dequant_s_at(c, job->n, job->kb, u / c->L.n_col_tiles, u % c->L.n_col_tiles,
+                 job->sbuf, c->L.qx_f32 + u * HEXKL_ATTN_Q_ACC_BYTES);
+  }
+}
+
+/** @brief Q.K^T -> S[sbuf], or raw Qx readouts for deferred conversion. */
 static int phase_qk(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t buf,
-                    uint32_t sbuf) {
+                    uint32_t sbuf, int deferred) {
   const int q4 = c->kv->kind == HEXKL_KV_Q4;
   for (uint32_t i = 0; i < c->L.n_row_tiles; ++i) {
     for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
@@ -348,14 +412,20 @@ static int phase_qk(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t buf,
           hexkl_hmx_mm_u8i8(q_tile(c, c->qi, i, d), kt_tile(c, buf, col, d));
         }
       }
-      int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, c->L.acc);
+      const uint32_t acc_off =
+        deferred
+          ? c->L.qx_f32 + (i * c->L.n_col_tiles + col) * HEXKL_ATTN_Q_ACC_BYTES
+          : c->L.acc;
+      int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, acc_off);
       if (rc != AEE_SUCCESS) {
         return rc;
       }
       uint64_t t1 = now_us();
       c->st->us_qk += t1 - t0;
-      dequant_s(c, n, kb, i, col, sbuf);
-      c->st->us_dequant += now_us() - t1;
+      if (!deferred) {
+        dequant_s(c, n, kb, i, col, sbuf);
+        c->st->us_dequant += now_us() - t1;
+      }
     }
   }
   return AEE_SUCCESS;
@@ -582,9 +652,10 @@ static int phase_pv(attn_ctx *c, uint32_t buf, int first) {
 }
 
 /** @brief out rows = O / l, f32. */
-static void phase_store(attn_ctx *c, uint32_t n, uint32_t qb) {
+static void phase_store_rows(attn_ctx *c, uint32_t n, uint32_t qb, uint32_t lo,
+                             uint32_t hi) {
   const uint32_t hd = c->s->head_dim;
-  for (uint32_t r = 0; r < c->t->g_br; ++r) {
+  for (uint32_t r = lo; r < hi; ++r) {
     uint32_t q, g;
     if (!hexkl_attn_f16_tile_row_to_qg(c->s, c->t, qb, r, &q, &g)) {
       continue;
@@ -599,6 +670,33 @@ static void phase_store(attn_ctx *c, uint32_t n, uint32_t qb) {
   }
 }
 
+typedef struct {
+  attn_ctx *c;
+  uint32_t n, qb;
+} store_ctx;
+
+static void store_worker(uint32_t threads, uint32_t id, void *ctx_) {
+  const store_ctx *ctx = (const store_ctx *)ctx_;
+  uint32_t lo, hi;
+  unit_range(ctx->c->t->g_br, threads, id, &lo, &hi);
+  phase_store_rows(ctx->c, ctx->n, ctx->qb, lo, hi);
+}
+
+/** Independent LFM output rows keep the same scalar divide and vector multiply.
+ * The last softmax/quantization job has joined before this store phase. */
+static void phase_store(attn_ctx *c, uint32_t n, uint32_t qb) {
+  if (c->pool && c->s->n_q >= 128u && c->s->n_q % 128u == 0u &&
+      c->s->cache_from == 0u && c->s->cache_to == c->s->n_q &&
+      c->s->n_head_q == 32u && c->s->n_head_kv == 8u && c->s->head_dim == 64u &&
+      c->s->window == 0u && c->s->softcap == 0.0f &&
+      c->kv->kind == HEXKL_KV_Q8 && !c->kv->fixed) {
+    store_ctx ctx = {c, n, qb};
+    hvx_worker_pool_run(c->pool, store_worker, &ctx, c->t->g_br);
+  } else {
+    phase_store_rows(c, n, qb, 0u, c->t->g_br);
+  }
+}
+
 /* --- the block pipeline for one (kv head, query block) ---------------- */
 
 static int run_q_block(attn_ctx *c, uint32_t n, uint32_t qb) {
@@ -609,12 +707,13 @@ static int run_q_block(attn_ctx *c, uint32_t n, uint32_t qb) {
     return AEE_SUCCESS;
   }
   softmax_state_init(c, n, qb);
+  const int deferred = qx_dequant_available(c);
 
   uint64_t t0 = now_us();
   dma_issue(c, n, kb_lo, kb_lo & 1u);
   dma_land(c, kb_lo, kb_lo & 1u);
   st->us_dma += now_us() - t0;
-  int rc = phase_qk(c, n, kb_lo, kb_lo & 1u, 0);
+  int rc = phase_qk(c, n, kb_lo, kb_lo & 1u, 0, 0);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -638,7 +737,7 @@ static int run_q_block(attn_ctx *c, uint32_t n, uint32_t qb) {
       dma_land(c, kb + 1u, buf ^ 1u);
       uint64_t t2 = now_us();
       st->us_dma += t2 - t1;
-      rc = phase_qk(c, n, kb + 1u, buf ^ 1u, sbuf ^ 1u);
+      rc = phase_qk(c, n, kb + 1u, buf ^ 1u, sbuf ^ 1u, deferred);
       if (rc != AEE_SUCCESS) {
         hvx_worker_pool_wait(c->pool);
         return rc;
@@ -649,7 +748,23 @@ static int run_q_block(attn_ctx *c, uint32_t n, uint32_t qb) {
     // reads it; both happen here, workers joined in between.
     softmax_finish_pquant(c, buf);
 
+    dequant_job job = {c, n, kb + 1u, sbuf ^ 1u};
+    if (deferred && has_next) {
+      // Softmax and P quantization have joined. While PV uses L.acc,
+      // workers read the next QK block from Qx and write the other S bank.
+      t0 = now_us();
+      hvx_worker_pool_submit(c->pool, dequant_worker, &job,
+                             c->L.n_row_tiles * c->L.n_col_tiles);
+      st->us_dequant += now_us() - t0;
+    }
     rc = phase_pv(c, buf, first);
+    if (deferred && has_next) {
+      // Also drain on a PV error before returning stack/metadata storage.
+      // Joining here makes the next softmax and Qx reuse safe.
+      t0 = now_us();
+      hvx_worker_pool_wait(c->pool);
+      st->us_dequant += now_us() - t0;
+    }
     if (rc != AEE_SUCCESS) {
       return rc;
     }
@@ -681,6 +796,12 @@ int hexkl_attn_q_prefill(uint8_t *vtcm_base, uint32_t config_off,
   if (s->cache_to > 0xFFFFu || t->g_br > MAX_G_BR || s->softcap < 0.0f) {
     return AEE_EBADPARM;
   }
+
+  // Widen only the full LFM2 Q8 prefill geometry after checking its VTCM
+  // plan. Smaller arenas retain the original tiling.
+  hexkl_attn_f16_tiling wide = *t;
+  if (hexkl_attn_q_widen_prefill(s, t, config_off, kv->tile_bytes, &wide))
+    t = &wide;
 
   attn_ctx c;
   memset(&c, 0, sizeof(c));

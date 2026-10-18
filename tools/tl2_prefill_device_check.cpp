@@ -29,6 +29,7 @@ static unsigned round4k(unsigned bytes) { return (bytes + 4095u) & ~4095u; }
 
 static void check_shape(remote_handle64 session, unsigned K, unsigned I,
                         unsigned N, int magnitude, unsigned experts) {
+  const unsigned activation = K == 2048 && I == 1536 && N == 2048 ? 0u : 1u;
   const unsigned gu_bytes = round4k(K * 2 * I / 4 + 8 * 2 * I);
   const unsigned dn_bytes = round4k(I * N / 4 + 8 * N);
   nntrainer::HtpRpcBuffer arena_buffer(experts * (gu_bytes + dn_bytes),
@@ -99,8 +100,8 @@ static void check_shape(remote_handle64 session, unsigned K, unsigned I,
         uint32_t *h = handles.data() + 2 * experts * mode;
         const auto start = std::chrono::steady_clock::now();
         check(nntr_hvx_mm_u8i4_moe_layer(
-                session, M, K, I, N, 1, h, experts, h + experts, experts,
-                rows.data(), rows.size(), counts.data(), experts,
+                session, M, K, I, N, activation, h, experts, h + experts,
+                experts, rows.data(), rows.size(), counts.data(), experts,
                 routing.data(), routing.size(), input.data(), input.size(), out,
                 actual.size()),
               "prefill MoE");
@@ -139,12 +140,13 @@ int main() {
   const std::string uri = std::string(nntr_hvx_URI) + "&_dom=cdsp";
   check(nntr_hvx_open(uri.c_str(), &session), "open");
   uint32_t applied;
-  check(nntr_hvx_moe_set_opts(session, 0xcf03e1u, &applied), "MoE options");
+  check(nntr_hvx_moe_set_opts(session, 0xc703e1u, &applied), "MoE options");
   std::printf("MOE_FLAGS 0x%x\n", applied);
   for (int magnitude : {1, 7}) {
     for (unsigned experts : {1u, 3u}) {
       check_shape(session, 96, 192, 128, magnitude, experts);
       check_shape(session, 2816, 704, 2816, magnitude, experts);
+      check_shape(session, 2048, 1536, 2048, magnitude, experts);
     }
   }
   check(nntr_hvx_close(session), "close");

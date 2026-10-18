@@ -347,7 +347,12 @@ interface nntr_hvx : remote_handle64 {
    //
    // act is the gated activation between gate_up and down: 0 silu(g)*u
    // (LFM2), 1 gelu_tanh(g)*u (Gemma-4; doc 55). HVX_GLU_* in
-   // hvx_dequant_i32.h.
+   // hvx_dequant_i32.h. Opt-in LFM input handoff may put the ticket word
+   // from htp_router_handoff.h in act. Other entries retain act=0/1.
+   // Matching ARM+DSP binaries are required. The ARM client sends a ticket
+   // only after consuming its source/session/write-epoch stamp. DSP checks
+   // the same ticket against this session's scratch owner/extent/epoch; RPC
+   // input VAs may differ. Any missing stamp falls back to the input copy.
    AEEResult mm_u8i4_moe_layer(in uint32 M, in uint32 K, in uint32 inter,
                                in uint32 N_out, in uint32 act,
                                in sequence<uint32> h_gate_up,
@@ -382,6 +387,10 @@ interface nntr_hvx : remote_handle64 {
    // tie to the lower index -- the CPU layer's comparator) and weight the
    // first top_k's p * (1 / their sum) * scale[e] (hvx_router_topk_rows_f32);
    // scale is E floats. n_sel past top_k is the caller's prefetch hint.
+   // With top_k=0 only, n_sel may carry htp_router_handoff.h's opt-in
+   // ticket word. No selection arrays are used; a successful eligible LFM
+   // router retains one scratch stamp for the following plain MoE call.
+   // Its ticket binds the ARM-authorized ION source, not an RPC mapping VA.
    AEEResult router_logits_f32(in uint32 M, in uint32 K, in uint32 E,
                                in float eps, in sequence<float> gamma,
                                in sequence<float> w, in sequence<float> x,
@@ -1151,6 +1160,9 @@ interface nntr_hvx : remote_handle64 {
    // fewer than 5 query rows with head_dim <= 128, prefill (HMX) otherwise.
    // stats_us = { append us, attention us, 0 decode / 1 prefill, total us,
    // append quantize us, append stage us, append bake us, rows appended }.
+   // With length >= 20, the next 12 entries report prefill stages:
+   // qprep, dma, qk, dequant, softmax, pquant, pv, output update, store,
+   // n_blocks, kernel total us, kernel kcycles. Decode leaves them zero.
    AEEResult attn_q_step(in uint32 kv_handle, in uint32 row0,
                          in sequence<uint16> k_rows, in sequence<uint16> v_rows,
                          in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
@@ -1465,6 +1477,16 @@ interface nntr_hvx : remote_handle64 {
    // last.
    AEEResult moe_set_hadamard_signs(in sequence<float> s_in,
                                     in sequence<float> s_down);
+   // LFM native TL2 slots with stable handles. GU padding contains a
+   // 128-byte-aligned generation word after codes + 2*N float arrays.
+   // The host publishes a new generation only after both weights' reads
+   // complete. The compute call refreshes metadata before using the pair.
+   AEEResult weight_swap_batch_tl2_stable_arena(
+      in uint32 K, in uint32 inter, in uint32 N_out,
+      in sequence<uint32> old_gu, in sequence<uint32> old_dn,
+      in sequence<uint32> arena, in sequence<uint32> off_gu,
+      in sequence<uint32> off_dn, rout sequence<uint32> h_gu,
+      rout sequence<uint32> h_dn, rout uint32 n_done, rout int32 err);
    // Release large session temporaries after all prefill/queue work completes.
    // Retains weights, KV caches, graph, convolution state and decode FC feed.
    // Later prefill/decode kernels recreate these buffers on demand.

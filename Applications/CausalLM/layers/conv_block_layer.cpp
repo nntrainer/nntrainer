@@ -10,6 +10,23 @@
  * @bug    No known bugs except for NYI items
  */
 
+// Intrinsics are inline definitions: include them under precise arithmetic
+// before another header can include them with the app's fast-math defaults.
+#if defined(__aarch64__)
+#if defined(__clang__)
+#pragma float_control(precise, on, push)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("no-fast-math")
+#endif
+#include <arm_neon.h>
+#if defined(__clang__)
+#pragma float_control(pop)
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+#endif
+
 #include "htp_decode_hook.h"
 #include <conv_block_layer.h>
 
@@ -22,6 +39,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +76,213 @@ static double snrDb(const float *ref, const float *got, size_t n) {
   }
   return err == 0.0 ? 999.0 : 10.0 * std::log10(sig / err);
 }
+
+// The app enables fast-math, while the core convolution preserves each
+// rounding step. Limit precise arithmetic to this helper and its row lambda.
+#if defined(__clang__)
+#pragma float_control(precise, on, push)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("no-fast-math")
+#endif
+/** Preserve the wide ARM convolution's multiply/two-FMA order, then apply
+ *  the post gate before storing. The existing pre-gate barrier makes all
+ *  previous rows immutable, so separate rows can run on the same pool. */
+static bool lfmConvPostGatePrefill(const float *gated, const float *weights,
+                                   const float *projection, float *output,
+                                   unsigned int rows, unsigned int channels) {
+#if defined(__aarch64__)
+  if (rows < 16 || channels != 2048)
+    return false;
+  const size_t bytes = static_cast<size_t>(rows) * channels * sizeof(float);
+  const uintptr_t dst = reinterpret_cast<uintptr_t>(output);
+  const auto overlaps = [&](const float *input, size_t size) {
+    const uintptr_t src = reinterpret_cast<uintptr_t>(input);
+    return dst <= src ? src - dst < bytes : dst - src < size;
+  };
+  if (!gated || !weights || !projection || !output || overlaps(gated, bytes) ||
+      overlaps(projection, 3u * bytes) ||
+      overlaps(weights, 3u * channels * sizeof(float)))
+    return false;
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, static_cast<size_t>(rows), [&](size_t r) {
+#if defined(__clang__)
+#pragma clang fp exceptions(strict)
+#endif
+      const float *cur = gated + r * channels;
+      const float *prev1 = r >= 1 ? cur - channels : nullptr;
+      const float *prev2 = r >= 2 ? cur - 2u * channels : nullptr;
+      const float *gate = projection + r * 3u * channels + channels;
+      float *dst_row = output + r * channels;
+      const float32x4_t zero = vdupq_n_f32(0.0f);
+      for (unsigned int c = 0; c < channels; c += 4) {
+        float32x4_t v = vmulq_f32(vld1q_f32(cur + c), vld1q_f32(weights + c));
+        v = vfmaq_f32(v, prev1 ? vld1q_f32(prev1 + c) : zero,
+                      vld1q_f32(weights + channels + c));
+        v = vfmaq_f32(v, prev2 ? vld1q_f32(prev2 + c) : zero,
+                      vld1q_f32(weights + 2u * channels + c));
+        vst1q_f32(dst_row + c, vmulq_f32(v, vld1q_f32(gate + c)));
+      }
+    });
+  return true;
+#else
+  (void)gated;
+  (void)weights;
+  (void)projection;
+  (void)output;
+  (void)rows;
+  (void)channels;
+  return false;
+#endif
+}
+
+#if defined(__aarch64__)
+// Chunk-local projection rows use the global gated history. The full helper
+// above stays separate so existing prompts keep their original row callback.
+static bool lfmConvPostGatePrefillRange(const float *gated,
+                                        const float *weights,
+                                        const float *projection, float *output,
+                                        unsigned int rows,
+                                        unsigned int channels,
+                                        unsigned int first, unsigned int last) {
+  if (last == 0)
+    last = rows;
+  if (rows < 16 || channels != 2048 || first >= last || last > rows)
+    return false;
+  const size_t bytes = static_cast<size_t>(rows) * channels * sizeof(float);
+  const uintptr_t dst = reinterpret_cast<uintptr_t>(output);
+  const auto overlaps = [&](const float *input, size_t size) {
+    const uintptr_t src = reinterpret_cast<uintptr_t>(input);
+    return dst <= src ? src - dst < bytes : dst - src < size;
+  };
+  if (!gated || !weights || !projection || !output || overlaps(gated, bytes) ||
+      overlaps(projection, static_cast<size_t>(last - first) * 3u * channels *
+                             sizeof(float)) ||
+      overlaps(weights, 3u * channels * sizeof(float)))
+    return false;
+  nntrainer::ThreadManager::Global().parallel_for(
+    static_cast<size_t>(first), static_cast<size_t>(last), [&](size_t r) {
+#if defined(__clang__)
+#pragma clang fp exceptions(strict)
+#endif
+      const float *cur = gated + r * channels;
+      const float *prev1 = r >= 1 ? cur - channels : nullptr;
+      const float *prev2 = r >= 2 ? cur - 2u * channels : nullptr;
+      const float *gate = projection + (r - first) * 3u * channels + channels;
+      float *dst_row = output + r * channels;
+      const float32x4_t zero = vdupq_n_f32(0.0f);
+      for (unsigned int c = 0; c < channels; c += 4) {
+        float32x4_t v = vmulq_f32(vld1q_f32(cur + c), vld1q_f32(weights + c));
+        v = vfmaq_f32(v, prev1 ? vld1q_f32(prev1 + c) : zero,
+                      vld1q_f32(weights + channels + c));
+        v = vfmaq_f32(v, prev2 ? vld1q_f32(prev2 + c) : zero,
+                      vld1q_f32(weights + 2u * channels + c));
+        vst1q_f32(dst_row + c, vmulq_f32(v, vld1q_f32(gate + c)));
+      }
+    });
+  return true;
+}
+
+#endif
+
+#if defined(__clang__)
+#pragma float_control(pop)
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#if defined(__aarch64__)
+/** Consume each existing FC row chunk before the next engine call can reuse
+ *  its ION view. Global gated rows retain the two-row convolution history.
+ *  The 1920+128 requests match invokeFc at K=2048; no staging capacity grows.
+ */
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(gnu::noinline)
+[[gnu::noinline]]
+#elif __has_cpp_attribute(msvc::noinline)
+[[msvc::noinline]]
+#endif
+#endif
+static bool
+lfmConvChunkedPrefill(nntrainer::ComputeOps *ops, void *in_weight,
+                      float *in_scale, float *input, float *projection,
+                      float *gated, const float *weights, float *output,
+                      float *state, unsigned int rows, unsigned int channels) {
+  if (rows != 2048 || channels != 2048 || !ops || !in_weight || !in_scale ||
+      !input || !projection || !gated || !weights || !output || !state ||
+      !ops->supports_gemm_q4_0_batch_norm_fp32())
+    return false;
+  const size_t bytes = static_cast<size_t>(rows) * channels * sizeof(float);
+  const size_t weight_bytes = 3u * channels * sizeof(float);
+  const size_t state_bytes = 2u * channels * sizeof(float);
+  const auto disjoint = [](const void *a, size_t a_bytes, const void *b,
+                           size_t b_bytes) {
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x >= a_bytes : x - y >= b_bytes;
+  };
+  // Interleaving CPU writes with projection calls is safe only when they
+  // cannot change a later chunk's input or any still-live projection/history.
+  struct Range {
+    const void *data;
+    size_t bytes;
+  };
+  const Range writes[] = {{projection, 3u * bytes},
+                          {gated, bytes},
+                          {output, bytes},
+                          {state, state_bytes}};
+  for (size_t i = 0; i < 4; ++i) {
+    if (!disjoint(writes[i].data, writes[i].bytes, input, bytes) ||
+        !disjoint(writes[i].data, writes[i].bytes, weights, weight_bytes))
+      return false;
+    for (size_t j = 0; j < i; ++j)
+      if (!disjoint(writes[i].data, writes[i].bytes, writes[j].data,
+                    writes[j].bytes))
+        return false;
+  }
+  constexpr unsigned int step = 1920;
+  for (unsigned int first = 0; first < rows; first += step) {
+    const unsigned int count = std::min(step, rows - first);
+    const unsigned int last = first + count;
+    const size_t chunk_bytes =
+      static_cast<size_t>(count) * 3u * channels * sizeof(float);
+    float *host = projection + static_cast<size_t>(first) * 3u * channels;
+    ops->gemm_q4_0_batch_norm_fp32(
+      {in_weight}, {in_scale}, input + static_cast<size_t>(first) * channels,
+      {host}, count, {3u * channels}, channels, nullptr, {0u}, nullptr, 0.0f,
+      nullptr, 0u, 0u, false);
+    const auto *view =
+      static_cast<const float *>(ops->host_view(host, chunk_bytes));
+    if (!view || !disjoint(view, chunk_bytes, input, bytes) ||
+        !disjoint(view, chunk_bytes, gated, bytes) ||
+        !disjoint(view, chunk_bytes, output, bytes) ||
+        !disjoint(view, chunk_bytes, state, state_bytes) ||
+        !disjoint(view, chunk_bytes, weights, weight_bytes)) {
+      ops->sync_to_host(host, chunk_bytes);
+      view = host;
+    }
+    nntrainer::ThreadManager::Global().parallel_for(
+      static_cast<size_t>(first), static_cast<size_t>(last), [&](size_t r) {
+        const float *a = view + (r - first) * 3u * channels;
+        const float *c = a + 2u * channels;
+        float *dst = gated + r * channels;
+        for (unsigned int j = 0; j < channels; ++j)
+          dst[j] = a[j] * c[j];
+      });
+    // All geometry/overlap guards were checked before the first RPC and
+    // for this view. Keep failure explicit instead of reading future rows.
+    if (!lfmConvPostGatePrefillRange(gated, weights, view, output, rows,
+                                     channels, first, last))
+      throw std::runtime_error("conv_block: invalid retained chunk view");
+  }
+  std::memcpy(state, gated + static_cast<size_t>(rows - 2u) * channels,
+              channels * sizeof(float));
+  std::memcpy(state + channels,
+              gated + static_cast<size_t>(rows - 1u) * channels,
+              channels * sizeof(float));
+  return true;
+}
+#endif
 
 ConvBlockLayer::ConvBlockLayer() :
   LayerImpl(), conv_props(nntrainer::props::Unit()) {
@@ -274,24 +499,87 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // gate, conv and out_proj; the CONV1D_GATE hook below still binds its
   // weights, and neither projection's result would be read
   const bool row_resident = rows == 1 && htpDecodeRowResident(from);
+  const auto fp32 = nntrainer::Tdatatype::FP32;
+  const bool lfm_prefill =
+    rows > 1 && !compare && K == 2048 && N == 2048 &&
+    in_w.getDataType() == affine && out_w.getDataType() == affine &&
+    proj.getDataType() == fp32 && gated.getDataType() == fp32 &&
+    conv_out.getDataType() == fp32 && proj.getContiguous() &&
+    gated.getContiguous() && conv_out.getContiguous();
+  const float *p = proj.getData<float>();
+  float *g = gated.getData<float>();
+  float *y = conv_out.getData<float>();
+  // A retained projection is consumed before the next backend call (out_proj).
+  // Its host tensor must remain recognizable, and CPU writes must not overlap
+  // either the tensor or the retained view while the gates read it.
+  const size_t mid_bytes = static_cast<size_t>(rows) * C * sizeof(float);
+  const auto projection_disjoint = [&](const float *src) {
+    if (!src)
+      return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(src);
+    const auto overlaps = [&](const float *dst, size_t bytes) {
+      const uintptr_t other = reinterpret_cast<uintptr_t>(dst);
+      return begin <= other ? other - begin < 3u * mid_bytes
+                            : begin - other < bytes;
+    };
+    return !overlaps(g, mid_bytes) && !overlaps(y, mid_bytes) &&
+           !overlaps(state, 2u * C * sizeof(float)) &&
+           !overlaps(in_step.getData<float>(), mid_bytes);
+  };
+#if defined(__aarch64__)
+  // Keep both original RPC shapes at 2048 rows, consuming their retained
+  // views separately. Other prompts and unsupported/overlapping tensors
+  // continue through the existing projection and convolution paths below.
+  if (from == 0 && lfm_prefill && rows == 2048 && C == 2048 &&
+      in_step.getDataType() == fp32 && in_step.getContiguous() &&
+      !(htp_owns_state_ && from > 0) &&
+      lfmConvChunkedPrefill(ops, in_w.getData<char>(), in_w.getScale<float>(),
+                            in_step.getData<float>(), proj.getData<float>(), g,
+                            w_ptr, y, state, rows, C)) {
+    ops->gemm_qs4cx_accel_fp32(out_w.getData<char>(), out_w.getScale<float>(),
+                               conv_out.getData<float>(), out_step.getData<float>(), rows, N, C);
+    ops->sync_to_host(out_step.getData(), rows * N * sizeof(float));
+    return;
+  }
+#endif
+  // Match invokeFc's K=2048 row cap: larger calls would grow its output
+  // staging buffer instead of retaining an already allocated size.
+  const bool retain_projection =
+    lfm_prefill && rows >= 16 && rows <= 1920 && C == 2048 &&
+    in_step.getDataType() == fp32 && in_step.getContiguous() && ops &&
+    ops->supports_gemm_q4_0_batch_norm_fp32() && projection_disjoint(p);
   if (compare) {
     nntrainer::gemm_q4_0<float>(rows, 3 * C, K, in_step.getData<float>(), K,
                                 in_w.getData<char>(), 3 * C,
                                 proj.getData<float>(), 3 * C);
   } else if (!row_resident) {
-    if (packed_fc) {
+    if (retain_projection) {
+      // A nonempty zero post_chunk selects the strided FC output without
+      // applying a norm. Only its sampled windows need a host copy.
+      ops->gemm_q4_0_batch_norm_fp32(
+        {in_w.getData<char>()}, {in_w.getScale<float>()},
+        in_step.getData<float>(), {proj.getData<float>()}, rows, {3u * C}, K,
+        nullptr, {0u}, nullptr, 0.0f, nullptr, 0u, 0u, false);
+      const auto *view = static_cast<const float *>(
+        ops->host_view(proj.getData<float>(), 3u * mid_bytes));
+      if (projection_disjoint(view)) {
+        p = view;
+      } else {
+        // Materialize an unusable or overlapping view before CPU writes;
+        // the sampled host windows alone do not contain the projection.
+        ops->sync_to_host(proj.getData<float>(), 3u * mid_bytes);
+      }
+    } else if (packed_fc) {
       ops->gemm_qs4cx_accel_fp32(in_w.getData<char>(), in_w.getScale<float>(),
                                  in_step.getData<float>(),
                                  proj.getData<float>(), rows, 3 * C, K);
       ops->sync_to_host(proj.getData(), rows * 3 * C * sizeof(float));
     } else {
       in_step.dot(in_w, proj, false, false);
+      p = proj.getData<float>();
     }
   }
 
-  const float *p = proj.getData<float>();
-  float *g = gated.getData<float>();
-  float *y = conv_out.getData<float>();
   auto gate_pre = [&](size_t r) {
     const float *a = p + r * 3 * C;
     const float *c = a + 2 * C;
@@ -325,8 +613,11 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       << " after the HTP decode hook took over the conv state";
     nntrainer::ThreadManager::Global().parallel_for(
       0, static_cast<size_t>(rows), gate_pre);
+    const bool post_gated = from == 0 && lfm_prefill &&
+                            lfmConvPostGatePrefill(g, w_ptr, p, y, rows, C);
     if (from == 0) {
-      nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
+      if (!post_gated)
+        nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
     } else {
       // Rows continued from a position (a prefill chunk after the first, a
       // prompt after a loaded KV snapshot) convolve with the two rows the
@@ -348,8 +639,9 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                 C * sizeof(float));
     std::memcpy(state + C, g + static_cast<size_t>(rows - 1) * C,
                 C * sizeof(float));
-    nntrainer::ThreadManager::Global().parallel_for(
-      0, static_cast<size_t>(rows), gate_post);
+    if (!post_gated)
+      nntrainer::ThreadManager::Global().parallel_for(
+        0, static_cast<size_t>(rows), gate_post);
   }
 
   if (compare) {

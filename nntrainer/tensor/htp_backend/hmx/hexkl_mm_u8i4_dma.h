@@ -65,9 +65,23 @@ typedef struct {
   uint64_t tl2_expanded; /**< Prefill panels reserved for in-place expansion. */
   uint64_t tl2_pushed;   /**< Native panels queued for the current staging. */
   uint32_t tl2_dma_idx;  /**< Last DMA of the native prefill staging. */
+  /** Optional generation word in a validated arena padding region. Only
+   * stable native GU handles use it; a changed word refreshes both tails. */
+  const uint32_t *tl2_generation;
+  uint32_t tl2_generation_seen;
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;
+
+/** Bind a generation word after its arena extent was checked by the RPC.
+ * The metadata already reflects this generation after register/rebind. */
+void hexkl_weight_tl2_set_generation(hexkl_weight_u8i4 *weight,
+                                     const uint32_t *generation);
+
+/** Refresh an idle native pair's metadata when its arena was overwritten.
+ * Called within the compute RPC, before any kernel or DMA is in flight. */
+int hexkl_weight_tl2_refresh_pair(hexkl_weight_u8i4 *gate_up,
+                                  hexkl_weight_u8i4 *down);
 
 /** Set integer offsets sent in the second N entries of registration bias.
  * The first N entries retain their ordinary bias meaning. */

@@ -9,12 +9,15 @@
 #include <app_context.h>
 #include <cmath>
 #include <conv_block_layer.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <engine.h>
 #include <fstream>
 #include <htp_mha_core.h>
 #include <layer_context.h>
 #include <layer_node.h>
+#include <lfm2_moe_layer.h>
 #include <limits>
 #include <llm_util.hpp>
 #include <map>
@@ -348,6 +351,8 @@ void Lfm2HtpMoECausalLM::run(const WSTR prompt, bool sample, const WSTR system,
   // DSP's decode state (attention caches, conv states), the host conv states
   // and the host KV slabs decode may have dropped are reset.
   if (ran_) {
+    prefill_early_attempted_ = true;
+    retireHtpExpertPrefillKickoff(nntrainer::get_htp_ops());
     nntrainer::htp_begin_prompt();
     model->forEachLayer(
       [](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
@@ -439,6 +444,23 @@ void Lfm2HtpMoECausalLM::load_kvcache(std::string path, int to) {
     f.read(t->getData<char>(), t->bytes());
   if (!f)
     throw std::runtime_error("load_kvcache: " + conv_path + " is truncated");
+}
+
+void Lfm2HtpMoECausalLM::beforePrefillBlock(unsigned int from,
+                                            unsigned int to) {
+#ifdef ENABLE_HEXKL
+  const char *early = std::getenv("NNTR_LFM2_PREFILL_EARLY");
+  if (!early || std::strcmp(early, "1") != 0 || from != 0 || to <= 1 ||
+      !prepared_ || prefill_early_attempted_ || NUM_EXPERTS != 64 ||
+      MOE_CACHE_EXPERTS != 16)
+    return;
+  prefill_early_attempted_ = true;
+  const size_t queued = beginLfm2HtpExpertPrefill(nntrainer::get_htp_ops());
+  std::fprintf(stderr, "[LFM2-PREFILL] early queued_experts=%zu\n", queued);
+#else
+  (void)from;
+  (void)to;
+#endif
 }
 
 void Lfm2HtpMoECausalLM::prepareDecodeGraph() {

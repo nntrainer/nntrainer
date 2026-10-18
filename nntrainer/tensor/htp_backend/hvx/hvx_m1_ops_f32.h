@@ -111,8 +111,8 @@ void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
                   const float *cs, uint32_t head_dim);
 
 /**
- * @brief Causal depthwise conv1d (L=3) + gate for one token, through the
- *        prefill kernel hvx_conv_gate_f32 at m_count = 1.
+ * @brief Causal depthwise conv1d (L=3) + gate for one token, with the
+ *        CPU's two fused scalar taps between vector multiplies.
  *
  * @param abc    [3C]: the in_proj split a | b | c
  * @param state3 [3C]: rows 0-1 are the layer's conv state x_{t-2} | x_{t-1}
@@ -126,6 +126,15 @@ void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
  */
 void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
                           float *out, uint32_t C);
+
+/**
+ * @brief The same conv and state update, split by independent 32-channel
+ *        blocks across an existing worker pool. Each channel preserves
+ *        the serial operation order. No allocation; pool may be NULL.
+ */
+void hvx_conv_gate_m1_f32_parallel(const float *abc, float *state3,
+                                   const float *conv_w, float *out, uint32_t C,
+                                   hvx_worker_pool *pool);
 
 /**
  * @brief [#132 Part B E5f] m1_swiglu_cpu_det over @a pool's lanes: the

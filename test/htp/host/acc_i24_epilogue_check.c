@@ -12,8 +12,11 @@
 #include <string.h>
 
 enum { NP = 3, NT = 2 * NP, ROWS = 64, WIDTH = 160, COLS = 2 * WIDTH };
+#ifndef ACC_I24_TILE_BYTES
+#define ACC_I24_TILE_BYTES 8192u
+#endif
 static int32_t tiles[NT][2048] __attribute__((aligned(128)));
-static uint8_t planes[NT][8192] __attribute__((aligned(128)));
+static uint8_t planes[NT][ACC_I24_TILE_BYTES] __attribute__((aligned(128)));
 static uint8_t saved[sizeof planes];
 static float out[ROWS][WIDTH], ref[ROWS][WIDTH];
 
@@ -73,6 +76,7 @@ int main(void) {
                                act};
         hvx_dq_swiglu_worker(1, 0, &j);
         j.tiles_base = (const uint8_t *)planes;
+        j.tile_stride = sizeof planes[0];
         j.dst = &out[0][0];
         for (uint32_t w = 0; w < workers; ++w)
           hvx_dq_swiglu_i24(workers, w, &j);

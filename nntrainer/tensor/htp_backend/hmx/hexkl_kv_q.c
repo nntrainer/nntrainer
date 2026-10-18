@@ -351,8 +351,14 @@ static void write_row_i8_tiles(hexkl_kv_q *kv, uint32_t n, uint32_t row,
  */
 static inline void xor80_copy(uint8_t *dst, const uint8_t *src, uint32_t n) {
   const HVX_Vector x = Q6_V_vsplat_R(0x80808080);
-  for (uint32_t i = 0; i < n; i += 128u) {
+  const uint32_t full = n & ~127u;
+  uint32_t i = 0;
+  for (; i < full; i += 128u) {
     hvx_tile_store_u(dst + i, Q6_V_vxor_VV(hvx_tile_load_u(src + i), x));
+  }
+  // Legal head dimensions include 32, 64 and 96: do not touch the next row.
+  for (; i < n; ++i) {
+    dst[i] = src[i] ^ 0x80u;
   }
 }
 
@@ -645,54 +651,27 @@ static int bake_col_tile(hexkl_kv_q *kv, uint32_t n, uint32_t c,
 #endif
 }
 
-int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
-                      uint32_t n_rows, const uint16_t *k_rows,
-                      const uint16_t *v_rows, uint8_t *vtcm_base,
-                      hexkl_kv_q_append_stats *st) {
-  return hexkl_kv_q_append_pool(tbl, handle, row0, n_rows, k_rows, v_rows,
-                                vtcm_base, NULL, st);
-}
-
-int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
-                           uint32_t row0, uint32_t n_rows,
-                           const uint16_t *k_rows, const uint16_t *v_rows,
-                           uint8_t *vtcm_base, void *pool,
-                           hexkl_kv_q_append_stats *st) {
-  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
-  if (!kv || !k_rows || !v_rows || n_rows == 0 ||
-      row0 + n_rows > kv->max_rows || row0 + n_rows < row0) {
-    return AEE_EBADPARM;
-  }
-  if (st) {
-    memset(st, 0, sizeof(*st));
-  }
-#ifdef __hexagon__
-  if (kv->plain_masters) {
-    return append_fixed_i8(kv, row0, n_rows, k_rows, v_rows, vtcm_base, pool,
-                           st);
-  }
-#else
-  (void)pool;
-#endif
-  const uint64_t tq0 = kvq_now_us();
+/** Quantize disjoint heads; each worker owns its masters, scales and WH tiles.
+ */
+static void append_dynamic_heads(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
+                                 const uint16_t *k_rows, const uint16_t *v_rows,
+                                 int direct, uint32_t head_lo,
+                                 uint32_t head_hi) {
   const uint32_t hd = kv->head_dim;
   const uint32_t stride = kv->n_head_kv * hd;
 #ifndef __hexagon__
+  (void)direct;
   float x[HEXKL_KV_Q_MAX_HEAD_DIM];
 #endif
   int8_t q[HEXKL_KV_Q_MAX_HEAD_DIM];
   int8_t qk_row[HEXKL_KV_Q_MAX_HEAD_DIM];
   float sv[8];
-  int direct = 0;
-#ifdef __hexagon__
-  direct = vtcm_base && kv->kind == HEXKL_KV_Q8 && wh_i8_probe(vtcm_base);
-#endif
 
   for (uint32_t r = 0; r < n_rows; ++r) {
     const uint32_t row = row0 + r;
     const uint16_t *krow = k_rows + (size_t)r * stride;
     const uint16_t *vrow = v_rows + (size_t)r * stride;
-    for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+    for (uint32_t n = head_lo; n < head_hi; ++n) {
       float sk;
       int32_t cs;
       const float *inv_v = kv->fs_v_inv + (size_t)n * hd;
@@ -753,6 +732,69 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
       }
 #endif
     }
+  }
+}
+
+#ifdef __hexagon__
+typedef struct {
+  hexkl_kv_q *kv;
+  uint32_t row0, n_rows;
+  const uint16_t *k_rows, *v_rows;
+  int direct;
+} dynamic_heads_ctx;
+
+static void dynamic_heads_worker(uint32_t n_threads, uint32_t i, void *arg) {
+  const dynamic_heads_ctx *c = (const dynamic_heads_ctx *)arg;
+  const uint32_t lo = c->kv->n_head_kv * i / n_threads;
+  const uint32_t hi = c->kv->n_head_kv * (i + 1u) / n_threads;
+  append_dynamic_heads(c->kv, c->row0, c->n_rows, c->k_rows, c->v_rows,
+                       c->direct, lo, hi);
+}
+#endif
+
+int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                      uint32_t n_rows, const uint16_t *k_rows,
+                      const uint16_t *v_rows, uint8_t *vtcm_base,
+                      hexkl_kv_q_append_stats *st) {
+  return hexkl_kv_q_append_pool(tbl, handle, row0, n_rows, k_rows, v_rows,
+                                vtcm_base, NULL, st);
+}
+
+int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
+                           uint32_t row0, uint32_t n_rows,
+                           const uint16_t *k_rows, const uint16_t *v_rows,
+                           uint8_t *vtcm_base, void *pool,
+                           hexkl_kv_q_append_stats *st) {
+  hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
+  if (!kv || !k_rows || !v_rows || n_rows == 0 ||
+      row0 + n_rows > kv->max_rows || row0 + n_rows < row0) {
+    return AEE_EBADPARM;
+  }
+  if (st) {
+    memset(st, 0, sizeof(*st));
+  }
+#ifdef __hexagon__
+  if (kv->plain_masters) {
+    return append_fixed_i8(kv, row0, n_rows, k_rows, v_rows, vtcm_base, pool,
+                           st);
+  }
+#else
+  (void)pool;
+#endif
+  const uint64_t tq0 = kvq_now_us();
+  int direct = 0;
+#ifdef __hexagon__
+  direct = vtcm_base && kv->kind == HEXKL_KV_Q8 && wh_i8_probe(vtcm_base);
+  if (pool && direct && !kv->fixed && n_rows >= 64u && kv->n_head_kv == 8u &&
+      kv->head_dim == 64u) {
+    dynamic_heads_ctx ctx = {kv, row0, n_rows, k_rows, v_rows, direct};
+    hvx_worker_pool_run((hvx_worker_pool *)pool, dynamic_heads_worker, &ctx,
+                        kv->n_head_kv);
+  } else
+#endif
+  {
+    append_dynamic_heads(kv, row0, n_rows, k_rows, v_rows, direct, 0u,
+                         kv->n_head_kv);
   }
 
   if (st) {
