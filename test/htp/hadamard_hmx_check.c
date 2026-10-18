@@ -57,7 +57,7 @@ static void check(remote_handle64 session, unsigned rows, unsigned n,
          ((uint64_t)ticks[1] << 32 | ticks[0]) / (19.2 * passes), nrmse,
          energy_error, max_error);
   fflush(stdout);
-  /* FP16 arithmetic guard, separate from the stricter FP32 reference check
+  /** FP16 arithmetic guard, separate from the stricter FP32 reference check
      and from the quantized pipeline. This is not a model-quality assertion. */
   assert(nrmse <= 0.002 && energy_error <= 0.003);
   assert(storage[0] == 917.125f && storage[len + 1u] == 917.125f);
@@ -88,7 +88,7 @@ int main(void) {
                                  64, ticks, 2) != AEE_SUCCESS);
   assert(nntr_hvx_hadamard_probe(session, 1u, 704u, 4u, 1u, input, 704, output,
                                  704, ticks, 2) != AEE_SUCCESS);
-  /* FastRPC rout buffers are unspecified on an error return; the DSP
+  /** FastRPC rout buffers are unspecified on an error return; the DSP
      validates before writing. Guard checks above cover successful calls. */
   uint32_t applied;
   assert(nntr_hvx_moe_set_opts(session, 0x30000000u, &applied) != AEE_SUCCESS);

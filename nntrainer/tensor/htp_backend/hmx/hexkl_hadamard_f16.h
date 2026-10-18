@@ -38,7 +38,7 @@
 #define HAD_HMX_H64 8192u
 #define HAD_HMX_H16 16384u
 #define HAD_HMX_CFG 32768u
-/* Two 16-token Up banks (or two 64-token Down banks). The HMX caller
+/** Two 16-token Up banks (or two 64-token Down banks). The HMX caller
  * reuses one 8 KiB intermediate tile matrix; workers never touch it. */
 #define HAD_HMX_DATA 65536u
 #define HAD_HMX_TEMP 327680u
@@ -114,7 +114,7 @@ static inline void had_hmx_compute_group(const had_hmx_ctx *ctx, uint32_t g) {
   uint8_t *vb = ctx->vb;
   const uint32_t a_off = HAD_HMX_DATA + (ctx->bank + g) * cols * 4096;
   const uint32_t t_off = HAD_HMX_TEMP;
-  /* INT32 GEMM replaces the FP16 bias registers. The read API does not
+  /** INT32 GEMM replaces the FP16 bias registers. The read API does not
    * restore them; setup must run at each transition back to FP16. It touches
    * only a small config record. Never depend on its private byte offset. */
   if (g == 0u)
@@ -259,7 +259,7 @@ static void had_hmx_exchange_worker(uint32_t threads, uint32_t id, void *v) {
   if (ctx->have_pack)
     had_hmx_pack_worker(threads, id, &ctx->pack);
 }
-/* Positive rows, n in {704,2816}; gamma is supported only for n=2816.
+/** Positive rows, n in {704,2816}; gamma is supported only for n=2816.
  * Quantizing call: u8/scale/zp non-NULL, out NULL, input is read-only.
  * Standalone call: out non-NULL (may equal x), u8/scale/zp/gamma NULL.
  * A batch overlaps HMX with the workers storing the previous bank and then
