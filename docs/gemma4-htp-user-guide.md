@@ -8,8 +8,18 @@ the pieces fit together, and the shorter
 [setup and validation record](gemma4-htp-quickdotai.md) lists what was
 validated and how.
 
-Everything here was run on 2026-10-13 with this branch, so the commands and
-numbers describe this tree, not a plan.
+The setup and measurements below describe the original 2026-10-13
+QS2/Q4 integration. For the current native TL2/affine and rotated weight
+contracts, use the [TL2 guide](gemma4-htp-tl2-guide.md). The
+[LFM2 guide](lfm2-htp-user-guide.md) covers LFM2/SR15 and the latest matched
+LFM2/Gemma4 measurements; those packs and workloads differ from this record.
+
+Updated 2026-10-18: the current native TL2 pack uses compact expert slots,
+reclaims prefill staging and supports an affine untied head on the NPU.
+The latest 1024-input, C16/preload-128 series recorded medians of 621.36
+prefill and 12.32 decode tok/s over three runs with matching reference IDs.
+For the earlier 2048-input decode comparison, separate memory savings and
+their limits, see the [TL2 validation record](gemma4-htp-tl2-guide.md#current-validation-coverage).
 
 ## 1. What you get
 
@@ -236,7 +246,10 @@ adb push gemma4-26b-a4b-htp-w4a32 /sdcard/Download/aistudio-mobile/models/
    path shows `Load failed: [MODEL_LOAD_FAILED] ...` with the native reason.
 
 Only one HTP model can be loaded per process, each generation starts a fresh
-prompt (no conversation history), and there is no KV snapshot or resume.
+prompt (no conversation history), and the public API does not expose KV
+snapshot or resume. The native CLI has a separate
+[KV snapshot workflow](gemma4-htp-kv-cache-s25u.md); its historical S25
+measurements are distinct from current S26 throughput results.
 
 ## 7. Run from the command line
 
@@ -265,8 +278,13 @@ expert feed, the ARM's next-layer expert prediction with its read-ahead, and
 the prefill scratch released after the first token, and the expert pool grown
 to 34 experts a layer after the first token where the DSP's address space
 allows) is built into the library
-(`nntrainer/tensor/htp_fixed_opts.h`). The one knob left is
-`NNTR_HTP_PAGE_CACHE` (section 9.2): unset keeps the mmap loader.
+(`nntrainer/tensor/htp_fixed_opts.h`). Environment controls remain available:
+`NNTR_HTP_PAGE_CACHE` unset keeps the mmap loader; `0` selects direct I/O.
+The fixed-capacity measurement preset sets `moe_cache_experts=16` in the
+pack, `NNTR_MOE_CACHE_GROW=0` and `NNTR_MOE_PRELOAD_EXPERTS=128`.
+`NNTR_MOE_SERVER_DONE=1` enables the optional completion hint; it is off
+by default. See the [code guide](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)
+for the controls and the TL2 guide for the conditions of each measurement.
 
 With no prompt argument the CLI uses `sample_input` from `nntr_config.json`.
 Pass your own prompt as the second argument; the chat template from the pack

@@ -3,7 +3,17 @@
 New here? Start with the [user guide](gemma4-htp-user-guide.md) (build, model
 pack, app, command line, measured results) and the
 [code guide](gemma4-htp-code-guide.md) (how the HTP path is put together).
-This page is the setup and validation record of the integration.
+This page is the setup and validation record of the integration. For the
+current native TL2/affine and rotated pack contracts, see the
+[TL2 guide](gemma4-htp-tl2-guide.md). The
+[LFM2 guide](lfm2-htp-user-guide.md) covers LFM2 and SR15 CLI support.
+
+Status as of 2026-10-18: the native runtime also carries compact TL2
+expert storage, prefill-memory reclaim and the decode changes described
+in the [TL2 validation record](gemma4-htp-tl2-guide.md#current-validation-coverage).
+Its latest S26 measurements are CLI checks; the dated app/API lifecycle
+results below were not rerun as part of that series. After compact-slot
+RPC changes, stage matching ARM libraries, generated stub and DSP skeleton.
 
 The native HTP preset runs Gemma4 26B A4B through the same QuickDotAI handle,
 JNI and Android sample interfaces as other native models. Select
@@ -32,7 +42,9 @@ checks are included with the tests.
 This preset supports text, batch one and one active HTP handle per process.
 Each generation starts an independent prompt while retaining the loaded
 weights. Native Chat does not accumulate conversation history for this
-preset. KV snapshot/resume and concurrent HTP handles are not supported.
+preset. The public API does not expose KV snapshot/resume; the native CLI
+has a separate [snapshot workflow](gemma4-htp-kv-cache-s25u.md).
+Concurrent HTP handles are not supported.
 Cancellation stops at a token boundary. Unload waits for active work and
 releases the DSP session, worker pools and registered weights.
 

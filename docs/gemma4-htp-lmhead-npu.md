@@ -4,6 +4,14 @@ Companion to `gemma4-htp-user-guide.md` and `gemma4-htp-code-guide.md`.
 This note records what the two `[HTP] lm_head:` commits changed, why, what
 was measured and what is still open.
 
+Updated 2026-10-18: the native TL2/affine pack directly registers its
+prepacked affine head slices and needs no `.lmhead_wh` conversion cache
+(section 7). Greedy ID-only decode skips unused vocabulary-sized FP32
+copies; sampling and other logits consumers retain their output path.
+The fixture timings below are historical. Current whole-model throughput,
+memory changes and validation limits are in the
+[TL2 guide](gemma4-htp-tl2-guide.md#current-validation-coverage).
+
 ## 1. The head before
 
 The Gemma4 26B-A4B pack ships a tied head: `htp_tie_word_embeddings` reads
@@ -155,10 +163,10 @@ Lines to read on stderr:
   scales), which the weight producer decides. The gate is a token / PPL
   comparison of the delivered QS4CX head against a reference, on the real
   pack; the fixture above cannot give it.
-- **A pre-baked `QS4CX_WH` head.** If the producer writes the head already
-  in the tile layout, the bind needs a slice registration that gathers the
-  slice's k-tile rows from the image (`registerFcWh`'s way); the QS4CX
-  path, with its cache, makes that optional.
+- **Pre-baked affine WH head: implemented.** The native pack's
+  `QS4CX_WH_AFFINE` head uses slice registration through `registerFcWh`,
+  including offsets, as described in section 7. The QS4CX conversion/cache
+  path remains available for its own layout.
 - **VTCM size.** The 6 MiB slice bound assumes the 8 MiB VTCM of v79 /
   v81; a smaller VTCM wants the session's size in `bindLmHeadWh`.
 
