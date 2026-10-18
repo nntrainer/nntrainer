@@ -16,7 +16,7 @@
 #include <hvx_hexagon_protos.h>
 #endif
 
-/* Independently generated Paley construction over F_43:
+/** Independently generated Paley construction over F_43:
  * H[0,0]=1, H[0,j]=-1, H[i,0]=1, H[i,i]=1 and
  * H[i,j]=Legendre(i-j,43) otherwise. Four output signs per byte.
  * This equals SpinQuant get_had44; H is not symmetric, so the inverse
@@ -67,7 +67,7 @@ int hvx_hadamard_supported(uint32_t n) {
   return n % 44u == 0u && ((n / 44u) & (n / 44u - 1u)) == 0u;
 }
 
-/* LFM2 SR15's dephased H12. Rows of x multiply H12 on the right;
+/** LFM2 SR15's dephased H12. Rows of x multiply H12 on the right;
  * it is not symmetric. The output signs are supplied by the checkpoint. */
 static const int8_t lfm_h12[12][12] = {
   {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
@@ -132,7 +132,7 @@ static void hadamard_scalar(float *x, uint32_t n, uint32_t p) {
 }
 
 #if defined(__hexagon__)
-/* Reuse the eight signed sums of each four input blocks. H44 needs
+/** Reuse the eight signed sums of each four input blocks. H44 needs
  * 11 selections per output instead of 44 signed additions. Selectors
  * hold four output bytes: low three bits choose a sum, bit 3 its sign. */
 static const uint32_t selectors[11][11] = {
@@ -178,12 +178,12 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
   const HVX_Vector lane = *(const HVX_Vector *)lanes;
-  /* Each register contains one or two independent power-of-two blocks.
+  /** Each register contains one or two independent power-of-two blocks.
    * XOR shuffles implement butterfly partners; the upper member changes
    * sign before the add. There are no scalar lane loads/stores. */
   for (uint32_t base = 0u; base < n * (1u + pair); base += 32u) {
     HVX_Vector v = *(const HVX_Vector *)(x + base);
-    /* p >= 16 on this path. Literal stages let the compiler hoist all
+    /** p >= 16 on this path. Literal stages let the compiler hoist all
      * shuffle controls and sign masks out of the register loop. */
     v = butterfly(v, lane, 1u);
     v = butterfly(v, lane, 2u);
@@ -201,11 +201,32 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
         *(HVX_Vector *)(x + base + j) = Q6_Vsf_vadd_VsfVsf(a, b);
         *(HVX_Vector *)(x + base + j + step) = Q6_Vsf_vsub_VsfVsf(a, b);
       }
-  const HVX_Vector scale = hvx_splat_sf(1.0f / sqrtf((float)n));
+  const HVX_Vector scale =
+    hvx_splat_sf(n == 1536u ? 0.025515519082546234f : 1.0f / sqrtf((float)n));
   if (p == n) {
     for (uint32_t i = 0u; i < n; i += 32u)
       *(HVX_Vector *)(x + i) =
         Q6_Vsf_vmpy_VsfVsf(*(const HVX_Vector *)(x + i), scale);
+    return;
+  }
+  if (n == 1536u) {
+    // Each lane owns one column of H128. Preserve H12's input order and
+    // transpose convention, and read all inputs before overwriting x.
+    const HVX_Vector sign_bit = Q6_V_vsplat_R((int)0x80000000u);
+    for (uint32_t k = 0; k < 128u; k += 32u) {
+      HVX_Vector in[12];
+      for (uint32_t i = 0; i < 12u; ++i)
+        in[i] = *(const HVX_Vector *)(x + i * 128u + k);
+      for (uint32_t j = 0; j < 12u; ++j) {
+        HVX_Vector sum = Q6_V_vzero();
+        for (uint32_t i = 0; i < 12u; ++i) {
+          const HVX_Vector term =
+            lfm_h12[i][j] < 0 ? Q6_V_vxor_VV(in[i], sign_bit) : in[i];
+          sum = Q6_Vsf_vadd_VsfVsf(sum, term);
+        }
+        *(HVX_Vector *)(x + j * 128u + k) = Q6_Vsf_vmpy_VsfVsf(sum, scale);
+      }
+    }
     return;
   }
   if (n == 2816u || n == 704u) {
@@ -320,7 +341,12 @@ int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
   if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u))
     return -1;
   if (n == 1536u) {
-    hadamard_lfm1536(x);
+#if defined(__hexagon__)
+    if (mode == 2u && !((uintptr_t)x & 127u))
+      hadamard_hvx(x, 1536u, 128u, 0u);
+    else
+#endif
+      hadamard_lfm1536(x);
     return 0;
   }
   const uint32_t p = (n & (n - 1u)) == 0u ? n : n / 44u;

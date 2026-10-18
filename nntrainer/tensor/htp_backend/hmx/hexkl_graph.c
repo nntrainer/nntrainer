@@ -551,7 +551,8 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
   } else {
     if (g->router_wh[i])
       hvx_router_topk_wh(in, (const uint8_t *)g->param[i], g->state[i], op->K,
-                         op->n_experts, op->top_k, out, sel, w);
+                         op->n_experts, op->top_k, out, sel, w,
+                         call->env->pool);
     else
       hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
                           op->top_k, out, sel, w, call->env->pool);

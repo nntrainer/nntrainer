@@ -148,8 +148,8 @@ Tensor Lfm2HtpMoECausalLM::attentionBlock(unsigned l, Tensor input) {
 
 std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
   Tensor x({1, 1, 1, static_cast<unsigned>(INIT_SEQ_LEN)}, "input0");
-  auto embedding_props = buildEmbeddingLayerProperties("embedding0", NUM_VOCAB,
-                                                       DIM, EMBEDDING_DTYPE, 1.0f, "");
+  auto embedding_props = buildEmbeddingLayerProperties(
+    "embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE, 1.0f, "");
   // The untied FP32 table is 512 MiB for the 26B pack, but each token needs
   // only one 8 KiB row. Keep its exact bytes in the file under direct IO.
   const char *stream_embedding = std::getenv("NNTR_LFM2_STREAM_EMBEDDING");

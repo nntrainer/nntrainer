@@ -537,7 +537,8 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                             in_step.getData<float>(), proj.getData<float>(), g,
                             w_ptr, y, state, rows, C)) {
     ops->gemm_qs4cx_accel_fp32(out_w.getData<char>(), out_w.getScale<float>(),
-                               conv_out.getData<float>(), out_step.getData<float>(), rows, N, C);
+                               conv_out.getData<float>(),
+                               out_step.getData<float>(), rows, N, C);
     ops->sync_to_host(out_step.getData(), rows * N * sizeof(float));
     return;
   }
