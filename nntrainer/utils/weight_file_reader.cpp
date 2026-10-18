@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,16 @@
 #endif
 
 namespace nntrainer {
+
+namespace {
+thread_local WeightReadTiming *read_timing = nullptr;
+}
+
+WeightReadTiming *weightSetReadTiming(WeightReadTiming *timing) {
+  auto *previous = read_timing;
+  read_timing = timing;
+  return previous;
+}
 
 /** -1 preserves the existing loader; 0 bypasses the page cache; 1 bounds it. */
 int weightPageCachePolicy() {
@@ -232,15 +243,34 @@ int weightPreadScatter(int fd, const WeightReadSlice *slices, size_t count,
         return rc;
     }
     void *target = scratch.data;
+    const auto start = read_timing ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
     ssize_t got;
     do {
       got = ::pread(fd, target, request, static_cast<off_t>(offset - skip));
     } while (got < 0 && errno == EINTR);
+    const int read_errno = got < 0 ? errno : 0;
+    if (read_timing) {
+      read_timing->io_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+      ++read_timing->calls;
+      read_timing->requested_bytes += request;
+    }
     if (got < 0)
-      return errno;
+      return read_errno;
     if (static_cast<size_t>(got) < skip + take)
       return ENODATA;
+    const auto copy_start = read_timing
+                              ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     consume(static_cast<uint8_t *>(target) + skip, take);
+    if (read_timing)
+      read_timing->copy_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - copy_start)
+          .count();
     offset += take;
     bytes -= take;
   }

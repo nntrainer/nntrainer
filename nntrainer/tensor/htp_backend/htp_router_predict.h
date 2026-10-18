@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file htp_router_predict.h
- * @brief Prediction-only top-k on Gemma router dot products.
+ * @brief Prediction-only top-k on softmax and sigmoid router dot products.
  * @author NNTrainer contributors
  * @bug No known bugs
  */
@@ -105,13 +105,15 @@ public:
 };
 
 /** Positive RMS normalization and softmax preserve logit ranking. Per-expert
- * scales apply after selection. This approximation is only an I/O hint;
- * the real NPU router still supplies all expert IDs and mixture weights.
+ * scales apply after selection. A sigmoid router instead ranks sigmoid(logit)
+ * plus its expert bias; its input has already passed the layer's RMS norm.
+ * This approximation is only an I/O hint; the real NPU router still supplies
+ * all expert IDs and mixture weights.
  */
-inline std::vector<unsigned> htpPredictExperts(const float *input,
-                                               const float *weights,
-                                               unsigned hidden,
-                                               unsigned experts, unsigned top) {
+inline std::vector<unsigned>
+htpPredictExperts(const float *input, const float *weights, unsigned hidden,
+                  unsigned experts, unsigned top,
+                  const float *sigmoid_bias = nullptr) {
   if (!input || !weights || !hidden || !experts || !top)
     return {};
   std::vector<float> scores(experts, 0.0f);
@@ -121,6 +123,15 @@ inline std::vector<unsigned> htpPredictExperts(const float *input,
   for (float score : scores)
     if (!std::isfinite(score))
       return {};
+  if (sigmoid_bias) {
+    for (unsigned e = 0; e < experts; ++e) {
+      if (!std::isfinite(sigmoid_bias[e]))
+        return {};
+      const float ex = std::exp(-std::abs(scores[e]));
+      scores[e] = (scores[e] >= 0.0f ? 1.0f / (1.0f + ex) : ex / (1.0f + ex)) +
+                  sigmoid_bias[e];
+    }
+  }
   std::vector<unsigned> ids(experts);
   std::iota(ids.begin(), ids.end(), 0u);
   top = std::min(top, experts);

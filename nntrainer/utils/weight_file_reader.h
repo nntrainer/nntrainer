@@ -40,6 +40,15 @@ struct WeightReadSlice {
   size_t bytes;
 };
 
+/** Optional per-thread direct-read timing. No payload is retained. A caller
+ * owns this object and restores the previous pointer before its lifetime ends.
+ * Nanosecond counters separate storage waits from bounce-buffer copies. */
+struct WeightReadTiming {
+  uint64_t io_ns = 0, copy_ns = 0;
+  uint64_t calls = 0, requested_bytes = 0;
+};
+WeightReadTiming *weightSetReadTiming(WeightReadTiming *timing);
+
 /** Scatter one contiguous file range into one to four destinations. Empty
  * slices are allowed. The same bounded scratch is reused across direct reads;
  * metadata can go to CPU memory without reading back an uncached DMA mapping.

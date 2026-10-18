@@ -32,7 +32,8 @@ public:
   struct Stats {
     uint64_t submitted = 0, completed = 0, used = 0, late = 0;
     uint64_t discarded = 0, failed = 0, full = 0, joined = 0;
-    uint64_t cancelled = 0; /**< Aborted callbacks, excluded from completed. */
+    uint64_t cancelled = 0;  /**< Aborted callbacks, excluded from completed. */
+    uint64_t handed_off = 0; /**< Queued guesses replaced by demand reads. */
   };
   enum class ReadResult { Complete, Cancelled, Failed };
   using Reader = std::function<bool(Buffer &)>;
@@ -116,13 +117,26 @@ public:
 
   /** Reserve a real miss's speculative read. Queued demand goes first; an
    * in-flight read is joined after unrelated demand I/O instead of duplicated.
-   * The sole consumer must finish claims with takeClaimed or drain. */
-  bool claim(const void *key) {
+   * The sole consumer must finish claims with takeClaimed or drain.
+   * With queued_to_demand, an unread queued guess is removed and false is
+   * returned: the caller reads its own demand buffer. A worker that already
+   * owns the slot is always claimed normally. No buffer crosses this API.
+   * The removed key stays reserved until expiry/drain to reject late duplicate
+   * submissions while the caller finishes claiming its current miss batch. */
+  bool claim(const void *key, bool queued_to_demand = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < slots_.size(); ++i) {
       auto &s = slots_[i];
-      if (s.state == Free || s.retired || s.claimed || s.key != key)
+      if (s.state == Free || s.state == HandedOff || s.retired || s.claimed ||
+          s.key != key)
         continue;
+      if (queued_to_demand && s.state == Queued) {
+        queue_.erase(std::find(queue_.begin(), queue_.end(), i));
+        s.state = HandedOff;
+        ++stats_.late;
+        ++stats_.handed_off;
+        return false;
+      }
       s.claimed = true;
       if (s.state != Ready) {
         ++stats_.late;
@@ -181,7 +195,7 @@ public:
   }
 
 private:
-  enum State { Free, Queued, Reading, Ready, Failed };
+  enum State { Free, Queued, Reading, Ready, Failed, HandedOff };
   struct Slot {
     Buffer buffer;
     const void *key = nullptr;

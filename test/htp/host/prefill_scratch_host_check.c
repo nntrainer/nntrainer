@@ -53,8 +53,19 @@ int main(void) {
   assert(bytes == 0 && s->norm_rows == saved.norm_rows);
   s->moe_scratch.out_heap = 0;
 
+  hexkl_moe_rotated_input rotated = {0};
+  s->moe_scratch.rotated_input = &rotated;
+  assert(nntr_hvx_release_prefill_scratch(handle, &bytes) == AEE_EBADSTATE);
+  s->moe_scratch.rotated_input = NULL;
+  s->moe_scratch.router_act = (float *)persistent;
+  assert(nntr_hvx_release_prefill_scratch(handle, &bytes) == AEE_EBADSTATE);
+  s->moe_scratch.router_act = NULL;
+
   assert(nntr_hvx_release_prefill_scratch(handle, &bytes) == AEE_SUCCESS);
   assert(bytes == expected);
+  assert(s->moe_scratch.router_handoff.epoch ==
+         saved.moe_scratch.router_handoff.epoch + 1);
+  saved.moe_scratch.router_handoff = s->moe_scratch.router_handoff;
   saved.moe_scratch.raw = NULL;
   saved.moe_scratch.base = NULL;
   saved.moe_scratch.cap = 0;

@@ -398,6 +398,17 @@ causallm_htp_lib = static_library('causallm_htp',
   cpp_args: causallm_inc_args + causallm_core_cpp_args + causallm_htp_cpp_args,
 )
 
+# The exact ARM router must not inherit the fused model's contraction flags.
+lfm2_router_arm_cpp_args = []
+if cxx.get_id() in ['gcc', 'clang', 'apple-clang']
+  lfm2_router_arm_cpp_args += ['-fno-fast-math', '-ffp-contract=off']
+endif
+lfm2_router_arm_lib = static_library('lfm2_router_arm',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_router_arm.cpp',
+  dependencies: [nntrainer_dep],
+  cpp_args: causallm_inc_args + lfm2_router_arm_cpp_args,
+)
+
 # ── Build libcausallm.so ─────────────────────────────────────────────────
 causallm_lib = shared_library('causallm',
     causallm_src,
@@ -405,7 +416,7 @@ causallm_lib = shared_library('causallm',
     dependencies: [nntrainer_dep, openmp_dep, log_dep],
     cpp_args: causallm_inc_args + causallm_core_cpp_args,
     link_args: [tokenizer_path],
-    link_whole: [causallm_xgrammar_lib, causallm_htp_lib],
+    link_whole: [causallm_xgrammar_lib, causallm_htp_lib, lfm2_router_arm_lib],
     install: true,
 )
 

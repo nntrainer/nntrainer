@@ -107,6 +107,7 @@
 
 #include <hmx/hexkl_dma_trace.h>
 
+#include "htp_router_handoff.h"
 #include <nntr_hvx.h>
 
 namespace nntrainer {
@@ -116,6 +117,58 @@ namespace {
 /** [#225] Q4_0 weights re-quantized by qs4cxFromModelQ4_0 in this process:
  *  the FC WH banner's requant=, 0 when the sidecar served every FC. */
 std::atomic<unsigned> g_q4_requant{0};
+
+/** Diagnostic only. Reader threads collect fixed-size records; the caller
+ * prints them after joining a batch, so logging never serializes the I/O. */
+bool prefillIoTraceEnabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("NNTR_HTP_PREFILL_IO_TRACE");
+    return v && std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
+class PrefillComputeTrace {
+  using Clock = std::chrono::steady_clock;
+  bool enabled_;
+  unsigned M_, K_, N_, kind_;
+  uint64_t start_;
+
+public:
+  PrefillComputeTrace(unsigned M, unsigned K, unsigned N, unsigned kind) :
+    enabled_(M > 1u && prefillIoTraceEnabled()),
+    M_(M),
+    K_(K),
+    N_(N),
+    kind_(kind),
+    start_(enabled_ ? nowUs() : 0u) {}
+  static uint64_t nowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+             Clock::now().time_since_epoch())
+      .count();
+  }
+  ~PrefillComputeTrace() {
+    if (enabled_)
+      std::fprintf(stderr,
+                   "[HTP-PREFILL-COMPUTE] kind=%u M=%u K=%u N=%u "
+                   "start_us=%llu end_us=%llu\n",
+                   kind_, M_, K_, N_, (unsigned long long)start_,
+                   (unsigned long long)nowUs());
+  }
+};
+
+class WeightReadTimingScope {
+  WeightReadTiming *timing_, *previous_;
+
+public:
+  explicit WeightReadTimingScope(WeightReadTiming *timing) :
+    timing_(timing),
+    previous_(timing ? weightSetReadTiming(timing) : nullptr) {}
+  ~WeightReadTimingScope() {
+    if (timing_)
+      weightSetReadTiming(previous_);
+  }
+};
 
 /**
  * @brief htp_qs4cx_from_q4_0x4 on a model weight in the CPU's own repack.
@@ -1266,6 +1319,7 @@ public:
 
   /** Start an independent prompt; the caller has joined its generation. */
   void beginPrompt() {
+    htp_router_handoff_invalidate(&router_handoff_);
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
@@ -1603,6 +1657,7 @@ public:
   // section 9.10: 9.7 ms a call against the CPU dot's 6).
   void release_prefill_scratch() override {
     std::lock_guard<std::mutex> lock(invoke_mutex_);
+    htp_router_handoff_invalidate(&router_handoff_);
     // KEEP_OUT can leave only sampled windows in the host tensor. Publish
     // its complete value while the caller still owns the prefill tensors.
     for (StagingPool *pool : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
@@ -1743,6 +1798,19 @@ public:
       h8 != UINT32_MAX
         ? nullptr
         : routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
+    static const bool handoff_enabled = [] {
+      const char *v = std::getenv("NNTR_LFM2_ROUTER_INPUT_HANDOFF");
+      return v && std::strcmp(v, "1") == 0;
+    }();
+    const uint32_t ticket =
+      handoff_enabled && h8 == UINT32_MAX && !gamma && !top_k && E == 64u &&
+          htp_router_handoff_shape(M, K) &&
+          !htp_router_handoff_overlap(x, x_len * sizeof(float), act,
+                                      x_len * sizeof(float)) &&
+          !htp_router_handoff_overlap(logits, out_len * sizeof(float), act,
+                                      x_len * sizeof(float))
+        ? htp_router_handoff_next(&router_handoff_)
+        : 0u;
     const uint64_t t0 = HtpProfile::nowUs();
     // the selection is small (M x 13 + M x 8 at the softmax router's
     // width) and goes straight to the caller's arrays
@@ -1751,7 +1819,8 @@ public:
       h8 != UINT32_MAX
         ? nntr_hvx_router_logits_u8i8_f32(
             session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0, h8,
-            act, static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            act, static_cast<int>(x_len), top_k,
+            top_k ? n_sel : htp_router_handoff_wire(ticket), scale,
             top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
             reinterpret_cast<uint32_t *>(sel),
             top_k ? static_cast<int>(M * n_sel) : 0, weight,
@@ -1759,7 +1828,8 @@ public:
         : nntr_hvx_router_logits_f32(
             session, M, K, E, eps, gamma, gamma ? static_cast<int>(K) : 0,
             w_shared, static_cast<int>(static_cast<size_t>(K) * E), act,
-            static_cast<int>(x_len), top_k, top_k ? n_sel : 0u, scale,
+            static_cast<int>(x_len), top_k,
+            top_k ? n_sel : htp_router_handoff_wire(ticket), scale,
             top_k ? static_cast<int>(E) : 0, out, static_cast<int>(out_len),
             reinterpret_cast<uint32_t *>(sel),
             top_k ? static_cast<int>(M * n_sel) : 0, weight,
@@ -1772,6 +1842,8 @@ public:
         " E=" + std::to_string(E) + ")");
     }
     stagedMemcpy(logits, out, out_len * sizeof(float));
+    htp_router_handoff_publish(&router_handoff_, ticket, session, act,
+                               x_len * sizeof(float));
     HtpProfile &profile = HtpProfile::global();
     if (profile.level())
       profile.addInvoke(M, K, E, elapsed, nullptr);
@@ -2149,8 +2221,11 @@ public:
       ion = trueSource(host, bytes);
     if (ion == host)
       throwIfLost(host, bytes, __LINE__);
-    if (ion && ion != host)
+    if (ion && ion != host) {
+      // A caller's host view may alias a pending ION activation.
+      htp_router_handoff_invalidate(&router_handoff_);
       stagedMemcpy(host, ion, bytes);
+    }
   }
 
   bool gemm_qs4cx_res_add_fp32(void *w, float *w_scale, const float *act,
@@ -2175,6 +2250,8 @@ public:
       return v != nullptr && std::strcmp(v, "0") == 0;
     }();
     if (u16_in && u16_off) {
+      std::lock_guard<std::mutex> lock(invoke_mutex_);
+      htp_router_handoff_invalidate(&router_handoff_);
       float *dst = const_cast<float *>(act);
       const unsigned int hd = attn_out16_.head_dim;
       for (unsigned int r = 0; r < M; ++r)
@@ -3683,6 +3760,7 @@ public:
    * The public phase-boundary hook publishes kept outputs first. The token
    * driver calls here after the seed's last reader has completed. */
   void releasePrefillStaging() {
+    htp_router_handoff_invalidate(&router_handoff_);
     constexpr size_t keep_bytes = size_t(64) << 10;
     size_t freed = 0;
     for (StagingPool *pool : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
@@ -3905,9 +3983,17 @@ public:
         // becomes a spare with no DSP handles. S1 rebinds that pair in its
         // existing miss answer, after evicting its former graph entry.
         const char *join = std::getenv("NNTR_MOE_PREFETCH_JOIN");
+        static const bool handoff = [] {
+          const char *v = std::getenv("NNTR_LFM2_DECODE_DEMAND_HANDOFF");
+          return v && std::strcmp(v, "1") == 0;
+        }();
         for (auto &st : p.pending) {
           if (!join || std::strcmp(join, "0") != 0)
-            st.prefetch_claimed = pool_prefetch_->claim(st.d.key_gu);
+            st.prefetch_claimed = pool_prefetch_->claim(
+              st.d.key_gu, handoff && weightPageCachePolicy() == 0 &&
+                             st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
+                             st.d.K == 2048u && st.d.inter == 1536u &&
+                             st.d.N_out == 2048u);
           else
             pool_prefetch_->take(st.d.key_gu, [&st](StagedExpert &ready) {
               adoptPrefetch(st, ready);
@@ -3935,6 +4021,8 @@ public:
           throw std::runtime_error(
             "QS4CX_WH_AFFINE expert with non-zero offsets on the decode miss "
             "path: not supported");
+        if (st.slot.stable_tl2 && stableTl2Slots(st.d))
+          publishStableTl2(st);
         htp_miss_load &l = a.load[a.n_load++];
         l.e = r.miss[i];
         l.old_gu = st.slot.h_gu;
@@ -4858,6 +4946,8 @@ public:
           if (experts_.count(d.key_gu) == 0)
             batch->experts.push_back(stageExpert(session, d));
         }
+        if (prefillIoTraceEnabled())
+          batch->read_trace.resize(batch->experts.size());
       } catch (...) {
         for (const StagedExpert &st : batch->experts)
           free_expert_slots_.push_back(st.slot);
@@ -4869,6 +4959,11 @@ public:
     startPrefetchReaders();
     std::lock_guard<std::mutex> lock(prefetch_mutex_);
     PrefetchBatch *b = batch.get();
+    if (prefillIoTraceEnabled()) {
+      b->trace_id = ++prefetch_trace_next_;
+      b->queued_us = HtpProfile::nowUs();
+      b->jobs_ahead = prefetch_jobs_.size();
+    }
     prefetch_batches_.push_back(std::move(batch));
     for (size_t i = 0; i < b->experts.size(); ++i)
       prefetch_jobs_.emplace_back(b, i);
@@ -4897,12 +4992,14 @@ public:
     }
     const uint64_t t_wait = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(handle_mutex_);
+    const uint64_t t_register = batch->trace_id ? HtpProfile::nowUs() : 0u;
     std::exception_ptr first;
     try {
       registerStagedBatch(session, batch->experts);
     } catch (...) {
       first = std::current_exception();
     }
+    const uint64_t t_registered = batch->trace_id ? HtpProfile::nowUs() : 0u;
     std::vector<const void *> keys;
     for (const StagedExpert &st : batch->experts)
       if (experts_.count(st.d.key_gu) != 0)
@@ -4912,6 +5009,33 @@ public:
       profile.addPrefetch(batch->experts.size(), done_on_entry, t_wait - t0,
                           HtpProfile::nowUs() - t_wait, prefetch_caller_cpus_,
                           prefetch_reader_cpus_.load());
+    if (batch->trace_id) {
+      std::fprintf(stderr,
+                   "[HTP-PREFILL-BATCH] id=%llu experts=%zu jobs_ahead=%zu "
+                   "queued_us=%llu demand_us=%llu ready=%zu joined_us=%llu "
+                   "register_start_us=%llu register_end_us=%llu\n",
+                   (unsigned long long)batch->trace_id, batch->experts.size(),
+                   batch->jobs_ahead, (unsigned long long)batch->queued_us,
+                   (unsigned long long)t0, done_on_entry,
+                   (unsigned long long)t_wait, (unsigned long long)t_register,
+                   (unsigned long long)t_registered);
+      for (size_t i = 0; i < batch->read_trace.size(); ++i) {
+        const auto &r = batch->read_trace[i];
+        std::fprintf(stderr,
+                     "[HTP-PREFILL-READ] batch=%llu expert=%zu off_gu=%llu "
+                     "start_us=%llu end_us=%llu io_us=%llu copy_us=%llu "
+                     "calls=%llu bytes=%llu cpu=%u rc=%d\n",
+                     (unsigned long long)batch->trace_id, i,
+                     (unsigned long long)batch->experts[i].d.off_gu,
+                     (unsigned long long)r.start_us,
+                     (unsigned long long)r.end_us,
+                     (unsigned long long)(r.timing.io_ns / 1000u),
+                     (unsigned long long)(r.timing.copy_ns / 1000u),
+                     (unsigned long long)r.timing.calls,
+                     (unsigned long long)r.timing.requested_bytes, r.cpu,
+                     batch->experts[i].rc);
+      }
+    }
     if (first)
       std::rethrow_exception(first);
     return keys;
@@ -4933,6 +5057,8 @@ public:
       available.reserve(available.size() + n - expert_slots_placed_);
       while (expert_slots_placed_ < n)
         available.push_back(takeExpertSlot(session, *shape));
+      if (stableTl2Slots(*shape))
+        registerStableTl2Slots(session, *shape, available);
     } catch (...) {
       free_expert_slots_ = std::move(available);
       throw;
@@ -5326,6 +5452,21 @@ private:
       cls <<= 1;
     return cls;
   }
+  /** A writable output may first restore a kept host tensor. Reject the
+   * handoff if that restore could overwrite its actual ION input bytes. */
+  static bool stagingRestoreOverlaps(const StagingPool &pool, size_t bytes,
+                                     const void *input, size_t input_bytes) {
+    const size_t cls = stageClass(bytes);
+    for (const auto *m : {&pool.holds, &pool.copied_out}) {
+      auto it = m->find(cls);
+      if (it == m->end() || !it->second.kept)
+        continue;
+      if (htp_router_handoff_overlap(input, input_bytes, it->second.first,
+                                     it->second.second))
+        return true;
+    }
+    return false;
+  }
   /** @brief @a slot made large enough for @a bytes. The class only names
    *  the slot: the buffer is as large as the largest tensor it has held
    *  (plus a page), not the class, because the driver's cache maintenance
@@ -5335,6 +5476,7 @@ private:
   void fit(std::unique_ptr<HtpRpcBuffer> &slot, size_t bytes) {
     if (slot && slot->size() >= bytes)
       return;
+    htp_router_handoff_invalidate(&router_handoff_);
     if (slot) {
       const uint8_t *lo = slot->data(), *hi = lo + slot->size();
       for (IonAlias &a : ion_alias_)
@@ -5346,6 +5488,8 @@ private:
       ((bytes + 4095) & ~static_cast<size_t>(4095)) + 4096);
   }
   HtpRpcBuffer &stage(StagingPool &pool, size_t bytes) {
+    // Handing out a writable buffer ends any pending router ownership.
+    htp_router_handoff_invalidate(&router_handoff_);
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     // A tensor a call kept in this buffer (copyOutOf's to_host false) has
@@ -5404,6 +5548,8 @@ private:
     if (it != pool.holds.end() && slot && it->second.first == src &&
         it->second.second == bytes && sampledSame(src, slot->data(), bytes))
       return *slot;
+    // No-write hits above keep their ION epoch. Copies/swaps below do not.
+    htp_router_handoff_invalidate(&router_handoff_);
     if (from) {
       // what from's buffer of this size is: a call's output (copied_out),
       // or an input staged there (holds: the qkv call's activation rows are
@@ -5715,6 +5861,7 @@ private:
                    const std::vector<float *> *dsts = nullptr,
                    const FusedNorms *norms = nullptr,
                    const std::vector<OutSlice> *slices = nullptr) {
+    PrefillComputeTrace trace(M, K, N, 3u);
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N);
     const auto shape = [&]() {
@@ -5731,8 +5878,28 @@ private:
     float *out_cat = reinterpret_cast<float *>(
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
 
+    // LFM2's three-way convolution projection: have the existing strided
+    // epilogue place slices directly in [M, 3*C]. This avoids thousands of
+    // short row copies on ARM without changing quantization or arithmetic.
+    std::vector<OutSlice> contiguous_slices;
+    FusedNorms plain_norms;
+    const bool contiguous_conv =
+      M > 1 && K == 2048 && N == 6144 && !norms && !slices && !dsts && blocks &&
+      num_handles > 1 && blocks->size() == static_cast<size_t>(num_handles);
+    if (contiguous_conv) {
+      unsigned int c0 = 0;
+      for (unsigned int columns : *blocks) {
+        contiguous_slices.push_back({matCdata, N, c0, columns});
+        c0 += columns;
+      }
+      if (c0 != N)
+        throw std::invalid_argument("FC output slices do not cover the output");
+      slices = &contiguous_slices;
+      norms = &plain_norms;
+    }
+
     HtpProfile &profile = HtpProfile::global();
-    if (norms && norms->any()) {
+    if (norms && (norms->any() || contiguous_conv)) {
       // The norms ride the same call; the timed twin has no norm variant,
       // so this path counts as an untimed call in the profile.
       int post_gamma_len = 0;
@@ -6847,6 +7014,7 @@ private:
     if (!pool_descs_.empty())
       poolSync(); // [plan 201 S1]
     std::lock_guard<std::mutex> lock(invoke_mutex_);
+    htp_router_handoff_invalidate(&router_handoff_);
     std::memcpy(q.act->data(), act, act_bytes);
     const uint32_t tok = e.tok++;
     if (!pool_descs_.empty())
@@ -7005,6 +7173,8 @@ private:
   bool take_decode_token_id(unsigned *id) override {
     if (!have_id_)
       return false;
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    htp_router_handoff_invalidate(&router_handoff_);
     *id = pending_id_;
     have_id_ = false;
     return true;
@@ -7112,6 +7282,7 @@ private:
                       const float *add_x2 = nullptr,
                       const float *add_gamma = nullptr, float add_scale = 1.0f,
                       bool out_to_host = true) {
+    PrefillComputeTrace trace(M, K, N_out, static_cast<unsigned>(kind));
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     // [PR 4428] act bit 1: the dense FFN's chunks were never rotated, so
@@ -7166,6 +7337,17 @@ private:
       via_dspq       ? *dspq_->act
       : host_prenorm ? stage(act_pool_, act_bytes)
                      : stageInput(act_pool_, act, act_bytes, &out_pool_);
+    // Consume before obtaining output staging. That buffer has distinct
+    // ownership; no later operation in this plain path writes act_stage.
+    const uint32_t pending_ticket = router_handoff_.ticket;
+    const uint32_t handoff_ticket = htp_router_handoff_take(
+      &router_handoff_, session, act_stage.data(), act_bytes, pending_ticket);
+    const bool handoff_plain =
+      handoff_ticket && htp_router_handoff_shape(M, K) && inter == 1536u &&
+      N_out == 2048u && kind == 0 && glu == 0u && !with_norms && !add_x2 &&
+      !via_dspq && HtpProfile::global().level() < 2 &&
+      !stagingRestoreOverlaps(out_pool_, out_bytes, act_stage.data(),
+                              act_bytes);
     // The post-FFN epilogue's second addend rides its own staging buffer,
     // staged before out_stage: it may be swapped in from out_pool_.
     float *x2_f32 = nullptr;
@@ -7272,8 +7454,11 @@ private:
                         static_cast<int>(row_weight.size()), act_f32, act_len,
                         out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
                     : nntr_hvx_mm_u8i4_moe_layer(
-                        session, M, K, inter, N_out, glu, h_gu.data(),
-                        static_cast<int>(h_gu.size()), h_dn.data(),
+                        session, M, K, inter, N_out,
+                        handoff_plain && rep == 0 && &act_stage != &out_stage
+                          ? htp_router_handoff_wire(handoff_ticket)
+                          : glu,
+                        h_gu.data(), static_cast<int>(h_gu.size()), h_dn.data(),
                         static_cast<int>(h_dn.size()), row_index.data(),
                         static_cast<int>(row_index.size()), row_count.data(),
                         static_cast<int>(row_count.size()), row_weight.data(),
@@ -8263,6 +8448,7 @@ private:
     /** The retired expert's handles, still registered on the DSP until the
      *  next load into this slot swaps them out; kNoHandle when none. */
     uint32_t h_gu = kNoHandle, h_dn = kNoHandle;
+    bool stable_tl2 = false;
   };
   struct ExpertResident {
     ExpertSlot slot;
@@ -8333,6 +8519,12 @@ private:
         throw std::invalid_argument("Direct prefetch requires virtual experts");
       return; // built-in default on a model without the expert pool
     }
+    const auto &shape = pool_descs_[0][0];
+    const char *pair_read = std::getenv("NNTR_LFM2_DECODE_PAIR_READ");
+    const bool native_pair_read =
+      pair_read && std::strcmp(pair_read, "1") == 0 &&
+      weightPageCachePolicy() == 0 && shape.w_bits == HTP_TL2_WEIGHT_BITS &&
+      shape.K == 2048u && shape.inter == 1536u && shape.N_out == 2048u;
     // Keep decode worker tuning independent of prefill lookahead.
     size_t readers = prefetchThreads();
     if (std::getenv("NNTR_MOE_PREFETCH") == nullptr &&
@@ -8377,20 +8569,31 @@ private:
                          false});
       }
       std::fprintf(stderr,
-                   "[HTP-PREFETCH] direct slots=%zu bytes=%zu readers=%zu\n",
-                   count, count * bytes, readers);
+                   "[HTP-PREFETCH] direct slots=%zu bytes=%zu readers=%zu "
+                   "pair_read=%d\n",
+                   count, count * bytes, readers, native_pair_read ? 1 : 0);
     }
     auto cpus = backgroundCpus(cpuBit());
     using Prefetch = HtpExpertPrefetch<StagedExpert>;
     auto queue = std::make_shared<Prefetch>(
       std::move(slots), readers,
-      [this, cpus](StagedExpert &st, const Prefetch::CancelCheck &cancelled) {
+      [this, cpus, native_pair_read](StagedExpert &st,
+                                     const Prefetch::CancelCheck &cancelled) {
         // ThreadManager pins the caller; readers must not inherit that
         // single core and delay the mailbox server on every expert read.
         thread_local bool pinned = false;
         if (!pinned) {
           pinToCpus(cpus);
           pinned = true;
+        }
+        if (native_pair_read && canReadExpertTogether(st.d)) {
+          // One existing 2 MiB bounce read, with no extra staging or copy.
+          // A started pair finishes under the worker's ownership; expiry
+          // retires its slot until this callback returns. This opt-in trades
+          // the split path's GU-only cancellation for one fewer syscall.
+          st.rc = readExpertTogether(st);
+          return st.rc == 0 ? Prefetch::ReadResult::Complete
+                            : Prefetch::ReadResult::Failed;
         }
         st.rc = readExpertWeight(st, false, false);
         if (st.rc != 0)
@@ -8428,12 +8631,12 @@ private:
         stderr,
         "[HTP-PREFETCH] submitted=%llu completed=%llu used=%llu late=%llu "
         "discarded=%llu failed=%llu full=%llu joined=%llu cancelled=%llu "
-        "registration_rpc=0\n",
+        "handed_off=%llu registration_rpc=0\n",
         (unsigned long long)s.submitted, (unsigned long long)s.completed,
         (unsigned long long)s.used, (unsigned long long)s.late,
         (unsigned long long)s.discarded, (unsigned long long)s.failed,
         (unsigned long long)s.full, (unsigned long long)s.joined,
-        (unsigned long long)s.cancelled);
+        (unsigned long long)s.cancelled, (unsigned long long)s.handed_off);
     });
   }
 
@@ -8447,6 +8650,7 @@ private:
     unsigned hidden = 0, experts = 0, top = 0;
     const float *weights = nullptr;
     const float *gamma = nullptr;
+    const float *sigmoid_bias = nullptr;
   };
 
   static unsigned prefetchTop() {
@@ -8474,34 +8678,38 @@ private:
   /** Approximate lookahead only. Borrow the model's gate and gamma instead of
    * retaining another full gate copy. poolDisarm drains predictor jobs before
    * inference returns, so none can outlive the model's parameter storage.
-   * RMS's positive scalar and softmax do not change the top-k order. Actual
-   * routing and mixture weights always come from the NPU router.
+   * RMS's positive scalar and softmax do not change the top-k order. LFM2's
+   * router receives an already-normalized row and ranks sigmoid plus bias.
+   * Actual routing and mixture weights always come from the NPU router.
    */
   void initCpuPredictor(const std::vector<int> &cpus) {
     prediction_routers_.resize(moe_ops_.size());
     for (size_t m = 0; m < moe_ops_.size(); ++m) {
       const uint32_t router = moe_ops_[m] - 1u;
       const auto *op = graphOp(router);
-      if (op->kind != HTP_OP_ROUTER_TOPK || !op->eps_bits ||
+      const bool lfm2 = op->eps_bits == 0u && op->K == 2048u &&
+                        op->n_experts == 64u && op->top_k == 4u;
+      if (op->kind != HTP_OP_ROUTER_TOPK || (!op->eps_bits && !lfm2) ||
           op->K > HTP_MBOX_PRED_MAX_WIDTH)
         throw std::invalid_argument(
-          "ARM prefetch prediction requires Gemma softmax routers");
-      const float *w = nullptr, *gamma = nullptr;
+          "ARM prefetch prediction requires Gemma or LFM2 routers");
+      const float *w = nullptr, *state = nullptr;
       for (const auto &p : load_params_)
         if (p.op == router) {
           if (p.which == HTP_GRAPH_PARAM_ROUTER_W)
             w = p.data;
           if (p.which == HTP_GRAPH_PARAM_ROUTER_BIAS)
-            gamma = p.data;
+            state = p.data;
         }
-      if (!w || !gamma)
+      if (!w || !state)
         throw std::invalid_argument("Missing ARM prediction router weights");
       auto &r = prediction_routers_[m];
       r.hidden = op->K;
       r.experts = op->n_experts;
       r.top = std::min(op->top_k, prefetchTop());
       r.weights = w;
-      r.gamma = gamma;
+      r.gamma = lfm2 ? nullptr : state;
+      r.sigmoid_bias = lfm2 ? state : nullptr;
     }
     std::vector<PredictionJob> jobs(2);
     for (auto &j : jobs)
@@ -8546,10 +8754,12 @@ private:
           for (float candidate : {0.0f, 0.5f, 1.0f}) {
             residual->apply(job.layer, token, job.input.data(), candidate,
                             corrected.data());
-            for (unsigned h = 0; h < r.hidden; ++h)
-              corrected[h] *= r.gamma[h];
-            const auto ranked = htpPredictExperts(corrected.data(), r.weights,
-                                                  r.hidden, r.experts, 8u);
+            if (r.gamma)
+              for (unsigned h = 0; h < r.hidden; ++h)
+                corrected[h] *= r.gamma[h];
+            const auto ranked =
+              htpPredictExperts(corrected.data(), r.weights, r.hidden,
+                                r.experts, 8u, r.sigmoid_bias);
             std::fputs(" |", trace.get());
             for (unsigned e : ranked)
               std::fprintf(trace.get(), " %u", e);
@@ -8558,10 +8768,12 @@ private:
         }
         residual->apply(job.layer, token, job.input.data(), blend,
                         corrected.data());
-        for (unsigned h = 0; h < r.hidden; ++h)
-          corrected[h] *= r.gamma[h];
-        const auto ids = htpPredictExperts(corrected.data(), r.weights,
-                                           r.hidden, r.experts, r.top);
+        if (r.gamma)
+          for (unsigned h = 0; h < r.hidden; ++h)
+            corrected[h] *= r.gamma[h];
+        const auto ids =
+          htpPredictExperts(corrected.data(), r.weights, r.hidden, r.experts,
+                            r.top, r.sigmoid_bias);
         std::lock_guard<std::mutex> lock(handle_mutex_);
         std::vector<bool> absent;
         for (size_t k = 0; k < ids.size(); ++k) {
@@ -8805,6 +9017,9 @@ private:
     ready.slot.h_gu = st.slot.h_gu;
     ready.slot.h_dn = st.slot.h_dn;
     st.slot.h_gu = st.slot.h_dn = kNoHandle;
+    // Handles moved to another buffer are rebound by S1. Their validated
+    // generation address no longer belongs to either physical slot.
+    ready.slot.stable_tl2 = st.slot.stable_tl2 = false;
     std::swap(st, ready);
     st.prefetched = true;
     st.prefetch_claimed = false;
@@ -9118,6 +9333,77 @@ private:
                      ExpertResident{st.slot, d.key_dn, h_gu, h_dn, d, st.tl2});
   }
 
+  static bool stableTl2Slots(const ExpertFileDesc &d) {
+    const char *v = std::getenv("NNTR_HTP_TL2_STABLE_SLOTS");
+    return v && std::strcmp(v, "1") == 0 && weightPageCachePolicy() == 0 &&
+           d.w_bits == HTP_TL2_WEIGHT_BITS && d.K == 2048u &&
+           d.inter == 1536u && d.N_out == 2048u;
+  }
+
+  /** Both weights are complete and the slot is held by this read batch.
+   * Every payload replacement gets a new generation, including decode. */
+  void publishStableTl2(const StagedExpert &st) {
+    const size_t at =
+      codeBytes(st.d.K, 2u * st.d.inter, st.d.w_bits) + 16u * st.d.inter;
+    if (stable_tl2_generation_ == UINT32_MAX)
+      throw std::overflow_error("stable TL2 generation overflow");
+    const uint32_t generation = ++stable_tl2_generation_;
+    std::atomic_thread_fence(std::memory_order_release);
+    *reinterpret_cast<volatile uint32_t *>(st.base + at) = generation;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+
+  /** Bind the existing arena slots before reads, without preloading more
+   * experts. Only metadata and its padding word are initialized here. */
+  void registerStableTl2Slots(remote_handle64 session, const ExpertFileDesc &d,
+                              std::vector<ExpertSlot> &slots) {
+    std::vector<size_t> index;
+    std::vector<uint32_t> og, od, ar, ofg, ofd;
+    const uint32_t gb =
+      static_cast<uint32_t>(codeBytes(d.K, 2u * d.inter, d.w_bits));
+    const uint32_t db =
+      static_cast<uint32_t>(codeBytes(d.inter, d.N_out, d.w_bits));
+    const uint32_t gs = expertStride(d.K, 2u * d.inter, d.w_bits);
+    for (size_t i = 0; i < slots.size(); ++i) {
+      ExpertSlot &slot = slots[i];
+      if (slot.stable_tl2)
+        continue;
+      uint8_t *base = arena_chunks_[slot.chunk].buf->data() + slot.off;
+      std::memset(base + gb, 0, 16u * d.inter + 128u);
+      std::memset(base + gs + db, 0, 8u * d.N_out);
+      index.push_back(i);
+      og.push_back(slot.h_gu);
+      od.push_back(slot.h_dn);
+      ar.push_back(arena_chunks_[slot.chunk].dsp_id);
+      ofg.push_back(slot.off);
+      ofd.push_back(slot.off + gs);
+    }
+    if (index.empty())
+      return;
+    const int count = static_cast<int>(index.size());
+    std::vector<uint32_t> hg(count, kNoHandle), hd(count, kNoHandle);
+    uint32_t done = 0;
+    int32_t err = AEE_SUCCESS;
+    const int rc = nntr_hvx_weight_swap_batch_tl2_stable_arena(
+      session, d.K, d.inter, d.N_out, og.data(), count, od.data(), count,
+      ar.data(), count, ofg.data(), count, ofd.data(), count, hg.data(), count,
+      hd.data(), count, &done, &err);
+    for (uint32_t i = 0; i < done; ++i) {
+      ExpertSlot &slot = slots[index[i]];
+      slot.h_gu = hg[i];
+      slot.h_dn = hd[i];
+      slot.stable_tl2 = true;
+    }
+    if (rc != AEE_SUCCESS || done != index.size())
+      throw std::runtime_error("stable native TL2 arena registration failed: " +
+                               std::to_string(rc ? rc : err) +
+                               "; rebuild the HTP skel");
+    std::fprintf(stderr,
+                 "[HTP-TL2] stable slots=%zu preload unchanged generation "
+                 "in existing padding\n",
+                 index.size());
+  }
+
   /**
    * @brief registerStaged for several experts in ONE round trip (doc 52
    *        section 10.23): a prefill layer's read-ahead batch, or one call's
@@ -9133,6 +9419,12 @@ private:
     std::vector<StagedExpert *> ok;
     for (StagedExpert &st : sts) {
       if (st.rc == 0) {
+        if (st.slot.stable_tl2 && stableTl2Slots(st.d) &&
+            st.slot.h_gu != kNoHandle && st.slot.h_dn != kNoHandle) {
+          publishStableTl2(st);
+          fileRegistered(st, st.slot.h_gu, st.slot.h_dn);
+          continue;
+        }
         ok.push_back(&st);
         continue;
       }
@@ -9295,8 +9587,28 @@ private:
       prefetch_reader_cpus_.fetch_or(cpuBit());
       const uint64_t t0 = HtpProfile::nowUs();
       StagedExpert &st = job.first->experts[job.second];
-      st.rc = readExpert(st, /*use_pool=*/false);
+      PrefetchReadTrace *read_trace =
+        job.first->trace_id ? &job.first->read_trace[job.second] : nullptr;
+      if (read_trace) {
+        read_trace->start_us = t0;
+        read_trace->cpu = cpuBit();
+      }
+      WeightReadTimingScope timing(read_trace ? &read_trace->timing : nullptr);
+      // Prefill requests are confirmed, so adjacent native TL2 payloads
+      // can use the demand reader's single direct IO without a cancellation
+      // point between gate/up and down.
+      const bool lfm2 =
+        st.d.K == 2048u && st.d.inter == 1536u && st.d.N_out == 2048u;
+      if (lfm2 && canReadExpertTogether(st.d)) {
+        st.rc = readExpertTogether(st);
+        if (st.rc == 0 && fadviseKnob() != 0)
+          adviseLater({{st.d, false}});
+      } else {
+        st.rc = readExpert(st, /*use_pool=*/false);
+      }
       HtpProfile &profile = HtpProfile::global();
+      if (read_trace)
+        read_trace->end_us = HtpProfile::nowUs();
       if (profile.level() != 0)
         profile.addPrefetchRead(HtpProfile::nowUs() - t0);
       {
@@ -10279,6 +10591,7 @@ private:
   uint32_t prefetch_slot_bytes_ = 0;
   /** reserve_qs4cx_wh_expert_slots's count, and slots placed so far. */
   size_t expert_slots_wanted_ = 0, expert_slots_placed_ = 0;
+  uint32_t stable_tl2_generation_ = 0; /**< under handle_mutex_ */
   /** Slices of one expert weight's file read: 3.5 MiB over 8 is 448 KiB a
    *  pread, past which the per-call cost stops paying for the split. */
   static constexpr size_t kExpertReadSlicesMax = 8;
@@ -10287,11 +10600,20 @@ private:
    *  the write rate into the arena stops scaling well before that (doc 52
    *  section 10.9), and the ARM side has its own work after the call. */
   std::vector<StagedExpert> prefetch_;
+  struct PrefetchReadTrace {
+    uint64_t start_us = 0, end_us = 0;
+    WeightReadTiming timing;
+    uint32_t cpu = 0;
+  };
   /** One _begin's experts; done counts the ones read. */
   struct PrefetchBatch {
     std::vector<StagedExpert> experts;
     size_t done = 0;
+    uint64_t trace_id = 0, queued_us = 0;
+    size_t jobs_ahead = 0;
+    std::vector<PrefetchReadTrace> read_trace;
   };
+  uint64_t prefetch_trace_next_ = 0;
   /** Queued batches, oldest first, and their unread experts, all under
    *  prefetch_mutex_. A batch's address is stable until _end takes it. */
   std::mutex prefetch_mutex_;
@@ -10586,6 +10908,7 @@ private:
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
   uint64_t cpu_fc_skipped_ = 0; /**< [#132 Part B] decode_row_resident's
                                      true answers: CPU FC calls skipped */
+  htp_router_handoff router_handoff_{};
   StagingPool act_pool_;
   StagingPool out_pool_;
   StagingPool rope_pool_;     /**< the fused projection call's RoPE rows */
@@ -10790,23 +11113,32 @@ public:
          (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
       return false;
     }
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    htp_router_handoff_invalidate(&router_handoff_);
     const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
     const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
     const int sinks_len = sinks ? static_cast<int>(n_head_q) : 0;
     const int rows_len = static_cast<int>(append_rows * kv_stride);
-    uint32_t stats[8] = {0};
+    const bool trace = attn_trace_enabled();
+    uint32_t stats[20] = {0};
     const int64_t t0 = now_us();
     const int err = nntr_hvx_attn_q_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q, q_len,
-      sinks, sinks_len, out, q_len, stats, 8);
-    if (attn_trace_enabled()) {
+      sinks, sinks_len, out, q_len, stats, trace ? 20 : 8);
+    if (trace) {
       ml_logi("HTP attn trace q: handle=%d n_q=%u cache=%u..%u append=%u "
               "err=0x%x wall_us=%lld dsp_us=%u append_us=%u attn_us=%u "
               "quant_us=%u stage_us=%u bake_us=%u",
               handle, n_q, cache_from, cache_to, append_rows, err,
               static_cast<long long>(now_us() - t0), stats[3], stats[0],
               stats[1], stats[4], stats[5], stats[6]);
+      ml_logi("HTP attn stages q: n_q=%u qprep=%u dma=%u qk=%u dequant=%u "
+              "softmax=%u pquant=%u pv=%u oupd=%u store=%u blocks=%u "
+              "total=%u kcycles=%u",
+              n_q, stats[8], stats[9], stats[10], stats[11], stats[12],
+              stats[13], stats[14], stats[15], stats[16], stats[17], stats[18],
+              stats[19]);
     }
     if (err != AEE_SUCCESS) {
       ml_logw("HTP quantized attention step failed: 0x%x; CPU fallback", err);
@@ -11085,6 +11417,8 @@ public:
         kv_stride != n_head_kv * head_dim) {
       return false;
     }
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    htp_router_handoff_invalidate(&router_handoff_);
     const remote_handle64 h = static_cast<remote_handle64>(hb.handle());
     const int q_len = static_cast<int>(n_q * n_head_q * head_dim);
     const int kv_len = static_cast<int>(cache_to * n_head_kv * head_dim);

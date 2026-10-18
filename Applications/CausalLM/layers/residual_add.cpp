@@ -14,6 +14,7 @@
 #include "residual_add.h"
 
 #include <cpu_backend.h>
+#include <cstdint>
 #include <nntrainer_error.h>
 
 #include "htp_decode_hook.h"
@@ -21,6 +22,33 @@
 namespace causallm {
 
 static constexpr size_t OUT_IDX = 0;
+
+/** LFM2 prefill's plain residual uses the existing FP32 add kernel once.
+ * Keep the output's backend and reject overlapping buffers: the previous
+ * copy-plus-add can have different semantics when its addend aliases out. */
+static bool lfmPrefillAdd(const nntrainer::Tensor &lhs,
+                          const nntrainer::Tensor &rhs, nntrainer::Tensor &out,
+                          unsigned int rows) {
+  if (rows <= 1 || out.width() != 2048 || out.batch() != 1 ||
+      out.channel() != 1 || out.getFormat() != nntrainer::Tformat::NCHW ||
+      out.getDataType() != nntrainer::Tdatatype::FP32 ||
+      lhs.getDim() != out.getDim() || rhs.getDim() != out.getDim() ||
+      !lhs.getContiguous() || !rhs.getContiguous() || !out.getContiguous() ||
+      out.getOps() == nullptr)
+    return false;
+  const float *x = lhs.getData<float>(), *y = rhs.getData<float>();
+  float *z = out.getData<float>();
+  const size_t bytes = static_cast<size_t>(out.size()) * sizeof(float);
+  const auto disjoint = [z, bytes](const float *p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(z);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(p);
+    return a >= b ? a - b >= bytes : b - a >= bytes;
+  };
+  if (!x || !y || !z || !disjoint(x) || !disjoint(y))
+    return false;
+  out.getOps()->ele_add_fp32(out.size(), x, y, z, 1.0f, 0.0f, 1, 1);
+  return true;
+}
 
 void ResidualAddLayer::finalize(nntrainer::InitLayerContext &context) {
   const unsigned int n_in = context.getNumInputs();
@@ -133,6 +161,8 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
     if (fused && rows == 1 && out.batch() == 1 && htpDecodeRowResident(from))
       continue;
     if (!fused) {
+      if (lfmPrefillAdd(in0_step, in1_step, out_step, rows))
+        continue;
       out_step.copy(in0_step);
       out_step.add_i(in1_step);
       continue;

@@ -138,6 +138,46 @@ static inline int hexkl_attn_q_plan(const hexkl_attn_f16_shape *s,
   return HEXKL_ATTN_OK;
 }
 
+/**
+ * @brief Reuse each KV block across 128 LFM2 queries when VTCM permits.
+ *
+ * Keep the column blocks and every row's softmax reduction order. Restrict
+ * the wider query blocks to full prefill with aligned causal boundaries;
+ * other shapes and small arenas retain the caller's original tiling.
+ */
+static inline int hexkl_attn_q_widen_prefill(const hexkl_attn_f16_shape *s,
+                                             const hexkl_attn_f16_tiling *t,
+                                             uint32_t arena_top,
+                                             uint32_t tile_bytes,
+                                             hexkl_attn_f16_tiling *wide) {
+  if (!s || !t || !wide || tile_bytes != 1024u || s->n_q < 128u ||
+      s->n_q % 128u || s->cache_from || s->cache_to != s->n_q ||
+      s->n_head_q != 32u || s->n_head_kv != 8u || s->head_dim != 64u ||
+      s->window || s->softcap != 0.0f || !t->br || t->br > 128u ||
+      (t->bc != 128u && t->bc != 256u))
+    return 0;
+  hexkl_attn_f16_tiling candidate = *t;
+  candidate.br = 128u;
+  if (hexkl_attn_q_tiling_init(s, &candidate) != HEXKL_ATTN_OK)
+    return 0;
+  const uint32_t per_qb =
+    candidate.g_br * s->head_dim * 4u + (candidate.g_br / HEXKL_ATTN_Q_ROWS) *
+                                          (s->head_dim / HEXKL_ATTN_TILE) *
+                                          HEXKL_ATTN_TILE_BYTES;
+  uint32_t chunk = (1536u * 1024u) / per_qb;
+  const uint32_t n_qb = hexkl_attn_f16_n_q_blocks(s, &candidate);
+  if (chunk > n_qb)
+    chunk = n_qb;
+  if (!chunk)
+    chunk = 1u;
+  hexkl_attn_q_layout layout;
+  if (hexkl_attn_q_plan(s, &candidate, arena_top, tile_bytes, chunk, &layout) !=
+      HEXKL_ATTN_OK)
+    return 0;
+  *wide = candidate;
+  return 1;
+}
+
 #ifdef __cplusplus
 }
 #endif

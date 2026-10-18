@@ -96,8 +96,16 @@ static inline HVX_Vector tl2_expand_index(const uint8_t *src, uint32_t k) {
 }
 #endif
 
-void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
-                         uint32_t row_stride, int magnitude, uint8_t *dst) {
+#if defined(__GNUC__) || defined(__clang__)
+#define TL2_EXPAND_INLINE inline __attribute__((always_inline))
+#else
+#define TL2_EXPAND_INLINE inline
+#endif
+
+static TL2_EXPAND_INLINE void tl2_expand_wh96(const uint8_t *src, uint32_t rows,
+                                              uint32_t columns,
+                                              uint32_t row_stride,
+                                              int magnitude, uint8_t *dst) {
 #if defined(__hexagon__)
   if (magnitude == 1 || magnitude == 7) {
     const uint8_t(*table)[128] = tl2_expand_nibbles[magnitude == 7];
@@ -166,6 +174,19 @@ void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
         }
       }
     }
+}
+
+#undef TL2_EXPAND_INLINE
+
+void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
+                         uint32_t row_stride, int magnitude, uint8_t *dst) {
+  tl2_expand_wh96(src, rows, columns, row_stride, magnitude, dst);
+}
+
+void hvx_tl2_expand_wh96_disjoint(const uint8_t *__restrict src, uint32_t rows,
+                                  uint32_t columns, uint32_t row_stride,
+                                  int magnitude, uint8_t *__restrict dst) {
+  tl2_expand_wh96(src, rows, columns, row_stride, magnitude, dst);
 }
 
 int hvx_tl2_pack(const int8_t *kn, uint32_t K, uint32_t N, uint8_t *packed) {

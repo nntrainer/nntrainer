@@ -2177,6 +2177,35 @@ void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
   const float *w1 = packed_weight + 1 * W;
   const float *w2 = packed_weight + 2 * W;
 
+  // Wide out-of-place prefill: walk contiguous channels instead of revisiting
+  // every cache line once per four channels. Preserve the original multiply
+  // and two FMAs, including the zero history of the first two rows. The
+  // column traversal below still supports in-place and small/tail shapes.
+  if (H >= 16 && W >= 128 && W % 4 == 0 && input != output) {
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    for (unsigned int b = 0; b < B; ++b) {
+      const float *x = input + static_cast<size_t>(b) * H * W;
+      float *y = output + static_cast<size_t>(b) * H * W;
+      for (unsigned int t = 0; t < H; ++t) {
+        const float *cur = x + static_cast<size_t>(t) * W;
+        const float *prev1 = t >= 1 ? cur - W : nullptr;
+        const float *prev2 = t >= 2 ? cur - 2 * W : nullptr;
+        float *dst = y + static_cast<size_t>(t) * W;
+        for (unsigned int c = 0; c < W; c += 4) {
+          float32x4_t v = vmulq_f32(vld1q_f32(cur + c), vld1q_f32(w0 + c));
+          v = VFMAQ_F32(v, prev1 ? vld1q_f32(prev1 + c) : zero,
+                        vld1q_f32(w1 + c));
+          v = VFMAQ_F32(v, prev2 ? vld1q_f32(prev2 + c) : zero,
+                        vld1q_f32(w2 + c));
+          if (bias)
+            v = vaddq_f32(v, vld1q_f32(bias + c));
+          vst1q_f32(dst + c, v);
+        }
+      }
+    }
+    return;
+  }
+
   for (unsigned int b = 0; b < B; ++b) {
     const float *x_base = input + static_cast<size_t>(b) * H * W;
     float *y_base = output + static_cast<size_t>(b) * H * W;

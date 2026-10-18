@@ -26,6 +26,7 @@
 #ifndef __NNTRAINER_HEXKL_MM_U8I4_MOE_H__
 #define __NNTRAINER_HEXKL_MM_U8I4_MOE_H__
 
+#include "../htp_router_handoff.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -114,6 +115,11 @@ typedef struct {
                                the scan on the HMX path, so the normed rows
                                are never stored */
   float pre_eps;
+  htp_router_handoff_scratch
+    router_handoff; /**< Invalidated by every scratch reserve. */
+  const float
+    *router_act;   /**< Per-call request set only by a validated ticket. */
+  int router_used; /**< Diagnostic: this call actually skipped its input DMA. */
   int out_heap; /**< out_f32 is cached heap the caller owns alone: the HMX
                      path accumulates straight into it instead of into a
                      copy it then moves */

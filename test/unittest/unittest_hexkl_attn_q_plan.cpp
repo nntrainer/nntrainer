@@ -141,3 +141,68 @@ TEST(HexklAttnQPlan, LayoutRejectsBadInputAndReportsNoFit) {
   EXPECT_EQ(hexkl_attn_q_plan(&s, &t32, 8u << 20, 1024u, 1, &L),
             HEXKL_ATTN_EBADPARM);
 }
+
+TEST(HexklAttnQPlan, LfmFullPrefillWidensOnlyWhenTheArenaFits) {
+  for (uint32_t rows : {128u, 256u, 1024u, 2048u, 4096u}) {
+    auto s = shape(rows, 0, rows, 32, 8, 64);
+    auto t = tiling(16, rows < 256u ? 128u : 256u);
+    ASSERT_EQ(hexkl_attn_q_tiling_init(&s, &t), HEXKL_ATTN_OK);
+    auto wide = t;
+    ASSERT_TRUE(hexkl_attn_q_widen_prefill(&s, &t, 8u << 20, 1024, &wide));
+    EXPECT_EQ(wide.br, 128u);
+    EXPECT_EQ(wide.g_br, 512u);
+    EXPECT_EQ(wide.bc, t.bc);
+    wide = t;
+    EXPECT_FALSE(hexkl_attn_q_widen_prefill(&s, &t, 64u << 10, 1024, &wide));
+    EXPECT_EQ(wide.br, t.br);
+    EXPECT_EQ(wide.bc, t.bc);
+  }
+}
+
+TEST(HexklAttnQPlan, LfmWideningPreservesOtherAttentionGeometries) {
+  const auto valid = shape(1024, 0, 1024, 32, 8, 64);
+  for (unsigned i = 0; i < 10; ++i) {
+    auto s = valid;
+    uint32_t tile_bytes = 1024;
+    switch (i) {
+    case 0:
+      s.n_q = 1;
+      break;
+    case 1:
+      s.n_q = 1023;
+      break;
+    case 2:
+      s.cache_from = 128;
+      s.cache_to = 1152;
+      break;
+    case 3:
+      s.cache_to = 2048;
+      break;
+    case 4:
+      s.n_head_q = 16;
+      break;
+    case 5:
+      s.n_head_kv = 4;
+      break;
+    case 6:
+      s.head_dim = 256;
+      break; // Gemma sliding attention
+    case 7:
+      s.window = 512;
+      break;
+    case 8:
+      tile_bytes = 512;
+      break;
+    case 9:
+      s.softcap = 5.f;
+      break;
+    }
+    auto t = tiling(16, 256);
+    ASSERT_EQ(hexkl_attn_q_tiling_init(&s, &t), HEXKL_ATTN_OK);
+    auto wide = t;
+    EXPECT_FALSE(
+      hexkl_attn_q_widen_prefill(&s, &t, 8u << 20, tile_bytes, &wide));
+    EXPECT_EQ(wide.br, t.br);
+    EXPECT_EQ(wide.g_br, t.g_br);
+  }
+}

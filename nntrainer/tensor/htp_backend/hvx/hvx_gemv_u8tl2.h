@@ -41,6 +41,13 @@ int hvx_tl2_unpack(const uint8_t *packed, uint32_t K, uint32_t N, int8_t *kn);
 void hvx_tl2_expand_wh96(const uint8_t *src, uint32_t rows, uint32_t columns,
                          uint32_t row_stride, int magnitude, uint8_t *dst);
 
+/** Same bytes as expand_wh96 with its non-overlap contract made visible to
+ * the compiler. The LFM prefill caller uses only its separate native source
+ * slabs; in-place weight staging retains its snapshot and original entry. */
+void hvx_tl2_expand_wh96_disjoint(const uint8_t *src, uint32_t rows,
+                                  uint32_t columns, uint32_t row_stride,
+                                  int magnitude, uint8_t *dst);
+
 /** Exact int16 LUTs, 512 bytes per 24 input rows. The u8 activation is
  * contiguous and has K bytes; the last block is read with bounds checks.
  * Workers partition [block_begin,block_end) of ceil(K/24). Tables depend only

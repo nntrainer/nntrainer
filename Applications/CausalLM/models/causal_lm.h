@@ -87,6 +87,9 @@ public:
 
 protected:
   bool htp_execution_profile_ = false;
+  /** Model-local preparation immediately before a timed prefill block.
+   * The default is empty; loaders and decode steps never call this hook. */
+  virtual void beforePrefillBlock(unsigned int, unsigned int) {}
   /**
    * @brief One-shot CUDA prewarm guard, PER MODEL OBJECT. A function-local
    *        static was process-lifetime, so the second load of a load/destroy

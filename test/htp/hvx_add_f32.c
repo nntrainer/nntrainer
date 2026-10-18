@@ -115,7 +115,8 @@ int nntr_hvx_release_prefill_scratch(remote_handle64 handle, uint64 *bytes) {
   if (!s || !bytes)
     return AEE_EBADPARM;
   *bytes = 0;
-  if (s->moe_scratch.pre_gamma || s->moe_scratch.out_heap)
+  if (s->moe_scratch.pre_gamma || s->moe_scratch.out_heap ||
+      s->moe_scratch.rotated_input || s->moe_scratch.router_act)
     return AEE_EBADSTATE;
   if (s->moe_scratch.cap > keep_bytes) {
     *bytes += s->moe_scratch.cap + 128u;

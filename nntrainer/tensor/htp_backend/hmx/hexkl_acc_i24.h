@@ -27,6 +27,26 @@ static inline uint32_t hexkl_acc_i24_scratch_offset(uint32_t arena,
   return occupied_end <= off ? off : UINT32_MAX;
 }
 
+/** Size two gate/up and two foreground-down accumulator banks at their
+ * actual three-plane storage size. Native weight sources follow the banks;
+ * the separate convert config must still fit at the aligned arena end. */
+static inline int hexkl_acc_i24_banks(uint32_t arena, uint32_t first,
+                                      uint32_t tiles, uint32_t native_bytes,
+                                      uint32_t *down, uint32_t *end) {
+  if (!down || !end || first % HEXKL_CVT_PLANE_ALIGN || tiles < 2u ||
+      tiles % 2u)
+    return 0;
+  const uint64_t bank = (uint64_t)tiles * 3u * HEXKL_CVT_PLANE_BYTES;
+  const uint64_t total = first + 4u * bank;
+  const uint64_t occupied = total + native_bytes;
+  if (occupied > UINT32_MAX ||
+      hexkl_acc_i24_scratch_offset(arena, (uint32_t)occupied) == UINT32_MAX)
+    return 0;
+  *down = (uint32_t)(first + 2u * bank);
+  *end = (uint32_t)total;
+  return 1;
+}
+
 /** The complete u8 * signed-int4 dot must fit before any zero-point or
  * affine correction. Check both signs in uint64 so large K cannot wrap. */
 static inline int hexkl_acc_i24_range(uint32_t K, int32_t min_w,

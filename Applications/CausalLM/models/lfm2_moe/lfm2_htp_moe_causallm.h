@@ -30,12 +30,14 @@ public:
   void load_kvcache(std::string path, int to) override;
 
 protected:
+  void beforePrefillBlock(unsigned int from, unsigned int to) override;
   void allocateAndBindKVCache() override;
 
 private:
   bool sr15_ = false;
   unsigned dense_layers_ = 0;
   bool loading_ = false, prepared_ = false, ran_ = false;
+  bool prefill_early_attempted_ = false;
   std::vector<std::vector<float>> params_;
   Tensor attentionBlock(unsigned layer, Tensor input);
   void configureActiveKVLayers();

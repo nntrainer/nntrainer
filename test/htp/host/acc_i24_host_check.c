@@ -86,6 +86,30 @@ int main(void) {
   assert(hexkl_acc_i24_scratch_offset(31743u, 26624u) == 26624u);
   assert(hexkl_acc_i24_scratch_offset(31743u, 26625u) == UINT32_MAX);
   assert(hexkl_acc_i24_scratch_offset(32768u, UINT32_MAX) == UINT32_MAX);
+  {
+    uint32_t down = 0u, end = 0u;
+    const uint32_t first = 5439488u, native_bytes = 1976320u;
+    assert(
+      hexkl_acc_i24_banks(8u << 20, first, 32u, native_bytes, &down, &end));
+    assert(down == 5832704u && end == 6225920u);
+    const uint32_t exact = end + native_bytes + HEXKL_ACC_I24_SCRATCH_BYTES;
+    assert(hexkl_acc_i24_banks(exact, first, 32u, native_bytes, &down, &end));
+    assert(
+      !hexkl_acc_i24_banks(exact - 1u, first, 32u, native_bytes, &down, &end));
+    assert(down == 5832704u && end == 6225920u);
+    assert(!hexkl_acc_i24_banks(UINT32_MAX, UINT32_MAX - 2047u, 32u,
+                                native_bytes, &down, &end));
+    assert(!hexkl_acc_i24_banks(8u << 20, first, UINT32_MAX - 1u, native_bytes,
+                                &down, &end));
+    assert(!hexkl_acc_i24_banks(8u << 20, first + 1u, 32u, native_bytes, &down,
+                                &end));
+    assert(
+      !hexkl_acc_i24_banks(8u << 20, first, 1u, native_bytes, &down, &end));
+    assert(
+      !hexkl_acc_i24_banks(8u << 20, first, 31u, native_bytes, &down, &end));
+    assert(
+      !hexkl_acc_i24_banks(8u << 20, first, 32u, native_bytes, NULL, &end));
+  }
   puts("ACC_I24_HOST_PASS: 262144 signed lanes, range/layout guards, canaries");
   return 0;
 }

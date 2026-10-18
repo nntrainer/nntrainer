@@ -39,7 +39,7 @@ typedef struct {
   uint64_t us_qprep;   /**< Q gather + uint8 quantization into AH tiles */
   uint64_t us_dma;     /**< K^T / V tile DMA incl. the drain, block scales */
   uint64_t us_qk;      /**< HMX Q.K^T incl. accumulator reads */
-  uint64_t us_dequant; /**< int32 accumulator -> fp16 score tiles */
+  uint64_t us_dequant; /**< score conversion, or async submit + exposed wait */
   uint64_t us_softmax; /**< HVX online softmax (exposed time) */
   uint64_t us_pquant;  /**< P * s_v -> uint8 P' tiles */
   uint64_t us_pv;      /**< HMX P'.V incl. accumulator reads */

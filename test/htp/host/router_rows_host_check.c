@@ -182,6 +182,11 @@ int main(void) {
   fail |= run_norm(900, 320, 128); /* 300 rows a lane: two segments */
   fail |= run_norm(7, 2816, 128);  /* the Gemma-4 router */
   fail |= run_norm(5, 2048, 32);
+  /** LFM2 prefill uses eight-row dot blocks after the input norm. Compare
+   * against the existing four-row fused norm path, including worker tails. */
+  fail |= run_norm(128, 2048, 64);
+  fail |= run_norm(129, 2048, 64);
+  fail |= run_norm(257, 2048, 64);
   /* the softmax router's selection: top-8 plus the 5 prefetch hints */
   fail |= run_topk(7, 128, 8, 13, 0);
   fail |= run_topk(5, 128, 8, 8, 1); /* integer logits: exact ties */

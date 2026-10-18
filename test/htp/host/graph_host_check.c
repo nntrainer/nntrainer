@@ -1330,7 +1330,7 @@ static void check_stretches(void) {
 #define HD64_TOP 2u
 #define HD64_INTER 32u
 
-static float arm_hint_input[HID];
+static float arm_hint_input[2048];
 static uint32_t arm_hint_op, arm_hint_width, arm_hint_calls;
 static void capture_arm_hint(void *ctx, uint32_t op, const float *input,
                              uint32_t width) {
@@ -1338,8 +1338,8 @@ static void capture_arm_hint(void *ctx, uint32_t op, const float *input,
   arm_hint_op = op;
   arm_hint_width = width;
   ++arm_hint_calls;
-  if (width == HID)
-    memcpy(arm_hint_input, input, sizeof(arm_hint_input));
+  if (width <= sizeof(arm_hint_input) / sizeof(arm_hint_input[0]))
+    memcpy(arm_hint_input, input, width * sizeof(float));
 }
 
 /** hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
@@ -3073,8 +3073,8 @@ static void check_norm_scale_reuse(void) {
 static void check_profile_on_demand(void) {
   uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                  HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
-  const uint32_t n = build(words, sizeof(words) / sizeof(words[0]), &kHd64, "C",
-                           HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM));
+  const uint32_t n = build(words, sizeof(words) / sizeof(words[0]), &kHd64,
+                           "CAC", HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM));
   const uint32_t op = nth_op(words, HTP_OP_RMSNORM, 0u);
   hexkl_graph *g = NULL;
   uint32_t rc = hexkl_graph_init(words, n, &g_tbl, NULL, 0u, &g);
@@ -3174,6 +3174,151 @@ static void check_wh_lm_head(void) {
   printf("GRAPH WH LM HEAD: 64 parts, no Q4M1, softcap and argmax checked\n");
 }
 
+/** LFM2's already-normalized sigmoid router input is copied to the host only
+ * as a speculative hint. Neither logits, real routes nor mixtures may change.
+ */
+static void check_lfm2_arm_prediction(void) {
+  enum { H = 2048, E = 64, TOP = 4 };
+  static uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                        HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float input[H], weights[H * E], bias[E];
+  float logits[E], expected[E], expected_weight[TOP];
+  uint32_t expected_count[E];
+  htp_graph_lfm2_shape shape = kHd64;
+  shape.hidden = H;
+  shape.n_experts = E;
+  shape.top_k = TOP;
+  shape.n_heads = 32;
+  shape.n_kv_heads = 8;
+  const uint32_t n =
+    build(words, sizeof(words) / sizeof(words[0]), &shape, "CAC", D_KINDS);
+  hexkl_graph *g = NULL;
+  uint32_t rc = hexkl_graph_init(words, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "LFM2 predictor graph init");
+  if (!g)
+    return;
+  hexkl_graph_env env = {0};
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.scratch = &g_scratch;
+  env.pool = real_pool();
+  env.miss.input_hint = capture_arm_hint;
+  uint32_t seed = 4428u, resume = 0;
+  fill(input, H, &seed);
+  for (uint32_t layer = 0; layer < 2u; ++layer) {
+    fill(weights, H * E, &seed);
+    fill(bias, E, &seed);
+    uint32_t router = nth_op(words, HTP_OP_ROUTER_TOPK, layer);
+    rc = hexkl_graph_set_param(g, router, HTP_GRAPH_PARAM_ROUTER_W, weights,
+                               H * E);
+    rc |=
+      hexkl_graph_set_param(g, router, HTP_GRAPH_PARAM_ROUTER_BIAS, bias, E);
+    CHECK(rc == 0u, "LFM2 predictor router parameters");
+  }
+  const uint32_t router = nth_op(words, HTP_OP_ROUTER_TOPK, 0u);
+  rc = hexkl_graph_forward(g, &env, router, 1u, 0u, NULL, input, H, expected, E,
+                           &resume);
+  CHECK(rc == 0u && resume == router + 1u, "LFM2 real router baseline");
+  memcpy(expected_count, g->route_cnt, sizeof(expected_count));
+  memcpy(expected_weight, g->route_w, sizeof(expected_weight));
+  uint32_t mode = 2u;
+  float word;
+  memcpy(&word, &mode, sizeof(word));
+  CHECK(hexkl_graph_set_param(g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT,
+                              &word, 1u) == 0,
+        "LFM2 ARM predictor mode");
+  arm_hint_calls = 0;
+  rc = hexkl_graph_forward(g, &env, router, 1u, 0u, NULL, input, H, logits, E,
+                           &resume);
+  CHECK(rc == 0u && resume == router + 1u && arm_hint_calls == 1u &&
+          arm_hint_width == H &&
+          arm_hint_op == nth_op(words, HTP_OP_ROUTER_TOPK, 1u) &&
+          memcmp(arm_hint_input, input, sizeof(input)) == 0,
+        "LFM2 ARM hint copies input and targets next router");
+  CHECK(memcmp(logits, expected, sizeof(expected)) == 0 &&
+          memcmp(g->route_cnt, expected_count, sizeof(expected_count)) == 0 &&
+          memcmp(g->route_w, expected_weight, sizeof(expected_weight)) == 0 &&
+          memcmp(g->slots + (size_t)g->ops[router].in_slot * g->slot_words,
+                 input, sizeof(input)) == 0,
+        "LFM2 ARM hint preserves logits, real routes, mixtures and input");
+  hexkl_graph_free(g);
+  puts("LFM2 ARM HINT: INPUT / LOGITS / ROUTES / MIXTURES BIT-IDENTICAL");
+}
+
+/** The real LFM2 conv shape, including uneven three-lane partitioning and
+ * eight lanes, preserves every output and all three state rows. */
+static void check_lfm2_parallel_conv(void) {
+  enum { C = 2048 };
+  static uint32_t words[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                        HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float input[3u * C], weights[3u * C], out[C], serial[C], expected[C];
+  static float state[2u * C], state_serial[3u * C], state_expected[2u * C];
+  const uint32_t worker_counts[] = {0u, 2u, 7u};
+  htp_graph_lfm2_shape shape = kHd64;
+  shape.hidden = C;
+  shape.n_heads = 32;
+  shape.n_kv_heads = 8;
+  shape.n_experts = 64;
+  shape.top_k = 4;
+  const uint32_t n = build(words, sizeof(words) / sizeof(words[0]), &shape,
+                           "CAC", HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE));
+  hexkl_graph *g = NULL;
+  uint32_t rc = hexkl_graph_init(words, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "LFM2 parallel conv graph init");
+  if (g == NULL)
+    return;
+  const uint32_t op = nth_op(words, HTP_OP_CONV1D_GATE, 0u);
+  uint32_t seed = 4428u, resume;
+  fill(weights, 3u * C, &seed);
+  CHECK(hexkl_graph_set_param(g, op, HTP_GRAPH_PARAM_CONV_W, weights, 3u * C) ==
+          0u,
+        "LFM2 parallel conv weights");
+  hexkl_graph_env env = {0};
+  env.tbl = &g_tbl;
+  for (uint32_t p = 0; p < sizeof(worker_counts) / sizeof(worker_counts[0]);
+       ++p) {
+    env.pool =
+      worker_counts[p] ? hvx_worker_pool_create(worker_counts[p]) : NULL;
+    CHECK(worker_counts[p] == 0u || env.pool != NULL, "conv worker pool");
+    memset(state, 0, sizeof(state));
+    for (uint32_t t = 0; t < 12u; ++t) {
+      if (t == 0u || t == 8u) {
+        if (t == 8u)
+          fill(state, 2u * C, &seed);
+        memcpy(state_serial, state, sizeof(state));
+        memcpy(state_expected, state, sizeof(state));
+        CHECK(hexkl_graph_set_param(g, op, HTP_GRAPH_PARAM_CONV_STATE, state,
+                                    2u * C) == 0u,
+              "parallel conv state seed p=%u t=%u", p, t);
+      }
+      fill(input, 3u * C, &seed);
+      for (uint32_t j = 0; j < 3u * C; ++j) {
+        if (t == 2u)
+          input[j] = j % 2u ? 1e-39f : -1e-39f;
+        else if (t == 3u)
+          input[j] *= 1e4f;
+        else if (t == 4u)
+          input[j] = 0.0f;
+      }
+      rc = hexkl_graph_forward(g, &env, op, 1u, t, NULL, input, 3u * C, out, C,
+                               &resume);
+      hvx_conv_gate_m1_f32(input, state_serial, weights, serial, C);
+      m1_conv_gate_det(input, state_expected, weights, expected, C);
+      CHECK(rc == 0u && resume == op + 1u &&
+              memcmp(out, serial, sizeof(out)) == 0 &&
+              memcmp(out, expected, sizeof(out)) == 0 &&
+              memcmp(g->state[op], state_serial, sizeof(state_serial)) == 0 &&
+              memcmp(g->state[op], state_expected, sizeof(state_expected)) == 0,
+            "parallel conv output / state p=%u t=%u", p, t);
+    }
+    hvx_worker_pool_destroy(env.pool);
+  }
+  hexkl_graph_free(g);
+  puts("LFM2 CONV: 1 / 3 / 8 LANES, OUTPUT / STATE BIT-IDENTICAL");
+}
+
 int main(void) {
   check_validator();
   check_forward();
@@ -3190,6 +3335,8 @@ int main(void) {
   check_norm_scale_reuse();
   check_profile_on_demand();
   check_wh_lm_head();
+  check_lfm2_arm_prediction();
+  check_lfm2_parallel_conv();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;
