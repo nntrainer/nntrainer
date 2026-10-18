@@ -25,7 +25,8 @@
 #include <unistd.h>
 
 namespace {
-constexpr unsigned rows = 300, width = 64, tokens = 4;
+constexpr unsigned rows = 300, width = 2048, tokens = 4;
+constexpr size_t q4_stride = 18 * (width / 32);
 constexpr size_t offset = 13;
 
 void require(bool ok, const char *message) {
@@ -46,21 +47,25 @@ struct Fixture {
   std::vector<nntrainer::Var_Grad> inputs, outputs;
   std::unique_ptr<nntrainer::RunLayerContext> context;
 
-  Fixture(bool stream, int fd, float scale) {
+  Fixture(bool stream, int fd, float scale, bool q4 = false) {
     layer.setProperty(
-      {"in_dim=" + std::to_string(rows), "out_dim=64",
+      {"in_dim=" + std::to_string(rows), "out_dim=" + std::to_string(width),
        "scale=" + std::to_string(scale),
-       std::string("stream_fp32=") + (stream ? "true" : "false")});
+       std::string("stream_fp32=") + (stream && !q4 ? "true" : "false")});
     const nntrainer::TensorDim::TensorType f32(
       ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP32);
     nntrainer::InitLayerContext init(
       {nntrainer::TensorDim({1, 1, 1, tokens}, f32)}, {true}, false,
-      "embedding", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+      "embedding", "", 0.0f, {"NCHW", q4 ? "Q4_0" : "FP32", "FP32"}, 1.0f,
       ml::train::ExecutionMode::INFERENCE, ml::train::CPU);
     layer.finalize(init);
     for (const auto &spec : init.getWeightsSpec()) {
-      const bool is_virtual = std::get<12>(spec);
-      require(is_virtual == stream, "layer requested incorrect storage");
+      const bool requested_virtual = std::get<12>(spec);
+      require(requested_virtual == (stream || q4),
+              "layer requested incorrect storage");
+      // Construct the identical resident reference explicitly even when
+      // the Q4 inference policy requested virtual storage.
+      const bool is_virtual = stream;
       nntrainer::Tensor variable(
         std::get<0>(spec), !is_virtual, nntrainer::Initializer::NONE, "table",
         nntrainer::QScheme::PER_TENSOR_AFFINE, is_virtual);
@@ -227,12 +232,76 @@ int main() {
       rejected = true;
     }
     require(rejected, "truncated export used cached rows or accepted EOF");
+    // Q4_0 rows include 64 distinct half-precision scale blocks. A raw
+    // packed cache must retain all of them, not just the token's nibbles.
+    require(ftruncate(write_fd, offset + rows * q4_stride) == 0,
+            "Q4 resize failed");
+    std::vector<uint8_t> packed(rows * q4_stride);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t b = 0; b < width / 32; ++b) {
+        uint8_t *block = packed.data() + r * q4_stride + b * 18;
+        const uint16_t scale = 0x2000u + ((r * 37 + b * 19) % 0x1400u);
+        std::memcpy(block, &scale, sizeof(scale));
+        for (size_t j = 0; j < 16; ++j)
+          block[2 + j] = uint8_t(r * 71 + b * 23 + j * 13);
+      }
+    require(pwrite(write_fd, packed.data(), packed.size(), offset) ==
+                ssize_t(packed.size()) &&
+              fsync(write_fd) == 0,
+            "Q4 fixture write failed");
+    for (float scale : {1.0f, -0.75f}) {
+      Fixture expected(false, read_fd, scale, true);
+      Fixture actual(true, read_fd, scale, true);
+      for (const auto &ids : {std::vector<unsigned>{7, 7, 7, 7},
+                              std::vector<unsigned>{299, 0, 9, 299},
+                              std::vector<unsigned>{128, 65, 257, 65},
+                              std::vector<unsigned>{299}})
+        for (unsigned repeat = 0; repeat < 3; ++repeat)
+          require(actual.run(ids, 23) == expected.run(ids, 23),
+                  "Q4 cached/scaled/repeated rows changed");
+      auto &source = actual.weights[0].getVariableRef();
+      source.setFileOffset(offset + q4_stride);
+      require(actual.run({0, 0, 1, 1}, 0) == expected.run({1, 1, 2, 2}, 0),
+              "Q4 source offset used stale rows");
+      source.setFileOffset(offset);
+      require(actual.run({0, 1, 0, 1}, 0) == expected.run({0, 1, 0, 1}, 0),
+              "Q4 restored offset used stale rows");
+      source.read(nntrainer::FileReadSource{read_fd}, offset, true, -2);
+      bool rejected = false;
+      try {
+        actual.run({0, 0, 1, 1}, 0);
+      } catch (const std::runtime_error &) {
+        rejected = true;
+      }
+      require(rejected, "Q4 changed fd reused stale rows");
+      source.read(nntrainer::FileReadSource{read_fd}, offset, true, read_fd);
+      require(actual.run({0}, 0) == expected.run({0}, 0),
+              "Q4 restored source differs");
+    }
+    Fixture q4_expected(false, read_fd, 1.0f, true);
+    Fixture q4_cache(true, read_fd, 1.0f, true);
+    for (unsigned r = 0; r < 128; ++r)
+      q4_cache.run({r}, 0);
+    q4_cache.run({0}, 0);
+    q4_cache.run({128}, 0);
+    require(ftruncate(write_fd, offset) == 0, "Q4 truncate failed");
+    require(q4_cache.run({0, 127, 128, 0}, 0) ==
+              q4_expected.run({0, 127, 128, 0}, 0),
+            "Q4 cached hits read the file or changed values");
+    bool q4_evicted = false;
+    try {
+      q4_cache.run({1, 1, 1, 1}, 0);
+    } catch (const std::runtime_error &) {
+      q4_evicted = true;
+    }
+    require(q4_evicted, "Q4 cache exceeded 128 rows or accepted EOF");
     unlink(save_path.c_str());
     close(read_fd);
     close(write_fd);
     unlink(path);
-    std::puts("FP32 direct embedding: exact rows, concurrent cache hits, LRU, "
-              "source changes, bounded save, bounds and EOF passed");
+    std::puts(
+      "FP32/Q4 direct embedding: exact rows, concurrent cache hits, LRU, "
+      "source changes, bounded save, bounds and EOF passed");
     return 0;
   } catch (const std::exception &error) {
     if (read_fd >= 0)

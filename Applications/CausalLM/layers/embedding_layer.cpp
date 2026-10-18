@@ -877,18 +877,19 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     });
 }
 
-// Per-layer LRU with a fixed allocation (1 MiB for 128 x 2048 FP32 rows).
+// Per-layer LRU of at most 128 exact, unscaled file rows. FP32 rows use
+// 1 MiB at width 2048; packed Q4_0 rows use 144 KiB at the same width.
 // Only lookup/copy and insertion hold the lock; independent prefill misses
-// continue to use parallel direct I/O. Cached values are unscaled exact rows.
-class EmbeddingLayer::Fp32RowCache {
+// continue to use parallel direct I/O.
+class EmbeddingLayer::RowCache {
 public:
-  Fp32RowCache(size_t rows, size_t width) :
-    row_bytes(width * sizeof(float)),
+  RowCache(size_t rows, size_t bytes) :
+    row_bytes(bytes),
     keys(std::min<size_t>(rows, 128)),
     ages(keys.size(), 0),
-    values(keys.size() * width) {}
+    values(keys.size() * row_bytes) {}
 
-  int read(int fd, size_t offset, size_t index, float *out) {
+  int read(int fd, size_t offset, size_t index, void *out) {
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (fd != source_fd || offset != source_offset) {
@@ -898,8 +899,7 @@ public:
       }
       for (size_t slot = 0; slot < keys.size(); ++slot) {
         if (ages[slot] && keys[slot] == index) {
-          std::memcpy(out, values.data() + slot * row_bytes / sizeof(float),
-                      row_bytes);
+          std::memcpy(out, values.data() + slot * row_bytes, row_bytes);
           ages[slot] = ++clock;
           return 0;
         }
@@ -920,8 +920,7 @@ public:
         break;
       }
     }
-    std::memcpy(values.data() + slot * row_bytes / sizeof(float), out,
-                row_bytes);
+    std::memcpy(values.data() + slot * row_bytes, out, row_bytes);
     keys[slot] = index;
     ages[slot] = ++clock;
     return 0;
@@ -931,7 +930,7 @@ private:
   const size_t row_bytes;
   std::vector<size_t> keys;
   std::vector<uint64_t> ages;
-  std::vector<float> values;
+  std::vector<uint8_t> values;
   std::mutex mutex;
   uint64_t clock = 0;
   int source_fd = -1;
@@ -994,8 +993,16 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   size_t out_dim =
     static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
 
-  fp32_row_cache =
-    stream_fp32 ? std::make_shared<Fp32RowCache>(in_dim, out_dim) : nullptr;
+  const bool stream_q4 =
+    !has_quantized_lut &&
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE &&
+    context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0 &&
+    nntrainer::weightPageCachePolicy() == 0;
+  const size_t row_bytes =
+    stream_fp32 ? out_dim * sizeof(float) : 18 * ((out_dim + 31) / 32);
+  row_cache = (stream_fp32 || stream_q4)
+                ? std::make_shared<RowCache>(in_dim, row_bytes)
+                : nullptr;
   quant_lut.reset();
   if (has_quantized_lut) {
     quant_lut =
@@ -1522,33 +1529,51 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     auto &tm = nntrainer::ThreadManager::Global();
     const size_t total = static_cast<size_t>(iter);
     const size_t max_workers = std::max<size_t>(1, tm.getComputeThreadCount());
-    const size_t njobs = std::min(total, max_workers);
-    const bool stream_fp32 = fp32_row_cache && !ggml_lut &&
+    const bool stream_fp32 = row_cache && !ggml_lut &&
                              wt == nntrainer::TensorDim::DataType::FP32 &&
                              weight_p->isVirtual();
     // ThreadManager callbacks cannot propagate exceptions. Validate streaming
     // IDs here and report direct-I/O errors only after every worker joins.
-    if (stream_fp32) {
+    if (stream_fp32 || virt_q4) {
       for (size_t i = 0; i < total; ++i) {
         NNTR_THROW_IF(!(in_data[i] >= 0 && in_data[i] < in_dim),
                       std::invalid_argument)
           << "input word index is greater than in_dim";
       }
     }
+    // A prefill may repeat a row while its first direct read is still in
+    // flight. Resolve duplicates before dispatch so each distinct row has
+    // one owner, then copy its completed output after all readers join.
+    std::vector<size_t> unique_rows, source_rows;
+    if (virt_q4 && total > 1 &&
+        batchsliced_hidden.getDataType() ==
+          nntrainer::TensorDim::DataType::FP32) {
+      std::unordered_map<size_t, size_t> first;
+      source_rows.resize(total);
+      for (size_t i = 0; i < total; ++i) {
+        const auto entry = first.emplace(static_cast<size_t>(in_data[i]), i);
+        source_rows[i] = entry.first->second;
+        if (entry.second)
+          unique_rows.push_back(i);
+      }
+    }
+    const size_t work_rows = source_rows.empty() ? total : unique_rows.size();
+    const size_t njobs = std::min(work_rows, max_workers);
     std::atomic<int> stream_error{0};
     tm.parallel_for(0, njobs, [&](size_t t) {
       // Chunked over tokens (prefill: total == prompt length) so each worker
       // reuses ONE fp32 scratch for its whole chunk instead of paying a heap
       // allocation per token; decode (total==1) stays on the caller thread.
-      const size_t chunk_begin = t * total / njobs;
-      const size_t chunk_end = (t + 1) * total / njobs;
+      const size_t chunk_begin = t * work_rows / njobs;
+      const size_t chunk_end = (t + 1) * work_rows / njobs;
       std::vector<float> tmp;
       // One on-demand Q4_0 row per worker: shared across the workers it
       // was torn by concurrent reads (page-cache policy, prefill).
       std::vector<uint8_t> virt_row;
       if (row_quant || qs4cx_w || qs4cx_lut)
         tmp.resize(out_dim);
-      for (size_t i = chunk_begin; i < chunk_end; ++i) {
+      for (size_t job = chunk_begin; job < chunk_end; ++job) {
+        const size_t i = source_rows.empty() ? job : unique_rows[job];
         size_t embed_idx = static_cast<size_t>(in_data[i]);
         if (embed_idx >= in_dim) {
           throw std::invalid_argument(
@@ -1584,11 +1609,18 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             const void *row;
             if (virt_q4) {
               virt_row.resize(row_stride);
-              const int rc = nntrainer::weightPread(
-                weight_p->getFd(), virt_row.data(), virt_row.size(),
-                weight_p->getFileOffset() + row_stride * embed_idx);
-              NNTR_THROW_IF(rc != 0, std::runtime_error)
-                << "Embedding row read failed: " << std::strerror(rc);
+              const int rc =
+                row_cache
+                  ? row_cache->read(weight_p->getFd(),
+                                    weight_p->getFileOffset(), embed_idx,
+                                    virt_row.data())
+                  : nntrainer::weightPread(
+                      weight_p->getFd(), virt_row.data(), virt_row.size(),
+                      weight_p->getFileOffset() + row_stride * embed_idx);
+              if (rc != 0) {
+                stream_error.store(rc, std::memory_order_relaxed);
+                continue;
+              }
               row = virt_row.data();
             } else {
               row = quant_table + row_stride * embed_idx;
@@ -1621,8 +1653,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           }
         } else if (stream_fp32) {
           const int rc =
-            fp32_row_cache->read(weight_p->getFd(), weight_p->getFileOffset(),
-                                 embed_idx, out_tensor.getData<float>());
+            row_cache->read(weight_p->getFd(), weight_p->getFileOffset(),
+                            embed_idx, out_tensor.getData<float>());
           if (rc != 0) {
             stream_error.store(rc, std::memory_order_relaxed);
             continue;
@@ -1661,7 +1693,14 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     });
     const int stream_rc = stream_error.load(std::memory_order_relaxed);
     NNTR_THROW_IF(stream_rc != 0, std::runtime_error)
-      << "FP32 embedding row read failed: " << std::strerror(stream_rc);
+      << "Embedding row read failed: " << std::strerror(stream_rc);
+    if (!source_rows.empty()) {
+      float *out = batchsliced_hidden.getData<float>();
+      for (size_t i = 0; i < total; ++i)
+        if (source_rows[i] != i)
+          std::memcpy(out + i * out_dim, out + source_rows[i] * out_dim,
+                      out_dim * sizeof(float));
+    }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // Push the host-dequantized rows into the device-only output on the

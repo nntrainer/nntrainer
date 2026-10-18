@@ -283,9 +283,9 @@ private:
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
-  class Fp32RowCache;
-  /// Bounded, exact rows for the explicitly enabled streaming path only.
-  std::shared_ptr<Fp32RowCache> fp32_row_cache;
+  class RowCache;
+  /// Bounded, exact file rows for FP32 streaming or virtual Q4_0 direct I/O.
+  std::shared_ptr<RowCache> row_cache;
   /** CUDA dev-act pinned staging (cudaHostAlloc), PER INSTANCE. This was a
    *  function-scope static, which was safe while only the PLE used this class;
    *  once embedding0 became an EmbeddingLayer too, both layers shared one
