@@ -172,6 +172,59 @@ static inline HVX_Vector butterfly(HVX_Vector v, HVX_Vector lane,
   return Q6_Vsf_vadd_VsfVsf(Q6_V_vxor_VV(v, sign), other);
 }
 
+/** Keep eight butterfly vectors in registers. The low five stages are
+ * lane shuffles, then three register stages; a second pass joins the eight
+ * 256-wide blocks. Each output keeps exactly the scalar butterfly order. */
+static void hadamard_2048_hvx(float *x) {
+  static const int32_t lanes[32] __attribute__((aligned(128))) = {
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+  const HVX_Vector lane = *(const HVX_Vector *)lanes;
+  for (uint32_t base = 0; base < 2048u; base += 256u) {
+    HVX_Vector v[8];
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 8u; ++i) {
+      HVX_Vector a = *(const HVX_Vector *)(x + base + i * 32u);
+      a = butterfly(a, lane, 1u);
+      a = butterfly(a, lane, 2u);
+      a = butterfly(a, lane, 4u);
+      a = butterfly(a, lane, 8u);
+      v[i] = butterfly(a, lane, 16u);
+    }
+#pragma clang loop unroll(full)
+    for (uint32_t step = 1u; step < 8u; step *= 2u)
+#pragma clang loop unroll(full)
+      for (uint32_t i = 0; i < 8u; ++i)
+        if (!(i & step)) {
+          const HVX_Vector a = v[i], b = v[i + step];
+          v[i] = Q6_Vsf_vadd_VsfVsf(a, b);
+          v[i + step] = Q6_Vsf_vsub_VsfVsf(a, b);
+        }
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 8u; ++i)
+      *(HVX_Vector *)(x + base + i * 32u) = v[i];
+  }
+  const HVX_Vector scale = hvx_splat_sf(0.022097086533904076f);
+  for (uint32_t k = 0; k < 256u; k += 32u) {
+    HVX_Vector v[8];
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 8u; ++i)
+      v[i] = *(const HVX_Vector *)(x + i * 256u + k);
+#pragma clang loop unroll(full)
+    for (uint32_t step = 1u; step < 8u; step *= 2u)
+#pragma clang loop unroll(full)
+      for (uint32_t i = 0; i < 8u; ++i)
+        if (!(i & step)) {
+          const HVX_Vector a = v[i], b = v[i + step];
+          v[i] = Q6_Vsf_vadd_VsfVsf(a, b);
+          v[i + step] = Q6_Vsf_vsub_VsfVsf(a, b);
+        }
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 8u; ++i)
+      *(HVX_Vector *)(x + i * 256u + k) = Q6_Vsf_vmpy_VsfVsf(v[i], scale);
+  }
+}
+
 static inline __attribute__((always_inline)) void
 hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
   static const int32_t lanes[32] __attribute__((aligned(128))) = {
@@ -210,22 +263,26 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
     return;
   }
   if (n == 1536u) {
-    // Each lane owns one column of H128. Preserve H12's input order and
-    // transpose convention, and read all inputs before overwriting x.
+    /** Twelve independent accumulators hide the add latency without
+     * changing the order within any H12 dot. Reading one input at a time
+     * also avoids materializing twelve vector inputs on the worker stack. */
     const HVX_Vector sign_bit = Q6_V_vsplat_R((int)0x80000000u);
     for (uint32_t k = 0; k < 128u; k += 32u) {
-      HVX_Vector in[12];
-      for (uint32_t i = 0; i < 12u; ++i)
-        in[i] = *(const HVX_Vector *)(x + i * 128u + k);
-      for (uint32_t j = 0; j < 12u; ++j) {
-        HVX_Vector sum = Q6_V_vzero();
-        for (uint32_t i = 0; i < 12u; ++i) {
-          const HVX_Vector term =
-            lfm_h12[i][j] < 0 ? Q6_V_vxor_VV(in[i], sign_bit) : in[i];
-          sum = Q6_Vsf_vadd_VsfVsf(sum, term);
-        }
-        *(HVX_Vector *)(x + j * 128u + k) = Q6_Vsf_vmpy_VsfVsf(sum, scale);
+      HVX_Vector sums[12];
+#pragma clang loop unroll(full)
+      for (uint32_t j = 0; j < 12u; ++j)
+        sums[j] = Q6_V_vzero();
+#pragma clang loop unroll(full)
+      for (uint32_t i = 0; i < 12u; ++i) {
+        const HVX_Vector in = *(const HVX_Vector *)(x + i * 128u + k);
+        const HVX_Vector neg = Q6_V_vxor_VV(in, sign_bit);
+#pragma clang loop unroll(full)
+        for (uint32_t j = 0; j < 12u; ++j)
+          sums[j] = Q6_Vsf_vadd_VsfVsf(sums[j], lfm_h12[i][j] < 0 ? neg : in);
       }
+#pragma clang loop unroll(full)
+      for (uint32_t j = 0; j < 12u; ++j)
+        *(HVX_Vector *)(x + j * 128u + k) = Q6_Vsf_vmpy_VsfVsf(sums[j], scale);
     }
     return;
   }
@@ -354,6 +411,8 @@ int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
   if (mode == 2u && n % 32u == 0u && p >= 16u) {
     if ((uintptr_t)x & 127u) {
       hadamard_scalar(x, n, p);
+    } else if (n == 2048u) {
+      hadamard_2048_hvx(x);
     } else if (n == 704u) {
       hadamard_hvx(x, 704u, 16u, 0u);
     } else if (n == 2816u) {
