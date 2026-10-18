@@ -434,6 +434,44 @@ D. 공통(포맷과 무관하나 이번에 드러남)
     가치는 속도가 아니라 양자화 팀의 정확도 제어.
 13. Expert 파일 읽기 1.6–1.7 s/프리필은 호출 밑에 숨음(exposed wait 0) — 손댈 것 없음.
 
+### 7.6 2026-10-18 낮: 데모 시나리오, 간헐 실패, crispy encodings
+
+**데모(`/data/local/tmp/demo/ver1/petcare_gemma4`)**: static(system+tools) KV 저장 → 로드 →
+dynamic prefill → decode 를 `system_prompt.kvcache` 설정으로 구성(`claude_had/cfg/pc_*`,
+greedy, 1024 토큰, `_think`/`_nothink` = chat template의 `<|think|>` 유무 + 빈 thought).
+sub_agent(static 1608 + dynamic 17): 한 번에 prefill 과 분할 실행은 모두 정상 문장이지만
+4번째 토큰부터 갈라지고(원인: int8 attention 스케일이 저장 시점 행으로 잡힘 — 설계상),
+기준 output.txt 와는 둘 다 다르다(thinking off 는 42 토큰에 EOS, 올바른 도구를 고름).
+기준 출력은 다른 엔진(아래 W4/A16 시뮬레이션으로 추정)이라 바이트 일치는 목표가 될 수 없다.
+main_agent(static 23290 + dynamic 6828, max_seq_len 31232)는 아직 안 돌림.
+실행: `sh claude_lfm2kv/run2.sh <bin> <cfg> <tag>` (끝나면 생성 텍스트 출력), `show.sh <tag>`,
+반복은 `loop.sh <bin> <cfg> <n>`.
+
+**간헐 실패 1회**: `pc_sub_agent_full_think` 1024 토큰 실행 중 143 토큰에서
+`token driver: S1 did not rebind a pool load` 후 종료(이후 0x68 = AEE_ECONNRESET 는 뒷정리).
+같은 설정을 bin11 로 5회, 진단 빌드(bin12)로 6회 더 돌려 모두 완주, ids 동일(md5 457eaad7f9).
+그 실행 중 logcat 에 ActivityManager mem-pressure-event 2회. DSP 쪽 FARF 는 없었다.
+커밋 "[HTP] token driver: name the load S1 could not rebind" 이후에는 실패한 load 의
+expert/bits/arena/핸들/rc/슬롯 크기/prefetch 여부가 로그에 남는다. 다음에 나면 그 줄부터.
+확인하고 배제한 가설: DSP 핸들 테이블 포화(4096 중 ~1600), affine 12N 꼬리의 슬롯 침범
+(꼬리는 별도 버퍼, 슬롯에는 8N 만), 메일박스 캐시 일관성(uncached 매핑).
+
+**crispy encodings** (`/data/local/tmp/models/gemma4-26b-a4b-crispy`, AIMET 형식, prefill/generation
+두 파일): activation 은 전부 **16-bit per-tensor asym**(min_max), 8-bit 는 KV cache(past_key/value
+per head, symmetric)뿐 — "a8" 은 KV 를 뜻한다. FC/expert 의 8-bit activation scale 은 없다.
+param: attention q/k/v(head별)·o·dense FFN 4-bit per-channel asym, router 4-bit sym,
+experts 2-bit per-channel sym(128×1408 / 128×2816, 30개 층 전부 → 28/29 도 2-bit).
+prefill 파일에는 layer 29 가 없다(generation 에는 있음, 공통 항목 값 동일). activation
+그래프에 회전 op 가 안 보인다(calibration 이 회전 뒤 입력인지 컨버터 쪽 확인 필요).
+KV 8-bit scale 은 기존 `kv_quant_file` 포맷으로 뽑아 두었다(워크스테이션 scratch
+`crispy/kv_quant.json`); 단 HTP attention(htp_mha_core)은 그 키를 읽지 않고 자체 calibration 을
+하므로 연결 작업이 필요하다(연결하면 분할/한번에 실행 차이도 사라진다).
+→ MoE/FC activation 은 dynamic per-row 유지가 맞다. 재변환 요청 사항은 7.2절 + 28/29 TL2,
+원본 scale 사용, kv_quant.json 동봉.
+
+**한국어**: 긴 요약 프롬프트는 두 팩 모두 정상(새 팩이 오타 조금 더). 짧은 개방형 질문은
+두 팩 모두 60–100 토큰 뒤 반복(TL2 팩 포함) → 런타임이 아니라 모델 한계. 영어는 정상.
+
 ### 7.4 D (static activation scale) — 미착수, 설계 메모
 
 4.4절 그대로. 구현 시 carrier는 `hexkl_moe_scratch`의 per-call 필드(부호 벡터처럼 세션
