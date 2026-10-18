@@ -74,6 +74,16 @@ public:
   using prop_tag = nntrainer::str_prop_tag;
 };
 
+/** @brief Read FP32 inference rows from the weight file instead of retaining
+ *         the whole embedding table. Explicitly enabled by the LFM2 HTP graph.
+ */
+class StreamFp32 final : public nntrainer::Property<bool> {
+public:
+  StreamFp32() { set(false); }
+  static constexpr const char *key = "stream_fp32";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
 } // namespace props
 
 /**
@@ -269,10 +279,13 @@ private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Scale, props::QuantizedLutPath,
              props::OutputQuantScale, props::OutputQuantOffset,
-             props::SidecarExportPath>
+             props::SidecarExportPath, props::StreamFp32>
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+  class Fp32RowCache;
+  /// Bounded, exact rows for the explicitly enabled streaming path only.
+  std::shared_ptr<Fp32RowCache> fp32_row_cache;
   /** CUDA dev-act pinned staging (cudaHostAlloc), PER INSTANCE. This was a
    *  function-scope static, which was safe while only the PLE used this class;
    *  once embedding0 became an EmbeddingLayer too, both layers shared one

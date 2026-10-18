@@ -11,8 +11,10 @@
  */
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
@@ -60,6 +62,166 @@ TEST_F(KVCacheManagerTest, allocate_invalid_params) {
   EXPECT_THROW(m.allocate(0, 1, 128, 4, 8), std::invalid_argument);
   EXPECT_THROW(m.allocate(4, 0, 128, 4, 8), std::invalid_argument);
   EXPECT_THROW(m.allocate(4, 1, 0, 4, 8), std::invalid_argument);
+  m.setActiveLayers({true});
+  EXPECT_THROW(m.allocate(4, 1, 128, 4, 8), std::invalid_argument);
+}
+
+TEST(KVCacheManagerHybrid, inactive_layers_allocate_no_storage) {
+  unsigned allocations = 0, releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setActiveLayers({false, true, false, true});
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        ++allocations;
+        return std::malloc(bytes);
+      },
+      [&](void *p) {
+        ++releases;
+        std::free(p);
+      });
+    m.allocate(4, 1, 64, 2, 8, ml::train::TensorDim::DataType::FP32);
+    ASSERT_EQ(allocations, 4u);
+    EXPECT_EQ(m.getKeyCache(0).height(), 64u);
+    EXPECT_FALSE(m.getKeyCache(0).isAllocated());
+    EXPECT_FALSE(m.getValueCache(2).isAllocated());
+    EXPECT_TRUE(m.getKeyCache(1).isAllocated());
+    EXPECT_TRUE(m.getValueCache(3).isAllocated());
+    EXPECT_THROW(m.getKeyCacheWriteView(0, 0, 1), std::logic_error);
+    EXPECT_THROW(m.getValueCacheReadView(2, 0, 1), std::logic_error);
+    EXPECT_THROW(m.setActiveLayers({}), std::logic_error);
+
+    causallm::KVCacheManager moved;
+    moved = std::move(m);
+    EXPECT_FALSE(moved.isLayerActive(0));
+    EXPECT_TRUE(moved.isLayerActive(3));
+  }
+  EXPECT_EQ(releases, allocations);
+}
+
+TEST(KVCacheManagerHybrid, all_inactive_layers_keep_only_metadata) {
+  unsigned allocations = 0, releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setActiveLayers({true, false});
+    m.setActiveLayers({false, false});
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        ++allocations;
+        return std::malloc(bytes);
+      },
+      [&](void *p) {
+        ++releases;
+        std::free(p);
+      });
+    for (unsigned rows : {16u, 32u}) {
+      ASSERT_NO_THROW(
+        m.allocate(2, 1, rows, 2, 8, ml::train::TensorDim::DataType::FP32));
+      EXPECT_TRUE(m.isAllocated());
+      EXPECT_EQ(m.getNumLayers(), 2u);
+      for (unsigned i = 0; i < 2; ++i) {
+        EXPECT_FALSE(m.isLayerActive(i));
+        EXPECT_EQ(m.getKeyCache(i).height(), rows);
+        EXPECT_EQ(m.getValueCache(i).width(), 16u);
+        EXPECT_FALSE(m.getKeyCache(i).isAllocated());
+        EXPECT_FALSE(m.getValueCache(i).isAllocated());
+      }
+      m.advance(3);
+      m.reset();
+      EXPECT_EQ(m.getPosition(), 0u);
+      EXPECT_EQ(allocations, 0u);
+    }
+    // A new prompt can replace the manager and select a different layout.
+    m = causallm::KVCacheManager{};
+    m.setActiveLayers({});
+    m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+    EXPECT_TRUE(m.isLayerActive(0));
+    EXPECT_TRUE(m.getKeyCache(0).isAllocated());
+  }
+  EXPECT_EQ(allocations, 0u);
+  EXPECT_EQ(releases, 0u);
+}
+
+TEST(KVCacheManagerHybrid, compact_skips_inactive_windows) {
+  causallm::KVCacheManager m;
+  m.setActiveLayers({false, true});
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)}) {
+    auto *bits = cache->getData<uint16_t>();
+    for (unsigned i = 0; i < 8; ++i)
+      bits[i] = static_cast<uint16_t>(100 + i);
+  }
+  EXPECT_TRUE(m.compact(4));
+  EXPECT_EQ(m.getBase(0), 0u);
+  EXPECT_FALSE(m.getKeyCache(0).isAllocated());
+  EXPECT_FALSE(m.getValueCache(0).isAllocated());
+  EXPECT_EQ(m.getBase(1), 2u);
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)})
+    for (unsigned i = 0; i < 4; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 104 + i);
+  EXPECT_FALSE(m.compact(4));
+}
+
+TEST(KVCacheManagerHybrid, dense_files_remain_compatible_in_both_directions) {
+  const std::string path = "/tmp/test_kv_cache_hybrid.bin";
+  using Dtype = ml::train::TensorDim::DataType;
+  std::vector<Dtype> dtypes{Dtype::FP32};
+#ifdef ENABLE_FP16
+  dtypes.push_back(Dtype::FP16);
+#endif
+  for (auto dtype : dtypes) {
+    causallm::KVCacheManager dense, sparse, restored;
+    sparse.setActiveLayers({false, true, false, true});
+    for (auto *m : {&dense, &sparse, &restored})
+      m->allocate(4, 1, 16, 2, 8, dtype);
+    for (unsigned i = 0; i < 4; ++i) {
+      dense.getKeyCache(i).setValue(float(i + 1));
+      dense.getValueCache(i).setValue(float(i + 11));
+    }
+    const size_t bytes =
+      5u * 16u * dense.getKeyCache(0).getDim().getDataTypeSize();
+    dense.save(path, 5);
+    EXPECT_EQ(sparse.load(path, 5), 5u);
+    EXPECT_FALSE(sparse.getKeyCache(0).isAllocated());
+    for (unsigned i : {1u, 3u}) {
+      EXPECT_EQ(std::memcmp(sparse.getKeyCache(i).getData<char>(),
+                            dense.getKeyCache(i).getData<char>(), bytes),
+                0);
+      EXPECT_EQ(std::memcmp(sparse.getValueCache(i).getData<char>(),
+                            dense.getValueCache(i).getData<char>(), bytes),
+                0);
+    }
+    sparse.save(path, 5);
+    EXPECT_EQ(restored.load(path, 5), 5u);
+    const std::vector<char> zeros(bytes, 0);
+    for (unsigned i = 0; i < 4; ++i) {
+      EXPECT_EQ(
+        std::memcmp(restored.getKeyCache(i).getData<char>(),
+                    i % 2 ? dense.getKeyCache(i).getData<char>() : zeros.data(),
+                    bytes),
+        0);
+      EXPECT_EQ(std::memcmp(restored.getValueCache(i).getData<char>(),
+                            i % 2 ? dense.getValueCache(i).getData<char>()
+                                  : zeros.data(),
+                            bytes),
+                0);
+    }
+  }
+  std::remove(path.c_str());
+}
+
+TEST(KVCacheManagerHybrid, aliases_cannot_reference_inactive_layers) {
+  causallm::KVCacheManager m;
+  m.setActiveLayers({false, true});
+  m.setLayerKVSources({-1, 0});
+  EXPECT_THROW(m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32),
+               std::invalid_argument);
 }
 
 TEST_F(KVCacheManagerTest, cache_tensor_dimensions) {

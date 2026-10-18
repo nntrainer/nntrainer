@@ -1631,6 +1631,35 @@ public:
         }
     }
     releasePrefillStaging();
+    // The LFM2 memory profile is explicitly opted in and its graph contains
+    // convolution state. Gemma's graph has no CONV1D_GATE and keeps the
+    // existing session scratch policy, including across model reloads.
+    if (weightPageCachePolicy() >= 0 &&
+        !kind_ops_[HTP_OP_CONV1D_GATE].empty()) {
+      // Only the synchronous prefill router RPC borrows these ION copies.
+      // Decode graph parameters own separate DSP storage; another prefill
+      // lazily recreates the staging from its unchanged host gate weight.
+      size_t router_bytes = 0;
+      for (const auto &entry : router_w_)
+        router_bytes += entry.second->size();
+      router_w_.clear();
+      if (router_bytes)
+        std::fprintf(stderr, "[HTP-MEM] released_prefill_router_bytes=%zu\n",
+                     router_bytes);
+      uint64 freed = 0;
+      const int rc = nntr_hvx_release_prefill_scratch(
+        static_cast<remote_handle64>(HtpBackend::global().handle()), &freed);
+      if (rc == AEE_SUCCESS) {
+        if (freed)
+          std::fprintf(stderr,
+                       "[HTP-MEM] released_dsp_prefill_scratch_bytes=%llu\n",
+                       static_cast<unsigned long long>(freed));
+      } else {
+        // An older installed skel can still run the model with its original
+        // scratch lifetime. Reclamation is optional, never a math fallback.
+        ml_logw("HTP DSP prefill scratch release unavailable: 0x%x", rc);
+      }
+    }
   }
 
   bool supports_router_logits_fp32() const override { return true; }

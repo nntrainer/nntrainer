@@ -38,6 +38,7 @@ private:
   bool loading_ = false, prepared_ = false, ran_ = false;
   std::vector<std::vector<float>> params_;
   Tensor attentionBlock(unsigned layer, Tensor input);
+  void configureActiveKVLayers();
   void prepareDecodeGraph();
   void forEachConvBlock(
     const std::function<void(ConvBlockLayer &, nntrainer::RunLayerContext &)>

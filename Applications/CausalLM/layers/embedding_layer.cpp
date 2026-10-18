@@ -94,6 +94,7 @@ void emb_stage_h2d_wait() {
 #include "../third_party/nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -876,12 +877,73 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     });
 }
 
+// Per-layer LRU with a fixed allocation (1 MiB for 128 x 2048 FP32 rows).
+// Only lookup/copy and insertion hold the lock; independent prefill misses
+// continue to use parallel direct I/O. Cached values are unscaled exact rows.
+class EmbeddingLayer::Fp32RowCache {
+public:
+  Fp32RowCache(size_t rows, size_t width) :
+    row_bytes(width * sizeof(float)),
+    keys(std::min<size_t>(rows, 128)),
+    ages(keys.size(), 0),
+    values(keys.size() * width) {}
+
+  int read(int fd, size_t offset, size_t index, float *out) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (fd != source_fd || offset != source_offset) {
+        source_fd = fd;
+        source_offset = offset;
+        std::fill(ages.begin(), ages.end(), 0);
+      }
+      for (size_t slot = 0; slot < keys.size(); ++slot) {
+        if (ages[slot] && keys[slot] == index) {
+          std::memcpy(out, values.data() + slot * row_bytes / sizeof(float),
+                      row_bytes);
+          ages[slot] = ++clock;
+          return 0;
+        }
+      }
+    }
+    const int rc =
+      nntrainer::weightPread(fd, out, row_bytes, offset + index * row_bytes);
+    if (rc != 0 || keys.empty())
+      return rc;
+    std::lock_guard<std::mutex> lock(mutex);
+    // A different source must never receive an in-flight old source's row.
+    if (fd != source_fd || offset != source_offset)
+      return 0;
+    size_t slot = std::min_element(ages.begin(), ages.end()) - ages.begin();
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (ages[i] && keys[i] == index) {
+        slot = i;
+        break;
+      }
+    }
+    std::memcpy(values.data() + slot * row_bytes / sizeof(float), out,
+                row_bytes);
+    keys[slot] = index;
+    ages[slot] = ++clock;
+    return 0;
+  }
+
+private:
+  const size_t row_bytes;
+  std::vector<size_t> keys;
+  std::vector<uint64_t> ages;
+  std::vector<float> values;
+  std::mutex mutex;
+  uint64_t clock = 0;
+  int source_fd = -1;
+  size_t source_offset = 0;
+};
+
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
                   nntrainer::props::Scale(), props::QuantizedLutPath(),
                   props::OutputQuantScale(), props::OutputQuantOffset(),
-                  props::SidecarExportPath()),
+                  props::SidecarExportPath(), props::StreamFp32()),
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -895,6 +957,18 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   // wiring.]
   auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
   const bool has_quantized_lut = !quantized_lut_path.empty();
+  const bool stream_fp32 = std::get<props::StreamFp32>(embedding_props).get();
+  NNTR_THROW_IF(
+    stream_fp32 &&
+      (has_quantized_lut ||
+       context.getExecutionMode() != ml::train::ExecutionMode::INFERENCE ||
+       context.getWeightDataType() != nntrainer::TensorDim::DataType::FP32 ||
+       context.getActivationDataType() !=
+         nntrainer::TensorDim::DataType::FP32 ||
+       nntrainer::weightPageCachePolicy() != 0),
+    std::invalid_argument)
+    << "stream_fp32 requires FP32 inference without a sidecar and "
+       "NNTR_HTP_PAGE_CACHE=0";
   context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
 
   const nntrainer::TensorDim &input_dim =
@@ -920,6 +994,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   size_t out_dim =
     static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
 
+  fp32_row_cache =
+    stream_fp32 ? std::make_shared<Fp32RowCache>(in_dim, out_dim) : nullptr;
   quant_lut.reset();
   if (has_quantized_lut) {
     quant_lut =
@@ -1006,7 +1082,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
     weight_decay, "Embedding", true,
     context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE &&
       nntrainer::weightPageCachePolicy() >= 0 &&
-      context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0);
+      (context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
+       stream_fp32));
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -1446,6 +1523,19 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const size_t total = static_cast<size_t>(iter);
     const size_t max_workers = std::max<size_t>(1, tm.getComputeThreadCount());
     const size_t njobs = std::min(total, max_workers);
+    const bool stream_fp32 = fp32_row_cache && !ggml_lut &&
+                             wt == nntrainer::TensorDim::DataType::FP32 &&
+                             weight_p->isVirtual();
+    // ThreadManager callbacks cannot propagate exceptions. Validate streaming
+    // IDs here and report direct-I/O errors only after every worker joins.
+    if (stream_fp32) {
+      for (size_t i = 0; i < total; ++i) {
+        NNTR_THROW_IF(!(in_data[i] >= 0 && in_data[i] < in_dim),
+                      std::invalid_argument)
+          << "input word index is greater than in_dim";
+      }
+    }
+    std::atomic<int> stream_error{0};
     tm.parallel_for(0, njobs, [&](size_t t) {
       // Chunked over tokens (prefill: total == prompt length) so each worker
       // reuses ONE fp32 scratch for its whole chunk instead of paying a heap
@@ -1529,6 +1619,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
               o[k] = tmp[k] * scale;
           }
+        } else if (stream_fp32) {
+          const int rc =
+            fp32_row_cache->read(weight_p->getFd(), weight_p->getFileOffset(),
+                                 embed_idx, out_tensor.getData<float>());
+          if (rc != 0) {
+            stream_error.store(rc, std::memory_order_relaxed);
+            continue;
+          }
+          if (scale != 1.0f)
+            out_tensor.multiply_i(scale);
         } else if (wt == nntrainer::TensorDim::DataType::FP32 &&
                    out_tensor.getDataType() ==
                      nntrainer::TensorDim::DataType::FP16) {
@@ -1559,6 +1659,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         }
       }
     });
+    const int stream_rc = stream_error.load(std::memory_order_relaxed);
+    NNTR_THROW_IF(stream_rc != 0, std::runtime_error)
+      << "FP32 embedding row read failed: " << std::strerror(stream_rc);
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // Push the host-dequantized rows into the device-only output on the
@@ -1654,6 +1757,28 @@ void EmbeddingLayer::save(std::ofstream &file,
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {
       auto &weight = run_context.getWeight(i);
+      if (weight.isVirtual() &&
+          std::get<props::StreamFp32>(embedding_props).get()) {
+        NNTR_THROW_IF(dtype != nntrainer::TensorDim::DataType::NONE &&
+                        dtype != nntrainer::TensorDim::DataType::FP32,
+                      std::invalid_argument)
+          << "Streamed FP32 embedding export does not support quantization";
+        // A virtual table has no data pointer. Copy its exact payload with
+        // bounded staging, independently of the small inference row cache.
+        const size_t bytes = weight.bytes();
+        std::vector<char> buffer(std::min<size_t>(bytes, 64u << 10));
+        for (size_t offset = 0; offset < bytes; offset += buffer.size()) {
+          const size_t count = std::min(buffer.size(), bytes - offset);
+          const int rc =
+            nntrainer::weightPread(weight.getFd(), buffer.data(), count,
+                                   weight.getFileOffset() + offset);
+          NNTR_THROW_IF(rc != 0, std::runtime_error)
+            << "FP32 embedding export read failed: " << std::strerror(rc);
+          nntrainer::checkedWrite(out, buffer.data(), count,
+                                  "FP32 embedding export write failed");
+        }
+        continue;
+      }
       if (dtype == nntrainer::TensorDim::DataType::NONE ||
           weight.getDataType() == dtype)
         weight.save(out);
