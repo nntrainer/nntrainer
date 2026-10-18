@@ -264,17 +264,22 @@ void resetLfm2HtpExpertPool() {
 
 static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
                                     unsigned int layers,
-                                    unsigned int experts_per_layer,
-                                    unsigned int resident_layers) {
+                                    unsigned int experts_per_layer) {
   // Only fresh C16 native TL2 pools may start before the first MoE call.
   // A later pass keeps the existing layer-zero lifecycle unchanged.
   if (!ops || ops != g_expert_owner || g_prefetch_early_owner ||
       g_prefetch_next != 0 || !g_prefetch_batches.empty() ||
       !g_prefetch_inflight.empty() || !g_handed_expert_layers.empty() ||
       g_expert_layers.size() != layers ||
-      g_expert_lru.capacity() != layers * 16u ||
-      g_expert_lru.size() != resident_layers * experts_per_layer ||
+      g_expert_lru.capacity() != layers * 16u || !experts_per_layer ||
+      g_expert_lru.size() % experts_per_layer != 0u ||
       expertPrefetchDepth() == 0)
+    return 0;
+
+  // The startup preload may occupy any complete layer prefix within C16.
+  // Verify the actual keys below before using that prefix as the read frontier.
+  const size_t resident_layers = g_expert_lru.size() / experts_per_layer;
+  if (resident_layers >= layers)
     return 0;
 
   std::vector<causallm::ExpertLru::Key> pinned;
@@ -297,8 +302,8 @@ static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
        g_prefetch_next <= last; ++g_prefetch_next) {
     const auto &want = g_expert_layers[g_prefetch_next];
     // Full batches preserve the ordinary first layer's registration groups
-    // and LRFU acquire order: LFM C608 starts 7*64, preserving all 128
-    // preloaded experts and the later partial batch.
+    // and LRFU acquire order, retaining the preloaded prefix and leaving
+    // the later partial batch to the normal layer-time refill.
     if (want.size() > g_expert_lru.room(pinned) ||
         !g_expert_lru.makeRoom(want.size(), pinned, [](const void *) {
           throw std::logic_error("early prefill evicted a preloaded expert");
@@ -328,7 +333,7 @@ static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
 }
 
 size_t beginLfm2HtpExpertPrefill(nntrainer::ComputeOps *ops) {
-  return beginHtpExpertPrefill(ops, 38, 64, 2);
+  return beginHtpExpertPrefill(ops, 38, 64);
 }
 
 void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops) {
@@ -767,6 +772,30 @@ static void loadVirtualExpert(nntrainer::ComputeOps *ops,
   }
 }
 
+/** Publish startup residency only after every batch member is registered.
+ * A failed read may leave a backend subset registered; retry is idempotent and
+ * the LRU never advertises the unregistered remainder as cache hits.
+ */
+static void preloadNativeExpertBatch(nntrainer::ComputeOps *ops,
+                                     const std::vector<ExpertFileDesc> &descs) {
+  std::vector<ExpertFileDesc> missing;
+  std::vector<causallm::ExpertLru::Key> need;
+  for (const auto &d : descs) {
+    need.push_back(d.key_gu);
+    if (!g_expert_lru.resident(d.key_gu))
+      missing.push_back(d);
+  }
+  if (!missing.empty() &&
+      !ops->register_qs4cx_wh_expert_files(missing, /*at_load=*/true))
+    throw std::runtime_error("accelerator cannot preload native TL2 experts");
+  if (!need.empty())
+    g_expert_lru.acquire(
+      need, [](causallm::ExpertLru::Key) {},
+      [](causallm::ExpertLru::Key) {
+        throw std::logic_error("native preload exceeded expert capacity");
+      });
+}
+
 bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
   if (!experts_virtual)
     return true;
@@ -824,15 +853,26 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
     expert_of[descs[e].key_gu] = e;
   }
   if (!need.empty()) {
-    g_expert_lru.acquire(
-      need,
-      [&](causallm::ExpertLru::Key k) {
-        loadVirtualExpert(ops, descs[expert_of[k]], /*at_load=*/true);
-      },
-      [](causallm::ExpertLru::Key) {
-        throw std::logic_error("preloadExperts evicted an expert: the pool "
-                               "filled past its capacity");
-      });
+    const bool batch_native = descs.front().K == 2048u &&
+                              descs.front().inter == 1536u &&
+                              descs.front().N_out == 2048u &&
+                              descs.front().w_bits == HTP_TL2_WEIGHT_BITS;
+    if (batch_native) {
+      std::vector<ExpertFileDesc> preload_batch;
+      for (auto key : need)
+        preload_batch.push_back(descs[expert_of[key]]);
+      preloadNativeExpertBatch(ops, preload_batch);
+    } else {
+      g_expert_lru.acquire(
+        need,
+        [&](causallm::ExpertLru::Key k) {
+          loadVirtualExpert(ops, descs[expert_of[k]], /*at_load=*/true);
+        },
+        [](causallm::ExpertLru::Key) {
+          throw std::logic_error("preloadExperts evicted an expert: the pool "
+                                 "filled past its capacity");
+        });
+    }
   }
   return need.size() == num_experts;
 }

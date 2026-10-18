@@ -4888,8 +4888,8 @@ public:
 
   /** [doc 52 section 10.23] One call's misses: each read in turn, then all
    *  registered in one round trip instead of one each. */
-  bool register_qs4cx_wh_expert_files(
-    const std::vector<ExpertFileDesc> &ds) override {
+  bool register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds,
+                                      bool at_load = false) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     std::lock_guard<std::mutex> lock(handle_mutex_);
@@ -4900,8 +4900,18 @@ public:
         if (experts_.count(d.key_gu) != 0)
           continue;
         sts.push_back(stageExpert(session, d));
-        sts.back().rc = readExpert(sts.back(), /*use_pool=*/true);
       }
+      const bool paired_preload =
+        at_load &&
+        std::all_of(sts.begin(), sts.end(), [](const StagedExpert &st) {
+          return st.d.K == 2048u && st.d.inter == 1536u &&
+                 st.d.N_out == 2048u && canReadExpertTogether(st.d);
+        });
+      if (paired_preload)
+        readMisses(sts);
+      else
+        for (StagedExpert &st : sts)
+          st.rc = readExpert(st, /*use_pool=*/true);
     } catch (...) {
       for (const StagedExpert &st : sts)
         free_expert_slots_.push_back(st.slot);
@@ -4910,9 +4920,13 @@ public:
     const uint64_t t_read = HtpProfile::nowUs();
     registerStagedBatch(session, sts); // files what it can, then throws
     HtpProfile &profile = HtpProfile::global();
-    if (profile.level() != 0 && !sts.empty())
-      profile.addExpertLoad(t_read - t0, HtpProfile::nowUs() - t_read,
-                            sts.size());
+    if (profile.level() != 0 && !sts.empty()) {
+      const uint64_t t_rpc = HtpProfile::nowUs();
+      if (at_load)
+        profile.addRegister(t_rpc - t0, t_read - t0, t_rpc - t_read, true);
+      else
+        profile.addExpertLoad(t_read - t0, t_rpc - t_read, sts.size());
+    }
     return true;
   }
 
