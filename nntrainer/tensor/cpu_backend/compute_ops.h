@@ -956,12 +956,13 @@ public:
     return false;
   }
 
-  // The same for several experts, none at load (doc 52 section 10.23): a
-  // backend with a batched register makes one round trip for all of them.
+  // The same for several experts: a backend with a batched register makes
+  // one round trip for all of them. at_load preserves registration accounting.
   virtual bool
-  register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds) {
+  register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds,
+                                 bool at_load = false) {
     for (const ExpertFileDesc &d : ds)
-      if (!register_qs4cx_wh_expert_file(d, /*at_load=*/false))
+      if (!register_qs4cx_wh_expert_file(d, at_load))
         return false;
     return true;
   }

@@ -50,6 +50,7 @@ def function(text, start):
 helper_start = source_text.index('static causallm::ExpertLru g_expert_lru;')
 helper_end = source_text.index('/**\n * @brief NNTR_MOE_TRACE')
 helper = source_text[helper_start:helper_end]
+helper += "\n" + function(source_text, "static void preloadNativeExpertBatch(")
 first_start = source_text.index('    auto take_batch = [&] {')
 first_end = source_text.index('\n    stage(active);', first_start)
 collect = source_text[first_start:first_end]
@@ -77,6 +78,7 @@ header = r'''
 #include <expert_lru.h>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -91,8 +93,11 @@ public:
   struct ExpertFileDesc {
     const void *key_gu;
     unsigned w_bits, K, inter, N_out;
+    bool affine = false;
   };
   virtual ~ComputeOps() = default;
+  virtual bool register_qs4cx_wh_expert_files(
+    const std::vector<ExpertFileDesc> &, bool) = 0;
   virtual bool
   prefetch_qs4cx_wh_experts_begin(const std::vector<ExpertFileDesc> &) = 0;
   virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() = 0;
@@ -118,10 +123,27 @@ std::vector<int> ids(const std::vector<const void *> &p) {
 struct Fake : nntrainer::ComputeOps {
   int layer = -1, demand_reads = 0, end_calls = 0, fail_begin = -1;
   bool refuse = false, workers_stopped = false, old_pass = false;
+  int fail_preload = -1, preload_calls = 0;
+  bool throw_preload = false;
   std::deque<std::vector<const void *>> batches;
   std::vector<std::vector<int>> reads, registrations;
   std::vector<int> evictions;
   std::set<const void *> resident;
+  bool register_qs4cx_wh_expert_files(
+    const std::vector<ExpertFileDesc> &ds, bool at_load) override {
+    assert(at_load);
+    ++preload_calls;
+    int loaded = 0;
+    for (const auto &d : ds) {
+      if (resident.count(d.key_gu)) continue;
+      if (loaded++ == fail_preload) {
+        if (throw_preload) throw std::runtime_error("injected preload failure");
+        return false;
+      }
+      resident.insert(d.key_gu);
+    }
+    return true;
+  }
   bool prefetch_qs4cx_wh_experts_begin(
     const std::vector<ExpertFileDesc> &ds) override {
     if (int(reads.size()) == fail_begin) {
@@ -170,6 +192,7 @@ void seed(Fake &ops, size_t preload = 128, size_t capacity_per_layer = 16) {
       ds.push_back({&identities[l * EXPERTS + e], HTP_TL2_WEIGHT_BITS, HIDDEN,
                     INTERMEDIATE, HIDDEN});
     g_expert_layers.push_back(ds);
+    g_expert_class_cap[expertSlotClass(ds.front())] += capacity_per_layer;
   }
   for (int l = 0; l < LAYERS && preload; ++l) {
     std::vector<const void *> keys;
@@ -302,17 +325,18 @@ struct Result {
     future_order;
   int misses;
 };
-Result run(bool early) {
+Result run(bool early, unsigned preload = 128) {
   Fake ops;
-  seed(ops);
+  seed(ops, preload);
+  const unsigned expected = (CAPACITY - preload) / EXPERTS * EXPERTS;
   if (early) {
-    assert(BEGIN(&ops) == EARLY_READS);
-    assert(g_expert_lru.size() == 128 && g_expert_lru.capacity() == CAPACITY);
-    assert(ops.evictions.empty() && ops.reads.size() == EARLY_BATCHES &&
+    assert(BEGIN(&ops) == expected);
+    assert(g_expert_lru.size() == preload && g_expert_lru.capacity() == CAPACITY);
+    assert(ops.evictions.empty() && ops.reads.size() == expected / EXPERTS &&
            ops.registrations.empty());
     const auto before = g_expert_lru.order();
     assert(BEGIN(&ops) == 0);
-    assert(g_expert_lru.order() == before && ops.reads.size() == EARLY_BATCHES);
+    assert(g_expert_lru.order() == before && ops.reads.size() == expected / EXPERTS);
   }
   for (int l = 0; l < LAYERS; ++l) {
     forwardLayer(ops, l, active[l], recency[l]);
@@ -362,7 +386,7 @@ void checkGuards() {
   }
   {
     Fake a;
-    seed(a, 64);
+    seed(a, 65);
     assert(BEGIN(&a) == 0);
   }
   {
@@ -493,6 +517,30 @@ void checkGuards() {
     resetLfm2HtpExpertPool();
   }
 }
+void checkPreloadFailure() {
+  for (int count : {0, 5, 63})
+    for (bool throws : {false, true}) {
+      Fake ops;
+      seed(ops);
+      const auto batch = g_expert_layers[2];
+      ops.fail_preload = count;
+      ops.throw_preload = throws;
+      bool caught = false;
+      try { preloadNativeExpertBatch(&ops, batch); }
+      catch (const std::runtime_error &) { caught = true; }
+      assert(caught && g_expert_lru.size() == 128);
+      for (const auto &d : batch) assert(!g_expert_lru.resident(d.key_gu));
+      assert(ops.resident.size() == size_t(128 + count));
+      ops.fail_preload = -1;
+      preloadNativeExpertBatch(&ops, batch);
+      assert(g_expert_lru.size() == 192 && ops.resident.size() == 192);
+      for (const auto &d : batch) assert(g_expert_lru.resident(d.key_gu));
+      const int calls = ops.preload_calls;
+      preloadNativeExpertBatch(&ops, batch);
+      preloadNativeExpertBatch(&ops, {});
+      assert(ops.preload_calls == calls && g_expert_lru.size() == 192);
+    }
+}
 void checkModelHook() {
   {
     Fake a;
@@ -555,8 +603,22 @@ int main(int argc, char **argv) {
   for (const auto &batch : early.reads)
     count += batch.size();
   assert(count == LAYERS * EXPERTS - 128);
+  for (unsigned preload : {64u, 256u, 384u, 512u, 576u}) {
+    const auto regular = run(false, preload), kickoff = run(true, preload);
+    assert(regular.reads == kickoff.reads &&
+           regular.registrations == kickoff.registrations &&
+           regular.evictions == kickoff.evictions &&
+           regular.final_order == kickoff.final_order &&
+           regular.future_misses == kickoff.future_misses &&
+           regular.future_evictions == kickoff.future_evictions &&
+           regular.future_order == kickoff.future_order);
+    size_t reads = 0;
+    for (const auto &batch : kickoff.reads) reads += batch.size();
+    assert(reads == LAYERS * EXPERTS - preload);
+  }
   checkGuards();
   checkModelHook();
+  checkPreloadFailure();
   std::cout << "PASS: actual " << LAYERS << "-layer route, " << count
             << " identical reads, " << baseline.registrations.size()
             << " identical registration groups, " << baseline.evictions.size()
@@ -565,8 +627,8 @@ int main(int argc, char **argv) {
             << future_routes.size() << " future probes with "
             << baseline.future_misses.size() << " identical misses/evictions; C"
             << CAPACITY
-            << "/PRELOAD128, owner, old-pass, fallback, queue failure and "
-               "teardown guards\n";
+            << "/PRELOAD64..576, owner, old-pass, fallback, queue failure and "
+               "teardown guards; six partial startup failures and retries\n";
 }
 '''
 
