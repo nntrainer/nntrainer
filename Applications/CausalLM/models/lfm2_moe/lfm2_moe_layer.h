@@ -150,6 +150,7 @@ public:
   static constexpr const char *type = "lfm2_moe"; /**< type of the layer */
 
 private:
+  bool router_q4_ = false;
   unsigned int num_experts;      /**< number of experts */
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */

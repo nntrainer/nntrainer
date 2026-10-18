@@ -213,7 +213,7 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     up_w.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
   const bool scaled = wh || up_w.getDataType() == qs4cx;
   const auto wtype = up_w.getDataType();
-  auto *ops = in_step.getOps();
+  auto *ops = context.getComputeOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
   // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
   if (ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&

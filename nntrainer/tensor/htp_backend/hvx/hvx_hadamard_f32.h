@@ -10,7 +10,8 @@
 
 #include <stdint.h>
 
-/** Supports powers of two and 44 times a power of two, up to 8192.
+/** Supports powers of two, 44 times a power of two (up to 8192),
+ * and LFM2 SR15's 1536-wide dephased H12 x H128 transform.
  * The latter uses the Paley H44, with first row [1, -1, ...], matching
  * SpinQuant's get_had44 / matmul_hadU convention. No zero padding and no
  * block-diagonal approximation: every output depends on the entire row.

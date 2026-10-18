@@ -774,7 +774,10 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
                                input.getDataType() ==
                                  Tdatatype::QS4CX_WH_AFFINE))
       throw std::invalid_argument(
-        "QS4CX_WH dot requires the HTP FC kernel with no transpose or beta");
+        "QS4CX_WH dot requires the HTP FC kernel with no transpose or beta: " +
+        getName() + " x " + input.getName() + " shape=" +
+        std::to_string(input.height()) + "x" + std::to_string(input.width()) +
+        " accel=" + std::to_string(ops->supports_gemm_qs4cx_accel_fp32()));
     dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
     break;
   }

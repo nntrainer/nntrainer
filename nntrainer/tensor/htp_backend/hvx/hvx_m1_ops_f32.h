@@ -210,6 +210,11 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
  * @param weight  top_k routing weights out, in selection order
  * @param pool    the lanes for the chains (NULL: the caller alone)
  */
+/** Packed affine WH router; logits and sigmoid/top-k remain FP32. */
+void hvx_router_topk_wh(const float *x, const uint8_t *w, const float *bias,
+                        uint32_t K, uint32_t E, uint32_t top_k, float *logits,
+                        uint32_t *sel, float *weight);
+
 void hvx_router_softmax_topk_f32(const float *x, const float *wp,
                                  const float *pes, uint32_t K, uint32_t E,
                                  uint32_t top_k, float *logits, uint32_t *sel,

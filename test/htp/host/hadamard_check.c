@@ -42,13 +42,27 @@ static int coefficient(uint32_t i, uint32_t j, uint32_t p) {
   return sign;
 }
 
+/* Dephased Paley H12 from quadratic residues in F_11. Output column
+ * a receives input row b: the nonsymmetric basis must not be transposed. */
+static int lfm12_coefficient(uint32_t a, uint32_t b) {
+  if (!a || !b)
+    return 1;
+  if (a == b)
+    return -1;
+  const uint32_t d = (a + 11u - b) % 11u;
+  for (uint32_t k = 1; k < 11u; ++k)
+    if (k * k % 11u == d)
+      return -1;
+  return 1;
+}
+
 static void check(uint32_t n, uint32_t pattern) {
   float *storage = malloc((n + 2u) * sizeof(float));
   float *x = storage + 1, *input = malloc(n * sizeof(float));
   double *ref = calloc(n, sizeof(double));
   assert(storage && input && ref);
   storage[0] = storage[n + 1u] = 917.125f;
-  const uint32_t p = (n & (n - 1u)) == 0u ? n : n / 44u;
+  const uint32_t p = n == 1536u ? 128u : ((n & (n - 1u)) == 0u ? n : n / 44u);
   for (uint32_t i = 0; i < n; ++i)
     input[i] = pattern == 0u   ? sinf((float)i * .7123f) + .3f * cosf((float)i)
                : pattern == 1u ? (i == n - 1u ? 1.0f : 0.0f)
@@ -59,7 +73,7 @@ static void check(uint32_t n, uint32_t pattern) {
   int h[44][44];
   for (uint32_t a = 0; a < n / p; ++a)
     for (uint32_t b = 0; b < n / p; ++b)
-      h[a][b] = coefficient(a, b, 1u);
+      h[a][b] = n == 1536u ? lfm12_coefficient(a, b) : coefficient(a, b, 1u);
   const double norm = 1.0 / sqrt((double)n);
   for (uint32_t i = 0; i < n; ++i) {
     double sum = 0;
@@ -155,7 +169,7 @@ int main(void) {
                                 sizeof(thread_params)) == AEE_SUCCESS);
   assert(nntr_hvx_open(nntr_hvx_URI "&_dom=cdsp", &session) == AEE_SUCCESS);
 #endif
-  const uint32_t widths[] = {1, 16, 32, 64, 128, 176, 704, 2816};
+  const uint32_t widths[] = {1, 16, 32, 64, 128, 176, 704, 1536, 2048, 2816};
   for (uint32_t w = 0; w < sizeof(widths) / sizeof(widths[0]); ++w)
     for (uint32_t pattern = 0; pattern < 4; ++pattern)
       check(widths[w], pattern);

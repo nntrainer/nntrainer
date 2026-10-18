@@ -184,16 +184,17 @@ typedef struct hexkl_graph_s {
                             (param[op], max_seq x head_dim) reads that */
   htp_graph_op ops[HTP_GRAPH_MAX_OPS];
   uint64_t op_pcycles[HTP_GRAPH_MAX_OPS]; /**< of the last forward */
-  uint32_t op_qt[HTP_GRAPH_MAX_OPS];   /**< [#267 L0] the same brackets in wall
-                                            QTimer ticks (ns on the host): the
-                                            op's time at whatever clock it ran */
-  float *param[HTP_GRAPH_MAX_OPS];     /**< gamma or conv_w, NULL until bound */
-  float *state[HTP_GRAPH_MAX_OPS];     /**< CONV1D_GATE: 3 x N (rows 0-1 the
-                                            conv state, row 2 scratch) */
-  uint32_t ordinal[HTP_GRAPH_MAX_OPS]; /**< ATTN_M1: the attention-layer
-                                            index the cache is keyed by
-                                            ([plan 201 S4] counted within
-                                            its shape's cache) */
+  uint32_t op_qt[HTP_GRAPH_MAX_OPS]; /**< [#267 L0] the same brackets in wall
+                                          QTimer ticks (ns on the host): the
+                                          op's time at whatever clock it ran */
+  float *param[HTP_GRAPH_MAX_OPS];   /**< gamma or conv_w, NULL until bound */
+  uint8_t router_wh[HTP_GRAPH_MAX_OPS]; /**< param holds affine INT4 WH */
+  float *state[HTP_GRAPH_MAX_OPS];      /**< CONV1D_GATE: 3 x N (rows 0-1 the
+                                             conv state, row 2 scratch) */
+  uint32_t ordinal[HTP_GRAPH_MAX_OPS];  /**< ATTN_M1: the attention-layer
+                                             index the cache is keyed by
+                                             ([plan 201 S4] counted within
+                                             its shape's cache) */
   /** [plan 201 S1] MOE: the op's pool table, h_gu[0..E) then h_dn[0..E)
    *  (HTP_GRAPH_PARAM_EXPERTS; HTP_GRAPH_NO_HANDLE = not resident), NULL
    *  until bound */

@@ -235,19 +235,20 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
     MOE_HTP_LAYERS =
       parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
     MOE_CACHE_EXPERTS = nntr_cfg.value("moe_cache_experts", 0u);
-    // The checkpoint's online rotation (PR 4428: Hadamard before the expert
-    // input quantization, matching the converter's weight rotation), as the
-    // words of NNTR_MOE_HADAMARD / NNTR_MOE_HADAMARD_SCOPE, which win when
-    // set. ponytail: the backend reads the environment once at its first
-    // MoE call, so the pack's choice travels as an environment default.
-    for (const auto &[key, env] :
-         {std::pair{"moe_hadamard", "NNTR_MOE_HADAMARD"},
-          std::pair{"moe_hadamard_scope", "NNTR_MOE_HADAMARD_SCOPE"}})
-      if (nntr_cfg.contains(key))
-        setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
     MOE_HADAMARD_SIGNS_FILE =
       nntr_cfg.value("moe_hadamard_signs", std::string());
   }
+
+  // The checkpoint's online rotation (PR 4428: Hadamard before the expert
+  // input quantization, matching the converter's weight rotation), as the
+  // words of NNTR_MOE_HADAMARD / NNTR_MOE_HADAMARD_SCOPE, which win when
+  // set. ponytail: the backend reads the environment once at its first
+  // MoE call, so the pack's choice travels as an environment default.
+  for (const auto &[key, env] :
+       {std::pair{"moe_hadamard", "NNTR_MOE_HADAMARD"},
+        std::pair{"moe_hadamard_scope", "NNTR_MOE_HADAMARD_SCOPE"}})
+    if (nntr_cfg.contains(key))
+      setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
 
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
   LMHEAD_ENGINE = nntr_cfg.value("lmhead_engine", std::string("cpu"));

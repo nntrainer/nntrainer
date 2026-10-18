@@ -371,7 +371,7 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     Qweight.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
   const bool scaled = wh || Qweight.getDataType() == qs4cx;
   const auto wtype = Qweight.getDataType();
-  auto *ops = input_step.getOps();
+  auto *ops = context.getComputeOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
   // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1). The
   // accelerator's RoPE takes a head dim whose half is a multiple of 32.
