@@ -1465,4 +1465,8 @@ interface nntr_hvx : remote_handle64 {
    // last.
    AEEResult moe_set_hadamard_signs(in sequence<float> s_in,
                                     in sequence<float> s_down);
+   // Release large session temporaries after all prefill/queue work completes.
+   // Retains weights, KV caches, graph, convolution state and decode FC feed.
+   // Later prefill/decode kernels recreate these buffers on demand.
+   AEEResult release_prefill_scratch(rout uint64 bytes);
 };

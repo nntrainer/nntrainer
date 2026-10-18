@@ -20,6 +20,7 @@
 #include <map>
 #include <model.h>
 #include <stdexcept>
+#include <weight_file_reader.h>
 #ifdef ENABLE_HEXKL
 #include <htp_backend.h>
 #include <htp_graph_desc.h>
@@ -144,10 +145,15 @@ Tensor Lfm2HtpMoECausalLM::attentionBlock(unsigned l, Tensor input) {
 
 std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
   Tensor x({1, 1, 1, static_cast<unsigned>(INIT_SEQ_LEN)}, "input0");
-  LayerHandle embedding(
-    createLayer("embedding_layer",
-                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
-                                              EMBEDDING_DTYPE, 1.0f, "")));
+  auto embedding_props = buildEmbeddingLayerProperties("embedding0", NUM_VOCAB,
+                                                       DIM, EMBEDDING_DTYPE, 1.0f, "");
+  // The untied FP32 table is 512 MiB for the 26B pack, but each token needs
+  // only one 8 KiB row. Keep its exact bytes in the file under direct IO.
+  const char *stream_embedding = std::getenv("NNTR_LFM2_STREAM_EMBEDDING");
+  if (EMBEDDING_DTYPE == "FP32" && nntrainer::weightPageCachePolicy() == 0 &&
+      (!stream_embedding || std::strcmp(stream_embedding, "0") != 0))
+    embedding_props.push_back("stream_fp32=true");
+  LayerHandle embedding(createLayer("embedding_layer", embedding_props));
   Tensor h = embedding(x);
   for (unsigned l = 0; l < unsigned(NUM_LAYERS); ++l) {
     const std::string p = "layer" + std::to_string(l);
@@ -216,7 +222,17 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
   return {x, head(norm(h))};
 }
 
+void Lfm2HtpMoECausalLM::configureActiveKVLayers() {
+  if (!kv_cache.isAllocated()) {
+    std::vector<bool> active_layers(layer_types.size());
+    for (size_t i = 0; i < layer_types.size(); ++i)
+      active_layers[i] = layer_types[i] == "full_attention";
+    kv_cache.setActiveLayers(std::move(active_layers));
+  }
+}
+
 void Lfm2HtpMoECausalLM::allocateAndBindKVCache() {
+  configureActiveKVLayers();
   // The generic binder permits conv layers without KV placeholders.
   CausalLM::allocateAndBindKVCache();
 }
@@ -287,6 +303,8 @@ void Lfm2HtpMoECausalLM::load_weight(const std::string &path) {
       throw std::runtime_error("SR15 rotation signs rejected");
   }
 #endif
+  // NNTR_KV_EARLY can allocate on the loading thread before the binder runs.
+  configureActiveKVLayers();
   loading_ = true;
   try {
     CausalLM::load_weight(path);

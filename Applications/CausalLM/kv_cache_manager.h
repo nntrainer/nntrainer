@@ -353,6 +353,25 @@ public:
   }
 
   /**
+   * @brief Allocate storage only for active layers of a hybrid model.
+   *
+   * Call before allocate(). An empty mask keeps the default dense layout.
+   * Inactive layers retain tensor dimensions and cache-file slots, but own
+   * no data. This is separate from KV sharing: they never read another layer.
+   */
+  void setActiveLayers(std::vector<bool> active) {
+    if (isAllocated())
+      throw std::logic_error(
+        "KVCacheManager::setActiveLayers: call before allocate()");
+    active_layers_ = std::move(active);
+  }
+
+  /** @brief Whether this layer participates in attention. */
+  bool isLayerActive(unsigned int layer_idx) const {
+    return active_layers_.empty() || active_layers_.at(layer_idx);
+  }
+
+  /**
    * @brief The layer whose K/V storage layer_idx aliases, or -1 when the layer
    *        owns its own cache.
    * @param[in] layer_idx attention layer index
@@ -461,6 +480,7 @@ private:
   };
 
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
+  std::vector<bool> active_layers_;      /**< empty keeps every layer active */
 
   /**
    * @brief Optional device-accessible memory pool for the KV caches. On the

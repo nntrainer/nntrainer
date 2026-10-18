@@ -12,6 +12,7 @@
 
 #include "kv_cache_manager.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     layer_caches_.clear();
     releaseShared();
     layer_caches_ = std::move(other.layer_caches_);
+    active_layers_ = std::move(other.active_layers_);
     svm_pool_ = std::move(other.svm_pool_);
     cache_pos_ = other.cache_pos_;
     batch_size_ = other.batch_size_;
@@ -132,6 +134,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               const std::vector<unsigned int> &keep) {
   if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
       kv_widths.size() != num_layers ||
+      (!active_layers_.empty() && active_layers_.size() != num_layers) ||
       (!rows.empty() &&
        (rows.size() != num_layers || keep.size() != num_layers))) {
     throw std::invalid_argument(
@@ -183,6 +186,20 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // a source that is not strictly earlier, or whose geometry differs, would
   // produce a cache that reads the wrong plane without ever crashing.
   validateKVSources(num_layers);
+  // An all-convolution model needs only the tensor metadata. In particular,
+  // do not ask a backend MemoryPool to plan or allocate an empty set of slots.
+  if (!active_layers_.empty() &&
+      std::none_of(active_layers_.begin(), active_layers_.end(),
+                   [](bool active) { return active; })) {
+    svm_pool_.reset();
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim(
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+    }
+    return;
+  }
   {
     // [kv-window-ring] one-time diagnostic, printed only when the ring is
     // actually engaged: KV rows allocated vs the full-max_seq baseline.
@@ -286,7 +303,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     // (non-overlapping) region so the total pool is the sum. Size each region
     // per-layer so models with non-uniform KV widths stay correct.
     for (unsigned int i = 0; i < num_layers; ++i) {
-      if (isLayerKVAliased(i))
+      if (!isLayerActive(i) || isLayerKVAliased(i))
         continue;
       // [kv-window-ring] a ring layer only needs its Wcap rows.
       const size_t bytes =
@@ -300,6 +317,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      if (!isLayerActive(i)) {
+        layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+        layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+        continue;
+      }
       // [kv-share] The source is strictly earlier, so its storage is already
       // in place -- one pass suffices, no second fixup loop. The source's
       // plane was zeroed when the source itself was set up, so the sharer must
@@ -356,6 +378,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      if (!isLayerActive(i)) {
+        layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+        layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+        continue;
+      }
       // [kv-share] Same rule as the pool branch above: an aliased layer gets a
       // view, never an allocation. Tensor(dim, /*alloc=*/false) + setData()
       // shares the source's MemoryData shared_ptr, so the host buffer outlives
@@ -398,6 +425,9 @@ void KVCacheManager::validateKVSources(unsigned int num_layers) const {
       throw std::invalid_argument(
         "KVCacheManager::allocate: KV source layer " + std::to_string(src) +
         " for layer " + std::to_string(i) + " must be strictly earlier");
+    if (!isLayerActive(i) || !isLayerActive(static_cast<unsigned int>(src)))
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: inactive layers cannot share KV storage");
 
     // Same physical plane means same physical geometry. KV width is
     // per-layer, so a source/sharer drift (e.g. a narrow layer pointed at a
@@ -545,7 +575,7 @@ void KVCacheManager::reset() {
 bool KVCacheManager::compact(unsigned int pos) {
   bool changed = false;
   for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
-    if (!windowed(l) || isLayerKVAliased(l))
+    if (!isLayerActive(l) || !windowed(l) || isLayerKVAliased(l))
       continue;
     const unsigned int from = liveFrom(l, pos);
     if (from <= bases_[l])
@@ -597,6 +627,8 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: would exceed max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -617,6 +649,8 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
     throw std::out_of_range(
       "KVCacheManager::getValueCacheWriteView: would exceed max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -638,6 +672,8 @@ nntrainer::Tensor KVCacheManager::getKeyCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: read_len exceeds max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -659,6 +695,8 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getValueCacheReadView: read_len exceeds max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -852,6 +890,15 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len,
     // re-derive which row is which. A full layer is unchanged: rowsToPersist ==
     // seq_len.
     save_dim.height(rowsToPersist(li, seq_len));
+    if (!isLayerActive(li)) {
+      // Preserve the dense file layout, including dtype-specific metadata.
+      // This temporary plane exists only during an explicit cache save.
+      nntrainer::Tensor padding(save_dim, true);
+      padding.setZero();
+      padding.save(f);
+      padding.save(f);
+      continue;
+    }
     // [HTP window] a windowed layer's live rows start at liveFrom - base
     size_t save_off = 0;
     if (windowed(li)) {
@@ -1004,6 +1051,13 @@ unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
     auto &lc = layer_caches_[i];
     ml::train::TensorDim load_dim = lc.key_cache.getDim();
     load_dim.height(versioned ? rowsToPersist(i, seq_len) : seq_len);
+    if (!isLayerActive(i)) {
+      // Consume the old dense slot without retaining unused convolution KV.
+      nntrainer::Tensor padding(load_dim, true);
+      padding.read(f);
+      padding.read(f);
+      continue;
+    }
     // [HTP window] the loaded rows land at row 0; the base says which
     // absolute position that is
     if (windowed(i))
