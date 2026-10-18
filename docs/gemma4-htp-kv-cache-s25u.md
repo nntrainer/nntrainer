@@ -3,7 +3,17 @@
 이 문서는 PR #4428 head `6987da2db` 위에서 Gemma4 26B-A4B native TL2 / affine WH
 pack으로 **KV cache dump 저장 → 로드 → 남은 프롬프트 prefill → decode**를 S25
 Ultra(v79)에서 처음 실행한 기록이다. S26 Ultra가 없어서 S25 Ultra에서 했다.
-같은 작업을 S26 Ultra에서 이어 할 때 이 문서부터 읽는다.
+이하의 수치는 당시 S25 Ultra 실행 기록이다.
+
+**2026-10-18 상태:** 현재 native CLI는 KV snapshot과 chunked prefill을
+지원하며, public QuickDotAI API는 snapshot/resume을 노출하지 않는다.
+최신 native TL2/affine 런타임, compact expert 저장, 메모리 회수와 S26 검증
+결과는 [TL2 가이드](gemma4-htp-tl2-guide.md#current-validation-coverage)를 따른다.
+아래의 S25 장문 측정은 최신 코드로 다시 실행한 결과가 아니다. 이후 S26
+snapshot/demo 조사에서는 expert-load rebind 실패가 한 번 발생하고 11회
+반복에서 재현되지 않았으며 원인은 미확정이다. int8 KV scale은 calibration에
+참여한 행에 의존하므로 snapshot/chunked 실행과 단일 prefill의 생성 ID가
+달라질 수 있다. 7절은 이 측정 시점의 후속 과제로 읽는다.
 
 측정은 모두 기기 실측이고, 한 번 또는 두 번 실행한 값이다(번갈아 3회 규칙은
 지키지 않았다). 실행하지 않은 것은 "미실행"으로 적는다.

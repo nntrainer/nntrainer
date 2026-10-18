@@ -3,7 +3,16 @@
 This document explains how the HTP (Hexagon NPU) path of nntrainer is put
 together, so that someone who can build and run it (see the
 [user guide](gemma4-htp-user-guide.md)) can also read, debug and extend it.
-It names files and symbols; `git grep` them for the details.
+It names files and symbols; `git grep` them for the details. The format
+examples below describe the original QS2/Q4 integration; see the
+[TL2 guide](gemma4-htp-tl2-guide.md) for native ternary, affine WH and
+rotation, and the [LFM2 guide](lfm2-htp-user-guide.md) for the hybrid model.
+
+Updated 2026-10-18: native TL2 slots use compact registration/rebinding;
+prefill staging and unused fallback scratch are reclaimed; decode uses a
+dedicated demand-read pool with an optional completion hint. The
+[dated validation record](gemma4-htp-tl2-guide.md#decode-optimization-2026-10-15)
+separates the speed experiment, memory audit and combined-runtime checks.
 
 ## 1. The shape of the system
 
@@ -27,8 +36,10 @@ flowchart LR
 
 Three address spaces matter:
 
-- **Host DDR** holds the model file (mmap), the tokenizer, the CPU half of the
-  language-model head and the staging buffers.
+- **Host DDR** holds the tokenizer, embedding and staging buffers, and the
+  model mapping when mmap loading is selected. Head residency depends on the
+  pack: the native affine WH head is registered on the DSP without a second
+  CPU weight copy.
 - **rpcmem (ION) buffers** are shared between the ARM and the DSP. Weights the
   DSP reads live in an **arena** of such buffers; the expert cache, the KV
   cache and the activations between layers are rpcmem too.
@@ -47,6 +58,8 @@ more `ComputeOps` table (`htp_compute_ops.cpp`) that a layer picks when its
 | `QS4CX` | dense projections (QKV, O, gate / up / down of the dense FFN) | row-major int4 nibbles, one fp32 scale per output column | `nntrainer/tensor/qs4cx_tensor.h` |
 | `QS4CX_WH` | the same values, pre-arranged for the HMX | nibbles in the HMX WH tile order, then the scales, then one fp32 column sum per column | `qs4cx_tensor.h` (`QS4CX_WH_Tensor`), `htp_wh_layout.h` (the tile formula) |
 | `QS2CX_WH` | the 128 routed experts | 2-bit codes in WH tile order, a 4-byte palette of int4 levels, the scales, the column sums | `qs4cx_tensor.h` (`QS2CX_WH_Tensor`), `htp_wh_palette.h` (palette fit), `hvx/hvx_expand_i2i4.c` (expansion on the DSP) |
+| `TL2CX_WH` | native ternary experts | packed ternary codes, FP32 scales and signed-weight column sums; compact arena slots | `htp_tl2_opts.h`, `hvx/hvx_gemv_u8tl2.c` |
+| `QS4CX_WH_AFFINE` | affine projections and untied head; mixed-format experts | WH int4 codes, FP32 scales and code sums, INT32 channel offsets | `hmx/hexkl_wh_affine.h` |
 | `Q4_0` | embedding table and the language-model head | GGML Q4_0 blocks | existing CPU format; the HTP reads it through `htp_q4_0_convert.cpp` |
 | int8 KV | the attention cache | per-dimension fixed scales, int8 keys and values in HMX tiles | `hmx/hexkl_kv_q.c`, `cpu_backend/cpu_kv_q_attention.h` (the CPU mirror) |
 
@@ -134,6 +147,20 @@ Keeping 16 experts per layer resident in the arena (`moe_cache_experts`) and
 predicting the next layer's experts from the router (`htp_router_predict.h`,
 `htp_expert_prefetch.h`) is what the `NNTR_MOE_*` options tune.
 
+Before decode, `ComputeOps::release_prefill_scratch` publishes any held
+outputs and releases backend staging after the relevant work completes.
+QKV and dense-FFN CPU fallback buffers are allocated only if fallback runs.
+The contiguous inference planner can reuse gaps without increasing the
+allocation relative to its old layout. Native TL2 decode consumes dense u8
+activations directly; prefill still expands panels for HMX.
+
+`HtpExpertReadPool` handles small demand-read batches without waking the
+whole compute pool. `HtpTokenPollState` prevents a server from polling the
+same token twice. With `NNTR_MOE_SERVER_DONE=1`, a token-number/complement
+pair in the existing mailbox lets the server park before DSPQ reception.
+The hint does not establish success or replace DSPQ output/status checks;
+stale/torn records are rejected and older skeletons keep the fallback path.
+
 ## 5. The ARM side: `nntrainer/tensor/htp_backend/`
 
 | File | Role |
@@ -144,6 +171,7 @@ predicting the next layer's experts from the router (`htp_router_predict.h`,
 | `htp_graph_desc.h` | the op kinds and the words that describe the resident graph to the DSP |
 | `htp_dspq_wire.h` | the dspqueue message format shared with `nntr_hvx_dspq.c` |
 | `htp_moe_opts.h`, `htp_expert_prefetch.h`, `htp_router_predict.h` | MoE cache sizing, prefetch and prediction |
+| `htp_expert_read_pool.h`, `htp_token_completion.h` | demand-read worker ownership and optional token-completion hint |
 | `htp_prepared_fc.h`, `htp_prepared_qs2.h`, `htp_prepared_tl2.h`, `htp_qs2_lut_layout.h` | how each weight format is laid out in the arena |
 | `nntrainer/htp_context.cpp` | `htp_prepare_runtime` / `htp_release_runtime`, the process-wide handle the C API and the CLI share |
 
@@ -199,13 +227,17 @@ it, and it is not an option any more:
 | `htp_fixed::RELEASE_PREFILL_SCRATCH` | on | the CPU prefill scratch is discarded once the first token is out |
 | `htp_fixed::MOE_POOL_TARGET` | 34 | after the first token the expert pool grows towards 34 experts a layer, as far as the PD's 3840 MiB mapping ceiling (minus a 256 MiB margin) allows; `NNTR_MOE_CACHE_GROW=<n>` names the growth itself, 0 for none |
 
-The C API (`Applications/CausalLM/api/htp_model_runtime.h`) only sets
-`ADSP_LIBRARY_PATH` for the DSP skel. The weight page-cache policy is the
-one runtime option left to the environment:
+The C API (`Applications/CausalLM/api/htp_model_runtime.h`) sets
+`ADSP_LIBRARY_PATH` for the DSP skel. Environment controls still include
+page-cache policy, preload, cache growth and optional completion hints:
 
 | Variable | Effect |
 |---|---|
 | `NNTR_HTP_PAGE_CACHE=0` or `1` | read the weight file through the bounded reader instead of mmap: 0 bypasses the page cache (direct IO), 1 bounds it; unset keeps the mmap loader |
+| `NNTR_MOE_PRELOAD_EXPERTS=128` | default startup preload; distinct from total expert-cache capacity |
+| `NNTR_MOE_CACHE_GROW=0` | keep capacity fixed for the C16 measurement preset |
+| `NNTR_MOE_DEMAND_POOL=0` | disable the dedicated demand-read pool; it is enabled by default |
+| `NNTR_MOE_SERVER_DONE=1` | opt into the mailbox completion hint; default off |
 
 Diagnostics that are safe to set from the outside:
 
