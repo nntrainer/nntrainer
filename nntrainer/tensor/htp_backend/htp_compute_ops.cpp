@@ -8649,6 +8649,7 @@ private:
   struct PredictionRouter {
     unsigned hidden = 0, experts = 0, top = 0;
     const float *weights = nullptr;
+    const void *packed_weights = nullptr;
     const float *gamma = nullptr;
     const float *sigmoid_bias = nullptr;
   };
@@ -8694,20 +8695,24 @@ private:
         throw std::invalid_argument(
           "ARM prefetch prediction requires Gemma or LFM2 routers");
       const float *w = nullptr, *state = nullptr;
+      const void *wh = nullptr;
       for (const auto &p : load_params_)
         if (p.op == router) {
           if (p.which == HTP_GRAPH_PARAM_ROUTER_W)
             w = p.data;
+          if (lfm2 && p.which == HTP_GRAPH_PARAM_ROUTER_WH)
+            wh = p.data;
           if (p.which == HTP_GRAPH_PARAM_ROUTER_BIAS)
             state = p.data;
         }
-      if (!w || !state)
+      if ((!w && !wh) || !state)
         throw std::invalid_argument("Missing ARM prediction router weights");
       auto &r = prediction_routers_[m];
       r.hidden = op->K;
       r.experts = op->n_experts;
       r.top = std::min(op->top_k, prefetchTop());
       r.weights = w;
+      r.packed_weights = wh;
       r.gamma = lfm2 ? nullptr : state;
       r.sigmoid_bias = lfm2 ? state : nullptr;
     }
@@ -8747,6 +8752,14 @@ private:
         const auto &r = prediction_routers_[job.layer];
         const uint64_t token = job.epoch >> 32;
         std::vector<float> corrected(r.hidden);
+        const auto predict = [&](unsigned top) {
+          return r.packed_weights
+                   ? htpPredictExpertsWh(corrected.data(), r.packed_weights,
+                                         r.hidden, r.experts, top,
+                                         r.sigmoid_bias)
+                   : htpPredictExperts(corrected.data(), r.weights, r.hidden,
+                                       r.experts, top, r.sigmoid_bias);
+        };
         residual->observe(job.layer - 1u, token, job.input.data());
         if (trace) {
           std::fprintf(trace.get(), "%llu %zu", (unsigned long long)token,
@@ -8757,9 +8770,7 @@ private:
             if (r.gamma)
               for (unsigned h = 0; h < r.hidden; ++h)
                 corrected[h] *= r.gamma[h];
-            const auto ranked =
-              htpPredictExperts(corrected.data(), r.weights, r.hidden,
-                                r.experts, 8u, r.sigmoid_bias);
+            const auto ranked = predict(8u);
             std::fputs(" |", trace.get());
             for (unsigned e : ranked)
               std::fprintf(trace.get(), " %u", e);
@@ -8771,9 +8782,7 @@ private:
         if (r.gamma)
           for (unsigned h = 0; h < r.hidden; ++h)
             corrected[h] *= r.gamma[h];
-        const auto ids =
-          htpPredictExperts(corrected.data(), r.weights, r.hidden, r.experts,
-                            r.top, r.sigmoid_bias);
+        const auto ids = predict(r.top);
         std::lock_guard<std::mutex> lock(handle_mutex_);
         std::vector<bool> absent;
         for (size_t k = 0; k < ids.size(); ++k) {

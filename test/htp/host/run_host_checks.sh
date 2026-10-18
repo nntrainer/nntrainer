@@ -40,7 +40,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
   "$HERE/tl2_pair_read_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
   "$OUT/tl2_pair_pack.o" -o "$OUT/tl2_pair_read_check"
 "$OUT/tl2_pair_read_check" "$OUT"
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" \
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" -I "$BACKEND/.." \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
