@@ -42,7 +42,7 @@ static int coefficient(uint32_t i, uint32_t j, uint32_t p) {
   return sign;
 }
 
-/* Dephased Paley H12 from quadratic residues in F_11. Output column
+/** Dephased Paley H12 from quadratic residues in F_11. Output column
  * a receives input row b: the nonsymmetric basis must not be transposed. */
 static int lfm12_coefficient(uint32_t a, uint32_t b) {
   if (!a || !b)
@@ -123,7 +123,7 @@ static void check(uint32_t n, uint32_t pattern) {
   free(ref);
 }
 
-/* Distinct adjacent rows catch accidental mixing of the two HVX halves.
+/** Distinct adjacent rows catch accidental mixing of the two HVX halves.
  * Odd sizes exercise the paired path and its single-row remainder. */
 static void check_rows(uint32_t rows) {
   const uint32_t n = 704u, len = rows * n;
@@ -191,7 +191,9 @@ int main(void) {
                                  &sentinel, 1, ticks, 2) != AEE_SUCCESS);
   assert(sentinel == 91.0f);
   /* Batched worker path, compared to the independently verified scalar. */
-  for (uint32_t n = 704; n <= 2816; n *= 4) {
+  const uint32_t batch_widths[] = {704, 1536, 2048, 2816};
+  for (uint32_t wi = 0; wi < 4; ++wi) {
+    const uint32_t n = batch_widths[wi];
     const uint32_t rows = 1024;
     const size_t len = (size_t)n * rows;
     float *in = malloc(len * sizeof(float)), *out = malloc(len * sizeof(float));

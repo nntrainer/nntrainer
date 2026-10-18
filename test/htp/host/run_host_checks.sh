@@ -512,6 +512,12 @@ done
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/router_wh_host_check" \
+  "$HERE/router_wh_host_check.c" "$BACKEND/hvx/hvx_m1_ops_f32.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+"$OUT/router_wh_host_check"
 # Lossless BF16 router storage and the original FP32 fallback: real source
 # on hvx_emu's host lane arithmetic and pthread worker stubs, not Qualcomm
 # libnative or device validation. Compare logits, selected IDs and weights

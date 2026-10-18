@@ -454,26 +454,54 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 
+typedef struct {
+  const float *x, *scale, *bias;
+  const int32_t *offset;
+  const uint8_t *w;
+  uint32_t K, E;
+  float *acc, *sig, *score;
+} router_wh_ctx;
+
+/** @brief Decode eight packed expert columns together, retaining one fused
+ * k-ordered FP32 chain per expert. No unpacked weight copy is retained. */
+static void router_wh_lane(uint32_t n, uint32_t lane, void *v) {
+  const router_wh_ctx *c = (const router_wh_ctx *)v;
+  for (uint32_t e0 = lane * ROUTER_CHAINS; e0 < c->E; e0 += n * ROUTER_CHAINS) {
+    float acc[ROUTER_CHAINS] = {0};
+    for (uint32_t k = 0; k < c->K; ++k) {
+      const uint32_t r = k % 32u;
+      const size_t tile = ((size_t)(k / 32u) * (c->E / 32u) + e0 / 32u) * 512u;
+      const uint8_t *packed =
+        c->w + tile + (r / 8u) * 128u + (e0 % 32u) * 4u + r % 4u;
+      const float x = c->x[k];
+#pragma clang loop unroll(full)
+      for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+        int q = (packed[j * 4u] >> (4u * ((r / 4u) % 2u))) & 15u;
+        q = q >= 8 ? q - 16 : q;
+        acc[j] = Q6_R_sfmpyacc_RR(acc[j], x, (float)(q + c->offset[e0 + j]));
+      }
+    }
+    for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+      const uint32_t e = e0 + j;
+      c->acc[e] = acc[j] * c->scale[e];
+      m1_router_cpu_sigmoid(c->acc[e], c->bias[e], &c->sig[e], &c->score[e]);
+    }
+  }
+}
+
 void hvx_router_topk_wh(const float *x, const uint8_t *w, const float *bias,
                         uint32_t K, uint32_t E, uint32_t top_k, float *logits,
-                        uint32_t *sel, float *weight) {
-  float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
+                        uint32_t *sel, float *weight, hvx_worker_pool *pool) {
+  float acc[M1_DET_ROUTER_MAX_E], sig[M1_DET_ROUTER_MAX_E],
+    score[M1_DET_ROUTER_MAX_E];
+  if (!x || !w || !bias || !logits || !sel || !weight || !K || K % 32u || !E ||
+      E % 32u || E > M1_DET_ROUTER_MAX_E || !top_k || top_k > E)
+    return;
   const float *scale = (const float *)(w + (size_t)K * E / 2u);
   const int32_t *offset = (const int32_t *)(scale + 2u * E);
-  for (uint32_t e = 0; e < E; ++e) {
-    float sum = 0;
-    for (uint32_t k = 0; k < K; ++k) {
-      const uint32_t r = k % 32u, c = e % 32u;
-      const size_t tile = ((size_t)(k / 32u) * (E / 32u) + e / 32u) * 512u;
-      const uint32_t byte = (r / 8u) * 128u + c * 4u + r % 4u;
-      int q = (w[tile + byte] >> (4u * ((r / 4u) % 2u))) & 15u;
-      if (q >= 8)
-        q -= 16;
-      sum += x[k] * (float)(q + offset[e]);
-    }
-    logits[e] = sum * scale[e];
-    m1_router_cpu_sigmoid(logits[e], bias[e], &sig[e], &score[e]);
-  }
+  router_wh_ctx c = {x, scale, bias, offset, w, K, E, acc, sig, score};
+  hvx_worker_pool_run(pool, router_wh_lane, &c, E / ROUTER_CHAINS);
+  memcpy(logits, acc, (size_t)E * sizeof(float));
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 

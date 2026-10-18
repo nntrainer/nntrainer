@@ -106,12 +106,21 @@ struct ComputeOps : ViewBase {
   };
   View mode = Separate;
   bool supported = true, poison_old = true;
+  unsigned output_projections = 0;
   unsigned calls = 0, syncs = 0, views = 0, fail_rpc = 0, fail_sync = 0;
   const float *input_base = nullptr, *truth = nullptr;
   float *gated = nullptr, *output = nullptr, *state = nullptr;
   const float *expected_gated = nullptr, *expected_output = nullptr;
   std::vector<unsigned> row_calls;
   std::vector<std::array<size_t, 4>> requests;
+  void gemm_qs4cx_accel_fp32(const char *w, const float *scales,
+                             const float *in, float *out, unsigned rows,
+                             unsigned n, unsigned k) {
+    check(w && scales && in == output && out == output && rows == 2048 &&
+            n == 2048 && k == 2048,
+          "chunked output projection must use the layer's packed HTP path");
+    ++output_projections;
+  }
   bool supports_gemm_q4_0_batch_norm_fp32() const { return supported; }
   const void *view(const void *host, size_t n) {
     ++views;
@@ -439,6 +448,7 @@ struct Tensor {
   nntrainer::Tdatatype dtype = nntrainer::Tdatatype::FP32;
   bool contiguous = true;
   unsigned dots = 0;
+  void *getData() const { return data; }
   template <typename T> T *getData() const {
     return reinterpret_cast<T *>(data);
   }
@@ -457,6 +467,7 @@ static void appRoute(Tensor &in_step, Tensor &in_w, Tensor &out_w, Tensor &proj,
                      nntrainer::ComputeOps *ops, unsigned rows, unsigned K,
                      unsigned C, unsigned N, unsigned from, bool compare,
                      bool htp_owns_state_, bool &fellthrough) {
+  const auto affine = nntrainer::Tdatatype::QS4CX_WH_AFFINE;
 #include "app_route.inc"
   (void)p;
   (void)row_resident;
@@ -468,6 +479,7 @@ static void app_guards() {
   Fixture f;
   for (unsigned reason = 0; reason < 25; ++reason) {
     f.prepare(0, reason);
+    f.ops.output_projections = 0;
     Tensor in{f.input.data()},
       iw{f.truth.data(), nntrainer::Tdatatype::QS4CX_WH_AFFINE};
     Tensor ow = iw, p{f.proj.data()}, g{f.g.data()}, y{f.out.data()},
@@ -531,7 +543,7 @@ static void app_guards() {
                         compare, owns, fellthrough);
     const bool accepted = reason == 0 || reason == 2;
     check(fellthrough != accepted && f.ops.calls == (accepted ? 2u : 0u) &&
-            y.dots == unsigned(accepted),
+            y.dots == 0 && f.ops.output_projections == unsigned(accepted),
           "actual app guard/fallback path differs");
     if (accepted)
       f.exact();
