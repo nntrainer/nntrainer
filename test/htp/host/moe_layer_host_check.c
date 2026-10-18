@@ -1857,10 +1857,10 @@ int main(void) {
     free(want_g);
   }
 
-  /* Rotation placement, routing reuse, padding, HMX, tails and GEMV.
+  /** Rotation placement, routing reuse, padding, HMX, tails and GEMV.
    * The reference rotates each expert row independently, intentionally
    * unlike the shared pre-gather implementation. */
-  /* Prefetch/DMA scheduling is tested above. Disable its diagnostic hook
+  /** Prefetch/DMA scheduling is tested above. Disable its diagnostic hook
    * while comparing the arithmetic on both weight-feed choices. */
   hvx_scalar_hook.prefetch = NULL;
   hvx_scalar_hook.gemv = NULL;
@@ -1912,7 +1912,7 @@ int main(void) {
       free(rot_got);
       free(rot_want);
     }
-    /* [PR 4428] The checkpoint's signs after the Hadamard: the kernel with
+    /** [PR 4428] The checkpoint's signs after the Hadamard: the kernel with
        hexkl_moe_set_hadamard_signs equals the reference with the same +-1
        per dimension (HVX path, up and down); signs of another width are
        refused. */
@@ -1952,7 +1952,7 @@ int main(void) {
       free(sin);
       free(sdn);
     }
-    /* A shared 4-bit FFN must retain its original output even when its
+    /** A shared 4-bit FFN must retain its original output even when its
        dimensions are unsupported by the requested HMX rotation. */
     float *plain = malloc(sizeof(float) * M * N_out);
     float *scoped = malloc(sizeof(float) * M * N_out);
@@ -1994,7 +1994,7 @@ int main(void) {
     return fail;
   }
 
-  /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
+  /** Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
      the host, against the whole call. Only the fp32 addition order may
      differ, so the error is taken against the output's largest magnitude:
      per element, a sum that cancels to near zero reads 3.5e-5 here. */
@@ -2097,7 +2097,7 @@ int main(void) {
            "mixed=%d\n",
            r4, r2, changed, same, mixed);
     hg2[0] = 4u * NE;
-    /* A cache miss splits one token across several kernel calls. Compare
+    /** A cache miss splits one token across several kernel calls. Compare
        each part with a fresh rotation while unrelated calls reuse the
        ordinary heap scratch. Then change the token at the same address. */
     {

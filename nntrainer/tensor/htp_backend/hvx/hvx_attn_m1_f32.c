@@ -1598,7 +1598,7 @@ pv_group_q8(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->div += (uint32_t)(now - *t);
     *t = now;
   }
-  /* LFM2's 64-wide heads occupy half an int8 vector. Load only that
+  /** LFM2's 64-wide heads occupy half an int8 vector. Load only that
      half, and keep the same fp16 probability/value arithmetic as the
      full-vector path. hd / VLEN is zero for this geometry. */
   if (hd == CH) {

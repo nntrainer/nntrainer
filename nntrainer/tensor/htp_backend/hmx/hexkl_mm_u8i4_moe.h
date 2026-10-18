@@ -120,9 +120,9 @@ typedef struct {
   const float
     *router_act;   /**< Per-call request set only by a validated ticket. */
   int router_used; /**< Diagnostic: this call actually skipped its input DMA. */
-  int out_heap; /**< out_f32 is cached heap the caller owns alone: the HMX
-                     path accumulates straight into it instead of into a
-                     copy it then moves */
+  int out_heap;    /**< out_f32 is cached heap the caller owns alone: the HMX
+                        path accumulates straight into it instead of into a
+                        copy it then moves */
   hexkl_moe_rotated_input *rotated_input; /**< borrowed for this call only;
                                              NULL disables input reuse */
 } hexkl_moe_scratch;
