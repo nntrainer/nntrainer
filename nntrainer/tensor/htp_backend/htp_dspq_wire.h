@@ -179,6 +179,10 @@ typedef struct {
    *  the palettes unused */
   uint32_t bits;
   int8_t pal_gu[4], pal_dn[4];
+  /** S1's rebind result for this load (AEE_SUCCESS, or the code it refused
+   *  with); 0 with @a h_gu NO_HANDLE means an earlier load's failure stopped
+   *  the round before this one was tried. */
+  int32_t rc;
 } htp_miss_load;
 
 /** @brief The owner -> S1: every expert it evicted (MOE op, expert), then

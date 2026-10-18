@@ -302,6 +302,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
     }
     l->h_gu = hg; /* the owner files these */
     l->h_dn = hd;
+    l->rc = rc;
     m->st->misses += rc == AEE_SUCCESS;
   }
   m->st->miss_rebind_us += (tk_qt() - q_seen) * 10u / 192u; /* [#282 C] */
