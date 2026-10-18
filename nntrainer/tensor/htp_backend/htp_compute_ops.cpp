@@ -3924,6 +3924,7 @@ public:
         std::copy(st.gu.pal.begin(), st.gu.pal.end(), l.pal_gu);
         std::copy(st.dn.pal.begin(), st.dn.pal.end(), l.pal_dn);
         l.h_gu = l.h_dn = kNoHandle;
+        l.rc = 0;
       }
     } catch (...) {
       if (!p.err)
