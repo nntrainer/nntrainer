@@ -2,7 +2,7 @@
 
 LFM2 24B A2B runs its hybrid convolution/attention decoder on Hexagon v81
 using the shared Gemma4 HTP backend. This guide covers the current weight
-formats, conversion, execution and validated performance in PR #4428 as of 2026-10-19.
+format, conversion, execution and validated performance in PR #4428 as of 2026-10-19.
 For SDK installation, Android packaging and device staging, follow the
 [Gemma4 user guide](gemma4-htp-user-guide.md); the
 [code guide](gemma4-htp-code-guide.md) explains the shared backend.
@@ -14,31 +14,31 @@ for `lfm2_moe` + `sr15_v2` + `htp_fused`. Explicit environment variables take
 precedence. These are short-run results for one fixed prompt, not sustained
 throughput or a per-run guarantee.
 
-## Supported model packs
+## Supported model pack
 
-Both packs use `lfm2_execution_profile=htp_fused`, batch one, FP32 graph
+LFM2 HTP supports only `lfm2_weight_format=sr15_v2`. The pack uses
+`lfm2_execution_profile=htp_fused`, batch one, FP32 graph
 tensors and HTP engines for attention, projections, dense FFN, MoE and
 the LM head. LFM2 uses sigmoid routing with expert bias, SwiGLU, embedding
 scale 1 and `attention_kv_dtype=q8_row` for unnormalized value projections.
 Gemma4's `q8` cache setting is a different model contract.
 
-| Component | Unrotated `htp_fused_v1` | Rotated `sr15_v2` |
-|---|---|---|
-| Routed experts | `TL2CX_WH` | `TL2CX_WH` |
-| Attention, dense FFN, conv projections and LM head | `QS4CX_WH_AFFINE` | `QS4CX_WH_AFFINE` |
-| Embedding | FP32 | `Q4_0` |
-| Router | FP32 | `QS4CX_WH_AFFINE` |
-| Short-convolution weights | FP32 | `DW3_INT4` on disk, decoded to FP32 at load |
-| Norms and expert bias | FP32 | FP32 |
-| Online expert rotation | Off | Both input and down rotations, with checkpoint basis and signs |
-| Activation quantization | Dynamic | Dynamic |
-| Public QuickDotAI descriptor | `lfm2-24ba2b-htp`, NPU/W4A32 | Not accepted by the current public API guard; use the native CLI |
+| Component | `sr15_v2` |
+|---|---|
+| Routed experts | `TL2CX_WH` |
+| Attention, dense FFN, conv projections and LM head | `QS4CX_WH_AFFINE` |
+| Embedding | `Q4_0` |
+| Router | `QS4CX_WH_AFFINE` |
+| Short-convolution weights | `DW3_INT4` on disk, decoded to FP32 at load |
+| Norms and expert bias | FP32 |
+| Online expert rotation | Both input and down rotations, with checkpoint basis and signs |
+| Activation quantization | Dynamic |
+| Public QuickDotAI descriptor | `lfm2-24ba2b-htp`, NPU/W4A32 |
 
-The model factory accepts both formats. The public QuickDotAI loader
-currently requires `lfm2_weight_format=htp_fused_v1`; changing an SR15
-pack's metadata to bypass that check would misdescribe its binary layout.
-The public unrotated pack directory is
-`<model_base_path>/lfm2-24ba2b-htp-w4a32/`.
+The model factory and public QuickDotAI loader both require SR15. The
+legacy unrotated LFM2 pack is no longer supported; convert the matching
+SR15 checkpoint instead of changing an old pack's metadata. Place the
+public API pack in `<model_base_path>/lfm2-24ba2b-htp-w4a32/`.
 
 The fused profile requires 64-wide attention heads, three-tap bias-free
 short convolutions, untied embeddings, normalized top-k probabilities,
@@ -49,19 +49,10 @@ for the full geometry checks.
 
 ## Convert the weights
 
-Run the converters from the repository root with NumPy and a host C
-compiler installed. They read local checkpoints, verify emitted records,
-and refuse to overwrite an existing output directory. SDK binaries and
+Run the converter from the repository root with NumPy and a host C
+compiler installed. It reads local checkpoints, verifies emitted records,
+and refuses to overwrite an existing output directory. SDK binaries and
 production weights are supplied separately.
-
-For an unrotated BF16-dequantized ternary checkpoint:
-
-```bash
-python3 tools/convert_lfm2_htp.py /path/to/checkpoint \
-  --output /path/to/lfm2-24ba2b-htp-w4a32 \
-  --tokenizer-source /path/to/tokenizer
-python3 test/htp/host/lfm2_conversion_check.py
-```
 
 For the rotated SR15 checkpoint:
 
@@ -80,10 +71,9 @@ directory supplies `tokenizer.json` and `tokenizer_config.json`.
 
 Keep the generated pack together:
 
-- The model binary named by `nntr_config.json` (`LFM2-24B-A2B-Ternary-INT4.bin`
-  for SR15, `nntr_lfm2_tl2_affine.bin` for the unrotated pack).
-- `conversion_report.json`, including tensor offsets, sizes, hashes and,
-  for SR15, rotation records.
+- The model binary named by `nntr_config.json` (`LFM2-24B-A2B-Ternary-INT4.bin`).
+- `conversion_report.json`, including tensor offsets, sizes, hashes and
+  rotation records.
 - `config.json`, `generation_config.json`, `nntr_config.json`, tokenizer
   files and the chat template when supplied.
 - SR15's `activation_scales.bin`, retained as conversion output. The
@@ -132,6 +122,14 @@ different geometry/position is rejected. This native model capability
 does not imply snapshot support through the public QuickDotAI loader.
 Weight reload requires a new model handle.
 
+For QuickDotAI, build with `--htp` and load `lfm2-24ba2b-htp` using
+`CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`. Pass an absolute
+`native_lib_dir` containing the matching v81 DSP library. The public API
+accepts SR15 packs and rejects other LFM2 formats and KV snapshot options.
+Each streaming call starts an independent prompt. See the
+[C API guide](../Applications/CausalLM/api/README.md#lfm2-moe-on-native-htp)
+for the handle lifecycle.
+
 ## Default SR15 CLI preset
 
 `nntr_causallm` applies the preset after reading the model configuration and
@@ -159,7 +157,7 @@ The exact defaults are in
 
 These process-level defaults belong to the single-model CLI. They are not
 installed by the library or QuickDotAI API, and are not selected for
-Gemma4, unrotated LFM2 or other execution profiles. Diagnostic tracing and
+Gemma4 or other execution profiles. Diagnostic tracing and
 profiling are not enabled by the preset.
 
 For example, use the default combined preset, or retain the initial cache:
