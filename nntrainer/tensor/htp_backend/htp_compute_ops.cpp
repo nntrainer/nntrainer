@@ -3586,6 +3586,39 @@ public:
     return seedRows(n_rows, nullptr, nullptr, k_rows, v_rows);
   }
 
+  /** [#4428 window] the dropped rows' |max| ahead of the layer's seed */
+  bool decode_kv_amax_floor(const float *k_amax, const float *v_amax,
+                            unsigned n) override {
+    if (seed_ordinal_ == HTP_GRAPH_NO_OP) {
+      throw std::runtime_error(
+        "decode_kv_amax_floor: no attention hook asked for a seed");
+    }
+    const htp_graph_op *rec = graphOp(attn_op_[seed_ordinal_]);
+    if (n != rec->n_kv * rec->head_dim) {
+      throw std::runtime_error("decode_kv_amax_floor: " + std::to_string(n) +
+                               " values for a layer of " +
+                               std::to_string(rec->n_kv * rec->head_dim));
+    }
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const uint32_t layer =
+      attn_cache_ord_[seed_ordinal_] |
+      (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
+    int err;
+    {
+      std::lock_guard<std::mutex> lock(invoke_mutex_);
+      err = nntr_hvx_attn_m1_kv_amax_floor(session, layer, k_amax,
+                                           static_cast<int>(n), v_amax,
+                                           static_cast<int>(n));
+    }
+    if (err != AEE_SUCCESS) {
+      throw std::runtime_error(
+        "nntr_hvx_attn_m1_kv_amax_floor failed at layer " +
+        std::to_string(seed_ordinal_) + ": " + graphErr(err));
+    }
+    return true;
+  }
+
   bool seedRows(unsigned n_rows, const float *k_rows, const float *v_rows,
                 const uint16_t *k16, const uint16_t *v16) {
     if (seed_ordinal_ == HTP_GRAPH_NO_OP) {

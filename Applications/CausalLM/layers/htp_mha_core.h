@@ -369,6 +369,18 @@ public:
   }
 
   /**
+   * @brief [#4428 window] |max| per column (kv head x head_dim) of the K
+   *        and V rows the host's windowed cache dropped
+   *        (KVCacheManager::compact), folded into the layer's floor by
+   *        elementwise max. The decode seed hands the floor to the
+   *        accelerator so its int8 scales cover the whole context, as the
+   *        full cache's seed sets them; the q2 store keeps it beside the
+   *        calibration, so a saved cache carries it.
+   */
+  WIN_EXPORT void foldDroppedAmax(const std::vector<float> &k_amax,
+                                  const std::vector<float> &v_amax);
+
+  /**
    * @brief Get the current cache index
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
@@ -494,6 +506,8 @@ private:
   inline static std::map<std::string, std::vector<float>> q2_store_;
   inline static bool q2_from_file_ = false;
   std::string q2_name_; /**< this layer's key in q2_store_ */
+  /** [#4428 window] see foldDroppedAmax; empty until a row was dropped */
+  std::vector<float> kv_floor_k_, kv_floor_v_;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
                                    leaves the CPU, for run logs */

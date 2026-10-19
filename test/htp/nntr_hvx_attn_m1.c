@@ -136,6 +136,29 @@ int nntr_hvx_attn_m1_kv_append_f16(remote_handle64 handle, uint32 layer,
   return hvx_attn_m1_kv_append_f16(c, layer, kv_from, n_rows, k_rows, v_rows);
 }
 
+int nntr_hvx_attn_m1_kv_amax_floor(remote_handle64 handle, uint32 layer,
+                                   const float *k_amax, int kLen,
+                                   const float *v_amax, int vLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  hvx_attn_m1_ctx *c =
+    (layer & HTP_ATTN_KV_CACHE_B) != 0u ? s->attn_m1_b : s->attn_m1;
+  layer &= ~HTP_ATTN_KV_CACHE_B;
+  if (!c) {
+    return AEE_EBADSTATE;
+  }
+  const uint64_t want = (uint64_t)c->n_kv * c->head_dim;
+  if (kLen < 0 || vLen < 0 || (uint64_t)kLen != want ||
+      (uint64_t)vLen != want) {
+    FARF(ERROR, "attn_m1_kv_amax_floor: bad shape (k=%d v=%d want=%u)", kLen,
+         vLen, (unsigned)want);
+    return AEE_EINVALIDFORMAT;
+  }
+  return hvx_attn_m1_kv_amax_floor(c, layer, k_amax, v_amax);
+}
+
 int nntr_hvx_attn_m1_seed_kvq(remote_handle64 handle, uint32 layer,
                               uint32 kv_handle, uint32 n_rows,
                               const float *k_rows, int k_rowsLen) {

@@ -155,6 +155,23 @@ public:
   bool compact(unsigned int pos);
 
   /**
+   * @brief [HTP window] |max| per column (the layer's kv width) of every K
+   *        row compact() has dropped from the layer so far, as f32 of the
+   *        fp16 bits; empty while nothing was dropped. The decode seed's
+   *        int8 scales take it (HtpMHACoreLayer::foldDroppedAmax), so a
+   *        windowed cache quantizes as the full one would.
+   */
+  const std::vector<float> &droppedAmaxK(unsigned int layer_idx) const {
+    return layer_idx < dropped_amax_k_.size() ? dropped_amax_k_[layer_idx]
+                                              : no_amax_;
+  }
+  /** @brief droppedAmaxK for the V rows. */
+  const std::vector<float> &droppedAmaxV(unsigned int layer_idx) const {
+    return layer_idx < dropped_amax_v_.size() ? dropped_amax_v_[layer_idx]
+                                              : no_amax_;
+  }
+
+  /**
    * @brief Check if the manager has been allocated
    */
   bool isAllocated() const { return !layer_caches_.empty(); }
@@ -522,6 +539,13 @@ private:
   std::vector<unsigned int> keep_;
   /** [HTP window] per-layer absolute position of row 0 */
   std::vector<unsigned int> bases_;
+  /** [HTP window] per-layer droppedAmaxK / V (empty: nothing dropped) */
+  std::vector<std::vector<float>> dropped_amax_k_, dropped_amax_v_;
+  inline static const std::vector<float> no_amax_{};
+
+  /** @brief compact()'s fold of the layer's first n_rows rows (the ones it
+   *         is about to drop) into dropped_amax_k_ / v_. */
+  void foldDroppedRows(unsigned int l, unsigned int n_rows);
 
   /** @brief Whether the layer compacts a window (allocate()'s rows / keep). */
   bool windowed(unsigned int l) const {

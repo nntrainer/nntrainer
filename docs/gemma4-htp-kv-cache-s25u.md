@@ -203,6 +203,42 @@ S26 Ultra에서는 **실행하지 않았다**. 코드를 읽어 확인한 것:
   프로세스가 바로 끝난다).
 - host 단위 테스트는 추가하지 않았다. 검증은 3절의 기기 실행이다.
 
+### 4.2 windowed cache의 decode 출력 불일치 (2026-10-19, S26 Ultra)
+
+`max_seq_len` > 3072 (sliding 층이 3072행 window cache로 바뀌는 지점)에서만 decode
+토큰이 달라지던 문제(PR #4428 코멘트 10-16, "starts right, then repeats")의 원인과 수정.
+
+- **원인**: decode attention(`attn_m1`)의 int8 cache scale은 층별로 **첫 seed에 들어온
+  행들의 |max|** (kv head × dim마다, `q8_set_scales_rows`)로 한 번 정해진다. full
+  cache는 프롬프트 전체 행을 seed하지만 windowed cache는 compaction 뒤 남은 window
+  (1024행)만 seed하므로 scale이 달라지고, 9번째 토큰부터 갈렸다(p2048, ids md5
+  `dcdc84441c` vs `1dd27d8bf5`; 3328과 4096은 서로 같음 = windowed 쪽은 결정적).
+  prefill·첫 토큰은 같다.
+- **수정**: `KVCacheManager::compact`가 버리는 행들의 열별 |max|를 접어 두고
+  (`droppedAmaxK/V`, fp16 비트로 max → 열마다 한 번 f32), `compactKVCache`가 그 값을
+  `HtpMHACoreLayer::foldDroppedAmax`로 층에 넘긴다. 층은 decode seed 직전에
+  `attn_m1_kv_amax_floor`(새 IDL 메서드)로 DSP에 보내고, DSP는 scale을
+  `max(seed 행 |max|, floor)`로 잡는다. max는 순서와 무관하게 정확하므로 full cache의
+  seed와 **비트 동일**한 scale이 된다. floor는 `.q2` 사이드카에 calibration 뒤에
+  붙어 저장되고(`save_kvcache`가 저장 전 compaction을 한 번 더 해 window 밖 행을
+  접는다), USE 실행이 그대로 이어받는다. full cache(아무 행도 버리지 않음)는 floor가
+  비어 있어 바이트 하나 바뀌지 않는다.
+- **결과** (p2048 요약 프롬프트, C=16, bin = PR head + 수정): `max_seq_len` 2304 /
+  4096 / 30272(C=8, `NNTR_MOE_CACHE_GROW=0`) 모두 ids md5 `dcdc84441c`. 30272의
+  prefill 622 TPS, decode 9.3 TPS(C=8), peak 5.25 GB — 메모리는 여전히
+  `max_seq_len`에 비례해 로드 때 잡힌다(한 config로 합치는 일의 남은 과제).
+- **검사**: `test/htp/host/attn_m1_host_check.c`의 `check_amax_floor`(window seed +
+  floor = full seed의 scale·출력 바이트, floor 없는 대조군은 달라야 함),
+  `unittest_kv_cache_manager`의 `compact_folds_the_dropped_rows_amax`.
+
+프롬프트 예산도 같은 날 고쳤다: 로드한 KV prefix 행(`SYS_PROMP_LEN`, 이어 쓰는 세션의
+`global_token_len`)을 `max_seq_len - num_to_generate`에서 빼고 남는 만큼만 프롬프트에
+준다. prefix가 있는데 프롬프트가 그 안에 안 들어가면 **cache 로드와 prefill 전에**
+`std::runtime_error`로 거부한다(메시지에 prefix 행 수, 프롬프트 토큰 수,
+num_to_generate, max_seq_len, 남는 자리). 전에는 예산이 prefix를 몰라 첫 qkv 단계에서
+`rows 1537..2482 past the RoPE table's 2304`로 죽었다. prefix 없는 프롬프트는 전처럼
+경고와 함께 꼬리를 자른다.
+
 ## 5. 운영상 주의
 
 ### 5.1 처음 배치에서 본 오류

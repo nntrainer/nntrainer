@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include <fp16.h>
 #include <memory_data.h>
 
 #include <basic_planner.h>
@@ -57,6 +58,8 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     layer_caps_ = std::move(other.layer_caps_);
     keep_ = std::move(other.keep_);
     bases_ = std::move(other.bases_);
+    dropped_amax_k_ = std::move(other.dropped_amax_k_);
+    dropped_amax_v_ = std::move(other.dropped_amax_v_);
     dtype_ = other.dtype_;
     format_ = other.format_;
     shared_alloc_ = std::move(other.shared_alloc_);
@@ -146,6 +149,8 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // capacity goes through the same per-layer cap the ring uses.
   keep_.assign(num_layers, 0u);
   bases_.assign(num_layers, 0u);
+  dropped_amax_k_.assign(num_layers, {});
+  dropped_amax_v_.assign(num_layers, {});
   if (!rows.empty()) {
     layer_caps_.assign(num_layers, 0u);
     for (unsigned int i = 0; i < num_layers; ++i) {
@@ -570,6 +575,38 @@ void KVCacheManager::advance(unsigned int step_size) {
 void KVCacheManager::reset() {
   cache_pos_ = 0;
   bases_.assign(bases_.size(), 0u);
+  for (auto *v : {&dropped_amax_k_, &dropped_amax_v_})
+    for (auto &a : *v)
+      a.clear();
+}
+
+void KVCacheManager::foldDroppedRows(unsigned int l, unsigned int n_rows) {
+  // fp16 magnitudes order as their bit patterns, so the max is taken on
+  // the bits (one compare a value, vectorizable) and widened once a column
+  const size_t w = kv_widths_[l];
+  const size_t rows = getLayerCap(l);
+  std::vector<uint16_t> mk(w, 0u), mv(w, 0u);
+  for (auto [t, m] : {std::pair{&layer_caches_[l].key_cache, &mk},
+                      std::pair{&layer_caches_[l].value_cache, &mv}}) {
+    const auto md = t->getMemoryData();
+    if (md && !md->isHostAddressable())
+      throw std::runtime_error("KVCacheManager::compact: a windowed layer's "
+                               "cache must be host addressable");
+    for (unsigned int b = 0; b < batch_size_; ++b) {
+      const uint16_t *d = t->getData<uint16_t>() + b * rows * w;
+      uint16_t *mm = m->data();
+      for (unsigned int r = 0; r < n_rows; ++r, d += w)
+        for (size_t c = 0; c < w; ++c)
+          mm[c] = std::max<uint16_t>(mm[c], d[c] & 0x7FFFu);
+    }
+  }
+  for (auto [m, a] : {std::pair{&mk, &dropped_amax_k_[l]},
+                      std::pair{&mv, &dropped_amax_v_[l]}}) {
+    if (a->empty())
+      a->assign(w, 0.0f);
+    for (size_t c = 0; c < w; ++c)
+      (*a)[c] = std::max((*a)[c], nntrainer::compute_fp16_to_fp32((*m)[c]));
+  }
 }
 
 bool KVCacheManager::compact(unsigned int pos) {
@@ -583,6 +620,8 @@ bool KVCacheManager::compact(unsigned int pos) {
     const size_t w = kv_widths_[l];
     const unsigned int rows = getLayerCap(l);
     const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;
+    // [#4428 window] the rows about to go: their |max| for the decode seed
+    foldDroppedRows(l, from - bases_[l]);
     for (auto *t :
          {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
       const auto md = t->getMemoryData();
