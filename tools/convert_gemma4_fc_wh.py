@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import struct
 
 import numpy as np
 
@@ -35,6 +36,23 @@ def hf_name(name):
               "self_attn.o_proj" if kind == "attention_out" else
               f"mlp.{kind[4:]}_proj")
     return f"model.layers.{layer}.{suffix}.weight"
+
+
+def bf16_rows(path, name, expected_shape):
+    """Yield (row0, float32 rows) of a BF16 safetensors tensor, 256 rows at a
+    time, through pread: the file may be far larger than memory, so no mmap."""
+    with path.open("rb") as stream:
+        size = struct.unpack("<Q", stream.read(8))[0]
+        entry = json.loads(stream.read(size))[name]
+        if entry["dtype"] != "BF16" or entry["shape"] != expected_shape:
+            raise ValueError(f"HF dtype/shape mismatch: {name}")
+        start = entry["data_offsets"][0]
+        n, k = expected_shape
+        for c0 in range(0, n, 256):
+            rows = min(256, n - c0)
+            stream.seek(8 + size + start + c0 * k * 2)
+            raw = np.fromfile(stream, np.uint16, rows * k)
+            yield c0, (raw.astype(np.uint32) << 16).view(np.float32).reshape(rows, k)
 
 
 def bf16_round(w):
@@ -128,10 +146,6 @@ def verify_chunk(stream, offset, k, n, c0, q, scale, channel_offset):
 
 
 def convert(source, output, hf_source):
-    from safetensors import safe_open
-    import torch
-    torch.set_num_threads(1)
-
     if output.exists():
         raise FileExistsError(output)
     report = json.loads((source / "conversion_report.json").read_text())
@@ -157,7 +171,7 @@ def convert(source, output, hf_source):
             if name not in index:
                 raise KeyError(name)
             item.update(dtype="QS4CX_WH_AFFINE", bytes=k * n // 2 + 12 * n, hf_name=name)
-        elif entry["dtype"] not in ("Q4_0", "TL2CX_WH", "FP32"):
+        elif entry["dtype"] not in ("Q4_0", "TL2CX_WH", "FP32", "QS4CX_WH_AFFINE"):
             raise ValueError("Unexpected source dtype")
         before += entry["bytes"]
         after += item["bytes"]
@@ -176,7 +190,7 @@ def convert(source, output, hf_source):
         with binary.open("rb") as src, partial.open("xb+") as dst:
             dst.truncate(after)
             for entry, item in zip(report["tensors"], plan):
-                if item["dtype"] != "QS4CX_WH_AFFINE":
+                if "hf_name" not in item:  # copied: not an FC/head record of this pass
                     src.seek(entry["offset"])
                     dst.seek(item["offset"])
                     left = entry["bytes"]
@@ -190,29 +204,25 @@ def convert(source, output, hf_source):
                     continue
                 k, n = item["shape"]
                 maximum = squared = energy = 0.
-                with safe_open(hf_source / index[item["hf_name"]], framework="pt") as handle:
-                    tensor = handle.get_slice(item["hf_name"])
-                    if tensor.get_shape() != [n, k]:
-                        raise ValueError(f"HF shape mismatch: {item['hf_name']}")
-                    for c0 in range(0, n, 256):
-                        w = tensor[c0:c0 + 256].float().numpy()
-                        q, scale, offsets = recover(w)
-                        tiles = pack(q)
-                        for kt, row in enumerate(tiles):
-                            dst.seek(item["offset"] + (kt * (n // 32) + c0 // 32) * 512)
-                            dst.write(row.tobytes())
-                        for at, values in ((k * n // 2 + c0 * 4, scale),
-                                           (k * n // 2 + (n + c0) * 4,
-                                            q.sum(axis=1, dtype=np.int32).astype("<f4")),
-                                           (k * n // 2 + (2 * n + c0) * 4, offsets)):
-                            dst.seek(item["offset"] + at)
-                            dst.write(values.tobytes())
-                        dst.flush()
-                        verify_chunk(dst, item["offset"], k, n, c0, q, scale, offsets)
-                        error = (q.astype(np.int32) + offsets[:, None]) * scale[:, None] - w
-                        maximum = max(maximum, float(np.abs(error).max()))
-                        squared += np.square(error.astype(np.float64)).sum()
-                        energy += np.square(w.astype(np.float64)).sum()
+                for c0, w in bf16_rows(hf_source / index[item["hf_name"]],
+                                       item["hf_name"], [n, k]):
+                    q, scale, offsets = recover(w)
+                    tiles = pack(q)
+                    for kt, row in enumerate(tiles):
+                        dst.seek(item["offset"] + (kt * (n // 32) + c0 // 32) * 512)
+                        dst.write(row.tobytes())
+                    for at, values in ((k * n // 2 + c0 * 4, scale),
+                                       (k * n // 2 + (n + c0) * 4,
+                                        q.sum(axis=1, dtype=np.int32).astype("<f4")),
+                                       (k * n // 2 + (2 * n + c0) * 4, offsets)):
+                        dst.seek(item["offset"] + at)
+                        dst.write(values.tobytes())
+                    dst.flush()
+                    verify_chunk(dst, item["offset"], k, n, c0, q, scale, offsets)
+                    error = (q.astype(np.int32) + offsets[:, None]) * scale[:, None] - w
+                    maximum = max(maximum, float(np.abs(error).max()))
+                    squared += np.square(error.astype(np.float64)).sum()
+                    energy += np.square(w.astype(np.float64)).sum()
                 metrics.append({"name": item["name"], "max_fp32_grid_vs_bf16_error": maximum,
                                 "max_bf16_roundtrip_error": 0,
                                 "fp32_grid_vs_bf16_rmse": float(np.sqrt(squared / (k * n))),
@@ -220,7 +230,7 @@ def convert(source, output, hf_source):
                 print(f"WH {len(metrics):3}: {item['name']} [{k},{n}], BF16_roundtrip=exact; FP32_grid_error={maximum:.7g}", flush=True)
             dst.flush()
             for item in plan:
-                if item["dtype"] == "QS4CX_WH_AFFINE":
+                if "hf_name" in item:
                     continue
                 dst.seek(item["offset"])
                 left = item["bytes"]

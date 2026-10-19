@@ -56,7 +56,7 @@ def convert_native(source, output, tool):
             experts.append(entry)
             item.update(dtype="TL2CX_WH", bytes=((k + 23) // 24) *
                         ((n + 127) // 128) * 640 + 8 * n)
-        elif entry["dtype"] not in ("Q4_0", "FP32"):
+        elif entry["dtype"] not in ("Q4_0", "FP32", "QS4CX_WH_AFFINE"):
             raise ValueError("Unsupported non-expert dtype")
         before += entry["bytes"]
         after += item["bytes"]
