@@ -182,21 +182,6 @@ void hexkl_moe_set_hadamard_signs(const uint32_t *mask_in, uint32_t n_in,
   g_moe_had_sign_down_n = mask_down ? n_down : 0u;
 }
 
-/** @brief x[i] ^= mask[i] over n floats (n a multiple of 32): the rotation's
- *  signs as a flip of the f32 sign bit. */
-static void moe_xor_row(float *x, const uint32_t *mask, uint32_t n) {
-#if defined(__hexagon__)
-  HVX_UVector *v = (HVX_UVector *)x;
-  const HVX_UVector *m = (const HVX_UVector *)mask;
-  for (uint32_t i = 0; i < n / 32u; ++i)
-    v[i] = Q6_V_vxor_VV(v[i], m[i]);
-#else
-  uint32_t *u = (uint32_t *)x;
-  for (uint32_t i = 0; i < n; ++i)
-    u[i] ^= mask[i];
-#endif
-}
-
 /** @brief The src_bypass a weight's descriptor gets: the knob, and only for
  *         a slot no DSP cache holds a dirty line of -- an arena-backed
  *         (borrowed) slot, which the CPU wrote and the DSP never does, or
@@ -384,7 +369,19 @@ static void moe_expand_unit(uint32_t n_units, uint32_t u, void *vctx) {
         continue;
       const uint32_t g0 = lo > first ? lo - first : 0u;
       const uint32_t g1 = hi < job ? hi - first : groups;
-      for (uint32_t g = g0; g < g1; ++g) {
+      uint32_t g = g0;
+      if (disjoint_lfm2) {
+        const uint32_t full = c->native_K / 96u;
+        const uint32_t end = g1 < full ? g1 : full;
+        if (g < end) {
+          hvx_tl2_expand_wh96_disjoint_batch(
+            c->native_packed + (size_t)p * c->native_panel_bytes + g * 2560u,
+            end - g, c->stride, c->native_magnitude,
+            c->native_base + (size_t)g * 3u * c->stride + p * 2048u);
+          g = end;
+        }
+      }
+      for (; g < g1; ++g) {
         uint8_t *dst = c->native_base + (size_t)g * 3u * c->stride + p * 2048u;
         const uint32_t rows = c->native_K - g * 96u;
         const uint8_t *src = source;
@@ -720,7 +717,9 @@ typedef struct {
 #define MOE_U8_GUARD 128u
 /** @brief Down staging buffers at most (hexkl_moe_layout.dn_ring). */
 #define MOE_DN_RING 4u
-#define MOE_RQ_UNIT_ROWS 16u
+/** Async jobs use seven workers on an eight-HVX device. Four-row units
+ * cap the full block's longest slice at twelve rows instead of sixteen. */
+#define MOE_RQ_UNIT_ROWS 4u
 #define MOE_RQ_UNITS (HEXKL_HMX_INT8_BLOCK_N_ROW / MOE_RQ_UNIT_ROWS)
 
 static inline void moe_worker_probe_add(uint64_t t0);
@@ -780,11 +779,12 @@ static void moe_dn_unit(uint32_t n_units, uint32_t u, void *vctx) {
  * Already on the owning worker: no extra dispatch, allocation or RPC. */
 static void moe_rotate_rows(float *x, uint32_t rows, uint32_t width,
                             uint32_t mode) {
-  if (mode)
-    (void)hvx_hadamard_rows_f32(x, rows, width, mode == 3u ? 2u : mode);
-  if (mode && g_moe_had_sign_down && g_moe_had_sign_down_n == width)
-    for (uint32_t r = 0; r < rows; ++r)
-      moe_xor_row(x + (size_t)r * width, g_moe_had_sign_down, width);
+  if (mode) {
+    const uint32_t *mask =
+      g_moe_had_sign_down_n == width ? g_moe_had_sign_down : NULL;
+    (void)hvx_hadamard_signed_rows_f32(x, rows, width, mode == 3u ? 2u : mode,
+                                       mask);
+  }
 }
 
 /** @brief Requantize independent row groups into the next block's mid. */
@@ -811,6 +811,14 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
         memset(x + (size_t)valid * c->inter, 0,
                sizeof(float) * (size_t)(r1 - r0 - valid) * c->inter);
       }
+      float extrema[2u * MOE_RQ_UNIT_ROWS];
+      int have_extrema = 0;
+      if (c->had_down == 2u) {
+        const uint32_t *mask =
+          g_moe_had_sign_down_n == c->inter ? g_moe_had_sign_down : NULL;
+        have_extrema = !hvx_hadamard_signed_rows_extrema_f32(x, valid, c->inter,
+                                                             mask, extrema);
+      }
 #if defined(__hexagon__)
       if (c->had_down == 3u) {
         had_hmx_ctx hc = {
@@ -821,8 +829,12 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
           had_hmx_store_group(&hc, g, c->gate + (size_t)g * 2u * 704u);
       } else
 #endif
+        if (!have_extrema)
         moe_rotate_rows(x, valid, c->inter, c->had_down);
-      if (c->had_down != 3u)
+      if (have_extrema)
+        hvx_quant_rows_u8_params_extrema(extrema, valid, r1 - r0,
+                                         c->rq_scale + r0, c->rq_zp + r0);
+      else if (c->had_down != 3u)
         hvx_quant_rows_u8_params(x, valid, r1 - r0, c->inter, c->rq_scale + r0,
                                  c->rq_zp + r0, NULL);
       else
@@ -873,9 +885,14 @@ static void moe_gu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_gu_ctx *c = (moe_gu_ctx *)vctx;
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
-  if (c->acc_i24)
-    hvx_dq_swiglu_i24(n_threads, i, &c->dq);
-  else if (c->affine_offset)
+  if (c->acc_i24) {
+    /** HMX Hadamard packing below reads this worker's original full columns
+     * before the job barrier, so it retains the original partition. */
+    if (c->had_vb)
+      hvx_dq_swiglu_i24(n_threads, i, &c->dq);
+    else
+      hvx_dq_swiglu_i24_balanced(n_threads, i, &c->dq);
+  } else if (c->affine_offset)
     hvx_dq_swiglu_affine(n_threads, i, &c->dq, c->affine_offset,
                          c->affine_sums);
   else
@@ -2082,14 +2099,23 @@ static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
       hvx_rmsnorm_row_f32(src, row, c->gamma, c->K, c->eps);
     else if (row != src)
       memcpy(row, src, (size_t)c->K * sizeof(float));
-    if (c->mode) {
-      (void)hvx_hadamard_f32(row, c->K, c->mode);
-      if (g_moe_had_sign_in && g_moe_had_sign_in_n == c->K)
-        moe_xor_row(row, g_moe_had_sign_in, c->K);
+    const uint32_t *mask =
+      g_moe_had_sign_in_n == c->K ? g_moe_had_sign_in : NULL;
+    float extrema[2];
+    if (c->M > 1u && c->mode == 2u &&
+        !hvx_hadamard_signed_rows_extrema_f32(row, 1u, c->K, mask, extrema)) {
+      hvx_quant_rows_u8_params_extrema(extrema, 1u, 1u, c->scale + m,
+                                       c->zp + m);
+      if (c->u8)
+        hvx_quant_row_u8_rm(row, c->K, c->scale[m], c->zp[m],
+                            c->u8 + (size_t)m * c->K);
+    } else {
+      if (c->mode)
+        (void)hvx_hadamard_signed_f32(row, c->K, c->mode, mask);
+      hvx_quant_rows_u8_params_rm(row, 1u, 1u, c->K, c->scale + m, c->zp + m,
+                                  c->u8 ? c->u8 + (size_t)m * c->K : NULL, NULL,
+                                  0.0f, NULL, NULL);
     }
-    hvx_quant_rows_u8_params_rm(row, 1u, 1u, c->K, c->scale + m, c->zp + m,
-                                c->u8 ? c->u8 + (size_t)m * c->K : NULL, NULL,
-                                0.0f, NULL, NULL);
   }
 }
 

@@ -88,6 +88,7 @@ public:
 
 private:
   bool packed_short_conv_ = false;
+  bool out_to_host_ = true; /**< false only with a view-aware consumer */
   std::vector<float> decoded_short_conv_;
   /** unit = the conv width C (in_proj is 3C wide) */
   std::tuple<nntrainer::props::Unit> conv_props;

@@ -468,6 +468,16 @@ static void router_wh_lane(uint32_t n, uint32_t lane, void *v) {
   const router_wh_ctx *c = (const router_wh_ctx *)v;
   for (uint32_t e0 = lane * ROUTER_CHAINS; e0 < c->E; e0 += n * ROUTER_CHAINS) {
     float acc[ROUTER_CHAINS] = {0};
+    /** Each expert has just sixteen possible unscaled weights. Convert them
+       once, then retain the original fused chain and its k order. This
+       removes K integer additions/conversions per expert without retaining
+       an unpacked matrix or changing the quantized representation. */
+    float lut[ROUTER_CHAINS][16];
+    for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+      const int32_t offset = c->offset[e0 + j];
+      for (uint32_t q = 0; q < 16u; ++q)
+        lut[j][q] = (float)((q >= 8u ? (int32_t)q - 16 : (int32_t)q) + offset);
+    }
     for (uint32_t k = 0; k < c->K; ++k) {
       const uint32_t r = k % 32u;
       const size_t tile = ((size_t)(k / 32u) * (c->E / 32u) + e0 / 32u) * 512u;
@@ -476,9 +486,8 @@ static void router_wh_lane(uint32_t n, uint32_t lane, void *v) {
       const float x = c->x[k];
 #pragma clang loop unroll(full)
       for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
-        int q = (packed[j * 4u] >> (4u * ((r / 4u) % 2u))) & 15u;
-        q = q >= 8 ? q - 16 : q;
-        acc[j] = Q6_R_sfmpyacc_RR(acc[j], x, (float)(q + c->offset[e0 + j]));
+        const unsigned q = (packed[j * 4u] >> (4u * ((r / 4u) % 2u))) & 15u;
+        acc[j] = Q6_R_sfmpyacc_RR(acc[j], x, lut[j][q]);
       }
     }
     for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
@@ -502,6 +511,69 @@ void hvx_router_topk_wh(const float *x, const uint8_t *w, const float *bias,
   router_wh_ctx c = {x, scale, bias, offset, w, K, E, acc, sig, score};
   hvx_worker_pool_run(pool, router_wh_lane, &c, E / ROUTER_CHAINS);
   memcpy(logits, acc, (size_t)E * sizeof(float));
+  m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
+}
+
+/** The resident graph owns this representation for its lifetime. Store
+ * unscaled integer weights exactly as the packed kernel converts them, then
+ * retain its final scale multiply after the fused chain. Applying scale at
+ * unpack time would change the router's arithmetic. */
+float *hvx_router_wh_weights_create(const uint8_t *w, uint32_t K, uint32_t E) {
+  if (!w || !K || K % 32u || !E || E % 32u || E > M1_DET_ROUTER_MAX_E ||
+      (size_t)K > (SIZE_MAX / sizeof(float) - E) / E)
+    return NULL;
+  float *decoded = (float *)memalign(128u, ((size_t)K * E + E) * sizeof(float));
+  if (!decoded)
+    return NULL;
+  const float *scale = (const float *)(w + (size_t)K * E / 2u);
+  const int32_t *offset = (const int32_t *)(scale + 2u * E);
+  for (uint32_t k = 0; k < K; ++k) {
+    const uint32_t r = k % 32u;
+    for (uint32_t e = 0; e < E; ++e) {
+      const size_t tile = ((size_t)(k / 32u) * (E / 32u) + e / 32u) * 512u;
+      const uint8_t qbyte = w[tile + (r / 8u) * 128u + (e % 32u) * 4u + r % 4u];
+      int q = (qbyte >> (4u * ((r / 4u) % 2u))) & 15u;
+      q = q >= 8 ? q - 16 : q;
+      decoded[(size_t)k * E + e] = (float)(q + offset[e]);
+    }
+  }
+  memcpy(decoded + (size_t)K * E, scale, E * sizeof(float));
+  return decoded;
+}
+
+typedef struct {
+  const float *x, *w, *bias;
+  uint32_t K, E;
+  float *acc, *sig, *score;
+} router_wh_decoded_ctx;
+
+static void router_wh_decoded_lane(uint32_t n, uint32_t lane, void *v) {
+  const router_wh_decoded_ctx *c = (const router_wh_decoded_ctx *)v;
+  const float *scale = c->w + (size_t)c->K * c->E;
+  for (uint32_t e0 = lane * ROUTER_CHAINS; e0 < c->E; e0 += n * ROUTER_CHAINS) {
+    float acc[ROUTER_CHAINS];
+    router_chains(c->x, c->w, c->K, c->E, e0, acc);
+    for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+      const uint32_t e = e0 + j;
+      c->acc[e] = acc[j] * scale[e];
+      m1_router_cpu_sigmoid(c->acc[e], c->bias[e], &c->sig[e], &c->score[e]);
+    }
+  }
+}
+
+void hvx_router_topk_wh_decoded_f32(const float *x, const float *w,
+                                    const float *bias, uint32_t K, uint32_t E,
+                                    uint32_t top_k, float *logits,
+                                    uint32_t *sel, float *weight,
+                                    hvx_worker_pool *pool) {
+  float acc[M1_DET_ROUTER_MAX_E], sig[M1_DET_ROUTER_MAX_E],
+    score[M1_DET_ROUTER_MAX_E];
+  if (!x || !w || !bias || !logits || !sel || !weight || !K || K % 32u || !E ||
+      E % 32u || E > M1_DET_ROUTER_MAX_E || !top_k || top_k > E)
+    return;
+  router_wh_decoded_ctx c = {x, w, bias, K, E, acc, sig, score};
+  hvx_worker_pool_run(pool, router_wh_decoded_lane, &c, E / ROUTER_CHAINS);
+  memcpy(logits, acc, E * sizeof(float));
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 

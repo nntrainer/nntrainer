@@ -185,6 +185,20 @@ static int hexkl_micro_hmx_acc_read_int32(uint8_t *vb, uint32_t cfg,
   return AEE_SUCCESS;
 }
 
+/** Stand in for the four SDK accumulator reads; retain the serial reference
+ * calculation and failure injection, then encode the actual raw byte planes. */
+static int read_acc_planes(attn_ctx *c, uint32_t off) {
+  const int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, off);
+  if (rc != AEE_SUCCESS)
+    return rc;
+  uint32_t rows[2048];
+  memcpy(rows, c->vb + off, sizeof(rows));
+  for (uint32_t plane = 0; plane < 4u; ++plane)
+    for (uint32_t i = 0; i < 2048u; ++i)
+      c->vb[off + plane * 2048u + i] = (uint8_t)(rows[i] >> (8u * plane));
+  return AEE_SUCCESS;
+}
+
 static void fake_softmax_worker(uint32_t threads, uint32_t id, void *ctx) {
   attn_ctx *c = ctx;
   const size_t bytes = 2u * c->L.n_row_tiles * c->L.n_col_tiles * TB;
@@ -312,15 +326,18 @@ static void check_guard(attn_ctx *c) {
   }
 }
 
+static uint32_t test_br = 128u;
+
 static void check_case(uint32_t rows, uint32_t qb, uint32_t qi,
                        unsigned workers, int fixed, int error,
                        unsigned pattern) {
   hexkl_attn_f16_shape s = {rows, 0u, rows, 32u, 8u, 64u, 0u, 0.0f};
-  hexkl_attn_f16_tiling t = {128u, 256u, 0u, 0u};
+  hexkl_attn_f16_tiling t = {test_br, 256u, 0u, 0u};
   assert(hexkl_attn_q_tiling_init(&s, &t) == HEXKL_ATTN_OK);
-  uint32_t chunk = (rows + 127u) / 128u;
-  if (chunk > 9u)
-    chunk = 9u;
+  uint32_t chunk = (rows + test_br - 1u) / test_br;
+  const uint32_t max_chunk = test_br == 256u ? 4u : 9u;
+  if (chunk > max_chunk)
+    chunk = max_chunk;
   hexkl_kv_q kv = {0};
   kv.kind = HEXKL_KV_Q8;
   kv.fixed = fixed;
@@ -356,7 +373,7 @@ static void check_case(uint32_t rows, uint32_t qb, uint32_t qi,
   expected = aligned_bytes(c.L.total + 2048u);
   memset(c.vb, 0xa5, c.L.total + 2048u);
   memset(expected, 0xa5, c.L.total + 2048u);
-  const uint32_t meta_rows = chunk * 512u;
+  const uint32_t meta_rows = chunk * t.g_br;
   c.q_scale = aligned_bytes((size_t)meta_rows * 4u);
   c.q_zp = aligned_bytes((size_t)meta_rows * 4u);
   for (uint32_t i = 0; i < meta_rows; ++i) {
@@ -364,6 +381,8 @@ static void check_case(uint32_t rows, uint32_t qb, uint32_t qi,
     c.q_zp[i] = (int32_t)((i + pattern * 64u) & 255u);
   }
   const int enabled = rows >= 1024u && rows % 128u == 0u && workers && !fixed;
+  c.profile = (pattern >> 1u) & 1u;
+  c.qk_planes = (pattern & 1u) && enabled;
   assert(qx_dequant_available(&c) == enabled);
   if (enabled)
     check_guard(&c);
@@ -430,6 +449,13 @@ int main(void) {
       check_case(2048u, 7u, 7u, workers, 0, error, 2u);
       ++cases;
     }
+  test_br = 256u;
+  for (unsigned workers = 0; workers <= 8u; ++workers)
+    for (unsigned pattern = 0; pattern < 4u; ++pattern)
+      for (uint32_t qb = 0u; qb < 8u; ++qb) {
+        check_case(2048u, qb, qb % 4u, workers, 0, 0, pattern);
+        ++cases;
+      }
   puts("Qx overlap: exact serial-HVX scores, async PV accumulator clobber,");
   printf("  %u pipeline/tail/error cases + repeated 18-guard sets PASS\n",
          cases);

@@ -48,6 +48,7 @@
 #include <cpu_backend.h>
 #include <cpu_ops_table.h>
 #include <htp_act_quant.h>
+#include <htp_arena_size.h>
 #include <htp_backend.h>
 #include <htp_context.h>
 #include <htp_dspq_wire.h>
@@ -101,6 +102,10 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+
+#if defined(__ANDROID__)
+#include <malloc.h>
 #endif
 
 #include <remote.h>
@@ -1196,6 +1201,34 @@ inline void stagedMemcpy(void *dst, const void *src, size_t bytes,
   p.addStaging(HtpProfile::nowUs() - t0, bytes, line);
 }
 
+/** @brief Copy large independent FC input stripes if the CPU pool is idle. */
+inline bool tryParallelStagedMemcpy(void *dst, const void *src, size_t bytes,
+                                    int line) {
+  constexpr size_t stripe = 256u * 1024u;
+  if (bytes < 4u * stripe)
+    return false;
+  const uintptr_t d = reinterpret_cast<uintptr_t>(dst);
+  const uintptr_t s = reinterpret_cast<uintptr_t>(src);
+  if (d < s ? s - d < bytes : d - s < bytes)
+    return false;
+  auto &tm = nntrainer::ThreadManager::Global();
+  if (tm.getComputeThreadCount() < 2)
+    return false;
+  HtpProfile &profile = HtpProfile::global();
+  const uint64_t start = profile.level() ? HtpProfile::nowUs() : 0;
+  const bool copied =
+    tm.try_parallel_for(0, (bytes + stripe - 1) / stripe, [&](size_t index) {
+      const size_t offset = index * stripe;
+      std::memcpy(static_cast<char *>(dst) + offset,
+                  static_cast<const char *>(src) + offset,
+                  std::min(stripe, bytes - offset));
+    });
+  // Profile once on the caller: worker stripes do not mutate shared counters.
+  if (copied && profile.level())
+    profile.addStaging(HtpProfile::nowUs() - start, bytes, line);
+  return copied;
+}
+
 } // namespace
 
 // --- nntrainer/nntrainer#4343: fp16 and quantized KV-cache attention ---
@@ -2210,13 +2243,31 @@ public:
   // the FC's row chunks as invokeFc takes them, each one call that also
   // norms, adds the residual and scales, so the FC output never comes back.
   const void *host_view(const void *host, size_t bytes) override {
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
     const void *ion = ionAlias(host, bytes);
-    return ion ? ion : host;
+    if (ion)
+      return ion;
+    static const bool prefill_views = [] {
+      const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!prefill_views)
+      return host;
+    // copyOutOf may retain an entire prefill output without an IonAlias.
+    // Use the same ownership and lifetime checks as sync_to_host before a
+    // CPU consumer reads it directly from the staging allocation.
+    ion = trueSource(host, bytes);
+    if (ion == host)
+      throwIfLost(host, bytes, __LINE__);
+    return ion;
   }
 
   void sync_to_host(void *host, size_t bytes) override {
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    const void *ion = ionAlias(host, bytes);
+    bool host_complete = false;
+    const void *ion = ionAlias(host, bytes, &host_complete);
+    if (ion && host_complete)
+      return;
     if (!ion)
       ion = trueSource(host, bytes);
     if (ion == host)
@@ -3790,6 +3841,42 @@ public:
                    freed);
   }
 
+  /** Optional Android phase-boundary reclamation of allocator-owned free
+   * pages. Live tensors and in-flight reader buffers remain owned unchanged.
+   * Older allocators may reject M_PURGE_ALL; that is a diagnostic no-op. */
+  static void purgePrefillHeap() {
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26 && defined(M_PURGE_ALL)
+    const char *purge = std::getenv("NNTR_HTP_PURGE_PREFILL");
+    if (!purge || std::strcmp(purge, "1") != 0)
+      return;
+    const auto rss_anon_kib = []() -> long long {
+      FILE *file = std::fopen("/proc/self/status", "r");
+      if (!file)
+        return -1;
+      char line[160];
+      long long value = -1;
+      while (std::fgets(line, sizeof(line), file))
+        if (std::sscanf(line, "RssAnon: %lld kB", &value) == 1)
+          break;
+      std::fclose(file);
+      return value;
+    };
+    const long long before = rss_anon_kib();
+    const uint64_t begin = HtpProfile::nowUs();
+    const int result = ::mallopt(M_PURGE_ALL, 0);
+    const uint64_t elapsed = HtpProfile::nowUs() - begin;
+    const long long after = rss_anon_kib();
+    const long long reclaimed =
+      before >= 0 && after >= 0 ? std::max(0LL, before - after) : -1;
+    std::fprintf(stderr,
+                 "[HTP-MEM] purge_prefill result=%d us=%llu "
+                 "rss_anon_before_kib=%lld rss_anon_after_kib=%lld "
+                 "reclaimed_kib=%lld\n",
+                 result, static_cast<unsigned long long>(elapsed), before,
+                 after, reclaimed);
+#endif
+  }
+
   void poolSync() {
     if (!pool_dirty_)
       return;
@@ -4962,6 +5049,7 @@ public:
         }
         if (prefillIoTraceEnabled())
           batch->read_trace.resize(batch->experts.size());
+        batch->cancelled.resize(batch->experts.size(), false);
       } catch (...) {
         for (const StagedExpert &st : batch->experts)
           free_expert_slots_.push_back(st.slot);
@@ -4987,7 +5075,9 @@ public:
 
   /** @brief Waits for the oldest queued batch, registers it, and returns
    *  its keys. Empty when nothing is queued. */
-  std::vector<const void *> prefetch_qs4cx_wh_experts_end() override {
+  std::vector<const void *> prefetch_qs4cx_wh_experts_end(
+    const std::vector<const void *> *needed = nullptr,
+    std::vector<const void *> *cancelled = nullptr) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const uint64_t t0 = HtpProfile::nowUs();
@@ -4999,6 +5089,24 @@ public:
         return {};
       PrefetchBatch *b = prefetch_batches_.front().get();
       done_on_entry = b->done;
+      if (needed && cancelled) {
+        // Only jobs still owned by the queue can be cancelled. A reader
+        // removes its job under this same lock before touching the slot.
+        for (auto it = prefetch_jobs_.begin(); it != prefetch_jobs_.end();) {
+          if (it->first != b)
+            break; // FIFO: subsequent batches belong to later layers.
+          const auto index = it->second;
+          const auto key = b->experts[index].d.key_gu;
+          if (std::find(needed->begin(), needed->end(), key) == needed->end()) {
+            cancelled->push_back(key);
+            b->cancelled[index] = true;
+            ++b->done;
+            it = prefetch_jobs_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
       prefetch_done_cv_.wait(lock,
                              [b] { return b->done == b->experts.size(); });
       batch = std::move(prefetch_batches_.front());
@@ -5008,8 +5116,22 @@ public:
     std::lock_guard<std::mutex> lock(handle_mutex_);
     const uint64_t t_register = batch->trace_id ? HtpProfile::nowUs() : 0u;
     std::exception_ptr first;
+    const size_t cancelled_count =
+      std::count(batch->cancelled.begin(), batch->cancelled.end(), true);
+    std::vector<StagedExpert> live;
+    if (cancelled_count) {
+      live.reserve(batch->experts.size() - cancelled_count);
+      for (size_t i = 0; i < batch->experts.size(); ++i) {
+        if (batch->cancelled[i]) {
+          free_expert_slots_.push_back(batch->experts[i].slot);
+          batch->experts[i].rc = ECANCELED;
+        } else {
+          live.push_back(std::move(batch->experts[i]));
+        }
+      }
+    }
     try {
-      registerStagedBatch(session, batch->experts);
+      registerStagedBatch(session, cancelled_count ? live : batch->experts);
     } catch (...) {
       first = std::current_exception();
     }
@@ -5020,19 +5142,21 @@ public:
         keys.push_back(st.d.key_gu);
     HtpProfile &profile = HtpProfile::global();
     if (profile.level() != 0) // the read time is only what the calls left
-      profile.addPrefetch(batch->experts.size(), done_on_entry, t_wait - t0,
+      profile.addPrefetch(batch->experts.size() - cancelled_count,
+                          done_on_entry, t_wait - t0,
                           HtpProfile::nowUs() - t_wait, prefetch_caller_cpus_,
                           prefetch_reader_cpus_.load());
     if (batch->trace_id) {
-      std::fprintf(stderr,
-                   "[HTP-PREFILL-BATCH] id=%llu experts=%zu jobs_ahead=%zu "
-                   "queued_us=%llu demand_us=%llu ready=%zu joined_us=%llu "
-                   "register_start_us=%llu register_end_us=%llu\n",
-                   (unsigned long long)batch->trace_id, batch->experts.size(),
-                   batch->jobs_ahead, (unsigned long long)batch->queued_us,
-                   (unsigned long long)t0, done_on_entry,
-                   (unsigned long long)t_wait, (unsigned long long)t_register,
-                   (unsigned long long)t_registered);
+      std::fprintf(
+        stderr,
+        "[HTP-PREFILL-BATCH] id=%llu experts=%zu jobs_ahead=%zu "
+        "queued_us=%llu demand_us=%llu ready=%zu joined_us=%llu "
+        "register_start_us=%llu register_end_us=%llu cancelled=%zu\n",
+        (unsigned long long)batch->trace_id, batch->experts.size(),
+        batch->jobs_ahead, (unsigned long long)batch->queued_us,
+        (unsigned long long)t0, done_on_entry, (unsigned long long)t_wait,
+        (unsigned long long)t_register, (unsigned long long)t_registered,
+        cancelled_count);
       for (size_t i = 0; i < batch->read_trace.size(); ++i) {
         const auto &r = batch->read_trace[i];
         std::fprintf(stderr,
@@ -5555,7 +5679,7 @@ private:
    *  own output buffer, which may be the one swapped in. */
   HtpRpcBuffer &stageInput(StagingPool &pool, const void *src, size_t bytes,
                            StagingPool *from = nullptr,
-                           int line = __builtin_LINE()) {
+                           int line = __builtin_LINE(), bool parallel = false) {
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     auto it = pool.holds.find(cls);
@@ -5564,17 +5688,20 @@ private:
       return *slot;
     // No-write hits above keep their ION epoch. Copies/swaps below do not.
     htp_router_handoff_invalidate(&router_handoff_);
-    if (from) {
+    for (StagingPool *source_pool : {from, &attn_out_pool_}) {
+      if (!source_pool || source_pool == &pool)
+        continue;
       // what from's buffer of this size is: a call's output (copied_out),
       // or an input staged there (holds: the qkv call's activation rows are
       // the o-proj call's residual)
-      auto c = from->copied_out.find(cls);
-      const Held *was = c != from->copied_out.end() ? &c->second : nullptr;
+      auto c = source_pool->copied_out.find(cls);
+      const Held *was =
+        c != source_pool->copied_out.end() ? &c->second : nullptr;
       if (!was) {
-        auto h = from->holds.find(cls);
-        was = h != from->holds.end() ? &h->second : nullptr;
+        auto h = source_pool->holds.find(cls);
+        was = h != source_pool->holds.end() ? &h->second : nullptr;
       }
-      auto &fslot = from->by_class[cls];
+      auto &fslot = source_pool->by_class[cls];
       if (was && was->first == src && was->second == bytes && fslot &&
           sampledSame(src, fslot->data(), bytes)) {
         const bool kept = was->kept;
@@ -5592,8 +5719,8 @@ private:
             noteLost(k->second.first, k->second.second);
         }
         std::swap(slot, fslot);
-        from->holds.erase(cls);
-        from->copied_out.erase(cls);
+        source_pool->holds.erase(cls);
+        source_pool->copied_out.erase(cls);
         pool.copied_out.erase(cls);
         pool.holds[cls] = {src, bytes, kept};
         return *slot;
@@ -5624,7 +5751,9 @@ private:
       throwIfLost(src, bytes, line);
     // a source inside this very buffer means it is large enough already
     fit(slot, bytes);
-    if (from_buf != slot->data())
+    if (from_buf != slot->data() &&
+        (!parallel ||
+         !tryParallelStagedMemcpy(slot->data(), from_buf, bytes, line)))
       stagedMemcpy(slot->data(), from_buf, bytes, line);
     pool.holds[cls] = {src, bytes, false};
     return *slot;
@@ -5721,10 +5850,11 @@ private:
    *  builder sets the flag only where every consumer runs here, the layers'
    *  CPU fallbacks call sync_to_host first, and NNTR_HTP_PROFILE >= 2 (its
    *  host norms read these tensors) copies in full. */
-  static void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
-                        bool to_host = true, int line = __builtin_LINE()) {
+  void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
+                 bool to_host = true, int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     const void *buf = pool.by_class[cls]->data();
+    forgetIonAliases(dst, buf, bytes);
     // NNTR_HTP_KEEP_OUT=0: every output copied to the host whole (a
     // reference for the kept path; never set in a tok/s run)
     static const bool keep_off = [] {
@@ -5753,22 +5883,44 @@ private:
     const void *host = nullptr;
     const void *ion = nullptr;
     size_t bytes = 0;
+    bool host_complete = false;
   };
   std::array<IonAlias, 16> ion_alias_{};
   size_t ion_alias_next_ = 0;
-  void noteIonAlias(const void *host, const void *ion, size_t bytes) {
-    ion_alias_[ion_alias_next_++ % ion_alias_.size()] = {host, ion, bytes};
+  void forgetIonAliases(const void *host, const void *ion, size_t bytes) {
+    const auto overlaps = [](const void *a, size_t an, const void *b,
+                             size_t bn) {
+      const uintptr_t x = reinterpret_cast<uintptr_t>(a);
+      const uintptr_t y = reinterpret_cast<uintptr_t>(b);
+      return x <= y ? y - x < an : x - y < bn;
+    };
+    // Materialization belongs to one output generation. Reusing its host
+    // or staging storage must not inherit an older complete-copy record.
+    for (auto &a : ion_alias_)
+      if (a.host && (overlaps(host, bytes, a.host, a.bytes) ||
+                     overlaps(ion, bytes, a.ion, a.bytes)))
+        a = {};
+  }
+  void noteIonAlias(const void *host, const void *ion, size_t bytes,
+                    bool host_complete) {
+    forgetIonAliases(host, ion, bytes);
+    ion_alias_[ion_alias_next_++ % ion_alias_.size()] = {host, ion, bytes,
+                                                         host_complete};
   }
   /** @brief The staging bytes that hold [host, host + bytes), or null. */
-  const void *ionAlias(const void *host, size_t bytes) const {
+  const void *ionAlias(const void *host, size_t bytes,
+                       bool *host_complete = nullptr) const {
     const char *h = static_cast<const char *>(host);
     for (const IonAlias &a : ion_alias_) {
       const char *b = static_cast<const char *>(a.host);
       if (!b || h < b || h + bytes > b + a.bytes)
         continue;
       const void *ion = static_cast<const char *>(a.ion) + (h - b);
-      if (sampledSame(host, ion, bytes))
+      if (sampledSame(host, ion, bytes)) {
+        if (host_complete)
+          *host_complete = a.host_complete;
         return ion;
+      }
     }
     return nullptr;
   }
@@ -5884,10 +6036,15 @@ private:
              " handles=" + std::to_string(num_handles) + ")";
     };
 
+    static const bool parallel_stage = [] {
+      const char *e = std::getenv("NNTR_LFM2_PARALLEL_STAGE");
+      return e && std::strcmp(e, "1") == 0;
+    }();
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     float *act_f32 = reinterpret_cast<float *>(
       stageInput(act_pool_, matBdata,
-                 static_cast<size_t>(M) * K * sizeof(float), &out_pool_)
+                 static_cast<size_t>(M) * K * sizeof(float), &out_pool_,
+                 __builtin_LINE(), parallel_stage && M >= 128 && K == 2048)
         .data());
     float *out_cat = reinterpret_cast<float *>(
       stage(out_pool_, static_cast<size_t>(out_len) * sizeof(float)).data());
@@ -5972,9 +6129,11 @@ private:
             const float *src = out_cat + out_off[i];
             if (!norms->to_host)
               sampledCopy(dst, src, b);
-            if (norms->to_host || !sampledSame(dst, src, b))
+            const bool host_complete =
+              norms->to_host || !sampledSame(dst, src, b);
+            if (host_complete)
               stagedMemcpy(dst, src, b);
-            noteIonAlias(dst, src, b);
+            noteIonAlias(dst, src, b, host_complete);
           }
         }
       } else {
@@ -7155,6 +7314,8 @@ private:
     ++fwd_tokens_;
     if (++prompt_tokens_ == 1) {
       releasePrefillStaging(); // [#4416 mem] the seed was the last big row
+      releaseIdlePrefillReaders();
+      purgePrefillHeap();
     }
     if (e.tokens == 1)
       growPool();
@@ -7832,6 +7993,31 @@ private:
                 float *matCdata, unsigned int M, unsigned int N,
                 unsigned int K) {
     const unsigned int step = fcMaxRows(K);
+    // The strided entry already walks VTCM-sized row chunks on the DSP.
+    // Keeping the complete activation in one call avoids another host copy,
+    // mapping and RPC for the tail while preserving each row's arithmetic.
+    static const bool whole_prefill = [] {
+      const char *value = std::getenv("NNTR_HTP_FC_WHOLE_PREFILL");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    if (whole_prefill && M > step) {
+      std::vector<unsigned int> chunks(fh.handles.size(), 0u);
+      std::vector<OutSlice> slices;
+      slices.reserve(fh.handles.size());
+      unsigned int column = 0;
+      for (unsigned int cols : fh.cols) {
+        slices.push_back({matCdata, N, column, cols});
+        column += cols;
+      }
+      if (column != N || slices.size() != fh.handles.size())
+        throw std::invalid_argument("FC output slices do not cover the output");
+      FusedNorms norms;
+      norms.post_chunk = &chunks;
+      invokeLayer(session, fh.handles.data(),
+                  static_cast<int>(fh.handles.size()), matBdata, matCdata, M, N,
+                  K, nullptr, nullptr, &norms, &slices);
+      return;
+    }
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       invokeLayer(session, fh.handles.data(),
@@ -8666,6 +8852,7 @@ private:
     const void *packed_weights = nullptr;
     const float *gamma = nullptr;
     const float *sigmoid_bias = nullptr;
+    const float *input_gamma = nullptr;
   };
 
   static unsigned prefetchTop() {
@@ -8729,7 +8916,31 @@ private:
       r.packed_weights = wh;
       r.gamma = lfm2 ? nullptr : state;
       r.sigmoid_bias = lfm2 ? state : nullptr;
+      // LFM's router input is the immediately preceding FFN RMSNorm row.
+      // Borrow its gamma; the model owns every load parameter until drain.
+      if (lfm2 && router > 0u) {
+        const auto *norm = graphOp(router - 1u);
+        if (norm->kind == HTP_OP_RMSNORM && norm->K == r.hidden &&
+            norm->out_slot == op->in_slot)
+          for (const auto &p : load_params_)
+            if (p.op == router - 1u && p.which == HTP_GRAPH_PARAM_GAMMA)
+              r.input_gamma = p.data;
+      }
     }
+    const char *gamma_env = std::getenv("NNTR_LFM2_PREFETCH_GAMMA");
+    const bool gamma_requested = gamma_env && std::strcmp(gamma_env, "1") == 0;
+    const bool gamma_normalized =
+      gamma_requested &&
+      std::all_of(prediction_routers_.begin(), prediction_routers_.end(),
+                  [](const PredictionRouter &r) {
+                    return r.sigmoid_bias &&
+                           htpRouterGammaUsable(r.input_gamma, r.hidden);
+                  });
+    if (gamma_requested)
+      std::fprintf(stderr, "[HTP-PREDICT] gamma_normalized=%u%s\n",
+                   gamma_normalized ? 1u : 0u,
+                   gamma_normalized ? ""
+                                    : " (unusable gamma; legacy fallback)");
     std::vector<PredictionJob> jobs(2);
     for (auto &j : jobs)
       j.input.resize(prediction_routers_[0].hidden);
@@ -8757,7 +8968,8 @@ private:
       prediction_routers_.size(), prediction_routers_[0].hidden);
     cpu_predictor_ = std::make_shared<HtpExpertPrefetch<PredictionJob>>(
       std::move(jobs), 1,
-      [this, cpus, blend, residual, trace](PredictionJob &job) {
+      [this, cpus, blend, residual, trace,
+       gamma_normalized](PredictionJob &job) {
         thread_local bool pinned = false;
         if (!pinned) {
           pinToCpus(cpus);
@@ -8765,6 +8977,15 @@ private:
         }
         const auto &r = prediction_routers_[job.layer];
         const uint64_t token = job.epoch >> 32;
+        if (gamma_normalized) {
+          // The job owns this copy. Observe deltas before gamma so source
+          // and target layers share one coordinate system across tokens.
+          const float *source_gamma =
+            prediction_routers_[job.layer - 1u].input_gamma;
+          for (unsigned h = 0; h < r.hidden; ++h)
+            job.input[h] /= source_gamma[h];
+        }
+        const float *target_gamma = gamma_normalized ? r.input_gamma : r.gamma;
         std::vector<float> corrected(r.hidden);
         const auto predict = [&](unsigned top) {
           return r.packed_weights
@@ -8781,9 +9002,9 @@ private:
           for (float candidate : {0.0f, 0.5f, 1.0f}) {
             residual->apply(job.layer, token, job.input.data(), candidate,
                             corrected.data());
-            if (r.gamma)
+            if (target_gamma)
               for (unsigned h = 0; h < r.hidden; ++h)
-                corrected[h] *= r.gamma[h];
+                corrected[h] *= target_gamma[h];
             const auto ranked = predict(8u);
             std::fputs(" |", trace.get());
             for (unsigned e : ranked)
@@ -8793,9 +9014,9 @@ private:
         }
         residual->apply(job.layer, token, job.input.data(), blend,
                         corrected.data());
-        if (r.gamma)
+        if (target_gamma)
           for (unsigned h = 0; h < r.hidden; ++h)
-            corrected[h] *= r.gamma[h];
+            corrected[h] *= target_gamma[h];
         const auto ids = predict(r.top);
         std::lock_guard<std::mutex> lock(handle_mutex_);
         std::vector<bool> absent;
@@ -8864,7 +9085,7 @@ private:
     slot.bytes = slot_bytes;
     // A new chunk is sized to the slots still to come when the caller said
     // how many there will be (reserve_qs4cx_wh_expert_slots), else a full
-    // chunk as before. newChunk rounds up to its 64 MiB grain.
+    // chunk as before. newChunk rounds up to its configured grain.
     const size_t left = expert_slots_wanted_ > expert_slots_placed_
                           ? expert_slots_wanted_ - expert_slots_placed_
                           : 0;
@@ -9572,6 +9793,41 @@ private:
     }
     if (first)
       std::rethrow_exception(first);
+  }
+
+  /** Retire only the idle prefill readers at a completed token boundary.
+   * Empty batches prove every payload owner was joined by prefetch _end.
+   * Thread exit releases each direct reader's 2 MiB thread-local scratch;
+   * reset the stop flag so a later prompt can lazily start fresh readers.
+   * Like startPrefetchReaders, the model's serialized caller owns lifecycle.
+   */
+  void releaseIdlePrefillReaders() {
+    const char *v = std::getenv("NNTR_HTP_RELEASE_PREFILL_READERS");
+    if (!v || std::strcmp(v, "1") != 0)
+      return;
+    size_t count;
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mutex_);
+      if (prefetch_readers_.empty())
+        return;
+      if (!prefetch_batches_.empty() || !prefetch_jobs_.empty()) {
+        std::fprintf(stderr,
+                     "[HTP-MEM] prefill_readers_release skipped=busy\n");
+        return;
+      }
+      count = prefetch_readers_.size();
+      prefetch_stop_ = true;
+    }
+    prefetch_cv_.notify_all();
+    for (auto &t : prefetch_readers_)
+      if (t.joinable())
+        t.join();
+    prefetch_readers_.clear();
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mutex_);
+      prefetch_stop_ = false;
+    }
+    std::fprintf(stderr, "[HTP-MEM] prefill_readers_released=%zu\n", count);
   }
 
   /** @brief Starts the readers once, pinned to NNTR_MOE_PREFETCH_CPUS or
@@ -10398,6 +10654,30 @@ private:
                               std::vector<ArenaChunk> &chunks) {
     if (chunks.empty())
       return;
+    // Read-only accounting after the readers stop: no payload is touched.
+    // Include the final decode growth, whose slots are allocated on misses.
+    const char *trace = std::getenv("NNTR_INIT_TRACE");
+    if (trace && std::strcmp(trace, "0") != 0) {
+      uint64_t capacity = 0, used = 0;
+      for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto &chunk = chunks[i];
+        const size_t size = chunk.buf->size();
+        capacity += size;
+        used += chunk.used;
+        std::fprintf(stderr,
+                     "[HTP-MEM] arena_chunk=%zu dsp_id=%u size_bytes=%zu "
+                     "used_bytes=%zu tail_bytes=%zu\n",
+                     i, chunk.dsp_id, size, chunk.used,
+                     size - std::min(size, chunk.used));
+      }
+      std::fprintf(
+        stderr,
+        "[HTP-MEM] arena_total size_bytes=%llu used_bytes=%llu "
+        "tail_bytes=%llu\n",
+        static_cast<unsigned long long>(capacity),
+        static_cast<unsigned long long>(used),
+        static_cast<unsigned long long>(capacity - std::min(capacity, used)));
+    }
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
     uint32_t put = 0, unmapped = 0;
     size_t bytes = 0;
@@ -10445,17 +10725,16 @@ private:
   bool newChunkOn(remote_handle64 session, int domain,
                   std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
                   size_t want) {
-    static constexpr size_t kGrain = size_t(64) << 20;
-    /** Below this a chunk holds too few weights to be worth an arena slot,
-     *  and the DSP's table is not unbounded. [#132 Part B E5g] 16 MiB (was
-     *  64): the tail of the MoE arena, ~112 MiB above 14 x 256, may have
-     *  to go in pieces on a boot whose last 256 MiB window is taken. */
-    static constexpr size_t kFloor = size_t(16) << 20;
+    static const size_t grain =
+      htpArenaGrainBytes(std::getenv("NNTR_HTP_ARENA_GRAIN_MB"));
+    /** Preserve the established 16 MiB retry floor unless the explicit
+     *  4 MiB tail option is selected. The DSP arena table still bounds the
+     *  number of mappings, and every retry must fit the complete weight. */
+    const size_t floor = std::min(grain, size_t(16) << 20);
 
-    size_t size = (std::max(want, size_t(bytes)) + kGrain - 1) & ~(kGrain - 1);
-    size = std::min(std::max(size, kGrain), cap);
-    if (size < bytes) {
-      arena_fail_ = "a weight is larger than a whole chunk";
+    size_t size = htpArenaChunkBytes(bytes, want, cap, grain);
+    if (!size) {
+      arena_fail_ = "a weight exceeds the chunk cap or its size overflows";
       return false; // not this model
     }
 
@@ -10464,7 +10743,7 @@ private:
       if (tryChunkOn(session, domain, chunks, size))
         return true;
       const size_t half = size / 2;
-      if (half < kFloor || half < bytes)
+      if (half < floor || half < bytes)
         return false; // arena_fail_ holds the last refusal, which is the one
       if (HtpProfile::global().level() != 0) {
         std::printf("[HTP] arena: %zu MiB refused, retrying at %zu MiB (%s)\n",
@@ -10631,6 +10910,7 @@ private:
   /** One _begin's experts; done counts the ones read. */
   struct PrefetchBatch {
     std::vector<StagedExpert> experts;
+    std::vector<bool> cancelled;
     size_t done = 0;
     uint64_t trace_id = 0, queued_us = 0;
     size_t jobs_ahead = 0;
@@ -11151,20 +11431,78 @@ public:
     const bool staged = n_q >= 128;
     const float *q_rpc = q;
     float *out_rpc = out;
+    static const bool ion_handoff = [] {
+      const char *value = std::getenv("NNTR_LFM2_ATTN_ION_HANDOFF");
+      return value && std::strcmp(value, "1") == 0;
+    }();
     if (staged) {
-      float *q_ion =
-        reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+      const float *direct_q = nullptr;
+      const float *q_source = q;
+      if (ion_handoff) {
+        const auto contains = [](const void *base, size_t extent,
+                                 const void *ptr, size_t bytes) {
+          const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+          const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+          return p >= b && bytes <= extent && p - b <= extent - bytes;
+        };
+        const void *resolved = ionAlias(q, q_bytes);
+        if (!resolved)
+          resolved = q;
+        // host_view may already have resolved Q. Accept it only from a
+        // current output allocation and a matching live output alias.
+        // No out_pool staging occurs before this synchronous RPC completes.
+        for (const auto &slot : out_pool_.by_class) {
+          if (!slot.second || !contains(slot.second->data(),
+                                        slot.second->size(), resolved, q_bytes))
+            continue;
+          for (const IonAlias &alias : ion_alias_) {
+            if (alias.host &&
+                contains(alias.ion, alias.bytes, resolved, q_bytes) &&
+                contains(slot.second->data(), slot.second->size(), alias.ion,
+                         alias.bytes) &&
+                sampledSame(alias.host, alias.ion, alias.bytes)) {
+              direct_q = static_cast<const float *>(resolved);
+              q_source = direct_q;
+              break;
+            }
+          }
+        }
+        const auto writable = attn_out_pool_.by_class.find(stageClass(q_bytes));
+        if (direct_q &&
+            ((writable != attn_out_pool_.by_class.end() && writable->second &&
+              htp_router_handoff_overlap(direct_q, q_bytes,
+                                         writable->second->data(),
+                                         writable->second->size())) ||
+             stagingRestoreOverlaps(attn_out_pool_, q_bytes, direct_q,
+                                    q_bytes)))
+          direct_q = nullptr;
+      }
+      if (ion_handoff && q_source == q) {
+        q_source = static_cast<const float *>(trueSource(q, q_bytes));
+        if (q_source == q)
+          throwIfLost(q, q_bytes, __LINE__);
+      }
+      if (direct_q) {
+        q_rpc = direct_q;
+      } else {
+        float *q_ion =
+          reinterpret_cast<float *>(stage(attn_q_pool_, q_bytes).data());
+        stagedMemcpy(q_ion, q_source, q_bytes);
+        q_rpc = q_ion;
+      }
       out_rpc =
         reinterpret_cast<float *>(stage(attn_out_pool_, q_bytes).data());
-      stagedMemcpy(q_ion, q, q_bytes);
-      q_rpc = q_ion;
     }
     const int err = nntr_hvx_attn_q_step(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
       q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
-    if (staged && err == AEE_SUCCESS)
-      stagedMemcpy(out, out_rpc, q_bytes);
+    if (staged && err == AEE_SUCCESS) {
+      if (ion_handoff)
+        copyOutOf(attn_out_pool_, out, q_bytes, true);
+      else
+        stagedMemcpy(out, out_rpc, q_bytes);
+    }
     if (trace) {
       ml_logi("HTP attn trace q: handle=%d n_q=%u cache=%u..%u append=%u "
               "err=0x%x wall_us=%lld dsp_us=%u append_us=%u attn_us=%u "

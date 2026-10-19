@@ -272,25 +272,28 @@ static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
       !g_prefetch_inflight.empty() || !g_handed_expert_layers.empty() ||
       g_expert_layers.size() != layers ||
       g_expert_lru.capacity() != layers * 16u || !experts_per_layer ||
-      g_expert_lru.size() % experts_per_layer != 0u ||
       expertPrefetchDepth() == 0)
     return 0;
 
-  // The startup preload may occupy any complete layer prefix within C16.
-  // Verify the actual keys below before using that prefix as the read frontier.
-  const size_t resident_layers = g_expert_lru.size() / experts_per_layer;
+  // Preload is a graph-order prefix and can end partway through a layer.
+  // Validate the actual resident keys before using it as the read frontier.
+  const size_t resident_count = g_expert_lru.size();
+  const size_t resident_layers = resident_count / experts_per_layer;
+  const size_t resident_tail = resident_count % experts_per_layer;
   if (resident_layers >= layers)
     return 0;
 
   std::vector<causallm::ExpertLru::Key> pinned;
+  size_t ordinal = 0;
   for (size_t l = 0; l < g_expert_layers.size(); ++l) {
     if (g_expert_layers[l].size() != experts_per_layer)
       return 0;
     for (const ExpertFileDesc &d : g_expert_layers[l]) {
+      const bool expected_resident = ordinal++ < resident_count;
       if (d.w_bits != HTP_TL2_WEIGHT_BITS ||
-          g_expert_lru.resident(d.key_gu) != (l < resident_layers))
+          g_expert_lru.resident(d.key_gu) != expected_resident)
         return 0;
-      if (l < resident_layers)
+      if (expected_resident)
         pinned.push_back(d.key_gu);
     }
   }
@@ -300,7 +303,12 @@ static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
                             static_cast<int>(g_expert_layers.size()) - 1);
   for (g_prefetch_next = static_cast<int>(resident_layers);
        g_prefetch_next <= last; ++g_prefetch_next) {
-    const auto &want = g_expert_layers[g_prefetch_next];
+    const auto &layer = g_expert_layers[g_prefetch_next];
+    std::vector<ExpertFileDesc> suffix;
+    if (g_prefetch_next == static_cast<int>(resident_layers) && resident_tail)
+      suffix.assign(layer.begin() + resident_tail, layer.end());
+    const auto &want = suffix.empty() ? layer : suffix;
+    // Only the first incomplete layer needs a temporary descriptor list.
     // Full batches preserve the ordinary first layer's registration groups
     // and LRFU acquire order, retaining the preloaded prefix and leaving
     // the later partial batch to the normal layer-time refill.
@@ -1657,13 +1665,13 @@ static bool tryMoeLayerOnAccelerator(
     *add_done = false;
   // The layer's whole output (the epilogue in the call) may stay on the
   // accelerator when the builder says so; a partial one is read here.
-  auto call = [&](float *dst, bool with_add) {
+  auto call = [&](float *dst, bool with_add, bool retain_plain = false) {
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
       hidden_size, w_bits, gelu, pre_gamma, post_gamma, eps,
       with_add ? add_x2 : nullptr, with_add ? add_gamma : nullptr, add_scale,
-      out_to_host || !with_add || total_tokens == 1);
+      out_to_host || (!with_add && !retain_plain) || total_tokens == 1);
   };
 
   // [doc 52 section 10.14] A layer call needs all of its routed experts
@@ -1723,12 +1731,26 @@ static bool tryMoeLayerOnAccelerator(
       experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
         ? expertPrefetchDepth()
         : 0;
+    static const bool prune_prefill = [] {
+      const char *v = std::getenv("NNTR_LFM2_PREFILL_PRUNE");
+      return v && std::strcmp(v, "1") == 0;
+    }();
+    std::vector<const void *> routed_keys;
+    if (prune_prefill)
+      for (size_t e : active)
+        routed_keys.push_back(&context.getWeight(gate_up_indices[e]));
     auto take_batch = [&] {
+      const bool current =
+        g_prefetch_batches.front().first == expert_layer_slot;
       const size_t held = g_prefetch_batches.front().second;
       g_prefetch_batches.pop_front();
       g_expert_lru.unhold(held);
+      std::vector<const void *> cancelled;
       const std::vector<causallm::ExpertLru::Key> got =
-        ops->prefetch_qs4cx_wh_experts_end();
+        ops->prefetch_qs4cx_wh_experts_end(
+          prune_prefill && current ? &routed_keys : nullptr, &cancelled);
+      for (auto k : cancelled)
+        g_prefetch_inflight.erase(k);
       for (causallm::ExpertLru::Key k : got)
         g_prefetch_inflight.erase(k);
       g_expert_lru.acquire(
@@ -1808,7 +1830,23 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
 
-    call(output.getData<float>(), add_x2 != nullptr);
+    // Only a complete plain result can be consumed through a mapped view.
+    // Split expert groups above are always materialized for CPU accumulation.
+    static const bool prefill_views = [] {
+      const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    const bool host_diagnostics =
+      std::getenv("NNTR_HTP_DUMP") || std::getenv("NNTR_ACT_STATS") ||
+      std::getenv("NNTR_ACT_DUMP") || std::getenv("NNTR_DUMP_ROWS_DIR") ||
+      std::getenv("NNTR_DUMP_ROWS_HASH");
+    bool retain_plain = prefill_views && !out_to_host &&
+                        post_gamma == nullptr && add_x2 == nullptr &&
+                        !host_diagnostics;
+#ifndef _WIN32
+    retain_plain = retain_plain && moeDiffRows() < 0 && !moeShadowEnabled();
+#endif
+    call(output.getData<float>(), add_x2 != nullptr, retain_plain);
     if (add_done)
       *add_done = add_x2 != nullptr;
   }
@@ -1832,9 +1870,30 @@ static bool tryMoeLayerOnAccelerator(
     // the most recent, so reversing puts a token's top-ranked expert --
     // the likeliest to be routed to again -- at the back.
     std::vector<causallm::ExpertLru::Key> recency;
-    recency.reserve(extra_top_k->size());
-    for (auto it = extra_top_k->rbegin(); it != extra_top_k->rend(); ++it)
-      recency.push_back(&context.getWeight(gate_up_indices[*it]));
+    static const bool compact_recency = [] {
+      const char *value = std::getenv("NNTR_LFM2_COMPACT_RECENCY");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    if (compact_recency && total_tokens > 1) {
+      // Only the last touch of each key affects the final LRU order. The
+      // old loop traverses hints backwards, so these are the first forward
+      // occurrences, reversed. Keep absent keys too: refresh skips them.
+      std::vector<bool> seen(n_experts, false);
+      recency.reserve(n_experts);
+      for (int expert : *extra_top_k) {
+        if (!seen[expert]) {
+          seen[expert] = true;
+          recency.push_back(&context.getWeight(gate_up_indices[expert]));
+          if (recency.size() == n_experts)
+            break;
+        }
+      }
+      std::reverse(recency.begin(), recency.end());
+    } else {
+      recency.reserve(extra_top_k->size());
+      for (auto it = extra_top_k->rbegin(); it != extra_top_k->rend(); ++it)
+        recency.push_back(&context.getWeight(gate_up_indices[*it]));
+    }
     g_expert_lru.refresh(recency);
   }
   return true;
@@ -2227,7 +2286,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         norm_on_accel
           ? context.getWeight(add_scale_idx).getValue<float>(0, 0, 0, 0)
           : 1.0f,
-        &add_done, out_to_host);
+        &add_done, out_to_host || (out_add && !norm_on_accel));
       out_normed_on_accel = moe_layer_done && out_norm && total_tokens > 1;
     }
 

@@ -32,6 +32,28 @@
 /** @brief f32 lanes per HVX vector. */
 #define FLANES (VLEN / 4u)
 
+/** Apply the same scalar arithmetic after any exact extrema reduction. */
+static void quant_params_from_extrema_one(float min0, float max0, float *scale,
+                                          int32_t *zp) {
+  const float rmin = min0 < 0.0f ? min0 : 0.0f;
+  const float rmax = max0 > 0.0f ? max0 : 0.0f;
+  if (rmin == rmax) {
+    return; /* leaves scale 1, zp 0 */
+  }
+  const float s = (rmax - rmin) / 255.0f;
+  /** nearbyintf, not roundf: the vectorized path rounds to nearest even
+     and the host reference is written to match. */
+  int32_t z = (int32_t)nearbyintf(-rmin / s);
+  if (z < 0) {
+    z = 0;
+  }
+  if (z > 255) {
+    z = 255;
+  }
+  scale[0] = s;
+  zp[0] = z;
+}
+
 /** @brief One row of K1: scale[m]/zp[m] from x's m-th row. Independent of
  *         every other row, which is what makes splitting this by row
  *         range across worker threads safe. */
@@ -48,7 +70,31 @@ static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
     const HVX_UVector *vrow = (const HVX_UVector *)row;
     HVX_Vector vmin = vrow[0];
     HVX_Vector vmax = vrow[0];
-    for (uint32_t i = 1; i < n_vec; ++i) {
+    /** Independent extrema chains hide compare latency. HVX min/max propagate
+     * NaNs; the final clamp preserves their existing default-parameter path
+     * and removes signed-zero ties. Finite extrema are unchanged. */
+    uint32_t i = 1u;
+    if (n_vec >= 4u) {
+      HVX_Vector min1 = vrow[1], min2 = vrow[2], min3 = vrow[3];
+      HVX_Vector max1 = min1, max2 = min2, max3 = min3;
+      for (i = 4u; n_vec - i >= 4u; i += 4u) {
+        const HVX_Vector a = vrow[i], b = vrow[i + 1u];
+        const HVX_Vector c = vrow[i + 2u], d = vrow[i + 3u];
+        vmin = Q6_Vsf_vmin_VsfVsf(vmin, a);
+        vmax = Q6_Vsf_vmax_VsfVsf(vmax, a);
+        min1 = Q6_Vsf_vmin_VsfVsf(min1, b);
+        max1 = Q6_Vsf_vmax_VsfVsf(max1, b);
+        min2 = Q6_Vsf_vmin_VsfVsf(min2, c);
+        max2 = Q6_Vsf_vmax_VsfVsf(max2, c);
+        min3 = Q6_Vsf_vmin_VsfVsf(min3, d);
+        max3 = Q6_Vsf_vmax_VsfVsf(max3, d);
+      }
+      vmin = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmin_VsfVsf(vmin, min1),
+                                Q6_Vsf_vmin_VsfVsf(min2, min3));
+      vmax = Q6_Vsf_vmax_VsfVsf(Q6_Vsf_vmax_VsfVsf(vmax, max1),
+                                Q6_Vsf_vmax_VsfVsf(max2, max3));
+    }
+    for (; i < n_vec; ++i) {
       vmin = Q6_Vsf_vmin_VsfVsf(vmin, vrow[i]);
       vmax = Q6_Vsf_vmax_VsfVsf(vmax, vrow[i]);
     }
@@ -74,23 +120,19 @@ static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
       max0 = row[i];
     }
   }
-  const float rmin = min0 < 0.0f ? min0 : 0.0f;
-  const float rmax = max0 > 0.0f ? max0 : 0.0f;
-  if (rmin == rmax) {
-    return; /* leaves scale 1, zp 0 */
+  quant_params_from_extrema_one(min0, max0, scale + m, zp + m);
+}
+
+void hvx_quant_rows_u8_params_extrema(const float *extrema, uint32_t m_valid,
+                                      uint32_t m_pad, float *scale,
+                                      int32_t *zp) {
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+    if (m < m_valid)
+      quant_params_from_extrema_one(extrema[2u * m], extrema[2u * m + 1u],
+                                    scale + m, zp + m);
   }
-  const float s = (rmax - rmin) / 255.0f;
-  /** nearbyintf, not roundf: the vectorized path rounds to nearest even
-     and the host reference is written to match. */
-  int32_t z = (int32_t)nearbyintf(-rmin / s);
-  if (z < 0) {
-    z = 0;
-  }
-  if (z > 255) {
-    z = 255;
-  }
-  scale[m] = s;
-  zp[m] = z;
 }
 
 typedef struct {
@@ -132,6 +174,15 @@ void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m_valid,
   for (uint32_t m = 0; m < m_pad; ++m) {
     scale[m] = 1.0f;
     zp[m] = 0;
+  }
+
+  /** The rotated-input worker already owns this row. Avoid building another
+   * worker context and dispatching a serial nested job for every token. */
+  if (!pool && !pre_gamma && m_valid == 1u && m_pad == 1u) {
+    quant_row_params_one(x, 0u, k, scale, zp);
+    if (out_rm)
+      hvx_quant_row_u8_rm(x, k, scale[0], zp[0], out_rm);
+    return;
   }
 
   quant_rows_ctx ctx = {x,      m_valid,   k,       scale,      zp,

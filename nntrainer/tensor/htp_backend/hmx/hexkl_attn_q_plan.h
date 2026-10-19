@@ -178,6 +178,35 @@ static inline int hexkl_attn_q_widen_prefill(const hexkl_attn_f16_shape *s,
   return 1;
 }
 
+/** Full LFM Q8 prefill can share a Bc256 load across twice as many queries.
+ * Keep every query's KV-block sequence and mask unchanged. The packed Q
+ * chunk leaves its gathered FP32 rows dead; four Br256 blocks provide exactly
+ * enough space there for one full next-QK accumulator bank. */
+static inline int hexkl_attn_q_widen_prefill256(const hexkl_attn_f16_shape *s,
+                                                const hexkl_attn_f16_tiling *t,
+                                                uint32_t arena_top,
+                                                uint32_t tile_bytes,
+                                                hexkl_attn_f16_tiling *wide) {
+  hexkl_attn_f16_tiling candidate;
+  if (!s || !t || !wide || s->n_q < 1024u || s->n_q % 256u || t->bc != 256u ||
+      !hexkl_attn_q_widen_prefill(s, t, arena_top, tile_bytes, &candidate))
+    return 0;
+  candidate.br = 256u;
+  if (hexkl_attn_q_tiling_init(s, &candidate) != HEXKL_ATTN_OK)
+    return 0;
+  const uint32_t chunk = 4u;
+  hexkl_attn_q_layout layout;
+  if (hexkl_attn_q_plan(s, &candidate, arena_top, tile_bytes, chunk, &layout) !=
+      HEXKL_ATTN_OK)
+    return 0;
+  const uint64_t raw_bytes =
+    (uint64_t)layout.n_row_tiles * layout.n_col_tiles * HEXKL_ATTN_Q_ACC_BYTES;
+  if (raw_bytes > (uint64_t)layout.total - layout.qx_f32)
+    return 0;
+  *wide = candidate;
+  return 1;
+}
+
 #ifdef __cplusplus
 }
 #endif

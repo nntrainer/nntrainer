@@ -331,12 +331,12 @@ static inline int hexkl_attn_f16_tile_row_to_qg(const hexkl_attn_f16_shape *s,
                                                 const hexkl_attn_f16_tiling *t,
                                                 uint32_t qb, uint32_t r,
                                                 uint32_t *q, uint32_t *g) {
-  const uint32_t qq = qb * t->br + r / t->g;
+  const uint32_t qq = qb * t->br + (t->g == 4u ? r >> 2u : r / t->g);
   if (r >= t->g * t->br || qq >= s->n_q) {
     return 0;
   }
   *q = qq;
-  *g = r % t->g;
+  *g = t->g == 4u ? r & 3u : r % t->g;
   return 1;
 }
 

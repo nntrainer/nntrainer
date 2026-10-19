@@ -144,7 +144,8 @@ static bool lfmConvPostGatePrefill(const float *gated, const float *weights,
 static bool lfmConvFusedGatePrefill(const float *projection,
                                     const float *weights, float *gated,
                                     float *output, unsigned rows,
-                                    unsigned channels) {
+                                    unsigned channels,
+                                    const float *history = nullptr) {
 #if defined(__aarch64__)
   if (!projection || !weights || !gated || !output || rows < 16 ||
       channels != 2048)
@@ -161,7 +162,22 @@ static bool lfmConvFusedGatePrefill(const float *projection,
       return false;
   if (!disjoint(gated, bytes, output, bytes))
     return false;
-  constexpr unsigned stripe = 64;
+  static const bool channel_tile = [] {
+    const char *value = std::getenv("NNTR_LFM2_CONV_CHANNEL_TILE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  static const bool state_only = [] {
+    const char *value = std::getenv("NNTR_LFM2_CONV_STATE_ONLY");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  static const unsigned stripe = [] {
+    const char *value = std::getenv("NNTR_LFM2_CONV_STRIPE_ROWS");
+    if (value)
+      for (unsigned rows : {8u, 16u, 32u, 64u, 128u, 256u})
+        if (std::strcmp(value, std::to_string(rows).c_str()) == 0)
+          return rows;
+    return 64u;
+  }();
   nntrainer::ThreadManager::Global().parallel_for(
     0, (rows + stripe - 1u) / stripe, [&](size_t job) {
 #if defined(__clang__)
@@ -170,6 +186,65 @@ static bool lfmConvFusedGatePrefill(const float *projection,
       const unsigned first = unsigned(job) * stripe;
       const unsigned last = std::min(rows, first + stripe);
       const float32x4_t zero = vdupq_n_f32(0.0f);
+      if (channel_tile) {
+        constexpr unsigned width = 2048;
+        // One cache line per channel tile. Keep the three filter taps and
+        // two preceding gated vectors live while walking the row stripe.
+        // Only the final two gated rows are live after a helper call. The
+        // optional state-only path keeps those rows for the next chunk and
+        // decode; stripe boundaries are reconstructed from the projection.
+        for (unsigned c = 0; c < width; c += 16) {
+          float32x4_t w0[4], w1[4], w2[4], prev1[4], prev2[4];
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+          for (unsigned v = 0; v < 4; ++v) {
+            const unsigned offset = c + 4u * v;
+            w0[v] = vld1q_f32(weights + offset);
+            w1[v] = vld1q_f32(weights + width + offset);
+            w2[v] = vld1q_f32(weights + 2u * width + offset);
+            prev1[v] = zero;
+            prev2[v] = zero;
+            if (first) {
+              const float *q =
+                projection + size_t(first - 1u) * 3u * width + offset;
+              prev1[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
+              q -= 3u * width;
+              prev2[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
+            } else if (history) {
+              prev1[v] = vld1q_f32(history + width + offset);
+              prev2[v] = vld1q_f32(history + offset);
+            }
+          }
+          for (unsigned r = first; r < last; ++r) {
+            const float *p = projection + size_t(r) * 3u * width + c;
+            float *g = gated + size_t(r) * width + c;
+            float *out = output + size_t(r) * width + c;
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+            for (unsigned v = 0; v < 4; ++v) {
+              const unsigned offset = 4u * v;
+              const float32x4_t cur = vmulq_f32(
+                vld1q_f32(p + 2u * width + offset), vld1q_f32(p + offset));
+              if (!state_only || r + 2u >= rows)
+                vst1q_f32(g + offset, cur);
+              float32x4_t value = vmulq_f32(cur, w0[v]);
+              value = vfmaq_f32(value, prev1[v], w1[v]);
+              value = vfmaq_f32(value, prev2[v], w2[v]);
+              vst1q_f32(out + offset,
+                        vmulq_f32(value, vld1q_f32(p + width + offset)));
+              prev2[v] = prev1[v];
+              prev1[v] = cur;
+            }
+          }
+        }
+        return;
+      }
       for (unsigned r = first; r < last; ++r) {
         const float *p = projection + size_t(r) * 3u * channels;
         float *g = gated + size_t(r) * channels;
@@ -185,14 +260,16 @@ static bool lfmConvFusedGatePrefill(const float *projection,
             const float *q = p - 3u * channels;
             prev1 =
               vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
-          }
+          } else if (history)
+            prev1 = vld1q_f32(history + channels + c);
           if (r >= first + 2u)
             prev2 = vld1q_f32(g - 2u * channels + c);
           else if (r >= 2u) {
             const float *q = p - 6u * channels;
             prev2 =
               vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
-          }
+          } else if (history)
+            prev2 = vld1q_f32(history + r * channels + c);
           float32x4_t v = vmulq_f32(cur, vld1q_f32(weights + c));
           v = vfmaq_f32(v, prev1, vld1q_f32(weights + channels + c));
           v = vfmaq_f32(v, prev2, vld1q_f32(weights + 2u * channels + c));
@@ -208,6 +285,7 @@ static bool lfmConvFusedGatePrefill(const float *projection,
   (void)output;
   (void)rows;
   (void)channels;
+  (void)history;
   return false;
 #endif
 }
@@ -316,10 +394,16 @@ lfmConvChunkedPrefill(nntrainer::ComputeOps *ops, void *in_weight,
                     writes[j].bytes))
         return false;
   }
-  constexpr unsigned int step = 1920;
+  static const bool whole_prefill = [] {
+    const char *value = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  // The strided FC entry can keep all rows in one retained output while
+  // walking VTCM-sized chunks internally. This also shares one CPU gate
+  // dispatch across the full projection.
+  const unsigned int step = whole_prefill ? rows : 1920u;
   for (unsigned int first = 0; first < rows; first += step) {
     const unsigned int count = std::min(step, rows - first);
-    const unsigned int last = first + count;
     const size_t chunk_bytes =
       static_cast<size_t>(count) * 3u * channels * sizeof(float);
     float *host = projection + static_cast<size_t>(first) * 3u * channels;
@@ -337,18 +421,13 @@ lfmConvChunkedPrefill(nntrainer::ComputeOps *ops, void *in_weight,
       ops->sync_to_host(host, chunk_bytes);
       view = host;
     }
-    nntrainer::ThreadManager::Global().parallel_for(
-      static_cast<size_t>(first), static_cast<size_t>(last), [&](size_t r) {
-        const float *a = view + (r - first) * 3u * channels;
-        const float *c = a + 2u * channels;
-        float *dst = gated + r * channels;
-        for (unsigned int j = 0; j < channels; ++j)
-          dst[j] = a[j] * c[j];
-      });
-    // All geometry/overlap guards were checked before the first RPC and
-    // for this view. Keep failure explicit instead of reading future rows.
-    if (!lfmConvPostGatePrefillRange(gated, weights, view, output, rows,
-                                     channels, first, last))
+    // Consume the retained projection in one pool dispatch. Only the second
+    // chunk needs the two completed history rows from the preceding chunk;
+    // independent stripes reconstruct their own boundaries from the view.
+    if (!lfmConvFusedGatePrefill(
+          view, weights, gated + static_cast<size_t>(first) * channels,
+          output + static_cast<size_t>(first) * channels, count, channels,
+          first ? gated + static_cast<size_t>(first - 2u) * channels : nullptr))
       throw std::runtime_error("conv_block: invalid retained chunk view");
   }
   std::memcpy(state, gated + static_cast<size_t>(rows - 2u) * channels,
@@ -453,6 +532,10 @@ void ConvBlockLayer::setProperty(const std::vector<std::string> &values) {
   for (const auto &v : values) {
     if (v == "short_conv_dtype=DW3_INT4")
       packed_short_conv_ = true;
+    else if (v == "out_to_host=false")
+      out_to_host_ = false;
+    else if (v == "out_to_host=true")
+      out_to_host_ = true;
     else
       filtered.push_back(v);
   }
@@ -612,10 +695,35 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       lfmConvChunkedPrefill(ops, in_w.getData<char>(), in_w.getScale<float>(),
                             in_step.getData<float>(), proj.getData<float>(), g,
                             w_ptr, y, state, rows, C)) {
-    ops->gemm_qs4cx_accel_fp32(out_w.getData<char>(), out_w.getScale<float>(),
-                               conv_out.getData<float>(),
-                               out_step.getData<float>(), rows, N, C);
-    ops->sync_to_host(out_step.getData(), rows * N * sizeof(float));
+    bool keep_output = false;
+#if defined(ENABLE_HEXKL)
+    const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+    keep_output = !out_to_host_ && !training && views &&
+                  std::strcmp(views, "1") == 0 &&
+                  out_step.getDataType() == fp32 && out_step.getContiguous();
+    const char *keep = std::getenv("NNTR_HTP_KEEP_OUT");
+    if (keep && std::strcmp(keep, "0") == 0)
+      keep_output = false;
+    // The graph's plain residual reads host_view immediately. Diagnostic
+    // readers access the logical host tensor, so publish the full output.
+    for (const char *name :
+         {"NNTR_HTP_DUMP", "NNTR_ACT_STATS", "NNTR_ACT_DUMP",
+          "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH", "NNTR_MOE_DIFF",
+          "NNTR_MOE_SHADOW", "NNTR_L2_DIFF", "NNTR_L2_SHADOW"})
+      if (std::getenv(name))
+        keep_output = false;
+#endif
+    if (keep_output) {
+      ops->gemm_q4_0_batch_norm_fp32(
+        {out_w.getData<char>()}, {out_w.getScale<float>()},
+        conv_out.getData<float>(), {out_step.getData<float>()}, rows, {N}, C,
+        nullptr, {0u}, nullptr, 0.0f, nullptr, 0u, 0u, false);
+    } else {
+      ops->gemm_qs4cx_accel_fp32(out_w.getData<char>(), out_w.getScale<float>(),
+                                 conv_out.getData<float>(),
+                                 out_step.getData<float>(), rows, N, C);
+      ops->sync_to_host(out_step.getData(), rows * N * sizeof(float));
+    }
     return;
   }
 #endif

@@ -2,16 +2,17 @@
 
 LFM2 24B A2B runs its hybrid convolution/attention decoder on Hexagon v81
 using the shared Gemma4 HTP backend. This guide covers the current weight
-formats, conversion, execution and validated performance in PR #4428 as of 2026-10-18.
+formats, conversion, execution and validated performance in PR #4428 as of 2026-10-19.
 For SDK installation, Android packaging and device staging, follow the
 [Gemma4 user guide](gemma4-htp-user-guide.md); the
 [code guide](gemma4-htp-code-guide.md) explains the shared backend.
 
-The SR15 CLI preset reaches a median 903.00 prefill tok/s and 17.85 decode
-tok/s on the measured S26 Ultra with startup preload 384. With the default
-preload 128, the corresponding medians are 798.13 and 17.74 tok/s. These are
-different presets with different startup costs; neither result is a
-per-run throughput guarantee.
+The automatic SR15 preset reached **1157.72 prefill tok/s and 17.3877 decode
+tok/s** as medians of three runs on the measured S26 Ultra with 2048 input
+tokens and preload 128. The native CLI now selects this preset automatically
+for `lfm2_moe` + `sr15_v2` + `htp_fused`. Explicit environment variables take
+precedence. These are short-run results for one fixed prompt, not sustained
+throughput or a per-run guarantee.
 
 ## Supported model packs
 
@@ -120,7 +121,7 @@ export LD_LIBRARY_PATH="$runtime_dir" ADSP_LIBRARY_PATH="$runtime_dir"
 
 The converter's SR15 defaults are `init_seq_len=256`, `max_seq_len=2048`
 and `num_to_generate=32`. They are a smoke preset, not the measured
-1024-token preset below. Keep dtype, engine and rotation metadata from
+2048-token preset below. Keep dtype, engine and rotation metadata from
 the converter when changing the prompt or generation budget.
 
 Each run begins an independent prompt with the loaded weights. Inputs
@@ -131,19 +132,56 @@ different geometry/position is rejected. This native model capability
 does not imply snapshot support through the public QuickDotAI loader.
 Weight reload requires a new model handle.
 
-## Validated performance preset
+## Default SR15 CLI preset
 
-The latest matched measurements used SM-S948U / Hexagon v81 on 2026-10-18,
-eight threads, 16 cached experts per MoE layer, no cache growth, direct
-model-file I/O and no layer/HTP profiling. SR15 had 1024 input tokens,
-`max_seq_len=2048`, greedy generation and 127 decode steps: 128 output IDs
-including the first token selected by prefill. EOS ID 7 was suppressed
-only for this fixed-length benchmark.
+`nntr_causallm` applies the preset after reading the model configuration and
+before creating the model. It sets only environment variables that are
+absent. An explicit zero is preserved, so the caller can disable individual
+options. `NNTR_LFM2_DEFAULT_PRESET=0` disables automatic preset selection.
+The CLI does not change the checkpoint, quantization, rotation, prompt,
+context length, generation budget or configured expert-cache size.
 
-For the same workload, generate the benchmark `nntr_config.json` on the
-host and place it in the matching converted pack. This preserves the
-original prompt and settings without depending on a removed measurement
-commit. The EOS suppression is only for this fixed-length benchmark.
+The preset uses eight CPU threads, direct model-file I/O
+(`NNTR_HTP_PAGE_CACHE=0`), no load prefetch and startup preload 128.
+It enables the selected prefill whole-call, convolution, mapped-view,
+parallel norm/add/staging and attention handoff paths; convolution stripes
+have eight rows. Prefill pruning stays disabled. Decode uses stable TL2
+slots, paired expert reads, demand handoff, gamma-aware prediction with
+residual blend 0.5 and top-three prefetch, and six direct-read slots.
+
+After the first decode step, idle prefill readers and unused heap pages are
+released and `NNTR_MOE_CACHE_GROW=1` adds one expert slot per layer. With
+`moe_cache_experts=16`, the 38-layer LFM2 cache starts at 608 experts and
+grows to 646. The arena allocation grain is 4 MiB. This phase reuse is not
+a fixed-cache comparison and does not establish a total-memory bound.
+The exact defaults are in
+[`lfm2_runtime_defaults.h`](../Applications/CausalLM/lfm2_runtime_defaults.h).
+
+These process-level defaults belong to the single-model CLI. They are not
+installed by the library or QuickDotAI API, and are not selected for
+Gemma4, unrotated LFM2 or other execution profiles. Diagnostic tracing and
+profiling are not enabled by the preset.
+
+For example, use the default combined preset, or retain the initial cache:
+
+```sh
+"$runtime_dir/nntr_causallm" "$model_dir"
+NNTR_MOE_CACHE_GROW=0 "$runtime_dir/nntr_causallm" "$model_dir"
+```
+
+Remove environment overrides left by previous experiments before comparing
+with the default run. In particular, old `NNTR_MOE_CACHE_GROW=0` or
+`NNTR_MOE_PRELOAD_EXPERTS=384` exports still take precedence.
+
+## Validated 2048-token workload
+
+The 2026-10-19 comparison used SM-S948U / Hexagon v81, batch one,
+`init_seq_len=2048`, `max_seq_len=4096`, C16, greedy generation and 127
+measured decode steps: 128 output IDs including the token selected by
+prefill. EOS ID 7 was suppressed only for this fixed-length benchmark.
+
+To reproduce its prompt in an existing converted SR15 pack, update a copy
+of its configuration on the host:
 
 ```bash
 python3 - /path/to/lfm2-sr15/nntr_config.json <<'PYCONFIG'
@@ -151,124 +189,86 @@ import json
 import sys
 from pathlib import Path
 
-config = json.loads(r'''
-{
-  "model_type": "CausalLM",
-  "model_tensor_type": "FP32-FP32",
-  "model_file_name": "LFM2-24B-A2B-Ternary-INT4.bin",
-  "lfm2_weight_format": "sr15_v2",
-  "lfm2_execution_profile": "htp_fused",
-  "embedding_dtype": "Q4_0",
-  "fc_layer_dtype": "QS4CX_WH_AFFINE",
-  "lmhead_dtype": "QS4CX_WH_AFFINE",
-  "router_dtype": "QS4CX_WH_AFFINE",
-  "moe_layer_dtype": "TL2CX_WH",
-  "short_conv_dtype": "DW3_INT4",
-  "moe_engine": "htp",
-  "attn_proj_engine": "htp",
-  "dense_ffn_engine": "htp",
-  "attention_engine": "htp",
-  "attention_kv_dtype": "q8_row",
-  "lmhead_engine": "htp",
-  "moe_hadamard": "both",
-  "moe_hadamard_scope": "all",
-  "batch_size": 1,
-  "init_seq_len": 1024,
-  "max_seq_len": 2048,
-  "num_to_generate": 127,
-  "tokenizer_file": "tokenizer.json",
-  "bad_word_ids": [
-    7
-  ],
-  "moe_cache_experts": 16,
-  "sample_input": "",
-  "activation_quantization": "dynamic",
-  "skip_prefill": false
-}
-''')
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
 notes = (
     "A community garden provides vegetables and a place for neighbors to work "
     "together. Volunteers share tools, water plants, make compost, and keep "
     "a planting calendar. "
 )
-config["sample_input"] = (
-    "<|im_start|>user\n" + notes * 31
-    + "A community garden provides vegetables and a place for neighbors to work "
-    "together. Volunteers share tools, water plants, make compost, and keep "
-    "a planting Note. \nUsing the notes above, write a detailed practical guide "
-    "of at least 200 words for starting a community garden.<|im_end|>\n"
-    "<|im_start|>assistant\n"
+config.update(
+    init_seq_len=2048,
+    max_seq_len=4096,
+    num_to_generate=127,
+    moe_cache_experts=16,
+    bad_word_ids=[7],
+    skip_prefill=False,
+    sample_input=(
+        "<|im_start|>user\n" + notes * 65
+        + "..\nUsing the notes above, write a detailed practical guide "
+        "of at least 200 words for starting a community garden.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ),
 )
-Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + "\n")
+config.pop("chat_input", None)
+path.write_text(json.dumps(config, indent=2) + "\n")
 PYCONFIG
 ```
 
 The measured binary is 5,433,850,513 bytes, SHA256
 `8a424db49615749dc28496bd007f53d9961e700c0c2cc022bc638056648228bc`.
-The benchmark configuration SHA256 is
-`fcbea14cb03aaee7bbceb6fa43ca8f3bd1f25e7995ec01c073bcddf9ac172964`.
-A different checkpoint, tokenizer or prompt is a different workload.
+The measured configuration SHA256 is
+`e9e3b1678443255e028f1f3336be1c6aecc1311e379cff2838a9851e392a528b`.
+All six paired runs reproduced the same 128 IDs, whose newline-separated
+file SHA256 is
+`6706ee8cd9a2117a77e25a9ad1f99fa91906e9e0a87e2567cf3235b134015882`.
+Different checkpoints, tokenizers or prompts are different workloads.
 
-On the device, use the runtime/model paths set above:
+| Runtime / preset | Runs | Prefill median (range), tok/s | Decode median (range), tok/s |
+|---|---:|---:|---:|
+| Prefill optimization only | 3 | 1147.98 (1146.70–1153.80) | 16.303 (16.2967–16.3176) |
+| Combined prefill and decode | 3 | 1153.15 (1145.41–1157.72) | 17.402 (17.3996–17.4187) |
 
-```sh
-unset NNTR_HTP_PROFILE NNTR_LAYER_PROFILE NNTR_M0_PROFILE
-export NNTR_NUM_THREADS=8 NNTR_HTP_PAGE_CACHE=0 NNTR_LOAD_PREFETCH=0
-export NNTR_MOE_CACHE_GROW=0 NNTR_MOE_PRELOAD_EXPERTS=384
-export NNTR_HTP_TL2_STABLE_SLOTS=1 NNTR_LFM2_PREFILL_EARLY=1
-export NNTR_LFM2_DECODE_PAIR_READ=1 NNTR_LFM2_DECODE_DEMAND_HANDOFF=1
-export NNTR_HTP_PREDICT=2 NNTR_MOE_PREFETCH_RESIDUAL=0.5 NNTR_INIT_TRACE=1
-"$runtime_dir/nntr_causallm" "$model_dir"
-```
+The runs alternated baseline/candidate and candidate/baseline. Launches
+required five seconds without another inference process, current HAL AP
+at most 34 °C and skin at most 36.5 °C. No layer or HTP profiler was active.
+Combined decode improved 6.74% relative to the matched prefill-only
+runtime. The app's prefill and generation timers define these rates;
+they do not measure process startup or complete first-token latency.
 
-Use `NNTR_MOE_PRELOAD_EXPERTS=128` for the default-preload comparison.
-Preload 384 changes startup residency, not expert capacity: C16 remains
-608 resident slots across 38 MoE layers. It moves work ahead of prefill,
-so evaluate startup and first-token latency as well as prefill throughput.
-These options are an explicit benchmark preset, not a change to defaults.
+The final CLI was then tested three times with no performance environment
+overrides. Only the runtime library paths and output-ID capture were set;
+the automatic preset was active in every run. Prefill measured 1159.03,
+1151.21 and 1157.72 tok/s (median **1157.72**), and decode measured 17.4259,
+17.2813 and 17.3877 tok/s (median **17.3877**). All three runs reproduced
+the same 128 IDs above. These runs verify automatic selection separately
+from the earlier paired optimization comparison.
 
-The final benchmark compared the runtime after the six SR15 optimization
-commits (ending with `[CausalLM] Batch native LFM startup expert loads`)
-against the earlier runtime ending with `[HTP] Accelerate LFM2 INT4 router
-and 1536-wide Hadamard rotation`. The table reports the final candidate
-medians from that series. The history cleanup removed measurement-only
-commits and changed descendant commit IDs without changing runtime sources.
-Later documentation changes are not separate device measurements.
+The same final runtime also passed three paired Gemma4 native TL2/affine
+regression runs with 1024 input tokens, C16/preload 128 and 64 decode steps.
+All 65 output IDs matched the reference, and the LFM2 preset remained
+inactive. Baseline and current medians were respectively 621.736/12.9110
+and 632.099/12.9923 prefill/decode tok/s. See the
+[Gemma4 guide](gemma4-htp-user-guide.md) for the workload and comparison.
 
-| Model and preset | Input tokens | Decode steps | Runs | Prefill tok/s | Decode tok/s |
-|---|---:|---:|---:|---:|---:|
-| SR15, preload 384 | 1024 | 127 | 5 | 903.00 | 17.85 |
-| SR15, preload 128 | 1024 | 127 | 3 | 798.13 | 17.74 |
-| Unrotated LFM2, preload 128 | 1024 | 64 | 3 | 841.41 | 17.08 |
-| Unrotated LFM2, preload 128 | 2048 | 64 | 3 | 965.58 | 16.10 |
-| Unrotated Gemma4, preload 128 | 1024 | 64 | 3 | 621.36 | 12.32 |
-
-All 34 normal baseline/candidate runs preserved their reference output
-IDs. The unrotated LFM2 1024-token decode median was 1.31% lower than its
-paired baseline; the series does not establish zero performance regression.
-The unrotated LFM2 runs additionally enabled `NNTR_LFM2_ROUTER_INPUT_HANDOFF=1`
-and `NNTR_LFM2_ROUTER_ARM=1`; Gemma4 used the common environment without
-the LFM2 optimization switches. The cohorts have different decode lengths
-and must not be treated as a controlled cross-model speed comparison.
-
-| SR15 preset | Startup to load-ready ms | Run TTFT ms | Estimated main-to-first-token ms | Sampled peak MiB |
-|---|---:|---:|---:|---:|
-| Preload 128 | 728.60 | 1287.97 | 2018.47 | 2110.85 |
-| Preload 384 | 869.30 | 1138.12 | 2005.12 | 2110.28 |
-
-Startup includes configuration, initialization, loading and repacking.
-Run TTFT includes run setup and prefill. Estimated main-to-first-token is
-their per-run sum, excluding process-loader startup and the small gap
-between scopes; table entries are medians, so they need not add exactly.
-Memory is sampled every 20 ms over process lifetime as RssAnon plus
-deduplicated size-bearing FD allocations. It excludes unreported DSP/driver
-memory. At preload 384 the peak increased by 47.86 MiB versus its matched
-baseline despite unchanged expert capacity. Prefill ranged from 824.48 to
-914.29 tok/s across the five candidate runs.
+The earlier 2026-10-18 SR15 result (903.00 prefill / 17.85 decode tok/s)
+used a different 1024-token prompt and preload 384. Its preload-128
+comparison was 798.13 / 17.74 tok/s. Those historical results must not be
+mixed with the 2048-token comparison or interpreted as its baseline.
 
 ## Validation and limits
 
-The final runtime passed Android ARM64 and v81 DSP builds and 13 device
+The 2026-10-19 runtime passed Android ARM64 application/backend and v81
+DSP builds. The default-selection check covers model/profile isolation,
+explicit overrides and opt-out. Additional host checks passed sanitized
+prefetch cancellation and signed-Hadamard parity/canary cases, including
+portable and SDK libnative paths. The optional native HVX GEMV/quantizer
+checks were run separately with the SDK tools path set.
+The host suite completed through the repaired router-handoff fixture and
+remaining TL2/abs-max checks. The optional abs-max NEON emulation was not
+run because the AArch64 cross compiler or QEMU was unavailable.
+
+Earlier SR15 validation passed Android ARM64 and v81 DSP builds and 13 device
 regression entries covering Hadamard transforms, convolution continuation,
 KV operations, embedding row caching, RMSNorm, repeated prompts and
 snapshot cross-loading. Host checks cover routing assignment order,
@@ -289,10 +289,10 @@ the status of the full cross-platform CI matrix.
 
 ## Evidence and code references
 
-The measurement archives and their archive-only commits have been removed
-from this PR. This guide retains the measured workload, configuration,
-medians, memory definition and validation limits; the raw per-run logs,
-output-ID files, memory samples and binary manifests are no longer included.
+Raw validation artifacts are kept outside the commits in this PR. This
+guide retains the measured workload, configuration, medians, memory
+definition and validation limits. Per-run logs, output-ID files, memory
+samples and binary manifests remain local measurement artifacts.
 Earlier bring-up numbers and intermediate trials are not current results.
 
 | Source | Responsibility |

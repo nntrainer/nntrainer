@@ -36,6 +36,20 @@ static void disjoint_expand(const uint8_t *src, uint32_t rows, uint32_t cols,
   hvx_tl2_expand_wh96_disjoint(src, rows, cols, stride, mag, dst);
 }
 
+static void batch_expand(const uint8_t *src, uint32_t groups, uint32_t stride,
+                         int mag, uint8_t *dst) {
+  disjoint_calls += groups;
+  if (!src) {
+    fprintf(stderr, "FAIL: caller selection missing packed source\n");
+    abort();
+  }
+  const uintptr_t s = (uintptr_t)src, d = (uintptr_t)dst;
+  const size_t sn = groups * 2560u;
+  const size_t dn = (size_t)groups * 3u * stride;
+  assert(s + sn <= d || d + dn <= s);
+  hvx_tl2_expand_wh96_disjoint_batch(src, groups, stride, mag, dst);
+}
+
 /** The runner extracts these complete types/functions without rewriting their
  * bodies. Only names are changed to link both production versions together. */
 #include "candidate-unit.inc"
@@ -146,6 +160,45 @@ static unsigned primitive_checks(void) {
   return cases;
 }
 
+/** Batch runs cross native-24 and HMX-32 boundaries repeatedly. Compare
+ * all bytes with the bounded entry already checked against the oracle. */
+static unsigned batch_checks(void) {
+  const uint32_t groups[] = {0u, 1u, 2u, 3u, 8u, 21u};
+  const uint32_t strides[] = {2048u, 32768u, 49152u};
+  const uint32_t offsets[] = {0u, 1u, 31u};
+  const int magnitudes[] = {1, 7, 2};
+  unsigned cases = 0;
+  for (unsigned gi = 0; gi < 6u; ++gi)
+    for (unsigned si = 0; si < 3u; ++si)
+      for (unsigned oi = 0; oi < 3u; ++oi)
+        for (unsigned mi = 0; mi < 3u; ++mi)
+          for (unsigned mode = 0; mode < 4u; ++mode) {
+            const uint32_t n = groups[gi], stride = strides[si];
+            const size_t sn = (size_t)n * 2560u;
+            const size_t dn = (size_t)n * 3u * stride;
+            uint8_t *source = allocate(sn + 256u);
+            uint8_t *saved = allocate(sn + 256u);
+            uint8_t *a = allocate(dn + 256u), *b = allocate(dn + 256u);
+            uint8_t *src = source + offsets[oi];
+            pattern(src, sn, mode);
+            memcpy(saved, source, sn + 256u);
+            for (uint32_t g = 0; g < n; ++g)
+              hvx_tl2_expand_wh96(src + g * 2560u, 96u, 128u, stride,
+                                  magnitudes[mi],
+                                  a + offsets[oi] + (size_t)g * 3u * stride);
+            hvx_tl2_expand_wh96_disjoint_batch(src, n, stride, magnitudes[mi],
+                                               b + offsets[oi]);
+            expect_equal(a, b, dn + 256u, "batch bounded-entry parity/canary");
+            expect_equal(source, saved, sn + 256u, "batch input unchanged");
+            free(source);
+            free(saved);
+            free(a);
+            free(b);
+            ++cases;
+          }
+  return cases;
+}
+
 static unsigned popcount(uint64_t x) {
   unsigned n = 0;
   for (; x; x &= x - 1u)
@@ -236,8 +289,9 @@ static unsigned caller_checks(void) {
 
 int main(void) {
   const unsigned primitive = primitive_checks(), callers = caller_checks();
+  const unsigned batches = batch_checks();
   printf("PASS: %u primitive parity/oracle/canary cases; %u actual caller "
-         "selection/snapshot/worker-partition cases\n",
-         primitive, callers);
+         "selection/snapshot/worker-partition cases; %u batch cases\n",
+         primitive, callers, batches);
   return 0;
 }

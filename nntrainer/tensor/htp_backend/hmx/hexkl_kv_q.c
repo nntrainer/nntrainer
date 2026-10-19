@@ -286,6 +286,14 @@ void hexkl_kv_q_stage(hexkl_kv_q *kv, uint32_t n, uint32_t c) {
 #ifdef __hexagon__
 static uint16_t g_wh_i8_pos[1024];
 static int g_wh_i8_state; /* 0 unprobed, 1 usable, -1 not */
+static int g_wh_i8_segments;
+static inline int wh_i8_segments_match(const uint16_t *pos) {
+  for (uint32_t r = 0; r < 32u; ++r)
+    for (uint32_t k = 0; k < 32u; ++k)
+      if (pos[r * 32u + k] != (r / 4u) * 128u + 4u * k + r % 4u)
+        return 0;
+  return 1;
+}
 
 static int wh_i8_probe(uint8_t *vtcm_base) {
   if (g_wh_i8_state != 0) {
@@ -314,6 +322,7 @@ static int wh_i8_probe(uint8_t *vtcm_base) {
     seen[idx] = 1;
     g_wh_i8_pos[idx] = (uint16_t)p;
   }
+  g_wh_i8_segments = wh_i8_segments_match(g_wh_i8_pos);
   g_wh_i8_state = 1;
   return 1;
 }
@@ -334,6 +343,33 @@ static void write_row_i8_tiles(hexkl_kv_q *kv, uint32_t n, uint32_t row,
     for (uint32_t j = 0; j < 32u; ++j) {
       kt[g_wh_i8_pos[j * 32u + rr]] = (uint8_t)qk[32u * d + j];
       vt[g_wh_i8_pos[rr * 32u + j]] = (uint8_t)qv[32u * d + j];
+    }
+  }
+}
+
+static void copy_interleaved_i8_tile(hexkl_kv_q *kv, uint32_t n, uint32_t c) {
+#ifdef __hexagon__
+  const HVX_Vector bias = Q6_V_vsplat_R(0x80808080);
+#endif
+  for (uint32_t d = 0; d < kv->n_dot_tiles; ++d) {
+    uint8_t *kt = kv->kt + hexkl_kv_q_tile_off(kv, n, c, d);
+    uint8_t *vt = kv->v + hexkl_kv_q_tile_off(kv, n, c, d);
+    for (uint32_t seg = 0; seg < 8u; ++seg) {
+      const uint8_t *km =
+        kv->kt4 + hexkl_kv_q_kt4_index(kv, n, 32u * c, 32u * d + 4u * seg);
+      const uint8_t *vm =
+        kv->v4 + hexkl_kv_q_v4_index(kv, n, 32u * c + 4u * seg, 32u * d);
+#ifdef __hexagon__
+      hvx_tile_store_u(kt + 128u * seg,
+                       Q6_V_vxor_VV(hvx_tile_load_u(km), bias));
+      hvx_tile_store_u(vt + 128u * seg,
+                       Q6_V_vxor_VV(hvx_tile_load_u(vm), bias));
+#else
+      for (uint32_t b = 0; b < 128u; ++b) {
+        kt[128u * seg + b] = km[b] ^ 0x80u;
+        vt[128u * seg + b] = vm[b] ^ 0x80u;
+      }
+#endif
     }
   }
 }
@@ -736,6 +772,73 @@ static void append_dynamic_heads(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
 }
 
 #ifdef __hexagon__
+/** Quantize one complete hd64 head/tile and write both cache layouts in
+ * vectors. Staging holds only this worker's signed rows; the original per-row
+ * quantizers produce every byte and metadata value before layout conversion.
+ */
+static void append_dynamic_tile64(hexkl_kv_q *kv, uint32_t head, uint32_t row0,
+                                  const uint16_t *k_rows,
+                                  const uint16_t *v_rows) {
+  int8_t k[2048] __attribute__((aligned(128)));
+  int8_t v[2048] __attribute__((aligned(128)));
+  const uint32_t stride = kv->n_head_kv * 64u;
+  for (uint32_t r = 0; r < 32u; ++r) {
+    const size_t src = (size_t)r * stride + head * 64u;
+    const size_t meta = hexkl_kv_q_sk_index(kv, head, row0 + r);
+    hvx_kv_quant_k_row(k_rows + src, 64u, kv->qmax, k + r * 64u, kv->s_k + meta,
+                       kv->colsum_k + meta);
+    hvx_kv_quant_v_row(v_rows + src, 64u, kv->qmax, v + r * 64u,
+                       kv->s_v + hexkl_kv_q_sv_index(kv, head, row0 + r));
+  }
+  const uint32_t col = row0 / 32u;
+  const HVX_Vector bias = Q6_V_vsplat_R(0x80808080);
+  // V: each pair is two contiguous 64-byte rows. Interleave four rows
+  // through bytes then halfwords to form the two WH dim-tile segments.
+  for (uint32_t seg = 0; seg < 8u; ++seg) {
+    const HVX_Vector ab = ((const HVX_Vector *)v)[2u * seg];
+    const HVX_Vector cd = ((const HVX_Vector *)v)[2u * seg + 1u];
+    const HVX_VectorPair first = Q6_W_vshuff_VVR(Q6_V_vror_VR(ab, 64), ab, -1);
+    const HVX_VectorPair last = Q6_W_vshuff_VVR(Q6_V_vror_VR(cd, 64), cd, -1);
+    const HVX_VectorPair words =
+      Q6_W_vshuff_VVR(Q6_V_lo_W(last), Q6_V_lo_W(first), -2);
+    const HVX_Vector out[2] = {Q6_V_lo_W(words), Q6_V_hi_W(words)};
+    for (uint32_t d = 0; d < 2u; ++d) {
+      hvx_tile_store_u(
+        kv->v + hexkl_kv_q_tile_off(kv, head, col, d) + 128u * seg, out[d]);
+      hvx_tile_store_u(
+        kv->v4 + hexkl_kv_q_v4_index(kv, head, row0 + 4u * seg, 32u * d),
+        Q6_V_vxor_VV(out[d], bias));
+    }
+  }
+  // K: transpose the 16 pairs of rows at word width, then interleave
+  // their even/odd row halves. Each result is four dims across all 32 rows.
+  HVX_Vector words[16];
+  for (uint32_t r = 0; r < 16u; ++r)
+    words[r] = ((const HVX_Vector *)k)[r];
+  for (uint32_t distance = 8u; distance; distance >>= 1u)
+    for (uint32_t r = 0; r < 16u; ++r) {
+      if (r & distance)
+        continue;
+      const HVX_VectorPair pair =
+        Q6_W_vshuff_VVR(words[r + distance], words[r], -4);
+      words[r] = Q6_V_lo_W(pair);
+      words[r + distance] = Q6_V_hi_W(pair);
+    }
+  for (uint32_t pair_idx = 0; pair_idx < 8u; ++pair_idx) {
+    const HVX_VectorPair pair =
+      Q6_W_vshuff_VVR(words[pair_idx + 8u], words[pair_idx], -4);
+    const HVX_Vector out[2] = {Q6_V_lo_W(pair), Q6_V_hi_W(pair)};
+    for (uint32_t half = 0; half < 2u; ++half) {
+      const uint32_t seg = pair_idx * 2u + half;
+      hvx_tile_store_u(kv->kt + hexkl_kv_q_tile_off(kv, head, col, seg / 8u) +
+                         128u * (seg % 8u),
+                       out[half]);
+      hvx_tile_store_u(kv->kt4 + hexkl_kv_q_kt4_index(kv, head, row0, 4u * seg),
+                       Q6_V_vxor_VV(out[half], bias));
+    }
+  }
+}
+
 typedef struct {
   hexkl_kv_q *kv;
   uint32_t row0, n_rows;
@@ -754,9 +857,20 @@ static void dynamic_heads_worker(uint32_t n_threads, uint32_t i, void *arg) {
     for (uint32_t u = units * i / n_threads; u < units * (i + 1u) / n_threads;
          ++u) {
       const uint32_t head = u / blocks, row = 32u * (u % blocks);
-      append_dynamic_heads(
-        c->kv, c->row0 + row, 32u, c->k_rows + (size_t)row * stride,
-        c->v_rows + (size_t)row * stride, c->direct, head, head + 1u);
+      const int tile_copy =
+        c->direct && g_wh_i8_segments && !c->kv->plain_masters;
+      if (tile_copy && !c->kv->fixed && c->kv->head_dim == 64u) {
+        append_dynamic_tile64(c->kv, head, c->row0 + row,
+                              c->k_rows + (size_t)row * stride,
+                              c->v_rows + (size_t)row * stride);
+        continue;
+      }
+      append_dynamic_heads(c->kv, c->row0 + row, 32u,
+                           c->k_rows + (size_t)row * stride,
+                           c->v_rows + (size_t)row * stride,
+                           tile_copy ? 0 : c->direct, head, head + 1u);
+      if (tile_copy)
+        copy_interleaved_i8_tile(c->kv, head, (c->row0 + row) / 32u);
     }
     return;
   }

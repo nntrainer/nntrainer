@@ -38,6 +38,10 @@ static void stagedMemcpy(void *d, const void *s, size_t n, int = 0) {
   ion_copy_bytes += n;
   std::memcpy(d, s, n);
 }
+/** @brief Leave copy dispatch serial in this ownership-only fixture. */
+static bool tryParallelStagedMemcpy(void *, const void *, size_t, int) {
+  return false;
+}
 struct HtpRpcBuffer {
   std::vector<uint8_t> memory;
   uint8_t *mapped = nullptr; // Fixture-only alternate mapping of the same ION.
@@ -96,12 +100,9 @@ template <typename... Args> static int nntr_hvx_attn_f16_prefill(Args... args) {
   return direct_rpc<19>(args...);
 }
 struct Backend {
-  struct IonAlias {
-    const void *host = nullptr;
-    const void *ion = nullptr;
-    size_t bytes = 0;
-  };
-  std::array<IonAlias, 16> ion_alias_{};
+// clang-format off
+#include "ion_alias_state.inc"
+  // clang-format on
   htp_router_handoff router_handoff_{};
   std::mutex invoke_mutex_;
 // clang-format off

@@ -30,17 +30,67 @@
 #define __aarch64__ 1
 #endif
 #include <htp_router_handoff.h>
+#define ENABLE_HEXKL 1
 #define ml_logw(...) ((void)0)
 
 static void check(bool ok, const char *message) {
   if (!ok)
     throw std::runtime_error(message);
 }
+static bool sameOutput(const float *a, const float *b, size_t count) {
+#ifdef CONV_SIMDE_FIXTURE
+  // x86 FMA may select a different NaN operand's payload than ARM. Preserve
+  // exact checks for every finite value, infinity and signed zero; the native
+  // ARM fixture also checks NaN payloads byte for byte.
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t x, y;
+    std::memcpy(&x, a + i, sizeof(x));
+    std::memcpy(&y, b + i, sizeof(y));
+    if (x != y &&
+        !((x & 0x7fffffffu) > 0x7f800000u && (y & 0x7fffffffu) > 0x7f800000u))
+      return false;
+  }
+  return true;
+#else
+  return std::memcmp(a, b, count * sizeof(float)) == 0;
+#endif
+}
+static bool stateOnlyGated() {
+  const char *tile = std::getenv("NNTR_LFM2_CONV_CHANNEL_TILE");
+  const char *state = std::getenv("NNTR_LFM2_CONV_STATE_ONLY");
+  return tile && std::strcmp(tile, "1") == 0 && state &&
+         std::strcmp(state, "1") == 0;
+}
+static bool sameGated(const float *got, const float *expected, size_t count,
+                      unsigned rows, bool chunked = false) {
+  if (!stateOnlyGated())
+    return sameOutput(got, expected, count);
+  const char *whole = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
+  const bool split = chunked && !(whole && std::strcmp(whole, "1") == 0);
+  for (size_t r = 0; r < count / 2048u; ++r) {
+    const bool saved =
+      (r < rows && r + 2u >= rows) || (split && (r == 1918u || r == 1919u));
+    if (saved) {
+      if (!sameOutput(got + r * 2048u, expected + r * 2048u, 2048))
+        return false;
+    } else {
+      for (size_t c = 0; c < 2048u; ++c)
+        if (got[r * 2048u + c] != -9876.0f)
+          return false;
+    }
+  }
+  return true;
+}
 static unsigned cases = 0;
 static size_t copied_bytes = 0;
 static void stagedMemcpy(void *d, const void *s, size_t n, int = 0) {
   std::memcpy(d, s, n);
   copied_bytes += n;
+}
+// This fixture exercises staging ownership; the real parallel-copy helper and
+// ThreadManager contention are tested separately with the actual CPU pool.
+static bool tryParallelStagedMemcpy(void *, const void *, size_t, int) {
+  return false;
 }
 namespace nntrainer {
 struct ThreadManager {
@@ -93,7 +143,7 @@ struct ViewBase {
 struct ComputeOps : ViewBase {
 #include "staging.inc"
 #include "views.inc"
-  StagingPool act_pool_, out_pool_, x2_pool_;
+  StagingPool act_pool_, out_pool_, x2_pool_, attn_out_pool_;
   htp_router_handoff router_handoff_{};
   std::mutex invoke_mutex_;
   enum View {
@@ -108,6 +158,8 @@ struct ComputeOps : ViewBase {
   View mode = Separate;
   bool supported = true, poison_old = true;
   unsigned output_projections = 0;
+  bool mock_output_projection = false;
+  unsigned retained_output_projections = 0;
   unsigned calls = 0, syncs = 0, views = 0, fail_rpc = 0, fail_sync = 0;
   const float *input_base = nullptr, *truth = nullptr;
   float *gated = nullptr, *output = nullptr, *state = nullptr;
@@ -117,10 +169,34 @@ struct ComputeOps : ViewBase {
   void gemm_qs4cx_accel_fp32(const char *w, const float *scales,
                              const float *in, float *out, unsigned rows,
                              unsigned n, unsigned k) {
-    check(w && scales && in == output && out == output && rows == 2048 &&
+    check(w && scales && in == output &&
+            (mock_output_projection || out == output) && rows == 2048 &&
             n == 2048 && k == 2048,
           "chunked output projection must use the layer's packed HTP path");
+    if (mock_output_projection)
+      projectOutput(in, out, rows, false);
+    else
+      ++output_projections;
+  }
+  void projectOutput(const float *in, float *dst, unsigned rows,
+                     bool retained) {
+    const size_t bytes = size_t(rows) * 2048u * sizeof(float);
+    auto &input = stageInput(act_pool_, in, bytes, &out_pool_);
+    check(sameOutput(reinterpret_cast<const float *>(input.data()),
+                     expected_output, size_t(rows) * 2048u),
+          "output projection sees stale CPU convolution");
+    auto &out = stage(out_pool_, bytes);
+    float *values = reinterpret_cast<float *>(out.data());
+    const float *source = reinterpret_cast<const float *>(input.data());
+    for (size_t i = 0; i < bytes / sizeof(float); ++i)
+      values[i] = source[i] * 0.5f;
+    if (retained)
+      sampledCopy(dst, values, bytes);
+    else
+      stagedMemcpy(dst, values, bytes);
+    noteIonAlias(dst, values, bytes, !retained);
     ++output_projections;
+    retained_output_projections += retained;
   }
   bool supports_gemm_q4_0_batch_norm_fp32() const { return supported; }
   const void *view(const void *host, size_t n) {
@@ -149,9 +225,9 @@ struct ComputeOps : ViewBase {
     const size_t first = size_t(input - input_base) / 2048u;
     check(first == 0 || first == 1920, "unexpected input row offset");
     if (first == 1920 && expected_gated) {
-      check(std::memcmp(gated, expected_gated, 1920u * 2048u * 4u) == 0,
+      check(sameGated(gated, expected_gated, 1920u * 2048u, 1920u),
             "first gated chunk not completed before next RPC");
-      check(std::memcmp(output, expected_output, 1920u * 2048u * 4u) == 0,
+      check(sameOutput(output, expected_output, 1920u * 2048u),
             "first conv chunk not completed before next RPC");
       if (poison_old) {
         auto &old = out_pool_.by_class[size_t(64) << 20];
@@ -172,7 +248,7 @@ struct ComputeOps : ViewBase {
       stagedMemcpy(dst, out.data(), out_bytes);
     else
       sampledCopy(dst, out.data(), out_bytes);
-    noteIonAlias(dst, out.data(), out_bytes);
+    noteIonAlias(dst, out.data(), out_bytes, false);
     requests.push_back({in_bytes, out_bytes, act.size(), out.size()});
   }
   void
@@ -182,6 +258,15 @@ struct ComputeOps : ViewBase {
                             const float *pre, const std::vector<unsigned> &post,
                             const float *gamma, float eps, const float *rope,
                             unsigned hd, unsigned rope_weights, bool to_host) {
+    if (mock_output_projection && widths == std::vector<unsigned>{2048}) {
+      check(w.size() == 1 && w[0] && scales.size() == 1 && scales[0] &&
+              dst.size() == 1 && rows == 2048 && k == 2048 && !pre &&
+              post == std::vector<unsigned>{0} && !gamma && eps == 0 && !rope &&
+              !hd && !rope_weights && !to_host,
+            "retained output FC contract changed");
+      projectOutput(in, dst[0], rows, true);
+      return;
+    }
     check(w.size() == 1 && w[0] && scales.size() == 1 && scales[0] &&
             dst.size() == 1 && widths == std::vector<unsigned>{6144} &&
             k == 2048 && !pre && post == std::vector<unsigned>{0} && !gamma &&
@@ -270,11 +355,11 @@ struct Fixture {
       weights.data(), out.data(), state.data(), rows, channels);
   }
   void exact() {
-    check(std::memcmp(g.data(), refg.data(), g.size() * 4) == 0,
+    check(sameGated(g.data(), refg.data(), g.size(), M, true),
           "gated byte mismatch");
-    check(std::memcmp(out.data(), refout.data(), out.size() * 4) == 0,
+    check(sameOutput(out.data(), refout.data(), out.size()),
           "output byte mismatch");
-    check(std::memcmp(state.data(), refstate.data(), state.size() * 4) == 0,
+    check(sameOutput(state.data(), refstate.data(), state.size()),
           "state byte mismatch");
   }
 };
@@ -467,7 +552,8 @@ static void appRoute(Tensor &in_step, Tensor &in_w, Tensor &out_w, Tensor &proj,
                      float *state, const float *w_ptr,
                      nntrainer::ComputeOps *ops, unsigned rows, unsigned K,
                      unsigned C, unsigned N, unsigned from, bool compare,
-                     bool htp_owns_state_, bool &fellthrough) {
+                     bool htp_owns_state_, bool &fellthrough,
+                     bool out_to_host_ = true, bool training = false) {
   const auto affine = nntrainer::Tdatatype::QS4CX_WH_AFFINE;
 #include "app_route.inc"
   (void)p;
@@ -622,7 +708,7 @@ static void fused_gate_stripes() {
                                                  f.weights.data(), f.g.data(),
                                                  f.out.data(), rows, C),
               "fused stripe rejected");
-        check(std::memcmp(f.g.data(), f.refg.data(), f.g.size() * 4) == 0,
+        check(sameGated(f.g.data(), f.refg.data(), f.g.size(), rows),
               "fused pre-gate/history/canary differs");
         for (size_t i = 0; i < f.out.size(); ++i) {
           uint32_t got, want;
@@ -667,8 +753,157 @@ static void fused_gate_stripes() {
     }
 }
 
+static void retained_host_views() {
+  constexpr size_t bytes = 8192;
+  std::vector<uint8_t> host(bytes, 0), expected(bytes), other(bytes, 0);
+  for (size_t i = 0; i < bytes; ++i)
+    expected[i] = uint8_t((i * 13u + 7u) % 251u);
+  nntrainer::ComputeOps ops;
+  auto &buffer = ops.stage(ops.out_pool_, bytes);
+  std::memcpy(buffer.data(), expected.data(), bytes);
+  ops.copyOutOf(ops.out_pool_, host.data(), bytes, false);
+  check(host != expected, "retained fixture unexpectedly copied whole output");
+  check(ops.host_view(host.data(), bytes) == buffer.data(),
+        "kept whole view not resolved");
+  ++cases;
+  check(ops.host_view(host.data() + 1024, 4096) == buffer.data() + 1024,
+        "kept subrange view not resolved");
+  ++cases;
+  ops.sync_to_host(host.data(), bytes);
+  check(host == expected, "view fallback sync differs");
+  ++cases;
+  host[0] ^= 0x20;
+  check(ops.host_view(host.data(), bytes) == host.data(),
+        "CPU overwrite incorrectly reused retained view");
+  ++cases;
+
+  // Swap a new kept result into a pool whose previous kept input has no
+  // remaining reader. The actual stageInput marks that old tensor as lost.
+  auto &old = ops.stage(ops.act_pool_, bytes);
+  std::memcpy(old.data(), expected.data(), bytes);
+  ops.copyOutOf(ops.act_pool_, host.data(), bytes, false);
+  auto &next = ops.stage(ops.out_pool_, bytes);
+  for (size_t i = 0; i < bytes; ++i)
+    next.data()[i] = uint8_t(expected[i] ^ 0x80u);
+  ops.copyOutOf(ops.out_pool_, other.data(), bytes, false);
+  const void *next_ptr = next.data();
+  ops.stageInput(ops.act_pool_, other.data(), bytes, &ops.out_pool_);
+  check(ops.host_view(other.data(), bytes) == next_ptr,
+        "swapped retained view not found in activation pool");
+  ++cases;
+  bool threw = false;
+  try {
+    (void)ops.host_view(host.data(), bytes);
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  check(threw, "lost retained host view accepted");
+  ++cases;
+}
+
+static void retained_output_route() {
+  const char *diagnostics[] = {
+    nullptr,         "NNTR_HTP_DUMP",      "NNTR_ACT_STATS",
+    "NNTR_ACT_DUMP", "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH",
+    "NNTR_MOE_DIFF", "NNTR_MOE_SHADOW",    "NNTR_L2_DIFF",
+    "NNTR_L2_SHADOW"};
+  for (unsigned reason = 0; reason < 15; ++reason) {
+    Fixture f;
+    f.prepare(0, reason);
+    f.ops.mock_output_projection = true;
+    std::vector<float> output(size_t(M) * C, -9934.0f);
+    Tensor in{f.input.data()},
+      iw{f.truth.data(), nntrainer::Tdatatype::QS4CX_WH_AFFINE};
+    Tensor ow = iw, p{f.proj.data()}, g{f.g.data()}, y{f.out.data()},
+           o{output.data()};
+    const bool training = reason == 10, to_host = reason == 11;
+    if (reason == 12)
+      o.contiguous = false;
+    if (reason == 13)
+      unsetenv("NNTR_LFM2_PREFILL_VIEWS");
+    if (reason == 14)
+      setenv("NNTR_HTP_KEEP_OUT", "0", 1);
+    if (reason > 0 && reason < 10)
+      setenv(diagnostics[reason], "1", 1);
+    bool fellthrough = false;
+    candidate::appRoute(in, iw, ow, p, g, y, o, f.state.data(),
+                        f.weights.data(), &f.ops, M, C, C, C, 0, false, false,
+                        fellthrough, to_host, training);
+    const bool retained = reason == 0;
+    check(!fellthrough && f.ops.output_projections == 1 &&
+            f.ops.retained_output_projections == unsigned(retained),
+          "retained output eligibility/diagnostic guard differs");
+    const size_t bytes = output.size() * sizeof(float);
+    const float *view =
+      static_cast<const float *>(f.ops.host_view(output.data(), bytes));
+    for (size_t i = 0; i < output.size(); ++i)
+      check(view[i] == f.refout[i] * 0.5f, "retained output view differs");
+    if (retained)
+      check(output[64] == -9934.0f && view != output.data(),
+            "retained output was copied to host whole");
+    else
+      check(sameOutput(output.data(), view, output.size()),
+            "diagnostic/training output remained partial");
+    f.ops.sync_to_host(output.data(), bytes);
+    check(sameOutput(output.data(), view, output.size()),
+          "retained output fallback materialization differs");
+    check(sameOutput(f.state.data(), f.refstate.data(), f.state.size()),
+          "retained output changed convolution state");
+    if (reason > 0 && reason < 10)
+      unsetenv(diagnostics[reason]);
+    if (reason == 13)
+      setenv("NNTR_LFM2_PREFILL_VIEWS", "1", 1);
+    if (reason == 14)
+      unsetenv("NNTR_HTP_KEEP_OUT");
+    ++cases;
+  }
+}
+
+static void whole_numeric() {
+  for (unsigned lanes : {1u, 4u})
+    for (unsigned pattern : {0u, 1u, 2u}) {
+      nntrainer::ThreadManager::lanes = lanes;
+      Fixture f;
+      for (unsigned generation = 0; generation < 2; ++generation) {
+        f.prepare(pattern, generation);
+        check(f.run(), "whole projection path declined");
+        f.exact();
+        check(f.ops.row_calls == std::vector<unsigned>({2048}) &&
+                f.ops.syncs == 0 && f.ops.views == 1,
+              "whole dispatch/view counts");
+        ++cases;
+      }
+    }
+  for (auto mode : {nntrainer::ComputeOps::Host, nntrainer::ComputeOps::Null,
+                    nntrainer::ComputeOps::OverlapInput,
+                    nntrainer::ComputeOps::OverlapGated,
+                    nntrainer::ComputeOps::OverlapOutput,
+                    nntrainer::ComputeOps::OverlapState}) {
+    Fixture f;
+    f.prepare(0, 0);
+    f.ops.mode = mode;
+    check(f.run(), "whole fallback view declined");
+    f.exact();
+    check(f.ops.syncs == unsigned(mode == nntrainer::ComputeOps::Host ? 0 : 1),
+          "whole fallback sync count");
+    ++cases;
+  }
+}
+
 int main() {
   try {
+    const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+    if (views && std::strcmp(views, "1") == 0)
+      retained_host_views();
+    const char *whole = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
+    if (whole && std::strcmp(whole, "1") == 0) {
+      whole_numeric();
+      if (views && std::strcmp(views, "1") == 0)
+        retained_output_route();
+      fused_gate_stripes();
+      std::printf("CONV_WHOLE %u cases PASS\n", cases);
+      return 0;
+    }
     numeric();
     capacity();
     guards();

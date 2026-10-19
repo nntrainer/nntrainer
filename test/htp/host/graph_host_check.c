@@ -3243,6 +3243,65 @@ static void check_lfm2_arm_prediction(void) {
           memcmp(g->slots + (size_t)g->ops[router].in_slot * g->slot_words,
                  input, sizeof(input)) == 0,
         "LFM2 ARM hint preserves logits, real routes, mixtures and input");
+  /** Rebinding exercises ownership and format changes: FP32 -> decoded WH,
+     another WH allocation, then FP32 again. Invalid length keeps the old
+     pointer. Compare actual graph dispatch against the packed kernel. */
+  const size_t packed_bytes = (size_t)H * E / 2u + 12u * E;
+  uint8_t *packed = malloc(packed_bytes);
+  CHECK(packed != NULL, "LFM2 WH router test allocation");
+  if (packed) {
+    float *scales = (float *)(packed + (size_t)H * E / 2u);
+    int32_t *offsets = (int32_t *)(scales + 2u * E);
+    for (uint32_t round = 0; round < 2u; ++round) {
+      for (size_t b = 0; b < (size_t)H * E / 2u; ++b)
+        packed[b] = (uint8_t)(b * 13u + b / 32u + 7u * round);
+      for (uint32_t e = 0; e < E; ++e) {
+        scales[e] = .001f * (1u + e % 7u + round);
+        offsets[e] = (int32_t)(e % 7u) - 3;
+      }
+      float *old = g->param[router];
+      CHECK(hexkl_graph_set_param(g, router, HTP_GRAPH_PARAM_ROUTER_WH,
+                                  (const float *)packed,
+                                  packed_bytes / 4u - 1u) != 0u &&
+              g->param[router] == old,
+            "LFM2 bad WH bind preserves allocation");
+      CHECK(hexkl_graph_set_param(g, router, HTP_GRAPH_PARAM_ROUTER_WH,
+                                  (const float *)packed,
+                                  packed_bytes / 4u) == 0u &&
+              g->router_wh[router] != 0u,
+            "LFM2 WH bind/rebind");
+      uint32_t selected[TOP];
+      float weights_by_rank[TOP];
+      hvx_router_topk_wh(input, packed, g->state[router], H, E, TOP, expected,
+                         selected, weights_by_rank, env.pool);
+      rc = hexkl_graph_forward(g, &env, router, 1u, 0u, NULL, input, H, logits,
+                               E, &resume);
+      CHECK(rc == 0u && memcmp(expected, logits, sizeof(logits)) == 0,
+            "LFM2 decoded WH graph logits match packed kernel");
+      for (uint32_t k = 0; k < TOP; ++k) {
+        uint32_t pos = 0;
+        for (uint32_t e = 0; e < selected[k]; ++e)
+          pos += g->route_cnt[e];
+        CHECK(g->route_cnt[selected[k]] == 1u &&
+                memcmp(&g->route_w[pos], &weights_by_rank[k], sizeof(float)) ==
+                  0,
+              "LFM2 decoded WH graph route matches packed kernel");
+      }
+    }
+    CHECK(hexkl_graph_set_param(g, router, HTP_GRAPH_PARAM_ROUTER_W, weights,
+                                H * E) == 0u &&
+            g->router_wh[router] == 0u,
+          "LFM2 WH to FP32 bind resets dispatch format");
+    uint32_t selected[TOP];
+    float weights_by_rank[TOP];
+    hvx_router_topk_f32(input, weights, g->state[router], H, E, TOP, expected,
+                        selected, weights_by_rank, env.pool);
+    rc = hexkl_graph_forward(g, &env, router, 1u, 0u, NULL, input, H, logits, E,
+                             &resume);
+    CHECK(rc == 0u && memcmp(expected, logits, sizeof(logits)) == 0,
+          "LFM2 FP32 graph after WH rebind");
+    free(packed);
+  }
   hexkl_graph_free(g);
   puts("LFM2 ARM HINT: INPUT / LOGITS / ROUTES / MIXTURES BIT-IDENTICAL");
 }

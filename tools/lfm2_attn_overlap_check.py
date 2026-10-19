@@ -70,10 +70,11 @@ def main():
     h += function((b / "hvx/hvx_tile_f16.h").read_text(), "hvx_tile_load_u") + "\n"
     for name in ("q_tile", "kt_tile", "s_tile", "acc_rows", "unit_range"):
         h += function(source, name) + "\n"
-    for name in ("dequant_s_at", "dequant_s", "qx_dequant_available", "dequant_worker"):
+    for name in ("acc_four_rows_at", "dequant_s_at", "dequant_s", "qx_dequant_available", "dequant_worker"):
         h += function(source, name) + "\n"
     h += """
 static uint64_t now_us(void);
+static int read_acc_planes(attn_ctx *, uint32_t);
 static void softmax_state_init(attn_ctx *, uint32_t, uint32_t);
 static void dma_issue(attn_ctx *, uint32_t, uint32_t, uint32_t);
 static void dma_land(attn_ctx *, uint32_t, uint32_t);
@@ -88,6 +89,7 @@ static int hexkl_micro_hmx_acc_read_int32(uint8_t *, uint32_t, uint32_t);
 static void checked_submit(hvx_worker_pool *, hvx_worker_pool_func, void *, uint32_t);
 static void checked_wait(hvx_worker_pool *);
 """
+    h += function(source, "phase_time") + "\n"
     h += function(source, "phase_qk") + "\n"
     h += "#define hvx_worker_pool_submit checked_submit\n#define hvx_worker_pool_wait checked_wait\n"
     h += function(source, "run_q_block") + "\n"

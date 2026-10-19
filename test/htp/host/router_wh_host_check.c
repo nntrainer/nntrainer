@@ -59,9 +59,18 @@ int main(void) {
           m1_router_cpu_sigmoid(ref[e], bias[e], sig + e, score + e);
         }
         m1_router_cpu_pick(sig, score, E, 4, rs, rw);
+        float *decoded = hvx_router_wh_weights_create(w, K, E);
+        assert(decoded);
         for (lanes = 1; lanes <= 8; ++lanes) {
           out[0] = out[E + 1] = 123.5f;
           hvx_router_topk_wh(x, w, bias, K, E, 4, out + 1, os, ow, NULL);
+          assert(memcmp(ref, out + 1, E * sizeof(float)) == 0);
+          assert(memcmp(rs, os, sizeof(rs)) == 0);
+          assert(memcmp(rw, ow, sizeof(rw)) == 0);
+          assert(out[0] == 123.5f && out[E + 1] == 123.5f);
+          ++cases;
+          hvx_router_topk_wh_decoded_f32(x, decoded, bias, K, E, 4, out + 1, os,
+                                         ow, NULL);
           assert(memcmp(ref, out + 1, E * sizeof(float)) == 0);
           assert(memcmp(rs, os, sizeof(rs)) == 0);
           assert(memcmp(rw, ow, sizeof(rw)) == 0);
@@ -72,6 +81,16 @@ int main(void) {
         hvx_router_topk_wh(x, w, bias, K, E, 4, x, os, ow, NULL);
         assert(memcmp(ref, x, E * sizeof(float)) == 0);
         ++cases;
+        for (uint32_t k = 0; k < K; ++k)
+          x[k] =
+            pattern == 0 ? 0 : sinf((float)(k * 13 + pattern)) * (pattern + 1);
+        hvx_router_topk_wh_decoded_f32(x, decoded, bias, K, E, 4, x, os, ow,
+                                       NULL);
+        assert(memcmp(ref, x, E * sizeof(float)) == 0);
+        assert(memcmp(rs, os, sizeof(rs)) == 0);
+        assert(memcmp(rw, ow, sizeof(rw)) == 0);
+        ++cases;
+        free(decoded);
       }
       free(x);
       free(w);
