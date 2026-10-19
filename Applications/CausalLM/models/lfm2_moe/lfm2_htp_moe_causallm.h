@@ -34,7 +34,6 @@ protected:
   void allocateAndBindKVCache() override;
 
 private:
-  bool sr15_ = false;
   unsigned dense_layers_ = 0;
   bool loading_ = false, prepared_ = false, ran_ = false;
   bool prefill_early_attempted_ = false;

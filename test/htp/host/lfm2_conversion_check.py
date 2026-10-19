@@ -10,7 +10,7 @@ import tempfile
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'tools'))
-import convert_lfm2_htp as converter
+import convert_lfm2_sr15 as converter
 
 
 def main():
@@ -50,7 +50,7 @@ def main():
             for key,n,k in [('w1',256,128),('w3',256,128),('w2',128,256)]:
                 matrix(p+f'feed_forward.{key}.weight',n,k)
         else:
-            tensors[p+'feed_forward.gate.weight'] = converter.bf16_round(rng.standard_normal((32,128)).astype(np.float32))
+            matrix(p+'feed_forward.gate.weight',32,128)
             tensors[p+'feed_forward.expert_bias'] = rng.standard_normal(32).astype(np.float32)
             for e in range(32):
                 for key in ('w1','w2','w3'):
@@ -60,6 +60,22 @@ def main():
         (source/'config.json').write_text(json.dumps(cfg))
         (source/'generation_config.json').write_text('{}')
         (source/'tokenizer.json').write_text('{}')
+        (source/'tokenizer_config.json').write_text('{}')
+        (source/'chat_template.jinja').write_text('{{ messages }}')
+        # Small rotations exercise serialization; production geometry is
+        # validated separately by the runtime.
+        for name in ('R_in', 'R_down'):
+            signs = rng.choice([-1, 1], 128).astype(np.int8)
+            rotation = (converter.sylvester(128) * signs).astype(np.float32)
+            rotation *= np.float32(1 / np.sqrt(128))
+            np.save(source / (name + '_f32.npy'), rotation)
+        encodings = source / 'encodings'
+        encodings.mkdir()
+        entry = dict(name='activation', enc_type='PER_TENSOR', dtype='INT',
+                     bw=8, scale=[0.125], offset=[-128], is_sym=True)
+        for mode in ('generation', 'prefill'):
+            (encodings / f'lfm2_24b_w4a8kv8_{mode}.encodings').write_text(
+                json.dumps(dict(activation_encodings=[entry])))
         header={};payload=bytearray()
         for name,w in tensors.items():
             is_f32=name.endswith('expert_bias')
@@ -69,20 +85,57 @@ def main():
         encoded=json.dumps(header).encode();encoded+=b' '*(-len(encoded)%8)
         (source/'model.safetensors').write_bytes(struct.pack('<Q',len(encoded))+encoded+payload)
         output=root/'output'
-        report=converter.convert(source,output,source,cache_experts=4)
-        assert report['source_tensors_consumed']==len(tensors)
-        assert report['expert_tensors_verified']==128
-        assert report['max_expert_weight_error']==report['max_fc_bf16_roundtrip_error']==0
+        converter.convert(source, encodings, output, source)
+        report = json.loads((output / 'conversion_report.json').read_text())
+        config = json.loads((output / 'nntr_config.json').read_text())
+        assert report['format'] == 'nntr_lfm2_sr15_v2'
+        assert config['lfm2_weight_format'] == 'sr15_v2'
+        assert config['embedding_dtype'] == 'Q4_0'
+        assert config['router_dtype'] == 'QS4CX_WH_AFFINE'
+        assert config['short_conv_dtype'] == 'DW3_INT4'
+        assert config['moe_hadamard'] == 'both'
+        assert report['tensor_counts']['TL2CX_WH'] == 128
+        consumed = [name for item in report['tensors'] for name in item['source']]
+        assert len(consumed) == len(set(consumed)) == len(tensors)
+        assert set(consumed) == set(tensors)
+        for metric in report['metrics']:
+            assert metric.get('max_weight_error', 0) == 0
+            assert metric.get('max_bf16_roundtrip_error', 0) == 0
         raw=(output/report['model_file']).read_bytes()
         assert len(raw)==report['bytes']
+        cursor = 0
         for item in report['tensors']:
+            assert item['offset'] == cursor
+            cursor += item['bytes']
             if item['name'].endswith('_conv:conv'):
-                got=np.frombuffer(raw,'<f4',3*128,item['offset']).reshape(3,128)
-                assert np.array_equal(got[:,0],[1.,.5,.25])
+                assert item['dtype'] == 'DW3_INT4'
+                at = item['offset']
+                packed = np.frombuffer(raw, np.uint8, 256, at).reshape(128, 2)
+                codes = np.stack([packed[:, 0] & 15, packed[:, 0] >> 4,
+                                  packed[:, 1] & 15], axis=1)
+                assert np.all(packed[:, 1] >> 4 == 0)
+                scale = np.frombuffer(raw, '<f4', 128, at + 256)
+                offset = np.frombuffer(raw, '<i4', 128, at + 768)
+                got = converter.bf16_round((codes + offset[:, None]) * scale[:, None])
+                assert np.array_equal(got, np.tile([1., .5, .25], (128, 1)))
             if item['name'].endswith('_sparse_moe:gate'):
-                got=np.frombuffer(raw,'<f4',128*32,item['offset']).reshape(128,32)
-                assert np.array_equal(got,tensors[item['source'][0]].T)
-        try: converter.convert(source,output,source)
+                assert item['dtype'] == 'QS4CX_WH_AFFINE'
+                assert item['shape'] == [128, 32]
+                assert item['bytes'] == 128 * 32 // 2 + 12 * 32
+        for record in report['rotations']:
+            assert record['offset'] == cursor
+            cursor += record['bytes']
+            at = record['offset']
+            signs = np.frombuffer(raw, np.int8, 128, at)
+            basis = np.frombuffer(raw, np.int8, record['basis_width'] ** 2,
+                                  at + 128).reshape(record['basis_width'], -1)
+            restored = (np.kron(basis, converter.sylvester(record['sylvester_width']))
+                        * signs).astype(np.float32) * np.float32(record['magnitude'])
+            assert np.array_equal(restored, np.load(source / (record['name'] + '_f32.npy')))
+        assert cursor == len(raw)
+        assert converter.read_activations(output / 'activation_scales.bin') == {
+            ('activation', 0.125, -128, 8, True): 3}
+        try: converter.convert(source, encodings, output, source)
         except FileExistsError: pass
         else: raise AssertionError('Existing pack overwritten')
         cp=converter.Checkpoint(source)
@@ -92,6 +145,6 @@ def main():
             except ValueError:pass
             else:raise AssertionError('Unconsumed source accepted')
         finally:cp.close()
-    print('LFM2 conversion: native TL2, affine WH, conv taps, router layout and rejection checks PASS')
+    print('LFM2 SR15 conversion: TL2, affine router, Q4_0, DW3_INT4, rotations and rejection checks PASS')
 
 if __name__=='__main__':main()

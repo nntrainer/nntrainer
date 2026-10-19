@@ -699,6 +699,8 @@ static std::string resolve_model_path(const std::string &model_key,
 
   if (path_upper == "GEMMA4-26B-A4B-HTP")
     return "/gemma4-26b-a4b-htp-w4a32";
+  if (path_upper == "LFM2-24BA2B-HTP")
+    return "/lfm2-24ba2b-htp-w4a32";
   std::string base_dir_name = "";
 
   // 1. Try to find base directory name from map
@@ -1334,12 +1336,11 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
           quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
           cfg.value("architectures", std::vector<std::string>{}) !=
             std::vector<std::string>{"Lfm2MoeForCausalLM"} ||
-          nntr_cfg.value("lfm2_weight_format", std::string()) !=
-            "htp_fused_v1" ||
+          nntr_cfg.value("lfm2_weight_format", std::string()) != "sr15_v2" ||
           nntr_cfg.value("use_kvcache", false) ||
           nntr_cfg.value("save_kvcache", false))
         throw std::invalid_argument(
-          "LFM2 HTP requires the NPU/W4A32 fused pack");
+          "LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack");
       fix_paths(nntr_cfg, abs_model_dir);
       h.htp_runtime =
         std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);

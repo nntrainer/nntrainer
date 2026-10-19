@@ -32,7 +32,7 @@ import tempfile
 import numpy as np
 
 from convert_gemma4_fc_wh import bf16_round, sha256
-from convert_lfm2_htp import (Checkpoint, Tl2, weight_plan, write_expert,
+from lfm2_weight_utils import (Checkpoint, Tl2, weight_plan, write_expert,
                               write_fc, write_float)
 
 
@@ -228,18 +228,7 @@ def convert(source, encodings, output, tokenizer, rotation_mode="both"):
     cfg = json.loads((source/'config.json').read_text())
     checkpoint = Checkpoint(source)
     try:
-        plan, _ = weight_plan(cfg, checkpoint)
-        cursor = 0
-        for item in plan:
-            if item['name'] == 'embedding0:Embedding':
-                item.update(dtype='Q4_0', bytes=math.prod(item['shape'])//32*18)
-            elif item['name'].endswith('_conv:conv'):
-                item.update(dtype='DW3_INT4', bytes=cfg['hidden_size']*10)
-            elif item['name'].endswith('_sparse_moe:gate'):
-                k, n = item['shape']
-                item.update(dtype='QS4CX_WH_AFFINE', bytes=k*n//2+12*n,
-                            transform='identity')
-            item['offset'] = cursor; cursor += item['bytes']
+        plan, cursor = weight_plan(cfg, checkpoint)
         rotations = []
         for name, n in [('R_in', cfg['hidden_size']), ('R_down', cfg['moe_intermediate_size'])]:
             info, raw = rotation(source, name, n)

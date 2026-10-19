@@ -1,30 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Stream LFM2 MoE BF16 weights into the shared Gemma4 HTP record layouts.
-
-Experts: exact ternary -> native TL2CX_WH, gate/up fused per expert.
-FC/head/conv projections: original affine INT4 grids -> QS4CX_WH_AFFINE.
-Embedding, short-conv, norms and router: losslessly promoted to FP32.
-A positional file is paired with a complete named offset manifest. Every
-serialized expert and FC is decoded and checked before publishing the pack.
-Requires numpy; the native TL2 library is built from this tree with a host C
-compiler. No Transformers import, intermediate FP32 checkpoint or network.
-"""
-import argparse
-from collections import Counter
+"""Checkpoint reading and native record writers for the LFM2 SR15 converter."""
 import ctypes
 import hashlib
 import json
 import math
 import mmap
-from pathlib import Path
-import shutil
 import struct
-import subprocess
-import tempfile
 
 import numpy as np
-from convert_gemma4_fc_wh import bf16_round, pack, recover, verify_chunk, sha256
+from convert_gemma4_fc_wh import pack, recover, verify_chunk
 
 
 class Checkpoint:
@@ -133,10 +118,13 @@ def weight_plan(cfg, checkpoint):
                     raise ValueError('Affine WH requires complete 32x32 tiles')
                 size = k * n // 2 + 12 * n
         else:
-            size = math.prod(shape) * 4
-            if transform == 'transpose': expected = [shape[::-1]]
-            elif transform == 'conv_reverse': expected = [[h, 1, 3]]
-            else: expected = [shape]
+            expected = [[h, 1, 3]] if dtype == 'DW3_INT4' else [shape]
+            if dtype == 'Q4_0':
+                size = math.prod(shape) // 32 * 18
+            elif dtype == 'DW3_INT4':
+                size = h * 10
+            else:
+                size = math.prod(shape) * 4
         for key, want in zip(names, expected):
             if checkpoint.header[key]['shape'] != want:
                 raise ValueError(f'Shape mismatch: {key}: expected {want}')
@@ -144,13 +132,13 @@ def weight_plan(cfg, checkpoint):
                          transform=transform, offset=cursor, bytes=size))
         cursor += size
 
-    add('embedding0:Embedding', 'model.embed_tokens.weight', [cfg['vocab_size'], h])
+    add('embedding0:Embedding', 'model.embed_tokens.weight', [cfg['vocab_size'], h], 'Q4_0')
     for l, kind in enumerate(cfg['layer_types']):
         p, src = f'layer{l}', f'model.layers.{l}.'
         if kind == 'conv':
             add(p + '_conv_norm:gamma', src + 'operator_norm.weight', [h])
             add(p + '_conv:in_proj', src + 'conv.in_proj.weight', [h, 3*h], 'QS4CX_WH_AFFINE')
-            add(p + '_conv:conv', src + 'conv.conv.weight', [3, h], transform='conv_reverse')
+            add(p + '_conv:conv', src + 'conv.conv.weight', [3, h], 'DW3_INT4', transform='conv_reverse')
             add(p + '_conv:out_proj', src + 'conv.out_proj.weight', [h, h], 'QS4CX_WH_AFFINE')
         else:
             add(p + '_qkv:in_norm_gamma', src + 'operator_norm.weight', [h])
@@ -168,7 +156,7 @@ def weight_plan(cfg, checkpoint):
         else:
             m = p + '_sparse_moe:'
             add(m + 'in_norm_gamma', src + 'ffn_norm.weight', [h])
-            add(m + 'gate', src + 'feed_forward.gate.weight', [h, cfg['num_experts']], transform='transpose')
+            add(m + 'gate', src + 'feed_forward.gate.weight', [h, cfg['num_experts']], 'QS4CX_WH_AFFINE')
             add(m + 'expert_bias', src + 'feed_forward.expert_bias', [cfg['num_experts']])
             for e in range(cfg['num_experts']):
                 ex = src + f'feed_forward.experts.{e}.'
@@ -253,21 +241,14 @@ def write_fc(dst, item, checkpoint):
 
 def write_float(dst, item, checkpoint):
     name = item['source'][0]
-    # Bound memory for the large embedding table.
     shape = checkpoint.header[name]['shape']
     count = shape[0]
     dst.seek(item['offset'])
     digest = hashlib.sha256()
     for first in range(0, count, 256):
         w = checkpoint.read(name, first, min(count, first + 256))
-        if item['transform'] == 'transpose':
-            # Routers are small and must be transposed as a whole.
-            w = checkpoint.read(name).T
-        elif item['transform'] == 'conv_reverse':
-            w = checkpoint.read(name)[:, 0, ::-1].T
         raw = np.ascontiguousarray(w, dtype='<f4').tobytes()
         digest.update(raw); dst.write(raw)
-        if item['transform'] != 'identity': break
     end = dst.tell()
     if end != item['offset'] + item['bytes']: raise ValueError('FP32 size mismatch')
     dst.flush(); dst.seek(item['offset'])
@@ -277,97 +258,3 @@ def write_float(dst, item, checkpoint):
         if not raw: raise EOFError('Truncated FP32 record')
         check.update(raw); remaining -= len(raw)
     if check.digest() != digest.digest(): raise ValueError('FP32 read-back mismatch')
-
-
-def convert(source, output, tokenizer_source, library=None, cache_experts=16):
-    source, output = source.resolve(), output.resolve()
-    if output.exists(): raise FileExistsError(output)
-    cfg = json.loads((source/'config.json').read_text())
-    checkpoint = Checkpoint(source)
-    try:
-        plan, size = weight_plan(cfg, checkpoint)
-        if not (tokenizer_source/'tokenizer.json').is_file():
-            raise FileNotFoundError(tokenizer_source/'tokenizer.json')
-        if not 1 <= cache_experts <= cfg['num_experts']:
-            raise ValueError('Invalid resident expert count')
-        output.parent.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(output.parent).free < size + 1024**3:
-            raise OSError('Insufficient free disk space')
-        with tempfile.TemporaryDirectory(prefix='.lfm2-htp-', dir=output.parent) as work:
-            work = Path(work)
-            if library is None:
-                library = work/'tl2_pack.so'
-                root = Path(__file__).resolve().parents[1]
-                subprocess.run(['cc', '-O3', '-shared', '-fPIC', '-I',
-                    str(root/'nntrainer/tensor/htp_backend/hvx'),
-                    str(root/'nntrainer/tensor/htp_backend/hvx/hvx_gemv_u8tl2.c'),
-                    '-o', str(library)], check=True)
-            tl2 = Tl2(library.resolve())
-            binary = work/'nntr_lfm2_tl2_affine.bin'
-            metrics = []; counts = Counter()
-            with binary.open('xb+') as dst:
-                dst.truncate(size)
-                for i, item in enumerate(plan):
-                    if item['dtype'] == 'TL2CX_WH':
-                        metrics.append(write_expert(dst, item, checkpoint, tl2))
-                    elif item['dtype'] == 'QS4CX_WH_AFFINE':
-                        metrics.append(write_fc(dst, item, checkpoint))
-                    else: write_float(dst, item, checkpoint)
-                    counts[item['dtype']] += 1
-                    if i % 128 == 0 or i == len(plan)-1:
-                        print(f'{i+1}/{len(plan)} {item["name"]} verified', flush=True)
-            now = checkpoint.path.stat()
-            if (now.st_size, now.st_mtime_ns, now.st_ino) != (checkpoint.stamp.st_size, checkpoint.stamp.st_mtime_ns, checkpoint.stamp.st_ino):
-                raise ValueError('Source checkpoint changed during conversion')
-            config = dict(model_type='CausalLM', model_tensor_type='FP32-FP32',
-                model_file_name=binary.name, lfm2_weight_format='htp_fused_v1',
-                lfm2_execution_profile='htp_fused', embedding_dtype='FP32',
-                fc_layer_dtype='QS4CX_WH_AFFINE', lmhead_dtype='QS4CX_WH_AFFINE',
-                moe_layer_dtype='TL2CX_WH', short_conv_dtype='FP32',
-                moe_engine='htp', attn_proj_engine='htp', dense_ffn_engine='htp',
-                attention_engine='htp', attention_kv_dtype='q8_row', lmhead_engine='htp',
-                batch_size=1, init_seq_len=512, max_seq_len=2048,
-                num_to_generate=32, tokenizer_file='tokenizer.json', bad_word_ids=[],
-                moe_cache_experts=cache_experts)
-            report = dict(source=str(checkpoint.path),
-                source_header_sha256=checkpoint.header_hash, source_bytes=now.st_size,
-                model_file=binary.name, bytes=size, sha256=sha256(binary),
-                storage_format='TL2CX_WH/1 + QS4CX_WH_AFFINE/1 + FP32',
-                source_tensors_consumed=len(checkpoint.header), tensor_counts=dict(counts),
-                expert_tensors_verified=counts['TL2CX_WH'],
-                affine_fc_tensors_verified=counts['QS4CX_WH_AFFINE'],
-                max_expert_weight_error=0, max_fc_bf16_roundtrip_error=0,
-                requantization=False, short_conv_dtype='FP32',
-                conv_layout='[3, hidden], newest tap first; source taps reversed',
-                embedding='source values preserved as FP32 without sqrt(hidden) scaling',
-                router='source BF16 promoted to FP32, transposed to [hidden, experts]; sigmoid+bias',
-                activation='SwiGLU', device_validation='not performed',
-                runtime_requirements=['Rebuilt ARM HTP runtime and matching v81 DSP skel',
-                    f'Sigmoid router supporting {cfg["num_experts"]} experts',
-                    'WH dense FFN intermediate slicing'],
-                verification='every serialized TL2 trit/tail, WH nibble/tail and FP32 byte verified',
-                tensors=plan, metrics=metrics)
-            for name in ('config.json', 'generation_config.json'):
-                shutil.copyfile(source/name, work/name)
-            for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
-                if (tokenizer_source/name).is_file(): shutil.copyfile(tokenizer_source/name, work/name)
-            (work/'nntr_config.json').write_text(json.dumps(config, indent=2)+'\n')
-            (work/'conversion_report.json').write_text(json.dumps(report, indent=2)+'\n')
-            # The host helper is not a runtime dependency or model artifact.
-            if library.parent == work: library.unlink()
-            work.rename(output)
-            print(f'Published {output}: {size:,} bytes, SHA256 {report["sha256"]}', flush=True)
-            return report
-    finally: checkpoint.close()
-
-
-if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('source', type=Path)
-    ap.add_argument('--output', type=Path, required=True)
-    ap.add_argument('--tokenizer-source', type=Path, help='Local matching base model tokenizer directory')
-    ap.add_argument('--tl2-library', type=Path)
-    ap.add_argument('--cache-experts', type=int, default=16)
-    args = ap.parse_args()
-    convert(args.source, args.output, args.tokenizer_source or args.source,
-            args.tl2_library, args.cache_experts)
