@@ -177,7 +177,12 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
     ctx->sk_inv =
       (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
     ctx->scaled = (uint8_t *)calloc(n_layers, 1);
-    if (!ctx->sk || !ctx->sv || !ctx->sv_inv || !ctx->sk_inv || !ctx->scaled) {
+    ctx->sk_floor =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    ctx->sv_floor =
+      (float *)calloc((size_t)n_layers * n_kv * head_dim, sizeof(float));
+    if (!ctx->sk || !ctx->sv || !ctx->sv_inv || !ctx->sk_inv || !ctx->scaled ||
+        !ctx->sk_floor || !ctx->sv_floor) {
       rc = AEE_ENOMEMORY;
     }
   }
@@ -259,6 +264,8 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx->sv_inv);
   free(ctx->sk_inv);
   free(ctx->scaled);
+  free(ctx->sk_floor);
+  free(ctx->sv_floor);
   free(ctx->kv_len);
   free(ctx);
 }
@@ -418,6 +425,14 @@ static void q8_set_scales_rows(hvx_attn_m1_ctx *ctx, uint32_t layer,
       k_rows, v_rows, k16, v16};
     hvx_worker_pool_run(ctx->pool, run_amax, &job, job.units);
   }
+  if (ctx->sk_floor) { /* [#4428 window] rows the caller no longer holds */
+    const float *fk = ctx->sk_floor + (size_t)layer * n;
+    const float *fv = ctx->sv_floor + (size_t)layer * n;
+    for (size_t i = 0; i < n; ++i) {
+      sk[i] = sk[i] > fk[i] ? sk[i] : fk[i];
+      sv[i] = sv[i] > fv[i] ? sv[i] : fv[i];
+    }
+  }
   float *ski = ctx->sk_inv + (size_t)layer * n;
   float *svi = ctx->sv_inv + (size_t)layer * n;
   for (size_t i = 0; i < n; ++i) {
@@ -433,6 +448,20 @@ static void q8_set_scales(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
                           const float *k_rows, const float *v_rows,
                           float margin) {
   q8_set_scales_rows(ctx, layer, n_rows, k_rows, v_rows, NULL, NULL, margin);
+}
+
+int hvx_attn_m1_kv_amax_floor(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              const float *k_amax, const float *v_amax) {
+  if (!ctx || !ctx->q8 || !ctx->sk_floor || !k_amax || !v_amax) {
+    return AEE_EBADSTATE;
+  }
+  if (layer >= ctx->n_layers) {
+    return AEE_EINVALIDFORMAT;
+  }
+  const size_t n = (size_t)ctx->n_kv * ctx->head_dim;
+  memcpy(ctx->sk_floor + layer * n, k_amax, n * sizeof(float));
+  memcpy(ctx->sv_floor + layer * n, v_amax, n * sizeof(float));
+  return AEE_SUCCESS;
 }
 
 /** @brief [#282 D] One position of one (layer, kv head) into the int8

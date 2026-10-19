@@ -168,6 +168,47 @@ TEST(KVCacheManagerHybrid, compact_skips_inactive_windows) {
   EXPECT_FALSE(m.compact(4));
 }
 
+TEST(KVCacheManagerHybrid, compact_folds_the_dropped_rows_amax) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // one windowed layer: 4 rows of width 2, a window of 2
+  m.allocate(1, 1, 8, std::vector<unsigned int>{2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4}, {2});
+  // fp16 bits: 1.0 = 0x3C00, 2.0 = 0x4000, -3.0 = 0xC200, 0.5 = 0x3800,
+  // -2.0 = 0xC000; rows 0..3 as (col0, col1)
+  const uint16_t kb[8] = {0x3C00, 0xC200, 0x4000, 0x3800,
+                          0x3800, 0x3800, 0x3800, 0x3800};
+  const uint16_t vb[8] = {0x3800, 0x3C00, 0xC000, 0x3C00,
+                          0x3800, 0x3800, 0x3800, 0x3800};
+  std::copy(kb, kb + 8, m.getKeyCache(0).getData<uint16_t>());
+  std::copy(vb, vb + 8, m.getValueCache(0).getData<uint16_t>());
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  EXPECT_TRUE(m.droppedAmaxV(0).empty());
+  EXPECT_TRUE(m.droppedAmaxK(7).empty()); // no such layer: empty, no throw
+  // rows 0 and 1 go: |max| per column of what went
+  EXPECT_TRUE(m.compact(4));
+  ASSERT_EQ(m.droppedAmaxK(0).size(), 2u);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[1], 3.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[1], 1.0f);
+  // the next compaction drops smaller rows (old 2 and 3): the fold only grows
+  EXPECT_TRUE(m.compact(6));
+  EXPECT_EQ(m.getBase(0), 4u);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[1], 3.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[1], 1.0f);
+  // a new sequence starts from nothing
+  m.reset();
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  EXPECT_TRUE(m.droppedAmaxV(0).empty());
+}
+
 TEST(KVCacheManagerHybrid, dense_files_remain_compatible_in_both_directions) {
   const std::string path = "/tmp/test_kv_cache_hybrid.bin";
   using Dtype = ml::train::TensorDim::DataType;

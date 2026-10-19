@@ -149,6 +149,8 @@ void HtpMHACoreLayer::beginHtpPrompt() {
   htp_owns_cache_ = false;
   q_cache_failed = false;
   q2_calibrated = false;
+  kv_floor_k_.clear();
+  kv_floor_v_.clear();
   htp_rope_table_.clear();
 }
 
@@ -800,6 +802,11 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     const unsigned int seed_rows = pos - cache_base;
     const size_t n = static_cast<size_t>(seed_rows) * wk;
     auto t_conv = t_seed;
+    // [#4428 window] the rows the host cache dropped are not in the seed:
+    // their |max| goes ahead of it, so the scales cover the whole context
+    if (!kv_floor_k_.empty())
+      htpDecodeKvAmaxFloor(kv_floor_k_.data(), kv_floor_v_.data(),
+                           static_cast<unsigned>(kv_floor_k_.size()));
     // [#4416 D6] an fp16 / UINT16 cache goes as its bits: the DSP widens
     // them exactly (hvx_hf_bits_to_sf), nothing converted or copied here
     const bool bits16 =
@@ -1284,6 +1291,27 @@ void HtpMHACoreLayer::q2_keep() {
   all.clear();
   for (const auto *v : {&q2_scale_k, &q2_scale_v, &q2_q_enc, &q2_out_enc})
     all.insert(all.end(), v->begin(), v->end());
+  // [#4428 window] the dropped rows' |max| behind them, when any
+  for (const auto *v : {&kv_floor_k_, &kv_floor_v_})
+    all.insert(all.end(), v->begin(), v->end());
+}
+
+void HtpMHACoreLayer::foldDroppedAmax(const std::vector<float> &k_amax,
+                                      const std::vector<float> &v_amax) {
+  NNTR_THROW_IF(k_amax.size() != v_amax.size() ||
+                  (!kv_floor_k_.empty() && kv_floor_k_.size() != k_amax.size()),
+                std::invalid_argument)
+    << "mha_core: a dropped-rows |max| of " << k_amax.size() << " / "
+    << v_amax.size() << " columns against a floor of " << kv_floor_k_.size();
+  if (kv_floor_k_.empty()) {
+    kv_floor_k_.assign(k_amax.size(), 0.0f);
+    kv_floor_v_.assign(v_amax.size(), 0.0f);
+  }
+  for (size_t i = 0; i < k_amax.size(); ++i) {
+    kv_floor_k_[i] = std::max(kv_floor_k_[i], k_amax[i]);
+    kv_floor_v_[i] = std::max(kv_floor_v_[i], v_amax[i]);
+  }
+  q2_keep();
 }
 
 void HtpMHACoreLayer::q2_maxima_from_scales() {
@@ -1298,15 +1326,21 @@ void HtpMHACoreLayer::q2_maxima_from_scales() {
 bool HtpMHACoreLayer::take_q2_calibration() {
   const auto it = q2_store_.find(q2_name_);
   const size_t nk = num_heads_KV, nv = nk * head_dim, nq = 2 * num_heads_Q;
+  // [#4428 window] + 2 * nv when the saving run dropped rows (the floor)
+  const size_t n_cal = nk + nv + 2 * nq;
   if (!q2_from_file_ || it == q2_store_.end() ||
-      it->second.size() != nk + nv + 2 * nq)
+      (it->second.size() != n_cal && it->second.size() != n_cal + 2 * nv))
     return false;
-  const float *p = it->second.data();
+  const std::vector<float> all = it->second; // q2_keep rewrites the entry
+  const float *p = all.data();
   q2_scale_k.assign(p, p + nk);
   q2_scale_v.assign(p + nk, p + nk + nv);
   q2_q_enc.assign(p + nk + nv, p + nk + nv + nq);
   q2_out_enc.assign(p + nk + nv + nq, p + nk + nv + 2 * nq);
   q2_maxima_from_scales();
+  if (all.size() == n_cal + 2 * nv)
+    foldDroppedAmax(std::vector<float>(p + n_cal, p + n_cal + nv),
+                    std::vector<float>(p + n_cal + nv, p + n_cal + 2 * nv));
   return q2_calibrated = true;
 }
 

@@ -833,6 +833,18 @@ public:
     (void)v_rows;
     return false;
   }
+  // [#4428 window] Before the seed of the layer whose hook asked for one:
+  // the |max| per (kv head, dim) of the context rows the host's windowed
+  // cache dropped (KVCacheManager::compact), n = n_kv x head_dim values
+  // each, so the accelerator's int8 scales of the layer cover the whole
+  // context as a full cache's seed sets them. False: not taken.
+  virtual bool decode_kv_amax_floor(const float *k_amax, const float *v_amax,
+                                    unsigned n) {
+    (void)k_amax;
+    (void)v_amax;
+    (void)n;
+    return false;
+  }
   // [#289] The same seed with V from the layer's own quantized prefill
   // cache (kv_cache_q_register's handle, fixed scales) on the accelerator
   // and K from k_rows ([n_rows][n_kv x head_dim] f32); the handle is

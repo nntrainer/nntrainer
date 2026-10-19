@@ -1491,4 +1491,12 @@ interface nntr_hvx : remote_handle64 {
    // Retains weights, KV caches, graph, convolution state and decode FC feed.
    // Later prefill/decode kernels recreate these buffers on demand.
    AEEResult release_prefill_scratch(rout uint64 bytes);
+
+   // [#4428 window] Before a layer's first attn_m1 append: the |max| per
+   // (kv head, dim) of the context rows the host's windowed cache dropped,
+   // so the layer's int8 scales cover the whole context as a full cache's
+   // seed sets them. k_amax / v_amax [n_kv][head_dim] f32; layer may carry
+   // HTP_ATTN_KV_CACHE_B. A shape off the cache's is AEE_EINVALIDFORMAT.
+   AEEResult attn_m1_kv_amax_floor(in uint32 layer, in sequence<float> k_amax,
+                                   in sequence<float> v_amax);
 };

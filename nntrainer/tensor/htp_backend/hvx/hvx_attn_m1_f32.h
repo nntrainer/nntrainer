@@ -125,6 +125,12 @@ typedef struct {
   float *sv;          /**< [n_layers][n_kv][head_dim] */
   float *sv_inv;      /**< 1 / sv, for the appends */
   uint8_t *scaled;    /**< [n_layers] 1 once the layer's scales are set */
+  /** [#4428 window] |max| per (kv head, dim) of context rows the host's
+   *  windowed cache dropped before the layer's seed
+   *  (hvx_attn_m1_kv_amax_floor): the scales are over max(seed rows,
+   *  floor), what a seed of the whole context would give. Zeros until set */
+  float *sk_floor;
+  float *sv_floor;
   size_t layer_bytes; /**< [#289] kt[l] / v[l] size, for a lazy layer */
   /** [#4416 F] HVX_ATTN_M1_FAST at create (needs q8, head_dim % 256 == 0):
    *  the forward is NOT the fp16 spec. q is int16 a head (x K's per-dim
@@ -192,6 +198,18 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
 int hvx_attn_m1_kv_append_f16(hvx_attn_m1_ctx *ctx, uint32_t layer,
                               uint32_t kv_from, uint32_t n_rows,
                               const uint16_t *k_rows, const uint16_t *v_rows);
+
+/** @brief [#4428 window] Before @a layer's first append of an int8 cache:
+ *         @a k_amax / @a v_amax ([n_kv][head_dim] f32) are the |max| of
+ *         context rows the caller holds no more (its windowed cache dropped
+ *         them). The layer's scales become max(seed rows' amax, these) x
+ *         margin / 127: the scales a seed of the whole context would set.
+ *         Kept per layer; a layer whose scales are set takes them at its
+ *         next scale pass only.
+ * @return AEE_SUCCESS; AEE_EBADSTATE unless the cache is int8 (or ctx is
+ *         NULL); AEE_EINVALIDFORMAT for a layer out of range */
+int hvx_attn_m1_kv_amax_floor(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              const float *k_amax, const float *v_amax);
 
 /**
  * @brief [#289] Seeds an int8 cache's @a layer with @a n_rows positions

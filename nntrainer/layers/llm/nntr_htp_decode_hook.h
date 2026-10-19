@@ -243,6 +243,21 @@ inline bool htpDecodeKvSeedF16(unsigned n_rows, const uint16_t *k_rows,
 #endif
 }
 
+/** @brief [#4428 window] Before the seed: the |max| per (kv head, dim) of
+ *  the rows the layer's windowed host cache dropped, n = n_kv x head_dim
+ *  values each (ComputeOps::decode_kv_amax_floor). */
+inline bool htpDecodeKvAmaxFloor(const float *k_amax, const float *v_amax,
+                                 unsigned n) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_amax_floor(k_amax, v_amax, n);
+#else
+  (void)k_amax;
+  (void)v_amax;
+  (void)n;
+  return false;
+#endif
+}
+
 /** @brief The windowed attention layers' KV caches hold `rows` rows from
  *  absolute position `base` (ComputeOps::set_decode_kv_window); before the
  *  first decode row. */

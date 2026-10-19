@@ -84,6 +84,7 @@ void clLaunchStatDump(const char *phase);
 #include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
 #include <htp_decode_hook.h>
 #include <htp_mha_core.h>
+#include <layer_node.h>
 #include <llm_util.hpp>
 #if !defined(_WIN32)
 #include <sys/mman.h> // [lmhead-tie-lut] madvise the uploaded LUT mmap away
@@ -1039,9 +1040,24 @@ void CausalLM::compactKVCache(unsigned int pos, bool force) {
   unsigned int n = 0;
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
-      if (l.getType() == causallm::HtpMHACoreLayer::type &&
-          n < kv_cache.getNumLayers())
-        l.setProperty({"cache_base=" + std::to_string(kv_cache.getBase(n++))});
+      if (l.getType() != causallm::HtpMHACoreLayer::type ||
+          n >= kv_cache.getNumLayers())
+        return;
+      const unsigned int idx = n++;
+      l.setProperty({"cache_base=" + std::to_string(kv_cache.getBase(idx))});
+      // [#4428 window] the rows the compactions dropped so far: their |max|
+      // reaches the decode seed's int8 scales through the layer
+      if (kv_cache.droppedAmaxK(idx).empty())
+        return;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      auto *mha =
+        node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+             : nullptr;
+      NNTR_THROW_IF(mha == nullptr, std::runtime_error)
+        << "compactKVCache: attention layer " << idx
+        << " is not an HtpMHACoreLayer";
+      mha->foldDroppedAmax(kv_cache.droppedAmaxK(idx),
+                           kv_cache.droppedAmaxV(idx));
     };
   model->forEachLayer(fn, nullptr);
 }
@@ -1051,6 +1067,9 @@ void CausalLM::save_kvcache(std::string path, int to_) {
     throw std::runtime_error(
       "save_kvcache called before allocateAndBindKVCache()");
   }
+  // [#4428 window] a windowed layer's rows before its window are not in
+  // the dump: their |max| is folded first and goes with the calibration
+  compactKVCache(static_cast<unsigned int>(to_));
   kv_cache.save(path, static_cast<unsigned int>(to_), kvCacheModelTag());
   // the int8 attention's scales of this prefill, for the run that loads it
   std::ofstream q2(path + ".q2", std::ios::binary);

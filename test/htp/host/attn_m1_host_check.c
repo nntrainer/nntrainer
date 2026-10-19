@@ -1583,6 +1583,96 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   }
 }
 
+/** [#4428 window] A windowed host cache seeds only its window, so the int8
+ *  scales (the seed rows' amax) would differ from a full cache's and so
+ *  would every token after: with the dropped rows' |max| as the floor the
+ *  scales, and the output, are the full seed's bytes. Gemma's sliding
+ *  shape, L = 1536 rows, window W = 1024: ctx a seeds rows [0, L - 1) and
+ *  attends at pos L - 1; ctx b takes the floor of rows [0, L - W), seeds
+ *  rows [L - W, L - 1) and attends at pos W - 1 over the same keys. The
+ *  control c seeds the window without the floor and must differ, or the
+ *  case tests nothing. */
+static void check_amax_floor(hvx_worker_pool *pool) {
+  const uint32_t nk = G4[0].n_kv, gqa = G4[0].gqa, hd = G4[0].hd,
+                 W = G4[0].window;
+  const uint32_t L = 1536u, nq = nk * gqa, row = nk * hd, qrow = nq * hd;
+  const int fail0 = g_fail;
+  amc_rng rng = {0x4428u};
+  float *q = malloc(qrow * sizeof(float));
+  float *k = malloc((size_t)L * row * sizeof(float));
+  float *v = malloc((size_t)L * row * sizeof(float));
+  float *fk = calloc(row, sizeof(float)), *fv = calloc(row, sizeof(float));
+  float *out_a = malloc(qrow * sizeof(float));
+  float *out_b = malloc(qrow * sizeof(float));
+  float *out_c = malloc(qrow * sizeof(float));
+  float stats[2u * 64u];
+  int err = 0;
+  hvx_attn_m1_ctx *ctx[3];
+  CHECK(q && k && v && fk && fv && out_a && out_b && out_c,
+        "amax_floor: malloc");
+  g4_fill(&rng, q, k, v, L, nk, gqa, hd, W);
+  for (uint32_t p = 0; p < L - W; ++p) {
+    for (uint32_t i = 0; i < row; ++i) {
+      const float ak = fabsf(k[(size_t)p * row + i]);
+      const float av = fabsf(v[(size_t)p * row + i]);
+      fk[i] = ak > fk[i] ? ak : fk[i];
+      fv[i] = av > fv[i] ? av : fv[i];
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    ctx[i] =
+      hvx_attn_m1_create(2u, nk, gqa, hd, G4_SEQ | HVX_ATTN_M1_Q8, pool, &err);
+    CHECK(ctx[i] && err == AEE_SUCCESS, "amax_floor: create %d", i);
+  }
+  if (ctx[0] && ctx[1] && ctx[2]) {
+    const size_t last = (size_t)(L - 1u) * row, win0 = (size_t)(L - W) * row;
+    int rc = hvx_attn_m1_kv_append(ctx[0], 0u, 0u, L - 1u, k, v);
+    rc |= hvx_attn_m1_forward(ctx[0], 0u, L - 1u, W, 1.0f, q, k + last,
+                              v + last, out_a, stats);
+    CHECK(rc == AEE_SUCCESS, "amax_floor: full seed rc=%d", rc);
+    rc = hvx_attn_m1_kv_amax_floor(ctx[1], 0u, fk, fv);
+    rc |= hvx_attn_m1_kv_append(ctx[1], 0u, 0u, W - 1u, k + win0, v + win0);
+    rc |= hvx_attn_m1_forward(ctx[1], 0u, W - 1u, W, 1.0f, q, k + last,
+                              v + last, out_b, stats);
+    CHECK(rc == AEE_SUCCESS, "amax_floor: window seed rc=%d", rc);
+    CHECK(memcmp(ctx[0]->sk, ctx[1]->sk, row * sizeof(float)) == 0 &&
+            memcmp(ctx[0]->sv, ctx[1]->sv, row * sizeof(float)) == 0 &&
+            memcmp(ctx[0]->sk_inv, ctx[1]->sk_inv, row * sizeof(float)) == 0 &&
+            memcmp(ctx[0]->sv_inv, ctx[1]->sv_inv, row * sizeof(float)) == 0,
+          "amax_floor: the window's scales differ from the full seed's");
+    CHECK(memcmp(out_a, out_b, qrow * sizeof(float)) == 0,
+          "amax_floor: the window's output differs from the full seed's");
+    rc = hvx_attn_m1_kv_append(ctx[2], 0u, 0u, W - 1u, k + win0, v + win0);
+    rc |= hvx_attn_m1_forward(ctx[2], 0u, W - 1u, W, 1.0f, q, k + last,
+                              v + last, out_c, stats);
+    CHECK(rc == AEE_SUCCESS &&
+            memcmp(ctx[0]->sk, ctx[2]->sk, row * sizeof(float)) != 0,
+          "amax_floor: the control (no floor) has the full seed's scales");
+    /* layer 1's floor is its own: layer 0's scales are set already */
+    CHECK(hvx_attn_m1_kv_amax_floor(ctx[1], 1u, fk, fv) == AEE_SUCCESS &&
+            memcmp(ctx[1]->sk, ctx[0]->sk, row * sizeof(float)) == 0,
+          "amax_floor: another layer's floor moved layer 0's scales");
+    CHECK(hvx_attn_m1_kv_amax_floor(ctx[1], 2u, fk, fv) == AEE_EINVALIDFORMAT,
+          "amax_floor: a layer out of range is refused");
+    CHECK(hvx_attn_m1_kv_amax_floor(NULL, 0u, fk, fv) == AEE_EBADSTATE,
+          "amax_floor: a NULL ctx is refused");
+  }
+  for (int i = 0; i < 3; ++i) {
+    hvx_attn_m1_free(ctx[i]);
+  }
+  free(q);
+  free(k);
+  free(v);
+  free(fk);
+  free(fv);
+  free(out_a);
+  free(out_b);
+  free(out_c);
+  if (g_fail == fail0) {
+    printf("ATTN M1 AMAX FLOOR OK\n");
+  }
+}
+
 /** [#4416 D6] The vector seed (hvx_attn_m1_f32.c's run_amax / append_tile_q8)
  *  against the per-element definition it replaced: amax = max |x| per dim,
  *  byte = (int)(clamp(x * inv, +-127) +- 0.5). Two passes a shape: scales
@@ -1906,6 +1996,8 @@ int main(void) {
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);
   check_seed_f16(NULL);
+  check_amax_floor(pools[2]);
+  check_amax_floor(NULL);
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);
