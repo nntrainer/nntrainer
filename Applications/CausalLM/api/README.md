@@ -108,6 +108,66 @@ for device checks and the current 16 KB compatibility limitation of the SDK
 runtime/DSP packaging. Keep `jniLibs.useLegacyPackaging = true` and exclude
 `libnntr_hvx_skel.so` from stripping in downstream applications.
 
+## LFM2 MoE on native HTP
+
+The `--htp` build also registers `lfm2-24ba2b-htp` with the NPU backend.
+Load it with `CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`
+from `<model_base_path>/lfm2-24ba2b-htp-w4a32`.
+
+The only supported LFM2 HTP format is `lfm2_weight_format=sr15_v2`, with
+`lfm2_execution_profile=htp_fused`: TL2 experts, affine WH projections and
+router, Q4_0 embedding and DW3_INT4 short convolutions. Keep the generated
+`conversion_report.json` alongside the weights; the loader requires both
+checkpoint rotation records. The legacy unrotated LFM2 pack is rejected.
+
+Pass the absolute directory containing the matching v81 DSP library as
+`native_lib_dir`. HTP runtime ownership follows the lifecycle above: only
+one active HTP handle is supported, and each streaming call starts an
+independent prompt. Public KV snapshot/resume remains unsupported. The
+SR15 performance defaults in `lfm2_runtime_defaults.h` are selected by the
+native CLI only; the API does not install those process-wide settings.
+See the [LFM2 guide](../../../docs/lfm2-htp-user-guide.md) for conversion and
+runtime requirements.
+
+The standalone `test/htp/quick_dot_ai_validation.cpp` device check accepts
+`lfm2 <legacy-base> <lib-dir> <sr15-base> <prompt-file>`. It checks legacy
+format rejection, SR15 load, two identical greedy streaming requests and
+unload. Each base contains the `lfm2-24ba2b-htp-w4a32` directory; the prompt
+file contains an already formatted prompt.
+
+For SampleTestAPP, select family `lfm2`, runtime `NATIVE` and backend `NPU`.
+The model base path must contain the same `lfm2-24ba2b-htp-w4a32` directory.
+The APK does not include model weights. Normal launches use
+`/sdcard/Download/aistudio-mobile/models/`; stage the model there to use
+Chat **Open** or OpenAI **Load model** without editing the path. A path
+supplied to an instrumentation test is temporary and is not saved for the
+next app launch.
+The opt-in app lifecycle test accepts `htpModelId=lfm2-24ba2b-htp`; its
+default remains Gemma4. After installing the HTP app and instrumentation
+APKs, granting model-file access and acknowledging any first-launch system
+dialogs, run:
+
+```bash
+adb -s "$DEVICE" shell am instrument -w -r \
+  -e class 'com.example.sampletestapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
+  -e htpModelId lfm2-24ba2b-htp \
+  -e htpModelBase /sdcard/Download/aistudio-mobile/models \
+  -e htpMessages /sdcard/Download/lfm2/messages.json \
+  com.example.sampletestapp.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+`messages.json` is an OpenAI messages array. Use greedy generation and a
+prompt/output limit long enough to exercise cancellation (for example,
+96 generated tokens). The test checks repeatability, stop, unload during
+generation, reload and recovery from an invalid model path. Reports and
+native token traces are written under the app's `files/htp-app-validation`.
+
+Also verify the normal-launch path with
+`-e class 'com.example.sampletestapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' -e htpDefaultPathCheck true`.
+This test uses the default model path and LFM2 prompt. It opens Chat and
+generates an answer, compares the OpenAI output and repeats after restarting the
+Activity. Reports are stored in `files/htp-default-path-validation`.
+
 ## Compatibility
 
 Consumers must use `quick_dot_ai_api.h` and `libquick_dot_ai_api.so`; the
