@@ -224,6 +224,19 @@ void hvx_router_topk_wh(const float *x, const uint8_t *w, const float *bias,
                         uint32_t K, uint32_t E, uint32_t top_k, float *logits,
                         uint32_t *sel, float *weight, hvx_worker_pool *pool);
 
+/** Decode affine INT4 into exact unscaled [K][E] floats followed by E
+ * scales. The caller owns the aligned allocation and releases it with free.
+ * Returns NULL on invalid shapes or allocation failure. */
+float *hvx_router_wh_weights_create(const uint8_t *w, uint32_t K, uint32_t E);
+
+/** Same logits, selection and routing weights as hvx_router_topk_wh using
+ * hvx_router_wh_weights_create's immutable representation. */
+void hvx_router_topk_wh_decoded_f32(const float *x, const float *w,
+                                    const float *bias, uint32_t K, uint32_t E,
+                                    uint32_t top_k, float *logits,
+                                    uint32_t *sel, float *weight,
+                                    hvx_worker_pool *pool);
+
 void hvx_router_softmax_topk_f32(const float *x, const float *wp,
                                  const float *pes, uint32_t K, uint32_t E,
                                  uint32_t top_k, float *logits, uint32_t *sel,

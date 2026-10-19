@@ -981,7 +981,15 @@ public:
     (void)ds;
     return false;
   }
-  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() {
+  // If needed is supplied, a backend may cancel unread experts outside it.
+  // Cancelled keys are returned separately so the caller can retire its holds.
+  // Started reads must finish before their slots are reused. A null needed
+  // preserves the complete-batch drain used by teardown and earlier passes.
+  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end(
+    const std::vector<const void *> *needed = nullptr,
+    std::vector<const void *> *cancelled = nullptr) {
+    (void)needed;
+    (void)cancelled;
     return {};
   }
 

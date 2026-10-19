@@ -14,12 +14,37 @@ contracts, use the [TL2 guide](gemma4-htp-tl2-guide.md). The
 [LFM2 guide](lfm2-htp-user-guide.md) covers LFM2/SR15 and the latest matched
 LFM2/Gemma4 measurements; those packs and workloads differ from this record.
 
-Updated 2026-10-18: the current native TL2 pack uses compact expert slots,
+Updated 2026-10-19: the current native TL2 pack uses compact expert slots,
 reclaims prefill staging and supports an affine untied head on the NPU.
-The latest 1024-input, C16/preload-128 series recorded medians of 621.36
-prefill and 12.32 decode tok/s over three runs with matching reference IDs.
-For the earlier 2048-input decode comparison, separate memory savings and
-their limits, see the [TL2 validation record](gemma4-htp-tl2-guide.md#current-validation-coverage).
+The combined LFM2 optimization runtime was checked against the PR #4428
+runtime at `b0c1c338e2dd4c8d5075938a4fbff92c90cb3ab4` using the same
+unrotated Gemma4 TL2/affine pack on SM-S948U / Hexagon v81. This fixture
+uses 1024 input tokens, maximum context 2048, C16/preload 128, eight CPU
+threads, direct file I/O, no load prefetch and no cache growth. It generates
+64 timed decode tokens plus the token selected by prefill.
+
+| Runtime | Runs | Prefill median (range), tok/s | Decode median (range), tok/s |
+|---|---:|---:|---:|
+| PR baseline | 3 | 621.736 (615.385–630.930) | 12.9110 (12.8617–12.9660) |
+| Combined LFM2 runtime | 3 | 632.099 (622.871–641.202) | 12.9923 (12.9215–13.0240) |
+
+The pair order alternated baseline/current, current/baseline and
+baseline/current. Each launch required five seconds without another
+inference process, HAL AP at most 34 °C and skin at most 36.5 °C; no layer
+or HTP profiler was enabled. All six runs reproduced the same 65 IDs
+(newline-separated file SHA256
+`d0ca48a0dab9c2a745edb099df3766971d30b69ce4ea72744fa6e9e61d5ed3f3`).
+The configuration SHA256 was
+`32ceda336eb51070053c6bf103d9450c22a50e1bb533b73f927c22037bfdcbad`.
+The LFM2 automatic CLI preset did not activate for Gemma4. No regression
+was observed for this fixture; these short runs do not establish sustained
+throughput or validate other Gemma4 weight packs.
+
+The earlier 2026-10-18 1024-input series recorded 621.36 prefill and 12.32
+decode tok/s. For the earlier 2048-input decode comparison, separate memory
+savings and their limits, see the
+[TL2 validation record](gemma4-htp-tl2-guide.md#current-validation-coverage).
+Raw measurement logs and runtime binaries remain outside the commits.
 
 ## 1. What you get
 

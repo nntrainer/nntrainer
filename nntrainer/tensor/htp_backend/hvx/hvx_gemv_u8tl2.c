@@ -189,6 +189,76 @@ void hvx_tl2_expand_wh96_disjoint(const uint8_t *__restrict src, uint32_t rows,
   tl2_expand_wh96(src, rows, columns, row_stride, magnitude, dst);
 }
 
+void hvx_tl2_expand_wh96_disjoint_batch(const uint8_t *__restrict src,
+                                        uint32_t groups, uint32_t row_stride,
+                                        int magnitude,
+                                        uint8_t *__restrict dst) {
+#if defined(__hexagon__)
+  if ((magnitude == 1 || magnitude == 7) &&
+      (((uintptr_t)src | (uintptr_t)dst | row_stride) & 127u) == 0u) {
+    const HVX_Vector *input = __builtin_assume_aligned(src, 128u);
+    uint8_t *output = __builtin_assume_aligned(dst, 128u);
+    const uint8_t(*table)[128] = tl2_expand_nibbles[magnitude == 7];
+    const HVX_Vector low[3] = {*(const HVX_Vector *)table[0],
+                               *(const HVX_Vector *)table[1],
+                               *(const HVX_Vector *)table[2]};
+    const HVX_Vector high[3] = {Q6_Vh_vasl_VhR(low[0], 4),
+                                Q6_Vh_vasl_VhR(low[1], 4),
+                                Q6_Vh_vasl_VhR(low[2], 4)};
+    const HVX_Vector mask = Q6_V_vsplat_R(0x0f0f0f0f);
+    /** A native block contains 24 rows. Its five source vectors cover three
+     * eight-row WH groups. Keep this loop rolled so the compiler retires
+     * those source vectors before loading the next block. */
+#pragma clang loop unroll(disable)
+    for (uint32_t b = 0; b < groups * 4u; ++b) {
+      const HVX_Vector codes[4] = {input[b * 5u], input[b * 5u + 1u],
+                                   input[b * 5u + 2u], input[b * 5u + 3u]};
+      const HVX_Vector signs = input[b * 5u + 4u];
+#pragma unroll(3)
+      for (uint32_t t = 0; t < 3u; ++t) {
+        HVX_Vector bytes[4];
+#pragma unroll(4)
+        for (uint32_t r = 0; r < 4u; ++r) {
+          const uint32_t k = t * 8u + r;
+          const uint32_t lg = k / 3u, hg = (k + 4u) / 3u;
+          HVX_Vector li = codes[lg / 2u], hi = codes[hg / 2u];
+          if (lg % 2u)
+            li = Q6_Vuh_vlsr_VuhR(li, 4);
+          if (hg % 2u)
+            hi = Q6_Vuh_vlsr_VuhR(hi, 4);
+          li =
+            Q6_V_vandor_VQR(Q6_V_vand_VV(li, mask),
+                            Q6_Q_vand_VR(signs, 0x01010101u << lg), 0x10101010);
+          hi =
+            Q6_V_vandor_VQR(Q6_V_vand_VV(hi, mask),
+                            Q6_Q_vand_VR(signs, 0x01010101u << hg), 0x10101010);
+          const HVX_Vector lo = Q6_Vb_vlut32_VbVbI(li, low[k % 3u], 0);
+          bytes[r] = Q6_Vb_vlut32or_VbVbVbI(lo, hi, high[(k + 4u) % 3u], 0);
+        }
+        const HVX_VectorPair a = Q6_W_vshuff_VVR(bytes[1], bytes[0], 1);
+        const HVX_VectorPair c = Q6_W_vshuff_VVR(bytes[3], bytes[2], 1);
+        const HVX_VectorPair even =
+          Q6_W_vshuff_VVR(Q6_V_lo_W(c), Q6_V_lo_W(a), 2);
+        const HVX_VectorPair odd =
+          Q6_W_vshuff_VVR(Q6_V_hi_W(c), Q6_V_hi_W(a), 2);
+        const uint32_t k = b * 24u + t * 8u;
+        HVX_Vector *out =
+          (HVX_Vector *)(output + (size_t)(k / 32u) * row_stride +
+                         k % 32u / 8u * 128u);
+        out[0] = Q6_V_lo_W(even);
+        out[4] = Q6_V_lo_W(odd);
+        out[8] = Q6_V_hi_W(even);
+        out[12] = Q6_V_hi_W(odd);
+      }
+    }
+    return;
+  }
+#endif
+  for (uint32_t g = 0; g < groups; ++g)
+    hvx_tl2_expand_wh96_disjoint(src + (size_t)g * 2560u, 96u, 128u, row_stride,
+                                 magnitude, dst + (size_t)g * 3u * row_stride);
+}
+
 int hvx_tl2_pack(const int8_t *kn, uint32_t K, uint32_t N, uint8_t *packed) {
   const size_t bytes = hvx_tl2_weight_bytes(K, N);
   if (!kn || !packed || !bytes || (size_t)K > SIZE_MAX / N)

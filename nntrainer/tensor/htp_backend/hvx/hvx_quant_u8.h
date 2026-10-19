@@ -23,6 +23,13 @@
 void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
                          uint8_t *dst);
 
+/** Parameters from two extrema per valid row. The extrema must propagate
+ * NaNs and include the same values as the row scan; including zero is safe.
+ * Padded rows and zero/NaN ranges retain scale 1 and zero point 0. */
+void hvx_quant_rows_u8_params_extrema(const float *extrema, uint32_t m_valid,
+                                      uint32_t m_pad, float *scale,
+                                      int32_t *zp);
+
 /**
  * @brief Computes the per-row scale and zero point (K1).
  *

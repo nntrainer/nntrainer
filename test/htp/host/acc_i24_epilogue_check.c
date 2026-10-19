@@ -20,7 +20,7 @@ static uint8_t planes[NT][ACC_I24_TILE_BYTES] __attribute__((aligned(128)));
 static uint8_t saved[sizeof planes];
 static float out[ROWS][WIDTH], ref[ROWS][WIDTH];
 
-int main(void) {
+static uint32_t check_pattern(uint32_t pattern) {
   float as[ROWS], ws[COLS], bias[COLS], weights[ROWS];
   int32_t az[ROWS], cs[COLS];
   uint32_t rows[ROWS];
@@ -43,16 +43,21 @@ int main(void) {
   memcpy(saved, planes, sizeof planes);
   for (uint32_t r = 0; r < ROWS; ++r) {
     as[r] = 0.0001f * (float)(1u + r % 3u);
-    az[r] = 127 + (int32_t)r;
+    az[r] = pattern == 0u   ? 127 + (int32_t)r
+            : pattern == 1u ? 0
+            : pattern == 2u ? 255
+                            : (int32_t)((r * 73u) % 256u);
     weights[r] = 0.125f * (float)(1u + r % 5u);
     rows[r] = (r * 13u + 17u) % ROWS;
   }
   for (uint32_t c = 0; c < COLS; ++c) {
     ws[c] = 0.001f * (float)(1u + c % 5u);
     bias[c] = ((float)(c % 7u) - 3.f) * 0.01f;
-    cs[c] = (int32_t)(c * 317u % 2048u) - 1024;
+    const int32_t limits[] = {-32896, -32768, -1, 0, 1, 32767, 32896};
+    cs[c] = pattern == 0u ? (int32_t)(c * 317u % 2048u) - 1024
+                          : limits[c % (sizeof limits / sizeof *limits)];
   }
-  const uint32_t counts[] = {1, 2, 3, 4, 7, 15, 16, 31, 63, 64};
+  const uint32_t counts[] = {0, 1, 2, 3, 4, 5, 7, 15, 16, 31, 32, 33, 63, 64};
   uint32_t cases = 0;
   for (uint32_t act = 0; act < 2u; ++act)
     for (uint32_t ci = 0; ci < sizeof counts / sizeof *counts; ++ci)
@@ -111,8 +116,15 @@ int main(void) {
           ++cases;
         }
       }
-  printf("ACC_I24_EPILOGUE_PASS: %u GU/DN cases, partial rows, worker slices, "
-         "GLU variants, repeated scatter and read-only planes\n",
+  return cases;
+}
+int main(void) {
+  uint32_t cases = 0;
+  for (uint32_t pattern = 0; pattern < 4u; ++pattern)
+    cases += check_pattern(pattern);
+  printf("ACC_I24_EPILOGUE_PASS: %u GU/DN cases, zero-point/colsum bounds, "
+         "partial rows, worker slices, GLU variants, repeated scatter and "
+         "read-only planes\n",
          cases);
   return 0;
 }

@@ -549,7 +549,11 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
       out, (const hvx_router_sm_weights *)g->param[i], g->state[i] + op->K,
       op->top_k, out, sel, w, call->env->pool);
   } else {
-    if (g->router_wh[i])
+    if (g->router_wh[i] == 2u)
+      hvx_router_topk_wh_decoded_f32(in, g->param[i], g->state[i], op->K,
+                                     op->n_experts, op->top_k, out, sel, w,
+                                     call->env->pool);
+    else if (g->router_wh[i])
       hvx_router_topk_wh(in, (const uint8_t *)g->param[i], g->state[i], op->K,
                          op->n_experts, op->top_k, out, sel, w,
                          call->env->pool);
@@ -1337,13 +1341,28 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     return AEE_EINVALIDFORMAT;
   }
   if (which == HTP_GRAPH_PARAM_ROUTER_WH) {
-    float *packed = (float *)memalign(128, (size_t)n * sizeof(float));
-    if (!packed)
-      return AEE_ENOMEMORY;
-    memcpy(packed, data, (size_t)n * sizeof(float));
+    /** The small router is read at every decode layer. Decode its sixteen
+       integer levels once at bind instead of once per token, retaining
+       the original final scale multiply. Experts stay compressed. A packed
+       fallback keeps binding usable when this extra cache cannot fit. */
+#ifndef NNTR_GRAPH_ROUTER_WH_DECODED
+#define NNTR_GRAPH_ROUTER_WH_DECODED 1
+#endif
+    float *packed =
+      NNTR_GRAPH_ROUTER_WH_DECODED
+        ? hvx_router_wh_weights_create((const uint8_t *)data, g->ops[op].K,
+                                       g->ops[op].n_experts)
+        : NULL;
+    const uint8_t format = packed ? 2u : 1u;
+    if (!packed) {
+      packed = (float *)memalign(128, (size_t)n * sizeof(float));
+      if (!packed)
+        return AEE_ENOMEMORY;
+      memcpy(packed, data, (size_t)n * sizeof(float));
+    }
     free(*dst);
     *dst = packed;
-    g->router_wh[op] = 1u;
+    g->router_wh[op] = format;
     return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_ROUTER_W) {
@@ -1366,12 +1385,16 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
       *dst = (float *)packed;
       return AEE_SUCCESS;
     }
-    if (*dst == NULL) {
-      *dst = (float *)memalign(128, (size_t)K * W * sizeof(float));
-      if (*dst == NULL) {
+    if (*dst == NULL || g->router_wh[op]) {
+      float *replacement =
+        (float *)memalign(128, (size_t)K * W * sizeof(float));
+      if (replacement == NULL) {
         return AEE_ENOMEMORY;
       }
+      free(*dst);
+      *dst = replacement;
     }
+    g->router_wh[op] = 0u;
     memset(*dst, 0, (size_t)K * W * sizeof(float));
     for (k = 0; k < K; ++k) {
       memcpy(*dst + (size_t)k * W, data + (size_t)k * E,

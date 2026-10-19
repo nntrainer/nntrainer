@@ -13,9 +13,13 @@
 
 #include "residual_add.h"
 
+#include <algorithm>
 #include <cpu_backend.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <nntrainer_error.h>
+#include <thread_manager.h>
 
 #include "htp_decode_hook.h"
 
@@ -28,7 +32,8 @@ static constexpr size_t OUT_IDX = 0;
  * copy-plus-add can have different semantics when its addend aliases out. */
 static bool lfmPrefillAdd(const nntrainer::Tensor &lhs,
                           const nntrainer::Tensor &rhs, nntrainer::Tensor &out,
-                          unsigned int rows) {
+                          unsigned int rows,
+                          nntrainer::ComputeOps *view_ops = nullptr) {
   if (rows <= 1 || out.width() != 2048 || out.batch() != 1 ||
       out.channel() != 1 || out.getFormat() != nntrainer::Tformat::NCHW ||
       out.getDataType() != nntrainer::Tdatatype::FP32 ||
@@ -44,8 +49,46 @@ static bool lfmPrefillAdd(const nntrainer::Tensor &lhs,
     const uintptr_t b = reinterpret_cast<uintptr_t>(p);
     return a >= b ? a - b >= bytes : b - a >= bytes;
   };
-  if (!x || !y || !z || !disjoint(x) || !disjoint(y))
+  bool parallel_prefill = false;
+#if defined(__aarch64__) && defined(ENABLE_HEXKL)
+  static const bool enabled = [] {
+    const char *value = std::getenv("NNTR_LFM2_PARALLEL_ADD");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  parallel_prefill = enabled;
+#endif
+  // copy(lhs) is a no-op when out already is lhs, so the add is safely
+  // in-place. A distinct rhs aliased by out is different: copy(lhs) would
+  // overwrite it before the old add. Preserve that case and partial overlaps.
+  const bool lhs_inplace = parallel_prefill && z == x;
+  if (!x || !y || !z || (!disjoint(x) && !lhs_inplace) ||
+      (!disjoint(y) && !(lhs_inplace && y == x)))
     return false;
+  // The producer can leave its complete result in CPU-mapped accelerator
+  // storage. Keep the logical alias checks above before resolving that view.
+  if (view_ops) {
+    x = static_cast<const float *>(view_ops->host_view(x, bytes));
+    y = static_cast<const float *>(view_ops->host_view(y, bytes));
+    if (!x || !y || (!disjoint(x) && x != z) || (!disjoint(y) && y != z))
+      return false;
+  }
+#if defined(__aarch64__) && defined(ENABLE_HEXKL)
+  // HTP's plain residual is a CPU operation. Partition independent cache
+  // lines without changing the add kernel or allocating another tensor.
+  if (parallel_prefill && rows >= 128 &&
+      (out.getOps() == nntrainer::get_htp_ops() ||
+       out.getOps() == nntrainer::get_cpu_ops())) {
+    constexpr size_t chunk = 32u * 2048u;
+    const size_t count = out.size();
+    nntrainer::ThreadManager::Global().parallel_for(
+      0, (count + chunk - 1u) / chunk, [&](size_t job) {
+        const size_t offset = job * chunk;
+        out.getOps()->ele_add_fp32(std::min(chunk, count - offset), x + offset,
+                                   y + offset, z + offset, 1.0f, 0.0f, 1, 1);
+      });
+    return true;
+  }
+#endif
   out.getOps()->ele_add_fp32(out.size(), x, y, z, 1.0f, 0.0f, 1, 1);
   return true;
 }
@@ -161,8 +204,23 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
     if (fused && rows == 1 && out.batch() == 1 && htpDecodeRowResident(from))
       continue;
     if (!fused) {
-      if (lfmPrefillAdd(in0_step, in1_step, out_step, rows))
+      nntrainer::ComputeOps *view_ops = nullptr;
+#if defined(__aarch64__) && defined(ENABLE_HEXKL)
+      static const bool prefill_views = [] {
+        const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+        return value && std::strcmp(value, "1") == 0;
+      }();
+      if (prefill_views && rows > 1)
+        view_ops = context.getComputeOps();
+#endif
+      if (lfmPrefillAdd(in0_step, in1_step, out_step, rows, view_ops))
         continue;
+      if (view_ops && out.getDataType() == nntrainer::Tdatatype::FP32) {
+        view_ops->sync_to_host(in0_step.getData<float>(),
+                               in0_step.size() * sizeof(float));
+        view_ops->sync_to_host(in1_step.getData<float>(),
+                               in1_step.size() * sizeof(float));
+      }
       out_step.copy(in0_step);
       out_step.add_i(in1_step);
       continue;

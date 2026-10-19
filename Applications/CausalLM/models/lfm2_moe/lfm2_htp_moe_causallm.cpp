@@ -171,6 +171,13 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "htp")};
       if (sr15_)
         conv_props.push_back("short_conv_dtype=DW3_INT4");
+#if defined(__aarch64__) && defined(ENABLE_HEXKL)
+      const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+      const char *retain = std::getenv("NNTR_LFM2_CONV_RETAIN_OUT");
+      if (sr15_ && views && std::strcmp(views, "1") == 0 && retain &&
+          std::strcmp(retain, "1") == 0)
+        conv_props.push_back("out_to_host=false");
+#endif
       LayerHandle conv(createLayer("conv_block", conv_props));
       branch = conv(norm(h));
     } else {
@@ -205,6 +212,11 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
       if (sr15_)
         props.push_back("router_dtype=QS4CX_WH_AFFINE");
+#if defined(__aarch64__) && defined(ENABLE_HEXKL)
+      const char *prefill_views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
+      if (sr15_ && prefill_views && std::strcmp(prefill_views, "1") == 0)
+        props.push_back("out_to_host=false");
+#endif
       LayerHandle moe(createLayer("lfm2_moe", props));
       branch = moe(h);
     }

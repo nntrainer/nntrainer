@@ -100,7 +100,8 @@ public:
     const std::vector<ExpertFileDesc> &, bool) = 0;
   virtual bool
   prefetch_qs4cx_wh_experts_begin(const std::vector<ExpertFileDesc> &) = 0;
-  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end() = 0;
+  virtual std::vector<const void *> prefetch_qs4cx_wh_experts_end(
+    const std::vector<const void *> * = nullptr, std::vector<const void *> * = nullptr) = 0;
 };
 ComputeOps *current_ops;
 ComputeOps *get_htp_ops() { return current_ops; }
@@ -123,6 +124,7 @@ std::vector<int> ids(const std::vector<const void *> &p) {
 struct Fake : nntrainer::ComputeOps {
   int layer = -1, demand_reads = 0, end_calls = 0, fail_begin = -1;
   bool refuse = false, workers_stopped = false, old_pass = false;
+  bool cancel_queued = false;
   int fail_preload = -1, preload_calls = 0;
   bool throw_preload = false;
   std::deque<std::vector<const void *>> batches;
@@ -161,13 +163,23 @@ struct Fake : nntrainer::ComputeOps {
     batches.push_back(keys);
     return true;
   }
-  std::vector<const void *> prefetch_qs4cx_wh_experts_end() override {
+  std::vector<const void *> prefetch_qs4cx_wh_experts_end(
+    const std::vector<const void *> *needed = nullptr,
+    std::vector<const void *> *cancelled = nullptr) override {
     assert(!batches.empty());
     auto keys = batches.front();
     batches.pop_front();
     // Only the established old-pass drain may join a future layer early.
     assert(old_pass || id(keys.front()) / EXPERTS <= layer);
     ++end_calls;
+    if (cancel_queued && needed && cancelled) {
+      keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const void *key) {
+        if (std::find(needed->begin(), needed->end(), key) != needed->end())
+          return false;
+        cancelled->push_back(key);
+        return true;
+      }), keys.end());
+    }
     registrations.push_back(ids(keys));
     for (auto k : keys)
       resident.insert(k);
@@ -215,6 +227,8 @@ void forwardLayer(Fake &backend, int expert_layer_slot,
   std::vector<const void *> need;
   for (int e : active)
     need.push_back(&identities[expert_layer_slot * EXPERTS + e]);
+  const bool prune_prefill = true;
+  const auto &routed_keys = need;
   auto release = [&](const void *k) { backend.evict(k); };
 '''
 
@@ -377,6 +391,61 @@ Result run(bool early, unsigned preload = 128) {
   result.future_order = ids(g_expert_lru.order());
   return result;
 }
+void checkPreloads() {
+  for (size_t preload : {0u, 1u, 32u, 63u, 64u, 65u, 127u, 128u, 129u,
+                         384u, 600u, 608u}) {
+    Fake ops;
+    seed(ops, preload);
+    const auto pinned = g_expert_lru.order();
+    const size_t queued = beginLfm2HtpExpertPrefill(&ops);
+    assert(queued <= CAPACITY - preload);
+    assert(g_expert_lru.order() == pinned && ops.evictions.empty());
+    std::set<int> reads;
+    for (const auto &batch : ops.reads)
+      for (int key : batch) {
+        assert(size_t(key) >= preload);
+        assert(reads.insert(key).second);
+      }
+    assert(reads.size() == queued);
+    if (preload < 576)
+      assert(queued > 0);
+    else
+      assert(queued == 0);
+    for (int l = 0; l < LAYERS; ++l) {
+      forwardLayer(ops, l, active[l], recency[l]);
+      assert(g_expert_lru.size() <= CAPACITY);
+      assert(g_expert_lru.size() == ops.resident.size());
+      for (int e : active[l])
+        assert(ops.resident.count(&identities[l * EXPERTS + e]));
+    }
+    assert(ops.demand_reads == 0 && g_prefetch_batches.empty());
+    assert(g_prefetch_inflight.empty() && ops.batches.empty());
+    reads.clear();
+    for (const auto &batch : ops.reads)
+      for (int key : batch) {
+        assert(size_t(key) >= preload);
+        assert(reads.insert(key).second);
+      }
+    assert(reads.size() == LAYERS * EXPERTS - preload);
+  }
+}
+void checkPruning() {
+  for (unsigned preload : {0u, 32u, 128u, 384u}) {
+    Fake ops;
+    seed(ops, preload);
+    ops.cancel_queued = true;
+    beginLfm2HtpExpertPrefill(&ops);
+    for (int l = 0; l < LAYERS; ++l) {
+      forwardLayer(ops, l, active[l], recency[l]);
+      assert(g_expert_lru.size() <= CAPACITY);
+      assert(g_expert_lru.size() == ops.resident.size());
+      for (int e : active[l])
+        assert(ops.resident.count(&identities[l * EXPERTS + e]));
+    }
+    assert(ops.demand_reads == 0 && g_prefetch_batches.empty());
+    assert(g_prefetch_inflight.empty() && ops.batches.empty());
+  }
+}
 void checkGuards() {
   {
     Fake a, b;
@@ -386,7 +455,10 @@ void checkGuards() {
   }
   {
     Fake a;
-    seed(a, 65);
+    seed(a);
+    g_expert_lru.acquire(
+      {&identities[200]}, [&](const void *k) { a.resident.insert(k); },
+      [](const void *) { assert(false); });
     assert(BEGIN(&a) == 0);
   }
   {
@@ -616,6 +688,8 @@ int main(int argc, char **argv) {
     for (const auto &batch : kickoff.reads) reads += batch.size();
     assert(reads == LAYERS * EXPERTS - preload);
   }
+  checkPreloads();
+  checkPruning();
   checkGuards();
   checkModelHook();
   checkPreloadFailure();
@@ -627,8 +701,9 @@ int main(int argc, char **argv) {
             << future_routes.size() << " future probes with "
             << baseline.future_misses.size() << " identical misses/evictions; C"
             << CAPACITY
-            << "/PRELOAD64..576, owner, old-pass, fallback, queue failure and "
-               "teardown guards; six partial startup failures and retries\n";
+            << "/PRELOAD64..576 parity, PRELOAD0..608 partial-prefix safety, "
+               "owner, old-pass, fallback, queue failure and "
+               "teardown guards; six partial startup failures and retries; active-only cancellation retires all holds and inflight keys\n";
 }
 '''
 

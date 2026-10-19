@@ -67,6 +67,12 @@ static inline int mm_u8i4_tile(uint8_t *vtcm_base, uint32_t act_off,
  *         this size have a documented hardware bug (doc13 §3a, §5). */
 #define MAX_DMA_ROW_BYTES 262144u
 
+/** Native TL2 has zero bias and no affine offsets. Its shape limit bounds
+ * every epilogue read by this shared, immutable, vector-aligned table. */
+#define COMPACT_TL2_MAX_N 8192u
+static const float compact_tl2_zero_bias[COMPACT_TL2_MAX_N]
+  __attribute__((aligned(128))) = {0};
+
 static uint32_t dma_row_size_dividing(uint32_t total_bytes) {
   uint32_t rs = MAX_DMA_ROW_BYTES;
   while (rs > 1 && (total_bytes % rs) != 0) {
@@ -119,9 +125,29 @@ int hexkl_weight_u8i4_set_offsets(hexkl_weight_u8i4 *w, const float *offsets) {
     if (!(offsets[c] >= -15.0f && offsets[c] <= 15.0f) ||
         offsets[c] != (float)(int32_t)offsets[c])
       return AEE_EBADPARM;
+  /** A native handle rebound to legacy still has zero bias and can keep
+   * its small allocation. Only affine offsets need the fourth array.
+   * Validate and allocate before changing the handle; retain the old block
+   * until offsets have been read in case they alias its scale storage. */
+  void *retired_arrays = NULL;
+  if (w->bias == compact_tl2_zero_bias) {
+    const size_t n4 = sizeof(float) * w->N;
+    void *arrays = malloc(4u * n4 + 128u);
+    if (!arrays)
+      return AEE_ENOMEMORY;
+    const uintptr_t a = ((uintptr_t)arrays + 127u) & ~(uintptr_t)127u;
+    memcpy((void *)a, w->w_scale, 2u * n4);
+    memset((void *)(a + 2u * n4), 0, n4);
+    retired_arrays = w->arrays;
+    w->arrays = arrays;
+    w->w_scale = (float *)a;
+    w->colsum_w = (int32_t *)(a + n4);
+    w->bias = (const float *)(a + 2u * n4);
+  }
   w->w_offset = (int32_t *)((uintptr_t)w->w_scale + 3u * sizeof(float) * w->N);
   for (uint32_t c = 0; c < w->N; ++c)
     w->w_offset[c] = (int32_t)offsets[c];
+  free(retired_arrays);
   return AEE_SUCCESS;
 }
 
@@ -175,7 +201,8 @@ static void hexkl_weight_u8i4_tail_from_arena(hexkl_weight_u8i4 *h,
   hexkl_dma_ring_push2d(h->colsum_w, tail + n4, n4, n4, n4, 1u, 0, 0);
   hexkl_dma_ring_drain();
   hexkl_dcache_inva(h->w_scale, 2u * n4);
-  memset(h->bias, 0, n4);
+  if (h->bias != compact_tl2_zero_bias)
+    memset(h->w_scale + 2u * h->N, 0, n4);
 }
 
 void hexkl_weight_tl2_set_generation(hexkl_weight_u8i4 *weight,
@@ -241,21 +268,20 @@ static int hexkl_weight_u8i4_flush(const void *p, size_t n) {
  *
  * @a wh_src is the finished WH bytes -- the VTCM scratch the bake just
  * wrote, or the host's cached copy. Neither path owns them afterwards.
- * The three N-sized arrays are one 128-aligned block (hexkl_weight_u8i4's
- * arrays): the DMA that fills them from an arena wants aligned rows, and
- * one allocation frees as one.
+ * Metadata occupies one 128-aligned block: scales and column sums for
+ * native compact TL2, or four arrays including bias and affine offset room
+ * for legacy formats. The compact bias is the shared immutable zero table.
+ * The DMA that fills metadata from an arena requires aligned rows.
  */
 /** borrow != 0 points the slot at wh_src instead of copying it: the bytes
    live in a host arena the DSP has mapped, and release() must not free
    them. A NULL w_scale with borrow set takes the scales and column sums
    from the arena too (hexkl_weight_u8i4_tail_from_arena). Everything else
    about the slot is the same either way. */
-static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
-                                       uint32_t slot, uint32_t K, uint32_t N,
-                                       uint32_t wh_bytes, const uint8_t *wh_src,
-                                       const float *w_scale,
-                                       const int32_t *colsum_w,
-                                       const float *bias, int borrow) {
+static int hexkl_weight_u8i4_fill_slot(
+  hexkl_weight_u8i4_table *tbl, uint32_t slot, uint32_t K, uint32_t N,
+  uint32_t wh_bytes, const uint8_t *wh_src, const float *w_scale,
+  const int32_t *colsum_w, const float *bias, int borrow, int compact_arrays) {
   hexkl_weight_u8i4 *h = &tbl->slots[slot];
   const size_t n4 = sizeof(float) * N; /* N is a multiple of 32: n4 of 128 */
   uintptr_t a;
@@ -265,7 +291,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   h->tl2_generation = NULL;
   h->tl2_generation_seen = 0u;
   h->w_offset = NULL;
-  h->arrays = malloc(4u * n4 + 128u);
+  h->arrays = malloc((compact_arrays ? 2u : 4u) * n4 + 128u);
   if (!h->wh_bytes || !h->arrays) {
     if (!borrow) {
       free(h->wh_bytes);
@@ -277,7 +303,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   a = ((uintptr_t)h->arrays + 127u) & ~(uintptr_t)127u;
   h->w_scale = (float *)a;
   h->colsum_w = (int32_t *)(a + n4);
-  h->bias = (float *)(a + 2u * n4);
+  h->bias = compact_arrays ? compact_tl2_zero_bias : (float *)(a + 2u * n4);
   h->borrowed = borrow;
   h->K = K;
   h->N = N;
@@ -287,7 +313,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   if (w_scale) {
     memcpy(h->w_scale, w_scale, n4);
     memcpy(h->colsum_w, colsum_w, n4);
-    memcpy(h->bias, bias, n4);
+    memcpy(h->w_scale + 2u * N, bias, n4);
   } else {
     hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
   }
@@ -363,7 +389,8 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
   rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, vtcm_base,
-                                   w_scale, colsum_w, bias, /*borrow=*/0);
+                                   w_scale, colsum_w, bias, /*borrow=*/0,
+                                   /*compact_arrays=*/0);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -398,7 +425,8 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
     return AEE_ENOMEMORY;
   }
   rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, wh, w_scale,
-                                   colsum_w, bias, /*borrow=*/1);
+                                   colsum_w, bias, /*borrow=*/1,
+                                   /*compact_arrays=*/0);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -433,9 +461,12 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
     memcpy(w->pal, pal, sizeof(w->pal));
   }
   if (w_scale) {
-    memcpy(w->w_scale, w_scale, sizeof(float) * N);
-    memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
-    memset(w->bias, 0, sizeof(float) * N);
+    if (w->w_scale != w_scale)
+      memcpy(w->w_scale, w_scale, sizeof(float) * N);
+    if (w->colsum_w != colsum_w)
+      memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
+    if (w->bias != compact_tl2_zero_bias)
+      memset(w->w_scale + 2u * N, 0, sizeof(float) * N);
   } else {
     hexkl_weight_u8i4_tail_from_arena(
       w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) * (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
@@ -478,7 +509,8 @@ int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
     return AEE_ENOMEMORY;
   }
   rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes / 2u, wh, w_scale,
-                                   colsum_w, bias, /*borrow=*/1);
+                                   colsum_w, bias, /*borrow=*/1,
+                                   /*compact_arrays=*/0);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -491,7 +523,8 @@ int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
 /** Native-only slots keep metadata immediately after their packed codes.
  * Legacy QS2/TL2 slots retain their original WH2 metadata offset. */
 static int compact_tl2_shape(uint32_t K, uint32_t N) {
-  return K && N && K <= 8192u && N <= 8192u && K % 32u == 0u && N % 128u == 0u;
+  return K && N && K <= 8192u && N <= COMPACT_TL2_MAX_N && K % 32u == 0u &&
+         N % 128u == 0u;
 }
 
 int hexkl_weight_tl2_compact_register_arena(hexkl_weight_u8i4_table *tbl,
@@ -508,9 +541,9 @@ int hexkl_weight_tl2_compact_register_arena(hexkl_weight_u8i4_table *tbl,
   const uint32_t slot = hexkl_weight_u8i4_free_slot(tbl);
   if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS)
     return AEE_ENOMEMORY;
-  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N,
-                                   (uint32_t)htp_tl2_native_bytes(K, N), codes,
-                                   NULL, NULL, NULL, 1);
+  rc = hexkl_weight_u8i4_fill_slot(
+    tbl, slot, K, N, (uint32_t)htp_tl2_native_bytes(K, N), codes, NULL, NULL,
+    NULL, /*borrow=*/1, /*compact_arrays=*/1);
   if (rc != AEE_SUCCESS)
     return rc;
   hexkl_weight_u8i4 *w = &tbl->slots[slot];

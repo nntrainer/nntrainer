@@ -61,6 +61,8 @@ int main(void) {
   for (unsigned r = 0; r < 32u; ++r)
     for (unsigned c = 0; c < 32u; ++c)
       g_wh_i8_pos[32u * r + c] = (r / 4u) * 128u + 4u * c + r % 4u;
+  assert(wh_i8_segments_match(g_wh_i8_pos));
+  g_wh_i8_segments = 1;
   const unsigned lanes[] = {1u, 2u, 3u, 4u, 6u, 8u};
   unsigned cases = 0;
   for (unsigned i = 0; i < sizeof(lanes) / sizeof(lanes[0]); ++i) {
@@ -71,6 +73,14 @@ int main(void) {
     cases += 4;
   }
   check(0, 1024, 6);
+  check(0, 2048, 6);
+  cases += 2;
+  // An unknown WH layout preserves the scalar position-table fallback.
+  g_wh_i8_pos[0] = 4u;
+  g_wh_i8_pos[1] = 0u;
+  assert(!wh_i8_segments_match(g_wh_i8_pos));
+  g_wh_i8_segments = 0;
+  check(0, 64, 6);
   ++cases;
   printf("Dynamic KV: %u exact A/B/A serial-HVX/worker cases, full "
          "masters/metadata/WH and untouched rows PASS\n",

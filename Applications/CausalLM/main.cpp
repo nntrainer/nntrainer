@@ -33,6 +33,7 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "lfm2_runtime_defaults.h"
 #include "model_registry.h"
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
@@ -262,6 +263,14 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+#ifdef ENABLE_HEXKL
+    if (causallm::configureLfm2HtpDefaults(
+          cfg.value("model_type", std::string()),
+          nntr_cfg.value("lfm2_weight_format", std::string()),
+          nntr_cfg.value("lfm2_execution_profile", std::string())))
+      std::cerr << "[LFM2] SR15 HTP CLI defaults active; explicit environment "
+                   "values take precedence\n";
+#endif
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);

@@ -88,8 +88,8 @@ static inline void pack_bytes(const HVX_Vector *w, uint32_t hd, int8_t *q) {
   }
 }
 
-void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                        int8_t *q, float *scale, int32_t *colsum) {
+static void quant_k_row_generic(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                                int8_t *q, float *scale, int32_t *colsum) {
   HVX_Vector v[MAX_VECS];
   const uint32_t n = hd / 32u;
   load_row_f32(x_hf, hd, v);
@@ -117,8 +117,8 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
   *colsum = (int32_t)hvx_attn_word0(sum);
 }
 
-void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                        int8_t *q, float *scale) {
+static void quant_v_row_generic(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                                int8_t *q, float *scale) {
   HVX_Vector v[MAX_VECS];
   const uint32_t n = hd / 32u;
   load_row_f32(x_hf, hd, v);
@@ -171,4 +171,55 @@ void hvx_kv_quant_v_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
     w[g] = quant_vec(v[g], iv, lo, hi);
   }
   pack_bytes(w, hd, q);
+}
+
+/** LFM2's 64-channel heads need only two vectors. Keep them in registers,
+ * pack both halves together, and preserve the generic quantizer's operations.
+ */
+static inline void quant_row64(const uint16_t *x_hf, int32_t qmax, int8_t *q,
+                               float *scale, int32_t *colsum) {
+  HVX_Vector v0, v1;
+  widen64(hvx_tile_load_u(x_hf), &v0, &v1);
+  const HVX_Vector mask = Q6_V_vsplat_R(0x7FFFFFFF);
+  const HVX_Vector max =
+    Q6_Vsf_vmax_VsfVsf(Q6_V_vand_VV(v0, mask), Q6_V_vand_VV(v1, mask));
+  const float amax = hvx_attn_lane0_f32(hvx_attn_max32_sf(max));
+  if (amax == 0.0f) {
+    memset(q, 0, 64u);
+    *scale = 1.0f;
+    if (colsum)
+      *colsum = 0;
+    return;
+  }
+  const float fq = (float)qmax;
+  const HVX_Vector inv = hvx_splat_sf(fq / amax);
+  const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
+  const HVX_Vector w0 = quant_vec(v0, inv, lo, hi);
+  const HVX_Vector w1 = quant_vec(v1, inv, lo, hi);
+  const HVX_Vector h = Q6_Vh_vpack_VwVw_sat(w1, w0);
+  const HVX_Vector bytes = Q6_Vb_vpack_VhVh_sat(h, h);
+  memcpy(q, &bytes, 64u);
+  if (colsum) {
+    HVX_Vector sum = Q6_Vw_vadd_VwVw(w0, w1);
+    for (int rot = 4; rot <= 64; rot <<= 1)
+      sum = Q6_Vw_vadd_VwVw(sum, Q6_V_vror_VR(sum, rot));
+    *colsum = (int32_t)hvx_attn_word0(sum);
+  }
+  *scale = amax / fq;
+}
+
+void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                        int8_t *q, float *scale, int32_t *colsum) {
+  if (hd == 64u)
+    quant_row64(x_hf, qmax, q, scale, colsum);
+  else
+    quant_k_row_generic(x_hf, hd, qmax, q, scale, colsum);
+}
+
+void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
+                        int8_t *q, float *scale) {
+  if (hd == 64u)
+    quant_row64(x_hf, qmax, q, scale, NULL);
+  else
+    quant_v_row_generic(x_hf, hd, qmax, q, scale);
 }

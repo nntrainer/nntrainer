@@ -14,7 +14,22 @@
 #include <htp_wh_layout.h>
 #include <numeric>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 namespace nntrainer {
+/** An inverse gamma is used only by speculative normalized-row prediction.
+ * Reject the whole representation change when any channel cannot be inverted
+ * safely, rather than mixing normalized and legacy residual coordinates. */
+inline bool htpRouterGammaUsable(const float *gamma, unsigned width) {
+  if (!gamma || !width)
+    return false;
+  for (unsigned h = 0; h < width; ++h)
+    if (!std::isfinite(gamma[h]) || std::abs(gamma[h]) < 1.0e-6f)
+      return false;
+  return true;
+}
+
 /** Previous-token layer residuals, used exclusively for speculative routing.
  * A skipped observation or token never joins unrelated hidden states. */
 class HtpRouterResidual {
@@ -166,6 +181,41 @@ htpPredictExpertsWh(const float *input, const void *weights, unsigned hidden,
     reinterpret_cast<const float *>(packed + whBytes(hidden, experts));
   const float *offset = scale + 2 * experts;
   std::vector<float> scores(experts, 0.0f);
+#if defined(__aarch64__) && !defined(__AARCH64EB__) &&                         \
+  !defined(NNTR_ROUTER_PREDICT_SCALAR)
+  // Keep one WH panel's accumulators and affine offsets in registers.
+  // A word contains four consecutive K values for one expert; its high
+  // nibbles hold the next four. Decode four experts with one vector load,
+  // preserving the original K order without expanding the packed gate.
+  const uint32x4_t mask = vdupq_n_u32(15u);
+  const int32x4_t sign = vdupq_n_s32(8);
+  for (unsigned block = 0; block < experts; block += WH_TILE) {
+    float32x4_t sum[WH_TILE / 4], bias[WH_TILE / 4];
+    for (unsigned c = 0; c < WH_TILE / 4; ++c) {
+      sum[c] = vdupq_n_f32(0.0f);
+      bias[c] = vld1q_f32(offset + block + c * 4u);
+    }
+    for (unsigned h = 0; h < hidden; ++h) {
+      const uint8_t *row =
+        packed +
+        ((size_t)(h / WH_TILE) * (experts / WH_TILE) + block / WH_TILE) *
+          WH_TILE_BYTES +
+        (h % WH_TILE / 8u) * 128u;
+      const int32x4_t shift =
+        vdupq_n_s32(-int((h % 4u) * 8u + ((h / 4u) % 2u) * 4u));
+      for (unsigned c = 0; c < WH_TILE / 4; ++c) {
+        const uint32x4_t word = vreinterpretq_u32_u8(vld1q_u8(row + c * 16u));
+        const int32x4_t nibble =
+          vreinterpretq_s32_u32(vandq_u32(vshlq_u32(word, shift), mask));
+        const int32x4_t q = vsubq_s32(veorq_s32(nibble, sign), sign);
+        const float32x4_t value = vaddq_f32(vcvtq_f32_s32(q), bias[c]);
+        sum[c] = vaddq_f32(sum[c], vmulq_n_f32(value, input[h]));
+      }
+    }
+    for (unsigned c = 0; c < WH_TILE / 4; ++c)
+      vst1q_f32(scores.data() + block + c * 4u, sum[c]);
+  }
+#else
   for (unsigned h = 0; h < hidden; ++h) {
     const unsigned shift = ((h / 4u) % 2u) * 4u;
     for (unsigned block = 0; block < experts; block += WH_TILE) {
@@ -181,6 +231,7 @@ htpPredictExpertsWh(const float *input, const void *weights, unsigned hidden,
       }
     }
   }
+#endif
   for (unsigned e = 0; e < experts; ++e)
     scores[e] *= scale[e];
   return htpRankPredictedExperts(scores, top, sigmoid_bias);

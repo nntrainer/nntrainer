@@ -16,7 +16,8 @@ HVX = Path("nntrainer/tensor/htp_backend/hvx")
 MOE = Path("nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c")
 EXPORTS = ("hvx_tl2_weight_bytes", "hvx_tl2_table_bytes", "hvx_tl2_k_splits",
            "hvx_tl2_pack", "hvx_tl2_unpack", "hvx_tl2_expand_wh96",
-           "hvx_tl2_prepare", "hvx_gemv_u8tl2_panel")
+           "hvx_tl2_prepare", "hvx_gemv_u8tl2_panel", "hvx_tl2_expand_wh96_disjoint",
+           "hvx_tl2_expand_wh96_disjoint_batch")
 
 
 def unit(text, name):
@@ -32,6 +33,7 @@ def unit(text, name):
                               "reference_hvx_tl2_expand_wh96(")
     else:
         value = value.replace("hvx_tl2_expand_wh96_disjoint(", "disjoint_expand(")
+        value = value.replace("hvx_tl2_expand_wh96_disjoint_batch(", "batch_expand(")
         value = value.replace("hvx_tl2_expand_wh96(", "original_expand(")
     return value
 

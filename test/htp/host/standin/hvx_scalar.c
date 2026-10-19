@@ -250,6 +250,39 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
     zp[r] = (int32_t)z;
   }
 }
+/** @brief Quantization parameters from a preceding rotation's extrema. */
+void hvx_quant_rows_u8_params_extrema(const float *extrema, uint32_t m,
+                                      uint32_t mp, float *scale, int32_t *zp) {
+  buf(extrema, sizeof(float) * 2u * m, 0);
+  buf(scale, sizeof(float) * mp, 1);
+  buf(zp, sizeof(int32_t) * mp, 1);
+  for (uint32_t r = 0; r < mp; ++r) {
+    scale[r] = 1.0f;
+    zp[r] = 0;
+    if (r >= m)
+      continue;
+    const float lo = fminf(0.0f, extrema[2u * r]);
+    const float hi = fmaxf(0.0f, extrema[2u * r + 1u]);
+    float step = (hi - lo) / 255.0f;
+    if (step <= 0.0f)
+      step = 1e-8f;
+    scale[r] = step;
+    const long zero = lrintf(-lo / step);
+    zp[r] = (int32_t)(zero < 0 ? 0 : zero > 255 ? 255 : zero);
+  }
+}
+
+/** @brief Scalar row-major quantization with the supplied parameters. */
+void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
+                         uint8_t *dst) {
+  buf(row, sizeof(float) * k, 0);
+  buf(dst, k, 1);
+  for (uint32_t j = 0; j < k; ++j) {
+    const long q = lrintf(row[j] / scale) + zp;
+    dst[j] = (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q);
+  }
+}
+
 /** A row range, the one scalar formula the two entry points below share so
    they cannot drift: the kernel's units are 16-row quarters of a block.
    Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
@@ -675,18 +708,17 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
                        NULL);
 }
 
-void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
-                       const hvx_dq_swiglu_job *c) {
-  uint32_t lo, hi;
-  slice(c->n_pairs, n_threads, i, &lo, &hi);
+/** @brief Read selected raw-plane pairs, retaining the original up offset. */
+static void scalar_swiglu_i24_span(const hvx_dq_swiglu_job *c,
+                                   uint32_t up_pairs, uint32_t lo,
+                                   uint32_t hi) {
   for (uint32_t j = lo; j < hi; ++j) {
     int32_t tiles[2][2048];
     for (uint32_t p = 0; p < 2u; ++p)
       for (uint32_t r = 0; r < c->m_count; ++r)
         for (uint32_t n = 0; n < 32u; ++n)
           tiles[p][r * 32u + n] = scalar_i24_at(
-            c->tiles_base + (size_t)(p * c->n_pairs + j) * c->tile_stride, r,
-            n);
+            c->tiles_base + (size_t)(p * up_pairs + j) * c->tile_stride, r, n);
     hvx_dq_swiglu_job one = *c;
     one.tiles_base = (const uint8_t *)tiles;
     one.tile_stride = sizeof tiles[0];
@@ -695,6 +727,40 @@ void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
     one.row_stride = 32u;
     hvx_dq_swiglu_worker(1u, 0u, &one);
   }
+}
+void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
+                       const hvx_dq_swiglu_job *c) {
+  uint32_t lo, hi;
+  slice(c->n_pairs, n_threads, i, &lo, &hi);
+  scalar_swiglu_i24_span(c, c->n_pairs, lo, hi);
+}
+
+/** @brief Model the balanced kernel's pair and four-row ownership. */
+void hvx_dq_swiglu_i24_balanced(uint32_t n_threads, uint32_t i,
+                                const hvx_dq_swiglu_job *job) {
+  const uint32_t whole = job->n_pairs / n_threads;
+  const uint32_t full_pairs = whole * n_threads;
+  if (n_threads <= 1u || job->m_count < 32u || job->m_count > 64u ||
+      whole == 0u || full_pairs == job->n_pairs) {
+    hvx_dq_swiglu_i24(n_threads, i, job);
+    return;
+  }
+  scalar_swiglu_i24_span(job, job->n_pairs, whole * i, whole * (i + 1u));
+  const uint32_t groups = (job->m_count + 3u) / 4u;
+  const uint32_t m0 = 4u * (uint32_t)((uint64_t)groups * i / n_threads);
+  uint32_t m1 = 4u * (uint32_t)((uint64_t)groups * (i + 1u) / n_threads);
+  if (m1 > job->m_count)
+    m1 = job->m_count;
+  if (m0 >= m1)
+    return;
+  hvx_dq_swiglu_job part = *job;
+  part.tiles_base += (size_t)full_pairs * job->tile_stride + m0 * 32u;
+  part.g0 += full_pairs;
+  part.m_count = m1 - m0;
+  part.act_scale += m0;
+  part.act_zp += m0;
+  part.dst += (size_t)m0 * part.dst_stride;
+  scalar_swiglu_i24_span(&part, job->n_pairs, 0u, job->n_pairs - full_pairs);
 }
 /** The tail path calls the pooled pair function directly (pool NULL, one
    pair); it is the job above run synchronously, as on device. */

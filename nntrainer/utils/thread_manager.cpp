@@ -11,6 +11,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,37 @@
 #endif
 
 namespace {
+
+// Every dispatched callback, including the caller's own share, passes through
+// thread_parallelize. This also covers callers compiled with the old inline
+// parallelize body and avoids try_lock on a mutex owned by the current thread.
+thread_local bool in_parallel_callback = false;
+
+struct ParallelCallbackScope {
+  bool previous = in_parallel_callback;
+  ParallelCallbackScope() { in_parallel_callback = true; }
+  ~ParallelCallbackScope() { in_parallel_callback = previous; }
+};
+
+uint32_t workerIdleSpins() {
+  static const uint32_t spins = [] {
+    constexpr uint32_t limit = 1000000;
+    const char *value = std::getenv("NNTR_WORKER_IDLE_SPINS");
+    if (!value || !*value)
+      return limit;
+    uint32_t count = 0;
+    for (const char *p = value; *p; ++p) {
+      if (*p < '0' || *p > '9')
+        return limit;
+      const uint32_t digit = static_cast<uint32_t>(*p - '0');
+      if (count > (limit - digit) / 10)
+        return limit;
+      count = count * 10 + digit;
+    }
+    return count;
+  }();
+  return spins;
+}
 
 inline size_t modulo_decrement(size_t i, size_t n) {
   if (i == 0)
@@ -155,7 +187,7 @@ uint32_t ThreadManager::wait_for_new_command(uint32_t last_command) {
     return command;
 
   // spin wait
-  for (uint32_t i = SPIN_COUNT; i != 0; i--) {
+  for (uint32_t i = workerIdleSpins(); i != 0; i--) {
     yield();
 
     command = command_.load(std::memory_order_acquire);
@@ -222,6 +254,80 @@ void ThreadManager::wait_worker_threads() {
 #endif
 }
 
+bool ThreadManager::try_parallel_for(size_t begin, size_t end,
+                                     std::function<void(size_t)> task) {
+  if (in_parallel_callback)
+    return false;
+  std::unique_lock<std::mutex> lock(execution_mutex_, std::try_to_lock);
+  if (!lock.owns_lock())
+    return false;
+  if (begin >= end)
+    return true;
+  if (end - begin == 1 || compute_workers_.empty()) {
+    ParallelCallbackScope scope;
+    for (size_t i = begin; i < end; ++i)
+      task(i);
+    return true;
+  }
+  parallelize_locked(begin, end, std::move(task));
+  return true;
+}
+
+void ThreadManager::parallelize_locked(size_t begin, size_t end,
+                                       std::function<void(size_t)> task) {
+#if defined(_WIN32)
+  std::unique_lock<std::mutex> command_lock(command_mutex_);
+#endif
+
+  task_ = std::move(task);
+
+  // set active thread numbers
+  size_t threads_count = compute_workers_.size() + 1;
+  active_threads_.store(threads_count - 1, std::memory_order_relaxed);
+#if defined(__linux__) || defined(__ANDROID__)
+  has_active_threads_.store(1, std::memory_order_relaxed);
+#endif
+  // distribute loops
+  size_t range_quotient = (end - begin) / threads_count;
+  size_t range_remainder = (end - begin) % threads_count;
+
+  size_t range_start = begin;
+  for (size_t tid = 0; tid < threads_count; tid++) {
+    size_t range_length = range_quotient + (size_t)(tid < range_remainder);
+    size_t range_end = range_start + range_length;
+
+    thread_infos_[tid].range_start.store(range_start,
+                                         std::memory_order_relaxed);
+    thread_infos_[tid].range_end.store(range_end, std::memory_order_relaxed);
+    thread_infos_[tid].range_length.store(range_length,
+                                          std::memory_order_relaxed);
+
+    range_start = range_end;
+  }
+
+  // always flipping MSB makes workers notice new command arrives even if last
+  // command was same command
+  uint32_t old_command = command_.load(std::memory_order_relaxed);
+  uint32_t new_command =
+    (~(old_command | COMMAND_MASK)) | threadpool_command::RUN;
+
+  command_.store(new_command, std::memory_order_release);
+
+#if defined(__linux__) || defined(__ANDROID__)
+  futex_wake(&command_);
+#elif defined(_WIN32)
+  command_lock.unlock();
+  command_cv_.notify_all();
+#endif
+
+  // main thread also works
+  thread_parallelize(0);
+
+  wait_worker_threads();
+
+  std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 void ThreadManager::thread_main(size_t tid) {
   uint32_t last_command = threadpool_command::INIT;
   checkin();
@@ -257,6 +363,7 @@ inline bool ThreadManager::try_decrement(std::atomic<size_t> &value) {
 }
 
 void ThreadManager::thread_parallelize(size_t my_tid) {
+  ParallelCallbackScope scope;
 
   // process my job
   size_t range_start =

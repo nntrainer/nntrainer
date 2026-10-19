@@ -175,7 +175,23 @@ static inline HVX_Vector butterfly(HVX_Vector v, HVX_Vector lane,
 /** Keep eight butterfly vectors in registers. The low five stages are
  * lane shuffles, then three register stages; a second pass joins the eight
  * 256-wide blocks. Each output keeps exactly the scalar butterfly order. */
-static void hadamard_2048_hvx(float *x) {
+/** Extrema may be reduced in final-store order: min/max propagate NaNs,
+ * while the caller's quantization clamps all NaN/zero extrema to +0. */
+static inline __attribute__((always_inline)) void
+hadamard_store_extrema(HVX_Vector vmin, HVX_Vector vmax, float *extrema) {
+  for (uint32_t rot = 64u; rot >= 4u; rot >>= 1u) {
+    vmin = Q6_Vsf_vmin_VsfVsf(vmin, Q6_V_vror_VR(vmin, (int)rot));
+    vmax = Q6_Vsf_vmax_VsfVsf(vmax, Q6_V_vror_VR(vmax, (int)rot));
+  }
+  float mins[32], maxs[32];
+  *(HVX_UVector *)mins = vmin;
+  *(HVX_UVector *)maxs = vmax;
+  extrema[0] = mins[0];
+  extrema[1] = maxs[0];
+}
+
+static inline __attribute__((always_inline)) void
+hadamard_2048_hvx_core(float *x, const uint32_t *mask, float *extrema) {
   static const int32_t lanes[32] __attribute__((aligned(128))) = {
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
@@ -204,6 +220,7 @@ static void hadamard_2048_hvx(float *x) {
     for (uint32_t i = 0; i < 8u; ++i)
       *(HVX_Vector *)(x + base + i * 32u) = v[i];
   }
+  HVX_Vector vmin = Q6_V_vzero(), vmax = vmin;
   const HVX_Vector scale = hvx_splat_sf(0.022097086533904076f);
   for (uint32_t k = 0; k < 256u; k += 32u) {
     HVX_Vector v[8];
@@ -220,40 +237,86 @@ static void hadamard_2048_hvx(float *x) {
           v[i + step] = Q6_Vsf_vsub_VsfVsf(a, b);
         }
 #pragma clang loop unroll(full)
-    for (uint32_t i = 0; i < 8u; ++i)
-      *(HVX_Vector *)(x + i * 256u + k) = Q6_Vsf_vmpy_VsfVsf(v[i], scale);
+    for (uint32_t i = 0; i < 8u; ++i) {
+      HVX_Vector value = Q6_Vsf_vmpy_VsfVsf(v[i], scale);
+      if (mask)
+        value =
+          Q6_V_vxor_VV(value, *(const HVX_UVector *)(mask + i * 256u + k));
+      if (extrema) {
+        vmin = Q6_Vsf_vmin_VsfVsf(vmin, value);
+        vmax = Q6_Vsf_vmax_VsfVsf(vmax, value);
+      }
+      *(HVX_Vector *)(x + i * 256u + k) = value;
+    }
   }
+  if (extrema)
+    hadamard_store_extrema(vmin, vmax, extrema);
+}
+
+static void hadamard_2048_hvx(float *x, const uint32_t *mask) {
+  hadamard_2048_hvx_core(x, mask, NULL);
 }
 
 static inline __attribute__((always_inline)) void
-hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
+hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair,
+             const uint32_t *mask, float *extrema) {
   static const int32_t lanes[32] __attribute__((aligned(128))) = {
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
   const HVX_Vector lane = *(const HVX_Vector *)lanes;
-  /** Each register contains one or two independent power-of-two blocks.
-   * XOR shuffles implement butterfly partners; the upper member changes
-   * sign before the add. There are no scalar lane loads/stores. */
-  for (uint32_t base = 0u; base < n * (1u + pair); base += 32u) {
-    HVX_Vector v = *(const HVX_Vector *)(x + base);
-    /** p >= 16 on this path. Literal stages let the compiler hoist all
-     * shuffle controls and sign masks out of the register loop. */
-    v = butterfly(v, lane, 1u);
-    v = butterfly(v, lane, 2u);
-    v = butterfly(v, lane, 4u);
-    v = butterfly(v, lane, 8u);
-    if (p >= 32u)
-      v = butterfly(v, lane, 16u);
-    *(HVX_Vector *)(x + base) = v;
-  }
-  for (uint32_t step = 32u; step < p; step *= 2u)
-    for (uint32_t base = 0u; base < n; base += 2u * step)
-      for (uint32_t j = 0u; j < step; j += 32u) {
-        const HVX_Vector a = *(const HVX_Vector *)(x + base + j);
-        const HVX_Vector b = *(const HVX_Vector *)(x + base + j + step);
-        *(HVX_Vector *)(x + base + j) = Q6_Vsf_vadd_VsfVsf(a, b);
-        *(HVX_Vector *)(x + base + j + step) = Q6_Vsf_vsub_VsfVsf(a, b);
+  if (n == 1536u) {
+    /** Keep each H128 block in four registers through all seven stages.
+     * This removes the two intermediate row-memory passes for stages32/64
+     * while keeping each output's butterfly order unchanged. */
+    for (uint32_t base = 0u; base < 1536u; base += 128u) {
+      HVX_Vector v[4];
+#pragma clang loop unroll(full)
+      for (uint32_t i = 0; i < 4u; ++i) {
+        HVX_Vector a = *(const HVX_Vector *)(x + base + i * 32u);
+        a = butterfly(a, lane, 1u);
+        a = butterfly(a, lane, 2u);
+        a = butterfly(a, lane, 4u);
+        a = butterfly(a, lane, 8u);
+        v[i] = butterfly(a, lane, 16u);
       }
+#pragma clang loop unroll(full)
+      for (uint32_t step = 1u; step < 4u; step *= 2u)
+#pragma clang loop unroll(full)
+        for (uint32_t i = 0; i < 4u; ++i)
+          if (!(i & step)) {
+            const HVX_Vector a = v[i], b = v[i + step];
+            v[i] = Q6_Vsf_vadd_VsfVsf(a, b);
+            v[i + step] = Q6_Vsf_vsub_VsfVsf(a, b);
+          }
+#pragma clang loop unroll(full)
+      for (uint32_t i = 0; i < 4u; ++i)
+        *(HVX_Vector *)(x + base + i * 32u) = v[i];
+    }
+  } else {
+    /** Each register contains one or two independent power-of-two blocks.
+     * XOR shuffles implement butterfly partners; the upper member changes
+     * sign before the add. There are no scalar lane loads/stores. */
+    for (uint32_t base = 0u; base < n * (1u + pair); base += 32u) {
+      HVX_Vector v = *(const HVX_Vector *)(x + base);
+      /** p >= 16 on this path. Literal stages let the compiler hoist all
+       * shuffle controls and sign masks out of the register loop. */
+      v = butterfly(v, lane, 1u);
+      v = butterfly(v, lane, 2u);
+      v = butterfly(v, lane, 4u);
+      v = butterfly(v, lane, 8u);
+      if (p >= 32u)
+        v = butterfly(v, lane, 16u);
+      *(HVX_Vector *)(x + base) = v;
+    }
+    for (uint32_t step = 32u; step < p; step *= 2u)
+      for (uint32_t base = 0u; base < n; base += 2u * step)
+        for (uint32_t j = 0u; j < step; j += 32u) {
+          const HVX_Vector a = *(const HVX_Vector *)(x + base + j);
+          const HVX_Vector b = *(const HVX_Vector *)(x + base + j + step);
+          *(HVX_Vector *)(x + base + j) = Q6_Vsf_vadd_VsfVsf(a, b);
+          *(HVX_Vector *)(x + base + j + step) = Q6_Vsf_vsub_VsfVsf(a, b);
+        }
+  }
   const HVX_Vector scale =
     hvx_splat_sf(n == 1536u ? 0.025515519082546234f : 1.0f / sqrtf((float)n));
   if (p == n) {
@@ -267,6 +330,7 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
      * changing the order within any H12 dot. Reading one input at a time
      * also avoids materializing twelve vector inputs on the worker stack. */
     const HVX_Vector sign_bit = Q6_V_vsplat_R((int)0x80000000u);
+    HVX_Vector vmin = Q6_V_vzero(), vmax = vmin;
     for (uint32_t k = 0; k < 128u; k += 32u) {
       HVX_Vector sums[12];
 #pragma clang loop unroll(full)
@@ -281,9 +345,20 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair) {
           sums[j] = Q6_Vsf_vadd_VsfVsf(sums[j], lfm_h12[i][j] < 0 ? neg : in);
       }
 #pragma clang loop unroll(full)
-      for (uint32_t j = 0; j < 12u; ++j)
-        *(HVX_Vector *)(x + j * 128u + k) = Q6_Vsf_vmpy_VsfVsf(sums[j], scale);
+      for (uint32_t j = 0; j < 12u; ++j) {
+        HVX_Vector value = Q6_Vsf_vmpy_VsfVsf(sums[j], scale);
+        if (mask)
+          value =
+            Q6_V_vxor_VV(value, *(const HVX_UVector *)(mask + j * 128u + k));
+        if (extrema) {
+          vmin = Q6_Vsf_vmin_VsfVsf(vmin, value);
+          vmax = Q6_Vsf_vmax_VsfVsf(vmax, value);
+        }
+        *(HVX_Vector *)(x + j * 128u + k) = value;
+      }
     }
+    if (extrema)
+      hadamard_store_extrema(vmin, vmax, extrema);
     return;
   }
   if (n == 2816u || n == 704u) {
@@ -400,7 +475,7 @@ int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
   if (n == 1536u) {
 #if defined(__hexagon__)
     if (mode == 2u && !((uintptr_t)x & 127u))
-      hadamard_hvx(x, 1536u, 128u, 0u);
+      hadamard_hvx(x, 1536u, 128u, 0u, NULL, NULL);
     else
 #endif
       hadamard_lfm1536(x);
@@ -412,13 +487,13 @@ int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
     if ((uintptr_t)x & 127u) {
       hadamard_scalar(x, n, p);
     } else if (n == 2048u) {
-      hadamard_2048_hvx(x);
+      hadamard_2048_hvx(x, NULL);
     } else if (n == 704u) {
-      hadamard_hvx(x, 704u, 16u, 0u);
+      hadamard_hvx(x, 704u, 16u, 0u, NULL, NULL);
     } else if (n == 2816u) {
-      hadamard_hvx(x, 2816u, 64u, 0u);
+      hadamard_hvx(x, 2816u, 64u, 0u, NULL, NULL);
     } else {
-      hadamard_hvx(x, n, p, 0u);
+      hadamard_hvx(x, n, p, 0u, NULL, NULL);
     }
     return 0;
   }
@@ -435,9 +510,121 @@ int hvx_hadamard_rows_f32(float *x, uint32_t rows, uint32_t n, uint32_t mode) {
 #if defined(__hexagon__)
   if (mode == 2u && n == 704u && !((uintptr_t)x & 127u))
     for (; rows - m >= 2u; m += 2u)
-      hadamard_hvx(x + (size_t)m * 704u, 704u, 16u, 1u);
+      hadamard_hvx(x + (size_t)m * 704u, 704u, 16u, 1u, NULL, NULL);
 #endif
   for (; m < rows; ++m)
     (void)hvx_hadamard_f32(x + (size_t)m * n, n, mode);
+  return 0;
+}
+
+/** XOR is deliberately after normalization: multiplying a signed scale instead
+ * would change exceptional values and their sign/payload behavior. */
+static void hadamard_xor_row(float *x, const uint32_t *mask, uint32_t n) {
+  uint32_t i = 0;
+#if defined(__hexagon__)
+  for (; n - i >= 32u; i += 32u)
+    *(HVX_UVector *)(x + i) = Q6_V_vxor_VV(*(const HVX_UVector *)(x + i),
+                                           *(const HVX_UVector *)(mask + i));
+#endif
+  for (; i < n; ++i) {
+    uint32_t value;
+    memcpy(&value, x + i, sizeof(value));
+    value ^= mask[i];
+    memcpy(x + i, &value, sizeof(value));
+  }
+}
+
+int hvx_hadamard_signed_f32(float *x, uint32_t n, uint32_t mode,
+                            const uint32_t *mask) {
+  if (!mask)
+    return hvx_hadamard_f32(x, n, mode);
+#if defined(__hexagon__)
+  if (x && mode == 2u && !((uintptr_t)x & 127u)) {
+    if (n == 2048u) {
+      hadamard_2048_hvx(x, mask);
+      return 0;
+    }
+    if (n == 1536u) {
+      hadamard_hvx(x, 1536u, 128u, 0u, mask, NULL);
+      return 0;
+    }
+  }
+#endif
+  const int result = hvx_hadamard_f32(x, n, mode);
+  if (!result)
+    hadamard_xor_row(x, mask, n);
+  return result;
+}
+
+int hvx_hadamard_signed_rows_f32(float *x, uint32_t rows, uint32_t n,
+                                 uint32_t mode, const uint32_t *mask) {
+  if (!mask)
+    return hvx_hadamard_rows_f32(x, rows, n, mode);
+  if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u) ||
+      rows > SIZE_MAX / sizeof(float) / n)
+    return -1;
+#if defined(__hexagon__)
+  if (mode == 2u && !((uintptr_t)x & 127u)) {
+    if (n == 2048u) {
+      for (uint32_t r = 0; r < rows; ++r)
+        hadamard_2048_hvx(x + (size_t)r * n, mask);
+      return 0;
+    }
+    if (n == 1536u) {
+      for (uint32_t r = 0; r < rows; ++r)
+        hadamard_hvx(x + (size_t)r * n, 1536u, 128u, 0u, mask, NULL);
+      return 0;
+    }
+  }
+#endif
+  const int result = hvx_hadamard_rows_f32(x, rows, n, mode);
+  if (!result)
+    for (uint32_t r = 0; r < rows; ++r)
+      hadamard_xor_row(x + (size_t)r * n, mask, n);
+  return result;
+}
+
+#if defined(__hexagon__)
+/** Keep each row's two extrema live only within its transform. Inlining
+ * these into the row loop spills the extrema inside H12's four iterations. */
+static __attribute__((noinline, nonnull(1, 3))) void
+hadamard_extrema_1536_hvx(float *x, const uint32_t *mask, float *out) {
+  hadamard_hvx(x, 1536u, 128u, 0u, mask, out);
+}
+static __attribute__((noinline, nonnull(1, 3))) void
+hadamard_extrema_2048_hvx(float *x, const uint32_t *mask, float *out) {
+  hadamard_2048_hvx_core(x, mask, out);
+}
+#endif
+int hvx_hadamard_signed_rows_extrema_f32(float *x, uint32_t rows, uint32_t n,
+                                         const uint32_t *mask, float *extrema) {
+  if (!x || !extrema || (n != 1536u && n != 2048u) || ((uintptr_t)x & 127u) ||
+      rows > SIZE_MAX / sizeof(float) / n)
+    return -1;
+  for (uint32_t r = 0; r < rows; ++r) {
+    float *row = x + (size_t)r * n;
+    float *out = extrema + (size_t)r * 2u;
+#if defined(__hexagon__)
+    if (n == 2048u)
+      hadamard_extrema_2048_hvx(row, mask, out);
+    else
+      hadamard_extrema_1536_hvx(row, mask, out);
+#else
+    (void)hvx_hadamard_signed_f32(row, n, 2u, mask);
+    float vmin = 0.0f, vmax = 0.0f;
+    for (uint32_t k = 0; k < n; ++k) {
+      if (isnan(row[k])) {
+        vmin = vmax = row[k];
+        break;
+      }
+      if (row[k] < vmin)
+        vmin = row[k];
+      if (row[k] > vmax)
+        vmax = row[k];
+    }
+    out[0] = vmin;
+    out[1] = vmax;
+#endif
+  }
   return 0;
 }

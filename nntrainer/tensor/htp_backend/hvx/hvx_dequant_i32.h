@@ -141,8 +141,11 @@ void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
 
 /** @brief Native signed24 planes directly to the scatter epilogue. Every
  * ring tile contains low/middle/high byte planes of 2048 bytes each. The
- * complete signed int32 is reconstructed before the original float math.
- * Row layout is fixed at 64x32; there are no affine offsets. */
+ * complete signed int32 is reconstructed before dequantization. Callers
+ * establish hexkl_acc_i24_range for the source weights and use u8 zero
+ * points in [0, 255]; these bounds make integer zero-point correction
+ * bit-identical to the original float operations. Row layout is fixed at
+ * 64x32; there are no affine offsets. */
 void hvx_dequant_i24_tiles_scatter_rows_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t m0, uint32_t m1, const float *act_scale, const int32_t *act_zp,
@@ -280,9 +283,18 @@ void hvx_dq_swiglu_affine(uint32_t n_threads, uint32_t i,
 
 /** @brief Native signed24 planes to the gate/up epilogue. Each tile holds
  * three 2048-byte planes, while tile_stride still names its full ring slot.
- * Reconstructs signed int32 before the original float math. */
+ * Callers establish hexkl_acc_i24_range for the source weights and use u8
+ * zero points in [0, 255], making integer zero-point correction exact.
+ * Scale, bias and activation retain their original float operation order. */
 void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
                        const hvx_dq_swiglu_job *job);
+
+/** Whole-job alternative: distribute leftover column pairs by aligned row
+ * groups. Individual workers no longer own their original complete columns;
+ * callers must wait for all workers before reading or further transforming
+ * any output. Other arithmetic and output ownership remain disjoint. */
+void hvx_dq_swiglu_i24_balanced(uint32_t n_threads, uint32_t i,
+                                const hvx_dq_swiglu_job *job);
 
 /**
  * @brief Dequantizes gate/up tile PAIRS and applies SwiGLU before anything

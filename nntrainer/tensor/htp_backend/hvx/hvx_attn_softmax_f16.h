@@ -193,8 +193,36 @@ static inline HVX_Vector hvx_attn_max64_hf(HVX_Vector v) {
   return v;
 }
 
+/** Exact finite mapping, copied from hexkl_cvt_hf_to_f32. NaN/Inf retain
+ * the original cast below, including its exceptional payload behavior. */
+static inline float hvx_attn_finite_hf_to_f32(uint16_t h) {
+  const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  const uint32_t mant = h & 0x3ffu;
+  uint32_t u;
+  if (exp == 0) {
+    if (mant == 0) {
+      u = sign;
+    } else {
+      // subnormal: value = mant * 2^-24
+      float f = (float)mant * (1.0f / 16777216.0f);
+      memcpy(&u, &f, 4);
+      u |= sign;
+    }
+  } else if (exp == 31) {
+    u = sign | 0x7f800000u | (mant << 13);
+  } else {
+    u = sign | ((exp + 112u) << 23) | (mant << 13);
+  }
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+
 /** @brief Scalar fp16 bits -> f32. */
 static inline float hvx_attn_hf_to_f32(uint16_t bits) {
+  if ((bits & 0x7c00u) != 0x7c00u)
+    return hvx_attn_finite_hf_to_f32(bits);
   _Float16 h;
   memcpy(&h, &bits, sizeof(h));
   return (float)h;

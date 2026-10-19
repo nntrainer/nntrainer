@@ -24,6 +24,10 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
+  -I "$HERE/../../../Applications/CausalLM" \
+  "$HERE/lfm2_runtime_defaults_check.cpp" -o "$OUT/lfm2_runtime_defaults_check"
+"$OUT/lfm2_runtime_defaults_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Werror -I "$BACKEND/hvx" \
   "$HERE/hadamard_check.c" "$BACKEND/hvx/hvx_hadamard_f32.c" -lm \
   -o "$OUT/hadamard_check"
@@ -43,8 +47,13 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" -I "$BACKEND/.." \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
+python3 "$HERE/prefill_reader_release_check.py" --repo "$HERE/../../.." \
+  --output "$OUT/prefill_reader_release" --cxx "${CXX:-g++}"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
   "$HERE/expert_read_pool_check.cpp" -o "$OUT/expert_read_pool_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I"$BACKEND" \
+  "$HERE/arena_size_check.cpp" -o "$OUT/arena_size_check"
+"$OUT/arena_size_check"
 "$OUT/expert_read_pool_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
   "$HERE/token_completion_check.cpp" -o "$OUT/token_completion_check"

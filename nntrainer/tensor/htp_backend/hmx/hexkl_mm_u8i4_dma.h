@@ -47,9 +47,10 @@ typedef struct {
   uint8_t *wh_bytes; /**< k_tiles*n_tiles*512 bytes, WH layout */
   float *w_scale;    /**< N entries */
   int32_t *colsum_w; /**< N entries */
-  float *bias;       /**< N entries */
+  const float *bias; /**< N entries; compact TL2 shares immutable zeros */
   int32_t *w_offset; /**< NULL: symmetric; otherwise N affine integer offsets */
-  void *arrays;      /**< scales, sums, bias, and optional affine offsets */
+  void
+    *arrays; /**< scales/sums; legacy also owns bias and affine offset room */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
   int clean;    /**< [#267 L1] a heap image: written once at registration
@@ -84,7 +85,10 @@ int hexkl_weight_tl2_refresh_pair(hexkl_weight_u8i4 *gate_up,
                                   hexkl_weight_u8i4 *down);
 
 /** Set integer offsets sent in the second N entries of registration bias.
- * The first N entries retain their ordinary bias meaning. */
+ * The first N entries retain their ordinary bias meaning. A former compact
+ * handle allocates offset storage here, leaving the handle unchanged if
+ * allocation fails (AEE_ENOMEMORY). Same-shape rebind itself remains
+ * allocation-free. */
 int hexkl_weight_u8i4_set_offsets(hexkl_weight_u8i4 *weight,
                                   const float *offsets);
 
@@ -144,10 +148,11 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
 
 /**
  * @brief [doc 52 section 10.25] Points a live arena-borrowed slot at new
- *        bytes of the same shape, in place: the handle keeps its number and
- *        its arrays, the scales and column sums are overwritten and the
- *        bias zeroed. What an expert swap does when the retired pair has
- *        the new expert's shape -- no allocation, no free, no slot search.
+ *        bytes of the same shape, in place: the handle keeps its number,
+ *        the scales and column sums are overwritten and the bias zeroed.
+ *        Metadata stays allocated even when leaving compact TL2: legacy
+ *        rebind also has zero bias, so it can retain the shared zero table.
+ *        There is no allocation, free, or slot search during expert swaps.
  *        NULL @a w_scale and @a colsum_w take them from the arena after
  *        @a wh, as hexkl_weight_u8i4_register_arena does. A non-NULL
  *        @a pal makes the slot 2-bit (QS2CX_WH codes at @a wh, the tail

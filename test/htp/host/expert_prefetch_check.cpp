@@ -267,7 +267,115 @@ static void abandonedHandoffDrain_p() {
   assert(q.take(keys + 1, [](Buffer &) {}));
 }
 
+/** Exercise every packed nibble position and multiple expert panels against
+ * independent row-major codes. Random nonzero affine offsets expose omitted
+ * corrections; full rankings also check experts outside the routed top four.
+ * AArch64 runs the production NEON path; other platforms check its fallback.
+ */
+static void randomWhPrediction_p() {
+  uint32_t state = 1u;
+  const auto next = [&state]() {
+    state = 1664525u * state + 1013904223u;
+    return state;
+  };
+  unsigned cases = 0;
+  for (unsigned hidden : {32u, 96u, 2048u}) {
+    for (unsigned experts : {32u, 64u, 128u}) {
+      const size_t bytes = nntrainer::whBytes(hidden, experts);
+      std::vector<float> image(bytes / sizeof(float) + 3u * experts);
+      auto *packed = reinterpret_cast<uint8_t *>(image.data());
+      float *scale = image.data() + bytes / sizeof(float);
+      float *offset = scale + 2u * experts;
+      std::vector<int8_t> codes(size_t(hidden) * experts);
+      std::vector<float> input(hidden), bias(experts);
+      for (unsigned round = 0; round < 128u; ++round) {
+        for (auto &x : input)
+          x = (int(next() >> 16u) - 32768) / 32768.0f;
+        for (auto &q : codes)
+          q = int8_t(int(next() >> 28u) - 8);
+        for (unsigned e = 0; e < experts; ++e) {
+          scale[e] = (1u + (next() >> 24u)) / 8192.0f;
+          offset[e] = (int(next() >> 24u) - 128) / 64.0f;
+          bias[e] = (int(next() >> 16u) - 32768) / 262144.0f;
+        }
+        nntrainer::whPack(codes.data(), hidden, experts, packed);
+        // Preserve the legacy per-expert accumulation order while using
+        // unpacked codes, independent of the WH addressing and bit shifts.
+        std::vector<float> scores(experts, 0.0f);
+        for (unsigned h = 0; h < hidden; ++h)
+          for (unsigned e = 0; e < experts; ++e)
+            scores[e] +=
+              input[h] * (codes[size_t(h) * experts + e] + offset[e]);
+        for (unsigned e = 0; e < experts; ++e)
+          scores[e] *= scale[e];
+        const auto ranked =
+          nntrainer::htpRankPredictedExperts(scores, experts, bias.data());
+        for (unsigned top : {1u, 4u, 8u, experts}) {
+          const std::vector<unsigned> expected(ranked.begin(),
+                                               ranked.begin() + top);
+          const auto actual = nntrainer::htpPredictExpertsWh(
+            input.data(), packed, hidden, experts, top, bias.data());
+          assert(actual == expected);
+          ++cases;
+        }
+      }
+    }
+  }
+  assert(cases == 4608u);
+  std::printf("WH PREDICTOR RANDOM RANK IDENTITY OK cases=%u\n", cases);
+}
+
+/** Layer-specific gamma must not enter the learned hidden-state delta.
+ * With a repeated underlying delta, every blend reconstructs the expected
+ * target row even when source and target channel scales differ in sign. */
+static void gammaResidual_p() {
+  const float source_gamma[] = {2.0f, 0.5f, -1.0f};
+  const float target_gamma[] = {0.5f, 2.0f, -2.0f};
+  assert(nntrainer::htpRouterGammaUsable(source_gamma, 3));
+  assert(nntrainer::htpRouterGammaUsable(target_gamma, 3));
+  for (float invalid :
+       {0.0f, 1.0e-8f, -1.0e-8f, std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity()}) {
+    const float gamma[] = {2.0f, invalid, -1.0f};
+    assert(!nntrainer::htpRouterGammaUsable(gamma, 3));
+  }
+  assert(!nntrainer::htpRouterGammaUsable(nullptr, 3));
+  assert(!nntrainer::htpRouterGammaUsable(source_gamma, 0));
+  const float first[] = {2.0f, 1.0f, -3.0f};
+  const float second[] = {0.75f, 2.0f, -10.0f};
+  const float current[] = {8.0f, -0.5f, -2.0f};
+  const float current_without_gamma[] = {4.0f, -1.0f, 2.0f};
+  const float repeated_delta[] = {0.5f, -1.0f, 2.0f};
+  float source[3], target[3], normalized[3], corrected[3];
+  for (unsigned h = 0; h < 3; ++h) {
+    source[h] = first[h] / source_gamma[h];
+    target[h] = second[h] / target_gamma[h];
+    normalized[h] = current[h] / source_gamma[h];
+  }
+  nntrainer::HtpRouterResidual residual(2, 3);
+  residual.observe(0, 10, source);
+  residual.observe(1, 10, target);
+  for (float blend : {0.0f, 0.5f, 1.0f}) {
+    residual.apply(1, 11, normalized, blend, corrected);
+    for (unsigned h = 0; h < 3; ++h) {
+      corrected[h] *= target_gamma[h];
+      const float expected =
+        (current_without_gamma[h] + blend * repeated_delta[h]) *
+        target_gamma[h];
+      assert(corrected[h] == expected);
+    }
+  }
+  // A stale residual still translates only the current row's gamma.
+  residual.apply(1, 12, normalized, 1.0f, normalized);
+  for (unsigned h = 0; h < 3; ++h)
+    assert(normalized[h] * target_gamma[h] ==
+           current_without_gamma[h] * target_gamma[h]);
+}
+
 int main() {
+  randomWhPrediction_p();
+  gammaResidual_p();
   queuedDemandHandoff_p();
   abandonedHandoffDrain_p();
   cooperativeCancellation_p();

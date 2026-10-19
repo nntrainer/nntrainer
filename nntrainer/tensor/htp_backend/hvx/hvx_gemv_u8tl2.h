@@ -48,6 +48,14 @@ void hvx_tl2_expand_wh96_disjoint(const uint8_t *src, uint32_t rows,
                                   uint32_t columns, uint32_t row_stride,
                                   int magnitude, uint8_t *dst);
 
+/** Restore consecutive complete 96x128 groups from disjoint native input.
+ * Source groups occupy 2560 bytes each; output groups occupy three WH rows.
+ * Aligned callers amortize setup and use fixed dimensions. Partial groups
+ * must use expand_wh96_disjoint with their actual row count. */
+void hvx_tl2_expand_wh96_disjoint_batch(const uint8_t *src, uint32_t groups,
+                                        uint32_t row_stride, int magnitude,
+                                        uint8_t *dst);
+
 /** Exact int16 LUTs, 512 bytes per 24 input rows. The u8 activation is
  * contiguous and has K bytes; the last block is read with bounds checks.
  * Workers partition [block_begin,block_end) of ceil(K/24). Tables depend only

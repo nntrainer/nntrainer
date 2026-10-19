@@ -188,7 +188,7 @@ typedef struct hexkl_graph_s {
                                           QTimer ticks (ns on the host): the
                                           op's time at whatever clock it ran */
   float *param[HTP_GRAPH_MAX_OPS];   /**< gamma or conv_w, NULL until bound */
-  uint8_t router_wh[HTP_GRAPH_MAX_OPS]; /**< param holds affine INT4 WH */
+  uint8_t router_wh[HTP_GRAPH_MAX_OPS]; /**< 0: FP32, 1: WH, 2: decoded WH */
   float *state[HTP_GRAPH_MAX_OPS];      /**< CONV1D_GATE: 3 x N (rows 0-1 the
                                              conv state, row 2 scratch) */
   uint32_t ordinal[HTP_GRAPH_MAX_OPS];  /**< ATTN_M1: the attention-layer

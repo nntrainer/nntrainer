@@ -182,6 +182,15 @@ public:
   }
 
   /**
+   * @brief Run a loop only if the pool is available, otherwise return false.
+   * @details Nested callbacks also return false, including callbacks on the
+   * calling thread. A false result runs no iterations; callers may fall back
+   * to serial work. This does not wait for another pool user.
+   */
+  bool try_parallel_for(size_t begin, size_t end,
+                        std::function<void(size_t)> task);
+
+  /**
    * @brief return the number of threads including main thread
    */
   uint32_t getComputeThreadCount() const {
@@ -261,59 +270,12 @@ private:
    */
   template <typename F> void parallelize(size_t begin, size_t end, F &&task) {
     std::lock_guard<std::mutex> lock(execution_mutex_);
-
-#if defined(_WIN32)
-    std::unique_lock<std::mutex> command_lock(command_mutex_);
-#endif
-
-    task_ = std::move(task);
-
-    // set active thread numbers
-    size_t threads_count = compute_workers_.size() + 1;
-    active_threads_.store(threads_count - 1, std::memory_order_relaxed);
-#if defined(__linux__) || defined(__ANDROID__)
-    has_active_threads_.store(1, std::memory_order_relaxed);
-#endif
-    // distribute loops
-    size_t range_quotient = (end - begin) / threads_count;
-    size_t range_remainder = (end - begin) % threads_count;
-
-    size_t range_start = begin;
-    for (size_t tid = 0; tid < threads_count; tid++) {
-      size_t range_length = range_quotient + (size_t)(tid < range_remainder);
-      size_t range_end = range_start + range_length;
-
-      thread_infos_[tid].range_start.store(range_start,
-                                           std::memory_order_relaxed);
-      thread_infos_[tid].range_end.store(range_end, std::memory_order_relaxed);
-      thread_infos_[tid].range_length.store(range_length,
-                                            std::memory_order_relaxed);
-
-      range_start = range_end;
-    }
-
-    // always flipping MSB makes workers notice new command arrives even if last
-    // command was same command
-    uint32_t old_command = command_.load(std::memory_order_relaxed);
-    uint32_t new_command =
-      (~(old_command | COMMAND_MASK)) | threadpool_command::RUN;
-
-    command_.store(new_command, std::memory_order_release);
-
-#if defined(__linux__) || defined(__ANDROID__)
-    futex_wake(&command_);
-#elif defined(_WIN32)
-    command_lock.unlock();
-    command_cv_.notify_all();
-#endif
-
-    // main thread also works
-    thread_parallelize(0);
-
-    wait_worker_threads();
-
-    std::atomic_thread_fence(std::memory_order_acquire);
+    parallelize_locked(begin, end, std::forward<F>(task));
   }
+
+  /** @brief Dispatch with execution_mutex_ already held. */
+  void parallelize_locked(size_t begin, size_t end,
+                          std::function<void(size_t)> task);
 
 protected:
   void initialize() noexcept override;

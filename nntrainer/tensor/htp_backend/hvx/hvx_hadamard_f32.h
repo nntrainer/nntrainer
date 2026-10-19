@@ -33,4 +33,23 @@ int hvx_hadamard_f32(float *x, uint32_t width, uint32_t mode);
 int hvx_hadamard_rows_f32(float *x, uint32_t rows, uint32_t width,
                           uint32_t mode);
 
+/** Transform then apply the checkpoint's immutable width-element XOR mask.
+ * A null mask is equivalent to the unsigned API. Masks need only uint32_t
+ * alignment and must not overlap x. The aligned 1536/2048-wide HVX paths fuse
+ * XOR into their final store, preserving transform-then-XOR bit order.
+ */
+int hvx_hadamard_signed_f32(float *x, uint32_t width, uint32_t mode,
+                            const uint32_t *mask);
+int hvx_hadamard_signed_rows_f32(float *x, uint32_t rows, uint32_t width,
+                                 uint32_t mode, const uint32_t *mask);
+
+/** Aligned mode-2 transform with two extrema per row, including zero.
+ * Width must be 1536 or 2048, and x must be 128-byte aligned. Extrema owns
+ * 2 * rows floats, disjoint from x and mask. NaNs propagate to both extrema;
+ * quantization's usual zero clamp therefore preserves its NaN behavior.
+ * Invalid arguments return -1 without modifying x or extrema. */
+int hvx_hadamard_signed_rows_extrema_f32(float *x, uint32_t rows,
+                                         uint32_t width, const uint32_t *mask,
+                                         float *extrema);
+
 #endif

@@ -13,13 +13,20 @@
 
 #include "hexkl_mm_u8i4_dma.h"
 
-static unsigned allocations, frees, refreshing;
+static unsigned allocations, frees, refreshing, fail_next_allocation;
+static size_t allocated_bytes;
 static hexkl_weight_u8i4 *gu, *dn;
 static void *checked_malloc(size_t bytes) {
-  ++allocations;
+  if (fail_next_allocation) {
+    fail_next_allocation = 0;
+    return NULL;
+  }
   void *p = malloc(bytes);
-  if (p)
+  if (p) {
+    ++allocations;
+    allocated_bytes += bytes;
     memset(p, 0xa5, bytes);
+  }
   return p;
 }
 static void checked_free(void *p) {
@@ -153,6 +160,7 @@ int main(void) {
   hexkl_weight_u8i4_table *table = calloc(1, sizeof(*table));
   assert(table);
   uint32_t gh, dh, rg, rd;
+  const size_t bytes_before = allocated_bytes;
   assert(hexkl_weight_tl2_compact_register_arena(table, 8u << 20, K, 2u * I,
                                                  arena, &gh) == AEE_SUCCESS);
   assert(hexkl_weight_tl2_compact_register_arena(
@@ -163,6 +171,10 @@ int main(void) {
            table, 8u << 20, I, N, arena + down, &rd) == AEE_SUCCESS);
   gu = table->slots + gh;
   dn = table->slots + dh;
+  assert(allocated_bytes - bytes_before == 2u * (8u * (2u * I + N) + 256u));
+  assert(gu->bias == dn->bias && gu->bias == table->slots[rg].bias);
+  assert(((uintptr_t)gu->bias & 127u) == 0u);
+  assert(hexkl_weight_u8i4_set_offsets(gu, gu->w_scale) == AEE_EBADPARM);
   assert((uint8_t *)gu->colsum_w == (uint8_t *)gu->w_scale + 4u * gu->N);
   assert((uint8_t *)dn->colsum_w == (uint8_t *)dn->w_scale + 4u * dn->N);
   check_zero(gu->bias, gu->N);
@@ -194,8 +206,8 @@ int main(void) {
     /* The existing serial helper is an independent byte-copy reference. */
     hexkl_weight_u8i4_tail_from_arena(table->slots + rg, gb);
     hexkl_weight_u8i4_tail_from_arena(table->slots + rd, db);
-    assert(memcmp(gu->w_scale, table->slots[rg].w_scale, 12u * gu->N) == 0);
-    assert(memcmp(dn->w_scale, table->slots[rd].w_scale, 12u * dn->N) == 0);
+    assert(memcmp(gu->w_scale, table->slots[rg].w_scale, 8u * gu->N) == 0);
+    assert(memcmp(dn->w_scale, table->slots[rd].w_scale, 8u * dn->N) == 0);
   }
 
   /* Every current validation rejection precedes DMA and generation commit. */
@@ -249,9 +261,7 @@ int main(void) {
   assert(hexkl_weight_tl2_refresh_pair(&gemma_g, &gemma_d) == AEE_SUCCESS);
   assert(pushes == 0u && drains == 0u && invalidations == 0u);
 
-  /* Even an explicitly rebound compact slot re-establishes zero bias. */
-  memset(gu->bias, 0xa5, 4u * gu->N);
-  memset(dn->bias, 0xa5, 4u * dn->N);
+  /* Compact rebind retains the shared immutable bias and its allocation. */
   assert(hexkl_weight_tl2_compact_rebind_arena(table, gh, K, 2u * I, arena) ==
          AEE_SUCCESS);
   assert(hexkl_weight_tl2_compact_rebind_arena(table, dh, I, N, arena + down) ==
@@ -284,7 +294,97 @@ int main(void) {
   assert(!legacy->tl2_compact && !legacy->tl2_generation);
   assert(legacy->tl2_generation_seen == 0u);
   hexkl_weight_u8i4_release(table, legacy_h);
+
+  /** Native-to-legacy pair rebind must remain allocation-free: the RPC
+   * validates both handles before touching either and cannot roll back a
+   * partially rebound pair. An armed allocation failure must not fire. */
+  hexkl_weight_u8i4 *upgraded = table->slots + rg;
+  hexkl_weight_u8i4 before_upgrade = *upgraded;
+  hexkl_weight_u8i4 *legacy2 = table->slots + rd;
+  const unsigned rebind_allocations = allocations;
+  fail_next_allocation = 1u;
+  assert(hexkl_weight_u8i4_rebind_arena(table, rg, K, 2u * I, arena, NULL,
+                                        upgraded->w_scale,
+                                        upgraded->colsum_w) == AEE_SUCCESS);
+  assert(hexkl_weight_u8i4_rebind_arena(table, rd, I, N, arena + down,
+                                        legacy_pal, legacy2->w_scale,
+                                        legacy2->colsum_w) == AEE_SUCCESS);
+  assert(fail_next_allocation == 1u && allocations == rebind_allocations);
+  fail_next_allocation = 0u;
+  assert(upgraded->arrays == before_upgrade.arrays);
+  assert(upgraded->bias == gu->bias && upgraded->bits == 4u);
+  assert(!upgraded->tl2_compact && !upgraded->tl2_generation);
+  assert(memcmp(upgraded->w_scale, gu->w_scale, 8u * gu->N) == 0);
+  check_zero(upgraded->bias, upgraded->N);
+  for (uint32_t i = 0; i < gu->N; ++i)
+    legacy_bias[i] = (float)((int)(i % 31u) - 15);
+  /* Affine setup alone upgrades storage; allocation failure is atomic. */
+  before_upgrade = *upgraded;
+  fail_next_allocation = 1u;
+  assert(hexkl_weight_u8i4_set_offsets(upgraded, legacy_bias) == AEE_ENOMEMORY);
+  assert(memcmp(upgraded, &before_upgrade, sizeof(*upgraded)) == 0);
+  const size_t before_upgrade_bytes = allocated_bytes;
+  assert(hexkl_weight_u8i4_set_offsets(upgraded, legacy_bias) == AEE_SUCCESS);
+  assert(allocated_bytes - before_upgrade_bytes == 16u * upgraded->N + 128u);
+  assert(upgraded->arrays != before_upgrade.arrays);
+  assert(upgraded->bias != gu->bias);
+  assert(memcmp(upgraded->w_scale, gu->w_scale, 8u * gu->N) == 0);
+  check_zero(upgraded->bias, upgraded->N);
+  for (uint32_t i = 0; i < gu->N; ++i)
+    assert(upgraded->w_offset[i] == (int32_t)legacy_bias[i]);
+  assert(hexkl_weight_tl2_compact_rebind_arena(table, rg, K, 2u * I, arena) ==
+         AEE_SUCCESS);
+  assert(upgraded->tl2_compact && !upgraded->w_offset && upgraded->bits == 2u);
+  check_zero(upgraded->bias, upgraded->N);
+  check_zero(gu->bias, gu->N);
+
+  assert(legacy2->bits == 2u && !legacy2->tl2_compact);
+  assert(memcmp(legacy2->pal, legacy_pal, sizeof(legacy_pal)) == 0);
+  assert(hexkl_weight_u8i4_set_offsets(legacy2, legacy_bias) == AEE_EBADPARM);
+  assert(memcmp(legacy2->w_scale, dn->w_scale, 8u * dn->N) == 0);
+  check_zero(legacy2->bias, legacy2->N);
+  assert(hexkl_weight_u8i4_rebind_arena(table, rd, I, N, arena + down, NULL,
+                                        legacy2->w_scale,
+                                        legacy2->colsum_w) == AEE_SUCCESS);
+  for (uint32_t i = 0; i < legacy2->N; ++i)
+    legacy2->w_scale[i] = (float)((int)(i % 31u) - 15);
+  assert(hexkl_weight_u8i4_set_offsets(legacy2, legacy2->w_scale) ==
+         AEE_SUCCESS);
+  for (uint32_t i = 0; i < legacy2->N; ++i) {
+    assert(legacy2->w_scale[i] == (float)((int)(i % 31u) - 15));
+    assert(legacy2->w_offset[i] == (int)(i % 31u) - 15);
+  }
+  check_zero(legacy2->bias, legacy2->N);
   free(legacy_bias);
+
+  /** Largest supported native N consumes only 8*N metadata bytes and can
+   * read the entire shared zero table without relying on padding. */
+  const uint32_t max_n = 8192u;
+  const size_t max_codes = htp_tl2_native_bytes(32u, max_n);
+  uint8_t *max_alloc = malloc(max_codes + 8u * max_n + 512u);
+  assert(max_alloc);
+  uint8_t *max_arena =
+    (uint8_t *)(((uintptr_t)max_alloc + 511u) & ~(uintptr_t)511u);
+  memset(max_arena, 0x6d, max_codes + 8u * max_n);
+  fill_tail(max_arena + max_codes, max_n, 13u);
+  uint32_t max_handle = UINT32_MAX;
+  fail_next_allocation = 1u;
+  assert(hexkl_weight_tl2_compact_register_arena(table, 8u << 20, 32u, max_n,
+                                                 max_arena,
+                                                 &max_handle) == AEE_ENOMEMORY);
+  assert(max_handle == UINT32_MAX);
+  const size_t max_before = allocated_bytes;
+  assert(hexkl_weight_tl2_compact_register_arena(
+           table, 8u << 20, 32u, max_n, max_arena, &max_handle) == AEE_SUCCESS);
+  assert(allocated_bytes - max_before == 8u * max_n + 128u);
+  check_zero(table->slots[max_handle].bias, max_n);
+  assert(memcmp(table->slots[max_handle].w_scale, max_arena + max_codes,
+                8u * max_n) == 0);
+  assert(hexkl_weight_tl2_compact_register_arena(table, 8u << 20, 32u,
+                                                 max_n + 128u, max_arena,
+                                                 &max_handle) == AEE_EBADPARM);
+  hexkl_weight_u8i4_release(table, max_handle);
+  free(max_alloc);
 
   /** Moving a compact pair to a different arena clears the old generation
    * pointer. The newly published generation then refreshes only its own

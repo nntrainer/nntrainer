@@ -44,6 +44,7 @@ parts = {}
 parts['state.h'] = sources['state']
 parts['pool.inc'] = block(sources['arm'], '  struct Held {', '  /** @brief A host range last copied')
 parts['producer.inc'] = block(sources['arm'], '    const uint32_t ticket =', '    const uint64_t t0 =')
+parts['ion_alias_state.inc'] = block(sources['arm'], '  struct IonAlias {', '  /** @brief The staging bytes that hold')
 parts['ion_alias.inc'] = body(sources['arm'], '  const void *ionAlias(')
 parts['sync.inc'] = body(sources['arm'], '  void sync_to_host(').replace(' override', '')
 parts['attn_q.inc'] = body(sources['arm'], '  bool sdpa_q_kvcache(').replace(' override', '')
