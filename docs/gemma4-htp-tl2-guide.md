@@ -107,12 +107,45 @@ python3 Applications/CausalLM/res/gemma4/convert_gemma4_tl2.py \
   --hf-source /path/to/bf16-checkpoint
 ```
 
-Use Python 3.11+ for this wrapper (`hashlib.file_digest`) and install NumPy,
-PyTorch and safetensors for affine conversion. Existing output directories are
-refused. Keep the generated binary, report, model/generation configuration,
+Use Python 3.11+ for this wrapper (`hashlib.file_digest`) and NumPy; the
+affine stage reads the BF16 rows itself (no PyTorch, no safetensors, no
+whole-file mmap). Existing output directories are refused. Keep the generated binary, report, model/generation configuration,
 tokenizer and chat template together. Changing JSON dtype names does not
 convert the binary. Rebuild and stage the matching ARM libraries and v81
 DSP skeleton using the [Android build instructions](gemma4-htp-quickdotai.md#android-build).
+
+### The rotated checkpoint in one run
+
+[weight_converter.py](../Applications/CausalLM/res/gemma4-26b-a4b/weight_converter.py)
+takes the pre-rotated, fake-quantized BF16 HF checkpoint directly (experts
+exact ternary per output channel, FC/head on an int4 grid, `rotation_meta.json`)
+and chains the stages above: it writes the QS2 pack itself (expert codes with
+the BF16 scale and column sum, embedding Q4_0, norms and router FP32 with
+`router.scale` folded with `1/sqrt(hidden)` and the router gate transposed),
+builds `convert_tl2_model`, runs the wrapper, then adds `rotation_signs.json`
+(regenerated from the seed: `RandomState(seed).randint(0, 2)`, hidden then
+moe_intermediate, `s = 1 - 2 * bit`), the rotation keys and config.json's
+`global_head_dim`/`num_global_key_value_heads`. The experts of
+`--affine-layers` (default `28,29`, the recipe's 4-bit expert layers) are
+written as `QS4CX_WH_AFFINE` with the int4 grid recovered like FC/head and
+listed in `moe_layer_dtype_per_layer`; every other MoE layer becomes native
+TL2CX_WH. A layer whose values are not ternary is written affine whatever
+the option.
+
+```bash
+python3 Applications/CausalLM/res/gemma4-26b-a4b/weight_converter.py \
+  --source /path/to/gemma4-26b-a4b-crispy --output /path/to/gemma4-26b-a4b-rotated-2bit-4bit
+```
+
+2026-10-19: with the defaults the output is byte-identical to the hand-made
+`nntr_gemma4_26b_a4b_2bit_4bit.bin` (SHA256 `ce3b6e6e...`), so the
+2026-10-18 demo results apply unchanged. With `--affine-layers ''` (all 30
+layers TL2; the 28/29 values of this checkpoint are exactly ternary, so the
+weights are the same) the S26 Ultra p2048/g128 run used 8 arena chunks
+(1792 MiB) instead of 12 (2624 MiB), peak 3669 MB instead of 4723 MB, with
+prefill 613 vs 577 TPS and decode 15.5 vs 11.8 TPS back to back; the sub_agent
+demo gave the same token ids for one-shot think, one-shot no-think and
+KV-split no-think, and diverged after 34 tokens for KV-split think.
 
 ## Rotated checkpoints
 
@@ -133,7 +166,9 @@ format is `nntr_hadamard_signs_v1`, with an `in` array of 2816 signs and a
 supported convention applies the normalized H44 x Sylvester transform
 then output-coordinate signs: `(x H) * signs`. Orientation, factor order
 and signs are part of the weight contract. A seed alone is not a substitute
-for the matching vectors. [The sign recovery tool](../tools/htp/recover_hadamard_signs.py)
+for the matching vectors unless the generator convention is known; the
+converter above regenerates them and they match the vectors recovered from
+the first rotated pack. [The sign recovery tool](../tools/htp/recover_hadamard_signs.py)
 can compare reference and rotated packs for diagnosis.
 
 Scope `all` covers routed experts of both two- and four-bit formats;
