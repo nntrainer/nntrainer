@@ -1627,12 +1627,36 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // so a 29K-token prompt was cut to INIT_SEQ_LEN even though the prefill
   // could have fed it in chunks.
   const bool _prefill_chunking = prefillDriveChunk() > 0;
+  // Rows the cache holds before this prompt: a loaded prefix (USE mode) and
+  // a continued session. They are not the prompt's, but they are the
+  // window's, so the prompt's room is what they leave. A prompt past that
+  // room used to fail inside the first qkv step ("rows 1537..2482 past the
+  // RoPE table's 2304", the AI Studio app with a 1537-row prefix and a 946-
+  // token message) -- the budget below did not know the prefix.
+  const unsigned int prefix_rows =
+    (USE_KVCACHE && !SAVE_KVCACHE ? SYS_PROMP_LEN : 0u) + global_token_len;
+  const unsigned int prompt_room =
+    kv_budget > prefix_rows ? kv_budget - prefix_rows : 0u;
   unsigned int num_allow_str =
-    _prefill_chunking ? kv_budget
-                      : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
+    _prefill_chunking ? prompt_room
+                      : std::min<unsigned int>(INIT_SEQ_LEN, prompt_room);
   unsigned int text_len = _len;
 
   performance_metrics.prompt_truncated_tokens = 0;
+  // A continuation cut at its tail answers a message the user did not
+  // send: refuse it here, before the cache load and the prefill, with the
+  // numbers the caller needs (the app shows this message).
+  NNTR_THROW_IF(prefix_rows > 0 && _len > num_allow_str, std::runtime_error)
+    << "[causallm] the prompt (" << _len
+    << " tokens) does not fit behind the KV cache's " << prefix_rows
+    << " rows: "
+    << (_len > prompt_room
+          ? "prefix + prompt + num_to_generate (" +
+              std::to_string(reserved_for_generation) +
+              ") exceeds max_seq_len " + std::to_string(MAX_SEQ_LEN)
+          : "one prefill block holds init_seq_len " +
+              std::to_string(INIT_SEQ_LEN) + " rows")
+    << " (room for " << num_allow_str << " prompt tokens)";
   if (_len > num_allow_str) {
     text_len = num_allow_str;
     performance_metrics.prompt_truncated_tokens = _len - num_allow_str;
