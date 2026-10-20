@@ -1067,10 +1067,14 @@ void CausalLM::save_kvcache(std::string path, int to_) {
     throw std::runtime_error(
       "save_kvcache called before allocateAndBindKVCache()");
   }
+  if (to_ < 0)
+    throw std::out_of_range("save_kvcache: position must not be negative");
+  const auto pos = static_cast<unsigned int>(to_);
+  kv_cache.validateSaveRange(pos);
   // [#4428 window] a windowed layer's rows before its window are not in
   // the dump: their |max| is folded first and goes with the calibration
-  compactKVCache(static_cast<unsigned int>(to_));
-  kv_cache.save(path, static_cast<unsigned int>(to_), kvCacheModelTag());
+  compactKVCache(pos);
+  kv_cache.save(path, pos, kvCacheModelTag());
   // the int8 attention's scales of this prefill, for the run that loads it
   std::ofstream q2(path + ".q2", std::ios::binary);
   causallm::HtpMHACoreLayer::saveQ2Calibration(q2);
