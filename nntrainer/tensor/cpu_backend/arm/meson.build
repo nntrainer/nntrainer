@@ -9,8 +9,7 @@ arm_compute_backend_sources = [
     'neon_impl.cpp',
 ]
 
-arch = host_machine.cpu_family()
-if arch != 'arm'
+if arm_target == 'aarch64'
   subdir('kai_interface')
   nntrainer_inc += include_directories('kai_interface')
   nntrainer_inc_abs += meson.current_source_dir() / 'kai_interface'
@@ -30,7 +29,7 @@ if get_option('enable-fp16')
   nntrainer_inc_abs += meson.current_source_dir() / 'hgemm'
 endif
 
-if arch == 'arm'
+if arm_target == 'armv7'
   arm_compute_backend_headers += 'armv7_neon.h'
 endif
 

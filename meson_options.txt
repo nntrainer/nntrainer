@@ -117,12 +117,12 @@ option('enable-dotprod', type: 'boolean', value: true,
 option('enable-i8mm', type: 'boolean', value: true,
        description: 'Enable the ARM Int8 Matrix Multiply (+i8mm) ISA extension.')
 option('enable-fp16fml', type: 'boolean', value: false,
-       description: 'Enable the ARM FP16 multiply-long (+fp16fml) ISA extension.')
+       description: 'Enable the ARM FP16 multiply-long (+fp16fml) ISA extension. Requires enable-fp16.')
 option('enable-sve', type: 'boolean', value: false,
        description: 'Enable the ARM SVE (+sve) ISA extension.')
 option('enable-sve2', type: 'boolean', value: false,
-       description: 'Enable the ARM SVE2 (+sve2) ISA extension')
+       description: 'Enable the ARM SVE2 (+sve2) ISA extension. Implies enable-sve.')
 option('enable-sme', type: 'boolean', value: false,
-       description: 'Enable the ARM SME (+sme) ISA extension')
+       description: 'Enable the ARM SME (+sme) ISA extension.')
 option('enable-sme2', type: 'boolean', value: false,
-       description: 'Enable the ARM SME2 (+sme2) ISA extension')
+       description: 'Enable the ARM SME2 (+sme2) ISA extension. Implies enable-sme.')

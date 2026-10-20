@@ -107,12 +107,23 @@ arch = host_machine.cpu_family()
 
 target = target_machine.cpu_family()
 
+# ARM target of the build: 'aarch64', 'armv7' or '' (non-ARM).
+# Since android build uses ndk-build, meson can't detect its arch properly. (arch != aarch64)
+# So we need to add an android case explicitly
+if arch == 'aarch64' or get_option('platform') == 'android'
+  arm_target = 'aarch64'
+elif arch == 'arm'
+  arm_target = 'armv7'
+else
+  arm_target = ''
+endif
+
 
 subprojects_dir_relative = 'subprojects'
 subprojects_dir_absolute = meson.current_source_dir() / subprojects_dir_relative
 
 if get_option('platform') == 'windows'
-  if arch == 'arm' or arch == 'aarch64'
+  if arm_target != ''
   windows_resource_dir_relative = 'nntrainer-windows-resource' / 'arm64'
   windows_resource_dir_absolute = meson.current_source_dir() / windows_resource_dir_relative
   else
@@ -122,9 +133,9 @@ if get_option('platform') == 'windows'
 endif
 
 enable_avxvnni_dispatch = false
-if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
+if arm_target != ''
   message('Build for ARM architecture')
-  if arch == 'arm'
+  if arm_target == 'armv7'
     extra_defines += '-DARMV7=1'
   endif
 elif arch == 'x86' or arch == 'x86_64'
@@ -168,9 +179,10 @@ endif
 
 arm_arch_opt = get_option('arm-arch')
 arm_march_flag = ''
-# Since android build uses ndk-build, meson can't detect its arch properly. (arch != aarch64)
-# So we need to add an android case explicitly
-if arch == 'aarch64' or get_option('platform') == 'android'
+arm_isa_args = []
+# ISA extensions in -march order; only sve2->sve and sme2->sme are resolved
+arm_features = []
+if arm_target == 'aarch64'
   if arm_arch_opt == 'armv7-a'
     error('arm-arch=armv7-a is not supported on aarch64/android (arm64-v8a only).')
   elif arm_arch_opt == 'auto'
@@ -188,32 +200,44 @@ if arch == 'aarch64' or get_option('platform') == 'android'
     extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
     extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
   endif
-  arm_march_flag = '-march=' + arm_arch_opt
   if get_option('enable-fp16')
-    arm_march_flag += '+fp16'
+    if arm_arch_opt == 'armv8-a'
+      error('enable-fp16 requires arm-arch=armv8.2-a or later (FEAT_FP16 is Armv8.2+)')
+    endif
+    arm_features += 'fp16'
   endif
   if get_option('enable-dotprod')
-    arm_march_flag += '+dotprod'
+    arm_features += 'dotprod'
   endif
   if get_option('enable-i8mm')
-    arm_march_flag += '+i8mm'
+    arm_features += 'i8mm'
   endif
   if get_option('enable-fp16fml')
-    arm_march_flag += '+fp16fml'
+    # fp16fml is only used by FP16 kernels, so it has no effect without them
+    if not get_option('enable-fp16')
+      error('enable-fp16fml requires enable-fp16 (FEAT_FHM extends FEAT_FP16)')
+    endif
+    arm_features += 'fp16fml'
   endif
-  if get_option('enable-sve')
-    arm_march_flag += '+sve'
+  # sve2 implies sve, and sme2 implies sme
+  if get_option('enable-sve') or get_option('enable-sve2')
+    arm_features += 'sve'
   endif
   if get_option('enable-sve2')
-    arm_march_flag += '+sve2'
+    arm_features += 'sve2'
   endif
-  if get_option('enable-sme')
-    arm_march_flag += '+sme'
+  if get_option('enable-sme') or get_option('enable-sme2')
+    arm_features += 'sme'
   endif
   if get_option('enable-sme2')
-    arm_march_flag += '+sme2'
+    arm_features += 'sme2'
   endif
-elif arch == 'arm'
+  arm_march_flag = '-march=' + arm_arch_opt
+  foreach feature : arm_features
+    arm_march_flag += '+' + feature
+  endforeach
+  arm_isa_args += arm_march_flag
+elif arm_target == 'armv7'
   if arm_arch_opt == 'auto'
     arm_arch_opt = 'armv7-a'
   elif arm_arch_opt != 'armv7-a'
@@ -224,14 +248,32 @@ elif arch == 'arm'
     error('armv7-a requires enable-neon (no non-NEON backend yet).')
   endif
   arm_march_flag = '-march=armv7-a'
-  add_project_arguments('-mfpu=neon', language: ['c', 'cpp'])
+  arm_isa_args += [arm_march_flag, '-mfpu=neon']
 elif arm_arch_opt != 'auto'
   warning('arm-arch=@0@ is ignored on non-ARM builds.'.format(arm_arch_opt))
 endif
 
+# Off-by-default extension toggles only take effect on aarch64
+if arm_target != 'aarch64'
+  foreach opt : ['enable-fp16fml', 'enable-sve', 'enable-sve2', 'enable-sme', 'enable-sme2']
+    if get_option(opt)
+      warning('@0@ is ignored on non-aarch64 builds.'.format(opt))
+    endif
+  endforeach
+endif
+
 # Android compiles via ndk-build (jni/meson.build), so it should not be applied here.
-if arm_march_flag != '' and get_option('platform') != 'android'
-  add_project_arguments(arm_march_flag, language: ['c', 'cpp'])
+if arm_isa_args.length() > 0 and get_option('platform') != 'android'
+  # Fail at configure time, not mid-build, if the compiler lacks an extension.
+  # MSVC cl ignores -march, so skip it; clang-cl applies it and is checked.
+  # Android checks it with the NDK clang in jni/meson.build.
+  foreach lang : ['c', 'cpp']
+    compiler = meson.get_compiler(lang)
+    if compiler.get_id() != 'msvc' and not compiler.has_multi_arguments(arm_isa_args)
+      error('The @0@ compiler (@1@) does not support @2@. Check arm-arch and the enable-* ISA options; see meson-logs/meson-log.txt for the compiler output.'.format(lang, compiler.get_id(), ' '.join(arm_isa_args)))
+    endif
+  endforeach
+  add_project_arguments(arm_isa_args, language: ['c', 'cpp'])
 endif
 
 if get_option('enable-fp16')
@@ -242,10 +284,7 @@ if get_option('enable-fp16')
   if get_option('fp16-impl') != 'auto' and not (arch == 'x86_64' and get_option('platform') != 'android')
     warning('fp16-impl=@0@ is ignored on this build: the option selects the x86_64 fp16 backing type, and this build uses the native __fp16/_Float16.'.format(get_option('fp16-impl')))
   endif
-  if arch == 'aarch64' or get_option('platform') == 'android'
-    if arm_arch_opt == 'armv8-a'
-      error('enable-fp16 requires arm-arch=armv8.2-a or later (FEAT_FP16 is Armv8.2+)')
-    endif
+  if arm_target == 'aarch64'
     # NDK clang (and non-ARM host compilers used for the meson-built QNN
     # plugin) reject -mfp16-format=ieee; only pass it when supported.
     if cxx.has_argument('-mfp16-format=ieee')
@@ -253,7 +292,7 @@ if get_option('enable-fp16')
     endif
     extra_defines += '-DENABLE_FP16=1'
     extra_defines += '-DUSE__FP16=1'
-  elif arch == 'arm'
+  elif arm_target == 'armv7'
     # __fp16 on 32-bit arm must be enabled explicitly with -mfp16-format
     if cxx.has_argument('-mfp16-format=ieee')
       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
