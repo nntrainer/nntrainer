@@ -176,10 +176,9 @@ if arch == 'aarch64' or get_option('platform') == 'android'
   elif arm_arch_opt == 'auto'
     arm_arch_opt = 'armv8.2-a'
   endif
-  # KleidiAI is always built on aarch64 and needs dotprod+i8mm (implied by v9.2)
+  # KleidiAI is always built on aarch64 and needs dotprod+i8mm
   # @todo support dotprod-only by dropping the i8mm kai kernels
-  if arm_arch_opt != 'armv9.2-a' and \
-     not (get_option('enable-dotprod') and get_option('enable-i8mm'))
+  if not (get_option('enable-dotprod') and get_option('enable-i8mm'))
     error('aarch64 requires enable-dotprod and enable-i8mm (KleidiAI).')
   endif
   # Tizen optflags (-march=armv8-a...) come after project args and win, and
