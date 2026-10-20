@@ -85,6 +85,9 @@ protected:
   /** nntr_config moe_hadamard_signs: the rotated checkpoint's +-1 per input
    *  dimension after the Hadamard (a JSON beside the model, "in" / "down") */
   std::string MOE_HADAMARD_SIGNS_FILE;
+  /** Checkpoint defaults, copied to the HTP session before its first MoE call.
+   */
+  std::string MOE_HADAMARD = "off", MOE_HADAMARD_SCOPE = "2bit";
   std::string moeLayerDtype(int layer_id) const {
     const auto it = MOE_LAYER_DTYPE_PER_LAYER.find(layer_id);
     return it == MOE_LAYER_DTYPE_PER_LAYER.end() ? MOE_LAYER_DTYPE : it->second;

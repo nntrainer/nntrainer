@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -742,6 +743,15 @@ public:
   // experts and dense FFN: true = GeGLU (gelu_tanh(gate) * up, Gemma 4),
   // false = SwiGLU (the default). Set before the first MoE call.
   virtual void set_moe_geglu(bool on) { (void)on; }
+
+  // Checkpoint defaults for this session's online MoE rotation. Set before
+  // the first MoE call; explicit environment overrides still take precedence.
+  // A new session starts with mode=off and scope=2bit. No-op without HTP.
+  virtual void set_moe_hadamard(const std::string &mode,
+                                const std::string &scope) {
+    (void)mode;
+    (void)scope;
+  }
 
   // [#130] The per-token hook a CPU layer calls at one decode row before
   // running its own kernel: kind is the op kind of htp_graph_desc.h, pos

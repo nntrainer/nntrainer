@@ -2953,6 +2953,18 @@ public:
     moeGeglu().store(on);
   }
 
+  /** @brief Copy checkpoint rotation defaults into this HTP session. */
+  void set_moe_hadamard(const std::string &mode,
+                        const std::string &scope) override {
+    std::lock_guard<std::mutex> lock(moe_opts_mutex_);
+    if (moeOptsSent().load() &&
+        (moe_hadamard_ != mode || moe_hadamard_scope_ != scope))
+      throw std::runtime_error("set_moe_hadamard: the MoE options were already "
+                               "sent with other rotation defaults");
+    moe_hadamard_ = mode;
+    moe_hadamard_scope_ = scope;
+  }
+
   /** [#132 Part B] One weight's rows [r0, r0 + rows) as a Q4M1 handle:
    *  canonical block_q4_0 (unpacked from the CPU's repack unless the
    *  model says it is canonical already, as the tied lm_head is), the
@@ -4803,6 +4815,7 @@ public:
    *  [HTP-PROFILE]'s m1_gemv= and blocks= are the per-call proof. */
   void sendMoeOptsOnce(remote_handle64 session) {
     std::call_once(moe_opts_once_, [this, session]() {
+      std::lock_guard<std::mutex> lock(moe_opts_mutex_);
       moeOptsSent().store(true);
       const char *env = std::getenv("NNTR_MOE_HTP_M1_GEMV");
       const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
@@ -4826,6 +4839,10 @@ public:
       }
       const char *had_env = std::getenv("NNTR_MOE_HADAMARD");
       const char *had_scope = std::getenv("NNTR_MOE_HADAMARD_SCOPE");
+      if (!had_env)
+        had_env = moe_hadamard_.c_str();
+      if (!had_scope)
+        had_scope = moe_hadamard_scope_.c_str();
       uint32_t had_scope_bits = 0;
       if (htp_moe_opts_hadamard_scope(had_scope, &had_scope_bits) != 0)
         throw std::runtime_error(std::string("NNTR_MOE_HADAMARD_SCOPE=") +
@@ -11157,6 +11174,8 @@ private:
   // same mutex that serializes every call into the one HTP session.
   std::mutex invoke_mutex_;
   std::once_flag moe_opts_once_; /**< sendMoeOptsOnce */
+  std::mutex moe_opts_mutex_;
+  std::string moe_hadamard_ = "off", moe_hadamard_scope_ = "2bit";
   std::atomic<bool> moe_opts_sent_{false};
   /** [PR 4428] set_moe_hadamard_signs's vectors until the session has them */
   std::mutex had_signs_mutex_;

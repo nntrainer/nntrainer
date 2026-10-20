@@ -33,16 +33,6 @@
 
 namespace causallm {
 namespace {
-/** @brief Sets @a name to @a value unless the environment already has it. */
-static void setEnvDefault(const char *name, const std::string &value) {
-#ifdef _WIN32
-  if (std::getenv(name) == nullptr)
-    _putenv_s(name, value.c_str());
-#else
-  setenv(name, value.c_str(), 0);
-#endif
-}
-
 std::set<int> parseLayerIdList(const std::string &csv) {
   std::set<int> ids;
   std::stringstream ss(csv);
@@ -239,16 +229,11 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
       nntr_cfg.value("moe_hadamard_signs", std::string());
   }
 
-  // The checkpoint's online rotation (PR 4428: Hadamard before the expert
-  // input quantization, matching the converter's weight rotation), as the
-  // words of NNTR_MOE_HADAMARD / NNTR_MOE_HADAMARD_SCOPE, which win when
-  // set. ponytail: the backend reads the environment once at its first
-  // MoE call, so the pack's choice travels as an environment default.
-  for (const auto &[key, env] :
-       {std::pair{"moe_hadamard", "NNTR_MOE_HADAMARD"},
-        std::pair{"moe_hadamard_scope", "NNTR_MOE_HADAMARD_SCOPE"}})
-    if (nntr_cfg.contains(key))
-      setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
+  // Keep checkpoint defaults on the model. The HTP session applies explicit
+  // environment overrides when it sends its MoE options for the first time.
+  MOE_HADAMARD = nntr_cfg.value("moe_hadamard", std::string("off"));
+  MOE_HADAMARD_SCOPE =
+    nntr_cfg.value("moe_hadamard_scope", std::string("2bit"));
 
   STATIC_ACTIVATION_FILE =
     nntr_cfg.value("static_activation_file", std::string());

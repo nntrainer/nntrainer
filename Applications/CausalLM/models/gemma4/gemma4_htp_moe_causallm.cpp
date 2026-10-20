@@ -97,8 +97,11 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   // experts; their GeGLU goes into the session's MoE word too, which the
   // one-PD token's MOE and DENSE_FFN ops read (#4415's prefill call ORs it
   // in per call anyway)
-  if (MOE_ENGINE == "htp")
-    nntrainer::get_htp_ops()->set_moe_geglu(true);
+  if (MOE_ENGINE == "htp") {
+    auto *ops = nntrainer::get_htp_ops();
+    ops->set_moe_geglu(true);
+    ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
+  }
   // [plan 201 S4] the whole decode token on the HTP, one call a token; the
   // list is built after load (load_weight). Built in (htp_fixed::E2E).
   htp_e2e = nntrainer::htp_fixed::E2E && MOE_ENGINE == "htp";
