@@ -24,6 +24,8 @@ int hvx_hadamard_supported(uint32_t width);
  * float only. Weights must be transformed consistently before quantization;
  * applying this to an existing checkpoint changes the model.
  */
+/** Mode 4 applies the Gemma4 Paley-I input signs, then mode 2.
+ * Supported widths for mode 4 are 2816 and 704. */
 int hvx_hadamard_f32(float *x, uint32_t width, uint32_t mode);
 
 /** Contiguous independent rows. The 704-wide HVX path packs two rows

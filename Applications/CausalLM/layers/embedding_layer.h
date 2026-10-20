@@ -107,6 +107,11 @@ struct QuantLut {
 
   bool is_raw_u16 = false;
   bool is_signed4 = false;
+  bool is_affine4 =
+    false; ///< unsigned group32 codes with per-group zero points
+  bool round_bf16 = false; ///< round restored weights before layer scaling
+  bool bf16_scale_output = false; ///< BF16 layer scale and scaled output
+  std::vector<uint8_t> group_zero_points; ///< one uint4 zero point per group
 
   /// Row-block payload (Q4_0/Q6_K/QS4CX); NONE for the packed-4bit/raw formats.
   nntrainer::TensorDim::DataType ggml_dtype =

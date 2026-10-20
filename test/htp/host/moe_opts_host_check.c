@@ -46,12 +46,12 @@ int main(void) {
            "all-weight scope");
     expect(htp_moe_opts_hadamard_scope("", &scope) == -1 && scope == 0u,
            "invalid scope is rejected without changing output");
-    const char *names[] = {NULL,     "off",      "up",
-                           "down",   "both",     "both_scalar",
-                           "up_hmx", "down_hmx", "both_hmx"};
-    const uint32_t words[] = {0u,          0u,          0x04000000u,
-                              0x08000000u, 0x0c000000u, 0x1c000000u,
-                              0x24000000u, 0x28000000u, 0x2c000000u};
+    const char *names[] = {NULL,       "off",         "up",     "down",
+                           "both",     "both_scalar", "up_hmx", "down_hmx",
+                           "both_hmx", "both_paley"};
+    const uint32_t words[] = {
+      0u,          0u,          0x04000000u, 0x08000000u, 0x0c000000u,
+      0x1c000000u, 0x24000000u, 0x28000000u, 0x2c000000u, 0x8c000000u};
     for (size_t i = 0; i < sizeof words / sizeof *words; ++i) {
       uint32_t bits = 0xdeadu;
       expect(htp_moe_opts_hadamard(names[i], &bits) == 0 && bits == words[i],
