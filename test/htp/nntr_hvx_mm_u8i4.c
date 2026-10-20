@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <float.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -719,8 +720,39 @@ int nntr_hvx_moe_set_hadamard_signs(remote_handle64 handle, const float *s_in,
   return AEE_SUCCESS;
 }
 
-/** [PR 4428] weight_set_offsets_batch: hexkl_weight_u8i4_set_offsets on
- *  each swapped-in affine expert handle; see the IDL. */
+/** Attach checkpoint input encodings to registered weights. */
+int nntr_hvx_weight_set_static_quant(remote_handle64 handle,
+                                     const uint32 *handles, int handlesLen,
+                                     const float *scales, int scalesLen,
+                                     const int32 *zero_points,
+                                     int zero_pointsLen, uint32 gate_plus1,
+                                     uint32 up_plus1) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || handlesLen <= 0 || scalesLen != handlesLen ||
+      zero_pointsLen != handlesLen || !handles || !scales || !zero_points ||
+      ((gate_plus1 == 0) != (up_plus1 == 0)))
+    return AEE_EBADPARM;
+  if (gate_plus1 && (gate_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS ||
+                     up_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS ||
+                     !s->weights_u8i4.slots[gate_plus1 - 1].in_use ||
+                     !s->weights_u8i4.slots[up_plus1 - 1].in_use))
+    return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i)
+    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[handles[i]].in_use ||
+        !(scales[i] >= FLT_MIN && scales[i] <= FLT_MAX / 255.0f) ||
+        zero_points[i] < 0 || zero_points[i] > 255)
+      return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    w->static_scale = scales[i];
+    w->static_zp = zero_points[i];
+    w->static_gate_plus1 = gate_plus1;
+    w->static_up_plus1 = up_plus1;
+  }
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_weight_set_offsets_batch(remote_handle64 handle,
                                       const uint32 *handles, int handlesLen,
                                       const uint32 *n_per, int n_perLen,

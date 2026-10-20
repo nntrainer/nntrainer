@@ -61,6 +61,7 @@
 #include <htp_q4_0_convert.h>
 #include <htp_router_predict.h>
 #include <htp_rpcmem.h>
+#include <htp_static_quant.h>
 #include <htp_token_completion.h>
 #include <htp_wh_layout.h>
 #include <htp_wh_palette.h>
@@ -1818,6 +1819,28 @@ public:
       stageInput(act_pool_, x, x_len * sizeof(float)).data());
     float *out = reinterpret_cast<float *>(
       stage(out_pool_, out_len * sizeof(float)).data());
+    const auto fixed = static_quant_.find(w);
+    std::unique_ptr<HtpRpcBuffer> fixed_act;
+    if (fixed != static_quant_.end()) {
+      fixed_act = std::make_unique<HtpRpcBuffer>(x_len * sizeof(float));
+      float *dst = reinterpret_cast<float *>(fixed_act->data());
+      for (unsigned m = 0; m < M; ++m) {
+        float sum = 0.0f;
+        if (gamma)
+          for (unsigned k = 0; k < K; ++k)
+            sum += act[(size_t)m * K + k] * act[(size_t)m * K + k];
+        float inv = gamma ? 1.0f / std::sqrt(sum / K + eps) : 1.0f;
+        for (unsigned k = 0; k < K; ++k) {
+          float v = act[(size_t)m * K + k] * inv;
+          if (gamma)
+            v *= gamma[k];
+          dst[(size_t)m * K + k] =
+            htp_static_qdq(v, fixed->second.scale, fixed->second.zp);
+        }
+      }
+      act = dst;
+      gamma = nullptr;
+    }
     // NNTR_HTP_ROUTER_U8I8=1: the logits on the HMX (u8 x i8). Off by
     // default: on device its logits were up to 0.17-0.39 off the CPU's
     // (the f32 kernel: 2e-5), the per-row u8 step being coarse beside
@@ -1825,8 +1848,9 @@ public:
     // is not a model's own (doc 57 section 9.33).
     static const bool router_u8i8 =
       std::getenv("NNTR_HTP_ROUTER_U8I8") != nullptr;
-    const uint32_t h8 =
-      router_u8i8 ? routerWeightU8i8(session, w, K, E) : UINT32_MAX;
+    const uint32_t h8 = router_u8i8 && fixed == static_quant_.end()
+                          ? routerWeightU8i8(session, w, K, E)
+                          : UINT32_MAX;
     const float *w_shared =
       h8 != UINT32_MAX
         ? nullptr
@@ -3956,10 +3980,25 @@ public:
         }
       }
     }
-    for (size_t m = 0; m < tabs.size(); ++m)
+    for (size_t m = 0; m < tabs.size(); ++m) {
       setParam(e.h1, moe_ops_[m], HTP_GRAPH_PARAM_EXPERTS, tabs[m].data(),
                static_cast<unsigned>(tabs[m].size()),
                static_cast<unsigned>(tabs[m].size()), "EXPERTS");
+      const auto &desc = pool_descs_[m];
+      if (!desc.empty() && static_quant_.count(desc[0].key_gu)) {
+        std::vector<float> grids;
+        grids.reserve(4 * desc.size());
+        for (const auto &d : desc) {
+          const auto &gu = static_quant_.at(d.key_gu);
+          const auto &dn = static_quant_.at(d.key_dn);
+          grids.insert(grids.end(), {gu.scale, static_cast<float>(gu.zp),
+                                     dn.scale, static_cast<float>(dn.zp)});
+        }
+        setParam(e.h1, moe_ops_[m], HTP_GRAPH_PARAM_EXPERT_QUANT, grids.data(),
+                 static_cast<unsigned>(grids.size()),
+                 static_cast<unsigned>(grids.size()), "expert static grids");
+      }
+    }
     pool_dirty_ = false;
     if (!t1_printed_) { // [#282 F]
       t1_printed_ = true;
@@ -4005,7 +4044,9 @@ public:
             std::runtime_error("token driver: S1 did not rebind a pool load"));
         continue;
       }
-      fileRegistered(p.pending[i], hg, hd);
+      // The DSP graph restores static grids after rebinding. An RPC here
+      // would race the running token's next miss round.
+      fileRegistered(p.pending[i], hg, hd, false);
     }
     p.pending.clear();
     if (first)
@@ -4623,8 +4664,16 @@ public:
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
       // [plan 201 S4] the parameters the model handed at load, by name
-      for (const LoadParam &p : load_params_)
+      for (const LoadParam &p : load_params_) {
         setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
+        const auto q = static_quant_.find(p.data);
+        if (p.which == HTP_GRAPH_PARAM_ROUTER_W && q != static_quant_.end()) {
+          const float grid[] = {q->second.scale,
+                                static_cast<float>(q->second.zp)};
+          setParam(session, p.op, HTP_GRAPH_PARAM_ROUTER_QUANT, grid, 2, 2,
+                   "router static quantization");
+        }
+      }
       // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
       if (const uint32_t on = predictMode()) {
@@ -4786,7 +4835,7 @@ public:
         throw std::runtime_error(
           std::string("NNTR_MOE_HADAMARD=") + had_env +
           " is not off, up, down, both, both_scalar, up_hmx, "
-          "down_hmx, both_hmx");
+          "down_hmx, both_hmx, both_paley");
       }
       if (had_bits)
         had_bits |= had_scope_bits;
@@ -8334,6 +8383,9 @@ private:
       if (handle != kNoHandle) {
         handle_cache_.emplace(key, handle);
         fcwh_arena_bytes_ += len;
+        if (parts.size() == 1)
+          applyStaticQuant(
+            session, reinterpret_cast<const void *>(parts[0].w->key), handle);
         return handle;
       }
     }
@@ -8345,8 +8397,12 @@ private:
     HtpRpcBuffer buf(rm.size());
     std::memcpy(buf.data(), rm.data(), rm.size());
     fcwh_heap_bytes_ += len;
-    return register_locked(key, session, kn, cn, buf, ws, cs, t_begin, 0,
-                           &bias);
+    const uint32_t handle =
+      register_locked(key, session, kn, cn, buf, ws, cs, t_begin, 0, &bias);
+    if (parts.size() == 1)
+      applyStaticQuant(session, reinterpret_cast<const void *>(parts[0].w->key),
+                       handle);
+    return handle;
   }
 
   /** @brief Registers one row-major int8 [K x N] weight (values in [-8, 7],
@@ -8455,6 +8511,16 @@ private:
                                        {{wg, c0, w}, {wu, c0, w}}, 0, K));
         dh.h_dn.push_back(registerFcWh(static_cast<char *>(down) + c0, session,
                                        {{wd, 0, N}}, c0, w));
+        if (static_quant_.count(gate)) {
+          if (!static_quant_.count(up) || !static_quant_.count(down))
+            throw std::runtime_error(
+              "Static dense FFN requires all three input encodings");
+          const uint32_t hg = registerFcWh(static_cast<char *>(gate) + c0 + 1,
+                                           session, {{wg, c0, w}}, 0, K);
+          const uint32_t hu = registerFcWh(static_cast<char *>(up) + c0,
+                                           session, {{wu, c0, w}}, 0, K);
+          applyStaticQuant(session, gate, dh.h_gu.back(), hg + 1, hu + 1);
+        }
       }
       return dense_cache_.emplace(up, std::move(dh)).first->second;
     }
@@ -8544,6 +8610,37 @@ private:
                    act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u,
                    pre_gamma, post_gamma, eps, nullptr, nullptr, 1.0f,
                    out_to_host);
+  }
+
+  struct StaticQuant {
+    float scale;
+    int32_t zp;
+  };
+  std::unordered_map<const void *, StaticQuant> static_quant_;
+
+  bool set_weight_static_quant(const void *key, float scale, int zp) override {
+    if (!key ||
+        !(scale >= std::numeric_limits<float>::min() &&
+          scale <= std::numeric_limits<float>::max() / 255.0f) ||
+        zp < 0 || zp > 255)
+      throw std::invalid_argument("Invalid static U8 encoding");
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    static_quant_[key] = {scale, zp};
+    return true;
+  }
+
+  void applyStaticQuant(remote_handle64 session, const void *key,
+                        uint32_t handle, uint32_t gate_plus1 = 0,
+                        uint32_t up_plus1 = 0) {
+    const auto it = static_quant_.find(key);
+    if (it == static_quant_.end())
+      return;
+    const int rc = nntr_hvx_weight_set_static_quant(
+      session, &handle, 1, &it->second.scale, 1, &it->second.zp, 1, gate_plus1,
+      up_plus1);
+    if (rc)
+      throw std::runtime_error("HTP static encoding registration failed: " +
+                               std::to_string(rc));
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,
@@ -9601,8 +9698,15 @@ private:
 
   /** @brief Files an expert the DSP has just registered.
    *  @note Call with handle_mutex_ held. */
-  void fileRegistered(StagedExpert &st, uint32_t h_gu, uint32_t h_dn) {
+  void fileRegistered(StagedExpert &st, uint32_t h_gu, uint32_t h_dn,
+                      bool register_quant = true) {
     const ExpertFileDesc &d = st.d;
+    if (register_quant) {
+      const auto session =
+        static_cast<remote_handle64>(HtpBackend::global().handle());
+      applyStaticQuant(session, d.key_gu, h_gu);
+      applyStaticQuant(session, d.key_dn, h_dn);
+    }
     st.slot.h_gu = st.slot.h_dn = kNoHandle; // released by the swap
     handle_cache_[d.key_gu] = h_gu;
     handle_cache_[d.key_dn] = h_dn;

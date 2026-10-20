@@ -28,6 +28,11 @@ cc=${CC:-gcc}
   -I "$HERE/../../../Applications/CausalLM" \
   "$HERE/lfm2_runtime_defaults_check.cpp" -o "$OUT/lfm2_runtime_defaults_check"
 "$OUT/lfm2_runtime_defaults_check"
+"${CXX:-g++}" -std=c++17 -O2 -ffast-math -Wall -Wextra -Werror \
+  -I "${NNTR_JSON_INCLUDE:-$HERE/../../../Applications/CausalLM}" \
+  -I "$HERE/../../../Applications/CausalLM/models/gemma4" -I "$BACKEND" \
+  "$HERE/static_encoding_check.cpp" -o "$OUT/static_encoding_check"
+"$OUT/static_encoding_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Werror -I "$BACKEND/hvx" \
   "$HERE/hadamard_check.c" "$BACKEND/hvx/hvx_hadamard_f32.c" -lm \
   -o "$OUT/hadamard_check"

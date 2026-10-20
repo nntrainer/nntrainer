@@ -9,7 +9,7 @@
 #undef main
 #include "hvx_gemv_u8tl2.h"
 
-static int check(int gu_magnitude, int dn_magnitude) {
+static int check(int gu_magnitude, int dn_magnitude, int fixed) {
   const uint32_t K = 2816u, I = 704u, N = 2816u, E = 8u;
   static uint8_t vtcm[8u << 20] __attribute__((aligned(128)));
   W weights[16];
@@ -23,6 +23,8 @@ static int check(int gu_magnitude, int dn_magnitude) {
     hvx_expand_i2i4_table(pal, lut);
     make_weight(h, h < E ? K : I, h < E ? 2u * I : N, &weights[h]);
     hexkl_weight_u8i4 *w = &g_tbl.slots[h];
+    w->static_scale = fixed ? (h < E ? .01f : .125f) : 0.f;
+    w->static_zp = h < E ? 129 : 93;
     size_t bytes = (size_t)w->K * w->N / 4u;
     qs2[h] = malloc(bytes);
     tl2[h] = malloc(hvx_tl2_weight_bytes(w->K, w->N));
@@ -61,13 +63,19 @@ static int check(int gu_magnitude, int dn_magnitude) {
   hexkl_moe_scratch scratch = {0};
   int fail = 0;
   for (uint32_t active = 1; active <= E; ++active) {
+    if (fixed && active != 1u && active != E)
+      continue;
     for (uint32_t e = 0; e < E; ++e)
       count[e] = e < active;
     for (uint32_t workers = 0; workers <= 7;
          workers = workers == 0 ? 3 : workers + 4) {
       g_workers = workers;
       for (uint32_t nq = 1; nq <= 4; nq *= 2) {
-        const uint32_t flags = 0xf03e1u | HEXKL_MOE_FLAG_GELU_TANH;
+        const uint32_t flags =
+          0xf03e1u | HEXKL_MOE_FLAG_GELU_TANH |
+          (fixed ? HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |
+                     HEXKL_MOE_FLAG_HAD_PALEY_I
+                 : 0u);
         /** Default queues are encoded in bits 22..23; use the public helper's
          * scheme. */
         const uint32_t opts =
@@ -86,8 +94,9 @@ static int check(int gu_magnitude, int dn_magnitude) {
             &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1u, K, I, N, E, hg, hd, ri,
             count, rw, input, mode ? got : ref, NULL, &scratch, opts);
           fail |= rc != 0 || (mode && memcmp(ref, got, sizeof ref));
-          printf("TL2 MoE experts=%u workers=%u queues=%u mode=%u rc=%d\n",
-                 active, workers, nq, mode, rc);
+          printf(
+            "TL2 MoE experts=%u workers=%u queues=%u mode=%u static=%d rc=%d\n",
+            active, workers, nq, mode, fixed, rc);
         }
         int bad = memcmp(ref, got, sizeof ref);
         printf("TL2 MoE exact=%d\n", bad == 0);
@@ -107,4 +116,10 @@ static int check(int gu_magnitude, int dn_magnitude) {
   return fail;
 }
 
-int main(void) { return check(1, 1) | check(7, 7) | check(1, 7) | check(7, 1); }
+int main(int argc, char **argv) {
+  (void)argv;
+  if (argc > 1)
+    return check(1, 1, 1);
+  return check(1, 1, 0) | check(7, 7, 0) | check(1, 7, 0) | check(7, 1, 0) |
+         check(1, 1, 1);
+}

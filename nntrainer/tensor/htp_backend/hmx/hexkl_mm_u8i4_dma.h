@@ -21,6 +21,7 @@
 #ifndef __NNTRAINER_HEXKL_MM_U8I4_DMA_H__
 #define __NNTRAINER_HEXKL_MM_U8I4_DMA_H__
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "hexkl_mm_opts.h"
@@ -51,6 +52,9 @@ typedef struct {
   int32_t *w_offset; /**< NULL: symmetric; otherwise N affine integer offsets */
   void
     *arrays; /**< scales/sums; legacy also owns bias and affine offset room */
+  float static_scale; /**< 0: dynamic, positive: supplied U8 encoding. */
+  int32_t static_zp;
+  uint32_t static_gate_plus1, static_up_plus1; /**< Separate dense inputs. */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
   int clean;    /**< [#267 L1] a heap image: written once at registration
@@ -73,6 +77,19 @@ typedef struct {
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;
+
+/** Fixed params bypass extrema selection, including padded rows. */
+static inline int hexkl_weight_static_params(const hexkl_weight_u8i4 *w,
+                                             uint32_t rows, float *scale,
+                                             int32_t *zp) {
+  if (!w || !(w->static_scale > 0.0f))
+    return 0;
+  for (uint32_t i = 0; i < rows; ++i) {
+    scale[i] = w->static_scale;
+    zp[i] = w->static_zp;
+  }
+  return 1;
+}
 
 /** Bind a generation word after its arena extent was checked by the RPC.
  * The metadata already reflects this generation after register/rebind. */

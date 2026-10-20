@@ -60,6 +60,147 @@ static void put_wh(uint8_t *wh, uint32_t N, uint32_t k, uint32_t n, int q) {
   wh[at] = (wh[at] & ~(15u << shift)) | (((uint32_t)q & 15u) << shift);
 }
 
+/** Independent fixed-grid rounding, including saturation and odd zero points.
+ */
+static void static_quant_ref(const float *x, uint32_t n, float scale,
+                             int32_t zp, uint8_t *q) {
+  for (uint32_t k = 0; k < n; ++k) {
+    long v = lrintf(x[k] / scale) + zp;
+    q[k] = v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+  }
+}
+
+static void static_linear_cases(uint8_t *vtcm, uint32_t vtcm_size) {
+  enum { K = 96, I = 64, N = 32, ROWS = 129 };
+  W w[4];
+  memset(&g_tbl, 0, sizeof(g_tbl));
+  make_weight(0, K, 2 * I, &w[0]);
+  make_weight(1, I, N, &w[1]);
+  make_weight(2, K, I, &w[2]);
+  make_weight(3, K, I, &w[3]);
+  const float scales[] = {.125f, .03125f, .125f, .0625f};
+  const int32_t zps[] = {171, 142, 171, 93};
+  for (unsigned h = 0; h < 4; ++h) {
+    g_tbl.slots[h].static_scale = scales[h];
+    g_tbl.slots[h].static_zp = zps[h];
+    for (uint32_t c = 0; c < w[h].N; ++c) {
+      w[h].cs[c] = 0;
+      for (uint32_t k = 0; k < w[h].K; ++k) {
+        const uint8_t *tile =
+          (uint8_t *)w[h].nib +
+          ((size_t)(k / 32u) * (w[h].N / 32u) + c / 32u) * 512u;
+        w[h].cs[c] += wh_value(tile, k % 32u, c % 32u);
+      }
+    }
+  }
+  float x[ROWS * K], got[ROWS * 2 * I], want[ROWS * 2 * I];
+  uint32_t rows[ROWS];
+  float routing[ROWS];
+  for (unsigned j = 0; j < ROWS * K; ++j)
+    x[j] = (int)(j % 41u) * .0625f - 1.25f;
+  x[0] = -100.f;
+  x[K - 1] = 100.f;
+  hexkl_moe_scratch scratch = {0};
+  const uint32_t sizes[] = {1, 3, 64, 65, 129};
+  for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
+    const uint32_t M = sizes[s];
+    for (unsigned workers = 0; workers <= 3; workers += 3) {
+      g_workers = workers;
+      const uint32_t handles[] = {2, 3};
+      for (unsigned p = 0; p < 2; ++p)
+        for (unsigned m = 0; m < M; ++m) {
+          uint8_t q[K];
+          static_quant_ref(x + m * K, K, scales[p + 2], zps[p + 2], q);
+          ref_mm(w + p + 2, q, scales[p + 2], zps[p + 2],
+                 want + p * M * I + m * I);
+        }
+      if (M == 1)
+        assert(hexkl_mm_u8i4_fc_m1_run(&g_tbl, vtcm, 0, 0, K, 2, handles, x,
+                                       got, NULL, &scratch,
+                                       HEXKL_MOE_FLAG_GEMV_FEED_SET) == 0);
+      else
+        assert(hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, vtcm_size, vtcm_size, M, K,
+                                       handles, 2, x, got, NULL) == 0);
+      assert(!memcmp(want, got, (size_t)M * 2 * I * sizeof(float)));
+
+      // Dense gate/up have different grids; routed experts share the input
+      // grid but quantize their own post-GELU down input.
+      for (unsigned dense = 0; dense < 2; ++dense) {
+        g_tbl.slots[0].static_gate_plus1 = dense ? 3 : 0;
+        g_tbl.slots[0].static_up_plus1 = dense ? 4 : 0;
+        for (unsigned m = 0; m < M; ++m) {
+          uint8_t q[K];
+          float gu[2 * I], mid[I], output[N];
+          static_quant_ref(x + m * K, K, scales[0], zps[0], q);
+          if (dense) {
+            ref_mm(w + 2, q, scales[2], zps[2], gu);
+            static_quant_ref(x + m * K, K, scales[3], zps[3], q);
+            ref_mm(w + 3, q, scales[3], zps[3], gu + I);
+          } else
+            ref_mm(w, q, scales[0], zps[0], gu);
+          for (unsigned j = 0; j < I; ++j)
+            mid[j] = geglu_det_one(gu[j], gu[I + j]);
+          static_quant_ref(mid, I, scales[1], zps[1], q);
+          ref_mm(w + 1, q, scales[1], zps[1], output);
+          rows[m] = dense ? m : M - 1u - m;
+          routing[m] = dense ? 1.f : .75f;
+          for (unsigned j = 0; j < N; ++j)
+            want[m * N + j] = output[j] * routing[m];
+        }
+        const uint32_t gu = 0, dn = 1;
+        assert(hexkl_mm_u8i4_moe_layer_run(
+                 &g_tbl, vtcm, M == 1 && dense ? 0 : vtcm_size,
+                 M == 1 && dense ? 0 : vtcm_size, M, K, I, N, 1, &gu, &dn, rows,
+                 &M, routing, x, got, NULL, &scratch,
+                 HEXKL_MOE_FLAG_GELU_TANH | HEXKL_MOE_FLAG_M1_GEMV |
+                   HEXKL_MOE_FLAG_GEMV_FEED_SET) == 0);
+        assert(!memcmp(want, got, (size_t)M * N * sizeof(float)));
+        if (dense) {
+          /* Gemma's decode graph uses slot 1 for both the dense input and
+           * output. Every chunk must still read the original input. */
+          float in_place[ROWS * K];
+          uint32_t chunk_rows[2 * ROWS], counts[] = {M, M};
+          float chunk_weights[2 * ROWS];
+          const uint32_t gu_chunks[] = {gu, gu}, dn_chunks[] = {dn, dn};
+          for (unsigned j = 0; j < 2 * M; ++j) {
+            chunk_rows[j] = j % M;
+            chunk_weights[j] = 1.f;
+          }
+          /* 28 KiB fits only 64 gate/up rows and 128 down rows beside
+           * the weight/accumulator double buffers. Exercise both arena
+           * limits, multiple row tiles and a one-row prefill tail. */
+          const uint32_t budgets[][2] = {
+            {vtcm_size, vtcm_size},
+            {28u << 10, vtcm_size},
+            {vtcm_size, 28u << 10},
+          };
+          for (unsigned b = 0; b < sizeof(budgets) / sizeof(budgets[0]); ++b)
+            for (unsigned chunks = 1; chunks <= 2; ++chunks) {
+              memcpy(in_place, x, (size_t)M * K * sizeof(float));
+              assert(hexkl_mm_u8i4_moe_layer_run(
+                       &g_tbl, vtcm, M == 1 ? 0 : budgets[b][0],
+                       M == 1 ? 0 : budgets[b][1], M, K, I, N, chunks,
+                       gu_chunks, dn_chunks, chunk_rows, counts, chunk_weights,
+                       in_place, in_place, NULL, &scratch,
+                       HEXKL_MOE_FLAG_GELU_TANH | HEXKL_MOE_FLAG_M1_GEMV |
+                         HEXKL_MOE_FLAG_GEMV_FEED_SET) == 0);
+              for (unsigned j = 0; j < M * N; ++j)
+                assert(in_place[j] == chunks * want[j]);
+            }
+        }
+      }
+      printf("Static FC/dense/MoE exact M=%u workers=%u\n", M, workers);
+    }
+  }
+  hexkl_moe_scratch_free(&scratch);
+  for (unsigned h = 0; h < 4; ++h) {
+    free(w[h].nib);
+    free(w[h].ws);
+    free(w[h].cs);
+    free(w[h].bias);
+  }
+}
+
 int main(void) {
   const uint32_t K = 96u, I = 192u, N = 128u;
   static uint8_t vtcm[8u << 20] __attribute__((aligned(128)));
@@ -230,5 +371,6 @@ int main(void) {
     free(weights[h].cs);
     free(weights[h].bias);
   }
+  static_linear_cases(vtcm, sizeof(vtcm));
   return 0;
 }

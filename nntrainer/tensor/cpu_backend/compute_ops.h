@@ -1078,6 +1078,14 @@ public:
     throw std::runtime_error(
       "ComputeOps::gemm_q4_0_dense_ffn_fp32 not implemented by this backend");
   }
+  /** @brief Bind a fixed U8 input grid before registering an HTP weight. */
+  virtual bool set_weight_static_quant(const void *key, float scale, int zp) {
+    (void)key;
+    (void)scale;
+    (void)zp;
+    return false;
+  }
+
   virtual bool register_q4_0_dense_ffn(void *up, void *gate, void *down,
                                        unsigned int K, unsigned int I,
                                        unsigned int N,

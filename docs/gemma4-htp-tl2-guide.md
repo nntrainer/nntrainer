@@ -179,10 +179,112 @@ so clear stale overrides when switching packs. Rotation stays off for
 an unrotated checkpoint. A rotation-on smoke with unrotated weights does
 not validate model output quality.
 
-MoE/FC activation quantization remains dynamic per row. The presence of
-calibration files does not enable static activation scales. The HTP
-attention implementation also does not consume the external
+The strict 2026-10-20 checkpoint uses `moe_hadamard: "both_paley"`: its
+Paley-I basis differs from the earlier `both` basis. Use the checkpoint's
+rotation signs and its asymmetric U4 embedding sidecar, including the
+manifest's BF16 rounding flag.
+
+Paley input signs are applied with HVX before the existing FP32 transform;
+the 704-wide down input then uses the same two-row kernel as `both`.
+Applying the signs in a scalar loop and leaving mode `4` outside that batch
+dispatch made the down rotation expensive. The vector sign pass and batch
+dispatch preserve the checkpoint basis and the output-coordinate signs.
+Selecting `both` or `both_hmx` instead would change the checkpoint contract.
+
+## Static linear activation quantization
+
+For the strict checkpoint, add its supplied input encodings to
+`nntr_config.json`:
+
+```json
+{
+  "static_activation_file": "static_linear.json"
+}
+```
+
+The path is relative to the model directory, or absolute.
+`NNTR_HTP_STATIC_LINEAR` overrides it for existing experiment scripts.
+Without either setting, linear activation quantization remains dynamic.
+Both supplied formats are accepted:
+
+- `static_linear.json`: physical weight names mapped to `[scale, zero_point]`.
+- `encoding_provenance.json`: its `sites` object of logical linear inputs,
+  using `scale` and `-offset` as the unsigned eight-bit grid. The expert
+  sites expand to every expert in the layer.
+
+The 26B A4B strict sidecars describe 296 logical sites, mapped to 7,916
+weight inputs. Q/K/V, output projections, dense gate/up/down, routed
+experts, the FP32 router input and the output head use their supplied
+grids in both prefill and decode. Expert grids are restored after cache
+eviction and handle reuse; gate and up can use different grids. Quantization
+rounds to nearest even and saturates to the unsigned eight-bit range.
+Expert quantization follows the checkpoint's rotation.
+
+This path requires HTP linear engines and WH weights (TL2, QS2 or QS4
+experts, QS4 FC/head), with an FP32 router. Missing, extra, unsupported or
+invalid encodings fail loading. The old output-projection suffix `:proj`
+is accepted as an alias for `:weight`. The supplied expert input grid is
+shared across a layer; per-expert down grids are supported. HMX FP16
+Hadamard modes are unsupported with these static encodings.
+
+These sidecars cover U8 **linear inputs**, not all simulator QDQ boundaries.
+The HTP attention implementation does not consume the external
 `kv_quant_file` calibration as a replacement for its own cache scales.
+Setting `attention_kv_dtype: "q8"` still selects HTP's existing cache
+quantization. The source checkpoint's other activation boundaries require
+separate encodings and implementation before full simulator parity can
+be claimed.
+
+The host checks include static grids, saturation, ties, distinct gate/up
+grids and prefill/decode kernel comparisons. Dense checks also run with
+aliased input/output and multiple chunks, as used by Gemma's decode graph.
+`run_host_checks.sh` uses the application's `json.hpp`; set `NNTR_JSON_INCLUDE`
+if it is installed elsewhere.
+
+The 2026-10-20 S26 Ultra check loads all 7,916 encodings and completes
+generation, including expert-cache misses. Both sidecar formats produce
+the same smoke-test token IDs and answer `1 + 1 = 2`. An initial static
+implementation erased the dense input when clearing its output: Gemma's
+decode graph uses the same slot for both. The static dense path now
+preserves that input through all chunks. The regression fails before this
+fix and matches independent fixed-grid arithmetic afterwards.
+
+**The original agent quality gate still fails.** The PetCare sub-agent TC
+(1,625 input tokens, 2,048-token prefill capacity, existing HTP q8 KV) now
+produces coherent text and ends at a tool response after 424 tokens. Its call
+is `launchPetMonitoring(petName="초코")`, while the original strict fixture
+expects `turnOnPetMonitoring(petName="Choco")`. The dynamic control also
+chooses `launchPetMonitoring`. Fixing the corrupted dense input does not
+establish parity with the original HF simulation or a passing agent TC.
+
+### Korean 2K summary check (2026-10-20)
+
+The S26 Ultra (v81) check uses the same strict weights, q8 KV cache, greedy
+sampling, and 2,048 input IDs including the chat template. Prefill processes
+2,047 IDs; the last input ID is consumed at the decode handoff. The dynamic
+rows below are three-run medians, with no profiling and a cool, idle start
+(AP at most 34 C). The static row is one regression run.
+
+| Runtime | Prefill tok/s | Decode tok/s | Output IDs |
+| --- | ---: | ---: | ---: |
+| Static-capable runtime, dynamic, before Paley optimization | 355.81 | 18.98 | 323 |
+| Model compatibility only, dynamic, before optimization | 353.36 | 19.10 | 323 |
+| Final static-capable runtime, dynamic | 677.82 | 19.42 | 323 |
+| Final static-capable runtime, static | 82.16 | 16.86 | 268 |
+
+Every dynamic run emits the same 323 IDs; the final static run also matches
+all 268 IDs of its earlier static result. Both terminate normally. This
+checks output stability for one summary, not broad accuracy or the agent
+quality gate above. The dynamic summary still omits the satisfaction figure
+and misstates the seat-release timing.
+
+The profile located 4.33 of 5.74 seconds of the slow prefill in sparse MoE.
+A separate synthetic 2K MoE benchmark held input, routing and weights fixed:
+the old HVX/HMX rotations took 35.17/32.13 ms per layer, while the original
+Paley implementation took 128.43 ms. These are diagnostic DSP times, not
+end-to-end model throughput. The optimization retained the synthetic
+output hashes and the real summary IDs; it did not disable rotation.
+
 Gemma4's rotated pack and [LFM2 SR15](lfm2-htp-user-guide.md) use different
 rotation metadata; they are not interchangeable.
 

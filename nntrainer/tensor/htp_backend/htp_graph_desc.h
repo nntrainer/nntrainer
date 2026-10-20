@@ -201,8 +201,12 @@ enum {
   HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_EXPERTS,
   HTP_GRAPH_PARAM_PREDICT,
-  HTP_GRAPH_PARAM_DENSE_EARLY, /**< [#289] 1 = see hexkl_graph.h dense_early */
-  HTP_GRAPH_PARAM_ROUTER_WH,   /**< Packed affine WH INT4 router, raw words. */
+  HTP_GRAPH_PARAM_DENSE_EARLY,  /**< [#289] 1 = see hexkl_graph.h dense_early */
+  HTP_GRAPH_PARAM_ROUTER_WH,    /**< Packed affine WH INT4 router, raw words. */
+  HTP_GRAPH_PARAM_ROUTER_QUANT, /**< FP32 router input U8 scale and zero point.
+                                 */
+  HTP_GRAPH_PARAM_EXPERT_QUANT, /**< Per expert: gate scale/zp, down scale/zp.
+                                 */
   HTP_GRAPH_PARAM_N
 };
 /** @brief LM_BAN's longest list. */

@@ -290,6 +290,10 @@ static int hexkl_mm_u8i4_moe_layer_run(
   const int use_m1 = M == 1u;
   // This fixture isolates the unrotated native LFM handoff path.
   const int had_up = 0, use_had_hmx = 0;
+  struct StaticInput {
+    float static_scale;
+  };
+  const StaticInput *static_input = nullptr;
   const bool use_tl2 = tbl->compact;
   uint32_t n_rows = 0, n_with_rows = 0;
   for (uint32_t e = 0; e < n_experts; ++e) {

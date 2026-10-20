@@ -30,6 +30,26 @@
 
 hvx_scalar_hooks hvx_scalar_hook = {NULL, NULL, NULL, NULL};
 
+/** MoE-only fixtures do not invoke separate static dense projections. The
+ * static/affine fixture links the real FC implementation instead. */
+__attribute__((weak)) int hexkl_mm_u8i4_layer_run(
+  hexkl_weight_u8i4_table *tbl, uint8_t *vtcm, uint32_t size, uint32_t config,
+  uint32_t rows, uint32_t width, const uint32_t *handles, uint32_t count,
+  const float *input, float *output, const hexkl_mm_opts *opts) {
+  (void)tbl;
+  (void)vtcm;
+  (void)size;
+  (void)config;
+  (void)rows;
+  (void)width;
+  (void)handles;
+  (void)count;
+  (void)input;
+  (void)output;
+  (void)opts;
+  abort();
+}
+
 /** Host stand-ins share coherent ordinary memory. Device cache visibility
  * is checked separately by the stable-slot device fixture. Checks that
  * supply their own DMA implementation may override this no-op. */

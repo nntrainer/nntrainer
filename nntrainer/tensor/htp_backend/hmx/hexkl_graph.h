@@ -188,6 +188,8 @@ typedef struct hexkl_graph_s {
                                           QTimer ticks (ns on the host): the
                                           op's time at whatever clock it ran */
   float *param[HTP_GRAPH_MAX_OPS];   /**< gamma or conv_w, NULL until bound */
+  float router_quant[HTP_GRAPH_MAX_OPS]
+                    [2];                /**< zero scale disables static QDQ */
   uint8_t router_wh[HTP_GRAPH_MAX_OPS]; /**< 0: FP32, 1: WH, 2: decoded WH */
   float *state[HTP_GRAPH_MAX_OPS];      /**< CONV1D_GATE: 3 x N (rows 0-1 the
                                              conv state, row 2 scratch) */
@@ -199,6 +201,8 @@ typedef struct hexkl_graph_s {
    *  (HTP_GRAPH_PARAM_EXPERTS; HTP_GRAPH_NO_HANDLE = not resident), NULL
    *  until bound */
   uint32_t *experts[HTP_GRAPH_MAX_OPS];
+  /** Checkpoint grids survive cache eviction and handle reuse. */
+  float *expert_quant[HTP_GRAPH_MAX_OPS];
   /** the session's handle table graph_init checked against, which the
    *  EXPERTS tables are checked against too */
   const hexkl_weight_u8i4_table *tbl;
