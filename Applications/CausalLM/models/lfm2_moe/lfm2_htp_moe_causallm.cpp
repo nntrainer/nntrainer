@@ -86,7 +86,9 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
                                 "projections and router, Q4_0 embedding "
                                 "and DW3_INT4 conv");
 #ifdef ENABLE_HEXKL
-  nntrainer::get_htp_ops()->set_moe_geglu(false);
+  auto *ops = nntrainer::get_htp_ops();
+  ops->set_moe_geglu(false);
+  ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
 #else
   throw std::invalid_argument("LFM2 HTP requires an ENABLE_HEXKL build");
 #endif
