@@ -231,6 +231,36 @@ S26 Ultra에서는 **실행하지 않았다**. 코드를 읽어 확인한 것:
   floor = full seed의 scale·출력 바이트, floor 없는 대조군은 달라야 함),
   `unittest_kv_cache_manager`의 `compact_folds_the_dropped_rows_amax`.
 
+**20k prefill에서의 확인** (2026-10-19 밤, 같은 기기, C=8 + `NNTR_MOE_CACHE_GROW=0`
+`NNTR_HTP_PAGE_CACHE=0`, 128 토큰 greedy). 20k에서는 full cache가 DSP에 올라가지 않으므로
+직접 비교 대신 세 가지로 확인했다.
+
+| 구성 | prefill 토큰 | ids md5 |
+|---|---|---|
+| 22528 windowed, 수정 후 | 19,270 | `3a6276ddfc` |
+| 30272 windowed, 수정 후 | 19,270 | `3a6276ddfc` |
+| 22528 windowed, 수정 전(PR head) | 19,270 | `1d3df1379a` (2번째 토큰부터) |
+| full 3072 vs windowed 3328, `init_seq_len` 512 (compaction 여러 번) | 1,645 | 둘 다 `110f13888b` (수정 전 `be575fec7e`) |
+| save 17,590행 → use +1,680행, floor 있음 / `.q2`에서 floor를 지움 | | `415ec37813` / `d5923d5fb5` |
+
+- 수정 후는 `max_seq_len`에 무관하고, compaction이 여러 번 일어나도 full cache와 비트
+  동일하며, USE 실행은 `.q2`의 floor를 실제로 읽어 쓴다(지우면 ids가 바뀐다). 2k에서
+  9번째 토큰이던 분기가 20k에서 2번째인 것은 window가 19,270행 중 1,024행만 seed해
+  scale 차이가 훨씬 컸기 때문이다. USE가 단일 pass와 다른 것(2번째 토큰부터)은
+  prefill 쪽 calibration 차이로, window와 무관한 기존 항목이다.
+- 20k에서의 성능: prefill 385~394 TPS, decode 7.3~7.9 TPS, peak 약 4.9 GB (C=8).
+- **절대 정확도는 결론 내리지 못했다.** CPU attention을 기준(prefill 423 s)으로 두면
+  수정 후는 1번째, 수정 전은 4번째 토큰에서 갈리는데 greedy 한 샘플이고 그 뒤로는 양쪽
+  다 거의 맞지 않아(75개 중 2 / 8) 의미가 없다. 요약이 문서의 어느 부분을 다루는지도
+  near-tie에서 뒤집힌다(floor 유무에 따라 같은 초점이 양쪽으로 오갔다).
+- 20k 덤프(`kvsu20k.bin` + `.q2`)를 뜯어 보면 floor(버린 행 |max|)는 window 행
+  |max|의 중앙값 1.25배(일부 열 최대 6배, BOS 이상치 없음)다. 그래서 sliding 층 window
+  행의 int8 상대 오차는 window-local scale 0.65 % → floor scale 0.82 %로 1.25배 커진다.
+  즉 이 수정은 full cache를 정확히 재현하지만, full cache 자체가 전체 행 |max|로 scale을
+  잡는 설계라 수정 전 windowed 경로가 양자화는 조금 더 촘촘했다. 둘 다 1 % 미만이다.
+  정확도를 우선한다면 compaction 때 window 기준으로 scale을 다시 잡는 쪽이 둘 다보다
+  낫지만, "`max_seq_len`에 무관"이라는 요구와는 다른 선택이라 여기서는 하지 않았다.
+
 프롬프트 예산도 같은 날 고쳤다: 로드한 KV prefix 행(`SYS_PROMP_LEN`, 이어 쓰는 세션의
 `global_token_len`)을 `max_seq_len - num_to_generate`에서 빼고 남는 만큼만 프롬프트에
 준다. prefix가 있는데 프롬프트가 그 안에 안 들어가면 **cache 로드와 prefill 전에**
