@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
@@ -207,6 +209,98 @@ TEST(KVCacheManagerHybrid, compact_folds_the_dropped_rows_amax) {
   m.reset();
   EXPECT_TRUE(m.droppedAmaxK(0).empty());
   EXPECT_TRUE(m.droppedAmaxV(0).empty());
+}
+
+TEST(KVCacheManagerHybrid, invalid_later_window_leaves_every_layer_unchanged) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+      std::fill_n(t->getData<uint16_t>(), m.getRows(l) * 2, 0x3c00u);
+  // Layer 0 can compact at 3, but layer 1 cannot hold that position.
+  for (unsigned pos : {3u, 9u}) {
+    EXPECT_THROW(m.compact(pos), std::out_of_range);
+    for (unsigned l = 0; l < 2; ++l) {
+      EXPECT_EQ(m.getBase(l), 0u);
+      EXPECT_TRUE(m.droppedAmaxK(l).empty());
+      EXPECT_TRUE(m.droppedAmaxV(l).empty());
+      for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+        for (unsigned i = 0; i < m.getRows(l) * 2; ++i)
+          EXPECT_EQ(t->getData<uint16_t>()[i], 0x3c00u);
+    }
+  }
+}
+
+TEST(KVCacheManagerHybrid, rejected_snapshot_preserves_existing_file) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  const auto path =
+    (std::filesystem::temp_directory_path() / "nntr_kv_rejected_snapshot.bin")
+      .string();
+  const std::string original = "keep the previous snapshot";
+  const auto check_refused = [&](unsigned pos) {
+    {
+      std::ofstream file(path, std::ios::binary);
+      file << original;
+    }
+    EXPECT_THROW(m.save(path, pos), std::out_of_range);
+    std::ifstream file(path, std::ios::binary);
+    const std::string content((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+    EXPECT_EQ(content, original);
+  };
+  check_refused(3);
+  check_refused(9);
+  ASSERT_TRUE(m.compact(2));
+  check_refused(0); // The earlier rows have already been evicted.
+  EXPECT_EQ(m.getBase(0), 1u);
+  EXPECT_EQ(m.getBase(1), 1u);
+  std::filesystem::remove(path);
+}
+
+TEST(KVCacheManagerHybrid, valid_window_snapshot_round_trip) {
+  causallm::KVCacheManager m, restored;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  for (auto *cache : {&m, &restored})
+    cache->allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+                    ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+      for (unsigned i = 0; i < m.getRows(l) * 2; ++i)
+        t->getData<uint16_t>()[i] = 0x3c00u + l * 16u + i;
+  const auto path =
+    (std::filesystem::temp_directory_path() / "nntr_kv_window_round_trip.bin")
+      .string();
+  ASSERT_NO_THROW(m.validateSaveRange(2));
+  ASSERT_TRUE(m.compact(2));
+  ASSERT_NO_THROW(m.save(path, 2));
+  ASSERT_EQ(restored.load(path, 2), 2u);
+  for (unsigned l = 0; l < 2; ++l) {
+    EXPECT_EQ(restored.getBase(l), 1u);
+    for (unsigned i = 0; i < 2; ++i) {
+      EXPECT_EQ(restored.getKeyCache(l).getData<uint16_t>()[i],
+                m.getKeyCache(l).getData<uint16_t>()[i]);
+      EXPECT_EQ(restored.getValueCache(l).getData<uint16_t>()[i],
+                m.getValueCache(l).getData<uint16_t>()[i]);
+    }
+  }
+  std::filesystem::remove(path);
 }
 
 TEST(KVCacheManagerHybrid, dense_files_remain_compatible_in_both_directions) {

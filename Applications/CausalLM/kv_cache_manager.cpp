@@ -588,10 +588,6 @@ void KVCacheManager::foldDroppedRows(unsigned int l, unsigned int n_rows) {
   std::vector<uint16_t> mk(w, 0u), mv(w, 0u);
   for (auto [t, m] : {std::pair{&layer_caches_[l].key_cache, &mk},
                       std::pair{&layer_caches_[l].value_cache, &mv}}) {
-    const auto md = t->getMemoryData();
-    if (md && !md->isHostAddressable())
-      throw std::runtime_error("KVCacheManager::compact: a windowed layer's "
-                               "cache must be host addressable");
     for (unsigned int b = 0; b < batch_size_; ++b) {
       const uint16_t *d = t->getData<uint16_t>() + b * rows * w;
       uint16_t *mm = m->data();
@@ -609,7 +605,43 @@ void KVCacheManager::foldDroppedRows(unsigned int l, unsigned int n_rows) {
   }
 }
 
+void KVCacheManager::validateRange(unsigned int pos, bool compacting) const {
+  if (pos > max_seq_len_)
+    throw std::out_of_range("KVCacheManager: position exceeds max_seq_len");
+
+  for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
+    if (!isLayerActive(l) || !windowed(l) ||
+        (compacting && isLayerKVAliased(l)))
+      continue;
+    const unsigned int from = liveFrom(l, pos);
+    if (from < bases_[l] || pos - bases_[l] > getLayerCap(l))
+      throw std::out_of_range("KVCacheManager: layer " + std::to_string(l) +
+                              " does not hold rows [" + std::to_string(from) +
+                              ", " + std::to_string(pos) + ")");
+    if (compacting && from > bases_[l]) {
+      for (const auto *t :
+           {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
+        const auto md = t->getMemoryData();
+        if (md && !md->isHostAddressable())
+          throw std::runtime_error(
+            "KVCacheManager::compact: a windowed layer's "
+            "cache must be host addressable");
+      }
+    }
+  }
+}
+
+void KVCacheManager::validateSaveRange(unsigned int seq_len) const {
+  if (!isAllocated())
+    throw std::runtime_error("KVCacheManager::save: not allocated");
+  validateRange(seq_len, false);
+}
+
 bool KVCacheManager::compact(unsigned int pos) {
+  if (!isAllocated())
+    return false;
+  // Validate every layer before folding dropped rows or moving any buffer.
+  validateRange(pos, true);
   bool changed = false;
   for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
     if (!isLayerActive(l) || !windowed(l) || isLayerKVAliased(l))
@@ -624,10 +656,6 @@ bool KVCacheManager::compact(unsigned int pos) {
     foldDroppedRows(l, from - bases_[l]);
     for (auto *t :
          {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
-      const auto md = t->getMemoryData();
-      if (md && !md->isHostAddressable())
-        throw std::runtime_error("KVCacheManager::compact: a windowed layer's "
-                                 "cache must be host addressable");
       for (unsigned int b = 0; b < batch_size_; ++b) {
         // fp16 bits on every build (FP16 or UINT16 storage)
         uint16_t *d =
@@ -872,13 +900,7 @@ void KVCacheManager::save(const std::string &path) const {
 
 void KVCacheManager::save(const std::string &path, unsigned int seq_len,
                           const std::string &model_tag) const {
-  if (layer_caches_.empty()) {
-    throw std::runtime_error("KVCacheManager::save: not allocated");
-  }
-  if (seq_len > max_seq_len_) {
-    throw std::out_of_range(
-      "KVCacheManager::save: seq_len exceeds max_seq_len");
-  }
+  validateSaveRange(seq_len);
 
   std::ofstream f(path, std::ios::binary);
   if (!f.is_open()) {
@@ -942,11 +964,6 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len,
     size_t save_off = 0;
     if (windowed(li)) {
       const unsigned int from = liveFrom(li, seq_len);
-      if (from < bases_[li] || seq_len - bases_[li] > getLayerCap(li))
-        throw std::out_of_range("KVCacheManager::save: layer " +
-                                std::to_string(li) + " does not hold rows [" +
-                                std::to_string(from) + ", " +
-                                std::to_string(seq_len) + ")");
       save_off = static_cast<size_t>(from - bases_[li]) * kv_widths_[li];
     }
 

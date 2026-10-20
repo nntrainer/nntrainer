@@ -155,6 +155,14 @@ public:
   bool compact(unsigned int pos);
 
   /**
+   * @brief Validate a snapshot's position against the allocated cache ranges.
+   *        Does not change cache data, bases, calibration, or files. Call
+   * before compacting a cache for save().
+   * @param[in] seq_len absolute token position to save
+   */
+  void validateSaveRange(unsigned int seq_len) const;
+
+  /**
    * @brief [HTP window] |max| per column (the layer's kv width) of every K
    *        row compact() has dropped from the layer so far, as f32 of the
    *        fp16 bits; empty while nothing was dropped. The decode seed's
@@ -452,6 +460,9 @@ public:
   }
 
 private:
+  /** @brief Check all ranges before save or compaction changes any state. */
+  void validateRange(unsigned int pos, bool compacting) const;
+
   /**
    * @brief FNV-1a over the per-layer geometry vectors, so the header can refuse
    *        a file whose widths / ring capacities / alias map differ without
