@@ -397,9 +397,10 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
 }
 
 /**
- * @brief sfixed4 sidecar: packed signed-4bit nibbles (low nibble first, two's
- *        complement) with fp32 scales. Two scale layouts, keyed by the
- *        manifest's "quant-type":
+ * @brief Packed 4-bit sidecar with fp32 scales, low nibble first. sfixed4
+ *        uses signed two's-complement codes with symmetric scales; ufixed4
+ *        uses unsigned codes with a scale and zero point per group of 32.
+ *        The signed layouts are keyed by the manifest's "quant-type":
  *          - "per-row-symmetric" (default): ONE scale per row.
  *          - "per-row-per-block-symmetric": each row splits into equal-width
  *            blocks, one scale per (row, block) -- the folded per-layer table,
@@ -414,9 +415,10 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
  *        table) and parsing it would wreck init latency; when both are
  *        present the file wins.
  */
-std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
-                                              const nlohmann::json &json,
-                                              bool affine = false) {
+std::shared_ptr<QuantLut>
+loadPacked4BitManifest(const std::string &manifest_path,
+                       const nlohmann::json &json, bool affine = false) {
+  const char *datatype = affine ? "ufixed4" : "sfixed4";
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
@@ -429,15 +431,15 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
                                 : quant_type == "per-row-per-block-symmetric";
   NNTR_THROW_IF(!per_block && (affine || quant_type != "per-row-symmetric"),
                 std::runtime_error)
-    << "Malformed LUT manifest " << manifest_path
-    << ": unsupported sfixed4 quant-type '" << quant_type << "'";
+    << "Malformed LUT manifest " << manifest_path << ": unsupported "
+    << datatype << " quant-type '" << quant_type << "'";
 
   const bool has_scale_path = quant_param.contains("scale-path");
   NNTR_THROW_IF(!has_scale_path && (!quant_param.contains("scale") ||
                                     !quant_param.at("scale").is_array()),
                 std::runtime_error)
-    << "Malformed LUT manifest " << manifest_path
-    << ": sfixed4 expects quant-param.scale array or quant-param.scale-path";
+    << "Malformed LUT manifest " << manifest_path << ": " << datatype
+    << " expects quant-param.scale array or quant-param.scale-path";
 
   auto lut = std::make_shared<QuantLut>();
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
@@ -481,8 +483,8 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
       nblocks = derived;
     }
     NNTR_THROW_IF(nblocks == 0, std::runtime_error)
-      << "Malformed LUT manifest " << manifest_path
-      << ": per-row-per-block-symmetric needs scale-shape or size-per-layer";
+      << "Malformed LUT manifest " << manifest_path << ": " << quant_type
+      << " needs scale-shape or size-per-layer";
     NNTR_THROW_IF(lut->out_dim % nblocks != 0, std::invalid_argument)
       << "Malformed LUT manifest " << manifest_path << ": " << nblocks
       << " blocks must tile size " << lut->out_dim;
@@ -500,7 +502,7 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
       readBinaryFile(resolveLutPath(manifest_path, scale_path));
     NNTR_THROW_IF(scale_bytes.size() != expected_scales * sizeof(float),
                   std::runtime_error)
-      << "sfixed4 scale file size " << scale_bytes.size()
+      << datatype << " scale file size " << scale_bytes.size()
       << " does not match rows*blocks*4 (" << expected_scales * sizeof(float)
       << ") for " << manifest_path;
     lut->row_scales.resize(expected_scales);
@@ -509,21 +511,21 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     lut->row_scales.reserve(quant_param.at("scale").size());
     for (const auto &scale : quant_param.at("scale")) {
       NNTR_THROW_IF(!scale.is_number(), std::runtime_error)
-        << "Malformed LUT manifest " << manifest_path
-        << ": sfixed4 row scale must be numeric";
+        << "Malformed LUT manifest " << manifest_path << ": " << datatype
+        << " row scale must be numeric";
       lut->row_scales.push_back(scale.get<float>());
     }
   }
 
   NNTR_THROW_IF(lut->row_scales.size() != expected_scales,
                 std::invalid_argument)
-    << "sfixed4 scale count " << lut->row_scales.size()
+    << datatype << " scale count " << lut->row_scales.size()
     << " does not match rows*blocks (" << lut->in_dim << "*"
     << lut->sfixed4_blocks << ") for " << manifest_path;
   NNTR_THROW_IF(shape_rows != 0 && shape_rows != lut->in_dim,
                 std::invalid_argument)
-    << "sfixed4 scale-shape rows " << shape_rows << " does not match payload "
-    << lut->in_dim << " for " << manifest_path;
+    << datatype << " scale-shape rows " << shape_rows
+    << " does not match payload " << lut->in_dim << " for " << manifest_path;
 
   if (affine) {
     NNTR_THROW_IF(lut->out_dim / lut->sfixed4_blocks != 32,
@@ -670,9 +672,9 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   if (datatype == "ufixed8")
     return loadUfixed8Manifest(manifest_path, json);
   if (datatype == "sfixed4")
-    return loadSfixed4Manifest(manifest_path, json);
+    return loadPacked4BitManifest(manifest_path, json);
   if (datatype == "ufixed4")
-    return loadSfixed4Manifest(manifest_path, json, true);
+    return loadPacked4BitManifest(manifest_path, json, true);
   if (datatype == "q4_0")
     return loadGgmlManifest(manifest_path, json,
                             nntrainer::TensorDim::DataType::Q4_0);

@@ -25,6 +25,13 @@ struct HtpStaticEncoding {
   int zero_point;
 };
 
+/** @brief Only these graph weights consume a linear input encoding. */
+inline bool htpStaticLinearWeight(const std::string &name) {
+  static const std::regex pattern(
+    R"((layer[0-9]+_(qkv:(qweight|kweight|vweight)|post_attention_norm:weight|ffn:(gate|up|down)|sparse_moe:(gate|expert_gate_up_[0-9]+|expert_down_[0-9]+)))|output_of_causallm:weight)");
+  return std::regex_match(name, pattern);
+}
+
 /** @brief Convert either device sidecars or their logical-site provenance. */
 inline std::map<std::string, HtpStaticEncoding>
 parseHtpStaticLinear(const nlohmann::json &document, unsigned experts) {
@@ -36,8 +43,6 @@ parseHtpStaticLinear(const nlohmann::json &document, unsigned experts) {
     throw std::invalid_argument(
       "static activation encodings must be a nonempty object");
   const std::regex site_pattern(R"(model\.layers\.([0-9]+)\.(.+)/in)");
-  const std::regex weight_pattern(
-    R"((layer[0-9]+_(qkv:(qweight|kweight|vweight)|post_attention_norm:(weight|proj)|ffn:(gate|up|down)|sparse_moe:(gate|expert_gate_up_[0-9]+|expert_down_[0-9]+)))|output_of_causallm:weight)");
   const std::map<std::string, std::string> suffixes = {
     {"self_attn.q_proj", "qkv:qweight"},
     {"self_attn.k_proj", "qkv:kweight"},
@@ -86,7 +91,7 @@ parseHtpStaticLinear(const nlohmann::json &document, unsigned experts) {
       const auto pos = name.find(alias);
       if (pos != std::string::npos)
         name.replace(pos, alias.size(), "post_attention_norm:weight");
-      if (!std::regex_match(name, weight_pattern) ||
+      if (!htpStaticLinearWeight(name) ||
           !result.emplace(name, encoding).second)
         throw std::invalid_argument("unknown or duplicate static input " +
                                     name);
@@ -121,11 +126,5 @@ parseHtpStaticLinear(const nlohmann::json &document, unsigned experts) {
   return result;
 }
 
-/** @brief Only these graph weights consume a linear input encoding. */
-inline bool htpStaticLinearWeight(const std::string &name) {
-  static const std::regex pattern(
-    R"((layer[0-9]+_(qkv:(qweight|kweight|vweight)|post_attention_norm:weight|ffn:(gate|up|down)|sparse_moe:(gate|expert_gate_up_[0-9]+|expert_down_[0-9]+)))|output_of_causallm:weight)");
-  return std::regex_match(name, pattern);
-}
 } // namespace causallm
 #endif
