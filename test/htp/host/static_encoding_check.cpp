@@ -3,6 +3,7 @@
  * @file static_encoding_check.cpp
  * @brief Validate static grids, logical-to-physical mapping and QDQ ties.
  * @author Codex <noreply@openai.com>
+ * @bug See the repository issue tracker for known issues.
  */
 #include <cassert>
 #include <fstream>

@@ -2,6 +2,7 @@
 /** @file htp_static_quant.h
  * @brief Fixed unsigned activation QDQ with round-to-nearest-even.
  * @author NNTrainer contributors
+ * @bug See the repository issue tracker for known issues.
  */
 #ifndef NNTR_HTP_STATIC_QUANT_H
 #define NNTR_HTP_STATIC_QUANT_H

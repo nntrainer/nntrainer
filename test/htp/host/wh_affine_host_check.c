@@ -156,7 +156,7 @@ static void static_linear_cases(uint8_t *vtcm, uint32_t vtcm_size) {
                    HEXKL_MOE_FLAG_GEMV_FEED_SET) == 0);
         assert(!memcmp(want, got, (size_t)M * N * sizeof(float)));
         if (dense) {
-          /* Gemma's decode graph uses slot 1 for both the dense input and
+          /** Gemma's decode graph uses slot 1 for both the dense input and
            * output. Every chunk must still read the original input. */
           float in_place[ROWS * K];
           uint32_t chunk_rows[2 * ROWS], counts[] = {M, M};
@@ -166,7 +166,7 @@ static void static_linear_cases(uint8_t *vtcm, uint32_t vtcm_size) {
             chunk_rows[j] = j % M;
             chunk_weights[j] = 1.f;
           }
-          /* 28 KiB fits only 64 gate/up rows and 128 down rows beside
+          /** 28 KiB fits only 64 gate/up rows and 128 down rows beside
            * the weight/accumulator double buffers. Exercise both arena
            * limits, multiple row tiles and a one-row prefill tail. */
           const uint32_t budgets[][2] = {

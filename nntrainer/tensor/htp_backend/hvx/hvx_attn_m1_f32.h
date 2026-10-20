@@ -119,12 +119,12 @@ typedef struct {
    *  amax x HVX_ATTN_M1_Q8_MARGIN / 127), later rows are clamped. Half the
    *  cache bytes; not the fp16 spec any more -- the gate is the model's */
   uint32_t q8;
-  float *sk;          /**< [n_layers][n_kv][head_dim]: K's outliers are per
-                           dim, so per dim (folded into q all the same) */
-  float *sk_inv;      /**< 1 / sk, for the appends */
-  float *sv;          /**< [n_layers][n_kv][head_dim] */
-  float *sv_inv;      /**< 1 / sv, for the appends */
-  uint8_t *scaled;    /**< [n_layers] 1 once the layer's scales are set */
+  float *sk;       /**< [n_layers][n_kv][head_dim]: K's outliers are per
+                        dim, so per dim (folded into q all the same) */
+  float *sk_inv;   /**< 1 / sk, for the appends */
+  float *sv;       /**< [n_layers][n_kv][head_dim] */
+  float *sv_inv;   /**< 1 / sv, for the appends */
+  uint8_t *scaled; /**< [n_layers] 1 once the layer's scales are set */
   /** [#4428 window] |max| per (kv head, dim) of context rows the host's
    *  windowed cache dropped before the layer's seed
    *  (hvx_attn_m1_kv_amax_floor): the scales are over max(seed rows,
