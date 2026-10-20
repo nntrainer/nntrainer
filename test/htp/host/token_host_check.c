@@ -60,6 +60,8 @@
 #define SPIN_US 20000u
 
 static int g_fail;
+static int g_test_static;
+static unsigned g_static_calls;
 
 #define CHECK(cond, ...)                                                       \
   do {                                                                         \
@@ -149,6 +151,15 @@ int hexkl_mm_u8i4_moe_layer_run(
       /** the expert is what its gate_up's bytes say, not its handle: the
          pool check moves experts between handles */
       const uint32_t id = *(const uint32_t *)tbl->slots[h_gate_up[e]].wh_bytes;
+      if (g_test_static) {
+        const hexkl_weight_u8i4 *gu = &tbl->slots[h_gate_up[e]];
+        const hexkl_weight_u8i4 *dn = &tbl->slots[h_down[e]];
+        CHECK(gu->static_scale == (id / 10u + 1u) * .125f &&
+                gu->static_zp == 129 && dn->static_scale == (id + 1u) * .25f &&
+                dn->static_zp == 93,
+              "expert %u lost static grid after handle reuse", id);
+        ++g_static_calls;
+      }
       for (c = 0; c < N_out; ++c)
         y[c] +=
           row_weight[r] *
@@ -518,6 +529,11 @@ static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
     return AEE_EBADPARM;
   *h_gu = old_gu;
   *h_dn = old_dn;
+  if (g_test_static) {
+    // A rebind has no checkpoint encoding and may reuse another layer's slot.
+    g_tbl.slots[old_gu].static_scale = g_tbl.slots[old_dn].static_scale = 99.f;
+    g_tbl.slots[old_gu].static_zp = g_tbl.slots[old_dn].static_zp = -1;
+  }
   return AEE_SUCCESS;
 }
 
@@ -556,6 +572,21 @@ static void set_pool(session *s, pool_owner *o, uint32_t held) {
     CHECK(hexkl_graph_set_param(s->g, o->op[m], HTP_GRAPH_PARAM_EXPERTS, tab,
                                 2u * POOL_E) == 0,
           "pool table %u", m);
+    if (g_test_static) {
+      float grids[4u * POOL_E];
+      for (e = 0; e < POOL_E; ++e) {
+        grids[4u * e] = (m + 1u) * .125f;
+        grids[4u * e + 1u] = 129.f;
+        grids[4u * e + 2u] = (10u * m + e + 1u) * .25f;
+        grids[4u * e + 3u] = 93.f;
+      }
+      CHECK(hexkl_graph_set_param(s->g, o->op[m], HTP_GRAPH_PARAM_EXPERT_QUANT,
+                                  grids, 4u * POOL_E - 1u) == AEE_EBADPARM,
+            "reject incomplete expert grids");
+      CHECK(hexkl_graph_set_param(s->g, o->op[m], HTP_GRAPH_PARAM_EXPERT_QUANT,
+                                  grids, 4u * POOL_E) == 0,
+            "static pool table %u", m);
+    }
   }
 }
 
@@ -649,6 +680,8 @@ static void check_pool(const uint32_t *words, uint32_t n, int compact) {
   o.page = new_page();
   o.format = compact ? HTP_TL2_COMPACT_WEIGHT_BITS : 4u;
   compact_rebind_calls = 0u;
+  g_test_static = compact;
+  g_static_calls = 0;
   set_pool(&s, &o, 2u); /* experts 0 and 1 of each layer */
   memset(&st, 0, sizeof(st));
   g_moe_calls = 0;
@@ -672,6 +705,12 @@ static void check_pool(const uint32_t *words, uint32_t n, int compact) {
   }
   o.stop = 1;
   pthread_join(tho, NULL);
+  if (g_test_static) {
+    CHECK(g_static_calls > TOKENS, "static expert grids were not exercised");
+    printf("STATIC EXPERT GRIDS SURVIVE REBIND: %u calls, %u loads\n",
+           g_static_calls, o.loads);
+  }
+  g_test_static = 0;
   CHECK(compact_rebind_calls == (compact ? o.loads : 0u),
         "compact callback calls %u / loads %u", compact_rebind_calls, o.loads);
   CHECK(st.tokens == TOKENS, "pool tokens %u", st.tokens);

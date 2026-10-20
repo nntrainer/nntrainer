@@ -117,6 +117,7 @@ typedef struct {
   const float *post_res;
   const float *post_res_gamma;
   float post_res_eps, post_res_scale;
+  int static_applied; /**< Internal recursion guard for per-handle encodings. */
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

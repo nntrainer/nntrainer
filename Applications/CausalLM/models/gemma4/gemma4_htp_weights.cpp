@@ -10,9 +10,12 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <gemma4_htp_static_quant.h>
 #include <mutex>
 #include <set>
 
@@ -73,6 +76,29 @@ void Gemma4HtpTransformer::repack_weight() {
   // registered in graph order (conv in_proj between the MoE layers) the
   // arena stopped at 3584 MiB, 14 chunks, against the 3840 it reaches on
   // its own.
+  std::map<std::string, HtpStaticEncoding> static_weights;
+  std::string static_path = STATIC_ACTIVATION_FILE;
+  if (const char *path = std::getenv("NNTR_HTP_STATIC_LINEAR"))
+    static_path = path;
+  if (!static_path.empty()) {
+    std::filesystem::path path(static_path);
+    if (path.is_relative())
+      path = std::filesystem::path(WEIGHT_DIR) / path;
+    std::ifstream stream(path);
+    if (!stream)
+      throw std::runtime_error("Cannot open static activation file: " +
+                               path.string());
+    static_weights = parseHtpStaticLinear(json::parse(stream), NUM_EXPERTS);
+    if (MOE_ENGINE != "htp" || ATTN_PROJ_ENGINE != "htp" ||
+        FFN_ENGINE != "htp" || LMHEAD_ENGINE != "htp" ||
+        !MOE_HTP_LAYERS.empty() || !ATTN_PROJ_HTP_LAYERS.empty() ||
+        !FFN_HTP_LAYERS.empty() ||
+        (FC_LAYER_DTYPE != "QS4CX_WH" && FC_LAYER_DTYPE != "QS4CX_WH_AFFINE"))
+      throw std::invalid_argument(
+        "Static Gemma4 activation encodings require all linear ops on HTP with "
+        "WH FC/head weights");
+  }
+  size_t static_bound = 0;
   struct PendingFc {
     nntrainer::ComputeOps *ops;
     void *data;
@@ -129,12 +155,39 @@ void Gemma4HtpTransformer::repack_weight() {
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending,
-          &mha_pending, &cpu_weight_sources, &shared_heads, discard_sources](
+          &mha_pending, &cpu_weight_sources, &shared_heads, &static_weights,
+          &static_bound, discard_sources](
            ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       // forEachLayer hands out LayerNodes.
       auto *consumer = context.getComputeOps();
       for (auto *w : context.getWeights()) {
         auto &tensor = w->getVariableRef();
+        auto encoding = static_weights.find(w->getName());
+        if (!static_weights.empty() && htpStaticLinearWeight(w->getName()) &&
+            encoding == static_weights.end())
+          throw std::runtime_error("Missing static input encoding: " +
+                                   w->getName());
+        if (encoding != static_weights.end()) {
+          using DType = ml::train::TensorDim::DataType;
+          const auto dtype = tensor.getDataType();
+          const bool router =
+            w->getName().find("_sparse_moe:gate") != std::string::npos;
+          if (!(router && dtype == DType::FP32) && dtype != DType::QS4CX_WH &&
+              dtype != DType::QS4CX_WH_AFFINE && dtype != DType::QS2CX_WH &&
+              dtype != DType::TL2CX_WH)
+            throw std::invalid_argument(
+              "Static input requires WH weights or an FP32 router: " +
+              w->getName());
+          const auto &q = encoding->second;
+          const void *key = tensor.isVirtual()
+                              ? static_cast<const void *>(&tensor)
+                              : tensor.getData();
+          if (!consumer ||
+              !consumer->set_weight_static_quant(key, q.scale, q.zero_point))
+            throw std::runtime_error("Cannot attach static encoding: " +
+                                     w->getName());
+          ++static_bound;
+        }
         if (tensor.isVirtual())
           continue;
         // Only the bias-free untied head opts into this. Another CPU consumer
@@ -517,6 +570,14 @@ void Gemma4HtpTransformer::repack_weight() {
     // the FC call does (register_qs4cx_weight is the one-handle expert
     // form), so its call registers it: 64 rows, one row block, for every
     // weight but the warm-up one.
+    if (!static_weights.empty()) {
+      if (static_bound != static_weights.size())
+        throw std::runtime_error("Static weight names did not all match: " +
+                                 std::to_string(static_bound) + "/" +
+                                 std::to_string(static_weights.size()));
+      std::fprintf(stderr, "[HTP-STATIC] bound %zu weight inputs\n",
+                   static_bound);
+    }
     bool fc_warmed = false;
     for (const auto &p : fc_pending) {
       const bool qs4cx = p.scale != nullptr;
@@ -568,9 +629,10 @@ void Gemma4HtpTransformer::repack_weight() {
       const unsigned int M = 512;
       std::vector<float> act(static_cast<size_t>(M) * p.K, 0.0f);
       std::vector<float> out(static_cast<size_t>(M) * p.N, 0.0f);
-      p.ops->gemm_q4_0_dense_ffn_fp32(
-        p.up, p.gate, p.down, act.data(), out.data(), M, p.K, p.I, p.N, false,
-        nullptr, nullptr, 0.0f, p.up_s, p.gate_s, p.down_s);
+      p.ops->gemm_q4_0_dense_ffn_fp32(p.up, p.gate, p.down, act.data(),
+                                      out.data(), M, p.K, p.I, p.N,
+                                      !static_weights.empty(), nullptr, nullptr,
+                                      0.0f, p.up_s, p.gate_s, p.down_s);
       ml_logd("dense FFN HTP kernel warmed up at load (M=%u, K=%u, I=%u, N=%u)",
               M, p.K, p.I, p.N);
     }

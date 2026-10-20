@@ -47,6 +47,8 @@ public:
 protected:
   std::string ATTENTION_ENGINE, ATTENTION_KV_DTYPE;
   std::string FC_WH_FILE_NAME, FC_WH_FORMAT, WEIGHT_DIR;
+  /** Model-relative sidecar of fixed U8 linear input encodings. */
+  std::string STATIC_ACTIVATION_FILE;
   static json &sanitizeConfig(json &cfg);
   static json &sanitizeGenerationConfig(json &gen_cfg, const json &cfg);
 

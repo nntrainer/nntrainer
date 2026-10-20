@@ -68,9 +68,11 @@
 #if defined(__hexagon__)
 #include "hexkl_hadamard_f16.h"
 #endif
+#include "hvx_m1_ops_f32.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_scale_add_f32.h"
+#include "swiglu_det.h"
 
 /** Read into the existing ring tile. Native TL2 may use the exact bounded
  * reader; the fallback keeps the vendor API and its error reporting. */
@@ -705,6 +707,7 @@ typedef struct {
   uint32_t n_rows_b;
   /* the next block's requantization; gate NULL when there is none */
   float *gate; /**< [64 x inter] f32, VTCM */
+  const hexkl_weight_u8i4 *quant_weight;
   uint32_t rq_m_blk, inter, had_down;
   uint8_t *had_vb;
   float *rq_scale; /**< 64 each, the params the next down dequantizes with */
@@ -831,7 +834,10 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
 #endif
         if (!have_extrema)
         moe_rotate_rows(x, valid, c->inter, c->had_down);
-      if (have_extrema)
+      if (hexkl_weight_static_params(c->quant_weight, r1 - r0, c->rq_scale + r0,
+                                     c->rq_zp + r0)) {
+        /* static grid, after rotation */
+      } else if (have_extrema)
         hvx_quant_rows_u8_params_extrema(extrema, valid, r1 - r0,
                                          c->rq_scale + r0, c->rq_zp + r0);
       else if (c->had_down != 3u)
@@ -1046,8 +1052,10 @@ static void moe_tail_requant_unit(uint32_t n_units, uint32_t u, void *v) {
            sizeof(float) * (size_t)(m4 - t->m) * t->inter);
   }
   moe_rotate_rows(sh->gate_f32, t->m, t->inter, t->had_down);
-  hvx_quant_rows_u8_params(sh->gate_f32, t->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
-                           t->inter, sh->rq_scale, sh->rq_zp, NULL);
+  if (!hexkl_weight_static_params(t->d, HEXKL_HMX_INT8_BLOCK_N_ROW,
+                                  sh->rq_scale, sh->rq_zp))
+    hvx_quant_rows_u8_params(sh->gate_f32, t->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
+                             t->inter, sh->rq_scale, sh->rq_zp, NULL);
   hvx_quant_pack_u8_ah_rows(sh->gate_f32, NULL, 0u, m4, t->inter, sh->rq_scale,
                             sh->rq_zp, sh->mid_ah);
   moe_worker_probe_add(t0);
@@ -1567,8 +1575,13 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
        * left this branch unrotated, and decode's TL2 layers computed
        * against rotated down weights from an unrotated row). */
       moe_rotate_rows(e->gate_f32, 1u, c->inter, c->had_down);
-      hvx_quant_rows_u8_params_rm(e->gate_f32, 1u, 1u, c->inter, e->rq_scale,
-                                  e->rq_zp, e->mid_ah, NULL, 0.0f, NULL, NULL);
+      if (hexkl_weight_static_params(e->d, 1u, e->rq_scale, e->rq_zp))
+        hvx_quant_row_u8_rm(e->gate_f32, c->inter, e->rq_scale[0], e->rq_zp[0],
+                            e->mid_ah);
+      else
+        hvx_quant_rows_u8_params_rm(e->gate_f32, 1u, 1u, c->inter, e->rq_scale,
+                                    e->rq_zp, e->mid_ah, NULL, 0.0f, NULL,
+                                    NULL);
       hvx_tl2_prepare(e->mid_ah, c->inter, 0u, (c->inter + 23u) / 24u,
                       e->tl2_down);
       continue;
@@ -1579,8 +1592,10 @@ static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
              sizeof(float) * (size_t)(m4 - e->m) * c->inter);
     }
     moe_rotate_rows(e->gate_f32, e->m, c->inter, c->had_down);
-    hvx_quant_rows_u8_params(e->gate_f32, e->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
-                             c->inter, e->rq_scale, e->rq_zp, NULL);
+    if (!hexkl_weight_static_params(e->d, HEXKL_HMX_INT8_BLOCK_N_ROW,
+                                    e->rq_scale, e->rq_zp))
+      hvx_quant_rows_u8_params(e->gate_f32, e->m, HEXKL_HMX_INT8_BLOCK_N_ROW,
+                               c->inter, e->rq_scale, e->rq_zp, NULL);
     hvx_quant_pack_u8_ah_rows(e->gate_f32, NULL, 0u, m4, c->inter, e->rq_scale,
                               e->rq_zp, e->mid_ah);
     if (e->d->w_offset)
@@ -2087,6 +2102,7 @@ typedef struct {
   uint8_t *u8;
   uint32_t M, K, mode;
   float eps;
+  const hexkl_weight_u8i4 *static_weight;
 } moe_rotate_input_ctx;
 
 static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
@@ -2102,8 +2118,16 @@ static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
     const uint32_t *mask =
       g_moe_had_sign_in_n == c->K ? g_moe_had_sign_in : NULL;
     float extrema[2];
-    if (c->M > 1u && c->mode == 2u &&
-        !hvx_hadamard_signed_rows_extrema_f32(row, 1u, c->K, mask, extrema)) {
+    if (c->static_weight && c->static_weight->static_scale > 0.0f) {
+      if (c->mode)
+        (void)hvx_hadamard_signed_f32(row, c->K, c->mode, mask);
+      hexkl_weight_static_params(c->static_weight, 1, c->scale + m, c->zp + m);
+      if (c->u8)
+        hvx_quant_row_u8_rm(row, c->K, c->scale[m], c->zp[m],
+                            c->u8 + (size_t)m * c->K);
+    } else if (c->M > 1u && c->mode == 2u &&
+               !hvx_hadamard_signed_rows_extrema_f32(row, 1u, c->K, mask,
+                                                     extrema)) {
       hvx_quant_rows_u8_params_extrema(extrema, 1u, 1u, c->scale + m,
                                        c->zp + m);
       if (c->u8)
@@ -2117,6 +2141,132 @@ static void moe_rotate_input_worker(uint32_t threads, uint32_t id, void *v) {
                                   0.0f, NULL, NULL);
     }
   }
+}
+
+/** Decode executes on a queue thread without the HMX lock. Keep even the
+ * separate static gate/up projections on HVX there. */
+static int static_dense_fc(hexkl_weight_u8i4_table *tbl, uint8_t *vb,
+                           uint32_t vs, uint32_t co, uint32_t M, uint32_t K,
+                           uint32_t handle, const float *x, float *out,
+                           hvx_worker_pool *pool, hexkl_moe_scratch *scratch,
+                           uint32_t flags) {
+  if (M == 1u)
+    return hexkl_mm_u8i4_fc_m1_run(tbl, vb, vs, co, K, 1u, &handle, x, out,
+                                   pool, scratch, flags);
+  if (handle >= HEXKL_MM_U8I4_MAX_WEIGHTS)
+    return AEE_EBADPARM;
+  const hexkl_weight_u8i4 *w = &tbl->slots[handle];
+  if (!w->in_use || !K || w->K != K || !w->N ||
+      K % HEXKL_HMX_INT8_BLOCK_N_INNER || w->N % HEXKL_HMX_INT8_BLOCK_N_COL)
+    return AEE_EBADPARM;
+
+  /* The FC kernel keeps every padded input row in VTCM. These direct DSP
+   * calls bypass the host's fcMaxRows cap, so tile prefill to fit beside
+   * its weight double buffer and two accumulator tiles. Activation row
+   * bands are already aligned; only the weight region needs rounding. */
+  const uint32_t arena = vs < co ? vs : co;
+  const uint64_t weight_bytes = (uint64_t)(K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+                                (w->N / HEXKL_HMX_INT8_BLOCK_N_COL) *
+                                WEIGHT_TILE_BYTES_U8I4;
+  const uint64_t reserved =
+    ROUND_UP_SZ(2u * weight_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT) +
+    2u * ACC_TILE_BYTES;
+  if (reserved >= arena)
+    return AEE_ENOMEMORY;
+  uint32_t rows = (uint32_t)((arena - reserved) / K);
+  rows -= rows % HEXKL_HMX_INT8_BLOCK_N_ROW;
+  if (!rows)
+    return AEE_ENOMEMORY;
+  hexkl_mm_opts opts = {0};
+  opts.pool = pool;
+  for (uint32_t m0 = 0; m0 < M;) {
+    const uint32_t count = M - m0 < rows ? M - m0 : rows;
+    /* A one-row prefill tail still runs under the caller's HMX lock. */
+    const int rc = hexkl_mm_u8i4_layer_run(tbl, vb, vs, co, count, K, &handle,
+                                           1u, x + (size_t)m0 * K,
+                                           out + (size_t)m0 * w->N, &opts);
+    if (rc)
+      return rc;
+    m0 += count;
+  }
+  return AEE_SUCCESS;
+}
+
+static int static_dense_run(hexkl_weight_u8i4_table *tbl, uint8_t *vb,
+                            uint32_t vs, uint32_t co, uint32_t M, uint32_t K,
+                            uint32_t I, uint32_t N, uint32_t chunks,
+                            const uint32_t *gu, const uint32_t *dn,
+                            const float *x, float *out, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  float *normalized = NULL, *gate = NULL, *up = NULL, *down = NULL;
+  int rc = AEE_ENOMEMORY;
+  gate = malloc((size_t)M * I * sizeof(float));
+  up = malloc((size_t)M * I * sizeof(float));
+  down = malloc((size_t)M * N * sizeof(float));
+  if (!gate || !up || !down)
+    goto done;
+  /* Gemma's decode graph runs DENSE_FFN in place. Preserve all input rows
+   * before clearing the accumulator, and keep them through every chunk. */
+  if (scratch->pre_gamma || x == out) {
+    normalized = malloc((size_t)M * K * sizeof(float));
+    if (!normalized)
+      goto done;
+    if (scratch->pre_gamma)
+      for (uint32_t m = 0; m < M; ++m)
+        hvx_rmsnorm_row_f32(x + (size_t)m * K, normalized + (size_t)m * K,
+                            scratch->pre_gamma, K, scratch->pre_eps);
+    else
+      memcpy(normalized, x, (size_t)M * K * sizeof(float));
+    x = normalized;
+  }
+  memset(out, 0, (size_t)M * N * sizeof(float));
+  for (uint32_t c = 0; c < chunks; ++c) {
+    if (gu[c] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        dn[c] >= HEXKL_MM_U8I4_MAX_WEIGHTS) {
+      rc = AEE_EBADPARM;
+      goto done;
+    }
+    const hexkl_weight_u8i4 *w = &tbl->slots[gu[c]];
+    if (!w->static_gate_plus1 || !w->static_up_plus1 ||
+        w->static_gate_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        w->static_up_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS || w->K != K ||
+        w->N != 2u * I || tbl->slots[dn[c]].K != I ||
+        tbl->slots[dn[c]].N != N) {
+      rc = AEE_EBADSTATE;
+      goto done;
+    }
+    const uint32_t gh = w->static_gate_plus1 - 1, uh = w->static_up_plus1 - 1;
+    if (tbl->slots[gh].N != I || tbl->slots[uh].N != I) {
+      rc = AEE_EBADPARM;
+      goto done;
+    }
+    rc =
+      static_dense_fc(tbl, vb, vs, co, M, K, gh, x, gate, pool, scratch, flags);
+    if (rc)
+      goto done;
+    rc =
+      static_dense_fc(tbl, vb, vs, co, M, K, uh, x, up, pool, scratch, flags);
+    if (rc)
+      goto done;
+#if defined(__hexagon__)
+    hvx_geglu_f32(gate, up, gate, M * I);
+#else
+    for (size_t j = 0; j < (size_t)M * I; ++j)
+      gate[j] = geglu_det_one(gate[j], up[j]);
+#endif
+    rc = static_dense_fc(tbl, vb, vs, co, M, I, dn[c], gate, down, pool,
+                         scratch, flags);
+    if (rc)
+      goto done;
+    for (size_t j = 0; j < (size_t)M * N; ++j)
+      out[j] += down[j];
+  }
+done:
+  free(normalized);
+  free(gate);
+  free(up);
+  free(down);
+  return rc;
 }
 
 int hexkl_mm_u8i4_moe_layer_run(
@@ -2137,6 +2287,36 @@ int hexkl_mm_u8i4_moe_layer_run(
       n_experts == 0u) {
     return AEE_EBADPARM;
   }
+  if (h_gate_up[0] < HEXKL_MM_U8I4_MAX_WEIGHTS &&
+      tbl->slots[h_gate_up[0]].static_gate_plus1) {
+    if (!(flags & HEXKL_MOE_FLAG_GELU_TANH))
+      return AEE_EUNSUPPORTED;
+    for (uint32_t c = 0; c < n_experts; ++c) {
+      if (row_count[c] != M)
+        return AEE_EUNSUPPORTED;
+      for (uint32_t m = 0; m < M; ++m)
+        if (row_index[c * M + m] != m || row_weight[c * M + m] != 1.0f)
+          return AEE_EUNSUPPORTED;
+    }
+    return static_dense_run(tbl, vtcm_base, vtcm_size, config_off, M, K, inter,
+                            N_out, n_experts, h_gate_up, h_down, act_f32,
+                            out_f32, pool, scratch, flags);
+  }
+  const hexkl_weight_u8i4 *static_input = NULL;
+  for (uint32_t e = 0; e < n_experts; ++e)
+    if (row_count[e]) {
+      if (h_gate_up[e] >= HEXKL_MM_U8I4_MAX_WEIGHTS)
+        return AEE_EBADPARM;
+      const hexkl_weight_u8i4 *w = &tbl->slots[h_gate_up[e]];
+      if (static_input &&
+          (w->static_scale != static_input->static_scale ||
+           (w->static_scale > 0 && w->static_zp != static_input->static_zp)))
+        return AEE_EBADPARM; /* the gathered input grid is shared by experts */
+      static_input = w;
+    }
+  if (static_input && static_input->static_scale > 0 &&
+      (flags & HEXKL_MOE_FLAG_HAD_HMX))
+    return AEE_EUNSUPPORTED;
   const uint32_t act =
     (flags & HEXKL_MOE_FLAG_GELU_TANH) != 0u ? HVX_GLU_GELU_TANH : HVX_GLU_SILU;
 
@@ -2513,7 +2693,8 @@ int hexkl_mm_u8i4_moe_layer_run(
      a reused rotation skips: such a call rotates again (one HVX row, the
      same bytes) instead of carrying the row over. */
   if (!use_m1 || M != 1u || !had_up || pre_gamma != NULL || rotated == NULL ||
-      rotated->row == NULL || rotated->capacity < K || use_tl2) {
+      rotated->row == NULL || rotated->capacity < K || use_tl2 ||
+      (static_input && static_input->static_scale > 0)) {
     rotated = NULL;
   }
   const int reuse_rotated = rotated && rotated->valid &&
@@ -2819,7 +3000,8 @@ int hexkl_mm_u8i4_moe_layer_run(
                                 M,
                                 K,
                                 had_up == 3u ? 0u : had_up,
-                                scratch->pre_eps};
+                                scratch->pre_eps,
+                                static_input};
     if (had_up != 3u)
       hvx_worker_pool_run(gu0_async ? NULL : pool, moe_rotate_input_worker,
                           &ctx, M);
@@ -2831,6 +3013,23 @@ int hexkl_mm_u8i4_moe_layer_run(
       rotated->zp = zp_all[0];
       rotated->valid = 1u;
     }
+  } else if (static_input && static_input->static_scale > 0) {
+    moe_rotate_input_ctx ctx = {act_direct ? act_f32 : act_c,
+                                act_direct ? pre_gamma : NULL,
+                                act_c,
+                                act_direct ? pre_rows : NULL,
+                                scale_all,
+                                zp_all,
+                                use_tl2 ? act_ah : act_u8,
+                                M,
+                                K,
+                                0,
+                                scratch->pre_eps,
+                                static_input};
+    hvx_worker_pool_run(gu0_async ? NULL : pool, moe_rotate_input_worker, &ctx,
+                        M);
+    hexkl_weight_static_params(static_input, m_pad - M, scale_all + M,
+                               zp_all + M);
   } else {
     hvx_quant_rows_u8_params_rm(
       act_direct ? act_f32 : act_c, M, lfm_m1_setup ? 1u : m_pad, K, scale_all,
@@ -3597,6 +3796,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       memset(&rq0, 0, sizeof rq0);
       rq0.gate = gate;
+      rq0.quant_weight = &tbl->slots[h_down[blk.e]];
       rq0.rq_m_blk = blk.m_blk;
       rq0.inter = inter;
       rq0.had_down = had_down;
@@ -3748,6 +3948,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           moe_dn_ctx *q = fuse_dn_rq ? &dn_ctx[k] : &rq_ctx[n & 1u];
           q->nb = 0u;
           q->gate = gate;
+          q->quant_weight = &tbl->slots[h_down[blk.e]];
           q->rq_m_blk = blk.m_blk;
           q->inter = inter;
           q->had_down = had_down;
@@ -4156,6 +4357,23 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
     c.w[p] = w;
     c.t0[p + 1u] = c.t0[p] + w->N / HEXKL_HMX_INT8_BLOCK_N_COL;
   }
+  int fixed = 0;
+  for (uint32_t p = 0; p < n_parts; ++p)
+    fixed |= c.w[p]->static_scale > 0;
+  if (fixed && n_parts > 1) {
+    size_t offset = 0;
+    for (uint32_t p = 0; p < n_parts; ++p) {
+      if (!(c.w[p]->static_scale > 0))
+        return AEE_EBADSTATE;
+      int rc = hexkl_mm_u8i4_fc_m1_run(tbl, vtcm_base, vtcm_size, config_off, K,
+                                       1, h + p, act_f32, out_f32 + offset,
+                                       pool, scratch, flags);
+      if (rc)
+        return rc;
+      offset += c.w[p]->N;
+    }
+    return AEE_SUCCESS;
+  }
   c.n_parts = n_parts;
   c.n_tiles = c.t0[n_parts];
   /** The activation's one AH block and its row parameters (rows 1-3 repeat
@@ -4173,7 +4391,8 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
   uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_ah);
   float *scale = (float *)hexkl_moe_carve(&cur, sz_rq);
   int32_t *zp = (int32_t *)hexkl_moe_carve(&cur, sz_rq);
-  hvx_quant_rows_u8_params(act_f32, 1u, BR, K, scale, zp, NULL); /* 1 row */
+  if (!hexkl_weight_static_params(c.w[0], BR, scale, zp))
+    hvx_quant_rows_u8_params(act_f32, 1u, BR, K, scale, zp, NULL); /* 1 row */
   for (uint32_t r = 1; r < 4u; ++r) {
     scale[r] = scale[0];
     zp[r] = zp[0];

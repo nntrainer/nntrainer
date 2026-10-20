@@ -42,6 +42,8 @@
  */
 
 #include "hexkl_graph.h"
+#include "../htp_static_quant.h"
+#include <float.h>
 
 #include "../../attn_m1_det.h" /* nntrainer/tensor/ */
 
@@ -123,6 +125,25 @@ typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
    the token's one row each: a whole layer, or a set of a miss round's
    experts (@a extra = HEXKL_MOE_FLAG_ROWS_OUT: row i of out is expert
    ids[i]'s term alone). */
+static int graph_moe_static(const hexkl_graph *g, const htp_graph_op *op,
+                            const hexkl_graph_env *env, const uint32_t *h,
+                            const uint32_t *ids, uint32_t n) {
+  const float *grid = g->expert_quant[op - g->ops];
+  if (!grid)
+    return AEE_SUCCESS;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t e = ids[i], gu = h[e], dn = h[op->n_experts + e];
+    if (gu >= HEXKL_MM_U8I4_MAX_WEIGHTS || dn >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !env->tbl->slots[gu].in_use || !env->tbl->slots[dn].in_use)
+      return AEE_EBADPARM;
+    env->tbl->slots[gu].static_scale = grid[4u * e];
+    env->tbl->slots[gu].static_zp = (int32_t)grid[4u * e + 1u];
+    env->tbl->slots[dn].static_scale = grid[4u * e + 2u];
+    env->tbl->slots[dn].static_zp = (int32_t)grid[4u * e + 3u];
+  }
+  return AEE_SUCCESS;
+}
+
 static int graph_moe_run(hexkl_graph *g, const hexkl_graph_env *env,
                          const htp_graph_op *op, const uint32_t *h,
                          const uint32_t *ids, const float *w, uint32_t n,
@@ -135,6 +156,9 @@ static int graph_moe_run(hexkl_graph *g, const hexkl_graph_env *env,
   if (env->scratch == NULL) {
     return AEE_EBADPARM;
   }
+  const int fixed = graph_moe_static(g, op, env, h, ids, n);
+  if (fixed != AEE_SUCCESS)
+    return fixed;
   ++g->moe_calls;
   hexkl_moe_rotated_input *saved = env->scratch->rotated_input;
   env->scratch->rotated_input = &g->moe_rotated_input;
@@ -322,6 +346,9 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
   if (n_miss != 0u) {
     return graph_moe_miss(g, op, call, h, ids, r->row_weight, sum, in, out);
   }
+  const int fixed = graph_moe_static(g, op, env, h, ids, sum);
+  if (fixed != AEE_SUCCESS)
+    return fixed;
   ++g->moe_calls;
   ++g->moe_calls_1x;
   /** the table is the handle arrays: the kernel skips an expert with no
@@ -545,6 +572,10 @@ static void graph_router(hexkl_graph *g, const htp_graph_op *op,
                       &scale);
       graph_norm_keep(g, op, call, in, out, 0u, scale);
     }
+    if (g->router_quant[i][0] > 0.0f)
+      for (uint32_t k = 0; k < op->K; ++k)
+        out[k] = htp_static_qdq(out[k], g->router_quant[i][0],
+                                (int32_t)g->router_quant[i][1]);
     hvx_router_softmax_topk_owned_f32(
       out, (const hvx_router_sm_weights *)g->param[i], g->state[i] + op->K,
       op->top_k, out, sel, w, call->env->pool);
@@ -1099,6 +1130,7 @@ void hexkl_graph_free(hexkl_graph *g) {
     }
     free(g->state[i]);
     free(g->experts[i]);
+    free(g->expert_quant[i]);
   }
   free(g->rope_cs);
   free(g->moe_rows);
@@ -1225,6 +1257,32 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
   }
   if (which >= HTP_GRAPH_PARAM_N || data == NULL) {
     return AEE_EBADITEM;
+  }
+  if (which == HTP_GRAPH_PARAM_EXPERT_QUANT) {
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_MOE ||
+        n != 4u * g->ops[op].n_experts)
+      return AEE_EBADPARM;
+    for (uint32_t i = 0; i < n; i += 2u)
+      if (!(data[i] >= FLT_MIN && data[i] <= FLT_MAX / 255.0f) ||
+          !(data[i + 1] >= 0.0f && data[i + 1] <= 255.0f) ||
+          data[i + 1] != (int32_t)data[i + 1])
+        return AEE_EBADPARM;
+    if (!g->expert_quant[op]) {
+      g->expert_quant[op] = malloc(n * sizeof(float));
+      if (!g->expert_quant[op])
+        return AEE_ENOMEMORY;
+    }
+    memcpy(g->expert_quant[op], data, n * sizeof(float));
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_QUANT) {
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_ROUTER_TOPK ||
+        !g->ops[op].eps_bits || n != 2 ||
+        !(data[0] >= FLT_MIN && data[0] <= FLT_MAX / 255.0f) ||
+        !(data[1] >= 0.0f && data[1] <= 255.0f) || data[1] != (int32_t)data[1])
+      return AEE_EBADPARM;
+    memcpy(g->router_quant[op], data, 2 * sizeof(float));
+    return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_LM_BAN) {
     uint32_t i;

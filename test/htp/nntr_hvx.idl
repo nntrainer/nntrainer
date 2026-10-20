@@ -1499,4 +1499,9 @@ interface nntr_hvx : remote_handle64 {
    // HTP_ATTN_KV_CACHE_B. A shape off the cache's is AEE_EINVALIDFORMAT.
    AEEResult attn_m1_kv_amax_floor(in uint32 layer, in sequence<float> k_amax,
                                    in sequence<float> v_amax);
+   // Checkpoint U8 input grids, applied in prefill and decode. A dense
+   // gate/up pair can reference separately encoded handles (handle + 1).
+   AEEResult weight_set_static_quant(in sequence<uint32> handles,
+      in sequence<float> scales, in sequence<int32> zero_points,
+      in uint32 gate_plus1, in uint32 up_plus1);
 };

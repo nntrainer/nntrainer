@@ -704,6 +704,81 @@ static void fc_affine_worker(uint32_t n_threads, uint32_t i, void *v) {
   hvx_dq_tiles_rows_affine(n_threads, i, &job->rows, job->offset, job->sums);
 }
 
+static int static_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vb,
+                            uint32_t vs, uint32_t co, uint32_t M, uint32_t K,
+                            const uint32_t *handles, uint32_t count,
+                            const float *input, float *out,
+                            const hexkl_mm_opts *o) {
+  if (o->act_ah_prepacked)
+    return AEE_EUNSUPPORTED;
+  const uint32_t padded = (M + 63u) & ~63u;
+  float *scales = malloc(padded * sizeof(float));
+  int32_t *zps = malloc(padded * sizeof(int32_t));
+  float *normed = NULL;
+  int rc = AEE_SUCCESS;
+  if (!scales || !zps) {
+    rc = AEE_ENOMEMORY;
+    goto done;
+  }
+  if (o->pre_scratch) {
+    normed = malloc((size_t)M * K * sizeof(float));
+    if (!normed) {
+      rc = AEE_ENOMEMORY;
+      goto done;
+    }
+    for (uint32_t m = 0; m < M; ++m) {
+      if (o->act_u16) {
+        for (uint32_t k = 0; k < K; ++k) {
+          uint32_t h = k / o->act16_hd;
+          normed[(size_t)m * K + k] =
+            ((float)o->act_u16[(size_t)m * K + k] - o->act16_enc[2 * h + 1]) *
+            o->act16_enc[2 * h];
+        }
+      } else
+        hvx_rmsnorm_row_f32(input + (size_t)m * K, normed + (size_t)m * K,
+                            o->pre_gamma, K, o->pre_eps);
+    }
+    input = normed;
+  }
+  if (o->post_done)
+    *o->post_done = 0; /* caller runs post-norm/rope/residual */
+  size_t at = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const hexkl_weight_u8i4 *w = &tbl->slots[handles[i]];
+    hexkl_mm_opts one = *o;
+    one.static_applied = 1;
+    one.pre_scratch = NULL;
+    one.pre_gamma = NULL;
+    one.act_u16 = NULL;
+    one.post_done = NULL;
+    one.post_res = NULL;
+    one.post_gamma = NULL;
+    one.rope_handles = 0;
+    one.post_chunk = NULL;
+    if (hexkl_weight_static_params(w, padded, scales, zps)) {
+      one.act_scale = scales;
+      one.act_zp = zps;
+    } else {
+      rc = AEE_EBADSTATE;
+      break;
+    }
+    if (o->out_off) {
+      one.out_off = o->out_off + i;
+      one.out_ld = o->out_ld + i;
+    }
+    rc = hexkl_mm_u8i4_layer_run(tbl, vb, vs, co, M, K, handles + i, 1, input,
+                                 o->out_off ? out : out + at, &one);
+    if (rc)
+      break;
+    at += (size_t)M * w->N;
+  }
+done:
+  free(normed);
+  free(scales);
+  free(zps);
+  return rc;
+}
+
 int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
@@ -754,6 +829,19 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         return AEE_EBADPARM;
       }
     }
+  }
+
+  if (!o->static_applied) {
+    int fixed = 0;
+    for (uint32_t i = 0; i < n_handles; ++i) {
+      if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+          !tbl->slots[handles[i]].in_use)
+        return AEE_EBADPARM;
+      fixed |= tbl->slots[handles[i]].static_scale > 0.0f;
+    }
+    if (fixed)
+      return static_layer_run(tbl, vtcm_base, vtcm_size, config_off, M, K,
+                              handles, n_handles, act_f32, out_cat, o);
   }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);

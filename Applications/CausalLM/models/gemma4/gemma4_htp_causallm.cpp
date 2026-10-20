@@ -250,6 +250,9 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
     if (nntr_cfg.contains(key))
       setEnvDefault(env, nntr_cfg.at(key).get<std::string>());
 
+  STATIC_ACTIVATION_FILE =
+    nntr_cfg.value("static_activation_file", std::string());
+
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
   LMHEAD_ENGINE = nntr_cfg.value("lmhead_engine", std::string("cpu"));
   ATTN_PROJ_HTP_LAYERS =
