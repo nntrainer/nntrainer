@@ -48,11 +48,18 @@
 
 %endif # 0%{tizen_version_major}%{tizen_version_minor} >= 65
 
-%define enable_fp16 0
-### nntrainer fp16 implementation relies on NEON, which requires armv8.2-a
+### Float16 support. Off by default; enable from gbs: --define "enable_fp16 1"
+### (1/0 or true/false). nntrainer fp16 relies on NEON, which needs armv8.2-a
 ### armv7l Tizen: do not support fp16 neon.
-### aarch64 Tizen: uses armv8.0a. no fp16 neon.
+### aarch64 Tizen: uses armv8.0a by default; enable_fp16 builds armv8.2-a+fp16.
 ### x86/x64 Tizen: it has gcc9. x86 requires gcc >= 12 for fp16
+%{!?enable_fp16:%global enable_fp16 0}
+%if "%{enable_fp16}" == "true"
+%global enable_fp16 1
+%endif
+%if "%{enable_fp16}" == "false"
+%global enable_fp16 0
+%endif
 
 ## Float16 support
 %if 0%{?enable_fp16}
@@ -64,12 +71,20 @@
 ## ARM base ISA and per-extension ISA toggles.
 ## meson composes the -march flag from arm-arch + each extension toggle, so
 ## every option below can be turned on/off individually from gbs, e.g.:
-##   gbs build --define "arm_arch armv8-a"       # base ISA: armv7-a / armv8-a / armv8.2-a
+##   gbs build --define "arm_arch armv8.2-a"     # base ISA: armv7-a / armv8-a / armv8.2-a
 ##   gbs build --define "enable_sve true"        # extensions take true / false
+## Extension toggles take only true / false (meson rejects 1 / 0), unlike
+## enable_fp16 above, which also takes 1 / 0.
 ## Only options given via --define are passed; defaults live in meson_options.txt
 ## (arm-arch=auto: armv8.2-a+dotprod+i8mm on aarch64, armv7-a+neon on armv7l).
-## @todo Tizen optflags -march is placed after meson's -march and wins, so
-## these toggles don't change the compiled ISA until optflags -march is stripped.
+## Giving any of these (or enable_fp16) strips optflags -march/-mcpu/-mfpu so
+## meson's -march takes effect. Otherwise the optflags ISA is kept (aarch64:
+## armv8-a, armv7l: armv7-a+neon), so the default package runs on armv8.0.
+## Any single define (e.g. only enable_neon) also moves the unset options to
+## the meson defaults, so the aarch64 package then needs dotprod+i8mm.
+## aarch64 always adds +dotprod+i8mm, even with arm_arch armv8-a, so no
+## define gives an armv8.0 build until per-extension source selection lands.
+%define arm_isa_custom %{?arm_arch:1}%{?enable_neon:1}%{?enable_dotprod:1}%{?enable_i8mm:1}%{?enable_fp16fml:1}%{?enable_sve:1}%{?enable_sve2:1}%{?enable_sme:1}%{?enable_sme2:1}
 %define arm_isa_support %{?arm_arch:-Darm-arch=%{arm_arch}} %{?enable_neon:-Denable-neon=%{enable_neon}} %{?enable_dotprod:-Denable-dotprod=%{enable_dotprod}} %{?enable_i8mm:-Denable-i8mm=%{enable_i8mm}} %{?enable_fp16fml:-Denable-fp16fml=%{enable_fp16fml}} %{?enable_sve:-Denable-sve=%{enable_sve}} %{?enable_sve2:-Denable-sve2=%{enable_sve2}} %{?enable_sme:-Denable-sme=%{enable_sme}} %{?enable_sme2:-Denable-sme2=%{enable_sme2}}
 
 
@@ -434,11 +449,14 @@ export CFLAGS+=" -fprofile-arcs -ftest-coverage"
 export CXXFLAGS+=" -fprofile-arcs -ftest-coverage"
 %endif
 
-# Tizen optflags carry their own -march, which overrides meson's project args
-# @todo drop once optflags -march is stripped and meson owns the ISA flags
-%if 0%{?enable_fp16}
-export CFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
-export CXXFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
+# Tizen optflags carry -march/-mcpu/-mfpu, which come after meson's project
+# args and win. Strip them when an ISA option is given so meson composes the
+# ISA flags. Subprojects and meson probes then build at the toolchain default.
+%ifarch %arm aarch64
+%if 0%{arm_isa_custom} || 0%{?enable_fp16}
+CFLAGS=`echo $CFLAGS | sed -E "s/(^|[[:space:]])-m(arch|cpu|fpu)=[^[:space:]]*/\\1/g"`
+CXXFLAGS=`echo $CXXFLAGS | sed -E "s/(^|[[:space:]])-m(arch|cpu|fpu)=[^[:space:]]*/\\1/g"`
+%endif
 %endif
 
 # Add backward competibility for tizen < 6
@@ -664,10 +682,18 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/hgemm_common.h
 %{_includedir}/nntrainer/hgemm_kernel.h
 %{_includedir}/nntrainer/hgemm_util.h
-%{_includedir}/nntrainer/hgemm_noTrans.h
-%{_includedir}/nntrainer/hgemm_transA.h
-%{_includedir}/nntrainer/hgemm_transAB.h
-%{_includedir}/nntrainer/hgemm_transB.h
+%{_includedir}/nntrainer/hgemm_pack.h
+%{_includedir}/nntrainer/hgemm_padding.h
+%{_includedir}/nntrainer/hgemm_padding_a.h
+%{_includedir}/nntrainer/hgemm_padding_b.h
+%{_includedir}/nntrainer/mask_neon.h
+%{_includedir}/nntrainer/matrix_transpose_kernels_neon.h
+%{_includedir}/nntrainer/kai_lhs_quant_pack_qai8dxp_f16_neon.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f16_qai8dxp_qsi4cxp_interface.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f16_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f16_qai8dxp1x8_qsi4cxp4x8_1x4_neon_dotprod.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f16_qai8dxp4x4_qsi4cxp4x4_16x4_neon_dotprod.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_16x4_neon_i8mm.h
 %endif
 %endif
 %ifarch %arm
