@@ -22,7 +22,7 @@ if get_option('enable-blas')
 endif
 
 arch = host_machine.cpu_family()
-if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
+if arm_target != ''
     subdir('arm')
     nntrainer_inc += include_directories('arm')
     nntrainer_inc_abs += meson.current_source_dir() / 'arm'
