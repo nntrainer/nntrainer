@@ -219,6 +219,32 @@ int main(void) {
   }
   assert(nntr_hvx_close(session) == AEE_SUCCESS);
 #endif
+
+#ifndef NNTR_HADAMARD_DEVICE
+  /* Independent Paley-I definition: first input block positive, remaining
+   * input blocks negative relative to SpinQuant H^T. */
+  for (uint32_t width = 704u; width <= 2816u; width *= 4u) {
+    const uint32_t rows = 3u, len = rows * width;
+    float input[3 * 2816], output[3 * 2816];
+    for (uint32_t j = 0; j < len; ++j)
+      input[j] = sinf((float)j * .17f);
+    memcpy(output, input, len * sizeof(float));
+    assert(hvx_hadamard_rows_f32(output, rows, width, 4u) == 0);
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t i = 0; i < width; ++i) {
+        double sum = 0;
+        for (uint32_t j = 0; j < width; ++j)
+          sum += (j < width / 44u ? 1 : -1) * coefficient(i, j, width / 44u) *
+                 (double)input[r * width + j];
+        assert(fabs(output[r * width + i] - sum / sqrt((double)width)) < 1e-5);
+      }
+  }
+  {
+    float row[32] = {1};
+    assert(hvx_hadamard_rows_f32(row, 1, 32, 4u) == -1);
+    assert(row[0] == 1);
+  }
+#endif
   puts("HADAMARD CHECK OK");
   return 0;
 }

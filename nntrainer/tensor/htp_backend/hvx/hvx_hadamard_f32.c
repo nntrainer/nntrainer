@@ -469,9 +469,38 @@ hadamard_hvx(float *x, uint32_t n, uint32_t p, uint32_t pair,
 }
 #endif
 
+/** Preserve the first H44 block and negate the remaining input blocks. */
+static void hadamard_paley_prepare(float *x, uint32_t n) {
+  uint32_t i = n / 44u;
+#if defined(__hexagon__)
+  if (!((uintptr_t)x & 127u)) {
+    const HVX_Vector sign = Q6_V_vsplat_R((int32_t)0x80000000u);
+    const uint32_t first = i & ~31u;
+    if (i != first) {
+      const HVX_VectorPred keep = Q6_Q_vsetq_R((int)((i - first) * 4u));
+      const HVX_Vector mask = Q6_V_vmux_QVV(keep, Q6_V_vzero(), sign);
+      *(HVX_Vector *)(x + first) =
+        Q6_V_vxor_VV(*(const HVX_Vector *)(x + first), mask);
+      i = first + 32u;
+    }
+    for (; n - i >= 32u; i += 32u)
+      *(HVX_Vector *)(x + i) = Q6_V_vxor_VV(*(const HVX_Vector *)(x + i), sign);
+  }
+#endif
+  for (; i < n; ++i)
+    x[i] = -x[i];
+}
+
 int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
-  if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u))
+  if (!x || !hvx_hadamard_supported(n) ||
+      (mode == 4u && n != 2816u && n != 704u) ||
+      (mode != 1u && mode != 2u && mode != 4u))
     return -1;
+  /* Paley-I H = diag(1,-1,...,-1) * SpinQuant H^T. */
+  if (mode == 4u) {
+    hadamard_paley_prepare(x, n);
+    mode = 2u;
+  }
   if (n == 1536u) {
 #if defined(__hexagon__)
     if (mode == 2u && !((uintptr_t)x & 127u))
@@ -503,9 +532,17 @@ int hvx_hadamard_f32(float *x, uint32_t n, uint32_t mode) {
 }
 
 int hvx_hadamard_rows_f32(float *x, uint32_t rows, uint32_t n, uint32_t mode) {
-  if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u) ||
+  if (!x || !hvx_hadamard_supported(n) ||
+      (mode == 4u && n != 2816u && n != 704u) ||
+      (mode != 1u && mode != 2u && mode != 4u) ||
       rows > SIZE_MAX / sizeof(float) / n)
     return -1;
+  if (mode == 4u) {
+    for (uint32_t r = 0; r < rows; ++r)
+      hadamard_paley_prepare(x + (size_t)r * n, n);
+    /* The prepared rows use the existing two-row H704 kernel unchanged. */
+    mode = 2u;
+  }
   uint32_t m = 0u;
 #if defined(__hexagon__)
   if (mode == 2u && n == 704u && !((uintptr_t)x & 127u))
@@ -560,7 +597,9 @@ int hvx_hadamard_signed_rows_f32(float *x, uint32_t rows, uint32_t n,
                                  uint32_t mode, const uint32_t *mask) {
   if (!mask)
     return hvx_hadamard_rows_f32(x, rows, n, mode);
-  if (!x || !hvx_hadamard_supported(n) || (mode != 1u && mode != 2u) ||
+  if (!x || !hvx_hadamard_supported(n) ||
+      (mode == 4u && n != 2816u && n != 704u) ||
+      (mode != 1u && mode != 2u && mode != 4u) ||
       rows > SIZE_MAX / sizeof(float) / n)
     return -1;
 #if defined(__hexagon__)

@@ -2193,9 +2193,10 @@ int hexkl_mm_u8i4_moe_layer_run(
 #else
   (void)had_signs;
 #endif
-  const uint32_t had_mode = (flags & HEXKL_MOE_FLAG_HAD_SCALAR) ? 1u
-                            : use_had_hmx                       ? 3u
-                                                                : 2u;
+  const uint32_t had_mode = (flags & HEXKL_MOE_FLAG_HAD_PALEY_I)  ? 4u
+                            : (flags & HEXKL_MOE_FLAG_HAD_SCALAR) ? 1u
+                            : use_had_hmx                         ? 3u
+                                                                  : 2u;
   const uint32_t had_up = (flags & HEXKL_MOE_FLAG_HAD_UP) ? had_mode : 0u;
   const uint32_t had_down = (flags & HEXKL_MOE_FLAG_HAD_DOWN) ? had_mode : 0u;
   if ((had_up && !hvx_hadamard_supported(K)) ||

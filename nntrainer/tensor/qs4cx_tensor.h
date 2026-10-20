@@ -476,11 +476,11 @@ bool int4DropPlainOn(ml::train::TensorDim::DataType dt);
  *    needs it to correct for the activation zero point and recomputing it
  *    from the packed nibbles costs about 20 seconds across this model.
  *
- * So the only layout difference is the extra N floats, which is why getData
- * and getScale are inherited unchanged. Nothing on the CPU can read this
- * tensor: the layout is the accelerator's, and a CPU kernel handed one would
- * compute a wrong answer rather than fail, so loading a model with these
- * weights commits it to the HTP path.
+ * WH records have no legacy QS4CX row padding: scales immediately follow
+ * the nibble tiles, followed by the extra N column sums. Nothing on the CPU
+ * can read this tensor: the layout is the accelerator's, and a CPU kernel
+ * handed one would compute a wrong answer rather than fail, so loading a
+ * model with these weights commits it to the HTP path.
  */
 class QS4CX_WH_Tensor : public QS4CX_Tensor {
 public:
@@ -515,11 +515,19 @@ public:
 
   /**
    * @copydoc Tensor::size()
-   * @note The nibble half matches QS4CX exactly; the extra N floats are the
-   *       column sums.
+   * @note WH uses unpadded nibble tiles followed by N scales and N column sums.
    */
   size_t size() const override {
-    return QS4CX_Tensor::size() + width() * sizeof(float);
+    // WH is a whole-tile format, independent of legacy QS4CX row padding.
+    return height() * width() / 2 + 2 * width() * sizeof(float);
+  }
+
+  /** @brief WH scales immediately follow the 32x32 nibble tiles. */
+  void *getScale() const override {
+    if (!data)
+      return nullptr;
+    data->validate();
+    return static_cast<int8_t *>(getData()) + height() * width() / 2;
   }
 
   /**

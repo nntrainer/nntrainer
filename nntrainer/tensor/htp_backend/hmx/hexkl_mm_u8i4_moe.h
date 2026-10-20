@@ -503,19 +503,21 @@ int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
 /** The rotation selectors together: a caller whose weights were never
  * rotated (the dense FFN's chunks, PR 4428) clears them from the session's
  * flags before the MoE kernel. */
+/** Paley-I checkpoint basis: negate blocks 1..43 before SpinQuant rotation. */
+#define HEXKL_MOE_FLAG_HAD_PALEY_I 0x80000000u
 #define HEXKL_MOE_FLAG_HAD_MASK                                                \
-  (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |                           \
-   HEXKL_MOE_FLAG_HAD_SCALAR | HEXKL_MOE_FLAG_HAD_HMX |                        \
-   HEXKL_MOE_FLAG_HAD_2BIT_ONLY)
+  (HEXKL_MOE_FLAG_HAD_PALEY_I | HEXKL_MOE_FLAG_HAD_UP |                        \
+   HEXKL_MOE_FLAG_HAD_DOWN | HEXKL_MOE_FLAG_HAD_SCALAR |                       \
+   HEXKL_MOE_FLAG_HAD_HMX | HEXKL_MOE_FLAG_HAD_2BIT_ONLY)
 
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
-  (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN |                           \
-   HEXKL_MOE_FLAG_HAD_SCALAR | HEXKL_MOE_FLAG_HAD_HMX |                        \
-   HEXKL_MOE_FLAG_HAD_2BIT_ONLY | HEXKL_MOE_FLAG_M1_GEMV |                     \
-   HEXKL_MOE_FLAG_GEMV_LEAD_SET | HEXKL_MOE_FLAG_GEMV_ROWS1_SET |              \
-   HEXKL_MOE_FLAG_GEMV_FEED_SET |                                              \
+  (HEXKL_MOE_FLAG_HAD_PALEY_I | HEXKL_MOE_FLAG_HAD_UP |                        \
+   HEXKL_MOE_FLAG_HAD_DOWN | HEXKL_MOE_FLAG_HAD_SCALAR |                       \
+   HEXKL_MOE_FLAG_HAD_HMX | HEXKL_MOE_FLAG_HAD_2BIT_ONLY |                     \
+   HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_LEAD_SET |                     \
+   HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
    HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH |                      \

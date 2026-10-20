@@ -109,10 +109,11 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
 #define HTP_MOE_FLAG_HAD_SCALAR 0x10000000u
 #define HTP_MOE_FLAG_HAD_HMX 0x20000000u
 #define HTP_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
-#define HTP_MOE_FLAG_HAD_MASK 0x7c000000u
+#define HTP_MOE_FLAG_HAD_PALEY_I 0x80000000u
+#define HTP_MOE_FLAG_HAD_MASK 0xfc000000u
 
 /** NNTR_MOE_HADAMARD: unset/off, up, down, both, both_scalar,
- * up_hmx, down_hmx, both_hmx. HMX uses full-width FP16 on prefill;
+ * up_hmx, down_hmx, both_hmx, both_paley. HMX uses full-width FP16 on prefill;
  * calls of at most four tokens and HVX expert tails keep FP32.
  * Invalid values leave the output untouched and fail instead of silently
  * benchmarking the baseline. */
@@ -125,6 +126,9 @@ static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
     *bits = HTP_MOE_FLAG_HAD_DOWN;
   else if (strcmp(env, "both") == 0)
     *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN;
+  else if (strcmp(env, "both_paley") == 0)
+    *bits =
+      HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_PALEY_I;
   else if (strcmp(env, "both_scalar") == 0)
     *bits =
       HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_SCALAR;

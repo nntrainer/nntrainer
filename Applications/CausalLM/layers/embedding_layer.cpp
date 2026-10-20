@@ -143,6 +143,8 @@ const char *lutDatatypeName(const QuantLut &lut) {
   }
   if (lut.is_raw_u16)
     return "raw-uint16";
+  if (lut.is_affine4)
+    return "ufixed4";
   return lut.is_signed4 ? "sfixed4" : "ufixed8";
 }
 
@@ -413,7 +415,8 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
  *        present the file wins.
  */
 std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
-                                              const nlohmann::json &json) {
+                                              const nlohmann::json &json,
+                                              bool affine = false) {
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
@@ -422,8 +425,9 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     json.contains("quant-type")
       ? requireJsonStringField(json, "quant-type", manifest_path)
       : std::string("per-row-symmetric");
-  const bool per_block = quant_type == "per-row-per-block-symmetric";
-  NNTR_THROW_IF(!per_block && quant_type != "per-row-symmetric",
+  const bool per_block = affine ? quant_type == "per-row-per-block-asymmetric"
+                                : quant_type == "per-row-per-block-symmetric";
+  NNTR_THROW_IF(!per_block && (affine || quant_type != "per-row-symmetric"),
                 std::runtime_error)
     << "Malformed LUT manifest " << manifest_path
     << ": unsupported sfixed4 quant-type '" << quant_type << "'";
@@ -438,7 +442,13 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
   auto lut = std::make_shared<QuantLut>();
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
   lut->is_raw_u16 = false;
-  lut->is_signed4 = true;
+  lut->is_signed4 = !affine;
+  lut->is_affine4 = affine;
+  lut->round_bf16 = json.value("round-bf16", false);
+  lut->bf16_scale_output = json.value("bf16-scale-output", false);
+  NNTR_THROW_IF(lut->bf16_scale_output && (!affine || !lut->round_bf16),
+                std::invalid_argument)
+    << "bf16-scale-output requires affine4 with round-bf16";
 
   // Per-block geometry. A block boundary MAY fall inside a nibble byte (each
   // nibble resolves its own column, unlike the QS4CX group decode), so no
@@ -514,6 +524,25 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
                 std::invalid_argument)
     << "sfixed4 scale-shape rows " << shape_rows << " does not match payload "
     << lut->in_dim << " for " << manifest_path;
+
+  if (affine) {
+    NNTR_THROW_IF(lut->out_dim / lut->sfixed4_blocks != 32,
+                  std::invalid_argument)
+      << "ufixed4 requires 32 values per group";
+    const auto zero_path =
+      requireJsonStringField(quant_param, "zero-point-path", manifest_path);
+    lut->group_zero_points =
+      readBinaryFile(resolveLutPath(manifest_path, zero_path));
+    NNTR_THROW_IF(lut->group_zero_points.size() != expected_scales,
+                  std::invalid_argument)
+      << "ufixed4 zero-point count must match rows*groups";
+    for (size_t i = 0; i < expected_scales; ++i) {
+      NNTR_THROW_IF(!std::isfinite(lut->row_scales[i]) ||
+                      lut->row_scales[i] <= 0 || lut->group_zero_points[i] > 15,
+                    std::invalid_argument)
+        << "ufixed4 requires positive finite scales and zero points in [0,15]";
+    }
+  }
 
   return lut;
 }
@@ -642,6 +671,8 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
     return loadUfixed8Manifest(manifest_path, json);
   if (datatype == "sfixed4")
     return loadSfixed4Manifest(manifest_path, json);
+  if (datatype == "ufixed4")
+    return loadSfixed4Manifest(manifest_path, json, true);
   if (datatype == "q4_0")
     return loadGgmlManifest(manifest_path, json,
                             nntrainer::TensorDim::DataType::Q4_0);
@@ -653,7 +684,7 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << " (expected ufixed8, sfixed4, q4_0, q6_k, or qs4cx)";
+    << " (expected ufixed8, ufixed4, sfixed4, q4_0, q6_k, or qs4cx)";
   return nullptr;
 }
 
@@ -729,6 +760,17 @@ void validateDecodeArgs(const QuantLut &lut, size_t token_idx,
     << lut.out_dim;
 }
 
+/// Round to BF16 with ties to even, retaining FP32 storage.
+float roundToBf16(float value) {
+  if (!std::isfinite(value))
+    return value;
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
 /// Decodes one packed-4-bit row, calling emit(col, value) for every column in
 /// order. The per-element overhead the old per-nibble helper paid on every
 /// value is hoisted: the scale-count check runs once per row (it is also
@@ -744,6 +786,25 @@ void forEachPacked4BitValue(const QuantLut &lut, size_t token_idx,
 
   const size_t bytes_per_row = lut.out_dim / 2;
   const uint8_t *row = lut.data() + token_idx * bytes_per_row;
+
+  if (lut.is_affine4) {
+    if (lut.bf16_scale_output)
+      layer_scale = roundToBf16(layer_scale);
+    const size_t base = token_idx * lut.sfixed4_blocks;
+    for (size_t col = 0; col < lut.out_dim; ++col) {
+      const size_t group = base + col / 32;
+      const int code = (row[col / 2] >> ((col % 2) * 4)) & 15;
+      float value = (code - static_cast<int>(lut.group_zero_points[group])) *
+                    lut.row_scales[group];
+      if (lut.round_bf16)
+        value = roundToBf16(value);
+      value *= layer_scale;
+      if (lut.bf16_scale_output)
+        value = roundToBf16(value);
+      emit(col, value);
+    }
+    return;
+  }
 
   if (lut.is_signed4) {
     NNTR_THROW_IF(lut.row_scales.size() != lut.in_dim * lut.sfixed4_blocks,
