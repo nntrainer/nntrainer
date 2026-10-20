@@ -221,7 +221,7 @@ int main(void) {
 #endif
 
 #ifndef NNTR_HADAMARD_DEVICE
-  /* Independent Paley-I definition: first input block positive, remaining
+  /** Independent Paley-I definition: first input block positive, remaining
    * input blocks negative relative to SpinQuant H^T. */
   for (uint32_t width = 704u; width <= 2816u; width *= 4u) {
     const uint32_t rows = 3u, len = rows * width;

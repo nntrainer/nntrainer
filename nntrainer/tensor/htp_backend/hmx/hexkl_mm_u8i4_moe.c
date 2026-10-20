@@ -2160,7 +2160,7 @@ static int static_dense_fc(hexkl_weight_u8i4_table *tbl, uint8_t *vb,
       K % HEXKL_HMX_INT8_BLOCK_N_INNER || w->N % HEXKL_HMX_INT8_BLOCK_N_COL)
     return AEE_EBADPARM;
 
-  /* The FC kernel keeps every padded input row in VTCM. These direct DSP
+  /** The FC kernel keeps every padded input row in VTCM. These direct DSP
    * calls bypass the host's fcMaxRows cap, so tile prefill to fit beside
    * its weight double buffer and two accumulator tiles. Activation row
    * bands are already aligned; only the weight region needs rounding. */
@@ -2205,7 +2205,7 @@ static int static_dense_run(hexkl_weight_u8i4_table *tbl, uint8_t *vb,
   down = malloc((size_t)M * N * sizeof(float));
   if (!gate || !up || !down)
     goto done;
-  /* Gemma's decode graph runs DENSE_FFN in place. Preserve all input rows
+  /** Gemma's decode graph runs DENSE_FFN in place. Preserve all input rows
    * before clearing the accumulator, and keep them through every chunk. */
   if (scratch->pre_gamma || x == out) {
     normalized = malloc((size_t)M * K * sizeof(float));

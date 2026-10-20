@@ -3,6 +3,7 @@
  * @file gemma4_htp_static_quant.h
  * @brief Checkpoint supplied U8 input encodings for Gemma4 HTP linear ops.
  * @author Codex <noreply@openai.com>
+ * @bug See the repository issue tracker for known issues.
  */
 #ifndef GEMMA4_HTP_STATIC_QUANT_H
 #define GEMMA4_HTP_STATIC_QUANT_H
