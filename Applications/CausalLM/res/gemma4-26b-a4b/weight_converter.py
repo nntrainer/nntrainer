@@ -43,6 +43,8 @@ REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO / "tools"))
 from convert_gemma4_fc_wh import pack as pack_wh, recover as recover_wh  # noqa: E402
 MODEL_FILE = "nntr_gemma4_26b_a4b_tl2_rotated.bin"
+ACT_ENCODINGS = "p0-linear8-mse-asym-safe16-boundaries.encodings.json"
+ACT_TABLE_FILE = "act_scales.json"
 STAGE0_FILE = "nntr_gemma4_26b_a4b_qs2_stage0.bin"
 PALETTE = bytes((0xff, 0x00, 0x01, 0x01))  # QS2CX_WH codes 0, 1, 2 -> -1, 0, +1
 COPIED = ("config.json", "tokenizer.json", "tokenizer_config.json",
@@ -64,6 +66,26 @@ STAGE0_CONFIG = {
 def sha256(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def act_scale_table(source):
+    """Static 8-bit linear-input scales: one (scale, offset) per site, the
+    '<module>/in' sites of the prefill graph (the generation graph repeats them),
+    sorted by name. None when the checkpoint has no encodings file."""
+    path = source / ACT_ENCODINGS
+    if not path.is_file():
+        return None
+    graph = json.loads(path.read_text())["graphs"]["prefill"]
+    sites = []
+    for name in sorted(graph):
+        if not name.endswith("/in"):
+            continue
+        enc = graph[name]["encodings"]
+        if len(enc) != 1 or enc[0]["bitwidth"] != 8 or enc[0]["is_symmetric"] != "False":
+            continue  # 16-bit boundaries stay out of the table
+        sites.append({"name": name, "scale": float(enc[0]["scale"]),
+                      "offset": int(enc[0]["offset"])})
+    return sites
 
 
 class Checkpoint:
@@ -408,6 +430,20 @@ def main():
     nntr_config = json.loads((output / "nntr_config.json").read_text())
     nntr_config.update(model_file_name=MODEL_FILE, moe_hadamard=meta["rotation_mode"],
                        moe_hadamard_scope="all", moe_hadamard_signs="rotation_signs.json")
+    table = act_scale_table(source)
+    if table:
+        # Tail of the binary: float32 scale, int32 offset per site. The loader
+        # reads the weights ahead of it and ignores the tail; the HTP runtime
+        # reads it only with htp_act_quant "static" (default "dynamic").
+        size = (output / MODEL_FILE).stat().st_size
+        with (output / MODEL_FILE).open("ab") as stream:
+            for site in table:
+                stream.write(struct.pack("<fi", site["scale"], site["offset"]))
+        (output / ACT_TABLE_FILE).write_text(json.dumps(
+            {"format": "nntr_act_scales_v1", "source": ACT_ENCODINGS,
+             "record": "<float32 scale, int32 offset>", "sites": table}, indent=1) + "\n")
+        nntr_config.update(act_scale_offset=size, act_scale_bytes=8 * len(table),
+                           act_scale_sites=len(table), act_scale_json=ACT_TABLE_FILE)
     (output / "nntr_config.json").write_text(json.dumps(nntr_config, indent=2) + "\n")
     extra = global_attention_keys(config, ckpt)
     if extra.keys() - config.keys():
