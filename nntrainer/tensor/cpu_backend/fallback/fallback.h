@@ -1075,6 +1075,18 @@ float dot_q6_K_f32(const unsigned int K, const void *v_q6_K, const float *f);
 size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights);
 /**
+ * @brief quantize_q8_0 function
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* to store quantized data
+ * @param nrow number of rows in src
+ * @param n_per_row number of elements in each row of src
+ * @param quant_weights unused for now -> imatrix
+ * @return size_t size of total quantized data in bytes
+ */
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+/**
  * @brief quantize_q4_K function
  *
  * @param src float* to quantize
@@ -1115,6 +1127,15 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  * @param k number of elements in x
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
+
+/**
+ * @brief dequantize row of q8_0 data to float
+ *
+ * @param x input to be dequantized from q8_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x
+ */
+void dequantize_row_q8_0(const void *x, float *y, int64_t k);
 
 /**
  * @brief dequantize row of q6_K data to float
@@ -1194,6 +1215,33 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
  * @param N number of columns
  */
 void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
+                 const unsigned int M, const unsigned int N);
+
+/**
+ * @brief repack q8_0 rows to q8_0x4, the layout the Q8_0 GEMM kernels use
+ *
+ * Every 4 rows are interleaved block by block: the 4 fp16 scales come first,
+ * then bytes 8k..8k+7 of row r go to qs[32k + 8r].
+ *
+ * @param dst output q8_0x4
+ * @param src input q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q8_0x4 to q8_0 rows - inverse of repack_q8_0
+ *
+ * @param src input q8_0x4
+ * @param dst output q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
                  const unsigned int M, const unsigned int N);
 
 /**
