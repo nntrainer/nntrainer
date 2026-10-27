@@ -60,6 +60,9 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../xgrammar/include \
     $(LOCAL_PATH)/../xgrammar/3rdparty/picojson \
     $(LOCAL_PATH)/../xgrammar/3rdparty/dlpack/include \
+    $(LOCAL_PATH)/../models/siglip2 \
+    $(LOCAL_PATH)/../models/bert_decoder \
+    $(LOCAL_PATH)/../models/screenai_caption \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/utils \

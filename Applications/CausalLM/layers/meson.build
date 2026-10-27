@@ -4,6 +4,9 @@
 causallm_layer_inc_abs = [meson.current_source_dir(), meson.current_source_dir() / '..']
 causallm_layer_inc = [include_directories('.'), include_directories('..')]
 
+causallm_layer_inc_abs = causallm_layer_inc_abs
+causallm_layer_inc = causallm_layer_inc
+
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
 causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp']
 causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d_layer.cpp']
@@ -17,6 +20,9 @@ causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_atte
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
 causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
+causallm_rtmcc_gau_src_abs = [meson.current_source_dir() / 'rtmcc_gau.cpp']
+causallm_rtmcc_head_src_abs = [meson.current_source_dir() / 'rtmcc_head.cpp']
+causallm_xi_pooling_src_abs = [meson.current_source_dir() / 'xi_pooling.cpp']
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
@@ -60,6 +66,31 @@ causallm_causal_conv1d_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+causallm_rtmcc_gau = shared_library(
+    'rtmcc_gau_layer',
+    causallm_rtmcc_gau_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_rtmcc_gau_dep = declare_dependency(
+    link_with: causallm_rtmcc_gau,
+    include_directories: causallm_layer_inc
+)
+
+causallm_rtmcc_head = shared_library(
+    'rtmcc_head_layer',
+    causallm_rtmcc_head_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_rtmcc_head_dep = declare_dependency(
+    link_with: causallm_rtmcc_head,
+    include_directories: causallm_layer_inc
+)
 
 
 causallm_mha_core = shared_library(
@@ -198,5 +229,18 @@ causallm_custom_multiply_layer = shared_library(
 
 causallm_custom_multiply_dep = declare_dependency(
     link_with: causallm_custom_multiply_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_xi_pooling = shared_library(
+    'xi_pooling_layer',
+    causallm_xi_pooling_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_xi_pooling_dep = declare_dependency(
+    link_with: causallm_xi_pooling,
     include_directories: causallm_layer_inc
 )

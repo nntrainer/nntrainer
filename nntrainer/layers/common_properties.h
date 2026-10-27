@@ -503,6 +503,19 @@ public:
 };
 
 /**
+ * @brief Groups property for grouped convolution.
+ *        Input and output channels are split into `groups` independent groups.
+ *        groups=1 (the default when unset) is a regular conv;
+ * groups=in_channels is a depthwise conv. Left empty by default so it is not
+ * serialized for ordinary (groups=1) convolutions.
+ */
+class ConvGroups : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "groups"; /**< unique key to access */
+  using prop_tag = uint_prop_tag;              /**< property type */
+};
+
+/**
  * @brief KernelSize property, kernel size is used to measure the filter size
  *
  */

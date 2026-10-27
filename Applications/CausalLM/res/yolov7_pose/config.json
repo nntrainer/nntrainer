@@ -1,0 +1,8 @@
+{
+  "architectures": ["YOLOv7ReIDtiny"],
+  "model_type": "yolov7_reid_tiny",
+  "img_size": 320,
+  "nkpt": 87,
+  "embed_dim": 128,
+  "widen_factor": 1.5
+}

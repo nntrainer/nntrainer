@@ -59,7 +59,17 @@
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "siglip2/siglip2_vision_encoder.h"
 #include "timm_vit/timm_vit_transformer.h"
+#if !defined(_WIN32) && !defined(__ANDROID__)
+#include "ced/ced_transformer.h"
+#endif
+#include "FastViTKeyword/fastvit_keyword_model.h"
+#include "YOLOv7Pose/yolov7_pose.h"
+#if !defined(_WIN32)
+#include "bert_decoder/bert_decoder.h"
+#include "screenai_caption/screenai_caption.h"
+#endif
 
 namespace causallm {
 
@@ -213,6 +223,46 @@ void registerAllModels() {
         return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
                                                         nntr_cfg);
       });
+#if !defined(_WIN32) && !defined(__ANDROID__)
+    causallm::Factory::Instance().registerModel(
+      "CedForAudioClassification",
+      [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::CedTransformer>(cfg, generation_cfg,
+                                                          nntr_cfg);
+      });
+#endif
+    causallm::Factory::Instance().registerModel(
+      "YOLOv7ReIDtiny", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Yolov7Pose>(cfg, generation_cfg,
+                                                      nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "FastViTKeyword", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::FastViTKeywordModel>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "Siglip2VisionEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Siglip2VisionEncoder>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+#if !defined(_WIN32)
+    causallm::Factory::Instance().registerModel(
+      "BertDecoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+        // BertDecoder hardcodes its dimensions; tensor dtypes come from
+        // nntr_config (FP32 for the source model).
+        auto dec = std::make_unique<causallm::BertDecoder>();
+        dec->setTensorTypes(nntr_cfg.value("model_tensor_type", "FP32-FP32"),
+                            nntr_cfg.value("fc_layer_dtype", "FP32"),
+                            nntr_cfg.value("embedding_dtype", "FP32"));
+        return dec;
+      });
+    causallm::Factory::Instance().registerModel(
+      "ScreenAICaption", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::ScreenAICaption>(cfg, generation_cfg,
+                                                           nntr_cfg);
+      });
+#endif
   });
 }
 

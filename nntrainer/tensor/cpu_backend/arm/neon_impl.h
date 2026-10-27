@@ -521,6 +521,21 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 void gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
+ * @brief FP16-storage exact-erf GELU, vectorized (NEON).
+ *
+ * Same piecewise polynomial as gelu_v2 but on FP16 buffers (load FP16x4,
+ * widen to FP32x4 for the polynomial, narrow back on store). The N%4 scalar
+ * tail uses exact std::erf. Used by ActiFunc::gelu for FP16 (W8A16) tensors.
+ *
+ * @param N number of elements in X
+ * @param X _FP16 * for Vector X (input, FP16 storage)
+ * @param Y _FP16 * for Vector Y (output, FP16 storage)
+ */
+#ifdef ENABLE_FP16
+void gelu_v2_fp16(const unsigned int N, const _FP16 *X, _FP16 *Y);
+#endif
+
+/**
  * @brief tanh_gelu function with neon but as
  * Y = X / (1 + exp(-pi/4*(X + 0.04
  *      4715X^3)) with multiplication with loop unrolling x4

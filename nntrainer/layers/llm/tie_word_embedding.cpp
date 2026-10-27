@@ -307,6 +307,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   if (!(weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
+        weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0 ||
         weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K ||
         weight.getDataType() == nntrainer::TensorDim::DataType::FP32))
     throw std::invalid_argument(
@@ -377,7 +378,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 
       const auto wt = weight.getDataType();
       if (wt == nntrainer::TensorDim::DataType::Q6_K ||
-          wt == nntrainer::TensorDim::DataType::Q4_0) {
+          wt == nntrainer::TensorDim::DataType::Q4_0 ||
+          wt == nntrainer::TensorDim::DataType::Q8_0) {
         // dequantize_row_q{6_K,4_0} ALWAYS writes out_dim FP32 values. The
         // destination out_tensor is FP16 in an FP16-activation run, so writing
         // FP32 directly would overrun the buffer 2x and corrupt every value
@@ -389,6 +391,13 @@ void TieWordEmbedding::incremental_forwarding_embedding(
           nntrainer::dequantize_row_q6_K(
             (void *)((char *)weight.getData<uint8_t>() +
                      (210 * num_blocks_per_row) * embed_idx),
+            tmp.data(), out_dim);
+        } else if (wt == nntrainer::TensorDim::DataType::Q8_0) {
+          // block_q8_0 is 34 bytes: one fp16 scale + 32 int8 quants.
+          int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+          nntrainer::dequantize_row_q8_0(
+            (void *)((char *)weight.getData<uint8_t>() +
+                     (34 * num_blocks_per_row) * embed_idx),
             tmp.data(), out_dim);
         } else {
           int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
@@ -557,18 +566,25 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
                   std::invalid_argument)
       << "weight type is not supported for custom tie word embedding layer";
 
-    if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-      ///@note Q4_0 tensor dot does not support trans_in=true for the
-      /// embedding-shaped tied weight, so compute each vocab row explicitly.
+    if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
+        weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+      ///@note The Q4_0 / Q8_0 tensor dot does not support trans_in=true for
+      /// the embedding-shaped tied weight, so compute each vocab row
+      /// explicitly: logits[v] = dot(input, dequant(weight_row_v)).
+      const bool is_q8 =
+        weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0;
       const unsigned int hidden_size = input_step.width();
       const unsigned int vocab_size = weight.height();
       NNTR_THROW_IF(weight.width() != hidden_size ||
                       hidden_step.width() != vocab_size,
                     std::invalid_argument)
-        << "Q4_0 tie word embedding lmhead has mismatched dimensions";
+        << (is_q8 ? "Q8_0" : "Q4_0")
+        << " tie word embedding lmhead has mismatched dimensions";
 
       const unsigned int num_blocks_per_row = (hidden_size + 32 - 1) / 32;
-      const size_t row_size = sizeof(uint16_t) + 16;
+      // block_q4_0 = fp16 scale + 16 nibble bytes; block_q8_0 = fp16 scale +
+      // 32 int8 quants.
+      const size_t row_size = sizeof(uint16_t) + (is_q8 ? 32 : 16);
       const size_t row_stride = row_size * num_blocks_per_row;
       const uint8_t *weight_data = weight.getData<uint8_t>();
       // dtype-aware I/O: the hidden (input_step) and logits (hidden_step) are
@@ -607,9 +623,14 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         std::vector<float> dequant_row(hidden_size);
 
         for (unsigned int row = start; row < end; ++row) {
-          nntrainer::dequantize_row_q4_0(
-            static_cast<const void *>(weight_data + row_stride * row),
-            dequant_row.data(), hidden_size);
+          if (is_q8)
+            nntrainer::dequantize_row_q8_0(
+              static_cast<const void *>(weight_data + row_stride * row),
+              dequant_row.data(), hidden_size);
+          else
+            nntrainer::dequantize_row_q4_0(
+              static_cast<const void *>(weight_data + row_stride * row),
+              dequant_row.data(), hidden_size);
           const float val =
             nntrainer::sdot(hidden_size, input_data, 1, dequant_row.data(), 1);
 #ifdef ENABLE_FP16

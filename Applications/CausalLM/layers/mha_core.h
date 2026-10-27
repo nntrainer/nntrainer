@@ -169,6 +169,43 @@ public:
 };
 
 /**
+ * @brief CrossAttention property
+ * @note When true, the layer runs in static read-only cross-attention mode:
+ *       inputs 3/4 (cache_key/cache_value) are treated as a fully-populated
+ *       encoder K/V cache of @c enc_len rows; the query (input 0) attends
+ *       over ALL @c enc_len cached rows, inputs 1/2 (K/V) are NOT written
+ *       into the cache, and cache_index is NOT advanced. Only meaningful in
+ *       external-cache (5-input) mode. Default false so existing
+ *       self-attention callers see byte-identical behaviour.
+ */
+class CrossAttention : public nntrainer::Property<bool> {
+public:
+  CrossAttention(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "cross_attention";                       /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
+/**
+ * @brief AttnFp32Accum property
+ * @note On an ENABLE_FP16 Android build an FP32-activation model normally
+ *       narrows Q/K/V to fp16 and runs the all-fp16 NEON attention kernels
+ *       (fp16 accumulation). When true, the fp32 Q/K/V are passed through as
+ *       on desktop: the kernels read the fp16-stored cache converted to fp32
+ *       and accumulate in fp32, matching the desktop result bit for bit at the
+ *       cost of the fp16 kernels' speed. Used by the ScreenAI encoder/decoder,
+ *       whose caption token parity breaks under fp16 accumulation. Default
+ *       false keeps every existing model on its current path.
+ */
+class AttnFp32Accum : public nntrainer::Property<bool> {
+public:
+  AttnFp32Accum(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "attn_fp32_accum";                       /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
+/**
  * @brief UseGemmAttention property
  * @note  Optional GEMM-based attention path for the non-causal (encoder) case.
  *        QK and AV are computed with (s)gemm per head instead of the per-row
@@ -513,7 +550,7 @@ private:
     props::RopePartialRotaryFactor, props::RopeScalingMaxPositionEmbeddings,
     props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention,
     props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope,
-    props::KvWindowRing>
+    props::KvWindowRing, props::CrossAttention, props::AttnFp32Accum>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -583,6 +620,15 @@ private:
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool use_gemm_attention = false;
+  /**
+   * @brief static read-only cross-attention mode. See props::CrossAttention.
+   *        Default false; guards every cross-attn change so self-attention
+   *        callers are unaffected.
+   */
+  bool cross_attention = false;
+  /** @brief fp32-accumulating attention for FP32-activation models on an
+   *         ENABLE_FP16 Android build. See props::AttnFp32Accum. */
+  bool attn_fp32_accum = false;
 
   /**
    * @brief Adreno image-attention path (paper §3.7/§3.8). gpu_native runs

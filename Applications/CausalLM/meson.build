@@ -38,6 +38,9 @@ causallm_src = [
     # compiled into libcausallm exactly once so every consumer .so (the api lib
     # and the optional model plugin) shares a single Factory (see factory.h).
     meson.current_source_dir() / 'factory.cpp',
+    # FastViTKeyword's attention layer is referenced by model_registry.cpp
+    # (FastViTKeywordModel registers it), so it lives in libcausallm itself.
+    meson.current_source_dir() / 'models/FastViTKeyword/jni/fastvit_attention_layer.cpp',
 ]
 
 executable_src = [
@@ -65,12 +68,15 @@ causallm_layer_dependencies += [
     # qkv_layer is a core nntrainer layer
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
-    causallm_causal_conv1d_dep,
-    causallm_custom_multiply_dep,
     causallm_deberta_attention_layer_dep,
     causallm_shared_fully_connected_layer_dep,
     causallm_per_layer_slice_dep,
+    causallm_causal_conv1d_dep,
+    causallm_custom_multiply_dep,
     # scalar_multiply and logit_softcapping are core nntrainer layers
+    causallm_rtmcc_gau_dep,
+    causallm_rtmcc_head_dep,
+    causallm_xi_pooling_dep,
 ]
 
 # Additive CUDA backend: the model TUs (transformer/causal_lm/gemma4) include
@@ -357,9 +363,13 @@ quantize_src = [
 
 e_quantize = executable('nntr_quantize',
     quantize_src,
-    include_directories: causallm_inc,
+    include_directories: [causallm_inc, causallm_layer_inc,
+        include_directories('models/YOLOv7Pose'),
+        include_directories('models/FastViTKeyword'),
+        include_directories('models/FastViTKeyword/jni')],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
+
 
 
 safetensors_info_src = [

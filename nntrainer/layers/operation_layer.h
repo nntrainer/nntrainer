@@ -14,6 +14,8 @@
 #define __LAYER_OPERATION_H__
 #ifdef __cplusplus
 
+#include <fstream>
+
 #include <layer_context.h>
 #include <layer_devel.h>
 
@@ -40,6 +42,37 @@ public:
 
     const Tensor input = context.getInput(0);
     forwarding_operation(input, hidden_);
+
+    // Dump one named layer's real output (from inside the untruncated
+    // production forward pass), for external bisection. Mirrors the
+    // NNTR_DUMP_LAYER hooks in conv2d_layer.cpp/addition_layer.cpp/
+    // concat_layer.cpp/etc; needed here (rather than in forwarding_operation)
+    // since only this base-class forwarding() has the layer's name.
+    if (const char *dl = std::getenv("NNTR_DUMP_LAYER");
+        dl && context.getName() == dl) {
+      const char *dp = std::getenv("NNTR_DUMP_PATH");
+      if (dp) {
+        std::vector<float> buf(hidden_.size());
+        if (hidden_.getDataType() == ml::train::TensorDim::DataType::QINT8) {
+          const int8_t *q = hidden_.getData<int8_t>();
+          const float sc = hidden_.getScale<float>()[0];
+          static const bool perch_asym_env =
+            std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+            std::getenv("NNTR_W8A8_SYM") == nullptr;
+          constexpr float kActOff = 0.27846455f;
+          for (size_t i = 0; i < hidden_.size(); ++i)
+            buf[i] = perch_asym_env ? ((float)q[i] + 128.f) * sc - kActOff
+                                    : sc * (float)q[i];
+        } else if (hidden_.getDataType() ==
+                   ml::train::TensorDim::DataType::FP32) {
+          const float *d = hidden_.getData<float>();
+          std::copy(d, d + hidden_.size(), buf.begin());
+        }
+        std::ofstream of(dp, std::ios::binary);
+        of.write(reinterpret_cast<const char *>(buf.data()),
+                 buf.size() * sizeof(float));
+      }
+    }
   }
 
   /**

@@ -15,12 +15,24 @@ subdir('qwen3_moe')
 subdir('qwen3_slim_moe')
 subdir('gemma2')
 subdir('gemma3')
+subdir('siglip2')
 subdir('gemma4')
 subdir('timm_vit')
+subdir('ced')
 subdir('lfm2')
+subdir('YOLOv7/jni')
+subdir('YOLOv7Pose/jni')
+subdir('FastViTKeyword/jni')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('xlm_roberta')
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
+    subdir('screenai_caption')
+    subdir('bert_decoder')
+endif
+
+# YOLOv11 inference harness
+if get_option('enable-app')
+    subdir('YOLOv11/jni')
 endif

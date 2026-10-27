@@ -17,6 +17,7 @@
 
 #include <cfloat>
 #include <common.h>
+#include <conv_indirect.h>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -513,6 +514,19 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
  */
 void gelu_v2(const unsigned int N, const float *X, float *Y);
 
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-storage exact-erf GELU (x86: scalar fallback). Used by
+ * ActiFunc::gelu for FP16 (W8A16) tensors. ARM provides the NEON vectorized
+ * version; x86 delegates to __fallback_gelu_v2.
+ *
+ * @param N number of elements in X
+ * @param X _FP16 * for Vector X (input, FP16 storage)
+ * @param Y _FP16 * for Vector Y (output, FP16 storage)
+ */
+void gelu_v2_fp16(const unsigned int N, const _FP16 *X, _FP16 *Y);
+#endif
+
 /**
  * @brief tanh_gelu function with neon but as
  * X = Y / (1 + exp(-pi/4*(Y
@@ -891,10 +905,66 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
 
+/**
+ * @brief q8_0 GEMM (scalar fallback for now; SIMD path TBD).
+ *        See cpu_backend.h gemm_q8_0 for semantics.
+ */
+template <typename T = float>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const T *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, T *C, const unsigned int ldc);
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldc);
+/**
+ * @brief q4_0 conv GEMM with fused im2col gather (ARM-only path). On x86 this
+ * throws NYI; callers gate on supports_gemm_q4_0_indirect_conv_fp32().
+ */
+void gemm_q4_0_indirect_conv(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *in,
+                             const ConvGatherParams &geom, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc);
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-activation q4_0 conv GEMM (ARM-only path). On x86 this throws
+ * NYI; callers gate on supports_gemm_q4_0_indirect_conv_fp16().
+ */
+void gemm_q4_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+/**
+ * @brief Q8_0-activation q4_0 conv GEMM (ARM-only path). On x86 throws NYI;
+ * callers gate on supports_gemm_q4_0_indirect_conv_q8_0().
+ */
+void gemm_q4_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+/**
+ * @brief Q8_0-activation q8_0 conv GEMM (ARM-only path). On x86 throws NYI;
+ * callers gate on supports_gemm_q8_0_indirect_conv_q8_0().
+ */
+void gemm_q8_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+/**
+ * @brief FP16-activation q8_0 conv GEMM (ARM-only path). On x86 throws NYI;
+ * callers gate on supports_gemm_q8_0_indirect_conv_fp16().
+ */
+void gemm_q8_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+#endif
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
@@ -945,6 +1015,23 @@ void gemm_q6_K(const unsigned int M, const unsigned int N, const unsigned int K,
  * @return size_t size of total quantized data in bytes
  */
 size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief quantize_q8_0 function (FP32 source).
+ *
+ * Non-template float overload for layer code that wants a uniform
+ * nntrainer::quantize_q8_0(const float*, ...) call site mirroring Q4_0 /
+ * Q6_K. Internally calls __ggml_quantize_q8_0.
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* destination (34 bytes / 32 elements)
+ * @param nrow number of rows
+ * @param n_per_row number of elements in each row (must be multiple of 32)
+ * @param quant_weights unused
+ * @return size_t size of total quantized data in bytes
+ */
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights);
 
 /**
@@ -1013,6 +1100,20 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 
 /**
+ * @brief dequantize row of q8_0 data to float
+ *
+ * @param x_raw input to be dequantized from q8_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x_raw (multiple of 32)
+ */
+void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k);
+
+/**
+ * @brief Quantize a row of float data to q8_0 (non-template, float overload).
+ */
+void quantize_row_q8_0(const float *src, void *dst, int64_t k);
+
+/**
  * @brief dequantize row of q6_K data to float
  *
  * @param x input to be dequantized from q6_K to float
@@ -1068,6 +1169,33 @@ void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
                  const unsigned int N,
                  ml::train::ISA target = ml::train::ISA::DEFAULT);
+
+/**
+ * @brief repack q8_0 rows to q8_0x4, the layout the Q8_0 GEMM kernels use
+ *
+ * Every 4 rows are interleaved block by block: the 4 fp16 scales come first,
+ * then bytes 8k..8k+7 of row r go to qs[32k + 8r].
+ *
+ * @param dst output q8_0x4
+ * @param src input q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q8_0x4 to q8_0 rows - inverse of repack_q8_0
+ *
+ * @param src input q8_0x4
+ * @param dst output q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N);
 
 /**
  * @brief repack q4K to q4Kx8
@@ -1257,6 +1385,36 @@ template <typename T = float>
 void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief Depthwise convolution FP32 (x86 backend).
+ *        Correctness path delegates to __fallback_depthwise_conv2d_fp32.
+ *        TODO: AVX specialization.
+ *        See fallback_internal.h for full parameter documentation.
+ */
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief Depthwise convolution FP16 (x86 backend). Delegates to
+ *        __fallback_depthwise_conv2d_fp16.
+ */
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+#endif
 
 /**
  * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights

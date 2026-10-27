@@ -21,6 +21,8 @@
  *
  */
 
+#include <fstream>
+
 #include <bn_layer.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
@@ -205,8 +207,27 @@ void BatchNormalizationLayer::forwarding(RunLayerContext &context,
       hidden_ = context.getOutput(SINGLE_INOUT_IDX);
     }
   } else {
-    input_ = context.getInput(SINGLE_INOUT_IDX);
-    hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+    // Inference: force FP32 compute when the activation is FP16. BN's
+    // moving_variance can be ~1e-45 (near-zero) for some channels; in FP16,
+    // invstd = 1/sqrt(var+eps) ~316 and (x-mean)*invstd*gamma overflows the
+    // +-65504 FP16 range -> nan/inf, poisoning every downstream layer. FP32
+    // compute has the range to absorb this exactly (the fold is bit-exact in
+    // FP32), so upcast the input, compute, then narrow the output back to the
+    // graph's FP16 activation dtype.
+    if (context.getInput(SINGLE_INOUT_IDX).getDataType() ==
+        TensorDim::DataType::FP16) {
+      input_ =
+        context.getInput(SINGLE_INOUT_IDX).clone(TensorDim::DataType::FP32);
+    } else {
+      input_ = context.getInput(SINGLE_INOUT_IDX);
+    }
+    if (context.getOutput(SINGLE_INOUT_IDX).getDataType() ==
+        TensorDim::DataType::FP16) {
+      hidden_ =
+        context.getOutput(SINGLE_INOUT_IDX).clone(TensorDim::DataType::FP32);
+    } else {
+      hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+    }
   }
 
   Tensor &deviation = context.getTensor(wt_idx[BNParams::deviation]);
@@ -260,9 +281,105 @@ void BatchNormalizationLayer::forwarding(RunLayerContext &context,
   hidden_.multiply_i(gamma);
   hidden_.add_i(beta);
 
-  if (training && hidden_.getDataType() !=
-                    context.getOutput(SINGLE_INOUT_IDX).getDataType())
+  if (hidden_.getDataType() !=
+      context.getOutput(SINGLE_INOUT_IDX).getDataType())
     context.getOutput(SINGLE_INOUT_IDX).copyData(hidden_);
+
+  if (std::getenv("NNTR_NAN_TRACE")) {
+    // Report BOTH the pre-narrow FP32 hidden_ and the post-narrow output.
+    {
+      const unsigned int hn = hidden_.size();
+      unsigned int h_nan = 0, h_inf = 0, h_fin = 0, h_over = 0;
+      float h_max = 0.0f, h_min = 1e30f;
+      const float *hd = hidden_.getData<float>();
+      for (unsigned int i = 0; i < hn; ++i) {
+        float v = hd[i];
+        if (std::isnan(v))
+          h_nan++;
+        else if (std::isinf(v))
+          h_inf++;
+        else {
+          h_fin++;
+          float a = std::fabs(v);
+          if (a > h_max)
+            h_max = a;
+          if (a < h_min)
+            h_min = a;
+          if (a > 65504.0f)
+            h_over++;
+        }
+      }
+      std::cerr << "[NANTRACE-BN32] " << context.getName() << " n=" << hn
+                << " fin=" << h_fin << " nan=" << h_nan << " inf=" << h_inf
+                << " >65504=" << h_over << " maxAbs=" << h_max << "\n"
+                << std::flush;
+    }
+    const Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+    const unsigned int n = out.size();
+    unsigned int n_nan = 0, n_inf = 0, n_fin = 0, n_over = 0;
+    float max_abs = 0.0f, min_abs = 1e30f;
+    if (out.getDataType() == nntrainer::Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+      const _FP16 *d = out.getData<_FP16>();
+      for (unsigned int i = 0; i < n; ++i) {
+        float v = (float)d[i];
+        if (std::isnan(v))
+          n_nan++;
+        else if (std::isinf(v))
+          n_inf++;
+        else {
+          n_fin++;
+          float a = std::fabs(v);
+          if (a > max_abs)
+            max_abs = a;
+          if (a < min_abs)
+            min_abs = a;
+          if (a > 65504.0f)
+            n_over++;
+        }
+      }
+#endif
+    } else {
+      const float *d = out.getData<float>();
+      for (unsigned int i = 0; i < n; ++i) {
+        float v = d[i];
+        if (std::isnan(v))
+          n_nan++;
+        else if (std::isinf(v))
+          n_inf++;
+        else {
+          n_fin++;
+          float a = std::fabs(v);
+          if (a > max_abs)
+            max_abs = a;
+          if (a < min_abs)
+            min_abs = a;
+          if (a > 65504.0f)
+            n_over++;
+        }
+      }
+    }
+    std::cerr << "[NANTRACE-BN] " << context.getName() << " n=" << n << " dt="
+              << (out.getDataType() == nntrainer::Tdatatype::FP16 ? "FP16"
+                                                                  : "FP32")
+              << " fin=" << n_fin << " nan=" << n_nan << " inf=" << n_inf
+              << " >65504=" << n_over << " maxAbs=" << max_abs
+              << " minAbs=" << min_abs << "\n"
+              << std::flush;
+  }
+
+  // Dump one named layer's real pre-narrow FP32 output (hidden_, from inside
+  // the untruncated production forward pass), for external bisection.
+  if (const char *dl = std::getenv("NNTR_DUMP_LAYER");
+      dl && context.getName() == dl) {
+    const char *dp = std::getenv("NNTR_DUMP_PATH");
+    if (dp) {
+      const float *hd = hidden_.getData<float>();
+      std::ofstream of(dp, std::ios::binary);
+      of.write(reinterpret_cast<const char *>(hd),
+               hidden_.size() * sizeof(float));
+    }
+  }
 }
 
 void BatchNormalizationLayer::calcDerivative(RunLayerContext &context) {
@@ -455,7 +572,8 @@ void BatchNormalizationLayer::read(std::ifstream &file,
           T_read.read(file);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(file, start_offset);
+          run_context.getWeight(i).read(file, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&
@@ -501,7 +619,8 @@ void BatchNormalizationLayer::read(ReadSource src, RunLayerContext &run_context,
           T_read.read(src);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(src, start_offset);
+          run_context.getWeight(i).read(src, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&

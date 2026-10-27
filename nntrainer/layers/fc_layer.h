@@ -136,6 +136,18 @@ private:
   bool skip_prefill = false;
   ActiFunc acti_func; /**< inline fused activation; inert unless
                            fused_activation is set by the FusionRealizer */
+
+  /**
+   * @brief W8A8 int8-resident GEMM + epilogue for the MLP FC path.
+   *
+   * Runs the channel-wise int8 kernel (input int8 or FP32) into an FP32
+   * staging buffer, applies bias, and (for an up-projection) quantizes the
+   * output to QINT8 with a per-tensor symmetric scale. Returns true if it
+   * handled the op (channel-wise weight, W8A8 active); false to fall back to
+   * the generic dot().
+   */
+  bool dotW8A8(Tensor const &input_, Tensor const &weight, Tensor &hidden_,
+               Tensor const &bias, bool bias_enabled);
 };
 } // namespace nntrainer
 

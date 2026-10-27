@@ -55,10 +55,17 @@ Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
 
   bool is_virtual = lifespan == TensorLifespan::VIRTUAL;
   lifespan = is_virtual ? TensorLifespan::UNMANAGED : lifespan;
+  // QINT8 activation tensors carry ONE per-tensor scale (the W8A8 resident
+  // path); PER_CHANNEL_AFFINE would make scale_size()==width() and the inline
+  // scale slot oversized/misinterpreted. Weights keep PER_CHANNEL. This is the
+  // TensorPool QScheme fix noted in YOLOv7's W8A8_DESIGN.md §3.1.
+  const QScheme qs =
+    (dim.getDataType() == ml::train::TensorDim::DataType::QINT8)
+      ? QScheme::PER_TENSOR_AFFINE
+      : QScheme::PER_CHANNEL_AFFINE;
   return registerRequestSpec(
     {is_weight_grad,
-     std::make_unique<Tensor>(dim, false, init, name,
-                              QScheme::PER_CHANNEL_AFFINE, is_virtual),
+     std::make_unique<Tensor>(dim, false, init, name, qs, is_virtual),
      TensorPool::SourceDetails{0, lifespan, exec_order, {}, engine}});
 }
 

@@ -442,6 +442,89 @@ TEST(nntrainer_activation, gelu_01_p) {
   }
 }
 
+#ifdef ENABLE_FP16
+/**
+ * @brief GELU activation on an FP16 tensor. Before the ActiFunc::gelu FP16
+ *        dispatch fix, gelu<T> hardcoded getData<float>() on the 2N-byte FP16
+ *        buffer and called the FP32 kernel -> 2N-byte overread -> SIGSEGV.
+ *        This test mirrors gelu_01_p with a Tdatatype::FP16 tensor; the FP16
+ *        output must match the FP32 erf-form reference (answer[]) within
+ *        FP16 tolerance.
+ */
+TEST(nntrainer_activation, gelu_fp16_01_p) {
+  int batch = 3;
+  int channel = 1;
+  int height = 1;
+  int width = 10;
+  float answer[30] = {
+    -0.13783135f, -0.11462659f, -0.08414805f, -0.04601721f, 0.0f,
+    0.05398279f,  0.11585195f,  0.18537343f,  0.26216868f,  0.34573120f,
+    -0.16948429f, -0.16455182f, -0.13783135f, -0.08414805f, 0.0f,
+    0.11585195f,  0.26216868f,  0.43544820f,  0.63051575f,  0.84134471f,
+    -0.13808367f, -0.16565408f, -0.16455182f, -0.11462659f, 0.0f,
+    0.18537343f,  0.43544820f,  0.73434591f,  1.06191635f,  1.39978909f};
+
+  nntrainer::TensorDim::TensorType t_type_fp16 = {nntrainer::Tformat::NCHW,
+                                                  nntrainer::Tdatatype::FP16};
+
+  nntrainer::Tensor input(batch, channel, height, width, t_type_fp16);
+  GEN_TEST_INPUT(input, (l - 4) * 0.1 * (i + 1));
+
+  nntrainer::Tensor results(batch, channel, height, width, t_type_fp16);
+  results = nntrainer::ActiFunc::gelu(input, results);
+
+  const _FP16 *data = results.getData<_FP16>();
+  ASSERT_NE(nullptr, data);
+
+  const float fp16_tol = 1e-2f;
+  for (int i = 0; i < batch * channel * height * width; ++i) {
+    EXPECT_NEAR(static_cast<float>(data[i]), answer[i], fp16_tol);
+  }
+}
+
+/**
+ * @brief tanh-approximate GELU on an FP16 tensor. Same dispatch bug as
+ *        gelu_fp16_01_p. Compares against an inline FP32 tanh-form reference:
+ *          0.5 x (1 + tanh(0.7978845608 (x + 0.044715 x^3)))
+ */
+TEST(nntrainer_activation, tanh_gelu_fp16_01_p) {
+  int batch = 3;
+  int channel = 1;
+  int height = 1;
+  int width = 10;
+
+  nntrainer::TensorDim::TensorType t_type_fp16 = {nntrainer::Tformat::NCHW,
+                                                  nntrainer::Tdatatype::FP16};
+  nntrainer::TensorDim::TensorType t_type_fp32 = {nntrainer::Tformat::NCHW,
+                                                  nntrainer::Tdatatype::FP32};
+
+  nntrainer::Tensor input(batch, channel, height, width, t_type_fp16);
+  GEN_TEST_INPUT(input, (l - 4) * 0.1 * (i + 1));
+
+  nntrainer::Tensor input_fp32(batch, channel, height, width, t_type_fp32);
+  GEN_TEST_INPUT(input_fp32, (l - 4) * 0.1 * (i + 1));
+  nntrainer::Tensor ref(batch, channel, height, width, t_type_fp32);
+  const float *x32 = input_fp32.getData();
+  float *r32 = ref.getData();
+  for (int i = 0; i < batch * channel * height * width; ++i) {
+    float x = x32[i];
+    r32[i] = 0.5f * x *
+             (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+
+  nntrainer::Tensor results(batch, channel, height, width, t_type_fp16);
+  results = nntrainer::ActiFunc::tanhGelu(input, results);
+
+  const _FP16 *data = results.getData<_FP16>();
+  ASSERT_NE(nullptr, data);
+
+  const float fp16_tol = 1e-2f;
+  for (int i = 0; i < batch * channel * height * width; ++i) {
+    EXPECT_NEAR(static_cast<float>(data[i]), r32[i], fp16_tol);
+  }
+}
+#endif /* ENABLE_FP16 */
+
 TEST(nntrainer_activation, geluPrime_01_p) {
   int batch = 3;
   int channel = 1;

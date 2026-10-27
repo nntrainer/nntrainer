@@ -378,7 +378,7 @@ void CharTensor::copyData(const Tensor &from) {
     << getName() << " is not contiguous, cannot copy.";
 
   NNTR_THROW_IF(size() != from.size(), std::invalid_argument)
-    << "Size of tensor to copy must match";
+    << "Size of tensor to copy must match: " << size() << " vs " << from.size();
 
   /// @todo support copy from float32 & float16 to int8 data
   /// @note this could require scale factor

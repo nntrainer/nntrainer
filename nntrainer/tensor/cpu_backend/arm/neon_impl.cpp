@@ -1444,6 +1444,75 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
   }
 }
 
+#ifdef ENABLE_FP16
+void gelu_v2_fp16(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  /// FP16-storage GELU, vectorized. The FastViT keyword backbone is W8A16
+  /// (FP16 activations) and has ~12 GELU layers; the previous FP16 path
+  /// routed through HalfTensor::apply (std::transform + scalar std::erf per
+  /// element), which dominated backbone latency. This kernel reuses the
+  /// exact-erf piecewise polynomial already proven by FP32 gelu_v2 above
+  /// (thresholds gelu_start/gelu_end, constants c_gelu_p*) but operates on
+  /// FP16 buffers: load 4x FP16, widen to FP32x4 for the polynomial (FP16
+  /// has no erf/tanh hardware and the polynomial needs FP32 range), narrow
+  /// back to FP16 on store. The |x|>gelu_end tail maps to identity (x), the
+  /// |x|<gelu_start tail maps to 0 -- same semantics as gelu_v2. The N%4
+  /// scalar tail uses exact std::erf (a handful of elements per layer).
+  /// Max elementwise deviation from exact-erf GELU is bounded by the FP32
+  /// polynomial's own error (<1e-6) plus one FP16 round, comfortably under
+  /// the W8A16 q8_0 quantization noise (~1e-3) already present in the net.
+  unsigned int i = 0;
+#if defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC) || defined(__ARM_FEATURE_FP16)
+  for (; N - i >= 4; i += 4) {
+    float16x4_t xh = vld1_f16(reinterpret_cast<const __fp16 *>(&X[i]));
+    float32x4_t x = vcvt_f32_f16(xh);
+    float32x4_t x2 = vmulq_f32(x, x);
+
+    uint32x4_t x_gt = vcgtq_f32(x, vdupq_n_f32(gelu_start));
+    uint32x4_t x_ls = vcleq_f32(x, vdupq_n_f32(gelu_end));
+    uint32x4_t x_gt2 = vcgtq_f32(x, vdupq_n_f32(gelu_end));
+
+    float32x4_t y = vmulq_f32(x2, vdupq_n_f32(c_gelu_p20));
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p18));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p16));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p14));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p12));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p10));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p8));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p6));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p4));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p2));
+    y = vmulq_f32(x2, y);
+
+    float32x4_t z = vmulq_f32(x, vdupq_n_f32(c_gelu_p1));
+    z = vaddq_f32(z, vdupq_n_f32(c_gelu_p0));
+
+    y = vaddq_f32(y, z);
+
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_gt));
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_ls));
+    x = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(x), x_gt2));
+
+    y = vaddq_f32(y, x);
+    vst1_f16(reinterpret_cast<__fp16 *>(&Y[i]), vcvt_f16_f32(y));
+  }
+#endif
+  while (i < N) {
+    float x = static_cast<float>(X[i]);
+    Y[i] =
+      static_cast<_FP16>(0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f))));
+    ++i;
+  }
+}
+#endif
+
 void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
   unsigned int i = 0;
   float32x4_t one = vdupq_n_f32(1.0f);

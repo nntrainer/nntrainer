@@ -16,8 +16,11 @@
 #define __ACTI_FUNC_H__
 #ifdef __cplusplus
 
+#include <algorithm>
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <thread_manager.h>
+#include <type_traits>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -35,7 +38,7 @@ class Tensor;
 class ActiFunc {
 
 public:
-  constexpr static inline float NEGATIVE_SLOPE = 0.01f;
+  constexpr static inline float NEGATIVE_SLOPE = 0.1f;
 
   /**
    * @brief     Constructor of ActiFunc
@@ -436,8 +439,57 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+#ifdef ENABLE_FP16
+    // Callers may invoke gelu() without a template argument on an FP16 tensor
+    // (T defaults to float); dispatch on the tensor's real type so the FP32
+    // kernel never reinterprets half-width storage.
+    if constexpr (!std::is_same_v<T, _FP16>) {
+      if (t_in.getDataType() == Tdatatype::FP16)
+        return gelu<_FP16>(t_in, t_out);
+    }
+#endif
+    // FP32-only vectorized kernel below; see tanhGelu() for why a non-float
+    // tensor must not be reinterpreted as float here.
+    if constexpr (!std::is_same_v<T, float>) {
+#ifdef ENABLE_FP16
+      if constexpr (std::is_same_v<T, _FP16>) {
+        // Exact erf form on FP16 storage: the FP16 kernel widens to FP32 for
+        // the polynomial and narrows on store, so there is no overread of the
+        // half-width buffer (unlike a float* reinterpretation).
+        nntrainer::gelu_v2_fp16(t_in.size(), t_in.getData<_FP16>(),
+                                t_out.getData<_FP16>());
+        return t_out;
+      }
+#endif
+      t_in.apply<T>(
+        [](T x) {
+          const float v = static_cast<float>(x);
+          return static_cast<T>(0.5f * v *
+                                (1.0f + std::erf(v * 0.7071067811f)));
+        },
+        t_out);
+      return t_out;
+    }
+    const unsigned int N = t_in.size();
+    const float *x = t_in.getData<float>();
+    float *y = t_out.getData<float>();
+
+    // Elementwise, so chunks are independent: split large tensors (e.g. the
+    // encoder's [196, 3072] FFN activation) across the ThreadManager pool the
+    // same way the tensor ops do. Small tensors (decode-step rows) stay on
+    // the single-dispatch vectorized kernel.
+    constexpr unsigned int chunk = 1u << 14; // 16K floats per task
+    if (N >= 2 * chunk) {
+      auto &tm = ThreadManager::Global();
+      const size_t loops = (N + chunk - 1) / chunk;
+      tm.parallel_for(0, loops, [=](size_t li) {
+        const unsigned int start = (unsigned int)(li * chunk);
+        const unsigned int end = std::min(N, start + chunk);
+        nntrainer::gelu_v2(end - start, x + start, y + start);
+      });
+    } else {
+      nntrainer::gelu_v2(N, x, y);
+    }
     return t_out;
   }
 
@@ -477,8 +529,31 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+#ifdef ENABLE_FP16
+    // Same runtime dispatch as gelu(): an FP16 tensor takes the FP16 path even
+    // when the caller left T at its float default.
+    if constexpr (!std::is_same_v<T, _FP16>) {
+      if (t_in.getDataType() == Tdatatype::FP16)
+        return tanhGelu<_FP16>(t_in, t_out);
+    }
+#endif
+    // The vectorized kernel is FP32-only. Dispatching a non-float tensor to it
+    // would reinterpret T data as float and read/write size()*4 bytes out of a
+    // size()*sizeof(T) buffer — an out-of-bounds write for FP16. Compute in
+    // float and store back as T for those types.
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
+                           t_out.getData<float>());
+    } else {
+      t_in.apply<T>(
+        [](T x) {
+          const float v = static_cast<float>(x);
+          return static_cast<T>(
+            0.5f * v *
+            (1.0f + std::tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+        },
+        t_out);
+    }
     return t_out;
   }
 

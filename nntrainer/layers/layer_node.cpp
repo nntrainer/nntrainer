@@ -14,6 +14,8 @@
 #include "layer_context.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 #include <utility>

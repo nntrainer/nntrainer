@@ -215,7 +215,7 @@ template <>
 void Exporter::saveTflResult(
   const std::tuple<props::FilterSize, std::array<props::KernelSize, CONV2D_DIM>,
                    std::array<props::Stride, CONV2D_DIM>, props::Padding2D,
-                   std::array<props::Dilation, CONV2D_DIM>,
+                   std::array<props::Dilation, CONV2D_DIM>, props::ConvGroups,
                    props::FusedActivation> &props,
   const Conv2DLayer *self) {
   // See the fully_connected case: refuse rather than drop the epilogue.
@@ -225,6 +225,18 @@ void Exporter::saveTflResult(
                 nntrainer::exception::not_supported)
     << "conv2d with a fused activation cannot be converted to tfnode";
   createIfNull(tf_node);
+
+  // ConvGroups may be unset for plain conv layers (defaults to 1). Treat empty
+  // as 1 rather than throwing on property access — matches Conv2DLayer's own
+  // usage (conv2d_layer.cpp). Only explicitly-configured groups > 1 is rejected
+  // below, since TFLite CONV_2D has no groups field.
+  auto &groups_prop = std::get<props::ConvGroups>(props);
+  unsigned int groups = groups_prop.empty() ? 1 : groups_prop.get();
+  if (groups > 1) {
+    throw std::runtime_error(
+      "[Conv2DLayer] TFLite export does not support grouped convolution "
+      "(groups > 1). TFLite CONV_2D has no groups field; use groups=1.");
+  }
 
   auto weight_transform = [](std::vector<const Tensor *> &old_weights) {
     std::vector<Tensor> new_weights;

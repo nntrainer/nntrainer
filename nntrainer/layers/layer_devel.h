@@ -28,8 +28,11 @@
 #include <vector>
 
 #include <base_properties.h>
+#include <cmath>
 #include <common.h>
 #include <cpu_backend.h>
+#include <cstdint>
+#include <cstring>
 #include <layer_context.h>
 #include <quantizer.h>
 #include <tensor_dim.h>
@@ -72,6 +75,93 @@ enum class InPlaceDirection {
   LEFT,  /**< left side of the layer is in-place */
   RIGHT, /**< right side of the layer is in-place */
 };
+
+/**
+ * @brief Round an FP32 value to the nearest fp16-representable value, returned
+ * as the fp16 bit pattern. Used when writing a per-channel scale into a Q8_0
+ * block, whose scale field is fp16: quantizing with the already-rounded value
+ * makes the consumer reproduce the produced numbers exactly.
+ */
+inline uint16_t nntr_fp32_to_fp16_bits(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, 4);
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+  const uint32_t man = bits & 0x7fffffu;
+  if (exp <= 0)
+    return (uint16_t)sign;
+  if (exp >= 31)
+    return (uint16_t)(sign | 0x7c00u);
+  uint32_t m = man >> 13;
+  const uint32_t rem = man & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (m & 1u)))
+    ++m;
+  if (m == 0x400u) {
+    m = 0;
+    if (++exp >= 31)
+      return (uint16_t)(sign | 0x7c00u);
+  }
+  return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
+}
+
+/**
+ * @brief Decode an fp16 bit pattern to FP32.
+ */
+inline float nntr_fp16_bits_to_fp32(uint16_t h) {
+  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  const uint32_t man = h & 0x3ffu;
+  uint32_t f;
+  if (exp == 0)
+    f = sign | (man ? (0x38800000u | (man << 13)) : 0u);
+  else if (exp == 31)
+    f = sign | 0x7f800000u | (man << 13);
+  else
+    f = sign | ((exp + 112u) << 23) | (man << 13);
+  float out;
+  std::memcpy(&out, &f, 4);
+  return out;
+}
+
+/**
+ * @brief Quantize an [nrow, ncol] FP32 matrix to Q8_0 blocks with ONE scale per
+ * row, that is channel-wise weight quantization.
+ *
+ * The container stays the standard 34-byte Q8_0 block (fp16 scale + 32 int8),
+ * so the file remains readable by every Q8_0 consumer, but all blocks of a row
+ * carry the same scale. That makes the per-block dequantization the identity
+ * relative to a per-channel scheme, and lets a per-channel kernel lift the
+ * scale out of the inner loop entirely.
+ *
+ * The scale is round-tripped through fp16 before quantizing, so the stored
+ * (q, d) pair reproduces these values exactly at inference time.
+ */
+inline void nntr_quantize_q8_0_per_channel(const float *src, void *dst,
+                                           unsigned int nrow,
+                                           unsigned int ncol) {
+  constexpr unsigned int QK = 32;
+  const unsigned int nb = ncol / QK;
+  char *out = static_cast<char *>(dst);
+  for (unsigned int n = 0; n < nrow; ++n) {
+    const float *row = src + (size_t)n * ncol;
+    float amax = 0.0f;
+    for (unsigned int k = 0; k < ncol; ++k)
+      amax = std::max(amax, std::fabs(row[k]));
+    const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const uint16_t d16 = nntr_fp32_to_fp16_bits(d);
+    const float d_used = nntr_fp16_bits_to_fp32(d16);
+    const float inv = d_used > 0.0f ? 1.0f / d_used : 0.0f;
+    for (unsigned int b = 0; b < nb; ++b) {
+      char *blk = out + ((size_t)n * nb + b) * (2 + QK);
+      std::memcpy(blk, &d16, 2);
+      int8_t *qs = reinterpret_cast<int8_t *>(blk + 2);
+      for (unsigned int j = 0; j < QK; ++j) {
+        const float r = std::round(row[(size_t)b * QK + j] * inv);
+        qs[j] = (int8_t)std::max(-127.0f, std::min(127.0f, r));
+      }
+    }
+  }
+}
 
 /**
  * @class   Layer Base class for layers
@@ -434,6 +524,52 @@ public:
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                             quant_weight.size(), N, K, target_isa);
+                quant_weight.save(file);
+              }
+            } else if (dtype == TensorDim::DataType::Q8_0) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              // Skip quantization for bias-like tensors (1D with height == 1)
+              // as they are not suitable for Q8_0 block quantization
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "Q8_0 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                    {Tformat::NCHW, dtype});
+                std::vector<char> tmp(quant_weight.size());
+
+                // Two Q8_0 FC encodings share the block_q8_0 byte layout:
+                //  * default: per-32-block scales, quantized to plain rows and
+                //    then repacked to q8_0x4 on every ISA, the layout the
+                //    q8_0_4x8 GEMM kernels read (see FloatTensor::dotQnK);
+                //  * NNTR_W8A8_PERCH: channel-wise -- one scale per output
+                //    channel, i.e. per row of the transposed [N, K] weight,
+                //    not one per block. Plain rows, no repack, portable
+                //    across ISAs; consumed by int8_gemm::gemmPerChannelA8.
+                static const bool perch_quant =
+                  std::getenv("NNTR_W8A8_PERCH") != nullptr;
+                if (perch_quant) {
+                  nntr_quantize_q8_0_per_channel(weight_t.getData<float>(),
+                                                 tmp.data(), N, K);
+                  std::memcpy(quant_weight.getData<uint8_t>(), tmp.data(),
+                              quant_weight.size());
+                } else {
+                  quantize_q8_0(weight_t.getData<float>(), tmp.data(), N, K,
+                                nullptr);
+                  repack_q8_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                              quant_weight.size(), N, K);
+                }
                 quant_weight.save(file);
               }
             } else if (dtype == TensorDim::DataType::QS4CX) {

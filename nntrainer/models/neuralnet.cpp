@@ -138,6 +138,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
+  case TensorDim::DataType::Q8_0:
     return Tensor::Map<uint8_t>(reinterpret_cast<uint8_t *>(buf), bytes, dim,
                                 0);
   case TensorDim::DataType::UINT32:
@@ -1028,10 +1029,24 @@ public:
 #endif
 
 /**
+ * @brief A block-quantized weight is laid out as [N rows, K cols]. An FC weight
+ * is stored [1, 1, K, N] so N=width, K=height. A conv filter is stored
+ * [out_ch, in_ch, kh, kw] so N=out_ch=batch and K=in_ch*kh*kw (CRS). Returns
+ * (N, K) for the appropriate interpretation; batch>1 marks a conv filter.
+ */
+inline std::pair<unsigned int, unsigned int> quantRowsCols(const TensorDim &d) {
+  if (d.batch() > 1) // conv filter: out_ch rows of CRS
+    return {d.batch(), d.channel() * d.height() * d.width()};
+  return {d.width(), d.height()}; // FC weight [1,1,K,N]
+}
+
+/**
  * @brief Resolve the data type a weight will actually be stored as.
  *
- * Mirrors the per-weight policy of the layer save overrides: bias-like tensors
- * (height == 1) are not block-quantized and stay in their original type.
+ * Mirrors the per-weight policy of the layer save overrides: only weights that
+ * form a real [N>1, K>1] matrix are block-quantized; bias-like tensors (a
+ * single row/col, e.g. [1, C, 1, 1]) stay in their original type. This must
+ * agree with both the FC base save (Layer::save) and Conv2DLayer::save.
  */
 TensorDim::DataType resolveStoredDtype(const Tensor &weight,
                                        TensorDim::DataType requested) {
@@ -1039,9 +1054,11 @@ TensorDim::DataType resolveStoredDtype(const Tensor &weight,
       requested == weight.getDataType())
     return weight.getDataType();
 
-  if (nntrainer::safetensors::isQuantized(requested) &&
-      weight.getDim().height() == 1)
-    return weight.getDataType();
+  if (nntrainer::safetensors::isQuantized(requested)) {
+    auto [N, K] = quantRowsCols(weight.getDim());
+    if (N <= 1 || K <= 1)
+      return weight.getDataType(); // bias-like: not block-quantizable
+  }
 
   return requested;
 }
@@ -1187,12 +1204,14 @@ void NeuralNetwork::save(
           entry.offset_end = data_offset + wsize;
           if (is_quant) {
             // Quantized blobs are opaque bytes (U8) with a 1-D byte shape;
-            // the native type and logical shape live in extension fields.
+            // the native type and logical shape live in extension fields. The
+            // logical shape is the matmul-weight shape [1, 1, K, N] the runtime
+            // reconstructs (FC: [1,1,K,N]; conv filter: [1,1,CRS,out_ch]).
+            auto [N, K] = quantRowsCols(dim);
             entry.dtype = safetensors::dtypeToString(w.stored); // "U8"
             entry.shape = {wsize};
             entry.nntr_dtype = safetensors::nntrDtypeName(w.stored);
-            entry.nntr_shape = {dim.batch(), dim.channel(), dim.height(),
-                                dim.width()};
+            entry.nntr_shape = {1, 1, K, N};
           } else {
             entry.dtype = safetensors::dtypeToString(w.stored);
             entry.shape = {dim.batch(), dim.channel(), dim.height(),
@@ -1223,10 +1242,11 @@ void NeuralNetwork::save(
     }
     if (any_quant)
       metadata["nntr_format"] = "nntr-safetensors-v1";
-    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4)
-    // that is indistinguishable from the header alone, so record which one was
-    // produced. DEFAULT resolves to the build platform's layout. Only emitted
-    // when a Q4_0 tensor is present, since no other type depends on the ISA.
+    // Q4_0 weights (x86: q4_0x8, ARM: q4_0x4) are repacked into ISA-specific
+    // layouts that are indistinguishable from the header alone, so record
+    // which one was produced. DEFAULT resolves to the build platform's
+    // layout. Only emitted when a Q4_0 tensor is present. Q8_0 FC weights are
+    // q8_0x4 on every ISA, so they need no tag.
     if (any_q4_0) {
       const char *isa_str;
       switch (target_isa) {
@@ -1427,6 +1447,7 @@ void NeuralNetwork::load(const std::string &file_path,
             tensor_data_type != TensorDim::DataType::FP16 &&
             tensor_data_type != TensorDim::DataType::Q6_K &&
             tensor_data_type != TensorDim::DataType::Q4_0 &&
+            tensor_data_type != TensorDim::DataType::Q8_0 &&
             tensor_data_type != TensorDim::DataType::QS4CX) {
           // for tensor with qparam
           size += sizeof(uint16_t);
@@ -2160,6 +2181,7 @@ void NeuralNetwork::load(const std::string &file_path,
 
     // Assign file offsets to each weight by name
     std::unordered_set<const Tensor *> visited_st;
+    unsigned int missing_weights = 0;
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       auto weights = (*iter)->getRunContext().getWeights();
       for (auto weight : weights) {
@@ -2167,8 +2189,18 @@ void NeuralNetwork::load(const std::string &file_path,
           continue;
         const std::string &name = weight->getName();
         auto it = name_offset_map.find(name);
-        if (it == name_offset_map.end())
+        if (it == name_offset_map.end()) {
+          // A missing tensor means the weight keeps whatever bytes its buffer
+          // held (typically uninitialized), which surfaces as silently wrong
+          // outputs — e.g. a converter that wrote "layer:weight" where the
+          // runtime tensor is named "layer:filter". Warn loudly instead of
+          // failing so partial files (LoRA-style overlays) still load.
+          ml_logw("safetensors: no tensor named '%s' in %s; weight left "
+                  "unloaded",
+                  name.c_str(), f_path.c_str());
+          ++missing_weights;
           continue;
+        }
         const size_t file_off = data_base + it->second.first;
         weight->getVariableRef().setFileOffset(file_off);
 
@@ -2192,6 +2224,20 @@ void NeuralNetwork::load(const std::string &file_path,
             weight->getVariableRef().setQs4cxRecordPadded(true);
         }
       }
+    }
+    if (missing_weights > 0) {
+      ml_logw("safetensors: %u model weight(s) were not found in %s — the "
+              "model will run with uninitialized values for them",
+              missing_weights, f_path.c_str());
+      // Also warn on stderr: the file logger / logcat is invisible from the
+      // CLI tools where this mistake (converter tensor-name mismatch) is
+      // usually made, and the failure mode is silent garbage output.
+      std::cerr << "[nntrainer] WARNING: " << missing_weights
+                << " model weight(s) not found by name in safetensors file '"
+                << f_path
+                << "'; they remain uninitialized and outputs will be wrong. "
+                   "Check the tensor names in the converted file."
+                << std::endl;
     }
 
     if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
@@ -2277,6 +2323,83 @@ void NeuralNetwork::load(const std::string &file_path,
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
         (*iter)->read(st_in, false, exec_mode, fsu_mode);
+      }
+    }
+
+    // --- mixed-precision dtype fix-up --------------------------------------
+    // TensorBase::read() raw-copies bytes() bytes assuming the on-disk dtype
+    // equals the destination tensor dtype. For a mixed-precision graph (e.g.
+    // an FP16-activation model whose biases are declared FP16 while the
+    // safetensors payload is FP32) that assumption is false, so the raw read
+    // yields garbage. Re-load every tensor whose file dtype differs from its
+    // declared dtype, converting through the Tensor system (Map<file dtype> +
+    // copyData). Only standard float entries are touched; quantized payloads
+    // (nntr_dtype set) are left to their dedicated read path.
+    {
+      auto fileFloatDType =
+        [](const std::string &s) -> ml::train::TensorDim::DataType {
+        if (s == "F32")
+          return ml::train::TensorDim::DataType::FP32;
+        if (s == "F16")
+          return ml::train::TensorDim::DataType::FP16;
+        return ml::train::TensorDim::DataType::NONE;
+      };
+      auto entries = safetensors::parseHeaderEntries(header_json);
+      std::unordered_map<std::string, const safetensors::TensorEntry *> emap;
+      emap.reserve(entries.size());
+      for (const auto &e : entries)
+        emap[e.name] = &e;
+
+      std::ifstream cf(f_path, std::ios::in | std::ios::binary);
+      std::unordered_set<const Tensor *> fixed;
+      if (cf.is_open()) {
+        for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+             ++iter) {
+          for (auto weight : (*iter)->getRunContext().getWeights()) {
+            Tensor &var = weight->getVariableRef();
+            if (!fixed.insert(&var).second)
+              continue;
+            auto eit = emap.find(weight->getName());
+            if (eit == emap.end())
+              continue;
+            const safetensors::TensorEntry *e = eit->second;
+            if (!e->nntr_dtype.empty())
+              continue; // quantized / native payload: skip
+            auto file_dt = fileFloatDType(e->dtype);
+            if (file_dt == ml::train::TensorDim::DataType::NONE)
+              continue;
+            if (file_dt == var.getDataType())
+              continue; // dtype matches: raw read was correct
+
+            TensorDim src_dim = var.getDim();
+            src_dim.setDataType(file_dt);
+            const size_t n = src_dim.getDataLen();
+            const size_t src_bytes = n * src_dim.getDataTypeSize();
+            std::vector<char> buf(src_bytes);
+            cf.seekg(static_cast<std::streamoff>(data_base + e->offset_start),
+                     std::ios::beg);
+            cf.read(buf.data(), static_cast<std::streamsize>(src_bytes));
+            if (!cf) {
+              cf.clear();
+              continue;
+            }
+
+            if (file_dt == ml::train::TensorDim::DataType::FP32) {
+              Tensor staged = Tensor::Map<float>(
+                reinterpret_cast<float *>(buf.data()),
+                static_cast<unsigned int>(src_bytes), src_dim, 0);
+              var.copyData(staged);
+            }
+#ifdef ENABLE_FP16
+            else if (file_dt == ml::train::TensorDim::DataType::FP16) {
+              Tensor staged = Tensor::Map<_FP16>(
+                reinterpret_cast<_FP16 *>(buf.data()),
+                static_cast<unsigned int>(src_bytes), src_dim, 0);
+              var.copyData(staged);
+            }
+#endif
+          }
+        }
       }
     }
 
@@ -2485,9 +2608,41 @@ NeuralNetwork::inference(unsigned int batch_size,
   std::vector<float *> output;
   output.reserve(output_tensors.size());
 
+  // Outputs come back in their declared dtype, as on main. The one exception
+  // is a QINT8 output with a real scale (W8A8 int8-resident models): its
+  // dequantized FP32 copy is kept in fp32_output_cache until the next call.
+  fp32_output_cache.clear();
+  fp32_output_cache.reserve(output_tensors.size());
   for (auto &out : output_tensors) {
-    auto out_t = *out.get();
-    output.push_back(out_t.getData());
+    const Tensor &out_t = *out.get();
+    if (out_t.getDataType() == TensorDim::DataType::FP32) {
+      output.push_back(out_t.getData());
+    } else if (out_t.getDataType() == TensorDim::DataType::QINT8 &&
+               out_t.getScale<float>() != nullptr &&
+               out_t.getScale<float>()[0] != 0.0f) {
+      // A QINT8-typed graph output (W8A8 int8-resident models) carries a real
+      // per-tensor scale: hand the caller dequantized values, not int8 codes.
+      // The per-channel W8A8 mode (NNTR_W8A8_PERCH, unless NNTR_W8A8_SYM)
+      // encodes activations asymmetrically as x = (q + 128) * s - kActOff,
+      // the same formula conv2d_layer.cpp's epilogue produces.
+      static const bool perch_asym =
+        std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+        std::getenv("NNTR_W8A8_SYM") == nullptr;
+      constexpr float kActOff = 0.27846455f;
+      TensorDim fp32_dim = out_t.getDim();
+      fp32_dim.setDataType(TensorDim::DataType::FP32);
+      fp32_output_cache.emplace_back(fp32_dim, true);
+      const int8_t *q = out_t.getData<int8_t>();
+      const float sc = out_t.getScale<float>()[0];
+      float *dst = fp32_output_cache.back().getData<float>();
+      const size_t n = out_t.size();
+      for (size_t i = 0; i < n; ++i)
+        dst[i] =
+          perch_asym ? ((float)q[i] + 128.f) * sc - kActOff : (float)q[i] * sc;
+      output.push_back(dst);
+    } else {
+      output.push_back(out_t.getData());
+    }
   }
 
   return output;

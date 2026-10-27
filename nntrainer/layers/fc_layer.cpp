@@ -23,6 +23,7 @@
 
 #include <common_properties.h>
 #include <fc_layer.h>
+#include <int8_gemm.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
 #include <nntrainer_error.h>
@@ -121,6 +122,36 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
+
+  // W8A8 int8-resident MLP (NNTR_W8A8, see W8A8_DESIGN.md): an MLP
+  // up-projection FC (name ends in "ffn_up") with a Q8_0 weight emits a
+  // per-tensor-scale QINT8 activation that GELU consumes and ffn_down reads as
+  // a QINT8 input, so the MLP's intermediate activation (768-dim x N tokens x
+  // 12 blocks) is stored at 1 byte instead of 4. Every FC that is NOT an
+  // up-projection -- the attention qkv/out_proj, the head, and ffn_down (whose
+  // consumer is the FP32 residual addition) -- outputs FP32; if such an FC is
+  // fed a QINT8 input it dequantizes (ffn_down's exit from the int8 region),
+  // exactly as conv2d does at its FP32 boundary. Env-gated so every other mode
+  // is untouched. This runs AFTER setTensorType so the QINT8 override is not
+  // clobbered.
+  const bool w8a8_mode = std::getenv("NNTR_W8A8") != nullptr;
+  const bool weight_is_q8 =
+    context.getWeightDataType() == TensorDim::DataType::Q8_0;
+  if (w8a8_mode && weight_is_q8) {
+    const std::string &lname = context.getName();
+    const bool mlp_up =
+      lname.size() >= 6 && lname.compare(lname.size() - 6, 6, "ffn_up") == 0;
+    if (mlp_up) {
+      output_dims[0].setDataType(TensorDim::DataType::QINT8);
+    } else if (output_dims[0].getDataType() == TensorDim::DataType::QINT8) {
+      // An FC never passes int8 through unless it is an up-projection: a
+      // non-mlp-up FC fed a QINT8 input dequantizes to FP32, so the residual
+      // addition and the head see clean FP32. Without this, ffn_down would
+      // inherit QINT8 from its input and write FP32 bytes into an int8-typed
+      // tensor.
+      output_dims[0].setDataType(TensorDim::DataType::FP32);
+    }
+  }
 
   context.setOutputDimensions(output_dims);
 
@@ -279,6 +310,18 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
+  if (std::getenv("NNTR_W8A8") != nullptr &&
+      weight.getDataType() == Tdatatype::Q8_0) {
+    const bool bias_en = [&] {
+      auto &db = std::get<props::DisableBias>(*layer_impl_props);
+      return db.empty() || db.get() == false;
+    }();
+    Tensor &bias = bias_en ? context.getWeight(weight_idx[FCParams::bias])
+                           : weight; // placeholder, unused when !bias_en
+    if (dotW8A8(input_, weight, hidden_, bias, bias_en))
+      return;
+  }
+
   ///@todo This dequantization action should be moved to tensor.dot()
   if (quantizer != nullptr) {
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
@@ -326,6 +369,99 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   }
 }
 
+bool FullyConnectedLayer::dotW8A8(Tensor const &input_, Tensor const &weight,
+                                  Tensor &hidden_, Tensor const &bias,
+                                  bool bias_enabled) {
+  const bool out_qint8 = hidden_.getDataType() == Tdatatype::QINT8;
+  const bool in_qint8 = input_.getDataType() == Tdatatype::QINT8;
+  if (!out_qint8 && !in_qint8)
+    return false; // not on an int8 edge; caller uses the generic dot()
+
+  const unsigned int M = input_.getDim().height();
+  const unsigned int K = input_.getDim().width();
+  const unsigned int N = hidden_.getDim().width();
+
+  // FP32 staging buffer for the GEMM output (the typed output is int8 for an
+  // up-projection, so we cannot write floats there directly).
+  static thread_local std::vector<float> cbuf;
+  cbuf.resize((size_t)M * N);
+  float *cptr = cbuf.data();
+
+  bool done = false;
+  if (in_qint8) {
+    const int8_t *aq = input_.getData<int8_t>();
+    const float a_scale = input_.getScale<float>()[0];
+    done = int8_gemm::gemmPerChannelA8_q8in(M, N, K, aq, a_scale,
+                                            weight.getData<uint8_t>(), cptr);
+  } else {
+    // Activation may be FP32 or, under Q8_0-FP16, FP16 (from the preceding
+    // LayerNorm). gemmPerChannelA8 takes a float*, so dequantize FP16 into a
+    // thread-local FP32 buffer first.
+    const float *aptr;
+    static thread_local std::vector<float> fp32_in;
+    if (input_.getDataType() == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+      const _FP16 *h = input_.getData<_FP16>();
+      const size_t nin = (size_t)M * K;
+      fp32_in.resize(nin);
+      for (size_t i = 0; i < nin; ++i)
+        fp32_in[i] = (float)h[i];
+      aptr = fp32_in.data();
+#else
+      throw std::runtime_error("FP16 FC input but ENABLE_FP16 is off");
+#endif
+    } else {
+      aptr = input_.getData<float>();
+    }
+    done = int8_gemm::gemmPerChannelA8(M, N, K, aptr, weight.getData<uint8_t>(),
+                                       cptr);
+  }
+  if (!done)
+    return false; // per-block weight; caller falls back to generic dot()
+
+  // bias (FP32 on disk for a Q8_0 weight) into the FP32 staging buffer.
+  if (bias_enabled) {
+    const float *bptr = bias.getData<float>();
+    for (unsigned int m = 0; m < M; ++m) {
+      float *row = cptr + (size_t)m * N;
+      for (unsigned int n = 0; n < N; ++n)
+        row[n] += bptr[n];
+    }
+  }
+  if (out_qint8) {
+    // Symmetric per-tensor quantize: no fused activation here (GELU is a
+    // separate layer), and GELU output spans both signs, so amax/127.
+    float amax = 0.f;
+    const size_t nout = (size_t)M * N;
+    for (size_t i = 0; i < nout; ++i)
+      amax = std::max(amax, std::fabs(cptr[i]));
+    const float sc = amax > 0.f ? amax / 127.f : 1.f;
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+    int8_t *qo = hidden_.getData<int8_t>();
+    for (size_t i = 0; i < nout; ++i)
+      qo[i] =
+        (int8_t)std::max(-128.f, std::min(127.f, std::round(cptr[i] * inv)));
+    hidden_.getScale<float>()[0] = sc;
+  } else if (hidden_.getDataType() == Tdatatype::FP16) {
+    // FP16 output (ffn_down leaving the region under Q8_0-FP16): cast the
+    // staged FP32 result down to FP16.
+#ifdef ENABLE_FP16
+    _FP16 *out = hidden_.getData<_FP16>();
+    const size_t nout = (size_t)M * N;
+    for (size_t i = 0; i < nout; ++i)
+      out[i] = static_cast<_FP16>(cptr[i]);
+#else
+    throw std::runtime_error("FP16 FC output requested but ENABLE_FP16 is off");
+#endif
+  } else {
+    // FP32 output (ffn_down leaving the region): copy the staged FP32
+    // result straight into the output tensor.
+    float *out = hidden_.getData<float>();
+    std::copy(cptr, cptr + (size_t)M * N, out);
+  }
+  return true;
+}
+
 void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
                                                  unsigned int from,
                                                  unsigned int to,
@@ -362,11 +498,27 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   auto &fused_act = std::get<props::FusedActivation>(fc_props);
 
   // @todo make it parallelized with batch axis
+  const bool w8a8_active = std::getenv("NNTR_W8A8") != nullptr &&
+                           weight.getDataType() == Tdatatype::Q8_0;
+  const bool bias_en_i = [&] {
+    auto &db = std::get<props::DisableBias>(*layer_impl_props);
+    return db.empty() || db.get() == false;
+  }();
+  Tensor &bias_ref = bias_en_i ? context.getWeight(weight_idx[FCParams::bias])
+                               : weight; // placeholder, unused when !bias_en_i
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor input_step = input_.getSharedDataTensor(
       input_step_dim, b * hidden_dim.getFeatureLen(), true);
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+    if (w8a8_active &&
+        dotW8A8(input_step, weight, hidden_step, bias_ref, bias_en_i)) {
+      // int8-resident path handled the GEMM + bias + (de)quantize for this
+      // step. Skip the generic dot/bias below; LoRA is unused by the CED
+      // detector.
+      continue;
+    }
 
     input_step.dot(weight, hidden_step, false, false);
 

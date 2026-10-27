@@ -12,6 +12,7 @@
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
 #include <cfloat>
+#include <conv_indirect.h>
 #include <cpu_backend.h>
 #include <cstring>
 #include <fallback_internal.h>
@@ -1789,6 +1790,98 @@ TEST(nntrainer_cpu_backend_standalone, qs4cx_fp16_gemm_vs_reference) {
 }
 #endif
 #endif
+
+/**
+ * @brief Independent naive im2col reference (the textbook definition, with no
+ * memcpy-run / fast-path tricks) used to validate gather_conv_act_rows_fp32.
+ * Produces the full [OH*OW, in_ch*k_h*k_w] matrix with padding positions = 0.
+ */
+static std::vector<float> naive_im2col_ref(const std::vector<float> &in, int C,
+                                           int H, int W, int kh, int kw, int pt,
+                                           int pl, int sh, int sw, int dh,
+                                           int dw, int OH, int OW) {
+  const int K = C * kh * kw;
+  const int M = OH * OW;
+  std::vector<float> out((size_t)M * K, 0.0f);
+  for (int oh = 0; oh < OH; ++oh) {
+    for (int ow = 0; ow < OW; ++ow) {
+      const int m = oh * OW + ow;
+      for (int c = 0; c < C; ++c) {
+        for (int i = 0; i < kh; ++i) {
+          for (int j = 0; j < kw; ++j) {
+            const int h = oh * sh - pt + i * dh;
+            const int w = ow * sw - pl + j * dw;
+            float v = 0.0f;
+            if (h >= 0 && h < H && w >= 0 && w < W)
+              v = in[((long)c * H + h) * W + w];
+            out[(long)m * K + (c * kh * kw + i * kw + j)] = v;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * @brief Drive gather_conv_act_rows_fp32 over one geometry (in full and in
+ * arbitrary tiles, exercising the m0/nrows tiling the packer uses) and assert
+ * the result is bit-identical to the independent naive im2col reference.
+ */
+static void check_indirect_gather(int C, int H, int W, int kh, int kw, int pt,
+                                  int pb, int pl, int pr, int sh, int sw,
+                                  int dh, int dw) {
+  const int eff_kh = (kh - 1) * dh + 1;
+  const int eff_kw = (kw - 1) * dw + 1;
+  const int OH = (H + pt + pb - eff_kh) / sh + 1;
+  const int OW = (W + pl + pr - eff_kw) / sw + 1;
+  const int K = C * kh * kw;
+  const int M = OH * OW;
+
+  std::mt19937 rng(1234 + C * 31 + H * 7 + kh * 13 + sh * 3 + dh);
+  std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+  std::vector<float> in((size_t)C * H * W);
+  for (auto &v : in)
+    v = dist(rng);
+
+  const std::vector<float> ref =
+    naive_im2col_ref(in, C, H, W, kh, kw, pt, pl, sh, sw, dh, dw, OH, OW);
+
+  nntrainer::ConvGatherParams p{C, H, W, kh, kw, pt, pl, sh, sw, dh, dw, OW};
+
+  // (a) gather all rows at once
+  std::vector<float> full((size_t)M * K, -42.0f);
+  nntrainer::gather_conv_act_rows_fp32(full.data(), in.data(), p, 0, M);
+  for (size_t i = 0; i < (size_t)M * K; ++i)
+    ASSERT_FLOAT_EQ(full[i], ref[i]) << "full mismatch at " << i;
+
+  // (b) gather in tiles (4-row tiles + a ragged remainder), as the Q8_0 packer
+  //     does: tile output must land bit-identically into the same rows.
+  std::vector<float> tiled((size_t)M * K, -42.0f);
+  for (int m0 = 0; m0 < M; m0 += 4) {
+    const int nr = std::min(4, M - m0);
+    nntrainer::gather_conv_act_rows_fp32(tiled.data() + (size_t)m0 * K,
+                                         in.data(), p, m0, nr);
+  }
+  for (size_t i = 0; i < (size_t)M * K; ++i)
+    ASSERT_FLOAT_EQ(tiled[i], ref[i]) << "tiled mismatch at " << i;
+}
+
+TEST(nntrainer_cpu_backend_standalone, indirect_conv_gather_matches_im2col) {
+  // 3x3 stride1 pad1 (the dominant YOLO conv geometry)
+  check_indirect_gather(/*C*/ 3, /*H*/ 7, /*W*/ 7, /*k*/ 3, 3, /*pad*/ 1, 1, 1,
+                        1, /*stride*/ 1, 1, /*dil*/ 1, 1);
+  // 3x3 stride2 pad1 (downsample)
+  check_indirect_gather(8, 8, 8, 3, 3, 1, 1, 1, 1, 2, 2, 1, 1);
+  // 1x1 stride1 pad0 (pointwise)
+  check_indirect_gather(16, 5, 5, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1);
+  // 3x3 dilation2 pad2 (general scalar gather path)
+  check_indirect_gather(4, 9, 9, 3, 3, 2, 2, 2, 2, 1, 1, 2, 2);
+  // asymmetric kernel + multi-channel, stride1 pad1
+  check_indirect_gather(5, 6, 8, 3, 5, 1, 1, 2, 2, 1, 1, 1, 1);
+  // larger channel count to cross several K-blocks
+  check_indirect_gather(33, 5, 5, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1);
+}
 
 int main(int argc, char **argv) {
   int result = -1;

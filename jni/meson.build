@@ -193,6 +193,15 @@ ndk_build = find_program('ndk-build', required : true)
 ndk_args = {
   'NDK_LIBS_OUT': meson.current_build_dir(),
 }
+# jni/Android.mk gates OptimizedV3Planner behind ENABLE_MEMORY_PLANNER_V3 on
+# the ndk-build command line (its own `ifeq ($(ENABLE_MEMORY_PLANNER_V3), 1)`
+# guard). The -Dmemory-planner meson option only added
+# add_project_arguments('-DENABLE_MEMORY_PLANNER_V3=1', ...) at the top-level
+# meson.build, which never reaches this ndk-build custom_target -- so setting
+# -Dmemory-planner=v3 was a silent no-op for Android until this forwarded it.
+if get_option('memory-planner') == 'v3'
+  ndk_args += {'ENABLE_MEMORY_PLANNER_V3': '1'}
+endif
 num_threads = run_command(nproc_prog, check: true).stdout().strip()
 
 thread_opt_flag = '-j' + num_threads

@@ -74,6 +74,10 @@ void ActivationLayer::finalize(InitLayerContext &context) {
 void ActivationLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  // W8A8 int8-resident GELU pass-through (NNTR_W8A8): see geluQint8.
+  if (std::getenv("NNTR_W8A8") != nullptr && geluQint8(input_, hidden_))
+    return;
+
   // Backend-neutral whole-op dispatch: one call, no preprocessor branch, no
   // backend name. The CPU table delegates every non-gelu mode back to this very
   // same ActiFunc, so each existing mode stays value-identical; acti_func is
@@ -82,6 +86,42 @@ void ActivationLayer::forwarding(RunLayerContext &context, bool training) {
   input_.getOps()->activation(
     input_, hidden_, act_type_int,
     in_dim.batch() * in_dim.channel() * in_dim.height(), /*row_offset=*/0);
+}
+
+bool ActivationLayer::geluQint8(Tensor const &input_, Tensor &hidden_) {
+  if (input_.getDataType() != Tdatatype::QINT8)
+    return false;
+  // Only GELU is reached on an int8 edge today (CED's ffn_gelu). If another
+  // activation appears here, the caller falls back to acti_func.
+  auto &act = std::get<props::Activation>(*activation_props);
+  if (act.empty() || act.get() != ActivationType::ACT_GELU)
+    return false;
+
+  const unsigned int n = input_.size();
+  const int8_t *qi = input_.getData<int8_t>();
+  const float in_scale = input_.getScale<float>()[0];
+  static thread_local std::vector<float> fbuf, fbuf_out;
+  fbuf.resize(n);
+  fbuf_out.resize(n);
+  float *fp = fbuf.data();
+  for (unsigned int i = 0; i < n; ++i)
+    fp[i] = (float)qi[i] * in_scale;
+  // Dequantize via the inline per-tensor scale -> FP32, apply exact-erf GELU
+  // (matching ACT_GELU's float path), then requantize symmetric (amax/127 --
+  // GELU output spans both signs, so the SiLU-specific affine offset does not
+  // apply) and write the new scale. The output dtype inherits QINT8.
+  gelu_v2(n, fp, fbuf_out.data());
+  float *fo = fbuf_out.data();
+  float amax = 0.f;
+  for (unsigned int i = 0; i < n; ++i)
+    amax = std::max(amax, std::fabs(fo[i]));
+  const float sc = amax > 0.f ? amax / 127.f : 1.f;
+  const float inv = amax > 0.f ? 127.f / amax : 0.f;
+  int8_t *qo = hidden_.getData<int8_t>();
+  for (unsigned int i = 0; i < n; ++i)
+    qo[i] = (int8_t)std::max(-128.f, std::min(127.f, std::round(fo[i] * inv)));
+  hidden_.getScale<float>()[0] = sc;
+  return true;
 }
 
 void ActivationLayer::incremental_forwarding(RunLayerContext &context,
@@ -109,6 +149,23 @@ void ActivationLayer::incremental_forwarding(RunLayerContext &context,
   const unsigned int rows_in_batch = input_dim.channel() * input_dim.height();
 
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
+    // W8A8 int8-resident GELU pass-through (NNTR_W8A8): see geluQint8. The
+    // step views exist only for this check; the generic path below works on
+    // (rows, offset) numbers so a backend op can read residency state.
+    if (std::getenv("NNTR_W8A8") != nullptr) {
+      TensorDim in_step_dim = input_dim;
+      in_step_dim.batch(1);
+      in_step_dim.height(input_dim.height() > 1 ? (to - from) : 1u);
+      TensorDim out_step_dim = hidden_.getDim();
+      out_step_dim.batch(1);
+      out_step_dim.height(in_step_dim.height());
+      Tensor input_step = input_.getSharedDataTensor(
+        in_step_dim, b * input_dim.getFeatureLen(), true);
+      Tensor hidden_step = hidden_.getSharedDataTensor(
+        out_step_dim, b * hidden_.getDim().getFeatureLen(), true);
+      if (geluQint8(input_step, hidden_step))
+        continue;
+    }
     input_.getOps()->activation(input_, hidden_, act_type_int, rows_per_batch,
                                 b * rows_in_batch);
   }

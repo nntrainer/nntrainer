@@ -11,6 +11,9 @@
  *
  */
 
+#include <cstring>
+#include <fstream>
+
 #include <addition_layer.h>
 #include <env_compat.h>
 #include <nntrainer_error.h>
@@ -34,20 +37,132 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 void AdditionLayer::finalize(InitLayerContext &context) {
   if (!std::get<props::SkipPrefill>(add_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(add_props).get();
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+  TensorDim out_dim = context.getInputDimensions()[0];
+  // W8A8/PERCH: produce FP32 here instead of requantizing back to QINT8.
+  // Root cause (confirmed via on-device bisection 2026-08-11): a QINT8
+  // tensor produced by AdditionLayer does not correctly bind to its
+  // downstream consumer(s) through nntrainer's graph/tensor-pool -- a
+  // conv or concat reading this layer's output sees stale/never-written
+  // memory, even though THIS layer's own post-write view of hidden_ is
+  // correct (verified byte-exact against golden). Conv2d's per-channel
+  // GEMM path and concat's FP32-input branch both already auto-quantize a
+  // genuine FP32 input on the fly (the same mechanism the network stem
+  // uses), so emitting FP32 here sidesteps the bug entirely.
+  if (out_dim.getDataType() == nntrainer::Tdatatype::QINT8)
+    out_dim.setDataType(nntrainer::Tdatatype::FP32);
+  context.setOutputDimensions({out_dim});
 }
 
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
-  /** @todo check possibility for in-place of addition layer */
+  bool any_qint8_input = false;
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
-    const Tensor &input_ = context.getInput(idx);
-    // The first operand copies into hidden, the rest accumulate. The active
-    // backend's op table picks the residency path: the CPU table runs the same
-    // host copy/add this used to call inline, an accelerator can keep the
-    // residual stream in device memory.
-    hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
+    if (context.getInput(idx).getDataType() == nntrainer::Tdatatype::QINT8) {
+      any_qint8_input = true;
+      break;
+    }
+  }
+
+  if (any_qint8_input && hidden_.getDataType() == nntrainer::Tdatatype::FP32) {
+    // See finalize(): dequantize QINT8 inputs and sum in FP32 directly,
+    // skipping the QINT8 output requantization that doesn't bind correctly.
+    static const bool perch_asym_env =
+      std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+      std::getenv("NNTR_W8A8_SYM") == nullptr;
+    constexpr float kActOff = 0.27846455f;
+    float *out = hidden_.getData<float>();
+    const size_t n = hidden_.size();
+    for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
+      const Tensor &input_ = context.getInput(idx);
+      if (input_.getDataType() == nntrainer::Tdatatype::QINT8) {
+        const int8_t *q = input_.getData<int8_t>();
+        const float sc = input_.getScale<float>()[0];
+        if (!idx) {
+          if (perch_asym_env)
+            for (size_t i = 0; i < n; ++i)
+              out[i] = ((float)q[i] + 128.f) * sc - kActOff;
+          else
+            for (size_t i = 0; i < n; ++i)
+              out[i] = sc * (float)q[i];
+        } else {
+          if (perch_asym_env)
+            for (size_t i = 0; i < n; ++i)
+              out[i] += ((float)q[i] + 128.f) * sc - kActOff;
+          else
+            for (size_t i = 0; i < n; ++i)
+              out[i] += sc * (float)q[i];
+        }
+      } else {
+        const float *d = input_.getData<float>();
+        if (!idx)
+          std::copy(d, d + n, out);
+        else
+          for (size_t i = 0; i < n; ++i)
+            out[i] += d[i];
+      }
+    }
+  } else {
+    for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
+      const Tensor &input_ = context.getInput(idx);
+      // The first operand copies into hidden, the rest accumulate. The active
+      // backend's op table picks the residency path: the CPU table runs the
+      // same host copy/add this used to call inline, an accelerator can keep
+      // the residual stream in device memory.
+      hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
+    }
+  }
+
+  if (const char *dl = std::getenv("NNTR_CONCAT_DEBUG");
+      dl && std::strstr(dl, context.getName().c_str()) &&
+      hidden_.getDataType() == nntrainer::Tdatatype::QINT8) {
+    const int8_t *q = hidden_.getData<int8_t>();
+    const float sc = hidden_.getScale<float>()[0];
+    int8_t qmin = 127, qmax = -128;
+    for (size_t i = 0; i < hidden_.size(); ++i) {
+      if (q[i] < qmin)
+        qmin = q[i];
+      if (q[i] > qmax)
+        qmax = q[i];
+    }
+    std::cerr << "[CONCATDBG] " << context.getName()
+              << " (producer) scale=" << sc << " qmin=" << (int)qmin
+              << " qmax=" << (int)qmax << " n=" << hidden_.size()
+              << " ptr=" << (const void *)q << "\n"
+              << std::flush;
+  }
+
+  // Dump one named layer's real output (from inside the untruncated
+  // production forward pass), for external bisection.
+  if (const char *dl = std::getenv("NNTR_DUMP_LAYER");
+      dl && context.getName() == dl) {
+    const char *dp = std::getenv("NNTR_DUMP_PATH");
+    if (dp) {
+      std::vector<float> buf(hidden_.size());
+      if (hidden_.getDataType() == nntrainer::Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+        const _FP16 *d = hidden_.getData<_FP16>();
+        for (unsigned int i = 0; i < hidden_.size(); ++i)
+          buf[i] = (float)d[i];
+#endif
+      } else if (hidden_.getDataType() == nntrainer::Tdatatype::QINT8) {
+        const int8_t *q = hidden_.getData<int8_t>();
+        const float sc = hidden_.getScale<float>()[0];
+        static const bool perch_asym_env =
+          std::getenv("NNTR_W8A8_PERCH") != nullptr &&
+          std::getenv("NNTR_W8A8_SYM") == nullptr;
+        constexpr float kActOff = 0.27846455f;
+        for (unsigned int i = 0; i < hidden_.size(); ++i)
+          buf[i] = perch_asym_env ? ((float)q[i] + 128.f) * sc - kActOff
+                                  : sc * (float)q[i];
+      } else {
+        const float *d = hidden_.getData<float>();
+        std::copy(d, d + hidden_.size(), buf.begin());
+      }
+      std::ofstream of(dp, std::ios::binary);
+      of.write(reinterpret_cast<const char *>(buf.data()),
+               buf.size() * sizeof(float));
+    }
   }
 }
 

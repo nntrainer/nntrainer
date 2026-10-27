@@ -19,12 +19,18 @@
   defined(_M_ARM64)
 #include <arm_compute_backend.h>
 #define NNTR_CPU_HAS_Q6_K_Q8_K_DOT 1
+// The im2col-fused q4_0 conv GEMM rides the ARM i8mm 4x8 micro-kernel; only the
+// ARM backend implements it. Single source of truth for both the ComputeOps
+// supports_*() flag and the conv layer's path/scratch selection.
+#define NNTR_HAS_Q4_0_INDIRECT_CONV 1
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
 #include <x86_compute_backend.h>
 #define NNTR_CPU_HAS_Q6_K_Q8_K_DOT 1
+#define NNTR_HAS_Q4_0_INDIRECT_CONV 0
 #else
 #include <fallback.h>
+#define NNTR_HAS_Q4_0_INDIRECT_CONV 0
 #endif
 
 /**
@@ -38,6 +44,9 @@
 // Expose the ComputeOps dispatch table (and init_backend declaration) to any
 // consumer that already includes cpu_backend.h.
 #include <compute_ops.h>
+
+// ConvGatherParams for the im2col-fused q4_0 conv GEMM declaration below.
+#include <conv_indirect.h>
 
 #include <common.h>
 #include <cstdint>
@@ -1130,6 +1139,82 @@ extern void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                       std::vector<unsigned int> ldcs);
 
 /**
+ * @brief q8_0 GEMM : A (M,K) * W.T (N,K) = O (M,N)
+ */
+template <typename T = float>
+extern void gemm_q8_0(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const T *A, const unsigned int lda,
+                      const void *B, const unsigned int ldb, T *C,
+                      const unsigned int ldc);
+
+/**
+ * @brief q4_0 conv GEMM with im2col gather fused into the q8_0 activation
+ * packing. The FP32 im2col col buffer is never materialized: each output row is
+ * gathered directly from the NCHW input @a in (per @a geom) as it is quantized.
+ * The weight @a B and the i8mm micro-kernel are identical to gemm_q4_0.
+ *
+ * @param M Output row count (OH * OW)
+ * @param N Output channel count
+ * @param K Reduction size (in_ch * k_h * k_w)
+ * @param in NCHW input activation (gathered on the fly, not pre-im2col'd)
+ * @param geom Convolution geometry describing the gather
+ * @param B (void*) offline-quantized transposed q4_0 weight
+ * @param ldb Leading dimension of B
+ * @param C float* output [M, N]
+ * @param ldc Leading dimension of C
+ */
+extern void gemm_q4_0_indirect_conv(const unsigned int M, const unsigned int N,
+                                    const unsigned int K, const float *in,
+                                    const nntrainer::ConvGatherParams &geom,
+                                    const void *B, const unsigned int ldb,
+                                    float *C, const unsigned int ldc);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-activation q4_0 conv GEMM with im2col-fused q8_0 activation
+ * packing (no FP16 col materialization). FP16 mirror of
+ * gemm_q4_0_indirect_conv above.
+ *
+ * @param in batch-sliced contiguous NCHW _FP16 input
+ * @param C  _FP16* output [M, N]
+ */
+extern void gemm_q4_0_indirect_conv_fp16(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const _FP16 *in, const nntrainer::ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc);
+
+/**
+ * @brief Q8_0-activation q4_0 conv GEMM (ARM-only; x86 NYI stub). Callers
+ * gate on supports_gemm_q4_0_indirect_conv_q8_0().
+ *
+ * @param in batch-sliced contiguous NCHW q8_0-packed input
+ * @param C  _FP16* output [M, N]
+ */
+extern void gemm_q4_0_indirect_conv_q8_0(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const void *in, const nntrainer::ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc);
+
+/**
+ * @brief Q8_0-activation q8_0 conv GEMM, Q8_0 weight (ARM-only; x86 NYI
+ * stub). Callers gate on supports_gemm_q8_0_indirect_conv_q8_0().
+ */
+extern void gemm_q8_0_indirect_conv_q8_0(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const void *in, const nntrainer::ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc);
+
+/**
+ * @brief FP16-activation q8_0 conv GEMM, Q8_0 weight / W8A16 (ARM-only; x86
+ * NYI stub). Callers gate on supports_gemm_q8_0_indirect_conv_fp16().
+ */
+extern void gemm_q8_0_indirect_conv_fp16(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const _FP16 *in, const nntrainer::ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc);
+#endif
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output
@@ -1178,6 +1263,16 @@ extern void gemm_q6_K(const unsigned int M, const unsigned int N,
  */
 extern size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
                             int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief quantize_q8_0 function
+ */
+extern size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                            int64_t n_per_row, const float *quant_weights);
+#ifdef ENABLE_FP16
+extern size_t quantize_q8_0(const _FP16 *src, void *dst, int64_t nrow,
+                            int64_t n_per_row, const float *quant_weights);
+#endif
 
 /**
  * @brief quantize_q4_K function
@@ -1246,6 +1341,16 @@ extern void dequantize_row_q4_K(const void *x, float *y, int64_t k);
 extern void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 
 /**
+ * @brief dequantize row of q8_0 data to float
+ */
+extern void dequantize_row_q8_0(const void *x, float *y, int64_t k);
+
+/**
+ * @brief quantize row of float data to q8_0
+ */
+extern void quantize_row_q8_0(const float *src, void *dst, int64_t k);
+
+/**
  * @brief dequantize row of q6_K data to float
  *
  * @param x input to be dequantized from q6_K to float
@@ -1300,6 +1405,33 @@ extern void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 extern void repack_q4_0(void *dst, void *src, size_t data_size,
                         const unsigned int M, const unsigned int N,
                         ml::train::ISA target = ml::train::ISA::DEFAULT);
+
+/**
+ * @brief repack q8_0 rows to q8_0x4, the layout the Q8_0 GEMM kernels use
+ *
+ * Every 4 rows are interleaved block by block: the 4 fp16 scales come first,
+ * then bytes 8k..8k+7 of row r go to qs[32k + 8r].
+ *
+ * @param dst output q8_0x4
+ * @param src input q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+extern void repack_q8_0(void *dst, const void *src, size_t data_size,
+                        const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q8_0x4 to q8_0 rows - inverse of repack_q8_0
+ *
+ * @param src input q8_0x4
+ * @param dst output q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+extern void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                        const unsigned int M, const unsigned int N);
 
 /**
  * @brief repack q4K to q4Kx8
@@ -1514,6 +1646,33 @@ template <typename T = float>
 extern void clamp(const T *input, T *output, size_t length,
                   T lower_bound = std::numeric_limits<T>::lowest(),
                   T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief Depthwise convolution FP32 backend op.
+ *        Input  : [batch, channels, in_h,  in_w ] contiguous NCHW.
+ *        Kernel : [channels, 1, kh, kw]  — channel c at kernel + c*kh*kw.
+ *        Output : [batch, channels, out_h, out_w] contiguous NCHW.
+ *        No bias (added by the caller afterward).
+ */
+extern void depthwise_conv2d_fp32(
+  const float *input, const float *kernel, float *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief Depthwise convolution FP16 backend op. FP16-activation mirror of
+ *        depthwise_conv2d_fp32 (same layout/semantics, float accumulation).
+ */
+extern void depthwise_conv2d_fp16(
+  const _FP16 *input, const float *kernel, _FP16 *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w);
+#endif
 
 /**
  * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights

@@ -720,6 +720,11 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+  // Orchestrator subclasses (e.g. ScreenAICaption) own sub-models instead of
+  // populating this base `model` member; nothing to repack here in that case.
+  if (!model) {
+    return;
+  }
   /** Recorded (before the engine gate below, which is a per-engine no-op rather
    *  than "the caller did not ask") so growPrefillPlane() replays the caller's
    *  load sequence in the same order it happened. */

@@ -243,6 +243,10 @@ causallm_src = [
   causallm_root / 'models' / 'bert' / 'bert_transformer.cpp',
   causallm_root / 'models' / 'bert' / 'multilingual_tinybert_16mb.cpp',
   causallm_root / 'models' / 'xlm_roberta' / 'xlm_roberta.cpp',
+  causallm_root / 'models' / 'siglip2' / 'siglip2_vision_encoder.cpp',
+  causallm_root / 'models' / 'bert_decoder' / 'bert_decoder.cpp',
+  causallm_root / 'models' / 'screenai_caption' / 'screenai_caption.cpp',
+  causallm_root / 'models' / 'FastViTKeyword' / 'jni' / 'fastvit_attention_layer.cpp',
   causallm_root / 'layers' / 'embedding_layer.cpp',
   causallm_root / 'layers' / 'embedding_pooling_layer.cpp',
   causallm_root / 'layers' / 'embedding_normalize_layer.cpp',
@@ -257,6 +261,8 @@ causallm_src = [
   causallm_root / 'layers' / 'rms_reverse_norm.cpp',
   causallm_root / 'layers' / 'deberta_attention_layer.cpp',
   causallm_root / 'layers' / 'shared_fully_connected_layer.cpp',
+  causallm_root / 'layers' / 'rtmcc_head.cpp',
+  causallm_root / 'layers' / 'xi_pooling.cpp',
   causallm_root / 'api' / 'streamer.cpp',
 ]
 

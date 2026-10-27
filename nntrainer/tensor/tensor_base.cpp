@@ -345,7 +345,8 @@ void TensorBase::calculateFlattenDot(
     ml_logw("Warning: support only for rank of dot matrix <= 2 with trans");
   }
 
-  if (getFormat() == Tformat::NHWC) {
+  const bool is_nhwc = (getFormat() == Tformat::NHWC);
+  if (is_nhwc) {
     first_three_flat = batch() * height() * width();
     last_axis = channel();
     input_first_three_flat = input.batch() * input.height() * input.width();
@@ -358,9 +359,18 @@ void TensorBase::calculateFlattenDot(
   }
 
   if (!trans && !trans_in) {
-    if (last_axis != input_first_three_flat)
-      throw std::runtime_error(
-        "Error: incompatible dimensions for dot product");
+    if (last_axis != input_first_three_flat) {
+      std::stringstream ss;
+      ss << "Error: incompatible dimensions for dot product. this: [" << batch()
+         << "," << channel() << "," << height() << "," << width()
+         << "] (format=" << static_cast<int>(getFormat()) << "), input: ["
+         << input.batch() << "," << input.channel() << "," << input.height()
+         << "," << input.width()
+         << "] (format=" << static_cast<int>(input.getFormat())
+         << "), last_axis: " << last_axis
+         << ", input_first_three_flat: " << input_first_three_flat;
+      throw std::runtime_error(ss.str());
+    }
     K = input_first_three_flat; /** == last_axis */
     N = input_last_axis;
     M = first_three_flat;
@@ -419,7 +429,7 @@ void TensorBase::calculateFlattenDot(
 
   lda = last_axis;
   ldb = input_last_axis;
-  ldc = (getFormat() == Tformat::NHWC) ? output.channel() : output.width();
+  ldc = (is_nhwc) ? output.channel() : output.width();
 }
 
 /**
@@ -602,6 +612,14 @@ void TensorBase::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   throw std::invalid_argument("Tensor::dot(std::vector<Tensor*>) is currently "
                               "not supported in tensor data type " +
                               getStringDataType());
+}
+
+Tensor &TensorBase::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                     const ConvGatherParams &geom) const {
+  throw std::invalid_argument(
+    "Tensor::convQ4_0Indirect() is currently not supported in tensor data "
+    "type " +
+    getStringDataType());
 }
 
 void TensorBase::dropout_mask(float dropout) {

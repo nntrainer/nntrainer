@@ -172,7 +172,20 @@ public:
       return;
     }
 
-    if (end - begin == 1 || compute_workers_.empty()) {
+    // Below a small iteration count the threadpool dispatch cost (mutex +
+    // std::function assign + futex wake/join of every worker) outweighs the
+    // parallel speedup, so run serially on the calling thread. The threshold is
+    // tunable at runtime via NNTR_PARALLEL_MIN (default 1 = only the trivial
+    // single-iteration case) so it can be swept per device without a rebuild.
+    static const size_t min_parallel = []() -> size_t {
+      const char *e = std::getenv("NNTR_PARALLEL_MIN");
+      if (!e)
+        return 1;
+      size_t v = static_cast<size_t>(std::strtoul(e, nullptr, 10));
+      return v < 1 ? 1 : v;
+    }();
+
+    if (end - begin <= min_parallel || compute_workers_.empty()) {
       for (size_t i = begin; i < end; i++)
         fn(i);
       return;
@@ -194,6 +207,31 @@ public:
    * @warning It should be called before first call of thread manager.
    */
   static void setConfig(const ThreadManagerConfig &config) { config_ = config; }
+
+  /**
+   * @brief Override the compute thread count before the pool starts.
+   * @param num_threads number of compute threads (including main thread)
+   * @return false if the pool was already initialized (call came too late,
+   *         after the first Global()/parallel_for() in this process) or if
+   *         num_threads is 0; true if the override was applied.
+   * @note Unlike setConfig(), this checks whether the pool has already
+   *       spun up and reports failure instead of silently doing nothing.
+   */
+  static bool setComputeThreads(uint32_t num_threads) {
+    if (num_threads == 0 || pool_initialized_.load(std::memory_order_acquire))
+      return false;
+    config_.compute_threads = num_threads;
+    return true;
+  }
+
+  /**
+   * @brief return the currently configured compute thread count
+   * @note This is the configured value, not necessarily what the running
+   *       pool ended up with (initialize() may clamp it to hw_threads).
+   */
+  static uint32_t getConfiguredComputeThreads() {
+    return config_.compute_threads;
+  }
 
 private:
 #if defined(__linux__) || defined(__ANDROID__)
@@ -274,13 +312,20 @@ private:
 #if defined(__linux__) || defined(__ANDROID__)
     has_active_threads_.store(1, std::memory_order_relaxed);
 #endif
-    // distribute loops
-    size_t range_quotient = (end - begin) / threads_count;
-    size_t range_remainder = (end - begin) % threads_count;
+    // distribute loops. Only spread work across as many threads as there are
+    // iterations: with fewer iterations than threads, the surplus workers get
+    // an empty range (they still wake and rejoin the barrier, but do no work
+    // and never touch a stale range from a previous call). This avoids
+    // splitting e.g. 3 iterations across 8 threads.
+    const size_t work = end - begin;
+    const size_t active = work < threads_count ? work : threads_count;
+    size_t range_quotient = work / active;
+    size_t range_remainder = work % active;
 
     size_t range_start = begin;
     for (size_t tid = 0; tid < threads_count; tid++) {
-      size_t range_length = range_quotient + (size_t)(tid < range_remainder);
+      size_t range_length =
+        tid < active ? range_quotient + (size_t)(tid < range_remainder) : 0;
       size_t range_end = range_start + range_length;
 
       thread_infos_[tid].range_start.store(range_start,
@@ -341,6 +386,7 @@ private:
 
   // ─── Config ─────────────────────────────────────────
   static ThreadManagerConfig config_;
+  static std::atomic<bool> pool_initialized_;
 };
 
 } // namespace nntrainer

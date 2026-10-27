@@ -37,6 +37,7 @@ inline size_t modulo_decrement(size_t i, size_t n) {
 namespace nntrainer {
 
 ThreadManagerConfig ThreadManager::config_ = {};
+std::atomic<bool> ThreadManager::pool_initialized_{false};
 
 /** @brief Return the ThreadManager singleton. */
 template <>
@@ -75,6 +76,10 @@ ThreadManager::~ThreadManager() {
 }
 
 void ThreadManager::initialize() noexcept {
+  // Mark the pool as committed before reading config_ so that any
+  // setComputeThreads() call racing with this initialize() either lands
+  // before this line (and is reflected below) or is correctly rejected.
+  pool_initialized_.store(true, std::memory_order_release);
   auto config = config_;
 
   // Don't initialize for 1 thread(0 worker)

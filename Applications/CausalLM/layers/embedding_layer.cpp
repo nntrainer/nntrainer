@@ -838,8 +838,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   // wiring.]
   auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
   const bool has_quantized_lut = !quantized_lut_path.empty();
-  context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
-
+  if (has_quantized_lut)
+    context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
@@ -1271,7 +1271,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     const auto wt = ggml_lut ? quant_lut->ggml_dtype : weight_p->getDataType();
     const bool row_quant = (wt == nntrainer::TensorDim::DataType::Q6_K ||
-                            wt == nntrainer::TensorDim::DataType::Q4_0);
+                            wt == nntrainer::TensorDim::DataType::Q4_0 ||
+                            wt == nntrainer::TensorDim::DataType::Q8_0);
     // Per-channel 4-bit symmetric embedding table (upstream QS4CX support).
     // finalize() stores it transposed as (out_dim, in_dim) so the per-channel
     // scale vector has in_dim entries; the row decoder takes the token id as
@@ -1295,6 +1296,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       qs4cx_lut ? quant_lut->row_bytes
                 : ((wt == nntrainer::TensorDim::DataType::Q6_K)
                      ? 210 * ((static_cast<size_t>(out_dim) + 255) / 256)
+                   : (wt == nntrainer::TensorDim::DataType::Q8_0)
+                     ? 34 * ((static_cast<size_t>(out_dim) + 31) / 32)
                      : 18 * ((static_cast<size_t>(out_dim) + 31) / 32));
     // The scale block follows all the nibble rows, so it starts where the
     // payload's row region ends.
@@ -1406,6 +1409,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             const void *row = quant_table + row_stride * embed_idx;
             if (wt == nntrainer::TensorDim::DataType::Q6_K)
               nntrainer::dequantize_row_q6_K(const_cast<void *>(row),
+                                             tmp.data(), out_dim);
+            else if (wt == nntrainer::TensorDim::DataType::Q8_0)
+              nntrainer::dequantize_row_q8_0(const_cast<void *>(row),
                                              tmp.data(), out_dim);
             else
               nntrainer::dequantize_row_q4_0(const_cast<void *>(row),
@@ -1585,6 +1591,19 @@ void EmbeddingLayer::save(std::ofstream &file,
           nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                          {nntrainer::Tformat::NCHW, dtype});
           nntrainer::quantize_q4_0(weight.getData<float>(),
+                                   quant_weight.getData<uint8_t>(), K, N,
+                                   nullptr);
+          quant_weight.save(out);
+        } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+          NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+            << "Q8_0 embedding quantization requires width to be "
+               "divisible by 32, but got width="
+            << N;
+          // Same plain row layout as Q4_0: the lookup table is never
+          // transposed, each row is ceil(N/32) block_q8_0 (34 bytes each).
+          nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                         {nntrainer::Tformat::NCHW, dtype});
+          nntrainer::quantize_q8_0(weight.getData<float>(),
                                    quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(out);

@@ -21,10 +21,14 @@
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <limits>
+#include <nntr_ggml_impl.h>
 #include <q4_0_utils.h>
+#include <q8_0_tensor.h>
 #include <stdexcept>
 #include <tensor_dim.h>
+#include <thread_manager.h>
 #include <util_func.h>
+#include <vector>
 
 #define sgemv_loop(ci, cj, cM, cN)                                             \
   do {                                                                         \
@@ -497,6 +501,95 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
   throw std::runtime_error("NYI : __fallback_gemm_q4_0");
 }
 
+namespace {
+// IEEE 754 half-precision (fp16) -> single-precision (fp32) bit cast.
+static inline float fp16_bits_to_fp32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h & 0x7C00u) >> 10;
+  uint32_t mant = h & 0x03FFu;
+  uint32_t f;
+  if (exp == 0u) {
+    if (mant == 0u) {
+      f = sign;
+    } else {
+      while ((mant & 0x0400u) == 0u) {
+        mant <<= 1;
+        exp -= 1u;
+      }
+      exp += 1u;
+      mant &= ~0x0400u;
+      f = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    f = sign | 0x7F800000u | (mant << 13);
+  } else {
+    f = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+} // namespace
+
+template <>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const float *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, float *C,
+                          const unsigned int ldc) {
+  constexpr unsigned int QK = 32;
+  /// same layout as block_q8_0: fp16 scale and 32 int8 quants
+  struct Block {
+    uint16_t d;
+    int8_t qs[QK];
+  };
+  /// same layout as block_q8_0x4: 4 scales, quant l of row r at
+  /// qs[32 * (l / 8) + 8 * r + l % 8]
+  struct Block4 {
+    uint16_t d[4];
+    int8_t qs[4 * QK];
+  };
+  if (K % QK != 0 || N % 4 != 0)
+    throw std::invalid_argument(
+      "gemm_q8_0: K must be a multiple of 32 and N a multiple of 4");
+  if (ldb != K)
+    throw std::invalid_argument("gemm_q8_0: B must be packed (ldb == K)");
+
+  const unsigned int nb = K / QK;
+  std::vector<Block> a_q(nb);
+  const Block4 *b_blocks = static_cast<const Block4 *>(B);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    // quantize one activation row the way GGML does: d = amax / 127
+    const float *a = A + static_cast<size_t>(m) * lda;
+    for (unsigned int b = 0; b < nb; ++b) {
+      float amax = 0.0f;
+      for (unsigned int l = 0; l < QK; ++l)
+        amax = std::max(amax, std::fabs(a[b * QK + l]));
+      const float d = amax / 127.0f;
+      const float id = d != 0.0f ? 1.0f / d : 0.0f;
+      a_q[b].d = compute_fp32_to_fp16(d);
+      for (unsigned int l = 0; l < QK; ++l)
+        a_q[b].qs[l] = static_cast<int8_t>(std::round(a[b * QK + l] * id));
+    }
+
+    for (unsigned int n = 0; n < N; ++n) {
+      const Block4 *w = b_blocks + static_cast<size_t>(n / 4) * nb;
+      const unsigned int r = n % 4;
+      float acc = 0.0f;
+      for (unsigned int b = 0; b < nb; ++b) {
+        int32_t sumi = 0;
+        for (unsigned int l = 0; l < QK; ++l)
+          sumi += static_cast<int32_t>(a_q[b].qs[l]) *
+                  w[b].qs[32 * (l / 8) + 8 * r + l % 8];
+        acc += compute_fp16_to_fp32(a_q[b].d) *
+               compute_fp16_to_fp32(w[b].d[r]) * static_cast<float>(sumi);
+      }
+      C[static_cast<size_t>(m) * ldc + n] = acc;
+    }
+  }
+}
+
 void __fallback_gemm_q4_K(const unsigned int M, const unsigned int N,
                           const unsigned int K, const float *A,
                           const unsigned int lda, const void *B,
@@ -592,6 +685,58 @@ void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
                                       size_t data_size, const unsigned int M,
                                       const unsigned int N) {
   throw std::runtime_error("NYI : __fallback_unpack_q4_0_8_to_q4_0");
+}
+
+/**
+ * @brief Moves bytes between q8_0 rows and q8_0x4 blocks, one way or the other.
+ *
+ * A block_q8_0 is an fp16 scale and 32 int8 quants. A block_q8_0x4 holds the
+ * same block of 4 rows: their 4 scales, then bytes 8k..8k+7 of row r at
+ * qs[32k + 8r].
+ */
+template <bool pack>
+static void q8_0x4_convert(const void *src, void *dst, size_t data_size,
+                           const unsigned int M, const unsigned int N) {
+  constexpr size_t block_bytes = sizeof(uint16_t) + 32;
+  const size_t nb = N / 32;
+  if (M % 4 != 0 || N % 32 != 0 || data_size != M * nb * block_bytes)
+    throw std::invalid_argument(
+      "q8_0x4 needs rows in multiples of 4, columns in multiples of 32 and a "
+      "matching data size");
+
+  const uint8_t *in = static_cast<const uint8_t *>(src);
+  uint8_t *out = static_cast<uint8_t *>(dst);
+  auto move = [&](size_t x4_off, size_t row_off, size_t n) {
+    if (pack)
+      std::memcpy(out + x4_off, in + row_off, n);
+    else
+      std::memcpy(out + row_off, in + x4_off, n);
+  };
+
+  for (size_t r = 0; r < M; r += 4) {
+    for (size_t b = 0; b < nb; ++b) {
+      const size_t x4 = (r / 4 * nb + b) * 4 * block_bytes;
+      for (size_t i = 0; i < 4; ++i) {
+        const size_t row = ((r + i) * nb + b) * block_bytes;
+        move(x4 + sizeof(uint16_t) * i, row, sizeof(uint16_t));
+        for (size_t k = 0; k < 4; ++k)
+          move(x4 + 4 * sizeof(uint16_t) + 32 * k + 8 * i,
+               row + sizeof(uint16_t) + 8 * k, 8);
+      }
+    }
+  }
+}
+
+void __fallback_repack_q8_0_to_q8_0_4x8(void *dst, const void *src,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<true>(src, dst, data_size, M, N);
+}
+
+void __fallback_unpack_q8_0_4x8_to_q8_0(const void *src, void *dst,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<false>(src, dst, data_size, M, N);
 }
 
 void __fallback_softmax_row_inplace(float *qk_out, size_t start_row,
@@ -1427,5 +1572,88 @@ void __fallback_gemm_qs8d32p_qs4c32p_packed(size_t m, size_t n, size_t k,
                                             float upper_bound) {
   throw std::runtime_error("NYI : __fallback_gemm_qs8d32p_qs4c32p_packed");
 }
+
+void __fallback_depthwise_conv2d_fp32(
+  const float *input, const float *kernel, float *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w) {
+  // Scalar depthwise conv — reproduces the fast path from conv2d_layer.cpp.
+  // Layout: input/output are NCHW contiguous; kernel is [C,1,kh,kw].
+  // Parallelized over (batch*channels) via the nntr thread manager (the same
+  // primitive ggml_interface_omp uses), so each channel's small convolution
+  // runs independently — this preserves the channel-parallel speedup the old
+  // in-layer ParallelBatch fast path had.
+  // TODO: NEON/AVX inner-loop specialization in the arch backends.
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, (size_t)batch * channels, [&](size_t bc) {
+    const unsigned int c = (unsigned int)(bc % channels);
+    const float *inc = input + bc * in_h * in_w;
+    const float *fc = kernel + (size_t)c * kh * kw;
+    float *outc = output + bc * out_h * out_w;
+    for (unsigned int oh = 0; oh < out_h; ++oh) {
+      const int ih0 = (int)oh * (int)stride_h - (int)pad_top;
+      for (unsigned int ow = 0; ow < out_w; ++ow) {
+        const int iw0 = (int)ow * (int)stride_w - (int)pad_left;
+        float acc = 0.0f;
+        for (unsigned int ki = 0; ki < kh; ++ki) {
+          const int ih = ih0 + (int)ki * (int)dilation_h;
+          if (ih < 0 || ih >= (int)in_h)
+            continue;
+          for (unsigned int kj = 0; kj < kw; ++kj) {
+            const int iw = iw0 + (int)kj * (int)dilation_w;
+            if (iw < 0 || iw >= (int)in_w)
+              continue;
+            acc += inc[(size_t)ih * in_w + iw] * fc[ki * kw + kj];
+          }
+        }
+        outc[(size_t)oh * out_w + ow] = acc;
+      }
+    }
+  });
+}
+
+#ifdef ENABLE_FP16
+void __fallback_depthwise_conv2d_fp16(
+  const _FP16 *input, const float *kernel, _FP16 *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w) {
+  // FP16 mirror of __fallback_depthwise_conv2d_fp32: same channel-parallel
+  // direct loop, but accumulate in float (the kernel/input are widened per MAC)
+  // so a long kh*kw reduction does not lose precision in FP16. Output narrowed
+  // back to _FP16. Keeps depthwise off the slow per-channel im2col + FP16 GEMV
+  // path the grouped conv else-branch would otherwise take.
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, (size_t)batch * channels, [&](size_t bc) {
+    const unsigned int c = (unsigned int)(bc % channels);
+    const _FP16 *inc = input + bc * in_h * in_w;
+    const float *fc = kernel + (size_t)c * kh * kw;
+    _FP16 *outc = output + bc * out_h * out_w;
+    for (unsigned int oh = 0; oh < out_h; ++oh) {
+      const int ih0 = (int)oh * (int)stride_h - (int)pad_top;
+      for (unsigned int ow = 0; ow < out_w; ++ow) {
+        const int iw0 = (int)ow * (int)stride_w - (int)pad_left;
+        float acc = 0.0f;
+        for (unsigned int ki = 0; ki < kh; ++ki) {
+          const int ih = ih0 + (int)ki * (int)dilation_h;
+          if (ih < 0 || ih >= (int)in_h)
+            continue;
+          for (unsigned int kj = 0; kj < kw; ++kj) {
+            const int iw = iw0 + (int)kj * (int)dilation_w;
+            if (iw < 0 || iw >= (int)in_w)
+              continue;
+            acc += static_cast<float>(inc[(size_t)ih * in_w + iw]) *
+                   static_cast<float>(fc[ki * kw + kj]);
+          }
+        }
+        outc[(size_t)oh * out_w + ow] = static_cast<_FP16>(acc);
+      }
+    }
+  });
+}
+#endif
 
 } // namespace nntrainer

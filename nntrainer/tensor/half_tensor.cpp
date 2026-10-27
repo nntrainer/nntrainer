@@ -14,14 +14,21 @@
 #include <mutex>
 #include <numeric>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <compute_ops.h>
 #include <cpu_backend.h>
 #include <fp16.h>
 #include <half_tensor.h>
+#include <int8_gemm.h>
 #include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <tensor.h>
 #include <thread_manager.h>
 #include <util_func.h>
+
+#include <conv_indirect.h>
 
 namespace nntrainer {
 
@@ -741,6 +748,7 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   }
   case Tdatatype::Q4_0:
   case Tdatatype::Q6_K:
+  case Tdatatype::Q8_0:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   case Tdatatype::QS4CX: {
@@ -822,7 +830,11 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     break;
   }
   default:
-    throw std::invalid_argument("Error: unsupported datatype");
+    throw std::invalid_argument(
+      "HalfTensor::dot: unsupported operand datatype (Tdatatype=" +
+      std::to_string(static_cast<int>(input.getDataType())) +
+      ", expected FP16, Q4_0, Q6_K or Q8_0). An FP32 weight under an "
+      "FP16-activation model usually means that layer was left unquantized.");
   }
   return output;
 }
@@ -845,9 +857,87 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q6_K:
     o->gemm_q6_K_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
+  case Tdatatype::Q8_0:
+    /// Q8_0 has no direct GEMM kernel for FP16; dequantize to FP32 then
+    /// cast to FP16 for GEMM
+    M = getDim().height();
+    K = getDim().width();
+    N = input.getDim().width();
+    {
+      size_t total_elems = (size_t)K * N;
+      static thread_local std::vector<float> dq_buf;
+      static thread_local std::vector<_FP16> dq_fp16;
+      static thread_local std::vector<uint8_t> rows;
+      if (dq_buf.size() < total_elems) {
+        dq_buf.resize(total_elems);
+      }
+      if (dq_fp16.size() < total_elems) {
+        dq_fp16.resize(total_elems);
+      }
+      // A per-block weight is q8_0x4 (see repack_q8_0); a channel-wise
+      // (NNTR_W8A8_PERCH) one stays in plain rows. Dequantize N rows of K.
+      const void *plain = mdata;
+      if (!int8_gemm::prepareWeight(mdata, N, K).usable) {
+        const size_t q_bytes = input.size();
+        if (rows.size() < q_bytes)
+          rows.resize(q_bytes);
+        unpack_q8_0(mdata, rows.data(), q_bytes, N, K);
+        plain = rows.data();
+      }
+      dequantize_row_q8_0(plain, dq_buf.data(), (int64_t)total_elems);
+      // Cast to FP16 using NEON vectorization if available
+#if defined(__ARM_NEON)
+      size_t i = 0;
+      for (; i + 7 < total_elems; i += 8) {
+        float32x4_t f0 = vld1q_f32(dq_buf.data() + i);
+        float32x4_t f1 = vld1q_f32(dq_buf.data() + i + 4);
+        float16x4_t h0 = vcvt_f16_f32(f0);
+        float16x4_t h1 = vcvt_f16_f32(f1);
+        vst1_f16((float16_t *)(dq_fp16.data() + i), h0);
+        vst1_f16((float16_t *)(dq_fp16.data() + i + 4), h1);
+      }
+      for (; i < total_elems; ++i) {
+        dq_fp16[i] = static_cast<_FP16>(dq_buf[i]);
+      }
+#else
+      for (size_t i = 0; i < total_elems; ++i)
+        dq_fp16[i] = static_cast<_FP16>(dq_buf[i]);
+#endif
+      const float alpha = 1.0f;
+      o->sgemm_fp16((unsigned int)dim.getStorageOrder(), false, true, M, N, K,
+                    alpha, data, K, dq_fp16.data(), K, beta, rdata, N);
+    }
+    break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
+  return output;
+}
+
+Tensor &HalfTensor::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                     const ConvGatherParams &geom) const {
+  // `this` is the NCHW FP16 input (gathered on the fly in FP16), `weight` is
+  // the Q4_0 filter [CRS, out_ch], `output` is [OH*OW, out_ch] FP16. The fused
+  // backend op mirrors FloatTensor::convQ4_0Indirect: M = output rows (OH*OW),
+  // N = out_ch, K = CRS. The gather stays FP16 (no FP32 staging), the FP16 Q8_0
+  // quantizer (id-FP32-narrowing-fixed) feeds the FP16-output Q4_0xQ8_0 GEMM.
+  const _FP16 *in = (const _FP16 *)getData();
+  uint8_t *wdata = weight.getData<uint8_t>();
+  _FP16 *rdata = output.getData<_FP16>();
+
+  unsigned int M = output.getDim().height();
+  unsigned int N = output.getDim().width();
+  unsigned int K =
+    (unsigned int)geom.in_ch * (unsigned int)geom.k_h * (unsigned int)geom.k_w;
+
+  // Q8_0 weights use the plain-block Q8_0xQ8_0 kernel; Q4_0 uses the
+  // interleaved SMMLA kernel. Both quantize this FP16 activation identically.
+  if (weight.getDataType() == Tdatatype::Q8_0)
+    getOps()->gemm_q8_0_indirect_conv_fp16(M, N, K, in, geom, (void *)wdata, N,
+                                           rdata, N);
+  else
+    getOps()->gemm_q4_0_indirect_conv_fp16(M, N, K, in, geom, (void *)wdata, N,
+                                           rdata, N);
   return output;
 }
 
@@ -1310,23 +1400,59 @@ void HalfTensor::apply_broadcast(
 
   NNTR_THROW_IF(getData() == nullptr, std::invalid_argument)
     << getName() << " is not allocated";
-  NNTR_THROW_IF(m.getData<_FP16>() == nullptr, std::invalid_argument)
-    << m.getName() << " is not allocated";
-  NNTR_THROW_IF(output.getData<_FP16>() == nullptr, std::invalid_argument)
-    << output.getName() << " is not allocated";
+
+  // m's and output's raw buffers are always read/written below as _FP16*
+  // with no dtype check. A caller combining this FP16 tensor with a
+  // same-shaped tensor that stayed a different dtype (e.g. a mixed-precision
+  // graph region: resnet_graph.h's body/N residual add of a maxpool'd FP32
+  // shortcut into a FP16 conv2 output, or bn_layer.cpp's FP16 `deviation`
+  // multiplied by an FP32-upcast `invstd` into an FP32 `hidden_`) would
+  // otherwise silently reinterpret those bytes as garbage FP16 pairs on
+  // read, and scatter real results into the wrong byte offsets of a wider
+  // buffer on write -- producing huge/NaN-looking results with no error.
+  // Convert m by value first when it isn't FP16, and stage the result
+  // through a real FP16 buffer when output isn't FP16, narrowing into the
+  // caller's actual output tensor at the end.
+  Tensor m_fp16_owner;
+  const Tensor *m_ptr = &m;
+  if (m.getDataType() != ml::train::TensorDim::DataType::FP16) {
+    m_fp16_owner = m.clone(ml::train::TensorDim::DataType::FP16);
+    m_ptr = &m_fp16_owner;
+  }
+  const Tensor &mm = *m_ptr;
+
+  NNTR_THROW_IF(mm.getData<_FP16>() == nullptr, std::invalid_argument)
+    << mm.getName() << " is not allocated";
+
+  const bool out_mismatched =
+    output.getDataType() != ml::train::TensorDim::DataType::FP16;
+  Tensor out_fp16_owner;
+  Tensor *out_ptr = &output;
+  if (out_mismatched) {
+    TensorDim out_fp16_dim = output.getDim();
+    out_fp16_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+    out_fp16_owner = Tensor(out_fp16_dim, true);
+    out_ptr = &out_fp16_owner;
+  } else {
+    NNTR_THROW_IF(output.getData<_FP16>() == nullptr, std::invalid_argument)
+      << output.getName() << " is not allocated";
+  }
+  Tensor &out = *out_ptr;
 
   /// shortcut to cover when dimension matches
   /// note that buffer_size, the last stride is only used in v_func but it
   /// might be changed
-  if (dim == m.getDim()) {
+  if (dim == mm.getDim()) {
     BroadcastInfo e;
     e.buffer_size = size();
     e.strides[3] = 1;
-    v_func(e, (_FP16 *)getData(), m.getData<_FP16>(), output.getData<_FP16>());
-    return;
+    v_func(e, (_FP16 *)getData(), mm.getData<_FP16>(), out.getData<_FP16>());
+  } else {
+    apply_broadcast_util(mm, v_func, out, this->computeBroadcastInfo(mm));
   }
 
-  return apply_broadcast_util(m, v_func, output, this->computeBroadcastInfo(m));
+  if (out_mismatched)
+    output.copyData(out);
 }
 
 void HalfTensor::apply_broadcast_util(
@@ -1347,7 +1473,20 @@ void HalfTensor::apply_broadcast_util(
   }
 
   cur_axis++;
-  for (unsigned int i = 0; i < dim.getTensorDim(cur_axis); ++i) {
+  /// @note continuity[] must mirror FloatTensor::apply_broadcast_util and
+  /// computeBroadcastInfo (which fills e.strides/buffer_axis using continuity[]
+  /// for both FP32 and FP16). Without this NHWC remap the FP16 recursion loop
+  /// bound used the raw axis while e.strides were computed with the remapped
+  /// axis, producing out-of-bounds buf+/m_buf+ offsets -> SEGV in ele_mul on
+  /// NHWC broadcast multiplies (e.g. FastViT SE se_mul [B,C,H,W]*[B,C,1,1]).
+  /// NCHW (continuity=={0,1,2,3}) is unaffected, so the bug was dormant there.
+  unsigned int continuity[4] = {0, 1, 2, 3};
+  if (getFormat() == Tformat::NHWC) {
+    continuity[1] = 2;
+    continuity[2] = 3;
+    continuity[3] = 1;
+  }
+  for (unsigned int i = 0; i < dim.getTensorDim(continuity[cur_axis]); ++i) {
     size_t next_offset = offset + i * strides[cur_axis];
     size_t next_m_offset = m_offset + i * e.strides[cur_axis];
     apply_broadcast_util(m, v_func, output, e, cur_axis, next_offset,

@@ -1,0 +1,21 @@
+{
+  "model_tensor_type": "FP32-FP32",
+  "model_file_name": "nntr_siglip2_encoder_fp32.bin",
+  "model_type": "ScreenAICaption",
+  "encoder_model_file_name": "nntr_siglip2_encoder_fp32.bin",
+  "decoder_model_file_name": "nntr_caption_decoder_fp32.bin",
+  "embedding_dtype": "FP32",
+  "fc_layer_dtype": "FP32",
+  "batch_size": 1,
+  "patch_size": 16,
+  "img_size": 224,
+  "num_patches": 196,
+  "encoder_hidden_size": 768,
+  "decoder_hidden_size": 256,
+  "num_to_generate": 32,
+  "init_seq_len": 1,
+  "max_seq_len": 64,
+  "tokenizer_file": "tokenizer.json",
+  "sample_input": "sample.png",
+  "fsu": false
+}

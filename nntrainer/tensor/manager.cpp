@@ -33,6 +33,9 @@
 #include <unistd.h>
 #endif
 
+#include <cstdlib>
+#include <string>
+
 #include <activation_layer.h>
 #include <basic_planner.h>
 #include <bn_layer.h>
@@ -976,13 +979,53 @@ void Manager::flushCacheExcept(unsigned int order) {
 
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
+  // Runtime planner override (NNTR_MEMORY_PLANNER=v3|v2|v1|basic). The planner
+  // is otherwise fixed at compile time, but every planner .cpp is always linked
+  // into the library, so it can be chosen at runtime. Planning only relocates
+  // tensors (values are unchanged), so this cannot alter results; V3 packs the
+  // activation pool far tighter than the default V1 (e.g. the W8A8 YOLOv7Pose
+  // activation pool drops 39 MB -> 18 MB, near its theoretical minimum). This
+  // exists because the compile-time meson flag does not always reach app
+  // build scripts.
+  if (const char *mp = std::getenv("NNTR_MEMORY_PLANNER")) {
+    const std::string s(mp);
+    if (s == "v3") {
+      pool.finalize(OptimizedV3Planner(), start, end);
+      return;
+    } else if (s == "v2") {
+      pool.finalize(OptimizedV2Planner(), start, end);
+      return;
+    } else if (s == "v1") {
+      pool.finalize(OptimizedV1Planner(), start, end);
+      return;
+    } else if (s == "basic") {
+      pool.finalize(BasicPlanner(), start, end);
+      return;
+    }
+  }
   if (enable_optimizations) {
+#if defined(ENABLE_MEMORY_PLANNER_V3)
+    /**
+     * Opt-in (compile time -DENABLE_MEMORY_PLANNER_V3, meson
+     * -Dmemory-planner=v3 or ndk-build ENABLE_MEMORY_PLANNER_V3=1) lower
+     * peak-memory planner. The Android CausalLM inference build enables it.
+     */
+    pool.finalize(OptimizedV3Planner(), start, end);
+#elif defined(ENABLE_MEMORY_PLANNER_V2)
+    /**
+     * Opt-in OptimizedV2Planner (meson -Dmemory-planner=v2). Note: V2 is not
+     * part of the validated default path; selected explicitly for evaluation.
+     */
+    pool.finalize(OptimizedV2Planner(), start, end);
+#else
+    /// Default validated planner (OptimizedV1Planner), selected by 'auto'/'v1'.
     if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
       //@todo change V3 and validate
       pool.finalize(OptimizedV1Planner(), start, end);
     } else {
       pool.finalize(OptimizedV1Planner(), start, end);
     }
+#endif
   } else {
     pool.finalize(BasicPlanner(), start, end);
   }

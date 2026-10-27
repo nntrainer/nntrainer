@@ -1,0 +1,14 @@
+{
+  "model_tensor_type": "FP32-FP32",
+  "model_file_name": "nntr_ced_tiny_fp32.bin",
+  "model_type": "Model",
+  "embedding_dtype": "FP32",
+  "fc_layer_dtype": "FP32",
+  "batch_size": 1,
+  "sample_input": "nntr_ref/input_values.bin",
+  "init_seq_len": 252,
+  "max_seq_len": 252,
+  "num_to_generate": 0,
+  "fsu": false,
+  "skip_tokenizer": true
+}

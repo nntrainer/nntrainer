@@ -62,6 +62,10 @@ if get_option('enable-transformer')
   add_project_arguments('-DENABLE_TRANSFORMER=1', language: ['c', 'cpp'])
 endif
 
+if get_option('memory-planner') == 'v3'
+  add_project_arguments('-DENABLE_MEMORY_PLANNER_V3=1', language: ['c', 'cpp'])
+endif
+
 warning_flags = [
   '-Wredundant-decls',
   '-Wwrite-strings',

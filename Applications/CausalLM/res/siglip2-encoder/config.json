@@ -1,0 +1,24 @@
+{
+  "architectures": [
+    "Siglip2VisionEncoder"
+  ],
+  "model_type": "siglip_vision_model",
+  "dtype": "float32",
+  "encoder": {
+    "architectures": null,
+    "attention_dropout": 0.0,
+    "dtype": "float32",
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "image_size": 224,
+    "intermediate_size": 3072,
+    "is_encoder_decoder": false,
+    "layer_norm_eps": 1e-06,
+    "model_type": "siglip_vision_model",
+    "num_attention_heads": 12,
+    "num_channels": 3,
+    "num_hidden_layers": 12,
+    "patch_size": 16,
+    "return_dict": true
+  }
+}

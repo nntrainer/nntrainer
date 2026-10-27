@@ -210,6 +210,12 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
 
+#ifdef ENABLE_FP16
+void gelu_v2_fp16(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  __fallback_gelu_v2(N, X, Y);
+}
+#endif
+
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
@@ -242,6 +248,13 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
   for (size_t i = 0; i < Ns.size(); ++i)
     __fallback_gemm_q4_0<float>(M, Ns[i], K, A, lda, Bs[i], ldbs[i], Cs[i],
                                 ldcs[i]);
+}
+
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  return __fallback_gemm_q8_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
@@ -329,6 +342,16 @@ void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
   __fallback_unpack_q4_0_8_to_q4_0(in_q4_0x, out_q4_0, data_size, M, N);
 }
 
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
+
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
+}
+
 template <>
 void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, float *sink) {
@@ -387,6 +410,34 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {
   __fallback_clamp(input, output, length, lower_bound, upper_bound);
 }
+
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+  __fallback_depthwise_conv2d_fp32(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+
+#ifdef ENABLE_FP16
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+  __fallback_depthwise_conv2d_fp16(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+#endif
 
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
   __fallback_create_q4_0_weights(int4_weight, q4_0_weight);

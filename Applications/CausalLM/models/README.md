@@ -19,6 +19,7 @@ Here is the list of supported models. We provide **Standard** implementations an
 | `qwen3_cached_slim_moe_causallm` | **30B-A3B** | 🛠️ **Variant** | ⚡ **Cached Slim** | MoE-specific FSU implementation with **expert caching**. |
 | `gptoss_causallm` | **20B-A3.6B, 120B-5.1B** | 📦 Standard | - | Basic implementation of the GPT-OSS model. |
 | `gptoss_cached_slim_causallm` | **20B-A3.6B, 120B-5.1B** | 🛠️ **Variant** | ⚡ **Cached Slim** | GPT-OSS MoE implementation with **expert caching**. |
+| `screenai_caption` | **~100M** | 📦 Standard | 🖼️ **Vision+Text** | SigLIP2 vision encoder + mini-BERT cross-attention decoder for image captioning (`VisionEncoderDecoderModel`). |
 
 > *Note: 📦 **Standard** refers to the basic implementation, while 🛠️ **Variant** refers to models optimized for your device using FSU schemes.*
 

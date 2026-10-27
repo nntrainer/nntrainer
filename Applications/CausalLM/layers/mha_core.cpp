@@ -715,7 +715,7 @@ MHACoreLayer::MHACoreLayer() :
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
     props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope(),
-    props::KvWindowRing()),
+    props::KvWindowRing(), props::CrossAttention(), props::AttnFp32Accum()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -1005,17 +1005,17 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Weight for Sink */
   use_sink = std::get<props::UseSink>(mha_core_props).get();
   if (use_sink) {
+    // The sink weight must match the attention compute precision: fp16 on the
+    // Android fp16-kernel path, the activation dtype (fp32) when the layer
+    // accumulates in fp32 (attn_fp32_accum) or on every other platform.
+    nntrainer::TensorDim::DataType sink_dtype = context.getActivationDataType();
 #if ENABLE_FP16 && defined(__ANDROID__)
-    nntrainer::TensorDim sink_dim(
-      1, 1, 1, num_heads_Q,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       ml::train::TensorDim::DataType::FP16));
-#else
-    nntrainer::TensorDim sink_dim(
-      1, 1, 1, num_heads_Q,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       context.getActivationDataType()));
+    if (!std::get<props::AttnFp32Accum>(mha_core_props).get())
+      sink_dtype = ml::train::TensorDim::DataType::FP16;
 #endif
+    nntrainer::TensorDim sink_dim(
+      1, 1, 1, num_heads_Q,
+      nntrainer::TensorDim::TensorType(context.getFormat(), sink_dtype));
     sink_idx = context.requestWeight(sink_dim, nntrainer::Initializer::ZEROS,
                                      nntrainer::WeightRegularizer::NONE, 0.0f,
                                      0.0f, "sink");
@@ -1027,6 +1027,15 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
   use_gemm_attention = std::get<props::UseGemmAttention>(mha_core_props).get();
+
+  /** Static read-only cross-attention mode; default false. */
+  cross_attention = std::get<props::CrossAttention>(mha_core_props).get();
+  attn_fp32_accum = std::get<props::AttnFp32Accum>(mha_core_props).get();
+  NNTR_THROW_IF(cross_attention && !use_external_cache, std::invalid_argument)
+    << "mha_core cross_attention=true needs the external-cache (5-input) "
+       "form: the encoder K/V are passed as inputs 3/4";
+  NNTR_THROW_IF(cross_attention && use_sink, std::invalid_argument)
+    << "mha_core cross_attention=true does not support use_sink";
 
   // Honor the LayerImpl `skip_prefill` property (parsed into layer_impl_props
   // by LayerImpl::setProperty). When set, mha_core writes its KV cache during
@@ -1373,8 +1382,20 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   unsigned int step_size = (incremental_step_size > 0)
                              ? incremental_step_size
                              : (unsigned int)query.height();
-  unsigned int from = cache_index;
-  unsigned int to = cache_index + step_size;
+
+  // Static read-only cross-attention: the encoder K/V cache (inputs 3/4) is
+  // already fully populated with enc_len rows. The query must attend over ALL
+  // enc_len rows independent of cache_index, and the cache is neither written
+  // nor advanced. Drive the existing kernel by pinning the read window to the
+  // full cache height: with `from = enc_len - step_size`, `to = enc_len` the
+  // (non-causal) kernel reads rows [0, enc_len) for each of the step_size
+  // query rows. Self-attention keeps the cache_index-derived window.
+  const unsigned int enc_len = (unsigned int)cache_key.height();
+  NNTR_THROW_IF(cross_attention && step_size > enc_len, std::invalid_argument)
+    << "mha_core cross-attention: step_size (" << step_size << ") > enc_len ("
+    << enc_len << ")";
+  unsigned int from = cross_attention ? (enc_len - step_size) : cache_index;
+  unsigned int to = cross_attention ? enc_len : (cache_index + step_size);
 
   auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -1426,6 +1447,24 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       host_io.add(output_step, /*read_only=*/false);
 #endif
 #if ENABLE_FP16 && defined(__ANDROID__)
+      // fp16-kernel path: narrow the fp32 Q/K/V to fp16 and accumulate in fp16.
+      // attn_fp32_accum keeps the fp32 operands (the desktop data flow): the
+      // kernels read the fp16-stored cache converted to fp32 and accumulate in
+      // fp32, which the ScreenAI models need for token parity.
+      if (attn_fp32_accum) {
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim);
+        }
+        continue;
+      }
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
       nntrainer::TensorDim V_step_dim = value_step_dim;
@@ -1477,7 +1516,10 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     }
   }
 
-  cache_index += step_size;
+  // Cross-attention is a static read-only pass: it neither writes nor advances
+  // the cache. Only self-attention advances the write position.
+  if (!cross_attention)
+    cache_index += step_size;
 }
 
 /**
@@ -1627,6 +1669,24 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       host_io.add(output_step, /*read_only=*/false);
 #endif
 #if ENABLE_FP16 && defined(__ANDROID__)
+      // fp16-kernel path: narrow the fp32 Q/K/V to fp16 and accumulate in fp16.
+      // attn_fp32_accum keeps the fp32 operands (the desktop data flow): the
+      // kernels read the fp16-stored cache converted to fp32 and accumulate in
+      // fp32, which the ScreenAI models need for token parity.
+      if (attn_fp32_accum) {
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, _from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, _from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim);
+        }
+        continue;
+      }
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
       nntrainer::TensorDim V_step_dim = value_step_dim;
@@ -2204,17 +2264,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     lower_q();
     lower_kv();
   }
-  if (kv_int8) {
-    // KV int8 path (paper section 3.7): Q RoPE in fp16 as usual, K RoPE
-    // in-place on the fp16 key_step buffer, then quantize key_step and
-    // value_step to int8 cache + per-(token, head) fp16 scale. V has no
-    // RoPE so it's a direct quantize.
-    if (use_rope) {
-      apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                                 true);
-      apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
-                                 true);
-    }
+  // Static read-only cross-attention: the encoder K/V cache (inputs 3/4) is
+  // already fully populated with enc_len rows, so the whole cache write below
+  // (RoPE-K / scatter / copy of key_step, value_step) is skipped; only the
+  // attention read over the full cache runs. Self-attention is unchanged.
+  if (!cross_attention) {
+    if (kv_int8) {
+      // KV int8 path (paper section 3.7): Q RoPE in fp16 as usual, K RoPE
+      // in-place on the fp16 key_step buffer, then quantize key_step and
+      // value_step to int8 cache + per-(token, head) fp16 scale. V has no
+      // RoPE so it's a direct quantize.
+      if (use_rope) {
+        apply_rotary_emb_tensor_v2(query_step, query_step, head_dim,
+                                   cache_index, true);
+        apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
+                                   true);
+      }
 #ifdef ENABLE_FP16
     // Slice the int8 cache + fp16 scale for this batch/step window.
     const size_t scale_feature_len =
@@ -2262,8 +2327,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     NNTR_THROW_IF(true, std::invalid_argument)
       << "NNTR_KV_INT8 requires ENABLE_FP16";
 #endif
-  } else if (use_rope) {
-    bool gpu_rope_done = false;
+    } else if (use_rope) {
+      bool gpu_rope_done = false;
 #ifdef ENABLE_FP16
 #if defined(ENABLE_OPENCL) // GPU concat-RoPE (rope_inplace_f16_cl) path
     // GPU-resident RoPE (residency): rotate Q in place and K into its cache
@@ -3174,14 +3239,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
       }
     }
-  } else {
-    // No-RoPE path: host scatters/copies read K/V on the host -- lower first.
-    lower_kv();
-    const bool kv_ohwi_active =
-      is_kv_ohwi_enabled() && !kv_int8 &&
-      key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-      cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
-    if (kv_ohwi_active) {
+    } else {
+      // No-RoPE path: host scatters/copies read K/V on the host -- lower first.
+      lower_kv();
+      const bool kv_ohwi_active =
+        is_kv_ohwi_enabled() && !kv_int8 &&
+        key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
+      if (kv_ohwi_active) {
 #ifdef ENABLE_FP16
       scatter_k_concat_to_ohwi_fp16(
         reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>()),
@@ -3192,16 +3257,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       NNTR_THROW_IF(true, std::invalid_argument)
         << "NNTR_KV_OHWI requires ENABLE_FP16";
 #endif
-    } else {
-      b_cache_key_step.copyData(key_step);
-    }
+      } else {
+        b_cache_key_step.copyData(key_step);
+      }
     b_cache_value_step.copyData(value_step);
-  }
+    }
+
+  } // !cross_attention: cache write
 
   /// @todo replace step_size into input height
   unsigned int step_size = to - from;
-  unsigned int cache_from = cache_index;
-  unsigned int cache_to = cache_from + step_size;
+  // Cross-attention reads the full encoder cache [0, enc_len): forwarding()
+  // passes from = enc_len - step_size and to = enc_len, so the non-causal
+  // kernel's row_to_compute = cache_from + step_size resolves to enc_len for
+  // every query row. Self-attention keeps the cache_index-based window.
+  unsigned int cache_from = cross_attention ? from : cache_index;
+  unsigned int cache_to = cross_attention ? to : (cache_from + step_size);
 
   // NNTR_KVHASH: hash this layer's SVM K/V cache so two runs of
   // the same prompt can be compared without pulling the caches off the device.
@@ -3291,7 +3362,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // prefill big-step -- so skip the heavy attention compute + output write.
   // Decode (step_size == 1) always runs the full path. The CLMEM output raise
   // is skipped intentionally: the downstream wo FC does not read O in prefill.
-  if (skip_prefill && step_size > 1)
+  if (!cross_attention && skip_prefill && step_size > 1)
     return;
 
   // NNTR_MHA_CLMEM boundary sync (see mha_clmem_mode): gather the mirror

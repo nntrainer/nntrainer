@@ -85,6 +85,12 @@ LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 
 LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @MESON_CXXFLAGS@
+# Opt-in lower-peak-memory inference planner (off by default). The YOLOv11
+# inference build sets ENABLE_MEMORY_PLANNER_V3=1 on the ndk-build command line.
+ifeq ($(ENABLE_MEMORY_PLANNER_V3), 1)
+LOCAL_CFLAGS        += -DENABLE_MEMORY_PLANNER_V3=1
+LOCAL_CXXFLAGS      += -DENABLE_MEMORY_PLANNER_V3=1
+endif
 LOCAL_MODULE_TAGS   := optional
 
 LOCAL_LDLIBS        := -llog -landroid

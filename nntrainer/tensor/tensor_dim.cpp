@@ -22,7 +22,13 @@
 #include <tensor_dim.h>
 #include <util_func.h>
 
+/**
+ * @brief Namespace for machine learning APIs
+ */
 namespace ml {
+/**
+ * @brief Namespace for training APIs
+ */
 namespace train {
 
 TensorDim::TensorDim(TensorDim::Format fm, TensorDim::DataType d_type,
@@ -176,6 +182,8 @@ unsigned int TensorDim::getDataTypeSize() const {
   case TensorDim::DataType::Q6_K:
     return sizeof(uint8_t);
   case TensorDim::DataType::Q4_0:
+    return sizeof(uint8_t);
+  case TensorDim::DataType::Q8_0:
     return sizeof(uint8_t);
   case TensorDim::DataType::QS4CX:
     return sizeof(uint8_t);
@@ -418,6 +426,8 @@ std::ostream &operator<<(std::ostream &out, TensorDim const &d) {
     type_ = "Q6_K";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
     type_ = "Q4_0";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::Q8_0) {
+    type_ = "Q8_0";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4CX) {
     type_ = "QS4CX";
   } else {

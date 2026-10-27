@@ -335,6 +335,138 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                            "kernels for armv7l");
 }
 
+// Q8_0 x Q8_0 GEMM/GEMV: fallback (non-AVX2 / non-NEON CPU builds).
+// The actual scalar reference lives in __fallback_gemm_q8_0 in
+// nntrainer/tensor/cpu_backend/fallback/fallback_internal.cpp -- the x86
+// backend routes here only when AVX2 is unavailable, which is unusual
+// for nntrainer's CPU builds. Keep an explicit NYI so a misconfiguration
+// surfaces loudly instead of running silently slow.
+void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error(
+    "NYI: nntr_gemm_q8_0_q8_0 fallback - AVX2 build required for SIMD path; "
+    "use __fallback_gemm_q8_0 (scalar) directly otherwise");
+}
+
+// FP32-output plain Q8_0xQ8_0 GEMM (scalar). Portable; keeps the W8A32 conv
+// correct on the fallback build.
+void nntr_gemm_q8_0_q8_0_f32(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0 *a_base = (const block_q8_0 *)vy;
+  const block_q8_0 *b_base = (const block_q8_0 *)vx;
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0 *arow = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j) {
+      const block_q8_0 *brow = b_base + (size_t)j * nb;
+      float acc = 0.0f;
+      for (int b = 0; b < nb; ++b) {
+        int32_t isum = 0;
+        for (int t = 0; t < QK8_0; ++t)
+          isum += (int32_t)arow[b].qs[t] * (int32_t)brow[b].qs[t];
+        acc += nntr_compute_fp16_to_fp32(arow[b].d) *
+               nntr_compute_fp16_to_fp32(brow[b].d) * (float)isum;
+      }
+      s[(size_t)m * bs + j] = acc;
+    }
+  }
+}
+// Interleaved (q8_0x4) FP32-output GEMM (scalar). Matches the layout of
+// nntr_gemm_q8_0_q8_0_4x4_f32's NEON SMMLA path; correct on x86/SVE/fallback
+// (the indirect conv only runs on NEON, but this keeps it linkable + testable).
+void nntr_gemm_q8_0_q8_0_4x4_f32(int n, float *__restrict s, size_t bs,
+                                 const void *__restrict vx,
+                                 const void *__restrict vy, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto dot_one = [&](const block_q8_0x4 *a, int ar, const block_q8_0x4 *b,
+                     int wr) -> float {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+      int32_t si = 0;
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+      acc += nntr_compute_fp16_to_fp32(a[bi].d[ar]) *
+             nntr_compute_fp16_to_fp32(b[bi].d[wr]) * (float)si;
+    }
+    return acc;
+  };
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        dot_one(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+}
+
+// Per-channel W8A8 GEMM (int32 accumulate; scalar reference). Same numerics as
+// the NEON nntr_gemm_q8ch_4x4_f32: int8 x int8 dot over the whole reduction,
+// then one scale a_scale*w_scale[col]. The per-block fp16 d fields are ignored.
+void nntr_gemm_q8ch_4x4_f32(int n, float *__restrict s, size_t bs,
+                            const void *__restrict vx,
+                            const float *__restrict w_scale,
+                            const void *__restrict vy, float a_scale, int nr,
+                            int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto int_dot = [&](const block_q8_0x4 *a, int ar, const block_q8_0x4 *b,
+                     int wr) -> int32_t {
+    int32_t si = 0;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+    return si;
+  };
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(a, ar, b_sbase + (size_t)(j / 4) * nb, j % 4);
+  }
+}
+// PLAIN row-major int8 activation variant of nntr_gemm_q8ch_4x4_f32 (scalar).
+void nntr_gemm_q8ch_plainA_f32(int n, float *__restrict s, size_t bs,
+                               const void *__restrict vx,
+                               const float *__restrict w_scale,
+                               const int8_t *__restrict A, size_t lda,
+                               float a_scale, int nr, int nc) {
+  const int nb = n / QK8_0;
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx;
+  auto int_dot = [&](int ar, const block_q8_0x4 *b, int wr) -> int32_t {
+    const int8_t *a = A + (size_t)ar * lda;
+    int32_t si = 0;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi * 32 + sub * 8 + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+    return si;
+  };
+  for (int m = 0; m < nr; ++m)
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] =
+        a_scale * w_scale[j] *
+        (float)int_dot(m, b_sbase + (size_t)(j / 4) * nb, j % 4);
+}
+
 //============================================================================
 // GEMM/GEMV - Q8_0 4x4
 //============================================================================
@@ -549,16 +681,17 @@ void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
 // Quantization helper functions (matrix packing)
 //============================================================================
 
-void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
-                                int64_t k) {
+// Quantizes 4 rows into block_q8_0x4, interleaving their quants in runs of
+// blck_size_interleave bytes.
+static void quantize_mat_q8_0_4xN(const float *__restrict x,
+                                  void *__restrict vy, int64_t k,
+                                  const int blck_size_interleave) {
   assert(QK8_0 == 32);
   assert(k % QK8_0 == 0);
   const int nb = k / QK8_0;
 
   block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
 
-  // scalar
-  const int blck_size_interleave = 4;
   float srcv[4][QK8_0];
   float id[4];
 
@@ -588,10 +721,14 @@ void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
   }
 }
 
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k) {
+  quantize_mat_q8_0_4xN(x, vy, k, 4);
+}
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
-  // NYI: Fallback quantization - requires row-by-row implementation
-  throw std::runtime_error("NYI: nntr_quantize_mat_q8_0_4x8 fallback");
+  quantize_mat_q8_0_4xN(x, vy, k, 8);
 }
 
 void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
@@ -779,3 +916,36 @@ int nntr_repack_q4_K_to_q4_K_8_bl(void *__restrict dst, int interleave_block,
   }
   return 0;
 }
+
+#ifdef ENABLE_FP16
+void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,
+                                  size_t bs, const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error(
+    "NYI: nntr_gemm_q8_0_q8_0_4x4_fp16 on Fallback - FP16 Q8_0 GEMM is "
+    "ARM/NEON "
+    "only; callers must gate on supports_gemm_q8_0_indirect_conv_q8_0()");
+}
+
+void nntr_gemm_q8_0_q8_0_fp16(int n, NNTR_GGML_FP16 *__restrict s, size_t bs,
+                              const void *__restrict vx,
+                              const void *__restrict vy, int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error(
+    "NYI: nntr_gemm_q8_0_q8_0_fp16 on Fallback - FP16 Q8_0 GEMM is ARM/NEON "
+    "only; callers must gate on supports_gemm_q8_0_indirect_conv_q8_0()");
+}
+#endif // ENABLE_FP16
