@@ -787,4 +787,48 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
     });
   }
 }
+
+/**
+ * @brief Q8_0 GEMM on q8_0x4 weights. The output columns are split across the
+ * compute threads in multiples of 4, the q8_0x4 row group.
+ */
+void __ggml_q8_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, const void *B,
+                               const unsigned int ldb, float *C,
+                               const unsigned int ldc) {
+  auto &tm = ThreadManager::Global();
+  const unsigned int thread_num = tm.getComputeThreadCount();
+
+  const size_t row_bytes = sizeof(block_q8_0) * (K / QK8_0);
+  const unsigned int M4 = M / 4;
+
+  // Every 4 activation rows become one q8_0x4 row group of the same size;
+  // the M % 4 tail rows stay plain block_q8_0 rows.
+  std::vector<char> QA((size_t)M * row_bytes);
+  for (unsigned int i = 0; i < M4; i++)
+    nntr_quantize_mat_q8_0_4x8(A + (size_t)4 * i * K,
+                               QA.data() + (size_t)4 * i * row_bytes, K);
+  for (unsigned int i = M4 * 4; i < M; i++)
+    nntr_quantize_row_q8_0(A + (size_t)i * K, QA.data() + (size_t)i * row_bytes,
+                           K);
+
+  const unsigned int groups = N / 4;
+  tm.parallel_for(0, thread_num, [=, &QA](size_t t) {
+    const unsigned int c_start = 4 * (t * groups / thread_num);
+    const unsigned int c_end = 4 * ((t + 1) * groups / thread_num);
+    if (c_end <= c_start)
+      return;
+
+    const char *b = (const char *)B + (size_t)c_start * row_bytes;
+    if (M4 > 0)
+      nntr_gemm_q8_0_4x8_q8_0(K, C + c_start, ldc, b, QA.data(), M4 * 4,
+                              c_end - c_start);
+    for (unsigned int i = M4 * 4; i < M; i++)
+      nntr_gemv_q8_0_4x8_q8_0(K, C + (size_t)i * ldc + c_start, ldc, b,
+                              QA.data() + (size_t)i * row_bytes, 1,
+                              c_end - c_start);
+  });
+}
+
 } // namespace nntrainer

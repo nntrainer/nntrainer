@@ -158,6 +158,11 @@ public:
                               const unsigned int lda, const void *B,
                               const unsigned int ldb, float *C,
                               const unsigned int ldc);
+  virtual void gemm_q8_0_fp32(const unsigned int M, const unsigned int N,
+                              const unsigned int K, const float *A,
+                              const unsigned int lda, const void *B,
+                              const unsigned int ldb, float *C,
+                              const unsigned int ldc);
   virtual void gemm_q4_K_fp32(const unsigned int M, const unsigned int N,
                               const unsigned int K, const float *A,
                               const unsigned int lda, const void *B,

@@ -1107,6 +1107,25 @@ extern void gemm_q4_0(const unsigned int M, const unsigned int N,
                       const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output
+ * @param K Hidden size
+ * @param A Input activation to be online-runtime quantized to q8_0 format
+ * @param lda Leading dimension of A
+ * @param B Offline-quantized transposed weight in q8_0x4 (see repack_q8_0)
+ * @param ldb Leading dimension of B (row length, K)
+ * @param C T* output
+ * @param ldc Leading dimension of C
+ */
+template <typename T = float>
+extern void gemm_q8_0(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const T *A, const unsigned int lda,
+                      const void *B, const unsigned int ldb, T *C,
+                      const unsigned int ldc);
+
+/**
  * @brief q4_0 GEMM against several weights : A (M,K) * Ws[i].T (Ns[i],K)
  *
  * Quantizes A to q8_0 once and walks every weight inside a single parallel
@@ -1324,6 +1343,33 @@ extern void repack_q4_K(void *dst, void *src, size_t data_size,
  * @param N number of columns
  */
 extern void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
+                        const unsigned int M, const unsigned int N);
+
+/**
+ * @brief repack q8_0 rows to q8_0x4, the layout the Q8_0 GEMM kernels use
+ *
+ * Every 4 rows are interleaved block by block: the 4 fp16 scales come first,
+ * then bytes 8k..8k+7 of row r go to qs[32k + 8r].
+ *
+ * @param dst output q8_0x4
+ * @param src input q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+extern void repack_q8_0(void *dst, const void *src, size_t data_size,
+                        const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q8_0x4 to q8_0 rows - inverse of repack_q8_0
+ *
+ * @param src input q8_0x4
+ * @param dst output q8_0 rows
+ * @param data_size total weight size in bytes
+ * @param M number of rows, a multiple of 4
+ * @param N number of columns, a multiple of 32
+ */
+extern void unpack_q8_0(const void *src, void *dst, size_t data_size,
                         const unsigned int M, const unsigned int N);
 
 /**

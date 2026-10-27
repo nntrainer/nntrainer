@@ -549,16 +549,17 @@ void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
 // Quantization helper functions (matrix packing)
 //============================================================================
 
-void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
-                                int64_t k) {
+// Quantizes 4 rows into block_q8_0x4, interleaving their quants in runs of
+// blck_size_interleave bytes.
+static void quantize_mat_q8_0_4xN(const float *__restrict x,
+                                  void *__restrict vy, int64_t k,
+                                  const int blck_size_interleave) {
   assert(QK8_0 == 32);
   assert(k % QK8_0 == 0);
   const int nb = k / QK8_0;
 
   block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
 
-  // scalar
-  const int blck_size_interleave = 4;
   float srcv[4][QK8_0];
   float id[4];
 
@@ -588,10 +589,14 @@ void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
   }
 }
 
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k) {
+  quantize_mat_q8_0_4xN(x, vy, k, 4);
+}
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
-  // NYI: Fallback quantization - requires row-by-row implementation
-  throw std::runtime_error("NYI: nntr_quantize_mat_q8_0_4x8 fallback");
+  quantize_mat_q8_0_4xN(x, vy, k, 8);
 }
 
 void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
