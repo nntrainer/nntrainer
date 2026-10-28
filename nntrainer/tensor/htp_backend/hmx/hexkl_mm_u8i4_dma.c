@@ -24,6 +24,7 @@
 #include "hexkl_micro.h"
 #include "hexkl_mm_opts.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_gemm_u8i4_wh.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
@@ -493,6 +494,150 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
   }
 }
 
+#ifndef NNTR_HVX_NO_M1_GEMV
+/** @brief Rows up to which a layer call takes the HVX GEMV instead of a
+ *         64-row HMX block: the decode row, and a small batch. */
+#define LAYER_GEMV_MAX_ROWS 4u
+
+/** @brief One weight's columns on the HVX GEMV, split over the pool. */
+typedef struct {
+  const uint8_t *act_ah; /**< VTCM: the rows' AH tiles */
+  const uint8_t *wh;     /**< VTCM: the weight's WH tiles */
+  const hexkl_weight_u8i4 *h;
+  uint32_t M, k_tiles, nt_n, ld;
+  const float *act_scale;
+  const int32_t *act_zp;
+  float *out;
+  int accumulate;
+} layer_gemv_job;
+
+static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const layer_gemv_job *j = (const layer_gemv_job *)vjob;
+  const uint32_t lo = (uint32_t)((uint64_t)j->nt_n * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)j->nt_n * (i + 1) / n_threads);
+  int32_t acc[LAYER_GEMV_MAX_ROWS * HEXKL_ACC_TILE_COLS]
+    __attribute__((aligned(128)));
+  for (uint32_t nt = lo; nt < hi; ++nt) {
+    const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
+    hvx_gemm_u8i4_wh_col_nopf(j->act_ah, j->M, j->k_tiles, j->wh, j->nt_n, nt,
+                              /*rows1=*/1, acc);
+    hvx_dequant_acc_tile_to_f32(acc, HEXKL_ACC_TILE_COLS, j->M, j->act_scale,
+                                j->act_zp, j->h->colsum_w + c0,
+                                j->h->w_scale + c0, j->h->bias + c0,
+                                j->out + c0, j->ld, j->accumulate);
+  }
+}
+
+/**
+ * @brief hexkl_mm_u8i4_layer_run for M <= LAYER_GEMV_MAX_ROWS: the same
+ *        weight DMA into VTCM (double-buffered across handles), but the
+ *        rows on the HVX GEMV instead of a 64-row HMX block. A decode row
+ *        otherwise pays the 63 padding rows three times: zeroing them in
+ *        the activation, multiplying them, and reading the accumulator out
+ *        through four convert passes a tile.
+ *
+ * The int32 sums are the HMX's (hvx_gemm_u8i4_wh.h) and the dequant is the
+ * per-tile one in the pipelined epilogue's order, so a row's f32 output is
+ * the HMX path's byte for byte (the device test checks M = 1..4 against
+ * the same rows inside an M = 64 call).
+ */
+static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
+                          uint32_t arena, uint32_t M, uint32_t K,
+                          const uint32_t *handles, uint32_t n_handles,
+                          const float *act_f32, float *out_cat,
+                          const hexkl_mm_opts *o, uint32_t wb_max) {
+  const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
+  const uint32_t act_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+  const uint32_t wbuf[2] = {0u, wb_max};
+  if (2u * wb_max > arena) {
+    return AEE_ENOMEMORY;
+  }
+  float loc_scale[LAYER_GEMV_MAX_ROWS];
+  int32_t loc_zp[LAYER_GEMV_MAX_ROWS];
+  const float *act_scale = o->act_scale ? o->act_scale : loc_scale;
+  const int32_t *act_zp = o->act_zp ? o->act_zp : loc_zp;
+  uint64_t p0 = 0;
+  int rc = AEE_SUCCESS;
+  /* The activation stays in cached memory, not VTCM: the GEMV reads it a
+     32-bit word at a time with scalar loads, which VTCM serves slowly (a
+     VTCM copy made the M = 1 call six times slower than the HMX block).
+     The AH tile stride is kept; only rows 0..M-1 of each tile are written
+     or read. */
+  uint8_t *act_ah = (uint8_t *)o->act_ah_prepacked;
+  uint8_t *act_own = NULL;
+  if (act_ah == NULL) {
+    act_own = (uint8_t *)memalign(128, act_bytes);
+    if (!act_own) {
+      return AEE_ENOMEMORY;
+    }
+    act_ah = act_own;
+  }
+
+  hexkl_dma_ring_reset();
+  {
+    const hexkl_weight_u8i4 *h0 = &tbl->slots[handles[0]];
+    const uint32_t wb0 =
+      k_tiles * (h0->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+    const uint32_t rs0 = dma_row_size_dividing(wb0);
+    hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
+                          wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  }
+  if (act_own != NULL) {
+    /* m_pad = M: the GEMV reads rows 0..M-1 only, so no padding to zero */
+    HEXKL_PROBE_T0(p0);
+    rc = o->act_scale == NULL
+           ? hvx_quant_params_pack_u8_ah(act_f32, o->act_u16, o->act16_enc,
+                                         o->act16_hd, M, M, K, o->pre_gamma,
+                                         o->pre_eps, o->pre_scratch, loc_scale,
+                                         loc_zp, act_own, o->pool)
+           : hvx_quant_pack_u8_ah(act_f32, M, M, K, o->act_scale, o->act_zp,
+                                  act_own, o->pool);
+    HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+  }
+  HEXKL_PROBE_T0(p0);
+  hexkl_dma_ring_drain();
+  HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+  if (rc != AEE_SUCCESS) {
+    free(act_own);
+    return rc;
+  }
+
+  size_t out_off = 0;
+  for (uint32_t i = 0; i < n_handles; ++i) {
+    const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
+    if (i + 1 < n_handles) {
+      const hexkl_weight_u8i4 *hn = &tbl->slots[handles[i + 1]];
+      const uint32_t wb_next =
+        k_tiles * (hn->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+      const uint32_t rs = dma_row_size_dividing(wb_next);
+      hexkl_dma_ring_push2d(vtcm_base + wbuf[(i + 1) & 1u], hn->wh_bytes, rs,
+                            rs, rs, wb_next / rs, /*src_vtcm=*/0,
+                            /*dst_vtcm=*/1);
+    }
+    layer_gemv_job job = {act_ah,
+                          vtcm_base + wbuf[i & 1u],
+                          h,
+                          M,
+                          k_tiles,
+                          h->N / HEXKL_HMX_INT8_BLOCK_N_COL,
+                          o->out_ld ? o->out_ld[i] : h->N,
+                          act_scale,
+                          act_zp,
+                          o->out_off ? out_cat + o->out_off[i]
+                                     : out_cat + out_off,
+                          o->accumulate};
+    hvx_worker_pool_run(o->pool, layer_gemv_worker, &job, job.nt_n);
+    HEXKL_PROBE_T0(p0);
+    hexkl_dma_ring_drain();
+    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+    out_off += (size_t)M * h->N;
+  }
+  free(act_own);
+  return AEE_SUCCESS;
+}
+
+#endif /* NNTR_HVX_NO_M1_GEMV */
+
 int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
@@ -553,6 +698,24 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       n_max = h->N;
     }
   }
+
+#ifndef NNTR_HVX_NO_M1_GEMV
+  /* A few rows on the HVX GEMV. Not with the per-head passes (post_done,
+     the qkv call's norms and RoPE ride the HMX epilogue) nor 2-bit slots
+     (whose codes the HMX path expands in VTCM). */
+  {
+    int gemv = M <= LAYER_GEMV_MAX_ROWS && o->post_done == NULL;
+    for (uint32_t i = 0; gemv && i < n_handles; ++i) {
+      gemv = tbl->slots[handles[i]].bits != 2u;
+    }
+    if (gemv) {
+      const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
+      return layer_run_gemv(tbl, vtcm_base, arena, M, K, handles, n_handles,
+                            act_f32, out_cat, o,
+                            k_tiles * n_tiles_max * WEIGHT_TILE_BYTES_U8I4);
+    }
+  }
+#endif
 
   // VTCM layout: activation (all row-bands, shared across every handle) |
   // weight double-buffer (sized for the widest handle) | TWO staging

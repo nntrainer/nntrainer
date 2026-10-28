@@ -858,6 +858,66 @@ TEST_F(HmxMmU8I4Layer, BakeBitsDump) {
  * threshold here would encode the lab conditions rather
  * than a property of the code. Read the ratio, do not gate on it.
  */
+/**
+ * @brief A call of 1..4 rows (the HVX GEMV path) gives the bytes the same
+ *        rows get inside a 64-row call (the HMX block): the int32 sums are
+ *        the same integers and the dequant runs the same operations, and the
+ *        per-row activation scale depends on the row alone. A short and a
+ *        long reduction, three weights a call so the weight double buffer
+ *        and the out_cat offsets are exercised.
+ */
+TEST_F(HmxMmU8I4Layer, SmallMGemvMatchesHmxRows) {
+  struct {
+    uint32_t K, N;
+  } shapes[] = {{1536, 512}, {12288, 128}};
+  for (const auto &sh : shapes) {
+    SCOPED_TRACE("K=" + std::to_string(sh.K) + " N=" + std::to_string(sh.N));
+    std::vector<Weight> ws(3);
+    std::vector<uint32_t> hs;
+    uint32_t n_total = 0;
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_NO_FATAL_FAILURE(
+        MakeAndRegister(sh.K, sh.N, 0xB10C0000u + i * 0x111u, ws[i]));
+      hs.push_back(ws[i].handle);
+      n_total += sh.N;
+    }
+    const uint32_t M_full = 64;
+    std::vector<float> x(static_cast<size_t>(M_full) * sh.K);
+    fill_deterministic(x, 0x5EED0B10u ^ sh.K);
+    std::vector<float> full(static_cast<size_t>(M_full) * n_total, 0.0f);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M_full, sh.K, hs.data(),
+                                     static_cast<int>(hs.size()), x.data(),
+                                     static_cast<int>(x.size()), full.data(),
+                                     static_cast<int>(full.size())),
+              AEE_SUCCESS);
+    for (uint32_t M = 1; M <= 4; ++M) {
+      std::vector<float> got(static_cast<size_t>(M) * n_total, -1.0f);
+      ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M, sh.K, hs.data(),
+                                       static_cast<int>(hs.size()), x.data(),
+                                       static_cast<int>(M * sh.K), got.data(),
+                                       static_cast<int>(got.size())),
+                AEE_SUCCESS)
+        << "M=" << M;
+      // out_cat is per weight [M][N]; the full call's is [64][N].
+      size_t bad = 0;
+      for (uint32_t w = 0; w < 3; ++w) {
+        for (uint32_t m = 0; m < M; ++m) {
+          const float *a = got.data() + (size_t)M * sh.N * w + (size_t)m * sh.N;
+          const float *b =
+            full.data() + (size_t)M_full * sh.N * w + (size_t)m * sh.N;
+          if (std::memcmp(a, b, sh.N * sizeof(float)) != 0) {
+            ++bad;
+          }
+        }
+      }
+      EXPECT_EQ(bad, 0u) << "rows differing from the 64-row call at M=" << M;
+    }
+    for (const auto &w : ws) {
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+    }
+  }
+}
+
 TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   const uint32_t M = 64, K = 1024, N = 1024;
   const int kReps = 20;
