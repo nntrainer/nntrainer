@@ -18,6 +18,9 @@ jobs:
             gbs_build_option: "--define \"unit_test 0\""
 
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: write # evict stale gbs cache snapshots
 
     steps:
     - uses: actions/checkout@v4
@@ -58,6 +61,12 @@ jobs:
       with:
         path: ~/GBS-ROOT/local/cache
         key: gbs-cache-${{ matrix.gbs_build_arch }}-${{ steps.get-date.outputs.date }}
+
+    - name: evict stale gbs RPM cache
+      # PRs restore only the newest snapshot, so older date-keyed ones are dead weight.
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash .github/workflows/gbs-cache-evict.sh gbs-cache-${{ matrix.gbs_build_arch }}- gbs-cache-${{ matrix.gbs_build_arch }}-${{ steps.get-date.outputs.date }}
 
     # Disabled: nnstreamer/api/mlagent tests are unstable on Tizen CI
     # - name: get ML API
