@@ -1,26 +1,17 @@
+if get_option('platform') != 'android'
+  error('jni is available for android only')
+endif
+
 and_conf = configuration_data()
 
 flags = []
-arm_march_flag = ''
 if get_option('debug')
     flags += '-g'
 endif
 
-# Architecture flags: applied based on platform (decoupled from enable-fp16)
-if get_option('platform') == 'android'
-  arm_march_flag = get_option('arm-march')
-  if arm_march_flag == ''
-    # Fallback: derive from arm-arch (for builds without --arm-arch argument)
-    arm_arch_opt = get_option('arm-arch')
-    if arm_arch_opt == 'armv9.2-a'
-      arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
-    elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
-      arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
-    endif
-  endif
-  if arm_march_flag != ''
-    flags += arm_march_flag
-  endif
+# ARM ISA flags for the ndk-build (Android)
+if arm_march_flag != ''
+  flags += arm_march_flag
 endif
 
 flags += '-O@0@'.format(get_option('optimization'))
@@ -183,9 +174,7 @@ configure_file(input: 'Application.mk', output: 'Application.mk',
 
 # below is list of file that meson acknowledges this is the output of custom target so that
 # this has to be installed by meson
-outputs= [
-  'arm64-v8a'
-]
+outputs = [ 'arm64-v8a' ]
 
 
 ndk_build = find_program('ndk-build', required : true)

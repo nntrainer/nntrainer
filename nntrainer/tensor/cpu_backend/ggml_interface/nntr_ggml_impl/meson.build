@@ -12,13 +12,14 @@ ggml_impl_interface_sources = [
 
 # Build-time exclusive source selection (ARM first, then x86)
 arch = host_machine.cpu_family()
-arm_arch_opt = get_option('arm-arch')
 
-message('arm_arch_opt : ' + arm_arch_opt)
-
-# arm_arch_opt != 'none' case for cross-compilation scenario
-if arch == 'aarch64' or arm_arch_opt != 'none'
+# Since android build uses ndk-build, meson can't detect its arch properly. (arch != aarch64)
+# So we need to add an android case explicitly
+if arch == 'aarch64' or get_option('platform') == 'android'
   ggml_impl_interface_sources += 'nntr_ggml_impl_neon.cpp'
+elif arch == 'arm'
+  # @todo check neon_impl for armv7
+  ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'
 elif arch == 'x86_64' or arch == 'x86'
   # AVX/AVX2/AVX512 implementation for x86_64
   ggml_impl_interface_sources += 'nntr_ggml_impl_avx.cpp'
@@ -34,8 +35,6 @@ elif arch == 'x86_64' or arch == 'x86'
       pic: true,
     )
   endif
-elif arch == 'arm'
-  ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'
 else
   # Fallback for other architectures
   ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'

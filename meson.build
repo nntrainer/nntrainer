@@ -166,100 +166,131 @@ else
   extra_defines += '-DKERNEL_CACHE=0'
 endif
 
-if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
-  extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
-  extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+arm_arch_opt = get_option('arm-arch')
+arm_march_flag = ''
+# Since android build uses ndk-build, meson can't detect its arch properly. (arch != aarch64)
+# So we need to add an android case explicitly
+if arch == 'aarch64' or get_option('platform') == 'android'
+  if arm_arch_opt == 'armv7-a'
+    error('arm-arch=armv7-a is not supported on aarch64/android (arm64-v8a only).')
+  elif arm_arch_opt == 'auto'
+    arm_arch_opt = 'armv8.2-a'
+  endif
+  # KleidiAI is always built on aarch64 and needs dotprod+i8mm
+  # @todo support dotprod-only by dropping the i8mm kai kernels
+  if not (get_option('enable-dotprod') and get_option('enable-i8mm'))
+    error('aarch64 requires enable-dotprod and enable-i8mm (KleidiAI).')
+  endif
+  # Tizen optflags (-march=armv8-a...) come after project args and win, and
+  # MSVC ignores -march, so force the ACLE macros KleidiAI/ggml check.
+  # @todo drop once sources are selected per extension and Tizen uses arm-arch
+  if get_option('platform') != 'android'
+    extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+    extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+  endif
+  arm_march_flag = '-march=' + arm_arch_opt
+  if get_option('enable-fp16')
+    arm_march_flag += '+fp16'
+  endif
+  if get_option('enable-dotprod')
+    arm_march_flag += '+dotprod'
+  endif
+  if get_option('enable-i8mm')
+    arm_march_flag += '+i8mm'
+  endif
+  if get_option('enable-fp16fml')
+    arm_march_flag += '+fp16fml'
+  endif
+  if get_option('enable-sve')
+    arm_march_flag += '+sve'
+  endif
+  if get_option('enable-sve2')
+    arm_march_flag += '+sve2'
+  endif
+  if get_option('enable-sme')
+    arm_march_flag += '+sme'
+  endif
+  if get_option('enable-sme2')
+    arm_march_flag += '+sme2'
+  endif
+elif arch == 'arm'
+  if arm_arch_opt == 'auto'
+    arm_arch_opt = 'armv7-a'
+  elif arm_arch_opt != 'armv7-a'
+    error('arm-arch=@0@ is not supported on 32-bit arm (armv7-a only).'.format(arm_arch_opt))
+  endif
+  # @todo add a non-NEON fallback; neon_impl is always built on armv7
+  if not get_option('enable-neon')
+    error('armv7-a requires enable-neon (no non-NEON backend yet).')
+  endif
+  arm_march_flag = '-march=armv7-a'
+  add_project_arguments('-mfpu=neon', language: ['c', 'cpp'])
+elif arm_arch_opt != 'auto'
+  warning('arm-arch=@0@ is ignored on non-ARM builds.'.format(arm_arch_opt))
+endif
+
+# Android compiles via ndk-build (jni/meson.build), so it should not be applied here.
+if arm_march_flag != '' and get_option('platform') != 'android'
+  add_project_arguments(arm_march_flag, language: ['c', 'cpp'])
 endif
 
 if get_option('enable-fp16')
-   # fp16-impl is read by exactly one branch below, the non-android x86_64 one:
-   # every other arch has a native half type and takes it unconditionally. Say
-   # so rather than let a non-default value be discarded in silence, which
-   # otherwise lets someone believe they produced a wrapper build.
-   if get_option('fp16-impl') != 'auto' and not (arch == 'x86_64' and get_option('platform') != 'android')
-     warning('fp16-impl=@0@ is ignored on this build: the option selects the x86_64 fp16 backing type, and this build uses the native __fp16/_Float16.'.format(get_option('fp16-impl')))
-   endif
-   if get_option('platform') == 'android'
-     # NDK clang (and non-ARM host compilers used for the meson-built QNN
-     # plugin) reject -mfp16-format=ieee; only pass it when supported.
-     if cxx.has_argument('-mfp16-format=ieee')
-       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
-     endif
-     extra_defines += '-DENABLE_FP16=1'
-     extra_defines += '-DUSE__FP16=1'
-   elif arch == 'aarch64'
-     ## About FP16 in GCC (from GCC-9.1 manual)
-     # https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html
-     # On ARM and AArch64 targets, GCC supports half-precision (16-bit) floating point
-     #   via the __fp16 type defined in the ARM C Language Extensions.
-     # On ARM systems, you must enable this type explicitly with the -mfp16-format
-     #   command-line option in order to use it.
-     ## About FP16-SIMD in aarch64
-     # FP16-SIMD is supported since armv8.2. If you enable this forcibly, it won't be
-     # comaptible with armv8.0 machines.
-     if cxx.has_argument('-mfp16-format=ieee')
-       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
-     else
-       message ('The compiler does not support -mfp16-format=ieee. However, according to https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html, gcc may use IEEE fp16 anyway. Thus, we will proceed without the option for FP16 support.')
-     endif
-     # Use arm-arch option for architecture-specific flags
-     arm_arch_opt = get_option('arm-arch')
-     if arm_arch_opt == 'armv9.2-a'
-       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
-       extra_defines += '-DARM_ARCH_ARMV9_2A=1'
-       extra_defines += '-DENABLE_SVE2=1'
-     elif arm_arch_opt == 'armv8.2-a'
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
-       extra_defines += '-DARM_ARCH_ARMV8_2A=1'
-     else
-       # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
-       extra_defines += '-DARM_ARCH_ARMV8_2A=1'
-       message('Unknown arm-arch option. Using default armv8.2-a+fp16+dotprod+i8mm')
-     endif
-     extra_defines += '-DENABLE_FP16=1'
-     extra_defines += '-DUSE__FP16=1'
-   elif arch == 'arm'
-     ## About FP16-SIMD in arm
-     # FP16-SIMD is supported since armv9.2.
-     # Thus, even if fp16 is force-enabled, NEON is off.
-     if cxx.has_argument('-mfp16-format=ieee')
-       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
-       extra_defines += '-DENABLE_FP16=1'
-       extra_defines += '-DUSE__FP16=1'
-     else
-       error ('The compiler does not support -mfp16-format=ieee')
-     endif
-   elif arch == 'x86_64'
-     # Selection is capability-based, not compiler-name-based: use native
-     # _Float16 when the compiler can actually *do* half arithmetic, otherwise
-     # fall back to the uint16-backed nntrainer::Half wrapper (e.g. MSVC).
-     fp16_impl = get_option('fp16-impl')
-     fp16_probe = '''_Float16 mul(_Float16 a, _Float16 b){ return a * b; }
+  # fp16-impl is read by exactly one branch below, the non-android x86_64 one:
+  # every other arch has a native half type and takes it unconditionally. Say
+  # so rather than let a non-default value be discarded in silence, which
+  # otherwise lets someone believe they produced a wrapper build.
+  if get_option('fp16-impl') != 'auto' and not (arch == 'x86_64' and get_option('platform') != 'android')
+    warning('fp16-impl=@0@ is ignored on this build: the option selects the x86_64 fp16 backing type, and this build uses the native __fp16/_Float16.'.format(get_option('fp16-impl')))
+  endif
+  if arch == 'aarch64' or get_option('platform') == 'android'
+    if arm_arch_opt == 'armv8-a'
+      error('enable-fp16 requires arm-arch=armv8.2-a or later (FEAT_FP16 is Armv8.2+)')
+    endif
+    # NDK clang (and non-ARM host compilers used for the meson-built QNN
+    # plugin) reject -mfp16-format=ieee; only pass it when supported.
+    if cxx.has_argument('-mfp16-format=ieee')
+      add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+    endif
+    extra_defines += '-DENABLE_FP16=1'
+    extra_defines += '-DUSE__FP16=1'
+  elif arch == 'arm'
+    # __fp16 on 32-bit arm must be enabled explicitly with -mfp16-format
+    if cxx.has_argument('-mfp16-format=ieee')
+      add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+    else
+      error ('The compiler does not support -mfp16-format=ieee')
+    endif
+    # armv7 (32-bit) has no FP16 SIMD (needs armv8.2-a); only scalar __fp16 storage
+    # is enabled here, and the FP16 NEON kernels may fail to build.
+    warning('FP16 is enabled on armv7 (32-bit ARM). NEON FP16 SIMD is unavailable, so FP16 NEON kernels may fail to build. Use -Denable-fp16=false on armv7 if the build breaks.')
+    extra_defines += '-DENABLE_FP16=1'
+    extra_defines += '-DUSE__FP16=1'
+  elif arch == 'x86_64'
+    # Selection is capability-based, not compiler-name-based: use native
+    # _Float16 when the compiler can actually *do* half arithmetic, otherwise
+    # fall back to the uint16-backed nntrainer::Half wrapper (e.g. MSVC).
+    fp16_impl = get_option('fp16-impl')
+    fp16_probe = '''_Float16 mul(_Float16 a, _Float16 b){ return a * b; }
 int main(){ _Float16 x = (_Float16)1, y = (_Float16)2; return (int)mul(x, y); }'''
-     if fp16_impl == 'native'
-       fp16_native = true
-     elif fp16_impl == 'wrapper'
-       fp16_native = false
-     else # auto
-       fp16_native = cxx.compiles(fp16_probe, name: 'native _Float16 arithmetic')
-     endif
-     if fp16_native
-       message ('Float16 for x86_64 enabled: native _Float16 (GCC/clang, byte-identical).')
-       extra_defines += '-DENABLE_FP16=1'
-     else
-       message ('Float16 for x86_64 enabled: uint16-backed nntrainer::Half wrapper (no native _Float16).')
-       extra_defines += '-DENABLE_FP16=1'
-       extra_defines += '-DUSE_HALF_WRAPPER=1'
-     endif
-   elif arch == 'riscv64'
-     error ('RISCV64 RVV support and fp16 support is not yet implemented.')
-   else
-     error ('FP16 support for this arch is not yet implemented.')
-   endif
-else
-  if arch == 'aarch64'
-    add_project_arguments('-march=armv8.2-a+dotprod+i8mm', language: ['c', 'cpp'])
+    if fp16_impl == 'native'
+      fp16_native = true
+    elif fp16_impl == 'wrapper'
+      fp16_native = false
+    else # auto
+      fp16_native = cxx.compiles(fp16_probe, name: 'native _Float16 arithmetic')
+    endif
+    if fp16_native
+      message ('Float16 for x86_64 enabled: native _Float16 (GCC/clang, byte-identical).')
+      extra_defines += '-DENABLE_FP16=1'
+    else
+      message ('Float16 for x86_64 enabled: uint16-backed nntrainer::Half wrapper (no native _Float16).')
+      extra_defines += '-DENABLE_FP16=1'
+      extra_defines += '-DUSE_HALF_WRAPPER=1'
+    endif
+  elif arch == 'riscv64'
+    error ('RISCV64 RVV support and fp16 support is not yet implemented.')
+  else
+    error ('FP16 support for this arch is not yet implemented.')
   endif
 endif
 

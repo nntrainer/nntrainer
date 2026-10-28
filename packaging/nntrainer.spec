@@ -48,11 +48,18 @@
 
 %endif # 0%{tizen_version_major}%{tizen_version_minor} >= 65
 
-%define enable_fp16 0
-### nntrainer fp16 implementation relies on NEON, which requires armv8.2-a
+### Float16 support. Off by default; enable from gbs: --define "enable_fp16 1"
+### (1/0 or true/false). nntrainer fp16 relies on NEON, which needs armv8.2-a
 ### armv7l Tizen: do not support fp16 neon.
-### aarch64 Tizen: uses armv8.0a. no fp16 neon.
+### aarch64 Tizen: uses armv8.0a by default; enable_fp16 builds armv8.2-a+fp16.
 ### x86/x64 Tizen: it has gcc9. x86 requires gcc >= 12 for fp16
+%{!?enable_fp16:%global enable_fp16 0}
+%if "%{enable_fp16}" == "true"
+%global enable_fp16 1
+%endif
+%if "%{enable_fp16}" == "false"
+%global enable_fp16 0
+%endif
 
 ## Float16 support
 %if 0%{?enable_fp16}
@@ -60,6 +67,25 @@
 %else
 %define fp16_support -Denable-fp16=false
 %endif # enable_fp16
+
+## ARM base ISA and per-extension ISA toggles.
+## meson composes the -march flag from arm-arch + each extension toggle, so
+## every option below can be turned on/off individually from gbs, e.g.:
+##   gbs build --define "arm_arch armv8.2-a"     # base ISA: armv7-a / armv8-a / armv8.2-a
+##   gbs build --define "enable_sve true"        # extensions take true / false
+## Extension toggles take only true / false (meson rejects 1 / 0), unlike
+## enable_fp16 above, which also takes 1 / 0.
+## Only options given via --define are passed; defaults live in meson_options.txt
+## (arm-arch=auto: armv8.2-a+dotprod+i8mm on aarch64, armv7-a+neon on armv7l).
+## Giving any of these (or enable_fp16) strips optflags -march/-mcpu/-mfpu so
+## meson's -march takes effect. Otherwise the optflags ISA is kept (aarch64:
+## armv8-a, armv7l: armv7-a+neon), so the default package runs on armv8.0.
+## Any single define (e.g. only enable_neon) also moves the unset options to
+## the meson defaults, so the aarch64 package then needs dotprod+i8mm.
+## aarch64 always adds +dotprod+i8mm, even with arm_arch armv8-a, so no
+## define gives an armv8.0 build until per-extension source selection lands.
+%define arm_isa_custom %{?arm_arch:1}%{?enable_neon:1}%{?enable_dotprod:1}%{?enable_i8mm:1}%{?enable_fp16fml:1}%{?enable_sve:1}%{?enable_sve2:1}%{?enable_sme:1}%{?enable_sme2:1}
+%define arm_isa_support %{?arm_arch:-Darm-arch=%{arm_arch}} %{?enable_neon:-Denable-neon=%{enable_neon}} %{?enable_dotprod:-Denable-dotprod=%{enable_dotprod}} %{?enable_i8mm:-Denable-i8mm=%{enable_i8mm}} %{?enable_fp16fml:-Denable-fp16fml=%{enable_fp16fml}} %{?enable_sve:-Denable-sve=%{enable_sve}} %{?enable_sve2:-Denable-sve2=%{enable_sve2}} %{?enable_sme:-Denable-sme=%{enable_sme}} %{?enable_sme2:-Denable-sme2=%{enable_sme2}}
 
 
 ## GPU flag
@@ -423,9 +449,14 @@ export CFLAGS+=" -fprofile-arcs -ftest-coverage"
 export CXXFLAGS+=" -fprofile-arcs -ftest-coverage"
 %endif
 
-%if 0%{?enable_fp16}
-export CFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
-export CXXFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
+# Tizen optflags carry -march/-mcpu/-mfpu, which come after meson's project
+# args and win. Strip them when an ISA option is given so meson composes the
+# ISA flags. Subprojects and meson probes then build at the toolchain default.
+%ifarch %arm aarch64
+%if 0%{arm_isa_custom} || 0%{?enable_fp16}
+CFLAGS=`echo $CFLAGS | sed -E "s/(^|[[:space:]])-m(arch|cpu|fpu)=[^[:space:]]*/\\1/g"`
+CXXFLAGS=`echo $CXXFLAGS | sed -E "s/(^|[[:space:]])-m(arch|cpu|fpu)=[^[:space:]]*/\\1/g"`
+%endif
 %endif
 
 # Add backward competibility for tizen < 6
@@ -450,7 +481,7 @@ meson --buildtype=plain --prefix=%{_prefix} --sysconfdir=%{_sysconfdir} \
       %{enable_reduce_tolerance} %{configure_subplugin_install_path} %{enable_debug} \
       -Dml-api-support=enabled -Denable-nnstreamer-tensor-filter=enabled \
       -Denable-nnstreamer-tensor-trainer=enabled -Denable-capi=enabled \
-      %{fp16_support} %{opencl_support} build --wrap-mode=nodownload
+      %{fp16_support} %{arm_isa_support} %{opencl_support} build --wrap-mode=nodownload
 
 ninja -C build %{?_smp_mflags}
 

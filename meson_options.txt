@@ -99,15 +99,30 @@ option('causallm-tokenizer-cache', type: 'feature', value: 'auto',
        description: 'Persistent tokenizer snapshot cache (NNTR_TOKENIZER_CACHE=0 turns it off at run time). auto = on when the linked tokenizer library exports the snapshot entry points, which Applications/CausalLM/tools/build_tokenizers_c.sh builds.')
 
 # ARM architecture options
-# Note: Tizen (GBS) builds do not use this option
-# armv7l is a Tizen-only target, so it is not listed here.
-# Note that armv9.2-a used to denote enabling sve kernels, but as of now
-# it only means enabling auto vectorization from compiler.
-# @todo extract each extension from `arm-arch` presets.
 option('arm-arch', type: 'combo',
-       choices: ['none', 'armv8.2-a', 'armv9.2-a'],
-       value: 'none',
-       description: 'Target ARM architecture. "none" disables arm related features.')
-option('arm-march', type: 'string',
-       value: '',
-       description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
+       choices: ['auto', 'armv7-a', 'armv8-a', 'armv8.2-a'],
+       value: 'auto',
+       description: 'Target ARM base ISA. "auto" = armv8.2-a on aarch64/android, armv7-a on arm. Ignored on non-ARM builds.')
+# Individual ARM ISA feature toggles. Combined with arm-arch to compose the
+# -march flag (e.g. armv8.2-a + fp16 + dotprod + i8mm). fp16 is toggled via the
+# existing enable-fp16 option above.
+
+# armv7
+option('enable-neon', type: 'boolean', value: true,
+       description: 'Enable the ARM neon (-mfpu=neon) for armv7-a.')
+
+# aarch64
+option('enable-dotprod', type: 'boolean', value: true,
+       description: 'Enable the ARM dotprod (+dotprod) ISA extension.')
+option('enable-i8mm', type: 'boolean', value: true,
+       description: 'Enable the ARM Int8 Matrix Multiply (+i8mm) ISA extension.')
+option('enable-fp16fml', type: 'boolean', value: false,
+       description: 'Enable the ARM FP16 multiply-long (+fp16fml) ISA extension.')
+option('enable-sve', type: 'boolean', value: false,
+       description: 'Enable the ARM SVE (+sve) ISA extension.')
+option('enable-sve2', type: 'boolean', value: false,
+       description: 'Enable the ARM SVE2 (+sve2) ISA extension')
+option('enable-sme', type: 'boolean', value: false,
+       description: 'Enable the ARM SME (+sme) ISA extension')
+option('enable-sme2', type: 'boolean', value: false,
+       description: 'Enable the ARM SME2 (+sme2) ISA extension')
