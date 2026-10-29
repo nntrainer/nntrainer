@@ -383,13 +383,10 @@ void CpuComputeOps::rotary_embedding(const Tensor &in, Tensor &out,
                                      unsigned int start_pos, bool rotate) {
   using DataType = ml::train::TensorDim::DataType;
   const unsigned int half = head_dim / 2;
-  const bool out_fp16 = out.getDataType() == DataType::FP16 ||
-                        out.getDataType() == DataType::UINT16;
-  if (in.getDataType() != DataType::FP32 ||
-      (!out_fp16 && out.getDataType() != DataType::FP32))
+  if (head_dim == 0 || head_dim % 2 != 0 || in.width() % head_dim != 0)
     throw std::invalid_argument(
-      "CpuComputeOps::rotary_embedding: FP32 input to FP32 / FP16 / UINT16 "
-      "output only");
+      "CpuComputeOps::rotary_embedding: head_dim must be even, non-zero and "
+      "divide the row width");
   if (out.width() != in.width() || out.size() < in.size())
     throw std::invalid_argument(
       "CpuComputeOps::rotary_embedding: out must hold every row of in");
@@ -401,6 +398,42 @@ void CpuComputeOps::rotary_embedding(const Tensor &in, Tensor &out,
 
   const unsigned int W = in.width();
   const unsigned int rows = in.batch() * in.channel() * in.height();
+
+  if (in.getDataType() == DataType::FP16) {
+#ifdef ENABLE_FP16
+    if (out.getDataType() != DataType::FP16 || !rotate ||
+        table.cos_fp16 == nullptr || table.sin_fp16 == nullptr)
+      throw std::invalid_argument(
+        "CpuComputeOps::rotary_embedding: an FP16 input rotates into an FP16 "
+        "output with the fp16 table");
+    const _FP16 *cos16 = reinterpret_cast<const _FP16 *>(table.cos_fp16);
+    const _FP16 *sin16 = reinterpret_cast<const _FP16 *>(table.sin_fp16);
+    for (unsigned int r = 0; r < rows; ++r) {
+      const size_t pos = start_pos + r % in.height();
+      compute_rotary_emb_value(W, head_dim, half,
+                               in.getData<_FP16>() + (size_t)r * W,
+                               out.getData<_FP16>() + (size_t)r * W,
+                               cos16 + pos * half, sin16 + pos * half);
+    }
+    return;
+#else
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: FP16 input needs enable-fp16");
+#endif
+  }
+
+  const bool out_fp16 = out.getDataType() == DataType::FP16 ||
+                        out.getDataType() == DataType::UINT16;
+  if (in.getDataType() != DataType::FP32 ||
+      (!out_fp16 && out.getDataType() != DataType::FP32))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: FP32 input to FP32 / FP16 / UINT16 "
+      "output, or FP16 input to FP16 output");
+  if (rotate && (table.cos == nullptr || table.sin == nullptr))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: an FP32 input rotates with the fp32 "
+      "table");
+
   for (unsigned int r = 0; r < rows; ++r) {
     const size_t pos = start_pos + r % in.height();
     const float *cos_row = rotate ? table.cos + pos * half : nullptr;
