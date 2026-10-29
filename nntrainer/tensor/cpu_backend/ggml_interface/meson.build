@@ -6,9 +6,13 @@ ggml_interface_headers = [
     'ggml_interface.h',
 ]
 
-ggml_interface_sources = [
-  'ggml_interface.cpp'
+# Built for every thread-backend; test/unittest reuses this list.
+ggml_interface_common_sources = [
+  'ggml_interface.cpp',
+  'ggml_interface_q8_0.cpp',
 ]
+
+ggml_interface_sources = ggml_interface_common_sources
 
 if get_option('thread-backend') == 'bstp'
   ggml_interface_sources += 'ggml_interface_bs_threadpool.cpp'
