@@ -591,9 +591,9 @@ are gaps in the code relative to the rules above; they are not a schedule.
 
 - **No whole-op virtual for `rmsnorm` or `attention`.** They are absent from
   `nntrainer/tensor/cpu_backend/compute_ops.h`, so §4's collapse is blocked for those operations
-  and §4's interim rule applies instead. `rope` has one, `rotary_embedding`, but only the host
-  FP32-input path of `mha_core` dispatches through it so far; the FP16 host path and the OpenCL /
-  CUDA device arms are still selected inside `mha_core.cpp` (#4451).
+  and §4's interim rule applies instead. `rope` has one, `rotary_embedding`, and `mha_core`'s host
+  RoPE (FP32 and FP16 input) dispatches through it; the OpenCL and CUDA device arms are still
+  selected inside `mha_core.cpp` (#4451).
 - **Allocator-name string comparisons remain** in `nntrainer/tensor/memory_pool.cpp` (`"qnn"`)
   and `Applications/CausalLM/kv_cache_manager.cpp` (`"gpu-svm"`) — see §3.
 - **There is no public layer-author API.** `ml::train::Layer`
