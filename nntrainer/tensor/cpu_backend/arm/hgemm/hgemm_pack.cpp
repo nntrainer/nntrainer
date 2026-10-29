@@ -25,7 +25,7 @@
 void packing_A1(unsigned int m, unsigned int k, const __fp16 *from,
                 unsigned int lda, const __fp16 *to) {
 
-  assert(k != 0 && m != 0 && k % 4 == 0 && m % 4 == 0);
+  assert(k != 0 && m != 0 && k % 4 == 0);
   unsigned int i, j;
 
   __fp16 *a_offset, *a_offset1, *a_offset2, *a_offset3, *a_offset4;
