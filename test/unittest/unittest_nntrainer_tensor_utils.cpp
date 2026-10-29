@@ -353,6 +353,34 @@ TEST(Tensor, transpose) {
   EXPECT_NEAR(result.getValue(0, 0, 2, 1), 6.0f, TOLERANCE);
 }
 
+TEST(Tensor, transpose_hw_shapes) {
+  for (unsigned int h = 1; h <= 6; ++h) {
+    for (unsigned int w = 1; w <= 6; ++w) {
+      nntrainer::Tensor t(nntrainer::TensorDim(2, 3, h, w));
+
+      for (unsigned int b = 0; b < t.batch(); ++b)
+        for (unsigned int c = 0; c < t.channel(); ++c)
+          for (unsigned int i = 0; i < h; ++i)
+            for (unsigned int j = 0; j < w; ++j)
+              t.setValue(b, c, i, j,
+                         static_cast<float>(((b * 3 + c) * h + i) * w + j));
+
+      nntrainer::Tensor result = t.transpose("0:2:1");
+
+      ASSERT_EQ(result.height(), w) << "h=" << h << " w=" << w;
+      ASSERT_EQ(result.width(), h) << "h=" << h << " w=" << w;
+
+      for (unsigned int b = 0; b < t.batch(); ++b)
+        for (unsigned int c = 0; c < t.channel(); ++c)
+          for (unsigned int i = 0; i < h; ++i)
+            for (unsigned int j = 0; j < w; ++j)
+              ASSERT_NEAR(result.getValue(b, c, j, i), t.getValue(b, c, i, j),
+                          TOLERANCE)
+                << "h=" << h << " w=" << w << " at " << i << "," << j;
+    }
+  }
+}
+
 TEST(Tensor, apply_exp) {
   nntrainer::TensorDim dim(1, 1, 1, 3);
   nntrainer::Tensor t(dim);
