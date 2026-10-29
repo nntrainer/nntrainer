@@ -770,6 +770,13 @@ private:
 #ifdef ENABLE_FP16
     std::vector<std::vector<_FP16>> cos_fp16;
     std::vector<std::vector<_FP16>> sin_fp16;
+    /**
+     * The same fp16 angles as [positions, head_dim / 2]: the
+     * nntrainer::RotaryTable layout the host RoPE reads and the LUT the
+     * OpenCL RoPE uploads. The row form above stays for the CUDA arm.
+     */
+    std::vector<_FP16> cos_fp16_flat;
+    std::vector<_FP16> sin_fp16_flat;
 #endif
   };
   inline static std::unordered_map<std::string, RopeFreqCache> rope_freq_cache;
@@ -783,37 +790,26 @@ private:
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
   std::vector<std::vector<_FP16>> *cached_freqs_cos_fp16 = {};
   std::vector<std::vector<_FP16>> *cached_freqs_sin_fp16 = {};
-  // Flattened [max_pos * head_dim/2] cos/sin LUT (fp16 bits) for the GPU RoPE
-  // path (rope_inplace_f16_cl). PROCESS-WIDE static (inline static) CACHE keyed
-  // by (head_dim, theta, max_pos): models that alternate RoPE slots per layer
-  // (Gemma4: sliding head_dim=256/theta=1e4, full head_dim=512/theta=1e6) keep
-  // a SEPARATE, STABLE table per slot instead of rebuilding + re-uploading the
-  // single shared table on every sliding<->full transition. std::map is chosen
-  // for NODE STABILITY: the cos/sin vector storage never moves on insert, so
-  // the .data() pointer handed to the GPU wrapper stays valid for the whole run
-  // -- the rope_inplace_f16_cl device-LUT cache is keyed by that host pointer,
-  // so stable pointers keep the upload cached per slot (no per-layer thrash).
-  // Single-head_dim models (Qwen3/Gemma2) populate exactly one entry, matching
-  // the previous "built once" behaviour.
-  using RopeFlatKey = std::tuple<int, float, unsigned int>; // head_dim,theta,mp
-  using RopeFlatVal =
-    std::pair<std::vector<uint16_t>, std::vector<uint16_t>>; // (cos, sin)
-  inline static std::map<RopeFlatKey, RopeFlatVal> rope_flat_cache;
-  // Stable pointers into the cache entry for the CURRENT slot (set by
-  // ensure_rope_flat_lut). Per-instance: each layer instance points at its own
-  // slot's cached table; the underlying storage lives in the shared map so the
-  // pointers stay valid (and identical) across calls for a given slot.
+  inline static std::vector<_FP16> *freqs_cos_fp16_flat = {};
+  inline static std::vector<_FP16> *freqs_sin_fp16_flat = {};
+  // This instance's [max_pos, head_dim / 2] fp16 cos/sin table (fp16 bits),
+  // set by ensure_rope_flat_lut. It points into rope_freq_cache, whose key
+  // holds every RoPE parameter, so Gemma4's sliding and full slots each keep
+  // their own table. The vectors never move once built (unordered_map nodes
+  // are stable), so rope_inplace_f16_cl's device-LUT cache, keyed by this host
+  // pointer, uploads each table once.
   const uint16_t *rope_cos_flat_cur = nullptr;
   const uint16_t *rope_sin_flat_cur = nullptr;
+  unsigned int rope_flat_positions = 0; /**< rows of that table */
 
   /**
-   * @brief Build (or reuse) the process-wide flat RoPE LUT for THIS instance's
-   *        current (head_dim, theta, max_pos) slot. Idempotent: an existing
-   *        cache entry is reused (just repoints rope_cos/sin_flat_cur); a new
-   *        slot is built (precompute_freqs + the flatten fill) and inserted.
-   *        Called from finalize() so the build lands at model load instead of
-   *        inside the first timed prefill (KVST "lutcheck" segment), and from
-   *        the GPU-RoPE hot path as the fallback.
+   * @brief Point rope_cos/sin_flat_cur at this instance's flat fp16 RoPE
+   *        table, building it through precompute_freqs on first use. Once set
+   *        the pointers are returned as they are, until setProperty() clears
+   *        them. Called from finalize() so the build lands at model load
+   *        instead of inside the first timed prefill (KVST "lutcheck"
+   *        segment), and from the GPU-RoPE and host-RoPE paths as the
+   *        fallback.
    */
   void ensure_rope_flat_lut();
   /** @brief positions the RoPE LUT must cover = min(max_position_embeddings,
