@@ -99,6 +99,13 @@ std::vector<TensorEntry> parseHeaderEntries(const std::string &json);
 std::map<std::string, std::string> parseMetadata(const std::string &json);
 
 /**
+ * @brief Read the @c __metadata__ block of the safetensors file at @a path
+ *        (the header only, not the data).
+ * @throw std::runtime_error when the file or its header cannot be read
+ */
+std::map<std::string, std::string> readMetadata(const std::string &path);
+
+/**
  * @brief Produce a human-readable summary of a safetensors header (metadata
  *        plus a per-tensor table) for inspection without loading weights.
  */

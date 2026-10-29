@@ -248,6 +248,7 @@ int main(int argc, char *argv[]) {
     resolveNntrConfigPath(nntr_cfg, "model_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
+    resolveNntrConfigPath(nntr_cfg, "kv_quant_file", model_path);
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =

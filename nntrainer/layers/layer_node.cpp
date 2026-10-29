@@ -919,6 +919,15 @@ void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
                                        bool training) {
   loss->set(run_context->getRegularizationLoss());
   PROFILE_TIME_START(forward_event_key);
+  // a producer may have deferred the kernels that write one of the inputs
+  // (ComputeOps::flush_deferred): they are enqueued ahead of this reader
+  if (deferredOutputsPending()) {
+    for (unsigned int i = 0; i < run_context->getNumInputs(); ++i) {
+      Tensor &in = run_context->getInput(i);
+      if (ComputeOps *ops = in.getOps())
+        ops->flush_deferred(in);
+    }
+  }
   // std::cerr << getType() << "\n";
   layer->incremental_forwarding(*run_context, from, to, training);
   PROFILE_TIME_END(forward_event_key);

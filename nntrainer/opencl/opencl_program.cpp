@@ -167,6 +167,17 @@ std::string Program::GetDefaultCompilerOptions() const {
          "-cl-finite-math-only -cl-fast-relaxed-math ";
 }
 
+std::string
+Program::GetDefaultCompilerOptions(const std::string &compiler_options) const {
+  // A program whose results must match a host computation bit for bit
+  // (IEEE add / multiply / fma in a fixed order) asks for strict math by
+  // defining NNTR_STRICT_FP: the relaxed / unsafe defaults would let the
+  // compiler fuse, reassociate and substitute its own approximations.
+  if (compiler_options.find("-DNNTR_STRICT_FP") != std::string::npos)
+    return "-cl-std=CL3.0 ";
+  return GetDefaultCompilerOptions();
+}
+
 /**
  * @brief Create OpenCL program from source
  *
@@ -193,8 +204,8 @@ bool Program::CreateCLProgram(const cl_context &context,
   }
 
   // building the created program
-  return BuildProgram(device_id,
-                      GetDefaultCompilerOptions() + compiler_options);
+  return BuildProgram(device_id, GetDefaultCompilerOptions(compiler_options) +
+                                   compiler_options);
 }
 
 /**
@@ -236,7 +247,7 @@ bool Program::CreateCLProgramWithBinary(const cl_context &context,
 
 std::size_t Program::GetKernelHash(const std::string &code,
                                    const std::string &compiler_options) {
-  return std::hash<std::string>{}(GetDefaultCompilerOptions() +
+  return std::hash<std::string>{}(GetDefaultCompilerOptions(compiler_options) +
                                   compiler_options + code);
 }
 

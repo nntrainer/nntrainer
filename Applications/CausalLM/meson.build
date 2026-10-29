@@ -471,6 +471,24 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Expert slot residency (expert_residency.h): host-only, header-only. Pins
+  # the per-layer LRU that decides which device slot a streamed MoE expert
+  # is read into.
+  unittest_expert_residency = executable(
+    'unittest_expert_residency',
+    meson.current_source_dir() / 'layers' / 'unittest_expert_residency.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_expert_residency', unittest_expert_residency,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_expert_residency'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Portable token sampler (token_sampler.h): host-only, header-only. Pins the
   # RNG stream, same-seed reproducibility and the top-k / top-p tie rules.
   unittest_sampling = executable(

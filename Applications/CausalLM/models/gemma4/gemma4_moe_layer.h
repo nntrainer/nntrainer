@@ -19,6 +19,8 @@
 
 #include <memory>
 #include <tensor.h>
+#include <utility>
+#include <vector>
 
 namespace causallm {
 
@@ -37,6 +39,37 @@ public:
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/**
+ * @brief Whether the router RMSNorm carries a learned per-feature scale.
+ *
+ * The HF Gemma4 router normalizes its input without a scale (followed by the
+ * router scale and hidden^-0.5, which this layer always applies). Set this
+ * for checkpoints whose router norm has its own weight; it is then read as
+ * the extra weight "router_norm" (fp32, [hidden]) and applied after the
+ * normalization.
+ */
+class Gemma4RouterNormWeight : public nntrainer::Property<bool> {
+public:
+  Gemma4RouterNormWeight(bool value = false) { set(value); }
+  static constexpr const char *key = "router_norm_weight";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
+ * @brief Stream the experts from the weight file into device slots (the gpu
+ *        engine's expert slot arena) instead of keeping all of them resident.
+ *
+ * Needs a positive moe_cache_size: the slots per layer. The cpu engine maps
+ * virtual experts through its own cache (moe_cache_size alone) and ignores
+ * this.
+ */
+class Gemma4MoEFsu : public nntrainer::Property<bool> {
+public:
+  Gemma4MoEFsu(bool value = false) { set(value); }
+  static constexpr const char *key = "moe_fsu";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
 } // namespace props
 
 class Gemma4ExpertCache;
@@ -45,7 +78,7 @@ class Gemma4ExpertCache;
  * @class Gemma4MoELayer
  * @brief Gemma4 sparse expert layer with its model-specific router.
  */
-class WIN_EXPORT Gemma4MoELayer final : public nntrainer::LayerImpl {
+class WIN_EXPORT Gemma4MoELayer : public nntrainer::LayerImpl {
 public:
   Gemma4MoELayer();
   ~Gemma4MoELayer();
@@ -75,7 +108,7 @@ public:
 
   static constexpr const char *type = "gemma4_moe";
 
-private:
+protected:
   unsigned int num_experts;
   unsigned int topk;
   unsigned int cache_size;
@@ -83,7 +116,8 @@ private:
   nntrainer::ActiFunc acti_func;
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation,
-             nntrainer::props::Epsilon, props::Gemma4MoECacheSize>
+             nntrainer::props::Epsilon, props::Gemma4MoECacheSize,
+             props::Gemma4RouterNormWeight, props::Gemma4MoEFsu>
     moe_props;
 
   std::unique_ptr<Gemma4ExpertCache> expert_cache;
@@ -94,6 +128,7 @@ private:
   unsigned int router_idx;
   unsigned int router_scale_idx;
   unsigned int per_expert_scale_idx;
+  unsigned int router_norm_idx;
   unsigned int router_input_scaled_idx;
   unsigned int router_logits_idx;
 
@@ -118,12 +153,59 @@ private:
 
   void registerExpertCache(nntrainer::RunLayerContext &context);
 
-  void forwardTensors(nntrainer::RunLayerContext &context,
-                      nntrainer::Tensor &expert_input,
-                      nntrainer::Tensor &router_input,
-                      nntrainer::Tensor &output,
-                      nntrainer::Tensor &router_input_scaled,
-                      nntrainer::Tensor &router_logits);
+  /**
+   * @brief Routing of one forward call: per expert, the (token row, routing
+   *        weight) pairs assigned to it in ascending token order, and the
+   *        experts with at least one row in ascending expert id.
+   */
+  struct Routing {
+    std::vector<std::vector<std::pair<unsigned int, float>>> assignments;
+    std::vector<unsigned int> active;
+  };
+
+  /**
+   * @brief Route @a total_tokens rows: rms_norm, router scale, router GEMM,
+   *        softmax, top-k, renormalisation and per-expert scale.
+   * @param router_input router rows [T, 1, 1, hidden] (read on the host)
+   * @param router_input_scaled scratch [T, 1, 1, hidden]
+   * @param router_logits scratch [T, 1, 1, num_experts]
+   * @param routing result
+   */
+  void routeTokens(nntrainer::RunLayerContext &context,
+                   nntrainer::Tensor &router_input,
+                   nntrainer::Tensor &router_input_scaled,
+                   nntrainer::Tensor &router_logits, unsigned int total_tokens,
+                   unsigned int hidden_size, Routing &routing);
+
+  /**
+   * @brief Whether this implementation computes with FP16 activations. The
+   *        host expert loop is FP32 only; the gpu layer accepts both.
+   */
+  virtual bool acceptsFp16Activations() const { return false; }
+
+  virtual void forwardTensors(nntrainer::RunLayerContext &context,
+                              nntrainer::Tensor &expert_input,
+                              nntrainer::Tensor &router_input,
+                              nntrainer::Tensor &output,
+                              nntrainer::Tensor &router_input_scaled,
+                              nntrainer::Tensor &router_logits);
+
+  /**
+   * @brief Decode step (one token) with TQ2CX experts: the gate and up
+   * projections of every selected expert go to the batched GEMM in one call
+   * (one fork / join instead of two per expert), then activation, down and
+   * the weighted scatter run per expert in ascending expert order exactly as
+   * computeExpertForward does, so the result is bit-identical to it.
+   * @return false when the compute ops cannot take the batched call
+   */
+  bool computeGroupedDecode(
+    nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+    nntrainer::Tensor &output, const std::vector<unsigned int> &active_experts,
+    const std::vector<std::vector<std::pair<unsigned int, float>>>
+      &expert_assignments,
+    unsigned int hidden_size);
+
+  nntrainer::Tensor scratch_grouped_gate_up;
 
   void computeExpertForward(
     const nntrainer::Tensor &input, nntrainer::Tensor &output,

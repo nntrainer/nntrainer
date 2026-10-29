@@ -15,3 +15,14 @@ __kernel void geglu_cl(__global const float *restrict in1,
 
   out[i] = gelu * in2_val;
 }
+
+// Exact GeGLU (gelu with the erf, HF "gelu" / approximate="none"):
+//   0.5 * x * (1 + erf(x / sqrt(2))) * up
+__kernel void geglu_erf_cl(__global const float *restrict in1,
+                           __global const float *restrict in2,
+                           __global float *restrict out) {
+  const int i = get_global_id(0);
+  const float x = in1[i];
+  const float gelu = 0.5f * x * (1.0f + erf(x * 0.7071067811865476f));
+  out[i] = gelu * in2[i];
+}

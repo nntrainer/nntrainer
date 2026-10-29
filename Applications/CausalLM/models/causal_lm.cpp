@@ -28,6 +28,7 @@
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -401,65 +402,119 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
+CausalLM::KVCacheLayout CausalLM::planKVCache() {
+  KVCacheLayout layout;
+  layout.max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+
+  // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
+  // stores a Wcap-row ring, every other layer keeps max_seq. Same
+  // getKVCacheRows() hook the placeholder factories use, so the two shapes
+  // line up at bind time (the bind asserts they do).
+  std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
+  for (int i = 0; i < NUM_LAYERS; ++i)
+    layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
+  kv_cache.setLayerCaps(layer_caps);
+
+  // Per-layer width via the getKVCacheWidth() hook: uniform
+  // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
+  // variable-geometry models. One vector path now serves every model, so the
+  // per-model allocateAndBindKVCache overrides are gone. (The scalar
+  // allocate this used before only additionally set the KVCacheManager
+  // num_heads_kv_/head_dim_ members, which have no reader -- getKVWidth() is
+  // uncalled -- so this is behavior-identical.)
+  layout.widths.assign(static_cast<size_t>(NUM_LAYERS), 0u);
+  for (int i = 0; i < NUM_LAYERS; ++i)
+    layout.widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
+
+  // Second hook, same shape as the one above: which layers need storage at
+  // all. A KV-shared layer (gemma4 `num_kv_shared_layers`) has no wk/wv and
+  // no k_norm/v_norm of its own -- it attends over an earlier layer's K/V
+  // plane -- so the private slab it gets otherwise is filled with
+  // byte-identical values every step. Declaring the source makes those
+  // layers aliases of it (same MemoryData, same offset) instead of copies.
+  //
+  // The map comes from getKVSourceLayer(), which resolves through the SAME
+  // function the model's graph builder used to wire the shared attention, so
+  // the plane a layer reads is by construction the plane it was given.
+  //
+  // Declared only when some layer actually shares: a model that inherits the
+  // -1 default for every layer never calls setLayerKVSources at all, so it
+  // keeps the literal pre-aliasing path through KVCacheManager (empty map =>
+  // validate early-returns, both allocation loops are untouched, no witness
+  // line) rather than an all-(-1) map that merely behaves the same.
+  std::vector<int> kv_sources(static_cast<size_t>(NUM_LAYERS), -1);
+  bool any_kv_shared = false;
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    kv_sources[static_cast<size_t>(i)] = getKVSourceLayer(i);
+    any_kv_shared |= (kv_sources[static_cast<size_t>(i)] >= 0);
+  }
+  if (any_kv_shared)
+    kv_cache.setLayerKVSources(std::move(kv_sources));
+  return layout;
+}
+
+void CausalLM::allocateKVCacheStorage(const KVCacheLayout &layout) {
+  // dtype matches mha_core's cache placeholders so external cache storage
+  // is interpreted consistently across platforms.
+#ifdef ENABLE_FP16
+  const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                    layout.max_timestep, layout.widths, cache_dtype);
+}
+
+void CausalLM::load_weight(const std::string &weight_path) {
+  // NNTR_KV_EARLY: unset/anything else = allocate on a side thread during the
+  // load (default on the OpenCL gpu engine), "sync" = after the load on this
+  // thread, "0" = lazily in the first run() as before. Other engines keep the
+  // lazy path unless NNTR_KV_EARLY is set: the early build was measured on
+  // the gpu engine only. A model whose plane can still grow sizes its
+  // KV from the first prompt, so it keeps the lazy path whatever the env says.
+  // The CUDA engine always takes "sync": its KV zero fill is a kernel on the
+  // stream the weight upload is using, and its context sets environment
+  // variables lazily, which a getenv on another thread must not race.
+  enum class Mode { lazy, sync, overlap };
+  static const Mode mode = []() {
+    const char *e = std::getenv("NNTR_KV_EARLY");
+    if (e == nullptr && causallm_engine() != "gpu")
+      return Mode::lazy;
+    if (e != nullptr && e[0] == '0')
+      return Mode::lazy;
+    if (e != nullptr && std::strcmp(e, "sync") == 0)
+      return Mode::sync;
+    return Mode::overlap;
+  }();
+  const bool early = prepare_run_at_load_ && mode != Mode::lazy &&
+                     !kv_cache.isAllocated() && !prefillPlaneCanGrow();
+
+  const bool overlap = mode == Mode::overlap && causallm_engine() != "cuda";
+  std::future<void> kv_alloc;
+  if (early && overlap) {
+    // The hooks run here, on this thread, before the load starts; the side
+    // thread only allocates and zeroes kv_cache, which nothing in the weight
+    // load reads or writes. The future is joined below, or by its destructor
+    // if the load throws, so the thread never outlives this call.
+    KVCacheLayout layout = planKVCache();
+    kv_alloc = std::async(std::launch::async,
+                          [this, layout]() { allocateKVCacheStorage(layout); });
+  }
+
+  Transformer::load_weight(weight_path);
+
+  if (kv_alloc.valid())
+    kv_alloc.get(); // rethrows an allocation failure here, not in run()
+  if (early) {
+    // Binds the placeholders of the graph that was just loaded (and, in sync
+    // mode, allocates first). run() finds it done and skips both.
+    allocateAndBindKVCache();
+  }
+}
+
 void CausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
-    // dtype matches mha_core's cache placeholders so external cache storage
-    // is interpreted consistently across platforms.
-#ifdef ENABLE_FP16
-    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
-#else
-    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
-#endif
-
-    const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
-
-    // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
-    // stores a Wcap-row ring, every other layer keeps max_seq. Same
-    // getKVCacheRows() hook the placeholder factories use, so the two shapes
-    // line up at bind time (the bind asserts they do).
-    std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
-    for (int i = 0; i < NUM_LAYERS; ++i)
-      layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
-    kv_cache.setLayerCaps(layer_caps);
-
-    // Per-layer width via the getKVCacheWidth() hook: uniform
-    // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
-    // variable-geometry models. One vector path now serves every model, so the
-    // per-model allocateAndBindKVCache overrides are gone. (The scalar
-    // allocate this used before only additionally set the KVCacheManager
-    // num_heads_kv_/head_dim_ members, which have no reader -- getKVWidth() is
-    // uncalled -- so this is behavior-identical.)
-    std::vector<unsigned int> kv_widths(static_cast<size_t>(NUM_LAYERS), 0u);
-    for (int i = 0; i < NUM_LAYERS; ++i)
-      kv_widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
-
-    // Second hook, same shape as the one above: which layers need storage at
-    // all. A KV-shared layer (gemma4 `num_kv_shared_layers`) has no wk/wv and
-    // no k_norm/v_norm of its own -- it attends over an earlier layer's K/V
-    // plane -- so the private slab it gets otherwise is filled with
-    // byte-identical values every step. Declaring the source makes those
-    // layers aliases of it (same MemoryData, same offset) instead of copies.
-    //
-    // The map comes from getKVSourceLayer(), which resolves through the SAME
-    // function the model's graph builder used to wire the shared attention, so
-    // the plane a layer reads is by construction the plane it was given.
-    //
-    // Declared only when some layer actually shares: a model that inherits the
-    // -1 default for every layer never calls setLayerKVSources at all, so it
-    // keeps the literal pre-aliasing path through KVCacheManager (empty map =>
-    // validate early-returns, both allocation loops are untouched, no witness
-    // line) rather than an all-(-1) map that merely behaves the same.
-    std::vector<int> kv_sources(static_cast<size_t>(NUM_LAYERS), -1);
-    bool any_kv_shared = false;
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      kv_sources[static_cast<size_t>(i)] = getKVSourceLayer(i);
-      any_kv_shared |= (kv_sources[static_cast<size_t>(i)] >= 0);
-    }
-    if (any_kv_shared)
-      kv_cache.setLayerKVSources(std::move(kv_sources));
-
-    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
-                      max_timestep, kv_widths, cache_dtype);
+    allocateKVCacheStorage(planKVCache());
     kv_cache_bound = false;
   }
 

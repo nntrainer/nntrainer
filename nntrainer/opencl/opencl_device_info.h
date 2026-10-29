@@ -66,6 +66,11 @@ public:
     return device_svm_capabilities_;
   }
 
+  /** CL_DEVICE_SINGLE_FP_CONFIG; 0 when the device did not answer */
+  cl_device_fp_config getDeviceSingleFpConfig() const {
+    return device_single_fp_config_;
+  }
+
 private:
   // Order of parameters based on
   // https://registry.khronos.org/OpenCL/specs/3.0-unified/html/OpenCL_API.html#device-queries-table
@@ -81,6 +86,7 @@ private:
   std::string driver_version_ = {};
   std::string device_extensions_ = {};
   cl_device_svm_capabilities device_svm_capabilities_ = {};
+  cl_device_fp_config device_single_fp_config_ = {};
 };
 
 } // namespace nntrainer::opencl

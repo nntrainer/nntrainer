@@ -61,6 +61,9 @@ test_target = [
   # Closed-form contract for the fused sigmoid-gated whole-ops.
   ['unittest_sigmoid_gate_ops', []],
   ['unittest_nntrainer_fallback', []],
+  ['unittest_nntrainer_tensor_ternary', []],
+  ['unittest_nntrainer_qs4acx', []],
+  ['unittest_nntrainer_kv_snap', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
   ['unittest_nntrainer_exe_order', []],
@@ -110,6 +113,11 @@ if get_option('enable-opencl')
   # The backend is selected by NNTR_OPS_BACKEND so the two engines are compared
   # across separate processes.
   test_target += [['unittest_embedding_pool_ops', []]]
+  # The OpenCL backend's expert reader pool (reads a temporary file; no GPU).
+  test_target += [['unittest_expert_reader_pool', []]]
+  # The streamed-expert decode protocol without a host round trip
+  # (expert_fsu_flags.h): the device side emulated on a thread; no GPU.
+  test_target += [['unittest_expert_fsu_flags', []]]
 endif
 
 if get_option('enable-fp16')

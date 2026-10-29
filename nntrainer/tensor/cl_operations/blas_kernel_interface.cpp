@@ -140,6 +140,13 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     const float *mdata = m.getData();
     float *rdata = result.getData();
 
+    // out_svm: the same landing rule as the FP16 branch below. A result tensor
+    // in coarse-grain shared virtual memory has to be host-mapped before the
+    // staging read-back, or the copy-out never lands and the tensor keeps
+    // whatever it held -- an all-zero FP32 FC on Intel Xe3.
+    const bool out_svm =
+      result.getMemoryData() && result.getMemoryData()->isSVM();
+
     /// shortcut handling in case of vector
     /// for vector, (1 * K) == (K * 1) in current memory layout...
     /// and plaese note that N, K, M is a fixed place holder after considering
@@ -157,19 +164,21 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
-      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda)
-            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda);
+      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda, out_svm)
+            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda, out_svm);
     }
     /// case3: (1 * K) X (K * N) = 1 * N = R
     /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
     /// Effectively a translation of sgemv
     else if (M == 1) {
-      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb)
-              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb);
+      trans_m
+        ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb, out_svm)
+        : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb, out_svm);
     }
     /// case others: use sgemm
     else {
-      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
+      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc,
+               out_svm);
     }
   } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -391,6 +400,7 @@ int aminCl(const Tensor &input) { throwNoOpenCLKernel("aminCl"); }
 #include "cl_tensor_view.h"
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -456,6 +466,10 @@ struct V8cWeightEntry {
   std::unique_ptr<tv::TensorBacking> backing;
   OwnedClMem scale_buf;      // [N] fp32 recip-scale (owned)
   OwnedClMem row_sum_w_int4; // [N] int32 sum_k(int4 w_nk) (owned)
+  // [N] int32 per-channel zero point of an ASYMMETRIC int4 weight (owned;
+  // empty for a symmetric weight). Selects the -DV8C_ASYM kernels -- see
+  // dotCl_v8c_set_weight_zero_points().
+  OwnedClMem zp_buf;
   unsigned int N = 0, K = 0;
   // Name of the weight this pack was built from. The map is keyed on the
   // weight's host address, which the allocator may hand to a DIFFERENT weight
@@ -511,6 +525,36 @@ static std::mutex &v8c_cache_mtx() {
 static std::unordered_map<const void *, V8cWeightEntry> &v8c_weight_cache() {
   static std::unordered_map<const void *, V8cWeightEntry> c;
   return c;
+}
+
+// Host copies of the per-channel weight zero points registered through
+// dotCl_v8c_set_weight_zero_points(), keyed by weight NAME. The device copy
+// lives on the weight's cache entry, but that entry is built lazily (or by the
+// load-time prebuild) and may be rebuilt on a reused-key miss, so the source of
+// truth is kept here and re-attached whenever an entry for that name is
+// (re)built. Guarded by v8c_cache_mtx().
+static std::unordered_map<std::string, std::vector<int>> &v8c_zp_registry() {
+  static std::unordered_map<std::string, std::vector<int>> r;
+  return r;
+}
+
+// Upload @p zp into @p e.zp_buf (replacing any previous one). Caller holds
+// v8c_cache_mtx(). False -- and the entry left symmetric -- on an allocation
+// failure or a length that does not match the entry.
+static bool v8c_attach_zp_locked(V8cWeightEntry &e,
+                                 const std::vector<int> &zp) {
+  e.zp_buf.reset();
+  if (zp.size() != (size_t)e.N || zp.empty())
+    return false;
+  cl_int err = CL_SUCCESS;
+  cl_mem buf = opencl::clCreateBufferT(
+    ClContext::Global().context_inst_.GetContextNoRetain(),
+    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * zp.size(),
+    const_cast<int *>(zp.data()), &err);
+  if (err != CL_SUCCESS || buf == nullptr)
+    return false;
+  e.zp_buf.reset(buf);
+  return true;
 }
 
 // Number of per-fanout activation slots. RACE#1 (R3) fix: the GEMM reads the
@@ -816,6 +860,18 @@ static unsigned int v8c_norm_quant_max_rows() {
 
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
 // Returns nullptr if shape unsupported (caller falls back).
+
+/**
+ * @brief Whether @a weight is an int4 record the v8c path consumes: QS4CX,
+ *        or QS4ACX -- the same nibbles and scale tail followed by a
+ *        per-channel zero point, which the build attaches to the entry.
+ */
+static bool v8c_int4_record(const Tensor &weight) {
+  const auto dt = weight.getDataType();
+  return dt == ml::train::TensorDim::DataType::QS4CX ||
+         dt == ml::train::TensorDim::DataType::QS4ACX;
+}
+
 static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                                                unsigned int K, unsigned int N,
                                                const uint8_t *nib_override) {
@@ -877,7 +933,7 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // per-output-channel fp32 scale. A legacy QINT4 .bin is re-laid-out to this
   // form at load (QS4CX_Tensor::read), so the v8c backing has a single source.
   //
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!v8c_int4_record(weight))
     return nullptr;
   V8cWeightEntry e;
   {
@@ -1007,6 +1063,37 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       cache.erase(it); // a stale mismatched entry raced back in; replace it
   }
   auto inserted = cache.emplace(key, std::move(e));
+  // Zero points registered for this weight (possibly before this build,
+  // possibly for a pack this miss is rebuilding) ride on the entry the GEMM
+  // binds.
+  {
+    auto &reg = v8c_zp_registry();
+    // A QS4ACX record carries its zero points: register them from the record
+    // tail ([nibbles][N fp32 scales][N fp32 zero points]) the first time the
+    // weight is built, so the asymmetric epilogue runs with no caller step.
+    if (weight.getDataType() == ml::train::TensorDim::DataType::QS4ACX &&
+        reg.find(inserted.first->second.name) == reg.end()) {
+      const float *zp = static_cast<const float *>(weight.getScale()) + N;
+      std::vector<int> zi(N);
+      bool ok = true;
+      for (unsigned int n = 0; n < N && ok; ++n) {
+        const float r = std::nearbyint(zp[n]);
+        ok = r == zp[n] && r >= -255.0f && r <= 255.0f;
+        zi[n] = (int)r;
+      }
+      if (ok)
+        reg.emplace(inserted.first->second.name, std::move(zi));
+      else
+        ml_logw("[v8c] %s: QS4ACX zero points are not integers in [-255, "
+                "255]; the weight is built without them",
+                inserted.first->second.name.c_str());
+    }
+    auto rit = reg.find(inserted.first->second.name);
+    if (rit != reg.end() &&
+        !v8c_attach_zp_locked(inserted.first->second, rit->second))
+      ml_logw("[v8c] could not attach the weight zero points of %s",
+              inserted.first->second.name.c_str());
+  }
 
   // [NNTR_V8C_DROP_PLAIN] The device backing + scale buf + row-sum built
   // above are the only things the v8c GPU path reads from now on, so dropping
@@ -1039,7 +1126,12 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
   {
-    static const bool drop_plain = qs4cxDropPlainOn();
+    // Per record type: QS4CX keeps qs4cxDropPlainOn(), QS4ACX resolves its
+    // own default (int4DropPlainOn) -- its record also carries the zero
+    // points, registered above from these bytes before anything is released.
+    const auto w_dt = weight.getDataType();
+    const bool is_qs4acx = w_dt == ml::train::TensorDim::DataType::QS4ACX;
+    const bool drop_plain = int4DropPlainOn(w_dt);
     // Announce the resolved decision once. The drop is otherwise invisible in
     // a run log -- same outputs, same caches, only the residency differs --
     // which makes "was it actually on?" unanswerable after the fact. The
@@ -1098,7 +1190,8 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       }
     } else if (drop_plain && droppable) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
-                             + (size_t)N * sizeof(float);      // fp32 scales
+                             + (size_t)N * sizeof(float)       // fp32 scales
+                             + (is_qs4acx ? (size_t)N * sizeof(float) : 0);
       const size_t page = 4096;
       uintptr_t lo = ((uintptr_t)nibbles + page - 1) & ~(page - 1);
       uintptr_t hi = ((uintptr_t)nibbles + payload) & ~(page - 1);
@@ -1125,7 +1218,7 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                      rc == 0 ? 0 : errno);
       // Record the release for the host-side guards -- only for a self-owned
       // payload, whose pages really are gone (see the block comment above).
-      if (rc == 0 && qs4cxHeapBypassOn())
+      if (rc == 0 && int4HeapBypassOn(w_dt))
         markQs4cxPayloadDropped(nibbles, payload);
     }
   }
@@ -1277,6 +1370,48 @@ void v8cNormQuantAbort() {
   v8c_scratch().nq_pending_slot = -1;
 }
 
+bool v8cNormQuantClaim(void *src_clmem, unsigned int rows, unsigned int K,
+                       void **act_i8, void **act_scale, void **act_zp,
+                       void **act_rs) {
+  if (src_clmem == nullptr || rows == 0 || K == 0)
+    return false;
+  std::lock_guard<std::mutex> slock(v8c_cache_mtx());
+  V8cScratch &sc = v8c_scratch();
+  auto &fs = v8c_fuse_stats();
+  if (sc.nq_slot < 0) {
+    ++fs.nq_none;
+    return false;
+  }
+  if (sc.nq_src != src_clmem) {
+    ++fs.nq_other;
+    return false;
+  }
+  const int slot = sc.nq_slot;
+  const unsigned int M_pad = v8c_m_pad_for(rows);
+  if (sc.nq_rows != rows || sc.nq_K != K ||
+      sc.act_i8_bytes[slot] < (size_t)M_pad * K ||
+      sc.act_scale_bytes[slot] < sizeof(float) * M_pad ||
+      sc.act_zp_bytes[slot] < sizeof(int) * M_pad ||
+      sc.act_rs_bytes[slot] < sizeof(int) * M_pad) {
+    ++fs.nq_shape;
+    return false;
+  }
+  // The same test the FC applies: the bytes at the handle must still be the
+  // ones the norm quantised.
+  if (!opencl::Kernel::bufferUnchangedSince(src_clmem, sc.nq_seq)) {
+    ++fs.nq_dirty;
+    return false;
+  }
+  ++fs.nq_hit;
+  if (sc.nq_site != nullptr)
+    ++v8c_norm_sites()[sc.nq_site].claimed;
+  *act_i8 = sc.act_i8[slot];
+  *act_scale = sc.act_scale[slot];
+  *act_zp = sc.act_zp[slot];
+  *act_rs = sc.act_rs[slot];
+  return true;
+}
+
 // Eager v8c weight build (see header). Moves the lazy per-weight nibble
 // permute + upload out of the first timed prefill: the CL FC layer calls this
 // right after its weight is read at model load. No-op (false) off the v8c
@@ -1292,13 +1427,97 @@ bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   // hygiene only — the in-order queue already sequences those writes ahead
   // of this GEMM). Relaxed-atomic no-op after the first forward.
   v8c_flush_pending_uploads();
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!v8c_int4_record(weight))
     return false;
   const unsigned int N = weight.width();
   const unsigned int K = weight.height();
   if (N == 0 || K == 0 || N % 8 != 0 || K % 32 != 0)
     return false;
   return v8c_get_or_build_weight(weight, K, N, nullptr) != nullptr;
+}
+
+bool dotCl_v8c_set_weight_zero_points(const Tensor &weight, const float *zp,
+                                      unsigned int N) {
+  const std::string &name = weight.getName();
+  if (name.empty())
+    return false;
+  std::vector<int> zi;
+  if (zp != nullptr) {
+    if (N == 0 || N != weight.width())
+      return false;
+    // The kernels fold the zero point into their int32 epilogue, so it must
+    // be an integer; the bound keeps (8 - z) * K far from int32 overflow.
+    zi.resize(N);
+    for (unsigned int n = 0; n < N; ++n) {
+      const float r = std::nearbyint(zp[n]);
+      if (r != zp[n] || r < -255.0f || r > 255.0f)
+        return false;
+      zi[n] = (int)r;
+    }
+  }
+  // Bring the OpenCL context up before the first touch of the static weight
+  // cache below: function-local statics are destroyed in reverse order of
+  // construction, and a cache constructed before the context would release
+  // its device buffers after the context is gone at process exit (measured
+  // as a driver crash on Adreno when this is called ahead of any dispatch).
+  (void)ClContext::Global();
+  std::lock_guard<std::mutex> lock(v8c_cache_mtx());
+  auto &reg = v8c_zp_registry();
+  // The entry this weight is cached under, if it was built already. Same
+  // identity test as a cache hit: the key is a host address, the name is what
+  // tells two same-shaped weights apart.
+  V8cWeightEntry *entry = nullptr;
+  if (const void *key = weight.getData<uint8_t>()) {
+    auto it = v8c_weight_cache().find(key);
+    if (it != v8c_weight_cache().end() && it->second.name == name)
+      entry = &it->second;
+  }
+  if (zp == nullptr) {
+    reg.erase(name);
+    if (entry != nullptr)
+      entry->zp_buf.reset();
+    return true;
+  }
+  auto &host = reg[name];
+  host = std::move(zi);
+  if (entry != nullptr && !v8c_attach_zp_locked(*entry, host)) {
+    // Never leave registered zero points that the GEMM is not applying.
+    reg.erase(name);
+    return false;
+  }
+  return true;
+}
+
+bool zeroPointsFromCorrection(const float *scale, const float *corr,
+                              unsigned int N, std::vector<float> &zp) {
+  if (scale == nullptr || corr == nullptr)
+    return false;
+  zp.resize(N);
+  for (unsigned int n = 0; n < N; ++n) {
+    if (!(scale[n] > 0.0f))
+      return false;
+    // c = s * (8 - z) with an integer z: recover z and require that c is
+    // exactly what that z gives back (to float rounding), so a correction that
+    // does not come from an integer zero point is refused, not approximated.
+    const float z = std::nearbyint(8.0f - corr[n] / scale[n]);
+    const float back = scale[n] * (8.0f - z);
+    if (std::fabs(back - corr[n]) > 1e-5f * std::fabs(scale[n]) * 8.0f + 1e-30f)
+      return false;
+    zp[n] = z;
+  }
+  return true;
+}
+
+bool dotCl_v8c_set_zero_point_correction(const Tensor &weight,
+                                         const float *corr, unsigned int N) {
+  if (corr == nullptr)
+    return dotCl_v8c_set_weight_zero_points(weight, nullptr, N);
+  if (N == 0 || N != weight.width())
+    return false;
+  std::vector<float> zp;
+  if (!zeroPointsFromCorrection(weight.getScale<float>(), corr, N, zp))
+    return false;
+  return dotCl_v8c_set_weight_zero_points(weight, zp.data(), N);
 }
 
 bool dotCl_v8c_prebuild_weight_from(const Tensor &weight,
@@ -1309,7 +1528,7 @@ bool dotCl_v8c_prebuild_weight_from(const Tensor &weight,
     return false;
   nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PREBUILD);
   v8c_flush_pending_uploads();
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!v8c_int4_record(weight))
     return false;
   const unsigned int N = weight.width();
   const unsigned int K = weight.height();
@@ -1600,7 +1819,7 @@ static void v8c_copy_svm_to_clmem(const void *in_svm, cl_mem out,
 bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (!v8c_env_enabled())
     return false;
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!v8c_int4_record(weight))
     return false;
   // Derive M, K, N from tensor dims (no-transpose case only).
   unsigned int M, K, N;
@@ -1692,7 +1911,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                             ? static_cast<void *>(output.getData<_FP16>())
                             : static_cast<void *>(output.getData<float>());
       if (lmhead_int4_v8c_gemv_cl(w->weight_buf, w->scale_buf.get(), act,
-                                  act_clmem, logits_host, out_fp16, N, K))
+                                  act_clmem, logits_host, out_fp16, N, K,
+                                  w->zp_buf.get()))
         return true;
     }
 #endif
@@ -2127,7 +2347,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     opencl::Kernel::noteDispatchWrites(static_cast<void *>(gemm_y_arg));
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg,
                      w->scale_buf.get(), act_rs_arg, act_zp_arg,
-                     w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M);
+                     w->row_sum_w_int4.get(), gemm_y_arg, M_pad, N, K, M,
+                     w->zp_buf.get());
     // NNTR_XE3_FC_SYNC=1: clFinish after the FC GEMM. Off by default on
     // every platform; =0 or leaving it unset keeps it off.
     //
@@ -2428,6 +2649,10 @@ void cl_fc_release_caches() {
   //    the previous model's pack, whose aux sub-buffers point into an arena the
   //    next load is still bumping through (see v8c_release_aux_arena).
   v8c_weight_cache().clear();
+  //    The weight zero points registered for those weights are keyed by
+  //    weight NAME, which the next model reuses ("layer0_wq" ...): a survivor
+  //    would be attached to a different model's weight of the same name.
+  v8c_zp_registry().clear();
   // 2. The norm-site strike counters, keyed by the gamma HOST pointer: a
   //    recycled address hands the next model's norm the previous model's
   //    "written off, never fuse again" verdict.

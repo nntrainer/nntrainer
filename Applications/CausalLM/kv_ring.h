@@ -382,6 +382,22 @@ inline bool kvRingArmAvailable() {
 }
 
 /**
+ * @brief Whether NNTR_KV_WINDOW_RING explicitly turns the ring OFF (set, and
+ *        not a truthy value).
+ * @details The opt-out is one switch for everything the ring brings with it:
+ * kvRingEnabled() keeps the linear cache, and a model whose ring default also
+ * made it chunk prompts longer than the plane (Transformer::chunkLongPrompts())
+ * goes back to the single-block bound, so the opt-out arm is the pre-ring
+ * behaviour rather than a third configuration (linear cache + chunking).
+ * NNTR_PREFILL_CHUNK still chunks explicitly on top of the opt-out.
+ */
+inline bool kvRingOptedOut() {
+  const char *req = std::getenv("NNTR_KV_WINDOW_RING");
+  return req != nullptr && req[0] != '\0' &&
+         !nntr_env_on("NNTR_KV_WINDOW_RING");
+}
+
+/**
  * @brief Whether the KV ring is enabled.
  * @param model_default what the MODEL asks for when the environment is silent.
  * @details NNTR_KV_WINDOW_RING, when set, is the whole answer to "is the ring
@@ -406,7 +422,7 @@ inline bool kvRingArmAvailable() {
 inline bool kvRingEnabled(bool model_default = false) {
   const char *req = std::getenv("NNTR_KV_WINDOW_RING");
   const bool explicit_req = (req != nullptr && req[0] != '\0');
-  if (explicit_req ? !nntr_env_on("NNTR_KV_WINDOW_RING") : !model_default)
+  if (explicit_req ? kvRingOptedOut() : !model_default)
     return false;
   const bool ok = kvRingEngineEligible() && kvRingArmAvailable();
   if (!ok && explicit_req) {
@@ -469,7 +485,7 @@ inline constexpr unsigned int kPrefillBlockCap = 4096u;
  * @brief Requested prefill chunk size (0 = no chunking / single-block prefill).
  * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
  * tuning); a non-positive or unparseable value is REJECTED (treated as unset)
- * rather than wrapped into a ~4e9 unsigned, which the (W/C + 2) * C ring
+ * rather than wrapped into a ~4e9 unsigned, which the ring-capacity
  * arithmetic would have consumed. Otherwise, chunking follows the ring:
  * chunking is what bounds a launch's live key span, so the ring picks the
  * chunk, 4096 for every backend. The equal-thermal ring-on sweep is monotone in
@@ -637,10 +653,12 @@ inline unsigned int prefillPlaneFor(unsigned int prompt_tokens,
  * shape, KV allocation, cache write, attention kernel dispatch -- computes Wcap
  * from THIS one function so they stay consistent.
  *
- * Wcap is a multiple of C and >= W + C: a multiple of C means a C-aligned chunk
- * write never straddles the wrap seam (it stays one contiguous slice), and
- * >= W + C means the live window [pos-W+1, pos+C) never self-collides mod Wcap.
- * Returning 0 keeps the exact pre-ring behaviour, so ring-off is bit-identical.
+ * Wcap is the smallest multiple of C that is >= W + C (when W and C are
+ * 64-row aligned; otherwise (W / C + 2) * C): a multiple of C means a
+ * C-aligned chunk write never straddles the wrap seam (it stays one contiguous
+ * slice), and >= W + C means the live window [pos-W+1, pos+C) never
+ * self-collides mod Wcap. Returning 0 keeps the exact pre-ring behaviour, so
+ * ring-off is bit-identical.
  *
  * @param local_window W, the layer's sliding window (0 = full attention).
  * @param max_seq the full context window this layer would otherwise allocate.
@@ -661,9 +679,26 @@ inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq,
   const unsigned int C = chunk;
   if (C == 0)
     return 0; // the ring requires chunked prefill to bound the live span
-  // multiple of C, >= W + C (headroom so the window never wraps onto itself).
-  const unsigned int cap = (local_window / C + 2u) * C;
-  return (cap < max_seq) ? cap : 0u; // no benefit if it would not shrink
+  // The smallest multiple of C that is >= W + C: the live span of a chunk
+  // launch is W + C - 1 rows, and a multiple of C keeps a C-aligned chunk
+  // write on one side of the seam. That is ceil(W / C) * C + C.
+  //
+  // Where W and C both sit on the 64-row grid the Adreno image mirror's
+  // 64-floored base still fits this exactly: a launch at [f, f + S) with S <=
+  // C lies inside the C-aligned block starting at floor_C(f), whose window
+  // starts at floor_C(f) - W, a 64-aligned row no later than the floored base,
+  // so (f + S) - base <= W + C = cap. Off that grid the old (W / C + 2) * C
+  // is kept, whose extra C rows of headroom cover the 63-row floor.
+  //
+  // At W == C == 1024 (the Gemma4 MoE pack, plane 1024) this is 2048 rows
+  // against 3072 for (W / C + 2) * C, which did not fit under a 2560-row
+  // max_seq_len -- the ring then returned 0 and saved nothing at that plane.
+  unsigned long cap;
+  if ((local_window % 64u) == 0u && (C % 64u) == 0u)
+    cap = ((unsigned long)local_window + C - 1ul) / C * C + C;
+  else
+    cap = ((unsigned long)local_window / C + 2ul) * C;
+  return (cap < max_seq) ? (unsigned int)cap : 0u; // no benefit -> linear
 }
 
 /**

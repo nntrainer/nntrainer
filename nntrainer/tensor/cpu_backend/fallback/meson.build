@@ -1,5 +1,5 @@
 fallback_headers = ['fallback_internal.h']
-fallback_sources = ['fallback_internal.cpp']
+fallback_sources = ['fallback_internal.cpp', 'tq2cx_kernels.cpp']
 
 arch = host_machine.cpu_family()
 

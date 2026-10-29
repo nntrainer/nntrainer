@@ -64,6 +64,13 @@ protected:
   float SLIDING_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR = 1.0f;
   float FINAL_LOGIT_SOFTCAPPING = 0.0f;
   bool ENABLE_SKIP_PREFILL_OPT = false;
+  /** nntrainer activation of the gated MLPs (dense, per-layer input and MoE
+   *  experts), from the HF config key hidden_activation */
+  std::string HIDDEN_ACTIVATION = "tanh_gelu";
+  /** per layer, comma separated per kv-head int8 scales of the K / V cache
+   *  (nntr_config "kv_quant_file"); empty: fp KV cache */
+  std::vector<std::string> K_CACHE_INT8_SCALES;
+  std::vector<std::string> V_CACHE_INT8_SCALES;
 
   /** nntr_config "folded_lut": the sidecar embedding LUTs are PRE-FOLDED.
    *  The token table already contains the sqrt(hidden) embedding scaling, and
@@ -120,6 +127,18 @@ protected:
   virtual Tensor createFeedForwardBlock(const int layer_id,
                                         Tensor post_attention,
                                         bool is_kv_shared_layer);
+  /**
+   * @brief Whether every "norm, then residual add" pair of a decoder block is
+   *        built as one two-input rms_norm (out = rmsnorm(x) * gamma +
+   *        residual, a single fused kernel on the gpu engine) instead of an
+   *        rms_norm followed by an addition layer. When true, the
+   *        post-attention norm takes the block input as its residual, and
+   *        createFeedForwardBlock() must return the FFN output with
+   *        post_attention already added (its last norm takes post_attention
+   *        as the residual), so the decoder block drops both addition layers.
+   *        Default false: the graph is the plain norm + addition form.
+   */
+  virtual bool fuseNormResidualAdd() const { return false; }
   std::pair<Tensor, Tensor>
   createGemma4KVCachePlaceholders(const int layer_id, unsigned int kv_width);
   /**

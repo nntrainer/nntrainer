@@ -50,6 +50,7 @@
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layernorm_cl_op.h>
+#include <moe_route_cl.h>
 #include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <sigmoid_add_cl_op.h>
 #include <sigmoid_glu_cl_op.h>
@@ -218,7 +219,8 @@ public:
       return;
 
     switch (weight.getDataType()) {
-    case ml::train::TensorDim::DataType::QS4CX: {
+    case ml::train::TensorDim::DataType::QS4CX:
+    case ml::train::TensorDim::DataType::QS4ACX: {
       // This is the fallback boundary the plain-payload release is guarded
       // at: once the v8c repack exists, NNTR_V8C_DROP_PLAIN may have handed
       // the nibbles' pages back, and the host dot below would then multiply
@@ -242,9 +244,15 @@ public:
       input.dot(weight, output, false, false);
       break;
     }
-    default:
+    default: {
+      // dotCl stages the FP32 / FP16 activation through a host copy (its
+      // kernels read staging buffers, not the tensor), so an input a kernel
+      // may still be writing -- the row gather of a MoE expert, say -- has to
+      // land on the host first, exactly like the quantized host arm above.
+      HostOperand host_in(input, /*host_writes=*/false);
       nntrainer::dotCl(input, weight, output);
       break;
+    }
     }
   }
 
@@ -276,6 +284,10 @@ public:
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void geglu_erf(const Tensor &in1, const Tensor &in2, Tensor &out,
+                 unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::geglu_erf_cl_op(in1, in2, out, active_rows, row_offset);
   }
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override {
@@ -526,6 +538,44 @@ public:
   void l2_normalize_rows(const Tensor &in, Tensor &out,
                          float epsilon) override {
     l2_normalize_rows_cl_op(in, out, epsilon);
+  }
+
+  // MoE row movement and the expert FC: see moe_route_cl.h.
+  bool moe_gather_rows(const Tensor &in, Tensor &out,
+                       const unsigned int *src_rows,
+                       unsigned int rows) override {
+    return nntrainer::moe_gather_rows_cl(in, out, src_rows, rows);
+  }
+  bool moe_scatter_add_rows(const Tensor &expert_out, Tensor &out,
+                            const unsigned int *dst_rows, const float *weights,
+                            unsigned int rows) override {
+    return nntrainer::moe_scatter_add_rows_cl(expert_out, out, dst_rows,
+                                              weights, rows);
+  }
+  bool moe_zero_rows(Tensor &out, unsigned int rows) override {
+    return nntrainer::moe_zero_rows_cl(out, rows);
+  }
+  void fc_expert(Tensor &input, Tensor &weight, Tensor &output) override {
+    nntrainer::moe_expert_fc_cl(input, weight, output);
+  }
+  bool moe_experts(const MoeExpertGroup &group) override {
+    return nntrainer::moe_experts_cl(group);
+  }
+  bool moe_experts_prebuild(const MoeExpertGroup &group) override {
+    return nntrainer::moe_experts_prebuild_cl(group);
+  }
+  bool moe_route(const MoeRouter &router, unsigned int tokens, uint32_t *ids,
+                 float *weights) override {
+    return nntrainer::moe_route_cl(router, tokens, ids, weights);
+  }
+  bool moe_experts_prefetch(const MoeExpertGroup &group) override {
+    return nntrainer::moe_experts_prefetch_cl(group);
+  }
+  void moe_experts_join(const MoeExpertGroup &group) override {
+    nntrainer::moe_experts_join_cl(group);
+  }
+  void flush_deferred(const Tensor &t) override {
+    nntrainer::moe_experts_flush_deferred_cl(t);
   }
 
 #ifdef ENABLE_FP16

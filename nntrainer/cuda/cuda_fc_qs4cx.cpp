@@ -250,6 +250,9 @@ bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
                              unsigned int M, unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
+  // An asymmetric weight is not handled by this diagnostic route.
+  if (cuda_fc_qs4cx_has_weight_zero_points(plain_w))
+    return false;
 
   auto kernel = CudaContext::Global().registerCudaKernel(FC_QS4CX_PLAIN_SRC,
                                                          "fc_qs4cx_plain_gemm");
@@ -321,6 +324,9 @@ bool cuda_fc_qs4cx_gemm_fp32_resident(const float *host_X,
                                       unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
+  // An asymmetric weight is not handled by this diagnostic route.
+  if (cuda_fc_qs4cx_has_weight_zero_points(host_plain))
+    return false;
   std::lock_guard<std::mutex> lk(g_qs4cx_mtx);
 
   // 1) device weight (upload once, cache by host pointer).
@@ -441,10 +447,51 @@ __device__ __forceinline__ void asym_qparams(float fmn, float fmx,
   zp = (int)rintf(zp_f);
 }
 
+// Optional per-row sum of the int8 codes (arsum[m] = sum_k q8[m][k]), the
+// input of the asymmetric-weight term in the GEMM epilogues below: with a
+// per-channel asymmetric int4 weight w = s*(q - z), integer z, carried as the
+// symmetric codes q - 8 plus wzp[n] = z[n],
+//   sum_k (a - azp)(q - z) = [sum_k (a - azp)(q - 8)]
+//                            + (8 - z[n]) * (arsum[m] - K*azp[m])
+// -- an exact int32 term, added before the float rescale. Every quantiser
+// takes arsum last and skips the reduction when it is null, so the default
+// launch writes exactly what it wrote before. blockDim.x must be a multiple
+// of 32; the result is valid in thread 0. Called block-uniformly.
+__device__ __forceinline__ int block_sum_i32(int v, int *scratch) {
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, o);
+  if ((threadIdx.x & 31) == 0)
+    scratch[threadIdx.x >> 5] = v;
+  __syncthreads();
+  int r = 0;
+  if (threadIdx.x < 32) {
+    r = (threadIdx.x < (blockDim.x >> 5)) ? scratch[threadIdx.x] : 0;
+    for (int o = 16; o > 0; o >>= 1)
+      r += __shfl_down_sync(0xffffffffu, r, o);
+  }
+  return r;
+}
+#define ARSUM_STORE(arsum, m, rs)                                              \
+  do {                                                                         \
+    if (arsum) {                                                               \
+      __shared__ int _rss[32];                                                 \
+      const int _t = block_sum_i32(rs, _rss);                                  \
+      if (threadIdx.x == 0)                                                    \
+        arsum[m] = _t;                                                         \
+    }                                                                          \
+  } while (0)
+
+// The int32 epilogue term of that asymmetric weight for one output element.
+__device__ __forceinline__ int zp_term(const int *wzp, const int *arsum,
+                                       const int *azp, int m, int n, int K) {
+  return (8 - wzp[n]) * (arsum[m] - K * azp[m]);
+}
+
 // per-row asymmetric int8 quant of an fp16 activation (one block per row).
 // stores recip in ascale[m], zero-point in azp[m].
 __global__ void act_quant_i8_h(const unsigned short *Xh, signed char *q8,
-                               float *ascale, int *azp, int M, int K) {
+                               float *ascale, int *azp, int M, int K,
+                               int *arsum) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -474,11 +521,14 @@ __global__ void act_quant_i8_h(const unsigned short *Xh, signed char *q8,
     ascale[m] = recip;
     azp[m] = zp;
   }
+  int rs = 0;
   for (int k = threadIdx.x; k < K; k += blockDim.x) {
     int q = (int)rintf(dp4a_h2f(xr[k]) * scale_q) + zp;
     q = max(-128, min(127, q));
     q8[(long)m * K + k] = (signed char)q;
+    rs += q;
   }
+  ARSUM_STORE(arsum, m, rs);
 }
 
 // Hardware half<->float conversion, reachable from NVRTC without cuda_fp16.h.
@@ -547,7 +597,8 @@ __device__ __forceinline__ float vq_add(float a, float b) { return a + b; }
 // act_quant_i8_h: min/max are order-independent, the conversions are the same
 // values, and the rint/clamp is unchanged.
 __global__ void act_quant_i8_h_v4(const unsigned short *Xh, signed char *q8,
-                                  float *ascale, int *azp, int M, int K) {
+                                  float *ascale, int *azp, int M, int K,
+                                  int *arsum) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -576,6 +627,7 @@ __global__ void act_quant_i8_h_v4(const unsigned short *Xh, signed char *q8,
     azp[m] = zp;
   }
   nc = 0;
+  int rs = 0;
   for (int i = threadIdx.x; i < nv; i += blockDim.x) {
     float4 f = (nc < VQ_NCARRY) ? carry[nc++] : vq_load4(xv[i]);
     int q0 = max(-128, min(127, (int)rintf(f.x * scale_q) + zp));
@@ -584,7 +636,9 @@ __global__ void act_quant_i8_h_v4(const unsigned short *Xh, signed char *q8,
     int q3 = max(-128, min(127, (int)rintf(f.w * scale_q) + zp));
     q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
              ((q3 & 0xFF) << 24);
+    rs += q0 + q1 + q2 + q3;
   }
+  ARSUM_STORE(arsum, m, rs);
 }
 
 // Vectorized RMSNorm + int8 quant of the normed row (see rmsnorm_quant_i8_h
@@ -596,7 +650,7 @@ __global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
                                       const unsigned short *gamma,
                                       unsigned short *y, signed char *q8,
                                       float *ascale, int *azp, int M, int K,
-                                      float eps, int has_gamma) {
+                                      float eps, int has_gamma, int *arsum) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -660,6 +714,7 @@ __global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
     azp[m] = zp;
   }
   nc = 0;
+  int rs = 0;
   for (int i = threadIdx.x; i < nv; i += blockDim.x) {
     float4 r = (nc < VQ_NCARRY) ? carry[nc++] : vq_load4(yv[i]);
     int q0 = max(-128, min(127, (int)rintf(r.x * scale_q) + zp));
@@ -668,7 +723,9 @@ __global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
     int q3 = max(-128, min(127, (int)rintf(r.w * scale_q) + zp));
     q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
              ((q3 & 0xFF) << 24);
+    rs += q0 + q1 + q2 + q3;
   }
+  ARSUM_STORE(arsum, m, rs);
 }
 
 // RMSNorm fused with the int8 activation quant its consumer FC needs.
@@ -694,7 +751,7 @@ __global__ void rmsnorm_quant_i8_h(const unsigned short *x,
                                    const unsigned short *gamma,
                                    unsigned short *y, signed char *q8,
                                    float *ascale, int *azp, int M, int K,
-                                   float eps, int has_gamma) {
+                                   float eps, int has_gamma, int *arsum) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -743,11 +800,14 @@ __global__ void rmsnorm_quant_i8_h(const unsigned short *x,
     ascale[m] = recip;
     azp[m] = zp;
   }
+  int rs = 0;
   for (int k = threadIdx.x; k < K; k += blockDim.x) {
     int q = (int)rintf(dp4a_h2f(yr[k]) * scale_q) + zp;
     q = max(-128, min(127, q));
     q8[(long)m * K + k] = (signed char)q;
+    rs += q;
   }
+  ARSUM_STORE(arsum, m, rs);
 }
 
 // per-output-channel weight row-sum (sum of signed int4) for the activation
@@ -796,7 +856,7 @@ __device__ __forceinline__ int plain_decode(const unsigned char *qw, int n,
 
 // per-row asymmetric int8 quant of the activation (one block per row).
 __global__ void act_quant_i8(const float *X, signed char *q8, float *ascale,
-                             int *azp, int M, int K) {
+                             int *azp, int M, int K, int *arsum) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -826,11 +886,14 @@ __global__ void act_quant_i8(const float *X, signed char *q8, float *ascale,
     ascale[m] = recip;
     azp[m] = zp;
   }
+  int rs = 0;
   for (int k = threadIdx.x; k < K; k += blockDim.x) {
     int q = (int)rintf(xr[k] * scale_q) + zp;
     q = max(-128, min(127, q));
     q8[(long)m * K + k] = (signed char)q;
+    rs += q;
   }
+  ARSUM_STORE(arsum, m, rs);
 }
 
 // QS4CX plain -> signed packed int4 [N, ceil(K/2)]: byte[n][kb] low nibble =
@@ -856,7 +919,8 @@ __global__ void repack_plain_i4(const unsigned char *qw, signed char *packed,
 __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                           const float *ascale, const int *azp,
                           const int *wrowsum, const unsigned short *wscale,
-                          float *Y, int M, int N, int K, int out_fp16) {
+                          float *Y, int M, int N, int K, int out_fp16,
+                          const int *wzp, const int *arsum) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
   if (m >= M || n >= N)
@@ -885,7 +949,10 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                      : (((int)(signed char)(b << 4)) >> 4);
     acc += (int)qrow[k] * wv;
   }
-  float r = (float)(acc - azp[m] * wrowsum[n]) * ascale[m] * dp4a_h2f(wscale[n]);
+  int c = acc - azp[m] * wrowsum[n];
+  if (wzp)
+    c += zp_term(wzp, arsum, azp, m, n, K);
+  float r = (float)c * ascale[m] * dp4a_h2f(wscale[n]);
   if (out_fp16)
     ((unsigned short *)Y)[(long)m * N + n] = dp4a_f2h(r);
   else
@@ -900,7 +967,8 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
 __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
                           const float *ascale, const int *azp,
                           const int *wrowsum, const unsigned short *wscale,
-                          float *Y, int N, int K, int out_fp16) {
+                          float *Y, int N, int K, int out_fp16,
+                          const int *wzp, const int *arsum) {
   // One WARP per output n (warps_per_block outputs per block) -> N/warps_per_block
   // blocks instead of N, amortizing the per-block launch/epilogue overhead that
   // dominated the old one-block-per-tiny-output design. No shared memory, no
@@ -962,8 +1030,10 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
   for (int o = 16; o > 0; o >>= 1)
     acc += __shfl_down_sync(0xffffffffu, acc, o);
   if (lane == 0) {
-    float r = (float)(acc - azp[0] * wrowsum[n]) * ascale[0] *
-              dp4a_h2f(wscale[n]);
+    int c = acc - azp[0] * wrowsum[n];
+    if (wzp)
+      c += zp_term(wzp, arsum, azp, 0, n, K);
+    float r = (float)c * ascale[0] * dp4a_h2f(wscale[n]);
     if (out_fp16)
       ((unsigned short *)Y)[n] = dp4a_f2h(r);
     else
@@ -983,7 +1053,8 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
 __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
                               const float *ascale, const int *azp,
                               const int *wrowsum, const unsigned short *wscale,
-                              float *Y, int M, int N, int K, int out_fp16) {
+                              float *Y, int M, int N, int K, int out_fp16,
+                              const int *wzp, const int *arsum) {
   __shared__ signed char As[RB_BM][RB_BK];
   __shared__ signed char Ws[RB_BN][RB_BK];
   int tx = threadIdx.x, ty = threadIdx.y; // 0..15 each
@@ -1042,8 +1113,10 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
     for (int j = 0; j < RB_TN; j++) {
       int col = blockN + tx * RB_TN + j;
       if (col < N) {
-        float r =
-          (float)(acc[i][j] - zp * wrowsum[col]) * as * dp4a_h2f(wscale[col]);
+        int c = acc[i][j] - zp * wrowsum[col];
+        if (wzp)
+          c += zp_term(wzp, arsum, azp, row, col, K);
+        float r = (float)c * as * dp4a_h2f(wscale[col]);
         if (out_fp16)
           ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(r);
         else
@@ -1090,13 +1163,16 @@ __global__ void weight_rowsum_kn(const signed char *w8, int *rowsum, int N,
 __global__ void dequant_i32_fp16(const int *C, const float *ascale,
                                  const int *azp, const int *wrowsum,
                                  const unsigned short *wscale, unsigned short *Y,
-                                 int M, int N) {
+                                 int M, int N, int K, const int *wzp,
+                                 const int *arsum) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
   if (m >= M || n >= N)
     return;
-  float r = (float)(C[(long)m * N + n] - azp[m] * wrowsum[n]) * ascale[m] *
-            dp4a_h2f(wscale[n]);
+  int c = C[(long)m * N + n] - azp[m] * wrowsum[n];
+  if (wzp)
+    c += zp_term(wzp, arsum, azp, m, n, K);
+  float r = (float)c * ascale[m] * dp4a_h2f(wscale[n]);
   Y[(long)m * N + n] = dp4a_f2h(r);
 }
 
@@ -1126,9 +1202,17 @@ __global__ void dequant_i32_fp16(const int *C, const float *ascale,
 // so a warp step consumes 256 channels and reads 128 CONTIGUOUS weight bytes.
 // @p wide is the caller's alignment verdict; the scalar arm keeps odd K and
 // unaligned activation rows correct.
-__global__ void fpact_gemv_i4_h(const unsigned short *Xh,
-                                const signed char *plain, const float *wscale,
-                                unsigned short *Y, int N, int K, int wide) {
+// Body shared by the plain and the asymmetric kernel below. CORR is a literal
+// at each call site, so after inlining the plain kernel is the original one.
+// The asymmetric one decodes the weight against its own zero point instead of
+// the symmetric 8 -- (q - z[n]) = (q - 8) - (z[n] - 8), one integer subtract
+// per channel ahead of the int->float conversion the dot product already does
+// -- so the zero point costs no extra float work and no row-sum pass (this
+// route never quantises the activation).
+__device__ __forceinline__ void
+fpact_gemv_i4_body(const unsigned short *Xh, const signed char *plain,
+                   const float *wscale, unsigned short *Y, int N, int K,
+                   int wide, const bool CORR, const int *wzp) {
   const int warps_per_block = blockDim.x >> 5;
   const int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
   if (n >= N)
@@ -1136,6 +1220,7 @@ __global__ void fpact_gemv_i4_h(const unsigned short *Xh,
   const int lane = threadIdx.x & 31;
   const int Kh = (K + 1) >> 1;
   const signed char *wrow = plain + (long)n * Kh;
+  const int d = CORR ? wzp[n] - 8 : 0; // per-row decode offset
   float acc = 0.f;
   if (wide) {
     for (int k = lane * 8; k < K; k += 32 * 8) {
@@ -1147,17 +1232,23 @@ __global__ void fpact_gemv_i4_h(const unsigned short *Xh,
         // byte j holds channels k+2j (low nibble) and k+2j+1 (high nibble),
         // which is exactly the half PAIR packed in aw[j].
         const int b = (int)((wb >> (j * 8)) & 0xFFu);
-        acc += vq_h2f((unsigned short)(aw[j] & 0xFFFFu)) *
-               (float)(((int)(signed char)(b << 4)) >> 4);
-        acc += vq_h2f((unsigned short)(aw[j] >> 16)) *
-               (float)(((int)(signed char)b) >> 4);
+        int w0 = ((int)(signed char)(b << 4)) >> 4;
+        int w1 = ((int)(signed char)b) >> 4;
+        if (CORR) {
+          w0 -= d;
+          w1 -= d;
+        }
+        acc += vq_h2f((unsigned short)(aw[j] & 0xFFFFu)) * (float)w0;
+        acc += vq_h2f((unsigned short)(aw[j] >> 16)) * (float)w1;
       }
     }
   } else {
     for (int k = lane; k < K; k += 32) {
       const int b = (unsigned char)wrow[k >> 1];
-      const int wv = (k & 1) ? (((int)(signed char)b) >> 4)
-                             : (((int)(signed char)(b << 4)) >> 4);
+      int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                       : (((int)(signed char)(b << 4)) >> 4);
+      if (CORR)
+        wv -= d;
       acc += vq_h2f(Xh[k]) * (float)wv;
     }
   }
@@ -1166,6 +1257,20 @@ __global__ void fpact_gemv_i4_h(const unsigned short *Xh,
     acc += __shfl_down_sync(0xffffffffu, acc, o);
   if (lane == 0)
     Y[n] = vq_f2h(acc * wscale[n]);
+}
+
+__global__ void fpact_gemv_i4_h(const unsigned short *Xh,
+                                const signed char *plain, const float *wscale,
+                                unsigned short *Y, int N, int K, int wide) {
+  fpact_gemv_i4_body(Xh, plain, wscale, Y, N, K, wide, false, nullptr);
+}
+
+// The per-channel asymmetric weight's variant (integer zero point wzp[n]).
+__global__ void fpact_gemv_i4_h_asym(const unsigned short *Xh,
+                                     const signed char *plain,
+                                     const float *wscale, unsigned short *Y,
+                                     int N, int K, int wide, const int *wzp) {
+  fpact_gemv_i4_body(Xh, plain, wscale, Y, N, K, wide, true, wzp);
 }
 
 // --- tied lm_head GEMV over the embedding sidecar LUT (VRAM copy) ---------
@@ -1260,6 +1365,17 @@ float *g_dp4a_ascale = nullptr; // per-row recip (dequant scale)
 size_t g_dp4a_ascale_cap = 0;
 int *g_dp4a_azp = nullptr; // per-row activation zero-point
 size_t g_dp4a_azp_cap = 0;
+int *g_dp4a_arsum =
+  nullptr; // per-row sum of the int8 codes (asymmetric weights only)
+size_t g_dp4a_arsum_cap = 0;
+
+// Per-channel integer zero points of asymmetric int4 weights (see the kernel
+// source), device copies keyed by the plain payload pointer like every other
+// derived cache here. g_any_wzp gates the whole mechanism: until one is
+// registered the quantisers get a null row-sum output and every GEMM a null
+// wzp, i.e. the unchanged kernels. Guarded by g_dp4a_mtx.
+std::unordered_map<const void *, int *> g_wzp_cache;
+bool g_any_wzp = false;
 
 // act_quant dedup (cuBLAS prefill path): sibling FCs that share an input
 // activation (q/k/v <- attention_norm; gate/up <- ffn_norm) re-quantize the
@@ -1285,6 +1401,10 @@ const void *g_last_quant_xh = nullptr;
 int g_last_quant_k = 0;
 unsigned long long g_last_quant_seq = 0;
 bool g_last_quant_valid = false;
+// Whether that staging also wrote g_dp4a_arsum (it does whenever g_any_wzp
+// was set when the quantiser ran). A corrected FC must not reuse one that did
+// not.
+bool g_last_quant_rsum = false;
 
 // NNTR_CUDA_FUSED_NORMQ: fold the decode RMSNorm and the int8 activation quant
 // of the FC group it feeds into one kernel, and let the sibling FCs of that
@@ -1305,12 +1425,27 @@ void mark_quant_staged(const void *xh, int k) {
   g_last_quant_k = k;
   g_last_quant_seq = StreamManager::Global().dispatchSeq();
   g_last_quant_valid = true;
+  g_last_quant_rsum = g_any_wzp;
 }
 
 // True when g_dp4a_q8 already holds the int8 quant of (xh, k).
 bool quant_staged_for(const void *xh, int k) {
   return g_last_quant_valid && xh == g_last_quant_xh && k == g_last_quant_k &&
-         StreamManager::Global().dispatchSeq() == g_last_quant_seq;
+         StreamManager::Global().dispatchSeq() == g_last_quant_seq &&
+         (g_last_quant_rsum || !g_any_wzp);
+}
+
+// Row-sum output for a quantiser launch: null (skip) unless a correction is
+// registered anywhere. Caller holds g_dp4a_mtx and has sized the scratch.
+int *arsum_arg() { return g_any_wzp ? g_dp4a_arsum : nullptr; }
+
+// The registered zero points of this weight, or null. Caller holds
+// g_dp4a_mtx.
+const int *wzp_for_locked(const void *plain_w) {
+  if (!g_any_wzp)
+    return nullptr;
+  auto it = g_wzp_cache.find(plain_w);
+  return it == g_wzp_cache.end() ? nullptr : it->second;
 }
 float *g_dp4a_yf = nullptr; // float Y staging for the fp16-output path
 size_t g_dp4a_yf_cap = 0;
@@ -1398,6 +1533,8 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
     return false;
   signed char *plain = dwp->plain;
   int *wrowsum = dwp->rowsum;
+  const int *wzp = wzp_for_locked(plain_w);
+  const int *arsum = wzp ? g_dp4a_arsum : nullptr;
 
   const int mm = (int)M;
   kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
@@ -1414,6 +1551,8 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
     kg->SetKernelArguments(7, &n, sizeof(n));
     kg->SetKernelArguments(8, &k, sizeof(k));
     kg->SetKernelArguments(9, &out_fp16, sizeof(out_fp16));
+    kg->SetKernelArguments(10, &wzp, sizeof(wzp));
+    kg->SetKernelArguments(11, &arsum, sizeof(arsum));
     const int gvb[3] = {128, 1, 1};
     const int gvg[3] = {((int)N + 3) / 4, 1, 1};
     return StreamManager::Global().DispatchCommand(*kg, gvg, gvb);
@@ -1422,6 +1561,8 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  kg->SetKernelArguments(11, &wzp, sizeof(wzp));
+  kg->SetKernelArguments(12, &arsum, sizeof(arsum));
   const int gb[3] = {16, 16, 1};
   const int tile = tiled ? 64 : 16;
   const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
@@ -1513,6 +1654,8 @@ static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
          ensure_buf((void **)&g_dp4a_ascale, &g_dp4a_ascale_cap,
                     sizeof(float) * (size_t)M) &&
          ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
+                    sizeof(int) * (size_t)M) &&
+         ensure_buf((void **)&g_dp4a_arsum, &g_dp4a_arsum_cap,
                     sizeof(int) * (size_t)M);
 }
 
@@ -1810,6 +1953,14 @@ void cuda_fc_qs4cx_release_weight_caches() {
     }
     g_i8_weight_cache.clear();
     g_i8_exempt.clear();
+    // Weight zero points: keyed by the plain pointer like the packs, so a
+    // survivor would apply to the next model's weight at a recycled address.
+    for (auto &kv : g_wzp_cache) {
+      cudaFree(kv.second);
+      touched = true;
+    }
+    g_wzp_cache.clear();
+    g_any_wzp = false;
   }
   if (touched)
     cudaGetLastError(); // a failed free must not stick to the next lane
@@ -1972,6 +2123,85 @@ bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
 // already exists -- the dispatch then only needs the pointer VALUE as a key,
 // so a host-heap (non-device-accessible) payload is fine and the host->device
 // weight staging can be skipped entirely.
+bool cuda_fc_qs4cx_set_weight_zero_points(const unsigned char *plain_w,
+                                          const float *zp, unsigned int N) {
+  if (plain_w == nullptr)
+    return false;
+  std::vector<int> zi;
+  if (zp != nullptr) {
+    if (N == 0)
+      return false;
+    // Folded into the int32 epilogue: integers only, and bounded so that
+    // (8 - z) * (rowsum - K * azp) stays far from int32 overflow.
+    zi.resize(N);
+    for (unsigned int n = 0; n < N; ++n) {
+      const float r = std::nearbyint(zp[n]);
+      if (r != zp[n] || r < -255.0f || r > 255.0f)
+        return false;
+      zi[n] = (int)r;
+    }
+  }
+  // cudaMalloc / a synchronous copy are illegal inside a graph capture; this
+  // is a load-time call.
+  if (StreamManager::Global().isCapturing())
+    return false;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  auto it = g_wzp_cache.find(plain_w);
+  if (zp == nullptr) {
+    if (it != g_wzp_cache.end()) {
+      cudaFree(it->second);
+      g_wzp_cache.erase(it);
+    }
+    return true;
+  }
+  int *d = (it != g_wzp_cache.end()) ? it->second : nullptr;
+  if (d == nullptr && cudaMalloc(&d, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaMemcpy(d, zi.data(), sizeof(int) * (size_t)N,
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    // Never leave a weight bound to half-written zero points.
+    cudaGetLastError();
+    cudaFree(d);
+    if (it != g_wzp_cache.end())
+      g_wzp_cache.erase(it);
+    return false;
+  }
+  g_wzp_cache[plain_w] = d;
+  // From here on every quantiser also writes the row sum (g_dp4a_arsum is
+  // sized with the other scratch, so this adds no allocation at run time).
+  g_any_wzp = true;
+  return true;
+}
+
+bool cuda_fc_qs4cx_set_zero_point_correction(const unsigned char *plain_w,
+                                             const float *scales_fp32,
+                                             const float *corr,
+                                             unsigned int N) {
+  if (corr == nullptr)
+    return cuda_fc_qs4cx_set_weight_zero_points(plain_w, nullptr, N);
+  if (scales_fp32 == nullptr || N == 0)
+    return false;
+  std::vector<float> zp(N);
+  for (unsigned int n = 0; n < N; ++n) {
+    const float s = scales_fp32[n];
+    if (!(s > 0.0f))
+      return false;
+    // c = s * (8 - z), integer z: recover z and refuse anything else.
+    const float z = std::nearbyint(8.0f - corr[n] / s);
+    if (std::fabs(s * (8.0f - z) - corr[n]) > 8e-5f * s + 1e-30f)
+      return false;
+    zp[n] = z;
+  }
+  return cuda_fc_qs4cx_set_weight_zero_points(plain_w, zp.data(), N);
+}
+
+bool cuda_fc_qs4cx_has_weight_zero_points(const unsigned char *plain_w) {
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return wzp_for_locked(plain_w) != nullptr;
+}
+
 bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w) {
   if (plain_w == nullptr)
     return false;
@@ -2018,6 +2248,8 @@ bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
   k->SetKernelArguments(7, &kk, sizeof(kk));
   k->SetKernelArguments(8, &eps, sizeof(eps));
   k->SetKernelArguments(9, &has_gamma, sizeof(has_gamma));
+  int *arsum = arsum_arg();
+  k->SetKernelArguments(10, &arsum, sizeof(arsum));
   const int block[3] = {vec4 ? 512 : 256, 1, 1};
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*k, grid, block))
@@ -2050,6 +2282,8 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
   kq->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
   kq->SetKernelArguments(4, &m, sizeof(m));
   kq->SetKernelArguments(5, &k, sizeof(k));
+  int *arsum = arsum_arg();
+  kq->SetKernelArguments(6, &arsum, sizeof(arsum));
   const int qb[3] = {256, 1, 1};
   const int qg[3] = {(int)M, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kq, qg, qb))
@@ -2099,6 +2333,8 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
     kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
     kqh->SetKernelArguments(4, &m, sizeof(m));
     kqh->SetKernelArguments(5, &k, sizeof(k));
+    int *arsum = arsum_arg();
+    kqh->SetKernelArguments(6, &arsum, sizeof(arsum));
     const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
     const int qg[3] = {(int)M, 1, 1};
     if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
@@ -2268,13 +2504,14 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
   if (!cuda_fc_qs4cx_scales_to_uvm_fp32(scales_fp32, N, &sc,
                                         !cuda_fc_qs4cx_plain_dropped(plain_w)))
     return false;
-  auto kg = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
-                                                     "fpact_gemv_i4_h");
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  const int *wzp = wzp_for_locked(plain_w);
+  auto kg = CudaContext::Global().registerCudaKernel(
+    FC_QS4CX_DP4A_SRC, wzp ? "fpact_gemv_i4_h_asym" : "fpact_gemv_i4_h");
   if (!kg) {
     ml_loge("[CUDA] fc_qs4cx fp-act lm_head GEMV: kernel registration failed");
     return false;
   }
-  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
   // The SAME derived weight cache the dp4a path uses (signed packed int4 +
   // rowsum; the rowsum is dead here, there is no activation zero-point to
   // correct). Reusing it is what keeps this route free of extra VRAM -- and
@@ -2298,6 +2535,8 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
   kg->SetKernelArguments(4, &n, sizeof(n));
   kg->SetKernelArguments(5, &k, sizeof(k));
   kg->SetKernelArguments(6, &wide, sizeof(wide));
+  if (wzp)
+    kg->SetKernelArguments(7, &wzp, sizeof(wzp));
   // One warp per output row, 4 warps per block -- the dp4a_gemv launch shape.
   const int blk[3] = {128, 1, 1};
   const int grd[3] = {((int)N + 3) / 4, 1, 1};
@@ -2539,6 +2778,8 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
     kqh->SetKernelArguments(4, &m, sizeof(m));
     kqh->SetKernelArguments(5, &k, sizeof(k));
+    int *arsum = arsum_arg();
+    kqh->SetKernelArguments(6, &arsum, sizeof(arsum));
     const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
     const int qg[3] = {(int)M, 1, 1};
     if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
@@ -2609,6 +2850,11 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   kde->SetKernelArguments(5, &Yh, sizeof(Yh));
   kde->SetKernelArguments(6, &m, sizeof(m));
   kde->SetKernelArguments(7, &n, sizeof(n));
+  kde->SetKernelArguments(8, &k, sizeof(k));
+  const int *wzp = wzp_for_locked(plain_w);
+  const int *arsum = wzp ? g_dp4a_arsum : nullptr;
+  kde->SetKernelArguments(9, &wzp, sizeof(wzp));
+  kde->SetKernelArguments(10, &arsum, sizeof(arsum));
   const int db[3] = {16, 16, 1};
   const int dg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kde, dg, db))
@@ -2650,6 +2896,9 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
                                    unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
+  // An asymmetric weight is not handled by this diagnostic route.
+  if (cuda_fc_qs4cx_has_weight_zero_points(plain_w))
+    return false;
   auto kh2f =
     CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC, "cvt_h2f");
   auto kf2h =
