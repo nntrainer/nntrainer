@@ -224,6 +224,9 @@ subdir('layers')
 subdir('datasets')
 subdir('models')
 subdir('singleton')
+if host_machine.system() == 'linux'
+  subdir('qnn')
+endif
 if get_option('enable-tflite-interpreter')
   subdir('integration_tests')
 endif
