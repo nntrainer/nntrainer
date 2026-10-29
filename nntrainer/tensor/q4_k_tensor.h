@@ -91,14 +91,20 @@ public:
    */
   size_t scale_size() const override;
 
+  /**
+   * @brief keep copy(const Tensor &) visible next to the copy(const void *)
+   * override
+   */
+  using Uint4QTensor::copy;
+
 private:
   /**
-   * @brief copy a buffer to @a this, the caller has to ensure that @a this is
-   * initialized otherwise undefined behavior
+   * @brief copy a buffer of getMemoryBytes() bytes to @a this, the caller has
+   * to ensure that @a this is initialized otherwise undefined behavior
    *
    * @param buf buffer to copy from
    */
-  void copy_q4k(const void *buf);
+  void copy(const void *buf) override;
 
   /**
    * @brief  Get the Data Type String object
