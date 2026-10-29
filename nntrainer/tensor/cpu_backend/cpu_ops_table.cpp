@@ -377,4 +377,51 @@ void CpuComputeOps::l2_normalize_rows(const Tensor &in, Tensor &out,
   out.normalization_i(3, 2.0f, epsilon);
 }
 
+void CpuComputeOps::rotary_embedding(const Tensor &in, Tensor &out,
+                                     unsigned int head_dim,
+                                     const RotaryTable &table,
+                                     unsigned int start_pos, bool rotate) {
+  using DataType = ml::train::TensorDim::DataType;
+  const unsigned int half = head_dim / 2;
+  const bool out_fp16 = out.getDataType() == DataType::FP16 ||
+                        out.getDataType() == DataType::UINT16;
+  if (in.getDataType() != DataType::FP32 ||
+      (!out_fp16 && out.getDataType() != DataType::FP32))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: FP32 input to FP32 / FP16 / UINT16 "
+      "output only");
+  if (out.width() != in.width() || out.size() < in.size())
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: out must hold every row of in");
+  if (rotate &&
+      (table.half != half || start_pos + in.height() > table.positions))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: position or head_dim outside the "
+      "table");
+
+  const unsigned int W = in.width();
+  const unsigned int rows = in.batch() * in.channel() * in.height();
+  for (unsigned int r = 0; r < rows; ++r) {
+    const size_t pos = start_pos + r % in.height();
+    const float *cos_row = rotate ? table.cos + pos * half : nullptr;
+    const float *sin_row = rotate ? table.sin + pos * half : nullptr;
+    float *in_row = in.getData<float>() + (size_t)r * W;
+
+    if (out_fp16) {
+      // Rotate (or only convert) straight into the fp16 bits of out.
+      uint16_t *out_row = out.getData<uint16_t>() + (size_t)r * W;
+      compute_rotary_emb_value(W, head_dim, half, in_row, out_row, cos_row,
+                               sin_row, !rotate);
+      continue;
+    }
+
+    float *out_row = out.getData<float>() + (size_t)r * W;
+    if (out_row != in_row)
+      std::memcpy(out_row, in_row, sizeof(float) * W);
+    if (rotate)
+      compute_rotary_emb_value(W, head_dim, half, out_row, nullptr, cos_row,
+                               sin_row, false);
+  }
+}
+
 } // namespace nntrainer
