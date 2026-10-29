@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include <basic_planner.h>
@@ -22,6 +23,7 @@
 #include <env_compat.h>
 #include <mem_allocator.h>
 #include <nntrainer_log.h>
+#include <runtime_config.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
@@ -40,9 +42,13 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       "KVCacheManager::allocate: all parameters must be > 0");
   }
 
-  allocate(num_layers, batch_size, max_seq_len,
-           std::vector<unsigned int>(num_layers, num_heads_kv * head_dim),
-           dtype, format);
+  const auto width = nntrainer::kv::checkedMultiply(num_heads_kv, head_dim);
+  if (width > std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error("KV width exceeds Tensor dimensions");
+  allocate(
+    num_layers, batch_size, max_seq_len,
+    std::vector<unsigned int>(num_layers, static_cast<unsigned int>(width)),
+    dtype, format, std::vector<unsigned int>(num_layers, num_heads_kv));
 
   num_heads_kv_ = num_heads_kv;
   head_dim_ = head_dim;
@@ -52,7 +58,10 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
                               const std::vector<unsigned int> &kv_widths,
                               ml::train::TensorDim::DataType dtype,
-                              ml::train::TensorDim::Format format) {
+                              ml::train::TensorDim::Format format,
+                              const std::vector<unsigned int> &kv_heads) {
+  if (cpu_cache_ && cpu_cache_->hasActiveStep())
+    throw std::logic_error("Cannot reallocate an active CPU KV cache");
   if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
       kv_widths.size() != num_layers) {
     throw std::invalid_argument(
@@ -65,6 +74,16 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
         "KVCacheManager::allocate: KV widths must be > 0");
     }
   }
+
+  const auto runtime = RuntimeConfig::capture();
+  const auto &selected = runtime.engine;
+  const bool cpu = runtime.cpu && !runtime.cpu_kv_legacy;
+  if (cpu) {
+    allocateCpu(num_layers, batch_size, max_seq_len, kv_widths, dtype, format,
+                kv_heads);
+    return;
+  }
+  cpu_cache_.reset();
 
   batch_size_ = batch_size;
   max_seq_len_ = max_seq_len;
@@ -121,9 +140,9 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // cache.
   std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
   const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
-  const std::string _eng = nntr_engine_env();
+  const std::string &_eng = selected;
   const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
-  const bool gpu_engine = _eng != "cpu" && _eng != "cuda";
+  const bool gpu_engine = _eng == "gpu";
   if (svm_pool_on && gpu_engine) {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find("gpu");
@@ -152,7 +171,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // cuda::device_memset0/copy_any. Falls back to the UVM path if the cuda
   // engine is not registered. Takes precedence over NNTR_CUDA_KV_UVM.
   const char *kv_dev = std::getenv("NNTR_CUDA_KV_DEV");
-  if (!svm_alloc && kv_dev != nullptr && kv_dev[0] == '1') {
+  if (_eng == "cuda" && !svm_alloc && kv_dev != nullptr && kv_dev[0] == '1') {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     if (allocs.find("cuda") != allocs.end()) {
       svm_alloc =
@@ -161,7 +180,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   }
 
   const char *kv_uvm = std::getenv("NNTR_CUDA_KV_UVM");
-  if (!svm_alloc && kv_uvm != nullptr && kv_uvm[0] != '0') {
+  if (_eng == "cuda" && !svm_alloc && kv_uvm != nullptr && kv_uvm[0] != '0') {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find("cuda");
     if (it != allocs.end() && it->second &&
@@ -272,6 +291,104 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   }
 
   reportKVShare(num_layers, batch_size, dtype, svm_alloc ? "svm-pool" : "host");
+}
+
+void KVCacheManager::allocateCpu(
+  unsigned int num_layers, unsigned int batch_size, unsigned int max_seq_len,
+  const std::vector<unsigned int> &widths, ml::train::TensorDim::DataType dtype,
+  ml::train::TensorDim::Format format, const std::vector<unsigned int> &heads) {
+  using DataType = ml::train::TensorDim::DataType;
+  using namespace nntrainer::kv;
+  if ((!heads.empty() && heads.size() != num_layers) ||
+      (!layer_caps_.empty() && layer_caps_.size() != num_layers) ||
+      (!layer_kv_sources_.empty() && layer_kv_sources_.size() != num_layers) ||
+      (!layer_producers_.empty() && layer_producers_.size() != num_layers) ||
+      (dtype != DataType::FP32 && dtype != DataType::FP16 &&
+       dtype != DataType::UINT16))
+    throw std::invalid_argument("Unsupported CPU KV geometry or storage type");
+
+  CacheSpec spec;
+  for (unsigned int i = 0; i < num_layers; ++i) {
+    LayerSpec s;
+    s.batch = batch_size;
+    s.max_tokens = max_seq_len;
+    s.capacity =
+      i < layer_caps_.size() && layer_caps_[i] ? layer_caps_[i] : max_seq_len;
+    if (s.capacity != max_seq_len)
+      throw std::invalid_argument("CPU CausalLM requires linear KV storage; "
+                                  "ring attention is unsupported");
+    s.has_producer = layer_producers_.empty() || layer_producers_[i];
+    s.num_kv_heads = heads.empty() ? 1 : heads[i];
+    if (!s.num_kv_heads || widths[i] % s.num_kv_heads)
+      throw std::invalid_argument("KV width is not divisible by head count");
+    s.head_dim = widths[i] / s.num_kv_heads;
+    s.source = getLayerKVSource(i);
+    s.encoding =
+      dtype == DataType::FP32 ? Encoding::Float32 : Encoding::Float16;
+    s.storage_type = dtype == DataType::FP32
+                       ? StorageType::Float32
+                       : (dtype == DataType::FP16 ? StorageType::Float16
+                                                  : StorageType::UInt16);
+    spec.layers.push_back(s);
+  }
+  auto next = std::make_unique<nntrainer::kv::KvCacheManager>();
+  next->initialize(spec);
+  std::vector<LayerCache> caches(num_layers);
+  for (unsigned int i = 0; i < num_layers; ++i) {
+    ml::train::TensorDim dim(
+      {batch_size, 1, static_cast<unsigned int>(spec.layers[i].capacity),
+       widths[i]},
+      {format, dtype});
+    caches[i].key_cache = nntrainer::Tensor(dim, false);
+    caches[i].value_cache = nntrainer::Tensor(dim, false);
+    caches[i].key_cache.setData(next->keyMemory(i), 0, false);
+    caches[i].value_cache.setData(next->valueMemory(i), 0, false);
+  }
+  layer_caches_ = std::move(caches);
+  cpu_cache_ = std::move(next);
+  svm_pool_.reset();
+  batch_size_ = batch_size;
+  max_seq_len_ = max_seq_len;
+  num_heads_kv_ = head_dim_ = 0;
+  kv_width_ = widths.front();
+  kv_widths_ = widths;
+  dtype_ = dtype;
+  format_ = format;
+  cache_pos_ = 0;
+  reportKVShare(num_layers, batch_size, dtype, "core-cpu");
+  if (nntr_env_on("NNTR_KV_CPU_TRACE")) {
+    const auto stats = cpu_cache_->stats();
+    std::fprintf(stderr,
+                 "[kv-cpu-storage] backing_bytes=%zu owner_layers=%zu\n",
+                 stats.backing_bytes, stats.owner_layers);
+    for (unsigned int i = 0; i < num_layers; ++i)
+      std::fprintf(
+        stderr,
+        "[kv-cpu-storage] layer=%u key=%p value=%p plane_bytes=%zu source=%d\n",
+        i, static_cast<void *>(getKeyCache(i).getData<char>()),
+        static_cast<void *>(getValueCache(i).getData<char>()),
+        spec.layers[i].planeBytes(), spec.layers[i].source);
+  }
+}
+
+nntrainer::kv::StepLease KVCacheManager::beginStep(unsigned int from,
+                                                   unsigned int to) {
+  if (!cpu_cache_ || from != getPosition() || to <= from)
+    throw std::logic_error("CPU KV step does not match the committed position");
+  return cpu_cache_->beginStep(to - from);
+}
+
+void KVCacheManager::commitStep(nntrainer::kv::StepLease &&step) {
+  if (!cpu_cache_)
+    throw std::logic_error("CPU KV storage is not initialized");
+  // Actual MHA producers mark their own checked write views ready. A skipped
+  // or failed producer must make commit fail, even if the graph returns.
+  cpu_cache_->commit(std::move(step));
+}
+
+void KVCacheManager::requireCpuIdle() const {
+  if (cpu_cache_ && (!cpu_cache_->valid() || cpu_cache_->hasActiveStep()))
+    throw std::logic_error("CPU KV snapshot requires a valid idle session");
 }
 
 void KVCacheManager::validateKVSources(unsigned int num_layers) const {
@@ -425,18 +542,24 @@ void KVCacheManager::setPosition(unsigned int pos) {
     throw std::out_of_range(
       "KVCacheManager::setPosition: pos exceeds max_seq_len");
   }
+  if (cpu_cache_)
+    cpu_cache_->setPosition(pos);
   cache_pos_ = pos;
 }
 
 void KVCacheManager::advance(unsigned int step_size) {
-  if (cache_pos_ + step_size > max_seq_len_) {
+  if (step_size > max_seq_len_ - getPosition()) {
     throw std::out_of_range(
       "KVCacheManager::advance: position would exceed max_seq_len");
   }
-  cache_pos_ += step_size;
+  setPosition(getPosition() + step_size);
 }
 
-void KVCacheManager::reset() { cache_pos_ = 0; }
+void KVCacheManager::reset() {
+  if (cpu_cache_)
+    cpu_cache_->reset();
+  cache_pos_ = 0;
+}
 
 nntrainer::Tensor &KVCacheManager::getKeyCache(unsigned int layer_idx) {
   if (layer_idx >= layer_caches_.size()) {
@@ -459,7 +582,11 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: invalid layer_idx");
   }
-  if (cache_pos_ + step_size > max_seq_len_) {
+  const unsigned int position = getPosition();
+  const unsigned int row = position % getLayerCap(layer_idx);
+  if (!step_size || batch >= batch_size_ ||
+      step_size > max_seq_len_ - position ||
+      step_size > getLayerCap(layer_idx) - row) {
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: would exceed max_seq_len");
   }
@@ -469,7 +596,7 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
   const unsigned int kv_width = kv_widths_[layer_idx];
   ml::train::TensorDim step_dim({1, 1, step_size, kv_width}, {format_, dtype_});
 
-  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width;
+  size_t offset = batch * cache_dim.getFeatureLen() + size_t{row} * kv_width;
   return cache.getSharedDataTensor(step_dim, offset, true);
 }
 
@@ -479,7 +606,11 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
     throw std::out_of_range(
       "KVCacheManager::getValueCacheWriteView: invalid layer_idx");
   }
-  if (cache_pos_ + step_size > max_seq_len_) {
+  const unsigned int position = getPosition();
+  const unsigned int row = position % getLayerCap(layer_idx);
+  if (!step_size || batch >= batch_size_ ||
+      step_size > max_seq_len_ - position ||
+      step_size > getLayerCap(layer_idx) - row) {
     throw std::out_of_range(
       "KVCacheManager::getValueCacheWriteView: would exceed max_seq_len");
   }
@@ -489,7 +620,7 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
   const unsigned int kv_width = kv_widths_[layer_idx];
   ml::train::TensorDim step_dim({1, 1, step_size, kv_width}, {format_, dtype_});
 
-  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width;
+  size_t offset = batch * cache_dim.getFeatureLen() + size_t{row} * kv_width;
   return cache.getSharedDataTensor(step_dim, offset, true);
 }
 
@@ -500,7 +631,7 @@ nntrainer::Tensor KVCacheManager::getKeyCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: invalid layer_idx");
   }
-  if (read_len > max_seq_len_) {
+  if (!read_len || batch >= batch_size_ || read_len > getLayerCap(layer_idx)) {
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: read_len exceeds max_seq_len");
   }
@@ -521,7 +652,7 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getValueCacheReadView: invalid layer_idx");
   }
-  if (read_len > max_seq_len_) {
+  if (!read_len || batch >= batch_size_ || read_len > getLayerCap(layer_idx)) {
     throw std::out_of_range(
       "KVCacheManager::getValueCacheReadView: read_len exceeds max_seq_len");
   }
@@ -655,11 +786,12 @@ std::string KVCacheManager::describeFile(const std::string &path) {
 }
 
 void KVCacheManager::save(const std::string &path) const {
-  save(path, cache_pos_);
+  save(path, getPosition());
 }
 
 void KVCacheManager::save(const std::string &path, unsigned int seq_len,
                           const std::string &model_tag) const {
+  requireCpuIdle();
   if (layer_caches_.empty()) {
     throw std::runtime_error("KVCacheManager::save: not allocated");
   }
@@ -750,6 +882,7 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len,
 
 unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
                                   const std::string &model_tag) {
+  requireCpuIdle();
   if (layer_caches_.empty()) {
     throw std::runtime_error("KVCacheManager::load: not allocated");
   }
@@ -905,7 +1038,7 @@ unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
 #endif
   }
 
-  cache_pos_ = seq_len;
+  setPosition(seq_len);
   return seq_len;
 }
 

@@ -14,6 +14,7 @@
 #define __CAUSALLM_TEST_UTILS_H__
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -24,11 +25,41 @@
 #include <vector>
 
 #include <causal_lm.h>
+#include <env_compat.h>
 #include <layer.h>
 #include <layer_context.h>
 #include <transformer.h>
 
 namespace causallm_test {
+
+/** @brief Restore an environment override after a model runtime test. */
+class ScopedEnv {
+public:
+  ScopedEnv(const char *name, const char *value) : name_(name) {
+    const char *previous = std::getenv(name);
+    had_previous_ = previous != nullptr;
+    if (previous)
+      previous_ = previous;
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_previous_) {
+      ::setenv(name_.c_str(), previous_.c_str(), 1);
+    } else {
+#ifdef _WIN32
+      ::_putenv_s(name_.c_str(), "");
+#else
+      ::unsetenv(name_.c_str());
+#endif
+    }
+  }
+  ScopedEnv(const ScopedEnv &) = delete;
+  ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+private:
+  std::string name_, previous_;
+  bool had_previous_;
+};
 
 /**
  * @brief Is this layer type string one of the RMS norm families?
@@ -321,13 +352,12 @@ public:
     }
 
     auto [input, cache_inputs] = buildCacheInput(input_sample);
-    std::vector<float *> label;
     this->setKVCachePosition(0);
-    auto output = this->model->incremental_inference(
-      this->BATCH_SIZE, input, label, init_len, 0, init_len, false);
+    auto output = this->incrementalInference(this->BATCH_SIZE, input, init_len,
+                                             0, init_len);
     std::vector<float> logits(output[0], output[0] + this->NUM_VOCAB);
     for (auto &out : output)
-      delete[] out;
+      this->releaseLogitsBuf(out);
 
     return logits;
   }
@@ -350,11 +380,9 @@ public:
           static_cast<float>(ids[i]);
 
     auto [input, cache_inputs] = buildCacheInput(input_sample);
-    std::vector<float *> label;
-
     this->setKVCachePosition(0);
-    auto output = this->model->incremental_inference(
-      this->BATCH_SIZE, input, label, init_len, 0, init_len, false);
+    auto output = this->incrementalInference(this->BATCH_SIZE, input, init_len,
+                                             0, init_len);
 
     std::vector<unsigned int> generated;
     generated.reserve(n);
@@ -364,7 +392,7 @@ public:
         output[0], std::max_element(output[0], output[0] + this->NUM_VOCAB)));
       generated.push_back(next_tok);
       for (auto &out : output)
-        delete[] out;
+        this->releaseLogitsBuf(out);
       output.clear();
 
       if (step + 1 >= n)
@@ -376,8 +404,7 @@ public:
       unsigned int from = init_len + static_cast<unsigned int>(step);
       unsigned int to = from + 1;
       this->setKVCachePosition(from);
-      output = this->model->incremental_inference(this->BATCH_SIZE, input,
-                                                  label, 1, from, to, false);
+      output = this->incrementalInference(this->BATCH_SIZE, input, 1, from, to);
     }
 
     return generated;
@@ -421,6 +448,58 @@ public:
                                        nntrainer::RunLayerContext &, void *)>
                       fn) {
     this->model->forEachLayer(fn, nullptr);
+  }
+
+  /** @brief Access the real facade for runtime failure injection and checks. */
+  causallm::KVCacheManager &cacheManager() { return this->kv_cache; }
+
+  /** @brief Bind the manager-owned planes before a runtime test mutates them.
+   */
+  void prepareKVCache() { this->allocateAndBindKVCache(); }
+
+  /** @brief Declare a producer absent from the already constructed graph. */
+  void addUnproducedCacheOwner() {
+    if (this->kv_cache.isAllocated())
+      throw std::logic_error("Add the unmatched owner before cache allocation");
+    ++this->NUM_LAYERS;
+  }
+
+  /** @brief Model declaration for attention versus non-attention blocks. */
+  bool producesKV(int layer) const { return this->hasKVCacheProducer(layer); }
+
+  /** @brief Number of distinct pooled logits allocations after real inference.
+   */
+  size_t logitsPoolAllocations() const {
+    return this->logits_pool_sizes_.size();
+  }
+
+  /** @brief Number of pooled buffers returned by the inference caller. */
+  size_t logitsPoolAvailable() const { return this->logits_pool_free_.size(); }
+
+  /**
+   * @brief Run one actual graph step without altering the committed position.
+   * The requested from/to interval is validated by incrementalInference's
+   * lease.
+   */
+  std::vector<float> stepLogitsFromIds(const std::vector<unsigned int> &ids,
+                                       unsigned int from) {
+    if (ids.empty() || ids.size() > this->MAX_SEQ_LEN)
+      throw std::invalid_argument("Invalid tiny-model step input length");
+    this->allocateAndBindKVCache();
+    std::vector<float> sample(
+      static_cast<size_t>(this->BATCH_SIZE) * this->MAX_SEQ_LEN, 0.0f);
+    for (unsigned int b = 0; b < this->BATCH_SIZE; ++b)
+      for (size_t i = 0; i < ids.size(); ++i)
+        sample[static_cast<size_t>(b) * this->MAX_SEQ_LEN + i] =
+          static_cast<float>(ids[i]);
+    auto [input, cache_inputs] = buildCacheInput(sample);
+    const auto count = static_cast<unsigned int>(ids.size());
+    auto output = this->incrementalInference(this->BATCH_SIZE, input, count,
+                                             from, from + count);
+    std::vector<float> logits(output[0], output[0] + this->NUM_VOCAB);
+    for (auto *buffer : output)
+      this->releaseLogitsBuf(buffer);
+    return logits;
   }
 
 private:

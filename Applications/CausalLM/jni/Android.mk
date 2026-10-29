@@ -18,6 +18,7 @@ endif
 # private and deliberately does not install, so the ndk build has to find them
 # in the nntrainer source dir rather than through the prebuilt include export
 # (the meson leg does not notice because it compiles against nntrainer_inc):
+#   nntrainer                     internal <kv_cache/...> ownership headers
 #   nntrainer/tensor              residency_policy.h, the application-declared
 #                                 residency boundaries causal_lm.cpp populates
 #                                 before the graph allocates
@@ -62,6 +63,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../xgrammar/3rdparty/dlpack/include \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
@@ -106,17 +108,65 @@ LOCAL_SRC_FILES := $(CAUSALLM_PREBUILT_LIB)
 LOCAL_EXPORT_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
 
-# Vendored googletest used only by the on-device CausalLM reference suite.
+# The KV suites define their own main; keep gtest-all separate from gtest_main.
 include $(CLEAR_VARS)
 GTEST_PATH := googletest
-LOCAL_MODULE := googletest_main
+LOCAL_MODULE := googletest
 LOCAL_CPP_FEATURES := rtti exceptions
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(GTEST_PATH)/include $(LOCAL_PATH)/$(GTEST_PATH)
 LOCAL_CFLAGS := -std=c++17 -frtti -fexceptions
-LOCAL_SRC_FILES := \
-    $(GTEST_PATH)/src/gtest-all.cc \
-    $(GTEST_PATH)/src/gtest_main.cc
+LOCAL_SRC_FILES := $(GTEST_PATH)/src/gtest-all.cc
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/$(GTEST_PATH)/include
 include $(BUILD_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := googletest_main
+LOCAL_CPP_FEATURES := rtti exceptions
+LOCAL_SRC_FILES := $(GTEST_PATH)/src/gtest_main.cc
+LOCAL_STATIC_LIBRARIES := googletest
+include $(BUILD_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := unittest_kv_cache_core
+LOCAL_CFLAGS := $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_LDLIBS := -llog -landroid
+LOCAL_SRC_FILES := ../../../test/unittest/unittest_kv_cache_core.cpp
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest
+LOCAL_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := unittest_kv_cache_manager
+LOCAL_CFLAGS := $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_LDLIBS := -llog -landroid
+LOCAL_SRC_FILES := ../../../test/unittest/layers/unittest_kv_cache_manager.cpp
+LOCAL_SHARED_LIBRARIES := causallm nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest
+LOCAL_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := unittest_kv_ring
+LOCAL_CFLAGS := $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_LDLIBS := -llog -landroid
+LOCAL_SRC_FILES := ../layers/unittest_kv_ring.cpp
+LOCAL_SHARED_LIBRARIES := nntrainer
+LOCAL_STATIC_LIBRARIES := googletest
+LOCAL_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
+include $(BUILD_EXECUTABLE)
+
+# Compile the production MHA translation unit into this focused test. This
+# exercises finalize guards directly without a model or tokenizer dependency.
+include $(CLEAR_VARS)
+LOCAL_MODULE := unittest_mha_cpu_profile
+LOCAL_CFLAGS := $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_LDLIBS := -llog -landroid
+LOCAL_SRC_FILES := ../layers/unittest_mha_cpu_profile.cpp ../layers/mha_core.cpp
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest_main
+LOCAL_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
+include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := unittest_causallm_models

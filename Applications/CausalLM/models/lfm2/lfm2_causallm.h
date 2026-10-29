@@ -57,6 +57,9 @@ public:
   Tensor createConvBlock(const int layer_id, Tensor input);
 
   void registerCustomLayers() override;
+  bool hasKVCacheProducer(int layer_id) const override {
+    return layer_types_.at(layer_id) != "conv";
+  }
 
   /**
    * @brief Setup LFM2-specific parameters shared by CausalLM and VL decoder.

@@ -403,6 +403,61 @@ TEST(nntrainerGraphUnitTest, NoLossLayerWhenInferenceMode) {
   ans.clear();
 }
 
+namespace {
+
+/** Observe the mode inside the actual finalize callback, including reinit. */
+class ExecutionModeInput final : public nntrainer::InputLayer {
+public:
+  void finalize(nntrainer::InitLayerContext &context) override {
+    modes.push_back(context.getExecutionMode());
+    nntrainer::InputLayer::finalize(context);
+  }
+
+  std::vector<ml::train::ExecutionMode> modes;
+};
+
+} // namespace
+
+class NetworkGraphReinitializeMode
+  : public ::testing::TestWithParam<ml::train::ExecutionMode> {};
+
+TEST_P(NetworkGraphReinitializeMode, PreservesMode) {
+  const auto mode = GetParam();
+  nntrainer::NeuralNetwork model;
+  auto capture = std::make_unique<ExecutionModeInput>();
+  auto *observed = capture.get();
+  std::shared_ptr<nntrainer::LayerNode> input = nntrainer::createLayerNode(
+    std::move(capture), {"name=input", "input_shape=1:1:4"});
+  ASSERT_EQ(model.addLayer(input), ML_ERROR_NONE);
+  ASSERT_EQ(
+    model.addLayer(ml::train::createLayer("fully_connected", {"unit=2"})),
+    ML_ERROR_NONE);
+  model.setProperty({"batch_size=1", "loss=mse"});
+  ASSERT_EQ(model.setOptimizer(ml::train::createOptimizer("sgd")),
+            ML_ERROR_NONE);
+  ASSERT_EQ(model.compile(mode), ML_ERROR_NONE);
+  ASSERT_EQ(model.initialize(mode), ML_ERROR_NONE);
+  ASSERT_EQ(observed->modes, std::vector<ml::train::ExecutionMode>({mode}));
+
+  ASSERT_EQ(model.reinitialize(), ML_ERROR_NONE);
+  EXPECT_EQ(observed->modes,
+            std::vector<ml::train::ExecutionMode>({mode, mode}));
+}
+
+INSTANTIATE_TEST_SUITE_P(ExecutionModes, NetworkGraphReinitializeMode,
+                         ::testing::Values(ml::train::ExecutionMode::TRAIN,
+                                           ml::train::ExecutionMode::INFERENCE,
+                                           ml::train::ExecutionMode::VALIDATE));
+
+TEST(nntrainerGraphUnitTest, LayerRefinalizeDefaultsToTraining) {
+  auto layer = nntrainer::createLayerNode(nntrainer::InputLayer::type,
+                                          {"name=input", "input_shape=1:1:4"});
+  ASSERT_EQ(layer->finalize().getExecutionMode(),
+            ml::train::ExecutionMode::TRAIN);
+  EXPECT_EQ(layer->refinalize().getExecutionMode(),
+            ml::train::ExecutionMode::TRAIN);
+}
+
 void check_sorted_graph(nntrainer::GraphCore graph,
                         std::vector<std::string> expected_layer_names) {
   int expected_graph_size = expected_layer_names.size();

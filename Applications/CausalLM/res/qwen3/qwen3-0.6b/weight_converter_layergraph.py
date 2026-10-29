@@ -27,8 +27,8 @@
 ##     v_proj  -> transpose
 ##     o_proj  -> transpose
 ##     post_attention_layernorm
-##     gate_proj -> transpose
 ##     up_proj   -> transpose
+##     gate_proj -> transpose
 ##     down_proj -> transpose
 ##   model.norm.weight
 ##   (lm_head: written transposed only when NOT tied)
@@ -128,8 +128,11 @@ def main():
         w(proj(i, "self_attn.o_proj"), transpose=True)
         # feed forward
         w(read(lp + "post_attention_layernorm.weight"), is_rms=True)
-        w(proj(i, "mlp.gate_proj"), transpose=True)
+        # Match the positional order restored in the current Qwen3 graph and
+        # in weight_converter.py. Swapping equal-shaped gate/up matrices is
+        # not detected by the .bin loader's size checks.
         w(proj(i, "mlp.up_proj"), transpose=True)
+        w(proj(i, "mlp.gate_proj"), transpose=True)
         w(proj(i, "mlp.down_proj"), transpose=True)
 
     # final norm

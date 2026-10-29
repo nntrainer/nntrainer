@@ -283,6 +283,7 @@ public:
    * dimensions. if empty function This function must set output dimensions in
    * the given context. Further, context can be used to request weights for the
    * layer, and any extra tensor required for the operation of the layer.
+   * @param   mode execution mode of the graph being reinitialized
    * @note      After calling this it is not allowed to
    * change properties.
    * @note      No memory allocation must be performed in the reinitialization
@@ -290,7 +291,9 @@ public:
    * will be made available during execution of the layer with the context.
    * @note configureRunContext() is expected to called right after this.
    */
-  InitLayerContext refinalize(const std::vector<TensorDim> &input_dims = {});
+  InitLayerContext
+  refinalize(const std::vector<TensorDim> &input_dims = {},
+             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN);
 
   void initialize() override { layer->initialize(*run_context); }
 
