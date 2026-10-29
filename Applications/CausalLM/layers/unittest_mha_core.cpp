@@ -25,14 +25,13 @@
  *  - The per-row cases run on every architecture. The host flash (gemm) arm
  *    is what x86 picks for every step; elsewhere it needs a 32-row step and
  *    never takes a decode step, so the gemm cases are x86-only.
- *  - Built and run in the enable-fp16=false x86 cell, the only one that
- *    builds CausalLM tests. The cases feed FP32 activations, so they also
- *    pass in an enable-fp16 build on x86 and on Linux aarch64. An Android
- *    fp16 build is different: there the layer narrows FP32 activations to
+ *  - CI builds and runs it in the x86 enable-fp16=false and enable-fp16=true
+ *    cells. The fp16_* cases feed FP16 activations, the type an Android fp16
+ *    build runs, and need enable-fp16; they are held to 1e-2. An Android
+ *    fp16 build itself narrows the FP32 activations of the other cases to
  *    FP16 copies and runs its FP16 kernels (mha_core.cpp, ENABLE_FP16 &&
- *    __ANDROID__), so every case lands at fp16 precision and is held to
- *    1e-2 (8e-4 at most on a Galaxy S26). The FP16 activation type itself
- *    is not fed here.
+ *    __ANDROID__), so there every case is held to 1e-2 (8e-4 at most on a
+ *    Galaxy S26).
  *  - A sliding window is tested on causal cases only. With a non-causal
  *    input the per-row arm ignores the window and the flash arm applies it;
  *    the reference follows the per-row arm.
