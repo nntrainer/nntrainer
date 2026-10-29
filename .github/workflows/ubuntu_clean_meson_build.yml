@@ -103,6 +103,7 @@ jobs:
 
         required_tests = {
             "unittest_causallm_models",
+            "unittest_mha_core",
         }
         missing_tests = sorted(required_tests - tests)
         if missing_tests:
