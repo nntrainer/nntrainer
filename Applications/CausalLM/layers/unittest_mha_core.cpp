@@ -16,9 +16,22 @@
  *   out = softmax(rope(Q) . rope(K)^T / sqrt(head_dim) + mask) . V
  *
  * The reference rounds K and V to fp16 the way the layer's KV cache stores
- * them, so the two agree to fp32 rounding. These tests pin the current
- * host-path behaviour before the backend dispatch inside the layer is moved
- * to ComputeOps (#4451); a refactor of the layer must keep them passing.
+ * them, so the two agree within 1e-4. These tests pin the current host-path
+ * behaviour before the backend dispatch inside the layer is moved to
+ * ComputeOps (#4451); a refactor of the layer must keep them passing.
+ *
+ * Scope:
+ *  - The per-row cases run on every architecture. The host flash (gemm) arm
+ *    is what x86 picks for every step; elsewhere it needs a 32-row step and
+ *    never takes a decode step, so the gemm cases are x86-only.
+ *  - Built and run in the enable-fp16=false x86 cell, the only one that
+ *    builds CausalLM tests. An fp16 build computes Q in fp16 on Android and
+ *    needs a looser tolerance than this file uses.
+ *  - Batch 1, no KV window ring and no int8 KV cache, as on the host path
+ *    models take today.
+ *  - The yarn and proportional tables follow the layer's formulas (yarn
+ *    without HF's default truncation of the ramp bounds), so those two cases
+ *    pin the layer rather than check it against Hugging Face.
  */
 
 #include <mha_core.h>
@@ -33,6 +46,8 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -40,7 +55,11 @@
 
 namespace {
 
-/** @brief One configuration of the layer and the steps fed to it. */
+/**
+ * @brief One configuration of the layer and the steps fed to it. The
+ *        constructor takes the shape; the named setters below change one
+ *        property each from the layer's default.
+ */
 struct MhaCase {
   std::string name;
   unsigned int heads_q;
@@ -60,10 +79,63 @@ struct MhaCase {
   unsigned int rope_orig_max = 64; /**< rope_scaling_max_position_embeddings */
   /**
    * Whether the layer applies softcap on this path. The host flash arm
-   * (gemm_attention) does not: it ignores attn_logit_softcapping, while the
-   * per-row arm and the OpenCL arms apply it. Pinned as-is; a fix flips it.
+   * (gemm_attention) ignores attn_logit_softcapping today (#4461), while the
+   * per-row arm and the OpenCL arms apply it. Pinned as-is; the #4461 fix
+   * flips softcap_gemm_not_applied to true.
    */
   bool softcap_applied = true;
+  /**
+   * Flash tile rows / keys (VJEPA_BQ / VJEPA_BK) for the gemm arm, 0 to keep
+   * the layer's tile. A small tile splits these short sequences over several
+   * query and key blocks, which the default tile never does.
+   */
+  unsigned int flash_bq = 0;
+  unsigned int flash_bk = 0;
+
+  MhaCase(std::string name_, unsigned int heads_q_, unsigned int heads_kv_,
+          unsigned int head_dim_, std::vector<unsigned int> steps_) :
+    name(std::move(name_)),
+    heads_q(heads_q_),
+    heads_kv(heads_kv_),
+    head_dim(head_dim_),
+    steps(std::move(steps_)) {}
+
+  MhaCase &gemmArm() {
+    gemm = true;
+    return *this;
+  }
+  MhaCase &encoder() {
+    causal = false;
+    return *this;
+  }
+  MhaCase &slidingWindow(unsigned int w) {
+    window = w;
+    return *this;
+  }
+  MhaCase &noRope() {
+    theta = 0;
+    return *this;
+  }
+  MhaCase &softcapAt(float cap, bool applied = true) {
+    softcap = cap;
+    softcap_applied = applied;
+    return *this;
+  }
+  MhaCase &attentionSink() {
+    sink = true;
+    return *this;
+  }
+  MhaCase &ropeScaling(std::string type, float factor, float partial = 1.0f) {
+    rope_type = std::move(type);
+    rope_factor = factor;
+    partial_rotary = partial;
+    return *this;
+  }
+  MhaCase &flashTile(unsigned int bq, unsigned int bk) {
+    flash_bq = bq;
+    flash_bk = bk;
+    return *this;
+  }
 };
 
 std::ostream &operator<<(std::ostream &os, const MhaCase &c) {
@@ -71,6 +143,45 @@ std::ostream &operator<<(std::ostream &os, const MhaCase &c) {
 }
 
 constexpr float kPi = 3.14159265358979323846f;
+
+/**
+ * Environment the layer reads to pick its attention arm or KV-cache layout.
+ * mha_core latches most of them once per process, so a test cannot clear
+ * them; it reports them and skips instead of testing a different arm.
+ */
+const char *const kArmSelectingEnv[] = {
+  "NNTR_MIN_PREFILL", "NNTR_MHA_GPU", "NNTR_MHA_GPU_DECODE", "NNTR_CUDA_ATTN",
+  "NNTR_KV_INT8",     "NNTR_KV_OHWI", "NNTR_KV_WINDOW_RING",
+};
+
+/** @brief Set an environment variable for one scope, restoring it after. */
+class ScopedEnv {
+public:
+  ScopedEnv(const char *name, const std::string &value) : name_(name) {
+    if (const char *old = std::getenv(name)) {
+      had_ = true;
+      old_ = old;
+    }
+    set(value.c_str());
+  }
+  ~ScopedEnv() { set(had_ ? old_.c_str() : nullptr); }
+
+private:
+  void set(const char *value) {
+#ifdef _WIN32
+    _putenv_s(name_, value ? value : "");
+#else
+    if (value)
+      setenv(name_, value, 1);
+    else
+      unsetenv(name_);
+#endif
+  }
+
+  const char *name_;
+  bool had_ = false;
+  std::string old_;
+};
 
 /** @brief Round a value through fp16 storage, as the KV cache does. */
 float roundFp16(float v) {
@@ -234,6 +345,27 @@ class MhaCoreHostPath : public ::testing::TestWithParam<MhaCase> {};
  */
 TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   const MhaCase &c = GetParam();
+  for (const char *name : kArmSelectingEnv) {
+    if (std::getenv(name))
+      GTEST_SKIP() << name << " is set; it changes which arm the layer runs";
+  }
+#if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||           \
+      defined(_M_IX86))
+  // min_prefill_thr() and host_decode_prefers_per_row() in mha_core.cpp: off
+  // x86 the host flash arm needs a 32-row step and never takes a decode step,
+  // so with these step sizes a gemm case would re-test the per-row arm.
+  if (c.gemm)
+    GTEST_SKIP() << "the host flash arm is not selected for these step sizes "
+                    "on this architecture";
+#endif
+  std::unique_ptr<ScopedEnv> tile_q, tile_k;
+  if (c.flash_bq) {
+    tile_q =
+      std::make_unique<ScopedEnv>("VJEPA_BQ", std::to_string(c.flash_bq));
+    tile_k =
+      std::make_unique<ScopedEnv>("VJEPA_BK", std::to_string(c.flash_bk));
+  }
+
   const unsigned int D = c.head_dim;
   const unsigned int q_width = c.heads_q * D;
   const unsigned int kv_width = c.heads_kv * D;
@@ -296,12 +428,26 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   std::mt19937 rng(0x5eed);
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
+  // The sink weight is FP16 on an Android fp16 build and the activation type
+  // otherwise; the reference reads back whatever the weight now holds.
   std::vector<float> sink;
   if (c.sink) {
     ASSERT_EQ(weights.size(), 1u);
-    float *w = weights[0].getVariableRef().getData<float>();
-    for (unsigned int h = 0; h < c.heads_q; ++h)
-      sink.push_back(w[h] = dist(rng));
+    nntrainer::Tensor &w = weights[0].getVariableRef();
+    for (unsigned int h = 0; h < c.heads_q; ++h) {
+      const float value = dist(rng);
+      if (w.getDataType() == fp32) {
+        w.getData<float>()[h] = value;
+        sink.push_back(value);
+      } else {
+#ifdef ENABLE_FP16
+        w.getData<_FP16>()[h] = static_cast<_FP16>(value);
+        sink.push_back(static_cast<float>(w.getData<_FP16>()[h]));
+#else
+        FAIL() << "sink weight is neither FP32 nor FP16";
+#endif
+      }
+    }
   }
 
   nntrainer::RunLayerContext run_context(
@@ -352,35 +498,43 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   }
 }
 
-// clang-format off
 INSTANTIATE_TEST_SUITE_P(
   CausalLm, MhaCoreHostPath,
   ::testing::Values(
-    MhaCase{"mha_rowwise", 2, 2, 16, {5, 1, 1, 1}},
-    MhaCase{"mha_gemm", 2, 2, 16, {5, 1, 1, 1}, true, true},
-    MhaCase{"gqa_rowwise", 4, 2, 16, {5, 1, 1, 1}},
-    MhaCase{"gqa_gemm", 4, 2, 16, {5, 1, 1, 1}, true, true},
-    MhaCase{"chunked_prefill_rowwise", 4, 2, 16, {4, 4, 1, 1}},
-    MhaCase{"chunked_prefill_gemm", 4, 2, 16, {4, 4, 1, 1}, true, true},
-    MhaCase{"window_rowwise", 4, 2, 16, {6, 1, 1, 1}, true, false, 3},
-    MhaCase{"window_gemm", 4, 2, 16, {6, 1, 1, 1}, true, true, 3},
-    MhaCase{"no_rope_rowwise", 2, 2, 16, {5, 1, 1}, true, false, UINT_MAX, 0},
-    MhaCase{"no_rope_gemm", 2, 2, 16, {5, 1, 1}, true, true, UINT_MAX, 0},
-    MhaCase{"softcap_rowwise", 2, 2, 16, {5, 1, 1}, true, false, UINT_MAX,
-            10000, 0.5f},
-    MhaCase{"softcap_gemm_not_applied", 2, 2, 16, {5, 1, 1}, true, true,
-            UINT_MAX, 10000, 0.5f, false, "default", 1.0f, 1.0f, 64, false},
-    MhaCase{"encoder_rowwise", 4, 2, 16, {6}, false, false},
-    MhaCase{"encoder_gemm", 4, 2, 16, {6}, false, true},
-    MhaCase{"sink", 4, 2, 16, {5, 1, 1}, true, false, UINT_MAX, 10000, 0.0f,
-            true},
-    MhaCase{"yarn", 2, 2, 16, {5, 1, 1}, true, false, UINT_MAX, 10000, 0.0f,
-            false, "yarn", 4.0f},
-    MhaCase{"proportional", 2, 2, 16, {5, 1, 1}, true, false, UINT_MAX, 10000,
-            0.0f, false, "proportional", 2.0f, 0.5f}),
+    MhaCase("mha_rowwise", 2, 2, 16, {5, 1, 1, 1}),
+    MhaCase("mha_gemm", 2, 2, 16, {5, 1, 1, 1}).gemmArm(),
+    MhaCase("gqa_rowwise", 4, 2, 16, {5, 1, 1, 1}),
+    MhaCase("gqa_gemm", 4, 2, 16, {5, 1, 1, 1}).gemmArm(),
+    MhaCase("chunked_prefill_rowwise", 4, 2, 16, {4, 4, 1, 1}),
+    MhaCase("chunked_prefill_gemm", 4, 2, 16, {4, 4, 1, 1}).gemmArm(),
+    MhaCase("window_rowwise", 4, 2, 16, {6, 1, 1, 1}).slidingWindow(3),
+    MhaCase("window_gemm", 4, 2, 16, {6, 1, 1, 1}).slidingWindow(3).gemmArm(),
+    MhaCase("no_rope_rowwise", 2, 2, 16, {5, 1, 1}).noRope(),
+    MhaCase("no_rope_gemm", 2, 2, 16, {5, 1, 1}).noRope().gemmArm(),
+    MhaCase("softcap_rowwise", 2, 2, 16, {5, 1, 1}).softcapAt(0.5f),
+    MhaCase("softcap_gemm_not_applied", 2, 2, 16, {5, 1, 1})
+      .softcapAt(0.5f, /*applied=*/false)
+      .gemmArm(),
+    MhaCase("encoder_rowwise", 4, 2, 16, {6}).encoder(),
+    MhaCase("encoder_gemm", 4, 2, 16, {6}).encoder().gemmArm(),
+    MhaCase("sink", 4, 2, 16, {5, 1, 1}).attentionSink(),
+    MhaCase("yarn", 2, 2, 16, {5, 1, 1}).ropeScaling("yarn", 4.0f),
+    MhaCase("proportional", 2, 2, 16, {5, 1, 1})
+      .ropeScaling("proportional", 2.0f, /*partial=*/0.5f),
+    // 2 x 4 flash tiles: several query and key blocks per step, so the
+    // online-softmax rescale across key blocks runs.
+    MhaCase("gemm_multi_tile", 4, 2, 16, {6, 3, 1, 1})
+      .gemmArm()
+      .flashTile(2, 4),
+    // 2 x 2 tiles with a window of 3: the arm skips key blocks wholly before
+    // the window and masks the one straddling its edge, so a skip that drops a
+    // visible block fails here.
+    MhaCase("window_gemm_multi_tile", 4, 2, 16, {7, 1, 1, 1})
+      .slidingWindow(3)
+      .gemmArm()
+      .flashTile(2, 2)),
   [](const ::testing::TestParamInfo<MhaCase> &info) {
     return info.param.name;
   });
-// clang-format on
 
 } // namespace
