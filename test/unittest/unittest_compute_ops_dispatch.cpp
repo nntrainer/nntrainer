@@ -17,6 +17,7 @@
 #include <common_properties.h>
 #include <compute_ops.h>
 #include <context_data.h>
+#include <fp16.h>
 #include <gtest/gtest.h>
 #include <quantizer.h>
 #include <tensor.h>
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #ifdef ENABLE_HEXKL
 #include <htp_backend.h>
@@ -49,6 +51,7 @@ struct CallCounters {
   std::atomic<int> activation{0};
   std::atomic<int> residual_op{0};
   std::atomic<int> swiglu{0};
+  std::atomic<int> rotary_embedding{0};
 };
 
 /**
@@ -123,6 +126,13 @@ public:
               unsigned int row_offset) override {
     counters_->swiglu++;
     real_->swiglu(in1, in2, out, active_rows, row_offset);
+  }
+  void rotary_embedding(const nntrainer::Tensor &in, nntrainer::Tensor &out,
+                        unsigned int head_dim,
+                        const nntrainer::RotaryTable &table,
+                        unsigned int start_pos, bool rotate) override {
+    counters_->rotary_embedding++;
+    real_->rotary_embedding(in, out, head_dim, table, start_pos, rotate);
   }
 
 private:
@@ -569,6 +579,122 @@ TEST_F(ComputeOpsDispatchTest, SwigluDispatchesThroughAttachedContextOps) {
       EXPECT_NEAR(got, (float)ref, 1e-5f);
     }
   }
+}
+
+namespace {
+
+/**
+ * @brief cos / sin rows for positions [0, positions) and angles
+ *        theta_i = 10000^(-2i / head_dim), in the RotaryTable layout.
+ */
+struct RotaryRows {
+  std::vector<float> cos, sin;
+  nntrainer::RotaryTable table;
+
+  RotaryRows(unsigned int positions, unsigned int head_dim) {
+    const unsigned int half = head_dim / 2;
+    for (unsigned int p = 0; p < positions; ++p) {
+      for (unsigned int i = 0; i < half; ++i) {
+        const double angle =
+          p * std::pow(10000.0, -2.0 * i / static_cast<double>(head_dim));
+        cos.push_back((float)std::cos(angle));
+        sin.push_back((float)std::sin(angle));
+      }
+    }
+    table.cos = cos.data();
+    table.sin = sin.data();
+    table.positions = positions;
+    table.half = half;
+  }
+};
+
+/** @brief Rotate-half reference of one element of a [rows, W] input. */
+float rotatedRef(const float *x, const RotaryRows &rows, unsigned int W,
+                 unsigned int head_dim, unsigned int start_pos, unsigned int r,
+                 unsigned int w) {
+  const unsigned int half = head_dim / 2;
+  const unsigned int head = w / head_dim * head_dim;
+  const unsigned int i = (w - head) % half;
+  const size_t t = (size_t)(start_pos + r) * half + i;
+  const float a = x[r * W + head + i];
+  const float b = x[r * W + head + i + half];
+  return (w - head) < half ? a * rows.cos[t] - b * rows.sin[t]
+                           : a * rows.sin[t] + b * rows.cos[t];
+}
+
+} // namespace
+
+/**
+ * @brief rotary_embedding reaches the attached table and rotates every head of
+ *        every row by the table row of its position, in place.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingDispatchesThroughAttachedOps) {
+  constexpr unsigned int H = 3, head_dim = 8, W = 2 * head_dim, start = 5;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(1, 1, H, W);
+  for (unsigned int i = 0; i < H * W; ++i)
+    x.getData<float>()[i] = 0.1f * i - 1.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + H * W);
+
+  x.setContextData(ct_data);
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+
+  EXPECT_EQ(counters->rotary_embedding.load(), 1);
+  for (unsigned int r = 0; r < H; ++r)
+    for (unsigned int w = 0; w < W; ++w)
+      EXPECT_NEAR(x.getData<float>()[r * W + w],
+                  rotatedRef(before.data(), rows, W, head_dim, start, r, w),
+                  1e-5f)
+        << "row " << r << " col " << w;
+}
+
+/**
+ * @brief Into fp16 bits (a KV-cache write): rotated with rotate == true,
+ *        converted unchanged with rotate == false. The input is left as is.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingWritesFp16Bits) {
+  constexpr unsigned int H = 2, head_dim = 8, W = head_dim, start = 3;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(1, 1, H, W);
+  for (unsigned int i = 0; i < H * W; ++i)
+    x.getData<float>()[i] = 0.25f * i - 2.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + H * W);
+  const nntrainer::TensorDim fp16_bits(
+    {1, 1, H, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16});
+  nntrainer::Tensor rotated(fp16_bits);
+  nntrainer::Tensor copied(fp16_bits);
+
+  x.getOps()->rotary_embedding(x, rotated, head_dim, rows.table, start, true);
+  x.getOps()->rotary_embedding(x, copied, head_dim, rows.table, start, false);
+
+  for (unsigned int r = 0; r < H; ++r) {
+    for (unsigned int w = 0; w < W; ++w) {
+      const unsigned int i = r * W + w;
+      EXPECT_FLOAT_EQ(x.getData<float>()[i], before[i]);
+      EXPECT_NEAR(
+        nntrainer::compute_fp16_to_fp32(rotated.getData<uint16_t>()[i]),
+        rotatedRef(before.data(), rows, W, head_dim, start, r, w), 2e-3f);
+      EXPECT_EQ(copied.getData<uint16_t>()[i],
+                nntrainer::compute_fp32_to_fp16(before[i]));
+    }
+  }
+}
+
+/**
+ * @brief A position past the end of the table is rejected instead of reading
+ *        beyond it.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRejectsPositionsPastTable) {
+  constexpr unsigned int H = 2, head_dim = 8;
+  const RotaryRows rows(4, head_dim);
+  nntrainer::Tensor x(1, 1, H, head_dim);
+  EXPECT_NO_THROW(
+    x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 2, true));
+  EXPECT_THROW(
+    x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 3, true),
+    std::invalid_argument);
 }
 
 /**

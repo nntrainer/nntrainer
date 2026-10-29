@@ -418,6 +418,10 @@ public:
   void mean_rows(const Tensor &in, Tensor &out, unsigned int active_rows,
                  unsigned int row_offset) override;
   void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon) override;
+  // Per-row compute_rotary_emb_value over the table row of each position.
+  void rotary_embedding(const Tensor &in, Tensor &out, unsigned int head_dim,
+                        const RotaryTable &table, unsigned int start_pos,
+                        bool rotate) override;
 };
 
 } // namespace nntrainer
