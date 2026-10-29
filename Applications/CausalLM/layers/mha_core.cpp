@@ -5457,9 +5457,13 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
   auto &cache = rope_freq_cache[cache_key];
 
   if (!is_fp16) {
-    // cos / sin
-    cache.cos.assign(seq_len, std::vector<float>(head_dim, 0));
-    cache.sin.assign(seq_len, std::vector<float>(head_dim, 0));
+    // cos / sin as [seq_len, half_] rows, the nntrainer::RotaryTable layout.
+    // calc_trigonometric_vals_dup writes a head_dim-wide row whose second half
+    // repeats the first; the rotary kernels read only the first half.
+    cache.cos.assign((size_t)seq_len * half_, 0.0f);
+    cache.sin.assign((size_t)seq_len * half_, 0.0f);
+    std::vector<float> cos_row(head_dim);
+    std::vector<float> sin_row(head_dim);
 
     // update cos / sin frequency
     for (unsigned int i = 0; i < seq_len; ++i) {
@@ -5467,9 +5471,11 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
       // cpu_backend provides calc_trigonometric_vals_dup on every arch (NEON
       // on ARM, scalar fallback elsewhere), so the app-side USE_NEON fork is
       // gone — one code path, one rounding behaviour across backends.
-      nntrainer::calc_trigonometric_vals_dup(
-        half_, thetas.data(), cache.cos[i].data(), cache.sin[i].data(), i,
-        attention_scaling);
+      nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
+                                             cos_row.data(), sin_row.data(), i,
+                                             attention_scaling);
+      std::copy_n(cos_row.data(), half_, &cache.cos[(size_t)i * half_]);
+      std::copy_n(sin_row.data(), half_, &cache.sin[(size_t)i * half_]);
     }
     freqs_cos = &cache.cos;
     freqs_sin = &cache.sin;
@@ -5637,10 +5643,6 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool apply_rope) {
-  unsigned int half_ = dim / 2;
-  unsigned int max_timestep =
-    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
-
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
@@ -5648,53 +5650,17 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
       cached_freqs_cos = freqs_cos;
       cached_freqs_sin = freqs_sin;
     }
-    std::vector<std::vector<float>> *freqs_cos_local = cached_freqs_cos;
-    std::vector<std::vector<float>> *freqs_sin_local = cached_freqs_sin;
-    std::vector<float> *cos_ = nullptr;
-    std::vector<float> *sin_ = nullptr;
-
-    for (unsigned int b = 0; b < in.batch(); b++) {
-      for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_local)[from + h];
-            sin_ = &(*freqs_sin_local)[from + h];
-          }
-          float *in_ptr = in.getData<float>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-
-          if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
-            float *out_ptr = out.getData<float>() +
-                             b * out.channel() * out.height() * out.width() +
-                             c * out.height() * out.width() + h * out.width();
-
-            if (out_ptr != in_ptr) {
-              std::memcpy(out_ptr, in_ptr, sizeof(float) * in.width());
-            }
-            if (apply_rope) {
-              nntrainer::compute_rotary_emb_value(
-                in.width(), dim, half_, out_ptr, nullptr, cos_->data(),
-                sin_->data(), false);
-            }
-          } else if (out.getDataType() ==
-                       ml::train::TensorDim::DataType::UINT16 ||
-                     out.getDataType() ==
-                       ml::train::TensorDim::DataType::FP16) {
-            uint16_t *out_ptr = out.getData<uint16_t>() +
-                                b * out.channel() * out.height() * out.width() +
-                                c * out.height() * out.width() +
-                                h * out.width();
-
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), !apply_rope);
-          }
-        }
-      }
-    }
+    nntrainer::RotaryTable table;
+    table.cos = cached_freqs_cos->data();
+    table.sin = cached_freqs_sin->data();
+    table.half = dim / 2;
+    table.positions = (unsigned int)(cached_freqs_cos->size() / table.half);
+    in.getOps()->rotary_embedding(in, out, dim, table, from, apply_rope);
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+    unsigned int half_ = dim / 2;
+    unsigned int max_timestep =
+      std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
     if (cached_freqs_cos_fp16 == nullptr || cached_freqs_sin_fp16 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       // Cap to the live max sequence length (= the `from < max_timestep` bound

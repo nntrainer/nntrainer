@@ -764,19 +764,20 @@ private:
    * @brief Rotary frequency cache for FP32 and optional FP16 lookup tables
    */
   struct RopeFreqCache {
-    std::vector<std::vector<float>> cos;
-    std::vector<std::vector<float>> sin;
+    /** fp32 [positions, head_dim / 2], the nntrainer::RotaryTable layout */
+    std::vector<float> cos;
+    std::vector<float> sin;
 #ifdef ENABLE_FP16
     std::vector<std::vector<_FP16>> cos_fp16;
     std::vector<std::vector<_FP16>> sin_fp16;
 #endif
   };
   inline static std::unordered_map<std::string, RopeFreqCache> rope_freq_cache;
-  inline static std::vector<std::vector<float>> *freqs_cos = {};
-  inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<float> *freqs_cos = {};
+  inline static std::vector<float> *freqs_sin = {};
   inline static std::vector<float> thetas;
-  std::vector<std::vector<float>> *cached_freqs_cos = {};
-  std::vector<std::vector<float>> *cached_freqs_sin = {};
+  std::vector<float> *cached_freqs_cos = {};
+  std::vector<float> *cached_freqs_sin = {};
 #ifdef ENABLE_FP16
   inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
