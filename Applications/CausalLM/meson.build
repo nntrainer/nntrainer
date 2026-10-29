@@ -453,6 +453,23 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # MHACoreLayer host path against a plain attention reference: pins the
+  # layer's output before its backend dispatch moves to ComputeOps (#4451).
+  unittest_mha_core = executable(
+    'unittest_mha_core',
+    meson.current_source_dir() / 'layers' / 'unittest_mha_core.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_mha_core_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_mha_core', unittest_mha_core,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_mha_core'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # KV window-ring rule (kv_ring.h): host-only, no GPU needed. Pins the
   # capacity formula and the row wrap that the model-side allocation and the
   # layer-side modulo map must both obey.
