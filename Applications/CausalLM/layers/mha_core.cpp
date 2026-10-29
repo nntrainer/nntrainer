@@ -4761,9 +4761,9 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
   // Opt-in GPU attention (engine=cuda, UVM): the interleaved fp16 query +
   // fp16 KV cache feed a flash core on the device, replacing the host O(M^2)
   // loop below. Matches gemm_attention (scale 1/sqrt(d), causal + sliding
-  // mask, GQA) except for softcap, which it is not given (#4461). Gated by
-  // NNTR_CUDA_ATTN, which the CudaContext device profile defaults on (=0
-  // disables); falls through to the host path when off / not device-resident.
+  // mask, GQA, softcap). Gated by NNTR_CUDA_ATTN, which the CudaContext device
+  // profile defaults on (=0 disables); falls through to the host path when off
+  // / not device-resident.
   {
     static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
@@ -4782,7 +4782,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
-              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap))
+              win, attn_logit_softcapping, /*ring_cap=*/(int)kv_ring_cap))
           return;
       }
     }
