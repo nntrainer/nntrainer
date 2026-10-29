@@ -682,6 +682,53 @@ TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingWritesFp16Bits) {
   }
 }
 
+#ifdef ENABLE_FP16
+/**
+ * @brief An FP16 input reads the fp16 table and rotates into an FP16 output,
+ *        in place or not; it does not take the copy-only (rotate == false)
+ *        form, which exists for the FP32 value write.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRotatesFp16Input) {
+  constexpr unsigned int H = 3, head_dim = 16, W = 2 * head_dim, start = 4;
+  RotaryRows rows(start + H, head_dim);
+  std::vector<uint16_t> cos16, sin16;
+  for (float v : rows.cos)
+    cos16.push_back(nntrainer::compute_fp32_to_fp16(v));
+  for (float v : rows.sin)
+    sin16.push_back(nntrainer::compute_fp32_to_fp16(v));
+  rows.table.cos_fp16 = cos16.data();
+  rows.table.sin_fp16 = sin16.data();
+
+  const nntrainer::TensorDim dim(
+    {1, 1, H, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16});
+  nntrainer::Tensor x(dim), out(dim);
+  std::vector<float> before;
+  for (unsigned int i = 0; i < H * W; ++i) {
+    x.getData<_FP16>()[i] = static_cast<_FP16>(0.1f * i - 1.5f);
+    before.push_back(static_cast<float>(x.getData<_FP16>()[i]));
+  }
+
+  x.setContextData(ct_data);
+  x.getOps()->rotary_embedding(x, out, head_dim, rows.table, start, true);
+  EXPECT_EQ(counters->rotary_embedding.load(), 1);
+  for (unsigned int r = 0; r < H; ++r)
+    for (unsigned int w = 0; w < W; ++w)
+      EXPECT_NEAR(static_cast<float>(out.getData<_FP16>()[r * W + w]),
+                  rotatedRef(before.data(), rows, W, head_dim, start, r, w),
+                  2e-2f)
+        << "row " << r << " col " << w;
+
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+  for (unsigned int i = 0; i < H * W; ++i)
+    EXPECT_EQ(static_cast<float>(x.getData<_FP16>()[i]),
+              static_cast<float>(out.getData<_FP16>()[i]));
+
+  EXPECT_THROW(
+    x.getOps()->rotary_embedding(x, out, head_dim, rows.table, start, false),
+    std::invalid_argument);
+}
+#endif
+
 /**
  * @brief A position past the end of the table is rejected instead of reading
  *        beyond it.
@@ -695,6 +742,65 @@ TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRejectsPositionsPastTable) {
   EXPECT_THROW(
     x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 3, true),
     std::invalid_argument);
+}
+
+/**
+ * @brief Each batch's rows start again at start_pos: height index h is at
+ *        position start_pos + h in every batch.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRestartsPositionsPerBatch) {
+  constexpr unsigned int B = 2, H = 3, head_dim = 8, W = head_dim, start = 2;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(B, 1, H, W);
+  for (unsigned int i = 0; i < B * H * W; ++i)
+    x.getData<float>()[i] = 0.05f * i - 1.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + B * H * W);
+
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+
+  for (unsigned int b = 0; b < B; ++b)
+    for (unsigned int h = 0; h < H; ++h)
+      for (unsigned int w = 0; w < W; ++w)
+        EXPECT_NEAR(
+          x.getData<float>()[(b * H + h) * W + w],
+          rotatedRef(before.data() + b * H * W, rows, W, head_dim, start, h, w),
+          1e-5f)
+          << "batch " << b << " row " << h << " col " << w;
+}
+
+/**
+ * @brief A head_dim that cannot tile the row, or a missing fp32 table, is
+ *        rejected instead of looping or reading past the row.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRejectsBadHeadDimOrTable) {
+  const RotaryRows rows(4, 8);
+  nntrainer::Tensor x(1, 1, 1, 12);
+  for (unsigned int head_dim : {0u, 5u, 8u})
+    EXPECT_THROW(
+      x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 0, true),
+      std::invalid_argument)
+      << "head_dim " << head_dim;
+
+  // The copy-only form reads no table, so only the head_dim check stops a
+  // head_dim of 0 (the kernels' head loop would not advance) or an odd one
+  // that divides the row.
+  const nntrainer::TensorDim bits15(
+    {1, 1, 1, 15, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16});
+  nntrainer::Tensor z(1, 1, 1, 15), z_bits(bits15);
+  for (unsigned int head_dim : {0u, 5u})
+    EXPECT_THROW(
+      x.getOps()->rotary_embedding(z, z_bits, head_dim, rows.table, 0, false),
+      std::invalid_argument)
+      << "copy-only, head_dim " << head_dim;
+
+  nntrainer::Tensor y(1, 1, 1, 8);
+  nntrainer::RotaryTable no_fp32 = rows.table;
+  no_fp32.cos = nullptr;
+  no_fp32.sin = nullptr;
+  EXPECT_THROW(x.getOps()->rotary_embedding(y, y, 8, no_fp32, 0, true),
+               std::invalid_argument);
+  EXPECT_NO_THROW(x.getOps()->rotary_embedding(y, y, 8, no_fp32, 0, false));
 }
 
 /**

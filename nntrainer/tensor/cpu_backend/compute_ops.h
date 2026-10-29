@@ -58,6 +58,9 @@ class Tensor;
 struct RotaryTable {
   const float *cos = nullptr; /**< [positions, half] fp32 cos */
   const float *sin = nullptr; /**< [positions, half] fp32 sin */
+  /** [positions, half] fp16-bit cos / sin, read for an FP16 input */
+  const uint16_t *cos_fp16 = nullptr;
+  const uint16_t *sin_fp16 = nullptr;
   unsigned int positions = 0; /**< number of rows */
   unsigned int half = 0;      /**< head_dim / 2 */
 };
@@ -614,10 +617,14 @@ public:
    *   out[i]        = x[i] * cos - x[i + half] * sin
    *   out[i + half] = x[i] * sin + x[i + half] * cos
    *
-   * @p in is FP32. @p out is FP32 (and may alias @p in) or FP16 / UINT16
-   * holding fp16 bits, which is how a layer writes rotated keys straight
-   * into an fp16 KV cache. With @p rotate false the op only copies, or
-   * converts to fp16, without rotating -- the value side of that cache write.
+   * An FP32 @p in reads the fp32 table. @p out is then FP32 (and may alias
+   * @p in) or FP16 / UINT16 holding fp16 bits, which is how a layer writes
+   * rotated keys straight into an fp16 KV cache. With @p rotate false the op
+   * only copies, or converts to fp16, without rotating -- the value side of
+   * that cache write.
+   *
+   * An FP16 @p in (enable-fp16 builds) reads the fp16 table and writes an
+   * FP16 @p out, which may alias @p in. It always rotates.
    *
    * @throws std::invalid_argument when a row's position falls outside the
    *         table, or for a dtype combination the backend does not handle.
