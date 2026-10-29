@@ -99,6 +99,12 @@ struct MhaCase {
    */
   unsigned int flash_bq = 0;
   unsigned int flash_bk = 0;
+  /**
+   * Feed Q / K / V and take the output as FP16, the activation type of an
+   * Android fp16 build. The layer then runs its FP16 paths (FP16 RoPE, FP16
+   * attention kernels); enable-fp16 builds only.
+   */
+  bool fp16_activations = false;
 
   MhaCase(std::string name_, unsigned int heads_q_, unsigned int heads_kv_,
           unsigned int head_dim_, std::vector<unsigned int> steps_) :
@@ -142,6 +148,10 @@ struct MhaCase {
   MhaCase &flashTile(unsigned int bq, unsigned int bk) {
     flash_bq = bq;
     flash_bk = bk;
+    return *this;
+  }
+  MhaCase &fp16Activations() {
+    fp16_activations = true;
     return *this;
   }
 };
@@ -348,6 +358,33 @@ nntrainer::TensorDim dim4(unsigned int h, unsigned int w,
   return nntrainer::TensorDim({1, 1, h, w, nntrainer::Tformat::NCHW, dtype});
 }
 
+/**
+ * @brief Write @p values into the first rows of an FP32 or FP16 tensor. For
+ *        FP16 the values are rounded in place, so the reference sees what the
+ *        layer reads.
+ */
+void writeRows(nntrainer::Tensor &t, std::vector<float> &values) {
+  if (t.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+    std::copy(values.begin(), values.end(), t.getData<float>());
+    return;
+  }
+#ifdef ENABLE_FP16
+  for (size_t i = 0; i < values.size(); ++i) {
+    t.getData<_FP16>()[i] = static_cast<_FP16>(values[i]);
+    values[i] = static_cast<float>(t.getData<_FP16>()[i]);
+  }
+#endif
+}
+
+/** @brief Element @p i of an FP32 or FP16 tensor, as float. */
+float readAt(const nntrainer::Tensor &t, size_t i) {
+#ifdef ENABLE_FP16
+  if (t.getDataType() == nntrainer::TensorDim::DataType::FP16)
+    return static_cast<float>(t.getData<_FP16>()[i]);
+#endif
+  return t.getData<float>()[i];
+}
+
 class MhaCoreHostPath : public ::testing::TestWithParam<MhaCase> {};
 
 /**
@@ -368,6 +405,10 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   if (c.gemm)
     GTEST_SKIP() << "the host flash arm is not selected for these step sizes "
                     "on this architecture";
+#endif
+#ifndef ENABLE_FP16
+  if (c.fp16_activations)
+    GTEST_SKIP() << "FP16 activations need an enable-fp16 build";
 #endif
   // gemm_attention reads the flash tile on every call, so the test owns it:
   // the case's tile, or unset for the layer's default. A 0 size would divide
@@ -412,16 +453,19 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   // key/value caches. Without enable-fp16 the caches hold fp16 bits as UINT16,
   // as Transformer::createKVCachePlaceholders declares them.
   const auto fp32 = nntrainer::TensorDim::DataType::FP32;
+  const auto act =
+    c.fp16_activations ? nntrainer::TensorDim::DataType::FP16 : fp32;
 #ifdef ENABLE_FP16
   const auto cache_dtype = nntrainer::TensorDim::DataType::FP16;
 #else
   const auto cache_dtype = nntrainer::TensorDim::DataType::UINT16;
 #endif
   nntrainer::InitLayerContext init_context(
-    {dim4(plane, q_width, fp32), dim4(plane, kv_width, fp32),
-     dim4(plane, kv_width, fp32), dim4(max_seq, kv_width, cache_dtype),
+    {dim4(plane, q_width, act), dim4(plane, kv_width, act),
+     dim4(plane, kv_width, act), dim4(max_seq, kv_width, cache_dtype),
      dim4(max_seq, kv_width, cache_dtype)},
-    {true}, false, "mha_core", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    {true}, false, "mha_core", "", 0.0f,
+    {"NCHW", "FP32", c.fp16_activations ? "FP16" : "FP32"}, 1.0f,
     ml::train::ExecutionMode::INFERENCE);
   ASSERT_NO_THROW(layer.finalize(init_context));
 
@@ -482,9 +526,9 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     for (auto &x : v)
       x = dist(rng);
 
-    std::copy(q.begin(), q.end(), run_context.getInput(0).getData<float>());
-    std::copy(k.begin(), k.end(), run_context.getInput(1).getData<float>());
-    std::copy(v.begin(), v.end(), run_context.getInput(2).getData<float>());
+    writeRows(run_context.getInput(0), q);
+    writeRows(run_context.getInput(1), k);
+    writeRows(run_context.getInput(2), v);
 
     for (unsigned int r = 0; r < rows; ++r) {
       for (unsigned int h = 0; h < c.heads_kv; ++h) {
@@ -502,17 +546,19 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
 
     const std::vector<float> expected =
       referenceAttention(c, rope, q, k_hist, v_hist, sink, from, rows);
-    const float *actual = run_context.getOutput(0).getData<float>();
-    // An Android fp16 build runs the FP16 path for these FP32 activations
-    // (see the header), so it is held to fp16 precision; 8e-4 at most on a
-    // Galaxy S26. Every other build computes in FP32 and keeps 1e-4.
+    // FP16 activations round Q, the RoPE products and every attention
+    // intermediate to fp16, so they are held to fp16 precision instead:
+    // 5e-3 passes on aarch64 NEON and 2e-3 on the x86 fallback. An Android
+    // fp16 build takes that path for the FP32 cases too (see the header),
+    // so there every case is held to it; 8e-4 at most on a Galaxy S26.
 #if defined(ENABLE_FP16) && defined(__ANDROID__)
     const float tolerance = 1e-2f;
 #else
-    const float tolerance = 1e-4f;
+    const float tolerance = c.fp16_activations ? 1e-2f : 1e-4f;
 #endif
+    const nntrainer::Tensor &out = run_context.getOutput(0);
     for (size_t i = 0; i < expected.size(); ++i) {
-      ASSERT_NEAR(actual[i], expected[i], tolerance)
+      ASSERT_NEAR(readAt(out, i), expected[i], tolerance)
         << "step [" << from << ", " << from + rows << ") element " << i;
     }
     from += rows;
@@ -553,7 +599,14 @@ INSTANTIATE_TEST_SUITE_P(
     MhaCase("window_gemm_multi_tile", 4, 2, 16, {7, 1, 1, 1})
       .slidingWindow(3)
       .gemmArm()
-      .flashTile(2, 2)),
+      .flashTile(2, 2),
+    // The FP16 paths an Android fp16 build takes: FP16 RoPE through
+    // ComputeOps::rotary_embedding and the FP16 attention kernels.
+    MhaCase("fp16_rowwise", 4, 2, 16, {4, 4, 1, 1}).fp16Activations(),
+    MhaCase("fp16_window_rowwise", 4, 2, 16, {6, 1, 1, 1})
+      .slidingWindow(3)
+      .fp16Activations(),
+    MhaCase("fp16_gemm", 4, 2, 16, {5, 1, 1, 1}).gemmArm().fp16Activations()),
   [](const ::testing::TestParamInfo<MhaCase> &info) {
     return info.param.name;
   });
