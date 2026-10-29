@@ -245,18 +245,55 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
       FARF(HIGH, "nntr_hvx_open: apptype vote rejected (continuing)");
     }
+    /** Burst: the vote QNN's HTP backend casts for its "burst" perf
+       profile (QnnHtpPerfInfrastructure DCVS_V3), cast here because this
+       path opens its own skel and never goes through QNN. DCVS off, core
+       and bus pinned at the maximum corner, sleep disabled and a 40 us
+       wake latency, so the clocks do not drop between calls. A device
+       that rejects it falls back to the DCVS_v2 vote below.
+       -DNNTR_HVX_NO_BURST (HEX_EXTRA_CFLAGS in build.sh) builds the skel
+       with the DCVS_v2 vote only. */
+    int burst = 0;
+#ifndef NNTR_HVX_NO_BURST
     memset(&req, 0, sizeof(req));
-    req.type = HAP_power_set_DCVS_v2;
-    req.dcvs_v2.dcvs_enable = 1;
-    req.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
-    req.dcvs_v2.set_latency = 1;
-    req.dcvs_v2.latency = 100; /* us of wake latency we are willing to pay */
-    req.dcvs_v2.set_dcvs_params = 1;
-    req.dcvs_v2.dcvs_params.min_corner = HAP_DCVS_VCORNER_NOM;
-    req.dcvs_v2.dcvs_params.target_corner = HAP_DCVS_VCORNER_TURBO;
-    req.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
-    if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
-      FARF(HIGH, "nntr_hvx_open: DCVS vote rejected (continuing)");
+    req.type = HAP_power_set_DCVS_v3;
+    req.dcvs_v3.set_dcvs_enable = 1;
+    req.dcvs_v3.dcvs_enable = 0;
+    req.dcvs_v3.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+    req.dcvs_v3.set_latency = 1;
+    req.dcvs_v3.latency = 40;
+    req.dcvs_v3.set_core_params = 1;
+    req.dcvs_v3.core_params.min_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.set_bus_params = 1;
+    req.dcvs_v3.bus_params.min_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.set_sleep_disable = 1;
+    req.dcvs_v3.sleep_disable = 1;
+    if (HAP_power_set((void *)s, &req) == AEE_SUCCESS) {
+      burst = 1;
+      FARF(HIGH, "nntr_hvx_open: burst vote accepted");
+    } else {
+      FARF(HIGH, "nntr_hvx_open: burst vote rejected (falling back to "
+                 "DCVS_v2)");
+    }
+#endif
+    if (!burst) {
+      memset(&req, 0, sizeof(req));
+      req.type = HAP_power_set_DCVS_v2;
+      req.dcvs_v2.dcvs_enable = 1;
+      req.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+      req.dcvs_v2.set_latency = 1;
+      req.dcvs_v2.latency = 100; /* us of wake latency we are willing to pay */
+      req.dcvs_v2.set_dcvs_params = 1;
+      req.dcvs_v2.dcvs_params.min_corner = HAP_DCVS_VCORNER_NOM;
+      req.dcvs_v2.dcvs_params.target_corner = HAP_DCVS_VCORNER_TURBO;
+      req.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
+      if (HAP_power_set((void *)s, &req) != AEE_SUCCESS) {
+        FARF(HIGH, "nntr_hvx_open: DCVS vote rejected (continuing)");
+      }
     }
 #if defined(HAP_POWER_SET_HMX_V2_DEFINED) && !defined(NNTR_HVX_NO_HMX_VOTE)
     /** The HMX clock, separately from the core's: with no clock vote the
