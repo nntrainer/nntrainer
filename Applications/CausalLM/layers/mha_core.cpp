@@ -210,18 +210,18 @@ private:
   defined(ENABLE_FP16)
 #include <climits>
 // libnntrainer builds the all-FP16 CPU attention kernels (compute_kcaches /
-// compute_fp16vcache_transposed / compute_rotary_emb_value with _FP16 I/O, and
-// the softmax_row[_inplace] _FP16 instantiations) only for ARM/NEON
-// (neon_impl_fp16.cpp); the x86 backend has only the FP32/templated variants.
-// This layer's FP16 CPU attention path references the all-FP16 versions, so on
-// x86 they are undefined.
+// compute_fp16vcache_transposed with _FP16 I/O, and the softmax_row[_inplace]
+// _FP16 instantiations) only for ARM/NEON (neon_impl_fp16.cpp); the x86 backend
+// has only the FP32/templated variants. This layer's FP16 CPU attention path
+// references the all-FP16 versions, so on x86 they are undefined. (The FP16
+// compute_rotary_emb_value is in every backend, and the layer reaches it
+// through ComputeOps::rotary_embedding.)
 //
 // nntrainer activations can be FP16 independently of the weight type (the
 // model dtype is Weight-Activation, e.g. QINT4-FP16), so the FP16 CPU path IS
-// reachable on x86 — notably RoPE, which the mha layer applies on the host even
-// when attention runs on the GPU. Provide real x86 implementations (scalar,
-// FP32 accumulation — matching the GPU's FP32-accumulate numerics) so x86+FP16
-// works end to end. This block is x86-only; ARM keeps its NEON kernels.
+// reachable on x86. Provide real x86 implementations (scalar, FP32
+// accumulation — matching the GPU's FP32-accumulate numerics) so x86+FP16 works
+// end to end. This block is x86-only; ARM keeps its NEON kernels.
 namespace nntrainer {
 
 // O[row] scores = scale * (Q · K), per (kv-head n, gqa group g, key row).
@@ -289,28 +289,6 @@ void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
       const float *acc_h = acc.data() + (size_t)h * head_dim;
       for (int d = 0; d < head_dim; ++d)
         out_h[d] = (_FP16)acc_h[d];
-    }
-  }
-}
-
-// RoPE: rotate (a,b) pairs across the half_ boundary by (cos,sin). Mirrors the
-// all-FP16 neon_impl_fp16.cpp compute_rotary_emb_value.
-void compute_rotary_emb_value(unsigned int width, unsigned int dim,
-                              unsigned int half_, _FP16 *inout, _FP16 *output,
-                              const _FP16 *cos_, const _FP16 *sin_) {
-  for (unsigned int w = 0; w < width; w += dim) {
-    for (unsigned int k = 0; k < half_; ++k) {
-      const unsigned int i0 = w + k, i1 = w + k + half_;
-      const float a = (float)inout[i0], b = (float)inout[i1];
-      const float c = (float)cos_[k], s = (float)sin_[k];
-      const float o0 = a * c - b * s, o1 = a * s + b * c;
-      if (output != nullptr) {
-        output[i0] = (_FP16)o0;
-        output[i1] = (_FP16)o1;
-      } else {
-        inout[i0] = (_FP16)o0;
-        inout[i1] = (_FP16)o1;
-      }
     }
   }
 }
