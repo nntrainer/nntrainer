@@ -25,8 +25,12 @@
  *    is what x86 picks for every step; elsewhere it needs a 32-row step and
  *    never takes a decode step, so the gemm cases are x86-only.
  *  - Built and run in the enable-fp16=false x86 cell, the only one that
- *    builds CausalLM tests. An fp16 build computes Q in fp16 on Android and
- *    needs a looser tolerance than this file uses.
+ *    builds CausalLM tests. The cases feed FP32 activations, so they also
+ *    pass in an enable-fp16 build; the FP16 activations an Android fp16
+ *    build runs are not covered.
+ *  - A sliding window is tested on causal cases only. With a non-causal
+ *    input the per-row arm ignores the window and the flash arm applies it;
+ *    the reference follows the per-row arm.
  *  - Batch 1, no KV window ring and no int8 KV cache, as on the host path
  *    models take today.
  *  - The yarn and proportional tables follow the layer's formulas (yarn
@@ -47,7 +51,6 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
-#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -85,9 +88,9 @@ struct MhaCase {
    */
   bool softcap_applied = true;
   /**
-   * Flash tile rows / keys (VJEPA_BQ / VJEPA_BK) for the gemm arm, 0 to keep
-   * the layer's tile. A small tile splits these short sequences over several
-   * query and key blocks, which the default tile never does.
+   * Flash tile rows / keys (VJEPA_BQ / VJEPA_BK) for the gemm arm, both 0 to
+   * keep the layer's tile. A small tile splits these short sequences over
+   * several query and key blocks, which the default tile never does.
    */
   unsigned int flash_bq = 0;
   unsigned int flash_bk = 0;
@@ -154,15 +157,18 @@ const char *const kArmSelectingEnv[] = {
   "NNTR_KV_INT8",     "NNTR_KV_OHWI", "NNTR_KV_WINDOW_RING",
 };
 
-/** @brief Set an environment variable for one scope, restoring it after. */
+/**
+ * @brief Set (or, for a null value, unset) an environment variable for one
+ *        scope, restoring it after.
+ */
 class ScopedEnv {
 public:
-  ScopedEnv(const char *name, const std::string &value) : name_(name) {
+  ScopedEnv(const char *name, const char *value) : name_(name) {
     if (const char *old = std::getenv(name)) {
       had_ = true;
       old_ = old;
     }
-    set(value.c_str());
+    set(value);
   }
   ~ScopedEnv() { set(had_ ? old_.c_str() : nullptr); }
 
@@ -358,13 +364,15 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     GTEST_SKIP() << "the host flash arm is not selected for these step sizes "
                     "on this architecture";
 #endif
-  std::unique_ptr<ScopedEnv> tile_q, tile_k;
-  if (c.flash_bq) {
-    tile_q =
-      std::make_unique<ScopedEnv>("VJEPA_BQ", std::to_string(c.flash_bq));
-    tile_k =
-      std::make_unique<ScopedEnv>("VJEPA_BK", std::to_string(c.flash_bk));
-  }
+  // gemm_attention reads the flash tile on every call, so the test owns it:
+  // the case's tile, or unset for the layer's default. A 0 size would divide
+  // by zero there.
+  ASSERT_EQ(c.flash_bq == 0, c.flash_bk == 0)
+    << "flashTile takes two nonzero sizes";
+  const std::string bq = std::to_string(c.flash_bq);
+  const std::string bk = std::to_string(c.flash_bk);
+  ScopedEnv tile_q("VJEPA_BQ", c.flash_bq ? bq.c_str() : nullptr);
+  ScopedEnv tile_k("VJEPA_BK", c.flash_bk ? bk.c_str() : nullptr);
 
   const unsigned int D = c.head_dim;
   const unsigned int q_width = c.heads_q * D;
