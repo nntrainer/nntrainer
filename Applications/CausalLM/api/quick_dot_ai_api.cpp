@@ -11,6 +11,7 @@
  */
 
 #include "quick_dot_ai_api.h"
+#include "htp_model_runtime.h"
 #ifdef ENABLE_QNN_MODELS
 #include "quick_dot_ai_qnn.h"
 #endif
@@ -101,7 +102,26 @@ using json = nlohmann::json;
  */
 struct CausalLmModel {
   std::mutex mtx;
+  // Cancellation must not wait on generation's mutex, but must serialize with
+  // replacement/destruction of the model objects it visits.
+  std::mutex lifetime_mtx;
+#ifdef ENABLE_HEXKL
+  std::unique_ptr<quick_dot_ai::HtpModelRuntime> htp_runtime;
+#endif
   std::vector<std::unique_ptr<causallm::Transformer>> models;
+
+  void clearModels() {
+    std::lock_guard<std::mutex> lock(lifetime_mtx);
+#ifdef ENABLE_HEXKL
+    if (htp_runtime)
+      nntrainer::htp_stop_workers();
+#endif
+    models.clear();
+#ifdef ENABLE_HEXKL
+    htp_runtime.reset();
+#endif
+  }
+  ~CausalLmModel() { clearModels(); }
   std::vector<std::string> architectures;
   std::vector<std::string> model_dirs;
   std::string last_output;
@@ -115,6 +135,7 @@ struct CausalLmModel {
 // process-wide regardless of which handle is active.
 static std::mutex g_registry_mutex;
 static bool g_use_chat_template = true;
+static thread_local std::string g_last_model_load_error;
 static bool g_verbose = false;
 static std::string g_last_output = "";
 static std::optional<causallm::ChatTemplate> g_chat_template;
@@ -676,6 +697,10 @@ static std::string resolve_model_path(const std::string &model_key,
   std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
                  ::toupper);
 
+  if (path_upper == "GEMMA4-26B-A4B-HTP")
+    return "/gemma4-26b-a4b-htp-w4a32";
+  if (path_upper == "LFM2-24BA2B-HTP")
+    return "/lfm2-24ba2b-htp-w4a32";
   std::string base_dir_name = "";
 
   // 1. Try to find base directory name from map
@@ -722,7 +747,7 @@ static void fix_paths(json &nntr_cfg, const std::string &sub_dir) {
   static const char *kKeys[] = {
     "tokenizer_file",       "model_file_name",     "binary_config_path",
     "image_newline_path",   "embedding_file_name", "ple_file_name",
-    "rotation_matrix_path",
+    "rotation_matrix_path", "fc_wh_file_name",
   };
   for (const char *k : kKeys) {
     if (!nntr_cfg.contains(k) || !nntr_cfg[k].is_string())
@@ -932,6 +957,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
        target_model_name ? target_model_name : "(null)");
   LOGD("[DEBUG]   quant_type: %d", quant_type);
 
+  g_last_model_load_error.clear();
   auto start_init = std::chrono::high_resolution_clock::now();
 
   // Ensure models/configs are registered (thread-safe via call_once)
@@ -945,7 +971,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     // device caches the old models seeded once they are gone, exactly as
     // unloadModelHandle() does, before this load recycles their addresses.
     const bool reload = !h.models.empty();
-    h.models.clear();
+    h.clearModels();
     if (reload)
       causallm::CausalLM::releaseDeviceCaches();
     h.architectures.clear();
@@ -1139,6 +1165,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
            top_nntr.contains("model_dirs"), top_nntr["model_dirs"].is_array(),
            top_nntr["architectures"].size(), top_nntr["model_dirs"].size());
 
+      if (is_multi && (input_name_upper == "GEMMA4-26B-A4B-HTP" ||
+                       input_name_upper == "LFM2-24BA2B-HTP"))
+        throw std::invalid_argument("HTP supports a single model per handle");
       if (is_multi) {
         // ----------------------------------------------------------------
         // Multi-model branch.
@@ -1203,6 +1232,12 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
             LOGD("lora_path is now %s", lora_path.c_str());
           }
 
+          if (sub_nntr.value("gemma4_execution_profile", std::string()) ==
+                "htp_fused" ||
+              sub_nntr.value("lfm2_execution_profile", std::string()) ==
+                "htp_fused")
+            throw std::invalid_argument(
+              "HTP profile requires its dedicated descriptor");
           auto m = causallm::Factory::Instance().create(arch_i, sub_cfg,
                                                         sub_gen, sub_nntr);
           if (!m) {
@@ -1228,7 +1263,10 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                             sub_t1 - sub_t0)
                             .count();
 
-          h.models.push_back(std::move(m));
+          {
+            std::lock_guard<std::mutex> life_lock(h.lifetime_mtx);
+            h.models.push_back(std::move(m));
+          }
           h.architectures.push_back(arch_i);
           h.model_dirs.push_back(sub_dir);
           h.initialization_duration_ms.push_back(sub_ms);
@@ -1284,6 +1322,70 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       if (nntr_cfg.contains("tokenizer_file")) {
         nntr_cfg["tokenizer_file"] = abs_model_dir + "/tokenizer.json";
       }
+    }
+
+    const bool lfm2_htp_model = input_name_upper == "LFM2-24BA2B-HTP";
+    const bool lfm2_htp_profile =
+      nntr_cfg.value("lfm2_execution_profile", std::string()) == "htp_fused";
+    if (lfm2_htp_model || lfm2_htp_profile) {
+#ifndef ENABLE_HEXKL
+      throw std::invalid_argument("LFM2 HTP requires an HTP build");
+#else
+      if (!lfm2_htp_model || !lfm2_htp_profile ||
+          compute != CAUSAL_LM_BACKEND_NPU ||
+          quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
+          cfg.value("architectures", std::vector<std::string>{}) !=
+            std::vector<std::string>{"Lfm2MoeForCausalLM"} ||
+          nntr_cfg.value("lfm2_weight_format", std::string()) != "sr15_v2" ||
+          nntr_cfg.value("use_kvcache", false) ||
+          nntr_cfg.value("save_kvcache", false))
+        throw std::invalid_argument(
+          "LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack");
+      fix_paths(nntr_cfg, abs_model_dir);
+      h.htp_runtime =
+        std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);
+#endif
+    }
+    const bool htp_model = input_name_upper == "GEMMA4-26B-A4B-HTP";
+    const bool htp_profile =
+      nntr_cfg.value("gemma4_execution_profile", std::string()) == "htp_fused";
+    if (htp_model || htp_profile) {
+#ifndef ENABLE_HEXKL
+      throw std::invalid_argument("Gemma4 HTP requires an HTP build");
+#else
+      if (!htp_model || !htp_profile || compute != CAUSAL_LM_BACKEND_NPU ||
+          quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
+          nntr_cfg.value("gemma4_weight_format", std::string()) !=
+            "htp_fused_v1" ||
+          nntr_cfg.value("moe_engine", std::string()) != "htp" ||
+          nntr_cfg.value("attention_engine", std::string()) != "htp" ||
+          nntr_cfg.value("attn_proj_engine", std::string()) != "htp" ||
+          nntr_cfg.value("dense_ffn_engine", std::string()) != "htp")
+        throw std::invalid_argument(
+          "Gemma4 HTP requires the validated NPU/W4A32 preset");
+      if (cfg.value("architectures", std::vector<std::string>{}) !=
+            std::vector<std::string>{"Gemma4ForCausalLM"} ||
+          cfg.value("hidden_size", 0) != 2816 ||
+          cfg.value("num_hidden_layers", 0) != 30 ||
+          cfg.value("num_experts", 0) != 128 ||
+          !((nntr_cfg.value("moe_layer_dtype", std::string()) == "QS2CX_WH" &&
+             nntr_cfg.value("fc_layer_dtype", std::string()) == "QS4CX" &&
+             nntr_cfg.value("lmhead_dtype", std::string()) == "Q4_0") ||
+            (nntr_cfg.value("moe_layer_dtype", std::string()) == "TL2CX_WH" &&
+             nntr_cfg.value("fc_layer_dtype", std::string()) ==
+               "QS4CX_WH_AFFINE" &&
+             nntr_cfg.value("lmhead_dtype", std::string()) ==
+               "QS4CX_WH_AFFINE" &&
+             nntr_cfg.value("lmhead_engine", std::string()) == "htp")) ||
+          nntr_cfg.value("embedding_dtype", std::string()) != "Q4_0" ||
+          nntr_cfg.value("use_kvcache", false) ||
+          nntr_cfg.value("save_kvcache", false))
+        throw std::invalid_argument(
+          "Unsupported Gemma4 HTP pack or KV snapshot option");
+      fix_paths(nntr_cfg, abs_model_dir);
+      h.htp_runtime =
+        std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);
+#endif
     }
 
     // Load chat template from model directory if available.
@@ -1380,11 +1482,17 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     ensure_qnn_backend_ext_config(base_dir);
 #endif
 
+    causallm::Transformer *model_to_load = m.get();
+    {
+      std::lock_guard<std::mutex> life_lock(h.lifetime_mtx);
+      h.models.push_back(std::move(m));
+    }
     LOGD("[DEBUG] load_into_handle: Calling model->initialize()...");
-    if (native_lib_dir != nullptr && strlen(native_lib_dir) > 0) {
+    if (!htp_model && !lfm2_htp_model && native_lib_dir != nullptr &&
+        strlen(native_lib_dir) > 0) {
       setenv("ADSP_LIBRARY_PATH", native_lib_dir, 1);
     }
-    m->initialize();
+    model_to_load->initialize();
     LOGD("[DEBUG] load_into_handle: model->initialize() done");
 
     LOGD("[DEBUG] load_into_handle: Calling model->load_weight()...");
@@ -1393,9 +1501,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     // weight file relative to the model directory, so hand them the directory
     // instead.
     if (architecture == "Lfm2VLVJepa21BModel") {
-      m->load_weight(abs_model_dir);
+      model_to_load->load_weight(abs_model_dir);
     } else {
-      m->load_weight(weight_file);
+      model_to_load->load_weight(weight_file);
     }
     LOGD("[DEBUG] load_into_handle: model->load_weight() done");
 
@@ -1403,7 +1511,6 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       finish_init - start_init);
 
-    h.models.push_back(std::move(m));
     h.architectures.push_back(architecture);
     h.model_dirs.push_back(abs_model_dir);
     h.initialization_duration_ms.push_back(
@@ -1437,6 +1544,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                         : nullptr;
     LOGE("[DEBUG] load_into_handle: unknown exception, type=%s",
          demangled ? demangled : raw);
+    g_last_model_load_error = demangled ? demangled : raw;
     std::free(demangled);
 
     // Also try once more via rethrow — in case std::exception RTTI does
@@ -1445,11 +1553,17 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     try {
       throw;
     } catch (const std::exception &e) {
+      g_last_model_load_error = e.what();
       LOGE("[DEBUG] load_into_handle: rethrown std::exception what()=%s",
            e.what());
     } catch (...) {
       LOGE("[DEBUG] load_into_handle: rethrown still non-std");
     }
+    h.clearModels();
+    h.initialized = false;
+    h.architectures.clear();
+    h.model_dirs.clear();
+    h.initialization_duration_ms.clear();
     return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
   }
   LOGD("[DEBUG] load_into_handle: END (returning CAUSAL_LM_ERROR_NONE)");
@@ -1646,11 +1760,10 @@ convertMessages(const CausalLMChatMessage *messages, size_t num_messages) {
 static std::string apply_chat_template_messages(
   const std::string &architecture, const std::vector<ChatMessage> &messages,
   bool add_generation_prompt, const std::string &model_dir = "") {
-  // If g_chat_template is not loaded but a model_dir is provided,
-  // try loading tokenizer_config.json from that directory at run time.
+  // Load an external template only when the pack actually provides one.
+  // A tokenizer_config.json without chat_template uses the built-in format.
   if (!g_chat_template && !model_dir.empty()) {
-    std::string tc_path = model_dir + "/tokenizer_config.json";
-    if (check_file_exists(tc_path)) {
+    if (causallm::ChatTemplate::Exists(model_dir)) {
       try {
         g_chat_template = causallm::ChatTemplate::Load(model_dir);
         if (g_chat_template) {
@@ -1666,8 +1779,8 @@ static std::string apply_chat_template_messages(
              model_dir.c_str(), e.what());
       }
     } else {
-      LOGE("[Warning] tokenizer_config.json not found in %s",
-           model_dir.c_str());
+      LOGD("No external chat template in %s; using the built-in %s format",
+           model_dir.c_str(), architecture.c_str());
     }
   }
 
@@ -1974,9 +2087,13 @@ ErrorCode loadModelHandleByName(BackendType compute, const char *model_id,
                                 const char *native_lib_dir,
                                 const char *model_base_path,
                                 CausalLmHandle *out_handle) {
+  g_last_model_load_error = "Invalid model id, backend, or load parameters";
   if (out_handle == nullptr || model_id == nullptr)
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
 
+  *out_handle = nullptr;
+  if (compute < CAUSAL_LM_BACKEND_CPU || compute > CAUSAL_LM_BACKEND_NPU)
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   register_models(); // ensure factory + public descriptors registered
 
   auto d_opt = find_descriptor_by_id(model_id);
@@ -2003,12 +2120,19 @@ ErrorCode loadModelHandleByName(BackendType compute, const char *model_id,
   ErrorCode ec = load_into_handle(*h, compute, d.config_name, quant_type,
                                   native_lib_dir, model_base_path);
   if (ec != CAUSAL_LM_ERROR_NONE) {
+    if (g_last_model_load_error.empty())
+      g_last_model_load_error =
+        "Model configuration or weights could not be loaded";
     delete h;
     *out_handle = nullptr;
     return ec;
   }
   *out_handle = h;
   return CAUSAL_LM_ERROR_NONE;
+}
+
+const char *getLastModelLoadError(void) {
+  return g_last_model_load_error.c_str();
 }
 
 ErrorCode configureSpeculativeDecoding(CausalLmHandle h, bool use_sd) {
@@ -2333,7 +2457,7 @@ ErrorCode unloadModelHandle(CausalLmHandle handle) {
     return CAUSAL_LM_ERROR_NONE;
   }
   std::lock_guard<std::mutex> lock(handle->mtx);
-  handle->models.clear();
+  handle->clearModels();
   handle->architectures.clear();
   handle->model_dirs.clear();
   handle->initialization_duration_ms.clear();
@@ -2356,7 +2480,7 @@ ErrorCode destroyModelHandle(CausalLmHandle handle) {
   // freed memory after this point — documented as "valid until destroy".
   {
     std::lock_guard<std::mutex> lock(handle->mtx);
-    handle->models.clear();
+    handle->clearModels();
     handle->architectures.clear();
     handle->model_dirs.clear();
     handle->initialization_duration_ms.clear();
@@ -2377,20 +2501,9 @@ ErrorCode cancelModelHandle(CausalLmHandle handle) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
-  // NOTE: We intentionally do NOT take the mutex here to avoid blocking
-  // when run() is holding the lock. The requestStop() method is thread-safe
-  // (uses atomic<bool>), and the models vector is not modified during run()
-  // (only during load/unload which do take the mutex). This allows immediate
-  // cancellation from any thread (e.g., UI cancel button handler).
-  LOGD("[DEBUG] cancelModelHandle: checking state without mutex, "
-       "initialized=%d, models.size=%zu",
-       handle->initialized, handle->models.size());
-
-  if (!handle->initialized || handle->models.empty()) {
-    LOGE(
-      "[DEBUG] cancelModelHandle: not initialized, returning NOT_INITIALIZED");
+  std::lock_guard<std::mutex> life_lock(handle->lifetime_mtx);
+  if (handle->models.empty())
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-  }
 
   // Set stop flag on all models (primarily affects models[0] for LLM)
   for (size_t i = 0; i < handle->models.size(); ++i) {

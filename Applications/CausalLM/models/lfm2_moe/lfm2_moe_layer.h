@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Jungwon-Lee <jungone.lee@samsung.com>
+ *
+ * @file   lfm2_moe_layer.h
+ * @date   06 July 2026
+ * @brief  Mixture-of-Experts layer for the LFM2-8B-A1B (lfm2_moe) model.
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Jungwon-Lee <jungone.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @note   Adapted from qwen_moe_layer. Differences from the Qwen3-MoE router:
+ *         - router scores use sigmoid (not softmax);
+ *         - a per-expert bias is added only for top-k selection while the
+ *           routing weights are gathered from the bias-free sigmoid scores;
+ *         - the selected weights are normalised (norm_topk_prob) and scaled by
+ *           routed_scaling_factor.
+ *         It does not support shared experts. Inference only (no backwarding).
+ */
+
+#ifndef __LFM2_MOE_LAYER_H__
+#define __LFM2_MOE_LAYER_H__
+#ifdef __cplusplus
+
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
+#include <acti_func.h>
+#include <causallm_common_properties.h>
+#include <common_properties.h>
+#include <layer_impl.h>
+
+namespace nntrainer {
+class ComputeOps;
+}
+
+namespace causallm {
+
+/** Reset the HTP expert registry after workers and model layers are gone. */
+void resetLfm2HtpExpertPool();
+
+/** Start first-pass native TL2 reads inside the prefill timer. Keeps the
+ * initial two resident layers and queues only full layers in existing slots.
+ * Returns the number queued, or zero when this is not a fresh eligible pool. */
+size_t beginLfm2HtpExpertPrefill(nntrainer::ComputeOps *ops);
+
+/** Mark an interrupted early kickoff as a previous pass. Its held batches
+ * remain owned until the existing layer-zero drain or backend teardown. */
+void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops);
+
+/**
+ * @class   Lfm2MoELayer
+ * @brief   Mixture-of-Experts layer for LFM2-MoE (sigmoid router + expert bias)
+ */
+class WIN_EXPORT Lfm2MoELayer : public nntrainer::LayerImpl {
+public:
+  /**
+   * @brief Constructor of the LFM2 Mixture-of-Experts layer
+   */
+  Lfm2MoELayer();
+
+  /**
+   * @brief Destructor of the LFM2 Mixture-of-Experts layer
+   */
+  ~Lfm2MoELayer() = default;
+
+  /**
+   * @brief Move constructor.
+   * @param[in] rhs Lfm2MoELayer &&
+   */
+  Lfm2MoELayer(Lfm2MoELayer &&rhs) noexcept = default;
+
+  /**
+   * @brief Move assignment operator.
+   * @param[in] rhs Lfm2MoELayer to be moved.
+   */
+  Lfm2MoELayer &operator=(Lfm2MoELayer &&rhs) = default;
+
+  /**
+   * @copydoc Layer::finalize(InitLayerContext &context)
+   */
+  void finalize(nntrainer::InitLayerContext &context) override;
+
+  /**
+   * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
+   */
+  void forwarding(nntrainer::RunLayerContext &context, bool training) override;
+
+  /**
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned)
+   */
+  void incremental_forwarding(nntrainer::RunLayerContext &context,
+                              unsigned int from, unsigned int to,
+                              bool training) override;
+
+  /**
+   * @copydoc Layer::calcDerivative(RunLayerContext &context)
+   */
+  void calcDerivative(nntrainer::RunLayerContext &context) override;
+
+  /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   */
+  void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
+   * @copydoc Layer::setProperty(const std::vector<std::string> &values)
+   */
+  void setProperty(const std::vector<std::string> &values) override;
+
+  /**
+   * @copydoc Layer::exportTo(Exporter &exporter, const ml::train::ExportMethods
+   * &methods)
+   */
+  void exportTo(nntrainer::Exporter &exporter,
+                const ml::train::ExportMethods &method) const override;
+
+  /**
+   * @copydoc Layer::save(std::ofstream &file, RunLayerContext &run_context,
+   * bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+   * TensorDim::DataType dtype, ml::train::ISA target_isa)
+   * @note Overridden so the router gate and expert bias are never quantized:
+   *       the generic default only special-cases height==1 (bias-like)
+   *       tensors, but the router gate is [hidden, num_experts] with
+   *       num_experts possibly divisible by 32 (e.g. 32 for LFM2-8B-A1B),
+   *       which would otherwise be silently Q4_0-quantized on save and
+   *       corrupt the file layout for every tensor written after it.
+   */
+  void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
+
+  /**
+   * @copydoc Layer::getType()
+   */
+  const std::string getType() const override { return Lfm2MoELayer::type; };
+
+  /**
+   * @brief Layer::supportBackwarding()
+   */
+  bool supportBackwarding() const override { return false; }
+
+  /**
+   * @brief [doc 52] Brings this layer's virtual experts into the shared
+   *        resident pool at load, in expert order, until the pool is full.
+   *        Called by Transformer::repack_weight after every weight is read
+   *        so the first prefill pays no arena mapping; a no-op when the
+   *        experts are not virtual. Goes through the same LRU the forward
+   *        uses, so what is resident and what the LRU believes agree.
+   * @return true when every expert of this layer is resident afterwards
+   *         (always, for non-virtual experts): what the load-time warm-up
+   *         call needs of the layer it runs on.
+   */
+  bool preloadExperts(nntrainer::RunLayerContext &context);
+
+  static constexpr const char *type = "lfm2_moe"; /**< type of the layer */
+
+private:
+  bool router_q4_ = false;
+  unsigned int num_experts;      /**< number of experts */
+  unsigned int topk;             /**< number of experts per token, i.e., topk */
+  nntrainer::ActiFunc acti_func; /**< activation function for the expert */
+  std::tuple<props::NumExperts, props::NumExpertsPerToken,
+             nntrainer::props::Unit, props::MoEActivation, props::RouterType,
+             props::CacheExperts, props::InNorm, props::RouterNorm,
+             props::OutNorm, props::OutAdd, nntrainer::props::Epsilon,
+             props::OutToHost>
+    moe_props;
+  /** The block's norms folded into this layer (doc 57 section 5 step 4):
+   *  in_norm norms the input for the experts, router_norm norms it again
+   *  for the router, out_norm norms the output; the gammas are weights in
+   *  the file's order (in, router, ..., out). The output norm rides the
+   *  accelerator call at prefill and runs on the CPU otherwise. */
+  bool in_norm = false, router_norm = false, out_norm = false;
+  unsigned int in_gamma_idx = 0, router_gamma_idx = 0, out_gamma_idx = 0;
+  /** out_add (doc 57 section 9.30): the post-FFN epilogue's gamma and the
+   *  block scalar, and whether the epilogue is on. */
+  unsigned int add_gamma_idx = 0, add_scale_idx = 0;
+  bool out_add = false;
+  bool out_to_host = true; /**< props::OutToHost */
+  /** @brief out = scalar * (raw + rmsnorm(out + x2) * gamma) on the CPU,
+   *  @a scratch a tensor of out's shape. */
+  void addEpilogue(nntrainer::RunLayerContext &context,
+                   const nntrainer::Tensor &raw, const nntrainer::Tensor &x2,
+                   nntrainer::Tensor &out, nntrainer::Tensor &scratch,
+                   float eps);
+  unsigned int experts_in_idx = 0, router_in_idx = 0; /**< the normed rows */
+  /** props::RouterType "softmax_scale": Gemma-4 routing, and the layer's
+   *  optional second input is what the router reads (Gemma-4 norms the
+   *  residual differently for the router and for the experts). */
+  bool softmax_router;
+  /** props::MoEActivation tanh_gelu (Gemma-4) rather than swish (LFM2):
+   *  the deterministic GeGLU on both the host and the DSP (doc 55). */
+  bool gelu_act;
+
+  // weight indices
+  std::vector<unsigned int> expert_gate_up_proj_indices;
+  std::vector<unsigned int> expert_down_proj_indices;
+  unsigned int gate_idx;
+  unsigned int expert_bias_idx;
+
+  /** [doc 52] Expert weights left virtual (never read by the loader) and
+   *  streamed from the model file into accelerator-owned slots under an
+   *  LRU shared by every MoE layer: set when the layer runs on an
+   *  accelerator engine and NNTR_MOE_CACHE_EXPERTS is in the environment.
+   *  cache_per_layer is that variable's value, this layer's share of the
+   *  pool. Unset, nothing about the resident path changes. */
+  bool experts_virtual;
+  unsigned int cache_per_layer;
+  /** [doc 52 section 10.10] This layer's row in the table of virtual
+   *  experts preloadExperts builds in layer order, so a prefill call can
+   *  read the next layer's experts while it runs; -1 until preloaded. */
+  int expert_layer_slot;
+  /** Ordinal of this MoE layer in finalize order, the layer id written to
+   *  NNTR_MOE_TRACE. */
+  unsigned int trace_layer;
+
+  // intermediate tensor indices
+  unsigned int router_logits_idx;
+  unsigned int decode_expert_output_idx;
+  unsigned int decode_gate_up_output_idx;
+  unsigned int decode_activation_output_idx;
+
+  /** Reusable backing tensors shared by all active experts in one pass. */
+  struct ExpertWorkspace {
+    nntrainer::Tensor *token_input;
+    nntrainer::Tensor *expert_output;
+    nntrainer::Tensor *gate_up_output;
+    nntrainer::Tensor *activation_output;
+  };
+
+  /** @brief act(gate)*up for n elements into dst: swiglu_det or
+   *  geglu_det_one by gelu_act. */
+  void glu(unsigned int n, float *dst, const float *gate,
+           const float *up) const;
+
+  /**
+   * @brief Build the per-expert token assignments for LFM2 routing.
+   * @param router_logits Raw router logits tensor [total_tokens, 1, 1, E]
+   * @param expert_bias Per-expert bias (or, for softmax_scale, scale)
+   *        tensor [1, 1, 1, E]
+   * @param total_tokens number of tokens routed
+   * @param[out] expert_assignments per-expert list of (token index, weight)
+   * @param[out] extra_top_k when non-null, every token's top-(k + 5)
+   *             expert ids in rank order, appended token by token: the
+   *             recency hint the expert LRU refreshes from (doc 52), the
+   *             same rule Lfm2CachedSlimMoELayer applies. The routing
+   *             itself is unchanged by asking for it.
+   */
+  void buildExpertAssignments(
+    const nntrainer::Tensor &router_logits,
+    const nntrainer::Tensor &expert_bias, unsigned int total_tokens,
+    std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments,
+    std::vector<int> *extra_top_k = nullptr);
+
+  /**
+   * @brief Run one expert as a token batch and stream its compact output
+   * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])
+   * @param output Output tensor to accumulate results
+   * @param token_assignments Vector of (token_index, weight) pairs for this
+   * expert
+   * @param gate_up_proj Fused gate and up projection weight tensor
+   * @param down_proj Down projection weight tensor
+   * @param hidden_size Hidden dimension size
+   * @param workspace Reusable expert input, output, and intermediate storage
+   */
+  inline void compute_expert_forward(
+    const nntrainer::Tensor &input, nntrainer::Tensor &output,
+    const std::vector<std::pair<unsigned, float>> &token_assignments,
+    const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
+
+  /**
+   * @brief Compute weighted expert output in assignment order
+   * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])
+   * @param expert_output Compact expert output in assignment order
+   * @param token_assignments Vector of (token_index, weight) pairs for this
+   * expert
+   * @param gate_up_proj Fused gate and up projection weight tensor
+   * @param down_proj Down projection weight tensor
+   * @param hidden_size Hidden dimension size
+   * @param workspace Reusable expert input, output, and intermediate storage
+   */
+  inline void compute_expert_forward_no_critical(
+    const nntrainer::Tensor &input, nntrainer::Tensor &expert_output,
+    const std::vector<std::pair<unsigned, float>> &token_assignments,
+    const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
+
+  /**
+   * @brief Decode (single-token) fast path: every expert in
+   * @a selected_experts has exactly one (token 0, weight) assignment here,
+   * so they all read the SAME activation for gate_up. Groups that into one
+   * Tensor::dot(vector, vector) call instead of one dot() per expert --
+   * a no-op reshuffle on CPU (its fallback for that call is the same
+   * per-weight loop this replaces) and, on HTP, the one thing that lets the
+   * DSP kernel prefetch the next expert's weight while the current one
+   * computes instead of a separate FastRPC round trip per expert.
+   * @param context Layer context (for expert weight lookup)
+   * @param input Input tensor (reshaped to [1, 1, 1, hidden_size])
+   * @param output Output tensor to accumulate results into
+   * @param selected_experts Expert ids with a non-empty assignment (>= 2)
+   * @param expert_assignments Full per-expert assignment table (for the
+   * per-expert routing weight)
+   * @param hidden_size Hidden dimension size
+   * @param workspace Reusable expert output/activation storage (reused per
+   * expert, sequentially, matching compute_expert_forward)
+   */
+  void computeGroupedDecodeExperts(
+    nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+    nntrainer::Tensor &output,
+    const std::vector<unsigned int> &selected_experts,
+    const std::vector<std::vector<std::pair<unsigned, float>>>
+      &expert_assignments,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
+};
+} // namespace causallm
+
+#endif /* __cplusplus */
+#endif /* __LFM2_MOE_LAYER_H__ */

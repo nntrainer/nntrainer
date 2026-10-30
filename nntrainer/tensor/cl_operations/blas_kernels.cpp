@@ -1562,9 +1562,15 @@ static inline unsigned int v8c_wrow_texels(unsigned int K) {
 void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                       cl_mem scale_wgt, cl_mem row_sum_act, cl_mem zp_act,
                       cl_mem row_sum_w_int4, cl_mem output_fp16, unsigned int M,
-                      unsigned int N, unsigned int K, unsigned int M_valid) {
+                      unsigned int N, unsigned int K, unsigned int M_valid,
+                      cl_mem weight_zp) {
   if (M_valid == 0)
     M_valid = M; // legacy: store every (padded) row
+  // Per-channel asymmetric weight (see the header): the same kernels built
+  // with -DV8C_ASYM, which take weight_zp as one extra trailing argument. A
+  // symmetric weight keeps the unchanged program and argument list.
+  const bool asym = (weight_zp != nullptr);
+  static const std::string kAsymOpt = " -DV8C_ASYM";
   // [M=2..4 row-gap fix] The m1/coop GEMV kernels compute ONLY row 0. That is
   // correct for the M=1 decode (M_pad=4, M_valid=1) they were built for, but
   // a REAL 2-4-row call must compute every valid row: a short (e.g. 5-token)
@@ -1635,6 +1641,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     return mf && mf[0] == '1';
   }();
   copts += v8c_env_copts;
+  if (asym)
+    copts += kAsymOpt;
   // ML Drift reaudit (decode, 2026-06-12): cooperative M=1 GEMV. The m1
   // kernels' total parallelism is only N/8 work-items (at N=2304 that is
   // ~4.5 waves device-wide) = latency-bound at 12-22 GB/s effective, while
@@ -1701,7 +1709,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
           ck->SetKernelArguments(a++, &output_fp16, sizeof(cl_mem)) &&
           ck->SetKernelArguments(a++, &Ni, sizeof(int)) &&
           ck->SetKernelArguments(a++, &Ki, sizeof(int)) &&
-          ck->SetKernelArguments(a++, &Ww, sizeof(int));
+          ck->SetKernelArguments(a++, &Ww, sizeof(int)) &&
+          (!asym || ck->SetKernelArguments(a++, &weight_zp, sizeof(cl_mem)));
         if (ok) {
           const size_t wg = kl16 ? 128 : 64;
           std::array<size_t, 3> gws = {(size_t)(N / 8) * wg, 1, 1};
@@ -1842,8 +1851,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     char xmx_co[176];
     snprintf(
       xmx_co, sizeof(xmx_co),
-      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -DMT=%d -DNT=%d -DSG_M=%d",
-      xmx_mt, xmx_nt, xmx_sgm);
+      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -DMT=%d -DNT=%d -DSG_M=%d%s",
+      xmx_mt, xmx_nt, xmx_sgm, asym ? kAsymOpt.c_str() : "");
     ClContext::SharedPtrClKernel kx = blas_cc->registerClKernel(
       int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", std::string(xmx_co));
     static bool xmx_reg_logged = false;
@@ -1873,7 +1882,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
         kx->SetKernelArguments(a++, &Ki, sizeof(int)) &&
         kx->SetKernelArguments(a++, &Wa, sizeof(int)) &&
         kx->SetKernelArguments(a++, &Ww, sizeof(int)) &&
-        kx->SetKernelArguments(a++, &Mv, sizeof(int));
+        kx->SetKernelArguments(a++, &Mv, sizeof(int)) &&
+        (!asym || kx->SetKernelArguments(a++, &weight_zp, sizeof(cl_mem)));
       if (ok) {
         const size_t mpwg = (size_t)xmx_mt * 8 * xmx_sgm; // rows per workgroup
         const size_t Mpad = (((size_t)M + mpwg - 1) / mpwg) * mpwg;
@@ -1932,6 +1942,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     if (!kp->SetKernelArguments(arg++, &Mv, sizeof(int)))
       throw std::runtime_error("v8c gemm arg (M_valid)");
   }
+  if (asym && !kp->SetKernelArguments(arg++, &weight_zp, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg (weight_zp)");
 
   // V8C_TM=4, V8C_TN=8 (defaults in the .cl). global = (N/TN, M/TM); kernel
   // requires M%4=0, N%8=0, K%32=0. The historic 4×16 LWS is only valid when
@@ -4030,16 +4042,30 @@ static constexpr int ARGMAX_GROUPS = 128;
 // unpack.
 static const std::string lmhead_int4_v8c_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// -DLMH_ASYM (per-channel asymmetric weight with integer zero point wzp[n],
+// built only when one is bound): w = scale * (nibble - wzp), so the nibble is
+// decoded against the row's own zero point instead of the constant 8 -- the
+// same instruction count, no row-sum pass. The default build is the
+// unchanged source.
 __kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbles
                                    __global const half *x,      // [K] fp16 act
                                    __global const float *scale, // [N] fp32
                                    __global half *logits,       // [N]
-                                   const int N, const int K) {
+                                   const int N, const int K
+#ifdef LMH_ASYM
+                                   , __global const int *wzp    // [N] int
+#endif
+                                   ) {
   const int row = get_group_id(0);
   const int t = get_local_id(0); // 0..63
   const int kblocks = K >> 5;    // K/32
   __global const uchar *wr = W + (size_t)row * (size_t)(K >> 1);
   float sum = 0.0f;
+#ifdef LMH_ASYM
+  const int zr = wzp[row];
+#else
+  const int zr = 8;
+#endif
   for (int kb = t; kb < kblocks; kb += 64) {
     __global const uchar *blk = wr + (kb << 4); // 16 bytes
     __global const half *xb = x + (kb << 5);    // K base for this block
@@ -4053,16 +4079,33 @@ __kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbl
       const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
       const float8 a = convert_float8(vload8(0, xb + (c << 3)));
       sum += dot(a.lo, lo) + dot(a.hi, hi);
+#ifdef LMH_ASYM
+      xs += dot(a.lo, (float4)(1.0f)) + dot(a.hi, (float4)(1.0f));
+#endif
     }
   }
   __local float red[64];
   red[t] = sum;
+#ifdef LMH_ASYM
+  __local float xred[64];
+  xred[t] = xs;
+#endif
   barrier(CLK_LOCAL_MEM_FENCE);
   for (int off = 32; off > 0; off >>= 1) {
-    if (t < off) red[t] += red[t + off];
+    if (t < off) {
+      red[t] += red[t + off];
+#ifdef LMH_ASYM
+      xred[t] += xred[t + off];
+#endif
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
+#ifdef LMH_ASYM
+  if (t == 0)
+    logits[row] = (half)((red[0] + (float)(8 - wzp[row]) * xred[0]) * scale[row]);
+#else
   if (t == 0) logits[row] = (half)(red[0] * scale[row]);
+#endif
 }
 )CL";
 
@@ -4099,7 +4142,11 @@ __kernel void lmhead_int4_v8c_gemv_nr(__global const uchar *W,   // [N][K/2]
                                       __global const half *x,     // [K] fp16
                                       __global const float *scale,// [N] fp32
                                       __global half *logits,      // [N]
-                                      const int N, const int K) {
+                                      const int N, const int K
+#ifdef LMH_ASYM
+                                      , __global const int *wzp    // [N]
+#endif
+                                      ) {
   const int row0 = (int)get_group_id(0) * NR;
   const int t = get_local_id(0); // 0..63
   const int kblocks = K >> 5;
@@ -4107,21 +4154,54 @@ __kernel void lmhead_int4_v8c_gemv_nr(__global const uchar *W,   // [N][K/2]
   float sum[NR];
 #pragma unroll
   for (int r = 0; r < NR; ++r) sum[r] = 0.0f;
+#ifdef LMH_ASYM
+  // Each row is decoded against its own zero point instead of the constant 8.
+  // Held as float: nibble and zero point are both integers in [0, 15], so the
+  // float subtraction below is exact and gives the same value the int
+  // subtraction + convert did, without the per-element int -> float convert.
+  float zf[NR];
+#pragma unroll
+  for (int r = 0; r < NR; ++r) zf[r] = (float)wzp[row0 + r];
+#define LMH_ZERO zf[r]
+#else
+#define LMH_ZERO 8.0f
+#endif
   for (int kb = t; kb < kblocks; kb += 64) {
     __global const half *xb = x + (kb << 5);
+#ifdef LMH_LOAD16
+    // One 16 B load per row per kblock -- the kblock's 32 packed int4 weights
+    // -- instead of four 4 B loads. rb = K/2 and kb * 16 keep it aligned. It
+    // holds NR uint4 in registers across the c loop, which is what makes it a
+    // per-device choice (see lmhead_load16()).
+    uint4 wq[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+      wq[r] = vload4(0, (__global const uint *)(W + (size_t)(row0 + r) * rb +
+                                                (kb << 4)));
+#endif
     for (int c = 0; c < 4; ++c) {
       // The one load that NR rows now share.
       const float8 a = convert_float8(vload8(0, xb + (c << 3)));
 #pragma unroll
       for (int r = 0; r < NR; ++r) {
+#ifdef LMH_LOAD16
+        // Bytes 4c..4c+3 of the kblock, in memory order (little endian).
+        const uint wc = c == 0   ? wq[r].s0
+                        : c == 1 ? wq[r].s1
+                        : c == 2 ? wq[r].s2
+                                 : wq[r].s3;
+        const uchar4 by = as_uchar4(wc);
+#else
         __global const uchar *blk = W + (size_t)(row0 + r) * rb + (kb << 4);
         const uchar4 by = vload4(0, blk + (c << 2));
-        const float4 lo = convert_float4(convert_int4(by & (uchar4)0x0F) - 8);
-        const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
+#endif
+        const float4 lo = convert_float4(by & (uchar4)0x0F) - LMH_ZERO;
+        const float4 hi = convert_float4(by >> (uchar4)4) - LMH_ZERO;
         sum[r] += dot(a.lo, lo) + dot(a.hi, hi);
       }
     }
   }
+#undef LMH_ZERO
   __local float red[NR][64];
 #pragma unroll
   for (int r = 0; r < NR; ++r) red[r][t] = sum[r];
@@ -4154,12 +4234,34 @@ static int lmhead_nr_rows() {
   return nr;
 }
 
+// Weight loads of the N-tiled lm_head kernel: one 16 B load per row per
+// kblock (-DLMH_LOAD16) or four 4 B loads. Same bytes, same float operations
+// in the same order -- the fp16 logits are byte-identical either way, checked
+// over all 262144 rows of the K = 2816 lm_head. Speed is per device: the wide
+// load keeps NR uint4 live across the kblock, and on Intel Xe3 at NR = 8 that
+// costs ~30 % (4.25 -> 5.5 ms), so it is the default only where the narrow
+// loads are the measured cost (Adreno). NNTR_LMHEAD_LOAD16=0/1 overrides.
+static bool lmhead_load16() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_LMHEAD_LOAD16");
+    if (e != nullptr && (e[0] == '0' || e[0] == '1') && e[1] == 0)
+      return e[0] == '1';
+    constexpr uint32_t qualcomm_vendor_id = 0x5143; // Adreno
+    return ClContext::Global().caps().vendor_id == qualcomm_vendor_id;
+  }();
+  return on;
+}
+
 bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
                              void *act, bool act_is_clmem, void *logits_host,
-                             bool out_fp16, unsigned int N, unsigned int K) {
+                             bool out_fp16, unsigned int N, unsigned int K,
+                             void *weight_zp_clmem) {
   if (K == 0 || (K % 32) != 0 || N == 0 || !w_buf_clmem || !scale_buf_clmem ||
       !act || !logits_host)
     return false;
+  // The asymmetric variant is a separate build of the same source
+  // (-DLMH_ASYM), so the default program -- and its output -- is untouched.
+  const bool corr_on = (weight_zp_clmem != nullptr);
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
@@ -4177,11 +4279,13 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
   const int nr = lmhead_nr_rows();
   const bool tiled = nr > 1 && (N % (unsigned)nr) == 0;
   ClContext::SharedPtrClKernel kp =
-    tiled ? blas_cc->registerClKernel(lmhead_int4_v8c_nr_kernel,
-                                      "lmhead_int4_v8c_gemv_nr",
-                                      "-DNR=" + std::to_string(nr))
+    tiled ? blas_cc->registerClKernel(
+              lmhead_int4_v8c_nr_kernel, "lmhead_int4_v8c_gemv_nr",
+              "-DNR=" + std::to_string(nr) + (corr_on ? " -DLMH_ASYM" : "") +
+                (lmhead_load16() ? " -DLMH_LOAD16" : ""))
           : blas_cc->registerClKernel(lmhead_int4_v8c_kernel,
-                                      "lmhead_int4_v8c_gemv");
+                                      "lmhead_int4_v8c_gemv",
+                                      corr_on ? "-DLMH_ASYM" : "");
   if (!kp) {
     static int logged = 0;
     if (!logged++)
@@ -4223,6 +4327,10 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
        kp->SetKernelArguments(3, &out_buf, sizeof(cl_mem)) &&
        kp->SetKernelArguments(4, &Ni, sizeof(int)) &&
        kp->SetKernelArguments(5, &Ki, sizeof(int));
+  if (corr_on) {
+    cl_mem zp_buf = static_cast<cl_mem>(weight_zp_clmem);
+    ok = ok && kp->SetKernelArguments(6, &zp_buf, sizeof(cl_mem));
+  }
   if (!ok)
     return false;
 

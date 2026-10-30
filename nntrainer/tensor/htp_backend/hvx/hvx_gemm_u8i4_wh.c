@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
+ * @file   hvx_gemm_u8i4_wh.c
+ * @date   16 Sep 2026
+ * @brief  HVX u8 x i4 matmul over HMX-layout tiles, bit-identical to HMX
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * Why this exists: the HMX unit computes a 64-row block whatever the row
+ * count, so an expert's tail block of 10-20 rows costs the full 252 us
+ * (doc 47 section 14, O1). Those rows are cheap on HVX, and the HVX is
+ * idle for most of the HMX issue, so the tail rides on the worker pool's
+ * background lane and the HMX skips the block. What makes it exact rather
+ * than approximately equal is that both units do integer sums of the same
+ * products; what makes it cheap is the WH layout (see the header).
+ */
+
+#include "hvx_gemm_u8i4_wh.h"
+
+#include "hvx_expand_i2i4.h"
+
+#include <stddef.h>
+
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+
+#define WH_TILE_BYTES 512u
+#define AH_TILE_BYTES 2048u
+#define AH_ROW_BYTES 32u
+#define WH2_TILE_BYTES 256u
+
+void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles) {
+#if defined(__hexagon__)
+  /** Rtt: [47:32] stride, [31:16] width, [15:0] height -- 16 bits each. The
+     callers' strides are 112*512 and 64*512; the width is n_tiles*512, so
+     n_tiles must stay below 128 (128*512 = 65536 wraps the field to 0).
+     The MoE caller clamps its lead to 127 units for exactly that
+     (moe_m1_lead_units); this function validates nothing. */
+  const uint64_t cfg = ((uint64_t)(n_col * WH_TILE_BYTES) << 32) |
+                       ((uint64_t)(n_tiles * WH_TILE_BYTES) << 16) |
+                       (uint64_t)k_tiles;
+  Q6_l2fetch_AP((void *)(wh + (size_t)nt * WH_TILE_BYTES), cfg);
+#else
+  (void)wh;
+  (void)n_col;
+  (void)nt;
+  (void)n_tiles;
+  (void)k_tiles;
+#endif
+}
+
+/**
+ * @brief Row r0 of one column alone: gemm_rows4's acc0 with the three
+ *        other rows left out.
+ *
+ * At m = 1 gemm_rows4 issues 32 vrmpy per k-tile for 8 that are stored,
+ * and its four accumulators rotate, so no vrmpy finds its accumulator
+ * produced by the packet before it -- the V79 HVX PRM's accumulator stall
+ * (80-N2040-61 AB section 5.6). One chain is the non-stalling pattern that
+ * section shows, and it is also acc0's exact sequence: same kt, same g,
+ * low nibble then high, same final shift, so the int32 is gemm_rows4's row
+ * r0 by construction.
+ */
+static inline void gemm_row1(const uint8_t *act_ah, uint32_t r0,
+                             uint32_t k_tiles, const uint8_t *col,
+                             uint32_t stride, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc = Q6_V_vzero();
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint32_t *a0 =
+      (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES +
+                         r0 * AH_ROW_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector v = *(const HVX_UVector *)(tile + g * 128u);
+      const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(v, 4), mask);
+      const HVX_Vector whi = Q6_V_vand_VV(v, mask);
+      acc = Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g]), wlo);
+      acc =
+        Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g + 1u]), whi);
+    }
+  }
+  *(HVX_UVector *)(out + (size_t)r0 * 32u) = Q6_Vw_vasr_VwR(acc, 4);
+}
+
+static inline HVX_Vector gemv_quarter(HVX_Vector acc, const uint8_t *weights,
+                                      HVX_Vector a_lo, HVX_Vector a_hi,
+                                      HVX_Vector mask) {
+  const HVX_Vector v = *(const HVX_Vector *)weights;
+  const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(v, 4), mask);
+  const HVX_Vector whi = Q6_V_vand_VV(v, mask);
+  acc = Q6_Vw_vrmpyacc_VwVubVb(acc, a_lo, wlo);
+  return Q6_Vw_vrmpyacc_VwVubVb(acc, a_hi, whi);
+}
+
+void hvx_gemv_u8i4_wh_col_aligned_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                       const uint8_t *wh, uint32_t n_col,
+                                       uint32_t nt, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc = Q6_V_vzero();
+  const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * n_col * WH_TILE_BYTES;
+    const uint32_t *a = (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g)
+      acc = gemv_quarter(acc, tile + g * 128u, Q6_V_vsplat_R((int)a[2u * g]),
+                         Q6_V_vsplat_R((int)a[2u * g + 1u]), mask);
+  }
+  *(HVX_Vector *)out = Q6_Vw_vasr_VwR(acc, 4);
+}
+
+void hvx_gemv_u8i4_wh_3col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero();
+  const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * n_col * WH_TILE_BYTES;
+    const uint32_t *a = (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector a_lo = Q6_V_vsplat_R((int)a[2u * g]);
+      const HVX_Vector a_hi = Q6_V_vsplat_R((int)a[2u * g + 1u]);
+      acc0 = gemv_quarter(acc0, tile + g * 128u, a_lo, a_hi, mask);
+      acc1 =
+        gemv_quarter(acc1, tile + plane_bytes + g * 128u, a_lo, a_hi, mask);
+      acc2 = gemv_quarter(acc2, tile + 2u * plane_bytes + g * 128u, a_lo, a_hi,
+                          mask);
+    }
+  }
+  *(HVX_Vector *)out = Q6_Vw_vasr_VwR(acc0, 4);
+  *(HVX_Vector *)(out + 32u) = Q6_Vw_vasr_VwR(acc1, 4);
+  *(HVX_Vector *)(out + 64u) = Q6_Vw_vasr_VwR(acc2, 4);
+}
+
+void hvx_gemv_u8i4_wh_4col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero(),
+             acc3 = Q6_V_vzero();
+  const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * n_col * WH_TILE_BYTES;
+    const uint32_t *a = (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector a_lo = Q6_V_vsplat_R((int)a[2u * g]);
+      const HVX_Vector a_hi = Q6_V_vsplat_R((int)a[2u * g + 1u]);
+      acc0 = gemv_quarter(acc0, tile + g * 128u, a_lo, a_hi, mask);
+      acc1 =
+        gemv_quarter(acc1, tile + plane_bytes + g * 128u, a_lo, a_hi, mask);
+      acc2 = gemv_quarter(acc2, tile + 2u * plane_bytes + g * 128u, a_lo, a_hi,
+                          mask);
+      acc3 = gemv_quarter(acc3, tile + 3u * plane_bytes + g * 128u, a_lo, a_hi,
+                          mask);
+    }
+  }
+  *(HVX_Vector *)out = Q6_Vw_vasr_VwR(acc0, 4);
+  *(HVX_Vector *)(out + 32u) = Q6_Vw_vasr_VwR(acc1, 4);
+  *(HVX_Vector *)(out + 64u) = Q6_Vw_vasr_VwR(acc2, 4);
+  *(HVX_Vector *)(out + 96u) = Q6_Vw_vasr_VwR(acc3, 4);
+}
+
+/**
+ * @brief The four rows [r0, r0+4) of one column, all k-tiles, accumulators
+ *        in registers.
+ *
+ * Per weight quarter-tile vector v (rows 8g..8g+7 of the tile), the low
+ * nibbles are rows 8g..8g+3 and the high nibbles rows 8g+4..8g+7, each as a
+ * signed 4-bit value. Shifting the low nibble up by 4 and masking gives a
+ * signed byte equal to 16*w; masking the high nibble in place gives 16*w
+ * for the other four rows. The activation words that go with them are
+ * bytes 8g..8g+3 and 8g+4..8g+7 of the row, splatted. vrmpy's u8 x i8 dot
+ * over those four bytes into lane c is then 16 times the true partial sum
+ * for column c, exact in int32 (|sum| < 255*8*32*16*k_tiles), and one
+ * arithmetic shift at the end undoes the 16.
+ */
+static inline void gemm_rows4(const uint8_t *act_ah, uint32_t r0, uint32_t rows,
+                              uint32_t k_tiles, const uint8_t *col,
+                              uint32_t stride, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero(),
+             acc3 = Q6_V_vzero();
+  /** Rows past the count read row r0's bytes and are never stored: the
+     block's AH tile has 64 rows, so the reads are in range. */
+  const uint32_t r1 = (rows > 1u) ? r0 + 1u : r0;
+  const uint32_t r2 = (rows > 2u) ? r0 + 2u : r0;
+  const uint32_t r3 = (rows > 3u) ? r0 + 3u : r0;
+
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint8_t *arow = act_ah + (size_t)kt * AH_TILE_BYTES;
+    const uint32_t *a0 = (const uint32_t *)(arow + r0 * AH_ROW_BYTES);
+    const uint32_t *a1 = (const uint32_t *)(arow + r1 * AH_ROW_BYTES);
+    const uint32_t *a2 = (const uint32_t *)(arow + r2 * AH_ROW_BYTES);
+    const uint32_t *a3 = (const uint32_t *)(arow + r3 * AH_ROW_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector v = *(const HVX_UVector *)(tile + g * 128u);
+      const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(v, 4), mask);
+      const HVX_Vector whi = Q6_V_vand_VV(v, mask);
+      acc0 = Q6_Vw_vrmpyacc_VwVubVb(acc0, Q6_V_vsplat_R((int)a0[2u * g]), wlo);
+      acc0 =
+        Q6_Vw_vrmpyacc_VwVubVb(acc0, Q6_V_vsplat_R((int)a0[2u * g + 1u]), whi);
+      acc1 = Q6_Vw_vrmpyacc_VwVubVb(acc1, Q6_V_vsplat_R((int)a1[2u * g]), wlo);
+      acc1 =
+        Q6_Vw_vrmpyacc_VwVubVb(acc1, Q6_V_vsplat_R((int)a1[2u * g + 1u]), whi);
+      acc2 = Q6_Vw_vrmpyacc_VwVubVb(acc2, Q6_V_vsplat_R((int)a2[2u * g]), wlo);
+      acc2 =
+        Q6_Vw_vrmpyacc_VwVubVb(acc2, Q6_V_vsplat_R((int)a2[2u * g + 1u]), whi);
+      acc3 = Q6_Vw_vrmpyacc_VwVubVb(acc3, Q6_V_vsplat_R((int)a3[2u * g]), wlo);
+      acc3 =
+        Q6_Vw_vrmpyacc_VwVubVb(acc3, Q6_V_vsplat_R((int)a3[2u * g + 1u]), whi);
+    }
+  }
+  *(HVX_UVector *)(out + (size_t)r0 * 32u) = Q6_Vw_vasr_VwR(acc0, 4);
+  if (rows > 1u) {
+    *(HVX_UVector *)(out + (size_t)(r0 + 1u) * 32u) = Q6_Vw_vasr_VwR(acc1, 4);
+  }
+  if (rows > 2u) {
+    *(HVX_UVector *)(out + (size_t)(r0 + 2u) * 32u) = Q6_Vw_vasr_VwR(acc2, 4);
+  }
+  if (rows > 3u) {
+    *(HVX_UVector *)(out + (size_t)(r0 + 3u) * 32u) = Q6_Vw_vasr_VwR(acc3, 4);
+  }
+}
+
+void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, uint32_t rows1,
+                               int32_t *out) {
+  const uint32_t stride = n_col * WH_TILE_BYTES;
+  const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
+  if (m > HVX_GEMM_U8I4_MAX_ROWS) {
+    m = HVX_GEMM_U8I4_MAX_ROWS;
+  }
+  for (uint32_t r0 = 0; r0 < m; r0 += 4u) {
+    if (rows1 != 0u && m - r0 == 1u) {
+      gemm_row1(act_ah, r0, k_tiles, col, stride, out);
+    } else {
+      gemm_rows4(act_ah, r0, m - r0, k_tiles, col, stride, out);
+    }
+  }
+}
+
+void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, int32_t *out) {
+  hvx_gemm_u8i4_wh_prefetch(wh, n_col, nt, 1u, k_tiles);
+  hvx_gemm_u8i4_wh_col_nopf(act_ah, m, k_tiles, wh, n_col, nt, rows1, out);
+}
+
+/**
+ * @brief Accumulate one row from packed 2-bit WH codes.
+ *
+ * whPack2 deliberately places the codes for i4 byte ranges [0,127] and
+ * [128,255] in the low and high code nibbles of one source vector.  Thus
+ * two vlut32 results are exactly the two vectors the i4 GEMV used to load.
+ * The table remains a vector register through all k tiles.
+ */
+static inline void gemm_i2_row1(const uint8_t *act_ah, uint32_t r0,
+                                uint32_t k_tiles, const uint8_t *col,
+                                uint32_t stride, const HVX_Vector tab,
+                                int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  /** The code split takes the low nibble of every byte: a vlut32 index is
+     0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
+  const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
+  HVX_Vector acc = Q6_V_vzero();
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint32_t *a0 =
+      (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES +
+                         r0 * AH_ROW_BYTES);
+    for (uint32_t q = 0; q < 2u; ++q) {
+      const HVX_Vector codes = *(const HVX_UVector *)(tile + q * 128u);
+      const HVX_Vector lo = Q6_V_vand_VV(codes, m0f);
+      const HVX_Vector hi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(codes, 4), m0f);
+      const HVX_Vector w[2] = {Q6_Vb_vlut32_VbVbI(lo, tab, 0),
+                               Q6_Vb_vlut32_VbVbI(hi, tab, 0)};
+      for (uint32_t h = 0; h < 2u; ++h) {
+        const uint32_t g = 2u * q + h;
+        const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(w[h], 4), mask);
+        const HVX_Vector whi = Q6_V_vand_VV(w[h], mask);
+        acc = Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g]), wlo);
+        acc =
+          Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g + 1u]), whi);
+      }
+    }
+  }
+  *(HVX_UVector *)(out + (size_t)r0 * 32u) = Q6_Vw_vasr_VwR(acc, 4);
+}
+
+/** @brief Two arbitrary output columns for M=1, blocked in registers. */
+static inline void gemm_i2_row1_cols2(const uint8_t *act_ah, uint32_t k_tiles,
+                                      const uint8_t *col0, const uint8_t *col1,
+                                      uint32_t stride, const HVX_Vector tab,
+                                      int32_t *out0, int32_t *out1) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  /** The code split takes the low nibble of every byte: a vlut32 index is
+     0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
+  const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
+  HVX_Vector acc0 = Q6_V_vzero();
+  HVX_Vector acc1 = Q6_V_vzero();
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile0 = col0 + (size_t)kt * stride;
+    const uint8_t *tile1 = col1 + (size_t)kt * stride;
+    const uint32_t *a0 =
+      (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES);
+    for (uint32_t q = 0; q < 2u; ++q) {
+      const HVX_Vector codes0 = *(const HVX_UVector *)(tile0 + q * 128u);
+      const HVX_Vector codes1 = *(const HVX_UVector *)(tile1 + q * 128u);
+      const HVX_Vector lo0 = Q6_V_vand_VV(codes0, m0f);
+      const HVX_Vector hi0 = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(codes0, 4), m0f);
+      const HVX_Vector lo1 = Q6_V_vand_VV(codes1, m0f);
+      const HVX_Vector hi1 = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(codes1, 4), m0f);
+      const HVX_Vector w0[2] = {Q6_Vb_vlut32_VbVbI(lo0, tab, 0),
+                                Q6_Vb_vlut32_VbVbI(hi0, tab, 0)};
+      const HVX_Vector w1[2] = {Q6_Vb_vlut32_VbVbI(lo1, tab, 0),
+                                Q6_Vb_vlut32_VbVbI(hi1, tab, 0)};
+      for (uint32_t h = 0; h < 2u; ++h) {
+        const uint32_t g = 2u * q + h;
+        const HVX_Vector wlo0 = Q6_V_vand_VV(Q6_Vh_vasl_VhR(w0[h], 4), mask);
+        const HVX_Vector whi0 = Q6_V_vand_VV(w0[h], mask);
+        const HVX_Vector wlo1 = Q6_V_vand_VV(Q6_Vh_vasl_VhR(w1[h], 4), mask);
+        const HVX_Vector whi1 = Q6_V_vand_VV(w1[h], mask);
+        const HVX_Vector av0 = Q6_V_vsplat_R((int)a0[2u * g]);
+        const HVX_Vector av1 = Q6_V_vsplat_R((int)a0[2u * g + 1u]);
+        acc0 = Q6_Vw_vrmpyacc_VwVubVb(acc0, av0, wlo0);
+        acc1 = Q6_Vw_vrmpyacc_VwVubVb(acc1, av0, wlo1);
+        acc0 = Q6_Vw_vrmpyacc_VwVubVb(acc0, av1, whi0);
+        acc1 = Q6_Vw_vrmpyacc_VwVubVb(acc1, av1, whi1);
+      }
+    }
+  }
+  *(HVX_UVector *)out0 = Q6_Vw_vasr_VwR(acc0, 4);
+  *(HVX_UVector *)out1 = Q6_Vw_vasr_VwR(acc1, 4);
+}
+
+static inline void gemm_i2_rows4(const uint8_t *act_ah, uint32_t r0,
+                                 uint32_t rows, uint32_t k_tiles,
+                                 const uint8_t *col, uint32_t stride,
+                                 const HVX_Vector tab, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  /** The code split takes the low nibble of every byte: a vlut32 index is
+     0..15 (hvx_expand_i2i4.c's loop, the device-gated reading). */
+  const HVX_Vector m0f = Q6_V_vsplat_R((int)0x0F0F0F0Fu);
+  HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero(), acc2 = Q6_V_vzero(),
+             acc3 = Q6_V_vzero();
+  const uint32_t r1 = rows > 1u ? r0 + 1u : r0;
+  const uint32_t r2 = rows > 2u ? r0 + 2u : r0;
+  const uint32_t r3 = rows > 3u ? r0 + 3u : r0;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint8_t *arow = act_ah + (size_t)kt * AH_TILE_BYTES;
+    const uint32_t *a0 = (const uint32_t *)(arow + r0 * AH_ROW_BYTES);
+    const uint32_t *a1 = (const uint32_t *)(arow + r1 * AH_ROW_BYTES);
+    const uint32_t *a2 = (const uint32_t *)(arow + r2 * AH_ROW_BYTES);
+    const uint32_t *a3 = (const uint32_t *)(arow + r3 * AH_ROW_BYTES);
+    for (uint32_t q = 0; q < 2u; ++q) {
+      const HVX_Vector codes = *(const HVX_UVector *)(tile + q * 128u);
+      const HVX_Vector lo = Q6_V_vand_VV(codes, m0f);
+      const HVX_Vector hi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(codes, 4), m0f);
+      const HVX_Vector w[2] = {Q6_Vb_vlut32_VbVbI(lo, tab, 0),
+                               Q6_Vb_vlut32_VbVbI(hi, tab, 0)};
+      for (uint32_t h = 0; h < 2u; ++h) {
+        const uint32_t g = 2u * q + h;
+        const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(w[h], 4), mask);
+        const HVX_Vector whi = Q6_V_vand_VV(w[h], mask);
+#define I2_MAC(acc, a)                                                         \
+  do {                                                                         \
+    acc = Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)(a)[2u * g]), wlo);   \
+    acc =                                                                      \
+      Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)(a)[2u * g + 1u]), whi);  \
+  } while (0)
+        I2_MAC(acc0, a0);
+        I2_MAC(acc1, a1);
+        I2_MAC(acc2, a2);
+        I2_MAC(acc3, a3);
+#undef I2_MAC
+      }
+    }
+  }
+  *(HVX_UVector *)(out + (size_t)r0 * 32u) = Q6_Vw_vasr_VwR(acc0, 4);
+  if (rows > 1u)
+    *(HVX_UVector *)(out + (size_t)(r0 + 1u) * 32u) = Q6_Vw_vasr_VwR(acc1, 4);
+  if (rows > 2u)
+    *(HVX_UVector *)(out + (size_t)(r0 + 2u) * 32u) = Q6_Vw_vasr_VwR(acc2, 4);
+  if (rows > 3u)
+    *(HVX_UVector *)(out + (size_t)(r0 + 3u) * 32u) = Q6_Vw_vasr_VwR(acc3, 4);
+}
+
+void hvx_gemm_u8i2_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles) {
+#if defined(__hexagon__)
+  const uint64_t cfg = ((uint64_t)(n_col * WH2_TILE_BYTES) << 32) |
+                       ((uint64_t)(n_tiles * WH2_TILE_BYTES) << 16) |
+                       (uint64_t)k_tiles;
+  Q6_l2fetch_AP((void *)(wh + (size_t)nt * WH2_TILE_BYTES), cfg);
+#else
+  (void)wh;
+  (void)n_col;
+  (void)nt;
+  (void)n_tiles;
+  (void)k_tiles;
+#endif
+}
+
+void hvx_gemm_u8i2_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, uint32_t rows1,
+                               const uint8_t *table, int32_t *out) {
+  const uint32_t stride = n_col * WH2_TILE_BYTES;
+  const uint8_t *col = wh + (size_t)nt * WH2_TILE_BYTES;
+  const HVX_Vector tab = *(const HVX_UVector *)table;
+  if (m > HVX_GEMM_U8I4_MAX_ROWS)
+    m = HVX_GEMM_U8I4_MAX_ROWS;
+  for (uint32_t r0 = 0; r0 < m; r0 += 4u) {
+    if (rows1 != 0u && m - r0 == 1u)
+      gemm_i2_row1(act_ah, r0, k_tiles, col, stride, tab, out);
+    else
+      gemm_i2_rows4(act_ah, r0, m - r0, k_tiles, col, stride, tab, out);
+  }
+}
+
+void hvx_gemm_u8i2_wh_cols2_nopf(const uint8_t *act_ah, uint32_t m,
+                                 uint32_t k_tiles, const uint8_t *wh,
+                                 uint32_t n_col, uint32_t nt0, uint32_t nt1,
+                                 uint32_t rows1, const uint8_t *table,
+                                 int32_t *out0, int32_t *out1) {
+  if (m == 1u) {
+    const uint32_t stride = n_col * WH2_TILE_BYTES;
+    const HVX_Vector tab = *(const HVX_UVector *)table;
+    gemm_i2_row1_cols2(act_ah, k_tiles, wh + (size_t)nt0 * WH2_TILE_BYTES,
+                       wh + (size_t)nt1 * WH2_TILE_BYTES, stride, tab, out0,
+                       out1);
+    return;
+  }
+  hvx_gemm_u8i2_wh_col_nopf(act_ah, m, k_tiles, wh, n_col, nt0, rows1, table,
+                            out0);
+  hvx_gemm_u8i2_wh_col_nopf(act_ah, m, k_tiles, wh, n_col, nt1, rows1, table,
+                            out1);
+}
+
+void hvx_gemm_u8i2_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, const uint8_t *table, int32_t *out) {
+  hvx_gemm_u8i2_wh_prefetch(wh, n_col, nt, 1u, k_tiles);
+  hvx_gemm_u8i2_wh_col_nopf(act_ah, m, k_tiles, wh, n_col, nt, rows1, table,
+                            out);
+}

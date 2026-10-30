@@ -411,8 +411,11 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M,
                                std::vector<unsigned int> ldbs,
                                std::vector<float *> C,
                                std::vector<unsigned int> ldcs) {
-  throw std::runtime_error("nntrainer::__ggml_q4_0_8x8_q8_0_GEMM for "
-                           "multi-weights is not implemented yet");
+  // ponytail: one single-weight GEMM per weight (the activation is
+  // quantized once per weight); the mixed / bstp backends share it.
+  for (size_t i = 0; i < Ns.size(); ++i)
+    __ggml_q4_0_8x8_q8_0_GEMM(M, Ns[i], K, A, lda, Bs[i], ldbs[i], C[i],
+                              ldcs[i]);
 }
 
 void __ggml_q8_0_4x4_q8_0_GEMM(const unsigned int M, const unsigned int N,

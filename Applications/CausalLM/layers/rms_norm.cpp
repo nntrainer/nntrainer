@@ -13,9 +13,13 @@
 
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
+#include "htp_decode_hook.h"
 #include "rms_norm.h"
+#include "rms_norm_rows.h"
 
 namespace causallm {
 
@@ -89,6 +93,22 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       const auto &dim = in_step.getDim();
+      // [#130] one decode row: the HTP runs it when RMSNORM is resident
+      if (to - from == 1 && b_size == 1 &&
+          gamma.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+          htpDecodeRmsNorm(from, in_step.getData<float>(),
+                           out_step.getData<float>(), gamma.getData<float>(),
+                           dim.width(), epsilon))
+        continue;
+      // The same per-row reduction as the serial path, with gamma applied
+      // before the row leaves cache. Decode retains its existing hook above.
+      static const bool parallel_prefill = [] {
+        const char *value = std::getenv("NNTR_LFM2_PARALLEL_NORM");
+        return value && std::strcmp(value, "1") == 0;
+      }();
+      if (parallel_prefill && dim.width() == 2048 &&
+          parallelRmsNormRows(in_step, out_step, gamma, epsilon))
+        continue;
 #ifdef ENABLE_FP16
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(
         in_step.getData<float>(), out_step.getData<float>(), dim.height(),

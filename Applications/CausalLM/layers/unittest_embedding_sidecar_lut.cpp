@@ -540,3 +540,97 @@ TEST(CausalLmEmbeddingSidecarLut, nonSidecarForwardingPreservesNoOpBehavior) {
   EXPECT_FLOAT_EQ(run_context.getOutput(0).getData<float>()[0], -7.0f);
   EXPECT_FLOAT_EQ(run_context.getOutput(0).getData<float>()[1], -8.0f);
 }
+
+TEST(CausalLmEmbeddingSidecarLut, affineGroup32PreservesZeroPointsAndBf16) {
+  TempDir dir("nntrainer_embedding_affine32");
+  const auto manifest = dir.path() / "embedding.json";
+  writeBytes(dir.path() / "codes.u4", std::vector<uint8_t>(64, 0xf0));
+  writeF32(dir.path() / "scales.f32", {0.1f, 0.5f, 2.0f, 0.25f});
+  writeBytes(dir.path() / "zeros.u8", {3, 8, 0, 15});
+  writeText(manifest, R"({"datatype":"ufixed4", "size":64,
+    "lut-path":"codes.u4", "quant-type":"per-row-per-block-asymmetric",
+    "size-per-layer":32, "round-bf16":true,
+    "quant-param":{"scale-path":"scales.f32", "scale-shape":[2,2],
+                   "zero-point-path":"zeros.u8"}})");
+  auto lut = causallm::get_or_load_quant_lut(manifest.string(), 2, 64);
+  ASSERT_TRUE(lut->is_affine4);
+  std::vector<float> row(64);
+  causallm::decode_quant_lut_row_to_fp32(*lut, 0, 2.0f, row.data(), row.size());
+  EXPECT_FLOAT_EQ(row[0], -0.30078125f * 2);
+  EXPECT_FLOAT_EQ(row[1], 1.203125f * 2);
+  EXPECT_FLOAT_EQ(row[32], -8.0f);
+  EXPECT_FLOAT_EQ(row[33], 7.0f);
+
+  causallm::EmbeddingLayer layer;
+  layer.setProperty({"in_dim=2", "out_dim=64", "scale=2.0",
+                     "quantized_lut_path=" + manifest.string()});
+  nntrainer::InitLayerContext init_context(
+    {makeInputDim(nntrainer::TensorDim::DataType::FP32, 2)}, {true}, false,
+    "embedding_sidecar_lut", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+  auto *ids = inputs[0].getVariableRef().getData<float>();
+  ids[0] = 0;
+  ids[1] = 1;
+  auto run = makeRunContext(weights, inputs, outputs, tensors);
+  layer.forwarding(run, false);
+  auto *out = run.getOutput(0).getData<float>();
+  EXPECT_FLOAT_EQ(out[0], row[0]);
+  EXPECT_FLOAT_EQ(out[65], 60.0f);
+  EXPECT_FLOAT_EQ(out[96], -7.5f);
+  ids[0] = 1;
+  layer.incremental_forwarding(run, 2, 3, false);
+  EXPECT_FLOAT_EQ(out[1], 60.0f);
+  EXPECT_FLOAT_EQ(out[32], -7.5f);
+}
+
+TEST(CausalLmEmbeddingSidecarLut, affineGroup32RejectsInvalidQparams) {
+  TempDir dir("nntrainer_embedding_affine32_invalid");
+  writeBytes(dir.path() / "codes.u4", std::vector<uint8_t>(16, 0x80));
+  writeF32(dir.path() / "scales.f32", {1.0f});
+  writeBytes(dir.path() / "zeros.u8", {16});
+  const auto manifest = dir.path() / "embedding.json";
+  writeText(manifest, R"({"datatype":"ufixed4", "size":32,
+    "lut-path":"codes.u4", "quant-type":"per-row-per-block-asymmetric",
+    "size-per-layer":32, "quant-param":{"scale-path":"scales.f32",
+      "zero-point-path":"zeros.u8"}})");
+  EXPECT_THROW(causallm::get_or_load_quant_lut(manifest.string(), 1, 32),
+               std::invalid_argument);
+  writeBytes(dir.path() / "zeros.u8", {});
+  EXPECT_THROW(causallm::get_or_load_quant_lut(manifest.string(), 1, 32),
+               std::invalid_argument);
+  writeBytes(dir.path() / "zeros.u8", {8});
+  writeF32(dir.path() / "scales.f32", {-1.0f});
+  EXPECT_THROW(causallm::get_or_load_quant_lut(manifest.string(), 1, 32),
+               std::invalid_argument);
+}
+
+TEST(CausalLmEmbeddingSidecarLut, affineBf16ScaleOutputMatchesReference) {
+  TempDir dir("nntrainer_embedding_bf16_output");
+  const auto manifest = dir.path() / "embedding.json";
+  writeBytes(dir.path() / "codes.u4", std::vector<uint8_t>(16, 0xf0));
+  writeF32(dir.path() / "scales.f32", {0.1f});
+  writeBytes(dir.path() / "zeros.u8", {3});
+  writeText(manifest, R"({"datatype":"ufixed4", "size":32,
+    "lut-path":"codes.u4", "quant-type":"per-row-per-block-asymmetric",
+    "size-per-layer":32, "round-bf16":true, "bf16-scale-output":true,
+    "quant-param":{"scale-path":"scales.f32", "scale-shape":[1,1],
+                   "zero-point-path":"zeros.u8"}})");
+  auto lut = causallm::get_or_load_quant_lut(manifest.string(), 1, 32);
+  ASSERT_TRUE(lut->bf16_scale_output);
+  std::vector<float> row(32);
+  causallm::decode_quant_lut_row_to_fp32(*lut, 0, 53.065998f, row.data(),
+                                         row.size());
+  // PyTorch BF16: BF16(-0.3) * BF16(sqrt(2816)) and BF16(1.2) * 53.
+  EXPECT_FLOAT_EQ(row[0], -15.9375f);
+  EXPECT_FLOAT_EQ(row[1], 63.75f);
+  // A power-of-two scale retains the already restored BF16 weight exactly.
+  causallm::decode_quant_lut_row_to_fp32(*lut, 0, 2.0f, row.data(), row.size());
+  EXPECT_FLOAT_EQ(row[0], -0.6015625f);
+  EXPECT_FLOAT_EQ(row[1], 2.40625f);
+}

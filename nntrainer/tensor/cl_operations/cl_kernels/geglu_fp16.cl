@@ -15,3 +15,11 @@ __kernel void geglu_cl_fp16(__global const half *in1, __global const half *in2,
 
   out[i] = (half)(gelu * in2_val);
 }
+
+__kernel void geglu_erf_cl_fp16(__global const half *in1,
+                                __global const half *in2, __global half *out) {
+  const int i = get_global_id(0);
+  const float x = (float)in1[i];
+  const float gelu = 0.5f * x * (1.0f + erf(x * 0.7071067811865476f));
+  out[i] = (half)(gelu * (float)in2[i]);
+}

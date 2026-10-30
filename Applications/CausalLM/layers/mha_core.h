@@ -37,6 +37,7 @@
 #include <acti_func.h>
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <fused_llm_properties.h>
 #include <layer_impl.h>
 #include <limits.h>
 #include <util_simd.h>
@@ -119,12 +120,7 @@ public:
 /**
  * @brief RopeTheta
  */
-class RopeTheta : public nntrainer::Property<unsigned int> {
-public:
-  RopeTheta(unsigned int value = 500000) { set(value); };
-  static constexpr const char *key = "rope_theta"; /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
-};
+using nntrainer::props::RopeTheta;
 
 /**
  * @brief UseRope property (Gemma4/Gemma3n). Accepted but our mha_core derives
@@ -253,13 +249,31 @@ public:
  * - default
  * - yarn
  */
-class RopeScalingType : public nntrainer::Property<std::string> {
+using nntrainer::props::RopeScalingType;
+/**
+ * @brief Per kv-head int8 scales of the key cache, "s0,s1,..." (empty: off)
+ *
+ * When set, every key written to the cache (after RoPE) is fake-quantized
+ * per kv head to symmetric int8, x = clamp(round(x / s), -128, 127) * s, as
+ * for checkpoints trained with an int8 KV cache.
+ */
+class KCacheInt8Scales : public nntrainer::Property<std::string> {
 public:
-  RopeScalingType(std::string value = "default") { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_type";                    /**< unique key to access */
-  using prop_tag = nntrainer::str_prop_tag; /**< property type */
+  KCacheInt8Scales(const std::string &value = "") { set(value); };
+  static constexpr const char *key = "k_cache_int8_scales";
+  using prop_tag = nntrainer::str_prop_tag;
 };
+
+/**
+ * @brief Per kv-head int8 scales of the value cache, "s0,s1,..." (empty: off)
+ */
+class VCacheInt8Scales : public nntrainer::Property<std::string> {
+public:
+  VCacheInt8Scales(const std::string &value = "") { set(value); };
+  static constexpr const char *key = "v_cache_int8_scales";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
 /**
  * @brief RopeScalingFactor
  */
@@ -277,13 +291,7 @@ public:
  *        which gives rotary frequencies to only factor * head_dim / 2 of the
  *        head_dim / 2 pairs; the rest pass through unrotated.
  */
-class RopePartialRotaryFactor : public nntrainer::Property<float> {
-public:
-  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
-  static constexpr const char *key =
-    "rope_partial_rotary_factor";             /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::RopePartialRotaryFactor;
 
 /**
  * @brief RopeScalingMaxPositionEmbeddings
@@ -513,8 +521,30 @@ private:
     props::RopePartialRotaryFactor, props::RopeScalingMaxPositionEmbeddings,
     props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention,
     props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope,
-    props::KvWindowRing>
+    props::KvWindowRing, props::KCacheInt8Scales, props::VCacheInt8Scales>
     mha_core_props; /**< mha_core layer properties */
+
+  std::vector<float> k_cache_int8_scales; /**< per kv head, empty: off */
+  std::vector<float> v_cache_int8_scales; /**< per kv head, empty: off */
+  void *k_snap_cl = nullptr; /**< device copy of k_cache_int8_scales */
+  void *v_snap_cl = nullptr; /**< device copy of v_cache_int8_scales */
+
+  /**
+   * @brief The device copy of the key / value int8 scales (uploaded on first
+   *        use), or nullptr when this layer has none or there is no OpenCL
+   *        device. The device RoPE / narrowing kernels take it to snap the
+   *        cache rows they write.
+   */
+  void *k_snap_device();
+  void *v_snap_device();
+
+  /**
+   * @brief Host store of FP16 value rows into their cache slice: a plain copy,
+   *        or for an int8-KV model the snapping store (the CPU snap kernel)
+   * @param from sequence position of the first row
+   */
+  void storeValueRows(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                      unsigned int from);
 
   /** softmax activation operation */
   nntrainer::ActiFunc sm;
@@ -857,9 +887,11 @@ private:
    * @param[in] apply_rope true to apply rotary embedding, false to only store
    *                       the tensor into the cache dtype
    */
-  void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
-                                  unsigned int dim, unsigned int from,
-                                  bool apply_rope = true);
+  void
+  apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                             unsigned int dim, unsigned int from,
+                             bool apply_rope = true,
+                             const std::vector<float> *snap_scales = nullptr);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

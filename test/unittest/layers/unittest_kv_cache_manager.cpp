@@ -10,7 +10,13 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
@@ -58,6 +64,299 @@ TEST_F(KVCacheManagerTest, allocate_invalid_params) {
   EXPECT_THROW(m.allocate(0, 1, 128, 4, 8), std::invalid_argument);
   EXPECT_THROW(m.allocate(4, 0, 128, 4, 8), std::invalid_argument);
   EXPECT_THROW(m.allocate(4, 1, 0, 4, 8), std::invalid_argument);
+  m.setActiveLayers({true});
+  EXPECT_THROW(m.allocate(4, 1, 128, 4, 8), std::invalid_argument);
+}
+
+TEST(KVCacheManagerHybrid, inactive_layers_allocate_no_storage) {
+  unsigned allocations = 0, releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setActiveLayers({false, true, false, true});
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        ++allocations;
+        return std::malloc(bytes);
+      },
+      [&](void *p) {
+        ++releases;
+        std::free(p);
+      });
+    m.allocate(4, 1, 64, 2, 8, ml::train::TensorDim::DataType::FP32);
+    ASSERT_EQ(allocations, 4u);
+    EXPECT_EQ(m.getKeyCache(0).height(), 64u);
+    EXPECT_FALSE(m.getKeyCache(0).isAllocated());
+    EXPECT_FALSE(m.getValueCache(2).isAllocated());
+    EXPECT_TRUE(m.getKeyCache(1).isAllocated());
+    EXPECT_TRUE(m.getValueCache(3).isAllocated());
+    EXPECT_THROW(m.getKeyCacheWriteView(0, 0, 1), std::logic_error);
+    EXPECT_THROW(m.getValueCacheReadView(2, 0, 1), std::logic_error);
+    EXPECT_THROW(m.setActiveLayers({}), std::logic_error);
+
+    causallm::KVCacheManager moved;
+    moved = std::move(m);
+    EXPECT_FALSE(moved.isLayerActive(0));
+    EXPECT_TRUE(moved.isLayerActive(3));
+  }
+  EXPECT_EQ(releases, allocations);
+}
+
+TEST(KVCacheManagerHybrid, all_inactive_layers_keep_only_metadata) {
+  unsigned allocations = 0, releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setActiveLayers({true, false});
+    m.setActiveLayers({false, false});
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        ++allocations;
+        return std::malloc(bytes);
+      },
+      [&](void *p) {
+        ++releases;
+        std::free(p);
+      });
+    for (unsigned rows : {16u, 32u}) {
+      ASSERT_NO_THROW(
+        m.allocate(2, 1, rows, 2, 8, ml::train::TensorDim::DataType::FP32));
+      EXPECT_TRUE(m.isAllocated());
+      EXPECT_EQ(m.getNumLayers(), 2u);
+      for (unsigned i = 0; i < 2; ++i) {
+        EXPECT_FALSE(m.isLayerActive(i));
+        EXPECT_EQ(m.getKeyCache(i).height(), rows);
+        EXPECT_EQ(m.getValueCache(i).width(), 16u);
+        EXPECT_FALSE(m.getKeyCache(i).isAllocated());
+        EXPECT_FALSE(m.getValueCache(i).isAllocated());
+      }
+      m.advance(3);
+      m.reset();
+      EXPECT_EQ(m.getPosition(), 0u);
+      EXPECT_EQ(allocations, 0u);
+    }
+    // A new prompt can replace the manager and select a different layout.
+    m = causallm::KVCacheManager{};
+    m.setActiveLayers({});
+    m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+    EXPECT_TRUE(m.isLayerActive(0));
+    EXPECT_TRUE(m.getKeyCache(0).isAllocated());
+  }
+  EXPECT_EQ(allocations, 0u);
+  EXPECT_EQ(releases, 0u);
+}
+
+TEST(KVCacheManagerHybrid, compact_skips_inactive_windows) {
+  causallm::KVCacheManager m;
+  m.setActiveLayers({false, true});
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)}) {
+    auto *bits = cache->getData<uint16_t>();
+    for (unsigned i = 0; i < 8; ++i)
+      bits[i] = static_cast<uint16_t>(100 + i);
+  }
+  EXPECT_TRUE(m.compact(4));
+  EXPECT_EQ(m.getBase(0), 0u);
+  EXPECT_FALSE(m.getKeyCache(0).isAllocated());
+  EXPECT_FALSE(m.getValueCache(0).isAllocated());
+  EXPECT_EQ(m.getBase(1), 2u);
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)})
+    for (unsigned i = 0; i < 4; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 104 + i);
+  EXPECT_FALSE(m.compact(4));
+}
+
+TEST(KVCacheManagerHybrid, compact_folds_the_dropped_rows_amax) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // one windowed layer: 4 rows of width 2, a window of 2
+  m.allocate(1, 1, 8, std::vector<unsigned int>{2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4}, {2});
+  // fp16 bits: 1.0 = 0x3C00, 2.0 = 0x4000, -3.0 = 0xC200, 0.5 = 0x3800,
+  // -2.0 = 0xC000; rows 0..3 as (col0, col1)
+  const uint16_t kb[8] = {0x3C00, 0xC200, 0x4000, 0x3800,
+                          0x3800, 0x3800, 0x3800, 0x3800};
+  const uint16_t vb[8] = {0x3800, 0x3C00, 0xC000, 0x3C00,
+                          0x3800, 0x3800, 0x3800, 0x3800};
+  std::copy(kb, kb + 8, m.getKeyCache(0).getData<uint16_t>());
+  std::copy(vb, vb + 8, m.getValueCache(0).getData<uint16_t>());
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  EXPECT_TRUE(m.droppedAmaxV(0).empty());
+  EXPECT_TRUE(m.droppedAmaxK(7).empty()); // no such layer: empty, no throw
+  // rows 0 and 1 go: |max| per column of what went
+  EXPECT_TRUE(m.compact(4));
+  ASSERT_EQ(m.droppedAmaxK(0).size(), 2u);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[1], 3.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[1], 1.0f);
+  // the next compaction drops smaller rows (old 2 and 3): the fold only grows
+  EXPECT_TRUE(m.compact(6));
+  EXPECT_EQ(m.getBase(0), 4u);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxK(0)[1], 3.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[0], 2.0f);
+  EXPECT_FLOAT_EQ(m.droppedAmaxV(0)[1], 1.0f);
+  // a new sequence starts from nothing
+  m.reset();
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  EXPECT_TRUE(m.droppedAmaxV(0).empty());
+}
+
+TEST(KVCacheManagerHybrid, invalid_later_window_leaves_every_layer_unchanged) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+      std::fill_n(t->getData<uint16_t>(), m.getRows(l) * 2, 0x3c00u);
+  // Layer 0 can compact at 3, but layer 1 cannot hold that position.
+  for (unsigned pos : {3u, 9u}) {
+    EXPECT_THROW(m.compact(pos), std::out_of_range);
+    for (unsigned l = 0; l < 2; ++l) {
+      EXPECT_EQ(m.getBase(l), 0u);
+      EXPECT_TRUE(m.droppedAmaxK(l).empty());
+      EXPECT_TRUE(m.droppedAmaxV(l).empty());
+      for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+        for (unsigned i = 0; i < m.getRows(l) * 2; ++i)
+          EXPECT_EQ(t->getData<uint16_t>()[i], 0x3c00u);
+    }
+  }
+}
+
+TEST(KVCacheManagerHybrid, rejected_snapshot_preserves_existing_file) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  const auto path =
+    (std::filesystem::temp_directory_path() / "nntr_kv_rejected_snapshot.bin")
+      .string();
+  const std::string original = "keep the previous snapshot";
+  const auto check_refused = [&](unsigned pos) {
+    {
+      std::ofstream file(path, std::ios::binary);
+      file << original;
+    }
+    EXPECT_THROW(m.save(path, pos), std::out_of_range);
+    std::ifstream file(path, std::ios::binary);
+    const std::string content((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+    EXPECT_EQ(content, original);
+  };
+  check_refused(3);
+  check_refused(9);
+  ASSERT_TRUE(m.compact(2));
+  check_refused(0); // The earlier rows have already been evicted.
+  EXPECT_EQ(m.getBase(0), 1u);
+  EXPECT_EQ(m.getBase(1), 1u);
+  std::filesystem::remove(path);
+}
+
+TEST(KVCacheManagerHybrid, valid_window_snapshot_round_trip) {
+  causallm::KVCacheManager m, restored;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  for (auto *cache : {&m, &restored})
+    cache->allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+                    ml::train::TensorDim::Format::NCHW, {4, 2}, {1, 1});
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *t : {&m.getKeyCache(l), &m.getValueCache(l)})
+      for (unsigned i = 0; i < m.getRows(l) * 2; ++i)
+        t->getData<uint16_t>()[i] = 0x3c00u + l * 16u + i;
+  const auto path =
+    (std::filesystem::temp_directory_path() / "nntr_kv_window_round_trip.bin")
+      .string();
+  ASSERT_NO_THROW(m.validateSaveRange(2));
+  ASSERT_TRUE(m.compact(2));
+  ASSERT_NO_THROW(m.save(path, 2));
+  ASSERT_EQ(restored.load(path, 2), 2u);
+  for (unsigned l = 0; l < 2; ++l) {
+    EXPECT_EQ(restored.getBase(l), 1u);
+    for (unsigned i = 0; i < 2; ++i) {
+      EXPECT_EQ(restored.getKeyCache(l).getData<uint16_t>()[i],
+                m.getKeyCache(l).getData<uint16_t>()[i]);
+      EXPECT_EQ(restored.getValueCache(l).getData<uint16_t>()[i],
+                m.getValueCache(l).getData<uint16_t>()[i]);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+TEST(KVCacheManagerHybrid, dense_files_remain_compatible_in_both_directions) {
+  const std::string path = "/tmp/test_kv_cache_hybrid.bin";
+  using Dtype = ml::train::TensorDim::DataType;
+  std::vector<Dtype> dtypes{Dtype::FP32};
+#ifdef ENABLE_FP16
+  dtypes.push_back(Dtype::FP16);
+#endif
+  for (auto dtype : dtypes) {
+    causallm::KVCacheManager dense, sparse, restored;
+    sparse.setActiveLayers({false, true, false, true});
+    for (auto *m : {&dense, &sparse, &restored})
+      m->allocate(4, 1, 16, 2, 8, dtype);
+    for (unsigned i = 0; i < 4; ++i) {
+      dense.getKeyCache(i).setValue(float(i + 1));
+      dense.getValueCache(i).setValue(float(i + 11));
+    }
+    const size_t bytes =
+      5u * 16u * dense.getKeyCache(0).getDim().getDataTypeSize();
+    dense.save(path, 5);
+    EXPECT_EQ(sparse.load(path, 5), 5u);
+    EXPECT_FALSE(sparse.getKeyCache(0).isAllocated());
+    for (unsigned i : {1u, 3u}) {
+      EXPECT_EQ(std::memcmp(sparse.getKeyCache(i).getData<char>(),
+                            dense.getKeyCache(i).getData<char>(), bytes),
+                0);
+      EXPECT_EQ(std::memcmp(sparse.getValueCache(i).getData<char>(),
+                            dense.getValueCache(i).getData<char>(), bytes),
+                0);
+    }
+    sparse.save(path, 5);
+    EXPECT_EQ(restored.load(path, 5), 5u);
+    const std::vector<char> zeros(bytes, 0);
+    for (unsigned i = 0; i < 4; ++i) {
+      EXPECT_EQ(
+        std::memcmp(restored.getKeyCache(i).getData<char>(),
+                    i % 2 ? dense.getKeyCache(i).getData<char>() : zeros.data(),
+                    bytes),
+        0);
+      EXPECT_EQ(std::memcmp(restored.getValueCache(i).getData<char>(),
+                            i % 2 ? dense.getValueCache(i).getData<char>()
+                                  : zeros.data(),
+                            bytes),
+                0);
+    }
+  }
+  std::remove(path.c_str());
+}
+
+TEST(KVCacheManagerHybrid, aliases_cannot_reference_inactive_layers) {
+  causallm::KVCacheManager m;
+  m.setActiveLayers({false, true});
+  m.setLayerKVSources({-1, 0});
+  EXPECT_THROW(m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32),
+               std::invalid_argument);
 }
 
 TEST_F(KVCacheManagerTest, cache_tensor_dimensions) {
@@ -428,7 +727,118 @@ TEST(KVCacheManagerShare, no_declaration_means_no_aliasing) {
             m.getKeyCache(2).getData<float>());
 }
 
+/**
+ * Shared-memory allocator (the accelerator-visible KV cache): every slab is
+ * one block from the allocator, the cache tensors and their views resolve
+ * into those blocks with no copy, and each block goes back exactly once
+ * when the manager is destroyed.
+ */
+TEST(KVCacheManagerSharedMemory, slabs_come_from_allocator_and_return) {
+  std::vector<void *> blocks;
+  std::vector<size_t> sizes;
+  std::vector<void *> released;
+  {
+    causallm::KVCacheManager m;
+    m.setSharedAllocator(
+      [&](size_t bytes) {
+        void *p = std::malloc(bytes);
+        blocks.push_back(p);
+        sizes.push_back(bytes);
+        return p;
+      },
+      [&](void *p) {
+        released.push_back(p);
+        std::free(p);
+      });
+    m.allocate(3, 1, 64, 2, 8, ml::train::TensorDim::DataType::FP32);
+
+    EXPECT_TRUE(m.usesSharedMemory());
+    ASSERT_EQ(blocks.size(), 6u); // key and value per layer
+    for (size_t b : sizes) {
+      EXPECT_EQ(b, 64u * 16u * sizeof(float));
+    }
+    for (unsigned int l = 0; l < 3; ++l) {
+      EXPECT_EQ(m.getKeyCache(l).getData<float>(), blocks[2 * l]);
+      EXPECT_EQ(m.getValueCache(l).getData<float>(), blocks[2 * l + 1]);
+    }
+
+    // A write view at position 5 lands at row 5 of the value block.
+    m.setPosition(5);
+    auto view = m.getValueCacheWriteView(1, 0, 1);
+    float *vd = view.getData<float>();
+    EXPECT_EQ(vd, static_cast<float *>(blocks[3]) + 5 * 16);
+    vd[3] = 42.0f;
+    EXPECT_FLOAT_EQ(static_cast<float *>(blocks[3])[5 * 16 + 3], 42.0f);
+    EXPECT_TRUE(released.empty());
+  }
+  ASSERT_EQ(released.size(), 6u);
+  for (size_t i = 0; i < 6; ++i) {
+    EXPECT_NE(std::find(blocks.begin(), blocks.end(), released[i]),
+              blocks.end());
+  }
+}
+
+TEST(KVCacheManagerSharedMemory, nullptr_from_allocator_means_heap) {
+  int releases = 0;
+  {
+    causallm::KVCacheManager m;
+    m.setSharedAllocator([](size_t) -> void * { return nullptr; },
+                         [&](void *) { ++releases; });
+    m.allocate(2, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+    EXPECT_TRUE(m.isAllocated());
+    EXPECT_FALSE(m.usesSharedMemory());
+    EXPECT_NE(m.getKeyCache(0).getData<float>(), nullptr);
+  }
+  EXPECT_EQ(releases, 0);
+}
+
+TEST(KVCacheManagerSharedMemory, allocator_must_be_set_before_allocate) {
+  causallm::KVCacheManager m;
+  m.allocate(1, 1, 16, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_THROW(m.setSharedAllocator([](size_t) -> void * { return nullptr; },
+                                    [](void *) {}),
+               std::logic_error);
+  causallm::KVCacheManager n;
+  EXPECT_THROW(
+    n.setSharedAllocator([](size_t) -> void * { return nullptr; }, nullptr),
+    std::invalid_argument);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST(KVCacheManagerShared, MovePreservesGeometryAndReleasesEachAllocationOnce) {
+  unsigned int allocated = 0, released = 0;
+  auto alloc = [&](size_t bytes) -> void * {
+    ++allocated;
+    return std::malloc(bytes);
+  };
+  auto free = [&](void *p) {
+    ++released;
+    std::free(p);
+  };
+  {
+    causallm::KVCacheManager source, destination;
+    source.setSharedAllocator(alloc, free);
+    source.setLayerCaps({4, 4});
+    source.setLayerKVSources({-1, 0});
+    source.allocate(2, 1, 8, std::vector<unsigned int>{16, 16},
+                    ml::train::TensorDim::DataType::FP32);
+    source.setPosition(3);
+    auto *key = source.getKeyCache(0).getData<float>();
+    key[0] = 7.0f;
+    destination.setSharedAllocator(alloc, free);
+    destination.allocate(1, 1, 8, 1, 16, ml::train::TensorDim::DataType::FP32);
+    EXPECT_EQ(allocated, 4u);
+    destination = std::move(source);
+    EXPECT_EQ(released, 2u);
+    EXPECT_EQ(destination.getPosition(), 3u);
+    EXPECT_EQ(destination.getLayerCap(1), 4u);
+    EXPECT_EQ(destination.getLayerKVSource(1), 0);
+    EXPECT_EQ(destination.getKeyCache(1).getData<float>(), key);
+    EXPECT_FLOAT_EQ(destination.getKeyCache(0).getData<float>()[0], 7.0f);
+  }
+  EXPECT_EQ(released, allocated);
 }

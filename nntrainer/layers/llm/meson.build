@@ -11,6 +11,7 @@ llm_layer_sources = [
   'scalar_multiply.cpp',
   'swiglu_layer.cpp',
   'tie_word_embedding.cpp',
+  'htp_tie_word_embedding.cpp',
   'sigmoid_glu_layer.cpp',
   'sigmoid_add_layer.cpp',
 ]
@@ -32,6 +33,16 @@ llm_layer_sources = [
 # therefore, and listed in packaging/nntrainer.spec and
 # debian/nntrainer-dev.install accordingly.
 nntrainer_headers += meson.current_source_dir() / 'layer_prof.h'
+
+# fused_llm_properties.h and nntr_htp_decode_hook.h are not layers either: the
+# first holds the property types the CausalLM layers share, the second the
+# HTP decode hook interface. CausalLM's causallm_common_properties.h, mha_core.h
+# and htp_decode_hook.h include them, so an out-of-tree build (Android's
+# android_build_result/include/nntrainer) fails without them. Installed for the
+# same reason as layer_prof.h, and listed in packaging/nntrainer.spec and
+# debian/nntrainer-dev.install.
+nntrainer_headers += meson.current_source_dir() / 'fused_llm_properties.h'
+nntrainer_headers += meson.current_source_dir() / 'nntr_htp_decode_hook.h'
 
 foreach s : llm_layer_sources
   nntrainer_sources += meson.current_source_dir() / s

@@ -14,6 +14,7 @@
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <lm_head.h>
+#include <nntr_htp_decode_hook.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -150,12 +151,34 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+    auto &disable_bias =
+      std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+    const bool no_bias = !disable_bias.empty() && disable_bias.get();
+
+    // [#276] An untied head's decode row on the HTP, as tie_word_embedding's
+    // (the list's LM_HEAD op is this weight alone; the final norm is its own
+    // RMSNORM op and the softcap stays in the CPU layer after this one).
+    // With NNTR_HTP_E2E=1 it is the token's last hook: without it the
+    // stretch never closes.
+    if (b_size == 1 && to - from == 1 && no_bias &&
+        input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        nntrainer::htpDecodeLmHead(
+          from, input_step.getData<float>(), input_step.width(),
+          hidden_step.getData<float>(), hidden_step.width()))
+      continue;
+
+#ifdef ENABLE_HEXKL
+    if (!training && no_bias &&
+        input_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        nntrainer::get_htp_ops()->lm_head_shared_fp32(
+          weight.getData(), input_step.width(), hidden_step.width(),
+          input_step.getData<float>(), hidden_step.getData<float>()))
+      continue;
+#endif
 
     input_step.dot(weight, hidden_step, false, false);
 
-    if (auto &disable_bias =
-          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
-        disable_bias.empty() || disable_bias.get() == false) {
+    if (!no_bias) {
       nntrainer::Tensor &bias =
         context.getWeight(weight_idx[LmHeadParams::bias]);
       hidden_step.add_i(bias);

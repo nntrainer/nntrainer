@@ -873,6 +873,24 @@ public:
     return *run_context;
   }
 
+  /**
+   * @brief   Get the effective layer managed by this layer node
+   *
+   * @details this is layer inside the distribution layer if this layer node
+   * is distributed. Public so an application can reach its own custom
+   * layer from a forEachLayer callback (a LayerNode is what that hands
+   * out), e.g. CausalLM's lm_head twin build after load.
+   */
+  const nntrainer::Layer *getLayer() const;
+
+  /**
+   * @brief   Get the effective layer managed by this layer node
+   *
+   * @details this is layer inside the distribution layer if this layer node
+   * is distributed.
+   */
+  nntrainer::Layer *getLayer();
+
 #ifdef ENABLE_TEST
   /**
    * @brief   Get init layer context
@@ -1154,22 +1172,6 @@ properties in the context/graph unless intended. */
                                  output  */
 
   std::array<TensorDim::DataType, 2> data_type;
-
-  /**
-   * @brief   Get the effective layer managed by this layer node
-   *
-   * @details this is layer inside the distribution layer if this layer node
-   * is distributed.
-   */
-  const nntrainer::Layer *getLayer() const;
-
-  /**
-   * @brief   Get the effective layer managed by this layer node
-   *
-   * @details this is layer inside the distribution layer if this layer node
-   * is distributed.
-   */
-  nntrainer::Layer *getLayer();
 
   /**
    * @brief anchor point to override if PRINT_SHAPE_INFO is enabled for

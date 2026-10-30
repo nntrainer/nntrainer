@@ -15,6 +15,9 @@ cl_op_sources = [
   'sigmoid_glu_cl_op.cpp',
   'sigmoid_add_cl_op.cpp',
   'v8c_pack_cache.cpp',
+  'moe_route_cl.cpp',
+  'tq2cx_cl.cpp',
+  'expert_reader_pool.cpp',
 ]
 
 cl_op_headers = [

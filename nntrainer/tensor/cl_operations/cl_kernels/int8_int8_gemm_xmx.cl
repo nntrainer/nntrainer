@@ -9,6 +9,8 @@
 //     acc_raw   = sum_k  act_int8[m][k] * nibble_raw(n,k)      (i8_u8 DPAS)
 //     corrected = acc_raw - 8*row_sum_act[m] - zp_act[m]*row_sum_w_int4[n]
 //     Y[m][n]   = (half)((float)corrected * scale_act[m] * scale_wgt[n])
+//   With -DV8C_ASYM (per-channel asymmetric int4 weight, integer zero point
+//   wzp[n]) the 8 becomes wzp[n] and row_sum_w_int4[n] gains (8 - wzp[n])*K.
 //
 // Device : Intel Arc Graphics, Lunar Lake Xe2, NEO 25.18, IGC 2.11, SG16 only.
 // Compile: -cl-std=CL3.0 -cl-intel-256-GRF-per-thread
@@ -125,7 +127,11 @@ __kernel void gemm_xmx_i4(
     __global half *Y,                    // arg7: [M][N] fp16 output
     const int M, const int N, const int K,        // arg8,9,10
     const int W_act, const int W_wgt,             // arg11,12 (unused; byte off)
-    const int M_valid) {                          // arg13: store guard
+    const int M_valid                             // arg13: store guard
+#ifdef V8C_ASYM
+    , __global const int *wzp                     // arg14: [N] int zero point
+#endif
+    ) {
   const int lane = get_sub_group_local_id();      // 0..15
   const int sg   = get_sub_group_id();            // 0..SG_M-1 (M stacking)
 
@@ -189,7 +195,15 @@ __kernel void gemm_xmx_i4(
     const int col = n0 + j * 16 + lane;
     if (col >= N) continue;
     const float sw  = scale_wgt[col];
+#ifdef V8C_ASYM
+    // Per-channel asymmetric weight: the exact integer fold of the dp4a
+    // kernels (int8_int4_gemm_v8c.cl, V8C_CORRECTED).
+    const int   zw  = wzp[col];
+    const int   rsw = row_sum_w_int4[col] + (8 - zw) * K;
+#else
+    const int   zw  = 8;
     const int   rsw = row_sum_w_int4[col];
+#endif
 #pragma unroll
     for (int i = 0; i < MT; ++i) {
       const int row_base = m0 + i * 8;
@@ -200,7 +214,7 @@ __kernel void gemm_xmx_i4(
         if (m >= M_valid) continue;
         const int acc_raw = r[rr];
         const int corrected =
-            acc_raw - 8 * row_sum_act[m] - zp_act[m] * rsw;
+            acc_raw - zw * row_sum_act[m] - zp_act[m] * rsw;
         const float v = (float)corrected * scale_act[m] * sw;
         Y[(long)m * N + col] = (half)v;
       }

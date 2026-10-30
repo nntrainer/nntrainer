@@ -42,10 +42,11 @@
 #include <optimized_v1_planner.h>
 #include <optimized_v2_planner.h>
 #include <optimized_v3_planner.h>
-#include <qs4cx_tensor.h> // qs4cxHeapBypassOn
+#include <qs4cx_tensor.h> // int4HeapBypassOn
 #include <residency_policy.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
+#include <ternary_tensor.h> // tq2cxSingleCopyOn
 #include <util_func.h>
 #include <var_grad.h>
 
@@ -499,9 +500,16 @@ std::vector<Weight *> Manager::requestWeights(
       // can never disagree about whether a payload is self-owned.
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
+      // QS4ACX takes the same arm under its own decision (int4HeapBypassOn),
+      // and a TQ2CX expert weight under tq2cxSingleCopyOn(): its one fast
+      // reader is the device expert stack, built from the file at load.
+      const auto v_dt = dim_v.getDataType();
       const bool qs4cx_heap_bypass =
-        dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
-        !enable_fsu && qs4cxHeapBypassOn();
+        !enable_fsu && (((v_dt == ml::train::TensorDim::DataType::QS4CX ||
+                          v_dt == ml::train::TensorDim::DataType::QS4ACX) &&
+                         int4HeapBypassOn(v_dt)) ||
+                        (v_dt == ml::train::TensorDim::DataType::TQ2CX &&
+                         !is_virtual && tq2cxSingleCopyOn()));
 #else
       const bool qs4cx_heap_bypass = false;
 #endif
@@ -963,12 +971,11 @@ void Manager::flushCacheExcept(unsigned int order) {
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
   if (enable_optimizations) {
-    if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
-      //@todo change V3 and validate
-      pool.finalize(OptimizedV1Planner(), start, end);
-    } else {
-      pool.finalize(OptimizedV1Planner(), start, end);
-    }
+    // QNN and FSU allocate separate buffers for distinct offsets. Splitting
+    // free gaps only reduces the allocation for a contiguous inference pool.
+    const bool reuse_gaps = exec_mode == ExecutionMode::INFERENCE &&
+                            !enable_fsu && pool.supportsGapReuse();
+    pool.finalize(OptimizedV1Planner(reuse_gaps), start, end);
   } else {
     pool.finalize(BasicPlanner(), start, end);
   }

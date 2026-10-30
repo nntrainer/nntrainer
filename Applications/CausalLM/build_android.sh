@@ -10,6 +10,7 @@ Usage: ./build_android.sh [options] [engine Meson options]
 Options:
   --app                   Also assemble the QuickDotAI AAR and sample APK
   --install               Push native artifacts; with --app, install the APK
+  --htp                   Build the native Hexagon HTP variant (requires Hexagon SDK/HexKL)
   --qnn                   Build the QNN-enabled native/app variant (default: CPU-only)
   --cache                 Reuse a compatible engine build; build on cache miss
   --clean                 Recreate the selected CausalLM build outputs
@@ -30,9 +31,10 @@ EOF
 CLEAN=false
 USE_BUILD_CACHE=false
 ENABLE_QNN=false
+ENABLE_HTP=false
 INSTALL=false
 BUILD_APP=false
-NNTR_THREADS="${NNTR_THREADS:-7}"
+NNTR_THREADS="${NNTR_THREADS:-}"
 ENGINE_ARGS=()
 
 deprecated_option() {
@@ -46,6 +48,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install)
             INSTALL=true
+            ;;
+        --htp)
+            ENABLE_HTP=true
             ;;
         --qnn)
             ENABLE_QNN=true
@@ -88,11 +93,22 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# The HTP path was measured at 8 compute threads (its miss readers and the
+# prefill's CPU stages); the other variants keep 7.
+if [[ -z "$NNTR_THREADS" ]]; then
+    if [[ "$ENABLE_HTP" == true ]]; then NNTR_THREADS=8; else NNTR_THREADS=7; fi
+fi
 if ! [[ "$NNTR_THREADS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --nntr-threads must be a positive integer." >&2
     exit 2
 fi
-if [[ "$ENABLE_QNN" == true ]]; then
+if [[ "$ENABLE_HTP" == true && "$ENABLE_QNN" == true ]]; then
+    echo "Error: --htp and --qnn select separate native variants." >&2
+    exit 2
+fi
+if [[ "$ENABLE_HTP" == true ]]; then
+    BUILD_VARIANT="htp"
+elif [[ "$ENABLE_QNN" == true ]]; then
     BUILD_VARIANT="qnn"
 else
     BUILD_VARIANT="cpu"
@@ -177,6 +193,30 @@ if [[ "$ENABLE_QNN" == true ]]; then
     export QNN_SDK_ROOT="$QNN_SDK_ROOT_MESON"
 fi
 
+HTP_ENGINE_ARGS=()
+if [[ "$ENABLE_HTP" == true ]]; then
+    : "${HEXAGON_SDK_ROOT:?--htp requires HEXAGON_SDK_ROOT}"
+    : "${DEFAULT_HEXAGON_TOOLS_ROOT:?--htp requires DEFAULT_HEXAGON_TOOLS_ROOT}"
+    : "${HEXKL_ROOT:?--htp requires HEXKL_ROOT}"
+    : "${HEX_ARCH:?--htp requires an explicit DSP target, e.g. HEX_ARCH=v81}"
+    if [[ "$HEX_ARCH" != v81 ]]; then
+        echo "Error: the Gemma4 HTP runtime requires HEX_ARCH=v81." >&2
+        exit 1
+    fi
+    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.2}"
+    export HEXKL_SDK_VER HEX_ARCH
+    HEXKL_LIB_SUBDIR="$HEXKL_SDK_VER/${HEXKL_ARCH:-armv8_android26}"
+    if [[ ! -f "$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" ]]; then
+        echo "Error: missing $HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" >&2
+        exit 1
+    fi
+    bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
+    bash "$NNTRAINER_ROOT/test/htp/build.sh"
+    HTP_ENGINE_ARGS=(-Dhexagon-sdk-root="$HEXAGON_SDK_ROOT"
+                     -Dhexkl-sdk-root="$HEXKL_ROOT"
+                     -Dhexkl-lib-subdir="$HEXKL_LIB_SUBDIR")
+fi
+
 echo "=== nntrainer CausalLM Android build ==="
 echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK:    $ANDROID_NDK"
@@ -249,6 +289,11 @@ engine_mode_text() {
     printf 'schema=2\n'
     printf 'variant=%s\n' "$BUILD_VARIANT"
     printf 'enable_qnn=%s\n' "$ENABLE_QNN"
+    printf 'enable_htp=%s\n' "$ENABLE_HTP"
+    if [[ "$ENABLE_HTP" == true ]]; then
+        printf 'hex_arch=%s\nhexagon_sdk=%s\nhexkl_root=%s\nhexkl_lib=%s\n' \
+            "$HEX_ARCH" "$HEXAGON_SDK_ROOT" "$HEXKL_ROOT" "$HEXKL_LIB_SUBDIR"
+    fi
     printf 'nntr_threads=%s\n' "$NNTR_THREADS"
     printf 'android_ndk=%s\n' "$ANDROID_NDK"
     if [[ "$ENABLE_QNN" == true ]]; then
@@ -335,6 +380,8 @@ else
         ./tools/package_android.sh \
             -Dnntr-num-threads="$NNTR_THREADS" \
             -Denable-npu="$ENABLE_QNN" \
+            -Denable-htp="$ENABLE_HTP" \
+            "${HTP_ENGINE_ARGS[@]}" \
             "${ENGINE_ARGS[@]}"
     )
     engine_mode_text > "$NNTRAINER_MODE_FILE"
@@ -488,6 +535,11 @@ QNN_SKEL_RELATIVE_PATHS=(
     hexagon-v81/unsigned/libQnnHtpV81Skel.so
 )
 
+if [[ "$ENABLE_HTP" == true ]]; then
+    RUNTIME_LIBRARIES+=("$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so"
+                       "$NNTRAINER_ROOT/test/htp/build/libnntr_hvx_skel.so")
+fi
+
 if [[ "$ENABLE_QNN" == true ]]; then
     RUNTIME_LIBRARIES+=("$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so")
     QNN_AARCH64_LIB_DIR="$QNN_SDK_ROOT_SHELL/lib/aarch64-android"
@@ -550,7 +602,7 @@ stage_runtime_libraries() {
     if [[ "$ENABLE_QNN" == false ]]; then
         if find "$PREBUILT_DIR" -maxdepth 1 -type f \
             \( -name 'libqnn_context.so' -o -name 'libQnn*.so' \) | grep -q .; then
-            echo "Error: a CPU-only stage contains QNN libraries." >&2
+            echo "Error: a $BUILD_VARIANT stage contains QNN libraries." >&2
             exit 1
         fi
     fi
@@ -578,6 +630,10 @@ if [[ "$BUILD_APP" == true ]]; then
             exit 1
         fi
     done
+    python3 "$CAUSALLM_ROOT/Android/verify_native_package.py" \
+        --variant "$BUILD_VARIANT" --prebuilt-dir "$PREBUILT_DIR" \
+        --readelf "$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/bin/llvm-readelf" \
+        --output "$APK.native-manifest.json" "$AAR" "$APK"
 fi
 
 if [[ "$INSTALL" == false ]]; then

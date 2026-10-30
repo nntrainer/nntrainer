@@ -1,0 +1,104 @@
+LFM dynamic-Q8 deferred dequantization host check
+
+Run from the repository root (no device or model required):
+
+  python3 tools/lfm2_attn_overlap_check.py \
+    --hexagon-tools "$DEFAULT_HEXAGON_TOOLS_ROOT" \
+    --output /tmp/lfm2-attn-overlap-check --sanitize --mutations
+
+DEFAULT_HEXAGON_TOOLS_ROOT is the Hexagon tools version directory containing
+Tools/libnative, for example the SDK's tools/HEXAGON_Tools/<version> directory.
+The script also accepts that environment variable directly. GCC/G++ and the
+SDK host HVX emulation library are required. --repo and --source allow testing
+another source checkout. Output files are confined to --output, or a temporary
+directory if omitted. No developer-specific paths are embedded in the tools.
+
+What is real, and what is simulated
+  The checker extracts the actual production context, address helpers,
+  dequant_s_at, serial wrapper, Qx guard, dequant worker, phase_qk and
+  run_q_block. It uses SDK libnative for HVX arithmetic and the production
+  worker pool with the repository's pthread-based QuRT shim.
+  HMX accumulator values, DMA, softmax and PV are stand-ins. Fake PV overwrites
+  the original L.acc before releasing the dequant workers. This forces the
+  overlap that would expose an incorrect accumulator reference or missing
+  drain. It does not measure silicon performance or full attention accuracy.
+
+Frozen serial reference
+  attn_overlap_native_check.c embeds the former dequant_s body independently
+  of the candidate source. Its only functional source change is its name,
+  reference_dequant_s. The source was:
+
+    nntrainer/tensor/htp_backend/hmx/hexkl_attn_q.c
+    commit 0fcdfc1f9 [CausalLM] Remove redundant LFM attention prefill passes
+    source-file SHA256:
+    67a1cc02396fd4115d5d243b3563fa1260402e06bf96739e3dbe3260c2de6d52
+
+  That reference preserves int32-to-float conversion, floating-point
+  zero-point correction, both scale products, and fp16 lane packing. The
+  tested candidate only changes the accumulator address and scheduling.
+  The original source can be inspected with:
+
+    git show 0fcdfc1f9:nntrainer/tensor/htp_backend/hmx/hexkl_attn_q.c
+
+Production scope and measured selection
+  Enable overlap only for full dynamic-Q8 LFM prefill with n_q >= 2048 and
+  n_q divisible by 128, plus the existing shape, pool and extent guards.
+  The earlier candidate also enabled 1024 rows. Although its 10 attention
+  layers shortened from 150.939 to 127.291 ms in a diagnostic profile, three
+  normal 1024-token A/B pairs all regressed: median 844.188 -> 827.141 TPS
+  (-2.02%). The final guard therefore keeps 1024 on the serial path.
+  In the same 12-run comparison, the three 2048-token pairs were all faster:
+    baseline: 714.834 / 729.605 / 747.718 TPS
+    candidate: 749.360 / 895.496 / 759.644 TPS
+  The median gain was 4.12%, with considerable run-to-run variation. These
+  measurements selected the 2048-and-larger scope; they do not establish a
+  speedup at every larger size. After narrowing, another three 2048-token
+  pairs measured median 730.906 -> 784.374 TPS (+7.32%, two pairs faster).
+  The final 21-case DSP replay and same-handle 2x2048+64-token runs preserved
+  exact outputs. See docs/measurements/lfm2_tl2_prefill1000_20261016/
+  followup_attention_overlap for all runs and the sampled-memory scope.
+
+Coverage
+  The normal run has 460 cases:
+  worker counts 0..8, first/no-next blocks, last qi, partial final Q chunks,
+  partially filled KV blocks, 1024/1920/2048/2176/2304/2432 rows, a small
+  fallback, fixed-Q8 fallback, four scale/zero-point patterns, six HMX-read
+  failure positions and two PV-failure positions. Failure tests run at 2048
+  rows so deferred work and its drain remain covered. The 1024/1920 cases
+  explicitly require the old serial path. It repeatedly checks 18
+  shape/extent/pool guards. Q/K/V/P/O regions, metadata and trailing redzones
+  are checked for unintended writes. ASan and UBSan are optional flags.
+  --mutations must reject all three deliberate errors with assertions:
+  wrong accumulator address, removed Qx extent guard and missing PV drain.
+  commands.json, source_manifest.json and per-run logs record the exact inputs
+  and compiler commands. An existing snprintf truncation warning in the
+  unchanged worker-pool source is not promoted to an error by this runner;
+  the extracted candidate and fixture are compiled with -Werror.
+
+Ownership and size
+  The synchronous Q preparation packs the entire chunk before Qx is reused.
+  QK then reads q_ah and cached q_scale/q_zp; it no longer needs gathered Qx.
+  The new job reads raw QK tiles from Qx, writing the other S bank while PV
+  uses L.acc/P/O. The pool joins before the next softmax, next qi, next Q
+  preparation, or an error return. No worker calls HMX or submits another job.
+  The raw score bank is 8 * 8 * 8192 = 524288 bytes. Existing Qx has 1179648
+  bytes for 2048 rows (chunk 9). The 1048576-byte Qx allocation at 1024 rows
+  remains untouched by deferred readouts because that shape is disabled. The
+  partially filled last chunk retains that allocated extent. No additional
+  heap, VTCM, ION or persistent weight-cache capacity is allocated. Existing
+  worker stacks are reused; a small caller-side job struct has stack lifetime.
+
+Statistics semantics
+  hexkl_attn_q_stats.us_dequant originally summed each synchronous score
+  conversion. With overlap enabled it sums unchanged first-block conversion,
+  asynchronous job submission, and only the exposed wait after current PV.
+  Work hidden by PV is not counted again. Consequently a lower dequant field
+  is not itself evidence of fewer arithmetic operations or the end-to-end
+  speedup. us_softmax can increase when shorter QK exposes more of the current
+  softmax. Compare us_total and normal whole-model timing; do not sum the old
+  dequant field with an independently estimated worker duration.
+
+  Full-DSP checker output and all dumped model token IDs must still be compared
+  on the target device before adoption. Gemma fixed-Q8 and other geometries
+  are excluded by the production guard. Host tests establish these guards;
+  they do not replace target-device validation for the newly enabled path.

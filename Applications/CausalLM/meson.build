@@ -471,6 +471,24 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Expert slot residency (expert_residency.h): host-only, header-only. Pins
+  # the per-layer LRU that decides which device slot a streamed MoE expert
+  # is read into.
+  unittest_expert_residency = executable(
+    'unittest_expert_residency',
+    meson.current_source_dir() / 'layers' / 'unittest_expert_residency.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_expert_residency', unittest_expert_residency,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_expert_residency'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Portable token sampler (token_sampler.h): host-only, header-only. Pins the
   # RNG stream, same-seed reproducibility and the top-k / top-p tie rules.
   unittest_sampling = executable(
@@ -507,6 +525,7 @@ if get_option('enable-test')
   causallm_fixture_tars = [
     meson.source_root() / 'packaging' / 'causallm_reference_generation.tar.gz',
     meson.source_root() / 'packaging' / 'causallm_reference_embedding.tar.gz',
+    meson.source_root() / 'packaging' / 'causallm_reference_gemma4_htp.tar.gz',
   ]
   # The tarballs already contain a top-level `causallm_reference/` directory, so
   # extract into models/ (NOT models/causallm_reference/, which would double the
@@ -564,6 +583,9 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_htp.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_slim_moe.cpp',

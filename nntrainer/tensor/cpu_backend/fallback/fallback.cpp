@@ -16,14 +16,14 @@
 #include <compute_ops.h>
 #include <fallback.h>
 #include <fallback_internal.h>
+#include <ggml_interface.h>
 #include <nntrainer_error.h>
+#include <tq2cx_kernels.h>
 
 namespace nntrainer {
 
 void init_backend() {
-  // Fallback build has no GGML / OpenBLAS to set up — bind the CPU
-  // ops table directly. Same shape as the ARM / x86 init_backend
-  // entry points so callers can use ensureComputeOps() uniformly.
+  __ggml_init();
   g_compute_ops = get_cpu_ops();
 }
 
@@ -235,6 +235,21 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __fallback_gemm_q4_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+size_t q4_0_gemv_activation_size(const unsigned int K) {
+  return __ggml_q4_0_gemv_activation_size(K);
+}
+
+void quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                   void *quantized_A) {
+  __ggml_quantize_q4_0_gemv_activation(K, A, quantized_A);
+}
+
+void gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                             const unsigned int row_end, const unsigned int K,
+                             const void *quantized_A, const void *B, float *C) {
+  __ggml_gemv_q4_0_rowwise_range(row_begin, row_end, K, quantized_A, B, C);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
@@ -242,6 +257,14 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
   for (size_t i = 0; i < Ns.size(); ++i)
     __fallback_gemm_q4_0<float>(M, Ns[i], K, A, lda, Bs[i], ldbs[i], Cs[i],
                                 ldcs[i]);
+}
+
+void gemm_tq2cx_batch(const unsigned int M, const std::vector<unsigned int> &Ns,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const std::vector<void *> &Bs,
+                      const std::vector<float *> &Cs,
+                      const std::vector<unsigned int> &ldcs) {
+  tq2cx_gemm_batch(M, Ns, K, A, lda, Bs, Cs, ldcs, tq2cx_tile_ref);
 }
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
@@ -359,6 +382,15 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
   __fallback_compute_kcaches<uint16_t>(
     in, kcache, output, num_rows, num_cache_head, head_dim, gqa_size, tile_size,
     local_window_size, head_start, head_end);
+}
+
+void compute_rotary_emb_value_snap(unsigned int width, unsigned int dim,
+                                   unsigned int half_, const float *input,
+                                   uint16_t *output, const float *cos_,
+                                   const float *sin_,
+                                   const float *head_scales) {
+  __fallback_compute_rotary_emb_value_snap(width, dim, half_, input, output,
+                                           cos_, sin_, head_scales);
 }
 
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,

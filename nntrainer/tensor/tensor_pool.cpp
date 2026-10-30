@@ -14,6 +14,8 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
@@ -26,6 +28,10 @@
 
 #if defined(ENABLE_OPENCL)
 #include <opencl_loader.h> /* GPU memory ledger tag (NNTR_GPU_MEM_ACCT) */
+#endif
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace nntrainer {
@@ -415,6 +421,55 @@ void TensorPool::deallocate() {
   for (auto &spec : pool) {
     spec.tensor->setData(nullptr);
   }
+}
+
+size_t TensorPool::releaseInferenceScratch() {
+#if defined(__linux__)
+  if (cache_loader || !mem_pool->isAllocated() ||
+      mem_pool->getAllocator()->getName() != "cpu")
+    return 0;
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return 0;
+  const size_t page = static_cast<size_t>(page_size);
+  const uintptr_t base =
+    reinterpret_cast<uintptr_t>(mem_pool->getMemoryPoolAddress());
+  if (!base || base % page != 0)
+    return 0;
+  const size_t bytes = mem_pool->size();
+  // Protect every page intersecting a tensor that can outlive one forward
+  // call. Source lifespans already include their views' requirements.
+  std::vector<std::pair<size_t, size_t>> keep;
+  for (const auto &spec : pool) {
+    const auto *details = std::get_if<SourceDetails>(&spec.details);
+    if (!details || !details->token ||
+        details->lifespan == TensorLifespan::FORWARD_FUNC_LIFESPAN)
+      continue;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(
+      mem_pool->getMemory(details->token)->getAddr<void>());
+    const size_t length = spec.tensor->getMemoryBytes();
+    if (address < base || address - base > bytes ||
+        length > bytes - (address - base))
+      return 0; // An unexpected layout must never discard persistent state.
+    const size_t begin = address - base;
+    const size_t end = begin + length;
+    keep.emplace_back(begin / page * page,
+                      end / page * page + (end % page ? page : 0));
+  }
+  std::sort(keep.begin(), keep.end());
+  const size_t limit = bytes / page * page;
+  keep.emplace_back(limit, limit);
+  size_t cursor = 0, released = 0;
+  for (const auto &[begin, end] : keep) {
+    if (begin > cursor && madvise(reinterpret_cast<void *>(base + cursor),
+                                  begin - cursor, MADV_DONTNEED) == 0)
+      released += begin - cursor;
+    cursor = std::max(cursor, end);
+  }
+  return released;
+#else
+  return 0;
+#endif
 }
 
 const std::vector<unsigned int> &

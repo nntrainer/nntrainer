@@ -195,6 +195,9 @@ if not fs.exists(tokenizer_path)
   error('CausalLM tokenizer library not found: @0@'.format(tokenizer_path))
 endif
 
+causallm_inc_args += ['-I' + causallm_root / 'models' / 'lfm2_moe',
+                       '-I' + nntrainer_root / 'nntrainer' / 'tensor' / 'htp_backend']
+
 # ── libcausallm.so sources ────────────────────────────────────────────────
 # NOTE: Do NOT include causallm_root / 'api' sources here (besides streamer) -
 # the API layer is provided by libquick_dot_ai_api.so below; compiling it
@@ -205,6 +208,20 @@ endif
 # models/. This is the canonical Android core source manifest. The shared
 # LLM layers (lm_head, qkv, scalar_multiply, logit_softcapping, swiglu,
 # tie_word_embedding) live in libnntrainer (nntrainer/layers/llm), not here.
+causallm_htp_src = [
+  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_causallm.cpp',
+  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_moe_causallm.cpp',
+  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_weights.cpp',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_layer.cpp',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_htp_moe_causallm.cpp',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_pool_layer.cpp',
+  causallm_root / 'layers' / 'htp_mha_core.cpp',
+  causallm_root / 'layers' / 'htp_qkv_layer.cpp',
+  causallm_root / 'layers' / 'dense_ffn_layer.cpp',
+  causallm_root / 'layers' / 'residual_add.cpp',
+  causallm_root / 'layers' / 'conv_block_layer.cpp',
+]
+
 causallm_src = [
   causallm_root / 'chat_template.cpp',
   causallm_root / 'factory.cpp',
@@ -237,6 +254,7 @@ causallm_src = [
   causallm_root / 'models' / 'gemma4' / 'gemma4_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_moe_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_moe_layer.cpp',
+  causallm_root / 'models' / 'gemma4' / 'gemma4_moe_layer_gpu.cpp',
   causallm_root / 'models' / 'lfm2' / 'lfm2_causallm.cpp',
   causallm_root / 'models' / 'timm_vit' / 'timm_vit_transformer.cpp',
   causallm_root / 'models' / 'deberta_v2' / 'deberta_v2.cpp',
@@ -368,6 +386,29 @@ causallm_xgrammar_lib = static_library('causallm_xgrammar',
   override_options: ['werror=false'],
 )
 
+# PR 4416's Android fused graph was compiled with fast-math. Keep that
+# arithmetic local to its opt-in model/layers; main models retain their flags.
+causallm_htp_cpp_args = []
+if host_machine.system() == 'android'
+  causallm_htp_cpp_args += ['-ffast-math']
+endif
+causallm_htp_lib = static_library('causallm_htp',
+  causallm_htp_src,
+  dependencies: [nntrainer_dep, openmp_dep, log_dep],
+  cpp_args: causallm_inc_args + causallm_core_cpp_args + causallm_htp_cpp_args,
+)
+
+# The exact ARM router must not inherit the fused model's contraction flags.
+lfm2_router_arm_cpp_args = []
+if cxx.get_id() in ['gcc', 'clang', 'apple-clang']
+  lfm2_router_arm_cpp_args += ['-fno-fast-math', '-ffp-contract=off']
+endif
+lfm2_router_arm_lib = static_library('lfm2_router_arm',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_router_arm.cpp',
+  dependencies: [nntrainer_dep],
+  cpp_args: causallm_inc_args + lfm2_router_arm_cpp_args,
+)
+
 # ── Build libcausallm.so ─────────────────────────────────────────────────
 causallm_lib = shared_library('causallm',
     causallm_src,
@@ -375,7 +416,7 @@ causallm_lib = shared_library('causallm',
     dependencies: [nntrainer_dep, openmp_dep, log_dep],
     cpp_args: causallm_inc_args + causallm_core_cpp_args,
     link_args: [tokenizer_path],
-    link_whole: [causallm_xgrammar_lib],
+    link_whole: [causallm_xgrammar_lib, causallm_htp_lib, lfm2_router_arm_lib],
     install: true,
 )
 

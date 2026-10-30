@@ -10,6 +10,7 @@ causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d_la
 causallm_mha_core_abs = [meson.current_source_dir()/ 'mha_core.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
 causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms_norm.cpp']
+causallm_residual_add_src_abs = [meson.current_source_dir() / 'residual_add.cpp']
 causallm_rms_reverse_norm_src_abs = [meson.current_source_dir() / 'rms_reverse_norm.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
@@ -17,6 +18,8 @@ causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_atte
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
 causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
+causallm_dense_ffn_layer_src_abs = [meson.current_source_dir() / 'dense_ffn_layer.cpp']
+causallm_conv_block_layer_src_abs = [meson.current_source_dir() / 'conv_block_layer.cpp']
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
@@ -128,6 +131,48 @@ causallm_reshaped_rms_norm_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+
+causallm_residual_add = shared_library(
+    'residual_add',
+    causallm_residual_add_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_residual_add_dep = declare_dependency(
+    link_with: causallm_residual_add,
+    include_directories: causallm_layer_inc
+)
+
+causallm_dense_ffn_layer = shared_library(
+    'dense_ffn_layer',
+    causallm_dense_ffn_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_dense_ffn_layer_dep = declare_dependency(
+    link_with: causallm_dense_ffn_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_conv_block_layer = shared_library(
+    'conv_block_layer',
+    causallm_conv_block_layer_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_conv_block_layer_dep = declare_dependency(
+    link_with: causallm_conv_block_layer,
+    include_directories: causallm_layer_inc
+)
 
 causallm_deberta_attention_layer = shared_library(
     'deberta_attention_layer',

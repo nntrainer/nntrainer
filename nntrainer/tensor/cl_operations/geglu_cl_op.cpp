@@ -12,23 +12,32 @@
 
 #include "geglu_cl_op.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
+#include <blas_kernel_interface.h>
 #include <cl_gated_op.h>
 #include <cl_kernels/geglu.h>
 #include <engine.h>
 #include <nntrainer_log.h>
+#include <opencl_kernel.h>
 #include <tensor.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/geglu_fp16.h>
+#include <cl_kernels/geglu_q_fp16.h>
 #endif
 
 namespace nntrainer {
 
 namespace {
 
-enum Kernels { GEGLU_CL, GEGLU_CL_FP16 }; /**< kernels enum */
+enum Kernels {
+  GEGLU_CL,
+  GEGLU_ERF_CL,
+  GEGLU_CL_FP16,
+  GEGLU_ERF_CL_FP16
+}; /**< kernels enum */
 
 /**
  * @brief kernel objects registered for this op
@@ -57,11 +66,26 @@ bool registerGeGLUClKernels(ClContext &cl_context) {
     }
     op_kernel_ptrs.emplace_back(kernel_ptr);
 
+    kernel_ptr = cl_context.registerClKernel(geglu_kernel, "geglu_erf_cl");
+    if (!kernel_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_erf_cl kernel");
+      break;
+    }
+    op_kernel_ptrs.emplace_back(kernel_ptr);
+
 #ifdef ENABLE_FP16
     kernel_ptr =
       cl_context.registerClKernel(geglu_fp16_kernel, "geglu_cl_fp16");
     if (!kernel_ptr) {
       ml_loge("OpenCL Error: Fail to register geglu_cl_fp16 kernel");
+      break;
+    }
+    op_kernel_ptrs.emplace_back(kernel_ptr);
+
+    kernel_ptr =
+      cl_context.registerClKernel(geglu_fp16_kernel, "geglu_erf_cl_fp16");
+    if (!kernel_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_erf_cl_fp16 kernel");
       break;
     }
     op_kernel_ptrs.emplace_back(kernel_ptr);
@@ -76,8 +100,91 @@ bool registerGeGLUClKernels(ClContext &cl_context) {
   return false;
 }
 
-void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
-                 unsigned int active_rows, unsigned int row_offset) {
+namespace {
+
+#ifdef ENABLE_FP16
+/**
+ * @brief NNTR_FUSE_GEGLU_QUANT=0 keeps the plain GeGLU kernel on every call
+ *        (an A/B switch: the fused kernel writes the same bytes). Read once.
+ */
+bool gegluQuantOn() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_FUSE_GEGLU_QUANT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+/**
+ * @brief The decode-shaped FP16 GeGLU whose row feeds a v8c FC (the MLP down
+ *        projection): one kernel writes the GeGLU row and the int8
+ *        quantisation the FC would compute from it, and publishes that
+ *        through the norm->FC handoff, so the FC skips its own quant launch.
+ *
+ * Same contract as the fused norm (rmsnorm_cl_fp16): v8cNormQuantBegin admits
+ * only few-row calls and stops fusing at a site whose quantisation nothing
+ * claims, and the FC takes the handoff only when the write log says the row
+ * is still the one quantised. All three operands must be on the device plane
+ * (the FC's handoff test is keyed by the device buffer it reads).
+ *
+ * @return true when the fused kernel was enqueued (the GeGLU is done)
+ */
+bool gegluQuantHandoff(const GatedClOperands &dev, const _FP16 *in1,
+                       const _FP16 *in2, _FP16 *out, unsigned int rows,
+                       unsigned int width, bool exact) {
+  // The v8c quantiser the FC would run reads K % 64 == 0 rows; the fused
+  // kernel mirrors that one, so other widths keep the plain GeGLU.
+  if (!gegluQuantOn() || dev.in1 == nullptr || dev.in2 == nullptr ||
+      dev.out == nullptr || rows == 0 || width % 64 != 0)
+    return false;
+  // A site key per GeGLU form: the FC that claims the handoff is what keeps
+  // the fusion on, and every layer's GeGLU feeds its down projection alike.
+  static const char site_tanh = 0, site_erf = 0;
+  void *q_i8 = nullptr, *q_scale = nullptr, *q_zp = nullptr, *q_rs = nullptr;
+  if (!v8cNormQuantBegin(exact ? &site_erf : &site_tanh, rows, width, &q_i8,
+                         &q_scale, &q_zp, &q_rs))
+    return false;
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kq = cc->registerClKernel(
+    geglu_q_fp16_kernel, exact ? "geglu_erf_cl_fp16_q" : "geglu_cl_fp16_q");
+  cl_mem a = static_cast<cl_mem>(dev.in1), b = static_cast<cl_mem>(dev.in2),
+         o = static_cast<cl_mem>(dev.out), i8 = static_cast<cl_mem>(q_i8),
+         sca = static_cast<cl_mem>(q_scale), zpb = static_cast<cl_mem>(q_zp),
+         rsb = static_cast<cl_mem>(q_rs);
+  const int n_rows = (int)rows, w = (int)width;
+  bool ok = kq != nullptr && kq->SetKernelArguments(0, &a, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(1, &b, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(2, &o, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(3, &n_rows, sizeof(int)) &&
+            kq->SetKernelArguments(4, &w, sizeof(int)) &&
+            kq->SetKernelArguments(5, &i8, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(6, &sca, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(7, &zpb, sizeof(cl_mem)) &&
+            kq->SetKernelArguments(8, &rsb, sizeof(cl_mem));
+  // One work-group per row, as the fused norm: at one row the group is the
+  // dispatch, and 256 lanes is the width the FC's own decode quantiser uses.
+  constexpr int GEGLUQ_LWS = 256;
+  const int gws[3] = {GEGLUQ_LWS * n_rows, 1, 1};
+  const int lws[3] = {GEGLUQ_LWS, 1, 1};
+  if (ok) {
+    // The GeGLU row is the one graph tensor this writes; the int8 scratch is
+    // the FC's own.
+    opencl::Kernel::noteDispatchWrites(dev.out);
+    ok = cc->command_queue_inst_.DispatchCommand(kq, gws, lws);
+  }
+  if (!ok) {
+    v8cNormQuantAbort();
+    return false;
+  }
+  v8cNormQuantCommit(dev.out, rows, width);
+  return true;
+}
+#endif
+
+void geglu_cl_dispatch(const Tensor &in1, const Tensor &in2, Tensor &out,
+                       unsigned int active_rows, unsigned int row_offset,
+                       bool exact) {
   if (active_rows == 0)
     return;
 
@@ -113,13 +220,18 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
   const auto dt = in1.getDataType();
   if (dt == ml::train::TensorDim::DataType::FP32) {
     dispatchGatedClKernel<float>(
-      getOpKernelPtrs()[Kernels::GEGLU_CL], in1.getData<float>() + elem_off,
-      in2.getData<float>() + elem_off, out.getData<float>() + elem_off,
-      num_elems, use_svm, dev);
+      getOpKernelPtrs()[exact ? Kernels::GEGLU_ERF_CL : Kernels::GEGLU_CL],
+      in1.getData<float>() + elem_off, in2.getData<float>() + elem_off,
+      out.getData<float>() + elem_off, num_elems, use_svm, dev);
   } else if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+    if (use_svm &&
+        gegluQuantHandoff(dev, in1.getData<_FP16>(), in2.getData<_FP16>(),
+                          out.getData<_FP16>(), active_rows, width, exact))
+      return;
     dispatchGatedClKernel<_FP16>(
-      getOpKernelPtrs()[Kernels::GEGLU_CL_FP16],
+      getOpKernelPtrs()[exact ? Kernels::GEGLU_ERF_CL_FP16
+                              : Kernels::GEGLU_CL_FP16],
       in1.getData<_FP16>() + elem_off, in2.getData<_FP16>() + elem_off,
       out.getData<_FP16>() + elem_off, num_elems, use_svm, dev);
 #else
@@ -128,6 +240,18 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
   } else {
     throw std::invalid_argument("geglu_cl_op: unsupported data type");
   }
+}
+
+} // namespace
+
+void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
+                 unsigned int active_rows, unsigned int row_offset) {
+  geglu_cl_dispatch(in1, in2, out, active_rows, row_offset, false);
+}
+
+void geglu_erf_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset) {
+  geglu_cl_dispatch(in1, in2, out, active_rows, row_offset, true);
 }
 
 } // namespace nntrainer

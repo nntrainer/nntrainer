@@ -1,0 +1,2661 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   nntr_hvx_mm_u8i4.c
+ * @date   03 Aug 2026
+ * @brief  FastRPC entry points for the HMX u8i4 accuracy harness
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#include <float.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <AEEStdErr.h>
+#include <HAP_farf.h>
+#include <HAP_perf.h>
+#include <remote.h>
+
+#include "../htp_tl2_opts.h"
+#include "hexkl_conv_block.h"
+#include "hexkl_dma_ring.h"
+#include "hexkl_dma_trace.h"
+#include "hexkl_micro.h"
+#include "hexkl_mm_u8i4.h"
+#include "hexkl_mm_u8i4_dma.h"
+#include "hexkl_mm_u8i4_moe.h"
+#include "hexkl_mm_u8i8_dma.h"
+#include "hexkl_probe.h"
+#include "hvx_dequant_i32.h"
+#include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
+#include "hvx_router_rows_f32.h"
+#include "nntr_hvx.h"
+#include "nntr_hvx_session.h"
+
+/** @brief Rounds @a v up to a multiple of @a a. */
+#define ROUND_UP(v, a) ((((v) + ((a)-1)) / (a)) * (a))
+
+/**
+ * @brief Accuracy harness: the whole flow, quantization and dequantization
+ *        on the DSP, with every intermediate buffer returned so each stage
+ *        is checkable. Used by unittest_hvx_mm_u8i4's fixed shapes.
+ *
+ * hw_init and the HMX lock are session-scoped (nntr_hvx_open), not per
+ * call, since doc15 §8 item 3 turned this from a call that stood alone into
+ * one of several entry points sharing one session. The weight is still
+ * baked fresh every call -- that is the point of this harness, checking the
+ * bake -- unlike the resident-weight path in mm_u8i4_layer below.
+ */
+int nntr_hvx_mm_u8i4_from_f32(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
+  int act_f32Len, const int8 *w_i4_rm, int w_i4_rmLen, const float *w_scale,
+  int w_scaleLen, const int32 *colsum_w, int colsum_wLen, const float *bias,
+  int biasLen, uint8 *act_u8_ah, int act_u8_ahLen, float *act_scale,
+  int act_scaleLen, int32 *act_zp, int act_zpLen, int32 *acc_i32,
+  int acc_i32Len, float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+
+  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+
+  if ((uint32_t)act_f32Len != M * K || (uint32_t)w_i4_rmLen != K * N ||
+      (uint32_t)act_u8_ahLen != m_pad * K || (uint32_t)act_scaleLen != m_pad ||
+      (uint32_t)act_zpLen != m_pad || (uint32_t)acc_i32Len != m_pad * N ||
+      (uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      (uint32_t)biasLen != N || (uint32_t)out_f32Len != M * N) {
+    FARF(ERROR, "bad lengths (M=%u K=%u N=%u m_pad=%u)", (unsigned)M,
+         (unsigned)K, (unsigned)N, (unsigned)m_pad);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_mm_u8i4_layout L;
+  int res = hexkl_mm_u8i4_plan(s->vtcm_base, s->vtcm_size, m_pad, K, N, &L);
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "plan failed: 0x%08x", res);
+    return res;
+  }
+
+  // K1 then K2, writing the AH tiles straight into VTCM.
+  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp,
+                           s->quant_pool);
+  res = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                             s->vtcm_base + L.act_base, s->quant_pool);
+  if (res != AEE_SUCCESS) {
+    return res;
+  }
+  memcpy(act_u8_ah, s->vtcm_base + L.act_base, (size_t)m_pad * K);
+
+  // setup_acc_read_int32 already ran once in nntr_hvx_open for
+  // s->config_off, which hexkl_mm_u8i4_plan recomputes identically here
+  // (it is a pure function of vtcm_size) -- no need to call it again.
+  res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
+  if (res == AEE_SUCCESS) {
+    res = hexkl_mm_u8i4_run(&L, m_pad, K, N, acc_i32);
+  }
+
+  if (res == AEE_SUCCESS) {
+    hvx_dequant_i32_to_f32(acc_i32, M, m_pad, N, act_scale, act_zp, colsum_w,
+                           w_scale, bias, out_f32, /*accumulate=*/0);
+  }
+  return res;
+}
+
+/**
+ * @brief Bakes a K x N int4 weight once and keeps it resident until
+ *        weight_release_u8i4 -- see hexkl_mm_u8i4_dma.h.
+ */
+static int finish_affine_registration(nntr_hvx_session *s, int rc,
+                                      const float *bias, uint32_t N,
+                                      int bias_len, uint32_t *handle) {
+  if (rc == AEE_SUCCESS && (uint32_t)bias_len == 2u * N) {
+    rc =
+      hexkl_weight_u8i4_set_offsets(&s->weights_u8i4.slots[*handle], bias + N);
+    if (rc != AEE_SUCCESS)
+      hexkl_weight_u8i4_release(&s->weights_u8i4, *handle);
+  }
+  return rc;
+}
+
+int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
+                                  const int8 *w_i4_rm, int w_i4_rmLen,
+                                  const float *w_scale, int w_scaleLen,
+                                  const int32 *colsum_w, int colsum_wLen,
+                                  const float *bias, int biasLen,
+                                  uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)w_i4_rmLen != K * N || (uint32_t)w_scaleLen != N ||
+      (uint32_t)colsum_wLen != N ||
+      ((uint32_t)biasLen != N && (uint32_t)biasLen != 2u * N)) {
+    FARF(ERROR, "weight_register_u8i4: bad lengths (K=%u N=%u)", (unsigned)K,
+         (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  const int rc = hexkl_weight_u8i4_register(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, K, N, w_i4_rm, w_scale,
+    colsum_w, bias, s->quant_pool, w_handle);
+  return finish_affine_registration(s, rc, bias, N, biasLen, w_handle);
+}
+
+int nntr_hvx_weight_bake_export(remote_handle64 handle, uint32 w_handle,
+                                uint8 *wh_out, int wh_outLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || wh_outLen < 0) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_export(&s->weights_u8i4, w_handle, wh_out,
+                                  (uint32_t)wh_outLen);
+}
+
+int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  /** [#85] The arena_detach rule, one level up: a handle the live graph's
+     MoE ops name stays registered until graph_release. */
+  if (hexkl_graph_uses_handle(s->graph, w_handle)) {
+    FARF(ERROR, "weight_release_u8i4: handle %u is bound in the graph",
+         (unsigned)w_handle);
+    return AEE_EBADSTATE;
+  }
+  return hexkl_weight_u8i4_release(&s->weights_u8i4, w_handle);
+}
+
+/**
+ * @brief Runs a layer's worth of matmuls (Q/K/V, or gate/up) against one
+ *        shared activation -- see hexkl_mm_u8i4_dma.h. This is the entry
+ *        point PR③'s ComputeOps seam will call; nntr_hvx_mm_u8i4_from_f32
+ *        above stays the accuracy harness.
+ */
+/**
+ * @brief Slots mm_u8i4_layer_timed fills, in order.
+ *
+ * MUST match the same enum in nntr_hvx_mm_u8i8.c and the kStage list in
+ * unittest_hvx_fc.cpp: the ARM side cannot include this header, so the entry
+ * point rejects a stale count with AEE_EBADPARM rather than silently
+ * truncating. Restated per width rather than shared, the same call this tree
+ * already made for the two dma modules.
+ */
+enum {
+  FC_T_DSP_TOTAL = 0, /**< the whole layer_run call, DSP clock */
+  FC_T_QUANT,         /**< act f32 -> u8 AH in VTCM */
+  FC_T_DEQUANT,       /**< i32 -> f32, in place on the VTCM tile */
+  FC_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor */
+  FC_T_ACC_COPY,      /**< VTCM -> DDR staging; 0 on the in-place path */
+  FC_T_DRAIN,         /**< DMA waits */
+  FC_T_ACC_STRIDE,    /**< not a time: the derived row stride, 0 if fallback */
+  FC_N_STAGES
+};
+
+/**
+ * @brief [doc 45 Gate 0b] The DSP PD's own allocatable memory.
+ *
+ * Gate 0 stopped at 1.89 GB with 0x8000040d, an error raised before
+ * hexkl_weight_u8i4_register ran -- registration's own out-of-memory path
+ * returns AEE_ENOMEMORY. So the PD could not service the call at all, and
+ * what ran out was PD memory generally rather than the malloc heap the
+ * baked weights live in. This probe carries no payload, so whatever it
+ * reaches is the heap ceiling on its own, with none of the 3.67 MB input
+ * buffer registration also needs in flight.
+ *
+ * Every chunk is touched one byte per 4 KB page: an allocator that reserves
+ * lazily would otherwise report a ceiling that does not exist once the
+ * pages are actually written.
+ */
+/** Gate 0c. HAP_mem.h is the first use of that header in this tree, so the
+   probe reports "unavailable" rather than failing the build if the SDK in
+   use does not ship it -- a probe that cannot compile is worse than one
+   that answers no. */
+#if defined(__has_include)
+#if __has_include(<HAP_mem.h>)
+#include <HAP_mem.h>
+#define NNTR_HAVE_HAP_MMAP 1
+#endif
+#endif
+
+int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
+                         uint32 dma_bytes, uint32 *res, int resLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !res || resLen < 10) {
+    return AEE_EBADPARM;
+  }
+  for (int i = 0; i < resLen; ++i) {
+    res[i] = 0;
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  (void)fd;
+  (void)bytes;
+  (void)dma_bytes;
+  FARF(ERROR, "arena_probe: HAP_mem.h not available in this SDK");
+  return AEE_EUNSUPPORTED;
+#else
+  if (dma_bytes == 0u || dma_bytes > bytes || dma_bytes > s->vtcm_size) {
+    return AEE_EBADPARM;
+  }
+  {
+    uint64_t t0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+    /** prot and flags are written numerically because PROT_* and MAP_* are
+       host macros and a missing one would be a build break in a probe whose
+       job is to answer. That cost a device cycle: attempt 2 passed flags=0,
+       and POSIX mmap requires exactly one of MAP_SHARED or MAP_PRIVATE, so
+       it came back MAP_FAILED. Rather than guess the next single value, try
+       the small set that could be right and report which one the device
+       accepts -- one run instead of three. */
+    static const struct {
+      int prot;
+      int flags;
+    } kTry[] = {
+      {1 | 2, 1}, /* 1 rw | shared  */
+      {1, 1},     /* 2 r  | shared  */
+      {1 | 2, 2}, /* 3 rw | private */
+      {1, 2},     /* 4 r  | private */
+      {1 | 2, 0}, /* 5 rw | 0 -- attempt 2's, kept so a pass here is visible */
+    };
+    const uint32_t n_try = (uint32_t)(sizeof(kTry) / sizeof(kTry[0]));
+    void *va = NULL;
+    uint64_t t1 = t0;
+    int used_get = 0;
+
+    /** Ask for the mapping the host already made, before trying to make one.
+       HAP_mem.h declares this as (fd, void **vaddr, uint64 *paddr) -- the
+       third argument is the physical address, not a size, so there is
+       nothing to check the length against here; the host sized the buffer.
+       res[8] keeps the return code and res[9] the low half of the physical
+       address, which separates "mapped somewhere real" from a zero that
+       happens to come back with rc 0. */
+    {
+      void *gp = NULL;
+      uint64 gpa = 0;
+      const int grc = HAP_mmap_get(fd, &gp, &gpa);
+      res[8] = (uint32)grc;
+      res[9] = (uint32)(gpa & 0xFFFFFFFFu);
+      if (grc == 0 && gp != NULL) {
+        va = gp;
+        used_get = 1;
+        t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+        res[6] = 6u; /* past the five prot/flags pairs */
+      }
+    }
+
+    for (uint32_t ti = 0; va == NULL && ti < n_try; ++ti) {
+      void *p =
+        HAP_mmap(NULL, (int)bytes, kTry[ti].prot, kTry[ti].flags, fd, 0);
+      if (p != NULL && p != (void *)-1) {
+        va = p;
+        t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+        res[6] = ti + 1u; /* 1-based: 0 stays "none worked" */
+        break;
+      }
+      /** Null and MAP_FAILED apart: null reads as "this fd is unknown here",
+         MAP_FAILED as "known and refused". Attempt 1 could not tell them
+         apart and spent a cycle on it. Two bits per attempt. */
+      res[7] |= (uint32)((p == NULL ? 1u : 2u) << (ti * 2u));
+    }
+    if (va == NULL) {
+      FARF(ERROR,
+           "arena_probe: every HAP_mmap prot/flags pair failed "
+           "(fd=%d bytes=%u mask=0x%x)",
+           (int)fd, (unsigned)bytes, (unsigned)res[7]);
+      return AEE_ENOMEMORY;
+    }
+    res[0] = 1u;
+    res[1] = (uint32)(t1 - t0);
+    (void)n_try;
+
+    /** One 2D transfer out of the mapping into VTCM, same shape the weight
+       pusher uses, so the rate is comparable to the 27-33 GB/s the profile
+       already reports for DSP-heap weights. */
+    {
+      uint32_t rs = 4096u;
+      while (rs > 1u && (dma_bytes % rs) != 0u) {
+        rs >>= 1;
+      }
+      hexkl_dma_ring_reset();
+      uint64_t d0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+      hexkl_dma_ring_push2d(s->vtcm_base, va, rs, rs, rs, dma_bytes / rs,
+                            /*src_vtcm=*/0, /*dst_vtcm=*/1);
+      hexkl_dma_ring_drain();
+      uint64_t d1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+      res[2] = (uint32)(d1 - d0);
+      res[3] = dma_bytes;
+    }
+
+    /** Summed so the transfer cannot be elided and an all-zero mapping --
+       which would look like a success with a garbage rate -- is visible. */
+    {
+      uint32_t sum = 0;
+      const uint8_t *p = (const uint8_t *)s->vtcm_base;
+      for (uint32_t i = 0; i < dma_bytes; i += 64u) {
+        sum += p[i];
+      }
+      res[4] = sum;
+    }
+    /** Release through whichever call handed it over: a mapping obtained
+       with HAP_mmap_get belongs to the host's attachment and is given back
+       with HAP_mmap_put, not unmapped. */
+    if (used_get) {
+      res[5] = (HAP_mmap_put(fd) == 0) ? 1u : 0u;
+    } else {
+      res[5] = (HAP_munmap(va, (int)bytes) == 0) ? 1u : 0u;
+    }
+  }
+  return AEE_SUCCESS;
+#endif
+}
+
+/* ---- the arena (doc 46 section 32) ------------------------------------- */
+
+static nntr_hvx_arena *nntr_hvx_arena_slot(nntr_hvx_session *s, uint32 arena) {
+  if (arena >= NNTR_HVX_MAX_ARENAS || s->arenas[arena].va == NULL) {
+    return NULL;
+  }
+  return &s->arenas[arena];
+}
+
+int nntr_hvx_arena_attach(remote_handle64 handle, int32 fd, uint32 bytes,
+                          uint32 *arena) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !arena || bytes == 0u) {
+    return AEE_EBADPARM;
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  (void)fd;
+  FARF(ERROR, "arena_attach: HAP_mem.h not available in this SDK");
+  return AEE_EUNSUPPORTED;
+#else
+  {
+    uint32 i;
+    for (i = 0; i < NNTR_HVX_MAX_ARENAS; ++i) {
+      if (s->arenas[i].va == NULL) {
+        break;
+      }
+    }
+    if (i == NNTR_HVX_MAX_ARENAS) {
+      return AEE_ENOMEMORY;
+    }
+    {
+      void *va = NULL;
+      uint64 pa = 0;
+      const int rc = HAP_mmap_get((int)fd, &va, &pa);
+      if (rc != 0 || va == NULL) {
+        FARF(ERROR, "arena_attach: HAP_mmap_get(fd=%d) rc=0x%08x", (int)fd,
+             (unsigned)rc);
+        return rc != 0 ? rc : AEE_ENOMEMORY;
+      }
+      s->arenas[i].fd = (int)fd;
+      s->arenas[i].va = (uint8_t *)va;
+      s->arenas[i].bytes = bytes;
+    }
+    *arena = i;
+    return AEE_SUCCESS;
+  }
+#endif
+}
+
+int nntr_hvx_arena_detach(remote_handle64 handle, uint32 arena) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  nntr_hvx_arena *a;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  a = nntr_hvx_arena_slot(s, arena);
+  if (!a) {
+    return AEE_EBADPARM;
+  }
+  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes) ||
+      nntr_hvx_q4m1_borrows(s, a->va, a->bytes)) {
+    return AEE_EBADSTATE; /* [#132 Part B E3] q4m1_attach borrows too */
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  return AEE_EUNSUPPORTED;
+#else
+  {
+    const int rc = HAP_mmap_put(a->fd);
+    memset(a, 0, sizeof(*a));
+    return rc == 0 ? AEE_SUCCESS : rc;
+  }
+#endif
+}
+
+void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
+#ifdef NNTR_HAVE_HAP_MMAP
+  uint32 i;
+  for (i = 0; i < NNTR_HVX_MAX_ARENAS; ++i) {
+    if (s->arenas[i].va != NULL) {
+      HAP_mmap_put(s->arenas[i].fd);
+      memset(&s->arenas[i], 0, sizeof(s->arenas[i]));
+    }
+  }
+#else
+  (void)s;
+#endif
+}
+
+/** @brief The address of a K x N weight at @a wh_off in arena @a arena, or
+ *  NULL when the arena is unknown or the weight runs past its end. With
+ *  @a tail, the 8*N bytes of scales and column sums after it must fit too
+ *  (doc 52 section 10.30). The extent check is here and not only in the
+ *  registry: the registry sees a pointer, this is the one place that knows
+ *  how big the mapping behind it is. Overflow-safe in 64-bit. */
+static const uint8_t *arena_weight_at(nntr_hvx_session *s, uint32 arena,
+                                      uint32 wh_off, uint32 K, uint32 N,
+                                      int tail, uint32 bits) {
+  const nntr_hvx_arena *a = nntr_hvx_arena_slot(s, arena);
+  /* 512 bytes a 32x32 tile at four bits, 256 at two. */
+  const uint64_t codes = bits == HTP_TL2_COMPACT_WEIGHT_BITS
+                           ? htp_tl2_native_bytes(K, N)
+                           : (uint64_t)(K / 32u) * (N / 32u) * (bits * 128u);
+  const uint64_t bytes = codes + (tail ? 8u * (uint64_t)N : 0u);
+  if (!a) {
+    return NULL;
+  }
+  if ((uint64_t)wh_off + bytes > a->bytes) {
+    FARF(ERROR, "weight arena: off=%u + %u past arena %u", (unsigned)wh_off,
+         (unsigned)bytes, (unsigned)a->bytes);
+    return NULL;
+  }
+  return a->va + wh_off;
+}
+
+int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
+                                        uint32 N, uint32 arena, uint32 wh_off,
+                                        const float *w_scale, int w_scaleLen,
+                                        const int32 *colsum_w, int colsum_wLen,
+                                        const float *bias, int biasLen,
+                                        uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint8_t *wh;
+  if (!s || !w_handle) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      ((uint32_t)biasLen != N && (uint32_t)biasLen != 2u * N)) {
+    FARF(ERROR, "weight_register_u8i4_arena: bad lengths (K=%u N=%u)",
+         (unsigned)K, (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0, 4u);
+  if (!wh) {
+    return AEE_EBADPARM;
+  }
+  const int rc =
+    hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N, wh,
+                                     w_scale, colsum_w, bias, w_handle);
+  return finish_affine_registration(s, rc, bias, N, biasLen, w_handle);
+}
+
+/** @brief One weight of a swap: registered from the arena with the given
+ *  arrays, or, when @a w_scale is NULL, with the scales and column sums
+ *  that follow it there and a zero bias. A non-NULL @a pal registers
+ *  QS2CX_WH codes (tail only). */
+static int swap_register_one(nntr_hvx_session *s, uint32 K, uint32 N,
+                             uint32 arena, uint32 wh_off, const int8 *pal,
+                             const float *w_scale, const int32 *colsum_w,
+                             const float *bias, uint32 *out, int compact) {
+  const uint8_t *wh = arena_weight_at(s, arena, wh_off, K, N, w_scale == NULL,
+                                      compact ? HTP_TL2_COMPACT_WEIGHT_BITS
+                                      : pal   ? 2u
+                                              : 4u);
+  if (!wh) {
+    return AEE_EBADPARM;
+  }
+  if (compact)
+    return hexkl_weight_tl2_compact_register_arena(&s->weights_u8i4,
+                                                   s->vtcm_size, K, N, wh, out);
+  if (pal) {
+    return hexkl_weight_u2i4_register_arena(&s->weights_u8i4, s->vtcm_size, K,
+                                            N, wh, (const int8_t *)pal, NULL,
+                                            NULL, NULL, out);
+  }
+  return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          wh, w_scale, colsum_w, bias, out);
+}
+
+/** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
+#define NNTR_HVX_NO_HANDLE 0xFFFFFFFFu
+
+/** @brief True for a live handle whose bytes are borrowed from an arena --
+ *  the only kind weight_swap_u8i4_arena may release, since the host's
+ *  expert pool never owns a heap-baked weight. */
+static int swap_releasable(const hexkl_weight_u8i4_table *tbl, uint32 h) {
+  return h < HEXKL_MM_U8I4_MAX_WEIGHTS && tbl->slots[h].in_use &&
+         tbl->slots[h].borrowed;
+}
+
+/** @brief weight_swap_u8i4_arena's body; non-NULL @a pal_gu / @a pal_dn
+ *  (four int4 codes each, both or neither) make the pair QS2CX_WH, whose
+ *  scales and column sums are always in the arena. */
+static int swap_pair(remote_handle64 handle, uint32 old_gu, uint32 old_dn,
+                     uint32 K, uint32 inter, uint32 N_out, uint32 arena,
+                     uint32 off_gu, uint32 off_dn, const int8 *pal_gu,
+                     const int8 *pal_dn, const float *gu_scale, int gu_scaleLen,
+                     const int32 *gu_colsum, int gu_colsumLen,
+                     const float *dn_scale, int dn_scaleLen,
+                     const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
+                     uint32 *h_dn, int compact) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32 bits = compact ? HTP_TL2_COMPACT_WEIGHT_BITS : pal_gu ? 2u : 4u;
+  const uint32 n_gu = 2u * inter;
+  const int release_old =
+    !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
+  /** [doc 52 section 10.30] Empty sequences: the scales and column sums are
+     in the arena after each weight's WH bytes, and the registry takes them
+     from there. The host's expert pool always sends them that way now; the
+     arrays stay accepted for the tests and for an older host. */
+  const int tail = gu_scaleLen == 0 && gu_colsumLen == 0 && dn_scaleLen == 0 &&
+                   dn_colsumLen == 0;
+  float *bias = NULL;
+  uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
+  int rc;
+  if (compact && (!K || !inter || !N_out || K > 8192u || inter > 4096u ||
+                  N_out > 8192u || K % 32u || inter % 64u || N_out % 128u))
+    return AEE_EBADPARM;
+  if (!s || !h_gu || !h_dn || !pal_gu != !pal_dn || (pal_gu && !tail)) {
+    return AEE_EBADPARM;
+  }
+  if (!tail &&
+      ((uint32_t)gu_scaleLen != n_gu || (uint32_t)gu_colsumLen != n_gu ||
+       (uint32_t)dn_scaleLen != N_out || (uint32_t)dn_colsumLen != N_out)) {
+    FARF(ERROR, "weight_swap_u8i4_arena: bad lengths (K=%u inter=%u N=%u)",
+         (unsigned)K, (unsigned)inter, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if (tail) {
+    gu_scale = dn_scale = NULL;
+    gu_colsum = dn_colsum = NULL;
+  }
+  /** Checked before anything is registered, so a bad pair costs nothing:
+     both or neither, both arena-borrowed, and not the same handle twice. */
+  if (release_old &&
+      (old_gu == old_dn || !swap_releasable(&s->weights_u8i4, old_gu) ||
+       !swap_releasable(&s->weights_u8i4, old_dn))) {
+    FARF(ERROR, "weight_swap_u8i4_arena: old pair %u/%u is not releasable",
+         (unsigned)old_gu, (unsigned)old_dn);
+    return AEE_EBADPARM;
+  }
+  /** [doc 52 section 10.25] The retired pair has the new expert's shape --
+     every swap in the expert pool -- so rebind both handles in place: no
+     allocation, no free, no slot search, which were most of a swap's DSP
+     time. Everything that can refuse is checked before either is touched,
+     so a refusal still leaves the old pair as it was. */
+  if (release_old && s->weights_u8i4.slots[old_gu].K == K &&
+      s->weights_u8i4.slots[old_gu].N == n_gu &&
+      s->weights_u8i4.slots[old_dn].K == inter &&
+      s->weights_u8i4.slots[old_dn].N == N_out) {
+    const uint8_t *wg = arena_weight_at(s, arena, off_gu, K, n_gu, tail, bits);
+    const uint8_t *wd =
+      arena_weight_at(s, arena, off_dn, inter, N_out, tail, bits);
+    /** 512: the registry's WEIGHT_TILE_BYTES_U8I4, which rebind also checks
+       -- checked here too so the second rebind cannot refuse after the
+       first has landed. */
+    if (!wg || !wd || ((uintptr_t)wg % 512u) != 0u ||
+        ((uintptr_t)wd % 512u) != 0u) {
+      return AEE_EBADPARM;
+    }
+    rc = compact
+           ? hexkl_weight_tl2_compact_rebind_arena(&s->weights_u8i4, old_gu, K,
+                                                   n_gu, wg)
+           : hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_gu, K, n_gu,
+                                            wg, (const int8_t *)pal_gu,
+                                            gu_scale, gu_colsum);
+    if (rc == AEE_SUCCESS) {
+      rc = compact
+             ? hexkl_weight_tl2_compact_rebind_arena(&s->weights_u8i4, old_dn,
+                                                     inter, N_out, wd)
+             : hexkl_weight_u8i4_rebind_arena(&s->weights_u8i4, old_dn, inter,
+                                              N_out, wd, (const int8_t *)pal_dn,
+                                              dn_scale, dn_colsum);
+    }
+    if (rc != AEE_SUCCESS) { /* unreachable after the checks above */
+      return rc;
+    }
+    *h_gu = old_gu;
+    *h_dn = old_dn;
+    return AEE_SUCCESS;
+  }
+  if (!tail) {
+    bias = (float *)calloc(n_gu > N_out ? n_gu : N_out, sizeof(float));
+    if (!bias) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  rc = swap_register_one(s, K, n_gu, arena, off_gu, pal_gu, gu_scale, gu_colsum,
+                         bias, &g, compact);
+  if (rc == AEE_SUCCESS) {
+    rc = swap_register_one(s, inter, N_out, arena, off_dn, pal_dn, dn_scale,
+                           dn_colsum, bias, &d, compact);
+    if (rc != AEE_SUCCESS) {
+      hexkl_weight_u8i4_release(&s->weights_u8i4, g);
+    }
+  }
+  free(bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* Last, and validated above, so these cannot fail. */
+  if (release_old) {
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_gu);
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_dn);
+  }
+  *h_gu = g;
+  *h_dn = d;
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_swap_u8i4_arena(
+  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
+  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
+  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
+  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
+  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+  return swap_pair(handle, old_gu, old_dn, K, inter, N_out, arena, off_gu,
+                   off_dn, NULL, NULL, gu_scale, gu_scaleLen, gu_colsum,
+                   gu_colsumLen, dn_scale, dn_scaleLen, dn_colsum, dn_colsumLen,
+                   h_gu, h_dn, 0);
+}
+
+/** [PR 4428] A +-1 sequence as the kernel's sign-bit masks, or NULL. */
+static uint32_t *had_sign_masks(const float *s, int n, int *ok) {
+  uint32_t *m = NULL;
+  int i;
+  if (n == 0) {
+    return NULL;
+  }
+  m = (uint32_t *)malloc((size_t)n * sizeof(uint32_t) + 128u);
+  if (!m) {
+    *ok = 0;
+    return NULL;
+  }
+  for (i = 0; i < n; ++i) {
+    if (s[i] != 1.0f && s[i] != -1.0f) {
+      free(m);
+      *ok = 0;
+      return NULL;
+    }
+    m[i] = s[i] < 0.0f ? 0x80000000u : 0u;
+  }
+  return m;
+}
+
+int nntr_hvx_moe_set_hadamard_signs(remote_handle64 handle, const float *s_in,
+                                    int s_inLen, const float *s_down,
+                                    int s_downLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint32_t *in, *down;
+  int ok = 1;
+  if (!s || s_inLen < 0 || s_downLen < 0 || (s_inLen % 32) != 0 ||
+      (s_downLen % 32) != 0 || (s_inLen > 0 && !s_in) ||
+      (s_downLen > 0 && !s_down)) {
+    return AEE_EBADPARM;
+  }
+  in = had_sign_masks(s_in, s_inLen, &ok);
+  down = ok ? had_sign_masks(s_down, s_downLen, &ok) : NULL;
+  if (!ok) {
+    free(in);
+    free(down);
+    return AEE_EBADPARM;
+  }
+  hexkl_moe_set_hadamard_signs(NULL, 0u, NULL, 0u);
+  free(s->had_sign_in);
+  free(s->had_sign_down);
+  s->had_sign_in = in;
+  s->had_sign_down = down;
+  s->had_sign_in_n = (uint32_t)s_inLen;
+  s->had_sign_down_n = (uint32_t)s_downLen;
+  hexkl_moe_set_hadamard_signs(in, (uint32_t)s_inLen, down,
+                               (uint32_t)s_downLen);
+  return AEE_SUCCESS;
+}
+
+/** Attach checkpoint input encodings to registered weights. */
+int nntr_hvx_weight_set_static_quant(remote_handle64 handle,
+                                     const uint32 *handles, int handlesLen,
+                                     const float *scales, int scalesLen,
+                                     const int32 *zero_points,
+                                     int zero_pointsLen, uint32 gate_plus1,
+                                     uint32 up_plus1) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || handlesLen <= 0 || scalesLen != handlesLen ||
+      zero_pointsLen != handlesLen || !handles || !scales || !zero_points ||
+      ((gate_plus1 == 0) != (up_plus1 == 0)))
+    return AEE_EBADPARM;
+  if (gate_plus1 && (gate_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS ||
+                     up_plus1 > HEXKL_MM_U8I4_MAX_WEIGHTS ||
+                     !s->weights_u8i4.slots[gate_plus1 - 1].in_use ||
+                     !s->weights_u8i4.slots[up_plus1 - 1].in_use))
+    return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i)
+    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[handles[i]].in_use ||
+        !(scales[i] >= FLT_MIN && scales[i] <= FLT_MAX / 255.0f) ||
+        zero_points[i] < 0 || zero_points[i] > 255)
+      return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    w->static_scale = scales[i];
+    w->static_zp = zero_points[i];
+    w->static_gate_plus1 = gate_plus1;
+    w->static_up_plus1 = up_plus1;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_set_offsets_batch(remote_handle64 handle,
+                                      const uint32 *handles, int handlesLen,
+                                      const uint32 *n_per, int n_perLen,
+                                      const float *offsets, int offsetsLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t total = 0;
+  int i;
+  if (!s || handlesLen < 0 || n_perLen != handlesLen || offsetsLen < 0 ||
+      (handlesLen > 0 && (!handles || !n_per || !offsets))) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < handlesLen; ++i) {
+    total += n_per[i];
+  }
+  if (total != (uint64_t)offsetsLen) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = handles[i] < HEXKL_MM_U8I4_MAX_WEIGHTS
+                             ? &s->weights_u8i4.slots[handles[i]]
+                             : NULL;
+    int rc;
+    if (!w || !w->in_use || w->N != n_per[i]) {
+      return AEE_EBADPARM;
+    }
+    rc = hexkl_weight_u8i4_set_offsets(w, offsets);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    offsets += n_per[i];
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_swap_batch_u8i4_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, const float *gu_scale, int gu_scaleLen,
+  const int32 *gu_colsum, int gu_colsumLen, const float *dn_scale,
+  int dn_scaleLen, const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu,
+  int h_guLen, uint32 *h_dn, int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  const uint32 n_gu = 2u * inter;
+  /* Empty sequences for all four: every expert's tail is in the arena. */
+  const int tail = gu_scaleLen == 0 && gu_colsumLen == 0 && dn_scaleLen == 0 &&
+                   dn_colsumLen == 0;
+  int i, rc = AEE_SUCCESS;
+  if (!handle || !n_done || !err) {
+    return AEE_EBADPARM;
+  }
+  *n_done = 0;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (!tail && ((uint64_t)gu_scaleLen != (uint64_t)n * n_gu ||
+                 (uint64_t)gu_colsumLen != (uint64_t)n * n_gu ||
+                 (uint64_t)dn_scaleLen != (uint64_t)n * N_out ||
+                 (uint64_t)dn_colsumLen != (uint64_t)n * N_out))) {
+    FARF(ERROR, "weight_swap_batch_u8i4_arena: bad lengths (n=%d)", n);
+    return AEE_EBADPARM;
+  }
+  /** One expert at a time through the single call, so each keeps its
+     all-or-nothing guarantee and the batch stops at the first refusal. */
+  for (i = 0; i < n; ++i) {
+    rc = tail
+           ? nntr_hvx_weight_swap_u8i4_arena(handle, old_gu[i], old_dn[i], K,
+                                             inter, N_out, arena[i], off_gu[i],
+                                             off_dn[i], NULL, 0, NULL, 0, NULL,
+                                             0, NULL, 0, &h_gu[i], &h_dn[i])
+           : nntr_hvx_weight_swap_u8i4_arena(
+               handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+               off_gu[i], off_dn[i], gu_scale + (size_t)i * n_gu, (int)n_gu,
+               gu_colsum + (size_t)i * n_gu, (int)n_gu,
+               dn_scale + (size_t)i * N_out, (int)N_out,
+               dn_colsum + (size_t)i * N_out, (int)N_out, &h_gu[i], &h_dn[i]);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
+int nntr_hvx_weight_swap_batch_u2i4_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, const int8 *pal_gu, int pal_guLen,
+  const int8 *pal_dn, int pal_dnLen, uint32 *h_gu, int h_guLen, uint32 *h_dn,
+  int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  int i, rc = AEE_SUCCESS;
+  if (!handle || !n_done || !err) {
+    return AEE_EBADPARM;
+  }
+  *n_done = 0;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (int64_t)pal_guLen != 4 * (int64_t)n ||
+      (int64_t)pal_dnLen != 4 * (int64_t)n) {
+    FARF(ERROR, "weight_swap_batch_u2i4_arena: bad lengths (n=%d)", n);
+    return AEE_EBADPARM;
+  }
+  /* As the 4-bit batch: one expert at a time, stop at the first refusal. */
+  for (i = 0; i < n; ++i) {
+    rc = swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+                   off_gu[i], off_dn[i], pal_gu + 4 * i, pal_dn + 4 * i, NULL,
+                   0, NULL, 0, NULL, 0, NULL, 0, &h_gu[i], &h_dn[i], 0);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS; /* a partial batch reports through n_done and err */
+}
+
+int nntr_hvx_weight_swap_batch_tl2_compact_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, uint32 *h_gu, int h_guLen, uint32 *h_dn,
+  int h_dnLen, uint32 *n_done, int32 *err) {
+  const int n = old_guLen;
+  if (!handle || !n_done || !err)
+    return AEE_EBADPARM;
+  *n_done = 0u;
+  *err = AEE_SUCCESS;
+  if (n < 0 || old_dnLen != n || arenaLen != n || off_guLen != n ||
+      off_dnLen != n || h_guLen != n || h_dnLen != n ||
+      (n &&
+       (!old_gu || !old_dn || !arena || !off_gu || !off_dn || !h_gu || !h_dn)))
+    return AEE_EBADPARM;
+  for (int i = 0; i < n; ++i) {
+    const int rc =
+      swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+                off_gu[i], off_dn[i], NULL, NULL, NULL, 0, NULL, 0, NULL, 0,
+                NULL, 0, &h_gu[i], &h_dn[i], 1);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_swap_batch_tl2_stable_arena(
+  remote_handle64 handle, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *old_gu, int old_guLen, const uint32 *old_dn, int old_dnLen,
+  const uint32 *arena, int arenaLen, const uint32 *off_gu, int off_guLen,
+  const uint32 *off_dn, int off_dnLen, uint32 *h_gu, int h_guLen, uint32 *h_dn,
+  int h_dnLen, uint32 *n_done, int32 *err) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const int n = old_guLen;
+  if (!s || !n_done || !err)
+    return AEE_EBADPARM;
+  *n_done = 0u;
+  *err = AEE_SUCCESS;
+  if (K != 2048u || inter != 1536u || N_out != 2048u || n < 0 ||
+      old_dnLen != n || arenaLen != n || off_guLen != n || off_dnLen != n ||
+      h_guLen != n || h_dnLen != n ||
+      (n &&
+       (!old_gu || !old_dn || !arena || !off_gu || !off_dn || !h_gu || !h_dn)))
+    return AEE_EBADPARM;
+  const uint32_t tail_end =
+    (uint32_t)htp_tl2_native_bytes(K, 2u * inter) + 16u * inter;
+  const uint32_t gu_stride = (tail_end + 4095u) & ~4095u;
+  for (int i = 0; i < n; ++i) {
+    const uint8_t *gu = arena_weight_at(s, arena[i], off_gu[i], K, 2u * inter,
+                                        1, HTP_TL2_COMPACT_WEIGHT_BITS);
+    if (!gu || tail_end % 128u || tail_end + 128u > gu_stride ||
+        (uint64_t)off_gu[i] + gu_stride != off_dn[i] ||
+        (uint64_t)off_gu[i] + tail_end + 128u > s->arenas[arena[i]].bytes) {
+      *err = AEE_EBADPARM;
+      break;
+    }
+    const int rc =
+      swap_pair(handle, old_gu[i], old_dn[i], K, inter, N_out, arena[i],
+                off_gu[i], off_dn[i], NULL, NULL, NULL, 0, NULL, 0, NULL, 0,
+                NULL, 0, &h_gu[i], &h_dn[i], 1);
+    if (rc != AEE_SUCCESS) {
+      *err = rc;
+      break;
+    }
+    hexkl_weight_tl2_set_generation(&s->weights_u8i4.slots[h_gu[i]],
+                                    (const uint32_t *)(gu + tail_end));
+    *n_done = (uint32)(i + 1);
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_weight_register_u2i4_arena(remote_handle64 handle, uint32 K,
+                                        uint32 N, uint32 arena, uint32 wh_off,
+                                        const int8 *pal, int palLen,
+                                        const float *w_scale, int w_scaleLen,
+                                        const int32 *colsum_w, int colsum_wLen,
+                                        const float *bias, int biasLen,
+                                        uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint8_t *wh;
+  if (!s || !w_handle || !pal) {
+    return AEE_EBADPARM;
+  }
+  if (palLen != 4 || (uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      (uint32_t)biasLen != N) {
+    FARF(ERROR, "weight_register_u2i4_arena: bad lengths (K=%u N=%u pal=%d)",
+         (unsigned)K, (unsigned)N, palLen);
+    return AEE_EBADPARM;
+  }
+  wh = arena_weight_at(s, arena, wh_off, K, N, /*tail=*/0, 2u);
+  if (!wh) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u2i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          wh, (const int8_t *)pal, w_scale,
+                                          colsum_w, bias, w_handle);
+}
+
+int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
+                                uint32 max_chunks, uint32 *chunks_ok,
+                                int chunks_okLen, uint64 *touched_sum,
+                                int touched_sumLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  void **blocks;
+  uint32_t n = 0, i;
+  uint64_t sum = 0;
+  const size_t chunk = (size_t)chunk_mb * 1024u * 1024u;
+
+  if (!s || chunks_okLen < 1 || touched_sumLen < 1) {
+    return AEE_EBADPARM;
+  }
+  if (chunk_mb == 0 || max_chunks == 0) {
+    return AEE_EBADPARM;
+  }
+  blocks = (void **)malloc(sizeof(void *) * max_chunks);
+  if (!blocks) {
+    return AEE_ENOMEMORY;
+  }
+
+  for (n = 0; n < max_chunks; ++n) {
+    unsigned char *p = (unsigned char *)malloc(chunk);
+    size_t off;
+    if (!p) {
+      break;
+    }
+    for (off = 0; off < chunk; off += 4096u) {
+      p[off] = (unsigned char)(off + n);
+      sum += p[off];
+    }
+    blocks[n] = p;
+  }
+  for (i = 0; i < n; ++i) {
+    free(blocks[i]);
+  }
+  free(blocks);
+
+  chunks_ok[0] = n;
+  touched_sum[0] = sum;
+  return AEE_SUCCESS;
+}
+
+/**
+ * @brief [doc 45 Gate 0b] Whether the DSP can reach a host buffer of a
+ *        given size.
+ *
+ * Called with rpcmem/ION memory, this is the measurement doc 45 section 8.4
+ * rests on: the redesign puts one baked-weight arena in ION and has the DSP
+ * read it directly, so what matters is the largest ION mapping the DSP can
+ * touch, not how much it can malloc. Touching every page rather than the
+ * first byte is what makes it a mapping test rather than an address test.
+ */
+int nntr_hvx_mem_probe_touch(remote_handle64 handle, const uint8 *buf,
+                             int bufLen, uint64 *touched_sum,
+                             int touched_sumLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t sum = 0;
+  int off;
+
+  if (!s || !buf || bufLen <= 0 || touched_sumLen < 1) {
+    return AEE_EBADPARM;
+  }
+  for (off = 0; off < bufLen; off += 4096) {
+    sum += buf[off];
+  }
+  touched_sum[0] = sum;
+  return AEE_SUCCESS;
+}
+
+/** @brief Shared by both entry points below, so they cannot drift apart on
+ *         what they accept. */
+static int check_layer_args(const nntr_hvx_session *s, uint32 M, uint32 K,
+                            const uint32 *w_handles, int w_handlesLen,
+                            int act_f32Len, int out_catLen) {
+  uint32_t n_total = 0;
+  int i;
+  if (!s || w_handlesLen <= 0) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_layer: bad act_f32Len (M=%u K=%u)", (unsigned)M,
+         (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    n_total += s->weights_u8i4.slots[w_handles[i]].N;
+  }
+  if ((uint32_t)out_catLen != M * n_total) {
+    FARF(ERROR, "mm_u8i4_layer: bad out_catLen (M=%u n_total=%u)", (unsigned)M,
+         (unsigned)n_total);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
+                           const uint32 *w_handles, int w_handlesLen,
+                           const float *act_f32, int act_f32Len, float *out_cat,
+                           int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc =
+    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /** No probe reset here: this is the production path, and hexkl_probe_on stays
+   * wherever the last timed call left it -- off, unless one ran. */
+  return hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                                 s->config_off, M, K, w_handles,
+                                 (uint32_t)w_handlesLen, act_f32, out_cat,
+                                 &(const hexkl_mm_opts){.pool = s->quant_pool});
+}
+
+static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
+
+/** @brief Floats hexkl_mm_opts.pre_scratch needs: four rows of K a lane
+ *  (hvx_quant_params_pack_u8_ah), not the M x K the whole-copy norm takes
+ *  -- 23 MB of DSP heap at 2048 x 2816 against 0.4. */
+/** @brief Rows one hexkl_mm_u8i4_layer_run call takes at this K and these
+ *  handles: the rows' u8 tiles share VTCM with the widest handle's double
+ *  buffer and the staging tiles (512 KiB kept for those: two batches of
+ *  24 or more, so a batch can be whole heads of 256 or 512 columns for the
+ *  per-head passes in the epilogue). Whole 64-row blocks, at least one; 0 for a
+ *  handle that is not registered. The entries below walk a taller call in
+ *  such chunks themselves: as separate calls each chunk had its buffers
+ *  mapped and synced whole by the driver again (S26 Ultra: 4.3 ms a qkv
+ *  call, 2.2 an o-proj call, two to four calls a 2048-row layer). */
+static uint32_t fc_rows_a_call(const nntr_hvx_session *s, uint32_t K,
+                               const uint32 *w_handles, int w_handlesLen) {
+  uint32_t n_max = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return 0u;
+    }
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    n_max = n_i > n_max ? n_i : n_max;
+  }
+  const size_t arena =
+    s->vtcm_size < s->config_off ? s->vtcm_size : s->config_off;
+  const size_t fixed = (size_t)K * n_max + ((size_t)512u << 10);
+  if (K == 0u || arena < fixed + (size_t)64u * K) {
+    return 64u;
+  }
+  const uint32_t rows = (uint32_t)((arena - fixed) / K);
+  return rows - rows % 64u;
+}
+
+static size_t pre_scratch_floats(const nntr_hvx_session *s, uint32_t M,
+                                 uint32_t K) {
+  const size_t rows =
+    ((size_t)hvx_worker_pool_workers(s->quant_pool) + 1u) * 4u;
+  return (rows < M ? rows : (size_t)M) * K;
+}
+
+/** Both res_add entries: the activation f32, or u16 with act_enc / act_hd
+   (dequantized inside the quant pass through the norm_rows scratch). */
+static int layer_res_add_chunk(nntr_hvx_session *s, uint32 M, uint32 K,
+                               float eps, float scale, const float *gamma,
+                               int gammaLen, const uint32 *w_handles,
+                               int w_handlesLen, const float *act_f32,
+                               const uint16 *act_u16, const float *act_enc,
+                               uint32 act_hd, int actLen, const float *res,
+                               int resLen, float *out_f32, int out_f32Len) {
+  if (!s || w_handlesLen <= 0 || w_handlesLen > 16) {
+    return AEE_EBADPARM;
+  }
+  uint32_t N = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    N += s->weights_u8i4.slots[w_handles[i]].N;
+  }
+  const uint64_t n = (uint64_t)M * N;
+  int rc = check_layer_args(s, M, K, w_handles, w_handlesLen, actLen, (int)n);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if ((uint64_t)resLen != n || (uint64_t)out_f32Len != n ||
+      (gammaLen != 0 && (uint32_t)gammaLen != N)) {
+    FARF(ERROR, "mm_u8i4_layer_res_add: bad lengths (M=%u N=%u)", (unsigned)M,
+         (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  hexkl_mm_opts opts = {.pool = s->quant_pool};
+  if (act_u16) {
+    if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
+      return AEE_ENOMEMORY;
+    }
+    opts.pre_scratch = s->norm_rows;
+    opts.act_u16 = act_u16;
+    opts.act16_enc = act_enc;
+    opts.act16_hd = act_hd;
+  }
+  /** [P3] the handles land row-major in out_f32 and the norm + residual
+     add runs in the kernel's epilogue while each row is in the cache
+     (hexkl_mm_opts.post_res). Without the in-place accumulator layout the
+     kernel refuses row-major output (AEE_EUNSUPPORTED): the packed blocks
+     through the heap scratch and the whole-tensor pass, as before. */
+  uint32_t out_off[16], out_ld[16];
+  for (int i = 0; i < w_handlesLen; ++i) {
+    out_off[i] =
+      i ? out_off[i - 1] + s->weights_u8i4.slots[w_handles[i - 1]].N : 0u;
+    out_ld[i] = N;
+  }
+  int post_done = 0;
+  opts.out_off = out_off;
+  opts.out_ld = out_ld;
+  opts.post_done = &post_done;
+  opts.post_res = res;
+  opts.post_res_gamma = gammaLen ? gamma : NULL;
+  opts.post_res_eps = eps;
+  opts.post_res_scale = scale;
+  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles,
+                               (uint32_t)w_handlesLen, act_f32, out_f32, &opts);
+  if (rc == AEE_SUCCESS && post_done) {
+    return AEE_SUCCESS;
+  }
+  if (rc == AEE_SUCCESS) {
+    /* row-major rows, the pass over them in place */
+    const float *xb1 = out_f32;
+    if (hvx_rmsnorm_add_blocks_f32(out_f32, res, &xb1, &N, 1u, M,
+                                   gammaLen ? gamma : NULL, eps, scale,
+                                   s->quant_pool) != 0) {
+      return AEE_EINVALIDFORMAT;
+    }
+    return AEE_SUCCESS;
+  }
+  if (rc != AEE_EUNSUPPORTED) {
+    return rc;
+  }
+  opts.out_off = NULL;
+  opts.out_ld = NULL;
+  opts.post_done = NULL;
+  opts.post_res = NULL;
+  if (s->moe_res_n < n) {
+    free(s->moe_res);
+    s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+    if (!s->moe_res) {
+      FARF(ERROR, "layer_res_add: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  rc = hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, act_f32, s->moe_res, &opts);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* layer_run wrote one M x N_i block per handle, in handle order */
+  const float *xb[16];
+  uint32_t cols[16];
+  size_t off = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    cols[i] = s->weights_u8i4.slots[w_handles[i]].N;
+    xb[i] = s->moe_res + off;
+    off += (size_t)M * cols[i];
+  }
+  if (hvx_rmsnorm_add_blocks_f32(out_f32, res, xb, cols, (uint32_t)w_handlesLen,
+                                 M, gammaLen ? gamma : NULL, eps, scale,
+                                 s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
+/* A call of any height, in fc_rows_a_call chunks of its rows. */
+static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
+                              float eps, float scale, const float *gamma,
+                              int gammaLen, const uint32 *w_handles,
+                              int w_handlesLen, const float *act_f32,
+                              const uint16 *act_u16, const float *act_enc,
+                              uint32 act_hd, int actLen, const float *res,
+                              int resLen, float *out_f32, int out_f32Len) {
+  if (!s || w_handlesLen <= 0 || M == 0u || K == 0u) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t step = fc_rows_a_call(s, K, w_handles, w_handlesLen);
+  if (step == 0u || (uint64_t)actLen != (uint64_t)M * K || resLen < 0 ||
+      (uint32_t)resLen % M != 0u || resLen != out_f32Len) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t N = (uint32_t)resLen / M;
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    const int rc = layer_res_add_chunk(
+      s, m, K, eps, scale, gamma, gammaLen, w_handles, w_handlesLen,
+      act_f32 ? act_f32 + (size_t)m0 * K : NULL,
+      act_u16 ? act_u16 + (size_t)m0 * K : NULL, act_enc, act_hd, (int)(m * K),
+      res + (size_t)m0 * N, (int)(m * N), out_f32 + (size_t)m0 * N,
+      (int)(m * N));
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
+                                   float eps, float scale, const float *gamma,
+                                   int gammaLen, const uint32 *w_handles,
+                                   int w_handlesLen, const float *act_f32,
+                                   int act_f32Len, const float *res, int resLen,
+                                   float *out_f32, int out_f32Len) {
+  return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
+                            gammaLen, w_handles, w_handlesLen, act_f32, NULL,
+                            NULL, 0u, act_f32Len, res, resLen, out_f32,
+                            out_f32Len);
+}
+
+int nntr_hvx_mm_u8i4_layer_res_add_u16(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, float scale,
+  const float *gamma, int gammaLen, const uint32 *w_handles, int w_handlesLen,
+  const uint16 *act_u16, int act_u16Len, const float *act_enc, int act_encLen,
+  uint32 act_hd, const float *res, int resLen, float *out_f32, int out_f32Len) {
+  if (act_hd == 0u || K % act_hd != 0u ||
+      (uint32_t)act_encLen != 2u * (K / act_hd)) {
+    FARF(ERROR, "mm_u8i4_layer_res_add_u16: act_hd %u of K %u, enc %d",
+         (unsigned)act_hd, (unsigned)K, act_encLen);
+    return AEE_EBADPARM;
+  }
+  return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
+                            gammaLen, w_handles, w_handlesLen, NULL, act_u16,
+                            act_enc, act_hd, act_u16Len, res, resLen, out_f32,
+                            out_f32Len);
+}
+
+/** @brief The activation rows normed into the session's scratch (grown to
+ *  M x K floats), for the *_norm entries. NULL when the heap refuses. */
+static int norm_rows_reserve(nntr_hvx_session *s, size_t n) {
+  if (s->norm_rows_n < n) {
+    free(s->norm_rows);
+    s->norm_rows = (float *)memalign(128, n * sizeof(float));
+    s->norm_rows_n = s->norm_rows ? (uint32_t)n : 0u;
+    if (!s->norm_rows) {
+      FARF(ERROR, "norm_rows: no heap for %u floats", (unsigned)n);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
+                                 uint32 M, uint32 K, const float *gamma,
+                                 float eps) {
+  if (!norm_rows_reserve(s, (size_t)M * K)) {
+    return NULL;
+  }
+  if (hvx_rmsnorm_rows_f32(act_f32, s->norm_rows, M, K, K, gamma, eps,
+                           s->quant_pool) != 0) {
+    return NULL;
+  }
+  return s->norm_rows;
+}
+
+/** @brief Both layer_norm entries; @a out_off / @a out_ld NULL for the
+ *  packed [M x N_i] blocks, else hexkl_mm_opts's per-handle placement. */
+static int layer_norm_impl(nntr_hvx_session *s, uint32 M, uint32 K, float eps,
+                           const float *pre_gamma, int pre_gammaLen,
+                           const uint32 *post_chunk, int post_chunkLen,
+                           const float *post_gamma, int post_gammaLen,
+                           uint32 rope_hd, uint32 rope_handles,
+                           const float *rope_cs, int rope_csLen,
+                           const uint32 *w_handles, int w_handlesLen,
+                           const float *act_f32, int act_f32Len, float *out_cat,
+                           int out_catLen, const uint32 *out_off,
+                           const uint32 *out_ld) {
+  /** With out_off / out_ld the rows land inside out_cat wherever the caller
+     says (the _ld entry checked every handle's rectangle), and out_cat may
+     be longer than this call's M rows: a row chunk of a bigger tensor
+     writes into the whole tensor's buffer. */
+  int out_need = out_catLen;
+  if (out_off && s) {
+    uint32_t n_all = 0;
+    for (int j = 0; j < w_handlesLen; ++j)
+      n_all += s->weights_u8i4.slots[w_handles[j]].N;
+    if ((uint64_t)M * n_all > (uint64_t)(uint32_t)out_catLen) {
+      return AEE_EBADPARM;
+    }
+    out_need = (int)(M * n_all);
+  }
+  int rc =
+    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_need);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /** The norms' shapes: K a multiple of 32 for the pre norm; every post
+     chunk a multiple of 32 dividing its handle's N; the gammas exactly as
+     long as the chunks they serve. */
+  if ((pre_gammaLen != 0 && ((uint32_t)pre_gammaLen != K || K % 32u != 0u)) ||
+      (post_chunkLen != 0 && post_chunkLen != w_handlesLen)) {
+    FARF(ERROR, "mm_u8i4_layer_norm: bad norm lengths");
+    return AEE_EBADPARM;
+  }
+  uint32_t gamma_total = 0;
+  int i;
+  for (i = 0; i < post_chunkLen; ++i) {
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    const uint32_t c = post_chunk[i];
+    if (c != 0u && (c % 32u != 0u || n_i % c != 0u)) {
+      FARF(ERROR, "mm_u8i4_layer_norm: post chunk %u of N %u", (unsigned)c,
+           (unsigned)n_i);
+      return AEE_EBADPARM;
+    }
+    gamma_total += c;
+  }
+  if ((uint32_t)post_gammaLen != gamma_total) {
+    FARF(ERROR, "mm_u8i4_layer_norm: post_gammaLen %d, chunks %u",
+         post_gammaLen, (unsigned)gamma_total);
+    return AEE_EBADPARM;
+  }
+  /** RoPE's shape: the head dim's half a multiple of 32, a table row per
+     activation row, every rotated handle a whole number of heads. */
+  if (rope_hd != 0u) {
+    if ((rope_hd / 2u) % 32u != 0u || rope_handles > (uint32_t)w_handlesLen ||
+        (uint64_t)rope_csLen != (uint64_t)M * 2u * rope_hd) {
+      FARF(ERROR, "mm_u8i4_layer_norm: rope hd %u handles %u cs %d",
+           (unsigned)rope_hd, (unsigned)rope_handles, rope_csLen);
+      return AEE_EBADPARM;
+    }
+    for (i = 0; i < (int)rope_handles; ++i) {
+      if (s->weights_u8i4.slots[w_handles[i]].N % rope_hd != 0u) {
+        FARF(ERROR, "mm_u8i4_layer_norm: rope hd %u of N %u", (unsigned)rope_hd,
+             (unsigned)s->weights_u8i4.slots[w_handles[i]].N);
+        return AEE_EBADPARM;
+      }
+    }
+  }
+
+  /** The pre norm goes into the quant pass, rows normed four at a time into
+     a worker's slice of norm_rows: the normed rows stay in cache. */
+  /** The post norms and RoPE ride the dequant epilogue when the kernel can
+     (post_done); the loop below is for when it cannot. */
+  int post_done = 0;
+  uint32_t chunk_of[64];
+  if (w_handlesLen > 64) {
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < w_handlesLen; ++i) {
+    chunk_of[i] = i < post_chunkLen ? post_chunk[i] : 0u;
+  }
+  hexkl_mm_opts opts = {.pool = s->quant_pool,
+                        .out_off = out_off,
+                        .out_ld = out_ld,
+                        .post_done = &post_done,
+                        .post_chunk = chunk_of,
+                        .post_gamma = post_gamma,
+                        .post_eps = eps,
+                        .rope_hd = rope_hd,
+                        .rope_handles = rope_hd ? rope_handles : 0u,
+                        .rope_cs = rope_cs};
+  if (pre_gammaLen != 0) {
+    if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
+      return AEE_ENOMEMORY;
+    }
+    opts.pre_scratch = s->norm_rows;
+    opts.pre_gamma = pre_gamma;
+    opts.pre_eps = eps;
+  }
+  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles,
+                               (uint32_t)w_handlesLen, act_f32, out_cat, &opts);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /** The post norms, in place on each handle's rows, and RoPE on the first
+     rope_handles after their norms -- one pass per handle that has both. */
+  const float *g = post_gamma;
+  size_t off = 0;
+  for (i = 0; !post_done && i < w_handlesLen; ++i) {
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    const uint32_t c = i < post_chunkLen ? post_chunk[i] : 0u;
+    const int rope = rope_hd != 0u && i < (int)rope_handles;
+    float *o_i = out_off ? out_cat + out_off[i] : out_cat + off;
+    const uint32_t ld_i = out_ld ? out_ld[i] : n_i;
+    if (c != 0u && rope) {
+      hvx_norm_rope_rows_ld_f32(o_i, M, n_i, ld_i, c, g, eps, rope_hd, rope_cs,
+                                s->quant_pool);
+    } else if (c != 0u) {
+      hvx_rmsnorm_rows_ld_f32(o_i, o_i, M, n_i, ld_i, c, g, eps, s->quant_pool);
+    } else if (rope) {
+      hvx_rope_rows_ld_f32(o_i, M, n_i, ld_i, rope_hd, rope_cs, s->quant_pool);
+    }
+    g += c;
+    off += (size_t)M * n_i;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_norm(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
+  return layer_norm_impl((nntr_hvx_session *)handle, M, K, eps, pre_gamma,
+                         pre_gammaLen, post_chunk, post_chunkLen, post_gamma,
+                         post_gammaLen, rope_hd, rope_handles, rope_cs,
+                         rope_csLen, w_handles, w_handlesLen, act_f32,
+                         act_f32Len, out_cat, out_catLen, NULL, NULL);
+}
+
+int nntr_hvx_mm_u8i4_layer_norm_ld(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const uint32 *out_off,
+  int out_offLen, const uint32 *out_ld, int out_ldLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || w_handlesLen <= 0 || out_offLen != w_handlesLen ||
+      out_ldLen != w_handlesLen || M == 0u) {
+    return AEE_EBADPARM;
+  }
+  /** Every handle's rows inside out_cat (the rectangles apart is the
+     caller's to keep; overlapping ones only garble its own output). */
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    if (out_ld[i] < n_i ||
+        (uint64_t)out_off[i] + (uint64_t)(M - 1u) * out_ld[i] + n_i >
+          (uint64_t)(uint32_t)out_catLen) {
+      FARF(ERROR, "mm_u8i4_layer_norm_ld: handle %d off %u ld %u N %u", i,
+           (unsigned)out_off[i], (unsigned)out_ld[i], (unsigned)n_i);
+      return AEE_EBADPARM;
+    }
+  }
+  /** Any height, in fc_rows_a_call chunks: every norm and the RoPE are per
+     row, and each chunk's rows land at their own rows of the rectangles. */
+  uint32_t off[64];
+  const uint32_t step = fc_rows_a_call(s, K, w_handles, w_handlesLen);
+  if (step == 0u || w_handlesLen > 64 ||
+      (uint64_t)act_f32Len != (uint64_t)M * K ||
+      (rope_hd != 0u && (uint64_t)rope_csLen != (uint64_t)M * 2u * rope_hd)) {
+    return AEE_EBADPARM;
+  }
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    for (int i = 0; i < w_handlesLen; ++i) {
+      off[i] = out_off[i] + m0 * out_ld[i];
+    }
+    const int rc = layer_norm_impl(
+      s, m, K, eps, pre_gamma, pre_gammaLen, post_chunk, post_chunkLen,
+      post_gamma, post_gammaLen, rope_hd, rope_handles,
+      rope_hd ? rope_cs + (size_t)m0 * 2u * rope_hd : rope_cs,
+      rope_hd ? (int)(m * 2u * rope_hd) : rope_csLen, w_handles, w_handlesLen,
+      act_f32 + (size_t)m0 * K, (int)(m * K), out_cat, out_catLen, off, out_ld);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
+                                 const uint32 *w_handles, int w_handlesLen,
+                                 const float *act_f32, int act_f32Len,
+                                 float *out_cat, int out_catLen,
+                                 uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc =
+    check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != FC_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_layer_timed: stage_usLen %d, expected %d", stage_usLen,
+         (int)FC_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles,
+                               (uint32_t)w_handlesLen, act_f32, out_cat,
+                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+  t1 = hexkl_probe_now();
+  /** Left off again on the way out: the production entry point above shares
+   * these globals, and an instrumented run must not make the next
+   * uninstrumented one pay for the probes. */
+  hexkl_probe_on = 0;
+
+  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/** @brief Shared by both u8in entry points below, mirroring
+ *         check_layer_args's role for the f32-activation pair. */
+static int check_layer_args_u8in(const nntr_hvx_session *s, uint32 M, uint32 K,
+                                 const uint32 *w_handles, int w_handlesLen,
+                                 int act_ahLen, int act_scaleLen, int act_zpLen,
+                                 int out_catLen) {
+  uint32_t n_total = 0;
+  int i;
+  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+  if (!s || w_handlesLen <= 0) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if ((uint32_t)act_ahLen != m_pad * K || (uint32_t)act_scaleLen != m_pad ||
+      (uint32_t)act_zpLen != m_pad) {
+    FARF(ERROR, "mm_u8i4_layer_u8in: bad lengths (M=%u K=%u m_pad=%u)",
+         (unsigned)M, (unsigned)K, (unsigned)m_pad);
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    n_total += s->weights_u8i4.slots[w_handles[i]].N;
+  }
+  if ((uint32_t)out_catLen != M * n_total) {
+    FARF(ERROR, "mm_u8i4_layer_u8in: bad out_catLen (M=%u n_total=%u)",
+         (unsigned)M, (unsigned)n_total);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_u8in(remote_handle64 handle, uint32 M, uint32 K,
+                                const uint32 *w_handles, int w_handlesLen,
+                                const uint8 *act_ah, int act_ahLen,
+                                const float *act_scale, int act_scaleLen,
+                                const int32 *act_zp, int act_zpLen,
+                                float *out_cat, int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_layer_args_u8in(s, M, K, w_handles, w_handlesLen, act_ahLen,
+                                 act_scaleLen, act_zpLen, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, /*act_f32=*/NULL, out_cat,
+    &(const hexkl_mm_opts){.pool = s->quant_pool,
+                           .act_scale = act_scale,
+                           .act_zp = act_zp,
+                           .act_ah_prepacked = act_ah});
+}
+
+int nntr_hvx_mm_u8i4_layer_u8in_timed(
+  remote_handle64 handle, uint32 M, uint32 K, const uint32 *w_handles,
+  int w_handlesLen, const uint8 *act_ah, int act_ahLen, const float *act_scale,
+  int act_scaleLen, const int32 *act_zp, int act_zpLen, float *out_cat,
+  int out_catLen, uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_layer_args_u8in(s, M, K, w_handles, w_handlesLen, act_ahLen,
+                                 act_scaleLen, act_zpLen, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != FC_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_layer_u8in_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)FC_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, /*act_f32=*/NULL, out_cat,
+    &(const hexkl_mm_opts){.pool = s->quant_pool,
+                           .act_scale = act_scale,
+                           .act_zp = act_zp,
+                           .act_ah_prepacked = act_ah});
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/**
+ * @brief Slots mm_u8i4_layer_fused_timed fills, in order.
+ *
+ * NOT the FC_T_* layout: the fused call runs a second QUANT pass (the
+ * SwiGLU output's requant) and a SwiGLU stage the unfused call does not
+ * have, so the slots are restated here rather than reusing FC_N_STAGES --
+ * the entry rejects a stale count with AEE_EBADPARM, same drift guard as
+ * the FC pair.
+ */
+enum {
+  FU_T_DSP_TOTAL = 0, /**< the whole fused_run call, DSP clock */
+  FU_T_QUANT,         /**< act quant + the SwiGLU output's requant */
+  FU_T_SWIGLU,        /**< silu(gate)*up, in VTCM */
+  FU_T_DEQUANT,       /**< both matmuls' i32 -> f32 */
+  FU_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor (both matmuls) */
+  FU_T_ACC_COPY,      /**< always 0: fused_run requires the in-place layout */
+  FU_T_DRAIN,         /**< DMA waits */
+  FU_T_ACC_STRIDE,    /**< not a time: the derived row stride */
+  FU_N_STAGES
+};
+
+/** @brief Shared by both fused entry points below. The SwiGLU contract
+ *         (down.K == gate_up.N / 2) is checked here so a mismatching pair
+ *         fails loudly instead of computing garbage. */
+static int check_layer_args_fused(const nntr_hvx_session *s, uint32 M, uint32 K,
+                                  const uint32 *w_handles, int w_handlesLen,
+                                  int act_f32Len, int out_f32Len) {
+  int i;
+  if (!s || w_handlesLen != 2) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_layer_fused: bad act_f32Len (M=%u K=%u)", (unsigned)M,
+         (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < 2; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+  }
+  const hexkl_weight_u8i4 *gu = &s->weights_u8i4.slots[w_handles[0]];
+  const hexkl_weight_u8i4 *dn = &s->weights_u8i4.slots[w_handles[1]];
+  if (gu->K != K || gu->N != 2 * dn->K) {
+    FARF(ERROR, "mm_u8i4_layer_fused: SwiGLU contract (gu K=%u N=%u, dn K=%u)",
+         (unsigned)gu->K, (unsigned)gu->N, (unsigned)dn->K);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)out_f32Len != M * dn->N) {
+    FARF(ERROR, "mm_u8i4_layer_fused: bad out_f32Len (M=%u N=%u)", (unsigned)M,
+         (unsigned)dn->N);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_fused(remote_handle64 handle, uint32 M, uint32 K,
+                                 const uint32 *w_handles, int w_handlesLen,
+                                 const float *act_f32, int act_f32Len,
+                                 float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_layer_args_fused(s, M, K, w_handles, w_handlesLen, act_f32Len,
+                                  out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /** No probe reset here: this is the production path, same policy as
+   * mm_u8i4_layer above. */
+  return hexkl_mm_u8i4_fused_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, act_f32, out_f32, &(const hexkl_mm_opts){.pool = s->quant_pool});
+}
+
+int nntr_hvx_mm_u8i4_layer_fused_timed(remote_handle64 handle, uint32 M,
+                                       uint32 K, const uint32 *w_handles,
+                                       int w_handlesLen, const float *act_f32,
+                                       int act_f32Len, float *out_f32,
+                                       int out_f32Len, uint32 *stage_us,
+                                       int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_layer_args_fused(s, M, K, w_handles, w_handlesLen, act_f32Len,
+                                  out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != FU_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_layer_fused_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)FU_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_fused_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles, act_f32, out_f32,
+                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[FU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[FU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[FU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[FU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[FU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[FU_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[FU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[FU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/**
+ * @brief Slots mm_u8i4_gate_up_swiglu_timed fills. Restated rather than
+ *        reusing FU_T_*: this call has no down-side dequant/acc_read at
+ *        all, so FU_T_DEQUANT/FU_T_ACC_READ would silently mean something
+ *        narrower here than there.
+ */
+enum {
+  GU_T_DSP_TOTAL = 0,
+  GU_T_QUANT, /**< act quant + the SwiGLU output's requant */
+  GU_T_SWIGLU,
+  GU_T_DEQUANT, /**< gate_up matmul's i32 -> f32 split */
+  GU_T_ACC_READ,
+  GU_T_DRAIN,
+  GU_T_ACC_STRIDE,
+  GU_N_STAGES
+};
+
+static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
+                                     uint32 K, uint32 w_handle_gate_up,
+                                     int act_f32Len, int out_ahLen,
+                                     int out_scaleLen, int out_zpLen) {
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad act_f32Len (M=%u K=%u)",
+         (unsigned)M, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  if (w_handle_gate_up >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !s->weights_u8i4.slots[w_handle_gate_up].in_use) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_weight_u8i4 *gu = &s->weights_u8i4.slots[w_handle_gate_up];
+  if (gu->K != K || (gu->N % 2) != 0) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad shape (gu K=%u N=%u, want K=%u)",
+         (unsigned)gu->K, (unsigned)gu->N, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  const uint32_t inter = gu->N / 2;
+  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+  if ((uint32_t)out_ahLen != m_pad * inter || (uint32_t)out_scaleLen != m_pad ||
+      (uint32_t)out_zpLen != m_pad) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad out lengths (M=%u inter=%u)",
+         (unsigned)M, (unsigned)inter);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+/** @brief Slots mm_u8i4_moe_layer_timed fills, in order. Mirrors GU_T_*
+ *         with one extra: the routing multiply and scatter-add, which no
+ *         existing call has because the ARM side does them today. */
+enum {
+  MOE_T_DSP_TOTAL = 0,
+  MOE_T_QUANT, /**< act quant + the SwiGLU output's requant */
+  MOE_T_SWIGLU,
+  MOE_T_DEQUANT, /**< both matmuls' i32 -> f32 */
+  MOE_T_ACC_READ,
+  MOE_T_DRAIN,     /**< the cross-expert weight DMA waits */
+  MOE_T_SCATTER,   /**< routing multiply + accumulate into out_f32 */
+  MOE_T_GATHER,    /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
+  MOE_T_REQUANT,   /**< the SwiGLU output's per-block quantize */
+  MOE_T_BLOCKS,    /**< NOT us: 64-row blocks issued, summed over experts */
+  MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
+  MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
+  MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
+  MOE_T_ALLOC,     /**< the layer call's own malloc and free */
+  MOE_T_DMA_FIRST_KB, /**< NOT us: KB that first wait covered */
+  MOE_T_DRAIN_DN,     /**< the down-weight drain, apart from gate_up's */
+  MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
+  MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
+  MOE_T_ACC_STRIDE,
+  /** [#87] The DMA ring trace's per-call numbers (hexkl_probe.h's
+      HEXKL_PROBE_DMA_*), in the same order. Counts unless named _US. */
+  MOE_T_DMA_DESC,
+  MOE_T_DMA_WAITS,
+  MOE_T_DMA_WAITS_BLOCKED,
+  MOE_T_DMA_WAIT_US,
+  MOE_T_DMA_WAIT_ACT_US,
+  MOE_T_DMA_BUSY_LO_US,
+  MOE_T_DMA_BUSY_HI_US,
+  MOE_T_DMA_DEPTH_MAX,
+  MOE_T_DMA_FIRST_READY_US,
+  MOE_T_DMA_LAST_ISSUE_US,
+  MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
+  MOE_T_M1_FEED, /**< NOT us: the DMA queues that fed the GEMV's VTCM slabs
+                      (#117: 1; #177: 1..4), 0 = it read the arena */
+  MOE_N_STAGES
+};
+
+/** @brief Copies the probe columns into a timed call's stage_us. */
+static void moe_fill_stage_us(uint32 *stage_us, uint32 dsp_total) {
+  stage_us[MOE_T_DSP_TOTAL] = dsp_total;
+  stage_us[MOE_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[MOE_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[MOE_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[MOE_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[MOE_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_SCATTER];
+  stage_us[MOE_T_STAGE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[MOE_T_GATHER] = (uint32)hexkl_probe_us[HEXKL_PROBE_GATHER];
+  stage_us[MOE_T_REQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_REQUANT];
+  stage_us[MOE_T_BLOCKS] = (uint32)hexkl_probe_us[HEXKL_PROBE_BLOCKS];
+  stage_us[MOE_T_MM] = (uint32)hexkl_probe_us[HEXKL_PROBE_MM];
+  stage_us[MOE_T_DMA_KB] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+  stage_us[MOE_T_DMA_FIRST] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST];
+  stage_us[MOE_T_ALLOC] = (uint32)hexkl_probe_us[HEXKL_PROBE_ALLOC];
+  stage_us[MOE_T_DMA_FIRST_KB] =
+    (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST_KB];
+  stage_us[MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
+  stage_us[MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
+  stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  for (int k = 0; k <= MOE_T_DMA_LAST_ISSUE_US - MOE_T_DMA_DESC; ++k) {
+    stage_us[MOE_T_DMA_DESC + k] =
+      (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_DESC + k];
+  }
+  stage_us[MOE_T_PATH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PATH];
+  stage_us[MOE_T_M1_FEED] = (uint32)hexkl_probe_us[HEXKL_PROBE_M1_FEED];
+}
+
+/** @brief Shared by both entry points so they cannot drift on what they
+ *         accept. Lengths are the only thing the skel can check that the
+ *         kernel cannot: the kernel sees pointers, not sequence lengths. */
+static int check_moe_layer_args(nntr_hvx_session *s, uint32 M, uint32 K,
+                                uint32 inter, uint32 N_out, int h_guLen,
+                                int h_dnLen, int row_indexLen, int row_countLen,
+                                int row_weightLen, int act_f32Len,
+                                int out_f32Len) {
+  if (s) {
+    htp_router_handoff_scratch_invalidate(&s->moe_scratch.router_handoff);
+    s->moe_scratch.router_act = NULL;
+    s->moe_scratch.router_used = 0;
+  }
+  if (!s || M == 0 || K == 0 || inter == 0 || N_out == 0) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if (h_guLen <= 0 || h_dnLen != h_guLen || row_countLen != h_guLen) {
+    FARF(ERROR, "moe_layer: expert count mismatch (gu=%d dn=%d count=%d)",
+         h_guLen, h_dnLen, row_countLen);
+    return AEE_EBADPARM;
+  }
+  if (row_indexLen < 0 || row_weightLen != row_indexLen) {
+    FARF(ERROR, "moe_layer: row_index %d vs row_weight %d", row_indexLen,
+         row_weightLen);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "moe_layer: bad act_f32Len %d (M=%u K=%u)", act_f32Len,
+         (unsigned)M, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)out_f32Len != M * N_out) {
+    FARF(ERROR, "moe_layer: bad out_f32Len %d (M=%u N_out=%u)", out_f32Len,
+         (unsigned)M, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+/** @brief The row_count entries must add up to exactly the number of
+ *         row_index entries, or the kernel would read past the array while
+ *         slicing per-expert groups out of it. */
+static int check_moe_row_totals(const uint32 *row_count, int n_experts,
+                                int row_indexLen) {
+  uint32_t sum = 0;
+  int i;
+  for (i = 0; i < n_experts; ++i) {
+    sum += row_count[i];
+  }
+  if (sum != (uint32_t)row_indexLen) {
+    FARF(ERROR, "moe_layer: row_count sums to %u, row_index has %d", sum,
+         row_indexLen);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+/** @brief The MoE layer entries' act argument: bit 0 the gelu_tanh
+ *  epilogue, bit 1 [PR 4428] "these weights were never rotated" -- the
+ *  dense FFN's chunks through this entry -- which drops the session's
+ *  online rotation selectors (NNTR_MOE_HADAMARD_SCOPE=all) for this call. */
+static uint32_t moe_call_flags(const nntr_hvx_session *s, uint32 act) {
+  uint32_t flags = s->moe_flags | ((act & 1u) ? HEXKL_MOE_FLAG_GELU_TANH : 0u);
+  if (act & 2u) {
+    flags &= ~HEXKL_MOE_FLAG_HAD_MASK;
+  }
+  return flags;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
+                               uint32 inter, uint32 N_out, uint32 act,
+                               const uint32 *h_gate_up, int h_gate_upLen,
+                               const uint32 *h_down, int h_downLen,
+                               const uint32 *row_index, int row_indexLen,
+                               const uint32 *row_count, int row_countLen,
+                               const float *row_weight, int row_weightLen,
+                               const float *act_f32, int act_f32Len,
+                               float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32_t ticket = htp_router_handoff_ticket(act);
+  const size_t input_bytes =
+    htp_router_handoff_shape(M, K) ? (size_t)M * K * sizeof(float) : 0u;
+#if defined(NNTR_LFM2_ROUTER_HANDOFF_TRACE) && NNTR_LFM2_ROUTER_HANDOFF_TRACE
+  if (s && htp_router_handoff_shape(M, K)) {
+    const htp_router_handoff_scratch *saved = &s->moe_scratch.router_handoff;
+    const unsigned match = (saved->ticket != 0u) |
+                           ((saved->ticket == ticket) << 1u) |
+                           ((saved->epoch == saved->published_epoch) << 2u) |
+                           ((saved->owner == s->moe_scratch.base) << 3u) |
+                           ((saved->bytes == input_bytes) << 4u);
+    FARF(ERROR,
+         "[nntr-router-handoff-state] M=%u match=%u request_ticket=%u "
+         "saved_ticket=%u "
+         "epoch=%llu published=%llu bytes=%u saved_bytes=%u input=%p "
+         "owner=%p base=%p source_scope=arm",
+         (unsigned)M, match, (unsigned)ticket, (unsigned)saved->ticket,
+         (unsigned long long)saved->epoch,
+         (unsigned long long)saved->published_epoch, (unsigned)input_bytes,
+         (unsigned)saved->bytes, act_f32, saved->owner, s->moe_scratch.base);
+  }
+#endif
+  const int reuse = s && htp_router_handoff_scratch_take(
+                           &s->moe_scratch.router_handoff, s->moe_scratch.base,
+                           input_bytes, ticket);
+  int rc = check_moe_layer_args(s, M, K, inter, N_out, h_gate_upLen, h_downLen,
+                                row_indexLen, row_countLen, row_weightLen,
+                                act_f32Len, out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  rc = check_moe_row_totals(row_count, h_gate_upLen, row_indexLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (act > 3u && !ticket) {
+    return AEE_EBADPARM;
+  }
+  s->moe_scratch.router_act = reuse ? (const float *)s->moe_scratch.base : NULL;
+#if defined(NNTR_LFM2_ROUTER_HANDOFF_TRACE) && NNTR_LFM2_ROUTER_HANDOFF_TRACE
+  const size_t cap_before = s->moe_scratch.cap;
+#endif
+  rc = hexkl_mm_u8i4_moe_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
+    N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
+    moe_call_flags(s, ticket ? 0u : act));
+#if defined(NNTR_LFM2_ROUTER_HANDOFF_TRACE) && NNTR_LFM2_ROUTER_HANDOFF_TRACE
+  if (htp_router_handoff_shape(M, K) && inter == 1536u && N_out == 2048u)
+    FARF(ERROR,
+         "[nntr-router-handoff] M=%u ticket=%u request=%u owner=%u used=%u "
+         "fallback=%u bytes=%u cap_before=%u cap_after=%u rc=%d",
+         (unsigned)M, (unsigned)ticket, (unsigned)(ticket != 0u),
+         (unsigned)reuse, (unsigned)s->moe_scratch.router_used,
+         (unsigned)(ticket != 0u && !s->moe_scratch.router_used),
+         (unsigned)input_bytes, (unsigned)cap_before,
+         (unsigned)s->moe_scratch.cap, rc);
+#endif
+  return rc;
+}
+
+int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
+                               uint32 E, float eps, const float *gamma,
+                               int gammaLen, const float *w, int wLen,
+                               const float *x, int xLen, uint32 top_k,
+                               uint32 n_sel, const float *scale, int scaleLen,
+                               float *logits, int logitsLen, uint32 *sel,
+                               int selLen, float *weight, int weightLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  htp_router_handoff_scratch_invalidate(&s->moe_scratch.router_handoff);
+  s->moe_scratch.router_act = NULL;
+  const float *rpc_input = x;
+  const uint32_t ticket = top_k == 0u ? htp_router_handoff_ticket(n_sel) : 0u;
+  if (M == 0u || K == 0u || E == 0u || E % 32u != 0u || E > 128u ||
+      (uint64_t)M * K > 0x7FFFFFFFu || (uint64_t)xLen != (uint64_t)M * K ||
+      (uint64_t)wLen != (uint64_t)K * E ||
+      (uint64_t)logitsLen != (uint64_t)M * E ||
+      (gammaLen != 0 && (uint32)gammaLen != K)) {
+    FARF(ERROR,
+         "router_logits_f32: bad shape (M=%u K=%u E=%u gamma=%d w=%d x=%d "
+         "logits=%d)",
+         (unsigned)M, (unsigned)K, (unsigned)E, gammaLen, wLen, xLen,
+         logitsLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u && (n_sel < top_k || n_sel > E || (uint32)scaleLen != E ||
+                      (uint64_t)selLen != (uint64_t)M * n_sel ||
+                      (uint64_t)weightLen != (uint64_t)M * top_k)) {
+    FARF(ERROR,
+         "router_logits_f32: bad top-k shape (top_k=%u n_sel=%u scale=%d "
+         "sel=%d weight=%d)",
+         (unsigned)top_k, (unsigned)n_sel, scaleLen, selLen, weightLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  /** The LFM2 sigmoid router reads already-normalized FP32 rows. Keep
+   * its scalar broadcasts and intermediate logits in cached memory. The
+   * ordered FP32 dot remains unchanged, as do Gemma's softmax routes. */
+  float *rpc_logits = NULL;
+  const size_t x_bytes = (size_t)M * K * sizeof(float);
+  const size_t logits_bytes = (size_t)M * E * sizeof(float);
+  if (M >= 128u && M <= 4096u && K == 2048u && E == 64u && top_k == 0u &&
+      gammaLen == 0 && x && logits &&
+      hexkl_moe_scratch_reserve(&s->moe_scratch, x_bytes + logits_bytes) ==
+        AEE_SUCCESS) {
+    hexkl_dma_ring_reset();
+    hexkl_moe_dma_copy(s->moe_scratch.base, x, x_bytes, 0, 0);
+    x = (const float *)s->moe_scratch.base;
+    rpc_logits = logits;
+    logits = (float *)(s->moe_scratch.base + x_bytes);
+  }
+  /** the norm rides in the logits kernel, block by block (no M x K copy),
+     and w is read from VTCM */
+  const size_t w_bytes = (size_t)K * E * sizeof(float);
+  float *w_stage =
+    s->vtcm_base && w_bytes <= s->vtcm_size ? (float *)s->vtcm_base : NULL;
+  if (hvx_router_rows_norm_f32(x, gammaLen ? gamma : NULL, eps, w, w_stage,
+                               logits, M, K, E, s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u &&
+      hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
+                               s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (rpc_logits) {
+    hexkl_dma_ring_reset();
+    hexkl_moe_dma_copy(rpc_logits, logits, logits_bytes, 0, 0);
+    if (!htp_router_handoff_overlap(rpc_logits, logits_bytes, rpc_input,
+                                    x_bytes))
+      htp_router_handoff_scratch_publish(&s->moe_scratch.router_handoff, ticket,
+                                         s->moe_scratch.base, x_bytes);
+  }
+#if defined(NNTR_LFM2_ROUTER_HANDOFF_TRACE) && NNTR_LFM2_ROUTER_HANDOFF_TRACE
+  if (htp_router_handoff_shape(M, K) && E == 64u && top_k == 0u) {
+    const htp_router_handoff_scratch *saved = &s->moe_scratch.router_handoff;
+    FARF(ERROR,
+         "[nntr-router-handoff-publish] M=%u sent=%u saved=%u epoch=%llu "
+         "published=%llu "
+         "bytes=%u input=%p owner=%p base=%p source_scope=arm",
+         (unsigned)M, (unsigned)ticket, (unsigned)saved->ticket,
+         (unsigned long long)saved->epoch,
+         (unsigned long long)saved->published_epoch, (unsigned)saved->bytes,
+         rpc_input, saved->owner, s->moe_scratch.base);
+  }
+#endif
+#if defined(NNTR_LFM2_ROUTER_HANDOFF_TRACE) && NNTR_LFM2_ROUTER_HANDOFF_TRACE
+  if (htp_router_handoff_shape(M, K) && E == 64u && top_k == 0u)
+    FARF(ERROR,
+         "[nntr-router-handoff-producer] M=%u ticket=%u cached=%u bytes=%u",
+         (unsigned)M, (unsigned)ticket, (unsigned)(rpc_logits != NULL),
+         (unsigned)x_bytes);
+#endif
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_router_logits_u8i8_f32(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 E, float eps,
+  const float *gamma, int gammaLen, uint32 w_handle, const float *x, int xLen,
+  uint32 top_k, uint32 n_sel, const float *scale, int scaleLen, float *logits,
+  int logitsLen, uint32 *sel, int selLen, float *weight, int weightLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (s) {
+    htp_router_handoff_scratch_invalidate(&s->moe_scratch.router_handoff);
+    s->moe_scratch.router_act = NULL;
+  }
+  if (!s || !s->hmx_locked) {
+    return AEE_EBADPARM;
+  }
+  if (M == 0u || K == 0u || E == 0u || E % 32u != 0u || E > 128u ||
+      (uint64_t)M * K > 0x7FFFFFFFu || (uint64_t)xLen != (uint64_t)M * K ||
+      (uint64_t)logitsLen != (uint64_t)M * E ||
+      (gammaLen != 0 && (uint32)gammaLen != K) ||
+      w_handle >= HEXKL_MM_U8I8_MAX_WEIGHTS ||
+      !s->weights_u8i8.slots[w_handle].in_use ||
+      s->weights_u8i8.slots[w_handle].K != K ||
+      s->weights_u8i8.slots[w_handle].N != E) {
+    FARF(ERROR, "router_logits_u8i8_f32: bad shape or handle");
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u && (n_sel < top_k || n_sel > E || (uint32)scaleLen != E ||
+                      (uint64_t)selLen != (uint64_t)M * n_sel ||
+                      (uint64_t)weightLen != (uint64_t)M * top_k)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  const float *rows = x;
+  if (gammaLen) {
+    rows = norm_rows_in(s, x, M, K, gamma, eps);
+    if (!rows) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = hexkl_mm_u8i8_layer_run(
+    &s->weights_u8i8, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    &w_handle, 1u, rows, logits, &(const hexkl_mm_opts){.pool = s->quant_pool});
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (top_k != 0u &&
+      hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
+                               s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
+/** Both norm entries. The pre norm rides the kernel's scan and, when the
+   result is the session's own heap (out_heap: the add entry's moe_res), the
+   kernel accumulates straight into it: what used to be a pass that stored
+   the normed rows, a copy of them and a copy of the result (doc: the S26
+   Ultra handoff, section 8). The post norm reads the result where the
+   kernel left it. */
+static int moe_layer_norm_impl(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
+  int h_gate_upLen, const uint32 *h_down, int h_downLen,
+  const uint32 *row_index, int row_indexLen, const uint32 *row_count,
+  int row_countLen, const float *row_weight, int row_weightLen,
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len,
+  int out_heap) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if ((pre_gammaLen != 0 && ((uint32_t)pre_gammaLen != K || K % 32u != 0u)) ||
+      (post_gammaLen != 0 &&
+       ((uint32_t)post_gammaLen != N_out || N_out % 32u != 0u))) {
+    FARF(ERROR, "mm_u8i4_moe_layer_norm: bad norm lengths");
+    return AEE_EBADPARM;
+  }
+  if (pre_gammaLen != 0 && (uint32_t)act_f32Len != M * K) {
+    return AEE_EBADPARM;
+  }
+  /** A post norm of a caller's buffer: the kernel's result goes to moe_res
+     and the norm carries it over, instead of a copy and a norm in place. */
+  float *kout = out_f32;
+  if (!out_heap && post_gammaLen != 0) {
+    const uint64_t n = (uint64_t)M * N_out;
+    if ((uint64_t)out_f32Len != n) {
+      return AEE_EBADPARM;
+    }
+    if (s->moe_res_n < n) {
+      free(s->moe_res);
+      s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+      s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+      if (!s->moe_res) {
+        FARF(ERROR, "moe_layer_norm: no heap for %u floats", (unsigned)n);
+        return AEE_ENOMEMORY;
+      }
+    }
+    kout = s->moe_res;
+  }
+  s->moe_scratch.pre_gamma = pre_gammaLen != 0 ? pre_gamma : NULL;
+  s->moe_scratch.pre_eps = eps;
+  s->moe_scratch.out_heap = out_heap || kout != out_f32;
+  const int rc = nntr_hvx_mm_u8i4_moe_layer(
+    handle, M, K, inter, N_out, act, h_gate_up, h_gate_upLen, h_down, h_downLen,
+    row_index, row_indexLen, row_count, row_countLen, row_weight, row_weightLen,
+    act_f32, act_f32Len, kout, out_f32Len);
+  s->moe_scratch.pre_gamma = NULL;
+  s->moe_scratch.out_heap = 0;
+  if (rc == AEE_SUCCESS && post_gammaLen != 0) {
+    hvx_rmsnorm_rows_f32(kout, out_f32, M, N_out, N_out, post_gamma, eps,
+                         s->quant_pool);
+  }
+  return rc;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
+  int h_gate_upLen, const uint32 *h_down, int h_downLen,
+  const uint32 *row_index, int row_indexLen, const uint32 *row_count,
+  int row_countLen, const float *row_weight, int row_weightLen,
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len) {
+  return moe_layer_norm_impl(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, out_f32, out_f32Len, 0);
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm_add(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, float scale2, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const float *gamma2,
+  int gamma2Len, const uint32 *h_gate_up, int h_gate_upLen,
+  const uint32 *h_down, int h_downLen, const uint32 *row_index,
+  int row_indexLen, const uint32 *row_count, int row_countLen,
+  const float *row_weight, int row_weightLen, const float *act_f32,
+  int act_f32Len, const float *x2, int x2Len, float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const uint64_t n = (uint64_t)M * N_out;
+  /* The residual is the call's own input rows, so K == N_out. */
+  if (M == 0u || K != N_out || N_out % 32u != 0u || n > 0x7FFFFFFFu ||
+      (uint64_t)act_f32Len != n || (uint64_t)x2Len != n ||
+      (uint64_t)out_f32Len != n ||
+      (gamma2Len != 0 && (uint32_t)gamma2Len != N_out)) {
+    FARF(ERROR, "mm_u8i4_moe_layer_norm_add: bad shape (M=%u K=%u N=%u)",
+         (unsigned)M, (unsigned)K, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if (s->moe_res_n < n) {
+    free(s->moe_res);
+    s->moe_res = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->moe_res_n = s->moe_res ? (uint32_t)n : 0u;
+    if (!s->moe_res) {
+      FARF(ERROR, "moe_layer_norm_add: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  const int rc = moe_layer_norm_impl(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, s->moe_res, (int)n, 1);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (hvx_rmsnorm_add_res_f32(out_f32, act_f32, s->moe_res, x2, M, N_out,
+                              gamma2Len ? gamma2 : NULL, eps, scale2,
+                              s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_timed(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,
+  int h_downLen, const uint32 *row_index, int row_indexLen,
+  const uint32 *row_count, int row_countLen, const float *row_weight,
+  int row_weightLen, const float *act_f32, int act_f32Len, float *out_f32,
+  int out_f32Len, uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_moe_layer_args(s, M, K, inter, N_out, h_gate_upLen, h_downLen,
+                                row_indexLen, row_countLen, row_weightLen,
+                                act_f32Len, out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  rc = check_moe_row_totals(row_count, h_gate_upLen, row_indexLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != MOE_N_STAGES) {
+    FARF(ERROR, "moe_layer_timed: stage_usLen %d, expected %d", stage_usLen,
+         (int)MOE_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_moe_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
+    N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
+    moe_call_flags(s, act));
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+  return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);
+}
+
+uint32_t nntr_hvx_moe_stage_count(void) { return MOE_N_STAGES; }
+
+/** [#85] The slot fill, shared with forward_debug (nntr_hvx_graph.c). Read
+   after hexkl_probe_on is cleared, as moe_layer_timed always did; the
+   column copy itself is moe_fill_stage_us, which the conv block's timed
+   entry shares. */
+int nntr_hvx_moe_stage_fill(uint32 *stage_us, uint64_t t0, uint64_t t1,
+                            int rc) {
+  moe_fill_stage_us(stage_us, (uint32)(t1 - t0));
+  return rc;
+}
+
+/** @brief The conv block call's lengths; the kernel sees pointers. */
+static int check_conv_block_args(nntr_hvx_session *s, uint32 M, uint32 K,
+                                 uint32 C, uint32 N_out, int h_inLen,
+                                 int conv_wLen, int act_f32Len, int out_f32Len,
+                                 int state_f32Len) {
+  if (s) {
+    htp_router_handoff_scratch_invalidate(&s->moe_scratch.router_handoff);
+    s->moe_scratch.router_act = NULL;
+  }
+  if (!s || M == 0 || K == 0 || C == 0 || N_out == 0) {
+    return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
+  if (h_inLen != 3) {
+    FARF(ERROR, "conv_block: h_in has %d handles, want 3 (a, b, c)", h_inLen);
+    return AEE_EBADPARM;
+  }
+  /* [#225] 5 x C: the taps, then the history rows of a prefill chunk */
+  if ((uint32_t)conv_wLen != 3 * C && (uint32_t)conv_wLen != 5 * C) {
+    FARF(ERROR, "conv_block: bad conv_wLen %d (C=%u)", conv_wLen, (unsigned)C);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "conv_block: bad act_f32Len %d (M=%u K=%u)", act_f32Len,
+         (unsigned)M, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)out_f32Len != M * N_out) {
+    FARF(ERROR, "conv_block: bad out_f32Len %d (M=%u N_out=%u)", out_f32Len,
+         (unsigned)M, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)state_f32Len != 2 * C) {
+    FARF(ERROR, "conv_block: bad state_f32Len %d (C=%u)", state_f32Len,
+         (unsigned)C);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_conv_block(remote_handle64 handle, uint32 M, uint32 K,
+                                uint32 C, uint32 N_out, const uint32 *h_in,
+                                int h_inLen, uint32 h_out, const float *conv_w,
+                                int conv_wLen, const float *act_f32,
+                                int act_f32Len, float *out_f32, int out_f32Len,
+                                float *state_f32, int state_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_conv_block_args(s, M, K, C, N_out, h_inLen, conv_wLen,
+                                 act_f32Len, out_f32Len, state_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
+}
+
+int nntr_hvx_mm_u8i4_conv_block_timed(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 C, uint32 N_out,
+  const uint32 *h_in, int h_inLen, uint32 h_out, const float *conv_w,
+  int conv_wLen, const float *act_f32, int act_f32Len, float *out_f32,
+  int out_f32Len, float *state_f32, int state_f32Len, uint32 *stage_us,
+  int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_conv_block_args(s, M, K, C, N_out, h_inLen, conv_wLen,
+                                 act_f32Len, out_f32Len, state_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != MOE_N_STAGES) {
+    FARF(ERROR, "conv_block_timed: stage_usLen %d, expected %d", stage_usLen,
+         (int)MOE_N_STAGES);
+    return AEE_EBADPARM;
+  }
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_conv_block_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, C, N_out,
+    h_in[0], h_in[1], h_in[2], h_out, conv_w,
+    (uint32_t)conv_wLen == 5 * C ? conv_w + 3 * C : NULL, act_f32, out_f32,
+    state_f32, s->quant_pool, &s->moe_scratch);
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+  moe_fill_stage_us(stage_us, (uint32)(t1 - t0));
+  return rc;
+}
+
+int nntr_hvx_moe_dma_trace_read(remote_handle64 handle, uint32 *words,
+                                int wordsLen, uint32 *n_words) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !words || wordsLen <= 0 || !n_words) {
+    return AEE_EBADPARM;
+  }
+  /** The tables of the last mm_u8i4_moe_layer_timed call: static, so they
+     survive until the next timed call overwrites them. A buffer too small
+     for the whole trace gets 0 words rather than a truncated one. */
+  *n_words = hexkl_dma_trace_serialize(words, (uint32_t)wordsLen);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_moe_set_opts(remote_handle64 handle, uint32 flags,
+                          uint32 *applied) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !applied) {
+    return AEE_EBADPARM;
+  }
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) &&
+      ((flags & HEXKL_MOE_FLAG_HAD_SCALAR) ||
+       !(flags & (HEXKL_MOE_FLAG_HAD_UP | HEXKL_MOE_FLAG_HAD_DOWN))))
+    return AEE_EBADPARM;
+  /* A requested precision must never silently become a different benchmark. */
+  if ((flags & HEXKL_MOE_FLAG_HAD_HMX) && (!s->hmx_locked || !s->hmx_fp16_rate))
+    return AEE_EUNSUPPORTED;
+  /** Only the bits this skel knows are kept; the echo is how the ARM side
+     tells "took" from "ignored by an older skel". Since #113 that covers
+     the tune bit and the (lead, rows1) field beside it, so a skel without
+     them echoes a different word and the ARM side throws rather than
+     measuring the wrong cell of the matrix. */
+  s->moe_flags = flags & HEXKL_MOE_FLAGS_KNOWN;
+  *applied = s->moe_flags;
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_gate_up_swiglu(remote_handle64 handle, uint32 M, uint32 K,
+                                    uint32 w_handle_gate_up,
+                                    const float *act_f32, int act_f32Len,
+                                    uint8 *out_ah, int out_ahLen,
+                                    float *out_scale, int out_scaleLen,
+                                    int32 *out_zp, int out_zpLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_gate_up_swiglu_args(s, M, K, w_handle_gate_up, act_f32Len,
+                                     out_ahLen, out_scaleLen, out_zpLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_mm_u8i4_gate_up_swiglu_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handle_gate_up, act_f32, out_ah, out_scale, out_zp, s->quant_pool);
+}
+
+int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
+                                          uint32 K, uint32 w_handle_gate_up,
+                                          const float *act_f32, int act_f32Len,
+                                          uint8 *out_ah, int out_ahLen,
+                                          float *out_scale, int out_scaleLen,
+                                          int32 *out_zp, int out_zpLen,
+                                          uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_gate_up_swiglu_args(s, M, K, w_handle_gate_up, act_f32Len,
+                                     out_ahLen, out_scaleLen, out_zpLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != GU_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)GU_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_gate_up_swiglu_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handle_gate_up, act_f32, out_ah, out_scale, out_zp, s->quant_pool);
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[GU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[GU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[GU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[GU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[GU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[GU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+int nntr_hvx_weights_tl2(remote_handle64 handle, const uint32 *handles,
+                         int handlesLen, uint32 native) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || handlesLen < 0 || (handlesLen && !handles) || native > 1u)
+    return AEE_EBADPARM;
+  for (int i = 0; i < handlesLen; ++i) {
+    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS)
+      return AEE_EBADPARM;
+    const hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    if (!w->in_use || !w->borrowed || w->bits != 2u ||
+        (w->tl2_compact && !native) ||
+        htp_tl2_native_bytes(w->K, w->N) > (uint64_t)w->K * w->N / 4u)
+      return AEE_EBADPARM;
+    if (!htp_tl2_palette_magnitude(w->pal))
+      return AEE_EBADPARM;
+  }
+  for (int i = 0; i < handlesLen; ++i) {
+    hexkl_weight_u8i4 *w = &s->weights_u8i4.slots[handles[i]];
+    w->tl2_bytes = native ? w->wh_bytes : NULL;
+  }
+  return AEE_SUCCESS;
+}
+
+/** An untied head's row on its WH slices outside the token driver (the
+   prefill's last row): the graph's LM_HEAD op on HTP_GRAPH_FEED_WH, the
+   same kernel (hexkl_mm_u8i4_fc_m1_run) on the same handles, the parts'
+   outputs side by side in y. No norm and no soft-cap here: an untied
+   model keeps those in their own layers. */
+int nntr_hvx_lm_head_wh_f32(remote_handle64 handle, const uint32 *h, int hLen,
+                            const float *x, int xLen, float *y, int yLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t n_total = 0;
+  int p;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (hLen <= 0 || hLen > (int)HEXKL_FC_M1_MAX_PARTS || xLen <= 0 ||
+      xLen % 32 != 0 || yLen <= 0) {
+    FARF(ERROR, "lm_head_wh_f32: bad shape (h=%d x=%d y=%d)", hLen, xLen, yLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  for (p = 0; p < hLen; ++p) {
+    const hexkl_weight_u8i4 *w;
+    if (h[p] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[h[p]].in_use) {
+      return AEE_EBADITEM;
+    }
+    w = &s->weights_u8i4.slots[h[p]];
+    if (w->K != (uint32_t)xLen || w->N % 32u != 0u) {
+      FARF(ERROR, "lm_head_wh_f32: slice %d is %u x %u, x is %d", p,
+           (unsigned)w->K, (unsigned)w->N, xLen);
+      return AEE_EINVALIDFORMAT;
+    }
+    n_total += w->N;
+  }
+  if (n_total != (uint64_t)yLen) {
+    FARF(ERROR, "lm_head_wh_f32: slices hold %u columns, y is %d",
+         (unsigned)n_total, yLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  return hexkl_mm_u8i4_fc_m1_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, (uint32_t)xLen,
+    (uint32_t)hLen, h, x, y, s->quant_pool, &s->moe_scratch, s->moe_flags);
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_norm_timed(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  uint32 act, float eps, const float *pre_gamma, int pre_gammaLen,
+  const float *post_gamma, int post_gammaLen, const uint32 *h_gate_up,
+  int h_gate_upLen, const uint32 *h_down, int h_downLen,
+  const uint32 *row_index, int row_indexLen, const uint32 *row_count,
+  int row_countLen, const float *row_weight, int row_weightLen,
+  const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len,
+  uint32 *stage_us, int stage_usLen) {
+  if (!stage_us || stage_usLen != MOE_N_STAGES)
+    return AEE_EBADPARM;
+  memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+  hexkl_probe_on = 1;
+  const uint64_t start = hexkl_probe_now();
+  const int rc = moe_layer_norm_impl(
+    handle, M, K, inter, N_out, act, eps, pre_gamma, pre_gammaLen, post_gamma,
+    post_gammaLen, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, out_f32, out_f32Len, 0);
+  const uint64_t elapsed = hexkl_probe_now() - start;
+  hexkl_probe_on = 0;
+  moe_fill_stage_us(stage_us, (uint32)elapsed);
+  return rc;
+}

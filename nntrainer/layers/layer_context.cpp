@@ -155,6 +155,14 @@ RunLayerContext::RunLayerContext(const std::string &name, bool trainable,
 
   if (!validate())
     throw std::invalid_argument("Creating invalid run context");
+
+  // Regularizers are fixed when Weight is constructed. Keep only weights
+  // that can contribute, but check their current gradient state and values
+  // in getRegularizationLoss() on every call.
+  for (unsigned int idx = 0; idx < weights.size(); ++idx) {
+    if (weights[idx]->isWeightRegularizerL2Norm())
+      regularization_weights.push_back(idx);
+  }
 }
 
 /**

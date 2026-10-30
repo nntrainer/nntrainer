@@ -25,6 +25,7 @@ static constexpr size_t INPUT_IDX_2 = 1; // up
 void GeGLULayer::finalize(InitLayerContext &context) {
   if (!std::get<props::SkipPrefill>(geglu_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(geglu_props).get();
+  exact_gelu = std::get<props::GeluApproximate>(geglu_props).get() == "none";
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
@@ -41,8 +42,11 @@ void GeGLULayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &in1 = context.getInput(INPUT_IDX_1);
   Tensor &in2 = context.getInput(INPUT_IDX_2);
   Tensor &out = context.getOutput(OUT_IDX);
-  in1.getOps()->geglu(in1, in2, out, in1.batch() * in1.channel() * in1.height(),
-                      /*row_offset=*/0);
+  const unsigned int rows = in1.batch() * in1.channel() * in1.height();
+  if (exact_gelu)
+    in1.getOps()->geglu_erf(in1, in2, out, rows, /*row_offset=*/0);
+  else
+    in1.getOps()->geglu(in1, in2, out, rows, /*row_offset=*/0);
 }
 
 void GeGLULayer::incremental_forwarding(RunLayerContext &context,
@@ -77,7 +81,10 @@ void GeGLULayer::incremental_forwarding(RunLayerContext &context,
   const unsigned int bc = in1.batch() * in1.channel();
   const unsigned int active_rows = (to - from) * bc;
 
-  in1.getOps()->geglu(in1, in2, out, active_rows, /*row_offset=*/0);
+  if (exact_gelu)
+    in1.getOps()->geglu_erf(in1, in2, out, active_rows, /*row_offset=*/0);
+  else
+    in1.getOps()->geglu(in1, in2, out, active_rows, /*row_offset=*/0);
 }
 
 void GeGLULayer::calcDerivative(RunLayerContext &context) {

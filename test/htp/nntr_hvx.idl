@@ -10,4 +10,1498 @@
 interface nntr_hvx : remote_handle64 {
    AEEResult add_f32(in sequence<float> a, in sequence<float> b,
                      rout sequence<float> c);
+
+   // Accuracy harness: the whole flow, quantization and dequantization on
+   // the DSP. Intermediate buffers come back so each stage is checkable.
+   AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
+                              in sequence<float> act_f32,
+                              in sequence<int8> w_i4_rm,
+                              in sequence<float> w_scale,
+                              in sequence<int32> colsum_w,
+                              in sequence<float> bias,
+                              rout sequence<uint8> act_u8_ah,
+                              rout sequence<float> act_scale,
+                              rout sequence<int32> act_zp,
+                              rout sequence<int32> acc_i32,
+                              rout sequence<float> out_f32);
+
+   // --- Performance path ---
+   //
+   // Bakes a K x N int4 weight (int4 values in int8 containers, row-major)
+   // to WH layout once and keeps it DSP-resident, along with its dequant
+   // constants, until weight_release_u8i4. hw_init and the HMX lock happen
+   // once in nntr_hvx_open, not per call -- see nntr_hvx_session.h.
+   // bias has N entries for symmetric weights, or 2*N entries for affine
+   // weights: N ordinary biases followed by N integer channel offsets.
+   // Older DSPs reject the extended length instead of ignoring offsets.
+   AEEResult weight_register_u8i4(in uint32 K, in uint32 N,
+                                  in sequence<int8> w_i4_rm,
+                                  in sequence<float> w_scale,
+                                  in sequence<int32> colsum_w,
+                                  in sequence<float> bias,
+                                  rout uint32 w_handle);
+
+   // Copies a registered weight's baked WH bytes back out so the host can
+   // write the cache the call above reads. wh_out must be exactly
+   // (K/32)*(N/32)*512 bytes for that weight's shape.
+   AEEResult weight_bake_export(in uint32 w_handle,
+                                rout sequence<uint8> wh_out);
+
+   // [doc 46 section 32] The arena: a host rpcmem buffer the DSP maps once
+   // with HAP_mmap_get and then reads weights straight out of, at the same
+   // ~30 GB/s the DMA gets from DSP heap (Gate 0c, section 32.11). fd comes
+   // from rpcmem_to_fd, attached on the host with fastrpc_mmap and
+   // FASTRPC_MAP_FD -- not 0, which is FASTRPC_MAP_STATIC and is not tagged
+   // with the fd; that was attempts 1-3. Up to NNTR_HVX_MAX_ARENAS at a
+   // time; close() puts back whatever is still attached.
+   AEEResult arena_attach(in int32 fd, in uint32 bytes, rout uint32 arena);
+
+   // Refused (AEE_EBADSTATE) while any registered weight still points into
+   // it, since releasing the mapping under a live handle would turn the
+   // next matmul into a read of unmapped memory.
+   AEEResult arena_detach(in uint32 arena);
+
+   // Registers a weight whose WH bytes already sit in an arena at wh_off,
+   // borrowing them in place: no copy, no DSP heap, which is what lifts the
+   // 1.89 GB ceiling Gate 0 hit. The host owns the bytes and keeps them
+   // unchanged while the handle lives. wh_off must be tile-aligned (512)
+   // and the (K/32)*(N/32)*512 bytes must lie inside the arena.
+   // Same N / 2*N bias contract as weight_register_u8i4.
+   AEEResult weight_register_u8i4_arena(in uint32 K, in uint32 N,
+                                        in uint32 arena, in uint32 wh_off,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
+
+   AEEResult weight_release_u8i4(in uint32 w_handle);
+
+   // Runs matmuls against several registered weights that share ONE
+   // quantized activation -- e.g. a Q/K/V or gate/up projection set. Every
+   // handle must have been registered with the same K. Quantizes act_f32
+   // once, double-buffers each handle's weight into VTCM with the next
+   // handle prefetched while the current one computes (cross-matmul
+   // prefetch, measured at 1.7-2x over SDKL on V79), and returns
+   // dequantized f32 -- one contiguous M x handle[i].N block per handle in
+   // call order.
+   AEEResult mm_u8i4_layer(in uint32 M, in uint32 K,
+                           in sequence<uint32> w_handles,
+                           in sequence<float> act_f32,
+                           rout sequence<float> out_cat);
+
+   // Same three ops, at the wider weight width. u8i8 keeps the activation
+   // at uint8 (HMX's activation port is always 8-bit) and widens only the
+   // weight, so the accuracy risk relative to u8i4 is narrower -- this is
+   // why it is worth having alongside u8i4 rather than instead of it.
+   // Same as mm_u8i4_layer, plus the DSP-side stage breakdown. Separate
+   // entry point rather than an optional out-param: the production path must
+   // not pay for the probes, and a caller that wants the breakdown is asking
+   // for a different contract, not a flag.
+   AEEResult mm_u8i4_layer_timed(in uint32 M, in uint32 K,
+                                 in sequence<uint32> w_handles,
+                                 in sequence<float> act_f32,
+                                 rout sequence<float> out_cat,
+                                 rout sequence<uint32> stage_us);
+
+   // mm_u8i4_layer with the RMSNorms a block runs around its projections
+   // folded into the call (doc 57 section 5 step 4), so the rows do not
+   // round-trip for them. pre_gamma (K floats, or empty for none): every
+   // activation row is normed over its K floats, times gamma, before the
+   // quantizer. post_chunk (one per handle, or empty for none; 0 = that
+   // handle untouched) and post_gamma (the chunks of every normed handle
+   // in call order, concatenated): handle i's output rows are normed per
+   // post_chunk[i]-wide piece (N_i for a whole-row norm, the head dim for
+   // a per-head one), times its gamma, in place. eps for both.
+   // After the norms, RoPE (hvx_rope_rows_f32) on the first rope_handles
+   // handles' output rows, per head of rope_hd (0 = none): rope_cs is M
+   // rows of 2*rope_hd floats, the CPU table's cos row then sin row for
+   // each row's position. The q and k projections thus leave rotated.
+   AEEResult mm_u8i4_layer_norm(in uint32 M, in uint32 K, in float eps,
+                                in sequence<float> pre_gamma,
+                                in sequence<uint32> post_chunk,
+                                in sequence<float> post_gamma,
+                                in uint32 rope_hd, in uint32 rope_handles,
+                                in sequence<float> rope_cs,
+                                in sequence<uint32> w_handles,
+                                in sequence<float> act_f32,
+                                rout sequence<float> out_cat);
+
+   // Same as mm_u8i4_layer, but the caller has already quantized AND
+   // AH-tile-packed the activation on the ARM side (htp_act_quant.h's
+   // htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
+   // hvx_quant_pack_u8_ah -- the two pieces this replaces on the DSP).
+   // act_ah is m_pad*K bytes where m_pad = M rounded up to 64; act_scale
+   // and act_zp are m_pad entries each. Cuts the wire payload for the
+   // activation 4x (u8 instead of f32) and removes the DSP-side quant
+   // pass entirely instead of just its scan (weight_register_u8i4's
+   // act_scale/act_zp caller-supply already skipped the scan; this also
+   // skips the pack, since there is no f32 left on the DSP to pack).
+   AEEResult mm_u8i4_layer_u8in(in uint32 M, in uint32 K,
+                                in sequence<uint32> w_handles,
+                                in sequence<uint8> act_ah,
+                                in sequence<float> act_scale,
+                                in sequence<int32> act_zp,
+                                rout sequence<float> out_cat);
+
+   // Same as mm_u8i4_layer_u8in, plus the DSP-side stage breakdown -- see
+   // mm_u8i4_layer_timed's comment for why this is a separate entry point
+   // rather than a flag.
+   AEEResult mm_u8i4_layer_u8in_timed(in uint32 M, in uint32 K,
+                                      in sequence<uint32> w_handles,
+                                      in sequence<uint8> act_ah,
+                                      in sequence<float> act_scale,
+                                      in sequence<int32> act_zp,
+                                      rout sequence<float> out_cat,
+                                      rout sequence<uint32> stage_us);
+
+   // Fused MoE expert FFN: gate_up matmul -> SwiGLU -> down matmul in ONE
+   // round trip. w_handles must be exactly two registered u8i4 weights,
+   // [gate_up (K x 2I), down (I x N_out)] -- down.K == gate_up.N / 2 is the
+   // SwiGLU contract and is checked, not assumed. The gate_up result
+   // dequantizes into VTCM, SwiGLU runs there, and the SwiGLU output is
+   // requantized and fed to the down matmul, so no intermediate crosses the
+   // wire: what this deletes versus two mm_u8i4_layer calls is the
+   // M x 2I + M x I f32 intermediates' round trips (doc 43 §[L2]).
+   AEEResult mm_u8i4_layer_fused(in uint32 M, in uint32 K,
+                                 in sequence<uint32> w_handles,
+                                 in sequence<float> act_f32,
+                                 rout sequence<float> out_f32);
+
+   // Same fused call, plus the DSP-side stage breakdown. Slots are the
+   // fused entry's own list (nntr_hvx_mm_u8i4.c's FU_T_* enum): the
+   // intermediate requant is a second QUANT pass and the SwiGLU is a stage
+   // the unfused call does not have, so this is not the FC_T_* layout.
+   // Separate entry rather than a flag, same reason as mm_u8i4_layer_timed.
+   AEEResult mm_u8i4_layer_fused_timed(in uint32 M, in uint32 K,
+                                       in sequence<uint32> w_handles,
+                                       in sequence<float> act_f32,
+                                       rout sequence<float> out_f32,
+                                       rout sequence<uint32> stage_us);
+
+   // [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize to u8
+   // AH tiles, ONE weight, no down matmul -- the smaller-surface
+   // alternative to mm_u8i4_layer_fused (doc 43 §7's L2 rows: the one-call
+   // fused kernel above produces wrong output on this model's real
+   // weights, root cause not found; this reuses mm_u8i4_layer_u8in's
+   // already-verified act_ah_prepacked path for the down side instead of
+   // reimplementing it). w_handle_gate_up.N must be even (gate|up split);
+   // out_ah/out_scale/out_zp are exactly mm_u8i4_layer_u8in's act_ah/
+   // act_scale/act_zp inputs for the caller's next call -- feed them
+   // straight through.
+   AEEResult mm_u8i4_gate_up_swiglu(in uint32 M, in uint32 K,
+                                    in uint32 w_handle_gate_up,
+                                    in sequence<float> act_f32,
+                                    rout sequence<uint8> out_ah,
+                                    rout sequence<float> out_scale,
+                                    rout sequence<int32> out_zp);
+
+   // Same call, plus the DSP-side stage breakdown (this entry's own slot
+   // list -- see nntr_hvx_mm_u8i4.c's GU_T_* enum).
+   AEEResult mm_u8i4_gate_up_swiglu_timed(in uint32 M, in uint32 K,
+                                         in uint32 w_handle_gate_up,
+                                         in sequence<float> act_f32,
+                                         rout sequence<uint8> out_ah,
+                                         rout sequence<float> out_scale,
+                                         rout sequence<int32> out_zp,
+                                         rout sequence<uint32> stage_us);
+
+   AEEResult weight_register_u8i8(in uint32 K, in uint32 N,
+                                  in sequence<int8> w_i8_rm,
+                                  in sequence<float> w_scale,
+                                  in sequence<int32> colsum_w,
+                                  in sequence<float> bias,
+                                  rout uint32 w_handle);
+
+   AEEResult weight_release_u8i8(in uint32 w_handle);
+
+   AEEResult mm_u8i8_layer(in uint32 M, in uint32 K,
+                           in sequence<uint32> w_handles,
+                           in sequence<float> act_f32,
+                           rout sequence<float> out_cat);
+
+   // Same layer call, plus the DSP-internal microseconds:
+   // [dsp_total, quant, dequant, acc_read, acc_copy, drain, acc_stride].
+   // DEBUG ONLY and stripped before the PR, same as attn_forward_timed.
+   //
+   // A fully connected layer carries M*K floats in and M*N floats out -- 12 MB
+   // per call at Qwen3-0.6B's q_proj with M=1024 -- so the host-side wall clock
+   // is part FastRPC and part compute in a ratio nobody should have to guess
+   // at. This makes the split measured rather than assumed, which is what lets
+   // the result be compared against a per-op QNN number that has no host
+   // transfer in it at all.
+   AEEResult mm_u8i8_layer_timed(in uint32 M, in uint32 K,
+                                 in sequence<uint32> w_handles,
+                                 in sequence<float> act_f32,
+                                 rout sequence<float> out_cat,
+                                 rout sequence<uint32> stage_us);
+
+   // For HVX softmax verification. exp is broken out as its own entry
+   // because looking at softmax output alone hides exp's relative error --
+   // sum normalization cancels it out. xLen must be a multiple of 32 --
+   // hvx_exp_sf operates in whole vectors and this entry does not handle a
+   // tail.
+   AEEResult exp_f32(in sequence<float> x, rout sequence<float> y);
+
+   // [A1] The deterministic SwiGLU (hvx_swiglu_det.h), with its two
+   // intermediates alongside the result. Same reason exp_f32 is broken out
+   // of softmax: the thing under test is whether HVX's plain Vsf arithmetic
+   // rounds exactly the way ARM's f32 does, and only an unreduced,
+   // unquantized output can answer that. exp_out and recip_out are what
+   // separate "the two arithmetics differ" from "they agree and something
+   // downstream does not" -- the whole point is bit identity against a
+   // scalar reference, so a failure has to say WHERE.
+   // Every length must match and be a multiple of 32. act 0 is SwiGLU,
+   // 1 the GeGLU twin (hvx_geglu_det_sf; exp_out and recip_out are then
+   // of t = g (C0 + C1 g^2), doc 55).
+   AEEResult swiglu_det_f32(in uint32 act, in sequence<float> gate,
+                            in sequence<float> up, rout sequence<float> res,
+                            rout sequence<float> exp_out,
+                            rout sequence<float> recip_out);
+
+   AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
+                         in float scale, in sequence<float> x,
+                         rout sequence<float> y);
+
+   // PHASE B of the fused attention loop, exposed on its own so it can be
+   // gated against the host model (test/unittest/mha_htp_host_model.cpp)
+   // before the attention endpoint that will call it in-process exists.
+   //
+   // The band arrives flattened as n_seg contiguous M x T blocks -- the same
+   // bytes hexkl_mm_u8iX_layer_run's out_cat holds, in the same order -- and
+   // comes back holding UNNORMALIZED exp values, plus l per row. Flattening
+   // it into one buffer is a marshalling convenience for this harness only;
+   // on device the blocks are already adjacent in VTCM and the kernel takes
+   // the pointer array directly. Pass an empty sink to mean "no sink".
+   AEEResult softmax_blocked_f32(in uint32 n_seg, in uint32 T, in uint32 M,
+                                 in float scale, in sequence<float> band_in,
+                                 in sequence<uint32> begin,
+                                 in sequence<uint32> end,
+                                 in sequence<float> sink,
+                                 rout sequence<float> band_out,
+                                 rout sequence<float> l_out);
+
+   // --- Attention (MHA_HTP_U8_TASKS.md Task 6) --------------------------
+   //
+   // ONE register entry taking both widths, not one entry per width: the
+   // combinations are four (K and V are independent, §0.2) and four copies of
+   // every attention entry point is not a surface worth carrying.
+   AEEResult attn_register(in uint32 nch, in uint32 gqa, in uint32 head_dim,
+                           in uint32 max_kv, in uint32 T, in uint32 M_band,
+                           in uint32 w_k, in uint32 w_v, rout uint32 h);
+
+   AEEResult attn_release(in uint32 h);
+
+   // Appends KV positions and re-registers only the blocks they land in.
+   AEEResult attn_kv_append(in uint32 h, in uint32 kv_from, in uint32 n_rows,
+                            in sequence<uint16> k_rows,
+                            in sequence<uint16> v_rows);
+
+   // DEBUG ONLY, and stripped before the PR: returns the raw S band so it can
+   // be compared against mha_htp_host_forward's PHASE A. Without a per-stage
+   // output a wrong O gives no signal about which stage produced it
+   // (MHA_HTP_PLAN.md §9.5). Mirrors how mm_u8i4_from_f32 returns
+   // intermediates as an accuracy harness.
+   AEEResult attn_scores_debug(in uint32 h, in uint32 head, in uint32 M,
+                               in sequence<float> q_band,
+                               rout sequence<float> out_s);
+
+   // The whole layer in ONE round trip: Q.Kt, masked softmax and P.V, with S
+   // and P never crossing the host boundary. An unfused seam would pay the
+   // ~404 us fixed FastRPC cost three times per layer instead of once, which
+   // is the entire reason softmax runs on the DSP (MHA_HTP_PLAN.md §2).
+   //
+   // This replaces exactly compute_kcaches + softmax_triangle +
+   // compute_fp16vcache_transposed in mha_core's incremental path. RoPE and
+   // the Q/K/V and output projections stay where they are.
+   AEEResult attn_forward(in uint32 h, in uint32 kv_from, in uint32 n_query,
+                          in float scale, in uint32 is_causal,
+                          in uint32 window, in sequence<float> sink,
+                          in sequence<float> q, rout sequence<float> attn_out);
+
+   // Same forward, plus the DSP-internal per-stage microseconds:
+   // [qk, softmax, pv, accum, gather, total, layer_run_calls]. DEBUG ONLY and
+   // stripped before the PR. The host times the whole call, this times the
+   // inside, and the difference is the FastRPC transport -- which is how §2's
+   // transport share gets checked rather than assumed.
+   AEEResult attn_forward_timed(in uint32 h, in uint32 kv_from,
+                                in uint32 n_query, in float scale,
+                                in uint32 is_causal, in uint32 window,
+                                in sequence<float> sink, in sequence<float> q,
+                                rout sequence<float> attn_out,
+                                rout sequence<uint32> stage_us);
+
+   // [doc 46] A whole MoE FFN layer -- every expert, the token gather, the
+   // routing multiply and the scatter-add -- in one call, replacing the 64
+   // (32 experts x gate_up_swiglu + layer_u8in) it costs today.
+   //
+   // row_index holds the token row each (expert, slot) pair works on,
+   // grouped by expert in expert order; row_count says how many belong to
+   // each, and row_weight the routing weight for each. act_f32 is M x K and
+   // out_f32 is M x N_out, which the DSP zeroes and accumulates into --
+   // experts share token rows.
+   //
+   // act and out are sequences here because that is what today's model
+   // hands over. The kernel underneath takes plain pointers, so the Phase D
+   // entry point that leaves the residual stream on the DSP is a second
+   // wrapper over the same code, not a rewrite (doc 45 section 3.1).
+   //
+   // act is the gated activation between gate_up and down: 0 silu(g)*u
+   // (LFM2), 1 gelu_tanh(g)*u (Gemma-4; doc 55). HVX_GLU_* in
+   // hvx_dequant_i32.h. Opt-in LFM input handoff may put the ticket word
+   // from htp_router_handoff.h in act. Other entries retain act=0/1.
+   // Matching ARM+DSP binaries are required. The ARM client sends a ticket
+   // only after consuming its source/session/write-epoch stamp. DSP checks
+   // the same ticket against this session's scratch owner/extent/epoch; RPC
+   // input VAs may differ. Any missing stamp falls back to the input copy.
+   AEEResult mm_u8i4_moe_layer(in uint32 M, in uint32 K, in uint32 inter,
+                               in uint32 N_out, in uint32 act,
+                               in sequence<uint32> h_gate_up,
+                               in sequence<uint32> h_down,
+                               in sequence<uint32> row_index,
+                               in sequence<uint32> row_count,
+                               in sequence<float> row_weight,
+                               in sequence<float> act_f32,
+                               rout sequence<float> out_f32);
+
+   // Same, plus the DSP-internal per-stage microseconds:
+   // [total, quant, swiglu, dequant, acc_read, drain, scatter, acc_stride].
+   // DEBUG ONLY.
+   AEEResult mm_u8i4_moe_layer_timed(in uint32 M, in uint32 K, in uint32 inter,
+                                     in uint32 N_out, in uint32 act,
+                                     in sequence<uint32> h_gate_up,
+                                     in sequence<uint32> h_down,
+                                     in sequence<uint32> row_index,
+                                     in sequence<uint32> row_count,
+                                     in sequence<float> row_weight,
+                                     in sequence<float> act_f32,
+                                     rout sequence<float> out_f32,
+                                     rout sequence<uint32> stage_us);
+
+   // [57 section 5 step 5] The MoE router's logits at prefill shapes:
+   // logits[M][E] = rmsnorm(x)[M][K] . w[K][E] in f32 (hvx_router_rows_f32),
+   // gamma K floats for the router's own norm or empty for none. E a
+   // multiple of 32 up to 128. The call removes the M x K x E CPU matmul
+   // and the norm before it. top_k 0: logits only, sel and weight empty.
+   // top_k > 0 (the softmax router): logits returns the softmax
+   // probabilities, sel the n_sel largest per row (descending, an exact
+   // tie to the lower index -- the CPU layer's comparator) and weight the
+   // first top_k's p * (1 / their sum) * scale[e] (hvx_router_topk_rows_f32);
+   // scale is E floats. n_sel past top_k is the caller's prefetch hint.
+   // With top_k=0 only, n_sel may carry htp_router_handoff.h's opt-in
+   // ticket word. No selection arrays are used; a successful eligible LFM
+   // router retains one scratch stamp for the following plain MoE call.
+   // Its ticket binds the ARM-authorized ION source, not an RPC mapping VA.
+   AEEResult router_logits_f32(in uint32 M, in uint32 K, in uint32 E,
+                               in float eps, in sequence<float> gamma,
+                               in sequence<float> w, in sequence<float> x,
+                               in uint32 top_k, in uint32 n_sel,
+                               in sequence<float> scale,
+                               rout sequence<float> logits,
+                               rout sequence<uint32> sel,
+                               rout sequence<float> weight);
+
+   // mm_u8i4_moe_layer with the block's norms folded in, as
+   // mm_u8i4_layer_norm does for the FC call: pre_gamma (K floats, or
+   // empty) norms every activation row before the call, post_gamma (N_out
+   // floats, or empty) norms every output row after it, in place.
+   AEEResult mm_u8i4_moe_layer_norm(in uint32 M, in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 act,
+                                    in float eps,
+                                    in sequence<float> pre_gamma,
+                                    in sequence<float> post_gamma,
+                                    in sequence<uint32> h_gate_up,
+                                    in sequence<uint32> h_down,
+                                    in sequence<uint32> row_index,
+                                    in sequence<uint32> row_count,
+                                    in sequence<float> row_weight,
+                                    in sequence<float> act_f32,
+                                    rout sequence<float> out_f32);
+
+   // [doc 51 section 2] An LFM2 conv block -- in_proj, a*c, causal conv1d,
+   // *b, out_proj -- in one call, so its four M x C f32 intermediates never
+   // cross FastRPC. h_in holds in_proj's three column slices [a, b, c] as
+   // registered weights (each K x C), h_out the out_proj (C x N_out).
+   // conv_w is [3 x C] f32 (w0 for row t, w1 for t-1, w2 for t-2). act_f32
+   // is M x K, out_f32 M x N_out. state_f32 gets the conv input's last two
+   // rows (2 x C), which the CPU decode path continues from.
+   AEEResult mm_u8i4_conv_block(in uint32 M, in uint32 K, in uint32 C,
+                                in uint32 N_out,
+                                in sequence<uint32> h_in,
+                                in uint32 h_out,
+                                in sequence<float> conv_w,
+                                in sequence<float> act_f32,
+                                rout sequence<float> out_f32,
+                                rout sequence<float> state_f32);
+
+   // Same, plus mm_u8i4_moe_layer_timed's stage_us layout: the columns
+   // mean the same things, SWIGLU carries the conv gate pass and SCATTER
+   // is always 0. DEBUG ONLY.
+   AEEResult mm_u8i4_conv_block_timed(in uint32 M, in uint32 K, in uint32 C,
+                                      in uint32 N_out,
+                                      in sequence<uint32> h_in,
+                                      in uint32 h_out,
+                                      in sequence<float> conv_w,
+                                      in sequence<float> act_f32,
+                                      rout sequence<float> out_f32,
+                                      rout sequence<float> state_f32,
+                                      rout sequence<uint32> stage_us);
+
+   // [doc 45 Gate 0b] Two memory probes. Gate 0 stopped weight registration
+   // at 1.89 GB of the 4.10 the whole-model plan needs, with an error that
+   // came from before the registration function ran -- so the PD was out of
+   // memory generally, not out of malloc heap. These separate the two
+   // limits that could be responsible, because ION-backed weights get past
+   // one of them and not the other. DEBUG ONLY.
+
+   // [doc 46 section 32.4, Gate 0c] Maps a host rpcmem buffer into the DSP
+   // once and DMAs out of it, which is the one step of the arena design
+   // this tree has never done: neither rpcmem_to_fd nor HAP_mmap appears
+   // anywhere, and Gate 0b measured how much ION could be allocated, not
+   // whether the DSP can reach it. If this fails the arena is not
+   // available and the plan that rests on it has to change.
+   //
+   // fd comes from rpcmem_to_fd on the host. dma_bytes of the mapping are
+   // pulled into VTCM and timed, so the rate can be compared against the
+   // 27-33 GB/s the weight path already measures from DSP heap.
+   //
+   // res: [mapped(0/1), map_us, dma_us, dma_bytes, checksum, unmap_ok]
+   // checksum is a sum over the DMA'd bytes so nothing can be optimised
+   // away and a mapping that reads as zeros is visible. DEBUG ONLY.
+   AEEResult arena_probe(in int32 fd, in uint32 bytes, in uint32 dma_bytes,
+                         rout sequence<uint32> res);
+
+   // Allocates chunk_mb-sized blocks on the DSP and touches one byte per 4 KB
+   // page of each (so they are committed, not just reserved) until an
+   // allocation fails, then frees them all. Reports how many succeeded and
+   // the sum of the touched bytes so nothing can be optimised away. Carries
+   // no large payload, unlike weight_register_u8i4, so it measures the PD's
+   // own allocatable memory rather than that plus a 3.67 MB input buffer.
+   AEEResult mem_probe_dsp_heap(in uint32 chunk_mb, in uint32 max_chunks,
+                                rout sequence<uint32> chunks_ok,
+                                rout sequence<uint64> touched_sum);
+
+   // Touches one byte per 4 KB page of a host-provided buffer. Called with
+   // rpcmem/ION memory, this is what proves the DSP can actually reach an
+   // ION mapping of a given size -- the design section 8.4 depends on.
+   AEEResult mem_probe_touch(in sequence<uint8> buf,
+                             rout sequence<uint64> touched_sum);
+
+   // [#77, doc 48 section 5 C] Streams bytes of an attached arena into VTCM
+   // with one DMA engine per worker thread (each worker issues its own
+   // dmstart on its own descriptors -- not the shared dmlinked ring), so
+   // the three axes of the arena bandwidth question can be moved one at a
+   // time: descriptor shape (row_size x nrows at src_stride), worker
+   // count, and the bus vote (a compile-time property of the skel,
+   // reported back as vote_state). The plan that splits the range into
+   // descriptors is test/htp/nntr_dma_probe_plan.h, checked on the host.
+   //
+   // res: [us, bytes_lo, bytes_hi, checksum, workers_used, vote_state,
+   //       n_descriptors, max_desc_bytes, vtcm_per_worker, passes]
+   // checksum sums worker 0's VTCM slice at a 64-byte stride after the
+   // run, so a mapping that reads as zeros is visible. DEBUG ONLY.
+   AEEResult dma_probe(in uint32 arena, in uint32 src_off, in uint32 bytes,
+                       in uint32 row_size, in uint32 nrows,
+                       in uint32 src_stride, in uint32 workers,
+                       in uint32 passes, rout sequence<uint32> res);
+
+   // [#87] The DMA ring trace of the last mm_u8i4_moe_layer_timed call,
+   // flattened by hexkl_dma_trace_serialize: an 8-word header (n_push,
+   // n_wait, n_blocked, depth_max, n_dropped, t_end ticks, words per push
+   // record, words per wait record), then the push records (issue tick,
+   // kind, expert, chunk, bytes, row_size, nrows, src_stride, ring index,
+   // depth before, done_lo, done_hi) and the wait records (in, out, ring
+   // index, site, blocked). n_words is 0 when words is too small for the
+   // whole trace. Ticks are 19.2 MHz qtimer counts since the call's ring
+   // reset. DEBUG ONLY.
+   AEEResult moe_dma_trace_read(rout sequence<uint32> words,
+                                rout uint32 n_words);
+
+   // [#87] Replays an M=1 MoE chunk schedule (test/htp/nntr_moe_dma_plan.h)
+   // from an attached arena with no compute between the pushes, so the
+   // in-situ descriptor list can be timed on its own. schedule is 8 words
+   // per item: op << 8 | kind-or-site, expert, src_off (region-relative
+   // for weights, scratch-relative for the rest; for a wait, the index of
+   // the push item it waits on), dst_off (VTCM), row_size, nrows,
+   // src_stride, t_rel (ticks after the call's start at which to issue,
+   // honoured when pace != 0). region_bytes is one expert's gate_up +
+   // down; the arena holds up to 32 such regions plus one region-sized
+   // scratch after them.
+   //   workers 1: the production ring, one dmlinked chain, on the caller;
+   //           N: pushes round-robin over N pool threads, each with its
+   //              own dmstart chain, a wait done by the owner of its push.
+   //   load    0 none; 1 the pool workers stream a 4 MiB DDR heap buffer
+   //           (read + write) for the call's duration; 2 the same over
+   //           1 MiB of VTCM (HVX busy, no DDR traffic). workers == 1 only.
+   //   pace    0 issue as fast as the order allows; 1 spin to t_rel first.
+   //   fresh   0 every call reads regions 0..E-1; 1 call c reads regions
+   //           (c * E + e) % n_regions, so each call touches new pages.
+   //   gap_us  spin between calls (the FastRPC gap between tokens).
+   // res: [us_total, calls, bytes_per_call, wait_us, n_blocked, depth_max,
+   //       checksum, n_regions, workers_used, load_units, busy_lo_us,
+   //       busy_hi_us]. checksum sums the gate_up VTCM slice at a 64-byte
+   //       stride after the last call; busy_* only for workers == 1.
+   // DEBUG ONLY.
+   AEEResult dma_replay(in uint32 arena, in uint32 region_bytes,
+                        in sequence<uint32> schedule, in uint32 workers,
+                        in uint32 load, in uint32 pace, in uint32 fresh,
+                        in uint32 gap_us, in uint32 calls,
+                        rout sequence<uint32> res);
+
+   // [#80] Session-scoped options for mm_u8i4_moe_layer*. flags is
+   // HEXKL_MOE_FLAG_* bits (hexkl_mm_u8i4_moe.h); bit 0 lets a call of at
+   // most 4 rows take the HVX GEMV path instead of the 64-row HMX block
+   // loop. The DSP stores the bits it knows and echoes them in applied, so
+   // a caller can tell a stale skel (AEE_EUNSUPPORTED from the stub, or
+   // applied != flags) from a switch that took. Default 0 = the HMX loop.
+   AEEResult moe_set_opts(in uint32 flags, rout uint32 applied);
+
+   // [#85] One FastRPC call per token, the skeleton. graph_init takes the
+   // decode step's op list (htp_graph_desc.h words: header, layer kinds,
+   // one 80-word record per op with its kind, shapes, activation slots,
+   // next_mm and, for a MoE op, its 32 + 32 registered weight handles;
+   // since #132 Part B an FC / DENSE_FFN / LM_HEAD op's Q4M1 handles),
+   // validates it once and keeps it; n_ops echoes the count. A second init
+   // without a release is AEE_EBADSTATE; a handle a resident op names
+   // cannot be released while the graph lives (AEE_EBADSTATE from
+   // weight_release_u8i4). Validation codes are the header's: never
+   // AEE_EBADPARM, which stays the stale-skel symptom.
+   AEEResult graph_init(in sequence<uint32> desc, rout uint32 n_ops);
+   AEEResult graph_release();
+
+   // forward runs ops [start_op, ...) while they carry the resident bit
+   // and returns the index of the first that does not in resume_at. act_in
+   // is the start op's input (its K floats), copied into the op's slot;
+   // act_out receives the last run op's output, or is untouched when the
+   // start op is not resident (then resume_at == start_op). pos is the
+   // token position (checked < max_seq; the attention and RoPE kinds read
+   // it). row_index / row_count / row_weight are the routing of the first
+   // MoE op run, in mm_u8i4_moe_layer's layout, while the router stays on
+   // the ARM; empty otherwise.
+   AEEResult forward(in uint32 start_op, in uint32 pos,
+                     in sequence<uint32> row_index,
+                     in sequence<uint32> row_count,
+                     in sequence<float> row_weight,
+                     in sequence<float> act_in, rout sequence<float> act_out,
+                     rout uint32 resume_at);
+
+   // Same, at most n_ops_limit ops, plus op_pcycles[n_ops_limit] (the
+   // HAP_perf_get_pcycles bracket of each op run, 0 for the rest) and
+   // stage_us in mm_u8i4_moe_layer_timed's layout for the whole call
+   // (slot 0 is the call's DSP time; the MoE stages are the probe's).
+   // DEBUG ONLY.
+   AEEResult forward_debug(in uint32 start_op, in uint32 n_ops_limit,
+                           in uint32 pos,
+                           in sequence<uint32> row_index,
+                           in sequence<uint32> row_count,
+                           in sequence<float> row_weight,
+                           in sequence<float> act_in,
+                           rout sequence<float> act_out,
+                           rout uint32 resume_at,
+                           rout sequence<uint32> op_pcycles,
+                           rout sequence<uint32> stage_us);
+
+   // [#82] The M=1 small ops (hvx_m1_ops_f32.c) against the scalar spec
+   // nntrainer/tensor/m1_ops_det.h. Test entries: no model path calls
+   // them, and they use the caller's buffers only (no session state, heap
+   // or VTCM). A bad shape is AEE_EINVALIDFORMAT, never AEE_EBADPARM,
+   // which stays the stale-skel symptom.
+   //
+   // RMSNorm over x in chunks of `chunk` floats (a power of two, a
+   // multiple of 32, dividing xLen), gamma of `chunk` floats shared by
+   // every chunk (chunk == xLen: the hidden norm; 64: the per-head q/k
+   // norm). row_scale is xLen / chunk floats, r per chunk, so a mismatch
+   // says whether the reduction + rsqrt or the scaling diverged.
+   AEEResult rmsnorm_det_f32(in uint32 chunk, in float eps,
+                             in sequence<float> x, in sequence<float> gamma,
+                             rout sequence<float> y,
+                             rout sequence<float> row_scale);
+
+   // [57 section 5 step 4] The decoder block's epilogue at prefill shapes:
+   // res = scale * (res + rmsnorm(x [+ x2]) * gamma) over M rows of n
+   // floats (n a multiple of 32), the whole-row norm of the summed addend.
+   // res carries the residual in; x is M*n floats, or 2*M*n with the
+   // second addend (the MoE output beside the dense one) behind the first.
+   // gamma is n floats or empty for 1. Lives on the hvx_rmsnorm_rows_f32
+   // kernel, so the rows split across the session's worker pool.
+   AEEResult rmsnorm_add_f32(in uint32 M, in uint32 n, in float eps,
+                             in float scale, in sequence<float> gamma,
+                             in sequence<float> x,
+                             inrout sequence<float> res);
+
+   // RoPE at head_dim 64: qk is n_q q heads then (qkLen / 64 - n_q) k
+   // heads of 64 contiguous floats, cs the 64-float cos[32] | sin[32] row
+   // of one position; y receives the rotated copy.
+   AEEResult rope64_det_f32(in uint32 n_q, in sequence<float> cs,
+                            in sequence<float> qk, rout sequence<float> y);
+
+   // Causal depthwise conv1d (L=3) + gate for one token, C = yLen (a
+   // multiple of 32): abc = a | b | c (3C), conv_w = w0 | w1 | w2 (3C),
+   // state_in = x_{t-2} | x_{t-1} (2C), y = b * conv1d(a*c) (C). state_out
+   // is 3C: rows 0-1 the new state x_{t-1} | a*c, row 2 the kernel's
+   // scratch (hvx_m1_ops_f32.h).
+   AEEResult conv_gate_m1_f32(in sequence<float> abc,
+                              in sequence<float> conv_w,
+                              in sequence<float> state_in,
+                              rout sequence<float> y,
+                              rout sequence<float> state_out);
+
+   // [#81] Decode attention at m=1 (hvx_attn_m1_f32.c) against the scalar
+   // spec nntrainer/tensor/attn_m1_det.h, with a session-owned fp16 KV
+   // cache (#170; rows stay f32 on the wire): Kt tiled [layer][kv][tile]
+   // [head_dim][64], V [layer][kv][max_seq][head_dim], allocated at
+   // register for the whole shape (24 MiB at the LFM2.5 shape and max_seq
+   // 2048) and freed at release or close. layer
+   // is the attention-layer ordinal. Not wired into the model here: #85's
+   // ATTN_M1 slot stays NULL. One cache per shape: [plan 201 S4] a second
+   // register of another (n_kv, gqa, head_dim) is the session's second
+   // cache (Gemma 4's full layers), kv_append names it with
+   // HTP_ATTN_KV_CACHE_B in layer (htp_graph_desc.h); a second of the same
+   // shape, or a third, without a release is AEE_EBADSTATE (release frees
+   // both). A bad shape or a position out
+   // of range is AEE_EINVALIDFORMAT, a hole (pos or kv_from past the
+   // layer's length) or a missing cache AEE_EBADSTATE; never AEE_EBADPARM,
+   // which stays the stale-skel symptom.
+   AEEResult attn_m1_register(in uint32 n_layers, in uint32 n_kv,
+                              in uint32 gqa, in uint32 head_dim,
+                              in uint32 max_seq);
+   AEEResult attn_m1_release();
+
+   // Bulk append of n_rows positions [kv_from, kv_from + n_rows) of one
+   // layer from the CPU cache layout, k_rows / v_rows [n_rows][n_kv]
+   // [head_dim] f32 (how the wiring issue seeds the prompt's rows after
+   // the CPU prefill). Sets the layer's length to kv_from + n_rows.
+   AEEResult attn_m1_kv_append(in uint32 layer, in uint32 kv_from,
+                               in uint32 n_rows, in sequence<float> k_rows,
+                               in sequence<float> v_rows);
+
+   // [#4416 D6] attn_m1_kv_append with the rows as fp16 bits (the CPU
+   // cache's storage, half the bytes): widened exactly on the DSP, so the
+   // ARM converts nothing for the first token's seed.
+   AEEResult attn_m1_kv_append_f16(in uint32 layer, in uint32 kv_from,
+                                   in uint32 n_rows,
+                                   in sequence<uint16> k_rows,
+                                   in sequence<uint16> v_rows);
+
+   // Appends position pos (k, v: [n_kv][head_dim], post-RoPE) to layer and
+   // returns the attention of q ([n_kv * gqa][head_dim], post-RoPE) over
+   // positions 0..pos in y ([n_kv * gqa][head_dim]); scale is the
+   // model's 1/sqrt(head_dim). pos <= the layer's length: equal appends,
+   // less rewinds. stats is empty, or 2 * n_kv * gqa floats receiving
+   // (m, l) per q head -- the localising intermediates a device mismatch
+   // is read with; production passes it empty and pays nothing. [#146]
+   // 2 * n_kv * gqa + ATTN_M1_PROF_WORDS floats also receives the phase
+   // pcycle words after the pairs (uint32 bits, attn_m1_det.h).
+   AEEResult attn_m1_forward(in uint32 layer, in uint32 pos, in float scale,
+                             in sequence<float> q, in sequence<float> k,
+                             in sequence<float> v, rout sequence<float> y,
+                             rout sequence<float> stats);
+
+   // [#130] Binds one f32 parameter of a graph op after graph_init and
+   // before the first forward that runs it: which is HTP_GRAPH_PARAM_*
+   // (htp_graph_desc.h, the lengths beside it) -- a norm's gamma (K, or
+   // q | k gamma of 2 x head_dim for QK_NORM), a conv op's weights (3N)
+   // or its state seed (2N, re-sendable), the RoPE table (max_seq x 64
+   // with op == HTP_GRAPH_NO_OP), or a ROUTER_TOPK op's gate weight
+   // (K x n_experts, [K][E]) and bias (n_experts) (#132), or [#132 Part
+   // B E3] an LM_HEAD op's banned ids (LM_BAN: 1..32 u32 in the f32
+   // words, the argmax skips them), or [plan 201 S1] a MOE op's expert
+   // table (EXPERTS: 2 x n_experts u32 handles, h_gu then h_dn, each
+   // HTP_GRAPH_NO_HANDLE or a registered weight of the op's shape, else
+   // AEE_EINVHANDLE; re-sendable). The copy lives on the DSP heap for
+   // the graph's life (plan 130 section 3.1), so the per-token calls
+   // carry activations only. A wrong length or a kind that does not take
+   // which is AEE_EINVALIDFORMAT, an op or which out of range
+   // AEE_EBADITEM, no graph AEE_EBADSTATE; never AEE_EBADPARM.
+   AEEResult graph_set_param(in uint32 op, in uint32 which,
+                             in sequence<float> data);
+
+   // [#4416 D6] ROPE op `op` shares the table ROPE op `src_op` already
+   // holds (which = ROPE_TABLE only): the ARM sends a layer's table once
+   // and points the layers that have the same one at it (Gemma 4: 2 of
+   // 30 tables cross, not 30 x 2 MiB through the heap-argument copy and
+   // the DSP's memcmp -- 439 ms of the first token on the S26 Ultra).
+   AEEResult graph_share_param(in uint32 op, in uint32 which,
+                               in uint32 src_op);
+
+   // [#132] The MoE router of one token (hvx_m1_ops_f32.c's
+   // hvx_router_topk_f32) against the scalar spec m1_router_cpu_det
+   // (nntrainer/tensor/m1_ops_det.h; the Android CPU's order since #132
+   // PR 2): K = xLen (a multiple of 4), E =
+   // biasLen (1..32), w the [K][E] gate weight; logits (E), the top_k
+   // selected experts in selection order and their routing weights. A bad
+   // shape is AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   AEEResult router_topk_det_f32(in uint32 top_k, in sequence<float> x,
+                                 in sequence<float> w,
+                                 in sequence<float> bias,
+                                 rout sequence<float> logits,
+                                 rout sequence<uint32> sel,
+                                 rout sequence<float> weight);
+
+   // [#141] dspqueue microbench, DEBUG ONLY (no model path calls these).
+   // start imports the queue the ARM side exported and parks one DSP thread
+   // on it: mode 0 blocks in dspqueue_read (signalled), mode 1 spins on
+   // dspqueue_read_noblock (polling). AEE_EUNSUPPORTED: this DSP image has
+   // no dspqueue. AEE_EBADSTATE: a bench queue is already open.
+   // Never AEE_EBADPARM (the stale-skel symptom, rule 3).
+   AEEResult dspq_bench_start(in uint64 queue_id, in uint32 mode);
+   // Stops the thread and closes the queue.
+   // res: [packets served, empty polls, bad packets, mode]
+   AEEResult dspq_bench_stop(rout sequence<uint32> res);
+
+   // [#141 step 2] The M==1 MoE layer call over dspqueue (plan
+   // docs/plans/141-dspq-moe.md; packet: htp_backend/htp_dspq_wire.h).
+   // start imports the queue the ARM side exported and parks one DSP thread
+   // on it that runs mm_u8i4_moe_layer[_timed] -- the same C function -- per
+   // request packet. After each response it spins spin_us on read_noblock,
+   // then blocks (spin_us 0 = always block). AEE_EUNSUPPORTED: this DSP
+   // image has no dspqueue. AEE_EBADSTATE: the session already has a queue.
+   // Never AEE_EBADPARM (the stale-skel symptom, rule 3). close() stops a
+   // queue that is still open.
+   AEEResult dspq_start(in uint64 queue_id, in uint32 spin_us);
+   // Stops the thread and closes the queue.
+   // res: [packets served, bad packets, empty polls, spin_us]
+   AEEResult dspq_stop(rout sequence<uint32> res);
+
+   // [#170] DEBUG ONLY (no model path calls it): hvx_attn_m1_hf.h's
+   // fp16-lane primitives on silicon, and the cost of the kernel shapes
+   // plan 170 designs (test/htp/nntr_hvx_attn_m1_probe.c). op < 16: y[i] =
+   // f(a[i], b[i], c[i]) over n lanes (a, b, c, y all n long, n a multiple
+   // of 64), one thread. op >= 16: a kernel-shaped loop on lanes pool lanes,
+   // reps timed pool runs; a, b, c, y empty. Op codes and the prof words:
+   // test/htp/nntr_attn_m1_probe.h. A bad op, length, lane or rep count is
+   // AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   AEEResult attn_m1_probe(in uint32 op, in uint32 lanes, in uint32 reps,
+                           in sequence<uint16> a, in sequence<uint16> b,
+                           in sequence<uint16> c, rout sequence<uint16> y,
+                           rout sequence<uint32> prof);
+
+   // [#132 PR 2] The CPU-exact M=1 Q4_0 FC (hvx_q4_gemv_f32.c) against
+   // nntrainer/tensor/q4_gemv_cpu_det.h, and the CPU-order small ops of
+   // m1_ops_det.h. Test entries: no model path calls them. A bad shape is
+   // AEE_EINVALIDFORMAT, a bad handle AEE_EBADITEM; never AEE_EBADPARM.
+   //
+   // One K x N weight in the Q4M1 layout (q4_gemv_cpu_det.h; K % 64 == 0,
+   // K <= 8192, N % 32 == 0), copied to the DSP heap: h names it until
+   // q4m1_release or close. At most 80 at once (AEE_EBADITEM past that).
+   // [#132 Part B] A resident graph op may name h (graph_init's FC,
+   // DENSE_FFN and LM_HEAD records): release is then AEE_EBADSTATE until
+   // graph_release.
+   AEEResult q4m1_register(in uint32 K, in uint32 N, in sequence<uint8> w,
+                           rout uint32 h);
+   AEEResult q4m1_release(in uint32 h);
+
+   // y (N) = the CPU's Q4_0 FC of x (K) with weight h, reps times (y from
+   // the last). variant: bit 16 the VTCM feed (per-lane DMA, src_bypass),
+   // bit 17 the same double buffer in a 2 MiB DSP heap scratch through the
+   // L2 (#178; not both), [#194 L1] bit 18 the native quantizer and GEMV
+   // (q4_gemv_native_det.h, not the CPU's order), every other bit 0.
+   // lanes: pool threads, 1..8
+   // (capped at the pool). stats
+   // (8): [0] GEMV us over the reps, [1] quantizer us, [2..3] GEMV
+   // pcycles lo | hi, [4] lanes used, [5] reps, [6] K, [7] N.
+   AEEResult fc_q4m1_f32(in uint32 h, in uint32 variant, in uint32 lanes,
+                         in uint32 reps, in sequence<float> x,
+                         rout sequence<float> y,
+                         rout sequence<uint32> stats);
+
+   // [57 section 9.7] The lm_head of one row as one call: x (K floats)
+   // normed by gamma (K floats, or empty for none) with eps, quantized
+   // once in the CPU's Q4_0 FC order (hvx_q4m1_prep), then every slice h[p]
+   // (registered or attached Q4M1 weights of K columns, in vocab order)
+   // into its rows of y, and y capped by softcap * tanh(y / softcap)
+   // (hvx_softcap_f32; 0 for none). y is the slices' rows summed. A model
+   // path, unlike fc_q4m1_f32: AEE_EINVALIDFORMAT for a bad shape,
+   // AEE_EBADITEM for a bad handle.
+   AEEResult lm_head_q4m1_f32(in float eps, in sequence<float> gamma,
+                              in float softcap, in sequence<uint32> h,
+                              in sequence<float> x, rout sequence<float> y);
+
+   // An untied head's row on its WH slices, outside the token driver (the
+   // prefill's last row): x (K floats, K % 32 == 0) through h[p] (u8i4
+   // handles of K columns, in vocab order, at most HEXKL_FC_M1_MAX_PARTS)
+   // into y (their N summed) -- the graph's LM_HEAD op on
+   // HTP_GRAPH_FEED_WH, the same kernel on the same bytes. No norm and no
+   // soft-cap: an untied model keeps those in their own layers.
+   // AEE_EINVALIDFORMAT for a bad shape, AEE_EBADITEM for a bad handle.
+   AEEResult lm_head_wh_f32(in sequence<uint32> h, in sequence<float> x,
+                            rout sequence<float> y);
+
+   // The FC's vector quantizer (hvx_q4m1_prep, = q8_0_quant_cpu_det, the
+   // CPU's nntr_quantize_row_q8_0): xLen % 64 == 0, <= 8192 floats into
+   // xLen int8 and xLen/32 f16 scales.
+   AEEResult q8_quant_f32(in sequence<float> x, rout sequence<int8> q,
+                          rout sequence<uint16> d);
+
+   // m1_swiglu_cpu_det: o = (y / (exp_ps(-y) + 1)) * z, neon::swiglu's
+   // order.
+   AEEResult swiglu_cpu_f32(in sequence<float> y, in sequence<float> z,
+                            rout sequence<float> o);
+
+   // m1_argmax_first: the index of the first maximum (std::max_element).
+   AEEResult argmax_f32(in sequence<float> x, rout uint32 idx);
+
+   // [#178] Second-session probe (plan docs/plans/178-second-dsp-session.md).
+   // Test entries: no model path calls them. Never AEE_EBADPARM for a bad
+   // length (AEE_EINVALIDFORMAT), which stays the stale-skel symptom.
+   //
+   // res (7): [hmx_locked, vtcm_size bytes, vtcm_avail_kib, vtcm_max_page_kib
+   // (HAP_query_avail_VTCM now), heap_used_kib ([#132 Part B E5g] the PD's
+   // heap in use, HAP_mem_get_stats; 0 without it), open_path (0 full, 1
+   // lite: no HMX lock, VTCM from HAP_compute_res), hvx_units]; with 8
+   // slots, res[7] is the fp16 HMX rate hexkl_micro_hw_init reported (0:
+   // none), which bounds every fp16 / quantized attention plan.
+   AEEResult session_info(rout sequence<uint32> res);
+
+   // One side of a DSP-to-DSP hop through a shared page (nntr_hvx_mailbox.c):
+   // fd is an ION buffer of bytes the caller fastrpc_mmap'd for this
+   // session. role 0 posts seq 1..n in the ping word (after copying payload
+   // bytes into its half, cache clean) and waits for the same seq in pong;
+   // role 1 mirrors. A wait spins spin_us, then polls every 50 us until
+   // spin_us + 1 s, which counts a timeout and ends the run. payload is 0
+   // or a multiple of 4 of at least 12 bytes; us_total is 0 when n_done is 0.
+   // res (5): [us_total, n_done, n_timeouts, payload_checksum, n_bad].
+   AEEResult mailbox_run(in int32 fd, in uint32 bytes, in uint32 role,
+                         in uint32 n, in uint32 payload, in uint32 spin_us,
+                         rout sequence<uint32> res);
+
+   // One f32 operation per element on the DSP (nntr_hvx_sf_probe.c), to
+   // name the operation a kernel disagrees on: op 0/1/2 the inline-asm
+   // IEEE vadd/vsub/vmpy .sf, 3/4/5 the Q6_Vsf_* intrinsics, 6 scalar a/b,
+   // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 0..5.
+   AEEResult sf_probe(in uint32 op, in sequence<float> a,
+                      in sequence<float> b, rout sequence<float> o);
+
+   // [#132 Part B E2, #211] The one-PD token driver (nntr_hvx_token.c over
+   // hmx/hexkl_token.c). start maps the mailbox page the ARM side
+   // allocated and fastrpc_mmap'd into the session (mbox_fd; mbox_bytes >=
+   // 18432, HEXKL_MBOX_BYTES): the expert pool's miss lines. role must be
+   // 0 (op 0 to the argmax); 1, the two-PD path's MoE server, was removed
+   // by #211 and is refused. A miss wait spins spin_us, then polls every
+   // 20 us, and fails the token with AEE_EEXPIRED 1 s later. The tokens
+   // themselves are dspqueue packets (HTP_DSPQ_OP_TOKEN, htp_dspq_wire.h)
+   // on the session's dspq thread. AEE_EBADSTATE: a driver is already
+   // running; AEE_EINVALIDFORMAT: role or page size. Never AEE_EBADPARM.
+   // close() stops a driver still running.
+   AEEResult token_driver_start(in int32 mbox_fd, in uint32 mbox_bytes,
+                                in uint32 role, in uint32 spin_us);
+   // Unmaps the page. res (5): [tokens served, hops (0), timeouts, stale
+   // reads, wait us (0)].
+   AEEResult token_driver_stop(rout sequence<uint32> res);
+
+   // [#132 Part B E3] q4m1_register's arena form: the K x N Q4M1 weight
+   // the ARM side already wrote at byte off of an attached arena
+   // (arena_attach; off % 128 == 0, the weight inside the arena). No copy:
+   // h names those bytes until q4m1_release or close, and the arena cannot
+   // be detached while a slot borrows from it (AEE_EBADSTATE). The ARM
+   // writes the arena uncached and before this call, the DSP never writes
+   // it, so the FC's DMA reads it around the L2 as it reads a registered
+   // copy. Shapes and slots as q4m1_register (AEE_EINVALIDFORMAT,
+   // AEE_EBADITEM); an unknown arena or a weight past its end is
+   // AEE_EINVALIDFORMAT, never AEE_EBADPARM.
+   AEEResult q4m1_attach(in uint32 arena, in uint32 off, in uint32 K,
+                         in uint32 N, rout uint32 h);
+
+   // [#132 Part B E5i] The release half of close(), so the ARM side can
+   // fastrpc_munmap every arena chunk before it closes the handle (the
+   // S1Ceiling probe's order; E5f-E5h lost one 256 MiB window per ~20 app
+   // runs that left their arena mapped to process exit): stops a dspq
+   // thread and a token driver still running, frees the graph, releases
+   // every registered weight and Q4M1 slot, and puts every attached arena.
+   // n = the arenas it put. The session stays open; close() after it
+   // finds nothing of these left.
+   AEEResult arenas_release(rout uint32 n);
+
+   // [doc 52 section 10.12] One flash-streamed expert in, one out, in one
+   // round trip: registers gate_up [K, 2*inter] at off_gu and down
+   // [inter, N_out] at off_dn in the arena, as weight_register_u8i4_arena
+   // does (bias zero -- experts have none), and only then releases old_gu
+   // and old_dn, the pair the host retired from the slot it just refilled.
+   // 0xFFFFFFFF for both means nothing to release. On any error nothing is
+   // released and nothing stays registered, so the host's view -- old pair
+   // live, new pair absent -- still holds. Appended last so every method
+   // above keeps its index: a skel older than this IDL answers only this
+   // call with an error.
+   // [doc 52 section 10.30] All four sequences empty: the scales and
+   // column sums sit in the arena right after each weight's WH bytes (N
+   // f32 scales, then N i32 column sums), the DSP reads them from there
+   // and the bias is zero. What the host's expert pool sends; a skel older
+   // than this refuses the empty lengths.
+   AEEResult weight_swap_u8i4_arena(in uint32 old_gu, in uint32 old_dn,
+                                    in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 arena,
+                                    in uint32 off_gu, in uint32 off_dn,
+                                    in sequence<float> gu_scale,
+                                    in sequence<int32> gu_colsum,
+                                    in sequence<float> dn_scale,
+                                    in sequence<int32> dn_colsum,
+                                    rout uint32 h_gu, rout uint32 h_dn);
+
+   // [doc 52 section 10.23] weight_swap_u8i4_arena for n experts in one
+   // round trip -- a prefill layer's read-ahead batch or a decode call's
+   // misses. Expert i's arrays are the i-th n_gu = 2*inter (gate_up) and
+   // N_out (down) entries of the flat sequences; old_*[i] is the pair
+   // retired from its slot (0xFFFFFFFF for none). The experts are swapped
+   // in order, each exactly as the single call does it; on an error at
+   // expert i, experts 0..i-1 are swapped, i onwards untouched, n_done
+   // says i and err holds the error. The call itself fails only when the
+   // lengths disagree, before anything is touched: a failed call's outputs
+   // need not reach the host, so a partial batch has to be a success.
+   // All four flat sequences empty means every expert's arrays are in the
+   // arena, as for the single call. Appended last, like the single call
+   // before it.
+   AEEResult weight_swap_batch_u8i4_arena(in uint32 K, in uint32 inter,
+                                          in uint32 N_out,
+                                          in sequence<uint32> old_gu,
+                                          in sequence<uint32> old_dn,
+                                          in sequence<uint32> arena,
+                                          in sequence<uint32> off_gu,
+                                          in sequence<uint32> off_dn,
+                                          in sequence<float> gu_scale,
+                                          in sequence<int32> gu_colsum,
+                                          in sequence<float> dn_scale,
+                                          in sequence<int32> dn_colsum,
+                                          rout sequence<uint32> h_gu,
+                                          rout sequence<uint32> h_dn,
+                                          rout uint32 n_done, rout int32 err);
+
+   // --- fp16 attention bring-up ---
+   //
+   // Layout probe for the hand-written fp16 tile builders the attention
+   // kernel depends on (hvx_tile_f16.h). x and w are 32x32 fp16 row-major
+   // (bit patterns in uint16); wt is w transposed, computed on the host.
+   // flags[i] is 1 where builder i matched HexKL's own converter byte for
+   // byte (see nntr_hvx_attn_f16.c for the index meanings). y_hexkl and
+   // y_hand are x.w computed on HMX with HexKL-built and hand-built tiles
+   // respectively, as 32x32 fp16 row-major, for the host to check against
+   // its own reference. Returns AEE_EUNSUPPORTED when hmx_fp16_rate is 0.
+   AEEResult probe_f16_layouts(in sequence<uint16> x, in sequence<uint16> w,
+                               in sequence<uint16> wt,
+                               rout sequence<uint32> flags,
+                               rout sequence<uint16> y_hexkl,
+                               rout sequence<uint16> y_hand);
+
+   // Math probe for the HVX primitives both attention kernels share. x is
+   // 64 f32. Returns: hf(x) via the natural-order narrowing (f32x64_to_hf),
+   // 2^hf(x) via hvx_attn_exp2_hf, softcap(hf(x)) with cap 30 (in the
+   // log2e-scaled domain the kernels use), and misc = { sum of x[0..31],
+   // per-parity max of hf(x) (even, odd), max over all 64, dot(hf(x),
+   // hf(x)) by the decode kernel's widening accumulate, 2^(x[0]) with x[0]
+   // passed as an fp16 scalar through hvx_attn_f32_to_hf }.
+   AEEResult probe_f16_math(in sequence<float> x, rout sequence<uint16> hf_x,
+                            rout sequence<uint16> exp2_x,
+                            rout sequence<uint16> softcap_x,
+                            rout sequence<float> misc);
+
+   // fp16 subtraction probe: hf(x) - hf(c) three ways -- the direct
+   // Vhf_vsub_VhfVhf, the qf16 route (Vqf16_vsub_VhfVhf then
+   // Vhf_equals_Vqf16), and 2^(direct difference) -- so the one step of
+   // the softmax the math probe does not cover is isolated.
+   AEEResult probe_f16_sub(in sequence<float> x, in float c,
+                           rout sequence<uint16> sub_hf,
+                           rout sequence<uint16> sub_qf16,
+                           rout sequence<uint16> exp2_sub_hf);
+
+   // Decode-block probe: the first cache block of hvx_attn_decode_f16 for
+   // one (row, head), step by step. q is head_dim f32, k is kv rows of
+   // head_dim fp16 (kv <= 64, contiguous). Returns the f32 scores the dot
+   // products produced, the fp16 scores after narrowing + masking, the
+   // fp16 probabilities, and misc = { m (fp16 as f32), rowsum, scale }.
+   AEEResult probe_f16_decode_block(in uint32 head_dim, in uint32 kv,
+                                    in sequence<float> q,
+                                    in sequence<uint16> k,
+                                    rout sequence<float> sc_f32,
+                                    rout sequence<uint16> sv_hf,
+                                    rout sequence<uint16> p_hf,
+                                    rout sequence<float> misc);
+
+   // Causal (optionally sliding-window) attention for one prefill step on
+   // HMX: fp16 flash attention with online softmax over the fp16 KV cache.
+   // q_f32 is [n_q][n_head_q*head_dim] post-RoPE; k_cache/v_cache are
+   // [cache_to][n_head_kv*head_dim] fp16 bit patterns; out_f32 matches q.
+   // br/bc are the query/cache block sizes (bc a multiple of 32); 0 for
+   // either lets the DSP pick (hexkl_attn_f16_choose_tiling). softcap
+   // > 0 applies tanh(s/softcap)*softcap to the scaled logits (Gemma);
+   // sinks is empty or n_head_q per-head sink logits that join each row's
+   // softmax denominator (GPT-OSS). stats_us returns the on-DSP phase
+   // times in microseconds, in the order of hexkl_attn_f16_stats, followed
+   // by the block count.
+   AEEResult attn_f16_prefill(in uint32 n_q, in uint32 cache_from,
+                              in uint32 cache_to, in uint32 n_head_q,
+                              in uint32 n_head_kv, in uint32 head_dim,
+                              in uint32 window, in uint32 br, in uint32 bc,
+                              in float softcap,
+                              in sequence<float> q_f32,
+                              in sequence<uint16> k_cache,
+                              in sequence<uint16> v_cache,
+                              in sequence<float> sinks,
+                              rout sequence<float> out_f32,
+                              rout sequence<uint32> stats_us);
+
+   // The decode counterpart: same contract and options, no HMX. One
+   // (query row, head) per HVX work unit, fp16 dot products, f32 output
+   // accumulation, K/V read from DDR directly. For n_q < 5 and head_dim
+   // <= 128 (llama.cpp's own gate) this beats padding one row into a
+   // 32-row HMX tile. stats_us[0] is the total on-DSP time.
+   AEEResult attn_f16_decode(in uint32 n_q, in uint32 cache_from,
+                             in uint32 cache_to, in uint32 n_head_q,
+                             in uint32 n_head_kv, in uint32 head_dim,
+                             in uint32 window, in float softcap,
+                             in sequence<float> q_f32,
+                             in sequence<uint16> k_cache,
+                             in sequence<uint16> v_cache,
+                             in sequence<float> sinks,
+                             rout sequence<float> out_f32,
+                             rout sequence<uint32> stats_us);
+
+   // --- resident fp16 KV cache as HMX tiles ("NativeKV") ---
+   //
+   // Registers zeroed tile storage for one layer's cache of up to max_rows
+   // rows; append writes cache rows [row0, row0+n) from the cache's own
+   // row-major fp16 layout ([n][n_head_kv*head_dim]) into K^T / V weight
+   // tiles once, so every later attention step DMAs ready 2 KiB tiles
+   // instead of raw rows and does no tile work. Rows may be rewritten.
+   AEEResult kv_register_f16(in uint32 max_rows, in uint32 n_head_kv,
+                             in uint32 head_dim, rout uint32 kv_handle);
+
+   AEEResult kv_release_f16(in uint32 kv_handle);
+
+   AEEResult kv_append_f16(in uint32 kv_handle, in uint32 row0,
+                           in sequence<uint16> k_rows,
+                           in sequence<uint16> v_rows);
+
+   // attn_f16_prefill against a registered cache instead of k_cache /
+   // v_cache sequences. cache_to must not exceed the registered max_rows.
+   // Output is bit-identical to attn_f16_prefill on the same rows.
+   AEEResult attn_f16_prefill_resident(in uint32 kv_handle, in uint32 n_q,
+                                       in uint32 cache_from,
+                                       in uint32 cache_to, in uint32 n_head_q,
+                                       in uint32 window, in uint32 br,
+                                       in uint32 bc, in float softcap,
+                                       in sequence<float> q_f32,
+                                       in sequence<float> sinks,
+                                       rout sequence<float> out_f32,
+                                       rout sequence<uint32> stats_us);
+
+   // --- resident int8 / int4 KV cache with per-token scales (A8W8 / A8W4) ---
+   //
+   // kind 0 = int8 (A8W8), 1 = int4 (A8W4). Rows arrive as the cache's own
+   // row-major fp16 ([n][n_head_kv*head_dim]) and are quantized on the DSP:
+   // K symmetric per (row, head) with colsum, V symmetric per (row, head,
+   // 32-dim group); masters in decode layout plus baked HMX WH tiles. See
+   // hexkl_kv_q.h and 21_quantized_attention_plan.md.
+   AEEResult kv_register_q(in uint32 kind, in uint32 max_rows,
+                           in uint32 n_head_kv, in uint32 head_dim,
+                           rout uint32 kv_handle);
+
+   AEEResult kv_release_q(in uint32 kv_handle);
+
+   // Fixed quantization scales for a registered cache: s_k [n_head_kv],
+   // s_v [n_head_kv][head_dim]. See hexkl_kv_q_set_fixed_scales.
+   AEEResult kv_set_fixed_scales_q(in uint32 kv_handle, in sequence<float> s_k,
+                                   in sequence<float> s_v);
+
+   AEEResult kv_append_q(in uint32 kv_handle, in uint32 row0,
+                         in sequence<uint16> k_rows,
+                         in sequence<uint16> v_rows);
+
+   // Rows [row0, row0+n_rows) back in row-major order: k_q / v_q
+   // [n_rows][n_head_kv*head_dim] int8, s_k / colsum_k [n_rows][n_head_kv],
+   // s_v [n_rows][n_head_kv][head_dim/32]. Test and debug use.
+   AEEResult kv_dump_q(in uint32 kv_handle, in uint32 row0, in uint32 n_rows,
+                       rout sequence<int8> k_q, rout sequence<int8> v_q,
+                       rout sequence<float> s_k, rout sequence<int32> colsum_k,
+                       rout sequence<float> s_v);
+
+   // The int32 accumulator readout layout as hexkl_acc_layout_get derives
+   // it: layout = { usable, base, row_stride }.
+   AEEResult probe_acc_i32_layout(rout sequence<uint32> layout);
+
+   // Runs HMX against the baked tiles of column tile c (cache rows
+   // 32c..32c+31) of kv head n: s_i32 [64][32] = act_s [64][head_dim] u8
+   // . K^T, o_i32 [64][head_dim] = act_p [64][32] u8 . V, both read from the
+   // accumulator through the probed layout. Exact integers, so the host
+   // checks them against its own int matmul over kv_dump_q's masters --
+   // this is what gates the bake, the kind and the layout probe together.
+   AEEResult probe_kv_q_mm(in uint32 kv_handle, in uint32 n, in uint32 c,
+                           in sequence<uint8> act_s, in sequence<uint8> act_p,
+                           rout sequence<int32> s_i32,
+                           rout sequence<int32> o_i32);
+
+   // attn_f16_prefill_resident's contract over a quantized cache: Q as
+   // per-row uint8, K^T / V as the cache's int8 or int4 tiles, P as uint8
+   // with the per-token V scales folded in, f32 output. stats_us is in
+   // the order of hexkl_attn_q_stats: 9 phase times, the block count, the
+   // whole call in microseconds, and its processor kilocycles (their ratio
+   // is the clock the DSP ran at).
+   AEEResult attn_q_prefill(in uint32 kv_handle, in uint32 n_q,
+                            in uint32 cache_from, in uint32 cache_to,
+                            in uint32 n_head_q, in uint32 window,
+                            in uint32 br, in uint32 bc, in float softcap,
+                            in sequence<float> q_f32,
+                            in sequence<float> sinks,
+                            rout sequence<float> out_f32,
+                            rout sequence<uint32> stats_us);
+
+   // The decode counterpart over the quantized cache: no HMX, one (row,
+   // head) per HVX work unit, Q.K^T and P'.V by vrmpy over the registry's
+   // masters, f32 softmax; the same quantization of Q and P' as the
+   // prefill kernel with 32-row blocks. stats_us = { total us, kcycles }.
+   AEEResult attn_q_decode(in uint32 kv_handle, in uint32 n_q,
+                           in uint32 cache_from, in uint32 cache_to,
+                           in uint32 n_head_q, in uint32 window,
+                           in float softcap, in sequence<float> q_f32,
+                           in sequence<float> sinks,
+                           rout sequence<float> out_f32,
+                           rout sequence<uint32> stats_us);
+
+   // One step in one round trip: appends cache rows [row0, row0 + n) from
+   // k_rows / v_rows (n = length / (n_head_kv*head_dim); empty = nothing
+   // to append), then attends over rows [0, cache_to) -- decode (HVX) for
+   // fewer than 5 query rows with head_dim <= 128, prefill (HMX) otherwise.
+   // stats_us = { append us, attention us, 0 decode / 1 prefill, total us,
+   // append quantize us, append stage us, append bake us, rows appended }.
+   // With length >= 20, the next 12 entries report prefill stages:
+   // qprep, dma, qk, dequant, softmax, pquant, pv, output update, store,
+   // n_blocks, kernel total us, kernel kcycles. Decode leaves them zero.
+   AEEResult attn_q_step(in uint32 kv_handle, in uint32 row0,
+                         in sequence<uint16> k_rows, in sequence<uint16> v_rows,
+                         in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
+                         in uint32 n_head_q, in uint32 window, in float softcap,
+                         in sequence<float> q_f32, in sequence<float> sinks,
+                         rout sequence<float> out_f32,
+                         rout sequence<uint32> stats_us);
+
+   // The convert unit on a real accumulator: act_s (64 x head_dim u8) times
+   // the K^T tiles of (head n, column tile c), then two convert passes with
+   // the fp16 scales scale0_hf / scale1_hf (bias field bias_q on both) into
+   // plane0 / plane1 (2048 u8 each, activation tile layout), their HVX zip
+   // s16 (2048 int16, same layout), and the same accumulator through the
+   // library's int32 drain as the reference.
+   // stats = { cycles per convert pass over n_rep passes, cycles per
+   // library drain }.
+   AEEResult probe_cvt(in uint32 kv_handle, in uint32 n, in uint32 c,
+                       in sequence<uint8> act_s, in uint32 scale0_hf,
+                       in uint32 scale1_hf, in uint32 bias_q, in uint32 n_rep,
+                       rout sequence<uint8> plane0, rout sequence<uint8> plane1,
+                       rout sequence<int16> s16, rout sequence<int32> acc_i32,
+                       rout sequence<uint32> stats);
+
+   // The row-blocked a16/kv8 kernel (hexkl_attn_q2) over a fixed-scale
+   // cache. Same operands as attn_q_prefill without br/bc, softcap or
+   // sinks; Q is the model's u16 tensor with q_enc = n_head_q (scale, zero
+   // point) pairs, the output is u16 with out_enc likewise.
+   // stats_us = { qprep, dma, qk, softmax, pv, epilogue, total, n_blocks,
+   // kcycles, hmx wait, head setup, submit }.
+   AEEResult attn_q2_prefill(in uint32 kv_handle, in uint32 n_q,
+                             in uint32 cache_from, in uint32 cache_to,
+                             in uint32 n_head_q, in uint32 window,
+                             in sequence<uint16> q_u16,
+                             in sequence<float> q_enc,
+                             in sequence<float> out_enc,
+                             rout sequence<uint16> out_u16,
+                             rout sequence<uint32> stats_us);
+
+   // HVX issue-rate probe, n iterations each: stats = { cycles per vadd
+   // (8 independent chains), per Q15 vmpy (8 chains), per exp2 chain of the
+   // softmax (4 chains), per VTCM vector load (8 streams) }.
+   AEEResult probe_hvx_rate(in uint32 n, rout sequence<uint32> stats);
+
+   // attn_q_step's counterpart for the row-blocked kernel over a cache in
+   // fixed-scale mode: appends rows [row0, row0 + n) from k_rows / v_rows
+   // (empty = nothing to append), then hexkl_attn_q2_prefill with the u16
+   // Q / output and their per-head encodings. stats_us = { append us,
+   // attention us, 0, total us, append quantize us, append stage us,
+   // append bake us, rows appended, kernel: qk, softmax, pv, hmx wait }.
+   AEEResult attn_q2_step(in uint32 kv_handle, in uint32 row0,
+                          in sequence<uint16> k_rows, in sequence<uint16> v_rows,
+                          in uint32 n_q, in uint32 cache_from, in uint32 cache_to,
+                          in uint32 n_head_q, in uint32 window,
+                          in sequence<uint16> q_u16, in sequence<float> q_enc,
+                          in sequence<float> out_enc,
+                          rout sequence<uint16> out_u16,
+                          rout sequence<uint32> stats_us);
+
+   // The int8 WH tile permutation (hexkl_kv_q_wh_i8_pos), 1024 entries.
+   AEEResult probe_wh_i8_pos(rout sequence<uint16> pos);
+
+   // The HVX integer softmax of one 64-row block over int16 score tiles
+   // (hvx_softmax_q), for the bit-exact check against the scalar
+   // definition the host runs. corr has (n_col_tiles + 1) * 32 entries.
+   // stats = { cycles of the HVX call }.
+   AEEResult probe_softmax_q(in uint32 n_col_tiles, in uint32 col0,
+                             in uint32 n_cols, in uint32 row0, in uint32 n_rows,
+                             in uint32 window, in uint32 rho_q15,
+                             in uint32 frac_bits, in sequence<int16> s_tiles,
+                             in sequence<int16> corr,
+                             rout sequence<uint8> p_tiles,
+                             rout sequence<int32> rowsum,
+                             rout sequence<uint32> stats);
+
+   // The same for the 16-bit P of the a16 contract (hvx_softmax_q16):
+   // P16 leaves as its low and high byte tiles, rowsum holds the P' sums.
+   AEEResult probe_softmax_q16(in uint32 n_col_tiles, in uint32 col0,
+                               in uint32 n_cols, in uint32 row0,
+                               in uint32 n_rows, in uint32 window,
+                               in uint32 rho_q15, in uint32 frac_bits,
+                               in sequence<int16> s_tiles,
+                               in sequence<int16> corr,
+                               rout sequence<uint8> p_lo,
+                               rout sequence<uint8> p_hi,
+                               rout sequence<int32> rowsum,
+                               rout sequence<uint32> stats);
+
+   // mm_u8i4_moe_layer_norm followed by the decoder block's post-FFN
+   // epilogue on its output (doc 57 section 9.30):
+   //   out = scale2 * (act + rmsnorm(moe + x2) * gamma2)
+   // with act the call's own raw input (pre_gamma norms it for the experts;
+   // the residual is the same rows, K == N_out) and x2 the dense branch's
+   // output. One call instead of the MoE call and rmsnorm_add_f32.
+   AEEResult mm_u8i4_moe_layer_norm_add(in uint32 M, in uint32 K,
+                                        in uint32 inter, in uint32 N_out,
+                                        in uint32 act, in float eps,
+                                        in float scale2,
+                                        in sequence<float> pre_gamma,
+                                        in sequence<float> post_gamma,
+                                        in sequence<float> gamma2,
+                                        in sequence<uint32> h_gate_up,
+                                        in sequence<uint32> h_down,
+                                        in sequence<uint32> row_index,
+                                        in sequence<uint32> row_count,
+                                        in sequence<float> row_weight,
+                                        in sequence<float> act_f32,
+                                        in sequence<float> x2,
+                                        rout sequence<float> out_f32);
+
+   // mm_u8i4_layer (one FC weight in its column-slice handles) followed by
+   // the decoder block's post-attention epilogue on its output (doc 57
+   // section 9.32): out = scale * (res + rmsnorm(act . W) * gamma). One
+   // call instead of the o-proj call and rmsnorm_add_f32.
+   AEEResult mm_u8i4_layer_res_add(in uint32 M, in uint32 K, in float eps,
+                                   in float scale, in sequence<float> gamma,
+                                   in sequence<uint32> w_handles,
+                                   in sequence<float> act_f32,
+                                   in sequence<float> res,
+                                   rout sequence<float> out_f32);
+
+   // router_logits_f32 with the logits from the u8 x i8 HMX path, over a
+   // gate weight registered by weight_register_u8i8 (K x E int8, a scale per
+   // expert): the HVX f32 logits were ~4 ms of a 7 ms prefill router call
+   // (doc 57 section 9.33). Same norm, softmax and selection.
+   AEEResult router_logits_u8i8_f32(in uint32 M, in uint32 K, in uint32 E,
+                                    in float eps, in sequence<float> gamma,
+                                    in uint32 w_handle,
+                                    in sequence<float> x, in uint32 top_k,
+                                    in uint32 n_sel,
+                                    in sequence<float> scale,
+                                    rout sequence<float> logits,
+                                    rout sequence<uint32> sel,
+                                    rout sequence<float> weight);
+
+   // mm_u8i4_layer_norm with handle i's output rows at out_cat + out_off[i],
+   // out_ld[i] floats apart, instead of packed [M x N_i] blocks: the column
+   // slices of one weight then land as its row-major [M x N], which the
+   // host copies out whole instead of one slice-row at a time (132.8 ms of
+   // 4 KB copies a 1024-token prefill, doc 57 section 9.34).
+   AEEResult mm_u8i4_layer_norm_ld(in uint32 M, in uint32 K, in float eps,
+                                   in sequence<float> pre_gamma,
+                                   in sequence<uint32> post_chunk,
+                                   in sequence<float> post_gamma,
+                                   in uint32 rope_hd, in uint32 rope_handles,
+                                   in sequence<float> rope_cs,
+                                   in sequence<uint32> w_handles,
+                                   in sequence<uint32> out_off,
+                                   in sequence<uint32> out_ld,
+                                   in sequence<float> act_f32,
+                                   rout sequence<float> out_cat);
+
+   // [doc 54] The 2-bit expert expansion (hvx_expand_i2i4.h). Same reason
+   // swiglu_det_f32 exists: the HVX form rests on an unverified reading of
+   // V6_vlutvvb, its scalar twin is the specification, and only running
+   // both on the device settles it. codes are QS2CX_WH bytes, pal is the
+   // tensor's four int4 levels, and both outputs come back so a failure
+   // says whether the table or the lookup is wrong.
+   // codesLen must be a multiple of 128; hvx and ref are 2 * codesLen.
+   // ("out" is an IDL reserved word.) The 2-bit entries are appended last,
+   // like weight_swap_u8i4_arena before them, so every method above keeps
+   // its index.
+   AEEResult expand_i2i4(in sequence<uint8> codes, in sequence<int8> pal,
+                         rout sequence<uint8> hvx, rout sequence<uint8> ref);
+
+   // [doc 54] weight_register_u8i4_arena for QS2CX_WH: the arena holds
+   // (K/32)*(N/32)*256 bytes of 2-bit codes instead of 512 of nibbles, and
+   // pal carries the four int4 values they index. The M=1 GEMV reads the
+   // codes through a register LUT; the HMX path expands a chunk in place
+   // after its DMA lands, so the VTCM budget is the 4-bit one and nothing
+   // after the matmul changes. wh_off must be 512-aligned, as for 4 bits.
+   AEEResult weight_register_u2i4_arena(in uint32 K, in uint32 N,
+                                        in uint32 arena, in uint32 wh_off,
+                                        in sequence<int8> pal,
+                                        in sequence<float> w_scale,
+                                        in sequence<int32> colsum_w,
+                                        in sequence<float> bias,
+                                        rout uint32 w_handle);
+
+   // [plan 229] weight_swap_batch_u8i4_arena for QS2CX_WH experts: each
+   // weight's arena span is its (K/32)*(N/32)*256 bytes of codes, then N
+   // f32 scales and N i32 column sums (always in the arena: no arrays),
+   // and pal_gu / pal_dn carry four int4 codes per expert. The swap and
+   // the partial-batch rules are the 4-bit call's; a rebind retags the
+   // slot's width with the bytes.
+   AEEResult weight_swap_batch_u2i4_arena(in uint32 K, in uint32 inter,
+                                          in uint32 N_out,
+                                          in sequence<uint32> old_gu,
+                                          in sequence<uint32> old_dn,
+                                          in sequence<uint32> arena,
+                                          in sequence<uint32> off_gu,
+                                          in sequence<uint32> off_dn,
+                                          in sequence<int8> pal_gu,
+                                          in sequence<int8> pal_dn,
+                                          rout sequence<uint32> h_gu,
+                                          rout sequence<uint32> h_dn,
+                                          rout uint32 n_done, rout int32 err);
+
+   // [#289] Seeds attn_m1's int8 cache layer (HTP_ATTN_KV_CACHE_B names
+   // the second cache) with rows [0, n_rows) of the prefill's fixed-scale
+   // int8 cache kv_handle (attn_q2's masters, moved as they are, and its
+   // scales), then releases kv_handle. k_rows non-empty ([n_rows][n_kv]
+   // [head_dim] f32): K comes from them at attn_m1's per-dim scales, only
+   // V from the masters.
+   AEEResult attn_m1_seed_kvq(in uint32 layer, in uint32 kv_handle,
+                              in uint32 n_rows, in sequence<float> k_rows);
+
+   // attn_q2_step with f32 Q: the qkv call's rows as they are, quantized
+   // to u16 by the pool before the kernel (x * q_inv[h] + (zp + 0.5),
+   // clamped, truncated, as the CPU's quant_u16_f32), so the ARM converts
+   // nothing. The output stays u16 for mm_u8i4_layer_res_add_u16.
+   AEEResult attn_q2_step_fq(in uint32 kv_handle, in uint32 row0,
+                             in sequence<uint16> k_rows,
+                             in sequence<uint16> v_rows, in uint32 n_q,
+                             in uint32 cache_from, in uint32 cache_to,
+                             in uint32 n_head_q, in uint32 window,
+                             in sequence<float> q_f32,
+                             in sequence<float> q_inv,
+                             in sequence<float> q_enc,
+                             in sequence<float> out_enc,
+                             rout sequence<uint16> out_u16,
+                             rout sequence<uint32> stats_us);
+
+   // [P2] attn_q2_step_fq with the layer's calibration folded in, for the
+   // first rows a layer sees: the DSP scans the fp16 K rows (|max| per KV
+   // head), V rows (|max| per KV head and dim) and the f32 Q rows (min /
+   // max per query head), derives the fixed int8 scales (max / 127, 1 for
+   // an all-zero tensor), the Q u16 encodings ((hi - lo) / 65535, zero
+   // point round(-lo / scale)) and the context encodings (2 * V max /
+   // 65535, zero point 32768) exactly as mha_core::calibrate_q2_scales
+   // does, sets the scales on the cache and runs the step. calib returns
+   // them: s_k[n_head_kv] | s_v[n_head_kv * head_dim] | q_enc[2 n_head_q]
+   // | out_enc[2 n_head_q].
+   AEEResult attn_q2_step_fqc(in uint32 kv_handle, in uint32 row0,
+                              in sequence<uint16> k_rows,
+                              in sequence<uint16> v_rows, in uint32 n_q,
+                              in uint32 cache_from, in uint32 cache_to,
+                              in uint32 n_head_q, in uint32 window,
+                              in sequence<float> q_f32,
+                              rout sequence<float> calib,
+                              rout sequence<uint16> out_u16,
+                              rout sequence<uint32> stats_us);
+
+   // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
+   // M x K with a (scale, zero point) per head of act_hd columns in act_enc
+   // (the attention's out_enc), dequantized inside the quant pass (the
+   // CPU's dequant_u16_f32), so the f32 context never exists.
+   AEEResult mm_u8i4_layer_res_add_u16(in uint32 M, in uint32 K, in float eps,
+                                       in float scale, in sequence<float> gamma,
+                                       in sequence<uint32> w_handles,
+                                       in sequence<uint16> act_u16,
+                                       in sequence<float> act_enc,
+                                       in uint32 act_hd, in sequence<float> res,
+                                       rout sequence<float> out_f32);
+   // Retag an idle symmetric QS2 arena slot after its native payload is read.
+   AEEResult weights_tl2(in sequence<uint32> handles, in uint32 enabled);
+   // Debug-only: 8*n VLUTs. mode=0/1 independent vlut32/vlut16,
+   // 2/3 dependent. stats: cycles lo/hi, microseconds lo/hi, checksum.
+   AEEResult vlut_probe(in uint32 mode, in uint32 n,
+                       rout sequence<uint32> stats);
+   // Debug-only native TL2 correctness and worker/DMA timing.
+   AEEResult tl2_gemv_probe(in uint32 K, in uint32 N, in uint32 mode,
+                           in uint32 workers, in uint32 passes,
+                           in sequence<uint8> act, in sequence<uint8> weight,
+                           rout sequence<int32> result, rout sequence<uint32> stats);
+   // Native-only TL2: codes then N FP32 scales and N int32 column sums.
+   // Legacy QS2 and convertible TL2 continue using the existing entries.
+   AEEResult weight_swap_batch_tl2_compact_arena(
+      in uint32 K, in uint32 inter, in uint32 N_out,
+      in sequence<uint32> old_gu, in sequence<uint32> old_dn,
+      in sequence<uint32> arena, in sequence<uint32> off_gu,
+      in sequence<uint32> off_dn, rout sequence<uint32> h_gu,
+      rout sequence<uint32> h_dn, rout uint32 n_done, rout int32 err);
+   // Debug-only full normalized Hadamard (1 scalar, 2 HVX FP32, 3 HMX FP16).
+   // Mode 3 requires FP16 HMX and width 704 or 2816.
+   // stats is the total 19.2-MHz ticks, low/high words; copies excluded.
+   AEEResult hadamard_probe(in uint32 rows, in uint32 width, in uint32 mode,
+                            in uint32 passes, in sequence<float> input,
+                            rout sequence<float> output,
+                            rout sequence<uint32> stats);
+   // Timing companion for the fused pre/post RMSNorm MoE path.
+   AEEResult mm_u8i4_moe_layer_norm_timed(in uint32 M, in uint32 K, in uint32 inter,
+                                    in uint32 N_out, in uint32 act,
+                                    in float eps,
+                                    in sequence<float> pre_gamma,
+                                    in sequence<float> post_gamma,
+                                    in sequence<uint32> h_gate_up,
+                                    in sequence<uint32> h_down,
+                                    in sequence<uint32> row_index,
+                                    in sequence<uint32> row_count,
+                                    in sequence<float> row_weight,
+                                    in sequence<float> act_f32,
+                                    rout sequence<float> out_f32,
+                                    rout sequence<uint32> stage_us);
+   // [PR 4428] Per-output-channel integer offsets for QS4CX_WH_AFFINE
+   // experts already swapped into the arena: handles[i] takes the next
+   // n_per[i] (= its N) entries of offsets, the values weight_register_u8i4
+   // reads from the second half of a 2N bias. Integer-valued, |offset| <=
+   // 15. A handle whose offsets are all zero needs no call: the symmetric
+   // registration computes the same bytes. Rejected whole on a length
+   // mismatch; on a bad handle or value the handles before it keep their
+   // offsets, the rest are untouched. The next swap into the slot clears
+   // them. Appended last.
+   AEEResult weight_set_offsets_batch(in sequence<uint32> handles,
+                                      in sequence<uint32> n_per,
+                                      in sequence<float> offsets);
+
+   // [PR 4428] The checkpoint's rotation signs (hexkl_moe_set_hadamard_signs):
+   // s_in has one +-1 per gate_up input dimension (K), s_down one per down
+   // input dimension (inter); the kernel flips the sign of the rotated
+   // activation's element before it quantizes. Any other value is refused
+   // whole; two empty sequences clear them. Kept for the session. Appended
+   // last.
+   AEEResult moe_set_hadamard_signs(in sequence<float> s_in,
+                                    in sequence<float> s_down);
+   // LFM native TL2 slots with stable handles. GU padding contains a
+   // 128-byte-aligned generation word after codes + 2*N float arrays.
+   // The host publishes a new generation only after both weights' reads
+   // complete. The compute call refreshes metadata before using the pair.
+   AEEResult weight_swap_batch_tl2_stable_arena(
+      in uint32 K, in uint32 inter, in uint32 N_out,
+      in sequence<uint32> old_gu, in sequence<uint32> old_dn,
+      in sequence<uint32> arena, in sequence<uint32> off_gu,
+      in sequence<uint32> off_dn, rout sequence<uint32> h_gu,
+      rout sequence<uint32> h_dn, rout uint32 n_done, rout int32 err);
+   // Release large session temporaries after all prefill/queue work completes.
+   // Retains weights, KV caches, graph, convolution state and decode FC feed.
+   // Later prefill/decode kernels recreate these buffers on demand.
+   AEEResult release_prefill_scratch(rout uint64 bytes);
+
+   // [#4428 window] Before a layer's first attn_m1 append: the |max| per
+   // (kv head, dim) of the context rows the host's windowed cache dropped,
+   // so the layer's int8 scales cover the whole context as a full cache's
+   // seed sets them. k_amax / v_amax [n_kv][head_dim] f32; layer may carry
+   // HTP_ATTN_KV_CACHE_B. A shape off the cache's is AEE_EINVALIDFORMAT.
+   AEEResult attn_m1_kv_amax_floor(in uint32 layer, in sequence<float> k_amax,
+                                   in sequence<float> v_amax);
+   // Checkpoint U8 input grids, applied in prefill and decode. A dense
+   // gate/up pair can reference separately encoded handles (handle + 1).
+   AEEResult weight_set_static_quant(in sequence<uint32> handles,
+      in sequence<float> scales, in sequence<int32> zero_points,
+      in uint32 gate_plus1, in uint32 up_plus1);
 };

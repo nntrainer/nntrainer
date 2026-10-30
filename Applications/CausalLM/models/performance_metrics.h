@@ -42,7 +42,7 @@ typedef struct {
    *  truncated run still returns success and fluent text, so this is the only
    *  way a caller can tell that the model never saw the end of its prompt. */
   unsigned int prompt_truncated_tokens;
-  /* ---- [perf-split] honest prefill/decode split -----------------------
+  /** ---- [perf-split] honest prefill/decode split -----------------------
    * The two duration fields above take the prefill->decode boundary where the
    * HOST loop leaves prefill, which on an asynchronous backend is BEFORE the
    * GPU has retired the work prefill submitted. A larger prefill block leaves

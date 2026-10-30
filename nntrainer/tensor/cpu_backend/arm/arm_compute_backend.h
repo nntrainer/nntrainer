@@ -660,6 +660,32 @@ void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int head_end = -1);
 
 /**
+ * @brief RoPE (optional) + symmetric int8 snap + fp16 store, one pass: the
+ *        KV-cache write of a model trained with an int8 KV cache.
+ *
+ * For every head h (columns [h * dim, (h + 1) * dim) of each row) and
+ * element x (rotated with cos_ / sin_ first when cos_ != nullptr, using the
+ * rotate-half form of compute_rotary_emb_value):
+ *   q = nearbyint(x / head_scales[h])   (round half to even)
+ *   x = clamp(q, -128, 127) * head_scales[h]
+ * and x is stored to @a output as IEEE fp16. Every implementation must use
+ * true division and round-half-to-even so all paths give identical bits.
+ *
+ * @param[in] width row width (number of heads * dim)
+ * @param[in] dim head dimension
+ * @param[in] half_ dim / 2
+ * @param[in] input fp32 row (not modified)
+ * @param[out] output fp16 (uint16_t bits) row
+ * @param[in] cos_ cos table of this position or nullptr (no RoPE)
+ * @param[in] sin_ sin table of this position (ignored when cos_ == nullptr)
+ * @param[in] head_scales one scale per head
+ */
+void compute_rotary_emb_value_snap(unsigned int width, unsigned int dim,
+                                   unsigned int half_, const float *input,
+                                   uint16_t *output, const float *cos_,
+                                   const float *sin_, const float *head_scales);
+
+/**
  * @brief Compute rotary embedding value
  * @param[in] width current w value from b, c, h, w
  * @param[in] dim unit length of simd computation
@@ -1126,10 +1152,38 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+size_t q4_0_gemv_activation_size(const unsigned int K);
+void quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                   void *quantized_A);
+void gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                             const unsigned int row_end, const unsigned int K,
+                             const void *quantized_A, const void *B, float *C);
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldc);
+/**
+ * @brief TQ2CX GEMM against several weights : A (M,K) * Ws[i].T (Ns[i],K)
+ *
+ * A is used in fp32 as is. The arithmetic contract (bit-exact across
+ * implementations of one target for finite activations) is documented in
+ * tq2cx_kernels.h, the weight layout in ternary_tensor.h.
+ *
+ * @param M rows of A and of every output
+ * @param Ns output channels of each weight
+ * @param K input size shared by every weight
+ * @param A fp32 activation
+ * @param lda leading dimension of A
+ * @param Bs TQ2CX records (N x K)
+ * @param Cs fp32 outputs
+ * @param ldcs leading dimension of each output
+ */
+void gemm_tq2cx_batch(const unsigned int M, const std::vector<unsigned int> &Ns,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const std::vector<void *> &Bs,
+                      const std::vector<float *> &Cs,
+                      const std::vector<unsigned int> &ldcs);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *

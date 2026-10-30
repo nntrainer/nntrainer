@@ -1,0 +1,50 @@
+Native LFM M1 unused setup check
+================================
+
+This is an optional Linux/GNU host check requiring Qualcomm Hexagon Tools
+libnative. It is not added to a platform's ordinary build or Windows CI.
+It compiles the complete reference and candidate MoE translation units and
+compares their outputs, return codes, used quantization parameters, scratch
+boundaries, and pool retirement. The observation hook runs after real setup
+and before any native M1 consumer, and changes no computed value.
+
+Example (run from a repository containing the candidate and these tests):
+
+  R="$PWD"
+  CHECK_OUT="$(mktemp -d)"
+  git show 03d652fc0:nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c > "$CHECK_OUT/reference.c"
+  python3 test/htp/host/lfm2_m1_setup_check.py --repo "$R"     --reference "$CHECK_OUT/reference.c" --hexagon-tools "$HEXAGON_TOOLS"     --output "$CHECK_OUT/san" --sanitize --mutations
+
+HEXAGON_TOOLS is the installed version directory containing
+Tools/libnative/lib/libnative.a (validated with 19.0.04). Omit --sanitize
+and --mutations for the optimized ordinary host build. --source accepts a
+candidate source override. All generated files and logs stay in --output.
+The reference must be from before this setup change; the runner does not
+retrieve a revision or modify the repository. CC/CXX can select compilers.
+
+Coverage: native LFM 1..4 experts, one/eight lanes, one/four DMA queues,
+rows_out on/off, unequal expert weights, zero/ties/tiny/random inputs,
+E32 and GeLU fallback, Gemma native geometry, invalid row, empty expert
+sets, DMA lane timeout, and preserved scratch contents across qualified4
+-> fallback2 -> qualified1 -> qualified4 -> pre_gamma transitions.
+Every successful case compares the entire output byte for byte. Padding is
+checked against a pre-call snapshot, then made inaccessible with ASan so
+later accidental consumers fail. Ordinary output zero and the per-expert
+0 + weighted result remain required. Three mutants must fail: reading scale
+padding, omitting required per-expert output zero, and skipping fallback
+out_c initialization.
+
+The production quantizer is executed through SDK libnative, and native TL2
+LUT/GEMV uses its production scalar branch. The existing host harness supplies
+DMA, worker-pool scheduling, RMS norm, and dequantization stand-ins. The NULL
+pool inline path is modeled explicitly so quantization cannot retire a live
+GU(0) job. DMA lane failure is injected independently of the old 4-bit GEMV
+scoreboard; native TL2 does not emit that scoreboard's column-read callbacks.
+This checks scheduling and setup lifetimes, not hardware DMA overlap/timing.
+
+Sanitizer scope: both production MoE TUs, fixture and actual quantizer use
+ASan and UBSan, with undefined-behavior recovery disabled. Only hvx_scalar.c
+(the scalar epilogue stand-in) adds -fno-sanitize=shift-base for the preexisting
+signed exponent construction in swiglu_det.h:152. All other sanitizer classes
+remain enabled there; no production source is altered or globally suppressed.
+The SDK's prebuilt libnative itself is not sanitizer-instrumented.

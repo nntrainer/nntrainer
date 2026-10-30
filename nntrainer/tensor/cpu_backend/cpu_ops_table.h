@@ -27,6 +27,7 @@
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cpu_kv_q_attention.h>
 
 namespace nntrainer {
 
@@ -197,6 +198,16 @@ public:
                             std::vector<unsigned int> N,
                             unsigned int K) override {
     nntrainer::gemm_q4_0(M, N, K, matBdata, K, matAdata, N, matCdata, N);
+  }
+
+  // One fp32 activation against several TQ2CX (ternary) weights. Every arch
+  // backend provides it, with the scalar reference tile as the fallback.
+  bool supports_gemm_tq2cx_batch_fp32() const override { return true; }
+  void gemm_tq2cx_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                             std::vector<float *> matCdata, unsigned int M,
+                             std::vector<unsigned int> N,
+                             unsigned int K) override {
+    nntrainer::gemm_tq2cx_batch(M, N, K, matBdata, K, matAdata, matCdata, N);
   }
 
   // Quantization / Utility
@@ -388,6 +399,9 @@ public:
   // out = gelu_tanh(gate) * up over the live rows.
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override;
+  // out = gelu_erf(gate) * up over the live rows (exact gelu).
+  void geglu_erf(const Tensor &in1, const Tensor &in2, Tensor &out,
+                 unsigned int active_rows, unsigned int row_offset) override;
   // out = silu(gate) * up over the live rows (numerically stable SiLU).
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override;
@@ -418,6 +432,36 @@ public:
   void mean_rows(const Tensor &in, Tensor &out, unsigned int active_rows,
                  unsigned int row_offset) override;
   void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon) override;
+  // The int8 KV cache and the A8W8 attention over it, on the CPU: the same
+  // registry and arithmetic as the HTP path (cpu_kv_q_attention.h), so a
+  // model with attention_kv_dtype set runs the same scheme on either
+  // engine. Accelerator subclasses override these with their own copy.
+  bool supports_kv_cache_q() const override { return true; }
+  int kv_cache_q_register(unsigned int kind, unsigned int max_rows,
+                          unsigned int n_head_kv,
+                          unsigned int head_dim) override {
+    return cpu_kv_q_register(kind, max_rows, n_head_kv, head_dim);
+  }
+  bool kv_cache_q_append(int handle, unsigned int row0, unsigned int n_rows,
+                         unsigned int kv_stride, const uint16_t *k_rows,
+                         const uint16_t *v_rows) override {
+    return cpu_kv_q_append(handle, row0, n_rows, kv_stride, k_rows, v_rows);
+  }
+  void kv_cache_q_release(int handle) override { cpu_kv_q_release(handle); }
+  bool sdpa_q_kvcache(int handle, unsigned int append_row0,
+                      unsigned int append_rows, unsigned int kv_stride,
+                      const uint16_t *k_rows, const uint16_t *v_rows,
+                      const float *q, unsigned int q_stride, unsigned int n_q,
+                      unsigned int cache_from, unsigned int cache_to,
+                      unsigned int n_head_q, unsigned int n_head_kv,
+                      unsigned int head_dim, unsigned int window, float softcap,
+                      const float *sinks, float *out,
+                      unsigned int out_stride) override {
+    return cpu_sdpa_q_kvcache(handle, append_row0, append_rows, kv_stride,
+                              k_rows, v_rows, q, q_stride, n_q, cache_from,
+                              cache_to, n_head_q, n_head_kv, head_dim, window,
+                              softcap, sinks, out, out_stride);
+  }
 };
 
 } // namespace nntrainer

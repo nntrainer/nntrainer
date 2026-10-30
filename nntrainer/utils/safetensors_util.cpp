@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -28,6 +30,8 @@ bool isQuantized(DT dtype) {
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::QS4CX:
+  case DT::TQ2CX:
+  case DT::QS4ACX:
     return true;
   default:
     return false;
@@ -61,6 +65,8 @@ const char *dtypeToString(DT dtype) {
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::QS4CX:
+  case DT::TQ2CX:
+  case DT::QS4ACX:
     return "U8";
   default:
     return "F32";
@@ -95,6 +101,10 @@ const char *nntrDtypeName(DT dtype) {
     return "Q6_K";
   case DT::QS4CX:
     return "QS4CX";
+  case DT::TQ2CX:
+    return "TQ2CX";
+  case DT::QS4ACX:
+    return "QS4ACX";
   default:
     return "FP32";
   }
@@ -130,6 +140,10 @@ DT nntrDtypeFromName(const std::string &name) {
     return DT::Q6_K;
   if (up == "QS4CX")
     return DT::QS4CX;
+  if (up == "TQ2CX")
+    return DT::TQ2CX;
+  if (up == "QS4ACX")
+    return DT::QS4ACX;
   throw std::invalid_argument("safetensors: unknown nntr_dtype name: " + name);
 }
 
@@ -365,6 +379,22 @@ std::map<std::string, std::string> parseMetadata(const std::string &json) {
   }
   s.expect('}');
   return out;
+}
+
+std::map<std::string, std::string> readMetadata(const std::string &path) {
+  std::ifstream f(path, std::ios::in | std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("safetensors: cannot open " + path);
+  uint64_t header_size = 0;
+  f.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+  // a header is a few MB at most; refuse a size that is not one
+  if (!f || header_size == 0 || header_size > (1ull << 30))
+    throw std::runtime_error("safetensors: bad header length in " + path);
+  std::string json(static_cast<size_t>(header_size), '\0');
+  f.read(json.data(), static_cast<std::streamsize>(header_size));
+  if (!f)
+    throw std::runtime_error("safetensors: short header in " + path);
+  return parseMetadata(json);
 }
 
 std::string inspect(const std::string &json) {

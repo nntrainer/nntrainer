@@ -1,0 +1,1656 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   hexkl_graph.c
+ * @date   23 Sep 2026
+ * @brief  The session's validated decode op table and its forward loop
+ *         (#85), with the small ops and m=1 attention resident (#130),
+ *         the residual add and the router (#132)
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * Address space (LEDGER rule 8): one hexkl_graph is HTP_GRAPH_MAX_OPS x
+ * (320 + 8 + 4 + 4 + 4 + 4) B of table, about 344 KiB at 1024 ops (plan
+ * 201 S1; 88 KiB at the 256 before it), plus the MOE ops' EXPERTS tables
+ * (8 B an expert: 5.5 KiB at LFM2.5, 30 KiB at Gemma's 30 x 128) and the
+ * miss round's rows (top_k x N_out f32: 32 KiB at LFM2.5, 88 KiB at
+ * Gemma), plus
+ * HTP_GRAPH_N_SLOTS x slot_words f32 of activation slots (36 KiB at LFM2.5:
+ * QK_NORM's 3072 words is the widest resident op; [plan 201 S4] 120 KiB at
+ * Gemma 4's full-attention QK_NORM, 10 x 2 x 512 words), plus the parameters
+ * bound
+ * through hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
+ * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
+ * max_seq 2048; plan 82 section 3.4) -- plus, with ROUTER_TOPK resident
+ * (#132), 22 router weights padded to [2048][32] f32, 256 KiB each, 5.5
+ * MiB -- all DSP heap, no arena, no VTCM, no DMA. The 24 MiB fp16 KV cache the
+ * ATTN_M1 op reads is the session's (hvx_attn_m1_f32.h's budget note), borrowed
+ * through the env. [#132 Part B] With a Q4M1 kind resident: the quantized
+ * activation (about 13 KiB), the dense FFN's three rows (84 KiB at inter
+ * 7168), the logits (vocab floats, 256 KiB at 65536; [plan 201 S4] 1 MiB
+ * at Gemma's 262144) and the slot shape
+ * copy (8 B a slot) -- about 0.35 MiB of heap. The Q4M1 weights are the
+ * session's (nntr_hvx_fc_q4.c's note), not the graph's.
+ * [#266 S2] The prediction log: 320 B in the graph record, no heap.
+ * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
+ * 11 KiB of scales, 1.4 MiB a layer, 43 MiB (the ponytail note in
+ * hvx_router_softmax_topk_f32). Its RoPE: one max_seq x head_dim f32 table
+ * per distinct (theta, variant) -- equal tables are shared -- so 4 MiB
+ * (sliding, 256) + 8 MiB (full, 512) at max_seq 4096.
+ */
+
+#include "hexkl_graph.h"
+#include "../htp_static_quant.h"
+#include <float.h>
+
+#include "../../attn_m1_det.h" /* nntrainer/tensor/ */
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <AEEStdErr.h>
+#include <HAP_perf.h>
+
+#include "hvx_m1_ops_f32.h"
+#include "hvx_q4_gemv_f32.h"
+#include "hvx_scale_add_f32.h"
+#include "m1_ops_det.h"
+
+/** htp_graph_desc.h restates the SDK's codes so it can be built with no
+   SDK; here both are in scope, so a drift is a build error. */
+#if HTP_GRAPH_E_CLASSNOTSUPPORT != AEE_ECLASSNOTSUPPORT ||                     \
+  HTP_GRAPH_E_BADSTATE != AEE_EBADSTATE ||                                     \
+  HTP_GRAPH_E_BADITEM != AEE_EBADITEM ||                                       \
+  HTP_GRAPH_E_INVALIDFORMAT != AEE_EINVALIDFORMAT ||                           \
+  HTP_GRAPH_E_INCOMPLETEITEM != AEE_EINCOMPLETEITEM ||                         \
+  HTP_GRAPH_E_UNSUPPORTED != AEE_EUNSUPPORTED ||                               \
+  HTP_GRAPH_E_NOTYPE != AEE_ENOTYPE ||                                         \
+  HTP_GRAPH_E_INVALIDITEM != AEE_EINVALIDITEM ||                               \
+  HTP_GRAPH_E_INVHANDLE != AEE_EINVHANDLE ||                                   \
+  HTP_GRAPH_E_SCHEMENOTSUPPORTED != AEE_ESCHEMENOTSUPPORTED ||                 \
+  HTP_GRAPH_E_NOTALLOWED != AEE_ENOTALLOWED
+#error "htp_graph_desc.h's error codes drifted from AEEStdErr.h"
+#endif
+
+/** @brief [#267 L0] Wall time in QTimer ticks on the DSP; in ns on the host
+ *  (whose HAP_perf stub's QTimer reads 0). */
+static uint64_t graph_now_qt(void) {
+#if defined(__hexagon__)
+  return HAP_perf_get_qtimer_count();
+#else
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+#endif
+}
+
+/** The token request already selects profiling through
+ *  attn_prof_on. Keep regular/debug forward timing, whose callers have no
+ *  token miss callbacks and may explicitly request the per-op counters.
+ *  Define 0 to retain unconditional token instrumentation for comparison. */
+#ifndef NNTR_GRAPH_PROFILE_ON_DEMAND
+#define NNTR_GRAPH_PROFILE_ON_DEMAND 1
+#endif
+
+/** @brief A scale belongs to an unchanged activation slot, width, epsilon
+ *  and reduction algorithm. width == 0 invalidates the entry. */
+typedef struct {
+  uint32_t width, eps_bits, n1;
+  float scale;
+} graph_norm_cache;
+
+/** @brief What one forward call carries to the kernels. */
+typedef struct {
+  const hexkl_graph_env *env;
+  hexkl_graph_routing routing; /**< n_experts 0 once consumed */
+  uint32_t pos;                /**< the token position (ROPE, ATTN_M1) */
+  uint32_t end_op;             /**< [#289] this forward runs ops < end_op */
+  graph_norm_cache norm[HTP_GRAPH_N_SLOTS]; /**< Never survives a forward. */
+} graph_call;
+
+typedef int (*graph_kernel)(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out);
+
+/* ---- MOE: hexkl_mm_u8i4_moe_layer_run at M = 1, unchanged -------------- */
+
+#ifndef NNTR_MOE_MERGE_HITS
+#define NNTR_MOE_MERGE_HITS 1
+#endif
+
+/** The kernel over the n experts ids[] (ascending) with their weights w[],
+   the token's one row each: a whole layer, or a set of a miss round's
+   experts (@a extra = HEXKL_MOE_FLAG_ROWS_OUT: row i of out is expert
+   ids[i]'s term alone). */
+static int graph_moe_static(const hexkl_graph *g, const htp_graph_op *op,
+                            const hexkl_graph_env *env, const uint32_t *h,
+                            const uint32_t *ids, uint32_t n) {
+  const float *grid = g->expert_quant[op - g->ops];
+  if (!grid)
+    return AEE_SUCCESS;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t e = ids[i], gu = h[e], dn = h[op->n_experts + e];
+    if (gu >= HEXKL_MM_U8I4_MAX_WEIGHTS || dn >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !env->tbl->slots[gu].in_use || !env->tbl->slots[dn].in_use)
+      return AEE_EBADPARM;
+    env->tbl->slots[gu].static_scale = grid[4u * e];
+    env->tbl->slots[gu].static_zp = (int32_t)grid[4u * e + 1u];
+    env->tbl->slots[dn].static_scale = grid[4u * e + 2u];
+    env->tbl->slots[dn].static_zp = (int32_t)grid[4u * e + 3u];
+  }
+  return AEE_SUCCESS;
+}
+
+static int graph_moe_run(hexkl_graph *g, const hexkl_graph_env *env,
+                         const htp_graph_op *op, const uint32_t *h,
+                         const uint32_t *ids, const float *w, uint32_t n,
+                         uint32_t extra, const float *in, float *out) {
+  uint32_t cnt[HTP_GRAPH_MAX_EXPERTS] = {0}, idx[HEXKL_GRAPH_MISS_MAX] = {0};
+  uint32_t i;
+  for (i = 0; i < n; ++i) {
+    cnt[ids[i]] = 1u;
+  }
+  if (env->scratch == NULL) {
+    return AEE_EBADPARM;
+  }
+  const int fixed = graph_moe_static(g, op, env, h, ids, n);
+  if (fixed != AEE_SUCCESS)
+    return fixed;
+  ++g->moe_calls;
+  hexkl_moe_rotated_input *saved = env->scratch->rotated_input;
+  env->scratch->rotated_input = &g->moe_rotated_input;
+  const int rc = hexkl_mm_u8i4_moe_layer_run(
+    env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K, op->N,
+    op->N_out, op->n_experts, h, h + op->n_experts, idx, cnt, w, in, out,
+    env->pool, env->scratch, env->moe_flags | extra);
+  env->scratch->rotated_input = saved;
+  return rc;
+}
+
+/** [#267 L3] The n experts ids[] / w[] (ascending), each into its own row
+   of rows: one call with HEXKL_MOE_FLAG_ROWS_OUT, or -- a call the kernel
+   refuses that way (off its M = 1 GEMV path), before writing anything --
+   one call each. Either way row i is 0 + w[i] * res(ids[i]). */
+static int graph_moe_rows(hexkl_graph *g, const hexkl_graph_env *env,
+                          const htp_graph_op *op, const uint32_t *h,
+                          const uint32_t *ids, const float *w, uint32_t n,
+                          const float *in, float *rows) {
+  uint32_t i;
+  int rc;
+  if (n == 0u) {
+    return AEE_SUCCESS;
+  }
+  rc =
+    graph_moe_run(g, env, op, h, ids, w, n, HEXKL_MOE_FLAG_ROWS_OUT, in, rows);
+  if (rc != AEE_EUNSUPPORTED) {
+    return rc;
+  }
+  --g->moe_calls; /* refused: not a call that ran */
+  rc = AEE_SUCCESS;
+  for (i = 0; rc == AEE_SUCCESS && i < n; ++i) {
+    rc = graph_moe_run(g, env, op, h, &ids[i], &w[i], 1u, 0u, in,
+                       rows + (size_t)i * op->N_out);
+  }
+  return rc;
+}
+
+/**
+ * Post the miss, compute the resident experts while the owner reads the
+ * rest, then compute the arrived experts. Each set writes one weighted
+ * row per expert (0 + w * res). Adding these rows at scale 1 in the original
+ * expert order preserves the all-resident multiply/add roundings. Keeping
+ * every resident expert in the same batch also shares its quantization and
+ * weight DMA pipeline across hits before and after the first miss.
+ * NNTR_MOE_MERGE_HITS=0 retains the earlier three-call schedule for diagnosis.
+ */
+static int graph_dense_early(hexkl_graph *g, uint32_t op_i, graph_call *call);
+
+static int graph_moe_miss(hexkl_graph *g, const htp_graph_op *op,
+                          graph_call *call, const uint32_t *h,
+                          const uint32_t *ids, const float *w, uint32_t n,
+                          const float *in, float *out) {
+  const hexkl_graph_env *env = call->env;
+  const uint32_t op_i = (uint32_t)(op - g->ops);
+  uint32_t miss[HEXKL_GRAPH_MISS_MAX], was_miss[HEXKL_GRAPH_MISS_MAX];
+  /* the later experts split into the present (p) and the arrived (a) */
+  uint32_t p_ids[HEXKL_GRAPH_MISS_MAX], a_ids[HEXKL_GRAPH_MISS_MAX];
+  float p_w[HEXKL_GRAPH_MISS_MAX], a_w[HEXKL_GRAPH_MISS_MAX];
+  uint32_t i, n_miss = 0, first = n, n_p = 0, n_a = 0;
+  float *p_rows, *a_rows;
+  int rc;
+  for (i = 0; i < n; ++i) {
+    was_miss[i] = h[ids[i]] == HTP_GRAPH_NO_HANDLE ||
+                  h[op->n_experts + ids[i]] == HTP_GRAPH_NO_HANDLE;
+    if (was_miss[i]) {
+      miss[n_miss++] = ids[i];
+      first = first < i ? first : i;
+    }
+  }
+  if (env->miss.post == NULL || g->moe_rows == NULL) {
+    return AEE_EBADSTATE; /* no miss path: the one-session entry */
+  }
+  const uint32_t begin =
+    NNTR_MOE_MERGE_HITS && (env->moe_flags & HEXKL_MOE_FLAG_M1_GEMV) ? 0u
+                                                                     : first;
+  for (i = begin; i < n; ++i) {
+    if (was_miss[i]) {
+      a_ids[n_a] = ids[i];
+      a_w[n_a++] = w[i];
+    } else {
+      p_ids[n_p] = ids[i];
+      p_w[n_p++] = w[i];
+    }
+  }
+  /* n - begin <= top_k rows: the present set's, then the arrived set's */
+  p_rows = g->moe_rows;
+  a_rows = g->moe_rows + (size_t)n_p * op->N_out;
+  g->moe_calls_1x += (first != 0u) + (n - first);
+  rc = env->miss.post(env->miss.ctx, op_i, ids, n, miss, n_miss);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (begin != 0u) {
+    rc = graph_moe_run(g, env, op, h, ids, w, first, 0u, in, out);
+  } else {
+    memset(out, 0, (size_t)op->N_out * sizeof(float));
+  }
+  if (rc == AEE_SUCCESS) {
+    rc = graph_moe_rows(g, env, op, h, p_ids, p_w, n_p, in, p_rows);
+  }
+  /* [#289] the dense branch while the ARM reads */
+  if (rc == AEE_SUCCESS && g->dense_early != 0u) {
+    rc = graph_dense_early(g, op_i, call);
+  }
+  /** the wait comes even after a failure: the answer must not land on a
+     later round's page */
+  {
+    const int wrc = env->miss.wait(env->miss.ctx, g, op_i);
+    rc = rc != AEE_SUCCESS ? rc : wrc;
+  }
+  for (i = 0; rc == AEE_SUCCESS && i < n_a; ++i) {
+    if (h[a_ids[i]] == HTP_GRAPH_NO_HANDLE ||
+        h[op->n_experts + a_ids[i]] == HTP_GRAPH_NO_HANDLE) {
+      return AEE_EBADSTATE; /* the answer did not bring it */
+    }
+  }
+  if (rc == AEE_SUCCESS) {
+    rc = graph_moe_rows(g, env, op, h, a_ids, a_w, n_a, in, a_rows);
+  }
+  /* in expert order, as before: both sets are ascending */
+  n_p = n_a = 0u;
+  for (i = begin; rc == AEE_SUCCESS && i < n; ++i) {
+    hvx_scale_add_rows_f32(out,
+                           was_miss[i] ? a_rows + (size_t)n_a++ * op->N_out
+                                       : p_rows + (size_t)n_p++ * op->N_out,
+                           1.0f, op->N_out);
+  }
+  return rc;
+}
+
+static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
+                        graph_call *call, const float *in, float *out) {
+  const hexkl_graph_env *env = call->env;
+  const hexkl_graph_routing *r = &call->routing;
+  const uint32_t *h = g->experts[op - g->ops];
+  uint32_t ids[HEXKL_GRAPH_MISS_MAX];
+  uint32_t e, sum = 0, n_miss = 0;
+  if (h == NULL) {
+    return AEE_EBADSTATE;
+  }
+  /** The same checks as the per-layer entry (nntr_hvx_mm_u8i4.c
+     check_moe_layer_args / check_moe_row_totals), with M fixed at 1: every
+     row index is 0 and no expert sees the token twice. */
+  if (r->n_experts == 0u) {
+    return AEE_EBADSTATE;
+  }
+  if (r->n_experts != op->n_experts || r->n_rows == 0u ||
+      r->n_rows > op->top_k || r->n_rows > HEXKL_GRAPH_MISS_MAX) {
+    return AEE_EINVALIDFORMAT;
+  }
+  for (e = 0; e < r->n_experts; ++e) {
+    if (r->row_count[e] > 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    if (r->row_count[e] != 0u) {
+      if (sum < HEXKL_GRAPH_MISS_MAX) {
+        ids[sum] = e;
+      }
+      /* [plan 201 S1] a routed expert the pool does not hold */
+      n_miss += h[e] == HTP_GRAPH_NO_HANDLE ||
+                h[op->n_experts + e] == HTP_GRAPH_NO_HANDLE;
+    }
+    sum += r->row_count[e];
+  }
+  if (sum != r->n_rows) {
+    return AEE_EINVALIDFORMAT;
+  }
+  for (e = 0; e < r->n_rows; ++e) {
+    if (r->row_index[e] != 0u) {
+      return AEE_EINVALIDFORMAT;
+    }
+  }
+  call->routing.n_experts = 0u; /* consumed */
+  /** A graph slot can keep its address while its contents change. Never
+     carry a rotated row to another MoE op or token, even at that address. */
+  g->moe_rotated_input.valid = 0u;
+  /* [plan 201 S1] the token's routed set, for the pool's recency */
+  if (g->route_log_n + 1u + sum <= HEXKL_GRAPH_ROUTE_LOG) {
+    g->route_log[g->route_log_n++] = (uint8_t)sum;
+    for (e = 0; e < sum; ++e) {
+      g->route_log[g->route_log_n++] = (uint8_t)ids[e];
+    }
+  }
+  if (n_miss != 0u) {
+    return graph_moe_miss(g, op, call, h, ids, r->row_weight, sum, in, out);
+  }
+  const int fixed = graph_moe_static(g, op, env, h, ids, sum);
+  if (fixed != AEE_SUCCESS)
+    return fixed;
+  ++g->moe_calls;
+  ++g->moe_calls_1x;
+  /** the table is the handle arrays: the kernel skips an expert with no
+     rows before it reads its handle, so a NO_HANDLE there is never read */
+  return hexkl_mm_u8i4_moe_layer_run(
+    env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K, op->N,
+    op->N_out, op->n_experts, h, h + op->n_experts, r->row_index, r->row_count,
+    r->row_weight, in, out, env->pool, env->scratch, env->moe_flags);
+}
+
+/* ---- the small ops (#82) and m=1 attention (#81), as they are ---------- */
+
+static float graph_eps(const htp_graph_op *op) {
+  float eps;
+  memcpy(&eps, &op->eps_bits, sizeof(eps));
+  return eps;
+}
+
+/** @brief A graph slot can retain its scale only if this norm leaves the
+ *  input unchanged. In-place norms and the dense-early scratch cannot
+ *  populate a slot's cache. Every dispatch invalidates its output slot. */
+static graph_norm_cache *graph_norm_cache_for(hexkl_graph *g,
+                                              const htp_graph_op *op,
+                                              graph_call *call, const float *in,
+                                              float *out) {
+  if (in == out || in != g->slots + (size_t)op->in_slot * g->slot_words) {
+    return NULL;
+  }
+  return &call->norm[op->in_slot];
+}
+
+static int graph_norm_reuse(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out,
+                            const float *gamma, uint32_t n1) {
+  const graph_norm_cache *c = graph_norm_cache_for(g, op, call, in, out);
+  if (c == NULL || c->width != op->K || c->eps_bits != op->eps_bits ||
+      c->n1 != n1) {
+    return 0;
+  }
+  hvx_rmsnorm_apply_f32(in, gamma, out, op->K, c->scale);
+  return 1;
+}
+
+static void graph_norm_keep(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out,
+                            uint32_t n1, float scale) {
+  graph_norm_cache *c = graph_norm_cache_for(g, op, call, in, out);
+  if (c != NULL) {
+    c->width = op->K;
+    c->eps_bits = op->eps_bits;
+    c->n1 = n1;
+    c->scale = scale;
+  }
+}
+
+static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const float *gamma = g->param[op - g->ops];
+  const uint32_t n1 = (op->feed & HTP_GRAPH_NORM_N1) != 0u;
+  float scale;
+  if (gamma == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (graph_norm_reuse(g, op, call, in, out, gamma, n1)) {
+    return AEE_SUCCESS;
+  }
+  ((op->feed & HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32 : hvx_rmsnorm_f32)(
+    in, gamma, out, op->K, op->K, graph_eps(op), &scale);
+  graph_norm_keep(g, op, call, in, out, n1, scale);
+  return AEE_SUCCESS;
+}
+
+/** q heads with gamma[0..head_dim), k heads with gamma[head_dim..2 head_dim),
+   v copied through: the row stays q | k | v for ROPE and ATTN_M1.
+   [plan 201 S4] Gemma 4 (#4296 gemma4_causallm.cpp:672-708): with
+   HTP_GRAPH_QKNORM_V the v heads are normed with no gamma (v_norm), and
+   with HTP_GRAPH_QKNORM_K_EQ_V v is the raw k (v = k before k_norm); v is
+   written first, so in == out still reads the raw k. */
+static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const float *gamma = g->param[op - g->ops];
+  if (gamma == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_qkv_rmsnorm_f32(
+    in, gamma, out, op->gqa * op->n_kv, op->n_kv, op->head_dim, graph_eps(op),
+    (op->feed & HTP_GRAPH_QKNORM_V) != 0u,
+    (op->feed & HTP_GRAPH_QKNORM_K_EQ_V) != 0u, call->env->pool);
+  return AEE_SUCCESS;
+}
+
+/** [plan 201 S4] The op's own table (ROPE_TABLE bound on this op: max_seq
+   x head_dim, Gemma's per-layer theta and partial factor) when it has one,
+   else the session's shared head_dim 64 table (LFM2). */
+static int graph_op_rope(hexkl_graph *g, const htp_graph_op *op,
+                         graph_call *call, const float *in, float *out) {
+  const uint32_t n_q = op->gqa * op->n_kv, hd = op->head_dim;
+  const float *cs = g->param[op - g->ops];
+  if (cs == NULL) {
+    cs = hd == 64u ? g->rope_cs : NULL;
+  }
+  if (cs == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (in != out) {
+    memcpy(out, in, (size_t)op->K * sizeof(float));
+  }
+  hvx_rope_f32(out, n_q, out + (size_t)n_q * hd, op->n_kv,
+               cs + (size_t)call->pos * hd, hd);
+  return AEE_SUCCESS;
+}
+
+static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
+                                graph_call *call, const float *in, float *out) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  if (g->param[i] == NULL || g->state[i] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (op->N == 2048u) {
+    hvx_conv_gate_m1_f32_parallel(in, g->state[i], g->param[i], out, op->N,
+                                  call->env->pool);
+  } else {
+    hvx_conv_gate_m1_f32(in, g->state[i], g->param[i], out, op->N);
+  }
+  return AEE_SUCCESS;
+}
+
+/** @brief The score scale: eps_bits' f32 when set ([plan 201 S4] Gemma
+ *  4's 1.0, attn_m1_det.h's GEMMA note), else 1/sqrt(head_dim) -- at 64
+ *  0.125f, exact, and the same bits as the fp16 CPU's `/ sqrt(64.f)`
+ *  (attn_m1_det.h step 2). The kernel refuses a scale that is not an fp16
+ *  value (1/sqrt(512) is not). */
+static float graph_attn_scale(const htp_graph_op *op) {
+  return op->eps_bits != 0u    ? graph_eps(op)
+         : op->head_dim == 64u ? 0.125f
+                               : 1.0f / sqrtf((float)op->head_dim);
+}
+
+/** @brief The session cache an ATTN_M1 op's shape names: env->attn_m1, or
+ *  [plan 201 S4] env->attn_m1_b (Gemma's full layers beside its sliding
+ *  ones), or NULL. */
+static hvx_attn_m1_ctx *graph_attn_cache(const hexkl_graph_env *env,
+                                         const htp_graph_op *op) {
+  hvx_attn_m1_ctx *const c[2] = {env->attn_m1, env->attn_m1_b};
+  uint32_t i;
+  for (i = 0; i < 2u; ++i) {
+    if (c[i] != NULL && c[i]->n_kv == op->n_kv && c[i]->gqa == op->gqa &&
+        c[i]->head_dim == op->head_dim) {
+      return c[i];
+    }
+  }
+  return NULL;
+}
+
+typedef char
+  graph_attn_prof_fits[HEXKL_GRAPH_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS ? 1
+                                                                         : -1];
+
+/** [plan 201 S4] top_k is the sliding window (0: full causal, LFM2 and
+   Gemma's full layers), eps_bits the scale (graph_attn_scale) */
+static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
+                 n_k = op->n_kv * hd;
+  hvx_attn_m1_ctx *c = graph_attn_cache(call->env, op);
+  uint32_t w[ATTN_M1_PROF_WORDS], i;
+  int rc;
+  if (c == NULL) {
+    return AEE_EBADSTATE;
+  }
+  /** n_experts: the absolute position of the cache's row 0 (a sliding
+     layer's cache holds a window of a long context; 0 otherwise) */
+  if (call->pos < op->n_experts) {
+    return AEE_EBADPARM;
+  }
+  rc = hvx_attn_m1_forward_prof(
+    c, g->ordinal[op - g->ops], call->pos - op->n_experts, op->top_k,
+    graph_attn_scale(op), in, in + n_q, in + n_q + n_k, out, NULL,
+    g->attn_prof_on ? w : NULL);
+  if (rc == AEE_SUCCESS && g->attn_prof_on) { /* [#261] */
+    const uint32_t b = c == call->env->attn_m1_b ? 1u : 0u;
+    ++g->attn_prof_calls[b];
+    for (i = 0; i < ATTN_M1_PROF_WORDS; ++i) {
+      g->attn_prof[b][i] += w[i];
+    }
+  }
+  return rc;
+}
+
+/* ---- #132: the residual add and the router ------------------------------ */
+
+/** out += in * 1 (LFM2: out is slot 0, the residual). x * 1 is exact and
+   the add rounds once, which is the CPU's copy + add_i bit for bit.
+   [plan 201 S4] eps_bits set: then out *= s, Gemma 4's layer_scalar
+   (#4296 gemma4_causallm.cpp:486-494, a scalar_multiply after the add). */
+static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
+                        graph_call *call, const float *in, float *out) {
+  (void)g;
+  (void)call;
+  hvx_scale_add_rows_f32(out, in, 1.0f, op->N);
+  if (op->eps_bits != 0u) {
+    hvx_mul_scalar_f32(out, graph_eps(op), op->N);
+  }
+  return AEE_SUCCESS;
+}
+
+/** The logits go to the out slot (nothing reads them); the routing goes to
+   g->route_* in ascending expert order -- tryMoeLayerOnAccelerator's
+   grouping -- and the call's routing points at it for the MOE op next.
+   [plan 201 S4] The softmax router (eps_bits set) norms its un-normed input
+   into the out slot first (gamma = ROUTER_BIAS's g, the validator keeps
+   in != out), then its logits overwrite it. */
+static void graph_router(hexkl_graph *g, const htp_graph_op *op,
+                         graph_call *call, const float *in, float *out,
+                         uint32_t *sel, float *w) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  if (op->eps_bits != 0u) {
+    if (!graph_norm_reuse(g, op, call, in, out, g->state[i], 0u)) {
+      float scale;
+      hvx_rmsnorm_f32(in, g->state[i], out, op->K, op->K, graph_eps(op),
+                      &scale);
+      graph_norm_keep(g, op, call, in, out, 0u, scale);
+    }
+    if (g->router_quant[i][0] > 0.0f)
+      for (uint32_t k = 0; k < op->K; ++k)
+        out[k] = htp_static_qdq(out[k], g->router_quant[i][0],
+                                (int32_t)g->router_quant[i][1]);
+    hvx_router_softmax_topk_owned_f32(
+      out, (const hvx_router_sm_weights *)g->param[i], g->state[i] + op->K,
+      op->top_k, out, sel, w, call->env->pool);
+  } else {
+    if (g->router_wh[i] == 2u)
+      hvx_router_topk_wh_decoded_f32(in, g->param[i], g->state[i], op->K,
+                                     op->n_experts, op->top_k, out, sel, w,
+                                     call->env->pool);
+    else if (g->router_wh[i])
+      hvx_router_topk_wh(in, (const uint8_t *)g->param[i], g->state[i], op->K,
+                         op->n_experts, op->top_k, out, sel, w,
+                         call->env->pool);
+    else
+      hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
+                          op->top_k, out, sel, w, call->env->pool);
+  }
+}
+
+/** [#266 S2] The next ROUTER_TOPK op's router on this one's input: a guess
+   at the next MoE layer's routing (pre-gated MoE), logged best first. It
+   runs before this op's own router and writes only the out slot, which
+   that router rewrites, so the real routing moves no bit. */
+static void graph_predict(hexkl_graph *g, const htp_graph_op *op,
+                          graph_call *call, const float *in, float *out) {
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], j, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS];
+  const htp_graph_op *nx = NULL;
+  for (j = (uint32_t)(op - g->ops) + 1u; j < g->n_ops && nx == NULL; ++j) {
+    if (g->ops[j].kind == HTP_OP_ROUTER_TOPK) {
+      nx = &g->ops[j];
+    }
+  }
+  /** in != out: the guess must not clobber this router's input (the
+     validator allows it for the sigmoid router); the same kind and width,
+     so the guess writes no more of the slot than this router does */
+  if (nx != NULL && g->param[nx - g->ops] != NULL &&
+      g->state[nx - g->ops] != NULL && in != out &&
+      nx->n_experts == op->n_experts &&
+      (nx->eps_bits != 0u) == (op->eps_bits != 0u) &&
+      nx->top_k <= HEXKL_GRAPH_MISS_MAX) {
+    if (g->predict == 2u) {
+      const int lfm2 = nx->eps_bits == 0u && nx->K == 2048u &&
+                       nx->n_experts == 64u && nx->top_k == 4u;
+      if (nx->K == op->K && (nx->eps_bits != 0u || lfm2) &&
+          call->env->miss.input_hint != NULL)
+        call->env->miss.input_hint(call->env->miss.ctx, (uint32_t)(nx - g->ops),
+                                   in, op->K);
+      return;
+    }
+    graph_router(g, nx, call, in, out, sel, w);
+    n = nx->top_k;
+    if (call->env->miss.hint != NULL) { /* [#282 B] the prefetch hint */
+      call->env->miss.hint(call->env->miss.ctx, (uint32_t)(nx - g->ops), sel,
+                           n);
+    }
+  }
+  /** ponytail: an entry that does not fit is dropped, as route_log does
+     (Gemma's 29 x 9 + 1 B fit); a model past 320 B needs a bigger log */
+  if (g->pred_log_n + 1u + n <= HEXKL_GRAPH_ROUTE_LOG) {
+    g->pred_log[g->pred_log_n++] = (uint8_t)n;
+    for (r = 0; r < n; ++r) {
+      g->pred_log[g->pred_log_n++] = (uint8_t)sel[r];
+    }
+  }
+}
+
+static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
+                                graph_call *call, const float *in, float *out) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
+  if (g->param[i] == NULL || g->state[i] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (g->predict != 0u) {
+    graph_predict(g, op, call, in, out);
+  }
+  graph_router(g, op, call, in, out, sel, w);
+  memset(g->route_cnt, 0, sizeof(g->route_cnt));
+  for (r = 0; r < op->top_k; ++r) {
+    g->route_cnt[sel[r]] = 1u;
+    by_expert[sel[r]] = w[r];
+  }
+  for (e = 0; e < op->n_experts; ++e) {
+    if (g->route_cnt[e] != 0u) {
+      g->route_idx[n] = 0u;
+      g->route_w[n++] = by_expert[e];
+    }
+  }
+  call->routing.row_index = g->route_idx;
+  call->routing.row_count = g->route_cnt;
+  call->routing.row_weight = g->route_w;
+  call->routing.n_rows = n;
+  call->routing.n_experts = op->n_experts;
+  return AEE_SUCCESS;
+}
+
+/* ---- #132 Part B: the CPU-exact Q4_0 FC, the dense FFN, the lm_head ---- */
+
+/** [#194 L1] The op's quantizer: the native one under the feed word's
+   HTP_GRAPH_FEED_NATIVE (the runner then takes the native GEMV), else the
+   CPU-exact one. */
+static void graph_prep(const htp_graph_op *op, const float *x, uint32_t K,
+                       hvx_q4m1_act *a) {
+  if ((op->feed & HTP_GRAPH_FEED_NATIVE) != 0u) {
+    hvx_q4m1_prep_vec(x, K, a);
+  } else {
+    hvx_q4m1_prep(x, K, a);
+  }
+}
+
+/** Runs parts h[0..n) on the prepared activation, their outputs
+   concatenated in y (q | k | v; the lm_head's slices). */
+static int graph_q4m1_parts(hexkl_graph *g, const htp_graph_op *op,
+                            const graph_call *call, const uint32_t *h,
+                            uint32_t n, float *y) {
+  uint32_t p;
+  for (p = 0; p < n; ++p) {
+    const int rc = call->env->fc(call->env->fc_ctx, h[p], op->feed, &g->act, y);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    y += g->q4m1[h[p]].N;
+  }
+  return AEE_SUCCESS;
+}
+
+/** [#225] A WH op's kernel flags: the session's MoE flags, with the VTCM
+   feed off under the op's L2 bit (the weights then stay in the arena). */
+_Static_assert(HEXKL_FC_M1_MAX_PARTS >= HTP_GRAPH_MAX_PARTS &&
+                 HTP_GRAPH_WH_DENSE_MAX_CHUNKS <= HEXKL_GRAPH_MISS_MAX,
+               "the WH ops' part and chunk limits drifted from the kernels'");
+static uint32_t graph_wh_flags(const htp_graph_op *op, uint32_t flags) {
+  if ((op->feed & HTP_GRAPH_FEED_L2) != 0u) {
+    flags = (flags | HEXKL_MOE_FLAG_GEMV_FEED_SET) & ~HEXKL_MOE_FLAG_GEMV_FEED;
+  }
+  return flags;
+}
+
+/** [#225] HTP_GRAPH_FEED_WH: the parts are the session's u8i4 handles (the
+   FC WH sidecar's), one u8 row quantization and the WH GEMV over them. */
+static int graph_op_fc_wh(const htp_graph_op *op, const graph_call *call,
+                          const float *in, float *out) {
+  const hexkl_graph_env *env = call->env;
+  return hexkl_mm_u8i4_fc_m1_run(env->tbl, env->vtcm_base, env->vtcm_size,
+                                 env->config_off, op->K, op->n_experts,
+                                 op->h_gu, in, out, env->pool, env->scratch,
+                                 graph_wh_flags(op, env->moe_flags));
+}
+
+static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
+                       const float *in, float *out) {
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    return graph_op_fc_wh(op, call, in, out);
+  }
+  if (call->env->fc == NULL) {
+    return AEE_EBADSTATE;
+  }
+  graph_prep(op, in, op->K, &g->act);
+  return graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, out);
+}
+
+/** up and gate on one quantization, silu(gate) * up in the CPU's order
+   (m1_swiglu_cpu_det: swiglu layer input 0 is gate), the swiglu row
+   quantized, down. [#132 E5f] The SwiGLU over the pool with the scalar
+   IEEE divide (hvx_swiglu_cpu_f32; E5d read DENSE_FFN at 5.6 ms/token
+   with the spec's integer division on one thread). [plan 201 S4] Under
+   the session's HEXKL_MOE_FLAG_GELU_TANH (the model's activation, #209) it is
+   gelu_tanh(gate) * up (geglu_det_one), Gemma 4's dense FFN (#4296
+   gemma4_causallm.cpp:760-806: separate gate and up, tanh_gelu, multiply). */
+static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
+                              graph_call *call, const float *in, float *out) {
+  float *up, *gate, *act;
+  int rc;
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    /** [#225] the n_experts chunks as experts of weight 1, the token's one
+       row each: the MoE kernel's M = 1 pair path, its VTCM feed, its
+       SwiGLU (GeGLU under the session's flag), the chunks' downs added in
+       chunk order */
+    const hexkl_graph_env *env = call->env;
+    uint32_t idx[HTP_GRAPH_MAX_PARTS], cnt[HTP_GRAPH_MAX_PARTS];
+    float w[HTP_GRAPH_MAX_PARTS];
+    uint32_t c;
+    for (c = 0; c < op->n_experts; ++c) {
+      idx[c] = 0u;
+      cnt[c] = 1u;
+      w[c] = 1.0f;
+    }
+    /** [PR 4428] The dense FFN's weights are never rotated and its 1056-wide
+       chunks have no Hadamard anyway: the session's rotation selectors
+       (NNTR_MOE_HADAMARD_SCOPE=all) apply to the experts only. */
+    return hexkl_mm_u8i4_moe_layer_run(
+      env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K,
+      op->N / op->n_experts, op->N_out, op->n_experts, op->h_gu, op->h_dn, idx,
+      cnt, w, in, out, env->pool, env->scratch,
+      graph_wh_flags(op, env->moe_flags) & ~HEXKL_MOE_FLAG_HAD_MASK);
+  }
+  if (call->env->fc == NULL) {
+    return AEE_EBADSTATE;
+  }
+  /** g->ffn is NULL when every DENSE_FFN is WH (graph_init sizes it by the
+     Q4M1 ones): set only on this path */
+  up = g->ffn;
+  gate = g->ffn + op->N;
+  act = g->ffn + 2u * op->N;
+  graph_prep(op, in, op->K, &g->act);
+  rc = call->env->fc(call->env->fc_ctx, op->h_gu[0], op->feed, &g->act, up);
+  if (rc == AEE_SUCCESS) {
+    rc = call->env->fc(call->env->fc_ctx, op->h_gu[1], op->feed, &g->act, gate);
+  }
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if ((call->env->moe_flags & HEXKL_MOE_FLAG_GELU_TANH) != 0u) {
+    hvx_geglu_f32(gate, up, act, op->N);
+  } else {
+    hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
+  }
+  graph_prep(op, act, op->N, &g->act);
+  return call->env->fc(call->env->fc_ctx, op->h_dn[0], op->feed, &g->act, out);
+}
+
+/** The slices into g->logits (forward hands them out as the op's output),
+   then the first maximum, as the CPU's sampler picks it. [plan 201 S4]
+   eps_bits set: the logits are soft-capped first (Gemma 4's
+   final_logit_softcapping, #4296 gemma4_causallm.cpp:855-864), so the
+   pick and the logits handed out are the capped ones, as on the CPU. */
+static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  int rc;
+  (void)out;
+  if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+    /** an untied head's QS4CX slices as WH handles: the FC's one call (its
+       own u8 row quantization) straight into the logits */
+    rc = graph_op_fc_wh(op, call, in, g->logits);
+  } else {
+    if (call->env->fc == NULL) {
+      return AEE_EBADSTATE;
+    }
+    graph_prep(op, in, op->K, &g->act);
+    rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
+  }
+  if (rc == AEE_SUCCESS && op->eps_bits != 0u) {
+    hvx_softcap_m1_f32(g->logits, op->N, graph_eps(op), call->env->pool);
+  }
+  if (rc == AEE_SUCCESS) {
+    /** [#132 Part B E3] the banned ids at -inf for the pick only (the
+       CPU's applyBadWordsPenalty), put back in reverse so a repeated id
+       gets its own value again */
+    float keep[HTP_GRAPH_MAX_BAN];
+    uint32_t i;
+    for (i = 0; i < g->n_ban; ++i) {
+      keep[i] = g->logits[g->ban[i]];
+      g->logits[g->ban[i]] = -INFINITY;
+    }
+    g->lm_id = hvx_argmax_first_f32(g->logits, op->N);
+    for (i = g->n_ban; i-- > 0;) {
+      g->logits[g->ban[i]] = keep[i];
+    }
+  }
+  return rc;
+}
+
+/** @brief The kernel table: a NULL slot is a kind this build does not run
+ *  (hvx_impl's htp_op_table rule); the validator refuses a resident bit on
+ *  it with AEE_ECLASSNOTSUPPORT, so forward never reaches a NULL. */
+static const graph_kernel kernels[HTP_OP_KIND_N] = {
+  graph_op_rmsnorm,     /* RMSNORM      #82 */
+  graph_op_fc,          /* FC           #132 Part B */
+  graph_op_conv1d_gate, /* CONV1D_GATE  #82 */
+  graph_op_qk_norm,     /* QK_NORM      #82 */
+  graph_op_rope,        /* ROPE         #82 */
+  graph_op_attn_m1,     /* ATTN_M1      #81 */
+  graph_op_add,         /* ADD          #132 */
+  graph_op_router_topk, /* ROUTER_TOPK  #132 */
+  graph_op_moe,         /* MOE */
+  graph_op_dense_ffn,   /* DENSE_FFN    #132 Part B */
+  graph_op_lm_head,     /* LM_HEAD      #132 Part B */
+};
+
+/** [#289] Gemma's dense branch after MOE op op_i -- RMSNORM (the MoE
+   output's, in place), then RMSNORM from a slot the MoE does not write,
+   DENSE_FFN and RMSNORM in place -- run now into g->early: the same
+   kernels on the same input (the residual), so the same bits. A list of
+   another shape, or one this forward stops inside, is left as it is. */
+static int graph_dense_early(hexkl_graph *g, uint32_t op_i, graph_call *call) {
+  const htp_graph_op *m = &g->ops[op_i], *o = m + 1;
+  uint32_t j, s;
+  int rc;
+  if (g->early == NULL || op_i + 4u >= call->end_op || !o[0].resident ||
+      !o[1].resident || !o[2].resident || !o[3].resident ||
+      o[0].kind != HTP_OP_RMSNORM || o[0].in_slot != m->out_slot ||
+      o[0].out_slot != m->out_slot || o[1].kind != HTP_OP_RMSNORM ||
+      o[1].in_slot == m->out_slot || o[2].kind != HTP_OP_DENSE_FFN ||
+      o[2].in_slot != o[1].out_slot || o[2].out_slot != o[1].out_slot ||
+      o[3].kind != HTP_OP_RMSNORM || o[3].in_slot != o[1].out_slot ||
+      o[3].out_slot != o[1].out_slot ||
+      htp_graph_op_out_words(&o[3]) > g->slot_words) {
+    return AEE_SUCCESS;
+  }
+  s = o[1].in_slot;
+  for (j = 1u; j <= 3u; ++j) {
+    rc = kernels[o[j].kind](
+      g, &o[j], call, j == 1u ? g->slots + (size_t)s * g->slot_words : g->early,
+      g->early);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  g->early_from = op_i + 2u;
+  g->early_to = op_i + 4u;
+  return AEE_SUCCESS;
+}
+
+uint32_t hexkl_graph_resident_kinds(void) {
+  uint32_t mask = 0, k;
+  for (k = 0; k < HTP_OP_KIND_N; ++k) {
+    if (kernels[k] != NULL) {
+      mask |= HTP_GRAPH_KIND_BIT(k);
+    }
+  }
+  return mask;
+}
+
+static int graph_check_handle(const hexkl_weight_u8i4_table *tbl, uint32_t h,
+                              uint32_t K, uint32_t N) {
+  if (h >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h].in_use ||
+      tbl->slots[h].K != K || tbl->slots[h].N != N) {
+    return AEE_EINVHANDLE;
+  }
+  return AEE_SUCCESS;
+}
+
+/* A resident Q4M1 op's parts against the slot shapes (hexkl_graph.h). */
+static int graph_check_q4m1(const htp_graph_op *op,
+                            const hexkl_graph_q4m1_shape *q4m1,
+                            uint32_t n_q4m1) {
+  uint32_t p, sum = 0;
+#define Q4M1_OK(h, k) ((h) < n_q4m1 && q4m1[h].K != 0u && q4m1[h].K == (k))
+  if (op->kind == HTP_OP_DENSE_FFN) {
+    return (op->n_experts == 3u && Q4M1_OK(op->h_gu[0], op->K) &&
+            Q4M1_OK(op->h_gu[1], op->K) && Q4M1_OK(op->h_dn[0], op->N) &&
+            q4m1[op->h_gu[0]].N == op->N && q4m1[op->h_gu[1]].N == op->N &&
+            q4m1[op->h_dn[0]].N == op->N_out)
+             ? AEE_SUCCESS
+             : AEE_EINVHANDLE;
+  }
+  if (op->n_experts == 0u) {
+    return AEE_EINVHANDLE;
+  }
+  for (p = 0; p < op->n_experts; ++p) {
+    if (!Q4M1_OK(op->h_gu[p], op->K) || q4m1[op->h_gu[p]].N % 32u != 0u) {
+      return AEE_EINVHANDLE;
+    }
+    sum += q4m1[op->h_gu[p]].N;
+  }
+#undef Q4M1_OK
+  return sum == op->N ? AEE_SUCCESS : AEE_EINVHANDLE;
+}
+
+/** [#225] A resident op's WH handles (HTP_GRAPH_FEED_WH) against the
+   session's table: an FC's (or an untied LM_HEAD's) parts K x N_p,
+   N_p % 32, summing to N; a
+   DENSE_FFN's n_experts chunks (<= HTP_GRAPH_WH_DENSE_MAX_CHUNKS) gate |
+   up K x 2w and down w x N_out, w = N / n_experts. */
+static int graph_check_wh(const htp_graph_op *op,
+                          const hexkl_weight_u8i4_table *tbl) {
+  uint32_t p, sum = 0;
+  if (op->kind == HTP_OP_DENSE_FFN) {
+    const uint32_t n = op->n_experts, w = n != 0u ? op->N / n : 0u;
+    if (n == 0u || n > HTP_GRAPH_WH_DENSE_MAX_CHUNKS || w * n != op->N ||
+        w % 32u != 0u) {
+      return AEE_EINVHANDLE;
+    }
+    for (p = 0; p < n; ++p) {
+      if (graph_check_handle(tbl, op->h_gu[p], op->K, 2u * w) != AEE_SUCCESS ||
+          graph_check_handle(tbl, op->h_dn[p], w, op->N_out) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    }
+    return AEE_SUCCESS;
+  }
+  if ((op->kind != HTP_OP_FC && op->kind != HTP_OP_LM_HEAD) ||
+      op->n_experts == 0u) {
+    return AEE_EINVHANDLE;
+  }
+  for (p = 0; p < op->n_experts; ++p) {
+    const uint32_t h = op->h_gu[p];
+    /** [#234 P4] 4-bit only: hexkl_mm_u8i4_fc_m1_run refuses a 2-bit
+       handle on every token, so it is refused here, once */
+    if (h >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h].in_use ||
+        tbl->slots[h].K != op->K || tbl->slots[h].N % 32u != 0u ||
+        tbl->slots[h].bits == 2u) {
+      return AEE_EINVHANDLE;
+    }
+    sum += tbl->slots[h].N;
+  }
+  return sum == op->N ? AEE_SUCCESS : AEE_EINVHANDLE;
+}
+
+int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
+                     const hexkl_weight_u8i4_table *tbl,
+                     const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
+                     hexkl_graph **out) {
+  uint32_t n_ops = 0, i, slot_words = 0, ffn_n = 0;
+  uint32_t q4m1_ops = 0, vocab_out = 0, moe_rows = 0, moe_input = 0;
+  hexkl_graph *g;
+  int rc;
+  if (out == NULL || tbl == NULL) {
+    return AEE_EBADSTATE;
+  }
+  rc = (int)htp_graph_validate(words, n_words, hexkl_graph_resident_kinds(),
+                               &n_ops);
+  if (rc != 0) {
+    return rc;
+  }
+  for (i = 0; i < n_ops; ++i) {
+    const htp_graph_op *op = htp_graph_op_cat(words, i);
+    if (!op->resident) {
+      continue;
+    }
+    if ((op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+      if (graph_check_wh(op, tbl) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    } else if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u) {
+      if (q4m1 == NULL || graph_check_q4m1(op, q4m1, n_q4m1) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+      ++q4m1_ops;
+      if (op->kind == HTP_OP_DENSE_FFN && op->N > ffn_n) {
+        ffn_n = op->N;
+      }
+    }
+    if (op->kind == HTP_OP_MOE && op->top_k * op->N_out > moe_rows) {
+      moe_rows = op->top_k * op->N_out; /* the miss round's rows */
+    }
+    if (op->kind == HTP_OP_MOE && op->K > moe_input) {
+      moe_input = op->K;
+    }
+    if (htp_graph_op_in_words(op) > slot_words) {
+      slot_words = htp_graph_op_in_words(op);
+    }
+    /* the logits are not a slot: g->logits below */
+    if (op->kind == HTP_OP_LM_HEAD) {
+      vocab_out = op->N;
+    } else if (htp_graph_op_out_words(op) > slot_words) {
+      slot_words = htp_graph_op_out_words(op);
+    }
+  }
+  g = (hexkl_graph *)calloc(1, sizeof(*g));
+  if (g == NULL) {
+    return AEE_ENOMEMORY;
+  }
+  g->tbl = tbl;
+  if (moe_rows != 0u) {
+    g->moe_rows =
+      (float *)malloc(((size_t)moe_rows + 31u + moe_input) * sizeof(float));
+    if (g->moe_rows == NULL) {
+      free(g);
+      return AEE_ENOMEMORY;
+    }
+    g->moe_rotated_input.row =
+      (float *)(((uintptr_t)(g->moe_rows + moe_rows) + 127u) &
+                ~(uintptr_t)127u);
+    g->moe_rotated_input.capacity = moe_input;
+  }
+  g->n_layers = words[2];
+  g->n_ops = n_ops;
+  g->hidden = words[4];
+  g->vocab = words[5];
+  g->max_seq = words[6];
+  g->slot_words = slot_words;
+  if (slot_words != 0u) {
+    g->slots =
+      (float *)calloc((size_t)HTP_GRAPH_N_SLOTS * slot_words, sizeof(float));
+    if (g->slots == NULL) {
+      free(g->moe_rows);
+      free(g);
+      return AEE_ENOMEMORY;
+    }
+  }
+  /** the logits: an LM_HEAD's output whichever feed it has */
+  g->logits =
+    vocab_out ? (float *)malloc((size_t)vocab_out * sizeof(float)) : NULL;
+  if (vocab_out && g->logits == NULL) {
+    hexkl_graph_free(g);
+    return AEE_ENOMEMORY;
+  }
+  if (q4m1_ops != 0u) {
+    /* q (K bytes, 128-aligned) then s8 / ma / ea / df / d per block */
+    const size_t nb = HEXKL_GRAPH_Q4M1_MAX_K / 32u;
+    g->act_buf = (uint8_t *)memalign(128, HEXKL_GRAPH_Q4M1_MAX_K + nb * 18u);
+    g->q4m1 =
+      (hexkl_graph_q4m1_shape *)malloc((size_t)n_q4m1 * sizeof(*g->q4m1));
+    g->ffn = ffn_n ? (float *)malloc((size_t)3u * ffn_n * sizeof(float)) : NULL;
+    if (g->act_buf == NULL || g->q4m1 == NULL || (ffn_n && g->ffn == NULL)) {
+      hexkl_graph_free(g);
+      return AEE_ENOMEMORY;
+    }
+    memcpy(g->q4m1, q4m1, (size_t)n_q4m1 * sizeof(*g->q4m1));
+    g->n_q4m1 = n_q4m1;
+    g->act.q = (int8_t *)g->act_buf;
+    g->act.s8 = (int32_t *)(g->act_buf + HEXKL_GRAPH_Q4M1_MAX_K);
+    g->act.ma = g->act.s8 + nb;
+    g->act.ea = g->act.ma + nb;
+    g->act.df = (float *)(g->act.ea + nb);
+    g->act.d = (uint16_t *)(g->act.df + nb);
+  }
+  for (i = 0; i < n_ops; ++i) {
+    g->ops[i] = *htp_graph_op_cat(words, i);
+    if (g->ops[i].kind == HTP_OP_ATTN_M1) {
+      /** [plan 201 S4] the layer index within its shape's cache: the ATTN_M1
+         ops before it of the same (n_kv, gqa, head_dim). The ARM side
+         (htp_compute_ops.cpp attn_ordinal_, the kv seed) still counts all
+         ATTN_M1 ops: the same numbers while there is one shape (LFM2); the
+         Gemma hand-over that registers attn_m1_b counts per shape too. */
+      uint32_t j;
+      g->ordinal[i] = 0u;
+      for (j = 0; j < i; ++j) {
+        g->ordinal[i] += g->ops[j].kind == HTP_OP_ATTN_M1 &&
+                         g->ops[j].n_kv == g->ops[i].n_kv &&
+                         g->ops[j].gqa == g->ops[i].gqa &&
+                         g->ops[j].head_dim == g->ops[i].head_dim;
+      }
+    }
+  }
+  *out = g;
+  return AEE_SUCCESS;
+}
+
+/** @brief ROPE ops after @a i whose table is @a t (NULL: none). */
+static uint32_t graph_rope_users_after(const hexkl_graph *g, const float *t,
+                                       uint32_t i) {
+  uint32_t j, n = 0;
+  for (j = i + 1u; t != NULL && j < g->n_ops; ++j) {
+    n += g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
+}
+
+void hexkl_graph_free(hexkl_graph *g) {
+  uint32_t i;
+  if (g == NULL) {
+    return;
+  }
+  for (i = 0; i < g->n_ops; ++i) {
+    /* a shared ROPE table is freed by its last holder */
+    if (g->ops[i].kind != HTP_OP_ROPE ||
+        graph_rope_users_after(g, g->param[i], i) == 0u) {
+      free(g->param[i]);
+    }
+    free(g->state[i]);
+    free(g->experts[i]);
+    free(g->expert_quant[i]);
+  }
+  free(g->rope_cs);
+  free(g->moe_rows);
+  free(g->early);
+  free(g->slots);
+  free(g->act_buf);
+  free(g->q4m1);
+  free(g->ffn);
+  free(g->logits);
+  free(g);
+}
+
+/** @brief The parameter's length for (kind, which), 0 when the kind does
+ *  not take it. */
+static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which,
+                                uint32_t max_seq) {
+  switch (which) {
+  case HTP_GRAPH_PARAM_GAMMA:
+    return op->kind == HTP_OP_RMSNORM   ? op->K
+           : op->kind == HTP_OP_QK_NORM ? 2u * op->head_dim
+                                        : 0u;
+  case HTP_GRAPH_PARAM_CONV_W:
+    return op->kind == HTP_OP_CONV1D_GATE ? 3u * op->N : 0u;
+  case HTP_GRAPH_PARAM_CONV_STATE:
+    return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_W:
+    return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_WH:
+    return op->kind == HTP_OP_ROUTER_TOPK && op->eps_bits == 0u
+             ? op->K * op->n_experts / 8u + 3u * op->n_experts
+             : 0u;
+  case HTP_GRAPH_PARAM_ROPE_TABLE: /* [plan 201 S4] the op's own */
+    return op->kind == HTP_OP_ROPE ? op->head_dim * max_seq : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_BIAS: /* softmax: g[K] | per-expert scale */
+    return op->kind != HTP_OP_ROUTER_TOPK ? 0u
+           : op->eps_bits != 0u           ? op->K + op->n_experts
+                                          : op->n_experts;
+  default:
+    return 0u;
+  }
+}
+
+/** @brief ROPE ops other than @a except whose table is @a t. */
+static uint32_t graph_rope_users(const hexkl_graph *g, const float *t,
+                                 uint32_t except) {
+  uint32_t j, n = 0;
+  for (j = 0; j < g->n_ops; ++j) {
+    n += j != except && g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
+}
+
+/** [plan 201 S4] A ROPE op's own table, max_seq x head_dim. A table equal to
+   one another ROPE op of the same head_dim holds is shared, not copied
+   (Gemma's 25 sliding layers bind one: 4 MiB at max_seq 4096 and head_dim
+   256, not 100), and a shared table is never written in place. */
+static int graph_set_rope(hexkl_graph *g, uint32_t op, const float *data,
+                          uint32_t n) {
+  float *mine, *t = NULL;
+  uint32_t j;
+  if (op >= g->n_ops) {
+    return AEE_EBADITEM;
+  }
+  if (n == 0u || n != graph_param_len(&g->ops[op], HTP_GRAPH_PARAM_ROPE_TABLE,
+                                      g->max_seq)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  for (j = 0; j < g->n_ops && t == NULL; ++j) {
+    if (j != op && g->ops[j].kind == HTP_OP_ROPE && g->param[j] != NULL &&
+        g->ops[j].head_dim == g->ops[op].head_dim &&
+        memcmp(g->param[j], data, (size_t)n * sizeof(float)) == 0) {
+      t = g->param[j];
+    }
+  }
+  mine = g->param[op];
+  if (t == NULL) {
+    t = (mine != NULL && graph_rope_users(g, mine, op) == 0u)
+          ? mine
+          : (float *)malloc((size_t)n * sizeof(float));
+    if (t == NULL) {
+      return AEE_ENOMEMORY;
+    }
+    memcpy(t, data, (size_t)n * sizeof(float));
+  }
+  if (mine != NULL && mine != t && graph_rope_users(g, mine, op) == 0u) {
+    free(mine);
+  }
+  g->param[op] = t;
+  return AEE_SUCCESS;
+}
+
+int hexkl_graph_share_param(hexkl_graph *g, uint32_t op, uint32_t which,
+                            uint32_t src) {
+  float *mine;
+  if (g == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (which != HTP_GRAPH_PARAM_ROPE_TABLE || op >= g->n_ops ||
+      src >= g->n_ops || op == src || g->ops[op].kind != HTP_OP_ROPE ||
+      g->ops[src].kind != HTP_OP_ROPE) {
+    return AEE_EBADITEM;
+  }
+  if (g->ops[op].head_dim != g->ops[src].head_dim) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (g->param[src] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  mine = g->param[op];
+  if (mine != NULL && mine != g->param[src] &&
+      graph_rope_users(g, mine, op) == 0u) {
+    free(mine);
+  }
+  g->param[op] = g->param[src];
+  return AEE_SUCCESS;
+}
+
+int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
+                          const float *data, uint32_t n) {
+  float **dst;
+  uint32_t want, alloc;
+  if (g == NULL) {
+    return AEE_EBADSTATE;
+  }
+  if (which >= HTP_GRAPH_PARAM_N || data == NULL) {
+    return AEE_EBADITEM;
+  }
+  if (which == HTP_GRAPH_PARAM_EXPERT_QUANT) {
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_MOE ||
+        n != 4u * g->ops[op].n_experts)
+      return AEE_EBADPARM;
+    for (uint32_t i = 0; i < n; i += 2u)
+      if (!(data[i] >= FLT_MIN && data[i] <= FLT_MAX / 255.0f) ||
+          !(data[i + 1] >= 0.0f && data[i + 1] <= 255.0f) ||
+          data[i + 1] != (int32_t)data[i + 1])
+        return AEE_EBADPARM;
+    if (!g->expert_quant[op]) {
+      g->expert_quant[op] = malloc(n * sizeof(float));
+      if (!g->expert_quant[op])
+        return AEE_ENOMEMORY;
+    }
+    memcpy(g->expert_quant[op], data, n * sizeof(float));
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_QUANT) {
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_ROUTER_TOPK ||
+        !g->ops[op].eps_bits || n != 2 ||
+        !(data[0] >= FLT_MIN && data[0] <= FLT_MAX / 255.0f) ||
+        !(data[1] >= 0.0f && data[1] <= 255.0f) || data[1] != (int32_t)data[1])
+      return AEE_EBADPARM;
+    memcpy(g->router_quant[op], data, 2 * sizeof(float));
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_LM_BAN) {
+    uint32_t i;
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_LM_HEAD) {
+      return AEE_EBADITEM;
+    }
+    if (n > HTP_GRAPH_MAX_BAN) { /* 0 clears the list */
+      return AEE_EINVALIDFORMAT;
+    }
+    for (i = 0; i < n; ++i) {
+      uint32_t id;
+      memcpy(&id, &data[i], sizeof(id));
+      if (id >= g->ops[op].N) {
+        return AEE_EINVALIDFORMAT;
+      }
+      g->ban[i] = id;
+    }
+    g->n_ban = n;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_PREDICT) {
+    uint32_t v;
+    if (op != HTP_GRAPH_NO_OP) {
+      return AEE_EBADITEM;
+    }
+    if (n != 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    memcpy(&v, data, sizeof(v));
+    if (v > 2u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    g->predict = v;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_DENSE_EARLY) {
+    uint32_t v;
+    if (op != HTP_GRAPH_NO_OP) {
+      return AEE_EBADITEM;
+    }
+    if (n != 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    memcpy(&v, data, sizeof(v));
+    if (v > 1u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    /* one slot of heap (slot_words f32, the hidden width on Gemma) */
+    if (v != 0u && g->early == NULL && g->slot_words != 0u) {
+      g->early = (float *)malloc((size_t)g->slot_words * sizeof(float));
+      if (g->early == NULL) {
+        return AEE_ENOMEMORY;
+      }
+    }
+    g->dense_early = v;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_EXPERTS) {
+    /** [plan 201 S1] the MOE op's pool table: every entry checked before
+       any is stored, so a refused table leaves the old one in place */
+    const htp_graph_op *o;
+    uint32_t i, *h;
+    if (op >= g->n_ops) {
+      return AEE_EBADITEM;
+    }
+    o = &g->ops[op];
+    if (o->kind != HTP_OP_MOE || n != 2u * o->n_experts) {
+      return AEE_EINVALIDFORMAT;
+    }
+    for (i = 0; i < n; ++i) {
+      uint32_t v;
+      memcpy(&v, &data[i], sizeof(v));
+      if (v != HTP_GRAPH_NO_HANDLE &&
+          (i < o->n_experts
+             ? graph_check_handle(g->tbl, v, o->K, 2u * o->N)
+             : graph_check_handle(g->tbl, v, o->N, o->N_out)) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    }
+    h = g->experts[op];
+    if (h == NULL) {
+      h = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+      if (h == NULL) {
+        return AEE_ENOMEMORY;
+      }
+      g->experts[op] = h;
+    }
+    memcpy(h, data, (size_t)n * sizeof(uint32_t));
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_ROPE_TABLE && op != HTP_GRAPH_NO_OP) {
+    return graph_set_rope(g, op, data, n);
+  }
+  if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
+    want = alloc = g->max_seq * 64u;
+    dst = &g->rope_cs;
+  } else {
+    if (op >= g->n_ops) {
+      return AEE_EBADITEM;
+    }
+    want = graph_param_len(&g->ops[op], which, g->max_seq);
+    if (want == 0u) {
+      return AEE_EINVALIDFORMAT;
+    }
+    /** the conv state buffer is 3 rows: the kernel's scratch is row 2; the
+       router bias shares the state pointer (a ROUTER_TOPK op has none) */
+    alloc = (which == HTP_GRAPH_PARAM_CONV_STATE) ? 3u * g->ops[op].N : want;
+    dst = (which == HTP_GRAPH_PARAM_CONV_STATE ||
+           which == HTP_GRAPH_PARAM_ROUTER_BIAS)
+            ? &g->state[op]
+            : &g->param[op];
+  }
+  if (n != want) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_WH) {
+    /** The small router is read at every decode layer. Decode its sixteen
+       integer levels once at bind instead of once per token, retaining
+       the original final scale multiply. Experts stay compressed. A packed
+       fallback keeps binding usable when this extra cache cannot fit. */
+#ifndef NNTR_GRAPH_ROUTER_WH_DECODED
+#define NNTR_GRAPH_ROUTER_WH_DECODED 1
+#endif
+    float *packed =
+      NNTR_GRAPH_ROUTER_WH_DECODED
+        ? hvx_router_wh_weights_create((const uint8_t *)data, g->ops[op].K,
+                                       g->ops[op].n_experts)
+        : NULL;
+    const uint8_t format = packed ? 2u : 1u;
+    if (!packed) {
+      packed = (float *)memalign(128, (size_t)n * sizeof(float));
+      if (!packed)
+        return AEE_ENOMEMORY;
+      memcpy(packed, data, (size_t)n * sizeof(float));
+    }
+    free(*dst);
+    *dst = packed;
+    g->router_wh[op] = format;
+    return AEE_SUCCESS;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_W) {
+    /** [K][E] padded to [K][W], zero lanes, with E rounded up to
+       32 for either sigmoid or softmax routing */
+    const uint32_t K = g->ops[op].K, E = g->ops[op].n_experts;
+    const uint32_t W = (E + 31u) / 32u * 32u;
+    uint32_t k;
+    if (E > W) { /* the sigmoid router's width (htp_graph_desc.h) */
+      return AEE_ESCHEMENOTSUPPORTED;
+    }
+    if (g->ops[op].eps_bits != 0u) {
+      /** Construct before replacing: a failed allocation leaves the old
+         router valid. The owned header and payload share one free. */
+      hvx_router_sm_weights *packed = hvx_router_sm_weights_create(data, K, E);
+      if (packed == NULL) {
+        return AEE_ENOMEMORY;
+      }
+      free(*dst);
+      *dst = (float *)packed;
+      return AEE_SUCCESS;
+    }
+    if (*dst == NULL || g->router_wh[op]) {
+      float *replacement =
+        (float *)memalign(128, (size_t)K * W * sizeof(float));
+      if (replacement == NULL) {
+        return AEE_ENOMEMORY;
+      }
+      free(*dst);
+      *dst = replacement;
+    }
+    g->router_wh[op] = 0u;
+    memset(*dst, 0, (size_t)K * W * sizeof(float));
+    for (k = 0; k < K; ++k) {
+      memcpy(*dst + (size_t)k * W, data + (size_t)k * E,
+             (size_t)E * sizeof(float));
+    }
+    return AEE_SUCCESS;
+  }
+  if (*dst == NULL) {
+    *dst = (float *)calloc(alloc, sizeof(float));
+    if (*dst == NULL) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  memcpy(*dst, data, (size_t)n * sizeof(float));
+  return AEE_SUCCESS;
+}
+
+int hexkl_graph_pool_set(hexkl_graph *g, uint32_t op, uint32_t e, uint32_t h_gu,
+                         uint32_t h_dn) {
+  const htp_graph_op *o;
+  if (g == NULL || op >= g->n_ops || g->ops[op].kind != HTP_OP_MOE ||
+      e >= g->ops[op].n_experts) {
+    return AEE_EBADITEM;
+  }
+  if (g->experts[op] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  o = &g->ops[op];
+  if ((h_gu == HTP_GRAPH_NO_HANDLE) != (h_dn == HTP_GRAPH_NO_HANDLE) ||
+      (h_gu != HTP_GRAPH_NO_HANDLE &&
+       (graph_check_handle(g->tbl, h_gu, o->K, 2u * o->N) != AEE_SUCCESS ||
+        graph_check_handle(g->tbl, h_dn, o->N, o->N_out) != AEE_SUCCESS))) {
+    return AEE_EINVHANDLE;
+  }
+  g->experts[op][e] = h_gu;
+  g->experts[op][o->n_experts + e] = h_dn;
+  return AEE_SUCCESS;
+}
+
+int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
+  uint32_t i, e;
+  if (g == NULL) {
+    return 0;
+  }
+  for (i = 0; i < g->n_ops; ++i) {
+    const htp_graph_op *op = &g->ops[i];
+    if (op->resident && (op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+      /* [#225] an FC's parts, a DENSE_FFN's chunk pairs */
+      for (e = 0; e < op->n_experts; ++e) {
+        if (op->h_gu[e] == handle ||
+            (op->kind == HTP_OP_DENSE_FFN && op->h_dn[e] == handle)) {
+          return 1;
+        }
+      }
+    }
+    if (g->experts[i] == NULL) {
+      continue;
+    }
+    for (e = 0; e < 2u * g->ops[i].n_experts; ++e) {
+      if (g->experts[i][e] == handle) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle) {
+  uint32_t i, p;
+  if (g == NULL) {
+    return 0;
+  }
+  for (i = 0; i < g->n_ops; ++i) {
+    const htp_graph_op *op = &g->ops[i];
+    if (!op->resident ||
+        (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u ||
+        (op->feed & HTP_GRAPH_FEED_WH) != 0u) {
+      continue;
+    }
+    if (op->kind == HTP_OP_DENSE_FFN) { /* up, gate, down */
+      if (op->h_gu[0] == handle || op->h_gu[1] == handle ||
+          op->h_dn[0] == handle) {
+        return 1;
+      }
+      continue;
+    }
+    for (p = 0; p < op->n_experts; ++p) {
+      if (op->h_gu[p] == handle) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
+                        uint32_t start_op, uint32_t n_ops_limit, uint32_t pos,
+                        const hexkl_graph_routing *routing, const float *act_in,
+                        uint32_t act_in_len, float *act_out,
+                        uint32_t act_out_len, uint32_t *resume_at) {
+  graph_call call;
+  uint32_t i, n_run = 0;
+  const htp_graph_op *last = NULL;
+  if (g == NULL || env == NULL || resume_at == NULL) {
+    return AEE_EBADSTATE;
+  }
+  const int timed = !NNTR_GRAPH_PROFILE_ON_DEMAND || g->attn_prof_on != 0u ||
+                    env->miss.post == NULL;
+  /** Also clear after a profiled token: disabled, skipped and failed ops
+     must never report the previous forward's measurements. */
+  memset(g->op_pcycles, 0, sizeof(g->op_pcycles));
+  memset(g->op_qt, 0, sizeof(g->op_qt));
+  if (start_op >= g->n_ops || pos >= g->max_seq) {
+    return AEE_EBADITEM;
+  }
+  if (act_in == NULL ||
+      act_in_len != htp_graph_op_in_words(&g->ops[start_op])) {
+    return AEE_EINVALIDFORMAT;
+  }
+  /** Which op will be the last one run is known before anything runs, so
+     act_out is checked now rather than after the work was done. */
+  for (i = start_op; i < g->n_ops && n_run < n_ops_limit && g->ops[i].resident;
+       ++i, ++n_run) {
+    last = &g->ops[i];
+  }
+  if (last != NULL &&
+      (act_out == NULL || act_out_len != htp_graph_op_out_words(last))) {
+    return AEE_EINVALIDFORMAT;
+  }
+  last = NULL;
+  n_run = 0;
+  call.env = env;
+  call.pos = pos;
+  call.end_op =
+    n_ops_limit >= g->n_ops - start_op ? g->n_ops : start_op + n_ops_limit;
+  memset(call.norm, 0, sizeof(call.norm));
+  g->early_from = g->early_to = 0u;
+  if (routing != NULL) {
+    call.routing = *routing;
+  } else {
+    memset(&call.routing, 0, sizeof(call.routing));
+  }
+  for (i = start_op; i < g->n_ops && n_run < n_ops_limit; ++i) {
+    const htp_graph_op *op = &g->ops[i];
+    const graph_kernel k = kernels[op->kind];
+    float *in, *out;
+    uint64_t t0, n0;
+    int rc;
+    if (!op->resident) {
+      break;
+    }
+    if (k == NULL) {
+      return AEE_ECLASSNOTSUPPORT;
+    }
+    in = g->slots + (size_t)op->in_slot * g->slot_words;
+    out = g->slots + (size_t)op->out_slot * g->slot_words;
+    if (n_run == 0u) {
+      memcpy(in, act_in, (size_t)act_in_len * sizeof(float));
+    }
+    n0 = timed ? graph_now_qt() : 0u;
+    t0 = timed ? HAP_perf_get_pcycles() : 0u;
+    /** Even a partial slot write invalidates its previous scale. Clearing
+       before dispatch also covers in-place operators and skipped early
+       ops; a resumed forward starts with an entirely empty cache. */
+    call.norm[op->out_slot].width = 0u;
+    if (g->early_to != 0u && i >= g->early_from) {
+      /* [#289] run in the miss round: its result, at the branch's last op */
+      if (i == g->early_to) {
+        memcpy(out, g->early,
+               (size_t)htp_graph_op_out_words(op) * sizeof(float));
+        g->early_from = g->early_to = 0u;
+      }
+      rc = AEE_SUCCESS;
+    } else {
+      rc = k(g, op, &call, in, out);
+    }
+    if (timed) {
+      g->op_pcycles[i] = HAP_perf_get_pcycles() - t0;
+      g->op_qt[i] = (uint32_t)(graph_now_qt() - n0);
+    }
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    last = op;
+    ++n_run;
+  }
+  *resume_at = i;
+  if (last != NULL) {
+    if (act_out == NULL || act_out_len != htp_graph_op_out_words(last)) {
+      return AEE_EINVALIDFORMAT;
+    }
+    const float *src = last->kind == HTP_OP_LM_HEAD
+                         ? g->logits
+                         : g->slots + (size_t)last->out_slot * g->slot_words;
+    /* the token driver may hand the logits buffer itself (hexkl_token.c) */
+    if (src != act_out) {
+      memcpy(act_out, src, (size_t)act_out_len * sizeof(float));
+    }
+  }
+  return AEE_SUCCESS;
+}

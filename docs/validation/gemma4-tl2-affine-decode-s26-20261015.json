@@ -1,0 +1,248 @@
+{
+  "date": "2026-10-15",
+  "upstream_pr": 4428,
+  "base_commit": "62fdb7145760e37b4f58e54c38b10d77af26993e",
+  "status": "Affine FFN decode works through the DSP queue; 700 TPS prefill target remains unmet.",
+  "device": {
+    "serial": "R3CY70LV96T",
+    "model": "SM-S948U",
+    "dsp_arch": "v81"
+  },
+  "model": {
+    "sha256": "c7e978a68c026b9bd54f7e84594701fe63dd3be5b4a62348d2a6afc3a9b9514b",
+    "expert_dtype": "TL2CX_WH",
+    "fc_dtype": "QS4CX_WH_AFFINE",
+    "head_dtype": "QS4CX_WH_AFFINE",
+    "embedding_dtype": "Q4_0",
+    "repacked_or_requantized": false
+  },
+  "prompt": {
+    "file": "docs/validation/gemma4-tl2-prefill-p2048.txt",
+    "bytes": 9960,
+    "sha256": "9af6c70fa776dbfc2c813c08a43dcced97da63ffeeafeac3eae7f794a12ea4a5",
+    "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "token_count_verified_by": [
+      "tokenizers 0.23.3",
+      "CausalLM API performance metrics"
+    ]
+  },
+  "conditions": {
+    "init_seq_len": 2048,
+    "max_seq_len": 2304,
+    "moe_cache_experts": 16,
+    "skip_prefill": false,
+    "num_to_generate": 128,
+    "attention_kv_dtype": "q8",
+    "use_chat_template": false,
+    "input_tokens": 2048
+  },
+  "environment": {
+    "NNTR_NUM_THREADS": "8",
+    "NNTR_HTP_PAGE_CACHE": "0",
+    "NNTR_MOE_CACHE_GROW": "0"
+  },
+  "page_cache_off_scope": "Expert miss reads use O_DIRECT.",
+  "command": "LD_LIBRARY_PATH=\"$RUNTIME\" ADSP_LIBRARY_PATH=\"$RUNTIME\" NNTR_NUM_THREADS=8 NNTR_HTP_PAGE_CACHE=0 NNTR_MOE_CACHE_GROW=0 NNTR_GENERATED_IDS=\"$IDS\" ./nntr_causallm \"$MODEL\"",
+  "fix": {
+    "failure": "The first decode faults in hexkl_micro_hmx_acc_clear_int32 on nntr_dspq after affine weights exclude the M=1 GEMV path. The host subsequently reports S1 did not rebind a pool load.",
+    "implementation": "Apply exact affine row-sum correction to gate, up and down GEMV accumulators before dequantization and allow affine weights on the existing M<=4 GEMV path. Keep affine large-row HVX tails disabled."
+  },
+  "final_run": {
+    "profile": "NNTR_HTP_PROFILE and NNTR_LAYER_PROFILE unset",
+    "log": "gemma4-tl2-affine-decode-s26-20261015.log",
+    "log_sha256": "0c4af278d77034a652a628085beb505ba2bf38823c8ab5d343839c891ad7a34d",
+    "prefill_tokens": 2048,
+    "prefill_ms": 3296,
+    "prefill_tps": 621.359,
+    "generation_tokens": 101,
+    "generation_ms": 8637,
+    "generation_tps": 11.6939,
+    "skel_sha256": "873c3b5d9bc1e774b7cc67d9975dd2c4d6f7048f3565ce236774efb41e733915",
+    "raw_log_sha256": "ef8e494deafa1ca9f5fdb65abc8137e92ce108fdcc8fae685463c65e19c87e5c",
+    "log_note": "Repository copy removes one trailing space from the e2e timing line to pass whitespace CI; generated text and all measurements are unchanged. Raw log retained at /tmp/pr4428-tl2-700-20261015/affine-final-decode.log."
+  },
+  "earlier_profiled_decode": {
+    "profile": "NNTR_HTP_PROFILE=1",
+    "prefill_tokens": 2048,
+    "prefill_ms": 3693,
+    "prefill_tps": 554.563,
+    "generation_tokens": 101,
+    "generation_ms": 8625,
+    "generation_tps": 11.7101,
+    "log_sha256": "8482f24d05c40d5618c8a2ad7f2bfb941321331c0c8058e76eb31a357a2a6620",
+    "skel_sha256": "689acefcedd6198f09a88e5b32f893615db1352ec28592d22a94579d52e8295f"
+  },
+  "output": {
+    "token_ids": [
+      818,
+      1944,
+      53676,
+      5148,
+      529,
+      84056,
+      2624,
+      563,
+      496,
+      25260,
+      3399,
+      5221,
+      684,
+      1061,
+      13763,
+      532,
+      24949,
+      23060,
+      236764,
+      1298,
+      506,
+      10465,
+      3892,
+      684,
+      506,
+      38268,
+      532,
+      506,
+      9199,
+      7606,
+      236761,
+      669,
+      5148,
+      236789,
+      236751,
+      4083,
+      14069,
+      1063,
+      531,
+      506,
+      102778,
+      7691,
+      236764,
+      532,
+      625,
+      815,
+      28404,
+      699,
+      496,
+      1944,
+      19960,
+      1131,
+      496,
+      31044,
+      3399,
+      607,
+      496,
+      10810,
+      15659,
+      236764,
+      496,
+      2528,
+      236764,
+      532,
+      496,
+      12763,
+      24564,
+      219943,
+      6410,
+      236761,
+      669,
+      1331,
+      659,
+      3224,
+      573,
+      910,
+      14512,
+      4135,
+      532,
+      3107,
+      23948,
+      1534,
+      506,
+      5442,
+      532,
+      2601,
+      236764,
+      41346,
+      6672,
+      10154,
+      607,
+      4532,
+      18783,
+      531,
+      5330,
+      496,
+      13726,
+      532,
+      67836,
+      3402,
+      236761,
+      106
+    ],
+    "token_ids_ascii_sha256": "6e6ac3677d2f11bfc6b40d7c271d031e1e831427fe6ab29da00a574801e24d60",
+    "same_ids_in_both_runs": true,
+    "first_prefill_id": 818,
+    "decode_forward_count": 101,
+    "raw_generated_text": " small harbour town of Ardley is a coastal community defined by its fishing and farming heritage, where the residents live by the tide and the changing weather. The town's history dates back to the twelfth century, and it has evolved from a small settlement into a structured community with a stone pier, a school, and a vital volunteer lifeboat station. The people are known for their reserved nature and close ties between the sea and land, balancing traditional practices with modern developments to ensure a sustainable and prosperous future.<turn|>",
+    "assessment": "Three coherent sentences summarize fishing/farming, history, lifeboat and community. This is a single-prompt smoke test, not PPL or a general quality benchmark. The raw CLI text starts with a space; the saved token IDs also include prefill ID 818, which the CLI does not print in its decode stream."
+  },
+  "validation": {
+    "dsp_builds": {
+      "v79_sha256": "be44d1b87bd07c96cc03317dd54d175308c1c624ad41f38fb6e21bc7ff5f1382",
+      "v81_sha256": "873c3b5d9bc1e774b7cc67d9975dd2c4d6f7048f3565ce236774efb41e733915"
+    },
+    "device_affine_flags": [
+      "0x0",
+      "0x21",
+      "0xcf03e1"
+    ],
+    "device_affine_moe_rows": [
+      1,
+      2,
+      3,
+      4,
+      64,
+      65,
+      129
+    ],
+    "device_affine_moe_shapes": [
+      [
+        96,
+        192,
+        128
+      ],
+      [
+        2816,
+        704,
+        2816
+      ]
+    ],
+    "device_affine_repetitions": 3,
+    "device_result": "All outputs bit-identical to independently packed int4; FC and last-row LM head checks also pass.",
+    "host_affine_result": "M=1/2/3/4 GEMV with feed off/on, zero/three workers equals independent HMX reference; assert GEMV path is selected. Existing large-row and FC checks pass.",
+    "affine_asan_ubsan": "passed",
+    "host_suite": {
+      "command": "CC=gcc bash test/htp/host/run_host_checks.sh",
+      "exit_code": 0,
+      "optional_skips": [
+        "libnative library unavailable",
+        "AArch64 g++ or qemu-aarch64 unavailable"
+      ],
+      "log_sha256": "75f96f6c57f9c11a3f47c5e33da7f50a0c2ee3dfd29dedff458198be9d9dc0e6"
+    },
+    "affine_device_log_sha256": "a893b214efc1aaf6033a7473c206700ca52c573bd3a10dec672af52e61026c74"
+  },
+  "performance_limit": "Final full-generation run is 621.359 prefill TPS. The previous five-run prefill-only median was 641.805 TPS on the earlier commit; do not combine the measurements. No new prefill speedup or 700 TPS claim.",
+  "uncommitted_experiment": {
+    "description": "Router cached scratch experiment saved outside the repository, excluded from this commit.",
+    "profile1_before": {
+      "prefill_ms": 3293,
+      "tps": 621.925,
+      "router_ms": 271.2
+    },
+    "profile1_after": {
+      "prefill_ms": 3299,
+      "tps": 620.794,
+      "router_ms": 267.0
+    },
+    "conclusion": "One pair did not establish an end-to-end speed improvement."
+  }
+}
