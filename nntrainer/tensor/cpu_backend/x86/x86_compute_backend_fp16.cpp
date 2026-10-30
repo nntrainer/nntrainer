@@ -293,6 +293,13 @@ void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
   __fallback_compute_rotary_embedding_value(dim, half_, w, in, out, cos_, sin_);
 }
 
+void compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                              unsigned int half_, _FP16 *inout, _FP16 *output,
+                              const _FP16 *cos_, const _FP16 *sin_) {
+  __fallback_compute_rotary_emb_value(width, dim, half_, inout, output, cos_,
+                                      sin_);
+}
+
 void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   __fallback_swiglu(N, X, Y, Z);
 }

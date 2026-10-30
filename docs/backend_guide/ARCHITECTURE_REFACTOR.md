@@ -319,9 +319,11 @@ A **KEEP** layer is not exempt from the collapse rule: it stays application-side
 dispatches through the op table rather than carrying its own backend fork.
 
 **Interim rule, enforceable before the virtuals land.** A whole-op virtual does not yet exist for
-every operation (`rmsnorm`, `rope` and `attention` are absent from
-`nntrainer/tensor/cpu_backend/compute_ops.h`), so a full collapse is blocked for those. Until the
-virtual lands, new accelerator work on such an operation must:
+every operation (`rmsnorm` and `attention` are absent from
+`nntrainer/tensor/cpu_backend/compute_ops.h`; `rope` has `rotary_embedding` and the KV-cache
+write has `kv_cache_write`, but their device arms are not behind them yet), so a full collapse is
+blocked for those. Until the virtual lands, new
+accelerator work on such an operation must:
 
 - **not** add a per-backend `Layer` subclass beyond the fork that already exists for it, and
 - keep the whole-op body in a single whole-`Tensor` helper called **once** from `forwarding()`,
@@ -588,9 +590,13 @@ replacement, not by writing code that assumes the other branch.
 Stated so that a reader is not surprised, and so a reviewer can check a change against them. These
 are gaps in the code relative to the rules above; they are not a schedule.
 
-- **No whole-op virtual for `rmsnorm`, `rope` or `attention`.** They are absent from
+- **No whole-op virtual for `rmsnorm` or `attention`.** They are absent from
   `nntrainer/tensor/cpu_backend/compute_ops.h`, so §4's collapse is blocked for those operations
-  and §4's interim rule applies instead.
+  and §4's interim rule applies instead. `rope` has one, `rotary_embedding`, and `mha_core`'s host
+  RoPE (FP32 and FP16 input) dispatches through it. The KV-cache write has one too,
+  `kv_cache_write` (fp16 concat cache, `KVCacheView`), and `mha_core`'s host K/V write goes
+  through it. The OpenCL and CUDA device arms of both, the OHWI and int8 cache layouts, and
+  attention itself are still selected inside `mha_core.cpp` (#4451).
 - **Allocator-name string comparisons remain** in `nntrainer/tensor/memory_pool.cpp` (`"qnn"`)
   and `Applications/CausalLM/kv_cache_manager.cpp` (`"gpu-svm"`) — see §3.
 - **There is no public layer-author API.** `ml::train::Layer`

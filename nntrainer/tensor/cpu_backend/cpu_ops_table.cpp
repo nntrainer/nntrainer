@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 #include <acti_func.h>
+#include <fp16.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -375,6 +376,138 @@ void CpuComputeOps::l2_normalize_rows(const Tensor &in, Tensor &out,
   if (out.getData<uint8_t>() != in.getData<uint8_t>())
     out.copyData(in);
   out.normalization_i(3, 2.0f, epsilon);
+}
+
+void CpuComputeOps::rotary_embedding(const Tensor &in, Tensor &out,
+                                     unsigned int head_dim,
+                                     const RotaryTable &table,
+                                     unsigned int start_pos, bool rotate) {
+  using DataType = ml::train::TensorDim::DataType;
+  const unsigned int half = head_dim / 2;
+  if (head_dim == 0 || head_dim % 2 != 0 || in.width() % head_dim != 0)
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: head_dim must be even, non-zero and "
+      "divide the row width");
+  if (out.width() != in.width() || out.size() < in.size())
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: out must hold every row of in");
+  if (rotate &&
+      (table.half != half || start_pos + in.height() > table.positions))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: position or head_dim outside the "
+      "table");
+
+  const unsigned int W = in.width();
+  const unsigned int rows = in.batch() * in.channel() * in.height();
+
+  if (in.getDataType() == DataType::FP16) {
+#ifdef ENABLE_FP16
+    if (out.getDataType() != DataType::FP16 || !rotate ||
+        table.cos_fp16 == nullptr || table.sin_fp16 == nullptr)
+      throw std::invalid_argument(
+        "CpuComputeOps::rotary_embedding: an FP16 input rotates into an FP16 "
+        "output with the fp16 table");
+    const _FP16 *cos16 = reinterpret_cast<const _FP16 *>(table.cos_fp16);
+    const _FP16 *sin16 = reinterpret_cast<const _FP16 *>(table.sin_fp16);
+    for (unsigned int r = 0; r < rows; ++r) {
+      const size_t pos = start_pos + r % in.height();
+      compute_rotary_emb_value(W, head_dim, half,
+                               in.getData<_FP16>() + (size_t)r * W,
+                               out.getData<_FP16>() + (size_t)r * W,
+                               cos16 + pos * half, sin16 + pos * half);
+    }
+    return;
+#else
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: FP16 input needs enable-fp16");
+#endif
+  }
+
+  const bool out_fp16 = out.getDataType() == DataType::FP16 ||
+                        out.getDataType() == DataType::UINT16;
+  if (in.getDataType() != DataType::FP32 ||
+      (!out_fp16 && out.getDataType() != DataType::FP32))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: FP32 input to FP32 / FP16 / UINT16 "
+      "output, or FP16 input to FP16 output");
+  if (rotate && (table.cos == nullptr || table.sin == nullptr))
+    throw std::invalid_argument(
+      "CpuComputeOps::rotary_embedding: an FP32 input rotates with the fp32 "
+      "table");
+
+  for (unsigned int r = 0; r < rows; ++r) {
+    const size_t pos = start_pos + r % in.height();
+    const float *cos_row = rotate ? table.cos + pos * half : nullptr;
+    const float *sin_row = rotate ? table.sin + pos * half : nullptr;
+    float *in_row = in.getData<float>() + (size_t)r * W;
+
+    if (out_fp16) {
+      // Rotate (or only convert) straight into the fp16 bits of out.
+      uint16_t *out_row = out.getData<uint16_t>() + (size_t)r * W;
+      compute_rotary_emb_value(W, head_dim, half, in_row, out_row, cos_row,
+                               sin_row, !rotate);
+      continue;
+    }
+
+    float *out_row = out.getData<float>() + (size_t)r * W;
+    if (out_row != in_row)
+      std::memcpy(out_row, in_row, sizeof(float) * W);
+    if (rotate)
+      compute_rotary_emb_value(W, head_dim, half, out_row, nullptr, cos_row,
+                               sin_row, false);
+  }
+}
+
+void CpuComputeOps::kv_cache_write(const Tensor &k, const Tensor &v,
+                                   const KVCacheView &kv, unsigned int pos,
+                                   const RotaryTable *rope) {
+  const unsigned int rows = k.height();
+  if (v.height() != rows)
+    throw std::invalid_argument(
+      "CpuComputeOps::kv_cache_write: k and v must hold the same rows");
+
+  auto write_plane = [&](const Tensor &in, Tensor *cache,
+                         const RotaryTable *table) {
+    if (cache == nullptr)
+      return;
+    const unsigned int width = cache->width();
+    if (in.width() != width || in.size() != (size_t)rows * width)
+      throw std::invalid_argument(
+        "CpuComputeOps::kv_cache_write: a step row must be one cache row");
+    const unsigned int cap = kv.ring_cap ? kv.ring_cap : cache->height();
+    const unsigned int row = kv.ring_cap ? pos % kv.ring_cap : pos;
+    if (cap > cache->height() || row + rows > cap)
+      throw std::invalid_argument(
+        "CpuComputeOps::kv_cache_write: the rows do not fit the cache (past "
+        "its last row, or across the ring seam)");
+
+    TensorDim slice_dim = cache->getDim();
+    slice_dim.batch(1);
+    slice_dim.channel(1);
+    slice_dim.height(rows);
+    Tensor slice =
+      cache->getSharedDataTensor(slice_dim, (size_t)row * width, true);
+    using DataType = ml::train::TensorDim::DataType;
+    const bool to_fp16 = in.getDataType() == DataType::FP32 &&
+                         (slice.getDataType() == DataType::FP16 ||
+                          slice.getDataType() == DataType::UINT16);
+    if (table != nullptr) {
+      rotary_embedding(in, slice, kv.head_dim, *table, pos, true);
+    } else if (to_fp16 && kv.head_dim % 2 == 0) {
+      rotary_embedding(in, slice, kv.head_dim, RotaryTable{}, pos, false);
+    } else if (to_fp16) {
+      // rotary_embedding pairs element i of a head with i + head_dim / 2, so
+      // it cannot convert odd-sized heads; convert element by element.
+      const float *src = in.getData<float>();
+      uint16_t *dst = slice.getData<uint16_t>();
+      for (size_t i = 0; i < in.size(); ++i)
+        dst[i] = compute_fp32_to_fp16(src[i]);
+    } else {
+      slice.copyData(in);
+    }
+  };
+  write_plane(k, kv.key, rope);
+  write_plane(v, kv.value, nullptr);
 }
 
 } // namespace nntrainer

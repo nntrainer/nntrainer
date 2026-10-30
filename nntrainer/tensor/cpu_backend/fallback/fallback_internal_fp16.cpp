@@ -211,6 +211,25 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
   }
 }
 
+void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                                         unsigned int half_, _FP16 *inout,
+                                         _FP16 *output, const _FP16 *cos_,
+                                         const _FP16 *sin_) {
+  // Same pairing as the NEON kernel; the products are taken in fp32 and
+  // rounded once, where NEON rounds each fp16 product.
+  _FP16 *dst = output != nullptr ? output : inout;
+  for (unsigned int w = 0; w < width; w += dim) {
+    for (unsigned int k = 0; k < half_; ++k) {
+      const float a = static_cast<float>(inout[w + k]);
+      const float b = static_cast<float>(inout[w + k + half_]);
+      const float c = static_cast<float>(cos_[k]);
+      const float s = static_cast<float>(sin_[k]);
+      dst[w + k] = static_cast<_FP16>(a * c - b * s);
+      dst[w + k + half_] = static_cast<_FP16>(a * s + b * c);
+    }
+  }
+}
+
 void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   unsigned int i = 0;
   while (i < N) {

@@ -210,18 +210,18 @@ private:
   defined(ENABLE_FP16)
 #include <climits>
 // libnntrainer builds the all-FP16 CPU attention kernels (compute_kcaches /
-// compute_fp16vcache_transposed / compute_rotary_emb_value with _FP16 I/O, and
-// the softmax_row[_inplace] _FP16 instantiations) only for ARM/NEON
-// (neon_impl_fp16.cpp); the x86 backend has only the FP32/templated variants.
-// This layer's FP16 CPU attention path references the all-FP16 versions, so on
-// x86 they are undefined.
+// compute_fp16vcache_transposed with _FP16 I/O, and the softmax_row[_inplace]
+// _FP16 instantiations) only for ARM/NEON (neon_impl_fp16.cpp); the x86 backend
+// has only the FP32/templated variants. This layer's FP16 CPU attention path
+// references the all-FP16 versions, so on x86 they are undefined. (The FP16
+// compute_rotary_emb_value is in every backend, and the layer reaches it
+// through ComputeOps::rotary_embedding.)
 //
 // nntrainer activations can be FP16 independently of the weight type (the
 // model dtype is Weight-Activation, e.g. QINT4-FP16), so the FP16 CPU path IS
-// reachable on x86 — notably RoPE, which the mha layer applies on the host even
-// when attention runs on the GPU. Provide real x86 implementations (scalar,
-// FP32 accumulation — matching the GPU's FP32-accumulate numerics) so x86+FP16
-// works end to end. This block is x86-only; ARM keeps its NEON kernels.
+// reachable on x86. Provide real x86 implementations (scalar, FP32
+// accumulation — matching the GPU's FP32-accumulate numerics) so x86+FP16 works
+// end to end. This block is x86-only; ARM keeps its NEON kernels.
 namespace nntrainer {
 
 // O[row] scores = scale * (Q · K), per (kv-head n, gqa group g, key row).
@@ -289,28 +289,6 @@ void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
       const float *acc_h = acc.data() + (size_t)h * head_dim;
       for (int d = 0; d < head_dim; ++d)
         out_h[d] = (_FP16)acc_h[d];
-    }
-  }
-}
-
-// RoPE: rotate (a,b) pairs across the half_ boundary by (cos,sin). Mirrors the
-// all-FP16 neon_impl_fp16.cpp compute_rotary_emb_value.
-void compute_rotary_emb_value(unsigned int width, unsigned int dim,
-                              unsigned int half_, _FP16 *inout, _FP16 *output,
-                              const _FP16 *cos_, const _FP16 *sin_) {
-  for (unsigned int w = 0; w < width; w += dim) {
-    for (unsigned int k = 0; k < half_; ++k) {
-      const unsigned int i0 = w + k, i1 = w + k + half_;
-      const float a = (float)inout[i0], b = (float)inout[i1];
-      const float c = (float)cos_[k], s = (float)sin_[k];
-      const float o0 = a * c - b * s, o1 = a * s + b * c;
-      if (output != nullptr) {
-        output[i0] = (_FP16)o0;
-        output[i1] = (_FP16)o1;
-      } else {
-        inout[i0] = (_FP16)o0;
-        inout[i1] = (_FP16)o1;
-      }
     }
   }
 }
@@ -1250,44 +1228,18 @@ unsigned int MHACoreLayer::rope_lut_positions() const {
 }
 
 void MHACoreLayer::ensure_rope_flat_lut() {
-  const unsigned int half_ = head_dim / 2;
-  const unsigned int mp = rope_lut_positions();
-  const RopeFlatKey key{(int)head_dim, theta, mp};
-
-  // The cache is process-wide static and shared by every layer instance; guard
-  // both the lookup and the build under rope_init_mtx (the flatten was already
-  // run single-threaded at finalize, but the GPU-RoPE fallback can re-enter
-  // from the forward path, and a per-slot insert must not race a concurrent
-  // slot's insert -- std::map node stability protects EXISTING entries' data()
-  // pointers across inserts, but the insert itself must be serialized).
-  std::lock_guard<std::mutex> lock(rope_init_mtx);
-
-  auto it = rope_flat_cache.find(key);
-  if (it != rope_flat_cache.end()) {
-    // Existing slot: just repoint the current-slot pointers. Stable across
-    // calls (std::map nodes never move) so the GPU upload stays cached.
-    rope_cos_flat_cur = it->second.first.data();
-    rope_sin_flat_cur = it->second.second.data();
+  if (rope_cos_flat_cur != nullptr)
     return;
-  }
-
-  // New slot: build the flat table (math identical to the previous path).
+  // rope_freq_cache is process-wide and shared by every layer instance; the
+  // lookup and the build run under rope_init_mtx.
+  const std::lock_guard<std::mutex> lock(rope_init_mtx);
+  const unsigned int mp = rope_lut_positions();
   precompute_freqs((int)head_dim, mp, theta, true);
-  RopeFlatVal val;
-  val.first.assign((size_t)mp * half_, 0);
-  val.second.assign((size_t)mp * half_, 0);
-  // Row-wise bulk copy (rows are contiguous _FP16 = 2 bytes, same as the
-  // uint16 bit view): the old per-element memcpy pair was ~12ms for
-  // [2048 x 128].
-  for (unsigned int p = 0; p < mp; ++p) {
-    std::memcpy(&val.first[(size_t)p * half_], (*freqs_cos_fp16)[p].data(),
-                (size_t)half_ * sizeof(uint16_t));
-    std::memcpy(&val.second[(size_t)p * half_], (*freqs_sin_fp16)[p].data(),
-                (size_t)half_ * sizeof(uint16_t));
-  }
-  auto ins = rope_flat_cache.emplace(key, std::move(val));
-  rope_cos_flat_cur = ins.first->second.first.data();
-  rope_sin_flat_cur = ins.first->second.second.data();
+  rope_cos_flat_cur =
+    reinterpret_cast<const uint16_t *>(freqs_cos_fp16_flat->data());
+  rope_sin_flat_cur =
+    reinterpret_cast<const uint16_t *>(freqs_sin_fp16_flat->data());
+  rope_flat_positions = mp;
 }
 #endif
 
@@ -2327,18 +2279,18 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         device_addressable(query_step) && device_addressable(key_step)) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
-      // table. Built once (cached by theta/head_dim/max_pos) so the GPU RoPE
+      // table. Built once (cached by every RoPE parameter) so the GPU RoPE
       // path has no per-call flatten; rope_inplace_f16_cl uploads it once.
       const unsigned int mp = rope_lut_positions();
       if (mp >= cache_index + (to - from)) {
         ensure_rope_flat_lut();
         const double _mha_t_lut = _kvst_on() ? _kvst_now() : 0;
-        // Current-slot stable pointers (per-(head_dim, theta, max_pos) cache):
-        // for Gemma4 the two attention slots each keep their own resident
-        // table, so the sliding<->full transition no longer rebuilds +
-        // re-uploads the shared LUT every layer. The pointers are
-        // std::map-node-stable, which keeps the rope_inplace_f16_cl device-LUT
-        // upload cached per slot.
+        // Current-slot stable pointers (one table per RoPE configuration): for
+        // Gemma4 the two attention slots each keep their own resident table,
+        // so the sliding<->full transition no longer rebuilds + re-uploads the
+        // shared LUT every layer. The pointers are rope_freq_cache-node-stable,
+        // which keeps the rope_inplace_f16_cl device-LUT upload cached per
+        // slot.
         const uint16_t *cos_lut = rope_cos_flat_cur;
         const uint16_t *sin_lut = rope_sin_flat_cur;
         uint16_t *q_p =
@@ -3019,6 +2971,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         is_kv_ohwi_enabled() && !kv_int8 &&
         key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
+      // Whether K still has to be written on the host, after the OHWI scatter
+      // or a device arm below.
+      bool k_on_host = false;
       if (kv_ohwi_active) {
 #ifdef ENABLE_FP16
         apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
@@ -3082,34 +3037,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
 #endif
-        if (!k_rope_gpu) {
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-#if defined(ENABLE_FP16)
-          NNTR_THROW_IF(
-            b_cache_key_step.getMemoryData() &&
-              !b_cache_key_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
-               "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
-               "range miss at cache_index="
-            << cache_index << ")";
-#endif
-#endif
-          apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                     cache_index, true);
-        }
+        k_on_host = !k_rope_gpu;
       }
 
-      // append vcache without rotary embedding
-      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                                   cache_index, false);
-      } else if (query_step.getDataType() ==
-                 ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
+      // V has no RoPE. On the cuda engine an FP16 V may be copied into its
+      // cache slice on the device; otherwise it is written on the host below.
+      bool v_on_host = true;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
         bool v_copy_gpu = false;
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
         {
           static const bool cuda_elt = nntr_env_on("NNTR_CUDA_ROPE");
           // V-copy historically stayed host for the prefill big-step (height>1)
@@ -3156,22 +3092,34 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
           }
         }
+        v_on_host = !v_copy_gpu;
+      }
 #endif
-        if (!v_copy_gpu) {
+
+      // The host writes the planes no device arm took: K rotated, V as is.
+      if (k_on_host || v_on_host) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-          NNTR_THROW_IF(
+        nntrainer::cuda::drain_if_async();
+#if defined(ENABLE_FP16)
+        NNTR_THROW_IF(k_on_host && b_cache_key_step.getMemoryData() &&
+                        !b_cache_key_step.getMemoryData()->isHostAddressable(),
+                      std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
+             "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
+             "range miss at cache_index="
+          << cache_index << ")";
+        NNTR_THROW_IF(
+          v_on_host &&
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
             b_cache_value_step.getMemoryData() &&
-              !b_cache_value_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
-               "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
+            !b_cache_value_step.getMemoryData()->isHostAddressable(),
+          std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
+             "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
-          b_cache_value_step.copyData(value_step);
-        }
-#else
-        NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+        write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                       cache_index, k_on_host, v_on_host, /*rotate_key=*/true);
       }
     }
   } else {
@@ -3192,10 +3140,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       NNTR_THROW_IF(true, std::invalid_argument)
         << "NNTR_KV_OHWI requires ENABLE_FP16";
 #endif
-    } else {
-      b_cache_key_step.copyData(key_step);
     }
-    b_cache_value_step.copyData(value_step);
+    write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                   cache_index,
+                   /*write_key=*/!kv_ohwi_active, /*write_value=*/true,
+                   /*rotate_key=*/false);
   }
 
   /// @todo replace step_size into input height
@@ -5333,30 +5282,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     << "NNTR_KV_INT8 is not supported for the sink_step (gpt-oss) variant of "
        "one_batch_incremental_forwarding";
 
-  /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-   * **/
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
-  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
-    cache_value_step_dim,
-    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
-    true);
-
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, true);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true);
-
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               false);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
+  // K rotated and V into rows [from, to). from is _from: a step past the cache
+  // end (the only case where they differ) is rejected before this.
+  write_kv_cache(batch, key_step, value_step, cache_key, cache_value, _from,
+                 /*write_key=*/true, /*write_value=*/true,
+                 /*rotate_key=*/true);
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
@@ -5411,7 +5343,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
     std::string(is_fp16 ? "fp16:" : "fp32:") + std::to_string(head_dim) + ":" +
     std::to_string(seq_len) + ":" + std::to_string(theta) + ":" +
     rope_scaling_type + ":" + std::to_string(scale) + ":" +
-    std::to_string(original_max_position_embeddings);
+    std::to_string(original_max_position_embeddings) + ":" +
+    std::to_string(rope_partial_rotary_factor);
 
   auto cache_iter = rope_freq_cache.find(cache_key);
   if (cache_iter != rope_freq_cache.end()) {
@@ -5419,6 +5352,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
 #ifdef ENABLE_FP16
       freqs_cos_fp16 = &cache_iter->second.cos_fp16;
       freqs_sin_fp16 = &cache_iter->second.sin_fp16;
+      freqs_cos_fp16_flat = &cache_iter->second.cos_fp16_flat;
+      freqs_sin_fp16_flat = &cache_iter->second.sin_fp16_flat;
 #endif
     } else {
       freqs_cos = &cache_iter->second.cos;
@@ -5457,9 +5392,13 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
   auto &cache = rope_freq_cache[cache_key];
 
   if (!is_fp16) {
-    // cos / sin
-    cache.cos.assign(seq_len, std::vector<float>(head_dim, 0));
-    cache.sin.assign(seq_len, std::vector<float>(head_dim, 0));
+    // cos / sin as [seq_len, half_] rows, the nntrainer::RotaryTable layout.
+    // calc_trigonometric_vals_dup writes a head_dim-wide row whose second half
+    // repeats the first; the rotary kernels read only the first half.
+    cache.cos.assign((size_t)seq_len * half_, 0.0f);
+    cache.sin.assign((size_t)seq_len * half_, 0.0f);
+    std::vector<float> cos_row(head_dim);
+    std::vector<float> sin_row(head_dim);
 
     // update cos / sin frequency
     for (unsigned int i = 0; i < seq_len; ++i) {
@@ -5467,9 +5406,11 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
       // cpu_backend provides calc_trigonometric_vals_dup on every arch (NEON
       // on ARM, scalar fallback elsewhere), so the app-side USE_NEON fork is
       // gone — one code path, one rounding behaviour across backends.
-      nntrainer::calc_trigonometric_vals_dup(
-        half_, thetas.data(), cache.cos[i].data(), cache.sin[i].data(), i,
-        attention_scaling);
+      nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
+                                             cos_row.data(), sin_row.data(), i,
+                                             attention_scaling);
+      std::copy_n(cos_row.data(), half_, &cache.cos[(size_t)i * half_]);
+      std::copy_n(sin_row.data(), half_, &cache.sin[(size_t)i * half_]);
     }
     freqs_cos = &cache.cos;
     freqs_sin = &cache.sin;
@@ -5480,6 +5421,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
     // cos / sin for FP16
     cache.cos_fp16.assign(seq_len, std::vector<_FP16>(head_dim, 0));
     cache.sin_fp16.assign(seq_len, std::vector<_FP16>(head_dim, 0));
+    cache.cos_fp16_flat.assign((size_t)seq_len * half_, 0);
+    cache.sin_fp16_flat.assign((size_t)seq_len * half_, 0);
 
     std::vector<float> cos_tmp(head_dim);
     std::vector<float> sin_tmp(head_dim);
@@ -5494,9 +5437,15 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
         cache.cos_fp16[i][j] = (_FP16)cos_tmp[j];
         cache.sin_fp16[i][j] = (_FP16)sin_tmp[j];
       }
+      std::copy_n(cache.cos_fp16[i].data(), half_,
+                  &cache.cos_fp16_flat[(size_t)i * half_]);
+      std::copy_n(cache.sin_fp16[i].data(), half_,
+                  &cache.sin_fp16_flat[(size_t)i * half_]);
     }
     freqs_cos_fp16 = &cache.cos_fp16;
     freqs_sin_fp16 = &cache.sin_fp16;
+    freqs_cos_fp16_flat = &cache.cos_fp16_flat;
+    freqs_sin_fp16_flat = &cache.sin_fp16_flat;
   }
 #endif
 };
@@ -5637,107 +5586,73 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool apply_rope) {
-  unsigned int half_ = dim / 2;
-  unsigned int max_timestep =
-    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  if (in.getDataType() != ml::train::TensorDim::DataType::FP32 &&
+      in.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return;
+  in.getOps()->rotary_embedding(
+    in, out, dim, rotary_table(in.getDataType(), dim), from, apply_rope);
+}
 
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, false);
-      cached_freqs_cos = freqs_cos;
-      cached_freqs_sin = freqs_sin;
-    }
-    std::vector<std::vector<float>> *freqs_cos_local = cached_freqs_cos;
-    std::vector<std::vector<float>> *freqs_sin_local = cached_freqs_sin;
-    std::vector<float> *cos_ = nullptr;
-    std::vector<float> *sin_ = nullptr;
-
-    for (unsigned int b = 0; b < in.batch(); b++) {
-      for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_local)[from + h];
-            sin_ = &(*freqs_sin_local)[from + h];
-          }
-          float *in_ptr = in.getData<float>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-
-          if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
-            float *out_ptr = out.getData<float>() +
-                             b * out.channel() * out.height() * out.width() +
-                             c * out.height() * out.width() + h * out.width();
-
-            if (out_ptr != in_ptr) {
-              std::memcpy(out_ptr, in_ptr, sizeof(float) * in.width());
-            }
-            if (apply_rope) {
-              nntrainer::compute_rotary_emb_value(
-                in.width(), dim, half_, out_ptr, nullptr, cos_->data(),
-                sin_->data(), false);
-            }
-          } else if (out.getDataType() ==
-                       ml::train::TensorDim::DataType::UINT16 ||
-                     out.getDataType() ==
-                       ml::train::TensorDim::DataType::FP16) {
-            uint16_t *out_ptr = out.getData<uint16_t>() +
-                                b * out.channel() * out.height() * out.width() +
-                                c * out.height() * out.width() +
-                                h * out.width();
-
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), !apply_rope);
-          }
-        }
-      }
-    }
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+nntrainer::RotaryTable
+MHACoreLayer::rotary_table(ml::train::TensorDim::DataType dt,
+                           unsigned int dim) {
+  nntrainer::RotaryTable table;
+  table.half = dim / 2;
+  if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    if (cached_freqs_cos_fp16 == nullptr || cached_freqs_sin_fp16 == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      // Cap to the live max sequence length (= the `from < max_timestep` bound
-      // used below), not the model's max_position_embeddings (131072 for
-      // gemma4). The host-RoPE table is indexed [from + h] with from+height <=
-      // max_timestep, so rope_lut_positions() positions suffice. Mirrors the
-      // CUDA/OpenCL GPU-RoPE paths which already cap; avoids a 128K-position
-      // trig build on any platform that falls back to host RoPE.
-      precompute_freqs(head_dim, rope_lut_positions(), theta, true);
-      cached_freqs_cos_fp16 = freqs_cos_fp16;
-      cached_freqs_sin_fp16 = freqs_sin_fp16;
-    }
-    std::vector<std::vector<_FP16>> *freqs_cos_fp16_local =
-      cached_freqs_cos_fp16;
-    std::vector<std::vector<_FP16>> *freqs_sin_fp16_local =
-      cached_freqs_sin_fp16;
-    std::vector<_FP16> *cos_ = nullptr;
-    std::vector<_FP16> *sin_ = nullptr;
-
-    for (unsigned int b = 0; b < in.batch(); b++) {
-      for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_fp16_local)[from + h];
-            sin_ = &(*freqs_sin_fp16_local)[from + h];
-          }
-          _FP16 *in_ptr = in.getData<_FP16>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-          _FP16 *out_ptr = out.getData<_FP16>() +
-                           b * out.channel() * out.height() * out.width() +
-                           c * out.height() * out.width() + h * out.width();
-
-          nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                              out_ptr, cos_->data(),
-                                              sin_->data());
-        }
-      }
-    }
+    // The same table the OpenCL RoPE uses, capped at rope_lut_positions()
+    // (the live max sequence length, not max_position_embeddings).
+    ensure_rope_flat_lut();
+    table.cos_fp16 = rope_cos_flat_cur;
+    table.sin_fp16 = rope_sin_flat_cur;
+    table.positions = rope_flat_positions;
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    return table;
   }
+  if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
+    const std::lock_guard<std::mutex> lock(rope_init_mtx);
+    precompute_freqs(head_dim, max_position_embeddings, theta, false);
+    cached_freqs_cos = freqs_cos;
+    cached_freqs_sin = freqs_sin;
+  }
+  table.cos = cached_freqs_cos->data();
+  table.sin = cached_freqs_sin->data();
+  table.positions = (unsigned int)(cached_freqs_cos->size() / table.half);
+  return table;
+}
+
+void MHACoreLayer::write_kv_cache(unsigned int batch,
+                                  nntrainer::Tensor &key_step,
+                                  nntrainer::Tensor &value_step,
+                                  nntrainer::Tensor &cache_key,
+                                  nntrainer::Tensor &cache_value,
+                                  unsigned int pos, bool write_key,
+                                  bool write_value, bool rotate_key) {
+  auto batch_plane = [batch](nntrainer::Tensor &cache) {
+    ml::train::TensorDim dim = cache.getDim();
+    dim.batch(1);
+    return cache.getSharedDataTensor(dim, batch * dim.getFeatureLen(), true);
+  };
+  nntrainer::Tensor key_plane, value_plane;
+  nntrainer::KVCacheView kv;
+  if (write_key) {
+    key_plane = batch_plane(cache_key);
+    kv.key = &key_plane;
+  }
+  if (write_value) {
+    value_plane = batch_plane(cache_value);
+    kv.value = &value_plane;
+  }
+  kv.head_dim = head_dim;
+  kv.ring_cap = kv_ring_cap;
+
+  nntrainer::RotaryTable rope;
+  if (rotate_key && write_key)
+    rope = rotary_table(key_step.getDataType(), head_dim);
+  key_step.getOps()->kv_cache_write(key_step, value_step, kv, pos,
+                                    rotate_key && write_key ? &rope : nullptr);
 }
 
 void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
@@ -6178,6 +6093,8 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
 #ifdef ENABLE_FP16
   cached_freqs_cos_fp16 = nullptr;
   cached_freqs_sin_fp16 = nullptr;
+  rope_cos_flat_cur = nullptr;
+  rope_sin_flat_cur = nullptr;
 #endif
 }
 

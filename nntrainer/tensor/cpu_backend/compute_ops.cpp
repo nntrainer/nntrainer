@@ -447,6 +447,15 @@ void ComputeOps::mean_rows(const Tensor &, Tensor &, unsigned int,
 void ComputeOps::l2_normalize_rows(const Tensor &, Tensor &, float) {
   NI(l2_normalize_rows);
 }
+void ComputeOps::rotary_embedding(const Tensor &, Tensor &, unsigned int,
+                                  const RotaryTable &, unsigned int, bool) {
+  NI(rotary_embedding);
+}
+void ComputeOps::kv_cache_write(const Tensor &, const Tensor &,
+                                const KVCacheView &, unsigned int,
+                                const RotaryTable *) {
+  NI(kv_cache_write);
+}
 
 #undef NI
 
