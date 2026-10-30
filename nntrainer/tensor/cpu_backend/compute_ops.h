@@ -43,6 +43,29 @@ namespace nntrainer {
 class Tensor;
 
 /**
+ * @brief A rotary-embedding cos/sin table, laid out the way the
+ *        rotary_embedding() op reads it.
+ *
+ * Row p holds, for absolute position p, the cos (and sin) of the head_dim / 2
+ * rotation angles, row-major: row p starts at cos + p * half. Rotate-half
+ * pairs element i of a head with element i + half, so one half-width row
+ * serves both members of every pair.
+ *
+ * The pointers belong to the caller and must stay valid and unchanged for
+ * the table's life: a device backend may cache its upload of a table by
+ * pointer.
+ */
+struct RotaryTable {
+  const float *cos = nullptr; /**< [positions, half] fp32 cos */
+  const float *sin = nullptr; /**< [positions, half] fp32 sin */
+  /** [positions, half] fp16-bit cos / sin, read for an FP16 input */
+  const uint16_t *cos_fp16 = nullptr;
+  const uint16_t *sin_fp16 = nullptr;
+  unsigned int positions = 0; /**< number of rows */
+  unsigned int half = 0;      /**< head_dim / 2 */
+};
+
+/**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
  */
@@ -582,6 +605,33 @@ public:
    *        gamma).
    */
   virtual void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon);
+
+  /**
+   * @brief Rotary position embedding, rotate-half layout.
+   *
+   * Every row of @p in (batch, channel and height flattened) is a sequence of
+   * head_dim-wide heads; height index h is the token at absolute position
+   * start_pos + h. Each head's element pairs (i, i + head_dim / 2) are rotated
+   * by row (start_pos + h) of @p table and written to the same place in
+   * @p out:
+   *   out[i]        = x[i] * cos - x[i + half] * sin
+   *   out[i + half] = x[i] * sin + x[i + half] * cos
+   *
+   * An FP32 @p in reads the fp32 table. @p out is then FP32 (and may alias
+   * @p in) or FP16 / UINT16 holding fp16 bits, which is how a layer writes
+   * rotated keys straight into an fp16 KV cache. With @p rotate false the op
+   * only copies, or converts to fp16, without rotating -- the value side of
+   * that cache write.
+   *
+   * An FP16 @p in (enable-fp16 builds) reads the fp16 table and writes an
+   * FP16 @p out, which may alias @p in. It always rotates.
+   *
+   * @throws std::invalid_argument when a row's position falls outside the
+   *         table, or for a dtype combination the backend does not handle.
+   */
+  virtual void rotary_embedding(const Tensor &in, Tensor &out,
+                                unsigned int head_dim, const RotaryTable &table,
+                                unsigned int start_pos, bool rotate);
 
 protected:
   /**

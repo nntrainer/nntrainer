@@ -20,15 +20,16 @@
  * The second family is the whole-op table a backend-neutral layer calls
  * without asking a predicate first: fc, apply_activation, layer_norm,
  * activation, residual_op / residual_op2, geglu, swiglu, sigmoid_glu,
- * sigmoid_add, mean_rows, l2_normalize_rows and the scopy family. These have
- * no supports_*() escape hatch, so every op a layer registered on the gpu
- * engine can reach has to resolve here — the base ComputeOps default throws,
- * and a layer has nowhere to catch that. The list follows the layers this
- * context registers, among them FullyConnectedLayerCl (fc, apply_activation,
- * fc_prebuild_weight), AdditionLayer (residual_op), SwiGLULayer (swiglu),
- * GeGLULayer (geglu), SigmoidGluLayer / SigmoidAddLayer, LayerNormalization-
- * Layer (layer_norm), ActivationLayer (activation), plus Tensor::copy
- * (scopy). ActivationLayer does not throw either: a mode with no
+ * sigmoid_add, mean_rows, l2_normalize_rows, rotary_embedding and the scopy
+ * family. These have no supports_*() escape hatch, so every op a layer
+ * registered on the gpu engine can reach has to resolve here — the base
+ * ComputeOps default throws, and a layer has nowhere to catch that. The list
+ * follows the layers this context registers, among them FullyConnectedLayerCl
+ * (fc, apply_activation, fc_prebuild_weight), AdditionLayer (residual_op),
+ * SwiGLULayer (swiglu), GeGLULayer (geglu), SigmoidGluLayer / SigmoidAddLayer,
+ * LayerNormalizationLayer (layer_norm), ActivationLayer (activation), plus
+ * Tensor::copy (scopy) and CausalLM's MHACoreLayer (rotary_embedding).
+ * ActivationLayer does not throw either: a mode with no
  * OpenCL kernel runs on the host table, and supports_activation() reports
  * which modes are accelerated.
  *
@@ -526,6 +527,16 @@ public:
   void l2_normalize_rows(const Tensor &in, Tensor &out,
                          float epsilon) override {
     l2_normalize_rows_cl_op(in, out, epsilon);
+  }
+  // Host rotation for now: the device RoPE (rope_inplace_f16_cl) is still
+  // selected inside the attention layer, which settles the queue before it
+  // reaches the host path this serves. Moving that device arm here is the
+  // next step; until then this keeps the host path's behaviour unchanged.
+  void rotary_embedding(const Tensor &in, Tensor &out, unsigned int head_dim,
+                        const RotaryTable &table, unsigned int start_pos,
+                        bool rotate) override {
+    get_cpu_ops()->rotary_embedding(in, out, head_dim, table, start_pos,
+                                    rotate);
   }
 
 #ifdef ENABLE_FP16
