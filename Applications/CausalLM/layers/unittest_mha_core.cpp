@@ -593,6 +593,9 @@ INSTANTIATE_TEST_SUITE_P(
     MhaCase("window_gemm", 4, 2, 16, {6, 1, 1, 1}).slidingWindow(3).gemmArm(),
     MhaCase("no_rope_rowwise", 2, 2, 16, {5, 1, 1}).noRope(),
     MhaCase("no_rope_gemm", 2, 2, 16, {5, 1, 1}).noRope().gemmArm(),
+    // No RoPE allows an odd head_dim; the KV cache write must still convert
+    // every element (#4466 review).
+    MhaCase("no_rope_odd_head_dim_rowwise", 2, 1, 5, {3, 1, 1}).noRope(),
     MhaCase("softcap_rowwise", 2, 2, 16, {5, 1, 1}).softcapAt(0.5f),
     MhaCase("softcap_gemm", 2, 2, 16, {5, 1, 1}).softcapAt(0.5f).gemmArm(),
     // Gemma2's sliding layers: softcap and the window mask together.

@@ -2971,6 +2971,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         is_kv_ohwi_enabled() && !kv_int8 &&
         key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
+      // Whether K still has to be written on the host, after the OHWI scatter
+      // or a device arm below.
+      bool k_on_host = false;
       if (kv_ohwi_active) {
 #ifdef ENABLE_FP16
         apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
@@ -3034,34 +3037,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
 #endif
-        if (!k_rope_gpu) {
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-#if defined(ENABLE_FP16)
-          NNTR_THROW_IF(
-            b_cache_key_step.getMemoryData() &&
-              !b_cache_key_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
-               "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
-               "range miss at cache_index="
-            << cache_index << ")";
-#endif
-#endif
-          apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                     cache_index, true);
-        }
+        k_on_host = !k_rope_gpu;
       }
 
-      // append vcache without rotary embedding
-      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                                   cache_index, false);
-      } else if (query_step.getDataType() ==
-                 ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
+      // V has no RoPE. On the cuda engine an FP16 V may be copied into its
+      // cache slice on the device; otherwise it is written on the host below.
+      bool v_on_host = true;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
         bool v_copy_gpu = false;
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
         {
           static const bool cuda_elt = nntr_env_on("NNTR_CUDA_ROPE");
           // V-copy historically stayed host for the prefill big-step (height>1)
@@ -3108,22 +3092,34 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
           }
         }
+        v_on_host = !v_copy_gpu;
+      }
 #endif
-        if (!v_copy_gpu) {
+
+      // The host writes the planes no device arm took: K rotated, V as is.
+      if (k_on_host || v_on_host) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-          NNTR_THROW_IF(
+        nntrainer::cuda::drain_if_async();
+#if defined(ENABLE_FP16)
+        NNTR_THROW_IF(k_on_host && b_cache_key_step.getMemoryData() &&
+                        !b_cache_key_step.getMemoryData()->isHostAddressable(),
+                      std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
+             "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
+             "range miss at cache_index="
+          << cache_index << ")";
+        NNTR_THROW_IF(
+          v_on_host &&
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
             b_cache_value_step.getMemoryData() &&
-              !b_cache_value_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
-               "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
+            !b_cache_value_step.getMemoryData()->isHostAddressable(),
+          std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
+             "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
-          b_cache_value_step.copyData(value_step);
-        }
-#else
-        NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+        write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                       cache_index, k_on_host, v_on_host, /*rotate_key=*/true);
       }
     }
   } else {
@@ -3144,10 +3140,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       NNTR_THROW_IF(true, std::invalid_argument)
         << "NNTR_KV_OHWI requires ENABLE_FP16";
 #endif
-    } else {
-      b_cache_key_step.copyData(key_step);
     }
-    b_cache_value_step.copyData(value_step);
+    write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                   cache_index,
+                   /*write_key=*/!kv_ohwi_active, /*write_value=*/true,
+                   /*rotate_key=*/false);
   }
 
   /// @todo replace step_size into input height
@@ -5302,30 +5299,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     << "NNTR_KV_INT8 is not supported for the sink_step (gpt-oss) variant of "
        "one_batch_incremental_forwarding";
 
-  /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-   * **/
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
-  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
-    cache_value_step_dim,
-    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
-    true);
-
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, true);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true);
-
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               false);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
+  // K rotated and V into rows [from, to). from is _from: a step past the cache
+  // end (the only case where they differ) is rejected before this.
+  write_kv_cache(batch, key_step, value_step, cache_key, cache_value, _from,
+                 /*write_key=*/true, /*write_value=*/true,
+                 /*rotate_key=*/true);
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
@@ -5623,34 +5603,73 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool apply_rope) {
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, false);
-      cached_freqs_cos = freqs_cos;
-      cached_freqs_sin = freqs_sin;
-    }
-    nntrainer::RotaryTable table;
-    table.cos = cached_freqs_cos->data();
-    table.sin = cached_freqs_sin->data();
-    table.half = dim / 2;
-    table.positions = (unsigned int)(cached_freqs_cos->size() / table.half);
-    in.getOps()->rotary_embedding(in, out, dim, table, from, apply_rope);
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+  if (in.getDataType() != ml::train::TensorDim::DataType::FP32 &&
+      in.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return;
+  in.getOps()->rotary_embedding(
+    in, out, dim, rotary_table(in.getDataType(), dim), from, apply_rope);
+}
+
+nntrainer::RotaryTable
+MHACoreLayer::rotary_table(ml::train::TensorDim::DataType dt,
+                           unsigned int dim) {
+  nntrainer::RotaryTable table;
+  table.half = dim / 2;
+  if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     // The same table the OpenCL RoPE uses, capped at rope_lut_positions()
     // (the live max sequence length, not max_position_embeddings).
     ensure_rope_flat_lut();
-    nntrainer::RotaryTable table;
     table.cos_fp16 = rope_cos_flat_cur;
     table.sin_fp16 = rope_sin_flat_cur;
-    table.half = dim / 2;
     table.positions = rope_flat_positions;
-    in.getOps()->rotary_embedding(in, out, dim, table, from, apply_rope);
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    return table;
   }
+  if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
+    const std::lock_guard<std::mutex> lock(rope_init_mtx);
+    precompute_freqs(head_dim, max_position_embeddings, theta, false);
+    cached_freqs_cos = freqs_cos;
+    cached_freqs_sin = freqs_sin;
+  }
+  table.cos = cached_freqs_cos->data();
+  table.sin = cached_freqs_sin->data();
+  table.positions = (unsigned int)(cached_freqs_cos->size() / table.half);
+  return table;
+}
+
+void MHACoreLayer::write_kv_cache(unsigned int batch,
+                                  nntrainer::Tensor &key_step,
+                                  nntrainer::Tensor &value_step,
+                                  nntrainer::Tensor &cache_key,
+                                  nntrainer::Tensor &cache_value,
+                                  unsigned int pos, bool write_key,
+                                  bool write_value, bool rotate_key) {
+  auto batch_plane = [batch](nntrainer::Tensor &cache) {
+    ml::train::TensorDim dim = cache.getDim();
+    dim.batch(1);
+    return cache.getSharedDataTensor(dim, batch * dim.getFeatureLen(), true);
+  };
+  nntrainer::Tensor key_plane, value_plane;
+  nntrainer::KVCacheView kv;
+  if (write_key) {
+    key_plane = batch_plane(cache_key);
+    kv.key = &key_plane;
+  }
+  if (write_value) {
+    value_plane = batch_plane(cache_value);
+    kv.value = &value_plane;
+  }
+  kv.head_dim = head_dim;
+  kv.ring_cap = kv_ring_cap;
+
+  nntrainer::RotaryTable rope;
+  if (rotate_key && write_key)
+    rope = rotary_table(key_step.getDataType(), head_dim);
+  key_step.getOps()->kv_cache_write(key_step, value_step, kv, pos,
+                                    rotate_key && write_key ? &rope : nullptr);
 }
 
 void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,

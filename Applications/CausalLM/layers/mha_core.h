@@ -858,6 +858,28 @@ private:
                                   unsigned int dim, unsigned int from,
                                   bool apply_rope = true);
 
+  /**
+   * @brief This layer's RoPE table for an input of dtype @p dt (the fp32 or
+   *        the fp16 angles), built on first use.
+   */
+  nntrainer::RotaryTable rotary_table(ml::train::TensorDim::DataType dt,
+                                      unsigned int dim);
+
+  /**
+   * @brief     Write one step's K / V rows into batch @p batch of the KV
+   *            cache through ComputeOps::kv_cache_write.
+   * @param[in] pos absolute position of the first row
+   * @param[in] write_key false when K was written already (a device arm or
+   *            the OHWI scatter)
+   * @param[in] write_value false when V was written already
+   * @param[in] rotate_key true to apply RoPE to K
+   */
+  void write_kv_cache(unsigned int batch, nntrainer::Tensor &key_step,
+                      nntrainer::Tensor &value_step,
+                      nntrainer::Tensor &cache_key,
+                      nntrainer::Tensor &cache_value, unsigned int pos,
+                      bool write_key, bool write_value, bool rotate_key);
+
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
                int N, int chunk_size, int group_size, int tile_size,
