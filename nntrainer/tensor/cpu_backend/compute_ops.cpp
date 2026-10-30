@@ -456,6 +456,10 @@ void ComputeOps::kv_cache_write(const Tensor &, const Tensor &,
                                 const RotaryTable *) {
   NI(kv_cache_write);
 }
+void ComputeOps::attention(const Tensor &, const KVCacheView &, Tensor &,
+                           const AttentionOpParams &) {
+  NI(attention);
+}
 
 #undef NI
 

@@ -30,6 +30,7 @@
 #define __COMPUTE_OPS_H__
 #ifdef __cplusplus
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -79,6 +80,24 @@ struct KVCacheView {
   /** 0 for a linear cache; otherwise absolute row n is stored at row
    *  n % ring_cap and the cache holds ring_cap rows */
   unsigned int ring_cap = 0;
+  /** int8 cache (UINT8 planes) only: fp16 bits of the scale of each
+   *  (row, KV head) of K / V, [rows, num_heads_kv] */
+  const uint16_t *key_scale = nullptr;
+  const uint16_t *value_scale = nullptr;
+};
+
+/**
+ * @brief The formula one attention() call applies.
+ */
+struct AttentionOpParams {
+  unsigned int num_heads_q = 0;
+  unsigned int q_pos = 0;   /**< absolute position of query row 0 */
+  unsigned int kv_len = 0;  /**< keys [0, kv_len) take part: q_pos + rows */
+  bool causal = true;       /**< a query row sees no key after its own row */
+  size_t window = UINT_MAX; /**< sliding window of causal rows, UINT_MAX
+                                 for none (see attention()) */
+  float softcap = 0.0f;     /**< cap * tanh(score / cap) when > 0 */
+  Tensor *sink = nullptr;   /**< per-head sink logit, or null */
 };
 
 /**
@@ -667,6 +686,27 @@ public:
   virtual void kv_cache_write(const Tensor &k, const Tensor &v,
                               const KVCacheView &kv, unsigned int pos,
                               const RotaryTable *rope);
+
+  /**
+   * @brief Attention of one step's query rows over a KV cache.
+   *
+   * out = softmax(softcap(Q K^T / sqrt(head_dim)) + mask [+ sink]) V, where
+   * query head h reads KV head h / (num_heads_q / num_heads_kv). @p q holds
+   * the step's rows, already rotated, [1, 1, rows, num_heads_q * head_dim];
+   * row r is at absolute position q_pos + r. The keys are rows
+   * [0, kv_len) of @p kv's planes. A causal row sees the keys up to its own
+   * position, the last @c window of them; a non-causal row sees them all.
+   * A window shorter than kv_len with non-causal rows is not supported: the
+   * CPU arm, moved from MHACoreLayer as it was, gives an unspecified result
+   * there. A sink, num_heads_q values of @p q's dtype, adds exp(sink - max)
+   * to each head's softmax denominator. @p out has @p q's shape.
+   *
+   * @throws std::invalid_argument for shapes or dtypes that do not match
+   *         (the sink's included), a missing plane, or a cache the backend
+   *         cannot read (on the CPU, a ringed cache).
+   */
+  virtual void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
+                         const AttentionOpParams &p);
 
 protected:
   /**

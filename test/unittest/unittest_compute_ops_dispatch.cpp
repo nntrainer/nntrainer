@@ -22,7 +22,9 @@
 #include <quantizer.h>
 #include <tensor.h>
 
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <memory>
 #include <stdexcept>
@@ -53,6 +55,7 @@ struct CallCounters {
   std::atomic<int> swiglu{0};
   std::atomic<int> rotary_embedding{0};
   std::atomic<int> kv_cache_write{0};
+  std::atomic<int> attention{0};
 };
 
 /**
@@ -140,6 +143,12 @@ public:
                       const nntrainer::RotaryTable *rope) override {
     counters_->kv_cache_write++;
     real_->kv_cache_write(k, v, kv, pos, rope);
+  }
+  void attention(const nntrainer::Tensor &q, const nntrainer::KVCacheView &kv,
+                 nntrainer::Tensor &out,
+                 const nntrainer::AttentionOpParams &p) override {
+    counters_->attention++;
+    real_->attention(q, kv, out, p);
   }
 
 private:
@@ -954,6 +963,368 @@ TEST_F(ComputeOpsDispatchTest, KvCacheWriteConvertsOddHeadDim) {
               nntrainer::compute_fp32_to_fp16(v.getData<float>()[i]));
   }
   EXPECT_EQ(key.getData<uint16_t>()[0], 0xABCD);
+}
+
+/**
+ * @brief attention reaches the attached table and computes
+ *        softmax(softcap(q . k / sqrt(d))) . v per query row over the keys
+ *        its causal window sees, with two query heads on one KV head; a
+ *        ringed cache and a kv_len that is not q_pos + rows are rejected.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionDispatchesAndMatchesTheFormula) {
+  constexpr unsigned int D = 4, Hq = 2, R = 2, keys = 3, window = 2;
+  constexpr float cap = 0.5f;
+  nntrainer::Tensor q = stepRows(R, Hq * D, -0.2f);
+  nntrainer::Tensor key = cachePlane(keys, D), value = cachePlane(keys, D);
+  for (unsigned int i = 0; i < keys * D; ++i) {
+    key.getData<uint16_t>()[i] =
+      nntrainer::compute_fp32_to_fp16(0.1f * i - 0.6f);
+    value.getData<uint16_t>()[i] =
+      nntrainer::compute_fp32_to_fp16(0.3f - 0.05f * i);
+  }
+  nntrainer::Tensor out(1, 1, R, Hq * D);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = D;
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = Hq;
+  p.q_pos = keys - R;
+  p.kv_len = keys;
+  p.window = window;
+  p.softcap = cap;
+
+  q.setContextData(ct_data);
+  q.getOps()->attention(q, kv, out, p);
+  EXPECT_EQ(counters->attention.load(), 1);
+
+  for (unsigned int r = 0; r < R; ++r) {
+    const unsigned int pos = p.q_pos + r;
+    const unsigned int first = pos + 1 > window ? pos + 1 - window : 0;
+    for (unsigned int h = 0; h < Hq; ++h) {
+      const float *qh = q.getData<float>() + (r * Hq + h) * D;
+      std::vector<float> s;
+      float mx = -INFINITY;
+      for (unsigned int j = first; j <= pos; ++j) {
+        float dot = 0.0f;
+        for (unsigned int d = 0; d < D; ++d)
+          dot += qh[d] * nntrainer::compute_fp16_to_fp32(
+                           key.getData<uint16_t>()[j * D + d]);
+        s.push_back(cap * std::tanh(dot / std::sqrt((float)D) / cap));
+        mx = std::max(mx, s.back());
+      }
+      float sum = 0.0f;
+      for (float &x : s)
+        sum += (x = std::exp(x - mx));
+      for (unsigned int d = 0; d < D; ++d) {
+        float expect = 0.0f;
+        for (unsigned int j = first; j <= pos; ++j)
+          expect += s[j - first] / sum *
+                    nntrainer::compute_fp16_to_fp32(
+                      value.getData<uint16_t>()[j * D + d]);
+        EXPECT_NEAR(out.getData<float>()[(r * Hq + h) * D + d], expect, 1e-4f)
+          << "row " << r << " head " << h << " dim " << d;
+      }
+    }
+  }
+
+  kv.ring_cap = keys;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  kv.ring_cap = 0;
+  p.kv_len = keys + 1;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+}
+
+namespace {
+
+/** @brief The cache a per-row attention case reads. */
+enum class AttnCache { FP32, FP16Bits, Int8 };
+
+/** @brief One configuration of the per-row attention op. */
+struct AttnCase {
+  const char *name;
+  bool fp16_q; /**< FP16 query and output (FP32 otherwise) */
+  AttnCache cache;
+  unsigned int rows;  /**< query rows: 1 is a decode step */
+  unsigned int q_pos; /**< absolute position of query row 0 */
+  bool causal;
+  size_t window; /**< UINT_MAX for none */
+  float softcap; /**< 0 for none */
+  bool sink;
+};
+
+/** @brief A tensor of the given dtype holding @p v (fp16 bits for UINT16). */
+nntrainer::Tensor makeTensor(unsigned int h, unsigned int w,
+                             nntrainer::Tdatatype dt,
+                             const std::vector<float> &v) {
+  nntrainer::Tensor t(
+    nntrainer::TensorDim({1, 1, h, w, nntrainer::Tformat::NCHW, dt}));
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (dt == nntrainer::Tdatatype::FP32)
+      t.getData<float>()[i] = v[i];
+    else
+      t.getData<uint16_t>()[i] = nntrainer::compute_fp32_to_fp16(v[i]);
+  }
+  return t;
+}
+
+/** @brief @p x as the fp16 value it is stored as. */
+float roundFp16(float x) {
+  return nntrainer::compute_fp16_to_fp32(nntrainer::compute_fp32_to_fp16(x));
+}
+
+/**
+ * @brief Run ComputeOps::attention on one case and compare every output with
+ *        softmax(softcap(q . k / sqrt(d))) . v over the keys each row sees,
+ *        computed in fp32 from the values the tensors actually hold.
+ */
+void checkAttention(const AttnCase &c, float tol) {
+  SCOPED_TRACE(c.name);
+  constexpr unsigned int D = 4, Hq = 4, Hkv = 2, G = Hq / Hkv;
+  const unsigned int keys = c.q_pos + c.rows;
+  const auto q_dt =
+    c.fp16_q ? nntrainer::Tdatatype::FP16 : nntrainer::Tdatatype::FP32;
+
+  std::vector<float> q(c.rows * Hq * D), k(keys * Hkv * D), v(keys * Hkv * D),
+    sink(Hq);
+  for (size_t i = 0; i < q.size(); ++i)
+    q[i] = 0.3f * std::sin(0.7f * i + 0.1f);
+  for (size_t i = 0; i < k.size(); ++i) {
+    k[i] = 0.5f * std::cos(0.37f * i);
+    v[i] = 0.4f * std::sin(0.23f * i + 1.0f);
+  }
+  for (unsigned int h = 0; h < Hq; ++h)
+    sink[h] = 0.25f * h - 0.3f;
+  if (c.fp16_q) {
+    for (float &x : q)
+      x = roundFp16(x);
+    for (float &x : sink)
+      x = roundFp16(x);
+  }
+
+  // The cache, and the values it holds as the reference reads them.
+  nntrainer::Tensor key, value;
+  std::vector<uint16_t> kscale, vscale;
+  std::vector<float> kref = k, vref = v;
+  if (c.cache == AttnCache::Int8) {
+    key = nntrainer::Tensor(
+      nntrainer::TensorDim({1, 1, keys, Hkv * D, nntrainer::Tformat::NCHW,
+                            nntrainer::Tdatatype::UINT8}));
+    value = nntrainer::Tensor(
+      nntrainer::TensorDim({1, 1, keys, Hkv * D, nntrainer::Tformat::NCHW,
+                            nntrainer::Tdatatype::UINT8}));
+    auto quantize = [&](const std::vector<float> &x, nntrainer::Tensor &t,
+                        std::vector<uint16_t> &scale, std::vector<float> &ref) {
+      int8_t *dst = reinterpret_cast<int8_t *>(t.getData<uint8_t>());
+      for (unsigned int j = 0; j < keys * Hkv; ++j) {
+        float amax = 0.0f;
+        for (unsigned int d = 0; d < D; ++d)
+          amax = std::max(amax, std::fabs(x[j * D + d]));
+        scale.push_back(nntrainer::compute_fp32_to_fp16(amax / 127.0f));
+        const float s = nntrainer::compute_fp16_to_fp32(scale.back());
+        for (unsigned int d = 0; d < D; ++d) {
+          const int qv = static_cast<int>(std::lround(x[j * D + d] / s));
+          dst[j * D + d] =
+            static_cast<int8_t>(std::max(-127, std::min(127, qv)));
+          ref[j * D + d] = dst[j * D + d] * s;
+        }
+      }
+    };
+    quantize(k, key, kscale, kref);
+    quantize(v, value, vscale, vref);
+  } else {
+    const auto kv_dt = c.cache == AttnCache::FP32
+                         ? nntrainer::Tdatatype::FP32
+                         : (c.fp16_q ? nntrainer::Tdatatype::FP16
+                                     : nntrainer::Tdatatype::UINT16);
+    key = makeTensor(keys, Hkv * D, kv_dt, k);
+    value = makeTensor(keys, Hkv * D, kv_dt, v);
+    if (c.cache == AttnCache::FP16Bits) {
+      for (float &x : kref)
+        x = roundFp16(x);
+      for (float &x : vref)
+        x = roundFp16(x);
+    }
+  }
+
+  nntrainer::Tensor qt = makeTensor(c.rows, Hq * D, q_dt, q);
+  nntrainer::Tensor st = makeTensor(1, Hq, q_dt, sink);
+  nntrainer::Tensor out(nntrainer::TensorDim(
+    {1, 1, c.rows, Hq * D, nntrainer::Tformat::NCHW, q_dt}));
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = D;
+  kv.key_scale = kscale.empty() ? nullptr : kscale.data();
+  kv.value_scale = vscale.empty() ? nullptr : vscale.data();
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = Hq;
+  p.q_pos = c.q_pos;
+  p.kv_len = keys;
+  p.causal = c.causal;
+  p.window = c.window;
+  p.softcap = c.softcap;
+  p.sink = c.sink ? &st : nullptr;
+  qt.getOps()->attention(qt, kv, out, p);
+
+  for (unsigned int r = 0; r < c.rows; ++r) {
+    const unsigned int pos = c.q_pos + r;
+    const unsigned int last = c.causal ? pos : keys - 1;
+    const unsigned int first =
+      c.causal && pos + 1 > c.window ? pos + 1 - c.window : 0;
+    for (unsigned int h = 0; h < Hq; ++h) {
+      const unsigned int kh = h / G;
+      std::vector<float> s;
+      float mx = c.sink ? sink[h] : -INFINITY;
+      for (unsigned int j = first; j <= last; ++j) {
+        float dot = 0.0f;
+        for (unsigned int d = 0; d < D; ++d)
+          dot += q[(r * Hq + h) * D + d] * kref[(j * Hkv + kh) * D + d];
+        float x = dot / std::sqrt(static_cast<float>(D));
+        if (c.softcap > 0.0f)
+          x = c.softcap * std::tanh(x / c.softcap);
+        s.push_back(x);
+        mx = std::max(mx, x);
+      }
+      float sum = c.sink ? std::exp(sink[h] - mx) : 0.0f;
+      for (float &x : s)
+        sum += (x = std::exp(x - mx));
+      for (unsigned int d = 0; d < D; ++d) {
+        float expect = 0.0f;
+        for (unsigned int j = first; j <= last; ++j)
+          expect += s[j - first] / sum * vref[(j * Hkv + kh) * D + d];
+        const size_t o = (r * Hq + h) * D + d;
+        const float got =
+          c.fp16_q ? nntrainer::compute_fp16_to_fp32(out.getData<uint16_t>()[o])
+                   : out.getData<float>()[o];
+        EXPECT_NEAR(got, expect, tol)
+          << "row " << r << " head " << h << " dim " << d;
+      }
+    }
+  }
+}
+
+} // namespace
+
+/**
+ * @brief The per-row arm on an FP32 query, for each cache it reads (FP32,
+ *        fp16 bits), decode and prefill steps, with a window, softcap, sink
+ *        or non-causal rows.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionFp32QueryPaths) {
+  const AttnCase cases[] = {
+    {"fp32_cache_decode", false, AttnCache::FP32, 1, 4, true, 3, 0.5f, false},
+    {"fp32_cache_prefill", false, AttnCache::FP32, 3, 2, true, 3, 0.0f, false},
+    {"fp16_bits_sink_decode", false, AttnCache::FP16Bits, 1, 3, true, UINT_MAX,
+     0.0f, true},
+    {"fp16_bits_sink_prefill", false, AttnCache::FP16Bits, 3, 1, true, UINT_MAX,
+     0.0f, true},
+    {"fp16_bits_non_causal", false, AttnCache::FP16Bits, 3, 0, false, UINT_MAX,
+     0.0f, false},
+  };
+  for (const AttnCase &c : cases)
+    checkAttention(c, 1e-4f);
+}
+
+#ifdef ENABLE_FP16
+/**
+ * @brief The per-row arm on an FP16 query (the Android fp16 path), over an
+ *        FP16 cache and an int8 cache with per-(row, head) scales, decode and
+ *        prefill steps, with a window, softcap, sink or non-causal rows. Held
+ *        to 1e-2, as the FP16 cases of unittest_mha_core.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionFp16QueryPaths) {
+  const AttnCase cases[] = {
+    {"fp16_softcap_window_prefill", true, AttnCache::FP16Bits, 3, 2, true, 3,
+     0.5f, false},
+    {"fp16_sink_decode", true, AttnCache::FP16Bits, 1, 3, true, UINT_MAX, 0.0f,
+     true},
+    {"fp16_sink_prefill", true, AttnCache::FP16Bits, 3, 1, true, UINT_MAX, 0.0f,
+     true},
+    {"fp16_non_causal", true, AttnCache::FP16Bits, 3, 0, false, UINT_MAX, 0.0f,
+     false},
+    {"int8_decode", true, AttnCache::Int8, 1, 4, true, UINT_MAX, 0.0f, false},
+    {"int8_window_prefill", true, AttnCache::Int8, 3, 2, true, 3, 0.0f, false},
+  };
+  for (const AttnCase &c : cases)
+    checkAttention(c, 1e-2f);
+}
+#endif
+
+/**
+ * @brief attention rejects a kv_len past the cache rows (a K or V plane
+ *        shorter than it), dtypes no arm reads (an FP32 query over an int8
+ *        cache, an FP16 query over an FP32 cache, K and V of different dtypes,
+ *        an output of another dtype than the query), and a sink of another
+ *        size or dtype than num_heads_q values of the query's.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionRejectsShortCacheAndBadDtypes) {
+  constexpr unsigned int D = 4, R = 2, keys = 3;
+  nntrainer::Tensor q = stepRows(R, D, 0.1f);
+  nntrainer::Tensor out(1, 1, R, D);
+  nntrainer::Tensor key = cachePlane(keys, D), value = cachePlane(keys, D);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = D;
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = 1;
+  p.q_pos = keys - R;
+  p.kv_len = keys;
+  EXPECT_NO_THROW(q.getOps()->attention(q, kv, out, p));
+
+  nntrainer::Tensor short_value = cachePlane(keys - 1, D);
+  kv.value = &short_value;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  kv.value = &value;
+
+  nntrainer::Tensor short_key = cachePlane(keys - 1, D);
+  kv.key = &short_key;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  kv.key = &key;
+
+  nntrainer::Tensor sink(1, 1, 1, 1);
+  p.sink = &sink;
+  EXPECT_NO_THROW(q.getOps()->attention(q, kv, out, p));
+  nntrainer::Tensor sink_wide(1, 1, 1, 2);
+  p.sink = &sink_wide;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  nntrainer::Tensor sink16(nntrainer::TensorDim(
+    {1, 1, 1, 1, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16}));
+  p.sink = &sink16;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  p.sink = nullptr;
+
+  nntrainer::Tensor fp32_value(1, 1, keys, D);
+  kv.value = &fp32_value;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  kv.value = &value;
+
+  const nntrainer::TensorDim u8(
+    {1, 1, keys, D, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT8});
+  nntrainer::Tensor key8(u8), value8(u8);
+  kv.key = &key8;
+  kv.value = &value8;
+  EXPECT_THROW(q.getOps()->attention(q, kv, out, p), std::invalid_argument);
+  kv.key = &key;
+  kv.value = &value;
+
+  nntrainer::Tensor out16(nntrainer::TensorDim(
+    {1, 1, R, D, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16}));
+  EXPECT_THROW(q.getOps()->attention(q, kv, out16, p), std::invalid_argument);
+
+#ifdef ENABLE_FP16
+  const nntrainer::TensorDim f16(
+    {1, 1, R, D, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16});
+  nntrainer::Tensor q16(f16), out_f16(f16);
+  nntrainer::Tensor fp32_key(1, 1, keys, D), fp32_val(1, 1, keys, D);
+  kv.key = &fp32_key;
+  kv.value = &fp32_val;
+  EXPECT_THROW(q16.getOps()->attention(q16, kv, out_f16, p),
+               std::invalid_argument);
+  kv.key = &key;
+  kv.value = &value;
+#endif
 }
 
 /**

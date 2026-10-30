@@ -425,6 +425,10 @@ public:
   // A fp16 concat cache: the K rows through rotary_embedding, V converted.
   void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
                       unsigned int pos, const RotaryTable *rope) override;
+
+  /** Host per-row arm (cpu_attention.cpp). Rejects a ringed cache. */
+  void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
+                 const AttentionOpParams &p) override;
 };
 
 } // namespace nntrainer

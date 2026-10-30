@@ -880,32 +880,27 @@ private:
                       nntrainer::Tensor &cache_value, unsigned int pos,
                       bool write_key, bool write_value, bool rotate_key);
 
+  /**
+   * @brief     Host per-row attention of query rows [from, to) over the
+   *            cached keys [0, to), through ComputeOps::attention.
+   * @param[in] sink per-head sink logits (the attention-sink overload), or
+   *            nullptr
+   */
+  void attend_rowwise(nntrainer::Tensor &query_step,
+                      nntrainer::Tensor &cached_key,
+                      nntrainer::Tensor &cached_value,
+                      nntrainer::Tensor &output, unsigned int from,
+                      unsigned int to, nntrainer::Tensor *sink);
+
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
                int N, int chunk_size, int group_size, int tile_size,
                bool process_all);
 
-  void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
-                       nntrainer::Tensor &out, unsigned int from,
-                       size_t sequence_len, unsigned int num_heads,
-                       unsigned int group_size, unsigned int head_dim);
-
-  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from);
-
-  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, nntrainer::Tensor &sink_step);
-
   void compute_vcaches(nntrainer::Tensor &in, nntrainer::Tensor &vcache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
                        unsigned int group_size, unsigned int head_dim);
-
-  void compute_fp16vcache_transposed(nntrainer::Tensor &in,
-                                     nntrainer::Tensor &vcache,
-                                     nntrainer::Tensor &output, int from,
-                                     int num_cache_head, int gqa_size,
-                                     int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
 
@@ -916,20 +911,6 @@ private:
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
 
   size_t calc_attn_index(size_t i);
-
-  /**
-   * @brief Windowed cumulative attention score index.
-   *
-   * Returns the cumulative number of attention scores before absolute query
-   * row i, respecting a sliding window of size local_window_size (W):
-   *
-   *   S(i) = sum_{k=0}^{i-1} min(k+1, W)
-   *        = (i <= W) ? i*(i+1)/2 : W*(W+1)/2 + (i - W)*W
-   *
-   * When W == UINT_MAX (full attention), this reduces exactly to
-   * i*(i+1)/2 == calc_attn_index(i), preserving byte-identical behaviour.
-   */
-  size_t calc_windowed_attn_index(size_t i);
 
 }; // end of class MHACoreLayer
 } // namespace causallm

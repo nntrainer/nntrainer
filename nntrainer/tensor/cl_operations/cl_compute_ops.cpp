@@ -33,6 +33,7 @@
  * OpenCL kernel runs on the host table, and supports_activation() reports
  * which modes are accelerated.
  * MHACoreLayer's KV cache write (kv_cache_write) belongs to the same family.
+ * So does its host attention (attention).
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
@@ -544,6 +545,11 @@ public:
   void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
                       unsigned int pos, const RotaryTable *rope) override {
     get_cpu_ops()->kv_cache_write(k, v, kv, pos, rope);
+  }
+
+  void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
+                 const AttentionOpParams &p) override {
+    get_cpu_ops()->attention(q, kv, out, p);
   }
 
 #ifdef ENABLE_FP16
