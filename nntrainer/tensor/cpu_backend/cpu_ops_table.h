@@ -422,6 +422,9 @@ public:
   void rotary_embedding(const Tensor &in, Tensor &out, unsigned int head_dim,
                         const RotaryTable &table, unsigned int start_pos,
                         bool rotate) override;
+  // A fp16 concat cache: the K rows through rotary_embedding, V converted.
+  void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
+                      unsigned int pos, const RotaryTable *rope) override;
 };
 
 } // namespace nntrainer

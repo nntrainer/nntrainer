@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 #include <acti_func.h>
+#include <fp16.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -455,6 +456,58 @@ void CpuComputeOps::rotary_embedding(const Tensor &in, Tensor &out,
       compute_rotary_emb_value(W, head_dim, half, out_row, nullptr, cos_row,
                                sin_row, false);
   }
+}
+
+void CpuComputeOps::kv_cache_write(const Tensor &k, const Tensor &v,
+                                   const KVCacheView &kv, unsigned int pos,
+                                   const RotaryTable *rope) {
+  const unsigned int rows = k.height();
+  if (v.height() != rows)
+    throw std::invalid_argument(
+      "CpuComputeOps::kv_cache_write: k and v must hold the same rows");
+
+  auto write_plane = [&](const Tensor &in, Tensor *cache,
+                         const RotaryTable *table) {
+    if (cache == nullptr)
+      return;
+    const unsigned int width = cache->width();
+    if (in.width() != width || in.size() != (size_t)rows * width)
+      throw std::invalid_argument(
+        "CpuComputeOps::kv_cache_write: a step row must be one cache row");
+    const unsigned int cap = kv.ring_cap ? kv.ring_cap : cache->height();
+    const unsigned int row = kv.ring_cap ? pos % kv.ring_cap : pos;
+    if (cap > cache->height() || row + rows > cap)
+      throw std::invalid_argument(
+        "CpuComputeOps::kv_cache_write: the rows do not fit the cache (past "
+        "its last row, or across the ring seam)");
+
+    TensorDim slice_dim = cache->getDim();
+    slice_dim.batch(1);
+    slice_dim.channel(1);
+    slice_dim.height(rows);
+    Tensor slice =
+      cache->getSharedDataTensor(slice_dim, (size_t)row * width, true);
+    using DataType = ml::train::TensorDim::DataType;
+    const bool to_fp16 = in.getDataType() == DataType::FP32 &&
+                         (slice.getDataType() == DataType::FP16 ||
+                          slice.getDataType() == DataType::UINT16);
+    if (table != nullptr) {
+      rotary_embedding(in, slice, kv.head_dim, *table, pos, true);
+    } else if (to_fp16 && kv.head_dim % 2 == 0) {
+      rotary_embedding(in, slice, kv.head_dim, RotaryTable{}, pos, false);
+    } else if (to_fp16) {
+      // rotary_embedding pairs element i of a head with i + head_dim / 2, so
+      // it cannot convert odd-sized heads; convert element by element.
+      const float *src = in.getData<float>();
+      uint16_t *dst = slice.getData<uint16_t>();
+      for (size_t i = 0; i < in.size(); ++i)
+        dst[i] = compute_fp32_to_fp16(src[i]);
+    } else {
+      slice.copyData(in);
+    }
+  };
+  write_plane(k, kv.key, rope);
+  write_plane(v, kv.value, nullptr);
 }
 
 } // namespace nntrainer

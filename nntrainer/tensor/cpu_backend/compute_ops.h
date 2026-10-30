@@ -66,6 +66,22 @@ struct RotaryTable {
 };
 
 /**
+ * @brief One batch's KV cache, as the kv_cache_write() op sees it.
+ *
+ * key and value are the batch's whole cache planes, [1, 1, rows, width]. A
+ * null plane is not written: its rows were written by the caller (a device
+ * arm, or the OHWI scatter of K) until those writers move behind the op.
+ */
+struct KVCacheView {
+  Tensor *key = nullptr;   /**< K plane, or null */
+  Tensor *value = nullptr; /**< V plane, or null */
+  unsigned int head_dim = 0;
+  /** 0 for a linear cache; otherwise absolute row n is stored at row
+   *  n % ring_cap and the cache holds ring_cap rows */
+  unsigned int ring_cap = 0;
+};
+
+/**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
  */
@@ -632,6 +648,25 @@ public:
   virtual void rotary_embedding(const Tensor &in, Tensor &out,
                                 unsigned int head_dim, const RotaryTable &table,
                                 unsigned int start_pos, bool rotate);
+
+  /**
+   * @brief Write one step's keys and values into a KV cache.
+   *
+   * @p k and @p v hold the step's rows, [1, 1, rows, num_heads_kv *
+   * head_dim]; height index h is absolute position pos + h. Each row goes to
+   * cache row pos + h (pos + h modulo ring_cap on a ringed cache) of the
+   * matching plane of @p kv. K is rotated there by row pos + h of @p rope
+   * when @p rope is set, as rotary_embedding() does; V is not rotated. Both
+   * are converted to the cache's fp16 element. A null plane of @p kv is
+   * skipped.
+   *
+   * @throws std::invalid_argument when the rows do not fit the cache (past
+   *         its last row, or across the ring seam), or for a dtype the
+   *         backend does not handle.
+   */
+  virtual void kv_cache_write(const Tensor &k, const Tensor &v,
+                              const KVCacheView &kv, unsigned int pos,
+                              const RotaryTable *rope);
 
 protected:
   /**

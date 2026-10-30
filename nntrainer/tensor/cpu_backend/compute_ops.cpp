@@ -451,6 +451,11 @@ void ComputeOps::rotary_embedding(const Tensor &, Tensor &, unsigned int,
                                   const RotaryTable &, unsigned int, bool) {
   NI(rotary_embedding);
 }
+void ComputeOps::kv_cache_write(const Tensor &, const Tensor &,
+                                const KVCacheView &, unsigned int,
+                                const RotaryTable *) {
+  NI(kv_cache_write);
+}
 
 #undef NI
 

@@ -32,6 +32,7 @@
  * ActivationLayer does not throw either: a mode with no
  * OpenCL kernel runs on the host table, and supports_activation() reports
  * which modes are accelerated.
+ * MHACoreLayer's KV cache write (kv_cache_write) belongs to the same family.
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
@@ -537,6 +538,12 @@ public:
                         bool rotate) override {
     get_cpu_ops()->rotary_embedding(in, out, head_dim, table, start_pos,
                                     rotate);
+  }
+  // Host cache write for now, for the same reason: the device K/V writes are
+  // still chosen inside the attention layer, which settles the queue first.
+  void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
+                      unsigned int pos, const RotaryTable *rope) override {
+    get_cpu_ops()->kv_cache_write(k, v, kv, pos, rope);
   }
 
 #ifdef ENABLE_FP16
