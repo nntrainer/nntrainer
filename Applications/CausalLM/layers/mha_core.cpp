@@ -4713,6 +4713,10 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
     (num_heads_KV > 0) ? static_cast<unsigned int>(num_heads_Q / num_heads_KV)
                        : 1u;
   const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(d));
+  // Gemma2-style logit softcap, score = cap * tanh(score / cap), as
+  // softmax_triangle applies it on the per-row arm. 0 = off.
+  const float softcap = attn_logit_softcapping;
+  const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
   const unsigned int order =
     static_cast<unsigned int>(query_step.getDim().getStorageOrder());
   const bool causal = is_causal;
@@ -4804,10 +4808,10 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Opt-in GPU attention (engine=cuda, UVM): the interleaved fp16 query +
   // fp16 KV cache feed a flash core on the device, replacing the host O(M^2)
-  // loop below. Matches gemm_attention exactly (scale 1/sqrt(d), causal +
-  // sliding mask, GQA, NO softcap). Gated by NNTR_CUDA_ATTN, which the
-  // CudaContext device profile defaults on (=0 disables); falls through to the
-  // host path when off / not device-resident.
+  // loop below. Matches gemm_attention (scale 1/sqrt(d), causal + sliding
+  // mask, GQA, softcap). Gated by NNTR_CUDA_ATTN, which the CudaContext device
+  // profile defaults on (=0 disables); falls through to the host path when off
+  // / not device-resident.
   {
     static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
@@ -4826,7 +4830,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
-              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap))
+              win, attn_logit_softcapping, /*ring_cap=*/(int)kv_ring_cap))
           return;
       }
     }
@@ -5027,6 +5031,14 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         for (unsigned int i = 0; i < bq; ++i) {
           uint16_t *sp16 = Sp16.data() + (size_t)i * bk;
           const long long q_abs = (long long)cache_from + qb + i;
+          // Softcap before the mask: tanh would turn its -inf into -cap.
+          if (softcap > 0.0f) {
+            for (unsigned int k = 0; k < bk; ++k)
+              sp16[k] = nntrainer::compute_fp32_to_fp16(
+                std::tanh(nntrainer::compute_fp16_to_fp32(sp16[k]) *
+                          inv_softcap) *
+                softcap);
+          }
           if (causal_boundary) {
             long long valid_count_ll = q_abs + 1 - (long long)kb;
             unsigned int valid_count = (valid_count_ll <= 0)
@@ -5135,6 +5147,11 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         for (unsigned int i = 0; i < bq; ++i) {
           float *s = S.data() + (size_t)i * bk;
           const long long q_abs = (long long)cache_from + qb + i;
+          // Softcap before the mask: tanh would turn its -inf into -cap.
+          if (softcap > 0.0f) {
+            for (unsigned int k = 0; k < bk; ++k)
+              s[k] = std::tanh(s[k] * inv_softcap) * softcap;
+          }
           if (causal_boundary) {
             long long valid_count_ll = q_abs + 1 - (long long)kb;
             unsigned int valid_count = (valid_count_ll <= 0)

@@ -51,7 +51,7 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
  *        fp16->fp32 happen inside the kernel), runs the flash core in FP32, and
  *        writes the interleaved fp16 output [N_q, num_heads_Q*head_dim].
  * Matches gemm_attention's math: scale 1/sqrt(d), causal + sliding mask with
- * the cache_from offset, GQA; softcap<=0 (gemm_attention applies none).
+ * the cache_from offset, GQA, and the logit softcap when softcap > 0.
  *
  * @param q_fp16   query step, fp16 bits (device-accessible)
  * @param k_fp16   KV cache key, fp16 bits
