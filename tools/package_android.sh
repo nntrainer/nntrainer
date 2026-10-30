@@ -73,9 +73,9 @@ except Exception as e:
     preset_args+=("-Darm-arch=${arm_arch}")
 fi
 
-# A builddir configured with the removed arm-march option can't be reconfigured
-if grep -qs '^arm-march' builddir/meson-private/cmd_line.txt; then
-  echo "warning: $TARGET/builddir uses the removed arm-march option, recreating it"
+# A builddir configured with a removed ARM option can't be reconfigured
+if grep -qsE '^(arm-march|arm-arch = armv9\.2-a)' builddir/meson-private/cmd_line.txt; then
+  echo "warning: $TARGET/builddir uses a removed ARM option, recreating it"
   rm -rf builddir
 fi
 

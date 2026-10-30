@@ -64,7 +64,7 @@
 ## ARM base ISA and per-extension ISA toggles.
 ## meson composes the -march flag from arm-arch + each extension toggle, so
 ## every option below can be turned on/off individually from gbs, e.g.:
-##   gbs build --define "arm_arch armv9.2-a"     # base ISA: armv7-a / armv8-a / armv8.2-a / armv9.2-a
+##   gbs build --define "arm_arch armv8-a"       # base ISA: armv7-a / armv8-a / armv8.2-a
 ##   gbs build --define "enable_sve true"        # extensions take true / false
 ## Only options given via --define are passed; defaults live in meson_options.txt
 ## (arm-arch=auto: armv8.2-a+dotprod+i8mm on aarch64, armv7-a+neon on armv7l).

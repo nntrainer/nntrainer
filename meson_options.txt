@@ -99,9 +99,8 @@ option('causallm-tokenizer-cache', type: 'feature', value: 'auto',
        description: 'Persistent tokenizer snapshot cache (NNTR_TOKENIZER_CACHE=0 turns it off at run time). auto = on when the linked tokenizer library exports the snapshot entry points, which Applications/CausalLM/tools/build_tokenizers_c.sh builds.')
 
 # ARM architecture options
-# @todo remove armv9.2-a; use armv8.2-a + extensions (e.g. +sve2+sme) instead
 option('arm-arch', type: 'combo',
-       choices: ['auto', 'armv7-a', 'armv8-a', 'armv8.2-a', 'armv9.2-a'],
+       choices: ['auto', 'armv7-a', 'armv8-a', 'armv8.2-a'],
        value: 'auto',
        description: 'Target ARM base ISA. "auto" = armv8.2-a on aarch64/android, armv7-a on arm. Ignored on non-ARM builds.')
 # Individual ARM ISA feature toggles. Combined with arm-arch to compose the
