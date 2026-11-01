@@ -2017,6 +2017,47 @@ static void _kvst_mark_scatter(double t1, double tk, double tv, double t2) {
 }
 #endif
 
+// [TEMP-DEBUG] nonfinite scan for paged KV debugging (env NNTR_KV_DEBUG).
+static void nntr_kv_dbg_scan(const char *tag, const void *p, size_t bytes,
+                             bool f32) {
+  size_t nan_cnt = 0, inf_cnt = 0;
+  size_t first = static_cast<size_t>(-1);
+  if (f32) {
+    const float *u = static_cast<const float *>(p);
+    for (size_t i = 0; i < bytes / 4; ++i) {
+      uint32_t b;
+      std::memcpy(&b, u + i, 4);
+      if ((b & 0x7F800000u) == 0x7F800000u) {
+        if (b & 0x007FFFFFu) {
+          if (first == static_cast<size_t>(-1))
+            first = i;
+          ++nan_cnt;
+        } else {
+          if (first == static_cast<size_t>(-1))
+            first = i;
+          ++inf_cnt;
+        }
+      }
+    }
+  } else {
+    const uint16_t *u = static_cast<const uint16_t *>(p);
+    for (size_t i = 0; i < bytes / 2; ++i) {
+      const uint16_t b = u[i];
+      if ((b & 0x7C00u) == 0x7C00u) {
+        if (first == static_cast<size_t>(-1))
+          first = i;
+        if (b & 0x03FFu)
+          ++nan_cnt;
+        else
+          ++inf_cnt;
+      }
+    }
+  }
+  if (nan_cnt || inf_cnt)
+    std::fprintf(stderr, "[kvdbg]   %s bytes=%zu NaN=%zu INF=%zu first=%zu\n",
+                 tag, bytes, nan_cnt, inf_cnt, first);
+}
+
 bool MHACoreLayer::paged_forwarding(
   unsigned int batch, unsigned int from, unsigned int to,
   nntrainer::Tensor &query, nntrainer::Tensor &key, nntrainer::Tensor &value,
@@ -2045,56 +2086,221 @@ bool MHACoreLayer::paged_forwarding(
       value.width() != key.width() || key.height() != query.height() ||
       value.height() != query.height())
     throw std::invalid_argument("Paged MHA operand geometry mismatch");
+  if (nntr_env_on("NNTR_KV_DEBUG")) {
+    nntr_kv_dbg_scan("in_q", query.getData<char>(), query.bytes(),
+                     query.getDataType() == DataType::FP32);
+    nntr_kv_dbg_scan("in_k", key.getData<char>(), key.bytes(),
+                     key.getDataType() == DataType::FP32);
+    nntr_kv_dbg_scan("in_v", value.getData<char>(), value.bytes(),
+                     value.getDataType() == DataType::FP32);
+  }
+
   // Only the new token block is staged. History stays in pool pages.
-  auto fp32_copy = [](nntrainer::Tensor &input) {
-    auto dim = input.getDim();
-    dim.setDataType(DataType::FP32);
-    nntrainer::Tensor result(dim, true);
-    result.copyData(input);
-    return result;
-  };
+  const void *dbg_appended_k = nullptr;
+  const void *dbg_appended_v = nullptr;
   if (!access->alias()) {
-    auto k = fp32_copy(key);
-    auto v = fp32_copy(value);
-    if (theta > 0)
-      apply_rotary_emb_tensor_v2(k, k, head_dim, from, true);
-    auto dim = k.getDim();
-    dim.setDataType(key_handle.getDataType());
-    nntrainer::Tensor stored_k(dim, true), stored_v(dim, true);
-    if (spec.encoding == Encoding::Float32) {
-      stored_k.copyData(k);
-      stored_v.copyData(v);
+    const auto target_type = key_handle.getDataType();
+    auto k_dim = key.getDim();
+    k_dim.setDataType(target_type);
+    nntrainer::Tensor stored_k(k_dim, true);
+
+    if (key.getDataType() == target_type) {
+      if (theta > 0)
+        apply_rotary_emb_tensor_v2(key, stored_k, head_dim, from, true);
+      else
+        stored_k.copyData(key);
     } else {
-      for (size_t i = 0; i < k.size(); ++i) {
-        stored_k.getData<uint16_t>()[i] =
-          nntrainer::compute_fp32_to_fp16(k.getData<float>()[i]);
-        stored_v.getData<uint16_t>()[i] =
-          nntrainer::compute_fp32_to_fp16(v.getData<float>()[i]);
-      }
+      nntrainer::Tensor k_in(k_dim, true);
+      k_in.copyData(key);
+      if (theta > 0)
+        apply_rotary_emb_tensor_v2(k_in, stored_k, head_dim, from, true);
+      else
+        stored_k.copyData(k_in);
     }
-    access->append(stored_k.getData<char>(), stored_v.getData<char>(),
-                   stored_k.bytes());
+
+    const void *v_ptr = nullptr;
+    nntrainer::Tensor stored_v;
+    if (value.getDataType() == target_type) {
+      v_ptr = value.getData<char>();
+    } else {
+      auto v_dim = value.getDim();
+      v_dim.setDataType(target_type);
+      stored_v = nntrainer::Tensor(v_dim, true);
+      stored_v.copyData(value);
+      v_ptr = stored_v.getData<char>();
+    }
+
+    access->append(stored_k.getData<char>(), v_ptr, stored_k.bytes());
+    dbg_appended_k = stored_k.getData<char>();
+    dbg_appended_v = v_ptr;
   }
   if (skip_prefill && to - from > 1)
     return true;
-  auto q = fp32_copy(query);
+
+  nntrainer::Tensor rotated_q(query.getDim(), true);
   if (theta > 0)
-    apply_rotary_emb_tensor_v2(q, q, head_dim, from, true);
+    apply_rotary_emb_tensor_v2(query, rotated_q, head_dim, from, true);
+  else
+    rotated_q.copyData(query);
+
   AttentionOptions options;
   options.query_heads = num_heads_Q;
   options.causal = is_causal;
   options.window = is_causal ? local_window_size : 0;
   options.logit_softcap = attn_logit_softcapping;
   if (sink) {
-    auto sink_fp32 = fp32_copy(*sink);
-    options.sinks.assign(sink_fp32.getData<float>(),
-                         sink_fp32.getData<float>() + sink_fp32.size());
+    if (sink->getDataType() == DataType::FP32) {
+      options.sinks.assign(sink->getData<float>(),
+                           sink->getData<float>() + sink->size());
+    } else {
+      const size_t sz = sink->size();
+      options.sinks.resize(sz);
+      const uint16_t *s_ptr = sink->getData<uint16_t>();
+      for (size_t i = 0; i < sz; ++i)
+        options.sinks[i] = nntrainer::compute_fp16_to_fp32(s_ptr[i]);
+    }
   }
-  std::vector<float> queries(q.getData<float>(), q.getData<float>() + q.size());
+
+  // Reroute to the host flash kernel (gemm_attention) when the model has no
+  // sink / softcap tail: with page_tokens aligned to the flash key block the
+  // pages are read zero-copy with the continuous cache's exact block
+  // arithmetic, so paged results stay bit-identical to continuous mode.
+  // Sink / softcap models keep the online-softmax kernel below.
+  if (nntr_env_on("NNTR_KV_DEBUG")) {
+    static unsigned dbg_call = 0;
+    const unsigned dbg_no = dbg_call++;
+    const bool dbg_f32 = spec.encoding == Encoding::Float32;
+    const size_t dbg_rb = spec.rowBytes();
+    nntr_kv_dbg_scan("q", rotated_q.getData<char>(), rotated_q.bytes(),
+                     rotated_q.getDataType() == DataType::FP32);
+    std::fprintf(stderr,
+                 "[kvdbg] call=%u from=%u to=%u rb=%zu f32=%d alias=%d\n",
+                 dbg_no, from, to, dbg_rb, (int)dbg_f32, (int)access->alias());
+    if (dbg_appended_k) {
+      nntr_kv_dbg_scan("appended_k", dbg_appended_k,
+                       (size_t)(to - from) * dbg_rb, dbg_f32);
+      nntr_kv_dbg_scan("appended_v", dbg_appended_v,
+                       (size_t)(to - from) * dbg_rb, dbg_f32);
+    }
+    const size_t dbg_pt = access->pageTokens();
+    const size_t dbg_pages = ((size_t)to + dbg_pt - 1) / dbg_pt;
+    std::vector<const uint16_t *> dbg_kp(dbg_pages, nullptr);
+    std::vector<const uint16_t *> dbg_vp(dbg_pages, nullptr);
+    size_t dbg_pos_k = 0, dbg_pos_v = 0;
+    bool dbg_fill_ok = true;
+    auto dbg_fill = [&](std::vector<KvView> segs,
+                        std::vector<const uint16_t *> &dst, size_t &dbg_pos) {
+      for (const auto &v : segs) {
+        const size_t page = dbg_pos / dbg_pt;
+        if (page >= dst.size() || dst[page]) {
+          dbg_fill_ok = false;
+          break;
+        }
+        dst[page] = static_cast<const uint16_t *>(v.data()) -
+                    v.offsetBytes() / sizeof(uint16_t);
+        dbg_pos += v.sizeBytes() / dbg_rb;
+      }
+    };
+    dbg_fill(access->readKeyViews(batch), dbg_kp, dbg_pos_k);
+    dbg_fill(access->readValueViews(batch), dbg_vp, dbg_pos_v);
+    if (dbg_fill_ok && dbg_pos_k == (size_t)to && dbg_pos_v == (size_t)to) {
+      size_t dbg_mm = 0;
+      for (size_t n = from; n < (size_t)to && dbg_appended_k; ++n) {
+        const size_t pg = n / dbg_pt;
+        const size_t off = n % dbg_pt;
+        const char *pk = (const char *)dbg_kp[pg] + off * dbg_rb;
+        const char *pv = (const char *)dbg_vp[pg] + off * dbg_rb;
+        const char *ek = (const char *)dbg_appended_k + (n - from) * dbg_rb;
+        const char *ev = (const char *)dbg_appended_v + (n - from) * dbg_rb;
+        if (std::memcmp(pk, ek, dbg_rb) || std::memcmp(pv, ev, dbg_rb)) {
+          if (dbg_mm < 3)
+            std::fprintf(stderr,
+                         "[kvdbg]   MISMATCH token=%zu pg=%zu off=%zu "
+                         "pageK=%02x%02x appK=%02x%02x\n",
+                         n, pg, off, (unsigned)(unsigned char)pk[0],
+                         (unsigned)(unsigned char)pk[1],
+                         (unsigned)(unsigned char)ek[0],
+                         (unsigned)(unsigned char)ek[1]);
+          ++dbg_mm;
+        }
+      }
+      if (dbg_mm)
+        std::fprintf(stderr, "[kvdbg] call=%u MISMATCHES=%zu\n", dbg_no,
+                     dbg_mm);
+      for (size_t pg = 0; pg < dbg_pages; ++pg) {
+        const size_t start = pg * dbg_pt;
+        const size_t rows = std::min((size_t)to - start, dbg_pt);
+        nntr_kv_dbg_scan("page_k", dbg_kp[pg], rows * dbg_rb, dbg_f32);
+        nntr_kv_dbg_scan("page_v", dbg_vp[pg], rows * dbg_rb, dbg_f32);
+      }
+    } else {
+      std::fprintf(stderr,
+                   "[kvdbg] call=%u fill abnormal posk=%zu posv=%zu want=%zu "
+                   "ok=%d\n",
+                   dbg_no, dbg_pos_k, dbg_pos_v, (size_t)to, (int)dbg_fill_ok);
+    }
+  }
+
+  const size_t page_tokens = access->pageTokens();
+  if (!nntr_env_on("NNTR_KV_NO_FLASH") && !sink &&
+      attn_logit_softcapping == 0.0f && page_tokens > 0) {
+    const size_t pages =
+      (static_cast<size_t>(to) + page_tokens - 1) / page_tokens;
+    std::vector<const uint16_t *> k_pages(pages, nullptr);
+    std::vector<const uint16_t *> v_pages(pages, nullptr);
+    auto fill_pages = [&](std::vector<KvView> segs,
+                          std::vector<const uint16_t *> &dst) {
+      size_t pos = 0;
+      for (const auto &v : segs) {
+        const size_t page = pos / page_tokens;
+        NNTR_THROW_IF(page >= dst.size() || dst[page], std::invalid_argument)
+          << "Unexpected paged KV view segmentation";
+        dst[page] = static_cast<const uint16_t *>(v.data()) -
+                    v.offsetBytes() / sizeof(uint16_t);
+        pos += v.sizeBytes() / spec.rowBytes();
+      }
+      NNTR_THROW_IF(pos != static_cast<size_t>(to), std::invalid_argument)
+        << "Paged KV views do not cover the step";
+    };
+    fill_pages(access->readKeyViews(batch), k_pages);
+    fill_pages(access->readValueViews(batch), v_pages);
+
+    MhaPagedKvPages paged_src;
+    paged_src.k_pages = k_pages.data();
+    paged_src.v_pages = v_pages.data();
+    paged_src.page_tokens = static_cast<unsigned int>(page_tokens);
+    // K/V pages carry the whole history [0, to); queries are [from, to).
+    gemm_attention(rotated_q, key_handle, value_handle, output,
+                   /*N_kv=*/to, /*N_q=*/to - from, /*cache_from=*/from,
+                   &paged_src);
+    if (runtime_config.cpu_trace)
+      std::fprintf(stderr,
+                   "[kv-paged-flash-attention] from=%u to=%u pages=%zu "
+                   "page_tokens=%u alias=%d\n",
+                   from, to, pages, paged_src.page_tokens, access->alias());
+    return true;
+  }
+
+  const size_t q_size = rotated_q.size();
+  std::vector<float> queries(q_size);
+  if (rotated_q.getDataType() == DataType::FP32) {
+    const float *q_ptr = rotated_q.getData<float>();
+    std::copy(q_ptr, q_ptr + q_size, queries.begin());
+  } else {
+    const uint16_t *q_ptr = rotated_q.getData<uint16_t>();
+    for (size_t i = 0; i < q_size; ++i)
+      queries[i] = nntrainer::compute_fp16_to_fp32(q_ptr[i]);
+  }
+
   auto result = access->attention(queries, options);
-  nntrainer::Tensor fp32_output(q.getDim(), true);
-  std::copy(result.begin(), result.end(), fp32_output.getData<float>());
-  output.copyData(fp32_output);
+
+  if (output.getDataType() == DataType::FP32) {
+    std::copy(result.begin(), result.end(), output.getData<float>());
+  } else {
+    uint16_t *out_ptr = output.getData<uint16_t>();
+    for (size_t i = 0; i < result.size(); ++i)
+      out_ptr[i] = nntrainer::compute_fp32_to_fp16(result[i]);
+  }
   if (runtime_config.cpu_trace)
     std::fprintf(
       stderr,
@@ -4907,7 +5113,8 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
                                   nntrainer::Tensor &b_cached_value,
                                   nntrainer::Tensor &attention_output_step,
                                   unsigned int N_kv, unsigned int N_q,
-                                  unsigned int cache_from) {
+                                  unsigned int cache_from,
+                                  const MhaPagedKvPages *paged) {
   const unsigned int d = head_dim;
   const unsigned int HD_Q = num_heads_Q * d;
   const unsigned int HD_KV = num_heads_KV * d;
@@ -5088,13 +5295,28 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
   const bool direct_kv = false;
   const bool tiled_kv = false;
 #endif
-  const bool pack_history = !direct_kv && !tiled_kv;
-  const unsigned int kv_stride = pack_history ? d : HD_KV;
+  bool pack_history = !direct_kv && !tiled_kv;
   std::vector<uint16_t> Ka, Va;
+  // Paged KV page table (see MhaPagedKvPages): pages aligned to the flash
+  // key block are read zero-copy inside the key-block loop below (same
+  // arithmetic as the continuous cache); unaligned pages gather the history
+  // into the pack buffers once, sharing the pack_history layout.
+  bool paged_direct = false;
+  unsigned int page_tokens = 0;
+  if (paged && paged->k_pages && paged->v_pages) {
+    page_tokens = paged->page_tokens;
+    NNTR_THROW_IF(!page_tokens, std::invalid_argument)
+      << "Paged KV source requires a positive page_tokens";
+    if (!kv_int8 && page_tokens % Bk == 0)
+      paged_direct = true;
+    else
+      pack_history = true;
+  }
   if (pack_history) {
     Ka.resize((size_t)num_heads_KV * N_kv * d);
     Va.resize((size_t)num_heads_KV * N_kv * d);
   }
+  const unsigned int kv_stride = pack_history ? d : HD_KV;
   const bool trace_cpu = runtime_config.cpu_trace;
   std::atomic<size_t> tile_pack_bytes{0}, tile_scratch_bytes{0};
   {
@@ -5161,18 +5383,37 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         << "kv_int8 gemm_attention requires ENABLE_FP16";
 #endif
     } else if (pack_history) {
-      tm.parallel_for(0, static_cast<size_t>(num_heads_KV), [&](size_t hkv) {
-        uint16_t *ka = Ka.data() + (size_t)hkv * N_kv * d;
-        uint16_t *va = Va.data() + (size_t)hkv * N_kv * d;
-        const uint16_t *kh = Kbase + hkv * d;
-        const uint16_t *vh = Vbase + hkv * d;
-        for (unsigned int n = 0; n < N_kv; ++n) {
-          std::memcpy(ka + (size_t)n * d, kh + (size_t)n * HD_KV,
-                      d * sizeof(uint16_t));
-          std::memcpy(va + (size_t)n * d, vh + (size_t)n * HD_KV,
-                      d * sizeof(uint16_t));
-        }
-      });
+      if (paged) {
+        // Paged gather: token n lives in page n/P at row n%P. Pure memcpy,
+        // so the packed bits match the continuous pack exactly.
+        tm.parallel_for(0, static_cast<size_t>(num_heads_KV), [&](size_t hkv) {
+          uint16_t *ka = Ka.data() + (size_t)hkv * N_kv * d;
+          uint16_t *va = Va.data() + (size_t)hkv * N_kv * d;
+          for (unsigned int n = 0; n < N_kv; ++n) {
+            const unsigned int page = n / page_tokens;
+            const unsigned int off = n % page_tokens;
+            std::memcpy(ka + (size_t)n * d,
+                        paged->k_pages[page] + (size_t)off * HD_KV + hkv * d,
+                        d * sizeof(uint16_t));
+            std::memcpy(va + (size_t)n * d,
+                        paged->v_pages[page] + (size_t)off * HD_KV + hkv * d,
+                        d * sizeof(uint16_t));
+          }
+        });
+      } else {
+        tm.parallel_for(0, static_cast<size_t>(num_heads_KV), [&](size_t hkv) {
+          uint16_t *ka = Ka.data() + (size_t)hkv * N_kv * d;
+          uint16_t *va = Va.data() + (size_t)hkv * N_kv * d;
+          const uint16_t *kh = Kbase + hkv * d;
+          const uint16_t *vh = Vbase + hkv * d;
+          for (unsigned int n = 0; n < N_kv; ++n) {
+            std::memcpy(ka + (size_t)n * d, kh + (size_t)n * HD_KV,
+                        d * sizeof(uint16_t));
+            std::memcpy(va + (size_t)n * d, vh + (size_t)n * HD_KV,
+                        d * sizeof(uint16_t));
+          }
+        });
+      }
     }
   }
 
@@ -5258,8 +5499,18 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
       // Does this block straddle the sliding-window lower bound for any row?
       const bool window_boundary = windowed && ((size_t)kb + W < q_abs_hi + 1);
 
-      const uint16_t *Kblock = Kp + (size_t)kb * kv_stride;
-      const uint16_t *Vblock = Vp + (size_t)kb * kv_stride;
+      // Paged zero-copy: page_tokens % Bk == 0 keeps every key block inside
+      // one page, so pick the page base and index the token-major row within
+      // it -- the same layout and block arithmetic the continuous cache uses,
+      // hence bit-identical scores (mha_hsgemm_avx2 is ldb/alignment agnostic).
+      const uint16_t *Kblock =
+        paged_direct ? paged->k_pages[kb / page_tokens] +
+                         (size_t)(kb % page_tokens) * HD_KV + (size_t)h_kv * d
+                     : Kp + (size_t)kb * kv_stride;
+      const uint16_t *Vblock =
+        paged_direct ? paged->v_pages[kb / page_tokens] +
+                         (size_t)(kb % page_tokens) * HD_KV + (size_t)h_kv * d
+                     : Vp + (size_t)kb * kv_stride;
       if (tiled_kv) {
         for (unsigned int k = 0; k < bk; ++k) {
           std::memcpy(Ktile.data() + (size_t)k * d,

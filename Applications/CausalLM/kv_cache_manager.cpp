@@ -22,6 +22,7 @@
 #include <engine.h>
 #include <env_compat.h>
 #include <mem_allocator.h>
+#include <mha_core.h>
 #include <nntrainer_log.h>
 #include <runtime_config.h>
 
@@ -311,7 +312,13 @@ void KVCacheManager::allocateCpu(
     throw std::invalid_argument("Unsupported CPU KV geometry or storage type");
 
   CacheSpec spec;
-  spec.page_tokens = RuntimeConfig::capture().cpu_kv_paged ? 16u : 0u;
+  // Default page width follows the host flash key block (gemm_attention Bk):
+  // page_tokens % Bk == 0 lets the paged MHA read pages zero-copy with the
+  // continuous cache's exact block arithmetic (bit-identical results).
+  // NNTR_KV_PAGE_TOKENS still overrides for tests/experiments.
+  spec.page_tokens = RuntimeConfig::capture().cpu_kv_paged
+                       ? causallm::mha_host_flash_kv_block()
+                       : 0u;
   if (spec.page_tokens) {
     if (const char *value = std::getenv("NNTR_KV_PAGE_TOKENS")) {
       const std::string text(value);

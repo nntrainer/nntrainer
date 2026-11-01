@@ -351,6 +351,35 @@ unsigned int prefillSpanHint();
  *             [ O ]
  *
  */
+/** Default key-block width (Bk) of the host flash attention kernel
+ * (gemm_attention). KV page_tokens should be a multiple of this so the paged
+ * path reads pages zero-copy with the continuous cache's exact block
+ * arithmetic (bit-identical results); 512 on x86, 128 on ARM.
+ */
+inline unsigned int mha_host_flash_kv_block() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  return 512u;
+#else
+  return 128u;
+#endif
+}
+
+/** Paged KV page table for gemm_attention: k_pages/v_pages[p] point at the
+ * token-major page base (row stride = num_kv_heads * head_dim, the same
+ * layout as the continuous cache) and page_tokens is the page width in
+ * tokens. When page_tokens % Bk == 0 (Bk = mha_host_flash_kv_block()) the
+ * kernel reads pages zero-copy with the continuous path's exact flash block
+ * arithmetic, reproducing continuous-mode results bit-for-bit; otherwise the
+ * history is gathered once into the contiguous pack buffers (the same
+ * layout the pack_history path already uses).
+ */
+struct MhaPagedKvPages {
+  const uint16_t *const *k_pages = nullptr;
+  const uint16_t *const *v_pages = nullptr;
+  unsigned int page_tokens = 0;
+};
+
 WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
 public:
   /**
@@ -695,13 +724,18 @@ private:
    * @param[in] N_q       step length (= step_size, rows of the output)
    * @param[in] cache_from absolute starting position of queries in the cache
    *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
+   * @param[in] paged      optional paged KV page table (see MhaPagedKvPages);
+   *                      when given, K/V are read from the pages instead of
+   *                      the b_cached_key/b_cached_value tensors (which are
+   *                      then ignored and may be small identity tensors)
    */
   void gemm_attention(nntrainer::Tensor &query_step,
                       nntrainer::Tensor &b_cached_key,
                       nntrainer::Tensor &b_cached_value,
                       nntrainer::Tensor &attention_output_step,
                       unsigned int N_kv, unsigned int N_q,
-                      unsigned int cache_from);
+                      unsigned int cache_from,
+                      const MhaPagedKvPages *paged = nullptr);
 
   enum INOUT_INDEX {
     /** input index */

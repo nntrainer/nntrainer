@@ -4,6 +4,7 @@
  * @author Codex (OpenAI)
  * @bug Covers synchronous CPU storage; device integration is not exercised.
  */
+#include <fp16.h>
 #include <gtest/gtest.h>
 #include <kv_cache/kv_cache_manager.h>
 #include <tensor.h>
@@ -626,6 +627,188 @@ TEST(KvCacheCore, pagedAttentionDecodesBinary16WithoutNativeHalf) {
   EXPECT_FLOAT_EQ(output[5], 3);
   EXPECT_FLOAT_EQ(output[6], 4);
   EXPECT_FLOAT_EQ(output[7], 5);
+}
+
+TEST(KvCacheCore,
+     pagedAttentionVectorizedMatchesDenseReferenceForStandardHeadDim) {
+  const size_t head_dim = 64;
+  const size_t num_kv_heads = 2;
+  const size_t query_heads = 4;
+  const size_t page_tokens = 4;
+  const size_t max_tokens = 16;
+
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = num_kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = max_tokens;
+  layer.max_tokens = max_tokens;
+  layer.encoding = Encoding::Float32;
+  layer.storage_type = StorageType::Float32;
+  s.layers = {layer};
+  s.page_tokens = page_tokens;
+
+  KvCacheManager manager;
+  manager.initialize(s);
+
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  options.causal = true;
+
+  std::vector<float> history_k, history_v;
+
+  for (size_t count : {5u, 1u, 2u}) {
+    auto step = manager.beginStep(count);
+    const size_t width = query_heads * head_dim;
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] = std::sin(static_cast<float>(i + step.from() * 7 + 1));
+
+    std::vector<float> k(count * num_kv_heads * head_dim);
+    std::vector<float> v(count * num_kv_heads * head_dim);
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = std::cos(static_cast<float>(i + step.from() * 11 + 3)) * 0.1f;
+      v[i] = static_cast<float>((i + 5) % 37) / 19.0f;
+    }
+
+    manager.append(step, 0, k.data(), v.data(), k.size() * sizeof(float));
+    history_k.insert(history_k.end(), k.begin(), k.end());
+    history_v.insert(history_v.end(), v.begin(), v.end());
+    manager.markReady(step, 0);
+
+    auto actual = manager.attention(step, 0, queries, options);
+
+    const size_t group = query_heads / num_kv_heads;
+    const size_t kv_width = num_kv_heads * head_dim;
+
+    for (size_t q = 0; q < count; ++q) {
+      const size_t end = step.from() + q + 1;
+      for (size_t h = 0; h < query_heads; ++h) {
+        std::vector<double> scores(end);
+        for (size_t t = 0; t < end; ++t) {
+          double score = 0;
+          for (size_t d = 0; d < head_dim; ++d) {
+            score +=
+              static_cast<double>(queries[q * width + h * head_dim + d]) *
+              history_k[t * kv_width + (h / group) * head_dim + d];
+          }
+          scores[t] = score * options.scale;
+        }
+        double maximum = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (double &sc : scores) {
+          sc = std::exp(sc - maximum);
+          sum += sc;
+        }
+        for (size_t d = 0; d < head_dim; ++d) {
+          double expected = 0;
+          for (size_t t = 0; t < end; ++t)
+            expected += scores[t] *
+                        history_v[t * kv_width + (h / group) * head_dim + d] /
+                        sum;
+          EXPECT_NEAR(actual[q * width + h * head_dim + d], expected, 1e-4);
+        }
+      }
+    }
+    finish(manager, std::move(step));
+  }
+}
+
+TEST(KvCacheCore,
+     pagedAttentionVectorizedFloat16MatchesDenseReferenceForStandardHeadDim) {
+  const size_t head_dim = 64;
+  const size_t num_kv_heads = 2;
+  const size_t query_heads = 4;
+  const size_t page_tokens = 4;
+  const size_t max_tokens = 16;
+
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = num_kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = max_tokens;
+  layer.max_tokens = max_tokens;
+  layer.encoding = Encoding::Float16;
+  layer.storage_type = StorageType::UInt16;
+  s.layers = {layer};
+  s.page_tokens = page_tokens;
+
+  KvCacheManager manager;
+  manager.initialize(s);
+
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  options.causal = true;
+
+  std::vector<float> history_k, history_v;
+
+  for (size_t count : {4u, 1u}) {
+    auto step = manager.beginStep(count);
+    const size_t width = query_heads * head_dim;
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] = std::sin(static_cast<float>(i + step.from() * 5 + 2));
+
+    const size_t kv_elements = count * num_kv_heads * head_dim;
+    std::vector<uint16_t> k_u16(kv_elements), v_u16(kv_elements);
+    std::vector<float> k_f32(kv_elements), v_f32(kv_elements);
+
+    for (size_t i = 0; i < kv_elements; ++i) {
+      float k_val =
+        std::cos(static_cast<float>(i + step.from() * 7 + 1)) * 0.1f;
+      float v_val = static_cast<float>((i + 3) % 29) / 15.0f;
+      uint16_t k_bits = nntrainer::compute_fp32_to_fp16(k_val);
+      uint16_t v_bits = nntrainer::compute_fp32_to_fp16(v_val);
+      k_u16[i] = k_bits;
+      v_u16[i] = v_bits;
+      k_f32[i] = nntrainer::compute_fp16_to_fp32(k_bits);
+      v_f32[i] = nntrainer::compute_fp16_to_fp32(v_bits);
+    }
+
+    manager.append(step, 0, k_u16.data(), v_u16.data(),
+                   kv_elements * sizeof(uint16_t));
+    history_k.insert(history_k.end(), k_f32.begin(), k_f32.end());
+    history_v.insert(history_v.end(), v_f32.begin(), v_f32.end());
+    manager.markReady(step, 0);
+
+    auto actual = manager.attention(step, 0, queries, options);
+
+    const size_t group = query_heads / num_kv_heads;
+    const size_t kv_width = num_kv_heads * head_dim;
+
+    for (size_t q = 0; q < count; ++q) {
+      const size_t end = step.from() + q + 1;
+      for (size_t h = 0; h < query_heads; ++h) {
+        std::vector<double> scores(end);
+        for (size_t t = 0; t < end; ++t) {
+          double score = 0;
+          for (size_t d = 0; d < head_dim; ++d) {
+            score +=
+              static_cast<double>(queries[q * width + h * head_dim + d]) *
+              history_k[t * kv_width + (h / group) * head_dim + d];
+          }
+          scores[t] = score * options.scale;
+        }
+        double maximum = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (double &sc : scores) {
+          sc = std::exp(sc - maximum);
+          sum += sc;
+        }
+        for (size_t d = 0; d < head_dim; ++d) {
+          double expected = 0;
+          for (size_t t = 0; t < end; ++t)
+            expected += scores[t] *
+                        history_v[t * kv_width + (h / group) * head_dim + d] /
+                        sum;
+          EXPECT_NEAR(actual[q * width + h * head_dim + d], expected, 2e-3);
+        }
+      }
+    }
+    finish(manager, std::move(step));
+  }
 }
 
 TEST(KvCacheCore, pagedTruncateReturnsWholeBlocksAndRejectsForwardSeek) {

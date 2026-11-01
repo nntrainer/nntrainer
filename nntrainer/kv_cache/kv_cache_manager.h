@@ -145,6 +145,8 @@ public:
   std::shared_ptr<MemoryData> keyMemory(size_t layer);
   std::shared_ptr<MemoryData> valueMemory(size_t layer);
   bool paged() const;
+  /** Page width in tokens of the initialized spec (0 for continuous). */
+  size_t pageTokens() const;
   /** One-row graph identity tensors, never used to hold cache history. */
   std::shared_ptr<MemoryData> graphKeyMemory(size_t layer);
   std::shared_ptr<MemoryData> graphValueMemory(size_t layer);
@@ -173,6 +175,13 @@ public:
   void append(const void *key, const void *value, size_t bytes);
   std::vector<float> attention(const std::vector<float> &,
                                const AttentionOptions &);
+  /** Page width in tokens (0 for continuous storage). */
+  size_t pageTokens() const;
+  /** Ready-checked read views in token order (owner-resolved). Paged storage
+   * yields one view per page; a page base is data() - offsetBytes().
+   */
+  std::vector<KvView> readKeyViews(size_t batch = 0) const;
+  std::vector<KvView> readValueViews(size_t batch = 0) const;
   void validateWrite(const void *key, const void *value, size_t bytes) const;
   void producerReady();
   void validateRead(const void *key, const void *value, size_t bytes) const;

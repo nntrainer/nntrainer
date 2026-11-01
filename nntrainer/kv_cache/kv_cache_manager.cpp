@@ -450,6 +450,10 @@ bool KvCacheManager::paged() const {
   return state_ && state_->spec.page_tokens;
 }
 
+size_t KvCacheManager::pageTokens() const {
+  return state_ ? state_->spec.page_tokens : 0;
+}
+
 std::shared_ptr<MemoryData> KvCacheManager::graphKeyMemory(size_t layer) {
   const auto &s = layerSpec(layer);
   if (!paged())
@@ -483,6 +487,20 @@ std::vector<float> KvLayerAccess::attention(const std::vector<float> &q,
                                             const AttentionOptions &options) {
   auto &scope = checkedScope();
   return scope.manager_.attention(scope.step_, layer_, q, options);
+}
+
+size_t KvLayerAccess::pageTokens() const {
+  return checkedScope().manager_.pageTokens();
+}
+
+std::vector<KvView> KvLayerAccess::readKeyViews(size_t batch) const {
+  auto &scope = checkedScope();
+  return scope.manager_.readKey(scope.step_, layer_, batch);
+}
+
+std::vector<KvView> KvLayerAccess::readValueViews(size_t batch) const {
+  auto &scope = checkedScope();
+  return scope.manager_.readValue(scope.step_, layer_, batch);
 }
 
 void KvCacheManager::savePlane(std::ostream &out, size_t layer, bool key,
