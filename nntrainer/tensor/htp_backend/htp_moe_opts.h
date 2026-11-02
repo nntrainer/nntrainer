@@ -5,7 +5,7 @@
  * @file   htp_moe_opts.h
  * @date   22 Sep 2026
  * @brief  The MoE layer call's option resolver and its profile-row residue,
- *         as pure functions a host check can run (#101, #102)
+ *         as pure functions shared with host checks
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -40,20 +40,15 @@
 #define HTP_MOE_GEMV_LEAD_MAX_UNITS 127u
 #define HTP_MOE_FLAG_GEMV_ROWS1 0x10000u
 
-/** @brief hexkl_mm_u8i4_moe.h's third tune bit and its field (#117): bit 5
- *  says the DSP takes the weight feed from bit 17 (1 = each expert's
- *  weights staged into VTCM by DMA, 0 = read from the arena) instead of
- *  from its build default. Always sent, like the pair above: an unset
- *  run prints applied=0x303e1 (feed=vtcm), NNTR_MOE_HTP_GEMV_FEED=0
- *  0x103e1 (feed=arena, the D192 arena read = #117's A). */
+/** @brief Weight feed override: bit 5 enables bit 17, where 1 selects DMA
+ *  staging into VTCM and 0 selects direct arena reads. Always sent, like
+ *  the lead and row-loop overrides above; matches hexkl_mm_u8i4_moe.h. */
 #define HTP_MOE_FLAG_GEMV_FEED_SET 0x20u
 #define HTP_MOE_FLAG_GEMV_FEED 0x20000u
 
-/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_DMA_BYPASS restated (#158):
- *  bit 18 sets src_bypass on every arena expert weight descriptor, M = 1
- *  feed and M > 1 HMX path alike. On by default since the #158 sitting
- *  (user, 2026-09-29: decode +31..35 %, MoE dumps bit-identical), so an
- *  unset run's word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 clears it (0x303e1). */
+/** @brief Bit 18 sets src_bypass on arena expert weight descriptors for
+ *  both GEMV and HMX, matching hexkl_mm_u8i4_moe.h. Enabled by default;
+ *  NNTR_MOE_DMA_BYPASS=0 disables it. */
 #define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
 
 /** @brief HTP_MOE_FLAG_DMA_BYPASS for getenv("NNTR_MOE_DMA_BYPASS"): set
@@ -62,11 +57,9 @@ static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
   return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
 }
 
-/** @brief hexkl_mm_u8i4_moe.h's DMA queue field restated (#177): bits
- *  [23:22] (at [20:19] before #4415 took bit 19) hold N - 1, the number of
- *  DMA queues (pool lanes) the M = 1 feed splits each weight matrix over.
- *  The default N = 1 leaves the field 0, so an unset run's word stays
- *  0x703e1; N = 2 is 0x4703e1, N = 4 0xc703e1. */
+/** @brief Bits [23:22] encode N - 1 DMA queues for the M=1 weight feed,
+ *  matching hexkl_mm_u8i4_moe.h. The resolver defaults to one queue;
+ *  callers may provide a different configured default. */
 #define HTP_MOE_DMA_Q_SHIFT 22u
 #define HTP_MOE_DMA_Q_BITS 3u
 #define HTP_MOE_DMA_QUEUES_DEFAULT 1u
@@ -91,13 +84,9 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
   return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
 }
 
-/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GELU_TANH restated (#4415's
- *  bit 19; plan 201 S4 had it at 21): every expert's gate_up epilogue
- *  gelu_tanh(gate) * up instead of SwiGLU, on the M = 1 GEMV and the HMX
- *  loop alike. #4415's prefill call ORs it in per call from its act
- *  argument; set_moe_geglu puts it in the session word, which is what the
- *  one-PD token's MOE and DENSE_FFN ops read. A model property: LFM never
- *  sets it, so its word stays 0x703e1. */
+/** @brief Bit 19 selects gelu_tanh(gate) * up in GEMV and HMX, matching
+ *  HEXKL_MOE_FLAG_GELU_TANH. Prefill supplies the activation per call;
+ *  resident MOE and DENSE_FFN ops read the session's set_moe_geglu value. */
 #define HTP_MOE_FLAG_GEGLU 0x80000u
 
 /** Opt-in online rotations, matching hexkl_mm_u8i4_moe.h. These rotate
@@ -145,7 +134,7 @@ static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
 
 /** NNTR_MOE_HADAMARD_SCOPE: default/2bit rotates only 2-bit pairs.
  * all is for kernel experiments; every active width must then be supported.
- * In particular, PR #4416's shared FFN uses unsupported 1056-wide chunks. */
+ * The Gemma shared FFN uses unsupported 1056-wide chunks. */
 static inline int htp_moe_opts_hadamard_scope(const char *env, uint32_t *bits) {
   if (env == NULL || strcmp(env, "2bit") == 0)
     *bits = HTP_MOE_FLAG_HAD_2BIT_ONLY;
@@ -196,28 +185,21 @@ static inline uint32_t htp_moe_gemv_lead_units(const char *env) {
   return (uint32_t)u;
 }
 
-/** @brief The (loop, lead, feed) cell an unset run asks for: #113's D192
- *  under #117's VTCM feed, the same values as hexkl_mm_u8i4_moe.h's
- *  HVX_GEMV_M1_ROWS1, HVX_GEMV_PF_LEAD_KB and HVX_GEMV_M1_FEED. Restated
- *  here because the DSP header does not compile on the ARM side; keep the
- *  two in step. Sent explicitly rather than left to the skel's default so
- *  that every log's echo names its cell (LEDGER rule 21): an unset run
- *  prints applied=0x303e1, NNTR_MOE_HTP_GEMV_FEED=0 prints 0x103e1 (the
- *  D192 arena read), and LEAD_KB=0 ROWS1=0 FEED=0 (the pre-#115 four-row,
- *  no-lead cell) prints 0xe1. */
+/** @brief Defaults matching hexkl_mm_u8i4_moe.h's HVX_GEMV_M1_ROWS1,
+ *  HVX_GEMV_PF_LEAD_KB and HVX_GEMV_M1_FEED. Keep these host values in sync
+ *  with the DSP. Send them explicitly so the options echo confirms them. */
 #define HTP_MOE_GEMV_LEAD_KB_DEFAULT 192u
 #define HTP_MOE_GEMV_ROWS1_DEFAULT 1u
 #define HTP_MOE_GEMV_FEED_DEFAULT 1u
 
 /**
- * @brief moe_set_opts flags for NNTR_MOE_HTP_M1_GEMV and, since #113, the
- *        GEMV tuning variables.
+ * @brief moe_set_opts flags for NNTR_MOE_HTP_M1_GEMV and GEMV tuning.
  * @param env       getenv("NNTR_MOE_HTP_M1_GEMV"), NULL when unset
  * @param lead_env  getenv("NNTR_MOE_HTP_GEMV_LEAD_KB"), NULL when unset
  * @param rows1_env getenv("NNTR_MOE_HTP_GEMV_ROWS1"), NULL when unset
- * @param feed_env  getenv("NNTR_MOE_HTP_GEMV_FEED"), NULL when unset (#117)
- * @return HTP_MOE_FLAG_M1_GEMV when @a env is unset (the default since
- *         #101) or set to a non-zero number, 0 for "0" (the opt-out); plus
+ * @param feed_env  getenv("NNTR_MOE_HTP_GEMV_FEED"), NULL when unset
+ * @return HTP_MOE_FLAG_M1_GEMV when @a env is unset or non-zero, 0 for
+ *         "0" (the opt-out); plus
  *         all three tune bits, each field from its own variable when set
  *         and from the *_DEFAULT above when not
  *

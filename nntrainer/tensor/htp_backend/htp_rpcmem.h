@@ -10,20 +10,10 @@
  * @brief  rpcmem/ION-backed scratch buffer for the HTP weight-registration
  *         path.
  *
- * Ported from test/unittest/htp_rpc_bench.h's RpcBuf/RpcMemApi (a test-only
- * header) so production code can use the same allocator without depending
- * on a test target. The logic is unchanged: resolve rpcmem_alloc/free via
- * dlsym against the process's already-loaded libcdsprpc.so (the SDK's
- * link-time stub does not export them), fall back to plain heap when the
- * device library has none.
- *
- * Why this exists at all: plain heap memory is pinned and mapped on EVERY
- * FastRPC call, which is part of the measured per-call transport; rpcmem/ION
- * memory is recognized by the driver and keeps its SMMU mapping across
- * calls. This branch's own harness already measured the gap
- * (docs/htp_attention/34_fc_measured.md section4 item F: 44.6 GB/s sustained
- * with ION-backed payload buffers) -- the LFM2.5-8B-A1B MoE FFN's own weight
- * registration transport measured at ~155 MB/s before this, on plain heap.
+ * Resolve rpcmem_alloc/free from the loaded libcdsprpc.so because the SDK
+ * link-time stub does not export them. Fall back to heap allocation when
+ * unavailable. Unlike heap buffers, ION buffers retain their SMMU mappings
+ * across FastRPC calls and avoid repeated pinning and mapping.
  *
  * Compiled only when ENABLE_HEXKL is defined.
  */
@@ -88,7 +78,7 @@ struct HtpRpcMemApi {
 };
 
 /**
- * @brief [#141] dspqueue, resolved at runtime from the same libcdsprpc.so,
+ * @brief dspqueue, resolved at runtime from the same libcdsprpc.so,
  *        so libnntrainer.so has no dspqueue import and still loads on a
  *        runtime without it. missing names the first unresolved symbol.
  */
@@ -142,7 +132,7 @@ constexpr uint32_t HTP_RPC_FLAGS_UNCACHED = 0;
 class HtpRpcBuffer {
 public:
   /** @brief How many buffers this process has constructed (ION or heap).
-   *  [#88] Read by the profile's staging: line: a count that grows with
+   *  Read by the profile's staging: line: a count that grows with
    *  the call count means a call path allocates per call; the staging
    *  pool should hold it at one per size class per direction. */
   static uint32_t &allocCount() {

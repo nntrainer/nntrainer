@@ -180,13 +180,11 @@ static uint32_t hexkl_weight_u8i4_free_slot(hexkl_weight_u8i4_table *tbl) {
 }
 
 /**
- * @brief [doc 52 section 10.30] Fills a borrowed slot's scales and column
+ * @brief Fills a borrowed slot's scales and column
  *        sums from the arena, where the host lays them right after the WH
  *        bytes: N f32 scales, then N i32 column sums. Bias is zero.
  *
- * Through the DMA engine, not memcpy: the arena is host-uncached DDR,
- * which the scalar core reads at under 1 GB/s (doc 46 section 10) and the
- * DMA at full bandwidth. Both ends are invalidated around the transfer --
+ * DMA avoids scalar reads of the host-uncached arena. Invalidate both ends:
  * the source because the engine reads through L2 (src_bypass=0) and a
  * previous swap into this slot may have left its lines there, the
  * destination because the epilogues read these arrays and L1 may still
@@ -354,29 +352,10 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     return AEE_ENOMEMORY;
   }
 
-  // Bake every tile into VTCM (borrowed as scratch -- caller holds the HMX
-  // lock and has no other VTCM use in flight), then copy the baked bytes
-  // out to DSP heap memory where they stay resident across calls. A plain
-  // copy, not the DMA ring: registration happens once per weight at model
-  // load, off the per-token hot path.
-  //
-  // This bake is the expensive half of registration -- 7168 independent
-  // 512-byte tiles for a gate_up weight, about 25 ms even split ~6 ways
-  // across the caller's HVX pool, and 64 weights of it is the 1597 ms the
-  // profile reports as "register FastRPC". A run pays it once per weight and
-  // exports the bytes; every later run hands them back through
-  // hexkl_weight_u8i4_register_arena below, already in a host buffer the
-  // DSP has mapped, so neither the bake nor a DSP-heap copy happens again.
-  //
-  // Verified NOT a race (doc 43 section 7, corrected): an earlier session
-  // read a hash mismatch as HMX-lock corruption from running this across
-  // worker threads, but the "serial reference" in that comparison was
-  // itself produced by hvx_worker_pool_run(NULL, ...) with n_units > 1 --
-  // which at the time ran ONLY worker 0's 1/n_units slice. That reference
-  // had baked one tile and left the rest as stale VTCM scratch. The REAL
-  // pool path was re-verified bit-identical to a true serial loop --
-  // FNV-1a of the same M/K/N matmul output matches either way
-  // (0x198748e597cf4105).
+  // Bake disjoint tiles into VTCM scratch, then copy to resident DSP heap.
+  // The caller holds the HMX lock with no other VTCM use in flight.
+  // Registration is outside the token loop; exporting the baked bytes and
+  // using hexkl_weight_u8i4_register_arena avoids rebaking on later loads.
   {
     const uint32_t n_tiles_row = N / HEXKL_HMX_INT8_BLOCK_N_COL;
     const uint32_t n_tiles = wh_bytes / WEIGHT_TILE_BYTES_U8I4;
@@ -880,9 +859,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // buffers of acc_tiles result tiles each, in whatever room is left (at
   // least one tile each): the HMX issues a batch of n-tiles into one while
   // the pool dequantizes the other, the same shape as hexkl_mm_u8i4_moe.c's
-  // epilogue. Dequantizing each tile on the calling thread between two
-  // acc_reads left the HMX idle for it -- 270-400 us of a 1.3-1.8 ms
-  // prefill projection call (doc 51 section 2.24).
+  // epilogue.
   const uint32_t act_bytes =
     n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
@@ -1513,28 +1490,15 @@ out:
 }
 
 /**
- * @brief [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize to
- *        u8 AH tiles, ONE weight, no down matmul.
+ * @brief gate_up matmul -> SwiGLU -> requantize to u8 AH tiles.
  *
- * hexkl_mm_u8i4_fused_run (above) does gate_up AND down in one call, with
- * a six-region VTCM layout carved by hand -- that shipped a real, still
- * unexplained correctness bug on this model's real weights (doc 43 §7's
- * L2 rows), passing its own synthetic-data unit test throughout. This is
- * the smaller-surface alternative: ONE weight, ONE region set (no dual-
- * weight double-buffer, no down-side accumulator reuse to get wrong), and
- * the down matmul is NOT reimplemented here -- the caller feeds this
- * function's out_ah/out_scale/out_zp straight into the ALREADY-DEVICE-
- * VERIFIED hexkl_mm_u8i4_layer_run via its act_ah_prepacked path (the same
- * one mm_u8i4_layer_u8in exposes), so half of the fused kernel's risk
- * surface is "reuse code nobody had to write new."
+ * The fully fused variant's real-weight mismatch (doc 43 section 7) is why
+ * this path keeps gate_up separate from the down matmul.
  *
- * SwiGLU still never leaves the DSP: gate_up's dequantized output lands in
- * VTCM (gate half, up half), hvx_swiglu_inplace_f32 runs on it there, and
- * the result is requantized straight into out_ah without a DDR round trip.
- * What DOES cross FastRPC that a fully-fused call would not: the
- * requantized u8 intermediate (1 byte/value + a scale/zp per row) instead
- * of nothing -- still 4x smaller than the pre-L2 unfused path's f32
- * intermediate, just not zero.
+ * SwiGLU runs in VTCM and is requantized directly into out_ah. The caller
+ * passes out_ah/out_scale/out_zp to hexkl_mm_u8i4_layer_run through
+ * act_ah_prepacked for the down matmul. The FastRPC intermediate is one
+ * byte per value plus scale/zp per row.
  *
  * @param[in]  handle_gate_up  registered handle, N must be even (gate|up)
  * @param[out] out_ah     m_pad(M) * inter bytes, AH-tiled -- inter =

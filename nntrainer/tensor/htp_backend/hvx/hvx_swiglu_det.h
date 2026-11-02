@@ -9,24 +9,9 @@
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * WHY THIS EXISTS
- *
- * The fused MoE FFN path computes SwiGLU on the DSP and requantizes the
- * result to uint8 for the down matmul; the working path computes it on ARM
- * and lets the down matmul's own quantizer do the same thing. Both are
- * accurate to spec and they still disagree, because they are different
- * approximations: a value that lands within half a quantization step of a
- * bin boundary can round to different levels on the two sides. Measured on
- * device (doc 43 section 7): one element of 1792 flips on 5 of 32 expert
- * calls, and the down matmul spreads that one element across all 2048
- * output columns. Twenty-two layers of that is a different token stream.
- *
- * No amount of extra accuracy fixes it -- two independently-rounded
- * pipelines will always disagree somewhere. The fix is for both sides to
- * compute the SAME sequence of IEEE-754 f32 operations, so they produce the
- * same bits and the flip count is exactly zero.
- *
- * THE SPECIFICATION
+ * ARM and DSP must use the same IEEE-754 f32 operation sequence. Different
+ * SwiGLU approximations can cross a uint8 quantization boundary, changing
+ * the down matmul and ultimately the generated tokens.
  *
  * Every operation below is a plain f32 multiply, add, subtract, min or max,
  * each rounding to f32 on its own. No fused multiply-add (it rounds once
@@ -52,7 +37,7 @@
  *
  *   swiglu_det(g, u) = (g * recip_det(1 + exp_det(-g))) * u
  *
- * ACCURACY, for the record -- this is not a precision compromise:
+ * Accuracy:
  *   |r| <= ln2/2, so the degree-7 truncation is r^8/8! <= 5.2e-9 relative,
  *   well under f32's 1.2e-7 epsilon. Three Newton-Raphson steps take the
  *   magic seed's ~6% to ~1.7e-10. Both are below the last bit.
@@ -62,26 +47,13 @@
  * bits(d) > 0x7EF311C2, i.e. d > 1.615e38 -- and Newton-Raphson on a
  * negative seed diverges to NaN rather than to a merely wrong number. At
  * x = 85 the reciprocal's relative error is 1.55e-8 with 36.5M ULPs of
- * headroom to that edge (host-derived, doc 43 section 7). What the clamp
- * discards is nothing: the largest silu term it can suppress is
+ * headroom to that edge. The largest silu term the clamp can suppress is
  * 85*exp(-85) = 1.03e-35 per unit of up.
  *
- * THE ASSUMPTION THIS RESTS ON, AND HOW IT IS CHECKED
- *
- * That HVX's Vsf multiply and add round exactly the way ARM's f32 multiply
- * and add do. hvx_exp_f32.h's own comment says chained Vsf multiply-adds
- * "lose precision that qf32 retains", which is either the ordinary
- * observation that f32 rounds at every step where an extended format does
- * not -- in which case this works -- or a statement that Vsf is not
- * IEEE-correctly-rounded, in which case bit identity is impossible here and
- * this whole approach is dead.
- *
- * That is not something to assume. nntr_hvx_swiglu_det_f32 exposes this
- * function's output AND its two intermediates, and
- * unittest_hvx_softmax.cpp's HvxSwigluDet.MatchesScalarBitExact compares all
- * three against a scalar reference built from the same spec, bit for bit.
- * If it fails, its per-stage counts say whether exp_det, recip_det or the
- * final multiply is where the two arithmetics part company.
+ * Bit identity requires HVX Vsf multiply/add to round like ARM f32.
+ * HvxSwigluDet.MatchesScalarBitExact in unittest_hvx_softmax.cpp compares
+ * exp_det, recip_det and the final output from nntr_hvx_swiglu_det_f32
+ * with the scalar spec, reporting mismatches per stage.
  */
 
 #ifndef __NNTRAINER_HVX_SWIGLU_DET_H__

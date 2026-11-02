@@ -10,20 +10,16 @@
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * Plan 170 section 3. Every fp16 step of the spec is one hf op or one
- * hvx_attn_m1_hf.h primitive (its fused FMA was bit-exact on silicon
- * against the spec on real, adversarial and zero / sign triples: S1, G1).
+ * Every fp16 step of the spec is one hf op or one hvx_attn_m1_hf.h primitive.
  * One call rounds k / v / q as vectors (the v row into V, the k row kept
  * for P1, q as one zipped row per head), then runs three pool runs with
- * two short serial steps between them (the lane plan from S1's cost sweep:
- * the one-head score shape and the four-head PV shape scale to 6 lanes,
- * the two-head score shape does not):
+ * two serial steps between them:
  *
  *   P1 scores   unit = (kv head, 64-position Kt tile): the last tile first
  *               takes the new k column (spec step 1); for each q head of
  *               the kv head, eight accumulators over d = 8 blk + l (the
  *               CPU's float16x8_t lanes, positions in the vector lanes;
- *               q[d] a vlut16 splat of the zipped row, round 3), the
+ *               q[d] a vlut16 splat of the zipped row), the
  *               vpaddq tree, 0 + t, * scale -> S[hq][tile]. The tile
  *               (8 KiB) is read from DDR once, behind an l2fetch the lane
  *               issued one unit earlier, and from L2 for the other q heads.
@@ -32,8 +28,8 @@
  *   P2 exp      same units: e = exp16(hf(s - m)) (masked lanes 0) back to
  *               S, and into ET[p][hq], one 128-byte row per position with
  *               the q heads in lanes 0 .. n_q - 1, by a 4-head transpose
- *               and masked vector stores. Since
- *               round 3 exp16 is the spec's checked table (37 KiB in the
+ *               and masked vector stores. exp16 uses the spec's checked
+ *               table (37 KiB in the
  *               ctx) at the spec's index, three integer ops per vector,
  *               gathered by scalar loads for the unit's heads at once.
  *   caller      l: the CPU's sequential fp16 sum, all q heads at once: one
@@ -45,9 +41,9 @@
  *               of a group sharing each V row load, the V rows l2fetched
  *               two PV_BLOCKs ahead; out = o widened to f32 as vectors.
  *
- * [plan 201 S4] Gemma 4: a head_dim of 256 or 512 is head_dim / 64 chunks
+ * Gemma 4: a head_dim of 256 or 512 is head_dim / 64 chunks
  * of the same vectors (P1 runs its chains on through the chunks' zipped q
- * rows, P3 one walk per PV_CG(ng) chunks, #261), and a window starts every
+ * rows, P3 one walk per PV_CG(ng) chunks), and a window starts every
  * run at the tile of the first visible position, its lanes before that masked
  * like the lanes past L (max, exp), the sum and PV chains from that position.
  *
@@ -55,7 +51,7 @@
  * caller's rounding and stores, SCORES = P1 (with the k column merge),
  * SOFTMAX = P2 + the two caller steps + the divides, PV = P3's chains,
  * summed over lanes; POOL spans P1 .. P3; BUSY_MAX is the busiest lane over
- * the three runs; LANES and START_MAX are P1's. Round 3 splits SOFTMAX:
+ * the three runs; LANES and START_MAX are P1's. SOFTMAX is split into:
  * EXP and ET bracket P2's two halves per unit, MAX and SUM the caller's
  * steps, DIV the divides (every bracket behind if (ps) / if (prof), so a
  * NULL prof takes no timestamp).
@@ -81,9 +77,8 @@
 #define TILE 64u
 /** @brief Vector length in bytes, the alignment of every buffer. */
 #define VLEN 128u
-/** @brief hf lanes per vector: one 64-wide chunk of a head row. head_dim
- *         is a multiple of it (#152: 64; plan 201 S4: up to 512, Gemma 4's
- *         256 and 512), head_dim / CH chunks a row. */
+/** @brief hf lanes per vector: one 64-wide chunk of a head row.
+ *         head_dim is a multiple of CH up to 512, with head_dim / CH chunks. */
 #define CH 64u
 /** @brief Upper bound on q heads per kv head. */
 #define MAX_GQA 8u
@@ -98,13 +93,8 @@
 /** @brief fp16 bits of -65504, the mask fill for the max. */
 #define HF_NEG_MAX 0xFBFF
 
-/** exp16 by the checked table (plan 170 round 3 section 3.1), the same bits
-   as hvx_hf_exp16. S4 (cold pos 1023, 6 lanes, lane-summed): the table's
-   scalar gather read 387-389 k pcycles where hvx_hf_exp16 read 272 k (the
-   v79 ISS: 124 k and 271 k -- it prices the compute, not six threads'
-   gathers). The G6 gates were read with the table on, so it stays the
-   default; 0 compiles hvx_hf_exp16 back, round 4's first cell, before
-   vgather from VTCM (plan section 3.5). */
+/** Use the checked exp16 table by default. Set to 0 to use hvx_hf_exp16,
+ * which produces the same bits. */
 #ifndef ATTN_M1_EXP_TAB
 #define ATTN_M1_EXP_TAB 1 /**< P2: exp16 by the checked table */
 #endif

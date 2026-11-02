@@ -35,16 +35,15 @@ public:
                        json &nntr_cfg) override;
 
   /**
-   * @brief Gemma4HtpCausalLM::load_weight, then [plan 201 S4] with
-   *        NNTR_HTP_E2E=1 and moe_engine=htp the decode op list, built now
-   *        that the checkpoint's layer_scalar is in memory, and its
-   *        parameters handed to the HTP backend by weight name.
+   * @brief Load weights, then build the HTP decode graph when htp_e2e is
+   *        enabled. The graph needs the checkpoint's layer_scalar and
+   *        binds its parameters by weight name.
    */
   void load_weight(const std::string &weight_path) override;
 
   /**
    * @brief Gemma4HtpCausalLM::repack_weight (the experts' registration), then
-   *        [plan 201 S4] the E2E FC arena (finish_decode_graph_q4_0).
+   *        the E2E FC arena (finish_decode_graph_q4_0).
    */
   void repack_weight() override;
 
@@ -53,13 +52,12 @@ public:
            bool log_output = false) override;
 
 private:
-  /** [plan 201 S4] NNTR_HTP_E2E=1 with moe_engine=htp: the whole decode
-   *  token on the HTP */
+  /** Run the whole decode token on HTP when moe_engine=htp. */
   bool htp_e2e = false;
   bool loading_weights_ = false;
   bool weights_prepared_ = false;
   bool htp_run_started_ = false;
-  /** [plan 201 S4] parameters assembled for the backend (q | k gammas, the
+  /** Parameters assembled for the backend (q | k gammas, the
    *  router's g | per-expert scale), kept until its graph init */
   std::vector<std::vector<float>> htp_params;
 };
