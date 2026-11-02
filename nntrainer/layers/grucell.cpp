@@ -323,7 +323,8 @@ void GRUCellLayer::finalize(InitLayerContext &context) {
 
   // output_dim = [ batch_size, 1, 1, unit ]
   TensorDim output_dim(batch_size, 1, 1, unit);
-  context.setOutputDimensions({output_dim});
+  context.setOutputDimensions({output_dim},
+                              TensorLifespan::FORWARD_GRAD_LIFESPAN);
 
   // weight_initializer can be set seperately. weight_ih initializer,
   // weight_hh initializer kernel initializer & recurrent_initializer in keras

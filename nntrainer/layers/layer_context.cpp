@@ -69,14 +69,16 @@ unsigned int InitLayerContext::getNumRequestedOutputs() const {
 
 void InitLayerContext::setOutputDimensions(
   const std::vector<TensorDim> &out_dim) {
+  setOutputDimensions(out_dim, TensorLifespan::FORWARD_FUNC_LIFESPAN);
+}
+
+void InitLayerContext::setOutputDimensions(
+  const std::vector<TensorDim> &out_dim, TensorLifespan ls) {
   std::vector<VarGradSpecV2> specs;
   specs.reserve(out_dim.size());
 
-  for (unsigned i = 0u, sz = out_dim.size(); i < sz; ++i) {
-    auto spec = outSpec(out_dim.at(i));
-
-    specs.push_back(std::move(spec));
-  }
+  for (unsigned i = 0u, sz = out_dim.size(); i < sz; ++i)
+    specs.push_back(outSpec(out_dim.at(i), "out", ls));
 
   requestOutputs(std::move(specs));
 }

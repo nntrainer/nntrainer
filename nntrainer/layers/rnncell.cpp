@@ -98,7 +98,8 @@ void RNNCellLayer::finalize(InitLayerContext &context) {
 
   // output_hidden_state_dim = [ batch, 1, 1, unit ]
   TensorDim output_hidden_state_dim(batch_size, 1, 1, unit);
-  context.setOutputDimensions({output_hidden_state_dim});
+  context.setOutputDimensions({output_hidden_state_dim},
+                              TensorLifespan::FORWARD_GRAD_LIFESPAN);
 
   // weight_initializer can be set seperately. weight_ih initializer,
   // weight_hh initializer kernel initializer & recurrent_initializer in keras
