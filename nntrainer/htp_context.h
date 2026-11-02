@@ -56,6 +56,11 @@ public:
   createLayerObject(const int int_key,
                     const std::vector<std::string> &properties = {}) override;
 
+  std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label) override;
+
 protected:
   void initialize() noexcept override;
 };

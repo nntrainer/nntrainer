@@ -509,3 +509,12 @@ executable('nntr_safetensors_info',
     cpp_args: causallm_inc_args,
     install: false,
 )
+
+if get_option('enable-htp-device-check')
+  executable('htp_continuation_check',
+      nntrainer_root / 'test' / 'htp' / 'htp_continuation_device_check.cpp',
+      dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+      cpp_args: causallm_inc_args,
+      install: false,
+  )
+endif
