@@ -29,15 +29,26 @@ public:
   }
   void destroy(uint64_t id) override { caches.erase(id); }
   Generated generate(uint64_t id, const Generation &request) override {
+    if (request.on_start)
+      request.on_start();
     if (block) {
       entered.set_value();
-      release.get_future().wait();
+      auto released = release.get_future();
+      while (released.wait_for(std::chrono::milliseconds(20)) !=
+             std::future_status::ready) {
+        if (request.cancelled && request.cancelled()) {
+          block = false;
+          return {};
+        }
+      }
       block = false;
     }
     if (fail)
       throw ApiError(500, "failed", "inference_failed");
     if (!caches.count(id))
       throw std::logic_error("Wrong cache");
+    if (request.on_delta)
+      request.on_delta(request.prompt);
     return {request.prompt, 3, 1, 0, "length"};
   }
 };
@@ -49,6 +60,145 @@ Json request() {
 }
 Json call(Service &service, Json body) {
   return service.submit("POST", "/v1/completions", std::move(body)).get();
+}
+Json sseEvents(const std::string &wire) {
+  Json events = Json::array();
+  size_t from = 0;
+  while (from < wire.size()) {
+    auto end = wire.find("\n\n", from);
+    if (end == std::string::npos)
+      break;
+    auto frame = wire.substr(from, end - from);
+    from = end + 2;
+    if (frame.rfind("data: ", 0) != 0)
+      continue;
+    auto data = frame.substr(6);
+    if (data == "[DONE]")
+      events.push_back("[DONE]");
+    else
+      events.push_back(Json::parse(data));
+  }
+  return events;
+}
+std::string drain(const std::shared_ptr<EventStream> &stream) {
+  std::string wire, frame;
+  for (int attempts = 0; attempts < 1000; ++attempts) {
+    int state = stream->next(frame);
+    if (state < 0)
+      return wire;
+    if (state > 0)
+      wire += frame;
+  }
+  throw std::runtime_error("Stream did not terminate");
+}
+TEST(Serving, StreamingSchemasAndUsage) {
+  for (bool chat : {false, true}) {
+    FakeBackend backend;
+    Service service(backend, "test");
+    auto body = request();
+    body["stream"] = true;
+    body["stream_options"] = {{"include_usage", true}};
+    auto path = chat ? "/v1/chat/completions" : "/v1/completions";
+    if (chat) {
+      body.erase("prompt");
+      body["messages"] =
+        Json::array({{{"role", "user"}, {"content", "hello"}}});
+    }
+    auto stream = std::make_shared<EventStream>();
+    auto finished = service.submit("POST", path, body, stream);
+    stream->waitStarted();
+    auto events = sseEvents(drain(stream));
+    auto final = finished.get();
+    ASSERT_EQ(events.size(), 5u);
+    EXPECT_EQ(events.back(), "[DONE]");
+    EXPECT_EQ(events[2]["choices"][0]["finish_reason"], "length");
+    EXPECT_TRUE(events[3]["choices"].empty());
+    EXPECT_EQ(events[3]["usage"], final["usage"]);
+    for (size_t i = 0; i < 4; ++i)
+      EXPECT_EQ(events[i]["id"], final["id"]);
+    Json expected =
+      chat ? Json{{"content", backend.renderChat(body)}} : Json("hello");
+    EXPECT_EQ(events[1]["choices"][0][chat ? "delta" : "text"], expected);
+    if (chat) {
+      EXPECT_EQ(events[0]["choices"][0]["delta"]["role"], "assistant");
+    }
+  }
+}
+TEST(Serving, StreamingValidationBeforeStart) {
+  FakeBackend backend;
+  Service service(backend, "test");
+  for (auto patch : {Json{{"model", "missing"}}, Json{{"max_tokens", 0}},
+                     Json{{"stream_options", "invalid"}},
+                     Json{{"stream_options", {{"include_usage", "true"}}}},
+                     Json{{"stream_options", {{"unsupported", true}}}}}) {
+    auto body = request();
+    body.update(patch);
+    body["stream"] = true;
+    auto stream = std::make_shared<EventStream>();
+    auto result = service.submit("POST", "/v1/completions", body, stream);
+    EXPECT_THROW(stream->waitStarted(), ApiError);
+    EXPECT_THROW(result.get(), ApiError);
+  }
+}
+TEST(Serving, StreamBoundsAndOverflowCleanup) {
+  for (auto bounds : {std::make_pair(1u, 1024u), std::make_pair(128u, 4u)}) {
+    FakeBackend backend;
+    Service service(backend, "test");
+    auto body = request();
+    body["stream"] = true;
+    auto stream = std::make_shared<EventStream>(bounds.first, bounds.second);
+    auto result = service.submit("POST", "/v1/completions", body, stream);
+    EXPECT_THROW(result.get(), ApiError);
+    auto wire = drain(stream);
+    EXPECT_NE(wire.find("stream_overflow"), std::string::npos);
+    EXPECT_NE(wire.find("[DONE]"), std::string::npos);
+    EXPECT_TRUE(stream->cancelled());
+    EXPECT_TRUE(backend.caches.empty());
+    EXPECT_TRUE(service.submit("GET", "/sessions", {}).get()["data"].empty());
+  }
+}
+TEST(Serving, CancelActiveAndQueuedStreams) {
+  FakeBackend backend;
+  Service service(backend, "test");
+  auto id = service.submit("POST", "/sessions", {}).get()["id"];
+  auto queuedId = service.submit("POST", "/sessions", {}).get()["id"];
+  auto body = request();
+  body["session_id"] = id;
+  body["stream"] = true;
+  backend.block = true;
+  auto entered = backend.entered.get_future();
+  auto active = std::make_shared<EventStream>();
+  auto running = service.submit("POST", "/v1/completions", body, active);
+  entered.wait();
+  body["session_id"] = queuedId;
+  auto queued = std::make_shared<EventStream>();
+  auto waiting = service.submit("POST", "/v1/completions", body, queued);
+  queued->cancel();
+  active->cancel();
+  EXPECT_THROW(running.get(), ApiError);
+  EXPECT_THROW(waiting.get(), ApiError);
+  EXPECT_TRUE(backend.caches.empty());
+  auto retained = service.submit("GET", "/sessions", {}).get()["data"];
+  ASSERT_EQ(retained.size(), 1u);
+  EXPECT_EQ(retained[0]["id"],
+            queuedId); // Never executed: preserve pinned KV owner.
+  EXPECT_NO_THROW(call(service, request()));
+}
+TEST(Serving, StreamFailureAfterStart) {
+  FakeBackend backend;
+  backend.fail = true;
+  Service service(backend, "test");
+  auto body = request();
+  body["stream"] = true;
+  auto stream = std::make_shared<EventStream>();
+  auto result = service.submit("POST", "/v1/completions", body, stream);
+  stream->waitStarted();
+  EXPECT_THROW(result.get(), ApiError);
+  auto events = sseEvents(drain(stream));
+  ASSERT_EQ(events.size(), 3u);
+  EXPECT_EQ(events[1]["error"]["code"], "inference_failed");
+  EXPECT_EQ(events.back(), "[DONE]");
+  EXPECT_TRUE(backend.caches.empty());
 }
 TEST(Serving, SchemaAndChatHistory) {
   FakeBackend backend;
@@ -173,6 +323,39 @@ TEST(Serving, NativeHttp) {
     client.Post("/v1/completions", request().dump(), "application/json");
   ASSERT_TRUE(good);
   EXPECT_EQ(good->status, 200);
+  backend.block = true;
+  auto body = request();
+  body["stream"] = true;
+  httplib::Request streamed;
+  streamed.method = "POST";
+  streamed.path = "/v1/completions";
+  streamed.body = body.dump();
+  streamed.set_header("Content-Type", "application/json");
+  std::string wire;
+  bool released = false;
+  streamed.content_receiver = [&](const char *data, size_t length, uint64_t,
+                                  uint64_t) {
+    wire.append(data, length);
+    if (!released) {
+      released = true;
+      backend.release.set_value();
+    }
+    return true;
+  };
+  auto live = client.send(streamed);
+  if (!released)
+    backend.release.set_value();
+  ASSERT_TRUE(live);
+  EXPECT_TRUE(released); // A chunk arrived while generation was still blocked.
+  EXPECT_EQ(live->get_header_value("Content-Type"), "text/event-stream");
+  EXPECT_EQ(sseEvents(wire).back(), "[DONE]");
+  auto invalid = body;
+  invalid["model"] = "missing";
+  auto rejected =
+    client.Post("/v1/completions", invalid.dump(), "application/json");
+  ASSERT_TRUE(rejected);
+  EXPECT_EQ(rejected->status, 404);
+  EXPECT_EQ(rejected->get_header_value("Content-Type"), "application/json");
   auto bad = client.Post("/v1/chat/completions", "{", "application/json");
   ASSERT_TRUE(bad);
   EXPECT_EQ(bad->status, 400);
@@ -181,6 +364,44 @@ TEST(Serving, NativeHttp) {
   ASSERT_TRUE(unknown);
   EXPECT_EQ(unknown->status, 404);
   EXPECT_TRUE(Json::parse(unknown->body).contains("error"));
+}
+TEST(Serving, HttpDisconnectCancelsOnlyActiveRequest) {
+  FakeBackend backend;
+  backend.block = true;
+  Service service(backend, "test");
+  HttpServer server(service);
+  auto port = server.bind("127.0.0.1", 0);
+  ASSERT_GT(port, 0);
+  std::thread listener([&] { server.listen(); });
+  struct Stop {
+    HttpServer &server;
+    std::thread &listener;
+    ~Stop() {
+      server.stop();
+      listener.join();
+    }
+  } stop{server, listener};
+  httplib::Client client("127.0.0.1", port);
+  client.set_read_timeout(5, 0);
+  auto body = request();
+  body["stream"] = true;
+  httplib::Request req;
+  req.method = "POST";
+  req.path = "/v1/completions";
+  req.body = body.dump();
+  req.set_header("Content-Type", "application/json");
+  req.content_receiver = [](const char *, size_t, uint64_t, uint64_t) {
+    return false;
+  };
+  auto interrupted = client.send(req);
+  EXPECT_FALSE(interrupted);
+  auto listed = service.submit("GET", "/sessions", {});
+  auto state = listed.wait_for(std::chrono::seconds(5));
+  if (state != std::future_status::ready)
+    backend.release.set_value();
+  EXPECT_EQ(state, std::future_status::ready);
+  EXPECT_TRUE(listed.get()["data"].empty());
+  EXPECT_NO_THROW(call(service, request()));
 }
 TEST(Serving, RealPagedCacheInterleavedHistories) {
   setenv("NNTR_ENGINE", "cpu", 1);
@@ -343,10 +564,69 @@ TEST(Serving, Qwen3_06B_NativeHttp) {
   report["session_a_repeated"] = repeated;
   EXPECT_EQ(repeated["choices"][0]["message"]["content"],
             resumedA["choices"][0]["message"]["content"]);
+  auto streamedBody = a;
+  streamedBody["stream"] = true;
+  streamedBody["stream_options"] = {{"include_usage", true}};
+  auto streamed = client.Post("/v1/chat/completions", streamedBody.dump(),
+                              "application/json");
+  ASSERT_TRUE(streamed);
+  ASSERT_EQ(streamed->status, 200) << streamed->body;
+  EXPECT_EQ(streamed->get_header_value("Content-Type"), "text/event-stream");
+  auto chunks = sseEvents(streamed->body);
+  ASSERT_GT(chunks.size(), 3u);
+  EXPECT_EQ(chunks.back(), "[DONE]");
+  std::string joined;
+  for (auto &chunk : chunks) {
+    if (chunk.is_object() && !chunk["choices"].empty())
+      joined += chunk["choices"][0]["delta"].value("content", "");
+  }
+  EXPECT_EQ(joined, resumedA["choices"][0]["message"]["content"]);
+  EXPECT_EQ(joined.find("<|im_end|>"), std::string::npos);
+  EXPECT_EQ(chunks[chunks.size() - 2]["usage"]["completion_tokens"],
+            resumedA["usage"]["completion_tokens"]);
+  report["streaming_chunks"] = chunks;
+  auto korean = makeChat("대한민국의 수도는 어디인가요? 한 문장으로 답하세요.");
+  auto koreanFull = post("/v1/chat/completions", korean);
+  korean["stream"] = true;
+  auto koreanStream =
+    client.Post("/v1/chat/completions", korean.dump(), "application/json");
+  ASSERT_TRUE(koreanStream);
+  ASSERT_EQ(koreanStream->status, 200) << koreanStream->body;
+  std::string koreanJoined;
+  auto koreanChunks = sseEvents(koreanStream->body);
+  for (auto &event : koreanChunks)
+    if (event.is_object() && !event["choices"].empty())
+      koreanJoined += event["choices"][0]["delta"].value("content", "");
+  EXPECT_EQ(koreanJoined, koreanFull["choices"][0]["message"]["content"]);
+  EXPECT_NE(koreanJoined.find("서울"), std::string::npos);
+  report["korean_streaming_text"] = koreanJoined;
+  auto cancelId = post("/sessions", {})["id"].get<std::string>();
+  auto cancelBody = makeChat("Count from 1 to 100. Write every number.");
+  cancelBody["stream"] = true;
+  cancelBody["max_tokens"] = 128;
+  cancelBody["session_id"] = cancelId;
+  httplib::Request cancelReq;
+  cancelReq.method = "POST";
+  cancelReq.path = "/v1/chat/completions";
+  cancelReq.body = cancelBody.dump();
+  cancelReq.set_header("Content-Type", "application/json");
+  cancelReq.content_receiver = [](const char *, size_t, uint64_t, uint64_t) {
+    return false;
+  };
+  auto disconnected = client.send(cancelReq);
+  EXPECT_FALSE(disconnected);
+  // Queued behind the cancelled inference, so this is also a cleanup barrier.
+  auto afterCancel = client.Get("/sessions");
+  ASSERT_TRUE(afterCancel);
+  auto remaining = Json::parse(afterCancel->body)["data"];
+  EXPECT_FALSE(
+    std::any_of(remaining.begin(), remaining.end(),
+                [&](const Json &entry) { return entry["id"] == cancelId; }));
+  auto afterCancelReply = post("/v1/chat/completions", a);
+  EXPECT_EQ(afterCancelReply["choices"][0]["message"]["content"],
+            resumedA["choices"][0]["message"]["content"]);
+  report["cancelled_session_released"] = true;
   auto invalid = a;
-  invalid["stream"] = true;
-  report["stream_rejected"] = post("/v1/chat/completions", invalid, 400);
-  invalid = a;
   invalid["messages"][0]["content"] = std::string(10000, 'x');
   report["context_rejected"] = post("/v1/chat/completions", invalid, 400);
   auto models = client.Get("/v1/models");

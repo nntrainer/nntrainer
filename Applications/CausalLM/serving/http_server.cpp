@@ -17,6 +17,44 @@ struct HttpServer::Impl {
         Json body = Json::object();
         if (!request.body.empty())
           body = Json::parse(request.body);
+        if (body.is_object() && body.contains("stream") &&
+            body["stream"].is_boolean() && body["stream"].get<bool>() &&
+            request.method == "POST" &&
+            (request.path == "/v1/chat/completions" ||
+             request.path == "/v1/completions")) {
+          auto stream = std::make_shared<EventStream>();
+          service.submit(request.method, request.path, std::move(body), stream);
+          stream->waitStarted(request.is_connection_closed);
+          response.set_header("Cache-Control", "no-cache");
+          response.set_header("X-Accel-Buffering", "no");
+          auto disconnected = request.is_connection_closed;
+          response.set_chunked_content_provider(
+            "text/event-stream",
+            [stream, disconnected](size_t, httplib::DataSink &sink) {
+              if (disconnected()) {
+                stream->cancel();
+                return false;
+              }
+              std::string frame;
+              int state = stream->next(frame);
+              if (state < 0) {
+                sink.done();
+                return true;
+              }
+              if (state == 0)
+                frame = ": keep-alive\n\n";
+              if (disconnected() || !sink.write(frame.data(), frame.size())) {
+                stream->cancel();
+                return false;
+              }
+              return true;
+            },
+            [stream](bool success) {
+              if (!success)
+                stream->cancel();
+            });
+          return;
+        }
         auto result =
           service.submit(request.method, request.path, std::move(body)).get();
         response.set_content(result.dump(), "application/json");

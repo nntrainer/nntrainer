@@ -33,6 +33,99 @@ Json errorBody(int status, const std::string &message,
             {"code", code}}}};
 }
 
+EventStream::EventStream(size_t max_events_, size_t max_bytes_) :
+  max_events(max_events_), max_bytes(max_bytes_) {
+  if (!max_events || !max_bytes)
+    throw std::invalid_argument("Stream bounds must be positive");
+}
+void EventStream::start() {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (aborted)
+    throw ApiError(499, "Request cancelled", "request_cancelled");
+  started = true;
+  changed.notify_all();
+}
+void EventStream::waitStarted(const std::function<bool()> &disconnected) {
+  std::unique_lock<std::mutex> lock(mutex);
+  while (!started && !done && !aborted) {
+    changed.wait_for(lock, std::chrono::milliseconds(100));
+    if (disconnected && disconnected()) {
+      aborted = true;
+      changed.notify_all();
+    }
+  }
+  if (!started) {
+    if (error)
+      std::rethrow_exception(error);
+    throw ApiError(499, "Request cancelled", "request_cancelled");
+  }
+}
+bool EventStream::push(const Json &event) {
+  auto frame = "data: " + event.dump() + "\n\n";
+  std::lock_guard<std::mutex> lock(mutex);
+  if (aborted || done)
+    return false;
+  if (events.size() >= max_events || frame.size() > max_bytes - bytes) {
+    aborted = true;
+    error = std::make_exception_ptr(
+      ApiError(503, "Streaming client is too slow", "stream_overflow"));
+    changed.notify_all();
+    return false;
+  }
+  bytes += frame.size();
+  events.push_back(std::move(frame));
+  changed.notify_all();
+  return true;
+}
+void EventStream::finish(std::exception_ptr failure) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (done)
+    return;
+  if (!error)
+    error = failure;
+  done = true;
+  changed.notify_all();
+}
+void EventStream::cancel() {
+  std::lock_guard<std::mutex> lock(mutex);
+  aborted = true;
+  changed.notify_all();
+}
+bool EventStream::cancelled() const {
+  std::lock_guard<std::mutex> lock(mutex);
+  return aborted;
+}
+int EventStream::next(std::string &frame) {
+  std::unique_lock<std::mutex> lock(mutex);
+  if (!changed.wait_for(lock, std::chrono::milliseconds(1000),
+                        [this] { return !events.empty() || done; }))
+    return 0;
+  if (!events.empty()) {
+    frame = std::move(events.front());
+    bytes -= frame.size();
+    events.pop_front();
+    return 1;
+  }
+  if (terminal_sent)
+    return -1;
+  terminal_sent = true;
+  frame.clear();
+  if (error) {
+    try {
+      std::rethrow_exception(error);
+    } catch (const ApiError &e) {
+      frame = "data: " + errorBody(e.status, e.what(), e.code).dump() + "\n\n";
+    } catch (...) {
+      frame =
+        "data: " +
+        errorBody(500, "Inference service failed", "internal_error").dump() +
+        "\n\n";
+    }
+  }
+  frame += "data: [DONE]\n\n";
+  return 1;
+}
+
 Service::Service(Backend &backend_, std::string model_, size_t max_sessions_,
                  size_t queue_capacity_) :
   backend(backend_),
@@ -53,10 +146,24 @@ Service::~Service() {
   worker.join();
 }
 std::future<Json> Service::submit(std::string method, std::string path,
-                                  Json body) {
-  std::packaged_task<Json()> task(
-    [this, method = std::move(method), path = std::move(path),
-     body = std::move(body)] { return dispatch(method, path, body); });
+                                  Json body,
+                                  std::shared_ptr<EventStream> stream) {
+  std::packaged_task<Json()> task([this, method = std::move(method),
+                                   path = std::move(path),
+                                   body = std::move(body), stream] {
+    try {
+      if (stream && stream->cancelled())
+        throw ApiError(499, "Request cancelled", "request_cancelled");
+      auto result = dispatch(method, path, body, stream);
+      if (stream)
+        stream->finish();
+      return result;
+    } catch (...) {
+      if (stream)
+        stream->finish(std::current_exception());
+      throw;
+    }
+  });
   auto result = task.get_future();
   {
     std::lock_guard<std::mutex> lock(mutex);
@@ -113,7 +220,8 @@ void Service::eraseSession(const std::string &id) {
   sessions.erase(it);
 }
 Json Service::dispatch(const std::string &method, const std::string &path,
-                       const Json &body) {
+                       const Json &body,
+                       const std::shared_ptr<EventStream> &stream) {
   if (method == "POST" && path == "/sessions")
     return {{"id", createSession(true)}, {"object", "session"}};
   if (method == "GET" && path == "/sessions") {
@@ -131,10 +239,11 @@ Json Service::dispatch(const std::string &method, const std::string &path,
   }
   if (method == "POST" &&
       (path == "/v1/chat/completions" || path == "/v1/completions"))
-    return completion(body, path == "/v1/chat/completions");
+    return completion(body, path == "/v1/chat/completions", stream);
   throw ApiError(404, "Unknown route", "not_found");
 }
-Json Service::completion(const Json &body, bool chat) {
+Json Service::completion(const Json &body, bool chat,
+                         const std::shared_ptr<EventStream> &stream) {
   require(body.is_object(), "Expected a JSON object");
   static const std::set<std::string> supported = {"model",
                                                   "messages",
@@ -148,7 +257,8 @@ Json Service::completion(const Json &body, bool chat) {
                                                   "seed",
                                                   "session_id",
                                                   "user",
-                                                  "chat_template_kwargs"};
+                                                  "chat_template_kwargs",
+                                                  "stream_options"};
   for (auto it = body.begin(); it != body.end(); ++it)
     require(supported.count(it.key()), "Unsupported parameter: " + it.key());
   require(body.contains("model") && body["model"].is_string(),
@@ -156,8 +266,19 @@ Json Service::completion(const Json &body, bool chat) {
   if (body["model"] != model)
     throw ApiError(404, "Unknown model", "model_not_found");
   if (body.contains("stream"))
-    require(body["stream"].is_boolean() && !body["stream"].get<bool>(),
-            "Only stream=false is supported");
+    require(body["stream"].is_boolean(), "stream must be a boolean");
+  require(body.value("stream", false) == static_cast<bool>(stream),
+          "Streaming transport required for stream=true");
+  bool include_usage = false;
+  if (body.contains("stream_options")) {
+    require(stream && body["stream_options"].is_object(),
+            "stream_options requires stream=true");
+    for (auto it = body["stream_options"].begin();
+         it != body["stream_options"].end(); ++it)
+      require(it.key() == "include_usage" && it.value().is_boolean(),
+              "Only boolean stream_options.include_usage is supported");
+    include_usage = body["stream_options"].value("include_usage", false);
+  }
   if (body.contains("n"))
     require(body["n"].is_number_integer() && body["n"] == 1,
             "Only n=1 is supported");
@@ -225,14 +346,55 @@ Json Service::completion(const Json &body, bool chat) {
   }
   auto &session = sessions.at(id);
   session.touched = ++sequence;
+  const auto completion_id =
+    (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++sequence);
+  const auto created = std::time(nullptr);
+  Json prototype = {
+    {"id", completion_id},
+    {"object", chat ? "chat.completion.chunk" : "text_completion"},
+    {"created", created},
+    {"model", model},
+    {"session_id", id}};
+  if (include_usage)
+    prototype["usage"] = nullptr;
+  auto chunk = [prototype, chat](const std::string &text, bool initial,
+                                 const Json &reason) mutable {
+    Json choice = {
+      {"index", 0}, {"finish_reason", reason}, {"logprobs", nullptr}};
+    if (chat) {
+      choice["delta"] = Json::object();
+      if (initial)
+        choice["delta"] = {{"role", "assistant"}, {"content", ""}};
+      else if (!text.empty())
+        choice["delta"]["content"] = text;
+    } else
+      choice["text"] = text;
+    prototype["choices"] = Json::array({choice});
+    return prototype;
+  };
+  if (stream) {
+    request.cancelled = [stream] { return stream->cancelled(); };
+    request.on_start = [stream, chunk]() mutable {
+      stream->start();
+      if (!stream->push(chunk("", true, nullptr)))
+        throw ApiError(499, "Stream cancelled", "request_cancelled");
+    };
+    request.on_delta = [stream, chunk](const std::string &text) mutable {
+      return !stream->cancelled() && stream->push(chunk(text, false, nullptr));
+    };
+  }
   Generated result;
   try {
     if (!session.cache)
       session.cache = backend.create(request.prompt);
     result = backend.generate(*session.cache, request);
+    if (stream && stream->cancelled())
+      throw ApiError(499, "Generation cancelled; session released",
+                     "request_cancelled");
   } catch (const ApiError &e) {
     // Validation errors occur before inference and preserve pinned history.
-    if (e.status >= 500 || !body.contains("session_id")) {
+    if (e.status >= 500 || (stream && stream->cancelled()) ||
+        !body.contains("session_id")) {
       try {
         eraseSession(id);
       } catch (...) {
@@ -255,10 +417,10 @@ Json Service::completion(const Json &body, bool chat) {
     choice["message"] = {{"role", "assistant"}, {"content", result.text}};
   else
     choice["text"] = result.text;
-  return {
-    {"id", (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++sequence)},
+  Json response = {
+    {"id", completion_id},
     {"object", chat ? "chat.completion" : "text_completion"},
-    {"created", std::time(nullptr)},
+    {"created", created},
     {"model", model},
     {"session_id", id},
     {"choices", Json::array({choice})},
@@ -267,5 +429,19 @@ Json Service::completion(const Json &body, bool chat) {
       {"completion_tokens", result.completion_tokens},
       {"total_tokens", result.prompt_tokens + result.completion_tokens},
       {"prompt_tokens_details", {{"cached_tokens", result.cached_tokens}}}}}};
+  if (stream) {
+    bool accepted = stream->push(chunk("", false, result.finish_reason));
+    if (accepted && include_usage) {
+      prototype["choices"] = Json::array();
+      prototype["usage"] = response["usage"];
+      accepted = stream->push(prototype);
+    }
+    if (!accepted) {
+      eraseSession(id);
+      throw ApiError(499, "Stream cancelled; session released",
+                     "request_cancelled");
+    }
+  }
+  return response;
 }
 } // namespace causallm::serving

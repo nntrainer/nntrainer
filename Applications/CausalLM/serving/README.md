@@ -64,12 +64,12 @@ response field identifies the cache session.
 
 Supported inputs: `model`, text `messages` (system/developer/user/assistant),
 string `prompt` for Completions, `max_tokens` or `max_completion_tokens`,
-`temperature`, `top_p`, `seed`, `n=1`, `stream=false`, and `user`.
+`temperature`, `top_p`, `seed`, `n=1`, boolean `stream`, and `user`.
 The local `chat_template_kwargs` extension accepts boolean `enable_thinking`
-for model templates such as Qwen3; clients can pass it in their extra body fields. Unsupported
-parameters are rejected rather than silently ignored. This is non-streaming
-text Chat Completions/Completions compatibility; Responses, tools, multimodal
-content, stop sequences, penalties, logprobs and streaming are not implemented.
+for model templates such as Qwen3; clients can pass it in their extra body fields.
+Unsupported parameters are rejected rather than silently ignored. This is text
+Chat Completions/Completions compatibility; Responses, tools, multimodal content,
+stop sequences, penalties and logprobs are not implemented.
 The request body limit is 1 MiB. Input exceeding the context or prefill window
 is rejected instead of truncated. An inference failure invalidates and releases
 its session; validation errors preserve an existing session.
@@ -112,5 +112,38 @@ The opt-in full-size integration test `Serving.Qwen3_06B_NativeHttp` loads
 `<builddir>/models/qwen3-0.6b-fp32` when available. Set
 `NNTR_SERVING_QWEN3_DIR` to select another converted Qwen3 0.6B directory. It
 tests real HTTP chat completions, two interleaved conversations, history replay,
-cache reuse, invalid context/stream requests and session deletion. It writes
+cache reuse, context rejection, streaming, cancellation and session deletion. It writes
 its responses to `/tmp/nntrainer-qwen3-serving-results.json`.
+
+## Streaming
+
+Both completion endpoints accept `stream:true`. Chat responses use
+`chat.completion.chunk` with an initial assistant role delta, content deltas,
+a final `finish_reason`, and `data: [DONE]`. Text completions use `text` chunks.
+`stream_options:{"include_usage":true}` adds a final usage chunk with empty
+`choices` before `[DONE]`; other chunks then carry `usage:null`.
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local-model","messages":[{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":64}'
+```
+
+Every request owns a bounded token mailbox (128 events, 256 KiB). Model callbacks
+never block on client reads. Overflow cancels that generation. Disconnects are
+checked while queued and during SSE writes/heartbeats; cancellation is observed
+by the model at its next decoded-output boundary (prefill is not interrupted).
+An active cancelled generation's session, including a pinned session, is deleted
+on the inference worker. A cancellation before execution leaves an existing
+session intact. Other sessions and requests are unaffected; recreate a deleted
+pinned session before retrying. Completed streams retain their session normally.
+
+Validation errors before generation starts retain HTTP status/error JSON. Once
+SSE starts, inference failures are delivered as an SSE OpenAI-shaped error then
+`[DONE]`, without a successful finish chunk. EOS marker text is held across token
+callbacks and removed before emission, while preserving UTF-8 boundaries.
+Socket writes have a 30-second timeout. Shutdown still drains accepted tasks;
+stream queues bound memory even if a reader disappears.
+
+Streaming response format reference:
+https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
