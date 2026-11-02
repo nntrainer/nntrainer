@@ -377,6 +377,58 @@ S26 Ultra에서 같은 DSP·model·prompt로 각 버전을 1회 측정했다.
 단일 측정은 통계적 성능 동등성을 확정하지 않으며, 실제 LFM pack의 품질·성능과
 전체 원격 플랫폼 CI 검증은 포함하지 않는다. Speculative decoding은 추가하지 않았다.
 
+## 2026-11-02 런타임·빌드 소유권 추가 정리
+
+기준 `ec4f5457b`에서 구현 `89fcdde29`까지 sub-agent 3명이 구현·교차 검토했다.
+코드·빌드 설정은 **305줄 감소**했고, 회귀 검사 보강을 포함하면 207줄 감소했다.
+기존 guide 경로 수정까지 포함한 차이는 98개 파일, +1,229/-1,425줄로 순감
+196줄이다. 이 절과 측정 JSON은 제외한다. 파일 21개, 원본 9,832줄의 이동을
+삭제로 세지 않았으며, 기존 경로에 wrapper를 남긴 빌드 스크립트도 양쪽을 계산했다.
+
+| 변경 전 | 변경 후 |
+| --- | --- |
+| 일반/HTP embedding의 메타데이터·IO 중복 | 공통 base 사용; HTP FP32 logits와 수치 경로 유지 |
+| 사용하지 않는 PPL 상태·계산 | 호출처가 없는 상태와 API 제거 |
+| LFM 파일의 전역 expert pool | `HtpComputeOps`가 pool과 worker 수명을 소유 |
+| Gemma/LFM의 독립 prompt 초기화 중복 | 공통 초기화 + LFM convolution reset callback |
+| 두 Meson 진입점의 소스·기능 목록 중복 | 공통 목록과 tokenizer probe; 플랫폼 설정은 각 진입점 유지 |
+| `test/htp`의 production DSP 소스·IDL | `nntrainer/tensor/htp_backend/dsp`; 진단 probe는 test에 유지 |
+| HVX 파일에 결합된 portable TL2 packing | 공통 codec을 도구와 kernel이 사용; 수치 kernel은 유지 |
+
+남은 fixed-policy/native-packing 헤더도 `htp_backend`로 옮겼다. Scratch 수명 검사는
+문자열로 함수를 추출하는 대신 실제 production 모듈을 직접 링크한다. 독립 prompt
+초기화는 `run()`에서만 호출하며 추가 prefill 경로에 삽입하지 않았다. Speculative
+decoding은 추가하지 않았다.
+
+[검증 기록](../measurements/htp_refactor_20261102/additional-refactor.json):
+embedding 127개 비교, expert 읽기·등록·교체 순서 539,818 bytes, TL2 packing의
+경계값·정상·비정상 입력이 변경 전과 일치했다. 전체 SDK-free host suite와 26개
+오류 주입 검사, 이후 TL2 영향 범위 검사 및 ASan/UBSan이 통과했다. CPU FP16
+off/on, 두 앱 빌드 진입점, Android 엔진·API 앱, v81 production/diagnostic DSP
+빌드가 통과했다. DSP의 IDL과 423개 함수 export(146개 RPC)를 유지했다.
+
+S26 Ultra에서 각 버전을 1회 실행했다. 같은 Gemma4 26B A4B pack, 1,555-token
+prompt, 8 threads, page cache off 조건이며 변경 후에는 새 production DSP도 사용했다.
+
+| 항목 | 변경 전 | 변경 후 |
+| --- | ---: | ---: |
+| prefill | 643.892 tok/s | 633.659 tok/s (-1.59%) |
+| decode | 18.4846 tok/s | 18.1521 tok/s (-1.80%) |
+
+112개 생성 ID와 문자열은 완전히 같았다. **속도 불변은 확정하지 못했다.** 단일
+관측만으로 측정 변동과 실제 회귀를 구분할 수 없으며 추가 속도 측정은 하지 않았다.
+Gemma 실제 pack과 LFM synthetic fixture의 `prefill 8 → decode 1 → 추가 3 → decode 1 →
+추가 2 → decode 1`에서 6개 지점 logits가 변경 전 및 한 토큰씩 입력한 경로와
+바이트 단위로 같았다. 두 모델의 API 반복 요청·취소·실행 중 unload·중복 unload·
+재로드 검사와 정상 완료 6개 시나리오의 변경 전후 ID 비교도 통과했다.
+
+내부 C++ class/vtable 및 미사용 PPL export 6개가 변경되므로 앱과 엔진을 함께
+재빌드해야 한다. 공개 C API는 유지했다. 기존 HTP FP32-weight/FP16 embedding의
+view 동작과 일반/HTP FP16 반올림 차이는 보존했으며 이번 작업에서 고치지 않았다.
+runtime 객체 생성 실패 시 release가 진단용 layer ordinal도 초기화하는 작은 차이가
+있다. 실제 LFM 배포 pack의 품질·속도, Windows/Tizen/Yocto 전체 CI는 별도 검증이
+필요하다. SDK native-host 및 선택적 QEMU NEON 검사는 생략했다.
+
 ## 구현 검토 시 참고할 소스
 
 | 파일 | 주요 symbol 또는 확인 내용 |
