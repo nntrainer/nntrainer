@@ -200,6 +200,24 @@ backend의 일반 지원 범위를 해당 pack의 숫자로 제한하지 않는�
 shared-expert 커널이나 새로운 router를 미리 구현하지 않는다. 기존 Gemma/LFM의
 커널·연산·DMA 순서와 튜닝값을 먼저 보존하고 일반화와 성능 개선은 분리한다.
 
+## 구현 계약
+
+구현 기준은 정리 커밋 `3514d3247854e8d10616ea1a63a10df0216be409`이다.
+기존 단일 prompt의 kernel, quantization, DMA 순서와 튜닝값을 유지한다.
+동일 입력의 token ID와 생성 문자열은 완전히 일치해야 하며, logits와 파일
+record는 기존 경로와 동일해야 한다. 동일 장치 비교의 prefill/decode 속도는
+각각 2% 이상 느려지면 원인을 조사한다. 단일 측정은 회귀 탐지 참고값이며
+통계적 동등성의 근거로 사용하지 않는다. 기존 측정과 같은 page-cache 정책을
+사용하고 peak host/ION/DSP 메모리를 함께 확인한다.
+
+실행 상태는 초기 prefill → decode → 추가 prefill → decode를 허용해야 한다.
+추가 prefill은 여러 토큰을 받을 수 있으며, DSP가 소유한 attention KV와 LFM2
+convolution state를 그대로 이어받아야 한다. 독립 prompt reset과 continuation은
+다른 동작이다. host KV가 stale하거나 해제된 상태에서 이를 다시 seed하지 않는다.
+지원 구간은 기존 `Context::runDecode` 진입점에서 선택하고, 아직 준비되지 않은
+첫 decode와 mixed-engine graph는 기존 layer hook을 유지한다.
+Speculative decoding의 draft 모델, 검증, rollback 정책은 이번 작업에 추가하지 않는다.
+
 ## 단계별 이행 계획
 
 | 단계 | 변경 | 단계 완료 조건 |
