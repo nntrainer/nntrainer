@@ -11,6 +11,7 @@
  */
 
 #include <float.h>
+#include <htp_profile_wire.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -177,25 +178,6 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
  *        point PR③'s ComputeOps seam will call; nntr_hvx_mm_u8i4_from_f32
  *        above stays the accuracy harness.
  */
-/**
- * @brief Slots mm_u8i4_layer_timed fills, in order.
- *
- * MUST match the same enum in nntr_hvx_mm_u8i8.c and the kStage list in
- * unittest_hvx_fc.cpp: the ARM side cannot include this header, so the entry
- * point rejects a stale count with AEE_EBADPARM rather than silently
- * truncating. Restated per width rather than shared, the same call this tree
- * already made for the two dma modules.
- */
-enum {
-  FC_T_DSP_TOTAL = 0, /**< the whole layer_run call, DSP clock */
-  FC_T_QUANT,         /**< act f32 -> u8 AH in VTCM */
-  FC_T_DEQUANT,       /**< i32 -> f32, in place on the VTCM tile */
-  FC_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor */
-  FC_T_ACC_COPY,      /**< VTCM -> DDR staging; 0 on the in-place path */
-  FC_T_DRAIN,         /**< DMA waits */
-  FC_T_ACC_STRIDE,    /**< not a time: the derived row stride, 0 if fallback */
-  FC_N_STAGES
-};
 
 /**
  * @brief Probe the DSP PD's allocatable heap without an input payload.
@@ -1547,9 +1529,9 @@ int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != FC_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_N_STAGES) {
     FARF(ERROR, "mm_u8i4_layer_timed: stage_usLen %d, expected %d", stage_usLen,
-         (int)FC_N_STAGES);
+         (int)HTP_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -1565,13 +1547,13 @@ int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
    * uninstrumented one pay for the probes. */
   hexkl_probe_on = 0;
 
-  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
-  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
-  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[HTP_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[HTP_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[HTP_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
 
@@ -1644,9 +1626,9 @@ int nntr_hvx_mm_u8i4_layer_u8in_timed(
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != FC_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_N_STAGES) {
     FARF(ERROR, "mm_u8i4_layer_u8in_timed: stage_usLen %d, expected %d",
-         stage_usLen, (int)FC_N_STAGES);
+         stage_usLen, (int)HTP_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -1662,36 +1644,15 @@ int nntr_hvx_mm_u8i4_layer_u8in_timed(
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
 
-  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
-  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
-  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[HTP_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[HTP_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[HTP_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
-
-/**
- * @brief Slots mm_u8i4_layer_fused_timed fills, in order.
- *
- * NOT the FC_T_* layout: the fused call runs a second QUANT pass (the
- * SwiGLU output's requant) and a SwiGLU stage the unfused call does not
- * have, so the slots are restated here rather than reusing FC_N_STAGES --
- * the entry rejects a stale count with AEE_EBADPARM, same drift guard as
- * the FC pair.
- */
-enum {
-  FU_T_DSP_TOTAL = 0, /**< the whole fused_run call, DSP clock */
-  FU_T_QUANT,         /**< act quant + the SwiGLU output's requant */
-  FU_T_SWIGLU,        /**< silu(gate)*up, in VTCM */
-  FU_T_DEQUANT,       /**< both matmuls' i32 -> f32 */
-  FU_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor (both matmuls) */
-  FU_T_ACC_COPY,      /**< always 0: fused_run requires the in-place layout */
-  FU_T_DRAIN,         /**< DMA waits */
-  FU_T_ACC_STRIDE,    /**< not a time: the derived row stride */
-  FU_N_STAGES
-};
 
 /** @brief Shared by both fused entry points below. The SwiGLU contract
  *         (down.K == gate_up.N / 2) is checked here so a mismatching pair
@@ -1762,9 +1723,9 @@ int nntr_hvx_mm_u8i4_layer_fused_timed(remote_handle64 handle, uint32 M,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != FU_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_FU_N_STAGES) {
     FARF(ERROR, "mm_u8i4_layer_fused_timed: stage_usLen %d, expected %d",
-         stage_usLen, (int)FU_N_STAGES);
+         stage_usLen, (int)HTP_FU_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -1776,33 +1737,17 @@ int nntr_hvx_mm_u8i4_layer_fused_timed(remote_handle64 handle, uint32 M,
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
 
-  stage_us[FU_T_DSP_TOTAL] = (uint32)(t1 - t0);
-  stage_us[FU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[FU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
-  stage_us[FU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[FU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[FU_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
-  stage_us[FU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[FU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[HTP_FU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[HTP_FU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_FU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[HTP_FU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_FU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_FU_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[HTP_FU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_FU_T_ACC_STRIDE] =
+    (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
-
-/**
- * @brief Slots mm_u8i4_gate_up_swiglu_timed fills. Restated rather than
- *        reusing FU_T_*: this call has no down-side dequant/acc_read at
- *        all, so FU_T_DEQUANT/FU_T_ACC_READ would silently mean something
- *        narrower here than there.
- */
-enum {
-  GU_T_DSP_TOTAL = 0,
-  GU_T_QUANT, /**< act quant + the SwiGLU output's requant */
-  GU_T_SWIGLU,
-  GU_T_DEQUANT, /**< gate_up matmul's i32 -> f32 split */
-  GU_T_ACC_READ,
-  GU_T_DRAIN,
-  GU_T_ACC_STRIDE,
-  GU_N_STAGES
-};
 
 static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
                                      uint32 K, uint32 w_handle_gate_up,
@@ -1840,75 +1785,35 @@ static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
   return AEE_SUCCESS;
 }
 
-/** @brief Slots mm_u8i4_moe_layer_timed fills, in order. Mirrors GU_T_*
- *         with one extra: the routing multiply and scatter-add, which no
- *         existing call has because the ARM side does them today. */
-enum {
-  MOE_T_DSP_TOTAL = 0,
-  MOE_T_QUANT, /**< act quant + the SwiGLU output's requant */
-  MOE_T_SWIGLU,
-  MOE_T_DEQUANT, /**< both matmuls' i32 -> f32 */
-  MOE_T_ACC_READ,
-  MOE_T_DRAIN,     /**< the cross-expert weight DMA waits */
-  MOE_T_SCATTER,   /**< routing multiply + accumulate into out_f32 */
-  MOE_T_GATHER,    /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
-  MOE_T_REQUANT,   /**< the SwiGLU output's per-block quantize */
-  MOE_T_BLOCKS,    /**< NOT us: 64-row blocks issued, summed over experts */
-  MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
-  MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
-  MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
-  MOE_T_ALLOC,     /**< the layer call's own malloc and free */
-  MOE_T_DMA_FIRST_KB, /**< NOT us: KB that first wait covered */
-  MOE_T_DRAIN_DN,     /**< the down-weight drain, apart from gate_up's */
-  MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
-  MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
-  MOE_T_ACC_STRIDE,
-  /** [#87] The DMA ring trace's per-call numbers (hexkl_probe.h's
-      HEXKL_PROBE_DMA_*), in the same order. Counts unless named _US. */
-  MOE_T_DMA_DESC,
-  MOE_T_DMA_WAITS,
-  MOE_T_DMA_WAITS_BLOCKED,
-  MOE_T_DMA_WAIT_US,
-  MOE_T_DMA_WAIT_ACT_US,
-  MOE_T_DMA_BUSY_LO_US,
-  MOE_T_DMA_BUSY_HI_US,
-  MOE_T_DMA_DEPTH_MAX,
-  MOE_T_DMA_FIRST_READY_US,
-  MOE_T_DMA_LAST_ISSUE_US,
-  MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
-  MOE_T_M1_FEED, /**< NOT us: the DMA queues that fed the GEMV's VTCM slabs
-                      (#117: 1; #177: 1..4), 0 = it read the arena */
-  MOE_N_STAGES
-};
-
 /** @brief Copies the probe columns into a timed call's stage_us. */
 static void moe_fill_stage_us(uint32 *stage_us, uint32 dsp_total) {
-  stage_us[MOE_T_DSP_TOTAL] = dsp_total;
-  stage_us[MOE_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[MOE_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
-  stage_us[MOE_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[MOE_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[MOE_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_SCATTER];
-  stage_us[MOE_T_STAGE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
-  stage_us[MOE_T_GATHER] = (uint32)hexkl_probe_us[HEXKL_PROBE_GATHER];
-  stage_us[MOE_T_REQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_REQUANT];
-  stage_us[MOE_T_BLOCKS] = (uint32)hexkl_probe_us[HEXKL_PROBE_BLOCKS];
-  stage_us[MOE_T_MM] = (uint32)hexkl_probe_us[HEXKL_PROBE_MM];
-  stage_us[MOE_T_DMA_KB] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_KB];
-  stage_us[MOE_T_DMA_FIRST] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST];
-  stage_us[MOE_T_ALLOC] = (uint32)hexkl_probe_us[HEXKL_PROBE_ALLOC];
-  stage_us[MOE_T_DMA_FIRST_KB] =
+  stage_us[HTP_MOE_T_DSP_TOTAL] = dsp_total;
+  stage_us[HTP_MOE_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_MOE_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[HTP_MOE_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_MOE_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_MOE_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_SCATTER];
+  stage_us[HTP_MOE_T_STAGE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[HTP_MOE_T_GATHER] = (uint32)hexkl_probe_us[HEXKL_PROBE_GATHER];
+  stage_us[HTP_MOE_T_REQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_REQUANT];
+  stage_us[HTP_MOE_T_BLOCKS] = (uint32)hexkl_probe_us[HEXKL_PROBE_BLOCKS];
+  stage_us[HTP_MOE_T_MM] = (uint32)hexkl_probe_us[HEXKL_PROBE_MM];
+  stage_us[HTP_MOE_T_DMA_KB] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+  stage_us[HTP_MOE_T_DMA_FIRST] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST];
+  stage_us[HTP_MOE_T_ALLOC] = (uint32)hexkl_probe_us[HEXKL_PROBE_ALLOC];
+  stage_us[HTP_MOE_T_DMA_FIRST_KB] =
     (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST_KB];
-  stage_us[MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
-  stage_us[MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
-  stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
-  for (int k = 0; k <= MOE_T_DMA_LAST_ISSUE_US - MOE_T_DMA_DESC; ++k) {
-    stage_us[MOE_T_DMA_DESC + k] =
+  stage_us[HTP_MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
+  stage_us[HTP_MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
+  stage_us[HTP_MOE_T_ACC_STRIDE] =
+    (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  for (int k = 0; k <= HTP_MOE_T_DMA_LAST_ISSUE_US - HTP_MOE_T_DMA_DESC; ++k) {
+    stage_us[HTP_MOE_T_DMA_DESC + k] =
       (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_DESC + k];
   }
-  stage_us[MOE_T_PATH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PATH];
-  stage_us[MOE_T_M1_FEED] = (uint32)hexkl_probe_us[HEXKL_PROBE_M1_FEED];
+  stage_us[HTP_MOE_T_PATH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PATH];
+  stage_us[HTP_MOE_T_M1_FEED] = (uint32)hexkl_probe_us[HEXKL_PROBE_M1_FEED];
 }
 
 /** @brief Shared by both entry points so they cannot drift on what they
@@ -2346,9 +2251,9 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != MOE_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_MOE_N_STAGES) {
     FARF(ERROR, "moe_layer_timed: stage_usLen %d, expected %d", stage_usLen,
-         (int)MOE_N_STAGES);
+         (int)HTP_MOE_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -2364,7 +2269,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);
 }
 
-uint32_t nntr_hvx_moe_stage_count(void) { return MOE_N_STAGES; }
+uint32_t nntr_hvx_moe_stage_count(void) { return HTP_MOE_N_STAGES; }
 
 /** [#85] The slot fill, shared with forward_debug (nntr_hvx_graph.c). Read
    after hexkl_probe_on is cleared, as moe_layer_timed always did; the
@@ -2450,9 +2355,9 @@ int nntr_hvx_mm_u8i4_conv_block_timed(
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != MOE_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_MOE_N_STAGES) {
     FARF(ERROR, "conv_block_timed: stage_usLen %d, expected %d", stage_usLen,
-         (int)MOE_N_STAGES);
+         (int)HTP_MOE_N_STAGES);
     return AEE_EBADPARM;
   }
   hexkl_probe_reset(1);
@@ -2535,9 +2440,9 @@ int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != GU_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_GU_N_STAGES) {
     FARF(ERROR, "mm_u8i4_gate_up_swiglu_timed: stage_usLen %d, expected %d",
-         stage_usLen, (int)GU_N_STAGES);
+         stage_usLen, (int)HTP_GU_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -2549,13 +2454,14 @@ int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
 
-  stage_us[GU_T_DSP_TOTAL] = (uint32)(t1 - t0);
-  stage_us[GU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[GU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
-  stage_us[GU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[GU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[GU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[HTP_GU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[HTP_GU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_GU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[HTP_GU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_GU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_GU_T_ACC_STRIDE] =
+    (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
 
@@ -2633,7 +2539,7 @@ int nntr_hvx_mm_u8i4_moe_layer_norm_timed(
   int row_countLen, const float *row_weight, int row_weightLen,
   const float *act_f32, int act_f32Len, float *out_f32, int out_f32Len,
   uint32 *stage_us, int stage_usLen) {
-  if (!stage_us || stage_usLen != MOE_N_STAGES)
+  if (!stage_us || stage_usLen != HTP_MOE_N_STAGES)
     return AEE_EBADPARM;
   memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
   hexkl_probe_on = 1;

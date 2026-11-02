@@ -24,6 +24,9 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
+"$cc" -std=c11 -Wall -Wextra -Werror -I "$BACKEND" \
+  "$HERE/profile_wire_check.c" -o "$OUT/profile_wire_check"
+"$OUT/profile_wire_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
   -I "$HERE/../../../Applications/CausalLM" \
   "$HERE/lfm2_runtime_defaults_check.cpp" -o "$OUT/lfm2_runtime_defaults_check"

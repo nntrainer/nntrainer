@@ -3,67 +3,10 @@
 """Checkpoint reading and native record writers for the LFM2 SR15 converter."""
 import ctypes
 import hashlib
-import json
 import math
-import mmap
-import struct
 
 import numpy as np
-from convert_gemma4_fc_wh import pack, recover, verify_chunk
-
-
-class Checkpoint:
-    def __init__(self, source):
-        self.path = source / 'model.safetensors'
-        self.file = self.path.open('rb')
-        self.stamp = self.path.stat()
-        raw = self.file.read(8)
-        if len(raw) != 8:
-            raise ValueError('Truncated safetensors length')
-        length, = struct.unpack('<Q', raw)
-        if length > 16 * 1024**2:
-            raise ValueError('Unexpected safetensors header size')
-        encoded = self.file.read(length)
-        self.header_hash = hashlib.sha256(raw + encoded).hexdigest()
-        self.header = json.loads(encoded)
-        self.header.pop('__metadata__', None)
-        self.start = 8 + length
-        self.mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
-        extents = []
-        for name, t in self.header.items():
-            if t['dtype'] not in ('BF16', 'F32'):
-                raise ValueError(f'Unsupported source dtype: {name}')
-            a, b = t['data_offsets']
-            expected = math.prod(t['shape']) * (2 if t['dtype'] == 'BF16' else 4)
-            if b - a != expected or a < 0 or self.start + b > len(self.mm):
-                raise ValueError(f'Invalid tensor extent: {name}')
-            extents.append((a, b))
-        end = 0
-        for a, b in sorted(extents):
-            if a != end:
-                raise ValueError('Non-contiguous safetensors data')
-            end = b
-        if self.start + end != len(self.mm):
-            raise ValueError('Unexpected safetensors length')
-
-    def read(self, name, first=None, last=None):
-        t = self.header[name]
-        dtype = '<u2' if t['dtype'] == 'BF16' else '<f4'
-        values = np.frombuffer(self.mm, dtype, math.prod(t['shape']),
-                               self.start + t['data_offsets'][0]).reshape(t['shape'])
-        if first is not None:
-            values = values[first:last]
-        if t['dtype'] == 'BF16':
-            values = (values.astype(np.uint32) << 16).view(np.float32)
-        else:
-            values = values.copy()
-        if not np.isfinite(values).all():
-            raise ValueError(f'Nonfinite source: {name}')
-        return values
-
-    def close(self):
-        self.mm.close()
-        self.file.close()
+from htp_weight_utils import Checkpoint, write_affine_wh
 
 
 def validate_config(cfg):
@@ -215,28 +158,10 @@ def write_expert(dst, item, checkpoint, tl2):
 
 
 def write_fc(dst, item, checkpoint):
-    k, n = item['shape']; maximum = energy = squared = 0.
-    for c0 in range(0, n, 256):
-        w = checkpoint.read(item['source'][0], c0, min(n, c0 + 256))
-        q, scale, offsets = recover(w)
-        tiles = pack(q)
-        for kt, row in enumerate(tiles):
-            dst.seek(item['offset'] + (kt * (n // 32) + c0 // 32) * 512)
-            dst.write(row.tobytes())
-        for at, v in [(k*n//2 + 4*c0, scale),
-                      (k*n//2 + 4*(n+c0), q.sum(axis=1, dtype=np.int32).astype('<f4')),
-                      (k*n//2 + 4*(2*n+c0), offsets)]:
-            dst.seek(item['offset'] + at); dst.write(v.tobytes())
-        dst.flush()
-        verify_chunk(dst, item['offset'], k, n, c0, q, scale, offsets)
-        error = (q.astype(np.int32) + offsets[:, None]) * scale[:, None] - w
-        maximum = max(maximum, float(np.abs(error).max()))
-        squared += np.square(error.astype(np.float64)).sum()
-        energy += np.square(w.astype(np.float64)).sum()
-    return dict(name=item['name'], max_bf16_roundtrip_error=0,
-                max_fp32_grid_vs_bf16_error=maximum,
-                fp32_grid_vs_bf16_rmse=float(np.sqrt(squared/(k*n))),
-                fp32_grid_vs_bf16_relative_rmse=float(np.sqrt(squared/energy)) if energy else 0.)
+    n = item['shape'][1]
+    rows = ((c0, checkpoint.read(item['source'][0], c0, min(n, c0 + 256)))
+            for c0 in range(0, n, 256))
+    return write_affine_wh(dst, item, rows)
 
 
 def write_float(dst, item, checkpoint):

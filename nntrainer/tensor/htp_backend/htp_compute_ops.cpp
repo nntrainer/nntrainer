@@ -39,6 +39,7 @@
 #include <htp_graph_desc.h>
 #include <htp_moe_opts.h>
 #include <htp_prepared_tl2.h>
+#include <htp_profile_wire.h>
 #include <htp_q4_0_convert.h>
 #include <htp_router_predict.h>
 #include <htp_rpcmem.h>
@@ -176,104 +177,6 @@ void qs4cxFromModelQ4_0(const void *w, uint32_t K, uint32_t N, int8_t *q,
   htp_qs4cx_from_q4_0x4(x4.data(), K, N, q, scale, colsum);
 #endif
 }
-
-/**
- * @brief Slots mm_u8i4_layer_timed fills.
- *
- * Keep these ordinals in sync with nntr_hvx_mm_u8i4.c, which ARM cannot
- * include. The DSP rejects a mismatched count with AEE_EBADPARM.
- */
-enum {
-  HTP_T_DSP_TOTAL = 0,
-  HTP_T_QUANT,
-  HTP_T_DEQUANT,
-  HTP_T_ACC_READ,
-  HTP_T_ACC_COPY,
-  HTP_T_DRAIN,
-  HTP_T_ACC_STRIDE,
-  HTP_N_STAGES
-};
-
-/**
- * @brief Slots mm_u8i4_layer_fused_timed fills.
- *
- * Keep in sync with the DSP layout. The fused call has a second quantize
- * pass and a SwiGLU stage, so it uses separate slots and counters.
- */
-enum {
-  HTP_FU_T_DSP_TOTAL = 0,
-  HTP_FU_T_QUANT,
-  HTP_FU_T_SWIGLU,
-  HTP_FU_T_DEQUANT,
-  HTP_FU_T_ACC_READ,
-  HTP_FU_T_ACC_COPY,
-  HTP_FU_T_DRAIN,
-  HTP_FU_T_ACC_STRIDE,
-  HTP_FU_N_STAGES
-};
-
-/**
- * @brief Slots mm_u8i4_gate_up_swiglu_timed fills, in order -- test/htp/
- * nntr_hvx_mm_u8i4.c's GU_T_* enum restated (the ARM side cannot include
- * that DSP source). NOT the same layout as HTP_FU_T_*: this call has no
- * down-side accumulator at all, so there is no ACC_COPY slot -- reusing
- * HTP_FU_T_*'s indices against this array would silently read DRAIN's
- * value out of the slot ACC_STRIDE actually lives in.
- */
-enum {
-  HTP_GU_T_DSP_TOTAL = 0,
-  HTP_GU_T_QUANT,
-  HTP_GU_T_SWIGLU,
-  HTP_GU_T_DEQUANT,
-  HTP_GU_T_ACC_READ,
-  HTP_GU_T_DRAIN,
-  HTP_GU_T_ACC_STRIDE,
-  HTP_GU_N_STAGES
-};
-
-/**
- * @brief Slots mm_u8i4_moe_layer_timed fills, in order -- test/htp/
- * nntr_hvx_mm_u8i4.c's MOE_T_* restated, for the same reason HTP_GU_T_* is.
- * One slot none of the others have: the routing multiply and scatter-add,
- * which live on the ARM side until this call takes them.
- */
-enum {
-  HTP_MOE_T_DSP_TOTAL = 0,
-  HTP_MOE_T_QUANT,
-  HTP_MOE_T_SWIGLU,
-  HTP_MOE_T_DEQUANT,
-  HTP_MOE_T_ACC_READ,
-  HTP_MOE_T_DRAIN,
-  HTP_MOE_T_SCATTER,
-  HTP_MOE_T_GATHER,
-  HTP_MOE_T_REQUANT,
-  HTP_MOE_T_BLOCKS,
-  HTP_MOE_T_MM,
-  HTP_MOE_T_DMA_KB,
-  HTP_MOE_T_DMA_FIRST,
-  HTP_MOE_T_ALLOC, /**< the layer call's own malloc and free */
-  HTP_MOE_T_DMA_FIRST_KB,
-  HTP_MOE_T_DRAIN_DN,
-  HTP_MOE_T_PUSH,
-  HTP_MOE_T_STAGE,
-  HTP_MOE_T_ACC_STRIDE,
-  /** The DMA ring trace's per-call numbers, hexkl_probe.h's
-      HEXKL_PROBE_DMA_* in the same order. Counts unless named _US. */
-  HTP_MOE_T_DMA_DESC,
-  HTP_MOE_T_DMA_WAITS,
-  HTP_MOE_T_DMA_WAITS_BLOCKED,
-  HTP_MOE_T_DMA_WAIT_US,
-  HTP_MOE_T_DMA_WAIT_ACT_US,
-  HTP_MOE_T_DMA_BUSY_LO_US,
-  HTP_MOE_T_DMA_BUSY_HI_US,
-  HTP_MOE_T_DMA_DEPTH_MAX,
-  HTP_MOE_T_DMA_FIRST_READY_US,
-  HTP_MOE_T_DMA_LAST_ISSUE_US,
-  HTP_MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
-  HTP_MOE_T_M1_FEED, /**< NOT us: the DMA queues the VTCM feed used (#117:
-                          1; #177: 1..4), 0 = the GEMV read the arena */
-  HTP_MOE_N_STAGES
-};
 
 /**
  * @brief Per-stage timing for the HTP path. Off unless NNTR_HTP_PROFILE is set.

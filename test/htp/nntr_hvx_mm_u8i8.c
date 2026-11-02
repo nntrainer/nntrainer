@@ -19,30 +19,13 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <htp_profile_wire.h>
 #include <remote.h>
 
 #include "hexkl_mm_u8i8_dma.h"
 #include "hexkl_probe.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
-
-/**
- * @brief Slots mm_u8i8_layer_timed fills, in order.
- *
- * unittest_hvx_fc.cpp mirrors this list; the ARM side cannot include this
- * header, so the entry point rejects a stale count with AEE_EBADPARM rather
- * than silently truncating -- the same contract attn_forward_timed uses.
- */
-enum {
-  FC_T_DSP_TOTAL = 0, /**< the whole layer_run call, DSP clock */
-  FC_T_QUANT,         /**< act f32 -> u8 AH in VTCM */
-  FC_T_DEQUANT,       /**< i32 -> f32, in place on the VTCM tile */
-  FC_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor */
-  FC_T_ACC_COPY,      /**< VTCM -> DDR staging; 0 on the in-place path */
-  FC_T_DRAIN,         /**< DMA waits */
-  FC_T_ACC_STRIDE,    /**< not a time: the derived row stride, 0 if fallback */
-  FC_N_STAGES
-};
 
 int nntr_hvx_weight_register_u8i8(remote_handle64 handle, uint32 K, uint32 N,
                                   const int8 *w_i8_rm, int w_i8_rmLen,
@@ -135,9 +118,9 @@ int nntr_hvx_mm_u8i8_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (!stage_us || stage_usLen != FC_N_STAGES) {
+  if (!stage_us || stage_usLen != HTP_N_STAGES) {
     FARF(ERROR, "mm_u8i8_layer_timed: stage_usLen %d, expected %d", stage_usLen,
-         (int)FC_N_STAGES);
+         (int)HTP_N_STAGES);
     return AEE_EBADPARM;
   }
 
@@ -153,12 +136,12 @@ int nntr_hvx_mm_u8i8_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
    * uninstrumented one pay for the probes. */
   hexkl_probe_on = 0;
 
-  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
-  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
-  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
-  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
-  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
-  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  stage_us[HTP_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[HTP_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[HTP_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[HTP_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[HTP_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[HTP_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[HTP_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
