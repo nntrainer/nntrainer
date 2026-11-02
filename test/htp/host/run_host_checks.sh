@@ -28,6 +28,9 @@ cc=${CC:-gcc}
   "$HERE/profile_wire_check.c" -o "$OUT/profile_wire_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/decode_runtime_check.cpp" -o "$OUT/decode_runtime_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
+  "$HERE/graph_binding_check.cpp" -o "$OUT/graph_binding_check"
+"$OUT/graph_binding_check"
 "$OUT/decode_runtime_check"
 "$OUT/profile_wire_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \

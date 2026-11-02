@@ -2,12 +2,12 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   transformer.cpp
+ * @file   htp_weight_preparation.cpp
  * @date   10 July 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  This file defines Transformer's basic actions
+ * @brief  Shared HTP weight preparation from the existing layer contexts.
  */
 
 #include <cmath>
@@ -23,7 +23,7 @@
 #include <engine.h>
 #include <model.h>
 
-#include <gemma4_htp_causallm.h>
+#include <htp_weight_preparation.h>
 #include <llm_util.hpp>
 #include <tokenizers_cpp.h>
 
@@ -59,33 +59,26 @@ void packCpuWeight(nntrainer::Tensor &weight) {
 }
 } // namespace
 
-void Gemma4HtpTransformer::repack_weight() {
-  if (!is_initialized) {
-    throw std::runtime_error(
-      "Transformer model is not initialized. Please call "
-      "initialize() before repack_weight().");
-  }
+void prepareHtpWeights(ml::train::Model &model,
+                       const HtpWeightPreparation &options) {
   // Register FC weights after all MoE arena chunks are mapped. DSP chunks
   // require 256 MiB alignment in a 32-bit address space; interleaved heap
   // allocations strand the space up to the next chunk boundary.
   std::map<std::string, HtpStaticEncoding> static_weights;
-  std::string static_path = STATIC_ACTIVATION_FILE;
+  std::string static_path = options.static_activation_file;
   if (const char *path = std::getenv("NNTR_HTP_STATIC_LINEAR"))
     static_path = path;
   if (!static_path.empty()) {
     std::filesystem::path path(static_path);
     if (path.is_relative())
-      path = std::filesystem::path(WEIGHT_DIR) / path;
+      path = std::filesystem::path(options.weight_dir) / path;
     std::ifstream stream(path);
     if (!stream)
       throw std::runtime_error("Cannot open static activation file: " +
                                path.string());
-    static_weights = parseHtpStaticLinear(json::parse(stream), NUM_EXPERTS);
-    if (MOE_ENGINE != "htp" || ATTN_PROJ_ENGINE != "htp" ||
-        FFN_ENGINE != "htp" || LMHEAD_ENGINE != "htp" ||
-        !MOE_HTP_LAYERS.empty() || !ATTN_PROJ_HTP_LAYERS.empty() ||
-        !FFN_HTP_LAYERS.empty() ||
-        (FC_LAYER_DTYPE != "QS4CX_WH" && FC_LAYER_DTYPE != "QS4CX_WH_AFFINE"))
+    static_weights =
+      parseHtpStaticLinear(nlohmann::json::parse(stream), options.num_experts);
+    if (!options.all_linear_htp)
       throw std::invalid_argument(
         "Static Gemma4 activation encodings require all linear ops on HTP with "
         "WH FC/head weights");
@@ -464,7 +457,7 @@ void Gemma4HtpTransformer::repack_weight() {
       }
     };
   try {
-    model->forEachLayer(fn, nullptr);
+    model.forEachLayer(fn, nullptr);
 #ifdef ENABLE_HEXKL
     for (const void *head : shared_heads)
       if (!cpu_weight_sources.count(head))
@@ -472,15 +465,18 @@ void Gemma4HtpTransformer::repack_weight() {
 #endif
     // Set the FC WH sidecar before registering pending accelerator weights.
     // CPU backends decline it without opening the file.
-    if (!FC_WH_FILE_NAME.empty()) {
-      NNTR_THROW_IF(FC_WH_FORMAT != nntrainer::FCWH_FORMAT, std::runtime_error)
-        << "fc_wh_format \"" << FC_WH_FORMAT << "\" in nntr_config.json, this "
+    if (!options.fc_wh_file.empty()) {
+      NNTR_THROW_IF(options.fc_wh_format != nntrainer::FCWH_FORMAT,
+                    std::runtime_error)
+        << "fc_wh_format \"" << options.fc_wh_format
+        << "\" in nntr_config.json, this "
         << "build reads \"" << nntrainer::FCWH_FORMAT
         << "\": re-run nntr_quantize_stream --fc_wh_sidecar";
-      const std::filesystem::path p(FC_WH_FILE_NAME);
+      const std::filesystem::path p(options.fc_wh_file);
       const std::string path =
-        p.is_absolute() ? p.string()
-                        : (std::filesystem::path(WEIGHT_DIR) / p).string();
+        p.is_absolute()
+          ? p.string()
+          : (std::filesystem::path(options.weight_dir) / p).string();
       std::set<nntrainer::ComputeOps *> backends;
       for (const auto &f : fc_pending)
         backends.insert(f.ops);
@@ -500,8 +496,8 @@ void Gemma4HtpTransformer::repack_weight() {
     if (moe_warm.ops != nullptr) {
       // Size scratch and staging for the configured prefill to avoid
       // growing and first-touching those buffers on the first call.
-      const unsigned int M = std::max(512u, INIT_SEQ_LEN), K = moe_warm.K,
-                         N_out = moe_warm.N_out;
+      const unsigned int M = std::max(512u, options.prefill_rows),
+                         K = moe_warm.K, N_out = moe_warm.N_out;
       const unsigned int E = static_cast<unsigned int>(moe_warm.gu_data.size());
       const unsigned int per = 64; // one 64-row block per expert
       std::vector<unsigned int> row_index, row_count(E, per);

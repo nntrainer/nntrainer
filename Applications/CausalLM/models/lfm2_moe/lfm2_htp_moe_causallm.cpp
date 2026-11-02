@@ -12,9 +12,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dense_ffn_layer.h>
 #include <engine.h>
 #include <fstream>
+#include <htp_cache_inputs.h>
 #include <htp_mha_core.h>
+#include <htp_model_config.h>
+#include <htp_qkv_layer.h>
 #include <layer_context.h>
 #include <layer_node.h>
 #include <lfm2_moe_layer.h>
@@ -22,22 +26,37 @@
 #include <llm_util.hpp>
 #include <map>
 #include <model.h>
+#include <residual_add.h>
 #include <stdexcept>
 #ifdef ENABLE_HEXKL
 #include <htp_backend.h>
+#include <htp_graph_binding.h>
 #include <htp_graph_desc.h>
+#include <htp_model_binding.h>
 #endif
 
 namespace causallm {
 Lfm2HtpMoECausalLM::Lfm2HtpMoECausalLM(json &cfg, json &gen, json &nntr) :
-  Transformer(sanitizeConfig(cfg), sanitizeGenerationConfig(gen, cfg), nntr,
+  Transformer(normalizeHtpModelConfig(cfg),
+              normalizeHtpGenerationConfig(gen, cfg), nntr,
               ModelType::CAUSALLM),
-  Gemma4HtpCausalLM(cfg, gen, nntr) {
+  CausalLM(cfg, gen, nntr) {
+  setPrepareRunAtLoad(false);
   setupParameters(cfg, gen, nntr);
 }
 
 void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
-  Gemma4HtpCausalLM::setupParameters(cfg, gen, nntr);
+  CausalLM::setupParameters(cfg, gen, nntr);
+  Transformer::setupParameters(cfg, gen, nntr);
+  layer_types = cfg.value("layer_types", std::vector<std::string>{});
+  ATTENTION_ENGINE = nntr.value("attention_engine", std::string());
+  const auto ATTN_PROJ_ENGINE =
+    nntr.value("attn_proj_engine", std::string("cpu"));
+  const auto FFN_ENGINE = nntr.value("dense_ffn_engine", std::string("cpu"));
+  const auto LMHEAD_ENGINE = nntr.value("lmhead_engine", std::string("cpu"));
+  const auto MOE_HADAMARD = nntr.value("moe_hadamard", std::string("off"));
+  const auto MOE_HADAMARD_SCOPE =
+    nntr.value("moe_hadamard_scope", std::string("2bit"));
   if (nntr.value("activation_quantization", std::string("dynamic")) !=
       "dynamic")
     throw std::invalid_argument(
@@ -50,9 +69,8 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
   NUM_EXPERTS_PER_TOK = cfg.at("num_experts_per_tok").get<unsigned>();
   MOE_INTERMEDIATE_SIZE = cfg.at("moe_intermediate_size").get<unsigned>();
   MOE_LAYER_DTYPE = nntr.at("moe_layer_dtype").get<std::string>();
-  MOE_ENGINE = nntr.value("moe_engine", std::string("htp"));
+  const auto MOE_ENGINE = nntr.value("moe_engine", std::string("htp"));
   MOE_CACHE_EXPERTS = nntr.value("moe_cache_experts", 16u);
-  ENABLE_MOE_BLOCK = true;
   EMBEDDING_SCALE = 1.0f;
   // Use per-row INT8 prefill for LFM2's raw V projections.
   ATTENTION_KV_DTYPE = "q8_row";
@@ -85,6 +103,16 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
     throw std::invalid_argument("LFM2 SR15 requires TL2 experts, affine WH "
                                 "projections and router, Q4_0 embedding "
                                 "and DW3_INT4 conv");
+  preparation_ = {
+    nntr.value("static_activation_file", std::string()),
+    "",
+    nntr.value("fc_wh_file_name", std::string()),
+    nntr.value("fc_wh_format", std::string()),
+    NUM_EXPERTS,
+    INIT_SEQ_LEN,
+    htpLayerIds(nntr.value("moe_htp_layers", std::string())).empty() &&
+      htpLayerIds(nntr.value("attn_proj_htp_layers", std::string())).empty() &&
+      htpLayerIds(nntr.value("dense_ffn_htp_layers", std::string())).empty()};
 #ifdef ENABLE_HEXKL
   auto *ops = nntrainer::get_htp_ops();
   ops->set_moe_geglu(false);
@@ -95,14 +123,22 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
 }
 
 void Lfm2HtpMoECausalLM::registerCustomLayers() {
-  Gemma4HtpCausalLM::registerCustomLayers();
+  CausalLM::registerCustomLayers();
   auto *ctx = static_cast<nntrainer::AppContext *>(
     nntrainer::Engine::Global().getRegisteredContext("cpu"));
-  try {
-    ctx->registerFactory(nntrainer::createLayer<ConvBlockLayer>);
-  } catch (const std::invalid_argument &) {
-    // The shared fused layer can already have been registered by another model.
-  }
+  auto register_layer = [&](auto factory) {
+    try {
+      ctx->registerFactory(factory);
+    } catch (const std::invalid_argument &) {
+      // Factories can already be registered by another model.
+    }
+  };
+  register_layer(nntrainer::createLayer<HtpMHACoreLayer>);
+  register_layer(nntrainer::createLayer<HtpQKVLayer>);
+  register_layer(nntrainer::createLayer<DenseFfnLayer>);
+  register_layer(nntrainer::createLayer<ResidualAddLayer>);
+  register_layer(nntrainer::createLayer<Lfm2MoELayer>);
+  register_layer(nntrainer::createLayer<ConvBlockLayer>);
 }
 
 Tensor Lfm2HtpMoECausalLM::attentionBlock(unsigned l, Tensor input) {
@@ -120,16 +156,16 @@ Tensor Lfm2HtpMoECausalLM::attentionBlock(unsigned l, Tensor input) {
      withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "htp")}));
   Tensor projections = qkv(input);
   auto cache =
-    createGemma4KVCachePlaceholders(l, NUM_KEY_VALUE_HEADS * HEAD_DIM);
-  LayerHandle attn(createAttentionCore(
+    htpCacheInputs(l, BATCH_SIZE, MAX_SEQ_LEN, NUM_KEY_VALUE_HEADS * HEAD_DIM);
+  LayerHandle attn(htpAttentionCore(
     {withKey("name", p + "_attention"), withKey("num_heads", NUM_HEADS),
      withKey("num_heads_kv", NUM_KEY_VALUE_HEADS),
      withKey("max_timestep", MAX_SEQ_LEN),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("sliding_window", std::numeric_limits<unsigned>::max()),
      withKey("use_rope", "false"), withKey("rope_theta", ROPE_THETA),
-     withKey("max_new_tokens", NUM_TO_GENERATE),
-     withKey("is_causal", "true")}));
+     withKey("max_new_tokens", NUM_TO_GENERATE), withKey("is_causal", "true")},
+    ATTENTION_ENGINE, ATTENTION_KV_DTYPE));
   Tensor a = attn({projections.output(0), projections.output(1),
                    projections.output(2), cache.first, cache.second});
   LayerHandle out(createLayer(
@@ -318,7 +354,9 @@ void Lfm2HtpMoECausalLM::load_weight(const std::string &path) {
 void Lfm2HtpMoECausalLM::repack_weight() {
   if (loading_ || prepared_)
     return;
-  Gemma4HtpTransformer::repack_weight();
+  if (!is_initialized)
+    throw std::runtime_error("Initialize LFM2 before repacking weights");
+  prepareHtpWeights(*model, preparation_);
 #ifdef ENABLE_HEXKL
   nntrainer::get_htp_ops()->finish_decode_graph_q4_0();
 #endif
@@ -460,31 +498,7 @@ void Lfm2HtpMoECausalLM::beforePrefillBlock(unsigned int from,
 
 void Lfm2HtpMoECausalLM::prepareDecodeGraph() {
 #ifdef ENABLE_HEXKL
-  std::map<std::string, nntrainer::Tensor *> weights;
-  model->forEachLayer(
-    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
-      for (auto *w : rc.getWeights()) {
-        const auto &name = w->getName();
-        weights[name] = &w->getVariableRef();
-        const auto colon = name.rfind(':');
-        if (colon != std::string::npos)
-          weights.emplace(layer.getName() + name.substr(colon),
-                          &w->getVariableRef());
-      }
-    },
-    nullptr);
-  auto weight = [&](const std::string &name) -> nntrainer::Tensor & {
-    auto it = weights.find(name);
-    if (it == weights.end())
-      throw std::runtime_error("Missing LFM2 weight " + name);
-    return *it->second;
-  };
-  auto f32 = [&](const std::string &name, size_t count) {
-    auto &t = weight(name);
-    if (t.getDataType() != nntrainer::Tdatatype::FP32 || t.size() != count)
-      throw std::runtime_error("Invalid LFM2 FP32 parameter " + name);
-    return t.getData<float>();
-  };
+  const HtpModelBinding binding(*model);
   htp_graph_lfm2_shape s{};
   s.n_layers = NUM_LAYERS;
   s.n_dense_layers = dense_layers_;
@@ -520,7 +534,7 @@ void Lfm2HtpMoECausalLM::prepareDecodeGraph() {
       throw std::runtime_error("HTP rejected LFM2 parameter");
   };
   auto wh = [&](const std::string &name) {
-    auto &t = weight(name);
+    auto &t = binding.weight(name);
     if (t.getDataType() != nntrainer::Tdatatype::QS4CX_WH_AFFINE ||
         !ops->set_fc_wh_source(t.getData(), t.height(), t.width(), true) ||
         !ops->add_decode_graph_qs4cx(t.getData<char>(), t.getScale<float>(),
@@ -528,54 +542,76 @@ void Lfm2HtpMoECausalLM::prepareDecodeGraph() {
       throw std::runtime_error("HTP rejected LFM2 affine weight " + name);
   };
   params_.clear();
-  unsigned layer = HTP_GRAPH_NO_OP, norm = 0, fc = 0;
   for (unsigned i = 0; i < words[3]; ++i) {
     const auto *op = htp_graph_op_cat(words.data(), i);
-    if (layer != op->layer) {
-      layer = op->layer;
-      norm = fc = 0;
-    }
+    const unsigned layer = op->layer;
     const std::string p = "layer" + std::to_string(layer);
     switch (op->kind) {
     case HTP_OP_RMSNORM: {
-      const std::string name =
-        layer == s.n_layers ? "output_norm:gamma"
-        : norm++ == 0
-          ? (attn[layer] ? p + "_qkv:in_norm_gamma" : p + "_conv_norm:gamma")
-          : p + (layer < dense_layers_ ? "_ffn:in_norm_gamma"
-                                       : "_sparse_moe:in_norm_gamma");
-      hand(i, HTP_GRAPH_PARAM_GAMMA, f32(name, DIM), DIM);
+      using Role = nntrainer::HtpBindingRole;
+      std::string name;
+      switch (nntrainer::htpBindingRole(words, i)) {
+      case Role::OutputNorm:
+        name = "output_norm:gamma";
+        break;
+      case Role::InputNorm:
+        name = p + (attn[layer] ? "_qkv:in_norm_gamma" : "_conv_norm:gamma");
+        break;
+      case Role::DenseInputNorm:
+        name = p + "_ffn:in_norm_gamma";
+        break;
+      case Role::MoeInputNorm:
+        name = p + "_sparse_moe:in_norm_gamma";
+        break;
+      default:
+        throw std::invalid_argument("LFM2 HTP: unsupported norm role");
+      }
+      hand(i, HTP_GRAPH_PARAM_GAMMA, binding.f32(name, DIM), DIM);
       break;
     }
     case HTP_OP_QK_NORM: {
       std::vector<float> g(2 * HEAD_DIM);
-      std::copy_n(f32(p + "_qkv:q_norm_gamma", HEAD_DIM), HEAD_DIM, g.begin());
-      std::copy_n(f32(p + "_qkv:k_norm_gamma", HEAD_DIM), HEAD_DIM,
+      std::copy_n(binding.f32(p + "_qkv:q_norm_gamma", HEAD_DIM), HEAD_DIM,
+                  g.begin());
+      std::copy_n(binding.f32(p + "_qkv:k_norm_gamma", HEAD_DIM), HEAD_DIM,
                   g.begin() + HEAD_DIM);
       params_.push_back(std::move(g));
       hand(i, HTP_GRAPH_PARAM_GAMMA, params_.back().data(), 2 * HEAD_DIM);
       break;
     }
     case HTP_OP_ROUTER_TOPK: {
-      auto &t = weight(p + "_sparse_moe:gate");
+      auto &t = binding.weight(p + "_sparse_moe:gate");
       if (!ops->set_fc_wh_source(t.getData(), DIM, NUM_EXPERTS, true))
         throw std::runtime_error("HTP rejected INT4 router");
       hand(i, HTP_GRAPH_PARAM_ROUTER_WH,
            reinterpret_cast<const float *>(t.getData<char>()), t.bytes() / 4);
       hand(i, HTP_GRAPH_PARAM_ROUTER_BIAS,
-           f32(p + "_sparse_moe:expert_bias", NUM_EXPERTS), NUM_EXPERTS);
+           binding.f32(p + "_sparse_moe:expert_bias", NUM_EXPERTS),
+           NUM_EXPERTS);
       break;
     }
-    case HTP_OP_FC:
-      if (!attn[layer])
-        wh(p + (fc++ == 0 ? "_conv:in_proj" : "_conv:out_proj"));
-      else if (fc++ == 0) {
+    case HTP_OP_FC: {
+      using Role = nntrainer::HtpBindingRole;
+      switch (nntrainer::htpBindingRole(words, i)) {
+      case Role::ConvInput:
+        wh(p + "_conv:in_proj");
+        break;
+      case Role::ConvOutput:
+        wh(p + "_conv:out_proj");
+        break;
+      case Role::AttentionInput:
         wh(p + "_qkv:qweight");
         wh(p + "_qkv:kweight");
         wh(p + "_qkv:vweight");
-      } else
+        break;
+      case Role::AttentionOutput:
         wh(p + "_attention_out:weight");
+        break;
+      default:
+        throw std::invalid_argument("LFM2 HTP: unsupported FC role");
+      }
       break;
+    }
     case HTP_OP_DENSE_FFN:
       wh(p + "_ffn:up");
       wh(p + "_ffn:gate");

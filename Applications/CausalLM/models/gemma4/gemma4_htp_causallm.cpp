@@ -18,9 +18,12 @@
 #include <app_context.h>
 #include <dense_ffn_layer.h>
 #include <engine.h>
+#include <htp_cache_inputs.h>
 #include <htp_mha_core.h>
+#include <htp_model_config.h>
 #include <htp_qkv_layer.h>
 #include <htp_tie_word_embedding.h>
+#include <htp_weight_preparation.h>
 #include <lfm2_moe_layer.h>
 #include <llm_util.hpp>
 #include <logit_softcapping.h>
@@ -32,28 +35,10 @@
 #include <sstream>
 
 namespace causallm {
-namespace {
-std::set<int> parseLayerIdList(const std::string &csv) {
-  std::set<int> ids;
-  std::stringstream ss(csv);
-  std::string tok;
-  while (std::getline(ss, tok, ',')) {
-    if (!tok.empty())
-      ids.insert(std::stoi(tok));
-  }
-  return ids;
-}
-
-} // namespace
 
 LayerHandle Gemma4HtpTransformer::createAttentionCore(
   const std::vector<std::string> &properties) const {
-  auto props = properties;
-  if (!ATTENTION_ENGINE.empty())
-    props.push_back(withKey("engine", ATTENTION_ENGINE));
-  if (!ATTENTION_KV_DTYPE.empty())
-    props.push_back(withKey("kv_cache_quant", ATTENTION_KV_DTYPE));
-  return LayerHandle(createLayer("htp_mha_core", props));
+  return htpAttentionCore(properties, ATTENTION_ENGINE, ATTENTION_KV_DTYPE);
 }
 
 namespace {
@@ -117,53 +102,12 @@ void Gemma4HtpTransformer::appendSkipPrefillIfNeeded(
 }
 
 json &Gemma4HtpTransformer::sanitizeConfig(json &cfg) {
-  if (cfg.contains("text_config") && cfg["text_config"].is_object()) {
-    const auto &text_cfg = cfg["text_config"];
-    for (auto it = text_cfg.begin(); it != text_cfg.end(); ++it) {
-      if (!cfg.contains(it.key())) {
-        cfg[it.key()] = it.value();
-      }
-    }
-  }
-
-  if (cfg.contains("use_bidirectional_attention") &&
-      !cfg["use_bidirectional_attention"].is_boolean())
-    cfg.erase("use_bidirectional_attention");
-
-  if (!cfg.contains("tie_word_embeddings")) {
-    cfg["tie_word_embeddings"] = true;
-  }
-
-  if (!cfg.contains("head_dim") && cfg.contains("hidden_size") &&
-      cfg.contains("num_attention_heads")) {
-    cfg["head_dim"] = cfg["hidden_size"].get<unsigned int>() /
-                      cfg["num_attention_heads"].get<unsigned int>();
-  }
-
-  return cfg;
+  return normalizeHtpModelConfig(cfg);
 }
 
 json &Gemma4HtpTransformer::sanitizeGenerationConfig(json &gen_cfg,
                                                      const json &cfg) {
-  if (!gen_cfg.contains("eos_token_id")) {
-    if (cfg.contains("eos_token_id")) {
-      auto eos = cfg["eos_token_id"];
-      if (eos.is_number()) {
-        gen_cfg["eos_token_id"] =
-          std::vector<unsigned int>{eos.get<unsigned int>()};
-      } else {
-        gen_cfg["eos_token_id"] = eos;
-      }
-    }
-  } else {
-    auto eos = gen_cfg["eos_token_id"];
-    if (eos.is_number()) {
-      gen_cfg["eos_token_id"] =
-        std::vector<unsigned int>{eos.get<unsigned int>()};
-    }
-  }
-
-  return gen_cfg;
+  return normalizeHtpGenerationConfig(gen_cfg, cfg);
 }
 
 void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
@@ -223,7 +167,7 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
         MOE_LAYER_DTYPE_PER_LAYER[std::stoi(layer)] = dtype.get<std::string>();
     MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
     MOE_HTP_LAYERS =
-      parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
+      htpLayerIds(nntr_cfg.value("moe_htp_layers", std::string("")));
     MOE_CACHE_EXPERTS = nntr_cfg.value("moe_cache_experts", 0u);
     MOE_HADAMARD_SIGNS_FILE =
       nntr_cfg.value("moe_hadamard_signs", std::string());
@@ -241,10 +185,10 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
   ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
   LMHEAD_ENGINE = nntr_cfg.value("lmhead_engine", std::string("cpu"));
   ATTN_PROJ_HTP_LAYERS =
-    parseLayerIdList(nntr_cfg.value("attn_proj_htp_layers", std::string("")));
+    htpLayerIds(nntr_cfg.value("attn_proj_htp_layers", std::string("")));
   FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
   FFN_HTP_LAYERS =
-    parseLayerIdList(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));
+    htpLayerIds(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));
 
   FULL_ATTENTION_ROPE_THETA = ROPE_THETA;
   SLIDING_ATTENTION_ROPE_THETA = ROPE_THETA;
@@ -310,31 +254,8 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
 std::pair<Tensor, Tensor>
 Gemma4HtpTransformer::createGemma4KVCachePlaceholders(const int layer_id,
                                                       unsigned int kv_width) {
-  const unsigned int max_timestep = getKVCacheRows(layer_id);
-#ifdef ENABLE_FP16
-  ml::train::TensorDim cache_dim(
-    {BATCH_SIZE, 1, max_timestep, kv_width},
-    {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
-
-  Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
-  Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
-  return {cache_k, cache_v};
-#else
-  const std::string cache_shape = std::to_string(BATCH_SIZE) +
-                                  ":1:" + std::to_string(max_timestep) + ":" +
-                                  std::to_string(kv_width);
-
-  LayerHandle cache_k_input(createLayer(
-    "input",
-    {withKey("name", "cache_k_l" + std::to_string(layer_id)),
-     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
-  LayerHandle cache_v_input(createLayer(
-    "input",
-    {withKey("name", "cache_v_l" + std::to_string(layer_id)),
-     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
-
-  return {cache_k_input(Tensor()), cache_v_input(Tensor())};
-#endif
+  return htpCacheInputs(layer_id, BATCH_SIZE, getKVCacheRows(layer_id),
+                        kv_width);
 }
 
 std::pair<Tensor, Tensor> Gemma4HtpTransformer::constructModel() {
@@ -998,6 +919,22 @@ Tensor Gemma4HtpTransformer::createMlp(const int layer_id, int dim,
   LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
 
   return ffn_down(geglu);
+}
+
+void Gemma4HtpTransformer::repack_weight() {
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before repack_weight().");
+  }
+  prepareHtpWeights(
+    *model,
+    {STATIC_ACTIVATION_FILE, WEIGHT_DIR, FC_WH_FILE_NAME, FC_WH_FORMAT,
+     NUM_EXPERTS, INIT_SEQ_LEN,
+     MOE_ENGINE == "htp" && ATTN_PROJ_ENGINE == "htp" && FFN_ENGINE == "htp" &&
+       LMHEAD_ENGINE == "htp" && MOE_HTP_LAYERS.empty() &&
+       ATTN_PROJ_HTP_LAYERS.empty() && FFN_HTP_LAYERS.empty() &&
+       (FC_LAYER_DTYPE == "QS4CX_WH" || FC_LAYER_DTYPE == "QS4CX_WH_AFFINE")});
 }
 
 void Gemma4HtpTransformer::registerCustomLayers() {
