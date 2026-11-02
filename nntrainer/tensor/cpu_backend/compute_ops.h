@@ -45,6 +45,7 @@
 namespace nntrainer {
 
 class Tensor;
+struct HtpExpertPool;
 
 /**
  * @brief The router of a MoE layer, for a backend that routes a decode row on
@@ -1933,6 +1934,9 @@ public:
     (void)pos;
     return false;
   }
+
+  /** Borrow the runtime-owned expert policy; null without HTP slot support. */
+  virtual HtpExpertPool *htpExpertPool() { return nullptr; }
 
 protected:
   /**

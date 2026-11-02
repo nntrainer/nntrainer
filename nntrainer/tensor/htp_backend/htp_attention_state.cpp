@@ -13,7 +13,7 @@
 #include <cpu_backend.h>
 #include <cstdlib>
 #include <cstring>
-#include <htp_fixed_opts.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <istream>
 #include <memory>
 #include <nntr_htp_decode_hook.h>

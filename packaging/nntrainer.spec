@@ -578,6 +578,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/cpu_kv_q_attention.h
 %{_includedir}/nntrainer/htp_act_quant.h
 %{_includedir}/nntrainer/htp_fixed_opts.h
+%{_includedir}/nntrainer/htp_expert_pool.h
 %{_includedir}/nntrainer/htp_q4_0_convert.h
 %{_includedir}/nntrainer/htp_wh_layout.h
 %{_includedir}/nntrainer/htp_wh_palette.h
