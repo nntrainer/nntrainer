@@ -811,6 +811,110 @@ TEST(KvCacheCore,
   }
 }
 
+TEST(KvCacheCore, pagedAttentionThreadedGroupsMatchDenseReference) {
+  const size_t head_dim = 64, kv_heads = 2, query_heads = 8;
+  const size_t width = query_heads * head_dim, kv_width = kv_heads * head_dim;
+  const size_t group = query_heads / kv_heads, window = 20;
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = layer.max_tokens = 64;
+  layer.encoding = Encoding::Float16;
+  layer.storage_type = StorageType::UInt16;
+  s.layers = {layer};
+  s.page_tokens = 8;
+  KvCacheManager manager;
+  manager.initialize(s);
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.window = window;
+  options.sinks = {0.5f, -1, 0, 1, 2, -2, 0.25f, 0};
+  std::vector<float> history_k, history_v;
+  // A long prefill spreads groups across threads; decode splits the groups.
+  for (size_t count : {48u, 1u, 3u}) {
+    auto step = manager.beginStep(count);
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] =
+        std::sin(static_cast<float>(i + step.from() * 3 + 1) * 0.37f);
+    std::vector<uint16_t> k(count * kv_width), v(count * kv_width);
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = nntrainer::compute_fp32_to_fp16(
+        std::cos(static_cast<float>(i + step.from() * kv_width) * 0.11f) *
+        0.2f);
+      v[i] = nntrainer::compute_fp32_to_fp16(
+        static_cast<float>((i * 7 + step.from()) % 23) / 11.0f);
+      history_k.push_back(nntrainer::compute_fp16_to_fp32(k[i]));
+      history_v.push_back(nntrainer::compute_fp16_to_fp32(v[i]));
+    }
+    manager.append(step, 0, k.data(), v.data(), k.size() * sizeof(uint16_t));
+    manager.markReady(step, 0);
+    for (bool causal : {true, false}) {
+      options.causal = causal;
+      auto actual = manager.attention(step, 0, queries, options);
+      for (size_t q = 0; q < count; ++q) {
+        const size_t end = causal ? step.from() + q + 1 : step.to();
+        const size_t start = end > window ? end - window : 0;
+        for (size_t h = 0; h < query_heads; ++h) {
+          const size_t kv_offset = (h / group) * head_dim;
+          std::vector<double> scores(end - start);
+          double maximum = options.sinks[h];
+          const float *q_head = queries.data() + q * width + h * head_dim;
+          for (size_t t = start; t < end; ++t) {
+            double score = 0;
+            for (size_t d = 0; d < head_dim; ++d)
+              score += static_cast<double>(q_head[d]) *
+                       history_k[t * kv_width + kv_offset + d];
+            scores[t - start] = score / 8.0; // 1 / sqrt(64)
+            maximum = std::max(maximum, scores[t - start]);
+          }
+          double sum = std::exp(options.sinks[h] - maximum);
+          for (auto &score : scores) {
+            score = std::exp(score - maximum);
+            sum += score;
+          }
+          for (size_t d = 0; d < head_dim; ++d) {
+            double expected = 0;
+            for (size_t t = start; t < end; ++t)
+              expected +=
+                scores[t - start] * history_v[t * kv_width + kv_offset + d];
+            EXPECT_NEAR(actual[q * width + h * head_dim + d], expected / sum,
+                        2e-3);
+          }
+        }
+      }
+    }
+    manager.commit(std::move(step));
+  }
+}
+
+TEST(KvCacheCore, pagePoolFreesIdlePagesOfOtherSizesUnderBudget) {
+  auto pool = std::make_shared<KvPagePool>(128);
+  {
+    auto first = pool->acquire(64);
+    auto second = pool->acquire(64);
+    EXPECT_EQ(pool->reservedBytes(), 128u);
+    EXPECT_THROW(pool->acquire(32), std::bad_alloc); // Both pages are in use.
+  }
+  auto large = pool->acquire(128); // Idle 64-byte pages are freed first.
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  const auto identity = large->identity();
+  large.reset();
+  EXPECT_EQ(pool->acquire(128)->identity(), identity);
+}
+
+TEST(KvCacheCore, pagePoolHandlesMayOutliveThePool) {
+  std::shared_ptr<KvStorage> page;
+  {
+    KvPagePool pool;
+    page = pool.acquire(64);
+  }
+  ASSERT_EQ(page->bytes(), 64u);
+  std::memset(page->data(), 1, 64);
+  page.reset();
+}
+
 TEST(KvCacheCore, pagedTruncateReturnsWholeBlocksAndRejectsForwardSeek) {
   auto s = spec();
   s.page_tokens = 2;

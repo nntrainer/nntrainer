@@ -159,33 +159,52 @@ StepLease KvCacheManager::beginStep(size_t count) {
   if (state_->spec.page_tokens) {
     const size_t page_tokens = state_->spec.page_tokens;
     const size_t pages = 1 + (to - 1) / page_tokens;
-    // Stage all allocations before changing the live session.
-    auto keys = state_->key_pages;
-    auto values = state_->value_pages;
+    // Committed history [0, position) always has its pages, so only the
+    // partial tail page and pages beyond it can be missing. Newly acquired
+    // pages are recorded and released again if any later acquisition fails,
+    // leaving the session unchanged without copying the whole page table.
+    const size_t first_page = state_->position / page_tokens;
+    std::vector<std::pair<size_t, size_t>> added;
     size_t backing = state_->stats.backing_bytes;
-    for (size_t i = 0; i < state_->spec.layers.size(); ++i) {
-      const auto &s = state_->spec.layers[i];
-      if (s.source >= 0)
-        continue;
-      const size_t page_bytes = checkedMultiply(page_tokens, s.rowBytes());
-      const size_t aligned = checkedAdd(page_bytes, 63) & ~size_t{63};
-      // A fixed stride keeps existing batch page indices stable as pages grow.
-      const size_t stride = 1 + (s.max_tokens - 1) / page_tokens;
-      const size_t slots = checkedMultiply(s.batch, stride);
-      keys[i].resize(slots);
-      values[i].resize(slots);
-      for (size_t b = 0; b < s.batch; ++b)
-        for (size_t p = 0; p < pages; ++p) {
-          const size_t index = b * stride + p;
-          if (!keys[i][index]) {
-            keys[i][index] = state_->pool->acquire(page_bytes);
-            values[i][index] = state_->pool->acquire(page_bytes);
-            backing = checkedAdd(backing, checkedMultiply(aligned, 2));
-          }
+    try {
+      for (size_t i = 0; i < state_->spec.layers.size(); ++i) {
+        const auto &s = state_->spec.layers[i];
+        if (s.source >= 0)
+          continue;
+        const size_t page_bytes = checkedMultiply(page_tokens, s.rowBytes());
+        const size_t aligned = checkedAdd(page_bytes, 63) & ~size_t{63};
+        // A fixed stride keeps existing batch page indices stable.
+        const size_t stride = 1 + (s.max_tokens - 1) / page_tokens;
+        const size_t slots = checkedMultiply(s.batch, stride);
+        auto &keys = state_->key_pages[i];
+        auto &values = state_->value_pages[i];
+        if (keys.size() != slots) {
+          keys.resize(slots);
+          values.resize(slots);
         }
+        for (size_t b = 0; b < s.batch; ++b)
+          for (size_t p = first_page; p < pages; ++p) {
+            const size_t index = b * stride + p;
+            if (keys[index])
+              continue;
+            // Reserve first so recording the slot below cannot throw.
+            if (added.size() == added.capacity())
+              added.reserve(std::max<size_t>(16, 2 * added.capacity()));
+            auto key = state_->pool->acquire(page_bytes);
+            auto value = state_->pool->acquire(page_bytes);
+            backing = checkedAdd(backing, checkedMultiply(aligned, 2));
+            keys[index] = std::move(key);
+            values[index] = std::move(value);
+            added.emplace_back(i, index);
+          }
+      }
+    } catch (...) {
+      for (const auto &slot : added) {
+        state_->key_pages[slot.first][slot.second].reset();
+        state_->value_pages[slot.first][slot.second].reset();
+      }
+      throw;
     }
-    state_->key_pages.swap(keys);
-    state_->value_pages.swap(values);
     state_->stats.backing_bytes = backing;
   }
   state_->overwrites = false;

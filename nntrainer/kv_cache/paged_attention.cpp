@@ -9,212 +9,161 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <exception>
 #include <limits>
+#include <mutex>
 
-#if defined(__AVX2__)
+// FMA and F16C are separate x86 extensions from AVX2: GCC/Clang reject their
+// intrinsics unless enabled. MSVC exposes them with /arch:AVX2 without
+// defining the feature macros. The NEON kernels need AArch64 (vfmaq_f32,
+// vaddvq_f32, half conversion); ARMv7 NEON and other targets use scalar code.
+#if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
 #include <immintrin.h>
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#define KV_ATTN_AVX2 1
+#if defined(__F16C__) || defined(_MSC_VER)
+#define KV_ATTN_F16C 1
+#endif
+#elif defined(__aarch64__)
 #include <arm_neon.h>
+#define KV_ATTN_NEON 1
 #endif
 
 namespace nntrainer::kv {
 namespace {
 
-inline double compute_dot_f32(const float *a, const float *b, size_t n) {
-#if defined(__AVX2__)
-  __m256 acc0 = _mm256_setzero_ps();
-  __m256 acc1 = _mm256_setzero_ps();
+/** Keys scored per online-softmax update; bounds per-thread scratch. */
+constexpr size_t kChunk = 64;
+/** Approximate multiply-adds below which threading costs more than it saves. */
+constexpr double kParallelWork = 1 << 16;
+
+#if defined(KV_ATTN_AVX2)
+inline float hsum(__m256 v) {
+  __m128 x = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+  x = _mm_add_ss(x, _mm_shuffle_ps(x, x, 0x55));
+  return _mm_cvtss_f32(x);
+}
+#endif
+
+#if defined(KV_ATTN_F16C)
+/** Load eight binary16 values as FP32. */
+inline __m256 load_ph8(const uint16_t *p) {
+  return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p)));
+}
+#endif
+
+inline float dot_f32(const float *a, const float *b, size_t n) {
   size_t i = 0;
+  float sum = 0.0f;
+#if defined(KV_ATTN_AVX2)
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
   for (; i + 16 <= n; i += 16) {
     acc0 =
       _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
     acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
                            _mm256_loadu_ps(b + i + 8), acc1);
   }
-  for (; i + 8 <= n; i += 8) {
+  for (; i + 8 <= n; i += 8)
     acc0 =
       _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
-  }
-  __m256 acc = _mm256_add_ps(acc0, acc1);
-  float buf[8];
-  _mm256_storeu_ps(buf, acc);
-  double sum =
-    buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7];
-  for (; i < n; ++i)
-    sum += static_cast<double>(a[i]) * b[i];
-  return sum;
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  float32x4_t acc0 = vdupq_n_f32(0.0f);
-  float32x4_t acc1 = vdupq_n_f32(0.0f);
-  size_t i = 0;
+  sum = hsum(_mm256_add_ps(acc0, acc1));
+#elif defined(KV_ATTN_NEON)
+  float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
   for (; i + 8 <= n; i += 8) {
     acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
     acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
   }
-  for (; i + 4 <= n; i += 4) {
+  for (; i + 4 <= n; i += 4)
     acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
-  }
-  acc0 = vaddq_f32(acc0, acc1);
-  double sum = vgetq_lane_f32(acc0, 0) + vgetq_lane_f32(acc0, 1) +
-               vgetq_lane_f32(acc0, 2) + vgetq_lane_f32(acc0, 3);
-  for (; i < n; ++i)
-    sum += static_cast<double>(a[i]) * b[i];
-  return sum;
-#else
-  double sum = 0.0;
-  for (size_t i = 0; i < n; ++i)
-    sum += static_cast<double>(a[i]) * b[i];
-  return sum;
+  sum = vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
+  for (; i < n; ++i)
+    sum += a[i] * b[i];
+  return sum;
 }
 
-inline void accum_f32(double *accum, const float *v, double old_w, double w,
-                      size_t n) {
-#if defined(__AVX2__)
-  __m256d vow = _mm256_set1_pd(old_w);
-  __m256d vw = _mm256_set1_pd(w);
+inline float dot_f16(const float *a, const uint16_t *b, size_t n) {
   size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    __m128 v_f32 = _mm_loadu_ps(v + i);
-    __m256d v_f64 = _mm256_cvtps_pd(v_f32);
-    __m256d acc = _mm256_loadu_pd(accum + i);
-    acc = _mm256_add_pd(_mm256_mul_pd(acc, vow), _mm256_mul_pd(v_f64, vw));
-    _mm256_storeu_pd(accum + i, acc);
-  }
-  for (; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * v[i];
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  float64x2_t vow = vdupq_n_f64(old_w);
-  float64x2_t vw = vdupq_n_f64(w);
-  size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    float32x4_t vf = vld1q_f32(v + i);
-    float64x2_t vf_low = vcvt_f64_f32(vget_low_f32(vf));
-    float64x2_t vf_high = vcvt_f64_f32(vget_high_f32(vf));
-    float64x2_t acc0 = vld1q_f64(accum + i);
-    float64x2_t acc1 = vld1q_f64(accum + i + 2);
-    acc0 = vmlaq_f64(vmulq_f64(acc0, vow), vf_low, vw);
-    acc1 = vmlaq_f64(vmulq_f64(acc1, vow), vf_high, vw);
-    vst1q_f64(accum + i, acc0);
-    vst1q_f64(accum + i + 2, acc1);
-  }
-  for (; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * v[i];
-#else
-  for (size_t i = 0; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * v[i];
-#endif
-}
-
-inline double compute_dot_f16(const float *a, const uint16_t *b, size_t n) {
-#if defined(__AVX2__) && defined(__F16C__)
-  __m256 acc0 = _mm256_setzero_ps();
-  __m256 acc1 = _mm256_setzero_ps();
-  size_t i = 0;
+  float sum = 0.0f;
+#if defined(KV_ATTN_F16C)
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
   for (; i + 16 <= n; i += 16) {
-    __m128i b_raw0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + i));
-    __m128i b_raw1 =
-      _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + i + 8));
-    __m256 b_f32_0 = _mm256_cvtph_ps(b_raw0);
-    __m256 b_f32_1 = _mm256_cvtph_ps(b_raw1);
-    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), b_f32_0, acc0);
-    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), b_f32_1, acc1);
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), load_ph8(b + i), acc0);
+    acc1 =
+      _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), load_ph8(b + i + 8), acc1);
   }
+  for (; i + 8 <= n; i += 8)
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), load_ph8(b + i), acc0);
+  sum = hsum(_mm256_add_ps(acc0, acc1));
+#elif defined(KV_ATTN_NEON)
+  float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
   for (; i + 8 <= n; i += 8) {
-    __m128i b_raw0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + i));
-    __m256 b_f32_0 = _mm256_cvtph_ps(b_raw0);
-    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), b_f32_0, acc0);
-  }
-  __m256 acc = _mm256_add_ps(acc0, acc1);
-  float buf[8];
-  _mm256_storeu_ps(buf, acc);
-  double sum =
-    buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7];
-  for (; i < n; ++i)
-    sum += static_cast<double>(a[i]) * nntrainer::compute_fp16_to_fp32(b[i]);
-  return sum;
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  float32x4_t acc0 = vdupq_n_f32(0.0f);
-  float32x4_t acc1 = vdupq_n_f32(0.0f);
-  size_t i = 0;
-  for (; i + 8 <= n; i += 8) {
-    float16x8_t b_f16 = vld1q_f16(reinterpret_cast<const __fp16 *>(b + i));
-    float32x4_t b_low = vcvt_f32_f16(vget_low_f16(b_f16));
-    float32x4_t b_high = vcvt_f32_f16(vget_high_f16(b_f16));
-    acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), b_low);
-    acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), b_high);
+    const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(b + i));
+    acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vcvt_f32_f16(vget_low_f16(h)));
+    acc1 =
+      vfmaq_f32(acc1, vld1q_f32(a + i + 4), vcvt_f32_f16(vget_high_f16(h)));
   }
   for (; i + 4 <= n; i += 4) {
-    float16x4_t b_f16 = vld1_f16(reinterpret_cast<const __fp16 *>(b + i));
-    acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vcvt_f32_f16(b_f16));
+    const float16x4_t h = vreinterpret_f16_u16(vld1_u16(b + i));
+    acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vcvt_f32_f16(h));
   }
-  acc0 = vaddq_f32(acc0, acc1);
-  double sum = vgetq_lane_f32(acc0, 0) + vgetq_lane_f32(acc0, 1) +
-               vgetq_lane_f32(acc0, 2) + vgetq_lane_f32(acc0, 3);
-  for (; i < n; ++i)
-    sum += static_cast<double>(a[i]) * nntrainer::compute_fp16_to_fp32(b[i]);
-  return sum;
-#else
-  double sum = 0.0;
-  for (size_t i = 0; i < n; ++i)
-    sum += static_cast<double>(a[i]) * nntrainer::compute_fp16_to_fp32(b[i]);
-  return sum;
+  sum = vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
+  for (; i < n; ++i)
+    sum += a[i] * nntrainer::compute_fp16_to_fp32(b[i]);
+  return sum;
 }
 
-inline void accum_f16(double *accum, const uint16_t *v, double old_w, double w,
-                      size_t n) {
-#if defined(__AVX2__) && defined(__F16C__)
-  __m256d vow = _mm256_set1_pd(old_w);
-  __m256d vw = _mm256_set1_pd(w);
+/** acc += w * v */
+inline void axpy_f32(float *acc, float w, const float *v, size_t n) {
   size_t i = 0;
-  for (; i + 8 <= n; i += 8) {
-    __m128i v_raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(v + i));
-    __m256 v_f32 = _mm256_cvtph_ps(v_raw);
-    __m256d v_f64_0 = _mm256_cvtps_pd(_mm256_castps256_ps128(v_f32));
-    __m256d v_f64_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(v_f32, 1));
-    __m256d acc0 = _mm256_loadu_pd(accum + i);
-    __m256d acc1 = _mm256_loadu_pd(accum + i + 4);
-    acc0 = _mm256_add_pd(_mm256_mul_pd(acc0, vow), _mm256_mul_pd(v_f64_0, vw));
-    acc1 = _mm256_add_pd(_mm256_mul_pd(acc1, vow), _mm256_mul_pd(v_f64_1, vw));
-    _mm256_storeu_pd(accum + i, acc0);
-    _mm256_storeu_pd(accum + i + 4, acc1);
-  }
-  for (; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * nntrainer::compute_fp16_to_fp32(v[i]);
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  float64x2_t vow = vdupq_n_f64(old_w);
-  float64x2_t vw = vdupq_n_f64(w);
-  size_t i = 0;
-  for (; i + 8 <= n; i += 8) {
-    float16x8_t vf = vld1q_f16(reinterpret_cast<const __fp16 *>(v + i));
-    float32x4_t vf_low = vcvt_f32_f16(vget_low_f16(vf));
-    float32x4_t vf_high = vcvt_f32_f16(vget_high_f16(vf));
-    float64x2_t acc0 = vld1q_f64(accum + i);
-    float64x2_t acc1 = vld1q_f64(accum + i + 2);
-    float64x2_t acc2 = vld1q_f64(accum + i + 4);
-    float64x2_t acc3 = vld1q_f64(accum + i + 6);
-    acc0 =
-      vmlaq_f64(vmulq_f64(acc0, vow), vcvt_f64_f32(vget_low_f32(vf_low)), vw);
-    acc1 =
-      vmlaq_f64(vmulq_f64(acc1, vow), vcvt_f64_f32(vget_high_f32(vf_low)), vw);
-    acc2 =
-      vmlaq_f64(vmulq_f64(acc2, vow), vcvt_f64_f32(vget_low_f32(vf_high)), vw);
-    acc3 =
-      vmlaq_f64(vmulq_f64(acc3, vow), vcvt_f64_f32(vget_high_f32(vf_high)), vw);
-    vst1q_f64(accum + i, acc0);
-    vst1q_f64(accum + i + 2, acc1);
-    vst1q_f64(accum + i + 4, acc2);
-    vst1q_f64(accum + i + 6, acc3);
-  }
-  for (; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * nntrainer::compute_fp16_to_fp32(v[i]);
-#else
-  for (size_t i = 0; i < n; ++i)
-    accum[i] = accum[i] * old_w + w * nntrainer::compute_fp16_to_fp32(v[i]);
+#if defined(KV_ATTN_AVX2)
+  const __m256 vw = _mm256_set1_ps(w);
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(acc + i, _mm256_fmadd_ps(vw, _mm256_loadu_ps(v + i),
+                                              _mm256_loadu_ps(acc + i)));
+#elif defined(KV_ATTN_NEON)
+  const float32x4_t vw = vdupq_n_f32(w);
+  for (; i + 4 <= n; i += 4)
+    vst1q_f32(acc + i, vfmaq_f32(vld1q_f32(acc + i), vld1q_f32(v + i), vw));
 #endif
+  for (; i < n; ++i)
+    acc[i] += w * v[i];
 }
+
+inline void axpy_f16(float *acc, float w, const uint16_t *v, size_t n) {
+  size_t i = 0;
+#if defined(KV_ATTN_F16C)
+  const __m256 vw = _mm256_set1_ps(w);
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(
+      acc + i, _mm256_fmadd_ps(vw, load_ph8(v + i), _mm256_loadu_ps(acc + i)));
+#elif defined(KV_ATTN_NEON)
+  const float32x4_t vw = vdupq_n_f32(w);
+  for (; i + 8 <= n; i += 8) {
+    const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(v + i));
+    vst1q_f32(acc + i, vfmaq_f32(vld1q_f32(acc + i),
+                                 vcvt_f32_f16(vget_low_f16(h)), vw));
+    vst1q_f32(acc + i + 4, vfmaq_f32(vld1q_f32(acc + i + 4),
+                                     vcvt_f32_f16(vget_high_f16(h)), vw));
+  }
+#endif
+  for (; i < n; ++i)
+    acc[i] += w * nntrainer::compute_fp16_to_fp32(v[i]);
+}
+
+inline void scale_f32(float *acc, float c, size_t n) {
+  for (size_t i = 0; i < n; ++i)
+    acc[i] *= c;
+}
+
+/** One checked view resolved to raw pointers on the calling thread. */
+struct Segment {
+  const char *key;
+  const char *value;
+  size_t begin; /**< First logical token of this segment. */
+  size_t rows;
+};
 
 } // namespace
 
@@ -238,7 +187,8 @@ std::vector<float> KvCacheManager::attention(const StepLease &step,
   for (float sink : options.sinks)
     if (!std::isfinite(sink))
       throw std::invalid_argument("Attention sink must be finite");
-  const size_t width = checkedMultiply(options.query_heads, s.head_dim);
+  const size_t head_dim = s.head_dim;
+  const size_t width = checkedMultiply(options.query_heads, head_dim);
   const size_t q_tokens = step.to() - step.from();
   const size_t elements = checkedMultiply(q_tokens, width);
   if (queries.size() != elements)
@@ -246,96 +196,183 @@ std::vector<float> KvCacheManager::attention(const StepLease &step,
   for (float value : queries)
     if (!std::isfinite(value))
       throw std::invalid_argument("Attention query must be finite");
+
+  // Resolve every checked view once here. Workers only touch raw pointers,
+  // whose allocations stay pinned by these views until this call returns.
   const auto keys = readKey(step, layer, batch);
   const auto values = readValue(step, layer, batch);
+  const size_t row_bytes = s.rowBytes();
+  std::vector<Segment> segments;
+  segments.reserve(keys.size());
+  size_t covered = 0;
+  for (size_t p = 0; p < keys.size(); ++p) {
+    if (keys[p].sizeBytes() != values[p].sizeBytes())
+      throw std::logic_error("KV key/value segmentation differs");
+    const size_t rows = keys[p].sizeBytes() / row_bytes;
+    segments.push_back({static_cast<const char *>(keys[p].data()),
+                        static_cast<const char *>(values[p].data()), covered,
+                        rows});
+    covered += rows;
+  }
+  if (covered != step.to())
+    throw std::logic_error("KV views do not cover the attended history");
+
   std::vector<float> output(elements);
-  const double scale = options.scale
-                         ? options.scale
-                         : 1.0 / std::sqrt(static_cast<double>(s.head_dim));
+  const float scale =
+    options.scale ? options.scale
+                  : static_cast<float>(
+                      1.0 / std::sqrt(static_cast<double>(head_dim)));
+  const float softcap = options.logit_softcap;
+  const bool has_sinks = !options.sinks.empty();
   const size_t group = options.query_heads / s.num_kv_heads;
-  const size_t kv_width = s.num_kv_heads * s.head_dim;
+  const size_t kv_head_bytes = head_dim * s.elementBytes();
   const bool is_f32 = (s.encoding == Encoding::Float32);
 
-  const size_t total_tasks = q_tokens * options.query_heads;
-  auto compute_task = [&](size_t task_idx) {
-    const size_t q = task_idx / options.query_heads;
-    const size_t h = task_idx % options.query_heads;
+  // Query heads sharing one KV head run in the same task so every K/V row is
+  // loaded once per group. The group is split only as far as needed to give
+  // every thread work (decode has a single query token).
+  auto &tm = nntrainer::ThreadManager::Global();
+  const size_t threads = std::max<size_t>(1, tm.getComputeThreadCount());
+  const size_t base_tasks = q_tokens * s.num_kv_heads;
+  size_t splits = 1;
+  while (base_tasks * splits < threads && splits < group) {
+    size_t next = splits + 1;
+    while (group % next)
+      ++next;
+    splits = next;
+  }
+  const size_t heads = group / splits;
+  const size_t per_token = s.num_kv_heads * splits;
+  const size_t tasks = q_tokens * per_token;
 
-    std::vector<double> accumulator(s.head_dim, 0.0);
-    double maximum = -std::numeric_limits<double>::infinity();
-    double denominator = 0.0;
-    if (!options.sinks.empty()) {
-      maximum = options.sinks[h];
-      denominator = 1.0;
-    }
+  std::mutex failure_lock;
+  std::exception_ptr failure;
 
-    const size_t end = options.causal ? step.from() + q + 1 : step.to();
-    const size_t start =
-      options.window && end > options.window ? end - options.window : 0;
-    const float *q_head = queries.data() + q * width + h * s.head_dim;
+  auto run = [&](size_t task) {
+    try {
+      const size_t q = task / per_token;
+      const size_t kv_head = (task % per_token) / splits;
+      const size_t h0 = kv_head * group + (task % splits) * heads;
+      const size_t end = options.causal ? step.from() + q + 1 : step.to();
+      const size_t start =
+        options.window && end > options.window ? end - options.window : 0;
+      const float *q_base = queries.data() + q * width + h0 * head_dim;
+      const size_t kv_offset = kv_head * kv_head_bytes;
 
-    size_t token = 0;
-    for (size_t p = 0; p < keys.size() && token < end; ++p) {
-      const auto *k_raw = static_cast<const char *>(keys[p].data());
-      const auto *v_raw = static_cast<const char *>(values[p].data());
-      const size_t rows = keys[p].sizeBytes() / s.rowBytes();
-
-      for (size_t row = 0; row < rows && token < end; ++row, ++token) {
-        if (token < start)
-          continue;
-        const size_t offset = row * kv_width + (h / group) * s.head_dim;
-
-        double score = 0.0;
-        if (is_f32) {
-          const auto *k_ptr = reinterpret_cast<const float *>(k_raw) + offset;
-          score = compute_dot_f32(q_head, k_ptr, s.head_dim);
-        } else {
-          const auto *k_ptr =
-            reinterpret_cast<const uint16_t *>(k_raw) + offset;
-          score = compute_dot_f16(q_head, k_ptr, s.head_dim);
-        }
-
-        score *= scale;
-        if (options.logit_softcap)
-          score =
-            options.logit_softcap * std::tanh(score / options.logit_softcap);
-
-        if (!std::isfinite(score))
-          throw std::invalid_argument(
-            "Attention key produces a nonfinite score");
-
-        const double next_max = std::max(maximum, score);
-        const double old_weight = std::exp(maximum - next_max);
-        const double weight = std::exp(score - next_max);
-        denominator = denominator * old_weight + weight;
-
-        if (is_f32) {
-          const auto *v_ptr = reinterpret_cast<const float *>(v_raw) + offset;
-          accum_f32(accumulator.data(), v_ptr, old_weight, weight, s.head_dim);
-        } else {
-          const auto *v_ptr =
-            reinterpret_cast<const uint16_t *>(v_raw) + offset;
-          accum_f16(accumulator.data(), v_ptr, old_weight, weight, s.head_dim);
-        }
-
-        maximum = next_max;
+      thread_local std::vector<float> scratch;
+      scratch.resize(heads * (head_dim + kChunk + 2));
+      float *acc = scratch.data();              // [heads, head_dim]
+      float *scores = acc + heads * head_dim;   // [heads, kChunk]
+      float *row_max = scores + heads * kChunk; // [heads]
+      float *row_sum = row_max + heads;         // [heads]
+      std::fill(acc, acc + heads * head_dim, 0.0f);
+      for (size_t j = 0; j < heads; ++j) {
+        // A sink is one extra denominator-only logit with no value row.
+        row_max[j] = has_sinks ? options.sinks[h0 + j]
+                               : -std::numeric_limits<float>::infinity();
+        row_sum[j] = has_sinks ? 1.0f : 0.0f;
       }
-    }
 
-    float *out_ptr = output.data() + q * width + h * s.head_dim;
-    for (size_t d = 0; d < s.head_dim; ++d) {
-      out_ptr[d] = static_cast<float>(accumulator[d] / denominator);
+      // First segment that contains `start`; windows skip whole pages.
+      size_t seg = static_cast<size_t>(
+        std::upper_bound(
+          segments.begin(), segments.end(), start,
+          [](size_t pos, const Segment &item) { return pos < item.begin; }) -
+        segments.begin() - 1);
+      for (size_t pos = start; pos < end;) {
+        const Segment &segment = segments[seg];
+        const size_t row0 = pos - segment.begin;
+        const size_t n = std::min({end - pos, segment.rows - row0, kChunk});
+        const char *k_rows = segment.key + row0 * row_bytes + kv_offset;
+        const char *v_rows = segment.value + row0 * row_bytes + kv_offset;
+
+        for (size_t r = 0; r < n; ++r) {
+          const char *k_row = k_rows + r * row_bytes;
+          for (size_t j = 0; j < heads; ++j) {
+            const float *q_head = q_base + j * head_dim;
+            float score =
+              is_f32
+                ? dot_f32(q_head, reinterpret_cast<const float *>(k_row),
+                          head_dim)
+                : dot_f16(q_head, reinterpret_cast<const uint16_t *>(k_row),
+                          head_dim);
+            score *= scale;
+            if (softcap)
+              score = softcap * std::tanh(score / softcap);
+            scores[j * kChunk + r] = score;
+          }
+        }
+
+        for (size_t j = 0; j < heads; ++j) {
+          float *chunk = scores + j * kChunk;
+          float next_max = row_max[j];
+          for (size_t r = 0; r < n; ++r) {
+            if (!std::isfinite(chunk[r]))
+              throw std::invalid_argument(
+                "Attention key produces a nonfinite score");
+            next_max = std::max(next_max, chunk[r]);
+          }
+          float sum = 0.0f;
+          for (size_t r = 0; r < n; ++r) {
+            chunk[r] = std::exp(chunk[r] - next_max);
+            sum += chunk[r];
+          }
+          // exp(-inf) == 0 before the first key; acc is still zero then.
+          const float rescale = std::exp(row_max[j] - next_max);
+          if (rescale != 1.0f)
+            scale_f32(acc + j * head_dim, rescale, head_dim);
+          row_sum[j] = row_sum[j] * rescale + sum;
+          row_max[j] = next_max;
+        }
+
+        for (size_t r = 0; r < n; ++r) {
+          const char *v_row = v_rows + r * row_bytes;
+          for (size_t j = 0; j < heads; ++j) {
+            const float w = scores[j * kChunk + r];
+            if (is_f32)
+              axpy_f32(acc + j * head_dim, w,
+                       reinterpret_cast<const float *>(v_row), head_dim);
+            else
+              axpy_f16(acc + j * head_dim, w,
+                       reinterpret_cast<const uint16_t *>(v_row), head_dim);
+          }
+        }
+
+        pos += n;
+        if (row0 + n == segment.rows)
+          ++seg;
+      }
+
+      for (size_t j = 0; j < heads; ++j) {
+        float *out = output.data() + q * width + (h0 + j) * head_dim;
+        const float *a = acc + j * head_dim;
+        for (size_t d = 0; d < head_dim; ++d)
+          out[d] = a[d] / row_sum[j];
+      }
+    } catch (...) {
+      // ThreadManager workers must not throw; report on the calling thread.
+      std::lock_guard<std::mutex> lock(failure_lock);
+      if (!failure)
+        failure = std::current_exception();
     }
   };
 
-  if (total_tasks <= 16 || q_tokens == 1) {
-    for (size_t task_idx = 0; task_idx < total_tasks; ++task_idx)
-      compute_task(task_idx);
+  // Causal prefill makes later queries more expensive; a cyclic assignment
+  // balances them where ThreadManager's contiguous ranges would not.
+  const double work = static_cast<double>(q_tokens) * options.query_heads *
+                      static_cast<double>(step.to()) * head_dim;
+  const size_t workers = std::min(threads, tasks);
+  if (workers <= 1 || work < kParallelWork) {
+    for (size_t task = 0; task < tasks; ++task)
+      run(task);
   } else {
-    auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, total_tasks, compute_task);
+    tm.parallel_for(0, workers, [&](size_t worker) {
+      for (size_t task = worker; task < tasks; task += workers)
+        run(task);
+    });
   }
-
+  if (failure)
+    std::rethrow_exception(failure);
   return output;
 }
 
