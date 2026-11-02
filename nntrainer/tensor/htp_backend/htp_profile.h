@@ -7,7 +7,9 @@
  */
 #ifndef NNTR_HTP_PROFILE_H
 #define NNTR_HTP_PROFILE_H
+#include "htp_runtime_config.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -17,14 +19,15 @@
 #include <htp_profile_wire.h>
 #include <htp_rpcmem.h>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
 
 namespace nntrainer {
 /**
- * @brief Per-stage timing for the HTP path. Off unless NNTR_HTP_PROFILE is set.
+ * @brief Per-stage timing for the HTP path. Off unless htp.profile is set.
  *
- * NNTR_HTP_PROFILE=1 times the three host-side stages a weight goes through:
+ * htp.profile=1 times the three host-side stages a weight goes through:
  * the Q4_0/QS4CX -> HexKL-registry conversion, the weight_register FastRPC,
  * and the per-dot() layer call. =2 additionally routes the layer call through
  * mm_u8i4_layer_timed, so the DSP reports its own microseconds and the
@@ -39,8 +42,26 @@ namespace nntrainer {
 class HtpProfile {
 public:
   static HtpProfile &global() {
-    static HtpProfile instance;
-    return instance;
+    auto &storage = instance();
+    auto *profile = storage.current.load(std::memory_order_acquire);
+    if (!profile) {
+      std::lock_guard<std::mutex> lock(storage.mutex);
+      profile = storage.current.load(std::memory_order_relaxed);
+      if (!profile) {
+        storage.owner.reset(new HtpProfile());
+        profile = storage.owner.get();
+        storage.current.store(profile, std::memory_order_release);
+      }
+    }
+    return *profile;
+  }
+
+  /** All runtime workers must have stopped before resetting the report. */
+  static void reset() {
+    auto &storage = instance();
+    std::lock_guard<std::mutex> lock(storage.mutex);
+    storage.current.store(nullptr, std::memory_order_release);
+    storage.owner.reset();
   }
 
   int level() const { return level_; }
@@ -254,7 +275,7 @@ public:
   }
 
   /** @brief Whether this call's per-descriptor trace should be
-   *  dumped: the first NNTR_HTP_DMA_TRACE (default 3) timed calls of each
+   *  dumped: the first htp.dma_trace_calls (default 3) timed calls of each
    *  bucket. Returns the 1-based call ordinal to print, or 0. */
   unsigned dmaTraceOrdinal(unsigned K, unsigned N_out, unsigned M,
                            int kind = 0) {
@@ -338,6 +359,16 @@ public:
   }
 
 private:
+  struct Storage {
+    std::mutex mutex;
+    std::unique_ptr<HtpProfile> owner;
+    std::atomic<HtpProfile *> current{nullptr};
+  };
+  static Storage &instance() {
+    static Storage storage;
+    return storage;
+  }
+
   struct Bucket {
     uint64_t calls = 0;
     uint64_t rows = 0; /**< summed M, so prefill batching is visible */
@@ -438,10 +469,8 @@ private:
   };
 
   HtpProfile() {
-    const char *env = std::getenv("NNTR_HTP_PROFILE");
-    level_ = (env != nullptr) ? std::atoi(env) : 0;
-    const char *trace_env = std::getenv("NNTR_HTP_DMA_TRACE");
-    dma_trace_calls_ = (trace_env != nullptr) ? std::atoi(trace_env) : 3;
+    level_ = static_cast<int>(htpRuntimeConfig().htp.profile);
+    dma_trace_calls_ = static_cast<int>(htpRuntimeConfig().htp.dma_trace_calls);
     // Captured at construction, not at static-destruction time in dump():
     // HtpProfile::global() is always reached through a HtpBackend::global()
     // call first (every accelerated entry point fetches the session handle

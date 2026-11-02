@@ -46,6 +46,7 @@ Lfm2HtpMoECausalLM::Lfm2HtpMoECausalLM(json &cfg, json &gen, json &nntr) :
 }
 
 void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
+  const auto runtime_config = normalizeHtpRuntimeConfig(nntr);
   CausalLM::setupParameters(cfg, gen, nntr);
   Transformer::setupParameters(cfg, gen, nntr);
   layer_types = cfg.value("layer_types", std::vector<std::string>{});
@@ -114,6 +115,7 @@ void Lfm2HtpMoECausalLM::setupParameters(json &cfg, json &gen, json &nntr) {
       htpLayerIds(nntr.value("attn_proj_htp_layers", std::string())).empty() &&
       htpLayerIds(nntr.value("dense_ffn_htp_layers", std::string())).empty()};
 #ifdef ENABLE_HEXKL
+  nntrainer::configureHtpRuntime(runtime_config);
   auto *ops = nntrainer::get_htp_ops();
   ops->set_moe_geglu(false);
   ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
@@ -195,10 +197,8 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "htp")};
       conv_props.push_back("short_conv_dtype=DW3_INT4");
 #if defined(__aarch64__) && defined(ENABLE_HEXKL)
-      const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-      const char *retain = std::getenv("NNTR_LFM2_CONV_RETAIN_OUT");
-      if (views && std::strcmp(views, "1") == 0 && retain &&
-          std::strcmp(retain, "1") == 0)
+      const auto &htp_config = nntrainer::htpRuntimeConfig().htp;
+      if (htp_config.lfm2_prefill_views && htp_config.lfm2_conv_retain_out)
         conv_props.push_back("out_to_host=false");
 #endif
       LayerHandle conv(createLayer("conv_block", conv_props));
@@ -235,8 +235,7 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
         props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
       props.push_back("router_dtype=QS4CX_WH_AFFINE");
 #if defined(__aarch64__) && defined(ENABLE_HEXKL)
-      const char *prefill_views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-      if (prefill_views && std::strcmp(prefill_views, "1") == 0)
+      if (nntrainer::htpRuntimeConfig().htp.lfm2_prefill_views)
         props.push_back("out_to_host=false");
 #endif
       LayerHandle moe(createLayer("lfm2_moe", props));
@@ -464,9 +463,8 @@ void Lfm2HtpMoECausalLM::load_kvcache(std::string path, int to) {
 void Lfm2HtpMoECausalLM::beforePrefillBlock(unsigned int from,
                                             unsigned int to) {
 #ifdef ENABLE_HEXKL
-  const char *early = std::getenv("NNTR_LFM2_PREFILL_EARLY");
-  if (!early || std::strcmp(early, "1") != 0 || from != 0 || to <= 1 ||
-      !prepared_ || prefill_early_attempted_ || NUM_EXPERTS != 64 ||
+  if (!nntrainer::htpRuntimeConfig().moe.lfm2_prefill_early || from != 0 ||
+      to <= 1 || !prepared_ || prefill_early_attempted_ || NUM_EXPERTS != 64 ||
       MOE_CACHE_EXPERTS != 16)
     return;
   prefill_early_attempted_ = true;

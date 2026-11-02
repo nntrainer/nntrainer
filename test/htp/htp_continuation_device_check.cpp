@@ -11,6 +11,7 @@
 #error "The continuation device check requires an HTP-enabled engine"
 #endif
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <gemma4_htp_moe_causallm.h>
@@ -20,6 +21,7 @@
 #include <lfm2_htp_moe_causallm.h>
 #include <lfm2_runtime_defaults.h>
 #include <neuralnet.h>
+#include <thread_manager.h>
 
 using causallm::json;
 
@@ -96,7 +98,15 @@ int main(int argc, char **argv) {
     causallm::configureLfm2HtpDefaults(
       cfg.value("model_type", std::string()),
       nntr.value("lfm2_weight_format", std::string()),
-      nntr.value("lfm2_execution_profile", std::string()));
+      nntr.value("lfm2_execution_profile", std::string()), nntr);
+    if (nntr.contains("num_threads") && !std::getenv("NNTR_NUM_THREADS")) {
+      nntrainer::ThreadManagerConfig threading;
+      causallm::detail::readHtpConfigValue(
+        nntr.at("num_threads"), threading.compute_threads, "num_threads");
+      if (threading.compute_threads == 0)
+        throw std::invalid_argument("num_threads must be positive");
+      nntrainer::ThreadManager::setConfig(threading);
+    }
     for (auto key : {"tokenizer_file", "model_file_name", "embedding_file_name",
                      "kv_quant_file", "static_activation_file"}) {
       if (nntr.contains(key) && nntr[key].is_string()) {
@@ -105,6 +115,7 @@ int main(int argc, char **argv) {
           nntr[key] = (pack / path).string();
       }
     }
+    causallm::resolveHtpRuntimeConfigPaths(nntr, pack.string());
     nntr["init_seq_len"] = 64;
     nntr["max_seq_len"] = 128;
     nntr["num_to_generate"] = 16;

@@ -53,6 +53,13 @@ public:
   std::unique_ptr<Transformer> create(const std::string &key, json &cfg,
                                       json &generation_cfg,
                                       json &nntr_cfg) const {
+    const bool htp_model = key == "Lfm2MoeForCausalLM" ||
+                           (key == "Gemma4ForCausalLM" &&
+                            nntr_cfg.value("gemma4_execution_profile",
+                                           std::string()) == "htp_fused");
+    if (!htp_model && (nntr_cfg.contains("htp") || nntr_cfg.contains("moe")))
+      throw std::invalid_argument(
+        "htp/moe runtime configuration requires an HTP model");
     auto it = creators.find(key);
     if (it != creators.end()) {
       return (it->second)(cfg, generation_cfg, nntr_cfg);

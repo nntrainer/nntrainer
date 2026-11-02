@@ -9,9 +9,12 @@
 #ifndef QUICK_DOT_AI_HTP_LIFECYCLE_TEST_H
 #define QUICK_DOT_AI_HTP_LIFECYCLE_TEST_H
 
+#include "json.hpp"
 #include "quick_dot_ai_api.h"
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -65,16 +68,18 @@ static int run_htp_lifecycle_test(const char *prompt, const char *base,
 
     const char *trace_env = std::getenv("QDA_HTP_TRACE_PREFIX");
     const std::string trace_prefix = trace_env ? trace_env : "";
+    std::string trace_path;
+    if (!trace_prefix.empty()) {
+      std::ifstream config_file(std::string(base) +
+                                "/gemma4-26b-a4b-htp-w4a32/nntr_config.json");
+      const auto config = nlohmann::json::parse(config_file);
+      trace_path = config.at("htp").at("token_trace").get<std::string>();
+      check(!trace_path.empty(), "configure htp.token_trace before model load");
+    }
     const auto generate = [&](const std::string &name, unsigned callback_stop,
                               bool thread_cancel, bool unload) {
-      if (!trace_prefix.empty()) {
-        const auto path = trace_prefix + "-" + name + ".json";
-#ifdef _WIN32
-        _putenv_s("NNTR_HTP_TOKEN_TRACE", path.c_str());
-#else
-        setenv("NNTR_HTP_TOKEN_TRACE", path.c_str(), 1);
-#endif
-      }
+      if (!trace_path.empty())
+        std::remove(trace_path.c_str());
       Stream stream;
       stream.stop_after = callback_stop;
       ErrorCode cancel_result = CAUSAL_LM_ERROR_UNKNOWN;
@@ -104,6 +109,14 @@ static int run_htp_lifecycle_test(const char *prompt, const char *base,
         canceller.join();
       check(result == CAUSAL_LM_ERROR_NONE && stream.callbacks != 0,
             name + " generation");
+      if (!trace_path.empty()) {
+        std::ifstream source(trace_path, std::ios::binary);
+        check(source.good(), name + " token trace");
+        std::ofstream destination(trace_prefix + "-" + name + ".json",
+                                  std::ios::binary);
+        destination << source.rdbuf();
+        check(destination.good(), name + " token trace copy");
+      }
       if (callback_stop)
         check(stream.callbacks == callback_stop, name + " callback stop");
       if (thread_cancel)

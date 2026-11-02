@@ -14,8 +14,7 @@
  * byte, with in0 the residual and in1 the addend. At one decode row it
  * first offers the row to the HTP ADD op (htpDecodeAdd), which holds the
  * residual on the DSP; on 1 the layer writes nothing. The models use it
- * only under NNTR_HTP_FORWARD (Transformer::RESIDUAL_ADD_TYPE), so the
- * core addition layer and every other model stay as they are.
+ * in the HTP execution profile through Transformer::RESIDUAL_ADD_TYPE.
  *
  * With its options it is the block's whole epilogue (doc 57 section 5
  * step 4): out = scale * (in0 + rmsnorm(in1 [+ in2]) * gamma). in_norm

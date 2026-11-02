@@ -223,14 +223,19 @@ that matter:
 | `moe_layer_dtype` / `fc_layer_dtype` | `QS2CX_WH` / `QS4CX` | expert and dense weight formats |
 | `moe_layer_dtype_per_layer` | `{"28": "QS4CX_WH_AFFINE", "29": "QS4CX_WH_AFFINE"}` | optional; overrides `moe_layer_dtype` for the listed MoE layers (the rotated ternary checkpoint keeps layers 28 and 29 in the 4-bit affine container, the rest `TL2CX_WH`) |
 | `moe_hadamard_signs` | `rotation_signs.json` | optional, with `moe_hadamard`; a JSON beside the model (`{"format": "nntr_hadamard_signs_v1", "in": [±1 × hidden], "down": [±1 × moe_intermediate]}`): the checkpoint's per-dimension signs applied after the Hadamard, the same for every MoE layer. Without it a seeded (sign-flipped) rotation gives wrong text; with it the rotation runs on the HVX path (no HMX fp16 variant) |
-| `moe_hadamard` / `moe_hadamard_scope` | `both_hmx` / `all` | optional; the online Hadamard rotation of the expert inputs a pre-rotated checkpoint needs (`rotation_meta.json`), with the words of `NNTR_MOE_HADAMARD` (off, up, down, both, both_scalar, up_hmx, down_hmx, both_hmx) and `NNTR_MOE_HADAMARD_SCOPE` (2bit, all); the environment wins when set. `all` rotates every expert layer and never the dense FFN. Unrotated weights with the rotation on, or the reverse, give wrong text |
+| `moe.hadamard` / `moe.hadamard_scope` | `both_hmx` / `all` | optional online rotation required by pre-rotated checkpoints (`rotation_meta.json`). Modes: off, up, down, both, both_scalar, up_hmx, down_hmx, both_hmx, both_paley; scope: 2bit or all. `all` rotates every expert layer, never the dense FFN. The setting must match the weights |
 | `embedding_dtype` / `lmhead_dtype` | `Q4_0` | embedding table and head; an untied head (`tie_word_embeddings: false` in `config.json`) may be `QS4CX`, and then runs on the DSP as WH slices for both the prefill's last row and decode; the slices are cached beside the model as `<model file>.lmhead_wh` after the first load (delete it after re-quantizing the head) |
 | `attention_kv_dtype` | `q8` | int8 KV cache (required) |
 | `moe_engine`, `attention_engine`, `attn_proj_engine`, `dense_ffn_engine` | `htp` | which blocks run on the DSP |
 | `lmhead_engine` | `cpu` | the tied Q4_0 head stays split: the DSP runs decode, the CPU the prefill's last row; a `QS4CX` untied head ignores this key and runs on the DSP throughout |
-| `moe_cache_experts` | `16` | experts kept resident per layer |
+| `moe.cache_experts` | `16` | experts kept resident per layer |
 | `init_seq_len` / `max_seq_len` | `1280` | context |
 | `num_to_generate` | `127` | generation budget per call |
+
+The `htp` and `moe` settings are nested JSON objects. Existing packs with
+flat `moe_cache_experts`, `moe_hadamard` and `moe_hadamard_scope` remain
+accepted; remove the flat key when replacing it with a different nested
+value. Conflicting values and unknown nested keys are rejected.
 
 Push the pack to the phone (the app and the tools read it from external
 storage):
@@ -297,28 +302,36 @@ adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D \
 ```
 
 `ADSP_LIBRARY_PATH` must point at the directory holding
-`libnntr_hvx_skel.so`. Nothing else has to be set: the runtime configuration
-the model was validated with (the resident decode graph, 16 resident experts
-per layer, the int8 decode attention, the dense projections in the DSP arena,
-the host copies dropped once the DSP holds them, four DMA queues for the
-expert feed, the ARM's next-layer expert prediction with its read-ahead, and
-the prefill scratch released after the first token, and the expert pool grown
-to 34 experts a layer after the first token where the DSP's address space
-allows) is built into the library
-(`nntrainer/tensor/htp_backend/htp_fixed_opts.h`). Environment controls remain
-available:
-`NNTR_HTP_PAGE_CACHE` unset keeps the mmap loader; `0` selects direct I/O.
-The fixed-capacity measurement preset sets `moe_cache_experts=16` in the
-pack, `NNTR_MOE_CACHE_GROW=0` and `NNTR_MOE_PRELOAD_EXPERTS=128`.
-`NNTR_MOE_SERVER_DONE=1` enables the optional completion hint; it is off
-by default. See the [code guide](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)
-for the controls and the TL2 guide for the conditions of each measurement.
+`libnntr_hvx_skel.so`. Runtime tuning is read from the model's
+`nntr_config.json`, with separate `htp` and `moe` objects. With both omitted,
+Gemma4 keeps the existing mmap, C16, automatic bounded cache growth and
+prediction defaults. Resident decode, int8 attention and DSP arena placement
+remain the normal execution path.
+
+For the direct-I/O, fixed-capacity measurement policy, merge this into the
+pack's configuration before loading it:
+
+```json
+{
+  "htp": {"page_cache": 0, "token_trace": "/data/local/tmp/htp/trace.json"},
+  "moe": {"cache_experts": 16, "cache_grow": 0, "preload_experts": 128}
+}
+```
+
+`htp.page_cache=-1` keeps mmap; `0` uses direct I/O; `1` uses bounded cached
+reads. `moe.server_done=true` enables the optional completion hint, which is
+off by default. The old `NNTR_HTP_*`, `NNTR_MOE_*` and `NNTR_LFM2_*` runtime
+exports have no effect. See the
+[code guide](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)
+for defaults and validation. Values stay fixed until model unload; edit the
+pack and reload to change them.
 
 With no prompt argument the CLI uses `sample_input` from `nntr_config.json`.
 Pass your own prompt as the second argument; the chat template from the pack
-is applied to it. Add `NNTR_HTP_TOKEN_TRACE=/data/local/tmp/htp/trace.json`
-to get the input and output token ids as JSON, which is how the numbers in
-section 9 were compared.
+is applied to it. `htp.token_trace` writes the input and output token IDs of
+each generation as JSON. Copy the file between generations to keep multiple
+results. The same config works with the CLI and public API; Gemma4 does not
+receive the LFM2 CLI preset.
 
 The public C API has its own device check that loads, generates, cancels,
 unloads and reloads through the same calls the app makes:
@@ -329,7 +342,10 @@ adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D QUICKAI_NATIVE_LIB_D
   ./quick_dot_ai_test gemma4-26b-a4b-htp 'I bought a red car yesterday' true W4A32 1 /sdcard/Download/aistudio-mobile/models"
 ```
 
-It prints one `[HTP-API-TEST] PASS ...` line per check (29 in total).
+It prints one `[HTP-API-TEST] PASS ...` line per check. To preserve per-step
+traces, configure `htp.token_trace` in the pack before loading and set the
+test-only `QDA_HTP_TRACE_PREFIX` to the destination prefix. The harness copies
+the completed trace after each generation.
 
 ## 8. Tests
 
@@ -412,7 +428,7 @@ The newer head also bounds the model's page-cache use, measured with a
 2,048-token prompt: peak memory 8.4 GB (up to 3.5 GB of it the model's page
 cache) at 645 tok/s prefill and 9.9 tok/s decode, or 3.6 GB with the page
 cache bounded at 682 tok/s prefill and 7.0 tok/s decode
-(`NNTR_HTP_PAGE_CACHE=0`). On this branch, built from the same head state,
+(historically `NNTR_HTP_PAGE_CACHE=0`, now `htp.page_cache=0`). On this branch, built from the same head state,
 the summary prompt of section 9.1 gives 1,633 ms (630 tok/s) prefill and
 13.8 tok/s (99 tokens in 7.2 s) decode, and the 100 generated token ids are identical to a
 build of the PR #4416 head run with the same options; they differ from the

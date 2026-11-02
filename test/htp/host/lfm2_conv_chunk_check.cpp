@@ -57,17 +57,15 @@ static bool sameOutput(const float *a, const float *b, size_t count) {
 #endif
 }
 static bool stateOnlyGated() {
-  const char *tile = std::getenv("NNTR_LFM2_CONV_CHANNEL_TILE");
-  const char *state = std::getenv("NNTR_LFM2_CONV_STATE_ONLY");
-  return tile && std::strcmp(tile, "1") == 0 && state &&
-         std::strcmp(state, "1") == 0;
+  const auto &config = nntrainer::htpRuntimeConfig().htp;
+  return config.lfm2_conv_channel_tile && config.lfm2_conv_state_only;
 }
 static bool sameGated(const float *got, const float *expected, size_t count,
                       unsigned rows, bool chunked = false) {
   if (!stateOnlyGated())
     return sameOutput(got, expected, count);
-  const char *whole = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
-  const bool split = chunked && !(whole && std::strcmp(whole, "1") == 0);
+  const bool split =
+    chunked && !nntrainer::htpRuntimeConfig().htp.lfm2_conv_whole_prefill;
   for (size_t r = 0; r < count / 2048u; ++r) {
     const bool saved =
       (r < rows && r + 2u >= rows) || (split && (r == 1918u || r == 1919u));
@@ -810,12 +808,24 @@ static void retained_host_views() {
 }
 
 static void retained_output_route() {
-  const char *diagnostics[] = {
-    nullptr,         "NNTR_HTP_DUMP",      "NNTR_ACT_STATS",
-    "NNTR_ACT_DUMP", "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH",
-    "NNTR_MOE_DIFF", "NNTR_MOE_SHADOW",    "NNTR_L2_DIFF",
-    "NNTR_L2_SHADOW"};
-  for (unsigned reason = 0; reason < 15; ++reason) {
+  const char *diagnostics[] = {"NNTR_ACT_STATS", "NNTR_ACT_DUMP",
+                               "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH"};
+  const auto base = nntrainer::htpRuntimeConfig();
+  for (unsigned reason = 0; reason < 13; ++reason) {
+    auto config = base;
+    if (reason == 1)
+      config.htp.dump_dir = "unused-dump-path";
+    if (reason == 6)
+      config.htp.l2_diff = true;
+    if (reason == 7)
+      config.htp.l2_shadow = true;
+    if (reason == 11)
+      config.htp.lfm2_prefill_views = false;
+    if (reason == 12)
+      config.htp.keep_out = false;
+    nntrainer::configureHtpRuntime(config);
+    if (reason >= 2 && reason <= 5)
+      setenv(diagnostics[reason - 2], "1", 1);
     Fixture f;
     f.prepare(0, reason);
     f.ops.mock_output_projection = true;
@@ -824,15 +834,9 @@ static void retained_output_route() {
       iw{f.truth.data(), nntrainer::Tdatatype::QS4CX_WH_AFFINE};
     Tensor ow = iw, p{f.proj.data()}, g{f.g.data()}, y{f.out.data()},
            o{output.data()};
-    const bool training = reason == 10, to_host = reason == 11;
-    if (reason == 12)
+    const bool training = reason == 8, to_host = reason == 9;
+    if (reason == 10)
       o.contiguous = false;
-    if (reason == 13)
-      unsetenv("NNTR_LFM2_PREFILL_VIEWS");
-    if (reason == 14)
-      setenv("NNTR_HTP_KEEP_OUT", "0", 1);
-    if (reason > 0 && reason < 10)
-      setenv(diagnostics[reason], "1", 1);
     bool fellthrough = false;
     candidate::appRoute(in, iw, ow, p, g, y, o, f.state.data(),
                         f.weights.data(), &f.ops, M, C, C, C, 0, false, false,
@@ -857,12 +861,9 @@ static void retained_output_route() {
           "retained output fallback materialization differs");
     check(sameOutput(f.state.data(), f.refstate.data(), f.state.size()),
           "retained output changed convolution state");
-    if (reason > 0 && reason < 10)
-      unsetenv(diagnostics[reason]);
-    if (reason == 13)
-      setenv("NNTR_LFM2_PREFILL_VIEWS", "1", 1);
-    if (reason == 14)
-      unsetenv("NNTR_HTP_KEEP_OUT");
+    if (reason >= 2 && reason <= 5)
+      unsetenv(diagnostics[reason - 2]);
+    nntrainer::configureHtpRuntime(base);
     ++cases;
   }
 }
@@ -898,15 +899,25 @@ static void whole_numeric() {
   }
 }
 
-int main() {
+int main(int argc, char **argv) {
   try {
-    const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-    if (views && std::strcmp(views, "1") == 0)
+    const std::string mode = argc > 1 ? argv[1] : "chunk";
+    check(mode == "chunk" || mode == "whole" || mode == "whole-views" ||
+            mode == "whole-state",
+          "invalid mode");
+    nntrainer::HtpRuntimeConfig config;
+    config.htp.lfm2_conv_whole_prefill = mode != "chunk";
+    config.htp.lfm2_prefill_views =
+      mode == "whole-views" || mode == "whole-state";
+    config.htp.lfm2_conv_retain_out = config.htp.lfm2_prefill_views;
+    config.htp.lfm2_conv_channel_tile = mode == "whole-state";
+    config.htp.lfm2_conv_state_only = mode == "whole-state";
+    nntrainer::configureHtpRuntime(config);
+    if (config.htp.lfm2_prefill_views)
       retained_host_views();
-    const char *whole = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
-    if (whole && std::strcmp(whole, "1") == 0) {
+    if (config.htp.lfm2_conv_whole_prefill) {
       whole_numeric();
-      if (views && std::strcmp(views, "1") == 0)
+      if (config.htp.lfm2_prefill_views)
         retained_output_route();
       fused_gate_stripes();
       std::printf("CONV_WHOLE %u cases PASS\n", cases);

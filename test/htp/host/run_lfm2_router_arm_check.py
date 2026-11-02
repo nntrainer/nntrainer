@@ -52,7 +52,8 @@ common = [a.cxx, '-std=c++17', '-pthread', '-mfma'] + flags + [
     '-I' + str(folder.resolve())]
 commands.append(common + ['-c', str((a.output / 'kernel.cpp').resolve()), '-o', str((a.output / 'kernel.o').resolve())])
 commands.append(common + [str((a.output / 'lfm2_router_arm_check.cpp').resolve()),
-                          str((a.output / 'kernel.o').resolve())] + objects + ['-Wl,--gc-sections', '-o', str((a.output / 'check').resolve())])
+                          str((a.output / 'kernel.o').resolve()),
+                          str((backend / 'htp_runtime_config.cpp').resolve())] + objects + ['-Wl,--gc-sections', '-o', str((a.output / 'check').resolve())])
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
 manifest = {'commands': commands, 'source_sha256': sha(folder / 'lfm2_moe_layer.cpp'),
             'kernel_sha256': sha(folder / 'lfm2_router_arm.cpp'),
@@ -62,14 +63,7 @@ manifest = {'commands': commands, 'source_sha256': sha(folder / 'lfm2_moe_layer.
 for cmd in commands:
     subprocess.run(cmd, check=True)
 if not a.build_only:
-    for value in ('1', '0', 'unset', 'true', 'quantized'):
+    for mode in ('on', 'off', 'quantized'):
         env = os.environ.copy()
         env.update(ASAN_OPTIONS='detect_leaks=1:halt_on_error=1', UBSAN_OPTIONS='halt_on_error=1')
-        env.pop('NNTR_HTP_ROUTER_U8I8', None)
-        if value == 'unset':
-            env.pop('NNTR_LFM2_ROUTER_ARM', None)
-        else:
-            env['NNTR_LFM2_ROUTER_ARM'] = '1' if value == 'quantized' else value
-        if value == 'quantized':
-            env['NNTR_HTP_ROUTER_U8I8'] = '0'  # Backend option deliberately uses presence.
-        subprocess.run([str((a.output / 'check').resolve())], env=env, check=True)
+        subprocess.run([str((a.output / 'check').resolve()), mode], env=env, check=True)

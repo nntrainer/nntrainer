@@ -1030,7 +1030,7 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
        nntrainer::weightPageCachePolicy() != 0),
     std::invalid_argument)
     << "stream_fp32 requires FP32 inference without a sidecar and "
-       "NNTR_HTP_PAGE_CACHE=0";
+       "htp.page_cache=0";
   context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
 
   const nntrainer::TensorDim &input_dim =

@@ -3,7 +3,6 @@ package com.example.sampletestapp
 
 import android.content.Intent
 import android.graphics.Bitmap
-import android.system.Os
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -33,6 +32,35 @@ class HtpAppLifecycleTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private lateinit var activity: MainActivity
     private lateinit var report: File
+    private var traceConfig: File? = null
+    private var originalConfig: ByteArray? = null
+    private lateinit var liveTrace: File
+
+    // Runtime options are immutable after model load. Restore the pack after
+    // every test, including failures, and copy each completed generation trace.
+    private fun prepareTrace(base: String, modelId: String) {
+        check(traceConfig == null)
+        val file = File(base, "$modelId-w4a32/nntr_config.json")
+        val original = file.readBytes()
+        val config = JSONObject(String(original, Charsets.UTF_8))
+        val htp = config.optJSONObject("htp") ?: JSONObject().also { config.put("htp", it) }
+        liveTrace = File(report, "live-trace.json")
+        htp.put("token_trace", liveTrace.path)
+        traceConfig = file
+        originalConfig = original
+        file.writeText(config.toString(2))
+    }
+
+    private fun restoreTrace() {
+        traceConfig?.writeBytes(requireNotNull(originalConfig))
+        traceConfig = null
+        originalConfig = null
+    }
+
+    private fun captureTrace(name: String) {
+        assertTrue("Missing native token trace for $name", liveTrace.isFile)
+        liveTrace.copyTo(File(report, "trace-$name.json"), overwrite = true)
+    }
 
     private fun <T> ui(block: () -> T): T {
         var result: T? = null
@@ -103,7 +131,7 @@ class HtpAppLifecycleTest {
     }
 
     private fun run(name: String, messages: String, stop: Boolean = false, unload: Boolean = false): String {
-        Os.setenv("NNTR_HTP_TOKEN_TRACE", File(report, "trace-$name.json").path, true)
+        liveTrace.delete()
         ui { field<EditText>("openAIMessagesField").setText(messages) }
         click("Run (streaming)")
         if (stop || unload) {
@@ -116,7 +144,7 @@ class HtpAppLifecycleTest {
         val text = output()
         assertTrue("Empty output", text.isNotBlank())
         File(report, "$name.txt").writeText(text)
-        assertTrue("Missing native token trace", File(report, "trace-$name.json").isFile)
+        captureTrace(name)
         return text
     }
 
@@ -144,10 +172,11 @@ class HtpAppLifecycleTest {
                 val base = ui { field<EditText>("chatModelBasePathField").text.toString() }
                 assertTrue("Missing model at the app's default path: $base",
                     File(base, "lfm2-24ba2b-htp-w4a32/nntr_config.json").isFile)
+                prepareTrace(base, ModelIds.LFM2_24BA2B_HTP)
                 click("+ Open")
                 drainWorker()
                 assertTrue(status(), status().startsWith("Chat session opened:"))
-                Os.setenv("NNTR_HTP_TOKEN_TRACE", File(report, "trace-chat-$attempt.json").path, true)
+                liveTrace.delete()
                 assertEquals("LFM2 must use its own default chat example", prompt,
                     ui { field<EditText>("chatPromptField").text.toString() })
                 click("▶")
@@ -156,7 +185,7 @@ class HtpAppLifecycleTest {
                 val chatOutput = output()
                 assertTrue("Empty chat output", chatOutput.isNotBlank())
                 File(report, "chat-$attempt.txt").writeText(chatOutput)
-                assertTrue(File(report, "trace-chat-$attempt.json").isFile)
+                captureTrace("chat-$attempt")
                 if (firstOutput == null) firstOutput = chatOutput
                 else assertEquals(firstOutput, chatOutput)
                 ui { field<NestedScrollView>("mainScrollView").fullScroll(View.FOCUS_DOWN) }
@@ -178,6 +207,7 @@ class HtpAppLifecycleTest {
             } finally {
                 ui { activity.finish() }
                 instrumentation.waitForIdleSync()
+                restoreTrace()
             }
         }
         File(report, "result.json").writeText(JSONObject()
@@ -210,6 +240,7 @@ class HtpAppLifecycleTest {
             assertEquals(summaryPrompt, defaultChatPrompt)
             File(report, "default-chat.txt").writeText(defaultChatPrompt)
             ui { field<EditText>("chatModelBasePathField").setText(base) }
+            prepareTrace(base!!, ModelIds.GEMMA4_26B_A4B_HTP)
             click("+ Open")
             drainWorker()
             assertTrue(status(), status().startsWith("Chat session opened:"))
@@ -220,7 +251,7 @@ class HtpAppLifecycleTest {
                 "summary" to summaryPrompt
             )
             for ((name, prompt) in prompts) {
-                Os.setenv("NNTR_HTP_TOKEN_TRACE", File(report, "trace-$name.json").path, true)
+                liveTrace.delete()
                 File(report, "$name-input.txt").writeText(prompt)
                 ui { field<EditText>("chatPromptField").setText(prompt) }
                 click("▶")
@@ -228,6 +259,7 @@ class HtpAppLifecycleTest {
                 File(report, "$name-status.txt").writeText(status())
                 File(report, "$name-output.txt").writeText(output())
                 assertTrue(status(), status().startsWith("Chat done."))
+                captureTrace(name)
                 assertTrue(output().isNotBlank())
                 assertFalse("Unexpected thought channel in $name", output().contains("<|channel>"))
                 assertFalse("Incomplete thought prefix in $name", output().contains("<channel|>"))
@@ -249,6 +281,8 @@ class HtpAppLifecycleTest {
             File(report, "result.json").writeText(JSONObject().put("status", "passed").toString())
         } finally {
             ui { activity.finish() }
+            instrumentation.waitForIdleSync()
+            restoreTrace()
         }
     }
 
@@ -270,6 +304,7 @@ class HtpAppLifecycleTest {
             ui { activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
             selectModel(modelId)
             ui { field<EditText>("modelBasePathField").setText(base) }
+            prepareTrace(base!!, modelId)
             click("Load model")
             drainWorker()
             assertTrue(status(), status().startsWith("Loaded $modelId"))
@@ -329,6 +364,8 @@ class HtpAppLifecycleTest {
             }.toString(2))
         } finally {
             ui { activity.finish() }
+            instrumentation.waitForIdleSync()
+            restoreTrace()
         }
     }
 }

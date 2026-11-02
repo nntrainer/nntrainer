@@ -10,7 +10,7 @@ For SDK installation, Android packaging and device staging, follow the
 The automatic SR15 preset reached **1157.72 prefill tok/s and 17.3877 decode
 tok/s** as medians of three runs on the measured S26 Ultra with 2048 input
 tokens and preload 128. The native CLI now selects this preset automatically
-for `lfm2_moe` + `sr15_v2` + `htp_fused`. Explicit environment variables take
+for `lfm2_moe` + `sr15_v2` + `htp_fused`. Explicit JSON values take
 precedence. These are short-run results for one fixed prompt, not sustained
 throughput or a per-run guarantee.
 
@@ -85,7 +85,9 @@ mean the recovered FP32 grid is identical to the BF16-rounded values.
 SR15's Q4_0 embedding is requantized, and its conversion error is reported
 separately. The converter validates serialization, not full-model quality.
 
-SR15 requires `moe_hadamard=both` and `moe_hadamard_scope=all`. Disabling
+SR15 requires `moe.hadamard="both"` and `moe.hadamard_scope="all"`
+(the converter's legacy flat `moe_hadamard` / `moe_hadamard_scope` keys
+remain accepted). Disabling
 the down rotation changes the model and is not a valid speed comparison.
 Its 2048-wide input and oriented H12 x H128 down transforms use the
 checkpoint's basis, normalization and signs.
@@ -132,44 +134,55 @@ for the handle lifecycle.
 
 ## Default SR15 CLI preset
 
-`nntr_causallm` applies the preset after reading the model configuration and
-before creating the model. It sets only environment variables that are
-absent. An explicit zero is preserved, so the caller can disable individual
-options. `NNTR_LFM2_DEFAULT_PRESET=0` disables automatic preset selection.
-The CLI does not change the checkpoint, quantization, rotation, prompt,
-context length, generation budget or configured expert-cache size.
+`nntr_causallm` applies the preset to the model JSON before creating the
+model. It fills only missing `htp`/`moe` fields and `num_threads`; explicit
+`false`, `0` and optional `null` values are preserved. Set
+`htp.lfm2_default_preset=false` to disable automatic selection. The CLI does
+not change the checkpoint, quantization, rotation, prompt, context length,
+generation budget or configured expert-cache size.
 
-The preset uses eight CPU threads, direct model-file I/O
-(`NNTR_HTP_PAGE_CACHE=0`), no load prefetch and startup preload 128.
-It enables the selected prefill whole-call, convolution, mapped-view,
-parallel norm/add/staging and attention handoff paths; convolution stripes
-have eight rows. Prefill pruning stays disabled. Decode uses stable TL2
-slots, paired expert reads, demand handoff, gamma-aware prediction with
-residual blend 0.5 and top-three prefetch, and six direct-read slots.
+The preset uses `num_threads=8`, `htp.page_cache=0` (direct model-file I/O),
+`htp.load_prefetch=false` and `moe.preload_experts=128`. The selected dense,
+convolution, mapped-view, parallel norm/add/staging and attention handoff
+paths are under `htp`; `htp.lfm2_conv_stripe_rows=8`. Expert pruning remains
+off. The `moe` preset enables stable TL2 slots, paired reads and demand
+handoff, with `prediction="arm-direct"`, gamma-aware prediction,
+`prefetch_residual=0.5`, `prefetch_top=3` and `prefetch_slots=6`.
 
 After the first decode step, idle prefill readers and unused heap pages are
-released and `NNTR_MOE_CACHE_GROW=1` adds one expert slot per layer. With
-`moe_cache_experts=16`, the 38-layer LFM2 cache starts at 608 experts and
-grows to 646. The arena allocation grain is 4 MiB. This phase reuse is not
-a fixed-cache comparison and does not establish a total-memory bound.
-The exact defaults are in
-[`lfm2_runtime_defaults.h`](../Applications/CausalLM/lfm2_runtime_defaults.h).
+released; `moe.cache_grow=1` adds one expert slot per layer. With
+`moe.cache_experts=16`, the 38-layer cache starts at 608 experts and grows
+to 646. `htp.arena_grain_mib=4` controls allocation granularity. This phase
+reuse is not a fixed-cache comparison or a total-memory bound. The exact
+preset is in
+[`lfm2_runtime_defaults.h`](../Applications/CausalLM/lfm2_runtime_defaults.h);
+shared defaults and validation are described in the
+[code guide](gemma4-htp-code-guide.md#7-runtime-configuration-and-options).
 
-These process-level defaults belong to the single-model CLI. They are not
-installed by the library or QuickDotAI API, and are not selected for
-Gemma4 or other execution profiles. Diagnostic tracing and
-profiling are not enabled by the preset.
+Only the single-model CLI selects this preset, for LFM2 SR15 on `htp_fused`.
+QuickDotAI and direct library users read the same explicit JSON fields but
+do not install the CLI preset. To use these settings through the API, place
+them in the deployed model's config. Diagnostic tracing and profiling stay
+off unless explicitly configured. An active model's settings cannot change;
+unload before loading another configuration.
 
-For example, use the default combined preset, or retain the initial cache:
+For example, keep the initial cache capacity by merging this object into a
+copy of `nntr_config.json` before deploying and running the model:
 
-```sh
-"$runtime_dir/nntr_causallm" "$model_dir"
-NNTR_MOE_CACHE_GROW=0 "$runtime_dir/nntr_causallm" "$model_dir"
+```json
+{"moe": {"cache_grow": 0}}
 ```
 
-Remove environment overrides left by previous experiments before comparing
-with the default run. In particular, old `NNTR_MOE_CACHE_GROW=0` or
-`NNTR_MOE_PRELOAD_EXPERTS=384` exports still take precedence.
+To use shared defaults instead of the LFM2 CLI preset:
+
+```json
+{"htp": {"lfm2_default_preset": false}}
+```
+
+Old HTP/MoE/LFM2 runtime environment exports are ignored. Unknown nested keys,
+wrong types and invalid combinations fail during configuration; boolean
+options require JSON booleans. Legacy flat cache and rotation keys remain
+compatible but must agree with any equivalent nested values.
 
 ## Validated 2048-token workload
 
@@ -280,7 +293,8 @@ python3 test/htp/host/lfm2_conversion_check.py
 
 Device parity here means parity with the recorded nntrainer runtime and
 pack. It is not a perplexity result or proof of equivalence to an external
-ONNX model. A diagnostic run with `NNTR_HTP_PROFILE=2` changed baseline
+ONNX model. A historical diagnostic run with `NNTR_HTP_PROFILE=2` (now
+`htp.profile=2`) changed baseline
 IDs and was excluded from both timing and correctness claims. Use ordinary
 runs for reported throughput; these local validations do not establish
 the status of the full cross-platform CI matrix.

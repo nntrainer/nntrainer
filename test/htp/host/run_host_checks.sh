@@ -26,6 +26,8 @@ trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
+  -c "$BACKEND/htp_runtime_config.cpp" -o "$OUT/runtime_config.o"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/decode_runtime_check.cpp" -o "$OUT/decode_runtime_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/graph_binding_check.cpp" -o "$OUT/graph_binding_check"
@@ -34,8 +36,20 @@ cc=${CC:-gcc}
 python3 "$HERE/run_prefill_scratch_check.py"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
   -I "$HERE/../../../Applications/CausalLM" \
+  -I "$HERE/../../../Applications/CausalLM/models" \
+  -I "${NNTR_JSON_INCLUDE:-$HERE/../../../Applications/CausalLM}" \
+  -I "$BACKEND" -I "$BACKEND/.." "$OUT/runtime_config.o" \
   "$HERE/lfm2_runtime_defaults_check.cpp" -o "$OUT/lfm2_runtime_defaults_check"
 "$OUT/lfm2_runtime_defaults_check"
+# The app enables fast-math; invalid NaN/Inf settings must still be rejected.
+"${CXX:-g++}" -std=c++17 -O2 -ffast-math -Wall -Wextra -Werror \
+  -I "$HERE/../../../Applications/CausalLM" \
+  -I "$HERE/../../../Applications/CausalLM/models" \
+  -I "${NNTR_JSON_INCLUDE:-$HERE/../../../Applications/CausalLM}" \
+  -I "$BACKEND" -I "$BACKEND/.." \
+  "$HERE/lfm2_runtime_defaults_check.cpp" "$BACKEND/htp_runtime_config.cpp" \
+  -o "$OUT/htp_config_fast_math_check"
+"$OUT/htp_config_fast_math_check"
 "${CXX:-g++}" -std=c++17 -O2 -ffast-math -Wall -Wextra -Werror \
   -I "${NNTR_JSON_INCLUDE:-$HERE/../../../Applications/CausalLM}" \
   -I "$HERE/../../../Applications/CausalLM/models/gemma4" -I "$BACKEND" \
@@ -46,10 +60,11 @@ python3 "$HERE/run_prefill_scratch_check.py"
   -o "$OUT/hadamard_check"
 "$OUT/hadamard_check"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
+  -I "$BACKEND" -I "$BACKEND/.." "$OUT/runtime_config.o" \
   "$HERE/weight_file_reader_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" -o "$OUT/weight_file_reader_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
   -I "$BACKEND" -I "$BACKEND/.." -I "$BACKEND/../../utils" \
-  "$HERE/weight_registry_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
+  "$HERE/weight_registry_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" "$OUT/runtime_config.o" \
   -o "$OUT/weight_registry_check"
 "$OUT/weight_registry_check"
 "$OUT/weight_file_reader_check"
@@ -58,16 +73,16 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
 "$cc" -std=c11 -O2 -Wall -Wextra -Werror -I "$BACKEND" -c \
   "$BACKEND/htp_tl2_codec.c" -o "$OUT/tl2_pair_pack.o"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
-  -I "$BACKEND" -I "$BACKEND/../../utils" \
+  -I "$BACKEND" -I "$BACKEND/.." -I "$BACKEND/../../utils" \
   "$HERE/tl2_pair_read_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
-  "$OUT/tl2_pair_pack.o" -o "$OUT/tl2_pair_read_check"
+  "$OUT/tl2_pair_pack.o" "$OUT/runtime_config.o" -o "$OUT/tl2_pair_read_check"
 "$OUT/tl2_pair_read_check" "$OUT"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" -I "$BACKEND/.." \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
   -I "$BACKEND" -I "$BACKEND/../../utils" \
-  "$HERE/prefill_reader_release_check.cpp" -o "$OUT/prefill_reader_release_check"
+  "$HERE/prefill_reader_release_check.cpp" "$OUT/runtime_config.o" -o "$OUT/prefill_reader_release_check"
 python3 -c 'import subprocess, sys; subprocess.run([sys.argv[1]], check=True, timeout=30)' \
   "$OUT/prefill_reader_release_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
@@ -95,9 +110,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$BACKEND/.." \
 "$OUT/tl2_native_packing_check"
 
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
-  "$HERE/../../../tools/prepare_tl2.cpp" -o "$OUT/prepare_tl2"
+  "$HERE/../../../tools/prepare_tl2.cpp" "$OUT/runtime_config.o" -o "$OUT/prepare_tl2"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" \
-  "$HERE/tl2_prepared_check.cpp" "$BACKEND/htp_tl2_codec.c" \
+  "$HERE/tl2_prepared_check.cpp" "$BACKEND/htp_tl2_codec.c" "$OUT/runtime_config.o" \
   -o "$OUT/tl2_prepared_check"
 echo '0 256 256' > "$OUT/tl2-weights.tsv"
 for fixture in fixture unit-fixture; do

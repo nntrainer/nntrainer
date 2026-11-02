@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <htp_backend/htp_runtime_config.h>
 #include <iomanip>
 #include <iostream>
 #include <load_trace.h>
@@ -1096,7 +1097,10 @@ namespace {
 class WeightFileReadAhead {
 public:
   explicit WeightFileReadAhead(int fd) {
-    static const bool enabled = []() {
+    const bool enabled = []() {
+      const auto configured = htpRuntimeConfig().htp.load_prefetch;
+      if (configured.has_value())
+        return *configured;
       const char *e = std::getenv("NNTR_LOAD_PREFETCH");
       return !(e != nullptr && e[0] == '0');
     }();

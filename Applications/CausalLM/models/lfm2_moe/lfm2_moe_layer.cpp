@@ -10,6 +10,11 @@
  * @bug    No known bugs except for NYI items
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <acti_func.h>
 #include <algorithm>
 #include <array>
@@ -33,7 +38,6 @@
 #include <unistd.h>
 #endif
 #include <htp_backend/htp_expert_pool.h>
-#include <htp_backend/htp_fixed_opts.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <lfm2_router_arm.h>
@@ -154,18 +158,11 @@ static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 static constexpr unsigned EXTRA_TOPK = 5;
 
 using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
-using nntrainer::expertPreloadLimit;
 using nntrainer::requireHtpExpertPool;
 
-/** @brief NNTR_MOE_PREFETCH=<k>: read experts up to k layers ahead during
- *  prefill; 0 disables read-ahead. Unset permits every remaining layer,
- *  bounded by available pool slots. */
+/** Read ahead by this many layers during prefill, bounded by free slots. */
 static int expertPrefetchDepth() {
-  static const int k = [] {
-    const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    return v != nullptr ? std::max(0, std::atoi(v)) : 1 << 20;
-  }();
-  return k;
+  return static_cast<int>(nntrainer::htpRuntimeConfig().moe.prefill_lookahead);
 }
 
 static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
@@ -259,29 +256,27 @@ void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops) {
     pool->early_owner = nullptr;
 }
 
-/**
- * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
- *        "<layer> <tokens> | <routed experts> | <top-(k+5) per token>",
- *        for tools/moe_expert_cache_sim.py to replay against cache
- *        policies offline. The routing is the same
- *        whatever the cache does, so one resident run gives every C.
- */
-static std::FILE *moeTrace() {
-  static std::FILE *f = [] {
-    const char *path = std::getenv("NNTR_MOE_TRACE");
-    return (path != nullptr && *path != '\0') ? std::fopen(path, "w") : nullptr;
-  }();
-  return f;
+/** Routing trace: layer, token count, routed experts and extended top-k. */
+static std::FILE *moeTrace(nntrainer::ComputeOps *ops) {
+  const auto &path = nntrainer::htpRuntimeConfig().moe.trace;
+  auto *pool = ops ? ops->htpExpertPool() : nullptr;
+  if (path.empty() || !pool)
+    return nullptr;
+  if (!pool->trace_opened) {
+    pool->trace_opened = true;
+    pool->trace_file.reset(std::fopen(path.c_str(), "w"));
+  }
+  return pool->trace_file.get();
 }
 
-/** @brief Experts kept resident per layer: the cache_experts property
- *  (nntr_config moe_cache_experts) when the model sets it, else the built-in
- *  count (htp_fixed::MOE_CACHE_EXPERTS), capped by the layer's expert count. */
-static unsigned int expertCacheFromEnv(unsigned int num_experts,
-                                       unsigned int from_props) {
-  return std::min(num_experts, from_props != 0u
-                                 ? from_props
-                                 : nntrainer::htp_fixed::MOE_CACHE_EXPERTS);
+/** Per-layer cache share, falling back to the runtime policy and capped by
+ * the layer's expert count. */
+static unsigned int expertCacheCapacity(unsigned int num_experts,
+                                        unsigned int from_props) {
+  return std::min(num_experts,
+                  from_props != 0u
+                    ? from_props
+                    : nntrainer::htpRuntimeConfig().moe.cache_experts);
 }
 
 /** M0 ordinal of prefill forwarding() calls, so each MoE layer
@@ -365,7 +360,7 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   // the loader records file offsets, and the shared LRU loads experts into
   // accelerator slots on demand. CPU layers keep resident weights.
   trace_layer = nntrainer::HtpExpertPool::nextLayerOrdinal();
-  cache_per_layer = expertCacheFromEnv(
+  cache_per_layer = expertCacheCapacity(
     num_experts, std::get<props::CacheExperts>(moe_props).get());
   experts_virtual =
     cache_per_layer != 0 &&
@@ -665,7 +660,7 @@ static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
        dt != nntrainer::Tdatatype::QS4CX_WH_AFFINE) ||
       dn.getDataType() != dt) {
     throw std::runtime_error(
-      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH, "
+      "Expert caching on an accelerator engine needs QS4CX_WH, "
       "QS2CX_WH, TL2CX_WH or QS4CX_WH_AFFINE expert weights (the file's "
       "bytes go to the DSP as they are); this model's are not");
   }
@@ -689,7 +684,7 @@ static void loadVirtualExpert(nntrainer::ComputeOps *ops,
   if (!ops->register_qs4cx_wh_expert_file(d, at_load)) {
     throw std::runtime_error(
       "this engine cannot load a virtual expert from the model file "
-      "(register_qs4cx_wh_expert_file); unset NNTR_MOE_CACHE_EXPERTS");
+      "(register_qs4cx_wh_expert_file); check the model expert weight format");
   }
 }
 
@@ -733,11 +728,10 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
     descs.push_back(
       expertDesc(context.getWeight(expert_gate_up_proj_indices[e]),
                  context.getWeight(expert_down_proj_indices[e])));
-  const char *preload = std::getenv("NNTR_MOE_PRELOAD_EXPERTS");
-  const size_t limit = expertPreloadLimit(pool->lru.capacity(), preload);
-  // [PR 4428] NNTR_MOE_DESC_TRACE=1: where each layer's first experts sit in
-  // the file, for tools/htp/recover_hadamard_signs.py
-  if (std::getenv("NNTR_MOE_DESC_TRACE") && !descs.empty())
+  const size_t limit = std::min(
+    pool->lru.capacity(),
+    static_cast<size_t>(nntrainer::htpRuntimeConfig().moe.preload_experts));
+  if (nntrainer::htpRuntimeConfig().moe.descriptor_trace && !descs.empty())
     for (unsigned int e = 0; e < std::min<unsigned int>(2u, num_experts); ++e)
       std::fprintf(stderr,
                    "[MoE-DESC] layer=%u expert=%u K=%u inter=%u N_out=%u "
@@ -873,11 +867,8 @@ lfmRouterOnArm(const nntrainer::Tensor &rows, const nntrainer::Tensor &weights,
           nntrainer::Tdatatype::TL2CX_WH)
       return false;
   }
-  static const bool enabled = [] {
-    const char *value = std::getenv("NNTR_LFM2_ROUTER_ARM");
-    return value != nullptr && std::strcmp(value, "1") == 0 &&
-           std::getenv("NNTR_HTP_ROUTER_U8I8") == nullptr;
-  }();
+  const auto &moe_config = nntrainer::htpRuntimeConfig().moe;
+  const bool enabled = moe_config.lfm2_router_arm && !moe_config.router_u8i8;
   if (!enabled)
     return false;
   const float *input = rows.getData<float>();
@@ -997,10 +988,10 @@ void Lfm2MoELayer::addEpilogue(nntrainer::RunLayerContext &context,
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   /** M0 (doc 43 §5): ARM-side wall timer around the whole layer -- this
-   * profile is invisible to NNTR_HTP_PROFILE's host column by design, and
+   * profile is invisible to the HTP profile's host column by design, and
    * in the htp run the one dispatched layer's figure includes its
    * registration (once, first forward) on top of dispatch. */
-  const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
+  const bool m0_profile = nntrainer::htpRuntimeConfig().moe.profile;
   const auto m0_t0 = std::chrono::steady_clock::now();
   g_m0_on = m0_profile;
   g_m0.reset();
@@ -1165,195 +1156,6 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 }
 
 /**
- * @brief NNTR_MOE_DIFF=<rows>: for the first @a rows tokens of every MoE
- *        layer call, recompute the layer on the CPU from the model file's
- *        own bytes and report the SNR of the accelerator's output against
- *        it, with the layer's INPUT statistics beside it.
- *
- * Input statistics distinguish upstream problems from disagreement in
- * this layer. The f32 reference and u8 accelerator may differ from
- * quantization. Unset disables the check; 0 checks every row and can be
- * expensive. Only virtual experts with file-backed weights are supported.
- */
-static int moeDiffRows() {
-  static const int rows = [] {
-    const char *v = std::getenv("NNTR_MOE_DIFF");
-    return v != nullptr ? std::max(0, std::atoi(v)) : -1;
-  }();
-  return rows;
-}
-
-/** @brief NNTR_MOE_SHADOW: replace every accelerator row with the CPU
- *  reference to isolate MoE errors. Implies the diff. */
-static bool moeShadowEnabled() {
-  static const bool on = std::getenv("NNTR_MOE_SHADOW") != nullptr;
-  return on;
-}
-
-#ifndef _WIN32
-/** @brief pread until @a len bytes are in, or false. */
-static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
-  auto *p = static_cast<uint8_t *>(dst);
-  while (len != 0) {
-    const ssize_t got = ::pread(fd, p, len, static_cast<off_t>(off));
-    if (got <= 0)
-      return false;
-    p += got;
-    off += static_cast<uint64_t>(got);
-    len -= static_cast<size_t>(got);
-  }
-  return true;
-}
-
-/**
- * @brief One QS4CX_WH, QS2CX_WH or QS4CX_WH_AFFINE weight from the model
- *        file, dequantized to f32 row-major [K][N].
- *
- * The file holds the codes -- whBytes(K, N) int4 nibbles, or whBytes2(K, N)
- * 2-bit codes followed by the tensor's four-entry palette
- * (QS2CX_WH_Tensor) -- then N f32 scales, then N f32 column sums (the
- * kernel's zero-point term, not needed here), then, when @a affine, N i32
- * offsets: W[k][n] = scale[n] * (q[k][n] + offset[n]).
- */
-static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
-                                unsigned int w_bits, bool affine,
-                                std::vector<float> &out) {
-  const bool two = w_bits == 2u;
-  const size_t codes =
-    two ? nntrainer::whBytes2(K, N) + nntrainer::WH_PALETTE_LEVELS
-        : nntrainer::whBytes(K, N);
-  std::vector<uint8_t> packed(codes);
-  std::vector<float> scale(N);
-  std::vector<int32_t> offset(N, 0);
-  if (!moeReadAt(fd, packed.data(), codes, off) ||
-      !moeReadAt(fd, scale.data(), N * sizeof(float), off + codes) ||
-      (affine && !moeReadAt(fd, offset.data(), N * sizeof(int32_t),
-                            off + codes + 2u * N * sizeof(float)))) {
-    return false;
-  }
-  std::vector<int8_t> q(static_cast<size_t>(K) * N);
-  if (two)
-    nntrainer::whUnpack2(
-      packed.data(), K, N,
-      reinterpret_cast<const int8_t *>(packed.data() + codes -
-                                       nntrainer::WH_PALETTE_LEVELS),
-      q.data());
-  else
-    nntrainer::whUnpack(packed.data(), K, N, q.data());
-  out.resize(q.size());
-  auto &tm = nntrainer::ThreadManager::Global();
-  tm.parallel_for(0, K, [&](size_t k) {
-    const size_t row = k * N;
-    for (uint32_t n = 0; n < N; ++n)
-      out[row + n] = static_cast<float>(q[row + n] + offset[n]) * scale[n];
-  });
-  return true;
-}
-
-/** @brief The layer, in f32, from the file. See moeDiffRows(). */
-static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
-                    const std::vector<std::vector<std::pair<unsigned, float>>>
-                      &expert_assignments,
-                    nntrainer::RunLayerContext &context,
-                    const std::vector<unsigned int> &gate_up_indices,
-                    const std::vector<unsigned int> &down_indices,
-                    unsigned int total_tokens, unsigned int hidden_size,
-                    unsigned int intermediate_size, bool gelu,
-                    unsigned int trace_layer) {
-  const bool shadow = moeShadowEnabled();
-  const int want = moeDiffRows();
-  const unsigned int rows =
-    (shadow || want == 0)
-      ? total_tokens
-      : std::min<unsigned int>(total_tokens, want < 0 ? 8u : (unsigned)want);
-
-  const float *in = input.getData<float>();
-  const size_t in_n = static_cast<size_t>(total_tokens) * hidden_size;
-  double sum = 0.0, sum2 = 0.0;
-  float in_max = 0.0f;
-  for (size_t i = 0; i < in_n; ++i) {
-    sum += in[i];
-    sum2 += static_cast<double>(in[i]) * in[i];
-    in_max = std::max(in_max, std::fabs(in[i]));
-  }
-  const double in_mean = sum / in_n;
-  const double in_std =
-    std::sqrt(std::max(0.0, sum2 / in_n - in_mean * in_mean));
-
-  std::vector<float> ref(in_n, 0.0f);
-  std::vector<float> w_gu, w_dn, mid(intermediate_size);
-  auto &tm = nntrainer::ThreadManager::Global();
-  unsigned int experts_seen = 0;
-  for (size_t e = 0; e < expert_assignments.size(); ++e) {
-    const auto &rows_of_e = expert_assignments[e];
-    if (std::none_of(rows_of_e.begin(), rows_of_e.end(),
-                     [&](const std::pair<unsigned, float> &p) {
-                       return p.first < rows;
-                     })) {
-      continue;
-    }
-    const ExpertFileDesc d = expertDesc(context.getWeight(gate_up_indices[e]),
-                                        context.getWeight(down_indices[e]));
-    if (d.fd < 0) {
-      std::fprintf(stderr,
-                   "[MOE-DIFF] layer=%u expert=%zu has no file fd; "
-                   "NNTR_MOE_DIFF needs virtual experts\n",
-                   trace_layer, e);
-      return;
-    }
-    if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
-                             d.w_bits, d.affine, w_gu) ||
-        !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
-                             d.w_bits, d.affine, w_dn)) {
-      std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
-                   trace_layer, e);
-      return;
-    }
-    ++experts_seen;
-    for (const auto &pair : rows_of_e) {
-      if (pair.first >= rows)
-        continue;
-      const float *x = in + static_cast<size_t>(pair.first) * hidden_size;
-      tm.parallel_for(0, intermediate_size, [&](size_t j) {
-        float g = 0.0f, u = 0.0f;
-        for (unsigned int k = 0; k < hidden_size; ++k) {
-          const size_t row = static_cast<size_t>(k) * 2u * intermediate_size;
-          g += x[k] * w_gu[row + j];
-          u += x[k] * w_gu[row + intermediate_size + j];
-        }
-        mid[j] = gelu ? geglu_det_one(g, u) : swiglu_det_one(g, u);
-      });
-      float *dst = ref.data() + static_cast<size_t>(pair.first) * hidden_size;
-      tm.parallel_for(0, hidden_size, [&](size_t n) {
-        float acc = 0.0f;
-        for (unsigned int j = 0; j < intermediate_size; ++j)
-          acc += mid[j] * w_dn[static_cast<size_t>(j) * hidden_size + n];
-        dst[n] += pair.second * acc;
-      });
-    }
-  }
-
-  float *got = output.getData<float>();
-  double signal = 0.0, noise = 0.0, max_ref = 0.0, max_got = 0.0;
-  for (size_t i = 0; i < static_cast<size_t>(rows) * hidden_size; ++i) {
-    const double r = ref[i], diff = static_cast<double>(got[i]) - r;
-    signal += r * r;
-    noise += diff * diff;
-    max_ref = std::max(max_ref, std::fabs(r));
-    max_got = std::max(max_got, std::fabs(static_cast<double>(got[i])));
-  }
-  std::fprintf(stderr,
-               "[MOE-DIFF] layer=%u M=%u rows=%u experts=%u snr=%.1fdB "
-               "max_abs_ref=%g max_abs_got=%g in_mean=%g in_std=%g in_max=%g\n",
-               trace_layer, total_tokens, rows, experts_seen,
-               noise == 0.0 ? 999.0 : 10.0 * std::log10(signal / noise),
-               max_ref, max_got, in_mean, in_std, static_cast<double>(in_max));
-  if (shadow)
-    std::memcpy(got, ref.data(), ref.size() * sizeof(float));
-}
-#endif
-
-/**
  * @brief The whole MoE FFN layer in one accelerator call.
  *
  * Flattens the per-expert assignment lists into the three arrays the call
@@ -1381,7 +1183,7 @@ static bool tryMoeLayerOnAccelerator(
   auto *ops = context.getComputeOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
     if (experts_virtual) {
-      throw std::runtime_error("virtual MoE experts (NNTR_MOE_CACHE_EXPERTS) "
+      throw std::runtime_error("virtual MoE experts "
                                "have no CPU path: the layer's engine offers "
                                "no MoE layer call");
     }
@@ -1413,12 +1215,8 @@ static bool tryMoeLayerOnAccelerator(
                               : (dt0 == wh2)                ? 2u
                                                             : 0u;
 
-  // Plain QS4CX decode stays on ARM unless NNTR_MOE_HTP_DECODE is set;
-  // a single row cannot amortize HMX's 64-row padding. Accelerator layouts
-  // have no CPU dot() fallback and must remain on HTP.
-  static const bool htp_decode_forced =
-    std::getenv("NNTR_MOE_HTP_DECODE") != nullptr;
-  if (total_tokens <= 1 && w_bits == 0u && !htp_decode_forced) {
+  // Plain QS4CX decode stays on ARM; accelerator layouts require HTP.
+  if (total_tokens <= 1 && w_bits == 0u) {
     return false;
   }
 
@@ -1518,7 +1316,8 @@ static bool tryMoeLayerOnAccelerator(
       if (!missed.empty() && !ops->register_qs4cx_wh_expert_files(missed)) {
         throw std::runtime_error(
           "this engine cannot load a virtual expert from the model file "
-          "(register_qs4cx_wh_expert_files); unset NNTR_MOE_CACHE_EXPERTS");
+          "(register_qs4cx_wh_expert_files); check the model expert weight "
+          "format");
       }
     }
     for (size_t e : group) {
@@ -1557,13 +1356,7 @@ static bool tryMoeLayerOnAccelerator(
   // If all routed experts cannot fit, split them into pool-sized groups
   // and sum their zero-initialized outputs on the host. This changes fp32
   // addition order across groups; numerical equivalence is not guaranteed.
-  // NNTR_MOE_SPLIT=<n> caps group size for diagnosing this path.
-  static const size_t split_env = [] {
-    const char *v = std::getenv("NNTR_MOE_SPLIT");
-    return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(0);
-  }();
-  const size_t capacity = pool ? pool->lru.capacity() : 0;
-  const size_t cap = split_env ? std::min(split_env, capacity) : capacity;
+  const size_t cap = pool ? pool->lru.capacity() : 0;
   if (experts_virtual && active.size() > cap) {
     // the host adds the groups and runs the epilogue: it reads the input
     // and the dense branch, which their calls may have kept (out_to_host)
@@ -1587,7 +1380,7 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
   } else {
-    // Prefetch missing experts up to NNTR_MOE_PREFETCH layers ahead while
+    // Prefetch missing experts up to the configured lookahead while
     // this call runs. Each layer registers its batch before staging.
     // Protect current and later layers' resident experts, reserve slots
     // for in-flight reads, and pause queuing when the pool is full.
@@ -1595,10 +1388,8 @@ static bool tryMoeLayerOnAccelerator(
       experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
         ? expertPrefetchDepth()
         : 0;
-    static const bool prune_prefill = [] {
-      const char *v = std::getenv("NNTR_LFM2_PREFILL_PRUNE");
-      return v && std::strcmp(v, "1") == 0;
-    }();
+    const bool prune_prefill =
+      nntrainer::htpRuntimeConfig().moe.lfm2_prefill_prune;
     std::vector<const void *> routed_keys;
     if (prune_prefill)
       for (size_t e : active)
@@ -1696,34 +1487,19 @@ static bool tryMoeLayerOnAccelerator(
 
     // Only a complete plain result can be consumed through a mapped view.
     // Split expert groups above are always materialized for CPU accumulation.
-    static const bool prefill_views = [] {
-      const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-      return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool prefill_views =
+      nntrainer::htpRuntimeConfig().htp.lfm2_prefill_views;
     const bool host_diagnostics =
-      std::getenv("NNTR_HTP_DUMP") || std::getenv("NNTR_ACT_STATS") ||
-      std::getenv("NNTR_ACT_DUMP") || std::getenv("NNTR_DUMP_ROWS_DIR") ||
-      std::getenv("NNTR_DUMP_ROWS_HASH");
+      !nntrainer::htpRuntimeConfig().htp.dump_dir.empty() ||
+      std::getenv("NNTR_ACT_STATS") || std::getenv("NNTR_ACT_DUMP") ||
+      std::getenv("NNTR_DUMP_ROWS_DIR") || std::getenv("NNTR_DUMP_ROWS_HASH");
     bool retain_plain = prefill_views && !out_to_host &&
                         post_gamma == nullptr && add_x2 == nullptr &&
                         !host_diagnostics;
-#ifndef _WIN32
-    retain_plain = retain_plain && moeDiffRows() < 0 && !moeShadowEnabled();
-#endif
     call(output.getData<float>(), add_x2 != nullptr, retain_plain);
     if (add_done)
       *add_done = add_x2 != nullptr;
   }
-
-#ifndef _WIN32
-  // After the whole layer, split calls included: the reference is of the
-  // layer, not of one call.
-  if (experts_virtual && (moeDiffRows() >= 0 || moeShadowEnabled())) {
-    moeDiff(input, output, expert_assignments, context, gate_up_indices,
-            down_indices, total_tokens, hidden_size, intermediate_size, gelu,
-            trace_layer);
-  }
-#endif
 
   // Recency from the routing's extended top-k, token by token, so the
   // last token's likely-next experts end up most recent -- the rule
@@ -1734,10 +1510,8 @@ static bool tryMoeLayerOnAccelerator(
     // the most recent, so reversing puts a token's top-ranked expert --
     // the likeliest to be routed to again -- at the back.
     std::vector<nntrainer::ExpertLru::Key> recency;
-    static const bool compact_recency = [] {
-      const char *value = std::getenv("NNTR_LFM2_COMPACT_RECENCY");
-      return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool compact_recency =
+      nntrainer::htpRuntimeConfig().moe.lfm2_compact_recency;
     if (compact_recency && total_tokens > 1) {
       // Only the last touch of each key affects the final LRU order. The
       // old loop traverses hints backwards, so these are the first forward
@@ -1904,7 +1678,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   /** M0: same timer as forwarding() -- the runner drives prefill through
    * this path too (from=0,to=prompt_len), decode is the total_tokens==1
    * case and stays silent under the same guard. */
-  const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
+  const bool m0_profile = nntrainer::htpRuntimeConfig().moe.profile;
   const bool op_time = to - from == 1 && OpTimeMoe::on();
   const auto m0_t0 = std::chrono::steady_clock::now();
   g_m0_on = m0_profile || op_time;
@@ -1952,11 +1726,9 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
     // With out_add the experts' input norm rides the prefill MoE call (its
     // pre_gamma), which then has the raw rows on the DSP for the
-    // epilogue's residual. Decode and the MoE diff / shadow
-    // instruments, which read the normed copy, keep the CPU norm.
+    // epilogue's residual. Decode keeps the CPU norm.
     auto *moe_ops = context.getComputeOps();
     const bool norm_on_accel = out_add && in_norm && to - from > 1 &&
-                               moeDiffRows() < 0 && !moeShadowEnabled() &&
                                moe_ops != nullptr &&
                                moe_ops->supports_gemm_qs4cx_moe_layer_fp32();
     if (in_norm && !norm_on_accel)
@@ -1978,7 +1750,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing, part one: the logits on the accelerator (its norm folded
     // in, and for the softmax router its selection too) or the CPU's norm
     // of the router's copy for the dot below
-    const bool want_extra = experts_virtual || moeTrace() != nullptr;
+    const bool want_extra =
+      experts_virtual || moeTrace(context.getComputeOps()) != nullptr;
     AcceleratedRoute route;
     route.top_k = topk;
     route.n_sel =
@@ -2051,7 +1824,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         buildExpertAssignments(router_logits, expert_bias, total_tokens,
                                expert_assignments,
                                want_extra ? &extra_top_k : nullptr);
-      if (std::FILE *tf = moeTrace()) {
+      if (std::FILE *tf = moeTrace(context.getComputeOps())) {
         std::fprintf(tf, "%u %u |", trace_layer, total_tokens);
         for (unsigned int e = 0; e < num_experts; ++e)
           if (!expert_assignments[e].empty())

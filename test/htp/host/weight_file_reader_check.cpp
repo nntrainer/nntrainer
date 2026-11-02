@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <htp_runtime_config.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -33,7 +34,9 @@ int main(int argc, char **argv) {
     original[i] = (i * 37 + i / 31) % 251;
   assert(write(fd, original.data(), size) == static_cast<ssize_t>(size));
   assert(fsync(fd) == 0);
-  setenv("NNTR_HTP_PAGE_CACHE", "0", 1);
+  nntrainer::HtpRuntimeConfig config;
+  config.htp.page_cache = 0;
+  nntrainer::configureHtpRuntime(config);
   int direct = nntrainer::openWeightFile(path);
   auto verify = [&](size_t offset, size_t bytes) {
     std::vector<unsigned char> data(bytes + 2, 0xff);
@@ -120,7 +123,8 @@ int main(int argc, char **argv) {
   assert(mincore(mapping, size, pages.data()) == 0);
   for (auto p : pages)
     assert((p & 1) == 0);
-  setenv("NNTR_HTP_PAGE_CACHE", "1", 1);
+  config.htp.page_cache = 1;
+  nntrainer::configureHtpRuntime(config);
   verifyScatter(fd, 4093, {830720, 11264, 422400, 22528});
   verifyScatter(fd, 3, {1u << 20, 4096, 1u << 20, 1003});
   verifySplit(fd, 3, 1002500, 11268);
@@ -154,18 +158,20 @@ int main(int argc, char **argv) {
   assert(mincore(sparse, page, &residency) == 0 && (residency & 1));
   munmap(sparse, blocks * grain);
   close(cached);
-  setenv("NNTR_HTP_PAGE_CACHE", "invalid", 1);
+  config.htp.page_cache = 2;
   bool rejected = false;
   try {
-    nntrainer::weightPageCachePolicy();
+    nntrainer::configureHtpRuntime(config);
   } catch (const std::invalid_argument &) {
     rejected = true;
   }
   assert(rejected);
+  assert(nntrainer::weightPageCachePolicy() == 1);
   munmap(mapping, size);
   close(direct);
   close(fd);
   unlink(path);
+  nntrainer::resetHtpRuntimeConfig();
   puts("WEIGHT FILE READ OK: direct/cache, unaligned EOF, parallel reads, no "
        "cache population");
 }

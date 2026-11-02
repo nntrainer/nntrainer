@@ -8,6 +8,8 @@ these timings do not establish overhead at identical expert assignments.
 """
 
 import argparse
+from contextlib import contextmanager
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -15,7 +17,36 @@ import re
 import shlex
 import statistics
 import subprocess
+import tempfile
 import time
+
+
+@contextmanager
+def staged_model(adb, root, config):
+    """Stage only the run's config; keep the original model pack untouched."""
+    remote = subprocess.check_output(
+        adb + ["shell", shlex.join(["mktemp", "-d", root + "/results/hadamard-config.XXXXXX"])],
+        text=True).strip()
+    if not remote.startswith(root + "/results/hadamard-config.") or "\n" in remote:
+        raise RuntimeError("Unexpected temporary model directory: " + remote)
+    try:
+        source = shlex.quote(root + "/model")
+        destination = shlex.quote(remote)
+        script = (
+            f'for entry in {source}/* {source}/.[!.]* {source}/..?*; do '
+            '[ -e "$entry" ] || continue; '
+            'name=${entry##*/}; [ "$name" = nntr_config.json ] && continue; '
+            f'ln -s "$entry" {destination}/"$name" || exit; done'
+        )
+        subprocess.run(adb + ["shell", script], check=True)
+        with tempfile.TemporaryDirectory(prefix="nntr-hadamard-config-") as local:
+            path = Path(local) / "nntr_config.json"
+            path.write_text(json.dumps(config, indent=2) + "\n")
+            subprocess.run(adb + ["push", str(path), remote + "/nntr_config.json"],
+                           check=True)
+        yield remote
+    finally:
+        subprocess.run(adb + ["shell", shlex.join(["rm", "-rf", remote])], check=True)
 
 
 def main():
@@ -49,22 +80,19 @@ def main():
     settings = {
         "LD_LIBRARY_PATH": ".",
         "ADSP_LIBRARY_PATH": ".",
-        "NNTR_NUM_THREADS": "8",
-        "NNTR_HTP_E2E": "1",
-        "NNTR_HTP_E2E_FREE_KVQ": "1",
-        "NNTR_HTP_KV_DROP_CPU": "1",
-        "NNTR_HTP_DROP_HOST_FC": "1",
-        "NNTR_HTP_ATTN_M1_Q8": "2",
-        "NNTR_HTP_FC_IN_ARENA": "1",
-        "NNTR_HTP_PAGE_CACHE": "0",
-        "NNTR_MOE_CACHE_EXPERTS": str(args.cache_experts),
-        "NNTR_MOE_CACHE_GROW": str(args.cache_grow),
-        "NNTR_MOE_MISS_READERS": str(args.miss_readers),
-        "NNTR_MOE_DMA_QUEUES": "4",
-        "NNTR_MOE_HADAMARD_SCOPE": "2bit",
     }
-    if args.profile:
-        settings["NNTR_HTP_PROFILE"] = "1"
+    original = subprocess.check_output(
+        adb + ["shell", shlex.join(["cat", root + "/model/nntr_config.json"])])
+    (args.output / "original-nntr_config.json").write_bytes(original)
+    config = json.loads(original)
+    config["num_threads"] = 8
+    for key in ("moe_cache_experts", "moe_hadamard", "moe_hadamard_scope"):
+        config.pop(key, None)
+    config.setdefault("htp", {}).update(page_cache=0, profile=int(args.profile))
+    config.setdefault("moe", {}).update(
+        cache_experts=args.cache_experts, cache_grow=args.cache_grow,
+        miss_readers=args.miss_readers, dma_queues=4, hadamard_scope="2bit")
+    subprocess.run(adb + ["shell", shlex.join(["mkdir", "-p", root + "/results"])], check=True)
     runtime_files = ("libnntr_hvx_skel.so", "libnntrainer.so", "nntrainer_causallm")
     hashes = subprocess.check_output(adb + ["shell", shlex.join(
         ["sha256sum"] + [root + "/runtime/" + name for name in runtime_files]
@@ -74,6 +102,7 @@ def main():
     records = []
     (args.output / "settings.json").write_text(json.dumps({
         "serial": args.serial, "remote_root": root, "environment": settings,
+        "runtime_config": {key: config[key] for key in ("htp", "moe")},
         "order": variants, "profile": args.profile,
         "measurement": "actual_rotation",
         "runtime_sha256": runtime_hashes,
@@ -81,23 +110,27 @@ def main():
     for index, variant in enumerate(variants):
         tag = f"{index:02d}-{variant}"
         ids_path = f"{root}/results/{tag}.ids"
-        env = dict(settings, NNTR_MOE_HADAMARD=variant,
-                   NNTR_GENERATED_IDS=ids_path)
+        env = dict(settings, NNTR_GENERATED_IDS=ids_path)
+        run_config = copy.deepcopy(config)
+        run_config["moe"]["hadamard"] = variant
         if args.profile:
-            env["NNTR_MOE_TRACE"] = f"{root}/results/{tag}.route.txt"
-            env["NNTR_HTP_ROUTE_LOG"] = f"{root}/results/{tag}.decode-route.txt"
-        command = "cd " + shlex.quote(root + "/runtime") + " && exec "
-        command += shlex.join(["timeout", "180", "env"] +
-                              [f"{k}={v}" for k, v in env.items()] +
-                              ["./nntrainer_causallm", root + "/model"])
-        (args.output / (tag + ".command.txt")).write_text(command + "\n")
-        thermal = subprocess.check_output(adb + ["shell", "cat",
-            "/sys/class/thermal/thermal_zone0/temp"], text=True).strip()
-        start = time.monotonic()
-        with (args.output / (tag + ".log")).open("w") as log:
-            subprocess.run(adb + ["shell", command], stdout=log,
-                           stderr=subprocess.STDOUT, timeout=210, check=True)
-        elapsed = time.monotonic() - start
+            run_config["moe"]["trace"] = f"{root}/results/{tag}.route.txt"
+            run_config["moe"]["route_log"] = f"{root}/results/{tag}.decode-route.txt"
+        (args.output / (tag + ".nntr_config.json")).write_text(
+            json.dumps(run_config, indent=2) + "\n")
+        with staged_model(adb, root, run_config) as model:
+            command = "cd " + shlex.quote(root + "/runtime") + " && exec "
+            command += shlex.join(["timeout", "180", "env"] +
+                                  [f"{k}={v}" for k, v in env.items()] +
+                                  ["./nntrainer_causallm", model])
+            (args.output / (tag + ".command.txt")).write_text(command + "\n")
+            thermal = subprocess.check_output(adb + ["shell", "cat",
+                "/sys/class/thermal/thermal_zone0/temp"], text=True).strip()
+            start = time.monotonic()
+            with (args.output / (tag + ".log")).open("w") as log:
+                subprocess.run(adb + ["shell", command], stdout=log,
+                               stderr=subprocess.STDOUT, timeout=210, check=True)
+            elapsed = time.monotonic() - start
         log = (args.output / (tag + ".log")).read_text()
         prefill = re.search(r"prefill: (\d+) tokens, (\d+) ms, ([\d.]+) TPS", log)
         decode = re.search(r"generation: (\d+) tokens, (\d+) ms, ([\d.]+) TPS", log)
@@ -111,14 +144,15 @@ def main():
         scope = 0x40000000 if bits[variant] else 0
         if int(flags[1], 16) != (0x00CF03E1 | bits[variant] | scope):
             raise RuntimeError(f"Wrong DSP flags: {tag}")
-        ids = subprocess.check_output(adb + ["shell", "cat", ids_path])
+        ids = subprocess.check_output(adb + ["shell", shlex.join(["cat", ids_path])])
         if len(ids.split()) != 128:
             raise RuntimeError(f"Expected 128 output IDs: {tag}")
         (args.output / (tag + ".ids")).write_bytes(ids)
         if args.profile:
-            for variable, suffix in (("NNTR_MOE_TRACE", ".route.txt"),
-                                     ("NNTR_HTP_ROUTE_LOG", ".decode-route.txt")):
-                trace = subprocess.check_output(adb + ["shell", "cat", env[variable]])
+            for variable, suffix in (("trace", ".route.txt"),
+                                     ("route_log", ".decode-route.txt")):
+                trace = subprocess.check_output(
+                    adb + ["shell", shlex.join(["cat", run_config["moe"][variable]])])
                 (args.output / (tag + suffix)).write_bytes(trace)
         record = dict(tag=tag, variant=variant, prefill_ms=int(prefill[2]),
                       decode_ms=int(decode[2]), e2e_ms=int(e2e[1]),
