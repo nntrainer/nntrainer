@@ -486,6 +486,14 @@ void KVCacheManager::destroySession(nntrainer::kv::SessionId session) {
   cpu_cache_->destroySession(session);
 }
 
+nntrainer::kv::SessionId
+KVCacheManager::forkSession(nntrainer::kv::SessionId parent) {
+  if (!usesPagedStorage())
+    throw std::logic_error("KV sessions require paged CPU storage "
+                           "(NNTR_ENGINE=cpu NNTR_KV_PAGED=1)");
+  return cpu_cache_->forkSession(parent);
+}
+
 nntrainer::kv::SessionId KVCacheManager::activeSession() const {
   return cpu_cache_ ? cpu_cache_->activeSession()
                     : nntrainer::kv::KvCacheManager::kDefaultSession;

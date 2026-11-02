@@ -1045,6 +1045,13 @@ void CausalLM::destroyKVSession(nntrainer::kv::SessionId session) {
   kv_cache.destroySession(session);
 }
 
+nntrainer::kv::SessionId
+CausalLM::forkKVSession(nntrainer::kv::SessionId parent) {
+  if (!kv_cache.isAllocated())
+    throw std::logic_error("forkKVSession: the KV cache is not allocated");
+  return kv_cache.forkSession(parent);
+}
+
 nntrainer::kv::SessionId CausalLM::getActiveKVSession() const {
   return kv_cache.activeSession();
 }

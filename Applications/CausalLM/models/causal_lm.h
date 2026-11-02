@@ -247,6 +247,20 @@ public:
    */
   WIN_EXPORT void destroyKVSession(nntrainer::kv::SessionId session);
 
+  /**
+   * @brief Fork @p parent: create a new KV session that shares its
+   *        committed history and then diverges from it.
+   * @details Full pages below the fork point are shared read-only and the
+   *          partial tail page is copied, so neither session writes into a
+   *          page the other reads. The fork inherits the committed token ids
+   *          and prefix blocks of the shared history. The parent's rows are
+   *          left unchanged and the selection does not change. Requires
+   *          paged CPU KV storage and an allocated cache.
+   * @return the new session id.
+   */
+  WIN_EXPORT nntrainer::kv::SessionId
+  forkKVSession(nntrainer::kv::SessionId parent);
+
   /** @brief The selected KV session id. */
   WIN_EXPORT nntrainer::kv::SessionId getActiveKVSession() const;
 

@@ -172,6 +172,20 @@ public:
   /** Release a session that is not selected. */
   void destroySession(nntrainer::kv::SessionId session);
 
+  /**
+   * @brief Create a session that shares the parent's committed KV history
+   *        and then diverges from it.
+   * @details Full pages below the fork point are shared read-only and the
+   *          partial tail page is copied, so neither session writes into a
+   *          page the other reads. The fork inherits the committed token ids
+   *          and prefix blocks of the shared history, so prefix publication
+   *          and reuse continue from the fork point. The parent's rows are
+   *          left unchanged. Requires paged CPU storage and an idle, valid
+   *          parent. The selection does not change.
+   * @return the new session id.
+   */
+  nntrainer::kv::SessionId forkSession(nntrainer::kv::SessionId parent);
+
   /** The selected session (0 also when CPU storage is not in use). */
   nntrainer::kv::SessionId activeSession() const;
 
