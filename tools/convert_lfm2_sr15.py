@@ -31,7 +31,7 @@ import tempfile
 
 import numpy as np
 
-from convert_gemma4_fc_wh import bf16_round, sha256
+from htp_weight_utils import bf16_round, sha256
 from lfm2_weight_utils import (Checkpoint, Tl2, weight_plan, write_expert,
                               write_fc, write_float)
 
