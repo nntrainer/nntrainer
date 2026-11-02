@@ -69,17 +69,21 @@ cd "$SCRIPT_DIR"
 
 mkdir -p generated build
 
-"$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic" \
-    -I "$HEXAGON_SDK_ROOT/incs" \
-    -I "$HEXAGON_SDK_ROOT/incs/stddef" \
-    -mdll -o generated nntr_hvx.idl
+bash "$SCRIPT_DIR/generate_rpc.sh" dsp "$SCRIPT_DIR/generated"
+source "$SCRIPT_DIR/dsp_sources.sh"
+case "${NNTR_HTP_DIAGNOSTICS:-1}" in
+    0) SRCS+=(nntr_hvx_diagnostic_stubs.c) ;;
+    1) SRCS+=("${DIAGNOSTIC_SRCS[@]}")
+       IEEE_SRCS+=("${DIAGNOSTIC_IEEE_SRCS[@]}") ;;
+    *) echo "NNTR_HTP_DIAGNOSTICS must be 0 or 1" >&2; exit 1 ;;
+esac
 
 # [#132 PR 2] hvx_q4_gemv_f32.c, the sf_probe entry and online Hadamard
 # are compiled with -mhvx-ieee-fp, the flag the first sitting's
 # silicon-checked kernel was built with; the rest of the skel is built
 # without it (its Q6_Vsf_* intrinsics keep their qf32 lowering, A's bits),
 # so these files are compiled on their own and linked in as objects.
-for f in "$BACKEND/hvx/hvx_q4_gemv_f32.c" "$BACKEND/hvx/hvx_hadamard_f32.c" nntr_hvx_sf_probe.c; do
+for f in "${IEEE_SRCS[@]}"; do
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -mhvx-ieee-fp -G0 -O3 -fPIC \
     -Wall -Werror ${HEX_EXTRA_CFLAGS:-} \
@@ -93,34 +97,10 @@ for f in "$BACKEND/hvx/hvx_q4_gemv_f32.c" "$BACKEND/hvx/hvx_hadamard_f32.c" nntr
     -c "$f" -o "build/$(basename "${f%.c}").o"
 done
 
-SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_mm_u8i8.c nntr_hvx_softmax.c nntr_hvx_attn.c nntr_hvx_dma_probe.c nntr_hvx_graph.c nntr_hvx_small_ops.c nntr_hvx_attn_m1.c nntr_hvx_dspq_bench.c nntr_hvx_dspq.c nntr_hvx_token.c generated/nntr_hvx_skel.c"
-SRCS="$SRCS nntr_hvx_attn_m1_probe.c nntr_hvx_hadamard_probe.c build/hvx_hadamard_f32.o"
-SRCS="$SRCS nntr_hvx_vlut_probe.c nntr_hvx_tl2_probe.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4_moe.c $BACKEND/hmx/hexkl_graph.c $BACKEND/hmx/hexkl_token.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_conv_block.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i8_dma.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c $BACKEND/hmx/hexkl_dma_trace.c $BACKEND/hmx/hexkl_kv_quant.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_probe.c $BACKEND/hmx/hexkl_acc_tile.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_attn_dtype.c $BACKEND/hmx/hexkl_attn_u8.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_swiglu_f32.c $BACKEND/hvx/hvx_conv_gate_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_m1_ops_f32.c $BACKEND/hvx/hvx_attn_m1_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_scale_add_f32.c $BACKEND/hvx/hvx_rmsnorm_rows_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_router_rows_f32.c $BACKEND/hvx/hvx_rope_rows_f32.c $BACKEND/hvx/hvx_softcap_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_gather_ah_u8.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c $BACKEND/hvx/hvx_softmax_blocked_f32.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c $BACKEND/hvx/hvx_gemm_u8i4_wh.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_expand_i2i4.c $BACKEND/hvx/hvx_gemv_u8tl2.c"
-SRCS="$SRCS nntr_hvx_fc_q4.c build/hvx_q4_gemv_f32.o build/nntr_hvx_sf_probe.o"
-SRCS="$SRCS nntr_hvx_mailbox.c"
-# nntrainer/nntrainer#4343: fp16 and quantized (int8 / int4) KV-cache attention
-SRCS="$SRCS nntr_hvx_attn_f16.c nntr_hvx_attn_q.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_attn_f16.c $BACKEND/hmx/hexkl_kv_tiles_f16.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_attn_q.c $BACKEND/hmx/hexkl_kv_q.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_attn_decode_f16.c $BACKEND/hvx/hvx_attn_decode_q.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_kv_quant.c"
-SRCS="$SRCS $BACKEND/hvx/hvx_softmax_q.c $BACKEND/hmx/hexkl_attn_q2.c"
+for f in "${IEEE_SRCS[@]}"; do
+    SRCS+=("build/$(basename "${f%.c}").o")
+done
+printf '%s\n' "${SRCS[@]}" > build/dsp-sources.txt
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -mhmx -G0 -O3 -fPIC -shared \
@@ -137,7 +117,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_softmax_q.c $BACKEND/hmx/hexkl_attn_q2.c"
     -isystem "$HEXAGON_SDK_ROOT/incs" \
     -isystem "$HEXAGON_SDK_ROOT/incs/stddef" \
     -isystem "$HEXAGON_SDK_ROOT/ipc/fastrpc/incs" \
-    $SRCS \
+    "${SRCS[@]}" \
     "$HEXKL_LIB" \
     -o build/libnntr_hvx_skel.so
 

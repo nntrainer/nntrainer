@@ -820,6 +820,19 @@ python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
 
 "$OUT/swap_host_check"
 
+if [ "$(uname -s)" = "Linux" ]; then
+  "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+    -ffunction-sections -fdata-sections -include malloc.h \
+    -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" \
+    -I "$HERE/.." -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    "$HERE/rpc_layer_check.c" "$HERE/../nntr_hvx_mm_u8i4.c" \
+    "$HERE/../nntr_hvx_mm_u8i8.c" "$BACKEND/hmx/hexkl_probe.c" \
+    -Wl,--gc-sections -lm -o "$OUT/rpc_layer_check"
+  "$OUT/rpc_layer_check"
+fi
+"$cc" -std=c99 -Wall -Wextra -Werror -I "$OUT" -I "$HERE/stub" \
+  -c "$HERE/../nntr_hvx_diagnostic_stubs.c" -o "$OUT/diagnostic_stubs.o"
+
 # Source ownership and scratch reuse across distinct FastRPC input mappings.
 python3 "$HERE/lfm2_router_handoff_check.py" --repo "$HERE/../../.." \
   --output "$OUT/router_handoff" --cxx "${CXX:-g++}"

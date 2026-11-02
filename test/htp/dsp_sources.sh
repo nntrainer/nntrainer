@@ -1,0 +1,72 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Sourced by build.sh after BACKEND is resolved. Profiling counters and DMA
+# tracing are runtime dependencies; only standalone diagnostic RPCs move out.
+SRCS=(
+  "hvx_add_f32.c"
+  "nntr_hvx_mm_u8i4.c"
+  "nntr_hvx_mm_u8i8.c"
+  "nntr_hvx_softmax.c"
+  "nntr_hvx_attn.c"
+  "nntr_hvx_graph.c"
+  "nntr_hvx_small_ops.c"
+  "nntr_hvx_attn_m1.c"
+  "nntr_hvx_dspq.c"
+  "nntr_hvx_token.c"
+  "generated/nntr_hvx_skel.c"
+  "$BACKEND/hmx/hexkl_mm_u8i4.c"
+  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c"
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c"
+  "$BACKEND/hmx/hexkl_graph.c"
+  "$BACKEND/hmx/hexkl_token.c"
+  "$BACKEND/hmx/hexkl_conv_block.c"
+  "$BACKEND/hmx/hexkl_mm_u8i8_dma.c"
+  "$BACKEND/hmx/hexkl_dma_ring.c"
+  "$BACKEND/hmx/hexkl_dma_trace.c"
+  "$BACKEND/hmx/hexkl_kv_quant.c"
+  "$BACKEND/hmx/hexkl_probe.c"
+  "$BACKEND/hmx/hexkl_acc_tile.c"
+  "$BACKEND/hmx/hexkl_attn_dtype.c"
+  "$BACKEND/hmx/hexkl_attn_u8.c"
+  "$BACKEND/hvx/hvx_quant_u8.c"
+  "$BACKEND/hvx/hvx_dequant_i32.c"
+  "$BACKEND/hvx/hvx_swiglu_f32.c"
+  "$BACKEND/hvx/hvx_conv_gate_f32.c"
+  "$BACKEND/hvx/hvx_m1_ops_f32.c"
+  "$BACKEND/hvx/hvx_attn_m1_f32.c"
+  "$BACKEND/hvx/hvx_scale_add_f32.c"
+  "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c"
+  "$BACKEND/hvx/hvx_router_rows_f32.c"
+  "$BACKEND/hvx/hvx_rope_rows_f32.c"
+  "$BACKEND/hvx/hvx_softcap_f32.c"
+  "$BACKEND/hvx/hvx_gather_ah_u8.c"
+  "$BACKEND/hvx/hvx_softmax_f32.c"
+  "$BACKEND/hvx/hvx_softmax_blocked_f32.c"
+  "$BACKEND/hvx/hvx_worker_pool.c"
+  "$BACKEND/hvx/hvx_gemm_u8i4_wh.c"
+  "$BACKEND/hvx/hvx_expand_i2i4.c"
+  "$BACKEND/hvx/hvx_gemv_u8tl2.c"
+  "nntr_hvx_fc_q4.c"
+  "nntr_hvx_mailbox.c"
+  "nntr_hvx_attn_f16.c"
+  "nntr_hvx_attn_q.c"
+  "$BACKEND/hmx/hexkl_attn_f16.c"
+  "$BACKEND/hmx/hexkl_kv_tiles_f16.c"
+  "$BACKEND/hmx/hexkl_attn_q.c"
+  "$BACKEND/hmx/hexkl_kv_q.c"
+  "$BACKEND/hvx/hvx_attn_decode_f16.c"
+  "$BACKEND/hvx/hvx_attn_decode_q.c"
+  "$BACKEND/hvx/hvx_kv_quant.c"
+  "$BACKEND/hvx/hvx_softmax_q.c"
+  "$BACKEND/hmx/hexkl_attn_q2.c"
+)
+IEEE_SRCS=("$BACKEND/hvx/hvx_q4_gemv_f32.c" "$BACKEND/hvx/hvx_hadamard_f32.c")
+DIAGNOSTIC_SRCS=(
+  nntr_hvx_dma_probe.c
+  nntr_hvx_dspq_bench.c
+  nntr_hvx_attn_m1_probe.c
+  nntr_hvx_hadamard_probe.c
+  nntr_hvx_vlut_probe.c
+  nntr_hvx_tl2_probe.c
+)
+DIAGNOSTIC_IEEE_SRCS=(nntr_hvx_sf_probe.c)
