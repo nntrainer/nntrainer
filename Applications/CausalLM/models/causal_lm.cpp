@@ -29,7 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <htp_fixed_opts.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -37,6 +37,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#ifdef ENABLE_HEXKL
+#include <htp_backend/htp_backend.h>
+#endif
 
 #include <compute_ops.h>
 #include <env_compat.h> // nntr_env_on: value-checked read of auto-injected flags
@@ -1468,6 +1471,35 @@ void CausalLM::registerCustomLayers() {
   }
 #endif
 }
+
+#ifdef ENABLE_HEXKL
+void CausalLM::beginIndependentHtpPrompt(
+  bool repeated,
+  const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
+    &reset_layer) {
+  if (repeated) {
+    nntrainer::htp_begin_prompt();
+    model->forEachLayer(
+      [&](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+        if (!node)
+          return;
+        if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
+          mha->beginHtpPrompt();
+        else if (node->getLayer() && reset_layer)
+          reset_layer(*node->getLayer(), rc);
+      },
+      nullptr);
+    // Decode may have dropped these host slabs after seeding the DSP.
+    kv_cache = KVCacheManager{};
+    kv_cache_bound = false;
+  }
+  if (USE_KVCACHE)
+    setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+  else
+    setSessionTokenPosition(0);
+}
+#endif
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {

@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file   expert_lru.h
+ * @file   htp_expert_pool.h
  * @date   22 September 2026
  * @brief  LRU of resident MoE experts for the HTP path (doc 52).
  * @see    https://github.com/nnstreamer/nntrainer
@@ -24,19 +24,24 @@
  * The score outlives the key's residency.
  */
 
-#ifndef __CAUSALLM_EXPERT_LRU_H__
-#define __CAUSALLM_EXPERT_LRU_H__
+#ifndef NNTR_HTP_EXPERT_POOL_H
+#define NNTR_HTP_EXPERT_POOL_H
 #ifdef __cplusplus
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <compute_ops.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <list>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -45,7 +50,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace causallm {
+namespace nntrainer {
 
 /**
  * @brief Total experts to read at startup, across all layers.
@@ -329,7 +334,48 @@ private:
   std::unordered_map<Key, Score> score_; /**< LRFU, every key seen */
 };
 
-} // namespace causallm
+/** Runtime-owned host policy and prefill registry for the accelerator slots.
+ * Readers and decode callbacks must stop before this object is destroyed.
+ * Only the LRU is accessed by worker callbacks; registry/queue mutation stays
+ * on the serial model-loading or generation thread, as before.
+ */
+struct HtpExpertPool {
+  using ExpertFileDesc = ComputeOps::ExpertFileDesc;
+  using SlotClass = std::array<unsigned int, 4>;
+  ExpertLru lru;
+  std::vector<std::vector<ExpertFileDesc>> layers;
+  std::map<SlotClass, size_t> class_capacity;
+  std::set<SlotClass> class_reserved;
+  size_t slots_reserved = 0;
+  std::deque<std::pair<int, size_t>> prefetch_batches;
+  int prefetch_next = 0;
+  std::unordered_set<ExpertLru::Key> prefetch_inflight;
+  std::unordered_set<const void *> handed_layers;
+  ComputeOps *owner = nullptr;
+  ComputeOps *early_owner = nullptr;
+
+  static SlotClass slotClass(const ExpertFileDesc &d) {
+    return {d.K, d.inter, d.N_out, d.w_bits * 2u + (d.affine ? 1u : 0u)};
+  }
+
+  // Diagnostics include CPU layers too; retain their process-wide numbering
+  // and reset it only at HTP runtime release, after model destruction.
+  static unsigned nextLayerOrdinal() { return trace_layers_.fetch_add(1); }
+  static void resetLayerOrdinals() { trace_layers_.store(0); }
+
+private:
+  inline static std::atomic<unsigned> trace_layers_{0};
+};
+
+inline HtpExpertPool &requireHtpExpertPool(ComputeOps *ops) {
+  auto *pool = ops ? ops->htpExpertPool() : nullptr;
+  if (!pool)
+    throw std::runtime_error(
+      "virtual MoE experts require a backend-owned pool");
+  return *pool;
+}
+
+} // namespace nntrainer
 
 #endif /* __cplusplus */
-#endif /* __CAUSALLM_EXPERT_LRU_H__ */
+#endif /* NNTR_HTP_EXPERT_POOL_H */

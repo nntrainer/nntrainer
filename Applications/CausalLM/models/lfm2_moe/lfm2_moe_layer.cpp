@@ -32,8 +32,8 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
-#include <expert_lru.h>
-#include <htp_fixed_opts.h>
+#include <htp_backend/htp_expert_pool.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <lfm2_router_arm.h>
@@ -153,33 +153,9 @@ static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 /** Experts beyond the routed top-k whose recency the LRU refreshes. */
 static constexpr unsigned EXTRA_TOPK = 5;
 
-/** Resident expert pool shared across virtual MoE layers. Capacity is the
- *  sum of their cache_per_layer shares, so one call can use more slots
- *  than its layer's share to hold all active experts at once. */
-static causallm::ExpertLru g_expert_lru;
-
 using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
-
-/** Every virtual MoE layer's experts, as the backend
- *  needs them to read one from the file, in layer order (preloadExperts is
- *  called in graph order). Row i + 1 is what layer i reads ahead. */
-static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
-/** The pool's slot sizes: the experts of one (K, inter, N_out,
- *  dtype) share a size, and the rotated ternary Gemma4 has two (native
- *  TL2 in layers 0-27, 4-bit affine in 28-29). Each layer adds its share
- *  at finalize, so the first preload of each size can reserve all of
- *  that size's slots at load, as the one-size pool always did. */
-using ExpertSlotClass = std::array<unsigned int, 4>;
-static std::map<ExpertSlotClass, size_t> g_expert_class_cap;
-static std::set<ExpertSlotClass> g_expert_class_reserved;
-static size_t g_expert_slots_reserved = 0;
-
-static ExpertSlotClass expertSlotClass(const ExpertFileDesc &d) {
-  return {d.K, d.inter, d.N_out, d.w_bits * 2u + (d.affine ? 1u : 0u)};
-}
-
-/** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
-static std::atomic<unsigned> g_moe_layer_count{0};
+using nntrainer::expertPreloadLimit;
+using nntrainer::requireHtpExpertPool;
 
 /** @brief NNTR_MOE_PREFETCH=<k>: read experts up to k layers ahead during
  *  prefill; 0 disables read-ahead. Unset permits every remaining layer,
@@ -192,64 +168,38 @@ static int expertPrefetchDepth() {
   return k;
 }
 
-/** Read-ahead batches in flight, oldest first: the
- *  layer slot each was queued for and the LRU slots it holds. */
-static std::deque<std::pair<int, size_t>> g_prefetch_batches;
-/** The next layer slot to queue in the current prefill. */
-static int g_prefetch_next = 0;
-/** The experts queued and not yet registered: a layer queued in part is
- *  queued again for the rest, and these are not resident yet. */
-static std::unordered_set<causallm::ExpertLru::Key> g_prefetch_inflight;
-static std::unordered_set<const void *> g_handed_expert_layers;
-/** Only one backend may own the descriptors used by an early first pass. */
-static nntrainer::ComputeOps *g_expert_owner = nullptr;
-static nntrainer::ComputeOps *g_prefetch_early_owner = nullptr;
-
-void resetLfm2HtpExpertPool() {
-  g_expert_lru.reset();
-  g_expert_class_cap.clear();
-  g_expert_class_reserved.clear();
-  g_expert_slots_reserved = 0;
-  g_expert_layers.clear();
-  g_prefetch_batches.clear();
-  g_prefetch_inflight.clear();
-  g_handed_expert_layers.clear();
-  g_prefetch_next = 0;
-  g_expert_owner = nullptr;
-  g_prefetch_early_owner = nullptr;
-  g_moe_layer_count.store(0);
-}
-
 static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
                                     unsigned int layers,
                                     unsigned int experts_per_layer) {
+  auto *pool = ops ? ops->htpExpertPool() : nullptr;
+  if (!pool)
+    return 0;
   // Only fresh C16 native TL2 pools may start before the first MoE call.
   // A later pass keeps the existing layer-zero lifecycle unchanged.
-  if (!ops || ops != g_expert_owner || g_prefetch_early_owner ||
-      g_prefetch_next != 0 || !g_prefetch_batches.empty() ||
-      !g_prefetch_inflight.empty() || !g_handed_expert_layers.empty() ||
-      g_expert_layers.size() != layers ||
-      g_expert_lru.capacity() != layers * 16u || !experts_per_layer ||
-      expertPrefetchDepth() == 0)
+  if (!ops || ops != pool->owner || pool->early_owner ||
+      pool->prefetch_next != 0 || !pool->prefetch_batches.empty() ||
+      !pool->prefetch_inflight.empty() || !pool->handed_layers.empty() ||
+      pool->layers.size() != layers || pool->lru.capacity() != layers * 16u ||
+      !experts_per_layer || expertPrefetchDepth() == 0)
     return 0;
 
   // Preload is a graph-order prefix and can end partway through a layer.
   // Validate the actual resident keys before using it as the read frontier.
-  const size_t resident_count = g_expert_lru.size();
+  const size_t resident_count = pool->lru.size();
   const size_t resident_layers = resident_count / experts_per_layer;
   const size_t resident_tail = resident_count % experts_per_layer;
   if (resident_layers >= layers)
     return 0;
 
-  std::vector<causallm::ExpertLru::Key> pinned;
+  std::vector<nntrainer::ExpertLru::Key> pinned;
   size_t ordinal = 0;
-  for (size_t l = 0; l < g_expert_layers.size(); ++l) {
-    if (g_expert_layers[l].size() != experts_per_layer)
+  for (size_t l = 0; l < pool->layers.size(); ++l) {
+    if (pool->layers[l].size() != experts_per_layer)
       return 0;
-    for (const ExpertFileDesc &d : g_expert_layers[l]) {
+    for (const ExpertFileDesc &d : pool->layers[l]) {
       const bool expected_resident = ordinal++ < resident_count;
       if (d.w_bits != HTP_TL2_WEIGHT_BITS ||
-          g_expert_lru.resident(d.key_gu) != expected_resident)
+          pool->lru.resident(d.key_gu) != expected_resident)
         return 0;
       if (expected_resident)
         pinned.push_back(d.key_gu);
@@ -257,44 +207,45 @@ static size_t beginHtpExpertPrefill(nntrainer::ComputeOps *ops,
   }
 
   size_t queued = 0;
-  const int last = std::min(expertPrefetchDepth(),
-                            static_cast<int>(g_expert_layers.size()) - 1);
-  for (g_prefetch_next = static_cast<int>(resident_layers);
-       g_prefetch_next <= last; ++g_prefetch_next) {
-    const auto &layer = g_expert_layers[g_prefetch_next];
+  const int last =
+    std::min(expertPrefetchDepth(), static_cast<int>(pool->layers.size()) - 1);
+  for (pool->prefetch_next = static_cast<int>(resident_layers);
+       pool->prefetch_next <= last; ++pool->prefetch_next) {
+    const auto &layer = pool->layers[pool->prefetch_next];
     std::vector<ExpertFileDesc> suffix;
-    if (g_prefetch_next == static_cast<int>(resident_layers) && resident_tail)
+    if (pool->prefetch_next == static_cast<int>(resident_layers) &&
+        resident_tail)
       suffix.assign(layer.begin() + resident_tail, layer.end());
     const auto &want = suffix.empty() ? layer : suffix;
     // Only the first incomplete layer needs a temporary descriptor list.
     // Full batches preserve the ordinary first layer's registration groups
     // and LRFU acquire order, retaining the preloaded prefix and leaving
     // the later partial batch to the normal layer-time refill.
-    if (want.size() > g_expert_lru.room(pinned) ||
-        !g_expert_lru.makeRoom(want.size(), pinned, [](const void *) {
+    if (want.size() > pool->lru.room(pinned) ||
+        !pool->lru.makeRoom(want.size(), pinned, [](const void *) {
           throw std::logic_error("early prefill evicted a preloaded expert");
         }))
       break;
-    g_expert_lru.hold(want.size());
+    pool->lru.hold(want.size());
     bool started = false;
     try {
       started = ops->prefetch_qs4cx_wh_experts_begin(want);
     } catch (...) {
-      g_expert_lru.unhold(want.size());
+      pool->lru.unhold(want.size());
       throw;
     }
     if (!started) {
-      g_expert_lru.unhold(want.size());
+      pool->lru.unhold(want.size());
       break;
     }
-    g_prefetch_batches.emplace_back(g_prefetch_next, want.size());
+    pool->prefetch_batches.emplace_back(pool->prefetch_next, want.size());
     for (const ExpertFileDesc &d : want)
-      g_prefetch_inflight.insert(d.key_gu);
+      pool->prefetch_inflight.insert(d.key_gu);
     queued += want.size();
-    g_prefetch_early_owner = ops;
+    pool->early_owner = ops;
   }
   if (!queued)
-    g_prefetch_next = 0;
+    pool->prefetch_next = 0;
   return queued;
 }
 
@@ -303,8 +254,9 @@ size_t beginLfm2HtpExpertPrefill(nntrainer::ComputeOps *ops) {
 }
 
 void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops) {
-  if (g_prefetch_early_owner == ops)
-    g_prefetch_early_owner = nullptr;
+  auto *pool = ops ? ops->htpExpertPool() : nullptr;
+  if (pool && pool->early_owner == ops)
+    pool->early_owner = nullptr;
 }
 
 /**
@@ -412,18 +364,25 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   // Accelerator layers with a nonzero cache share request virtual weights:
   // the loader records file offsets, and the shared LRU loads experts into
   // accelerator slots on demand. CPU layers keep resident weights.
-  trace_layer = g_moe_layer_count.fetch_add(1);
+  trace_layer = nntrainer::HtpExpertPool::nextLayerOrdinal();
   cache_per_layer = expertCacheFromEnv(
     num_experts, std::get<props::CacheExperts>(moe_props).get());
   experts_virtual =
     cache_per_layer != 0 &&
     context.getComputeEngineType() != ml::train::LayerComputeEngine::CPU;
-  if (experts_virtual)
-    g_expert_lru.addLayer(this, cache_per_layer);
+  nntrainer::HtpExpertPool *pool = nullptr;
+  if (experts_virtual) {
+#ifdef ENABLE_HEXKL
+    pool = &requireHtpExpertPool(nntrainer::get_htp_ops());
+#else
+    throw std::runtime_error("virtual MoE experts require an HTP build");
+#endif
+    pool->lru.addLayer(this, cache_per_layer);
+  }
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
   const unsigned int hidden_size = in_dim.width(); // Feature dimension
-  if (experts_virtual) {
+  if (pool) {
     const auto wdt = context.getWeightDataType();
     ExpertFileDesc shape{};
     shape.K = shape.N_out = hidden_size;
@@ -432,7 +391,8 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
                    : wdt == nntrainer::Tdatatype::QS2CX_WH ? 2u
                                                            : 4u;
     shape.affine = wdt == nntrainer::Tdatatype::QS4CX_WH_AFFINE;
-    g_expert_class_cap[expertSlotClass(shape)] += cache_per_layer;
+    pool->class_capacity[nntrainer::HtpExpertPool::slotClass(shape)] +=
+      cache_per_layer;
   }
 
   // activation function
@@ -739,20 +699,21 @@ static void loadVirtualExpert(nntrainer::ComputeOps *ops,
  */
 static void preloadNativeExpertBatch(nntrainer::ComputeOps *ops,
                                      const std::vector<ExpertFileDesc> &descs) {
+  auto *pool = &requireHtpExpertPool(ops);
   std::vector<ExpertFileDesc> missing;
-  std::vector<causallm::ExpertLru::Key> need;
+  std::vector<nntrainer::ExpertLru::Key> need;
   for (const auto &d : descs) {
     need.push_back(d.key_gu);
-    if (!g_expert_lru.resident(d.key_gu))
+    if (!pool->lru.resident(d.key_gu))
       missing.push_back(d);
   }
   if (!missing.empty() &&
       !ops->register_qs4cx_wh_expert_files(missing, /*at_load=*/true))
     throw std::runtime_error("accelerator cannot preload native TL2 experts");
   if (!need.empty())
-    g_expert_lru.acquire(
-      need, [](causallm::ExpertLru::Key) {},
-      [](causallm::ExpertLru::Key) {
+    pool->lru.acquire(
+      need, [](nntrainer::ExpertLru::Key) {},
+      [](nntrainer::ExpertLru::Key) {
         throw std::logic_error("native preload exceeded expert capacity");
       });
 }
@@ -765,6 +726,7 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
     throw std::runtime_error("virtual MoE experts need the layer's engine to "
                              "provide ComputeOps; none is registered");
   }
+  auto *pool = &requireHtpExpertPool(ops);
   std::vector<ExpertFileDesc> descs;
   descs.reserve(num_experts);
   for (unsigned int e = 0; e < num_experts; ++e)
@@ -772,7 +734,7 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
       expertDesc(context.getWeight(expert_gate_up_proj_indices[e]),
                  context.getWeight(expert_down_proj_indices[e])));
   const char *preload = std::getenv("NNTR_MOE_PRELOAD_EXPERTS");
-  const size_t limit = expertPreloadLimit(g_expert_lru.capacity(), preload);
+  const size_t limit = expertPreloadLimit(pool->lru.capacity(), preload);
   // [PR 4428] NNTR_MOE_DESC_TRACE=1: where each layer's first experts sit in
   // the file, for tools/htp/recover_hadamard_signs.py
   if (std::getenv("NNTR_MOE_DESC_TRACE") && !descs.empty())
@@ -787,28 +749,29 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
   // Map all slots before FC registration, independently of weight reads:
   // the first layer of each slot size reserves that size's share.
   if (!descs.empty() &&
-      g_expert_class_reserved.insert(expertSlotClass(descs[0])).second) {
-    g_expert_slots_reserved += g_expert_class_cap[expertSlotClass(descs[0])];
-    ops->reserve_qs4cx_wh_expert_slots(g_expert_slots_reserved, &descs[0]);
+      pool->class_reserved.insert(nntrainer::HtpExpertPool::slotClass(descs[0]))
+        .second) {
+    pool->slots_reserved +=
+      pool->class_capacity[nntrainer::HtpExpertPool::slotClass(descs[0])];
+    ops->reserve_qs4cx_wh_expert_slots(pool->slots_reserved, &descs[0]);
   }
-  if (g_expert_layers.empty()) {
-    g_expert_owner = ops;
+  if (pool->layers.empty()) {
+    pool->owner = ops;
     if (descs.empty())
-      ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity(), nullptr);
+      ops->reserve_qs4cx_wh_expert_slots(pool->lru.capacity(), nullptr);
     std::fprintf(stderr, "[MoE] preload_experts=%zu cache_slots=%zu\n", limit,
-                 g_expert_lru.capacity());
-  } else if (g_expert_owner != ops) {
-    g_expert_owner = nullptr;
+                 pool->lru.capacity());
+  } else if (pool->owner != ops) {
+    pool->owner = nullptr;
   }
   if (expert_layer_slot < 0) {
-    expert_layer_slot = static_cast<int>(g_expert_layers.size());
-    g_expert_layers.push_back(descs);
+    expert_layer_slot = static_cast<int>(pool->layers.size());
+    pool->layers.push_back(descs);
   }
 
-  std::vector<causallm::ExpertLru::Key> need;
-  std::unordered_map<causallm::ExpertLru::Key, unsigned int> expert_of;
-  const size_t room =
-    limit > g_expert_lru.size() ? limit - g_expert_lru.size() : 0;
+  std::vector<nntrainer::ExpertLru::Key> need;
+  std::unordered_map<nntrainer::ExpertLru::Key, unsigned int> expert_of;
+  const size_t room = limit > pool->lru.size() ? limit - pool->lru.size() : 0;
   for (unsigned int e = 0; e < num_experts && need.size() < room; ++e) {
     need.push_back(descs[e].key_gu);
     expert_of[descs[e].key_gu] = e;
@@ -824,12 +787,12 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
         preload_batch.push_back(descs[expert_of[key]]);
       preloadNativeExpertBatch(ops, preload_batch);
     } else {
-      g_expert_lru.acquire(
+      pool->lru.acquire(
         need,
-        [&](causallm::ExpertLru::Key k) {
+        [&](nntrainer::ExpertLru::Key k) {
           loadVirtualExpert(ops, descs[expert_of[k]], /*at_load=*/true);
         },
-        [](causallm::ExpertLru::Key) {
+        [](nntrainer::ExpertLru::Key) {
           throw std::logic_error("preloadExperts evicted an expert: the pool "
                                  "filled past its capacity");
         });
@@ -1425,6 +1388,7 @@ static bool tryMoeLayerOnAccelerator(
     return false;
   }
 
+  auto *pool = experts_virtual ? &requireHtpExpertPool(ops) : nullptr;
   const size_t n_experts = expert_assignments.size();
   if (n_experts == 0 || gate_up_indices.size() < n_experts ||
       down_indices.size() < n_experts) {
@@ -1476,19 +1440,19 @@ static bool tryMoeLayerOnAccelerator(
   // the layers in order), for the one-PD token's miss path: the pool's
   // slots are the same slots tracked by this LRU.
   if (experts_virtual) {
-    if (g_handed_expert_layers.insert(&context.getWeight(gate_up_indices[0]))
+    if (pool->handed_layers.insert(&context.getWeight(gate_up_indices[0]))
           .second) {
       std::vector<ExpertFileDesc> all;
       for (size_t e = 0; e < n_experts; ++e)
         all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
                                  context.getWeight(down_indices[e])));
       ops->set_decode_moe_experts(
-        all, [](const std::vector<const void *> &need,
-                const std::function<void(const void *)> &load,
-                const std::function<void(const void *)> &evict) {
-          g_expert_lru.acquire(need, load, evict);
+        all, [pool](const std::vector<const void *> &need,
+                    const std::function<void(const void *)> &load,
+                    const std::function<void(const void *)> &evict) {
+          pool->lru.acquire(need, load, evict);
         });
-      ops->set_decode_pool_grow([](size_t n) { g_expert_lru.addCapacity(n); });
+      ops->set_decode_pool_grow([pool](size_t n) { pool->lru.addCapacity(n); });
     }
   }
 
@@ -1506,7 +1470,7 @@ static bool tryMoeLayerOnAccelerator(
     if (!experts_virtual || !expert_assignments[e].empty())
       active.push_back(e);
   }
-  auto release = [&](causallm::ExpertLru::Key k) {
+  auto release = [&](nntrainer::ExpertLru::Key k) {
     if (!ops->release_qs4cx_wh_expert(k)) {
       throw std::logic_error("expert LRU evicted an expert the "
                              "accelerator does not hold");
@@ -1517,7 +1481,7 @@ static bool tryMoeLayerOnAccelerator(
   // the arrays the kernel takes for it. Grouped by expert in expert order
   // -- the layout the kernel slices by running offsets, so the order here
   // is part of the contract, not a convenience.
-  std::vector<causallm::ExpertLru::Key> need;
+  std::vector<nntrainer::ExpertLru::Key> need;
   std::vector<void *> call_gu, call_dn;
   std::vector<float *> call_gus, call_dns;
   std::vector<unsigned int> row_index, row_count;
@@ -1532,7 +1496,7 @@ static bool tryMoeLayerOnAccelerator(
     row_count.clear();
     row_weight.clear();
     if (experts_virtual) {
-      std::unordered_map<causallm::ExpertLru::Key, size_t> expert_of;
+      std::unordered_map<nntrainer::ExpertLru::Key, size_t> expert_of;
       for (size_t e : group) {
         auto *key = &context.getWeight(gate_up_indices[e]);
         need.push_back(key);
@@ -1543,9 +1507,9 @@ static bool tryMoeLayerOnAccelerator(
       // loaded together after it: one registration round trip, not one
       // per expert. Nothing reads them before the call below.
       std::vector<ExpertFileDesc> missed;
-      g_m0.misses += g_expert_lru.acquire(
+      g_m0.misses += pool->lru.acquire(
         need,
-        [&](causallm::ExpertLru::Key k) {
+        [&](nntrainer::ExpertLru::Key k) {
           const size_t e = expert_of[k];
           missed.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
                                       context.getWeight(down_indices[e])));
@@ -1598,8 +1562,8 @@ static bool tryMoeLayerOnAccelerator(
     const char *v = std::getenv("NNTR_MOE_SPLIT");
     return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(0);
   }();
-  const size_t cap = split_env ? std::min(split_env, g_expert_lru.capacity())
-                               : g_expert_lru.capacity();
+  const size_t capacity = pool ? pool->lru.capacity() : 0;
+  const size_t cap = split_env ? std::min(split_env, capacity) : capacity;
   if (experts_virtual && active.size() > cap) {
     // the host adds the groups and runs the epilogue: it reads the input
     // and the dense branch, which their calls may have kept (out_to_host)
@@ -1641,59 +1605,60 @@ static bool tryMoeLayerOnAccelerator(
         routed_keys.push_back(&context.getWeight(gate_up_indices[e]));
     auto take_batch = [&] {
       const bool current =
-        g_prefetch_batches.front().first == expert_layer_slot;
-      const size_t held = g_prefetch_batches.front().second;
-      g_prefetch_batches.pop_front();
-      g_expert_lru.unhold(held);
+        pool->prefetch_batches.front().first == expert_layer_slot;
+      const size_t held = pool->prefetch_batches.front().second;
+      pool->prefetch_batches.pop_front();
+      pool->lru.unhold(held);
       std::vector<const void *> cancelled;
-      const std::vector<causallm::ExpertLru::Key> got =
+      const std::vector<nntrainer::ExpertLru::Key> got =
         ops->prefetch_qs4cx_wh_experts_end(
           prune_prefill && current ? &routed_keys : nullptr, &cancelled);
       for (auto k : cancelled)
-        g_prefetch_inflight.erase(k);
-      for (causallm::ExpertLru::Key k : got)
-        g_prefetch_inflight.erase(k);
-      g_expert_lru.acquire(
-        got, [](causallm::ExpertLru::Key) {},
-        [](causallm::ExpertLru::Key) {
+        pool->prefetch_inflight.erase(k);
+      for (nntrainer::ExpertLru::Key k : got)
+        pool->prefetch_inflight.erase(k);
+      pool->lru.acquire(
+        got, [](nntrainer::ExpertLru::Key) {},
+        [](nntrainer::ExpertLru::Key) {
           throw std::logic_error("expert prefetch overfilled the LRU");
         });
     };
     if (depth > 0) {
       // Layer 0 normally retires an earlier pass. An explicit timed early
       // kickoff belongs to THIS pass, so do not join its future batches.
-      if (expert_layer_slot == 0 && g_prefetch_early_owner &&
-          g_prefetch_early_owner != ops)
+      if (expert_layer_slot == 0 && pool->early_owner &&
+          pool->early_owner != ops)
         throw std::logic_error("early prefill backend changed");
-      const bool early = expert_layer_slot == 0 && g_prefetch_early_owner;
-      while (!g_prefetch_batches.empty() &&
+      const bool early = expert_layer_slot == 0 && pool->early_owner;
+      while (!pool->prefetch_batches.empty() &&
              ((expert_layer_slot == 0 && !early) ||
-              g_prefetch_batches.front().first <= expert_layer_slot))
+              pool->prefetch_batches.front().first <= expert_layer_slot))
         take_batch();
       if (expert_layer_slot == 0 && !early) {
-        g_prefetch_next = 1;
-        g_prefetch_inflight.clear(); // every batch was taken just above
+        pool->prefetch_next = 1;
+        pool->prefetch_inflight.clear(); // every batch was taken just above
       }
       if (expert_layer_slot == 0)
-        g_prefetch_early_owner = nullptr;
+        pool->early_owner = nullptr;
     }
 
     stage(active);
 
     if (depth > 0) {
-      g_prefetch_next = std::max(g_prefetch_next, expert_layer_slot + 1);
-      const int n_layers = static_cast<int>(g_expert_layers.size());
+      pool->prefetch_next =
+        std::max(pool->prefetch_next, expert_layer_slot + 1);
+      const int n_layers = static_cast<int>(pool->layers.size());
       const int last = std::min(expert_layer_slot + depth, n_layers - 1);
-      for (; g_prefetch_next <= last; ++g_prefetch_next) {
-        std::vector<causallm::ExpertLru::Key> pinned(need);
+      for (; pool->prefetch_next <= last; ++pool->prefetch_next) {
+        std::vector<nntrainer::ExpertLru::Key> pinned(need);
         for (int l = expert_layer_slot + 1; l < n_layers; ++l)
-          for (const ExpertFileDesc &d : g_expert_layers[l])
-            if (g_expert_lru.resident(d.key_gu))
+          for (const ExpertFileDesc &d : pool->layers[l])
+            if (pool->lru.resident(d.key_gu))
               pinned.push_back(d.key_gu);
         std::vector<ExpertFileDesc> want;
-        for (const ExpertFileDesc &d : g_expert_layers[g_prefetch_next])
-          if (!g_expert_lru.resident(d.key_gu) &&
-              g_prefetch_inflight.count(d.key_gu) == 0)
+        for (const ExpertFileDesc &d : pool->layers[pool->prefetch_next])
+          if (!pool->lru.resident(d.key_gu) &&
+              pool->prefetch_inflight.count(d.key_gu) == 0)
             want.push_back(d);
         if (want.empty())
           continue;
@@ -1703,27 +1668,26 @@ static bool tryMoeLayerOnAccelerator(
         // whole-layer batch left those 104 slots idle, so every layer's
         // experts had one layer's time to be read in (exposed wait 5-141 ms
         // a 1024-token prefill).
-        const size_t room = g_expert_lru.room(pinned);
+        const size_t room = pool->lru.room(pinned);
         const bool part = want.size() > room;
         if (part)
           want.resize(room);
-        if (want.empty() ||
-            !g_expert_lru.makeRoom(want.size(), pinned, release))
+        if (want.empty() || !pool->lru.makeRoom(want.size(), pinned, release))
           break;
-        g_expert_lru.hold(want.size());
+        pool->lru.hold(want.size());
         bool queued = false;
         try {
           queued = ops->prefetch_qs4cx_wh_experts_begin(want);
         } catch (...) {
-          g_expert_lru.unhold(want.size());
+          pool->lru.unhold(want.size());
           throw;
         }
         if (queued) {
-          g_prefetch_batches.emplace_back(g_prefetch_next, want.size());
+          pool->prefetch_batches.emplace_back(pool->prefetch_next, want.size());
           for (const ExpertFileDesc &d : want)
-            g_prefetch_inflight.insert(d.key_gu);
+            pool->prefetch_inflight.insert(d.key_gu);
         } else {
-          g_expert_lru.unhold(want.size());
+          pool->lru.unhold(want.size());
         }
         if (part)
           break; // the rest of this layer first, a layer later
@@ -1769,7 +1733,7 @@ static bool tryMoeLayerOnAccelerator(
     // is rank order within each token, and refresh() makes its LAST entry
     // the most recent, so reversing puts a token's top-ranked expert --
     // the likeliest to be routed to again -- at the back.
-    std::vector<causallm::ExpertLru::Key> recency;
+    std::vector<nntrainer::ExpertLru::Key> recency;
     static const bool compact_recency = [] {
       const char *value = std::getenv("NNTR_LFM2_COMPACT_RECENCY");
       return value && std::strcmp(value, "1") == 0;
@@ -1794,7 +1758,7 @@ static bool tryMoeLayerOnAccelerator(
       for (auto it = extra_top_k->rbegin(); it != extra_top_k->rend(); ++it)
         recency.push_back(&context.getWeight(gate_up_indices[*it]));
     }
-    g_expert_lru.refresh(recency);
+    pool->lru.refresh(recency);
   }
   return true;
 }

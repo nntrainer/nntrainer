@@ -46,6 +46,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -87,6 +88,13 @@ public:
 
 protected:
   bool htp_execution_profile_ = false;
+#ifdef ENABLE_HEXKL
+  /** Start an independent request; continuation steps must not call this. */
+  void beginIndependentHtpPrompt(
+    bool repeated,
+    const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
+      &reset_layer = {});
+#endif
   /** Model-local preparation immediately before a timed prefill block.
    * The default is empty; loaders and decode steps never call this hook. */
   virtual void beforePrefillBlock(unsigned int, unsigned int) {}

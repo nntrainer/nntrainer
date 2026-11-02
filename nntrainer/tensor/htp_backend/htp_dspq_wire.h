@@ -6,7 +6,7 @@
  * @date   28 Sep 2026
  * @brief  The dspqueue packet of one M==1 MoE layer call, shared by
  *         the ARM side (htp_compute_ops.cpp) and the DSP side
- *         (test/htp/nntr_hvx_dspq.c), as pure C99
+ *         (dsp/nntr_hvx_dspq.c), as pure C99
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items

@@ -47,7 +47,7 @@ def function(text, start):
     return text[begin:end]
 
 
-helper_start = source_text.index('static causallm::ExpertLru g_expert_lru;')
+helper_start = source_text.index('using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;')
 helper_end = source_text.index('/**\n * @brief NNTR_MOE_TRACE')
 helper = source_text[helper_start:helper_end]
 helper += "\n" + function(source_text, "static void preloadNativeExpertBatch(")
@@ -55,8 +55,7 @@ first_start = source_text.index('    auto take_batch = [&] {')
 first_end = source_text.index('\n    stage(active);', first_start)
 collect = source_text[first_start:first_end]
 queue_start = first_end + len('\n    stage(active);')
-queue_end = source_text.index('\n    call(output.getData<float>()', queue_start)
-queue = source_text[queue_start:queue_end]
+queue = function(source_text[queue_start:], '    if (depth > 0) {')
 hook = function(model_text, 'void ' + model_name + '::beforePrefillBlock(')
 
 layers, experts, hidden, intermediate, early_batches = 38, 64, 2048, 1536, 7
@@ -75,7 +74,7 @@ header = r'''
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <expert_lru.h>
+#include <memory>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -87,7 +86,10 @@ header = r'''
 #include <vector>
 #define HTP_TL2_WEIGHT_BITS 0x102u
 #define ENABLE_HEXKL 1
+// Keep the fake I/O interface while compiling the real SDK-free pool state.
+#define __COMPUTE_OPS_H__
 namespace nntrainer {
+struct HtpExpertPool;
 class ComputeOps {
 public:
   struct ExpertFileDesc {
@@ -96,6 +98,7 @@ public:
     bool affine = false;
   };
   virtual ~ComputeOps() = default;
+  virtual HtpExpertPool *htpExpertPool() { return nullptr; }
   virtual bool register_qs4cx_wh_expert_files(
     const std::vector<ExpertFileDesc> &, bool) = 0;
   virtual bool
@@ -106,6 +109,7 @@ public:
 ComputeOps *current_ops;
 ComputeOps *get_htp_ops() { return current_ops; }
 }
+#include <htp_backend/htp_expert_pool.h>
 namespace causallm {
 '''
 
@@ -122,6 +126,13 @@ std::vector<int> ids(const std::vector<const void *> &p) {
   return result;
 }
 struct Fake : nntrainer::ComputeOps {
+  std::unique_ptr<nntrainer::HtpExpertPool> pool =
+    std::make_unique<nntrainer::HtpExpertPool>();
+  nntrainer::HtpExpertPool *borrowed = nullptr;
+  nntrainer::HtpExpertPool *htpExpertPool() override {
+    return borrowed ? borrowed : pool.get();
+  }
+  ~Fake() override { stopWorkers(); }
   int layer = -1, demand_reads = 0, end_calls = 0, fail_begin = -1;
   bool refuse = false, workers_stopped = false, old_pass = false;
   bool cancel_queued = false;
@@ -195,26 +206,35 @@ struct Fake : nntrainer::ComputeOps {
   }
 };
 
+nntrainer::HtpExpertPool &testPool() {
+  return nntrainer::requireHtpExpertPool(nntrainer::current_ops);
+}
+void resetPoolFixture() {
+  auto &ops = static_cast<Fake &>(*nntrainer::current_ops);
+  ops.pool = std::make_unique<nntrainer::HtpExpertPool>();
+}
+
 void seed(Fake &ops, size_t preload = 128, size_t capacity_per_layer = 16) {
-  resetLfm2HtpExpertPool();
+  nntrainer::current_ops = &ops;
+  resetPoolFixture();
   for (int l = 0; l < LAYERS; ++l) {
-    g_expert_lru.addLayer(&identities[l * EXPERTS], capacity_per_layer);
+    testPool().lru.addLayer(&identities[l * EXPERTS], capacity_per_layer);
     std::vector<ExpertFileDesc> ds;
     for (int e = 0; e < EXPERTS; ++e)
       ds.push_back({&identities[l * EXPERTS + e], HTP_TL2_WEIGHT_BITS, HIDDEN,
                     INTERMEDIATE, HIDDEN});
-    g_expert_layers.push_back(ds);
-    g_expert_class_cap[expertSlotClass(ds.front())] += capacity_per_layer;
+    testPool().layers.push_back(ds);
+    testPool().class_capacity[nntrainer::HtpExpertPool::slotClass(ds.front())] += capacity_per_layer;
   }
   for (int l = 0; l < LAYERS && preload; ++l) {
     std::vector<const void *> keys;
     for (int e = 0; e < EXPERTS && preload; ++e, --preload)
       keys.push_back(&identities[l * EXPERTS + e]);
-    g_expert_lru.acquire(
+    testPool().lru.acquire(
       keys, [&](const void *k) { ops.resident.insert(k); },
       [](const void *) { assert(false); });
   }
-  g_expert_owner = &ops;
+  testPool().owner = &ops;
   nntrainer::current_ops = &ops;
 }
 
@@ -222,6 +242,7 @@ void forwardLayer(Fake &backend, int expert_layer_slot,
                   const std::vector<int> &active,
                   const std::vector<int> &recency) {
   nntrainer::ComputeOps *ops = &backend;
+  auto *pool = ops->htpExpertPool();
   backend.layer = expert_layer_slot;
   const int depth = expertPrefetchDepth();
   std::vector<const void *> need;
@@ -235,7 +256,7 @@ void forwardLayer(Fake &backend, int expert_layer_slot,
 stage = r'''
 
 // Ordinary stage(active): exact ExpertLru acquire semantics, fake IO only.
-g_expert_lru.acquire(
+testPool().lru.acquire(
   need,
   [&](const void *k) {
     ++backend.demand_reads;
@@ -249,7 +270,7 @@ tail = r'''
 std::vector<const void *> refresh;
 for (int e : recency)
   refresh.push_back(&identities[expert_layer_slot * EXPERTS + e]);
-g_expert_lru.refresh(refresh);
+testPool().lru.refresh(refresh);
 }
 '''
 
@@ -345,30 +366,30 @@ Result run(bool early, unsigned preload = 128) {
   const unsigned expected = (CAPACITY - preload) / EXPERTS * EXPERTS;
   if (early) {
     assert(BEGIN(&ops) == expected);
-    assert(g_expert_lru.size() == preload && g_expert_lru.capacity() == CAPACITY);
+    assert(testPool().lru.size() == preload && testPool().lru.capacity() == CAPACITY);
     assert(ops.evictions.empty() && ops.reads.size() == expected / EXPERTS &&
            ops.registrations.empty());
-    const auto before = g_expert_lru.order();
+    const auto before = testPool().lru.order();
     assert(BEGIN(&ops) == 0);
-    assert(g_expert_lru.order() == before && ops.reads.size() == expected / EXPERTS);
+    assert(testPool().lru.order() == before && ops.reads.size() == expected / EXPERTS);
   }
   for (int l = 0; l < LAYERS; ++l) {
     forwardLayer(ops, l, active[l], recency[l]);
     if (!l) {
       assert(ops.end_calls == 0);
-      assert(g_prefetch_early_owner == nullptr);
+      assert(testPool().early_owner == nullptr);
     }
-    assert(g_expert_lru.size() <= CAPACITY &&
-           g_expert_lru.capacity() == CAPACITY);
+    assert(testPool().lru.size() <= CAPACITY &&
+           testPool().lru.capacity() == CAPACITY);
   }
-  assert(g_prefetch_batches.empty() && g_prefetch_inflight.empty() &&
+  assert(testPool().prefetch_batches.empty() && testPool().prefetch_inflight.empty() &&
          ops.batches.empty());
   assert(BEGIN(&ops) == 0);
   assert(ops.demand_reads == 0);
   Result result{ops.reads,
                 ops.registrations,
                 ops.evictions,
-                ids(g_expert_lru.order()),
+                ids(testPool().lru.order()),
                 {},
                 {},
                 {},
@@ -378,17 +399,17 @@ Result run(bool early, unsigned preload = 128) {
     std::vector<const void *> keys;
     for (int e : row.second)
       keys.push_back(&identities[row.first * EXPERTS + e]);
-    g_expert_lru.acquire(
+    testPool().lru.acquire(
       keys,
       [&](const void *k) {
         result.future_misses.push_back(id(k));
         ops.resident.insert(k);
       },
       [&](const void *k) { ops.evict(k); });
-    g_expert_lru.refresh(keys);
+    testPool().lru.refresh(keys);
   }
   result.future_evictions = ops.evictions;
-  result.future_order = ids(g_expert_lru.order());
+  result.future_order = ids(testPool().lru.order());
   return result;
 }
 void checkPreloads() {
@@ -396,10 +417,10 @@ void checkPreloads() {
                          384u, 600u, 608u}) {
     Fake ops;
     seed(ops, preload);
-    const auto pinned = g_expert_lru.order();
+    const auto pinned = testPool().lru.order();
     const size_t queued = beginLfm2HtpExpertPrefill(&ops);
     assert(queued <= CAPACITY - preload);
-    assert(g_expert_lru.order() == pinned && ops.evictions.empty());
+    assert(testPool().lru.order() == pinned && ops.evictions.empty());
     std::set<int> reads;
     for (const auto &batch : ops.reads)
       for (int key : batch) {
@@ -413,13 +434,13 @@ void checkPreloads() {
       assert(queued == 0);
     for (int l = 0; l < LAYERS; ++l) {
       forwardLayer(ops, l, active[l], recency[l]);
-      assert(g_expert_lru.size() <= CAPACITY);
-      assert(g_expert_lru.size() == ops.resident.size());
+      assert(testPool().lru.size() <= CAPACITY);
+      assert(testPool().lru.size() == ops.resident.size());
       for (int e : active[l])
         assert(ops.resident.count(&identities[l * EXPERTS + e]));
     }
-    assert(ops.demand_reads == 0 && g_prefetch_batches.empty());
-    assert(g_prefetch_inflight.empty() && ops.batches.empty());
+    assert(ops.demand_reads == 0 && testPool().prefetch_batches.empty());
+    assert(testPool().prefetch_inflight.empty() && ops.batches.empty());
     reads.clear();
     for (const auto &batch : ops.reads)
       for (int key : batch) {
@@ -437,13 +458,13 @@ void checkPruning() {
     beginLfm2HtpExpertPrefill(&ops);
     for (int l = 0; l < LAYERS; ++l) {
       forwardLayer(ops, l, active[l], recency[l]);
-      assert(g_expert_lru.size() <= CAPACITY);
-      assert(g_expert_lru.size() == ops.resident.size());
+      assert(testPool().lru.size() <= CAPACITY);
+      assert(testPool().lru.size() == ops.resident.size());
       for (int e : active[l])
         assert(ops.resident.count(&identities[l * EXPERTS + e]));
     }
-    assert(ops.demand_reads == 0 && g_prefetch_batches.empty());
-    assert(g_prefetch_inflight.empty() && ops.batches.empty());
+    assert(ops.demand_reads == 0 && testPool().prefetch_batches.empty());
+    assert(testPool().prefetch_inflight.empty() && ops.batches.empty());
   }
 }
 void checkGuards() {
@@ -456,7 +477,7 @@ void checkGuards() {
   {
     Fake a;
     seed(a);
-    g_expert_lru.acquire(
+    testPool().lru.acquire(
       {&identities[200]}, [&](const void *k) { a.resident.insert(k); },
       [](const void *) { assert(false); });
     assert(BEGIN(&a) == 0);
@@ -469,43 +490,43 @@ void checkGuards() {
   {
     Fake a;
     seed(a);
-    g_expert_layers[8][0].w_bits = 2;
+    testPool().layers[8][0].w_bits = 2;
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_expert_layers.pop_back();
+    testPool().layers.pop_back();
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_expert_layers[8].pop_back();
+    testPool().layers[8].pop_back();
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_handed_expert_layers.insert(&identities[0]);
+    testPool().handed_layers.insert(&identities[0]);
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_prefetch_inflight.insert(&identities[200]);
+    testPool().prefetch_inflight.insert(&identities[200]);
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_prefetch_batches.emplace_back(1, 1);
+    testPool().prefetch_batches.emplace_back(1, 1);
     assert(BEGIN(&a) == 0);
   }
   {
     Fake a;
     seed(a);
-    g_prefetch_next = 1;
+    testPool().prefetch_next = 1;
     assert(BEGIN(&a) == 0);
   }
   {
@@ -514,8 +535,8 @@ void checkGuards() {
     a.fail_begin = 0;
     a.refuse = true;
     assert(BEGIN(&a) == 0);
-    assert(g_prefetch_next == 0 &&
-           g_expert_lru.room(g_expert_lru.order()) == CAPACITY - 128);
+    assert(testPool().prefetch_next == 0 &&
+           testPool().lru.room(testPool().lru.order()) == CAPACITY - 128);
   }
   {
     Fake a;
@@ -527,10 +548,10 @@ void checkGuards() {
     } catch (const std::runtime_error &) {
       threw = true;
     }
-    assert(threw && a.reads.empty() && g_prefetch_batches.empty());
-    assert(g_expert_lru.room(g_expert_lru.order()) == CAPACITY - 128);
+    assert(threw && a.reads.empty() && testPool().prefetch_batches.empty());
+    assert(testPool().lru.room(testPool().lru.order()) == CAPACITY - 128);
     a.stopWorkers();
-    resetLfm2HtpExpertPool();
+    resetPoolFixture();
   }
   {
     Fake a;
@@ -542,12 +563,12 @@ void checkGuards() {
     } catch (const std::runtime_error &) {
       threw = true;
     }
-    assert(threw && a.reads.size() == 1 && g_prefetch_batches.size() == 1);
-    assert(g_expert_lru.room(g_expert_lru.order()) == CAPACITY - 128 - EXPERTS);
+    assert(threw && a.reads.size() == 1 && testPool().prefetch_batches.size() == 1);
+    assert(testPool().lru.room(testPool().lru.order()) == CAPACITY - 128 - EXPERTS);
     a.stopWorkers();
-    resetLfm2HtpExpertPool();
-    assert(g_prefetch_batches.empty() && !g_prefetch_early_owner &&
-           !g_expert_owner);
+    resetPoolFixture();
+    assert(testPool().prefetch_batches.empty() && !testPool().early_owner &&
+           !testPool().owner);
   }
   {
     Fake a;
@@ -558,7 +579,7 @@ void checkGuards() {
     a.fail_begin = -1;
     for (int l = 0; l < LAYERS; ++l)
       forwardLayer(a, l, active[l], recency[l]);
-    assert(a.demand_reads == 0 && g_prefetch_batches.empty());
+    assert(a.demand_reads == 0 && testPool().prefetch_batches.empty());
   }
   {
     Fake a, b;
@@ -566,27 +587,28 @@ void checkGuards() {
     assert(BEGIN(&a) == EARLY_READS);
     bool threw = false;
     try {
+      b.borrowed = a.pool.get(); // Deliberately pass another runtime's state.
       forwardLayer(b, 0, active[0], recency[0]);
     } catch (const std::logic_error &) {
       threw = true;
     }
     assert(threw && a.end_calls == 0 && b.end_calls == 0);
     a.stopWorkers();
-    resetLfm2HtpExpertPool();
+    resetPoolFixture();
   }
   {
     Fake a;
     seed(a);
     assert(BEGIN(&a) == EARLY_READS);
     a.stopWorkers();
-    resetLfm2HtpExpertPool();
-    assert(g_expert_lru.size() == 0 && g_expert_lru.capacity() == 0 &&
-           !g_expert_owner && !g_prefetch_early_owner);
+    resetPoolFixture();
+    assert(testPool().lru.size() == 0 && testPool().lru.capacity() == 0 &&
+           !testPool().owner && !testPool().early_owner);
     Fake b;
     seed(b);
     assert(BEGIN(&b) == EARLY_READS);
     b.stopWorkers();
-    resetLfm2HtpExpertPool();
+    resetPoolFixture();
   }
 }
 void checkPreloadFailure() {
@@ -594,23 +616,23 @@ void checkPreloadFailure() {
     for (bool throws : {false, true}) {
       Fake ops;
       seed(ops);
-      const auto batch = g_expert_layers[2];
+      const auto batch = testPool().layers[2];
       ops.fail_preload = count;
       ops.throw_preload = throws;
       bool caught = false;
       try { preloadNativeExpertBatch(&ops, batch); }
       catch (const std::runtime_error &) { caught = true; }
-      assert(caught && g_expert_lru.size() == 128);
-      for (const auto &d : batch) assert(!g_expert_lru.resident(d.key_gu));
+      assert(caught && testPool().lru.size() == 128);
+      for (const auto &d : batch) assert(!testPool().lru.resident(d.key_gu));
       assert(ops.resident.size() == size_t(128 + count));
       ops.fail_preload = -1;
       preloadNativeExpertBatch(&ops, batch);
-      assert(g_expert_lru.size() == 192 && ops.resident.size() == 192);
-      for (const auto &d : batch) assert(g_expert_lru.resident(d.key_gu));
+      assert(testPool().lru.size() == 192 && ops.resident.size() == 192);
+      for (const auto &d : batch) assert(testPool().lru.resident(d.key_gu));
       const int calls = ops.preload_calls;
       preloadNativeExpertBatch(&ops, batch);
       preloadNativeExpertBatch(&ops, {});
-      assert(ops.preload_calls == calls && g_expert_lru.size() == 192);
+      assert(ops.preload_calls == calls && testPool().lru.size() == 192);
     }
 }
 void checkModelHook() {
@@ -709,6 +731,25 @@ int main(int argc, char **argv) {
 
 restart_checks = r'''
 
+// Separate backend instances do not share descriptors, held slots or LRFU.
+{
+  Fake a, b;
+  seed(a);
+  assert(BEGIN(&a) == EARLY_READS);
+  const auto a_order = a.pool->lru.order();
+  const auto a_batches = a.pool->prefetch_batches;
+  seed(b, 64);
+  assert(b.pool->lru.size() == 64 && a.pool->lru.size() == 128);
+  assert(BEGIN(&b) > 0);
+  assert(a.pool->lru.order() == a_order);
+  assert(a.pool->prefetch_batches == a_batches);
+  b.stopWorkers();
+  resetPoolFixture();
+  assert(b.pool->lru.capacity() == 0);
+  assert(a.pool->lru.capacity() == CAPACITY);
+  assert(a.pool->early_owner == &a);
+}
+
 // The first run either fails during kickoff or is interrupted after kickoff
 // and before layer zero. A second run must retire the old early marker and
 // drain exactly those owned batches through the ordinary layer-zero path.
@@ -728,13 +769,13 @@ for (bool fail_queue : {false, true}) {
   assert(threw == fail_queue);
   const size_t old_batches = a.batches.size();
   assert(old_batches == (fail_queue ? 1u : size_t(EARLY_BATCHES)));
-  assert(g_prefetch_early_owner == &a);
+  assert(testPool().early_owner == &a);
   retireHtpExpertPrefillKickoff(&other);
   retireHtpExpertPrefillKickoff(nullptr);
-  assert(g_prefetch_early_owner == &a);
+  assert(testPool().early_owner == &a);
   a.fail_begin = -1;
   model.beginRun();
-  assert(!g_prefetch_early_owner && a.batches.size() == old_batches);
+  assert(!testPool().early_owner && a.batches.size() == old_batches);
   model.beforePrefillBlock(0, 1024);
   assert(a.batches.size() == old_batches);
   a.old_pass = true;
@@ -743,9 +784,9 @@ for (bool fail_queue : {false, true}) {
   assert(size_t(a.end_calls) == old_batches);
   for (int l = 1; l < LAYERS; ++l)
     forwardLayer(a, l, active[l], recency[l]);
-  assert(a.demand_reads == 0 && g_prefetch_batches.empty());
-  assert(g_prefetch_inflight.empty() && a.batches.empty());
-  assert(g_expert_lru.capacity() == CAPACITY);
+  assert(a.demand_reads == 0 && testPool().prefetch_batches.empty());
+  assert(testPool().prefetch_inflight.empty() && a.batches.empty());
+  assert(testPool().lru.capacity() == CAPACITY);
 }
 
 {
@@ -762,8 +803,7 @@ for (bool fail_queue : {false, true}) {
 # Only the new lifecycle prefix is under test here. The upstream backend
 # attention/conv/KV reset itself is covered by model/device checks.
 run_block = function(model_text, '  if (ran_) {')
-run_entry = run_block[:run_block.index('nntrainer::htp_begin_prompt();')]
-run_entry += '}\n'
+run_entry = run_block
 model_stub = model_stub.replace('MODEL_NAME', model_name)
 model_stub = model_stub.replace('RUN_ENTRY', run_entry)
 checks = checks.replace('EXTRA_MODEL_GUARDS', restart_checks)
@@ -773,7 +813,8 @@ source = (header + config + helper + fixture + collect + stage + queue + tail +
           model_stub + hook + arrays + checks)
 compiler = os.environ.get('CXX', 'g++')
 flags = ['-std=c++17', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
-         '-I' + str(app / 'lfm2_moe')]
+         '-I' + str(root / 'nntrainer/tensor'),
+         '-I' + str(root / 'nntrainer/tensor/cpu_backend')]
 if args.sanitize:
     flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 with tempfile.TemporaryDirectory(prefix='nntr-early-prefill-') as temporary:

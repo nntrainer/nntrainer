@@ -13,7 +13,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <htp_backend.h>
-#include <lfm2_moe_layer.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -72,7 +71,6 @@ public:
   ~HtpModelRuntime() {
     std::lock_guard<std::mutex> lock(mutex_);
     nntrainer::htp_release_runtime();
-    causallm::resetLfm2HtpExpertPool();
     owned_ = false;
   }
 

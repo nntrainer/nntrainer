@@ -29,7 +29,7 @@
  * and for fp16 the activation (AH) and weight (WH) tiles share this
  * layout, so an accumulator read back as AH can be fed straight back in
  * as a weight. Nothing here is verified by construction: the probe entry
- * in test/htp/nntr_hvx_attn_f16.c compares every builder byte for byte
+ * in DSP nntr_hvx_attn_f16.c compares every builder byte for byte
  * against HexKL's converters on the device, and the plan says to stop if
  * they differ.
  */

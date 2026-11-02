@@ -44,6 +44,7 @@
 namespace nntrainer {
 
 class Tensor;
+struct HtpExpertPool;
 
 /**
  * @class ComputeOps
@@ -1582,6 +1583,9 @@ public:
     (void)pos;
     return false;
   }
+
+  /** Borrow the runtime-owned expert policy; null without HTP slot support. */
+  virtual HtpExpertPool *htpExpertPool() { return nullptr; }
 
 protected:
   /**
