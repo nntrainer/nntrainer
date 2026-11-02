@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <htp_backend/htp_runtime_config.h>
 #include <limits>
 #include <list>
 #include <map>
@@ -43,16 +44,7 @@ WeightReadTiming *weightSetReadTiming(WeightReadTiming *timing) {
 }
 
 /** -1 preserves the existing loader; 0 bypasses the page cache; 1 bounds it. */
-int weightPageCachePolicy() {
-  const char *value = std::getenv("NNTR_HTP_PAGE_CACHE");
-  if (!value)
-    return -1;
-  if (std::strcmp(value, "0") == 0)
-    return 0;
-  if (std::strcmp(value, "1") == 0)
-    return 1;
-  throw std::invalid_argument("NNTR_HTP_PAGE_CACHE must be 0 or 1");
-}
+int weightPageCachePolicy() { return htpRuntimeConfig().htp.page_cache; }
 
 #if defined(__linux__)
 /** Open a separate direct-IO description: never change flags on another reader.
@@ -278,7 +270,7 @@ int weightPreadScatter(int fd, const WeightReadSlice *slices, size_t count,
 }
 #else
 int openWeightFile(const char *) {
-  throw std::runtime_error("NNTR_HTP_PAGE_CACHE requires Linux/Android");
+  throw std::runtime_error("htp.page_cache requires Linux/Android");
 }
 int weightPreadScatter(int, const WeightReadSlice *, size_t, uint64_t) {
   return ENOSYS;

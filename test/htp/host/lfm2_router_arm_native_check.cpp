@@ -18,6 +18,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <htp_backend.h>
+#include <htp_runtime_config.h>
 #include <layer_context.h>
 #include <memory>
 #include <nntrainer_error.h>
@@ -100,9 +101,13 @@ static bool expectedArm(unsigned mode, bool enabled) {
 }
 int main(int argc, char **argv) {
   try {
-    const char *option = std::getenv("NNTR_LFM2_ROUTER_ARM");
-    const bool enabled = option && std::strcmp(option, "1") == 0 &&
-                         !std::getenv("NNTR_HTP_ROUTER_U8I8");
+    const std::string mode = argc > 2 ? argv[2] : "off";
+    check(mode == "on" || mode == "off" || mode == "quantized", "invalid mode");
+    const bool enabled = mode == "on";
+    nntrainer::HtpRuntimeConfig runtime;
+    runtime.moe.lfm2_router_arm = mode != "off";
+    runtime.moe.router_u8i8 = mode == "quantized";
+    nntrainer::configureHtpRuntime(runtime);
     nntrainer::ThreadManagerConfig config;
     config.compute_threads = argc == 2 ? std::stoul(argv[1]) : 8;
     nntrainer::ThreadManager::setConfig(config);
@@ -232,7 +237,7 @@ int main(int argc, char **argv) {
             "pool reuse after failed RPC");
       ++cases;
     }
-    std::printf("ROUTER_ARM_NATIVE %u cases threads=%u env=%u RPC=%u PASS\n",
+    std::printf("ROUTER_ARM_NATIVE %u cases threads=%u config=%u RPC=%u PASS\n",
                 cases, config.compute_threads, unsigned(enabled), rpc_calls);
     return 0;
   } catch (const std::exception &e) {

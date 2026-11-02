@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <htp_backend.h>
+#include <htp_model_config.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,8 @@ namespace quick_dot_ai {
 
 class HtpModelRuntime {
 public:
-  explicit HtpModelRuntime(const char *native_lib_dir) {
+  explicit HtpModelRuntime(const char *native_lib_dir,
+                           const nntrainer::HtpRuntimeConfig &config) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (owned_)
       throw std::runtime_error(
@@ -36,18 +38,14 @@ public:
       throw std::invalid_argument(
         "HTP native_lib_dir is missing libnntr_hvx_skel.so");
 
-    // The HTP runtime configuration is built into the library
-    // (nntrainer/tensor/htp_backend/htp_fixed_opts.h); only the DSP library
-    // path is set here, and the weight page-cache policy
-    // (NNTR_HTP_PAGE_CACHE) is left to the environment.
+    // FastRPC resolves the skel through the process library search path.
     const std::vector<std::pair<std::string, std::string>> options = {
       {"ADSP_LIBRARY_PATH", dir.string()},
     };
     if (!options_.empty() && options_ != options)
       throw std::invalid_argument(
         "HTP runtime settings are fixed for this process");
-    // Validate all values before changing any. Several PR options are read
-    // once by function-local statics and cannot be changed between requests.
+    nntrainer::validateHtpRuntimeConfig(config);
     for (const auto &option : options) {
       const char *old = std::getenv(option.first.c_str());
       if (old && option.second != old)
@@ -59,6 +57,7 @@ public:
         throw std::runtime_error("Could not initialize HTP option: " +
                                  option.first);
     options_ = options;
+    nntrainer::configureHtpRuntime(config);
     try {
       nntrainer::htp_prepare_runtime();
     } catch (...) {

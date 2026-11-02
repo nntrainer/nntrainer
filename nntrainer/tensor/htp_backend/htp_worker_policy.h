@@ -6,6 +6,7 @@
  */
 #ifndef NNTR_HTP_WORKER_POLICY_H
 #define NNTR_HTP_WORKER_POLICY_H
+#include "htp_runtime_config.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -21,25 +22,9 @@ public:
     size_t readers = 6;
     std::vector<int> cpus;
   };
-  static const PrefetchKnobs &prefetchKnobs() {
-    static const PrefetchKnobs k = [] {
-      PrefetchKnobs r;
-      if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
-        r.readers = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
-      if (const char *v = std::getenv("NNTR_MOE_PREFETCH_CPUS")) {
-        for (const char *p = v; *p != '\0';) {
-          char *end = nullptr;
-          const long c = std::strtol(p, &end, 10);
-          if (end == p)
-            break;
-          if (c >= 0 && c < 32)
-            r.cpus.push_back(static_cast<int>(c));
-          p = (*end == ',') ? end + 1 : end;
-        }
-      }
-      return r;
-    }();
-    return k;
+  static PrefetchKnobs prefetchKnobs() {
+    const auto &config = htpRuntimeConfig().moe;
+    return {config.prefill_readers, config.worker_cpus};
   }
   /** Match the prefetch worker policy without inheriting a caller pinned
    *  to a single compute core. An explicit prefetch CPU list is retained. */

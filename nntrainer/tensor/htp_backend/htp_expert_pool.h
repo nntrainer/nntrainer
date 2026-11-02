@@ -18,7 +18,7 @@
  * evict the least recently used, refresh recency from the routing's
  * extended top-k so the likely-next experts move to the back.
  *
- * NNTR_MOE_LRFU=<H> (tokens) evicts by LRFU instead: each key's
+ * moe.lrfu_half_life=<H> (tokens) evicts by LRFU instead: each key's
  * score is its use count decayed by half every H tokens (H x layers
  * acquire() calls). The lowest score goes, ties least recent first.
  * The score outlives the key's residency.
@@ -28,6 +28,7 @@
 #define NNTR_HTP_EXPERT_POOL_H
 #ifdef __cplusplus
 
+#include "htp_runtime_config.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -36,12 +37,14 @@
 #include <compute_ops.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -59,16 +62,7 @@ namespace nntrainer {
  * arena but leaves all expert weight reads to prefill. An explicit value
  * at least as large as the capacity restores a full-cache preload.
  */
-inline size_t expertPreloadLimit(size_t capacity, const char *value) {
-  if (!value)
-    return std::min(capacity, size_t{128});
-  if (*value < '0' || *value > '9')
-    throw std::invalid_argument("NNTR_MOE_PRELOAD_EXPERTS must be nonnegative");
-  char *end = nullptr;
-  errno = 0;
-  const auto count = std::strtoull(value, &end, 10);
-  if (errno || *end || count > std::numeric_limits<size_t>::max())
-    throw std::invalid_argument("Invalid NNTR_MOE_PRELOAD_EXPERTS");
+inline size_t expertPreloadLimit(size_t capacity, unsigned count = 128u) {
   return std::min(capacity, static_cast<size_t>(count));
 }
 
@@ -85,13 +79,19 @@ public:
     order_.clear();
     score_.clear();
     layers_.clear();
-    lrfu_ = lrfuTokens();
+    lrfu_ = 0.0;
+    lrfu_configured_ = false;
   }
 
   /** @brief Registers one layer's share of the pool. Idempotent per layer,
    *  so a layer finalized twice does not double its share. */
   void addLayer(const void *layer, size_t per_layer) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // The engine can construct this pool before the model config is applied.
+    if (!lrfu_configured_) {
+      lrfu_ = lrfuTokens();
+      lrfu_configured_ = true;
+    }
     if (layers_.insert(layer).second)
       capacity_ += per_layer;
   }
@@ -105,8 +105,11 @@ public:
   }
 
   /** @brief LRFU with a half-life of @a tokens (0: LRU); the
-   *  default is NNTR_MOE_LRFU's. Set before the first acquire(). */
-  void setLrfu(double tokens) { lrfu_ = tokens; }
+   *  default is the runtime configuration. Set before the first acquire(). */
+  void setLrfu(double tokens) {
+    lrfu_ = tokens;
+    lrfu_configured_ = true;
+  }
 
   size_t capacity() const { return capacity_; }
   size_t size() const {
@@ -183,7 +186,7 @@ public:
       throw std::runtime_error(
         "ExpertLru: one call needs " + std::to_string(need.size()) +
         " experts resident but the pool holds " + std::to_string(capacity_) +
-        " (NNTR_MOE_CACHE_EXPERTS x MoE layers); raise it");
+        " (moe.cache_experts x MoE layers); raise it");
     }
     const size_t cap = capacity_ - std::min(held_, capacity_);
     if (need.size() > cap) {
@@ -245,22 +248,8 @@ public:
     return keys;
   }
 
-  /** @brief NNTR_MOE_LRFU's half-life in tokens; "0" is LRU, unset is 32.
-   *  Read once per process. */
-  static double lrfuTokens() {
-    static const double h = [] {
-      const char *v = std::getenv("NNTR_MOE_LRFU");
-      if (v == nullptr || *v == '\0')
-        return 32.0;
-      char *end = nullptr;
-      const double x = std::strtod(v, &end);
-      if (*end != '\0' || !(x >= 0.0))
-        throw std::invalid_argument(std::string("NNTR_MOE_LRFU=") + v +
-                                    ": want a half-life in tokens");
-      return x;
-    }();
-    return h;
-  }
+  /** @brief Configured half-life in tokens; zero selects LRU. */
+  static double lrfuTokens() { return htpRuntimeConfig().moe.lrfu_half_life; }
 
 private:
   struct Score {
@@ -329,7 +318,8 @@ private:
   std::set<const void *> layers_;
   Order order_; /**< front = least recently used */
   std::unordered_map<Key, Order::iterator> pos_;
-  double lrfu_ = lrfuTokens();           /**< half-life, tokens */
+  double lrfu_ = 0.0; /**< half-life, tokens */
+  bool lrfu_configured_ = false;
   uint64_t clock_ = 0;                   /**< acquire() calls */
   std::unordered_map<Key, Score> score_; /**< LRFU, every key seen */
 };
@@ -340,9 +330,14 @@ private:
  * on the serial model-loading or generation thread, as before.
  */
 struct HtpExpertPool {
+  struct FileCloser {
+    void operator()(std::FILE *file) const { std::fclose(file); }
+  };
   using ExpertFileDesc = ComputeOps::ExpertFileDesc;
   using SlotClass = std::array<unsigned int, 4>;
   ExpertLru lru;
+  std::unique_ptr<std::FILE, FileCloser> trace_file;
+  bool trace_opened = false;
   std::vector<std::vector<ExpertFileDesc>> layers;
   std::map<SlotClass, size_t> class_capacity;
   std::set<SlotClass> class_reserved;

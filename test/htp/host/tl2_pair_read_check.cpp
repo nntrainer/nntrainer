@@ -10,6 +10,7 @@
 #if defined(__linux__)
 #include "htp_expert_prefetch.h"
 #include "htp_expert_read_pool.h"
+#include "htp_runtime_config.h"
 #include "htp_tl2_codec.h"
 #include "weight_file_reader.h"
 #include <array>
@@ -120,7 +121,9 @@ struct Fixture {
     assert(fd >= 0);
     assert(write(fd, file.data(), file.size()) == ssize_t(file.size()));
     assert(fsync(fd) == 0);
-    assert(setenv("NNTR_HTP_PAGE_CACHE", "0", 1) == 0);
+    nntrainer::HtpRuntimeConfig config;
+    config.htp.page_cache = 0;
+    nntrainer::configureHtpRuntime(config);
     direct = nntrainer::openWeightFile(path.c_str());
     assert(direct >= 0);
   }

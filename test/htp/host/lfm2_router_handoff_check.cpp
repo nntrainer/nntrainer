@@ -110,6 +110,7 @@ struct StagingTransfer {
   template <typename... Args> static void warn(const char *, Args...) {}
 };
 #include "htp_staging.h"
+using nntrainer::htpRuntimeConfig;
 struct Backend : nntrainer::HtpStaging<HtpRpcBuffer, StagingTransfer> {
   std::mutex invoke_mutex_;
 // clang-format off

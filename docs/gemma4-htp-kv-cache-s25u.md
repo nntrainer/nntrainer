@@ -5,6 +5,13 @@ pack으로 **KV cache dump 저장 → 로드 → 남은 프롬프트 prefill →
 Ultra(v79)에서 처음 실행한 기록이다. S26 Ultra가 없어서 S25 Ultra에서 했다.
 이하의 수치는 당시 S25 Ultra 실행 기록이다.
 
+현재 실행에서는 아래 기록의 HTP/MoE 환경변수 대신 `nntr_config.json`의
+`htp`·`moe` 항목을 사용한다. 예를 들어 `NNTR_MOE_CACHE_GROW=0`은
+`"moe": {"cache_grow": 0}`, `NNTR_HTP_PAGE_CACHE=0`은
+`"htp": {"page_cache": 0}`으로 옮긴다.
+[현재 설정 안내](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)를
+따르고, 아래 명령과 옵션 이름은 측정 당시의 기록으로 읽는다.
+
 **2026-10-18 상태:** 현재 native CLI는 KV snapshot과 chunked prefill을
 지원하며, public QuickDotAI API는 snapshot/resume을 노출하지 않는다.
 최신 native TL2/affine 런타임, compact expert 저장, 메모리 회수와 S26 검증

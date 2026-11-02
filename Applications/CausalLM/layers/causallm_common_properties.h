@@ -79,12 +79,7 @@ public:
   using prop_tag = nntrainer::str_prop_tag;
 };
 
-/**
- * @brief Per-layer expert cache size C for the streamed (virtual) expert
- *  path, doc 52/55. 0 keeps the experts resident. NNTR_MOE_CACHE_EXPERTS in
- *  the environment overrides it, so one device can sweep C without a
- *  config edit.
- */
+/** Per-layer expert cache share; zero uses moe.cache_experts. */
 class CacheExperts : public nntrainer::Property<unsigned int> {
 public:
   CacheExperts(unsigned int value = 0) :

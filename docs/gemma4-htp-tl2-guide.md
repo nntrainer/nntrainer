@@ -172,9 +172,10 @@ can compare reference and rotated packs for diagnosis.
 
 Scope `all` covers routed experts of both two- and four-bit formats;
 dense FFNs remain unrotated. The default scope `2bit` does not rotate
-four-bit expert containers. Environment variables `NNTR_MOE_HADAMARD`
-and `NNTR_MOE_HADAMARD_SCOPE` take precedence over the configuration,
-so clear stale overrides when switching packs. Rotation stays off for
+four-bit expert containers. Set `moe.hadamard` and `moe.hadamard_scope` in
+`nntr_config.json`; the former environment overrides are no longer read.
+Legacy flat rotation keys remain accepted, but must agree with nested values.
+Rotation stays off for
 an unrotated checkpoint. A rotation-on smoke with unrotated weights does
 not validate model output quality.
 
@@ -202,7 +203,8 @@ For the strict checkpoint, add its supplied input encodings to
 ```
 
 The path is relative to the model directory, or absolute.
-`NNTR_HTP_STATIC_LINEAR` overrides it for existing experiment scripts.
+`htp.static_linear` in `nntr_config.json` overrides it for experiments;
+relative paths also resolve against the model directory.
 Without either setting, linear activation quantization remains dynamic.
 Both supplied formats are accepted:
 

@@ -46,7 +46,8 @@ for name,data in chunks.items():(a.output/name).write_text(data)
 shutil.copy2(Path(__file__).with_name('lfm2_conv_chunk_check.cpp'),a.output)
 cmd=[a.cxx,'-std=c++17','-O2','-g','-ffast-math','-pthread','-Wall','-Wextra',
  '-I'+str((a.repo/'nntrainer/tensor/htp_backend').resolve()),
- str((a.output/'lfm2_conv_chunk_check.cpp').resolve()),'-o',str((a.output/'check').resolve())]
+ str((a.output/'lfm2_conv_chunk_check.cpp').resolve()),
+ str((a.repo/'nntrainer/tensor/htp_backend/htp_runtime_config.cpp').resolve()),'-o',str((a.output/'check').resolve())]
 if a.simde_include:
  cmd[1:1]=['-I'+str(a.simde_include.resolve())]
 if a.native_arm:
@@ -65,4 +66,6 @@ manifest={'source_sha256':hashlib.sha256(s.encode()).hexdigest(),'baseline_sha25
  'Synchronous ThreadManager substitute can use1or4pthread row lanes; no DSP/FastRPC timing claim.']}
 (a.output/'commands.json').write_text(json.dumps(manifest,indent=2)+'\n')
 subprocess.run(cmd,check=True)
-if not a.build_only:subprocess.run(manifest['run'],check=True)
+if not a.build_only:
+ for mode in ('chunk', 'whole', 'whole-views', 'whole-state'):
+  subprocess.run(manifest['run']+[mode],check=True)

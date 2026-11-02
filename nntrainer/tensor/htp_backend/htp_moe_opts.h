@@ -48,33 +48,23 @@
 
 /** @brief Bit 18 sets src_bypass on arena expert weight descriptors for
  *  both GEMV and HMX, matching hexkl_mm_u8i4_moe.h. Enabled by default;
- *  NNTR_MOE_DMA_BYPASS=0 disables it. */
+ *  The runtime can explicitly disable it. */
 #define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
 
-/** @brief HTP_MOE_FLAG_DMA_BYPASS for getenv("NNTR_MOE_DMA_BYPASS"): set
- *  when unset or a non-zero number, clear for "0". */
-static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
-  return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
+/** @brief Source-cache bypass for expert weight DMA. */
+static inline uint32_t htp_moe_opts_dma_bypass(unsigned enabled) {
+  return enabled ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
 }
 
 /** @brief Bits [23:22] encode N - 1 DMA queues for the M=1 weight feed,
- *  matching hexkl_mm_u8i4_moe.h. The resolver defaults to one queue;
- *  callers may provide a different configured default. */
+ *  matching hexkl_mm_u8i4_moe.h. */
 #define HTP_MOE_DMA_Q_SHIFT 22u
 #define HTP_MOE_DMA_Q_BITS 3u
-#define HTP_MOE_DMA_QUEUES_DEFAULT 1u
 
-/** @brief The queue field for getenv("NNTR_MOE_DMA_QUEUES"): unset gives
- *  HTP_MOE_DMA_QUEUES_DEFAULT, exactly "1".."4" gives N. Anything else is
- *  an error (returns -1, *bits untouched): a mistyped variant must not run
- *  as the reference. */
-static inline int htp_moe_opts_dma_queues(const char *env, uint32_t *bits) {
-  uint32_t n = HTP_MOE_DMA_QUEUES_DEFAULT;
-  if (env != NULL) {
-    if (env[0] < '1' || env[0] > '4' || env[1] != '\0')
-      return -1;
-    n = (uint32_t)(env[0] - '0');
-  }
+/** @brief Encode a validated queue count; reject values outside 1..4. */
+static inline int htp_moe_opts_dma_queues(unsigned n, uint32_t *bits) {
+  if (n < 1u || n > 4u)
+    return -1;
   *bits = (n - 1u) << HTP_MOE_DMA_Q_SHIFT;
   return 0;
 }
@@ -101,7 +91,7 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
 #define HTP_MOE_FLAG_HAD_PALEY_I 0x80000000u
 #define HTP_MOE_FLAG_HAD_MASK 0xfc000000u
 
-/** NNTR_MOE_HADAMARD: unset/off, up, down, both, both_scalar,
+/** moe.hadamard: unset/off, up, down, both, both_scalar,
  * up_hmx, down_hmx, both_hmx, both_paley. HMX uses full-width FP16 on prefill;
  * calls of at most four tokens and HVX expert tails keep FP32.
  * Invalid values leave the output untouched and fail instead of silently
@@ -132,7 +122,7 @@ static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
   return 0;
 }
 
-/** NNTR_MOE_HADAMARD_SCOPE: default/2bit rotates only 2-bit pairs.
+/** moe.hadamard_scope: default/2bit rotates only 2-bit pairs.
  * all is for kernel experiments; every active width must then be supported.
  * The Gemma shared FFN uses unsupported 1056-wide chunks. */
 static inline int htp_moe_opts_hadamard_scope(const char *env, uint32_t *bits) {
@@ -159,69 +149,25 @@ static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
                    HTP_MOE_FLAG_HAD_MASK));
 }
 
-/**
- * @brief The lead field for a requested lead in KB: rounded to the nearest
- *        multiple of HTP_MOE_GEMV_LEAD_KB_UNIT and clamped to
- *        HTP_MOE_GEMV_LEAD_MAX_UNITS.
- *
- * The clamp is the l2fetch width field's 16 bits: a box is at most 127
- * tiles of 512 B (hvx_gemm_u8i4_wh.h), and at the decode shape a stage-A
- * unit is exactly 64 KB, so one field unit is one unit of weight there.
- * A negative or unparsable value reads as 0, which is "every column
- * fetches itself".
- */
-static inline uint32_t htp_moe_gemv_lead_units(const char *env) {
-  long kb;
-  unsigned long u;
-  if (env == NULL)
-    return 0u;
-  kb = atol(env);
-  if (kb <= 0)
-    return 0u;
-  u = ((unsigned long)kb + HTP_MOE_GEMV_LEAD_KB_UNIT / 2u) /
-      HTP_MOE_GEMV_LEAD_KB_UNIT;
-  if (u > HTP_MOE_GEMV_LEAD_MAX_UNITS)
-    u = HTP_MOE_GEMV_LEAD_MAX_UNITS;
-  return (uint32_t)u;
+/** @brief Round the lead to 64 KiB units, bounded by the DMA field. */
+static inline uint32_t htp_moe_gemv_lead_units(unsigned kb) {
+  const uint64_t units =
+    ((uint64_t)kb + HTP_MOE_GEMV_LEAD_KB_UNIT / 2u) / HTP_MOE_GEMV_LEAD_KB_UNIT;
+  return units > HTP_MOE_GEMV_LEAD_MAX_UNITS ? HTP_MOE_GEMV_LEAD_MAX_UNITS
+                                             : (uint32_t)units;
 }
 
-/** @brief Defaults matching hexkl_mm_u8i4_moe.h's HVX_GEMV_M1_ROWS1,
- *  HVX_GEMV_PF_LEAD_KB and HVX_GEMV_M1_FEED. Keep these host values in sync
- *  with the DSP. Send them explicitly so the options echo confirms them. */
-#define HTP_MOE_GEMV_LEAD_KB_DEFAULT 192u
-#define HTP_MOE_GEMV_ROWS1_DEFAULT 1u
-#define HTP_MOE_GEMV_FEED_DEFAULT 1u
-
-/**
- * @brief moe_set_opts flags for NNTR_MOE_HTP_M1_GEMV and GEMV tuning.
- * @param env       getenv("NNTR_MOE_HTP_M1_GEMV"), NULL when unset
- * @param lead_env  getenv("NNTR_MOE_HTP_GEMV_LEAD_KB"), NULL when unset
- * @param rows1_env getenv("NNTR_MOE_HTP_GEMV_ROWS1"), NULL when unset
- * @param feed_env  getenv("NNTR_MOE_HTP_GEMV_FEED"), NULL when unset
- * @return HTP_MOE_FLAG_M1_GEMV when @a env is unset or non-zero, 0 for
- *         "0" (the opt-out); plus
- *         all three tune bits, each field from its own variable when set
- *         and from the *_DEFAULT above when not
- *
- * Each knob is overridden only by its own variable: setting the lead
- * leaves the row loop at the default and vice versa, so naming one knob
- * cannot silently reset the other to zero.
- */
-static inline uint32_t htp_moe_opts_flags(const char *env, const char *lead_env,
-                                          const char *rows1_env,
-                                          const char *feed_env) {
+/** @brief Encode explicit GEMV settings for the DSP session. */
+static inline uint32_t htp_moe_opts_flags(unsigned enabled, unsigned lead_kb,
+                                          unsigned rows1, unsigned feed) {
   uint32_t flags = HTP_MOE_FLAG_GEMV_LEAD_SET | HTP_MOE_FLAG_GEMV_ROWS1_SET |
                    HTP_MOE_FLAG_GEMV_FEED_SET;
-  if (env == NULL || atoi(env) != 0)
+  if (enabled)
     flags |= HTP_MOE_FLAG_M1_GEMV;
-  flags |= (lead_env != NULL
-              ? htp_moe_gemv_lead_units(lead_env)
-              : HTP_MOE_GEMV_LEAD_KB_DEFAULT / HTP_MOE_GEMV_LEAD_KB_UNIT)
-           << HTP_MOE_GEMV_LEAD_SHIFT;
-  if (rows1_env != NULL ? atoi(rows1_env) != 0
-                        : HTP_MOE_GEMV_ROWS1_DEFAULT != 0u)
+  flags |= htp_moe_gemv_lead_units(lead_kb) << HTP_MOE_GEMV_LEAD_SHIFT;
+  if (rows1)
     flags |= HTP_MOE_FLAG_GEMV_ROWS1;
-  if (feed_env != NULL ? atoi(feed_env) != 0 : HTP_MOE_GEMV_FEED_DEFAULT != 0u)
+  if (feed)
     flags |= HTP_MOE_FLAG_GEMV_FEED;
   return flags;
 }

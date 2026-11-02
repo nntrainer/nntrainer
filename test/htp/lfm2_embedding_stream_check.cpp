@@ -6,6 +6,7 @@
  * @bug No known bugs except for NYI items
  */
 #include <embedding_layer.h>
+#include <htp_runtime_config.h>
 #include <layer_context.h>
 #include <thread_manager.h>
 #include <var_grad.h>
@@ -124,7 +125,9 @@ int main() {
   int write_fd = -1, read_fd = -1;
   std::string save_path;
   try {
-    setenv("NNTR_HTP_PAGE_CACHE", "0", 1);
+    nntrainer::HtpRuntimeConfig config;
+    config.htp.page_cache = 0;
+    nntrainer::configureHtpRuntime(config);
     nntrainer::ThreadManagerConfig threads;
     threads.compute_threads = 4;
     threads.enable_affinity = false;

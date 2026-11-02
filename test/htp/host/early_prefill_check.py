@@ -48,7 +48,7 @@ def function(text, start):
 
 
 helper_start = source_text.index('using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;')
-helper_end = source_text.index('/**\n * @brief NNTR_MOE_TRACE')
+helper_end = source_text.index('/** Routing trace:')
 helper = source_text[helper_start:helper_end]
 helper += "\n" + function(source_text, "static void preloadNativeExpertBatch(")
 first_start = source_text.index('    auto take_batch = [&] {')
@@ -110,6 +110,7 @@ ComputeOps *current_ops;
 ComputeOps *get_htp_ops() { return current_ops; }
 }
 #include <htp_backend/htp_expert_pool.h>
+#include <htp_backend/htp_runtime_config.h>
 namespace causallm {
 '''
 
@@ -639,7 +640,7 @@ void checkModelHook() {
   {
     Fake a;
     seed(a);
-    unsetenv(ENV_NAME);
+    nntrainer::resetHtpRuntimeConfig();
     Model model;
     model.beginRun();
     model.beforePrefillBlock(0, 1024);
@@ -648,7 +649,9 @@ void checkModelHook() {
   {
     Fake a;
     seed(a);
-    setenv(ENV_NAME, "0", 1);
+    nntrainer::HtpRuntimeConfig config;
+    config.moe.lfm2_prefill_early = false;
+    nntrainer::configureHtpRuntime(config);
     Model model;
     model.beginRun();
     model.beforePrefillBlock(0, 1024);
@@ -657,7 +660,9 @@ void checkModelHook() {
   {
     Fake a;
     seed(a);
-    setenv(ENV_NAME, "1", 1);
+    nntrainer::HtpRuntimeConfig config;
+    config.moe.lfm2_prefill_early = true;
+    nntrainer::configureHtpRuntime(config);
     Model model;
     model.beginRun();
     model.beforePrefillBlock(0, 1);
@@ -808,13 +813,13 @@ model_stub = model_stub.replace('MODEL_NAME', model_name)
 model_stub = model_stub.replace('RUN_ENTRY', run_entry)
 checks = checks.replace('EXTRA_MODEL_GUARDS', restart_checks)
 checks = checks.replace('BEGIN', 'beginLfm2HtpExpertPrefill')
-checks = checks.replace('ENV_NAME', '"NNTR_LFM2_PREFILL_EARLY"')
 source = (header + config + helper + fixture + collect + stage + queue + tail +
           model_stub + hook + arrays + checks)
 compiler = os.environ.get('CXX', 'g++')
 flags = ['-std=c++17', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
          '-I' + str(root / 'nntrainer/tensor'),
-         '-I' + str(root / 'nntrainer/tensor/cpu_backend')]
+         '-I' + str(root / 'nntrainer/tensor/cpu_backend'),
+         '-I' + str(root / 'nntrainer/tensor/htp_backend')]
 if args.sanitize:
     flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 with tempfile.TemporaryDirectory(prefix='nntr-early-prefill-') as temporary:
@@ -823,13 +828,10 @@ with tempfile.TemporaryDirectory(prefix='nntr-early-prefill-') as temporary:
     cpp = directory / 'early_prefill_check.cpp'
     binary = directory / 'early_prefill_check'
     cpp.write_text(source)
-    subprocess.run([compiler, *flags, str(cpp), '-o', str(binary)], check=True)
+    subprocess.run([compiler, *flags, str(cpp),
+                    str(root / 'nntrainer/tensor/htp_backend/htp_runtime_config.cpp'),
+                    '-o', str(binary)], check=True)
     command = [str(binary), str(args.routes.resolve())]
     if args.decode_routes:
         command.append(str(args.decode_routes.resolve()))
-    env = dict(os.environ)
-    # Match the measured full-horizon default; run cache-policy sweeps by
-    # explicitly setting NNTR_MOE_LRFU in the parent environment.
-    env.pop('NNTR_MOE_PREFETCH', None)
-    env.pop('NNTR_MOE_SPLIT', None)
-    subprocess.run(command, env=env, check=True)
+    subprocess.run(command, check=True)

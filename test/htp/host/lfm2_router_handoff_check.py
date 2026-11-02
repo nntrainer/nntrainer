@@ -66,7 +66,7 @@ for name, (begin, write) in writer_anchors.items():
     guard = '    htp_router_handoff_invalidate(&router_handoff_);'
     assert guard in section[start:], name
     parts[name + '.inc'] = section[start:section.index(guard, start) + len(guard)]
-parts['select.inc'] = block(sources['arm'], '    HtpRpcBuffer &act_stage =\n      via_dspq', '    // NNTR_HTP_MOE_DEBUG=1')
+parts['select.inc'] = block(sources['arm'], '    HtpRpcBuffer &act_stage =\n      via_dspq', '    // moe.debug=')
 parts['wire.inc'] = block(sources['arm'], '                        handoff_plain && rep == 0', ',\n                        h_gu.data()').strip()
 for method in ['beginPrompt', 'releasePrefillStaging']:
     s = body(sources['staging' if method == 'releasePrefillStaging' else 'arm'], '  void ' + method + '()')
@@ -130,6 +130,8 @@ binpath = a.output / 'router_handoff_check'
 cmd = [a.cxx, '-std=c++17', '-O1', '-g', '-Wall', '-Wextra',
        '-Wno-unused-variable', '-Wno-unused-parameter', '-Wno-unused-but-set-variable', '-pthread',
        '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I' + str(a.output),
+       '-I' + str(a.repo / 'nntrainer/tensor/htp_backend'),
+       str(a.repo / 'nntrainer/tensor/htp_backend/htp_runtime_config.cpp'),
        str(a.output / fixture.name), '-o', str(binpath)]
 manifest = {
     'source_sha256': {paths[k]: hashlib.sha256(v.encode()).hexdigest() for k, v in original_sources.items()},

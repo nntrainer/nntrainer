@@ -7,6 +7,7 @@
  */
 #ifndef NNTR_HTP_STAGING_H
 #define NNTR_HTP_STAGING_H
+#include "htp_runtime_config.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -35,7 +36,7 @@ public:
    *  (htp_rpcmem.h's own doc comment; measured at ~155 MB/s vs ION's
    *  44.6 GB/s, docs/htp_attention/34_fc_measured.md section4 item F). The
    *  memcpy this adds is the trade: cheap relative to a per-call pin+map,
-   *  but that trade is exactly what NNTR_HTP_PROFILE's transport column is
+   *  but that trade is exactly what htp.profile's transport column is
    *  for confirming on device -- do not assume the win without it. */
   static void ensureCapacity(std::unique_ptr<Buffer> &buf, size_t bytes) {
     if (!buf || buf->size() < bytes) {
@@ -217,7 +218,7 @@ public:
     // buffer of): from where the bytes really are -- a tensor a call kept
     // (copyOutOf's to_host false) has only its windows on the host.
     const void *from_buf = trueSource(src, bytes);
-    static const bool stage_debug = std::getenv("NNTR_HTP_STAGE_DEBUG");
+    const bool stage_debug = htpRuntimeConfig().htp.stage_debug;
     if (stage_debug && from_buf == src) {
       // a host range that a kept record covers, whose buffer no longer
       // matches: the host bytes are the stale windows-only copy
@@ -286,7 +287,7 @@ public:
         throw std::runtime_error(
           "HTP stage: host read (line " + std::to_string(line) +
           ") of a kept tensor whose staging buffer was reused; "
-          "NNTR_HTP_KEEP_OUT=0 copies every output to the host");
+          "htp.keep_out=0 copies every output to the host");
     }
   }
   /** @brief Where [src, src + bytes) really is: inside a staging buffer
@@ -336,19 +337,16 @@ public:
    *  CPU layer writes at that address still fails the check and is copied.
    *  A host READER of this tensor sees stale bytes between the windows: the
    *  builder sets the flag only where every consumer runs here, the layers'
-   *  CPU fallbacks call sync_to_host first, and NNTR_HTP_PROFILE >= 2 (its
+   *  CPU fallbacks call sync_to_host first, and htp.profile >= 2 (its
    *  host norms read these tensors) copies in full. */
   void copyOutOf(StagingPool &pool, void *dst, size_t bytes,
                  bool to_host = true, int line = __builtin_LINE()) {
     const size_t cls = stageClass(bytes);
     const void *buf = pool.by_class[cls]->data();
     forgetIonAliases(dst, buf, bytes);
-    // NNTR_HTP_KEEP_OUT=0: every output copied to the host whole (a
+    // htp.keep_out=0: every output copied to the host whole (a
     // reference for the kept path; never set in a tok/s run)
-    static const bool keep_off = [] {
-      const char *v = std::getenv("NNTR_HTP_KEEP_OUT");
-      return v != nullptr && std::strcmp(v, "0") == 0;
-    }();
+    const bool keep_off = !htpRuntimeConfig().htp.keep_out;
     bool kept = !to_host && !keep_off && Transfer::profileLevel() < 2;
     if (kept) {
       sampledCopy(dst, buf, bytes);

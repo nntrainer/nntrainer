@@ -1342,8 +1342,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
         throw std::invalid_argument(
           "LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack");
       fix_paths(nntr_cfg, abs_model_dir);
-      h.htp_runtime =
-        std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);
+      causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, abs_model_dir);
+      h.htp_runtime = std::make_unique<quick_dot_ai::HtpModelRuntime>(
+        native_lib_dir, causallm::normalizeHtpRuntimeConfig(nntr_cfg));
 #endif
     }
     const bool htp_model = input_name_upper == "GEMMA4-26B-A4B-HTP";
@@ -1383,8 +1384,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
         throw std::invalid_argument(
           "Unsupported Gemma4 HTP pack or KV snapshot option");
       fix_paths(nntr_cfg, abs_model_dir);
-      h.htp_runtime =
-        std::make_unique<quick_dot_ai::HtpModelRuntime>(native_lib_dir);
+      causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, abs_model_dir);
+      h.htp_runtime = std::make_unique<quick_dot_ai::HtpModelRuntime>(
+        native_lib_dir, causallm::normalizeHtpRuntimeConfig(nntr_cfg));
 #endif
     }
 

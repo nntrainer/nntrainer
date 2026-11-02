@@ -25,25 +25,18 @@ using nntrainer::ExpertLru;
 
 TEST(ExpertPreload, BudgetDoesNotChangeCacheCapacity_p) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 480);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), nullptr), 128u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(0, nullptr), 0u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(64, nullptr), 64u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(128, nullptr), 128u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), "0"), 0u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), "64"), 64u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), "128"), 128u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), "480"), 480u);
-  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), "999"), 480u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity()), 128u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(0), 0u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(64), 64u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(128), 128u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), 0u), 0u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), 64u), 64u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), 128u), 128u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), 480u), 480u);
+  EXPECT_EQ(nntrainer::expertPreloadLimit(lru.capacity(), 999u), 480u);
   EXPECT_EQ(lru.capacity(), 480u);
-}
-
-TEST(ExpertPreload, RejectsMalformedBudget_n) {
-  for (const char *bad : {"", "-1", "+1", "1x", " 1", "1 ", "1.5", "0x80",
-                          "184467440737095516160"})
-    EXPECT_THROW(nntrainer::expertPreloadLimit(480, bad),
-                 std::invalid_argument);
 }
 
 /** Keys are opaque addresses; these are as good as any. */
@@ -70,7 +63,7 @@ static std::vector<int> ids(const std::vector<ExpertLru::Key> &keys) {
 
 TEST(ExpertLru, CapacityIsPerLayerTimesLayersAndIdempotentPerLayer) {
   ExpertLru lru;
-  int a, b;
+  int a = 0, b = 0;
   lru.addLayer(&a, 2);
   lru.addLayer(&b, 2);
   lru.addLayer(&a, 2); // a second finalize of the same layer adds nothing
@@ -79,7 +72,7 @@ TEST(ExpertLru, CapacityIsPerLayerTimesLayersAndIdempotentPerLayer) {
 
 TEST(ExpertLru, MissesLoadHitsDoNot) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 4);
   Recorder r;
   EXPECT_EQ(lru.acquire({key(0), key(1)}, r.load, r.evict), 2u);
@@ -93,7 +86,7 @@ TEST(ExpertLru, MissesLoadHitsDoNot) {
 
 TEST(ExpertLru, ResetAllowsAnUnloadedModelToReuseLayerAndExpertAddresses) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   Recorder first;
   lru.addLayer(&layer, 4);
   lru.setLrfu(8);
@@ -117,7 +110,7 @@ TEST(ExpertLru, ResetAllowsAnUnloadedModelToReuseLayerAndExpertAddresses) {
 
 TEST(ExpertLru, EvictsLeastRecentlyUsedNeverThisCallsExperts) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 3);
   Recorder r;
   lru.acquire({key(0), key(1), key(2)}, r.load, r.evict); // order 0 1 2
@@ -133,7 +126,7 @@ TEST(ExpertLru, EvictsLeastRecentlyUsedNeverThisCallsExperts) {
 TEST(ExpertLru, EvictionsPrecedeLoads) {
   // A slot has to be free before its replacement is read into it.
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 1);
   std::vector<std::string> trace;
   auto load = [&](ExpertLru::Key) { trace.push_back("load"); };
@@ -145,7 +138,7 @@ TEST(ExpertLru, EvictionsPrecedeLoads) {
 
 TEST(ExpertLru, RefusesAWorkingSetLargerThanThePool) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 2);
   Recorder r;
   EXPECT_THROW(lru.acquire({key(0), key(1), key(2)}, r.load, r.evict),
@@ -155,7 +148,7 @@ TEST(ExpertLru, RefusesAWorkingSetLargerThanThePool) {
 
 TEST(ExpertLru, RefreshMovesResidentKeysToTheBackInOrder) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 4);
   Recorder r;
   lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
@@ -169,7 +162,7 @@ TEST(ExpertLru, RefreshMovesResidentKeysToTheBackInOrder) {
 
 TEST(ExpertLru, MakeRoomEvictsOldestUnpinnedUntilNFit) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 5);
   Recorder r;
   lru.acquire({key(0), key(1), key(2), key(3), key(4)}, r.load, r.evict);
@@ -188,7 +181,7 @@ TEST(ExpertLru, MakeRoomEvictsOldestUnpinnedUntilNFit) {
 
 TEST(ExpertLru, MakeRoomRefusesWithoutEvictingWhenPinsFillThePool) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 4);
   Recorder r;
   lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
@@ -203,7 +196,7 @@ TEST(ExpertLru, MakeRoomRefusesWithoutEvictingWhenPinsFillThePool) {
 
 TEST(ExpertLru, RoomIsWhatMakeRoomWillGrant) {
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 6);
   Recorder r;
   lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
@@ -220,7 +213,7 @@ TEST(ExpertLru, HeldSlotsAreNotHandedOutUntilUnheld) {
   // Doc 52 section 10.20: read-ahead in flight owns its slots before its
   // keys are in the LRU, so a miss meanwhile must evict instead.
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.addLayer(&layer, 6);
   Recorder r;
   lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
@@ -251,7 +244,7 @@ TEST(ExpertLru, LrfuKeepsTheFrequentKeyWhereLruDropsIt) {
   // half-life) -- tools/moe_expert_cache_sim.py's lrfu on the same calls
   for (const double h : {0.0, 32.0}) {
     ExpertLru lru;
-    int layer;
+    int layer = 0;
     lru.setLrfu(h);
     lru.addLayer(&layer, 2);
     Recorder r;
@@ -261,12 +254,33 @@ TEST(ExpertLru, LrfuKeepsTheFrequentKeyWhereLruDropsIt) {
   }
 }
 
+TEST(ExpertLru, BindsModelConfigAtLayerRegistrationAndAfterReset_p) {
+  nntrainer::resetHtpRuntimeConfig();
+  ExpertLru lru; // HtpContext can construct its pool before model JSON is read.
+  bool first = true;
+  for (double half_life : {0.0, 1000.0, 0.0}) {
+    if (!first)
+      lru.reset(); // Reset also precedes the next model's configuration.
+    first = false;
+    nntrainer::HtpRuntimeConfig config;
+    config.moe.lrfu_half_life = half_life;
+    nntrainer::configureHtpRuntime(config);
+    int layer = 0;
+    lru.addLayer(&layer, 2);
+    Recorder r;
+    for (int e : {0, 0, 0, 1, 2})
+      lru.acquire({key(e)}, r.load, r.evict);
+    EXPECT_EQ(r.evicted, std::vector<int>{half_life == 0 ? 0 : 1});
+  }
+  nntrainer::resetHtpRuntimeConfig();
+}
+
 TEST(ExpertLru, LrfuEvictsSeveralLowestFirstLeastRecentOnATie) {
   // Uses: 0 x3, 1 x1, 2 x2, 3 x1 in a pool of 4. A call that brings three
   // new keys in evicts three: the two single-use keys (a tie: 1 before 3,
   // the least recent first), then 2 -- the order one victim at a time gave.
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.setLrfu(1000.0);
   lru.addLayer(&layer, 4);
   Recorder r;
@@ -281,7 +295,7 @@ TEST(ExpertLru, LrfuForgetsOldUsesWithAShortHalfLife) {
   // A used three times long ago, B four times since: with a half-life of
   // one call A's score has decayed below B's, so C evicts A, not B
   ExpertLru lru;
-  int layer;
+  int layer = 0;
   lru.setLrfu(1.0);
   lru.addLayer(&layer, 2);
   Recorder r;

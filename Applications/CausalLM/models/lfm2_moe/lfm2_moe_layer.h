@@ -207,7 +207,7 @@ private:
    *  streamed from the model file into accelerator-owned slots under an
    *  LRU shared by every MoE layer: set when the layer runs on an
    *  accelerator engine with a nonzero cache share. cache_per_layer is
-   *  this layer's configured share, or htp_fixed::MOE_CACHE_EXPERTS. */
+   *  this layer's configured share, or moe.cache_experts. */
   bool experts_virtual;
   unsigned int cache_per_layer;
   /** This layer's row in the table of virtual
@@ -215,7 +215,7 @@ private:
    *  read the next layer's experts while it runs; -1 until preloaded. */
   int expert_layer_slot;
   /** Ordinal of this MoE layer in finalize order, the layer id written to
-   *  NNTR_MOE_TRACE. */
+   *  moe.trace. */
   unsigned int trace_layer;
 
   // intermediate tensor indices

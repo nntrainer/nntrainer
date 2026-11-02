@@ -33,6 +33,8 @@
 
 namespace nntrainer {
 
+struct HtpRuntimeConfig;
+
 /**
  * @class HtpBackend
  * @brief Process-wide owner of the HTP (HexKL micro-API/FastRPC) session.
@@ -70,8 +72,8 @@ public:
   int qosMode() const { return qos_mode_; }
 
   /**
-   * @brief The poll-QoS window the driver accepted, in us (NNTR_HTP_POLL_US,
-   *        default 5000), or 0 when poll QoS was refused (qosMode() != 2):
+   * @brief The poll-QoS window the driver accepted, in us (default 5000),
+   *        or 0 when poll QoS was refused (qosMode() != 2):
    *        how long a FastRPC call spins before it blocks. The
    *        dspqueue MoE call spins its response wait for the same window.
    */
@@ -118,12 +120,6 @@ public:
     at_close_last_.push_back(std::move(fn));
   }
 
-  /**
-   * @brief Whether decode runs as a resident graph on one cDSP session,
-   *        as configured by htp_fixed_opts.h.
-   */
-  static bool e2eRequested();
-
   ~HtpBackend();
 
   HtpBackend(const HtpBackend &) = delete;
@@ -145,6 +141,7 @@ private:
 
 /** Lifecycle hooks for a single exclusively owned HTP model. */
 void htp_prepare_runtime();
+void htp_prepare_runtime(const HtpRuntimeConfig &config);
 void htp_begin_prompt();
 void htp_stop_workers();
 /** Call only after all model layers and shared KV buffers are destroyed. */

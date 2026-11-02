@@ -13,7 +13,7 @@
 #include <cpu_backend.h>
 #include <cstdlib>
 #include <cstring>
-#include <htp_backend/htp_fixed_opts.h>
+#include <htp_backend/htp_runtime_config.h>
 #include <istream>
 #include <memory>
 #include <nntr_htp_decode_hook.h>
@@ -180,14 +180,14 @@ bool HtpAttentionState::htpDecodeAttention(
     // longer reads them, and htp_owns_cache_ rejects appended prefill.
     // drop_shared leaves non-shared blocks alone.
     auto drop_cpu_cache = [&]() {
-      if (nntrainer::htp_fixed::KV_DROP_CPU && config_.compute_ops_)
+      if (config_.compute_ops_)
         for (nntrainer::Tensor *t : {&ck, &cv})
           config_.compute_ops_->drop_shared(
             t->getDataType() == ml::train::TensorDim::DataType::FP32
               ? static_cast<void *>(t->getData<float>())
               : static_cast<void *>(t->getData<uint16_t>()));
     };
-    // NNTR_HTP_KV_SEED_Q=1 reuses DSP int8 V when the backend permits it.
+    // Reuse DSP int8 V when the configured seed path permits it.
     // K comes from the CPU cache because prefill's per-head scale is too
     // coarse for decode. Widen fp16 rows in parallel when needed.
     auto rows_f32_of = [wk](const nntrainer::Tensor &c, float *dst, size_t m,
@@ -202,10 +202,7 @@ bool HtpAttentionState::htpDecodeAttention(
           dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
       });
     };
-    static const bool seed_q = [] {
-      const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
-      return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
+    const bool seed_q = htpRuntimeConfig().htp.kv_seed_q;
     std::vector<float> k_only;
     if (seed_q && config_.cache_base == 0 && !q_cache_handles.empty() &&
         q_cache_handles[0] >= 0 && q_cache_synced[0] == pos && q2_scales_set[0])
@@ -290,13 +287,7 @@ bool HtpAttentionState::try_accelerated_attention(
   if (!config_.is_causal) {
     return false;
   }
-  // NNTR_HTP_ATTN_F16=0: the CPU computes instead (a reference for the
-  // accelerator's fp16 attention; never set in a tok/s run)
-  static const bool f16_off = [] {
-    const char *v = std::getenv("NNTR_HTP_ATTN_F16");
-    return v != nullptr && std::strcmp(v, "0") == 0;
-  }();
-  if (f16_off) {
+  if (!htpRuntimeConfig().htp.attn_f16) {
     return false;
   }
   AccelF32Io io;
@@ -347,9 +338,6 @@ void HtpAttentionState::registerQuantizedCache(unsigned int cache_rows) {
     return; // The memory profile allocates only the current layer's layout.
   // Arena-backed FC weights leave room to register quantized caches at
   // load, avoiding first-prefill registration. Decode releases these caches.
-  static_assert(nntrainer::htp_fixed::E2E_FREE_KVQ &&
-                  nntrainer::htp_fixed::FC_IN_ARENA,
-                "the lazy registration path assumed the FC set on the heap");
   if (config_.kv_cache_quant_kind < 0 || q_cache_failed ||
       !config_.compute_ops_ || !config_.compute_ops_->supports_kv_cache_q() ||
       !config_.is_causal || !q_cache_handles.empty())
@@ -427,12 +415,7 @@ bool HtpAttentionState::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
 }
 
 void HtpAttentionState::q2_derive_kv() {
-  // NNTR_HTP_Q2_MARGIN=<f>: headroom over the maxima (1.0 = none)
-  static const float margin = [] {
-    const char *v = std::getenv("NNTR_HTP_Q2_MARGIN");
-    const float m = v ? std::strtof(v, nullptr) : 1.0f;
-    return m > 0.0f ? m : 1.0f;
-  }();
+  const float margin = htpRuntimeConfig().htp.q2_margin;
   q2_scale_k.resize(q2_kmax.size());
   q2_scale_v.resize(q2_vmax.size());
   for (size_t i = 0; i < q2_kmax.size(); ++i)
@@ -595,10 +578,9 @@ bool HtpAttentionState::try_quantized_attention(
   // Keep only this layer's temporary quantized layout during prefill. Reusing
   // calibration and resetting the synced row count also supports chunked
   // prefill: the next call rebuilds the layout from that history.
-  const char *seed_q = std::getenv("NNTR_HTP_KV_SEED_Q");
   const bool release_prefill = nntrainer::weightPageCachePolicy() >= 0 &&
                                cache_to - cache_from > 1 &&
-                               !(seed_q && std::strcmp(seed_q, "1") == 0);
+                               !htpRuntimeConfig().htp.kv_seed_q;
   auto release = [release_prefill](HtpAttentionState *layer) {
     if (release_prefill)
       layer->release_quantized_cache();
@@ -660,15 +642,10 @@ bool HtpAttentionState::try_quantized_attention(
   unsigned int &synced = q_cache_synced[batch];
   // int8 with the row-blocked kernel when the backend has it: fixed scales,
   // no softcap, no sinks, config_.head_dim up to 512.
-  // NNTR_HTP_ATTN_Q2=0: the per-row-scale int8 kernel (sdpa_q_kvcache)
-  // instead of the fixed-scale row-blocked one (a precision reference)
-  static const bool q2_off = [] {
-    const char *v = std::getenv("NNTR_HTP_ATTN_Q2");
-    return v != nullptr && std::strcmp(v, "0") == 0;
-  }();
   const bool use_q2 =
     config_.kv_cache_quant_kind == 0 && config_.kv_cache_fixed_scales &&
-    !q2_off && config_.compute_ops_->supports_kv_cache_q2() &&
+    htpRuntimeConfig().htp.attn_q2 &&
+    config_.compute_ops_->supports_kv_cache_q2() &&
     config_.attn_logit_softcapping <= 0.0f && io.sinks == nullptr;
   if (!use_q2 && config_.head_dim > 256) {
     return false;
@@ -713,14 +690,10 @@ bool HtpAttentionState::try_quantized_attention(
     // scales (exact maxima, the same derivation) inside the step itself,
     // so no pass over K / V / Q runs here. The checking paths and the
     // NEON path keep the layer's own calibration.
-    static const bool dsp_calib = [] {
-      const char *v = std::getenv("NNTR_HTP_ATTN_DSP_CALIB");
-      return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
+    const auto &runtime = htpRuntimeConfig().htp;
+    const bool dsp_calib = runtime.attn_dsp_calib;
     if (!q2_calibrated && config_.attn_out_u16 && dsp_calib &&
-        !std::getenv("NNTR_HTP_ATTN_F32_CHECK") &&
-        !(std::getenv("NNTR_HTP_ATTN_F32") &&
-          std::strcmp(std::getenv("NNTR_HTP_ATTN_F32"), "0") == 0)) {
+        !runtime.attn_f32_check.has_value() && runtime.attn_f32) {
       q2_scale_k.assign(config_.num_heads_KV, 0.0f);
       q2_scale_v.assign(
         static_cast<size_t>(config_.num_heads_KV) * config_.head_dim, 0.0f);
@@ -740,7 +713,7 @@ bool HtpAttentionState::try_quantized_attention(
         // for saveQ2Calibration as calibrate_q2_scales keeps its own
         q2_maxima_from_scales();
         q2_keep();
-        if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
+        if (runtime.attn_trace) {
           ml_logi("mha_core trace: q2 calibration on the accelerator rows=%u "
                   "us=%lld",
                   append_rows,
@@ -763,7 +736,7 @@ bool HtpAttentionState::try_quantized_attention(
       const auto t0 = std::chrono::steady_clock::now();
       calibrate_q2_scales(k_base + off, v_base + off, append_rows, width,
                           q_view, q_stride, n_q);
-      if (std::getenv("NNTR_HTP_ATTN_TRACE")) {
+      if (runtime.attn_trace) {
         ml_logi("mha_core trace: q2 calibration rows=%u us=%lld", append_rows,
                 static_cast<long long>(
                   std::chrono::duration_cast<std::chrono::microseconds>(
@@ -778,7 +751,7 @@ bool HtpAttentionState::try_quantized_attention(
       // [0, cache_to) again under the new scales.
       if (append_rows != 0 &&
           q2_grow(k_base + off, v_base + off, append_rows, width)) {
-        if (std::getenv("NNTR_HTP_ATTN_TRACE"))
+        if (runtime.attn_trace)
           ml_logi("mha_core trace: q2 scales grew at rows=%u from=%u; "
                   "re-quantizing %u rows",
                   append_rows, append_row0, cache_to);
@@ -791,9 +764,8 @@ bool HtpAttentionState::try_quantized_attention(
       // Q is not cached: its encoding follows this step's rows
       q2_derive_q(q_view, q_stride, n_q);
     }
-    // NNTR_HTP_ATTN_TRACE: how far this step's rows exceed the fixed int8
-    // scales (rows past the calibration's clip at 127)
-    if (std::getenv("NNTR_HTP_ATTN_TRACE") && append_rows != 0) {
+    // Trace rows that exceed the calibrated int8 range.
+    if (runtime.attn_trace && append_rows != 0) {
       float worst_k = 0.0f, worst_v = 0.0f;
       size_t clip_k = 0, clip_v = 0;
       for (unsigned int r = 0; r < append_rows; ++r) {
@@ -857,16 +829,10 @@ bool HtpAttentionState::try_quantized_attention(
     // No conversions on this thread when the o-proj is on the accelerator
     // too (config_.attn_out_u16): Q goes as the qkv call left it, the u16
     // context stays there for the o-proj. Else NEON on this thread below.
-    // NNTR_HTP_ATTN_F32=0 forces the NEON path; NNTR_HTP_ATTN_F32_CHECK=1
-    // runs both and compares the contexts (the u16 copied back, dequantized
-    // here), =2 runs the accelerator path twice (its own determinism).
-    static const bool f32_check = std::getenv("NNTR_HTP_ATTN_F32_CHECK");
-    static const int f32_check_mode =
-      f32_check ? std::atoi(std::getenv("NNTR_HTP_ATTN_F32_CHECK")) : 0;
-    static const bool f32_off = [] {
-      const char *v = std::getenv("NNTR_HTP_ATTN_F32");
-      return v != nullptr && std::strcmp(v, "0") == 0;
-    }();
+    // Check mode 1 compares with NEON; mode 2 reruns the accelerator.
+    const bool f32_check = runtime.attn_f32_check.has_value();
+    const int f32_check_mode = runtime.attn_f32_check.value_or(0);
+    const bool f32_off = !runtime.attn_f32;
     std::vector<float> q_inv(config_.num_heads_Q);
     for (unsigned int h = 0; h < config_.num_heads_Q; ++h)
       q_inv[h] = 1.0f / q2_q_enc[2 * h];
@@ -883,7 +849,7 @@ bool HtpAttentionState::try_quantized_attention(
         window, io.out, f32_check ? chk16.data() : nullptr, q2_out_enc.data(),
         q_stride);
     bool again = false;
-    if (f32_ran && f32_check && std::getenv("NNTR_HTP_ATTN_TRACE")) {
+    if (f32_ran && f32_check && runtime.attn_trace) {
       // the u16 context's saturation against the fixed output encoding
       size_t sat = 0;
       for (size_t i = 0; i < q_elems; ++i)
@@ -941,7 +907,7 @@ bool HtpAttentionState::try_quantized_attention(
     }
     ts5 = clk::now();
     // Keep both NEON conversions on this thread to avoid scheduling overhead.
-    static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
+    const bool conv_trace = runtime.attn_trace;
     const auto tq0 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q && !again; ++r) {
       const float *qr = q_view + static_cast<size_t>(r) * q_stride;

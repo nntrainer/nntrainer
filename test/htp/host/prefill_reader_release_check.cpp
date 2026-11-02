@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <htp_runtime_config.h>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -67,12 +68,9 @@ struct Fixture : nntrainer::HtpPrefillReaders<int, WorkerPolicy> {
 };
 
 static void enable(bool enabled) {
-#if defined(_WIN32)
-  _putenv_s("NNTR_HTP_RELEASE_PREFILL_READERS", enabled ? "1" : "0");
-#else
-  assert(setenv("NNTR_HTP_RELEASE_PREFILL_READERS", enabled ? "1" : "0", 1) ==
-         0);
-#endif
+  nntrainer::HtpRuntimeConfig config;
+  config.htp.release_prefill_readers = enabled;
+  nntrainer::configureHtpRuntime(config);
 }
 
 int main() {
@@ -99,5 +97,6 @@ int main() {
     assert(destroyed == 2 * (prompt + 1)); // Join includes TLS destruction.
     f.releaseIdlePrefillReaders();         // Safe before destructor and reuse.
   }
+  nntrainer::resetHtpRuntimeConfig();
   std::puts("PREFILL READER IDLE RELEASE / TLS DESTRUCTION / RESTART OK");
 }

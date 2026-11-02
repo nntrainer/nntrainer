@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <htp_backend.h>
+#include <htp_runtime_config.h>
 #include <htp_wh_layout.h>
 
 // Use the actual candidate convolution and arithmetic pragmas.
@@ -78,9 +79,7 @@ void exact(nntrainer::ComputeOps *ops, Weight &weight, unsigned rows) {
   auto to_fd =
     reinterpret_cast<int (*)(void *)>(dlsym(RTLD_DEFAULT, "rpcmem_to_fd"));
   check(to_fd != nullptr, "rpcmem_to_fd unavailable");
-  const bool force_host =
-    std::getenv("NNTR_HTP_QKV_TO_HOST") &&
-    std::strcmp(std::getenv("NNTR_HTP_QKV_TO_HOST"), "1") == 0;
+  const bool force_host = nntrainer::htpRuntimeConfig().htp.qkv_to_host;
   for (unsigned generation = 0; generation < 3; ++generation) {
     for (size_t i = 0; i < input.size(); ++i)
       input[i] = float(int((i * 17u + generation * 41u) % 257u) - 128) /
@@ -128,8 +127,13 @@ void exact(nntrainer::ComputeOps *ops, Weight &weight, unsigned rows) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    check(argc == 1 || (argc == 2 && std::strcmp(argv[1], "--force-host") == 0),
+          "usage: lfm2_conv_ion_projection_check [--force-host]");
+    nntrainer::HtpRuntimeConfig config;
+    config.htp.qkv_to_host = argc == 2;
+    nntrainer::configureHtpRuntime(config);
     check(nntrainer::HtpBackend::global().enabled(), "HTP unavailable");
     auto *ops = nntrainer::get_htp_ops();
     check(ops && ops->supports_gemm_q4_0_batch_norm_fp32() &&

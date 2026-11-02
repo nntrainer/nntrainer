@@ -34,6 +34,7 @@ static std::mutex rope_init_mtx;
 
 #include <fp16_attention.h>
 #include <htp_backend/htp_attention_state.h>
+#include <htp_backend/htp_runtime_config.h>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -812,14 +813,7 @@ void Fp16Attention::one_batch_incremental_forwarding(
                                       cache_row * cache_value_dim.width(),
                                     true);
 
-  // NNTR_HTP_ATTN_TRACE: the host's own share of this node beside the
-  // accelerator call's (htp_compute_ops' attn trace), per step, to logcat.
-  // The profile build counted ~40 ms a sliding layer outside a 40 ms call
-  // at 1023 rows (doc 57 section 9.13).
-  static const bool host_trace = [] {
-    const char *e = std::getenv("NNTR_HTP_ATTN_TRACE");
-    return e && *e && *e != '0';
-  }();
+  const bool host_trace = htpRuntimeConfig().htp.attn_trace;
   auto now_us = [] {
     return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -899,9 +893,8 @@ void Fp16Attention::one_batch_incremental_forwarding(
       query_step, b_cached_key, b_cached_value, attention_output_step,
       cache_from, cache_to, nullptr);
   }
-  // NNTR_HTP_ATTN_F16_CHECK=1: the accelerator's result against the CPU's
-  // from the same Q / K / V, per row (never set in a tok/s run)
-  static const bool f16_check = std::getenv("NNTR_HTP_ATTN_F16_CHECK");
+  // Compare the accelerator and CPU from the same Q/K/V rows.
+  const bool f16_check = htpRuntimeConfig().htp.attn_f16_check;
   std::vector<float> accel_out;
   if (done && f16_check && step_size > 1 &&
       attention_output_step.getDataType() ==

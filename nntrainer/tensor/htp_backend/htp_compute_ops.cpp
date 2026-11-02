@@ -32,7 +32,6 @@
 #include <cpu_ops_table.h>
 #include <htp_arena_size.h>
 #include <htp_backend.h>
-#include <htp_backend/htp_fixed_opts.h>
 #include <htp_context.h>
 #include <htp_decode_runtime.h>
 #include <htp_dspq_wire.h>
@@ -46,6 +45,7 @@
 #include <htp_profile.h>
 #include <htp_router_predict.h>
 #include <htp_rpcmem.h>
+#include <htp_runtime_config.h>
 #include <htp_staging.h>
 #include <htp_static_quant.h>
 #include <htp_token_completion.h>
@@ -107,6 +107,10 @@ namespace nntrainer {
 
 namespace {
 
+constexpr unsigned kMoePoolTarget = 34u;
+constexpr unsigned kPdMapCeilingMib = 3840u;
+constexpr unsigned kPdMapMarginMib = 256u;
+
 /** Q4_0 weights re-quantized by qs4cxFromModelQ4_0 in this process:
  *  the FC WH banner's requant=, 0 when the sidecar served every FC. */
 std::atomic<unsigned> g_q4_requant{0};
@@ -114,10 +118,7 @@ std::atomic<unsigned> g_q4_requant{0};
 /** Diagnostic only. Reader threads collect fixed-size records; the caller
  * prints them after joining a batch, so logging never serializes the I/O. */
 bool prefillIoTraceEnabled() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("NNTR_HTP_PREFILL_IO_TRACE");
-    return v && std::strcmp(v, "0") != 0;
-  }();
+  const bool enabled = htpRuntimeConfig().htp.prefill_io_trace;
   return enabled;
 }
 
@@ -184,30 +185,30 @@ void qs4cxFromModelQ4_0(const void *w, uint32_t K, uint32_t N, int8_t *q,
 }
 
 /**
- * @brief NNTR_L2_CHECK enables diagnostics for non-finite DSP values.
+ * @brief htp.l2_check enables diagnostics for non-finite DSP values.
  * A NaN SwiGLU lane propagates to its row's requantization scale, so
  * checking the padded row scales catches it before later computation.
  */
 inline bool l2CheckEnabled() {
-  static const bool on = std::getenv("NNTR_L2_CHECK") != nullptr;
+  const bool on = htpRuntimeConfig().htp.l2_check;
   return on;
 }
 
-/** @brief NNTR_L2_DIFF: run both MoE FFN paths and report their SNR. See
+/** @brief htp.l2_diff: run both MoE FFN paths and report their SNR. See
  *         HtpComputeOps::l2Diff for what the number separates. */
 inline bool l2DiffEnabled() {
-  static const bool on = std::getenv("NNTR_L2_DIFF") != nullptr;
+  const bool on = htpRuntimeConfig().htp.l2_diff;
   return on;
 }
 
 /**
  * @brief Run the accelerated path, then replace its output with l2Diff's
- *        reference when NNTR_L2_SHADOW is set.
+ *        reference when htp.l2_shadow is set.
  * Both paths still execute, preserving side effects for diagnosis. This
- * also enables the reference computation normally gated by NNTR_L2_DIFF.
+ * also enables the reference computation normally gated by htp.l2_diff.
  */
 inline bool l2ShadowEnabled() {
-  static const bool on = std::getenv("NNTR_L2_SHADOW") != nullptr;
+  const bool on = htpRuntimeConfig().htp.l2_shadow;
   return on;
 }
 
@@ -281,15 +282,12 @@ inline bool tryParallelStagedMemcpy(void *dst, const void *src, size_t bytes,
 namespace {
 
 /**
- * @brief NNTR_HTP_ATTN_TRACE=1 logs every attention call with its host-side
+ * @brief htp.attn_trace=1 logs every attention call with its host-side
  *        wall time and the skel's stats, so a model run shows where a step
  *        spends its time: in the kernel, or around the FastRPC call.
  */
 bool attn_trace_enabled() {
-  static const bool on = [] {
-    const char *e = std::getenv("NNTR_HTP_ATTN_TRACE");
-    return e && *e && *e != '0';
-  }();
+  const bool on = htpRuntimeConfig().htp.attn_trace;
   return on;
 }
 
@@ -337,6 +335,11 @@ struct HtpStagingTransfer {
 
 class HtpComputeOps : public CpuComputeOps {
   HtpExpertPool expert_pool_;
+  std::unique_ptr<std::FILE, HtpExpertPool::FileCloser> route_log_;
+  bool route_log_opened_ = false;
+  unsigned dump_moe_calls_ = 0;
+  unsigned dump_forward_calls_ = 0;
+  unsigned dump_fc_calls_ = 0;
   using Staging = HtpStaging<HtpRpcBuffer, HtpStagingTransfer>;
   using StagingPool = Staging::StagingPool;
   using Held = Staging::Held;
@@ -462,12 +465,9 @@ public:
   // Keep standalone M=1 Q4_0 calls on the CPU; per-FC RPC and weight DMA
   // overhead accumulates across MoE layers. Resident decode uses the graph.
   bool accelerates_q4_0_at_m1() const override { return false; }
-  // Resident decode must use the layers' row hooks to hand inputs to the
-  // token graph. Without E2E, standalone QS4CX rows use the prefill kernel.
-  // This predicate is process-wide; rows outside the graph use CPU fallback.
-  bool accelerates_qs4cx_at_m1() const override {
-    return !HtpBackend::e2eRequested();
-  }
+  // Resident decode uses the layers' row hooks to hand inputs to the token
+  // graph. Standalone QS4CX rows use CPU fallback.
+  bool accelerates_qs4cx_at_m1() const override { return false; }
 
   // matAdata: Q4_0x4-repacked weight bytes, identity-cached across calls --
   // the same pointer for the lifetime of a loaded model (inference does not
@@ -611,12 +611,9 @@ public:
     // once in chunks of its own (fc_rows_a_call), so the activation and
     // the outputs cross once, and the outputs may stay in that one buffer
     // (the reader takes them by host_view).
-    // NNTR_HTP_QKV_TO_HOST=1: the qkv outputs copied to the host whole (a
+    // htp.qkv_to_host=1: the qkv outputs copied to the host whole (a
     // reference for the kept path; never set in a tok/s run)
-    static const bool qkv_to_host = [] {
-      const char *v = std::getenv("NNTR_HTP_QKV_TO_HOST");
-      return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
+    const bool qkv_to_host = htpRuntimeConfig().htp.qkv_to_host;
     norms.to_host =
       out_to_host || qkv_to_host || HtpProfile::global().level() >= 2;
     // The table rows through ION like the activation: a plain host pointer
@@ -835,13 +832,12 @@ public:
       act = dst;
       gamma = nullptr;
     }
-    // NNTR_HTP_ROUTER_U8I8=1: the logits on the HMX (u8 x i8). Off by
+    // moe.router_u8i8=1: the logits on the HMX (u8 x i8). Off by
     // default: on device its logits were up to 0.17-0.39 off the CPU's
     // (the f32 kernel: 2e-5), the per-row u8 step being coarse beside
     // Gemma-4's outlier activations, and the routing that noise changes
     // is not a model's own (doc 57 section 9.33).
-    static const bool router_u8i8 =
-      std::getenv("NNTR_HTP_ROUTER_U8I8") != nullptr;
+    const bool router_u8i8 = htpRuntimeConfig().moe.router_u8i8;
     const uint32_t h8 = router_u8i8 && fixed == weights_.static_quant_.end()
                           ? routerWeightU8i8(session, w, K, E)
                           : UINT32_MAX;
@@ -849,10 +845,8 @@ public:
       h8 != UINT32_MAX
         ? nullptr
         : routerWeightShared(w, static_cast<size_t>(K) * E * sizeof(float));
-    static const bool handoff_enabled = [] {
-      const char *v = std::getenv("NNTR_LFM2_ROUTER_INPUT_HANDOFF");
-      return v && std::strcmp(v, "1") == 0;
-    }();
+    const bool handoff_enabled =
+      htpRuntimeConfig().htp.lfm2_router_input_handoff;
     const uint32_t ticket =
       handoff_enabled && h8 == UINT32_MAX && !gamma && !top_k && E == 64u &&
           htp_router_handoff_shape(M, K) &&
@@ -1267,10 +1261,7 @@ public:
     const void *ion = staging_.ionAlias(host, bytes);
     if (ion)
       return ion;
-    static const bool prefill_views = [] {
-      const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-      return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool prefill_views = htpRuntimeConfig().htp.lfm2_prefill_views;
     if (!prefill_views)
       return host;
     // copyOutOf may retain an entire prefill output without an IonAlias.
@@ -1314,13 +1305,10 @@ public:
     bool u16_in = staging_.attn_out16_.host == act &&
                   staging_.attn_out16_.rows == M &&
                   staging_.attn_out16_.width == K;
-    // NNTR_HTP_OPROJ_U16=0: the u16 context dequantized here into the host
+    // htp.oproj_u16=0: the u16 context dequantized here into the host
     // tensor and staged as f32, instead of the DSP's u16 input path (a
     // reference for that path; never set in a tok/s run)
-    static const bool u16_off = [] {
-      const char *v = std::getenv("NNTR_HTP_OPROJ_U16");
-      return v != nullptr && std::strcmp(v, "0") == 0;
-    }();
+    const bool u16_off = !htpRuntimeConfig().htp.oproj_u16;
     if (u16_in && u16_off) {
       std::lock_guard<std::mutex> lock(invoke_mutex_);
       htp_router_handoff_invalidate(&staging_.router_handoff_);
@@ -1385,11 +1373,11 @@ public:
     staging_.copyOutOf(staging_.out_pool_, out, o_all, out_to_host);
     if (u16_in)
       staging_.attn_out16_.host = nullptr;
-    // NNTR_HTP_DUMP=<dir>: this call's act (the attention's context, as the
+    // htp.dump_dir=<dir>: this call's act (the attention's context, as the
     // host has it), res and out as fc_<call>_{act,res,out}.f32; valid with
-    // NNTR_HTP_KEEP_OUT=0 (and NNTR_HTP_OPROJ_U16=0 for the u16 context)
-    if (const char *dir = std::getenv("NNTR_HTP_DUMP")) {
-      static unsigned int call = 0;
+    // htp.keep_out=0 (and htp.oproj_u16=0 for the u16 context)
+    if (const auto &dir = htpRuntimeConfig().htp.dump_dir; !dir.empty()) {
+      unsigned int &call = dump_fc_calls_;
       char name[32];
       std::snprintf(name, sizeof(name), "/fc_%05u_", call++);
       const std::string base = std::string(dir) + name;
@@ -1502,7 +1490,7 @@ public:
     // Bind MoE handles in graph order, then dispatch M=1 calls through the
     // token entry. Graph errors throw; per-layer fallback would hide them.
     if (!decode_.graph_words_.empty()) {
-      // a virtual expert (NNTR_MOE_CACHE_EXPERTS: a
+      // a virtual expert (moe.cache_experts: a
       // null scale) is resident only until the ARM's LRU evicts it, and
       // the per-token entry would keep reading its handle after that
       if (std::find(gate_up_scale.begin(), gate_up_scale.end(), nullptr) !=
@@ -1512,8 +1500,8 @@ public:
         // token (poolSync); these calls (the prefill's) stay per layer
         if (!e2e_)
           throw std::runtime_error(
-            "NNTR_HTP_FORWARD with NNTR_MOE_CACHE_EXPERTS: the expert pool "
-            "is served only by the E2E token (NNTR_HTP_E2E=1)");
+            "HTP forward with moe.cache_experts: the expert pool "
+            "is served only by the E2E token (resident HTP decode)");
         {
           std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
           // the layers hand their experts at their first calls, in order:
@@ -1588,50 +1576,27 @@ public:
     std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
     uint32_t n_ops, mask, present;
     HtpDecodeRuntime::validate(words, n_ops, mask, present);
-    // NNTR_HTP_FC_FEED=l2 forces L2 scratch; vtcm uses VTCM where it fits.
-    const char *feed_env = std::getenv("NNTR_HTP_FC_FEED");
-    const std::string feed_s = feed_env ? feed_env : "vtcm";
-    if (feed_s != "vtcm" && feed_s != "l2") {
-      throw std::invalid_argument("set_decode_graph_desc: NNTR_HTP_FC_FEED=" +
-                                  feed_s + " (want vtcm or l2)");
-    }
+    const std::string &feed_s = htpRuntimeConfig().htp.fc_feed;
     // E2E keeps every kind resident in one PD, with separate FC arena
     // chunks beside the expert pool.
-    const bool e2e = HtpBackend::e2eRequested();
-    if (e2e) {
-      // Reject obsolete multi-PD settings instead of silently ignoring them.
-      const char *pds = std::getenv("NNTR_HTP_E2E_PDS");
-      if (pds != nullptr && std::strcmp(pds, "1") != 0)
-        throw std::invalid_argument(
-          "NNTR_HTP_E2E_PDS=" + std::string(pds) +
-          ": the two-PD path was removed (#211); one PD is the only E2E "
-          "entry, unset the variable");
-      if (mask != present) {
-        throw std::invalid_argument(
-          "set_decode_graph_desc: NNTR_HTP_E2E=1 needs every kind of the "
-          "list resident");
-      }
-      if (decode_.graph_inited_) {
-        // Replacing a live E2E graph would remap its FC arena.
-        throw std::runtime_error("set_decode_graph_desc: a second "
-                                 "description with NNTR_HTP_E2E=1");
-      }
+    if (mask != present) {
+      throw std::invalid_argument(
+        "set_decode_graph_desc: resident HTP decode needs every kind of the "
+        "list resident");
+    }
+    if (decode_.graph_inited_) {
+      // Replacing a live E2E graph would remap its FC arena.
+      throw std::runtime_error("set_decode_graph_desc: a second "
+                               "description with resident HTP decode");
     }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    if (decode_.graph_inited_) {
-      // A second description in one process (a reload): the skel still
-      // holds the first graph and would refuse the next init.
-      nntr_hvx_graph_release(session);
-      if (decode_.attn_registered_)
-        nntr_hvx_attn_m1_release(session);
-    }
     releaseQ4m1(session);
     decode_.q4_pending_.clear();
     decode_.q4m1_bound_ = false;
     decode_.graph_words_ = words;
-    e2e_ = e2e;
-    if (e2e && !e2e_st_) {
+    e2e_ = true;
+    if (!e2e_st_) {
       e2e_st_ = std::make_shared<E2eState>();
       // every kind, the FC set on its own arena chunks and
       // the expert pool all in S1, one token packet (the FC feed takes
@@ -1640,28 +1605,13 @@ public:
       std::shared_ptr<E2eState> st = e2e_st_;
       HtpBackend::global().atClose([st] { e2eTeardown(*st); });
     }
-    // NNTR_HTP_FC_LANES=<small>,<large>: the L2 feed's
-    // lanes for K <= 2048 / larger K (1..8 each; unset: the DSP's 6 / 3)
-    uint32_t fc_lanes = 0;
-    if (const char *l = std::getenv("NNTR_HTP_FC_LANES")) {
-      unsigned a = 0, b = 0;
-      if (std::sscanf(l, "%u,%u", &a, &b) != 2 || a < 1 || a > 8 || b < 1 ||
-          b > 8)
-        throw std::invalid_argument("NNTR_HTP_FC_LANES=" + std::string(l) +
-                                    " (want <small>,<large>, 1..8 each)");
-      fc_lanes = (a << 8) | (b << 12);
-    }
-    // Only bit 1 (native FC / DENSE_FFN / LM_HEAD) is supported. Unset or
-    // zero selects CPU-exact kernels; reject unknown bits.
-    uint32_t levers = 0;
-    if (const char *l = std::getenv("NNTR_HTP_PPL_LEVERS")) {
-      char *end = nullptr;
-      const unsigned long v = std::strtoul(l, &end, 0);
-      if (end == l || *end != '\0' || (v & ~0x2ul) != 0)
-        throw std::invalid_argument("NNTR_HTP_PPL_LEVERS=" + std::string(l) +
-                                    " (known: 0x2 = L1 native FC)");
-      levers = static_cast<uint32_t>(v);
-    }
+    const auto &htp_config = htpRuntimeConfig().htp;
+    const uint32_t fc_lanes =
+      htp_config.fc_lanes_small || htp_config.fc_lanes_large
+        ? (htp_config.fc_lanes_small.value_or(6u) << 8) |
+            (htp_config.fc_lanes_large.value_or(3u) << 12)
+        : 0u;
+    const uint32_t levers = htp_config.native_fc ? 0x2u : 0u;
     std::fprintf(stderr, "[HTP] ppl levers=0x%x L1=%s\n", levers,
                  (levers & 0x2u) ? "native_fc" : "exact");
     for (uint32_t i = 0; i < n_ops; ++i) {
@@ -1824,10 +1774,10 @@ public:
         for (const ArenaChunk &c : e.arena)
           mapped += c.buf->size();
         throw std::runtime_error(
-          "NNTR_HTP_E2E=1: no room for the FC set beside the resident "
+          "resident HTP decode: no room for the FC set beside the resident "
           "experts (mapped=" +
           std::to_string(mapped >> 20) + " MiB, " + arena_fail_ +
-          "); set NNTR_MOE_CACHE_EXPERTS=<C> (28 on the S25 / S26)");
+          "); set moe.cache_experts=<C> (28 on the S25 / S26)");
       }
       std::memcpy(e.arena[chunk].buf->data() + off, q4m1.data(), bytes);
       decode_.q4m1_left_ =
@@ -1880,7 +1830,7 @@ public:
     // With the FC WH sidecar open, the FC and DENSE_FFN ops bind the
     // handles the prefill registered from it (HTP_GRAPH_FEED_WH): one copy
     // of those weights for both. The tied lm_head stays Q4M1.
-    // Lever L1 (HTP_GRAPH_FEED_NATIVE, NNTR_HTP_PPL_LEVERS=2)
+    // Lever L1 (HTP_GRAPH_FEED_NATIVE, htp.native_fc=true)
     // asks for the native Q4 kernels on every Q4M1 kind: the sidecar's
     // handles then stay out of the decode list.
     bool native = false;
@@ -1963,7 +1913,7 @@ public:
                             decode_.q4_pending_[next].scale != nullptr;
       if (qs4cx_op && native)
         throw std::runtime_error(
-          "set_decode_graph_desc: lever L1 (NNTR_HTP_PPL_LEVERS=2) takes "
+          "set_decode_graph_desc: htp.native_fc requires "
           "Q4_0 weights, op " +
           std::to_string(i) + "'s is QS4CX");
       const bool wh_op = wh || qs4cx_op;
@@ -2511,13 +2461,10 @@ public:
     return true;
   }
 
-  /** NNTR_HTP_KV_SEED_Q=1: attn_m1 is registered lazily and each
+  /** htp.kv_seed_q=1: attn_m1 is registered lazily and each
    *  layer is seeded from its quantized prefill cache on the DSP. */
   static bool kvSeedQ() {
-    static const bool on = [] {
-      const char *v = std::getenv("NNTR_HTP_KV_SEED_Q");
-      return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
+    const bool on = htpRuntimeConfig().htp.kv_seed_q;
     return on;
   }
 
@@ -2617,7 +2564,7 @@ public:
     pool_grow_ = grow;
   }
 
-  /** NNTR_MOE_CACHE_GROW=<n>: once the first token is done
+  /** moe.cache_grow=<n>: once the first token is done
    *  (the prefill's staging released, its quantized KV caches freed), the
    *  pool takes n more experts a layer; the slots are placed as the
    *  misses fill them (place), in the DSP address space those buffers
@@ -2628,25 +2575,24 @@ public:
         pool_descs_[0].empty())
       return;
     unsigned per_layer;
-    if (const char *v = std::getenv("NNTR_MOE_CACHE_GROW")) {
-      per_layer = static_cast<unsigned>(std::atoi(v));
+    if (const auto extra = htpRuntimeConfig().moe.cache_grow) {
+      per_layer = *extra;
     } else {
-      // Built in: towards htp_fixed::MOE_POOL_TARGET a layer, bounded by the
+      // Built in: towards kMoePoolTarget a layer, bounded by the
       // room left under the PD's mapping ceiling (a run past it dies with
       // fastrpc_mmap on a later miss, not here).
       const size_t layers = decode_.moe_ops_.size();
       const size_t have = expert_slots_wanted_ / layers;
-      const unsigned want =
-        have < htp_fixed::MOE_POOL_TARGET
-          ? static_cast<unsigned>(htp_fixed::MOE_POOL_TARGET - have)
-          : 0u;
+      const unsigned want = have < kMoePoolTarget
+                              ? static_cast<unsigned>(kMoePoolTarget - have)
+                              : 0u;
       uint32_t info1[7] = {0};
       nntr_hvx_session_info(e2e_st_->h1, info1, 7);
       size_t mapped = arenaBytes() + (static_cast<size_t>(info1[4]) << 10);
       for (const ArenaChunk &c : e2e_st_->arena)
         mapped += c.buf->size();
-      const size_t ceiling = size_t(htp_fixed::PD_MAP_CEILING_MIB) << 20,
-                   margin = size_t(htp_fixed::PD_MAP_MARGIN_MIB) << 20;
+      const size_t ceiling = size_t(kPdMapCeilingMib) << 20,
+                   margin = size_t(kPdMapMarginMib) << 20;
       const size_t room =
         mapped + margin < ceiling ? ceiling - mapped - margin : 0;
       const size_t slot = expertSlotBytes(pool_descs_[0][0]);
@@ -2655,7 +2601,7 @@ public:
       std::fprintf(stderr,
                    "[HTP] pool: %zu a layer, target %u, mapped %zu MiB, room "
                    "for %zu more a layer\n",
-                   have, htp_fixed::MOE_POOL_TARGET, mapped >> 20, fit);
+                   have, kMoePoolTarget, mapped >> 20, fit);
     }
     if (per_layer == 0u)
       return;
@@ -2681,8 +2627,7 @@ public:
    * Older allocators may reject M_PURGE_ALL; that is a diagnostic no-op. */
   static void purgePrefillHeap() {
 #if defined(__ANDROID__) && __ANDROID_API__ >= 26 && defined(M_PURGE_ALL)
-    const char *purge = std::getenv("NNTR_HTP_PURGE_PREFILL");
-    if (!purge || std::strcmp(purge, "1") != 0)
+    if (!htpRuntimeConfig().htp.purge_prefill)
       return;
     const auto rss_anon_kib = []() -> long long {
       FILE *file = std::fopen("/proc/self/status", "r");
@@ -2780,7 +2725,7 @@ public:
     if (!t1_printed_) {
       t1_printed_ = true;
       size_t left = 0;
-      if (kvSeedQ() && htp_fixed::E2E_FREE_KVQ) {
+      if (kvSeedQ()) {
         // a layer the DSP seed did not take keeps its cache till here
         std::lock_guard<std::mutex> lock(kvq_mutex_);
         left = kvq_handles_.size();
@@ -2920,13 +2865,10 @@ public:
         // Transfer the retired pair to the prepared buffer. The old buffer
         // becomes a spare with no DSP handles. S1 rebinds that pair in its
         // existing miss answer, after evicting its former graph entry.
-        const char *join = std::getenv("NNTR_MOE_PREFETCH_JOIN");
-        static const bool handoff = [] {
-          const char *v = std::getenv("NNTR_LFM2_DECODE_DEMAND_HANDOFF");
-          return v && std::strcmp(v, "1") == 0;
-        }();
+        const bool join = htpRuntimeConfig().moe.prefetch_join;
+        const bool handoff = htpRuntimeConfig().moe.lfm2_decode_demand_handoff;
         for (auto &st : p.pending) {
-          if (!join || std::strcmp(join, "0") != 0)
+          if (join)
             st.prefetch_claimed = pool_prefetch_->claim(
               st.d.key_gu, handoff && weightPageCachePolicy() == 0 &&
                              st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
@@ -3022,33 +2964,33 @@ public:
     return true;
   }
 
-  /** @brief NNTR_HTP_PREDICT: 0 off, 1 the DSP's guess, 2 the ARM's; unset
-   *  is htp_fixed::PREDICT when the routers are Gemma's, else off. */
+  /** Resolve model-dependent defaults after the graph describes its routers. */
   uint32_t predictMode() const {
-    const char *v = std::getenv("NNTR_HTP_PREDICT");
-    if (v == nullptr)
-      return routersSoftmax() ? htp_fixed::PREDICT : 0u;
-    if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0 &&
-        std::strcmp(v, "2") != 0)
-      throw std::runtime_error(std::string("NNTR_HTP_PREDICT=") + v +
-                               ": want 0 (off), 1 (DSP), or 2 (ARM)");
-    return static_cast<uint32_t>(v[0] - '0');
+    const auto &mode = htpRuntimeConfig().moe.prediction;
+    if (mode == "auto")
+      return routersSoftmax() ? 2u : 0u;
+    if (mode == "off")
+      return 0u;
+    return mode == "arm-direct" ? 2u : 1u;
   }
 
-  /** @brief NNTR_MOE_PREFETCH_DIRECT=1: the predicted experts read into
-   *  spare DMA slots; unset follows the ARM prediction (built in). */
   bool directPrefetch() const {
-    const char *v = std::getenv("NNTR_MOE_PREFETCH_DIRECT");
-    return v != nullptr ? std::strcmp(v, "1") == 0 : predictMode() == 2u;
+    const auto &mode = htpRuntimeConfig().moe.prediction;
+    return mode == "arm-direct" || mode == "dsp-direct" ||
+           (mode == "auto" && predictMode() == 2u);
   }
 
   size_t prefetchThreads() const {
-    if (weightPageCachePolicy() >= 0 && !directPrefetch())
-      return 0; // Only DMA-slot prefetch uses the selected bounded reader.
-    const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    if (v != nullptr)
-      return std::strtoul(v, nullptr, 10);
-    return directPrefetch() ? htp_fixed::PREFETCH_READERS : 0u;
+    const auto &config = htpRuntimeConfig().moe;
+    if (predictMode() == 0u)
+      return 0;
+    if (config.decode_prefetch_readers)
+      return *config.decode_prefetch_readers;
+    if (directPrefetch() && weightPageCachePolicy() == 0 &&
+        !pool_descs_.empty() && !pool_descs_[0].empty() &&
+        pool_descs_[0][0].w_bits == HTP_TL2_WEIGHT_BITS)
+      return 2u;
+    return 4u;
   }
 
   /** @brief The hint slot, if S1 posted a newer one this token
@@ -3106,11 +3048,8 @@ public:
     }
     {
       std::lock_guard<std::mutex> lock(weights_.handle_mutex_);
-      // NNTR_MOE_PREFETCH_TOP: only the guess's best n (best first)
-      static const uint32_t top = [] {
-        const char *v = std::getenv("NNTR_MOE_PREFETCH_TOP");
-        return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 16u;
-      }();
+      // moe.prefetch_top: only the guess's best n (best first)
+      const uint32_t top = htpRuntimeConfig().moe.prefetch_top.value_or(16u);
       for (uint32_t i = 0; i < std::min(h.n, top); ++i)
         if (h.ids[i] < d.size() && experts_.count(d[h.ids[i]].key_gu) == 0 &&
             pf_issued_keys_.insert(d[h.ids[i]].key_gu).second)
@@ -3164,10 +3103,7 @@ public:
 
   /** @brief A completion hint is optional: older skeletons leave it zero. */
   static bool serverDoneEnabled() {
-    static const bool enabled = [] {
-      const char *v = std::getenv("NNTR_MOE_SERVER_DONE");
-      return v && std::strcmp(v, "1") == 0;
-    }();
+    const bool enabled = htpRuntimeConfig().moe.server_done;
     return enabled;
   }
 
@@ -3200,7 +3136,7 @@ public:
         poll_state.begin(tok);
       }
       // The graph and prefetch configuration are fixed for this token.
-      // Resolving them on every mailbox poll repeats getenv and walks all
+      // Resolving them on every mailbox poll walks all
       // router nodes while no request is available.
       const bool hints = prefetchThreads() != 0;
       uint32_t hint_seq = tok * 256u; // the last hint taken
@@ -3294,17 +3230,20 @@ public:
     }
     poolHarvest(e2e_st_->mbox->data());
   }
-  /** NNTR_HTP_ROUTE_LOG=<path>: each token's routed sets, one line
-   *  per MoE op in NNTR_MOE_TRACE's format ("<op> 1 | <ids> |"), so
+  /** moe.route_log=<path>: each token's routed sets, one line
+   *  per MoE op in moe.trace's format ("<op> 1 | <ids> |"), so
    *  tools/moe_expert_cache_sim.py replays the one-PD token's routing.
-   *  Under NNTR_HTP_PREDICT=1 the third field is the previous
+   *  With DSP prediction the third field is the previous
    *  router op's guess at this op's ids, best first (the sim's --predict
    *  trace). */
-  static void routeLog(const htp_dspq_token_resp &s1r) {
-    static std::FILE *f = [] {
-      const char *path = std::getenv("NNTR_HTP_ROUTE_LOG");
-      return path != nullptr && *path != '\0' ? std::fopen(path, "w") : nullptr;
-    }();
+  void routeLog(const htp_dspq_token_resp &s1r) {
+    if (!route_log_opened_) {
+      const auto &path = htpRuntimeConfig().moe.route_log;
+      if (!path.empty())
+        route_log_.reset(std::fopen(path.c_str(), "w"));
+      route_log_opened_ = true;
+    }
+    std::FILE *f = route_log_.get();
     if (f == nullptr)
       return;
     const uint32_t pred_n =
@@ -3450,8 +3389,8 @@ public:
                    "router static quantization");
         }
       }
-      // NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
-      // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
+      // Enable the configured next-layer predictor. DSP guesses can also
+      // be logged through moe.route_log.
       if (const uint32_t on = predictMode()) {
         if (on == 2u && (!directPrefetch() || !prefetchThreads()))
           throw std::invalid_argument(
@@ -3463,14 +3402,9 @@ public:
       }
       // A miss round runs the layer's dense branch while the ARM
       // reads: the same ops on the same input, earlier, in time the DSP
-      // spent waiting. On unless NNTR_HTP_DENSE_EARLY=0.
+      // spent waiting. On unless htp.dense_early=0.
       {
-        const char *v = std::getenv("NNTR_HTP_DENSE_EARLY");
-        if (v != nullptr && std::strcmp(v, "0") != 0 &&
-            std::strcmp(v, "1") != 0)
-          throw std::runtime_error(std::string("NNTR_HTP_DENSE_EARLY=") + v +
-                                   ": want 0 or 1");
-        const uint32_t on = v == nullptr || v[0] == '1' ? 1u : 0u;
+        const uint32_t on = htpRuntimeConfig().htp.dense_early ? 1u : 0u;
         float word;
         std::memcpy(&word, &on, sizeof(word));
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_DENSE_EARLY, &word,
@@ -3499,8 +3433,7 @@ public:
       return;
     // Release quantized prefill caches before allocating the decode cache.
     // With kvSeedQ(), each layer releases its cache after seeding instead.
-    if (e2e_ && htp_fixed::E2E_FREE_KVQ &&
-        !kvSeedQ()) { // the seeds free them one layer at a time
+    if (e2e_ && !kvSeedQ()) { // the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
         nntr_hvx_kv_release_q(session, h);
@@ -3530,14 +3463,10 @@ public:
           : decode_.graph_words_[6];
       // The fixed int8-cache policy uses scales from the prefill seed:
       // 1 selects the first cache shape, 2 selects both shapes.
-      constexpr int q8_knob = htp_fixed::ATTN_M1_Q8; // built in: 2
-      const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
-      // NNTR_HTP_ATTN_M1_FAST=1: the integer forward over the
+      constexpr bool q8 = true;
+      // htp.attn_m1_fast=1: the integer forward over the
       // int8 cache (HVX_ATTN_M1_FAST; not bit-identical to the CPU)
-      static const bool fast_knob = [] {
-        const char *v = std::getenv("NNTR_HTP_ATTN_M1_FAST");
-        return v != nullptr && std::atoi(v) != 0;
-      }();
+      const bool fast_knob = htpRuntimeConfig().htp.attn_m1_fast;
       const bool fast = q8 && fast_knob;
       // lazy: a layer's cache comes at its seed, after the layer
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
@@ -3561,56 +3490,38 @@ public:
     }
   }
 
-  /** Send session options once. GEMV is enabled unless NNTR_MOE_HTP_M1_GEMV
-   *  is zero. Rejected or mismatched options throw to prevent silent kernel
-   *  changes; an older skel may continue only when GEMV is explicitly off
-   *  and no additional required options are requested. */
+  /** Send the configured session options once. Rejected or mismatched options
+   * throw to prevent silent kernel changes; an older skel may continue only
+   * when GEMV is explicitly off and no additional required options are
+   * requested. */
   void sendMoeOptsOnce(remote_handle64 session) {
     std::call_once(moe_opts_once_, [this, session]() {
       std::lock_guard<std::mutex> lock(moe_opts_mutex_);
       moeOptsSent().store(true);
-      const char *env = std::getenv("NNTR_MOE_HTP_M1_GEMV");
-      const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
-      const char *rows1_env = std::getenv("NNTR_MOE_HTP_GEMV_ROWS1");
-      const char *feed_env = std::getenv("NNTR_MOE_HTP_GEMV_FEED");
-      // Reject invalid queue counts instead of silently using the default.
-      const char *queues_env = std::getenv("NNTR_MOE_DMA_QUEUES");
+      const auto &config = htpRuntimeConfig().moe;
       uint32_t queue_bits = 0;
-      static_assert(htp_fixed::MOE_DMA_QUEUES >= 1u &&
-                      htp_fixed::MOE_DMA_QUEUES <= 4u,
-                    "the feed splits a matrix over 1..4 queues");
-      const char queues_fixed[] = {
-        static_cast<char>('0' + htp_fixed::MOE_DMA_QUEUES), '\0'};
-      if (htp_moe_opts_dma_queues(queues_env ? queues_env : queues_fixed,
-                                  &queue_bits) != 0) {
-        throw std::runtime_error(std::string("NNTR_MOE_DMA_QUEUES=") +
-                                 queues_env +
-                                 " is not one of 1, 2, 3, 4 (unset = 1)");
-      }
-      const char *had_env = std::getenv("NNTR_MOE_HADAMARD");
-      const char *had_scope = std::getenv("NNTR_MOE_HADAMARD_SCOPE");
-      if (!had_env)
-        had_env = moe_hadamard_.c_str();
-      if (!had_scope)
-        had_scope = moe_hadamard_scope_.c_str();
+      if (htp_moe_opts_dma_queues(config.dma_queues, &queue_bits) != 0)
+        throw std::logic_error("Invalid validated MoE DMA queue count");
+      const std::string &had_mode =
+        config.hadamard ? *config.hadamard : moe_hadamard_;
+      const std::string &had_scope_value =
+        config.hadamard_scope ? *config.hadamard_scope : moe_hadamard_scope_;
+      const char *had_env = had_mode.c_str();
+      const char *had_scope = had_scope_value.c_str();
       uint32_t had_scope_bits = 0;
       if (htp_moe_opts_hadamard_scope(had_scope, &had_scope_bits) != 0)
-        throw std::runtime_error(std::string("NNTR_MOE_HADAMARD_SCOPE=") +
-                                 had_scope + " is not 2bit or all");
+        throw std::invalid_argument("moe.hadamard_scope must be 2bit or all");
       uint32_t had_bits = 0;
-      if (htp_moe_opts_hadamard(had_env, &had_bits) != 0) {
-        throw std::runtime_error(
-          std::string("NNTR_MOE_HADAMARD=") + had_env +
-          " is not off, up, down, both, both_scalar, up_hmx, "
-          "down_hmx, both_hmx, both_paley");
-      }
+      if (htp_moe_opts_hadamard(had_env, &had_bits) != 0)
+        throw std::invalid_argument("Invalid moe.hadamard mode");
       if (had_bits)
         had_bits |= had_scope_bits;
       const uint32_t flags =
-        htp_moe_opts_flags(env, lead_env, rows1_env, feed_env) |
-        htp_moe_opts_dma_bypass(std::getenv("NNTR_MOE_DMA_BYPASS")) |
-        queue_bits | had_bits | (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
-      const char *source = env != nullptr ? "env" : "default";
+        htp_moe_opts_flags(config.m1_gemv, config.gemv_lead_kb,
+                           config.gemv_rows1, config.gemv_feed) |
+        htp_moe_opts_dma_bypass(config.dma_bypass) | queue_bits | had_bits |
+        (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
+      const char *source = "config";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
       if (htp_moe_opts_must_match(flags) == HTP_MOE_FLAG_M1_GEMV &&
@@ -3641,8 +3552,7 @@ public:
           "nntrainer/tensor/htp_backend/dsp/build.sh and "
           "check FP16 HMX support when requesting *_hmx)");
       }
-      // Report the echoed configuration; source describes only the GEMV
-      // switch, while each tuning field has its own environment override.
+      // Report the configuration echoed by the DSP.
       std::fprintf(
         stderr,
         "[HTP] moe m1 gemv: %s (applied=0x%x) lead=%uKB rows1=%u "
@@ -4079,8 +3989,8 @@ public:
   /**
    * @brief Compare the accelerated FFN against two reference FC calls and
    *        deterministic host SwiGLU, using this model's actual inputs.
-   * Reports SNR and quantization differences. Enabled by NNTR_L2_DIFF or
-   * NNTR_L2_SHADOW; allocates heap scratch and adds reference RPCs.
+   * Reports SNR and quantization differences. Enabled by htp.l2_diff or
+   * htp.l2_shadow; allocates heap scratch and adds reference RPCs.
    */
   void l2Diff(remote_handle64 session, uint32_t h_gu, uint32_t h_dn,
               const float *matBdata, float *got, unsigned int M, unsigned int K,
@@ -4276,7 +4186,7 @@ public:
 private:
   /** @brief The one FastRPC layer call both accelerated entries make.
    *
-   *  Under NNTR_HTP_PROFILE >= 2 it goes through mm_u8i4_layer_timed so the
+   *  Under htp.profile >= 2 it goes through mm_u8i4_layer_timed so the
    *  DSP's own microseconds come back alongside the host wall clock; the
    *  difference between the two is the FastRPC transport. The production
    *  path (profile off) still calls the untimed entry, which is why the
@@ -4371,10 +4281,7 @@ private:
              " handles=" + std::to_string(num_handles) + ")";
     };
 
-    static const bool parallel_stage = [] {
-      const char *e = std::getenv("NNTR_LFM2_PARALLEL_STAGE");
-      return e && std::strcmp(e, "1") == 0;
-    }();
+    const bool parallel_stage = htpRuntimeConfig().htp.lfm2_parallel_stage;
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     float *act_f32 = reinterpret_cast<float *>(
       staging_
@@ -4643,33 +4550,31 @@ private:
     profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
-  /** @brief NNTR_HTP_DUMP=<dir>: every MoE call's input (M x K f32)
+  /** @brief htp.dump_dir=<dir>: every MoE call's input (M x K f32)
    *  and output (M x N_out f32) as <dir>/moe_<call>_in.f32 / _out.f32, in
    *  call order, plus one line per call in <dir>/manifest.txt
    *  (name entry M K inter N_out kind r=<row_count per expert>, the
    *  routing the ARM handed the call -- so the comparator can
-   *  tell a top-k flip at a near-tie from a fault). Read once, off unless the
-   *  variable is set: with it unset this is one static load and a branch
-   *  per call. tools/htp/htp_dump_eval.py compares two such directories;
+   *  tell a top-k flip at a near-tie from a fault). Disabled when the output
+   *  directory is empty. tools/htp/htp_dump_eval.py compares two directories;
    *  the first file that differs names the call, which is where a _det is
    *  missing (plan 84 section 3.1). Never in a tok/s run: 16 KiB of file
    *  I/O per call. Callers hold invoke_mutex_, so the counter is plain. */
-  static void dumpMoeCall(const char *entry, const float *act, size_t act_n,
-                          const float *out, size_t out_n, unsigned int M,
-                          unsigned int K, unsigned int inter,
-                          unsigned int N_out, int kind,
-                          const std::vector<unsigned int> &row_count) {
-    static const char *dir = std::getenv("NNTR_HTP_DUMP");
-    if (dir == nullptr)
+  void dumpMoeCall(const char *entry, const float *act, size_t act_n,
+                   const float *out, size_t out_n, unsigned int M,
+                   unsigned int K, unsigned int inter, unsigned int N_out,
+                   int kind, const std::vector<unsigned int> &row_count) {
+    const auto &dir = htpRuntimeConfig().htp.dump_dir;
+    if (dir.empty())
       return;
-    static unsigned int call = 0;
+    unsigned int &call = dump_moe_calls_;
     char name[32];
     std::snprintf(name, sizeof(name), "moe_%05u", call);
     const std::string base = std::string(dir) + "/" + name;
     const auto write = [&](const std::string &path, const float *p, size_t n) {
       FILE *f = std::fopen(path.c_str(), "wb");
       if (f == nullptr || std::fwrite(p, sizeof(float), n, f) != n)
-        throw std::runtime_error("NNTR_HTP_DUMP: cannot write " + path);
+        throw std::runtime_error("htp.dump_dir: cannot write " + path);
       std::fclose(f);
     };
     write(base + "_in.f32", act, act_n);
@@ -4679,7 +4584,7 @@ private:
     FILE *m = std::fopen((std::string(dir) + "/manifest.txt").c_str(),
                          call == 0 ? "w" : "a");
     if (m == nullptr)
-      throw std::runtime_error("NNTR_HTP_DUMP: cannot write the manifest");
+      throw std::runtime_error("htp.dump_dir: cannot write the manifest");
     ++call;
     std::fprintf(m, "%s %s %u %u %u %u %d r=", name, entry, M, K, inter, N_out,
                  kind);
@@ -4689,7 +4594,7 @@ private:
     std::fclose(m);
   }
 
-  /** @brief NNTR_HTP_DUMP_ALL=1 (next to NNTR_HTP_DUMP=<dir>): what
+  /** @brief htp.dump_all=1 (next to htp.dump_dir=<dir>): what
    *  the ARM side hands the DSP between and inside the per-token
    *  stretches, all of it -- every stretch's input / output as
    *  <dir>/fwd_<call>_<kinds>_{in,out}.f32 with one line per call in
@@ -4701,15 +4606,14 @@ private:
    *  graph_host_check's emulation and names the first stretch whose
    *  device output leaves it (plan 136 section 3.2). Never in a tok/s run. */
   static const char *dumpAllDir() {
-    static const char *dir = std::getenv("NNTR_HTP_DUMP_ALL") != nullptr
-                               ? std::getenv("NNTR_HTP_DUMP")
-                               : nullptr;
-    return dir;
+    const auto &config = htpRuntimeConfig().htp;
+    return config.dump_all && !config.dump_dir.empty() ? config.dump_dir.c_str()
+                                                       : nullptr;
   }
   static void dumpAllFile(const std::string &path, const float *p, size_t n) {
     FILE *f = std::fopen(path.c_str(), "wb");
     if (f == nullptr || std::fwrite(p, sizeof(float), n, f) != n)
-      throw std::runtime_error("NNTR_HTP_DUMP_ALL: cannot write " + path);
+      throw std::runtime_error("htp.dump_all: cannot write " + path);
     std::fclose(f);
   }
   void dumpForwardCall(uint32_t op, uint32_t resume, uint32_t pos,
@@ -4718,7 +4622,7 @@ private:
     const char *dir = dumpAllDir();
     if (dir == nullptr)
       return;
-    static unsigned int call = 0;
+    unsigned int &call = dump_forward_calls_;
     std::string kinds;
     for (uint32_t i = op; i < resume; ++i)
       kinds += std::string(i == op ? "" : "-") +
@@ -4732,7 +4636,7 @@ private:
                          call == 0 ? "w" : "a");
     if (m == nullptr)
       throw std::runtime_error(
-        "NNTR_HTP_DUMP_ALL: cannot write the forward manifest");
+        "htp.dump_all: cannot write the forward manifest");
     ++call;
     std::fprintf(m, "%s %u %u %u %zu %zu %s\n", name, op, resume, pos, K, N_out,
                  kinds.c_str());
@@ -4933,24 +4837,18 @@ private:
    *  Failure disables the queue without retry. E2E needs a logits-sized
    *  output buffer even when a one-row prefill creates the queue first. */
   void dspqCreate(remote_handle64 session) {
-    const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
+    const unsigned spin_us = htpRuntimeConfig().htp.dsp_queue_spin_us;
     const size_t logits_bytes =
       e2e_ ? static_cast<size_t>(decode_.graph_words_[5]) * 4u : 0u;
-    dspq_ = dspqMake(
-      session, CDSP_DOMAIN_ID, "dspq",
-      std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
-      e2e_       ? e2eSpinUs()
-      : spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-                 : 1000u);
+    dspq_ = dspqMake(session, CDSP_DOMAIN_ID, "dspq",
+                     std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
+                     e2e_ ? e2eSpinUs() : spin_us);
   }
 
   /** DSP spin time before sleeping at miss waits and between tokens,
-   *  controlled by NNTR_HTP_E2E_SPIN_US (default 0 microseconds). */
+   *  controlled by htp.e2e_spin_us (default 0 microseconds). */
   static uint32_t e2eSpinUs() {
-    static const uint32_t us = [] {
-      const char *e = std::getenv("NNTR_HTP_E2E_SPIN_US");
-      return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
-    }();
+    const uint32_t us = htpRuntimeConfig().htp.e2e_spin_us;
     return us;
   }
 
@@ -5052,11 +4950,8 @@ private:
    *  Caller holds invoke_mutex_. */
   bool dspqReady(remote_handle64 session, size_t act_bytes, size_t out_bytes,
                  uint64_t msg_bytes) {
-    // NNTR_HTP_DSPQ=0 keeps MoE calls on FastRPC.
-    static const bool enabled = [] {
-      const char *e = std::getenv("NNTR_HTP_DSPQ");
-      return e == nullptr || std::atoi(e) != 0;
-    }();
+    // htp.dsp_queue=0 keeps MoE calls on FastRPC.
+    const bool enabled = htpRuntimeConfig().htp.dsp_queue;
     if (!enabled)
       return false;
     if (!dspq_)
@@ -5180,14 +5075,15 @@ private:
     if (!dspq_)
       dspqCreate(e.h1);
     if (dspq_->state != DspqMoe::ON || dspq_->session != e.h1) {
-      throw std::runtime_error("NNTR_HTP_E2E=1: S1's dspqueue is off (see "
-                               "the dspq line; NNTR_HTP_DSPQ=0?): the token "
+      throw std::runtime_error("resident HTP decode: S1's dspqueue is off (see "
+                               "the dspq line; htp.dsp_queue=0?): the token "
                                "packets ride it");
     }
     e.q1 = dspq_;
     e.mbox = std::make_unique<HtpRpcBuffer>(kMboxBytes, HTP_RPC_FLAGS_UNCACHED);
     if (!e.mbox->isIon() || e.mbox->fd() < 0 || mem.mmap == nullptr) {
-      throw std::runtime_error("NNTR_HTP_E2E=1: no ION page for the mailbox");
+      throw std::runtime_error(
+        "resident HTP decode: no ION page for the mailbox");
     }
     // zeroed before the DSP maps it, as the #178 probe's page: no sequence
     // word a first read could take for an answer
@@ -5197,9 +5093,10 @@ private:
                       FASTRPC_MAP_FD);
     e.mbox1 = rc == 0;
     if (rc != 0) {
-      throw std::runtime_error("NNTR_HTP_E2E=1: fastrpc_mmap of the mailbox "
-                               "page failed: " +
-                               std::to_string(rc));
+      throw std::runtime_error(
+        "resident HTP decode: fastrpc_mmap of the mailbox "
+        "page failed: " +
+        std::to_string(rc));
     }
     const uint32_t spin_us = e2eSpinUs();
     // role 0, the only one since #211 (the IDL keeps the argument)
@@ -5759,17 +5656,18 @@ private:
     size_t mapped = 0;
     for (const ArenaChunk &c : e.arena)
       mapped += c.buf->size();
-    std::fprintf(stderr,
-                 "[HTP] e2e: fc arena weights=%zu handles=%zu attach_mib=%.1f "
-                 "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
-                 "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u\n",
-                 decode_.q4_pending_.size(), e.q4m1.size(),
-                 static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0),
-                 e.arena.size(), mapped >> 20, q4m1FeedName(), ms,
-                 std::getenv("NNTR_HTP_FC_LANES")
-                   ? std::getenv("NNTR_HTP_FC_LANES")
-                   : "6,3",
-                 s1_mib, info1[4]);
+    std::fprintf(
+      stderr,
+      "[HTP] e2e: fc arena weights=%zu handles=%zu attach_mib=%.1f "
+      "chunks=%zu mapped_mib=%zu feed=%s load_ms=%.1f "
+      "lanes=%s s1_arena_mib=%zu s1_heap_kib=%u\n",
+      decode_.q4_pending_.size(), e.q4m1.size(),
+      static_cast<double>(e.attach_bytes) / (1024.0 * 1024.0), e.arena.size(),
+      mapped >> 20, q4m1FeedName(), ms,
+      (std::to_string(htpRuntimeConfig().htp.fc_lanes_small.value_or(6u)) +
+       "," + std::to_string(htpRuntimeConfig().htp.fc_lanes_large.value_or(3u)))
+        .c_str(),
+      s1_mib, info1[4]);
   }
 
   /** The feed the FC kinds take: the op's l2, else VTCM. */
@@ -5806,7 +5704,7 @@ private:
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     // act bit 1: the dense FFN's chunks were never rotated, so
-    // the session's online rotation (NNTR_MOE_HADAMARD_SCOPE=all) skips
+    // the session's online rotation (moe.hadamard_scope=all) skips
     // this call; the experts' calls keep it.
     if (kind == 1)
       glu |= 2u;
@@ -5820,26 +5718,20 @@ private:
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     // The queue uses the same DSP function and arguments. Unsupported
-    // packets and NNTR_HTP_DSPQ=0 keep the FastRPC transport.
+    // packets and htp.dsp_queue=0 keep the FastRPC transport.
     const bool via_dspq = M == 1 && kind == 0 && !with_norms &&
                           h_dn.size() == h_gu.size() &&
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
-    // NNTR_HTP_HOST_NORMS=1: the MoE call's norms and epilogue on the host
-    // around the plain entry, as NNTR_HTP_PROFILE=2 does without its timing;
-    // NNTR_HTP_MOE_HOST=<mask> picks them one at a time (1 pre-norm, 2
+    // moe.host_mask=7: the MoE call's norms and epilogue on the host
+    // around the plain entry, as htp.profile=2 does without its timing;
+    // moe.host_mask=<mask> picks them one at a time (1 pre-norm, 2
     // post-norm, 4 epilogue; the DSP's fused epilogue needs its pre-norm, so
     // a host pre-norm takes the epilogue with it). References for the fused
-    // entry; never set in a tok/s run. Both need NNTR_HTP_KEEP_OUT=0: the
+    // entry; never set in a tok/s run. Both need htp.keep_out=0: the
     // host reads act whole.
-    static const unsigned host_mask = [] {
-      const char *v = std::getenv("NNTR_HTP_HOST_NORMS");
-      if (v != nullptr && std::strcmp(v, "1") == 0)
-        return 7u;
-      const char *m = std::getenv("NNTR_HTP_MOE_HOST");
-      return m != nullptr ? static_cast<unsigned>(std::atoi(m)) : 0u;
-    }();
+    const unsigned host_mask = htpRuntimeConfig().moe.host_mask;
     const unsigned host_bits =
       HtpProfile::global().level() >= 2 ? 7u : host_mask;
     const bool host_prenorm =
@@ -5885,9 +5777,9 @@ private:
       via_dspq ? *dspq_->out : staging_.stage(staging_.out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
-    // NNTR_HTP_MOE_DEBUG=1 (with NNTR_HTP_KEEP_OUT=0 so the host tensors
+    // moe.debug=1 (with htp.keep_out=0 so the host tensors
     // are whole): the staged act / x2 against the host's bytes
-    static const bool moe_dbg = std::getenv("NNTR_HTP_MOE_DEBUG") != nullptr;
+    const bool moe_dbg = htpRuntimeConfig().moe.debug;
     if (moe_dbg && !via_dspq) {
       static unsigned call_no = 0;
       ++call_no;
@@ -5899,7 +5791,7 @@ private:
         ml_logw("HTP moe staging #%u M=%u: act %s x2 %s", call_no, M,
                 a_ok ? "ok" : "DIFFERS", x_ok ? "ok" : "DIFFERS");
     }
-    // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
+    // htp.profile>=2 on a call with folded norms: the timed entry
     // (stage breakdown) and the norms on the host around it, so the prefill
     // MoE and dense calls, which always carry them, have stages too (doc 57
     // section 9.26), the post-FFN epilogue too (section 9.34). Measurement
@@ -6057,7 +5949,7 @@ private:
     }
     if (timed) {
       // The per-descriptor trace of the last repeat, for the first
-      // NNTR_HTP_DMA_TRACE calls of this bucket. Read now, while the skel's
+      // htp.dma_trace_calls calls of this bucket. Read now, while the skel's
       // static tables still hold this call; printed now, so the lines sit
       // next to the token they came from.
       const unsigned ordinal = profile.dmaTraceOrdinal(K, N_out, M, kind);
@@ -6341,10 +6233,7 @@ private:
     // The strided entry already walks VTCM-sized row chunks on the DSP.
     // Keeping the complete activation in one call avoids another host copy,
     // mapping and RPC for the tail while preserving each row's arithmetic.
-    static const bool whole_prefill = [] {
-      const char *value = std::getenv("NNTR_HTP_FC_WHOLE_PREFILL");
-      return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool whole_prefill = htpRuntimeConfig().htp.fc_whole_prefill;
     if (whole_prefill && M > step) {
       std::vector<unsigned int> chunks(fh.handles.size(), 0u);
       std::vector<OutSlice> slices;
@@ -6469,7 +6358,7 @@ private:
    * else (the dense down's row chunks) summed from the values. No room:
    * the DSP heap through weight_register_u8i4, from whUnpack's row-major
    * values, which the bake packs back into the same tiles -- registerRm's
-   * overflow without its conversion. NNTR_HTP_FC_WH_HEAP=1 sends every
+   * overflow without its conversion. htp.fc_wh_heap=1 sends every
    * handle that way (the host check of that path).
    * 4-bit only -- the sidecar is QS4CX_WH/1 and the ArenaEntry
    * leaves pal empty; plan 229 S2 (2-bit FCs) bumps FCWH_FORMAT and sizes
@@ -6551,21 +6440,16 @@ private:
         for (uint32_t i = 0; i < cn; ++i)
           cs[i] += rm[static_cast<size_t>(r) * cn + i];
     }
-    static const bool heap_only = [] {
-      const char *v = std::getenv("NNTR_HTP_FC_WH_HEAP");
-      return v != nullptr && std::atoi(v) != 0;
-    }();
+    const bool heap_only = htpRuntimeConfig().htp.fc_wh_heap;
     // On the E2E path these images are also the decode FC set,
     // and the expert pool's chunks leave them no room (plan 225 section
     // 3.5: pool C=28 3328 + FC WH 216 + lm_head Q4M1 147 = 3691 of the
     // PD's 3840 MiB), so they map their own chunk, sized for every image
-    // still to come. The hybrid keeps PR 1's rule: mapped room or the heap.
+    // still to come. Allocation failure falls back to the heap.
     uint32_t chunk = 0, off = 0;
-    const bool e2e = HtpBackend::e2eRequested();
     if (!heap_only && ensureArena(session) &&
-        (e2e ? place(session, static_cast<uint32_t>(len), weights_.fcwhLeft(),
-                     &chunk, &off)
-             : placeExisting(static_cast<uint32_t>(len), &chunk, &off))) {
+        place(session, static_cast<uint32_t>(len), weights_.fcwhLeft(), &chunk,
+              &off)) {
       uint8_t *dst = arena_chunks_[chunk].buf->data() + off;
       if (host.empty())
         read_tiles(dst);
@@ -6623,10 +6507,8 @@ private:
     uint32_t chunk = 0, off = 0;
     // The fixed arena policy allows new chunks, preserving DSP heap room
     // for quantized KV caches.
-    constexpr bool fc_in_arena = htp_fixed::FC_IN_ARENA; // built in
     if (ensureArena(session) &&
-        (fc_in_arena ? place(session, wh_len, size_t(256) << 20, &chunk, &off)
-                     : placeExisting(wh_len, &chunk, &off))) {
+        place(session, wh_len, size_t(256) << 20, &chunk, &off)) {
       std::vector<uint8_t> wh(wh_len);
       whPack(rm, K, N, wh.data());
       std::memcpy(arena_chunks_[chunk].buf->data() + off, wh.data(), wh_len);
@@ -6890,12 +6772,9 @@ private:
   }
 
   /** @brief Conv prefill row limit for bounded session scratch: 512 by
-   *  default. NNTR_HTP_PREFILL_ROWS overrides it; 0 uses the whole prefill. */
+   *  default. htp.prefill_rows overrides it; 0 uses the whole prefill. */
   static unsigned int prefillRows() {
-    static const unsigned int rows = [] {
-      const char *v = std::getenv("NNTR_HTP_PREFILL_ROWS");
-      return v != nullptr ? static_cast<unsigned int>(std::atoi(v)) : 512u;
-    }();
+    const unsigned int rows = htpRuntimeConfig().htp.prefill_rows;
     return rows;
   }
 
@@ -6994,32 +6873,19 @@ private:
     const uint32_t predict = predictMode();
     if (predict == 0u || !prefetchThreads())
       throw std::invalid_argument(
-        "NNTR_MOE_PREFETCH_DIRECT requires NNTR_HTP_PREDICT=1 or 2 and "
-        "NNTR_MOE_PREFETCH > 0");
+        "Direct expert prefetch requires prediction and decode readers");
     if (pool_descs_.empty() || pool_descs_[0].empty()) {
-      if (std::getenv("NNTR_MOE_PREFETCH_DIRECT") != nullptr)
+      if (htpRuntimeConfig().moe.prediction != "auto")
         throw std::invalid_argument("Direct prefetch requires virtual experts");
-      return; // built-in default on a model without the expert pool
+      return;
     }
     const auto &shape = pool_descs_[0][0];
-    const char *pair_read = std::getenv("NNTR_LFM2_DECODE_PAIR_READ");
     const bool native_pair_read =
-      pair_read && std::strcmp(pair_read, "1") == 0 &&
+      htpRuntimeConfig().moe.lfm2_decode_pair_read &&
       weightPageCachePolicy() == 0 && shape.w_bits == HTP_TL2_WEIGHT_BITS &&
       shape.K == 2048u && shape.inter == 1536u && shape.N_out == 2048u;
-    // Keep decode worker tuning independent of prefill lookahead.
-    size_t readers = prefetchThreads();
-    if (std::getenv("NNTR_MOE_PREFETCH") == nullptr &&
-        weightPageCachePolicy() == 0 &&
-        pool_descs_[0][0].w_bits == HTP_TL2_WEIGHT_BITS)
-      readers = htp_fixed::TL2_DIRECT_PREFETCH_READERS;
-    if (const char *v = std::getenv("NNTR_MOE_PREFETCH_READERS"))
-      readers =
-        std::max<size_t>(1, std::min<size_t>(8, std::strtoul(v, nullptr, 10)));
-    size_t count = htp_fixed::PREFETCH_SLOTS;
-    if (const char *v = std::getenv("NNTR_MOE_PREFETCH_SLOTS"))
-      count =
-        std::max<size_t>(1, std::min<size_t>(32, std::strtoul(v, nullptr, 10)));
+    const size_t readers = prefetchThreads();
+    const size_t count = htpRuntimeConfig().moe.prefetch_slots;
     std::vector<StagedExpert> slots;
     const auto session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
@@ -7138,10 +7004,7 @@ private:
   };
 
   static unsigned prefetchTop() {
-    const char *v = std::getenv("NNTR_MOE_PREFETCH_TOP");
-    return v ? std::min(16u,
-                        static_cast<unsigned>(std::strtoul(v, nullptr, 10)))
-             : 8u;
+    return htpRuntimeConfig().moe.prefetch_top.value_or(8u);
   }
 
   bool queueDirectPrefetch(const ExpertFileDesc &d, uint64_t epoch,
@@ -7209,8 +7072,7 @@ private:
               r.input_gamma = p.data;
       }
     }
-    const char *gamma_env = std::getenv("NNTR_LFM2_PREFETCH_GAMMA");
-    const bool gamma_requested = gamma_env && std::strcmp(gamma_env, "1") == 0;
+    const bool gamma_requested = htpRuntimeConfig().moe.lfm2_prefetch_gamma;
     const bool gamma_normalized =
       gamma_requested &&
       std::all_of(prediction_routers_.begin(), prediction_routers_.end(),
@@ -7226,22 +7088,14 @@ private:
     std::vector<PredictionJob> jobs(2);
     for (auto &j : jobs)
       j.input.resize(prediction_routers_[0].hidden);
-    if (const char *v = std::getenv("NNTR_MOE_PREFETCH_CONFIDENCE")) {
-      const float threshold = std::strtof(v, nullptr);
-      if (!std::isfinite(threshold) || threshold < 0 || threshold > 1)
-        throw std::invalid_argument("Prefetch confidence must be in [0, 1]");
-      if (threshold > 0)
-        prediction_confidence_.reset(
-          new HtpPrefetchConfidence(prediction_routers_.size(), threshold));
-    }
-    const char *blend_env = std::getenv("NNTR_MOE_PREFETCH_RESIDUAL");
-    const float blend = blend_env ? std::strtof(blend_env, nullptr)
-                                  : htp_fixed::PREFETCH_RESIDUAL;
-    if (!std::isfinite(blend) || blend < 0 || blend > 1)
-      throw std::invalid_argument("Prefetch residual must be in [0, 1]");
+    const auto &config = htpRuntimeConfig().moe;
+    if (config.prefetch_confidence > 0)
+      prediction_confidence_.reset(new HtpPrefetchConfidence(
+        prediction_routers_.size(), config.prefetch_confidence));
+    const float blend = config.prefetch_residual;
     std::shared_ptr<FILE> trace;
-    if (const char *path = std::getenv("NNTR_HTP_PREDICT_LOG")) {
-      FILE *file = std::fopen(path, "w");
+    if (!config.predict_log.empty()) {
+      FILE *file = std::fopen(config.predict_log.c_str(), "w");
       if (!file)
         throw std::runtime_error("Cannot open prediction trace");
       trace.reset(file, std::fclose);
@@ -7318,16 +7172,16 @@ private:
   /** @note Call with handle_mutex_ held. */
   StagedExpert stageExpert(remote_handle64 session, const ExpertFileDesc &d) {
     if (!prepared_tl2_ && d.w_bits == 2u) {
-      const char *path = std::getenv("NNTR_HTP_TL2_PREPARED_FILE");
-      if (path && *path) {
+      const auto &path = htpRuntimeConfig().moe.tl2_prepared_file;
+      if (!path.empty()) {
         if (!e2e_)
-          throw std::runtime_error("prepared TL2 requires NNTR_HTP_E2E=1");
+          throw std::runtime_error("prepared TL2 requires resident HTP decode");
         if (weightPageCachePolicy() >= 0)
           throw std::invalid_argument(
-            "NNTR_HTP_PAGE_CACHE does not support prepared TL2 artifacts; "
-            "unset NNTR_HTP_TL2_PREPARED_FILE");
-        prepared_tl2_.reset(new PreparedTl2(path, d.fd));
-        std::fprintf(stderr, "[HTP-TL2] prepared=%s receipt=%d\n", path,
+            "htp.page_cache does not support prepared TL2 artifacts; "
+            "unset moe.tl2_prepared_file");
+        prepared_tl2_.reset(new PreparedTl2(path.c_str(), d.fd));
+        std::fprintf(stderr, "[HTP-TL2] prepared=%s receipt=%d\n", path.c_str(),
                      prepared_tl2_->validatedReceipt());
       }
     }
@@ -7474,18 +7328,12 @@ private:
 
   /** Diagnostic opt-outs keep both changes independently measurable. */
   static bool coalesceExpertReads() {
-    static const bool enabled = [] {
-      const char *v = std::getenv("NNTR_MOE_COALESCE_READ");
-      return !v || std::strcmp(v, "0") != 0;
-    }();
+    const bool enabled = htpRuntimeConfig().moe.coalesce_read;
     return enabled;
   }
 
   static bool cancelStaleExpertReads() {
-    static const bool enabled = [] {
-      const char *v = std::getenv("NNTR_MOE_CANCEL_STALE_READ");
-      return !v || std::strcmp(v, "0") != 0;
-    }();
+    const bool enabled = htpRuntimeConfig().moe.cancel_stale_read;
     return enabled;
   }
 
@@ -7553,7 +7401,7 @@ private:
 
   /** @brief A miss round's reads, all at once: one job per weight,
    *  or per adjacent native TL2 pair that fits one direct read.
-   *  NNTR_MOE_MISS_READERS threads of the ThreadManager
+   *  moe.miss_readers threads of the ThreadManager
    *  taking them in turn, each job one whole-range pread plus its tail.
    *  The S25 probe (docs/measurements/266-miss-readers.md): rounds of 3
    *  experts into ION read 3.1 GiB/s this way at 4 readers, 1.8 GiB/s as
@@ -7587,10 +7435,7 @@ private:
       };
       // A small miss batch need not wake every compute worker and leave
       // them spinning between I/O rounds. Zero restores the compute pool.
-      static const bool dedicated = [] {
-        const char *v = std::getenv("NNTR_MOE_DEMAND_POOL");
-        return !v || std::strcmp(v, "0") != 0;
-      }();
+      const bool dedicated = htpRuntimeConfig().moe.demand_pool;
       if (dedicated) {
         if (!demand_read_pool_) {
           const size_t readers = std::min<size_t>(
@@ -7634,19 +7479,15 @@ private:
       e2e_st_->pool_pair_reads += pair_reads;
   }
 
-  /** @brief NNTR_MOE_MISS_READERS: the miss round's reader count
+  /** @brief moe.miss_readers: the miss round's reader count
    *  (4, the S25 probe's best for whole-weight reads; 1 reads the round's
    *  weights one after another on the pool server). */
   static size_t missReaders() {
-    static const size_t n = [] {
-      const char *v = std::getenv("NNTR_MOE_MISS_READERS");
-      return v != nullptr ? std::max<size_t>(1, std::strtoul(v, nullptr, 10))
-                          : size_t(4);
-    }();
+    const size_t n = htpRuntimeConfig().moe.miss_readers;
     return n;
   }
 
-  /** @brief NNTR_MOE_FADVISE: unset / 0 = no advice (the bytes and
+  /** @brief moe.fadvise: unset / 0 = no advice (the bytes and
    *  the reads are the same either way); 1 = an expert's file pages are
    *  dropped from the page cache once its bytes are in the arena and asked
    *  back when it leaves the arena, so the cache holds about the arena's
@@ -7685,24 +7526,18 @@ private:
     return mib;
   }
 
-  /** @brief NNTR_MOE_LRFU unset or a half-life other than 0: the
+  /** @brief moe.lrfu_half_life unset or a half-life other than 0: the
    *  pool's policy (ExpertLru, whose default this restates) is
    *  LRFU, which parses the value. */
   static bool lrfuOn() {
-    static const bool on = [] {
-      const char *v = std::getenv("NNTR_MOE_LRFU");
-      return v == nullptr || *v == '\0' || std::strtod(v, nullptr) > 0.0;
-    }();
+    const bool on = htpRuntimeConfig().moe.lrfu_half_life > 0.0;
     return on;
   }
 
   static int fadviseKnob() {
     if (weightPageCachePolicy() >= 0)
       return 0;
-    static const int k = [] {
-      const char *v = std::getenv("NNTR_MOE_FADVISE");
-      return v != nullptr ? std::atoi(v) : 0;
-    }();
+    const int k = htpRuntimeConfig().moe.fadvise;
     return k;
   }
 
@@ -7869,10 +7704,9 @@ private:
   }
 
   static bool stableTl2Slots(const ExpertFileDesc &d) {
-    const char *v = std::getenv("NNTR_HTP_TL2_STABLE_SLOTS");
-    return v && std::strcmp(v, "1") == 0 && weightPageCachePolicy() == 0 &&
-           d.w_bits == HTP_TL2_WEIGHT_BITS && d.K == 2048u &&
-           d.inter == 1536u && d.N_out == 2048u;
+    return htpRuntimeConfig().moe.tl2_stable_slots &&
+           weightPageCachePolicy() == 0 && d.w_bits == HTP_TL2_WEIGHT_BITS &&
+           d.K == 2048u && d.inter == 1536u && d.N_out == 2048u;
   }
 
   /** Both weights are complete and the slot is held by this read batch.
@@ -8095,7 +7929,7 @@ private:
    * Like startPrefetchReaders, the model's serialized caller owns lifecycle.
    */
 
-  /** @brief Starts the readers once, pinned to NNTR_MOE_PREFETCH_CPUS or
+  /** @brief Starts the readers once, pinned to moe.worker_cpus or
    *  else to every core but the caller's. */
 
   void prefetchReaderLoop() {
@@ -8167,7 +8001,7 @@ private:
     const uint8_t *p;
   };
 
-  /** @brief NNTR_MOE_PIN: 0 / unset = misses pread the file (as
+  /** @brief moe.pin: 0 / unset = misses pread the file (as
    *  before); 1 = each MoE layer's expert range is mmapped MAP_POPULATE
    *  (+ mlock, logged, not required) and a miss copies from that mapping;
    *  2 = the range is read into anonymous memory (not evictable as page
@@ -8176,10 +8010,7 @@ private:
   static int pinKnob() {
     if (weightPageCachePolicy() >= 0)
       return 0; // Pinning retains a second copy of every expert.
-    static const int k = [] {
-      const char *v = std::getenv("NNTR_MOE_PIN");
-      return v != nullptr ? std::atoi(v) : 0;
-    }();
+    const int k = htpRuntimeConfig().moe.pin;
     return k;
   }
 
@@ -8207,7 +8038,7 @@ private:
       const uint64_t page = 4096, a = lo & ~(page - 1), len = hi - a;
       // Mode 2 on the S25 with all 30 layers (5.6 GB anonymous beside the
       // app's 3.3 GB) rebooted the phone: stop while MemAvailable keeps
-      // NNTR_MOE_PIN_FLOOR_MIB (default 2048) above this layer's bytes.
+      // moe.pin_floor_mib (default 2048) above this layer's bytes.
       if (pinKnob() == 2 && memAvailableMib() < pinFloorMib() + (len >> 20)) {
         std::fprintf(stderr,
                      "[HTP] pin: stop at layer %zu: MemAvailable %zu MiB < "
@@ -8278,17 +8109,14 @@ private:
     return kb >> 10;
   }
 
-  /** @brief NNTR_MOE_PIN_FLOOR_MIB (default 2048). */
+  /** @brief moe.pin_floor_mib (default 2048). */
   static size_t pinFloorMib() {
-    static const size_t v = [] {
-      const char *e = std::getenv("NNTR_MOE_PIN_FLOOR_MIB");
-      return e != nullptr ? std::strtoul(e, nullptr, 10) : size_t(2048);
-    }();
+    const size_t v = htpRuntimeConfig().moe.pin_floor_mib;
     return v;
   }
 
   /** @brief Release host FC / DENSE_FFN sources after DSP registration,
-   *  according to htp_fixed::DROP_HOST_FC. Retain LM_HEAD for later CPU
+   *  retaining LM_HEAD for later CPU
    *  prefills and any source with a CPU consumer. A dropped source would
    *  have to be reloaded before CPU fallback. */
   void dropHostFc(bool qs4cx_only = false) {
@@ -8296,7 +8124,7 @@ private:
     // an alias check in Transformer. Do not override a retained CPU consumer.
     if (weightPageCachePolicy() >= 0)
       return;
-    if (!htp_fixed::DROP_HOST_FC || host_fc_dropped_ || !e2e_)
+    if (host_fc_dropped_ || !e2e_)
       return;
     host_fc_dropped_ = !qs4cx_only;
     const size_t before = memAvailableMib();
@@ -8481,12 +8309,11 @@ private:
    * adjacent weights; the pointer remains a valid handle_cache_ key.
    * Released pages read as zeros, so callers must have no CPU consumer.
    * QS4CX_WH CPU dot rejects that format rather than reading these pages.
-   * NNTR_HTP_KEEP_ARM_WEIGHTS retains the source for debugging.
+   * htp.keep_arm_weights retains the source for debugging.
    */
   void releaseArmSource(void *src, size_t len) {
 #if defined(__linux__)
-    static const bool keep =
-      std::getenv("NNTR_HTP_KEEP_ARM_WEIGHTS") != nullptr;
+    const bool keep = htpRuntimeConfig().htp.keep_arm_weights;
     if (keep)
       return;
     const long ps = sysconf(_SC_PAGESIZE);
@@ -8703,9 +8530,6 @@ private:
   /** @brief place() without the new chunk: room in a mapped chunk or
    *  nothing. What the FC slices use (get_or_register_fc), so that they
    *  never map address space the remaining heap registrations need. */
-  bool placeExisting(uint32_t bytes, uint32_t *chunk, uint32_t *off) {
-    return placeExistingOn(arena_chunks_, bytes, chunk, off);
-  }
   bool placeExistingOn(std::vector<ArenaChunk> &chunks, uint32_t bytes,
                        uint32_t *chunk, uint32_t *off) {
     for (size_t c = 0; c < chunks.size(); ++c) {
@@ -8850,8 +8674,7 @@ private:
       return;
     // Read-only accounting after the readers stop: no payload is touched.
     // Include the final decode growth, whose slots are allocated on misses.
-    const char *trace = std::getenv("NNTR_INIT_TRACE");
-    if (trace && std::strcmp(trace, "0") != 0) {
+    if (htpRuntimeConfig().htp.init_trace) {
       uint64_t capacity = 0, used = 0;
       for (size_t i = 0; i < chunks.size(); ++i) {
         const auto &chunk = chunks[i];
@@ -8912,8 +8735,7 @@ private:
   bool newChunkOn(remote_handle64 session, int domain,
                   std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
                   size_t want) {
-    static const size_t grain =
-      htpArenaGrainBytes(std::getenv("NNTR_HTP_ARENA_GRAIN_MB"));
+    const size_t grain = size_t(htpRuntimeConfig().htp.arena_grain_mib) << 20;
     /** Preserve the established 16 MiB retry floor unless the explicit
      *  4 MiB tail option is selected. The DSP arena table still bounds the
      *  number of mappings, and every retry must fit the complete weight. */
@@ -9045,8 +8867,8 @@ private:
   /**
    * @brief Prefill reader settings, read once. Keep reader work off the
    *        caller's core to avoid competing with the layer call.
-   *  - NNTR_MOE_PREFETCH_READERS: thread count (default 6).
-   *  - NNTR_MOE_PREFETCH_CPUS: comma-separated cores; default excludes
+   *  - moe.prefill_readers: thread count (default 6).
+   *  - moe.worker_cpus: core indices; default excludes
    *    the caller's cores.
    */
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
@@ -9075,9 +8897,9 @@ private:
    *  gate_up key sits (layer, expert), the layer's policy, and whether a
    *  prefill touched the pool since the last token (poolSync). */
   std::vector<std::vector<ExpertFileDesc>> pool_descs_;
-  std::vector<PinRange> pin_ranges_; /**< NNTR_MOE_PIN */
+  std::vector<PinRange> pin_ranges_; /**< moe.pin */
   bool pinned_ = false;
-  bool host_fc_dropped_ = false; /**< NNTR_HTP_DROP_HOST_FC */
+  bool host_fc_dropped_ = false; /**< host FC release */
   /** the first token's setup timers */
   uint64_t seed_rpc_us_ = 0;
   unsigned seed_calls_ = 0;
@@ -9086,9 +8908,9 @@ private:
   /** the kv_cache_q handles registered and not released */
   std::mutex kvq_mutex_;
   std::set<uint32_t> kvq_handles_;
-  /** the prefetch readers (NNTR_MOE_PREFETCH): their queue, and
-   *  the counts the close line prints. The issued keys are the pool
-   *  server's alone: a later miss of one counts as useful. */
+  /** the decode prefetch readers (moe.decode_prefetch_readers):
+   * their queue, and the counts the close line prints. The issued keys are the
+   * pool server's alone: a later miss of one counts as useful. */
   std::mutex pf_mu_;
   std::condition_variable pf_cv_;
   std::deque<ExpertFileDesc> pf_q_;
@@ -9118,8 +8940,7 @@ private:
   void switchTl2Phase(bool native) {
     // A matched QS2 control reads the same validated artifact and uses the
     // same host reader, but keeps its prefill representation for decode.
-    const char *decode = std::getenv("NNTR_HTP_TL2_DECODE");
-    if (decode && std::strcmp(decode, "0") == 0)
+    if (!htpRuntimeConfig().moe.tl2_decode)
       native = false;
     if (!prepared_tl2_ || tl2_decode_ == native)
       return;
@@ -9190,7 +9011,7 @@ private:
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */
   /** The M==1 MoE call's dspqueue; null until the first such call
-      unless NNTR_HTP_DSPQ=0. */
+      unless htp.dsp_queue=0. */
   std::shared_ptr<DspqMoe> dspq_;
   /** The E2E path's state, shared with its
    *  HtpBackend close hook (which runs after this object is gone). */
@@ -9222,7 +9043,7 @@ private:
     uint64_t kind[HTP_OP_KIND_N] = {0};
     /** the ops' wall us per kind, the pcycles over the waits */
     uint64_t kind_us[HTP_OP_KIND_N] = {0}, miss_pcyc = 0;
-    /** NNTR_HTP_PROFILE: the ATTN_M1 phase words per KV cache,
+    /** htp.profile: the ATTN_M1 phase words per KV cache,
      *  summed over attn_tokens tokens */
     uint64_t attn_calls[2] = {0, 0}, attn_tokens = 0;
     uint64_t attn_prof[2][HTP_DSPQ_ATTN_PROF_WORDS] = {};
@@ -9262,7 +9083,7 @@ private:
     std::exception_ptr err;
   };
   std::unique_ptr<PoolServer> pool_srv_;
-  bool e2e_ = false; /**< NNTR_HTP_E2E=1 and a description set */
+  bool e2e_ = false; /**< resident HTP decode and a description set */
   std::shared_ptr<E2eState> e2e_st_;
 
   /** invokeConvBlock's conv_w in and state out, one small ION buffer. */
@@ -9344,7 +9165,7 @@ public:
     {
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       if (handle < 0 || kvq_handles_.erase(static_cast<uint32_t>(handle)) == 0)
-        return; // released already (NNTR_HTP_E2E_FREE_KVQ)
+        return; // released already (prefill quantized KV release)
     }
     if (hb.enabled() && handle >= 0) {
       nntr_hvx_kv_release_q(static_cast<remote_handle64>(hb.handle()),
@@ -9385,10 +9206,7 @@ public:
     const bool staged = n_q >= 128;
     const float *q_rpc = q;
     float *out_rpc = out;
-    static const bool ion_handoff = [] {
-      const char *value = std::getenv("NNTR_LFM2_ATTN_ION_HANDOFF");
-      return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool ion_handoff = htpRuntimeConfig().htp.lfm2_attn_ion_handoff;
     if (staged) {
       const float *direct_q = nullptr;
       const float *q_source = q;
@@ -9827,6 +9645,16 @@ ComputeOps *get_htp_ops() {
   return instance.get();
 }
 
+void htp_prepare_runtime(const HtpRuntimeConfig &config) {
+  configureHtpRuntime(config);
+  try {
+    htp_prepare_runtime();
+  } catch (...) {
+    htp_release_runtime();
+    throw;
+  }
+}
+
 void htp_prepare_runtime() {
   auto &backend = HtpBackend::global();
   backend.open();
@@ -9850,6 +9678,8 @@ void htp_release_runtime() {
   HtpContext::Global().getContextData()->setComputeOps(get_cpu_ops());
   htpOpsInstance().reset();
   HtpBackend::global().close();
+  HtpProfile::reset();
+  resetHtpRuntimeConfig();
   moeOptsSent().store(false);
   moeGeglu().store(false);
   HtpExpertPool::resetLayerOrdinals();

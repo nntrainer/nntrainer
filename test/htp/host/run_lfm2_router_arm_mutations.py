@@ -76,11 +76,9 @@ for name, target, old, new, reason, flag in mutations:
         subprocess.run(kc, stdout=log, stderr=subprocess.STDOUT, check=True)
         subprocess.run(lc, stdout=log, stderr=subprocess.STDOUT, check=True)
     env = os.environ.copy()
-    env.pop('NNTR_HTP_ROUTER_U8I8', None)
-    env.update(NNTR_LFM2_ROUTER_ARM=flag,
-               ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',
+    env.update(ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',
                UBSAN_OPTIONS='halt_on_error=1')
-    run = subprocess.run([str(out / 'check')], env=env, text=True,
+    run = subprocess.run([str(out / 'check'), 'on' if flag == '1' else 'off'], env=env, text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (out / 'run.log').write_text(run.stdout)
     if run.returncode == 0 or reason not in run.stdout:

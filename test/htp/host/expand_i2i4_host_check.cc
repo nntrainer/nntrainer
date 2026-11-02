@@ -82,7 +82,7 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
   std::snprintf(what, sizeof what, "%s half the bytes", label);
   check(two.size() * 2 == four.size(), what);
 
-  /** The host readers (NNTR_MOE_DIFF's reference) give back the codes the
+  /** The host readers give back the codes the
      packers were handed: whUnpack at four bits, whUnpack2 at two. */
   std::vector<int8_t> rm_back(rm.size(), 0x7F);
   nntrainer::whUnpack(four.data(), K, N, rm_back.data());

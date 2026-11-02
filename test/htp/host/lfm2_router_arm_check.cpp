@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <htp_backend/htp_runtime_config.h>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -33,10 +34,8 @@ static void check(bool ok, const char *why) {
     throw std::runtime_error(why);
 }
 static unsigned cases;
-static bool enabled() {
-  const char *s = std::getenv("NNTR_LFM2_ROUTER_ARM");
-  return s && std::strcmp(s, "1") == 0 && !std::getenv("NNTR_HTP_ROUTER_U8I8");
-}
+static bool expected_enabled;
+static bool enabled() { return expected_enabled; }
 extern "C" {
 typedef struct hvx_worker_pool_s hvx_worker_pool;
 typedef void (*hvx_worker_pool_func)(uint32_t, uint32_t, void *);
@@ -255,8 +254,15 @@ struct Data {
   }
 };
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    const std::string mode = argc > 1 ? argv[1] : "off";
+    check(mode == "on" || mode == "off" || mode == "quantized", "invalid mode");
+    expected_enabled = mode == "on";
+    nntrainer::HtpRuntimeConfig config;
+    config.moe.lfm2_router_arm = mode != "off";
+    config.moe.router_u8i8 = mode == "quantized";
+    nntrainer::configureHtpRuntime(config);
     // Actual strict kernel against the real HVX router C TU on lane emulation.
     // Hardware special/subnormal behavior is independently checked by native
     // DSP.
@@ -494,7 +500,7 @@ int main() {
       check(d.x == x && d.w == w && d.y == y, "rejected helper wrote memory");
       ++cases;
     }
-    std::printf("ROUTER_ARM_HOST %u cases env=%u PASS\n", cases,
+    std::printf("ROUTER_ARM_HOST %u cases config=%u PASS\n", cases,
                 unsigned(enabled()));
     return 0;
   } catch (const std::exception &e) {
