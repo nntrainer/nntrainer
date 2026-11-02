@@ -197,6 +197,18 @@ the next step then copies that page's committed rows into a private page
 before writing (copy-on-write). The original stays intact for the cache and
 for other sessions.
 
+`forkSession(parent)` creates a new session that shares the parent's
+committed history and then diverges from it; `forkSession(parent,
+at_position)` forks at an earlier point, so the child covers only the first
+`at_position` rows of the parent. Full pages below the fork point are shared
+with the parent, and the partial tail page is copied, so a session never
+writes into a page another session reads. The child inherits the committed
+token ids and prefix-cache blocks of the shared history, so it can continue
+publishing and reusing prefixes from the fork point. The parent's rows are
+left unchanged; both sessions record the shared pages in their copy-on-write
+bookkeeping. Forking requires paged storage and an idle, valid parent and
+does not change the selection.
+
 The cache holds page handles. `CacheStats::backing_bytes` counts the pages a
 session references, including shared ones, so summing it over sessions
 counts shared pages more than once; `KvPagePool::reservedBytes()` counts each
