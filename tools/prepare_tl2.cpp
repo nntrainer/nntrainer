@@ -8,6 +8,7 @@
 #include "htp_tl2_native_packing.h"
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <thread>
 
 #if defined(__ANDROID__) || defined(__linux__)
