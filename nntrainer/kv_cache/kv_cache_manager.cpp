@@ -243,6 +243,97 @@ void KvCacheManager::destroySession(SessionId session) {
   sessions_.erase(it);
 }
 
+SessionId KvCacheManager::forkSession(SessionId parent) {
+  auto it = sessions_.find(parent);
+  if (it == sessions_.end())
+    throw std::out_of_range("Unknown KV session");
+  return forkSession(parent, it->second->position);
+}
+
+SessionId KvCacheManager::forkSession(SessionId parent, size_t at_position) {
+  auto it = sessions_.find(parent);
+  if (it == sessions_.end())
+    throw std::out_of_range("Unknown KV session");
+  const SessionState &src = *it->second;
+  if (!src.spec.page_tokens)
+    throw std::logic_error("KV session fork requires paged storage");
+  if (src.epoch->active_step)
+    throw std::logic_error("Cannot fork a KV session during a step");
+  if (!src.valid)
+    throw std::logic_error("Cannot fork an invalid KV session");
+  if (at_position > src.position)
+    throw std::out_of_range("KV fork position exceeds the parent");
+
+  auto next = std::make_shared<SessionState>();
+  next->spec = src.spec;
+  next->keys = src.keys; // Shared graph identities.
+  next->values = src.values;
+  next->pool = src.pool;
+  next->prefix = src.prefix;
+  next->key_pages.resize(src.spec.layers.size());
+  next->value_pages.resize(src.spec.layers.size());
+  next->ready.resize(src.spec.layers.size());
+  next->stats.owner_layers = src.stats.owner_layers;
+
+  const size_t page_tokens = src.spec.page_tokens;
+  const size_t full = at_position / page_tokens;
+  const size_t kept = at_position % page_tokens;
+  size_t backing = 0;
+  for (size_t i = 0; i < src.spec.layers.size(); ++i) {
+    const auto &s = src.spec.layers[i];
+    if (s.source >= 0)
+      continue; // Alias layers resolve to their owner's pages.
+    const size_t stride = 1 + (s.max_tokens - 1) / page_tokens;
+    const size_t page_bytes = checkedMultiply(page_tokens, s.rowBytes());
+    const size_t aligned = checkedAdd(page_bytes, 63) & ~size_t{63};
+    const size_t held = full + (kept ? 1 : 0);
+    const size_t held_bytes = checkedMultiply(held, 2 * aligned);
+    backing = checkedAdd(backing, checkedMultiply(s.batch, held_bytes));
+    auto &keys = next->key_pages[i];
+    auto &values = next->value_pages[i];
+    const size_t slots = checkedMultiply(s.batch, stride);
+    keys.resize(slots);
+    values.resize(slots);
+    const auto &src_keys = src.key_pages[i];
+    const auto &src_values = src.value_pages[i];
+    for (size_t b = 0; b < s.batch; ++b) {
+      for (size_t p = 0; p < full; ++p) {
+        const size_t index = b * stride + p;
+        keys[index] = src_keys.at(index);
+        values[index] = src_values.at(index);
+      }
+      if (kept) {
+        const size_t index = b * stride + full;
+        auto key = next->pool->acquire(page_bytes);
+        auto value = next->pool->acquire(page_bytes);
+        const size_t used = kept * s.rowBytes();
+        std::memcpy(key->data(), src_keys.at(index)->data(), used);
+        std::memcpy(value->data(), src_values.at(index)->data(), used);
+        keys[index] = std::move(key);
+        values[index] = std::move(value);
+      }
+    }
+  }
+  next->stats.backing_bytes = backing;
+  // Known ids and prefix blocks of the shared history only.
+  const size_t known = std::min(src.tokens.size(), at_position);
+  next->tokens.assign(src.tokens.begin(), src.tokens.begin() + known);
+  const size_t blocks = std::min(src.block_ids.size(), full);
+  next->block_ids.assign(src.block_ids.begin(), src.block_ids.begin() + blocks);
+  next->prefix_epoch = src.prefix_epoch;
+  // Full pages are shared with the parent; the tail copy is private.
+  next->shared_pages = full;
+  next->position = at_position;
+  // The child reads the parent's full pages below the fork point: record
+  // them as shared so the parent copies before writing into them.
+  it->second->shared_pages = std::max(it->second->shared_pages, full);
+
+  const SessionId id = next_session_;
+  sessions_.emplace(id, std::move(next));
+  ++next_session_;
+  return id;
+}
+
 SessionId KvCacheManager::activeSession() const { return active_; }
 
 size_t KvCacheManager::sessionCount() const { return sessions_.size(); }

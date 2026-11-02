@@ -132,6 +132,22 @@ public:
   void selectSession(SessionId session);
   /** Release a session's pages. The selected session cannot be destroyed. */
   void destroySession(SessionId session);
+  /** Create a new session that shares the parent's committed history and
+   * then diverges from it. Full pages below the fork point are shared
+   * read-only; the partial tail page is copied, so a session never writes
+   * into a page another session reads. The child inherits the committed
+   * token ids and prefix blocks of the shared history, so it can continue
+   * publishing and reusing prefixes from the fork point. The parent's rows
+   * are left unchanged; both sessions record the shared pages in their
+   * copy-on-write bookkeeping. Requires paged storage and an idle, valid
+   * parent. Like createSession(), the selection does not change.
+   */
+  SessionId forkSession(SessionId parent);
+  /** Fork at an earlier point: the child covers the first at_position rows
+   * of the parent (0 <= at_position <= committedLength()) and inherits the
+   * token ids and prefix blocks that cover them.
+   */
+  SessionId forkSession(SessionId parent, size_t at_position);
   SessionId activeSession() const;
   size_t sessionCount() const;
 
