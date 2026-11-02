@@ -172,7 +172,7 @@ stale/torn records are rejected and older skeletons keep the fallback path.
 | `htp_dspq_wire.h` | the dspqueue message format shared with `nntr_hvx_dspq.c` |
 | `htp_moe_opts.h`, `htp_expert_prefetch.h`, `htp_router_predict.h` | MoE cache sizing, prefetch and prediction |
 | `htp_expert_read_pool.h`, `htp_token_completion.h` | demand-read worker ownership and optional token-completion hint |
-| `htp_prepared_fc.h`, `htp_prepared_qs2.h`, `htp_prepared_tl2.h`, `htp_qs2_lut_layout.h` | how each weight format is laid out in the arena |
+| `htp_prepared_fc.h`, `htp_prepared_qs2.h`, `htp_prepared_tl2.h` | prepared TL2 artifacts and shared endian/CRC/file helpers |
 | `nntrainer/htp_context.cpp` | `htp_prepare_runtime` / `htp_release_runtime`, the process-wide handle the C API and the CLI share |
 
 The CPU op table (`cpu_backend/cpu_ops_table.h`) carries the counterparts the

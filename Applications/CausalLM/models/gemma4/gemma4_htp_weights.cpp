@@ -35,7 +35,6 @@
 #include <htp_tie_word_embedding.h>
 #include <htp_wh_layout.h>
 #include <lfm2_moe_layer.h>
-#include <lfm2_moe_pool_layer.h>
 #include <lm_head.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
@@ -46,8 +45,7 @@
 namespace causallm {
 namespace {
 bool isMoeLayer(const ml::train::Layer &l) {
-  return l.getType() == Lfm2MoELayer::type ||
-         l.getType() == Lfm2MoePoolLayer::type;
+  return l.getType() == Lfm2MoELayer::type;
 }
 
 void packCpuWeight(nntrainer::Tensor &weight) {
@@ -467,8 +465,6 @@ void Gemma4HtpTransformer::repack_weight() {
         auto *layer = static_cast<nntrainer::LayerNode &>(l).getLayer();
         if (auto *moe = dynamic_cast<Lfm2MoELayer *>(layer))
           moe_all_resident = moe->preloadExperts(context);
-        else if (auto *pool = dynamic_cast<Lfm2MoePoolLayer *>(layer))
-          moe_all_resident = pool->preloadExperts(context);
       }
       // [doc 47 section 20.1, lever 6] One warm-up call through the layer
       // kernel at load, so the first prefill does not pay the first call's

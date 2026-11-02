@@ -1558,7 +1558,7 @@ static bool tryMoeLayerOnAccelerator(
   // [#260, plan 201 S1] A virtual layer hands all its experts and the
   // LRU's policy to the backend at its first call (the first prefill runs
   // the layers in order), for the one-PD token's miss path: the pool's
-  // slots are this LRU's, one set (lfm2_moe_pool_layer.cpp's hand-over).
+  // slots are the same slots tracked by this LRU.
   if (experts_virtual) {
     if (g_handed_expert_layers.insert(&context.getWeight(gate_up_indices[0]))
           .second) {

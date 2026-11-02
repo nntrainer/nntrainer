@@ -9,6 +9,7 @@
 #include "hvx_gemv_u8tl2.h"
 #include <cmath>
 #include <iostream>
+#include <mutex>
 #include <thread>
 
 #if defined(__ANDROID__) || defined(__linux__)
