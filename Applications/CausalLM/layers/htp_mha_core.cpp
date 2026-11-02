@@ -482,13 +482,13 @@ void HtpMHACoreLayer::incremental_forwarding(
     htp_owns_cache_ = true;
     return;
   }
-  // DSP ownership leaves the host's decoded rows stale. Reject appended
-  // multi-row prefill until it can use DSP KV or synchronize it to the host.
+  // Direct layer calls cannot consume stale host KV. Supported appended
+  // chunks enter through HtpContext, which preserves the resident DSP state.
   NNTR_THROW_IF(htp_owns_cache_ && _to - _from > 1 && _from > 0,
                 std::runtime_error)
     << "mha_core: a multi-row forwarding at " << _from
     << " after the HTP decode hook took over the KV cache "
-       "(NNTR_HTP_FORWARD=1 supports one prompt per process)";
+       "(use the HtpContext continuation entry for appended tokens)";
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.

@@ -350,6 +350,8 @@ class HtpComputeOps : public CpuComputeOps {
   using StaticQuant = HtpWeightRegistry::StaticQuant;
 
 public:
+  HtpDecodeRuntime &decodeRuntime() { return decode_; }
+
   /** Stop and join all background workers. Call only between tokens, with
    *  no inference in flight, before releasing their buffers or session. */
   void stopWorkers() {
@@ -9787,6 +9789,11 @@ public:
 static std::unique_ptr<HtpComputeOps> &htpOpsInstance() {
   static std::unique_ptr<HtpComputeOps> instance;
   return instance;
+}
+
+HtpDecodeRuntime *getHtpDecodeRuntime() noexcept {
+  auto &instance = htpOpsInstance();
+  return instance ? &instance->decodeRuntime() : nullptr;
 }
 
 static thread_local bool htp_decode_active = false;

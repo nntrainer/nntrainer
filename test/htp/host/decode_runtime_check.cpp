@@ -59,7 +59,50 @@ int main() {
     assert(runtime.kv_len_[0] == 2); // Hook counters never reset session KV.
     assert(runtime.conv_next_pos_[runtime.kind_ops_[HTP_OP_CONV1D_GATE][0]] ==
            2);
+    assert(!runtime.canContinue(3));
+    runtime.graph_inited_ = runtime.q4m1_bound_ = true;
+    runtime.prompt_tokens_ = 1;
+    runtime.kv_len_[0] = 3;
+    for (auto op : runtime.kind_ops_[HTP_OP_CONV1D_GATE])
+      runtime.conv_next_pos_[op] = 3;
+    assert(runtime.canContinue(3));
+    runtime.checkContinuationRange(3, 6);
+    assert(!runtime.canContinue(2) && !runtime.canContinue(4));
+    runtime.have_id_ = true;
+    assert(!runtime.canContinue(3));
+    runtime.have_id_ = false;
+    runtime.pending_op_ = 0;
+    assert(!runtime.canContinue(3));
+    runtime.clearPending();
+    runtime.want_logits_ = false;
+    try {
+      nntrainer::HtpDecodeRuntime::LogitsRequest request(runtime);
+      request.set(true);
+      runtime.checkContinuationRange(3, shape.max_seq + 1);
+      assert(false);
+    } catch (const std::invalid_argument &) {
+      assert(!runtime.want_logits_);
+    }
+    const auto conv_op = runtime.kind_ops_[HTP_OP_CONV1D_GATE][0];
+    runtime.conv_next_pos_[conv_op] = 0;
+    threw = false;
+    try {
+      runtime.checkContinuationRange(3, 6);
+    } catch (const std::logic_error &) {
+      threw = true;
+    }
+    assert(threw); // Never reseed a stale host convolution state.
+    runtime.conv_next_pos_[conv_op] = 3;
+    runtime.kv_len_[0] = 0;
+    threw = false;
+    try {
+      runtime.checkContinuationRange(3, 6);
+    } catch (const std::logic_error &) {
+      threw = true;
+    }
+    assert(threw); // Never reseed a stale or released host KV cache.
     runtime.indexGraph(mask);
+    assert(!runtime.canContinue(3));
     assert(runtime.kv_len_[0] == 0);
     assert(runtime.cur_pos_ == HTP_GRAPH_NO_OP);
     assert(!runtime.beginRow(HTP_OP_RMSNORM, 0));
