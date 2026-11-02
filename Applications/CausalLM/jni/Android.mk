@@ -156,3 +156,19 @@ LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES) \
     $(LOCAL_PATH)/../api \
     $(LOCAL_PATH)/$(UNITTEST_MODELS_DIR)
 include $(BUILD_EXECUTABLE)
+
+# MHACoreLayer host-path characterization test (layers/unittest_mha_core.cpp)
+# against the prebuilt libcausallm.so, which exports the layer. Meson builds
+# and runs it on the host; this module is how it runs on a device, where an
+# fp16 build takes the layer's FP16 path. The test file is built without
+# -ffast-math so its reference arithmetic stays plain.
+include $(CLEAR_VARS)
+LOCAL_MODULE := unittest_mha_core
+LOCAL_CFLAGS += -O2 -Igoogletest/include -Igoogletest/
+LOCAL_LDLIBS := -llog -landroid
+LOCAL_SRC_FILES := ../layers/unittest_mha_core.cpp
+LOCAL_SHARED_LIBRARIES := causallm nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest_main
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES) \
+    $(LOCAL_PATH)/$(GTEST_PATH)/include
+include $(BUILD_EXECUTABLE)
