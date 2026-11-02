@@ -39,6 +39,7 @@
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
+#include <runtime_config.h>
 #include <util_simd.h>
 
 #include <map>
@@ -336,6 +337,20 @@ void setPrefillSpanHint(unsigned int span);
 /** @copydoc setPrefillSpanHint(unsigned int) */
 unsigned int prefillSpanHint();
 
+/** Paged KV page table for gemm_attention: k_pages/v_pages[p] point at the
+ * binary16 token-major page base (row stride = num_kv_heads * head_dim, the
+ * continuous cache layout) and page_tokens is the page width in tokens. When
+ * page_tokens is a multiple of the flash key block Bk (512 on x86, 128
+ * elsewhere), the x86 and tiled ARM arms read pages in place with the
+ * continuous path's block arithmetic; otherwise the history is gathered once
+ * into the contiguous pack buffers.
+ */
+struct MhaPagedKvPages {
+  const uint16_t *const *k_pages = nullptr;
+  const uint16_t *const *v_pages = nullptr;
+  unsigned int page_tokens = 0;
+};
+
 /**
  * @class MHA Core Layer
  * @brief Part of Multi-Head-Attention Layer.
@@ -560,6 +575,13 @@ private:
    */
   bool use_external_cache = false;
 
+  /** Android CPU opt-in preserving FP32 Q/K/V/O for the external-cache RoPE
+   * producer profile. Validated once in finalize(); the default retains the
+   * legacy Android all-half attention arithmetic. */
+  bool cpu_attention_fp32 = false;
+  /** Backend and CPU feature snapshot refreshed by finalize, not per step. */
+  RuntimeConfig runtime_config;
+
   /** intermal info */
   size_t num_heads_Q;
   size_t num_heads_KV;
@@ -673,10 +695,13 @@ private:
   /**
    * @brief GEMM-based flash attention for one batch (covers both encoder
    *        non-causal and causal-LLM prefill paths).
-   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
-   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
-   *        balanced parallel_for over (h_q, query_block) units with online
-   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
+   *        2-phase: (1) de-interleave Q into contiguous [H,N,d] buffers;
+   *        x86 reads non-INT8 K/V directly from token-major cache rows using
+   *        their leading dimension, while ARM CPU packs bounded K/V tiles
+   *        immediately before the contiguous half kernels. Other compatibility
+   *        paths pack/dequantize contiguous per-head buffers; (2) balanced
+   *        parallel_for over (h_q, query_block) units with online softmax over
+   *        key-blocks (QK -> softmax -> AV).
    *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
    *        + in-block boundary mask. Sliding window: key-block lower-bound
    *        skip + in-block lower mask.
@@ -684,13 +709,18 @@ private:
    * @param[in] N_q       step length (= step_size, rows of the output)
    * @param[in] cache_from absolute starting position of queries in the cache
    *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
+   * @param[in] paged      optional paged KV page table (see MhaPagedKvPages);
+   *                      when given, K/V are read from the pages instead of
+   *                      the b_cached_key/b_cached_value tensors (which are
+   *                      then ignored and may be small identity tensors)
    */
   void gemm_attention(nntrainer::Tensor &query_step,
                       nntrainer::Tensor &b_cached_key,
                       nntrainer::Tensor &b_cached_value,
                       nntrainer::Tensor &attention_output_step,
                       unsigned int N_kv, unsigned int N_q,
-                      unsigned int cache_from);
+                      unsigned int cache_from,
+                      const MhaPagedKvPages *paged = nullptr);
 
   enum INOUT_INDEX {
     /** input index */
@@ -860,6 +890,30 @@ private:
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
                                   bool apply_rope = true);
+
+  /**
+   * @brief     run one batch through paged CPU KV storage
+   * @details   Applies RoPE to the new Q/K block, appends owner K/V to the
+   *            bound KV step and attends over the pages. Returns false when
+   *            no paged KV step is active (contiguous execution continues).
+   * @param[in] batch batch index (must be 0)
+   * @param[in] from first query position
+   * @param[in] to one past the last query position
+   * @param[in] query query block
+   * @param[in] key key block (pre-RoPE)
+   * @param[in] value value block
+   * @param[out] output attention output block
+   * @param[in] key_handle one-row key identity of this layer
+   * @param[in] value_handle one-row value identity of this layer
+   * @param[in] sink optional per-head attention sink logits
+   * @return true when the paged path handled the batch
+   */
+  bool paged_forwarding(unsigned int batch, unsigned int from, unsigned int to,
+                        nntrainer::Tensor &query, nntrainer::Tensor &key,
+                        nntrainer::Tensor &value, nntrainer::Tensor &output,
+                        nntrainer::Tensor &key_handle,
+                        nntrainer::Tensor &value_handle,
+                        nntrainer::Tensor *sink);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

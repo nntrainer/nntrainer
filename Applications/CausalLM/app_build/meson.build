@@ -84,6 +84,7 @@ if is_android
   # and the header-only layer profiler (layers/llm). They are deliberately not
   # installed, so the prebuilt include dir alone cannot provide them.
   foreach p : [
+    nntrainer_root / 'nntrainer',
     nntrainer_root / 'nntrainer' / 'utils',
     nntrainer_root / 'nntrainer' / 'tensor',
     nntrainer_root / 'nntrainer' / 'tensor' / 'cl_operations',

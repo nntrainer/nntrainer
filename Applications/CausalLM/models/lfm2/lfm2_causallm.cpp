@@ -570,12 +570,8 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
   const unsigned int prefill_to = prefill_from + input_len;
   setKVCachePosition(prefill_from);
 
-  std::vector<float *> outputs = model->incremental_inference(
-    BATCH_SIZE, input, label, input_len, prefill_from, prefill_to, false);
-
-  // Sync KVCacheManager's tracked position with mha_core's internal
-  // cache_index after prefill.
-  advanceKVCachePosition(input_len);
+  std::vector<float *> outputs = incrementalInference(
+    BATCH_SIZE, input, input_len, prefill_from, prefill_to);
 
   // Generate first token from prefill logits
   generated_ids_.clear();
@@ -592,7 +588,7 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
   }
 
   for (auto *out : outputs) {
-    delete[] out;
+    releaseLogitsBuf(out);
   }
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
@@ -647,10 +643,9 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
     input = build_inference_inputs(gen_input.data());
     allocateAndBindKVCache();
 
-    auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
+    auto output_interval = incrementalInference(
+      BATCH_SIZE, input, input_len, token_generation_idx - 1 + global_token_len,
+      token_generation_idx + global_token_len);
 
     id_list = generate(output_interval[0], do_sample);
     generated_ids_.push_back(id_list[0]);
@@ -665,7 +660,7 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
     }
 
     for (auto *out : output_interval) {
-      delete[] out;
+      releaseLogitsBuf(out);
     }
 
     // Check EOS

@@ -67,6 +67,10 @@ nntrainer_elements = [
   'graph'
 ]
 
+# Keep the core KV headers qualified as <kv_cache/...>: adding this directory
+# to nntrainer_elements would shadow CausalLM's legacy kv_cache_manager.h.
+subdir('kv_cache')
+
 if get_option('enable-opencl')
   nntrainer_elements += 'opencl'
   nntrainer_elements += 'layers/cl_layers'
