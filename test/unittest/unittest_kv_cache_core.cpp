@@ -52,6 +52,42 @@ void finish(KvCacheManager &manager, StepLease &&step) {
   manager.commit(std::move(step));
 }
 
+/** Commit one step whose key rows hold the token id and values id + 0.5. */
+void appendTokens(KvCacheManager &manager, const std::vector<TokenId> &ids) {
+  auto step = manager.beginStep(ids.size(), ids.data());
+  std::vector<float> keys, values;
+  for (TokenId id : ids)
+    for (int e = 0; e < 4; ++e) {
+      keys.push_back(static_cast<float>(id));
+      values.push_back(static_cast<float>(id) + 0.5f);
+    }
+  manager.append(step, 0, keys.data(), values.data(),
+                 keys.size() * sizeof(float));
+  finish(manager, std::move(step));
+}
+
+/** Append one more token, then return the first key element of every row. */
+std::vector<float> appendAndReadKeys(KvCacheManager &manager, TokenId id) {
+  auto step = manager.beginStep(1, &id);
+  std::vector<float> key(4, static_cast<float>(id)), value(4, id + 0.5f);
+  manager.append(step, 0, key.data(), value.data(), 16);
+  manager.markReady(step, 0);
+  std::vector<float> seen;
+  for (auto &view : manager.readKey(step, 0)) {
+    auto data = static_cast<const float *>(view.data());
+    for (size_t row = 0; row < view.sizeBytes() / 16; ++row)
+      seen.push_back(data[row * 4]);
+  }
+  manager.commit(std::move(step));
+  return seen;
+}
+
+CacheSpec pagedSpec() {
+  auto s = spec();
+  s.page_tokens = 2;
+  return s;
+}
+
 } // namespace
 
 TEST(KvCacheCore, validateBeforeAllocating) {
@@ -1055,6 +1091,223 @@ TEST(KvCacheCore, pagePoolAsksReclaimersBeforeFailing) {
   pool->removeReclaimer(token);
   EXPECT_THROW(pool->acquire(64), std::bad_alloc);
   EXPECT_EQ(calls, 1u);
+}
+
+TEST(KvCacheCore, pagedSessionsAreIndependentAndShareGraphIdentities) {
+  KvCacheManager manager;
+  manager.initialize(pagedSpec());
+  auto key_identity = manager.graphKeyMemory(0);
+  auto value_identity = manager.graphValueMemory(0);
+  appendTokens(manager, {1, 2, 3});
+  const auto second = manager.createSession();
+  EXPECT_NE(second, KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(manager.activeSession(), KvCacheManager::kDefaultSession);
+
+  manager.selectSession(second);
+  EXPECT_EQ(manager.activeSession(), second);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+  EXPECT_EQ(manager.graphKeyMemory(0), key_identity);
+  auto step = manager.beginStep(1);
+  {
+    auto scope = manager.bindStep(step);
+    auto access = KvStepScope::access(key_identity->getAddr(),
+                                      value_identity->getAddr(), 0, 0, 1);
+    ASSERT_TRUE(access);
+    std::vector<float> row(4, 7);
+    access->append(row.data(), row.data(), row.size() * sizeof(float));
+    EXPECT_THROW(manager.selectSession(KvCacheManager::kDefaultSession),
+                 std::logic_error);
+  }
+  manager.commit(std::move(step));
+  EXPECT_EQ(manager.committedLength(), 1u);
+  EXPECT_THROW(manager.selectSession(second + 100), std::out_of_range);
+  EXPECT_THROW(manager.destroySession(second), std::logic_error);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), (std::vector<float>{1, 2, 3, 4}));
+  manager.destroySession(second);
+  EXPECT_EQ(manager.sessionCount(), 1u);
+  EXPECT_THROW(manager.selectSession(second), std::out_of_range);
+}
+
+TEST(KvCacheCore, contiguousStorageHasOneSessionAndNoPrefixReuse) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  EXPECT_EQ(manager.sessionCount(), 1u);
+  EXPECT_THROW(manager.createSession(), std::logic_error);
+  EXPECT_THROW(manager.reusePrefix(nullptr, 0), std::logic_error);
+}
+
+TEST(KvCacheCore, reusePrefixKeepsMatchingOwnRowsAndTracksKnownIds) {
+  KvCacheManager manager;
+  manager.initialize(pagedSpec());
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(manager.knownTokenCount(), 5u);
+  const std::vector<TokenId> again = {1, 2, 3, 9};
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 3u);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u); // Two pages remain.
+
+  // Ids of an aborted step are discarded.
+  const std::vector<TokenId> dropped = {6};
+  manager.abort(manager.beginStep(1, dropped.data()));
+  EXPECT_EQ(manager.knownTokenCount(), 3u);
+
+  // A step without ids ends the known prefix; truncation restores it.
+  finish(manager, manager.beginStep(1));
+  EXPECT_EQ(manager.committedLength(), 4u);
+  EXPECT_EQ(manager.knownTokenCount(), 3u);
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 3u);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(appendAndReadKeys(manager, 9), (std::vector<float>{1, 2, 3, 9}));
+  EXPECT_EQ(manager.knownTokenCount(), 4u);
+
+  // Snapshots carry no ids.
+  std::stringstream saved;
+  manager.savePlane(saved, 0, true, 4);
+  manager.savePlane(saved, 0, false, 4);
+  manager.restorePlanes(saved, 4);
+  EXPECT_EQ(manager.committedLength(), 4u);
+  EXPECT_EQ(manager.knownTokenCount(), 0u);
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 0u);
+  EXPECT_THROW(manager.reusePrefix(nullptr, 1), std::invalid_argument);
+}
+
+TEST(KvCacheCore, prefixCachePublishesFullPagesAndSessionsAdoptThem) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  EXPECT_EQ(manager.prefixCache(), prefix);
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(prefix->stats().blocks, 2u); // [1 2] [3 4]; the tail is private.
+  EXPECT_EQ(prefix->stats().inserted_blocks, 2u);
+  EXPECT_EQ(pool->reservedBytes(), 384u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt = {1, 2, 3, 4, 9, 9};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3, 4}));
+  EXPECT_EQ(prefix->stats().hit_blocks, 2u);
+  EXPECT_EQ(prefix->stats().lookups, 1u);
+  EXPECT_EQ(pool->reservedBytes(), 384u); // Adoption allocates nothing.
+  EXPECT_EQ(appendAndReadKeys(manager, 9), (std::vector<float>{1, 2, 3, 4, 9}));
+  EXPECT_EQ(pool->reservedBytes(), 512u);
+  EXPECT_EQ(manager.stats().backing_bytes, 384u); // Includes shared pages.
+
+  // A different first block never matches a later block with equal tokens.
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> shifted = {9, 9, 3, 4, 1};
+  EXPECT_EQ(manager.reusePrefix(shifted.data(), shifted.size()), 0u);
+}
+
+TEST(KvCacheCore, prefixSharedPageIsCopiedBeforeAppend) {
+  auto prefix = std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>());
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  const auto other = manager.createSession();
+  manager.selectSession(other);
+  const std::vector<TokenId> prompt = {1, 2, 3, 4, 5};
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  manager.setPosition(3); // Inside the shared block [3 4].
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3}));
+  EXPECT_EQ(appendAndReadKeys(manager, 8), (std::vector<float>{1, 2, 3, 8}));
+
+  // The publisher and the cache still see the original rows.
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{1, 2, 3, 4, 5}));
+  manager.selectSession(manager.createSession());
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  EXPECT_EQ(appendAndReadKeys(manager, 6), (std::vector<float>{1, 2, 3, 4, 6}));
+  // The copy is published under its own chain once it is full again.
+  const std::vector<TokenId> copied = {1, 2, 3, 8, 0};
+  manager.selectSession(manager.createSession());
+  EXPECT_EQ(manager.reusePrefix(copied.data(), copied.size()), 4u);
+}
+
+TEST(KvCacheCore, prefixCacheReleasesUnusedBlocksUnderPoolBudget) {
+  auto pool = std::make_shared<KvPagePool>(256); // Two K/V page pairs.
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  EXPECT_EQ(prefix->stats().blocks, 1u);
+  manager.reset(); // The cache keeps the published block.
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+
+  appendTokens(manager, {3, 4, 5, 6}); // Evicts [1 2] to fit.
+  EXPECT_EQ(prefix->stats().evicted_blocks, 1u);
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(pool->reservedBytes(), 256u);
+  EXPECT_EQ(prefix->evictUnused(), 0u); // The session still uses both.
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> ids = {7, 8};
+  EXPECT_THROW(manager.beginStep(ids.size(), ids.data()), std::bad_alloc);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_FALSE(manager.hasActiveStep());
+}
+
+TEST(KvCacheCore, prefixCacheBlockBoundEvictsOnlyUnreferencedLeaves) {
+  auto prefix =
+    std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>(), 2);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto other = manager.createSession();
+  manager.selectSession(other);
+  appendTokens(manager, {9, 9}); // Full of referenced blocks: not published.
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(prefix->stats().evicted_blocks, 0u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  manager.reset();
+  manager.selectSession(other);
+  appendTokens(manager, {5, 6}); // Publishes [9 9] and [5 6] in their place.
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(prefix->stats().evicted_blocks, 2u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt = {9, 9, 5, 6, 1};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  const std::vector<TokenId> evicted = {1, 2, 3, 4, 1};
+  EXPECT_EQ(manager.reusePrefix(evicted.data(), evicted.size()), 0u);
+}
+
+TEST(KvCacheCore, prefixCacheRejectsMismatchedLayoutPoolAndBatch) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  const auto s = pagedSpec();
+  KvCacheManager first, other;
+  first.initialize(s, allocator, nullptr, prefix);
+  auto wider_pages = s;
+  wider_pages.page_tokens = 4;
+  EXPECT_THROW(other.initialize(wider_pages, allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_THROW(
+    other.initialize(s, allocator, std::make_shared<KvPagePool>(), prefix),
+    std::invalid_argument);
+  auto batched = s;
+  batched.layers[0].batch = 2;
+  EXPECT_THROW(other.initialize(batched, allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_THROW(other.initialize(spec(), allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_NO_THROW(other.initialize(s, allocator, pool, prefix));
+  EXPECT_THROW(KvPrefixCache cache(nullptr), std::invalid_argument);
 }
 
 GTEST_API_ int main(int argc, char **argv) {

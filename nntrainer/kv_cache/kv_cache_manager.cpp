@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file kv_cache_manager.cpp
- * @brief Synchronous CPU KV ownership, views and transactional publication.
+ * @brief Synchronous CPU KV sessions, views, publication and prefix reuse.
  * @author Codex (OpenAI)
  * @bug Sessions are thread confined; asynchronous device access is unsupported.
  */
@@ -20,11 +20,17 @@ struct ViewEpoch {
   uint64_t active_step = 0;
 };
 
+namespace {
+size_t roundedPageBytes(size_t bytes) { return (bytes + 63) & ~size_t{63}; }
+} // namespace
+
 struct SessionState {
   CacheSpec spec;
+  /** Contiguous planes, or the shared one-row graph identities when paged. */
   std::vector<std::shared_ptr<KvStorage>> keys, values;
   std::vector<std::vector<std::shared_ptr<KvStorage>>> key_pages, value_pages;
   std::shared_ptr<KvPagePool> pool;
+  std::shared_ptr<KvPrefixCache> prefix;
   std::vector<bool> ready;
   std::shared_ptr<ViewEpoch> epoch = std::make_shared<ViewEpoch>();
   size_t position = 0;
@@ -32,6 +38,27 @@ struct SessionState {
   bool valid = true;
   bool overwrites = false;
   CacheStats stats;
+  /** Known ids of committed rows; always a prefix of [0, position). */
+  std::vector<TokenId> tokens;
+  /** Ids of the live step, appended on commit when they extend tokens. */
+  std::vector<TokenId> pending_tokens;
+  bool pending_known = false;
+  /** Prefix-cache block ids of the leading full pages, in page order. */
+  std::vector<uint64_t> block_ids;
+  /** Cache epoch at which block_ids were last checked against evictions. */
+  uint64_t prefix_epoch = 0;
+  /** Leading logical pages that the prefix cache or another session may also
+   * reference. They are never written in place: a step that has to append to
+   * one of them copies it first. */
+  size_t shared_pages = 0;
+
+  void forgetPrefix() noexcept {
+    tokens.clear();
+    pending_tokens.clear();
+    pending_known = false;
+    block_ids.clear();
+    shared_pages = 0;
+  }
   // Shrinking never allocates, so lease destruction can return uncommitted
   // pages.
   void releaseTail(size_t position) noexcept {
@@ -47,12 +74,17 @@ struct SessionState {
           const size_t index = b * stride + p;
           if (key_pages[i][index]) {
             const size_t bytes = key_pages[i][index]->bytes();
-            stats.backing_bytes -= 2 * ((bytes + 63) & ~size_t{63});
+            stats.backing_bytes -= 2 * roundedPageBytes(bytes);
             key_pages[i][index].reset();
             value_pages[i][index].reset();
           }
         }
     }
+    // A page that is no longer full is no longer a complete cached block.
+    const size_t full = position / spec.page_tokens;
+    if (block_ids.size() > full)
+      block_ids.erase(block_ids.begin() + full, block_ids.end());
+    shared_pages = std::min(shared_pages, keep);
   }
 };
 
@@ -97,6 +129,8 @@ void StepLease::abort() noexcept {
   if (state_ && state_->epoch->active_step == id_) {
     if (state_->overwrites)
       state_->valid = false;
+    state_->pending_tokens.clear();
+    state_->pending_known = false;
     state_->releaseTail(state_->position);
     state_->epoch->active_step = 0;
     ++state_->epoch->generation;
@@ -111,24 +145,39 @@ KvCacheManager::~KvCacheManager() = default;
 
 void KvCacheManager::initialize(const CacheSpec &spec,
                                 std::shared_ptr<MemAllocator> allocator,
-                                std::shared_ptr<KvPagePool> page_pool) {
+                                std::shared_ptr<KvPagePool> page_pool,
+                                std::shared_ptr<KvPrefixCache> prefix_cache) {
   const auto bytes = spec.validate();
   if (state_ && state_->epoch->active_step)
     throw std::logic_error("KV step is in flight");
+  if (page_pool && !spec.page_tokens)
+    throw std::invalid_argument("Page pool requires paged KV geometry");
+  if (prefix_cache) {
+    if (page_pool && page_pool != prefix_cache->pool())
+      throw std::invalid_argument(
+        "KV prefix cache and its sessions must share one page pool");
+    prefix_cache->bind(spec); // Requires paged batch-1 geometry.
+    page_pool = prefix_cache->pool();
+  }
   auto next = std::make_shared<SessionState>();
   next->spec = spec;
   next->stats.backing_bytes = spec.page_tokens ? 0 : bytes;
-  if (page_pool && !spec.page_tokens)
-    throw std::invalid_argument("Page pool requires paged KV geometry");
   if (spec.page_tokens)
     next->pool = page_pool ? std::move(page_pool)
                            : std::make_shared<KvPagePool>(0, allocator);
+  next->prefix = std::move(prefix_cache);
   next->key_pages.resize(spec.layers.size());
   next->value_pages.resize(spec.layers.size());
   for (const auto &s : spec.layers) {
     if (spec.page_tokens) {
-      next->keys.push_back(nullptr);
-      next->values.push_back(nullptr);
+      // One-row graph identities, created up front so that every session of
+      // this manager shares them and a graph bound once can run any session.
+      // They never hold history and stay outside the page pool.
+      const size_t row = checkedMultiply(s.batch, s.rowBytes());
+      next->keys.push_back(
+        KvStorage::create(row, std::make_shared<MemAllocator>()));
+      next->values.push_back(
+        KvStorage::create(row, std::make_shared<MemAllocator>()));
       if (s.source < 0)
         ++next->stats.owner_layers;
     } else if (s.source >= 0) {
@@ -141,12 +190,64 @@ void KvCacheManager::initialize(const CacheSpec &spec,
     }
   }
   next->ready.resize(spec.layers.size());
-  if (state_)
-    ++state_->epoch->generation;
+  std::map<SessionId, std::shared_ptr<SessionState>> sessions;
+  sessions.emplace(kDefaultSession, next);
+  // Every view of every replaced session becomes stale.
+  for (auto &entry : sessions_)
+    ++entry.second->epoch->generation;
+  sessions_.swap(sessions);
   state_ = std::move(next);
+  active_ = kDefaultSession;
+  next_session_ = kDefaultSession + 1;
 }
 
-StepLease KvCacheManager::beginStep(size_t count) {
+SessionId KvCacheManager::createSession() {
+  if (!state_)
+    throw std::logic_error("KV cache is uninitialized");
+  if (!state_->spec.page_tokens)
+    throw std::logic_error("Additional KV sessions require paged storage");
+  auto next = std::make_shared<SessionState>();
+  next->spec = state_->spec;
+  next->keys = state_->keys; // Shared graph identities.
+  next->values = state_->values;
+  next->pool = state_->pool;
+  next->prefix = state_->prefix;
+  next->key_pages.resize(next->spec.layers.size());
+  next->value_pages.resize(next->spec.layers.size());
+  next->ready.resize(next->spec.layers.size());
+  next->stats.owner_layers = state_->stats.owner_layers;
+  const SessionId id = next_session_;
+  sessions_.emplace(id, std::move(next));
+  ++next_session_;
+  return id;
+}
+
+void KvCacheManager::selectSession(SessionId session) {
+  auto it = sessions_.find(session);
+  if (it == sessions_.end())
+    throw std::out_of_range("Unknown KV session");
+  if (state_ && state_->epoch->active_step)
+    throw std::logic_error("Cannot switch KV sessions during a step");
+  state_ = it->second;
+  active_ = session;
+}
+
+void KvCacheManager::destroySession(SessionId session) {
+  auto it = sessions_.find(session);
+  if (it == sessions_.end())
+    throw std::out_of_range("Unknown KV session");
+  if (session == active_)
+    throw std::logic_error("Cannot destroy the selected KV session");
+  // Exported views keep their pages alive but can no longer be accessed.
+  ++it->second->epoch->generation;
+  sessions_.erase(it);
+}
+
+SessionId KvCacheManager::activeSession() const { return active_; }
+
+size_t KvCacheManager::sessionCount() const { return sessions_.size(); }
+
+StepLease KvCacheManager::beginStep(size_t count, const TokenId *tokens) {
   if (!state_ || !state_->valid || state_->epoch->active_step)
     throw std::logic_error("KV session unavailable or step already active");
   if (!count ||
@@ -155,6 +256,10 @@ StepLease KvCacheManager::beginStep(size_t count) {
   for (const auto &s : state_->spec.layers)
     if (count > s.capacity)
       throw std::out_of_range("KV step exceeds physical capacity; split it");
+  // Copy the step's ids first, so a failed copy leaves the session unchanged.
+  std::vector<TokenId> pending;
+  if (tokens)
+    pending.assign(tokens, tokens + count);
   const size_t to = state_->position + count;
   if (state_->spec.page_tokens) {
     const size_t page_tokens = state_->spec.page_tokens;
@@ -164,7 +269,19 @@ StepLease KvCacheManager::beginStep(size_t count) {
     // pages are recorded and released again if any later acquisition fails,
     // leaving the session unchanged without copying the whole page table.
     const size_t first_page = state_->position / page_tokens;
+    // Copy-on-write: after a truncation into a page that may be shared, the
+    // step would append into a page that other sessions or the prefix cache
+    // still read. Give this session a private copy of its committed rows
+    // first. Whole shared pages are never written, so no other page needs it.
+    const size_t kept_rows = state_->position % page_tokens;
+    const bool copy_first = kept_rows && first_page < state_->shared_pages;
+    struct Replaced {
+      size_t layer;
+      size_t index;
+      std::shared_ptr<KvStorage> key, value;
+    };
     std::vector<std::pair<size_t, size_t>> added;
+    std::vector<Replaced> replaced;
     size_t backing = state_->stats.backing_bytes;
     try {
       for (size_t i = 0; i < state_->spec.layers.size(); ++i) {
@@ -182,11 +299,26 @@ StepLease KvCacheManager::beginStep(size_t count) {
           keys.resize(slots);
           values.resize(slots);
         }
+        if (copy_first)
+          replaced.reserve(replaced.size() + s.batch);
         for (size_t b = 0; b < s.batch; ++b)
           for (size_t p = first_page; p < pages; ++p) {
             const size_t index = b * stride + p;
-            if (keys[index])
+            if (keys[index]) {
+              if (!copy_first || p != first_page)
+                continue;
+              auto key = state_->pool->acquire(page_bytes);
+              auto value = state_->pool->acquire(page_bytes);
+              const size_t used = kept_rows * s.rowBytes();
+              std::memcpy(key->data(), keys[index]->data(), used);
+              std::memcpy(value->data(), values[index]->data(), used);
+              // Capacity was reserved above, so recording cannot throw.
+              replaced.push_back(
+                {i, index, std::move(keys[index]), std::move(values[index])});
+              keys[index] = std::move(key);
+              values[index] = std::move(value);
               continue;
+            }
             // Reserve first so recording the slot below cannot throw.
             if (added.size() == added.capacity())
               added.reserve(std::max<size_t>(16, 2 * added.capacity()));
@@ -203,9 +335,15 @@ StepLease KvCacheManager::beginStep(size_t count) {
         state_->key_pages[slot.first][slot.second].reset();
         state_->value_pages[slot.first][slot.second].reset();
       }
+      for (auto it = replaced.rbegin(); it != replaced.rend(); ++it) {
+        state_->key_pages[it->layer][it->index] = std::move(it->key);
+        state_->value_pages[it->layer][it->index] = std::move(it->value);
+      }
       throw;
     }
     state_->stats.backing_bytes = backing;
+    if (copy_first)
+      state_->shared_pages = first_page;
   }
   state_->overwrites = false;
   for (const auto &s : state_->spec.layers)
@@ -214,6 +352,8 @@ StepLease KvCacheManager::beginStep(size_t count) {
   // Old read ranges must expire before a new step can overwrite ring rows.
   ++state_->epoch->generation;
   state_->epoch->active_step = ++state_->next_step;
+  state_->pending_tokens = std::move(pending);
+  state_->pending_known = tokens != nullptr;
   return StepLease(state_, state_->epoch->active_step, state_->position, to);
 }
 
@@ -335,9 +475,65 @@ void KvCacheManager::commit(StepLease &&step) {
     if (state_->spec.layers[i].source < 0 &&
         state_->spec.layers[i].has_producer && !state_->ready[i])
       throw std::logic_error("KV commit before all producers completed");
+  // Ids extend the known prefix only when it already reaches this step.
+  bool record = state_->pending_known && state_->tokens.size() == step.from_;
+  if (record) {
+    try {
+      state_->tokens.insert(state_->tokens.end(),
+                            state_->pending_tokens.begin(),
+                            state_->pending_tokens.end());
+    } catch (...) {
+      record = false; // Unknown ids only disable reuse; the KV is committed.
+    }
+  }
   state_->position = step.to_;
   state_->epoch->active_step = 0;
   step.state_.reset();
+  state_->pending_tokens.clear();
+  state_->pending_known = false;
+  if (record)
+    publishPrefix();
+}
+
+void KvCacheManager::publishPrefix() noexcept {
+  auto &s = *state_;
+  if (!s.prefix || !s.spec.page_tokens)
+    return;
+  try {
+    auto &cache = *s.prefix;
+    if (s.prefix_epoch != cache.epoch()) {
+      // Blocks were dropped since the last check; keep the linked part only.
+      size_t linked = 0;
+      while (linked < s.block_ids.size() && cache.contains(s.block_ids[linked]))
+        ++linked;
+      s.block_ids.erase(s.block_ids.begin() + linked, s.block_ids.end());
+      s.prefix_epoch = cache.epoch();
+    }
+    const size_t page_tokens = s.spec.page_tokens;
+    const size_t full = std::min(s.tokens.size(), s.position) / page_tokens;
+    if (s.block_ids.size() >= full)
+      return;
+    std::vector<std::shared_ptr<KvStorage>> keys(s.spec.layers.size()),
+      values(s.spec.layers.size());
+    while (s.block_ids.size() < full) {
+      const size_t page = s.block_ids.size(); // Batch 1: slot == page.
+      for (size_t i = 0; i < s.spec.layers.size(); ++i) {
+        keys[i] = page < s.key_pages[i].size() ? s.key_pages[i][page] : nullptr;
+        values[i] =
+          page < s.value_pages[i].size() ? s.value_pages[i][page] : nullptr;
+      }
+      const uint64_t parent = page ? s.block_ids[page - 1] : 0;
+      const uint64_t id = cache.insert(
+        parent, s.tokens.data() + page * page_tokens, keys, values);
+      if (!id)
+        break; // Cache full of referenced blocks, or the chain was evicted.
+      // Mark the page shared before anything else can fail.
+      s.shared_pages = std::max(s.shared_pages, page + 1);
+      s.block_ids.push_back(id);
+    }
+  } catch (...) {
+    // Publication is an optimization; the committed session is unaffected.
+  }
 }
 
 void KvCacheManager::abort(StepLease &&step) {
@@ -350,6 +546,7 @@ void KvCacheManager::reset() {
     throw std::logic_error("Cannot reset an uninitialized or active KV cache");
   state_->valid = true;
   state_->position = 0;
+  state_->forgetPrefix();
   if (state_->spec.page_tokens) {
     for (auto &pages : state_->key_pages)
       pages.clear();
@@ -369,7 +566,93 @@ void KvCacheManager::setPosition(size_t position) {
     throw std::logic_error("Cannot seek beyond committed paged KV");
   state_->releaseTail(position);
   state_->position = position;
+  if (state_->tokens.size() > position)
+    state_->tokens.resize(position);
   ++state_->epoch->generation;
+}
+
+void KvCacheManager::requireIdle() const {
+  if (!state_ || !state_->valid || state_->epoch->active_step)
+    throw std::logic_error("KV session is unavailable or has an active step");
+}
+
+size_t KvCacheManager::reusePrefix(const TokenId *tokens, size_t count) {
+  requireIdle();
+  if (!state_->spec.page_tokens)
+    throw std::logic_error("KV prefix reuse requires paged storage");
+  if (count && !tokens)
+    throw std::invalid_argument("KV prefix reuse requires token ids");
+  auto &s = *state_;
+  count = std::min(count, s.spec.layers.front().max_tokens);
+
+  // Rows this session already holds for the same leading tokens.
+  size_t own = 0;
+  const size_t known = std::min(s.tokens.size(), count);
+  while (own < known && s.tokens[own] == tokens[own])
+    ++own;
+
+  std::vector<uint64_t> ids;
+  std::vector<std::vector<std::shared_ptr<KvStorage>>> keys, values;
+  if (s.prefix)
+    s.prefix->match(tokens, count, ids, keys, values);
+  const size_t page_tokens = s.spec.page_tokens;
+  const size_t cached = ids.size() * page_tokens;
+
+  if (cached > own) {
+    // Stage the adopted page table and publish it only once complete.
+    const size_t layers = s.spec.layers.size();
+    std::vector<std::vector<std::shared_ptr<KvStorage>>> key_pages(layers),
+      value_pages(layers);
+    size_t backing = 0;
+    for (size_t i = 0; i < layers; ++i) {
+      const auto &l = s.spec.layers[i];
+      if (l.source >= 0)
+        continue;
+      const size_t stride = 1 + (l.max_tokens - 1) / page_tokens;
+      const size_t page_bytes = checkedMultiply(page_tokens, l.rowBytes());
+      key_pages[i].resize(checkedMultiply(l.batch, stride));
+      value_pages[i].resize(key_pages[i].size());
+      for (size_t p = 0; p < ids.size(); ++p) {
+        const auto &key = keys[p].at(i);
+        const auto &value = values[p].at(i);
+        if (!key || !value || key->bytes() != page_bytes ||
+            value->bytes() != page_bytes)
+          throw std::logic_error("Cached KV block lacks an owner page");
+        backing = checkedAdd(backing, 2 * roundedPageBytes(page_bytes));
+        key_pages[i][p] = key; // Batch 1: slot == page.
+        value_pages[i][p] = value;
+      }
+    }
+    std::vector<TokenId> adopted(tokens, tokens + cached);
+    // Nothing below throws. Replaced private pages return to the pool.
+    s.key_pages.swap(key_pages);
+    s.value_pages.swap(value_pages);
+    s.tokens.swap(adopted);
+    s.block_ids.swap(ids);
+    s.prefix_epoch = s.prefix->epoch();
+    s.shared_pages = s.block_ids.size();
+    s.position = cached;
+    s.stats.backing_bytes = backing;
+    s.prefix->recordHit(s.block_ids.size());
+  } else if (own < s.position) {
+    s.releaseTail(own);
+    s.position = own;
+    s.tokens.resize(own);
+  }
+  ++s.epoch->generation;
+  return s.position;
+}
+
+std::vector<TokenId> KvCacheManager::committedTokens() const {
+  return state_ ? state_->tokens : std::vector<TokenId>{};
+}
+
+size_t KvCacheManager::knownTokenCount() const {
+  return state_ ? state_->tokens.size() : 0;
+}
+
+std::shared_ptr<KvPrefixCache> KvCacheManager::prefixCache() const {
+  return state_ ? state_->prefix : nullptr;
 }
 
 size_t KvCacheManager::committedLength() const {
@@ -474,21 +757,15 @@ size_t KvCacheManager::pageTokens() const {
 }
 
 std::shared_ptr<MemoryData> KvCacheManager::graphKeyMemory(size_t layer) {
-  const auto &s = layerSpec(layer);
+  layerSpec(layer);
   if (!paged())
     return keyMemory(layer);
-  if (!state_->keys[layer])
-    state_->keys[layer] = KvStorage::create(
-      checkedMultiply(s.batch, s.rowBytes()), std::make_shared<MemAllocator>());
-  return state_->keys[layer]->memory();
+  return state_->keys[layer]->memory(); // Shared by every session.
 }
 std::shared_ptr<MemoryData> KvCacheManager::graphValueMemory(size_t layer) {
-  const auto &s = layerSpec(layer);
+  layerSpec(layer);
   if (!paged())
     return valueMemory(layer);
-  if (!state_->values[layer])
-    state_->values[layer] = KvStorage::create(
-      checkedMultiply(s.batch, s.rowBytes()), std::make_shared<MemAllocator>());
   return state_->values[layer]->memory();
 }
 
@@ -588,6 +865,7 @@ void KvCacheManager::restorePlanes(std::istream &in, size_t length) {
   state_->value_pages.swap(next.state_->value_pages);
   state_->stats = next.state_->stats;
   state_->position = length;
+  state_->forgetPrefix(); // Snapshots carry no ids; the new pages are private.
   ++state_->epoch->generation;
 }
 

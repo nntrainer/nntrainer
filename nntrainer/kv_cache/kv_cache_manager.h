@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /** @file kv_cache_manager.h
- * @brief Internal synchronous CPU cache, single session and single live step.
+ * @brief Internal synchronous CPU cache: paged sessions, one live step.
  * @author Codex (OpenAI)
  * @bug Sessions are thread confined; asynchronous device access is unsupported.
  */
@@ -9,9 +9,11 @@
 
 #include <kv_cache/kv_cache_spec.h>
 #include <kv_cache/kv_page_pool.h>
+#include <kv_cache/kv_prefix_cache.h>
 #include <kv_cache/kv_storage.h>
 
 #include <iosfwd>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -69,10 +71,15 @@ private:
 };
 
 struct CacheStats {
-  size_t backing_bytes =
-    0; /**< Session pages; excludes idle or view-only pool pages. */
+  /** Pages referenced by the active session, including prefix pages it shares
+   * with other sessions or the prefix cache; excludes idle or view-only pool
+   * pages. Summing it over sessions counts shared pages more than once. */
+  size_t backing_bytes = 0;
   size_t owner_layers = 0;
 };
+
+/** Identifies one KV session of a manager. */
+using SessionId = uint64_t;
 
 /** CPU attention parameters. Queries and results use [token, query_head, dim].
  * RoPE must already have been applied to queries and keys by the producer.
@@ -88,21 +95,52 @@ struct AttentionOptions {
 };
 
 /** Cache ownership, publication and direct segmented CPU attention.
+ *
+ * A manager owns one or more sessions. A session is an independent sequence:
+ * its own page table, committed position, step state and token ids. All
+ * sessions of a manager share the spec, page pool, optional prefix cache and
+ * the graph identity tensors, so a graph bound once can run any session; the
+ * selected session receives every step, view and snapshot call. Additional
+ * sessions require paged storage. Only the selected session can have a live
+ * step, and selection cannot change while one is live.
+ *
  * Thread confined. No asynchronous backend completion is advertised.
  */
 class KvCacheManager {
 public:
+  /** The session that initialize() creates and selects. */
+  static constexpr SessionId kDefaultSession = 0;
+
   KvCacheManager();
   ~KvCacheManager();
   KvCacheManager(const KvCacheManager &) = delete;
   KvCacheManager &operator=(const KvCacheManager &) = delete;
 
-  /** page_tokens enables segmented CPU storage allocated as steps advance. */
+  /** page_tokens enables segmented CPU storage allocated as steps advance.
+   * A prefix cache requires paged batch-1 geometry and uses its own pool;
+   * page_pool, when also given, must be that pool. Replaces every session.
+   */
   void initialize(
     const CacheSpec &spec,
     std::shared_ptr<MemAllocator> allocator = std::make_shared<MemAllocator>(),
-    std::shared_ptr<KvPagePool> page_pool = nullptr);
-  StepLease beginStep(size_t token_count);
+    std::shared_ptr<KvPagePool> page_pool = nullptr,
+    std::shared_ptr<KvPrefixCache> prefix_cache = nullptr);
+
+  /** Create an empty paged session; it does not change the selection. */
+  SessionId createSession();
+  /** Route subsequent calls to an existing session. Requires no live step. */
+  void selectSession(SessionId session);
+  /** Release a session's pages. The selected session cannot be destroyed. */
+  void destroySession(SessionId session);
+  SessionId activeSession() const;
+  size_t sessionCount() const;
+
+  /** tokens, when given, holds the ids of the token_count rows this step
+   * writes. Steps that carry ids keep the session's committed ids complete,
+   * which prefix reuse and publication need; a step without ids ends the
+   * known prefix until the session is truncated back into it.
+   */
+  StepLease beginStep(size_t token_count, const TokenId *tokens = nullptr);
   std::vector<KvView> writeKey(const StepLease &, size_t layer,
                                size_t batch = 0);
   std::vector<KvView> writeValue(const StepLease &, size_t layer,
@@ -128,11 +166,28 @@ public:
                                const AttentionOptions &, size_t batch = 0);
   /** Bind checked accesses to one synchronous graph invocation. */
   std::unique_ptr<KvStepScope> bindStep(const StepLease &);
+  /** Publish the step. With a prefix cache, every newly completed full page
+   * whose token ids are known is published as a shared block.
+   */
   void commit(StepLease &&);
   void abort(StepLease &&);
   void reset();
   /** Compatibility restore/truncate. Caller supplies matching cache bytes. */
   void setPosition(size_t position);
+  /** Reuse as much of tokens[0, count) as is already computed, then continue
+   * from the returned position (always <= count).
+   *
+   * The session keeps its own committed rows that match the leading tokens.
+   * If the prefix cache holds a longer chain of full blocks, the session
+   * instead adopts those shared pages. The remaining rows are released, as in
+   * setPosition(). Pass one token fewer than the prompt to leave the last
+   * prompt token to be computed for its logits. Requires paged storage.
+   */
+  size_t reusePrefix(const TokenId *tokens, size_t count);
+  /** Committed token ids known for [0, knownTokenCount()). */
+  std::vector<TokenId> committedTokens() const;
+  size_t knownTokenCount() const;
+  std::shared_ptr<KvPrefixCache> prefixCache() const;
   size_t committedLength() const;
   bool valid() const;
   bool hasActiveStep() const;
@@ -151,16 +206,25 @@ public:
   std::shared_ptr<MemoryData> graphKeyMemory(size_t layer);
   std::shared_ptr<MemoryData> graphValueMemory(size_t layer);
   void savePlane(std::ostream &, size_t layer, bool key, size_t length) const;
-  /** Restore layer-major K/V planes atomically, preserving graph identities. */
+  /** Restore layer-major K/V planes atomically, preserving graph identities.
+   * Snapshots carry no token ids, so restored rows cannot be reused or
+   * published as prefixes.
+   */
   void restorePlanes(std::istream &, size_t length);
 
 private:
   friend class KvStepScope;
   friend class KvLayerAccess;
   void checkStep(const StepLease &) const;
+  void requireIdle() const;
+  /** Insert newly completed, id-known full pages into the prefix cache. */
+  void publishPrefix() noexcept;
   std::vector<KvView> views(const StepLease &, size_t layer, size_t batch,
                             bool key, bool write);
-  std::shared_ptr<SessionState> state_;
+  std::shared_ptr<SessionState> state_; /**< The selected session. */
+  std::map<SessionId, std::shared_ptr<SessionState>> sessions_;
+  SessionId active_ = kDefaultSession;
+  SessionId next_session_ = kDefaultSession + 1;
 };
 
 /** Checked CPU access, held across the actual producer and consumer.
