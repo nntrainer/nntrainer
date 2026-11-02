@@ -61,6 +61,56 @@ Json request() {
 Json call(Service &service, Json body) {
   return service.submit("POST", "/v1/completions", std::move(body)).get();
 }
+// A worker task is a KV-reclamation barrier; session controls are intentionally
+// immediate and no longer double as inference/reclamation barriers.
+void settle(Service &service) {
+  service.submit("GET", "/test-barrier", {}).wait();
+}
+
+std::string rawHttp(int port, const std::string &wire) {
+  auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (sock == INVALID_SOCKET)
+    throw std::runtime_error("socket failed");
+  struct Close {
+    socket_t sock;
+    ~Close() { httplib::detail::close_socket(sock); }
+  } close{sock};
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::connect(sock, reinterpret_cast<sockaddr *>(&address), sizeof(address)))
+    throw std::runtime_error("connect failed");
+  size_t offset = 0;
+  while (offset < wire.size()) {
+    auto sent = ::send(sock, wire.data() + offset,
+                       static_cast<int>(wire.size() - offset), 0);
+    if (sent <= 0)
+      throw std::runtime_error("send failed");
+    offset += static_cast<size_t>(sent);
+  }
+  std::string response;
+  char buffer[4096];
+  const auto deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (httplib::detail::select_read(sock, 0, 100000) <= 0)
+      continue;
+    auto count = ::recv(sock, buffer, sizeof(buffer), 0);
+    if (count <= 0)
+      return response;
+    response.append(buffer, static_cast<size_t>(count));
+    auto end = response.find("\r\n\r\n");
+    auto length = response.find("Content-Length: ");
+    if (end != std::string::npos && length != std::string::npos &&
+        length < end) {
+      auto bytes = std::stoul(response.substr(length + 16));
+      if (response.size() >= end + 4 + bytes)
+        return response;
+    }
+  }
+  throw std::runtime_error("Raw HTTP response timed out");
+}
 Json sseEvents(const std::string &wire) {
   Json events = Json::array();
   size_t from = 0;
@@ -153,6 +203,7 @@ TEST(Serving, StreamBoundsAndOverflowCleanup) {
     EXPECT_NE(wire.find("stream_overflow"), std::string::npos);
     EXPECT_NE(wire.find("[DONE]"), std::string::npos);
     EXPECT_TRUE(stream->cancelled());
+    settle(service);
     EXPECT_TRUE(backend.caches.empty());
     EXPECT_TRUE(service.submit("GET", "/sessions", {}).get()["data"].empty());
   }
@@ -177,6 +228,7 @@ TEST(Serving, CancelActiveAndQueuedStreams) {
   active->cancel();
   EXPECT_THROW(running.get(), ApiError);
   EXPECT_THROW(waiting.get(), ApiError);
+  settle(service);
   EXPECT_TRUE(backend.caches.empty());
   auto retained = service.submit("GET", "/sessions", {}).get()["data"];
   ASSERT_EQ(retained.size(), 1u);
@@ -198,6 +250,7 @@ TEST(Serving, StreamFailureAfterStart) {
   ASSERT_EQ(events.size(), 3u);
   EXPECT_EQ(events[1]["error"]["code"], "inference_failed");
   EXPECT_EQ(events.back(), "[DONE]");
+  settle(service);
   EXPECT_TRUE(backend.caches.empty());
 }
 TEST(Serving, SchemaAndChatHistory) {
@@ -269,6 +322,7 @@ TEST(Serving, SessionLruAndPinnedCapacity) {
     EXPECT_THROW(call(service, request()), ApiError);
     service.submit("DELETE", "/sessions/" + pinned.get<std::string>(), {})
       .get();
+    settle(service);
     EXPECT_TRUE(backend.caches.empty());
     EXPECT_THROW(service.submit("DELETE", "/sessions/missing", {}).get(),
                  ApiError);
@@ -281,6 +335,7 @@ TEST(Serving, FailureReleasesSession) {
   Service service(backend, "test");
   backend.fail = true;
   EXPECT_THROW(call(service, request()), ApiError);
+  settle(service);
   EXPECT_TRUE(backend.caches.empty());
   EXPECT_TRUE(service.submit("GET", "/sessions", {}).get()["data"].empty());
   backend.fail = false;
@@ -395,13 +450,161 @@ TEST(Serving, HttpDisconnectCancelsOnlyActiveRequest) {
   };
   auto interrupted = client.send(req);
   EXPECT_FALSE(interrupted);
-  auto listed = service.submit("GET", "/sessions", {});
+  auto listed = service.submit("GET", "/test-barrier", {});
   auto state = listed.wait_for(std::chrono::seconds(5));
   if (state != std::future_status::ready)
     backend.release.set_value();
   EXPECT_EQ(state, std::future_status::ready);
-  EXPECT_TRUE(listed.get()["data"].empty());
+  listed.wait();
+  EXPECT_TRUE(service.submit("GET", "/sessions", {}).get()["data"].empty());
   EXPECT_NO_THROW(call(service, request()));
+}
+TEST(Serving, BarePostAndControlsStayResponsiveDuringInference) {
+  FakeBackend backend;
+  Service service(backend, "test", 3, 1);
+  auto pinned = service.submit("POST", "/sessions", {}).get()["id"];
+  backend.block = true;
+  auto entered = backend.entered.get_future();
+  auto body = request();
+  body["session_id"] = pinned;
+  auto running = service.submit("POST", "/v1/completions", body);
+  entered.wait();
+  // Ensure the inference queue itself is full as well.
+  auto waiting = service.submit("POST", "/v1/completions", request());
+  struct Release {
+    FakeBackend &backend;
+    ~Release() { backend.release.set_value(); }
+  } release{backend};
+  HttpServer server(service);
+  auto port = server.bind("127.0.0.1", 0);
+  ASSERT_GT(port, 0);
+  std::thread listener([&] { server.listen(); });
+  struct Stop {
+    HttpServer &server;
+    std::thread &listener;
+    ~Stop() {
+      server.stop();
+      listener.join();
+    }
+  } stop{server, listener};
+  auto start = std::chrono::steady_clock::now();
+  // Exact curl -X POST framing: no body length, no transfer encoding, no EOF.
+  auto raw = rawHttp(
+    port,
+    "POST /sessions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  EXPECT_NE(raw.find("200 OK"), std::string::npos);
+  auto created =
+    Json::parse(raw.substr(raw.find("\r\n\r\n") + 4))["id"].get<std::string>();
+  httplib::Client client("127.0.0.1", port);
+  client.set_read_timeout(1, 0);
+  auto listed = client.Get("/sessions");
+  ASSERT_TRUE(listed);
+  EXPECT_EQ(listed->status, 200);
+  auto entries = Json::parse(listed->body)["data"];
+  EXPECT_TRUE(
+    std::any_of(entries.begin(), entries.end(), [&](const Json &entry) {
+      return entry["id"] == pinned && entry["state"] == "generating";
+    }));
+  auto busy = client.Delete("/sessions/" + pinned.get<std::string>());
+  ASSERT_TRUE(busy);
+  EXPECT_EQ(busy->status, 409);
+  auto deleted = client.Delete("/sessions/" + created);
+  ASSERT_TRUE(deleted);
+  EXPECT_EQ(deleted->status, 200);
+  auto health = client.Get("/health");
+  ASSERT_TRUE(health);
+  EXPECT_EQ(health->status, 200);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+  auto emptyCompletion =
+    rawHttp(port, "POST /v1/completions HTTP/1.1\r\nHost: "
+                  "localhost\r\nConnection: close\r\n\r\n");
+  EXPECT_NE(emptyCompletion.find("503 Service Unavailable"), std::string::npos);
+}
+TEST(Serving, InferenceSaturationReservesHttpWorkersForControls) {
+  FakeBackend backend;
+  backend.block = true;
+  Service service(backend, "test", 32, 32);
+  HttpServer server(service);
+  auto port = server.bind("127.0.0.1", 0);
+  ASSERT_GT(port, 0);
+  std::thread listener([&] { server.listen(); });
+  struct Stop {
+    HttpServer &server;
+    std::thread &listener;
+    ~Stop() {
+      server.stop();
+      listener.join();
+    }
+  } stop{server, listener};
+  std::promise<void> rejected;
+  auto observed = rejected.get_future();
+  std::atomic<bool> signalled{false};
+  std::vector<std::future<int>> callers;
+  for (int i = 0; i < 7; ++i) {
+    callers.push_back(std::async(std::launch::async, [&] {
+      httplib::Client client("127.0.0.1", port);
+      client.set_read_timeout(10, 0);
+      auto response =
+        client.Post("/v1/completions", request().dump(), "application/json");
+      if (!response)
+        return -1;
+      if (response->status == 503 && !signalled.exchange(true))
+        rejected.set_value();
+      return response->status;
+    }));
+  }
+  auto overloaded = observed.wait_for(std::chrono::seconds(3));
+  // Avoid blocking test cleanup if the admission invariant regresses.
+  if (overloaded != std::future_status::ready)
+    backend.release.set_value();
+  EXPECT_EQ(overloaded, std::future_status::ready);
+  httplib::Client client("127.0.0.1", port);
+  client.set_read_timeout(1, 0);
+  auto created = client.Post("/sessions");
+  EXPECT_TRUE(created);
+  if (created) {
+    EXPECT_EQ(created->status, 200);
+  }
+  auto health = client.Get("/health");
+  EXPECT_TRUE(health);
+  if (health) {
+    EXPECT_EQ(health->status, 200);
+  }
+  if (overloaded == std::future_status::ready)
+    backend.release.set_value();
+  for (auto &caller : callers) {
+    auto code = caller.get();
+    EXPECT_TRUE(code == 200 || code == 503);
+  }
+}
+TEST(Serving, InvalidFramingIsRejectedWithoutWaitingForBody) {
+  FakeBackend backend;
+  Service service(backend, "test");
+  HttpServer server(service);
+  auto port = server.bind("127.0.0.1", 0);
+  ASSERT_GT(port, 0);
+  std::thread listener([&] { server.listen(); });
+  struct Stop {
+    HttpServer &server;
+    std::thread &listener;
+    ~Stop() {
+      server.stop();
+      listener.join();
+    }
+  } stop{server, listener};
+  for (const std::string headers :
+       {"Content-Length: 9\r\nTransfer-Encoding: chunked\r\n",
+        "Content-Length: 0\r\nContent-Length: 9\r\n",
+        "Transfer-Encoding: gzip\r\n"}) {
+    auto response =
+      rawHttp(port, "POST /sessions HTTP/1.1\r\nHost: localhost\r\n" + headers +
+                      "\r\n");
+    EXPECT_NE(response.find("400 Bad Request"), std::string::npos);
+  }
+  auto empty =
+    rawHttp(port, "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  EXPECT_NE(empty.find("400 Bad Request"), std::string::npos);
+  EXPECT_TRUE(service.submit("GET", "/sessions", {}).get()["data"].empty());
 }
 TEST(Serving, RealPagedCacheInterleavedHistories) {
   setenv("NNTR_ENGINE", "cpu", 1);
@@ -615,7 +818,7 @@ TEST(Serving, Qwen3_06B_NativeHttp) {
   };
   auto disconnected = client.send(cancelReq);
   EXPECT_FALSE(disconnected);
-  // Queued behind the cancelled inference, so this is also a cleanup barrier.
+  settle(service);
   auto afterCancel = client.Get("/sessions");
   ASSERT_TRUE(afterCancel);
   auto remaining = Json::parse(afterCancel->body)["data"];

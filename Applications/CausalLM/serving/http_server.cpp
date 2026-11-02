@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "http_server.h"
 #include "third_party/cpp-httplib/httplib.h"
+#include <atomic>
 
 namespace causallm::serving {
 struct HttpServer::Impl {
   httplib::Server http;
   Service &service;
+  std::atomic<size_t> inferences{0};
+  struct Admission {
+    std::atomic<size_t> &count;
+    explicit Admission(std::atomic<size_t> &count_) : count(count_) {
+      if (count.fetch_add(1) >= 6) {
+        count.fetch_sub(1);
+        throw ApiError(503, "HTTP inference slots are full", "server_busy");
+      }
+    }
+    ~Admission() { count.fetch_sub(1); }
+  };
   explicit Impl(Service &service_) : service(service_) {
     http.new_task_queue = [] { return new httplib::ThreadPool(8, 64); };
     http.set_payload_max_length(1024 * 1024);
@@ -14,6 +26,13 @@ struct HttpServer::Impl {
     auto route = [this](const httplib::Request &request,
                         httplib::Response &response) {
       try {
+        // Leave two of eight HTTP workers available for management endpoints.
+        // A streaming permit lives until its response provider is released.
+        std::shared_ptr<Admission> admission;
+        if (request.method == "POST" &&
+            (request.path == "/v1/chat/completions" ||
+             request.path == "/v1/completions"))
+          admission = std::make_shared<Admission>(inferences);
         Json body = Json::object();
         if (!request.body.empty())
           body = Json::parse(request.body);
@@ -49,7 +68,7 @@ struct HttpServer::Impl {
               }
               return true;
             },
-            [stream](bool success) {
+            [stream, admission](bool success) {
               if (!success)
                 stream->cancel();
             });
@@ -74,6 +93,34 @@ struct HttpServer::Impl {
           "application/json");
       }
     };
+    http.set_pre_routing_handler([route](const httplib::Request &request,
+                                         httplib::Response &response) {
+      const bool length = request.has_header("Content-Length");
+      const bool transfer = request.has_header("Transfer-Encoding");
+      if ((length && transfer) ||
+          request.get_header_value_count("Content-Length") > 1 ||
+          request.get_header_value_count("Transfer-Encoding") > 1 ||
+          (transfer &&
+           request.get_header_value("Transfer-Encoding") != "chunked")) {
+        response.status = 400;
+        response.set_header("Connection", "close");
+        response.set_content(errorBody(400,
+                                       "Ambiguous or unsupported body framing",
+                                       "invalid_framing")
+                               .dump(),
+                             "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+      }
+      // RFC 9112: a request without either framing header has an empty body.
+      // This httplib version otherwise waits for EOF on a bare curl -X POST.
+      if (!length && !transfer &&
+          (request.method == "POST" || request.method == "PUT" ||
+           request.method == "PATCH" || request.method == "DELETE")) {
+        route(request, response);
+        return httplib::Server::HandlerResponse::Handled;
+      }
+      return httplib::Server::HandlerResponse::Unhandled;
+    });
     http.Get("/health", [](const auto &, auto &res) {
       res.set_content("{\"status\":\"ok\"}", "application/json");
     });

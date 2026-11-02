@@ -102,6 +102,7 @@ private:
     std::optional<uint64_t> cache;
     uint64_t touched = 0;
     bool pinned = false;
+    bool busy = false;
   };
   Backend &backend;
   const std::string model;
@@ -111,13 +112,15 @@ private:
   std::mutex mutex;
   std::condition_variable available;
   std::deque<std::packaged_task<Json()>> queue;
+  std::deque<uint64_t> retired; // Released only by the model worker.
   bool stopping = false;
   std::thread worker;
   void loop();
   Json dispatch(const std::string &method, const std::string &path,
                 const Json &body, const std::shared_ptr<EventStream> &stream);
   std::string createSession(bool pinned);
-  void eraseSession(const std::string &id);
+  void eraseSession(const std::string &id, bool allow_busy = false);
+  Json control(const std::string &method, const std::string &path);
   Json completion(const Json &body, bool chat,
                   const std::shared_ptr<EventStream> &stream);
 };

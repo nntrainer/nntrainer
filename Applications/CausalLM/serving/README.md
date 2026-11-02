@@ -21,8 +21,11 @@ The model must use batch size 1. Model loading completes before the socket binds
 
 `HttpServer` parses HTTP/JSON with cpp-httplib, using a bounded pool of HTTP
 workers. `Service` owns a bounded FIFO of tasks and a single inference worker.
-All session changes, template rendering and model/cache operations execute on
-that worker; an HTTP thread never calls the model. Queue saturation returns 503.
+Template rendering and model/cache operations execute on that worker; an HTTP
+thread never calls the model. Session metadata has a short mutex-protected
+control path, so create/list/delete do not wait for inference. Native cache
+release is deferred to the model worker. Queue saturation returns 503. At most
+six HTTP workers wait on inference or serve streams, leaving two for controls.
 
 Logical sessions own native `KVCacheManager` session IDs. The native default
 session stays empty so any conversation can be deselected and destroyed.
@@ -91,7 +94,10 @@ curl -X POST http://127.0.0.1:8080/sessions
 Send that ID in the optional `session_id` completion field. Continue sending the
 **complete history**, including assistant messages. Explicit sessions are pinned
 until deleted or process exit. If every session is pinned, creation returns 503.
-`GET /sessions` lists sessions; `DELETE /sessions/{id}` releases one. This is a
+`GET /sessions` lists sessions with `state: idle` or `generating`.
+`DELETE /sessions/{id}` removes an idle session immediately and schedules its
+KV release on the model worker. Deleting a generating session returns 409
+`session_busy`; it never blocks behind that generation. This is a
 local extension, not an OpenAI session endpoint. Native shared prefix pages can
 remain resident according to the prefix cache's own bounded eviction policy.
 Queue shutdown drains accepted work, then releases sessions on the model worker.
@@ -147,3 +153,9 @@ stream queues bound memory even if a reader disappears.
 
 Streaming response format reference:
 https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
+
+Bodyless requests such as `curl -X POST http://127.0.0.1:8080/sessions`
+require no Content-Length header. Requests without body framing are treated as
+empty according to RFC 9112 section 6.3, rather than waiting for connection EOF.
+Ambiguous or unsupported framing receives 400. Controls bypass the inference
+queue; an exhausted logical session capacity still returns 503 promptly.

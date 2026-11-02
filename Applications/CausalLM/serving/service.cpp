@@ -148,6 +148,23 @@ Service::~Service() {
 std::future<Json> Service::submit(std::string method, std::string path,
                                   Json body,
                                   std::shared_ptr<EventStream> stream) {
+  if (((method == "GET" || method == "POST") && path == "/sessions") ||
+      (method == "DELETE" && path.rfind("/sessions/", 0) == 0)) {
+    std::promise<Json> response;
+    auto result = response.get_future();
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      try {
+        if (stopping)
+          throw ApiError(503, "Service is shutting down", "server_busy");
+        response.set_value(control(method, path));
+      } catch (...) {
+        response.set_exception(std::current_exception());
+      }
+    }
+    available.notify_one();
+    return result;
+  }
   std::packaged_task<Json()> task([this, method = std::move(method),
                                    path = std::move(path),
                                    body = std::move(body), stream] {
@@ -178,16 +195,28 @@ std::future<Json> Service::submit(std::string method, std::string path,
 void Service::loop() {
   for (;;) {
     std::packaged_task<Json()> task;
+    std::deque<uint64_t> reclaim;
     {
       std::unique_lock<std::mutex> lock(mutex);
-      available.wait(lock, [this] { return stopping || !queue.empty(); });
-      if (queue.empty())
+      available.wait(lock, [this] {
+        return stopping || !queue.empty() || !retired.empty();
+      });
+      reclaim.swap(retired);
+      if (!queue.empty()) {
+        task = std::move(queue.front());
+        queue.pop_front();
+      } else if (stopping && reclaim.empty())
         break;
-      task = std::move(queue.front());
-      queue.pop_front();
     }
-    task(); // packaged_task transports exceptions to the HTTP caller.
+    for (auto cache : reclaim)
+      try {
+        backend.destroy(cache);
+      } catch (...) {
+      }
+    if (task.valid())
+      task();
   }
+  // Admission has stopped and queued work is drained; only this worker owns KV.
   for (auto &entry : sessions)
     if (entry.second.cache)
       try {
@@ -199,29 +228,35 @@ std::string Service::createSession(bool pinned) {
   if (sessions.size() == max_sessions) {
     auto victim = sessions.end();
     for (auto it = sessions.begin(); it != sessions.end(); ++it)
-      if (!it->second.pinned && (victim == sessions.end() ||
-                                 it->second.touched < victim->second.touched))
+      if (!it->second.pinned && !it->second.busy &&
+          (victim == sessions.end() ||
+           it->second.touched < victim->second.touched))
         victim = it;
     if (victim == sessions.end())
-      throw ApiError(503, "All sessions are pinned; delete a session",
-                     "session_capacity");
+      throw ApiError(
+        503, "All sessions are pinned or active; delete an idle session",
+        "session_capacity");
     eraseSession(victim->first);
   }
   auto id = "session-" + std::to_string(++sequence);
   sessions.emplace(id, Session{std::nullopt, sequence, pinned});
   return id;
 }
-void Service::eraseSession(const std::string &id) {
+void Service::eraseSession(const std::string &id, bool allow_busy) {
   auto it = sessions.find(id);
   if (it == sessions.end())
     throw ApiError(404, "Unknown session", "session_not_found");
+  if (it->second.busy && !allow_busy)
+    throw ApiError(409,
+                   "Session is generating; retry deletion after it finishes",
+                   "session_busy");
   if (it->second.cache)
-    backend.destroy(*it->second.cache);
+    retired.push_back(*it->second.cache);
   sessions.erase(it);
 }
-Json Service::dispatch(const std::string &method, const std::string &path,
-                       const Json &body,
-                       const std::shared_ptr<EventStream> &stream) {
+// The caller holds mutex. No control operation calls the model or waits on
+// inference.
+Json Service::control(const std::string &method, const std::string &path) {
   if (method == "POST" && path == "/sessions")
     return {{"id", createSession(true)}, {"object", "session"}};
   if (method == "GET" && path == "/sessions") {
@@ -229,7 +264,8 @@ Json Service::dispatch(const std::string &method, const std::string &path,
     for (const auto &entry : sessions)
       data.push_back({{"id", entry.first},
                       {"object", "session"},
-                      {"pinned", entry.second.pinned}});
+                      {"pinned", entry.second.pinned},
+                      {"state", entry.second.busy ? "generating" : "idle"}});
     return {{"object", "list"}, {"data", data}};
   }
   if (method == "DELETE" && path.rfind("/sessions/", 0) == 0) {
@@ -237,6 +273,11 @@ Json Service::dispatch(const std::string &method, const std::string &path,
     eraseSession(id);
     return {{"id", id}, {"deleted", true}, {"object", "session"}};
   }
+  throw ApiError(404, "Unknown route", "not_found");
+}
+Json Service::dispatch(const std::string &method, const std::string &path,
+                       const Json &body,
+                       const std::shared_ptr<EventStream> &stream) {
   if (method == "POST" &&
       (path == "/v1/chat/completions" || path == "/v1/completions"))
     return completion(body, path == "/v1/chat/completions", stream);
@@ -335,19 +376,33 @@ Json Service::completion(const Json &body, bool chat,
     request.prompt = body["prompt"].get<std::string>();
   }
   require(!request.prompt.empty(), "Prompt must not be empty");
-  std::string id;
-  if (body.contains("session_id")) {
-    require(body["session_id"].is_string(), "session_id must be a string");
-    id = body["session_id"].get<std::string>();
-    if (!sessions.count(id))
-      throw ApiError(404, "Unknown session", "session_not_found");
-  } else {
-    id = createSession(false);
+  std::string id, completion_id;
+  std::optional<uint64_t> cache;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (body.contains("session_id")) {
+      require(body["session_id"].is_string(), "session_id must be a string");
+      id = body["session_id"].get<std::string>();
+      if (!sessions.count(id))
+        throw ApiError(404, "Unknown session", "session_not_found");
+    } else
+      id = createSession(false);
+    auto &session = sessions.at(id);
+    session.touched = ++sequence;
+    session.busy = true;
+    cache = session.cache;
+    completion_id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++sequence);
   }
-  auto &session = sessions.at(id);
-  session.touched = ++sequence;
-  const auto completion_id =
-    (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++sequence);
+  struct BusyGuard {
+    Service &service;
+    const std::string &id;
+    ~BusyGuard() {
+      std::lock_guard<std::mutex> lock(service.mutex);
+      auto it = service.sessions.find(id);
+      if (it != service.sessions.end())
+        it->second.busy = false;
+    }
+  } busy{*this, id};
   const auto created = std::time(nullptr);
   Json prototype = {
     {"id", completion_id},
@@ -385,9 +440,21 @@ Json Service::completion(const Json &body, bool chat,
   }
   Generated result;
   try {
-    if (!session.cache)
-      session.cache = backend.create(request.prompt);
-    result = backend.generate(*session.cache, request);
+    // Reclaim LRU victims before this request allocates new KV pages. Controls
+    // may retire idle sessions concurrently but never touch native KV storage.
+    std::deque<uint64_t> reclaim;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      reclaim.swap(retired);
+    }
+    for (auto old : reclaim)
+      backend.destroy(old);
+    if (!cache) {
+      cache = backend.create(request.prompt);
+      std::lock_guard<std::mutex> lock(mutex);
+      sessions.at(id).cache = cache;
+    }
+    result = backend.generate(*cache, request);
     if (stream && stream->cancelled())
       throw ApiError(499, "Generation cancelled; session released",
                      "request_cancelled");
@@ -396,7 +463,8 @@ Json Service::completion(const Json &body, bool chat,
     if (e.status >= 500 || (stream && stream->cancelled()) ||
         !body.contains("session_id")) {
       try {
-        eraseSession(id);
+        std::lock_guard<std::mutex> lock(mutex);
+        eraseSession(id, true);
       } catch (...) {
       }
     }
@@ -405,7 +473,8 @@ Json Service::completion(const Json &body, bool chat,
     // Never resume cache rows left by a failed inference.
     auto original = std::current_exception();
     try {
-      eraseSession(id);
+      std::lock_guard<std::mutex> lock(mutex);
+      eraseSession(id, true);
     } catch (...) {
     }
     std::rethrow_exception(original);
@@ -437,7 +506,8 @@ Json Service::completion(const Json &body, bool chat,
       accepted = stream->push(prototype);
     }
     if (!accepted) {
-      eraseSession(id);
+      std::lock_guard<std::mutex> lock(mutex);
+      eraseSession(id, true);
       throw ApiError(499, "Stream cancelled; session released",
                      "request_cancelled");
     }
