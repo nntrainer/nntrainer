@@ -115,10 +115,9 @@ public:
   WIN_EXPORT ~Fp16Attention();
 
   /** Keep the execution state's reference to this object's config stable. */
-  WIN_EXPORT
   Fp16Attention(Fp16Attention &&rhs) = delete;
 
-  WIN_EXPORT Fp16Attention &operator=(Fp16Attention &&rhs) = delete;
+  Fp16Attention &operator=(Fp16Attention &&rhs) = delete;
 
   /** Validate input shapes and configure cache tensors. */
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context, bool skip);
