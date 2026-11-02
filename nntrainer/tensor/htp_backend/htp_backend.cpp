@@ -13,7 +13,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <htp_backend.h>
-#include <htp_fixed_opts.h>
+#include <htp_backend/htp_fixed_opts.h>
 
 #include <nntrainer_log.h>
 

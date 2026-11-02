@@ -29,8 +29,8 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <htp_backend/htp_tl2_opts.h>
-#include <htp_fixed_opts.h>
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
 #include <htp_wh_layout.h>

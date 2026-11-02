@@ -380,33 +380,15 @@ void Lfm2HtpMoECausalLM::forEachConvBlock(
 void Lfm2HtpMoECausalLM::run(const WSTR prompt, bool sample, const WSTR system,
                              const WSTR tail, bool log) {
 #ifdef ENABLE_HEXKL
-  // Each prompt is independent, as Gemma4HtpMoECausalLM::run does it: the
-  // DSP's decode state (attention caches, conv states), the host conv states
-  // and the host KV slabs decode may have dropped are reset.
   if (ran_) {
     prefill_early_attempted_ = true;
     retireHtpExpertPrefillKickoff(nntrainer::get_htp_ops());
-    nntrainer::htp_begin_prompt();
-    model->forEachLayer(
-      [](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
-        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
-        if (!node)
-          return;
-        if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
-          mha->beginHtpPrompt();
-        else if (auto *conv = dynamic_cast<ConvBlockLayer *>(node->getLayer()))
-          conv->beginPrompt(rc);
-      },
-      nullptr);
-    kv_cache = KVCacheManager{};
-    kv_cache_bound = false;
   }
-  // a precomputed cache (system_prompt.kvcache) stays on: the run saves
-  // or loads it at position 0
-  if (USE_KVCACHE)
-    setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
-  else
-    setSessionTokenPosition(0);
+  beginIndependentHtpPrompt(
+    ran_, [](nntrainer::Layer &layer, nntrainer::RunLayerContext &rc) {
+      if (auto *conv = dynamic_cast<ConvBlockLayer *>(&layer))
+        conv->beginPrompt(rc);
+    });
 #endif
   ran_ = true;
   CausalLM::run(prompt, sample, system, tail, log);

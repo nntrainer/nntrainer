@@ -9,7 +9,7 @@
 #include <app_context.h>
 #include <engine.h>
 #include <gemma4_htp_moe_causallm.h>
-#include <htp_fixed_opts.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <layer_context.h>
 #include <llm_util.hpp>
 #include <model.h>
@@ -371,26 +371,7 @@ void Gemma4HtpMoECausalLM::run(const WSTR prompt, bool do_sample,
       ATTN_PROJ_ENGINE == "htp" || FFN_ENGINE == "htp" ||
       LMHEAD_ENGINE == "htp") {
 #ifdef ENABLE_HEXKL
-    if (htp_run_started_) {
-      nntrainer::htp_begin_prompt();
-      model->forEachLayer(
-        [](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
-          auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
-          if (node)
-            if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
-              mha->beginHtpPrompt();
-        },
-        nullptr);
-      // Decode may have dropped these host slabs after seeding the DSP.
-      kv_cache = KVCacheManager{};
-      kv_cache_bound = false;
-    }
-    // a precomputed cache (system_prompt.kvcache) stays on: the run saves
-    // or loads it at position 0
-    if (USE_KVCACHE)
-      setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
-    else
-      setSessionTokenPosition(0);
+    beginIndependentHtpPrompt(htp_run_started_);
 #endif
     htp_run_started_ = true;
   }

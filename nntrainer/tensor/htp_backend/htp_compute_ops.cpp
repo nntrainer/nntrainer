@@ -32,12 +32,13 @@
 #include <cpu_ops_table.h>
 #include <htp_arena_size.h>
 #include <htp_backend.h>
+#include <htp_backend/htp_fixed_opts.h>
 #include <htp_context.h>
 #include <htp_decode_runtime.h>
 #include <htp_dspq_wire.h>
+#include <htp_expert_pool.h>
 #include <htp_expert_prefetch.h>
 #include <htp_expert_read_pool.h>
-#include <htp_fixed_opts.h>
 #include <htp_graph_desc.h>
 #include <htp_moe_opts.h>
 #include <htp_prefill_readers.h>
@@ -335,6 +336,7 @@ struct HtpStagingTransfer {
 };
 
 class HtpComputeOps : public CpuComputeOps {
+  HtpExpertPool expert_pool_;
   using Staging = HtpStaging<HtpRpcBuffer, HtpStagingTransfer>;
   using StagingPool = Staging::StagingPool;
   using Held = Staging::Held;
@@ -351,6 +353,7 @@ class HtpComputeOps : public CpuComputeOps {
 
 public:
   HtpDecodeRuntime &decodeRuntime() { return decode_; }
+  HtpExpertPool *htpExpertPool() override { return &expert_pool_; }
 
   /** Stop and join all background workers. Call only between tokens, with
    *  no inference in flight, before releasing their buffers or session. */
@@ -7677,7 +7680,7 @@ private:
   }
 
   /** @brief NNTR_MOE_LRFU unset or a half-life other than 0: the
-   *  pool's policy (causallm::ExpertLru, whose default this restates) is
+   *  pool's policy (ExpertLru, whose default this restates) is
    *  LRFU, which parses the value. */
   static bool lrfuOn() {
     static const bool on = [] {
@@ -9840,6 +9843,7 @@ void htp_release_runtime() {
   HtpBackend::global().close();
   moeOptsSent().store(false);
   moeGeglu().store(false);
+  HtpExpertPool::resetLayerOrdinals();
 }
 
 } // namespace nntrainer
