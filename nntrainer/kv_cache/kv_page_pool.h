@@ -2,6 +2,7 @@
 /** @file kv_page_pool.h
  * @brief Thread-confined host page pool shared by synchronous KV sessions.
  * @author Codex (OpenAI)
+ * @bug None known
  */
 #ifndef NNTRAINER_KV_PAGE_POOL_H
 #define NNTRAINER_KV_PAGE_POOL_H

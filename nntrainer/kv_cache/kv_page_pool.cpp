@@ -2,6 +2,7 @@
 /** @file kv_page_pool.cpp
  * @brief Budgeted page reuse with allocation ownership held by every view.
  * @author Codex (OpenAI)
+ * @bug None known
  */
 #include <cstring>
 #include <kv_cache/kv_cache_spec.h>

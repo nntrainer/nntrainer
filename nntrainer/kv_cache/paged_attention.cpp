@@ -2,6 +2,7 @@
 /** @file paged_attention.cpp
  * @brief Direct CPU attention over checked KV segments using online softmax.
  * @author Codex (OpenAI)
+ * @bug None known
  */
 #include <fp16.h>
 #include <kv_cache/kv_cache_manager.h>
