@@ -23,12 +23,13 @@
 
 #ifdef ENABLE_HEXKL
 
+#include "htp_act_quant.h"
+#include "htp_q4_0_convert.h"
 #include <attn_m1_det.h>
 #include <compute_ops.h>
 #include <context_data.h>
 #include <cpu_backend.h>
 #include <cpu_ops_table.h>
-#include <htp_act_quant.h>
 #include <htp_arena_size.h>
 #include <htp_backend.h>
 #include <htp_context.h>
@@ -42,7 +43,6 @@
 #include <htp_prefill_readers.h>
 #include <htp_prepared_tl2.h>
 #include <htp_profile.h>
-#include <htp_q4_0_convert.h>
 #include <htp_router_predict.h>
 #include <htp_rpcmem.h>
 #include <htp_staging.h>

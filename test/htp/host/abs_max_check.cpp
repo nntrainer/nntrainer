@@ -4,7 +4,7 @@
  *
  * @file   abs_max_check.cpp
  * @date   8 October 2026
- * @brief  Applications/CausalLM/layers/abs_max.h against the scalar loops
+ * @brief  Attention quantization helpers against the scalar loops
  *         the q2 calibration had, bit for bit, on every fp16 pattern and on
  *         f32 with NaNs. run_host_checks.sh runs it natively and, when an
  *         aarch64 g++ and qemu-aarch64 are installed, on the NEON path.
@@ -12,9 +12,9 @@
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */
-#include <abs_max.h>
 #include <cstdio>
 #include <cstring>
+#include <htp_backend/attention_quant_utils.h>
 #include <vector>
 // Scalar reference: the loops calibrate_q2_scales had.
 static float ref_f16(const uint16_t *x, unsigned n, float m) {
@@ -47,12 +47,12 @@ int main() {
       }
       float m0 = (t % 5) * 0.25f;
       ++cases;
-      float a = causallm::abs_max_f16(h.data(), n, m0),
+      float a = nntrainer::attention_quant::abs_max_f16(h.data(), n, m0),
             b = ref_f16(h.data(), n, m0);
-      float c = causallm::abs_max_f32(f.data(), n, m0),
+      float c = nntrainer::attention_quant::abs_max_f32(f.data(), n, m0),
             d = ref_f32(f.data(), n, m0);
       std::vector<float> l1(n, m0), l2(n, m0);
-      causallm::abs_max_f16_lanes(h.data(), n, l1.data());
+      nntrainer::attention_quant::abs_max_f16_lanes(h.data(), n, l1.data());
       for (unsigned i = 0; i < n; ++i)
         l2[i] =
           std::max(l2[i], std::fabs(nntrainer::compute_fp16_to_fp32(h[i])));
@@ -74,7 +74,7 @@ int main() {
       for (unsigned i = 0; i < n; ++i)
         f[i] = ((int)(rnd() % 20001) - 10000) * (0.0005f * (1 + t % 7));
       float lo = 1e30f, hi = -1e30f, rlo = 1e30f, rhi = -1e30f;
-      causallm::min_max_f32(f.data(), n, lo, hi);
+      nntrainer::attention_quant::min_max_f32(f.data(), n, lo, hi);
       for (unsigned i = 0; i < n; ++i) {
         rlo = std::min(rlo, f[i]);
         rhi = std::max(rhi, f[i]);
@@ -83,7 +83,7 @@ int main() {
       const float scale = std::max(rhi - rlo, 1e-6f) / 65535.0f;
       const float zp = std::round(-rlo / scale), inv = 1.0f / scale;
       std::vector<uint16_t> u(n);
-      causallm::quant_u16_f32(f.data(), n, inv, zp, u.data());
+      nntrainer::attention_quant::quant_u16_f32(f.data(), n, inv, zp, u.data());
       for (unsigned i = 0; i < n; ++i) {
         float v = f[i] * inv + zp + 0.5f;
         v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
@@ -93,7 +93,8 @@ int main() {
         ++q_n;
       }
       std::vector<float> o(n);
-      causallm::dequant_u16_f32(u.data(), n, scale, 32768.0f, o.data());
+      nntrainer::attention_quant::dequant_u16_f32(u.data(), n, scale, 32768.0f,
+                                                  o.data());
       for (unsigned i = 0; i < n; ++i) {
         const float r = (static_cast<float>(u[i]) - 32768.0f) * scale;
         dq_bad += std::memcmp(&r, &o[i], 4) != 0;

@@ -19,10 +19,8 @@
  * to handle here; if this file is ever compiled into a build that isn't
  * Android/ARM64, that assumption needs revisiting first.
  *
- * This file itself has no Hexagon SDK dependency -- it is plain host code
- * against Q4_0Utils, same as q4_0_utils.cpp next to it -- so it is not
- * gated behind ENABLE_HEXKL and its unit test runs in the default host
- * build, no device or SDK required.
+ * This file has no Hexagon SDK dependency. It uses Q4_0Utils and remains
+ * available in the default host build, including its unit test.
  */
 
 #ifndef __NNTRAINER_HTP_Q4_0_CONVERT_H__

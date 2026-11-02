@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
  *
- * @file   abs_max.h
+ * @file   attention_quant_utils.h
  * @date   8 October 2026
  * @brief  max |x| over fp16 bit patterns and f32, min / max over f32, and
  *         the f32 <-> u16 conversions of the int8 attention path's
@@ -17,8 +17,8 @@
  * "x if m < x else m" as a compare and select, so a NaN x keeps m. (vmaxnm
  * does not: a signaling NaN turns it into NaN.)
  */
-#ifndef __CAUSALLM_ABS_MAX_H__
-#define __CAUSALLM_ABS_MAX_H__
+#ifndef __NNTRAINER_ATTENTION_QUANT_UTILS_H__
+#define __NNTRAINER_ATTENTION_QUANT_UTILS_H__
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +30,8 @@
 #include <arm_neon.h>
 #endif
 
-namespace causallm {
+namespace nntrainer {
+namespace attention_quant {
 
 #if defined(__aarch64__)
 /** @brief std::max(m, x) per lane: x where m < x, else m. */
@@ -162,6 +163,7 @@ inline void dequant_u16_f32(const uint16_t *src, unsigned int n, float scale,
     dst[i] = (static_cast<float>(src[i]) - zp) * scale;
 }
 
-} // namespace causallm
+} // namespace attention_quant
+} // namespace nntrainer
 
-#endif // __CAUSALLM_ABS_MAX_H__
+#endif // __NNTRAINER_ATTENTION_QUANT_UTILS_H__

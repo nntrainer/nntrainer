@@ -9,8 +9,8 @@
  */
 
 #include "../htp/host/q4_gemv_cases.h"
-#include "htp_act_quant.h"
-#include "htp_q4_0_convert.h"
+#include "htp_backend/htp_act_quant.h"
+#include "htp_backend/htp_q4_0_convert.h"
 #include "htp_wh_layout.h"
 #include "htp_wh_palette.h"
 #include "int4_utils.h"

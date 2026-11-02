@@ -245,3 +245,6 @@ causallm_custom_multiply_dep = declare_dependency(
     link_with: causallm_custom_multiply_layer,
     include_directories: causallm_layer_inc
 )
+
+causallm_layer_dependencies += [causallm_residual_add_dep,
+  causallm_dense_ffn_layer_dep, causallm_conv_block_layer_dep]

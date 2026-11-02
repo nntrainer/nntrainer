@@ -214,8 +214,6 @@ causallm_htp_src = [
   causallm_root / 'models' / 'htp_weight_preparation.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_layer.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_htp_moe_causallm.cpp',
-  causallm_root / 'layers' / 'htp_mha_core.cpp',
-  causallm_root / 'layers' / 'htp_qkv_layer.cpp',
   causallm_root / 'layers' / 'dense_ffn_layer.cpp',
   causallm_root / 'layers' / 'residual_add.cpp',
   causallm_root / 'layers' / 'conv_block_layer.cpp',

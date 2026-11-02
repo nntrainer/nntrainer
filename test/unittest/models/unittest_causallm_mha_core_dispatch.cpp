@@ -37,6 +37,7 @@
 #include <htp_mha_core.h>
 #include <htp_qkv_layer.h>
 #include <layer_context.h>
+#include <node_exporter.h>
 #include <var_grad.h>
 #include <weight.h>
 
@@ -578,7 +579,8 @@ template <typename Layer>
 std::vector<std::vector<float>>
 runFallbackScratch(const std::vector<std::string> &properties, unsigned outputs,
                    ml::train::LayerComputeEngine engine, unsigned from,
-                   unsigned to) {
+                   unsigned to, bool forward = false,
+                   bool scratch_expected = true) {
   Layer layer;
   layer.setProperty(properties);
   const nntrainer::TensorDim::TensorType f32(
@@ -588,7 +590,7 @@ runFallbackScratch(const std::vector<std::string> &properties, unsigned outputs,
                       0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
                       ml::train::ExecutionMode::INFERENCE, engine);
   layer.finalize(ic);
-  if (engine == ml::train::HTP)
+  if (engine == ml::train::HTP || !scratch_expected)
     EXPECT_TRUE(ic.getTensorsSpec().empty());
   else
     EXPECT_FALSE(ic.getTensorsSpec().empty());
@@ -621,7 +623,12 @@ runFallbackScratch(const std::vector<std::string> &properties, unsigned outputs,
   };
   RunLayerContext rc("scratch", false, 0.0f, false, 1.0f, nullptr, false,
                      view(weights), view(ins), view(outs), view(tensors));
-  layer.incremental_forwarding(rc, from, to, false);
+  for (unsigned i = 0; i < outputs; ++i)
+    rc.getOutput(i).setValue(17.0f);
+  if (forward)
+    layer.forwarding(rc, false);
+  else
+    layer.incremental_forwarding(rc, from, to, false);
   std::vector<std::vector<float>> result;
   for (unsigned i = 0; i < outputs; ++i) {
     const auto &out = rc.getOutput(i);
@@ -668,5 +675,40 @@ TEST(CausalLMFallbackScratch, dense_ffn_prefill_and_decode) {
         properties, 1, ml::train::HTP, bounds.first, bounds.second);
       EXPECT_EQ(reference, lazy);
     }
+  }
+}
+
+TEST(QKVContract, PlainExportPreservesForwarding) {
+  nntrainer::QKVLayer plain;
+  plain.setProperty({"q_unit=128", "k_unit=64", "v_unit=64"});
+  nntrainer::Exporter exporter;
+  constexpr auto method = ml::train::ExportMethods::METHOD_STRINGVECTOR;
+  plain.exportTo(exporter, method);
+  auto values = exporter.getResult<method>();
+  ASSERT_NE(values, nullptr);
+  std::vector<std::string> properties;
+  for (const auto &value : *values)
+    properties.push_back(value.first + "=" + value.second);
+  const auto outputs = runFallbackScratch<nntrainer::QKVLayer>(
+    properties, 3, ml::train::CPU, 0, 7, true, false);
+  for (const auto &output : outputs)
+    for (float value : output)
+      EXPECT_EQ(value, 17.0f);
+}
+
+TEST(QKVContract, FusedPropertiesUseTheCommonParser) {
+  const std::vector<std::string> properties{"q_unit=128",   "k_unit=64",
+                                            "v_unit=64",    "feature_size=64",
+                                            "in_norm=true", "epsilon=0.00001"};
+  const auto expected = runFallbackScratch<causallm::HtpQKVLayer>(
+    properties, 3, ml::train::CPU, 0, 7);
+  for (const auto &parsed : std::vector<std::vector<std::string>>{
+         {"Q_UNIT=128", "K_UNIT=64", "V_UNIT=64", "FEATURE_SIZE=64",
+          "IN_NORM=true", "EPSILON=0.00001"},
+         {"q_unit=128|k_unit=64|v_unit=64|feature_size=64|in_norm=true|epsilon="
+          "0.00001"}}) {
+    const auto actual =
+      runFallbackScratch<nntrainer::QKVLayer>(parsed, 3, ml::train::CPU, 0, 7);
+    EXPECT_EQ(actual, expected);
   }
 }
