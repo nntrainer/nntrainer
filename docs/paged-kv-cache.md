@@ -70,7 +70,8 @@ blocks may remain idle in the pool. Aborting a step returns newly allocated
 whole blocks beyond the committed position. Reset returns all session blocks;
 backward `setPosition()` returns whole blocks beyond the new position. A
 partial tail remains private to that session. Forward seek is rejected because
-it would publish unwritten KV. There is no cross-session prefix sharing.
+it would publish unwritten KV. Sharing full blocks between sessions is
+described under "Sessions and prefix caching" below.
 
 Every exported view pins its physical block. Invalidating a view prevents API
 access but does not recycle its allocation until the view itself is released.
@@ -92,7 +93,8 @@ to the host flash key block (512 tokens on x86, 128 elsewhere);
 batch-1 NCHW CPU inference with external caches. INT8, OHWI, training, the legacy
 KV manager and device backends are rejected rather than falling back to a dense
 cache. Sliding windows use attention masks over paged history, with no ring
-layout. There is no automatic prefix caching or asynchronous completion.
+layout. Prefix caching is opt-in (see below); there is no asynchronous
+completion.
 
 In paged mode graph cache inputs have shape `[1, 1, 1, kv_width]`. These one-row
 allocations are stable per-layer identifiers, including distinct identifiers for
@@ -143,3 +145,116 @@ binary16 decoding, pinned pages, shared pool admission, reuse and allocation
 failure. A real Qwen graph regression compares contiguous and paged logits across
 page boundaries and snapshot restore; Gemma graph cases exercise paged inference.
 These tests were added without building or running them on macOS.
+
+## Sessions and prefix caching
+
+A `KvCacheManager` holds one or more sessions. A session is one independent
+sequence: its own page table, committed position, step state and token ids.
+`initialize()` creates and selects session `KvCacheManager::kDefaultSession`
+(0). With paged storage, `createSession()` adds empty sessions that share the
+spec, page pool, prefix cache and the one-row graph identity tensors, so a
+graph bound once can run any of them. `selectSession()` routes every later
+step, view, seek and snapshot call to that session; it is rejected while a
+step is live. `destroySession()` releases a session that is not selected;
+its exported views become stale. Contiguous storage keeps exactly one
+session.
+
+`beginStep(count, tokens)` can carry the ids of the rows the step writes.
+On commit they extend the session's known ids when the known prefix already
+reaches the step; a step without ids ends the known prefix until the session
+is truncated back into it. Aborted steps discard their ids. Snapshot restore
+forgets all ids, because snapshots do not store them.
+
+`KvPrefixCache` shares full pages between sessions, including sessions of
+other managers that use the same pool and page layout:
+
+```cpp
+auto pool = std::make_shared<KvPagePool>(256 * 1024 * 1024);
+auto prefix = std::make_shared<KvPrefixCache>(pool, /*max_blocks=*/0);
+KvCacheManager cache;
+cache.initialize(spec, std::make_shared<nntrainer::MemAllocator>(), pool,
+                 prefix);
+
+// Prompt ids; keep the last one for the step that produces logits.
+size_t from = cache.reusePrefix(ids.data(), ids.size() - 1);
+auto step = cache.beginStep(ids.size() - from, ids.data() + from);
+```
+
+A block covers one page of positions and holds that page of every owner layer
+for K and V. Its identity is the parent block plus its own token ids, compared
+exactly, so a block matches only after the identical prefix and a hash
+collision cannot produce a false match. On commit, every newly completed full
+page whose ids are known is published; a partial tail page stays private.
+`reusePrefix()` keeps the session's own rows that match the leading tokens,
+or, if the cache holds a longer chain, adopts those shared pages without
+copying or allocating; all later rows are released. It returns the position
+to continue from, which is always a page multiple when cached pages were
+adopted.
+
+Shared pages are never written in place. Appends always start in a page that
+the session owns, except after a truncation into the middle of a shared page;
+the next step then copies that page's committed rows into a private page
+before writing (copy-on-write). The original stays intact for the cache and
+for other sessions.
+
+The cache holds page handles. `CacheStats::backing_bytes` counts the pages a
+session references, including shared ones, so summing it over sessions
+counts shared pages more than once; `KvPagePool::reservedBytes()` counts each
+page once, including pages only the cache holds. When the pool budget would
+be exceeded, the pool asks registered reclaimers to free pages before
+failing. The prefix cache then drops its least recently used leaf block
+whose pages no session references. `max_blocks` bounds the number of cached
+blocks the same way; blocks still referenced by a session are never dropped,
+since that would free nothing. `evictUnused()` and `clear()` drop blocks
+explicitly.
+
+The first manager attached to a prefix cache binds its page layout (page
+size, layer count, per-layer heads, head size, encoding, aliases and
+producers). Other managers must match, must use the cache's pool, and must
+use batch 1. The check cannot see weights: share one prefix cache only
+between sessions of the same model. Reused rows are only correct when the KV
+cache is the whole decoder state for those positions. Hybrid models with
+convolution or recurrent blocks therefore must not use it.
+
+CausalLM enables prefix caching with:
+
+```sh
+NNTR_ENGINE=cpu NNTR_KV_PAGED=1 NNTR_KV_PREFIX_CACHE=1 <application> <arguments>
+```
+
+`NNTR_KV_PREFIX_CACHE` without paged CPU storage is rejected. The default
+bound is two contexts of blocks (`2 * ceil(max_seq_len / page_tokens)`), which
+leaves room for about one context of unreferenced blocks next to a full live
+session; `NNTR_KV_PREFIX_CACHE_BLOCKS` overrides it (0 removes the block
+bound; the pool has no budget in CausalLM). Models with a layer that has no
+KV producer, such as LFM2's convolution blocks, keep prefix caching disabled
+and report that on stderr.
+
+While `run()` executes, each step records the token ids it feeds. Before the
+prompt is prefilled, `run()` calls `reusePrefix()` with the session's known
+history up to the continuation position followed by the prompt, minus the
+last prompt token (minus the last two with `skip_prefill`, whose final prompt
+token is fed by the first decode step). It then prefills only the remaining
+tokens. A new conversation that starts with an already seen system prompt
+reuses its published pages; regenerating from an earlier position reuses the
+matching rows of the same session. The precomputed system-prompt file path
+does not reuse, since a restored snapshot has no ids.
+`getLastPrefixReusedTokens()` reports the reused prompt tokens of the last
+`run()`, and `NNTR_KV_CPU_TRACE=1` prints a `[kv-prefix]` line per request.
+
+`CausalLM::createKVSession()`, `selectKVSession()`, `destroyKVSession()` and
+`getActiveKVSession()` expose sessions to applications: each session is a
+separate conversation over the same model and graph. Sessions can be created
+once the cache is allocated, which happens on the first `run()` or resume,
+because the first prompt settles the prefill plane the cache is sized from.
+Selecting a session moves the session token position to its committed
+length, so the next `run()` continues that conversation;
+`setSessionTokenPosition(0)` afterwards starts it over. A selected session
+uses the same save, load and resume calls as before.
+
+Unit tests in `unittest_kv_cache_core.cpp` cover independent sessions with
+shared graph identities, id tracking through abort, truncation and restore,
+publication and adoption across sessions, exact chain matching,
+copy-on-write after truncation, eviction under a pool budget and a block
+bound, and layout binding. Like the rest of this backend, they were added
+without building or running them on macOS.
