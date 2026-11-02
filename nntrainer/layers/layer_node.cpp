@@ -777,8 +777,8 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
 /**
  * @brief     Refinalize creating the layer node
  */
-InitLayerContext
-LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
+InitLayerContext LayerNode::refinalize(const std::vector<TensorDim> &input_dims,
+                                       ml::train::ExecutionMode mode) {
   std::vector<TensorDim> actual_input_dims;
   auto &prop_dims = std::get<std::vector<props::InputShape>>(*layer_node_props);
   auto &prop_in_layers =
@@ -842,9 +842,9 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
     out_info.push_back(true);
   }
 
-  auto context = InitLayerContext(actual_input_dims, out_info,
-                                  getInPlaceType() != InPlaceType::NONE,
-                                  getName(), scope, max_norm);
+  auto context = InitLayerContext(
+    actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
+    getName(), scope, max_norm, {"NCHW", "FP32", "FP32"}, 1.0f, mode);
   // This InitLayerContext overload takes no engine argument, so stamp it
   // before finalize(): the layer requests its outputs inside finalize() and
   // outSpec() records the residency plane at that moment. Without this the

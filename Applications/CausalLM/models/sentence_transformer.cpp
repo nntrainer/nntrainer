@@ -15,6 +15,7 @@
 #include <embedding_pooling_layer.h>
 #include <engine.h>
 #include <llm_util.hpp> // withKey, causallm_engine
+#include <optional>
 #include <sentence_transformer.h>
 
 #include <algorithm>
@@ -374,8 +375,17 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   // start: 0, end: input_len (process all tokens at once)
   // This performs a single forward pass for the entire prompt sequence to get
   // embeddings.
+  std::optional<nntrainer::kv::StepLease> step;
+  std::unique_ptr<nntrainer::kv::KvStepScope> scope;
+  if (kv_cache.usesPagedStorage()) {
+    kv_cache.reset();
+    step.emplace(kv_cache.beginStep(0, input_len));
+    scope = kv_cache.bindStep(*step);
+  }
   std::vector<float *> output = model->incremental_inference(
     BATCH_SIZE, input, label, input_len, 0, input_len, false);
+  if (step)
+    kv_cache.commitStep(std::move(*step));
 
   return output;
 }

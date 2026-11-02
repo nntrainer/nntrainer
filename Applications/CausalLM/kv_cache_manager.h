@@ -21,6 +21,7 @@
 
 #include <memory>
 
+#include <kv_cache/kv_cache_manager.h>
 #include <memory_pool.h>
 #include <tensor.h>
 #include <tensor_dim.h>
@@ -44,7 +45,6 @@ namespace causallm {
  * Future extensions:
  * - Cache eviction policies
  * - Cache compression / quantization
- * - Paged attention support
  */
 class KVCacheManager {
 public:
@@ -86,7 +86,8 @@ public:
     unsigned int num_layers, unsigned int batch_size, unsigned int max_seq_len,
     const std::vector<unsigned int> &kv_widths,
     ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::FP16,
-    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW);
+    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW,
+    const std::vector<unsigned int> &kv_heads = {});
 
   /**
    * @brief Check if the manager has been allocated
@@ -96,7 +97,86 @@ public:
   /**
    * @brief Get current write position in the cache
    */
-  unsigned int getPosition() const { return cache_pos_; }
+  unsigned int getPosition() const {
+    return cpu_cache_ ? static_cast<unsigned int>(cpu_cache_->committedLength())
+                      : cache_pos_;
+  }
+
+  /** Synchronous CPU graph transaction; GPU compatibility paths stay separate.
+   */
+  bool usesCpuStorage() const { return cpu_cache_ != nullptr; }
+  bool usesPagedStorage() const { return cpu_cache_ && cpu_cache_->paged(); }
+  /**
+   * @brief Begin the CPU step that writes positions [from, to).
+   * @param[in] tokens optional ids of those to - from positions. Prefix
+   *            caching only publishes and reuses rows whose ids are known.
+   */
+  nntrainer::kv::StepLease
+  beginStep(unsigned int from, unsigned int to,
+            const nntrainer::kv::TokenId *tokens = nullptr);
+  void commitStep(nntrainer::kv::StepLease &&step);
+  std::unique_ptr<nntrainer::kv::KvStepScope>
+  bindStep(const nntrainer::kv::StepLease &step) {
+    if (!cpu_cache_)
+      throw std::logic_error("CPU KV storage is not initialized");
+    return cpu_cache_->bindStep(step);
+  }
+  /** Model-declared non-attention blocks need no producer completion. */
+  void setLayerProducers(std::vector<bool> producers) {
+    layer_producers_ = std::move(producers);
+  }
+  nntrainer::kv::CacheStats cpuStats() const {
+    return cpu_cache_ ? cpu_cache_->stats() : nntrainer::kv::CacheStats{};
+  }
+
+  /**
+   * @brief Whether the model allows prefix reuse at all. A model whose
+   *        decoder keeps state outside the KV cache (for example the
+   *        convolution blocks of a hybrid model) must pass false: reusing its
+   *        KV rows would skip updating that state. Call before allocate().
+   */
+  void setPrefixCacheAllowed(bool allowed) { prefix_cache_allowed_ = allowed; }
+
+  /** True when paged storage was allocated with a prefix cache. */
+  bool prefixCacheEnabled() const {
+    return cpu_cache_ && cpu_cache_->prefixCache() != nullptr;
+  }
+
+  /** Counters of the prefix cache (all zero when it is disabled). */
+  nntrainer::kv::PrefixCacheStats prefixCacheStats() const;
+
+  /**
+   * @brief Reuse already computed rows for the leading @p tokens of the
+   *        active session and continue from the returned position.
+   * @details Keeps the session's own rows that match, or adopts a longer chain
+   *          of shared full pages from the prefix cache; drops the rest. The
+   *          caller prefills tokens from the returned position onward.
+   * @return the committed position after reuse (<= tokens.size())
+   */
+  unsigned int reusePrefix(const std::vector<nntrainer::kv::TokenId> &tokens);
+
+  /** Token ids known for the leading committed rows of the active session. */
+  std::vector<nntrainer::kv::TokenId> committedTokens() const;
+
+  /**
+   * @brief Create an empty KV session that shares this cache's geometry, page
+   *        pool, prefix cache and graph bindings. Requires paged storage.
+   * @details The cache starts with the default session (id 0) selected. A
+   *          new session does not change the selection.
+   */
+  nntrainer::kv::SessionId createSession();
+
+  /** Route steps, positions and snapshots to @p session (no live step). */
+  void selectSession(nntrainer::kv::SessionId session);
+
+  /** Release a session that is not selected. */
+  void destroySession(nntrainer::kv::SessionId session);
+
+  /** The selected session (0 also when CPU storage is not in use). */
+  nntrainer::kv::SessionId activeSession() const;
+
+  /** Number of sessions (1 for contiguous or device storage). */
+  size_t sessionCount() const;
 
   /**
    * @brief Set current write position (e.g., after loading pre-computed cache)
@@ -118,14 +198,14 @@ public:
   /**
    * @brief Get the full key cache tensor for a layer (for direct access)
    * @param[in] layer_idx attention layer index
-   * @return reference to the full key cache tensor
+   * @return full cache tensor, or a one-row graph identity in paged mode
    */
   nntrainer::Tensor &getKeyCache(unsigned int layer_idx);
 
   /**
    * @brief Get the full value cache tensor for a layer (for direct access)
    * @param[in] layer_idx attention layer index
-   * @return reference to the full value cache tensor
+   * @return full cache tensor, or a one-row graph identity in paged mode
    */
   nntrainer::Tensor &getValueCache(unsigned int layer_idx);
 
@@ -243,7 +323,7 @@ public:
   /**
    * @brief Get the KV dimension width (num_heads_kv * head_dim)
    */
-  unsigned int getKVWidth() const { return num_heads_kv_ * head_dim_; }
+  unsigned int getKVWidth() const { return kv_width_; }
 
   /**
    * @brief [kv-share] Declare, per layer, which EARLIER layer owns the K/V
@@ -347,6 +427,13 @@ public:
   }
 
 private:
+  void requireCpuIdle() const;
+  void allocateCpu(unsigned int num_layers, unsigned int batch_size,
+                   unsigned int max_seq_len,
+                   const std::vector<unsigned int> &kv_widths,
+                   ml::train::TensorDim::DataType dtype,
+                   ml::train::TensorDim::Format format,
+                   const std::vector<unsigned int> &kv_heads);
   /**
    * @brief FNV-1a over the per-layer geometry vectors, so the header can refuse
    *        a file whose widths / ring capacities / alias map differ without
@@ -402,6 +489,9 @@ private:
    * (NNTR_CUDA_KV_UVM) allocator. Null on the host (CPU) path.
    */
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
+  std::unique_ptr<nntrainer::kv::KvCacheManager> cpu_cache_;
+  std::vector<bool> layer_producers_;
+  bool prefix_cache_allowed_ = true; /**< Model permits prefix reuse. */
 
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */

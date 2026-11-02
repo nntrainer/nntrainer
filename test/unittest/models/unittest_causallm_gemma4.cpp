@@ -377,6 +377,62 @@ TEST(Gemma4GraphTest, MoEUsesDenseAndSparseBranches) {
 }
 
 /**
+ * @brief Skip-prefill must preserve each LM head's supported properties.
+ */
+class Gemma4SkipPrefillHeadTest : public ::testing::TestWithParam<std::string> {
+};
+
+TEST_P(Gemma4SkipPrefillHeadTest, InitializesAndPlansOneLogitRow) {
+  const auto &head = GetParam();
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Gemma4SkipPrefillHeadTest", "InitializesAndPlansOneLogitRow", head);
+  const auto test_case = makeGemma4Case(causallm_test::makeTinyFp32DataType());
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  config.model["text_config"]["tie_word_embeddings"] =
+    head == "tie_word_embeddings";
+  config.nntrainer["lmhead_untie"] = head == "fully_connected";
+  config.nntrainer["skip_prefill"] = true;
+
+  TinyGemma4CausalLM model(config.model, config.generation, config.nntrainer);
+  ASSERT_NO_THROW(model.initializeModel());
+  setupGemma4DeterministicWeights(model);
+  ASSERT_NO_THROW(model.runPrompt("hello tok4"));
+  if (head == "tie_word_embeddings") {
+    EXPECT_NE(model.getOutputText().find("tok4"), std::string::npos);
+  }
+
+  bool found_head = false;
+  model.forEachLayer(
+    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
+      if (layer.getName() != "output_of_causallm")
+        return;
+      found_head = true;
+      EXPECT_EQ(layer.getType(), head);
+      EXPECT_EQ(context.getOutput(0).height(), 1u);
+    });
+  EXPECT_TRUE(found_head);
+}
+
+TEST_P(Gemma4SkipPrefillHeadTest,
+       RejectsUnsupportedOrMalformedPlanningProperty) {
+  // Keep strict property validation: accepting arbitrary properties would
+  // conceal the original model-builder mistake instead of fixing its caller.
+  const std::string property = GetParam() == "fully_connected"
+                                 ? "plan_last_row_only=invalid"
+                                 : "plan_last_row_only=true";
+  EXPECT_THROW(ml::train::createLayer(GetParam(), {property}),
+               std::invalid_argument);
+}
+
+INSTANTIATE_TEST_SUITE_P(Gemma4, Gemma4SkipPrefillHeadTest,
+                         ::testing::Values("tie_word_embeddings", "lm_head",
+                                           "fully_connected"),
+                         [](const ::testing::TestParamInfo<std::string> &info) {
+                           return info.param;
+                         });
+
+/**
  * @brief Q4_0 expert projections are virtual and respect the mmap LRU bound
  */
 #if !defined(_WIN32)
@@ -486,6 +542,15 @@ TEST_P(Gemma4TinyModelTest, WeightRoundTripProducesSameLogits) {
  * @brief Test that a prompt produces the expected golden logits
  */
 TEST_P(Gemma4TinyModelTest, PromptProducesExpectedLogits) {
+  const auto files = makeFiles();
+  causallm_test::expectPromptProducesExpectedLogits(GetParam(), files);
+}
+
+TEST_P(Gemma4TinyModelTest, PagedPromptProducesExpectedLogits) {
+  causallm_test::ScopedEnv engine("NNTR_ENGINE", "cpu");
+  causallm_test::ScopedEnv legacy("NNTR_CPU_KV_LEGACY", "0");
+  causallm_test::ScopedEnv paged("NNTR_KV_PAGED", "1");
+  causallm_test::ScopedEnv page_size("NNTR_KV_PAGE_TOKENS", "2");
   const auto files = makeFiles();
   causallm_test::expectPromptProducesExpectedLogits(GetParam(), files);
 }
