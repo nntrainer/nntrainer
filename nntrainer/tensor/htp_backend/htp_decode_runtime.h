@@ -105,6 +105,52 @@ public:
   size_t q4m1_left_ = 0; /**< E2E FC arena bytes still to place */
 
   std::vector<uint32_t> ban_, ban_sent_; /**< set_decode_ban, the LM_BAN */
+  /** A completed resident row owns the authoritative KV and convolution state.
+   *  Initial prefill, an unfinished row and non-contiguous positions keep the
+   *  existing graph-walk contract. */
+  bool canContinue(unsigned from) const {
+    return graph_inited_ && q4m1_bound_ && prompt_tokens_ != 0 &&
+           (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0 &&
+           cur_pos_ != HTP_GRAPH_NO_OP && cur_pos_ + 1u == from &&
+           pending_op_ == HTP_GRAPH_NO_OP && !have_id_;
+  }
+
+  void checkContinuationRange(unsigned from, unsigned to) const {
+    if (!canContinue(from) || to <= from || to > graph_words_[6])
+      throw std::invalid_argument("HTP continuation: invalid token range");
+    for (uint32_t op : kind_ops_[HTP_OP_ATTN_M1]) {
+      const auto *rec = graphOp(op);
+      const uint32_t capacity =
+        rec->top_k && attn_window_rows_ ? attn_window_rows_ : graph_words_[6];
+      if (from < rec->n_experts || to - rec->n_experts > capacity)
+        throw std::invalid_argument(
+          "HTP continuation: token range exceeds the reserved KV capacity");
+      if (kv_len_[attn_ordinal_[op]] != from - rec->n_experts)
+        throw std::logic_error(
+          "HTP continuation: attention state is not current");
+    }
+    for (uint32_t op : kind_ops_[HTP_OP_CONV1D_GATE])
+      if (conv_next_pos_[op] != from)
+        throw std::logic_error(
+          "HTP continuation: convolution state is not current");
+  }
+
+  /** Restore the caller's sampling/logits policy, including exceptional exits.
+   */
+  class LogitsRequest {
+  public:
+    explicit LogitsRequest(HtpDecodeRuntime &runtime) :
+      runtime_(runtime), previous_(runtime.want_logits_) {}
+    ~LogitsRequest() { runtime_.want_logits_ = previous_; }
+    LogitsRequest(const LogitsRequest &) = delete;
+    LogitsRequest &operator=(const LogitsRequest &) = delete;
+    void set(bool want) { runtime_.want_logits_ = want; }
+
+  private:
+    HtpDecodeRuntime &runtime_;
+    bool previous_;
+  };
+
   const htp_graph_op *graphOp(uint32_t op) const {
     return htp_graph_op_cat(graph_words_.data(), op);
   }
@@ -294,5 +340,7 @@ public:
     }
   }
 };
+/** Borrow the active runtime without creating a backend or opening the DSP. */
+HtpDecodeRuntime *getHtpDecodeRuntime() noexcept;
 } // namespace nntrainer
 #endif
