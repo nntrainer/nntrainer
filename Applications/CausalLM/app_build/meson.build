@@ -211,7 +211,7 @@ causallm_inc_args += ['-I' + causallm_root / 'models' / 'lfm2_moe',
 causallm_htp_src = [
   causallm_root / 'models' / 'gemma4' / 'gemma4_htp_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_htp_moe_causallm.cpp',
-  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_weights.cpp',
+  causallm_root / 'models' / 'htp_weight_preparation.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_layer.cpp',
   causallm_root / 'models' / 'lfm2_moe' / 'lfm2_htp_moe_causallm.cpp',
   causallm_root / 'layers' / 'htp_mha_core.cpp',

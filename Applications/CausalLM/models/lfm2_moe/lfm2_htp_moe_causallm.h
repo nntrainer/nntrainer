@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 /** @file lfm2_htp_moe_causallm.h
- * @brief LFM2 hybrid MoE using the shared Gemma4 HTP weight backend.
+ * @brief LFM2 hybrid MoE using shared HTP preparation services.
  * @author NNTrainer contributors
  * @bug No known bugs except for NYI items
  */
 #ifndef __LFM2_HTP_MOE_CAUSALLM_H__
 #define __LFM2_HTP_MOE_CAUSALLM_H__
+#include <causal_lm.h>
 #include <climits>
 #include <functional>
-#include <gemma4_htp_causallm.h>
+#include <htp_weight_preparation.h>
 namespace causallm {
 class ConvBlockLayer;
 /** LFM2 retains sigmoid+bias routing, SwiGLU, unscaled embeddings and
  * alternating conv/attention blocks. Only the HTP implementation is shared. */
-class Lfm2HtpMoECausalLM : public Gemma4HtpCausalLM {
+class Lfm2HtpMoECausalLM : public CausalLM {
 public:
   Lfm2HtpMoECausalLM(json &cfg, json &gen, json &nntr);
   void setupParameters(json &cfg, json &gen, json &nntr) override;
@@ -30,10 +31,16 @@ public:
   void load_kvcache(std::string path, int to) override;
 
 protected:
+  bool chunkLongPrompts() const override { return true; }
   void beforePrefillBlock(unsigned int from, unsigned int to) override;
   void allocateAndBindKVCache() override;
 
 private:
+  HtpWeightPreparation preparation_{};
+  std::vector<std::string> layer_types;
+  std::string ATTENTION_ENGINE, ATTENTION_KV_DTYPE, MOE_LAYER_DTYPE;
+  unsigned NUM_EXPERTS = 0, NUM_EXPERTS_PER_TOK = 0;
+  unsigned MOE_INTERMEDIATE_SIZE = 0, MOE_CACHE_EXPERTS = 0;
   unsigned dense_layers_ = 0;
   bool loading_ = false, prepared_ = false, ran_ = false;
   bool prefill_early_attempted_ = false;
