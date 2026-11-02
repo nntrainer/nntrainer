@@ -25,15 +25,12 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
-"$cc" -std=c11 -Wall -Wextra -Werror -I "$BACKEND" \
-  "$HERE/profile_wire_check.c" -o "$OUT/profile_wire_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/decode_runtime_check.cpp" -o "$OUT/decode_runtime_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/graph_binding_check.cpp" -o "$OUT/graph_binding_check"
 "$OUT/graph_binding_check"
 "$OUT/decode_runtime_check"
-"$OUT/profile_wire_check"
 python3 "$HERE/run_prefill_scratch_check.py"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
   -I "$HERE/../../../Applications/CausalLM" \
@@ -266,9 +263,8 @@ done
 
 "$OUT/dma_probe_host_check"
 
-# The M=1 GEMV default and the MoE profile row's rest (htp_moe_opts.h,
-# #101/#102): pure arithmetic on #94 sitting 2's printed rows.
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+# Profiling wire ordinals, the M=1 GEMV option word and profile-row arithmetic.
+"$cc" -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter \
   -I "$BACKEND" \
   -o "$OUT/moe_opts_host_check" \
   "$HERE/moe_opts_host_check.c" -lm
@@ -300,8 +296,9 @@ done
 # every #100 cell's res[12] equals the tag simulator the gtest uses. The
 # device's DMA timing and interleaving are not modelled here.
 # (memalign is in the Hexagon libc's stdlib.h, in glibc's malloc.h.)
+python3 "$HERE/gen_nntr_hvx_h.py" "$DSP/nntr_hvx.idl" "$OUT/nntr_hvx.h"
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
+  -include malloc.h -I "$OUT" -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/dma_replay_host_check" \
   "$HERE/dma_replay_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
@@ -316,7 +313,7 @@ done
 # distinct footprint, the tag for 1 / 20 / 500 calls; then the DDR bounds
 # (85.3 GB/s, #77's 3265.6 refused) and the net-per-token arithmetic.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
+  -include malloc.h -I "$OUT" -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/two_reader_host_check" \
   "$HERE/two_reader_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
@@ -820,7 +817,6 @@ done
 # over the real weight registry, the arena plain aligned memory. The header
 # qaic would generate is written from the IDL, so the entry points'
 # definitions are checked against the IDL too -- a mismatch fails here.
-python3 "$HERE/gen_nntr_hvx_h.py" "$DSP/nntr_hvx.idl" "$OUT/nntr_hvx.h"
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -include malloc.h \
   -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \

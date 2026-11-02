@@ -9,12 +9,10 @@
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * For every shape of docs/plans/77-first-handoff.md section 3.4 and worker
- * count 1..4 over a 256 MiB (and a 128 MiB fallback) source: descriptors
- * read disjoint source bytes, stay inside the range, the payload total is
- * n x row_size x nrows, every destination fits its worker's slice, the
- * descriptors are balanced across workers (max - min <= 1), and the
- * count fits NNTR_DMA_PROBE_MAX_DESC. Timing is the device's business.
+ * Checks four descriptor geometries with 1..4 workers over 128/256 MiB
+ * sources: source pages are disjoint and in bounds, destinations fit their
+ * worker slices, work is balanced, and every whole source band is covered.
+ * Invalid geometry and slice sizes must produce an empty plan.
  */
 #include "nntr_dma_probe_plan.h"
 
@@ -49,7 +47,6 @@ static void check_shape(const char *name, uint32_t bytes, uint32_t row_size,
                         plan, NNTR_DMA_PROBE_MAX_DESC);
   const uint64_t payload = (uint64_t)row_size * nrows;
   uint32_t per_w[8] = {0};
-  uint64_t total = 0;
   uint32_t k, r;
 
   CHECK(n > 0, "%s w=%u: empty plan", name, workers);
@@ -69,7 +66,6 @@ static void check_shape(const char *name, uint32_t bytes, uint32_t row_size,
     CHECK(d->dst_off % 128u == 0u, "%s w=%u: desc %u dst unaligned", name,
           workers, k);
     per_w[d->worker]++;
-    total += payload;
     for (r = 0; r < nrows; ++r) {
       const uint64_t row0 = (uint64_t)d->src_off + (uint64_t)r * src_stride;
       const uint64_t row1 = row0 + row_size;
@@ -85,8 +81,6 @@ static void check_shape(const char *name, uint32_t bytes, uint32_t row_size,
       }
     }
   }
-  CHECK(total == (uint64_t)n * payload, "%s w=%u: total %llu", name, workers,
-        (unsigned long long)total);
   {
     uint32_t mn = per_w[0], mx = per_w[0];
     for (r = 1; r < workers; ++r) {
@@ -108,7 +102,7 @@ static void check_shape(const char *name, uint32_t bytes, uint32_t row_size,
   }
   printf("  %-4s bytes=%u workers=%u n=%u payload=%llu MiB/pass=%llu\n", name,
          bytes, workers, n, (unsigned long long)payload,
-         (unsigned long long)(total >> 20));
+         (unsigned long long)(((uint64_t)n * payload) >> 20));
 }
 
 int main(void) {
