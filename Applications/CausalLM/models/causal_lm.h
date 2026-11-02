@@ -220,6 +220,45 @@ public:
   }
 
   /**
+   * @brief Create an independent KV session: a separate conversation with its
+   *        own cached history, sharing this model's weights, graph and KV
+   *        page pool.
+   * @return the new session id. The selection does not change; the session
+   *         every model starts with is id 0.
+   * @details Requires paged CPU KV storage (NNTR_ENGINE=cpu NNTR_KV_PAGED=1)
+   *          and an allocated cache, i.e. after the first run() or a resume
+   *          (the first prompt settles the prefill plane the cache is sized
+   *          from).
+   */
+  WIN_EXPORT nntrainer::kv::SessionId createKVSession();
+
+  /**
+   * @brief Make @p session the conversation the next run() continues.
+   * @details Moves the session token position to that session's committed
+   *          length (see setSessionTokenPosition()), so the next run()
+   *          appends to its history; setSessionTokenPosition(0) afterwards
+   *          starts that session over.
+   */
+  WIN_EXPORT void selectKVSession(nntrainer::kv::SessionId session);
+
+  /**
+   * @brief Release the KV pages of a session that is not selected. Pages it
+   *        published to the prefix cache stay cached.
+   */
+  WIN_EXPORT void destroyKVSession(nntrainer::kv::SessionId session);
+
+  /** @brief The selected KV session id. */
+  WIN_EXPORT nntrainer::kv::SessionId getActiveKVSession() const;
+
+  /**
+   * @brief Prompt tokens the last run() took from already computed KV rows
+   *        instead of prefilling them (prefix caching, NNTR_KV_PREFIX_CACHE).
+   */
+  unsigned int getLastPrefixReusedTokens() const {
+    return last_prefix_reused_tokens_;
+  }
+
+  /**
    * @brief Opaque identity written into a saved KV cache and checked when one
    * is loaded: everything about this model that decides how to read a KV plane.
    * @details Geometry alone is not enough. Two of this tree's models -- one
@@ -455,6 +494,10 @@ protected:
    */
   KVCacheManager kv_cache;
   bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
+  /** Set by run() while input[0] holds each call's token ids as floats, so
+   *  incrementalInference() can record them for prefix caching. */
+  bool kv_tokens_in_input_ = false;
+  unsigned int last_prefix_reused_tokens_ = 0; /**< Last run's reused rows */
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers by pointing

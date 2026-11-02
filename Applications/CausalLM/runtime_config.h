@@ -69,6 +69,9 @@ struct RuntimeConfig {
   bool cpu_kv_tiled = false;
   bool cpu_kv_legacy = false;
   bool cpu_kv_paged = false;
+  /** Share full KV pages between sessions by token prefix
+   * (NNTR_KV_PREFIX_CACHE); requires paged storage. */
+  bool cpu_kv_prefix_cache = false;
   /** Paged MHA always uses the online-softmax kernel (NNTR_KV_NO_FLASH). */
   bool cpu_kv_paged_online = false;
   bool device_attention = false;
@@ -90,6 +93,8 @@ struct RuntimeConfig {
     result.cpu_kv_legacy = result.cpu && nntr_env_on("NNTR_CPU_KV_LEGACY");
     result.cpu_kv_paged =
       result.cpu && !result.cpu_kv_legacy && nntr_env_on("NNTR_KV_PAGED");
+    result.cpu_kv_prefix_cache =
+      result.cpu_kv_paged && nntr_env_on("NNTR_KV_PREFIX_CACHE");
     result.cpu_kv_paged_online =
       result.cpu_kv_paged && nntr_env_on("NNTR_KV_NO_FLASH");
     result.device_attention =

@@ -536,6 +536,26 @@ TEST_F(KVCacheManagerTest, active_step_rejects_reallocation_and_snapshot) {
   EXPECT_EQ(manager.getPosition(), 2u);
 }
 
+TEST(KVCacheManagerCpu, contiguous_storage_has_one_session_and_no_prefix) {
+  causallm::KVCacheManager m;
+  m.allocate(1, 1, 16, 1, 4, ml::train::TensorDim::DataType::FP32);
+  ASSERT_TRUE(m.usesCpuStorage());
+  ASSERT_FALSE(m.usesPagedStorage());
+  EXPECT_FALSE(m.prefixCacheEnabled());
+  EXPECT_EQ(m.sessionCount(), 1u);
+  EXPECT_EQ(m.activeSession(), nntrainer::kv::KvCacheManager::kDefaultSession);
+  EXPECT_THROW(m.createSession(), std::logic_error);
+  EXPECT_THROW(m.reusePrefix({1, 2}), std::logic_error);
+  EXPECT_EQ(m.prefixCacheStats().blocks, 0u);
+  // Steps may carry ids on any CPU storage; they only matter when paged.
+  const std::vector<nntrainer::kv::TokenId> ids = {5, 6};
+  auto step = m.beginStep(0, 2, ids.data());
+  completeCpuProducers(m, step);
+  m.commitStep(std::move(step));
+  EXPECT_EQ(m.getPosition(), 2u);
+  EXPECT_EQ(m.committedTokens(), ids);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

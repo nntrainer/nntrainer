@@ -172,6 +172,20 @@ TEST_F(CausalRuntimeSnapshot, LegacyCpuFacadeIsAnIndependentOptOut) {
   EXPECT_FALSE(RuntimeConfig::captureForEngine("cpu").cpu_kv_legacy);
 }
 
+TEST_F(CausalRuntimeSnapshot, PrefixCacheRequiresPagedCpuStorage) {
+  ScopedEnv paged("NNTR_KV_PAGED", nullptr);
+  ScopedEnv prefix("NNTR_KV_PREFIX_CACHE", "1");
+  EXPECT_FALSE(RuntimeConfig::captureForEngine("cpu").cpu_kv_prefix_cache);
+  ScopedEnv enable_paged("NNTR_KV_PAGED", "1");
+  EXPECT_TRUE(RuntimeConfig::captureForEngine("cpu").cpu_kv_prefix_cache);
+  EXPECT_FALSE(RuntimeConfig::captureForEngine("gpu").cpu_kv_prefix_cache);
+  ScopedEnv legacy("NNTR_CPU_KV_LEGACY", "1");
+  EXPECT_FALSE(RuntimeConfig::captureForEngine("cpu").cpu_kv_prefix_cache);
+  ScopedEnv cpu_kv("NNTR_CPU_KV_LEGACY", "0");
+  ScopedEnv disabled("NNTR_KV_PREFIX_CACHE", "0");
+  EXPECT_FALSE(RuntimeConfig::captureForEngine("cpu").cpu_kv_prefix_cache);
+}
+
 TEST(CpuAttentionAdmission, SupportsExternalFp32RopeHalfCacheInference) {
   EXPECT_TRUE(supportsCpuAttentionFp32(CpuAttentionProfile{}));
 }

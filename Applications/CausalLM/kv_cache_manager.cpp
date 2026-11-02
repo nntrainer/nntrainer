@@ -79,6 +79,9 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   if (nntr_env_on("NNTR_KV_PAGED") && (!runtime.cpu || runtime.cpu_kv_legacy))
     throw std::invalid_argument(
       "NNTR_KV_PAGED requires the CPU core KV manager");
+  if (nntr_env_on("NNTR_KV_PREFIX_CACHE") && !runtime.cpu_kv_paged)
+    throw std::invalid_argument(
+      "NNTR_KV_PREFIX_CACHE requires paged CPU KV storage (NNTR_KV_PAGED=1)");
   const auto &selected = runtime.engine;
   const bool cpu = runtime.cpu && !runtime.cpu_kv_legacy;
   if (cpu) {
@@ -310,6 +313,7 @@ void KVCacheManager::allocateCpu(
        dtype != DataType::UINT16))
     throw std::invalid_argument("Unsupported CPU KV geometry or storage type");
 
+  const auto runtime = RuntimeConfig::capture();
   CacheSpec spec;
   // Default page width equals the host flash key block (Bk in
   // MHACoreLayer::gemm_attention: 512 on x86, 128 elsewhere), so the paged
@@ -322,8 +326,7 @@ void KVCacheManager::allocateCpu(
 #else
   constexpr unsigned int default_page_tokens = 128u;
 #endif
-  spec.page_tokens =
-    RuntimeConfig::capture().cpu_kv_paged ? default_page_tokens : 0u;
+  spec.page_tokens = runtime.cpu_kv_paged ? default_page_tokens : 0u;
   if (spec.page_tokens) {
     if (const char *value = std::getenv("NNTR_KV_PAGE_TOKENS")) {
       const std::string text(value);
@@ -366,8 +369,36 @@ void KVCacheManager::allocateCpu(
                                                   : StorageType::UInt16);
     spec.layers.push_back(s);
   }
+  // Prefix caching: full pages are published under their token chain and
+  // adopted by later requests (or other sessions) that start with the same
+  // tokens. The block bound counts blocks sessions still use, so the default
+  // of two contexts leaves room for about one context of unreferenced pages
+  // beyond a full live session. NNTR_KV_PREFIX_CACHE_BLOCKS overrides it
+  // (0 = no block bound).
+  std::shared_ptr<KvPrefixCache> prefix_cache;
+  if (spec.page_tokens && runtime.cpu_kv_prefix_cache) {
+    if (!prefix_cache_allowed_) {
+      std::fprintf(stderr,
+                   "[kv-prefix] disabled: this model keeps decoder state "
+                   "outside the KV cache\n");
+    } else {
+      size_t max_blocks = 2 * (1 + (max_seq_len - 1) / spec.page_tokens);
+      if (const char *value = std::getenv("NNTR_KV_PREFIX_CACHE_BLOCKS")) {
+        const std::string text(value);
+        if (text.empty() ||
+            text.find_first_not_of("0123456789") != std::string::npos ||
+            text.size() > 18)
+          throw std::invalid_argument(
+            "NNTR_KV_PREFIX_CACHE_BLOCKS must be a non-negative integer");
+        max_blocks = static_cast<size_t>(std::stoull(text));
+      }
+      prefix_cache = std::make_shared<KvPrefixCache>(
+        std::make_shared<KvPagePool>(), max_blocks);
+    }
+  }
   auto next = std::make_unique<nntrainer::kv::KvCacheManager>();
-  next->initialize(spec);
+  next->initialize(spec, std::make_shared<nntrainer::MemAllocator>(), nullptr,
+                   prefix_cache);
   std::vector<LayerCache> caches(num_layers);
   for (unsigned int i = 0; i < num_layers; ++i) {
     ml::train::TensorDim dim({batch_size, 1,
@@ -408,11 +439,60 @@ void KVCacheManager::allocateCpu(
   }
 }
 
-nntrainer::kv::StepLease KVCacheManager::beginStep(unsigned int from,
-                                                   unsigned int to) {
+nntrainer::kv::StepLease
+KVCacheManager::beginStep(unsigned int from, unsigned int to,
+                          const nntrainer::kv::TokenId *tokens) {
   if (!cpu_cache_ || from != getPosition() || to <= from)
     throw std::logic_error("CPU KV step does not match the committed position");
-  return cpu_cache_->beginStep(to - from);
+  return cpu_cache_->beginStep(to - from, tokens);
+}
+
+nntrainer::kv::PrefixCacheStats KVCacheManager::prefixCacheStats() const {
+  const auto prefix = cpu_cache_ ? cpu_cache_->prefixCache() : nullptr;
+  return prefix ? prefix->stats() : nntrainer::kv::PrefixCacheStats{};
+}
+
+unsigned int
+KVCacheManager::reusePrefix(const std::vector<nntrainer::kv::TokenId> &tokens) {
+  if (!usesPagedStorage())
+    throw std::logic_error("KV prefix reuse requires paged CPU storage");
+  const size_t position = cpu_cache_->reusePrefix(tokens.data(), tokens.size());
+  cache_pos_ = static_cast<unsigned int>(position);
+  return cache_pos_;
+}
+
+std::vector<nntrainer::kv::TokenId> KVCacheManager::committedTokens() const {
+  return cpu_cache_ ? cpu_cache_->committedTokens()
+                    : std::vector<nntrainer::kv::TokenId>{};
+}
+
+nntrainer::kv::SessionId KVCacheManager::createSession() {
+  if (!usesPagedStorage())
+    throw std::logic_error("KV sessions require paged CPU storage "
+                           "(NNTR_ENGINE=cpu NNTR_KV_PAGED=1)");
+  return cpu_cache_->createSession();
+}
+
+void KVCacheManager::selectSession(nntrainer::kv::SessionId session) {
+  if (!cpu_cache_)
+    throw std::logic_error("KV sessions require CPU KV storage");
+  cpu_cache_->selectSession(session);
+  cache_pos_ = getPosition();
+}
+
+void KVCacheManager::destroySession(nntrainer::kv::SessionId session) {
+  if (!cpu_cache_)
+    throw std::logic_error("KV sessions require CPU KV storage");
+  cpu_cache_->destroySession(session);
+}
+
+nntrainer::kv::SessionId KVCacheManager::activeSession() const {
+  return cpu_cache_ ? cpu_cache_->activeSession()
+                    : nntrainer::kv::KvCacheManager::kDefaultSession;
+}
+
+size_t KVCacheManager::sessionCount() const {
+  return cpu_cache_ ? cpu_cache_->sessionCount() : 1u;
 }
 
 void KVCacheManager::commitStep(nntrainer::kv::StepLease &&step) {

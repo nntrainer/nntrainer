@@ -425,6 +425,12 @@ void CausalLM::allocateAndBindKVCache() {
     std::vector<bool> producers;
     for (int i = 0; i < NUM_LAYERS; ++i)
       producers.push_back(hasKVCacheProducer(i));
+    // Reusing KV rows skips the decoder for those positions, which is only
+    // exact when the KV cache is the decoder's whole state. A layer without
+    // a KV producer (a convolution block of a hybrid model) keeps state
+    // elsewhere, so such models never share or reuse prefixes.
+    kv_cache.setPrefixCacheAllowed(
+      std::find(producers.begin(), producers.end(), false) == producers.end());
     kv_cache.setLayerProducers(std::move(producers));
 
     // Model hooks supply width and head count, including variable geometry.
@@ -632,7 +638,24 @@ std::vector<float *> CausalLM::incrementalInference(
   std::optional<nntrainer::kv::StepLease> cpu_step;
   std::unique_ptr<nntrainer::kv::KvStepScope> cpu_scope;
   if (kv_cache.usesCpuStorage()) {
-    cpu_step.emplace(kv_cache.beginStep(from, to));
+    // [prefix-cache] Record which token produced each row. Only run() vouches
+    // that input[0] holds token ids (rows [0, to - from) of batch 0); any
+    // other caller leaves the rows unknown, so they are never shared.
+    std::vector<nntrainer::kv::TokenId> step_tokens;
+    if (kv_tokens_in_input_ && kv_cache.prefixCacheEnabled() &&
+        !input.empty() && input[0] != nullptr) {
+      step_tokens.reserve(to - from);
+      for (unsigned int r = 0; r < to - from; ++r) {
+        const float id = input[0][r];
+        if (!(id >= 0.0f && id < 16777216.0f)) { // Exact in FP32, non-negative.
+          step_tokens.clear();
+          break;
+        }
+        step_tokens.push_back(static_cast<nntrainer::kv::TokenId>(id));
+      }
+    }
+    cpu_step.emplace(kv_cache.beginStep(
+      from, to, step_tokens.empty() ? nullptr : step_tokens.data()));
     cpu_scope = kv_cache.bindStep(*cpu_step);
   }
   nntrainer::sharedConstTensors output_tensors =
@@ -998,6 +1021,32 @@ void CausalLM::setSessionTokenPosition(unsigned int pos) {
   SYS_PROMP_LEN = 0;
   global_token_len = pos;
   retire_decode_capture();
+}
+
+nntrainer::kv::SessionId CausalLM::createKVSession() {
+  if (!kv_cache.isAllocated())
+    throw std::logic_error(
+      "createKVSession: the KV cache is allocated by the first run() or a "
+      "resume; create sessions after that");
+  return kv_cache.createSession();
+}
+
+void CausalLM::selectKVSession(nntrainer::kv::SessionId session) {
+  if (!kv_cache.isAllocated())
+    throw std::logic_error("selectKVSession: the KV cache is not allocated");
+  kv_cache.selectSession(session);
+  // Continue the selected conversation where its committed history ends.
+  setSessionTokenPosition(kv_cache.getPosition());
+}
+
+void CausalLM::destroyKVSession(nntrainer::kv::SessionId session) {
+  if (!kv_cache.isAllocated())
+    throw std::logic_error("destroyKVSession: the KV cache is not allocated");
+  kv_cache.destroySession(session);
+}
+
+nntrainer::kv::SessionId CausalLM::getActiveKVSession() const {
+  return kv_cache.activeSession();
 }
 
 void CausalLM::setPrecomputedKVCache(const std::string &path,
@@ -1581,6 +1630,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     return inference_inputs;
   };
   input = build_inference_inputs();
+  // input_sample rows hold the token ids of every call below.
+  struct TokenInputScope {
+    bool &flag;
+    explicit TokenInputScope(bool &f) : flag(f) { flag = true; }
+    ~TokenInputScope() { flag = false; }
+  } token_input_scope(kv_tokens_in_input_);
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;
@@ -1860,8 +1915,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         return prefill_chunk;
     return 0u;
   }();
-  auto do_prefill = [&](unsigned int n_tok,
-                        unsigned int from_pos) -> std::vector<float *> {
+  // tok_base: index in init_input of the first token this prefill feeds
+  // (non-zero when a reused prefix skips the leading prompt tokens).
+  auto do_prefill = [&](unsigned int n_tok, unsigned int from_pos,
+                        unsigned int tok_base = 0) -> std::vector<float *> {
     // [prefill-long] Tell the attention layers the whole key span this prefill
     // will reach, so the tight-stride V image is laid out once instead of once
     // per chunk (each re-layout re-scatters every V row already written). The
@@ -1876,7 +1933,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       for (unsigned int i = 0; i < n_tok; ++i) {
         for (unsigned int b = 0; b < BATCH_SIZE; ++b)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
-            static_cast<float>(init_input[i]);
+            static_cast<float>(init_input[tok_base + i]);
         const unsigned int p = from_pos + i;
         auto so = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
         if (i + 1 < n_tok)
@@ -1890,9 +1947,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // Single block (default) when chunking is off or the prompt fits one chunk.
     const bool one_block_on_grid =
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
-    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid))
+    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
+      // The block reads rows [0, n_tok), filled with the whole prompt above.
+      if (tok_base != 0)
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          for (unsigned int j = 0; j < n_tok; ++j)
+            input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+              static_cast<float>(init_input[tok_base + j]);
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
+    }
     // Chunked forward prefill.
     std::vector<float *> out;
     unsigned int clen = 0;
@@ -1904,7 +1968,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       for (unsigned int b = 0; b < BATCH_SIZE; ++b)
         for (unsigned int j = 0; j < clen; ++j)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
-            static_cast<float>(init_input[o + j]);
+            static_cast<float>(init_input[tok_base + o + j]);
       const unsigned int cf = from_pos + o;
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
@@ -1921,14 +1985,50 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  decode loop. See ttft_ms in performance_metrics.h. */
   std::chrono::high_resolution_clock::time_point perf_split_first_out{};
 
+  // [prefix-cache] Rows already computed for the leading tokens of this
+  // sequence are reused instead of prefilled again: the active session's own
+  // matching history, or full pages that another request or session
+  // published. The last prefilled token is always computed, because its
+  // logits (or, with skip_prefill, its KV for the first decode) are needed.
+  // A precomputed-cache file carries no token ids, so that path never reuses.
+  unsigned int prefix_skip = 0;
+  last_prefix_reused_tokens_ = 0;
+  if (!USE_KVCACHE && kv_cache.prefixCacheEnabled()) {
+    const unsigned int prefill_count =
+      (SKIP_PREFILL && init_len > 1) ? init_len - 1 : init_len;
+    std::vector<nntrainer::kv::TokenId> sequence = kv_cache.committedTokens();
+    // Reuse needs the ids of the history this run continues from.
+    if (prefill_count > 1 && sequence.size() >= prefill_from) {
+      sequence.resize(prefill_from);
+      for (unsigned int i = 0; i + 1 < prefill_count; ++i)
+        sequence.push_back(static_cast<nntrainer::kv::TokenId>(init_input[i]));
+      const unsigned int reached = kv_cache.reusePrefix(sequence);
+      NNTR_THROW_IF(reached < prefill_from, std::logic_error)
+        << "prefix reuse dropped committed history: " << reached << " < "
+        << prefill_from;
+      prefix_skip = reached - prefill_from;
+      last_prefix_reused_tokens_ = prefix_skip;
+      if (nntr_env_on("NNTR_KV_CPU_TRACE")) {
+        const auto stats = kv_cache.prefixCacheStats();
+        std::fprintf(stderr,
+                     "[kv-prefix] session=%llu from=%u reused=%u of %u "
+                     "cached_blocks=%zu hit_blocks=%zu\n",
+                     static_cast<unsigned long long>(kv_cache.activeSession()),
+                     prefill_from, prefix_skip, prefill_count, stats.blocks,
+                     stats.hit_blocks);
+      }
+    }
+  }
+
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
       static_cast<unsigned int>(init_input[init_len - 1]);
 
-    setKVCachePosition(prefill_from);
-    output = do_prefill(init_len - 1, prefill_from);
+    setKVCachePosition(prefill_from + prefix_skip);
+    output = do_prefill(init_len - 1 - prefix_skip, prefill_from + prefix_skip,
+                        prefix_skip);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -1938,8 +2038,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_len -= 1;
     init_len -= 1;
   } else {
-    setKVCachePosition(prefill_from);
-    output = do_prefill(init_len, prefill_from);
+    setKVCachePosition(prefill_from + prefix_skip);
+    output = do_prefill(init_len - prefix_skip, prefill_from + prefix_skip,
+                        prefix_skip);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);

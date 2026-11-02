@@ -106,7 +106,14 @@ public:
    */
   bool usesCpuStorage() const { return cpu_cache_ != nullptr; }
   bool usesPagedStorage() const { return cpu_cache_ && cpu_cache_->paged(); }
-  nntrainer::kv::StepLease beginStep(unsigned int from, unsigned int to);
+  /**
+   * @brief Begin the CPU step that writes positions [from, to).
+   * @param[in] tokens optional ids of those to - from positions. Prefix
+   *            caching only publishes and reuses rows whose ids are known.
+   */
+  nntrainer::kv::StepLease
+  beginStep(unsigned int from, unsigned int to,
+            const nntrainer::kv::TokenId *tokens = nullptr);
   void commitStep(nntrainer::kv::StepLease &&step);
   std::unique_ptr<nntrainer::kv::KvStepScope>
   bindStep(const nntrainer::kv::StepLease &step) {
@@ -121,6 +128,55 @@ public:
   nntrainer::kv::CacheStats cpuStats() const {
     return cpu_cache_ ? cpu_cache_->stats() : nntrainer::kv::CacheStats{};
   }
+
+  /**
+   * @brief Whether the model allows prefix reuse at all. A model whose
+   *        decoder keeps state outside the KV cache (for example the
+   *        convolution blocks of a hybrid model) must pass false: reusing its
+   *        KV rows would skip updating that state. Call before allocate().
+   */
+  void setPrefixCacheAllowed(bool allowed) { prefix_cache_allowed_ = allowed; }
+
+  /** True when paged storage was allocated with a prefix cache. */
+  bool prefixCacheEnabled() const {
+    return cpu_cache_ && cpu_cache_->prefixCache() != nullptr;
+  }
+
+  /** Counters of the prefix cache (all zero when it is disabled). */
+  nntrainer::kv::PrefixCacheStats prefixCacheStats() const;
+
+  /**
+   * @brief Reuse already computed rows for the leading @p tokens of the
+   *        active session and continue from the returned position.
+   * @details Keeps the session's own rows that match, or adopts a longer chain
+   *          of shared full pages from the prefix cache; drops the rest. The
+   *          caller prefills tokens from the returned position onward.
+   * @return the committed position after reuse (<= tokens.size())
+   */
+  unsigned int reusePrefix(const std::vector<nntrainer::kv::TokenId> &tokens);
+
+  /** Token ids known for the leading committed rows of the active session. */
+  std::vector<nntrainer::kv::TokenId> committedTokens() const;
+
+  /**
+   * @brief Create an empty KV session that shares this cache's geometry, page
+   *        pool, prefix cache and graph bindings. Requires paged storage.
+   * @details The cache starts with the default session (id 0) selected. A
+   *          new session does not change the selection.
+   */
+  nntrainer::kv::SessionId createSession();
+
+  /** Route steps, positions and snapshots to @p session (no live step). */
+  void selectSession(nntrainer::kv::SessionId session);
+
+  /** Release a session that is not selected. */
+  void destroySession(nntrainer::kv::SessionId session);
+
+  /** The selected session (0 also when CPU storage is not in use). */
+  nntrainer::kv::SessionId activeSession() const;
+
+  /** Number of sessions (1 for contiguous or device storage). */
+  size_t sessionCount() const;
 
   /**
    * @brief Set current write position (e.g., after loading pre-computed cache)
@@ -435,6 +491,7 @@ private:
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
   std::unique_ptr<nntrainer::kv::KvCacheManager> cpu_cache_;
   std::vector<bool> layer_producers_;
+  bool prefix_cache_allowed_ = true; /**< Model permits prefix reuse. */
 
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */
