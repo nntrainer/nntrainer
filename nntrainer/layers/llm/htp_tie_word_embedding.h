@@ -22,10 +22,8 @@
 #define WIN_EXPORT
 #endif
 
-#include <common_properties.h>
 #include <fused_llm_properties.h>
-#include <layer_devel.h>
-#include <layer_impl.h>
+#include <tie_word_embedding.h>
 
 #include <vector>
 
@@ -36,7 +34,7 @@ namespace nntrainer {
  * @brief   HtpTieWordEmbedding
  * @todo    Support setBatch for HtpTieWordEmbedding
  */
-WIN_EXPORT class HtpTieWordEmbedding : public nntrainer::LayerImpl {
+WIN_EXPORT class HtpTieWordEmbedding : public nntrainer::TieWordEmbedding {
 public:
   /**
    * @brief     Constructor of Embedding Layer
@@ -67,28 +65,12 @@ public:
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
-   * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
-   */
-  WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
-                             bool training) override;
-
-  /**
 ￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
 ￼   * int from, unsigned int to, bool training)
 ￼   */
   WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) override;
-
-  /**
-   * @copydoc Layer::calcDerivative(RunLayerContext &context)
-   */
-  WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
-
-  /**
-   * @copydoc Layer::calcGradient(RunLayerContext &context)
-   */
-  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
@@ -104,15 +86,6 @@ public:
   WIN_EXPORT const std::string getType() const override {
     return HtpTieWordEmbedding::type;
   };
-
-  /**
-   * @copydoc Layer::supportBackwarding()
-   */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
-
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   /**
    * @copydoc Layer::read()
@@ -176,41 +149,15 @@ public:
    */
   WIN_EXPORT bool placeLmheadOnAccelerator(nntrainer::RunLayerContext &context);
 
-  /**
-   * @brief NNTR_PPL (doc 51 section 2.14): the prompt's teacher-forced
-   *        negative log-likelihood at prefill, the accuracy gate that
-   *        replaces reading the generated text.
-   *
-   * The app hands the prompt's ids in before the prefill. The lm_head then
-   * computes every prefill position's logits, not only the last row's,
-   * and sums -log softmax(logits[t])[ids[t + 1]]; the model's own output
-   * (the last row) is untouched. takePpl returns the sum and the count
-   * and clears them. Process-wide state: one prompt at a time, batch 1.
-   */
-  WIN_EXPORT static void setPplTargets(const std::vector<unsigned int> &ids);
-  WIN_EXPORT static bool takePpl(double &nll_sum, unsigned int &count);
-
-  /** @brief -log softmax(logits)[target] over vocab logits, in double */
-  WIN_EXPORT static double nllOf(const float *logits, unsigned int vocab,
-                                 unsigned int target);
-
 private:
-  static std::vector<unsigned int> ppl_targets_;
-  static double ppl_nll_;
-  static unsigned int ppl_count_;
-  std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Unit, nntrainer::props::Scale, props::InNorm,
-             nntrainer::props::Epsilon, props::Softcap>
-    tieword_embedding_props;
-  enum mode { embedding, lm_head };
-  enum mode mode_;
-  std::array<unsigned int, 5> weight_idx; /**< indices of the weights */
+  std::tuple<props::InNorm, nntrainer::props::Epsilon, props::Softcap>
+    htp_props;
+  unsigned int norm_gamma_idx_ = std::numeric_limits<unsigned int>::max();
   /** @brief lm_head only: the model's final norm (in_norm, its gamma read
    *  where the output_norm layer's was) and logit softcap, folded in so
    *  an accelerator runs the three as one call. */
   bool in_norm = false;
   float softcap = 0.0f;
-  bool skip_prefill = false;
 
   /**
    * @brief The lm_head's weight in the blocked Q4_0 layout, built once.
@@ -235,8 +182,6 @@ private:
   std::vector<char> lmhead_blocked_;
   bool lmhead_blocked_tried_ = false;
 
-  WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
-  WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);
   WIN_EXPORT void
   incremental_forwarding_embedding(nntrainer::RunLayerContext &context,
                                    unsigned int from, unsigned int to,

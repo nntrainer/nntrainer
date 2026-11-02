@@ -20,12 +20,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include <cpu_backend.h>
+#include <htp_tie_word_embedding.h>
 #include <layer_context.h>
 #include <tensor.h>
 #include <tie_word_embedding.h>
@@ -64,7 +66,7 @@ struct TiedLmHeadRun {
  *
  * @param act activation dtype ("FP32" or "FP16")
  */
-TiedLmHeadRun runTiedLmHead(const std::string &act) {
+TiedLmHeadRun runTiedLmHead(const std::string &act, bool htp = false) {
   using nntrainer::Tensor;
   using nntrainer::TensorDim;
 
@@ -73,13 +75,17 @@ TiedLmHeadRun runTiedLmHead(const std::string &act) {
   TensorDim in_dim(1, 1, 1, kHidden,
                    TensorDim::TensorType(nntrainer::Tformat::NCHW, act_dt));
 
-  nntrainer::TieWordEmbedding layer;
-  layer.setProperty({"unit=" + std::to_string(kVocab), "disable_bias=true"});
+  std::unique_ptr<nntrainer::LayerImpl> layer;
+  if (htp)
+    layer = std::make_unique<nntrainer::HtpTieWordEmbedding>();
+  else
+    layer = std::make_unique<nntrainer::TieWordEmbedding>();
+  layer->setProperty({"unit=" + std::to_string(kVocab), "disable_bias=true"});
 
   nntrainer::InitLayerContext init_ctx({in_dim}, {true}, false, "tied_lm_head",
                                        "", 0.0, {"NCHW", "Q6_K", act}, 1.0,
                                        ml::train::ExecutionMode::INFERENCE);
-  layer.finalize(init_ctx);
+  layer->finalize(init_ctx);
 
   EXPECT_EQ(init_ctx.getWeightsSpec().size(), 1u);
   const TensorDim w_dim = std::get<0>(init_ctx.getWeightsSpec()[0]);
@@ -125,18 +131,18 @@ TiedLmHeadRun runTiedLmHead(const std::string &act) {
 
   const TensorDim out_dim = init_ctx.getOutSpecs()[0].variable_spec.dim;
   EXPECT_EQ(out_dim.width(), kVocab);
-  EXPECT_EQ(out_dim.getDataType(), act_dt);
+  EXPECT_EQ(out_dim.getDataType(), htp ? TensorDim::DataType::FP32 : act_dt);
   nntrainer::Var_Grad output(out_dim, nntrainer::Initializer::NONE, false, true,
                              "tied_lm_head:output");
 
   nntrainer::RunLayerContext run_ctx("tied_lm_head", false, 0.0f, false, 1.0f,
                                      nullptr, false, {&weight}, {&input},
                                      {&output}, {});
-  layer.incremental_forwarding(run_ctx, 0, 1, false);
+  layer->incremental_forwarding(run_ctx, 0, 1, false);
 
   r.logits.resize(kVocab);
   for (unsigned int v = 0; v < kVocab; ++v) {
-    if (act_dt == TensorDim::DataType::FP16) {
+    if (out_dim.getDataType() == TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
       r.logits[v] =
         static_cast<float>(output.getVariableRef().getData<_FP16>()[v]);
@@ -210,6 +216,10 @@ TEST(TieWordEmbeddingLmHead, q6_K_host_fp32_activation_p) {
   checkTiedLmHead(r, 0.0f);
 }
 
+TEST(HtpTieWordEmbeddingLmHead, q6_K_host_fp32_activation_p) {
+  checkTiedLmHead(runTiedLmHead("FP32", true), 0.0f);
+}
+
 #ifdef ENABLE_FP16
 /**
  * @brief FP16 activation: the hidden is widened, the integer dot runs as for
@@ -218,5 +228,9 @@ TEST(TieWordEmbeddingLmHead, q6_K_host_fp32_activation_p) {
 TEST(TieWordEmbeddingLmHead, q6_K_host_fp16_activation_p) {
   TiedLmHeadRun r = runTiedLmHead("FP16");
   checkTiedLmHead(r, 1.0f / 1024.0f);
+}
+
+TEST(HtpTieWordEmbeddingLmHead, q6_K_host_fp16_activation_fp32_logits_p) {
+  checkTiedLmHead(runTiedLmHead("FP16", true), 0.0f);
 }
 #endif

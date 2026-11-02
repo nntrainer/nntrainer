@@ -25,7 +25,6 @@
 #include <util_func.h>
 
 #include <algorithm>
-#include <cmath>
 #include <vector>
 
 namespace nntrainer {
@@ -36,162 +35,26 @@ enum HtpTieWordEmbeddingParams {
   weight,
   bias,
   candidate_weight,
-  candidate_hidden_step,
-  norm_gamma
+  candidate_hidden_step
 };
 
 HtpTieWordEmbedding::HtpTieWordEmbedding() :
-  LayerImpl(),
-  tieword_embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                          nntrainer::props::Unit(), nntrainer::props::Scale(),
-                          props::InNorm(), nntrainer::props::Epsilon(),
-                          props::Softcap()) {
-  weight_idx.fill(std::numeric_limits<unsigned>::max());
-}
+  TieWordEmbedding(),
+  htp_props(props::InNorm(), nntrainer::props::Epsilon(), props::Softcap()) {}
 
 void HtpTieWordEmbedding::finalize(nntrainer::InitLayerContext &context) {
-  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
-    skip_prefill =
-      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
+  TieWordEmbedding::finalize(context, nntrainer::TensorDim::DataType::FP32);
+  if (mode_ != mode::lm_head)
+    return;
 
-  mode_ = std::get<nntrainer::props::Unit>(tieword_embedding_props).empty()
-            ? mode::embedding
-            : mode::lm_head;
-  if (mode_ == mode::embedding)
-    finalize_embedding(context);
-  else if (mode_ == mode::lm_head)
-    finalize_lmhead(context);
-}
-
-void HtpTieWordEmbedding::finalize_embedding(
-  nntrainer::InitLayerContext &context) {
-
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Embedding layer takes only one input";
-
-  const nntrainer::TensorDim &input_dim =
-    context.getInputDimensions()[SINGLE_INOUT_IDX];
-  NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
-    << "Embedding layer takes only one for channel size";
-
-  // Token-ID input expected (caller responsibility). Input dtype check
-  // removed so the layer can sit between an FP32 input layer and FP16
-  // activation downstream.
-
-  auto &weight_regularizer =
-    std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
-  auto &weight_regularizer_constant =
-    std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
-  auto &weight_decay =
-    std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
-
-  unsigned int in_dim =
-    std::get<nntrainer::props::InDim>(tieword_embedding_props);
-  unsigned int out_dim =
-    std::get<nntrainer::props::OutDim>(tieword_embedding_props);
-
-  nntrainer::TensorDim output_dim = input_dim;
-
-  // output_dim expected as hidden x num input (batch size)
-  output_dim.height(input_dim.width());
-  output_dim.width(out_dim);
-  output_dim.setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-  context.setOutputDimensions({output_dim});
-
-  nntrainer::TensorDim dim = output_dim;
-
-  dim.setTensorType({context.getFormat(), context.getWeightDataType()});
-
-  dim.height(in_dim);
-  dim.width(out_dim);
-  dim.batch(1);
-
-  weight_idx[HtpTieWordEmbeddingParams::weight] = context.requestWeight(
-    dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
-}
-
-void HtpTieWordEmbedding::finalize_lmhead(
-  nntrainer::InitLayerContext &context) {
-  auto &weight_regularizer =
-    std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
-  auto &weight_regularizer_constant =
-    std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
-  auto &weight_decay =
-    std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
-  auto &bias_decay = std::get<nntrainer::props::BiasDecay>(*layer_impl_props);
-  auto &bias_initializer =
-    std::get<nntrainer::props::BiasInitializer>(*layer_impl_props);
-  auto &disable_bias =
-    std::get<nntrainer::props::DisableBias>(*layer_impl_props);
-
-  auto unit = std::get<nntrainer::props::Unit>(tieword_embedding_props).get();
-
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "lm head layer takes only one input";
-
-  std::vector<ml::train::TensorDim> output_dims(1);
-
-  /// @todo fc actaully supports multidimensions.
-  /// EffDimFlag shouldn't be fixed like this.
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
-  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
-
-  /** set output dimensions */
-  auto const &in_dim = context.getInputDimensions()[0];
-  output_dims[0] = in_dim;
-  is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
-  output_dims[0].height(1);
-
-  // The lm_head output is the logits; generate() reads them as float* for
-  // argmax/sampling. Force FP32 regardless of the activation dtype — under FP16
-  // activation an FP16 logits tensor is reinterpreted as FP32 and produces
-  // garbage tokens. (The Q6_K/Q4_0 lmhead matmul writes FP32 directly; the FP16
-  // activation is cast up to FP32 before the dot in incremental_forwarding.)
-  output_dims[0].setTensorType(
-    {context.getFormat(), nntrainer::TensorDim::DataType::FP32});
-
-  context.setOutputDimensions(output_dims);
-
-  /** set weight specifications */
-  ml::train::TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0001 : 0b0100);
-
-  ///@note HtpTieWordEmbedding layer's tensor dim is transposed dim of
-  /// user-defined
-  /// dim
-  /// so it can reuse embedding layer.
-  ml::train::TensorDim weight_dim(
-    1, is_nchw ? 1 : in_dim.channel(), is_nchw ? unit : 1,
-    is_nchw ? in_dim.width() : unit,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0011 : 0b0101);
-
-  weight_idx[HtpTieWordEmbeddingParams::weight] = context.requestWeight(
-    weight_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "Embedding", true);
-
-  if (disable_bias.empty() || disable_bias.get() == false) {
-    weight_idx[HtpTieWordEmbeddingParams::bias] = context.requestWeight(
-      bias_dim, bias_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
-      bias_decay, "bias", true);
-  }
-
-  in_norm = std::get<props::InNorm>(tieword_embedding_props).get();
-  softcap = std::get<props::Softcap>(tieword_embedding_props).get();
+  in_norm = std::get<props::InNorm>(htp_props).get();
+  softcap = std::get<props::Softcap>(htp_props).get();
   NNTR_THROW_IF(softcap < 0.0f, std::invalid_argument)
     << "lm head: softcap must be >= 0";
   if (in_norm) {
     // FP32 whatever the weights are, as the rms_norm layer requests it
-    weight_idx[HtpTieWordEmbeddingParams::norm_gamma] = context.requestWeight(
+    const auto &in_dim = context.getInputDimensions()[0];
+    norm_gamma_idx_ = context.requestWeight(
       ml::train::TensorDim(
         1, 1, 1, in_dim.width(),
         ml::train::TensorDim::TensorType(context.getFormat(),
@@ -203,11 +66,9 @@ void HtpTieWordEmbedding::finalize_lmhead(
 
 void HtpTieWordEmbedding::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, tieword_embedding_props);
+  remain_props = loadProperties(remain_props, htp_props);
   LayerImpl::setProperty(remain_props);
 }
-
-void HtpTieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
-                                     bool training) {}
 
 void HtpTieWordEmbedding::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
@@ -402,38 +263,6 @@ void HtpTieWordEmbedding::buildLmheadBlocked(const nntrainer::Tensor &weight,
           hidden_size, bytes);
 }
 
-std::vector<unsigned int> HtpTieWordEmbedding::ppl_targets_;
-double HtpTieWordEmbedding::ppl_nll_ = 0.0;
-unsigned int HtpTieWordEmbedding::ppl_count_ = 0;
-
-void HtpTieWordEmbedding::setPplTargets(const std::vector<unsigned int> &ids) {
-  ppl_targets_ = ids;
-  ppl_nll_ = 0.0;
-  ppl_count_ = 0;
-}
-
-bool HtpTieWordEmbedding::takePpl(double &nll_sum, unsigned int &count) {
-  if (ppl_targets_.empty())
-    return false;
-  nll_sum = ppl_nll_;
-  count = ppl_count_;
-  ppl_targets_.clear();
-  ppl_nll_ = 0.0;
-  ppl_count_ = 0;
-  return true;
-}
-
-double HtpTieWordEmbedding::nllOf(const float *logits, unsigned int vocab,
-                                  unsigned int target) {
-  float mx = logits[0];
-  for (unsigned int v = 1; v < vocab; ++v)
-    mx = std::max(mx, logits[v]);
-  double sum = 0.0;
-  for (unsigned int v = 0; v < vocab; ++v)
-    sum += std::exp(static_cast<double>(logits[v]) - mx);
-  return std::log(sum) + mx - static_cast<double>(logits[target]);
-}
-
 void HtpTieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
@@ -459,8 +288,6 @@ void HtpTieWordEmbedding::incremental_forwarding_lmhead(
 
   unsigned int b_size = input_dim.batch();
 
-  // One input row's logits. A lambda so the NNTR_PPL pass below can run
-  // it over every prefill row, not only the last.
   auto logits_of = [&](nntrainer::Tensor &input_step,
                        nntrainer::Tensor &hidden_step) {
     ///@note Since tieword embedding shares the weight with embedding,
@@ -556,27 +383,22 @@ void HtpTieWordEmbedding::incremental_forwarding_lmhead(
   // (doc 57 section 9.7): the accelerator runs the three as one call when
   // it can; otherwise the rms_norm layer's kernel and gamma multiply, the
   // head above, and the logit_softcapping layer's arithmetic, in that
-  // layer's order. cap false: the NNTR_PPL rows, scored uncapped as they
-  // were before the fold.
+  // layer's order.
   const auto f32 = nntrainer::TensorDim::DataType::FP32;
-  const float eps =
-    std::get<nntrainer::props::Epsilon>(tieword_embedding_props).get();
+  const float eps = std::get<nntrainer::props::Epsilon>(htp_props).get();
   const bool no_bias =
     !std::get<nntrainer::props::DisableBias>(*layer_impl_props).empty() &&
     std::get<nntrainer::props::DisableBias>(*layer_impl_props).get();
   nntrainer::ComputeOps *ops = input_.getOps();
-  auto head_of = [&](nntrainer::Tensor &row, nntrainer::Tensor &out, bool cap) {
-    const float c = cap ? softcap : 0.0f;
+  auto head_of = [&](nntrainer::Tensor &row, nntrainer::Tensor &out) {
+    const float c = softcap;
     if (no_bias && ops != nullptr && row.getDataType() == f32 &&
         weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 &&
         ops->lm_head_q4_0_fp32(
           weight.getData<uint8_t>(), row.width(), out.width(),
           row.getData<float>(),
-          in_norm
-            ? context
-                .getWeight(weight_idx[HtpTieWordEmbeddingParams::norm_gamma])
-                .getData<float>()
-            : nullptr,
+          in_norm ? context.getWeight(norm_gamma_idx_).getData<float>()
+                  : nullptr,
           eps, c, out.getData<float>()))
       return;
     if (in_norm) {
@@ -585,8 +407,7 @@ void HtpTieWordEmbedding::incremental_forwarding_lmhead(
       nntrainer::Tensor normed(row.getDim());
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(
         row.getData<float>(), normed.getData<float>(), 1, row.width(), eps);
-      normed.multiply_i(
-        context.getWeight(weight_idx[HtpTieWordEmbeddingParams::norm_gamma]));
+      normed.multiply_i(context.getWeight(norm_gamma_idx_));
       logits_of(normed, out);
     } else {
       logits_of(row, out);
@@ -617,60 +438,15 @@ void HtpTieWordEmbedding::incremental_forwarding_lmhead(
           from, input_step.getData<float>(), input_step.width(),
           hidden_step.getData<float>(), hidden_step.width()))
       continue;
-    head_of(input_step, hidden_step, true);
-  }
-
-  // NNTR_PPL: every other prefill row through the same lambda into a
-  // scratch row, scored against the next prompt token. Row by row, so the
-  // bias and every weight type are handled exactly as the model's own
-  // row is; ~7 ms a row at this vocabulary, a few seconds a prompt.
-  if (is_prefill && !ppl_targets_.empty() && b_size == 1 && to > from + 1) {
-    const unsigned int rows = to - from - 1; /* rows that have a target */
-    const unsigned int vocab = hidden_dim.width();
-    nntrainer::Tensor scratch(hidden_step_dim);
-    for (unsigned int t = 0; t < rows; ++t) {
-      const size_t pos = static_cast<size_t>(from) + t + 1;
-      if (pos >= ppl_targets_.size())
-        break;
-      nntrainer::Tensor row = input_.getSharedDataTensor(
-        input_step_dim, static_cast<size_t>(t) * input_.width(), true);
-      head_of(row, scratch, false);
-      ppl_nll_ += nllOf(scratch.getData<float>(), vocab, ppl_targets_[pos]);
-      ++ppl_count_;
-    }
+    head_of(input_step, hidden_step);
   }
 }
-
-void HtpTieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for Embedding layer is not supported");
-}
-
-void HtpTieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {}
 
 void HtpTieWordEmbedding::exportTo(
   nntrainer::Exporter &exporter, const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
-  exporter.saveResult(tieword_embedding_props, method, this);
-}
-
-void HtpTieWordEmbedding::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  nntrainer::TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-  nntrainer::TensorDim out_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
-
-  unsigned int height = input_dimensions[0].height();
-
-  if (mode_ == mode::embedding) {
-    in_dim.width(height);
-  } else {
-    in_dim.height(height);
-  }
-  out_dim.height(height);
-
-  context.updateInput(SINGLE_INOUT_IDX, in_dim);
-  context.updateOutput(SINGLE_INOUT_IDX, out_dim);
+  exporter.saveResult(std::tuple_cat(tieword_embedding_props, htp_props),
+                      method, this);
 }
 
 void HtpTieWordEmbedding::read(
@@ -678,25 +454,12 @@ void HtpTieWordEmbedding::read(
   ml::train::ExecutionMode mode, bool trainable,
   nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
   size_t start_offset, bool read_from_offset, int file_fd) {
-
-  // Only read when mode is embedding
-  if (mode_ == mode::embedding) {
-    for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
-      /// @note shared weights are only be read at the first acecss
-      if (context.isGradientFirstAccess(i)) {
-        context.getWeight(i).read(file, start_offset, read_from_offset);
-        if (context.isMixedPrecision(i) && trainable &&
-            !context.getWeightFP32(i).empty()) {
-          context.getWeightFP32(i).copyData(context.getWeight(i));
-        }
-      }
-    }
-  } else if (in_norm) {
-    // the lm_head's own weight: the folded output norm's gamma, where the
-    // output_norm layer's was (the tied weight stays the embedding's)
-    context.getWeight(weight_idx[HtpTieWordEmbeddingParams::norm_gamma])
+  TieWordEmbedding::read(file, context, opt_var, mode, trainable,
+                         definedWeightDataType, fsu, start_offset,
+                         read_from_offset, file_fd);
+  if (mode_ == mode::lm_head && in_norm)
+    context.getWeight(norm_gamma_idx_)
       .read(file, start_offset, read_from_offset);
-  }
 }
 
 void HtpTieWordEmbedding::read(
@@ -704,23 +467,12 @@ void HtpTieWordEmbedding::read(
   ml::train::ExecutionMode mode, bool trainable,
   nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
   size_t start_offset, bool read_from_offset, int file_fd) {
-
-  // Only read when mode is embedding
-  if (mode_ == mode::embedding) {
-    for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
-      /// @note shared weights are only be read at the first acecss
-      if (context.isGradientFirstAccess(i)) {
-        context.getWeight(i).read(src, start_offset, read_from_offset, file_fd);
-        if (context.isMixedPrecision(i) && trainable &&
-            !context.getWeightFP32(i).empty()) {
-          context.getWeightFP32(i).copyData(context.getWeight(i));
-        }
-      }
-    }
-  } else if (in_norm) {
-    context.getWeight(weight_idx[HtpTieWordEmbeddingParams::norm_gamma])
+  TieWordEmbedding::read(src, context, opt_var, mode, trainable,
+                         definedWeightDataType, fsu, start_offset,
+                         read_from_offset, file_fd);
+  if (mode_ == mode::lm_head && in_norm)
+    context.getWeight(norm_gamma_idx_)
       .read(src, start_offset, read_from_offset, file_fd);
-  }
 }
 
 void HtpTieWordEmbedding::save(std::ofstream &file,
@@ -732,64 +484,11 @@ void HtpTieWordEmbedding::save(std::ofstream &file,
   // the lm_head's folded norm gamma, FP32 whatever the target dtype (the
   // rms_norm layer's save)
   if (mode_ == mode::lm_head && in_norm) {
-    run_context.getWeight(weight_idx[HtpTieWordEmbeddingParams::norm_gamma])
-      .save(file);
+    run_context.getWeight(norm_gamma_idx_).save(file);
     return;
   }
-  // Only read when mode is embedding
-  if (mode_ == mode::embedding) {
-    // @note shared weights are only be saved at the first access
-    for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
-      if (run_context.isGradientFirstAccess(i)) {
-        auto &weight = run_context.getWeight(i);
-        if (dtype == nntrainer::TensorDim::DataType::NONE ||
-            weight.getDataType() == dtype)
-          weight.save(file);
-        else {
-          NNTR_THROW_IF(weight.getDataType() !=
-                          nntrainer::TensorDim::DataType::FP32,
-                        std::runtime_error)
-            << "Save with quantization only supports for FP32 weight.";
-          ///@note The codelines below can be replaced with quantizer's
-          /// quantize()
-          nntrainer::TensorDim dim = weight.getDim();
-          unsigned int K = dim.height();
-          unsigned int N = dim.width();
-
-          if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
-            if (K == 1) {
-              weight.save(file);
-            } else {
-              NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
-                << "Q4_0 embedding quantization requires width to be "
-                   "divisible by 32, but got width="
-                << N;
-              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                             {nntrainer::Tformat::NCHW, dtype});
-              nntrainer::quantize_q4_0(weight.getData<float>(),
-                                       quant_weight.getData<uint8_t>(), K, N,
-                                       nullptr);
-              quant_weight.save(file);
-            }
-          } else if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
-            //////////////////////////////////////////////////////////////////
-            ///@note Please note that Embedding layer doesn't need to be
-            /// transposed!
-            //////////////////////////////////////////////////////////////////
-            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                           {nntrainer::Tformat::NCHW, dtype});
-            nntrainer::quantize_q6_K(weight.getData<float>(),
-                                     quant_weight.getData<uint8_t>(), K, N,
-                                     nullptr);
-            quant_weight.save(file);
-          } else {
-            NNTR_THROW_IF(true, std::runtime_error)
-              << "This dtype is not supported in save with quantization";
-          }
-        }
-      }
-    }
-  }
+  TieWordEmbedding::save(file, run_context, opt_var, mode, trainable, dtype,
+                         target_isa);
 }
 
 #ifdef PLUGGABLE
