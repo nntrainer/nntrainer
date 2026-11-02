@@ -151,7 +151,10 @@ public:
 
   inline static const std::string type = "tie_word_embeddings";
 
-private:
+protected:
+  WIN_EXPORT void finalize(nntrainer::InitLayerContext &context,
+                           nntrainer::TensorDim::DataType logits_type);
+
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Unit, nntrainer::props::Scale>
     tieword_embedding_props;
@@ -160,8 +163,10 @@ private:
   std::array<unsigned int, 4> weight_idx; /**< indices of the weights */
   bool skip_prefill = false;
 
+private:
   WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
-  WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);
+  WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context,
+                                  nntrainer::TensorDim::DataType logits_type);
   WIN_EXPORT void
   incremental_forwarding_embedding(nntrainer::RunLayerContext &context,
                                    unsigned int from, unsigned int to,

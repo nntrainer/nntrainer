@@ -126,6 +126,11 @@ TieWordEmbedding::TieWordEmbedding() :
 }
 
 void TieWordEmbedding::finalize(nntrainer::InitLayerContext &context) {
+  finalize(context, context.getActivationDataType());
+}
+
+void TieWordEmbedding::finalize(nntrainer::InitLayerContext &context,
+                                nntrainer::TensorDim::DataType logits_type) {
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
       std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
@@ -136,7 +141,7 @@ void TieWordEmbedding::finalize(nntrainer::InitLayerContext &context) {
   if (mode_ == mode::embedding)
     finalize_embedding(context);
   else if (mode_ == mode::lm_head)
-    finalize_lmhead(context);
+    finalize_lmhead(context, logits_type);
 }
 
 void TieWordEmbedding::finalize_embedding(
@@ -189,7 +194,9 @@ void TieWordEmbedding::finalize_embedding(
     weight_decay, "Embedding", true);
 }
 
-void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
+void TieWordEmbedding::finalize_lmhead(
+  nntrainer::InitLayerContext &context,
+  nntrainer::TensorDim::DataType logits_type) {
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
@@ -222,17 +229,9 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
   output_dims[0].height(1);
 
-  // @note The logits keep the ACTIVATION dtype on purpose. This was once
-  // forced to FP32 because the caller read the logits unconditionally as
-  // float*, so an FP16 logits tensor was reinterpreted as FP32 (garbage
-  // tokens). That is no longer the case: the whole lm_head chain below is
-  // dtype-aware (the Q4_0 / Q6_K / FP32-weight paths all branch on
-  // hidden_step's dtype and cast), the device lm_head GEMVs require FP16
-  // logits to stay on the device, and incremental_inference() already
-  // narrows an FP16 output tensor to the float* the caller expects. Forcing
-  // FP32 here silently disables every device path.
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
+  // The regular head keeps the activation dtype for device execution;
+  // the HTP variant requests FP32 for its host-visible logits.
+  output_dims[0].setTensorType({context.getFormat(), logits_type});
 
   context.setOutputDimensions(output_dims);
 
