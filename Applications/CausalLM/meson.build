@@ -344,10 +344,24 @@ causallm_dep = declare_dependency(
     link_args: get_option('platform') == 'windows' ? tokenizer_link_args : []
 )
 
+server_args = []
+server_deps = []
+server_src = []
+if get_option('enable-causallm-server')
+    server_src = files('serving/service.cpp', 'serving/causal_backend.cpp', 'serving/http_server.cpp')
+    executable_src += server_src
+    server_args += '-DENABLE_CAUSALLM_SERVER'
+    server_deps += thread_dep
+    if host_machine.system() == 'windows'
+        server_deps += cxx.find_library('ws2_32')
+    endif
+endif
+
 e = executable('nntr_causallm',
     executable_src,
     include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep] + server_deps,
+    cpp_args: server_args,
 )
 
 
@@ -639,4 +653,18 @@ if get_option('enable-test')
       install: false,
     )
   endif
+endif
+
+if get_option('enable-test') and get_option('enable-causallm-server')
+    unittest_serving = executable('unittest_serving',
+        files('serving/unittest_serving.cpp') + server_src,
+        include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep, gtest_main_dep] + server_deps,
+        cpp_args: [
+            '-DSERVING_FIXTURE_DIR="' + meson.source_root() / 'test/unittest/models/causallm_reference/qwen2_tiny' + '"',
+            '-DSERVING_QWEN3_DIR="' + meson.build_root() / 'models/qwen3-0.6b-fp32' + '"',
+        ],
+    )
+    test('unittest_serving', unittest_serving,
+        args: '--gtest_output=xml:@0@/unittest_serving.xml'.format(meson.build_root()))
 endif

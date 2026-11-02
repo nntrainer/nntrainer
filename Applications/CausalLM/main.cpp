@@ -34,6 +34,11 @@
 #include "causal_lm.h"
 #include "chat_template.h"
 #include "model_registry.h"
+#include "runtime_config.h"
+#ifdef ENABLE_CAUSALLM_SERVER
+#include "serving/causal_backend.h"
+#include "serving/http_server.h"
+#endif
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -222,11 +227,20 @@ int main(int argc, char *argv[]) {
     std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"
               << "  <model_path>   : Path to model directory\n"
               << "  [input_prompt] : Optional input text (uses sample_input or "
-                 "chat_input if omitted)\n";
+                 "chat_input if omitted)\n"
+              << "  --serve [--host HOST] [--port PORT] [--model-id ID] "
+                 "[--max-sessions N] [--queue-capacity N]\n";
     return EXIT_FAILURE;
   }
 
   const std::string model_path = argv[1];
+  const bool serve = argc >= 3 && std::string(argv[2]) == "--serve";
+#ifndef ENABLE_CAUSALLM_SERVER
+  if (serve) {
+    std::cerr << "Reconfigure with -Denable-causallm-server=true\n";
+    return EXIT_FAILURE;
+  }
+#endif
   std::string input_text;
   std::string system_head_prompt = "";
   std::string system_tail_prompt = "";
@@ -234,6 +248,48 @@ int main(int argc, char *argv[]) {
   std::cout << model_path << std::endl;
 
   try {
+#ifdef ENABLE_CAUSALLM_SERVER
+    std::string host = "127.0.0.1";
+    std::string model_id =
+      std::filesystem::path(model_path).filename().string();
+    int port = 8080;
+    size_t max_sessions = 32, queue_capacity = 32;
+    if (serve) {
+      for (int i = 3; i < argc; i += 2) {
+        if (i + 1 == argc)
+          throw std::invalid_argument("Missing server option value");
+        std::string key = argv[i], value = argv[i + 1];
+        if (key == "--host")
+          host = value;
+        else if (key == "--model-id")
+          model_id = value;
+        else {
+          size_t end = 0;
+          auto number = std::stoul(value, &end);
+          if (end != value.size() || value[0] == '-' || number == 0 ||
+              number > 65535)
+            throw std::invalid_argument("Invalid server numeric option");
+          if (key == "--port")
+            port = static_cast<int>(number);
+          else if (key == "--max-sessions")
+            max_sessions = number;
+          else if (key == "--queue-capacity")
+            queue_capacity = number;
+          else
+            throw std::invalid_argument("Unknown server option: " + key);
+        }
+      }
+      if (model_id.empty())
+        throw std::invalid_argument("Model id must not be empty");
+      // Defaults apply only when not explicitly configured by the caller.
+      setenv("NNTR_ENGINE", "cpu", 0);
+      setenv("NNTR_KV_PAGED", "1", 0);
+      setenv("NNTR_KV_PREFIX_CACHE", "1", 0);
+      const auto runtime = causallm::RuntimeConfig::capture();
+      if (!runtime.cpu_kv_paged)
+        throw std::invalid_argument("Serving requires paged CPU KV storage");
+    }
+#endif
     // Load configuration files
     json cfg = causallm::LoadJsonFile(model_path + "/config.json");
     json generation_cfg = json::object();
@@ -242,6 +298,8 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    if (serve && nntr_cfg.value("batch_size", 1) != 1)
+      throw std::invalid_argument("Serving requires batch_size=1");
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
@@ -291,7 +349,9 @@ int main(int argc, char *argv[]) {
     }
 
     // Determine input text
-    if (argc >= 3) {
+    if (serve) {
+      // HTTP requests supply their own prompts and complete chat histories.
+    } else if (argc >= 3) {
       input_text = argv[2];
     } else {
       if (nntr_cfg.contains("chat_input")) {
@@ -331,6 +391,24 @@ int main(int argc, char *argv[]) {
     _ilap("model->repack_weight");
 
     bool do_sample = generation_cfg.value("do_sample", false);
+
+#ifdef ENABLE_CAUSALLM_SERVER
+    if (serve) {
+      auto *causal = dynamic_cast<causallm::CausalLM *>(model.get());
+      if (!causal)
+        throw std::invalid_argument("Serving requires a CausalLM model");
+      causallm::serving::CausalBackend backend(
+        *causal, chat_template ? &*chat_template : nullptr);
+      causallm::serving::Service service(backend, model_id, max_sessions,
+                                         queue_capacity);
+      causallm::serving::HttpServer server(service);
+      if (server.bind(host, port) < 0)
+        throw std::runtime_error("Cannot bind server socket");
+      std::cerr << "nntrainer serving " << model_id << " at http://" << host
+                << ':' << port << std::endl;
+      return server.listen() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+#endif
 
 #ifdef PROFILE
     start_peak_tracker();

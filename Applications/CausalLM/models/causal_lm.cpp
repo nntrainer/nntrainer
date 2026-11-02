@@ -1443,6 +1443,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   beginSamplingRun();
 
   output_list.clear();
+  last_generation_eos_ = false;
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     output_list.push_back("");
   }
@@ -2261,6 +2262,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
 
     if (is_finish) {
+      last_generation_eos_ = true;
       break;
     }
 

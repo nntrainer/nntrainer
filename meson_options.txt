@@ -111,3 +111,6 @@ option('arm-arch', type: 'combo',
 option('arm-march', type: 'string',
        value: '',
        description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
+
+option('enable-causallm-server', type: 'boolean', value: false,
+       description: 'Build native CausalLM HTTP serving with non-streaming OpenAI-compatible APIs (requires enable-transformer).')

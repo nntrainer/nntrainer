@@ -232,6 +232,30 @@ public:
    */
   WIN_EXPORT nntrainer::kv::SessionId createKVSession();
 
+  /** Prepare paged session storage after initialize/load, before first run.
+   * Settles the prefill plane from the first request before binding KV views.
+   * Subsequent calls preserve all existing sessions and their bindings.
+   */
+  void prepareKVSessionStorage(unsigned int prompt_tokens) {
+    if (!kv_cache.isAllocated()) {
+      growPrefillPlane(prompt_tokens);
+      allocateAndBindKVCache();
+    }
+  }
+
+  /** Largest unchunked prompt accepted without truncation. */
+  unsigned int getPrefillTokenLimit() const {
+    return prefillDriveChunk() ? MAX_SEQ_LEN : INIT_SEQ_LEN;
+  }
+
+  /** Whether the most recent run stopped at an EOS token. */
+  bool lastGenerationReachedEOS() const { return last_generation_eos_; }
+
+  /** Configured end-of-sequence token IDs, for transport output filtering. */
+  const std::vector<unsigned int> &getEosTokenIds() const {
+    return EOS_TOKEN_ID;
+  }
+
   /**
    * @brief Make @p session the conversation the next run() continues.
    * @details Moves the session token position to that session's committed
@@ -512,6 +536,7 @@ protected:
    *  incrementalInference() can record them for prefix caching. */
   bool kv_tokens_in_input_ = false;
   unsigned int last_prefix_reused_tokens_ = 0; /**< Last run's reused rows */
+  bool last_generation_eos_ = false; /**< Last run terminated with EOS */
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers by pointing
