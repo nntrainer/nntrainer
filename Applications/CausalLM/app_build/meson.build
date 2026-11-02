@@ -208,12 +208,14 @@ causallm_inc_args += ['-I' + causallm_root / 'models' / 'lfm2_moe',
 # models/. This is the canonical Android core source manifest. The shared
 # LLM layers (lm_head, qkv, scalar_multiply, logit_softcapping, swiglu,
 # tie_word_embedding) live in libnntrainer (nntrainer/layers/llm), not here.
-causallm_htp_src = [
-  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_causallm.cpp',
-  causallm_root / 'models' / 'gemma4' / 'gemma4_htp_moe_causallm.cpp',
-  causallm_root / 'models' / 'htp_weight_preparation.cpp',
-  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_moe_layer.cpp',
-  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_htp_moe_causallm.cpp',
+causallm_enable_qnn = enable_qnn
+causallm_tokenizer_cache_name = 'tokenizer-cache'
+causallm_tokenizer_cache_opt = get_option(causallm_tokenizer_cache_name)
+causallm_tokenizer_probe_args = [tokenizer_path]
+causallm_tokenizer_probe_deps = [thread_dep, log_dep]
+subdir('common')
+
+causallm_htp_src = causallm_htp_model_src + [
   causallm_root / 'layers' / 'dense_ffn_layer.cpp',
   causallm_root / 'layers' / 'residual_add.cpp',
   causallm_root / 'layers' / 'conv_block_layer.cpp',
@@ -275,34 +277,13 @@ causallm_src = [
   causallm_root / 'api' / 'streamer.cpp',
 ]
 
-causallm_core_cpp_args = []
+causallm_core_cpp_args = causallm_common_cpp_args
 quick_dot_ai_api_cpp_args = []
 quick_dot_ai_test_cpp_args = []
-
-# Persistent tokenizer snapshot cache: on only when the tokenizer archive
-# exports the snapshot entry points (an older archive still links without
-# them and every load parses tokenizer.json). See ../meson.build.
-tokenizer_cache_opt = get_option('tokenizer-cache')
-tokenizer_cache = false
-if not tokenizer_cache_opt.disabled()
-  tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
-    args: [tokenizer_path],
-    dependencies: [thread_dep, log_dep])
-  if not tokenizer_cache and tokenizer_cache_opt.enabled()
-    error('tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with ../tools/build_tokenizers_c.sh.'.format(tokenizer_path))
-  endif
-endif
-if not tokenizer_cache
-  causallm_core_cpp_args += ['-DCAUSALLM_DISABLE_TOKENIZER_CACHE']
-endif
 
 # Single QNN switch. Keep the QNN ABI-affecting definitions on the targets
 # that consume them instead of applying them to the whole Meson project.
 if enable_qnn
-  causallm_core_cpp_args += [
-    '-DENABLE_QNN=1',
-    '-DENABLE_QNN_MODELS=1',
-  ]
   quick_dot_ai_api_cpp_args += [
     '-DENABLE_QNN_MODELS=1',
     '-DQUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API=1',
@@ -310,23 +291,6 @@ if enable_qnn
   quick_dot_ai_test_cpp_args += [
     '-DENABLE_QNN=1',
     '-DENABLE_QNN_MODELS=1',
-  ]
-endif
-
-# ── QNN model-runtime infra + public gemma4-e2b-qnn model (gated) ────────
-# quick_dot_ai_qnn.cpp registers the QNN backend at runtime
-# (Engine::Global().registerContext("libqnn_context.so", ...)) rather than
-# linking the QNN SDK directly, so no QNN SDK headers are needed to compile
-# these sources.
-causallm_qnn_src = []
-if enable_qnn
-  causallm_qnn_src += [
-    causallm_root / 'qnn' / 'android_memory_allocator.cpp',
-    causallm_root / 'qnn' / 'quick_dot_ai_qnn.cpp',
-    causallm_root / 'qnn' / 'graph_parser.cpp',
-    causallm_root / 'qnn' / 'generate_qnn_utils.cpp',
-    causallm_root / 'qnn' / 'qnn_kv_cache_manager.cpp',
-    causallm_root / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
   ]
 endif
 
@@ -344,34 +308,6 @@ endif
 # entries below. Reuse the full causallm_inc_args here rather than a
 # hand-picked subset.
 causallm_xgrammar_inc_args = causallm_inc_args
-
-causallm_xgrammar_src = [
-  # wrapper: bridges causallm::XGrammar to the xgrammar library.
-  causallm_root / 'api' / 'xgrammar_wrapper.cpp',
-  causallm_root / 'api' / 'xgrammar_manager.cpp',
-  # xgrammar library sources (vendored xgrammar submodule checkout).
-  causallm_root / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'config.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'earley_parser.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'fsm.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'regex_converter.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'structural_tag.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'testing.cc',
-  # Support files (required for linking)
-  causallm_root / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
-]
 
 causallm_xgrammar_lib = static_library('causallm_xgrammar',
   causallm_xgrammar_src,

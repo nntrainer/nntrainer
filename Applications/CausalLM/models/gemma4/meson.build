@@ -1,8 +1,6 @@
 gemma4_src = [
     meson.current_source_dir() / 'gemma4_causallm.cpp',
     meson.current_source_dir() / 'gemma4_moe_causallm.cpp',
-    meson.current_source_dir() / 'gemma4_htp_causallm.cpp',
-    meson.current_source_dir() / 'gemma4_htp_moe_causallm.cpp',
 ]
 
 gemma4_inc = include_directories('.')
