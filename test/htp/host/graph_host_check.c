@@ -511,7 +511,7 @@ static void check_validator(void) {
   printf("GRAPH VALIDATOR OK: LFM2.5-8B-A1B n_ops=%u moe=22 words=%u "
          "resident=%s\n",
          n_ops, n, htp_graph_kinds_str(resident_ok, names, sizeof(names)));
-  /* the mask parser both sides read NNTR_HTP_FORWARD_KINDS with */
+  /* Graph-kind names and bit masks share one parser */
   CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1") ==
           ALL_KINDS,
         "kinds parse (six)");

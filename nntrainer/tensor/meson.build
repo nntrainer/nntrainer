@@ -18,6 +18,7 @@ tensor_sources = [
   'q4_0_utils.cpp',
   'htp_backend/htp_q4_0_convert.cpp',
   'htp_backend/htp_act_quant.cpp',
+  'htp_backend/htp_runtime_config.cpp',
   # SDK-free attention dispatch also supports CPU fallback and fake-op tests.
   'htp_backend/htp_attention_state.cpp',
   'qs4cx_tensor.cpp',
@@ -55,7 +56,7 @@ tensor_headers = [
   'htp_backend/htp_q4_0_convert.h',
   'htp_wh_layout.h',
   'htp_wh_palette.h',
-  'htp_backend/htp_fixed_opts.h',
+  'htp_backend/htp_runtime_config.h',
   'htp_backend/htp_expert_pool.h',
   'swiglu_det.h',
   'htp_backend/htp_act_quant.h',

@@ -20,6 +20,11 @@
  *          - Llama
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
@@ -29,7 +34,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <htp_backend/htp_fixed_opts.h>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -2190,21 +2194,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     generated_ids.insert(generated_ids.end(), id_list.begin(), id_list.end());
 
 #ifdef ENABLE_HEXKL
-  // The resident decode graph only needs a row of the CPU prefill scratch.
-  // Outputs have been consumed above; KV placeholders and persistent tensors
-  // retain their pages. Keep this opt-in while measuring the memory profile.
-  // Built in for the HTP profile (htp_fixed::RELEASE_PREFILL_SCRATCH);
-  // NNTR_HTP_RELEASE_PREFILL_SCRATCH=0 keeps the scratch.
-  const char *release = std::getenv("NNTR_HTP_RELEASE_PREFILL_SCRATCH");
-  if (release != nullptr || (htp_execution_profile_ &&
-                             nntrainer::htp_fixed::RELEASE_PREFILL_SCRATCH)) {
-    if (release == nullptr || std::strcmp(release, "1") == 0) {
-      if (auto *network =
-            dynamic_cast<nntrainer::NeuralNetwork *>(model.get())) {
-        const size_t bytes = network->releaseInferenceScratch();
-        std::cerr << "[HTP] CPU prefill scratch discarded: " << (bytes >> 20)
-                  << " MiB of virtual pages" << std::endl;
-      }
+  // KV placeholders and persistent tensors keep their pages for continuation.
+  if (htp_execution_profile_ &&
+      nntrainer::htpRuntimeConfig().htp.release_prefill_scratch) {
+    if (auto *network = dynamic_cast<nntrainer::NeuralNetwork *>(model.get())) {
+      const size_t bytes = network->releaseInferenceScratch();
+      std::cerr << "[HTP] CPU prefill scratch discarded: " << (bytes >> 20)
+                << " MiB of virtual pages" << std::endl;
     }
   }
 #endif
@@ -2540,7 +2536,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   if (htp_execution_profile_) {
-    if (const char *path = std::getenv("NNTR_HTP_TOKEN_TRACE")) {
+    const auto &path = nntrainer::htpRuntimeConfig().htp.token_trace;
+    if (!path.empty()) {
       json trace;
       trace["input_ids"] = init_input;
       const bool prefill_emitted = !SKIP_PREFILL && init_len < MAX_SEQ_LEN;
@@ -2550,7 +2547,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         ids_history + begin, ids_history + begin + count);
       std::ofstream file(path);
       if (!file)
-        throw std::runtime_error("Cannot open NNTR_HTP_TOKEN_TRACE");
+        throw std::runtime_error("Cannot open htp.token_trace");
       file << trace.dump(2) << '\n';
     }
   }

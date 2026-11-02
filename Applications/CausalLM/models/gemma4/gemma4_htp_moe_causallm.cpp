@@ -9,7 +9,7 @@
 #include <app_context.h>
 #include <engine.h>
 #include <gemma4_htp_moe_causallm.h>
-#include <htp_backend/htp_fixed_opts.h>
+#include <htp_model_config.h>
 #include <layer_context.h>
 #include <llm_util.hpp>
 #include <model.h>
@@ -35,6 +35,7 @@ namespace causallm {
 
 void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
                                            json &nntr_cfg) {
+  const auto runtime_config = normalizeHtpRuntimeConfig(nntr_cfg);
   if (nntr_cfg.value("gemma4_weight_format", std::string()) != "htp_fused_v1")
     throw std::invalid_argument(
       "Gemma4 htp_fused requires gemma4_weight_format=htp_fused_v1");
@@ -95,20 +96,23 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
       "Gemma4 htp_fused HTP engines require an HTP build");
 #endif
 #ifdef ENABLE_HEXKL
-  // Set GeGLU for the decode graph's MOE and DENSE_FFN ops as well as
-  // the prefill calls, which supply it per call.
-  if (MOE_ENGINE == "htp") {
-    auto *ops = nntrainer::get_htp_ops();
-    ops->set_moe_geglu(true);
-    ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
-  }
   // Build the full decode graph after loading its weights.
-  htp_e2e = nntrainer::htp_fixed::E2E && MOE_ENGINE == "htp";
+  htp_e2e = MOE_ENGINE == "htp";
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
                 std::invalid_argument)
     << "[Gemma4MoE] the HTP decode list has no per-layer input (PLE) and no "
        "attention logit soft-cap";
+  // Set GeGLU for the decode graph's MOE and DENSE_FFN ops as well as
+  // the prefill calls, which supply it per call.
+  if (MOE_ENGINE == "htp" || ATTN_PROJ_ENGINE == "htp" || FFN_ENGINE == "htp" ||
+      ATTENTION_ENGINE == "htp" || LMHEAD_ENGINE == "htp")
+    nntrainer::configureHtpRuntime(runtime_config);
+  if (MOE_ENGINE == "htp") {
+    auto *ops = nntrainer::get_htp_ops();
+    ops->set_moe_geglu(true);
+    ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
+  }
 #endif
 }
 
@@ -184,7 +188,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
                   1)[0];
     // The list's ADD stores 0.0f as "no multiplier".
     if (scalar[l] == 0.0f)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " +
+      throw std::runtime_error("[Gemma4MoE] HTP decode: layer " +
                                std::to_string(l) +
                                "'s layer_scalar is 0, which the decode list "
                                "cannot carry");
@@ -217,7 +221,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
     words.data(), static_cast<uint32_t>(words.size()), &shape, is_full.data(),
     scalar.data(), HTP_GRAPH_KINDS_ALL);
   if (n_words == 0u)
-    throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: the decode op list "
+    throw std::runtime_error("[Gemma4MoE] HTP decode: the decode op list "
                              "does not fit HTP_GRAPH_MAX_OPS");
   words.resize(n_words);
   auto *ops = nntrainer::get_htp_ops();
@@ -225,7 +229,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
     ops->set_lm_head_wh_cache((weight_path + ".lmhead_wh").c_str());
   if (!ops->set_decode_graph_desc(words))
     throw std::runtime_error(
-      "[Gemma4MoE] NNTR_HTP_E2E: the HTP backend has no per-token entry");
+      "[Gemma4MoE] HTP decode: the HTP backend has no per-token entry");
 
   // Bind semantic roles to graph-owned weights; wire operation order is
   // unchanged.
@@ -233,7 +237,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
   auto hand = [ops](uint32_t op, uint32_t which, const float *d, size_t n) {
     if (!ops->set_decode_graph_param(op, which, d, static_cast<unsigned>(n)))
       throw std::runtime_error(
-        "[Gemma4MoE] NNTR_HTP_E2E: the backend took no parameter");
+        "[Gemma4MoE] HTP decode: the backend took no parameter");
   };
   htp_params.clear();
   for (uint32_t i = 0; i < n_ops; ++i) {
@@ -312,10 +316,10 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
                     dt == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
     const bool qs4cx = wh || dt == ml::train::TensorDim::DataType::QS4CX;
     if (dt != ml::train::TensorDim::DataType::Q4_0 && !qs4cx)
-      throw std::runtime_error(
-        "[Gemma4MoE] NNTR_HTP_E2E: " + name + " is not " +
-        (lm_head ? "Q4_0 or QS4CX_WH, the LM_HEAD types"
-                 : "Q4_0, QS4CX or QS4CX_WH, the FC types"));
+      throw std::runtime_error("[Gemma4MoE] HTP decode: " + name + " is not " +
+                               (lm_head
+                                  ? "Q4_0 or QS4CX_WH, the LM_HEAD types"
+                                  : "Q4_0, QS4CX or QS4CX_WH, the FC types"));
     const unsigned K = tied ? t.width() : t.height();
     const unsigned N = tied ? t.height() : t.width();
     if (wh &&
@@ -327,7 +331,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
                                              t.getScale<float>(), K, N)
               : !ops->add_decode_graph_q4_0(t.getData<char>(), K, N, tied))
       throw std::runtime_error(
-        "[Gemma4MoE] NNTR_HTP_E2E: the backend took no weight " + name);
+        "[Gemma4MoE] HTP decode: the backend took no weight " + name);
   };
   for (uint32_t i = 0; i < n_ops; ++i) {
     const htp_graph_op *op = htp_graph_op_cat(words.data(), i);

@@ -11,6 +11,11 @@
  * @bug    No known bugs except for NYI items
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include "residual_add.h"
 
 #include <algorithm>
@@ -51,11 +56,7 @@ static bool lfmPrefillAdd(const nntrainer::Tensor &lhs,
   };
   bool parallel_prefill = false;
 #if defined(__aarch64__) && defined(ENABLE_HEXKL)
-  static const bool enabled = [] {
-    const char *value = std::getenv("NNTR_LFM2_PARALLEL_ADD");
-    return value && std::strcmp(value, "1") == 0;
-  }();
-  parallel_prefill = enabled;
+  parallel_prefill = nntrainer::htpRuntimeConfig().htp.lfm2_parallel_add;
 #endif
   // copy(lhs) is a no-op when out already is lhs, so the add is safely
   // in-place. A distinct rhs aliased by out is different: copy(lhs) would
@@ -206,10 +207,8 @@ void ResidualAddLayer::run(nntrainer::RunLayerContext &context,
     if (!fused) {
       nntrainer::ComputeOps *view_ops = nullptr;
 #if defined(__aarch64__) && defined(ENABLE_HEXKL)
-      static const bool prefill_views = [] {
-        const char *value = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-        return value && std::strcmp(value, "1") == 0;
-      }();
+      const bool prefill_views =
+        nntrainer::htpRuntimeConfig().htp.lfm2_prefill_views;
       if (prefill_views && rows > 1)
         view_ops = context.getComputeOps();
 #endif

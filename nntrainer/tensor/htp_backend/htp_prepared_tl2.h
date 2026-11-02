@@ -7,6 +7,7 @@
 #ifndef __HTP_PREPARED_TL2_H__
 #define __HTP_PREPARED_TL2_H__
 #include "htp_prepared_qs2.h"
+#include "htp_runtime_config.h"
 #include "htp_tl2_opts.h"
 #include <algorithm>
 #include <atomic>
@@ -42,10 +43,7 @@ class PreparedTl2 {
   std::unique_ptr<PreparedQs2Stamp> stamp_;
   std::unordered_map<uint64_t, std::unique_ptr<Entry>> entries_;
   bool receipt_ = false;
-  const bool direct_read_ = [] {
-    const char *v = std::getenv("NNTR_HTP_TL2_DIRECT_READ");
-    return !v || std::strcmp(v, "0") != 0;
-  }();
+  const bool direct_read_ = htpRuntimeConfig().moe.tl2_direct_read;
 
   // Native codes and the arena tail are separated by unused QS2 capacity.
   // Scatter the contiguous file record directly into these destinations.

@@ -13,7 +13,7 @@
 #ifdef ENABLE_HEXKL
 
 #include <htp_backend.h>
-#include <htp_backend/htp_fixed_opts.h>
+#include <htp_runtime_config.h>
 
 #include <nntrainer_log.h>
 
@@ -39,16 +39,12 @@ HtpBackend &HtpBackend::global() {
   return instance;
 }
 
-bool HtpBackend::e2eRequested() {
-  // built in: the one-PD decode graph is the HTP path's configuration
-  return htp_fixed::E2E;
-}
-
 HtpBackend::HtpBackend() { open(); }
 
 void HtpBackend::open() {
   if (enabled_)
     return;
+  lockHtpRuntimeConfig();
   // The MoE frame plus scratch allocation can overflow the default 16 KiB
   // FastRPC stack. Match the dspqueue thread's 64 KiB before any RPC.
   // Failure is logged but does not prevent opening the session.
@@ -87,17 +83,12 @@ void HtpBackend::open() {
   enabled_ = true;
 
   // Poll before blocking to reduce interrupt-wake latency. The default
-  // window is 5000 us; NNTR_HTP_POLL_US overrides it. If polling is refused,
+  // window is configured in microseconds. If polling is refused,
   // try PM QoS, then retain interrupt-driven behavior and report the mode.
   struct remote_rpc_control_latency lat;
   std::memset(&lat, 0, sizeof(lat));
   lat.enable = RPC_POLL_QOS;
-  lat.latency = 5000;
-  if (const char *poll_us = std::getenv("NNTR_HTP_POLL_US")) {
-    lat.latency = static_cast<uint32_t>(std::strtoul(poll_us, nullptr, 10));
-    ml_logi("HtpBackend: poll QoS latency %u us (NNTR_HTP_POLL_US)",
-            static_cast<unsigned>(lat.latency));
-  }
+  lat.latency = htpRuntimeConfig().htp.poll_us;
   int qos_err =
     remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
   if (qos_err == AEE_SUCCESS) {

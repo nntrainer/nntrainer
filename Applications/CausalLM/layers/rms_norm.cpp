@@ -11,6 +11,11 @@
  *
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <cmath>
 #include <cpu_backend.h>
 #include <cstdlib>
@@ -102,10 +107,8 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         continue;
       // The same per-row reduction as the serial path, with gamma applied
       // before the row leaves cache. Decode retains its existing hook above.
-      static const bool parallel_prefill = [] {
-        const char *value = std::getenv("NNTR_LFM2_PARALLEL_NORM");
-        return value && std::strcmp(value, "1") == 0;
-      }();
+      const bool parallel_prefill =
+        nntrainer::htpRuntimeConfig().htp.lfm2_parallel_norm;
       if (parallel_prefill && dim.width() == 2048 &&
           parallelRmsNormRows(in_step, out_step, gamma, epsilon))
         continue;

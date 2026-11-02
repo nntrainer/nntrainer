@@ -19,6 +19,11 @@
 #pragma GCC push_options
 #pragma GCC optimize("no-fast-math")
 #endif
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <arm_neon.h>
 #if defined(__clang__)
 #pragma float_control(pop)
@@ -162,22 +167,10 @@ static bool lfmConvFusedGatePrefill(const float *projection,
       return false;
   if (!disjoint(gated, bytes, output, bytes))
     return false;
-  static const bool channel_tile = [] {
-    const char *value = std::getenv("NNTR_LFM2_CONV_CHANNEL_TILE");
-    return value && std::strcmp(value, "1") == 0;
-  }();
-  static const bool state_only = [] {
-    const char *value = std::getenv("NNTR_LFM2_CONV_STATE_ONLY");
-    return value && std::strcmp(value, "1") == 0;
-  }();
-  static const unsigned stripe = [] {
-    const char *value = std::getenv("NNTR_LFM2_CONV_STRIPE_ROWS");
-    if (value)
-      for (unsigned rows : {8u, 16u, 32u, 64u, 128u, 256u})
-        if (std::strcmp(value, std::to_string(rows).c_str()) == 0)
-          return rows;
-    return 64u;
-  }();
+  const auto &htp_config = nntrainer::htpRuntimeConfig().htp;
+  const bool channel_tile = htp_config.lfm2_conv_channel_tile;
+  const bool state_only = htp_config.lfm2_conv_state_only;
+  const unsigned stripe = htp_config.lfm2_conv_stripe_rows;
   nntrainer::ThreadManager::Global().parallel_for(
     0, (rows + stripe - 1u) / stripe, [&](size_t job) {
 #if defined(__clang__)
@@ -394,10 +387,8 @@ lfmConvChunkedPrefill(nntrainer::ComputeOps *ops, void *in_weight,
                     writes[j].bytes))
         return false;
   }
-  static const bool whole_prefill = [] {
-    const char *value = std::getenv("NNTR_LFM2_CONV_WHOLE_PREFILL");
-    return value && std::strcmp(value, "1") == 0;
-  }();
+  const bool whole_prefill =
+    nntrainer::htpRuntimeConfig().htp.lfm2_conv_whole_prefill;
   // The strided FC entry can keep all rows in one retained output while
   // walking VTCM-sized chunks internally. This also shares one CPU gate
   // dispatch across the full projection.
@@ -697,19 +688,14 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                             w_ptr, y, state, rows, C)) {
     bool keep_output = false;
 #if defined(ENABLE_HEXKL)
-    const char *views = std::getenv("NNTR_LFM2_PREFILL_VIEWS");
-    keep_output = !out_to_host_ && !training && views &&
-                  std::strcmp(views, "1") == 0 &&
-                  out_step.getDataType() == fp32 && out_step.getContiguous();
-    const char *keep = std::getenv("NNTR_HTP_KEEP_OUT");
-    if (keep && std::strcmp(keep, "0") == 0)
-      keep_output = false;
-    // The graph's plain residual reads host_view immediately. Diagnostic
-    // readers access the logical host tensor, so publish the full output.
-    for (const char *name :
-         {"NNTR_HTP_DUMP", "NNTR_ACT_STATS", "NNTR_ACT_DUMP",
-          "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH", "NNTR_MOE_DIFF",
-          "NNTR_MOE_SHADOW", "NNTR_L2_DIFF", "NNTR_L2_SHADOW"})
+    const auto &htp_config = nntrainer::htpRuntimeConfig().htp;
+    keep_output = !out_to_host_ && !training && htp_config.lfm2_prefill_views &&
+                  out_step.getDataType() == fp32 && out_step.getContiguous() &&
+                  htp_config.keep_out && htp_config.dump_dir.empty() &&
+                  !htp_config.l2_diff && !htp_config.l2_shadow;
+    // Diagnostic readers need the complete logical host tensor.
+    for (const char *name : {"NNTR_ACT_STATS", "NNTR_ACT_DUMP",
+                             "NNTR_DUMP_ROWS_DIR", "NNTR_DUMP_ROWS_HASH"})
       if (std::getenv(name))
         keep_output = false;
 #endif

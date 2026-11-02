@@ -14,8 +14,8 @@ K = moe_intermediate), prints the correlation and the sign agreement between
 two experts, and writes the nntr_hadamard_signs_v1 sidecar the runtime
 takes through nntr_config "moe_hadamard_signs".
 
-Record offsets come from the runtime: run each pack once with
-NNTR_MOE_DESC_TRACE=1 (any short prompt) and save the [MoE-DESC] lines.
+Record offsets come from the runtime: set moe.descriptor_trace=true in each
+pack's nntr_config.json, run a short prompt, and save the [MoE-DESC] lines.
 
   recover_hadamard_signs.py --rotated BIN --rotated-desc TXT \\
       --plain BIN --plain-desc TXT --out rotation_signs.json [--layers 0 29]

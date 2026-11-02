@@ -10,6 +10,11 @@
  * @brief  Shared HTP weight preparation from the existing layer contexts.
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -29,7 +34,6 @@
 
 #include <dense_ffn_layer.h>
 #include <embedding_layer.h>
-#include <htp_backend/htp_fixed_opts.h>
 #include <htp_backend/htp_tl2_opts.h>
 #include <htp_mha_core.h>
 #include <htp_tie_word_embedding.h>
@@ -66,8 +70,8 @@ void prepareHtpWeights(ml::train::Model &model,
   // allocations strand the space up to the next chunk boundary.
   std::map<std::string, HtpStaticEncoding> static_weights;
   std::string static_path = options.static_activation_file;
-  if (const char *path = std::getenv("NNTR_HTP_STATIC_LINEAR"))
-    static_path = path;
+  if (!nntrainer::htpRuntimeConfig().htp.static_linear.empty())
+    static_path = nntrainer::htpRuntimeConfig().htp.static_linear;
   if (!static_path.empty()) {
     std::filesystem::path path(static_path);
     if (path.is_relative())
@@ -93,8 +97,7 @@ void prepareHtpWeights(ml::train::Model &model,
   std::vector<PendingFc> fc_pending;
   std::set<const void *> cpu_weight_sources;
   std::set<const void *> shared_heads;
-  const bool discard_sources =
-    nntrainer::weightPageCachePolicy() >= 0 && nntrainer::htp_fixed::E2E;
+  const bool discard_sources = nntrainer::weightPageCachePolicy() >= 0;
   struct PendingDense {
     nntrainer::ComputeOps *ops;
     void *up, *gate, *down;

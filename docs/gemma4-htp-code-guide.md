@@ -102,7 +102,7 @@ flowchart TB
 - `lfm2_moe_layer.cpp` is the routed MoE block shared with the LFM2 models:
   the router runs on the DSP (`router_logits_f32`), the selected experts are
   served from the expert cache, and `nntrainer/tensor/htp_backend/htp_expert_pool.h`
-  decide which experts stay resident (`moe_cache_experts`).
+  decide which experts stay resident (`moe.cache_experts`).
 - `nntrainer/layers/llm/` holds `lm_head`, `logit_softcapping` and the HTP
   tied-embedding head; the head is split so the DSP computes the argmax of
   the logits it holds and the CPU only sees logits when sampling needs them.
@@ -143,9 +143,9 @@ penalties and logits processors still work by asking the DSP for the logits.
 
 The decode loop's cost is almost entirely weight bandwidth: 128 experts per
 layer at 2 bits, of which 8 are read per token, plus the dense projections.
-Keeping 16 experts per layer resident in the arena (`moe_cache_experts`) and
+Keeping 16 experts per layer resident in the arena (`moe.cache_experts`) and
 predicting the next layer's experts from the router (`htp_router_predict.h`,
-`htp_expert_prefetch.h`) is what the `NNTR_MOE_*` options tune.
+`htp_expert_prefetch.h`) is configured in the `moe` object of `nntr_config.json`.
 
 Before decode, `ComputeOps::release_prefill_scratch` publishes any held
 outputs and releases backend staging after the relevant work completes.
@@ -156,7 +156,7 @@ activations directly; prefill still expands panels for HMX.
 
 `HtpExpertReadPool` handles small demand-read batches without waking the
 whole compute pool. `HtpTokenPollState` prevents a server from polling the
-same token twice. With `NNTR_MOE_SERVER_DONE=1`, a token-number/complement
+same token twice. With `moe.server_done=true`, a token-number/complement
 pair in the existing mailbox lets the server park before DSPQ reception.
 The hint does not establish success or replace DSPQ output/status checks;
 stale/torn records are rejected and older skeletons keep the fallback path.
@@ -165,6 +165,7 @@ stale/torn records are rejected and older skeletons keep the fallback path.
 
 | File | Role |
 |---|---|
+| `htp_runtime_config.cpp/.h` | typed HTP and MoE defaults, validation and active-session configuration lifetime |
 | `htp_backend.cpp/.h` | opens the FastRPC session to the cDSP (one process domain), loads `libnntr_hvx_skel.so` from `ADSP_LIBRARY_PATH`, owns the dspqueue |
 | `htp_compute_ops.cpp` | the `ComputeOps` table: weight registration (WH / palette / Q4_0 arena), the per-layer prefill calls, the KV cache calls, `moe_experts`, graph init and the token driver, the decode hook |
 | `htp_rpcmem.h` | rpcmem allocation, the arena and the staging pools |
@@ -211,55 +212,94 @@ compare against.
 
 ## 7. Runtime configuration and options
 
-The configuration the model was validated with is built into the library,
-in `nntrainer/tensor/htp_backend/htp_fixed_opts.h`; neither the app nor the CLI sets
-it, and it is not an option any more:
+Runtime options belong to two objects in the model's `nntr_config.json`:
+`htp` controls the transport, memory, dense kernels and attention; `moe`
+controls expert caching, reads, routing, prediction and expert kernels.
+The SDK-independent schema and defaults are in
+[`htp_runtime_config.h`](../nntrainer/tensor/htp_backend/htp_runtime_config.h).
+The app parser in
+[`htp_model_config.h`](../Applications/CausalLM/models/htp_model_config.h)
+rejects unknown keys, incorrect types, out-of-range values and incompatible
+combinations before opening the DSP session. Booleans are JSON `true`/`false`,
+not `0`/`1` or strings.
 
-| Setting | Value | Effect |
+For example, merge these objects into a Gemma4 pack to reproduce the direct
+I/O, fixed C16 policy and record tokens:
+
+```json
+{
+  "htp": {"page_cache": 0, "token_trace": "/data/local/tmp/htp/trace.json"},
+  "moe": {"cache_experts": 16, "cache_grow": 0, "preload_experts": 128}
+}
+```
+
+These are runtime settings, separate from model metadata such as weight
+format, dtypes, rotation signs and engine selection. The old flat keys
+`moe_cache_experts`, `moe_hadamard` and `moe_hadamard_scope` are accepted for
+existing packs; conflicting flat and nested values are rejected. Prefer the
+nested form for new configurations. Legacy flat cache size `0` still means
+16; nested `moe.cache_experts` must be positive.
+
+| Config key | Default | Effect |
 |---|---|---|
-| `htp_fixed::E2E` | on | compile the decode step into the resident DSP graph and run the token driver |
-| `htp_fixed::MOE_CACHE_EXPERTS` | 16 | experts kept resident per layer in the arena (a model's `moe_cache_experts` still names its own count) |
-| `htp_fixed::E2E_FREE_KVQ` | on | free the host copies of the quantized KV caches once the DSP holds them |
-| `htp_fixed::KV_DROP_CPU` | on | drop the CPU KV cache mirror after prefill |
-| `htp_fixed::DROP_HOST_FC` | on | unmap the host copy of the dense projections once registered in the arena |
-| `htp_fixed::ATTN_M1_Q8` | 2 | decode attention over the int8 KV cache with fixed per-dimension scales, on every layer |
-| `htp_fixed::FC_IN_ARENA` | on | dense projections live in the DSP arena, not in staging buffers |
-| `htp_fixed::MOE_DMA_QUEUES` | 4 | the M = 1 MoE feed splits each expert matrix over four DMA queues |
-| `htp_fixed::PREDICT` | 2 | the ARM predicts the next MoE layer's experts from the router's input row (Gemma's softmax routers only; `NNTR_HTP_PREDICT=0` turns it off) |
-| `htp_fixed::PREFETCH_READERS` / `PREFETCH_SLOTS` / `PREFETCH_RESIDUAL` | 4 / 32 / 0.5 | the predicted experts are read into spare DMA slots ahead of their layer |
-| `htp_fixed::RELEASE_PREFILL_SCRATCH` | on | the CPU prefill scratch is discarded once the first token is out |
-| `htp_fixed::MOE_POOL_TARGET` | 34 | after the first token the expert pool grows towards 34 experts a layer, as far as the PD's 3840 MiB mapping ceiling (minus a 256 MiB margin) allows; `NNTR_MOE_CACHE_GROW=<n>` names the growth itself, 0 for none |
+| `htp.page_cache` | `-1` | `-1`: mmap; `0`: direct file I/O; `1`: bounded cached reads |
+| `htp.load_prefetch` | `null` | explicit boolean overrides generic load read-ahead; absent/null keeps the loader's existing policy |
+| `htp.arena_grain_mib` | `64` | arena allocation grain: 4, 16 or 64 MiB |
+| `htp.release_prefill_scratch` / `release_prefill_readers` | `true` / `false` | release prefill allocations/readers when decode takes over; later prefill can create them again |
+| `htp.fc_lanes_small` / `fc_lanes_large` | `null` / `null` | keep the kernel's built-in lane selection; explicit overrides are 1..8 |
+| `moe.cache_experts` / `preload_experts` | `16` / `128` | per-layer resident capacity and separate startup preload limit |
+| `moe.cache_grow` | `null` | grow toward the bounded target of 34 per layer; `0` disables growth, positive values request that many additional slots |
+| `moe.prediction` | `"auto"` | `auto`, `off`, `dsp-page`, `dsp-direct` or `arm-direct`; replaces the old predict/direct variable pair |
+| `moe.decode_prefetch_readers` / `prefetch_slots` | `null` / `32` | automatic reader count (normally 4, native TL2 direct mode 2) and maximum predicted-read slots |
+| `moe.prefetch_top` / `prefetch_residual` | `null` / `0.5` | model-dependent predicted expert count and residual blend |
+| `moe.prefill_readers` / `miss_readers` | `6` / `4` | prefill and decode demand-read workers |
+| `moe.demand_pool` / `server_done` | `true` / `false` | dedicated demand readers and optional mailbox completion hint |
+| `moe.dma_queues` / `dma_bypass` | `4` / `true` | expert kernel DMA policy |
+| `moe.m1_gemv` / `gemv_lead_kb` / `gemv_rows1` / `gemv_feed` | `true` / `192` / `true` / `true` | M=1 expert GEMV and feed policy |
+| `moe.hadamard` / `hadamard_scope` | model metadata, otherwise `"off"` / `"2bit"` | checkpoint-compatible online rotation |
 
-The C API (`Applications/CausalLM/api/htp_model_runtime.h`) sets
-`ADSP_LIBRARY_PATH` for the DSP skel. Environment controls still include
-page-cache policy, preload, cache growth and optional completion hints:
+`moe.prediction="dsp-page"` and `moe.tl2_prepared_file` require
+`htp.page_cache=-1`. Optional numeric/bool fields accept `null` for automatic
+selection. The old overloaded `NNTR_MOE_PREFETCH` is split into
+`moe.prefill_lookahead` (prefill batches) and `moe.decode_prefetch_readers`
+(decode I/O workers). `NNTR_MOE_PREFETCH_READERS` becomes
+`moe.prefill_readers`; it no longer doubles as a decode setting.
+Explicit `moe.prediction="dsp-page"` selects active page prefetch. The old
+`NNTR_HTP_PREDICT=1` alone provided prediction hints unless decode prefetch
+was also enabled; `"auto"` retains the existing default selection.
 
-| Variable | Effect |
-|---|---|
-| `NNTR_HTP_PAGE_CACHE=0` or `1` | read the weight file through the bounded reader instead of mmap: 0 bypasses the page cache (direct IO), 1 bounds it; unset keeps the mmap loader |
-| `NNTR_MOE_PRELOAD_EXPERTS=128` | default startup preload; distinct from total expert-cache capacity |
-| `NNTR_MOE_CACHE_GROW=0` | keep capacity fixed for the C16 measurement preset |
-| `NNTR_MOE_DEMAND_POOL=0` | disable the dedicated demand-read pool; it is enabled by default |
-| `NNTR_MOE_SERVER_DONE=1` | opt into the mailbox completion hint; default off |
+The header lists all retained tuning fields; `lfm2_*` fields live
+under `htp` for dense/conv/attention operations and under `moe` for expert
+routing and reads.
 
-Diagnostics that are safe to set from the outside:
+Diagnostics also use config: `htp.token_trace` is the token JSON path,
+`htp.profile` selects DSP timing (0..3), `htp.dump_dir` is the layer-dump
+folder, `htp.attn_f32_check` enables the FP32 reference check, and
+`moe.trace` / `route_log` / `predict_log` are output paths. Empty paths and
+profile 0 disable those diagnostics. `NNTR_GENERATED_IDS` remains the
+shared CLI token-ID export, and `ADSP_LIBRARY_PATH` still locates the DSP
+library. `NNTR_HTP_DIAGNOSTICS` selects diagnostic code at **build time**.
 
-| Variable | Effect |
-|---|---|
-| `NNTR_HTP_TOKEN_TRACE=<path>` | write the input and output token ids of a run as JSON |
-| `NNTR_HTP_PROFILE=1` | per-op timing from the DSP |
-| `NNTR_HTP_DUMP=<dir>` | dump layer inputs and outputs for comparison with the CPU |
-| `NNTR_HTP_ATTN_F32_CHECK=1` | compare the DSP attention with an fp32 CPU reference |
-| `NNTR_MOE_TRACE=1` | log expert hits and misses per layer |
-| `NNTR_HTP_RELEASE_PREFILL_SCRATCH=1` | drop the CPU prefill scratch once the resident decode graph owns the step |
-| `NNTR_GENERATED_IDS=<path>` | write the generated token ids, one per line, without asking the DSP for logits |
-| `NNTR_HTP_ATTN_DSP_CALIB=0` | calibrate the int8 attention scales on the CPU instead of inside the DSP step |
-| `NNTR_MOE_CACHE_GROW=<n>` | grow the expert pool by exactly n slots per layer after the first token instead of the built-in bounded growth to 34 (0 = none); S26 Ultra, page cache off, C16: +18 takes the decode from 10.1 to 13.9 tok/s for about 1 GB of arena |
+The old HTP/MoE/LFM2 runtime environment variables are no longer read.
+Obsolete toggles for always-on resident decode, host-KV release, dense
+arena placement and fixed quantized attention are removed; those execution
+invariants remain unchanged. MoE CPU shadow/diff and split-dispatch
+experiments are removed rather than exposed as config.
 
-The rest of the `NNTR_HTP_*` and `NNTR_MOE_*` variables (about sixty) are
-tuning knobs for experiments; their readers are in `htp_compute_ops.cpp`,
-`htp_moe_opts.h` and the HTP layers, and
-[`docs/ENV_FLAGS.md`](ENV_FLAGS.md) explains the rule for documenting them.
+A resolved configuration is fixed for the active model. Reconfiguring an
+open session with different values is rejected; teardown resets it before
+another model loads. HTP still has one runtime per process, and
+`htp.page_cache` / `htp.load_prefetch` feed shared weight-loading utilities.
+A CPU model loaded in the same process while HTP is active can inherit these
+I/O policies. This preserves the former process-wide environment behavior;
+it does not provide concurrent models with independent loader policies.
+
+CLI and API read the same model JSON. Only the LFM2
+SR15 **CLI** merges the
+[documented preset](lfm2-htp-user-guide.md#default-sr15-cli-preset) into missing
+fields; QuickDotAI does not. Explicit JSON values, including `false` and
+`0`, win over that preset. Repeated prefill/decode cycles reuse this same
+configuration.
 
 ## 8. Tests, and what each one proves
 
@@ -271,7 +311,7 @@ tuning knobs for experiments; their readers are in `htp_compute_ops.cpp`,
 | `generators/check_gemma4_htp_converter.py` | x86 (python) | the production converter reproduces the independent tiny serializer byte for byte |
 | `unittest_hvx_attn`, `_attn_f16`, `_attn_q`, `_fc`, `_mm_u8i4`, `_softmax` | device (ndk-build via `test/htp/run_u8i4_layer_on_device.sh`) | the HVX / HMX kernels against CPU references on silicon |
 | `quick_dot_ai_test ... QDA_HTP_LIFECYCLE=1` | device | the C API lifecycle: load, parity across repeats, cancellation, unload, reload, invalid packs |
-| `HtpAppLifecycleTest` (two methods) | device (instrumentation) | the app's controls and prompt format, with token traces per step |
+| `HtpAppLifecycleTest` | device (instrumentation) | the app's controls and prompt format, with token traces per step |
 | `-Denable-htp=true -Dhtp-inproc=true` | x86 (meson) | the DSP sources and the ARM path compile together on the host (a compile gate; nothing it prints is a device number) |
 
 ## 9. Reading order and how to extend

@@ -6,6 +6,7 @@
  */
 #ifndef NNTR_HTP_PREFILL_READERS_H
 #define NNTR_HTP_PREFILL_READERS_H
+#include "htp_runtime_config.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -50,8 +51,7 @@ public:
   std::atomic<uint32_t> prefetch_reader_cpus_{0};
   uint32_t prefetch_caller_cpus_ = 0;
   void releaseIdlePrefillReaders() {
-    const char *v = std::getenv("NNTR_HTP_RELEASE_PREFILL_READERS");
-    if (!v || std::strcmp(v, "1") != 0)
+    if (!htpRuntimeConfig().htp.release_prefill_readers)
       return;
     size_t count;
     {
