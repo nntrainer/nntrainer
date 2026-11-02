@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-/** @file htp_prepared_qs2.h
- * @brief CRC and file I/O helpers for prepared weight artifacts.
+/**
+ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+ * @file htp_prepared_qs2.h
+ * @brief Endian, CRC and file I/O helpers for prepared weight artifacts.
  * @author NNTrainer contributors
  * @bug See the repository issue tracker for known issues.
  */
 #ifndef __HTP_PREPARED_QS2_H__
 #define __HTP_PREPARED_QS2_H__
-#include "htp_prepared_fc.h"
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #if defined(__ANDROID__) || defined(__linux__)
@@ -23,6 +25,15 @@
 #endif
 
 namespace nntrainer {
+inline uint32_t preparedFcU32(const uint8_t *p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+         (uint32_t(p[3]) << 24);
+}
+
+inline uint64_t preparedFcU64(const uint8_t *p) {
+  return preparedFcU32(p) | (uint64_t(preparedFcU32(p + 4)) << 32);
+}
+
 #if defined(__aarch64__) && (defined(__ANDROID__) || defined(__linux__))
 __attribute__((target("+crc"))) inline uint32_t
 preparedQs2CrcArm(const void *data, size_t size) {
