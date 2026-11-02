@@ -26,8 +26,10 @@
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #ifdef ENABLE_HEXKL
@@ -1051,6 +1053,39 @@ struct AttnCase {
   size_t window; /**< UINT_MAX for none */
   float softcap; /**< 0 for none */
   bool sink;
+  bool flash = false; /**< allow the flash arm (AttentionOpParams::flash) */
+};
+
+/**
+ * @brief Set (or, for a null value, unset) an environment variable for one
+ *        scope, restoring it after.
+ */
+class ScopedEnv {
+public:
+  ScopedEnv(const char *name, const char *value) : name_(name) {
+    if (const char *old = std::getenv(name)) {
+      had_ = true;
+      old_ = old;
+    }
+    set(value);
+  }
+  ~ScopedEnv() { set(had_ ? old_.c_str() : nullptr); }
+
+private:
+  void set(const char *value) {
+#ifdef _WIN32
+    _putenv_s(name_, value ? value : "");
+#else
+    if (value)
+      setenv(name_, value, 1);
+    else
+      unsetenv(name_);
+#endif
+  }
+
+  const char *name_;
+  bool had_ = false;
+  std::string old_;
 };
 
 /** @brief A tensor of the given dtype holding @p v (fp16 bits for UINT16). */
@@ -1087,8 +1122,10 @@ void checkAttention(const AttnCase &c, float tol) {
 
   std::vector<float> q(c.rows * Hq * D), k(keys * Hkv * D), v(keys * Hkv * D),
     sink(Hq);
+  // Scores of a few units, so a softcap and a window change the softmax
+  // visibly and a dropped one fails the tolerance.
   for (size_t i = 0; i < q.size(); ++i)
-    q[i] = 0.3f * std::sin(0.7f * i + 0.1f);
+    q[i] = 2.0f * std::sin(0.7f * i + 0.1f);
   for (size_t i = 0; i < k.size(); ++i) {
     k[i] = 0.5f * std::cos(0.37f * i);
     v[i] = 0.4f * std::sin(0.23f * i + 1.0f);
@@ -1165,6 +1202,7 @@ void checkAttention(const AttnCase &c, float tol) {
   p.window = c.window;
   p.softcap = c.softcap;
   p.sink = c.sink ? &st : nullptr;
+  p.flash = c.flash;
   qt.getOps()->attention(qt, kv, out, p);
 
   for (unsigned int r = 0; r < c.rows; ++r) {
@@ -1245,6 +1283,65 @@ TEST_F(ComputeOpsDispatchTest, AttentionFp16QueryPaths) {
      false},
     {"int8_decode", true, AttnCache::Int8, 1, 4, true, UINT_MAX, 0.0f, false},
     {"int8_window_prefill", true, AttnCache::Int8, 3, 2, true, 3, 0.0f, false},
+  };
+  for (const AttnCase &c : cases)
+    checkAttention(c, 1e-2f);
+}
+#endif
+
+/**
+ * @brief The flash arm, allowed by AttentionOpParams::flash: a 40-row step
+ *        takes it on every architecture (ARM from 32 rows, x86 for every
+ *        step), over an fp16-bits cache, with a window and softcap, and with
+ *        non-causal rows. 8 x 8 flash tiles split the step over several query
+ *        and key blocks, so the online-softmax rescale across key blocks
+ *        runs. The decode row goes to the platform's faster arm, a sink and
+ *        an FP32 cache to the per-row arm; each must still match the formula.
+ *        x86 keeps the probabilities in fp32 (1e-4); the ARM form stores
+ *        them in fp16 (2e-3).
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionFlashArm) {
+  ScopedEnv bq("VJEPA_BQ", "8"), bk("VJEPA_BK", "8");
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  const float tol = 1e-4f;
+#else
+  const float tol = 2e-3f;
+#endif
+  const AttnCase cases[] = {
+    {"flash_softcap_window_prefill", false, AttnCache::FP16Bits, 40, 3, true, 5,
+     0.5f, false, true},
+    {"flash_non_causal", false, AttnCache::FP16Bits, 40, 0, false, UINT_MAX,
+     0.0f, false, true},
+    {"flash_chunk_after_prefill", false, AttnCache::FP16Bits, 40, 40, true,
+     UINT_MAX, 0.0f, false, true},
+    {"flash_decode_row", false, AttnCache::FP16Bits, 1, 40, true, UINT_MAX,
+     0.0f, false, true},
+    {"flash_sink_takes_per_row", false, AttnCache::FP16Bits, 40, 2, true,
+     UINT_MAX, 0.0f, true, true},
+    {"flash_fp32_cache_takes_per_row", false, AttnCache::FP32, 40, 2, true,
+     UINT_MAX, 0.0f, false, true},
+  };
+  for (const AttnCase &c : cases)
+    checkAttention(c, tol);
+}
+
+#ifdef ENABLE_FP16
+/**
+ * @brief The flash arm on an FP16 query (the all-FP16 NEON form on ARM, the
+ *        widened FP32 form on x86) over an FP16 cache, with a softcap and a
+ *        window, and over an int8 cache, which it dequantizes per tile. Held
+ *        to 1e-2, as the FP16 cases of unittest_mha_core.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionFlashArmFp16Query) {
+  ScopedEnv bq("VJEPA_BQ", "8"), bk("VJEPA_BK", "8");
+  const AttnCase cases[] = {
+    {"flash_fp16_softcap_prefill", true, AttnCache::FP16Bits, 40, 2, true,
+     UINT_MAX, 0.1f, false, true},
+    {"flash_fp16_window_prefill", true, AttnCache::FP16Bits, 40, 0, true, 7,
+     0.0f, false, true},
+    {"flash_int8_prefill", true, AttnCache::Int8, 40, 1, true, UINT_MAX, 0.0f,
+     false, true},
   };
   for (const AttnCase &c : cases)
     checkAttention(c, 1e-2f);

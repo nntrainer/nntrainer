@@ -321,7 +321,7 @@ dispatches through the op table rather than carrying its own backend fork.
 **Interim rule, enforceable before the virtuals land.** A whole-op virtual does not yet exist for
 every operation (`rmsnorm` is absent from `nntrainer/tensor/cpu_backend/compute_ops.h`; `rope`
 has `rotary_embedding`, the KV-cache write has `kv_cache_write` and attention has `attention`,
-but their device arms, and attention's host flash arm, are not behind them yet), so a full collapse is
+but their device arms are not behind them yet, the CUDA attention arm aside), so a full collapse is
 blocked for those. Until the virtual lands, new
 accelerator work on such an operation must:
 
@@ -596,9 +596,10 @@ are gaps in the code relative to the rules above; they are not a schedule.
   RoPE (FP32 and FP16 input) dispatches through it. The KV-cache write has one too,
   `kv_cache_write` (fp16 concat cache, `KVCacheView`), and `mha_core`'s host K/V write goes
   through it. So does attention, `attention` (`AttentionOpParams`), which `mha_core`'s host
-  per-row arm goes through (`cpu_attention.cpp`). The OpenCL and CUDA device arms of all three,
-  the OHWI and int8 cache writes, the host flash arm (`gemm_attention`) and the choice between
-  the host arms are still inside `mha_core.cpp` (#4451).
+  per-row and flash arms go through, with the choice between them (`cpu_attention.cpp`); the
+  CUDA attention arm is `CudaComputeOps::attention`. The OpenCL device arms of all three, the
+  CUDA RoPE and cache-write arms, and the OHWI and int8 cache writes are still inside
+  `mha_core.cpp` (#4451).
 - **Allocator-name string comparisons remain** in `nntrainer/tensor/memory_pool.cpp` (`"qnn"`)
   and `Applications/CausalLM/kv_cache_manager.cpp` (`"gpu-svm"`) — see §3.
 - **There is no public layer-author API.** `ml::train::Layer`

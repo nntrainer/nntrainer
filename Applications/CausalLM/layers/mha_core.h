@@ -665,32 +665,10 @@ private:
    * @brief NNTR_MHA_CLMEM slab-sync watermark: concat SVM slab rows [0, n)
    *        hold valid K/V. In that mode the prefill window writes ONLY the
    *        OHWI mirrors (no SVM side-fill); host readers (decode NEON,
-   *        gemm_attention, flash fallback) gather the missing rows back
+   *        the flash arm) gather the missing rows back
    *        from the mirrors first (k/v_gather_ohwi, one drained sync).
    */
   unsigned int kv_slab_synced_to = 0;
-
-  /**
-   * @brief GEMM-based flash attention for one batch (covers both encoder
-   *        non-causal and causal-LLM prefill paths).
-   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
-   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
-   *        balanced parallel_for over (h_q, query_block) units with online
-   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
-   *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
-   *        + in-block boundary mask. Sliding window: key-block lower-bound
-   *        skip + in-block lower mask.
-   * @param[in] N_kv      total cache length (= cache_to, keys [0, N_kv))
-   * @param[in] N_q       step length (= step_size, rows of the output)
-   * @param[in] cache_from absolute starting position of queries in the cache
-   *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
-   */
-  void gemm_attention(nntrainer::Tensor &query_step,
-                      nntrainer::Tensor &b_cached_key,
-                      nntrainer::Tensor &b_cached_value,
-                      nntrainer::Tensor &attention_output_step,
-                      unsigned int N_kv, unsigned int N_q,
-                      unsigned int cache_from);
 
   enum INOUT_INDEX {
     /** input index */
@@ -734,7 +712,7 @@ private:
   nntrainer::Tensor *kv_int8_value_scale = nullptr;
   /** Per-batch raw pointers into the scale tensors above, set by
    * one_batch_incremental_forwarding before the read-path call to
-   * compute_kcaches / compute_fp16vcache_transposed / gemm_attention.
+   * the host attention arms (ComputeOps::attention).
    * Single-batch dispatch is sequential, so racing the helpers (which
    * parallelize over heads) against these is safe. */
   const uint16_t *cur_kv_int8_key_scale_batch = nullptr;
@@ -881,16 +859,19 @@ private:
                       bool write_key, bool write_value, bool rotate_key);
 
   /**
-   * @brief     Host per-row attention of query rows [from, to) over the
-   *            cached keys [0, to), through ComputeOps::attention.
+   * @brief     Attention of query rows [from, to) over the cached keys
+   *            [0, to), through ComputeOps::attention: the backend's host
+   *            per-row or flash arm (the flash-class arms are allowed by
+   *            use_gemm_attention), or its device arm (CUDA). The op table
+   *            is query_step's: the CUDA arm runs only when query_step
+   *            carries the CUDA ContextData (the layer's engine is cuda);
+   *            a query without ContextData takes the CPU table.
    * @param[in] sink per-head sink logits (the attention-sink overload), or
    *            nullptr
    */
-  void attend_rowwise(nntrainer::Tensor &query_step,
-                      nntrainer::Tensor &cached_key,
-                      nntrainer::Tensor &cached_value,
-                      nntrainer::Tensor &output, unsigned int from,
-                      unsigned int to, nntrainer::Tensor *sink);
+  void attend(nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
+              nntrainer::Tensor &cached_value, nntrainer::Tensor &output,
+              unsigned int from, unsigned int to, nntrainer::Tensor *sink);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

@@ -98,6 +98,10 @@ struct AttentionOpParams {
                                  for none (see attention()) */
   float softcap = 0.0f;     /**< cap * tanh(score / cap) when > 0 */
   Tensor *sink = nullptr;   /**< per-head sink logit, or null */
+  /** the flash-class arms may run (MHACoreLayer's use_gemm_attention): the
+   *  host flash arm, or a device arm. Which arm runs is the backend's
+   *  choice; without it the host per-row arm. */
+  bool flash = false;
 };
 
 /**
@@ -699,7 +703,10 @@ public:
    * A window shorter than kv_len with non-causal rows is not supported: the
    * CPU arm, moved from MHACoreLayer as it was, gives an unspecified result
    * there. A sink, num_heads_q values of @p q's dtype, adds exp(sink - max)
-   * to each head's softmax denominator. @p out has @p q's shape.
+   * to each head's softmax denominator. @p out has @p q's shape. With
+   * @p p.flash the backend may apply the same formula with its flash arm (a
+   * blocked GEMM with an online softmax, which rounds its probabilities to
+   * fp16 on ARM) or a device arm; the kernel is the backend's choice.
    *
    * @throws std::invalid_argument for shapes or dtypes that do not match
    *         (the sink's included), a missing plane, or a cache the backend

@@ -381,7 +381,8 @@ float readAt(const nntrainer::Tensor &t, size_t i) {
 
 /**
  * Whether this step runs on the host flash arm with its softmax probabilities
- * stored in fp16: the ARM NEON form of gemm_attention, which takes a step of
+ * stored in fp16: the ARM NEON form of the flash arm (cpu_attention.cpp),
+ * which takes a step of
  * 32 rows or more. Such a step is about 5e-4 off the reference with or without
  * softcap, so it is held to 2e-3 instead of 1e-4.
  */
@@ -410,7 +411,7 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   }
 #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||           \
       defined(_M_IX86))
-  // min_prefill_thr() and host_decode_prefers_per_row() in mha_core.cpp: off
+  // flash_min_rows() and decode_prefers_per_row() in cpu_attention.cpp: off
   // x86 the host flash arm needs a 32-row step and never takes a decode step,
   // so a gemm case with no such step would re-test the per-row arm.
   if (c.gemm && *std::max_element(c.steps.begin(), c.steps.end()) < 32)
@@ -421,7 +422,7 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   if (c.fp16_activations)
     GTEST_SKIP() << "FP16 activations need an enable-fp16 build";
 #endif
-  // gemm_attention reads the flash tile on every call, so the test owns it:
+  // The flash arm reads the flash tile on every call, so the test owns it:
   // the case's tile, or unset for the layer's default. A 0 size would divide
   // by zero there.
   ASSERT_EQ(c.flash_bq == 0, c.flash_bk == 0)
