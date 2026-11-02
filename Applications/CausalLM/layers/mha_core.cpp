@@ -726,7 +726,9 @@ static void compute_vcache_fp32_transposed_reference(
 /**
  * @brief constructor of MHACoreLayer
  */
-MHACoreLayer::MHACoreLayer() :
+MHACoreLayer::MHACoreLayer() : MHACoreLayer(false) {}
+
+MHACoreLayer::MHACoreLayer(bool fp16_cache) :
   mha_core_props(
     nntrainer::props::NumHeads(), props::NumHeads_KV(),
     nntrainer::props::ProjectedKeyDim(), nntrainer::props::ProjectedValueDim(),
@@ -748,6 +750,8 @@ MHACoreLayer::MHACoreLayer() :
   num_heads_KV(0),
   head_dim(0),
   cache_shift(false) {
+  if (fp16_cache)
+    fp16_attention_ = std::make_unique<nntrainer::Fp16Attention>();
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -1016,6 +1020,12 @@ void *MHACoreLayer::v_snap_device() {
 }
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
+  if (fp16_attention_) {
+    const auto &skip =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props);
+    fp16_attention_->finalize(context, !skip.empty() && skip.get());
+    return;
+  }
 
   NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
                 std::invalid_argument)
@@ -1448,6 +1458,11 @@ void MHACoreLayer::ensure_rope_flat_lut() {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+  if (fp16_attention_) {
+    fp16_attention_->forwarding(context, training);
+    return;
+  }
+
   if (!use_external_cache) {
     // 3/4-input (internal KV cache) mode: full-sequence self-attention.
     //
@@ -1625,6 +1640,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  if (fp16_attention_) {
+    fp16_attention_->incremental_forwarding(context, _from, _to, training);
+    return;
+  }
+
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
@@ -6527,6 +6547,10 @@ void MHACoreLayer::compute_fp16vcache_transposed(
 
 void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
                             unsigned int batch) {
+  if (fp16_attention_) {
+    fp16_attention_->setBatch(context, batch);
+    return;
+  }
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
@@ -6541,6 +6565,11 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
 void MHACoreLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
+  if (fp16_attention_) {
+    fp16_attention_->updateTensorsByInputDimensions(context, input_dimensions);
+    return;
+  }
+
   unsigned int height = input_dimensions[0].height();
   unsigned int &max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -6576,11 +6605,22 @@ void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
                             const ml::train::ExportMethods &method) const {
+  if (fp16_attention_) {
+    LayerImpl::exportTo(exporter, method);
+    fp16_attention_->exportTo(exporter, method, this);
+    return;
+  }
+
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(mha_core_props, method, this);
 }
 
 void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
+  if (fp16_attention_) {
+    LayerImpl::setProperty(fp16_attention_->setProperty(values));
+    return;
+  }
+
   std::vector<std::string> props;
   props.reserve(values.size());
   for (const auto &value : values) {

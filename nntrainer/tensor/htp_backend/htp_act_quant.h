@@ -34,9 +34,8 @@
  * sync by inspection, the same convention htp_compute_ops.cpp's HTP_T_*
  * enum and hexkl_mm_u8i4_dma.c's WEIGHT_TILE_BYTES_U8I4 already use.
  *
- * Plain host code, no Hexagon SDK dependency -- like htp_q4_0_convert.h
- * next to it, this is not gated behind ENABLE_HEXKL and its unit test runs
- * in the default host build.
+ * Plain host code with no Hexagon SDK dependency. This remains available
+ * in the default host build, including its unit test.
  */
 
 #ifndef __NNTRAINER_HTP_ACT_QUANT_H__

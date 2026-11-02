@@ -8,6 +8,7 @@ llm_layer_sources = [
   'lm_head.cpp',
   'logit_softcapping.cpp',
   'qkv_layer.cpp',
+  'fp16_attention.cpp',
   'scalar_multiply.cpp',
   'swiglu_layer.cpp',
   'tie_word_embedding.cpp',

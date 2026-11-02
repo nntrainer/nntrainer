@@ -3,6 +3,7 @@ causallm_src += [
     meson.current_source_dir() / 'transformer.cpp',
     meson.current_source_dir() / 'sentence_transformer.cpp',
     meson.current_source_dir() / 'model_registry.cpp',
+    meson.current_source_dir() / 'htp_weight_preparation.cpp',
 ]
 
 causallm_inc += include_directories('.')
@@ -16,6 +17,7 @@ subdir('qwen3_slim_moe')
 subdir('gemma2')
 subdir('gemma3')
 subdir('gemma4')
+subdir('lfm2_moe')
 subdir('timm_vit')
 subdir('lfm2')
 if get_option('platform') != 'windows'

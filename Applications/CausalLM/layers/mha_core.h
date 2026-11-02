@@ -37,6 +37,7 @@
 #include <acti_func.h>
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <fp16_attention.h>
 #include <fused_llm_properties.h>
 #include <layer_impl.h>
 #include <limits.h>
@@ -56,27 +57,12 @@ namespace props {
  * @brief NumHeads property, NumHeads is number of head in multi head attention
  * of Q
  */
-class NumHeads_KV : public nntrainer::PositiveIntegerProperty {
-public:
-  /**
-   * @brief Construct a new NumHeads object with default value 1
-   */
-  NumHeads_KV(unsigned int value = 1) { set(value); };
-  static constexpr const char *key =
-    "num_heads_KV";                          /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::NumHeads_KV;
 
 /**
  * @brief SlidingWindow
  */
-class SlidingWindow : public nntrainer::Property<unsigned int> {
-public:
-  SlidingWindow(unsigned int value = UINT_MAX) { set(value); };
-  static constexpr const char *key =
-    "sliding_window";                        /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::SlidingWindow;
 
 /**
  * @brief InitSeqLen -- the model's activation-plane height in query rows.
@@ -98,24 +84,12 @@ public:
 /**
  * @brief MaxNewTokens
  */
-class MaxNewTokens : public nntrainer::Property<unsigned int> {
-public:
-  MaxNewTokens(unsigned int value = 1) { set(value); };
-  static constexpr const char *key =
-    "max_new_tokens";                        /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::MaxNewTokens;
 
 /**
  * @brief MaxNewTokens
  */
-class MaxPositionEmbeddings : public nntrainer::Property<unsigned int> {
-public:
-  MaxPositionEmbeddings(unsigned int value = 40960) { set(value); };
-  static constexpr const char *key =
-    "max_position_embeddings";               /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::MaxPositionEmbeddings;
 
 /**
  * @brief RopeTheta
@@ -126,43 +100,22 @@ using nntrainer::props::RopeTheta;
  * @brief UseRope property (Gemma4/Gemma3n). Accepted but our mha_core derives
  *        rope-enable from theta>0, so it is informational here.
  */
-class UseRope : public nntrainer::Property<bool> {
-public:
-  UseRope(bool value = true) { set(value); };
-  static constexpr const char *key = "use_rope"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
-};
+using nntrainer::props::UseRope;
 
 /**
  * @brief UseSink property
  */
-class UseSink : public nntrainer::Property<bool> {
-public:
-  UseSink(bool value = false) { set(value); };
-  static constexpr const char *key = "use_sink"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
-};
+using nntrainer::props::UseSink;
 
 /**
  * @brief AttnLogitSoftcapping
  */
-class AttnLogitSoftcapping : public nntrainer::Property<float> {
-public:
-  AttnLogitSoftcapping(float value = 0.0f) { set(value); };
-  static constexpr const char *key =
-    "attn_logit_softcapping";                 /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::AttnLogitSoftcapping;
 
 /**
  * @brief IsCausal property
  */
-class IsCausal : public nntrainer::Property<bool> {
-public:
-  IsCausal(bool value = true) { set(value); };
-  static constexpr const char *key = "is_causal"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;      /**< property type */
-};
+using nntrainer::props::IsCausal;
 
 /**
  * @brief UseGemmAttention property
@@ -277,13 +230,7 @@ public:
 /**
  * @brief RopeScalingFactor
  */
-class RopeScalingFactor : public nntrainer::Property<float> {
-public:
-  RopeScalingFactor(float value = 1.0) { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_factor";                    /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::RopeScalingFactor;
 
 /**
  * @brief RopePartialRotaryFactor (Gemma4/Gemma3n). Outside yarn, a factor
@@ -296,14 +243,7 @@ using nntrainer::props::RopePartialRotaryFactor;
 /**
  * @brief RopeScalingMaxPositionEmbeddings
  */
-class RopeScalingMaxPositionEmbeddings
-  : public nntrainer::Property<unsigned int> {
-public:
-  RopeScalingMaxPositionEmbeddings(unsigned int value = 4096) { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_max_position_embeddings";  /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::RopeScalingMaxPositionEmbeddings;
 
 }; // namespace props
 
@@ -364,6 +304,7 @@ public:
    * @brief Constructor of MhaCore Layer
    */
   WIN_EXPORT MHACoreLayer();
+  WIN_EXPORT explicit MHACoreLayer(bool fp16_cache);
 
   /**
    * @brief Destructor of MhaCore Layer
@@ -499,16 +440,47 @@ public:
    *        Must be called before forwarding() when use_external_cache is true.
    * @param[in] idx current write position in the KV cache
    */
-  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+  WIN_EXPORT void setCacheIndex(unsigned int idx) {
+    if (fp16_attention_)
+      fp16_attention_->setCacheIndex(idx);
+    else
+      cache_index = idx;
+  }
+  void setCacheBase(unsigned int base) {
+    if (fp16_attention_)
+      fp16_attention_->setCacheBase(base);
+  }
+  void registerQuantizedCache(nntrainer::RunLayerContext &context) {
+    if (fp16_attention_)
+      fp16_attention_->registerQuantizedCache(context);
+  }
+  void beginHtpPrompt() {
+    if (fp16_attention_)
+      fp16_attention_->beginHtpPrompt();
+  }
+  void foldDroppedAmax(const std::vector<float> &k,
+                       const std::vector<float> &v) {
+    if (fp16_attention_)
+      fp16_attention_->foldDroppedAmax(k, v);
+  }
+  static void saveQ2Calibration(std::ostream &file) {
+    nntrainer::Fp16Attention::saveQ2Calibration(file);
+  }
+  static void loadQ2Calibration(std::istream &file) {
+    nntrainer::Fp16Attention::loadQ2Calibration(file);
+  }
 
   /**
    * @brief Get the current cache index
    */
-  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+  WIN_EXPORT unsigned int getCacheIndex() const {
+    return fp16_attention_ ? fp16_attention_->getCacheIndex() : cache_index;
+  }
 
   inline static const std::string type = "mha_core";
 
 private:
+  std::unique_ptr<nntrainer::Fp16Attention> fp16_attention_;
   std::tuple<
     nntrainer::props::NumHeads, props::NumHeads_KV,
     nntrainer::props::ProjectedKeyDim, nntrainer::props::ProjectedValueDim,

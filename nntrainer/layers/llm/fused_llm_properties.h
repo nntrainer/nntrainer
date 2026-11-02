@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file fused_llm_properties.h
- * @brief Properties shared by fused language-model layers.
+ * @brief Properties shared by language-model layers.
  * @author NNTrainer contributors
  * @bug See the project issue tracker.
  */
 #ifndef NNTR_FUSED_LLM_PROPERTIES_H
 #define NNTR_FUSED_LLM_PROPERTIES_H
 #include <base_properties.h>
+#include <climits>
 namespace nntrainer {
 namespace props {
 class FeatureSize : public nntrainer::PositiveIntegerProperty {
@@ -85,6 +86,77 @@ public:
   static constexpr const char *key =
     "rope_partial_rotary_factor";             /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+class NumHeads_KV : public nntrainer::PositiveIntegerProperty {
+public:
+  NumHeads_KV(unsigned int value = 1) { set(value); };
+  static constexpr const char *key = "num_heads_KV";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+class SlidingWindow : public nntrainer::Property<unsigned int> {
+public:
+  SlidingWindow(unsigned int value = UINT_MAX) { set(value); };
+  static constexpr const char *key = "sliding_window";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+class MaxNewTokens : public nntrainer::Property<unsigned int> {
+public:
+  MaxNewTokens(unsigned int value = 1) { set(value); };
+  static constexpr const char *key = "max_new_tokens";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+class MaxPositionEmbeddings : public nntrainer::Property<unsigned int> {
+public:
+  MaxPositionEmbeddings(unsigned int value = 40960) { set(value); };
+  static constexpr const char *key = "max_position_embeddings";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+class UseRope : public nntrainer::Property<bool> {
+public:
+  UseRope(bool value = true) { set(value); };
+  static constexpr const char *key = "use_rope";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+class UseSink : public nntrainer::Property<bool> {
+public:
+  UseSink(bool value = false) { set(value); };
+  static constexpr const char *key = "use_sink";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+class AttnLogitSoftcapping : public nntrainer::Property<float> {
+public:
+  AttnLogitSoftcapping(float value = 0.0f) { set(value); };
+  static constexpr const char *key = "attn_logit_softcapping";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+class IsCausal : public nntrainer::Property<bool> {
+public:
+  IsCausal(bool value = true) { set(value); };
+  static constexpr const char *key = "is_causal";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+class RopeScalingFactor : public nntrainer::Property<float> {
+public:
+  RopeScalingFactor(float value = 1.0) { set(value); };
+  static constexpr const char *key = "rope_scaling_factor";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+class RopeScalingMaxPositionEmbeddings
+  : public nntrainer::Property<unsigned int> {
+public:
+  RopeScalingMaxPositionEmbeddings(unsigned int value = 4096) { set(value); };
+  static constexpr const char *key = "rope_scaling_max_position_embeddings";
+  using prop_tag = nntrainer::uint_prop_tag;
 };
 
 /**
