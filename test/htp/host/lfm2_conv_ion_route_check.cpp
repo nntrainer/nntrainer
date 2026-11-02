@@ -36,7 +36,7 @@ struct MockOps {
   enum View { Separate, Host, Null, Overlap, FailRpc, FailSync };
   View mode = Separate;
   bool supported = true;
-  unsigned calls = 0, views = 0, syncs = 0;
+  unsigned calls = 0, packed_calls = 0, views = 0, syncs = 0;
   std::vector<float> truth;
   const float *overlap = nullptr;
   float *destination = nullptr;
@@ -74,6 +74,14 @@ struct MockOps {
       std::memcpy(dst + at, src + at, 64);
     }
   }
+  void gemm_qs4cx_accel_fp32(const char *, const float *, const float *,
+                             float *output, unsigned rows, unsigned n,
+                             unsigned) {
+    ++packed_calls;
+    destination = output;
+    truth.assign(size_t(rows) * n, 7.0f);
+    std::memcpy(destination, truth.data(), truth.size() * sizeof(float));
+  }
   const void *host_view(const void *host, size_t bytes) {
     ++views;
     check(host == destination && bytes == truth.size() * sizeof(float),
@@ -100,7 +108,7 @@ struct Tensor {
   bool contiguous = true;
   unsigned dots = 0;
   float *replacement = nullptr;
-  template <typename T> T *getData() const {
+  template <typename T = float> T *getData() const {
     return reinterpret_cast<T *>(data);
   }
   template <typename T> T *getScale() const {
@@ -125,6 +133,9 @@ static Result route(Tensor &in_step, Tensor &in_w, Tensor &out_w, Tensor &proj,
                     unsigned rows, unsigned K, unsigned C, unsigned N,
                     bool compare = false) {
   const unsigned from = 0;
+  const auto affine = nntrainer::Tdatatype::QS4CX_WH_AFFINE;
+  const bool packed_fc =
+    in_w.getDataType() == affine && out_w.getDataType() == affine;
 #include "route.inc"
   return {p, retain_projection, lfm_prefill};
 }
@@ -219,8 +230,14 @@ int main() {
       f.state = f.proj.data;
     if (reason == 21)
       f.input.data = f.proj.data;
+    if (reason == 22)
+      f.in_w.type = nntrainer::Tdatatype::Q4_0;
     const auto r = f.run(K, N, C, false, reason == 22);
-    check(!r.retained && !f.ops.calls && f.input.dots == 1,
+    const bool packed = f.in_w.type == nntrainer::Tdatatype::QS4CX_WH_AFFINE &&
+                        f.out_w.type == nntrainer::Tdatatype::QS4CX_WH_AFFINE;
+    check(!r.retained && !f.ops.calls &&
+            f.ops.packed_calls == unsigned(packed) &&
+            f.input.dots == unsigned(!packed),
           "guard failed to take original projection");
     if (reason == 3)
       check(r.lfm, "2048 must retain conv-postgate optimization");
@@ -228,6 +245,7 @@ int main() {
   }
   {
     Fixture f(16);
+    f.in_w.type = nntrainer::Tdatatype::Q4_0;
     f.input.replacement = f.alternate.data();
     f.ops.supported = false;
     check(f.run().p == f.alternate.data(), "fallback dot may change output");

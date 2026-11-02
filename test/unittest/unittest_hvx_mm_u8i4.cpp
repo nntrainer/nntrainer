@@ -25,7 +25,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,17 +34,10 @@
 
 #include <htp_wh_layout.h>
 
+#include "htp_rpc_bench.h"
 #include "nntr_hvx.h"
 
 namespace {
-
-/** @brief Render a FastRPC error as hex so the code is searchable. */
-std::string hex(int err) {
-  std::ostringstream os;
-  os << "0x" << std::hex << std::setw(8) << std::setfill('0')
-     << static_cast<unsigned>(err);
-  return os.str();
-}
 
 /** @brief Rounds @a v up to a multiple of @a a. */
 constexpr uint32_t round_up(uint32_t v, uint32_t a) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Extract actual app/staging helpers; SIMDe supplies host NEON semantics."""
+"""Check app helpers with the production staging owner and host NEON semantics."""
 import argparse
 import hashlib
 import json
@@ -36,10 +36,8 @@ end=s.index('ConvBlockLayer::ConvBlockLayer() :')
 bs=b.index('// The app enables fast-math,');be=b.index('ConvBlockLayer::ConvBlockLayer() :')
 chunks={'candidate_helpers.inc':s[start:end], 'baseline_helpers.inc':b[bs:be]}
 core=(a.repo/'nntrainer/tensor/htp_backend/htp_compute_ops.cpp').read_text()
-cs=core.index('  struct Held {');ce=core.index('  /** @brief The attention\'s u16 context',cs)
-chunks['staging.inc']=core[cs:ce]
 hs=core.index('  const void *host_view(');he=core.index('  bool gemm_qs4cx_res_add_fp32(',hs)
-chunks['views.inc']=core[hs:he]
+chunks['views.inc']=core[hs:he].replace('staging_.', '')
 # Actual app early route. Type/dtype/from/owns-state guards are not recoded.
 rs=s.index('  const bool row_resident = rows == 1 && htpDecodeRowResident(from);')
 re=s.index('  // Match invokeFc\'s K=2048 row cap:',rs)
@@ -57,7 +55,9 @@ else:
  cmd[1:1]=['-mfma']
 if a.sanitize:cmd[1:1]=['-fsanitize=address,undefined','-fno-omit-frame-pointer']
 manifest={'source_sha256':hashlib.sha256(s.encode()).hexdigest(),'baseline_sha256':hashlib.sha256(b.encode()).hexdigest(),
- 'core_sha256':hashlib.sha256(core.encode()).hexdigest(),'extracts':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in chunks.items()},
+ 'core_sha256':hashlib.sha256(core.encode()).hexdigest(),
+ 'staging_sha256':hashlib.sha256((a.repo/'nntrainer/tensor/htp_backend/htp_staging.h').read_bytes()).hexdigest(),
+ 'extracts':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in chunks.items()},
  'compile':cmd,'run':[str((a.output/'check').resolve())],
  'arithmetic':'native ARM NEON' if a.native_arm else 'SIMDe0.8.2 on x86 FMA',
  'standins':['Actual app arithmetic; simulated NEON results require separate native ARM validation.',

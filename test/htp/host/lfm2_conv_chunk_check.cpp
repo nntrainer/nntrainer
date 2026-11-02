@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <htp_staging.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -140,11 +141,18 @@ struct ViewBase {
   virtual void sync_to_host(void *, size_t) = 0;
   virtual ~ViewBase() = default;
 };
-struct ComputeOps : ViewBase {
-#include "staging.inc"
+struct StagingTransfer {
+  static void copy(void *dst, const void *src, size_t bytes, int line = 0) {
+    stagedMemcpy(dst, src, bytes, line);
+  }
+  static bool parallelCopy(void *dst, const void *src, size_t bytes, int line) {
+    return tryParallelStagedMemcpy(dst, src, bytes, line);
+  }
+  static int profileLevel() { return HtpProfile::global().level(); }
+  template <typename... Args> static void warn(const char *, Args...) {}
+};
+struct ComputeOps : ViewBase, HtpStaging<HtpRpcBuffer, StagingTransfer> {
 #include "views.inc"
-  StagingPool act_pool_, out_pool_, x2_pool_, attn_out_pool_;
-  htp_router_handoff router_handoff_{};
   std::mutex invoke_mutex_;
   enum View {
     Separate,

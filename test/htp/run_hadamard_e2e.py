@@ -25,8 +25,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--order", default="off,both_hmx,both,both,both_hmx,off")
     parser.add_argument("--profile", action="store_true", help="diagnostic only")
-    parser.add_argument("--shadow-decode", action="store_true",
-                        help="diagnostic binary: rotate then restore, no prefill rotation")
     parser.add_argument("--cache-experts", type=int, default=16,
                         help="expert cache capacity per layer, same for all variants")
     parser.add_argument("--cache-grow", type=int, default=0,
@@ -77,7 +75,7 @@ def main():
     (args.output / "settings.json").write_text(json.dumps({
         "serial": args.serial, "remote_root": root, "environment": settings,
         "order": variants, "profile": args.profile,
-        "measurement": "shadow_decode_rotate_restore" if args.shadow_decode else "actual_rotation",
+        "measurement": "actual_rotation",
         "runtime_sha256": runtime_hashes,
     }, indent=2) + "\n")
     for index, variant in enumerate(variants):
@@ -128,8 +126,6 @@ def main():
                       process_wall_ms=elapsed * 1000, thermal_zone0=thermal,
                       output_ids_sha256=hashlib.sha256(ids).hexdigest())
         records.append(record)
-        if args.shadow_decode and len({r["output_ids_sha256"] for r in records}) != 1:
-            raise RuntimeError("Shadow control changed output IDs; do not use these timings")
         (args.output / "runs.json").write_text(json.dumps(records, indent=2) + "\n")
         print(json.dumps(record), flush=True)
     summary = {}
