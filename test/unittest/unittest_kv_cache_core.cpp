@@ -1310,6 +1310,120 @@ TEST(KvCacheCore, prefixCacheRejectsMismatchedLayoutPoolAndBatch) {
   EXPECT_THROW(KvPrefixCache cache(nullptr), std::invalid_argument);
 }
 
+TEST(KvCacheCore, forkSessionSharesHistoryAndSessionsDiverge) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3});
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession);
+  EXPECT_NE(child, KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(manager.activeSession(), KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), std::vector<float>({1, 2, 3, 4}));
+
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  EXPECT_EQ(appendAndReadKeys(manager, 9), std::vector<float>({1, 2, 3, 9}));
+
+  const auto grandchild = manager.forkSession(child);
+  manager.selectSession(grandchild);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3, 9}));
+
+  manager.selectSession(child);
+  manager.destroySession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(appendAndReadKeys(manager, 6), std::vector<float>({1, 2, 3, 9, 6}));
+}
+
+TEST(KvCacheCore, forkAtEarlierPositionTruncatesRowsAndIds) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 3);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), std::vector<float>({1, 2, 3, 4}));
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 6),
+            std::vector<float>({1, 2, 3, 4, 5, 6}));
+  EXPECT_EQ(prefix->stats().blocks, 3u);
+}
+
+TEST(KvCacheCore, forkedSessionPublishesNewPagesAndOthersAdoptThem) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 4);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  appendTokens(manager, {5, 6});
+  EXPECT_EQ(prefix->stats().blocks, 3u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> child_prompt = {1, 2, 3, 4, 5, 6, 7};
+  EXPECT_EQ(manager.reusePrefix(child_prompt.data(), child_prompt.size()), 6u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 7), std::vector<float>({1, 2, 3, 4, 7}));
+  appendTokens(manager, {8});
+  EXPECT_EQ(prefix->stats().blocks, 4u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> parent_prompt = {1, 2, 3, 4, 7, 8, 9};
+  EXPECT_EQ(manager.reusePrefix(parent_prompt.data(), parent_prompt.size()),
+            6u);
+}
+
+TEST(KvCacheCore, forkSessionValidatesParentAndPosition) {
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  KvCacheManager contiguous;
+  contiguous.initialize(spec(), allocator);
+  EXPECT_THROW(contiguous.forkSession(KvCacheManager::kDefaultSession),
+               std::logic_error);
+
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), allocator, pool, prefix);
+  EXPECT_THROW(manager.forkSession(42), std::out_of_range);
+  appendTokens(manager, {1, 2, 3});
+  EXPECT_THROW(manager.forkSession(KvCacheManager::kDefaultSession, 4),
+               std::out_of_range);
+
+  TokenId id = 7;
+  auto step = manager.beginStep(1, &id);
+  EXPECT_THROW(manager.forkSession(KvCacheManager::kDefaultSession),
+               std::logic_error);
+  manager.abort(std::move(step));
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 0);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+  EXPECT_TRUE(manager.committedTokens().empty());
+  EXPECT_EQ(appendAndReadKeys(manager, 9), std::vector<float>({9}));
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
