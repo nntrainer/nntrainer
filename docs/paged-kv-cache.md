@@ -8,11 +8,13 @@ Only blocks needed for an admitted step are allocated. Physical blocks hold
 token-major KV heads, without expanding grouped query heads.
 
 `KvPagePool` can be shared between managers, allowing independent sessions to
-reuse released physical storage. Its optional byte budget includes 64-byte
-allocation rounding and idle blocks. `trim()` frees idle blocks, including
-blocks with sizes no longer needed. Pool and session operations are synchronous
-and thread confined; they must all run on the same thread or be externally
-serialized.
+reuse released physical storage. Each acquired block is a handle; when the
+session table and every exported view drop it, the block returns to a per-size
+idle list, so acquiring and releasing blocks is O(1). Its optional byte budget
+includes 64-byte allocation rounding and idle blocks; when a new allocation
+would exceed it, idle blocks are freed first. `trim()` frees all idle blocks.
+Pool and session operations are synchronous and thread confined; they must all
+run on the same thread or be externally serialized.
 
 ```cpp
 using namespace nntrainer::kv;
@@ -40,15 +42,23 @@ auto output = cache.attention(step, 0, q, options);
 cache.commit(std::move(step));
 ```
 
-`attention()` reads the checked KV segments directly. Its online softmax keeps
-one head-sized accumulator and does not gather KV history or allocate the full
-attention score matrix. It supports causal prefill, decode, GQA/MQA/MHA,
-noncausal attention, a trailing window and optional logit softcapping. Queries
-and results are FP32; cache data can be FP32 or IEEE binary16 (including UINT16
-backing without native half support). Scale defaults to `1/sqrt(head_dim)`.
-The window ends at each query's causal endpoint, or at the step endpoint for
-noncausal attention. This scalar CPU implementation prioritizes portability
-and correctness; it does not claim the throughput of device attention kernels.
+`attention()` reads the checked KV segments directly. It does not gather KV
+history or allocate the full attention score matrix. It supports causal
+prefill, decode, GQA/MQA/MHA, noncausal attention, a trailing window and
+optional logit softcapping. Queries and results are FP32; cache data can be
+FP32 or IEEE binary16 (including UINT16 backing without native half support).
+Scale defaults to `1/sqrt(head_dim)`. The window ends at each query's causal
+endpoint, or at the step endpoint for noncausal attention; pages entirely
+before the window are skipped.
+
+One task handles a query token and the query heads sharing one KV head, so
+each K/V row is loaded once per group. The group is split only when needed to
+occupy every `ThreadManager` thread, so decode is parallel as well. Keys are
+scored in chunks of 64 with an FP32 online softmax (one rescale per chunk).
+Dot products and value accumulation use AVX2+FMA (F16C for binary16) or
+AArch64 NEON, with a scalar fallback elsewhere, including ARMv7. Small calls
+stay on the calling thread. Exceptions raised by workers, such as a nonfinite
+score, are rethrown on the calling thread.
 
 Producers can also write through `writeKey()` / `writeValue()` segments instead
 of `append()`. A page-crossing write returns multiple segments in logical order.
@@ -73,11 +83,12 @@ CausalLM and SentenceTransformer inference can select this backend at model
 construction time:
 
 ```sh
-NNTR_ENGINE=cpu NNTR_KV_PAGED=1 NNTR_KV_PAGE_TOKENS=16 <application> <arguments>
+NNTR_ENGINE=cpu NNTR_KV_PAGED=1 <application> <arguments>
 ```
 
 `NNTR_KV_PAGED=0` (the default) retains the contiguous backend. Page size defaults
-to 16 tokens and must be a positive integer. The current graph adapter admits
+to the host flash key block (512 tokens on x86, 128 elsewhere);
+`NNTR_KV_PAGE_TOKENS` overrides it with a positive integer. The current graph adapter admits
 batch-1 NCHW CPU inference with external caches. INT8, OHWI, training, the legacy
 KV manager and device backends are rejected rather than falling back to a dense
 cache. Sliding windows use attention masks over paged history, with no ring
@@ -89,12 +100,21 @@ aliased layers; they never contain cache history. Their pointers resolve through
 the checked `KvStepScope` bound around each inference call. MHA dispatches to the
 paged path before constructing any dense cache slices or entering a device arm.
 It applies the layer's RoPE to the new Q/K token block, converts K/V to the cache
-encoding, appends only owner KV, and calls the manager's direct attention reader.
-Aliased layers consume the source's pages without another append. Skipped
-prefill consumers preserve the producer/readiness contract. Attention sinks add
-a denominator-only softmax logit per query head. The new-token transformations
-use FP32 arithmetic before cache narrowing; they can differ numerically from
-legacy native-half transformation paths.
+encoding, and appends only owner KV. Aliased layers consume the source's pages
+without another append. Skipped prefill consumers preserve the
+producer/readiness contract. FP32 activations are rotated in FP32 and then
+narrowed with IEEE binary16 rounding, like the contiguous store.
+`Tensor::copyData` is not used for that conversion: from FP32 to UINT16 it is
+an integer cast on ARM and the fallback backend.
+
+With a binary16 cache and no sink or softcap, attention runs through the host
+flash kernel (`gemm_attention`) over a page table. If `page_tokens` is a
+multiple of its key block, the x86 arm and the tiled ARM arm
+(`NNTR_CPU_KV_TILED`) read pages in place. Other configurations, including
+the default ARM arm whose GEMMs require contiguous rows, gather the history
+into the kernel's pack buffers once per call. FP32 caches, attention sinks
+(a denominator-only logit per query head), softcapping, and
+`NNTR_KV_NO_FLASH=1` use the manager's online-softmax reader instead.
 
 The facade's `getKeyCache()` / `getValueCache()` return identity tensors in paged
 mode. They must not be treated as dense history; its dense read/write view APIs
