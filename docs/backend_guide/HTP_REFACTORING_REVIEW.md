@@ -6,9 +6,9 @@
 HTP 내부의 실행·가중치·캐시·메모리 수명 관리 책임을 분리한다.
 
 검토 대상은 [PR 4428][pr]의 `a3640d20e09a91183fc69cae04165a72e24be213`이다.
-이 문서는 구현 계획이며, 변경 완료나 성능 검증 결과를 뜻하지 않는다. 코드 근거는
-해당 revision의 파일과 symbol로 표시한다. 문서를 담는 브랜치의 코드와 검토 대상
-revision이 다를 수 있으므로 PR의 소스는 고정 revision 링크로 확인한다.
+아래 구조 검토의 코드 근거는 해당 revision의 파일과 symbol로 표시한다.
+2026-11-02 구현 및 검증 결과는 문서 끝의 별도 항목에 기록한다.
+문서를 담는 브랜치와 최초 검토 revision은 다르다.
 
 ## 검토 결론
 
@@ -264,6 +264,83 @@ converter는 checkpoint reader와 affine WH writer를 내부 공통 모듈로 �
 필요한 HTP 기능에 국한되어야 한다. 기존 HTP 전용 레이어를 모두 중립 레이어로
 통합하는 것은 이 단계의 완료 조건이 아니다. 이번 단계는 추가 fork를 만들지 않고
 기존 nntrainer 아키텍처로 수렴할 수 있는 경계를 확보한다.
+
+## 2026-11-02 구현 결과
+
+정리 기준 `3514d324` 이후 단계 1–7의 구현을 적용했다. 수치 kernel, IDL,
+공통 `ComputeOps` virtual 목록과 순서, descriptor builder는 변경하지 않았다.
+
+| 단계 | 반영 내용 |
+| --- | --- |
+| 1 | 실행·수명·결과·성능 계약 명시 |
+| 2 | 항상 참인 `forwardSwitch` 제거, 사용하지 않는 MHA scratch 지연 할당 |
+| 3 | profiling wire enum, affine WH writer와 checkpoint reader, HTP 설정 파싱, u8i4/u8i8 layer timed/untimed dispatch 공유 |
+| 4 | `HtpDecodeRuntime`, `HtpWeightRegistry`, `HtpStaging`, `HtpPrefillReaders`, profiling·worker policy 추출; staging/reader 테스트 직접 연결 |
+| 5 | LFM2의 Gemma 상속 제거, 공통 weight preparation 조합, graph weight를 빌리는 typed binding |
+| 6 | `HtpContext::runDecode`에서 decode 이후 연속된 다중 토큰 입력 처리 |
+| 7 | runtime/diagnostic DSP source manifest 분리, qaic 생성 공통화, 진단 ordinal 호환 stub 유지 |
+
+추가 입력은 기존 resident M=1 연산을 토큰 순서대로 실행한다. DSP KV와
+convolution state를 유지하며 중간 token ID는 소비하고 마지막 logits를 반환한다.
+초기 prefill과 일반 한 토큰 decode는 기존 graph walk를 사용한다. batch=1,
+FP32 token 입력, 단일 vocabulary 출력, 준비된 전체 resident graph, 연속된 위치와
+이미 확보한 KV 용량 안에서 지원한다. host의 stale KV를 재사용하지 않는다.
+독립 prompt의 `run()` reset 의미, 저장·복원 API, sampling 정책은 바꾸지 않았다.
+추가 입력용 HMX batch kernel, KV 용량 자동 확장, speculative decoding은 포함하지 않는다.
+
+`htp_compute_ops.cpp`는 11,660줄에서 9,847줄로 분리되었다. 구현 커밋까지의
+전체 차이는 51개 파일, +4,766/-3,427줄로 **순증 1,339줄**이다. 분리한 header,
+명시적인 상태 검사, 회귀 테스트와 RPC 호환 stub이 포함된 수치이며, 선행 정리
+커밋의 삭제량은 포함하지 않는다.
+
+### 검증 결과와 한계
+
+[기계 판독 결과](../measurements/htp_refactor_20261102/validation.json)에
+binary hash, 실행 조건, token/logits 비교와 메모리 관측값을 기록했다.
+Gemma4 26B A4B TL2/affine WH를 S26 Ultra(v81)에서 측정했으며,
+`NNTR_HTP_PAGE_CACHE=0`, 8 threads, prompt 1,555 tokens, 생성 112 IDs
+(측정 decode 111 tokens) 조건을 유지했다. 최종 검증 쌍은 각 binary 1회 실행이다.
+개발 중 앞선 측정은 별도로 보관했으며 평균에 섞지 않았다.
+
+| 항목 | 변경 전 | 변경 후 |
+| --- | ---: | ---: |
+| prefill | 643.360 tok/s | 635.992 tok/s (-1.15%) |
+| decode | 18.3350 tok/s | 18.5619 tok/s (+1.24%) |
+| CLI peak footprint (RssAnon + accelerator) | 3,675,092 KiB | 3,656,540 KiB |
+| arena allocation | 2,496 MiB | 2,496 MiB |
+| 종료 시 DSP heap | 360,864 KiB | 360,864 KiB |
+
+112개 token ID와 생성 문자열이 완전히 일치했다. 단일 측정으로 통계적 성능
+동등성을 확정하지 않는다. CLI footprint는 `RssAnon + accelerator`의 합을
+sampling한 최대값이다. 독립적인 peak ION/DSP sampling은 수행하지 않았으므로
+위 allocation 및 종료 counter를 peak memory로 해석하지 않는다.
+
+Gemma pack과 별도의 LFM2 synthetic SR15 fixture에서 초기 prefill 8 tokens 이후
+`decode 1 → 추가 3 → decode 1 → 추가 2 → decode 1`을 수행했다. 각 모델의
+6개 지점 전체 FP32 logits가 한 토큰씩 입력한 경로 및 변경 전 binary와 바이트
+단위로 일치했다. LFM fixture는 conv/attention/conv 3 layers, 32 experts,
+top-k 2이며 기존 64-expert predictor preset은 끈 상태다. LFM 실제 배포 pack의
+생성 품질·속도 회귀 검증은 pack 확보 후 남아 있다.
+
+전체 HTP host suite, 수정 후 RPC·registry·staging 검사, ASan/UBSan staging·reader
+수명 검사, WH record 3종 byte fixture, 작은 LFM converter 검사가 통과했다.
+Android engine/app과 v81 production/diagnostic DSP 빌드가 통과했고, model source는
+host HTP on/off와 Android HTP에서 컴파일했다. HTP를 비활성화한 전체 CPU engine
+빌드도 통과했다. ARM/DSP 생성 header가 같으며
+IDL과 146개 공개 RPC symbol도 유지된다. Production skel은 904,592 bytes,
+diagnostic skel은 968,592 bytes다.
+
+### 재현 진입점
+
+- `test/htp/host/run_host_checks.sh`: SDK 없는 host 검사.
+- `test/htp/host/htp_weight_utils_check.py`: NumPy가 설치된 Python에서 WH byte 검사.
+- `test/htp/build.sh`: 기본 diagnostic 빌드. `NNTR_HTP_DIAGNOSTICS=0`은 production
+  빌드이며 독립 probe RPC는 `AEE_EUNSUPPORTED`를 반환한다. Android app 빌드는
+  production을 기본으로 선택하며 `NNTR_HTP_DIAGNOSTICS=1`로 진단 구현을 포함한다.
+- CausalLM `app_build`의 `-Denable-htp-device-check=true`:
+  `htp_continuation_check PACK gemma|lfm rows|chunks OUTPUT_PREFIX`를 빌드한다.
+  각 mode는 새 process로 실행하고 8/9/12/13/15/16 위치의 `.f32` 파일을 비교한다.
+  모델 수치 검증용으로 원래 pack의 init/max sequence를 64/128로 설정한다.
 
 ## 구현 검토 시 참고할 소스
 
