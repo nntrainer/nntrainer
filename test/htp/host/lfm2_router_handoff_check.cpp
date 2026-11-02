@@ -6,7 +6,7 @@
  * @author NNTrainer contributors
  * @bug Hardware cache coherence and model arithmetic need device validation.
  */
-#include "state.h"
+#include "htp_router_handoff.h"
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -99,18 +99,22 @@ template <typename... Args> static int nntr_hvx_attn_f16_decode(Args... args) {
 template <typename... Args> static int nntr_hvx_attn_f16_prefill(Args... args) {
   return direct_rpc<19>(args...);
 }
-struct Backend {
-// clang-format off
-#include "ion_alias_state.inc"
-  // clang-format on
-  htp_router_handoff router_handoff_{};
+struct StagingTransfer {
+  static void copy(void *dst, const void *src, size_t n, int line = 0) {
+    stagedMemcpy(dst, src, n, line);
+  }
+  static bool parallelCopy(void *dst, const void *src, size_t n, int line) {
+    return tryParallelStagedMemcpy(dst, src, n, line);
+  }
+  static int profileLevel() { return HtpProfile::global().level(); }
+  template <typename... Args> static void warn(const char *, Args...) {}
+};
+#include "htp_staging.h"
+struct Backend : nntrainer::HtpStaging<HtpRpcBuffer, StagingTransfer> {
   std::mutex invoke_mutex_;
 // clang-format off
-#include "pool.inc"
-#include "ion_alias.inc"
 #include "sync.inc"
   // clang-format on
-  StagingPool act_pool_, out_pool_, x2_pool_, attn_q_pool_, attn_out_pool_;
   bool have_id_ = false;
   unsigned pending_id_ = 17;
   enum { AEE_SUCCESS = 0 };

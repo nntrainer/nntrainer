@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sanitize', action='store_true')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[3]
-text = (root/'nntrainer/tensor/htp_backend/htp_compute_ops.cpp').read_text()
+text = (root/'nntrainer/tensor/htp_backend/htp_compute_ops.cpp').read_text().replace('readers_.', '').replace('weights_.', '')
 start = text.index('  std::vector<const void *> prefetch_qs4cx_wh_experts_end(')
 end = text.index('\n  void reserve_qs4cx_wh_expert_slots(', start)
 method = text[start:end].replace(' override {', ' {')
