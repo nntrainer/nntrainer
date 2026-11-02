@@ -197,5 +197,3 @@ def write_affine_wh(dst, item, rows):
                 max_fp32_grid_vs_bf16_error=maximum,
                 fp32_grid_vs_bf16_rmse=float(np.sqrt(squared/(k*n))),
                 fp32_grid_vs_bf16_relative_rmse=float(np.sqrt(squared/energy)) if energy else 0.)
-
-
