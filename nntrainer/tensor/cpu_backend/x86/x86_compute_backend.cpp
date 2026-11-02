@@ -14,7 +14,6 @@
 #include <assert.h>
 
 #include <avx2_impl.h>
-#include <avx2_tq2cx_impl.h>
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
@@ -24,6 +23,7 @@
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
 #include <thread_manager.h>
+#include <tq2cx_kernels.h>
 #include <x86_compute_backend.h>
 
 #include <algorithm>

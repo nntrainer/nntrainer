@@ -29,7 +29,8 @@
 #include <cstring>
 #include <immintrin.h>
 
-#include <avx2_tq2cx_impl.h>
+#include <avx2_impl.h>
+#include <tq2cx_kernels.h>
 
 namespace nntrainer::avx2 {
 

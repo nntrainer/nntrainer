@@ -33,7 +33,6 @@
 #include <unistd.h>
 #endif
 #include <expert_lru.h>
-#include <expert_preload.h>
 #include <htp_fixed_opts.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>

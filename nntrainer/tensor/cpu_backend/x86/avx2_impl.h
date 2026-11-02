@@ -21,6 +21,10 @@
 #include <stddef.h>
 #include <tensor_dim.h>
 
+namespace nntrainer {
+struct Tq2cxLayout;
+}
+
 namespace nntrainer::avx2 {
 
 #ifdef ENABLE_FP16
@@ -53,6 +57,15 @@ void vcvt_f32_f16(unsigned int N, const float *input, _FP16 *output);
  */
 bool is_valid(const unsigned int N, const _FP16 *X);
 #endif
+
+/**
+ * @brief AVX2 TQ2CX tile, bit-identical to tq2cx_tile_ref for finite
+ * activations.
+ */
+void tq2cx_tile(const float *A, unsigned int lda, unsigned int m0,
+                unsigned int m1, const void *W, unsigned int N, unsigned int K,
+                unsigned int n0, unsigned int n1, float *C, unsigned int ldc,
+                const Tq2cxLayout &lay);
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h

@@ -45,7 +45,7 @@ typedef struct {
   int accumulate;
 
   /** Non-NULL: the caller already quantized AND AH-tile-packed the
-      activation on the ARM side (nntrainer/tensor/htp_act_quant.h's
+      activation on the ARM side (nntrainer/tensor/htp_backend/htp_act_quant.h's
       htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
       hvx_quant_pack_u8_ah below), m_pad(M)*K bytes where m_pad is the same
       64-row rounding every caller of layer_run already computes. act_f32
