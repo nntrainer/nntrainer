@@ -2344,7 +2344,7 @@ public:
     }
     // Bind MoE handles in graph order, then dispatch M=1 calls through the
     // token entry. Graph errors throw; per-layer fallback would hide them.
-    if (forwardSwitch() && !graph_words_.empty()) {
+    if (!graph_words_.empty()) {
       // a virtual expert (NNTR_MOE_CACHE_EXPERTS: a
       // null scale) is resident only until the ARM's LRU evicts it, and
       // the per-token entry would keep reading its handle after that
@@ -2404,17 +2404,6 @@ public:
     invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight, act,
                    out, M, K, inter, N_out, 0, gelu ? 1u : 0u, pre_gamma,
                    post_gamma, eps, add_x2, add_gamma, add_scale, out_to_host);
-  }
-
-  /** Route decode through the token entry when E2E is configured or
-   *  NNTR_HTP_FORWARD is enabled. E2E is enabled in htp_fixed_opts.h. */
-  static bool forwardSwitch() {
-    static const bool on = [] {
-      const char *env = std::getenv("NNTR_HTP_FORWARD");
-      return (env != nullptr && std::atoi(env) != 0) ||
-             HtpBackend::e2eRequested();
-    }();
-    return on;
   }
 
   /** The graph entries' error, named: 0x8000040E from them means the
@@ -3171,7 +3160,7 @@ public:
                      unsigned in_len, float *out, unsigned out_len,
                      const float *param, unsigned param_len, const float *state,
                      unsigned state_len, float eps) override {
-    if (!forwardSwitch() || graph_words_.empty() || kind >= HTP_OP_KIND_N ||
+    if (graph_words_.empty() || kind >= HTP_OP_KIND_N ||
         (resident_mask_ & HTP_GRAPH_KIND_BIT(kind)) == 0u)
       return 0;
     if (pos != cur_pos_) {
