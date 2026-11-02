@@ -2081,8 +2081,8 @@ bool MHACoreLayer::paged_forwarding(
     throw std::invalid_argument("Paged MHA operand geometry mismatch");
   const bool half_cache = spec.encoding == Encoding::Float16;
   const auto target_type = key_handle.getDataType();
-  if (half_cache != (target_type == DataType::FP16 ||
-                     target_type == DataType::UINT16))
+  if (half_cache !=
+      (target_type == DataType::FP16 || target_type == DataType::UINT16))
     throw std::logic_error("Paged MHA graph identity dtype differs from cache");
 
   // Only the new token block is staged. History stays in pool pages.

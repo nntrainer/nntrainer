@@ -142,8 +142,8 @@ inline void axpy_f16(float *acc, float w, const uint16_t *v, size_t n) {
   const float32x4_t vw = vdupq_n_f32(w);
   for (; i + 8 <= n; i += 8) {
     const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(v + i));
-    vst1q_f32(acc + i, vfmaq_f32(vld1q_f32(acc + i),
-                                 vcvt_f32_f16(vget_low_f16(h)), vw));
+    vst1q_f32(acc + i,
+              vfmaq_f32(vld1q_f32(acc + i), vcvt_f32_f16(vget_low_f16(h)), vw));
     vst1q_f32(acc + i + 4, vfmaq_f32(vld1q_f32(acc + i + 4),
                                      vcvt_f32_f16(vget_high_f16(h)), vw));
   }
@@ -219,9 +219,9 @@ std::vector<float> KvCacheManager::attention(const StepLease &step,
 
   std::vector<float> output(elements);
   const float scale =
-    options.scale ? options.scale
-                  : static_cast<float>(
-                      1.0 / std::sqrt(static_cast<double>(head_dim)));
+    options.scale
+      ? options.scale
+      : static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
   const float softcap = options.logit_softcap;
   const bool has_sinks = !options.sinks.empty();
   const size_t group = options.query_heads / s.num_kv_heads;
