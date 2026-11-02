@@ -342,6 +342,41 @@ diagnostic skel은 968,592 bytes다.
   각 mode는 새 process로 실행하고 8/9/12/13/15/16 위치의 `.f32` 파일을 비교한다.
   모델 수치 검증용으로 원래 pack의 init/max sequence를 64/128로 설정한다.
 
+## 2026-11-02 추가 구조 정리
+
+기준은 `b51223427`이며, 구현·테스트 정리 3개 커밋은 53개 파일에서
++2,903/-3,351줄로 **순감 448줄**이다. 아래 검증 기록 추가분은 제외한다.
+
+- `htp_qkv_layer.cpp`를 core `QKVLayer`에 통합했다. 일반 QKV의 forwarding,
+  export와 weight 순서를 유지하며 기존 HTP type 이름은 얇은 호환 클래스로 남겼다.
+- `MHACoreLayer`가 FP16 cache 구현을 조합하고, DSP handle·보정·resident 상태는
+  `HtpAttentionState`가 소유한다. CPU/OpenCL/CUDA와 다른 계산·cache layout을
+  하나의 수치 구현으로 합친 것은 아니다. 같은 속성 선언 10개만 공유했다.
+- `htp_act_quant`와 `htp_q4_0_convert`의 소스·헤더를 `htp_backend`로 옮겼다.
+  SDK 없는 기본 빌드와 설치 헤더 이름, 수치 본문은 유지했다.
+- AVX2 TQ2CX 선언, expert preload 정책, LFM2 변환 보조 코드, prepared-format
+  endian reader를 기존 파일에 통합해 파일 4개와 62줄을 줄였다. AVX2 커널 CPP는 유지했다.
+- 오래된 Hadamard patch 생성기와 불필요한 실행 wrapper를 삭제했다.
+  실제 회귀 검사는 유지·수정하고 attention/QKV 검사를 Meson에 연결했다.
+
+[검증 기록](../measurements/htp_refactor_20261102/layer-refactor.json):
+CPU FP16 off/on과 Android engine/app 빌드, 관련 gtest 89건, 변환 pack 동일성,
+prepared-format 및 수명 검사가 통과했다. SDK-free host suite의 마지막 include
+오류를 수정한 뒤 영향받은 abs-max/quant 구간을 다시 실행해 통과했다.
+선행 구간과 26개 오류 주입 검사는 통과했으며, SDK native/QEMU NEON 검사는 생략했다.
+
+S26 Ultra에서 같은 DSP·model·prompt로 각 버전을 1회 측정했다.
+
+| 항목 | 변경 전 | 변경 후 |
+| --- | ---: | ---: |
+| prefill | 630.065 tok/s | 634.694 tok/s (+0.73%) |
+| decode | 18.2927 tok/s | 18.3108 tok/s (+0.10%) |
+
+112개 생성 ID·문자열이 같았고 Gemma와 LFM synthetic fixture의 6개 continuation
+지점 전체 logits가 변경 전 및 한 토큰씩 입력한 경로와 바이트 단위로 같았다.
+단일 측정은 통계적 성능 동등성을 확정하지 않으며, 실제 LFM pack의 품질·성능과
+전체 원격 플랫폼 CI 검증은 포함하지 않는다. Speculative decoding은 추가하지 않았다.
+
 ## 구현 검토 시 참고할 소스
 
 | 파일 | 주요 symbol 또는 확인 내용 |
