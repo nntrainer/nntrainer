@@ -13,31 +13,12 @@
  *
  * Compiled only when ENABLE_HEXKL is defined.
  *
- * HtpComputeOps overrides exactly the ops it accelerates and inherits the
- * CPU implementation of everything else from CpuComputeOps.
+ * HtpComputeOps inherits unaccelerated operations from CpuComputeOps. A
+ * layer's engine applies to every tensor, including FP32 router gates that
+ * call sgemm_fp32 without a supports_* guard, so CPU fallback is required.
  *
- * It deliberately does NOT derive from the abstract ComputeOps base the way
- * ClComputeOps does. A layer's engine covers every tensor in it, not just
- * the ones this backend has a kernel for: Lfm2MoELayer's router gate is
- * FP32 by construction (lfm2_moe_layer.cpp keeps gate and expert_bias
- * unquantized), so with engine=htp its dot() reaches sgemm_fp32, which has
- * no supports_* guard and no fallback of its own in FloatTensor::dot. Off
- * the abstract base that threw "ComputeOps::sgemm_fp32 not implemented by
- * this backend" on the first prefill. CpuComputeOps is stateless, so
- * inheriting it costs nothing and makes every unaccelerated op behave the
- * way it does with engine=cpu.
- *
- * gemm_q4_0_accel_fp32 is the first kernel: one FastRPC call per Q4_0 FC
- * dot(), single weight, single activation -- hexkl_mm_u8i4_layer_run with
- * n_handles=1 underneath. It is Tier 1 of docs/htp_attention/
- * 40_moe_ffn_htp_task.md section 3 and benefits every FC layer under
- * engine=htp, not just the LFM2 MoE FFN that motivated this task.
- *
- * gemm_q4_0_batch_fp32 is the same call with n_handles > 1: several
- * weights sharing one activation (LFM2-MoE decode's selected experts'
- * gate_up projections against the single routed token) go out as one
- * FastRPC call so hexkl_mm_u8i4_layer_run can prefetch the next handle's
- * weight while the current one computes.
+ * The Q4_0 entry points register weights and dispatch FastRPC calls. Batch
+ * calls share an activation and overlap weight prefetch with computation.
  */
 
 #ifdef ENABLE_HEXKL
@@ -120,7 +101,7 @@ namespace nntrainer {
 
 namespace {
 
-/** [#225] Q4_0 weights re-quantized by qs4cxFromModelQ4_0 in this process:
+/** Q4_0 weights re-quantized by qs4cxFromModelQ4_0 in this process:
  *  the FC WH banner's requant=, 0 when the sidecar served every FC. */
 std::atomic<unsigned> g_q4_requant{0};
 
@@ -179,11 +160,8 @@ public:
 /**
  * @brief htp_qs4cx_from_q4_0x4 on a model weight in the CPU's own repack.
  *
- * On the device that repack is q4_0x4, the converter's format, and the
- * bytes pass through. The in-process host build (#84) holds the host
- * ISA's repack (x8 on x86), which the converter would read as garbage
- * scales (NaN logits): it is re-laid as q4_0x4 first, so the prefill FC
- * kinds the engine keys route (#222) run on the host as on the device.
+ * ARM model weights already use q4_0x4. Other host builds may use a different
+ * repack (x8 on x86), so convert to q4_0x4 before reading scales and codes.
  */
 void qs4cxFromModelQ4_0(const void *w, uint32_t K, uint32_t N, int8_t *q,
                         float *scale, int32_t *colsum) {
@@ -202,10 +180,8 @@ void qs4cxFromModelQ4_0(const void *w, uint32_t K, uint32_t N, int8_t *q,
 /**
  * @brief Slots mm_u8i4_layer_timed fills.
  *
- * Restated here because the ARM side cannot include the DSP source that
- * declares them (nntr_hvx_mm_u8i4.c). The entry point rejects a stale count
- * with AEE_EBADPARM rather than truncating, so a drift shows up as a failed
- * call, not as wrong numbers.
+ * Keep these ordinals in sync with nntr_hvx_mm_u8i4.c, which ARM cannot
+ * include. The DSP rejects a mismatched count with AEE_EBADPARM.
  */
 enum {
   HTP_T_DSP_TOTAL = 0,
@@ -221,12 +197,8 @@ enum {
 /**
  * @brief Slots mm_u8i4_layer_fused_timed fills.
  *
- * Restated for the same reason as HTP_T_* (the ARM side cannot include the
- * DSP source). NOT the HTP_T_* layout: the fused call runs a second QUANT
- * pass (the SwiGLU output's requant) and a SwiGLU stage the unfused call
- * does not have, so it carries its own slot list and its own Bucket
- * counter -- folding SwiGLU into an existing slot would put its time in a
- * column named after something else.
+ * Keep in sync with the DSP layout. The fused call has a second quantize
+ * pass and a SwiGLU stage, so it uses separate slots and counters.
  */
 enum {
   HTP_FU_T_DSP_TOTAL = 0,
@@ -285,7 +257,7 @@ enum {
   HTP_MOE_T_PUSH,
   HTP_MOE_T_STAGE,
   HTP_MOE_T_ACC_STRIDE,
-  /** [#87] The DMA ring trace's per-call numbers, hexkl_probe.h's
+  /** The DMA ring trace's per-call numbers, hexkl_probe.h's
       HEXKL_PROBE_DMA_* in the same order. Counts unless named _US. */
   HTP_MOE_T_DMA_DESC,
   HTP_MOE_T_DMA_WAITS,
@@ -334,7 +306,7 @@ public:
         .count());
   }
 
-  /** [#85] The per-token entry's own line under the layer rows: how many
+  /** The per-token entry's own line under the layer rows: how many
    *  forward calls, ops per call, the DSP time of the whole call and the
    *  sum of the per-op pcycle brackets (level >= 2, forward_debug). The
    *  MoE op's stages go to the M==1 bucket through addInvokeMoeLayer, so
@@ -346,7 +318,7 @@ public:
     graph_dsp_us_ += dsp_us;
     graph_op_pcyc_ += op_pcyc;
   }
-  /** [#130] One resident op's pcycle bracket, by kind (level >= 2). */
+  /** One resident op's pcycle bracket, by kind (level >= 2). */
   void addGraphOp(unsigned kind, uint64_t pcyc) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (kind < HTP_OP_KIND_N) {
@@ -467,17 +439,9 @@ public:
     }
   }
 
-  /** One call now covers a whole layer, so this bucket's `calls` is 1 where
-   *  the split-call path's was 64. Bucketed under (K, N_out) -- the layer's
-   *  own shape -- which is deliberately NOT either of the two shapes the
-   *  path it replaces reported, so a profile cannot be read as if the two
-   *  were the same row. `rows` stays M, the tokens the layer saw, not the
-   *  expert-slot count, so it means the same thing it always did.
-   *
-   *  The scatter and the FastRPC-buffer staging go into their own field,
-   *  not into acc_us. Folding them in looked tidy and cost a measurement:
-   *  the first run of this call put 104.8 ms in a bucket ACC_READ and the
-   *  scatter shared, and the profile could not say which. */
+  /** Count calls by whole layer shape (K, N_out); rows counts input tokens,
+   *  not expert slots. Keep scatter and RPC staging separate from acc_us
+   *  so profiling distinguishes those costs. */
   /** @param kind 0 the MoE layer; 1 the dense FFN routed through the MoE
    *  layer kernel (doc 51 section 1); 2 the conv block (doc 51 section 2).
    *  Each files in its own row: the dense FFN has the MoE layer's shapes
@@ -494,7 +458,7 @@ public:
     b.dspq_calls += via_dspq ? 1 : 0;
     b.rows += M;
     b.host_us += host_us;
-    // [#88] What this call staged through, for the staging: line. The
+    // What this call staged through, for the staging: line. The
     // class sizes are the max over the bucket's calls (one class per shape
     // in practice), ion is the AND (one heap fallback voids the number).
     b.stage_act_bytes = std::max(b.stage_act_bytes, act_stage.size());
@@ -543,7 +507,7 @@ public:
     }
   }
 
-  /** @brief [#87] Whether this call's per-descriptor trace should be
+  /** @brief Whether this call's per-descriptor trace should be
    *  dumped: the first NNTR_HTP_DMA_TRACE (default 3) timed calls of each
    *  bucket. Returns the 1-based call ordinal to print, or 0. */
   unsigned dmaTraceOrdinal(unsigned K, unsigned N_out, unsigned M,
@@ -557,7 +521,7 @@ public:
   }
 
   /**
-   * @brief [#87] Prints one traced call, one line per push and per wait,
+   * @brief Prints one traced call, one line per push and per wait,
    *        as read back by moe_dma_trace_read. Ticks are 19.2 MHz.
    *
    * At level 3 the trace is the last of the repeats -- a warm call -- which
@@ -698,7 +662,7 @@ private:
     uint64_t dequant_us = 0;
     uint64_t acc_us = 0;
     uint64_t drain_us = 0;
-    /** [#87] The DMA ring trace's per-call numbers, summed over calls
+    /** The DMA ring trace's per-call numbers, summed over calls
         (depth_max is the max). Printed on the DMA ring: line under weight
         DMA:, never folded into the columns above. */
     uint64_t dma_desc = 0;
@@ -712,7 +676,7 @@ private:
     uint64_t dma_first_ready_us = 0;
     uint64_t dma_last_issue_us = 0;
     uint64_t dma_traces = 0; /**< per-descriptor dumps printed so far */
-    /** [#88] MoE layer call only: the ION staging class the call rode
+    /** MoE layer call only: the ION staging class the call rode
         (stage() in HtpComputeOps), whether both landed on ION, and the
         bytes of the non-ION in-args the stub hands the driver (the 48-byte
         primitive block plus the five routing/handle sequences). Printed
@@ -722,7 +686,7 @@ private:
     size_t stage_out_bytes = 0;
     bool stage_ion = true;
     uint64_t in_arg_bytes = 0;
-    /** [#141] Of calls, how many rode the dspqueue; then in_arg_bytes is
+    /** Of calls, how many rode the dspqueue; then in_arg_bytes is
         the request message, not the stub's non-ION in-args. */
     uint64_t dspq_calls = 0;
   };
@@ -884,14 +848,9 @@ private:
                      first_us > 0.0 ? first_kb * 1.024 / first_us : 0.0,
                      dsp_us > 0.0 ? kb * 1.024 / dsp_us : 0.0);
       } else if (level_ >= 2 && b.calls != 0 && b.m1_calls == b.calls) {
-        // [#102] The GEMV path reads the weights straight from the arena and
-        // never waits on the ring, so there is no first-wait rate to print;
-        // this line keeps the row block's line count and says what swiglu
-        // means on this path (lanes busy = swiglu / mm, 6 lanes on v79).
-        // ponytail: no GB/s here -- the bucket knows K, N_out and M but not
-        // inter, so the rate stays hand arithmetic (weight bytes / mm).
-        // Upgrade: count DMA_KB-style bytes on the GEMV path in the kernel
-        // (a skel change), or pass the bytes to addInvokeMoeLayer.
+        // GEMV reads the arena directly, so there is no ring wait rate.
+        // swiglu is summed lane time; swiglu / mm estimates busy lanes.
+        // Weight bandwidth is unavailable because this bucket lacks inter.
         const double mm_us = static_cast<double>(b.mm_us) / b.calls;
         std::fprintf(stderr,
                      "\n[HTP-PROFILE]     weight DMA: n/a (direct arena read "
@@ -902,7 +861,7 @@ private:
                        : 0.0);
       }
       if (level_ >= 2 && b.calls != 0 && b.dma_desc != 0) {
-        // [#87] How the call used the ring. busy is a bracket, not a point
+        // How the call used the ring. busy is a bracket, not a point
         // (hexkl_dma_trace.h), so the engine rate is a range: bytes over
         // busy_hi up to bytes over busy_lo. gu / dn restate the drain
         // columns above so the three wait sites read side by side.
@@ -940,7 +899,7 @@ private:
                      static_cast<double>(b.dsp_us) / n);
       }
       if (level_ >= 2 && b.stage_act_bytes != 0) {
-        // [#88] The MoE call's per-call transport inventory. The driver's
+        // The MoE call's per-call transport inventory. The driver's
         // cache maintenance covers the whole staging buffer, so the class
         // size is the number that explains a transport figure; rpc allocs
         // is process-wide and must not grow with calls; the in-args are the
@@ -952,7 +911,7 @@ private:
                      b.stage_act_bytes, b.stage_out_bytes,
                      b.stage_ion ? 'y' : 'n', HtpRpcBuffer::allocCount());
         if (b.dspq_calls != 0) {
-          // [#141] The request message is copied into the queue's shared
+          // The request message is copied into the queue's shared
           // memory; the act/out classes above are the queue's buffers.
           std::fprintf(stderr, "via=dspq %llu/%llu calls msg=%llu B",
                        (unsigned long long)b.dspq_calls,
@@ -1035,7 +994,7 @@ private:
                    (unsigned long long)prefetch_n_, ms(prefetch_wait_us_),
                    ms(prefetch_wait_us_) / prefetch_n_, ms(prefetch_rpc_us_),
                    ms(prefetch_rpc_us_) / prefetch_n_);
-      // [doc 52 sections 10.18, 10.20] How far ahead the readers were: the
+      // How far ahead the readers were: the
       // experts already read when their layer asked for them, and the
       // cores each side ran on.
       auto cpus = [](uint32_t m) {
@@ -1054,7 +1013,7 @@ private:
                    100.0 * prefetch_done_on_entry_ / prefetch_n_,
                    cpus(prefetch_caller_cpus_).c_str(),
                    cpus(prefetch_reader_cpus_).c_str());
-      // [doc 52 section 10.30] The per-expert read on a reader thread: page
+      // The per-expert read on a reader thread: page
       // cache 1.4 ms with 2 readers and 2.1 with 4 (they share the write
       // bandwidth), flash several times that.
       if (prefetch_reads_ != 0)
@@ -1079,11 +1038,11 @@ private:
   std::map<int, std::array<uint64_t, 3>> staging_by_line_;
   uint64_t convert_us_ = 0;
   uint64_t rpc_us_ = 0;
-  uint64_t graph_calls_ = 0; /**< [#85] addInvokeForward */
+  uint64_t graph_calls_ = 0; /**< addInvokeForward */
   uint64_t graph_ops_ = 0;
   uint64_t graph_dsp_us_ = 0;
   uint64_t graph_op_pcyc_ = 0;
-  uint32_t graph_resident_ = 0; /**< [#130] the description's mask */
+  uint32_t graph_resident_ = 0; /**< the description's mask */
   uint64_t graph_kind_n_[HTP_OP_KIND_N] = {0};
   uint64_t graph_kind_pcyc_[HTP_OP_KIND_N] = {0};
   uint64_t miss_pending_ = 0, miss_read_pending_us_ = 0,
@@ -1099,34 +1058,9 @@ private:
 };
 
 /**
- * @brief memcpy that charges itself to HtpProfile's staging line.
- *
- * Every host_us window in this file starts AFTER the activation is copied
- * into the rpcmem buffer and ends BEFORE the result is copied back out, on
- * purpose: that is what keeps `transport = host - dsp` a FastRPC number
- * rather than a FastRPC-plus-memcpy number. The consequence was that the
- * copies appeared nowhere at all, and on this model's MoE they are not
- * small -- ~450 KB in and ~450 KB out per expert call, 64 calls per layer.
- * Same copy, one accumulator, so the profile's bottom line stops
- * understating what the path costs.
- */
-/**
- * @brief NNTR_L2_CHECK: does the DSP still hand back non-finite values?
- *
- * The two L2 failures in docs/htp_attention/43_moe_ffn_measured_next_
- * levers.md section 7 were diagnosed as hvx_recip_qf32 returning NaN for
- * any gate at or below hvx_swiglu_row_f32's exp clamp. That diagnosis is
- * only worth what a device can confirm, and the model's own output cannot
- * confirm it: wrong text is equally consistent with a dozen other causes.
- * This is the discriminator. If it counts zero and the text is still
- * wrong, the SwiGLU clamp is NOT the (whole) bug and the search moves
- * elsewhere; if it counts non-zero, whatever skel is on the device does
- * not have the fix in it.
- *
- * Cheap where it matters most: a NaN SwiGLU lane lands in its row's
- * requantization scale (hvx_quant_rows_u8_params scans the whole row for
- * min/max), so scanning m_pad floats -- 64 of them -- catches it before
- * the value has spread anywhere. Off unless the env var is set.
+ * @brief NNTR_L2_CHECK enables diagnostics for non-finite DSP values.
+ * A NaN SwiGLU lane propagates to its row's requantization scale, so
+ * checking the padded row scales catches it before later computation.
  */
 inline bool l2CheckEnabled() {
   static const bool on = std::getenv("NNTR_L2_CHECK") != nullptr;
@@ -1141,27 +1075,10 @@ inline bool l2DiffEnabled() {
 }
 
 /**
- * @brief NNTR_L2_SHADOW: run the fused path, then hand the model the
- *        REFERENCE result instead of the fused one.
- *
- * Splits "the fused path computes wrong values" from "the fused path has a
- * side effect" -- the two remaining stories, and no SNR number can tell
- * them apart. Under this flag both paths execute in full, touching every
- * buffer, taking every lock, leaving every piece of state exactly as a
- * normal fused run would; only the floats the layer goes on to use are
- * swapped for the reference's.
- *
- *   text becomes correct -> the values are the fault, and the 67-80 dB
- *                           calls are worth chasing;
- *   text still broken    -> the values are NOT the fault (they match the
- *                           working path at 142 dB on 84% of calls
- *                           anyway), and the bug is a side effect --
- *                           aliasing, a clobbered workspace, retained
- *                           state -- that differencing output values can
- *                           never surface.
- *
- * Implies NNTR_L2_DIFF: the reference it hands over is the one l2Diff
- * already computes.
+ * @brief Run the accelerated path, then replace its output with l2Diff's
+ *        reference when NNTR_L2_SHADOW is set.
+ * Both paths still execute, preserving side effects for diagnosis. This
+ * also enables the reference computation normally gated by NNTR_L2_DIFF.
  */
 inline bool l2ShadowEnabled() {
   static const bool on = std::getenv("NNTR_L2_SHADOW") != nullptr;
@@ -1267,7 +1184,7 @@ constexpr unsigned int kDecodeMaxHeadDim = 128;
 } // namespace
 #endif /* NNTR_HTP_INPROC */
 
-/** [plan 201 S4] set_moe_geglu's flag (HTP_MOE_FLAG_GEGLU) and whether
+/** set_moe_geglu's flag (HTP_MOE_FLAG_GEGLU) and whether
  *  sendMoeOptsOnce has sent the word it goes into. */
 static std::atomic<bool> &moeGeglu() {
   static std::atomic<bool> on{false};
@@ -1280,13 +1197,10 @@ static std::atomic<bool> &moeOptsSent() {
 
 class HtpComputeOps : public CpuComputeOps {
 public:
-  /** [#130] The per-token entry's call count at close, the one line the
-   *  host E2E harness reads (plan 130 section 3.5): tokens are the calls
-   *  that started at the list's first resident op. No RPC here: the
-   *  session may already be closed. The expert prefetch readers (doc 52)
-   *  are stopped first. */
+  /** Stop and join all background workers. Call only between tokens, with
+   *  no inference in flight, before releasing their buffers or session. */
   void stopWorkers() {
-    if (pool_srv_) { // [plan 201 S1] idle between tokens: nothing in flight
+    if (pool_srv_) { // idle between tokens: nothing in flight
       {
         std::lock_guard<std::mutex> lock(pool_srv_->mu);
         pool_srv_->stop = true;
@@ -1346,7 +1260,7 @@ public:
                                    static_cast<double>(fwd_tokens_)
                                : 0.0);
     }
-    if (cpu_fc_skipped_ != 0) // [#132 Part B] the harness's second line
+    if (cpu_fc_skipped_ != 0) // the harness's second line
       std::fprintf(stderr, "[HTP] graph: cpu fc skipped=%llu\n",
                    (unsigned long long)cpu_fc_skipped_);
   }
@@ -1393,47 +1307,17 @@ public:
 
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
-  // ponytail: decode-shaped (M == 1) calls are declined for the MoE FFN,
-  // not accelerated -- reversing 34_fc_measured.md section5.1's own
-  // conclusion for the isolated single-FC comparison it was measured on.
-  // That comparison is still correct in isolation (M=1 padding tax ~40us
-  // against 113us of DSP-only work, so one call is cheap) -- what it does
-  // not cover is 22 MoE layers' worth of M==1 calls stacked into one
-  // decode token. Device-measured on this branch: gate_up decode's DMA is
-  // fully exposed at M=1 (drain 419.2us for a 14.7MB weight group = 35
-  // GB/s, no different from one handle -- cross-matmul prefetch has
-  // nothing to hide behind at this width, unlike the FC benchmark's
-  // narrower weights), so the real per-layer cost is ~2.6ms/token, and
-  // 22 layers' worth is a ~57ms/token transport floor alone (17.5 TPS
-  // ceiling) against a CPU decode baseline measured at ~25.9 TPS on the
-  // same device. HTP cannot win decode until the call is fused across
-  // projections or the DMA-exposure problem above is fixed -- ceiling:
-  // revisit if 41_moe_ffn_e2e_and_perf_task.md's P1.3 (fused gate_up+
-  // swiglu+down, one call per layer) or P2 (u8 in/out, cuts payload 4x)
-  // lands, since either changes this arithmetic. Until then declining M=1
-  // costs nothing on the FC path this predicate was written for (single
-  // dot(), not a MoE stack) and saves the one MoE FFN caller from a
-  // documented loss.
+  // Keep standalone M=1 Q4_0 calls on the CPU; per-FC RPC and weight DMA
+  // overhead accumulates across MoE layers. Resident decode uses the graph.
   bool accelerates_q4_0_at_m1() const override { return false; }
-  // QS4CX weights live on the DSP in their own format and nowhere else
-  // once the FCs are quantized to it offline (doc 57 section 5): decode's
-  // row goes to the same kernel as prefill, 64-row pad tax and all (one
-  // call per FC, a few ms a token), rather than to a CPU kernel on another
-  // packing of the same bytes. [#260] Except under the one-PD token
-  // (NNTR_HTP_E2E=1): a decode row is the token's, and the layers' hooks
-  // that hand it over (qkv's input norm first) sit on their row path.
-  // ponytail: process-wide, so a decode row the token does not take (a
-  // moe_htp_layers subset) runs its QS4CX FCs on the CPU kernel; a
-  // per-row answer needs the hook's verdict before qkv's fused call.
+  // Resident decode must use the layers' row hooks to hand inputs to the
+  // token graph. Without E2E, standalone QS4CX rows use the prefill kernel.
+  // This predicate is process-wide; rows outside the graph use CPU fallback.
   bool accelerates_qs4cx_at_m1() const override {
     return !HtpBackend::e2eRequested();
   }
 
-  /** @brief The handles one conv block is registered as: in_proj's column
-   *  thirds a, b, c (get_or_register_fc's slices at this model's K) and
-   *  out_proj. Declared up here because invokeConvBlock takes it by
-   *  reference -- a parameter type has to be complete where the function
-   *  is declared. */
+  /** @brief Conv block handles: in_proj column thirds a/b/c and out_proj. */
   struct ConvHandles {
     std::vector<uint32_t> h_in; /**< a, b, c */
     uint32_t h_out = 0;
@@ -1448,43 +1332,22 @@ public:
                             unsigned int K) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    // One handle for a weight the layer kernel's VTCM double buffer holds,
-    // several column slices for a wider one (doc 50 section 3): the kernel
-    // takes them as one call either way, prefetching each slice behind the
-    // previous one's matmul, and copyOut puts the slices' output blocks
-    // back into the caller's [M x N].
+    // Slice wide weights to fit the VTCM double buffer; copyOut restores
+    // the slices to the caller's [M x N] layout.
     const FcHandles &fh = get_or_register_fc(matAdata, session, K, N);
 
-    // ponytail: NOT invokeLayerU8In. Quantizing the activation on ARM/NEON
-    // moved that work off HVX (already vectorized, already writes straight
-    // into VTCM for HMX to read -- no DRAM detour ever existed for this
-    // step) onto ARM scalar/NEON code paying its own cost outside every
-    // number this file's profiler measures. Device-measured: DSP time did
-    // drop 19-26%, but wall-clock barely moved because the ARM-side
-    // quantize (300-420us unvectorized, ~200us with a magic-number round)
-    // ate the transport savings it was supposed to create. Reverted to
-    // the HVX-quantizes-into-VTCM path. invokeLayerU8In/htp_act_quant.*
-    // stay in the tree, unused, in case a caller that is not this one
-    // ever legitimately arrives with pre-quantized bytes already in hand.
-    //
-    // In row chunks when the activation would not fit VTCM beside the
-    // slice double buffer (fcMaxRows): the dense FFN's down projection is
-    // K = 7168, 3.1 MiB of u8 rows at M = 444 and 7 at M = 1024. Each
-    // chunk is a whole call, so a chunk costs the FastRPC fixed ~0.4 ms;
-    // one call covers every K = 2048 weight up to 1,920 rows.
+    // Quantize on HVX directly into VTCM. Host quantization adds CPU work
+    // and staging without reducing wall time. fcMaxRows bounds each chunk
+    // so activations fit beside the weight double buffer.
     invokeFc(session, fh, matBdata, matCdata, M, N, K);
   }
 
   /** @brief Rows one layer call may carry at this K.
    *
-   * hexkl_mm_u8i4_layer_run holds the whole activation (m_pad x K u8) in
-   * VTCM next to the widest handle's double buffer -- 2 x 2 MiB once
-   * fcSliceCols has sized the handles -- a result tile and the HMX config.
-   * Budgeted at 7.75 MiB of the 8 MiB VTCM, so 3.75 MiB of rows: 1,920 at
-   * K = 2048, 512 at K = 7168. Whole 64-row blocks, at least one.
-   * ponytail: 7.75 MiB stands in for the session's real vtcm_size less
-   * hexkl_micro_hmx_config_size(), which the host does not see; a kernel
-   * that walked 64-row blocks like hexkl_mm_u8i4_moe.c would need no cap. */
+   * Reserve 7.75 MiB of the 8 MiB VTCM for activations and the widest
+   * handle's double buffer; leave space for the result tile and HMX config.
+   * The host cannot query the session's exact VTCM/config size. Round down
+   * to whole 64-row blocks, with a minimum of one block. */
   static unsigned int fcMaxRows(unsigned int K) {
     constexpr size_t kVtcmBudget = (size_t(8) << 20) - (size_t(256) << 10);
     // the widest handle's double buffer: fcSliceCols's slice, int4
@@ -1495,27 +1358,8 @@ public:
     return rows < 64u ? 64u : rows;
   }
 
-  // Several Q4_0 weights that share ONE activation -- LFM2-MoE decode's
-  // top-K selected experts' gate_up projections, all against the single
-  // token just routed -- go out as ONE FastRPC call across their handles
-  // instead of one call per weight. hexkl_mm_u8i4_layer_run's own doc
-  // (test/htp/nntr_hvx.idl mm_u8i4_layer) says what that call buys beyond
-  // saving round trips: it double-buffers each handle's weight into VTCM
-  // with the next handle prefetched while the current one computes, which
-  // only happens with more than one handle in the call -- measured 1.7-2x
-  // over one-call-per-weight (docs/htp_attention/34_fc_measured.md
-  // section4 items C and E). Nothing here changes CPU: FloatTensor::dot's
-  // vector overload falls back to the same per-weight loop this replaces
-  // when supports_gemm_q4_0_batch_fp32() is false, so this is additive.
-  //
-  // NOTE: this override was written and syntax-checked in an earlier
-  // session but never actually landed in a commit -- Lfm2MoELayer's
-  // caller-side grouping shipped without it, so every "grouped" decode
-  // call silently fell through Tensor::dot's un-accelerated per-weight
-  // loop (ComputeOps::gemm_q4_0_fp32, plain CPU dequant+GEMM) instead of
-  // reaching HTP at all. Confirmed by NNTR_HTP_PROFILE=2 output showing
-  // zero calls of any shape for gate_up at M==1 after the caller-side
-  // change landed. This commit is that missing override.
+  // Batch weights sharing an activation in one RPC. The kernel prefetches
+  // each handle's weight while computing the previous handle.
   bool supports_gemm_q4_0_batch_fp32() const override { return true; }
 
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
@@ -1914,7 +1758,7 @@ public:
   // at a 262144 vocabulary: past the DSP heap (it refused at ~100 MiB), so
   // the arena or nothing. A placement or attach refused leaves the
   // lm_head on the CPU for the run, said once on stderr.
-  // ponytail: it is placed after every other weight, in the address space
+  // it is placed after every other weight, in the address space
   // they leave; a second session's arena (the decode graph's S2) is the
   // upgrade if the first one has no room on a device.
   bool lm_head_q4_0_fp32(const void *w, unsigned int K, unsigned int N,
@@ -2008,7 +1852,7 @@ public:
 
   /** @brief The cache file's header (set_lm_head_wh_cache): the slicing
    *  and a hash of the N scales, then per slice WH bytes | f32 scales |
-   *  i32 column sums, slices in column order. ponytail: codes requantized
+   *  i32 column sums, slices in column order. codes requantized
    *  to the same scales pass the match; delete the file by hand then. */
   struct LmHeadWhHeader {
     char magic[8];
@@ -2449,7 +2293,7 @@ public:
   // leaving the DSP. The caller (Lfm2MoELayer) gates on M > 1 itself --
   // decode's single token cannot amortize the fused call's 64-row pad
   // tax, the same reasoning as accelerates_q4_0_at_m1() being false.
-  // [doc 46] The whole layer in one call. supports_* stays behind the
+  // The whole layer in one call. supports_* stays behind the
   // caller's own M > 1 gate for the same reason the fused one does: a
   // single decode token cannot amortize the 64-row pad tax.
   bool supports_gemm_qs4cx_moe_layer_fp32() const override { return true; }
@@ -2498,19 +2342,15 @@ public:
                                         inter, N_out);
       }
     }
-    // [#85] With NNTR_HTP_FORWARD=1 and a description from the model, every
-    // MoE call binds its handles to the next MoE op in list order (the
-    // first pass runs the layers in order), and once all are bound the
-    // M == 1 calls go through the per-token entry instead. Errors throw
-    // (contract section 2): a fallback to mm_u8i4_moe_layer would report
-    // per-layer numbers as the graph's.
+    // Bind MoE handles in graph order, then dispatch M=1 calls through the
+    // token entry. Graph errors throw; per-layer fallback would hide them.
     if (forwardSwitch() && !graph_words_.empty()) {
-      // [plan 201 section 2.3] a virtual expert (NNTR_MOE_CACHE_EXPERTS: a
+      // a virtual expert (NNTR_MOE_CACHE_EXPERTS: a
       // null scale) is resident only until the ARM's LRU evicts it, and
       // the per-token entry would keep reading its handle after that
       if (std::find(gate_up_scale.begin(), gate_up_scale.end(), nullptr) !=
           gate_up_scale.end()) {
-        // [plan 201 S1] with NNTR_HTP_E2E=1 the token driver serves the
+        // with E2E configured the token driver serves the
         // misses (poolServe) and the tables follow the pool at the next
         // token (poolSync); these calls (the prefill's) stay per layer
         if (!e2e_)
@@ -2525,7 +2365,6 @@ public:
             moe_bound_ = moe_ops_.size();
           pool_dirty_ = true;
         }
-        // [#260] with #4415's epilogue (GeGLU, the folded norms), as below
         invokeMoeLayer(session, h_gu, h_dn, row_index, row_count, row_weight,
                        act, out, M, K, inter, N_out, 0, gelu ? 1u : 0u,
                        pre_gamma, post_gamma, eps, add_x2, add_gamma, add_scale,
@@ -2533,7 +2372,7 @@ public:
         return;
       }
       const uint32_t op = bindMoeOp(h_gu, h_dn, K, inter, N_out);
-      // [#132] A sole MOE stretch runs here; with ADD resident the stretch
+      // A sole MOE stretch runs here; with ADD resident the stretch
       // is [MOE ADD RMSNORM] and the next layer's norm hook runs it, so a
       // row the hooks do not drive (row_bound_ false: a one-token prompt
       // binding as it goes) keeps the per-layer path.
@@ -2567,15 +2406,11 @@ public:
                    post_gamma, eps, add_x2, add_gamma, add_scale, out_to_host);
   }
 
-  /** [#85] NNTR_HTP_FORWARD=1 routes decode's MoE calls through the
-   *  per-token entry. Off by default: with only MOE resident it is 22
-   *  calls per token either way (plan 85 section 0), so the default path
-   *  stays byte-for-byte today's. */
+  /** Route decode through the token entry when E2E is configured or
+   *  NNTR_HTP_FORWARD is enabled. E2E is enabled in htp_fixed_opts.h. */
   static bool forwardSwitch() {
     static const bool on = [] {
       const char *env = std::getenv("NNTR_HTP_FORWARD");
-      // [#132 Part B E3] NNTR_HTP_E2E=1 is the per-token entry with every
-      // kind resident
       return (env != nullptr && std::atoi(env) != 0) ||
              HtpBackend::e2eRequested();
     }();
@@ -2595,10 +2430,8 @@ public:
               : "");
   }
 
-  /** [#130] The kinds this ARM side can drive: the MoE call and the
-   *  layer hooks (htp_decode_hook.h), with #132's residual add and router.
-   *  The skel's own table is checked at graph_init (AEE_ECLASSNOTSUPPORT
-   *  names a kind it lacks). */
+  /** Kinds driven by MoE calls and layer hooks. graph_init checks the DSP
+   *  table too; AEE_ECLASSNOTSUPPORT identifies an unsupported kind. */
   static constexpr uint32_t kArmKinds =
     HTP_GRAPH_KIND_BIT(HTP_OP_MOE) | HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) |
     HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |
@@ -2606,8 +2439,7 @@ public:
     HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
     HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KINDS_Q4M1;
 
-  /** [#132 Part B] Rows per lm_head slice (plan 132 section 3.2: 8 slices
-   *  of 16384 rows at LFM2.5, 18 MiB each). */
+  /** Rows per lm_head slice. */
   static constexpr uint32_t kLmHeadSliceRows = 16384u;
 
   bool set_decode_graph_desc(const std::vector<uint32_t> &words) override {
@@ -2639,7 +2471,7 @@ public:
                                   "resident without ATTN_M1 (no CPU layer "
                                   "consumes their output)");
     }
-    // [#132] A resident ROUTER_TOPK needs ADD resident: then the ffn norm
+    // A resident ROUTER_TOPK needs ADD resident: then the ffn norm
     // before it and the ADD after its MOE are resident too, so the MoE
     // layer's one hook is always mid-stretch and the layer skips its
     // router, top-k and experts. Without ADD the MoE call would start the
@@ -2649,7 +2481,7 @@ public:
       throw std::invalid_argument("set_decode_graph_desc: ROUTER_TOPK "
                                   "resident without ADD");
     }
-    // [#132 Part B, E1] No CPU layer hooks an FC, the dense FFN or a
+    // No CPU layer hooks an FC, the dense FFN or a
     // projection, so a Q4M1 kind is resident only when every kind the
     // list has is: the list is then one stretch per token, op 0's norm
     // hook keeps the row and the lm_head hook runs it (one call per
@@ -2660,22 +2492,18 @@ public:
         "set_decode_graph_desc: FC / DENSE_FFN / LM_HEAD resident without "
         "every other kind (one session runs them only as the whole token)");
     }
-    // [#132 Part B] NNTR_HTP_FC_FEED=l2 reads the Q4M1 kinds' weights
-    // through the L2 scratch even where VTCM would fit (the second
-    // session's feed, #178); unset or vtcm: VTCM when it fits
+    // NNTR_HTP_FC_FEED=l2 forces L2 scratch; vtcm uses VTCM where it fits.
     const char *feed_env = std::getenv("NNTR_HTP_FC_FEED");
     const std::string feed_s = feed_env ? feed_env : "vtcm";
     if (feed_s != "vtcm" && feed_s != "l2") {
       throw std::invalid_argument("set_decode_graph_desc: NNTR_HTP_FC_FEED=" +
                                   feed_s + " (want vtcm or l2)");
     }
-    // [#132 Part B E3, #211] NNTR_HTP_E2E=1: one PD, every kind resident,
-    // the FC set on its own arena chunks and the expert pool beside it.
+    // E2E keeps every kind resident in one PD, with separate FC arena
+    // chunks beside the expert pool.
     const bool e2e = HtpBackend::e2eRequested();
     if (e2e) {
-      // [#211] a guard, not a switch: the runners pass _PDS=1, and a _PDS=2
-      // that ran one PD would label a row with a variant that is gone.
-      // ponytail: drop it with the next IDL change (LEDGER 3a)
+      // Reject obsolete multi-PD settings instead of silently ignoring them.
       const char *pds = std::getenv("NNTR_HTP_E2E_PDS");
       if (pds != nullptr && std::strcmp(pds, "1") != 0)
         throw std::invalid_argument(
@@ -2688,8 +2516,7 @@ public:
           "list resident");
       }
       if (graph_inited_) {
-        // ponytail: one description per process on the E2E path (the
-        // model sets it once); a reload would re-map the FC arena
+        // Replacing a live E2E graph would remap its FC arena.
         throw std::runtime_error("set_decode_graph_desc: a second "
                                  "description with NNTR_HTP_E2E=1");
       }
@@ -2710,14 +2537,14 @@ public:
     e2e_ = e2e;
     if (e2e && !e2e_st_) {
       e2e_st_ = std::make_shared<E2eState>();
-      // [plan 201 S1] every kind, the FC set on its own arena chunks and
+      // every kind, the FC set on its own arena chunks and
       // the expert pool all in S1, one token packet (the FC feed takes
       // S1's VTCM in turn with the MoE)
       e2e_st_->h1 = session;
       std::shared_ptr<E2eState> st = e2e_st_;
       HtpBackend::global().atClose([st] { e2eTeardown(*st); });
     }
-    // [#132 Part B E5f] NNTR_HTP_FC_LANES=<small>,<large>: the L2 feed's
+    // NNTR_HTP_FC_LANES=<small>,<large>: the L2 feed's
     // lanes for K <= 2048 / larger K (1..8 each; unset: the DSP's 6 / 3)
     uint32_t fc_lanes = 0;
     if (const char *l = std::getenv("NNTR_HTP_FC_LANES")) {
@@ -2728,10 +2555,8 @@ public:
                                     " (want <small>,<large>, 1..8 each)");
       fc_lanes = (a << 8) | (b << 12);
     }
-    // [#194, htp_moe_ppl] NNTR_HTP_PPL_LEVERS=<mask>: the non-bit-exact
-    // levers of plan 194 section 3.1, bit n = lever Ln (0x2: L1, the native
-    // FC / DENSE_FFN / LM_HEAD kernels). Unset or 0 = the CPU-exact kernels
-    // (E0, bit-identical to htp_moe); a bit no lever owns yet is refused.
+    // Only bit 1 (native FC / DENSE_FFN / LM_HEAD) is supported. Unset or
+    // zero selects CPU-exact kernels; reject unknown bits.
     uint32_t levers = 0;
     if (const char *l = std::getenv("NNTR_HTP_PPL_LEVERS")) {
       char *end = nullptr;
@@ -2787,7 +2612,7 @@ public:
           : i + 1;
     }
     kv_len_.assign(n_attn, 0);
-    // [plan 201 S4] the attention shapes, in list order (one cache each,
+    // the attention shapes, in list order (one cache each,
     // at most two: Gemma 4's sliding and full layers)
     attn_op_.assign(n_attn, 0);
     attn_cache_.assign(n_attn, 0);
@@ -2838,7 +2663,7 @@ public:
     return true;
   }
 
-  /** [#132 Part B] The model's Q4_0 weights of the decode list's FC,
+  /** The model's Q4_0 weights of the decode list's FC,
    *  DENSE_FFN and LM_HEAD ops, in list order (lfm2_moe_causallm.cpp at
    *  load): kept as pointers here, converted and registered at graph init
    *  (bindQ4m1). False when no such kind is resident. */
@@ -2873,7 +2698,7 @@ public:
     return true;
   }
 
-  /** [#260] compute_ops.h: a QS4CX FC / DENSE_FFN weight of the decode
+  /** compute_ops.h: a QS4CX FC / DENSE_FFN weight of the decode
    *  list, bound (bindQ4m1) to the WH handles get_or_register_fc /
    *  get_or_register_dense make from its codes and scales -- the ones the
    *  fused prefill calls use. */
@@ -2890,7 +2715,7 @@ public:
     return true;
   }
 
-  /** [plan 201 S4] compute_ops.h: one f32 parameter of op @a op handed at
+  /** compute_ops.h: one f32 parameter of op @a op handed at
    *  load by the weight's name. The length is checked against the record
    *  now (hexkl_graph.c's graph_param_len), the pointer kept and bound
    *  after graph_init; the op's hook then binds nothing. */
@@ -2944,7 +2769,7 @@ public:
     return true;
   }
 
-  /** [plan 201 S4] compute_ops.h: the model's gated activation; read once
+  /** compute_ops.h: the model's gated activation; read once
    *  by sendMoeOptsOnce, so it is set before the first MoE call. */
   void set_moe_geglu(bool on) override {
     if (moeOptsSent().load() && moeGeglu().load() != on)
@@ -2965,7 +2790,7 @@ public:
     moe_hadamard_scope_ = scope;
   }
 
-  /** [#132 Part B] One weight's rows [r0, r0 + rows) as a Q4M1 handle:
+  /** One weight's rows [r0, r0 + rows) as a Q4M1 handle:
    *  canonical block_q4_0 (unpacked from the CPU's repack unless the
    *  model says it is canonical already, as the tied lm_head is), the
    *  Q4M1 reorder, q4m1_register. The same nibbles and scales the CPU
@@ -2977,7 +2802,7 @@ public:
     q4m1_from_q4_0(canonical + r0 * row_bytes, K, rows, q4m1.data());
     uint32_t h = 0;
     if (e2e_) {
-      // [#132 Part B E3] into the FC set's own arena chunks (place /
+      // into the FC set's own arena chunks (place /
       // tryChunk / arena_attach), written before the attach; the heap
       // holds no weight (the #178 heap rule)
       E2eState &e = *e2e_st_;
@@ -2985,7 +2810,7 @@ public:
       uint32_t chunk = 0, off = 0;
       if (!placeOn(e.h1, CDSP_DOMAIN_ID, e.arena, e.arena_cap, bytes,
                    q4m1_left_, &chunk, &off)) {
-        // [#211] on the 8B model every expert resident (3696 MiB) leaves
+        // on the 8B model every expert resident (3696 MiB) leaves
         // no room for the FC set (448 MiB) under the PD's 3840
         size_t mapped = arenaBytes();
         for (const ArenaChunk &c : e.arena)
@@ -3021,21 +2846,21 @@ public:
     return h;
   }
 
-  /** [#132 Part B] Frees every Q4M1 handle registered for the graph (after
+  /** Frees every Q4M1 handle registered for the graph (after
    *  graph_release, or when bindQ4m1 / graph_init failed half-way). */
   void releaseQ4m1(remote_handle64 session) {
     shared_lm_heads_.clear();
     for (uint32_t h : q4m1_handles_)
       nntr_hvx_q4m1_release(session, h);
     q4m1_handles_.clear();
-    if (e2e_st_) { // [#132 Part B E3] the E2E slots (the arena stays mapped)
+    if (e2e_st_) { // the E2E slots (the arena stays mapped)
       for (uint32_t h : e2e_st_->q4m1)
         nntr_hvx_q4m1_release(e2e_st_->h1, h);
       e2e_st_->q4m1.clear();
     }
   }
 
-  /** [#132 Part B] Binds q4_pending_ to the resident Q4M1 ops in list
+  /** Binds q4_pending_ to the resident Q4M1 ops in list
    *  order before graph_init checks them: an FC takes weights of its K
    *  until their widths make its N (q | k | v are three), a DENSE_FFN up,
    *  gate and down, the LM_HEAD the tied table in kLmHeadSliceRows slices.
@@ -3043,10 +2868,10 @@ public:
   void bindQ4m1(remote_handle64 session) {
     size_t next = 0;
     std::vector<uint8_t> canon;
-    // [#225] With the FC WH sidecar open, the FC and DENSE_FFN ops bind the
+    // With the FC WH sidecar open, the FC and DENSE_FFN ops bind the
     // handles the prefill registered from it (HTP_GRAPH_FEED_WH): one copy
     // of those weights for both. The tied lm_head stays Q4M1.
-    // [#234 P4] Lever L1 (HTP_GRAPH_FEED_NATIVE, NNTR_HTP_PPL_LEVERS=2)
+    // Lever L1 (HTP_GRAPH_FEED_NATIVE, NNTR_HTP_PPL_LEVERS=2)
     // asks for the native Q4 kernels on every Q4M1 kind: the sidecar's
     // handles then stay out of the decode list.
     bool native = false;
@@ -3057,12 +2882,12 @@ public:
       return fcwh_fd_ >= 0;
     }();
     uint32_t wh_handles = 0;
-    q4m1_left_ = 0; // [#132 Part B E3] what the FC arena chunks are sized for
+    q4m1_left_ = 0; // what the FC arena chunks are sized for
     if (!wh) {
       for (const Q4Pending &p : q4_pending_)
-        if (p.scale == nullptr) // [#260] a QS4CX weight binds WH handles
+        if (p.scale == nullptr) // a QS4CX weight binds WH handles
           q4m1_left_ += q4m1_bytes(p.K, p.N) + 4096u;
-    } else { // [#225] the LM_HEAD's slices only (a QS4CX head binds WH)
+    } else { // the LM_HEAD's slices only (a QS4CX head binds WH)
       for (uint32_t i = 0; i < static_cast<uint32_t>(stretch_start_.size());
            ++i) {
         const htp_graph_op *op = graphOp(i);
@@ -3097,7 +2922,7 @@ public:
     };
     auto take = [&](uint32_t op, uint32_t K, uint32_t N) -> const uint8_t * {
       const Q4Pending &p = pending(op, K, N);
-      if (p.scale != nullptr) // [#260] no Q4M1 from QS4CX (contract s. 2)
+      if (p.scale != nullptr) // no Q4M1 from QS4CX (contract s. 2)
         throw std::runtime_error("set_decode_graph_desc: op " +
                                  std::to_string(op) +
                                  " takes Q4M1, its weight is QS4CX");
@@ -3109,7 +2934,7 @@ public:
       nntrainer::unpack_q4_0(p.data, canon.data(), bytes, p.N, p.K);
       return canon.data();
     };
-    // [#225] the prefill's handles of a pending weight (registered at the
+    // the prefill's handles of a pending weight (registered at the
     // load's warm-ups, or here if its layer was not keyed)
     auto key = [](const Q4Pending &p) { return const_cast<void *>(p.data); };
     const uint32_t n_ops = static_cast<uint32_t>(stretch_start_.size());
@@ -3118,9 +2943,9 @@ public:
       if (!op->resident ||
           (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u)
         continue;
-      op->feed &= ~HTP_GRAPH_FEED_WH; // [#234 P4] a re-bind sets it anew
+      op->feed &= ~HTP_GRAPH_FEED_WH; // a re-bind sets it anew
       uint32_t parts = 0;
-      // [#260] a QS4CX weight takes the WH path with or without a sidecar;
+      // a QS4CX weight takes the WH path with or without a sidecar;
       // lever L1 asks for the native Q4 kernels, which QS4CX cannot feed
       const bool qs4cx_op =
         next < q4_pending_.size() && q4_pending_[next].scale != nullptr;
@@ -3197,7 +3022,7 @@ public:
         // A registered handle must fit VTCM (hexkl_weight_u8i4_check: its
         // bake stages there), so a slice is at most 6 MiB of WH bytes --
         // 4448 columns at K = 2816, 59 slices -- and HTP_GRAPH_MAX_PARTS
-        // bounds the count. ponytail: 6 MiB assumes the 8 MiB VTCM of v79 /
+        // bounds the count. 6 MiB assumes the 8 MiB VTCM of v79 /
         // v81; a smaller VTCM wants the session's size here.
         const uint32_t fit = std::max(
           32u,
@@ -3294,12 +3119,12 @@ public:
                  q4_pending_.size(),
                  e2e_ ? e2e_st_->q4m1.size() : q4m1_handles_.size(),
                  q4m1FeedName());
-    // [#225] the FC / DENSE_FFN ops on the sidecar's WH handles (absent:
+    // the FC / DENSE_FFN ops on the sidecar's WH handles (absent:
     // the line as before)
     if (wh_handles != 0u)
       std::fprintf(stderr, " wh_handles=%u", wh_handles);
     std::fputc('\n', stderr);
-    // [#4416 mem] the QS4CX FC / dense copies are read by nothing after
+    // the QS4CX FC / dense copies are read by nothing after
     // this: the prefill runs them on the WH handles just registered and
     // the token on its arena. Handing them back here, not at the first
     // decode token, frees 0.8 GiB for the prefill (S26 Ultra p2048:
@@ -3310,14 +3135,14 @@ public:
       dropHostFc(/*qs4cx_only=*/true);
   }
 
-  /** [#130] The op record of @a op in the description (the words are
+  /** The op record of @a op in the description (the words are
    *  the model's; the resident bits and shapes do not change after
    *  set_decode_graph_desc). */
   const htp_graph_op *graphOp(uint32_t op) const {
     return htp_graph_op_cat(graph_words_.data(), op);
   }
 
-  /** [#130] graph_set_param once per (op, which); throws on any error
+  /** graph_set_param once per (op, which); throws on any error
    *  (contract section 2: no silent fallback). */
   void setParam(remote_handle64 session, uint32_t op, uint32_t which,
                 const float *data, unsigned n, unsigned want,
@@ -3337,7 +3162,7 @@ public:
     }
   }
 
-  /** [#130] The per-token hook (compute_ops.h): the counter of its kind
+  /** The per-token hook (compute_ops.h): the counter of its kind
    *  names the op, the stretch tables say what to run. Hooks fire only at
    *  one row, from the model's thread, in list order within a token; the
    *  counters reset when pos changes, so every token re-synchronises and
@@ -3429,7 +3254,7 @@ public:
       break;
     case HTP_OP_ATTN_M1: {
       const uint32_t ord = attn_ordinal_[op];
-      // [plan 201 S4] the layer's RoPE table goes to its own ROPE op,
+      // the layer's RoPE table goes to its own ROPE op,
       // max_seq x head_dim: Gemma 4's layers differ in theta and rotary
       // variant even at one head_dim; the DSP shares equal tables, so
       // LFM2's layers still hold one
@@ -3444,7 +3269,7 @@ public:
           --kind_next_[kind]; // the layer builds its table and calls again
           return 3;
         }
-        // [#4416 D6] a table equal to one a bound ROPE op of this head_dim
+        // a table equal to one a bound ROPE op of this head_dim
         // holds is shared by name: the bytes cross once a distinct table
         // (S26 Ultra, p1024: 30 binds were 439 ms of the first token)
         const uint32_t want = graph_words_[6] * rec->head_dim;
@@ -3485,10 +3310,10 @@ public:
       break;
     }
     case HTP_OP_ADD:
-    case HTP_OP_LM_HEAD: // [#132 Part B] weights bound at init
+    case HTP_OP_LM_HEAD: // weights bound at init
       break;
     case HTP_OP_ROUTER_TOPK:
-      // [#132] the gate weight [K][E] and the expert bias, once
+      // the gate weight [K][E] and the expert bias, once
       if (!param_bound_[op]) {
         setParam(session, op, HTP_GRAPH_PARAM_ROUTER_W, param, param_len,
                  rec->K * rec->n_experts, "router weight");
@@ -3505,7 +3330,7 @@ public:
     return 1;
   }
 
-  /** [#132] Every hook's one dispatch over its op's stretch [s, e) (plan
+  /** Every hook's one dispatch over its op's stretch [s, e) (plan
    *  132 section 3.4): the first op keeps its input row (and, for a MOE
    *  op, the ARM's routing) pending and returns; a mid op checks that the
    *  row is there and returns; the last op -- or a sole one -- runs the
@@ -3578,7 +3403,7 @@ public:
     pending_rw_.clear();
   }
 
-  /** [#132 Part B] compute_ops.h: with a Q4M1 kind resident every kind
+  /** compute_ops.h: with a Q4M1 kind resident every kind
    *  is (set_decode_graph_desc's rule), so the token is one stretch; once
    *  op 0's hook at @a pos has kept the row, the DSP owns the whole row
    *  and the CPU's FC outputs until the lm_head hook are never read. */
@@ -3614,7 +3439,7 @@ public:
     return seedRows(n_rows, k_rows, v_rows, nullptr, nullptr);
   }
 
-  /** [#4416 D6] the rows as fp16 bits, widened on the DSP (S26 Ultra:
+  /** the rows as fp16 bits, widened on the DSP (S26 Ultra:
    *  the CPU's fp16 -> f32 pass was 145 ms of the p1024 first token, 288
    *  at p2048, and the staged bytes halve) */
   bool decode_kv_seed_f16(unsigned n_rows, const uint16_t *k_rows,
@@ -3622,7 +3447,7 @@ public:
     return seedRows(n_rows, nullptr, nullptr, k_rows, v_rows);
   }
 
-  /** [#4428 window] the dropped rows' |max| ahead of the layer's seed */
+  /** the dropped rows' |max| ahead of the layer's seed */
   bool decode_kv_amax_floor(const float *k_amax, const float *v_amax,
                             unsigned n) override {
     if (seed_ordinal_ == HTP_GRAPH_NO_OP) {
@@ -3663,26 +3488,20 @@ public:
     }
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
-    // [plan 201 S4] the layer's own shape and cache
+    // the layer's own shape and cache
     const htp_graph_op *rec = graphOp(attn_op_[seed_ordinal_]);
     const int n = static_cast<int>(n_rows * rec->n_kv * rec->head_dim);
     const uint32_t layer =
       attn_cache_ord_[seed_ordinal_] |
       (attn_cache_[seed_ordinal_] ? HTP_ATTN_KV_CACHE_B : 0u);
-    const uint64_t t_seed = HtpProfile::nowUs(); // [#282 F]
-    // Through two staging buffers: as heap arguments the driver copied the
-    // rows into a buffer of its own every call (S26 Ultra, 2048 rows, 30
-    // layers: 1,055-1,097 ms of seed RPCs as heap arguments, 973 staged).
-    // ponytail: one more copy of the rows (2 ms a layer); the upgrade is
-    // the caller converting its cache straight into these buffers.
+    const uint64_t t_seed = HtpProfile::nowUs();
+    // Stage FP32 rows in ION to avoid per-call driver copies. FP16 cache
+    // rows already reside in rpcmem and can be passed directly.
     int err;
     {
       std::lock_guard<std::mutex> lock(invoke_mutex_);
       if (k16) {
-        // [#4416 mem] the fp16 rows are the layer's CPU cache, an rpcmem
-        // block (alloc_shared): FastRPC maps it by its fd, so they go as
-        // they are -- no staging buffer, no copy (a heap source would be
-        // copied by the driver, as the f32 rows below were before staging)
+        // alloc_shared() gives FastRPC a persistent fd-backed mapping.
         err = nntr_hvx_attn_m1_kv_append_f16(session, layer, 0u, n_rows, k16, n,
                                              v16, n);
       } else {
@@ -3715,7 +3534,7 @@ public:
     return true;
   }
 
-  /** [#289] NNTR_HTP_KV_SEED_Q=1: attn_m1 is registered lazily and each
+  /** NNTR_HTP_KV_SEED_Q=1: attn_m1 is registered lazily and each
    *  layer is seeded from its quantized prefill cache on the DSP. */
   static bool kvSeedQ() {
     static const bool on = [] {
@@ -3791,7 +3610,7 @@ public:
         std::to_string(h_gu.size()) + "/" + std::to_string(K) + "/" +
         std::to_string(inter) + "/" + std::to_string(N_out));
     }
-    // [plan 201 S1] the handles go to the op's EXPERTS table, bound after
+    // the handles go to the op's EXPERTS table, bound after
     // graph_init (ensureGraphInit), not into the record
     std::vector<float> &t = moe_tables_[moe_bound_];
     t.resize(2 * h_gu.size());
@@ -3803,7 +3622,7 @@ public:
     return idx;
   }
 
-  /** [plan 201 S1] compute_ops.h: a MoE layer's experts, layer order. */
+  /** compute_ops.h: a MoE layer's experts, layer order. */
   void set_decode_moe_experts(const std::vector<ExpertFileDesc> &all,
                               const ExpertPoolFn &pool) override {
     std::lock_guard<std::mutex> lock(graph_mutex_);
@@ -3818,7 +3637,7 @@ public:
     pool_grow_ = grow;
   }
 
-  /** [#4416 mem] NNTR_MOE_CACHE_GROW=<n>: once the first token is done
+  /** NNTR_MOE_CACHE_GROW=<n>: once the first token is done
    *  (the prefill's staging released, its quantized KV caches freed), the
    *  pool takes n more experts a layer; the slots are placed as the
    *  misses fill them (place), in the DSP address space those buffers
@@ -3873,7 +3692,7 @@ public:
                  per_layer);
   }
 
-  /** [plan 201 S1] Re-sends S1's EXPERTS tables when a prefill touched the
+  /** Re-sends S1's EXPERTS tables when a prefill touched the
    *  pool since the last token: each expert's pair as the ARM files it
    *  (handle_cache_), HTP_GRAPH_NO_HANDLE for one the pool does not hold. */
   /** Release prefill/seed temporaries between completed synchronous calls.
@@ -3949,7 +3768,7 @@ public:
   void poolSync() {
     if (!pool_dirty_)
       return;
-    const uint64_t t_ps = HtpProfile::nowUs(); // [#282 F]
+    const uint64_t t_ps = HtpProfile::nowUs();
     switchTl2Phase(true);
     initPoolPrefetch();
     pinExperts();
@@ -3963,10 +3782,8 @@ public:
         "has " +
         std::to_string(moe_ops_.size()));
     std::vector<std::vector<float>> tabs(pool_descs_.size());
-    // [#216] The decode misses' file pages are dropped here, once per
-    // prefill, not as each is read: a drop beside the miss reads (advice
-    // worker) cost 0.4-0.7 ms a miss round (S25). Every resident expert is
-    // named; those dropped already (load, prefill) are a no-op.
+    // Drop resident experts' file pages once per prefill, away from the
+    // latency-sensitive miss reads. Advice for already-dropped pages is safe.
     std::vector<Advice> drop;
     {
       std::lock_guard<std::mutex> lock(handle_mutex_);
@@ -4012,11 +3829,11 @@ public:
       }
     }
     pool_dirty_ = false;
-    if (!t1_printed_) { // [#282 F]
+    if (!t1_printed_) {
       t1_printed_ = true;
       size_t left = 0;
       if (kvSeedQ() && htp_fixed::E2E_FREE_KVQ) {
-        // [#289] a layer the DSP seed did not take keeps its cache till here
+        // a layer the DSP seed did not take keeps its cache till here
         std::lock_guard<std::mutex> lock(kvq_mutex_);
         left = kvq_handles_.size();
         for (uint32_t h : kvq_handles_)
@@ -4032,13 +3849,11 @@ public:
                    (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0, seed_calls_,
                    seed_kvq_, left, rssMib(), memAvailMib());
     }
-    // ponytail: a generation's decode loads stay cached until the next
-    // prefill (<= misses x 5.3 MiB: 0.7 GiB at G = 1024); a drop per N
-    // tokens off the miss path is the upgrade for long generations
+    // Decode-loaded pages remain cached until the next prefill.
     adviseLater(std::move(drop));
   }
 
-  /** [plan 201 S1] Files the last answer's loads under the pairs S1 wrote
+  /** Files the last answer's loads under the pairs S1 wrote
    *  back after its rebinds (called once S1 has moved past that answer:
    *  at its next request, or when the token is done). */
   void poolHarvest(uint8_t *page) {
@@ -4065,11 +3880,11 @@ public:
       std::rethrow_exception(first);
   }
 
-  /** [plan 201 S1] One miss request of S1 (protocol P-A): the layer's
+  /** One miss request of S1 (protocol P-A): the layer's
    *  policy picks the victims (never a routed expert) and names the loads,
    *  each load is read into a free slot -- the victim's, with its pair --
    *  and the answer names both; S1 rebinds the pairs and fills them in. */
-  /** @brief [#282 C] The ARM's view of the DSP's QTimer: cntvct_el0, the
+  /** @brief The ARM's view of the DSP's QTimer: cntvct_el0, the
    *  same 19.2 MHz system counter on these SoCs (0 elsewhere). */
   static uint64_t qtNow() {
 #if defined(__aarch64__)
@@ -4083,7 +3898,7 @@ public:
 
   void poolAnswer(uint8_t *page, const htp_miss_req &r) {
     PoolServer &p = *pool_srv_;
-    { // [#282 C] post -> noticed here
+    { // post -> noticed here
       const uint64_t tp = uint64_t(r.t_post[0]) | (uint64_t(r.t_post[1]) << 32),
                      tn = qtNow();
       if (tp != 0 && tn >= tp)
@@ -4124,7 +3939,7 @@ public:
           if (a.n_evict == HTP_MBOX_MISS_MAX || !releaseExpert(k, v))
             throw std::runtime_error("token driver: the pool evicted an "
                                      "expert it does not hold");
-          if (fadviseKnob() == 1) // [#216] asked back after the answer
+          if (fadviseKnob() == 1) // asked back after the answer
             p.advice.emplace_back(v, true);
           a.evict[a.n_evict][0] = moe_ops_[w.first];
           a.evict[a.n_evict++][1] = w.second;
@@ -4143,7 +3958,7 @@ public:
           " experts, the pool loads " + std::to_string(loads.size()));
       const remote_handle64 session =
         static_cast<remote_handle64>(HtpBackend::global().handle());
-      // [#266] stage every miss, then read them together outside the
+      // stage every miss, then read them together outside the
       // lock; a staged slot is in p.pending at once, so a failed read
       // gives it back in poolDisarm like any failed round
       {
@@ -4174,10 +3989,10 @@ public:
         }
         pool_prefetch_->expireBefore((uint64_t(p.tok) << 32) + r.op + 1u);
       }
-      for (uint32_t i = 0; i < r.n_miss; ++i) // [#282 B]
+      for (uint32_t i = 0; i < r.n_miss; ++i)
         if (pf_issued_keys_.erase(d[r.miss[i]].key_gu) != 0)
           ++pf_useful_;
-      const uint64_t t_r0 = HtpProfile::nowUs(); // [#282 C]
+      const uint64_t t_r0 = HtpProfile::nowUs();
       e2e_st_->rt_pre_us += t_r0 - t0;
       readMisses(p.pending);
       e2e_st_->rt_read_us += HtpProfile::nowUs() - t_r0;
@@ -4186,7 +4001,7 @@ public:
         const ExpertFileDesc &x = d[r.miss[i]];
         const StagedExpert &st = p.pending[i];
         throwPread(st.rc, "expert weight (miss)");
-        // ponytail: the DSP rebinds a decode miss on its own from this
+        // the DSP rebinds a decode miss on its own from this
         // answer, which carries no offsets; an affine expert whose offsets
         // are all zero (the rotated ternary checkpoint's) is exact as a
         // symmetric one. Offsets in the answer are the upgrade.
@@ -4203,7 +4018,7 @@ public:
         l.arena = arena_chunks_[st.slot.chunk].dsp_id;
         l.off_gu = st.gu.off;
         l.off_dn = st.dn.off;
-        // [plan 229] QS2CX_WH: the width and the palettes ride the answer
+        // QS2CX_WH: the width and the palettes ride the answer
         // Native files use compact slots; prepared QS2 companions retain
         // their padded layout when switching between prefill and decode.
         l.bits = x.w_bits == HTP_TL2_WEIGHT_BITS ? HTP_TL2_COMPACT_WEIGHT_BITS
@@ -4229,7 +4044,7 @@ public:
       HtpProfile::global().addExpertLoad(read_us, 0, a.n_load);
     // the body, then seq last: S1 reads seq, then the rest
     a.seq2 = r.seq;
-    { // [#282 C] the answer's write time, for S1's answer latency
+    { // the answer's write time, for S1's answer latency
       const uint64_t ta = qtNow();
       a.t_ans[0] = static_cast<uint32_t>(ta);
       a.t_ans[1] = static_cast<uint32_t>(ta >> 32);
@@ -4244,11 +4059,6 @@ public:
     p.advice.clear();
   }
 
-  /** @brief [#282 B] NNTR_MOE_PREFETCH=<threads> (0 / unset: off; needs
-   *  NNTR_HTP_PREDICT=1 for S1 to post hints): the reader threads that
-   *  pull a hinted expert the pool lacks into the page cache, so its miss
-   *  a layer later preads DDR, not flash. The slots and S1's tables are
-   *  untouched -- the ids cannot move. */
   /** @brief Every MoE layer's router is Gemma's softmax router (eps_bits
    *  set): what the ARM predictor needs. False without a graph description. */
   bool routersSoftmax() const {
@@ -4291,7 +4101,7 @@ public:
     return directPrefetch() ? htp_fixed::PREFETCH_READERS : 0u;
   }
 
-  /** @brief [#282 B] The hint slot, if S1 posted a newer one this token
+  /** @brief The hint slot, if S1 posted a newer one this token
    *  (one slot: older hints the poll did not see are gone): the guessed
    *  experts of the next MoE layer the pool does not hold go to the
    *  prefetch readers. @return the seq taken. */
@@ -4365,10 +4175,8 @@ public:
     return seq;
   }
 
-  /** @brief [#282 B] Hands @a jobs to the prefetch readers (started on
-   *  first use, left running at exit like the advice worker): each preads
-   *  both weights into a scratch buffer, which leaves them in the page
-   *  cache. */
+  /** @brief Queue both expert weights for page-cache prefetch. Readers
+   *  start on first use and are joined by stopWorkers(). */
   void prefetchQueue(std::vector<ExpertFileDesc> jobs) {
     std::lock_guard<std::mutex> lock(pf_mu_);
     if (pf_threads_.empty()) {
@@ -4412,7 +4220,7 @@ public:
     return enabled;
   }
 
-  /** [plan 201 S1] Answer miss rounds until the DSP finishes the token.
+  /** Answer miss rounds until the DSP finishes the token.
    *  The optional completion hint parks the server before DSPQ reception,
    *  so a server on the caller's core cannot delay the caller's wakeup. */
   void poolServe() {
@@ -4444,7 +4252,7 @@ public:
       // Resolving them on every mailbox poll repeats getenv and walks all
       // router nodes while no request is available.
       const bool hints = prefetchThreads() != 0;
-      uint32_t hint_seq = tok * 256u; // [#282 B] the last hint taken
+      uint32_t hint_seq = tok * 256u; // the last hint taken
       for (uint32_t k = 0; k < 255u;) {
         if (hints)
           hint_seq = takeHint(page, tok, hint_seq);
@@ -4477,7 +4285,7 @@ public:
     }
   }
 
-  /** [plan 201 S1] Around one token: arm the server, then disarm it once
+  /** Around one token: arm the server, then disarm it once
    *  the DSP answered, file the last loads and refresh the pool's
    *  recency from the token's routed sets. */
   void poolArm(uint32_t tok) {
@@ -4488,7 +4296,7 @@ public:
       pool_srv_->th = std::thread([this] { poolServe(); });
     }
     std::lock_guard<std::mutex> lock(pool_srv_->mu);
-    pf_issued_keys_.clear(); // [#282 B] per token: the server is idle here
+    pf_issued_keys_.clear(); // per token: the server is idle here
     // The mailbox is uncached on ARM. Clear before sending the next token;
     // no old completion, including a wrapped sequence, may stop its server.
     auto *done = reinterpret_cast<volatile htp_token_done *>(
@@ -4535,10 +4343,10 @@ public:
     }
     poolHarvest(e2e_st_->mbox->data());
   }
-  /** [#266] NNTR_HTP_ROUTE_LOG=<path>: each token's routed sets, one line
+  /** NNTR_HTP_ROUTE_LOG=<path>: each token's routed sets, one line
    *  per MoE op in NNTR_MOE_TRACE's format ("<op> 1 | <ids> |"), so
    *  tools/moe_expert_cache_sim.py replays the one-PD token's routing.
-   *  [#266 S2] Under NNTR_HTP_PREDICT=1 the third field is the previous
+   *  Under NNTR_HTP_PREDICT=1 the third field is the previous
    *  router op's guess at this op's ids, best first (the sim's --predict
    *  trace). */
   static void routeLog(const htp_dspq_token_resp &s1r) {
@@ -4570,7 +4378,7 @@ public:
   }
 
   void poolRefresh(const htp_dspq_token_resp &s1r) {
-    // [#289] under LRFU a layer's routed set counts once a token: a layer
+    // under LRFU a layer's routed set counts once a token: a layer
     // whose miss round already handed it to the pool is not handed again
     std::vector<uint8_t> answered;
     {
@@ -4608,7 +4416,7 @@ public:
     }
   }
 
-  /** [#4416 mem] one line of where the memory is: the S1 PD's heap, the
+  /** one line of where the memory is: the S1 PD's heap, the
    *  staging pools' buffers, this process and the system (probe) */
   void memLine(const char *where) {
     uint32_t info1[7] = {0};
@@ -4633,7 +4441,7 @@ public:
       return;
     }
     memLine("t1 before graph init (= prefill end)");
-    // [#282 F] the first token's setup, timed (one line at the end)
+    // the first token's setup, timed (one line at the end)
     const uint64_t t_init = HtpProfile::nowUs();
     struct InitLine {
       uint64_t t0;
@@ -4651,7 +4459,7 @@ public:
         releaseQ4m1(session); // a retry registers them all again
         throw;
       }
-      // [#132 Part B E3] the E2E FC arena is placed once: a retry keeps it
+      // the E2E FC arena is placed once: a retry keeps it
       q4m1_bound_ = e2e_;
     }
     uint32_t n_ops = 0;
@@ -4665,7 +4473,7 @@ public:
                                  graphErr(err));
       }
     }
-    // [plan 201 S1] each resident MoE op's EXPERTS table; a refusal
+    // each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
       for (size_t m = 0; m < moe_ops_.size(); ++m) {
@@ -4675,7 +4483,7 @@ public:
                    static_cast<unsigned>(t.size()),
                    2u * graphOp(moe_ops_[m])->n_experts, "EXPERTS");
       }
-      // [plan 201 S4] the parameters the model handed at load, by name
+      // the parameters the model handed at load, by name
       for (const LoadParam &p : load_params_) {
         setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
         const auto q = static_quant_.find(p.data);
@@ -4686,7 +4494,7 @@ public:
                    "router static quantization");
         }
       }
-      // [#266 S2] NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
+      // NNTR_HTP_PREDICT=1: the routers' next-layer guesses,
       // logged through NNTR_HTP_ROUTE_LOG (unset: the skel's default, off)
       if (const uint32_t on = predictMode()) {
         if (on == 2u && (!directPrefetch() || !prefetchThreads()))
@@ -4697,7 +4505,7 @@ public:
         setParam(session, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_PREDICT, &word, 1u,
                  1u, "PREDICT");
       }
-      // [#289] A miss round runs the layer's dense branch while the ARM
+      // A miss round runs the layer's dense branch while the ARM
       // reads: the same ops on the same input, earlier, in time the DSP
       // spent waiting. On unless NNTR_HTP_DENSE_EARLY=0.
       {
@@ -4733,14 +4541,10 @@ public:
   void ensureAttentionCaches(remote_handle64 session) {
     if (attn_registered_)
       return;
-    // [#282 D] NNTR_HTP_E2E_FREE_KVQ=1: the prefill's quantized KV caches
-    // (kv_cache_q, the int8 masters and WH tiles, as large as the fp16
-    // attn_m1 cache below) go before that cache is registered: the one-PD
-    // token never reads them. ponytail: a later prefill on a layer whose
-    // handle is gone fails its append and takes mha_core's CPU attention
-    // -- single-prompt runs; the upgrade is mha_core re-registering.
+    // Release quantized prefill caches before allocating the decode cache.
+    // With kvSeedQ(), each layer releases its cache after seeding instead.
     if (e2e_ && htp_fixed::E2E_FREE_KVQ &&
-        !kvSeedQ()) { // [#289] the seeds free them one layer at a time
+        !kvSeedQ()) { // the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
         nntr_hvx_kv_release_q(session, h);
@@ -4748,9 +4552,9 @@ public:
                    kvq_handles_.size());
       kvq_handles_.clear();
     }
-    // [#130] the session's KV cache for the resident ATTN_M1 ops: one
+    // the session's KV cache for the resident ATTN_M1 ops: one
     // ordinal per attention layer, the shape from the first record;
-    // [plan 201 S4] a second cache for a second shape (Gemma 4's full
+    // a second cache for a second shape (Gemma 4's full
     // layers), registered second so the DSP files it as attn_m1_b
     for (uint32_t c = 0; c < 2u; ++c) {
       const htp_graph_op *rec = nullptr;
@@ -4767,20 +4571,18 @@ public:
       const uint32_t max_seq = rec->top_k != 0u && attn_window_rows_ != 0u
                                  ? attn_window_rows_
                                  : graph_words_[6];
-      // [#282 D] NNTR_HTP_ATTN_M1_Q8: the int8 cache (half the bytes;
-      // fixed scales from the prefill seed), HVX_ATTN_M1_Q8 in max_seq;
-      // 1 = the first cache only (Gemma's sliding layers, 400 of its 440
-      // MiB at max_seq 2048), 2 = both (the full layers too)
+      // The fixed int8-cache policy uses scales from the prefill seed:
+      // 1 selects the first cache shape, 2 selects both shapes.
       constexpr int q8_knob = htp_fixed::ATTN_M1_Q8; // built in: 2
       const bool q8 = q8_knob >= 2 || (q8_knob == 1 && c == 0u);
-      // [#4416 F] NNTR_HTP_ATTN_M1_FAST=1: the integer forward over the
+      // NNTR_HTP_ATTN_M1_FAST=1: the integer forward over the
       // int8 cache (HVX_ATTN_M1_FAST; not bit-identical to the CPU)
       static const bool fast_knob = [] {
         const char *v = std::getenv("NNTR_HTP_ATTN_M1_FAST");
         return v != nullptr && std::atoi(v) != 0;
       }();
       const bool fast = q8 && fast_knob;
-      // [#289] lazy: a layer's cache comes at its seed, after the layer
+      // lazy: a layer's cache comes at its seed, after the layer
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
@@ -4802,17 +4604,10 @@ public:
     }
   }
 
-  /** [#80] The M=1 GEMV switch, read once from NNTR_MOE_HTP_M1_GEMV and
-   *  sent to the DSP once per session through moe_set_opts (the DSP decides
-   *  per call on M). On by default since #101; NNTR_MOE_HTP_M1_GEMV=0 is the
-   *  opt-out (htp_moe_opts_flags). With the switch on, an error or an echo
-   *  that differs from what was sent throws rather than falling back: a
-   *  silent fallback would let a run report the HMX loop's numbers as the
-   *  GEMV's -- so a skel older than moe_set_opts now fails the first MoE call
-   *  unless the opt-out is set. With it off, such a skel is exactly the HMX
-   *  loop, so that case only logs. The stderr line (source=default|env) is
-   *  the proof of which path a run took when no profile is on;
-   *  [HTP-PROFILE]'s m1_gemv= and blocks= are the per-call proof. */
+  /** Send session options once. GEMV is enabled unless NNTR_MOE_HTP_M1_GEMV
+   *  is zero. Rejected or mismatched options throw to prevent silent kernel
+   *  changes; an older skel may continue only when GEMV is explicitly off
+   *  and no additional required options are requested. */
   void sendMoeOptsOnce(remote_handle64 session) {
     std::call_once(moe_opts_once_, [this, session]() {
       std::lock_guard<std::mutex> lock(moe_opts_mutex_);
@@ -4821,9 +4616,7 @@ public:
       const char *lead_env = std::getenv("NNTR_MOE_HTP_GEMV_LEAD_KB");
       const char *rows1_env = std::getenv("NNTR_MOE_HTP_GEMV_ROWS1");
       const char *feed_env = std::getenv("NNTR_MOE_HTP_GEMV_FEED");
-      // #177: the M=1 feed's DMA queue count. A value other than 1..4 is
-      // a mistyped variant, and running it as the default would measure
-      // the reference under the variant's name, so it throws.
+      // Reject invalid queue counts instead of silently using the default.
       const char *queues_env = std::getenv("NNTR_MOE_DMA_QUEUES");
       uint32_t queue_bits = 0;
       static_assert(htp_fixed::MOE_DMA_QUEUES >= 1u &&
@@ -4890,13 +4683,8 @@ public:
           "rebuild/push libnntr_hvx_skel.so with test/htp/build.sh and "
           "check FP16 HMX support when requesting *_hmx)");
       }
-      // The measured (loop, lead, feed) cell, in the same line. All three
-      // knobs are always sent (htp_moe_opts_flags: the env's value or the
-      // default), and the echo above confirmed them, so an unset run reads
-      // lead=192KB rows1=1 feed=vtcm and applied=0x303e1 (#113's D192
-      // under #117's VTCM feed); NNTR_MOE_HTP_GEMV_FEED=0 reads feed=arena
-      // and 0x103e1. The level-2 M==1 row's feed=n/calls is the per-call
-      // proof. source= still refers to the M1 GEMV switch alone (LEDGER 16).
+      // Report the echoed configuration; source describes only the GEMV
+      // switch, while each tuning field has its own environment override.
       std::fprintf(
         stderr,
         "[HTP] moe m1 gemv: %s (applied=0x%x) lead=%uKB rows1=%u "
@@ -4919,7 +4707,7 @@ public:
     });
   }
 
-  /** [PR 4428] The rotation signs to the session, once they and the MoE
+  /** The rotation signs to the session, once they and the MoE
    *  word are both known (set_moe_hadamard_signs, sendMoeOptsOnce). */
   void sendHadamardSigns(remote_handle64 session) {
     std::lock_guard<std::mutex> lock(had_signs_mutex_);
@@ -4979,7 +4767,7 @@ public:
     return true;
   }
 
-  /** [#225] Opens the FC WH sidecar and indexes it by fcWhKey, replacing
+  /** Opens the FC WH sidecar and indexes it by fcWhKey, replacing
    *  any earlier one (a reload). Every check that can fail on a wrong or
    *  stale file fails here, at load, with the path: the magic and version
    *  (the layout's tag), the index inside the file, each image's length
@@ -4990,7 +4778,7 @@ public:
       ::close(fcwh_fd_);
     fcwh_fd_ = -1;
     fcwh_.clear();
-    fcwh_arena_bytes_ = fcwh_heap_bytes_ = 0; // [#225] fcwhLeft's, the banner's
+    fcwh_arena_bytes_ = fcwh_heap_bytes_ = 0; // fcwhLeft's, the banner's
     const std::string where = std::string("fc_wh_file_name ") + path + ": ";
     const int fd = openWeightFile(path);
     if (fd < 0)
@@ -5032,7 +4820,7 @@ public:
   }
 
   /**
-   * @brief [doc 52] One expert's two WH weights, read from the model file
+   * @brief One expert's two WH weights, read from the model file
    *        straight into an arena slot and registered from there.
    *
    * The slot is the unit the LRU above this trades in: gate_up then down,
@@ -5072,7 +4860,7 @@ public:
     return true;
   }
 
-  /** [doc 52 section 10.23] One call's misses: each read in turn, then all
+  /** One call's misses: each read in turn, then all
    *  registered in one round trip instead of one each. */
   bool register_qs4cx_wh_expert_files(const std::vector<ExpertFileDesc> &ds,
                                       bool at_load = false) override {
@@ -5117,7 +4905,7 @@ public:
   }
 
   /**
-   * @brief [doc 52 sections 10.10, 10.20] Queues one batch of experts --
+   * @brief Queues one batch of experts --
    *        one layer's -- to be read into fresh slots by the prefetch
    *        readers, and returns at once. Batches are read and handed back
    *        in the order they were queued, so a caller can keep several
@@ -5361,16 +5149,9 @@ public:
       get_or_register_qs4cx(matAdata[0], matAscale[0], session, K, N[0]);
     const uint32_t h_dn =
       get_or_register_qs4cx(matAdata[1], matAscale[1], session, inter, N[1]);
-    // ponytail: split-call path (invokeGateUpSwiglu + invokeLayerU8In), NOT
-    // invokeFused. The one-call fused kernel (still in the tree, dormant --
-    // see invokeFused's own comment) produced wrong output on this model's
-    // real weights; root cause never found despite passing its own
-    // synthetic-data unit test. This is the smaller-surface alternative
-    // doc 43 §7 describes: gate_up+SwiGLU+requant in one call (one weight,
-    // one VTCM region set), feeding the requantized u8 intermediate into
-    // the ALREADY-device-verified u8in path for down instead of
-    // reimplementing the down matmul. Verified stage-by-stage on device
-    // (unittest_hvx_mm_u8i4's GateUpSwiglu* tests) before being wired here.
+    // Keep gate_up+SwiGLU and down as separate calls. The single-call
+    // fused kernel disagreed on real model weights despite passing its
+    // synthetic-data tests; this path reuses the validated u8-input down.
     invokeGateUpSwiglu(session, h_gu, matBdata, M, K, inter);
     invokeLayerU8InRaw(session, &h_dn, 1, htp_act_m_pad(M), matCdata, M, N[1],
                        inter);
@@ -5379,26 +5160,10 @@ public:
   }
 
   /**
-   * @brief NNTR_L2_DIFF: the one control neither L2 attempt ever applied.
-   *
-   * Both attempts were gated on unittest_hvx_mm_u8i4's SNR against
-   * fill_deterministic weights and activations, passed at 138-141 dB, and
-   * still broke the real model -- so the variable nobody has held fixed is
-   * the DATA, not the kernel. This runs the unit test's exact reference
-   * (mm_u8i4_layer on gate_up, SwiGLU on the host with expf, mm_u8i4_layer
-   * on down) against the split-call path, on THIS model's registered weight
-   * bytes and THIS forward's real activation, and reports the SNR per call.
-   *
-   * It bisects the search in one run:
-   *   high SNR -> the kernels agree on real data too, so the fault is on the
-   *               ARM side of the call (what is fed in, what is done with
-   *               what comes out), not inside the DSP;
-   *   low SNR  -> the kernels genuinely disagree on real data, and the
-   *               synthetic distribution was hiding it -- the dB number to
-   *               chase, with the offending M printed next to it.
-   *
-   * Debug path: plain heap buffers, three extra FastRPC round trips per
-   * expert. Never on unless the env var is.
+   * @brief Compare the accelerated FFN against two reference FC calls and
+   *        deterministic host SwiGLU, using this model's actual inputs.
+   * Reports SNR and quantization differences. Enabled by NNTR_L2_DIFF or
+   * NNTR_L2_SHADOW; allocates heap scratch and adds reference RPCs.
    */
   void l2Diff(remote_handle64 session, uint32_t h_gu, uint32_t h_dn,
               const float *matBdata, float *got, unsigned int M, unsigned int K,
@@ -5415,13 +5180,8 @@ public:
       return;
     }
 
-    // [A1] swiglu_det, the same specification Lfm2MoELayer's two-dot path
-    // and the DSP's hvx_swiglu_det.h both run. This used std::exp, which
-    // made total_flips measure the wrong thing: a nonzero count could mean
-    // either that the fused kernel disagreed with the host path the model
-    // actually uses, or merely that both disagreed with libm. Against this
-    // reference, total_flips == 0 is exactly the property the fused path
-    // needs, and anything else is a real divergence.
+    // Use the model's deterministic SwiGLU, also used by hvx_swiglu_det.h.
+    // A libm reference would conflate kernel errors with exp differences.
     std::vector<float> mid(static_cast<size_t>(M) * inter);
     for (unsigned int m = 0; m < M; ++m) {
       for (unsigned int j = 0; j < inter; ++j) {
@@ -5450,22 +5210,8 @@ public:
     }
     const double snr = (noise == 0.0) ? 999.0 : 10.0 * std::log10(sig / noise);
 
-    // Outlier-row hypothesis: hvx_quant_rows_u8_params sets ONE scale per
-    // row from that row's own min/max (the same scan the NaN bug poisoned
-    // -- doc 43 section 5). A real trained model's SwiGLU intermediate can
-    // have an outlier value fill_deterministic's bounded uniform fill never
-    // produces; if one lane dominates a row's range, the rest of that row's
-    // 255 levels spread thinner and the row's requant noise rises without
-    // ever going non-finite. `mid` is exactly that intermediate (pre-
-    // quantization, host f32), already computed above for the reference --
-    // this reuses it rather than adding a DSP round trip.
-    //
-    // Printed for EVERY call, not just suspect ones: the first round only
-    // ever showed the bad calls' own spans (0.05-0.24), with nothing to
-    // compare them against, so the hypothesis was untestable -- a narrow
-    // span could mean "outlier-free" (hypothesis holds) or "this model's
-    // rows are always this narrow" (hypothesis is irrelevant). This line
-    // is the missing baseline.
+    // Report row ranges for every call: outliers stretch the quantization
+    // grid and can increase error without producing non-finite values.
     float call_max_span = 0.0f;
     size_t call_max_span_row = 0;
     for (unsigned int m = 0; m < M; ++m) {
@@ -5505,34 +5251,10 @@ public:
         row_max = std::max(row_max, v);
       }
 
-      // Bin-flip test, take 1 (dev_scale held fixed): is this a rounding-
-      // boundary sensitivity given a SHARED scale? hvx_quant_rows_u8_params/
-      // hvx_quant_pack_u8_ah are the SAME function on both paths -- verified
-      // by inspection, not assumed -- so a difference cannot come from the
-      // quantizer having two implementations. What CAN differ is the float
-      // value handed to it: the reference quantizes the host's exact
-      // expf(); the device quantized its own hvx_exp_sf/hvx_recip_qf32
-      // approximation (~1e-6 relative error, well within spec -- doc 43's
-      // L2 fix candidate). act_ah_buf_/act_scale_scratch_/act_zp_scratch_
-      // still hold the device's own gate_up_swiglu output for this exact
-      // forward's worst row -- invokeLayerU8InRaw only reads them, never
-      // clears them -- so this first pass re-quantizes `mid` with the
-      // DEVICE's OWN scale/zp and counts per-element disagreements.
-      //
-      // Take 2 (below, scale_diff/total_flips): the first round's result
-      // (0 flips on the two WORST calls, 1 flip on the three milder ones)
-      // means take 1 tests the wrong thing when it comes back clean --
-      // hvx_quant_rows_u8_params derives scale/zp from THIS row's own
-      // min/max, so if the approximation nudges the row's extreme value
-      // even slightly, the REFERENCE path (which quantizes `mid` with a
-      // scale/zp it computes fresh from `mid`'s own min/max, independent of
-      // the device's) uses a DIFFERENT scale than the device did -- not a
-      // sparse per-element flip but a systematic per-row bias that shifts
-      // every one of the row's `inter` dequantized values in the same
-      // direction, which a down matmul's summation does not cancel out.
-      // Reimplements hvx_quant_rows_u8_params' exact formula (source read,
-      // not guessed) on `mid` alone to get that independent scale/zp, then
-      // diffs against the device's actual bytes the same way take 1 did.
+      // Compare quantized bins using both the device's scale/zp and values
+      // independently derived from the host intermediate. Holding the device
+      // scale fixed alone misses bias caused by shifted min/max extrema.
+      // The u8-input down call leaves the device's activation scratch intact.
       constexpr uint32_t kTileRow = 64, kTileInner = 32, kActTileBytes = 2048;
       const uint32_t n_ktiles = inter / kTileInner;
       const uint32_t rb = static_cast<uint32_t>(worst_row) / kTileRow;
@@ -5550,10 +5272,7 @@ public:
                                         std::nearbyint(-rmin / host_scale))))
           : 0;
 
-      // Flip count over the WHOLE block, not just worst_row. The previous
-      // round counted only the worst row and its result ("1 flip") was
-      // reported as if it described the call -- it did not. This is the
-      // number that can honestly be held against row_sq_err and the SNR.
+      // Count across all rows so the result can be compared with call SNR.
       uint32_t block_flips = 0;
       for (uint32_t m = 0; m < M; ++m) {
         const float s_m = act_scale_scratch_[m];
@@ -5750,7 +5469,7 @@ private:
     return *slot;
   }
   /** @brief Whether @a b still holds the copy of @a a: 32 spread 64-byte
-   *  windows and the tail compared. ponytail: a rewrite that keeps every
+   *  windows and the tail compared. a rewrite that keeps every
    *  sampled window is missed; a full compare costs about what the copy
    *  does. */
   static bool sampledSame(const void *a_, const void *b_, size_t bytes) {
@@ -5883,7 +5602,7 @@ private:
   }
   /** @brief Throws when [src, src + bytes) is inside a lost tensor the host
    *  has not rewritten since: those host bytes are only the windows.
-   *  ponytail: the last 8 lost tensors are remembered (3 are lost a layer);
+   *  the last 8 lost tensors are remembered (3 are lost a layer);
    *  a reader further behind than that is not caught. */
   void throwIfLost(const void *src, size_t bytes, int line) const {
     const char *s = static_cast<const char *>(src);
@@ -6028,7 +5747,7 @@ private:
    *  o-proj (sdpa_q2_kvcache_f32 -> gemm_qs4cx_res_add_fp32): the host
    *  tensor it stands for, the buffer, its shape and the per-head
    *  encodings. One at a time: the graph runs a layer's attention, then its
-   *  o-proj. ponytail: a CPU consumer of that f32 tensor, or another
+   *  o-proj. a CPU consumer of that f32 tensor, or another
    *  attention call before the o-proj, is not covered -- the builder sets
    *  mha_core's attn_out_u16 only for the folded o-proj on this engine. */
   struct AttnOut16 {
@@ -6396,11 +6115,11 @@ private:
     profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
-  /** @brief [#84] NNTR_HTP_DUMP=<dir>: every MoE call's input (M x K f32)
+  /** @brief NNTR_HTP_DUMP=<dir>: every MoE call's input (M x K f32)
    *  and output (M x N_out f32) as <dir>/moe_<call>_in.f32 / _out.f32, in
    *  call order, plus one line per call in <dir>/manifest.txt
    *  (name entry M K inter N_out kind r=<row_count per expert>, the
-   *  routing the ARM handed the call -- [#136] so the comparator can
+   *  routing the ARM handed the call -- so the comparator can
    *  tell a top-k flip at a near-tie from a fault). Read once, off unless the
    *  variable is set: with it unset this is one static load and a branch
    *  per call. tools/htp/htp_dump_eval.py compares two such directories;
@@ -6442,7 +6161,7 @@ private:
     std::fclose(m);
   }
 
-  /** @brief [#136] NNTR_HTP_DUMP_ALL=1 (next to NNTR_HTP_DUMP=<dir>): what
+  /** @brief NNTR_HTP_DUMP_ALL=1 (next to NNTR_HTP_DUMP=<dir>): what
    *  the ARM side hands the DSP between and inside the per-token
    *  stretches, all of it -- every stretch's input / output as
    *  <dir>/fwd_<call>_<kinds>_{in,out}.f32 with one line per call in
@@ -6492,7 +6211,7 @@ private:
     std::fclose(m);
   }
 
-  /** @brief [#85] The per-token entry over one resident stretch [op,
+  /** @brief The per-token entry over one resident stretch [op,
    *  expected_resume): the same staging pools as invokeMoeLayer, and for
    *  the MoE stretch (@a moe) the same profile bucket, so the M==1 row
    *  reads the same across the two paths. The DSP must stop exactly at
@@ -6505,7 +6224,7 @@ private:
                      const std::vector<float> &row_weight, const float *act,
                      unsigned int K, float *out, unsigned int N_out, bool moe) {
     if (e2e_) {
-      // [#132 Part B E3] with every kind resident the token is the one
+      // with every kind resident the token is the one
       // stretch [0, n_ops), run by the token driver
       if (op != 0u || expected_resume != stretch_start_.size() ||
           act == nullptr || out == nullptr)
@@ -6613,11 +6332,8 @@ private:
     }
   }
 
-  /** @brief [#141] The M==1 MoE call's dspqueue (plan 141-dspq-moe.md
-   *  section 3.4): the queue, its two ION buffers mapped once, and the
-   *  counters. Shared with the HtpBackend close hook, which tears it down
-   *  before the session closes: the two singletons' destruction order is
-   *  not fixed, so the hook must own what it touches. */
+  /** @brief MoE queue state, its two persistently mapped ION buffers and
+   *  transport counters. Shared with the backend's close hook. */
   struct DspqMoe {
     enum State { UNTRIED, ON, OFF } state = UNTRIED;
     bool broken = false; /**< a transport failure after ON: every later
@@ -6625,7 +6341,7 @@ private:
     const HtpDspqApi *api = nullptr;
     dspqueue_t q = nullptr;
     remote_handle64 session = 0;
-    int domain = CDSP_DOMAIN_ID; /**< [#132 Part B E3] the effective one */
+    int domain = CDSP_DOMAIN_ID; /**< the effective one */
     const char *tag = "dspq";    /**< log prefix */
     std::unique_ptr<HtpRpcBuffer> act, out;
     bool act_mapped = false, out_mapped = false;
@@ -6645,7 +6361,7 @@ private:
   /** @brief Undoes whatever creation got through, in reverse. */
   static uint32_t dspqRelease(DspqMoe &st) {
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
-    uint32_t fail = 0; // [#132 Part B] fastrpc_munmap refusals
+    uint32_t fail = 0; // fastrpc_munmap refusals
     if (st.act_mapped)
       fail += mem.munmap(st.domain, st.act->fd(), st.act->data(),
                          st.act->size()) != 0;
@@ -6685,11 +6401,9 @@ private:
     return true;
   }
 
-  /** @brief Creation, once, at the first M==1 MoE call (section 3.4) or
-   *  at the E2E graph init; any failure prints one "dspq: off" line and is
-   *  never retried. [#211] With NNTR_HTP_E2E=1 the token packets ride this
-   *  queue whichever call creates it (a one-row prefill chunk comes first):
-   *  its out buffer holds the logits and it spins the E2E way. */
+  /** @brief Create once at the first M=1 MoE call or E2E graph init.
+   *  Failure disables the queue without retry. E2E needs a logits-sized
+   *  output buffer even when a one-row prefill creates the queue first. */
   void dspqCreate(remote_handle64 session) {
     const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
     const size_t logits_bytes =
@@ -6702,11 +6416,8 @@ private:
                  : 1000u);
   }
 
-  /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long the DSP
-   *  spins (with a pause) before it sleeps -- at each miss wait and on the
-   *  dspqueue after a token. On two PDs (E5b) 1000 us kept one of the six
-   *  hardware threads busy through the other session's compute; E5d read
-   *  20.8 / 20.2 / 16.5 tok/s at 0 / 20 / 1000. */
+  /** DSP spin time before sleeping at miss waits and between tokens,
+   *  controlled by NNTR_HTP_E2E_SPIN_US (default 0 microseconds). */
   static uint32_t e2eSpinUs() {
     static const uint32_t us = [] {
       const char *e = std::getenv("NNTR_HTP_E2E_SPIN_US");
@@ -6716,7 +6427,7 @@ private:
   }
 
   /** @brief A queue on @a session in @a domain with an out buffer of
-   *  @a out_bytes (HTP_DSPQ_BUF_BYTES; [#132 Part B E3] the E2E one holds
+   *  @a out_bytes (HTP_DSPQ_BUF_BYTES; the E2E one holds
    *  the logits too). Its teardown is an HtpBackend close hook. */
   std::shared_ptr<DspqMoe> dspqMake(remote_handle64 session, int domain,
                                     const char *tag, size_t out_bytes,
@@ -6812,8 +6523,7 @@ private:
    *  Caller holds invoke_mutex_. */
   bool dspqReady(remote_handle64 session, size_t act_bytes, size_t out_bytes,
                  uint64_t msg_bytes) {
-    // On by default since the #141 sitting (user, 2026-09-28): bit-identical
-    // MoE dumps, decode +7.1 / +5.0 %. NNTR_HTP_DSPQ=0 keeps FastRPC.
+    // NNTR_HTP_DSPQ=0 keeps MoE calls on FastRPC.
     static const bool enabled = [] {
       const char *e = std::getenv("NNTR_HTP_DSPQ");
       return e == nullptr || std::atoi(e) != 0;
@@ -6826,8 +6536,7 @@ private:
     // retry on the queue nor a FastRPC fallback is safe.
     if (dspq_->broken)
       throw std::runtime_error("dspq: the queue failed on an earlier call");
-    // ponytail: a call larger than the packet or the 64 KiB buffers takes
-    // FastRPC; every MoE layer of this model has one shape that fits.
+    // Calls larger than the packet or staging buffers use FastRPC.
     return dspq_->state == DspqMoe::ON && dspq_->session == session &&
            act_bytes <= HTP_DSPQ_BUF_BYTES && out_bytes <= HTP_DSPQ_BUF_BYTES &&
            msg_bytes <= HTP_DSPQ_MAX_MSG;
@@ -6928,9 +6637,9 @@ private:
     return resp.rc;
   }
 
-  struct E2eState; // [#132 Part B E3] defined with the members below
+  struct E2eState; // defined with the members below
 
-  /** @brief [#132 Part B E3, #211] The one-PD decode's ARM side: the token
+  /** @brief The one-PD decode's ARM side: the token
    *  driver on S1 over one mailbox page (the expert pool's miss lines), the
    *  token packets on S1's dspqueue. Created at graph init; the HtpBackend
    *  close hook e2eTeardown undoes it. */
@@ -6981,7 +6690,7 @@ private:
                  fadviseKnob());
   }
 
-  /** @brief [#132 Part B E3, #211] The close hook, before the session
+  /** @brief The close hook, before the session
    *  closes: the queue, the driver, the mailbox, then the graph, the FC
    *  slots and their arena chunks, each buffer fastrpc_munmap'd before
    *  nntr_hvx_close (#178's rule). The MoE arena stays as on the hybrid
@@ -6992,7 +6701,7 @@ private:
     static_assert(HTP_DSPQ_ATTN_PROF_WORDS == ATTN_M1_PROF_WORDS,
                   "htp_dspq_wire.h's phase words are attn_m1_det.h's");
     const HtpRpcMemApi &mem = HtpRpcMemApi::get();
-    // [#132 Part B E5g] every DSP thread stopped before any munmap: the
+    // every DSP thread stopped before any munmap: the
     // queue (QUIT, joined), then the token driver (its HAP_mmap_put); then
     // the mappings. The close line counts what was mapped, what
     // fastrpc_munmap / arena_detach refused, and the DSP heap (E5f: one E
@@ -7028,7 +6737,7 @@ private:
                    "[HTP] graph per-kind pcyc/token:%s | wall_ms/token=%.3f "
                    "mhz=%.0f spin_us=%u\n",
                    line.c_str(), wus / n / 1000.0, mhz, e.spin_us);
-      // [#267 L0] the same kinds in wall us at whatever clock each ran, the
+      // the same kinds in wall us at whatever clock each ran, the
       // MOE net of its miss waits, and the clock outside the waits
       line.clear();
       uint64_t sum_us = 0;
@@ -7056,7 +6765,7 @@ private:
                    static_cast<double>(e.miss_pcyc)) /
                     cus
                 : 0.0);
-      // [#261] ATTN_M1's phase words per token and KV cache (attn_m1_det.h:
+      // ATTN_M1's phase words per token and KV cache (attn_m1_det.h:
       // the lane-summed pieces, the pool's span and busiest lane in k
       // pcycles; call_us the calls' wall)
       for (uint32_t c = 0; c < 2u && e.attn_tokens != 0; ++c) {
@@ -7098,7 +6807,7 @@ private:
             : 0.0,
           static_cast<double>(e.token_us) / n / 1000.0);
       }
-      // [#194 L0] where the token's time goes outside the kernels: the
+      // where the token's time goes outside the kernels: the
       // ARM's round trip (rt) against the DSP's own wall (wake = the
       // dspqueue transport and the ARM read's wake-up), tokenForward on the
       // ARM (arm_fwd, rt plus its copies) and the ARM between two
@@ -7199,7 +6908,7 @@ private:
                 (e.q1->out_mapped ? e.q1->out->size() : 0u);
       unmap_fail += dspqRelease(*e.q1);
     }
-    // [plan 201 S1] the graph names the FC slots below, so it goes first
+    // the graph names the FC slots below, so it goes first
     // (the graph's other close finds none left); slots exist once the FC
     // set was placed, which every graph init follows
     if (!e.q4m1.empty())
@@ -7222,7 +6931,7 @@ private:
                  detach_fail, info1[4], static_cast<unsigned>(i1));
   }
 
-  /** @brief [#194 L0] The system counter in us (low 32 bits): the ARM's
+  /** @brief The system counter in us (low 32 bits): the ARM's
    *  cntvct_el0, the counter the DSP's QTimer reads; off aarch64 (the
    *  in-process build, whose DSP clock is CLOCK_MONOTONIC) steady_clock. */
   static uint32_t sysCounterUs() {
@@ -7238,7 +6947,7 @@ private:
 #endif
   }
 
-  /** @brief [#132 Part B E3, #211] One decode token on the one PD: the
+  /** @brief One decode token on the one PD: the
    *  embedding row into the queue's act buffer, OP_TOKEN (op 0 to the
    *  argmax, the MOE ops' miss rounds on the page), the response. Only the
    *  id comes back unless set_decode_logits asked for the logits (the
@@ -7269,7 +6978,7 @@ private:
     if (have_id_)
       throw std::runtime_error("token driver: the previous token's id was "
                                "never taken (take_decode_token_id)");
-    // [#132 Part B E3] the bad-word ids the DSP's argmax skips (LM_BAN),
+    // the bad-word ids the DSP's argmax skips (LM_BAN),
     // sent when they change; more than the DSP holds, or none after some
     // (an empty sequence may reach the skel as NULL, the stale-skel code)
     // -> the logits come back and the CPU picks
@@ -7284,7 +6993,7 @@ private:
       ban_sent_ = ban_;
     }
     if (!pool_descs_.empty())
-      poolSync(); // [plan 201 S1]
+      poolSync();
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     htp_router_handoff_invalidate(&router_handoff_);
     std::memcpy(q.act->data(), act, act_bytes);
@@ -7292,7 +7001,7 @@ private:
     if (!pool_descs_.empty())
       poolArm(tok);
     const uint32_t attn_prof =
-      HtpProfile::global().level() ? HTP_DSPQ_TOKEN_ATTN_PROF : 0u; // [#261]
+      HtpProfile::global().level() ? HTP_DSPQ_TOKEN_ATTN_PROF : 0u;
     const htp_dspq_token_req req = {
       HTP_DSPQ_OP_TOKEN, tok, (logits ? HTP_DSPQ_TOKEN_LOGITS : 0u) | attn_prof,
       pos};
@@ -7379,7 +7088,7 @@ private:
     ++e.tokens;
     e.misses += r.misses;
     e.miss_us += r.miss_us;
-    e.rt_overlap_us += r.miss_overlap_us; // [#282 C]
+    e.rt_overlap_us += r.miss_overlap_us;
     e.rt_anslat_us += r.miss_anslat_us;
     e.rt_rebind_us += r.miss_rebind_us;
     if (!pool_descs_.empty())
@@ -7412,7 +7121,7 @@ private:
     ++fwd_calls_; // one ARM -> DSP packet per token: calls/token = 1.00
     ++fwd_tokens_;
     if (++prompt_tokens_ == 1) {
-      releasePrefillStaging(); // [#4416 mem] the seed was the last big row
+      releasePrefillStaging(); // the seed was the last big row
       releaseIdlePrefillReaders();
       purgePrefillHeap();
     }
@@ -7431,18 +7140,18 @@ private:
     e.fwd_us += e.last_exit_us - entry_us;
   }
 
-  /** [#132 Part B E3] compute_ops.h: whether the next decode tokens must
+  /** compute_ops.h: whether the next decode tokens must
    *  bring their logits back (else only the id travels). */
   void set_decode_logits(bool want) override { want_logits_ = want; }
 
-  /** [#132 Part B E3] compute_ops.h: the bad-word ids the caller's pick
+  /** compute_ops.h: the bad-word ids the caller's pick
    *  sets to -inf; the DSP's argmax skips them (LM_BAN) on the id-only
    *  path. */
   void set_decode_ban(const unsigned *ids, unsigned n) override {
     ban_.assign(ids, ids + n);
   }
 
-  /** [#132 Part B E3] compute_ops.h: the id the DSP's argmax picked for the
+  /** compute_ops.h: the id the DSP's argmax picked for the
    *  last decode token, once, when its logits did not come back. */
   bool take_decode_token_id(unsigned *id) override {
     if (!have_id_)
@@ -7460,11 +7169,11 @@ private:
     return have_id_ && pos == cur_pos_ && pending_op_ == HTP_GRAPH_NO_OP;
   }
 
-  /** [#132 Part B E3] compute_ops.h: the model handed its last Q4_0
+  /** compute_ops.h: the model handed its last Q4_0
    *  weight. On the E2E path the FC set goes into its arena chunks now,
    *  at load (the startup cell), not at the first decode token. */
   bool finish_decode_graph_q4_0() override {
-    // [#225] Called once after the load's registrations: where the FC
+    // Called once after the load's registrations: where the FC
     // prefill weights went. heap_kib != 0 is the overflow plan 225 section
     // 3.3 c expects on the full-residency hybrid; requant != 0 is a model
     // without a sidecar.
@@ -7484,14 +7193,14 @@ private:
     return true;
   }
 
-  /** [#234 P4] compute_ops.h: the E2E list's Q4_0 weights are still to
+  /** compute_ops.h: the E2E list's Q4_0 weights are still to
    *  bind, so the sidecar can serve its FC / DENSE_FFN ops (bindQ4m1). */
   bool has_decode_graph_q4_0() override {
     std::lock_guard<std::mutex> lock(graph_mutex_);
     return e2e_ && !q4_pending_.empty() && !q4m1_bound_;
   }
 
-  /** [#132 Part B E3, #211] Places the Q4M1 set on S1's own new arena
+  /** Places the Q4M1 set on S1's own new arena
    *  chunks: at load after the MoE arena (the model calls
    *  finish_decode_graph_q4_0 after repack_weight), else at graph init.
    *  Caller holds graph_mutex_. The banner's s1_arena_mib is the MoE arena
@@ -7526,7 +7235,7 @@ private:
                  s1_mib, info1[4]);
   }
 
-  /** [#132 Part B E3] The feed the FC kinds take: the op's l2, else VTCM. */
+  /** The feed the FC kinds take: the op's l2, else VTCM. */
   const char *q4m1FeedName() const {
     return !kind_ops_[HTP_OP_FC].empty() &&
                (graphOp(kind_ops_[HTP_OP_FC][0])->feed & HTP_GRAPH_FEED_L2) !=
@@ -7535,7 +7244,7 @@ private:
              : "vtcm";
   }
 
-  /** @brief [doc 46] One call for the whole layer.
+  /** @brief One call for the whole layer.
    *
    *  The activation goes over once instead of once per expert, and the
    *  output comes back once: with 32 experts at top-4 the old path shipped
@@ -7559,7 +7268,7 @@ private:
     PrefillComputeTrace trace(M, K, N_out, static_cast<unsigned>(kind));
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
-    // [PR 4428] act bit 1: the dense FFN's chunks were never rotated, so
+    // act bit 1: the dense FFN's chunks were never rotated, so
     // the session's online rotation (NNTR_MOE_HADAMARD_SCOPE=all) skips
     // this call; the experts' calls keep it.
     if (kind == 1)
@@ -7573,10 +7282,8 @@ private:
                          static_cast<uint32_t>(row_index.size()));
 
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    // [#141] The M==1 MoE call rides the dspqueue (default since the #141
-    // sitting; NNTR_HTP_DSPQ=0 keeps FastRPC): the same DSP function, the same
-    // argument bytes, only the transport differs. Anything the packet cannot
-    // carry stays on FastRPC.
+    // The queue uses the same DSP function and arguments. Unsupported
+    // packets and NNTR_HTP_DSPQ=0 keep the FastRPC transport.
     const bool via_dspq = M == 1 && kind == 0 && !with_norms &&
                           h_dn.size() == h_gu.size() &&
                           row_count.size() == h_gu.size() &&
@@ -7678,15 +7385,8 @@ private:
     const bool timed = profile.level() >= 2;
     const bool norm_entry =
       pre_gamma_dsp != nullptr || post_gamma_dsp != nullptr;
-    // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
-    // keeps the fastest. Two runs with no functional change between them
-    // differed by 4.5 ms of DSP time (doc 46 section 23.2) -- the
-    // compute-bound stage identical, the DDR-touching ones all moving
-    // together, so the device's memory system, not the code. Several of the
-    // changes on the list are worth 2 ms, which that noise floor swallows.
-    // Repeating inside one call puts the comparison at the same temperature
-    // and the same contention, and the output is unchanged because the
-    // input is.
+    // Level 3 repeats the same inputs five times and keeps the fastest
+    // sample to reduce noise from DDR contention.
     const int reps = (profile.level() >= 3) ? 5 : 1;
     uint64_t best_elapsed = UINT64_MAX;
     int err = AEE_SUCCESS;
@@ -7801,7 +7501,7 @@ private:
                 static_cast<size_t>(out_len), M, K, inter, N_out, kind,
                 row_count);
     if (profile.level()) {
-      // [#88] The bytes the stub hands the driver outside ION: the 48-byte
+      // The bytes the stub hands the driver outside ION: the 48-byte
       // primitive block (_primIn[12] in generated/nntr_hvx_stub.c) and the
       // five uint32/float sequences that are not the staged activation.
       const size_t in_arg_bytes =
@@ -7814,7 +7514,7 @@ private:
                                 out_stage, in_arg_bytes, kind, via_dspq);
     }
     if (timed) {
-      // [#87] The per-descriptor trace of the last repeat, for the first
+      // The per-descriptor trace of the last repeat, for the first
       // NNTR_HTP_DMA_TRACE calls of this bucket. Read now, while the skel's
       // static tables still hold this call; printed now, so the lines sit
       // next to the token they came from.
@@ -7836,7 +7536,7 @@ private:
     }
   }
 
-  /** @brief [doc 51 section 2] One call for a whole conv block.
+  /** @brief One call for a whole conv block.
    *
    *  The activation goes over once and the output comes back once; the
    *  four M x C intermediates the block has stay on the DSP. conv_w (24 KB)
@@ -7851,7 +7551,7 @@ private:
                        const float *hist = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
-    // [#225] A chunk after the first carries the conv's two history rows
+    // A chunk after the first carries the conv's two history rows
     // after the taps, [5 x C] (hexkl_conv_block_run's hist): no IDL change
     const int conv_len = (hist != nullptr ? 5 : 3) * static_cast<int>(C);
     const int state_len = 2 * static_cast<int>(C);
@@ -7911,7 +7611,7 @@ private:
     std::memcpy(state, state_f32,
                 static_cast<size_t>(state_len) * sizeof(float));
     if (profile.level()) {
-      // [#88] Outside ION: the primitive block and the three handles;
+      // Outside ION: the primitive block and the three handles;
       // conv_w and the state ride in conv_buf_ (ION).
       const size_t in_arg_bytes = 48 + sizeof(uint32_t) * ch.h_in.size();
       profile.addInvokeMoeLayer(M, K, N_out, elapsed,
@@ -8128,22 +7828,17 @@ private:
 
   /** @brief Columns of a K-deep weight per registered handle.
    *
-   * hexkl_mm_u8i4_layer_run lays VTCM out as the whole activation
-   * (m_pad x K) | the WIDEST handle's WH bytes twice (its double buffer) |
-   * a result tile, and returns AEE_ENOMEMORY when that exceeds the 8 MiB
-   * (doc 50 section 3: conv in_proj, 2048 x 6144 = 6 MiB, wanted 12). A
-   * 2 MiB slice keeps the double buffer at 4 MiB, which leaves the
-   * activation room up to m_pad ~ 1,900 rows at K = 2048.
-   * ponytail: the cap is the activation's ceiling, not the kernel's; a
-   * prompt past it needs the kernel to walk 64-row blocks the way
-   * hexkl_mm_u8i4_moe.c does. */
+   * VTCM holds the activation, two copies of the widest weight slice and
+   * a result tile. Bound the slice size so fcMaxRows can fit activation
+   * chunks within the 8 MiB budget.
+   */
   static unsigned int fcSliceCols(unsigned int K) {
     // 2 MiB slices, 1 MiB from K = 4096 up. The slice's double buffer is
     // what the activation rows share VTCM with (fcMaxRows): at 2 MiB the
     // o-proj's 4096-deep weight left 896 rows a call, two calls for a
     // 1024-row prefill; at 1 MiB it is 1,472 and one call (the same bytes
     // stream through VTCM in narrower slices).
-    // ponytail: K = 2816 at 1 MiB would make the qkv call one for 2048
+    // K = 2816 at 1 MiB would make the qkv call one for 2048
     // rows too (2,368 a call), but the MoE call after it then fails with
     // AEE_ENOMEMORY on the S26 Ultra at C = 32 (DSP memory, not yet found
     // which); the qkv call stays two calls there.
@@ -8155,7 +7850,7 @@ private:
     // A slice holds whole heads, so a per-head norm folded into the call
     // (mm_u8i4_layer_norm's post chunks) never straddles two handles: 512
     // columns is the widest head dim here and divides every smaller one.
-    // ponytail: a head dim that does not divide 512 needs its own
+    // a head dim that does not divide 512 needs its own
     // alignment passed down, not this constant.
     return cols >= 512u ? (cols / 512u) * 512u : cols;
   }
@@ -8179,7 +7874,7 @@ private:
     FcHandles fh;
     const unsigned int cap = fcSliceCols(K);
     if (const FcWhEntry *w = fcwhFind(matAdata, K, N)) {
-      // [#225] LFM's FC WH sidecar ahead of #4415's order; no-op without
+      // LFM's FC WH sidecar ahead of #4415's order; no-op without
       // fc_wh_file_name (Gemma sets none)
       for (uint32_t c0 = 0; c0 < N; c0 += cap) {
         const uint32_t n = std::min<uint32_t>(cap, N - c0);
@@ -8229,7 +7924,7 @@ private:
     return fc_cache_.emplace(matAdata, std::move(fh)).first->second;
   }
 
-  /** @brief [#225] The sidecar image of the Q4_0 weight at @a q4, or
+  /** @brief The sidecar image of the Q4_0 weight at @a q4, or
    *  nullptr when the model has no sidecar. A sidecar that lacks the weight
    *  or has it at another shape is a main file re-quantized without its
    *  sidecar, refused rather than re-quantized around. */
@@ -8272,13 +7967,13 @@ private:
     }
   }
 
-  /** @brief [#225] Columns [c0, c0 + cn) of one sidecar image. */
+  /** @brief Columns [c0, c0 + cn) of one sidecar image. */
   struct WhPart {
     const FcWhEntry *w;
     uint32_t c0, cn;
   };
 
-  /** @brief [#225] Registers rows [k0, k0 + kn) of the column parts
+  /** @brief Registers rows [k0, k0 + kn) of the column parts
    *  @a parts, side by side, as one [kn x sum(cn)] weight, from the sidecar.
    *
    * WH tiles are k-major (htp_wh_layout.h), so a part's kt-row is one
@@ -8290,7 +7985,7 @@ private:
    * values, which the bake packs back into the same tiles -- registerRm's
    * overflow without its conversion. NNTR_HTP_FC_WH_HEAP=1 sends every
    * handle that way (the host check of that path).
-   * ponytail: 4-bit only -- the sidecar is QS4CX_WH/1 and the ArenaEntry
+   * 4-bit only -- the sidecar is QS4CX_WH/1 and the ArenaEntry
    * leaves pal empty; plan 229 S2 (2-bit FCs) bumps FCWH_FORMAT and sizes
    * the image by its bits here (whBytes2 + the palette, as the 2-bit
    * experts do).
@@ -8372,7 +8067,7 @@ private:
       const char *v = std::getenv("NNTR_HTP_FC_WH_HEAP");
       return v != nullptr && std::atoi(v) != 0;
     }();
-    // [#225 PR 2] On the E2E path these images are also the decode FC set,
+    // On the E2E path these images are also the decode FC set,
     // and the expert pool's chunks leave them no room (plan 225 section
     // 3.5: pool C=28 3328 + FC WH 216 + lm_head Q4M1 147 = 3691 of the
     // PD's 3840 MiB), so they map their own chunk, sized for every image
@@ -8425,15 +8120,10 @@ private:
   /** @brief Registers one row-major int8 [K x N] weight (values in [-8, 7],
    *  the form htp_qs4cx_from_* produce) with its scales and column sums.
    *
-   * [doc 50 section 3.3] Into a mapped arena chunk's free room first: the
-   * 3840 MiB mapped hold 3696 of MoE weights, and the DSP heap gave the
-   * loaded app ~100 MiB before AEE_ENOMEMORY. Only room that is already
-   * mapped -- a new chunk would take the address space the heap
-   * registrations after this one need. The arena wants WH bytes: packed
-   * on the host into a cached buffer and copied in whole, since whPack's
-   * read-modify-write into the uncached chunk would crawl. When no mapped
-   * room is left, the DSP heap, as a whole weight would have gone. A
-   * refusal by the DSP leaves the arena bytes unused, once.
+   * Prefer the mapped arena; use the DSP heap when no arena space is
+   * available. Pack WH bytes in a cached host buffer before copying to the
+   * uncached arena, where read-modify-write packing would be slow. A DSP
+   * registration failure leaves that arena range unused.
    * @param key what handle_cache_ files the handle under: an address inside
    *            the weight this is a slice of, distinct per slice
    * @note  Call with handle_mutex_ already held. */
@@ -8443,10 +8133,8 @@ private:
                       uint64_t convert_us) {
     const uint32_t wh_len = static_cast<uint32_t>(whBytes(K, N));
     uint32_t chunk = 0, off = 0;
-    // NNTR_HTP_FC_IN_ARENA=1: new 256 MiB chunks when the mapped room runs
-    // out, so the FC set (~880 MiB on Gemma 4) stays off the DSP heap. The
-    // heap's growth stops near 1.7 GiB on the S25, and a 4k prompt's
-    // quantized KV caches (~950 MiB) are heap allocations.
+    // The fixed arena policy allows new chunks, preserving DSP heap room
+    // for quantized KV caches.
     constexpr bool fc_in_arena = htp_fixed::FC_IN_ARENA; // built in
     if (ensureArena(session) &&
         (fc_in_arena ? place(session, wh_len, size_t(256) << 20, &chunk, &off)
@@ -8520,7 +8208,7 @@ private:
     DenseHandles dh;
     dh.w = w;
     if (const FcWhEntry *wu = fcwhFind(up, K, I)) {
-      // [#225] the same chunks from the sidecar: gate | up column slices
+      // the same chunks from the sidecar: gate | up column slices
       // side by side, the down's row slices with their own column sums
       const FcWhEntry *wg = fcwhFind(gate, K, I), *wd = fcwhFind(down, I, N);
       for (uint32_t c0 = 0; c0 < I; c0 += w) {
@@ -8676,7 +8364,7 @@ private:
    *  K = 2048 are exactly C = 2048 wide, so its three handles ARE a, b
    *  and c and the kernel's split is free; a shape where the slices do
    *  not fall on the thirds is refused rather than re-sliced.
-   *  ponytail: fcSliceCols(K) == C is this model's coincidence. Another
+   *  fcSliceCols(K) == C is this model's coincidence. Another
    *  shape needs its own slicing here (three registerRm calls at c0 = 0,
    *  C, 2C), not a change to the kernel. Cached by in_proj's pointer. */
   const ConvHandles &get_or_register_conv(void *in_proj, void *out_proj,
@@ -8716,7 +8404,7 @@ private:
       static_cast<remote_handle64>(HtpBackend::global().handle());
     const ConvHandles &ch =
       get_or_register_conv(in_proj, out_proj, session, K, C, N);
-    // [#225] In row chunks like invokeMoeLayer's, each after the first
+    // In row chunks like invokeMoeLayer's, each after the first
     // continuing from the state the one before handed back
     const unsigned int step = prefillRows() != 0 ? prefillRows() : M;
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
@@ -8727,12 +8415,8 @@ private:
     }
   }
 
-  /** @brief [#225] Rows per call of the conv block's prefill, whose session
-   *  scratch grows with M (LFM2 only; since #260 #4415's MoE layer, FC and
-   *  dense FFN calls take the whole prefill in one call): 512, the
-   *  prefill the DSP heap held beside the FC weights in #222's sitting
-   *  where 1024 failed with AEE_ENOMEMORY. NNTR_HTP_PREFILL_ROWS=<n> sets
-   *  another, 0 one call per prefill (the host check of the chunking). */
+  /** @brief Conv prefill row limit for bounded session scratch: 512 by
+   *  default. NNTR_HTP_PREFILL_ROWS overrides it; 0 uses the whole prefill. */
   static unsigned int prefillRows() {
     static const unsigned int rows = [] {
       const char *v = std::getenv("NNTR_HTP_PREFILL_ROWS");
@@ -8749,11 +8433,6 @@ private:
     return true;
   }
 
-  /** Declared here rather than beside arena_chunks_ at the bottom of the
-     class: registerFromArena takes an ArenaEntry by reference, and a
-     parameter type has to be complete where the function is declared, unlike
-     a member a function BODY refers to. Only an HTP build compiles this
-     file, so a host build cannot catch it. */
   /** @brief One uncached ION buffer the DSP has mapped, filled front to
    *  back. Never reused or rewritten: a weight placed here keeps its bytes
    *  for the process lifetime, which is also why the DSP can borrow them
@@ -8777,7 +8456,7 @@ private:
     std::vector<float> bias;
     /** Four int4 codes when this is a QS2CX_WH weight, empty at 4 bits. */
     std::vector<int8_t> pal;
-    /** [PR 4428] A QS4CX_WH_AFFINE expert's per-column integer offsets,
+    /** A QS4CX_WH_AFFINE expert's per-column integer offsets,
      *  kept only when one of them is not zero: all-zero offsets register
      *  symmetric, which the kernel computes bit-identically and faster. */
     std::vector<int32_t> offsets;
@@ -8801,7 +8480,7 @@ private:
     ExpertSlot slot;
     const void *key_dn;
     uint32_t h_gu, h_dn;
-    ExpertFileDesc d; /**< [#216] its file ranges, for the WILLNEED on evict */
+    ExpertFileDesc d; /**< its file ranges, for the WILLNEED on evict */
     bool tl2 = false;
   };
 
@@ -9212,7 +8891,7 @@ private:
    *  free list holds every size the model's experts come in; the LRU is
    *  shared across them, so a layer whose experts are larger than its
    *  reserved share grows the arena by the difference.
-   *  ponytail: with one LRU over two slot sizes, the 4-bit layers can hold
+   *  with one LRU over two slot sizes, the 4-bit layers can hold
    *  more experts than were reserved for them while same-count smaller
    *  slots idle; bounded by those two layers' expert count. A per-size LRU
    *  is the upgrade if the arena growth shows in the memory numbers.
@@ -9281,7 +8960,7 @@ private:
     return d.affine ? 12u : 8u;
   }
 
-  /** @brief [plan 229] A weight's WH code bytes: whBytes at four bits,
+  /** @brief A weight's WH code bytes: whBytes at four bits,
    *  whBytes2 at two (QS2CX_WH). */
   static size_t codeBytes(uint32_t K, uint32_t N, uint32_t w_bits) {
     if (w_bits == HTP_TL2_WEIGHT_BITS)
@@ -9289,7 +8968,7 @@ private:
     return w_bits == 2u ? whBytes2(K, N) : whBytes(K, N);
   }
 
-  /** @brief [plan 229] The palette between a QS2CX_WH weight's codes and
+  /** @brief The palette between a QS2CX_WH weight's codes and
    *  its scales in the file (QS2CX_WH_Tensor); none at four bits. */
   static uint32_t paletteBytes(uint32_t w_bits) {
     return w_bits == 2u ? WH_PALETTE_LEVELS : 0u;
@@ -9302,7 +8981,7 @@ private:
     int rc = readExpertWeight(st, false, use_pool);
     if (rc == 0)
       rc = readExpertWeight(st, true, use_pool);
-    if (rc == 0 && advise && fadviseKnob() != 0) // [#216] the slot holds it
+    if (rc == 0 && advise && fadviseKnob() != 0) // the slot holds it
       adviseLater({{st.d, false}});
     return rc;
   }
@@ -9416,7 +9095,7 @@ private:
     st.prefetch_claimed = false;
   }
 
-  /** @brief [#266] A miss round's reads, all at once: one job per weight,
+  /** @brief A miss round's reads, all at once: one job per weight,
    *  or per adjacent native TL2 pair that fits one direct read.
    *  NNTR_MOE_MISS_READERS threads of the ThreadManager
    *  taking them in turn, each job one whole-range pread plus its tail.
@@ -9498,7 +9177,7 @@ private:
       e2e_st_->pool_pair_reads += pair_reads;
   }
 
-  /** @brief [#266] NNTR_MOE_MISS_READERS: the miss round's reader count
+  /** @brief NNTR_MOE_MISS_READERS: the miss round's reader count
    *  (4, the S25 probe's best for whole-weight reads; 1 reads the round's
    *  weights one after another on the pool server). */
   static size_t missReaders() {
@@ -9510,13 +9189,13 @@ private:
     return n;
   }
 
-  /** @brief [#216] NNTR_MOE_FADVISE: unset / 0 = no advice (the bytes and
+  /** @brief NNTR_MOE_FADVISE: unset / 0 = no advice (the bytes and
    *  the reads are the same either way); 1 = an expert's file pages are
    *  dropped from the page cache once its bytes are in the arena and asked
    *  back when it leaves the arena, so the cache holds about the arena's
    *  complement instead of the whole file; 2 = the drop only (diagnostic:
    *  every miss then reads storage). */
-  /** @brief [#289] The process's resident set now, MiB (0 off Linux). */
+  /** @brief The process's resident set now, MiB (0 off Linux). */
   static double rssMib() {
     double mib = 0.0;
 #if defined(__linux__)
@@ -9530,7 +9209,7 @@ private:
     return mib;
   }
 
-  /** @brief [#289] /proc/meminfo's MemAvailable, MiB (0 off Linux): the
+  /** @brief /proc/meminfo's MemAvailable, MiB (0 off Linux): the
    *  dma-buf blocks (the KV cache, the arena) are not in the RSS. */
   static double memAvailMib() {
     double mib = 0.0;
@@ -9549,7 +9228,7 @@ private:
     return mib;
   }
 
-  /** @brief [#289] NNTR_MOE_LRFU unset or a half-life other than 0: the
+  /** @brief NNTR_MOE_LRFU unset or a half-life other than 0: the
    *  pool's policy (causallm::ExpertLru, whose default this restates) is
    *  LRFU, which parses the value. */
   static bool lrfuOn() {
@@ -9570,7 +9249,7 @@ private:
     return k;
   }
 
-  /** @brief [#216] posix_fadvise DONTNEED (or WILLNEED) on both weight
+  /** @brief posix_fadvise DONTNEED (or WILLNEED) on both weight
    *  ranges of @a d as readWeight reads them: nibbles, N scales, N sums.
    *  Advice only -- a failure changes nothing a matmul reads, so it is not
    *  checked. */
@@ -9601,7 +9280,7 @@ private:
 #endif
   }
 
-  /** @brief [#216] fadviseExpert on each (expert, willneed) of @a v, on
+  /** @brief fadviseExpert on each (expert, willneed) of @a v, on
    *  one background thread: on the S25 a WILLNEED reads before it returns
    *  (3-8 ms an expert) and a DONTNEED took about 2 ms on a miss's path;
    *  a thread per call inherited its caller's core pin (the pool server's)
@@ -9655,7 +9334,7 @@ private:
     q->cv.notify_one();
   }
 
-  /** @brief [#216] /proc/vmstat pgpgin (KiB read from block devices,
+  /** @brief /proc/vmstat pgpgin (KiB read from block devices,
    *  system-wide), 0 where there is no such file. */
   static uint64_t vmstatPgpginKib() {
     uint64_t v = 0;
@@ -9842,7 +9521,7 @@ private:
       std::vector<uint32_t> hg(n, kNoHandle), hd(n, kNoHandle);
       std::vector<float> gs, ds;
       std::vector<int32_t> gc, dc;
-      std::vector<int8_t> pg, pd; // [plan 229] QS2CX_WH palettes, 4 each
+      std::vector<int8_t> pg, pd; // QS2CX_WH palettes, 4 each
       for (size_t i = 0; i < n; ++i) {
         const StagedExpert &st = *ok[i];
         pg.insert(pg.end(), st.gu.pal.begin(), st.gu.pal.end());
@@ -9901,7 +9580,7 @@ private:
         else
           free_expert_slots_.push_back(ok[i]->slot);
       }
-      // [PR 4428] The affine experts' non-zero offsets, one call for the
+      // The affine experts' non-zero offsets, one call for the
       // batch: the swap registered them symmetric, and a handle whose
       // offsets are all zero stays that way (bit-identical, faster).
       std::vector<uint32_t> oh, on;
@@ -10060,12 +9739,12 @@ private:
    *  arrays stay empty, which is what tells the swap call the arrays are
    *  in the arena. whBytes(K, N) is the nibble half exactly:
    *  QS4CX_Tensor::size() counts N * ceil(K / 2) and K is a multiple of
-   *  32 here. [plan 229] At @a w_bits 2 (QS2CX_WH) the codes are
+   *  32 here. At @a w_bits 2 (QS2CX_WH) the codes are
    *  whBytes2(K, N) and four palette bytes sit between them and the
    *  scales: those go to @a e.pal, not to the arena, which keeps the
    *  slot's [codes][scales][sums] shape. @return 0, errno, or -1 at end
    *  of file. */
-  /** @brief [#282] One layer's expert bytes held in RAM: file range
+  /** @brief One layer's expert bytes held in RAM: file range
    *  [off, off + len) at @a p. */
   struct PinRange {
     int fd;
@@ -10073,7 +9752,7 @@ private:
     const uint8_t *p;
   };
 
-  /** @brief [#282] NNTR_MOE_PIN: 0 / unset = misses pread the file (as
+  /** @brief NNTR_MOE_PIN: 0 / unset = misses pread the file (as
    *  before); 1 = each MoE layer's expert range is mmapped MAP_POPULATE
    *  (+ mlock, logged, not required) and a miss copies from that mapping;
    *  2 = the range is read into anonymous memory (not evictable as page
@@ -10170,7 +9849,7 @@ private:
                  static_cast<size_t>(rssKb() >> 10), memAvailableMib());
   }
 
-  /** @brief [#282] /proc/meminfo's MemAvailable, MiB (0 if unreadable). */
+  /** @brief /proc/meminfo's MemAvailable, MiB (0 if unreadable). */
   static size_t memAvailableMib() {
     FILE *f = std::fopen("/proc/meminfo", "r");
     if (f == nullptr)
@@ -10184,7 +9863,7 @@ private:
     return kb >> 10;
   }
 
-  /** @brief [#282] NNTR_MOE_PIN_FLOOR_MIB (default 2048). */
+  /** @brief NNTR_MOE_PIN_FLOOR_MIB (default 2048). */
   static size_t pinFloorMib() {
     static const size_t v = [] {
       const char *e = std::getenv("NNTR_MOE_PIN_FLOOR_MIB");
@@ -10193,14 +9872,10 @@ private:
     return v;
   }
 
-  /** @brief [#282 B] NNTR_HTP_DROP_HOST_FC=1: at the first decode token,
-   *  hand the OS back the CPU copies of the decode list's FC / DENSE_FFN /
-   *  LM_HEAD weights (q4_pending_). The one-PD token reads its own arena
-   *  copies (bindQ4m1, lmHeadHandles) and the prefill FCs their WH handles,
-   *  registered by then; the CPU layers skip their GEMVs on a resident row.
-   *  Keep the LM_HEAD for later prefills; unlike the other accelerated FCs,
-   *  an untied head can still run on the CPU. A CPU fallback for a dropped
-   *  FC would require re-reading its weight from the model file. */
+  /** @brief Release host FC / DENSE_FFN sources after DSP registration,
+   *  according to htp_fixed::DROP_HOST_FC. Retain LM_HEAD for later CPU
+   *  prefills and any source with a CPU consumer. A dropped source would
+   *  have to be reloaded before CPU fallback. */
   void dropHostFc(bool qs4cx_only = false) {
     // The memory profile releases sources individually after registration and
     // an alias check in Transformer. Do not override a retained CPU consumer.
@@ -10237,7 +9912,7 @@ private:
     memLine("t1 after drop host fc");
   }
 
-  /** @brief [#282] The pinned bytes of file range [off, off + len), or
+  /** @brief The pinned bytes of file range [off, off + len), or
    *  nullptr when they are not pinned. */
   const uint8_t *pinnedAt(int fd, uint64_t off, uint64_t len) const {
     for (const PinRange &r : pin_ranges_)
@@ -10309,7 +9984,7 @@ private:
         return rc;
       return finishTl2Weight(K, N, tail.data(), arena_dst, e);
     }
-    // [#282] a pinned expert is a DDR copy, never a file read
+    // a pinned expert is a DDR copy, never a file read
     const size_t pal0 = paletteBytes(w_bits);
     if (const uint8_t *pin = pinnedAt(fd, off, nib + pal0 + tail_bytes)) {
       std::memcpy(arena_dst, pin, nib);
@@ -10319,7 +9994,7 @@ private:
       e.N = N;
       return 0;
     }
-    // [doc 52 sections 10.7, 10.9] The nibble read is 82% of a miss and
+    // The nibble read is 82% of a miss and
     // capped near 4.9 GB/s by the uncached mapping whatever the thread
     // count: 8 slices bought 18% warm. Kept for the load and prefill
     // registration; the miss round (readMisses, #266: slices of one weight
@@ -10386,21 +10061,12 @@ private:
   /**
    * @brief Hands the OS back the pages of a weight that is now in the arena.
    *
-   * The arena copy doubles this model's 3.9 GB of expert weights, and the
-   * device refuses the fourth 1 GiB ION chunk long before the last layer
-   * registers (measured: 1170 of 1408 weights, doc 46 section 36.3). The ARM
-   * copy is dead the moment the memcpy above returns -- the matmul reads the
-   * arena -- so this drops it. MADV_DONTNEED rather than free() because every
-   * weight is a slice of ONE pool allocation that nobody may free piecemeal;
-   * see whSourcePageRange for why the range is rounded inward and why the
-   * pointer stays a valid handle_cache_ key afterwards.
-   *
-   * A read of these bytes after this point returns zeros, which would be a
-   * silently wrong matmul. Nothing reads them: the only other reader is the
-   * layer's per-expert CPU loop, and that path throws on a QS4CX_WH weight
-   * (FloatTensor::dot) rather than computing with zeros. Set
-   * NNTR_HTP_KEEP_ARM_WEIGHTS=1 to keep them anyway when bisecting a wrong
-   * answer -- the model then needs both copies resident.
+   * Use MADV_DONTNEED because weights share a pool allocation and cannot
+   * be freed individually. whSourcePageRange rounds inward to protect
+   * adjacent weights; the pointer remains a valid handle_cache_ key.
+   * Released pages read as zeros, so callers must have no CPU consumer.
+   * QS4CX_WH CPU dot rejects that format rather than reading these pages.
+   * NNTR_HTP_KEEP_ARM_WEIGHTS retains the source for debugging.
    */
   void releaseArmSource(void *src, size_t len) {
 #if defined(__linux__)
@@ -10575,15 +10241,10 @@ private:
   /**
    * @brief Decides, once, whether weights can be registered out of the arena.
    *
-   * Nothing is mapped here: the first weight's place() makes the first chunk.
-   * All this answers is whether this device gives out the two calls an arena
-   * is made of -- an fd for a host buffer and a way to attach it.
-   *
-   * @return true if weights can be registered out of the arena. false means
-   *         the ordinary DSP-heap path, which still works for QS4CX -- it
-   *         just has the 1.89 GB ceiling Gate 0 measured -- and which
-   *         get_or_register_wh refuses, because WH bytes have no other home.
-   * @note   Call with handle_mutex_ already held.
+   * Checks for fd lookup and mapping APIs; place() creates the first chunk.
+   * @return true when the arena APIs exist. Otherwise QS4CX may use the
+   *         DSP heap; WH registration fails because it requires the arena.
+   * @note Call with handle_mutex_ already held.
    */
   bool ensureArena(remote_handle64 session) {
     (void)session;
@@ -10609,7 +10270,7 @@ private:
                    want, chunk, off);
   }
 
-  /** @brief place() on any chunk list: [#132 Part B E3] the E2E FC arena
+  /** @brief place() on any chunk list: the E2E FC arena
    *  is the same path on its own chunks. */
   bool placeOn(remote_handle64 session, int domain,
                std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
@@ -10647,29 +10308,8 @@ private:
     return false;
   }
 
-  /** @brief Allocates one uncached ION buffer and attaches it to the DSP.
-   *  @note  Call with handle_mutex_ already held. */
-  /**
-   * @brief Largest arena chunk to ask the DSP for.
-   *
-   * 256 MiB, and the size is the whole fix for the memory wall (doc 46
-   * section 41). A clean process maps 3840 MiB in 256 MiB steps; the model
-   * with 1 GiB chunks stopped at 3072 and was then refused at every size
-   * down to 64 MiB. A flat byte budget cannot produce both. A bump
-   * allocator that aligns each mapping to its own size can: 1 GiB chunks
-   * land at 1G, 2G, 3G and push the cursor to the 4 GB end of the PD's
-   * address space, so the 768 MiB below the first one is never reachable
-   * again. 256 MiB chunks waste none of it.
-   *
-   * The model needs 3696 MiB of weights. That leaves ~144 MiB of margin,
-   * which place() protects by scanning every chunk for room -- a 1.75 MiB
-   * down weight fits tails a 3.5 MiB gate_up cannot.
-   *
-   * ponytail: if a bigger model needs more, the next thing to take is the
-   * DSP heap, which answered AEE_ENOMEMORY after 182 MiB with 3840 mapped
-   * -- heap and mappings share the one 4 GB space, so there is no second
-   * budget to find, only this one to stop wasting.
-   */
+  /** @brief Largest arena chunk: 256 MiB limits alignment waste in the
+   *  DSP's shared heap/mapping address space. place() reuses chunk tails. */
   static constexpr size_t kArenaChunkMax = size_t(256) << 20;
   /** @brief This process's resident set, in KB, or 0 if it cannot be read.
    *  The one number that says whether releaseArmSource actually gave the
@@ -10713,18 +10353,11 @@ private:
   bool tryChunkOn(remote_handle64 session, int domain,
                   std::vector<ArenaChunk> &chunks, size_t size) {
     const unsigned long long rss_before = rssKb();
-    // Uncached, because the DSP maps this once and the host keeps writing
-    // into it afterwards -- with an uncached CPU mapping those writes reach
-    // DDR with no flush to remember. The host never reads it back, so the
-    // cost is on the write side only. The probe that passed Gate 0c wrote
-    // BEFORE attaching and used a cached buffer, so this ordering is the
-    // one thing section 34 rests on that the probe did not show; the
-    // ArenaUncachedWriteAfterMap test is what answers it.
+    // The DSP maps once, then the host keeps writing. An uncached CPU
+    // mapping makes those writes visible without explicit flushes.
     auto buf = std::make_unique<HtpRpcBuffer>(size, HTP_RPC_FLAGS_UNCACHED);
-    // [#132 Part B E5g] the buffer of a refused mapping lives until this
-    // one exists, so the retry gets another fd: E5g's retries at 128 and 64
-    // MiB after a refused 256 were refused AEE_EALREADY on the freed
-    // buffer's fd number, which the driver still held
+    // Keep the refused buffer alive until this allocation gets a new fd.
+    // The driver may retain the old fd entry and reject its reuse.
     last_failed_.reset();
     if (!buf->isIon()) {
       arena_fail_ = "rpcmem_alloc(" + std::to_string(size >> 20) +
@@ -10739,10 +10372,8 @@ private:
     }
 
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
-    // FASTRPC_MAP_FD, not 0: 0 is FASTRPC_MAP_STATIC, which is the driver's
-    // mapping for a buffer passed as a call argument and is not tagged with
-    // the fd, so HAP_mmap_get on the DSP refuses it. Three device runs went
-    // on that (doc 46 section 32.10).
+    // HAP_mmap_get requires an fd-tagged mapping (FASTRPC_MAP_FD).
+    // FASTRPC_MAP_STATIC, value 0, does not retain that association.
     const int merr = api.mmap(domain, fd, buf->data(), 0, size, FASTRPC_MAP_FD);
     if (merr != 0) {
       // the driver may keep the fd's entry after a refused map: drop it
@@ -10794,15 +10425,9 @@ private:
   }
 
   /**
-   * @brief [#132 Part B E5i] The S1 arena's close hook, after the queues and
-   *        the token drivers (atCloseLast: after every atClose hook): the
-   *        skel releases the graph, the weights and every arena
-   *        (arenas_release), then each chunk is fastrpc_munmap'd, every rc
-   *        checked, before the session closes -- the S1Ceiling probe's
-   *        order. E5f-E5h: about one app run in 20, A or E, left the next
-   *        process one 256 MiB window short when the arena was left mapped
-   *        to process exit (and its buffers rpcmem_free'd, still mapped, by
-   *        whichever singleton died first).
+   * @brief Final close hook, after queues and token drivers stop. Release
+   *        DSP graph/weights/arenas, unmap every chunk, then free buffers.
+   * Unmapping before rpcmem_free avoids leaking mappings into later runs.
    */
   static void s1ArenaTeardown(remote_handle64 session,
                               std::vector<ArenaChunk> &chunks) {
@@ -10861,16 +10486,9 @@ private:
   /**
    * @brief Adds a chunk, halving the request until one is accepted.
    *
-   * The DSP refused a fourth 1 GiB mapping after three were accepted (doc 46
-   * section 39), so this ceiling is measured in whole GiB and the last GiB
-   * before it is left on the floor. Halving turns a ceiling that happens to
-   * fall between two chunk sizes into one the arena can fill up to, and the
-   * size the run settles on is itself the measurement -- there is no other
-   * way to learn where the DSP's address space actually ends.
-   *
-   * chunk_cap_ remembers what was refused, so a size known not to fit is not
-   * asked for again on the next weight. A failure to map is not free: the
-   * host buffer is allocated and released each time.
+   * Halving fills address space that cannot accommodate the requested
+   * chunk. chunk_cap_ remembers refusals to avoid repeated allocations
+   * and failed mappings on later weights.
    */
   bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
     return newChunkOn(session, CDSP_DOMAIN_ID, arena_chunks_, chunk_cap_, bytes,
@@ -10996,7 +10614,7 @@ private:
   std::unordered_map<const void *, DenseHandles> dense_cache_;
   /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */
   std::unordered_map<const void *, ConvHandles> conv_cache_;
-  /** [#225] The FC WH sidecar (set_fc_wh_file): its fd, path and index by
+  /** The FC WH sidecar (set_fc_wh_file): its fd, path and index by
    *  fcWhKey, and the bytes its images took in the arena and on the heap. */
   int fcwh_fd_ = -1;
   std::string fcwh_name_;
@@ -11004,7 +10622,7 @@ private:
   /** Main-file WH records keyed by their tensor data pointer. */
   std::unordered_map<const void *, FcWhEntry> direct_wh_;
   size_t fcwh_arena_bytes_ = 0, fcwh_heap_bytes_ = 0;
-  /** [#225 PR 2] WH bytes of the sidecar's images not registered yet, plus
+  /** WH bytes of the sidecar's images not registered yet, plus
    *  placeExistingOn's 4 KiB alignment for four handles an image (its most:
    *  a dense FFN's chunks). */
   size_t fcwhLeft() const {
@@ -11083,14 +10701,11 @@ private:
   uint32_t prefetch_caller_cpus_ = 0;
 
   /**
-   * @brief [doc 52 section 10.18] Measurement switches for the prefetch
-   *        readers, read once. Section 10.13 found the readers make almost
-   *        no progress while the layer call runs and the call's host side
-   *        grows by 7 ms; section 10.19 traced that to the readers
-   *        sharing the caller's core. Not defaults.
-   *  - NNTR_MOE_PREFETCH_READERS=<n>: reader threads (6)
-   *  - NNTR_MOE_PREFETCH_CPUS=<a,b,..>: pin the readers to these cores
-   *    (default: every core but the caller's)
+   * @brief Prefill reader settings, read once. Keep reader work off the
+   *        caller's core to avoid competing with the layer call.
+   *  - NNTR_MOE_PREFETCH_READERS: thread count (default 6).
+   *  - NNTR_MOE_PREFETCH_CPUS: comma-separated cores; default excludes
+   *    the caller's cores.
    */
   struct PrefetchKnobs {
     size_t readers = 6;
@@ -11160,14 +10775,9 @@ private:
   std::string arena_fail_;
   /** Largest chunk still worth asking for; only ever shrinks. */
   size_t chunk_cap_ = kArenaChunkMax;
-  /** [#132 Part B E5g] The last refused chunk's buffer, freed after the
+  /** The last refused chunk's buffer, freed after the
    *  next one is allocated (tryChunkOn). */
   std::unique_ptr<HtpRpcBuffer> last_failed_;
-
-  // [#132 Part B E5i] Unmapped by the close hook s1ArenaTeardown (it was
-  // left mapped to process exit until E5h). ponytail: a process that loads
-  // and unloads models still keeps every arena to its end; a reload would
-  // need the same hook at model teardown.
 
   // ION-backed activation/output scratch, reused across calls, one buffer
   // per size class (stage) -- see invokeLayer's comment. Guarded by the
@@ -11177,10 +10787,10 @@ private:
   std::mutex moe_opts_mutex_;
   std::string moe_hadamard_ = "off", moe_hadamard_scope_ = "2bit";
   std::atomic<bool> moe_opts_sent_{false};
-  /** [PR 4428] set_moe_hadamard_signs's vectors until the session has them */
+  /** set_moe_hadamard_signs's vectors until the session has them */
   std::mutex had_signs_mutex_;
   std::vector<float> had_signs_in_, had_signs_down_;
-  // [#85] The decode op list from set_decode_graph_desc, its MoE ops in
+  // The decode op list from set_decode_graph_desc, its MoE ops in
   // list order, how many have their handles bound (first-pass call order),
   // the op each layer's first gate_up handle belongs to, and whether
   // graph_init has run on the session.
@@ -11189,26 +10799,26 @@ private:
   std::vector<uint32_t> moe_ops_;
   size_t moe_bound_ = 0;
   std::unordered_map<uint32_t, uint32_t> moe_op_by_handle_;
-  /** [plan 201 S1] per MoE op (moe_ops_ order) its EXPERTS table as the
+  /** per MoE op (moe_ops_ order) its EXPERTS table as the
    *  f32 words graph_set_param carries: h_gu[0..E) then h_dn[0..E) */
   std::vector<std::vector<float>> moe_tables_;
-  /** [plan 201 S1] The expert pool behind the per-token entry
+  /** The expert pool behind the per-token entry
    *  (set_decode_moe_experts): per MoE layer its experts, where each
    *  gate_up key sits (layer, expert), the layer's policy, and whether a
    *  prefill touched the pool since the last token (poolSync). */
   std::vector<std::vector<ExpertFileDesc>> pool_descs_;
-  std::vector<PinRange> pin_ranges_; /**< [#282] NNTR_MOE_PIN */
+  std::vector<PinRange> pin_ranges_; /**< NNTR_MOE_PIN */
   bool pinned_ = false;
-  bool host_fc_dropped_ = false; /**< [#282 B] NNTR_HTP_DROP_HOST_FC */
-  /** [#282 F] the first token's setup timers */
+  bool host_fc_dropped_ = false; /**< NNTR_HTP_DROP_HOST_FC */
+  /** the first token's setup timers */
   uint64_t seed_rpc_us_ = 0;
   unsigned seed_calls_ = 0;
-  unsigned seed_kvq_ = 0; /**< [#289] of them, seeded on the DSP from kvq */
+  unsigned seed_kvq_ = 0; /**< of them, seeded on the DSP from kvq */
   bool t1_printed_ = false;
-  /** [#282 D] the kv_cache_q handles registered and not released */
+  /** the kv_cache_q handles registered and not released */
   std::mutex kvq_mutex_;
   std::set<uint32_t> kvq_handles_;
-  /** [#282 B] the prefetch readers (NNTR_MOE_PREFETCH): their queue, and
+  /** the prefetch readers (NNTR_MOE_PREFETCH): their queue, and
    *  the counts the close line prints. The issued keys are the pool
    *  server's alone: a later miss of one counts as useful. */
   std::mutex pf_mu_;
@@ -11222,8 +10832,8 @@ private:
   static inline std::atomic<uint64_t> pf_done_{0};
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
-  std::function<void(size_t)> pool_grow_; /**< [#4416] set_decode_pool_grow */
-  std::vector<uint8_t> pool_answered_;    /**< [#289] layers a miss round served
+  std::function<void(size_t)> pool_grow_; /**< set_decode_pool_grow */
+  std::vector<uint8_t> pool_answered_;    /**< layers a miss round served
                                              this token (handle_mutex_) */
   bool pool_dirty_ = true;
   std::shared_ptr<HtpExpertPrefetch<StagedExpert>> pool_prefetch_;
@@ -11295,7 +10905,7 @@ private:
   }
   bool graph_inited_ = false;
   bool graph_short_warned_ = false;
-  // [#130] The stretch tables of section 3.2: per op the maximal resident
+  // The stretch tables of section 3.2: per op the maximal resident
   // run it belongs to, per kind the resident ops in list order (what the
   // hooks' counters index), per op whether its parameter is bound and,
   // for CONV1D_GATE, the position its DSP state is valid for; per
@@ -11310,17 +10920,17 @@ private:
   uint32_t cur_pos_ = HTP_GRAPH_NO_OP;
   bool row_bound_ = false; /**< every MoE op bound when this row began */
   std::vector<uint8_t> param_bound_;
-  /** [#4416 D6] the distinct RoPE tables bound: (ROPE op, its bytes) */
+  /** the distinct RoPE tables bound: (ROPE op, its bytes) */
   std::vector<std::pair<uint32_t, std::vector<float>>> rope_tables_;
   std::vector<uint32_t> conv_next_pos_;
   std::vector<uint32_t> kv_len_;
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
-  /** [plan 201 S4] per attention ordinal its op, its session cache (0, or
+  /** per attention ordinal its op, its session cache (0, or
    *  1 for the second attn_m1_register: another (n_kv, gqa, head_dim)) and
    *  its ordinal within that cache (hexkl_graph_init's) */
   std::vector<uint32_t> attn_op_, attn_cache_, attn_cache_ord_;
-  /** [plan 201 S4] the f32 parameters the model handed at load
+  /** the f32 parameters the model handed at load
    *  (set_decode_graph_param), bound after graph_init */
   struct LoadParam {
     uint32_t op, which;
@@ -11331,17 +10941,17 @@ private:
   uint32_t seed_ordinal_ = HTP_GRAPH_NO_OP;
   uint32_t pending_op_ = HTP_GRAPH_NO_OP;
   std::vector<float> pending_in_;
-  // [#132] the routing a MOE op that starts a stretch was handed
+  // the routing a MOE op that starts a stretch was handed
   std::vector<unsigned int> pending_ri_, pending_rc_;
   std::vector<float> pending_rw_;
-  // [#132 Part B] the model's Q4_0 weights for the Q4M1 kinds, in list
+  // the model's Q4_0 weights for the Q4M1 kinds, in list
   // order, until bindQ4m1; the handles registered for them
   struct Q4Pending {
     const void *data;
     uint32_t K, N;
     bool canonical;
-    const float *scale = nullptr; /**< [#260] QS4CX: N scales; Q4_0: null */
-    bool dropped = false;         /**< [#4416 mem] CPU copy handed back */
+    const float *scale = nullptr; /**< QS4CX: N scales; Q4_0: null */
+    bool dropped = false;         /**< CPU copy handed back */
     bool keep_host = false;       /**< CPU prefill still reads this weight */
   };
   std::vector<Q4Pending> q4_pending_;
@@ -11365,7 +10975,7 @@ private:
   uint32_t first_resident_op_ = HTP_GRAPH_NO_OP;
   uint64_t fwd_calls_ = 0;      /**< nntr_hvx_forward* calls */
   uint64_t fwd_tokens_ = 0;     /**< of them at the first resident op */
-  uint64_t cpu_fc_skipped_ = 0; /**< [#132 Part B] decode_row_resident's
+  uint64_t cpu_fc_skipped_ = 0; /**< decode_row_resident's
                                      true answers: CPU FC calls skipped */
   htp_router_handoff router_handoff_{};
   StagingPool act_pool_;
@@ -11377,10 +10987,10 @@ private:
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */
-  /** [#141] The M==1 MoE call's dspqueue; null until the first such call
+  /** The M==1 MoE call's dspqueue; null until the first such call
       unless NNTR_HTP_DSPQ=0. */
   std::shared_ptr<DspqMoe> dspq_;
-  /** [#132 Part B E3, #211] The E2E path's state, shared with its
+  /** The E2E path's state, shared with its
    *  HtpBackend close hook (which runs after this object is gone). */
   struct E2eState {
     remote_handle64 h1 = 0;
@@ -11396,45 +11006,45 @@ private:
              id_mismatch = 0;
     uint64_t wall_us = 0, wall_pcyc = 0,
              token_us = 0; /**< the DSP's; token_us: the ARM's round trip */
-    /** [#194 L0] the hops' own latency (0 since #211, the wire keeps it),
+    /** the hops' own latency (0 since #211, the wire keeps it),
      *  the ARM's time inside tokenForward, and between one tokenForward's
      *  end and the next one's start (the layer walk, sampler, tokenizer,
      *  print; arm_n intervals) */
     uint64_t hop_us = 0, fwd_us = 0, arm_us = 0, arm_n = 0, last_exit_us = 0;
     uint64_t pool_idle_us = 0, pool_predict_drain_us = 0,
              pool_prefetch_drain_us = 0;
-    /** [#194 L0] wake split on the shared system counter: the ARM's post to
+    /** wake split on the shared system counter: the ARM's post to
      *  the DSP thread's read, the DSP's write to the ARM's read, the DSP's
      *  packet handling around its token (out - in) */
     int64_t disp_us = 0, ret_us = 0, inout_us = 0;
     uint64_t kind[HTP_OP_KIND_N] = {0};
-    /** [#267 L0] the ops' wall us per kind, the pcycles over the waits */
+    /** the ops' wall us per kind, the pcycles over the waits */
     uint64_t kind_us[HTP_OP_KIND_N] = {0}, miss_pcyc = 0;
-    /** [#261] NNTR_HTP_PROFILE: the ATTN_M1 phase words per KV cache,
+    /** NNTR_HTP_PROFILE: the ATTN_M1 phase words per KV cache,
      *  summed over attn_tokens tokens */
     uint64_t attn_calls[2] = {0, 0}, attn_tokens = 0;
     uint64_t attn_prof[2][HTP_DSPQ_ATTN_PROF_WORDS] = {};
-    /** [#267 L3] MOE kernel calls, and the one-at-a-time form's count */
+    /** MOE kernel calls, and the one-at-a-time form's count */
     uint64_t moe_calls = 0, moe_calls_1x = 0;
     uint32_t moe_ops = 0, spin_us = 0;
-    /** [plan 201 S1] the pool: experts S1 loaded and its waits, the miss
+    /** the pool: experts S1 loaded and its waits, the miss
      *  rounds served and the ARM's time on them */
     uint64_t misses = 0, miss_us = 0, pool_rounds = 0, pool_read_us = 0;
     uint64_t pool_pair_reads =
       0; /**< adjacent TL2 demand pairs read together */
-    /** [#282 C] a miss round's parts, us summed: post -> the server
+    /** a miss round's parts, us summed: post -> the server
      *  noticed it, its work before the reads, the reads, S1's present
      *  experts computed meanwhile, the answer written -> S1 saw it, S1's
      *  rebinds */
     uint64_t rt_notice_us = 0, rt_pre_us = 0, rt_read_us = 0, rt_overlap_us = 0,
              rt_anslat_us = 0, rt_rebind_us = 0;
-    uint64_t pgpgin0 = 0; /**< [#216] vmstatPgpginKib() at driver on */
+    uint64_t pgpgin0 = 0; /**< vmstatPgpginKib() at driver on */
   };
   /** @brief Mailbox allocation, including the optional prediction row. */
   static constexpr size_t kMboxBytes = size_t(64) << 10;
   static_assert(HTP_MBOX_PRED_INPUT + HTP_MBOX_PRED_BYTES <= kMboxBytes,
                 "Prediction input must fit the shared mailbox");
-  /** [plan 201 S1] poolServe's thread and its handshake with tokenForward:
+  /** poolServe's thread and its handshake with tokenForward:
    *  active while a token is in flight, idle once the thread stopped
    *  polling; the loads of the last answer until S1 fills their pairs. */
   struct PoolServer {
@@ -11445,7 +11055,7 @@ private:
     bool stop = false, idle = false;
     uint32_t tok = 0;
     std::vector<StagedExpert> pending;
-    /** [#216] this answer's victims, asked back after it */
+    /** this answer's victims, asked back after it */
     std::vector<std::pair<ExpertFileDesc, bool>> advice;
     std::exception_ptr err;
   };
@@ -11518,7 +11128,7 @@ public:
     }
     {
       std::lock_guard<std::mutex> lock(kvq_mutex_);
-      kvq_handles_.insert(h); // [#282 D]
+      kvq_handles_.insert(h);
     }
     return static_cast<int>(h);
   }
@@ -11546,7 +11156,7 @@ public:
     {
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       if (handle < 0 || kvq_handles_.erase(static_cast<uint32_t>(handle)) == 0)
-        return; // [#282 D] released already (NNTR_HTP_E2E_FREE_KVQ)
+        return; // released already (NNTR_HTP_E2E_FREE_KVQ)
     }
     if (hb.enabled() && handle >= 0) {
       nntr_hvx_kv_release_q(static_cast<remote_handle64>(hb.handle()),

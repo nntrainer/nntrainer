@@ -45,11 +45,8 @@
  *        on the DSP, with every intermediate buffer returned so each stage
  *        is checkable. Used by unittest_hvx_mm_u8i4's fixed shapes.
  *
- * hw_init and the HMX lock are session-scoped (nntr_hvx_open), not per
- * call, since doc15 §8 item 3 turned this from a call that stood alone into
- * one of several entry points sharing one session. The weight is still
- * baked fresh every call -- that is the point of this harness, checking the
- * bake -- unlike the resident-weight path in mm_u8i4_layer below.
+ * hw_init and the HMX lock are session-scoped (nntr_hvx_open). The weight
+ * is baked on every call to check baking, unlike the resident-weight path.
  */
 int nntr_hvx_mm_u8i4_from_f32(
   remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
@@ -201,15 +198,7 @@ enum {
 };
 
 /**
- * @brief [doc 45 Gate 0b] The DSP PD's own allocatable memory.
- *
- * Gate 0 stopped at 1.89 GB with 0x8000040d, an error raised before
- * hexkl_weight_u8i4_register ran -- registration's own out-of-memory path
- * returns AEE_ENOMEMORY. So the PD could not service the call at all, and
- * what ran out was PD memory generally rather than the malloc heap the
- * baked weights live in. This probe carries no payload, so whatever it
- * reaches is the heap ceiling on its own, with none of the 3.67 MB input
- * buffer registration also needs in flight.
+ * @brief Probe the DSP PD's allocatable heap without an input payload.
  *
  * Every chunk is touched one byte per 4 KB page: an allocator that reserves
  * lazily would otherwise report a ceiling that does not exist once the

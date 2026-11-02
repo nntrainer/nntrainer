@@ -5,8 +5,7 @@
  * @file   htp_graph_desc.h
  * @date   23 Sep 2026
  * @brief  The per-token decode graph as the DSP receives it: wire format,
- *         validator and the LFM2 / Gemma 4 builders, as pure C99 (#85, v2 in
- *         #130, Gemma in plan 201 S4)
+ *         validator and LFM2 / Gemma 4 builders in pure C99.
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -24,18 +23,15 @@
  *           ffn_kind[n_layers]    (HTP_GRAPH_FFN_*)
  *           ops[n_ops]            (HTP_GRAPH_OP_WORDS each, htp_graph_op)
  *
- * Version 2 (#130) adds four words to the op record -- n_kv, gqa,
- * head_dim for the attention kinds and eps_bits for the norms -- and the
- * kernel shape rules of #81 / #82 to the validator. A v1 skel refuses a
- * v2 list with AEE_EUNSUPPORTED, never AEE_EBADPARM.
- * Version 3 widens the handle arrays to 256 parts for WH LM heads. The
- * version check rejects older layouts before interpreting an op record.
+ * Version 2 added attention dimensions and norm epsilon to each op.
+ * Version 3 widens handle arrays to HTP_GRAPH_MAX_PARTS. A version mismatch
+ * returns AEE_EUNSUPPORTED before any op record is interpreted.
  *
  * The list carries every op of the decode step with its real kind, so the
  * validator can check layer consistency, and a per-op resident bit says
  * whether this build's kernel table runs it. forward() runs from a start
  * op while ops are resident and returns the index of the first op that is
- * not (plan 85 section 3.1: layer-granular resume).
+ * not, allowing layer-granular resume.
  */
 #ifndef __HTP_GRAPH_DESC_H__
 #define __HTP_GRAPH_DESC_H__
@@ -47,26 +43,24 @@
 #define HTP_GRAPH_VERSION                                                      \
   3u /**< 3: HTP_GRAPH_MAX_PARTS 64 (the op record grew) */
 #define HTP_GRAPH_HEADER_WORDS 7u
-/** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build),
- *  Gemma-4-26B-A4B 542 (htp_graph_gemma_build: 18 a layer x 30); the table
- *  is HTP_GRAPH_OP_WORDS x 4 B per op, so 1024 is 320 KiB of DSP heap at
- *  graph_init for v2; v3 uses about 576 KiB for the same 1024-op table. */
+/** @brief Maximum op count; the DSP table uses HTP_GRAPH_OP_WORDS * 4 bytes
+ *  per op. LFM2.5 has 228 ops and Gemma-4-26B-A4B has 542. */
 #define HTP_GRAPH_MAX_OPS 1024u
 #define HTP_GRAPH_MAX_LAYERS 64u
 /** @brief A MOE / ROUTER_TOPK op's expert count (Gemma: 128). A MOE op's
  *  handles are not in its record: they are its HTP_GRAPH_PARAM_EXPERTS
- *  table (plan 201 S1, the expert pool's table). */
+ *  table in the expert pool. */
 #define HTP_GRAPH_MAX_EXPERTS 128u
 /** @brief A resident sigmoid ROUTER_TOPK's expert count: up to two vectors of
- *  lanes (hvx_router_topk_f32, LFM2). The softmax router (eps_bits set,
- *  plan 201 S4) takes HTP_GRAPH_MAX_EXPERTS. */
+ *  lanes (hvx_router_topk_f32, LFM2). The softmax router (eps_bits set)
+ *  takes HTP_GRAPH_MAX_EXPERTS. */
 #define HTP_GRAPH_ROUTER_MAX_EXPERTS 64u
 /** @brief The op record's handle arrays: the Q4M1 kinds' parts. */
 #define HTP_GRAPH_MAX_PARTS                                                    \
   64u /**< 64: an untied lm_head's WH slices (vocab                            \
            262144 in slices a VTCM-sized handle holds) */
 /** @brief The activation slots: 0 the residual stream, 1 / 2 working.
- *  [plan 201 S4] Gemma 4's two-branch FFN fits in three: the MoE branch
+ *  Gemma 4's two-branch FFN fits in three: the MoE branch
  *  first (norm 0 -> 1, router 0 -> 2, MOE 1 -> 2, its post norm 2 -> 2),
  *  then the dense one in place on slot 1 (DENSE_FFN quantizes its input
  *  before it writes), the branch ADD 1 -> 2, the post-FFN norm 2 -> 1 and
@@ -167,25 +161,25 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
  *  position) with op == HTP_GRAPH_NO_OP, the head_dim 64 table every ROPE
- *  op without its own reads; [plan 201 S4] on a ROPE op it is that op's own
+ *  op without its own reads; on a ROPE op it is that op's own
  *  table, max_seq x head_dim (cos[hd / 2] | sin[hd / 2] per position, from
  *  the CPU's precompute_freqs: the layer's theta and rotary variant, e.g.
  *  Gemma 4's proportional RoPE with partial factor 0.25 as zero angles),
  *  shared between ROPE ops that bind equal tables; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
- *  ROUTER_TOPK (#132); [plan 201 S4] for the softmax router (eps_bits set)
+ *  ROUTER_TOPK (#132); for the softmax router (eps_bits set)
  *  ROUTER_BIAS is K + n_experts: the input scale g[K]
  *  (m1_router_input_scale_det: router_scale / sqrt(K)) then the per-expert
- *  scale. [#132 Part B E3] LM_BAN is 0..HTP_GRAPH_MAX_BAN
+ *  scale. LM_BAN is 0..HTP_GRAPH_MAX_BAN
  *  token ids (u32 bits in the f32 words, each < N; 0 clears) for LM_HEAD:
  *  its argmax
  *  skips them, as the CPU's bad-words penalty sets those logits to -inf
  *  before its first-maximum pick; the logits themselves stay raw. A later
- *  LM_BAN replaces the list. [plan 201 S1] EXPERTS is a MOE op's pool
+ *  LM_BAN replaces the list. EXPERTS is a MOE op's pool
  *  table, 2 x n_experts u32 handle words (h_gu[0..E) then h_dn[0..E)), each
  *  a registered weight of the op's shape or HTP_GRAPH_NO_HANDLE (not
  *  resident: forward refuses a token that routes to it); a later EXPERTS
- *  replaces the table. [#266 S2] PREDICT is one word (u32 bits) with op ==
+ *  replaces the table. PREDICT is one word (u32 bits) with op ==
  *  HTP_GRAPH_NO_OP: 1 makes every ROUTER_TOPK op also run the next
  *  ROUTER_TOPK op's router on its own input, a guess at the next MoE
  *  layer's routing, logged per router op (hexkl_graph.h pred_log); 0 (the
@@ -201,7 +195,7 @@ enum {
   HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_EXPERTS,
   HTP_GRAPH_PARAM_PREDICT,
-  HTP_GRAPH_PARAM_DENSE_EARLY,  /**< [#289] 1 = see hexkl_graph.h dense_early */
+  HTP_GRAPH_PARAM_DENSE_EARLY,  /**< 1 = see hexkl_graph.h dense_early */
   HTP_GRAPH_PARAM_ROUTER_WH,    /**< Packed affine WH INT4 router, raw words. */
   HTP_GRAPH_PARAM_ROUTER_QUANT, /**< FP32 router input U8 scale and zero point.
                                  */
@@ -213,14 +207,14 @@ enum {
 #define HTP_GRAPH_MAX_BAN 32u
 /** @brief An EXPERTS table entry for an expert that is not resident. */
 #define HTP_GRAPH_NO_HANDLE 0xFFFFFFFFu
-/** @brief [plan 201 S4] attn_m1_kv_append's layer word: this bit names the
+/** @brief attn_m1_kv_append's layer word: this bit names the
  *  session's second attention cache (the second attn_m1_register, of
  *  another shape: Gemma 4's full layers), the rest the layer's ordinal
  *  among the ATTN_M1 ops of that shape (hexkl_graph_init's ordinal). */
 #define HTP_ATTN_KV_CACHE_B 0x80000000u
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
-/** @brief A layer's FFN kind. [plan 201 S4] DENSE_MOE: Gemma 4's dense
+/** @brief A layer's FFN kind. DENSE_MOE: Gemma 4's dense
  *  GeGLU FFN beside the MoE in the same layer (both DENSE_FFN and
  *  ROUTER_TOPK / MOE ops). Append, never reorder. */
 enum {
@@ -234,30 +228,27 @@ enum {
  *
  * K is the input width, N the output width (inter for MOE / DENSE_FFN,
  * whose output width is N_out; vocab for LM_HEAD). in_slot / out_slot name
- * the session's
- * activation slots (plan 85 section 3.1); ADD reads its out slot (slot 0
+ * the session's activation slots; ADD reads its out slot (slot 0
  * in LFM2) as its second operand implicitly. next_mm names the next
  * weight-streaming op (FC, MOE, DENSE_FFN, LM_HEAD) or HTP_GRAPH_NO_OP; nothing
- * consumes it yet (the cross-op prefetch hook is a later issue), the validator
- * only requires it to point forward. h_gu / h_dn are the Q4M1 kinds' weight
- * handles, bound by the ARM before graph_init (a MOE op leaves them unused:
- * its handles are its HTP_GRAPH_PARAM_EXPERTS table, plan 201 S1), with
- * n_experts the part count (#132 Part B): an FC's parts
- * are h_gu[0..n_experts), K x N_p each, their outputs concatenated (q | k
- * | v: three parts, one quantization), an LM_HEAD's are its vocab slices
- * likewise, and a DENSE_FFN has h_gu[0] = up, h_gu[1] = gate (K x N each)
- * and h_dn[0] = down (N x N_out), n_experts 3. feed says how those
- * kinds' weights reach the vector unit: 0 VTCM by DMA when the session
- * has 2 groups per lane of it, else the L2 scratch; 1 the L2 scratch
- * (hexkl_graph.h); [#132 Part B E5f] bits 8-11 / 12-15 the L2 feed's
+ * consumes it yet; the validator only requires it to point forward. h_gu / h_dn
+ * are the Q4M1 kinds' weight handles, bound by the ARM before graph_init (a MOE
+ * op leaves them unused: its handles are its HTP_GRAPH_PARAM_EXPERTS table),
+ * with n_experts the part count: an FC's parts are h_gu[0..n_experts), K x N_p
+ * each, their outputs concatenated (q | k | v: three parts, one quantization),
+ * an LM_HEAD's are its vocab slices likewise, and a DENSE_FFN has h_gu[0] = up,
+ * h_gu[1] = gate (K x N each) and h_dn[0] = down (N x N_out), n_experts 3. feed
+ * says how those kinds' weights reach the vector unit: 0 VTCM by DMA when the
+ * session has 2 groups per lane of it, else the L2 scratch; 1 the L2 scratch
+ * (hexkl_graph.h); bits 8-11 / 12-15 the L2 feed's
  * lanes for a part with K <= 2048 / K > 2048, 0 = the runner's default
- * (HTP_GRAPH_FEED_*); [#194 L1, htp_moe_ppl] bit 16 the native kernels
+ * (HTP_GRAPH_FEED_*); bit 16 the native kernels
  * (q4_gemv_native_det.h: vector quantizer, no emulated FMA) in place of the
  * CPU-exact ones. Other kinds leave all of these 0. n_kv / gqa /
  * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
- * QK_NORM); both are 0 elsewhere. [plan 201 S4] An ATTN_M1's eps_bits is
+ * QK_NORM); both are 0 elsewhere. An ATTN_M1's eps_bits is
  * its score scale, which must be an fp16 value (0: 1/sqrt(head_dim),
  * LFM2's 0.125; Gemma 4 sets 1.0), and its top_k the sliding window (0:
  * every position; Gemma's sliding layers 1024). A ROUTER_TOPK with eps_bits
@@ -268,7 +259,7 @@ enum {
  * (HTP_GRAPH_NORM_N1) selects N1, the order-free integer sum of squares
  * (opt-in, not the CPU's bits).
  *
- * [plan 201 S4] Gemma 4 reuses fields that were 0 for these kinds: a
+ * Gemma 4 reuses fields that were 0 for these kinds: a
  * QK_NORM's feed takes HTP_GRAPH_QKNORM_V (the v heads RMS-normed with no
  * gamma, #4296's v_norm) and HTP_GRAPH_QKNORM_K_EQ_V (attention_k_eq_v:
  * v is the raw k projection, the row's v part is not read, so the FC
@@ -308,7 +299,7 @@ typedef struct {
 /** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
 #define HTP_GRAPH_FEED_L2 1u
 #define HTP_GRAPH_FEED_NATIVE (1u << 16)
-/** @brief [#225] FC, DENSE_FFN and LM_HEAD: h_gu / h_dn are u8i4 handles
+/** @brief FC, DENSE_FFN and LM_HEAD: h_gu / h_dn are u8i4 handles
  *  of the session's weight table -- the prefill's, from the FC WH sidecar
  *  or a QS4CX weight -- instead of Q4M1 slots. An FC's n_experts parts are
  *  K x N_p WH weights side by side (hexkl_mm_u8i4_fc_m1_run); an untied
@@ -318,18 +309,18 @@ typedef struct {
  * n_experts] and h_dn[c] down [N / n_experts x N_out], run at M = 1 as experts
  * of weight 1 (the prefill's invokeMoeLayer(kind 1)). */
 #define HTP_GRAPH_FEED_WH (1u << 17)
-/** @brief [#225] A WH DENSE_FFN's chunk limit: the M = 1 MoE path's expert
+/** @brief A WH DENSE_FFN's chunk limit: the M = 1 MoE path's expert
  *  bound (MOE_M1_MAX_EXPERTS), checked by the ARM's bind and graph_init. */
 #define HTP_GRAPH_WH_DENSE_MAX_CHUNKS 16u
 #define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
 #define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
 /** @brief An RMSNORM's feed word: N1 (hvx_rmsnorm_n1_f32, plan 201 S4).
- *  ponytail: RMSNORM only; QK_NORM and the router's own norm take it when
+ *  RMSNORM only; QK_NORM and the router's own norm take it when
  *  N1 is chosen for the model. */
 #define HTP_GRAPH_NORM_N1 1u
-/** @brief [plan 201 S4] A QK_NORM's feed word: the v heads normed without
+/** @brief A QK_NORM's feed word: the v heads normed without
  *  gamma (Gemma 4's v_norm), and v taken from the raw k (attention_k_eq_v).
- *  Bit 0 stays free for N1 (the ponytail note above). */
+ *  Bit 0 is reserved for N1. */
 #define HTP_GRAPH_QKNORM_V 2u
 #define HTP_GRAPH_QKNORM_K_EQ_V 4u
 typedef char
@@ -436,7 +427,7 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
  *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
  *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
- *         head_dim 32, 64, 128 ([plan 201 S4] 256 or 512) -- the
+ *         head_dim 32, 64, 128 (256 or 512) -- the
  *         per-head norm's chunk must be a power of two too -- gqa <= 8,
  *         max_seq a multiple of 32; ROPE and ATTN_M1 (#152: the fp16
  *         CPU order): head_dim 64, since plan 201 S4 any multiple of 64
@@ -455,15 +446,15 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         ROUTER_TOPK needs the next op, its MOE, resident (NOTALLOWED:
  *         the routing has no other consumer). #132 Part B's rules for
  *         the Q4M1 kinds: n_experts (the part count) at most 32 and feed
- *         0 or 1 (INVALIDFORMAT); [plan 201 S1] a resident sigmoid
+ *         0 or 1 (INVALIDFORMAT); a resident sigmoid
  *         ROUTER_TOPK over more than 64 experts (SCHEMENOTSUPPORTED: its
- *         vector width; [plan 201 S4] the softmax router takes 128, needs
+ *         vector width; the softmax router takes 128, needs
  *         a valid eps and in_slot != out_slot, INVALIDFORMAT: it norms
  *         into its out slot); a resident Q4M1 kind needs K % 64 == 0 and K
  *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
  *         N <= 8192 (WH instead permits intermediate slices within its chunk
  *         limit) -- the Q4M1 layout's pair and the quantizer's scratch
- *         (SCHEMENOTSUPPORTED). [plan 201 S4] INVALIDFORMAT for an ffn
+ *         (SCHEMENOTSUPPORTED). INVALIDFORMAT for an ffn
  *         kind past DENSE_MOE, a QK_NORM feed bit other than V / K_EQ_V,
  *         an ADD multiplier or LM_HEAD soft-cap that is not a normal f32
  *         (the soft-cap also positive)
@@ -629,7 +620,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
             ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) &&
              (op->head_dim % 64u != 0u || op->head_dim > 512u)))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
-        /** [plan 201 S4] the kernel's scale is one hf multiply: eps_bits an
+        /** the kernel's scale is one hf multiply: eps_bits an
            fp16 normal (sign clear, 13 low mantissa bits clear, 2^-14 ..
            65504), or 0 only where 1/sqrt(head_dim) is one (64, 256) */
         if (k == HTP_OP_ATTN_M1 &&
@@ -655,7 +646,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     if (k == HTP_OP_QK_NORM &&
         (op->feed & ~(HTP_GRAPH_QKNORM_V | HTP_GRAPH_QKNORM_K_EQ_V)) != 0u)
       return HTP_GRAPH_E_INVALIDFORMAT;
-    /** [plan 201 S4] ADD's multiplier: a normal f32 of either sign; the
+    /** ADD's multiplier: a normal f32 of either sign; the
        soft-cap: a positive normal one (0: none) */
     if ((k == HTP_OP_ADD || k == HTP_OP_LM_HEAD) && op->eps_bits != 0u) {
       const uint32_t exp = op->eps_bits & 0x7F800000u;
@@ -837,7 +828,7 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
   return htp_graph_words_for(s->n_layers, n);
 }
 
-/** @brief [plan 201 S4] The Gemma 4 MoE decode step's shape, from
+/** @brief The Gemma 4 MoE decode step's shape, from
  *  config.json's text_config (#4296's Gemma4MoECausalLM). */
 typedef struct {
   uint32_t n_layers;

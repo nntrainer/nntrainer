@@ -358,9 +358,8 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const auto Khidden_step_dim = step_dim(QKVParams::K);
   const auto Vhidden_step_dim = step_dim(QKVParams::V);
 
-  // Every norm of the block in the projection call (doc 57 section 5 step
-  // 4): the input norm before the quantizer, the per-head norms (q's gamma
-  // carrying q_scale, v's gamma all ones) on the output rows. v from the
+  // Fuse the input norm before quantization and per-head output norms (q's
+  // gamma carrying q_scale, v's gamma all ones) on the output rows. v from the
   // raw k projection is the k weight sent twice, its second copy normed
   // without a gamma -- one more projection on the accelerator instead of
   // a copy and a norm on the CPU.
@@ -466,10 +465,8 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                   std::invalid_argument)
       << "qkv_layer: in_norm is FP32 only";
     nntrainer::Tensor normed = scratch(tensor_idx[T_IN], input_step_dim);
-    // [#260] one decode row: the input norm is the layer's RMSNORM op (the
-    // token's first op at layer 0); once the row is resident the DSP runs
-    // the whole token -- norms, projections, RoPE -- and nothing below is
-    // read
+    // Once this norm makes the decode row resident, the DSP runs the
+    // remaining norms, projections and RoPE without reading host outputs.
     const bool hooked =
       rows == 1 && input_dim.batch() == 1 &&
       htpDecodeRmsNorm(from, input_step.getData<float>(),
@@ -494,14 +491,12 @@ void HtpQKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     Outputs.push_back(&Vhidden_step);
   }
 
-  // [#132 Part B] every kind resident: the HTP projects this row itself
-  // and the rows below are never read (the QK_NORM hook still binds its
-  // gammas)
+  // Resident decode uses DSP projections; QK_NORM still binds its gammas.
   if (!(to - from == 1 && input_dim.batch() == 1 && htpDecodeRowResident(from)))
     input_step.dot(Weights, Outputs);
 
   if (feature_size) {
-    // [#130] one decode row: with QK_NORM resident the HTP norms q | k and
+    // One decode row: with QK_NORM resident the HTP norms q | k and
     // keeps the row for the attention hook, so the outputs stay unwritten
     if (to - from == 1 && input_dim.batch() == 1 && !v_from_k && !v_norm &&
         q_scale == 1.0f && !rope &&

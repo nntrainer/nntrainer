@@ -4,55 +4,37 @@
  *
  * @file   nntr_hvx_fc_q4.c
  * @date   29 Sep 2026
- * @brief  DSP-side test entries for #132 PR 2: the CPU-exact M=1 Q4_0 FC
- *         (hvx_q4_gemv_f32.c) with its rate, and the CPU-order Q8_0
- *         quantizer, SwiGLU and argmax
+ * @brief  DSP test entries and graph runner for CPU-exact M=1 Q4_0 FC,
+ *         Q8_0 quantization, SwiGLU and argmax
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * No model path calls these (plan 132 Part A). q4m1_register copies one
- * Q4M1 weight to the DSP heap -- at most one lm_head slice of 18 MiB or
- * one FC of 14 MiB at a time in the tests and the shadow, inside the
- * ~100 MiB the loaded app has (doc 46 section 41, plan 132 section 0.4)
- * -- and cleans it out of the DSP caches, so the rate test's DMA may
- * read it around L2 (src_bypass = 1). fc_q4m1_f32 splits the 32-column
- * groups over @a lanes pool threads; with the VTCM feed each thread
- * double-buffers its next group into its own VTCM slice on its own DMA
- * engine while it computes the current one (weight DMA hidden behind
- * compute). q8_quant_f32 runs the FC's own vector quantizer; SwiGLU and
- * argmax run the scalar specs themselves (m1_ops_det.h compiled for the
- * DSP is the kernel, so G1 checks the DSP's scalar IEEE unit and the
- * compiler, not a second implementation).
- * ponytail: scalar, so a 7168-element SwiGLU pays 7168 integer divides on
- * one thread (test entries only); plan 132 section 3.2's HVX SwiGLU and
- * argmax come with Part B if decision D keeps the dense FFN and lm_head on
- * the NPU.
+ * q4m1_register copies weights to DSP heap and cleans them from DSP caches
+ * so DMA can bypass L2 (src_bypass = 1). fc_q4m1_f32 splits 32-column groups
+ * over @a lanes pool threads. Each thread double-buffers its next group in
+ * its own VTCM slice and DMA queue while computing the current group.
+ * q8_quant_f32 uses the FC's vector quantizer; the SwiGLU and argmax test
+ * entries run the scalar m1_ops_det.h specs on the DSP.
  *
  * A bad shape or handle is AEE_EINVALIDFORMAT / AEE_EBADITEM, never
  * AEE_EBADPARM, which stays the stale-skel symptom (rule 3); a DMA that
  * never completes is AEE_EEXPIRED (its output and timing are void).
  *
- * ponytail: the quantized activation and the per-lane scratch are static,
- * so two fc_q4m1_f32 calls must not overlap -- true while nntrainer opens
- * one session per process and calls it from one thread (the tests, the
- * shadow, and the graph's forward, which runs its ops one at a time). A
- * second session is a second PD with its own statics.
+ * Quantized activation and per-lane scratch are static, so fc_q4m1_f32
+ * calls must not overlap within a PD. Graph forward runs ops sequentially;
+ * a second session uses a separate PD with its own statics.
  *
- * [#132 Part B] nntr_hvx_fc_q4m1_run is the one lane runner: the test
- * entry and the resident graph's FC / DENSE_FFN / LM_HEAD ops
- * (nntr_hvx_graph.c's callback) both call it. Its feeds: VTCM by DMA
- * (dst_bypass 1) below the HMX config block, or -- lifted from the #178
- * probe -- the same double buffer in a 2 MiB DSP heap scratch with
- * dst_bypass 0 (the DMA writes through the L2, where the GEMV reads it),
- * for a session whose VTCM does not hold two groups per lane (#178: the
- * second session gets none). Address space: the Q4M1 weights are DSP heap
- * copies (q4m1_register) or [E3] borrowed from an attached arena
- * (q4m1_attach, no heap), 80 slots; the whole LFM2.5 FC set is 383 MiB,
- * which only a session without the 3840 MiB MoE arena can hold (plan 132
- * Part B section 3.2: S2's arena, attached, so S2's heap stays small) --
- * one session holding both is a host-only configuration. The L2 scratch
- * is 2 MiB of heap on first use, freed in close().
+ * nntr_hvx_fc_q4m1_run serves both the test entry and the graph's FC /
+ * DENSE_FFN / LM_HEAD ops. It feeds VTCM below the HMX config block by DMA
+ * (dst_bypass 1). If VTCM cannot hold two groups per lane, it uses a 2 MiB
+ * heap double buffer with dst_bypass 0, writing through L2 for GEMV reads.
+ * The heap scratch is allocated on first use and freed in close().
+ *
+ * The 80 weight slots hold heap copies (q4m1_register) or borrow an attached
+ * arena (q4m1_attach). The 383 MiB LFM2.5 FC set and 3840 MiB MoE arena
+ * cannot share a device session; attached weights keep the FC session's
+ * heap small.
  */
 
 #include <stdlib.h>

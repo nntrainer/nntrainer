@@ -369,7 +369,7 @@ public:
   }
 
   /**
-   * @brief [#4428 window] |max| per column (kv head x head_dim) of the K
+   * @brief |max| per column (kv head x head_dim) of the K
    *        and V rows the host's windowed cache dropped
    *        (KVCacheManager::compact), folded into the layer's floor by
    *        elementwise max. The decode seed hands the floor to the
@@ -493,11 +493,9 @@ private:
    *  dim)), kept across steps: a later step's rows past them would clip,
    *  so the scales widen and the mirror is re-quantized (q2_grow). */
   std::vector<float> q2_kmax, q2_vmax;
-  /** The a16 path's u16 Q and output, one pair for every layer: per layer
-   *  each first resize zero-filled 8-17 MB twice, 151 ms of the first
-   *  prefill over 30 layers (doc 57 section 9.24). ponytail: shared by all
-   *  HtpMHACoreLayer instances, so layers must not run concurrently (they run
-   *  in graph order); a per-thread pair is the upgrade if they ever do. */
+  /** Shared a16 Q/output staging avoids per-layer allocation and zero-fill.
+   *  HtpMHACoreLayer instances must run serially while sharing these buffers.
+   */
   static std::vector<uint16_t> q2_q_u16, q2_out_u16;
   bool q2_calibrated = false;
   /** Layer name -> q2_scale_k | q2_scale_v | q2_q_enc | q2_out_enc: every
@@ -506,7 +504,7 @@ private:
   inline static std::map<std::string, std::vector<float>> q2_store_;
   inline static bool q2_from_file_ = false;
   std::string q2_name_; /**< this layer's key in q2_store_ */
-  /** [#4428 window] see foldDroppedAmax; empty until a row was dropped */
+  /** See foldDroppedAmax; empty until a row was dropped. */
   std::vector<float> kv_floor_k_, kv_floor_v_;
   std::vector<unsigned char> q2_scales_set; /**< per batch handle */
   bool accel_logged_ = false; /**< one info line the first time attention
@@ -650,11 +648,11 @@ private:
                         float theta = 10000.0, bool is_fp16 = false);
 
   /**
-   * @brief [#130] The HTP per-token attention hook at one decode row:
+   * @brief The HTP per-token attention hook at one decode row:
    *        hands q | k | v, the RoPE table (once) and, when asked, the
    *        CPU cache's rows [0, pos) to the backend; on true the output
    *        row was written by the DSP and this layer's cache is stale
-   *        from now on (the DSP owns it, plan 130 section 3.3).
+   *        from now on (the DSP owns it).
    */
   bool htpDecodeAttention(nntrainer::RunLayerContext &context,
                           unsigned int pos);
