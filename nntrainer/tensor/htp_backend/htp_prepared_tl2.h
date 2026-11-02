@@ -8,9 +8,16 @@
 #define __HTP_PREPARED_TL2_H__
 #include "htp_prepared_qs2.h"
 #include "htp_tl2_opts.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <memory>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 #if defined(__ANDROID__) || defined(__linux__)
 #include <sys/uio.h>
 #endif
