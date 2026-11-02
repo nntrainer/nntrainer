@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 
 HVX = Path("nntrainer/tensor/htp_backend/hvx")
+CODEC = HVX.parent / "htp_tl2_codec.c"
 MOE = Path("nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c")
 EXPORTS = ("hvx_tl2_weight_bytes", "hvx_tl2_table_bytes", "hvx_tl2_k_splits",
            "hvx_tl2_pack", "hvx_tl2_unpack", "hvx_tl2_expand_wh96",
@@ -102,6 +103,12 @@ def main():
         run([cc, *flags, *definitions, "-c", str(root / HVX / "hvx_gemv_u8tl2.c"),
              "-o", str(obj)], "build-" + name)
         objects.append(obj)
+        # Older references keep the portable codec in the kernel TU.
+        if (root / CODEC).is_file():
+            obj = out / (name + "-codec.o")
+            run([cc, *flags, *definitions, "-c", str(root / CODEC),
+                 "-o", str(obj)], "build-" + name + "-codec")
+            objects.append(obj)
     expand_obj = out / "expand-i2i4.o"
     run([cc, *flags, "-c", str(repo / HVX / "hvx_expand_i2i4.c"),
          "-o", str(expand_obj)], "build-expand-i2i4")
@@ -140,8 +147,11 @@ def main():
         (out / "candidate-unit.inc").write_text(unit(source_text, "candidate"))
     hashes = {}
     for name, root in (("reference", reference), ("candidate", source)):
+        paths = [MOE, HVX / "hvx_gemv_u8tl2.c", HVX / "hvx_gemv_u8tl2.h"]
+        if (root / CODEC).is_file():
+            paths += [CODEC, CODEC.with_suffix(".h")]
         hashes[name] = {str(p): hashlib.sha256((root / p).read_bytes()).hexdigest()
-                        for p in (MOE, HVX / "hvx_gemv_u8tl2.c", HVX / "hvx_gemv_u8tl2.h")}
+                        for p in paths}
     (out / "results.json").write_text(json.dumps({
         "pass": True, "mutants_rejected": mutants, "sources": hashes,
         "limitations": ["HVX arithmetic uses SDK libnative; DMA/timing are not simulated.",

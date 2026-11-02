@@ -20,7 +20,8 @@ a.output = a.output.resolve()
 a.output.mkdir(parents=True, exist_ok=True)
 paths = {
  'arm': 'nntrainer/tensor/htp_backend/htp_compute_ops.cpp',
- 'dsp': 'test/htp/nntr_hvx_mm_u8i4.c',
+ 'dsp': 'nntrainer/tensor/htp_backend/dsp/nntr_hvx_mm_u8i4.c',
+ 'lifecycle': 'nntrainer/tensor/htp_backend/hmx/hexkl_moe_scratch.c',
  'core': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c',
  'scratch': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.h',
  'state': 'nntrainer/tensor/htp_backend/htp_router_handoff.h',
@@ -77,7 +78,9 @@ rotation_end = h.index('} hexkl_moe_rotated_input;') + len('} hexkl_moe_rotated_
 parts['scratch.inc'] = h[h.rindex('typedef struct {', 0, rotation_end):rotation_end] + '\n'
 parts['scratch.inc'] += h[h.rindex('typedef struct {', 0, end):end]
 parts['had_flags.inc'] = block(h, '#define HEXKL_MOE_FLAG_HAD_UP', '/** @brief Every bit')
-parts['reserve.inc'] = block(sources['core'], 'void hexkl_moe_scratch_free(', '/** @brief Kept in sync')
+parts['reserve.inc'] = body(sources['lifecycle'], 'void hexkl_moe_scratch_free(')
+parts['reserve.inc'] += body(sources['lifecycle'], 'int hexkl_moe_scratch_reserve(')
+parts['reserve.inc'] += body(sources['core'], 'void *hexkl_moe_carve(')
 parts['rpc.inc'] = block(sources['dsp'], 'static int check_moe_layer_args(', 'int nntr_hvx_router_logits_u8i8_f32(')
 parts['core_enter.inc'] = block(sources['core'], '  const float *router_act = scratch ?', '  if (!tbl || !vtcm_base')
 parts['core_layout.inc'] = block(sources['core'], '  const size_t n_slots_cap =', '  moe_m1_ctx m1;')

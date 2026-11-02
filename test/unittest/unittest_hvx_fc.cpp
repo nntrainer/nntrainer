@@ -122,7 +122,7 @@ constexpr int kProbeRuns = 3; /**< MHA_HTP_PLAN.md 9.7: >= 3, all printed */
 /**
  * @brief Slots mm_u8i8_layer_timed fills.
  *
- * Mirrors the enum in test/htp/nntr_hvx_mm_u8i8.c. The DSP header is not
+ * Mirrors the enum in DSP nntr_hvx_mm_u8i8.c. The DSP header is not
  * includable from the ARM side, so the skel rejects a stale count with
  * AEE_EBADPARM rather than silently truncating.
  */

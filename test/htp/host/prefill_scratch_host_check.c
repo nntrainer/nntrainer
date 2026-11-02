@@ -9,12 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 #include <AEEStdErr.h>
 #include <remote.h>
-
-#define MOE_SCRATCH_ALIGN 128u
-#include "prefill_scratch_methods.inc"
 
 int main(void) {
   nntr_hvx_session *s = (nntr_hvx_session *)calloc(1, sizeof(*s));
