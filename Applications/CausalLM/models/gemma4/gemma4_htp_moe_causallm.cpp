@@ -24,8 +24,10 @@
 #ifdef ENABLE_HEXKL
 #include <compute_ops.h>
 #include <htp_backend.h>
+#include <htp_graph_binding.h>
 #include <htp_graph_desc.h>
 #include <htp_mha_core.h>
+#include <htp_model_binding.h>
 #include <layer_node.h>
 #endif
 
@@ -167,37 +169,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
   // down and its two gammas, residual_add's gamma and the block's scalar),
   // never by index. Keyed under the owning layer too: a shared_from layer
   // (the tied head) names its own weights after the layer it shares with.
-  std::map<std::string, nntrainer::Tensor *> w;
-  model->forEachLayer(
-    [&w](ml::train::Layer &l, nntrainer::RunLayerContext &rc, void *) {
-      for (auto *t : rc.getWeights()) {
-        const std::string &n = t->getName();
-        w[n] = &t->getVariableRef();
-        const size_t colon = n.rfind(':');
-        if (colon != std::string::npos)
-          w.emplace(l.getName() + n.substr(colon), &t->getVariableRef());
-      }
-    },
-    nullptr);
-  auto weight = [&w](const std::string &name) -> nntrainer::Tensor & {
-    auto it = w.find(name);
-    if (it == w.end())
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: no weight " + name);
-    return *it->second;
-  };
-  // Folded projections and residuals use the owning layer's weight names;
-  // unfused layers, including KV-shared layers, retain their own names.
-  auto named = [&w](const std::string &folded, const std::string &own) {
-    return w.count(folded) ? folded : own;
-  };
-  auto f32 = [&weight](const std::string &name, size_t n) -> const float * {
-    nntrainer::Tensor &t = weight(name);
-    if (t.getDataType() != ml::train::TensorDim::DataType::FP32 ||
-        t.size() != n)
-      throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: " + name +
-                               " is not " + std::to_string(n) + " FP32 values");
-    return t.getData<float>();
-  };
+  const HtpModelBinding binding(*model);
 
   // The list, now that layer_scalar (a checkpoint weight) is in memory.
   const uint32_t n_layers = static_cast<uint32_t>(NUM_LAYERS);
@@ -206,9 +178,10 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
   for (uint32_t l = 0; l < n_layers; ++l) {
     is_full[l] = !isSlidingAttentionLayer(static_cast<int>(l));
     const std::string p = "layer" + std::to_string(l);
-    scalar[l] = f32(named(p + "_sparse_moe:add_scalar",
-                          p + "_post_ffn_norm:scalar_multiplier"),
-                    1)[0];
+    scalar[l] =
+      binding.f32(binding.choose(p + "_sparse_moe:add_scalar",
+                                 p + "_post_ffn_norm:scalar_multiplier"),
+                  1)[0];
     // The list's ADD stores 0.0f as "no multiplier".
     if (scalar[l] == 0.0f)
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " +
@@ -254,18 +227,8 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
     throw std::runtime_error(
       "[Gemma4MoE] NNTR_HTP_E2E: the HTP backend has no per-token entry");
 
-  // The f32 parameters by name. The RMSNORMs of a layer in the builder's
-  // order (htp_graph_gemma_build): input, post-attention, the MoE branch's
-  // pre / post, the dense branch's pre / post, post-FFN; the tail's final.
-  // #4415's graph holds all of them in fused layers: the input norm in
-  // qkv, the MoE branch's two in the MoE layer (in_norm / out_norm), the
-  // dense branch's two in dense_ffn, post-attention and post-FFN in the
-  // residual_adds.
-  static const char *const kNorms[7] = {
-    "_qkv:in_norm_gamma",        "_post_attention_norm:gamma",
-    "_sparse_moe:in_norm_gamma", "_sparse_moe:out_norm_gamma",
-    "_ffn:in_norm_gamma",        "_ffn:out_norm_gamma",
-    "_post_ffn_norm:gamma"};
+  // Bind semantic roles to graph-owned weights; wire operation order is
+  // unchanged.
   const uint32_t n_ops = words[3], H = shape.hidden, E = NUM_EXPERTS;
   auto hand = [ops](uint32_t op, uint32_t which, const float *d, size_t n) {
     if (!ops->set_decode_graph_param(op, which, d, static_cast<unsigned>(n)))
@@ -273,30 +236,49 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
         "[Gemma4MoE] NNTR_HTP_E2E: the backend took no parameter");
   };
   htp_params.clear();
-  uint32_t layer = HTP_GRAPH_NO_OP, norm = 0;
   for (uint32_t i = 0; i < n_ops; ++i) {
     const htp_graph_op *op = htp_graph_op_cat(words.data(), i);
-    if (op->layer != layer) {
-      layer = op->layer;
-      norm = 0;
-    }
+    const uint32_t layer = op->layer;
     const std::string p = "layer" + std::to_string(layer);
     if (op->kind == HTP_OP_RMSNORM) {
-      if (layer < n_layers && norm == 7u)
-        throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " + p +
-                                 " has more RMSNORM ops than names");
-      const std::string name =
-        layer < n_layers
-          ? (norm == 6u ? named(p + "_sparse_moe:add_gamma", p + kNorms[norm++])
-                        : p + kNorms[norm++])
-        : TIE_WORD_EMBEDDINGS ? std::string("output_of_causallm:gamma")
-                              : std::string("output_norm:gamma");
-      hand(i, HTP_GRAPH_PARAM_GAMMA, f32(name, H), H);
+      using Role = nntrainer::HtpBindingRole;
+      std::string name;
+      switch (nntrainer::htpBindingRole(words, i)) {
+      case Role::InputNorm:
+        name = p + "_qkv:in_norm_gamma";
+        break;
+      case Role::AttentionOutputNorm:
+        name = p + "_post_attention_norm:gamma";
+        break;
+      case Role::MoeInputNorm:
+        name = p + "_sparse_moe:in_norm_gamma";
+        break;
+      case Role::MoeOutputNorm:
+        name = p + "_sparse_moe:out_norm_gamma";
+        break;
+      case Role::DenseInputNorm:
+        name = p + "_ffn:in_norm_gamma";
+        break;
+      case Role::DenseOutputNorm:
+        name = p + "_ffn:out_norm_gamma";
+        break;
+      case Role::FfnOutputNorm:
+        name = binding.choose(p + "_sparse_moe:add_gamma",
+                              p + "_post_ffn_norm:gamma");
+        break;
+      case Role::OutputNorm:
+        name = TIE_WORD_EMBEDDINGS ? "output_of_causallm:gamma"
+                                   : "output_norm:gamma";
+        break;
+      default:
+        throw std::invalid_argument("Gemma HTP: unsupported norm role");
+      }
+      hand(i, HTP_GRAPH_PARAM_GAMMA, binding.f32(name, H), H);
     } else if (op->kind == HTP_OP_QK_NORM) {
       const uint32_t hd = op->head_dim;
       std::vector<float> g(2u * hd);
-      std::copy_n(f32(p + "_qkv:q_norm_gamma", hd), hd, g.begin());
-      std::copy_n(f32(p + "_qkv:k_norm_gamma", hd), hd, g.begin() + hd);
+      std::copy_n(binding.f32(p + "_qkv:q_norm_gamma", hd), hd, g.begin());
+      std::copy_n(binding.f32(p + "_qkv:k_norm_gamma", hd), hd, g.begin() + hd);
       htp_params.push_back(std::move(g));
       hand(i, HTP_GRAPH_PARAM_GAMMA, htp_params.back().data(), 2u * hd);
     } else if (op->kind == HTP_OP_ROUTER_TOPK) {
@@ -305,11 +287,11 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
       // file, the per-expert scale [E]; ROUTER_BIAS is gamma | scale, as
       // the file has them
       const std::string m = p + "_sparse_moe:";
-      hand(i, HTP_GRAPH_PARAM_ROUTER_W, f32(m + "gate", size_t(H) * E),
+      hand(i, HTP_GRAPH_PARAM_ROUTER_W, binding.f32(m + "gate", size_t(H) * E),
            size_t(H) * E);
       std::vector<float> b(H + E);
-      std::copy_n(f32(m + "router_norm_gamma", H), H, b.begin());
-      std::copy_n(f32(m + "expert_bias", E), E, b.begin() + H);
+      std::copy_n(binding.f32(m + "router_norm_gamma", H), H, b.begin());
+      std::copy_n(binding.f32(m + "expert_bias", E), E, b.begin() + H);
       htp_params.push_back(std::move(b));
       hand(i, HTP_GRAPH_PARAM_ROUTER_BIAS, htp_params.back().data(), H + E);
     }
@@ -322,9 +304,9 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
   // The LM_HEAD: Q4_0 as Q4M1 slices (tied: the embedding's own bytes), or
   // an untied QS4CX head (lmhead_dtype QS4CX) as WH slices like an FC, the
   // same handles serving the prefill's last row (lm_head_shared_fp32).
-  auto q4 = [&weight, ops](const std::string &name, bool tied,
-                           bool lm_head = false) {
-    nntrainer::Tensor &t = weight(name);
+  auto q4 = [&binding, ops](const std::string &name, bool tied,
+                            bool lm_head = false) {
+    nntrainer::Tensor &t = binding.weight(name);
     const auto dt = t.getDataType();
     const bool wh = dt == ml::train::TensorDim::DataType::QS4CX_WH ||
                     dt == ml::train::TensorDim::DataType::QS4CX_WH_AFFINE;
@@ -347,22 +329,22 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
       throw std::runtime_error(
         "[Gemma4MoE] NNTR_HTP_E2E: the backend took no weight " + name);
   };
-  layer = HTP_GRAPH_NO_OP;
-  uint32_t fc = 0;
   for (uint32_t i = 0; i < n_ops; ++i) {
     const htp_graph_op *op = htp_graph_op_cat(words.data(), i);
-    if (op->layer != layer) {
-      layer = op->layer;
-      fc = 0;
-    }
+    const uint32_t layer = op->layer;
     const std::string p = "layer" + std::to_string(layer);
-    if (op->kind == HTP_OP_FC && fc++ == 0) {
+    if (op->kind == HTP_OP_FC && nntrainer::htpBindingRole(words, i) ==
+                                   nntrainer::HtpBindingRole::AttentionInput) {
       q4(p + "_qkv:qweight", false);
       q4(p + "_qkv:kweight", false);
-      if (w.count(p + "_qkv:vweight")) // absent under k = v
+      if (binding.contains(p + "_qkv:vweight")) // absent under k = v
         q4(p + "_qkv:vweight", false);
     } else if (op->kind == HTP_OP_FC) {
-      q4(named(p + "_post_attention_norm:weight", p + "_attention_out:weight"),
+      if (nntrainer::htpBindingRole(words, i) !=
+          nntrainer::HtpBindingRole::AttentionOutput)
+        throw std::invalid_argument("Gemma HTP: unsupported FC role");
+      q4(binding.choose(p + "_post_attention_norm:weight",
+                        p + "_attention_out:weight"),
          false);
     } else if (op->kind == HTP_OP_DENSE_FFN) {
       // the list's order up, gate, down; the file's is gate-first
