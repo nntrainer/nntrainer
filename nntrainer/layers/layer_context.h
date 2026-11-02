@@ -203,6 +203,16 @@ public:
   void setOutputDimensions(const std::vector<TensorDim> &out_dim);
 
   /**
+   * @brief Set the Output Dimensions object, with a lifespan for every
+   * output's variable, overriding the default outSpec() would use
+   *
+   * @param out_dim the output dimension to set to
+   * @param ls      the variable lifespan to apply to every output
+   */
+  void setOutputDimensions(const std::vector<TensorDim> &out_dim,
+                           TensorLifespan ls);
+
+  /**
    * @brief Request a new weight for the layer
    *
    * @param dim dimension of Variable of the weight

@@ -100,6 +100,7 @@ test_target = [
   'unittest_layers_lstmcell.cpp',
   'unittest_layers_gru.cpp',
   'unittest_layers_grucell.cpp',
+  'unittest_layers_recurrent_cell_lifespan.cpp',
   'unittest_layers_preprocess_flip.cpp',
   'unittest_layers_split.cpp',
   'unittest_layers_embedding.cpp',

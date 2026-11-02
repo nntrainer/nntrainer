@@ -22,19 +22,16 @@
 #include <cross_entropy_softmax_loss_layer.h>
 #include <engine.h>
 #include <flatten_layer.h>
-#include <grucell.h>
 #include <identity_layer.h>
 #include <input_layer.h>
 #include <layer_node.h>
 #include <layer_normalization_layer.h>
-#include <lstmcell.h>
 #include <multiout_layer.h>
 #include <network_graph.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <profiler.h>
 #include <rnn.h>
-#include <rnncell.h>
 #include <split_layer.h>
 #include <time_dist.h>
 #include <tracer.h>
@@ -875,14 +872,6 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
       });
   }
 
-  if (lnode->getType() == RNNCellLayer::type or
-      lnode->getType() == LSTMCellLayer::type or
-      lnode->getType() == GRUCellLayer::type) {
-    std::for_each(out_specs.begin(), out_specs.end(), [](VarGradSpecV2 &spec) {
-      spec.variable_spec.ls = TensorLifespan::FORWARD_GRAD_LIFESPAN;
-    });
-  }
-
   const std::vector<Var_Grad *> &outputs = tensor_manager->requestTensors(
     out_specs, Manager::TensorGroupType::OUTPUT, lnode->getExecutionOrder(),
     lnode->getName());
@@ -1045,14 +1034,6 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
          *  produced it. */
         spec.variable_spec.engine = ml::train::LayerComputeEngine::CPU;
       });
-  }
-
-  if (lnode->getType() == RNNCellLayer::type or
-      lnode->getType() == LSTMCellLayer::type or
-      lnode->getType() == GRUCellLayer::type) {
-    std::for_each(out_specs.begin(), out_specs.end(), [](VarGradSpecV2 &spec) {
-      spec.variable_spec.ls = TensorLifespan::FORWARD_GRAD_LIFESPAN;
-    });
   }
 
   const std::vector<Var_Grad *> &outputs = tensor_manager->requestTensors(

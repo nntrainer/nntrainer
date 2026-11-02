@@ -101,7 +101,7 @@ void LSTMCellLayer::finalize(InitLayerContext &context) {
   std::vector<VarGradSpecV2> out_specs;
   out_specs.push_back(
     InitLayerContext::outSpec(output_hidden_state_dim, "output_hidden_state",
-                              TensorLifespan::FORWARD_FUNC_LIFESPAN));
+                              TensorLifespan::FORWARD_GRAD_LIFESPAN));
   out_specs.push_back(
     InitLayerContext::outSpec(output_cell_state_dim, "output_cell_state",
                               TensorLifespan::FORWARD_GRAD_LIFESPAN));
