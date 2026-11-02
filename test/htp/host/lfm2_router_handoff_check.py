@@ -24,8 +24,13 @@ paths = {
  'core': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c',
  'scratch': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.h',
  'state': 'nntrainer/tensor/htp_backend/htp_router_handoff.h',
+ 'staging': 'nntrainer/tensor/htp_backend/htp_staging.h',
 }
 sources = {k: (a.repo / v).read_text() for k, v in paths.items()}
+original_sources = sources.copy()
+# The fixture inherits the same staging owner; remaining RPC hooks use its members.
+sources['arm'] = re.sub(r'\b(?:staging_|weights_|decode_)\s*\.\s*', '', sources['arm'])
+
 def block(s, begin, end):
     at = s.index(begin)
     return s[at:s.index(end, at)]
@@ -41,11 +46,9 @@ def body(s, signature):
     return s[at:i] + '\n'
 
 parts = {}
-parts['state.h'] = sources['state']
-parts['pool.inc'] = block(sources['arm'], '  struct Held {', '  /** @brief A host range last copied')
+parts['htp_router_handoff.h'] = sources['state']
+parts['htp_staging.h'] = sources['staging']
 parts['producer.inc'] = block(sources['arm'], '    const uint32_t ticket =', '    const uint64_t t0 =')
-parts['ion_alias_state.inc'] = block(sources['arm'], '  struct IonAlias {', '  /** @brief The staging bytes that hold')
-parts['ion_alias.inc'] = body(sources['arm'], '  const void *ionAlias(')
 parts['sync.inc'] = body(sources['arm'], '  void sync_to_host(').replace(' override', '')
 parts['attn_q.inc'] = body(sources['arm'], '  bool sdpa_q_kvcache(').replace(' override', '')
 parts['attn_f16.inc'] = body(sources['arm'], '  bool sdpa_fp16_kvcache(').replace(' override', '')
@@ -65,7 +68,7 @@ for name, (begin, write) in writer_anchors.items():
 parts['select.inc'] = block(sources['arm'], '    HtpRpcBuffer &act_stage =\n      via_dspq', '    // NNTR_HTP_MOE_DEBUG=1')
 parts['wire.inc'] = block(sources['arm'], '                        handoff_plain && rep == 0', ',\n                        h_gu.data()').strip()
 for method in ['beginPrompt', 'releasePrefillStaging']:
-    s = body(sources['arm'], '  void ' + method + '()')
+    s = body(sources['staging' if method == 'releasePrefillStaging' else 'arm'], '  void ' + method + '()')
     assert s[s.index('{') + 1:].lstrip().startswith('htp_router_handoff_invalidate(&router_handoff_);')
     parts[method + '.inc'] = s[s.index('{') + 1:s.index(';') + 1]
 h = sources['scratch']
@@ -85,17 +88,17 @@ assert 'n_compact_tl2 += g->tl2_compact && d->tl2_compact;' in sources['core']
 assert 'n_compact_tl2 == n_with_rows' in parts['core_layout.inc']
 if a.mutant:
     key, old, new = {
-        'stage': ('pool.inc', '    // Handing out a writable buffer ends any pending router ownership.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed writable owner'),
-        'copy': ('pool.inc', '    // No-write hits above keep their ION epoch. Copies/swaps below do not.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed input copy'),
+        'stage': ('htp_staging.h', '    // Handing out a writable buffer ends any pending router ownership.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed writable owner'),
+        'copy': ('htp_staging.h', '    // No-write hits above keep their ION epoch. Copies/swaps below do not.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed input copy'),
         'reserve': ('reserve.inc', 'int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {\n  htp_router_handoff_scratch_invalidate(&s->router_handoff);', 'int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {'),
-        'take': ('state.h', '  htp_router_handoff_invalidate(s);\n  return hit;', '  return hit;'),
-        'ticket': ('state.h', 's->ticket == ticket', 'ticket != 0u'),
-        'arm_source': ('state.h', 's->source == source', 'source != NULL'),
-        'scratch_take': ('state.h', '  htp_router_handoff_scratch_invalidate(s);\n  return hit;', '  return hit;'),
-        'scratch_ticket': ('state.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
-        'scratch_epoch': ('state.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
-        'scratch_owner': ('state.h', 's->owner == owner && s->bytes == bytes', 'owner != NULL && s->bytes == bytes'),
-        'scratch_bytes': ('state.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && bytes != 0u'),
+        'take': ('htp_router_handoff.h', '  htp_router_handoff_invalidate(s);\n  return hit;', '  return hit;'),
+        'ticket': ('htp_router_handoff.h', 's->ticket == ticket', 'ticket != 0u'),
+        'arm_source': ('htp_router_handoff.h', 's->source == source', 'source != NULL'),
+        'scratch_take': ('htp_router_handoff.h', '  htp_router_handoff_scratch_invalidate(s);\n  return hit;', '  return hit;'),
+        'scratch_ticket': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
+        'scratch_epoch': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
+        'scratch_owner': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 'owner != NULL && s->bytes == bytes'),
+        'scratch_bytes': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && bytes != 0u'),
         'prefix': ('core_layout.inc', 'float *act_c = router_reuse ? (float *)hexkl_moe_carve(&cur, sz_act_c) : NULL;', 'float *act_c = router_reuse ? (float *)cur : NULL;'),
         'attn_q': ('attn_q.inc', '    htp_router_handoff_invalidate(&router_handoff_);', '    /* mutation: direct output not invalidated */'),
         'attn_f16': ('attn_f16.inc', '    htp_router_handoff_invalidate(&router_handoff_);', '    /* mutation: direct output not invalidated */'),
@@ -123,10 +126,10 @@ shutil.copy2(fixture, a.output / fixture.name)
 binpath = a.output / 'router_handoff_check'
 cmd = [a.cxx, '-std=c++17', '-O1', '-g', '-Wall', '-Wextra',
        '-Wno-unused-variable', '-Wno-unused-parameter', '-Wno-unused-but-set-variable', '-pthread',
-       '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+       '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I' + str(a.output),
        str(a.output / fixture.name), '-o', str(binpath)]
 manifest = {
-    'source_sha256': {paths[k]: hashlib.sha256(v.encode()).hexdigest() for k, v in sources.items()},
+    'source_sha256': {paths[k]: hashlib.sha256(v.encode()).hexdigest() for k, v in original_sources.items()},
     'extracted_sha256': {k: hashlib.sha256(v.encode()).hexdigest() for k, v in parts.items()},
     'mutant': a.mutant, 'compile': cmd, 'run': [str(binpath)],
     'limits': 'Real staging, ownership, RPC guards, reserve and carve helpers. Arithmetic, DMA and allocation are host stand-ins; no model-output or hardware-performance claim.',

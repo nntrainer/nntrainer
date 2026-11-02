@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+/** @file decode_runtime_check.cpp
+ * @brief Descriptor indexing and hook/session progression without an SDK.
+ * @author NNTrainer contributors
+ * @bug DSP arithmetic is covered by device tests.
+ */
+#include <cassert>
+#include <cstdio>
+#include <htp_decode_runtime.h>
+
+int main() {
+  for (unsigned experts : {32u, 64u}) {
+    htp_graph_lfm2_shape shape{};
+    shape.n_layers = 3;
+    shape.n_dense_layers = 1;
+    shape.hidden = shape.inter_moe = shape.vocab = 128;
+    shape.inter_dense = 256;
+    shape.n_experts = experts;
+    shape.top_k = experts / 16;
+    shape.n_heads = 2;
+    shape.n_kv_heads = 1;
+    shape.head_dim = 64;
+    shape.max_seq = 128;
+    shape.eps = 1e-5f;
+    uint8_t attention[] = {0, 1, 0};
+    nntrainer::HtpDecodeRuntime runtime;
+    auto &words = runtime.graph_words_;
+    words.resize(htp_graph_words_for(shape.n_layers, HTP_GRAPH_MAX_OPS));
+    const auto n = htp_graph_lfm2_build(words.data(), words.size(), &shape,
+                                        attention, HTP_GRAPH_KINDS_ALL);
+    assert(n);
+    words.resize(n);
+    uint32_t ops, mask, present;
+    runtime.validate(words, ops, mask, present);
+    assert(mask == present);
+    runtime.indexGraph(mask);
+    assert(runtime.moe_ops_.size() == 2 && runtime.kv_len_.size() == 1);
+    assert(runtime.kind_ops_[HTP_OP_CONV1D_GATE].size() == 2);
+    // A partially bound first row stays on the original graph walk.
+    assert(!runtime.beginRow(HTP_OP_RMSNORM, 0));
+    runtime.moe_bound_ = 2;
+    assert(!runtime.beginRow(HTP_OP_RMSNORM, 0));
+    assert(runtime.beginRow(HTP_OP_RMSNORM, 1));
+    const auto first = runtime.nextHook(HTP_OP_RMSNORM, 1);
+    assert(first == 0);
+    runtime.pending_op_ = first;
+    bool threw = false;
+    try {
+      runtime.beginRow(HTP_OP_RMSNORM, 2);
+    } catch (const std::runtime_error &) {
+      threw = true;
+    }
+    assert(threw); // An unfinished stretch cannot advance the KV position.
+    runtime.clearPending();
+    runtime.kv_len_[0] = 2;
+    runtime.conv_next_pos_[runtime.kind_ops_[HTP_OP_CONV1D_GATE][0]] = 2;
+    assert(runtime.beginRow(HTP_OP_RMSNORM, 2));
+    assert(runtime.nextHook(HTP_OP_RMSNORM, 2) == first);
+    assert(runtime.kv_len_[0] == 2); // Hook counters never reset session KV.
+    assert(runtime.conv_next_pos_[runtime.kind_ops_[HTP_OP_CONV1D_GATE][0]] ==
+           2);
+    runtime.indexGraph(mask);
+    assert(runtime.kv_len_[0] == 0);
+    assert(runtime.cur_pos_ == HTP_GRAPH_NO_OP);
+    assert(!runtime.beginRow(HTP_OP_RMSNORM, 0));
+  }
+  std::puts("HTP decode descriptor / binding latch / hook progression PASS");
+}
