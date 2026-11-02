@@ -1620,10 +1620,6 @@ bool HtpMHACoreLayer::try_quantized_attention(
     // here the f32 layer converts at its edges.
     const size_t q_elems = static_cast<size_t>(n_q) * q_stride;
     ts4 = clk::now();
-    if (q2_q_u16.size() < q_elems) {
-      q2_q_u16.resize(q_elems);
-      q2_out_u16.resize(q_elems);
-    }
     ts5 = clk::now();
     // No conversions on this thread when the o-proj is on the accelerator
     // too (attn_out_u16): Q goes as the qkv call left it, the u16 context
@@ -1697,6 +1693,13 @@ bool HtpMHACoreLayer::try_quantized_attention(
       }
       return true;
     }
+    // Only the host conversion path needs these buffers.
+    ts4 = clk::now();
+    if (!again && q2_q_u16.size() < q_elems) {
+      q2_q_u16.resize(q_elems);
+      q2_out_u16.resize(q_elems);
+    }
+    ts5 = clk::now();
     // Keep both NEON conversions on this thread to avoid scheduling overhead.
     static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
     const auto tq0 = std::chrono::steady_clock::now();
