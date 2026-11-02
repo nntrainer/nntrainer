@@ -1037,6 +1037,26 @@ TEST(KvCacheCore, pagedSinkContributesOnlyToSoftmaxDenominator) {
   EXPECT_FLOAT_EQ(result[4], 4);
 }
 
+TEST(KvCacheCore, pagePoolAsksReclaimersBeforeFailing) {
+  auto pool = std::make_shared<KvPagePool>(128);
+  std::vector<std::shared_ptr<KvStorage>> held = {pool->acquire(64),
+                                                  pool->acquire(64)};
+  size_t calls = 0;
+  const auto token = pool->addReclaimer([&held, &calls]() {
+    ++calls;
+    if (held.empty())
+      return false;
+    held.pop_back();
+    return true;
+  });
+  auto page = pool->acquire(64); // Reuses the page the reclaimer released.
+  EXPECT_EQ(calls, 1u);
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  pool->removeReclaimer(token);
+  EXPECT_THROW(pool->acquire(64), std::bad_alloc);
+  EXPECT_EQ(calls, 1u);
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
