@@ -74,6 +74,7 @@ public:
     UINT32, /** unsigned int 32 bit */
     FP16,   /** half precision */
     FP32,   /** single precision */
+    Q8_0,   /** Q8_0 quantized */
     NONE,   /** not specified */
   };
 

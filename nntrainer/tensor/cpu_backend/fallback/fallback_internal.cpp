@@ -532,6 +532,12 @@ size_t __fallback_quantize_q4_0(const float *src, void *dst, int64_t nrow,
   return 1;
 }
 
+size_t __fallback_quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                                int64_t n_per_row, const float *quant_weights) {
+  throw std::runtime_error("NYI : __fallback_quantize_q8_0");
+  return 1;
+}
+
 size_t __fallback_quantize_q4_K(const float *src, void *dst, int64_t nrow,
                                 int64_t n_per_row, const float *quant_weights) {
   throw std::runtime_error("NYI : __fallback_quantize_q4_K");
@@ -550,6 +556,10 @@ void __fallback_dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void __fallback_dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   throw std::runtime_error("NYI : __fallback_dequantize_row_q4_0");
+}
+
+void __fallback_dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  throw std::runtime_error("NYI : __fallback_dequantize_row_q8_0");
 }
 
 void __fallback_dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -592,6 +602,58 @@ void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
                                       size_t data_size, const unsigned int M,
                                       const unsigned int N) {
   throw std::runtime_error("NYI : __fallback_unpack_q4_0_8_to_q4_0");
+}
+
+/**
+ * @brief Moves bytes between q8_0 rows and q8_0x4 blocks, one way or the other.
+ *
+ * A block_q8_0 is an fp16 scale and 32 int8 quants. A block_q8_0x4 holds the
+ * same block of 4 rows: their 4 scales, then bytes 8k..8k+7 of row r at
+ * qs[32k + 8r].
+ */
+template <bool pack>
+static void q8_0x4_convert(const void *src, void *dst, size_t data_size,
+                           const unsigned int M, const unsigned int N) {
+  constexpr size_t block_bytes = sizeof(uint16_t) + 32;
+  const size_t nb = N / 32;
+  if (M % 4 != 0 || N % 32 != 0 || data_size != M * nb * block_bytes)
+    throw std::invalid_argument(
+      "q8_0x4 needs rows in multiples of 4, columns in multiples of 32 and a "
+      "matching data size");
+
+  const uint8_t *in = static_cast<const uint8_t *>(src);
+  uint8_t *out = static_cast<uint8_t *>(dst);
+  auto move = [&](size_t x4_off, size_t row_off, size_t n) {
+    if (pack)
+      std::memcpy(out + x4_off, in + row_off, n);
+    else
+      std::memcpy(out + row_off, in + x4_off, n);
+  };
+
+  for (size_t r = 0; r < M; r += 4) {
+    for (size_t b = 0; b < nb; ++b) {
+      const size_t x4 = (r / 4 * nb + b) * 4 * block_bytes;
+      for (size_t i = 0; i < 4; ++i) {
+        const size_t row = ((r + i) * nb + b) * block_bytes;
+        move(x4 + sizeof(uint16_t) * i, row, sizeof(uint16_t));
+        for (size_t k = 0; k < 4; ++k)
+          move(x4 + 4 * sizeof(uint16_t) + 32 * k + 8 * i,
+               row + sizeof(uint16_t) + 8 * k, 8);
+      }
+    }
+  }
+}
+
+void __fallback_repack_q8_0_to_q8_0_4x8(void *dst, const void *src,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<true>(src, dst, data_size, M, N);
+}
+
+void __fallback_unpack_q8_0_4x8_to_q8_0(const void *src, void *dst,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N) {
+  q8_0x4_convert<false>(src, dst, data_size, M, N);
 }
 
 void __fallback_softmax_row_inplace(float *qk_out, size_t start_row,

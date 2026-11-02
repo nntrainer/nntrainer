@@ -311,6 +311,8 @@ static const char *dtypeToStr(nntrainer::TensorDim::DataType dt) {
     return "UINT16";
   case DT::Q4_0:
     return "Q4_0";
+  case DT::Q8_0:
+    return "Q8_0";
   case DT::Q4_K:
     return "Q4_K";
   case DT::Q6_K:

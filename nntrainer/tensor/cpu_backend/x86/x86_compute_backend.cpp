@@ -385,6 +385,12 @@ size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
   return __ggml_quantize_q4_K(src, dst, nrow, n_per_row, quant_weights);
 }
 
+template <>
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q8_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
 size_t quantize_q6_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights) {
   return __ggml_quantize_q6_K(src, dst, nrow, n_per_row, quant_weights);
@@ -404,6 +410,10 @@ void dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   __ggml_dequantize_row_q4_0(x_raw, y, k);
+}
+
+template <> void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  __ggml_dequantize_row_q8_0(x_raw, y, k);
 }
 
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -449,6 +459,16 @@ void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
                  const unsigned int M, const unsigned int N) {
   Q4_0Utils::unpackBlocksQ4_0x8((const block_q4_0x8 *)in_q4_0x, data_size, M, N,
                                 (block_q4_0 *)out_q4_0);
+}
+
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
+
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
 }
 
 template <>

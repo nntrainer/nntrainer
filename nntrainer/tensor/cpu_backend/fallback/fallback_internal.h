@@ -986,6 +986,18 @@ float __fallback_dot_q6_K_f32(const unsigned int K, const void *v_q6_K,
 size_t __fallback_quantize_q4_0(const float *src, void *dst, int64_t nrow,
                                 int64_t n_per_row, const float *quant_weights);
 /**
+ * @brief quantize_q8_0 function
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* to store quantized data
+ * @param nrow number of rows in src
+ * @param n_per_row number of elements in each row of src
+ * @param quant_weights unused for now -> imatrix
+ * @return size_t size of total quantized data in bytes
+ */
+size_t __fallback_quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                                int64_t n_per_row, const float *quant_weights);
+/**
  * @brief quantize_q4_K function
  *
  * @param src float* to quantize
@@ -1046,6 +1058,15 @@ void __fallback_dequantize_row_q4_K(const void *x_raw, float *y, int64_t k);
  * @param k number of elements in x
  */
 void __fallback_dequantize_row_q4_0(const void *x_raw, float *y, int64_t k);
+
+/**
+ * @brief dequantize row of q8_0 data to float
+ *
+ * @param x input to be dequantized from q8_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x
+ */
+void __fallback_dequantize_row_q8_0(const void *x_raw, float *y, int64_t k);
 
 /**
  * @brief dequantize row of q6_K data to float
@@ -1118,6 +1139,20 @@ void __fallback_repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
 void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
                                       size_t data_size, const unsigned int M,
                                       const unsigned int N);
+
+/**
+ * @copydoc repack_q8_0 in cpu_backend.h
+ */
+void __fallback_repack_q8_0_to_q8_0_4x8(void *dst, const void *src,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N);
+
+/**
+ * @copydoc unpack_q8_0 in cpu_backend.h
+ */
+void __fallback_unpack_q8_0_4x8_to_q8_0(const void *src, void *dst,
+                                        size_t data_size, const unsigned int M,
+                                        const unsigned int N);
 
 /**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version

@@ -44,6 +44,7 @@ TEST(SafetensorsUtil, quantized_dtype_maps_to_u8_p) {
   EXPECT_STREQ(st::dtypeToString(DataType::Q4_K), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::Q6_K), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::QS4CX), "U8");
+  EXPECT_STREQ(st::dtypeToString(DataType::Q8_0), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::FP32), "F32");
   EXPECT_STREQ(st::dtypeToString(DataType::FP16), "F16");
 }
@@ -53,13 +54,15 @@ TEST(SafetensorsUtil, is_quantized_p) {
   EXPECT_TRUE(st::isQuantized(DataType::Q4_K));
   EXPECT_TRUE(st::isQuantized(DataType::Q6_K));
   EXPECT_TRUE(st::isQuantized(DataType::QS4CX));
+  EXPECT_TRUE(st::isQuantized(DataType::Q8_0));
   EXPECT_FALSE(st::isQuantized(DataType::FP32));
   EXPECT_FALSE(st::isQuantized(DataType::FP16));
 }
 
 TEST(SafetensorsUtil, nntr_dtype_name_round_trip_p) {
-  for (auto dt : {DataType::FP32, DataType::FP16, DataType::Q4_0,
-                  DataType::Q4_K, DataType::Q6_K, DataType::QS4CX}) {
+  for (auto dt :
+       {DataType::FP32, DataType::FP16, DataType::Q4_0, DataType::Q4_K,
+        DataType::Q6_K, DataType::QS4CX, DataType::Q8_0}) {
     const std::string name = st::nntrDtypeName(dt);
     EXPECT_EQ(st::nntrDtypeFromName(name), dt);
   }
@@ -423,6 +426,95 @@ TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
   auto md = st::parseMetadata(header_json);
   ASSERT_EQ(md.count("nntr_q4_0_isa"), 1u);
   EXPECT_EQ(md["nntr_q4_0_isa"], "arm");
+
+  remove(st_path.c_str());
+}
+
+/**
+ * @brief input -> dense1 (Q8_0 weight, no bias) -> dense2 (FP32), so the
+ *        Q8_0 record sits in front of another weight.
+ */
+static std::unique_ptr<nntrainer::NeuralNetwork> createQ8_0NN() {
+  auto nn = std::make_unique<nntrainer::NeuralNetwork>();
+  nn->addLayer(ml::train::layer::Input({"name=input", "input_shape=1:1:64"}));
+  nn->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense1", "unit=32", "weight_dtype=Q8_0", "disable_bias=true"}));
+  nn->addLayer(ml::train::layer::FullyConnected({"name=dense2", "unit=32"}));
+  nn->setProperty({"loss=mse", "batch_size=1"});
+  EXPECT_EQ(nn->compile(ml::train::ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  EXPECT_EQ(nn->initialize(ml::train::ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  return nn;
+}
+
+/**
+ * @brief Raw bytes of every weight in graph order.
+ */
+static std::vector<std::vector<char>>
+weightBytes(nntrainer::NeuralNetwork &nn) {
+  std::vector<std::vector<char>> out;
+  for (auto &node : nn.getFlatGraph())
+    for (unsigned int i = 0; i < node->getNumWeights(); ++i) {
+      nntrainer::Tensor &w = node->getWeight(i);
+      const char *p = w.getData<char>();
+      out.emplace_back(p, p + w.getMemoryBytes());
+    }
+  return out;
+}
+
+/**
+ * @brief A Q8_0 weight survives a save / load round trip in both formats,
+ *        and so does the weight stored after it.
+ */
+TEST(SafetensorsQuant, q8_0_save_load_round_trip_p) {
+  auto nn = createQ8_0NN();
+  for (auto &node : nn->getFlatGraph())
+    for (unsigned int i = 0; i < node->getNumWeights(); ++i) {
+      nntrainer::Tensor &w = node->getWeight(i);
+      char *p = w.getData<char>();
+      for (size_t b = 0; b < w.getMemoryBytes(); ++b)
+        p[b] = static_cast<char>(b * 13 + i + 1);
+    }
+  const auto saved = weightBytes(*nn);
+  ASSERT_EQ(saved.size(), 3u); // dense1 weight, dense2 weight and bias
+  EXPECT_EQ(saved[0].size(), 64u * 32 / 32 * 34);
+
+  for (auto format :
+       {ModelFormat::MODEL_FORMAT_BIN, ModelFormat::MODEL_FORMAT_SAFETENSORS}) {
+    const std::string path = format == ModelFormat::MODEL_FORMAT_BIN
+                               ? "q8_0_rt.bin"
+                               : "q8_0_rt.safetensors";
+    ASSERT_NO_THROW(nn->save(path, format));
+
+    auto loaded = createQ8_0NN();
+    ASSERT_NO_THROW(loaded->load(path, format));
+    EXPECT_EQ(weightBytes(*loaded), saved) << path;
+    remove(path.c_str());
+  }
+}
+
+/**
+ * @brief The safetensors header tags a Q8_0 weight as U8 with nntr_dtype Q8_0.
+ */
+TEST(SafetensorsQuant, q8_0_header_entry_p) {
+  auto nn = createQ8_0NN();
+  const std::string st_path = "q8_0_header.safetensors";
+  ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS));
+
+  std::ifstream stf(st_path, std::ios::binary);
+  ASSERT_TRUE(stf.is_open());
+  uint64_t header_size = 0;
+  stf.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+  std::string header_json(header_size, '\0');
+  stf.read(header_json.data(), static_cast<std::streamsize>(header_size));
+
+  const st::TensorEntry *q = nullptr;
+  auto entries = st::parseHeaderEntries(header_json);
+  for (const auto &e : entries)
+    if (e.nntr_dtype == "Q8_0")
+      q = &e;
+  ASSERT_NE(q, nullptr);
+  EXPECT_EQ(q->dtype, "U8");
+  EXPECT_EQ(q->offset_end - q->offset_start, 64u * 32 / 32 * 34);
 
   remove(st_path.c_str());
 }
