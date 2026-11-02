@@ -337,6 +337,20 @@ void setPrefillSpanHint(unsigned int span);
 /** @copydoc setPrefillSpanHint(unsigned int) */
 unsigned int prefillSpanHint();
 
+/** Paged KV page table for gemm_attention: k_pages/v_pages[p] point at the
+ * binary16 token-major page base (row stride = num_kv_heads * head_dim, the
+ * continuous cache layout) and page_tokens is the page width in tokens. When
+ * page_tokens is a multiple of the flash key block Bk (512 on x86, 128
+ * elsewhere), the x86 and tiled ARM arms read pages in place with the
+ * continuous path's block arithmetic; otherwise the history is gathered once
+ * into the contiguous pack buffers.
+ */
+struct MhaPagedKvPages {
+  const uint16_t *const *k_pages = nullptr;
+  const uint16_t *const *v_pages = nullptr;
+  unsigned int page_tokens = 0;
+};
+
 /**
  * @class MHA Core Layer
  * @brief Part of Multi-Head-Attention Layer.
@@ -351,35 +365,6 @@ unsigned int prefillSpanHint();
  *             [ O ]
  *
  */
-/** Default key-block width (Bk) of the host flash attention kernel
- * (gemm_attention). KV page_tokens should be a multiple of this so the paged
- * path reads pages zero-copy with the continuous cache's exact block
- * arithmetic (bit-identical results); 512 on x86, 128 on ARM.
- */
-inline unsigned int mha_host_flash_kv_block() {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-  defined(_M_IX86)
-  return 512u;
-#else
-  return 128u;
-#endif
-}
-
-/** Paged KV page table for gemm_attention: k_pages/v_pages[p] point at the
- * token-major page base (row stride = num_kv_heads * head_dim, the same
- * layout as the continuous cache) and page_tokens is the page width in
- * tokens. When page_tokens % Bk == 0 (Bk = mha_host_flash_kv_block()) the
- * kernel reads pages zero-copy with the continuous path's exact flash block
- * arithmetic, reproducing continuous-mode results bit-for-bit; otherwise the
- * history is gathered once into the contiguous pack buffers (the same
- * layout the pack_history path already uses).
- */
-struct MhaPagedKvPages {
-  const uint16_t *const *k_pages = nullptr;
-  const uint16_t *const *v_pages = nullptr;
-  unsigned int page_tokens = 0;
-};
-
 WIN_EXPORT class MHACoreLayer : public nntrainer::LayerImpl {
 public:
   /**
@@ -902,16 +887,33 @@ private:
    * @param[in] apply_rope true to apply rotary embedding, false to only store
    *                       the tensor into the cache dtype
    */
+  void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                                  unsigned int dim, unsigned int from,
+                                  bool apply_rope = true);
+
+  /**
+   * @brief     run one batch through paged CPU KV storage
+   * @details   Applies RoPE to the new Q/K block, appends owner K/V to the
+   *            bound KV step and attends over the pages. Returns false when
+   *            no paged KV step is active (contiguous execution continues).
+   * @param[in] batch batch index (must be 0)
+   * @param[in] from first query position
+   * @param[in] to one past the last query position
+   * @param[in] query query block
+   * @param[in] key key block (pre-RoPE)
+   * @param[in] value value block
+   * @param[out] output attention output block
+   * @param[in] key_handle one-row key identity of this layer
+   * @param[in] value_handle one-row value identity of this layer
+   * @param[in] sink optional per-head attention sink logits
+   * @return true when the paged path handled the batch
+   */
   bool paged_forwarding(unsigned int batch, unsigned int from, unsigned int to,
                         nntrainer::Tensor &query, nntrainer::Tensor &key,
                         nntrainer::Tensor &value, nntrainer::Tensor &output,
                         nntrainer::Tensor &key_handle,
                         nntrainer::Tensor &value_handle,
                         nntrainer::Tensor *sink);
-
-  void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
-                                  unsigned int dim, unsigned int from,
-                                  bool apply_rope = true);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
