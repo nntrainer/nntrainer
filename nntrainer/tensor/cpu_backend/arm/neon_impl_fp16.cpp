@@ -2246,15 +2246,6 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
   }
 }
 
-static __fp16 hsumq_f16(float16x8_t v) {
-  float16x4_t lo = vget_low_f16(v);
-  float16x4_t hi = vget_high_f16(v);
-  float16x4_t s4 = vadd_f16(lo, hi);
-  float16x4_t s2 = vadd_f16(s4, vext_f16(s4, s4, 2));
-  float16x4_t s1 = vadd_f16(s2, vext_f16(s2, s2, 1));
-  return vget_lane_f16(s1, 0);
-}
-
 // Native FP16-in / FP16-out RMS-norm-over-width.
 //
 // Sum-of-squares is accumulated in FP32 (two float32x4 vectors per 8-lane
