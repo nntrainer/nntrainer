@@ -211,7 +211,7 @@ if [[ "$ENABLE_HTP" == true ]]; then
         exit 1
     fi
     bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
-    bash "$NNTRAINER_ROOT/test/htp/build.sh"
+    NNTR_HTP_DIAGNOSTICS="${NNTR_HTP_DIAGNOSTICS:-0}" bash "$NNTRAINER_ROOT/test/htp/build.sh"
     HTP_ENGINE_ARGS=(-Dhexagon-sdk-root="$HEXAGON_SDK_ROOT"
                      -Dhexkl-sdk-root="$HEXKL_ROOT"
                      -Dhexkl-lib-subdir="$HEXKL_LIB_SUBDIR")
