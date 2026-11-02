@@ -1,5 +1,4 @@
 causallm_inc += include_directories('.')
-causallm_src += files('lfm2_moe_layer.cpp', 'lfm2_htp_moe_causallm.cpp')
 
 # Preserve exact router arithmetic independently of the fused model's flags.
 lfm2_router_arm_cpp_args = []

@@ -185,24 +185,15 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-# Persistent tokenizer snapshot cache (tokenizer_cache.cpp). It needs the
-# snapshot entry points of the in-tree crate (tools/build_tokenizers_c.sh).
-# An archive built before they existed still links everything else, so
-# 'auto' probes the archive that is linked and, without them, builds the
-# cache out: every load then parses tokenizer.json as before.
-tokenizer_cache_opt = get_option('causallm-tokenizer-cache')
-tokenizer_cache = false
-if not tokenizer_cache_opt.disabled()
-    tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
-        args: [tokenizer_check_path] + tokenizer_system_libs,
-        dependencies: [thread_dep, libdl_dep])
-    if not tokenizer_cache and tokenizer_cache_opt.enabled()
-        error('causallm-tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with Applications/CausalLM/tools/build_tokenizers_c.sh.'.format(tokenizer_check_path))
-    endif
-endif
-if not tokenizer_cache
-    cpp_args += [ '-DCAUSALLM_DISABLE_TOKENIZER_CACHE' ]
-endif
+causallm_root = meson.current_source_dir()
+causallm_enable_qnn = get_option('enable-qnn-models')
+causallm_tokenizer_cache_name = 'causallm-tokenizer-cache'
+causallm_tokenizer_cache_opt = get_option(causallm_tokenizer_cache_name)
+causallm_tokenizer_probe_args = [tokenizer_check_path] + tokenizer_system_libs
+causallm_tokenizer_probe_deps = [thread_dep, libdl_dep]
+subdir('app_build/common')
+causallm_src += causallm_htp_model_src + causallm_qnn_src
+cpp_args += causallm_common_cpp_args
 
 # ── xgrammar (wrapper + vendored library), compiled into libcausallm.so ──
 # api/xgrammar_manager.cpp:26 defines a Meyers singleton
@@ -220,35 +211,6 @@ causallm_xgrammar_inc = [
     include_directories('xgrammar' / 'include'),
     include_directories('xgrammar' / '3rdparty' / 'picojson'),
     include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
-]
-
-causallm_xgrammar_src = [
-    # wrapper: bridges causallm::XGrammar to the xgrammar library.
-    meson.current_source_dir() / 'api' / 'xgrammar_wrapper.cpp',
-    meson.current_source_dir() / 'api' / 'xgrammar_manager.cpp',
-    # xgrammar library sources (from the xgrammar submodule checkout under
-    # this directory).
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'config.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'earley_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'regex_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'structural_tag.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'testing.cc',
-    # Support files (required for linking)
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
 ]
 
 causallm_xgrammar_lib = static_library('causallm_xgrammar',
@@ -276,23 +238,9 @@ if get_option('enable-qnn-models')
         error('enable-qnn-models requires enable-npu (the libqnn_context.so QNN backend)')
     endif
 
-    causallm_src += [
-        meson.current_source_dir() / 'qnn' / 'android_memory_allocator.cpp',
-        meson.current_source_dir() / 'qnn' / 'quick_dot_ai_qnn.cpp',
-        meson.current_source_dir() / 'qnn' / 'graph_parser.cpp',
-        meson.current_source_dir() / 'qnn' / 'generate_qnn_utils.cpp',
-        meson.current_source_dir() / 'qnn' / 'qnn_kv_cache_manager.cpp',
-        meson.current_source_dir() / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
-    ]
-
     causallm_extra_inc += [
         include_directories('qnn'),
         include_directories('qnn' / 'gemma4-e2b-qnn'),
-    ]
-
-    cpp_args += [
-        '-DENABLE_QNN=1',
-        '-DENABLE_QNN_MODELS=1',
     ]
 endif
 

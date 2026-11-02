@@ -3,7 +3,6 @@ causallm_src += [
     meson.current_source_dir() / 'transformer.cpp',
     meson.current_source_dir() / 'sentence_transformer.cpp',
     meson.current_source_dir() / 'model_registry.cpp',
-    meson.current_source_dir() / 'htp_weight_preparation.cpp',
 ]
 
 causallm_inc += include_directories('.')
