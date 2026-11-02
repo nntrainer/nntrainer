@@ -8,18 +8,10 @@ Hardware arithmetic and DSP/queue scheduling still require device validation.
 import argparse
 import os
 from pathlib import Path
-import re
 import shlex
 import subprocess
+import sys
 import tempfile
-
-
-def function(source, name):
-    match = re.search(r"(?m)^(?:int|void) " + re.escape(name) + r"\(", source)
-    if not match:
-        raise ValueError("Missing production function: " + name)
-    end = source.index("\n}\n", match.start()) + 3
-    return source[match.start():end]
 
 
 def main():
@@ -29,22 +21,22 @@ def main():
     here = Path(__file__).resolve().parent
     root = here.parents[2]
     backend = root / "nntrainer/tensor/htp_backend"
-    session = (here.parent / "hvx_add_f32.c").read_text()
-    moe = (backend / "hmx/hexkl_mm_u8i4_moe.c").read_text()
-    methods = "\n".join((function(moe, "hexkl_moe_scratch_free"),
-                          function(moe, "hexkl_moe_scratch_reserve"),
-                          function(session, "nntr_hvx_release_prefill_scratch")))
+    dsp = backend / "dsp"
     flags = ["-std=c11", "-O1", "-Wall", "-Wextra", "-Werror", "-pthread"]
     if args.sanitize:
         flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g1"]
     with tempfile.TemporaryDirectory(prefix="nntr-prefill-scratch-") as path:
         temporary = Path(path)
-        (temporary / "prefill_scratch_methods.inc").write_text(methods)
+        subprocess.run([sys.executable,
+                        str(here / "gen_nntr_hvx_h.py"), str(dsp / "nntr_hvx.idl"),
+                        str(temporary / "nntr_hvx.h")], check=True)
         binary = temporary / "prefill_scratch_host_check"
         command = shlex.split(os.environ.get("CC", "cc")) + flags
-        command += ["-I" + str(p) for p in (temporary, here / "stub", here.parent,
+        command += ["-I" + str(p) for p in (temporary, here / "stub", dsp,
                                            backend, backend / "hmx", backend / "hvx")]
-        command += [str(here / "prefill_scratch_host_check.c"), "-o", str(binary)]
+        command += [str(here / "prefill_scratch_host_check.c"),
+                    str(dsp / "nntr_hvx_prefill_scratch.c"),
+                    str(backend / "hmx/hexkl_moe_scratch.c"), "-o", str(binary)]
         subprocess.run(command, check=True)
         subprocess.run([str(binary)], check=True, timeout=60)
 

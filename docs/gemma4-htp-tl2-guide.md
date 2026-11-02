@@ -92,13 +92,12 @@ Build its native helper from the repository root:
 
 ```bash
 mkdir -p /tmp/nntr-tl2-tools
-cc -O3 -c nntrainer/tensor/htp_backend/hvx/hvx_gemv_u8tl2.c \
-  -I nntrainer/tensor/htp_backend/hvx \
-  -o /tmp/nntr-tl2-tools/hvx_gemv_u8tl2.o
+cc -O3 -c nntrainer/tensor/htp_backend/htp_tl2_codec.c \
+  -I nntrainer/tensor/htp_backend \
+  -o /tmp/nntr-tl2-tools/htp_tl2_codec.o
 c++ -O3 -std=c++17 -pthread tools/convert_tl2_model.cpp \
-  /tmp/nntr-tl2-tools/hvx_gemv_u8tl2.o \
+  /tmp/nntr-tl2-tools/htp_tl2_codec.o \
   -I nntrainer/tensor -I nntrainer/tensor/htp_backend \
-  -I nntrainer/tensor/htp_backend/hvx \
   -o /tmp/nntr-tl2-tools/convert_tl2_model
 python3 Applications/CausalLM/res/gemma4/convert_gemma4_tl2.py \
   /path/to/verified-qs2-q40-pack \
@@ -410,7 +409,8 @@ from this PR; the results and their limitations are retained here.
 |---|---|
 | [Gemma4 HTP MoE model](../Applications/CausalLM/models/gemma4/gemma4_htp_moe_causallm.cpp) | Per-layer formats and rotation sign loading |
 | [Shared MoE layer](../Applications/CausalLM/models/lfm2_moe/lfm2_moe_layer.cpp) | Routed experts and residency |
-| [TL2 kernels](../nntrainer/tensor/htp_backend/hvx/hvx_gemv_u8tl2.c) | Native packing, decode and prefill expansion |
+| [TL2 codec](../nntrainer/tensor/htp_backend/htp_tl2_codec.c) | Portable native weight packing and validation |
+| [TL2 kernels](../nntrainer/tensor/htp_backend/hvx/hvx_gemv_u8tl2.c) | Decode and prefill expansion |
 | [Affine correction](../nntrainer/tensor/htp_backend/hmx/hexkl_wh_affine.h) | Offset arithmetic |
 | [MoE kernels](../nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c) | Rotation, quantization and fused execution |
 | [Hadamard kernels](../nntrainer/tensor/htp_backend/hvx/hvx_hadamard_f32.c) | FP32 transforms and signs |

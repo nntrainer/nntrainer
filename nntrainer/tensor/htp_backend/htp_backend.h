@@ -11,7 +11,7 @@
  *
  * Process-wide owner of the HexKL micro-API FastRPC session. If the DSP
  * skel cannot be opened, the backend stays disabled and HtpComputeOps
- * falls back to CPU operations. The interface is test/htp/nntr_hvx.idl.
+ * falls back to CPU operations. The interface is dsp/nntr_hvx.idl.
  *
  * Do not open a HexKL macro-API session after this micro-API session;
  * that ordering permanently fails macro-API initialization.

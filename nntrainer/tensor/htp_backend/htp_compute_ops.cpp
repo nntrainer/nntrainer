@@ -1573,7 +1573,8 @@ public:
     return std::string(htp_graph_err_name(static_cast<uint32_t>(err))) +
            " (0x" + hex + ")" +
            (static_cast<unsigned>(err) == 0x8000040Eu
-              ? " -- AEE_EBADPARM: rebuild the DSP skel (test/htp/build.sh)"
+              ? " -- AEE_EBADPARM: rebuild the DSP skel "
+                "(nntrainer/tensor/htp_backend/dsp/build.sh)"
               : "");
   }
 
@@ -3636,7 +3637,8 @@ public:
         throw std::runtime_error(
           std::string(buf) +
           " (DSP skel or hardware did not accept the requested options; "
-          "rebuild/push libnntr_hvx_skel.so with test/htp/build.sh and "
+          "rebuild/push libnntr_hvx_skel.so with "
+          "nntrainer/tensor/htp_backend/dsp/build.sh and "
           "check FP16 HMX support when requesting *_hmx)");
       }
       // Report the echoed configuration; source describes only the GEMV
@@ -3679,7 +3681,8 @@ public:
         std::string("nntr_hvx_moe_set_hadamard_signs failed: err=") + code +
         " (widths " + std::to_string(had_signs_in_.size()) + " / " +
         std::to_string(had_signs_down_.size()) +
-        "; a skel older than test/htp/nntr_hvx.idl answers this call with an "
+        "; a skel older than nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl "
+        "answers this call with an "
         "error: rebuild and push libnntr_hvx_skel.so)");
     }
     std::fprintf(stderr, "[HTP] Hadamard signs: in=%zu down=%zu\n",
@@ -4283,8 +4286,8 @@ private:
    *  scratch buffers by size class reused across calls (stage above).
    *  invoke_mutex_ guards them -- required once they are shared
    *  mutable state, and consistent with the single-owner assumption
-   *  test/htp/nntr_hvx_session.h already documents for the one HTP session
-   *  a process opens (one VTCM arena, one HMX lock).
+   *  nntrainer/tensor/htp_backend/dsp/nntr_hvx_session.h already documents for
+   * the one HTP session a process opens (one VTCM arena, one HMX lock).
    */
   /** @brief Copies the kernel's output back into the caller's [M x N].
    *
@@ -5015,7 +5018,8 @@ private:
       const int e = nntr_hvx_dspq_start(session, id, dsp_spin_us);
       if (e != AEE_SUCCESS)
         fail(static_cast<unsigned>(e) == 0x8000040Eu
-               ? "dspq_start (stale skel: rebuild test/htp/build.sh)"
+               ? "dspq_start (stale skel: rebuild "
+                 "nntrainer/tensor/htp_backend/dsp/build.sh)"
                : "dspq_start",
              e);
     }
@@ -5990,13 +5994,14 @@ private:
       // the likeliest cause is that libnntr_hvx_skel.so on the device is
       // older than this binary and the two disagree on how many stage_us
       // slots there are. build_android.sh does not rebuild the skel; only
-      // test/htp/build.sh does, and forgetting that has cost three
-      // measurement cycles.
+      // nntrainer/tensor/htp_backend/dsp/build.sh does, and forgetting that has
+      // cost three measurement cycles.
       std::string hint;
       if (static_cast<unsigned>(err) == 0x8000040Eu) {
         hint =
           " (AEE_EBADPARM -- if the shapes are right, rebuild the DSP skel: "
-          "test/htp/build.sh, then push libnntr_hvx_skel.so. This binary "
+          "nntrainer/tensor/htp_backend/dsp/build.sh, then push "
+          "libnntr_hvx_skel.so. This binary "
           "expects " +
           std::to_string(static_cast<int>(HTP_MOE_N_STAGES)) +
           " stage_us slots.)";
@@ -6134,7 +6139,8 @@ private:
                (hist != nullptr ? "the chunked conv block (conv_wLen 5 C, "
                                   "#225)"
                                 : "mm_u8i4_conv_block") +
-               ": rebuild it with test/htp/build.sh and push "
+               ": rebuild it with nntrainer/tensor/htp_backend/dsp/build.sh "
+               "and push "
                "libnntr_hvx_skel.so)";
       }
       throw std::runtime_error(
@@ -7833,7 +7839,8 @@ private:
         std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(err));
         throw std::runtime_error(
           std::string("nntr_hvx_weight_swap_u8i4_arena failed: err=") + code +
-          " (a skel older than test/htp/nntr_hvx.idl answers this call with "
+          " (a skel older than nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl "
+          "answers this call with "
           "an error: rebuild and push libnntr_hvx_skel.so)");
       }
     } catch (...) {
@@ -8057,7 +8064,8 @@ private:
             std::string("nntr_hvx_weight_set_offsets_batch failed: err=") +
             code +
             " (an affine expert's offsets did not reach the DSP; a "
-            "skel older than test/htp/nntr_hvx.idl answers this call "
+            "skel older than nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl "
+            "answers this call "
             "with an error: rebuild and push libnntr_hvx_skel.so)");
         }
       }
@@ -8071,7 +8079,8 @@ private:
                             : "nntr_hvx_weight_swap_batch_u8i4_arena") +
           " failed: err=" + code + " at expert " + std::to_string(done) +
           " of " + std::to_string(n) +
-          " (a skel older than test/htp/nntr_hvx.idl answers this call with "
+          " (a skel older than nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl "
+          "answers this call with "
           "an error: rebuild and push libnntr_hvx_skel.so)"));
       }
     }

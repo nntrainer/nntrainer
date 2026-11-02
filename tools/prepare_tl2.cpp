@@ -4,8 +4,8 @@
  * @author NNTrainer contributors
  * @bug See the repository issue tracker for known issues.
  */
+#include "htp_backend/htp_tl2_native_packing.h"
 #include "htp_prepared_tl2.h"
-#include "htp_tl2_native_packing.h"
 #include <fstream>
 #include <iostream>
 #include <mutex>

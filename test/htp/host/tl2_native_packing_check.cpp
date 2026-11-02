@@ -4,10 +4,35 @@
  * @author NNTrainer contributors
  * @bug See the repository issue tracker for known issues.
  */
-#include "htp_tl2_native_packing.h"
-#include "hvx_gemv_u8tl2.h"
+#include "htp_backend/htp_tl2_codec.h"
+#include "htp_backend/htp_tl2_native_packing.h"
 #include <cassert>
 #include <cstdio>
+
+/** Encode logical columns directly without the production layout helpers. */
+static std::vector<uint8_t> reference(const std::vector<int8_t> &dense,
+                                      uint32_t K, uint32_t N) {
+  const uint32_t blocks = (K + 23u) / 24u;
+  std::vector<uint8_t> out(
+    static_cast<size_t>(blocks) * ((N + 127u) / 128u) * 640u, 0u);
+  for (uint32_t n = 0; n < N; ++n)
+    for (uint32_t k = 0; k < K; k += 3u) {
+      const int a = dense[static_cast<size_t>(k) * N + n];
+      const int b = k + 1u < K ? dense[static_cast<size_t>(k + 1u) * N + n] : 0;
+      const int c = k + 2u < K ? dense[static_cast<size_t>(k + 2u) * N + n] : 0;
+      const int value = 9 * a + 3 * b + c;
+      const unsigned magnitude = value < 0 ? -value : value;
+      const uint32_t lane = 4u * (n % 32u) + (n % 128u) / 32u;
+      const uint32_t group = (k % 24u) / 3u;
+      const size_t base =
+        (static_cast<size_t>(n / 128u) * blocks + k / 24u) * 640u;
+      out[base + 128u * (group / 2u) + lane] |= magnitude
+                                                << (4u * (group % 2u));
+      if (value < 0)
+        out[base + 512u + lane] |= 1u << group;
+    }
+  return out;
+}
 
 static void check(uint32_t K, uint32_t N, bool unit) {
   const size_t bytes = static_cast<size_t>(K) * N / 4u;
@@ -39,8 +64,10 @@ static void check(uint32_t K, uint32_t N, bool unit) {
   nntrainer::prepareSymmetricTl2(baseline.data(), K, N, nullptr);
   nntrainer::prepareSymmetricTl2(file.data(), K, N, &native);
   assert(baseline == file);
-  std::vector<uint8_t> expected(hvx_tl2_weight_bytes(K, N));
-  assert(hvx_tl2_pack(dense.data(), K, N, expected.data()) == 0);
+  const auto expected = reference(dense, K, N);
+  std::vector<uint8_t> encoded(hvx_tl2_weight_bytes(K, N));
+  assert(hvx_tl2_pack(dense.data(), K, N, encoded.data()) == 0);
+  assert(encoded == expected);
   assert(native == expected);
   const auto *prepared_palette =
     reinterpret_cast<const int8_t *>(file.data() + bytes);

@@ -17,27 +17,18 @@ foreach h : htp_backend_headers
   nntrainer_headers += meson.current_source_dir() / h
 endforeach
 
-# FastRPC client stub for the same IDL the DSP skel (test/htp/build.sh) is
-# built from. Not a custom_target: qaic is a proprietary Hexagon SDK tool a
-# normal build host does not have, and test/htp/build.sh already established
-# the convention of a manual generation step for it. generate_stub.sh puts
-# its output where this checks for it; both nntrainer_sources (this build)
-# and jni/meson.build's ndk-build source list (the Android build) read
-# nntrainer_sources by absolute path, so one entry here reaches both.
+# ARM client and DSP skeleton share dsp/nntr_hvx.idl; generate_stub.sh and
+# dsp/build.sh generate them separately because qaic requires the Hexagon SDK.
+# Both this build and jni/meson.build consume nntrainer_sources by absolute path.
 nntr_hvx_stub_c = meson.current_source_dir() / 'generated' / 'nntr_hvx_stub.c'
-nntr_hvx_idl = meson.project_source_root() / 'test' / 'htp' / 'nntr_hvx.idl'
+nntr_hvx_idl = meson.current_source_dir() / 'dsp' / 'nntr_hvx.idl'
 if not fs.is_file(nntr_hvx_stub_c)
   error('enable-htp=true requires the generated FastRPC stub. Run:\n' +
         '  HEXAGON_SDK_ROOT=<path> ' +
         meson.current_source_dir() / 'generate_stub.sh')
 endif
-# A MISSING stub is caught above; a STALE one used to sail through and fail
-# later as an undeclared identifier in htp_compute_ops.cpp, which names the
-# symbol but not the reason. Worse, test/htp/build.sh regenerates a SECOND
-# copy under test/htp/generated for the DSP skel, so running only that one
-# leaves a fresh skel against a stale client -- the device then rejects the
-# call with EBADPARM and the build looks fine. Compare against the IDL both
-# are generated from and say so here instead.
+# Building the DSP skeleton does not refresh the ARM stub. Reject a stale
+# client here so mismatched RPC methods do not fail later on the device.
 if fs.is_file(nntr_hvx_idl)
   stub_h = meson.current_source_dir() / 'generated' / 'nntr_hvx.h'
   if fs.is_file(stub_h)
@@ -45,7 +36,7 @@ if fs.is_file(nntr_hvx_idl)
       'test', nntr_hvx_idl, '-nt', stub_h, check: false).returncode() == 0
     if idl_newer
       error('The generated FastRPC stub is older than ' + nntr_hvx_idl +
-            '.\nRegenerate the ARM client stub (test/htp/build.sh only does ' +
+            '.\nRegenerate the ARM client stub (nntrainer/tensor/htp_backend/dsp/build.sh only does ' +
             'the DSP skel):\n' +
             '  HEXAGON_SDK_ROOT=<path> ' +
             meson.current_source_dir() / 'generate_stub.sh')
@@ -70,22 +61,25 @@ if get_option('htp-inproc')
   # hvx_emu does not emulate: nntr_hvx_softmax.c, nntr_hvx_attn.c,
   # nntr_hvx_mm_u8i8.c, nntr_hvx_dma_probe.c (device-gtest-only entries).
   # A skel entry the ARM calls but this list lacks is a link error
-  # (--no-undefined below), the host twin of test/htp/build.sh's guard.
+  # (--no-undefined below), the host twin of dsp/build.sh's guard.
   htp_test_dir = meson.source_root() / 'test' / 'htp'
   htp_host_dir = htp_test_dir / 'host'
+  htp_dsp_dir = meson.current_source_dir() / 'dsp'
   inproc_sources = files(
-    htp_test_dir / 'hvx_add_f32.c',
-    htp_test_dir / 'nntr_hvx_mm_u8i4.c',
-    htp_test_dir / 'nntr_hvx_graph.c',
-    htp_test_dir / 'nntr_hvx_small_ops.c',
-    htp_test_dir / 'nntr_hvx_attn_m1.c',
-    htp_test_dir / 'nntr_hvx_dspq.c',
-    htp_test_dir / 'nntr_hvx_token.c',
-    htp_test_dir / 'nntr_hvx_fc_q4.c',
+    htp_dsp_dir / 'hvx_add_f32.c',
+    htp_dsp_dir / 'nntr_hvx_prefill_scratch.c',
+    htp_dsp_dir / 'nntr_hvx_mm_u8i4.c',
+    htp_dsp_dir / 'nntr_hvx_graph.c',
+    htp_dsp_dir / 'nntr_hvx_small_ops.c',
+    htp_dsp_dir / 'nntr_hvx_attn_m1.c',
+    htp_dsp_dir / 'nntr_hvx_dspq.c',
+    htp_dsp_dir / 'nntr_hvx_token.c',
+    htp_dsp_dir / 'nntr_hvx_fc_q4.c',
     htp_test_dir / 'nntr_hvx_sf_probe.c',
     'hmx/hexkl_mm_u8i4.c',
     'hmx/hexkl_mm_u8i4_dma.c',
     'hmx/hexkl_mm_u8i4_moe.c',
+    'hmx/hexkl_moe_scratch.c',
     'hvx/hvx_hadamard_f32.c',
     'hmx/hexkl_mm_u8i8_dma.c',
     'hmx/hexkl_conv_block.c',
@@ -101,6 +95,7 @@ if get_option('htp-inproc')
     # hmx/hexkl_kv_q.c: in nntrainer_sources already (cpu_backend, #4415)
     'hvx/hvx_worker_pool.c',
     'hvx/hvx_expand_i2i4.c',
+    'htp_tl2_codec.c',
     'hvx/hvx_gemv_u8tl2.c',
     'hvx/hvx_gather_ah_u8.c',
     'hvx/hvx_scale_add_f32.c',
@@ -134,7 +129,7 @@ if get_option('htp-inproc')
     include_directories: include_directories(
       '../../../test/htp/host/inproc', '../../../test/htp/host/hvx_emu',
       '../../../test/htp/host/standin', '../../../test/htp',
-      'generated', 'hmx', 'hvx', '.', '..'),
+      'generated', 'dsp', 'hmx', 'hvx', '.', '..'),
     dependencies: [hexkl_dep, thread_dep, libm_dep],
     c_args: ['-ffp-contract=off', '-include', 'malloc.h',
              '-Wno-format-truncation', '-DNNTR_Q4M1_HOST_ID',

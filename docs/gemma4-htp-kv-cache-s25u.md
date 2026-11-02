@@ -45,6 +45,9 @@ tool 선언)은 한 번 prefill해서 KV cache 파일로 저장한다. 실행할
 
 ### 2.1 빌드 (v79)
 
+아래 빌드·배치 명령의 저장소 경로는 현재 구조에 맞췄다. 측정 조건과 결과는
+당시 기록 그대로다.
+
 `Applications/CausalLM/build_android.sh --htp`는 `HEX_ARCH`가 v81이 아니면 멈춘다.
 ARM 쪽은 아키텍처와 무관하므로 v81로 스크립트를 통과시킨 뒤 skel만 v79로 다시
 만든다. 스크립트는 고치지 않았다.
@@ -56,7 +59,7 @@ unset HEXAGON_SDK_ROOT; source $HOME/workspace/Hexagon_SDK/6.4.0.2/setup_sdk_env
 export HEXKL_ROOT=$HOME/workspace/hxkl-beta2/hexkl_addon HEXKL_SDK_VER=6.4.0.2
 
 HEX_ARCH=v81 bash Applications/CausalLM/build_android.sh --htp   # ARM 라이브러리, nntr_causallm
-(cd test/htp && HEX_ARCH=v79 ./build.sh)                          # "ARCH OK (V79)" 확인
+HEX_ARCH=v79 bash nntrainer/tensor/htp_backend/dsp/build.sh     # "ARCH OK (V79)" 확인
 # 이후 ARM만 바꿨으면: ninja -C builddir_app/htp
 ```
 
@@ -69,7 +72,7 @@ D=/data/local/tmp/nntrainer/causallm; R=$D/s25kv
 adb shell mkdir -p $R
 for f in builddir_app/htp/{nntr_causallm,libcausallm.so,libquick_dot_ai_api.so} \
          builddir/android_build_result/lib/arm64-v8a/{libnntrainer.so,libccapi-nntrainer.so,libc++_shared.so,libsdkl.so} \
-         test/htp/build/libnntr_hvx_skel.so; do adb push $f $R/; done
+         nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so; do adb push $f $R/; done
 adb shell chmod 755 $R/nntr_causallm
 ```
 

@@ -5,7 +5,7 @@
  * @bug See the repository issue tracker for known issues.
  */
 #include "htp_prepared_tl2.h"
-#include "hvx_gemv_u8tl2.h"
+#include "htp_tl2_codec.h"
 #include <cassert>
 #include <iostream>
 using namespace nntrainer;

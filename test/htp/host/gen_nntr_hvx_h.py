@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Writes a host stand-in for qaic's nntr_hvx.h from test/htp/nntr_hvx.idl.
+"""Writes a host stand-in for qaic's nntr_hvx.h from the backend DSP nntr_hvx.idl.
 
 qaic is a Hexagon SDK tool, so a host cannot generate the real header. This
 one declares every method with the prototype qaic gives it -- remote_handle64

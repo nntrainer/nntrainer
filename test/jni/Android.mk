@@ -864,7 +864,7 @@ include $(BUILD_EXECUTABLE)
 
 # HVX device bring-up test. Needs the Hexagon SDK for the FastRPC headers
 # and the generated stub, so it is skipped entirely when the SDK is absent.
-# Build the skel first: test/htp/build.sh
+# Build the skel first: nntrainer/tensor/htp_backend/dsp/build.sh
 ifdef HEXAGON_SDK_ROOT
 include $(CLEAR_VARS)
 
@@ -875,9 +875,9 @@ LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := \
 	 ../unittest/unittest_hvx_kernels.cpp \
-	 ../htp/generated/nntr_hvx_stub.c
+	 ../../nntrainer/tensor/htp_backend/dsp/generated/nntr_hvx_stub.c
 
-LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../nntrainer/tensor/htp_backend/dsp/generated \
 	 $(HEXAGON_SDK_ROOT)/incs \
 	 $(HEXAGON_SDK_ROOT)/incs/stddef \
 	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs

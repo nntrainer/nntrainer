@@ -28,7 +28,7 @@ flowchart LR
   end
   S -- "remote calls, rpcmem buffers" --> D
   subgraph dsp [Hexagon cDSP, one process domain]
-    D[libnntr_hvx_skel.so<br/>test/htp/nntr_hvx_*.c] --> H[HMX matmul<br/>htp_backend/hmx, HexKL]
+    D[libnntr_hvx_skel.so<br/>nntrainer/tensor/htp_backend/dsp/nntr_hvx_*.c] --> H[HMX matmul<br/>htp_backend/hmx, HexKL]
     D --> V[HVX kernels<br/>htp_backend/hvx]
     D --> T[resident graph + token driver<br/>hexkl_graph.c, hexkl_token.c]
   end
@@ -58,7 +58,7 @@ more `ComputeOps` table (`htp_compute_ops.cpp`) that a layer picks when its
 | `QS4CX` | dense projections (QKV, O, gate / up / down of the dense FFN) | row-major int4 nibbles, one fp32 scale per output column | `nntrainer/tensor/qs4cx_tensor.h` |
 | `QS4CX_WH` | the same values, pre-arranged for the HMX | nibbles in the HMX WH tile order, then the scales, then one fp32 column sum per column | `qs4cx_tensor.h` (`QS4CX_WH_Tensor`), `htp_wh_layout.h` (the tile formula) |
 | `QS2CX_WH` | the 128 routed experts | 2-bit codes in WH tile order, a 4-byte palette of int4 levels, the scales, the column sums | `qs4cx_tensor.h` (`QS2CX_WH_Tensor`), `htp_wh_palette.h` (palette fit), `hvx/hvx_expand_i2i4.c` (expansion on the DSP) |
-| `TL2CX_WH` | native ternary experts | packed ternary codes, FP32 scales and signed-weight column sums; compact arena slots | `htp_tl2_opts.h`, `hvx/hvx_gemv_u8tl2.c` |
+| `TL2CX_WH` | native ternary experts | packed ternary codes, FP32 scales and signed-weight column sums; compact arena slots | `htp_tl2_codec.h` / `.c` (native packing), `htp_tl2_opts.h` (arena options), `hvx/hvx_gemv_u8tl2.c` (compute) |
 | `QS4CX_WH_AFFINE` | affine projections and untied head; mixed-format experts | WH int4 codes, FP32 scales and code sums, INT32 channel offsets | `hmx/hexkl_wh_affine.h` |
 | `Q4_0` | embedding table and the language-model head | GGML Q4_0 blocks | existing CPU format; the HTP reads it through `htp_q4_0_convert.cpp` |
 | int8 KV | the attention cache | per-dimension fixed scales, int8 keys and values in HMX tiles | `hmx/hexkl_kv_q.c`, `cpu_backend/cpu_kv_q_attention.h` (the CPU mirror) |
@@ -101,7 +101,7 @@ flowchart TB
   fallback (`HtpMhaCoreDispatch` pins that contract).
 - `lfm2_moe_layer.cpp` is the routed MoE block shared with the LFM2 models:
   the router runs on the DSP (`router_logits_f32`), the selected experts are
-  served from the expert cache, and `expert_lru.h`
+  served from the expert cache, and `nntrainer/tensor/htp_backend/htp_expert_pool.h`
   decide which experts stay resident (`moe_cache_experts`).
 - `nntrainer/layers/llm/` holds `lm_head`, `logit_softcapping` and the HTP
   tied-embedding head; the head is split so the DSP computes the argmax of
@@ -180,11 +180,14 @@ HTP path still needs on the ARM: the Q4_0 row-range GEMV for the CPU half of
 the head, and the int8 KV attention so a model with `attention_kv_dtype=q8`
 computes the same thing on either engine.
 
-## 6. The DSP side: `test/htp/` and `htp_backend/{hvx,hmx}/`
+## 6. The DSP side: `htp_backend/{dsp,hvx,hmx}/`
 
-`test/htp/nntr_hvx.idl` declares every remote entry point; `generate_stub.sh`
-turns it into the ARM stub, `test/htp/build.sh` compiles the skel with the
-Hexagon toolchain and links HexKL. The entry points fall into groups:
+`nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl` declares every remote entry
+point; `generate_stub.sh` turns it into the ARM stub, and `nntrainer/tensor/htp_backend/dsp/build.sh`
+compiles the skel with the Hexagon toolchain and links HexKL. Production
+`nntr_hvx_*.c` files and `nntr_hvx_session.h` live in `dsp/`; diagnostic
+probes remain under `test/htp/` and are selected by `NNTR_HTP_DIAGNOSTICS=1`.
+The entry points fall into groups:
 
 | Group | Entry points (prefix `nntr_hvx_`) | Implemented in |
 |---|---|---|
@@ -209,7 +212,7 @@ compare against.
 ## 7. Runtime configuration and options
 
 The configuration the model was validated with is built into the library,
-in `nntrainer/tensor/htp_fixed_opts.h`; neither the app nor the CLI sets
+in `nntrainer/tensor/htp_backend/htp_fixed_opts.h`; neither the app nor the CLI sets
 it, and it is not an option any more:
 
 | Setting | Value | Effect |
@@ -285,7 +288,8 @@ If you are new to the code, read in this order:
 4. `nntrainer/tensor/htp_backend/htp_compute_ops.cpp`: search for
    `graph_init` and `token_driver_start` to see the decode path, and for
    `weight_register` to see how weights reach the arena.
-5. `test/htp/nntr_hvx.idl`, then `test/htp/nntr_hvx_graph.c` and
+5. `nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl`, then
+   `nntrainer/tensor/htp_backend/dsp/nntr_hvx_graph.c` and
    `nntrainer/tensor/htp_backend/hmx/hexkl_graph.c`: the DSP side of the same
    path.
 6. `test/htp/host/graph_host_check.c`: the resident graph exercised on the
@@ -293,7 +297,8 @@ If you are new to the code, read in this order:
 
 To add a DSP operation: declare it in `nntr_hvx.idl`, implement it in a
 `nntr_hvx_*.c` skel source (and the HVX / HMX kernel under `htp_backend/`),
-add it to the `SRCS` list in `test/htp/build.sh` and to
+add it to the `SRCS` list in
+`nntrainer/tensor/htp_backend/dsp/dsp_sources.sh` and to
 `nntrainer/tensor/htp_backend/meson.build` so the host twin compiles it, give
 it a scalar reference and a host check under `test/htp/host/`, and call it
 from `htp_compute_ops.cpp`. If it belongs to the decode step, add its op kind

@@ -13,28 +13,18 @@
 #include <hvx_hexagon_protos.h>
 #endif
 
-static uint32_t blocks(uint32_t K) { return K / 24u + (K % 24u != 0); }
-
-size_t hvx_tl2_weight_bytes(uint32_t K, uint32_t N) {
-  if (!K || !N || K > INT32_MAX / 255u || N > UINT32_MAX - 127u)
-    return 0;
-  const uint64_t bytes =
-    (uint64_t)blocks(K) * (N / 128u + (N % 128u != 0)) * 640u;
-  return bytes > SIZE_MAX ? 0 : (size_t)bytes;
-}
-
 size_t hvx_tl2_table_bytes(uint32_t K) {
   if (!K || K > INT32_MAX / 255u)
     return 0;
-  const uint64_t bytes = (uint64_t)blocks(K) * 512u;
+  const uint64_t bytes = (uint64_t)htp_tl2_blocks(K) * 512u;
   return bytes > SIZE_MAX ? 0 : (size_t)bytes;
 }
 
 uint32_t hvx_tl2_k_splits(uint32_t K, uint32_t N, uint32_t workers) {
-  if (workers < 2u || workers > 8u || !hvx_tl2_weight_bytes(K, N))
+  if (workers < 2u || workers > 8u || !htp_tl2_weight_size(K, N))
     return 1u;
   const uint32_t panels = (N + 127u) / 128u;
-  const uint32_t kb = blocks(K);
+  const uint32_t kb = htp_tl2_blocks(K);
   uint64_t best = ((uint64_t)panels + workers - 1u) / workers * kb;
   uint32_t choice = 1u;
   for (uint32_t s = 2u; s <= 4u && kb >= 64u; s *= 2u) {
@@ -47,13 +37,6 @@ uint32_t hvx_tl2_k_splits(uint32_t K, uint32_t N, uint32_t workers) {
     }
   }
   return choice;
-}
-
-/** Balanced-base-3 digits of an unsigned magnitude (0..13). */
-static void digits(unsigned m, int *a, int *b, int *c) {
-  *a = (int)((m + 13u) / 9u) - 1;
-  *b = (int)(((m + 13u) / 3u) % 3u) - 1;
-  *c = (int)((m + 13u) % 3u) - 1;
 }
 
 #if defined(__hexagon__)
@@ -259,64 +242,6 @@ void hvx_tl2_expand_wh96_disjoint_batch(const uint8_t *__restrict src,
                                  magnitude, dst + (size_t)g * 3u * row_stride);
 }
 
-int hvx_tl2_pack(const int8_t *kn, uint32_t K, uint32_t N, uint8_t *packed) {
-  const size_t bytes = hvx_tl2_weight_bytes(K, N);
-  if (!kn || !packed || !bytes || (size_t)K > SIZE_MAX / N)
-    return -1;
-  for (size_t i = 0; i < (size_t)K * N; ++i)
-    if (kn[i] < -1 || kn[i] > 1)
-      return -1;
-  memset(packed, 0, bytes);
-  for (uint32_t p = 0; p < (N + 127u) / 128u; ++p)
-    for (uint32_t kb = 0; kb < blocks(K); ++kb) {
-      uint8_t *dst = packed + ((size_t)p * blocks(K) + kb) * 640u;
-      for (uint32_t j = 0; j < 128u; ++j) {
-        const uint32_t n = p * 128u + (j % 4u) * 32u + j / 4u;
-        for (uint32_t g = 0; g < 8u; ++g) {
-          int value = 0;
-          for (uint32_t t = 0; t < 3u; ++t) {
-            const uint32_t k = kb * 24u + g * 3u + t;
-            value = 3 * value + (k < K && n < N ? kn[(size_t)k * N + n] : 0);
-          }
-          const unsigned mag = value < 0 ? (unsigned)-value : (unsigned)value;
-          dst[(g / 2u) * 128u + j] |= mag << (4u * (g % 2u));
-          dst[512u + j] |= (value < 0) << g;
-        }
-      }
-    }
-  return 0;
-}
-
-int hvx_tl2_unpack(const uint8_t *packed, uint32_t K, uint32_t N, int8_t *kn) {
-  if (!packed || !kn || !hvx_tl2_weight_bytes(K, N) || (size_t)K > SIZE_MAX / N)
-    return -1;
-  for (uint32_t p = 0; p < (N + 127u) / 128u; ++p)
-    for (uint32_t kb = 0; kb < blocks(K); ++kb) {
-      const uint8_t *src = packed + ((size_t)p * blocks(K) + kb) * 640u;
-      for (uint32_t j = 0; j < 128u; ++j) {
-        const uint32_t n = p * 128u + (j % 4u) * 32u + j / 4u;
-        for (uint32_t g = 0; g < 8u; ++g) {
-          const unsigned mag =
-            (src[(g / 2u) * 128u + j] >> (4u * (g % 2u))) & 15u;
-          const int sign = (src[512u + j] >> g) & 1u;
-          if (mag > 13u || (!mag && sign))
-            return -1;
-          int t[3];
-          digits(mag, &t[0], &t[1], &t[2]);
-          for (uint32_t i = 0; i < 3u; ++i) {
-            const uint32_t k = kb * 24u + g * 3u + i;
-            const int w = sign ? -t[i] : t[i];
-            if (k < K && n < N)
-              kn[(size_t)k * N + n] = (int8_t)w;
-            else if (w)
-              return -1;
-          }
-        }
-      }
-    }
-  return 0;
-}
-
 #if defined(__hexagon__)
 /* Two 16-entry magnitude tables per vector, duplicated halfwords for VLUT. */
 static const int16_t tl2_digits[3][64] __attribute__((aligned(128))) = {
@@ -394,7 +319,7 @@ void hvx_tl2_prepare(const uint8_t *act, uint32_t K, uint32_t begin,
         const int c = k + 2u < K ? act[k + 2u] : 0;
         for (uint32_t m = 0; m < 16u; ++m) {
           int x, y, z;
-          digits(m < 14u ? m : 0u, &x, &y, &z);
+          htp_tl2_digits(m < 14u ? m : 0u, &x, &y, &z);
           const int16_t v = (int16_t)(a * x + b * y + c * z);
           tab[h * 32u + 2u * m] = v;
           tab[h * 32u + 2u * m + 1u] = v;
@@ -429,7 +354,7 @@ void hvx_gemv_u8tl2_panel(const uint8_t *src, uint32_t K, const int16_t *tables,
   /* Keep adjacent K blocks from competing for the four predicate registers. */
 #pragma clang loop pipeline(disable)
 #endif
-  for (uint32_t kb = 0; kb < blocks(K); ++kb) {
+  for (uint32_t kb = 0; kb < htp_tl2_blocks(K); ++kb) {
     const HVX_Vector signs =
       *(const HVX_Vector *)(src + (size_t)kb * 640u + 512u);
 #if NNTR_TL2_PREDICATED_SIGN
@@ -500,7 +425,7 @@ void hvx_gemv_u8tl2_panel(const uint8_t *src, uint32_t K, const int16_t *tables,
   *(HVX_Vector *)(out + 96u) = Q6_V_hi_W(odd);
 #else
   memset(out, 0, 128u * sizeof(*out));
-  for (uint32_t kb = 0; kb < blocks(K); ++kb)
+  for (uint32_t kb = 0; kb < htp_tl2_blocks(K); ++kb)
     for (uint32_t g = 0; g < 8u; ++g)
       for (uint32_t j = 0; j < 128u; ++j) {
         const uint8_t *s = src + (size_t)kb * 640u;
