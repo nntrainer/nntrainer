@@ -18,11 +18,10 @@
  * evict the least recently used, refresh recency from the routing's
  * extended top-k so the likely-next experts move to the back.
  *
- * [#289] NNTR_MOE_LRFU=<H> (tokens) evicts by LRFU instead: each key's
+ * NNTR_MOE_LRFU=<H> (tokens) evicts by LRFU instead: each key's
  * score is its use count decayed by half every H tokens (H x layers
- * acquire() calls), the lowest score goes, ties least recent first --
- * tools/moe_expert_cache_sim.py's lrfu:H, which cuts the #266 p1024 trace's
- * misses at C = 24 by 20 %. The score outlives the key's residency.
+ * acquire() calls). The lowest score goes, ties least recent first.
+ * The score outlives the key's residency.
  */
 
 #ifndef __CAUSALLM_EXPERT_LRU_H__
@@ -69,7 +68,7 @@ public:
       capacity_ += per_layer;
   }
 
-  /** @brief [#4416] Raises the capacity by @a n keys at run time (the
+  /** @brief Raises the capacity by @a n keys at run time (the
    *  backend, once the prefill's buffers are gone: the DSP's address
    *  space has room for more expert slots then). */
   void addCapacity(size_t n) {
@@ -77,7 +76,7 @@ public:
     capacity_ += n;
   }
 
-  /** @brief [#289] LRFU with a half-life of @a tokens (0: LRU); the
+  /** @brief LRFU with a half-life of @a tokens (0: LRU); the
    *  default is NNTR_MOE_LRFU's. Set before the first acquire(). */
   void setLrfu(double tokens) { lrfu_ = tokens; }
 
@@ -92,7 +91,7 @@ public:
   }
 
   /**
-   * @brief [doc 52 section 10.20] Counts @a n slots as taken by keys that
+   * @brief Counts @a n slots as taken by keys that
    *        are not in the LRU yet -- read-ahead still in flight -- so that
    *        neither makeRoom() nor acquire() hands those slots out again.
    *        unhold() gives them back, just before the keys are acquire()d.
@@ -218,11 +217,8 @@ public:
     return keys;
   }
 
-  /** @brief [#289] NNTR_MOE_LRFU's half-life in tokens; "0" is LRU, unset
-   *  is 32 (S26 Ultra, Gemma-4 26B-A4B, C = 32, three runs each: the decode
-   *  miss wait 25.2-32.0 -> 24.1-27.4 ms a token at 1024 prompt tokens and
-   *  32.3-35.1 -> 25.8-28.6 at 2048, the text identical). Read once per
-   *  process. */
+  /** @brief NNTR_MOE_LRFU's half-life in tokens; "0" is LRU, unset is 32.
+   *  Read once per process. */
   static double lrfuTokens() {
     static const double h = [] {
       const char *v = std::getenv("NNTR_MOE_LRFU");
@@ -305,9 +301,9 @@ private:
   std::set<const void *> layers_;
   Order order_; /**< front = least recently used */
   std::unordered_map<Key, Order::iterator> pos_;
-  double lrfu_ = lrfuTokens();           /**< [#289] half-life, tokens */
-  uint64_t clock_ = 0;                   /**< [#289] acquire() calls */
-  std::unordered_map<Key, Score> score_; /**< [#289] LRFU, every key seen */
+  double lrfu_ = lrfuTokens();           /**< half-life, tokens */
+  uint64_t clock_ = 0;                   /**< acquire() calls */
+  std::unordered_map<Key, Score> score_; /**< LRFU, every key seen */
 };
 
 } // namespace causallm

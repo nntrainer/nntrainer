@@ -148,7 +148,7 @@ public:
   bool supportBackwarding() const override { return false; }
 
   /**
-   * @brief [doc 52] Brings this layer's virtual experts into the shared
+   * @brief Brings this layer's virtual experts into the shared
    *        resident pool at load, in expert order, until the pool is full.
    *        Called by Transformer::repack_weight after every weight is read
    *        so the first prefill pays no arena mapping; a no-op when the
@@ -173,14 +173,14 @@ private:
              props::OutNorm, props::OutAdd, nntrainer::props::Epsilon,
              props::OutToHost>
     moe_props;
-  /** The block's norms folded into this layer (doc 57 section 5 step 4):
+  /** The block's norms folded into this layer:
    *  in_norm norms the input for the experts, router_norm norms it again
    *  for the router, out_norm norms the output; the gammas are weights in
    *  the file's order (in, router, ..., out). The output norm rides the
    *  accelerator call at prefill and runs on the CPU otherwise. */
   bool in_norm = false, router_norm = false, out_norm = false;
   unsigned int in_gamma_idx = 0, router_gamma_idx = 0, out_gamma_idx = 0;
-  /** out_add (doc 57 section 9.30): the post-FFN epilogue's gamma and the
+  /** out_add: the post-FFN epilogue's gamma and the
    *  block scalar, and whether the epilogue is on. */
   unsigned int add_gamma_idx = 0, add_scale_idx = 0;
   bool out_add = false;
@@ -197,7 +197,7 @@ private:
    *  residual differently for the router and for the experts). */
   bool softmax_router;
   /** props::MoEActivation tanh_gelu (Gemma-4) rather than swish (LFM2):
-   *  the deterministic GeGLU on both the host and the DSP (doc 55). */
+   *  the deterministic GeGLU on both the host and the DSP. */
   bool gelu_act;
 
   // weight indices
@@ -206,15 +206,14 @@ private:
   unsigned int gate_idx;
   unsigned int expert_bias_idx;
 
-  /** [doc 52] Expert weights left virtual (never read by the loader) and
+  /** Expert weights left virtual (never read by the loader) and
    *  streamed from the model file into accelerator-owned slots under an
    *  LRU shared by every MoE layer: set when the layer runs on an
-   *  accelerator engine and NNTR_MOE_CACHE_EXPERTS is in the environment.
-   *  cache_per_layer is that variable's value, this layer's share of the
-   *  pool. Unset, nothing about the resident path changes. */
+   *  accelerator engine with a nonzero cache share. cache_per_layer is
+   *  this layer's configured share, or htp_fixed::MOE_CACHE_EXPERTS. */
   bool experts_virtual;
   unsigned int cache_per_layer;
-  /** [doc 52 section 10.10] This layer's row in the table of virtual
+  /** This layer's row in the table of virtual
    *  experts preloadExperts builds in layer order, so a prefill call can
    *  read the next layer's experts while it runs; -1 until preloaded. */
   int expert_layer_slot;

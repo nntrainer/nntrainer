@@ -11,7 +11,7 @@
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * Plan 170 section 3. One header for the kernel, the probe entry
+ * Shared by the kernel, the probe entry
  * (test/htp/nntr_hvx_attn_m1_probe.c) and the host check, so the probe on
  * silicon tests the code the kernel ships. An hf vector is 64 fp16 lanes;
  * a widened pair holds the even lanes in lo and the odd lanes in hi.
@@ -19,18 +19,15 @@
  * WHY EXPLICIT qf32. hexagon-clang 19 -mv79 lowers every IEEE sf / hf
  * intrinsic to a qf32 / qf16 op plus a convert and, without
  * -mhvx-ieee-fp (the skel does not pass it), contracts an sf multiply into
- * a following sf add with no rounding between them (plan 170 section 0).
+ * a following sf add with no rounding between them.
  * So every f32 rounding point of the spec below is written as the qf32 op
  * and its own Vsf_equals_Vqf32, and the compiler has nothing to fuse. The
  * hf add / sub / mpy / max intrinsics are single fp16 operations already.
  *
  *   hvx_hf_fma      RN16(c + a*b) rounded once (attn_m1_det_fma16, the
  *                   CPU's fmla .8h): the exact products of a*b and c*1.0
- *                   in qf32, one qf32 add, one conversion to hf. The v79
- *                   ISS matched the fused spec on every real and
- *                   adversarial case, where the same sum narrowed through
- *                   sf failed every double-rounding hazard; silicon is
- *                   HvxAttnM1Probe.Semantics' question (G1).
+ *                   in qf32, one qf32 add, one conversion to hf. Narrowing
+ *                   through sf would introduce double-rounding hazards.
  *   hvx_hf_score    step 2's tail: the vpaddq tree of the eight
  *                   accumulators, 0 + t, * scale, each one hf op.
  *   hvx_hf_exp16    exp16 on hf lanes d <= 0: neon_mathfun's exp_ps, one
@@ -39,21 +36,18 @@
  *                   d <= 0: the host check's exhaustive exp16 row).
  *   hvx_hf_div16    rne16(e / l): the lanes widened to sf, hvx_div16_sf
  *                   (the kernel's proven divide), narrowed back.
- *                   ponytail: an hf-native divide (the midpoint test on
- *                   qf32 products) would drop the widen / narrow; worth it
- *                   only if the phase words show the divide matters.
- *   hvx_hf_round_row / hvx_hf_store_sf  (#170 round 2) the kernel's q / k
+ *   hvx_hf_round_row / hvx_hf_store_sf  the kernel's q / k
  *                   / v rounding and its output widening as vectors:
  *                   hvx_hf_bits_rne and hf_float per lane in integer ops
  *                   plus exact f32 steps, so the sign of a zero and the
  *                   subnormals come through (no qf32 conversion on the
  *                   result; qf32 has no -0).
- *   hvx_hf_round_row_lut / hvx_hf_splat_lut  (#170 round 3) P1's q
+ *   hvx_hf_round_row_lut / hvx_hf_splat_lut  P1's q
  *                   operand without 64 stored splat vectors per head: the
  *                   rounded row stored zipped (vshuffe for vpacke), q[d]
  *                   and q[d + 1] splatted from it by one vlut16 -- a
  *                   permute, no memory, no scalar -> vector transfer.
- *   hvx_hf_exp16_fill / hvx_hf_exp16_idx  (#170 round 3) exp16 as a lookup:
+ *   hvx_hf_exp16_fill / hvx_hf_exp16_idx  exp16 as a lookup:
  *                   attn_m1_det_exp_table's values as fp16 bits, and the
  *                   spec's attn_m1_det_exp_index as three integer ops on
  *                   the hf lanes. The kernel gathers tab[idx(d)] with
@@ -61,9 +55,8 @@
  *                   exp16(d) bit for bit at every fp16 d <= 0.
  *
  * Widening and narrowing values already on the fp16 grid are exact both
- * ways. The host emulation (test/htp/host/hvx_emu) checks all of this
- * against the spec (ATTN M1 HF PRIM); what it cannot see is a silicon
- * qf32 that narrows differently, which is why S1 runs first.
+ * ways. Host emulation (test/htp/host/hvx_emu, ATTN M1 HF PRIM) checks the
+ * spec; HvxAttnM1Probe.Semantics checks the hardware rounding behavior.
  */
 
 #ifndef __NNTRAINER_HVX_ATTN_M1_HF_H__

@@ -12,30 +12,16 @@
  * Design, and the arithmetic every constant here is checked against:
  * docs/htp_attention/46_moe_resident_kernel_design.md.
  *
- * Two things about this file are deliberate and easy to undo by accident.
+ * Two copies of gate_up and down need 10.5 MB in an 8.3 MB arena. Reuse
+ * each weight buffer only after its last reader: while expert e's down
+ * matmul runs, e+1's gate_up DMA can use the freed gate_up buffer.
  *
- * THE WEIGHTS ARE NOT DOUBLE-BUFFERED. Two copies of gate_up and down is
- * 10.5 MB against an 8.3 MB arena, so instead each buffer is reused with a
- * time offset: while expert e's down matmul runs, the gate_up buffer is
- * already dead and e+1's gate_up is pulled into it. That is the whole
- * reason the layout fits, and it is what keeps the weight DMA hidden --
- * doc 44 section 14.3 measured what happens when it is not: the u8in call
- * has no activation quant for the DMA to hide behind and all 5.18 ms/layer
- * of it is exposed.
- *
- * THE POOL RUNS ONE JOB BEHIND THE HMX, AND THE DOWN MATMUL ONE BLOCK
- * BEHIND THE GATE_UP. Each staged batch's epilogue (dequant+SwiGLU, or
- * dequant+scatter) is submitted to the worker pool and retired only when
- * the buffer it reads or writes is about to be reused: two accumulator
- * staging buffers alternate under the HMX issue, two mid buffers under the
- * requantization, res_f32 has its own region rather than aliasing gate.
- * Block n's down is issued after block n+1's gate_up, so that block n's
- * requantization and last epilogues have a matmul to hide behind (the
- * comment above the block loop derives it). Every wait is placed where
- * the dependency actually is, and each is timed, so the profile's
- * DEQUANT, REQUANT and SCATTER columns read the exposed part, not the
- * work. Moving a submit or a wait without re-deriving who reads what is
- * how this breaks -- silently, as a plausible wrong output.
+ * The pool runs one job behind HMX, and down runs one block behind gate_up.
+ * Retire each epilogue before reusing any buffer it reads or writes. Two
+ * accumulator staging buffers and two mid buffers alternate; res_f32 has
+ * its own region rather than aliasing gate. Block n's down follows block
+ * n+1's gate_up to overlap requantization and epilogues with HMX (see the
+ * block sequence below). DEQUANT, REQUANT and SCATTER time the exposed waits.
  */
 
 #include "hexkl_mm_u8i4_moe.h"
@@ -159,12 +145,8 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
  * WH tiles are indexed kt*n_col + nt, so a run of n-tile columns is cn*512
  * contiguous bytes repeated k_tiles times at a n_col*512 stride -- exactly
  * a 2D transfer, and the destination keeps the same layout so the matmul's
- * indexing is unchanged. The bake order does not have to move.
- *
- * Splitting the weight this way is what lets the matmul start on column
- * nt0 while the rest is still arriving. Waiting for all 3.5 MB of a
- * gate_up first cost 110 us an expert against a 136 us transfer -- the
- * prefetch was hiding almost nothing (doc 46 section 26.4).
+ * indexing is unchanged. Chunking lets the matmul start on column nt0
+ * while the rest of the weight is still arriving.
  *
  * @return the ring index to hand hexkl_dma_ring_wait
  */
@@ -463,9 +445,8 @@ static void moe_expand_native(moe_expand_ctx *ctx, uint8_t *base,
  * @brief Queues a chunk's expansion behind whatever the workers are doing.
  *
  * The caller must already have waited for the chunk's DMA. Submitted one
- * batch before the HMX that reads the chunk, so the expansion runs under
- * the previous batch's issue instead of in front of this one -- the same
- * move D1 made for the weight DMA itself (doc 54 5.12).
+ * batch before the HMX that reads the chunk, so expansion overlaps the
+ * previous batch's issue.
  *
  * @param nt1 second column run, or UINT32_MAX for one
  */
@@ -602,14 +583,9 @@ static uint32_t moe_push_gate_up_chunks(uint8_t *vtcm_base, uint32_t dst_off,
 /**
  * @brief Queues one 64-row activation block, slot-ordered heap -> VTCM.
  *
- * Issued AHEAD of the weight chunks it will be computed against, never
- * behind them. The ring retires in push order and hexkl_dma_ring_wait(idx)
- * therefore waits for everything queued before idx: with this transfer
- * queued after an expert's gate_up and down, its wait covered all 5.25 MB
- * of them, the chunked gate_up wait below then found nothing left to wait
- * for, and the profile filed the whole weight transfer under GATHER --
- * 795 us at decode for a 128 KB copy (doc 46 section 49). Pushed first,
- * the wait covers 128 KB and the weight waits time the weights.
+ * Queue before its weight chunks: the ring retires in push order, so
+ * hexkl_dma_ring_wait(idx) also waits for every earlier descriptor. This
+ * keeps the activation wait from blocking on the weight transfers.
  *
  * @return the ring index to hand hexkl_dma_ring_wait
  */
@@ -649,29 +625,19 @@ static uint32_t moe_push_act_block(uint8_t *vtcm_base, uint32_t act_off,
  *        gate_off into the other mid buffer, in MOE_RQ_UNIT_ROWS-row
  *        units.
  *
- * Why not a scatter job after the last dequant and a requantization of
- * its own, as it was: the foreground lane holds one job at a time, and a
- * job hides only when an HMX batch is issued between its submit and the
- * wait that retires it. Neither had one -- REQUANT read 0.7-1.0 ms of a
- * 15 ms prefill call and the last dequant and scatter 0.3 more (doc 51
- * section 2.21). Folded in, a block submits exactly as many jobs as it
- * issues batches.
- *
- * Why the fold is exact: a tile's 32 columns of every output row are its
- * own, so no two units write one address, and each output element still
- * receives one multiply-add per expert, in block order, since blocks'
- * jobs are sequential -- the bytes are the row split's. The requant
+ * Folding scatter and requantization into the epilogues gives each pool
+ * job an HMX batch to overlap. A tile owns 32 columns of every output row,
+ * so no two units write one address. Each output element still receives
+ * one multiply-add per expert in block order; blocks' jobs are sequential.
+ * The requant
  * units read gate_off, which every gate_up epilogue has finished writing
  * by the wait before this job's submit, and write the mid buffer the
  * next down will read, not the one this down's HMX is reading. Work is
  * dealt round-robin over the workers so the few heavy requant units do
  * not all land on one.
  *
- * The dequant and the scatter are one pass in registers, row-major over
- * the batch's tiles (hvx_dequant_acc_tiles_scatter_rows_f32): the DN
- * epilogue did show above its batch, 7.1 ms of HMX-thread wait a 1024-row
- * call (doc 57 section 9.34), and its f32 went through VTCM and 64
- * one-vector calls a tile.
+ * Dequant and scatter share one register pass, row-major over the batch's
+ * tiles (hvx_dequant_acc_tiles_scatter_rows_f32).
  */
 typedef struct {
   /* the batch's tiles */
@@ -936,35 +902,19 @@ static void moe_gu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_worker_probe_add(t0);
 }
 
-/** ---- O1: an expert's tail block on the HVX ------------------------------
+/** ---- An expert's tail block on HVX ------------------------------------
  *
- * The HMX computes 64 rows whatever the count, 252 us a block; 13.6 of a
- * prefill call's 45.6 blocks are an expert's second block of 10-20 rows
- * (doc 47 section 14). A block of at most MOE_TAIL_MAX_ROWS rows after a
- * full one is taken off the HMX and computed on the pool's background lane
- * as three gated jobs -- gate/up column pairs with the fused SwiGLU
- * epilogue, the requantization, down columns with their dequant -- reading
- * the weights straight from the arena (DDR) and the activation from the
- * packed slots. Every job of every tail is queued at the start of the call,
- * in expert order, so the lane grinds through them under the whole HMX
- * loop, and each tail's rows are scattered by the job that scatters its
- * expert's last HMX block. The int32 sums are the HMX's own (see
- * hvx_gemm_u8i4_wh.h) and the epilogues are the same functions on the same
- * numbers, so the output is byte for byte what the all-HMX path produced.
- *
- * ponytail: one tail at a time -- the gating serializes them, so the
- * staging below is shared. If tails ever outrun the shadow, two staging
- * sets and pairwise gating is the upgrade. And the threshold is a guess
- * until measured: HVX_GEMM_U8I4_MAX_ROWS (16) is where a row-group unit is
- * ~20 us; the average tail here is 10-20 rows.
+ * A block of at most MOE_TAIL_MAX_ROWS rows after a full HMX block runs
+ * on the pool's background lane in three gated jobs: gate/up pairs with
+ * SwiGLU, requantization, then down columns with dequantization. They read
+ * weights from DDR and activation from packed slots. All tails are queued
+ * in expert order at call entry; each is scattered with its expert's last
+ * HMX block. The int32 sums (hvx_gemm_u8i4_wh.h) and epilogues match HMX.
+ * Gating serializes tails, so they share one set of staging buffers.
  */
-/** OFF by default (0 rows): measured on device (doc 47 section 21.1) the path
-   took 3.5 tails a call off the HMX (-0.59 ms) and cost 1.07 ms in return --
-   the tails were not done when their expert's scatter needed them (SCATTER
-   +0.45) and the units held workers the requant and epilogue runs were
-   waiting for (REQUANT +0.48, DEQUANT +0.15). Net -0.5 ms a call. The host
-   check builds with -DMOE_TAIL_MAX_ROWS=16u so the path stays exercised;
-   HVX_GEMM_U8I4_MAX_ROWS is the ceiling. */
+/** Disabled by default: tail jobs delayed scatter and competed with HMX
+ * epilogues for workers on device. Host checks use MOE_TAIL_MAX_ROWS=16u
+ * to exercise the path; HVX_GEMM_U8I4_MAX_ROWS is the ceiling. */
 #ifndef MOE_TAIL_MAX_ROWS
 #define MOE_TAIL_MAX_ROWS 0u
 #endif
@@ -992,18 +942,11 @@ typedef struct {
     N_out, act, had_down;
 } moe_tail_ctx;
 
-/** @brief Worker time spent inside this kernel's pool jobs -- the gate_up
- *         epilogue (dequant + SwiGLU), the down epilogue (dequant, scatter,
- *         the requant units it carries) and the tail units -- summed
- *         across workers and filed under the SWIGLU column, which this
- *         kernel has no synchronous pass for. The same reading as the conv
- *         block's cb_stage_probe_add: HIDDEN work, not wall time, so the
- *         host leaves it out of the mm residual. What it answers is how
- *         much of the HMX shadow (3 workers x the issue time) the
- *         epilogues consume -- the number that decides whether making the
- *         epilogue arithmetic cheaper can move anything (doc 53 section
- *         8.4). Atomic because the slices run concurrently; HEXKL_PROBE_ADD
- *         is not. */
+/** @brief Worker time for gate_up/down epilogues and tail units, summed
+ *         across workers under SWIGLU (there is no synchronous SwiGLU pass).
+ *         This is overlapped work, not wall time, so the host excludes it
+ *         from the mm residual. Atomic because slices run concurrently;
+ *         HEXKL_PROBE_ADD is not. */
 static inline void moe_worker_probe_add(uint64_t t0) {
   if (hexkl_probe_on) {
     atomic_fetch_add_explicit(
@@ -1130,74 +1073,39 @@ static int moe_all_2bit(const hexkl_weight_u8i4_table *tbl, uint32_t n_experts,
   return 1;
 }
 
-/** ---- The M=1 path: every expert on the HVX GEMV, no 64-row block ---------
+/** ---- The M=1 path: every expert on HVX GEMV ----------------------------
  *
- * Decode routes one token (M=1; a few at a small batch) to four experts,
- * and the block loop above computes a 64-row HMX block for each of them
- * plus the 5.25 MB weight DMA into VTCM that one block of one live row
- * cannot hide (LEDGER wall 1). This path takes the whole call off the HMX:
- * it is the tail path's three stages (moe_tail_* above) run for every
- * active expert, the weights read straight from the arena behind the
- * GEMV's own l2fetch, the activation packed inline -- no weight DMA, so
- * BLOCKS and DMA_KB read 0 and PATH reads 1.
+ * The arena path runs three foreground pool stages for every active expert:
+ * A = gate/up pairs with SwiGLU, B = requantization, C = down columns with
+ * dequantization. The caller then scatters in expert and row order, matching
+ * moe_scatter_worker and the HMX path's f32 add sequence. Int32 sums also
+ * match HMX (hvx_gemm_u8i4_wh.h). Each stage joins before the next starts.
+ * Lanes take contiguous expert-major units, so adjacent 512-byte tiles share
+ * one 2D l2fetch; block b+1 is prefetched before block b is computed.
+ * Without the VTCM feed there is no weight DMA: BLOCKS and DMA_KB are 0,
+ * and PATH is 1.
  *
- * Foreground lane only. The tail path lost on device because its
- * background units held workers the HMX epilogues then waited for (doc 47
- * section 21.1); here there is no HMX loop to hide under, so each stage is
- * one hvx_worker_pool_run across the pool's lanes (n_hvx - 1 workers plus
- * the caller, 6 on v79) and nothing is left in flight: A = gate/up column
- * pairs with the fused SwiGLU epilogue, B =
- * one requantization per expert, C = down columns with their dequant, then
- * the scatter inline on the caller in expert order and row order -- the add
- * sequence moe_scatter_worker produces (blocks sequential across experts,
- * rows distinct inside one), so the f32 bytes are the HMX path's. The int32
- * sums are the HMX's own (hvx_gemm_u8i4_wh.h). A lane takes a contiguous,
- * expert-major slice of the units so its l2fetch stream stays in one weight:
- * a lane's consecutive units are adjacent 512-byte tiles, so one 2D l2fetch
- * covers a block of them, and the lane issues block b+1's box before it
- * computes block b (HVX_GEMV_PF_LEAD_KB, hexkl_mm_u8i4_moe.h).
+ * Requires HEXKL_MOE_FLAG_M1_GEMV, M <= MOE_M1_MAX_ROWS and at most
+ * MOE_M1_MAX_EXPERTS active experts; wider routing falls back to HMX. Scratch
+ * is reserved for that bound, not the actual routing (n_slots_cap): about
+ * 4.2 MB at LFM2, already covered by a prefill call's 12.8 MB.
  *
- * Taken only with HEXKL_MOE_FLAG_M1_GEMV set and M <= MOE_M1_MAX_ROWS with
- * at most MOE_M1_MAX_EXPERTS active experts (the top-4 bound at M = 4), so a
- * prefill call never sees it and a wider routing falls back to the HMX
- * loop rather than growing scratch. The scratch is reserved for the expert
- * bound, not the call's routing, the n_slots_cap rule: ~4.2 MB at the
- * LFM2 shape, only when a decode call comes before any prefill call (a
- * prefill call's 12.8 MB already covers it).
+ * VTCM FEED (hexkl_moe_flags_feed). Two gate_up-sized slabs G0/G1 start at
+ * offsets 0 and gu_bytes. Gate_up of expert i uses slab i & 1. Once a slab
+ * has no gate_up left to hold, two down matrices fit in it: down j uses
+ * slab (j >> 1) & 1, half j & 1. Every slab reuse follows the join of its
+ * last reader. A single-queue push transfers a whole matrix in one
+ * descriptor; only the caller touches the ring. Waits stay inside MM and
+ * must not also enter DRAIN/DRAIN_DN, which would double-count them.
+ * Disable l2fetch under the feed: VTCM needs none, and fetching the arena
+ * would read the same DDR bytes twice. Shapes whose slabs do not fit use
+ * the arena path, reflected in the call's feed count.
  *
- * THE VTCM FEED (#117, hexkl_moe_flags_feed). The arena read above tops
- * out at 21-27 GB/s on this SoC (LEDGER rule 27) while the DMA engine
- * moves the same bytes at 31-32 (#100's f2 cell, rule 32), so with the
- * feed on each expert's gate_up and down are staged into VTCM by the
- * engine one expert ahead and the GEMV reads the VTCM copy. The M=1 path
- * uses no VTCM otherwise, so the whole arena is free: two gate_up-sized
- * slabs G0 / G1 at offsets 0 and gu_bytes double-buffer stage A by expert
- * (gate_up of expert i in slab i & 1), and once a slab has no gate_up
- * left to hold, two down matrices land in it (down of expert j in slab
- * (j >> 1) & 1, half j & 1). Every push is a whole matrix in one
- * descriptor -- f2's shape, 8 per call at top-4 -- and every reuse of a
- * slab follows the join of the pool run that read it, which is what lets
- * the host scoreboard (test/htp/host/moe_layer_host_check.c) check the
- * schedule exactly. The caller alone touches the ring; the waits sit
- * inside the MM bracket so mm reads the feed + compute wall, and they are
- * NOT added to DRAIN / DRAIN_DN, whose subtraction would double-count
- * them. The l2fetch lead is off under the feed: an l2fetch of a VTCM
- * address is meaningless and one of the arena bytes would pull the same
- * DDR bytes twice. A shape whose two slabs do not fit the arena runs the
- * arena read as before and the call's feed count says so.
- *
- * N DMA QUEUES (#177, hexkl_moe_flags_dma_q > 1). The ring is one thread's
- * engine; the probe moves 1.3-1.7x more with 2-4 queues. So each matrix is
- * split by rows over the pool lanes, each lane issues its slice on its own
- * queue inside a pool run and polls it before the run joins (moe_m1_q_*):
- * GU(0) in a workers-only job beside the scan and the pack (#185), every
- * later push on the first run after the join that frees its slab. The slabs,
- * the GEMV units and their order are unchanged, so the output is the same
- * bytes.
- *
- * At 4 queues the call is DMA-bound (#185: ~21.5 MB at ~62 GB/s is ~76 %
- * of it), so the schedule's job is to keep the engines busy, not to hide
- * compute. The run table at n = 4 experts (the decode shape):
+ * MULTIPLE DMA QUEUES (hexkl_moe_flags_dma_q > 1). Each matrix is split by
+ * rows over pool lanes. Each lane issues and polls its slice on its own
+ * queue within a pool run. GU(0) runs on workers beside the caller's scan
+ * and pack; later pushes use the first run after the join freeing the slab.
+ * The four-expert schedule is:
  *
  *   run    carries          dest            computes
  *   GU0    GU(0)            slab 0          - (caller: scan + pack)
@@ -1213,13 +1121,9 @@ static int moe_all_2bit(const hexkl_weight_u8i4_table *tbl, uint32_t n_experts,
  *
  * The last A frees downs {0, 1} (odd n: they ride B, read by C(0)) or
  * {2, 3} (even n: they ride C(0) and C(1), two joins ahead of their
- * readers). A fifth or later down D(j + 3) rides C(j). Every slice is
- * still issued and polled by one lane inside one run and read only in a
- * later run, the invariant the host check proves.
- *
- * ponytail: C(2) and C(3) move no bytes (~38 us/call of idle engines).
- * The next rung is a third down slot in the arena's spare ~0.9 MiB or a
- * down split by rows over two runs; both need their own host proof.
+ * readers). A fifth or later down D(j + 3) rides C(j). Each slice is
+ * issued and polled by one lane within one run, then read by a later run;
+ * moe_layer_host_check.c checks this schedule.
  */
 #define MOE_M1_MAX_ROWS 4u
 #define MOE_M1_MAX_EXPERTS 16u
@@ -1920,15 +1824,10 @@ static inline void moe_m1_wait(uint32_t idx, uint32_t site) {
 }
 
 /**
- * @brief Background-lane unit: pack one 64-row slot block of the activation.
+ * @brief Background-lane unit: pack one 64-row activation slot block.
  *
- * The pack of a prefill call's ~2900 slots ran on the pool synchronously
- * before the expert loop, with the HMX idle for all of it (1.0 of the 1.44
- * ms QUANT column, doc 47 section 14). Every block is a unit here, in slot
- * order, and the expert loop waits for a block only just before it queues
- * that block's DMA -- so expert 0's block is packed at once and the rest
- * land under the first experts' HMX issue, in the workers' idle time
- * between epilogues.
+ * Units run in slot order, overlapping HMX work between epilogues. The
+ * expert loop waits for each block just before queuing that block's DMA.
  */
 void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
   (void)n_units;
@@ -1947,22 +1846,15 @@ void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
 }
 
 /**
- * @brief Copies through the DMA engine instead of the core.
+ * @brief Copies between uncached rpcmem and cached heap using DMA.
  *
- * The two staging copies move 3.6 MB each between the host's uncached
- * rpcmem buffers and cached heap, and doing that with memcpy costs about
- * 3.6 ms of the scatter column -- a scalar core reading uncached DDR. The
- * DMA engine is what this hardware has for bulk moves, and it is free at
- * both points: the activation copy runs before the expert loop, when only
- * expert 0's gate_up is in flight, and the output copy runs after the loop,
- * when nothing is.
+ * The activation copy precedes the expert loop, with only expert 0's
+ * gate_up in flight; the output copy follows the loop, with nothing in
+ * flight. Split into ring-sized pieces to respect the descriptor's row
+ * limit. row_size is the largest power of two dividing the transfer.
  *
- * Split into ring-sized pieces because a 2D descriptor's row count is
- * bounded; row_size stays the largest power of two that divides the
- * transfer, the same rule the weight pushes use.
- *
- * @param site the #87 trace's HEXKL_DMA_SITE_* for the drain, or -1 for a
- *             copy outside the MoE layer call (no record)
+ * @param site the HEXKL_DMA_SITE_* for the drain, or -1 for a copy outside
+ *             the MoE layer call (no trace record)
  */
 static void moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
                          int dst_vtcm, int site) {
@@ -2433,16 +2325,9 @@ int hexkl_mm_u8i4_moe_layer_run(
     n_affine += g->w_offset != NULL || d->w_offset != NULL;
     n_rows += row_count[e];
   }
-  /** Bounds are checked because out_f32 is indexed by these; distinctness
-     within one expert's slice is NOT, and moe_scatter_worker needs it (see
-     its comment) or two workers read-modify-write one output row. Top-k
-     routing gives it for free -- a token picks k distinct experts -- and
-     checking it here would cost a per-expert bitmap over M on every call to
-     restate what the caller's routing already guarantees.
-     ponytail: a caller that repeats a row inside one expert gets a racy
-     sum, not a wrong shape. If a future router can do that, the fix is to
-     sort each slice and merge duplicates on the ARM side before the call,
-     not a scan here. */
+  /** Bounds protect out_f32 indexing. Rows within one expert's slice must
+     also be distinct: otherwise two scatter workers read-modify-write the
+     same row. Top-k routing guarantees this; it is not checked here. */
   for (uint32_t i = 0; i < n_rows; ++i) {
     if (row_index[i] >= M) {
       return AEE_EBADPARM;
@@ -2654,28 +2539,16 @@ int hexkl_mm_u8i4_moe_layer_run(
   for (uint32_t e = 0; e < n_experts; ++e) {
     n_slots += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
   }
-  /** act_f32 and out_f32 are the host's FastRPC buffers, which are rpcmem
-     and therefore UNCACHED. The gather reads M*K*4 bytes of act four times
-     over at top-4 routing, and the scatter is a read-modify-write of
-     M*N_out*4 one float at a time -- both catastrophic against uncached
-     DDR, and measured so: 17.3 ms of gather+quant and 104.8 ms of scatter
-     against 3.6 and 2.8 for the path this replaces (doc 46 section 10).
-     Same axis Q1 broke on, doc 44 section 10.1.
-     So each is touched exactly once, sequentially: act is copied in at the
-     start (act_c) and out is copied out at the end (out_c), and everything
-     in between works on cached heap. */
+  /** FastRPC act_f32/out_f32 are uncached rpcmem. Copy each sequentially
+     once (act_c at entry, out_c at exit), so repeated gather reads and
+     scatter read-modify-writes use cached heap. */
   /** Sizes once, in carve order; the sum is what the scratch must hold.
      order / base_of / slot_of are per-expert tables on the heap rather
      than stack arrays sized by HEXKL_MM_U8I4_MAX_WEIGHTS: that constant is
      4096 and has nothing to do with how many experts this layer has. */
-  /** Reserved for the most slots THIS many rows can ever need -- every
-     expert padded to a whole block -- not for this call's routing. The 22
-     prefill calls of a token batch have the same n_rows but a different
-     n_slots each, and reserving for the actual count grew the block on
-     every layer that routed a little wider than the last: 323 us a call
-     left of the 3064 us this scratch was meant to remove (doc 46 section
-     50.7). With the bound, the first prefill call grows it once and no
-     later call of the same batch can exceed it. */
+  /** Reserve for the maximum slots at n_rows, with every expert padded to
+     a whole block. This avoids repeated growth when layers in one batch
+     route the same row count to different numbers of experts. */
   const size_t n_slots_cap = (size_t)n_rows + (size_t)n_experts * (BR - 1u);
   /* mid's row params, one set per mid buffer. */
   const size_t sz_scale = sizeof(float) * 2u * BR;
@@ -3428,36 +3301,23 @@ int hexkl_mm_u8i4_moe_layer_run(
 
   /** ---- The block sequence ---------------------------------------------
    *
-   * Blocks are numbered n = 0, 1, ... in expert order. GU(n) is block n's
-   * gate_up matmul with its fused epilogues, rq(n) the requantization of
-   * its gate_off into mid, DN(n) its down matmul with its epilogues. They
-   * are issued one block behind:
+   * Blocks are numbered in expert order. GU(n) is gate_up with epilogues,
+   * rq(n) requantizes gate_off into mid, and DN(n) is down with epilogues:
    *
    *   GU(0) rq(0) | GU(1) DN(0) | GU(2) DN(1) | ... | GU(N-1) DN(N-2) | DN(N-1)
    *
-   * The foreground lane runs one job at a time, and a job hides only when
-   * an HMX batch is issued between its submit and the wait that retires
-   * it (doc 47 section 14). In block order -- GU(n) then DN(n) -- three
-   * jobs a block had nothing to hide behind: the last gate_up epilogue
-   * (rq needs all of gate_off), rq itself, and the last down epilogue
-   * with the scatter after it; 1.5-2 ms of a 15 ms prefill call (doc 51
-   * section 2.21). One block behind, DN(n-1)'s batches cover GU(n)'s last
-   * epilogue and rq(n), and GU(n+1)'s first covers DN(n-1)'s last. rq(n)
-   * rides inside DN(n-1)'s first epilogue job and the scatter inside every
-   * down epilogue (moe_dn_worker), so a block submits exactly as many jobs
-   * as it issues batches; what stays exposed is the two ends of the call.
+   * The foreground lane holds one job at a time. DN(n-1) overlaps GU(n)'s
+   * last epilogue and rq(n); GU(n+1)'s first batch overlaps DN(n-1)'s last
+   * epilogue. rq(n) shares DN(n-1)'s first epilogue job, and scatter runs
+   * in every down epilogue (moe_dn_worker).
    *
-   * What the reorder needs. Two mid buffers, DN(n-1) reading one while
-   * rq(n) writes the other, with two sets of row params. down[e] pushed
-   * after DN(prev) has issued, not before GU(e)'s first block: a new
-   * expert's down would otherwise land on the one DN(prev) still reads.
-   * The staging parity (sb) carried across gate_up and down batches: a
-   * staging buffer is free once the epilogue that read it is retired,
-   * which is the wait one issue back whichever phase that was. gate_off
-   * stays single, because rq(n) is retired before GU(n+1)'s first
-   * epilogue is submitted. gate_up[e+1] and the next activation block go
-   * out as before, once GU(n) has freed their slots, and arrive under
-   * DN(n-1). */
+   * Two mid buffers and two sets of row params let DN(n-1) read while
+   * rq(n) writes. Push down[e] only after DN(prev) has issued, or it would
+   * overwrite weights DN(prev) still reads. Carry staging parity (sb)
+   * across both phases: reuse a buffer only after its epilogue retires.
+   * gate_off stays single because rq(n) retires before GU(n+1)'s first
+   * epilogue is submitted. Push gate_up[e+1] and the next activation once
+   * GU(n) frees their slots, so they arrive under DN(n-1). */
   /** The multiplies inline (hexkl_hmx_mm.h): the library call wraps one
      packet in ~50 cycles for ~9 of array time, and this loop issues ~760 k
      of them a 1024-row prefill call. The layout puts every activation tile
@@ -3537,13 +3397,9 @@ int hexkl_mm_u8i4_moe_layer_run(
       /* Counted, not timed -- see HEXKL_PROBE_BLOCKS. */
       HEXKL_PROBE_COUNT(HEXKL_PROBE_BLOCKS, 1);
 
-      /** The pack already wrote this block in slot order, so its 64 rows are
-         one contiguous run -- a single DMA, not a copy. Doing it on the
-         core moved 5.5 MB a layer at 3.1 GB/s, against the 33 the engine
-         measures, because the destination is VTCM and the core is the wrong
-         thing to write it with. Rows past m_blk are padding whose
-         accumulator output is never read. By now the block has had a down
-         matmul to arrive under. */
+      /** The packed block is one contiguous 64-row DMA. Rows past m_blk are
+         padding whose accumulators are never read. The transfer overlaps
+         the preceding down matmul. */
       HEXKL_PROBE_T0(p0);
       if (hexkl_probe_on) {
         hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), act_idx,
@@ -3560,15 +3416,11 @@ int hexkl_mm_u8i4_moe_layer_run(
         hexkl_wh_affine_sums(vtcm_base + L.act_off, blk.m_blk, K, act_zp,
                              gu_affine_sums);
       /* --- gate_up ------------------------------------------------- */
-      /** Matmul a batch of gate/up PAIRS -- gate tiles g0.. into staged
-         slots [0, np) of one staging buffer, the up tiles opposite them
-         into [np, 2np) -- then hand the batch to the pool, which
-         dequantizes and SwiGLUs it straight into gate_off (the same
-         hvx_swiglu_det_sf on the same two vectors the store-and-reread
-         sequence had, so no byte changes) while THIS thread issues the
-         nblk batch into the other staging buffer. A batch's HMX issue
-         (47 us at prefill) covers the previous batch's epilogue (18 us).
-         DEQUANT times the waits -- what stays exposed -- not the work. */
+      /** Stage gate tiles in [0, np) and their paired up tiles in [np, 2np).
+         The pool dequantizes and applies hvx_swiglu_det_sf directly into
+         gate_off while this thread issues the next batch into the other
+         staging buffer. The arithmetic matches the store-and-reread path.
+         DEQUANT measures exposed waits, not worker time. */
       for (uint32_t g0 = 0, gb = 0; g0 < inter_ntiles; g0 += half, ++gb) {
         const uint32_t np =
           (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
@@ -3657,18 +3509,10 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
         HEXKL_MOE_MM_END();
 
-        /** Queue the next chunk's expansion now that this batch is issued:
-           it runs on the background lane while the HMX works, and batch
-           gb+1 finds it done. The DMA wait is here rather than a batch
-           earlier so the transfer has had an issue to land under.
-
-           Two batches of lookahead, not one. At one, the DMA for chunk
-           gb+1 had only this batch's issue (~47 us at prefill) to land in
-           and a chunk needs ~70, so the main thread stalled on it: DRAIN
-           went 112 -> 2351 us a call and ate the 3.5 ms the hiding had
-           just won (doc 54 5.14). Chunks 0 and 1 are not left unhidden the
-           way they were then -- the down phase before this one queued
-           them (doc 54 5.16.4). */
+        /** Queue expansion on the background lane after this batch's issue.
+           Keep two batches of lookahead: one HMX batch is too short to
+           cover the chunk's DMA. Chunks 0 and 1 were queued during the
+           preceding down phase. */
         if (exp_bg && blk.first && gb + gu_bg0 < gu_chunks) {
           const uint32_t ng0 = g0 + gu_bg0 * half;
           const uint32_t nnp =
@@ -3683,13 +3527,9 @@ int hexkl_mm_u8i4_moe_layer_run(
           exp_live[gb + gu_bg0] = 1;
         }
 
-        /** And the DOWN weight that the down phase below will read: pushed
-           at the end of the previous iteration, so by batch 2 the gate_up
-           chunks ahead of it in the ring have all landed and the wait is
-           short. This is the half of the expansion that used to be 100%
-           exposed -- dn_ntiles / acc_tiles is 2 here, so the old
-           "db + 2 < dn_chunks" lookahead never fired once (doc 54
-           5.16.3). */
+        /** Expand the down weight pushed at the previous iteration's end.
+           By gate_up batch 2, the earlier chunks in the DMA ring have
+           landed. The two-batch down phase has no internal lookahead. */
         /** [P8] The last gate_up batch queues every down chunk left: with
            two gate_up batches and three down chunks the third was never
            queued here and was expanded in front of its batch, 128 times
@@ -3759,17 +3599,11 @@ int hexkl_mm_u8i4_moe_layer_run(
         ++sb;
       }
 
-      /** A and the gate_up slot are free once the last batch is issued: the
-         next block's activation, and its expert's gate_up when it is a
-         new expert, go out now and arrive under DN(n-1). Activation
-         first: it is what GU(n+1) waits on before anything else, and
-         queued behind 3.5 MB of gate_up that wait would cover the gate_up
-         too. Measured, not guessed: pushing the next expert's chunks early,
-         one after each batch that freed its columns, put the activation
-         behind them in the ring and GATHER went 84 -> 747 us a call (388
-         at decode) against DRAIN's 251 -> 18 -- the DMA moves ~12 GB/s
-         beside the HMX, not the idle 33, so 3.5 MB does not land in the
-         two down batches it had (doc 51 section 2.26). */
+      /** The last issue frees A and gate_up for the next block's activation
+         and, for a new expert, gate_up weight. Queue activation first:
+         GU(n+1) waits on it before anything else, and the in-order ring
+         would otherwise make that wait cover the weight too. Both
+         transfers overlap DN(n-1). */
       if (have_next) {
         HEXKL_PROBE_T0(p0);
         hvx_worker_pool_wait_bg(pool, pack_job,
@@ -3916,13 +3750,9 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
         HEXKL_MOE_MM_END();
 
-        /** The NEXT expert's gate_up chunk db, pushed a few lines above
-           (step 2) and read by the gate_up phase of the next iteration.
-           This is the window the intra-expert lookahead never had: the
-           chunk has this whole down phase plus the batches before it in
-           the next gate_up phase to land and expand in, instead of one
-           batch (doc 54 5.16.4). db runs 0..dn_chunks-1, which is exactly
-           the two gate_up chunks the old scheme left exposed. */
+        /** Expand the next expert's gate_up chunk db, pushed above. It has
+           this down phase and the preceding gate_up batches to finish;
+           db spans the first dn_chunks gate_up chunks. */
         if (exp_bg && have_next && nblk.first && db < gu_bg0) {
           const hexkl_weight_u8i4 *ng = &tbl->slots[h_gate_up[nblk.e]];
           const uint32_t ng0 = db * half;
@@ -4129,31 +3959,20 @@ out:
   return rc;
 }
 
-/** ---- [#225] The FC at M = 1 on WH weights (hexkl_mm_u8i4_fc_m1_run) ----
+/** ---- The FC at M = 1 on WH weights (hexkl_mm_u8i4_fc_m1_run) -----------
  *
- * The decode FC set as the prefill registered it (the FC WH sidecar's
- * handles): one u8 quantization of the row (the MoE M=1 path's scan and
- * pack), then every output column tile of every part is one unit of
- * moe_m1_down_worker's body -- hvx_gemm_u8i4_wh_col, then
- * hvx_dequant_acc_tile_to_f32 into the part's columns of the output. The
- * units are numbered across the parts (q | k | v side by side), and one
- * pool run covers the op: a lane takes a contiguous slice of them.
+ * Quantize the row once, then assign one unit per output tile across all
+ * parts (q | k | v). Each unit runs hvx_gemm_u8i4_wh_col and dequantizes
+ * into its part's output columns. One pool run covers the op; lanes take
+ * contiguous slices.
  *
- * THE FEED. A decode FC is one to three 2 MiB matrices read once, so the
- * MoE's whole-matrix slab schedule (one matrix ahead, a pool run per
- * matrix) would leave the first matrix exposed and pay a run per part.
- * Instead each lane cuts its slice into blocks of adjacent columns of one
- * part and double-buffers them in its own VTCM slice (arena / lanes) on
- * its own DMA queue (hexkl_dma_lane_push2d): wait block b, start block
- * b + 1, compute block b -- the Q4M1 runner's feed (45.5 GB/s, LEDGER
- * rule 49) on the WH tiles. A block's push is a 2D descriptor: k_tiles
- * rows of cn x 512 B at the part's row stride, landing as a [k_tiles][cn]
- * WH matrix the GEMV reads with n_col = cn. Every push is waited by the
- * lane that issued it before it is read and before its buffer is pushed
- * again, all inside the one run (moe_layer_host_check's scoreboard).
- * ponytail: FC_M1_BLOCKS blocks a lane, so its first block's transfer
- * (about a quarter of its slice) is exposed; the knob and the queue count
- * are what the device profile of plan 225 step 7 reads.
+ * Each lane double-buffers blocks of adjacent columns in its own VTCM
+ * slice (arena / lanes) on its own DMA queue: wait for block b, start b+1,
+ * compute b. The 2D descriptor copies k_tiles rows of cn * 512 bytes at
+ * the part's row stride into a [k_tiles][cn] WH matrix (GEMV n_col = cn).
+ * Each push is waited by its issuing lane before reading or reusing the
+ * buffer, within the same run (checked by moe_layer_host_check).
+ * FC_M1_BLOCKS controls blocks per lane; the first block's DMA is exposed.
  */
 #define FC_M1_MAX_LANES 8u
 /** @brief Blocks a lane cuts its slice into (fewer when VTCM is short). */

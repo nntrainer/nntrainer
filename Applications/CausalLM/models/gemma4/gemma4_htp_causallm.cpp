@@ -932,12 +932,12 @@ Tensor Gemma4HtpTransformer::createMlp(const int layer_id, int dim,
   const std::string ffn_engine =
     engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id);
 
-  // gate, up, GeGLU and down as one layer (dense_ffn, doc 51), so an
+  // gate, up, GeGLU and down as one layer (dense_ffn), so an
   // accelerator takes the block in one call with the GeGLU in its
   // epilogue; the same three weights in the file's order (gate, up, down),
   // so a model file is read identically, and on the CPU the same GEMMs.
-  // ponytail: a KV-shared layer keeps the three layers below, which carry
-  // skip_prefill; dense_ffn does not, and no model here has such a layer.
+  // KV-shared layers retain separate layers because dense_ffn does not
+  // support skip_prefill.
   if (!is_kv_shared_layer) {
     LayerHandle ffn(createLayer(
       "dense_ffn",

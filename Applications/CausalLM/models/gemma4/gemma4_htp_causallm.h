@@ -68,11 +68,11 @@ protected:
   bool USE_DOUBLE_WIDE_MLP = false;
   float EMBEDDING_PER_LAYER_SCALE = 1.0f;
 
-  /** MoE block beside the dense MLP (config enable_moe_block; doc 55). The
+  /** MoE block beside the dense MLP (config enable_moe_block). The
    *  expert layer is the LFM2 MoE layer with router_type softmax_scale, so
    *  the same nntr_config keys as LFM2 drive it: moe_layer_dtype,
-   *  moe_engine, moe_htp_layers, and moe_cache_experts (the per-layer expert
-   *  cache C; NNTR_MOE_CACHE_EXPERTS in the environment overrides it). */
+   *  moe_engine, moe_htp_layers, and moe_cache_experts (the per-layer share
+   *  of the expert cache). */
   bool ENABLE_MOE_BLOCK = false;
   unsigned int NUM_EXPERTS = 0;
   unsigned int NUM_EXPERTS_PER_TOK = 0;
@@ -96,21 +96,17 @@ protected:
   std::set<int> MOE_HTP_LAYERS;
   unsigned int MOE_CACHE_EXPERTS = 0;
 
-  /** Engines of the attention projections (q, k, v, o) and of the dense
-   *  MLP's three fully connected layers, under the nntr_config keys
-   *  Lfm2CausalLM reads (doc 50): attn_proj_engine / attn_proj_htp_layers
-   *  and dense_ffn_engine / dense_ffn_htp_layers. "htp" moves only their
-   *  prefill matmul to the accelerator -- FloatTensor::dot declines M == 1,
-   *  so decode keeps the CPU Q4_0 kernel on the same weight, which the Q4_0
-   *  registration path leaves resident. An empty layer list means every
-   *  layer. Default "cpu" leaves every existing run unchanged. */
   /** @brief The tied lm_head takes the final norm and the logit softcap
-   *  (doc 57 section 9.7): constructModel then ends at the last block's
+   *  so constructModel ends at the last block's
    *  output and Gemma4HtpCausalLM's lm_head norms it. */
   bool FOLD_OUTPUT_NORM = false;
   /** @brief lmhead_engine: "htp" runs the tied lm_head (norm, head,
    *  softcap) as one NPU call; "cpu" (default) keeps it on the CPU. */
   std::string LMHEAD_ENGINE = "cpu";
+  /** Attention projection and dense MLP engines, selected by nntr_config's
+   *  attn_proj_engine / attn_proj_htp_layers and
+   *  dense_ffn_engine / dense_ffn_htp_layers. An empty layer list selects
+   *  every layer; the default engine is "cpu". */
   std::string ATTN_PROJ_ENGINE = "cpu";
   std::set<int> ATTN_PROJ_HTP_LAYERS;
   std::string FFN_ENGINE = "cpu";
@@ -153,7 +149,7 @@ public:
 
 private:
   /** createAttention returns the attention core's output, leaving the
-   *  o-proj to the post-attention residual_add (proj, doc 57 section 9.32);
+   *  o-proj to the post-attention residual_add (proj);
    *  set by the block around its one call. */
   bool fold_o_proj_ = false;
   /** The block's dense branch and its MoE layer's output stay on the
@@ -175,7 +171,7 @@ public:
   /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
    *  on @a input, both already normed by the caller. */
   /** @param dense_out non-null: the layer also takes the post-FFN epilogue
-   *  with the dense branch's output (out_add, doc 57 section 9.30) and
+   *  with the dense branch's output (out_add) and
    *  returns the decoder block's output. */
   Tensor createMoe(const int layer_id, Tensor input,
                    const Tensor *dense_out = nullptr);

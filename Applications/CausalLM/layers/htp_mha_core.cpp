@@ -392,12 +392,8 @@ void HtpMHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor output_step = output.getSharedDataTensor(
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
-    // The accelerated paths take the f32 query and write f32 output, and
-    // the cache write converts the f32 rows itself, so the fp16 staging
-    // below (four step-sized tensors and five element-wise conversions a
-    // layer) only costs: ~36 ms of a 1023-row step beside a 41 ms call
-    // (doc 57 section 9.16). If the call still fails, the CPU computes
-    // from the f32 query as the non-Android build always does.
+    // Accelerated attention accepts f32 query/output and converts cache
+    // rows itself, so skip fp16 staging. On failure the CPU uses f32 too.
     const bool accelerated = compute_ops_ && is_causal &&
                              (compute_ops_->supports_sdpa_fp16_kvcache() ||
                               (kv_cache_quant_kind >= 0 && !q_cache_failed &&
@@ -479,18 +475,15 @@ void HtpMHACoreLayer::incremental_forwarding(
   if (q2_name_.empty())
     q2_name_ = context.getName();
 
-  // [#130] one decode row through the HTP when ATTN_M1 is resident, on
+  // One decode row through the HTP when ATTN_M1 is resident, on
   // either cache path: _from is the absolute position on both.
   if (_to - _from == 1 && htpDecodeAttention(context, _from)) {
     cache_index = _to;
     htp_owns_cache_ = true;
     return;
   }
-  // ponytail: once the DSP owns the cache this layer's rows [prompt, ..)
-  // are stale, so a later multi-row prefill (a second prompt appended to
-  // the same context) would attend to garbage and then re-seed the DSP
-  // from it. Refused, not silently wrong; the upgrade is writing the
-  // decoded k / v back from the DSP, or running that prefill on the DSP.
+  // DSP ownership leaves the host's decoded rows stale. Reject appended
+  // multi-row prefill until it can use DSP KV or synchronize it to the host.
   NNTR_THROW_IF(htp_owns_cache_ && _to - _from > 1 && _from > 0,
                 std::runtime_error)
     << "mha_core: a multi-row forwarding at " << _from
@@ -676,11 +669,8 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                 wv * sizeof(float));
   }
   const float *qkv = resident ? nullptr : row.data();
-  // The RoPE table, once per layer instance, in the ROPE op's shape:
-  // cos[i][0..hd/2) | sin[i][0..hd/2) per position, the CPU RoPE's own
-  // source (plan 82 section 3.4). Head_dim 64 builds it up front (LFM2);
-  // [plan 201 S4] any other head_dim when the hook asks for it (3), so a
-  // CPU run of such a model keeps no table.
+  // Reuse CPU RoPE values as [cos hd/2 | sin hd/2] per position. Build
+  // head_dim 64 up front; other dimensions only when the hook requests them.
   auto build_rope_table = [&]() {
     const unsigned int rows =
       std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -691,11 +681,8 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                          theta, false);
     }
     const unsigned int half = head_dim / 2;
-    // ponytail: htp_rope_table_ is built once, at the max_timestep of the
-    // first decode row, like the DSP graph's KV cache; a later
-    // updateTensorsByInputDimensions that grows max_timestep rebuilds the
-    // CPU tables but not this one. Upgrade path: clear it there and
-    // re-bind the graph at the new length.
+    // The DSP graph and this table use the first decode's max_timestep.
+    // Growing CPU tables alone cannot extend them; the graph must be rebound.
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
       << " positions, max_timestep is " << rows;
@@ -712,10 +699,8 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
                         htp_rope_table_.data(),
                         static_cast<unsigned>(htp_rope_table_.size()));
   if (r == 3) {
-    // [#260] use_rope may be off here when the token runs the row: its
-    // q / k are the DSP's own, unrotated (qkv_layer rotates on the CPU
-    // path, #4415, with the table precompute_freqs also builds). A row the
-    // CPU projected arrives rotated already.
+    // DSP-resident q/k still need RoPE even when use_rope is off here;
+    // CPU-projected rows arrive rotated by qkv_layer.
     NNTR_THROW_IF(!htp_rope_table_.empty() ||
                     (!use_rope && !htpDecodeRowResident(pos)),
                   std::runtime_error)
@@ -724,9 +709,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
                       htp_rope_table_.data(),
                       static_cast<unsigned>(htp_rope_table_.size()));
-    // [#4416 mem] bound: the DSP holds its copy and asks (3) again only
-    // after a new graph init, when build_rope_table makes it again. 30
-    // layers x 2.2-4.5 MB kept for nothing otherwise.
+    // The DSP owns a copy and requests it again only after graph init.
     if (r != 3)
       std::vector<float>().swap(htp_rope_table_);
   }
@@ -741,10 +724,9 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
       use_external_cache
         ? context.getInput(4)
         : context.getTensor(tensor_idx[AttentionParams::cache_value]);
-    // [#289] NNTR_HTP_KV_DROP_CPU=1: once the DSP holds the rows, this
-    // layer's CPU cache (an rpcmem block, compute_ops alloc_shared) is freed:
-    // the decode row never reads it (it returns above) and a later prefill
-    // is refused (htp_owns_cache_). Not a shared block: nothing happens.
+    // Release shared CPU cache blocks after seeding the DSP. Decode no
+    // longer reads them, and htp_owns_cache_ rejects appended prefill.
+    // drop_shared leaves non-shared blocks alone.
     auto drop_cpu_cache = [&]() {
       if (nntrainer::htp_fixed::KV_DROP_CPU && compute_ops_)
         for (nntrainer::Tensor *t : {&ck, &cv})
@@ -753,12 +735,9 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
               ? static_cast<void *>(t->getData<float>())
               : static_cast<void *>(t->getData<uint16_t>()));
     };
-    // [#289] NNTR_HTP_KV_SEED_Q=1: from the layer's quantized prefill cache,
-    // without the rows leaving the DSP (the backend declines otherwise)
-    // K still comes from the CPU cache (the prefill's K scale is one a head,
-    // too coarse: decode nll +9.4 %), V from the DSP's int8 masters
-    // [#289] the CPU cache's rows [0, m) as f32, rows over the CPU pool (one
-    // thread read 0.5 s of the p1024 first token); the same conversion
+    // NNTR_HTP_KV_SEED_Q=1 reuses DSP int8 V when the backend permits it.
+    // K comes from the CPU cache because prefill's per-head scale is too
+    // coarse for decode. Widen fp16 rows in parallel when needed.
     auto rows_f32_of = [wk](const nntrainer::Tensor &c, float *dst, size_t m,
                             size_t) {
       if (c.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -793,7 +772,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
         << pos;
       return true;
     }
-    const auto t_seed = std::chrono::steady_clock::now(); // [#282 F]
+    const auto t_seed = std::chrono::steady_clock::now();
     // the cache's rows [0, pos - cache_base): a windowed cache seeds its
     // window, the DSP's attention subtracts the same base
     NNTR_THROW_IF(pos < cache_base, std::runtime_error)
@@ -802,12 +781,12 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     const unsigned int seed_rows = pos - cache_base;
     const size_t n = static_cast<size_t>(seed_rows) * wk;
     auto t_conv = t_seed;
-    // [#4428 window] the rows the host cache dropped are not in the seed:
+    // The rows the host cache dropped are not in the seed:
     // their |max| goes ahead of it, so the scales cover the whole context
     if (!kv_floor_k_.empty())
       htpDecodeKvAmaxFloor(kv_floor_k_.data(), kv_floor_v_.data(),
                            static_cast<unsigned>(kv_floor_k_.size()));
-    // [#4416 D6] an fp16 / UINT16 cache goes as its bits: the DSP widens
+    // An fp16 / UINT16 cache goes as its bits: the DSP widens
     // them exactly (hvx_hf_bits_to_sf), nothing converted or copied here
     const bool bits16 =
       ck.getDataType() != ml::train::TensorDim::DataType::FP32 &&
@@ -825,7 +804,7 @@ bool HtpMHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
     }
     drop_cpu_cache();
     {
-      static double conv_ms = 0.0, all_ms = 0.0; // [#282 F] summed, logged
+      static double conv_ms = 0.0, all_ms = 0.0;
       using ms = std::chrono::duration<double, std::milli>;
       conv_ms += ms(t_conv - t_seed).count();
       all_ms += ms(std::chrono::steady_clock::now() - t_seed).count();
@@ -1133,15 +1112,8 @@ void HtpMHACoreLayer::registerQuantizedCache(
   compute_ops_ = context.getComputeOps();
   if (nntrainer::weightPageCachePolicy() >= 0)
     return; // The memory profile allocates only the current layer's layout.
-  // [#282 D] with NNTR_HTP_E2E_FREE_KVQ the caches go at the first decode
-  // token anyway; registering them at the prefill's first call (the lazy
-  // path, try_quantized_attention) keeps them out of the address space the
-  // load's FC set and expert pool map into (p4096: 915 MiB at load).
-  // NNTR_HTP_FC_IN_ARENA moves the FC set off the heap, so the caches fit at
-  // load again and the prefill skips their registration (124 ms at p1024).
-  // Built in: the quantized caches go at the first decode token
-  // (E2E_FREE_KVQ) and the FC set lives in the arena (FC_IN_ARENA), so they
-  // are registered here, at load, and the prefill skips it.
+  // Arena-backed FC weights leave room to register quantized caches at
+  // load, avoiding first-prefill registration. Decode releases these caches.
   static_assert(nntrainer::htp_fixed::E2E_FREE_KVQ &&
                   nntrainer::htp_fixed::FC_IN_ARENA,
                 "the lazy registration path assumed the FC set on the heap");
@@ -1257,8 +1229,7 @@ void HtpMHACoreLayer::q2_derive_kv() {
 
 void HtpMHACoreLayer::q2_derive_q(const float *q, unsigned int q_stride,
                                   unsigned int n_q) {
-  // Q's per-head range, NEON (min / max are order-free): scalar it was
-  // 11-22 ms a 1024-row layer (doc 59 section 2.2).
+  // Q's per-head range uses order-independent NEON min/max reductions.
   std::vector<float> q_lo(num_heads_Q, 1e30f), q_hi(num_heads_Q, -1e30f);
   // The range so far (a loaded or accelerator calibration, earlier steps):
   // like K / V the encoding only widens. A step with a narrow Q would
@@ -1291,7 +1262,7 @@ void HtpMHACoreLayer::q2_keep() {
   all.clear();
   for (const auto *v : {&q2_scale_k, &q2_scale_v, &q2_q_enc, &q2_out_enc})
     all.insert(all.end(), v->begin(), v->end());
-  // [#4428 window] the dropped rows' |max| behind them, when any
+  // Append dropped rows' |max| when present.
   for (const auto *v : {&kv_floor_k_, &kv_floor_v_})
     all.insert(all.end(), v->begin(), v->end());
 }
@@ -1326,7 +1297,7 @@ void HtpMHACoreLayer::q2_maxima_from_scales() {
 bool HtpMHACoreLayer::take_q2_calibration() {
   const auto it = q2_store_.find(q2_name_);
   const size_t nk = num_heads_KV, nv = nk * head_dim, nq = 2 * num_heads_Q;
-  // [#4428 window] + 2 * nv when the saving run dropped rows (the floor)
+  // A saved dropped-row floor adds 2 * nv values.
   const size_t n_cal = nk + nv + 2 * nq;
   if (!q2_from_file_ || it == q2_store_.end() ||
       (it->second.size() != n_cal && it->second.size() != n_cal + 2 * nv))
@@ -1726,9 +1697,7 @@ bool HtpMHACoreLayer::try_quantized_attention(
       }
       return true;
     }
-    // Both conversions NEON on this thread: scalar they were 8-13 ms a
-    // 1024-row layer (doc 59 section 2.2); NEON 1.0 / 1.1 ms, and split over
-    // 4 or 8 compute threads slower (doc 57 section 9.23).
+    // Keep both NEON conversions on this thread to avoid scheduling overhead.
     static const bool conv_trace = std::getenv("NNTR_HTP_ATTN_TRACE");
     const auto tq0 = std::chrono::steady_clock::now();
     for (unsigned int r = 0; r < n_q && !again; ++r) {
@@ -2324,11 +2293,7 @@ void HtpMHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   unsigned int half_ = dim / 2;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
-  // The table only needs the positions the cache can hold: a model's
-  // max_position_embeddings (262144 on one here) is far past max_timestep,
-  // and cos/sin rows past it are never indexed. Measured on device: the
-  // first layer of each RoPE shape spent about 0.5 s building the full
-  // table (doc 57 section 3).
+  // Build RoPE only for positions the cache can hold.
   const unsigned int rope_rows =
     std::min(max_position_embeddings, max_timestep);
 

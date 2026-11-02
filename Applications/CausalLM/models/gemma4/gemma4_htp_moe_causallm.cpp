@@ -93,17 +93,14 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
       "Gemma4 htp_fused HTP engines require an HTP build");
 #endif
 #ifdef ENABLE_HEXKL
-  // [plan 201 S4, #260] moe_engine=htp: #4415's lfm2_moe layer runs the
-  // experts; their GeGLU goes into the session's MoE word too, which the
-  // one-PD token's MOE and DENSE_FFN ops read (#4415's prefill call ORs it
-  // in per call anyway)
+  // Set GeGLU for the decode graph's MOE and DENSE_FFN ops as well as
+  // the prefill calls, which supply it per call.
   if (MOE_ENGINE == "htp") {
     auto *ops = nntrainer::get_htp_ops();
     ops->set_moe_geglu(true);
     ops->set_moe_hadamard(MOE_HADAMARD, MOE_HADAMARD_SCOPE);
   }
-  // [plan 201 S4] the whole decode token on the HTP, one call a token; the
-  // list is built after load (load_weight). Built in (htp_fixed::E2E).
+  // Build the full decode graph after loading its weights.
   htp_e2e = nntrainer::htp_fixed::E2E && MOE_ENGINE == "htp";
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
@@ -188,10 +185,8 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: no weight " + name);
     return *it->second;
   };
-  // [#260 r3] #4415 @ 2db6cad59 folds the o-proj into the post-attention
-  // residual_add (proj) and the post-FFN residual_add into the MoE layer
-  // (out_add): the same weights under the folding layer's name; a layer
-  // that does not fold (KV-shared) keeps the old one.
+  // Folded projections and residuals use the owning layer's weight names;
+  // unfused layers, including KV-shared layers, retain their own names.
   auto named = [&w](const std::string &folded, const std::string &own) {
     return w.count(folded) ? folded : own;
   };
@@ -214,7 +209,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
     scalar[l] = f32(named(p + "_sparse_moe:add_scalar",
                           p + "_post_ffn_norm:scalar_multiplier"),
                     1)[0];
-    // the list's ADD stores 0.0f as "no multiplier" (#221)
+    // The list's ADD stores 0.0f as "no multiplier".
     if (scalar[l] == 0.0f)
       throw std::runtime_error("[Gemma4MoE] NNTR_HTP_E2E: layer " +
                                std::to_string(l) +
@@ -322,7 +317,7 @@ void Gemma4HtpMoECausalLM::load_weight(const std::string &weight_path) {
 
   // The Q4_0 weights of the FC / DENSE_FFN / LM_HEAD ops, in list order:
   // q | k (| v), o; up, gate, down; the tied table.
-  // [#260] an FC / dense weight may be QS4CX (fc_layer_dtype QS4CX): it
+  // An FC / dense weight may be QS4CX (fc_layer_dtype QS4CX): it
   // binds the WH handles the prefill registers from the same bytes
   // The LM_HEAD: Q4_0 as Q4M1 slices (tied: the embedding's own bytes), or
   // an untied QS4CX head (lmhead_dtype QS4CX) as WH slices like an FC, the
@@ -425,7 +420,7 @@ void Gemma4HtpMoECausalLM::repack_weight() {
     return;
   Gemma4HtpCausalLM::repack_weight();
 #ifdef ENABLE_HEXKL
-  // [plan 201 S4] the E2E FC arena, after the experts' registration above
+  // Finalize the decode FC arena after registering the experts.
   if (htp_e2e)
     nntrainer::get_htp_ops()->finish_decode_graph_q4_0();
 #endif

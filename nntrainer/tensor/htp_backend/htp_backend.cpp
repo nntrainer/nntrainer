@@ -49,13 +49,9 @@ HtpBackend::HtpBackend() { open(); }
 void HtpBackend::open() {
   if (enabled_)
     return;
-  // [#260 r3] The FastRPC thread runs every call that does not ride the
-  // dspqueue, the load-time MoE warm-up included. Its default stack is the
-  // 16 KiB minimum; hexkl_mm_u8i4_moe_layer_run's frame alone is 14.6 KiB
-  // since #4415's down ring joined ours, and the first scratch malloc that
-  // grows the heap then overflowed it (DSP crash in apps_mem_request_map64,
-  // 0x8000040d). 64 KiB as the dspqueue thread (nntr_hvx_dspq.c). Must
-  // precede every other RPC of the process; not fatal if refused.
+  // The MoE frame plus scratch allocation can overflow the default 16 KiB
+  // FastRPC stack. Match the dspqueue thread's 64 KiB before any RPC.
+  // Failure is logged but does not prevent opening the session.
   remote_rpc_thread_params thread_params = {CDSP_DOMAIN_ID, -1, 64 * 1024};
   int tp_err = remote_session_control(FASTRPC_THREAD_PARAMS, &thread_params,
                                       sizeof(thread_params));
@@ -90,26 +86,9 @@ void HtpBackend::open() {
   handle_ = static_cast<uint64_t>(h);
   enabled_ = true;
 
-  // Poll-mode QoS: the host half of the measured 90 -> 3,900 us transport
-  // spread (docs/htp_attention/34_fc_measured.md section4 item F; the
-  // control call itself is test/unittest/htp_rpc_bench.h's
-  // htp_set_latency_qos, ported here because this is the first production
-  // caller -- every 34_fc_measured.md transport number assumes this is on,
-  // and until now nothing in the model path turned it on). The DSP-side
-  // half (DCVS/apptype vote) already runs unconditionally in
-  // nntr_hvx_open's session setup; this is the other half of the same pair.
-  // Best effort: an SDK or device without the control just keeps the old
-  // interrupt-driven behavior, logged so a slow transport number is
-  // explainable rather than silently misread as the kernel being slow.
-  // NNTR_HTP_POLL_US: how long the host polls for the DSP's reply before
-  // falling back to the interrupt wait. Measured on device (doc 51
-  // section 2.20): at 100 us the MoE layer call's transport read 2.19 ms
-  // and decode's 158 us; at 5000, 1.13 ms and 83 us, which is prefill
-  // -30 ms and decode 20.6 -> 23.7 TPS. 10000 was refused by the driver
-  // (the control call fails and the session falls back to PM QoS, which
-  // the profile's first line reports as qos_mode=1), so 5000 is the
-  // default and the ceiling between the two is still to be found. The
-  // cost is a core spinning for up to 5 ms per call while it waits.
+  // Poll before blocking to reduce interrupt-wake latency. The default
+  // window is 5000 us; NNTR_HTP_POLL_US overrides it. If polling is refused,
+  // try PM QoS, then retain interrupt-driven behavior and report the mode.
   struct remote_rpc_control_latency lat;
   std::memset(&lat, 0, sizeof(lat));
   lat.enable = RPC_POLL_QOS;
@@ -170,7 +149,7 @@ void HtpBackend::free_shared(void *block) {
   {
     std::lock_guard<std::mutex> lock(shared_mu_);
     if (dropped_.erase(block) != 0)
-      return; // [#289] drop_shared freed it
+      return; // drop_shared freed it
     shared_.erase(block);
   }
   HtpRpcMemApi::get().free_(block);

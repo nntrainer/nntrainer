@@ -12,9 +12,8 @@
  * @bug    No known bugs except for NYI items
  *
  * The specification, its operation order and its domain live in
- * attn_m1_det.h; this file's kernel (hvx_attn_m1_f32.c; the name predates
- * the fp16 cache) runs it in fp16 lanes with hvx_attn_m1_hf.h's primitives
- * (plan 170) over a cache object the session owns:
+ * attn_m1_det.h. hvx_attn_m1_f32.c runs it in fp16 lanes using
+ * hvx_attn_m1_hf.h over a cache object owned by the session:
  *
  *   Kt [n_layers][n_kv][seq / 64][head_dim][64]  fp16, one 8 KiB tile per
  *                                                64 positions (a vector per d)
@@ -23,38 +22,28 @@
  * seq = max_seq rounded up to 64. Every row is rounded to fp16 on append
  * (the CPU's seed rows already are), 128-byte aligned, zero-filled at
  * create so the lanes past the context in the last tile read finite values
- * (they are masked out of every reduction). head_dim is 64 (LFM2) or,
- * since plan 201 S4, any multiple of 64 up to 512 (Gemma 4's 256 and 512:
+ * (they are masked out of every reduction). head_dim is a multiple of 64
+ * up to 512 (LFM2's 64; Gemma 4's 256 and 512:
  * a Kt tile is then head_dim vectors, a V row head_dim / 64), n_kv * gqa <=
  * 64 (the sum vector's lanes). A sliding window (Gemma's sliding layers)
  * is a forward argument: the cache keeps every position, the call reads
  * the last min(L, window).
  *
- * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
- * The cache is n_layers * n_kv * head_dim * seq * 2 * 2 bytes, allocated
- * per layer since #282 D: at the
- * LFM2.5 shape (6 attention layers, 8 kv heads, head_dim 64) 12 MiB per 1024
- * of max_seq, so 24 MiB at nntr_config.json's max_seq_len 2048 (48 MiB
- * with the f32 cache before #170). Scratch per cache: the scores /
+ * MEMORY. The cache uses n_layers * n_kv * head_dim * seq * 2 * 2 bytes,
+ * allocated per layer: at LFM2.5 (6 layers, 8 kv heads, head_dim 64),
+ * 12 MiB per 1024 positions, or 24 MiB at max_seq_len 2048. Scratch at
+ * that shape: scores /
  * probabilities n_q * seq * 2 (128 KiB), the transposed exps seq * 128
- * (256 KiB), the q rows n_q * 128 (4 KiB; round 2's splats were
- * n_q * head_dim * 128 = 256 KiB), the k
- * rows n_kv * head_dim * 2 (1 KiB) and the exp16 table ATTN_M1_DET_EXP_N *
- * 2 (37 KiB, #170 round 3) at LFM2.5 and 2048: about 426 KiB of the ~182
- * MiB heap (215 KiB less than round 2). No VTCM, no mapping, no DMA (the
- * l2fetch leads are hints). Growth policy: none; the size is fixed at
- * create. [plan 201 S4] At Gemma 4's shape the cache does not fit that
- * heap: 25 sliding layers x 8 kv heads x 256 are 200 MiB per 1024 of
- * max_seq (K and V), the 5 full layers x 2 x 512 another 20 MiB.
- * ponytail: a ring of the window's 1024 positions would cap the sliding
- * layers at 200 MiB whatever max_seq, and the cache must move into the
- * session's arena either way (S5's load hand-over); this file only
- * computes over it.
+ * (256 KiB), q rows n_q * 128 (4 KiB), k rows n_kv * head_dim * 2 (1 KiB),
+ * and the exp16 table ATTN_M1_DET_EXP_N * 2 (37 KiB): about 426 KiB.
+ * All allocations use heap, with sizes fixed at create; l2fetch is only
+ * a hint. Gemma 4 needs 220 MiB per 1024 positions: 200 MiB for 25 sliding
+ * layers x 8 kv heads x 256, plus 20 MiB for 5 full layers x 2 x 512.
+ * This exceeds the roughly 182 MiB heap left by a 3840 MiB arena.
  *
  * THREADS. forward runs three pool runs (hvx_attn_m1_f32.c's header):
  * scores and exp by (kv head, 64-position tile), PV by a range of q-head
- * chains per lane (#170 round 2: 1.125x the mean lane at 6 lanes, from 1.5x
- * with (kv head, 4 heads) units), with the max and the sequential sum on
+ * chains per lane, with the max and the sequential sum on
  * the caller between them. No reduction crosses a unit or a chain except
  * those two serial steps, so the output is byte-equal at any worker count
  * -- which the host check proves at 0, 3 and 7 workers.

@@ -45,11 +45,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-/** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
-    purpose -- every model on ARM uses it and nothing is wrong with it.
-    What this path needs is not a better SwiGLU but the SAME one the DSP
-    runs, down to the bit, so that enabling the fused kernel cannot move a
-    single uint8 quantization level (doc 44 section 3.3). */
+/** Match the DSP's SwiGLU bit for bit so fusion preserves uint8
+ *  quantization levels. */
 #include <swiglu_det.h>
 
 namespace causallm {
@@ -57,34 +54,13 @@ namespace causallm {
 namespace {
 
 /**
- * @brief [P3] Where the MoE layer's ARM-side wall clock actually goes.
+ * @brief ARM-side MoE stage timings, shared by the CPU and HTP paths.
  *
- * NNTR_HTP_PROFILE accounts for everything inside a FastRPC call. M0
- * measures the layer's wall clock. Doc 43 section 4.3 subtracted one from
- * the other and got ~21 ms/layer that neither instrument sees, and the
- * whole HTP-vs-CPU verdict turns on it (doc 44 section 5): if that time is
- * HTP-specific, P1's batching removes it and HTP wins; if it is work the
- * CPU path does too, P1 changes nothing and the MoE FFN alone cannot beat
- * CPU.
+ * Matching stage boundaries separate shared routing/gather/scatter work
+ * from the FFN. `other` reports wall time outside the named stages.
  *
- * A residual cannot answer that, because most of what happens here --
- * routing, top-k, the token gather, the scatter-add -- runs on BOTH paths.
- * So this times the stages by name and prints them, and the same build
- * prints the same stages under moe_engine=cpu. Subtracting the two runs
- * cancels the shared work and leaves ffn_cpu against ffn_htp, which is the
- * comparison that decides P1.
- *
- * `other` is the layer wall clock minus every named stage. It is printed
- * rather than distributed, so a stage nobody thought to time shows up as a
- * number instead of hiding inside one that was.
- *
- * ponytail: one file-scope accumulator, no locking. Layers run one at a
- * time within a forward and each of these stages is entered from the
- * serial outer thread (the parallel_for inside the gather is timed from
- * its caller, not from the workers), so there is no race today. If layers
- * are ever run concurrently this needs to become per-call state threaded
- * through the two compute_expert_forward helpers -- which is why the
- * timers below take a pointer to their slot rather than an index.
+ * The unlocked accumulator requires serial layer execution. Timers run
+ * on the caller thread, including the gather's parallel_for interval.
  */
 struct M0Stages {
   uint64_t setup = 0;   /**< reshape + output.setZero() */
@@ -95,8 +71,7 @@ struct M0Stages {
   uint64_t ffn = 0;     /**< the expert FFN itself: HTP dispatch or two dots */
   uint64_t route = 0;   /**< multiply by the routing weight */
   uint64_t scatter = 0; /**< add_i back into the layer output */
-  uint64_t misses = 0;  /**< a count, not a time: experts loaded from the
-                             model file for this call (doc 52) */
+  uint64_t misses = 0;  /**< count of experts loaded from the model file */
 
   void reset() { *this = M0Stages{}; }
   uint64_t sum() const {
@@ -107,11 +82,10 @@ struct M0Stages {
 M0Stages g_m0;
 bool g_m0_on = false;
 
-/** @brief [#150] NNTR_OP_TIME=1: the decode MoE layer's M0 slots summed
+/** @brief NNTR_OP_TIME=1: the decode MoE layer's M0 slots summed
  *         over the run, split into the ARM part (setup + router + top-k)
  *         and the call (`ffn`: staging, queue write, ARM spin, response),
- *         one line at exit. Per call would be 22 lines per token on the
- *         timed run's stderr. */
+ *         one line at exit. */
 struct OpTimeMoe {
   uint64_t calls = 0, cpu_us = 0, call_us = 0;
 
@@ -146,11 +120,7 @@ public:
   }
   ~M0Timer() { stop(); }
 
-  /** @brief Ends the interval early and idempotently, for a stage that
-   *         finishes before its enclosing scope does. Without it the FFN
-   *         timer below would have to be given its own block, and the
-   *         re-indentation would bury a one-line instrument in a diff that
-   *         looks like a rewrite of the dispatch. */
+  /** @brief Ends the interval early and idempotently. */
   void stop() {
     if (!slot_) {
       return;
@@ -181,26 +151,21 @@ static constexpr size_t ROUTER_IN_IDX = 1;
 static constexpr bool NORM_TOPK_PROB = true;
 static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 
-/** [doc 52] Experts beyond the routed top-k whose recency the LRU refreshes,
- *  Lfm2CachedSlimMoELayer's value. */
+/** Experts beyond the routed top-k whose recency the LRU refreshes. */
 static constexpr unsigned EXTRA_TOPK = 5;
 
-/** [doc 52] The one pool of resident experts every MoE layer draws on. Its
- *  capacity is NNTR_MOE_CACHE_EXPERTS per layer, summed over the layers
- *  that finalize with virtual experts; the accelerator holds one slot per
- *  resident expert (register_qs4cx_wh_expert_file). Shared rather than per
- *  layer because the layer call needs a whole layer's active experts
- *  resident at once -- 32 at prefill -- which 22 layers x 2 can lend one
- *  layer and a per-layer bound of 2 cannot. */
+/** Resident expert pool shared across virtual MoE layers. Capacity is the
+ *  sum of their cache_per_layer shares, so one call can use more slots
+ *  than its layer's share to hold all active experts at once. */
 static causallm::ExpertLru g_expert_lru;
 
 using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
 
-/** [doc 52 section 10.10] Every virtual MoE layer's experts, as the backend
+/** Every virtual MoE layer's experts, as the backend
  *  needs them to read one from the file, in layer order (preloadExperts is
  *  called in graph order). Row i + 1 is what layer i reads ahead. */
 static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
-/** [PR 4428] The pool's slot sizes: the experts of one (K, inter, N_out,
+/** The pool's slot sizes: the experts of one (K, inter, N_out,
  *  dtype) share a size, and the rotated ternary Gemma4 has two (native
  *  TL2 in layers 0-27, 4-bit affine in 28-29). Each layer adds its share
  *  at finalize, so the first preload of each size can reserve all of
@@ -217,15 +182,9 @@ static ExpertSlotClass expertSlotClass(const ExpertFileDesc &d) {
 /** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
 static std::atomic<unsigned> g_moe_layer_count{0};
 
-/** @brief NNTR_MOE_PREFETCH=<k>: prefill reads the experts of the layers up
- *  to k ahead under the current layers' calls (doc 52 sections 10.10,
- *  10.20); 0 turns it off. Unset is every remaining layer (section 10.33):
- *  the pool's room is the real limit -- C=8 fits this layer's 32 and four
- *  more layers' in its 176 slots, C <= 3 not even one -- and where there is
- *  none, queuing just stops. A cap of 4 (section 10.26) was the same at
- *  C=8 but cost C=16 130 ms cold: its preload covers layers 0-10, so the
- *  first layer with anything to read is 11, and a 4-layer horizon did not
- *  start reading it until layer 7. */
+/** @brief NNTR_MOE_PREFETCH=<k>: read experts up to k layers ahead during
+ *  prefill; 0 disables read-ahead. Unset permits every remaining layer,
+ *  bounded by available pool slots. */
 static int expertPrefetchDepth() {
   static const int k = [] {
     const char *v = std::getenv("NNTR_MOE_PREFETCH");
@@ -234,7 +193,7 @@ static int expertPrefetchDepth() {
   return k;
 }
 
-/** [doc 52 section 10.20] Read-ahead batches in flight, oldest first: the
+/** Read-ahead batches in flight, oldest first: the
  *  layer slot each was queued for and the LRU slots it holds. */
 static std::deque<std::pair<int, size_t>> g_prefetch_batches;
 /** The next layer slot to queue in the current prefill. */
@@ -353,7 +312,7 @@ void retireHtpExpertPrefillKickoff(nntrainer::ComputeOps *ops) {
  * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
  *        "<layer> <tokens> | <routed experts> | <top-(k+5) per token>",
  *        for tools/moe_expert_cache_sim.py to replay against cache
- *        policies offline (doc 52 section 10.10). The routing is the same
+ *        policies offline. The routing is the same
  *        whatever the cache does, so one resident run gives every C.
  */
 static std::FILE *moeTrace() {
@@ -366,8 +325,7 @@ static std::FILE *moeTrace() {
 
 /** @brief Experts kept resident per layer: the cache_experts property
  *  (nntr_config moe_cache_experts) when the model sets it, else the built-in
- *  count (htp_fixed::MOE_CACHE_EXPERTS, formerly the NNTR_MOE_CACHE_EXPERTS
- *  option), capped by the layer's expert count. */
+ *  count (htp_fixed::MOE_CACHE_EXPERTS), capped by the layer's expert count. */
 static unsigned int expertCacheFromEnv(unsigned int num_experts,
                                        unsigned int from_props) {
   return std::min(num_experts, from_props != 0u
@@ -375,7 +333,7 @@ static unsigned int expertCacheFromEnv(unsigned int num_experts,
                                  : nntrainer::htp_fixed::MOE_CACHE_EXPERTS);
 }
 
-/** M0 (doc 43 §5): ordinal of prefill forwarding() calls, so each MoE layer
+/** M0 ordinal of prefill forwarding() calls, so each MoE layer
  * prints under a stable index in layer order. Decode never touches this --
  * it runs incremental_forwarding. */
 static std::atomic<unsigned> g_m0_call_index{0};
@@ -452,13 +410,9 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   num_experts = std::get<props::NumExperts>(moe_props).get();
   topk = std::get<props::NumExpertsPerToken>(moe_props).get();
 
-  // [doc 52] With NNTR_MOE_CACHE_EXPERTS set and an accelerator engine,
-  // the expert weights are requested virtual: the loader records their
-  // file offsets and reads nothing, and the forward brings each expert
-  // from the file into the accelerator's slot pool on demand, under one
-  // LRU shared by every MoE layer (g_expert_lru). A CPU-engine layer keeps
-  // its resident weights whatever the variable says -- the CPU cache is
-  // Lfm2CachedSlimMoELayer's job.
+  // Accelerator layers with a nonzero cache share request virtual weights:
+  // the loader records file offsets, and the shared LRU loads experts into
+  // accelerator slots on demand. CPU layers keep resident weights.
   trace_layer = g_moe_layer_count.fetch_add(1);
   cache_per_layer = expertCacheFromEnv(
     num_experts, std::get<props::CacheExperts>(moe_props).get());
@@ -741,7 +695,7 @@ void Lfm2MoELayer::buildExpertAssignments(
   }
 }
 
-/** @brief [doc 52] One virtual expert from the model file into the
+/** @brief One virtual expert from the model file into the
  *  accelerator's slot pool, keyed by its two weight tensors. The dims are
  *  the kernel's: gate_up is [K, 2 * inter], down [inter, N_out]. */
 static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
@@ -1254,32 +1208,10 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
  *        own bytes and report the SNR of the accelerator's output against
  *        it, with the layer's INPUT statistics beside it.
  *
- * The two numbers answer different halves of one question, which is why
- * they are printed together and why this is one instrument rather than two
- * runs (doc 56 section 6.1):
- *
- *   input mean/std/max already wild -> whatever is wrong is UPSTREAM of
- *                                      this layer (attention, embedding,
- *                                      the norms), and the MoE SNR is
- *                                      measuring agreement on garbage;
- *   input sane, SNR low             -> the MoE call itself, on these
- *                                      weights and this activation.
- *
- * Expect 30-45 dB when the kernel is right: the reference is pure f32 and
- * the kernel requantizes its activations to u8, so they do not agree
- * further than that. Near 0 dB or negative is a different computation, not
- * a quantization gap.
- *
- * 0 means every row. The cost is a full f32 MoE layer on the application
- * processor -- hidden * 2 * inter + inter * hidden MACs per routed token --
- * so the default of 8 rows keeps a prefill layer at seconds; every row is
- * minutes and is what NNTR_MOE_SHADOW needs.
- *
- * ponytail: virtual experts only (the layer's weights live in the file, not
- * in memory, which is what this reads). A resident-expert model has
- * NNTR_L2_DIFF on the same question one level down. The upgrade path, if a
- * resident model ever needs this one, is to read the tensors instead of the
- * file when getFd() is -1.
+ * Input statistics distinguish upstream problems from disagreement in
+ * this layer. The f32 reference and u8 accelerator may differ from
+ * quantization. Unset disables the check; 0 checks every row and can be
+ * expensive. Only virtual experts with file-backed weights are supported.
  */
 static int moeDiffRows() {
   static const int rows = [] {
@@ -1289,10 +1221,8 @@ static int moeDiffRows() {
   return rows;
 }
 
-/** @brief NNTR_MOE_SHADOW=1: compute the same reference for EVERY row and
- *  hand the model those values instead of the accelerator's. Text that
- *  comes back says the MoE values are the fault; text that stays broken
- *  says they are not, which no SNR number can decide. Implies the diff. */
+/** @brief NNTR_MOE_SHADOW: replace every accelerator row with the CPU
+ *  reference to isolate MoE errors. Implies the diff. */
 static bool moeShadowEnabled() {
   static const bool on = std::getenv("NNTR_MOE_SHADOW") != nullptr;
   return on;
@@ -1462,12 +1392,11 @@ static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
 #endif
 
 /**
- * @brief [doc 46] The whole MoE FFN layer in one accelerator call.
+ * @brief The whole MoE FFN layer in one accelerator call.
  *
  * Flattens the per-expert assignment lists into the three arrays the call
  * wants and hands the routing over, so the token gather, the routing
  * multiply and the scatter-add happen on the accelerator instead of here.
- * Doc 44 section 15.1 measured those at 6.3 ms/layer on the ARM side.
  *
  * @return true when the layer was computed; false when this build or these
  *         weights cannot take the path, and the caller's per-expert loop
@@ -1506,7 +1435,7 @@ static bool tryMoeLayerOnAccelerator(
   std::vector<float *> gu_scale(n_experts), dn_scale(n_experts);
   // QS4CX_WH is the same weight with its nibbles already in HMX tiles and a
   // column sum after the scales, built by the offline quantizer so the DSP
-  // does not have to convert and bake at load (doc 46 section 35). Both
+  // does not have to convert and bake at load. Both
   // experts' halves have to agree, and every expert with every other: the
   // call takes one flag for the layer, and a model that mixed the two would
   // otherwise read half its weights with the wrong layout.
@@ -1521,21 +1450,9 @@ static bool tryMoeLayerOnAccelerator(
                               : (dt0 == wh2)                ? 2u
                                                             : 0u;
 
-  // Decode's single token normally stays on the ARM side: it cannot amortize
-  // the kernel's 64-row pad, which is why the fused path has the same gate.
-  // QS4CX_WH has no ARM side to stay on -- FloatTensor implements no dot()
-  // for it, deliberately, because those bytes are in HMX tile order and only
-  // the DSP can read them -- so there the gate would pick a throw over a
-  // slow-but-correct call.
-  // ponytail: decode through the layer kernel pads M = 1 out to 64 rows for
-  // each of the num_experts_per_tok active experts. It is correct and it is
-  // the only option for these weights; a decode-shaped kernel, or moving the
-  // grouped-decode gather onto the DSP, is the upgrade if decode TPS asks
-  // for it.
-  // NNTR_MOE_HTP_DECODE=1 lifts that gate for plain QS4CX: the layers in
-  // moe_htp_layers take the kernel at M == 1 while the rest keep the ARM
-  // path, which is the only way to put decode's CPU and HTP FFN side by
-  // side in one run (doc 46 section 49). Measurement switch, not a default.
+  // Plain QS4CX decode stays on ARM unless NNTR_MOE_HTP_DECODE is set;
+  // a single row cannot amortize HMX's 64-row padding. Accelerator layouts
+  // have no CPU dot() fallback and must remain on HTP.
   static const bool htp_decode_forced =
     std::getenv("NNTR_MOE_HTP_DECODE") != nullptr;
   if (total_tokens <= 1 && w_bits == 0u && !htp_decode_forced) {
@@ -1555,7 +1472,7 @@ static bool tryMoeLayerOnAccelerator(
     dn_scale[e] = dn.getScale<float>();
   }
 
-  // [#260, plan 201 S1] A virtual layer hands all its experts and the
+  // A virtual layer hands all its experts and the
   // LRU's policy to the backend at its first call (the first prefill runs
   // the layers in order), for the one-PD token's miss path: the pool's
   // slots are the same slots tracked by this LRU.
@@ -1576,7 +1493,7 @@ static bool tryMoeLayerOnAccelerator(
     }
   }
 
-  // [doc 52] Virtual experts: the ones this call routes to are made
+  // Virtual experts: the ones this call routes to are made
   // resident through the shared LRU (a miss releases the least recently
   // used expert's slot and reads this one from the file into it), the
   // arrays are compacted to them, and the weight tensors' addresses stand
@@ -1622,7 +1539,7 @@ static bool tryMoeLayerOnAccelerator(
         need.push_back(key);
         expert_of[key] = e;
       }
-      // [doc 52 section 10.23] acquire() frees every slot the misses need
+      // acquire() frees every slot the misses need
       // before it names the first miss, so the misses are gathered and
       // loaded together after it: one registration round trip, not one
       // per expert. Nothing reads them before the call below.
@@ -1674,19 +1591,10 @@ static bool tryMoeLayerOnAccelerator(
       out_to_host || (!with_add && !retain_plain) || total_tokens == 1);
   };
 
-  // [doc 52 section 10.14] A layer call needs all of its routed experts
-  // resident at once, and at NNTR_MOE_CACHE_EXPERTS=1 the shared pool (one
-  // slot per layer, 22) is smaller than a prefill layer's 31-32. Then the
-  // call goes out in pool-sized groups and the host adds their outputs.
-  // Each call zero-fills its whole output and scatter-adds only its own
-  // experts' rows, so the sum is the layer's output with the fp32 addition
-  // order changed across group boundaries, which should move the ppl in its
-  // last digits only. It measured 63.03 against every other path's 62.09
-  // (section 10.15): not that, and open. Only prefill ever takes this; a
-  // decode call's 4 experts always fit.
-  // NNTR_MOE_SPLIT=<n> caps a group at n experts below the pool's size, so
-  // the split can be run where no group evicts another (section 10.15).
-  // Measurement switch, not a default.
+  // If all routed experts cannot fit, split them into pool-sized groups
+  // and sum their zero-initialized outputs on the host. This changes fp32
+  // addition order across groups; numerical equivalence is not guaranteed.
+  // NNTR_MOE_SPLIT=<n> caps group size for diagnosing this path.
   static const size_t split_env = [] {
     const char *v = std::getenv("NNTR_MOE_SPLIT");
     return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(0);
@@ -1716,17 +1624,10 @@ static bool tryMoeLayerOnAccelerator(
       }
     }
   } else {
-    // [doc 52 sections 10.10, 10.20] Prefill read-ahead: prefill routes
-    // every token to its top-4, so a layer wants (nearly) all 32 of its
-    // experts, and which ones is known long before its turn. This layer
-    // queues the ones layers up to NNTR_MOE_PREFETCH ahead lack, the
-    // backend reads them while this and the following calls run, and each
-    // layer registers its own batch -- between calls -- before it stages.
-    // Room comes from evicting outside this call's experts and every later
-    // layer's resident ones -- all of them are about to be used, and the
-    // slots that free up each layer are the finished layers' (section
-    // 10.33) -- and the in-flight slots are held so no miss takes them;
-    // where there is no room the queue stops and resumes a layer later.
+    // Prefetch missing experts up to NNTR_MOE_PREFETCH layers ahead while
+    // this call runs. Each layer registers its batch before staging.
+    // Protect current and later layers' resident experts, reserve slots
+    // for in-flight reads, and pause queuing when the pool is full.
     const int depth =
       experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
         ? expertPrefetchDepth()
@@ -1976,47 +1877,11 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   nntrainer::Tensor acti_out =
     workspace.activation_output->getSharedDataTensor(intermediate_dim, 0, true);
 
-  // [L2] fused HTP path: gate_up -> SwiGLU -> down, the SwiGLU never
-  // leaving the DSP. Decode (num_tokens == 1) stays on the two-dot path
-  // below: the fused call's 64-row pad tax is not amortizable by a single
-  // token (same reason accelerates_q4_0_at_m1() is false).
-  // gate_up_out / acti_out are simply unused when this takes.
-  //
-  // ponytail: DISABLED again, and this time with the NaN hypothesis ruled
-  // out on device rather than merely suspected.
-  //
-  // Three attempts now break the real model identically ("Could you please
-  // provide the text you would like summarized?", 206 tokens, vs the CPU
-  // path's correct 512-token summary) while passing every synthetic-weight
-  // SNR gate. The shared hvx_recip_qf32 NaN was the leading candidate --
-  // its magic seed really does diverge for any gate at or below the old
-  // exp clamp, host-verified, and hvx_swiglu_f32.c's clamp is fixed on that
-  // basis and stays fixed. But NNTR_L2_CHECK, which scans the DSP's own
-  // per-row requantization scales (where a NaN lane lands, since
-  // hvx_quant_rows_u8_params scans the whole row for min/max) and the down
-  // matmul's f32 output, reports ZERO non-finite values on a full run whose
-  // text is still wrong. So the fused path's output is finite and wrong,
-  // not NaN and wrong: a different class of bug, and the NaN fix -- correct
-  // on its own terms -- was never what this needed.
-  //
-  // What has still never been controlled for is the DATA. Every gate this
-  // path has ever passed used fill_deterministic weights and activations;
-  // the model's own registered weight bytes and a real captured activation
-  // have never been put through both paths side by side. NNTR_L2_DIFF
-  // (HtpComputeOps::l2Diff) does exactly that and bisects the remaining
-  // search in one run -- see its doc comment. Run it before writing a
-  // fourth implementation.
-  //
-  // Performance is NOT the reason this is off: at 41.5-42.6 ms/layer the
-  // split-call path beats the two-dot HTP path's 55.6 ms (doc 43 section 1).
-  // HTP losing to CPU at these shapes is a separate, structural finding --
-  // the matmul is 21% of the call (the profile's own mm<= column now
-  // measures it) and MoE prefill is DDR-bandwidth bound on expert weights.
+  // Keep gate_up -> SwiGLU -> down on the DSP for prefill. Decode uses
+  // the two-dot path because one token cannot amortize 64-row padding.
   constexpr bool kFusedSwigluEnabled = true;
   bool expert_ffn_done = false;
-  // [P3] One timer over the whole FFN, fused or two-dot, so the two engines
-  // are measured at the same boundary and the CPU-vs-HTP subtraction is
-  // between like and like.
+  // Use the same FFN timing boundary for fused and two-dot paths.
   M0Timer m0_ffn(&g_m0.ffn);
   if (kFusedSwigluEnabled && num_tokens > 1 && !gelu_act &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
@@ -2110,7 +1975,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   output_step_dim.height(to - from);
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
-    // [#260] a decode row under the one-PD token (NNTR_HTP_E2E=1): the DSP
+    // A resident decode row: the DSP
     // runs the block's norms, router and experts in the list, so nothing
     // here is read -- checked ahead of the folded norms below
     if (to - from == 1 && input_.batch() == 1 && htpDecodeRowResident(from))
@@ -2124,8 +1989,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
     // With out_add the experts' input norm rides the prefill MoE call (its
     // pre_gamma), which then has the raw rows on the DSP for the
-    // epilogue's residual (doc 57 section 9.30). Alone it gained nothing
-    // (section 9.27), so only then; decode and the MoE diff / shadow
+    // epilogue's residual. Decode and the MoE diff / shadow
     // instruments, which read the normed copy, keep the CPU norm.
     auto *moe_ops = context.getComputeOps();
     const bool norm_on_accel = out_add && in_norm && to - from > 1 &&
@@ -2188,10 +2052,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output.reshape({total_tokens, 1, 1, hidden_size});
     }
 
-    // [#132] one decode row: the HTP routes, runs the experts and adds
+    // One decode row: the HTP routes, runs the experts and adds
     // the result into its resident residual in the same stretch, so the
     // layer writes nothing (the next norm hook returns the stream). The
-    // fused call is the MoE wait, so it counts as ffn (#150); a continue
+    // fused call is the MoE wait, so it counts as ffn; a continue
     // stops the timer through its destructor.
     M0Timer fused(&g_m0.ffn);
     if (total_tokens == 1 && !out_add &&
@@ -2252,7 +2116,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // [doc 46] One call for every expert, when the accelerator offers it.
+    // One call for every expert, when the accelerator offers it.
     // The M > 1 gate that used to sit here moved inside: it does not apply to
     // QS4CX_WH weights, which have no ARM path to fall back to at M == 1.
     // Falls through to the per-expert loop below otherwise.

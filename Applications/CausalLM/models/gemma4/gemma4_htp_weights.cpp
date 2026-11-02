@@ -65,15 +65,9 @@ void Gemma4HtpTransformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
-  // [doc 50 section 3.2] FC weights an accelerator will hold are collected
-  // here and registered AFTER the walk, once every MoE arena chunk is
-  // mapped. The DSP's 32-bit address space maps each 256 MiB chunk at a
-  // 256 MiB boundary (doc 46 section 41); a heap allocation between two
-  // chunk mappings -- which is where a registered FC weight lives --
-  // strands the space from the heap's end to the next boundary. Measured:
-  // registered in graph order (conv in_proj between the MoE layers) the
-  // arena stopped at 3584 MiB, 14 chunks, against the 3840 it reaches on
-  // its own.
+  // Register FC weights after all MoE arena chunks are mapped. DSP chunks
+  // require 256 MiB alignment in a 32-bit address space; interleaved heap
+  // allocations strand the space up to the next chunk boundary.
   std::map<std::string, HtpStaticEncoding> static_weights;
   std::string static_path = STATIC_ACTIVATION_FILE;
   if (const char *path = std::getenv("NNTR_HTP_STATIC_LINEAR"))
@@ -122,12 +116,8 @@ void Gemma4HtpTransformer::repack_weight() {
     unsigned int K, C, N;
   };
   std::vector<PendingConv> conv_pending;
-  // [#132 Part B E5g] the MoE warm-up call, kept until every MoE weight is
-  // mapped: it grows the session's DSP heap by the M=512 scratch, and a heap
-  // growth between two arena chunk mappings strands the space up to the next
-  // chunk boundary (the note above). In the walk it landed between the first
-  // MoE layer's chunks and the rest, and the two-session sittings saw S1's
-  // last chunk refused (AEE_EMMAP) on some boots.
+  // Defer warm-up until every MoE weight is mapped: its scratch grows the
+  // DSP heap and would otherwise fragment the arena mappings above.
   struct PendingMoeWarm {
     nntrainer::ComputeOps *ops = nullptr;
     std::vector<void *> gu_data, dn_data;
@@ -136,11 +126,8 @@ void Gemma4HtpTransformer::repack_weight() {
     unsigned int w_bits = 0u; /**< 0 QS4CX, 4 QS4CX_WH, 2 QS2CX_WH */
   } moe_warm;
 
-  // The tied lm_head, prepared after the walk: on its accelerator it is
-  // placed in the arena, which must come after every other weight (the
-  // chunk-boundary note above), else its blocked CPU twin is built. Both
-  // at load, with every weight loaded, rather than on the first lm_head
-  // call inside the first prefill. The context is the node's own and
+  // Prepare the tied lm_head after all other weights, either in the
+  // accelerator arena or as a blocked CPU copy. Its node-owned context
   // outlives the walk.
   struct PendingTie {
     nntrainer::HtpTieWordEmbedding *layer = nullptr;
@@ -345,18 +332,11 @@ void Gemma4HtpTransformer::repack_weight() {
           l.getType() != "residual_add")
         return;
 
-      // An accelerator-dispatched MoE layer registers its expert weights
-      // here, at load, instead of on the first token: the layer's ComputeOps
-      // is only non-null when nntr_config.json routed it to an engine, and
-      // a backend that has nothing to register says so and is skipped. The
-      // expert weight tensors are [K, N] as the kernel sees them; the router
-      // gate and expert bias are FP32 and never reach this branch.
+      // Register accelerator MoE weights at load to avoid first-token work.
+      // Expert tensors use the kernel's [K, N] layout.
       auto *ops = isMoeLayer(l) ? context.getComputeOps() : nullptr;
-      // [doc 50] A fully_connected layer under engine=htp registers its
-      // Q4_0 weight here for the same reason: gemm_q4_0_accel_fp32's first
-      // call converts and registers it, and that first call is in the
-      // first prefill. A CPU-engine layer's ops answer false; nothing else
-      // changes for it. The weight is [K, N] as dot() reads it.
+      // Defer FC registration until after MoE mappings; CPU backends decline
+      // registration. FC weights use dot()'s [K, N] layout.
       auto *fc_ops = isMoeLayer(l) ? nullptr : context.getComputeOps();
 
       auto weights = context.getWeights();
@@ -429,7 +409,7 @@ void Gemma4HtpTransformer::repack_weight() {
                      ? 4u
                    : dtype == ml::train::TensorDim::DataType::QS2CX_WH ? 2u
                                                                        : 0u;
-          // [doc 52] A virtual expert has no bytes here: preloadExperts
+          // A virtual expert has no bytes here: preloadExperts
           // below reads it from the model file into the accelerator's slot
           // pool, keyed by the tensor itself, and the warm-up passes that
           // key with a null scale the way the layer's forward does.
@@ -457,7 +437,7 @@ void Gemma4HtpTransformer::repack_weight() {
           }
         }
       }
-      // [doc 52] Virtual experts into the shared pool now, in layer order
+      // Virtual experts into the shared pool now, in layer order
       // until it is full, so the first prefill maps no arena chunk. A
       // layer whose experts did not all fit cannot host the warm-up call.
       bool moe_all_resident = true;
@@ -466,15 +446,8 @@ void Gemma4HtpTransformer::repack_weight() {
         if (auto *moe = dynamic_cast<Lfm2MoELayer *>(layer))
           moe_all_resident = moe->preloadExperts(context);
       }
-      // [doc 47 section 20.1, lever 6] One warm-up call through the layer
-      // kernel at load, so the first prefill does not pay the first call's
-      // costs -- the session scratch's growth to the prefill size, the
-      // first touch of every page of it and of the FastRPC buffers, the
-      // DSP's own first-call setup: read as +10 ms on the first MoE layer
-      // of the first prefill (doc 47 section 15). One layer's call is
-      // enough, since all of that is per session, not per layer. Zero
-      // input, output discarded. Skipped, harmlessly, when the shapes do
-      // not read as an expert pair.
+      // One valid expert pair warms the session's scratch, FastRPC buffers
+      // and DSP setup at load. Use zero input and discard the output.
       if (ops && moe_warm.ops == nullptr && moe_all_resident && isMoeLayer(l) &&
           ops->supports_gemm_qs4cx_moe_layer_fp32() && !gu_data.empty() &&
           gu_data.size() == dn_data.size() && gu_w == 2 * dn_h &&
@@ -497,10 +470,8 @@ void Gemma4HtpTransformer::repack_weight() {
       if (!cpu_weight_sources.count(head))
         nntrainer::get_htp_ops()->share_decode_lm_head(head);
 #endif
-    // [#225] The FC WH sidecar, handed to every backend that registers a
-    // pending FC before it registers any. A CPU-engine layer's ops are
-    // pending too and answer false, so a model whose keys route no FC to
-    // an accelerator (the CPU-only and no-keys configs) never opens it.
+    // Set the FC WH sidecar before registering pending accelerator weights.
+    // CPU backends decline it without opening the file.
     if (!FC_WH_FILE_NAME.empty()) {
       NNTR_THROW_IF(FC_WH_FORMAT != nntrainer::FCWH_FORMAT, std::runtime_error)
         << "fc_wh_format \"" << FC_WH_FORMAT << "\" in nntr_config.json, this "
@@ -518,23 +489,17 @@ void Gemma4HtpTransformer::repack_weight() {
       for (const auto &c : conv_pending)
         backends.insert(c.ops);
 #ifdef ENABLE_HEXKL
-      // [#234 P4] the one-PD decode list binds its FC / DENSE_FFN ops to
-      // the sidecar's images too, so a model that keys no FC (Gemma 4)
-      // opens it for that bind
+      // The decode graph also binds FC / DENSE_FFN images from the sidecar.
       if (nntrainer::get_htp_ops()->has_decode_graph_q4_0())
         backends.insert(nntrainer::get_htp_ops());
 #endif
       for (auto *b : backends)
         b->set_fc_wh_file(path.c_str());
     }
-    // The MoE warm-up (doc 47 section 20.1, lever 6): one call through the
-    // layer kernel at load, now after the walk (see PendingMoeWarm).
+    // Warm the MoE session after all arena mappings (see PendingMoeWarm).
     if (moe_warm.ops != nullptr) {
-      // M as wide as a prefill can be: the kernel's scratch keeps its act
-      // and out copies (M x K, M x N_out f32) and the staging pools their
-      // size classes, so a 512-row warm-up left the first 1024-row prefill
-      // call to grow and touch them, 2.1 ms a call on average over 31
-      // (doc 57 section 9.26). The expert slots' bound is the same either way.
+      // Size scratch and staging for the configured prefill to avoid
+      // growing and first-touching those buffers on the first call.
       const unsigned int M = std::max(512u, INIT_SEQ_LEN), K = moe_warm.K,
                          N_out = moe_warm.N_out;
       const unsigned int E = static_cast<unsigned int>(moe_warm.gu_data.size());

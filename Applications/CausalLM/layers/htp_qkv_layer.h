@@ -101,11 +101,9 @@ public:
  *          with the per-head RMS norm of q and k folded in when
  *          feature_size is set.
  *
- * One layer so the three matmuls share one activation: an accelerator
- * takes them as one call (Tensor::dot's vector overload, doc 51 section
- * 2.21 -- three calls each quantized and shipped the same 3.6 MB
- * activation), and on the CPU it is the same three GEMMs. With
- * feature_size (the head dim) the layer holds, in the model file's
+ * The three matmuls share one activation and accelerator call through
+ * Tensor::dot's vector overload; the CPU runs the same three GEMMs. With
+ * feature_size (the head dim), the layer holds, in the model file's
  * order, q, q_norm's gamma, k, k_norm's gamma, v, and applies the same
  * rms_norm_wrt_width + gamma multiply ReshapedRMSNormLayer would; the
  * outputs are q_normed, k_normed, v. Without it: q, k, v as they are.
@@ -120,24 +118,24 @@ public:
 WIN_EXPORT class HtpQKVLayer : public nntrainer::LayerImpl {
 public:
   /**
-   * @brief     Constructor of Fully Connected Layer
+   * @brief Constructor of HtpQKVLayer.
    */
   WIN_EXPORT HtpQKVLayer();
 
   /**
-   * @brief     Destructor of Fully Connected Layer
+   * @brief Destructor of HtpQKVLayer.
    */
   WIN_EXPORT ~HtpQKVLayer() = default;
 
   /**
    *  @brief  Move constructor.
-   *  @param[in] FullyConnected &&
+   *  @param[in] rhs HtpQKVLayer to be moved.
    */
   WIN_EXPORT HtpQKVLayer(HtpQKVLayer &&rhs) noexcept = default;
 
   /**
    * @brief  Move assignment operator.
-   * @parma[in] rhs HtpQKVLayer to be moved.
+   * @param[in] rhs HtpQKVLayer to be moved.
    */
   WIN_EXPORT HtpQKVLayer &operator=(HtpQKVLayer &&rhs) = default;
 
