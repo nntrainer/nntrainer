@@ -635,7 +635,16 @@ INSTANTIATE_TEST_SUITE_P(
     MhaCase("fp16_window_rowwise", 4, 2, 16, {6, 1, 1, 1})
       .slidingWindow(3)
       .fp16Activations(),
-    MhaCase("fp16_gemm", 4, 2, 16, {5, 1, 1, 1}).gemmArm().fp16Activations()),
+    MhaCase("fp16_gemm", 4, 2, 16, {5, 1, 1, 1}).gemmArm().fp16Activations(),
+    // The FP16 score path of the host flash arm with the softcap, fed FP16
+    // activations: a 40-row prefill takes that arm on ARM too, and the small
+    // cap makes a dropped softcap fail clearly (with 0.5 it missed the 1e-2
+    // tolerance by 0.0108 under qemu).
+    MhaCase("fp16_softcap_gemm_long_prefill", 4, 2, 16, {40, 1, 1})
+      .softcapAt(0.1f)
+      .gemmArm()
+      .flashTile(16, 16)
+      .fp16Activations()),
   [](const ::testing::TestParamInfo<MhaCase> &info) {
     return info.param.name;
   });
