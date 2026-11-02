@@ -16,9 +16,10 @@
  *   out = softmax(rope(Q) . rope(K)^T / sqrt(head_dim) + mask) . V
  *
  * The reference rounds K and V to fp16 the way the layer's KV cache stores
- * them, so the two agree within 1e-4. These tests pin the current host-path
- * behaviour before the backend dispatch inside the layer is moved to
- * ComputeOps (#4451); a refactor of the layer must keep them passing.
+ * them, so the two agree within 1e-4 on the FP32 path. These tests pin the
+ * current host-path behaviour before the backend dispatch inside the layer
+ * is moved to ComputeOps (#4451); a refactor of the layer must keep them
+ * passing.
  *
  * Scope:
  *  - The per-row cases run on every architecture. The host flash (gemm) arm
@@ -26,8 +27,12 @@
  *    never takes a decode step, so the gemm cases are x86-only.
  *  - Built and run in the enable-fp16=false x86 cell, the only one that
  *    builds CausalLM tests. The cases feed FP32 activations, so they also
- *    pass in an enable-fp16 build; the FP16 activations an Android fp16
- *    build runs are not covered.
+ *    pass in an enable-fp16 build on x86 and on Linux aarch64. An Android
+ *    fp16 build is different: there the layer narrows FP32 activations to
+ *    FP16 copies and runs its FP16 kernels (mha_core.cpp, ENABLE_FP16 &&
+ *    __ANDROID__), so every case lands at fp16 precision and is held to
+ *    1e-2 (8e-4 at most on a Galaxy S26). The FP16 activation type itself
+ *    is not fed here.
  *  - A sliding window is tested on causal cases only. With a non-causal
  *    input the per-row arm ignores the window and the flash arm applies it;
  *    the reference follows the per-row arm.
@@ -498,8 +503,16 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     const std::vector<float> expected =
       referenceAttention(c, rope, q, k_hist, v_hist, sink, from, rows);
     const float *actual = run_context.getOutput(0).getData<float>();
+    // An Android fp16 build runs the FP16 path for these FP32 activations
+    // (see the header), so it is held to fp16 precision; 8e-4 at most on a
+    // Galaxy S26. Every other build computes in FP32 and keeps 1e-4.
+#if defined(ENABLE_FP16) && defined(__ANDROID__)
+    const float tolerance = 1e-2f;
+#else
+    const float tolerance = 1e-4f;
+#endif
     for (size_t i = 0; i < expected.size(); ++i) {
-      ASSERT_NEAR(actual[i], expected[i], 1e-4f)
+      ASSERT_NEAR(actual[i], expected[i], tolerance)
         << "step [" << from << ", " << from + rows << ") element " << i;
     }
     from += rows;
