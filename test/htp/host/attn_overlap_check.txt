@@ -40,23 +40,9 @@ Frozen serial reference
 
     git show 0fcdfc1f9:nntrainer/tensor/htp_backend/hmx/hexkl_attn_q.c
 
-Production scope and measured selection
+Production scope
   Enable overlap only for full dynamic-Q8 LFM prefill with n_q >= 2048 and
   n_q divisible by 128, plus the existing shape, pool and extent guards.
-  The earlier candidate also enabled 1024 rows. Although its 10 attention
-  layers shortened from 150.939 to 127.291 ms in a diagnostic profile, three
-  normal 1024-token A/B pairs all regressed: median 844.188 -> 827.141 TPS
-  (-2.02%). The final guard therefore keeps 1024 on the serial path.
-  In the same 12-run comparison, the three 2048-token pairs were all faster:
-    baseline: 714.834 / 729.605 / 747.718 TPS
-    candidate: 749.360 / 895.496 / 759.644 TPS
-  The median gain was 4.12%, with considerable run-to-run variation. These
-  measurements selected the 2048-and-larger scope; they do not establish a
-  speedup at every larger size. After narrowing, another three 2048-token
-  pairs measured median 730.906 -> 784.374 TPS (+7.32%, two pairs faster).
-  The final 21-case DSP replay and same-handle 2x2048+64-token runs preserved
-  exact outputs. See docs/measurements/lfm2_tl2_prefill1000_20261016/
-  followup_attention_overlap for all runs and the sampled-memory scope.
 
 Coverage
   The normal run has 460 cases:

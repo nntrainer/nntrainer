@@ -18,10 +18,20 @@
  */
 
 #include "htp_moe_opts.h"
+#include "htp_profile_wire.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+_Static_assert(HTP_N_STAGES == 7 && HTP_T_ACC_STRIDE == 6, "FC wire layout");
+_Static_assert(HTP_FU_N_STAGES == 8 && HTP_FU_T_ACC_COPY == 5,
+               "fused wire layout");
+_Static_assert(HTP_GU_N_STAGES == 7 && HTP_GU_T_DRAIN == 5,
+               "gate/up wire layout");
+_Static_assert(HTP_MOE_N_STAGES == 31 && HTP_MOE_T_PATH == 29 &&
+                 HTP_MOE_T_M1_FEED == 30 && HTP_MOE_T_DMA_DESC == 19,
+               "MoE wire layout");
 
 static int g_fail;
 

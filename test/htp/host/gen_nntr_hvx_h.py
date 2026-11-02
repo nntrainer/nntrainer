@@ -6,8 +6,7 @@ qaic is a Hexagon SDK tool, so a host cannot generate the real header. This
 one declares every method with the prototype qaic gives it -- remote_handle64
 first, then each argument, a sequence as a pointer plus an int length, an
 out scalar as a pointer -- so compiling the skel sources against it checks
-their definitions against the IDL, which tools/htp_syntax_check.sh's
-variadic stand-in cannot.
+their definitions against the IDL.
 """
 import re
 import sys
