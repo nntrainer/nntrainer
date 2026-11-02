@@ -20,6 +20,7 @@
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="$(cd "$HERE/../../../nntrainer/tensor/htp_backend" && pwd)"
+DSP="$BACKEND/dsp"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
@@ -33,6 +34,7 @@ cc=${CC:-gcc}
 "$OUT/graph_binding_check"
 "$OUT/decode_runtime_check"
 "$OUT/profile_wire_check"
+python3 "$HERE/run_prefill_scratch_check.py"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
   -I "$HERE/../../../Applications/CausalLM" \
   "$HERE/lfm2_runtime_defaults_check.cpp" -o "$OUT/lfm2_runtime_defaults_check"
@@ -56,10 +58,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
 "$OUT/weight_file_reader_check"
 # Native LFM2/Gemma4 pairs use the production direct reader and real queues.
 # The fixture explicitly skips its Linux-only I/O checks on other platforms.
-"$cc" -std=c11 -O2 -Wall -Wextra -Werror -I "$BACKEND/hvx" -c \
-  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -o "$OUT/tl2_pair_pack.o"
+"$cc" -std=c11 -O2 -Wall -Wextra -Werror -I "$BACKEND" -c \
+  "$BACKEND/htp_tl2_codec.c" -o "$OUT/tl2_pair_pack.o"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
-  -I "$BACKEND" -I "$BACKEND/hvx" -I "$BACKEND/../../utils" \
+  -I "$BACKEND" -I "$BACKEND/../../utils" \
   "$HERE/tl2_pair_read_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
   "$OUT/tl2_pair_pack.o" -o "$OUT/tl2_pair_read_check"
 "$OUT/tl2_pair_read_check" "$OUT"
@@ -81,24 +83,24 @@ python3 -c 'import subprocess, sys; subprocess.run([sys.argv[1]], check=True, ti
   "$HERE/token_completion_check.cpp" -o "$OUT/token_completion_check"
 "$OUT/token_completion_check"
 "$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
-  "$HERE/tl2_lut_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  "$HERE/tl2_lut_check.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_lut_check"
 "$OUT/tl2_lut_check"
 
 "$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hvx" \
-  "$HERE/tl2_expand_check.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  "$HERE/tl2_expand_check.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -o "$OUT/tl2_expand_check"
 "$OUT/tl2_expand_check"
 
-g++ -std=c++17 -O2 -Wall -Wextra -I "$BACKEND/.." -I "$BACKEND/hvx" \
-  "$HERE/tl2_native_packing_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+g++ -std=c++17 -O2 -Wall -Wextra -I "$BACKEND/.." \
+  "$HERE/tl2_native_packing_check.cpp" "$BACKEND/htp_tl2_codec.c" \
   -o "$OUT/tl2_native_packing_check"
 "$OUT/tl2_native_packing_check"
 
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
   "$HERE/../../../tools/prepare_tl2.cpp" -o "$OUT/prepare_tl2"
-g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/hvx" \
-  "$HERE/tl2_prepared_check.cpp" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" \
+  "$HERE/tl2_prepared_check.cpp" "$BACKEND/htp_tl2_codec.c" \
   -o "$OUT/tl2_prepared_check"
 echo '0 256 256' > "$OUT/tl2-weights.tsv"
 for fixture in fixture unit-fixture; do
@@ -108,8 +110,8 @@ for fixture in fixture unit-fixture; do
 done
 
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$BACKEND" -I "$BACKEND/.." \
-  -I "$BACKEND/hvx" "$HERE/../../../tools/convert_tl2_model.cpp" \
-  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -o "$OUT/convert_tl2_model"
+  "$HERE/../../../tools/convert_tl2_model.cpp" \
+  "$BACKEND/htp_tl2_codec.c" -o "$OUT/convert_tl2_model"
 python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 
 # -O2: the M=1 cases run the HMX stand-in at the real shape (64 rows a
@@ -126,40 +128,44 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -DMOE_TAIL_MAX_ROWS=16u -DHVX_FC_M1_COLS=4 \
   -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
-  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_moe_scratch.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/moe_layer_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
-  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_moe_host_check" \
   "$HERE/tl2_moe_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_moe_scratch.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_moe_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
-  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_prefill_host_check" \
   "$HERE/tl2_prefill_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_moe_scratch.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
   "$BACKEND/hmx/hexkl_dma_trace.c" \
-  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+  "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_prefill_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -ffunction-sections -fdata-sections -DMOE_TAIL_MAX_ROWS=16u \
   -DHVX_FC_M1_COLS=4 \
   -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
-  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/wh_affine_host_check" \
   "$HERE/wh_affine_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_moe_scratch.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" \
   "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" \
-  "$BACKEND/hvx/hvx_gemv_u8tl2.c" -Wl,--gc-sections -lm
+  "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -Wl,--gc-sections -lm
 "$OUT/wh_affine_host_check"
 "$cc" -std=gnu11 -O2 -Wall -Wextra -I "$BACKEND/hmx" \
   "$HERE/wh_affine_vector_check.c" -o "$OUT/wh_affine_vector_check"
@@ -176,12 +182,13 @@ for mut in 's/      if (hexkl_dma_lane_wait(\&d\[cur\]) != 0) {/      if (0) {/'
   fi
   "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
     -DMOE_TAIL_MAX_ROWS=16u \
-    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$OUT/moe_fc_mutant" \
     "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
+    "$BACKEND/hmx/hexkl_moe_scratch.c" \
     "$OUT/moe_fc_mutant.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-    "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+    "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
   if MOE_CHECK_FC_WH_ONLY=1 "$OUT/moe_fc_mutant" > "$OUT/moe_fc_mutant.log"; then
     echo "FC WH MUTANT PASSED (the check is blind): $mut"; exit 1
   fi
@@ -199,8 +206,9 @@ done
   -o "$OUT/conv_block_host_check" \
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
   "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_moe_scratch.c" \
   "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
-  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
+  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/conv_block_host_check"
 
@@ -252,7 +260,7 @@ done
 # disjoint rows, in-bounds destinations, worker balance -- is what the
 # device DMAs. Bandwidth is measured on the device, never here.
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
-  -I "$HERE/.." \
+  -I "$HERE/.." -I "$DSP" \
   -o "$OUT/dma_probe_host_check" \
   "$HERE/dma_probe_host_check.c"
 
@@ -281,7 +289,7 @@ done
 # replays, inside the skel's parse rules and the VTCM bound, and the tag
 # sum the gtest expects, simulated and held against a byte-by-byte copy.
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
-  -I "$HERE/.." \
+  -I "$HERE/.." -I "$DSP" \
   -o "$OUT/replay_cells_host_check" \
   "$HERE/replay_cells_host_check.c"
 
@@ -293,7 +301,7 @@ done
 # device's DMA timing and interleaving are not modelled here.
 # (memalign is in the Hexagon libc's stdlib.h, in glibc's malloc.h.)
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." \
+  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/dma_replay_host_check" \
   "$HERE/dma_replay_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
@@ -308,7 +316,7 @@ done
 # distinct footprint, the tag for 1 / 20 / 500 calls; then the DDR bounds
 # (85.3 GB/s, #77's 3265.6 refused) and the net-per-token arithmetic.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." \
+  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." -I "$DSP" \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/two_reader_host_check" \
   "$HERE/two_reader_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
@@ -667,7 +675,7 @@ done
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/tl2_dn_dequant_check" "$HERE/tl2_dn_dequant_check.c" \
-  "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
+  "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" \
   -Wl,--gc-sections -lm
 "$OUT/tl2_dn_dequant_check"
 
@@ -740,7 +748,7 @@ done
 # checksums equal; a lone role times out instead of hanging (MAILBOX OK).
 # The DSP cache maintenance and the hop's cost are the device's (probe Q2).
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -o "$OUT/mailbox_host_check" "$HERE/mailbox_host_check.c"
+  -I "$DSP" -o "$OUT/mailbox_host_check" "$HERE/mailbox_host_check.c"
 
 "$OUT/mailbox_host_check"
 
@@ -812,12 +820,12 @@ done
 # over the real weight registry, the arena plain aligned memory. The header
 # qaic would generate is written from the IDL, so the entry points'
 # definitions are checked against the IDL too -- a mismatch fails here.
-python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
+python3 "$HERE/gen_nntr_hvx_h.py" "$DSP/nntr_hvx.idl" "$OUT/nntr_hvx.h"
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -include malloc.h \
-  -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/swap_host_check" \
-  "$HERE/swap_host_check.c" "$HERE/../nntr_hvx_mm_u8i4.c" \
+  "$HERE/swap_host_check.c" "$DSP/nntr_hvx_mm_u8i4.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$HERE/hvx_scalar_stubs.c" "$HERE/standin/hvx_scalar.c" -lm
 
@@ -827,14 +835,14 @@ if [ "$(uname -s)" = "Linux" ]; then
   "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -include malloc.h \
     -I "$OUT" -I "$BACKEND" -I "$HERE/stub" -I "$HERE/standin" \
-    -I "$HERE/.." -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
-    "$HERE/rpc_layer_check.c" "$HERE/../nntr_hvx_mm_u8i4.c" \
-    "$HERE/../nntr_hvx_mm_u8i8.c" "$BACKEND/hmx/hexkl_probe.c" \
+    -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    "$HERE/rpc_layer_check.c" "$DSP/nntr_hvx_mm_u8i4.c" \
+    "$DSP/nntr_hvx_mm_u8i8.c" "$BACKEND/hmx/hexkl_probe.c" \
     -Wl,--gc-sections -lm -o "$OUT/rpc_layer_check"
   "$OUT/rpc_layer_check"
 fi
 "$cc" -std=c99 -Wall -Wextra -Werror -I "$OUT" -I "$HERE/stub" \
-  -c "$HERE/../nntr_hvx_diagnostic_stubs.c" -o "$OUT/diagnostic_stubs.o"
+  -c "$DSP/nntr_hvx_diagnostic_stubs.c" -o "$OUT/diagnostic_stubs.o"
 
 # Source ownership and scratch reuse across distinct FastRPC input mappings.
 python3 "$HERE/lfm2_router_handoff_check.py" --repo "$HERE/../../.." \
@@ -846,7 +854,7 @@ python3 "$HERE/lfm2_router_handoff_check.py" --repo "$HERE/../../.." \
 if [ "$(uname -s)" = "Linux" ]; then
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -include malloc.h \
-    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." \
+    -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" \
     -I "$BACKEND" -I "$BACKEND/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     "$HERE/tl2_refresh_pair_check.c" -Wl,--gc-sections -lm \
     -o "$OUT/tl2_refresh_pair_check"

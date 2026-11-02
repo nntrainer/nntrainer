@@ -6,7 +6,7 @@
  */
 #ifndef __NNTRAINER_HTP_TL2_NATIVE_PACKING_H__
 #define __NNTRAINER_HTP_TL2_NATIVE_PACKING_H__
-#include "htp_backend/htp_tl2_opts.h"
+#include "htp_tl2_opts.h"
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -53,13 +53,13 @@ inline void prepareSymmetricTl2(uint8_t *packed, uint32_t K, uint32_t N,
   if (!native)
     return;
   native->assign(static_cast<size_t>(htp_tl2_native_bytes(K, N)), 0u);
-  const uint32_t blocks = (K + 23u) / 24u;
+  const uint32_t blocks = htp_tl2_blocks(K);
   for (uint32_t p = 0; p < (N + 127u) / 128u; ++p)
     for (uint32_t kb = 0; kb < blocks; ++kb) {
       uint8_t *dst =
         native->data() + (static_cast<size_t>(p) * blocks + kb) * 640u;
       for (uint32_t j = 0; j < 128u; ++j) {
-        const uint32_t n = p * 128u + (j % 4u) * 32u + j / 4u;
+        const uint32_t n = htp_tl2_column(p, j);
         for (uint32_t g = 0; g < 8u; ++g) {
           int value = 0;
           for (uint32_t t = 0; t < 3u; ++t) {
@@ -76,9 +76,7 @@ inline void prepareSymmetricTl2(uint8_t *packed, uint32_t K, uint32_t N,
             }
             value = value * 3 + w;
           }
-          const unsigned magnitude = value < 0 ? -value : value;
-          dst[(g / 2u) * 128u + j] |= magnitude << (4u * (g % 2u));
-          dst[512u + j] |= (value < 0) << g;
+          htp_tl2_store_group(dst, g, j, value);
         }
       }
     }

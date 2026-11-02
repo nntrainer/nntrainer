@@ -97,9 +97,10 @@ Where the HTP code lives:
 | Path | What |
 |---|---|
 | `nntrainer/tensor/htp_backend/` | ARM side of the backend (FastRPC session, op table, graph and token driver) and the DSP kernels under `hvx/` and `hmx/` |
-| `test/htp/` | the DSP skel sources (`nntr_hvx_*.c`), the IDL and `build.sh` that builds `libnntr_hvx_skel.so` |
+| `nntrainer/tensor/htp_backend/dsp/` | production DSP skel sources (`nntr_hvx_*.c`), the IDL and `build.sh` that builds `libnntr_hvx_skel.so` |
+| `test/htp/` | diagnostic RPC probes, device checks and benchmark scripts |
 | `test/htp/host/` | host checks that run on x86 without a phone |
-| `Applications/CausalLM/layers/htp_*` | attention, QKV and fused blocks of the HTP graph |
+| `nntrainer/layers/llm/` | attention and QKV implementations; `Applications/CausalLM/layers/htp_*` provides the app adapters |
 | `Applications/CausalLM/models/gemma4/gemma4_htp_*` | the fused Gemma4 model and its weight loader |
 | `Applications/CausalLM/res/gemma4/` | `htp_weight_converter.py` and the `htp_chat/` preset |
 | `Applications/CausalLM/api/` | the QuickDotAI C API the app uses (`htp_model_runtime.h` fixes the HTP runtime options) |
@@ -158,7 +159,8 @@ bash Applications/CausalLM/build_android.sh --htp --app
 ```
 
 What the script does, in order: generates the FastRPC stub from
-`test/htp/nntr_hvx.idl`, builds the DSP skel `test/htp/build/libnntr_hvx_skel.so`
+`nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl`, builds the DSP skel
+`nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so`
 with the Hexagon toolchain, cross-builds libnntrainer for arm64 with
 `-Denable-htp=true`, builds the CausalLM app graph (`nntr_causallm`,
 `quick_dot_ai_test`, `libcausallm.so`, `libquick_dot_ai_api.so`), stages the
@@ -172,7 +174,7 @@ Outputs:
 |---|---|
 | `nntr_causallm`, `quick_dot_ai_test`, `libcausallm.so`, `libquick_dot_ai_api.so` | `builddir_app/htp/` |
 | `libnntrainer.so`, `libccapi-nntrainer.so` | `builddir/android_build_result/lib/arm64-v8a/` |
-| `libnntr_hvx_skel.so` | `test/htp/build/` |
+| `libnntr_hvx_skel.so` | `nntrainer/tensor/htp_backend/dsp/build/` |
 | `libsdkl.so` | `$HEXKL_ROOT/lib/6.4.0.2/armv8_android26/` |
 | `QuickDotAI-debug.aar` | `Applications/CausalLM/Android/QuickDotAI/build/outputs/aar/` |
 | `SampleTestAPP-debug.apk` | `Applications/CausalLM/Android/SampleTestAPP/build/outputs/apk/debug/` |
@@ -287,7 +289,7 @@ adb shell mkdir -p $D
 for f in builddir_app/htp/nntr_causallm builddir_app/htp/libcausallm.so builddir_app/htp/libquick_dot_ai_api.so \
          builddir/android_build_result/lib/arm64-v8a/libnntrainer.so builddir/android_build_result/lib/arm64-v8a/libccapi-nntrainer.so \
          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so \
-         test/htp/build/libnntr_hvx_skel.so $HEXKL_ROOT/lib/6.4.0.2/armv8_android26/libsdkl.so; do adb push $f $D/; done
+         nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so $HEXKL_ROOT/lib/6.4.0.2/armv8_android26/libsdkl.so; do adb push $f $D/; done
 adb shell chmod 755 $D/nntr_causallm
 
 adb shell "cd $D && LD_LIBRARY_PATH=$D ADSP_LIBRARY_PATH=$D \
@@ -303,7 +305,8 @@ expert feed, the ARM's next-layer expert prediction with its read-ahead, and
 the prefill scratch released after the first token, and the expert pool grown
 to 34 experts a layer after the first token where the DSP's address space
 allows) is built into the library
-(`nntrainer/tensor/htp_fixed_opts.h`). Environment controls remain available:
+(`nntrainer/tensor/htp_backend/htp_fixed_opts.h`). Environment controls remain
+available:
 `NNTR_HTP_PAGE_CACHE` unset keeps the mmap loader; `0` selects direct I/O.
 The fixed-capacity measurement preset sets `moe_cache_experts=16` in the
 pack, `NNTR_MOE_CACHE_GROW=0` and `NNTR_MOE_PRELOAD_EXPERTS=128`.

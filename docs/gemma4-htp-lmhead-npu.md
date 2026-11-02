@@ -180,7 +180,7 @@ Lines to read on stderr:
 | `nntrainer/tensor/htp_backend/htp_compute_ops.cpp` | `bindLmHeadWh` (slices, arena, cache), `invokeLmHeadWh`, `SharedLmHead::wh`, `set_lm_head_wh_cache` |
 | `nntrainer/tensor/cpu_backend/compute_ops.h` | `set_lm_head_wh_cache` |
 | `Applications/CausalLM/models/gemma4/gemma4_htp_moe_causallm.cpp` | a QS4CX head accepted for the `LM_HEAD` op; the cache named beside the model |
-| `test/htp/nntr_hvx.idl`, `test/htp/nntr_hvx_mm_u8i4.c` | skel entry `lm_head_wh_f32` |
+| `nntrainer/tensor/htp_backend/dsp/nntr_hvx.idl`, `nntrainer/tensor/htp_backend/dsp/nntr_hvx_mm_u8i4.c` | skel entry `lm_head_wh_f32` |
 | `test/htp/host/graph_host_check.c` | the WH `LM_HEAD` case; wire v3 |
 | `docs/gemma4-htp-user-guide.md`, `docs/gemma4-htp-code-guide.md` | the keys and the path |
 

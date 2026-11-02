@@ -94,7 +94,9 @@ def main():
              "-c", str(out / f"{key}.c"), "-o", str(obj)], f"build-{key}")
         objects.append(obj)
     for source in (here / "lfm2_m1_setup_check.c", here / "standin/hvx_scalar.c",
-                   backend / "hmx/hexkl_dma_trace.c", backend / "hvx/hvx_expand_i2i4.c",
+                   backend / "hmx/hexkl_dma_trace.c", backend / "hmx/hexkl_moe_scratch.c",
+                   backend / "hvx/hvx_expand_i2i4.c",
+                   backend / "htp_tl2_codec.c",
                    backend / "hvx/hvx_gemv_u8tl2.c"):
         obj = out / (source.stem + ".o")
         definitions = []

@@ -82,38 +82,6 @@ static inline int moe_acc_read(uint8_t *base, uint32_t config_off,
  *         activation is a DMA source and the HVX passes read the rest. */
 #define MOE_SCRATCH_ALIGN 128u
 
-void hexkl_moe_scratch_free(hexkl_moe_scratch *s) {
-  if (s) {
-    htp_router_handoff_scratch_invalidate(&s->router_handoff);
-    s->router_act = NULL;
-    s->router_used = 0;
-    free(s->raw);
-    s->raw = NULL;
-    s->base = NULL;
-    s->cap = 0;
-  }
-}
-
-/** @brief Grows the scratch to @a bytes; a no-op once it is big enough,
- *         which after the first prefill call is every call. */
-int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {
-  htp_router_handoff_scratch_invalidate(&s->router_handoff);
-  s->router_act = NULL;
-  s->router_used = 0;
-  if (s->cap >= bytes) {
-    return AEE_SUCCESS;
-  }
-  hexkl_moe_scratch_free(s);
-  s->raw = malloc(bytes + MOE_SCRATCH_ALIGN);
-  if (!s->raw) {
-    return AEE_ENOMEMORY;
-  }
-  s->base = (uint8_t *)(((uintptr_t)s->raw + (MOE_SCRATCH_ALIGN - 1u)) &
-                        ~(uintptr_t)(MOE_SCRATCH_ALIGN - 1u));
-  s->cap = bytes;
-  return AEE_SUCCESS;
-}
-
 /** @brief Hands out the next @a bytes of the scratch, aligned. The caller
  *         summed the same sizes through moe_scratch_reserve first. */
 void *hexkl_moe_carve(uint8_t **cur, size_t bytes) {

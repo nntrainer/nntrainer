@@ -21,7 +21,7 @@
 #include <pthread.h>
 #include <stdio.h>
 
-#include "../nntr_hvx_mailbox.c"
+#include "nntr_hvx_mailbox.c"
 
 typedef struct {
   uint8_t *base;

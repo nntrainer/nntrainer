@@ -54,7 +54,7 @@ log "1/4  Building the DSP skel (test/htp/build.sh, HexKL $HEXKL_SDK_VER)"
   cd "$REPO_ROOT/test/htp"
   HEXKL_ROOT="$HEXKL_ROOT" HEXKL_SDK_VER="$HEXKL_SDK_VER" bash build.sh
 )
-SKEL="$REPO_ROOT/test/htp/build/libnntr_hvx_skel.so"
+SKEL="$REPO_ROOT/nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so"
 [ -f "$SKEL" ] || fail "skel did not build: $SKEL"
 # The ARM client stub comes from the same IDL and is generated separately.
 # Regenerated here every time rather than when the IDL "looks" changed: a

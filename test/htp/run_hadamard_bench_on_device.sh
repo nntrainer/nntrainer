@@ -8,12 +8,14 @@ case "$SERIAL" in
   *[Ll][Hh]) echo "Devices ending in LH are excluded." >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKEL="$HERE/../../nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so"
 REPS="${HADAMARD_REPS:-20}"
 if [[ ! "$REPS" =~ ^[1-9][0-9]*$ ]] || (( REPS > 200 )); then
   echo "HADAMARD_REPS must be 1..200" >&2
   exit 2
 fi
-for binary in libnntr_hvx_skel.so hadamard_check_device hadamard_hmx_check hadamard_moe_bench; do
+test -f "$SKEL"
+for binary in hadamard_check_device hadamard_hmx_check hadamard_moe_bench; do
   test -f "$HERE/build/$binary"
 done
 test "$(adb -s "$SERIAL" get-state)" = device
@@ -26,10 +28,10 @@ REMOTE="/data/local/tmp/nntr_hadamard_$(date -u +%Y%m%d_%H%M%S)"
   adb -s "$SERIAL" shell getprop ro.product.model
   adb -s "$SERIAL" shell getprop ro.soc.model
   adb -s "$SERIAL" shell getprop ro.build.fingerprint
-  sha256sum "$HERE/build/libnntr_hvx_skel.so" "$HERE/build/hadamard_moe_bench"
+  sha256sum "$SKEL" "$HERE/build/hadamard_moe_bench"
 } > "$OUT/manifest.txt"
 adb -s "$SERIAL" shell mkdir -p "$REMOTE"
-adb -s "$SERIAL" push "$HERE/build/libnntr_hvx_skel.so" \
+adb -s "$SERIAL" push "$SKEL" \
   "$HERE/build/hadamard_check_device" "$HERE/build/hadamard_hmx_check" \
   "$HERE/build/hadamard_moe_bench" "$REMOTE/"
 # The SDK's android_aarch64 libcdsprpc.so is a link-time stub. Run with

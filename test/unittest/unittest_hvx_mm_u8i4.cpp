@@ -3008,7 +3008,7 @@ TEST_F(HmxMmU8I4Layer, MoeLayerU8I2GemvMatchesI4Twin) {
    the engine rate is the compute tail plus the per-expert fork/joins. */
 TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
   const uint32_t K = 2048, I = 1792, N = 2048, NE = 4;
-  // test/htp/nntr_hvx_mm_u8i4.c's MOE_N_STAGES and the four slots read.
+  // DSP nntr_hvx_mm_u8i4.c's MOE_N_STAGES and the four slots read.
   const int kMoeStages = 31, kMm = 10, kLane = 2, kPath = 29, kFeed = 30,
             kReps = 20;
   MoeExperts x;

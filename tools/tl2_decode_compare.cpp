@@ -25,8 +25,8 @@
  * without optional RMSNorm/softcap, identically for both weight formats.
  */
 #include "htp_graph_desc.h"
+#include "htp_tl2_codec.h"
 #include "htp_wh_palette.h"
-#include "hvx_gemv_u8tl2.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

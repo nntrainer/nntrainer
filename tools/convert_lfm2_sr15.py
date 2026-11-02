@@ -416,8 +416,8 @@ def convert(source, encodings, output, tokenizer, rotation_mode="both"):
             work = Path(tmp); library = work/'tl2.so'
             root = Path(__file__).resolve().parents[1]
             subprocess.run(['cc', '-O3', '-shared', '-fPIC', '-I',
-                str(root/'nntrainer/tensor/htp_backend/hvx'),
-                str(root/'nntrainer/tensor/htp_backend/hvx/hvx_gemv_u8tl2.c'),
+                str(root/'nntrainer/tensor/htp_backend'),
+                str(root/'nntrainer/tensor/htp_backend/htp_tl2_codec.c'),
                 '-o', str(library)], check=True)
             tl2 = Tl2(library); metrics = []
             binary = work/'LFM2-24B-A2B-Ternary-INT4.bin'

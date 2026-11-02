@@ -22,7 +22,7 @@
 #include <string>
 
 // remote_handle64, CDSP_DOMAIN_ID, remote_session_control -- Hexagon SDK,
-// not the HexKL addon. nntr_hvx.h is generated from test/htp/nntr_hvx.idl by
+// not the HexKL addon. nntr_hvx.h is generated from dsp/nntr_hvx.idl by
 // this directory's meson.build (the same IDL the DSP skel is built from).
 #include <remote.h>
 

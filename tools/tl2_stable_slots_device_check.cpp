@@ -4,7 +4,7 @@
  * @author NNTrainer contributors
  * @bug Device validation is required for shared-memory cache maintenance.
  */
-#include "hvx_gemv_u8tl2.h"
+#include "htp_tl2_codec.h"
 #include <htp_rpcmem.h>
 #include <nntr_hvx.h>
 #include <remote.h>

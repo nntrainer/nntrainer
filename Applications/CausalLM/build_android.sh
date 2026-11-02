@@ -211,7 +211,7 @@ if [[ "$ENABLE_HTP" == true ]]; then
         exit 1
     fi
     bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
-    NNTR_HTP_DIAGNOSTICS="${NNTR_HTP_DIAGNOSTICS:-0}" bash "$NNTRAINER_ROOT/test/htp/build.sh"
+    NNTR_HTP_DIAGNOSTICS="${NNTR_HTP_DIAGNOSTICS:-0}" bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/dsp/build.sh"
     HTP_ENGINE_ARGS=(-Dhexagon-sdk-root="$HEXAGON_SDK_ROOT"
                      -Dhexkl-sdk-root="$HEXKL_ROOT"
                      -Dhexkl-lib-subdir="$HEXKL_LIB_SUBDIR")
@@ -537,7 +537,7 @@ QNN_SKEL_RELATIVE_PATHS=(
 
 if [[ "$ENABLE_HTP" == true ]]; then
     RUNTIME_LIBRARIES+=("$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so"
-                       "$NNTRAINER_ROOT/test/htp/build/libnntr_hvx_skel.so")
+                       "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so")
 fi
 
 if [[ "$ENABLE_QNN" == true ]]; then

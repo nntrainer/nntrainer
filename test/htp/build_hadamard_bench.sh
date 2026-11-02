@@ -6,20 +6,22 @@ set -eu
 : "${ANDROID_NDK:?set ANDROID_NDK}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="$HERE/../../nntrainer/tensor/htp_backend"
+DSP="$BACKEND/dsp"
+mkdir -p "$HERE/build"
 CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
 "$CLANG" -std=gnu11 -O2 -Wall -Wextra -Werror -DNNTR_HADAMARD_DEVICE \
-  -I "$HERE/generated" -I "$BACKEND/hvx" \
+  -I "$DSP/generated" -I "$BACKEND/hvx" \
   -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" \
   "$HERE/host/hadamard_check.c" "$BACKEND/hvx/hvx_hadamard_f32.c" \
-  "$HERE/generated/nntr_hvx_stub.c" \
+  "$DSP/generated/nntr_hvx_stub.c" \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
   -lcdsprpc -ldl -llog -lm -Wl,-z,max-page-size=16384 \
   -o "$HERE/build/hadamard_check_device"
-"$CLANG" -O2 -c "$HERE/generated/nntr_hvx_stub.c" \
-  -I "$HERE/generated" -I "$HEXAGON_SDK_ROOT/incs" \
+"$CLANG" -O2 -c "$DSP/generated/nntr_hvx_stub.c" \
+  -I "$DSP/generated" -I "$HEXAGON_SDK_ROOT/incs" \
   -I "$HEXAGON_SDK_ROOT/incs/stddef" -o "$HERE/build/hadamard_stub.o"
 "${CLANG}++" -std=c++17 -O2 -Wall -Wextra -Werror -static-libstdc++ \
-  -I "$HERE/generated" -I "$HEXAGON_SDK_ROOT/incs" \
+  -I "$DSP/generated" -I "$HEXAGON_SDK_ROOT/incs" \
   -I "$HEXAGON_SDK_ROOT/incs/stddef" \
   "$HERE/hadamard_moe_bench.cpp" "$HERE/build/hadamard_stub.o" \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
@@ -27,7 +29,7 @@ CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-andr
   -o "$HERE/build/hadamard_moe_bench"
 
 "$CLANG" -std=gnu11 -O2 -Wall -Wextra -Werror \
-  -I "$HERE/generated" -I "$HEXAGON_SDK_ROOT/incs" \
+  -I "$DSP/generated" -I "$HEXAGON_SDK_ROOT/incs" \
   -I "$HEXAGON_SDK_ROOT/incs/stddef" \
   "$HERE/hadamard_hmx_check.c" "$HERE/build/hadamard_stub.o" \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \

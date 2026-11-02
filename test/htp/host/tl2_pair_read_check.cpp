@@ -10,7 +10,7 @@
 #if defined(__linux__)
 #include "htp_expert_prefetch.h"
 #include "htp_expert_read_pool.h"
-#include "hvx_gemv_u8tl2.h"
+#include "htp_tl2_codec.h"
 #include "weight_file_reader.h"
 #include <array>
 #include <atomic>

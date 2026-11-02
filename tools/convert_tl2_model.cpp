@@ -4,9 +4,9 @@
  * @author Jungwon-Lee <jungone.lee@samsung.com>
  * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
  */
+#include "htp_backend/htp_tl2_native_packing.h"
 #include "htp_prepared_tl2.h"
-#include "htp_tl2_native_packing.h"
-#include "hvx_gemv_u8tl2.h"
+#include "htp_tl2_codec.h"
 #include <cmath>
 #include <iostream>
 #include <mutex>
