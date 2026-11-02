@@ -26,7 +26,7 @@ static long sysconf(int) { return 2; }
 
 static std::atomic<unsigned> destroyed{0};
 
-struct Fixture {
+struct WorkerPolicy {
   struct PrefetchKnobs {
     size_t readers = 2;
     std::vector<int> cpus{0};
@@ -37,18 +37,14 @@ struct Fixture {
   }
   static uint32_t cpuBit() { return 1; }
   static void pinToCpus(const std::vector<int> &) {}
-
-  std::mutex prefetch_mutex_;
-  std::condition_variable prefetch_cv_, entered_cv;
-  std::deque<int> prefetch_batches_, prefetch_jobs_;
-  bool prefetch_stop_ = false;
-  std::vector<std::thread> prefetch_readers_;
-  uint32_t prefetch_caller_cpus_ = 0;
+};
+#include <htp_prefill_readers.h>
+struct Fixture : nntrainer::HtpPrefillReaders<int, WorkerPolicy> {
+  std::condition_variable entered_cv;
   unsigned entered = 0;
-
-#include "releaseIdlePrefillReaders.inc"
-#include "startPrefetchReaders.inc"
-
+  void startPrefetchReaders() {
+    HtpPrefillReaders::startPrefetchReaders([this] { prefetchReaderLoop(); });
+  }
   void prefetchReaderLoop() {
     struct Scratch {
       ~Scratch() { ++destroyed; }
@@ -90,11 +86,11 @@ int main() {
     f.releaseIdlePrefillReaders();
     assert(f.prefetch_readers_.size() == 2 && destroyed == 2 * prompt);
     enable(true);
-    f.prefetch_batches_.push_back(1);
+    f.prefetch_batches_.push_back(std::make_unique<Fixture::PrefetchBatch>());
     f.releaseIdlePrefillReaders(); // A running batch cannot be cancelled.
     assert(f.prefetch_readers_.size() == 2 && !f.prefetch_stop_);
     f.prefetch_batches_.clear();
-    f.prefetch_jobs_.push_back(1);
+    f.prefetch_jobs_.emplace_back(nullptr, 0);
     f.releaseIdlePrefillReaders(); // Queued payloads cannot be abandoned.
     assert(f.prefetch_readers_.size() == 2 && !f.prefetch_stop_);
     f.prefetch_jobs_.clear();

@@ -26,6 +26,9 @@ trap 'rm -rf "$OUT"' EXIT
 cc=${CC:-gcc}
 "$cc" -std=c11 -Wall -Wextra -Werror -I "$BACKEND" \
   "$HERE/profile_wire_check.c" -o "$OUT/profile_wire_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I "$BACKEND" \
+  "$HERE/decode_runtime_check.cpp" -o "$OUT/decode_runtime_check"
+"$OUT/decode_runtime_check"
 "$OUT/profile_wire_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
   -I "$HERE/../../../Applications/CausalLM" \
@@ -42,6 +45,11 @@ cc=${CC:-gcc}
 "$OUT/hadamard_check"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
   "$HERE/weight_file_reader_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" -o "$OUT/weight_file_reader_check"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
+  -I "$BACKEND" -I "$BACKEND/.." -I "$BACKEND/../../utils" \
+  "$HERE/weight_registry_check.cpp" "$BACKEND/../../utils/weight_file_reader.cpp" \
+  -o "$OUT/weight_registry_check"
+"$OUT/weight_registry_check"
 "$OUT/weight_file_reader_check"
 # Native LFM2/Gemma4 pairs use the production direct reader and real queues.
 # The fixture explicitly skips its Linux-only I/O checks on other platforms.
