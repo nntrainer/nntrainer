@@ -24,6 +24,7 @@
 
 #include <acti_func.h>
 #include <fp16.h>
+#include <kv_cache_layout.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -466,20 +467,91 @@ void CpuComputeOps::kv_cache_write(const Tensor &k, const Tensor &v,
     throw std::invalid_argument(
       "CpuComputeOps::kv_cache_write: k and v must hold the same rows");
 
+  using DataType = ml::train::TensorDim::DataType;
+
+  // The step's rows as fp16 bits into @p dst ([rows, width], FP16 or
+  // UINT16): rotated by @p table when given, converted otherwise.
+  auto rows_as_fp16 = [&](const Tensor &in, Tensor &dst,
+                          const RotaryTable *table) {
+    const bool to_fp16 = in.getDataType() == DataType::FP32;
+    if (table != nullptr) {
+      rotary_embedding(in, dst, kv.head_dim, *table, pos, true);
+    } else if (to_fp16 && kv.head_dim % 2 == 0) {
+      rotary_embedding(in, dst, kv.head_dim, RotaryTable{}, pos, false);
+    } else if (to_fp16) {
+      // rotary_embedding pairs element i of a head with i + head_dim / 2, so
+      // it cannot convert odd-sized heads; convert element by element.
+      const float *src = in.getData<float>();
+      uint16_t *out = dst.getData<uint16_t>();
+      for (size_t i = 0; i < in.size(); ++i)
+        out[i] = compute_fp32_to_fp16(src[i]);
+    } else {
+      dst.copyData(in);
+    }
+  };
+
   auto write_plane = [&](const Tensor &in, Tensor *cache,
-                         const RotaryTable *table) {
+                         const RotaryTable *table, uint16_t *scale,
+                         bool k_plane) {
     if (cache == nullptr)
       return;
     const unsigned int width = cache->width();
-    if (in.width() != width || in.size() != (size_t)rows * width)
+    if (in.width() != width || in.size() != (size_t)rows * width ||
+        kv.head_dim == 0 || width % kv.head_dim != 0)
       throw std::invalid_argument(
-        "CpuComputeOps::kv_cache_write: a step row must be one cache row");
+        "CpuComputeOps::kv_cache_write: a step row must be one cache row of "
+        "whole heads");
     const unsigned int cap = kv.ring_cap ? kv.ring_cap : cache->height();
     const unsigned int row = kv.ring_cap ? pos % kv.ring_cap : pos;
     if (cap > cache->height() || row + rows > cap)
       throw std::invalid_argument(
         "CpuComputeOps::kv_cache_write: the rows do not fit the cache (past "
         "its last row, or across the ring seam)");
+    const unsigned int num_heads_kv = width / kv.head_dim;
+    const DataType cache_type = cache->getDataType();
+
+    if (cache_type == DataType::UINT8) {
+      // An int8 cache: the step as fp16 bits first (rotated for K), then
+      // each (row, head) quantized with its scale, as the layer did.
+      if (scale == nullptr)
+        throw std::invalid_argument(
+          "CpuComputeOps::kv_cache_write: an int8 cache needs its scale rows");
+      const uint16_t *bits = nullptr;
+      Tensor step16;
+      if (table != nullptr || in.getDataType() != DataType::FP16) {
+        TensorDim dim16 = in.getDim();
+        dim16.setDataType(in.getDataType() == DataType::FP16
+                            ? DataType::FP16
+                            : DataType::UINT16);
+        step16 = Tensor(dim16, true);
+        rows_as_fp16(in, step16, table);
+        bits = step16.getData<uint16_t>();
+      } else {
+        bits = in.getData<uint16_t>();
+      }
+      quantize_kv_fp16_to_int8_per_row(
+        bits,
+        reinterpret_cast<int8_t *>(cache->getData<uint8_t>()) +
+          (size_t)row * width,
+        scale + (size_t)row * num_heads_kv, rows, num_heads_kv, kv.head_dim);
+      return;
+    }
+
+    if (k_plane && kv.layout == KVCacheLayout::KOhwi) {
+      // The K plane as [num_heads_kv, height, head_dim]: the step as fp16
+      // bits in concat order first, then each head's rows at its own stride.
+      if (cache_type != DataType::FP16 && cache_type != DataType::UINT16)
+        throw std::invalid_argument(
+          "CpuComputeOps::kv_cache_write: a KOhwi key plane holds fp16 bits");
+      TensorDim dim16 = in.getDim();
+      dim16.setDataType(cache_type);
+      Tensor step16(dim16, true);
+      rows_as_fp16(in, step16, table);
+      scatter_k_concat_to_ohwi_fp16(
+        step16.getData<uint16_t>(), cache->getData<uint16_t>(), /*batch=*/0,
+        row, rows, num_heads_kv, kv.head_dim, cache->height());
+      return;
+    }
 
     TensorDim slice_dim = cache->getDim();
     slice_dim.batch(1);
@@ -487,27 +559,16 @@ void CpuComputeOps::kv_cache_write(const Tensor &k, const Tensor &v,
     slice_dim.height(rows);
     Tensor slice =
       cache->getSharedDataTensor(slice_dim, (size_t)row * width, true);
-    using DataType = ml::train::TensorDim::DataType;
     const bool to_fp16 = in.getDataType() == DataType::FP32 &&
                          (slice.getDataType() == DataType::FP16 ||
                           slice.getDataType() == DataType::UINT16);
-    if (table != nullptr) {
-      rotary_embedding(in, slice, kv.head_dim, *table, pos, true);
-    } else if (to_fp16 && kv.head_dim % 2 == 0) {
-      rotary_embedding(in, slice, kv.head_dim, RotaryTable{}, pos, false);
-    } else if (to_fp16) {
-      // rotary_embedding pairs element i of a head with i + head_dim / 2, so
-      // it cannot convert odd-sized heads; convert element by element.
-      const float *src = in.getData<float>();
-      uint16_t *dst = slice.getData<uint16_t>();
-      for (size_t i = 0; i < in.size(); ++i)
-        dst[i] = compute_fp32_to_fp16(src[i]);
-    } else {
+    if (table != nullptr || to_fp16)
+      rows_as_fp16(in, slice, table);
+    else
       slice.copyData(in);
-    }
   };
-  write_plane(k, kv.key, rope);
-  write_plane(v, kv.value, nullptr);
+  write_plane(k, kv.key, rope, kv.key_scale, /*k_plane=*/true);
+  write_plane(v, kv.value, nullptr, kv.value_scale, /*k_plane=*/false);
 }
 
 } // namespace nntrainer

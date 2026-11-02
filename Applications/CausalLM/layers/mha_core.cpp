@@ -191,85 +191,16 @@ inline float convert_scalar(uint16_t h) {
 }
 
 // =============================================================================
-// KV int8 helpers (paper section 3.7 path).
-// =============================================================================
-// Quantize a [step_size, num_heads, head_dim] fp16 source (laid out as
-// row-major with row stride num_heads * head_dim) into an int8 destination
-// plus a per-(token, head) fp16 scale tensor. Scale = amax / 127; with
-// dequant via `int8_value * scale`. Symmetric (no zero point) so the
-// matmul stays a simple int8 dot product plus a fp16 scale-out multiply.
-static inline void quantize_kv_fp16_to_int8_per_row(
-  const uint16_t *src_fp16, // [step_size, num_heads * head_dim]
-  int8_t *dst_int8,         // [step_size, num_heads * head_dim]
-  uint16_t *dst_scale_fp16, // [step_size, num_heads]
-  unsigned int step_size, unsigned int num_heads, unsigned int head_dim) {
-  for (unsigned int s = 0; s < step_size; ++s) {
-    for (unsigned int h = 0; h < num_heads; ++h) {
-      const uint16_t *row =
-        src_fp16 + (size_t)s * num_heads * head_dim + (size_t)h * head_dim;
-      float amax = 0.0f;
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        float v = std::fabs(nntrainer::compute_fp16_to_fp32(row[d]));
-        if (v > amax)
-          amax = v;
-      }
-      const float scale = amax / 127.0f;
-      const float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
-      dst_scale_fp16[s * num_heads + h] =
-        nntrainer::compute_fp32_to_fp16(scale);
-      int8_t *out =
-        dst_int8 + (size_t)s * num_heads * head_dim + (size_t)h * head_dim;
-      for (unsigned int d = 0; d < head_dim; ++d) {
-        int q = (int)std::round(nntrainer::compute_fp16_to_fp32(row[d]) * inv);
-        if (q < -127)
-          q = -127;
-        if (q > 127)
-          q = 127;
-        out[d] = (int8_t)q;
-      }
-    }
-  }
-}
-
-// =============================================================================
 // §3.8 KV OHWI Phase 1 — env-gated K-cache layout switch.
 // =============================================================================
 // Default K cache layout: [B, max_seq_len, num_heads_KV, head_dim] row-major
 // (concat over [t, h, d]). Paper §3.8 OHWI layout reinterprets the SAME buffer
 // as [B, num_heads_KV, max_seq_len, head_dim] (per-head contiguous), which is
 // the convolution-weight form that attention's QK matmul wants for 1×1-conv
-// kernel access. Phase 1 only flips the WRITE side. The READ side allocates
-// a fresh concat-layout scratch tensor and gathers, so all existing downstream
-// attention paths (the host arms behind ComputeOps::attention / GPU
-// two_conv_attention) keep working without modification.
-static inline bool is_kv_ohwi_enabled() {
-  static const bool on = std::getenv("NNTR_KV_OHWI") != nullptr;
-  return on;
-}
-
-// Scatter a step's K (concat layout [step_size, num_heads_kv * head_dim])
-// into the OHWI cache buffer at positions [cache_pos, cache_pos + step_size).
-// cache_base points to the start of element [0,0,0,0] of the cache (i.e. the
-// raw Tensor data pointer). The cache's total per-batch element count is
-// max_seq_len * num_heads_kv * head_dim.
-static inline void scatter_k_concat_to_ohwi_fp16(
-  const uint16_t *src,  // [step_size, num_heads_kv * head_dim]
-  uint16_t *cache_base, // raw cache buffer
-  unsigned int batch, unsigned int cache_pos, unsigned int step_size,
-  unsigned int num_heads_kv, unsigned int head_dim, unsigned int max_seq_len) {
-  const size_t HD = (size_t)num_heads_kv * head_dim;
-  const size_t per_head = (size_t)max_seq_len * head_dim;
-  const size_t batch_off = (size_t)batch * num_heads_kv * per_head;
-  for (unsigned int h = 0; h < num_heads_kv; ++h) {
-    uint16_t *dst_head = cache_base + batch_off + (size_t)h * per_head;
-    const uint16_t *src_head = src + (size_t)h * head_dim;
-    for (unsigned int t = 0; t < step_size; ++t) {
-      std::memcpy(dst_head + (size_t)(cache_pos + t) * head_dim,
-                  src_head + (size_t)t * HD,
-                  (size_t)head_dim * sizeof(uint16_t));
-    }
-  }
-}
+// kernel access. The layout is the layer's kv_layout, fixed in finalize(), and
+// the host write and read go through the ops with it (KVCacheView::layout).
+// The gather below stays for the OpenCL two_conv arm, which reads concat,
+// until that arm moves behind the op. The GPU paths follow kv_layout too.
 
 // Gather an OHWI K cache slice [0, cache_to) into concat layout
 // [cache_to, num_heads_kv * head_dim]. dst is a freshly-allocated buffer of
@@ -674,6 +605,29 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // head) FP16 scale captures the row's amax. Env-gated so the FP16
   // baseline stays default.
   kv_int8 = std::getenv("NNTR_KV_INT8") != nullptr;
+#ifndef ENABLE_FP16
+  NNTR_THROW_IF(kv_int8, std::invalid_argument)
+    << "NNTR_KV_INT8 requires ENABLE_FP16";
+#endif
+
+  // The K cache layout (§3.8 OHWI, NNTR_KV_OHWI): per-head rows on an fp16
+  // cache that is not int8. Fixed here, once, instead of re-derived from the
+  // environment and the step's dtype on every write, so a write and the read
+  // that follows agree (the former write condition also asked for an FP16
+  // step, which an FP32-activation x86 run never has, while the read did not).
+  // Not on a KV window ring: the read gather below copies cache_to rows with
+  // the linear per-head stride into a plane only min(cache_to, Wcap) rows
+  // tall, so a ringed layer keeps the concat cache.
+  {
+    const bool cache_fp16 = use_external_cache
+                              ? context.getInputDimensions()[3].getDataType() ==
+                                  ml::train::TensorDim::DataType::FP16
+                              : !kv_int8;
+    kv_layout = (std::getenv("NNTR_KV_OHWI") != nullptr && !kv_int8 &&
+                 cache_fp16 && kv_ring_cap == 0)
+                  ? nntrainer::KVCacheLayout::KOhwi
+                  : nntrainer::KVCacheLayout::Concat;
+  }
 
   /** Tensor for KV-Cache (only allocate internally when not using external
    * cache) */
@@ -1646,62 +1600,24 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     lower_kv();
   }
   if (kv_int8) {
-    // KV int8 path (paper section 3.7): Q RoPE in fp16 as usual, K RoPE
-    // in-place on the fp16 key_step buffer, then quantize key_step and
-    // value_step to int8 cache + per-(token, head) fp16 scale. V has no
-    // RoPE so it's a direct quantize.
-    if (use_rope) {
+    // KV int8 path (paper section 3.7): Q RoPE in fp16 as usual; K (rotated
+    // when RoPE is on) and V go through kv_cache_write, which quantizes each
+    // (row, head) into the int8 planes with its fp16 scale.
+    if (use_rope)
       apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                                  true);
-      apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
-                                 true);
-    }
-#ifdef ENABLE_FP16
-    // Slice the int8 cache + fp16 scale for this batch/step window.
-    const size_t scale_feature_len =
-      kv_int8_key_scale->getDim().getFeatureLen();
-    const size_t scale_step_width =
-      static_cast<size_t>(num_heads_KV); // per-token scale row width
-    const size_t scale_batch_offset = batch * scale_feature_len;
-    // [kv-window-ring] scale row ring-indexed in lockstep with the int8 cache.
-    const size_t scale_step_offset =
-      scale_batch_offset + cacheRow(cache_index) * scale_step_width;
-
-    const uint16_t *key_src =
-      reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>());
-    const uint16_t *val_src =
-      reinterpret_cast<const uint16_t *>(value_step.getData<_FP16>());
-
-    int8_t *key_dst =
-      reinterpret_cast<int8_t *>(b_cache_key_step.getData<uint8_t>());
-    int8_t *val_dst =
-      reinterpret_cast<int8_t *>(b_cache_value_step.getData<uint8_t>());
-    uint16_t *key_scale_dst =
-      reinterpret_cast<uint16_t *>(kv_int8_key_scale->getData<_FP16>()) +
-      scale_step_offset;
-    uint16_t *val_scale_dst =
-      reinterpret_cast<uint16_t *>(kv_int8_value_scale->getData<_FP16>()) +
-      scale_step_offset;
-
-    const unsigned int step_n = to - from;
-    quantize_kv_fp16_to_int8_per_row(key_src, key_dst, key_scale_dst, step_n,
-                                     num_heads_KV, head_dim);
-    quantize_kv_fp16_to_int8_per_row(val_src, val_dst, val_scale_dst, step_n,
-                                     num_heads_KV, head_dim);
+    write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                   cache_index, /*write_key=*/true, /*write_value=*/true,
+                   /*rotate_key=*/use_rope);
 
     // Stash per-batch scale base pointers (row 0 of this batch) for the
     // read path: the host arms get them through KVCacheView (attend).
+    const size_t scale_batch_offset =
+      batch * kv_int8_key_scale->getDim().getFeatureLen();
     cur_kv_int8_key_scale_batch =
-      reinterpret_cast<const uint16_t *>(kv_int8_key_scale->getData<_FP16>()) +
-      scale_batch_offset;
-    cur_kv_int8_value_scale_batch = reinterpret_cast<const uint16_t *>(
-                                      kv_int8_value_scale->getData<_FP16>()) +
-                                    scale_batch_offset;
-
-#else
-    NNTR_THROW_IF(true, std::invalid_argument)
-      << "NNTR_KV_INT8 requires ENABLE_FP16";
-#endif
+      kv_int8_key_scale->getData<uint16_t>() + scale_batch_offset;
+    cur_kv_int8_value_scale_batch =
+      kv_int8_value_scale->getData<uint16_t>() + scale_batch_offset;
   } else if (use_rope) {
     bool gpu_rope_done = false;
 #ifdef ENABLE_FP16
@@ -1717,7 +1633,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
     static const bool _mha_gpu_on = nntr_env_on("NNTR_MHA_GPU");
     const bool kv_ohwi_now =
-      is_kv_ohwi_enabled() && !kv_int8 &&
+      kv_layout == nntrainer::KVCacheLayout::KOhwi &&
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
     const unsigned int ROPE_MIN_PREFILL =
@@ -2042,7 +1958,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // --------------------- The concat GPU-RoPE branch above is gated
     // `!kv_ohwi_now`, but the live Adreno gemma4 decode path is the
     // IMAGE-attention path (NNTR_KV_IMG_ATTN), which is a SEPARATE env from
-    // NNTR_KV_OHWI: is_kv_ohwi_enabled()/kv_ohwi_now are FALSE there, so the
+    // NNTR_KV_OHWI: kv_ohwi_now is FALSE there, so the
     // concat branch is also skipped and gpu_rope_done stays false -> the host
     // RoPE fallback (the !gpu_rope_done branch) runs lower_q()+lower_kv() (two
     // BLOCKING
@@ -2451,30 +2367,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       }
 #endif
 
-      // append kcache with rotary embedding. §3.8 OHWI write path: when
-      // enabled and on the FP16 cache path, rotate K in-place on key_step then
-      // scatter per-head into the OHWI-laid-out cache buffer. Otherwise stick
-      // to the original concat write.
-      const bool kv_ohwi_active =
-        is_kv_ohwi_enabled() && !kv_int8 &&
-        key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-        cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
-      // Whether K still has to be written on the host, after the OHWI scatter
-      // or a device arm below.
+      // append kcache with rotary embedding. A KOhwi cache (§3.8 OHWI,
+      // kv_layout) is written by the host through the op, which rotates K and
+      // scatters it per head; the device arms below write a concat cache only.
+      // Whether K still has to be written on the host, after a device arm.
       bool k_on_host = false;
-      if (kv_ohwi_active) {
-#ifdef ENABLE_FP16
-        apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
-                                   true);
-        scatter_k_concat_to_ohwi_fp16(
-          reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>()),
-          reinterpret_cast<uint16_t *>(cache_key.getData<_FP16>()), batch,
-          cache_index, /*step_size*/ to - from, num_heads_KV, head_dim,
-          cache_key_dim.height());
-#else
-        NNTR_THROW_IF(true, std::invalid_argument)
-          << "NNTR_KV_OHWI requires ENABLE_FP16";
-#endif
+      if (kv_layout == nntrainer::KVCacheLayout::KOhwi) {
+        k_on_host = true;
       } else {
         // GPU RoPE for K straight into the (UVM) cache slice + GPU V copy:
         // keeps the whole KV-cache write off the host. Requires NNTR_CUDA_ROPE
@@ -2613,25 +2512,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   } else {
     // No-RoPE path: host scatters/copies read K/V on the host -- lower first.
     lower_kv();
-    const bool kv_ohwi_active =
-      is_kv_ohwi_enabled() && !kv_int8 &&
-      key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-      cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
-    if (kv_ohwi_active) {
-#ifdef ENABLE_FP16
-      scatter_k_concat_to_ohwi_fp16(
-        reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>()),
-        reinterpret_cast<uint16_t *>(cache_key.getData<_FP16>()), batch,
-        cache_index, /*step_size*/ to - from, num_heads_KV, head_dim,
-        cache_key_dim.height());
-#else
-      NNTR_THROW_IF(true, std::invalid_argument)
-        << "NNTR_KV_OHWI requires ENABLE_FP16";
-#endif
-    }
     write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
-                   cache_index,
-                   /*write_key=*/!kv_ohwi_active, /*write_value=*/true,
+                   cache_index, /*write_key=*/true, /*write_value=*/true,
                    /*rotate_key=*/false);
   }
 
@@ -2884,8 +2766,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   {
     const unsigned int FLASH_MIN_PREFILL =
       min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
-    static const bool _ohwi_gpu_on =
-      is_kv_ohwi_enabled() && !kv_int8 && nntr_env_on("NNTR_MHA_GPU");
+    static const bool _mha_gpu_env = nntr_env_on("NNTR_MHA_GPU");
+    const bool _ohwi_gpu_on =
+      kv_layout == nntrainer::KVCacheLayout::KOhwi && _mha_gpu_env;
     // NNTR_MHA_GPU_DECODE=1 also routes DECODE (step_size==1) through this
     // OHWI image-attention path. The decode CPU NEON path (compute_kcaches) is
     // the long-context bottleneck; the OHWI qk/sv image kernels + KV scatter
@@ -2976,31 +2859,23 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     }
   }
 
-  // §3.8 OHWI Phase 1 read path: when OHWI is on, the cache_key buffer is
-  // stored in [B, H_kv, S, D] order. Existing downstream readers (CPU
-  // host arms behind ComputeOps::attention / GPU two_conv_attention) expect
-  // the concat layout [B, 1, S, H_kv*D]. Gather into a fresh scratch tensor
-  // so no downstream code needs to change. The fresh tensor is non-SVM so
-  // the GPU prefill SVM check below will naturally fall through to CPU —
-  // intended in Phase 1; Phase 2's OHWI-direct path above handles the
-  // success case for the OHWI+MHA_GPU combo.
-  const bool kv_ohwi_read_active =
-    is_kv_ohwi_enabled() && !kv_int8 &&
-    cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
+  // §3.8 OHWI read path: a KOhwi cache_key holds [B, H_kv, S, D]. The op
+  // reads that layout itself (KVCacheView::layout), but the OpenCL two_conv
+  // arm below reads concat and takes a host copy, so until it moves behind
+  // the op the layer gathers into a fresh concat scratch here and hands that
+  // to every reader (the op then sees a Concat plane). The fresh tensor is
+  // non-SVM, so the GPU prefill SVM check below falls through to the CPU as
+  // before; the OHWI-direct path above handles OHWI+MHA_GPU.
+  const bool kv_ohwi_read_active = kv_layout == nntrainer::KVCacheLayout::KOhwi;
   nntrainer::Tensor b_cached_key;
   if (kv_ohwi_read_active) {
-#ifdef ENABLE_FP16
+    // fp16 bits either way: an FP16 cache, or UINT16 without ENABLE_FP16.
     ml::train::TensorDim per_batch_key_dim = cached_key_dim;
     per_batch_key_dim.batch(1);
     b_cached_key = nntrainer::Tensor(per_batch_key_dim, true);
     gather_k_ohwi_to_concat_fp16(
-      reinterpret_cast<const uint16_t *>(cache_key.getData<_FP16>()),
-      reinterpret_cast<uint16_t *>(b_cached_key.getData<_FP16>()), batch,
+      cache_key.getData<uint16_t>(), b_cached_key.getData<uint16_t>(), batch,
       cache_to, num_heads_KV, head_dim, cache_key_dim.height());
-#else
-    NNTR_THROW_IF(true, std::invalid_argument)
-      << "NNTR_KV_OHWI requires ENABLE_FP16";
-#endif
   } else {
     b_cached_key = cache_key.getSharedDataTensor(
       cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
@@ -4250,6 +4125,15 @@ void MHACoreLayer::write_kv_cache(unsigned int batch,
   }
   kv.head_dim = head_dim;
   kv.ring_cap = kv_ring_cap;
+  kv.layout = kv_layout;
+  if (kv_int8) {
+    // The int8 cache's fp16 scales, from row 0 of this batch's plane.
+    const size_t scale_batch_offset =
+      batch * kv_int8_key_scale->getDim().getFeatureLen();
+    kv.key_scale = kv_int8_key_scale->getData<uint16_t>() + scale_batch_offset;
+    kv.value_scale =
+      kv_int8_value_scale->getData<uint16_t>() + scale_batch_offset;
+  }
 
   nntrainer::RotaryTable rope;
   if (rotate_key && write_key)

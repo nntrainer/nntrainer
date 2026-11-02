@@ -33,6 +33,7 @@
 #include <cpu_ops_table.h>
 #include <env_compat.h>
 #include <fp16.h>
+#include <kv_cache_layout.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
 #include <thread_manager.h>
@@ -1624,6 +1625,26 @@ void CpuComputeOps::attention(const Tensor &q, const KVCacheView &kv,
   const unsigned int from = p.q_pos;
   const unsigned int to = p.kv_len;
 
+  // Both host arms read a concat K plane. A KOhwi plane is gathered into one
+  // first, rows [0, kv_len), as the layer did before every host read.
+  Tensor k_concat;
+  KVCacheView view = kv;
+  if (kv.layout == KVCacheLayout::KOhwi) {
+    if (!fp16_bits)
+      throw std::invalid_argument(
+        "CpuComputeOps::attention: a KOhwi key plane holds fp16 bits");
+    TensorDim dim = kv.key->getDim();
+    dim.batch(1);
+    dim.channel(1);
+    dim.height(to);
+    k_concat = Tensor(dim, true);
+    gather_k_ohwi_to_concat_fp16(kv.key->getData<uint16_t>(),
+                                 k_concat.getData<uint16_t>(), /*batch=*/0, to,
+                                 num_heads_kv, head_dim, kv.key->height());
+    view.key = &k_concat;
+    view.layout = KVCacheLayout::Concat;
+  }
+
   // The flash arm when the caller allows it (p.flash) and it applies: it
   // reads an fp16-bits or int8 cache and has no sink. It pays off from
   // flash_min_rows() rows; a decode step takes the platform's faster arm.
@@ -1641,7 +1662,7 @@ void CpuComputeOps::attention(const Tensor &q, const KVCacheView &kv,
                      kv_type == DataType::UINT8,
                      kv.key_scale,
                      kv.value_scale};
-    f.run(q, *kv.key, *kv.value, out, to, rows, from);
+    f.run(q, *view.key, *view.value, out, to, rows, from);
     return;
   }
 
@@ -1655,7 +1676,7 @@ void CpuComputeOps::attention(const Tensor &q, const KVCacheView &kv,
                          : (size_t)rows * to,
                 p.num_heads_q, q.getTensorType());
 
-  r.compute_kcaches(q, *kv.key, scores, from, rows, p.num_heads_q, gqa_size,
+  r.compute_kcaches(q, *view.key, scores, from, rows, p.num_heads_q, gqa_size,
                     head_dim);
   if (p.sink != nullptr)
     r.softmax_triangle(scores, rows, p.num_heads_q, from, *p.sink);

@@ -38,8 +38,10 @@
  *  - A sliding window is tested on causal cases only. With a non-causal
  *    input the per-row arm ignores the window and the flash arm applies it;
  *    the reference follows the per-row arm.
- *  - Batch 1, no KV window ring and no int8 KV cache, as on the host path
- *    models take today.
+ *  - Batch 1 and no KV window ring. The internal-cache mode (3 inputs), the
+ *    int8 KV cache (NNTR_KV_INT8, internal cache, FP16 activations) and the
+ *    K-OHWI layout (NNTR_KV_OHWI) have their cases, which set those
+ *    variables themselves around the layer's finalize.
  *  - The yarn and proportional tables follow the layer's formulas (yarn
  *    without HF's default truncation of the ramp bounds), so those two cases
  *    pin the layer rather than check it against Hugging Face.
@@ -100,6 +102,12 @@ struct MhaCase {
    * attention kernels); enable-fp16 builds only.
    */
   bool fp16_activations = false;
+  /** Internal-cache mode (3 inputs): the layer allocates its own KV cache. */
+  bool internal_cache = false;
+  /** NNTR_KV_INT8: the internal cache as int8 with fp16 scales. */
+  bool kv_int8 = false;
+  /** NNTR_KV_OHWI: the K cache as per-head rows (KVCacheLayout::KOhwi). */
+  bool kv_ohwi = false;
 
   MhaCase(std::string name_, unsigned int heads_q_, unsigned int heads_kv_,
           unsigned int head_dim_, std::vector<unsigned int> steps_) :
@@ -148,6 +156,19 @@ struct MhaCase {
     fp16_activations = true;
     return *this;
   }
+  MhaCase &internalCache() {
+    internal_cache = true;
+    return *this;
+  }
+  MhaCase &kvInt8() {
+    internal_cache = true;
+    kv_int8 = true;
+    return *this;
+  }
+  MhaCase &kvOhwi() {
+    kv_ohwi = true;
+    return *this;
+  }
 };
 
 std::ostream &operator<<(std::ostream &os, const MhaCase &c) {
@@ -159,7 +180,9 @@ constexpr float kPi = 3.14159265358979323846f;
 /**
  * Environment the layer reads to pick its attention arm or KV-cache layout.
  * mha_core latches most of them once per process, so a test cannot clear
- * them; it reports them and skips instead of testing a different arm.
+ * them; it reports them and skips instead of testing a different arm. The
+ * layer reads NNTR_KV_INT8 and NNTR_KV_OHWI per finalize, so a case that
+ * asks for them sets them itself.
  */
 const char *const kArmSelectingEnv[] = {
   "NNTR_MIN_PREFILL", "NNTR_MHA_GPU", "NNTR_MHA_GPU_DECODE", "NNTR_CUDA_ATTN",
@@ -197,6 +220,33 @@ private:
   bool had_ = false;
   std::string old_;
 };
+
+/**
+ * @brief Replace rows [first, first + rows * heads * D) of @p vals, already
+ *        fp16-rounded, with what an int8 KV cache holds for them: each
+ *        (row, head) quantized symmetrically to int8 with an fp16 scale of
+ *        amax / 127 (kv_cache_write) and read back as int8 * scale
+ *        (attention).
+ */
+void dequantizeInt8Rows(std::vector<float> &vals, size_t first,
+                        unsigned int rows, unsigned int heads, unsigned int D) {
+  for (unsigned int r = 0; r < rows; ++r) {
+    for (unsigned int h = 0; h < heads; ++h) {
+      float *x = vals.data() + first + ((size_t)r * heads + h) * D;
+      float amax = 0.0f;
+      for (unsigned int d = 0; d < D; ++d)
+        amax = std::max(amax, std::fabs(x[d]));
+      const float scale = nntrainer::compute_fp16_to_fp32(
+        nntrainer::compute_fp32_to_fp16(amax / 127.0f));
+      const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+      for (unsigned int d = 0; d < D; ++d) {
+        const int q = std::max(
+          -127, std::min(127, static_cast<int>(std::round(x[d] * inv))));
+        x[d] = q * scale;
+      }
+    }
+  }
+}
 
 /** @brief Round a value through fp16 storage, as the KV cache does. */
 float roundFp16(float v) {
@@ -405,8 +455,13 @@ class MhaCoreHostPath : public ::testing::TestWithParam<MhaCase> {};
  */
 TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   const MhaCase &c = GetParam();
+  // A case that asks for the int8 cache or the K-OHWI layout sets that
+  // variable itself below; any other arm-selecting variable set from outside
+  // is reported, not tested.
   for (const char *name : kArmSelectingEnv) {
-    if (std::getenv(name))
+    const bool own = (c.kv_int8 && std::string(name) == "NNTR_KV_INT8") ||
+                     (c.kv_ohwi && std::string(name) == "NNTR_KV_OHWI");
+    if (!own && std::getenv(name))
       GTEST_SKIP() << name << " is set; it changes which arm the layer runs";
   }
 #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||           \
@@ -421,7 +476,19 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
 #ifndef ENABLE_FP16
   if (c.fp16_activations)
     GTEST_SKIP() << "FP16 activations need an enable-fp16 build";
+  if (c.kv_int8)
+    GTEST_SKIP() << "the int8 KV cache keeps fp16 scales: enable-fp16 only";
+  // The internal cache is UINT16 here and takes the K-OHWI layout; an
+  // external cache placeholder is not FP16, so the layer keeps it concat.
+  if (c.kv_ohwi && !c.internal_cache)
+    GTEST_SKIP() << "an external cache takes K-OHWI only as FP16: "
+                    "enable-fp16 only";
 #endif
+  // The int8 arms read an FP16 query (the type an Android fp16 build runs).
+  ASSERT_TRUE(!c.kv_int8 || c.fp16_activations)
+    << "an int8 case feeds FP16 activations";
+  ScopedEnv int8_env("NNTR_KV_INT8", c.kv_int8 ? "1" : nullptr);
+  ScopedEnv ohwi_env("NNTR_KV_OHWI", c.kv_ohwi ? "1" : nullptr);
   // The flash arm reads the flash tile on every call, so the test owns it:
   // the case's tile, or unset for the layer's default. A 0 size would divide
   // by zero there.
@@ -472,11 +539,15 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
 #else
   const auto cache_dtype = nntrainer::TensorDim::DataType::UINT16;
 #endif
+  std::vector<nntrainer::TensorDim> in_dims = {dim4(plane, q_width, act),
+                                               dim4(plane, kv_width, act),
+                                               dim4(plane, kv_width, act)};
+  if (!c.internal_cache) {
+    in_dims.push_back(dim4(max_seq, kv_width, cache_dtype));
+    in_dims.push_back(dim4(max_seq, kv_width, cache_dtype));
+  }
   nntrainer::InitLayerContext init_context(
-    {dim4(plane, q_width, act), dim4(plane, kv_width, act),
-     dim4(plane, kv_width, act), dim4(max_seq, kv_width, cache_dtype),
-     dim4(max_seq, kv_width, cache_dtype)},
-    {true}, false, "mha_core", "", 0.0f,
+    in_dims, {true}, false, "mha_core", "", 0.0f,
     {"NCHW", "FP32", c.fp16_activations ? "FP16" : "FP32"}, 1.0f,
     ml::train::ExecutionMode::INFERENCE);
   ASSERT_NO_THROW(layer.finalize(init_context));
@@ -553,6 +624,11 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
       k_hist.push_back(roundFp16(x));
     for (float x : v)
       v_hist.push_back(roundFp16(x));
+    if (c.kv_int8) {
+      // The int8 cache holds each (row, head) quantized with its fp16 scale.
+      dequantizeInt8Rows(k_hist, k_hist.size() - k.size(), rows, c.heads_kv, D);
+      dequantizeInt8Rows(v_hist, v_hist.size() - v.size(), rows, c.heads_kv, D);
+    }
 
     layer.incremental_forwarding(run_context, from, from + rows, false);
 
@@ -565,10 +641,15 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     // so there every case is held to it; 8e-4 at most on a Galaxy S26.
     // Elsewhere a flash step that stores its softmax probabilities in fp16
     // (ARM, 32 rows or more) is held to 2e-3, every other step to 1e-4.
+    // An int8 case is held to 2e-2: the layer rotates K in fp16 and the
+    // reference in fp32, so a value near a quantization boundary can land on
+    // the neighbouring int8 step, which is up to amax / 127 (about 1e-2 for
+    // these inputs) on one K or V element.
 #if defined(ENABLE_FP16) && defined(__ANDROID__)
-    const float tolerance = 1e-2f;
+    const float tolerance = c.kv_int8 ? 2e-2f : 1e-2f;
 #else
-    const float tolerance = c.fp16_activations ? 1e-2f
+    const float tolerance = c.kv_int8 ? 2e-2f
+                            : c.fp16_activations ? 1e-2f
                             : flashStoresFp16Probs(c, rows) ? 2e-3f
                                                             : 1e-4f;
 #endif
@@ -648,7 +729,30 @@ INSTANTIATE_TEST_SUITE_P(
       .softcapAt(0.1f)
       .gemmArm()
       .flashTile(16, 16)
-      .fp16Activations()),
+      .fp16Activations(),
+    // Internal-cache mode (3 inputs): the layer allocates its own fp16 cache.
+    MhaCase("internal_cache_rowwise", 4, 2, 16, {5, 1, 1}).internalCache(),
+    // NNTR_KV_INT8 (internal cache): kv_cache_write quantizes the rotated K
+    // and V to int8 with fp16 scales, which the per-row and the flash arm
+    // read back; the 40-row prefill takes the flash arm on every
+    // architecture.
+    MhaCase("int8_rowwise", 4, 2, 16, {5, 1, 1}).kvInt8().fp16Activations(),
+    MhaCase("int8_gemm_long_prefill", 4, 2, 16, {40, 1, 1})
+      .kvInt8()
+      .gemmArm()
+      .flashTile(16, 16)
+      .fp16Activations(),
+    // NNTR_KV_OHWI: the K cache as per-head rows, written through
+    // kv_cache_write with and without RoPE and gathered back for the arms.
+    MhaCase("ohwi_rowwise", 4, 2, 16, {5, 1, 1}).kvOhwi(),
+    MhaCase("ohwi_no_rope_rowwise", 2, 2, 16, {5, 1, 1}).noRope().kvOhwi(),
+    MhaCase("ohwi_internal_cache_rowwise", 4, 2, 16, {5, 1, 1})
+      .internalCache()
+      .kvOhwi(),
+    MhaCase("ohwi_gemm_long_prefill", 4, 2, 16, {40, 1, 1})
+      .kvOhwi()
+      .gemmArm()
+      .flashTile(16, 16)),
   [](const ::testing::TestParamInfo<MhaCase> &info) {
     return info.param.name;
   });

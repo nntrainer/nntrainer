@@ -36,6 +36,7 @@
 
 #include <acti_func.h>
 #include <common_properties.h>
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
@@ -704,6 +705,10 @@ private:
    * int8) + per-(token, head) FP16 scales. Enabled by setting the
    * NNTR_KV_INT8 env var; default false keeps the FP16 cache layout. */
   bool kv_int8 = false;
+  /** The K cache layout (NNTR_KV_OHWI on an fp16 cache: per-head rows),
+   * fixed in finalize(); the host write and read go through the ops with it
+   * (KVCacheView::layout). */
+  nntrainer::KVCacheLayout kv_layout = nntrainer::KVCacheLayout::Concat;
 
   /** Scale tensors for the int8 KV cache; populated by the forwarding
    * entry points when kv_int8 is active. Lifespan is the layer's, so
@@ -715,8 +720,8 @@ private:
    * the host attention arms (ComputeOps::attention).
    * Single-batch dispatch is sequential, so racing the helpers (which
    * parallelize over heads) against these is safe. */
-  const uint16_t *cur_kv_int8_key_scale_batch = nullptr;
-  const uint16_t *cur_kv_int8_value_scale_batch = nullptr;
+  uint16_t *cur_kv_int8_key_scale_batch = nullptr;
+  uint16_t *cur_kv_int8_value_scale_batch = nullptr;
   unsigned int sink_idx;
 
   /** attention parameters */

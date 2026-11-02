@@ -67,11 +67,23 @@ struct RotaryTable {
 };
 
 /**
- * @brief One batch's KV cache, as the kv_cache_write() op sees it.
+ * @brief How a KV cache plane lays its rows out.
+ */
+enum class KVCacheLayout {
+  Concat, /**< [rows, num_heads_kv * head_dim]: row r at r * width */
+  KOhwi,  /**< the K plane as [num_heads_kv, rows, head_dim]: head h of row r
+               at (h * rows + r) * head_dim, rows being the plane's height
+               (MHACoreLayer's NNTR_KV_OHWI). The V plane stays Concat. */
+};
+
+/**
+ * @brief One batch's KV cache, as the kv_cache_write() and attention() ops
+ *        see it.
  *
- * key and value are the batch's whole cache planes, [1, 1, rows, width]. A
- * null plane is not written: its rows were written by the caller (a device
- * arm, or the OHWI scatter of K) until those writers move behind the op.
+ * key and value are the batch's whole cache planes, [1, 1, rows, width],
+ * holding fp16 bits (FP16 or UINT16), or int8 (UINT8) with an fp16 scale per
+ * (row, KV head). A null plane is not written: its rows were written by the
+ * caller (a device arm) until those writers move behind the op.
  */
 struct KVCacheView {
   Tensor *key = nullptr;   /**< K plane, or null */
@@ -80,10 +92,12 @@ struct KVCacheView {
   /** 0 for a linear cache; otherwise absolute row n is stored at row
    *  n % ring_cap and the cache holds ring_cap rows */
   unsigned int ring_cap = 0;
+  KVCacheLayout layout = KVCacheLayout::Concat; /**< of the K plane */
   /** int8 cache (UINT8 planes) only: fp16 bits of the scale of each
-   *  (row, KV head) of K / V, [rows, num_heads_kv] */
-  const uint16_t *key_scale = nullptr;
-  const uint16_t *value_scale = nullptr;
+   *  (row, KV head) of K / V, [rows, num_heads_kv]; kv_cache_write() writes
+   *  the rows it quantizes, attention() reads them */
+  uint16_t *key_scale = nullptr;
+  uint16_t *value_scale = nullptr;
 };
 
 /**
@@ -680,12 +694,15 @@ public:
    * cache row pos + h (pos + h modulo ring_cap on a ringed cache) of the
    * matching plane of @p kv. K is rotated there by row pos + h of @p rope
    * when @p rope is set, as rotary_embedding() does; V is not rotated. Both
-   * are converted to the cache's fp16 element. A null plane of @p kv is
+   * are converted to the cache's element: fp16 bits, or for an int8 (UINT8)
+   * plane int8 with an fp16 scale per (row, KV head), amax / 127, written to
+   * the same rows of @p kv's key_scale / value_scale. A KOhwi key plane
+   * takes each head's rows at its own stride. A null plane of @p kv is
    * skipped.
    *
    * @throws std::invalid_argument when the rows do not fit the cache (past
-   *         its last row, or across the ring seam), or for a dtype the
-   *         backend does not handle.
+   *         its last row, or across the ring seam), for a dtype the backend
+   *         does not handle, or for an int8 plane without its scales.
    */
   virtual void kv_cache_write(const Tensor &k, const Tensor &v,
                               const KVCacheView &kv, unsigned int pos,
@@ -698,8 +715,9 @@ public:
    * query head h reads KV head h / (num_heads_q / num_heads_kv). @p q holds
    * the step's rows, already rotated, [1, 1, rows, num_heads_q * head_dim];
    * row r is at absolute position q_pos + r. The keys are rows
-   * [0, kv_len) of @p kv's planes. A causal row sees the keys up to its own
-   * position, the last @c window of them; a non-causal row sees them all.
+   * [0, kv_len) of @p kv's planes, in either layout of @p kv. A causal row
+   * sees the keys up to its own position, the last @c window of them; a
+   * non-causal row sees them all.
    * A window shorter than kv_len with non-causal rows is not supported: the
    * CPU arm, moved from MHACoreLayer as it was, gives an unspecified result
    * there. A sink, num_heads_q values of @p q's dtype, adds exp(sink - max)

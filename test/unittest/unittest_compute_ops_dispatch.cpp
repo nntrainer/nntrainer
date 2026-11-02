@@ -1425,6 +1425,228 @@ TEST_F(ComputeOpsDispatchTest, AttentionRejectsShortCacheAndBadDtypes) {
 }
 
 /**
+ * @brief On a KOhwi key plane kv_cache_write puts each head's rotated rows at
+ *        that head's stride (head h, row r at (h * height + r) * head_dim),
+ *        leaves the other rows alone, and writes V concat as before.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteScattersAKOhwiKeyPlane) {
+  constexpr unsigned int R = 2, head_dim = 8, H = 2, W = H * head_dim, pos = 3,
+                         height = 6;
+  const RotaryRows rows(pos + R, head_dim);
+  nntrainer::Tensor k = stepRows(R, W, -1.0f), v = stepRows(R, W, 0.5f);
+  nntrainer::Tensor key = cachePlane(height, W), value = cachePlane(height, W);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+  kv.layout = nntrainer::KVCacheLayout::KOhwi;
+  k.getOps()->kv_cache_write(k, v, kv, pos, &rows.table);
+
+  for (unsigned int h = 0; h < H; ++h) {
+    for (unsigned int r = 0; r < height; ++r) {
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        const uint16_t kb =
+          key.getData<uint16_t>()[((size_t)h * height + r) * head_dim + d];
+        if (r < pos || r >= pos + R) {
+          EXPECT_EQ(kb, 0xABCD) << "head " << h << " row " << r;
+          continue;
+        }
+        EXPECT_NEAR(nntrainer::compute_fp16_to_fp32(kb),
+                    rotatedRef(k.getData<float>(), rows, W, head_dim, pos,
+                               r - pos, h * head_dim + d),
+                    2e-3f)
+          << "head " << h << " row " << r << " dim " << d;
+      }
+    }
+  }
+  for (unsigned int r = 0; r < height; ++r) {
+    for (unsigned int w = 0; w < W; ++w) {
+      const uint16_t vb = value.getData<uint16_t>()[r * W + w];
+      if (r < pos || r >= pos + R)
+        EXPECT_EQ(vb, 0xABCD) << "row " << r;
+      else
+        EXPECT_EQ(vb, nntrainer::compute_fp32_to_fp16(
+                        v.getData<float>()[(r - pos) * W + w]))
+          << "row " << r << " col " << w;
+    }
+  }
+}
+
+/**
+ * @brief attention reads a KOhwi key plane as it reads the concat one: the
+ *        same rows written in both layouts give the same output, bit for bit.
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionReadsAKOhwiKeyPlane) {
+  constexpr unsigned int R = 5, head_dim = 4, H = 2, W = H * head_dim,
+                         Hq = 2 * H, height = 8;
+  const RotaryRows rows(R, head_dim);
+  nntrainer::Tensor k = stepRows(R, W, -0.6f), v = stepRows(R, W, 0.3f);
+  nntrainer::Tensor key_c = cachePlane(height, W),
+                    value_c = cachePlane(height, W);
+  nntrainer::Tensor key_o = cachePlane(height, W),
+                    value_o = cachePlane(height, W);
+  nntrainer::KVCacheView concat, ohwi;
+  concat.key = &key_c;
+  concat.value = &value_c;
+  concat.head_dim = head_dim;
+  ohwi = concat;
+  ohwi.key = &key_o;
+  ohwi.value = &value_o;
+  ohwi.layout = nntrainer::KVCacheLayout::KOhwi;
+  k.getOps()->kv_cache_write(k, v, concat, 0, &rows.table);
+  k.getOps()->kv_cache_write(k, v, ohwi, 0, &rows.table);
+
+  nntrainer::Tensor q = stepRows(R, Hq * head_dim, 0.2f);
+  nntrainer::Tensor out_c(1, 1, R, Hq * head_dim),
+    out_o(1, 1, R, Hq * head_dim);
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = Hq;
+  p.q_pos = 0;
+  p.kv_len = R;
+  q.getOps()->attention(q, concat, out_c, p);
+  q.getOps()->attention(q, ohwi, out_o, p);
+  for (size_t i = 0; i < out_c.size(); ++i)
+    EXPECT_EQ(out_c.getData<float>()[i], out_o.getData<float>()[i])
+      << "element " << i;
+}
+
+/**
+ * @brief On an int8 (UINT8) cache kv_cache_write quantizes each (row, head)
+ *        of K and V symmetrically to int8 with the fp16 scale amax / 127 at
+ *        the same row of the scale planes, leaves the other rows and scales
+ *        alone, and refuses the write without scales.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteQuantizesAnInt8Cache) {
+  constexpr unsigned int R = 2, head_dim = 4, H = 2, W = H * head_dim, pos = 2,
+                         height = 5;
+  nntrainer::Tensor k = stepRows(R, W, -1.0f), v = stepRows(R, W, 0.5f);
+  const nntrainer::TensorDim u8(
+    {1, 1, height, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT8});
+  nntrainer::Tensor key(u8), value(u8);
+  std::fill_n(key.getData<uint8_t>(), height * W, 0x55);
+  std::fill_n(value.getData<uint8_t>(), height * W, 0x55);
+  std::vector<uint16_t> kscale(height * H, 0xABCD), vscale(height * H, 0xABCD);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+  kv.key_scale = kscale.data();
+  kv.value_scale = vscale.data();
+  k.getOps()->kv_cache_write(k, v, kv, pos, nullptr);
+
+  auto expectPlane = [&](const nntrainer::Tensor &plane,
+                         const std::vector<uint16_t> &scale,
+                         const nntrainer::Tensor &in, const char *name) {
+    for (unsigned int r = 0; r < height; ++r) {
+      for (unsigned int h = 0; h < H; ++h) {
+        const int8_t *row =
+          reinterpret_cast<const int8_t *>(plane.getData<uint8_t>()) + r * W +
+          h * head_dim;
+        if (r < pos || r >= pos + R) {
+          for (unsigned int d = 0; d < head_dim; ++d)
+            EXPECT_EQ(static_cast<uint8_t>(row[d]), 0x55)
+              << name << " row " << r;
+          EXPECT_EQ(scale[r * H + h], 0xABCD) << name << " row " << r;
+          continue;
+        }
+        float x[head_dim], amax = 0.0f;
+        for (unsigned int d = 0; d < head_dim; ++d) {
+          x[d] =
+            roundFp16(in.getData<float>()[(r - pos) * W + h * head_dim + d]);
+          amax = std::max(amax, std::fabs(x[d]));
+        }
+        EXPECT_EQ(scale[r * H + h],
+                  nntrainer::compute_fp32_to_fp16(amax / 127.0f))
+          << name << " row " << r << " head " << h;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (unsigned int d = 0; d < head_dim; ++d)
+          EXPECT_EQ(static_cast<int>(row[d]),
+                    std::max(-127, std::min(127, static_cast<int>(
+                                                   std::round(x[d] * inv)))))
+            << name << " row " << r << " head " << h << " dim " << d;
+      }
+    }
+  };
+  expectPlane(key, kscale, k, "key");
+  expectPlane(value, vscale, v, "value");
+
+  kv.key_scale = nullptr;
+  EXPECT_THROW(k.getOps()->kv_cache_write(k, v, kv, pos, nullptr),
+               std::invalid_argument);
+}
+
+#ifdef ENABLE_FP16
+/**
+ * @brief What kv_cache_write quantizes, attention reads back: an FP16 query
+ *        over the int8 cache the op wrote matches the per-row arm over an
+ *        fp16 cache holding the dequantized rows, within fp16. (The FP16 step
+ *        is written unrotated: the fp32-only table of RotaryRows is for FP32
+ *        steps, and the rotation is covered by the other write tests.)
+ */
+TEST_F(ComputeOpsDispatchTest, AttentionReadsWhatKvCacheWriteQuantized) {
+  constexpr unsigned int R = 4, head_dim = 4, H = 2, W = H * head_dim,
+                         Hq = 2 * H;
+  std::vector<float> kf(R * W), vf(R * W), qf(R * Hq * head_dim);
+  for (size_t i = 0; i < kf.size(); ++i) {
+    kf[i] = roundFp16(0.9f * std::sin(0.31f * i));
+    vf[i] = roundFp16(0.7f * std::cos(0.17f * i + 0.5f));
+  }
+  for (size_t i = 0; i < qf.size(); ++i)
+    qf[i] = roundFp16(0.5f * std::sin(0.23f * i + 1.0f));
+  nntrainer::Tensor k = makeTensor(R, W, nntrainer::Tdatatype::FP16, kf);
+  nntrainer::Tensor v = makeTensor(R, W, nntrainer::Tdatatype::FP16, vf);
+  nntrainer::Tensor q =
+    makeTensor(R, Hq * head_dim, nntrainer::Tdatatype::FP16, qf);
+
+  const nntrainer::TensorDim u8(
+    {1, 1, R, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT8});
+  nntrainer::Tensor key8(u8), value8(u8);
+  std::vector<uint16_t> kscale(R * H), vscale(R * H);
+  nntrainer::KVCacheView int8;
+  int8.key = &key8;
+  int8.value = &value8;
+  int8.head_dim = head_dim;
+  int8.key_scale = kscale.data();
+  int8.value_scale = vscale.data();
+  k.getOps()->kv_cache_write(k, v, int8, 0, nullptr);
+
+  // The dequantized rows, as an fp16 cache for the reference run.
+  std::vector<float> kd(R * W), vd(R * W);
+  for (unsigned int r = 0; r < R; ++r)
+    for (unsigned int h = 0; h < H; ++h)
+      for (unsigned int d = 0; d < head_dim; ++d) {
+        const size_t i = r * W + h * head_dim + d;
+        kd[i] = reinterpret_cast<const int8_t *>(key8.getData<uint8_t>())[i] *
+                nntrainer::compute_fp16_to_fp32(kscale[r * H + h]);
+        vd[i] = reinterpret_cast<const int8_t *>(value8.getData<uint8_t>())[i] *
+                nntrainer::compute_fp16_to_fp32(vscale[r * H + h]);
+      }
+  nntrainer::Tensor key16 = makeTensor(R, W, nntrainer::Tdatatype::FP16, kd);
+  nntrainer::Tensor value16 = makeTensor(R, W, nntrainer::Tdatatype::FP16, vd);
+  nntrainer::KVCacheView fp16;
+  fp16.key = &key16;
+  fp16.value = &value16;
+  fp16.head_dim = head_dim;
+
+  nntrainer::Tensor out8(
+    nntrainer::TensorDim({1, 1, R, Hq * head_dim, nntrainer::Tformat::NCHW,
+                          nntrainer::Tdatatype::FP16}));
+  nntrainer::Tensor out16(out8.getDim());
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = Hq;
+  p.q_pos = 0;
+  p.kv_len = R;
+  q.getOps()->attention(q, int8, out8, p);
+  q.getOps()->attention(q, fp16, out16, p);
+  for (size_t i = 0; i < out8.size(); ++i)
+    EXPECT_NEAR(nntrainer::compute_fp16_to_fp32(out8.getData<uint16_t>()[i]),
+                nntrainer::compute_fp16_to_fp32(out16.getData<uint16_t>()[i]),
+                1e-2f)
+      << "element " << i;
+}
+#endif
+
+/**
  * @brief An op the table does not implement reports it instead of computing
  *        something else. The mock overrides only part of the whole-op family,
  *        so the rest still hit the throwing defaults.
