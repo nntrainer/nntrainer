@@ -4,7 +4,7 @@
  *
  * @file   qkv_layer.h
  * @date   14 May 2020
- * @brief  Fused query/key/value projection layer
+ * @brief  Query/key/value projections with optional fused normalization.
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -24,7 +24,9 @@
 #endif
 
 #include <common_properties.h>
+#include <fused_llm_properties.h>
 #include <layer_impl.h>
+#include <memory>
 
 namespace nntrainer {
 
@@ -48,22 +50,81 @@ public:
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/** v_norm: a gamma-less per-head RMS norm on v (feature_size wide, the
+ *  same kernel as q and k without the multiply) */
+class VNorm : public nntrainer::Property<bool> {
+public:
+  VNorm(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_norm";
+};
+
+/** v_from_k: no v weight; v is the raw k projection, before k_norm (a
+ *  model whose attention has K == V). Needs feature_size. */
+class VFromK : public nntrainer::Property<bool> {
+public:
+  VFromK(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "v_from_k";
+};
+
+/** q_scale: multiplied into q after its norm (folded into the gamma
+ *  multiply), e.g. sqrt(head_dim) for a model whose attention scaling is
+ *  1.0 against a core that divides by sqrt(head_dim) */
+class QScale : public nntrainer::Property<float> {
+public:
+  QScale(float val = 1.0f) : nntrainer::Property<float>(val) {}
+  using prop_tag = nntrainer::float_prop_tag;
+  static constexpr const char *key = "q_scale";
+};
+
+/**
+ * @brief rope: RoPE on q and k after their norms, with rope_theta,
+ *        rope_scaling_type (default or proportional),
+ * rope_partial_rotary_factor and max_timestep (the table's rows) as the
+ * attention core takes them -- whose use_rope is then off. The head dim is
+ * feature_size. On the accelerator it rides the projection call; on the CPU it
+ * is the attention core's own kernel over the same table.
+ */
+class Rope : public nntrainer::Property<bool> {
+public:
+  Rope(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "rope";
+};
+
 } // namespace props
 
 /**
  * @class   QKVLayer
- * @brief   One layer holding the query, key and value projection weights, so a
- *          single dot() call produces all three outputs from one input read.
+ * @brief   The q, k and v projections of one attention block as ONE layer,
+ *          with the per-head RMS norm of q and k folded in when
+ *          feature_size is set.
+ *
+ * The three matmuls share one activation and accelerator call through
+ * Tensor::dot's vector overload; the CPU runs the same three GEMMs. With
+ * feature_size (the head dim), the layer holds, in the model file's
+ * order, q, q_norm's gamma, k, k_norm's gamma, v, and applies the same
+ * rms_norm_wrt_width + gamma multiply ReshapedRMSNormLayer would; the
+ * outputs are q_normed, k_normed, v. Without it: q, k, v as they are.
+ * v_norm adds the gamma-less norm on v, q_scale a factor on q after its
+ * norm, and v_from_k drops the v weight and takes v from the raw k
+ * projection -- the three things one model's attention does around the
+ * projections, folded in so one call still covers the block. in_norm
+ * folds the block's input RMSNorm in too (its gamma leads the weights).
+ * On an accelerator with gemm_q4_0_batch_norm_fp32 every norm here rides
+ * the projection call; on the CPU they are the same kernels in sequence.
  */
 WIN_EXPORT class QKVLayer : public nntrainer::LayerImpl {
 public:
   /**
-   * @brief     Constructor of QKV Layer
+   * @brief Constructor of QKVLayer.
    */
   WIN_EXPORT QKVLayer();
+  WIN_EXPORT explicit QKVLayer(bool fused_forwarding);
 
   /**
-   * @brief     Destructor of QKV Layer
+   * @brief Destructor of QKVLayer.
    */
   WIN_EXPORT ~QKVLayer() = default;
 
@@ -75,7 +136,7 @@ public:
 
   /**
    * @brief  Move assignment operator.
-   * @parma[in] rhs QKVLayer to be moved.
+   * @param[in] rhs QKVLayer to be moved.
    */
   WIN_EXPORT QKVLayer &operator=(QKVLayer &&rhs) = default;
 
@@ -137,10 +198,6 @@ public:
    */
   WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
-  /**
-   * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
-   * std::vector<TensorDim> input_dimensions)
-   */
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
@@ -148,8 +205,31 @@ public:
   inline static const std::string type = "qkv_layer";
 
 private:
-  std::tuple<props::QUnit, props::KUnit, props::VUnit> qkv_props;
-  std::array<unsigned int, 3> weight_idx; /**< indices of the weights */
+  bool fused_forwarding_ = false;
+  /** feature_size: the head dim q and k are normed over; unset = no norm */
+  std::tuple<props::QUnit, props::KUnit, props::VUnit, props::FeatureSize,
+             nntrainer::props::Epsilon, props::VNorm, props::VFromK,
+             props::QScale, props::InNorm, props::Rope, props::RopeTheta,
+             props::RopeScalingType, props::RopePartialRotaryFactor,
+             nntrainer::props::MaxTimestep, props::NormInCall, props::OutToHost>
+    qkv_props;
+  std::array<unsigned int, 6>
+    weight_idx; /**< [in_gamma,] q, [q_gamma,] k, [k_gamma,] v */
+  std::array<unsigned int, 4>
+    tensor_idx; /**< q, k (and v) before the norm; the normed input */
+  bool in_norm = false;
+  bool lazy_scratch = false; /**< Allocate HTP fallback scratch only on use */
+  bool norm_in_call = true;  /**< props::NormInCall */
+  bool out_to_host = true;   /**< props::OutToHost */
+  unsigned int feature_size = 0;
+  bool v_norm = false;
+  bool v_from_k = false;
+  float q_scale = 1.0f;
+  bool rope = false;
+  unsigned int rope_rows = 0; /**< positions the table holds */
+  /** [pos][cos row (feature_size, halves duplicated) | sin row], shared by
+   *  every layer of the same shape */
+  std::shared_ptr<const std::vector<float>> rope_table;
 };
 
 } // namespace nntrainer

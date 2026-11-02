@@ -12,7 +12,7 @@
  * @bug    No known bugs except for NYI items
  */
 
-#include <htp_act_quant.h>
+#include "htp_act_quant.h"
 
 #include <algorithm>
 #include <cmath>

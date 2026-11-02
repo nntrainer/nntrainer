@@ -94,14 +94,14 @@ flowchart TB
   R --> Y[block output]
 ```
 
-- `htp_qkv_layer.cpp` and `htp_mha_core.cpp` are the attention of the fused
-  graph. `HtpMHACoreLayer` keeps the KV cache mirrored on both sides, asks
-  `ComputeOps::sdpa_q_kvcache` to run the attention on the DSP, and falls
-  back to the CPU reference when the backend declines (the unit test
-  `HtpMhaCoreDispatch` pins that contract).
+- Core `qkv_layer.cpp` implements the fused projections. `HtpMHACoreLayer`
+  selects `MHACoreLayer`'s `Fp16Attention` implementation; its
+  `HtpAttentionState` owns DSP cache handles and calibration and dispatches
+  through `ComputeOps::sdpa_q_kvcache`. A declined call retains the CPU
+  fallback (`HtpMhaCoreDispatch` pins that contract).
 - `lfm2_moe_layer.cpp` is the routed MoE block shared with the LFM2 models:
   the router runs on the DSP (`router_logits_f32`), the selected experts are
-  served from the expert cache, and `lfm2_moe_pool_layer.cpp` / `expert_lru.h`
+  served from the expert cache, and `expert_lru.h`
   decide which experts stay resident (`moe_cache_experts`).
 - `nntrainer/layers/llm/` holds `lm_head`, `logit_softcapping` and the HTP
   tied-embedding head; the head is split so the DSP computes the argmax of
@@ -172,7 +172,7 @@ stale/torn records are rejected and older skeletons keep the fallback path.
 | `htp_dspq_wire.h` | the dspqueue message format shared with `nntr_hvx_dspq.c` |
 | `htp_moe_opts.h`, `htp_expert_prefetch.h`, `htp_router_predict.h` | MoE cache sizing, prefetch and prediction |
 | `htp_expert_read_pool.h`, `htp_token_completion.h` | demand-read worker ownership and optional token-completion hint |
-| `htp_prepared_fc.h`, `htp_prepared_qs2.h`, `htp_prepared_tl2.h` | prepared TL2 artifacts and shared endian/CRC/file helpers |
+| `htp_prepared_qs2.h`, `htp_prepared_tl2.h` | prepared TL2 artifacts and shared endian/CRC/file helpers |
 | `nntrainer/htp_context.cpp` | `htp_prepare_runtime` / `htp_release_runtime`, the process-wide handle the C API and the CLI share |
 
 The CPU op table (`cpu_backend/cpu_ops_table.h`) carries the counterparts the
@@ -279,8 +279,9 @@ If you are new to the code, read in this order:
    the model exposes.
 2. `Applications/CausalLM/models/gemma4/gemma4_htp_causallm.cpp`:
    `constructModel` and `createTransformerDecoderBlock`, to see the graph.
-3. `Applications/CausalLM/layers/htp_mha_core.cpp`: one HTP layer end to end,
-   including the CPU fallback.
+3. `nntrainer/layers/llm/fp16_attention.cpp` and
+   `nntrainer/tensor/htp_backend/htp_attention_state.cpp`: attention arithmetic,
+   CPU fallback and DSP cache ownership.
 4. `nntrainer/tensor/htp_backend/htp_compute_ops.cpp`: search for
    `graph_init` and `token_driver_start` to see the decode path, and for
    `weight_register` to see how weights reach the arena.

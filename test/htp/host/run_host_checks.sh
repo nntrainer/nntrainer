@@ -66,8 +66,11 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND/../../utils" \
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I "$BACKEND" -I "$BACKEND/.." \
   "$HERE/expert_prefetch_check.cpp" -o "$OUT/expert_prefetch_check"
 "$OUT/expert_prefetch_check"
-python3 "$HERE/prefill_reader_release_check.py" --repo "$HERE/../../.." \
-  --output "$OUT/prefill_reader_release" --cxx "${CXX:-g++}"
+"${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
+  -I "$BACKEND" -I "$BACKEND/../../utils" \
+  "$HERE/prefill_reader_release_check.cpp" -o "$OUT/prefill_reader_release_check"
+python3 -c 'import subprocess, sys; subprocess.run([sys.argv[1]], check=True, timeout=30)' \
+  "$OUT/prefill_reader_release_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -I"$BACKEND" \
   "$HERE/expert_read_pool_check.cpp" -o "$OUT/expert_read_pool_check"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror -I"$BACKEND" \
@@ -852,10 +855,10 @@ else
   echo "TL2 refresh pair: Linux ELF fixture skipped on this platform"
 fi
 
-# The q2 attention calibration's abs-max (abs_max.h): natively, and on the
+# Attention quantization helpers: natively, and on the
 # NEON path when an aarch64 g++ and qemu-aarch64 are installed (ABS MAX OK).
 ABS_SRCS="$HERE/abs_max_check.cpp $BACKEND/../../utils/fp16.cpp"
-ABS_INC="-I $BACKEND/../../../Applications/CausalLM/layers -I $BACKEND/../../utils -I $BACKEND/../.."
+ABS_INC="-I $BACKEND/.. -I $BACKEND/../../utils -I $BACKEND/../.."
 g++ -std=c++17 -O2 $ABS_INC -o "$OUT/abs_max_check" $ABS_SRCS
 "$OUT/abs_max_check"
 if command -v aarch64-linux-gnu-g++ >/dev/null && command -v qemu-aarch64 >/dev/null; then
