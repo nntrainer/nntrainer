@@ -217,4 +217,69 @@ class PowerRunnerTest {
         assertEquals(PowerPhase.DONE, h.state.phase)
         assertEquals(listOf("send lost", "send lost"), h.state.runs.map { it.skipped })
     }
+
+    // ----- benchmark mode (the Metrics tab): no battery, no cable, no baseline ------------------
+
+    private val bench = PowerSettings(PromptSource.Fixed(256), windowTokens = 64, repeats = 2, baselineSec = 0, cooldownSec = 0,
+        measurePower = false, thermalGate = false)
+
+    @Test fun benchModeIgnoresTheCableSkipsTheBaselineAndReportsSpeeds() = runTest {
+        val h = Harness(this, settings = bench)
+        h.plugged = true                                             // Power would wait for the unplug here
+        h.runner.start(meta)
+        // 2 runs × (500 ms to the first token + 63 × 50 ms): done well before Power's settle + baselines would end
+        advanceTimeBy(8_000); runCurrent()
+        assertEquals(PowerPhase.DONE, h.state.phase)
+        assertEquals(2, h.state.runs.size)
+        for (run in h.state.runs) {
+            assertNull(run.skipped)
+            assertEquals(500L, run.ttftMs)
+            assertEquals(64 / 3.15, run.tokensPerSec!!, 0.05)        // wall clock over the window
+            assertEquals(4000.0, run.enginePrefillTps!!, 1e-9)       // 1000 prompt tokens in 250 ms
+            assertEquals(20.0, run.engineDecodeTps!!, 1e-9)          // 50 ms per token
+            assertNull(run.mJPerToken)
+        }
+        val series = PowerSeries(h.state.runs)
+        assertEquals(2, series.speedRuns.size)
+        assertEquals(64 / 3.15, series.medianTokensPerSec!!, 0.05)
+        assertEquals(1, h.logs.size)
+        assertNull(h.chat.observer)
+    }
+
+    @Test fun benchModeDoesNotWaitForAHotPhoneUnlessAsked() = runTest {
+        val h = Harness(this, settings = bench.copy(repeats = 1))
+        h.status = 3
+        h.runner.start(meta)
+        advanceTimeBy(5_000); runCurrent()
+        assertNull(h.state.runs.single().skipped)
+
+        val g = Harness(this, settings = bench.copy(repeats = 1, thermalGate = true))
+        g.status = 3
+        g.runner.start(meta)
+        advanceTimeBy(PowerRunner.GATE_MAX_MS + 5_000); runCurrent()
+        assertEquals("hot", g.state.runs.single().skipped)
+    }
+
+    @Test fun engineSpeedsAreZeroSafe() = runTest {
+        val h = Harness(this, settings = bench.copy(repeats = 1))
+        h.chat.prefillMs = 0.0; h.chat.decodeSteadyMs = null        // LiteRT reports neither
+        h.runner.start(meta)
+        advanceTimeBy(5_000); runCurrent()
+        val run = h.state.runs.single()
+        assertNull(run.enginePrefillTps); assertNull(run.engineDecodeTps)
+        assertNotNull(run.tokensPerSec)
+    }
+
+    @Test fun aSecondSessionIsRefusedWhileAnotherHoldsTheChat() = runTest {
+        val h = Harness(this, settings = bench.copy(repeats = 1))
+        val other = PowerRunner(scope = backgroundScope, chat = h.chat, sampler = { PowerSample(h.now(), 0, 4000, 280, false, 0, Float.NaN, null, null, null) },
+            prompts = { "p" }, onSessionDone = { null }, now = h.now).also { it.setSettings(bench) }
+        h.runner.start(meta)
+        other.start(meta)
+        assertEquals("Another measurement is running", other.state.value.error)
+        assertEquals(PowerPhase.IDLE, other.state.value.phase)
+        advanceTimeBy(5_000); runCurrent()
+        assertEquals(PowerPhase.DONE, h.state.phase)
+        assertNull(h.chat.observer)
+    }
 }

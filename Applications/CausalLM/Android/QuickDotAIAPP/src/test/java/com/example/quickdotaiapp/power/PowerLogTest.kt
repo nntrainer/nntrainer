@@ -50,4 +50,16 @@ class PowerLogTest {
         assertEquals("htp-summary", PromptSource.HtpSummary.label())
         assertEquals("htp-summary", PowerLog.csvRow(log, run).split(",")[4])
     }
+
+    @Test fun benchCsvRowCarriesTheSpeeds() {
+        val b = run.copy(ttftMs = 1000, enginePrefillTps = 812.5, engineDecodeTps = 16.4)
+        val log = PowerSessionLog(meta, PowerSettings(measurePower = false), null, listOf(b))
+        val cols = PowerLog.benchCsvRow(log, b).split(',')
+        assertEquals(PowerLog.BENCH_CSV_HEADER.split(',').size, cols.size)
+        val byName = PowerLog.BENCH_CSV_HEADER.split(',').zip(cols).toMap()
+        assertEquals("1000", byName["ttft_ms"]); assertEquals("812.5", byName["prefill_tok_s_engine"])
+        assertEquals("20.40", byName["decode_tok_s_wall"]); assertEquals("16.40", byName["decode_tok_s_engine"])
+        assertEquals("1017", byName["prompt_tokens"]); assertEquals("", byName["skipped"])
+        assertTrue(PowerLog.benchCsv(log).startsWith(PowerLog.BENCH_CSV_HEADER + "\n"))
+    }
 }

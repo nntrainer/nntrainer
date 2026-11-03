@@ -42,6 +42,33 @@ object PowerMath {
     fun maxW(samples: List<PowerSample>, fromMs: Long, toMs: Long): Double? =
         within(samples, fromMs, toMs).maxOfOrNull { it.watts }
 
+    /** [run] with the speeds that need no gauge: TTFT from the marks, prefill and decode from the engine's own timings. */
+    fun withSpeeds(run: PowerRun, marks: RunMarks, prefillMs: Double?, decodeSteadyMs: Double?): PowerRun = run.copy(
+        ttftMs = marks.firstTokenMs?.let { it - marks.sendMs },
+        enginePrefillTps = marks.promptTokens?.let { n -> prefillMs?.takeIf { it > 0 }?.let { n * 1000.0 / it } },
+        engineDecodeTps = decodeSteadyMs?.takeIf { it > 0 }?.let { 1000.0 / it },
+    )
+
+    /** The benchmark's run: speeds and temperatures only; skipped only when no token came. */
+    fun evaluateBench(index: Int, marks: RunMarks, samples: List<PowerSample>, prefillMs: Double?, decodeSteadyMs: Double?): PowerRun {
+        val first = marks.firstTokenMs
+        val end = marks.windowEndMs ?: marks.doneMs
+        val tokens = minOf(marks.generatedTokens, marks.windowTokens)
+        val windowMs = if (first != null && end != null) end - first else 0L
+        val tps = if (tokens >= 1 && windowMs >= 1000) tokens / (windowMs / 1000.0) else null
+        val span = within(samples, marks.sendMs, end ?: marks.sendMs)
+        val thermalMax = span.maxOfOrNull { it.thermalStatus } ?: 0
+        val run = PowerRun(
+            index = index, marks = marks, skipped = if (first == null) "no tokens" else null,
+            baselineW = null, prefillW = null, decodeW = null, peakW = null, mJPerToken = null, runEnergyJ = null,
+            tokensPerSec = tps, batteryStartC = null, batteryEndC = null,
+            npuMaxC = span.mapNotNull { it.npuC }.maxOrNull(), cpuMaxC = span.mapNotNull { it.cpuC }.maxOrNull(),
+            gpuMaxC = span.mapNotNull { it.gpuC }.maxOrNull(),
+            thermalStatusMax = thermalMax, throttled = thermalMax >= THERMAL_MODERATE,
+        )
+        return withSpeeds(run, marks, prefillMs, decodeSteadyMs)
+    }
+
     fun evaluate(index: Int, marks: RunMarks, samples: List<PowerSample>): PowerRun {
         val first = marks.firstTokenMs
         val end = marks.windowEndMs ?: marks.doneMs

@@ -33,6 +33,10 @@ object PowerLog {
         "prefill_w,decode_w,baseline_w,peak_w,mj_per_token,run_energy_j,bat_c_start,bat_c_end," +
         "npu_c_max,cpu_c_max,gpu_c_max,thermal_status_max,throttled,skipped"
 
+    /** The Metrics tab's benchmark: speeds only, one row per run (bench.csv). */
+    const val BENCH_CSV_HEADER = "time,model_id,runtime,backend,prompt,prompt_tokens,window_tokens,gen_tokens,ttft_ms," +
+        "prefill_tok_s_engine,decode_tok_s_wall,decode_tok_s_engine,npu_c_max,thermal_status_max,throttled,skipped"
+
     private val json = Json { encodeDefaults = true; classDiscriminator = "type"; allowSpecialFloatingPointValues = true }
 
     private fun num(v: Double?, pattern: String): String = v?.let { String.format(Locale.US, pattern, it) } ?: ""
@@ -52,6 +56,21 @@ object PowerLog {
             run.skipped?.replace(',', ';')?.replace('\n', ' ') ?: "",
         ).joinToString(",")
     }
+
+    fun benchCsvRow(log: PowerSessionLog, run: PowerRun): String {
+        val m = run.marks
+        return listOf(
+            log.meta.startedAt, log.meta.modelId, log.meta.runtime, log.meta.backend, log.settings.prompt.label(),
+            m?.promptTokens?.toString() ?: "", m?.windowTokens?.toString() ?: "", m?.generatedTokens?.toString() ?: "",
+            run.ttftMs?.toString() ?: "",
+            num(run.enginePrefillTps, "%.1f"), num(run.tokensPerSec, "%.2f"), num(run.engineDecodeTps, "%.2f"),
+            num(run.npuMaxC, "%.1f"), run.thermalStatusMax.toString(), run.throttled.toString(),
+            run.skipped?.replace(',', ';')?.replace('\n', ' ') ?: "",
+        ).joinToString(",")
+    }
+
+    fun benchCsv(log: PowerSessionLog): String =
+        (listOf(BENCH_CSV_HEADER) + log.runs.map { benchCsvRow(log, it) }).joinToString("\n") + "\n"
 
     fun csv(log: PowerSessionLog): String =
         (listOf(CSV_HEADER) + log.runs.map { csvRow(log, it) }).joinToString("\n") + "\n"

@@ -453,6 +453,7 @@ class ChatController(
                 )).takeLast(20),
             )
         }
+        obs?.onEngineMetrics(metrics?.prefillDurationMs, metrics?.decodeSteadyMs)
         obs?.onDone(now(), generatedTokens, metrics?.prefillTokens, stopped, error)
     }
 

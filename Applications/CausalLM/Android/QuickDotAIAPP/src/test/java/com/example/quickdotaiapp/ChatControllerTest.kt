@@ -489,9 +489,11 @@ class ChatControllerTest {
             override fun onFirstToken(tMs: Long) { events += "first" }
             override fun onToken(count: Int, tMs: Long) { events += "tok$count" }
             override fun onDone(tMs: Long, tokens: Int, promptTokens: Int?, stopped: Boolean, error: String?) { events += "done:$tokens:$promptTokens:$stopped" }
+            override fun onEngineMetrics(prefillMs: Double?, decodeSteadyMs: Double?) { events += "engine:$prefillMs:$decodeSteadyMs" }
         }
+        engines.lastOrNull()?.metricsToReturn = engines.last().metricsToReturn.copy(decodeSteadyMs = 42.0)
         assertTrue(c.sendPrompt("measure me")); c.awaitIdle()
-        assertEquals(listOf("send", "first", "tok1", "tok2", "tok3", "done:3:10:false"), events)
+        assertEquals(listOf("send", "first", "tok1", "tok2", "tok3", "engine:100.0:42.0", "done:3:10:false"), events)
         assertEquals("power", c.state.value.runs.last().mode)
         assertEquals("measure me", c.state.value.turns.first { it.role == TurnRole.USER }.text)
     }

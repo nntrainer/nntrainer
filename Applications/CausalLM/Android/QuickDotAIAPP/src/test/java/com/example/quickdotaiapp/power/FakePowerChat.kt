@@ -20,6 +20,9 @@ class FakePowerChat(private val scope: CoroutineScope, private val now: () -> Lo
     var perTokenMs = 50L
     var promptTokens: Int? = 1000
     var error: String? = null
+    /** What the engine reports for the run (onEngineMetrics), as ChatController passes it. */
+    var prefillMs: Double? = 250.0
+    var decodeSteadyMs: Double? = 50.0
     /** True between the first token and done: the sampler reads it to draw more current. */
     @Volatile var generating = false
     var sends = 0
@@ -49,6 +52,7 @@ class FakePowerChat(private val scope: CoroutineScope, private val now: () -> Lo
                 if (produced < tokens && !cancelled) delay(perTokenMs)
             }
             generating = false
+            obs.onEngineMetrics(prefillMs, decodeSteadyMs)
             obs.onDone(now(), produced, promptTokens, cancelled, error)
         }
         return true

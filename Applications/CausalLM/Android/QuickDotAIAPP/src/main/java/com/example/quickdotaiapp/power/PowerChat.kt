@@ -13,6 +13,8 @@ interface GenerationObserver {
     fun onFirstToken(tMs: Long)
     fun onToken(count: Int, tMs: Long)
     fun onDone(tMs: Long, tokens: Int, promptTokens: Int?, stopped: Boolean, error: String?)
+    /** The engine's own timings for the run, right before onDone; null or 0 where the engine reports none (LiteRT). */
+    fun onEngineMetrics(prefillMs: Double?, decodeSteadyMs: Double?) {}
 }
 
 interface PowerChat {

@@ -52,6 +52,8 @@ class PowerRunner(
         var promptTokens: Int? = null
         var stopped = false
         var error: String? = null
+        var prefillMs: Double? = null
+        var decodeSteadyMs: Double? = null
         var cancelSent = false
         /** Set right before the runner's own sendPrompt; onSend is accepted only while this is true. */
         var awaitingSend = false
@@ -62,6 +64,8 @@ class PowerRunner(
 
     fun start(meta: SessionMeta) {
         if (session?.isActive == true) return
+        // One observer slot on the chat: the Power tab and the Metrics benchmark never run together.
+        if (chat.observer != null && chat.observer !== this) { _state.update { it.copy(error = "Another measurement is running") }; return }
         val settings = state.value.settings
         val prompt = prompts(settings.prompt)?.takeIf { it.isNotBlank() }
         if (prompt == null) {
@@ -127,8 +131,10 @@ class PowerRunner(
     // ----- the session ----------------------------------------------------------
 
     private suspend fun runSession(settings: PowerSettings, prompt: String) {
-        while (!settings.allowPlugged && latest()?.plugged != false) delay(samplePeriodMs)
-        delay(SETTLE_MS)
+        if (settings.measurePower) {
+            while (!settings.allowPlugged && latest()?.plugged != false) delay(samplePeriodMs)
+            delay(SETTLE_MS)
+        }
         val runs = mutableListOf<PowerRun>()
         for (i in 1..settings.repeats) {
             _state.update {
@@ -136,8 +142,8 @@ class PowerRunner(
                     liveDecodeW = null, liveTokens = 0, liveMs = 0)
             }
             val gateStart = now()
-            while (!cool() && now() - gateStart < GATE_MAX_MS) delay(GATE_POLL_MS)
-            if (!cool()) {
+            while (settings.thermalGate && !cool() && now() - gateStart < GATE_MAX_MS) delay(GATE_POLL_MS)
+            if (settings.thermalGate && !cool()) {
                 runs += skipped(i, "hot")
                 _state.update { it.copy(runs = runs.toList()) }
                 continue
@@ -146,11 +152,13 @@ class PowerRunner(
             chat.clearConversation()
             val rs = RunState(settings.windowTokens, now())
             synchronized(lock) { run = rs }
-            _state.update { it.copy(phase = PowerPhase.BASELINE) }
-            delay(settings.baselineSec * 1000L)
-            val baselineW = PowerMath.median(snapshot().filter { it.tMs > rs.baselineStartMs }.map { it.watts })
-            _state.update { it.copy(liveBaselineW = baselineW) }
-            if (!stillLoaded()) { endReason = whyNotLoaded(); return }
+            if (settings.measurePower) {
+                _state.update { it.copy(phase = PowerPhase.BASELINE) }
+                delay(settings.baselineSec * 1000L)
+                val baselineW = PowerMath.median(snapshot().filter { it.tMs > rs.baselineStartMs }.map { it.watts })
+                _state.update { it.copy(liveBaselineW = baselineW) }
+                if (!stillLoaded()) { endReason = whyNotLoaded(); return }
+            }
 
             synchronized(lock) { rs.awaitingSend = true }
             val sentAt = now()
@@ -166,7 +174,7 @@ class PowerRunner(
             var ended: String? = null
             var lost = false
             while (!rs.done.isCompleted) {
-                if (!settings.allowPlugged && latest()?.plugged == true) { replugged = true; chat.cancel(); break }
+                if (settings.measurePower && !settings.allowPlugged && latest()?.plugged == true) { replugged = true; chat.cancel(); break }
                 if (!stillLoaded()) { ended = whyNotLoaded(); chat.cancel(); break }
                 if (synchronized(lock) { rs.sendMs } == null && now() - sentAt >= SEND_TIMEOUT_MS) { lost = true; break }
                 delay(samplePeriodMs)
@@ -184,7 +192,9 @@ class PowerRunner(
                 windowEndMs = rs.windowEndMs, doneMs = rs.doneMs, windowTokens = settings.windowTokens,
                 generatedTokens = rs.generated, promptTokens = rs.promptTokens, stopped = rs.stopped,
             )
-            var result = PowerMath.evaluate(i, marks, snapshot())
+            var result = if (settings.measurePower)
+                PowerMath.withSpeeds(PowerMath.evaluate(i, marks, snapshot()), marks, rs.prefillMs, rs.decodeSteadyMs)
+            else PowerMath.evaluateBench(i, marks, snapshot(), rs.prefillMs, rs.decodeSteadyMs)
             when {
                 replugged -> result = result.copy(skipped = "plugged")
                 ended != null -> result = result.copy(skipped = if (chat.isLoaded) "model changed" else "model unloaded")
@@ -196,7 +206,7 @@ class PowerRunner(
             _state.update { it.copy(runs = runs.toList(), livePrefillW = result.prefillW, liveDecodeW = result.decodeW) }
             if (replugged) return
             if (ended != null) { endReason = ended; return }
-            if (i < settings.repeats) {
+            if (i < settings.repeats && settings.cooldownSec > 0) {
                 _state.update { it.copy(phase = PowerPhase.COOLDOWN) }
                 delay(settings.cooldownSec * 1000L)
             }
@@ -210,7 +220,7 @@ class PowerRunner(
     private fun finish() {
         val inFlight = synchronized(lock) { run.also { run = null } }
         if (inFlight != null && !inFlight.done.isCompleted) chat.cancel()
-        chat.observer = null
+        if (chat.observer === this) chat.observer = null
         sampling?.cancel()
         val runs = state.value.runs
         val m = meta
@@ -260,6 +270,15 @@ class PowerRunner(
             _state.update { it.copy(phase = PowerPhase.TAIL, liveTokens = count, liveMs = tMs - (first ?: tMs)) }
         } else {
             _state.update { it.copy(liveTokens = count, liveMs = tMs - (first ?: tMs)) }
+        }
+    }
+
+    override fun onEngineMetrics(prefillMs: Double?, decodeSteadyMs: Double?) {
+        synchronized(lock) {
+            val rs = run ?: return
+            if (rs.sendMs == null) return
+            rs.prefillMs = prefillMs
+            rs.decodeSteadyMs = decodeSteadyMs
         }
     }
 

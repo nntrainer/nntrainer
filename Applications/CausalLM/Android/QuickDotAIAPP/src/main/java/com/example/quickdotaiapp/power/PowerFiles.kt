@@ -32,5 +32,13 @@ class PowerFiles(private val context: Context) {
         json.path
     }.getOrNull()
 
+    /** Appends one bench.csv row per benchmark run; the CSV path, or null when it could not be written. */
+    fun writeBench(log: PowerSessionLog): String? = runCatching {
+        val csv = File(dir.apply { mkdirs() }, "bench.csv")
+        val header = if (!csv.exists() || csv.length() == 0L) PowerLog.BENCH_CSV_HEADER + "\n" else ""
+        csv.appendText(header + log.runs.joinToString("") { PowerLog.benchCsvRow(log, it) + "\n" })
+        csv.path
+    }.getOrNull()
+
     private fun safe(s: String) = s.replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
