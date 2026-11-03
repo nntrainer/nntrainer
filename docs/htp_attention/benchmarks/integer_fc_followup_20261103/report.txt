@@ -1,0 +1,87 @@
+### Integer FC follow-up: waits and direct AH output (2026-11-03)
+
+Implemented in the same worktree, relative to the final integer kernel from
+2026-11-02, not the original PR's FP32-output API:
+
+- Each worker publishes one overflow summary; the caller retires each completed
+  batch once. Removed whole-job-array initialization and repeated scans of both
+  staging banks. Overflow remains an error, including the last partial batch.
+- Weight handles have descriptor-level readiness. HMX can start on the first
+  ready handle without waiting for the whole panel; later panels stay queued.
+  A partial-batch readout fence protects weight-buffer reuse.
+- `hexkl_mm_u16i4_layer_run_i32_ah` accepts packed input and/or emits directly
+  packed requantized output. INT32 output is retained. AH output concatenates
+  handle channels into a single logical tensor, with padded rows initialized.
+  The consumer DMA-loads the two planes by row band and does no HVX packing.
+- Packed epilogues keep four rows' intermediate vectors in registers. Explicit
+  loop unrolling removed the array spills found in the first device build.
+
+The packed buffer is external DDR, 128-byte aligned, with checked capacity and
+non-overlap requirements. The image is low plane followed by high plane, each
+`ceil(M/64)*64*width` bytes. Its per-plane offset for logical `(r,c)` is
+`(r/64)*64*width + (c/32)*2048 + (r%64)*32 + c%32`. Input width is K; output width
+is the sum of handle widths. The next FC needs one common output encoding and
+its matching zero-point. Per-channel requant multipliers remain supported.
+This is an explicit opt-in API, not VTCM-resident handoff or model/FastRPC wiring.
+
+**Matched single-FC comparison.** S26 Ultra v81, three alternating processes
+per build and shape, six samples per process, three timed calls per sample.
+Two warmup rounds; same offline WH weights and input codes; both INT32 and
+UINT16 outputs retained. Offline weight packing/registration and FastRPC are
+excluded; DMA, activation preparation and final completion are included.
+These are medians with profiling disabled; the baseline binary is the saved
+2026-11-02 final integer kernel.
+
+| M x K x N | Before FC+requant (us) | After FC+requant (us) | Reduction |
+|---|---:|---:|---:|
+| 128 x 2816 x 4096 | 181.293 | 172.231 | 5.0% |
+| 512 x 2816 x 4096 | 709.540 | 677.239 | 4.6% |
+| 768 x 2816 x 4096 | 997.092 | 955.096 | 4.2% |
+| 128 x 4096 x 4096 | 269.453 | 263.038 | 2.4% |
+| 512 x 4096 x 4096 | 942.265 | 903.507 | 4.1% |
+| 67 x 4160 x 256 | 30.425 | 29.835 | 1.9% |
+
+**Two-FC chain.** The producer has the shape shown below; the consumer is
+`M x N x 256`. The row baseline uses the original concatenated handle outputs,
+a parallel HVX join into an M x N tensor, and the consumer's normal packing.
+The packed path writes global-channel AH tiles directly and DMA-loads them in
+the consumer. Timings include both FCs and intermediate layout work. Therefore
+the gain includes eliminating the handle join as well as the consumer packing;
+it is not an isolated packing speedup. The after-row column separates the
+single-FC improvements from the layout change. Common requant `{3,8,30000}`
+is timed; per-channel parameters and shifts 0..62 are correctness-tested.
+
+| Producer M x K x N | Before row chain (us) | After row chain (us) | After packed chain (us) | Reduction vs before |
+|---|---:|---:|---:|---:|
+| 128 x 2816 x 4096 | 319.800 | 318.741 | 221.423 | 30.8% |
+| 512 x 2816 x 4096 | 1166.276 | 1127.657 | 833.064 | 28.6% |
+| 768 x 2816 x 4096 | 1668.559 | 1615.070 | 1168.976 | 29.9% |
+| 128 x 4096 x 4096 | 409.809 | 407.083 | 320.486 | 21.8% |
+| 512 x 4096 x 4096 | 1395.860 | 1362.370 | 1049.939 | 24.8% |
+| 67 x 4160 x 256 | 43.212 | 42.873 | 42.570 | 1.5% |
+
+At 512 x 2816 x 4096, the new row chain is 1127.657 us and the packed chain
+833.064 us: the layout change alone cuts 26.1%, while the full change versus
+yesterday's 1166.276 us row chain cuts 28.6%. Small single-handle shapes have
+much less to save. Direct AH output itself is not free; compare the whole chain.
+
+All 36 single-FC and 36 chain comparison processes passed. Complete consumer
+INT32 hashes match before/after in all six shapes. Candidate runs additionally
+compare every producer and consumer INT32 result, all requantized UINT16 codes,
+padding and common/per-channel cases. Guarded single-tile output, M tails,
+K=4096/4160/8192/32768, cancellation, genuine overflow and last-row/last-column
+failure in a final partial batch passed on device. Integer host checks including
+multi-handle packed input/output and rejection-without-write passed under
+ASan/UBSan; legacy FC host checks passed. DSP v79/v81 builds and clang-format 14
+passed; the build output was restored to the measured v81 skel after v79 validation.
+
+Remaining costs include HMX readout, first input/weight transfers, worker work
+and final completion. DMA wait reduction can expose packing waits elsewhere:
+the profile counters must not be interpreted as independent savings. No claim
+of fully hidden non-HMX work or whole-model end-to-end speedup is made.
+
+Artifacts: [single-FC medians](benchmarks/integer_fc_followup_20261103/fc-comparison/medians.csv),
+[two-FC medians](benchmarks/integer_fc_followup_20261103/chain-comparison/medians.csv),
+[chain components](benchmarks/integer_fc_followup_20261103/chain-comparison/components.csv),
+[source hashes](benchmarks/integer_fc_followup_20261103/source.sha256),
+and the raw comparison/build/validation logs alongside them.

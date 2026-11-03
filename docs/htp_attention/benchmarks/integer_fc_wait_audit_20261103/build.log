@@ -1,0 +1,8 @@
+UNDEFINED SYMBOLS OK (68 runtime imports)
+ARCH OK (V81)
+built: /tmp/nntr-w4a16-waits-20261103/source/test/htp/build/libnntr_hvx_skel.so (v81, hexkl 6.4.0.2)
+NOTE: this is the DSP skel only. If nntr_hvx.idl changed, the ARM client
+      stub needs regenerating too, or the build fails on the new symbols
+      (or worse, an old client meets this skel and the call returns
+      EBADPARM):
+        bash /tmp/nntr-w4a16-waits-20261103/source/nntrainer/tensor/htp_backend/generate_stub.sh

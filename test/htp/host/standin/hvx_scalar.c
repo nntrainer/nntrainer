@@ -69,6 +69,15 @@ int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
   return 0;
 }
 
+void hexkl_fc_acc_read_planes32(uint8_t *base, uint32_t off) {
+  uint8_t *d = base + off;
+  for (uint32_t p = 0; p < 2048u; ++p) {
+    const uint32_t v = (uint32_t)g_acc[p / 32u][p % 32u];
+    for (uint32_t b = 0; b < 4u; ++b)
+      d[b * 2048u + p] = (uint8_t)(v >> (8u * b));
+  }
+}
+
 /** The FC's byte-plane readout (hexkl_mm_u8i4_dma.c acc_read_planes24):
     bytes 0, 1, 2 of each element, element p = row p / 32, column p % 32,
     one 2 KiB plane each -- what the three device converts write. */
@@ -375,6 +384,37 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
                (size_t)(m % 64u) * 32u + j] = (uint8_t)q;
       }
   }
+  return 0;
+}
+
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi) {
+  for (uint32_t m = group * 4u; m < (group + 1u) * 4u; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      const size_t d = (size_t)(m / 64u) * 64u * k + (size_t)(c / 32u) * 2048u +
+                       (m % 64u) * 32u + c % 32u;
+      const uint16_t q = m < m_valid ? x[(size_t)m * k + c] : 0;
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
+}
+
+/* Independent scalar stand-in for the byte-only pack. */
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !lo || !hi || !m_valid || !k || k % 64u || m_pad < m_valid ||
+      m_pad % 64u || (size_t)m_pad > SIZE_MAX / sizeof(uint16_t) / k)
+    return 14;
+  for (uint32_t m = 0; m < m_pad; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      size_t d = (size_t)(m / 64u) * 64u * k + (size_t)(c / 32u) * 2048u +
+                 (m % 64u) * 32u + c % 32u;
+      uint16_t q = m < m_valid ? x[(size_t)m * k + c] : 0;
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
   return 0;
 }
 

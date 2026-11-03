@@ -1,0 +1,4 @@
+72/72 final comparison device processes passed; complete INT32 hashes match before/after.
+Producer and consumer outputs, packed codes/padding, per-channel shifts, large K, overflow and late partial-batch failure checked.
+Integer host ASan/UBSan and legacy FC host checks passed. v79/v81 DSP builds passed. clang-format 14.0.6 used.
+Current test/htp/build/libnntr_hvx_skel.so SHA256 equals final measured v81 binary.

@@ -1,0 +1,3 @@
+18/18 device processes passed. All INT32 output hashes match the 2026-11-02 final integer kernel.
+Every run also checked all UINT16 outputs against the integer requant reference, direct INT64 samples, and existing extreme arithmetic cases.
+DSP v81 build passed. Diagnostic instrumentation only; production source files unchanged and match the recorded 2026-11-02 source hashes.

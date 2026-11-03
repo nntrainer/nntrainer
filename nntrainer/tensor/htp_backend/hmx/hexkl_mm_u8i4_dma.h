@@ -21,6 +21,7 @@
 #ifndef __NNTRAINER_HEXKL_MM_U8I4_DMA_H__
 #define __NNTRAINER_HEXKL_MM_U8I4_DMA_H__
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "hexkl_mm_opts.h"
@@ -195,6 +196,88 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
                             float *out_cat, const hexkl_mm_opts *opts);
+
+/**
+ * @brief Integer-only FC: asymmetric UINT16 x symmetric INT4 -> INT32.
+ * Activation is row-major M x K with one fixed encoding for the tensor;
+ * K is a multiple of 64. Output consists of concatenated M x N_i blocks.
+ * out[m,c] = sum_k((activation[m,k] - zero_point) * weight[k,c]) + bias[c].
+ * bias is NULL, or n_handles pointers to N_i INT32 entries (a NULL entry
+ * means zero). Bias uses accumulator units s_a * s_w[c], prepared offline.
+ * The registry's float scales and biases are ignored. No float arithmetic,
+ * dynamic quantization, residual or normalization occurs in this path.
+ * Weights and column sums must already be prepared in offline WH layout;
+ * this call only transfers the tiled weights to VTCM, without repacking.
+ * Use hexkl_requantize_i32_u16 (hexkl_integer.h) to feed another integer FC.
+ * Inputs/weights/bias/output/VTCM must not overlap. As with layer_run, the
+ * caller owns the HMX lock and initializes accumulator readout beforehand.
+ * Returns AEE_EFAILED on INT32 output overflow (discard the whole output),
+ * AEE_EBADPARM for invalid shapes/weights, AEE_ENOMEMORY for insufficient
+ * VTCM, AEE_EUNSUPPORTED for an unsupported accumulator layout, or a
+ * HexKL error. Each byte sweep is checked to fit INT32; exact widened
+ * intermediates are used wherever the dot/correction range is not proven.
+ * Final overflow is always checked, including bias. No silent saturation.
+ */
+int hexkl_mm_u16i4_layer_run_i32(
+  hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
+  uint32_t config_off, uint32_t M, uint32_t K, const uint32_t *handles,
+  uint32_t n_handles, const uint16_t *activation, uint16_t zero_point,
+  const int32_t *const *bias, int32_t *out, hvx_worker_pool *pool);
+
+struct hexkl_requant_u16;
+/** @brief Same exact INT32 FC, plus fused UINT16 output for the next layer.
+ * Both output buffers are required, disjoint, and concatenated M x N_i.
+ * requant[i] has n_requant[i] entries: one or N_i (per channel), as defined
+ * by hexkl_requant_u16 in hexkl_integer.h. Parameters are validated before
+ * any output is written. On accumulator overflow discard BOTH outputs.
+ * Requantization runs in the epilogue, overlapping subsequent HMX batches,
+ * without rereading the INT32 output from DDR. Other i32 entry rules apply.
+ */
+int hexkl_mm_u16i4_layer_run_i32_requant(
+  hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
+  uint32_t config_off, uint32_t M, uint32_t K, const uint32_t *handles,
+  uint32_t n_handles, const uint16_t *activation, uint16_t zero_point,
+  const int32_t *const *bias, int32_t *out, hvx_worker_pool *pool,
+  const struct hexkl_requant_u16 *const *requant, const uint32_t *n_requant,
+  uint16_t *out_u16);
+
+/** @brief Optional external AH byte planes for integer FC chaining.
+ * Each image is [low plane][high plane], with ceil(M/64)*64*width bytes
+ * per plane. Within a plane, (r,c) is at
+ * (r/64)*64*width + (c/32)*2048 + (r%64)*32 + c%32.
+ * Input width is K; output width is the sum of the handles' N values in
+ * handle order, so output channels are interleaved into one logical tensor.
+ * Both pointers, when supplied, must be 128-byte aligned, outside VTCM,
+ * and disjoint from all other inputs/outputs. Capacities are in bytes.
+ * The caller keeps buffers alive until return. Padding output rows are zero.
+ */
+typedef struct {
+  const uint8_t *input;
+  size_t input_bytes;
+  uint8_t *output;
+  size_t output_bytes;
+} hexkl_u16_ah_io;
+
+/** @brief Integer FC with optional packed input and directly packed output.
+ * Supply exactly one of activation (row-major) or ah->input (AH planes).
+ * Packed input is DMA-transferred to VTCM without an HVX packing pass.
+ * out always receives the same concatenated INT32 blocks as the other APIs.
+ * ah->output, if non-NULL, receives requantized AH planes directly from the
+ * epilogue, without an intermediate row-major UINT16 array. requant and
+ * n_requant are required only when producing this packed output.
+ * To feed another FC, the caller must choose requant parameters defining
+ * one common output encoding, and pass that encoding's zero-point there.
+ * Per-channel multipliers can still reflect per-channel weight scales.
+ * No conversion or float metadata processing is performed by this API.
+ * The other integer FC error, overflow and ownership contracts apply.
+ */
+int hexkl_mm_u16i4_layer_run_i32_ah(
+  hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
+  uint32_t config_off, uint32_t M, uint32_t K, const uint32_t *handles,
+  uint32_t n_handles, const uint16_t *activation, uint16_t zero_point,
+  const int32_t *const *bias, int32_t *out, hvx_worker_pool *pool,
+  const struct hexkl_requant_u16 *const *requant, const uint32_t *n_requant,
+  const hexkl_u16_ah_io *ah);
 
 /**
  * @brief Runs ONE MoE expert FFN in a single call: gate_up matmul -> SwiGLU

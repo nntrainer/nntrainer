@@ -1,0 +1,20 @@
+run rc=0
+three handles     : mismatches=0 of 312000   worst_rel=0
+M=1               : mismatches=0 of 2080   worst_rel=0
+post in epilogue  : rc=0 done=1 bit-identical to the passes after
+accumulate        : mismatches=0 of 312000   worst_rel=0
+2-tile arena      : mismatches=0 of 312000   worst_rel=0
+1-tile arena      : rc=2 (want 2)
+chunked 512+512   : FC LAYER CHUNKED BIT-IDENTICAL
+mutant (rows 0..) : differs, as it must
+u16 run rc=0
+u16 activation    : mismatches=0 of 76800   worst_rel=0
+u16 vs f32 rows   : U16 ACTIVATION BIT-IDENTICAL
+mutant enc        : differs, as it must
+a16 f32 rows      : mismatches=0 of 235200   worst_rel=0
+a16 u16 direct    : mismatches=0 of 235200   worst_rel=0
+a16 prepacked     : rc=0 bit-identical to the direct run; without its encoding rc=14
+a16 u16 per head  : mismatches=0 of 235200   worst_rel=0
+a16 refusals      : accumulate rc=14, no scratch rc=14
+
+ALL CHECKS PASS

@@ -1,0 +1,12 @@
+3881042471377ec3c083afd06e55a04ab6934cbe
+QuIC LLVM Hexagon Clang version 19.0.04
+Target: hexagon
+Thread model: posix
+InstalledDir: /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1/tools/HEXAGON_Tools/19.0.04/Tools/bin
+Build config: +assertions
+SM-S948N
+SM8850
+  USB powered: true
+  level: 100
+  temperature: 249
+arch=v81 extra_cflags=

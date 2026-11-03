@@ -1,0 +1,8 @@
+integer FC M=67 K=128 zp=0 rc=0 expected=0
+integer FC M=67 K=128 zp=32768 rc=0 expected=0
+integer FC M=67 K=128 zp=65535 rc=0 expected=0
+integer FC M=1 K=4096 zp=0 rc=0 expected=0
+integer FC M=1 K=4160 zp=32768 rc=0 expected=0
+integer FC M=1 K=8192 zp=0 rc=1 expected=1
+PACKED INTEGER FC CHAIN OK
+INTEGER FC OK

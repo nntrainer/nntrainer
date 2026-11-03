@@ -96,6 +96,15 @@ done
 
 "$OUT/fc_layer_host_check"
 
+# Integer FC with direct INT64 references and a two-FC requantized chain.
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$BACKEND/.." -I "$BACKEND/hmx" \
+  -I "$BACKEND/hvx" \
+  -o "$OUT/fc_integer_host_check" \
+  "$HERE/fc_integer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$HERE/standin/hvx_scalar.c" "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" -lm
+"$OUT/fc_integer_host_check"
+
 # The worker pool's two lanes on pthreads (stub/qurt.h). Concurrency is
 # exercised for real here -- 3 workers, a caller that helps -- but a
 # desktop scheduler is not QuRT's; the device is still where the timing

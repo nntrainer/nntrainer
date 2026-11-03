@@ -1,0 +1,9 @@
+72/72 final device processes passed (36 against unchanged PR, 36 against preceding integer version).
+INT32 hashes are identical before/after for all six shapes in all integer comparison runs.
+Every fused UINT16 output matched the independent integer requant reference.
+Direct INT64 dot samples, arbitrary bias/column-sum correction, overflow/cancellation passed.
+Device guarded paired stores: aligned/unaligned destinations, odd starting tiles, trailing tile and row tails.
+Device arithmetic covers both bounded INT32 and widened correction, all requant shifts and per-channel parameters.
+Actual HMX extreme K=4096/4160/8192/32768 passed, including signed four-plane readout.
+Host legacy FC, integer FC, real HVX pack emulation, and byte-plane mutation passed.
+Integer FC ASan/UBSan passed. DSP v79/v81 builds passed with -Wall -Werror.

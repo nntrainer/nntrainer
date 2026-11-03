@@ -648,6 +648,87 @@ static void pack16_rows_u16(const uint16_t *u, uint32_t m, uint32_t n_kt,
   }
 }
 
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi) {
+  const uint32_t m = group * 4u;
+  const uint32_t count = m >= m_valid       ? 0u
+                         : m_valid - m < 4u ? m_valid - m
+                                            : 4u;
+  const size_t base =
+    (size_t)(m / TILE_ROW) * TILE_ROW * k + (m % TILE_ROW) * TILE_INNER;
+  if (count && k <= 32767u)
+    Q6_l2fetch_AP((void *)(x + (size_t)m * k), ((uint64_t)(2u * k) << 32) |
+                                                 ((uint64_t)(2u * k) << 16) |
+                                                 count);
+  const HVX_Vector zero = Q6_V_vzero();
+  for (uint32_t c = 0; c < k; c += 64u) {
+    // Read each 64-code vector once. Splitting its halves produces two
+    // consecutive K tiles, instead of overlapping 32-code input reads.
+    const HVX_Vector u0 =
+      count > 0u ? *(const HVX_UVector *)(x + (size_t)m * k + c) : zero;
+    const HVX_Vector u1 =
+      count > 1u ? *(const HVX_UVector *)(x + (size_t)(m + 1u) * k + c) : zero;
+    const HVX_Vector u2 =
+      count > 2u ? *(const HVX_UVector *)(x + (size_t)(m + 2u) * k + c) : zero;
+    const HVX_Vector u3 =
+      count > 3u ? *(const HVX_UVector *)(x + (size_t)(m + 3u) * k + c) : zero;
+    const HVX_VectorPair h01 = Q6_W_vshuff_VVR(u1, u0, -64);
+    const HVX_VectorPair h23 = Q6_W_vshuff_VVR(u3, u2, -64);
+    const size_t d = base + (size_t)(c / TILE_INNER) * ACT_TILE_BYTES;
+    // Each group owns whole aligned vectors, including partial/pad rows.
+    // No byte copies or read-modify-write stores touch neighboring groups.
+    *(HVX_Vector *)(lo + d) = Q6_Vb_vpacke_VhVh(Q6_V_lo_W(h23), Q6_V_lo_W(h01));
+    *(HVX_Vector *)(hi + d) = Q6_Vb_vpacko_VhVh(Q6_V_lo_W(h23), Q6_V_lo_W(h01));
+    *(HVX_Vector *)(lo + d + ACT_TILE_BYTES) =
+      Q6_Vb_vpacke_VhVh(Q6_V_hi_W(h23), Q6_V_hi_W(h01));
+    *(HVX_Vector *)(hi + d + ACT_TILE_BYTES) =
+      Q6_Vb_vpacko_VhVh(Q6_V_hi_W(h23), Q6_V_hi_W(h01));
+  }
+}
+
+/** @brief Byte splitting only: no encoding or float parameters. */
+static void pack16_worker(uint32_t threads, uint32_t lane, void *ctx) {
+  const quant16_ctx *c = (const quant16_ctx *)ctx;
+  const uint32_t begin = (uint32_t)((uint64_t)c->n_groups * lane / threads);
+  const uint32_t end =
+    (uint32_t)((uint64_t)c->n_groups * (lane + 1u) / threads);
+  for (uint32_t g = begin; g < end; ++g)
+    pack16_rows_u16(c->x16 + (size_t)4u * g * c->k, 4u * g, c->k / TILE_INNER,
+                    c->k, c->out_lo, c->out_hi);
+}
+
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool) {
+  if (!x || !lo || !hi || !m_valid || !k || k % 64u || m_pad < m_valid ||
+      m_pad % TILE_ROW || (size_t)m_pad > SIZE_MAX / sizeof(uint16_t) / k)
+    return AEE_EBADPARM;
+  const uint32_t end = m_valid / 4u * 4u;
+  if (m_valid < m_pad) {
+    const size_t block = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(lo + block * k, 0, (size_t)(m_pad - block) * k);
+    memset(hi + block * k, 0, (size_t)(m_pad - block) * k);
+  }
+  quant16_ctx ctx = {0};
+  ctx.x16 = x;
+  ctx.n_groups = end / 4u;
+  ctx.k = k;
+  ctx.out_lo = lo;
+  ctx.out_hi = hi;
+  if (ctx.n_groups)
+    hvx_worker_pool_run(pool, pack16_worker, &ctx, ctx.n_groups);
+  for (uint32_t m = end; m < m_valid; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      const size_t d = (size_t)(m / TILE_ROW) * TILE_ROW * k +
+                       (size_t)(c / TILE_INNER) * ACT_TILE_BYTES +
+                       (m % TILE_ROW) * TILE_INNER + c % TILE_INNER;
+      const uint16_t q = x[(size_t)m * k + c];
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
+  return AEE_SUCCESS;
+}
+
 /** @brief Row groups [lo, hi) of four, each one's parameters then its pack
  *         while the rows are cached, as quant_params_pack_worker. */
 static void quant16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {

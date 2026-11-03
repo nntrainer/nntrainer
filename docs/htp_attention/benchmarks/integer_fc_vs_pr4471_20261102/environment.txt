@@ -1,0 +1,19 @@
+3881042471377ec3c083afd06e55a04ab6934cbe
+SM-S948N
+SM8850
+  USB powered: true
+  level: 100
+  temperature: 249
+baseline=/tmp/nntr-integer-overlap/pr4471-original
+candidate=/tmp/nntr-integer-bench/overlap-stage7
+baseline_kind=fp32
+Two warmup rounds; six samples/process; three calls/sample; three processes/shape.
+SDK=6.4.0.1
+Hexagon compiler=19.0.04
+HexKL=6.4.0.2
+arch=v81 flags=-O3
+VTCM=8388608 workers=7
+Input=UINT16 zp=30000; weights=offline WH INT4, handles N_i=256
+FC output=INT32; fused chain adds UINT16 requant multiplier=3 shift=8 zp=30000
+Weight registration/packing and FastRPC excluded; weight DMA and activation pack included.
+Existing session DSP/HMX power votes enabled; actual clock frequencies not sampled.

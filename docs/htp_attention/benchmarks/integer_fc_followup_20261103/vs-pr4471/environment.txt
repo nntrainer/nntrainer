@@ -1,0 +1,10 @@
+3881042471377ec3c083afd06e55a04ab6934cbe
+SM-S948N
+SM8850
+  USB powered: true
+  level: 100
+  temperature: 246
+baseline=/tmp/nntr-integer-overlap/pr4471-original
+candidate=/tmp/nntr-w4a16-opt-20261103/packed-unroll
+baseline_kind=fp32
+Two warmup rounds; six samples/process; three calls/sample; three processes/shape.

@@ -89,7 +89,8 @@ static int check(const char *what, const uint8_t *lo, const uint8_t *hi,
 int main(void) {
   static float x[M * KK], dq[KK], scratch[4u * KK];
   static uint16_t x16[M * KK], q[MP][KK];
-  static uint8_t lo[MP * KK], hi[MP * KK];
+  static uint8_t lo[MP * KK] __attribute__((aligned(128)));
+  static uint8_t hi[MP * KK] __attribute__((aligned(128)));
   static float s[MP], ws[M];
   static int32_t z[MP], wz[M];
   int fail = 0;
@@ -97,6 +98,44 @@ int main(void) {
     x[i] = ((float)(rnd() % 20001u) - 9000.0f) / 3000.0f;
     x16[i] = (uint16_t)(rnd() & 0xffffu);
   }
+
+  /* The production integer-only pack, including tails and real pool lanes. */
+  hvx_worker_pool *pool = hvx_worker_pool_create(3);
+  if (!pool)
+    return 1;
+  const uint32_t sizes[] = {1, 3, 4, 63, 64, 65, M};
+  for (uint32_t threaded = 0; threaded < 2; ++threaded) {
+    for (uint32_t shape = 0; shape < sizeof sizes / sizeof sizes[0]; ++shape) {
+      const uint32_t rows = sizes[shape];
+      memset(lo, 0xa5, sizeof lo);
+      memset(hi, 0x5a, sizeof hi);
+      int prc =
+        hvx_pack_u16_ah(x16, rows, MP, KK, lo, hi, threaded ? pool : NULL);
+      size_t bad = 0;
+      for (uint32_t m = 0; m < MP; ++m)
+        for (uint32_t j = 0; j < KK; ++j) {
+          const uint16_t qv = m < rows ? x16[(size_t)m * KK + j] : 0;
+          bad += lo[ah(m, j)] != (qv & 255u) || hi[ah(m, j)] != (qv >> 8);
+        }
+      fail |= prc != 0 || bad != 0;
+      // Background units may finish out of order; no group may clear
+      // another group's valid rows, including the final partial group.
+      memset(lo, 0xa5, sizeof lo);
+      memset(hi, 0x5a, sizeof hi);
+      for (uint32_t g = MP / 4u; g > 0; --g)
+        hvx_pack_u16_ah_group(x16, g - 1u, rows, KK, lo, hi);
+      for (uint32_t m = 0; m < MP; ++m)
+        for (uint32_t j = 0; j < KK; ++j) {
+          const uint16_t qv = m < rows ? x16[(size_t)m * KK + j] : 0;
+          fail |= lo[ah(m, j)] != (qv & 255u) || hi[ah(m, j)] != (qv >> 8);
+        }
+    }
+  }
+  fail |= hvx_pack_u16_ah(x16, M, 64, KK, lo, hi, NULL) == 0;
+  fail |= hvx_pack_u16_ah(x16, M, MP, 32, lo, hi, NULL) == 0;
+  hvx_worker_pool_destroy(pool);
+  printf("integer-only pack: %s (tails, padding, 1 and 4 lanes)\n",
+         fail ? "FAIL" : "OK");
 
   /* f32 rows */
   memset(lo, 0xa5, sizeof lo);

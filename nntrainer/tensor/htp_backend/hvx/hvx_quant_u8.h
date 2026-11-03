@@ -87,6 +87,21 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
                                 float *pre_scratch, float *scale, int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool);
 
+/** @brief Packs already-quantized UINT16 codes into low/high AH byte planes.
+ * No scale calculation, dequantization or floating-point operations.
+ * k must be a multiple of 64, m_pad a multiple of 64 >= m_valid.
+ * Input and both output planes must not overlap; pad rows contain zero. */
+/** @brief One independent group of four rows in an already-sized AH arena.
+ * Caller validates K (multiple of 64), group < m_pad/4, and buffer sizes.
+ * Both AH output planes must be 128-byte aligned. Input may be unaligned.
+ * Rows >= m_valid are zero-filled. Groups may execute in any order. */
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi);
+
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool);
+
 /**
  * @brief The 16-bit activation of an a16 matmul as two u8 AH planes: row m
  *        is scale[m] * (u - zp[m]) with u in [0, 65535], its low bytes in
