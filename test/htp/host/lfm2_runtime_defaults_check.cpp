@@ -49,6 +49,15 @@ int main() {
   setEnvironment("NNTR_LFM2_DEFAULT_PRESET", "0");
   setEnvironment("NNTR_NUM_THREADS", "3");
   const auto defaults = parseHtpRuntimeConfig(json::object());
+  assert(defaults.htp.attn_m1_q_bits == 16);
+  const auto q8 = parseHtpRuntimeConfig({{"htp",
+                                          {{"attn_m1_fast", true},
+                                           {"attn_m1_fast_scope", "global"},
+                                           {"attn_m1_q_bits", 8}}}});
+  assert(q8.htp.attn_m1_q_bits == 8 && !(q8 == defaults));
+  invalid({{"htp", {{"attn_m1_q_bits", 8}}}});
+  invalid({{"htp", {{"attn_m1_fast", true}, {"attn_m1_q_bits", 8}}}});
+  invalid({{"htp", {{"attn_m1_q_bits", 4}}}});
   assert(defaults.htp.page_cache == -1 && defaults.htp.profile == 0);
   assert(defaults.htp.arena_grain_mib == 64 &&
          defaults.htp.prefill_rows == 512);

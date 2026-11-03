@@ -124,10 +124,13 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   const uint32_t q8 = (max_seq & HVX_ATTN_M1_Q8) != 0u;     /* [#282 D] */
   const uint32_t lazy = (max_seq & HVX_ATTN_M1_LAZY) != 0u; /* [#289] */
   const uint32_t fast = (max_seq & HVX_ATTN_M1_FAST) != 0u; /* [#4416 F] */
-  max_seq &= ~(HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY | HVX_ATTN_M1_FAST);
+  const uint32_t qk_i8 = (max_seq & HVX_ATTN_M1_QK_I8) != 0u;
+  max_seq &=
+    ~(HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY | HVX_ATTN_M1_FAST | HVX_ATTN_M1_QK_I8);
   if (n_layers == 0u || n_kv == 0u || gqa == 0u || gqa > MAX_GQA ||
       n_kv * gqa > MAX_NQ || head_dim == 0u || head_dim % CH != 0u ||
       head_dim > ATTN_M1_DET_MAX_HD || max_seq == 0u || max_seq % 32u != 0u ||
+      (qk_i8 && !fast) ||
       (fast && (!q8 || head_dim % (2u * VLEN) != 0u || (gqa & (gqa - 1u))))) {
     rc = AEE_EINVALIDFORMAT;
     goto out;
@@ -198,6 +201,7 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
     (uint16_t *)memalign(VLEN, (size_t)n_kv * head_dim * sizeof(uint16_t));
   ctx->exp_tab = (uint16_t *)malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
   ctx->fast = fast;
+  ctx->qk_i8 = qk_i8;
   if (fast) { /* [#4416 F] */
     ctx->sf = (float *)memalign(VLEN, (size_t)n_q * seq * sizeof(float));
     ctx->q16 =
@@ -1803,11 +1807,63 @@ p1_fast_group(const forward_job *job, uint32_t h, uint32_t t, uint32_t g0,
   }
 }
 
+/** @brief Four dimensions per byte dot, 32 consecutive tokens per vector.
+ * K stays in the existing [tile64][dim][position] layout. Interleave only
+ * in registers, shared by the query heads. No additional KV storage. */
+static inline __attribute__((always_inline)) void
+p1_fast_i8_group(const forward_job *job, uint32_t h, uint32_t t, uint32_t g0,
+                 const uint32_t ng) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t hd = ctx->head_dim, hq0 = h * ctx->gqa + g0;
+  const HVX_Vector *tv =
+    (const HVX_Vector *)(kt8_head(ctx, job->layer, h) + (size_t)t * hd * TILE);
+  const int8_t *qp[PV_GROUP];
+  HVX_Vector lo[PV_GROUP], hi[PV_GROUP];
+  for (uint32_t g = 0; g < ng; ++g) {
+    lo[g] = hi[g] = Q6_V_vzero();
+    qp[g] = (const int8_t *)(ctx->q16 + (size_t)(hq0 + g) * hd);
+  }
+  for (uint32_t d = 0; d < hd; d += 4u) {
+    const HVX_Vector a = Q6_Vb_vshuff_Vb(tv[d / 2u]);
+    const HVX_Vector b = Q6_Vb_vshuff_Vb(tv[d / 2u + 1u]);
+    const HVX_VectorPair k = Q6_W_vshuff_VVR(b, a, -2);
+    for (uint32_t g = 0; g < ng; ++g) {
+      int32_t word;
+      /* Q starts at a 128-byte boundary and d is a multiple of four.
+       * Preserve that alignment through memcpy to emit one word load. */
+      memcpy(&word, __builtin_assume_aligned(qp[g] + d, 4), sizeof(word));
+      const HVX_Vector q = Q6_V_vsplat_R(word);
+      lo[g] = Q6_Vw_vrmpyacc_VwVbVb(lo[g], Q6_V_lo_W(k), q);
+      hi[g] = Q6_Vw_vrmpyacc_VwVbVb(hi[g], Q6_V_hi_W(k), q);
+    }
+  }
+  for (uint32_t g = 0; g < ng; ++g) {
+    const HVX_Vector s = hvx_splat_sf(job->qscale[hq0 + g]);
+    HVX_Vector *dst =
+      (HVX_Vector *)(ctx->sf + (size_t)(hq0 + g) * ctx->seq + (size_t)t * TILE);
+    dst[0] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_equals_Vw(lo[g]), s);
+    dst[1] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_equals_Vw(hi[g]), s);
+  }
+}
+
 static void p1_unit_fast(const forward_job *job, uint32_t u) {
   const uint32_t h = u / job->ntt, t = job->tlo + u % job->ntt;
   const uint32_t gqa = job->ctx->gqa;
   for (uint32_t g0 = 0; g0 < gqa;) {
     const uint32_t left = gqa - g0;
+    if (job->ctx->qk_i8) {
+      if (left >= 4u) {
+        p1_fast_i8_group(job, h, t, g0, 4u);
+        g0 += 4u;
+      } else if (left >= 2u) {
+        p1_fast_i8_group(job, h, t, g0, 2u);
+        g0 += 2u;
+      } else {
+        p1_fast_i8_group(job, h, t, g0, 1u);
+        ++g0;
+      }
+      continue;
+    }
     if (left >= 4u) {
       p1_fast_group(job, h, t, g0, 4u);
       g0 += 4u;
@@ -2385,7 +2441,8 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
       const int32_t bits = Q6_R_vextract_VR(mx, 0);
       float amax;
       memcpy(&amax, &bits, sizeof(float));
-      const float sq = amax > 0.0f ? amax / FAST_QMAX : 1.0f;
+      const float qmax = ctx->qk_i8 ? 127.0f : FAST_QMAX;
+      const float sq = amax > 0.0f ? amax / qmax : 1.0f;
       const HVX_Vector inv = hvx_splat_sf(1.0f / sq);
       for (uint32_t i = 0; i < hd / 64u; ++i) {
         const HVX_Vector w0 = hvx_sf_to_w_rne(
@@ -2393,6 +2450,13 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
         const HVX_Vector w1 = hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(
           Q6_Vsf_vmpy_VsfVsf(qh[2u * i + 1u], s[2u * i + 1u]), inv));
         q16[i] = Q6_Vh_vpack_VwVw_sat(w1, w0);
+      }
+      if (ctx->qk_i8) {
+        /* In-place forward packing: each store precedes unread halfwords.
+         * The codes are bounded by +/-127, so low-byte packing is exact. */
+        for (uint32_t i = 0; i < hd / VLEN; ++i) {
+          q16[i] = Q6_Vb_vpacke_VhVh(q16[2u * i + 1u], q16[2u * i]);
+        }
       }
       job.qscale[hq] = sq * scale;
     }

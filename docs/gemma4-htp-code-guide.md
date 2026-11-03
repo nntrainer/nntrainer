@@ -247,6 +247,8 @@ nested form for new configurations. Legacy flat cache size `0` still means
 | `htp.arena_grain_mib` | `64` | arena allocation grain: 4, 16 or 64 MiB |
 | `htp.release_prefill_scratch` / `release_prefill_readers` | `true` / `false` | release prefill allocations/readers when decode takes over; later prefill can create them again |
 | `htp.fc_lanes_small` / `fc_lanes_large` | `null` / `null` | keep the kernel's built-in lane selection; explicit overrides are 1..8 |
+| `htp.attn_m1_fast` / `attn_m1_fast_scope` | `false` / `"all"` | experimental integer decode attention; scope `all` selects every attention cache, `global` selects only non-windowed caches. Global scope requires separate sliding/global cache shapes. Arithmetic differs from the default path; validate outputs before deployment. |
+| `htp.attn_m1_q_bits` | `16` | Experimental Q precision in integer decode attention: `8` uses signed byte QK dot products, requires fast attention with global scope. KV bytes, softmax and PV arithmetic are unchanged. Lower Q precision can change generated outputs. |
 | `moe.cache_experts` / `preload_experts` | `16` / `128` | per-layer resident capacity and separate startup preload limit |
 | `moe.cache_grow` | `null` | grow toward the bounded target of 34 per layer; `0` disables growth, positive values request that many additional slots |
 | `moe.prediction` | `"auto"` | `auto`, `off`, `dsp-page`, `dsp-direct` or `arm-direct`; replaces the old predict/direct variable pair |

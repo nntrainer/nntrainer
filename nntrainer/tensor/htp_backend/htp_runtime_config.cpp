@@ -87,6 +87,13 @@ void validateHtpRuntimeConfig(const HtpRuntimeConfig &config) {
             h.lfm2_conv_stripe_rows == 32 || h.lfm2_conv_stripe_rows == 64 ||
             h.lfm2_conv_stripe_rows == 128 || h.lfm2_conv_stripe_rows == 256,
           "htp.lfm2_conv_stripe_rows must be 8, 16, 32, 64, 128 or 256");
+  require(oneOf(h.attn_m1_fast_scope, {"all", "global"}),
+          "htp.attn_m1_fast_scope must be all or global");
+  require(h.attn_m1_q_bits == 16 || h.attn_m1_q_bits == 8,
+          "htp.attn_m1_q_bits must be 8 or 16");
+  require(h.attn_m1_q_bits != 8 ||
+            (h.attn_m1_fast && h.attn_m1_fast_scope == "global"),
+          "INT8 Q requires htp.attn_m1_fast=true and scope=global");
   require(!h.dump_all || !h.dump_dir.empty(),
           "htp.dump_all requires htp.dump_dir");
   require(m.cache_experts >= 1, "moe.cache_experts must be positive");

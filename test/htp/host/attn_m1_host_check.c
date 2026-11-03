@@ -1429,7 +1429,7 @@ static void check_gemma(hvx_worker_pool *const pools[3]) {
  *         integer forward land a few dB under it; a layout or lane mistake
  *         lands near 0), the pool count must not change the bytes, and the
  *         stats must carry the f32 max and the P sum. */
-static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
+static void check_gemma_fast(hvx_worker_pool *const pools[3], uint32_t q_bits) {
   static const uint32_t lengths[] = {1u, 65u, 1023u, 1024u, 1025u, 4096u};
   double lo_snr = 1e9;
   const int fail0 = g_fail;
@@ -1451,7 +1451,8 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
         int err = -1;
         hvx_attn_m1_ctx *ctx = hvx_attn_m1_create(
           N_LAYERS, n_kv, gqa, hd,
-          G4_SEQ | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY | HVX_ATTN_M1_FAST,
+          G4_SEQ | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY | HVX_ATTN_M1_FAST |
+            (q_bits == 8u ? HVX_ATTN_M1_QK_I8 : 0u),
           pools[pi], &err);
         CHECK(ctx && err == AEE_SUCCESS && ctx->fast, "fast %s create: %d",
               G4[s].name, err);
@@ -1462,6 +1463,43 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
         rc |= hvx_attn_m1_forward(ctx, LAYER, L - 1u, win, 1.0f, q, k + last,
                                   v + last, pi ? out1 : out, stats);
         CHECK(rc == AEE_SUCCESS, "fast %s L=%u rc=%d", G4[s].name, L, rc);
+        if (q_bits == 8u) {
+          uint32_t bad = 0;
+          /* Independent scalar oracle checks every Q code and visible
+           * score, including negative bytes and partial K tiles. */
+          for (uint32_t hq = 0; hq < n_q; ++hq) {
+            const uint32_t h = hq / gqa;
+            const float *sk = ctx->sk + ((size_t)LAYER * n_kv + h) * hd;
+            const int8_t *qq = (const int8_t *)(ctx->q16 + (size_t)hq * hd);
+            const int8_t *kt =
+              (const int8_t *)ctx->kt[LAYER] + (size_t)h * ctx->seq * hd;
+            float amax = 0.0f;
+            for (uint32_t d = 0; d < hd; ++d) {
+              const float a = fabsf(q[(size_t)hq * hd + d] * sk[d]);
+              amax = fmaxf(amax, a);
+            }
+            const float sq = amax > 0.0f ? amax / 127.0f : 1.0f;
+            for (uint32_t d = 0; d < hd; ++d) {
+              bad += qq[d] != (int)lrintf((q[(size_t)hq * hd + d] * sk[d]) *
+                                          (1.0f / sq));
+            }
+            const uint32_t lo = win && L > win ? L - win : 0u;
+            for (uint32_t p = lo; p < L; ++p) {
+              int32_t dot = 0;
+              for (uint32_t d = 0; d < hd; ++d) {
+                dot +=
+                  qq[d] *
+                  kt[(size_t)(p / 64u) * hd * 64u + (size_t)d * 64u + p % 64u];
+              }
+              const float expected = (float)dot * sq;
+              const float actual = ctx->sf[(size_t)hq * ctx->seq + p];
+              bad +=
+                fabsf(actual - expected) > 1e-6f * fmaxf(1.0f, fabsf(expected));
+            }
+          }
+          CHECK(bad == 0u, "Q8 scalar Q/score oracle %s L=%u: %u errors",
+                G4[s].name, L, bad);
+        }
         if (pi) {
           CHECK(count_bad(out1, out, nq) == 0u, "fast %s L=%u: pool changes",
                 G4[s].name, L);
@@ -1470,9 +1508,10 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
       }
       const double snr = g4_snr(q, k, v, L, n_kv, gqa, hd, win, out);
       lo_snr = snr < lo_snr ? snr : lo_snr;
-      printf("ATTN M1 FAST %s (%u,%u,%u) window=%u L=%u SNR(fast vs f64)=%.1f "
-             "dB m=%.3f l=%.0f\n",
-             G4[s].name, n_kv, gqa, hd, win, L, snr, stats[0], stats[1]);
+      printf(
+        "ATTN M1 FAST Q%u %s (%u,%u,%u) window=%u L=%u SNR(fast vs f64)=%.1f "
+        "dB m=%.3f l=%.0f\n",
+        q_bits, G4[s].name, n_kv, gqa, hd, win, L, snr, stats[0], stats[1]);
       CHECK(snr > 20.0, "fast %s L=%u: SNR %.1f dB", G4[s].name, L, snr);
       CHECK(stats[1] >= 32767.0f, "fast %s L=%u: l=%f lacks the max's P",
             G4[s].name, L, stats[1]);
@@ -1484,8 +1523,68 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3]) {
     }
   }
   if (g_fail == fail0) {
-    printf("ATTN M1 FAST OK: lowest SNR vs f64 %.1f dB\n", lo_snr);
+    printf("ATTN M1 FAST Q%u OK: lowest SNR vs f64 %.1f dB\n", q_bits, lo_snr);
   }
+}
+
+/** Exercise every QK query-group branch with signed byte endpoints. */
+static void check_qk_i8_endpoints(hvx_worker_pool *pool) {
+  const uint32_t hd = 256u, seq = 64u;
+  uint8_t *k8 = malloc(seq * hd), *v8 = malloc(seq * hd);
+  float q[8u * 256u], k[256], v[256], out[8u * 256u];
+  float sk = 1.0f, sv[256], svi[256];
+  for (uint32_t i = 0; i < seq * hd; ++i) {
+    /* Includes -128, 127 and intermediate values, varies by token/dim. */
+    k8[i] = (uint8_t)((i * 37u + i / hd * 53u) & 255u);
+    v8[i] = (uint8_t)((i * 19u) & 255u);
+  }
+  for (uint32_t d = 0; d < hd; ++d) {
+    sv[d] = svi[d] = 1.0f;
+    k[d] = d & 1u ? -127.0f : 127.0f;
+    v[d] = (float)(d % 17u);
+  }
+  for (uint32_t i = 0; i < 8u * hd; ++i) {
+    q[i] = (float)((int)((i * 71u) % 255u) - 127);
+  }
+  for (uint32_t gqa = 1u; gqa <= 8u; gqa *= 2u) {
+    /* Every head has amax 127, hence Q scale exactly 1. */
+    for (uint32_t h = 0; h < gqa; ++h) {
+      q[h * hd] = -127.0f;
+    }
+    int err = 0;
+    hvx_attn_m1_ctx *ctx = hvx_attn_m1_create(
+      1u, 1u, gqa, hd,
+      seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_FAST | HVX_ATTN_M1_QK_I8, pool, &err);
+    CHECK(ctx && err == AEE_SUCCESS, "Q8 endpoints create gqa=%u", gqa);
+    if (!ctx) {
+      continue;
+    }
+    int rc = hvx_attn_m1_seed_q8(ctx, 0u, seq - 1u, k8, v8, seq * hd, hd, &sk,
+                                 sv, svi, NULL);
+    rc |= hvx_attn_m1_forward(ctx, 0u, seq - 1u, 0u, 1.0f, q, k, v, out, NULL);
+    CHECK(rc == AEE_SUCCESS, "Q8 endpoints forward gqa=%u", gqa);
+    uint32_t bad = 0;
+    for (uint32_t h = 0; h < gqa; ++h) {
+      for (uint32_t p = 0; p < seq; ++p) {
+        int32_t dot = 0;
+        for (uint32_t d = 0; d < hd; ++d) {
+          const int32_t code =
+            p + 1u == seq ? (int32_t)k[d] : (int32_t)k8[p * hd + d] - 128;
+          dot += (int32_t)q[h * hd + d] * code;
+        }
+        bad += ctx->sf[h * ctx->seq + p] != (float)dot;
+      }
+    }
+    CHECK(bad == 0u, "Q8 signed endpoint oracle gqa=%u bad=%u", gqa, bad);
+    hvx_attn_m1_free(ctx);
+  }
+  int err = 0;
+  hvx_attn_m1_ctx *invalid = hvx_attn_m1_create(
+    1u, 1u, 1u, hd, seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_QK_I8, pool, &err);
+  CHECK(!invalid && err == AEE_EINVALIDFORMAT, "Q8 QK requires fast mode");
+  hvx_attn_m1_free(invalid);
+  free(k8);
+  free(v8);
 }
 
 /** [#289] seed_q8 on a lazy int8 cache: the q ^ 0x80 masters land in Kt's
@@ -1989,7 +2088,9 @@ int main(void) {
   check_division_tie(pools[1]);
   check_errors(pools[1]);
   check_gemma(pools);
-  check_gemma_fast(pools);
+  check_gemma_fast(pools, 16u);
+  check_gemma_fast(pools, 8u);
+  check_qk_i8_endpoints(pools[2]);
   check_gemma_q8(pools);
   check_seed_q8(pools[2]);
   check_seed_vec(pools[2]);

@@ -3450,10 +3450,13 @@ public:
     for (uint32_t c = 0; c < 2u; ++c) {
       const htp_graph_op *rec = nullptr;
       uint32_t n_attn = 0;
+      bool has_global = false, has_sliding = false;
       for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
         if (decode_.attn_cache_[decode_.attn_ordinal_[op]] != c)
           continue;
         rec = rec ? rec : decode_.graphOp(op);
+        has_global |= decode_.graphOp(op)->top_k == 0u;
+        has_sliding |= decode_.graphOp(op)->top_k != 0u;
         ++n_attn;
       }
       if (rec == nullptr)
@@ -3466,16 +3469,22 @@ public:
       // The fixed int8-cache policy uses scales from the prefill seed:
       // 1 selects the first cache shape, 2 selects both shapes.
       constexpr bool q8 = true;
-      // htp.attn_m1_fast=1: the integer forward over the
-      // int8 cache (HVX_ATTN_M1_FAST; not bit-identical to the CPU)
-      const bool fast_knob = htpRuntimeConfig().htp.attn_m1_fast;
-      const bool fast = q8 && fast_knob;
+      // Integer attention can be restricted to global layers. Each DSP cache
+      // has one arithmetic mode; its layers must agree on windowed attention.
+      const auto &runtime = htpRuntimeConfig().htp;
+      const bool global_only = runtime.attn_m1_fast_scope == "global";
+      if (runtime.attn_m1_fast && global_only && has_global && has_sliding)
+        throw std::invalid_argument("Global-only integer attention requires "
+                                    "separate sliding/global KV shapes");
+      const bool fast =
+        q8 && runtime.attn_m1_fast && (!global_only || !has_sliding);
+      const bool qk_i8 = fast && runtime.attn_m1_q_bits == 8;
       // lazy: a layer's cache comes at its seed, after the layer
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
         max_seq | (q8 ? 0x80000000u : 0u) | (kvSeedQ() ? 0x40000000u : 0u) |
-          (fast ? 0x20000000u : 0u));
+          (fast ? 0x20000000u : 0u) | (qk_i8 ? 0x10000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -3488,7 +3497,8 @@ public:
                    (unsigned long long)n_attn * rec->n_kv * rec->head_dim *
                      ((max_seq + 63u) / 64u * 64u) * 2u *
                      (q8 ? 1u : sizeof(uint16_t)) / 1024u,
-                   fast ? " int8 fast" : (q8 ? " int8" : ""));
+                   qk_i8 ? " int8 fast Q8"
+                         : (fast ? " int8 fast" : (q8 ? " int8" : "")));
     }
   }
 

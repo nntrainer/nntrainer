@@ -502,6 +502,32 @@ static inline HVX_Vector Q6_Vsf_equals_Vqf32(HVX_Vector a) { return a; }
  * prefetch hint with no architectural effect (a no-op here). The ISS runs
  * of plan 170 round 2 matched these on the kernel's patterns. */
 
+/** Interleave the lower and upper 64-byte halves, lower byte first. */
+static inline HVX_Vector Q6_Vb_vshuff_Vb(HVX_Vector u) {
+  HVX_Vector r;
+  const uint8_t *p = (const uint8_t *)u.w;
+  uint8_t *o = (uint8_t *)r.w;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    o[2 * i] = p[i];
+    o[2 * i + 1] = p[i + 2 * HVX_EMU_LANES];
+  }
+  return r;
+}
+
+/** Signed byte dot: Vx.w[i] += sum_j Vu.b[4i+j] * Vv.b[4i+j]. */
+static inline HVX_Vector Q6_Vw_vrmpyacc_VwVbVb(HVX_Vector x, HVX_Vector u,
+                                               HVX_Vector v) {
+  const int8_t *a = (const int8_t *)u.w, *b = (const int8_t *)v.w;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    int32_t s = 0;
+    for (int j = 0; j < 4; ++j) {
+      s += (int32_t)a[4 * i + j] * b[4 * i + j];
+    }
+    x.w[i] = (int32_t)((uint32_t)x.w[i] + (uint32_t)s);
+  }
+  return x;
+}
+
 static inline HVX_VectorPair Q6_W_vshuff_VVR(HVX_Vector u, HVX_Vector v,
                                              int32_t rt) {
   HVX_VectorPair w;

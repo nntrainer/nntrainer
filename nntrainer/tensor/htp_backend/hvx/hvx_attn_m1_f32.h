@@ -127,9 +127,10 @@ typedef struct {
    *  softmax f32 with P as 15-bit integers in s; PV int32 by vmpyh over
    *  the int8 rows, flushed to f32 every 256 positions. Same cache bytes */
   uint32_t fast;
-  float *sf;     /**< f32 [n_kv * gqa][seq]: the scores */
-  int16_t *q16;  /**< [n_kv * gqa][head_dim]: q quantized */
-  int32_t *psum; /**< [n_kv * gqa][seq / 64]: a tile's P sum */
+  uint32_t qk_i8; /**< Experimental INT8 Q x INT8 K; requires fast. */
+  float *sf;      /**< f32 [n_kv * gqa][seq]: the scores */
+  int16_t *q16;   /**< [n_kv * gqa][head_dim]: Q16 or packed Q8 scratch */
+  int32_t *psum;  /**< [n_kv * gqa][seq / 64]: a tile's P sum */
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
@@ -142,6 +143,8 @@ typedef struct {
  *  bit-identical to the spec); refused without HVX_ATTN_M1_Q8, at a
  *  head_dim that is not a multiple of 256, or a gqa not 1, 2, 4 or 8. */
 #define HVX_ATTN_M1_FAST 0x20000000u
+/** @brief Experimental byte QK dot product; requires FAST and Q8. */
+#define HVX_ATTN_M1_QK_I8 0x10000000u
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 

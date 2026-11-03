@@ -62,6 +62,8 @@ using HtpCpuList = std::vector<int>;
   X(HtpOptionalInt, attn_f32_check, {})                                        \
   X(float, q2_margin, 1.0f)                                                    \
   X(bool, attn_m1_fast, false)                                                 \
+  X(std::string, attn_m1_fast_scope, "all")                                    \
+  X(unsigned, attn_m1_q_bits, 16u)                                             \
   X(bool, l2_check, false)                                                     \
   X(bool, l2_diff, false)                                                      \
   X(bool, l2_shadow, false)                                                    \
