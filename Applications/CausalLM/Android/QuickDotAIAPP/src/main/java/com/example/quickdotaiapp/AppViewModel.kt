@@ -2,21 +2,32 @@
 /**
  * @file  AppViewModel.kt
  * @brief Android glue around ChatController: the engine executor, the
- *        native catalog, file reading through ContentResolver and the
- *        theme preference. Survives rotation; owns the only executor.
+ *        native catalog, file reading through ContentResolver, the theme
+ *        preference and the Power tab's runner with its gauge sampler,
+ *        prompt presets and session files. Survives rotation.
  */
 package com.example.quickdotaiapp
 
 import android.app.Application
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.quickdotai.ModelCatalog
 import com.example.quickdotai.createEngine
+import com.example.quickdotaiapp.power.BatterySampler
+import com.example.quickdotaiapp.power.PowerFiles
+import com.example.quickdotaiapp.power.PowerPrompts
+import com.example.quickdotaiapp.power.PowerRunner
+import com.example.quickdotaiapp.power.PromptSource
+import com.example.quickdotaiapp.power.SessionMeta
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -34,6 +45,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         examples = Examples(),
         initialTheme = ThemeMode.entries.firstOrNull { it.name == prefs.getString("theme", null) } ?: ThemeMode.SYSTEM,
     )
+
+    /** The Power tab: gauge and sysfs reads and the session files stay off the main thread on IO. */
+    private val sampler = BatterySampler(app)
+    private val files = PowerFiles(app)
+    val power = PowerRunner(
+        scope = CoroutineScope(viewModelScope.coroutineContext + Dispatchers.IO),
+        chat = controller,
+        sampler = sampler::sample,
+        prompts = ::prompt,
+        onSessionDone = files::write,
+    )
+
+    private fun prompt(source: PromptSource): String? = when (source) {
+        PromptSource.Composer -> controller.composerText().ifBlank { null }
+        is PromptSource.Fixed -> runCatching {
+            getApplication<Application>().resources.openRawResource(rawPrompt(source.tokens)).bufferedReader().readText()
+        }.getOrNull()
+    }
+
+    private fun rawPrompt(tokens: Int): Int = when (PowerPrompts.resourceName(tokens)) {
+        "power_prompt_256" -> R.raw.power_prompt_256
+        "power_prompt_1k" -> R.raw.power_prompt_1k
+        "power_prompt_2k" -> R.raw.power_prompt_2k
+        else -> R.raw.power_prompt_4k
+    }
+
+    fun startPower() {
+        val s = controller.state.value
+        val d = s.descriptor
+        power.start(SessionMeta(
+            startedAt = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(OffsetDateTime.now()),
+            device = Build.MODEL,
+            android = Build.VERSION.RELEASE,
+            modelId = d?.id ?: "?",
+            runtime = d?.let { Examples.runtimeLabel(it.runtime) } ?: "?",
+            backend = (s.loadedRequest?.backend ?: s.selection.backend).name,
+        ))
+    }
 
     fun setTheme(mode: ThemeMode) {
         prefs.edit().putString("theme", mode.name).apply()
@@ -88,6 +137,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        power.stop()
         controller.shutdown()?.let { e -> engineExecutor.execute { runCatching { e.close() } } }
         engineExecutor.shutdown()
     }

@@ -39,7 +39,9 @@ class FakeQuickDotAI(
     override fun load(req: LoadModelRequest): BackendResult<Unit> { calls += "load:${req.modelId}"; return loadResult }
     override fun unload(): BackendResult<Unit> { calls += "unload"; return BackendResult.Ok(Unit) }
     override fun metrics(): BackendResult<PerformanceMetrics> = BackendResult.Ok(metricsToReturn)
-    override fun cancel() { cancelled = true; gate?.countDown() }
+    /** A test that asserts on the state between cancel() and the engine's reaction keeps the gate closed. */
+    @Volatile var releaseGateOnCancel = true
+    override fun cancel() { cancelled = true; if (releaseGateOnCancel) gate?.countDown() }
     override fun chatCancel() = cancel()
     override fun close() { closed = true; calls += "close" }
     override fun openChatSession(config: QuickAiChatSessionConfig?): BackendResult<String> {
