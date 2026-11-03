@@ -16,6 +16,11 @@ management. DSP int8 cache handles/calibration and resident decode remain
 owned by the existing HTP backend. Device session switching, radix prefix
 reuse and Flash restoration are **not integrated or validated** by this work.
 
+The later resident-conversation contribution is recorded below under
+[Resident KV sessions and request reservations](#resident-kv-sessions-and-request-reservations).
+It adds continuation of one live conversation; it does not add device
+session switching, radix reuse or Flash restoration.
+
 ## Environment and model
 
 | Item | Observed value |
@@ -279,3 +284,70 @@ Evidence includes `android/htp-model-new-dsp-smoke.log`,
 `rpc-audit/probe-new-v81-provider.log`, `android/v81-dsp-provider-build.log`,
 `android/working-v81-dsp.sha256`, `android/integrated-{core,facade}.xml`,
 and `core-integration-unit-tests.log`.
+
+## Resident KV sessions and request reservations
+
+Contribution recorded on 2026-11-03, implemented in `729cabcaa` on top of
+PR #4428. The change preserves one conversation's DSP INT8 KV, quantization
+scales, graph and absolute positions across successive requests. The final
+emitted token remains pending attention and is automatically consumed before
+the next request's new input. This avoids recalculating the previous history.
+
+Request reservations round the required decode capacity to 64 rows. Global
+caches grow only when needed; sliding caches discard complete tiles while
+retaining their attention window. Both operations preserve the retained
+INT8 bytes and scales without requantization and run between requests. Reset
+also clears and synchronizes sliding bases in the host and the reused DSP
+graph. The C++ CLI supports request sequences and reports committed positions,
+pending-token state, output IDs and allocated device KV payload.
+
+### Observed contribution
+
+Validated on SM-S948N, Android 16, Hexagon v81 with the supplied Gemma4 26B
+A4B TL2 rotated model. The model context limit was 16,384 tokens, the initial
+prompt had 8,194 tokens, and both compared configurations kept the expert
+pool fixed and used the existing attention arithmetic.
+
+| Measurement | Reference | With the contribution | Observed reduction |
+|---|---:|---:|---:|
+| Follow-up TTFT | 23,251.06 ms, full history recomputed | 1,969.97 ms, resident KV reused | 91.53% |
+| Allocated DSP INT8 K+V payload | 266.25 MiB, full context reservation | 186.875 MiB, request reservation | 79.375 MiB (29.81%) |
+
+The follow-up comparison used the same token history. Full recomputation
+processed 8,226 tokens after resetting an already loaded model; continuation
+processed 21 new user tokens and one pending feedback token. These are single
+scenario observations, not averages over a broader workload. The payload
+comparison measures allocated DSP K+V bytes, excluding scales, attention
+scratch and the host FP16 prefill allocation, whose policy is unchanged.
+
+### Validation and scope
+
+- Four consecutive resident requests returned the expected parcel code.
+  Every output token and committed KV position matched the full-capacity
+  configuration. The full-recomputation follow-up returned the same output
+  token IDs as the reused request.
+- Global growth and a sliding drop of 64 rows executed on the device.
+  Long-context reset and independent requests with both options disabled
+  passed regression checks.
+- Host attention, reservation and configuration checks passed, including
+  exact output preservation after resizing/compaction and targeted
+  ASan/UBSan checks. Leak detection was excluded because the execution
+  environment prevents LeakSanitizer under ptrace.
+- The v81 DSP skeleton, Android engine, C++ application and CLI built
+  successfully. Changed C/C++ files pass clang-format 14.
+
+The contribution covers one synchronous resident conversation per model.
+Additional input uses the existing resident single-token path. Resizing
+temporarily retains old and replacement buffers. Device snapshots, arbitrary
+rewind, concurrent session switching and device radix reuse are outside this
+contribution.
+
+Enable `htp.kv_session=true` and `htp.kv_request_reserve=true`; pass only new
+input on subsequent `run()` calls and use `setSessionTokenPosition(0)` to
+start a fresh conversation. The ARM RPC client and DSP skeleton must both be
+rebuilt. See the [configuration and C++ request-sequence guide](gemma4-htp-code-guide.md#resident-gemma4-kv-sessions).
+
+The committed [evidence record](validation/gemma4-htp-kv-session-20261103.json)
+contains the exact measurements, configuration, device binary hashes,
+implementation revision and correctness checks. Local raw evidence remains
+under `/tmp/nntr-kv-session-20261103`.
