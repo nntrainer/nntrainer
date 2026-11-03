@@ -64,6 +64,9 @@ struct RotaryTable {
   const uint16_t *sin_fp16 = nullptr;
   unsigned int positions = 0; /**< number of rows */
   unsigned int half = 0;      /**< head_dim / 2 */
+  /** a device arm may rotate a single-row (decode) step too (MHACoreLayer's
+   *  gpu_decode_rope property or NNTR_MHA_GPU_DECODE); the host ignores it */
+  bool device_decode = false;
 };
 
 /**
