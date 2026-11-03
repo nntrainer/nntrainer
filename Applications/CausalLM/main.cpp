@@ -201,6 +201,26 @@ int main(int argc, char *argv[]) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
+#if defined(__ANDROID__)
+  // OpenCL kernel binary cache. On Android the library resolves its cache path
+  // against the working directory (there is no per-user cache directory to
+  // put it under), so every new run directory recompiled every kernel: +1.6 s
+  // init and +1.7 s TTFT on the first run in a fresh directory, measured on
+  // an Adreno 840. Pin the cache to one directory next to this executable
+  // unless the caller named one; NNTR_KERNEL_CACHE_DIR=off still disables
+  // it. The binary key already folds in the source, the per-kernel build
+  // options (every -D define included) and the device + driver, so one
+  // directory shared by all runs cannot hand out a mismatched binary.
+  if (std::getenv("NNTR_KERNEL_CACHE_DIR") == nullptr) {
+    std::error_code ec;
+    const std::filesystem::path exe =
+      std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && exe.has_parent_path())
+      setenv("NNTR_KERNEL_CACHE_DIR",
+             (exe.parent_path() / "nntr_kernel_cache").string().c_str(), 0);
+  }
+#endif
+
   /* INITBISECT_MARKS: env-gated init-phase trace (NNTR_INIT_TRACE). */
   static const bool _itrace = std::getenv("NNTR_INIT_TRACE") != nullptr;
   auto _ilap = [&](const char *what) {

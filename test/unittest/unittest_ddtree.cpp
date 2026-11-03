@@ -117,6 +117,37 @@ TEST(DDTreeBuild, BudgetExceedsVocabTopkClamped) {
   EXPECT_LE(t.nodeCount, 100);
 }
 
+TEST(DDTreeBuild, Uint16OverloadMatchesFloatOnDequantizedLogits) {
+  const int depth = 4, vocab = 300, budget = 31;
+  const float scale = 0.0125f;
+  const int32_t offset = -30000;
+  std::mt19937 rng(1234);
+  std::vector<uint16_t> q(depth * vocab);
+  for (int d = 0; d < depth; ++d) {
+    // Distinct values per row so every row has a strict ranking.
+    std::vector<uint16_t> row(vocab);
+    for (int v = 0; v < vocab; ++v)
+      row[v] = static_cast<uint16_t>(28000 + 13 * v);
+    std::shuffle(row.begin(), row.end(), rng);
+    std::copy(row.begin(), row.end(), q.begin() + d * vocab);
+  }
+  std::vector<float> f(q.size());
+  for (size_t i = 0; i < q.size(); ++i)
+    f[i] = (static_cast<int32_t>(q[i]) + offset) * scale;
+
+  DDTreeConfig cfg;
+  cfg.budget = budget;
+  DDTreeStructure tf = buildTree(f.data(), depth, vocab, cfg);
+  DDTreeStructure tq = buildTree(q.data(), scale, offset, depth, vocab, budget);
+
+  EXPECT_EQ(tq.nodeCount, tf.nodeCount);
+  EXPECT_EQ(tq.currentLength, tf.currentLength);
+  EXPECT_EQ(tq.nodeTokenIds, tf.nodeTokenIds);
+  EXPECT_EQ(tq.nodeDepths, tf.nodeDepths);
+  EXPECT_EQ(tq.parents, tf.parents);
+  EXPECT_EQ(tq.visibility, tf.visibility);
+}
+
 TEST(DDTreeCompile, IdsPositionsAndMask) {
   using nntrainer::ddtree::compile;
   using nntrainer::ddtree::CompiledTree;
