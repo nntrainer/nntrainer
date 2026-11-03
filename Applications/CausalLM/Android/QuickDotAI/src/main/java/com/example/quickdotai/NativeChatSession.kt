@@ -102,7 +102,7 @@ internal class NativeChatSession(
                 BackendResult.Ok(
                     QuickAiChatResult(
                         content = output,
-                        metrics = PerformanceMetrics(totalDurationMs = lastRunDurationMs)
+                        metrics = metricsFor(handle, lastRunDurationMs)
                     )
                 )
             }
@@ -170,7 +170,7 @@ internal class NativeChatSession(
                 BackendResult.Ok(
                     QuickAiChatResult(
                         content = output,
-                        metrics = PerformanceMetrics(totalDurationMs = lastRunDurationMs)
+                        metrics = metricsFor(handle, lastRunDurationMs)
                     )
                 )
             }
@@ -242,6 +242,18 @@ internal class NativeChatSession(
 
     private fun extractText(msg: QuickAiChatMessage): String =
         msg.parts.filterIsInstance<PromptPart.Text>().joinToString("") { it.text }
+
+    /** The engine's own counters; the wall clock only when the handle refuses. */
+    private fun metricsFor(handle: Long, wallMs: Double): PerformanceMetrics {
+        val m = try {
+            NativeCausalLm.getPerformanceMetricsHandleNative(handle)
+        } catch (t: Throwable) {
+            Log.w(TAG, "getPerformanceMetricsHandleNative threw", t)
+            null
+        }
+        return if (m != null && m.errorCode == 0) m.toPerformanceMetrics()
+        else PerformanceMetrics(totalDurationMs = wallMs)
+    }
 
     private fun errClosed(): BackendResult.Err = BackendResult.Err(
         QuickAiError.NOT_INITIALIZED,

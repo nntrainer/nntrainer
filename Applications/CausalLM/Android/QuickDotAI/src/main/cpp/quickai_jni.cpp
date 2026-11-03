@@ -95,7 +95,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
     find_global(env, "com/example/quickdotai/NativeCausalLm$MetricsResult");
   if (g_cache.metricsResultCls != nullptr) {
     g_cache.metricsResultCtor =
-      env->GetMethodID(g_cache.metricsResultCls, "<init>", "(IIDIDDDJ)V");
+      env->GetMethodID(g_cache.metricsResultCls, "<init>", "(IIDIDDDJDDDID)V");
   }
 
   return JNI_VERSION_1_6;
@@ -302,15 +302,19 @@ Java_com_example_quickdotai_NativeCausalLm_getPerformanceMetricsHandleNative(
       g_cache.metricsResultCtor == nullptr) {
     return nullptr;
   }
-  return env->NewObject(g_cache.metricsResultCls, g_cache.metricsResultCtor,
-                        static_cast<jint>(ec),
-                        static_cast<jint>(m.prefill_tokens),
-                        static_cast<jdouble>(m.prefill_duration_ms),
-                        static_cast<jint>(m.generation_tokens),
-                        static_cast<jdouble>(m.generation_duration_ms),
-                        static_cast<jdouble>(m.total_duration_ms),
-                        static_cast<jdouble>(m.initialization_duration_ms),
-                        static_cast<jlong>(m.peak_memory_kb));
+  return env->NewObject(
+    g_cache.metricsResultCls, g_cache.metricsResultCtor, static_cast<jint>(ec),
+    static_cast<jint>(m.prefill_tokens),
+    static_cast<jdouble>(m.prefill_duration_ms),
+    static_cast<jint>(m.generation_tokens),
+    static_cast<jdouble>(m.generation_duration_ms),
+    static_cast<jdouble>(m.total_duration_ms),
+    static_cast<jdouble>(m.initialization_duration_ms),
+    static_cast<jlong>(m.peak_memory_kb), static_cast<jdouble>(m.ttft_ms),
+    static_cast<jdouble>(m.first_token_ms),
+    static_cast<jdouble>(m.decode_steady_ms),
+    static_cast<jint>(m.decode_steady_tokens),
+    static_cast<jdouble>(m.prefill_drain_ms));
 }
 
 // ---------------------------------------------------------------------------
