@@ -1280,6 +1280,10 @@ bool MHACoreLayer::attention_fp32_on_device(
       return false;
     half[i] = nntrainer::Tensor(d, false);
     half[i].setData(plane[i], 0);
+    // The op table of the source: ComputeOps::attention on these planes must
+    // reach ClComputeOps (the device arms), not the CPU table a bare Tensor
+    // gets.
+    half[i].setContextData(src[i]->getContextData());
   }
   for (unsigned int i = 0; i < 3; ++i) {
     if (!nntrainer::gpu_cast_f32_to_f16_cl(
@@ -2886,8 +2890,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // The device attention arms (OpenCL), for a layer with use_gemm_attention.
   // Gated on a minimum prefill length. Decode (step_size == 1) enters when a
   // device attention arm can run (mha_device_attention_on()). A step no device
-  // arm takes falls through to the op call below, where the backend picks the
-  // host arm (CpuComputeOps::attention: per-row or flash) or the CUDA arm.
+  // arm here takes falls through to the op call below, where the backend picks
+  // the OpenCL flash / two_conv arms (ClComputeOps::attention), the CUDA arm,
+  // or a host arm (CpuComputeOps::attention: per-row or flash).
   const unsigned int FLASH_MIN_PREFILL =
     min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
   // S3 (decode GPU attention): NNTR_MHA_GPU_DECODE lets step_size==1 (decode)
@@ -2920,7 +2925,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           ml::train::TensorDim::DataType::FP16 &&
         head_dim > 0 && num_heads_KV > 0 && num_heads_Q % num_heads_KV == 0) {
 #ifdef ENABLE_FP16
-#if defined(ENABLE_OPENCL) // GPU two-conv/image/flash attention path
+#if defined(ENABLE_OPENCL) // GPU int8 two_conv / image attention path
       const uint16_t *Q_p =
         reinterpret_cast<const uint16_t *>(query_step.getData<_FP16>());
       uint16_t *O_p =
@@ -2960,11 +2965,6 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // the fly).
         ok = false;
       } else {
-        const uint16_t *K_p =
-          reinterpret_cast<const uint16_t *>(b_cached_key.getData<_FP16>());
-        const uint16_t *V_p =
-          reinterpret_cast<const uint16_t *>(b_cached_value.getData<_FP16>());
-
         // Adreno image attention (the texture-cache prefill path).
         // Read K/V via image2d_from_buffer (read_imageui texture cache) instead
         // of the SVM buffer flash kernel. The SVM KV cache can't back an image
@@ -3594,54 +3594,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           sync_kv_slab(cache_to);
         if (!ok)
           lower_q();
-        if (!ok && svm_ok) {
-          // Gemma4 sliding-window: pass local_window_size so the flash kernel
-          // masks keys older than the window (n + W <= m). UINT_MAX (full
-          // attention) and any window >= cache length are treated as "no
-          // window" inside the kernel. Prefill big-step writes from
-          // cache_from==0 so the kernel's row index m == absolute query pos.
-          const unsigned int win = (local_window_size >= (size_t)cache_to)
-                                     ? 0u
-                                     : (unsigned int)local_window_size;
-          // Decode (step_size==1): single query starves blockq/coop_vec
-          // (num_heads_Q groups). flash_decode splits the KV axis into chunks
-          // (num_heads_Q * n_chunks groups) for parallelism. Falls back to the
-          // prefill flash kernel on shape mismatch / softcap.
-          // sliding == the layer HAS a window (not "the window already
-          // clips"), so a sliding layer's cost is one series across contexts.
-          MhaAttnTimerScope _attn_timer(step_size, cache_to,
-                                        local_window_size != UINT_MAX);
-          if (step_size == 1)
-            ok = nntrainer::flash_decode_f16_cl(
-              Q_p, K_p, V_p, O_p, cache_to, num_heads_Q, num_heads_KV, head_dim,
-              /*max_seq_len=*/0u, /*svm_inputs=*/true, attn_logit_softcapping,
-              /*local_window=*/win, /*ring_cap=*/kv_ring_cap);
-          if (!ok)
-            ok = nntrainer::flash_attention_prefill_f16_cl(
-              Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q,
-              num_heads_KV, head_dim, /*max_seq_len=*/0u, is_causal,
-              /*svm_inputs=*/true, attn_logit_softcapping, /*local_window=*/win,
-              /*ring_cap=*/kv_ring_cap);
-        }
-        // image2d_from_buffer variant gated by NNTR_MHA_GPU_IMG=1. Uses 8-half
-        // texel loads (RGBA UINT32) for the d-axis reduction, ~8x fewer
-        // memory transactions vs the scalar fp16 path. Falls back to scalar
-        // on any failure. Non-SVM only (image2d_from_buffer needs cl_mem).
-        static const bool _tca_img_on =
-          std::getenv("NNTR_MHA_GPU_IMG") != nullptr;
-        if (!ok && _tca_img_on && head_dim % 8 == 0 &&
-            (num_heads_Q * head_dim) % 8 == 0 &&
-            (num_heads_KV * head_dim) % 8 == 0 &&
-            !mha_ring_refuses_arm(kv_ring_cap, "two_conv-image")) {
-          ok = nntrainer::two_conv_attention_prefill_f16_img_cl(
-            Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q, num_heads_KV,
-            head_dim, is_causal);
-        }
-        if (!ok && !mha_ring_refuses_arm(kv_ring_cap, "two_conv")) {
-          ok = nntrainer::two_conv_attention_prefill_f16_cl(
-            Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q, num_heads_KV,
-            head_dim, is_causal, svm_ok);
-        }
+        // The flash and two_conv arms over the concat cache are
+        // ClComputeOps::attention's (step 7a): a step the image arm did not
+        // take falls through to the op call below, which runs them first.
       }
       if (ok) {
         // The wo FC consumes O through its static plane: raise it into the
@@ -4164,6 +4119,10 @@ void MHACoreLayer::attend(nntrainer::Tensor &query_step,
   p.softcap = attn_logit_softcapping;
   p.sink = sink;
   p.flash = use_gemm_attention;
+  static const bool gpu_decode_env =
+    std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+  p.device_decode =
+    gpu_decode_env || std::get<props::GpuDecodeAttn>(mha_core_props).get();
   query_step.getOps()->attention(query_step, kv, output, p);
 }
 

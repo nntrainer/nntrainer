@@ -98,6 +98,12 @@ struct KVCacheView {
    *  the rows it quantizes, attention() reads them */
   uint16_t *key_scale = nullptr;
   uint16_t *value_scale = nullptr;
+
+  /** the plane rows a read of positions [0, kv_len) touches: kv_len on a
+   *  linear cache, at most ring_cap on a ringed one */
+  unsigned int rows_read(unsigned int kv_len) const {
+    return ring_cap != 0 && ring_cap < kv_len ? ring_cap : kv_len;
+  }
 };
 
 /**
@@ -116,6 +122,10 @@ struct AttentionOpParams {
    *  host flash arm, or a device arm. Which arm runs is the backend's
    *  choice; without it the host per-row arm. */
   bool flash = false;
+  /** a device arm may take a single-row (decode) step too (MHACoreLayer's
+   *  gpu_decode_attn property or NNTR_MHA_GPU_DECODE); the host arms ignore
+   *  it. */
+  bool device_decode = false;
 };
 
 /**

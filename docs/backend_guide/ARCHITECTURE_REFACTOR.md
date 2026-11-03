@@ -600,8 +600,10 @@ are gaps in the code relative to the rules above; they are not a schedule.
   CUDA attention arm is `CudaComputeOps::attention`. `KVCacheView` carries the K cache layout
   (`KOhwi`, NNTR_KV_OHWI) and an int8 element (UINT8 planes with fp16 scales), which both CPU
   ops honour, so the host OHWI and int8 writes go through `kv_cache_write` too. The OpenCL
-  device arms of all three and the CUDA RoPE and cache-write arms are still inside
-  `mha_core.cpp` (#4451).
+  flash and two_conv attention arms over the concat cache are `ClComputeOps::attention`
+  (`cl_compute_ops.cpp`), which runs them before the host arms. The OpenCL image attention
+  arm, the OpenCL RoPE and cache-write arms and the CUDA RoPE and cache-write arms are still
+  inside `mha_core.cpp` (#4451).
 - **Allocator-name string comparisons remain** in `nntrainer/tensor/memory_pool.cpp` (`"qnn"`)
   and `Applications/CausalLM/kv_cache_manager.cpp` (`"gpu-svm"`) — see §3.
 - **There is no public layer-author API.** `ml::train::Layer`
