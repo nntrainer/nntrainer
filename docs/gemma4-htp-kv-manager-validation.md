@@ -93,6 +93,59 @@ uninterrupted successful invocation.
 Changed lines were checked with clang-format 14 and `git diff --check`.
 The production v81 DSP rebuild still needs the package below.
 
+## Existing device DSP audit (subsequent correction)
+
+The phone already has v81 skeletons. The earlier explanation that a missing
+local SDK alone prevented running was incomplete: none of these device files
+had been staged in the smoke's DSP search path. The existence of a skeleton,
+its RPC coverage and the loader search path are separate checks.
+
+All 44 discovered skeleton paths were grouped by SHA256 into 30 distinct
+binaries. Every representative was pulled and checked against its device
+hash. A read-only ELF audit decoded each exported `nntr_hvx_slim` QAIC
+interface: method count, ordered names, argument types and directions,
+scalar/buffer counts and alignments. The reference metadata was generated
+from the pinned PR IDL with the SDK's qaic and compiled as a metadata-only
+Hexagon ELF. That reference ELF has unresolved kernel implementations and
+is **never deployed or executed**.
+
+| Skeleton | Actual QAIC methods, including open/close | Comparison with PR's 134 methods |
+|---|---:|---|
+| `g4ops_1016/ship/libnntr_hvx_skel.so` | 125 | All existing ordinals/signatures match; nine appended methods absent. ELF flags explicitly report V81. |
+| `nntr-w4a16-max/max-e/libnntr_hvx_skel.so` | 120 | Fourteen PR methods absent; some shared methods have different ordinals/signatures. ELF flags explicitly report V81. |
+| All 30 unique device binaries | One with 125, 17 with 120, 12 with 60 | No complete match to the current interface. |
+
+For the 125-method skeleton, `arena_attach` **is present**, at ordinal 6,
+with the same signature as the PR. Consequently, the original arena error
+44 cannot be attributed to an absent `arena_attach` RPC.
+
+A small Android probe built with the PR's real ARM stub loaded the
+125-method skeleton from a separate `rpc-probe` directory. Actual device
+results were:
+
+```text
+open_rc=0
+session_info_rc=0
+release_prefill_scratch_rc=-2147482604 hex=0x80000414
+moe_set_hadamard_signs_rc=-2147482604 hex=0x80000414
+close_rc=0
+```
+
+The SDK defines `0x80000414` as `AEE_EUNSUPPORTED` (API not implemented).
+These are actual RPC responses, not conclusions from string searches.
+The current PR uses ordinal 129 for the supplied rotated pack's signs and
+131 for prefill scratch release; neither is in the 125-method interface.
+
+Using the same working directory and probe, the original empty DSP search
+path instead failed `open` with `0x80000406` (`AEE_EUNABLETOLOAD`). Pointing
+only `ADSP_LIBRARY_PATH` at the staged skeleton made open/query/close pass.
+The earlier full-model run therefore had an unverified DSP load and must
+not be used to diagnose a specific missing RPC from its later error 44.
+
+Audit evidence: `rpc-audit/report.json`, `current-methods.json`, per-binary
+`device/*.methods.json`, `probe-absent-methods.log` and
+`probe-empty-cwd-{empty-path,dsp-path}.log` under the evidence directory.
+
 ## Current full-model blocker
 
 The public download used for HexKL supplied beta 1, with v73/v75/v79
@@ -111,9 +164,11 @@ nntr_hvx_arena_attach(16 MiB) failed: err=44 (0x0000002c)
 mapped=0 MiB in 0 chunks, RSS=2018 MB
 ```
 
-The root cause of error 44 is not established. A matching ARM client/DSP
-skeleton must be rebuilt and tested before diagnosing it as a model,
-memory-budget or manager problem. This run never used the new KV manager.
+The full-model error 44 is not itself proof of an absent RPC. The audit
+above separately confirms both the original DSP loading failure and the
+older skeleton's unsupported appended methods. A matching ARM client/DSP
+skeleton must be tested before diagnosing a model, memory-budget or
+manager problem. This run never used the new KV manager.
 There was no active inference process left after the smoke.
 
 Reproduce that diagnostic with the staged runtime:
