@@ -32,6 +32,7 @@
 
 #include <compute_ops.h>
 
+#include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -46,6 +47,18 @@ std::once_flag g_compute_ops_init_flag;
 
 void ensureComputeOps() {
   std::call_once(g_compute_ops_init_flag, []() { init_backend(); });
+}
+
+namespace {
+std::atomic<bool> g_deferred_outputs{false};
+} // namespace
+
+bool deferredOutputsPending() {
+  return g_deferred_outputs.load(std::memory_order_acquire);
+}
+
+void setDeferredOutputsPending(bool pending) {
+  g_deferred_outputs.store(pending, std::memory_order_release);
 }
 
 [[noreturn]] void ComputeOps::throwNotImplemented(const char *op) {
@@ -240,6 +253,12 @@ void ComputeOps::gemm_q4_0_batch_fp32(std::vector<void *>, float *,
                                       std::vector<unsigned int>, unsigned int) {
   NI(gemm_q4_0_batch_fp32);
 }
+void ComputeOps::gemm_tq2cx_batch_fp32(std::vector<void *>, float *,
+                                       std::vector<float *>, unsigned int,
+                                       std::vector<unsigned int>,
+                                       unsigned int) {
+  NI(gemm_tq2cx_batch_fp32);
+}
 void ComputeOps::gemm_q4_0_accel_fp32(void *, float *, float *, unsigned int,
                                       unsigned int, unsigned int) {
   NI(gemm_q4_0_accel_fp32);
@@ -414,6 +433,10 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
 void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                        unsigned int) {
   NI(geglu);
+}
+void ComputeOps::geglu_erf(const Tensor &, const Tensor &, Tensor &,
+                           unsigned int, unsigned int) {
+  NI(geglu_erf);
 }
 void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                         unsigned int) {

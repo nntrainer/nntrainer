@@ -1188,6 +1188,32 @@ void __fallback_compute_kcaches(const float *in, const BType *kcache,
                                 int head_start = 0, int head_end = -1);
 
 /**
+ * @brief RoPE (optional) + symmetric int8 snap + fp16 store, one pass: the
+ *        KV-cache write of a model trained with an int8 KV cache.
+ *
+ * For every head h (columns [h * dim, (h + 1) * dim) of each row) and
+ * element x (rotated with cos_ / sin_ first when cos_ != nullptr, using the
+ * rotate-half form of compute_rotary_emb_value):
+ *   q = nearbyint(x / head_scales[h])   (round half to even)
+ *   x = clamp(q, -128, 127) * head_scales[h]
+ * and x is stored to @a output as IEEE fp16. Every implementation must use
+ * true division and round-half-to-even so all paths give identical bits.
+ *
+ * @param[in] width row width (number of heads * dim)
+ * @param[in] dim head dimension
+ * @param[in] half_ dim / 2
+ * @param[in] input fp32 row (not modified)
+ * @param[out] output fp16 (uint16_t bits) row
+ * @param[in] cos_ cos table of this position or nullptr (no RoPE)
+ * @param[in] sin_ sin table of this position (ignored when cos_ == nullptr)
+ * @param[in] head_scales one scale per head
+ */
+void __fallback_compute_rotary_emb_value_snap(
+  unsigned int width, unsigned int dim, unsigned int half_, const float *input,
+  uint16_t *output, const float *cos_, const float *sin_,
+  const float *head_scales);
+
+/**
  * @brief Compute rotary embedding value
  * @param[in] width current w value from b, c, h, w
  * @param[in] dim unit length of simd computation
@@ -1201,6 +1227,7 @@ void __fallback_compute_kcaches(const float *in, const BType *kcache,
  * @param[in] only_convert_to_fp16 equal true if method is used only for
  * conversion
  */
+
 void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
                                          unsigned int half_, float *inout,
                                          void *output, const float *cos_,

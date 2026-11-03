@@ -22,6 +22,7 @@
 #include <env_compat.h>
 #include <kv_ring.h> // causallm::kvRingCap (shared with models/transformer.h)
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -715,7 +716,8 @@ MHACoreLayer::MHACoreLayer() :
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
     props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope(),
-    props::KvWindowRing()),
+    props::KvWindowRing(), props::KCacheInt8Scales(),
+    props::VCacheInt8Scales()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -901,6 +903,35 @@ mha_report_image_mirror_refused(size_t num_heads_KV, size_t head_dim,
   std::fflush(stderr);
 }
 
+void *MHACoreLayer::k_snap_device() {
+#if defined(ENABLE_OPENCL)
+  if (k_snap_cl == nullptr && !k_cache_int8_scales.empty())
+    k_snap_cl = nntrainer::kv_snap_scales_cl(k_cache_int8_scales);
+  return k_snap_cl;
+#else
+  return nullptr;
+#endif
+}
+
+void MHACoreLayer::storeValueRows(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                                  unsigned int from) {
+  if (v_cache_int8_scales.empty())
+    out.copyData(in);
+  else
+    apply_rotary_emb_tensor_v2(in, out, head_dim, from, /*apply_rope=*/false,
+                               &v_cache_int8_scales);
+}
+
+void *MHACoreLayer::v_snap_device() {
+#if defined(ENABLE_OPENCL)
+  if (v_snap_cl == nullptr && !v_cache_int8_scales.empty())
+    v_snap_cl = nntrainer::kv_snap_scales_cl(v_cache_int8_scales);
+  return v_snap_cl;
+#else
+  return nullptr;
+#endif
+}
+
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
@@ -994,6 +1025,27 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<props::NumHeads_KV>(mha_core_props).empty()
       ? num_heads_Q
       : static_cast<size_t>(std::get<props::NumHeads_KV>(mha_core_props).get());
+
+  /** optional int8 KV cache emulation (k/v_cache_int8_scales) */
+  auto parse_scales = [this](const std::string &str, const char *what) {
+    std::vector<float> out;
+    std::stringstream ss(str);
+    std::string item;
+    while (std::getline(ss, item, ','))
+      if (!item.empty())
+        out.push_back(std::stof(item));
+    NNTR_THROW_IF(!out.empty() &&
+                    out.size() != static_cast<size_t>(num_heads_KV),
+                  std::invalid_argument)
+      << what << ": expected " << num_heads_KV << " scales, got " << out.size();
+    return out;
+  };
+  k_cache_int8_scales =
+    parse_scales(std::get<props::KCacheInt8Scales>(mha_core_props).get(),
+                 "k_cache_int8_scales");
+  v_cache_int8_scales =
+    parse_scales(std::get<props::VCacheInt8Scales>(mha_core_props).get(),
+                 "v_cache_int8_scales");
 
   // head_dim
   head_dim = static_cast<size_t>(query_width) / num_heads_Q;
@@ -1722,9 +1774,21 @@ bool MHACoreLayer::attention_fp32_on_device(
     half[i].setData(plane[i], 0);
   }
   for (unsigned int i = 0; i < 3; ++i) {
-    if (!nntrainer::gpu_cast_f32_to_f16_cl(
-          src[i]->getData<float>(), half[i].getData<uint16_t>(),
-          static_cast<unsigned int>(src[i]->size())))
+    // The value rows of an int8-KV trained model are snapped to their int8
+    // grid in this narrowing (one launch either way): every V cache write
+    // downstream copies these rows. The keys are snapped after RoPE, in the
+    // kernel that writes them to the cache.
+    void *vs = i == 2 ? v_snap_device() : nullptr;
+    const bool ok = vs != nullptr
+                      ? nntrainer::gpu_cast_f32_to_f16_snap_cl(
+                          src[i]->getData<float>(), half[i].getData<uint16_t>(),
+                          static_cast<unsigned int>(src[i]->size()),
+                          static_cast<unsigned int>(head_dim),
+                          static_cast<unsigned int>(num_heads_KV), vs)
+                      : nntrainer::gpu_cast_f32_to_f16_cl(
+                          src[i]->getData<float>(), half[i].getData<uint16_t>(),
+                          static_cast<unsigned int>(src[i]->size()));
+    if (!ok)
       return false;
   }
 
@@ -2489,7 +2553,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // Staged (k_out_stage != null) already skips the drain by writing
             // a cl_mem; unstaged writes the SVM cache slice and, on the image
             // chain, has the same all-GPU consumer set.
-            /*drain_svm_out=*/!kv_chain_gpu_only);
+            /*drain_svm_out=*/!kv_chain_gpu_only, /*write_off=*/0,
+            /*snap_scales=*/k_snap_device());
         if (ok && k_out_stage == nullptr && kv_chain_gpu_only) {
           kv_write_undrained = true;
           // The rotation above bound an OFFSET-BAKED destination (kc_p = the
@@ -2537,7 +2602,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             ok = nntrainer::rope_inplace_f16_cl(
               k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
               cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
-              /*out_clmem=*/nullptr);
+              /*out_clmem=*/nullptr, /*drain_svm_out=*/true, /*write_off=*/0,
+              /*snap_scales=*/k_snap_device());
           }
         }
         if (ok) {
@@ -2557,7 +2623,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // Staged chain: the cache write is a decode side-fill (drain
           // skipped); v_scatter reads this step's V straight from value_step
           // (same bytes, no dependency on the cache write).
-          const bool v_stage = kv_stage_on && v_svm;
+          // An int8-KV model's V is snapped as it is stored, so the staged
+          // chain (which reads value_step itself) is not taken for it.
+          void *v_snap = v_snap_device();
+          const unsigned int v_row = (unsigned int)num_heads_KV * head_dim;
+          const bool v_stage = kv_stage_on && v_svm && v_snap == nullptr;
           if (mha_clmem_mode && v_stage) {
             // MHA_CLMEM: mirror-only store; v_scatter reads value_step.
             v_stage_svm = v_in;
@@ -2567,7 +2637,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           } else if (nntrainer::gpu_copy_f16_cl(
                        v_in, v_out, v_n, v_svm, /*in_clmem=*/v_cl,
                        /*out_clmem=*/nullptr,
-                       /*drain=*/!(v_stage || kv_chain_gpu_only))) {
+                       /*drain=*/!(v_stage || kv_chain_gpu_only), v_snap, v_row,
+                       head_dim)) {
             if (v_stage) {
               v_stage_svm = v_in;
               v_stage_clmem = v_cl;
@@ -2588,7 +2659,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               nntrainer::clmem_lower_cl(value_step, 0);
               v_cl = nullptr;
             }
-            b_cache_value_step.copyData(value_step); // host fallback
+            storeValueRows(value_step, b_cache_value_step,
+                           cache_index); // host fallback
           }
           gpu_rope_done = true;
         }
@@ -2730,7 +2802,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             _kv_soff_k ? (unsigned int)_kc_step_off : 0u, v_in, v_cl,
             _kv_soff_v ? vc_base : v_out,
             _kv_soff_v ? (unsigned int)_vc_step_off : 0u, cos_lut, sin_lut,
-            num_heads_Q, num_heads_KV, head_dim, cache_index, mp, _qkv_flush);
+            num_heads_Q, num_heads_KV, head_dim, cache_index, mp, _qkv_flush,
+            /*snap_scales=*/k_snap_device(),
+            /*v_snap_scales=*/v_snap_device());
         }
         bool ok = fused;
         if (!fused)
@@ -2738,7 +2812,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             k_p, _kv_soff_k ? kc_base : kc_p, cos_lut, sin_lut, to - from,
             num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
             /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
-            /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u);
+            /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u,
+            /*snap_scales=*/k_snap_device());
         // Enqueued without a drain: the SVM/host fallbacks below must drain
         // once if the image attention ends up missing this step.
         if (ok)
@@ -2750,11 +2825,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                               v_in, vc_base, kv_n, (int)_vc_step_off,
                               /*svm_inputs=*/true,
                               /*in_clmem=*/v_cl, /*out_base_clmem=*/nullptr,
-                              /*drain=*/false)
-                          : nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
-                                                       /*in_clmem=*/v_cl,
-                                                       /*out_clmem=*/nullptr,
-                                                       /*drain=*/false);
+                              /*drain=*/false, v_snap_device(),
+                              (unsigned int)num_heads_KV * head_dim, head_dim)
+                          : nntrainer::gpu_copy_f16_cl(
+                              v_in, v_out, kv_n, v_svm,
+                              /*in_clmem=*/v_cl,
+                              /*out_clmem=*/nullptr,
+                              /*drain=*/false, v_snap_device(),
+                              (unsigned int)num_heads_KV * head_dim, head_dim);
         // Q LAST: in-place into the SVM shadow (the OHWI decode qk reads Q_p
         // with q_clmem=null). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
@@ -3097,14 +3175,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
 #endif
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                     cache_index, true);
+                                     cache_index, true, &k_cache_int8_scales);
         }
       }
 
       // append vcache without rotary embedding
       if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                                   cache_index, false);
+                                   cache_index, false, &v_cache_int8_scales);
       } else if (query_step.getDataType() ==
                  ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -3167,7 +3245,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
                "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
-          b_cache_value_step.copyData(value_step);
+          storeValueRows(value_step, b_cache_value_step, cache_index);
         }
 #else
         NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -3704,6 +3782,29 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             kv_mirror_rows_want ? kv_mirror_rows_want : cache_key_dim.height());
           if (mirror_cap >= 8 && mirror_cap < S_max)
             S_max = (mirror_cap + 7u) & ~7u;
+          // [kimg-pack] The K image kernels are compiled for the one shift
+          // the process published, which may have grown after this layer
+          // packed its K mirror (a later layer with more KV heads x rows):
+          // re-pack the K mirror with the published shift. Its rows are
+          // re-filled from the cache by the backfill below.
+          if (kv_mirror_init &&
+              kv_kimg_gsh != nntrainer::kimg_gsh_published()) {
+            nntrainer::release_cl_mem(k_image_ohwi);
+            nntrainer::release_cl_mem(k_buf_ohwi);
+            k_image_ohwi = nullptr;
+            k_buf_ohwi = nullptr;
+            kv_kimg_gsh = nntrainer::kimg_gsh_published();
+            if (nntrainer::create_ohwi_kv_mirror(
+                  /*is_v=*/false, num_heads_KV, head_dim, kv_mirror_S_max,
+                  reinterpret_cast<cl_mem *>(&k_buf_ohwi),
+                  reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh)) {
+              kv_k_valid_to = kv_mirror_base;
+            } else {
+              // no K mirror: leave the image arm for this layer
+              kv_mirror_init = false;
+              use_image_attn = 0;
+            }
+          }
           if (!kv_mirror_init) {
             kv_mirror_S_max = S_max;
             // Same derivation as the finalize prebuild (which is Android-only).
@@ -5345,14 +5446,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, true);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true);
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true,
+                             &k_cache_int8_scales);
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
     apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               false);
+                               false, &v_cache_int8_scales);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+    storeValueRows(value_step, b_cache_value_step, _from);
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
@@ -5632,11 +5734,14 @@ void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
   }
 }
 
-void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
-                                              nntrainer::Tensor &out,
-                                              unsigned int dim,
-                                              unsigned int from,
-                                              bool apply_rope) {
+void MHACoreLayer::apply_rotary_emb_tensor_v2(
+  nntrainer::Tensor &in, nntrainer::Tensor &out, unsigned int dim,
+  unsigned int from, bool apply_rope, const std::vector<float> *snap_scales) {
+  const bool snap = snap_scales != nullptr && !snap_scales->empty();
+  NNTR_THROW_IF(snap &&
+                  out.getDataType() == ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "int8 KV cache snapping needs an fp16 cache";
   unsigned int half_ = dim / 2;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -5644,7 +5749,14 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, false);
+      // Positions this run can index (max_timestep), not
+      // max_position_embeddings: a 262144-position table is GBs per
+      // (head_dim, theta). Same cap as rope_lut_positions() on the fp16 path.
+      const unsigned int rope_len =
+        (max_timestep == 0 || max_timestep > max_position_embeddings)
+          ? max_position_embeddings
+          : max_timestep;
+      precompute_freqs(head_dim, rope_len, theta, false);
       cached_freqs_cos = freqs_cos;
       cached_freqs_sin = freqs_sin;
     }
@@ -5686,9 +5798,16 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                 c * out.height() * out.width() +
                                 h * out.width();
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), !apply_rope);
+            if (snap)
+              // int8 KV cache models: RoPE, snap and the fp16 store, one pass
+              nntrainer::compute_rotary_emb_value_snap(
+                in.width(), dim, half_, in_ptr, out_ptr,
+                apply_rope ? cos_->data() : nullptr, sin_->data(),
+                snap_scales->data());
+            else
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, out_ptr, cos_->data(),
+                                                  sin_->data(), !apply_rope);
           }
         }
       }
@@ -5713,6 +5832,22 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
       cached_freqs_sin_fp16;
     std::vector<_FP16> *cos_ = nullptr;
     std::vector<_FP16> *sin_ = nullptr;
+    // int8-KV snap on FP16 rows: the fp32 tables of the same positions
+    std::vector<float> snap_row;
+    std::vector<float> *snap_cos = nullptr;
+    std::vector<float> *snap_sin = nullptr;
+    if (snap && cached_freqs_cos == nullptr) {
+      const std::lock_guard<std::mutex> lock(rope_init_mtx);
+      if (cached_freqs_cos == nullptr) {
+        const unsigned int rope_len =
+          (max_timestep == 0 || max_timestep > max_position_embeddings)
+            ? max_position_embeddings
+            : max_timestep;
+        precompute_freqs(head_dim, rope_len, theta, false);
+        cached_freqs_cos = freqs_cos;
+        cached_freqs_sin = freqs_sin;
+      }
+    }
 
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
@@ -5720,6 +5855,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
           if (from < max_timestep) {
             cos_ = &(*freqs_cos_fp16_local)[from + h];
             sin_ = &(*freqs_sin_fp16_local)[from + h];
+            if (snap) {
+              snap_cos = apply_rope ? &(*cached_freqs_cos)[from + h] : nullptr;
+              snap_sin = &(*cached_freqs_sin)[from + h];
+            }
           }
           _FP16 *in_ptr = in.getData<_FP16>() +
                           b * in.channel() * in.height() * in.width() +
@@ -5728,6 +5867,20 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                            b * out.channel() * out.height() * out.width() +
                            c * out.height() * out.width() + h * out.width();
 
+          if (snap) {
+            // FP16 rows (the device arm's narrowed planes on its host
+            // fallback): widen the row and take the fp32 snap kernel, so
+            // the rotation, the snap and the store follow the one rule.
+            snap_row.resize(in.width());
+            for (unsigned int i = 0; i < in.width(); ++i)
+              snap_row[i] = static_cast<float>(in_ptr[i]);
+            nntrainer::compute_rotary_emb_value_snap(
+              in.width(), dim, half_, snap_row.data(),
+              reinterpret_cast<uint16_t *>(out_ptr),
+              snap_cos != nullptr ? snap_cos->data() : nullptr,
+              snap_sin->data(), snap_scales->data());
+            continue;
+          }
           nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                               out_ptr, cos_->data(),
                                               sin_->data());

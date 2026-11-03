@@ -972,6 +972,13 @@ const DeviceCaps &ClContext::caps() const {
       device_caps_.dpas =
         ext.find("cl_intel_subgroup_matrix_multiply_accumulate") !=
         std::string::npos;
+      device_caps_.int_dot_product =
+        ext.find("cl_khr_integer_dot_product") != std::string::npos;
+      // a device that did not answer keeps the default (fma() is correct
+      // either way; only its speed differs)
+      const cl_device_fp_config fp = info->getDeviceSingleFpConfig();
+      if (fp != 0)
+        device_caps_.fp32_fma = (fp & CL_FP_FMA) != 0;
 
       // Not a clean query: both kinds of device advertise
       // CL_DEVICE_IMAGE_SUPPORT and the split is a driver compiler quirk, so it

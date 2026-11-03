@@ -215,17 +215,22 @@ struct ModelTensorDataTypeInfo {
     WQ40A16,
     WQS4CXA32,
     WQS4CXA16,
+    WTQ2CXA32,
+    WTQ2CXA16,
+    WQS4ACXA32,
+    WQS4ACXA16,
   };
   /// @note W4A16 and W4A32 are deliberately absent: QINT4 is deprecated in
   /// favour of channel-wise QS4CX, so the two "QINT4-*" spellings are no
   /// longer accepted values. EnumList and EnumStr are matched by position, so
   /// the two lists drop the same slots together.
   static constexpr std::initializer_list<Enum> EnumList = {
-    Enum::W3A32,    Enum::W8A16,     Enum::W8A32,     Enum::W16A16,
-    Enum::W16A32,   Enum::W32A16,    Enum::W32A32,    Enum::WQ16AQ16,
-    Enum::WU16AU16, Enum::W8AU16,    Enum::WU4AU8,    Enum::WU4AU16,
-    Enum::WU8AU8,   Enum::WU8AU16,   Enum::WQ4KA32,   Enum::WQ40A32,
-    Enum::WQ40A16,  Enum::WQS4CXA32, Enum::WQS4CXA16,
+    Enum::W3A32,     Enum::W8A16,      Enum::W8A32,      Enum::W16A16,
+    Enum::W16A32,    Enum::W32A16,     Enum::W32A32,     Enum::WQ16AQ16,
+    Enum::WU16AU16,  Enum::W8AU16,     Enum::WU4AU8,     Enum::WU4AU16,
+    Enum::WU8AU8,    Enum::WU8AU16,    Enum::WQ4KA32,    Enum::WQ40A32,
+    Enum::WQ40A16,   Enum::WQS4CXA32,  Enum::WQS4CXA16,  Enum::WTQ2CXA32,
+    Enum::WTQ2CXA16, Enum::WQS4ACXA32, Enum::WQS4ACXA16,
   };
 
   static constexpr const char *EnumStr[] = {
@@ -233,7 +238,8 @@ struct ModelTensorDataTypeInfo {
     "FP16-FP32",     "FP32-FP16",    "FP32-FP32",   "QINT16-QINT16",
     "UINT16-UINT16", "QINT8-UINT16", "UINT4-UINT8", "UINT4-UINT16",
     "UINT8-UINT8",   "UINT8-UINT16", "Q4_K-FP32",   "Q4_0-FP32",
-    "Q4_0-FP16",     "QS4CX-FP32",   "QS4CX-FP16"};
+    "Q4_0-FP16",     "QS4CX-FP32",   "QS4CX-FP16",  "TQ2CX-FP32",
+    "TQ2CX-FP16",    "QS4ACX-FP32",  "QS4ACX-FP16"};
 };
 
 /**
