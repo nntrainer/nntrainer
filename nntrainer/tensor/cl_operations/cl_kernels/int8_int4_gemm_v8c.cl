@@ -28,6 +28,32 @@ __constant sampler_t SMP_v8c = CLK_NORMALIZED_COORDS_FALSE |
                                CLK_ADDRESS_CLAMP_TO_EDGE |
                                CLK_FILTER_NEAREST;
 
+// ------------------------------------------------------------
+// Per-channel ASYMMETRIC int4 weights (built with -DV8C_ASYM).
+//
+// w[n][k] = s[n] * (q - z[n]), q in [0, 15] and an INTEGER zero point z[n],
+// is stored in the symmetric layout unchanged (nibble q, scale s[n]); the
+// int4 kernels below then take one extra argument, wzp[n] = z[n], and the
+// zero point folds into their integer epilogue exactly:
+//   sum_k (a - zp_a) * (q - z)
+//     = acc - z * row_sum_act - zp_a * (row_sum_w + (8 - z) * K)
+// where acc = sum_k a * q is what the dp4a loop accumulates and row_sum_w =
+// sum_k (q - 8) is the symmetric weight row sum. Against the symmetric
+// epilogue (acc - 8 * row_sum_act - zp_a * row_sum_w) this only replaces the
+// constant 8 by z[n] -- no extra launch, no floating-point term, and the
+// result is the exact dequantised GEMM of the asymmetric weight against the
+// int8 activation. In the default build the macros below expand to the
+// symmetric epilogue verbatim, so that program is unchanged.
+// ------------------------------------------------------------
+#ifdef V8C_ASYM
+#define V8C_ASYM_ARG , __global const int *wzp
+#define V8C_CORRECTED(acc, rs, zp, rsw, n)                                     \
+  ((acc) - wzp[n] * (rs) - (zp) * ((rsw) + (8 - wzp[n]) * K))
+#else
+#define V8C_ASYM_ARG
+#define V8C_CORRECTED(acc, rs, zp, rsw, n) ((acc) - 8 * (rs) - (zp) * (rsw))
+#endif
+
 // ============================================================
 // fp→int8 activation quantizer + row_sum, paper §3.7 separate kernel.
 //   Input:  fp16 activations [M, K] (row-major in cl_mem buffer)
@@ -144,6 +170,20 @@ __kernel void v8c_act_quant_f32(
 // ============================================================
 #define V8C_QUANT_LWS 64
 
+// V8C_AQ_PERM (the _par kernels below): store the int8 row in "TQ2 order",
+// the order the TQ2CX TQ2_ACT_PERM GEMVs read (tq2cx_gemm.cl): inside every
+// 32-tap block, byte 4j + b holds tap 8b + j. Only the store index changes --
+// the values, the scale, the zero point and the row sum are those of the
+// plain order -- and K must be a multiple of 32 (the TQ2CX host checks it).
+#ifdef V8C_AQ_PERM
+#define V8C_AQ_IDX(k) (((k) & ~31) | (((k) & 7) << 2) | (((k) >> 3) & 3))
+#else
+#define V8C_AQ_IDX(k) (k)
+#endif
+
+// V8C_AQ_ROW0 (v8c_act_quant_f32_par): one more argument, row0 -- the
+// work-groups quantize rows row0, row0 + 1, ... (< M) in place of 0, 1, ...;
+// every row is quantized exactly as without it.
 __attribute__((reqd_work_group_size(V8C_QUANT_LWS, 1, 1)))
 __kernel void v8c_act_quant_f32_par(
     __global const float *act_fp32,
@@ -151,8 +191,16 @@ __kernel void v8c_act_quant_f32_par(
     __global       float *scale_per_row,
     __global       int   *zp_per_row,
     __global       int   *row_sum_act,
-    const int M, const int K) {
+    const int M, const int K
+#ifdef V8C_AQ_ROW0
+    , const int row0
+#endif
+    ) {
+#ifdef V8C_AQ_ROW0
+  const int row = row0 + get_group_id(0);
+#else
   const int row = get_group_id(0);
+#endif
   if (row >= M) return;
   const int tid = get_local_id(0);
   __local float lmin[V8C_QUANT_LWS];
@@ -208,7 +256,7 @@ __kernel void v8c_act_quant_f32_par(
     int q = (int)rint(act_fp32[(long)row * K + k] * scale_q) + zp;
     if (q < -128) q = -128;
     if (q > 127) q = 127;
-    act_int8[(long)row * K + k] = (char)q;
+    act_int8[(long)row * K + V8C_AQ_IDX(k)] = (char)q;
     psum += q;
   }
   lsum[tid] = psum;
@@ -280,7 +328,7 @@ __kernel void v8c_act_quant_f16_par(
     int q = (int)rint((float)act_fp16[(long)row * K + k] * scale_q) + zp;
     if (q < -128) q = -128;
     if (q > 127) q = 127;
-    act_int8[(long)row * K + k] = (char)q;
+    act_int8[(long)row * K + V8C_AQ_IDX(k)] = (char)q;
     psum += q;
   }
   lsum[tid] = psum;
@@ -425,11 +473,12 @@ __kernel void v8c_gemm_int8_int4(
     __global const int    *row_sum_w_int4,  // [N] sum_k(int4 w_nk), pre-decoded
     __global       half   *Y,               // [M, N] fp16 output
     const int M, const int N, const int K,
-    const int M_valid) {  // valid output rows: stores with row >= M_valid are
+    const int M_valid     // valid output rows: stores with row >= M_valid are
                           // skipped. Legacy callers pass M (=M_pad) so every
                           // row stores as before; direct-output mode (Y = the
                           // FC's planner sub-buffer, sized M x N) passes the
                           // unpadded M so padded rows cannot write OOB.
+    V8C_ASYM_ARG) {
 #ifdef V8C_MFAST
   // prefill weight-reuse: M is the fast-varying dispatch axis (wrapper sets
   // gws={M/TM, N/TN}), so m-tiles of a fixed n launch consecutively and the
@@ -560,7 +609,8 @@ __kernel void v8c_gemm_int8_int4(
     float s_i = scale_act[m0 + i];
     #pragma unroll
     for (int j = 0; j < V8C_TN; j++) {
-      int corrected = acc[i][j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+      int corrected =
+        V8C_CORRECTED(acc[i][j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
       float v = (float)corrected * s_i * scale_wgt[n0 + j];
       Y[(long)(m0 + i) * N + (n0 + j)] = (half)v;
     }
@@ -588,7 +638,8 @@ __kernel void v8c_gemm_int8_int4_m1(
     __global const int    *zp_act,
     __global const int    *row_sum_w_int4,
     __global       half   *Y,
-    const int M, const int N, const int K) {
+    const int M, const int N, const int K
+    V8C_ASYM_ARG) {
   const int n0 = get_global_id(0) * V8C_TN_M1;
   const int K32 = K >> 5;
 
@@ -626,7 +677,8 @@ __kernel void v8c_gemm_int8_int4_m1(
   const float s_i = scale_act[0];
   #pragma unroll
   for (int j = 0; j < V8C_TN_M1; j++) {
-    int corrected = acc[j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+    int corrected =
+      V8C_CORRECTED(acc[j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
     float v = (float)corrected * s_i * scale_wgt[n0 + j];
     Y[n0 + j] = (half)v;
   }
@@ -656,7 +708,8 @@ __kernel void v8c_gemm_int8_int4_v_ohwi(
     __global       half   *V_ohwi,        // [hKV, d, S_max] fp16
     const int M, const int N, const int K,
     const int d, const int S_max, const int position,
-    const int M_real) {                   // skip writes for rows >= M_real
+    const int M_real                      // skip writes for rows >= M_real
+    V8C_ASYM_ARG) {
   const int n0 = get_global_id(0) * V8C_TN;
   const int m0 = get_global_id(1) * V8C_TM;
   const int K32 = K >> 5;
@@ -713,7 +766,8 @@ __kernel void v8c_gemm_int8_int4_v_ohwi(
     const long t_off = (long)(position + m);
     #pragma unroll
     for (int j = 0; j < V8C_TN; j++) {
-      int corrected = acc[i][j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+      int corrected =
+        V8C_CORRECTED(acc[i][j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
       float v = (float)corrected * s_i * scale_wgt[n0 + j];
       V_ohwi[head_off + (long)(x_base + j) * (long)S_max + t_off] = (half)v;
     }
@@ -909,7 +963,8 @@ __kernel void v8c_gemm_int8_int4_buf(
     __global       half   *Y,
     const int M, const int N, const int K,
     const int W_act, const int W_wgt,
-    const int M_valid) {  // see v8c_gemm_int8_int4: skip stores >= M_valid
+    const int M_valid     // see v8c_gemm_int8_int4: skip stores >= M_valid
+    V8C_ASYM_ARG) {
   const int n0 = get_global_id(0) * V8C_TN;
   const int m0 = get_global_id(1) * V8C_TM;
   const int K32 = K >> 5;
@@ -968,7 +1023,8 @@ __kernel void v8c_gemm_int8_int4_buf(
     float s_i = scale_act[m0 + i];
     #pragma unroll
     for (int j = 0; j < V8C_TN; j++) {
-      int corrected = acc[i][j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+      int corrected =
+        V8C_CORRECTED(acc[i][j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
       float v = (float)corrected * s_i * scale_wgt[n0 + j];
       Y[(long)(m0 + i) * N + (n0 + j)] = (half)v;
     }
@@ -985,7 +1041,8 @@ __kernel void v8c_gemm_int8_int4_m1_buf(
     __global const int    *row_sum_w_int4,
     __global       half   *Y,
     const int M, const int N, const int K,
-    const int W_act, const int W_wgt) {
+    const int W_act, const int W_wgt
+    V8C_ASYM_ARG) {
   const int n0 = get_global_id(0) * V8C_TN_M1;
   const int K32 = K >> 5;
 
@@ -1023,7 +1080,8 @@ __kernel void v8c_gemm_int8_int4_m1_buf(
   const float s_i = scale_act[0];
   #pragma unroll
   for (int j = 0; j < V8C_TN_M1; j++) {
-    int corrected = acc[j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+    int corrected =
+      V8C_CORRECTED(acc[j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
     float v = (float)corrected * s_i * scale_wgt[n0 + j];
     Y[n0 + j] = (half)v;
   }
@@ -1085,8 +1143,8 @@ __kernel void v8c_gemm_int8_int4_m1_buf(
   }                                                                            \
   if (kl == 0) {                                                               \
     const int nn = get_group_id(0) * 8 + jc;                                   \
-    const int corrected =                                                      \
-      red[t] - 8 * row_sum_act[0] - zp_act[0] * row_sum_w_int4[nn];            \
+    const int corrected = V8C_CORRECTED(red[t], row_sum_act[0], zp_act[0],    \
+                                        row_sum_w_int4[nn], nn);               \
     Y[nn] = (half)((float)corrected * scale_act[0] * scale_wgt[nn]);           \
   }
 
@@ -1121,7 +1179,8 @@ __kernel void v8c_gemv_int8_int4_coop(
     __global const int    *row_sum_w_int4,
     __global       half   *Y,
     const int N, const int K,
-    const int W_wgt) {                       // weight row stride in uint4 (K/32)
+    const int W_wgt                          // weight row stride in uint4 (K/32)
+    V8C_ASYM_ARG) {
   V8C_GEMV_COOP_BODY(8, 64)
 }
 
@@ -1144,7 +1203,8 @@ __kernel void v8c_gemv_int8_int4_coop_kl16(
     __global const int    *row_sum_w_int4,
     __global       half   *Y,
     const int N, const int K,
-    const int W_wgt) {
+    const int W_wgt
+    V8C_ASYM_ARG) {
   V8C_GEMV_COOP_BODY(16, 128)
 }
 
@@ -1160,7 +1220,8 @@ __kernel void v8c_gemm_int8_int4_v_ohwi_buf(
     const int M, const int N, const int K,
     const int d, const int S_max, const int position,
     const int M_real,
-    const int W_act, const int W_wgt) {
+    const int W_act, const int W_wgt
+    V8C_ASYM_ARG) {
   const int n0 = get_global_id(0) * V8C_TN;
   const int m0 = get_global_id(1) * V8C_TM;
   const int K32 = K >> 5;
@@ -1216,7 +1277,8 @@ __kernel void v8c_gemm_int8_int4_v_ohwi_buf(
     const long t_off = (long)(position + m);
     #pragma unroll
     for (int j = 0; j < V8C_TN; j++) {
-      int corrected = acc[i][j] - 8 * rs - zp * row_sum_w_int4[n0 + j];
+      int corrected =
+        V8C_CORRECTED(acc[i][j], rs, zp, row_sum_w_int4[n0 + j], n0 + j);
       float v = (float)corrected * s_i * scale_wgt[n0 + j];
       V_ohwi[head_off + (long)(x_base + j) * (long)S_max + t_off] = (half)v;
     }

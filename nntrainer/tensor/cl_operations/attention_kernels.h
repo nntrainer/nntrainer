@@ -22,6 +22,7 @@
 #include <opencl_kernel.h>
 
 #include <string>
+#include <vector>
 
 namespace nntrainer {
 
@@ -131,13 +132,19 @@ bool two_conv_attention_prefill_f16_cl(
 /// out[write_off + ..] so the K rotation can target a STABLE base handle
 /// (cache_key) at a SCALAR per-token row offset (recordable) instead of an
 /// offset-baked SVM slice pointer. Default 0 == byte-identical.
+/// snap_scales: a cl_mem of num_heads fp32 scales; when given, every rotated
+/// value is snapped to its head's symmetric int8 grid in the store,
+/// x = clamp(rint(x / s), -128, 127) * s (int8-KV trained models; fp32
+/// rotation, true division, round half to even like the CPU kernel). nullptr
+/// == byte-identical to the build without it.
 bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          const uint16_t *cos_lut, const uint16_t *sin_lut,
                          unsigned int M, unsigned int num_heads,
                          unsigned int head_dim, unsigned int start_pos,
                          unsigned int max_positions, bool svm_inputs = false,
                          void *in_clmem = nullptr, void *out_clmem = nullptr,
-                         bool drain_svm_out = true, unsigned int write_off = 0);
+                         bool drain_svm_out = true, unsigned int write_off = 0,
+                         void *snap_scales = nullptr);
 
 /// One-launch decode commit of a token's Q/K/V: rope_inplace_f16 over Q in
 /// place, rope_inplace_f16 over K into k_dst[k_write_off + ..], and the flat V
@@ -147,15 +154,15 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
 /// the SVM pointer otherwise; the destinations are SVM cache bases. No drain;
 /// `flush` submits the batch. Returns false (nothing enqueued) when a
 /// precondition fails, so the caller can take the separate launches instead.
-bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
-                            void *k_clmem, uint16_t *k_dst,
-                            unsigned int k_write_off, const uint16_t *v,
-                            void *v_clmem, uint16_t *v_dst,
-                            unsigned int v_write_off, const uint16_t *cos_lut,
-                            const uint16_t *sin_lut, unsigned int num_heads_q,
-                            unsigned int num_heads_kv, unsigned int head_dim,
-                            unsigned int start_pos, unsigned int max_positions,
-                            bool flush);
+/// snap_scales / v_snap_scales: as rope_inplace_f16_cl's, applied to the K
+/// heads and to the V heads; both or neither (one alone returns false).
+bool qkv_rope_commit_f16_cl(
+  const uint16_t *q, void *q_clmem, const uint16_t *k, void *k_clmem,
+  uint16_t *k_dst, unsigned int k_write_off, const uint16_t *v, void *v_clmem,
+  uint16_t *v_dst, unsigned int v_write_off, const uint16_t *cos_lut,
+  const uint16_t *sin_lut, unsigned int num_heads_q, unsigned int num_heads_kv,
+  unsigned int head_dim, unsigned int start_pos, unsigned int max_positions,
+  bool flush, void *snap_scales = nullptr, void *v_snap_scales = nullptr);
 
 /// SVM-direct flat FP16 copy (out[i] = in[i], i in [0, N)). Used to scatter a
 /// V projection slice into its KV-cache window on the device without a host
@@ -170,9 +177,14 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
 /// (side-fill writes consumed only after a later full queue drain, e.g. the
 /// KV-cache slice read by host decode after the lm_head lower).
 /// Returns false if unsupported (caller falls back to a host copy).
+/// snap_scales (kv_snap_scales_cl, per kv head): snap each value to its
+/// head's int8 grid as it is stored; rows are row_len values of head_dim.
+/// SVM shape only.
 bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
                      bool svm_inputs = false, void *in_clmem = nullptr,
-                     void *out_clmem = nullptr, bool drain = true);
+                     void *out_clmem = nullptr, bool drain = true,
+                     void *snap_scales = nullptr, unsigned int row_len = 0,
+                     unsigned int head_dim = 0);
 
 /// Row-offset KV side-fill: writes into a STABLE out_base at [write_off + i]
 /// (write_off = cache_index * num_heads_KV * head_dim) instead of an
@@ -183,7 +195,9 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
 bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
                          int write_off, bool svm_inputs = false,
                          void *in_clmem = nullptr,
-                         void *out_base_clmem = nullptr, bool drain = true);
+                         void *out_base_clmem = nullptr, bool drain = true,
+                         void *snap_scales = nullptr, unsigned int row_len = 0,
+                         unsigned int head_dim = 0);
 
 /// Grow-only cl_mem staging buffer for kernel-chain temporaries (e.g. the
 /// rotated-K staging temp between RoPE and k_scatter). *buf / *cap persist at
@@ -219,6 +233,24 @@ std::shared_ptr<MemoryData> fp16_act_stage_svm(unsigned int slot, size_t bytes);
  * @return false when the kernel could not be built or bound
  */
 bool gpu_cast_f32_to_f16_cl(const float *in, uint16_t *out, unsigned int N);
+
+/**
+ * @brief gpu_cast_f32_to_f16_cl with an int8 snap of every value to its kv
+ *        head's grid, x = clamp(rint(x / s), -128, 127) * s, before the
+ *        store: the value rows of an int8-KV trained model (one launch, the
+ *        same as the plain narrowing it replaces).
+ * @param head_dim values per head; a row holds num_heads heads
+ * @param snap_scales cl_mem of num_heads fp32 scales (kv_snap_scales_cl)
+ */
+bool gpu_cast_f32_to_f16_snap_cl(const float *in, uint16_t *out, unsigned int N,
+                                 unsigned int head_dim, unsigned int num_heads,
+                                 void *snap_scales);
+
+/**
+ * @brief Upload per-head int8 KV scales once; the returned cl_mem is what the
+ *        snapping kernels take. nullptr for an empty list.
+ */
+void *kv_snap_scales_cl(const std::vector<float> &scales);
 
 /**
  * @brief Widen N FP16 values to FP32 on the device, SVM to SVM.
@@ -417,6 +449,13 @@ void attention_prewarm_programs(ClContext &cc);
  *        call it once with the largest max_S the run can reach.
  */
 unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S);
+
+/**
+ * @brief The packing shift currently published for the K image kernels (the
+ *        largest any layer has asked for). A K mirror packed with a different
+ *        shift must be re-packed before the kernels read it.
+ */
+unsigned int kimg_gsh_published();
 
 /**
  * @brief Row capacity to build an OHWI K/V mirror with for `rows` KV rows:

@@ -29,16 +29,36 @@
 
 namespace nntrainer {
 
+namespace props {
+/**
+ * @brief gelu form of the GeGLU, as HF names it: "tanh" (gelu_pytorch_tanh,
+ *        the default) or "none" (exact erf gelu).
+ */
+class GeluApproximate : public Property<std::string> {
+public:
+  GeluApproximate(const std::string &value = "tanh") { set(value); }
+  static constexpr const char *key = "gelu_approximate";
+  using prop_tag = str_prop_tag;
+  bool isValid(const std::string &v) const override {
+    return v == "tanh" || v == "none";
+  }
+};
+} // namespace props
+
 /**
  * @class GeGLULayer
- * @brief GeGLU (gelu_tanh(gate) * up), backend-neutral via ComputeOps.
+ * @brief GeGLU (gelu(gate) * up, tanh or exact gelu), backend-neutral via
+ *        ComputeOps.
  */
 class GeGLULayer final : public Layer {
 public:
   /**
    * @brief Construct a new GeGLULayer object
    */
-  GeGLULayer() : Layer(), geglu_props(props::Print(), props::SkipPrefill()) {}
+  GeGLULayer() :
+    Layer(),
+    geglu_props(props::Print(), props::SkipPrefill(),
+                props::GeluApproximate()) {}
 
   /**
    * @brief Destroy the GeGLULayer object
@@ -93,7 +113,9 @@ public:
 private:
   bool skip_prefill =
     false; /**< skip compute during prefill (Gemma4 KV-share) */
-  std::tuple<props::Print, props::SkipPrefill> geglu_props;
+  bool exact_gelu = false; /**< erf gelu instead of the tanh form */
+  std::tuple<props::Print, props::SkipPrefill, props::GeluApproximate>
+    geglu_props;
 };
 
 } // namespace nntrainer

@@ -621,6 +621,33 @@ void __fallback_compute_kcaches(const float *in, const uint16_t *kcache,
   throw std::runtime_error("NYI : __fallback_compute_kcaches");
 }
 
+void __fallback_compute_rotary_emb_value_snap(
+  unsigned int width, unsigned int dim, unsigned int half_, const float *input,
+  uint16_t *output, const float *cos_, const float *sin_,
+  const float *head_scales) {
+  for (unsigned int w = 0; w < width; w += dim) {
+    const float s = head_scales[w / dim];
+    for (unsigned int k = 0; k < half_; ++k) {
+      float a = input[w + k];
+      float b = input[w + k + half_];
+      if (cos_ != nullptr) {
+        const float ac = a * cos_[k];
+        const float bs = b * sin_[k];
+        const float as = a * sin_[k];
+        const float bc = b * cos_[k];
+        a = ac - bs;
+        b = as + bc;
+      }
+      const float qa =
+        std::min(127.0f, std::max(-128.0f, std::nearbyint(a / s)));
+      const float qb =
+        std::min(127.0f, std::max(-128.0f, std::nearbyint(b / s)));
+      output[w + k] = compute_fp32_to_fp16(qa * s);
+      output[w + k + half_] = compute_fp32_to_fp16(qb * s);
+    }
+  }
+}
+
 void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
                                          unsigned int half_, float *inout,
                                          void *output, const float *cos_,
