@@ -497,6 +497,20 @@ protected:
   void compactKVCache(unsigned int pos, bool force = false);
 
   /**
+   * @brief [C] NNTR_HTP_KV_ADOPT, before a prefill that ends at @a end: the
+   *        decode attention caches registered now, sized and based as the
+   *        compaction at @a end will leave the windowed layers, and each
+   *        HTP attention layer told its ordinal and decode base, so its last
+   *        prefill call seeds its decode cache (setHtpPrefillSeed). Not
+   *        registered: the layers keep their int8 caches to the first token.
+   */
+  void prepareKvAdopt(unsigned int end);
+
+  /** [C] prepareKvAdopt's @a end when it registered the decode caches (the
+   *  generation's window must then be that one), else 0 */
+  unsigned int adopt_window_end_ = 0;
+
+  /**
    * @brief Per-layer KV geometry, read from the model's hooks.
    */
   struct KVCacheLayout {

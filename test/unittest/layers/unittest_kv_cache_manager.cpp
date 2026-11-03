@@ -211,6 +211,128 @@ TEST(KVCacheManagerHybrid, compact_folds_the_dropped_rows_amax) {
   EXPECT_TRUE(m.droppedAmaxV(0).empty());
 }
 
+TEST(KVCacheManagerHybrid, compact_moves_a_detached_layers_base_only) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // two windowed layers of 4 rows, a window of 2; layer 0's rows freed
+  // elsewhere (an HTP layer's DSP copy took them): its base moves as layer
+  // 1's does, its bytes and its dropped-rows fold stay untouched
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  EXPECT_FALSE(m.hasKVAliasing());
+  EXPECT_FALSE(m.hasRingLayer()) << "a compacted window is not a ring";
+  for (unsigned l = 0; l < 2; ++l)
+    for (auto *cache : {&m.getKeyCache(l), &m.getValueCache(l)}) {
+      auto *bits = cache->getData<uint16_t>();
+      for (unsigned i = 0; i < 8; ++i)
+        bits[i] = static_cast<uint16_t>(0x3C00 + 16 * l + i);
+    }
+  m.setLayerDetached(0, true);
+  EXPECT_TRUE(m.isLayerDetached(0));
+  EXPECT_FALSE(m.isLayerDetached(1));
+  EXPECT_FALSE(m.isLayerDetached(9));
+  EXPECT_TRUE(m.compact(4));
+  EXPECT_EQ(m.getBase(0), 2u);
+  EXPECT_EQ(m.getBase(1), 2u);
+  for (auto *cache : {&m.getKeyCache(0), &m.getValueCache(0)})
+    for (unsigned i = 0; i < 8; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 0x3C00 + i) << "touched";
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  for (auto *cache : {&m.getKeyCache(1), &m.getValueCache(1)})
+    for (unsigned i = 0; i < 4; ++i)
+      EXPECT_EQ(cache->getData<uint16_t>()[i], 0x3C00 + 16 + 4 + i);
+  EXPECT_FALSE(m.droppedAmaxK(1).empty());
+  // a new allocation forgets it
+  m = causallm::KVCacheManager{};
+  m.allocate(2, 1, 8, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {4, 4}, {2, 2});
+  EXPECT_FALSE(m.isLayerDetached(0));
+}
+
+TEST(KVCacheManagerStaging, one_block_for_every_layer_and_bases_move) {
+  // [C] staging: every layer's K (and V) is a view of one block of the
+  // widest layer's width, its rows the step's only; compact(pos) moves each
+  // base to pos and no row
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  m.setStaging(8);
+  EXPECT_TRUE(m.isStaging());
+  m.allocate(3, 1, 32, std::vector<unsigned int>{4, 2, 4}, dtype,
+             ml::train::TensorDim::Format::NCHW, {32, 32, 32}, {0, 0, 0});
+  for (unsigned l = 0; l < 3; ++l) {
+    EXPECT_EQ(m.getRows(l), 8u);
+    EXPECT_EQ(m.getKeyCache(l).getData<uint16_t>(),
+              m.getKeyCache(0).getData<uint16_t>());
+    EXPECT_EQ(m.getValueCache(l).getData<uint16_t>(),
+              m.getValueCache(0).getData<uint16_t>());
+    EXPECT_EQ(m.getKeyCache(l).width(), l == 1 ? 2u : 4u);
+  }
+  EXPECT_NE(m.getKeyCache(0).getData<uint16_t>(),
+            m.getValueCache(0).getData<uint16_t>());
+  uint16_t *k = m.getKeyCache(0).getData<uint16_t>();
+  for (unsigned i = 0; i < 8 * 4; ++i)
+    k[i] = static_cast<uint16_t>(0x3C00 + i);
+  EXPECT_EQ(m.baseAfterCompact(1, 6), 6u);
+  EXPECT_TRUE(m.compact(6));
+  for (unsigned l = 0; l < 3; ++l)
+    EXPECT_EQ(m.getBase(l), 6u);
+  for (unsigned i = 0; i < 8 * 4; ++i)
+    EXPECT_EQ(k[i], 0x3C00 + i) << "a staging compact moved rows";
+  EXPECT_TRUE(m.droppedAmaxK(0).empty());
+  EXPECT_FALSE(m.compact(6));
+  EXPECT_TRUE(m.compact(14)); // a step of 8 rows from 14 fits
+  EXPECT_EQ(m.getBase(2), 14u);
+  // KV sharing does not stage
+  causallm::KVCacheManager s;
+  s.setStaging(8);
+  s.setLayerKVSources({-1, 0});
+  EXPECT_THROW(s.allocate(2, 1, 32, std::vector<unsigned int>{4, 4}, dtype,
+                          ml::train::TensorDim::Format::NCHW, {32, 32}, {0, 0}),
+               std::invalid_argument);
+}
+
+TEST(KVCacheManagerHybrid, base_after_compact_is_what_compact_leaves) {
+  causallm::KVCacheManager m;
+#ifdef ENABLE_FP16
+  const auto dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  // layer 0 windowed (8 rows, keep 4), layer 1 full
+  m.allocate(2, 1, 16, std::vector<unsigned int>{2, 2}, dtype,
+             ml::train::TensorDim::Format::NCHW, {8, 16}, {4, 0});
+  for (unsigned pos : {2u, 4u, 5u, 7u, 8u}) {
+    const unsigned want0 = m.baseAfterCompact(0, pos);
+    const unsigned want1 = m.baseAfterCompact(1, pos);
+    m.compact(pos);
+    EXPECT_EQ(m.getBase(0), want0) << "pos " << pos;
+    EXPECT_EQ(m.getBase(1), want1) << "pos " << pos;
+  }
+  EXPECT_EQ(m.getBase(0), 4u);
+  EXPECT_EQ(m.baseAfterCompact(0, 6u), 4u) << "a base never moves back";
+  EXPECT_EQ(m.getBase(1), 0u);
+}
+
+TEST(KVCacheManagerHybrid, ring_and_alias_queries) {
+  causallm::KVCacheManager m;
+  m.setLayerCaps({4, 0});
+  m.allocate(2, 1, 8, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_TRUE(m.hasRingLayer());
+  causallm::KVCacheManager a;
+  a.setLayerKVSources({-1, 0});
+  a.allocate(2, 1, 8, 2, 8, ml::train::TensorDim::DataType::FP32);
+  EXPECT_TRUE(a.hasKVAliasing());
+  EXPECT_FALSE(a.hasRingLayer());
+}
+
 TEST(KVCacheManagerHybrid, invalid_later_window_leaves_every_layer_unchanged) {
   causallm::KVCacheManager m;
 #ifdef ENABLE_FP16

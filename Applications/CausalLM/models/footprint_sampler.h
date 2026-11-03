@@ -43,6 +43,7 @@
 #ifndef __CAUSAL_LM_FOOTPRINT_SAMPLER_H__
 #define __CAUSAL_LM_FOOTPRINT_SAMPLER_H__
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -174,6 +175,9 @@ public:
       std::lock_guard<std::mutex> lk(m_);
       peak_kb_ = 0;
       peak_anon_kb_ = peak_gpu_kb_ = peak_dma_kb_ = 0;
+      phase_ = kLoad;
+      for (size_t &p : phase_peak_kb_)
+        p = 0;
       stop_ = false;
     }
     sample(); // one synchronous sample, so a run shorter than a tick reports
@@ -206,6 +210,20 @@ public:
     return peak_kb_;
   }
 
+  /** @brief The run's phases, each with its own peak (phasePeakKb): which
+   *  one sets the run's peak is what says whether a saving in it shows. */
+  enum Phase { kLoad = 0, kPrefill, kFirstToken, kDecode, kPhases };
+  /** @brief From now on the samples count to @a p (from the sampler's next
+   *  tick: sample() is never concurrent, so no sample is taken here). */
+  void phase(Phase p) {
+    std::lock_guard<std::mutex> lk(m_);
+    phase_ = p;
+  }
+  size_t phasePeakKb(Phase p) {
+    std::lock_guard<std::mutex> lk(m_);
+    return phase_peak_kb_[p];
+  }
+
   /** The three terms as they stood at the peak, for the run summary. */
   void peakTerms(size_t &anon_kb, size_t &gpu_kb, size_t &dma_kb) {
     std::lock_guard<std::mutex> lk(m_);
@@ -234,6 +252,7 @@ public:
 
     std::lock_guard<std::mutex> lk(m_);
     const size_t now_kb = anon_kb + accel_kb;
+    phase_peak_kb_[phase_] = std::max(phase_peak_kb_[phase_], now_kb);
     if (now_kb > peak_kb_) {
       peak_kb_ = now_kb;
       peak_anon_kb_ = anon_kb;
@@ -272,6 +291,8 @@ private:
   size_t peak_anon_kb_ = 0;
   size_t peak_gpu_kb_ = 0;
   size_t peak_dma_kb_ = 0;
+  Phase phase_ = kLoad;
+  size_t phase_peak_kb_[kPhases] = {};
   /** Touched by sample() only, and sample() is never concurrent: arm()
    *  takes its synchronous sample before the thread exists and finish() takes
    *  its last one after the join. */
