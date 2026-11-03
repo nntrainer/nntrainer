@@ -13,6 +13,7 @@
 
 #include "nntrainer_test_util.h"
 #include "util_func.h"
+#include <array>
 #include <fstream>
 #include <nntrainer_error.h>
 #include <quantizer.h>
@@ -403,6 +404,91 @@ TEST(nntrainer_Quantizer, per_tensor_affine_05_p) {
 
   ASSERT_EQ(output_s8, float_answer);
   ASSERT_EQ(output_u8, float_answer);
+}
+
+/**
+ * @brief Automatically calculate UINT8 affine parameters and round-trip data.
+ */
+TEST(nntrainer_Quantizer, per_tensor_affine_uint8_auto_qparams) {
+  const std::array<std::array<float, 3>, 3> inputs = {{
+    {-127.5f, 0.0f, 127.5f},
+    {0.0f, 127.5f, 255.0f},
+    {-255.0f, -127.5f, 0.0f},
+  }};
+  const std::array<unsigned int, 3> expected_zero_points = {128, 0, 255};
+
+  std::unique_ptr<nntrainer::Quantizer> quantizer =
+    nntrainer::Quantization::createQuantizer(
+      nntrainer::QScheme::PER_TENSOR_AFFINE);
+
+  for (unsigned int i = 0; i < inputs.size(); ++i) {
+    nntrainer::Tensor input({1, 1, 1, 3}, inputs[i].data());
+    nntrainer::Tensor quantized =
+      quantizer->quantize(input, nntrainer::Tdatatype::UINT8);
+
+    EXPECT_EQ(*quantized.getZeroPoint(), expected_zero_points[i]);
+    EXPECT_FLOAT_EQ(*quantized.getScale<float>(), 1.0f);
+
+    nntrainer::Tensor output =
+      quantizer->dequantize(quantized, nntrainer::Tdatatype::FP32);
+    for (unsigned int w = 0; w < 3; ++w)
+      EXPECT_NEAR(output.getValue(0, 0, 0, w), inputs[i][w], 0.50001f);
+  }
+}
+
+/**
+ * @brief Automatically calculate UINT16 and UINT4 affine parameters.
+ */
+TEST(nntrainer_Quantizer, per_tensor_affine_other_unsigned_auto_qparams) {
+  float uint16_data[] = {-32767.5f, 0.0f, 32767.5f};
+  nntrainer::Tensor uint16_input({1, 1, 1, 3}, uint16_data);
+  float uint4_data[] = {-7.5f, 0.0f, 7.5f};
+  nntrainer::Tensor uint4_input({1, 1, 1, 3}, uint4_data);
+
+  std::unique_ptr<nntrainer::Quantizer> quantizer =
+    nntrainer::Quantization::createQuantizer(
+      nntrainer::QScheme::PER_TENSOR_AFFINE);
+
+  nntrainer::Tensor uint16_quantized =
+    quantizer->quantize(uint16_input, nntrainer::Tdatatype::UINT16);
+  EXPECT_EQ(*uint16_quantized.getZeroPoint(), 32768u);
+  EXPECT_FLOAT_EQ(*uint16_quantized.getScale<float>(), 1.0f);
+  EXPECT_EQ(uint16_quantized.getValue<uint16_t>(0), 0u);
+  EXPECT_EQ(uint16_quantized.getValue<uint16_t>(1), 32768u);
+  EXPECT_EQ(uint16_quantized.getValue<uint16_t>(2), 65535u);
+
+  nntrainer::Tensor uint4_quantized =
+    quantizer->quantize(uint4_input, nntrainer::Tdatatype::UINT4);
+  EXPECT_EQ(*uint4_quantized.getZeroPoint(), 8u);
+  EXPECT_FLOAT_EQ(*uint4_quantized.getScale<float>(), 1.0f);
+
+  nntrainer::Tensor uint4_output =
+    quantizer->dequantize(uint4_quantized, nntrainer::Tdatatype::FP32);
+  for (unsigned int w = 0; w < 3; ++w)
+    EXPECT_NEAR(uint4_output.getValue(0, 0, 0, w), uint4_data[w], 0.50001f);
+}
+
+/**
+ * @brief UINT8 automatic affine codes are invariant under unit scaling.
+ */
+TEST(nntrainer_Quantizer, per_tensor_affine_uint8_unit_invariance) {
+  float input_data[] = {-128.0f, 0.0f, 127.0f};
+  float scaled_input_data[] = {-256.0f, 0.0f, 254.0f};
+  nntrainer::Tensor input({1, 1, 1, 3}, input_data);
+  nntrainer::Tensor scaled_input({1, 1, 1, 3}, scaled_input_data);
+
+  std::unique_ptr<nntrainer::Quantizer> quantizer =
+    nntrainer::Quantization::createQuantizer(
+      nntrainer::QScheme::PER_TENSOR_AFFINE);
+  nntrainer::Tensor quantized =
+    quantizer->quantize(input, nntrainer::Tdatatype::UINT8);
+  nntrainer::Tensor scaled_quantized =
+    quantizer->quantize(scaled_input, nntrainer::Tdatatype::UINT8);
+
+  EXPECT_EQ(*quantized.getZeroPoint(), *scaled_quantized.getZeroPoint());
+  for (unsigned int w = 0; w < 3; ++w)
+    EXPECT_EQ(quantized.getValue<uint8_t>(w),
+              scaled_quantized.getValue<uint8_t>(w));
 }
 
 /**
