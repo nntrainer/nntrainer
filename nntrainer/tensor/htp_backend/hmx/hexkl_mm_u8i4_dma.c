@@ -501,7 +501,7 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
 
 /** @brief One weight's columns on the HVX GEMV, split over the pool. */
 typedef struct {
-  const uint8_t *act_ah; /**< VTCM: the rows' AH tiles */
+  const uint8_t *act_ah; /**< cached memory: the rows' AH tiles */
   const uint8_t *wh;     /**< VTCM: the weight's WH tiles */
   const hexkl_weight_u8i4 *h;
   uint32_t M, k_tiles, nt_n, ld;
@@ -529,12 +529,74 @@ static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
 }
 
 /**
- * @brief hexkl_mm_u8i4_layer_run for M <= LAYER_GEMV_MAX_ROWS: the same
- *        weight DMA into VTCM (double-buffered across handles), but the
- *        rows on the HVX GEMV instead of a 64-row HMX block. A decode row
- *        otherwise pays the 63 padding rows three times: zeroing them in
- *        the activation, multiplying them, and reading the accumulator out
+ * @brief DMA queues the GEMV path spreads a weight over (#177's lanes).
+ *
+ * One: with the src bypass, M = 1 over six weights took 160 us (up,
+ * 1536 x 6 x 2048) / 182 (down, 12288 x 6 x 256) on the S26 Ultra at one
+ * queue and 160 / 212 at four; the S25 Ultra 172 / 666-943 at one, no
+ * better at two or four. The bypass, not the queue count, was the win.
+ */
+#define LAYER_GEMV_DMA_Q 1u
+
+/** @brief Per lane, its one descriptor of the current run; a lane waits for
+ *         it before its unit returns, so the next run may reuse it. */
+static hexkl_dma_desc2d g_layer_gemv_desc[LAYER_GEMV_DMA_Q]
+  __attribute__((aligned(128)));
+
+/** @brief One pool run: lane i < nq issues k-tile rows [nrows i / nq,
+ *         nrows (i + 1) / nq) of the next weight on its own DMA queue, runs
+ *         its share of the current weight's GEMV, then waits for its rows. */
+typedef struct {
+  const layer_gemv_job *gemv; /**< NULL: the run only moves a weight */
+  uint8_t *dst;               /**< NULL: no weight to move */
+  const uint8_t *src;
+  uint32_t row, nrows; /**< bytes per k-tile row, k-tile rows */
+  int bypass; /**< read around the L2: a weight no DSP store writes again */
+  uint32_t nq;
+  volatile uint32_t timed_out; /**< only ever set to 1 */
+} layer_gemv_run;
+
+static void layer_gemv_run_worker(uint32_t n, uint32_t i, void *v) {
+  layer_gemv_run *r = (layer_gemv_run *)v;
+  const uint32_t nq = r->nq < n ? r->nq : n;
+  hexkl_dma_desc2d *d = NULL;
+  if (r->dst != NULL && i < nq) {
+    const uint32_t r0 = (uint32_t)((uint64_t)r->nrows * i / nq);
+    const uint32_t r1 = (uint32_t)((uint64_t)r->nrows * (i + 1u) / nq);
+    if (r0 < r1) {
+      d = &g_layer_gemv_desc[i];
+      hexkl_dma_lane_push2d(d, NULL, r->dst + (size_t)r0 * r->row,
+                            r->src + (size_t)r0 * r->row, r->row, r->row,
+                            r->row, r1 - r0, r->bypass, /*dst_vtcm=*/1);
+    }
+  }
+  if (r->gemv != NULL) {
+    layer_gemv_worker(n, i, (void *)r->gemv);
+  }
+  if (d != NULL && hexkl_dma_lane_wait(d) != 0) {
+    r->timed_out = 1u;
+  }
+}
+
+/**
+ * @brief hexkl_mm_u8i4_layer_run for M <= LAYER_GEMV_MAX_ROWS: the rows on
+ *        the HVX GEMV instead of a 64-row HMX block. A decode row otherwise
+ *        pays the 63 padding rows three times: zeroing them in the
+ *        activation, multiplying them, and reading the accumulator out
  *        through four convert passes a tile.
+ *
+ * The weights still land in VTCM, double-buffered across handles, but over
+ * the lanes' queues instead of the ring: each pool run moves weight i + 1
+ * while it computes weight i, each of LAYER_GEMV_DMA_Q lanes issuing a
+ * slice of the k-tile rows on its own queue (the MoE M=1 path's #177
+ * feed). A
+ * weight no DSP store wrote is read around the L2 (the src bypass), which
+ * took the S26 Ultra's up M = 1 from 235 to 160 us.
+ *
+ * ponytail: on the S25 Ultra (v79) a narrow, deep weight -- the shared
+ * down's 160-column slices at K = 12288 -- is ~3x slower on this GEMV than
+ * on the HMX (6 x 256 columns: ~900 vs 276 us); the cause is not yet
+ * found. Gate on the column tiles, or split K over the pool, there.
  *
  * The int32 sums are the HMX's (hvx_gemm_u8i4_wh.h) and the dequant is the
  * per-tile one in the pipelined epilogue's order, so a row's f32 output is
@@ -571,18 +633,6 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       return AEE_ENOMEMORY;
     }
     act_ah = act_own;
-  }
-
-  hexkl_dma_ring_reset();
-  {
-    const hexkl_weight_u8i4 *h0 = &tbl->slots[handles[0]];
-    const uint32_t wb0 =
-      k_tiles * (h0->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
-    const uint32_t rs0 = dma_row_size_dividing(wb0);
-    hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
-                          wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-  }
-  if (act_own != NULL) {
     /* m_pad = M: the GEMV reads rows 0..M-1 only, so no padding to zero */
     HEXKL_PROBE_T0(p0);
     rc = o->act_scale == NULL
@@ -593,47 +643,63 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
            : hvx_quant_pack_u8_ah(act_f32, M, M, K, o->act_scale, o->act_zp,
                                   act_own, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-  }
-  HEXKL_PROBE_T0(p0);
-  hexkl_dma_ring_drain();
-  HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-  if (rc != AEE_SUCCESS) {
-    free(act_own);
-    return rc;
+    if (rc != AEE_SUCCESS) {
+      free(act_own);
+      return rc;
+    }
   }
 
+  layer_gemv_run run;
+  memset(&run, 0, sizeof(run));
+  run.nq = LAYER_GEMV_DMA_Q;
+  layer_gemv_job job;
   size_t out_off = 0;
-  for (uint32_t i = 0; i < n_handles; ++i) {
-    const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
-    if (i + 1 < n_handles) {
-      const hexkl_weight_u8i4 *hn = &tbl->slots[handles[i + 1]];
-      const uint32_t wb_next =
-        k_tiles * (hn->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
-      const uint32_t rs = dma_row_size_dividing(wb_next);
-      hexkl_dma_ring_push2d(vtcm_base + wbuf[(i + 1) & 1u], hn->wh_bytes, rs,
-                            rs, rs, wb_next / rs, /*src_vtcm=*/0,
-                            /*dst_vtcm=*/1);
+  /* Run i moves handle i (into buffer i & 1) and computes handle i - 1:
+     n_handles + 1 runs, the first only a move, the last only a GEMV. */
+  for (uint32_t i = 0; i <= n_handles; ++i) {
+    run.dst = NULL;
+    run.gemv = NULL;
+    if (i < n_handles) {
+      const hexkl_weight_u8i4 *hn = &tbl->slots[handles[i]];
+      run.dst = vtcm_base + wbuf[i & 1u];
+      run.src = hn->wh_bytes;
+      run.row = (hn->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+      run.nrows = k_tiles;
+      /* the MoE feed's rule (moe_weight_src_bypass): a host arena's bytes,
+         or a heap image flushed at registration, have no dirty DSP line */
+      run.bypass = hn->borrowed || hn->clean;
     }
-    layer_gemv_job job = {act_ah,
-                          vtcm_base + wbuf[i & 1u],
-                          h,
-                          M,
-                          k_tiles,
-                          h->N / HEXKL_HMX_INT8_BLOCK_N_COL,
-                          o->out_ld ? o->out_ld[i] : h->N,
-                          act_scale,
-                          act_zp,
-                          o->out_off ? out_cat + o->out_off[i]
-                                     : out_cat + out_off,
-                          o->accumulate};
-    hvx_worker_pool_run(o->pool, layer_gemv_worker, &job, job.nt_n);
+    uint32_t units = run.nq;
+    if (i > 0u) {
+      const uint32_t c = i - 1u;
+      const hexkl_weight_u8i4 *h = &tbl->slots[handles[c]];
+      job.act_ah = act_ah;
+      job.wh = vtcm_base + wbuf[c & 1u];
+      job.h = h;
+      job.M = M;
+      job.k_tiles = k_tiles;
+      job.nt_n = h->N / HEXKL_HMX_INT8_BLOCK_N_COL;
+      job.ld = o->out_ld ? o->out_ld[c] : h->N;
+      job.act_scale = act_scale;
+      job.act_zp = act_zp;
+      job.out = o->out_off ? out_cat + o->out_off[c] : out_cat + out_off;
+      job.accumulate = o->accumulate;
+      run.gemv = &job;
+      out_off += (size_t)M * h->N;
+      if (job.nt_n > units) {
+        units = job.nt_n;
+      }
+    }
     HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-    out_off += (size_t)M * h->N;
+    hvx_worker_pool_run(o->pool, layer_gemv_run_worker, &run, units);
+    HEXKL_PROBE_ADD(i == 0u ? HEXKL_PROBE_DRAIN : HEXKL_PROBE_MM, p0);
+    if (run.timed_out) {
+      rc = AEE_EFAILED;
+      break;
+    }
   }
   free(act_own);
-  return AEE_SUCCESS;
+  return rc;
 }
 
 #endif /* NNTR_HVX_NO_M1_GEMV */

@@ -6983,6 +6983,9 @@ private:
                                 bool out_to_host) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
+    // The chunks run on the MoE kernel, whose M=1 GEMV is a session option:
+    // a model with no MoE layer would otherwise never turn it on.
+    sendMoeOptsOnce(session);
     const DenseHandles &dh = get_or_register_dense(
       up, gate, down, session, K, I, N, up_scale, gate_scale, down_scale);
     // Every chunk is an "expert" that takes every row with weight 1: the
