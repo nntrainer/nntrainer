@@ -926,6 +926,19 @@ TEST_F(ComputeOpsDispatchTest, KvCacheWriteWrapsOnARing) {
  * @brief A null plane is left to the caller; a write past the last cache row
  *        is rejected.
  */
+/**
+ * @brief The rows a read needs follow the ring: a device attention arm that
+ *        reads a ringed cache checks its planes against them, not kv_len.
+ */
+TEST(KVCacheViewTest, RowsReadFollowsTheRing) {
+  nntrainer::KVCacheView kv;
+  EXPECT_EQ(kv.rows_read(100), 100u); // linear
+  kv.ring_cap = 64;
+  EXPECT_EQ(kv.rows_read(40), 40u); // the ring not yet full
+  EXPECT_EQ(kv.rows_read(64), 64u);
+  EXPECT_EQ(kv.rows_read(100), 64u); // past Wcap: the ring's rows
+}
+
 TEST_F(ComputeOpsDispatchTest, KvCacheWriteSkipsNullPlaneAndRejects) {
   constexpr unsigned int R = 2, head_dim = 8, W = head_dim;
   nntrainer::Tensor k = stepRows(R, W, 0.0f), v = stepRows(R, W, 1.0f);

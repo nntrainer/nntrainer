@@ -129,6 +129,140 @@ private:
 
 } // namespace
 
+#ifdef ENABLE_FP16
+/**
+ * @brief The device attention arms MHACoreLayer ran itself over its concat
+ *        FP16 cache (step 7a of #4466, first slice): the flash kernels (a
+ *        decode form and a prefill form, over shared virtual memory) and the
+ *        two_conv kernels (over SVM or host copies), in the layer's order and
+ *        under its gates. Taken when p.flash allows a flash-class arm,
+ *        NNTR_MHA_GPU is on, the step has NNTR_MIN_PREFILL rows (default 1)
+ *        or is a single row p.device_decode admits, there is no sink, and q,
+ *        out and the cache are FP16 with a concat K plane. The kernels enqueue
+ *        without a drain: a host reader of out settles the queue first. The
+ *        two_conv kernels apply neither the softcap nor the window, as in the
+ *        layer; the flash kernels do. A step the gates admit but no kernel
+ *        takes returns false after one queue drain, so the host arms read
+ *        what the device wrote into these planes; a step the gates decline
+ *        returns false at once. A ringed cache's planes need only the rows
+ *        the ring holds (KVCacheView::rows_read): the flash kernels map the
+ *        logical range onto the ring, the two_conv kernels do not take it.
+ */
+static bool cl_device_attention_arm(const Tensor &q, const KVCacheView &kv,
+                                    Tensor &out, const AttentionOpParams &p) {
+  static const bool gpu_on = [] {
+    const char *e = std::getenv("NNTR_MHA_GPU");
+    return e != nullptr && e[0] != '0';
+  }();
+  static const unsigned int min_rows = [] {
+    const char *e = std::getenv("NNTR_MIN_PREFILL");
+    const int v = e != nullptr ? std::atoi(e) : 0;
+    return v > 0 ? static_cast<unsigned int>(v) : 1u;
+  }();
+  static const bool img_two_conv = std::getenv("NNTR_MHA_GPU_IMG") != nullptr;
+  using DataType = ml::train::TensorDim::DataType;
+  const unsigned int rows = q.height();
+  if (!gpu_on || !p.flash || p.sink != nullptr || kv.key == nullptr ||
+      kv.value == nullptr || kv.layout != KVCacheLayout::Concat ||
+      q.getDataType() != DataType::FP16 ||
+      out.getDataType() != DataType::FP16 ||
+      kv.key->getDataType() != DataType::FP16 ||
+      kv.value->getDataType() != DataType::FP16 || rows == 0 ||
+      !(rows >= min_rows || (rows == 1 && p.device_decode)))
+    return false;
+  const unsigned int head_dim = kv.head_dim;
+  if (head_dim == 0 || q.width() % head_dim != 0 ||
+      kv.key->width() % head_dim != 0)
+    return false;
+  const unsigned int num_heads_q = q.width() / head_dim;
+  const unsigned int num_heads_kv = kv.key->width() / head_dim;
+  // A shape the formula rejects is left to the host arms, which report it.
+  if (num_heads_q != p.num_heads_q || num_heads_kv == 0 ||
+      num_heads_q % num_heads_kv != 0 || out.size() != q.size() ||
+      p.kv_len != p.q_pos + rows || kv.rows_read(p.kv_len) > kv.key->height() ||
+      kv.rows_read(p.kv_len) > kv.value->height() ||
+      kv.value->width() != kv.key->width())
+    return false;
+  auto svm = [](const Tensor &t) {
+    const auto md = t.getMemoryData();
+    return md && md->isSVM();
+  };
+  const bool svm_ok = svm(q) && svm(out) && svm(*kv.key) && svm(*kv.value);
+  const uint16_t *Q = reinterpret_cast<const uint16_t *>(q.getData<_FP16>());
+  const uint16_t *K =
+    reinterpret_cast<const uint16_t *>(kv.key->getData<_FP16>());
+  const uint16_t *V =
+    reinterpret_cast<const uint16_t *>(kv.value->getData<_FP16>());
+  uint16_t *O = reinterpret_cast<uint16_t *>(out.getData<_FP16>());
+  const unsigned int kv_len = p.kv_len;
+  // The flash kernels take a window shorter than the context; UINT_MAX and
+  // any window from the context length up mean none.
+  const unsigned int win =
+    (p.window >= (size_t)kv_len) ? 0u : (unsigned int)p.window;
+  bool ok = false;
+  if (svm_ok) {
+    if (rows == 1)
+      ok =
+        flash_decode_f16_cl(Q, K, V, O, kv_len, num_heads_q, num_heads_kv,
+                            head_dim, /*max_seq_len=*/0u,
+                            /*svm_inputs=*/true, p.softcap, win, kv.ring_cap);
+    if (!ok)
+      ok = flash_attention_prefill_f16_cl(
+        Q, K, V, O, rows, kv_len, num_heads_q, num_heads_kv, head_dim,
+        /*max_seq_len=*/0u, p.causal, /*svm_inputs=*/true, p.softcap, win,
+        kv.ring_cap);
+  }
+  // two_conv indexes the cache linearly: not over a ring.
+  if (!ok && kv.ring_cap == 0) {
+    if (img_two_conv && head_dim % 8 == 0 &&
+        (num_heads_q * head_dim) % 8 == 0 && (num_heads_kv * head_dim) % 8 == 0)
+      ok = two_conv_attention_prefill_f16_img_cl(Q, K, V, O, rows, kv_len,
+                                                 num_heads_q, num_heads_kv,
+                                                 head_dim, p.causal);
+    if (!ok)
+      ok = two_conv_attention_prefill_f16_cl(Q, K, V, O, rows, kv_len,
+                                             num_heads_q, num_heads_kv,
+                                             head_dim, p.causal, svm_ok);
+  }
+  if (!ok)
+    cl_queue_finish();
+  return ok;
+}
+#endif
+
+/**
+ * @brief Land the attention output in its planner cl_mem when the planner
+ *        placed it there (GPU_CLMEM): its consumer, the wo FC, reads that
+ *        buffer, and every arm writes the SVM shadow. A device arm's O is
+ *        copied GPU to GPU on the in-order queue, behind the kernel and with
+ *        no drain: a host upload would read the shadow as a host pointer,
+ *        which on a coarse-grained SVM is not coherent with what the kernel
+ *        wrote, even after a queue drain (a short prefill on Xe3 produced
+ *        garbage that way). NNTR_NO_GPU_OBRIDGE takes the drained host upload
+ *        instead, as the layer did. A host arm's O is uploaded from the host,
+ *        which is what wrote it.
+ * @param out the attention output
+ * @param device_wrote true when a device arm wrote @p out
+ */
+static void cl_attention_out_to_clmem(Tensor &out, bool device_wrote) {
+  if (!out.isClMem() || out.getOffset() != 0 || out.getClMem() == nullptr)
+    return;
+#ifdef ENABLE_FP16
+  if (device_wrote) {
+    static const bool gpu_bridge =
+      std::getenv("NNTR_NO_GPU_OBRIDGE") == nullptr;
+    uint16_t *o = reinterpret_cast<uint16_t *>(out.getData<_FP16>());
+    if (gpu_bridge &&
+        gpu_copy_f16_cl(o, o, (unsigned int)out.size(), /*svm_inputs=*/true,
+                        /*in_clmem=*/nullptr, /*out_clmem=*/out.getClMem(),
+                        /*drain=*/false))
+      return;
+    cl_queue_finish();
+  }
+#endif
+  clmem_raise_cl(out, 0);
+}
+
 /**
  * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
  *        ComputeOps interface, dispatched through ClContext's ContextData.
@@ -547,9 +681,20 @@ public:
     get_cpu_ops()->kv_cache_write(k, v, kv, pos, rope);
   }
 
+  // The flash and two_conv device arms over a concat FP16 cache (see
+  // cl_device_attention_arm), then the host arms. The image arm and the
+  // device RoPE and cache writes are still the layer's (7b). Only this op
+  // knows which arm wrote out, so it also lands out in its planner cl_mem.
   void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
                  const AttentionOpParams &p) override {
+#ifdef ENABLE_FP16
+    if (cl_device_attention_arm(q, kv, out, p)) {
+      cl_attention_out_to_clmem(out, /*device_wrote=*/true);
+      return;
+    }
+#endif
     get_cpu_ops()->attention(q, kv, out, p);
+    cl_attention_out_to_clmem(out, /*device_wrote=*/false);
   }
 
 #ifdef ENABLE_FP16
