@@ -8,6 +8,7 @@
 #   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
 # Override the target with: HEX_ARCH=v81 ./build.sh (the S26 Ultra; v79 = S25)
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
+# Use a device micro API provider: HEXKL_MICRO_DSO=/path/to/provider.so ./build.sh
 
 set -eu
 
@@ -33,10 +34,16 @@ if [ -z "${HEXKL_SDK_VER:-}" ]; then
 fi
 HEXKL_TOOLS_VARIANT="${HEXKL_TOOLS_VARIANT:-toolv19}"
 HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
+if [ -n "${HEXKL_MICRO_DSO:-}" ]; then
+    HEXKL_LIB="$HEXKL_MICRO_DSO"
+fi
 
 if [ ! -f "$HEXKL_LIB" ]; then
-    echo "Error: HexKL static library not found:" >&2
+    echo "Error: HexKL library not found:" >&2
     echo "  $HEXKL_LIB" >&2
+    if [ -n "${HEXKL_MICRO_DSO:-}" ]; then
+        exit 1
+    fi
     # Say which of the three parts of that path is actually wrong. The old
     # message here named the version policy no matter what was missing,
     # which points at the wrong thing when HEXKL_ROOT is simply not where
@@ -56,6 +63,19 @@ if [ ! -f "$HEXKL_LIB" ]; then
         echo "Pick an HEX_ARCH (or HEXKL_SDK_VER) from the list above." >&2
     fi
     exit 1
+fi
+
+HEXKL_LINK=("$HEXKL_LIB")
+if [ -n "${HEXKL_MICRO_DSO:-}" ]; then
+    PROVIDER_HEADER=$("$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-readelf" -h "$HEXKL_LIB")
+    if ! echo "$PROVIDER_HEADER" | grep -q 'Type:.*DYN' ||
+       ! echo "$PROVIDER_HEADER" | grep -q "Flags:.*0x${HEX_ARCH#v}\b"; then
+        echo "Error: HexKL provider must be a ${HEX_ARCH} shared object" >&2
+        exit 1
+    fi
+    # Record the provider's basename, not its host path. Bind this skeleton's
+    # own RPC definitions locally when the provider exports older ones too.
+    HEXKL_LINK=("-Wl,-L,$(dirname "$HEXKL_LIB"),-l:$(basename "$HEXKL_LIB"),-Bsymbolic")
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -124,7 +144,7 @@ printf '%s\n' "${SRCS[@]}" > build/dsp-sources.txt
     -isystem "$HEXAGON_SDK_ROOT/incs/stddef" \
     -isystem "$HEXAGON_SDK_ROOT/ipc/fastrpc/incs" \
     "${SRCS[@]}" \
-    "$HEXKL_LIB" \
+    "${HEXKL_LINK[@]}" \
     -o build/libnntr_hvx_skel.so
 
 READELF="$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-readelf"
@@ -147,6 +167,15 @@ if [ -z "$UND" ]; then
     exit 1
 fi
 BAD=$(echo "$UND" | grep -Ev '^(HAP_|compute_resource_|qurt_|dspqueue_|__hexagon_|__extendhfsf2$|__cxa_finalize$|__register_frame_info_bases$|malloc$|free$|calloc$|memalign$|memcpy$|memset$|lroundf$|nearbyintf$|snprintf$|vsnprintf$|strlcpy$|rintf$|sqrtf$|memcmp$|__truncsfhf2$|ceil$|ldexp$|ldexpf$|lround$|_Log$)' || true)
+if [ -n "${HEXKL_MICRO_DSO:-}" ] && [ -n "$BAD" ]; then
+    PROVIDED=$("$READELF" --dyn-syms "$HEXKL_LIB" |
+        awk '$7!="UND" && $8 ~ /^hexkl_micro_/ {print $8}')
+    if [ -z "$PROVIDED" ]; then
+        echo "Error: provider exports no HexKL micro API symbols" >&2
+        exit 1
+    fi
+    BAD=$(echo "$BAD" | grep -Fvx -f <(echo "$PROVIDED") || true)
+fi
 if [ -n "$BAD" ]; then
     echo "Error: skel has undefined symbols the DSP image will not provide:" >&2
     echo "$BAD" | sed 's/^/  /' >&2
