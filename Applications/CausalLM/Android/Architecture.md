@@ -22,7 +22,9 @@ Android/
 `ChatController` (pure Kotlin, JVM-tested) holds all state in one
 `StateFlow<UiState>` and makes every engine call on that executor. Screens:
 Chat (transcript, attach sheet, a composer that takes a message or OpenAI
-JSON) and Metrics; the model sheet opens from the top-bar chip.
+JSON), Metrics and Power (whole-device energy per token from the battery
+gauge, with a thermal gate between repeats and CSV / JSON files under
+Download/QuickAI/power); the model sheet opens from the top-bar chip.
 
 ## 🧱 QuickDotAI AAR
 
@@ -145,7 +147,7 @@ Apps that update UI must marshal callbacks to the main thread.
 
 `QuickDotAIAPP` is the current runnable Android sample. It links the
 `:QuickDotAI` module directly; it does not start a REST service and does not
-communicate over sockets. Its three destinations are Chat, Raw and Metrics;
+communicate over sockets. Its three destinations are Chat (with the JSON composer mode), Metrics and Power;
 `ChatController` is covered by JVM unit tests under `src/test`, and there is
 no device test on this branch.
 

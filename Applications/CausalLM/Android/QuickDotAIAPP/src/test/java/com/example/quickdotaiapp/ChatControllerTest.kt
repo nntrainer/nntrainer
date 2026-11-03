@@ -13,6 +13,7 @@ import com.example.quickdotai.RuntimeKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
+import com.example.quickdotaiapp.power.GenerationObserver
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -227,6 +228,7 @@ class ChatControllerTest {
         c.setDraft("go"); c.send()
         assertTrue(e.parked!!.await(2, TimeUnit.SECONDS))
         assertEquals("s1", e.chatSessionId)                  // LiteRT runs inside its chat session
+        e.releaseGateOnCancel = false                         // the status is read before the engine can finish
         c.cancel()
         assertEquals("Stopping… LiteRT finishes the current answer first", c.state.value.status)
         e.gate!!.countDown(); c.awaitIdle()
@@ -430,5 +432,62 @@ class ChatControllerTest {
         assertEquals(r0, c.state.value.rawRevision)
         c.resetRawJson()
         assertTrue(c.state.value.rawRevision > r0)
+    }
+
+    @Test
+    fun sendPromptReportsTheGenerationEvents() {
+        val c = controller(); c.selectFamily("fake-npu"); c.setBasePath("/m"); c.load(); c.awaitIdle()
+        val events = mutableListOf<String>()
+        c.observer = object : GenerationObserver {
+            override fun onSend(tMs: Long) { events += "send" }
+            override fun onFirstToken(tMs: Long) { events += "first" }
+            override fun onToken(count: Int, tMs: Long) { events += "tok$count" }
+            override fun onDone(tMs: Long, tokens: Int, promptTokens: Int?, stopped: Boolean, error: String?) { events += "done:$tokens:$promptTokens:$stopped" }
+        }
+        assertTrue(c.sendPrompt("measure me")); c.awaitIdle()
+        assertEquals(listOf("send", "first", "tok1", "tok2", "tok3", "done:3:10:false"), events)
+        assertEquals("power", c.state.value.runs.last().mode)
+        assertEquals("measure me", c.state.value.turns.first { it.role == TurnRole.USER }.text)
+    }
+
+    @Test
+    fun sendPromptRefusesWithoutALoadedModel() {
+        val c = controller(); c.selectFamily("fake-npu")
+        assertFalse(c.sendPrompt("x"))
+        assertEquals("Load a model first.", c.state.value.status)
+        assertFalse(c.sendPrompt("   "))
+    }
+
+    @Test
+    fun powerChatFacadeReadsTheState() {
+        val c = controller(); c.selectFamily("gemma4"); c.selectRuntime(RuntimeKind.LITERT)
+        assertTrue(c.isLiteRt); assertFalse(c.isLoaded)
+        c.setDraft("hello"); assertEquals("hello", c.composerText())
+    }
+
+    @Test
+    fun observerHearsOnlyPowerGenerations() {
+        val c = controller(); c.selectFamily("fake-npu"); c.setBasePath("/m"); c.load(); c.awaitIdle()
+        val events = mutableListOf<String>()
+        c.observer = object : GenerationObserver {
+            override fun onSend(tMs: Long) { events += "send" }
+            override fun onFirstToken(tMs: Long) { events += "first" }
+            override fun onToken(count: Int, tMs: Long) { events += "tok" }
+            override fun onDone(tMs: Long, tokens: Int, promptTokens: Int?, stopped: Boolean, error: String?) { events += "done" }
+        }
+        c.setDraft("hello"); c.send(); c.awaitIdle()                  // the user's own chat turn
+        assertTrue(events.toString(), events.isEmpty())
+        assertTrue(c.sendPrompt("measure")); c.awaitIdle()
+        assertEquals("send", events.first())
+    }
+
+    @Test
+    fun sendPromptRefusesWhenTheSelectionDiffersFromTheLoadedModel() {
+        val c = controller(); c.selectFamily("fake-npu"); c.setBasePath("/m"); c.load(); c.awaitIdle()
+        assertEquals("fake-npu", c.loadedKey?.substringBefore(':'))
+        c.selectFamily("qwen3-0.6b")
+        assertFalse(c.sendPrompt("x"))
+        assertEquals("Load the selected model first.", c.state.value.status)
+        assertEquals(1, engines.size)                                 // nothing was loaded by the refusal
     }
 }

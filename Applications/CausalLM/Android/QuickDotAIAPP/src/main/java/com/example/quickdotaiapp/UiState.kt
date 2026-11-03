@@ -13,7 +13,7 @@ import com.example.quickdotai.ModelDescriptor
 import com.example.quickdotai.PerformanceMetrics
 import com.example.quickdotai.RuntimeKind
 
-enum class Screen { CHAT, METRICS }
+enum class Screen { CHAT, METRICS, POWER }
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 

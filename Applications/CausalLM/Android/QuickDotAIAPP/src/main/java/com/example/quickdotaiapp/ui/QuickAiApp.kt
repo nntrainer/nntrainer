@@ -2,11 +2,13 @@
 /**
  * @file  QuickAiApp.kt
  * @brief The scaffold: splash, top bar with the model chip, status strip,
- *        the two screens on a bottom bar, the sheets, the file pickers
+ *        the three screens on a bottom bar, the sheets, the file pickers
  *        and the snackbar.
  */
 package com.example.quickdotaiapp.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,6 +47,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
@@ -65,18 +70,27 @@ import com.example.quickdotaiapp.UiState
 fun QuickAiApp(vm: AppViewModel) {
     val controller = vm.controller
     val state by controller.state.collectAsStateWithLifecycle()
+    val power by vm.power.state.collectAsStateWithLifecycle()
     QuickAiTheme(state.theme) {
         // The splash cross-fades into the app instead of being swapped out.
         Crossfade(targetState = state.splashShown, animationSpec = tween(350), label = "splash") { shown ->
-            if (shown) AppScaffold(state, vm) else Splash(onDone = controller::splashDone)
+            if (shown) AppScaffold(state, power, vm) else Splash(onDone = controller::splashDone)
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppScaffold(state: UiState, vm: AppViewModel) {
+private fun AppScaffold(state: UiState, power: com.example.quickdotaiapp.power.PowerUi, vm: AppViewModel) {
     val controller = vm.controller
+    val context = LocalContext.current
+    // The gauge must see the screen on for the whole Power session, whichever tab is shown.
+    val view = LocalView.current
+    val measuring = power.phase.measuring
+    DisposableEffect(measuring) {
+        view.keepScreenOn = measuring
+        onDispose { view.keepScreenOn = false }
+    }
     var modelSheetOpen by rememberSaveable { mutableStateOf(false) }
     var attachSheetOpen by rememberSaveable { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
@@ -135,6 +149,9 @@ private fun AppScaffold(state: UiState, vm: AppViewModel) {
                 NavigationBarItem(selected = state.screen == Screen.METRICS, onClick = { controller.setScreen(Screen.METRICS) },
                     icon = { Icon(painterResource(R.drawable.ic_chart), null) }, label = { Text("Metrics") },
                     modifier = Modifier.testTag(Tags.NAV_METRICS))
+                NavigationBarItem(selected = state.screen == Screen.POWER, onClick = { controller.setScreen(Screen.POWER) },
+                    icon = { Icon(painterResource(R.drawable.ic_bolt), null) }, label = { Text("Power") },
+                    modifier = Modifier.testTag(Tags.NAV_POWER))
             }
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -145,6 +162,14 @@ private fun AppScaffold(state: UiState, vm: AppViewModel) {
                 Screen.CHAT -> ChatScreen(state, controller, onAttach = { attachSheetOpen = true },
                     onLoadJson = { pickJson.launch(arrayOf("application/json", "text/*")) }, modifier = Modifier.weight(1f))
                 Screen.METRICS -> MetricsScreen(state, controller, modifier = Modifier.weight(1f))
+                Screen.POWER -> PowerScreen(
+                    state, power, vm.power, onMeasure = vm::startPower,
+                    onCopy = { text ->
+                        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("runs.csv", text))
+                        controller.notify("CSV copied")
+                    },
+                    modifier = Modifier.weight(1f),
+                )
             }
         }
     }
