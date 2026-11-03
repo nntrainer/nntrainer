@@ -1,8 +1,10 @@
 #!/bin/bash
-# Run CausalLM model unit tests on a connected Android device.
+# Run the CausalLM unit tests on a connected Android device: the model
+# reference suite (unittest_causallm_models) and the MHACoreLayer host-path
+# test (unittest_mha_core), both built by jni/Android.mk.
 # Usage: ./run_unittest_android.sh [--cache] [--filter <gtest_filter>]
 #   --cache          Reuse existing nntrainer builddir and ndk-build artifacts
-#   --filter <pat>   Pass --gtest_filter=<pat> to the test binary (e.g. '*Gemma4*')
+#   --filter <pat>   Pass --gtest_filter=<pat> to both test binaries (e.g. '*Gemma4*')
 #
 # Prerequisites:
 #   - ANDROID_NDK must be set (e.g. export ANDROID_NDK=/path/to/android-ndk-r26d)
@@ -19,6 +21,7 @@ NATIVE_BUILD="$NNTRAINER_ROOT/builddir_app/cpu"
 NNTRAINER_LIB_DIR="$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a"
 TEST_CACHE_MARKER="$JNI_DIR/obj/.canonical-libcausallm-test"
 INSTALL_DIR="/data/local/tmp/nntr_causallm_test"
+TEST_BINARIES=(unittest_causallm_models unittest_mha_core)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -112,10 +115,10 @@ log_step "4/6" "ndk-build"
 # ---------------------------------------------------------------------------
 
 if [[ "$USE_CACHE" -eq 1 && -f "$OBJ_DIR/unittest_causallm_models" && \
-      -f "$TEST_CACHE_MARKER" ]]; then
+      -f "$OBJ_DIR/unittest_mha_core" && -f "$TEST_CACHE_MARKER" ]]; then
     log_info "Reusing cached ndk-build artifacts"
 else
-    log_info "Building unittest_causallm_models against Meson libcausallm.so..."
+    log_info "Building ${TEST_BINARIES[*]} against Meson libcausallm.so..."
     ndk-build \
         -C "$JNI_DIR" \
         NDK_PROJECT_PATH="$JNI_DIR" \
@@ -124,16 +127,18 @@ else
         APP_BUILD_SCRIPT="$JNI_DIR/Android.mk" \
         NDK_APPLICATION_MK="$JNI_DIR/Application.mk" \
         CAUSALLM_PREBUILT_LIB="../../../builddir_app/cpu/libcausallm.so" \
-        unittest_causallm_models \
+        "${TEST_BINARIES[@]}" \
         -j"$(nproc)"
     touch "$TEST_CACHE_MARKER"
     log_success "ndk-build done"
 fi
 
-[[ -f "$OBJ_DIR/unittest_causallm_models" ]] || {
-    log_error "Missing artifact: $OBJ_DIR/unittest_causallm_models"
-    exit 1
-}
+for test_bin in "${TEST_BINARIES[@]}"; do
+    [[ -f "$OBJ_DIR/$test_bin" ]] || {
+        log_error "Missing artifact: $OBJ_DIR/$test_bin"
+        exit 1
+    }
+done
 
 # ---------------------------------------------------------------------------
 log_step "5/6" "Push to device"
@@ -153,10 +158,12 @@ adb shell "rm -f \
     $INSTALL_DIR/libcausallm_core.so \
     $INSTALL_DIR/libcausallm.so \
     $INSTALL_DIR/nntr_quantize \
-    $INSTALL_DIR/unittest_causallm_models"
+    $INSTALL_DIR/unittest_causallm_models \
+    $INSTALL_DIR/unittest_mha_core"
 
 log_info "Pushing binaries and libraries..."
 adb push "$OBJ_DIR/unittest_causallm_models"  "$INSTALL_DIR/" 2>&1 | tail -1
+adb push "$OBJ_DIR/unittest_mha_core"         "$INSTALL_DIR/" 2>&1 | tail -1
 adb push "$NATIVE_BUILD/nntr_quantize"        "$INSTALL_DIR/" 2>&1 | tail -1
 adb push "$NATIVE_BUILD/libcausallm.so"       "$INSTALL_DIR/" 2>&1 | tail -1
 adb push "$NNTRAINER_LIB_DIR/libnntrainer.so" "$INSTALL_DIR/" 2>&1 | tail -1
@@ -167,27 +174,31 @@ adb push "$NNTRAINER_LIB_DIR/libc++_shared.so" \
 log_info "Pushing fixtures..."
 adb push "$FIXTURE_DIR" "$INSTALL_DIR/" 2>&1 | tail -1
 
-adb shell "chmod 755 $INSTALL_DIR/unittest_causallm_models $INSTALL_DIR/nntr_quantize"
+adb shell "chmod 755 $INSTALL_DIR/unittest_causallm_models \
+    $INSTALL_DIR/unittest_mha_core $INSTALL_DIR/nntr_quantize"
 log_success "Push complete"
 
 # ---------------------------------------------------------------------------
 log_step "6/6" "Run tests on device"
 # ---------------------------------------------------------------------------
 
-ARGS="./unittest_causallm_models"
-[[ -n "$GTEST_FILTER" ]] && ARGS="$ARGS --gtest_filter=$GTEST_FILTER"
+EXIT=0
+for test_bin in "${TEST_BINARIES[@]}"; do
+    ARGS="./$test_bin"
+    [[ -n "$GTEST_FILTER" ]] && ARGS="$ARGS --gtest_filter=$GTEST_FILTER"
 
-log_info "Executing on device..."
-echo ""
-adb shell "cd $INSTALL_DIR && \
-    LD_LIBRARY_PATH=$INSTALL_DIR \
-    TMPDIR=$INSTALL_DIR/tmp \
-    NNTRAINER_CAUSALLM_FIXTURE_DIR=$INSTALL_DIR/causallm_reference \
-    NNTR_QUANTIZE_BIN=$INSTALL_DIR/nntr_quantize \
-    $ARGS 2>&1"
-EXIT=$?
+    log_info "Executing $test_bin on device..."
+    echo ""
+    # A failing binary is recorded, not fatal (set -e): the other one still runs.
+    adb shell "cd $INSTALL_DIR && \
+        LD_LIBRARY_PATH=$INSTALL_DIR \
+        TMPDIR=$INSTALL_DIR/tmp \
+        NNTRAINER_CAUSALLM_FIXTURE_DIR=$INSTALL_DIR/causallm_reference \
+        NNTR_QUANTIZE_BIN=$INSTALL_DIR/nntr_quantize \
+        $ARGS 2>&1" || EXIT=$?
+    echo ""
+done
 
-echo ""
 if [[ $EXIT -eq 0 ]]; then
     log_success "All tests passed."
 else
