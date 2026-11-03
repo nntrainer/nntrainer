@@ -17,7 +17,8 @@ RPC changes, stage matching ARM libraries, generated stub and DSP skeleton.
 
 The native HTP preset runs Gemma4 26B A4B through the same QuickDotAI handle,
 JNI and Android sample interfaces as other native models. Select
-`gemma4-26b-a4b` / `NATIVE` / `NPU` in SampleTestAPP. Quantization is `W4A32`.
+`gemma4-26b-a4b` / `Quick.AI` / `NPU` in QuickDotAIAPP, the Compose sample.
+Quantization is `W4A32`.
 
 The HTP implementation is ported from PR #4416 at
 `48a6bbb22f96087f9b993cf87e33c70f9840fe26`, onto main at
@@ -69,14 +70,14 @@ bash Applications/CausalLM/build_android.sh --htp --app
 
 HTP and QNN are separate build variants; combining their flags is rejected.
 The build checks the runtime dependencies and preserves the v81 DSP ELF
-when creating `QuickDotAI-debug.aar` and `SampleTestAPP-debug.apk`.
+when creating `QuickDotAI-debug.aar` and `QuickDotAIAPP-debug.apk`.
 The device's vendor `libcdsprpc.so` is used at runtime; the SDK link stub is
 not packaged. Downstream apps must retain `jniLibs.useLegacyPackaging=true`
 and exclude `libnntr_hvx_skel.so` from stripping.
 
 Install the APK, grant its requested model-file access, and set MODEL BASE
-PATH to the directory containing the model folder. Load/Run, Stop, Unload
-and Reload operate through the existing single engine worker. A changed
+PATH to the directory containing the model folder. Load model, Send, Stop,
+Unload and Reload model operate through the existing single engine worker. A changed
 base path or backend cannot silently reuse the old handle. Native load
 diagnostics are returned to the UI.
 
@@ -85,9 +86,10 @@ diagnostics are returned to the UI.
 Copy the three JSON/Jinja files from the
 [HTP chat preset](../Applications/CausalLM/res/gemma4/htp_chat/) into the
 validated pack. This preset is for the weight layout described above.
-Model selection fills OpenAI with a messages array and Chat with its user
-message: a three-sentence English summarization request about Ardley.
-Both use the same bundled resource; Load/Run preserves user edits.
+The validated summarization prompt ships with the sample as
+`QuickDotAIAPP/src/main/res/raw/gemma4_moe_messages.json` and as the Power
+tab's `HTP 1K` preset; selecting the model no longer fills the composer or the
+JSON editor with it.
 
 Chat accepts plain text. The model's template supplies the turn delimiters
 and the empty thought channel recommended for the 26B thinking-off mode:
@@ -112,7 +114,8 @@ Its 1,280 context positions accommodate the 1,028-token summary prompt plus
 the generation budget. The earlier 1,024/128 comparison deliberately used
 an older template and disabled EOS. Those benchmark settings must not be
 used for interactive responses: they continue generating after the turn
-ends. SampleTestAPP displays the raw final `<turn|>` marker.
+ends. QuickDotAIAPP keeps the raw final `<turn|>` marker in the turn's text
+(the Metrics screen's raw output shows it; the chat bubble hides it).
 
 ## Validation
 
@@ -126,7 +129,8 @@ PR and integration used the same 7,540,724,856-byte weight file, SHA-256
 | Tiny fused model/converter | Required FP32 fixture passed; production conversion matched the independent 600,488-byte reference. |
 | Pinned CLI comparison | Three alternating runs each; all 128 output IDs matched with identical 1,024 input IDs. |
 | QuickDotAI lifecycle | Seven complete runs matched the CLI; callback/thread cancellation, active unload, invalid pack and reload checked. |
-| SampleTestAPP lifecycle | Seven complete runs matched the CLI; Stop and active Unload returned matching partial prefixes; path failure and recovery checked. |
+| SampleTestAPP lifecycle (View app, before the Compose rewrite) | Seven complete runs matched the CLI; Stop and active Unload returned matching partial prefixes; path failure and recovery checked. |
+| QuickDotAIAPP lifecycle (Compose, `HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath`) | Galaxy S26 Ultra, 2026-11-03, the rotated TL2 pack (`nntr_gemma4_26b_a4b_tl2_rotated.bin`, not the validated 7.5 GB pack): seven complete runs of the summary prompt identical (1,028 input / 88 output tokens, 18-19 tok/s); Stop and active Unload returned matching partial prefixes; a bad base path reported `Load failed: not found: ...` and kept the loaded model; reload and explicit reload replaced the handle. |
 | Chat short prompt | 19 input / 117 output tokens; repeated run identical; stopped at the first end-of-turn ID. |
 | Chat/OpenAI summary | Both 1,028 input / 109 output tokens, identical IDs, complete thought-off suffix and no generated thought channel. |
 | Android builds | Native CPU/HTP/QNN, HTP and QNN AAR/APK builds passed. QNN SDK 2.47.1.260610; QNN inference not tested. |
@@ -142,10 +146,10 @@ Opt-in device tests use the actual Activity controls. Stage the bundled
 
 ```bash
 adb shell am instrument -w -r \
-  -e class 'com.example.sampletestapp.HtpAppLifecycleTest#chatUsesGemma4PromptFormat' \
+  -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#chatUsesGemma4PromptFormat' \
   -e htpModelBase /sdcard/Download/aistudio-mobile/models \
   -e htpMessages /sdcard/Download/aistudio-mobile/messages.json \
-  com.example.sampletestapp.test/androidx.test.runner.AndroidJUnitRunner
+  com.example.quickdotaiapp.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
 The separate `loadGenerateStopRepeatReloadAndReportInvalidPath` method

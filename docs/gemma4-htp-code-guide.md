@@ -19,7 +19,7 @@ separates the speed experiment, memory audit and combined-runtime checks.
 ```mermaid
 flowchart LR
   subgraph app [Android app process]
-    K[SampleTestAPP / QuickDotAI Kotlin] --> J[JNI quickai_jni.cpp]
+    K[QuickDotAIAPP / QuickDotAI Kotlin] --> J[JNI quickai_jni.cpp]
     J --> C[QuickDotAI C API<br/>quick_dot_ai_api.cpp<br/>htp_model_runtime.h]
     C --> M[Gemma4HtpMoECausalLM<br/>Applications/CausalLM/models/gemma4]
     M --> G[nntrainer graph<br/>htp_qkv, htp_mha_core, residual_add,<br/>dense_ffn, lfm2_moe, lm_head ...]

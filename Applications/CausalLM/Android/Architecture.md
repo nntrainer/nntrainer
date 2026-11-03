@@ -25,6 +25,13 @@ Chat (transcript, attach sheet, a composer that takes a message or OpenAI
 JSON), Metrics and Power (whole-device energy per token from the battery
 gauge, with a thermal gate between repeats and CSV / JSON files under
 Download/QuickAI/power); the model sheet opens from the top-bar chip.
+The Gemma4 HTP preset is selected first when the build has it, and the HTP
+presets' chat sends only the newest user turn: their packs hold 1,280
+positions and truncate a longer prompt's tail silently (nntrainer #4474).
+The validated summarization prompt is bundled as `res/raw/gemma4_moe_messages.json`
+and offered as the Power tab's `HTP 1K` preset. `HtpAppLifecycleTest` under
+`src/androidTest` drives the HTP presets on a device (opt-in, see
+`docs/gemma4-htp-user-guide.md`).
 
 ## 🧱 QuickDotAI AAR
 

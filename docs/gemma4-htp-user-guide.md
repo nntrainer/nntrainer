@@ -2,7 +2,8 @@
 
 This guide takes you from a clean Ubuntu machine to Gemma4 26B A4B generating
 text on the NPU (Hexagon HTP) of a Galaxy S26 Ultra, through the command-line
-tool and through the SampleTestAPP Android app. It assumes nothing about the
+tool and through the QuickDotAIAPP Android app (Quick.AI on the phone). It
+assumes nothing about the
 HTP code; the companion [code guide](gemma4-htp-code-guide.md) explains how
 the pieces fit together, and the shorter
 [setup and validation record](gemma4-htp-quickdotai.md) lists what was
@@ -104,7 +105,7 @@ Where the HTP code lives:
 | `Applications/CausalLM/models/gemma4/gemma4_htp_*` | the fused Gemma4 model and its weight loader |
 | `Applications/CausalLM/res/gemma4/` | `htp_weight_converter.py` and the `htp_chat/` preset |
 | `Applications/CausalLM/api/` | the QuickDotAI C API the app uses (`htp_model_runtime.h` fixes the HTP runtime options) |
-| `Applications/CausalLM/Android/` | the QuickDotAI library and SampleTestAPP |
+| `Applications/CausalLM/Android/` | the QuickDotAI library and the QuickDotAIAPP sample |
 
 ## 4. Build
 
@@ -155,7 +156,7 @@ Then build:
 # native libraries, CLI tools and the AAR/APK
 bash Applications/CausalLM/build_android.sh --htp --app
 # the instrumentation test APK (optional, for the device tests in section 8)
-( cd Applications/CausalLM/Android && ./gradlew -PnntrainerNdkPath=$ANDROID_NDK :SampleTestAPP:assembleDebugAndroidTest )
+( cd Applications/CausalLM/Android && ./gradlew -PnntrainerNdkPath=$ANDROID_NDK :QuickDotAIAPP:assembleDebugAndroidTest )
 ```
 
 What the script does, in order: generates the FastRPC stub from
@@ -177,8 +178,8 @@ Outputs:
 | `libnntr_hvx_skel.so` | `nntrainer/tensor/htp_backend/dsp/build/` |
 | `libsdkl.so` | `$HEXKL_ROOT/lib/6.4.0.2/armv8_android26/` |
 | `QuickDotAI-debug.aar` | `Applications/CausalLM/Android/QuickDotAI/build/outputs/aar/` |
-| `SampleTestAPP-debug.apk` | `Applications/CausalLM/Android/SampleTestAPP/build/outputs/apk/debug/` |
-| `SampleTestAPP-debug-androidTest.apk` | `Applications/CausalLM/Android/SampleTestAPP/build/outputs/apk/androidTest/debug/` |
+| `QuickDotAIAPP-debug.apk` | `Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/` |
+| `QuickDotAIAPP-debug-androidTest.apk` | `Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/androidTest/debug/` |
 
 A full build takes about 15 minutes on 8 cores. `--htp` and `--qnn` are
 separate variants; the HTP APK cannot run QNN models.
@@ -213,7 +214,13 @@ gemma4-26b-a4b-htp-w4a32/
 
 The three preset files are the interactive configuration: the official chat
 template with the empty thought channel, EOS ids `1, 106, 50`, a 1,280-token
-context and the default summarization prompt. The keys in `nntr_config.json`
+context and the default summarization prompt. Take `chat_template.jinja` from
+the preset directory, not from another pack: the built-in Jinja renderer
+rejects a variant of the same template that splits one string literal over
+several lines (row 260), and the API then falls back to the bare
+`<|turn>user ... <|turn>model` format without the empty thought channel, so
+the model starts its answer with `<|channel>thought`. The failure is only a
+logcat line (`Chat template apply failed`). The keys in `nntr_config.json`
 that matter:
 
 | Key | Value | Meaning |
@@ -245,41 +252,54 @@ adb shell mkdir -p /sdcard/Download/aistudio-mobile/models
 adb push gemma4-26b-a4b-htp-w4a32 /sdcard/Download/aistudio-mobile/models/
 ```
 
-## 6. Run the app (SampleTestAPP)
+## 6. Run the app (QuickDotAIAPP)
 
-1. Install the APK. If a SampleTestAPP signed by someone else is already on
+1. Install the APK. If a Quick.AI app signed by someone else is already on
    the phone, uninstall it first; otherwise `adb install` fails with
    `INSTALL_FAILED_UPDATE_INCOMPATIBLE`.
 
    ```bash
-   adb install -r -t Applications/CausalLM/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk
-   adb shell appops set com.example.sampletestapp MANAGE_EXTERNAL_STORAGE allow
+   adb install -r -t Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk
+   adb shell appops set com.example.quickdotaiapp MANAGE_EXTERNAL_STORAGE allow
    ```
 
    The second line grants the "all files" access the app needs to read the
-   pack; you can also grant it under Settings > Apps > SampleTestAPP. Android
+   pack; you can also grant it under Settings > Apps > Quick.AI. Android
    shows a one-time warning that the app is not built for 16 KB pages; the
    tested phone uses 4 KB pages and runs it.
 
-2. Open the app. In the model tab pick **FAMILY** `gemma4-26b-a4b`,
-   **RUNTIME** `NATIVE`, **BACKEND** `NPU` (the only backend this family
-   offers; the entry is labelled `[HTP]`). Quantization is `W4A32`.
-3. Set **MODEL BASE PATH** to `/sdcard/Download/aistudio-mobile/models` (the
-   directory that contains the pack, not the pack itself).
-4. Tap **Load model**. The status line reads `Loaded gemma4-26b-a4b-htp ...`
-   after about ten seconds. The OpenAI and Chat inputs are pre-filled with the
-   summarization prompt from the preset.
-5. Tap **Run (streaming)** in the OpenAI tab, or **+ Open** and then **▶** in
-   the Chat tab. The answer streams in and stops at the first end-of-turn
-   marker, which the app shows as `<turn|>`. The default prompt produces a
-   three-sentence summary of the Ardley text (109 tokens).
-6. **Stop** cancels at the next token boundary; **Unload** releases the DSP
-   session; **Reload** or a changed base path loads a fresh handle. A bad base
-   path shows `Load failed: [MODEL_LOAD_FAILED] ...` with the native reason.
+2. Open the app and tap the model chip under the top bar. In the sheet pick
+   **FAMILY** `gemma4-26b-a4b` from the dropdown, the **RUNTIME** chip
+   `Quick.AI` (the app's name for the native runtime) and the **BACKEND** chip
+   `NPU`, the only backend this family offers. The chip under the path field
+   then reads `HTP · W4A32 · ...`. A build that contains the preset selects it
+   by default.
+3. Set **BASE PATH** to `/sdcard/Download/aistudio-mobile/models` (the
+   directory that contains the pack, not the pack itself). The line under the
+   field says whether the pack's `nntr_config.json` was found.
+4. Tap **Load model** and close the sheet. The status line reads
+   `Loaded gemma4-26b-a4b-htp ...` after about ten seconds.
+5. Type a prompt in the composer and tap **Send**, or tap the `{ }` toggle
+   next to the attach button, paste an OpenAI messages array (the validated
+   one is `QuickDotAIAPP/src/main/res/raw/gemma4_moe_messages.json`) and tap
+   **Send**. The answer streams in and stops at the first end-of-turn marker;
+   the chat bubble hides the `<turn|>` marker, the Metrics screen's raw output
+   and the token trace show it. The summarization prompt produces a
+   three-sentence summary of the Ardley text (109 tokens); the same prompt is
+   the **HTP 1K** preset of the Power tab.
+6. While streaming, the send button becomes **Stop**, which cancels at the
+   next token boundary; **Unload** in the model sheet releases the DSP
+   session; **Reload model** or a changed base path loads a fresh handle. A
+   base path without the pack folder shows `Load failed: not found: ...` before
+   anything is unloaded, so the loaded model stays; a folder that exists but
+   fails to load shows `Load failed: [MODEL_LOAD_FAILED] ...` with the native
+   reason, and by then the previous model has been released.
 
-Only one HTP model can be loaded per process, each generation starts a fresh
-prompt (no conversation history), and the public API does not expose KV
-snapshot or resume. The native CLI has a separate
+Only one HTP model can be loaded per process, the public API does not expose
+KV snapshot or resume, and each generation starts a fresh prompt: the pack
+holds 1,280 positions and truncates a longer prompt's tail silently
+(nntrainer #4474), so for the HTP presets the app sends only the newest
+message of the conversation, not the transcript. The native CLI has a separate
 [KV snapshot workflow](gemma4-htp-kv-cache-s25u.md); its historical S25
 measurements are distinct from current S26 throughput results.
 
@@ -355,24 +375,33 @@ the completed trace after each generation.
 | Host, model | `unittest_causallm_models` (section 4.1) | the fused FP32 tiny model matches its pinned reference; bad packs are rejected before inference |
 | Host, registries | `meson test -C build unittest_hexkl_attn_f16_plan unittest_hexkl_kv_tiles_f16 unittest_hexkl_kv_q unittest_hexkl_attn_q_plan unittest_hvx_softmax_q unittest_cpu_kv_q_attention` | attention plans, KV tile registries, the int8 KV attention and the integer softmax |
 | Device, C API | `quick_dot_ai_test ... QDA_HTP_LIFECYCLE=1` (section 7) | load, repeat parity, cancellation, unload, reload, invalid path |
-| Device, app | the two instrumentation tests below | the app's controls, prompt format and token traces |
+| Device, app | the three instrumentation tests below | the app's controls, prompt format and token traces |
 
 The app tests need the model pack on the phone, the messages file staged
 somewhere the app can read, and both APKs installed:
 
 ```bash
-adb push Applications/CausalLM/Android/SampleTestAPP/src/main/res/raw/gemma4_moe_messages.json /sdcard/Download/aistudio-mobile/messages.json
-adb install -r -t Applications/CausalLM/Android/SampleTestAPP/build/outputs/apk/androidTest/debug/SampleTestAPP-debug-androidTest.apk
-R=com.example.sampletestapp.test/androidx.test.runner.AndroidJUnitRunner
-adb shell am instrument -w -r -e class 'com.example.sampletestapp.HtpAppLifecycleTest#chatUsesGemma4PromptFormat' \
+adb push Applications/CausalLM/Android/QuickDotAIAPP/src/main/res/raw/gemma4_moe_messages.json /sdcard/Download/aistudio-mobile/messages.json
+adb install -r -t Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/androidTest/debug/QuickDotAIAPP-debug-androidTest.apk
+R=com.example.quickdotaiapp.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -r -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#chatUsesGemma4PromptFormat' \
   -e htpModelBase /sdcard/Download/aistudio-mobile/models -e htpMessages /sdcard/Download/aistudio-mobile/messages.json $R
-adb shell am instrument -w -r -e class 'com.example.sampletestapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
+adb shell am instrument -w -r -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
   -e htpModelBase /sdcard/Download/aistudio-mobile/models -e htpMessages /sdcard/Download/aistudio-mobile/messages.json $R
+# with the LFM2 pack staged under the app's default base path
+adb shell am instrument -w -r -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' \
+  -e htpDefaultPathCheck true $R
 ```
 
+`-e htpChatPrompt '<text>'` replaces the short chat prompt of the first test
+(a pack that rambles on the default one still has to end the summary at
+`<turn|>`). The third test is skipped unless the LFM2 pack sits under the
+app's default base path.
+
 Each run leaves its token traces and outputs in the app's private files
-directory (`htp-chat-validation/`, `htp-app-validation/`); read them with
-`adb exec-out run-as com.example.sampletestapp tar c files | tar x`.
+directory (`htp-chat-validation/`, `htp-app-validation/`,
+`htp-default-path-validation/`); read them with
+`adb exec-out run-as com.example.quickdotaiapp tar c files | tar x`.
 
 ## 9. Results
 
@@ -399,7 +428,7 @@ Short prompt through the C API (19 input tokens, 117 output tokens): first
 call 1.6 s to the first token (this includes building the resident graph),
 decode 16.1-16.6 tok/s; the repeat call reproduces the same 441 bytes.
 
-In the app, the default summary (Chat or OpenAI tab) takes 11-18 s from tap
+In the app, the default summary (composer or JSON mode) takes 11-18 s from tap
 to the end-of-turn marker depending on how warm the phone is; the short
 prompt takes about 7 s.
 
@@ -441,7 +470,8 @@ change the arithmetic.
 |---|---|
 | `HTP native_lib_dir is missing libnntr_hvx_skel.so` | `ADSP_LIBRARY_PATH` / `nativeLibDir` does not contain the skel |
 | `Gemma4 HTP requires NPU / W4A32` | the app was asked for another backend or quantization |
-| `Load failed: [MODEL_LOAD_FAILED] Failed to open file ...` | the base path does not contain `gemma4-26b-a4b-htp-w4a32/` |
+| `Load failed: not found: .../gemma4-26b-a4b-htp-w4a32/nntr_config.json` | the base path does not contain the pack folder; the loaded model is kept |
+| `Load failed: [MODEL_LOAD_FAILED] Failed to open file ...` | the folder exists but a file in it is missing or unreadable; the previous model is already released |
 | `Only one active QuickDotAI HTP model is supported` | unload the first handle before loading another |
 | `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | an APK with another signature is installed; uninstall it |
 | host model tests fail with `Key is not found ... fully_connected` | an OpenCL build defaults to the GPU engine; set `NNTR_ENGINE=cpu` |
