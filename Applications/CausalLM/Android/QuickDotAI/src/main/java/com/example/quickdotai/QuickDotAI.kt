@@ -23,7 +23,7 @@
  * expectation is that the host app owns exactly one instance per loaded
  * model and drives it from a single worker thread — the same contract
  * that QuickAIService's ModelWorker implements, and the one the sample
- * app (SampleTestAPP) follows from its background dispatcher.
+ * app (QuickDotAIAPP) follows from its background dispatcher.
  */
 package com.example.quickdotai
 

@@ -18,7 +18,7 @@
  * Higher-level concerns (per-model threading, FIFO queue, Gemma4
  * routing) live one level up in NativeQuickDotAI.kt and in the host
  * app's worker (for QuickAIService that is ModelWorker / ModelRegistry;
- * SampleTestAPP drives NativeQuickDotAI directly from its own
+ * QuickDotAIAPP drives NativeQuickDotAI directly from its own
  * background dispatcher).
  */
 

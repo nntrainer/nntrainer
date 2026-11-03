@@ -620,10 +620,10 @@ if [[ "$BUILD_APP" == true ]]; then
     (
         cd "$CAUSALLM_ROOT/Android"
         ./gradlew "$GRADLE_NDK_ARG" \
-            :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
+            :QuickDotAI:assembleDebug :QuickDotAIAPP:assembleDebug
     )
     AAR="$CAUSALLM_ROOT/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar"
-    APK="$CAUSALLM_ROOT/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk"
+    APK="$CAUSALLM_ROOT/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk"
     for file in "$AAR" "$APK"; do
         if [[ ! -f "$file" ]]; then
             echo "Error: Gradle artifact missing: $file" >&2
