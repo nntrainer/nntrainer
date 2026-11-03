@@ -12,6 +12,7 @@ import com.example.quickdotai.BackendType
 import com.example.quickdotai.Capability
 import com.example.quickdotai.LoadModelRequest
 import com.example.quickdotai.ModelDescriptor
+import com.example.quickdotai.ModelIds
 import com.example.quickdotai.PerformanceMetrics
 import com.example.quickdotai.PromptPart
 import com.example.quickdotai.QuantizationType
@@ -65,7 +66,8 @@ class ChatController(
     init {
         scope.launch {
             val catalog = withContext(engineDispatcher) { catalogProvider() } // dlopen off the main thread
-            val initial = catalog.firstOrNull()
+            // The HTP preset first when this native build has it, like the View sample.
+            val initial = catalog.firstOrNull { it.id == ModelIds.GEMMA4_26B_A4B_HTP } ?: catalog.firstOrNull()
             update {
                 copy(
                     catalog = catalog,
@@ -237,7 +239,7 @@ class ChatController(
         }
         runGeneration(ChatTurn(nextId(), TurnRole.USER, text, images), mode = "chat", onStarted) { e, d, sink ->
             if (d.runtime == RuntimeKind.LITERT) sendLiteRt(e, text, images, sink)
-            else sendNative(e, sink)
+            else sendNative(e, d, sink)
         }
     }
 
@@ -274,7 +276,7 @@ class ChatController(
         // The sheet's selection must be what is loaded: a run must never include a load.
         if (buildRequest() != s.loadedRequest) { setStatus("Load the selected model first."); return false }
         runGeneration(ChatTurn(nextId(), TurnRole.USER, body), mode = "power", onStarted = {}) { e, d, sink ->
-            if (d.runtime == RuntimeKind.LITERT) sendLiteRt(e, body, emptyList(), sink) else sendNative(e, sink)
+            if (d.runtime == RuntimeKind.LITERT) sendLiteRt(e, body, emptyList(), sink) else sendNative(e, d, sink)
         }
         return true
     }
@@ -365,8 +367,10 @@ class ChatController(
         }
     }
 
-    private fun sendNative(e: QuickDotAI, sink: StreamSink): BackendResult<Unit> {
-        val history = state.value.turns.filter { !it.raw && !it.streaming && it.role != TurnRole.NOTE }
+    private fun sendNative(e: QuickDotAI, d: ModelDescriptor, sink: StreamSink): BackendResult<Unit> {
+        val transcript = state.value.turns.filter { !it.raw && !it.streaming && it.role != TurnRole.NOTE }
+        // HTP packs take one prompt at a time (Examples.oneShotIds): the newest user turn only.
+        val history = if (Examples.isOneShot(d)) listOfNotNull(transcript.lastOrNull { it.role == TurnRole.USER }) else transcript
         val lastUser = history.indexOfLast { it.role == TurnRole.USER }
         val messages = history.mapIndexed { i, t ->
             val role = if (t.role == TurnRole.USER) QuickAiChatRole.USER else QuickAiChatRole.ASSISTANT

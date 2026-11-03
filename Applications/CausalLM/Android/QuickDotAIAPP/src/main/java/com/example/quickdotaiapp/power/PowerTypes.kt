@@ -38,11 +38,14 @@ data class PowerSample(
 sealed interface PromptSource {
     @Serializable @SerialName("composer") data object Composer : PromptSource
     @Serializable @SerialName("fixed") data class Fixed(val tokens: Int) : PromptSource
+    /** The validated HTP summarization prompt (res/raw/gemma4_moe_messages.json, about 1K tokens). */
+    @Serializable @SerialName("htp-summary") data object HtpSummary : PromptSource
 }
 
 fun PromptSource.label(): String = when (this) {
     PromptSource.Composer -> "composer"
     is PromptSource.Fixed -> "fixed-$tokens"
+    PromptSource.HtpSummary -> "htp-summary"
 }
 
 @Serializable

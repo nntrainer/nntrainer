@@ -2,6 +2,7 @@
 package com.example.quickdotaiapp.power
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -26,5 +27,17 @@ class PowerPromptsTest {
             assertTrue("${file.path}: ${text.length} chars for $want", text.length in (want * 0.9).toInt()..(want * 1.1).toInt())
             assertTrue(file.path, text.trimEnd().endsWith(PowerPrompts.INSTRUCTION))
         }
+    }
+
+    /** The Power preset for the HTP packs is the validated summarization prompt: the first user message of the bundled file. */
+    @Test fun theHtpSummaryPromptIsTheFirstUserMessageOfTheBundledFile() {
+        val file = File("src/main/res/raw/gemma4_moe_messages.json")
+        assertTrue(file.path, file.exists())
+        val prompt = PowerPrompts.firstUserContent(file.readText())!!
+        assertTrue(prompt.startsWith("You are a summarization expert."))
+        assertTrue(prompt.trimEnd().endsWith("</Text>"))
+        assertNull(PowerPrompts.firstUserContent("not json"))
+        assertNull(PowerPrompts.firstUserContent("[]"))
+        assertNull(PowerPrompts.firstUserContent("""[{"role": "assistant", "content": "x"}]"""))
     }
 }

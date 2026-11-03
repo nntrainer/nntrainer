@@ -11,6 +11,7 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = true
+        jniLibs.keepDebugSymbols += setOf("**/libnntr_hvx_skel.so", "**/libQnnHtp*Skel.so")
     }
     defaultConfig {
         applicationId = "com.example.quickdotaiapp"

@@ -116,7 +116,8 @@ private fun Setup(chat: UiState, power: PowerUi, runner: PowerRunner, onMeasure:
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Choice("PROMPT", listOf<Pair<PromptSource, String>>(PromptSource.Composer to "Composer") +
-                PowerPrompts.sizes.map { PromptSource.Fixed(it) to (if (it < 1024) "$it" else "${it / 1024}K") },
+                PowerPrompts.sizes.map { PromptSource.Fixed(it) to (if (it < 1024) "$it" else "${it / 1024}K") } +
+                listOf<Pair<PromptSource, String>>(PromptSource.HtpSummary to "HTP 1K"),
                 s.prompt) { edit { copy(prompt = it) } }
             Choice("WINDOW TOKENS", listOf(64, 512, 1024).map { it to "$it" }, s.windowTokens) { edit { copy(windowTokens = it) } }
             Choice("REPEATS", listOf(1, 2, 3, 5).map { it to "$it" }, s.repeats) { edit { copy(repeats = it) } }

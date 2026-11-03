@@ -7,6 +7,7 @@ import com.example.quickdotai.ModelDescriptor
 import com.example.quickdotai.ModelIds
 import com.example.quickdotai.RuntimeKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -17,6 +18,10 @@ class ExamplesTest {
         RuntimeKind.LITERT, setOf(BackendType.GPU), setOf(Capability.MULTIMODAL, Capability.MESSAGES_API, Capability.STREAMING))
     private val qwen = ModelDescriptor(ModelIds.QWEN3_0_6B, "qwen3-0.6b", "Qwen3 0.6B",
         RuntimeKind.NATIVE, setOf(BackendType.CPU), setOf(Capability.STREAMING, Capability.TOOL_USE))
+    private val htp = ModelDescriptor(ModelIds.GEMMA4_26B_A4B_HTP, "gemma4-26b-a4b", "Gemma4 26B A4B (HTP)",
+        RuntimeKind.NATIVE, setOf(BackendType.NPU), setOf(Capability.STREAMING, Capability.MESSAGES_API))
+    private val lfm2Htp = ModelDescriptor(ModelIds.LFM2_24BA2B_HTP, "lfm2", "LFM2 24B A2B (HTP)",
+        RuntimeKind.NATIVE, setOf(BackendType.NPU), setOf(Capability.STREAMING, Capability.MESSAGES_API))
     private val examples = Examples()
 
     @Test
@@ -37,5 +42,18 @@ class ExamplesTest {
     fun runtimeLabels() {
         assertEquals("Quick.AI", Examples.runtimeLabel(RuntimeKind.NATIVE))
         assertEquals("LiteRT", Examples.runtimeLabel(RuntimeKind.LITERT))
+    }
+
+    /** The two HTP presets: the pack folders the public API names, the HTP badge, and a one-shot chat. */
+    @Test
+    fun htpPresetsHaveTheirFoldersBadgeAndOneShotChat() {
+        assertEquals("/m/gemma4-26b-a4b-htp-w4a32/nntr_config.json", Examples.requiredPath(htp, "/m"))
+        assertEquals("/m/lfm2-24ba2b-htp-w4a32", Examples.modelPath(lfm2Htp, "/m/"))
+        assertEquals("HTP", Examples.badge(htp))
+        assertEquals("NPU", Examples.badge(npu))
+        assertTrue(Examples.isOneShot(htp))
+        assertTrue(Examples.isOneShot(lfm2Htp))
+        assertFalse(Examples.isOneShot(npu))
+        assertFalse(Examples.isOneShot(null))
     }
 }

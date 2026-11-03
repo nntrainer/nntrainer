@@ -41,4 +41,13 @@ class PowerLogTest {
         val back = PowerLog.fromJson(PowerLog.toJson(log))
         assertTrue(back.runs.single().samples.single().headroom.isNaN())
     }
+
+    @Test fun theHtpSummaryPromptSourceRoundTripsAndLabels() {
+        val log = PowerSessionLog(meta, PowerSettings(prompt = PromptSource.HtpSummary), null, listOf(run))
+        val text = PowerLog.toJson(log)
+        assertTrue(text, text.contains("\"htp-summary\""))
+        assertEquals(log, PowerLog.fromJson(text))
+        assertEquals("htp-summary", PromptSource.HtpSummary.label())
+        assertEquals("htp-summary", PowerLog.csvRow(log, run).split(",")[4])
+    }
 }

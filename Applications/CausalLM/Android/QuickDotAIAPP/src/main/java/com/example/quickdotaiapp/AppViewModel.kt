@@ -59,6 +59,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun prompt(source: PromptSource): String? = when (source) {
         PromptSource.Composer -> controller.composerText().ifBlank { null }
+        PromptSource.HtpSummary -> runCatching {
+            getApplication<Application>().resources.openRawResource(R.raw.gemma4_moe_messages).bufferedReader().readText()
+        }.getOrNull()?.let(PowerPrompts::firstUserContent)
         is PromptSource.Fixed -> runCatching {
             getApplication<Application>().resources.openRawResource(rawPrompt(source.tokens)).bufferedReader().readText()
         }.getOrNull()
