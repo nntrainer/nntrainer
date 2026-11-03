@@ -98,6 +98,7 @@ test_target = [
   'unittest_layers_rnn.cpp',
   'unittest_layers_rnncell.cpp',
   'unittest_layers_reduce_mean.cpp',
+  'unittest_layers_reduce_mean_compute.cpp',
   'unittest_layers_reduce_sum.cpp',
   'unittest_layers_lstm.cpp',
   'unittest_layers_lstmcell.cpp',
