@@ -10,6 +10,11 @@ Reference fixtures are shipped as tarballs under `packaging/`:
 - `causallm_reference_generation.tar.gz` — CausalLM model fixtures
 - `causallm_reference_embedding.tar.gz` — embedding model fixtures
 
+`unittest_mha_core` (`layers/unittest_mha_core.cpp`) pins `MHACoreLayer`'s host
+attention path against a plain reference. Meson builds and runs it on the host;
+on Android the script below builds and runs it next to the model suite, because
+an fp16 Android build takes the layer's FP16 path there.
+
 ---
 
 ## x86 (Ubuntu host)
@@ -111,7 +116,7 @@ ndk-build \
   APP_BUILD_SCRIPT=Applications/CausalLM/jni/Android.mk \
   NDK_APPLICATION_MK=Applications/CausalLM/jni/Application.mk \
   CAUSALLM_PREBUILT_LIB=../../../builddir_app/cpu/libcausallm.so \
-  unittest_causallm_models \
+  unittest_causallm_models unittest_mha_core \
   -j$(nproc)
 # output: Applications/CausalLM/jni/obj/local/arm64-v8a/
 ```
@@ -135,6 +140,7 @@ ENGINE=builddir/android_build_result/lib/arm64-v8a
 adb shell "mkdir -p $INSTALL/causallm_reference $INSTALL/tmp"
 
 adb push $TEST/unittest_causallm_models $INSTALL/
+adb push $TEST/unittest_mha_core        $INSTALL/
 adb push $NATIVE/nntr_quantize          $INSTALL/
 adb push $NATIVE/libcausallm.so         $INSTALL/
 adb push $ENGINE/libnntrainer.so        $INSTALL/
@@ -142,7 +148,7 @@ adb push $ENGINE/libccapi-nntrainer.so  $INSTALL/
 adb push $ENGINE/libc++_shared.so       $INSTALL/
 adb push test/unittest/models/causallm_reference $INSTALL/
 
-adb shell "chmod 755 $INSTALL/unittest_causallm_models $INSTALL/nntr_quantize"
+adb shell "chmod 755 $INSTALL/unittest_causallm_models $INSTALL/unittest_mha_core $INSTALL/nntr_quantize"
 ```
 
 ### Run (steps 1–6 automated)
@@ -154,13 +160,14 @@ adb shell "chmod 755 $INSTALL/unittest_causallm_models $INSTALL/nntr_quantize"
 # reuse existing nntrainer build and ndk-build artifacts
 ./Applications/CausalLM/run_unittest_android.sh --cache
 
-# filter by model or test type
+# filter by model or test type (the filter goes to both binaries)
 ./Applications/CausalLM/run_unittest_android.sh --filter '*Gemma4*'
 ./Applications/CausalLM/run_unittest_android.sh --cache --filter '*Q40*'
 ```
 
-The script runs all six steps above end-to-end. Use `--cache` to reuse a
-compatible canonical native build and the test-only ndk-build artifact.
+The script runs all six steps above end-to-end for both binaries and fails if
+either does. Use `--cache` to reuse a compatible canonical native build and the
+test-only ndk-build artifacts.
 
 ### Expected result
 
@@ -168,6 +175,10 @@ compatible canonical native build and the test-only ndk-build artifact.
 [==========] 55 tests from 22 test suites ran.
 [  PASSED  ] 55 tests.
 ```
+
+`unittest_mha_core` passes its per-row cases and skips its gemm cases: on ARM
+the host flash arm is not selected at their step sizes, so those skips are by
+design (the skip message says so), not a missing prerequisite.
 
 ### Required environment variables
 
