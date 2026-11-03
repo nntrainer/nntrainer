@@ -76,10 +76,11 @@ must specify `HEX_ARCH=v81`, `HEXAGON_SDK_ROOT`, `DEFAULT_HEXAGON_TOOLS_ROOT`,
 and Android SDK. HTP and QNN are separate variants; do not combine their flags.
 The package verifier checks ARM dependencies and preserves the DSP ELF bytes.
 
-SampleTestAPP exposes the `gemma4-26b-a4b` family with `NATIVE / NPU / W4A32`.
-Use an app-readable model base directory, then Load and Run in the OpenAI tab.
-Selecting this model seeds both OpenAI and Chat with the validated summarization
-prompt. Load/Run preserves edits to that prompt.
+QuickDotAIAPP exposes the `gemma4-26b-a4b` family with `Quick.AI / NPU / W4A32`
+and selects it by default. Set an app-readable model base directory in the model
+sheet, tap Load model, then Send a message or an OpenAI messages array from the
+composer's JSON mode. The validated summarization prompt is bundled as
+`res/raw/gemma4_moe_messages.json` and offered as the Power tab's `HTP 1K` preset.
 
 For interactive use, copy `chat_template.jinja`, `generation_config.json` and
 `nntr_config.json` from [the HTP chat preset](../res/gemma4/htp_chat/) into the
@@ -93,9 +94,12 @@ The earlier 1,024/128 benchmark pack deliberately disabled EOS; retain that pack
 only for reproducing those measurements. Its fallback template is not the
 recommended interactive configuration.
 
-Chat input is plain message text; the API applies the template. The sample's raw
-output view includes the final `<turn|>` marker. Each native HTP request remains
-independent; the Chat tab does not retain conversation history for this preset.
+Chat input is plain message text; the API applies the template. The chat bubble
+hides the final `<turn|>` marker; the Metrics screen's raw output and the token
+trace show it. Each native HTP request is independent: for the HTP presets the
+app sends only the newest user message, not the transcript, because the pack's
+1,280 positions would overflow and the tail would be truncated silently
+(nntrainer #4474).
 See [the Chat verification results](../../../docs/gemma4-htp-quickdotai.md#validation)
 for the exact template source, model settings and device results.
 
@@ -103,7 +107,7 @@ Load failures include the native diagnostic returned by
 `getLastModelLoadError()` on the worker thread. The app compares the complete
 load request before reusing a handle, and Reload always replaces the handle.
 
-See the [SampleTestAPP validation results](../../../docs/gemma4-htp-quickdotai.md#validation)
+See the [sample app validation results](../../../docs/gemma4-htp-quickdotai.md#validation)
 for device checks and the current 16 KB compatibility limitation of the SDK
 runtime/DSP packaging. Keep `jniLibs.useLegacyPackaging = true` and exclude
 `libnntr_hvx_skel.so` from stripping in downstream applications.
@@ -135,11 +139,11 @@ format rejection, SR15 load, two identical greedy streaming requests and
 unload. Each base contains the `lfm2-24ba2b-htp-w4a32` directory; the prompt
 file contains an already formatted prompt.
 
-For SampleTestAPP, select family `lfm2`, runtime `NATIVE` and backend `NPU`.
+For QuickDotAIAPP, select family `lfm2`, runtime `Quick.AI` and backend `NPU`.
 The model base path must contain the same `lfm2-24ba2b-htp-w4a32` directory.
 The APK does not include model weights. Normal launches use
-`/sdcard/Download/aistudio-mobile/models/`; stage the model there to use
-Chat **Open** or OpenAI **Load model** without editing the path. A path
+`/sdcard/Download/aistudio-mobile/models/`; stage the model there to tap
+**Load model** in the model sheet without editing the path. A path
 supplied to an instrumentation test is temporary and is not saved for the
 next app launch.
 The opt-in app lifecycle test accepts `htpModelId=lfm2-24ba2b-htp`; its
@@ -149,11 +153,11 @@ dialogs, run:
 
 ```bash
 adb -s "$DEVICE" shell am instrument -w -r \
-  -e class 'com.example.sampletestapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
+  -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
   -e htpModelId lfm2-24ba2b-htp \
   -e htpModelBase /sdcard/Download/aistudio-mobile/models \
   -e htpMessages /sdcard/Download/lfm2/messages.json \
-  com.example.sampletestapp.test/androidx.test.runner.AndroidJUnitRunner
+  com.example.quickdotaiapp.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
 `messages.json` is an OpenAI messages array. Use greedy generation and a
@@ -163,7 +167,7 @@ generation, reload and recovery from an invalid model path. Reports and
 native token traces are written under the app's `files/htp-app-validation`.
 
 Also verify the normal-launch path with
-`-e class 'com.example.sampletestapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' -e htpDefaultPathCheck true`.
+`-e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' -e htpDefaultPathCheck true`.
 This test uses the default model path and LFM2 prompt. It opens Chat and
 generates an answer, compares the OpenAI output and repeats after restarting the
 Activity. Reports are stored in `files/htp-default-path-validation`.

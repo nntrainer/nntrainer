@@ -63,9 +63,10 @@ that also lists the DSP ELF in the native library directory. This build is
 not certified for a 16 KB device. See the
 [device validation](../../../../docs/gemma4-htp-quickdotai.md#validation).
 
-Gemma4 MoE selection fills the OpenAI and Chat inputs with the tested summary
-prompt. For Chat, use the [HTP chat preset](../../res/gemma4/htp_chat/) in the
-model pack: it supplies the 26B template with an empty thought channel, real EOS
+The tested summary prompt ships with the sample as
+`QuickDotAIAPP/src/main/res/raw/gemma4_moe_messages.json` and as the Power
+tab's `HTP 1K` preset. For Chat, use the [HTP chat preset](../../res/gemma4/htp_chat/)
+in the model pack: it supplies the 26B template with an empty thought channel, real EOS
 tokens and enough context for the full default prompt. The fixed-length benchmark
 configuration is not suitable for interactive responses. See the
 [Chat configuration and validation](../../../../docs/gemma4-htp-quickdotai.md#chat-and-the-default-prompt).
@@ -150,8 +151,8 @@ Use `runModelHandleWithMessagesStreaming()` for OpenAI-style message lists and
 `runModelHandleWithJsonStreaming()` for full OpenAI JSON requests containing
 `tools` or legacy `functions`.
 
-End-to-end Chat and Raw request examples live in
-[`../../docs/ChatAndOpenAIUsage.md`](../../docs/ChatAndOpenAIUsage.md).
+End-to-end Chat and JSON request examples live in the sample app
+([`../QuickDotAIAPP`](../QuickDotAIAPP), described in [`../Architecture.md`](../Architecture.md)).
 
 ## 🖼️ Multimodal Usage
 

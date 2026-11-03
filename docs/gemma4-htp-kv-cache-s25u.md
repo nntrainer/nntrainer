@@ -201,7 +201,7 @@ S26 Ultra에서는 **실행하지 않았다**. 코드를 읽어 확인한 것:
 - QuickDotAI API는 `run(input, …, "", "")`로 system prompt 없이 부르므로 SAVE는
   일어나지 않는다. 앱 pack의 `nntr_config.json`에 `system_prompt.kvcache`가 있으면
   이제 그 파일을 로드하려 한다(파일이 없으면 load가 실패) — 일반 `CausalLM`과 같은
-  동작이다. 현재 `htp_chat` preset과 SampleTestAPP pack에는 그 키가 없다.
+  동작이다. 현재 `htp_chat` preset과 QuickDotAIAPP pack에는 그 키가 없다.
 
 알려진 한계(코드는 그대로 둠):
 
