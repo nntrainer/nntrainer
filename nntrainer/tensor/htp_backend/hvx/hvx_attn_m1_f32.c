@@ -284,6 +284,62 @@ static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
   return AEE_SUCCESS;
 }
 
+hvx_attn_m1_ctx *hvx_attn_m1_reserve(const hvx_attn_m1_ctx *src, uint32_t rows,
+                                     uint32_t drop, int *err) {
+  int rc = AEE_EINVALIDFORMAT;
+  hvx_attn_m1_ctx *dst = NULL;
+  if (!src || !src->q8 || !rows || rows >= HVX_ATTN_M1_QK_I8 || rows % TILE ||
+      drop % TILE)
+    goto out;
+  for (uint32_t l = 0; l < src->n_layers; ++l)
+    if (src->kv_len[l] < drop || src->kv_len[l] - drop > rows)
+      goto out;
+  dst = hvx_attn_m1_create(src->n_layers, src->n_kv, src->gqa, src->head_dim,
+                           rows | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY |
+                             (src->fast ? HVX_ATTN_M1_FAST : 0u) |
+                             (src->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u),
+                           src->pool, &rc);
+  if (!dst)
+    goto out;
+  const size_t scales =
+    (size_t)src->n_layers * src->n_kv * src->head_dim * sizeof(float);
+  memcpy(dst->sk, src->sk, scales);
+  memcpy(dst->sk_inv, src->sk_inv, scales);
+  memcpy(dst->sv, src->sv, scales);
+  memcpy(dst->sv_inv, src->sv_inv, scales);
+  memcpy(dst->sk_floor, src->sk_floor, scales);
+  memcpy(dst->sv_floor, src->sv_floor, scales);
+  memcpy(dst->scaled, src->scaled, src->n_layers);
+  for (uint32_t l = 0; l < src->n_layers; ++l) {
+    const uint32_t live = src->kv_len[l] - drop;
+    if (src->kt[l]) {
+      rc = layer_alloc(dst, l);
+      if (rc != AEE_SUCCESS) {
+        hvx_attn_m1_free(dst);
+        dst = NULL;
+        goto out;
+      }
+      for (uint32_t h = 0; h < src->n_kv; ++h) {
+        const size_t old_head = (size_t)h * src->seq * src->head_dim;
+        const size_t new_head = (size_t)h * dst->seq * dst->head_dim;
+        const size_t offset = (size_t)drop * src->head_dim;
+        memcpy((uint8_t *)dst->kt[l] + new_head,
+               (const uint8_t *)src->kt[l] + old_head + offset,
+               (size_t)tiles_of(live) * TILE * src->head_dim);
+        memcpy((uint8_t *)dst->v[l] + new_head,
+               (const uint8_t *)src->v[l] + old_head + offset,
+               (size_t)live * src->head_dim);
+      }
+    }
+    dst->kv_len[l] = live;
+  }
+  rc = AEE_SUCCESS;
+out:
+  if (err)
+    *err = rc;
+  return dst;
+}
+
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
 static inline uint16_t *kt_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                 uint32_t h) {

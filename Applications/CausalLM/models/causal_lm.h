@@ -88,6 +88,11 @@ public:
 
 protected:
   bool htp_execution_profile_ = false;
+  bool htp_session_enabled_ = false;
+  bool htp_session_failed_ = false;
+  /** Last emitted token has not yet passed through attention. */
+  std::vector<unsigned int> htp_pending_tokens_;
+  std::vector<unsigned int> last_generated_ids_;
 #ifdef ENABLE_HEXKL
   /** Start an independent request; continuation steps must not call this. */
   void beginIndependentHtpPrompt(
@@ -238,9 +243,18 @@ public:
    * @brief Absolute token position the next run() would continue from.
    * @note Equal to getKvLen() after a completed run; the two differ only while
    *       a resume has been armed but not yet consumed.
+   *       A resident HTP session keeps its final emitted token separately;
+   *       the next run consumes it before the new prompt's token IDs.
    */
   unsigned int getSessionTokenPosition() const {
     return SYS_PROMP_LEN + global_token_len;
+  }
+
+  /** Device INT8 K+V payload; zero before decode registration. */
+  WIN_EXPORT size_t getDeviceKVCacheBytes() const;
+  bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
+  const std::vector<unsigned int> &getLastGeneratedTokenIds() const {
+    return last_generated_ids_;
   }
 
   /**

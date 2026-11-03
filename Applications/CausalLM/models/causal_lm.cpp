@@ -1070,6 +1070,9 @@ void CausalLM::compactKVCache(unsigned int pos, bool force) {
 }
 
 void CausalLM::save_kvcache(std::string path, int to_) {
+  if (htp_session_enabled_ && getDeviceKVCacheBytes())
+    throw std::logic_error(
+      "Resident DSP KV cannot be saved through the host FP16 snapshot API");
   if (!kv_cache.isAllocated()) {
     throw std::runtime_error(
       "save_kvcache called before allocateAndBindKVCache()");
@@ -1109,6 +1112,14 @@ static inline void retire_decode_capture() {
 }
 
 void CausalLM::setSessionTokenPosition(unsigned int pos) {
+  if (htp_session_enabled_ && pos != 0u &&
+      pos != static_cast<unsigned>(getKvLen()))
+    throw std::invalid_argument(
+      "Resident HTP KV can resume only at its current position");
+  if (pos == 0u) {
+    htp_pending_tokens_.clear();
+    htp_session_failed_ = false;
+  }
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH.clear();
   SYS_PROMP_LEN = 0;
@@ -1116,8 +1127,19 @@ void CausalLM::setSessionTokenPosition(unsigned int pos) {
   retire_decode_capture();
 }
 
+size_t CausalLM::getDeviceKVCacheBytes() const {
+#ifdef ENABLE_HEXKL
+  return htp_execution_profile_ ? nntrainer::get_htp_ops()->decode_kv_bytes()
+                                : 0;
+#else
+  return 0;
+#endif
+}
+
 void CausalLM::setPrecomputedKVCache(const std::string &path,
                                      unsigned int sys_prompt_token_len) {
+  htp_pending_tokens_.clear();
+  htp_session_failed_ = false;
   USE_KVCACHE = !path.empty();
   PRE_COMPUTED_CACHE_PATH = path;
   SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
@@ -1126,6 +1148,9 @@ void CausalLM::setPrecomputedKVCache(const std::string &path,
 }
 
 void CausalLM::load_kvcache(std::string path, int to_) {
+  if (htp_session_enabled_ && getDeviceKVCacheBytes())
+    throw std::logic_error("Resident DSP KV cannot be overwritten through the "
+                           "host FP16 snapshot API");
   if (!kv_cache.isAllocated()) {
     allocateAndBindKVCache();
   }
@@ -1563,6 +1588,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // This lets performance runs verify the normal DSP token-id path as well.
   const char *generated_ids_path = std::getenv("NNTR_GENERATED_IDS");
   std::vector<unsigned int> generated_ids;
+  last_generated_ids_.clear();
   // Diagnostic replay keeps token history fixed while recording the model's
   // actual predictions through NNTR_GENERATED_IDS. Normal generation is
   // unchanged.
@@ -1641,7 +1667,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   /// a tokenizer that prepends a BOS (LFM2's <|startoftext|>) must not put
   /// one there. Byte-identical for a tokenizer that adds none (Gemma4).
   auto _input = tokenizer->Encode(
-    prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE));
+    prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE) &&
+               !(htp_session_enabled_ && global_token_len != 0));
+  if (htp_session_enabled_ && global_token_len != 0) {
+    NNTR_THROW_IF(htp_pending_tokens_.size() != 1u, std::logic_error)
+      << "Resident HTP session has no pending feedback token";
+    _input.insert(_input.begin(), htp_pending_tokens_[0]);
+  }
 
   // [prefill-plane] Now that the prompt's real token count is known, give this
   // request the activation plane (== prefill block) it can use, and no more: a
@@ -1750,6 +1782,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // otherwise, feeds only a part of _input
   for (unsigned int i = 0; i < text_len; ++i)
     init_input.push_back(_input[i]);
+  NNTR_THROW_IF(init_input.empty(), std::invalid_argument)
+    << "The request has no input tokens";
+
+  bool resident_continuation = false;
+#ifdef ENABLE_HEXKL
+  if (htp_execution_profile_) {
+    const unsigned int end =
+      unlimited_generation ? MAX_SEQ_LEN
+                           : prefix_rows + text_len + reserved_for_generation;
+    resident_continuation = nntrainer::get_htp_ops()->prepare_decode_kv_request(
+      htp_session_enabled_ && global_token_len != 0 ? prefix_rows : 0u, end);
+  }
+#endif
 
   ///@todo currently, the whole sequence may not be fed into the model
   /// This should be handled later.
@@ -2147,7 +2192,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             static_cast<float>(init_input[o + j]);
       const unsigned int cf = from_pos + o;
       // a windowed (sliding) layer keeps its window in front of the chunk
-      compactKVCache(cf);
+      if (!resident_continuation)
+        compactKVCache(cf);
       beforePrefillBlock(cf, cf + clen);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
@@ -2164,7 +2210,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  decode loop. See ttft_ms in performance_metrics.h. */
   std::chrono::high_resolution_clock::time_point perf_split_first_out{};
 
-  if (SKIP_PREFILL && init_len > 1) {
+  const bool skipped_prefill_token = SKIP_PREFILL && init_len > 1;
+  if (skipped_prefill_token) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
@@ -2217,7 +2264,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   for (auto &out : output) {
     releaseLogitsBuf(out);
   }
-  if (generated_ids_path)
+  if (!skipped_prefill_token)
     generated_ids.insert(generated_ids.end(), id_list.begin(), id_list.end());
 
 #ifdef ENABLE_HEXKL
@@ -2339,9 +2386,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                         : MAX_SEQ_LEN;
   const unsigned int generation_begin = input_len + 1;
   const unsigned int generation_end =
-    generation_begin < MAX_SEQ_LEN
+    uint64_t(generation_begin) + global_token_len < MAX_SEQ_LEN
       ? generation_begin +
-          std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
+          std::min(MAX_SEQ_LEN - generation_begin - global_token_len,
+                   generation_budget)
       : generation_begin;
 
   // The windowed layers' caches from here on: the window, then one row a
@@ -2349,12 +2397,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // sized and based the same (before its first decode row).
   // ponytail: one (rows, base) for all windowed layers -- they share one
   // window and one DSP cache; per-layer values if a model ever mixes them.
-  compactKVCache(input_len + global_token_len);
+  if (!resident_continuation)
+    compactKVCache(input_len + global_token_len);
   for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
-    if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+    if (!resident_continuation &&
+        kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
       const unsigned int base = kv_cache.getBase(l);
-      htpDecodeKvWindow(input_len + global_token_len - base + NUM_TO_GENERATE,
-                        base);
+      const unsigned int end =
+        unlimited_generation
+          ? MAX_SEQ_LEN
+          : input_len + global_token_len + reserved_for_generation;
+      htpDecodeKvWindow(end - base, base);
       break;
     }
 
@@ -2414,9 +2467,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] = static_cast<float>(
         feedback_id(token_generation_idx - generation_begin + 1u, ids_list[b]));
     }
-    if (generated_ids_path)
-      generated_ids.insert(generated_ids.end(), ids_list.begin(),
-                           ids_list.end());
+    generated_ids.insert(generated_ids.end(), ids_list.begin(), ids_list.end());
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
@@ -2466,6 +2517,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   // Always release the input buffer after the generation loop, whether
   // the loop exited early (EOS found) or ran to the maximum token limit.
+  if (htp_session_enabled_)
+    htp_pending_tokens_ = {static_cast<unsigned>(input_sample[0])};
   free(input_sample);
 
   global_token_len += (generation_cnt + init_len);
@@ -2514,6 +2567,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   performance_metrics.prefill_tokens = init_len;
+  last_generated_ids_ = std::move(generated_ids);
   performance_metrics.prefill_duration_ms = prefill_duration.count();
   performance_metrics.generation_tokens = generation_cnt;
   performance_metrics.generation_duration_ms = generation_duration.count();
@@ -2567,7 +2621,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (!path.empty()) {
       json trace;
       trace["input_ids"] = init_input;
-      const bool prefill_emitted = !SKIP_PREFILL && init_len < MAX_SEQ_LEN;
+      const bool prefill_emitted =
+        !skipped_prefill_token && init_len < MAX_SEQ_LEN;
       const size_t begin = input_len + (prefill_emitted ? 0u : 1u);
       const size_t count = generation_cnt + (prefill_emitted ? 1u : 0u);
       trace["output_ids"] = std::vector<unsigned int>(

@@ -1504,4 +1504,10 @@ interface nntr_hvx : remote_handle64 {
    AEEResult weight_set_static_quant(in sequence<uint32> handles,
       in sequence<float> scales, in sequence<int32> zero_points,
       in uint32 gate_plus1, in uint32 up_plus1);
+
+   // Request-boundary reservation. cache is 0 or 1; drop is a multiple
+   // of 64 and is allowed only for sliding layers. Retains scales and KV
+   // bytes. No token may be running. Existing RPC ordinals stay unchanged.
+   AEEResult attn_m1_reserve(in uint32 cache, in uint32 rows, in uint32 drop,
+                           in uint32 base);
 };

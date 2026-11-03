@@ -1527,6 +1527,72 @@ static void check_gemma_fast(hvx_worker_pool *const pools[3], uint32_t q_bits) {
   }
 }
 
+/** Resizing and sliding retention must not change the quantized state. */
+static void check_kv_reserve(hvx_worker_pool *pool) {
+  for (uint32_t mode = 0; mode < 3u; ++mode) {
+    const uint32_t nk = 2u, hd = 512u, gqa = 8u, L = 129u;
+    const size_t row = nk * hd, nq = row * gqa;
+    amc_rng rng = {0x4428u};
+    float *q = malloc(nq * sizeof(float));
+    float *k = malloc((L + 1u) * row * sizeof(float));
+    float *v = malloc((L + 1u) * row * sizeof(float));
+    float *out = malloc(nq * sizeof(float)),
+          *other = malloc(nq * sizeof(float));
+    g4_fill(&rng, q, k, v, L + 1u, nk, gqa, hd, 64u);
+    int err = 0;
+    const uint32_t flags = HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY |
+                           (mode ? HVX_ATTN_M1_FAST : 0u) |
+                           (mode == 2u ? HVX_ATTN_M1_QK_I8 : 0u);
+    hvx_attn_m1_ctx *src =
+      hvx_attn_m1_create(2u, nk, gqa, hd, 256u | flags, pool, &err);
+    CHECK(src && err == AEE_SUCCESS, "KV reserve create");
+    if (!src)
+      abort();
+    CHECK(hvx_attn_m1_kv_append(src, 0u, 0u, L, k, v) == AEE_SUCCESS,
+          "KV reserve seed");
+    hvx_attn_m1_ctx *grown = hvx_attn_m1_reserve(src, 512u, 0u, &err);
+    CHECK(grown && err == AEE_SUCCESS, "KV reserve grow");
+    hvx_attn_m1_ctx *slid = hvx_attn_m1_reserve(src, 192u, 64u, &err);
+    CHECK(!slid && err == AEE_EINVALIDFORMAT, "KV reserve unseeded-layer drop");
+    CHECK(hvx_attn_m1_kv_append(src, 1u, 0u, L, k, v) == AEE_SUCCESS,
+          "KV reserve second seed");
+    slid = hvx_attn_m1_reserve(src, 192u, 64u, &err);
+    CHECK(grown && !grown->kt[1] && !grown->v[1],
+          "KV reserve keeps lazy layer");
+    CHECK(slid && err == AEE_SUCCESS, "KV reserve slide after valid lengths");
+    hvx_attn_m1_ctx *bad = hvx_attn_m1_reserve(src, 64u, 0u, &err);
+    CHECK(!bad && err == AEE_EINVALIDFORMAT && src->kv_len[0] == L,
+          "KV reserve rejects insufficient capacity without mutation");
+    bad = hvx_attn_m1_reserve(src, 192u, 1u, &err);
+    CHECK(!bad && err == AEE_EINVALIDFORMAT,
+          "KV reserve requires complete K tiles");
+    if (grown && slid) {
+      const size_t ns = (size_t)src->n_layers * nk * hd * sizeof(float);
+      CHECK(!memcmp(src->sk, slid->sk, ns) && !memcmp(src->sv, slid->sv, ns) &&
+              !memcmp(src->sk_inv, grown->sk_inv, nk * hd * sizeof(float)),
+            "KV reserve preserves scales");
+      int rc = hvx_attn_m1_forward(src, 0u, L, 64u, 1.0f, q, k + L * row,
+                                   v + L * row, out, NULL);
+      rc |= hvx_attn_m1_forward(grown, 0u, L, 64u, 1.0f, q, k + L * row,
+                                v + L * row, other, NULL);
+      CHECK(rc == AEE_SUCCESS && count_bad(out, other, nq) == 0,
+            "KV reserve grow preserves next attention output mode=%u", mode);
+      rc = hvx_attn_m1_forward(slid, 0u, L - 64u, 64u, 1.0f, q, k + L * row,
+                               v + L * row, other, NULL);
+      CHECK(rc == AEE_SUCCESS && count_bad(out, other, nq) == 0,
+            "KV reserve sliding preserves next attention output mode=%u", mode);
+    }
+    hvx_attn_m1_free(grown);
+    hvx_attn_m1_free(slid);
+    hvx_attn_m1_free(src);
+    free(q);
+    free(k);
+    free(v);
+    free(out);
+    free(other);
+  }
+}
+
 /** Exercise every QK query-group branch with signed byte endpoints. */
 static void check_qk_i8_endpoints(hvx_worker_pool *pool) {
   const uint32_t hd = 256u, seq = 64u;
@@ -2091,6 +2157,7 @@ int main(void) {
   check_gemma_fast(pools, 16u);
   check_gemma_fast(pools, 8u);
   check_qk_i8_endpoints(pools[2]);
+  check_kv_reserve(pools[2]);
   check_gemma_q8(pools);
   check_seed_q8(pools[2]);
   check_seed_vec(pools[2]);

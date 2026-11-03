@@ -148,6 +148,13 @@ typedef struct {
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 
+/** Build a resized INT8 cache, optionally dropping complete K tiles.
+ * The source stays valid on failure. No requantization; scales and retained
+ * KV bytes are preserved. Caller swaps ownership only after success.
+ * Must run between requests, with no outstanding worker or decode job. */
+hvx_attn_m1_ctx *hvx_attn_m1_reserve(const hvx_attn_m1_ctx *src, uint32_t rows,
+                                     uint32_t drop, int *err);
+
 /**
  * @brief Allocates and zero-fills the cache for a fixed shape.
  *

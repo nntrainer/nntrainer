@@ -835,6 +835,15 @@ public:
     (void)rows;
     (void)base;
   }
+  /** Reserve device KV between requests. Returns true for a resident prefix.
+   * An accelerator must reject a stale prefix rather than read host copies. */
+  virtual bool prepare_decode_kv_request(unsigned from, unsigned end) {
+    (void)from;
+    (void)end;
+    return false;
+  }
+  /** Allocated device K+V payload bytes, excluding scratch and scales. */
+  virtual size_t decode_kv_bytes() const { return 0; }
   // [#4416 D6] The same seed from the cache's fp16 bits, widened on the
   // accelerator (exactly, as compute_fp16_to_fp32): no CPU conversion.
   virtual bool decode_kv_seed_f16(unsigned n_rows, const uint16_t *k_rows,

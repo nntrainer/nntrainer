@@ -244,7 +244,9 @@ int main(int argc, char *argv[]) {
     std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"
               << "  <model_path>   : Path to model directory\n"
               << "  [input_prompt] : Optional input text (uses sample_input or "
-                 "chat_input if omitted)\n";
+                 "chat_input if omitted)\n"
+              << "  --requests FILE : JSON array of {prompt, reset?}; one "
+                 "loaded model\n";
     return EXIT_FAILURE;
   }
 
@@ -264,6 +266,21 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    json requests;
+    const bool request_mode = argc >= 3 && std::string(argv[2]) == "--requests";
+    if (request_mode) {
+      if (argc != 4)
+        throw std::invalid_argument("--requests requires one JSON file");
+      requests = causallm::LoadJsonFile(argv[3]);
+      if (!requests.is_array() || requests.empty())
+        throw std::invalid_argument("Requests must be a nonempty JSON array");
+      for (const auto &request : requests)
+        if (!request.is_object() || !request.contains("prompt") ||
+            !request["prompt"].is_string() ||
+            (request.contains("reset") && !request["reset"].is_boolean()))
+          throw std::invalid_argument(
+            "Each request requires a string prompt and optional boolean reset");
+    }
 #ifdef ENABLE_HEXKL
     if (causallm::configureLfm2HtpDefaults(
           cfg.value("model_type", std::string()),
@@ -343,7 +360,9 @@ int main(int argc, char *argv[]) {
     }
 
     // Determine input text
-    if (argc >= 3) {
+    if (request_mode) {
+      input_text = requests[0]["prompt"].get<std::string>();
+    } else if (argc >= 3) {
       input_text = argv[2];
     } else {
       if (nntr_cfg.contains("chat_input")) {
@@ -387,12 +406,42 @@ int main(int argc, char *argv[]) {
 #ifdef PROFILE
     start_peak_tracker();
 #endif
+    auto run_prompt = [&](const std::string &text) {
 #if defined(_WIN32)
-    model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
-               system_tail_prompt.c_str());
+      model->run(text.c_str(), do_sample, system_head_prompt.c_str(),
+                 system_tail_prompt.c_str());
 #else
-    model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
+      model->run(text, do_sample, system_head_prompt, system_tail_prompt);
 #endif
+    };
+    if (!request_mode) {
+      run_prompt(input_text);
+    } else {
+      auto *causal = dynamic_cast<causallm::CausalLM *>(model.get());
+      if (!causal)
+        throw std::invalid_argument(
+          "Request sequences require a causal language model");
+      size_t index = 0;
+      for (const auto &request : requests) {
+        if (request.value("reset", false))
+          causal->setSessionTokenPosition(0);
+        const auto before = causal->getSessionTokenPosition();
+        run_prompt(request["prompt"].get<std::string>());
+        const auto metrics = causal->getPerformanceMetrics();
+        json result = {{"index", index++},
+                       {"cached_before", before},
+                       {"cached_after", causal->getKvLen()},
+                       {"pending_token", causal->hasPendingSessionToken()},
+                       {"device_kv_bytes", causal->getDeviceKVCacheBytes()},
+                       {"prefill_tokens", metrics.prefill_tokens},
+                       {"ttft_ms", metrics.ttft_ms},
+                       {"decode_ms", metrics.decode_steady_ms},
+                       {"peak_memory_kb", metrics.peak_memory_kb},
+                       {"output", causal->getOutput()}};
+        result["output_ids"] = causal->getLastGeneratedTokenIds();
+        std::cout << "[REQUEST] " << result.dump() << std::endl;
+      }
+    }
 #ifdef PROFILE
     stop_and_print_peak();
 #endif

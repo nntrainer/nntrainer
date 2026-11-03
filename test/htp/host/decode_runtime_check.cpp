@@ -9,6 +9,18 @@
 #include <htp_decode_runtime.h>
 
 int main() {
+  assert(nntrainer::HtpDecodeRuntime::reserveRows(1) == 64);
+  assert(nntrainer::HtpDecodeRuntime::reserveRows(64) == 64);
+  assert(nntrainer::HtpDecodeRuntime::reserveRows(65) == 128);
+  for (uint64_t bad : {uint64_t(0), UINT64_MAX}) {
+    bool rejected = false;
+    try {
+      (void)nntrainer::HtpDecodeRuntime::reserveRows(bad);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
   for (unsigned experts : {32u, 64u}) {
     htp_graph_lfm2_shape shape{};
     shape.n_layers = 3;
@@ -67,6 +79,16 @@ int main() {
       runtime.conv_next_pos_[op] = 3;
     assert(runtime.canContinue(3));
     runtime.checkContinuationRange(3, 6);
+    runtime.attn_capacity_[0] = 3;
+    bool capacity_rejected = false;
+    try {
+      runtime.checkContinuationRange(3, 6);
+    } catch (const std::invalid_argument &) {
+      capacity_rejected = true;
+    }
+    assert(capacity_rejected);
+    runtime.checkContinuationRange(3, 6, false);
+    runtime.attn_capacity_[0] = 0;
     assert(!runtime.canContinue(2) && !runtime.canContinue(4));
     runtime.have_id_ = true;
     assert(!runtime.canContinue(3));

@@ -249,6 +249,8 @@ nested form for new configurations. Legacy flat cache size `0` still means
 | `htp.fc_lanes_small` / `fc_lanes_large` | `null` / `null` | keep the kernel's built-in lane selection; explicit overrides are 1..8 |
 | `htp.attn_m1_fast` / `attn_m1_fast_scope` | `false` / `"all"` | experimental integer decode attention; scope `all` selects every attention cache, `global` selects only non-windowed caches. Global scope requires separate sliding/global cache shapes. Arithmetic differs from the default path; validate outputs before deployment. |
 | `htp.attn_m1_q_bits` | `16` | Experimental Q precision in integer decode attention: `8` uses signed byte QK dot products, requires fast attention with global scope. KV bytes, softmax and PV arithmetic are unchanged. Lower Q precision can change generated outputs. |
+| `htp.kv_session` | `false` | Gemma4 fully resident HTP: successive `run()` calls append to one live conversation. Send only new prompt text; reset with `setSessionTokenPosition(0)`. Retains DSP INT8 KV, scales, graph and absolute positions. |
+| `htp.kv_request_reserve` | `false` | Reserve decode KV from the request end rather than the model context limit, rounded to 64 rows. Global storage grows between requests; sliding storage retains its window plus the current request's input/generation allowance. |
 | `moe.cache_experts` / `preload_experts` | `16` / `128` | per-layer resident capacity and separate startup preload limit |
 | `moe.cache_grow` | `null` | grow toward the bounded target of 34 per layer; `0` disables growth, positive values request that many additional slots |
 | `moe.prediction` | `"auto"` | `auto`, `off`, `dsp-page`, `dsp-direct` or `arm-direct`; replaces the old predict/direct variable pair |
@@ -259,6 +261,50 @@ nested form for new configurations. Legacy flat cache size `0` still means
 | `moe.dma_queues` / `dma_bypass` | `4` / `true` | expert kernel DMA policy |
 | `moe.m1_gemv` / `gemv_lead_kb` / `gemv_rows1` / `gemv_feed` | `true` / `192` / `true` / `true` | M=1 expert GEMV and feed policy |
 | `moe.hadamard` / `hadamard_scope` | model metadata, otherwise `"off"` / `"2bit"` | checkpoint-compatible online rotation |
+
+### Resident Gemma4 KV sessions
+
+Enable `htp.kv_session` and `htp.kv_request_reserve` in `nntr_config.json`.
+The model object is one active conversation, used synchronously. The first
+`run()` receives the initial prompt; later calls receive only its newly
+appended text, without another BOS or a repeated history. The final emitted
+token is pending attention and is automatically consumed before the next
+prompt. `getSessionTokenPosition()` and `getKvLen()` count committed KV rows;
+`hasPendingSessionToken()` identifies that remaining token.
+
+Continuation uses the existing resident single-token DSP path. It skips the
+old prompt's prefill and KV seeding; it does not run an HMX block prefill for
+the new input. A long appended prompt therefore costs decode-like work per
+new token. Global reservation grows only when needed. Sliding compaction
+drops complete 64-row tiles while retaining at least the attention window.
+Both operations run between requests, preserve INT8 bytes and scales, and
+temporarily need the old and replacement buffers. Token execution retains
+the existing contiguous KV layout. Initial prefill FP16 buffers keep their
+existing allocation policy and are released after DSP seeding.
+
+Use `setSessionTokenPosition(0)` to start an independent conversation on the
+next call. A failed run requires this reset before another continuation.
+Rewind, device snapshots, multiple resident conversation IDs and radix hits
+on device KV are not implemented by this option. Host FP16 snapshot APIs
+reject an active resident session rather than read released host storage.
+`getDeviceKVCacheBytes()` reports allocated INT8 K+V payload, excluding
+scales and temporary attention buffers. Existing `moe.cache_grow` policy
+remains separate; `0` still disables expert pool growth.
+
+Both the ARM RPC client and the DSP skeleton must be rebuilt from the
+updated IDL. To run several requests in one C++ process:
+
+```sh
+nntr_causallm /path/to/pack --requests /path/to/requests.json
+```
+
+`requests.json` is an array of objects with a string `prompt` and optional
+boolean `reset`. Prompt strings contain the model's chat delimiters, just as
+the ordinary CLI prompt does. A request with `reset: true` starts a fresh
+conversation. The CLI prints `[REQUEST]` JSON containing committed positions,
+pending-token status, output IDs, TTFT, decode time and device KV bytes.
+The C++ model API exposes the same state; the CLI does not start an HTTP
+server.
 
 `moe.prediction="dsp-page"` and `moe.tl2_prepared_file` require
 `htp.page_cache=-1`. Optional numeric/bool fields accept `null` for automatic

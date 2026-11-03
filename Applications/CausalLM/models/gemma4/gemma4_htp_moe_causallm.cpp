@@ -98,6 +98,12 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
 #ifdef ENABLE_HEXKL
   // Build the full decode graph after loading its weights.
   htp_e2e = MOE_ENGINE == "htp";
+  htp_session_enabled_ = runtime_config.htp.kv_session;
+  if (htp_session_enabled_ &&
+      (!htp_e2e || ATTENTION_ENGINE != "htp" || ATTN_PROJ_ENGINE != "htp" ||
+       FFN_ENGINE != "htp" || LMHEAD_ENGINE != "htp"))
+    throw std::invalid_argument(
+      "Gemma4 KV sessions require a fully resident HTP graph");
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
                 std::invalid_argument)
@@ -375,11 +381,20 @@ void Gemma4HtpMoECausalLM::run(const WSTR prompt, bool do_sample,
       ATTN_PROJ_ENGINE == "htp" || FFN_ENGINE == "htp" ||
       LMHEAD_ENGINE == "htp") {
 #ifdef ENABLE_HEXKL
-    beginIndependentHtpPrompt(htp_run_started_);
+    if (!htp_session_enabled_ || getSessionTokenPosition() == 0u)
+      beginIndependentHtpPrompt(htp_run_started_);
+    else if (htp_session_failed_)
+      throw std::logic_error(
+        "HTP KV session failed; reset its token position to zero");
 #endif
     htp_run_started_ = true;
   }
-  CausalLM::run(prompt, do_sample, system_prompt, tail_prompt, log_output);
+  try {
+    CausalLM::run(prompt, do_sample, system_prompt, tail_prompt, log_output);
+  } catch (...) {
+    htp_session_failed_ = true;
+    throw;
+  }
 }
 
 void Gemma4HtpMoECausalLM::repack_weight() {

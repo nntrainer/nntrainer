@@ -53,6 +53,8 @@ using HtpCpuList = std::vector<int>;
   X(bool, qkv_to_host, false)                                                  \
   X(bool, oproj_u16, true)                                                     \
   X(bool, kv_seed_q, false)                                                    \
+  X(bool, kv_session, false)                                                   \
+  X(bool, kv_request_reserve, false)                                           \
   X(bool, attn_f16, true)                                                      \
   X(bool, attn_q2, true)                                                       \
   X(bool, attn_dsp_calib, true)                                                \

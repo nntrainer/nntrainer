@@ -70,6 +70,42 @@ int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
   return AEE_SUCCESS;
 }
 
+int nntr_hvx_attn_m1_reserve(remote_handle64 handle, uint32 cache, uint32 rows,
+                             uint32 drop, uint32 base) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || cache > 1u)
+    return AEE_EBADPARM;
+  hvx_attn_m1_ctx **slot = cache ? &s->attn_m1_b : &s->attn_m1;
+  hvx_attn_m1_ctx *old = *slot;
+  if (!old || !s->graph)
+    return AEE_EBADSTATE;
+  for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+    const htp_graph_op *op = &s->graph->ops[i];
+    if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == old->n_kv &&
+        op->gqa == old->gqa && op->head_dim == old->head_dim &&
+        ((!op->top_k && (drop || base)) || base > s->graph->max_seq ||
+         (drop &&
+          (op->n_experts > UINT32_MAX - drop || base != op->n_experts + drop))))
+      return AEE_EINVALIDFORMAT;
+  }
+  int err = AEE_SUCCESS;
+  hvx_attn_m1_ctx *next = rows == old->max_seq && !drop
+                            ? old
+                            : hvx_attn_m1_reserve(old, rows, drop, &err);
+  if (!next)
+    return err;
+  *slot = next;
+  for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+    htp_graph_op *op = &s->graph->ops[i];
+    if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == old->n_kv &&
+        op->gqa == old->gqa && op->head_dim == old->head_dim)
+      op->n_experts = base;
+  }
+  if (old != next)
+    hvx_attn_m1_free(old);
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_attn_m1_release(remote_handle64 handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {

@@ -445,6 +445,12 @@ public:
     decode_.seed_ordinal_ = HTP_GRAPH_NO_OP;
     decode_.row_bound_ = false;
     decode_.have_id_ = false;
+    decode_.request_end_ = 0;
+    decode_.attn_capacity_[0] = decode_.attn_capacity_[1] = 0;
+    decode_.attn_window_rows_ = 0;
+    decode_.kv_bases_dirty_ = decode_.graph_inited_;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1])
+      htp_graph_op_at(decode_.graph_words_.data(), op)->n_experts = 0;
     // Prefill staging may have been freed during decode. Tensor addresses
     // are reused by the next prompt, so no old ION alias may survive it.
     staging_.ion_alias_ = {};
@@ -2360,6 +2366,99 @@ public:
     decode_.attn_window_rows_ = (rows + 63u) / 64u * 64u;
   }
 
+  size_t decode_kv_bytes() const override {
+    if (!decode_.attn_registered_)
+      return 0;
+    size_t bytes = 0;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+      const auto *rec = decode_.graphOp(op);
+      const auto ord = decode_.attn_ordinal_[op];
+      bytes += size_t(decode_.attn_capacity_[decode_.attn_cache_[ord]]) *
+               rec->n_kv * rec->head_dim * 2u;
+    }
+    return bytes;
+  }
+
+  bool prepare_decode_kv_request(unsigned from, unsigned end) override {
+    if (decode_.graph_words_.empty()) {
+      if (from)
+        throw std::logic_error("HTP KV session has no resident graph");
+      return false;
+    }
+    if (end <= from || end > decode_.graph_words_[6])
+      throw std::invalid_argument("HTP KV request exceeds model context");
+    decode_.request_end_ = end;
+    if (!from)
+      return false;
+    if (!decode_.canContinue(from) || !decode_.attn_registered_)
+      throw std::logic_error("HTP KV session is stale; reset the session");
+    // Validate all layers before making a change to either cache shape.
+    decode_.checkContinuationRange(from, from + 1u, false);
+    if (cpu_predictor_)
+      cpu_predictor_->drain();
+    if (pool_prefetch_)
+      pool_prefetch_->drain();
+    const auto session = HtpBackend::global().handle();
+    for (uint32_t cache = 0; cache < 2u; ++cache) {
+      const htp_graph_op *shape = nullptr;
+      bool sliding = false, global = false;
+      uint32_t keep = 0;
+      for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+        if (decode_.attn_cache_[decode_.attn_ordinal_[op]] != cache)
+          continue;
+        const auto *rec = decode_.graphOp(op);
+        shape = rec;
+        sliding |= rec->top_k != 0;
+        global |= rec->top_k == 0;
+        keep = std::max(keep, rec->top_k);
+      }
+      if (!shape)
+        continue;
+      if (sliding && global)
+        throw std::logic_error(
+          "HTP KV session needs separate global/sliding shapes");
+      const uint32_t live = from - shape->n_experts;
+      const uint32_t drop =
+        sliding && live > keep ? (live - keep) / 64u * 64u : 0u;
+      const uint32_t base = shape->n_experts + drop;
+      const uint32_t wanted = HtpDecodeRuntime::reserveRows(
+        sliding || htpRuntimeConfig().htp.kv_request_reserve
+          ? end - base
+          : decode_.graph_words_[6]);
+      // Global caches grow only when needed. Sliding caches compact at a
+      // request boundary; the token loop keeps direct contiguous accesses.
+      const uint32_t rows =
+        sliding ? wanted : std::max(wanted, decode_.attn_capacity_[cache]);
+      if (!drop && rows == decode_.attn_capacity_[cache])
+        continue;
+      const auto started = HtpProfile::nowUs();
+      const int rc = nntr_hvx_attn_m1_reserve(session, cache, rows, drop, base);
+      if (rc != AEE_SUCCESS)
+        throw std::runtime_error(
+          "HTP KV reservation failed (updated DSP skel required): " +
+          graphErr(rc));
+      for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+        const auto ord = decode_.attn_ordinal_[op];
+        if (decode_.attn_cache_[ord] != cache)
+          continue;
+        htp_graph_op_at(decode_.graph_words_.data(), op)->n_experts = base;
+        decode_.kv_len_[ord] -= drop;
+      }
+      decode_.attn_capacity_[cache] = rows;
+      if (sliding)
+        decode_.attn_window_rows_ = rows;
+      std::fprintf(
+        stderr,
+        "[HTP-KV] reserve cache=%u rows=%u base=%u dropped=%u us=%llu\n", cache,
+        rows, base, drop, (unsigned long long)(HtpProfile::nowUs() - started));
+    }
+    decode_.checkContinuationRange(from, end);
+    std::fprintf(stderr,
+                 "[HTP-KV] reuse prefix=%u reserved_end=%u payload_bytes=%zu\n",
+                 from, end, decode_kv_bytes());
+    return true;
+  }
+
   bool decode_kv_seed_fp32(unsigned n_rows, const float *k_rows,
                            const float *v_rows) override {
     return seedRows(n_rows, k_rows, v_rows, nullptr, nullptr);
@@ -3462,10 +3561,12 @@ public:
       if (rec == nullptr)
         continue;
       // a windowed cache (set_decode_kv_window) holds that many rows
-      const uint32_t max_seq =
+      const uint32_t max_seq = HtpDecodeRuntime::reserveRows(
         rec->top_k != 0u && decode_.attn_window_rows_ != 0u
           ? decode_.attn_window_rows_
-          : decode_.graph_words_[6];
+          : (htpRuntimeConfig().htp.kv_request_reserve && decode_.request_end_
+               ? decode_.request_end_
+               : decode_.graph_words_[6]));
       // The fixed int8-cache policy uses scales from the prefill seed:
       // 1 selects the first cache shape, 2 selects both shapes.
       constexpr bool q8 = true;
@@ -3489,7 +3590,19 @@ public:
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
       }
+      // Record ownership before synchronizing bases so reset can release a
+      // partially initialized cache if the new RPC is unavailable or fails.
       decode_.attn_registered_ = true;
+      if (runtime.kv_session || runtime.kv_request_reserve ||
+          decode_.kv_bases_dirty_) {
+        const int sync =
+          nntr_hvx_attn_m1_reserve(session, c, max_seq, 0, rec->n_experts);
+        if (sync != AEE_SUCCESS)
+          throw std::runtime_error(
+            "HTP KV initial reservation failed (updated DSP skel required): " +
+            graphErr(sync));
+      }
+      decode_.attn_capacity_[c] = max_seq;
       std::fprintf(stderr,
                    "[HTP] attn_m1: registered layers=%u kv=%u gqa=%u "
                    "head_dim=%u max_seq=%u cache=%llu KiB%s\n",
@@ -3500,6 +3613,7 @@ public:
                    qk_i8 ? " int8 fast Q8"
                          : (fast ? " int8 fast" : (q8 ? " int8" : "")));
     }
+    decode_.kv_bases_dirty_ = false;
   }
 
   /** Send the configured session options once. Rejected or mismatched options

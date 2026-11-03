@@ -51,6 +51,9 @@ public:
   std::vector<uint32_t> kv_len_;
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
+  uint32_t request_end_ = 0; /**< Absolute end reserved outside token loops. */
+  uint32_t attn_capacity_[2] = {0, 0}; /**< Rows per device cache shape. */
+  bool kv_bases_dirty_ = false; /**< Reused graph needs fresh cache bases. */
   /** per attention ordinal its op, its session cache (0, or
    *  1 for the second attn_m1_register: another (n_kv, gqa, head_dim)) and
    *  its ordinal within that cache (hexkl_graph_init's) */
@@ -115,14 +118,25 @@ public:
            pending_op_ == HTP_GRAPH_NO_OP && !have_id_;
   }
 
-  void checkContinuationRange(unsigned from, unsigned to) const {
+  static uint32_t reserveRows(uint64_t rows) {
+    if (!rows || rows > 0x0FFFFFC0u)
+      throw std::invalid_argument("HTP KV reservation exceeds cache limits");
+    return static_cast<uint32_t>((rows + 63u) / 64u * 64u);
+  }
+
+  void checkContinuationRange(unsigned from, unsigned to,
+                              bool check_capacity = true) const {
     if (!canContinue(from) || to <= from || to > graph_words_[6])
       throw std::invalid_argument("HTP continuation: invalid token range");
     for (uint32_t op : kind_ops_[HTP_OP_ATTN_M1]) {
       const auto *rec = graphOp(op);
+      const uint32_t reserved = attn_capacity_[attn_cache_[attn_ordinal_[op]]];
       const uint32_t capacity =
-        rec->top_k && attn_window_rows_ ? attn_window_rows_ : graph_words_[6];
-      if (from < rec->n_experts || to - rec->n_experts > capacity)
+        reserved ? reserved
+                 : (rec->top_k && attn_window_rows_ ? attn_window_rows_
+                                                    : graph_words_[6]);
+      if (from < rec->n_experts ||
+          (check_capacity && to - rec->n_experts > capacity))
         throw std::invalid_argument(
           "HTP continuation: token range exceeds the reserved KV capacity");
       if (kv_len_[attn_ordinal_[op]] != from - rec->n_experts)
@@ -239,6 +253,8 @@ public:
     clearPending();
     seed_ordinal_ = HTP_GRAPH_NO_OP;
     attn_registered_ = false;
+    request_end_ = attn_capacity_[0] = attn_capacity_[1] = 0;
+    kv_bases_dirty_ = false;
     moe_bound_ = 0;
     moe_op_by_handle_.clear();
     moe_tables_.assign(moe_ops_.size(), {});

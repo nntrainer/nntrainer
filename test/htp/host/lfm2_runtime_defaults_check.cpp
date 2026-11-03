@@ -49,6 +49,11 @@ int main() {
   setEnvironment("NNTR_LFM2_DEFAULT_PRESET", "0");
   setEnvironment("NNTR_NUM_THREADS", "3");
   const auto defaults = parseHtpRuntimeConfig(json::object());
+  assert(!defaults.htp.kv_session && !defaults.htp.kv_request_reserve);
+  const auto session = parseHtpRuntimeConfig(
+    {{"htp", {{"kv_session", true}, {"kv_request_reserve", true}}}});
+  assert(session.htp.kv_session && session.htp.kv_request_reserve &&
+         !(session == defaults));
   assert(defaults.htp.attn_m1_q_bits == 16);
   const auto q8 = parseHtpRuntimeConfig({{"htp",
                                           {{"attn_m1_fast", true},
