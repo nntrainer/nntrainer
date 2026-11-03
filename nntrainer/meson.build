@@ -57,6 +57,7 @@ if get_option('platform') == 'tizen'
 endif
 
 nntrainer_elements = [
+  'kv_cache',
   'compiler',
   'schema',
   'dataset',

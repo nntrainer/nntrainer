@@ -1,0 +1,1835 @@
+// SPDX-License-Identifier: Apache-2.0
+/** @file unittest_kv_cache_core.cpp
+ * @brief CPU ownership, checked geometry and transactional KV publication.
+ * @author Codex (OpenAI)
+ * @bug Covers synchronous CPU storage; device integration is not exercised.
+ */
+#include <fp16.h>
+#include <gtest/gtest.h>
+#include <kv_cache/kv_cache_manager.h>
+#include <tensor.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <random>
+#include <sstream>
+
+using namespace nntrainer::kv;
+
+namespace {
+
+CacheSpec spec(size_t capacity = 8, size_t max_tokens = 8) {
+  LayerSpec layer;
+  layer.num_kv_heads = 2;
+  layer.head_dim = 2;
+  layer.capacity = capacity;
+  layer.max_tokens = max_tokens;
+  layer.encoding = Encoding::Float32;
+  layer.storage_type = StorageType::Float32;
+  return {{layer}};
+}
+
+class CountingAllocator : public nntrainer::MemAllocator {
+public:
+  size_t allocations = 0;
+  size_t frees = 0;
+  size_t fail_at = std::numeric_limits<size_t>::max();
+  void alloc(void **ptr, size_t bytes, size_t alignment) override {
+    if (allocations == fail_at)
+      throw std::bad_alloc();
+    ++allocations;
+    nntrainer::MemAllocator::alloc(ptr, bytes, alignment);
+  }
+  void free(void *ptr) override {
+    ++frees;
+    nntrainer::MemAllocator::free(ptr);
+  }
+};
+
+void finish(KvCacheManager &manager, StepLease &&step) {
+  manager.markReady(step, 0);
+  manager.commit(std::move(step));
+}
+
+/** Commit one step whose key rows hold the token id and values id + 0.5. */
+void appendTokens(KvCacheManager &manager, const std::vector<TokenId> &ids) {
+  auto step = manager.beginStep(ids.size(), ids.data());
+  std::vector<float> keys, values;
+  for (TokenId id : ids)
+    for (int e = 0; e < 4; ++e) {
+      keys.push_back(static_cast<float>(id));
+      values.push_back(static_cast<float>(id) + 0.5f);
+    }
+  manager.append(step, 0, keys.data(), values.data(),
+                 keys.size() * sizeof(float));
+  finish(manager, std::move(step));
+}
+
+/** Append one more token, then return the first key element of every row. */
+std::vector<float> appendAndReadKeys(KvCacheManager &manager, TokenId id) {
+  auto step = manager.beginStep(1, &id);
+  std::vector<float> key(4, static_cast<float>(id)), value(4, id + 0.5f);
+  manager.append(step, 0, key.data(), value.data(), 16);
+  manager.markReady(step, 0);
+  std::vector<float> seen;
+  for (auto &view : manager.readKey(step, 0)) {
+    auto data = static_cast<const float *>(view.data());
+    for (size_t row = 0; row < view.sizeBytes() / 16; ++row)
+      seen.push_back(data[row * 4]);
+  }
+  manager.commit(std::move(step));
+  return seen;
+}
+
+CacheSpec pagedSpec() {
+  auto s = spec();
+  s.page_tokens = 2;
+  return s;
+}
+
+} // namespace
+
+TEST(KvCacheCore, validateBeforeAllocating) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].head_dim = 0;
+  EXPECT_THROW(manager.initialize(s, allocator), std::invalid_argument);
+  EXPECT_EQ(allocator->allocations, 0u);
+  s = spec();
+  s.layers[0].batch = std::numeric_limits<size_t>::max();
+  EXPECT_THROW(manager.initialize(s, allocator), std::overflow_error);
+  s = spec();
+  s.layers[0].encoding = Encoding::Float16;
+  EXPECT_THROW(manager.initialize(s, allocator), std::invalid_argument);
+  EXPECT_THROW(checkedAdd(std::numeric_limits<size_t>::max(), 1),
+               std::overflow_error);
+  EXPECT_EQ(allocator->allocations, 0u);
+}
+
+TEST(KvCacheCore, aliasGeometryValidatedBeforeAllocation) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].source = 0;
+  s.layers[1].capacity = 4;
+  EXPECT_THROW(manager.initialize(s, allocator), std::invalid_argument);
+  s.layers[1] = s.layers[0];
+  s.layers[1].source = 1;
+  EXPECT_THROW(manager.initialize(s, allocator), std::invalid_argument);
+  s.layers[1].source = -2;
+  EXPECT_THROW(manager.initialize(s, allocator), std::invalid_argument);
+  EXPECT_EQ(allocator->allocations, 0u);
+}
+
+TEST(KvCacheCore, aliasOwnsNoExtraStorageAndCannotWrite) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].source = 0;
+  s.layers.push_back(s.layers[1]);
+  s.layers[2].source = 1;
+  manager.initialize(s, allocator);
+  EXPECT_EQ(allocator->allocations, 2u);
+  EXPECT_EQ(manager.stats().backing_bytes, 2 * s.layers[0].planeBytes());
+  EXPECT_EQ(manager.stats().owner_layers, 1u);
+  EXPECT_EQ(manager.keyMemory(0), manager.keyMemory(2));
+  EXPECT_EQ(manager.valueMemory(0), manager.valueMemory(1));
+  auto step = manager.beginStep(2);
+  EXPECT_THROW(manager.writeKey(step, 1), std::out_of_range);
+  EXPECT_THROW(manager.readKey(step, 2), std::logic_error);
+  manager.markReady(step, 0);
+  EXPECT_EQ(manager.readKey(step, 2)[0].data(),
+            manager.writeKey(step, 0)[0].data());
+  manager.commit(std::move(step));
+}
+
+TEST(KvCacheCore, tensorPinsAllocationAfterManagerAndAllocatorGoAway) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  std::weak_ptr<CountingAllocator> weak = allocator;
+  nntrainer::Tensor retained;
+  {
+    KvCacheManager manager;
+    manager.initialize(spec(), allocator);
+    retained = nntrainer::Tensor(ml::train::TensorDim({1, 1, 8, 4}), false);
+    retained.setData(manager.keyMemory(0), 0, false);
+    retained.getData<float>()[0] = 17.0f;
+  }
+  EXPECT_EQ(allocator->frees, 1u); // V died; Tensor still owns K.
+  allocator.reset();
+  ASSERT_FALSE(weak.expired());
+  EXPECT_EQ(retained.getData<float>()[0], 17.0f);
+  retained = nntrainer::Tensor();
+  EXPECT_TRUE(weak.expired());
+}
+
+TEST(KvCacheCore,
+     failedReinitializePreservesOldSessionAndReleasesPartialStorage) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  KvCacheManager manager;
+  manager.initialize(spec(), allocator);
+  auto original = manager.keyMemory(0);
+  manager.setPosition(3);
+  allocator->fail_at = 3; // New K succeeds; new V fails.
+  EXPECT_THROW(manager.initialize(spec(), allocator), std::bad_alloc);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.keyMemory(0), original);
+  EXPECT_EQ(allocator->frees, 1u);
+}
+
+TEST(KvCacheCore, nullAllocationRejected) {
+  class NullAllocator : public nntrainer::MemAllocator {
+  public:
+    void alloc(void **ptr, size_t, size_t) override { *ptr = nullptr; }
+  };
+  KvCacheManager manager;
+  EXPECT_THROW(manager.initialize(spec(), std::make_shared<NullAllocator>()),
+               std::bad_alloc);
+}
+
+TEST(KvCacheCore, deviceMemoryRejectedByCpuAdapter) {
+  class DeviceAllocator : public CountingAllocator {
+  public:
+    bool isDeviceVisible() const override { return true; }
+  };
+  auto allocator = std::make_shared<DeviceAllocator>();
+  KvCacheManager manager;
+  EXPECT_THROW(manager.initialize(spec(), allocator), std::invalid_argument);
+  EXPECT_EQ(allocator->allocations, 0u);
+}
+
+TEST(KvCacheCore, graphScopeChecksRealSlicesAndProducerCompletion) {
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  manager.initialize(s);
+  auto step = manager.beginStep(2);
+  auto scope = manager.bindStep(step);
+  auto *key = manager.keyMemory(0)->getAddr<void>();
+  auto *value = manager.valueMemory(0)->getAddr<void>();
+  auto access = KvStepScope::access(key, value, 0, 0, 2);
+  ASSERT_NE(access, nullptr);
+  const size_t bytes = 2 * s.layers[0].rowBytes();
+  access->validateWrite(key, value, bytes);
+  EXPECT_THROW(access->validateWrite(value, key, bytes), std::logic_error);
+  EXPECT_THROW(access->validateRead(key, value, bytes), std::logic_error);
+  std::memset(key, 0, bytes);
+  std::memset(value, 0, bytes);
+  access->producerReady();
+  access->validateRead(key, value, bytes);
+  EXPECT_THROW(manager.commit(std::move(step)), std::logic_error);
+  EXPECT_THROW(KvStepScope::access(key, value, 0, 1, 2), std::logic_error);
+  EXPECT_THROW(KvStepScope::access(value, key, 0, 0, 2), std::logic_error);
+  auto other =
+    KvStepScope::access(manager.keyMemory(1)->getAddr<void>(),
+                        manager.valueMemory(1)->getAddr<void>(), 0, 0, 2);
+  other->producerReady();
+  manager.commit(std::move(step));
+  EXPECT_THROW(access->validateRead(key, value, bytes), std::logic_error);
+}
+
+TEST(KvCacheCore, graphScopeRejectsStaleAccessAfterAbort) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  auto scope = manager.bindStep(step);
+  auto access =
+    KvStepScope::access(manager.keyMemory(0)->getAddr<void>(),
+                        manager.valueMemory(0)->getAddr<void>(), 0, 0, 1);
+  manager.abort(std::move(step));
+  EXPECT_THROW(access->producerReady(), std::logic_error);
+  EXPECT_EQ(manager.committedLength(), 0u);
+}
+
+TEST(KvCacheCore, layerAccessCannotOutliveItsGraphScope) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  auto scope = manager.bindStep(step);
+  auto access =
+    KvStepScope::access(manager.keyMemory(0)->getAddr<void>(),
+                        manager.valueMemory(0)->getAddr<void>(), 0, 0, 1);
+  scope.reset();
+  auto next_scope = manager.bindStep(step);
+  EXPECT_THROW(access->producerReady(), std::logic_error);
+}
+
+TEST(KvCacheCore, graphScopeUsesDeclaredHybridProducersAndRejectsRing) {
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].has_producer = false;
+  manager.initialize(s);
+  {
+    auto step = manager.beginStep(1);
+    auto scope = manager.bindStep(step);
+    auto access =
+      KvStepScope::access(manager.keyMemory(0)->getAddr<void>(),
+                          manager.valueMemory(0)->getAddr<void>(), 0, 0, 1);
+    EXPECT_THROW(KvStepScope::access(manager.keyMemory(1)->getAddr<void>(),
+                                     manager.valueMemory(1)->getAddr<void>(), 0,
+                                     0, 1),
+                 std::out_of_range);
+    access->producerReady();
+    manager.commit(std::move(step));
+  }
+  manager.initialize(spec(4, 8));
+  auto step = manager.beginStep(1);
+  EXPECT_THROW(manager.bindStep(step), std::invalid_argument);
+}
+
+TEST(KvCacheCore, publishOnlyAfterAllOwnersAreReady) {
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers.push_back(s.layers[0]);
+  manager.initialize(s);
+  auto step = manager.beginStep(3);
+  EXPECT_EQ(step.from(), 0u);
+  EXPECT_EQ(step.to(), 3u);
+  EXPECT_THROW(manager.commit(std::move(step)), std::logic_error);
+  manager.markReady(step, 0);
+  EXPECT_THROW(manager.commit(std::move(step)), std::logic_error);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  manager.markReady(step, 1);
+  manager.commit(std::move(step));
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_THROW(manager.commit(std::move(step)), std::logic_error);
+}
+
+TEST(KvCacheCore, activeStepExcludesResetSeekAndReallocation) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  EXPECT_THROW(manager.beginStep(1), std::logic_error);
+  EXPECT_THROW(manager.reset(), std::logic_error);
+  EXPECT_THROW(manager.setPosition(0), std::logic_error);
+  EXPECT_THROW(manager.initialize(spec()), std::logic_error);
+  KvCacheManager other;
+  other.initialize(spec());
+  EXPECT_THROW(other.writeKey(step, 0), std::logic_error);
+}
+
+TEST(KvCacheCore, boundariesAndBatchOffsets) {
+  KvCacheManager manager;
+  auto s = spec();
+  s.layers[0].batch = 2;
+  manager.initialize(s);
+  EXPECT_THROW(manager.beginStep(0), std::out_of_range);
+  EXPECT_THROW(manager.beginStep(std::numeric_limits<size_t>::max()),
+               std::out_of_range);
+  auto step = manager.beginStep(8);
+  auto first = manager.writeKey(step, 0, 0)[0];
+  auto second = manager.writeKey(step, 0, 1)[0];
+  EXPECT_EQ(second.offsetBytes(),
+            s.layers[0].capacity * s.layers[0].rowBytes());
+  EXPECT_EQ(second.sizeBytes(), first.sizeBytes());
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(first.data()) % 64, 0u);
+  EXPECT_THROW(manager.writeKey(step, 0, 2), std::out_of_range);
+  EXPECT_THROW(manager.writeKey(step, 1), std::out_of_range);
+  finish(manager, std::move(step));
+  EXPECT_THROW(first.writableData(), std::logic_error);
+  EXPECT_THROW(manager.beginStep(1), std::out_of_range);
+}
+
+TEST(KvCacheCore, linearAbortPreservesPrefixAndInvalidatesViews) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  finish(manager, manager.beginStep(3));
+  auto step = manager.beginStep(2);
+  auto view = manager.writeValue(step, 0)[0];
+  std::memset(view.writableData(), 42, view.sizeBytes());
+  manager.abort(std::move(step));
+  EXPECT_TRUE(manager.valid());
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_THROW(view.data(), std::logic_error);
+  auto retry = manager.beginStep(2);
+  EXPECT_EQ(retry.from(), 3u);
+  finish(manager, std::move(retry));
+}
+
+TEST(KvCacheCore, abandonedMovedLeaseAborts) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  {
+    auto step = manager.beginStep(2);
+    auto moved = std::move(step);
+    EXPECT_THROW(manager.writeKey(step, 0), std::logic_error);
+  }
+  EXPECT_TRUE(manager.valid());
+  EXPECT_EQ(manager.committedLength(), 0u);
+  finish(manager, manager.beginStep(1));
+}
+
+TEST(KvCacheCore, resetAndReallocateInvalidateOldViewsButRetainAllocation) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  auto view = manager.writeKey(step, 0)[0];
+  auto memory = manager.keyMemory(0);
+  finish(manager, std::move(step));
+  manager.reset();
+  EXPECT_THROW(view.data(), std::logic_error);
+  auto next = manager.beginStep(1);
+  auto next_view = manager.writeKey(next, 0)[0];
+  finish(manager, std::move(next));
+  manager.initialize(spec());
+  EXPECT_THROW(next_view.data(), std::logic_error);
+  EXPECT_NE(memory, manager.keyMemory(0));
+}
+
+TEST(KvCacheCore, ringSeamSegmentsPreserveLogicalReadOrder) {
+  KvCacheManager manager;
+  manager.initialize(spec(4, 16));
+  auto first = manager.beginStep(3);
+  auto write = manager.writeKey(first, 0)[0];
+  auto ptr = static_cast<float *>(write.writableData());
+  for (size_t row = 0; row < 3; ++row)
+    ptr[row * 4] = static_cast<float>(row);
+  finish(manager, std::move(first));
+  auto next = manager.beginStep(3);
+  auto segments = manager.writeKey(next, 0);
+  ASSERT_EQ(segments.size(), 2u);
+  EXPECT_EQ(segments[0].sizeBytes(), 16u);
+  EXPECT_EQ(segments[1].sizeBytes(), 32u);
+  size_t value = 3;
+  for (auto &segment : segments) {
+    auto data = static_cast<float *>(segment.writableData());
+    for (size_t row = 0; row < segment.sizeBytes() / 16; ++row)
+      data[row * 4] = static_cast<float>(value++);
+  }
+  manager.markReady(next, 0);
+  auto read = manager.readKey(next, 0);
+  ASSERT_EQ(read.size(), 2u);
+  value = 2;
+  for (const auto &segment : read) {
+    auto data = static_cast<const float *>(segment.data());
+    for (size_t row = 0; row < segment.sizeBytes() / 16; ++row)
+      EXPECT_EQ(data[row * 4], static_cast<float>(value++));
+  }
+  manager.commit(std::move(next));
+  EXPECT_EQ(manager.committedLength(), 6u);
+}
+
+TEST(KvCacheCore, overwrittenRingAbortRequiresReset) {
+  KvCacheManager manager;
+  manager.initialize(spec(4, 16));
+  EXPECT_THROW(manager.beginStep(5), std::out_of_range);
+  finish(manager, manager.beginStep(4));
+  {
+    auto step = manager.beginStep(1);
+    auto view = manager.writeValue(step, 0)[0];
+    std::memset(view.writableData(), 7, view.sizeBytes());
+  }
+  EXPECT_FALSE(manager.valid());
+  EXPECT_THROW(manager.beginStep(1), std::logic_error);
+  EXPECT_THROW(manager.setPosition(0), std::logic_error);
+  manager.reset();
+  EXPECT_TRUE(manager.valid());
+  EXPECT_EQ(manager.committedLength(), 0u);
+  finish(manager, manager.beginStep(1));
+}
+
+TEST(KvCacheCore, nextStepInvalidatesPriorRingReadViewsBeforeOverwrite) {
+  KvCacheManager manager;
+  manager.initialize(spec(4, 16));
+  auto step = manager.beginStep(4);
+  manager.markReady(step, 0);
+  auto previous = manager.readKey(step, 0)[0];
+  manager.commit(std::move(step));
+  EXPECT_NO_THROW(previous.data());
+  auto next = manager.beginStep(1);
+  EXPECT_THROW(previous.data(), std::logic_error);
+  auto write = manager.writeKey(next, 0)[0];
+  std::memset(write.writableData(), 42, write.sizeBytes());
+  EXPECT_THROW(previous.data(), std::logic_error);
+  finish(manager, std::move(next));
+}
+
+TEST(KvCacheCore, wrapperRebindingCannotChangeOwnedAllocationOrCoreViews) {
+  class RecordingAllocator : public nntrainer::MemAllocator {
+  public:
+    void *allocated = nullptr;
+    void *released = nullptr;
+    void alloc(void **ptr, size_t bytes, size_t alignment) override {
+      nntrainer::MemAllocator::alloc(ptr, bytes, alignment);
+      allocated = *ptr;
+    }
+    void free(void *ptr) override {
+      released = ptr;
+      nntrainer::MemAllocator::free(ptr);
+    }
+  };
+  auto allocator = std::make_shared<RecordingAllocator>();
+  {
+    auto storage = KvStorage::create(16, allocator);
+    auto memory = storage->memory();
+    memory->setAddr(nullptr);
+    EXPECT_EQ(storage->data(), allocator->allocated);
+  }
+  EXPECT_EQ(allocator->released, allocator->allocated);
+
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  auto view = manager.writeKey(step, 0)[0];
+  const void *base = view.data();
+  manager.keyMemory(0)->setAddr(nullptr);
+  EXPECT_EQ(view.data(), base);
+  EXPECT_EQ(view.writableData(), base);
+}
+
+TEST(KvCacheCore, emptyOrMovedViewAccessIsRejected) {
+  KvView empty;
+  EXPECT_EQ(empty.bufferId(), 0u);
+  EXPECT_THROW(empty.data(), std::logic_error);
+  EXPECT_THROW(empty.writableData(), std::logic_error);
+  KvCacheManager manager;
+  manager.initialize(spec());
+  auto step = manager.beginStep(1);
+  auto view = manager.writeKey(step, 0)[0];
+  auto moved = std::move(view);
+  EXPECT_NE(moved.bufferId(), 0u);
+  EXPECT_EQ(view.bufferId(), 0u);
+  EXPECT_THROW(view.data(), std::logic_error);
+}
+
+TEST(KvCacheCore, pagedViewsAllocateOnDemandAndPreserveTokenOrder) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  auto s = spec(8, 8);
+  s.page_tokens = 2;
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].source = 0;
+  KvCacheManager manager;
+  manager.initialize(s, allocator);
+  EXPECT_EQ(allocator->allocations, 0u);
+  auto step = manager.beginStep(3);
+  auto write = manager.writeKey(step, 0);
+  ASSERT_EQ(write.size(), 2u);
+  EXPECT_EQ(allocator->allocations, 4u);
+  size_t token = 0;
+  for (auto &view : write) {
+    auto data = static_cast<float *>(view.writableData());
+    for (size_t row = 0; row < view.sizeBytes() / 16; ++row)
+      data[row * 4] = static_cast<float>(++token);
+  }
+  manager.markReady(step, 0);
+  auto read = manager.readKey(step, 1);
+  ASSERT_EQ(read.size(), 2u);
+  token = 0;
+  for (auto &view : read) {
+    auto data = static_cast<const float *>(view.data());
+    for (size_t row = 0; row < view.sizeBytes() / 16; ++row)
+      EXPECT_EQ(data[row * 4], static_cast<float>(++token));
+  }
+  EXPECT_THROW(manager.keyMemory(0), std::logic_error);
+  EXPECT_NO_THROW(manager.bindStep(step));
+  manager.commit(std::move(step));
+  auto next = manager.beginStep(2);
+  EXPECT_EQ(allocator->allocations, 6u);
+  EXPECT_THROW(read[0].data(), std::logic_error);
+  finish(manager, std::move(next));
+  manager.reset();
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+}
+
+TEST(KvCacheCore, pagedAllocationFailureLeavesSessionUnchanged) {
+  auto allocator = std::make_shared<CountingAllocator>();
+  auto s = spec();
+  s.page_tokens = 2;
+  KvCacheManager manager;
+  manager.initialize(s, allocator);
+  allocator->fail_at = 1;
+  EXPECT_THROW(manager.beginStep(2), std::bad_alloc);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_FALSE(manager.hasActiveStep());
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+  EXPECT_EQ(allocator->frees, 0u); // Failed admission leaves an idle pool page.
+}
+
+TEST(KvCacheCore, sharedPagePoolPinsViewsAndReusesReleasedPages) {
+  auto pool = std::make_shared<KvPagePool>(128);
+  auto s = spec();
+  s.page_tokens = 2;
+  KvCacheManager first, second;
+  first.initialize(s, std::make_shared<nntrainer::MemAllocator>(), pool);
+  second.initialize(s, std::make_shared<nntrainer::MemAllocator>(), pool);
+  auto step = first.beginStep(1);
+  auto retained = first.writeKey(step, 0);
+  const auto identity = retained[0].bufferId();
+  first.abort(std::move(step));
+  EXPECT_THROW(second.beginStep(1), std::bad_alloc);
+  EXPECT_THROW(retained[0].data(), std::logic_error);
+  retained.clear();
+  auto next = second.beginStep(1);
+  EXPECT_EQ(second.writeKey(next, 0)[0].bufferId(), identity);
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  second.abort(std::move(next));
+  pool->trim();
+  EXPECT_EQ(pool->reservedBytes(), 0u);
+}
+
+TEST(KvCacheCore, pagedAttentionMatchesDenseReferenceAcrossStepsAndBatches) {
+  auto s = spec(8, 8);
+  s.layers[0].batch = 2;
+  s.page_tokens = 2;
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].source = 0;
+  KvCacheManager manager;
+  manager.initialize(s);
+  AttentionOptions options;
+  options.query_heads = 4;
+  options.scale = 0.7f;
+  options.logit_softcap = 1.5f;
+  std::vector<float> history_k[2], history_v[2];
+  for (size_t count : {3u, 1u, 3u}) {
+    auto step = manager.beginStep(count);
+    std::vector<float> queries(count * 8);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] = std::sin(static_cast<float>(i + step.from()));
+    for (size_t b = 0; b < 2; ++b) {
+      std::vector<float> k(count * 4), v(count * 4);
+      for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = std::cos(static_cast<float>(i + step.from() * 4 + b));
+        v[i] = static_cast<float>(i + step.from() * 4 + b) / 13;
+      }
+      manager.append(step, 0, k.data(), v.data(), k.size() * sizeof(float), b);
+      history_k[b].insert(history_k[b].end(), k.begin(), k.end());
+      history_v[b].insert(history_v[b].end(), v.begin(), v.end());
+    }
+    EXPECT_THROW(manager.attention(step, 0, queries, options),
+                 std::logic_error);
+    manager.markReady(step, 0);
+    for (bool causal : {true, false})
+      for (size_t window : {0u, 2u})
+        for (size_t b = 0; b < 2; ++b) {
+          options.causal = causal;
+          options.window = window;
+          auto actual = manager.attention(step, 1, queries, options, b);
+          for (size_t q = 0; q < count; ++q) {
+            const size_t end = causal ? step.from() + q + 1 : step.to();
+            const size_t start = window && end > window ? end - window : 0;
+            for (size_t h = 0; h < 4; ++h) {
+              std::vector<double> scores(end - start);
+              for (size_t t = start; t < end; ++t) {
+                double score = 0;
+                for (size_t d = 0; d < 2; ++d)
+                  score += static_cast<double>(queries[q * 8 + h * 2 + d]) *
+                           history_k[b][t * 4 + (h / 2) * 2 + d];
+                scores[t - start] =
+                  1.5 * std::tanh(score * options.scale / 1.5);
+              }
+              double maximum = *std::max_element(scores.begin(), scores.end());
+              double sum = 0;
+              for (auto &score : scores) {
+                score = std::exp(score - maximum);
+                sum += score;
+              }
+              for (size_t d = 0; d < 2; ++d) {
+                double expected = 0;
+                for (size_t t = start; t < end; ++t)
+                  expected += scores[t - start] *
+                              history_v[b][t * 4 + (h / 2) * 2 + d] / sum;
+                EXPECT_NEAR(actual[q * 8 + h * 2 + d], expected, 1e-5);
+              }
+            }
+          }
+        }
+    finish(manager, std::move(step));
+  }
+}
+
+TEST(KvCacheCore, pagedAttentionDecodesBinary16WithoutNativeHalf) {
+  auto s = spec();
+  s.page_tokens = 1;
+  s.layers[0].encoding = Encoding::Float16;
+  s.layers[0].storage_type = StorageType::UInt16;
+  KvCacheManager manager;
+  manager.initialize(s);
+  auto step = manager.beginStep(2);
+  uint16_t k[8] = {}; // Equal scores give uniform attention.
+  uint16_t v[8] = {0x3c00, 0x4000, 0x4200, 0x4400,
+                   0x4200, 0x4400, 0x4500, 0x4600};
+  manager.append(step, 0, k, v, sizeof(k));
+  manager.markReady(step, 0);
+  AttentionOptions options;
+  options.query_heads = 2;
+  auto output = manager.attention(step, 0, std::vector<float>(8, 1), options);
+  EXPECT_FLOAT_EQ(output[0], 1);
+  EXPECT_FLOAT_EQ(output[4], 2);
+  EXPECT_FLOAT_EQ(output[5], 3);
+  EXPECT_FLOAT_EQ(output[6], 4);
+  EXPECT_FLOAT_EQ(output[7], 5);
+}
+
+TEST(KvCacheCore,
+     pagedAttentionVectorizedMatchesDenseReferenceForStandardHeadDim) {
+  const size_t head_dim = 64;
+  const size_t num_kv_heads = 2;
+  const size_t query_heads = 4;
+  const size_t page_tokens = 4;
+  const size_t max_tokens = 16;
+
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = num_kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = max_tokens;
+  layer.max_tokens = max_tokens;
+  layer.encoding = Encoding::Float32;
+  layer.storage_type = StorageType::Float32;
+  s.layers = {layer};
+  s.page_tokens = page_tokens;
+
+  KvCacheManager manager;
+  manager.initialize(s);
+
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  options.causal = true;
+
+  std::vector<float> history_k, history_v;
+
+  for (size_t count : {5u, 1u, 2u}) {
+    auto step = manager.beginStep(count);
+    const size_t width = query_heads * head_dim;
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] = std::sin(static_cast<float>(i + step.from() * 7 + 1));
+
+    std::vector<float> k(count * num_kv_heads * head_dim);
+    std::vector<float> v(count * num_kv_heads * head_dim);
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = std::cos(static_cast<float>(i + step.from() * 11 + 3)) * 0.1f;
+      v[i] = static_cast<float>((i + 5) % 37) / 19.0f;
+    }
+
+    manager.append(step, 0, k.data(), v.data(), k.size() * sizeof(float));
+    history_k.insert(history_k.end(), k.begin(), k.end());
+    history_v.insert(history_v.end(), v.begin(), v.end());
+    manager.markReady(step, 0);
+
+    auto actual = manager.attention(step, 0, queries, options);
+
+    const size_t group = query_heads / num_kv_heads;
+    const size_t kv_width = num_kv_heads * head_dim;
+
+    for (size_t q = 0; q < count; ++q) {
+      const size_t end = step.from() + q + 1;
+      for (size_t h = 0; h < query_heads; ++h) {
+        std::vector<double> scores(end);
+        for (size_t t = 0; t < end; ++t) {
+          double score = 0;
+          for (size_t d = 0; d < head_dim; ++d) {
+            score +=
+              static_cast<double>(queries[q * width + h * head_dim + d]) *
+              history_k[t * kv_width + (h / group) * head_dim + d];
+          }
+          scores[t] = score * options.scale;
+        }
+        double maximum = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (double &sc : scores) {
+          sc = std::exp(sc - maximum);
+          sum += sc;
+        }
+        for (size_t d = 0; d < head_dim; ++d) {
+          double expected = 0;
+          for (size_t t = 0; t < end; ++t)
+            expected += scores[t] *
+                        history_v[t * kv_width + (h / group) * head_dim + d] /
+                        sum;
+          EXPECT_NEAR(actual[q * width + h * head_dim + d], expected, 1e-4);
+        }
+      }
+    }
+    finish(manager, std::move(step));
+  }
+}
+
+TEST(KvCacheCore,
+     pagedAttentionVectorizedFloat16MatchesDenseReferenceForStandardHeadDim) {
+  const size_t head_dim = 64;
+  const size_t num_kv_heads = 2;
+  const size_t query_heads = 4;
+  const size_t page_tokens = 4;
+  const size_t max_tokens = 16;
+
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = num_kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = max_tokens;
+  layer.max_tokens = max_tokens;
+  layer.encoding = Encoding::Float16;
+  layer.storage_type = StorageType::UInt16;
+  s.layers = {layer};
+  s.page_tokens = page_tokens;
+
+  KvCacheManager manager;
+  manager.initialize(s);
+
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  options.causal = true;
+
+  std::vector<float> history_k, history_v;
+
+  for (size_t count : {4u, 1u}) {
+    auto step = manager.beginStep(count);
+    const size_t width = query_heads * head_dim;
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] = std::sin(static_cast<float>(i + step.from() * 5 + 2));
+
+    const size_t kv_elements = count * num_kv_heads * head_dim;
+    std::vector<uint16_t> k_u16(kv_elements), v_u16(kv_elements);
+    std::vector<float> k_f32(kv_elements), v_f32(kv_elements);
+
+    for (size_t i = 0; i < kv_elements; ++i) {
+      float k_val =
+        std::cos(static_cast<float>(i + step.from() * 7 + 1)) * 0.1f;
+      float v_val = static_cast<float>((i + 3) % 29) / 15.0f;
+      uint16_t k_bits = nntrainer::compute_fp32_to_fp16(k_val);
+      uint16_t v_bits = nntrainer::compute_fp32_to_fp16(v_val);
+      k_u16[i] = k_bits;
+      v_u16[i] = v_bits;
+      k_f32[i] = nntrainer::compute_fp16_to_fp32(k_bits);
+      v_f32[i] = nntrainer::compute_fp16_to_fp32(v_bits);
+    }
+
+    manager.append(step, 0, k_u16.data(), v_u16.data(),
+                   kv_elements * sizeof(uint16_t));
+    history_k.insert(history_k.end(), k_f32.begin(), k_f32.end());
+    history_v.insert(history_v.end(), v_f32.begin(), v_f32.end());
+    manager.markReady(step, 0);
+
+    auto actual = manager.attention(step, 0, queries, options);
+
+    const size_t group = query_heads / num_kv_heads;
+    const size_t kv_width = num_kv_heads * head_dim;
+
+    for (size_t q = 0; q < count; ++q) {
+      const size_t end = step.from() + q + 1;
+      for (size_t h = 0; h < query_heads; ++h) {
+        std::vector<double> scores(end);
+        for (size_t t = 0; t < end; ++t) {
+          double score = 0;
+          for (size_t d = 0; d < head_dim; ++d) {
+            score +=
+              static_cast<double>(queries[q * width + h * head_dim + d]) *
+              history_k[t * kv_width + (h / group) * head_dim + d];
+          }
+          scores[t] = score * options.scale;
+        }
+        double maximum = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (double &sc : scores) {
+          sc = std::exp(sc - maximum);
+          sum += sc;
+        }
+        for (size_t d = 0; d < head_dim; ++d) {
+          double expected = 0;
+          for (size_t t = 0; t < end; ++t)
+            expected += scores[t] *
+                        history_v[t * kv_width + (h / group) * head_dim + d] /
+                        sum;
+          EXPECT_NEAR(actual[q * width + h * head_dim + d], expected, 2e-3);
+        }
+      }
+    }
+    finish(manager, std::move(step));
+  }
+}
+
+TEST(KvCacheCore, pagedAttentionThreadedGroupsMatchDenseReference) {
+  const size_t head_dim = 64, kv_heads = 2, query_heads = 8;
+  const size_t width = query_heads * head_dim, kv_width = kv_heads * head_dim;
+  const size_t group = query_heads / kv_heads, window = 20;
+  CacheSpec s;
+  LayerSpec layer;
+  layer.num_kv_heads = kv_heads;
+  layer.head_dim = head_dim;
+  layer.capacity = layer.max_tokens = 64;
+  layer.encoding = Encoding::Float16;
+  layer.storage_type = StorageType::UInt16;
+  s.layers = {layer};
+  s.page_tokens = 8;
+  KvCacheManager manager;
+  manager.initialize(s);
+  AttentionOptions options;
+  options.query_heads = query_heads;
+  options.window = window;
+  options.sinks = {0.5f, -1, 0, 1, 2, -2, 0.25f, 0};
+  std::vector<float> history_k, history_v;
+  // A long prefill spreads groups across threads; decode splits the groups.
+  for (size_t count : {48u, 1u, 3u}) {
+    auto step = manager.beginStep(count);
+    std::vector<float> queries(count * width);
+    for (size_t i = 0; i < queries.size(); ++i)
+      queries[i] =
+        std::sin(static_cast<float>(i + step.from() * 3 + 1) * 0.37f);
+    std::vector<uint16_t> k(count * kv_width), v(count * kv_width);
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = nntrainer::compute_fp32_to_fp16(
+        std::cos(static_cast<float>(i + step.from() * kv_width) * 0.11f) *
+        0.2f);
+      v[i] = nntrainer::compute_fp32_to_fp16(
+        static_cast<float>((i * 7 + step.from()) % 23) / 11.0f);
+      history_k.push_back(nntrainer::compute_fp16_to_fp32(k[i]));
+      history_v.push_back(nntrainer::compute_fp16_to_fp32(v[i]));
+    }
+    manager.append(step, 0, k.data(), v.data(), k.size() * sizeof(uint16_t));
+    manager.markReady(step, 0);
+    for (bool causal : {true, false}) {
+      options.causal = causal;
+      auto actual = manager.attention(step, 0, queries, options);
+      for (size_t q = 0; q < count; ++q) {
+        const size_t end = causal ? step.from() + q + 1 : step.to();
+        const size_t start = end > window ? end - window : 0;
+        for (size_t h = 0; h < query_heads; ++h) {
+          const size_t kv_offset = (h / group) * head_dim;
+          std::vector<double> scores(end - start);
+          double maximum = options.sinks[h];
+          const float *q_head = queries.data() + q * width + h * head_dim;
+          for (size_t t = start; t < end; ++t) {
+            double score = 0;
+            for (size_t d = 0; d < head_dim; ++d)
+              score += static_cast<double>(q_head[d]) *
+                       history_k[t * kv_width + kv_offset + d];
+            scores[t - start] = score / 8.0; // 1 / sqrt(64)
+            maximum = std::max(maximum, scores[t - start]);
+          }
+          double sum = std::exp(options.sinks[h] - maximum);
+          for (auto &score : scores) {
+            score = std::exp(score - maximum);
+            sum += score;
+          }
+          for (size_t d = 0; d < head_dim; ++d) {
+            double expected = 0;
+            for (size_t t = start; t < end; ++t)
+              expected +=
+                scores[t - start] * history_v[t * kv_width + kv_offset + d];
+            EXPECT_NEAR(actual[q * width + h * head_dim + d], expected / sum,
+                        2e-3);
+          }
+        }
+      }
+    }
+    manager.commit(std::move(step));
+  }
+}
+
+TEST(KvCacheCore, pagePoolFreesIdlePagesOfOtherSizesUnderBudget) {
+  auto pool = std::make_shared<KvPagePool>(128);
+  {
+    auto first = pool->acquire(64);
+    auto second = pool->acquire(64);
+    EXPECT_EQ(pool->reservedBytes(), 128u);
+    EXPECT_THROW(pool->acquire(32), std::bad_alloc); // Both pages are in use.
+  }
+  auto large = pool->acquire(128); // Idle 64-byte pages are freed first.
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  const auto identity = large->identity();
+  large.reset();
+  EXPECT_EQ(pool->acquire(128)->identity(), identity);
+}
+
+TEST(KvCacheCore, pagePoolHandlesMayOutliveThePool) {
+  std::shared_ptr<KvStorage> page;
+  {
+    KvPagePool pool;
+    page = pool.acquire(64);
+  }
+  ASSERT_EQ(page->bytes(), 64u);
+  std::memset(page->data(), 1, 64);
+  page.reset();
+}
+
+TEST(KvCacheCore, pagedTruncateReturnsWholeBlocksAndRejectsForwardSeek) {
+  auto s = spec();
+  s.page_tokens = 2;
+  auto pool = std::make_shared<KvPagePool>();
+  KvCacheManager manager;
+  manager.initialize(s, std::make_shared<nntrainer::MemAllocator>(), pool);
+  finish(manager, manager.beginStep(5));
+  EXPECT_EQ(manager.stats().backing_bytes, 384u);
+  manager.setPosition(1);
+  EXPECT_EQ(manager.stats().backing_bytes, 128u);
+  EXPECT_THROW(manager.setPosition(2), std::logic_error);
+  pool->trim();
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  manager.reset();
+  pool->trim();
+  EXPECT_EQ(pool->reservedBytes(), 0u);
+}
+
+TEST(KvCacheCore, segmentedAttentionRejectsInvalidGeometryAndQueries) {
+  auto s = spec();
+  s.page_tokens = 2;
+  KvCacheManager manager;
+  manager.initialize(s);
+  auto step = manager.beginStep(1);
+  manager.markReady(step, 0);
+  AttentionOptions options;
+  options.query_heads = 3;
+  EXPECT_THROW(manager.attention(step, 0, std::vector<float>(6), options),
+               std::invalid_argument);
+  options.query_heads = 2;
+  EXPECT_THROW(manager.attention(step, 0, std::vector<float>(3), options),
+               std::invalid_argument);
+  options.scale = std::numeric_limits<float>::infinity();
+  EXPECT_THROW(manager.attention(step, 0, std::vector<float>(4), options),
+               std::invalid_argument);
+  options.scale = 0;
+  auto output =
+    manager.attention(step, 0, std::vector<float>(4, 10000), options);
+  for (float value : output)
+    EXPECT_FLOAT_EQ(value, 0);
+  EXPECT_THROW(manager.append(step, 0, nullptr, nullptr, 16),
+               std::invalid_argument);
+}
+
+TEST(KvCacheCore, pagedGraphIdentitiesResolveAliasesAndRequireActiveLease) {
+  auto s = spec();
+  s.page_tokens = 2;
+  s.layers.push_back(s.layers[0]);
+  s.layers[1].source = 0;
+  KvCacheManager manager;
+  manager.initialize(s);
+  auto k0 = manager.graphKeyMemory(0), v0 = manager.graphValueMemory(0);
+  auto k1 = manager.graphKeyMemory(1), v1 = manager.graphValueMemory(1);
+  ASSERT_NE(k0, k1);
+  auto step = manager.beginStep(3);
+  auto scope = manager.bindStep(step);
+  auto owner = KvStepScope::access(k0->getAddr(), v0->getAddr(), 0, 0, 3);
+  auto alias = KvStepScope::access(k1->getAddr(), v1->getAddr(), 0, 0, 3);
+  ASSERT_TRUE(owner->paged());
+  ASSERT_TRUE(alias->alias());
+  std::vector<float> kv(12, 1), q(12, 2);
+  owner->append(kv.data(), kv.data(), kv.size() * sizeof(float));
+  AttentionOptions options;
+  options.query_heads = 2;
+  options.sinks = {0, 0};
+  EXPECT_EQ(alias->attention(q, options), owner->attention(q, options));
+  manager.commit(std::move(step));
+  EXPECT_THROW(owner->attention(q, options), std::logic_error);
+  scope.reset();
+  EXPECT_THROW(owner->paged(), std::logic_error);
+}
+
+TEST(KvCacheCore, pagedSnapshotRestoreIsAtomicAndPreservesGraphIdentities) {
+  auto s = spec();
+  s.page_tokens = 2;
+  KvCacheManager manager;
+  manager.initialize(s);
+  auto handle = manager.graphKeyMemory(0);
+  auto step = manager.beginStep(3);
+  std::vector<float> data(12, 5);
+  manager.append(step, 0, data.data(), data.data(),
+                 data.size() * sizeof(float));
+  finish(manager, std::move(step));
+  std::stringstream saved;
+  manager.savePlane(saved, 0, true, 3);
+  manager.savePlane(saved, 0, false, 3);
+  std::stringstream truncated(saved.str().substr(0, saved.str().size() - 1));
+  EXPECT_THROW(manager.restorePlanes(truncated, 3), std::runtime_error);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.graphKeyMemory(0), handle);
+  manager.reset();
+  manager.restorePlanes(saved, 3);
+  EXPECT_EQ(manager.graphKeyMemory(0), handle);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  auto next = manager.beginStep(1);
+  std::vector<float> tail(4, 5);
+  manager.append(next, 0, tail.data(), tail.data(), 16);
+  manager.markReady(next, 0);
+  AttentionOptions options;
+  options.query_heads = 2;
+  for (float value :
+       manager.attention(next, 0, std::vector<float>(4, 1), options))
+    EXPECT_FLOAT_EQ(value, 5);
+}
+
+TEST(KvCacheCore, pagedSinkContributesOnlyToSoftmaxDenominator) {
+  auto s = spec();
+  s.page_tokens = 1;
+  KvCacheManager manager;
+  manager.initialize(s);
+  auto step = manager.beginStep(2);
+  std::vector<float> keys(8), values(8, 6);
+  manager.append(step, 0, keys.data(), values.data(), 32);
+  manager.markReady(step, 0);
+  AttentionOptions options;
+  options.query_heads = 2;
+  options.sinks = {0, 0};
+  auto result = manager.attention(step, 0, std::vector<float>(8), options);
+  EXPECT_FLOAT_EQ(result[0], 3);
+  EXPECT_FLOAT_EQ(result[4], 4);
+}
+
+TEST(KvCacheCore, pagePoolAsksReclaimersBeforeFailing) {
+  auto pool = std::make_shared<KvPagePool>(128);
+  std::vector<std::shared_ptr<KvStorage>> held = {pool->acquire(64),
+                                                  pool->acquire(64)};
+  size_t calls = 0;
+  const auto token = pool->addReclaimer([&held, &calls]() {
+    ++calls;
+    if (held.empty())
+      return false;
+    held.pop_back();
+    return true;
+  });
+  auto page = pool->acquire(64); // Reuses the page the reclaimer released.
+  EXPECT_EQ(calls, 1u);
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  pool->removeReclaimer(token);
+  EXPECT_THROW(pool->acquire(64), std::bad_alloc);
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST(KvCacheCore, pagedSessionsAreIndependentAndShareGraphIdentities) {
+  KvCacheManager manager;
+  manager.initialize(pagedSpec());
+  auto key_identity = manager.graphKeyMemory(0);
+  auto value_identity = manager.graphValueMemory(0);
+  appendTokens(manager, {1, 2, 3});
+  const auto second = manager.createSession();
+  EXPECT_NE(second, KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(manager.activeSession(), KvCacheManager::kDefaultSession);
+
+  manager.selectSession(second);
+  EXPECT_EQ(manager.activeSession(), second);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+  EXPECT_EQ(manager.graphKeyMemory(0), key_identity);
+  auto step = manager.beginStep(1);
+  {
+    auto scope = manager.bindStep(step);
+    auto access = KvStepScope::access(key_identity->getAddr(),
+                                      value_identity->getAddr(), 0, 0, 1);
+    ASSERT_TRUE(access);
+    std::vector<float> row(4, 7);
+    access->append(row.data(), row.data(), row.size() * sizeof(float));
+    EXPECT_THROW(manager.selectSession(KvCacheManager::kDefaultSession),
+                 std::logic_error);
+  }
+  manager.commit(std::move(step));
+  EXPECT_EQ(manager.committedLength(), 1u);
+  EXPECT_THROW(manager.selectSession(second + 100), std::out_of_range);
+  EXPECT_THROW(manager.destroySession(second), std::logic_error);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), (std::vector<float>{1, 2, 3, 4}));
+  manager.destroySession(second);
+  EXPECT_EQ(manager.sessionCount(), 1u);
+  EXPECT_THROW(manager.selectSession(second), std::out_of_range);
+}
+
+TEST(KvCacheCore, contiguousStorageHasOneSessionAndNoPrefixReuse) {
+  KvCacheManager manager;
+  manager.initialize(spec());
+  EXPECT_EQ(manager.sessionCount(), 1u);
+  EXPECT_THROW(manager.createSession(), std::logic_error);
+  EXPECT_THROW(manager.reusePrefix(nullptr, 0), std::logic_error);
+}
+
+TEST(KvCacheCore, reusePrefixKeepsMatchingOwnRowsAndTracksKnownIds) {
+  KvCacheManager manager;
+  manager.initialize(pagedSpec());
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(manager.knownTokenCount(), 5u);
+  const std::vector<TokenId> again = {1, 2, 3, 9};
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 3u);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u); // Two pages remain.
+
+  // Ids of an aborted step are discarded.
+  const std::vector<TokenId> dropped = {6};
+  manager.abort(manager.beginStep(1, dropped.data()));
+  EXPECT_EQ(manager.knownTokenCount(), 3u);
+
+  // A step without ids ends the known prefix; truncation restores it.
+  finish(manager, manager.beginStep(1));
+  EXPECT_EQ(manager.committedLength(), 4u);
+  EXPECT_EQ(manager.knownTokenCount(), 3u);
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 3u);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(appendAndReadKeys(manager, 9), (std::vector<float>{1, 2, 3, 9}));
+  EXPECT_EQ(manager.knownTokenCount(), 4u);
+
+  // Snapshots carry no ids.
+  std::stringstream saved;
+  manager.savePlane(saved, 0, true, 4);
+  manager.savePlane(saved, 0, false, 4);
+  manager.restorePlanes(saved, 4);
+  EXPECT_EQ(manager.committedLength(), 4u);
+  EXPECT_EQ(manager.knownTokenCount(), 0u);
+  EXPECT_EQ(manager.reusePrefix(again.data(), again.size()), 0u);
+  EXPECT_THROW(manager.reusePrefix(nullptr, 1), std::invalid_argument);
+}
+
+TEST(KvCacheCore, prefixCachePublishesFullPagesAndSessionsAdoptThem) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  EXPECT_EQ(manager.prefixCache(), prefix);
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(prefix->stats().blocks, 2u); // [1 2] [3 4]; the tail is private.
+  EXPECT_EQ(prefix->stats().inserted_blocks, 2u);
+  EXPECT_EQ(pool->reservedBytes(), 384u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt = {1, 2, 3, 4, 9, 9};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3, 4}));
+  EXPECT_EQ(prefix->stats().hit_blocks, 2u);
+  EXPECT_EQ(prefix->stats().lookups, 1u);
+  EXPECT_EQ(pool->reservedBytes(), 384u); // Adoption allocates nothing.
+  EXPECT_EQ(appendAndReadKeys(manager, 9), (std::vector<float>{1, 2, 3, 4, 9}));
+  EXPECT_EQ(pool->reservedBytes(), 512u);
+  EXPECT_EQ(manager.stats().backing_bytes, 384u); // Includes shared pages.
+
+  // A different first block never matches a later block with equal tokens.
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> shifted = {9, 9, 3, 4, 1};
+  EXPECT_EQ(manager.reusePrefix(shifted.data(), shifted.size()), 0u);
+}
+
+TEST(KvCacheCore, prefixSharedPageIsCopiedBeforeAppend) {
+  auto prefix = std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>());
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  const auto other = manager.createSession();
+  manager.selectSession(other);
+  const std::vector<TokenId> prompt = {1, 2, 3, 4, 5};
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  manager.setPosition(3); // Inside the shared block [3 4].
+  EXPECT_EQ(manager.committedTokens(), (std::vector<TokenId>{1, 2, 3}));
+  EXPECT_EQ(appendAndReadKeys(manager, 8), (std::vector<float>{1, 2, 3, 8}));
+
+  // The publisher and the cache still see the original rows.
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{1, 2, 3, 4, 5}));
+  manager.selectSession(manager.createSession());
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  EXPECT_EQ(appendAndReadKeys(manager, 6), (std::vector<float>{1, 2, 3, 4, 6}));
+  // The copy is published under its own chain once it is full again.
+  const std::vector<TokenId> copied = {1, 2, 3, 8, 0};
+  manager.selectSession(manager.createSession());
+  EXPECT_EQ(manager.reusePrefix(copied.data(), copied.size()), 4u);
+}
+
+TEST(KvCacheCore, radixSplitsCompressedEdgesAndMatchesOnlyCompletePages) {
+  auto prefix = std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>());
+  auto s = pagedSpec();
+  s.page_tokens = 4;
+  KvCacheManager manager;
+  manager.initialize(s, std::make_shared<nntrainer::MemAllocator>(), nullptr,
+                     prefix);
+  const std::vector<std::vector<TokenId>> histories{{1, 2, 3, 4, 5, 6, 7, 8},
+                                                    {1, 2, 3, 4, 5, 6, 9, 8},
+                                                    {1, 2, 3, 4, 5, 0, 7, 8},
+                                                    {1, 2, 0, 4, 5, 6, 7, 8}};
+  for (const auto &history : histories) {
+    manager.reset();
+    appendTokens(manager, history);
+  }
+  EXPECT_EQ(prefix->stats().blocks, 6u);
+  EXPECT_EQ(prefix->stats().radix_nodes, 9u); // Three interior branch nodes.
+  for (const auto &history : histories) {
+    manager.reset();
+    ASSERT_EQ(manager.reusePrefix(history.data(), history.size()), 8u);
+    std::ostringstream keys;
+    manager.savePlane(keys, 0, true, 8);
+    std::vector<float> expected;
+    for (auto id : history)
+      expected.insert(expected.end(), 4, static_cast<float>(id));
+    EXPECT_EQ(keys.str(),
+              std::string(reinterpret_cast<const char *>(expected.data()),
+                          expected.size() * sizeof(float)));
+  }
+  manager.reset();
+  const std::vector<TokenId> mismatch{1, 2, 3, 4, 5, 6, 0, 8};
+  EXPECT_EQ(manager.reusePrefix(mismatch.data(), mismatch.size()), 4u);
+  manager.reset();
+  EXPECT_EQ(manager.reusePrefix(histories[0].data(), 6), 4u);
+  manager.reset();
+  EXPECT_EQ(manager.reusePrefix(histories[0].data(), 2), 0u);
+  EXPECT_EQ(prefix->stats().inserted_blocks, 6u); // No duplicate publications.
+}
+
+TEST(KvCacheCore, radixEvictionMergesBranchesWithoutInvalidatingSessionIds) {
+  auto prefix = std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>());
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  manager.selectSession(manager.createSession());
+  appendTokens(manager, {1, 9, 3, 4});
+  EXPECT_EQ(prefix->stats().radix_nodes, 5u);
+  manager.reset();
+  EXPECT_EQ(prefix->evictUnused(), 2u); // Keep the original session's branch.
+  EXPECT_EQ(prefix->stats().radix_nodes, 2u);
+  const std::vector<TokenId> original{1, 2, 3, 4};
+  ASSERT_EQ(manager.reusePrefix(original.data(), original.size()), 4u);
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{1, 2, 3, 4, 5}));
+  // Clear drops the index, while existing sessions retain their page handles.
+  prefix->clear();
+  EXPECT_EQ(prefix->stats().radix_nodes, 0u);
+  manager.selectSession(manager.createSession());
+  EXPECT_EQ(manager.reusePrefix(original.data(), original.size()), 0u);
+  appendTokens(manager, original);
+  EXPECT_EQ(prefix->stats().radix_nodes, 2u);
+  manager.reset();
+  EXPECT_EQ(manager.reusePrefix(original.data(), original.size()), 4u);
+}
+
+TEST(KvCacheCore, radixMatchesLinearPrefixOracleAcrossInsertionsAndEvictions) {
+  auto prefix = std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>());
+  auto s = pagedSpec();
+  s.page_tokens = 4;
+  KvCacheManager manager;
+  manager.initialize(s, std::make_shared<nntrainer::MemAllocator>(), nullptr,
+                     prefix);
+  std::mt19937 random(42);
+  std::vector<std::vector<TokenId>> stored;
+  for (size_t iteration = 0; iteration < 100; ++iteration) {
+    if (iteration % 17 == 0) {
+      manager.reset();
+      prefix->evictUnused();
+      stored.clear();
+      EXPECT_EQ(prefix->stats().radix_nodes, 0u);
+    }
+    std::vector<TokenId> history(8);
+    for (auto &token : history)
+      token = random() % 3;
+    manager.reset();
+    appendTokens(manager, history);
+    stored.push_back(history);
+    auto query = stored[random() % stored.size()];
+    if (iteration % 2)
+      query[random() % query.size()] = random() % 3;
+    const size_t length = 1 + random() % query.size();
+    size_t expected = 0;
+    for (const auto &candidate : stored) {
+      size_t common = 0;
+      while (common < length && query[common] == candidate[common])
+        ++common;
+      expected = std::max(expected, common / s.page_tokens * s.page_tokens);
+    }
+    manager.reset();
+    EXPECT_EQ(manager.reusePrefix(query.data(), length), expected);
+    EXPECT_EQ(manager.committedTokens(),
+              std::vector<TokenId>(query.begin(), query.begin() + expected));
+  }
+}
+
+TEST(KvCacheCore, prefixCacheReleasesUnusedBlocksUnderPoolBudget) {
+  auto pool = std::make_shared<KvPagePool>(256); // Two K/V page pairs.
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  EXPECT_EQ(prefix->stats().blocks, 1u);
+  manager.reset(); // The cache keeps the published block.
+  EXPECT_EQ(pool->reservedBytes(), 128u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+
+  appendTokens(manager, {3, 4, 5, 6}); // Evicts [1 2] to fit.
+  EXPECT_EQ(prefix->stats().evicted_blocks, 1u);
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(pool->reservedBytes(), 256u);
+  EXPECT_EQ(prefix->evictUnused(), 0u); // The session still uses both.
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> ids = {7, 8};
+  EXPECT_THROW(manager.beginStep(ids.size(), ids.data()), std::bad_alloc);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_FALSE(manager.hasActiveStep());
+}
+
+TEST(KvCacheCore, prefixCacheBlockBoundEvictsOnlyUnreferencedLeaves) {
+  auto prefix =
+    std::make_shared<KvPrefixCache>(std::make_shared<KvPagePool>(), 2);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto other = manager.createSession();
+  manager.selectSession(other);
+  appendTokens(manager, {9, 9}); // Full of referenced blocks: not published.
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(prefix->stats().evicted_blocks, 0u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  manager.reset();
+  manager.selectSession(other);
+  appendTokens(manager, {5, 6}); // Publishes [9 9] and [5 6] in their place.
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+  EXPECT_EQ(prefix->stats().evicted_blocks, 2u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt = {9, 9, 5, 6, 1};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 4u);
+  const std::vector<TokenId> evicted = {1, 2, 3, 4, 1};
+  EXPECT_EQ(manager.reusePrefix(evicted.data(), evicted.size()), 0u);
+}
+
+TEST(KvCacheCore, prefixCacheRejectsMismatchedLayoutPoolAndBatch) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  const auto s = pagedSpec();
+  KvCacheManager first, other;
+  first.initialize(s, allocator, nullptr, prefix);
+  auto wider_pages = s;
+  wider_pages.page_tokens = 4;
+  EXPECT_THROW(other.initialize(wider_pages, allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_THROW(
+    other.initialize(s, allocator, std::make_shared<KvPagePool>(), prefix),
+    std::invalid_argument);
+  auto batched = s;
+  batched.layers[0].batch = 2;
+  EXPECT_THROW(other.initialize(batched, allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_THROW(other.initialize(spec(), allocator, nullptr, prefix),
+               std::invalid_argument);
+  EXPECT_NO_THROW(other.initialize(s, allocator, pool, prefix));
+  EXPECT_THROW(KvPrefixCache cache(nullptr), std::invalid_argument);
+}
+
+TEST(KvCacheCore, forkSessionSharesHistoryAndSessionsDiverge) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3});
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession);
+  EXPECT_NE(child, KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(manager.activeSession(), KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), std::vector<float>({1, 2, 3, 4}));
+
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedLength(), 3u);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  EXPECT_EQ(appendAndReadKeys(manager, 9), std::vector<float>({1, 2, 3, 9}));
+
+  const auto grandchild = manager.forkSession(child);
+  manager.selectSession(grandchild);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3, 9}));
+
+  manager.selectSession(child);
+  manager.destroySession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  EXPECT_EQ(appendAndReadKeys(manager, 6), std::vector<float>({1, 2, 3, 9, 6}));
+}
+
+TEST(KvCacheCore, forkAtEarlierPositionTruncatesRowsAndIds) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3, 4, 5});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 3);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedTokens(), std::vector<TokenId>({1, 2, 3}));
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  EXPECT_EQ(appendAndReadKeys(manager, 4), std::vector<float>({1, 2, 3, 4}));
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 6),
+            std::vector<float>({1, 2, 3, 4, 5, 6}));
+  EXPECT_EQ(prefix->stats().blocks, 3u);
+}
+
+TEST(KvCacheCore, forkedSessionPublishesNewPagesAndOthersAdoptThem) {
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     pool, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  EXPECT_EQ(prefix->stats().blocks, 2u);
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 4);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.stats().backing_bytes, 256u);
+  appendTokens(manager, {5, 6});
+  EXPECT_EQ(prefix->stats().blocks, 3u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> child_prompt = {1, 2, 3, 4, 5, 6, 7};
+  EXPECT_EQ(manager.reusePrefix(child_prompt.data(), child_prompt.size()), 6u);
+
+  manager.selectSession(KvCacheManager::kDefaultSession);
+  EXPECT_EQ(appendAndReadKeys(manager, 7), std::vector<float>({1, 2, 3, 4, 7}));
+  appendTokens(manager, {8});
+  EXPECT_EQ(prefix->stats().blocks, 4u);
+
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> parent_prompt = {1, 2, 3, 4, 7, 8, 9};
+  EXPECT_EQ(manager.reusePrefix(parent_prompt.data(), parent_prompt.size()),
+            6u);
+}
+
+TEST(KvCacheCore, forkSessionValidatesParentAndPosition) {
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  KvCacheManager contiguous;
+  contiguous.initialize(spec(), allocator);
+  EXPECT_THROW(contiguous.forkSession(KvCacheManager::kDefaultSession),
+               std::logic_error);
+
+  auto pool = std::make_shared<KvPagePool>();
+  auto prefix = std::make_shared<KvPrefixCache>(pool);
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), allocator, pool, prefix);
+  EXPECT_THROW(manager.forkSession(42), std::out_of_range);
+  appendTokens(manager, {1, 2, 3});
+  EXPECT_THROW(manager.forkSession(KvCacheManager::kDefaultSession, 4),
+               std::out_of_range);
+
+  TokenId id = 7;
+  auto step = manager.beginStep(1, &id);
+  EXPECT_THROW(manager.forkSession(KvCacheManager::kDefaultSession),
+               std::logic_error);
+  manager.abort(std::move(step));
+
+  const auto child = manager.forkSession(KvCacheManager::kDefaultSession, 0);
+  EXPECT_EQ(manager.sessionCount(), 2u);
+  manager.selectSession(child);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_EQ(manager.stats().backing_bytes, 0u);
+  EXPECT_TRUE(manager.committedTokens().empty());
+  EXPECT_EQ(appendAndReadKeys(manager, 9), std::vector<float>({9}));
+}
+
+namespace {
+struct FlashDirectory {
+  std::filesystem::path path;
+  FlashDirectory() {
+    std::random_device random;
+    for (;;) {
+      path = std::filesystem::temp_directory_path() /
+             ("nntr-flash-test-" + std::to_string(random()));
+      if (std::filesystem::create_directory(path))
+        break;
+    }
+  }
+  ~FlashDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+  }
+  FlashCacheOptions options(size_t budget = 4096, size_t reserve = 256) const {
+    return {path.string(), budget, reserve};
+  }
+};
+} // namespace
+
+TEST(KvCacheCore, flashRestoresExactPlanesAndContinuesGeneration) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(512);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 384));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4, 5, 6});
+  std::ostringstream before;
+  manager.savePlane(before, 0, true, 6);
+  manager.savePlane(before, 0, false, 6);
+  manager.reset();
+  EXPECT_LE(pool->reservedBytes(), 128u); // 384 bytes remain for restores.
+  ASSERT_EQ(prefix->stats().flash_blocks, 2u);
+  const std::vector<TokenId> prompt{1, 2, 3, 4, 5, 6};
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 6u);
+  EXPECT_EQ(prefix->stats().flash_hits, 2u);
+  std::ostringstream after;
+  manager.savePlane(after, 0, true, 6);
+  manager.savePlane(after, 0, false, 6);
+  EXPECT_EQ(before.str(), after.str());
+  EXPECT_EQ(appendAndReadKeys(manager, 9),
+            (std::vector<float>{1, 2, 3, 4, 5, 6, 9}));
+  EXPECT_LE(pool->reservedBytes(), pool->budgetBytes());
+}
+
+TEST(KvCacheCore, radixBranchesSurviveFlashDemotionAndRestoreExactPages) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(512);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 384));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  const std::vector<std::vector<TokenId>> histories{{1, 2, 3, 4}, {1, 9, 3, 4}};
+  std::vector<std::string> planes;
+  for (const auto &history : histories) {
+    appendTokens(manager, history);
+    std::ostringstream saved;
+    manager.savePlane(saved, 0, true, 4);
+    manager.savePlane(saved, 0, false, 4);
+    planes.push_back(saved.str());
+    manager.reset();
+  }
+  EXPECT_EQ(prefix->stats().radix_nodes, 5u);
+  ASSERT_GT(prefix->stats().flash_blocks, 0u);
+  for (size_t i = 0; i < histories.size(); ++i) {
+    const auto &history = histories[i];
+    ASSERT_EQ(manager.reusePrefix(history.data(), history.size()), 4u);
+    std::ostringstream restored;
+    manager.savePlane(restored, 0, true, 4);
+    manager.savePlane(restored, 0, false, 4);
+    EXPECT_EQ(restored.str(), planes[i]);
+    manager.reset();
+  }
+  EXPECT_GT(prefix->stats().flash_hits, 0u);
+  EXPECT_EQ(prefix->stats().flash_errors, 0u);
+  EXPECT_LE(pool->reservedBytes(), pool->budgetBytes());
+}
+
+TEST(KvCacheCore, radixCorruptFlashBranchDoesNotInvalidateItsSibling) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(512);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 384));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  const std::vector<TokenId> corrupt{1, 2, 3, 4}, healthy{1, 9, 3, 4};
+  appendTokens(manager, corrupt);
+  manager.reset();
+  appendTokens(manager, healthy);
+  manager.reset();
+  const auto directory = std::filesystem::directory_iterator(dir.path)->path();
+  ASSERT_TRUE(std::filesystem::exists(directory / "1.kv"));
+  {
+    std::ofstream file(directory / "1.kv", std::ios::binary | std::ios::trunc);
+    file << "corrupt";
+  }
+  EXPECT_EQ(manager.reusePrefix(corrupt.data(), corrupt.size()), 0u);
+  EXPECT_EQ(prefix->stats().radix_nodes, 2u); // Surviving branch recompressed.
+  ASSERT_EQ(manager.reusePrefix(healthy.data(), healthy.size()), 4u);
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{1, 9, 3, 4, 5}));
+  EXPECT_GT(prefix->stats().flash_errors, 0u);
+  manager.reset();
+  appendTokens(manager, corrupt); // Reinsert the erased branch after the merge.
+  manager.reset();
+  EXPECT_EQ(manager.reusePrefix(corrupt.data(), corrupt.size()), 4u);
+}
+
+TEST(KvCacheCore, flashPoolPressureSpillsAndReusesAcrossSessions) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(256);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 128));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  manager.reset();
+  appendTokens(manager, {3, 4, 5, 6}); // Pressure spills the unrelated prefix.
+  EXPECT_GE(prefix->stats().flash_writes, 1u);
+  manager.reset();
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt{1, 2};
+  ASSERT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 2u);
+  EXPECT_EQ(appendAndReadKeys(manager, 7), (std::vector<float>{1, 2, 7}));
+  EXPECT_LE(pool->reservedBytes(), 256u);
+}
+
+TEST(KvCacheCore, flashBudgetEvictsColdLruAndCleansOwnedDirectory) {
+  FlashDirectory dir;
+  {
+    auto pool = std::make_shared<KvPagePool>(256);
+    // A file contains a 32-byte header and two 32-byte planes: 96 bytes.
+    auto prefix =
+      std::make_shared<KvPrefixCache>(pool, 1, dir.options(96, 128));
+    KvCacheManager manager;
+    manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                       nullptr, prefix);
+    for (TokenId id = 1; id <= 6; ++id) {
+      appendTokens(manager, {id, id});
+      manager.reset();
+      EXPECT_LE(prefix->stats().flash_bytes, 96u);
+      EXPECT_LE(prefix->stats().flash_blocks, 1u);
+    }
+    const std::vector<TokenId> old{1, 1}, recent{5, 5};
+    EXPECT_EQ(manager.reusePrefix(old.data(), old.size()), 0u);
+    EXPECT_EQ(manager.reusePrefix(recent.data(), recent.size()), 2u);
+    EXPECT_GT(prefix->stats().evicted_blocks, 0u);
+  }
+  EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+}
+
+TEST(KvCacheCore, flashCorruptionIsCacheMissAndNeverPublishesPartialLoad) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(384);
+  auto prefix = std::make_shared<KvPrefixCache>(pool, 0, dir.options());
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2, 3, 4});
+  manager.reset();
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(dir.path))
+    if (entry.path().extension() == ".kv") {
+      std::fstream file(entry.path(),
+                        std::ios::in | std::ios::out | std::ios::binary);
+      file.seekp(40); // Change payload while retaining a valid header/length.
+      file.put('\xff');
+    }
+  const std::vector<TokenId> prompt{1, 2, 3, 4};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 0u);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_EQ(prefix->stats().flash_hits, 0u);
+  EXPECT_GE(prefix->stats().flash_errors, 1u);
+  appendTokens(manager, prompt); // The corrupt chain can be republished.
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{1, 2, 3, 4, 5}));
+}
+
+TEST(KvCacheCore, flashPinnedPagesPreventDemotionAndCapacityMissIsRetryable) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(256);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 128));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  manager.reset();
+  appendTokens(manager, {3, 4, 5, 6});
+  prefix->trim();
+  EXPECT_EQ(pool->reservedBytes(), 256u); // Both pairs are session-pinned.
+  const auto pinned = manager.activeSession();
+  manager.selectSession(manager.createSession());
+  const std::vector<TokenId> prompt{1, 2};
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 0u);
+  EXPECT_EQ(manager.committedLength(), 0u);
+  EXPECT_GE(prefix->stats().flash_blocks, 1u);
+  manager.destroySession(pinned);
+  EXPECT_EQ(manager.reusePrefix(prompt.data(), prompt.size()), 2u);
+}
+
+TEST(KvCacheCore, flashInvalidBudgetsRejectedAndTinyDiskFallsBackToEviction) {
+  FlashDirectory dir;
+  EXPECT_THROW(KvPrefixCache(std::make_shared<KvPagePool>(), 0, dir.options()),
+               std::invalid_argument);
+  auto pool = std::make_shared<KvPagePool>(128);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 128));
+  KvCacheManager manager;
+  EXPECT_THROW(manager.initialize(pagedSpec(),
+                                  std::make_shared<nntrainer::MemAllocator>(),
+                                  nullptr, prefix),
+               std::invalid_argument);
+  pool = std::make_shared<KvPagePool>(256);
+  prefix = std::make_shared<KvPrefixCache>(pool, 1, dir.options(1, 128));
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  manager.reset();
+  appendTokens(manager, {3, 4});
+  EXPECT_EQ(prefix->stats().flash_bytes, 0u);
+  EXPECT_GT(prefix->stats().evicted_blocks, 0u);
+}
+
+TEST(KvCacheCore, flashWriteFailureKeepsLiveRowsAndFallsBackToEviction) {
+  FlashDirectory dir;
+  auto pool = std::make_shared<KvPagePool>(256);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 1, dir.options(4096, 128));
+  KvCacheManager manager;
+  manager.initialize(pagedSpec(), std::make_shared<nntrainer::MemAllocator>(),
+                     nullptr, prefix);
+  appendTokens(manager, {1, 2});
+  // Make the cache's private directory unusable, without depending on uid or
+  // filesystem permission enforcement in CI.
+  auto private_dir = std::filesystem::directory_iterator(dir.path)->path();
+  std::filesystem::remove(private_dir);
+  {
+    std::ofstream replacement(private_dir);
+    replacement << "unavailable";
+  }
+  manager.reset();
+  EXPECT_NO_THROW(appendTokens(manager, {3, 4}));
+  EXPECT_GT(prefix->stats().flash_errors, 0u);
+  EXPECT_LE(prefix->stats().flash_bytes, 4096u);
+  EXPECT_EQ(appendAndReadKeys(manager, 5), (std::vector<float>{3, 4, 5}));
+}
+
+TEST(KvCacheCore, flashRoundTripPreservesMixedEncodingsAndAliasLayers) {
+  FlashDirectory dir;
+  auto s = pagedSpec();
+  auto half = s.layers[0];
+  half.encoding = Encoding::Float16;
+  half.storage_type = StorageType::Float16;
+  s.layers.push_back(half);
+  auto alias = s.layers[0];
+  alias.source = 0;
+  s.layers.push_back(alias);
+  auto pool = std::make_shared<KvPagePool>(768);
+  auto prefix =
+    std::make_shared<KvPrefixCache>(pool, 0, dir.options(4096, 512));
+  KvCacheManager manager;
+  manager.initialize(s, std::make_shared<nntrainer::MemAllocator>(), nullptr,
+                     prefix);
+  const std::vector<TokenId> ids{1, 2, 3, 4};
+  auto step = manager.beginStep(ids.size(), ids.data());
+  std::vector<float> keys(16, 1.25f), values(16, 2.5f);
+  manager.append(step, 0, keys.data(), values.data(),
+                 keys.size() * sizeof(float));
+  manager.markReady(step, 0);
+  std::vector<uint16_t> half_keys(16, 0x3c00), half_values(16, 0x4000);
+  manager.append(step, 1, half_keys.data(), half_values.data(),
+                 half_keys.size() * sizeof(uint16_t));
+  manager.markReady(step, 1);
+  manager.commit(std::move(step));
+  auto planes = [&] {
+    std::ostringstream out;
+    for (size_t i = 0; i < s.layers.size(); ++i) {
+      manager.savePlane(out, i, true, 4);
+      manager.savePlane(out, i, false, 4);
+    }
+    return out.str();
+  };
+  const auto before = planes();
+  manager.reset();
+  ASSERT_GT(prefix->stats().flash_blocks, 0u);
+  ASSERT_EQ(manager.reusePrefix(ids.data(), ids.size()), 4u);
+  EXPECT_EQ(before, planes());
+  EXPECT_GT(prefix->stats().flash_hits, 0u);
+}
+
+GTEST_API_ int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
