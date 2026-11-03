@@ -125,9 +125,7 @@ the public API does not expose it. In `nntr_config.json`:
 
 Generation after a snapshot can differ from a single prefill of the same
 text, because the int8 KV scale calibration depends on the rows present
-when it ran. The one recorded long-context run of this workflow is kept in
-[`docs/validation/gemma4-htp-kv-cache-s25u-20261015.md`](../validation/gemma4-htp-kv-cache-s25u-20261015.md)
-(in Korean; a Galaxy S25 Ultra with a v79 build of that time).
+when it ran.
 
 ## The C API lifecycle test
 

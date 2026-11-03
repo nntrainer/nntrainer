@@ -3,7 +3,7 @@
  * @brief Verify affine WH correction on a real DSP against equivalent int4
  * weights, through the generated FastRPC interface.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/backend_guide/HTP_ARCHITECTURE.md for validation limits.
  */
 #include <AEEStdErr.h>
 #include <remote.h>
