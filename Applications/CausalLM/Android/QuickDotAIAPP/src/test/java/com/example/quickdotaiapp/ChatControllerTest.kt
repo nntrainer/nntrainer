@@ -31,7 +31,9 @@ class ChatControllerTest {
         RuntimeKind.NATIVE, setOf(BackendType.CPU, BackendType.GPU), setOf(Capability.STREAMING, Capability.TOOL_USE))
     val litert = ModelDescriptor(ModelIds.GEMMA4, "gemma4", "Gemma4 (LiteRT)",
         RuntimeKind.LITERT, setOf(BackendType.GPU), setOf(Capability.MULTIMODAL, Capability.MESSAGES_API, Capability.STREAMING))
-    val catalog = listOf(qwen, npu, litert)
+    val htp = ModelDescriptor(ModelIds.GEMMA4_26B_A4B_HTP, "gemma4-26b-a4b", "Gemma4 26B A4B (HTP)",
+        RuntimeKind.NATIVE, setOf(BackendType.NPU), setOf(Capability.STREAMING, Capability.MESSAGES_API))
+    var catalog = listOf(qwen, npu, litert)
 
     private val executor = Executors.newSingleThreadExecutor()
     val engines: MutableList<FakeQuickDotAI> = java.util.Collections.synchronizedList(mutableListOf())
@@ -489,5 +491,29 @@ class ChatControllerTest {
         assertFalse(c.sendPrompt("x"))
         assertEquals("Load the selected model first.", c.state.value.status)
         assertEquals(1, engines.size)                                 // nothing was loaded by the refusal
+    }
+
+    @Test
+    fun theHtpPresetIsSelectedFirstWhenTheCatalogHasIt() {
+        catalog = listOf(qwen, npu, htp, litert)
+        val c = controller()
+        assertEquals(htp, c.state.value.descriptor)
+    }
+
+    /** The HTP packs hold 1,280 positions and truncate a long prompt's tail silently (nntrainer #4474):
+     *  the chat sends only the newest user turn, like the View sample did, while the transcript keeps everything. */
+    @Test
+    fun anHtpChatSendsOnlyTheLastUserTurn() {
+        catalog = listOf(qwen, htp)
+        existing += "/m/gemma4-26b-a4b-htp-w4a32/nntr_config.json"
+        val c = controller()
+        c.selectFamily("gemma4-26b-a4b"); c.setBasePath("/m"); c.load(); c.awaitIdle()
+        assertTrue(c.state.value.status, c.state.value.load is LoadState.Loaded)
+        c.setDraft("first"); c.send(); c.awaitIdle()
+        c.setDraft("second"); c.send(); c.awaitIdle()
+        val e = engines.single()
+        assertEquals(listOf(QuickAiChatRole.USER to "second"),
+            e.lastMessages!!.map { it.role to (it.parts.single() as PromptPart.Text).text })
+        assertEquals(4, c.state.value.turns.size)
     }
 }

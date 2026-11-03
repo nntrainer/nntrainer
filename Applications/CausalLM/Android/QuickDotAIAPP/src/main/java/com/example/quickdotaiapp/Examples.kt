@@ -29,9 +29,17 @@ class Examples {
             ModelIds.TINY_BERT to "tiny-bert",
             ModelIds.FUNCTION_GEMMA to "function_gemma",
             ModelIds.GEMMA4_CPU to "gemma4_cpu",
+            ModelIds.GEMMA4_26B_A4B_HTP to "gemma4-26b-a4b-htp-w4a32",
+            ModelIds.LFM2_24BA2B_HTP to "lfm2-24ba2b-htp-w4a32",
             ModelIds.GEMMA4_E2B_QNN to "gemma-4-e2b-qnn",
             ModelIds.VJEPA_QNN to "vjepa2-qnn",
         )
+
+        /** The HTP packs: 1,280 positions and a prompt whose tail is truncated silently when it does
+         *  not fit (nntrainer #4474), so their chat sends only the newest user turn, as the View sample did. */
+        val oneShotIds: Set<String> = setOf(ModelIds.GEMMA4_26B_A4B_HTP, ModelIds.LFM2_24BA2B_HTP)
+
+        fun isOneShot(descriptor: ModelDescriptor?): Boolean = descriptor?.id in oneShotIds
 
         fun modelPath(descriptor: ModelDescriptor, basePath: String): String =
             "${basePath.trimEnd('/')}/${modelPathById[descriptor.id] ?: descriptor.id}"
@@ -56,6 +64,7 @@ class Examples {
             descriptor?.runtime == RuntimeKind.NATIVE && Capability.SPECULATIVE in descriptor.capabilities
 
         fun badge(descriptor: ModelDescriptor): String = when {
+            descriptor.id in oneShotIds -> "HTP"
             Capability.MULTIMODAL in descriptor.capabilities -> "MULTIMODAL"
             Capability.EMBEDDING in descriptor.capabilities -> "EMBEDDING"
             descriptor.backends == setOf(BackendType.NPU) -> "NPU"
