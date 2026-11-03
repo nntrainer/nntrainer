@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+package com.example.quickdotaiapp.ui
+
+/** testTag ids shared with the instrumentation test. */
+object Tags {
+    const val SPLASH = "splash"
+    const val MODEL_CHIP = "modelChip"
+    const val STATUS = "status"
+    const val TRANSCRIPT = "transcript"
+    const val ASSISTANT_TEXT = "assistantText"
+    const val COMPOSER = "composer"
+    const val ATTACH = "attach"
+    const val SEND = "send"
+    const val STOP = "stop"
+    const val CLEAR = "clear"
+    const val NAV_CHAT = "navChat"
+    const val NAV_METRICS = "navMetrics"
+    const val BASE_PATH = "basePath"
+    const val LOAD = "load"
+    const val UNLOAD = "unload"
+    const val SHEET_CLOSE = "sheetClose"
+    const val RAW_MODE = "rawMode"
+    const val RAW_JSON = "rawJson"
+    const val RAW_LOAD = "rawLoad"
+    const val RAW_RESET = "rawReset"
+    const val ATTACH_IMAGE = "attachImage"
+    const val ATTACH_TEXT = "attachText"
+    const val ATTACH_JSON = "attachJson"
+}

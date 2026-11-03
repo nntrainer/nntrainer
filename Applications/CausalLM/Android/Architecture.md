@@ -11,11 +11,18 @@ The Android build currently includes:
 ```text
 Android/
 ├── QuickDotAI/       # AAR module
-└── SampleTestAPP/    # Direct sample app using the AAR
+└── QuickDotAIAPP/    # Direct sample app using the AAR
 ```
 
 `Android/settings.gradle.kts` includes only `:QuickDotAI` and
-`:SampleTestAPP`.
+`:QuickDotAIAPP`.
+
+`QuickDotAIAPP` is a Jetpack Compose app: `MainActivity` sets the content,
+`AppViewModel` owns the single engine executor and file reading, and
+`ChatController` (pure Kotlin, JVM-tested) holds all state in one
+`StateFlow<UiState>` and makes every engine call on that executor. Screens:
+Chat (transcript, attach sheet, a composer that takes a message or OpenAI
+JSON) and Metrics; the model sheet opens from the top-bar chip.
 
 ## 🧱 QuickDotAI AAR
 
@@ -87,7 +94,9 @@ merged in at the Kotlin layer.
 
 ### 3-axis cascading UI
 
-`SampleTestAPP` presents a 3-axis cascading UI:
+`QuickDotAIAPP`'s model sheet presents the same three axes as cascading
+controls (a family dropdown, then runtime chips, then backend chips); the
+`NATIVE` runtime is labelled `Quick.AI` in the UI:
 
 1. **Family** — populated from `ModelCatalog.selectableFamilies()`
 2. **Runtime chip row** — populated from `ModelCatalog.runtimesFor(selectedFamily)`
@@ -126,17 +135,19 @@ multimodal calls for engines/models that support image input.
 ## 🧵 Threading Model
 
 A `QuickDotAI` instance is not internally thread-safe. Host apps should drive a
-loaded engine from one worker thread. `SampleTestAPP` follows this pattern with
+loaded engine from one worker thread. `QuickDotAIAPP` follows this pattern with
 a background dispatcher.
 
 Streaming callbacks are delivered to the caller-provided `StreamSink`.
 Apps that update UI must marshal callbacks to the main thread.
 
-## 🧪 SampleTestAPP
+## 🧪 QuickDotAIAPP
 
-`SampleTestAPP` is the current runnable Android sample. It links the
+`QuickDotAIAPP` is the current runnable Android sample. It links the
 `:QuickDotAI` module directly; it does not start a REST service and does not
-communicate over sockets.
+communicate over sockets. Its three destinations are Chat, Raw and Metrics;
+`ChatController` is covered by JVM unit tests under `src/test`, and there is
+no device test on this branch.
 
 ## 🗺️ Planned Service Layer
 
@@ -160,11 +171,11 @@ no-option mode builds the canonical CPU native artifacts with Meson. `--app`
 adds the standalone app, stages `libcausallm.so`,
 `libquick_dot_ai_api.so`, and their nntrainer dependencies into
 `QuickDotAI/prebuilt_libs/`, and assembles the QuickDotAI AAR and
-SampleTestAPP without touching a device.
+QuickDotAIAPP without touching a device.
 
 Use `--qnn` with `QNN_SDK_ROOT` to select the QNN variant; CPU is the default.
 `--install` pushes the canonical native libraries and
-tools, and installs SampleTestAPP only when combined with `--app`. Use
+tools, and installs QuickDotAIAPP only when combined with `--app`. Use
 `ANDROID_SERIAL` to select a device when necessary. `--cache` reuses a
 compatible engine build when available and rebuilds it on a cache miss.
 

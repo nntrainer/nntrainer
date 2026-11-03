@@ -836,7 +836,7 @@ class LiteRTLm(
     /**
      * @brief Build the test-mode fallback model file handle from the shared
      * model directory at `/sdcard/Download/aistudio-mobile/models/`.
-     * This ensures all team apps (AI Studio Mobile, SampleTestAPP, etc.)
+     * This ensures all team apps (AI Studio Mobile, QuickDotAIAPP, etc.)
      * can share the same model file without duplication.
      */
     private fun testModelFile(): File {
