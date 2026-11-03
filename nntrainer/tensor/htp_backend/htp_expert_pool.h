@@ -324,6 +324,128 @@ private:
   std::unordered_map<Key, Score> score_; /**< LRFU, every key seen */
 };
 
+/**
+ * @brief One layer's warm list from a prefill call: the last token's
+ *        extended top-k in rank order (@a ranked, @a per_token ids a token,
+ *        token after token), then the experts the call routed most rows
+ *        to (@a rows, by expert; ties to the lower id). At most @a n,
+ *        distinct.
+ */
+inline std::vector<unsigned> expertWarmList(const std::vector<int> &ranked,
+                                            size_t per_token,
+                                            const std::vector<size_t> &rows,
+                                            size_t n) {
+  std::vector<unsigned> out;
+  std::vector<char> taken(rows.size(), 0);
+  const size_t from =
+    per_token && ranked.size() >= per_token ? ranked.size() - per_token : 0;
+  for (size_t i = from; i < ranked.size() && out.size() < n; ++i) {
+    const int e = ranked[i];
+    if (e >= 0 && static_cast<size_t>(e) < rows.size() && !taken[e]) {
+      taken[e] = 1;
+      out.push_back(static_cast<unsigned>(e));
+    }
+  }
+  std::vector<unsigned> by_rows;
+  for (size_t e = 0; e < rows.size(); ++e)
+    if (!taken[e] && rows[e] != 0)
+      by_rows.push_back(static_cast<unsigned>(e));
+  std::stable_sort(by_rows.begin(), by_rows.end(),
+                   [&](unsigned a, unsigned b) { return rows[a] > rows[b]; });
+  for (size_t i = 0; i < by_rows.size() && out.size() < n; ++i)
+    out.push_back(by_rows[i]);
+  return out;
+}
+
+/**
+ * @brief The decode pool's warm-up from the prefill's routing
+ *        (moe.warm_experts a layer): each layer's list from its last
+ *        prefill call, read into the pool while the first token's setup
+ *        runs. S26 Ultra, Gemma 4 26B-A4B at 16: the first token's misses
+ *        222 -> ~115.
+ */
+class ExpertWarm {
+public:
+  using Desc = ComputeOps::ExpertFileDesc;
+
+  /** @brief Experts a layer, read when used: the pool can exist before the
+   *         model's configuration is applied (0: off). */
+  static size_t count() { return htpRuntimeConfig().moe.warm_experts; }
+
+  /** @brief A prefill call of layer @a slot: its warm list from the
+   *         routing (@a ranked, the extended top-k token by token) and
+   *         each expert's rows. A no-op when off. */
+  void note(int slot, const std::vector<int> &ranked,
+            const std::vector<std::vector<std::pair<unsigned, float>>> &rows,
+            unsigned int total_tokens) {
+    if (count() == 0 || slot < 0 || total_tokens < 2)
+      return;
+    if (lists_.size() <= static_cast<size_t>(slot))
+      lists_.resize(slot + 1);
+    std::vector<size_t> n(rows.size());
+    for (size_t e = 0; e < rows.size(); ++e)
+      n[e] = rows[e].size();
+    lists_[slot] =
+      expertWarmList(ranked, ranked.size() / total_tokens, n, count());
+  }
+
+  /** @brief Hands the warm-up to the backend (set_decode_pool_warm) when
+   *         on. @a layers: every layer slot's experts, by expert. */
+  void install(ComputeOps *ops, ExpertLru &lru,
+               const std::vector<std::vector<Desc>> &layers) {
+    if (count() == 0)
+      return;
+    ops->set_decode_pool_warm(
+      [this, ops, &lru, &layers] { return begin(ops, lru, layers); },
+      [this, &lru](const std::vector<const void *> &keys) {
+        lru.unhold(held_);
+        held_ = 0;
+        lru.acquire(
+          keys, [](ExpertLru::Key) {},
+          [](ExpertLru::Key) {
+            throw std::logic_error("expert warm-up overfilled the LRU");
+          });
+      });
+  }
+
+private:
+  /** Room for the warm experts not resident, rank-major over the layers
+   *  (a short room cuts every layer's tail, not the last layers), the
+   *  slots held, the experts to read. */
+  std::vector<Desc> begin(ComputeOps *ops, ExpertLru &lru,
+                          const std::vector<std::vector<Desc>> &layers) {
+    std::vector<Desc> want;
+    std::vector<ExpertLru::Key> pinned;
+    size_t depth = 0;
+    for (const auto &w : lists_)
+      depth = std::max(depth, w.size());
+    for (size_t r = 0; r < depth; ++r)
+      for (size_t l = 0; l < lists_.size() && l < layers.size(); ++l) {
+        if (r >= lists_[l].size() || lists_[l][r] >= layers[l].size())
+          continue;
+        const Desc &d = layers[l][lists_[l][r]];
+        if (lru.resident(d.key_gu))
+          pinned.push_back(d.key_gu);
+        else
+          want.push_back(d);
+      }
+    want.resize(std::min(want.size(), lru.room(pinned)));
+    auto release = [ops](ExpertLru::Key k) {
+      if (!ops->release_qs4cx_wh_expert(k))
+        throw std::logic_error(
+          "expert warm-up evicted an expert the accelerator does not hold");
+    };
+    if (want.empty() || !lru.makeRoom(want.size(), pinned, release))
+      return {};
+    lru.hold(want.size());
+    held_ = want.size();
+    return want;
+  }
+
+  std::vector<std::vector<unsigned>> lists_;
+  size_t held_ = 0;
+};
+
 /** Runtime-owned host policy and prefill registry for the accelerator slots.
  * Readers and decode callbacks must stop before this object is destroyed.
  * Only the LRU is accessed by worker callbacks; registry/queue mutation stays
@@ -348,6 +470,7 @@ struct HtpExpertPool {
   std::unordered_set<const void *> handed_layers;
   ComputeOps *owner = nullptr;
   ComputeOps *early_owner = nullptr;
+  ExpertWarm warm; /**< moe.warm_experts: the decode pool's warm-up */
 
   static SlotClass slotClass(const ExpertFileDesc &d) {
     return {d.K, d.inter, d.N_out, d.w_bits * 2u + (d.affine ? 1u : 0u)};

@@ -47,6 +47,15 @@ public:
   std::vector<uint8_t> param_bound_;
   /** the distinct RoPE tables bound: (ROPE op, its bytes) */
   std::vector<std::pair<uint32_t, std::vector<float>>> rope_tables_;
+  /** the host address each bound RoPE table came from, this graph: the
+   *  layers of one RoPE cache hand one table at one address over the first
+   *  row, and that address names it without a memcmp */
+  struct RopePtr {
+    const float *data;
+    unsigned n;
+    uint32_t op;
+  };
+  std::vector<RopePtr> rope_ptrs_;
   std::vector<uint32_t> conv_next_pos_;
   std::vector<uint32_t> kv_len_;
   bool attn_registered_ = false;
@@ -172,6 +181,7 @@ public:
     stretch_end_.assign(n_ops, 0);
     attn_ordinal_.assign(n_ops, 0);
     param_bound_.assign(n_ops, 0);
+    rope_ptrs_.clear();
     conv_next_pos_.assign(n_ops, HTP_GRAPH_NO_OP);
     first_resident_op_ = HTP_GRAPH_NO_OP;
     uint32_t n_attn = 0;

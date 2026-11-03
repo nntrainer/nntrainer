@@ -31,6 +31,30 @@
 
 namespace nntrainer {
 
+/**
+ * @brief What the model's prefill tells its HTP attention layers, one per
+ *        process across the library boundary (htp_attention_state.cpp).
+ */
+struct HtpPrefillPlan {
+  /** the absolute position the prompt being prefilled ends at (0: none, or
+   *  a handoff the model cannot take: KV-shared layers, a ringed cache) */
+  unsigned end = 0;
+  /** the KV cache stages a step's rows only (KVCacheManager::setStaging):
+   *  each layer keeps its rows in its int8 decode cache alone, so the int8
+   *  path may not fall back to the CPU's */
+  bool staging = false;
+  /** the prefill's last block runs, the one the first decode row follows */
+  bool last_block = false;
+};
+HtpPrefillPlan &htpPrefillPlan();
+inline unsigned &htpPrefillEnd() { return htpPrefillPlan().end; }
+inline bool &htpKvStaging() { return htpPrefillPlan().staging; }
+inline bool &htpPrefillLastBlock() { return htpPrefillPlan().last_block; }
+/** @brief The KV adoption (htp.kv_adopt, on by default): each HTP attention
+ *  layer's prefill seeds its decode cache from its int8 prefill cache and
+ *  frees its CPU rows; K's prefill scale is per (head, dim) with it. */
+bool htpKvAdopt();
+
 #ifdef ENABLE_HEXKL
 /** The active model on this inference thread, shared across library boundaries.
  */
@@ -211,6 +235,50 @@ inline bool htpDecodeKvSeedKvq(unsigned n_rows, int kv_handle,
   (void)n_rows;
   (void)kv_handle;
   (void)k_rows;
+  return false;
+#endif
+}
+
+/** @brief [C] ComputeOps::decode_kv_prepare. */
+inline bool htpDecodeKvPrepare() {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_prepare();
+#else
+  return false;
+#endif
+}
+
+/** @brief [C] ComputeOps::decode_kv_seed_kvq_layer. */
+inline bool htpDecodeKvSeedKvqLayer(unsigned ordinal, unsigned n_rows,
+                                    int kv_handle, unsigned shift,
+                                    bool reseed = false) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_seed_kvq_layer(
+    ordinal, n_rows, kv_handle, shift, reseed);
+#else
+  (void)ordinal;
+  (void)n_rows;
+  (void)kv_handle;
+  (void)shift;
+  (void)reseed;
+  return false;
+#endif
+}
+
+/** @brief [C] ComputeOps::decode_kv_fill_kvq. */
+inline bool htpDecodeKvFillKvq(unsigned ordinal, int kv_handle, unsigned n_rows,
+                               const float *k_ratio, const float *v_ratio,
+                               unsigned n_ratio) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_kv_fill_kvq(
+    ordinal, kv_handle, n_rows, k_ratio, v_ratio, n_ratio);
+#else
+  (void)ordinal;
+  (void)kv_handle;
+  (void)n_rows;
+  (void)k_ratio;
+  (void)v_ratio;
+  (void)n_ratio;
   return false;
 #endif
 }
