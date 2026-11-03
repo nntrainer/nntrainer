@@ -2,17 +2,19 @@
 
 ## State on 2026-11-03
 
-**Full-model generation and the manager performance comparison have not
-passed.** The supplied model is on the phone and its files match the host.
-The Android HTP engine, CLI and continuation checker build and load, but the
-model smoke stops while registering an expert arena on the DSP.
+**The rebuilt v81 DSP runs the supplied Gemma4 26B A4B model.** The first
+full-model run completed 128 generated tokens at 20.898 tok/s (10 prompt
+tokens, 1,734 ms prefill, 6,125 ms generation). DSP queue errors, timeouts,
+stale responses and detach/unmap failures were zero.
 
 The work starts at PR [#4428](https://github.com/nntrainer/nntrainer/pull/4428),
 revision `e91adaf25a828ea9180edfa384687dc9be2fe8fc`, in branch
 `kv/pr4428-htp-cache`, worktree `/tmp/nntr-pr4428-validation`.
-The separately tested CPU KV manager is `ee0e83d3b` from
-`kv-dram-flash-cache`. It has **not** been connected to the HTP path in this
-worktree. Passing its independent tests does not establish HTP compatibility.
+The KV core is ported from `ee0e83d3b` (`kv-dram-flash-cache`). The HTP
+integration uses its contiguous shared-slab ownership and position/reset
+management. DSP int8 cache handles/calibration and resident decode remain
+owned by the existing HTP backend. Device session switching, radix prefix
+reuse and Flash restoration are **not integrated or validated** by this work.
 
 ## Environment and model
 
@@ -66,9 +68,11 @@ models were retained.
 | Optional libnative checks | Passed after SDK installation: 5,760 HVX GEMV cases, 3,456 u8i2 cases, 72 aligned FC cases, 640 TL2 quantization cases. All three injected mutants were rejected. This validates host emulation, not device throughput. |
 | HTP in-process build | Passed after the fixes described below, GCC/G++ 12 and `werror=false`. |
 | In-process targeted checks | Gemma4 HTP tiny reference/input contract 4/4 and KV facade 33/33 passed; targeted process exit reported zero mapped memory. |
-| In-process full model suite | All 125 test bodies completed (124 passed, one skip), but the process did not exit within the 60-second Meson timeout. This is an unresolved teardown issue; the overall run failed by timeout. |
-| Android HTP ARM engine/app | Built with the SDK and beta 1 ARM SDKL link dependency. CLI and continuation checker loaded on the phone. This does not validate a v81 DSP build. |
-| Full 26B Android smoke | Failed during expert arena registration; no generated tokens or throughput result. |
+| In-process full model suite | 125 registered: 124 passed, one skip, successful process exit when rerun outside the sandbox. The original sandbox-only teardown timeout did not reproduce. |
+| Android HTP ARM engine/app | Built with the SDK and beta 1 ARM SDKL link dependency. CLI and continuation checker loaded on the phone; subsequent production v81 DSP rebuild also passed. |
+| Full 26B Android smoke | Passed after rebuilding the DSP and correcting its search path: 128 generated tokens, 20.898 tok/s. Initial failed attempt is retained in the evidence directory. |
+| Integrated Android KV core/facade | 63/63 core and 36/36 facade tests passed using the integrated Android shared libraries, zero skips. These are ARM ownership/algorithm tests; the separate full-model comparison exercises DSP execution. |
+| Integrated host KV core/facade | 63/63 core and 36/36 facade tests passed with successful process exit. Initial sandbox-only core teardown timeout did not reproduce outside the sandbox. |
 
 Logs and XML files are under the evidence directory, including `android/`,
 `host-unit-tests-complete.log`, `host-checks-gcc12.log`, `libnative-checks.log`,
@@ -91,7 +95,7 @@ uninterrupted successful invocation.
    for the standalone host-check fixtures.
 
 Changed lines were checked with clang-format 14 and `git diff --check`.
-The production v81 DSP rebuild still needs the package below.
+The production v81 DSP was subsequently rebuilt using the explicit micro API provider described below.
 
 ## Existing device DSP audit (subsequent correction)
 
@@ -146,66 +150,132 @@ Audit evidence: `rpc-audit/report.json`, `current-methods.json`, per-binary
 `device/*.methods.json`, `probe-absent-methods.log` and
 `probe-empty-cwd-{empty-path,dsp-path}.log` under the evidence directory.
 
-## Current full-model blocker
+## Rebuilt v81 DSP and successful execution
 
-The public download used for HexKL supplied beta 1, with v73/v75/v79
-libraries and no v81 target. PR #4428's production DSP build needs the
-matching **HexKL beta 2**, including
-`lib/6.4.0.2/hexagon_toolv19_v81/libhexkl_micro.a`. No PR-matched DSP
-skeleton has been built or staged here. An old device skeleton is not
-treated as a compatible substitute. Beta 1's ARM SDKL library was used
-only to finish the ARM build and loader check.
+The public HexKL beta 1 package lacks v81 support; compiling its v79 archive
+into a v81 ELF did not initialize HMX. Instead, the already working v81
+`g4ops_1016/ship/libnntr_hvx_skel.so` supplies only the HexKL micro API as an
+explicit dynamic dependency. Its SHA256 is
+`a167afcf746d9c7f1aa2f74f7bb4f454d78b79d8000e664dcc5c2067a2dba01e`.
+It is copied unchanged as `libnntr_hexkl_provider.so`. The complete current
+nntrainer DSP source and current QAIC interface are freshly compiled; this
+is not the older 125-method skeleton reused as the RPC endpoint.
 
-The real-model smoke reached a 542-op graph and then reported:
+`dsp/build.sh` accepts an optional `HEXKL_MICRO_DSO` path, validates its
+architecture, links its basename as a dependency, and binds the new
+skeleton's own symbols locally with `-Bsymbolic`. The undefined-symbol
+guard allows only micro symbols actually exported by that provider, in
+addition to the existing DSP runtime imports. The default static-library
+build is unchanged. Provider headers must match its ABI: this provider uses
+the three-argument `hexkl_micro_hw_init`, matching the PR's beta 2 declarations.
+A matching official v81 static library can replace this local validation
+arrangement when available; no vendor binaries or SDK headers are committed.
 
-```text
-Failed to repack weights: HTP arena: cannot place an expert slot (1 MiB).
-nntr_hvx_arena_attach(16 MiB) failed: err=44 (0x0000002c)
-mapped=0 MiB in 0 chunks, RSS=2018 MB
+Reproduce this host's DSP build:
+
+```bash
+source ~/toolchain/nntrainer-htp-20261103/env.sh
+export HEXKL_ROOT=/tmp/nntr-pr4428-validation-results/hexkl-device
+export HEXKL_SDK_VER=device-v81
+export HEXKL_MICRO_DSO=$HEXKL_ROOT/lib/libnntr_hexkl_provider.so
+NNTR_HTP_DIAGNOSTICS=0 bash nntrainer/tensor/htp_backend/dsp/build.sh
 ```
 
-The full-model error 44 is not itself proof of an absent RPC. The audit
-above separately confirms both the original DSP loading failure and the
-older skeleton's unsupported appended methods. A matching ARM client/DSP
-skeleton must be tested before diagnosing a model, memory-budget or
-manager problem. This run never used the new KV manager.
-There was no active inference process left after the smoke.
+The new ELF reports V81 and all 134 QAIC methods match the current IDL's
+names, ordinals and wire signatures. A real phone probe successfully opened,
+queried, released prefill scratch, set/reset Hadamard signs and closed. Session
+info reports HMX enabled, 8 MiB VTCM, eight HVX contexts and FP16 rate 8.
 
-Reproduce that diagnostic with the staged runtime:
+Both DSP files must be in `ADSP_LIBRARY_PATH`, and the skeleton must also be
+available from the working directory used by the CLI. ARM libraries use
+`LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64`; placing vendor libraries
+before system libraries caused an unrelated Android framework symbol mismatch.
+The SDK `libcdsprpc.so` link stub is never deployed; execution uses the phone's
+real vendor FastRPC library.
 
-```sh
-cd /data/local/tmp/nntr_pr4428_kv_validation/pr4428
-LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64 \
-ADSP_LIBRARY_PATH=/data/local/tmp/nntr_pr4428_kv_validation/pr4428 \
-NNTR_NUM_THREADS=8 ./nntr_causallm \
-  /data/local/tmp/nntr_pr4428_kv_validation/models/gemma4
+The supplied example's EOS configuration contains token 1 only, so its
+128-token smoke repeats turns after answering the greeting. Performance
+comparisons below use deterministic fixed-length generation and compare IDs,
+without modifying the original weight pack.
+
+## KV integration and comparison
+
+`NNTR_HTP_KV_MANAGER=1` selects the imported core manager for HTP shared
+FP32/FP16 planes. Its allocator wraps the same HTP shared allocation/free
+callbacks. Existing Tensor views pin the core allocation, and aliases refer
+to the same storage. There are no per-token cache copies or extra RPCs.
+`NNTR_HTP_KV_MANAGER=0` selects the original PR slab owner in the same binary.
+Allocation failure on the core path fails explicitly instead of falling back
+to ordinary heap memory. DSP int8 KV and backend completion/registration stay
+on their original path. Window compaction, dropped-row maxima and bases are
+preserved by the facade; unit tests cover compaction, ownership, reset and moves.
+
+The imported session/radix/Flash core remains covered by its CPU tests. Its
+host-plane snapshot alone cannot restore an HTP session: a future backend
+snapshot must also restore int8 KV/calibration, window bases and resident
+decode state. Those features are not enabled by this switch.
+
+The controlled phone comparison uses three conditions: the PR baseline plus
+build fixes, the integrated binary with ownership OFF, and that same binary
+with ownership ON. All use the same newly rebuilt DSP/provider and weights,
+greedy sampling, eight CPU threads, 16 cached experts, disabled cache growth
+and fixed lengths. Cases are 1,024 input + 64 decode tokens and 2,048 input +
+128 decode tokens. After one warmup per condition, five measurements per
+condition alternate forward/reverse condition order. Warm runs do not establish
+cold-storage performance. The CLI's generated-ID capture does not force a CPU
+logit readback. Logs, IDs, thermal snapshots and `runs.json` are under
+`android/compare/` in the evidence directory.
+
+All 36 runs completed: six warmups and 30 measurements. Every captured ID
+sequence matched across all three conditions and repetitions within each case:
+65 IDs for p1024 and 129 for p2048 (prefill prediction plus decode steps).
+The first smoke's 20.898 tok/s is a different short greeting/configuration;
+it is not the throughput of these fixed-budget long-input cases.
+
+Median results, five measurements per row; decode excludes the first decode
+step and reports the CLI's steady per-token latency:
+
+| Input / decode steps | Condition | Prefill ms | TTFT ms | Steady decode ms/token | E2E ms | Peak MiB |
+|---|---|---:|---:|---:|---:|---:|
+| 1024 / 64 | PR baseline | 1866 | 1943.09 | 85.8203 | 7864 | 3285.4 |
+| 1024 / 64 | Core OFF | 1854 | 1920.88 | 84.3639 | 7707 | 3343.9 |
+| 1024 / 64 | Core ON | 1805 | 1871.04 | 85.0536 | 7756 | 3321.5 |
+| 2048 / 128 | PR baseline | 3649 | 3743.52 | 84.1437 | 15553 | 3380.7 |
+| 2048 / 128 | Core OFF | 3633 | 3734.82 | 85.1473 | 15560 | 3379.3 |
+| 2048 / 128 | Core ON | 3622 | 3725.58 | 84.1358 | 15525 | 3382.0 |
+
+Core ON versus OFF: prefill -2.64% / -0.30%, steady decode +0.82% / -1.19%,
+and E2E +0.64% / -0.22% for p1024 / p2048. Observed median regressions are
+below the provisional 3% threshold, but this is not a general no-regression
+guarantee. The phone's skin temperature rose from 30.1 to 45.2 C, with
+reported skin thermal status 0 through 3. Alternating condition order helps
+with drift but does not remove thermal effects or supply statistical confidence.
+For example, p1024 steady decode ranges were 80.16–86.58 ms for the PR,
+83.67–86.52 ms OFF, and 82.05–86.08 ms ON. The small differences must not
+be advertised as a speedup.
+
+Peak memory is the CLI's RssAnon + accelerator accounting, not just ru_maxrss.
+The ON owner reports 30 layers and 519,045,120 bytes (495 MiB) of shared KV
+planes. Both paths retain the original DSP quantized cache implementation.
+A machine-readable record with every run, ranges, token hashes, settings and
+DSP hashes is committed in
+[`validation/gemma4-htp-kv-manager-20261103.json`](validation/gemma4-htp-kv-manager-20261103.json).
+These runs validate single-context contiguous ownership only; they do not
+validate session switching, a real-context window rollover, or prefix/Flash
+restore on the NPU.
+
+## Running the staged manager build
+
+```bash
+adb -s R5KL20NFRCK shell 'cd /data/local/tmp/nntr_pr4428_kv_validation/core-htp &&
+  LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64 \
+  ADSP_LIBRARY_PATH=/data/local/tmp/nntr_pr4428_kv_validation/core-htp \
+  NNTR_NUM_THREADS=8 NNTR_HTP_KV_MANAGER=1 \
+  ./nntr_causallm /data/local/tmp/nntr_pr4428_kv_validation/models/gemma4'
 ```
 
-System libraries must precede vendor libraries in this loader path; a
-vendor-first path failed on a `libandroidfw`/`libbase` symbol mismatch.
-Do not deploy the SDK's link-only `libcdsprpc.so` to the phone.
-
-## Manager integration and comparison still required
-
-The existing core manager owns plain host storage and supports FP32/FP16.
-The HTP path uses accelerator-visible slabs, per-layer window bases and
-dropped-row maxima, plus separate DSP int8 KV handles and calibration.
-Resident decode bypasses the normal host attention layer calls. A manager
-integration must preserve these paths, including their lifetimes and
-completion, rather than copying host cache bytes every token.
-
-Once a matching DSP runtime works, compare the fixed PR baseline, the
-integrated build with the manager disabled, and the same build with
-contiguous manager ownership enabled. Require identical generated token
-IDs and verify the actual ownership/HTP dispatch path. Use identical
-weights, prompts, sampler, expert budget, thread count and context.
-Alternate at least five measured runs per condition after warmup; record
-thermal state, TTFT, prefill throughput, decode ms/token and memory.
-Separate loading, cold I/O and warm execution. A provisional goal is
-median prefill/decode regression within 3%, with uncertainty reported
-when run-to-run variation is larger.
-
-Only after that compare two sessions A/B/A/B, then radix reuse and Flash
-restore. Their backend snapshot must also restore int8 KV/calibration,
-window base and resident decode state. Neither single-session NPU
-compatibility nor performance parity is claimed by the results above.
+Use `models/p1024` or `models/p2048` for the fixed comparison configurations.
+Evidence includes `android/htp-model-new-dsp-smoke.log`,
+`rpc-audit/probe-new-v81-provider.log`, `android/v81-dsp-provider-build.log`,
+`android/working-v81-dsp.sha256`, `android/integrated-{core,facade}.xml`,
+and `core-integration-unit-tests.log`.
