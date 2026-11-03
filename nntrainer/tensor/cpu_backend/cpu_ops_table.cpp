@@ -46,6 +46,10 @@ inline float gelu_tanh_f(float x) {
   constexpr float k = 0.7978845608028654f; // sqrt(2/pi)
   return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
 }
+/** gelu, exact erf form (the same expression as the gelu activation) */
+inline float gelu_erf_f(float x) {
+  return 0.5f * x * (1.0f + std::erf(x * 0.7071067811f));
+}
 /** silu, in the numerically stable x / (1 + exp(-x)) form */
 inline float silu_f(float x) { return x / (1.0f + std::exp(-x)); }
 /**
@@ -173,6 +177,13 @@ void CpuComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                           unsigned int active_rows, unsigned int row_offset) {
   elementwise2_rows(in1, in2, out, active_rows, row_offset, "geglu",
                     [](float a, float b) { return gelu_tanh_f(a) * b; });
+}
+
+void CpuComputeOps::geglu_erf(const Tensor &in1, const Tensor &in2, Tensor &out,
+                              unsigned int active_rows,
+                              unsigned int row_offset) {
+  elementwise2_rows(in1, in2, out, active_rows, row_offset, "geglu_erf",
+                    [](float a, float b) { return gelu_erf_f(a) * b; });
 }
 
 void CpuComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,

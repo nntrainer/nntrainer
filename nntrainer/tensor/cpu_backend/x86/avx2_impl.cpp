@@ -1778,6 +1778,65 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
   }
 }
 
+void compute_rotary_emb_value_snap(unsigned int width, unsigned int dim,
+                                   unsigned int half_, const float *input,
+                                   uint16_t *output, const float *cos_,
+                                   const float *sin_,
+                                   const float *head_scales) {
+  const __m256 lo = _mm256_set1_ps(-128.0f);
+  const __m256 hi = _mm256_set1_ps(127.0f);
+  auto snap = [&](__m256 x, __m256 s) {
+    __m256 q = _mm256_round_ps(_mm256_div_ps(x, s),
+                               _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    q = _mm256_min_ps(hi, _mm256_max_ps(lo, q));
+    return _mm256_mul_ps(q, s);
+  };
+  for (unsigned int w = 0; w < width; w += dim) {
+    const float sc = head_scales[w / dim];
+    const __m256 s = _mm256_set1_ps(sc);
+    unsigned int k = 0;
+    for (; k + 7 < half_; k += 8) {
+      const unsigned int i0 = w + k;
+      const unsigned int i1 = w + k + half_;
+      __m256 a = _mm256_loadu_ps(&input[i0]);
+      __m256 b = _mm256_loadu_ps(&input[i1]);
+      if (cos_ != nullptr) {
+        const __m256 c = _mm256_loadu_ps(&cos_[k]);
+        const __m256 sn = _mm256_loadu_ps(&sin_[k]);
+        const __m256 ra =
+          _mm256_sub_ps(_mm256_mul_ps(a, c), _mm256_mul_ps(b, sn));
+        const __m256 rb =
+          _mm256_add_ps(_mm256_mul_ps(a, sn), _mm256_mul_ps(b, c));
+        a = ra;
+        b = rb;
+      }
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(output + i0),
+                       convert_vector_f32_to_f16(snap(a, s)));
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(output + i1),
+                       convert_vector_f32_to_f16(snap(b, s)));
+    }
+    for (; k < half_; ++k) {
+      float a = input[w + k];
+      float b = input[w + k + half_];
+      if (cos_ != nullptr) {
+        const float ac = a * cos_[k];
+        const float bs = b * sin_[k];
+        const float as = a * sin_[k];
+        const float bc = b * cos_[k];
+        a = ac - bs;
+        b = as + bc;
+      }
+      const float qa =
+        std::min(127.0f, std::max(-128.0f, std::nearbyint(a / sc)));
+      const float qb =
+        std::min(127.0f, std::max(-128.0f, std::nearbyint(b / sc)));
+      output[w + k] = static_cast<uint16_t>(COMPUTE_FP32_TO_FP16(qa * sc));
+      output[w + k + half_] =
+        static_cast<uint16_t>(COMPUTE_FP32_TO_FP16(qb * sc));
+    }
+  }
+}
+
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,

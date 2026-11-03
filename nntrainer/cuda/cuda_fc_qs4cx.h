@@ -346,6 +346,46 @@ bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
                                unsigned int K);
 
 /**
+ * @brief Register the per-channel integer zero points of an ASYMMETRIC int4
+ *        weight w = s*(q - z), carried as the plain QS4CX payload unchanged
+ *        (nibble q = signed code q - 8, scale s).
+ *
+ * The device copy is keyed by @p plain_w like the other derived caches. Once
+ * any weight has zero points the int8 activation quantisers also emit the
+ * per-row sum of their codes, and the dp4a GEMV/GEMM and the cuBLAS-int8
+ * epilogue add the exact int32 term (8 - z[n]) * (rowsum_q8[m] - K*azp[m])
+ * before their float rescale; the fp-activation lm_head GEMV adds
+ * (8 - z[n]) * sum_k x[k]. No extra launch. A weight without zero points, and
+ * every weight while none is registered, runs the unchanged kernels
+ * bit-identically. The naive / host-resident fp32 diagnostic routes do not
+ * apply them and decline such a weight. Call at load time (refused under
+ * graph capture).
+ *
+ * @param plain_w plain QS4CX payload pointer of the weight (the cache key)
+ * @param zp      fp32 z[N] holding integer values (|z| <= 255), host memory;
+ *                nullptr removes registered zero points
+ * @param N       output channels
+ * @return false (nothing registered) on a bad argument, a non-integer zero
+ *         point, under capture or on an allocation / copy failure
+ */
+bool cuda_fc_qs4cx_set_weight_zero_points(const unsigned char *plain_w,
+                                          const float *zp, unsigned int N);
+
+/**
+ * @brief Same registration from the per-channel correction c[n] =
+ *        s[n] * (8 - z[n]): recovers the integer z[n] from c and the weight's
+ *        fp32 scales @p scales_fp32 (host-readable), then calls
+ *        cuda_fc_qs4cx_set_weight_zero_points(). nullptr @p corr removes.
+ * @return false on a bad argument or a c[n] that is not of that form
+ */
+bool cuda_fc_qs4cx_set_zero_point_correction(const unsigned char *plain_w,
+                                             const float *scales_fp32,
+                                             const float *corr, unsigned int N);
+
+/** @brief True when zero points are registered for @p plain_w. */
+bool cuda_fc_qs4cx_has_weight_zero_points(const unsigned char *plain_w);
+
+/**
  * @brief True when the dp4a derived cache exists for this
  *        plain pointer -- dispatch may then treat the pointer as a pure key
  *        (no device access, no staging needed).
