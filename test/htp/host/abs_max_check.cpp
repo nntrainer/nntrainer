@@ -92,6 +92,23 @@ int main() {
         q_bad += d > 1 || d < -1;
         ++q_n;
       }
+      // per-element inv: all equal gives the scalar version's codes
+      std::vector<float> invs(n, inv);
+      std::vector<uint16_t> u2(n);
+      nntrainer::attention_quant::quant_u16_f32(f.data(), n, invs.data(), zp,
+                                                u2.data());
+      q_bad += std::memcmp(u.data(), u2.data(), n * sizeof(uint16_t)) != 0;
+      // and per-element values reach their own lanes
+      for (unsigned i = 0; i < n; ++i)
+        invs[i] = inv * (0.25f + 0.75f * static_cast<float>(i % 5) / 4.0f);
+      nntrainer::attention_quant::quant_u16_f32(f.data(), n, invs.data(), zp,
+                                                u2.data());
+      for (unsigned i = 0; i < n; ++i) {
+        float v = f[i] * invs[i] + zp + 0.5f;
+        v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+        const int d = (int)u2[i] - (int)static_cast<uint16_t>(v);
+        q_bad += d > 1 || d < -1;
+      }
       std::vector<float> o(n);
       nntrainer::attention_quant::dequant_u16_f32(u.data(), n, scale, 32768.0f,
                                                   o.data());

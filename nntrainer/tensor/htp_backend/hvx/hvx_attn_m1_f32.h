@@ -130,6 +130,19 @@ typedef struct {
   float *sf;     /**< f32 [n_kv * gqa][seq]: the scores */
   int16_t *q16;  /**< [n_kv * gqa][head_dim]: q quantized */
   int32_t *psum; /**< [n_kv * gqa][seq / 64]: a tile's P sum */
+  /** [C] [n_layers] seeds on the pool's background lane
+   *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first */
+  struct hvx_attn_m1_seed_bg *seed_bg;
+  /** [C] the thread that allocates the layer after a seed's, one ahead
+   *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first seed */
+  struct hvx_attn_m1_pre *pre;
+  /** [C] [n_layers] 1: allocated ahead, not yet written (a seed writes
+   *  every tile; layer_alloc zero-fills it first otherwise) */
+  uint8_t *unfilled;
+  /** [C] seeds whose layer the thread had allocated / that allocated it
+   *  themselves, and the microseconds of each kind of allocation */
+  uint32_t pre_hits, pre_inline;
+  uint64_t pre_us, inline_us;
 } hvx_attn_m1_ctx;
 
 /** @brief [#282 D] Or-ed into create's max_seq: the int8 cache. */
@@ -204,11 +217,12 @@ int hvx_attn_m1_kv_amax_floor(hvx_attn_m1_ctx *ctx, uint32_t layer,
  * @brief [#289] Seeds an int8 cache's @a layer with @a n_rows positions
  *        already quantized: per kv head row-major masters stored as
  *        q ^ 0x80 (@a k8 / @a v8, @a row_stride bytes between positions,
- *        @a head_stride between heads), K at one scale a head (@a s_k), V
- *        at one a (head, dim) (@a s_v, @a s_v_inv). The bytes move as they
- *        are; the scales become the layer's. With @a k_rows
- *        ([n_rows][n_kv][head_dim] f32) K is quantized from them instead,
- *        at kv_append's per-dim scales (a head scale is too coarse for K).
+ *        @a head_stride between heads), K and V at one scale a (head, dim)
+ *        (@a s_k, @a s_k_inv, @a s_v, @a s_v_inv; a cache with one K scale
+ *        a head repeats it over the dims). The bytes move as they are; the
+ *        scales become the layer's. With @a k_rows ([n_rows][n_kv][head_dim]
+ *        f32) K is quantized from them instead, at kv_append's per-dim
+ *        scales, and @a s_k / @a s_k_inv are not read.
  * @return AEE_SUCCESS; AEE_EBADSTATE unless the cache is int8 and the
  *         layer empty; AEE_EINVALIDFORMAT for a range past max_seq;
  *         AEE_ENOMEMORY when a lazy layer cannot be allocated
@@ -216,8 +230,61 @@ int hvx_attn_m1_kv_amax_floor(hvx_attn_m1_ctx *ctx, uint32_t layer,
 int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
                         const uint8_t *k8, const uint8_t *v8,
                         size_t head_stride, size_t row_stride, const float *s_k,
-                        const float *s_v, const float *s_v_inv,
-                        const float *k_rows);
+                        const float *s_k_inv, const float *s_v,
+                        const float *s_v_inv, const float *k_rows);
+
+/**
+ * @brief hvx_attn_m1_seed_q8 from the prefill's row-major masters
+ *        (@a k8 / @a v8, q ^ 0x80, @a head_stride bytes between heads,
+ *        head_dim between positions) on HVX: positions [@a shift,
+ *        @a shift + @a n_rows) of the masters become the layer's [0,
+ *        n_rows) -- @a shift is the rows a windowed cache moved past since
+ *        the masters were filled. K goes into Kt's tiles a 64-position tile
+ *        and 128 dims at a time (six byte-zip rounds), V row by row; every
+ *        byte of the layer is written once (zeros past n_rows), so a lazy
+ *        layer is allocated without its zero fill. Scales as seed_q8's.
+ *        head_dim a multiple of 128.
+ * @return as hvx_attn_m1_seed_q8; AEE_EINVALIDFORMAT for a head_dim the
+ *         tiles do not take
+ */
+int hvx_attn_m1_seed_q8_tiles(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t n_rows, const uint8_t *k8,
+                              const uint8_t *v8, size_t head_stride,
+                              uint32_t shift, const float *s_k,
+                              const float *s_k_inv, const float *s_v,
+                              const float *s_v_inv);
+
+/** @brief Called once a background seed is done, with its @a token. */
+typedef void (*hvx_attn_m1_seed_done_fn)(void *arg, uint32_t token);
+
+/**
+ * @brief [C] hvx_attn_m1_seed_q8_tiles on the pool's background lane: the
+ *        layer's scales and length are set and its tiles queued
+ *        (hvx_worker_pool_submit_bg), a (kv head, tile) a unit, and the
+ *        call returns; the pool's idle workers, and any wait_bg caller, run
+ *        them under whatever foreground work follows. The masters must stay
+ *        as they are until @a done (@a arg, @a token) is called, from
+ *        hvx_attn_m1_seed_reap or from the layer's first forward or
+ *        append, which join the seed first.
+ * @return as hvx_attn_m1_seed_q8_tiles; AEE_EBADSTATE for a layer with a
+ *         seed in flight
+ */
+int hvx_attn_m1_seed_q8_tiles_async(
+  hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows, const uint8_t *k8,
+  const uint8_t *v8, size_t head_stride, uint32_t shift, const float *s_k,
+  const float *s_k_inv, const float *s_v, const float *s_v_inv,
+  hvx_attn_m1_seed_done_fn done, void *arg, uint32_t token);
+
+/** @brief [C] Finishes the background seeds that are done (every one with
+ *         @a wait, waiting for them): their done callbacks run here. A
+ *         NULL ctx is a no-op. */
+void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait);
+
+/** @brief [C] Waits for layer @a layer's background seed, if one is in
+ *         flight (its done callback runs here), so its tiles and scales can
+ *         be read, or the layer seeded again: @a forget also sets its
+ *         length to 0, which a new seed of the layer needs. */
+void hvx_attn_m1_seed_settle(hvx_attn_m1_ctx *ctx, uint32_t layer, int forget);
 
 /**
  * @brief Appends position @a pos (k, v of the new token) to @a layer and

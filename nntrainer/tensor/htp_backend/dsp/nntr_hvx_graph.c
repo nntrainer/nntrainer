@@ -17,10 +17,12 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 #include <remote.h>
 
 #include "hexkl_graph.h"
 #include "hexkl_probe.h"
+#include "hvx_attn_m1_f32.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -35,6 +37,10 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     FARF(ERROR, "graph_init: a graph is already live; release it first");
     return AEE_EBADSTATE;
   }
+  /* [C] the prefill's background seeds are done before the graph can run
+     a decode row, and their caches released */
+  hvx_attn_m1_seed_reap(s->attn_m1, 1);
+  hvx_attn_m1_seed_reap(s->attn_m1_b, 1);
   {
     /** [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
        [plan 201 S4] on the heap (2 KiB at 256 slots, init copies it) */
@@ -97,7 +103,9 @@ int nntr_hvx_graph_set_param(remote_handle64 handle, uint32 op, uint32 which,
   if (dataLen < 0) {
     return AEE_EINVALIDFORMAT;
   }
+  const uint64_t t0 = HAP_perf_get_time_us();
   rc = hexkl_graph_set_param(s->graph, op, which, data, (uint32_t)dataLen);
+  s->param_us += HAP_perf_get_time_us() - t0;
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_set_param: op=%u which=%u n=%d: %s (0x%08x)",
          (unsigned)op, (unsigned)which, dataLen, htp_graph_err_name(rc),

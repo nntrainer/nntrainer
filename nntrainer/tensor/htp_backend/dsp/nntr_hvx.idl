@@ -1504,4 +1504,23 @@ interface nntr_hvx : remote_handle64 {
    AEEResult weight_set_static_quant(in sequence<uint32> handles,
       in sequence<float> scales, in sequence<int32> zero_points,
       in uint32 gate_plus1, in uint32 up_plus1);
+
+   // [C] attn_m1_seed_kvq from the masters on HVX (hvx_attn_m1_seed_q8_
+   // tiles): K and V both from the masters (K's prefill scale per (head,
+   // dim)), rows [shift, shift + n_rows) of them as the layer's [0,
+   // n_rows) -- shift: the rows a windowed cache moved since the masters
+   // were filled. kv_handle is released.
+   AEEResult attn_m1_seed_kvq_tiles(in uint32 layer, in uint32 kv_handle,
+                                    in uint32 n_rows, in uint32 shift);
+
+   // [C] The other way: rows [0, n_rows) of decode layer `layer` (its word
+   // as attn_m1_kv_append's) into the fixed-scale int8 cache kv_handle --
+   // the masters, per-row scales and column sums, and the WH tiles baked
+   // -- each value times k_ratio / v_ratio ([n_kv][head_dim], the old
+   // scale over the cache's: empty for 1). A prefill call after the first
+   // runs its attention over the rows earlier calls left in the decode
+   // cache, with no CPU copy of them. The layer's seed in flight is waited
+   // for first.
+   AEEResult kv_fill_q(in uint32 kv_handle, in uint32 layer, in uint32 n_rows,
+                       in sequence<float> k_ratio, in sequence<float> v_ratio);
 };

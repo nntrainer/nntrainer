@@ -140,16 +140,16 @@ static void quant_v_row_generic(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
 }
 
 void hvx_kv_quant_k_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                              float inv_s, int8_t *q, int32_t *colsum) {
+                              const float *inv, int8_t *q, int32_t *colsum) {
   HVX_Vector v[MAX_VECS];
   const uint32_t n = hd / 32u;
   load_row_f32(x_hf, hd, v);
-  const HVX_Vector inv = hvx_splat_sf(inv_s);
   const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
   HVX_Vector w[MAX_VECS];
   HVX_Vector sum = Q6_V_vzero();
   for (uint32_t i = 0; i < n; ++i) {
-    w[i] = quant_vec(v[i], inv, lo, hi);
+    const HVX_Vector iv = *(const HVX_UVector *)(inv + 32u * i);
+    w[i] = quant_vec(v[i], iv, lo, hi);
     sum = Q6_Vw_vadd_VwVw(sum, w[i]);
   }
   for (int rot = 4; rot <= 64; rot <<= 1) {

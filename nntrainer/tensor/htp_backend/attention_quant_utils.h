@@ -144,6 +144,37 @@ inline void quant_u16_f32(const float *src, unsigned int n, float inv, float zp,
   }
 }
 
+/** @brief quant_u16_f32 with one inv per element: src[i] * inv[i] + (zp +
+ *         0.5), the same two roundings. The q2 Q with K's scale per dim,
+ *         inv[d] = inv * fs_kd / fs_k as hexkl_attn_q2's stage_qprep forms it.
+ */
+inline void quant_u16_f32(const float *src, unsigned int n, const float *inv,
+                          float zp, uint16_t *dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+  unsigned int i = 0;
+#if defined(__aarch64__)
+  const float32x4_t vzp = vdupq_n_f32(zp + 0.5f);
+  const float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(65535.0f);
+  for (; i + 8 <= n; i += 8) {
+    float32x4_t a =
+      vaddq_f32(vmulq_f32(vld1q_f32(src + i), vld1q_f32(inv + i)), vzp);
+    float32x4_t b =
+      vaddq_f32(vmulq_f32(vld1q_f32(src + i + 4), vld1q_f32(inv + i + 4)), vzp);
+    a = vbslq_f32(vcltq_f32(a, lo), lo, vbslq_f32(vcgtq_f32(a, hi), hi, a));
+    b = vbslq_f32(vcltq_f32(b, lo), lo, vbslq_f32(vcgtq_f32(b, hi), hi, b));
+    vst1q_u16(dst + i, vcombine_u16(vmovn_u32(vcvtq_u32_f32(a)),
+                                    vmovn_u32(vcvtq_u32_f32(b))));
+  }
+#endif
+  for (; i < n; ++i) {
+    float v = src[i] * inv[i] + (zp + 0.5f);
+    v = v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v;
+    dst[i] = static_cast<uint16_t>(v);
+  }
+}
+
 /** @brief dst[i] = (src[i] - zp) * scale, the a16 output's dequantization. */
 inline void dequant_u16_f32(const uint16_t *src, unsigned int n, float scale,
                             float zp, float *dst) {

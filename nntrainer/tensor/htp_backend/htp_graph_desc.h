@@ -212,6 +212,9 @@ enum {
  *  another shape: Gemma 4's full layers), the rest the layer's ordinal
  *  among the ATTN_M1 ops of that shape (hexkl_graph_init's ordinal). */
 #define HTP_ATTN_KV_CACHE_B 0x80000000u
+/** @brief [C] attn_m1_seed_kvq_tiles' layer word: a layer seeded before
+ *  (an earlier prefill call's) is seeded again, after its seed in flight */
+#define HTP_ATTN_KV_RESEED 0x40000000u
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 /** @brief A layer's FFN kind. DENSE_MOE: Gemma 4's dense

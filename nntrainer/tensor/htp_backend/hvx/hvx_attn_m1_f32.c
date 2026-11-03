@@ -60,6 +60,7 @@
 #include "hvx_attn_m1_f32.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,6 +68,7 @@
 #include <HAP_perf.h>
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
+#include <qurt.h>
 
 #include "attn_m1_det.h"
 #include "hvx_attn_m1_hf.h"
@@ -227,10 +229,16 @@ out:
   return ctx;
 }
 
+static void pre_stop(hvx_attn_m1_ctx *ctx);
+
 void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   if (!ctx) {
     return;
   }
+  hvx_attn_m1_seed_reap(ctx, 1); /* [C] no unit may outlive the tiles */
+  pre_stop(ctx);                 /* nor an allocation the layers */
+  free(ctx->seed_bg);
+  free(ctx->unfilled);
   free(ctx->psum);
   free(ctx->q16);
   free(ctx->sf);
@@ -260,9 +268,141 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   free(ctx);
 }
 
-/** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use;
- *  a no-op for an allocated one. */
-static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
+/** [C] The allocation thread: the layer after a seed's is allocated while
+    the prefill runs on, so the next seed's RPC -- which the prefill waits
+    for -- does not grow the DSP heap itself (S26 Ultra, Gemma 4: 275 MiB
+    over the 30 layers; the switch off pays the same at the graph init,
+    59-75 ms with the zero fill). One layer ahead: the heap holds one
+    layer's cache early, not all of them (round 7's peak). */
+struct hvx_attn_m1_pre {
+  hvx_attn_m1_ctx *ctx;
+  qurt_thread_t tid;
+  unsigned char *stack;
+  _Atomic int32_t want; /**< the layer queued; PRE_IDLE, PRE_STOP */
+};
+#define PRE_IDLE (-1)
+#define PRE_STOP (-2)
+#define PRE_STACK (32u * 1024u)
+
+static int layer_alloc_raw(hvx_attn_m1_ctx *ctx, uint32_t l, int fill);
+
+static void pre_thread(void *arg) {
+  struct hvx_attn_m1_pre *p = (struct hvx_attn_m1_pre *)arg;
+  for (;;) {
+    const int32_t l = atomic_load_explicit(&p->want, memory_order_acquire);
+    if (l == PRE_STOP) {
+      break;
+    }
+    if (l == PRE_IDLE) {
+      qurt_futex_wait(&p->want, PRE_IDLE);
+      continue;
+    }
+    const uint64_t t0 = HAP_perf_get_qtimer_count();
+    /* a failure leaves the layer to its seed, which allocates inline */
+    if (layer_alloc_raw(p->ctx, (uint32_t)l, 0) == AEE_SUCCESS) {
+      p->ctx->unfilled[l] = 1u;
+    }
+    /* ponytail: read by session_info after the graph init's reap, which
+       waits for this thread to be idle; a read mid-prefill could tear */
+    p->ctx->pre_us +=
+      HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+    atomic_store_explicit(&p->want, PRE_IDLE, memory_order_release);
+    qurt_futex_wake(&p->want, 2);
+  }
+  qurt_thread_exit(0);
+}
+
+/** @brief Until the thread is done with layer @a l (if it is on it). */
+static void pre_wait(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  if (!p) {
+    return;
+  }
+  int32_t w;
+  while ((w = atomic_load_explicit(&p->want, memory_order_acquire)) ==
+         (int32_t)l) {
+    qurt_futex_wait(&p->want, w);
+  }
+}
+
+/** @brief Queues layer @a l to the thread (started at the first call),
+ *         unless it is allocated or the thread is busy. */
+static void pre_request(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  if (l >= ctx->n_layers || (ctx->kt[l] && ctx->v[l])) {
+    return;
+  }
+  if (!ctx->pre) {
+    struct hvx_attn_m1_pre *p = (struct hvx_attn_m1_pre *)calloc(1, sizeof(*p));
+    if (!ctx->unfilled) {
+      ctx->unfilled = (uint8_t *)calloc(ctx->n_layers, 1);
+    }
+    if (!p || !ctx->unfilled || !(p->stack = memalign(64, PRE_STACK))) {
+      free(p);
+      return; /* the seeds allocate inline */
+    }
+    p->ctx = ctx;
+    atomic_init(&p->want, PRE_IDLE);
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_size(&attr, PRE_STACK);
+    qurt_thread_attr_set_stack_addr(&attr, p->stack);
+    int prio = qurt_thread_get_priority(qurt_thread_get_id());
+    qurt_thread_attr_set_priority(&attr, (unsigned short)(prio < 1 ? 1 : prio));
+    qurt_thread_attr_set_name(&attr, "attnm1pre");
+    if (qurt_thread_create(&p->tid, &attr, pre_thread, p) != 0) {
+      free(p->stack);
+      free(p);
+      return;
+    }
+    ctx->pre = p;
+  }
+  int32_t idle = PRE_IDLE;
+  if (atomic_compare_exchange_strong_explicit(&ctx->pre->want, &idle,
+                                              (int32_t)l, memory_order_release,
+                                              memory_order_relaxed)) {
+    qurt_futex_wake(&ctx->pre->want, 1);
+  }
+}
+
+/** @brief Until the thread has no allocation in hand. */
+static void pre_idle(hvx_attn_m1_ctx *ctx) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  int32_t w;
+  while (p && (w = atomic_load_explicit(&p->want, memory_order_acquire)) >= 0) {
+    qurt_futex_wait(&p->want, w);
+  }
+}
+
+static void pre_stop(hvx_attn_m1_ctx *ctx) {
+  struct hvx_attn_m1_pre *p = ctx->pre;
+  if (!p) {
+    return;
+  }
+  pre_idle(ctx);
+  atomic_store_explicit(&p->want, PRE_STOP, memory_order_release);
+  qurt_futex_wake(&p->want, 1);
+  int status;
+  qurt_thread_join(p->tid, &status);
+  free(p->stack);
+  free(p);
+  ctx->pre = NULL;
+}
+
+/** @brief [#289] A lazy layer's kt / v, allocated and zeroed on first use
+ *  (not zeroed with @a fill 0: the caller writes every byte); a no-op for
+ *  an allocated one -- zeroed then if the thread allocated it and no seed
+ *  wrote it. */
+static int layer_alloc_fill(hvx_attn_m1_ctx *ctx, uint32_t l, int fill) {
+  pre_wait(ctx, l);
+  if (fill && ctx->unfilled && ctx->unfilled[l]) {
+    memset(ctx->kt[l], 0, ctx->layer_bytes);
+    memset(ctx->v[l], 0, ctx->layer_bytes);
+    ctx->unfilled[l] = 0u;
+  }
+  return layer_alloc_raw(ctx, l, fill);
+}
+
+static int layer_alloc_raw(hvx_attn_m1_ctx *ctx, uint32_t l, int fill) {
   if (ctx->kt[l] && ctx->v[l]) {
     return AEE_SUCCESS;
   }
@@ -275,9 +415,15 @@ static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
     ctx->v[l] = NULL;
     return AEE_ENOMEMORY;
   }
-  memset(ctx->kt[l], 0, ctx->layer_bytes);
-  memset(ctx->v[l], 0, ctx->layer_bytes);
+  if (fill) {
+    memset(ctx->kt[l], 0, ctx->layer_bytes);
+    memset(ctx->v[l], 0, ctx->layer_bytes);
+  }
   return AEE_SUCCESS;
+}
+
+static int layer_alloc(hvx_attn_m1_ctx *ctx, uint32_t l) {
+  return layer_alloc_fill(ctx, l, 1);
 }
 
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
@@ -639,10 +785,15 @@ static void run_append(uint32_t n, uint32_t i, void *arg) {
   }
 }
 
+static void seed_join(hvx_attn_m1_ctx *ctx, uint32_t layer);
+
 static int kv_append_rows(hvx_attn_m1_ctx *ctx, uint32_t layer,
                           uint32_t kv_from, uint32_t n_rows,
                           const float *k_rows, const float *v_rows,
                           const uint16_t *k16, const uint16_t *v16) {
+  if (ctx && layer < ctx->n_layers) {
+    seed_join(ctx, layer); /* [C] */
+  }
   if (!ctx) {
     return AEE_EBADSTATE;
   }
@@ -736,10 +887,10 @@ static void run_seed_q8(uint32_t n, uint32_t i, void *arg) {
 int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
                         const uint8_t *k8, const uint8_t *v8,
                         size_t head_stride, size_t row_stride, const float *s_k,
-                        const float *s_v, const float *s_v_inv,
-                        const float *k_rows) {
+                        const float *s_k_inv, const float *s_v,
+                        const float *s_v_inv, const float *k_rows) {
   if (!ctx || !ctx->q8 || layer >= ctx->n_layers || ctx->kv_len[layer] != 0u ||
-      !k8 || !v8 || !s_k || !s_v || !s_v_inv) {
+      !k8 || !v8 || (!k_rows && (!s_k || !s_k_inv)) || !s_v || !s_v_inv) {
     return AEE_EBADSTATE;
   }
   if (n_rows == 0u || n_rows > ctx->max_seq) {
@@ -758,9 +909,9 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
     for (uint32_t d = 0; d < hd; ++d) {
       const size_t x = base + (size_t)h * hd + d;
-      if (!k_rows) {
-        ctx->sk[x] = s_k[h];
-        ctx->sk_inv[x] = 1.0f / s_k[h]; /* the prefill append's inverse */
+      if (!k_rows) { /* the prefill append's scale and inverse */
+        ctx->sk[x] = s_k[(size_t)h * hd + d];
+        ctx->sk_inv[x] = s_k_inv[(size_t)h * hd + d];
       }
       ctx->sv[x] = s_v[(size_t)h * hd + d];
       ctx->sv_inv[x] = s_v_inv[(size_t)h * hd + d];
@@ -776,6 +927,218 @@ int hvx_attn_m1_seed_q8(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows,
   hvx_worker_pool_run(ctx->pool, run_seed_q8, &job, job.units);
   ctx->kv_len[layer] = n_rows;
   return AEE_SUCCESS;
+}
+
+/** seed_q8_tiles over the pool: units are (kv head, 64-position tile) */
+typedef struct {
+  hvx_attn_m1_ctx *ctx;
+  uint32_t layer, n_rows, shift, units;
+  const uint8_t *k8, *v8;
+  size_t head_stride;
+} tile_seed_job;
+
+/**
+ * One tile of K: the masters' 64 positions x 128 dims (a vector a
+ * position) to Kt's 128 dims x 64 positions (a vector two dims). A byte's
+ * place is (vector, offset) = (position p, dim d) before and (d / 2,
+ * (d % 2) 64 + p) after: each vshuff byte zip of the vectors that differ in
+ * one bit of p moves that bit into the offset's lowest bit and the
+ * offset's highest bit into the vector index, so six zips over the
+ * position bits 5, 4, ..., 0 leave d's bits 6..1 in the vector index, d0
+ * on top of the offset and p below it.
+ */
+static inline void kt_tile_128(int8_t *dst, const uint8_t *src, uint32_t hd,
+                               uint32_t n) {
+  const HVX_Vector x80 = Q6_V_vsplat_R(0x80808080);
+  HVX_Vector v[TILE];
+  for (uint32_t p = 0; p < TILE; ++p) {
+    v[p] = p < n
+             ? Q6_V_vxor_VV(*(const HVX_UVector *)(src + (size_t)p * hd), x80)
+             : Q6_V_vzero();
+  }
+  for (uint32_t b = TILE / 2u; b >= 1u; b >>= 1) {
+    for (uint32_t p = 0; p < TILE; ++p) {
+      if (p & b) {
+        continue;
+      }
+      const HVX_VectorPair w = Q6_W_vshuff_VVR(v[p + b], v[p], -1);
+      v[p] = Q6_V_lo_W(w);
+      v[p + b] = Q6_V_hi_W(w);
+    }
+  }
+  for (uint32_t k = 0; k < TILE; ++k) {
+    *(HVX_Vector *)(dst + (size_t)k * 2u * TILE) = v[k];
+  }
+}
+
+/** Unit u of a tiled seed: (kv head u % n_kv, tile u / n_kv), every byte
+ *  of the tile written, zeros past n_rows. */
+static void seed_tile_unit(const tile_seed_job *job, uint32_t u) {
+  const hvx_attn_m1_ctx *ctx = job->ctx;
+  const uint32_t hd = ctx->head_dim;
+  const HVX_Vector x80 = Q6_V_vsplat_R(0x80808080);
+  const uint32_t h = u % ctx->n_kv, t = u / ctx->n_kv;
+  const uint32_t p0 = t * TILE;
+  const uint32_t np = p0 >= job->n_rows         ? 0u
+                      : job->n_rows - p0 < TILE ? job->n_rows - p0
+                                                : TILE;
+  const size_t at = h * job->head_stride + (size_t)(job->shift + p0) * hd;
+  const uint8_t *ks = np ? job->k8 + at : job->k8;
+  const uint8_t *vs = np ? job->v8 + at : job->v8;
+  int8_t *kt = kt8_head(ctx, job->layer, h) + (size_t)t * hd * TILE;
+  for (uint32_t m = 0; m < hd / VLEN; ++m) {
+    kt_tile_128(kt + (size_t)m * VLEN * TILE, ks + (size_t)m * VLEN, hd, np);
+  }
+  int8_t *vr = v8_head(ctx, job->layer, h) + (size_t)p0 * hd;
+  for (uint32_t p = 0; p < TILE; ++p) {
+    HVX_Vector *d = (HVX_Vector *)(vr + (size_t)p * hd);
+    const HVX_UVector *src = (const HVX_UVector *)(vs + (size_t)p * hd);
+    for (uint32_t m = 0; m < hd / VLEN; ++m) {
+      d[m] = p < np ? Q6_V_vxor_VV(src[m], x80) : Q6_V_vzero();
+    }
+  }
+}
+
+/** [C] A layer's seed on the background lane and what to call when done */
+struct hvx_attn_m1_seed_bg {
+  hvx_bg_job job;
+  tile_seed_job work;
+  uint8_t *done;
+  hvx_attn_m1_seed_done_fn fn;
+  void *arg;
+  uint32_t token;
+  int live;
+};
+
+static void seed_bg_unit(uint32_t n, uint32_t u, void *arg) {
+  (void)n;
+  seed_tile_unit((const tile_seed_job *)arg, u);
+}
+
+/** Waits for the layer's background seed, if any, and finishes it. */
+static void seed_join(hvx_attn_m1_ctx *ctx, uint32_t layer) {
+  struct hvx_attn_m1_seed_bg *b = ctx->seed_bg ? &ctx->seed_bg[layer] : NULL;
+  if (!b || !b->live) {
+    return;
+  }
+  hvx_worker_pool_wait_bg(ctx->pool, &b->job, UINT32_MAX);
+  free(b->done);
+  b->done = NULL;
+  b->live = 0;
+  if (b->fn) {
+    b->fn(b->arg, b->token);
+  }
+}
+
+void hvx_attn_m1_seed_reap(hvx_attn_m1_ctx *ctx, int wait) {
+  if (ctx && wait) {
+    pre_idle(ctx); /* the graph init: no allocation left in flight */
+  }
+  if (!ctx || !ctx->seed_bg) {
+    return;
+  }
+  for (uint32_t l = 0; l < ctx->n_layers; ++l) {
+    struct hvx_attn_m1_seed_bg *b = &ctx->seed_bg[l];
+    if (b->live && (wait || atomic_load_explicit(&b->job.complete,
+                                                 memory_order_acquire))) {
+      seed_join(ctx, l);
+    }
+  }
+}
+
+void hvx_attn_m1_seed_settle(hvx_attn_m1_ctx *ctx, uint32_t layer, int forget) {
+  if (!ctx || layer >= ctx->n_layers) {
+    return;
+  }
+  seed_join(ctx, layer);
+  if (forget) {
+    ctx->kv_len[layer] = 0u;
+  }
+}
+
+int hvx_attn_m1_seed_q8_tiles_async(
+  hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t n_rows, const uint8_t *k8,
+  const uint8_t *v8, size_t head_stride, uint32_t shift, const float *s_k,
+  const float *s_k_inv, const float *s_v, const float *s_v_inv,
+  hvx_attn_m1_seed_done_fn done, void *arg, uint32_t token) {
+  if (!ctx || !ctx->q8 || layer >= ctx->n_layers || ctx->kv_len[layer] != 0u ||
+      !k8 || !v8 || !s_k || !s_k_inv || !s_v || !s_v_inv ||
+      (ctx->seed_bg && ctx->seed_bg[layer].live)) {
+    return AEE_EBADSTATE;
+  }
+  const uint32_t hd = ctx->head_dim;
+  if (n_rows == 0u || n_rows > ctx->max_seq || hd % VLEN != 0u ||
+      (uint64_t)(shift + n_rows) * hd > head_stride) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (!ctx->seed_bg) {
+    ctx->seed_bg = (struct hvx_attn_m1_seed_bg *)calloc(
+      ctx->n_layers, sizeof(struct hvx_attn_m1_seed_bg));
+    if (!ctx->seed_bg) {
+      return AEE_ENOMEMORY;
+    }
+  }
+  struct hvx_attn_m1_seed_bg *b = &ctx->seed_bg[layer];
+  /* every tile of the layer: the seed's, then zeros as layer_alloc's */
+  const uint32_t units = ctx->n_kv * tiles_of(ctx->seq);
+  b->done = (uint8_t *)calloc(units, 1u);
+  pre_wait(ctx, layer);
+  const int ahead = ctx->kt[layer] && ctx->v[layer];
+  const uint64_t t0 = HAP_perf_get_qtimer_count();
+  if (!b->done || layer_alloc_fill(ctx, layer, 0) != AEE_SUCCESS) {
+    free(b->done);
+    b->done = NULL;
+    return AEE_ENOMEMORY;
+  }
+  if (ahead) {
+    ++ctx->pre_hits;
+  } else {
+    ++ctx->pre_inline;
+    ctx->inline_us +=
+      HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+  }
+  if (ctx->unfilled) {
+    ctx->unfilled[layer] = 0u; /* the units write every tile */
+  }
+  const size_t base = (size_t)layer * ctx->n_kv * hd;
+  for (size_t x = 0; x < (size_t)ctx->n_kv * hd; ++x) {
+    ctx->sk[base + x] = s_k[x];
+    ctx->sk_inv[base + x] = s_k_inv[x];
+    ctx->sv[base + x] = s_v[x];
+    ctx->sv_inv[base + x] = s_v_inv[x];
+  }
+  ctx->scaled[layer] = 1u;
+  ctx->kv_len[layer] = n_rows;
+  const tile_seed_job work = {ctx,   layer, n_rows, shift,
+                              units, k8,    v8,     head_stride};
+  b->work = work;
+  memset(&b->job, 0, sizeof(b->job));
+  b->job.func = seed_bg_unit;
+  b->job.ctx = &b->work;
+  b->job.n_units = units;
+  b->job.done = b->done;
+  b->fn = done;
+  b->arg = arg;
+  b->token = token;
+  b->live = 1;
+  hvx_worker_pool_submit_bg(ctx->pool, &b->job);
+  pre_request(ctx, layer + 1u);
+  return AEE_SUCCESS;
+}
+
+int hvx_attn_m1_seed_q8_tiles(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                              uint32_t n_rows, const uint8_t *k8,
+                              const uint8_t *v8, size_t head_stride,
+                              uint32_t shift, const float *s_k,
+                              const float *s_k_inv, const float *s_v,
+                              const float *s_v_inv) {
+  const int rc = hvx_attn_m1_seed_q8_tiles_async(
+    ctx, layer, n_rows, k8, v8, head_stride, shift, s_k, s_k_inv, s_v, s_v_inv,
+    NULL, NULL, 0u);
+  if (rc == AEE_SUCCESS) {
+    seed_join(ctx, layer);
+  }
+  return rc;
 }
 
 /** @brief One lane's phase pcycles (#146), summed over the three runs:
@@ -2323,6 +2686,8 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
       !(scale <= 65504.0f && scale >= -65504.0f)) {
     return AEE_EINVALIDFORMAT;
   }
+  seed_join(ctx, layer); /* [C] a background seed of the layer first */
+
   if (pos > ctx->kv_len[layer]) {
     return AEE_EBADSTATE;
   }
