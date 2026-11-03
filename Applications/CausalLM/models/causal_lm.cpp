@@ -1563,6 +1563,33 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // This lets performance runs verify the normal DSP token-id path as well.
   const char *generated_ids_path = std::getenv("NNTR_GENERATED_IDS");
   std::vector<unsigned int> generated_ids;
+  // Diagnostic replay keeps token history fixed while recording the model's
+  // actual predictions through NNTR_GENERATED_IDS. Normal generation is
+  // unchanged.
+  std::vector<unsigned int> replay_inputs;
+  if (const char *path = std::getenv("NNTR_FORCED_DECODE_INPUTS")) {
+    NNTR_THROW_IF(BATCH_SIZE != 1 || do_sample || SKIP_PREFILL ||
+                    REPETITION_PENALTY != 1.0f,
+                  std::invalid_argument)
+      << "Decode replay requires batch-one greedy generation without skip or "
+         "penalty";
+    std::ifstream file(path);
+    unsigned int id;
+    while (file >> id) {
+      NNTR_THROW_IF(id >= NUM_VOCAB, std::invalid_argument)
+        << "Decode replay token is outside the vocabulary";
+      replay_inputs.push_back(id);
+    }
+    NNTR_THROW_IF(!file.eof() || replay_inputs.empty(), std::invalid_argument)
+      << "Cannot read decode replay inputs";
+  }
+  auto feedback_id = [&](size_t index, unsigned int prediction) {
+    if (replay_inputs.empty())
+      return prediction;
+    NNTR_THROW_IF(index >= replay_inputs.size(), std::out_of_range)
+      << "Decode replay inputs exhausted";
+    return replay_inputs[index];
+  };
 
   /**
    * INPUT PREPARATION
@@ -2273,7 +2300,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Update generated token by prefill as an input
   for (unsigned int b = 0; b < BATCH_SIZE; ++b)
     input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
-      static_cast<float>(id_list[b]);
+      static_cast<float>(feedback_id(0, id_list[b]));
 
 #if defined(ENABLE_OPENCL)
   /** The GPU footprint peaks somewhere between "the graph is built" and "the
@@ -2384,8 +2411,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // token_generation_idx always starts at input_len + 1, so we are
     // always in the auto-regressive generation phase here.
     for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
-        static_cast<float>(ids_list[b]);
+      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] = static_cast<float>(
+        feedback_id(token_generation_idx - generation_begin + 1u, ids_list[b]));
     }
     if (generated_ids_path)
       generated_ids.insert(generated_ids.end(), ids_list.begin(),

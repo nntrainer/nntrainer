@@ -11,8 +11,10 @@
 #include <cmath>
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <htp_backend/htp_runtime_config.h>
 #include <istream>
 #include <memory>
@@ -680,6 +682,31 @@ bool HtpAttentionState::try_quantized_attention(
     (config_.local_window_size == 0 || config_.local_window_size >= cache_to)
       ? 0u
       : static_cast<unsigned int>(config_.local_window_size);
+  // Optional diagnostic records retain the exact FP32 scales after a successful
+  // attention call. Each record has ten u32 fields, the layer name, then K/V.
+  auto dump_scales = [&]() {
+    const char *path = std::getenv("NNTR_HTP_KV_SCALE_DUMP");
+    if (!path || !*path || !use_q2)
+      return;
+    const uint32_t header[] = {0x4B565331u,
+                               1u,
+                               static_cast<uint32_t>(q2_name_.size()),
+                               config_.cache_base,
+                               cache_from,
+                               cache_to,
+                               static_cast<uint32_t>(config_.num_heads_KV),
+                               static_cast<uint32_t>(config_.head_dim),
+                               static_cast<uint32_t>(q2_scale_k.size()),
+                               static_cast<uint32_t>(q2_scale_v.size())};
+    std::ofstream file(path, std::ios::binary | std::ios::app);
+    file.write(reinterpret_cast<const char *>(header), sizeof(header));
+    file.write(q2_name_.data(), q2_name_.size());
+    for (const auto *scales : {&q2_scale_k, &q2_scale_v})
+      file.write(reinterpret_cast<const char *>(scales->data()),
+                 scales->size() * sizeof(float));
+    if (!file)
+      throw std::runtime_error("Cannot write HTP KV scale diagnostics");
+  };
   if (use_q2) {
     // A loaded KV cache brought the calibration of the run that saved it
     // (loadQ2Calibration): it wins over calibrating on this step's rows.
@@ -728,6 +755,7 @@ bool HtpAttentionState::try_quantized_attention(
                   "the accelerator (row-blocked, fixed scales calibrated "
                   "there, u16 context handed to the o-proj)");
         }
+        dump_scales();
         return true;
       }
     }
@@ -897,6 +925,7 @@ bool HtpAttentionState::try_quantized_attention(
                 "accelerator (row-blocked, fixed scales, u16 context handed "
                 "to the o-proj)");
       }
+      dump_scales();
       return true;
     }
     // Only the host conversion path needs these buffers.
@@ -977,6 +1006,7 @@ bool HtpAttentionState::try_quantized_attention(
   }
   synced = cache_to;
   io.commit(attention_output_step);
+  dump_scales();
   if (!accel_logged_) {
     accel_logged_ = true;
     ml_logi("mha_core: attention over the %s quantized KV cache on the "
