@@ -303,7 +303,7 @@ does not establish a new result for the rotated Gemma4 checkpoint.
 Affine kernel validation covers M=1/2/3/4/64/65/129 at small and full Gemma
 shapes against an independent int4 reference on S26 Ultra. Whole-model
 affine generation completed with matching IDs across profiled and ordinary
-runs in the dedicated [decode validation](validation/gemma4-tl2-affine-decode-s26-20261015.json).
+runs (S26 Ultra, 2026-10-15).
 Those 2048-input measurements are a separate workload, not samples for
 the current 1024-input median.
 

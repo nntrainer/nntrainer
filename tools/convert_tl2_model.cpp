@@ -2,7 +2,7 @@
 /** @file convert_tl2_model.cpp
  * @brief Replace QS2 experts with native-only TL2 in a positional model.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "htp_backend/htp_tl2_native_packing.h"
 #include "htp_prepared_tl2.h"

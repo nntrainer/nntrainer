@@ -3,7 +3,7 @@
  * @file hexkl_wh_affine.h
  * @brief Exact affine WH activation sums and accumulator correction.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #ifndef NNTR_HEXKL_WH_AFFINE_H
 #define NNTR_HEXKL_WH_AFFINE_H

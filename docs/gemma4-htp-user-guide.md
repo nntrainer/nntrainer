@@ -299,9 +299,9 @@ Only one HTP model can be loaded per process, the public API does not expose
 KV snapshot or resume, and each generation starts a fresh prompt: the pack
 holds 1,280 positions and truncates a longer prompt's tail silently
 (nntrainer #4474), so for the HTP presets the app sends only the newest
-message of the conversation, not the transcript. The native CLI has a separate
-[KV snapshot workflow](gemma4-htp-kv-cache-s25u.md); its historical S25
-measurements are distinct from current S26 throughput results.
+message of the conversation, not the transcript. The native CLI saves and
+loads a KV snapshot through `system_prompt.kvcache` in `nntr_config.json`
+(that configuration keeps the fp16 KV cache).
 
 ## 7. Run from the command line
 

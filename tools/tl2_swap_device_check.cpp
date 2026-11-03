@@ -3,9 +3,9 @@
  * @brief Diagnostic native TL2 expert registration, M=1 and arena swap.
  * No arguments: small shape; "real": Gemma shape; "real fast": also
  * apply the model's 0xcf03e1 MoE options. Device validation is recorded in
- * docs/gemma4-tl2-affine-handoff.md.
+ * docs/gemma4-htp-tl2-guide.md.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "htp_tl2_codec.h"
 #include <chrono>

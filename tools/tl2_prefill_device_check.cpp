@@ -3,7 +3,7 @@
  * @brief Native TL2 prefill against independent int4 experts on the DSP.
  * Uses only M>1 calls; does not enter the model's token driver.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "htp_tl2_codec.h"
 #include <htp_rpcmem.h>

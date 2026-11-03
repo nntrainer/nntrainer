@@ -2,7 +2,7 @@
 /** @file tl2_prefill_host_check.c
  * @brief Native-only TL2 prefill versus independent int4 WH weights.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #define main nntr_existing_moe_check_main
 #include "moe_layer_host_check.c"

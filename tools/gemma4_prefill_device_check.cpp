@@ -5,7 +5,7 @@
  * The base must contain gemma4-26b-a4b-htp-w4a32/ with the desired config.
  * Use skip_prefill=false to include all prompt tokens and the WH head.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "quick_dot_ai_api.h"
 #include <atomic>

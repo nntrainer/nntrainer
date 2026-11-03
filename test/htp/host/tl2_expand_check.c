@@ -3,7 +3,7 @@
  * @brief Independent TL2 to WH layout, padding and magnitude checks.
  * Also runs on the Hexagon simulator to exercise the actual HVX branch.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "hvx_gemv_u8tl2.h"
 #include <assert.h>

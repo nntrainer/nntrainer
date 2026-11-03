@@ -44,7 +44,7 @@ This preset supports text, batch one and one active HTP handle per process.
 Each generation starts an independent prompt while retaining the loaded
 weights. Native Chat does not accumulate conversation history for this
 preset. The public API does not expose KV snapshot/resume; the native CLI
-has a separate [snapshot workflow](gemma4-htp-kv-cache-s25u.md).
+saves and loads one through `system_prompt.kvcache` in `nntr_config.json`.
 Concurrent HTP handles are not supported.
 Cancellation stops at a token boundary. Unload waits for active work and
 releases the DSP session, worker pools and registered weights.

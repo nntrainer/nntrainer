@@ -2,7 +2,7 @@
 /** @file wh_affine_vector_check.c
  * @brief Exact AH row sums and affine accumulator correction on host / HVX.
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * @bug See docs/gemma4-tl2-affine-handoff.md for validation limits.
+ * @bug See docs/gemma4-htp-tl2-guide.md for validation limits.
  */
 #include "hexkl_wh_affine.h"
 #include <assert.h>

@@ -340,7 +340,7 @@ def stage0(source, qs2, config, ckpt, plan, total):
 
 
 def build_tl2_tool(repo, build_dir):
-    """tools/convert_tl2_model with the scalar TL2 kernel (gemma4-tl2-affine-handoff.md)."""
+    """tools/convert_tl2_model with the scalar TL2 kernel (gemma4-htp-tl2-guide.md)."""
     tool = build_dir / "convert_tl2_model"
     if tool.is_file():
         return tool
