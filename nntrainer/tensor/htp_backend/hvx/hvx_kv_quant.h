@@ -39,9 +39,10 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
 void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
                         int8_t *q, float *scale);
 
-/** @brief K row at a given scale: q = rne(x * inv) clamped, colsum. */
+/** @brief K row at a given scale per dim: q[d] = rne(x[d] * inv[d])
+ *         clamped, colsum. @a inv as hvx_kv_quant_v_row_fixed's. */
 void hvx_kv_quant_k_row_fixed(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                              float inv, int8_t *q, int32_t *colsum);
+                              const float *inv, int8_t *q, int32_t *colsum);
 
 /** @brief V row at a given scale per dim: q[d] = rne(x[d] * inv[d]) clamped.
  *         @a inv is hd f32, 128-byte aligned or not (loaded unaligned). */

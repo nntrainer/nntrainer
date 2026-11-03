@@ -782,11 +782,11 @@ done
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
-  -pthread -include malloc.h \
+  -pthread -include malloc.h -DHEXKL_KV_Q_FILL_HVX \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-  -o "$OUT/attn_m1_host_check" \
+  -I "$BACKEND/hmx" -o "$OUT/attn_m1_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
-  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
 
 "$OUT/attn_m1_host_check"
 # The host default leaves the architecture-specific options off. Exercise
@@ -799,19 +799,32 @@ done
   -pthread -include malloc.h \
   -DNNTR_ATTN_Q8_HEAD_PREP=1 -DNNTR_ATTN_Q8_HEAD_PIPELINE=1 \
   -DNNTR_ATTN_Q8_QK_PAIR=1 -DNNTR_ATTN_Q8_GQA8_REUSE=1 \
-  -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 \
+  -DNNTR_ATTN_Q8_NARROW_PREFETCH=1 -DHEXKL_KV_Q_FILL_HVX \
   -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-  -o "$OUT/attn_m1_v81_host_check" \
+  -I "$BACKEND/hmx" -o "$OUT/attn_m1_v81_host_check" \
   "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
-  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
 
 "$OUT/attn_m1_v81_host_check"
 # [plan 201 S4] Two mutants of the kernel at Gemma 4's shapes, each of which
 # must fail it: the sliding window one position short (lo of L + 1), and V
 # taken from the k row -- attention_k_eq_v shares the projection only, the
-# cached K (k_norm with gamma, RoPE) and V (v_norm, no gamma) differ.
+# cached K (k_norm with gamma, RoPE) and V (v_norm, no gamma) differ. Three
+# of seed_q8_tiles (ATTN M1 SEED Q8 TILES OK): the zips in the wrong order,
+# the window shift dropped, V's rows past the seed left unzeroed; one of
+# the background seed (ATTN M1 SEED Q8 ASYNC OK): its done callback never
+# called, so its prefill cache would never be released; and two of the
+# allocation thread (ATTN M1 SEED PREALLOC OK): the next layer never
+# queued to it, and a layer it allocated left unzeroed when no seed writes
+# it.
 for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L + 1u, window);/' \
-  's/      hvx_hf_round_row(v + i);/      hvx_hf_round_row(k + i);/'; do
+  's/      hvx_hf_round_row(v + i);/      hvx_hf_round_row(k + i);/' \
+  's/  for (uint32_t b = TILE \/ 2u; b >= 1u; b >>= 1) {/  for (uint32_t b = 1u; b < TILE; b <<= 1) {/' \
+  's/  const size_t at = h \* job->head_stride + (size_t)(job->shift + p0) \* hd;/  const size_t at = h * job->head_stride + (size_t)p0 * hd;/' \
+  's/    b->fn(b->arg, b->token);/    (void)b;/' \
+  's/      d\[m\] = p < np ? Q6_V_vxor_VV(src\[m\], x80) : Q6_V_vzero();/      d[m] = Q6_V_vxor_VV(src[m], x80);/' \
+  's/  pre_request(ctx, layer + 1u);/  (void)0;/' \
+  's/  if (fill \&\& ctx->unfilled \&\& ctx->unfilled\[l\]) {/  if (0) {/'; do
   sed "$mut" "$BACKEND/hvx/hvx_attn_m1_f32.c" > "$OUT/hvx_attn_m1_mut.c"
   if cmp -s "$OUT/hvx_attn_m1_mut.c" "$BACKEND/hvx/hvx_attn_m1_f32.c"; then
     echo "ATTN M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -819,14 +832,64 @@ for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L 
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
-    -o "$OUT/attn_m1_mutant" \
+    -I "$BACKEND/hmx" -o "$OUT/attn_m1_mutant" \
     "$HERE/attn_m1_host_check.c" "$OUT/hvx_attn_m1_mut.c" \
-    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+    "$BACKEND/hvx/hvx_worker_pool.c" "$BACKEND/hmx/hexkl_kv_q.c" -lm
   if "$OUT/attn_m1_mutant" > "$OUT/attn_m1_mutant.log"; then
     echo "ATTN M1 MUTANT PASSED (the check is blind): $mut"; exit 1
   fi
   echo "ATTN M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL: gemma' "$OUT/attn_m1_mutant.log") Gemma lines failed)"
 done
+
+# [C] Four mutants of the HVX fill (hexkl_kv_q.c fill_tile_unit), each of
+# which must fail ATTN M1 FILL HVX: the last byte deal (position bit 5)
+# skipped, the column sum's bias dropped, the two dims of a K vector given
+# each other's ratio, and the rescale truncating instead of rounding.
+for mut in 's/    for (uint32_t b = 1u; b < 64u; b <<= 1) {/    for (uint32_t b = 1u; b < 32u; b <<= 1) {/' \
+  's/    cs\[p\] = -HEXKL_KV_Q_BIAS \* (int32_t)hd;/    cs[p] = 0;/' \
+  's/        const HVX_Vector rw\[4\] = {a, a, b, b};/        const HVX_Vector rw[4] = {b, b, a, a};/' \
+  's/    x = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(x, half), 15);/    x = Q6_Vw_vasr_VwR(x, 15);/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_kv_q.c" > "$OUT/hexkl_kv_q_mut.c"
+  if cmp -s "$OUT/hexkl_kv_q_mut.c" "$BACKEND/hmx/hexkl_kv_q.c"; then
+    echo "FILL HVX MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -pthread -include malloc.h -DHEXKL_KV_Q_FILL_HVX \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -I "$BACKEND/hmx" -o "$OUT/attn_m1_fill_mutant" \
+    "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
+    "$BACKEND/hvx/hvx_worker_pool.c" "$OUT/hexkl_kv_q_mut.c" -lm
+  if "$OUT/attn_m1_fill_mutant" > "$OUT/attn_m1_fill_mutant.log"; then
+    echo "FILL HVX MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "FILL HVX MUTANT CAUGHT: $mut ($(grep -c '^FAIL: fill hvx' "$OUT/attn_m1_fill_mutant.log") cells failed)"
+done
+
+# The q2 attention's DSP calibration lanes (nntr_hvx_attn_q.c q2c_worker,
+# q2c_worker_kd), extracted from the source and run on hvx_emu against a
+# scalar reference, lane by lane, at Gemma 4's shapes and with fewer rows
+# than lanes (Q2C CALIB WORKERS OK).
+python3 "$HERE/q2c_workers_extract.py" "$DSP/nntr_hvx_attn_q.c" \
+  "$OUT/q2c_workers.inc"
+"$cc" -std=gnu11 -O2 -fno-strict-aliasing -Wall -Wextra \
+  -Wno-unused-parameter -ffp-contract=off -include malloc.h \
+  -I "$OUT" -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." \
+  -I "$BACKEND/hvx" -o "$OUT/q2c_calib_check" "$HERE/q2c_calib_check.c" -lm
+"$OUT/q2c_calib_check"
+
+# The q2 kernel's Q prep with K's scale per dim (hexkl_attn_q2.c
+# stage_qprep_kd), extracted and run on hvx_emu: the f32 Q folded and
+# quantized in VTCM against the u16 path fed with the host's folded
+# quantization, tile bytes equal (Q2 QPREP KD OK).
+python3 "$HERE/q2c_workers_extract.py" "$BACKEND/hmx/hexkl_attn_q2.c" \
+  "$OUT/q2_qprep.inc" "item_t;" "head_t;" "seg_t;" "ctx;" now_us \
+  q_tiles_lo q_tiles_hi q_stage q_zp_of q_f32_to_u16 stage_qprep_kd
+"$cc" -std=gnu11 -O2 -fno-strict-aliasing -Wall -Wextra \
+  -Wno-unused-parameter -ffp-contract=off -include malloc.h \
+  -I "$OUT" -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." \
+  -I "$BACKEND/hvx" -I "$BACKEND/hmx" -o "$OUT/q2_qprep_check" \
+  "$HERE/q2_qprep_check.c" -lm
+"$OUT/q2_qprep_check"
 
 # weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
 # over the real weight registry, the arena plain aligned memory. The header

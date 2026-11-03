@@ -66,6 +66,7 @@
 
 #include "attn_m1_cases.h"
 #include "attn_m1_det.h"
+#include "hexkl_kv_q.h"
 #include "hvx_attn_m1_f32.h"
 #include "hvx_attn_m1_hf.h"
 #include "hvx_convert.h"
@@ -1506,6 +1507,11 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
           *v8 = (uint8_t *)malloc(n_kv * hs);
   float s_k[2] = {0.03f, 0.5f}, s_v[2 * 256], s_vi[2 * 256];
+  float s_kd[2 * 256], s_kdi[2 * 256]; /* a head scale over its dims */
+  for (uint32_t i = 0; i < n_kv * hd; ++i) {
+    s_kd[i] = s_k[i / hd];
+    s_kdi[i] = 1.0f / s_k[i / hd];
+  }
   for (size_t i = 0; i < n_kv * hs; ++i) {
     k8[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
     v8[i] = (uint8_t)((i * 53u + 7u) & 0xFFu);
@@ -1514,8 +1520,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
     s_v[i] = 0.01f + 0.001f * (float)i;
     s_vi[i] = 1.0f / s_v[i];
   }
-  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
-          AEE_SUCCESS,
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_kd, s_kdi, s_v, s_vi,
+                            NULL) == AEE_SUCCESS,
         "seed_q8: seed");
   CHECK(c->kt[1] && !c->kt[0] && !c->kt[2] && c->kv_len[1] == L && c->scaled[1],
         "seed_q8: one layer allocated and filled");
@@ -1539,8 +1545,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
     }
   }
   CHECK(bad == 0, "seed_q8: %d bytes or scales moved", bad);
-  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_k, s_v, s_vi, NULL) ==
-          AEE_EBADSTATE,
+  CHECK(hvx_attn_m1_seed_q8(c, 1u, L, k8, v8, hs, hd, s_kd, s_kdi, s_v, s_vi,
+                            NULL) == AEE_EBADSTATE,
         "seed_q8: a second seed of a layer is refused");
   /* K from f32 rows: the same K bytes and scales as kv_append's */
   float *kf = (float *)malloc((size_t)L * n_kv * hd * sizeof(float));
@@ -1556,8 +1562,8 @@ static void check_seed_q8(hvx_worker_pool *pool) {
                        max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
   CHECK(a && b, "seed_q8: create the K pair");
   if (a && b) {
-    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, s_k, s_v, s_vi, kf) ==
-            AEE_SUCCESS,
+    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, NULL, NULL, s_v, s_vi,
+                              kf) == AEE_SUCCESS,
           "seed_q8: seed with K rows");
     CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, kf, kf) == AEE_SUCCESS,
           "seed_q8: kv_append reference");
@@ -1580,6 +1586,647 @@ static void check_seed_q8(hvx_worker_pool *pool) {
   hvx_attn_m1_free(c);
   if (bad == 0) {
     printf("ATTN M1 SEED Q8 OK\n");
+  }
+}
+
+/** [C] The background seed (seed_q8_tiles_async): reaped, it leaves the
+ *  layer seed_q8_tiles leaves, bit for bit, and calls its done callback
+ *  once with its token; a forward of the layer before any reap joins the
+ *  seed first and gives the synchronously seeded layer's output; a free
+ *  with a seed in flight finishes it. A second seed of a live layer is
+ *  refused. Gemma 4's sliding shape, every pool. */
+static int g_done_calls;
+static uint32_t g_done_token;
+static void count_done(void *arg, uint32_t token) {
+  ++*(int *)arg;
+  g_done_token = token;
+}
+
+static void check_seed_q8_tiles_async(hvx_worker_pool *const *pools) {
+  const uint32_t n_kv = 8u, hd = 256u, max_seq = 1152u, src = 2048u;
+  const uint32_t shift = 66u, L = 1024u;
+  const size_t hs = (size_t)src * hd, n = (size_t)n_kv * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  float *q = (float *)malloc(2u * n * sizeof(float));
+  float *kv = (float *)malloc(2u * n * sizeof(float));
+  float *ya = (float *)malloc(2u * n * sizeof(float));
+  float *yb = (float *)malloc(2u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(i * 2654435761u >> 11);
+    v8[i] = (uint8_t)(i * 40503u >> 5);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.002f * (float)(1u + i % 499u);
+  for (size_t i = 0; i < 2u * n; ++i) {
+    q[i] = 0.01f * (float)((int)(i % 201u) - 100);
+    kv[i] = 0.02f * (float)((int)(i % 97u) - 48);
+  }
+  int bad = 0;
+  for (int pi = 0; pi < 3; ++pi) {
+    int err = 0;
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      2u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      2u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    CHECK(a && b, "seed async: create");
+    if (!a || !b) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(b);
+      continue;
+    }
+    g_done_calls = 0;
+    int calls = 0;
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 41u) == AEE_SUCCESS,
+          "seed async: submit");
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 42u) == AEE_EBADSTATE,
+          "seed async: a second seed of a live layer refused");
+    CHECK(hvx_attn_m1_seed_q8_tiles(b, 0u, L, k8, v8, hs, shift, sc, sc + n,
+                                    sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+          "seed async: the synchronous reference");
+    hvx_attn_m1_seed_reap(a, 1);
+    int cb = calls != 1 || g_done_token != 41u ||
+             memcmp(a->kt[0], b->kt[0], a->layer_bytes) != 0 ||
+             memcmp(a->v[0], b->v[0], a->layer_bytes) != 0 ||
+             a->kv_len[0] != b->kv_len[0];
+    CHECK(cb == 0, "seed async pool %d: reaped layer differs (calls %d)", pi,
+          calls);
+    bad += cb;
+    /* layer 1: a forward before any reap joins the seed */
+    calls = 0;
+    CHECK(hvx_attn_m1_seed_q8_tiles_async(
+            a, 1u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n, sc + 3u * n,
+            count_done, &calls, 43u) == AEE_SUCCESS,
+          "seed async: submit layer 1");
+    CHECK(hvx_attn_m1_seed_q8_tiles(b, 1u, L, k8, v8, hs, shift, sc, sc + n,
+                                    sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+          "seed async: reference layer 1");
+    const int ra =
+      hvx_attn_m1_forward(a, 1u, L, 0u, 0.0625f, q, kv, kv + n, ya, NULL);
+    const int rb =
+      hvx_attn_m1_forward(b, 1u, L, 0u, 0.0625f, q, kv, kv + n, yb, NULL);
+    cb = ra != AEE_SUCCESS || rb != AEE_SUCCESS || calls != 1 ||
+         memcmp(ya, yb, 2u * n * sizeof(float)) != 0;
+    CHECK(cb == 0,
+          "seed async pool %d: forward over an unjoined seed differs (rc %d "
+          "%d calls %d)",
+          pi, ra, rb, calls);
+    bad += cb;
+    hvx_attn_m1_free(b);
+    /* a free with a seed in flight finishes it */
+    calls = 0;
+    hvx_attn_m1_ctx *c = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[pi],
+      &err);
+    CHECK(c && hvx_attn_m1_seed_q8_tiles_async(
+                 c, 0u, L, k8, v8, hs, shift, sc, sc + n, sc + 2u * n,
+                 sc + 3u * n, count_done, &calls, 44u) == AEE_SUCCESS,
+          "seed async: submit then free");
+    hvx_attn_m1_free(c);
+    CHECK(calls == 1, "seed async pool %d: free left the seed (%d)", pi, calls);
+    bad += calls != 1;
+    hvx_attn_m1_free(a);
+  }
+  free(k8);
+  free(v8);
+  free(sc);
+  free(q);
+  free(kv);
+  free(ya);
+  free(yb);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 ASYNC OK\n");
+  }
+}
+
+/** [C] The int8 KV kept in one place: masters seeded into a decode layer
+ *  (hvx_attn_m1_seed_q8_tiles) and filled back into a fixed-scale int8
+ *  cache (hexkl_kv_q_fill_q8, what a later prefill call's attention reads)
+ *  give the masters' bytes back, with their column sums; a layer seeded
+ *  again after hvx_attn_m1_seed_settle(forget) takes the longer seed. */
+static void check_fill_roundtrip(hvx_worker_pool *pool) {
+  const uint32_t n_kv = 2u, hd = 256u, max_seq = 256u, L = 130u, M = 160u;
+  const size_t n = (size_t)n_kv * hd, hs = (size_t)M * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(1u + (i * 2654435761u >> 13) % 255u); /* q in -127..127 */
+    v8[i] = (uint8_t)(1u + (i * 40503u >> 7) % 255u);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.003f * (float)(1u + i % 251u);
+  int err = 0, bad = 0;
+  hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+    1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool, &err);
+  CHECK(a != NULL, "fill roundtrip: create");
+  if (!a) {
+    free(k8);
+    free(v8);
+    free(sc);
+    return;
+  }
+  /* a first call's 64 rows, then the layer again with all 130 */
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, 64u, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+        "fill roundtrip: first seed");
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_EBADSTATE,
+        "fill roundtrip: a seeded layer refuses a plain second seed");
+  hvx_attn_m1_seed_settle(a, 0u, 1);
+  CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                  sc + 2u * n, sc + 3u * n) == AEE_SUCCESS,
+        "fill roundtrip: reseed after settle");
+  hexkl_kv_q_table *tbl = (hexkl_kv_q_table *)calloc(1, sizeof(*tbl));
+  uint32_t h = 0;
+  CHECK(tbl && hexkl_kv_q_register(tbl, HEXKL_KV_Q8, M, n_kv, hd, &h) == 0 &&
+          hexkl_kv_q_set_fixed_scales_kd(tbl, h, sc, sc + 2u * n) == 0,
+        "fill roundtrip: register");
+  const hexkl_kv_q *kv = tbl ? hexkl_kv_q_get(tbl, h) : NULL;
+  if (kv && hexkl_kv_q_fill_q8(tbl, h, 0u, L, (const int8_t *)a->kt[0],
+                               (const int8_t *)a->v[0], (size_t)hd * a->seq,
+                               NULL, NULL, NULL, NULL) == 0) {
+    for (uint32_t r = 0; r < L; ++r)
+      for (uint32_t k = 0; k < n_kv; ++k) {
+        int32_t cs = 0;
+        for (uint32_t d = 0; d < hd; ++d) {
+          const uint8_t mk = k8[k * hs + (size_t)r * hd + d];
+          cs += (int32_t)mk - 128;
+          bad += kv->kt4[hexkl_kv_q_kt4_index(kv, k, r, d)] != mk;
+          bad += kv->v4[hexkl_kv_q_v4_index(kv, k, r, d)] !=
+                 v8[k * hs + (size_t)r * hd + d];
+        }
+        bad += kv->colsum_k[hexkl_kv_q_sk_index(kv, k, r)] != cs;
+      }
+  } else {
+    bad = 1;
+  }
+  CHECK(bad == 0, "fill roundtrip: %d bytes differ from the masters", bad);
+  if (tbl)
+    hexkl_kv_q_release(tbl, h);
+  free(tbl);
+  hvx_attn_m1_free(a);
+  free(k8);
+  free(v8);
+  free(sc);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 FILL ROUNDTRIP OK\n");
+  }
+}
+
+/** [C] The HVX fill (hexkl_kv_q.c fill_tile_unit, built here with
+ *  HEXKL_KV_Q_FILL_HVX) against the row-by-row fill: Gemma 4's head
+ *  dims, a range starting and ending inside 64-row tiles, with and without
+ *  the rescale ratios (1.0 among them). Masters, column sums and scales
+ *  byte for byte, and the rows outside the range left as they were.
+ *  (ATTN M1 FILL HVX OK) */
+static void check_fill_hvx(hvx_worker_pool *pool) {
+  static const uint32_t hds[2] = {256u, 512u};
+  int bad = 0, cells = 0;
+  for (uint32_t hi = 0; hi < 2u; ++hi) {
+    const uint32_t hd = hds[hi], n_kv = hd == 512u ? 2u : 3u, seq = 320u;
+    const size_t n = (size_t)n_kv * hd, hs = (size_t)seq * hd;
+    int8_t *kt8 = (int8_t *)malloc(n_kv * hs),
+           *v8 = (int8_t *)malloc(n_kv * hs);
+    float *kr = (float *)malloc(n * sizeof(float)),
+          *vr = (float *)malloc(n * sizeof(float));
+    if (!kt8 || !v8 || !kr || !vr) {
+      CHECK(0, "fill hvx: alloc");
+      free(kt8);
+      free(v8);
+      free(kr);
+      free(vr);
+      return;
+    }
+    uint32_t lcg = 0x5eedu + hd;
+    for (size_t i = 0; i < n_kv * hs; ++i) {
+      lcg = lcg * 1664525u + 1013904223u;
+      kt8[i] = (int8_t)((int)((lcg >> 24) % 255u) - 127);
+      lcg = lcg * 1664525u + 1013904223u;
+      v8[i] = (int8_t)((int)((lcg >> 24) % 255u) - 127);
+    }
+    for (size_t i = 0; i < n; ++i) {
+      kr[i] = i % 7u == 0u ? 1.0f : 0.3f + 0.1f * (float)(i % 7u);
+      vr[i] = i % 5u == 0u ? 1.0f : 0.45f + 0.1f * (float)(i % 5u);
+    }
+    static const uint32_t ranges[3][2] = {{0u, 64u}, {37u, 230u}, {5u, 1u}};
+    for (uint32_t ri = 0; ri < 3u; ++ri)
+      for (int with_ratio = 0; with_ratio < 2; ++with_ratio) {
+        const uint32_t row0 = ranges[ri][0], rows = ranges[ri][1];
+        hexkl_kv_q_table *ta = (hexkl_kv_q_table *)calloc(1, sizeof(*ta));
+        hexkl_kv_q_table *tb = (hexkl_kv_q_table *)calloc(1, sizeof(*tb));
+        uint32_t ha = 0, hb = 0;
+        float *sk = (float *)malloc(n * sizeof(float)),
+              *sv = (float *)malloc(n * sizeof(float));
+        for (size_t i = 0; sk && sv && i < n; ++i) {
+          sk[i] = 0.002f * (float)(1u + i % 97u);
+          sv[i] = 0.003f * (float)(1u + i % 89u);
+        }
+        if (!ta || !tb || !sk || !sv ||
+            hexkl_kv_q_register(ta, HEXKL_KV_Q8, seq, n_kv, hd, &ha) != 0 ||
+            hexkl_kv_q_register(tb, HEXKL_KV_Q8, seq, n_kv, hd, &hb) != 0 ||
+            hexkl_kv_q_set_fixed_scales_kd(ta, ha, sk, sv) != 0 ||
+            hexkl_kv_q_set_fixed_scales_kd(tb, hb, sk, sv) != 0) {
+          CHECK(0, "fill hvx: register hd %u", (unsigned)hd);
+          bad = 1;
+        } else {
+          const hexkl_kv_q *a = hexkl_kv_q_get(ta, ha),
+                           *b = hexkl_kv_q_get(tb, hb);
+          const int ra = hexkl_kv_q_fill_q8(ta, ha, row0, rows, kt8, v8, hs,
+                                            with_ratio ? kr : NULL,
+                                            with_ratio ? vr : NULL, NULL, pool);
+          const int rb = hexkl_kv_q_fill_q8_scalar(tb, hb, row0, rows, kt8, v8,
+                                                   hs, with_ratio ? kr : NULL,
+                                                   with_ratio ? vr : NULL);
+          int diff = ra != 0 || rb != 0;
+          for (uint32_t k = 0; !diff && k < n_kv; ++k)
+            for (uint32_t r = 0; r < seq; ++r) {
+              for (uint32_t d = 0; d < hd; ++d) {
+                diff += a->kt4[hexkl_kv_q_kt4_index(a, k, r, d)] !=
+                        b->kt4[hexkl_kv_q_kt4_index(b, k, r, d)];
+                diff += a->v4[hexkl_kv_q_v4_index(a, k, r, d)] !=
+                        b->v4[hexkl_kv_q_v4_index(b, k, r, d)];
+              }
+              const size_t s = hexkl_kv_q_sk_index(a, k, r);
+              diff += a->colsum_k[s] != b->colsum_k[s];
+              diff += a->s_k[s] != b->s_k[s];
+              diff += a->s_v[hexkl_kv_q_sv_index(a, k, r)] !=
+                      b->s_v[hexkl_kv_q_sv_index(b, k, r)];
+            }
+          if (diff) {
+            printf("FAIL: fill hvx hd=%u rows [%u, %u) ratio=%d: %d values "
+                   "differ from the row-by-row fill\n",
+                   (unsigned)hd, (unsigned)row0, (unsigned)(row0 + rows),
+                   with_ratio, diff);
+            g_fail = 1;
+            bad = 1;
+          }
+          ++cells;
+        }
+        if (ta && ha)
+          hexkl_kv_q_release(ta, ha);
+        if (tb && hb)
+          hexkl_kv_q_release(tb, hb);
+        free(ta);
+        free(tb);
+        free(sk);
+        free(sv);
+      }
+    free(kt8);
+    free(v8);
+    free(kr);
+    free(vr);
+  }
+  if (bad == 0) {
+    printf("ATTN M1 FILL HVX OK: %d cells (head_dim 256 / 512, rows inside "
+           "tiles, Q15 ratios) equal the row-by-row fill\n",
+           cells);
+  }
+}
+
+/** [C] The allocation thread one layer ahead of the seeds: each seed after
+ *  a ctx's first finds its layer allocated (pre_hits), the layers equal
+ *  the synchronous seed's bytes, and a layer allocated ahead but never
+ *  seeded is zero-filled at its first append (unfilled), as a lazy layer
+ *  is: its forward equals a fresh ctx's. A free with an allocation in
+ *  flight stops the thread. */
+static void check_seed_prealloc(hvx_worker_pool *const *pools) {
+  const uint32_t n_kv = 2u, hd = 256u, max_seq = 256u, L = 130u;
+  const size_t hs = (size_t)max_seq * hd, n = (size_t)n_kv * hd;
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+          *v8 = (uint8_t *)malloc(n_kv * hs);
+  float *sc = (float *)malloc(4u * n * sizeof(float));
+  float *q = (float *)malloc(2u * n * sizeof(float));
+  float *kv = (float *)malloc(2u * n * sizeof(float));
+  float *ya = (float *)malloc(2u * n * sizeof(float));
+  float *yb = (float *)malloc(2u * n * sizeof(float));
+  for (size_t i = 0; i < n_kv * hs; ++i) {
+    k8[i] = (uint8_t)(i * 2654435761u >> 13);
+    v8[i] = (uint8_t)(i * 40503u >> 7);
+  }
+  for (size_t i = 0; i < 4u * n; ++i)
+    sc[i] = 0.003f * (float)(1u + i % 251u);
+  for (size_t i = 0; i < 2u * n; ++i) {
+    q[i] = 0.01f * (float)((int)(i % 201u) - 100);
+    kv[i] = 0.02f * (float)((int)(i % 97u) - 48);
+  }
+  const uint32_t flags = max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY;
+  int bad = 0;
+  for (int pi = 0; pi < 3; ++pi) {
+    int err = 0;
+    hvx_attn_m1_ctx *a =
+      hvx_attn_m1_create(3u, n_kv, 2u, hd, flags, pools[pi], &err);
+    hvx_attn_m1_ctx *r =
+      hvx_attn_m1_create(3u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(a && r, "seed prealloc: create");
+    if (!a || !r) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(r);
+      continue;
+    }
+    int calls = 0, cb = 0;
+    for (uint32_t l = 0; l < 3u; ++l) {
+      cb |= hvx_attn_m1_seed_q8_tiles_async(
+              a, l, L, k8, v8, hs, 0u, sc, sc + n, sc + 2u * n, sc + 3u * n,
+              count_done, &calls, l) != AEE_SUCCESS;
+      hvx_attn_m1_seed_reap(a, 1);
+    }
+    /* the reference: each layer seeded synchronously */
+    for (uint32_t l = 0; l < 3u; ++l) {
+      cb |= hvx_attn_m1_seed_q8_tiles(r, l, L, k8, v8, hs, 0u, sc, sc + n,
+                                      sc + 2u * n, sc + 3u * n) != AEE_SUCCESS;
+      cb |= memcmp(a->kt[l], r->kt[l], a->layer_bytes) != 0 ||
+            memcmp(a->v[l], r->v[l], a->layer_bytes) != 0;
+    }
+    cb |= a->pre_hits != 2u || a->pre_inline != 1u || calls != 3 ||
+          r->pre_hits != 2u;
+    CHECK(cb == 0,
+          "seed prealloc pool %d: hits %u inline %u calls %d, or the layers "
+          "differ",
+          pi, a->pre_hits, a->pre_inline, calls);
+    bad += cb;
+    hvx_attn_m1_free(a);
+    hvx_attn_m1_free(r);
+    /* layer 1 allocated ahead, then run without a seed */
+    hvx_attn_m1_ctx *d =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    hvx_attn_m1_ctx *e =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(d && e, "seed prealloc: create d / e");
+    if (!d || !e) {
+      hvx_attn_m1_free(d);
+      hvx_attn_m1_free(e);
+      continue;
+    }
+    cb = hvx_attn_m1_seed_q8_tiles_async(d, 0u, L, k8, v8, hs, 0u, sc, sc + n,
+                                         sc + 2u * n, sc + 3u * n, count_done,
+                                         &calls, 9u) != AEE_SUCCESS;
+    hvx_attn_m1_seed_reap(d, 1); /* and the thread's allocation */
+    cb |= !d->kt[1] || !d->unfilled || d->unfilled[1] != 1u;
+    if (d->kt[1] && d->v[1]) { /* what a reused block may hold */
+      memset(d->kt[1], 0x5A, d->layer_bytes);
+      memset(d->v[1], 0xA5, d->layer_bytes);
+    }
+    const int rd =
+      hvx_attn_m1_forward(d, 1u, 0u, 0u, 0.0625f, q, kv, kv + n, ya, NULL);
+    const int re =
+      hvx_attn_m1_forward(e, 1u, 0u, 0u, 0.0625f, q, kv, kv + n, yb, NULL);
+    cb |= rd != AEE_SUCCESS || re != AEE_SUCCESS ||
+          (d->unfilled && d->unfilled[1] != 0u) ||
+          memcmp(ya, yb, 2u * n * sizeof(float)) != 0 ||
+          memcmp(d->kt[1], e->kt[1], d->layer_bytes) != 0;
+    CHECK(cb == 0,
+          "seed prealloc pool %d: a layer allocated ahead and not seeded "
+          "differs from a fresh one (rc %d %d)",
+          pi, rd, re);
+    bad += cb;
+    hvx_attn_m1_free(e);
+    /* a free right after a seed: the thread may be allocating layer 1 */
+    hvx_attn_m1_ctx *f =
+      hvx_attn_m1_create(2u, n_kv, 2u, hd, flags, pools[pi], &err);
+    CHECK(f && hvx_attn_m1_seed_q8_tiles_async(
+                 f, 0u, L, k8, v8, hs, 0u, sc, sc + n, sc + 2u * n, sc + 3u * n,
+                 count_done, &calls, 10u) == AEE_SUCCESS,
+          "seed prealloc: submit then free");
+    hvx_attn_m1_free(f);
+    hvx_attn_m1_free(d);
+  }
+  free(k8);
+  free(v8);
+  free(sc);
+  free(q);
+  free(kv);
+  free(ya);
+  free(yb);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED PREALLOC OK\n");
+  }
+}
+
+/** [NNTR_HTP_Q2_KDIM] With K's prefill scale per (head, dim) the int8
+ *  masters are the decode cache's own bytes: masters quantized as the
+ *  prefill appends them (rint(x / s), s = amax / 127, hexkl_kv_q's rule)
+ *  and seeded must give kv_append's scales bit for bit and its K bytes,
+ *  except at exact .5 ties (rint to even, q8_of away from zero). Data a:
+ *  irregular values (a few ties, where the two rules may agree). Data b:
+ *  s = 1 / 64 and values on the half grid, so ties are many and some must
+ *  differ, or the case would test nothing. */
+static void check_seed_q8_kd(hvx_worker_pool *pool) {
+  const uint32_t n_kv = 2u, hd = 256u, L = 130u, max_seq = 256u;
+  const size_t hs = (size_t)max_seq * hd, n = (size_t)n_kv * hd;
+  int err = 0, bad = 0;
+  float *kf = (float *)malloc((size_t)L * n * sizeof(float));
+  float *sk = (float *)malloc(n * sizeof(float));
+  float *ski = (float *)malloc(n * sizeof(float));
+  uint8_t *k8 = (uint8_t *)malloc(n_kv * hs), *v8 = (uint8_t *)calloc(n_kv, hs);
+  float *s_v = (float *)malloc(n * sizeof(float));
+  float *s_vi = (float *)malloc(n * sizeof(float));
+  for (size_t i = 0; i < n; ++i) {
+    s_v[i] = 0.02f;
+    s_vi[i] = 1.0f / 0.02f;
+  }
+  for (int data = 0; data < 2; ++data) {
+    for (size_t i = 0; i < (size_t)L * n; ++i) {
+      const uint32_t u = (uint32_t)(i * 2654435761u);
+      kf[i] =
+        data == 0
+          ? (float)((int)(u % 2001u) - 1000) * 0.0137f *
+              (1.0f + (float)(i % hd) * 0.01f)
+          : ((float)((int)(u % 254u) - 127) + 0.5f * (float)(u >> 31)) / 64.0f;
+      if (data == 1 && i < n) {
+        kf[i] = 127.0f / 64.0f; /* row 0: every dim's amax, s = 1 / 64 */
+      }
+      if (data == 1 && kf[i] > 127.0f / 64.0f) {
+        kf[i] = 127.0f / 64.0f;
+      }
+    }
+    /* the prefill side: amax per (head, dim), scale, inverse, masters */
+    for (size_t e = 0; e < n; ++e) {
+      float m = 0.0f;
+      for (uint32_t r = 0; r < L; ++r) {
+        const float a = fabsf(kf[(size_t)r * n + e]);
+        m = a > m ? a : m;
+      }
+      sk[e] = m > 0.0f ? m * 1.0f / 127.0f : 1.0f;
+      ski[e] = 1.0f / sk[e];
+    }
+    size_t ties = 0;
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      for (uint32_t r = 0; r < L; ++r) {
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t e = (size_t)h * hd + d;
+          float q = rintf(kf[(size_t)r * n + e] * ski[e]);
+          q = q > 127.0f ? 127.0f : (q < -127.0f ? -127.0f : q);
+          k8[h * hs + (size_t)r * hd + d] = (uint8_t)(int8_t)q ^ 0x80u;
+          const float x = kf[(size_t)r * n + e] * ski[e];
+          ties += x - floorf(x) == 0.5f;
+        }
+      }
+    }
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pool,
+      &err);
+    CHECK(a && b, "seed_q8 kd: create");
+    if (!a || !b) {
+      hvx_attn_m1_free(a);
+      hvx_attn_m1_free(b);
+      break;
+    }
+    CHECK(hvx_attn_m1_seed_q8(a, 0u, L, k8, v8, hs, hd, sk, ski, s_v, s_vi,
+                              NULL) == AEE_SUCCESS,
+          "seed_q8 kd: seed from masters");
+    CHECK(hvx_attn_m1_kv_append(b, 0u, 0u, L, kf, kf) == AEE_SUCCESS,
+          "seed_q8 kd: kv_append reference");
+    int sbad = 0;
+    for (size_t e = 0; e < n; ++e) {
+      sbad += a->sk[e] != b->sk[e] || a->sk_inv[e] != b->sk_inv[e];
+    }
+    size_t diff = 0, off_tie = 0;
+    for (uint32_t h = 0; h < n_kv; ++h) {
+      const int8_t *ka = (const int8_t *)a->kt[0] + (size_t)h * hd * a->seq;
+      const int8_t *kb = (const int8_t *)b->kt[0] + (size_t)h * hd * b->seq;
+      for (uint32_t r = 0; r < L; ++r) {
+        for (uint32_t d = 0; d < hd; ++d) {
+          const size_t t =
+            (size_t)(r / 64u) * hd * 64u + (size_t)d * 64u + r % 64u;
+          if (ka[t] == kb[t]) {
+            continue;
+          }
+          ++diff;
+          const float x = kf[(size_t)r * n + h * hd + d] * ski[h * hd + d];
+          off_tie += x - floorf(x) != 0.5f;
+        }
+      }
+    }
+    CHECK(sbad == 0, "seed_q8 kd data %d: %d scales differ from kv_append's",
+          data, sbad);
+    CHECK(off_tie == 0, "seed_q8 kd data %d: %zu K bytes differ off a tie",
+          data, off_tie);
+    CHECK(data == 0 || diff > 0, "seed_q8 kd data %d: no tie differs (%zu)",
+          data, ties);
+    printf("seed_q8 kd data %d: ties=%zu K bytes differing (ties only)=%zu\n",
+           data, ties, diff);
+    bad += sbad + (int)off_tie;
+    hvx_attn_m1_free(a);
+    hvx_attn_m1_free(b);
+  }
+  free(kf);
+  free(sk);
+  free(ski);
+  free(k8);
+  free(v8);
+  free(s_v);
+  free(s_vi);
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 KD OK\n");
+  }
+}
+
+/** seed_q8_tiles (the vector transpose with a window shift) against
+ *  seed_q8 (the scalar scatter) given the shifted masters: the whole layer
+ *  -- Kt tiles, V rows, the zeros past n_rows -- and the scales bit for
+ *  bit, at Gemma 4's sliding (8 x 256, a masters cache taller than the
+ *  decode one, shifted) and full (2 x 512) heads, a partial last tile, one
+ *  row, and every pool. A head_dim the tiles do not take is refused. */
+static void check_seed_q8_tiles(hvx_worker_pool *const *pools) {
+  static const uint32_t CASES[][5] = {
+    /* n_kv, hd, decode max_seq, masters rows, shift */
+    {8u, 256u, 1152u, 2048u, 66u},
+    {2u, 512u, 512u, 512u, 0u},
+    {1u, 128u, 128u, 192u, 63u},
+  };
+  int bad = 0;
+  for (size_t c = 0; c < sizeof(CASES) / sizeof(CASES[0]); ++c) {
+    const uint32_t n_kv = CASES[c][0], hd = CASES[c][1], max_seq = CASES[c][2];
+    const uint32_t src_rows = CASES[c][3], shift = CASES[c][4];
+    const size_t hs = (size_t)src_rows * hd, n = (size_t)n_kv * hd;
+    uint8_t *k8 = (uint8_t *)malloc(n_kv * hs),
+            *v8 = (uint8_t *)malloc(n_kv * hs);
+    float *sc = (float *)malloc(4u * n * sizeof(float));
+    for (size_t i = 0; i < n_kv * hs; ++i) {
+      k8[i] = (uint8_t)(i * 2654435761u >> 13);
+      v8[i] = (uint8_t)(i * 40503u >> 7);
+    }
+    for (size_t i = 0; i < 4u * n; ++i)
+      sc[i] = 0.001f * (float)(1u + i % 977u);
+    const uint32_t lens[3] = {max_seq - 64u - 13u, 1u, max_seq};
+    for (int li = 0; li < 3; ++li) {
+      const uint32_t L =
+        lens[li] + shift > src_rows ? src_rows - shift : lens[li];
+      for (int pi = 0; pi < 3; ++pi) {
+        int err = 0;
+        hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+          1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY,
+          pools[pi], &err);
+        hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+          1u, n_kv, 2u, hd, max_seq | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY,
+          pools[pi], &err);
+        CHECK(a && b, "seed_q8_tiles: create");
+        if (!a || !b) {
+          hvx_attn_m1_free(a);
+          hvx_attn_m1_free(b);
+          continue;
+        }
+        CHECK(hvx_attn_m1_seed_q8_tiles(a, 0u, L, k8, v8, hs, shift, sc, sc + n,
+                                        sc + 2u * n,
+                                        sc + 3u * n) == AEE_SUCCESS,
+              "seed_q8_tiles: seed");
+        CHECK(hvx_attn_m1_seed_q8(
+                b, 0u, L, k8 + (size_t)shift * hd, v8 + (size_t)shift * hd, hs,
+                hd, sc, sc + n, sc + 2u * n, sc + 3u * n, NULL) == AEE_SUCCESS,
+              "seed_q8_tiles: seed_q8 reference");
+        int cb = a->kv_len[0] != b->kv_len[0] ||
+                 memcmp(a->kt[0], b->kt[0], a->layer_bytes) != 0 ||
+                 memcmp(a->v[0], b->v[0], a->layer_bytes) != 0;
+        for (size_t e = 0; e < n; ++e)
+          cb += a->sk[e] != b->sk[e] || a->sk_inv[e] != b->sk_inv[e] ||
+                a->sv[e] != b->sv[e] || a->sv_inv[e] != b->sv_inv[e];
+        CHECK(cb == 0,
+              "seed_q8_tiles n_kv=%u hd=%u seq=%u rows=%u shift=%u L=%u "
+              "pool %d: differs from seed_q8",
+              n_kv, hd, max_seq, src_rows, shift, L, pi);
+        bad += cb;
+        hvx_attn_m1_free(a);
+        hvx_attn_m1_free(b);
+      }
+    }
+    free(k8);
+    free(v8);
+    free(sc);
+  }
+  {
+    int err = 0;
+    hvx_attn_m1_ctx *a = hvx_attn_m1_create(
+      1u, 1u, 2u, 64u, 128u | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[0],
+      &err);
+    static uint8_t m[128 * 128];
+    float s1[128];
+    for (int i = 0; i < 128; ++i)
+      s1[i] = 1.0f;
+    CHECK(a && hvx_attn_m1_seed_q8_tiles(a, 0u, 4u, m, m, sizeof(m), 0u, s1, s1,
+                                         s1, s1) == AEE_EINVALIDFORMAT,
+          "seed_q8_tiles: head_dim 64 refused");
+    hvx_attn_m1_ctx *b = hvx_attn_m1_create(
+      1u, 1u, 2u, 128u, 128u | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_LAZY, pools[0],
+      &err);
+    CHECK(b && hvx_attn_m1_seed_q8_tiles(b, 0u, 4u, m, m, 4u * 128u, 1u, s1, s1,
+                                         s1, s1) == AEE_EINVALIDFORMAT,
+          "seed_q8_tiles: rows past the masters refused");
+    hvx_attn_m1_free(b);
+    hvx_attn_m1_free(a);
+  }
+  if (bad == 0 && g_fail == 0) {
+    printf("ATTN M1 SEED Q8 TILES OK\n");
   }
 }
 
@@ -1992,6 +2639,13 @@ int main(void) {
   check_gemma_fast(pools);
   check_gemma_q8(pools);
   check_seed_q8(pools[2]);
+  check_seed_q8_kd(pools[2]);
+  check_seed_q8_tiles(pools);
+  check_seed_q8_tiles_async(pools);
+  check_seed_prealloc(pools);
+  check_fill_roundtrip(pools[2]);
+  check_fill_hvx(pools[2]);
+  check_fill_hvx(NULL);
   check_seed_vec(pools[2]);
   check_seed_vec(NULL);
   check_seed_f16(pools[2]);

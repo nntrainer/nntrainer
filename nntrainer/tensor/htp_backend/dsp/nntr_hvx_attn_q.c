@@ -29,6 +29,7 @@
 #include "hexkl_kv_q.h"
 #include "hexkl_micro.h"
 #include "hvx_attn_decode_q.h"
+#include "hvx_attn_m1_f32.h"
 #include "hvx_convert.h"
 #include "hvx_softmax_q.h"
 #include "hvx_worker_pool.h"
@@ -90,6 +91,10 @@ int nntr_hvx_kv_register_q(remote_handle64 handle, uint32 kind, uint32 max_rows,
   if (!s || !kv_handle) {
     return AEE_EBADPARM;
   }
+  /* [C] the caches the background seeds are done with go before this one
+     comes, so the heap can place it in their room */
+  hvx_attn_m1_seed_reap(s->attn_m1, 0);
+  hvx_attn_m1_seed_reap(s->attn_m1_b, 0);
   return hexkl_kv_q_register(&s->kv_q, (hexkl_kv_q_kind)kind, max_rows,
                              n_head_kv, head_dim, kv_handle);
 }
@@ -102,12 +107,17 @@ int nntr_hvx_kv_set_fixed_scales_q(remote_handle64 handle, uint32 kv_handle,
     return AEE_EBADPARM;
   }
   const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
-  if (!kv || (uint32_t)s_kLen != kv->n_head_kv ||
-      (uint32_t)s_vLen != kv->n_head_kv * kv->head_dim) {
+  /* s_k: per KV head, or per (KV head, dim) */
+  const uint32_t stride = kv ? kv->n_head_kv * kv->head_dim : 0u;
+  if (!kv ||
+      ((uint32_t)s_kLen != kv->n_head_kv && (uint32_t)s_kLen != stride) ||
+      (uint32_t)s_vLen != stride) {
     FARF(ERROR, "kv_set_fixed_scales_q: bad lengths");
     return AEE_EBADPARM;
   }
-  return hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
+  return (uint32_t)s_kLen == stride
+           ? hexkl_kv_q_set_fixed_scales_kd(&s->kv_q, kv_handle, s_k, s_v)
+           : hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
 }
 
 int nntr_hvx_kv_release_q(remote_handle64 handle, uint32 kv_handle) {
@@ -566,9 +576,10 @@ typedef struct {
   uint32_t n_rows, stride, n_kv, hd;
   const float *q;
   uint32_t n_q, n_hq, q_stride;
-  uint16_t *vmax;   /**< [lane][n_kv * hd] |V| max as fp16 bits */
-  uint16_t *kmax;   /**< [lane][n_kv] */
-  float *qlo, *qhi; /**< [lane][n_hq] */
+  uint16_t *vmax;     /**< [lane][n_kv * hd] |V| max as fp16 bits */
+  uint16_t *kmax;     /**< [lane][n_kv], [lane][n_kv * hd] for q2c_worker_kd */
+  float *qlo, *qhi;   /**< [lane][n_hq] */
+  const float *ratio; /**< q2c_worker_kd_q: [n_kv][hd] fs_kd / fs_k */
 } q2c_ctx;
 
 /** |x| of fp16 bits is the bits with the sign cleared, and for finite
@@ -638,6 +649,82 @@ static void q2c_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
 }
 
+/** q2c_worker's K and V with K's maxima per dim (NNTR_HTP_Q2_KDIM): one
+   head's per-dim values stay in registers over the lane's rows and are
+   stored once, hd / 64 vectors each. Q waits for K's scales
+   (q2c_worker_kd_q). */
+static void q2c_worker_kd(uint32_t n_threads, uint32_t i, void *v) {
+  const q2c_ctx *c = (const q2c_ctx *)v;
+  const HVX_Vector mask = Q6_Vh_vsplat_R(0x7fff);
+  uint16_t *vmax = c->vmax + (size_t)i * c->n_kv * c->hd;
+  uint16_t *kmax = c->kmax + (size_t)i * c->n_kv * c->hd;
+  {
+    const uint32_t lo = (uint32_t)(((uint64_t)c->n_rows * i) / n_threads);
+    const uint32_t hi =
+      (uint32_t)(((uint64_t)c->n_rows * (i + 1u)) / n_threads);
+    const uint32_t nvec = c->hd / 64u; /* <= 8 */
+    for (uint32_t n = 0; n < c->n_kv; ++n) {
+      HVX_Vector ka[8], va[8];
+      for (uint32_t j = 0; j < nvec; ++j) {
+        ka[j] = Q6_V_vzero();
+        va[j] = Q6_V_vzero();
+      }
+      for (uint32_t r = lo; r < hi; ++r) {
+        const HVX_UVector *kr =
+          (const HVX_UVector *)(c->k + (size_t)r * c->stride + n * c->hd);
+        const HVX_UVector *vr =
+          (const HVX_UVector *)(c->v + (size_t)r * c->stride + n * c->hd);
+        for (uint32_t j = 0; j < nvec; ++j) {
+          ka[j] = Q6_Vuh_vmax_VuhVuh(ka[j], Q6_V_vand_VV(kr[j], mask));
+          va[j] = Q6_Vuh_vmax_VuhVuh(va[j], Q6_V_vand_VV(vr[j], mask));
+        }
+      }
+      for (uint32_t j = 0; j < nvec; ++j) {
+        ((HVX_UVector *)(kmax + n * c->hd))[j] = ka[j];
+        ((HVX_UVector *)(vmax + n * c->hd))[j] = va[j];
+      }
+    }
+  }
+}
+
+/** The Q pass of K's scale per dim: each Q head's range of q * ratio[d]
+ *  (the Q stage_qprep_kd quantizes) over the lane's rows, one minimum and
+ *  one maximum a head as q2c_worker's. min (q r) = r min (q) for r > 0 in
+ *  floats too (the rounding is monotone), so this is the per-dim extremes
+ *  times the ratio without them. */
+static void q2c_worker_kd_q(uint32_t n_threads, uint32_t i, void *v) {
+  const q2c_ctx *c = (const q2c_ctx *)v;
+  float *qlo = c->qlo + (size_t)i * c->n_hq,
+        *qhi = c->qhi + (size_t)i * c->n_hq;
+  const uint32_t lo = (uint32_t)(((uint64_t)c->n_q * i) / n_threads);
+  const uint32_t hi = (uint32_t)(((uint64_t)c->n_q * (i + 1u)) / n_threads);
+  const uint32_t nvec = c->hd / 32u, G = c->n_hq / c->n_kv;
+  for (uint32_t h = 0; h < c->n_hq; ++h) {
+    const HVX_UVector *rv = (const HVX_UVector *)(c->ratio + (h / G) * c->hd);
+    HVX_Vector vlo = hvx_splat_sf(1e30f), vhi = hvx_splat_sf(-1e30f);
+    for (uint32_t r = lo; r < hi; ++r) {
+      const HVX_UVector *qr =
+        (const HVX_UVector *)(c->q + (size_t)r * c->q_stride + h * c->hd);
+      for (uint32_t j = 0; j < nvec; ++j) {
+        const HVX_Vector x = Q6_Vsf_vmpy_VsfVsf(qr[j], rv[j]);
+        vlo = Q6_Vsf_vmin_VsfVsf(vlo, x);
+        vhi = Q6_Vsf_vmax_VsfVsf(vhi, x);
+      }
+    }
+    float l[32] __attribute__((aligned(128)));
+    float u[32] __attribute__((aligned(128)));
+    *(HVX_Vector *)l = vlo;
+    *(HVX_Vector *)u = vhi;
+    float flo = 1e30f, fhi = -1e30f;
+    for (uint32_t j = 0; j < 32u; ++j) {
+      flo = l[j] < flo ? l[j] : flo;
+      fhi = u[j] > fhi ? u[j] : fhi;
+    }
+    qlo[h] = flo;
+    qhi[h] = fhi;
+  }
+}
+
 /** std::round: halves away from zero; the DSP image has no roundf. Below
    2^23 trunc then the exact fraction compared with 0.5; above, integral. */
 static inline float q2c_roundf(float x) {
@@ -667,14 +754,20 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
   const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
   if (!kv || n_head_q == 0 || kv->n_head_kv == 0 ||
       n_head_q % kv->n_head_kv != 0 || kv->head_dim % 64u != 0 ||
-      q_f32Len != out_u16Len || k_rowsLen != v_rowsLen ||
-      (uint32)calibLen !=
-        kv->n_head_kv + kv->n_head_kv * kv->head_dim + 4u * n_head_q) {
+      q_f32Len != out_u16Len || k_rowsLen != v_rowsLen) {
     FARF(ERROR, "attn_q2_step_fqc: bad handle or lengths");
     return AEE_EBADPARM;
   }
   const uint32_t n_kv = kv->n_head_kv, hd = kv->head_dim;
   const uint32_t stride = n_kv * hd;
+  /* K's scales per head, or per (head, dim) when calib has room for them */
+  const int kd = (uint32)calibLen == 2u * stride + 4u * n_head_q;
+  if (!kd && (uint32)calibLen != n_kv + stride + 4u * n_head_q) {
+    FARF(ERROR, "attn_q2_step_fqc: bad calib length");
+    return AEE_EBADPARM;
+  }
+  const uint32_t nk = kd ? stride : n_kv; /* K scales a lane */
+  const uint32_t nq = n_head_q;           /* Q extremes a lane */
   const uint32_t n_rows = (uint32_t)k_rowsLen / stride;
   const uint32_t lanes = hvx_worker_pool_workers(s->quant_pool) + 1u;
   if (lanes > Q2C_MAX_LANES || (uint32_t)k_rowsLen != n_rows * stride) {
@@ -683,15 +776,19 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
   const uint64_t tc0 = HAP_perf_get_time_us();
   uint16_t *vmax =
     (uint16_t *)malloc((size_t)lanes * stride * sizeof(uint16_t));
-  uint16_t *kmax = (uint16_t *)malloc((size_t)lanes * n_kv * sizeof(uint16_t));
-  float *qlo = (float *)malloc((size_t)lanes * n_head_q * sizeof(float) * 2u);
-  float *s_k = calib, *s_v = calib + n_kv;
+  uint16_t *kmax = (uint16_t *)malloc((size_t)lanes * nk * sizeof(uint16_t));
+  float *qlo = (float *)malloc((size_t)lanes * nq * sizeof(float) * 2u);
+  float *s_k = calib, *s_v = calib + nk;
   float *q_enc = s_v + stride, *out_enc = q_enc + 2u * n_head_q;
+  /* kd: fs_kd / fs_k per (KV head, dim), as hexkl_kv_q_set_fixed_scales_kd
+     forms fk_ratio, for the Q pass */
+  float *ratio = kd ? (float *)malloc((size_t)stride * sizeof(float)) : NULL;
   float q_inv[64];
-  if (!vmax || !kmax || !qlo || n_head_q > 64u) {
+  if (!vmax || !kmax || !qlo || (kd && !ratio) || n_head_q > 64u) {
     free(vmax);
     free(kmax);
     free(qlo);
+    free(ratio);
     return AEE_ENOMEMORY;
   }
   q2c_ctx c = {k_rows,   v_rows,
@@ -700,27 +797,47 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
                q_f32,    n_q,
                n_head_q, n_head_q * hd,
                vmax,     kmax,
-               qlo,      qlo + (size_t)lanes * n_head_q};
-  hvx_worker_pool_run(s->quant_pool, q2c_worker, &c,
-                      n_rows > n_q ? n_rows : n_q);
+               qlo,      qlo + (size_t)lanes * nq,
+               ratio};
+  const uint32_t units = n_rows > n_q ? n_rows : n_q;
+  hvx_worker_pool_run(s->quant_pool, kd ? q2c_worker_kd : q2c_worker, &c,
+                      units);
+  /* the lanes that ran: min(units, lanes), the rest never wrote theirs */
+  const uint32_t ran = units < lanes ? (units ? units : 1u) : lanes;
   /** the lanes merged, the maxima to f32 (exact), the scales as
      mha_core::calibrate_q2_scales derives them, in its order of operations */
-  for (uint32_t n = 0; n < n_kv; ++n) {
+  for (uint32_t n = 0; n < nk; ++n) {
     uint16_t m = 0;
-    for (uint32_t l = 0; l < lanes; ++l)
-      m = kmax[(size_t)l * n_kv + n] > m ? kmax[(size_t)l * n_kv + n] : m;
+    for (uint32_t l = 0; l < ran; ++l)
+      m = kmax[(size_t)l * nk + n] > m ? kmax[(size_t)l * nk + n] : m;
     s_k[n] = hexkl_kv_q_hf_to_f32(m);
   }
   for (uint32_t e = 0; e < stride; ++e) {
     uint16_t m = 0;
-    for (uint32_t l = 0; l < lanes; ++l)
+    for (uint32_t l = 0; l < ran; ++l)
       m = vmax[(size_t)l * stride + e] > m ? vmax[(size_t)l * stride + e] : m;
     s_v[e] = hexkl_kv_q_hf_to_f32(m);
+  }
+  /* per dim: Q's range is that of q * fs_kd / fs_k, the Q the kernel
+     quantizes (stage_qprep): K's scales first, then the Q pass with them
+     (q2c_worker_kd_q), whose lanes merge as q2c_worker's */
+  if (kd) {
+    for (uint32_t e = 0; e < nk; ++e)
+      s_k[e] = s_k[e] > 0.0f ? s_k[e] / 127.0f : 1.0f;
+    for (uint32_t n = 0; n < n_kv; ++n) {
+      const float *sk = s_k + (size_t)n * hd;
+      float top = 0.0f;
+      for (uint32_t d = 0; d < hd; ++d)
+        top = sk[d] > top ? sk[d] : top;
+      for (uint32_t d = 0; d < hd; ++d)
+        ratio[(size_t)n * hd + d] = sk[d] / top;
+    }
+    hvx_worker_pool_run(s->quant_pool, q2c_worker_kd_q, &c, units);
   }
   const uint32_t G = n_head_q / n_kv;
   for (uint32_t h = 0; h < n_head_q; ++h) {
     float lo = 1e30f, hi = -1e30f;
-    for (uint32_t l = 0; l < lanes; ++l) {
+    for (uint32_t l = 0; l < ran; ++l) {
       const float a = c.qlo[(size_t)l * n_head_q + h];
       const float b = c.qhi[(size_t)l * n_head_q + h];
       lo = a < lo ? a : lo;
@@ -739,14 +856,17 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
     out_enc[2u * h + 1u] = 32768.0f;
     q_inv[h] = 1.0f / q_enc[2u * h];
   }
-  for (uint32_t n = 0; n < n_kv; ++n)
-    s_k[n] = s_k[n] > 0.0f ? s_k[n] / 127.0f : 1.0f;
+  if (!kd)
+    for (uint32_t n = 0; n < n_kv; ++n)
+      s_k[n] = s_k[n] > 0.0f ? s_k[n] / 127.0f : 1.0f;
   for (uint32_t e = 0; e < stride; ++e)
     s_v[e] = s_v[e] > 0.0f ? s_v[e] / 127.0f : 1.0f;
   free(vmax);
   free(kmax);
   free(qlo);
-  int rc = hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
+  free(ratio);
+  int rc = kd ? hexkl_kv_q_set_fixed_scales_kd(&s->kv_q, kv_handle, s_k, s_v)
+              : hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "attn_q2_step_fqc: fixed scales: 0x%08x", rc);
     return rc;

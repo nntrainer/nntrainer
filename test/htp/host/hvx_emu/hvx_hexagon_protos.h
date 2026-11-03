@@ -118,6 +118,16 @@ static inline HVX_Vector Q6_Vsf_equals_Vw(HVX_Vector a) {
   return r;
 }
 
+/** f32 -> int32 toward zero, what hexkl_attn_q2's q_f32_to_u16 relies on
+   for its clamped [0, 65535] lanes. */
+static inline HVX_Vector Q6_Vw_equals_Vsf(HVX_Vector a) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.w[i] = (int32_t)hvx_emu_f(a.w[i]);
+  }
+  return r;
+}
+
 #define HVX_EMU_W_BINOP(name, op)                                              \
   static inline HVX_Vector name(HVX_Vector a, HVX_Vector b) {                  \
     HVX_Vector r;                                                              \
@@ -271,6 +281,18 @@ static inline HVX_Vector Q6_Vh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
     h[HVX_EMU_LANES + i] = (int16_t)(b < -32768  ? -32768
                                      : b > 32767 ? 32767
                                                  : b);
+  }
+  memcpy(r.w, h, sizeof h);
+  return r;
+}
+/** The same into unsigned halves, saturated to [0, 65535]. */
+static inline HVX_Vector Q6_Vuh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  uint16_t h[2 * HVX_EMU_LANES];
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const int32_t a = (int32_t)v.w[i], b = (int32_t)u.w[i];
+    h[i] = (uint16_t)(a < 0 ? 0 : a > 65535 ? 65535 : a);
+    h[HVX_EMU_LANES + i] = (uint16_t)(b < 0 ? 0 : b > 65535 ? 65535 : b);
   }
   memcpy(r.w, h, sizeof h);
   return r;
@@ -644,6 +666,15 @@ static inline HVX_Vector Q6_Vuh_vmin_VuhVuh(HVX_Vector a, HVX_Vector b) {
   for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
     const uint16_t x = hvx_emu_h(&a, i), y = hvx_emu_h(&b, i);
     hvx_emu_set_h(&r, i, x < y ? x : y);
+  }
+  return r;
+}
+
+static inline HVX_Vector Q6_Vuh_vmax_VuhVuh(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    const uint16_t x = hvx_emu_h(&a, i), y = hvx_emu_h(&b, i);
+    hvx_emu_set_h(&r, i, x > y ? x : y);
   }
   return r;
 }

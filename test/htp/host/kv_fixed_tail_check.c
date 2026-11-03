@@ -74,8 +74,8 @@ static void reference_rows(const quant_rows_ctx *c, uint8_t *k, uint8_t *v,
       const size_t in = (size_t)r * stride + (size_t)h * hd;
       const size_t out = hexkl_kv_q_kt4_index(kv, h, c->row0 + r, 0);
       const size_t meta = hexkl_kv_q_sk_index(kv, h, c->row0 + r);
-      hvx_kv_quant_k_row_fixed(c->k_rows + in, hd, kv->qmax, 1.0f / kv->fs_k[h],
-                               q, sums + meta);
+      hvx_kv_quant_k_row_fixed(c->k_rows + in, hd, kv->qmax,
+                               kv->fs_k_inv + (size_t)h * hd, q, sums + meta);
       for (uint32_t d = 0; d < hd; ++d)
         k[out + d] = (uint8_t)q[d] ^ 0x80u;
       hvx_kv_quant_v_row_fixed(c->v_rows + in, hd, kv->qmax,

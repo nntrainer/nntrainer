@@ -103,7 +103,17 @@ typedef struct {
                              HVX decode kernel, which a fixed-scale cache
                              never feeds (the row-blocked kernel takes its
                              decode steps too) */
-  float *fs_k;          /**< [n_head_kv] fixed K scale per head */
+  int k_per_dim;        /**< 1: K's fixed scale is per (head, dim)
+                             (hexkl_kv_q_set_fixed_scales_kd). The
+                             row-blocked kernel folds fk_ratio into an f32
+                             Q; a u16 Q comes with it folded by its caller */
+  float *fs_k;          /**< [n_head_kv] fixed K scale per head: the
+                             largest of the head's per-dim scales */
+  float *fs_kd;         /**< [n_head_kv][head_dim] K scale per dim (fs_k
+                             repeated without per-dim scales) */
+  float *fs_k_inv;      /**< [n_head_kv][head_dim] 1 / fs_kd, for the append */
+  float *fk_ratio;      /**< [n_head_kv][head_dim] fs_kd / fs_k, at most 1:
+                             the row-blocked kernel folds it into Q */
   float *fs_v;          /**< [n_head_kv][head_dim] fixed V scale per dim */
   float *fs_v_inv;      /**< [n_head_kv][head_dim] 1 / fs_v, for the append */
 } hexkl_kv_q;
@@ -223,12 +233,11 @@ void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
                             int8_t *q, float *scale);
 
 /**
- * @brief K row with a given scale: q = rint(x / scale) clamped, colsum.
- *
- * @param inv  1 / scale
+ * @brief K row with a given scale per dim: q[d] = rint(x[d] * inv[d])
+ *        clamped, colsum.
  */
 void hexkl_kv_q_quant_k_row_fixed(const float *x, uint32_t hd, int32_t qmax,
-                                  float inv, int8_t *q, int32_t *colsum);
+                                  const float *inv, int8_t *q, int32_t *colsum);
 
 /**
  * @brief V row with a given scale per dim: q[d] = rint(x[d] * inv[d])
@@ -248,6 +257,16 @@ void hexkl_kv_q_quant_v_row_fixed(const float *x, uint32_t hd, int32_t qmax,
  */
 int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
                                 const float *s_k, const float *s_v);
+
+/**
+ * @brief hexkl_kv_q_set_fixed_scales with K per (head, dim): @a s_k
+ *        [n_head_kv][head_dim]. fs_k becomes each head's largest, fk_ratio
+ *        the per-dim scale over it; the row-blocked kernel multiplies Q by
+ *        fk_ratio, so its scores (and fs_k in them) are unchanged in form.
+ *        int8 caches only.
+ */
+int hexkl_kv_q_set_fixed_scales_kd(hexkl_kv_q_table *tbl, uint32_t handle,
+                                   const float *s_k, const float *s_v);
 
 /**
  * @brief The int8 WH tile permutation the DSP derived from rm_to_wh_i8:
@@ -308,6 +327,35 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
                            const uint16_t *k_rows, const uint16_t *v_rows,
                            uint8_t *vtcm_base, void *pool,
                            hexkl_kv_q_append_stats *st);
+
+/**
+ * @brief [C] Rows [row0, row0 + n_rows) of a fixed-scale int8 cache from
+ *        int8 values kept in the decode cache's layout (hvx_attn_m1's q8
+ *        layers): K per head as 64-position transposed tiles,
+ *        [tiles][head_dim][64], V row-major, [seq][head_dim], each head
+ *        @a head_stride bytes after the last. Each value is taken times
+ *        @a k_ratio / @a v_ratio ([n_head_kv][head_dim]: the old scale over
+ *        the cache's, in [0, 1], NULL for 1) as a Q15 ratio r:
+ *        (q r + 2^14) >> 15, clamped to qmax; the masters, per-row scales
+ *        and column sums come out as an append of those values writes them,
+ *        and the tiles are baked as an append bakes them (vtcm_base NULL: no
+ *        bake, host builds). With no ratio the cache holds the decode
+ *        cache's bytes back: what lets a prefill call's attention run over
+ *        earlier rows the CPU no longer keeps. HVX over (head, 64-row tile)
+ *        units when head_dim is a multiple of 128 (the DSP build, or a host
+ *        build with HEXKL_KV_Q_FILL_HVX on hvx_emu); else row by row.
+ */
+int hexkl_kv_q_fill_q8(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
+                       uint32_t n_rows, const int8_t *kt8, const int8_t *v8,
+                       size_t head_stride, const float *k_ratio,
+                       const float *v_ratio, uint8_t *vtcm_base, void *pool);
+
+/** @brief hexkl_kv_q_fill_q8 row by row, no bake: the HVX fill's reference
+ *         in the host checks. */
+int hexkl_kv_q_fill_q8_scalar(hexkl_kv_q_table *tbl, uint32_t handle,
+                              uint32_t row0, uint32_t n_rows, const int8_t *kt8,
+                              const int8_t *v8, size_t head_stride,
+                              const float *k_ratio, const float *v_ratio);
 
 /**
  * @brief Fills the row-major staging buffers with column tile @a c of head

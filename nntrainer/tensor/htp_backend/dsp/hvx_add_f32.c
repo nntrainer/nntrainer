@@ -80,7 +80,7 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (resLen != 7 && resLen != 8) {
+  if (resLen != 7 && resLen != 8 && resLen != 12 && resLen != 13) {
     return AEE_EINVALIDFORMAT;
   }
   if (HAP_query_avail_VTCM) {
@@ -100,8 +100,38 @@ int nntr_hvx_session_info(remote_handle64 handle, uint32 *res, int resLen) {
   }
   res[5] = s->open_path;
   res[6] = (uint32)((qurt_hvx_get_units() >> 8) & 0xFF);
-  if (resLen == 8) {
+  if (resLen >= 8) {
     res[7] = s->hmx_fp16_rate;
+  }
+  if (resLen == 12) {
+    /** [C] the prefill seeds since the last read, which zeroes them: their
+       RPCs' DSP time (us), and the decode layers' allocations -- inline in
+       a seed (us; count in the high half of res[11]) or by the thread one
+       layer ahead (us; count in the low half) */
+    uint64_t in_us = 0, pre_us = 0;
+    uint32_t hits = 0, inl = 0;
+    hvx_attn_m1_ctx *cs[2] = {s->attn_m1, s->attn_m1_b};
+    for (int i = 0; i < 2; ++i) {
+      if (cs[i]) {
+        in_us += cs[i]->inline_us;
+        pre_us += cs[i]->pre_us;
+        hits += cs[i]->pre_hits;
+        inl += cs[i]->pre_inline;
+        cs[i]->inline_us = cs[i]->pre_us = 0;
+        cs[i]->pre_hits = cs[i]->pre_inline = 0;
+      }
+    }
+    res[8] = (uint32)s->seed_rpc_us;
+    res[9] = (uint32)in_us;
+    res[10] = (uint32)pre_us;
+    res[11] = (inl << 16) | (hits & 0xFFFFu);
+    s->seed_rpc_us = 0;
+    s->seed_rpcs = 0;
+  }
+  if (resLen == 13) {
+    /** [#282 F] graph_set_param's DSP time since the last such read */
+    res[12] = (uint32)s->param_us;
+    s->param_us = 0;
   }
   return AEE_SUCCESS;
 }
