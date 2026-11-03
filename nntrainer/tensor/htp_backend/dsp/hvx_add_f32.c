@@ -306,6 +306,15 @@ int nntr_hvx_arenas_release(remote_handle64 handle, uint32 *n) {
   return AEE_SUCCESS;
 }
 
+/** @brief Release a quantized KV handle in both DSP and in-process builds. */
+int nntr_hvx_kv_release_q(remote_handle64 handle, uint32 kv_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_kv_q_release(&s->kv_q, kv_handle);
+}
+
 int nntr_hvx_close(remote_handle64 handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   uint32 n = 0;

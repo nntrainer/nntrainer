@@ -110,14 +110,6 @@ int nntr_hvx_kv_set_fixed_scales_q(remote_handle64 handle, uint32 kv_handle,
   return hexkl_kv_q_set_fixed_scales(&s->kv_q, kv_handle, s_k, s_v);
 }
 
-int nntr_hvx_kv_release_q(remote_handle64 handle, uint32 kv_handle) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s) {
-    return AEE_EBADPARM;
-  }
-  return hexkl_kv_q_release(&s->kv_q, kv_handle);
-}
-
 int nntr_hvx_kv_append_q(remote_handle64 handle, uint32 kv_handle, uint32 row0,
                          const uint16 *k_rows, int k_rowsLen,
                          const uint16 *v_rows, int v_rowsLen) {

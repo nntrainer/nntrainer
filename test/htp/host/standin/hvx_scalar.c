@@ -308,6 +308,7 @@ void hvx_quant_row_u8_rm(const float *row, uint32_t k, float scale, int32_t zp,
    Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
    passing more than 64 rows writes several row blocks. */
 /* hvx_rmsnorm_row_f32's formula, scalar (lane order aside) */
+#ifndef NNTR_HTP_INPROC
 void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
                          uint32_t n, float eps) {
   float ss = 0.f;
@@ -317,6 +318,7 @@ void hvx_rmsnorm_row_f32(const float *x, float *y, const float *gamma,
   for (uint32_t j = 0; j < n; ++j)
     y[j] = gamma ? (x[j] * rs) * gamma[j] : x[j] * rs;
 }
+#endif
 void hvx_quant_rows_u8_params_rm(const float *x, uint32_t m, uint32_t mp,
                                  uint32_t k, float *scale, int32_t *zp,
                                  uint8_t *out_rm, const float *pre_gamma,
@@ -642,6 +644,7 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   hvx_dq_tiles_rows_affine(n_threads, i, (const hvx_dq_rows_job *)vjob, NULL,
                            NULL);
 }
+#ifndef NNTR_HTP_INPROC
 void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
                                 uint32_t n, uint32_t chunk, float eps) {
   for (uint32_t c0 = 0; c0 < n; c0 += chunk)
@@ -659,6 +662,7 @@ void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs) {
       *b = as + bc;
     }
 }
+#endif
 void hvx_dequant_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
   uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,

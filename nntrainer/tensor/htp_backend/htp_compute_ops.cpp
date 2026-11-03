@@ -329,7 +329,9 @@ struct HtpStagingTransfer {
   }
   static int profileLevel() { return HtpProfile::global().level(); }
   template <typename... Args> static void warn(const char *fmt, Args... args) {
-    ml_logw(fmt, args...);
+    std::array<char, 512> message{};
+    std::snprintf(message.data(), message.size(), fmt, args...);
+    ml_logw("%s", message.data());
   }
 };
 
