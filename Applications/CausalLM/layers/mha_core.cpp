@@ -1682,8 +1682,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       const auto md = t.getMemoryData();
       return t.isClMem() || (md && md->isSVM());
     };
-    if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
-        !kv_ohwi_now && _rope_len_ok &&
+    // The plain shared-virtual-memory form of this block (no image arm, no
+    // staging, no planner cl_mem handles; NNTR_MHA_CLMEM only matters to
+    // those) is ClComputeOps' now: the host path below rotates Q through
+    // rotary_embedding and writes K / V through kv_cache_write, and on the
+    // gpu engine those run the device kernels this block ran (step 7a). The
+    // staged and image forms stay here (7b).
+    const bool plain_svm = !_img_arm && !kv_stage_on && q_cl == nullptr &&
+                           k_cl == nullptr && v_cl == nullptr;
+    if (!plain_svm && !_gpu_rope_off && _mha_gpu_on && use_gemm_attention &&
+        !kv_int8 && !kv_ohwi_now && _rope_len_ok &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         device_addressable(query_step) && device_addressable(key_step)) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
@@ -4033,6 +4041,14 @@ MHACoreLayer::rotary_table(ml::train::TensorDim::DataType dt,
                            unsigned int dim) {
   nntrainer::RotaryTable table;
   table.half = dim / 2;
+  // The decode permission the layer's own device RoPE block reads: the env
+  // override, or the gpu_decode_rope property off the image arm, where a
+  // decode-step device RoPE is not validated.
+  static const bool gpu_decode_env =
+    std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+  table.device_decode =
+    gpu_decode_env ||
+    (std::get<props::GpuDecodeRope>(mha_core_props).get() && !img_arm_want);
   if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     // The same table the OpenCL RoPE uses, capped at rope_lut_positions()

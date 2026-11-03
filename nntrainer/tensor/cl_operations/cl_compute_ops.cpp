@@ -130,6 +130,118 @@ private:
 } // namespace
 
 #ifdef ENABLE_FP16
+/** NNTR_MHA_GPU: the layer's device arms are on. */
+static bool cl_mha_gpu_on() {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_MHA_GPU");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+/** NNTR_MIN_PREFILL (default 1): rows a step needs for a device arm. */
+static unsigned int cl_device_min_rows() {
+  static const unsigned int min_rows = [] {
+    const char *e = std::getenv("NNTR_MIN_PREFILL");
+    const int v = e != nullptr ? std::atoi(e) : 0;
+    return v > 0 ? static_cast<unsigned int>(v) : 1u;
+  }();
+  return min_rows;
+}
+/** An FP16 tensor in shared virtual memory (not a planner cl_mem). */
+static bool cl_svm_fp16(const Tensor &t) {
+  const auto md = t.getMemoryData();
+  return md && md->isSVM() && !t.isClMem() &&
+         t.getDataType() == ml::train::TensorDim::DataType::FP16;
+}
+
+/**
+ * @brief The device RoPE MHACoreLayer ran itself on an FP16 SVM activation
+ *        (step 7a of #4466, second slice): rope_inplace_f16_cl over @p in
+ *        into @p out (which may alias it) with the fp16 table, drained, as
+ *        the layer's plain SVM path did. Taken when NNTR_MHA_GPU is on and
+ *        NNTR_NO_GPU_ROPE is not, the op rotates, both tensors are FP16 in
+ *        shared virtual memory, the table has fp16 rows for every position
+ *        and the step has NNTR_MIN_PREFILL rows (default 1) or is a single
+ *        row the table's device_decode admits (the layer's gpu_decode_rope
+ *        property or NNTR_MHA_GPU_DECODE). Declines otherwise; a shape the
+ *        formula rejects is left to the host arm, which reports it.
+ */
+static bool cl_device_rotary_arm(const Tensor &in, Tensor &out,
+                                 unsigned int head_dim,
+                                 const RotaryTable &table,
+                                 unsigned int start_pos, bool rotate) {
+  static const bool rope_off = std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
+  if (!cl_mha_gpu_on() || rope_off || !rotate || head_dim == 0 ||
+      (head_dim & 1u) || table.cos_fp16 == nullptr ||
+      table.sin_fp16 == nullptr || table.half != head_dim / 2 ||
+      !cl_svm_fp16(in) || !cl_svm_fp16(out) || in.width() % head_dim != 0 ||
+      out.width() != in.width() || out.size() != in.size())
+    return false;
+  const unsigned int rows = in.height();
+  if (rows == 0 || start_pos + rows > table.positions ||
+      !(rows >= cl_device_min_rows() || (rows == 1 && table.device_decode)))
+    return false;
+  return rope_inplace_f16_cl(
+    reinterpret_cast<const uint16_t *>(in.getData<_FP16>()),
+    reinterpret_cast<uint16_t *>(out.getData<_FP16>()), table.cos_fp16,
+    table.sin_fp16, rows, in.width() / head_dim, head_dim, start_pos,
+    table.positions, /*svm_inputs=*/true, /*in_clmem=*/nullptr,
+    /*out_clmem=*/nullptr, /*drain_svm_out=*/true);
+}
+
+/**
+ * @brief The device KV write MHACoreLayer ran itself into its concat FP16
+ *        cache (step 7a, second slice): K rotated by rope_inplace_f16_cl
+ *        straight into its cache rows and V copied there by gpu_copy_f16_cl,
+ *        both drained, as the layer's plain SVM path did. Taken under the
+ *        same gates as cl_device_rotary_arm, with a rope (the no-RoPE write
+ *        stays on the host, as it did), over FP16 SVM step and cache planes,
+ *        a concat K plane, rows that fit the cache (pos modulo ring_cap on a
+ *        ringed cache, as the host write). Declines otherwise, before writing
+ *        anything, except when the V copy fails after K is in place: then the
+ *        host write redoes both.
+ */
+static bool cl_device_kv_write_arm(const Tensor &k, const Tensor &v,
+                                   const KVCacheView &kv, unsigned int pos,
+                                   const RotaryTable *rope) {
+  static const bool rope_off = std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
+  if (!cl_mha_gpu_on() || rope_off || rope == nullptr ||
+      rope->cos_fp16 == nullptr || rope->sin_fp16 == nullptr ||
+      kv.key == nullptr || kv.value == nullptr ||
+      kv.layout != KVCacheLayout::Concat || kv.head_dim == 0 ||
+      (kv.head_dim & 1u) || rope->half != kv.head_dim / 2 || !cl_svm_fp16(k) ||
+      !cl_svm_fp16(v) || !cl_svm_fp16(*kv.key) || !cl_svm_fp16(*kv.value))
+    return false;
+  const unsigned int rows = k.height();
+  const unsigned int width = kv.key->width();
+  if (rows == 0 || v.height() != rows || k.width() != width ||
+      v.width() != width || kv.value->width() != width ||
+      width % kv.head_dim != 0 || k.size() != (size_t)rows * width ||
+      v.size() != (size_t)rows * width)
+    return false;
+  const unsigned int cap = kv.ring_cap ? kv.ring_cap : kv.key->height();
+  const unsigned int row = kv.ring_cap ? pos % kv.ring_cap : pos;
+  if (cap > kv.key->height() || cap > kv.value->height() || row + rows > cap ||
+      pos + rows > rope->positions ||
+      !(rows >= cl_device_min_rows() || (rows == 1 && rope->device_decode)))
+    return false;
+  uint16_t *kc = reinterpret_cast<uint16_t *>(kv.key->getData<_FP16>()) +
+                 (size_t)row * width;
+  uint16_t *vc = reinterpret_cast<uint16_t *>(kv.value->getData<_FP16>()) +
+                 (size_t)row * width;
+  if (!rope_inplace_f16_cl(
+        reinterpret_cast<const uint16_t *>(k.getData<_FP16>()), kc,
+        rope->cos_fp16, rope->sin_fp16, rows, width / kv.head_dim, kv.head_dim,
+        pos, rope->positions, /*svm_inputs=*/true,
+        /*in_clmem=*/nullptr, /*out_clmem=*/nullptr,
+        /*drain_svm_out=*/true))
+    return false;
+  return gpu_copy_f16_cl(reinterpret_cast<const uint16_t *>(v.getData<_FP16>()),
+                         vc, rows * width, /*svm_inputs=*/true,
+                         /*in_clmem=*/nullptr, /*out_clmem=*/nullptr,
+                         /*drain=*/true);
+}
+
 /**
  * @brief The device attention arms MHACoreLayer ran itself over its concat
  *        FP16 cache (step 7a of #4466, first slice): the flash kernels (a
@@ -150,15 +262,8 @@ private:
  */
 static bool cl_device_attention_arm(const Tensor &q, const KVCacheView &kv,
                                     Tensor &out, const AttentionOpParams &p) {
-  static const bool gpu_on = [] {
-    const char *e = std::getenv("NNTR_MHA_GPU");
-    return e != nullptr && e[0] != '0';
-  }();
-  static const unsigned int min_rows = [] {
-    const char *e = std::getenv("NNTR_MIN_PREFILL");
-    const int v = e != nullptr ? std::atoi(e) : 0;
-    return v > 0 ? static_cast<unsigned int>(v) : 1u;
-  }();
+  const bool gpu_on = cl_mha_gpu_on();
+  const unsigned int min_rows = cl_device_min_rows();
   static const bool img_two_conv = std::getenv("NNTR_MHA_GPU_IMG") != nullptr;
   using DataType = ml::train::TensorDim::DataType;
   const unsigned int rows = q.height();
@@ -664,20 +769,28 @@ public:
                          float epsilon) override {
     l2_normalize_rows_cl_op(in, out, epsilon);
   }
-  // Host rotation for now: the device RoPE (rope_inplace_f16_cl) is still
-  // selected inside the attention layer, which settles the queue before it
-  // reaches the host path this serves. Moving that device arm here is the
-  // next step; until then this keeps the host path's behaviour unchanged.
+  // The device RoPE over an FP16 SVM activation (cl_device_rotary_arm), then
+  // the host kernel. The layer's clmem-staged and image-arm RoPE forms stay
+  // in the layer (7b).
   void rotary_embedding(const Tensor &in, Tensor &out, unsigned int head_dim,
                         const RotaryTable &table, unsigned int start_pos,
                         bool rotate) override {
+#ifdef ENABLE_FP16
+    if (cl_device_rotary_arm(in, out, head_dim, table, start_pos, rotate))
+      return;
+#endif
     get_cpu_ops()->rotary_embedding(in, out, head_dim, table, start_pos,
                                     rotate);
   }
-  // Host cache write for now, for the same reason: the device K/V writes are
-  // still chosen inside the attention layer, which settles the queue first.
+  // The device write into a concat FP16 SVM cache (cl_device_kv_write_arm),
+  // then the host write. The OHWI, int8 and no-RoPE writes are the host's,
+  // as they were; the clmem-staged forms stay in the layer (7b).
   void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
                       unsigned int pos, const RotaryTable *rope) override {
+#ifdef ENABLE_FP16
+    if (cl_device_kv_write_arm(k, v, kv, pos, rope))
+      return;
+#endif
     get_cpu_ops()->kv_cache_write(k, v, kv, pos, rope);
   }
 
