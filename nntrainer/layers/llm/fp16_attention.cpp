@@ -11,11 +11,13 @@
  * @brief  Attention arithmetic with an FP16 KV cache.
  */
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 // FP16 CPU attention kernels are implemented by the ARM backend only.
@@ -35,6 +37,7 @@ static std::mutex rope_init_mtx;
 #include <fp16_attention.h>
 #include <htp_backend/htp_attention_state.h>
 #include <htp_backend/htp_runtime_config.h>
+#include <nntr_htp_decode_hook.h>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -883,6 +886,16 @@ void Fp16Attention::one_batch_incremental_forwarding(
   bool done = state_->try_quantized_attention(
     batch, query_step, cache_key, cache_value, cache_key_dim,
     attention_output_step, cache_from, cache_to, nullptr);
+  // int8-only KV: the CPU keeps no rows to fall back on, and every call
+  // that ran ends seeding its decode cache (releasing its int8 cache)
+  NNTR_THROW_IF(!done && htpKvStaging(), std::runtime_error)
+    << "mha_core: " << state_->name() << " fell off the int8 KV path, and "
+    << "the CPU keeps no rows to attend over (int8-only KV)";
+  NNTR_THROW_IF(done && htpKvStaging() && state_->holdsQuantizedCache(batch),
+                std::runtime_error)
+    << "mha_core: " << state_->name() << " attended rows ["
+    << cache_base + cache_from << ", " << cache_base + cache_to
+    << ") without seeding its decode cache (int8-only KV)";
   if (!done) {
     // every path below reads Q in the host tensor
     if (compute_ops_ &&
@@ -1030,8 +1043,13 @@ void Fp16Attention::one_batch_incremental_forwarding(
   // enabled, and the accelerated paths take f32 (staged inside).
   if (state_->try_quantized_attention(batch, query_step, cache_key, cache_value,
                                       cache_key_dim, attention_output_step,
-                                      from, to, &sink_step) ||
-      state_->try_accelerated_attention(query_step, b_cached_key,
+                                      from, to, &sink_step)) {
+    return;
+  }
+  NNTR_THROW_IF(htpKvStaging(), std::runtime_error)
+    << "mha_core: " << state_->name() << " fell off the int8 KV path, and "
+    << "the CPU keeps no rows to attend over (int8-only KV)";
+  if (state_->try_accelerated_attention(query_step, b_cached_key,
                                         b_cached_value, attention_output_step,
                                         from, to, &sink_step)) {
     return;
@@ -1801,6 +1819,10 @@ void Fp16Attention::registerQuantizedCache(RunLayerContext &context) {
   state_->registerQuantizedCache(key.height());
 }
 void Fp16Attention::beginHtpPrompt() { state_->beginHtpPrompt(); }
+bool Fp16Attention::kvDetached() const { return state_->kvDetached(); }
+void Fp16Attention::setHtpPrefillSeed(int ordinal, unsigned int decode_base) {
+  state_->setHtpPrefillSeed(ordinal, decode_base);
+}
 void Fp16Attention::setCacheIndex(unsigned int index) {
   cache_index = index;
   state_->invalidate();
@@ -1821,9 +1843,34 @@ void Fp16Attention::saveQ2Calibration(std::ostream &file) {
 void Fp16Attention::loadQ2Calibration(std::istream &file) {
   HtpAttentionState::loadQ2Calibration(file);
 }
+namespace {
+/** The RoPE tables the layers of one RoPE cache share over the first decode
+ *  row, by cache and shape: they hand the backend one table at one address,
+ *  which it shares by that address (S26 Ultra Gemma 4: the first token's
+ *  to_token 35 -> 18 ms without the 30-table build and memcmp). Freed at
+ *  the first call of a later row, 2.6 + 5.2 MiB otherwise kept. */
+struct RopeTables {
+  std::mutex m;
+  unsigned int pos = UINT_MAX;
+  std::map<std::tuple<const void *, unsigned, unsigned>,
+           std::shared_ptr<const std::vector<float>>>
+    tabs;
+};
+RopeTables &ropeTables() {
+  static RopeTables t;
+  return t;
+}
+} // namespace
+
 bool Fp16Attention::htpDecodeAttention(RunLayerContext &context,
                                        unsigned int pos) {
-  auto make_rope = [&](std::vector<float> &table) {
+  {
+    RopeTables &rt = ropeTables();
+    const std::lock_guard<std::mutex> lock(rt.m);
+    if (rt.pos != pos)
+      rt.tabs.clear();
+  }
+  auto make_rope = [&]() -> std::shared_ptr<const std::vector<float>> {
     const unsigned int rows =
       std::get<props::MaxTimestep>(mha_core_props).get();
     if (!freqs_fp32) {
@@ -1834,13 +1881,23 @@ bool Fp16Attention::htpDecodeAttention(RunLayerContext &context,
     }
     NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
       << "mha_core: RoPE cache is shorter than max_timestep";
-    const unsigned half = head_dim / 2;
-    table.resize(static_cast<size_t>(rows) * head_dim);
-    for (unsigned i = 0; i < rows; ++i) {
-      auto *t = table.data() + static_cast<size_t>(i) * head_dim;
-      std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
-      std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
+    RopeTables &rt = ropeTables();
+    const std::lock_guard<std::mutex> lock(rt.m);
+    rt.pos = pos;
+    auto &slot =
+      rt.tabs[{freqs_fp32.get(), rows, static_cast<unsigned>(head_dim)}];
+    if (!slot) {
+      const unsigned half = head_dim / 2;
+      auto table = std::make_shared<std::vector<float>>(
+        static_cast<size_t>(rows) * head_dim);
+      for (unsigned i = 0; i < rows; ++i) {
+        auto *t = table->data() + static_cast<size_t>(i) * head_dim;
+        std::memcpy(t, freqs_fp32->cos[i].data(), half * sizeof(float));
+        std::memcpy(t + half, freqs_fp32->sin[i].data(), half * sizeof(float));
+      }
+      slot = std::move(table);
     }
+    return slot;
   };
   auto &ck = use_external_cache
                ? context.getInput(3)

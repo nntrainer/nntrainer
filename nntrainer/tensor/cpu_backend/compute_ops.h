@@ -868,6 +868,45 @@ public:
     return false;
   }
 
+  // [C] NNTR_HTP_KV_ADOPT: registers the decode attention caches now,
+  // before the prefill (set_decode_kv_window first), so each layer's last
+  // prefill call can seed its decode cache (decode_kv_seed_kvq_layer)
+  // instead of keeping its int8 cache to the first token. False: not
+  // registered, the seeds wait for the first token.
+  virtual bool decode_kv_prepare() { return false; }
+
+  // [C] decode_kv_seed_kvq_tiles for attention layer @a ordinal (graph
+  // order) during the prefill, outside any decode hook: needs
+  // decode_kv_prepare. The handle is released on success. @a reseed: the
+  // layer was seeded by an earlier prefill call and takes this seed over.
+  virtual bool decode_kv_seed_kvq_layer(unsigned ordinal, unsigned n_rows,
+                                        int kv_handle, unsigned shift,
+                                        bool reseed = false) {
+    (void)ordinal;
+    (void)n_rows;
+    (void)kv_handle;
+    (void)shift;
+    (void)reseed;
+    return false;
+  }
+
+  // [C] The other way: rows [0, n_rows) of attention layer @a ordinal's
+  // decode cache into the fixed-scale int8 cache @a kv_handle, each value
+  // times @a k_ratio / @a v_ratio (head x dim; nullptr for 1), so a prefill
+  // call's attention reads the rows earlier calls left there. False: not
+  // filled.
+  virtual bool decode_kv_fill_kvq(unsigned ordinal, int kv_handle,
+                                  unsigned n_rows, const float *k_ratio,
+                                  const float *v_ratio, unsigned n_ratio) {
+    (void)ordinal;
+    (void)kv_handle;
+    (void)n_rows;
+    (void)k_ratio;
+    (void)v_ratio;
+    (void)n_ratio;
+    return false;
+  }
+
   /** Whether the complete decode graph consumes this registered source.
    * Per-op M=1 capability can be false when the whole token runs on device.
    */
@@ -1041,6 +1080,22 @@ public:
   virtual void set_decode_pool_grow(const std::function<void(size_t)> &grow) {
     (void)grow;
   }
+
+  // NNTR_MOE_WARM: the decode pool's warm-up after a prefill. begin makes
+  // room in the layer's pool and returns the experts to read (none: no
+  // warm-up); the backend reads them while the first token's setup runs
+  // and hands the keys it registered to end, before the first token.
+  // Ignored by a backend without the pool.
+  virtual void set_decode_pool_warm(
+    const std::function<std::vector<ExpertFileDesc>()> &begin,
+    const std::function<void(const std::vector<const void *> &)> &end) {
+    (void)begin;
+    (void)end;
+  }
+
+  // NNTR_MOE_WARM: starts the warm-up's reads now, at a prefill's last MoE
+  // call, instead of at the first decode row. Ignored without the pool.
+  virtual void begin_decode_pool_warm() {}
 
   // Undoes the above for one expert: both handles released, the slot back
   // in the pool for the next register_qs4cx_wh_expert_file. False when the
@@ -1280,17 +1335,20 @@ public:
    *        first append; sdpa_q2_kvcache then has sdpa_q_kvcache's contract
    *        with the per-head Q scales added and softcap / sinks removed
    *        (neither exists in the models this path serves). head_dim up to
-   *        512.
+   *        512. @a k_per_dim: s_k is per (KV head, dim) instead, for
+   *        sdpa_q2_kvcache_f32 only (it folds K's dims into Q).
    */
   virtual bool supports_kv_cache_q2() const { return false; }
   virtual bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
                                            unsigned int head_dim,
-                                           const float *s_k, const float *s_v) {
+                                           const float *s_k, const float *s_v,
+                                           bool k_per_dim) {
     (void)handle;
     (void)n_head_kv;
     (void)head_dim;
     (void)s_k;
     (void)s_v;
+    (void)k_per_dim;
     return false;
   }
   virtual bool sdpa_q2_kvcache(int handle, unsigned int append_row0,
@@ -1343,8 +1401,8 @@ public:
    *        encodings exactly as the layer's calibrate_q2_scales does, sets
    *        the scales on the cache and runs the step. s_k[n_head_kv],
    *        s_v[n_head_kv * head_dim], q_enc[2 n_head_q], out_enc[2
-   *        n_head_q] receive them. false = not available, the caller
-   *        calibrates.
+   *        n_head_q] receive them (s_k[n_head_kv * head_dim] with
+   *        @a k_per_dim). false = not available, the caller calibrates.
    */
   virtual bool sdpa_q2_kvcache_f32_calib(
     int handle, unsigned int append_row0, unsigned int append_rows,
@@ -1353,12 +1411,12 @@ public:
     unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
     unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
     float *out, float *s_k, float *s_v, float *q_enc, float *out_enc,
-    unsigned int out_stride) {
+    unsigned int out_stride, bool k_per_dim) {
     (void)handle, (void)append_row0, (void)append_rows, (void)kv_stride;
     (void)k_rows, (void)v_rows, (void)q, (void)q_stride, (void)n_q;
     (void)cache_from, (void)cache_to, (void)n_head_q, (void)n_head_kv;
     (void)head_dim, (void)window, (void)out, (void)s_k, (void)s_v;
-    (void)q_enc, (void)out_enc, (void)out_stride;
+    (void)q_enc, (void)out_enc, (void)out_stride, (void)k_per_dim;
     return false;
   }
 

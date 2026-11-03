@@ -117,21 +117,30 @@ private:
 
 } // namespace
 
+HtpPrefillPlan &htpPrefillPlan() {
+  static HtpPrefillPlan plan;
+  return plan;
+}
+
+bool htpKvAdopt() { return htpRuntimeConfig().htp.kv_adopt; }
+
 void HtpAttentionState::beginHtpPrompt() {
   release_quantized_cache();
   config_.cache_index = 0;
   htp_owns_cache_ = false;
+  kv_detached_ = false;
+  htp_seed_ord_ = -1;
   q_cache_failed = false;
   q2_calibrated = false;
   kv_floor_k_.clear();
   kv_floor_v_.clear();
-  htp_rope_table_.clear();
+  htp_rope_table_.reset();
 }
 
 bool HtpAttentionState::htpDecodeAttention(
   Tensor &query, Tensor &key, Tensor &value, Tensor &output, Tensor &ck,
   Tensor &cv, unsigned int pos,
-  const std::function<void(std::vector<float> &)> &make_rope) {
+  const std::function<std::shared_ptr<const std::vector<float>>()> &make_rope) {
   if (query.getDataType() != ml::train::TensorDim::DataType::FP32 ||
       query.batch() != 1)
     return false;
@@ -152,26 +161,31 @@ bool HtpAttentionState::htpDecodeAttention(
   // Reuse CPU RoPE values as [cos hd/2 | sin hd/2] per position. Build
   // config_.head_dim 64 up front; other dimensions only when the hook requests
   // them.
-  auto build_rope_table = [&] { make_rope(htp_rope_table_); };
-  if (htp_rope_table_.empty() && config_.use_rope && config_.head_dim == 64)
+  auto build_rope_table = [&] { htp_rope_table_ = make_rope(); };
+  auto rope_data = [&]() -> const float * {
+    return htp_rope_table_ ? htp_rope_table_->data() : nullptr;
+  };
+  auto rope_len = [&]() -> unsigned {
+    return htp_rope_table_ ? static_cast<unsigned>(htp_rope_table_->size())
+                           : 0u;
+  };
+  if (!htp_rope_table_ && config_.use_rope && config_.head_dim == 64)
     build_rope_table();
   int r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                        htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
+                        rope_data(), rope_len());
   if (r == 3) {
     // DSP-resident q/k still need RoPE even when config_.use_rope is off here;
     // CPU-projected rows arrive rotated by qkv_layer.
-    NNTR_THROW_IF(!htp_rope_table_.empty() ||
+    NNTR_THROW_IF(htp_rope_table_ != nullptr ||
                     (!config_.use_rope && !htpDecodeRowResident(pos)),
                   std::runtime_error)
       << "mha_core: the HTP attention hook asked for a RoPE table it has";
     build_rope_table();
     r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                      htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
+                      rope_data(), rope_len());
     // The DSP owns a copy and requests it again only after graph init.
     if (r != 3)
-      std::vector<float>().swap(htp_rope_table_);
+      htp_rope_table_.reset();
   }
   if (r == 2) {
     // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
@@ -214,8 +228,7 @@ bool HtpAttentionState::htpDecodeAttention(
       q_cache_handles[0] = -1; // released on the DSP
       drop_cpu_cache();
       r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                        htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
+                        rope_data(), rope_len());
       NNTR_THROW_IF(r != 1, std::runtime_error)
         << "mha_core: the HTP attention hook asked for a seed twice at pos "
         << pos;
@@ -262,8 +275,7 @@ bool HtpAttentionState::htpDecodeAttention(
               pos, conv_ms, all_ms);
     }
     r = htpDecodeAttn(pos, qkv, wq + wk + wv, output.getData<float>(), wq,
-                      htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
+                      rope_data(), rope_len());
     NNTR_THROW_IF(r != 1, std::runtime_error)
       << "mha_core: the HTP attention hook asked for a seed twice at pos "
       << pos;
@@ -376,7 +388,9 @@ void HtpAttentionState::calibrate_q2_scales(
   const uint16_t *k_rows, const uint16_t *v_rows, unsigned int n_rows,
   unsigned int kv_stride, const float *q, unsigned int q_stride,
   unsigned int n_q) {
-  q2_kmax.assign(config_.num_heads_KV, 0.0f);
+  q2_kmax.assign(q2_k_per_dim() ? config_.num_heads_KV * config_.head_dim
+                                : config_.num_heads_KV,
+                 0.0f);
   q2_vmax.assign(static_cast<size_t>(config_.num_heads_KV) * config_.head_dim,
                  0.0f);
   q2_grow(k_rows, v_rows, n_rows, kv_stride);
@@ -384,17 +398,26 @@ void HtpAttentionState::calibrate_q2_scales(
   q2_calibrated = true;
 }
 
+bool HtpAttentionState::q2_k_per_dim() {
+  // the KV adoption seeds decode K from the masters: per dim, or nll +9.4 %
+  return htpRuntimeConfig().htp.kv_adopt;
+}
+
 bool HtpAttentionState::q2_grow(const uint16_t *k_rows, const uint16_t *v_rows,
                                 unsigned int n_rows, unsigned int kv_stride) {
-  std::vector<float> kmax(config_.num_heads_KV, 0.0f),
+  const bool kd = q2_kmax.size() != config_.num_heads_KV;
+  std::vector<float> kmax(q2_kmax.size(), 0.0f),
     vmax(static_cast<size_t>(config_.num_heads_KV) * config_.head_dim, 0.0f);
   for (unsigned int r = 0; r < n_rows; ++r) {
     const uint16_t *kr = k_rows + static_cast<size_t>(r) * kv_stride;
     const uint16_t *vr = v_rows + static_cast<size_t>(r) * kv_stride;
-    for (unsigned int n = 0; n < config_.num_heads_KV; ++n) {
-      kmax[n] = attention_quant::abs_max_f16(kr + n * config_.head_dim,
-                                             config_.head_dim, kmax[n]);
-    }
+    if (kd)
+      attention_quant::abs_max_f16_lanes(
+        kr, config_.num_heads_KV * config_.head_dim, kmax.data());
+    else
+      for (unsigned int n = 0; n < config_.num_heads_KV; ++n)
+        kmax[n] = attention_quant::abs_max_f16(kr + n * config_.head_dim,
+                                               config_.head_dim, kmax[n]);
     attention_quant::abs_max_f16_lanes(
       vr, config_.num_heads_KV * config_.head_dim, vmax.data());
   }
@@ -450,11 +473,36 @@ void HtpAttentionState::q2_derive_q(const float *q, unsigned int q_stride,
         q_lo[h] = -q2_q_enc[2 * h + 1] * q2_q_enc[2 * h];
         q_hi[h] = q_lo[h] + 65535.0f * q2_q_enc[2 * h];
       }
-  for (unsigned int r = 0; r < n_q; ++r) {
-    const float *qr = q + static_cast<size_t>(r) * q_stride;
-    for (unsigned int h = 0; h < config_.num_heads_Q; ++h)
-      attention_quant::min_max_f32(qr + h * config_.head_dim, config_.head_dim,
-                                   q_lo[h], q_hi[h]);
+  if (q2_scale_k.size() != config_.num_heads_KV) {
+    // K per dim: the range of the Q the kernel quantizes, q * fs_kd / fs_k
+    // (hexkl_attn_q2 stage_qprep); min (q r) = r min (q) for r > 0, so the
+    // per-dim extremes first, as the accelerator's calibration takes them
+    std::vector<float> lo(q_stride, 1e30f), hi(q_stride, -1e30f);
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const float *qr = q + static_cast<size_t>(r) * q_stride;
+      for (unsigned int i = 0; i < q_stride; ++i) {
+        lo[i] = std::min(lo[i], qr[i]);
+        hi[i] = std::max(hi[i], qr[i]);
+      }
+    }
+    const unsigned int G = config_.num_heads_Q / config_.num_heads_KV;
+    const unsigned int hd = config_.head_dim;
+    for (unsigned int h = 0; h < config_.num_heads_Q; ++h) {
+      const float *sk = q2_scale_k.data() + (h / G) * hd;
+      const float top = *std::max_element(sk, sk + hd);
+      for (unsigned int d = 0; d < hd; ++d) {
+        const float r = sk[d] / top;
+        q_lo[h] = std::min(q_lo[h], lo[h * hd + d] * r);
+        q_hi[h] = std::max(q_hi[h], hi[h * hd + d] * r);
+      }
+    }
+  } else {
+    for (unsigned int r = 0; r < n_q; ++r) {
+      const float *qr = q + static_cast<size_t>(r) * q_stride;
+      for (unsigned int h = 0; h < config_.num_heads_Q; ++h)
+        attention_quant::min_max_f32(qr + h * config_.head_dim,
+                                     config_.head_dim, q_lo[h], q_hi[h]);
+    }
   }
   q2_q_enc.assign(2 * static_cast<size_t>(config_.num_heads_Q), 0.0f);
   for (unsigned int h = 0; h < config_.num_heads_Q; ++h) {
@@ -506,7 +554,9 @@ void HtpAttentionState::q2_maxima_from_scales() {
 
 bool HtpAttentionState::take_q2_calibration() {
   const auto it = q2_store_.find(q2_name_);
-  const size_t nk = config_.num_heads_KV, nv = nk * config_.head_dim,
+  const size_t nv =
+                 static_cast<size_t>(config_.num_heads_KV) * config_.head_dim,
+               nk = q2_k_per_dim() ? nv : config_.num_heads_KV,
                nq = 2 * config_.num_heads_Q;
   // A saved dropped-row floor adds 2 * nv values.
   const size_t n_cal = nk + nv + 2 * nq;
@@ -633,6 +683,57 @@ bool HtpAttentionState::try_quantized_attention(
     return false;
   };
 
+  // htpKvStaging: the CPU cache holds this step's rows only and the decode
+  // cache every earlier one, so the int8 cache spans the absolute
+  // positions [0, cache_base + cache_to): its rows are the CPU rows shifted
+  // by cache_base. Each call registers it afresh, fills the earlier rows
+  // from the decode cache, appends its own and seeds the decode cache back.
+  const unsigned int cache_base = config_.cache_base;
+  const bool staging = htpKvStaging() && batch == 0;
+  const unsigned int kv_shift = staging ? cache_base : 0u;
+  // htpKvAdopt: with the decode caches registered before the prefill
+  // (setHtpPrefillSeed), a layer's call that ends at the prompt's end seeds
+  // its decode cache from its int8 cache, which goes with the seed, and
+  // frees its CPU rows (KVCacheManager compaction then moves this layer's
+  // base only, kvDetached). Under staging every call seeds. Not taken, the
+  // first token seeds from the CPU rows as before.
+  auto handoff = [&](unsigned int &synced_rows, int h, bool q2) {
+    if (staging) {
+      // the decode cache takes the rows [0, cache_base + cache_to) the
+      // int8 cache now holds (a later call's seed takes over an earlier
+      // one's)
+      NNTR_THROW_IF(
+        !q2 || h < 0 || htp_seed_ord_ < 0 || synced_rows != cache_to ||
+          !htpDecodeKvSeedKvqLayer(static_cast<unsigned>(htp_seed_ord_),
+                                   cache_base + cache_to, h, 0u,
+                                   cache_base > 0),
+        std::runtime_error)
+        << "mha_core: " << q2_name_ << " could not seed its decode cache "
+        << "(int8-only KV: the CPU keeps no rows)";
+      q_cache_handles[batch] = -1; // released on the DSP with the seed
+      kv_detached_ = true;
+      // not htp_owns_cache_: this prompt's next chunk takes its earlier
+      // rows back from the decode cache (the fill), so it is not refused;
+      // only the decode hook's first row hands the cache over for good
+      return;
+    }
+    const unsigned int end = htpPrefillEnd();
+    if (!htpKvAdopt() || !q2 || batch != 0 || h < 0 || !q2_k_per_dim() ||
+        q2_scales_set.empty() || !q2_scales_set[0] || synced_rows != cache_to ||
+        cache_to - cache_from < 2 || end == 0 || cache_base + cache_to != end ||
+        htp_seed_ord_ < 0 || htp_seed_base_ < cache_base ||
+        end <= htp_seed_base_ ||
+        !htpDecodeKvSeedKvqLayer(static_cast<unsigned>(htp_seed_ord_),
+                                 end - htp_seed_base_, h,
+                                 htp_seed_base_ - cache_base))
+      return;
+    q_cache_handles[batch] = -1; // released on the DSP with the seed
+    kv_detached_ = true;
+    htp_owns_cache_ = true;
+    for (const uint16_t *p : {k_base, v_base})
+      config_.compute_ops_->drop_shared(const_cast<uint16_t *>(p));
+  };
+
   if (q_cache_handles.size() <= batch) {
     q_cache_handles.resize(batch + 1, -1);
     q_cache_synced.resize(batch + 1, 0);
@@ -640,6 +741,7 @@ bool HtpAttentionState::try_quantized_attention(
   }
   int &handle = q_cache_handles[batch];
   unsigned int &synced = q_cache_synced[batch];
+  std::vector<float> fill_kr, fill_vr; // the old scale over the new, or none
   // int8 with the row-blocked kernel when the backend has it: fixed scales,
   // no softcap, no sinks, config_.head_dim up to 512.
   const bool use_q2 =
@@ -653,8 +755,9 @@ bool HtpAttentionState::try_quantized_attention(
   if (handle < 0) {
     ts2 = clk::now();
     handle = config_.compute_ops_->kv_cache_q_register(
-      static_cast<unsigned int>(config_.kv_cache_quant_kind), max_rows,
-      config_.num_heads_KV, config_.head_dim);
+      static_cast<unsigned int>(config_.kv_cache_quant_kind),
+      staging ? kv_shift + cache_to : max_rows, config_.num_heads_KV,
+      config_.head_dim);
     if (handle < 0) {
       return fail("register");
     }
@@ -677,7 +780,8 @@ bool HtpAttentionState::try_quantized_attention(
   const unsigned int n_q = cache_to - cache_from;
   const unsigned int q_stride = config_.num_heads_Q * config_.head_dim;
   const unsigned int window =
-    (config_.local_window_size == 0 || config_.local_window_size >= cache_to)
+    (config_.local_window_size == 0 ||
+     config_.local_window_size >= kv_shift + cache_to)
       ? 0u
       : static_cast<unsigned int>(config_.local_window_size);
   if (use_q2) {
@@ -694,18 +798,21 @@ bool HtpAttentionState::try_quantized_attention(
     const bool dsp_calib = runtime.attn_dsp_calib;
     if (!q2_calibrated && config_.attn_out_u16 && dsp_calib &&
         !runtime.attn_f32_check.has_value() && runtime.attn_f32) {
-      q2_scale_k.assign(config_.num_heads_KV, 0.0f);
+      q2_scale_k.assign(q2_k_per_dim() ? config_.num_heads_KV * config_.head_dim
+                                       : config_.num_heads_KV,
+                        0.0f);
       q2_scale_v.assign(
         static_cast<size_t>(config_.num_heads_KV) * config_.head_dim, 0.0f);
       q2_q_enc.assign(2 * static_cast<size_t>(config_.num_heads_Q), 0.0f);
       q2_out_enc.assign(2 * static_cast<size_t>(config_.num_heads_Q), 0.0f);
       const auto t0 = std::chrono::steady_clock::now();
       if (config_.compute_ops_->sdpa_q2_kvcache_f32_calib(
-            handle, append_row0, append_rows, width, k_base + off, v_base + off,
-            io.q, q_stride, n_q, cache_from, cache_to, config_.num_heads_Q,
-            config_.num_heads_KV, config_.head_dim, window, io.out,
-            q2_scale_k.data(), q2_scale_v.data(), q2_q_enc.data(),
-            q2_out_enc.data(), q_stride)) {
+            handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+            v_base + off, io.q, q_stride, n_q, cache_from + kv_shift,
+            cache_to + kv_shift, config_.num_heads_Q, config_.num_heads_KV,
+            config_.head_dim, window, io.out, q2_scale_k.data(),
+            q2_scale_v.data(), q2_q_enc.data(), q2_out_enc.data(), q_stride,
+            q2_k_per_dim())) {
         q2_calibrated = true;
         q2_scales_set[batch] = 1;
         synced = cache_to;
@@ -728,6 +835,7 @@ bool HtpAttentionState::try_quantized_attention(
                   "the accelerator (row-blocked, fixed scales calibrated "
                   "there, u16 context handed to the o-proj)");
         }
+        handoff(synced, handle, use_q2);
         return true;
       }
     }
@@ -749,8 +857,22 @@ bool HtpAttentionState::try_quantized_attention(
       // and would clip at 127 (seen: V 2x at a third chunk). The scales
       // widen to them and every row is re-quantized: the mirror takes rows
       // [0, cache_to) again under the new scales.
+      std::vector<float> old_k, old_v; // staging: the scales before growing
+      if (staging) {
+        old_k = q2_scale_k;
+        old_v = q2_scale_v;
+      }
       if (append_rows != 0 &&
           q2_grow(k_base + off, v_base + off, append_rows, width)) {
+        if (staging) {
+          // the earlier rows come back at the grown scales
+          fill_kr.resize(old_k.size());
+          fill_vr.resize(old_v.size());
+          for (size_t x = 0; x < old_k.size(); ++x)
+            fill_kr[x] = old_k[x] / q2_scale_k[x];
+          for (size_t x = 0; x < old_v.size(); ++x)
+            fill_vr[x] = old_v[x] / q2_scale_v[x];
+        }
         if (runtime.attn_trace)
           ml_logi("mha_core trace: q2 scales grew at rows=%u from=%u; "
                   "re-quantizing %u rows",
@@ -768,6 +890,7 @@ bool HtpAttentionState::try_quantized_attention(
     if (runtime.attn_trace && append_rows != 0) {
       float worst_k = 0.0f, worst_v = 0.0f;
       size_t clip_k = 0, clip_v = 0;
+      const unsigned int k_dims = q2_scale_k.size() / config_.num_heads_KV;
       for (unsigned int r = 0; r < append_rows; ++r) {
         const uint16_t *kr = k_base + off + static_cast<size_t>(r) * width;
         const uint16_t *vr = v_base + off + static_cast<size_t>(r) * width;
@@ -775,7 +898,7 @@ bool HtpAttentionState::try_quantized_attention(
           for (unsigned int d = 0; d < config_.head_dim; ++d) {
             const float kq = std::fabs(nntrainer::compute_fp16_to_fp32(
                                kr[n * config_.head_dim + d])) /
-                             q2_scale_k[n];
+                             q2_scale_k[n * k_dims + d % k_dims];
             const float vq = std::fabs(nntrainer::compute_fp16_to_fp32(
                                vr[n * config_.head_dim + d])) /
                              q2_scale_v[n * config_.head_dim + d];
@@ -789,13 +912,28 @@ bool HtpAttentionState::try_quantized_attention(
       // from the calibration rows)
       size_t clip_q = 0;
       float worst_q = 0.0f;
+      // K per dim: the encoding is the folded Q's, q * fs_kd / fs_k
+      std::vector<float> fold;
+      const unsigned int hd = config_.head_dim;
+      if (q2_scale_k.size() != config_.num_heads_KV) {
+        fold.resize(q2_scale_k.size());
+        for (unsigned int n = 0; n < config_.num_heads_KV; ++n) {
+          const float *sk = q2_scale_k.data() + n * hd;
+          const float top = *std::max_element(sk, sk + hd);
+          for (unsigned int d = 0; d < hd; ++d)
+            fold[n * hd + d] = sk[d] / top;
+        }
+      }
+      const unsigned int G = config_.num_heads_Q / config_.num_heads_KV;
       for (unsigned int r = 0; r < n_q; ++r)
         for (unsigned int h = 0; h < config_.num_heads_Q; ++h) {
           const float step = q2_q_enc[2 * h], zp = q2_q_enc[2 * h + 1];
           const float *qr =
             q_view + static_cast<size_t>(r) * q_stride + h * config_.head_dim;
           for (unsigned int d = 0; d < config_.head_dim; ++d) {
-            const float code = qr[d] / step + zp; // 0 .. 65535 inside
+            const float qd =
+              fold.empty() ? qr[d] : qr[d] * fold[(h / G) * hd + d];
+            const float code = qd / step + zp; // 0 .. 65535 inside
             const float over = code < 0.0f       ? -code
                                : code > 65535.0f ? code - 65535.0f
                                                  : 0.0f;
@@ -815,10 +953,21 @@ bool HtpAttentionState::try_quantized_attention(
     if (!q2_scales_set[batch]) {
       if (!config_.compute_ops_->kv_cache_q_set_fixed_scales(
             handle, config_.num_heads_KV, config_.head_dim, q2_scale_k.data(),
-            q2_scale_v.data())) {
+            q2_scale_v.data(), q2_scale_k.size() != config_.num_heads_KV)) {
         return fail("fixed scales");
       }
       q2_scales_set[batch] = 1;
+    }
+    if (staging && kv_shift > 0) {
+      NNTR_THROW_IF(htp_seed_ord_ < 0 || fill_kr.size() != fill_vr.size() ||
+                      !htpDecodeKvFillKvq(
+                        static_cast<unsigned>(htp_seed_ord_), handle, kv_shift,
+                        fill_kr.empty() ? nullptr : fill_kr.data(),
+                        fill_vr.empty() ? nullptr : fill_vr.data(),
+                        static_cast<unsigned>(fill_kr.size())),
+                    std::runtime_error)
+        << "mha_core: " << q2_name_ << " could not take its rows [0, "
+        << kv_shift << ") back from the decode cache";
     }
     // Q as the model's u16 tensor and the output back from u16: in a
     // quantized graph both are the neighbouring layers' formats already;
@@ -843,11 +992,11 @@ bool HtpAttentionState::try_quantized_attention(
     const bool f32_ran =
       config_.attn_out_u16 && !f32_off &&
       config_.compute_ops_->sdpa_q2_kvcache_f32(
-        handle, append_row0, append_rows, width, k_base + off, v_base + off,
-        io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
-        cache_to, config_.num_heads_Q, config_.num_heads_KV, config_.head_dim,
-        window, io.out, f32_check ? chk16.data() : nullptr, q2_out_enc.data(),
-        q_stride);
+        handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+        v_base + off, io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q,
+        cache_from + kv_shift, cache_to + kv_shift, config_.num_heads_Q,
+        config_.num_heads_KV, config_.head_dim, window, io.out,
+        f32_check ? chk16.data() : nullptr, q2_out_enc.data(), q_stride);
     bool again = false;
     if (f32_ran && f32_check && runtime.attn_trace) {
       // the u16 context's saturation against the fixed output encoding
@@ -869,13 +1018,13 @@ bool HtpAttentionState::try_quantized_attention(
             config_.head_dim, q2_out_enc[2 * h], q2_out_enc[2 * h + 1],
             chk.data() + static_cast<size_t>(r) * q_stride +
               h * config_.head_dim);
-      again =
-        f32_check_mode == 2 &&
-        config_.compute_ops_->sdpa_q2_kvcache_f32(
-          handle, append_row0, append_rows, width, k_base + off, v_base + off,
-          io.q, q_inv.data(), q2_q_enc.data(), q_stride, n_q, cache_from,
-          cache_to, config_.num_heads_Q, config_.num_heads_KV, config_.head_dim,
-          window, io.out, chk16.data(), q2_out_enc.data(), q_stride);
+      again = f32_check_mode == 2 &&
+              config_.compute_ops_->sdpa_q2_kvcache_f32(
+                handle, append_row0 + kv_shift, append_rows, width,
+                k_base + off, v_base + off, io.q, q_inv.data(), q2_q_enc.data(),
+                q_stride, n_q, cache_from + kv_shift, cache_to + kv_shift,
+                config_.num_heads_Q, config_.num_heads_KV, config_.head_dim,
+                window, io.out, chk16.data(), q2_out_enc.data(), q_stride);
       if (again)
         for (unsigned int r = 0; r < n_q; ++r)
           for (unsigned int h = 0; h < config_.num_heads_Q; ++h)
@@ -897,6 +1046,9 @@ bool HtpAttentionState::try_quantized_attention(
                 "accelerator (row-blocked, fixed scales, u16 context handed "
                 "to the o-proj)");
       }
+      // a later chunk's call ends here, as the first call ends at the
+      // calibration: it seeds the decode cache the same way
+      handoff(synced, handle, use_q2);
       return true;
     }
     // Only the host conversion path needs these buffers.
@@ -909,21 +1061,42 @@ bool HtpAttentionState::try_quantized_attention(
     // Keep both NEON conversions on this thread to avoid scheduling overhead.
     const bool conv_trace = runtime.attn_trace;
     const auto tq0 = std::chrono::steady_clock::now();
+    // K per dim: Q's inverse step times fs_kd / fs_k per dim, formed as the
+    // accelerator's f32 path forms it (hexkl_attn_q2 stage_qprep)
+    std::vector<float> q_inv_d;
+    if (q2_scale_k.size() != config_.num_heads_KV) {
+      const unsigned int G = config_.num_heads_Q / config_.num_heads_KV;
+      const unsigned int hd = config_.head_dim;
+      q_inv_d.resize(q_stride);
+      for (unsigned int h = 0; h < config_.num_heads_Q; ++h) {
+        const float *sk = q2_scale_k.data() + (h / G) * hd;
+        const float top = *std::max_element(sk, sk + hd);
+        for (unsigned int d = 0; d < hd; ++d)
+          q_inv_d[h * hd + d] = q_inv[h] * (sk[d] / top);
+      }
+    }
     for (unsigned int r = 0; r < n_q && !again; ++r) {
       const float *qr = q_view + static_cast<size_t>(r) * q_stride;
       uint16_t *dst = q2_q_u16.data() + static_cast<size_t>(r) * q_stride;
       for (unsigned int h = 0; h < config_.num_heads_Q; ++h)
-        attention_quant::quant_u16_f32(
-          qr + h * config_.head_dim, config_.head_dim, 1.0f / q2_q_enc[2 * h],
-          q2_q_enc[2 * h + 1], dst + h * config_.head_dim);
+        if (q_inv_d.empty())
+          attention_quant::quant_u16_f32(
+            qr + h * config_.head_dim, config_.head_dim, 1.0f / q2_q_enc[2 * h],
+            q2_q_enc[2 * h + 1], dst + h * config_.head_dim);
+        else
+          attention_quant::quant_u16_f32(
+            qr + h * config_.head_dim, config_.head_dim,
+            q_inv_d.data() + h * config_.head_dim, q2_q_enc[2 * h + 1],
+            dst + h * config_.head_dim);
     }
     const auto tq1 = std::chrono::steady_clock::now();
     if (!again &&
         !config_.compute_ops_->sdpa_q2_kvcache(
-          handle, append_row0, append_rows, width, k_base + off, v_base + off,
-          q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q, cache_from, cache_to,
-          config_.num_heads_Q, config_.num_heads_KV, config_.head_dim, window,
-          q2_out_u16.data(), q2_out_enc.data(), q_stride)) {
+          handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+          v_base + off, q2_q_u16.data(), q2_q_enc.data(), q_stride, n_q,
+          cache_from + kv_shift, cache_to + kv_shift, config_.num_heads_Q,
+          config_.num_heads_KV, config_.head_dim, window, q2_out_u16.data(),
+          q2_out_enc.data(), q_stride)) {
       return fail("attention");
     }
     const auto tq2 = std::chrono::steady_clock::now();
@@ -968,11 +1141,11 @@ bool HtpAttentionState::try_quantized_attention(
               n_q, us(tq1 - tq0), us(tq2 - tq1), us(tq3 - tq2));
     }
   } else if (!config_.compute_ops_->sdpa_q_kvcache(
-               handle, append_row0, append_rows, width, k_base + off,
-               v_base + off, q_view, q_stride, n_q, cache_from, cache_to,
-               config_.num_heads_Q, config_.num_heads_KV, config_.head_dim,
-               window, config_.attn_logit_softcapping, io.sinks, io.out,
-               q_stride)) {
+               handle, append_row0 + kv_shift, append_rows, width, k_base + off,
+               v_base + off, q_view, q_stride, n_q, cache_from + kv_shift,
+               cache_to + kv_shift, config_.num_heads_Q, config_.num_heads_KV,
+               config_.head_dim, window, config_.attn_logit_softcapping,
+               io.sinks, io.out, q_stride)) {
     return fail("attention");
   }
   synced = cache_to;
@@ -984,6 +1157,7 @@ bool HtpAttentionState::try_quantized_attention(
             config_.kv_cache_quant_kind == 0 ? "int8" : "int4",
             use_q2 ? " (row-blocked, fixed scales)" : "");
   }
+  handoff(synced, handle, use_q2);
   return true;
 }
 } // namespace nntrainer

@@ -225,6 +225,12 @@ public:
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
 
+  /** Whether the layer's CPU KV rows are gone (HtpAttentionState). */
+  WIN_EXPORT bool kvDetached() const;
+
+  /** See HtpAttentionState::setHtpPrefillSeed. */
+  WIN_EXPORT void setHtpPrefillSeed(int ordinal, unsigned int decode_base);
+
 private:
   std::tuple<
     nntrainer::props::NumHeads, attention_props::NumHeads_KV,

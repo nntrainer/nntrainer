@@ -90,6 +90,7 @@ void validateHtpRuntimeConfig(const HtpRuntimeConfig &config) {
   require(!h.dump_all || !h.dump_dir.empty(),
           "htp.dump_all requires htp.dump_dir");
   require(m.cache_experts >= 1, "moe.cache_experts must be positive");
+  require(m.warm_experts <= 4096, "moe.warm_experts must be 0..4096");
   require(finiteValue(m.lrfu_half_life) && m.lrfu_half_life >= 0,
           "moe.lrfu_half_life must be finite and nonnegative");
   require(m.prefill_lookahead <= INT_MAX,

@@ -53,6 +53,7 @@ using HtpCpuList = std::vector<int>;
   X(bool, qkv_to_host, false)                                                  \
   X(bool, oproj_u16, true)                                                     \
   X(bool, kv_seed_q, false)                                                    \
+  X(bool, kv_adopt, true)                                                      \
   X(bool, attn_f16, true)                                                      \
   X(bool, attn_q2, true)                                                       \
   X(bool, attn_dsp_calib, true)                                                \
@@ -81,6 +82,7 @@ using HtpCpuList = std::vector<int>;
 #define NNTR_MOE_CONFIG_FIELDS(X)                                              \
   X(unsigned, cache_experts, 16u)                                              \
   X(unsigned, preload_experts, 128u)                                           \
+  X(unsigned, warm_experts, 16u)                                               \
   X(HtpOptionalUnsigned, cache_grow, {})                                       \
   X(double, lrfu_half_life, 32.0)                                              \
   X(unsigned, prefill_lookahead, 1u << 20)                                     \

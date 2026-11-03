@@ -421,6 +421,7 @@ public:
   /** Start an independent prompt; the caller has joined its generation. */
   void beginPrompt() {
     htp_router_handoff_invalidate(&staging_.router_handoff_);
+    warmEnd(); // a generation stopped before its first token
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
@@ -458,6 +459,10 @@ public:
     t1_printed_ = false;
     decode_.prompt_tokens_ = 0;
     seed_rpc_us_ = seed_calls_ = seed_kvq_ = 0;
+    prefill_seeds_ = 0;
+    prefill_seed_us_ = 0;
+    prefill_fills_ = 0;
+    prefill_fill_us_ = 0;
   }
 
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
@@ -2205,13 +2210,24 @@ public:
         // (S26 Ultra, p1024: 30 binds were 439 ms of the first token)
         const uint32_t want = decode_.graph_words_[6] * rec->head_dim;
         uint32_t src = HTP_GRAPH_NO_OP;
-        for (const auto &t : decode_.rope_tables_)
+        // the layers of one RoPE cache hand one table at one address over
+        // the first row (the attention state's table cache): that address
+        // names it, without the memcmp below
+        for (const auto &p : decode_.rope_ptrs_)
+          if (p.data == param && p.n == param_len && param_len == want) {
+            src = p.op;
+            break;
+          }
+        for (const auto &t : decode_.rope_tables_) {
+          if (src != HTP_GRAPH_NO_OP)
+            break;
           if (t.second.size() == param_len && param_len == want &&
               std::memcmp(t.second.data(), param, param_len * sizeof(float)) ==
                 0) {
             src = t.first;
             break;
           }
+        }
         if (src != HTP_GRAPH_NO_OP) {
           const int err = nntr_hvx_graph_share_param(
             session, r, HTP_GRAPH_PARAM_ROPE_TABLE, src);
@@ -2225,6 +2241,8 @@ public:
           decode_.rope_tables_.emplace_back(
             r, std::vector<float>(param, param + param_len));
         }
+        decode_.rope_ptrs_.push_back(
+          {param, param_len, src != HTP_GRAPH_NO_OP ? src : r});
         decode_.param_bound_[r] = 1;
       }
       // The DSP cache must hold rows [0, pos): seed it from the layer's
@@ -2468,6 +2486,95 @@ public:
     return on;
   }
 
+  /** The KV adoption, on unless htp.kv_adopt=false: each HTP attention
+   *  layer's prefill seeds its decode cache on the DSP from its int8 cache
+   *  (decode_kv_seed_kvq_layer); attn_m1 is registered before the prefill
+   *  (decode_kv_prepare) and its layers allocated lazily, as under
+   *  kvSeedQ. K's prefill scale is per (head, dim) with it. */
+  static bool kvAdopt() { return htpRuntimeConfig().htp.kv_adopt; }
+
+  bool decode_kv_prepare() override {
+    if (!kvAdopt() || decode_.graph_words_.empty() ||
+        decode_.kind_ops_[HTP_OP_ATTN_M1].empty())
+      return false;
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    try {
+      ensureAttentionCaches(session);
+    } catch (const std::exception &e) {
+      std::fprintf(stderr,
+                   "[HTP] decode_kv_prepare: %s; the seeds wait for the "
+                   "first token\n",
+                   e.what());
+      return false;
+    }
+    return decode_.attn_registered_;
+  }
+
+  bool decode_kv_seed_kvq_layer(unsigned ordinal, unsigned n_rows,
+                                int kv_handle, unsigned shift,
+                                bool reseed) override {
+    if (!kvAdopt() || !decode_.attn_registered_ || kv_handle < 0 ||
+        ordinal >= decode_.attn_op_.size() ||
+        (decode_.kv_len_[ordinal] != 0u && !reseed))
+      return false;
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      if (kvq_handles_.count(static_cast<uint32_t>(kv_handle)) == 0)
+        return false;
+    }
+    const remote_handle64 session =
+      static_cast<remote_handle64>(HtpBackend::global().handle());
+    const uint32_t layer =
+      decode_.attn_cache_ord_[ordinal] |
+      (decode_.attn_cache_[ordinal] ? HTP_ATTN_KV_CACHE_B : 0u) |
+      (reseed ? HTP_ATTN_KV_RESEED : 0u);
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_attn_m1_seed_kvq_tiles(
+      session, layer, static_cast<uint32_t>(kv_handle), n_rows, shift);
+    prefill_seed_us_ += HtpProfile::nowUs() - t0;
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr,
+                   "[HTP] prefill seed: layer %u not seeded (%s); it keeps "
+                   "its CPU rows to the first token\n",
+                   ordinal, graphErr(err).c_str());
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(kvq_mutex_);
+      kvq_handles_.erase(static_cast<uint32_t>(kv_handle)); // DSP released
+    }
+    ++prefill_seeds_;
+    decode_.kv_len_[ordinal] = n_rows;
+    return true;
+  }
+
+  bool decode_kv_fill_kvq(unsigned ordinal, int kv_handle, unsigned n_rows,
+                          const float *k_ratio, const float *v_ratio,
+                          unsigned n_ratio) override {
+    if (!kvAdopt() || !decode_.attn_registered_ || kv_handle < 0 ||
+        ordinal >= decode_.attn_op_.size() || decode_.kv_len_[ordinal] < n_rows)
+      return false;
+    const uint32_t layer =
+      decode_.attn_cache_ord_[ordinal] |
+      (decode_.attn_cache_[ordinal] ? HTP_ATTN_KV_CACHE_B : 0u);
+    const uint64_t t0 = HtpProfile::nowUs();
+    const int err = nntr_hvx_kv_fill_q(
+      static_cast<remote_handle64>(HtpBackend::global().handle()),
+      static_cast<uint32_t>(kv_handle), layer, n_rows, k_ratio,
+      k_ratio ? static_cast<int>(n_ratio) : 0, v_ratio,
+      v_ratio ? static_cast<int>(n_ratio) : 0);
+    prefill_fill_us_ += HtpProfile::nowUs() - t0;
+    ++prefill_fills_;
+    if (err != AEE_SUCCESS) {
+      std::fprintf(stderr, "[HTP] prefill fill: layer %u not filled (%s)\n",
+                   ordinal, graphErr(err).c_str());
+      return false;
+    }
+    return true;
+  }
+
   bool decode_kv_seed_kvq(unsigned n_rows, int kv_handle,
                           const float *k_rows) override {
     if (!kvSeedQ() || kv_handle < 0 || decode_.seed_ordinal_ == HTP_GRAPH_NO_OP)
@@ -2562,6 +2669,69 @@ public:
 
   void set_decode_pool_grow(const std::function<void(size_t)> &grow) override {
     pool_grow_ = grow;
+  }
+
+  void set_decode_pool_warm(
+    const std::function<std::vector<ExpertFileDesc>()> &begin,
+    const std::function<void(const std::vector<const void *> &)> &end)
+    override {
+    warm_begin_ = begin;
+    warm_end_ = end;
+  }
+
+  /** moe.warm_experts: after a prefill (pool_dirty_), the layers' warm
+   *  lists are queued to the prefetch readers here -- at the prompt's last
+   *  MoE call (begin_decode_pool_warm), else at the first decode row's
+   *  graph init -- and registered at poolSync: the reads run under the lm
+   *  head, the graph init and the seed instead of as the first token's
+   *  misses. */
+  void begin_decode_pool_warm() override { warmBegin("prefill_end"); }
+
+  void warmBegin(const char *at) {
+    if (!warm_begin_ || warm_pending_ || !pool_dirty_ || !e2e_)
+      return;
+    const uint64_t t0 = HtpProfile::nowUs();
+    const std::vector<ExpertFileDesc> want = warm_begin_();
+    if (want.empty())
+      return;
+    warm_pending_ = prefetch_qs4cx_wh_experts_begin(want);
+    if (!warm_pending_)
+      warm_end_({});
+    std::fprintf(stderr, "[HTP] t1: warm queued=%zu queue_ms=%.1f at=%s\n",
+                 warm_pending_ ? want.size() : size_t(0),
+                 (HtpProfile::nowUs() - t0) / 1000.0, at);
+  }
+
+  /** The first token is the deadline: the reads not started by now are
+   *  cancelled (their slots go back, the token's misses read what it
+   *  routes to) and only the ones in flight are waited for. Waiting for
+   *  all 416 of 16 a layer cost the S26 Ultra's first token 68-139 ms with
+   *  the adoption, where the graph init hides only 42 ms of them, while a
+   *  third of them is the first token's. */
+  void warmEnd() {
+    if (!warm_pending_)
+      return;
+    const uint64_t t0 = HtpProfile::nowUs();
+    warm_pending_ = false;
+    const std::vector<const void *> none;
+    std::vector<const void *> cancelled;
+    const std::vector<const void *> keys =
+      prefetch_qs4cx_wh_experts_end(&none, &cancelled);
+    warm_end_(keys);
+    std::fprintf(
+      stderr, "[HTP] t1: warm registered=%zu cancelled=%zu wait_ms=%.1f\n",
+      keys.size(), cancelled.size(), (HtpProfile::nowUs() - t0) / 1000.0);
+  }
+
+  /** What a prompt's first token leaves: the prefill's staging, its idle
+   *  readers, its heap, and (@a grow) the pool's growth, in that order: the
+   *  growth places slots in the room the staging leaves. */
+  void runAfterFirstToken(bool grow) {
+    staging_.releasePrefillStaging(); // the seed was the last big row
+    readers_.releaseIdlePrefillReaders();
+    purgePrefillHeap();
+    if (grow)
+      growPool();
   }
 
   /** moe.cache_grow=<n>: once the first token is done
@@ -2661,6 +2831,7 @@ public:
     if (!pool_dirty_)
       return;
     const uint64_t t_ps = HtpProfile::nowUs();
+    warmEnd(); // before switchTl2Phase drains the queue without the LRU
     switchTl2Phase(true);
     initPoolPrefetch();
     pinExperts();
@@ -2725,7 +2896,7 @@ public:
     if (!t1_printed_) {
       t1_printed_ = true;
       size_t left = 0;
-      if (kvSeedQ()) {
+      if (kvSeedQ() || kvAdopt()) {
         // a layer the DSP seed did not take keeps its cache till here
         std::lock_guard<std::mutex> lock(kvq_mutex_);
         left = kvq_handles_.size();
@@ -2737,10 +2908,27 @@ public:
       std::fprintf(stderr,
                    "[HTP] t1: pool_sync_ms=%.1f (drop_host_fc+pin %.1f) "
                    "kv_seed_rpc_ms=%.1f seeds=%u (dsp %u, kvq freed late %zu) "
+                   "prefill_seeds=%u prefill_seed_ms=%.1f "
+                   "prefill_fills=%u prefill_fill_ms=%.1f "
                    "rss_mib=%.1f mem_available_mib=%.1f\n",
                    (HtpProfile::nowUs() - t_ps) / 1000.0,
                    (t_drop - t_ps) / 1000.0, seed_rpc_us_ / 1000.0, seed_calls_,
-                   seed_kvq_, left, rssMib(), memAvailMib());
+                   seed_kvq_, left, prefill_seeds_, prefill_seed_us_ / 1000.0,
+                   prefill_fills_, prefill_fill_us_ / 1000.0, rssMib(),
+                   memAvailMib());
+      uint32_t si[12] = {0};
+      if (prefill_seeds_ != 0 &&
+          nntr_hvx_session_info(
+            static_cast<remote_handle64>(HtpBackend::global().handle()), si,
+            12) == AEE_SUCCESS)
+        // [C] where prefill_seed_ms goes: the RPCs' DSP time (the rest is
+        // the round trips), and the decode layers' allocations, inline in
+        // a seed or by the DSP thread one layer ahead (off the prefill)
+        std::fprintf(stderr,
+                     "[HTP] t1: prefill_seed dsp_ms=%.1f alloc inline=%u "
+                     "(%.1f ms) ahead=%u (%.1f ms)\n",
+                     si[8] / 1000.0, si[11] >> 16, si[9] / 1000.0,
+                     si[11] & 0xFFFFu, si[10] / 1000.0);
     }
     // Decode-loaded pages remain cached until the next prefill.
     adviseLater(std::move(drop));
@@ -3326,6 +3514,7 @@ public:
   }
 
   void ensureGraphInit(remote_handle64 session) {
+    warmBegin("graph_init");
     std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
     if (decode_.graph_inited_) {
       ensureAttentionCaches(session);
@@ -3336,13 +3525,31 @@ public:
     const uint64_t t_init = HtpProfile::nowUs();
     struct InitLine {
       uint64_t t0;
+      uint64_t at[6] = {}; /**< place_fc bind rpc params attn e2e ends */
       ~InitLine() {
-        std::fprintf(stderr, "[HTP] t1: graph_init_ms=%.1f\n",
-                     (HtpProfile::nowUs() - t0) / 1000.0);
+        double ms[6];
+        uint64_t prev = t0;
+        for (int i = 0; i < 6; ++i) {
+          const uint64_t t = at[i] ? at[i] : prev;
+          ms[i] = (t - prev) / 1000.0;
+          prev = t;
+        }
+        std::fprintf(stderr,
+                     "[HTP] t1: graph_init_ms=%.1f (place_fc %.1f bind %.1f "
+                     "rpc %.1f params %.1f attn %.1f e2e %.1f)\n",
+                     (HtpProfile::nowUs() - t0) / 1000.0, ms[0], ms[1], ms[2],
+                     ms[3], ms[4], ms[5]);
       }
     } init_line{t_init};
+    // the first token's timeline (tokenForward prints it)
+    struct T1Mark {
+      uint64_t &end;
+      ~T1Mark() { end = HtpProfile::nowUs(); }
+    } t1_mark{t1_gi1_};
+    t1_gi0_ = t_init;
     if (e2e_ && !decode_.q4m1_bound_)
       e2ePlaceFc(); // a caller that never ran finish_decode_graph_q4_0
+    init_line.at[0] = HtpProfile::nowUs();
     if ((decode_.resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0u &&
         !decode_.q4m1_bound_) {
       try {
@@ -3354,6 +3561,7 @@ public:
       // the E2E FC arena is placed once: a retry keeps it
       decode_.q4m1_bound_ = e2e_;
     }
+    init_line.at[1] = HtpProfile::nowUs();
     uint32_t n_ops = 0;
     {
       const int err = nntr_hvx_graph_init(
@@ -3365,6 +3573,8 @@ public:
                                  graphErr(err));
       }
     }
+    init_line.at[2] = HtpProfile::nowUs();
+    size_t param_bytes = 0;
     // each resident MoE op's EXPERTS table; a refusal
     // releases the graph, so a retry inits again
     try {
@@ -3379,6 +3589,7 @@ public:
       }
       // the parameters the model handed at load, by name
       for (const LoadParam &p : decode_.load_params_) {
+        param_bytes += size_t(p.n) * sizeof(float);
         setParam(session, p.op, p.which, p.data, p.n, p.n, "load parameter");
         const auto q = weights_.static_quant_.find(p.data);
         if (p.which == HTP_GRAPH_PARAM_ROUTER_W &&
@@ -3417,6 +3628,19 @@ public:
       throw;
     }
     decode_.graph_inited_ = true;
+    init_line.at[3] = HtpProfile::nowUs();
+    {
+      // the DSP's share of the params stage (graph_set_param's own time;
+      // the rest is the round trips and the argument copies)
+      uint32_t si[13] = {0};
+      const bool dsp = nntr_hvx_session_info(session, si, 13) == AEE_SUCCESS;
+      std::fprintf(stderr,
+                   "[HTP] t1: graph_init params=%zu mib=%.1f ms=%.1f "
+                   "dsp_ms=%.1f\n",
+                   decode_.load_params_.size(), param_bytes / 1048576.0,
+                   (init_line.at[3] - init_line.at[2]) / 1000.0,
+                   dsp ? si[12] / 1000.0 : -1.0);
+    }
     memLine("t1 after graph init");
     char names[128];
     std::fprintf(
@@ -3424,8 +3648,10 @@ public:
       htp_graph_kinds_str(decode_.resident_mask_, names, sizeof(names)),
       decode_.moe_ops_.size());
     ensureAttentionCaches(session);
+    init_line.at[4] = HtpProfile::nowUs();
     if (e2e_)
       e2eStart();
+    init_line.at[5] = HtpProfile::nowUs();
   }
 
   void ensureAttentionCaches(remote_handle64 session) {
@@ -3433,7 +3659,8 @@ public:
       return;
     // Release quantized prefill caches before allocating the decode cache.
     // With kvSeedQ(), each layer releases its cache after seeding instead.
-    if (e2e_ && !kvSeedQ()) { // the seeds free them one layer at a time
+    if (e2e_ && !kvSeedQ() &&
+        !kvAdopt()) { // the seeds free them one layer at a time
       std::lock_guard<std::mutex> lock(kvq_mutex_);
       for (uint32_t h : kvq_handles_)
         nntr_hvx_kv_release_q(session, h);
@@ -3472,7 +3699,8 @@ public:
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
-        max_seq | (q8 ? 0x80000000u : 0u) | (kvSeedQ() ? 0x40000000u : 0u) |
+        max_seq | (q8 ? 0x80000000u : 0u) |
+          (kvSeedQ() || kvAdopt() ? 0x40000000u : 0u) |
           (fast ? 0x20000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
@@ -3749,6 +3977,9 @@ public:
    */
   bool prefetch_qs4cx_wh_experts_begin(
     const std::vector<ExpertFileDesc> &ds) override {
+    // a prefill started before the first token: its batches queue behind
+    // no warm-up (the readers hand batches back in order)
+    warmEnd();
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     switchTl2Phase(false);
@@ -5422,8 +5653,10 @@ private:
                static_cast<unsigned>(decode_.ban_.size()), "LM_BAN");
       decode_.ban_sent_ = decode_.ban_;
     }
+    const uint64_t ps0 = HtpProfile::nowUs();
     if (!pool_descs_.empty())
       poolSync();
+    const uint64_t ps1 = HtpProfile::nowUs();
     std::lock_guard<std::mutex> lock(invoke_mutex_);
     htp_router_handoff_invalidate(&staging_.router_handoff_);
     std::memcpy(q.act->data(), act, act_bytes);
@@ -5550,22 +5783,49 @@ private:
     e.inout_us += static_cast<int32_t>(r.t_out_us - r.t_in_us);
     ++decode_.fwd_calls_; // one ARM -> DSP packet per token: calls/token = 1.00
     ++decode_.fwd_tokens_;
-    if (++decode_.prompt_tokens_ == 1) {
-      staging_.releasePrefillStaging(); // the seed was the last big row
-      readers_.releaseIdlePrefillReaders();
-      purgePrefillHeap();
-    }
-    if (e.tokens == 1)
+    const uint64_t cl0 = HtpProfile::nowUs();
+    if (++decode_.prompt_tokens_ == 1)
+      runAfterFirstToken(e.tokens == 1);
+    else if (e.tokens == 1)
       growPool();
-    if (e.tokens == 1)
+    if (e.tokens == 1) {
       std::fprintf(stderr,
                    "[HTP] token driver: first token pos=%u id=%u us=%llu "
                    "logits=%d\n",
                    pos, r.id, (unsigned long long)us, logits);
+      auto ms = [](uint64_t a, uint64_t b) {
+        return b > a ? (b - a) / 1000.0 : 0.0;
+      };
+      // from the graph init's start: the graph init, the model's rows up
+      // to this token's packet, the pool sync, the packet, the cleanups
+      std::fprintf(stderr,
+                   "[HTP] t1: timeline_ms graph_init=%.1f to_token=%.1f "
+                   "pool_sync=%.1f to_packet=%.1f packet=%.1f cleanup=%.1f\n",
+                   ms(t1_gi0_, t1_gi1_), ms(t1_gi1_, entry_us), ms(ps0, ps1),
+                   ms(ps1, t0), us / 1000.0, ms(cl0, HtpProfile::nowUs()));
+    }
     HtpProfile &profile = HtpProfile::global();
     if (profile.level())
       profile.addInvokeForward(
         static_cast<unsigned>(decode_.stretch_start_.size()), 0, r.pcycles);
+    // htp.profile: the first tokens one line each, the summary lines being
+    // per-token means (the first token's packet runs ~3x a steady one: its
+    // misses and kinds side by side with the next tokens')
+    if (profile.level() && e.tokens <= 4) {
+      std::string kinds;
+      char buf[48];
+      for (uint32_t kd = 0; kd < HTP_OP_KIND_N; ++kd)
+        if (r.kind_us[kd] != 0) {
+          std::snprintf(buf, sizeof(buf), " %s=%u", htp_graph_kind_name(kd),
+                        r.kind_us[kd]);
+          kinds += buf;
+        }
+      std::fprintf(stderr,
+                   "[HTP] token driver: token %llu pos=%u us=%llu "
+                   "dsp_wall_us=%u misses=%u miss_us=%u kind_us:%s\n",
+                   (unsigned long long)e.tokens, pos, (unsigned long long)us,
+                   r.wall_us, r.misses, r.miss_us, kinds.c_str());
+    }
     e.last_exit_us = HtpProfile::nowUs();
     e.fwd_us += e.last_exit_us - entry_us;
   }
@@ -8904,6 +9164,13 @@ private:
   uint64_t seed_rpc_us_ = 0;
   unsigned seed_calls_ = 0;
   unsigned seed_kvq_ = 0; /**< of them, seeded on the DSP from kvq */
+  /** decode_kv_seed_kvq_layer: seeds run inside the prefill, and their
+   *  DSP time (printed with the t1 seed line) */
+  uint32_t prefill_seeds_ = 0;
+  uint64_t prefill_seed_us_ = 0;
+  uint64_t prefill_fill_us_ = 0; /**< decode_kv_fill_kvq's RPCs */
+  unsigned prefill_fills_ = 0;
+  uint64_t t1_gi0_ = 0, t1_gi1_ = 0; /**< graph init's window */
   bool t1_printed_ = false;
   /** the kv_cache_q handles registered and not released */
   std::mutex kvq_mutex_;
@@ -8923,6 +9190,10 @@ private:
   std::unordered_map<const void *, std::pair<uint32_t, uint32_t>> pool_where_;
   ExpertPoolFn pool_fn_;
   std::function<void(size_t)> pool_grow_; /**< set_decode_pool_grow */
+  /** moe.warm_experts: set_decode_pool_warm's pair, and a queued batch */
+  std::function<std::vector<ExpertFileDesc>()> warm_begin_;
+  std::function<void(const std::vector<const void *> &)> warm_end_;
+  bool warm_pending_ = false;
   std::vector<uint8_t> pool_answered_;    /**< layers a miss round served
                                              this token (handle_mutex_) */
   bool pool_dirty_ = true;
@@ -9306,7 +9577,7 @@ public:
 
   bool kv_cache_q_set_fixed_scales(int handle, unsigned int n_head_kv,
                                    unsigned int head_dim, const float *s_k,
-                                   const float *s_v) override {
+                                   const float *s_v, bool k_per_dim) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || !s_k || !s_v || n_head_kv == 0 ||
         head_dim == 0) {
@@ -9314,7 +9585,7 @@ public:
     }
     const int err = nntr_hvx_kv_set_fixed_scales_q(
       static_cast<remote_handle64>(hb.handle()), static_cast<uint32_t>(handle),
-      s_k, static_cast<int>(n_head_kv), s_v,
+      s_k, static_cast<int>(k_per_dim ? n_head_kv * head_dim : n_head_kv), s_v,
       static_cast<int>(n_head_kv * head_dim));
     if (err != AEE_SUCCESS) {
       ml_logw("HTP quantized KV cache: fixed scales failed: 0x%x", err);
@@ -9479,7 +9750,7 @@ public:
     unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
     unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
     float *out, float *s_k, float *s_v, float *q_enc, float *out_enc,
-    unsigned int out_stride) override {
+    unsigned int out_stride, bool k_per_dim) override {
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 64) != 0 ||
@@ -9508,15 +9779,16 @@ public:
     const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
     uint16_t *out_ion = reinterpret_cast<uint16_t *>(
       staging_.stage(staging_.attn_out_pool_, out_bytes).data());
-    std::vector<float> calib(n_head_kv + kv_stride + 4 * n_head_q);
+    const unsigned int nk = k_per_dim ? kv_stride : n_head_kv;
+    std::vector<float> calib(nk + kv_stride + 4 * n_head_q);
     const int err = nntr_hvx_attn_q2_step_fqc(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,
       calib.data(), static_cast<int>(calib.size()), out_ion, q_len, stats, 12);
     if (err == AEE_SUCCESS) {
       const float *p = calib.data();
-      std::copy(p, p + n_head_kv, s_k);
-      p += n_head_kv;
+      std::copy(p, p + nk, s_k);
+      p += nk;
       std::copy(p, p + kv_stride, s_v);
       p += kv_stride;
       std::copy(p, p + enc_len, q_enc);
