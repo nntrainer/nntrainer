@@ -1,0 +1,467 @@
+RUN hvx-round1-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=230.851 i32_us=193.872 chain_us=295.694 rq_us=63.715 rq_single_us=327.587
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=226.458 i32_us=188.038 chain_us=293.715 rq_us=60.417 rq_single_us=326.042
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=231.076 i32_us=194.392 chain_us=295.382 rq_us=73.958 rq_single_us=326.337
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=225.972 i32_us=188.160 chain_us=293.160 rq_us=64.583 rq_single_us=325.833
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=233.038 i32_us=194.444 chain_us=301.806 rq_us=61.042 rq_single_us=327.622
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=234.184 i32_us=197.170 chain_us=294.462 rq_us=74.132 rq_single_us=325.677
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN hvx-round1-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=868.628 i32_us=817.274 chain_us=1156.719 rq_us=353.837 rq_single_us=1348.038
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=870.087 i32_us=818.281 chain_us=1155.938 rq_us=342.813 rq_single_us=1344.878
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=868.108 i32_us=823.247 chain_us=1154.184 rq_us=356.979 rq_single_us=1349.340
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=860.347 i32_us=812.743 chain_us=1149.514 rq_us=352.413 rq_single_us=1348.889
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=874.028 i32_us=818.264 chain_us=1153.281 rq_us=344.323 rq_single_us=1347.552
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=873.316 i32_us=822.604 chain_us=1159.236 rq_us=355.295 rq_single_us=1344.757
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round1-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1235.069 i32_us=1171.181 chain_us=1690.052 rq_us=536.146 rq_single_us=2021.788
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1230.243 i32_us=1174.896 chain_us=1681.962 rq_us=511.615 rq_single_us=2021.476
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1233.316 i32_us=1175.278 chain_us=1676.528 rq_us=523.021 rq_single_us=2024.167
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1229.479 i32_us=1170.972 chain_us=1691.059 rq_us=526.354 rq_single_us=2021.163
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1230.590 i32_us=1173.646 chain_us=1684.757 rq_us=517.344 rq_single_us=2021.042
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1232.639 i32_us=1173.351 chain_us=1693.142 rq_us=529.722 rq_single_us=2024.601
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round1-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=285.052 i32_us=272.500 chain_us=372.118 rq_us=60.955 rq_single_us=325.764
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=283.229 i32_us=273.125 chain_us=372.899 rq_us=61.215 rq_single_us=324.931
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=282.205 i32_us=277.274 chain_us=372.396 rq_us=74.774 rq_single_us=325.260
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=287.934 i32_us=271.042 chain_us=372.569 rq_us=63.073 rq_single_us=324.653
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=285.903 i32_us=273.455 chain_us=383.715 rq_us=60.833 rq_single_us=324.896
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=285.764 i32_us=269.913 chain_us=374.219 rq_us=74.531 rq_single_us=326.979
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round1-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1084.375 i32_us=1047.205 chain_us=1368.854 rq_us=354.063 rq_single_us=1346.806
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1086.858 i32_us=1048.073 chain_us=1377.448 rq_us=339.392 rq_single_us=1348.385
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1081.944 i32_us=1049.601 chain_us=1379.236 rq_us=358.229 rq_single_us=1349.219
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1079.514 i32_us=1043.785 chain_us=1373.628 rq_us=354.392 rq_single_us=1346.944
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1076.042 i32_us=1046.458 chain_us=1371.007 rq_us=341.059 rq_single_us=1351.719
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1084.132 i32_us=1044.792 chain_us=1377.604 rq_us=357.760 rq_single_us=1342.222
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round1-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=342.830 i32_us=345.469 chain_us=347.465 rq_us=2.188 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=1 fp32_us=343.438 i32_us=346.094 chain_us=348.160 rq_us=2.205 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.587 i32_us=345.972 chain_us=347.535 rq_us=2.326 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=3 fp32_us=343.003 i32_us=345.764 chain_us=348.438 rq_us=2.205 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=4 fp32_us=342.431 i32_us=345.677 chain_us=348.021 rq_us=2.309 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=5 fp32_us=343.038 i32_us=345.868 chain_us=348.368 rq_us=2.240 rq_single_us=10.104
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK
+
+RUN hvx-round2-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=232.969 i32_us=195.295 chain_us=297.014 rq_us=62.240 rq_single_us=323.976
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=234.740 i32_us=191.979 chain_us=300.868 rq_us=60.608 rq_single_us=323.160
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=233.819 i32_us=195.799 chain_us=291.927 rq_us=72.535 rq_single_us=324.757
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=226.997 i32_us=190.660 chain_us=285.885 rq_us=61.406 rq_single_us=323.681
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=235.503 i32_us=193.924 chain_us=298.802 rq_us=59.549 rq_single_us=323.993
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=234.288 i32_us=197.760 chain_us=294.688 rq_us=74.878 rq_single_us=324.549
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN hvx-round2-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=868.090 i32_us=816.719 chain_us=1156.319 rq_us=356.198 rq_single_us=1347.708
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=870.278 i32_us=814.722 chain_us=1163.073 rq_us=339.722 rq_single_us=1348.472
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=861.753 i32_us=813.455 chain_us=1152.847 rq_us=356.632 rq_single_us=1350.712
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=867.847 i32_us=821.701 chain_us=1163.368 rq_us=355.868 rq_single_us=1350.017
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=864.670 i32_us=818.802 chain_us=1157.517 rq_us=342.378 rq_single_us=1350.642
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=865.764 i32_us=818.976 chain_us=1157.431 rq_us=360.972 rq_single_us=1349.236
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round2-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1216.424 i32_us=1168.576 chain_us=1678.420 rq_us=532.882 rq_single_us=2023.976
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1223.229 i32_us=1174.323 chain_us=1682.587 rq_us=511.875 rq_single_us=2022.986
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1229.358 i32_us=1174.462 chain_us=1684.705 rq_us=528.611 rq_single_us=2025.295
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1220.191 i32_us=1176.441 chain_us=1681.528 rq_us=520.260 rq_single_us=2024.844
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1223.976 i32_us=1178.802 chain_us=1678.073 rq_us=514.670 rq_single_us=2022.413
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1228.316 i32_us=1176.840 chain_us=1677.760 rq_us=537.569 rq_single_us=2024.566
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round2-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=282.951 i32_us=265.295 chain_us=366.458 rq_us=58.785 rq_single_us=324.618
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=286.128 i32_us=265.382 chain_us=362.153 rq_us=57.847 rq_single_us=325.069
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=288.125 i32_us=265.226 chain_us=361.458 rq_us=71.927 rq_single_us=325.625
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=288.854 i32_us=268.628 chain_us=366.528 rq_us=59.635 rq_single_us=325.260
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=287.517 i32_us=268.924 chain_us=366.563 rq_us=56.528 rq_single_us=326.719
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=293.941 i32_us=266.736 chain_us=366.736 rq_us=73.090 rq_single_us=326.753
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round2-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1076.944 i32_us=1051.163 chain_us=1383.194 rq_us=354.132 rq_single_us=1349.271
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1078.924 i32_us=1051.962 chain_us=1382.969 rq_us=340.538 rq_single_us=1350.122
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1071.163 i32_us=1051.597 chain_us=1382.309 rq_us=359.080 rq_single_us=1349.618
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1070.399 i32_us=1048.247 chain_us=1380.868 rq_us=353.576 rq_single_us=1350.451
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1069.983 i32_us=1038.281 chain_us=1372.552 rq_us=345.347 rq_single_us=1350.313
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1082.135 i32_us=1047.951 chain_us=1375.503 rq_us=356.007 rq_single_us=1348.542
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round2-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=341.476 i32_us=345.556 chain_us=347.622 rq_us=2.361 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=1 fp32_us=343.281 i32_us=345.573 chain_us=347.934 rq_us=2.205 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.153 i32_us=346.667 chain_us=348.281 rq_us=2.274 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=3 fp32_us=342.656 i32_us=345.885 chain_us=349.201 rq_us=2.274 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=4 fp32_us=342.951 i32_us=346.163 chain_us=347.813 rq_us=2.292 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=5 fp32_us=343.108 i32_us=345.451 chain_us=348.003 rq_us=2.240 rq_single_us=10.087
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK
+
+RUN hvx-round3-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=228.351 i32_us=193.455 chain_us=299.115 rq_us=62.170 rq_single_us=324.948
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=235.694 i32_us=195.104 chain_us=301.163 rq_us=56.545 rq_single_us=324.479
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=234.583 i32_us=197.865 chain_us=296.181 rq_us=73.785 rq_single_us=323.802
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=229.045 i32_us=191.910 chain_us=297.240 rq_us=61.285 rq_single_us=325.295
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=224.861 i32_us=189.583 chain_us=295.625 rq_us=58.681 rq_single_us=324.340
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=229.983 i32_us=197.431 chain_us=293.802 rq_us=73.264 rq_single_us=325.747
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN hvx-round3-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=868.194 i32_us=815.243 chain_us=1147.656 rq_us=348.090 rq_single_us=1347.899
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=872.795 i32_us=822.726 chain_us=1160.087 rq_us=344.983 rq_single_us=1346.823
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=870.920 i32_us=819.583 chain_us=1151.944 rq_us=361.736 rq_single_us=1349.201
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=859.514 i32_us=816.163 chain_us=1143.854 rq_us=354.010 rq_single_us=1348.576
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=872.674 i32_us=824.462 chain_us=1154.878 rq_us=349.722 rq_single_us=1349.566
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=875.903 i32_us=823.767 chain_us=1153.177 rq_us=358.854 rq_single_us=1351.997
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round3-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1226.806 i32_us=1176.111 chain_us=1678.438 rq_us=525.469 rq_single_us=2028.420
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1222.031 i32_us=1173.733 chain_us=1687.986 rq_us=513.993 rq_single_us=2023.056
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1227.604 i32_us=1181.372 chain_us=1691.927 rq_us=535.330 rq_single_us=2024.462
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1227.326 i32_us=1174.931 chain_us=1689.757 rq_us=523.524 rq_single_us=2030.660
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1224.444 i32_us=1175.920 chain_us=1691.007 rq_us=517.031 rq_single_us=2022.569
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1224.149 i32_us=1180.399 chain_us=1682.413 rq_us=535.903 rq_single_us=2024.948
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN hvx-round3-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=282.135 i32_us=269.878 chain_us=364.340 rq_us=60.521 rq_single_us=325.069
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=274.809 i32_us=269.132 chain_us=361.788 rq_us=58.333 rq_single_us=325.920
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=291.024 i32_us=267.135 chain_us=363.229 rq_us=72.552 rq_single_us=326.076
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=280.608 i32_us=270.382 chain_us=364.566 rq_us=59.410 rq_single_us=326.128
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=285.590 i32_us=270.972 chain_us=373.698 rq_us=60.365 rq_single_us=325.556
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=279.236 i32_us=266.649 chain_us=363.420 rq_us=71.910 rq_single_us=324.983
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round3-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1076.632 i32_us=1046.823 chain_us=1377.292 rq_us=353.073 rq_single_us=1346.424
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1078.785 i32_us=1046.667 chain_us=1379.705 rq_us=342.934 rq_single_us=1347.569
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1078.993 i32_us=1052.726 chain_us=1383.316 rq_us=363.837 rq_single_us=1346.163
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1069.219 i32_us=1046.493 chain_us=1380.451 rq_us=359.774 rq_single_us=1346.649
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1078.160 i32_us=1046.146 chain_us=1385.191 rq_us=342.274 rq_single_us=1347.344
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1070.833 i32_us=1047.743 chain_us=1376.059 rq_us=359.028 rq_single_us=1347.760
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN hvx-round3-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=341.927 i32_us=345.347 chain_us=347.674 rq_us=2.257 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=1 fp32_us=342.899 i32_us=345.399 chain_us=348.403 rq_us=2.378 rq_single_us=10.087
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.326 i32_us=345.799 chain_us=347.413 rq_us=2.274 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=3 fp32_us=342.865 i32_us=346.406 chain_us=348.767 rq_us=2.222 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=4 fp32_us=343.108 i32_us=345.833 chain_us=348.333 rq_us=2.240 rq_single_us=10.104
+TIME M=67 K=4160 N=256 rep=5 fp32_us=342.483 i32_us=345.816 chain_us=348.212 rq_us=2.465 rq_single_us=10.087
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK
+
+RUN scalar-round1-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=232.431 i32_us=18376.701 chain_us=18880.382 rq_us=480.174 rq_single_us=2909.340
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=226.979 i32_us=18413.368 chain_us=18956.910 rq_us=572.674 rq_single_us=2907.795
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=231.337 i32_us=18460.677 chain_us=18959.045 rq_us=497.031 rq_single_us=2912.639
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=232.847 i32_us=18479.219 chain_us=18977.292 rq_us=479.063 rq_single_us=2913.403
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=233.976 i32_us=18447.830 chain_us=18980.035 rq_us=480.365 rq_single_us=2910.313
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=233.281 i32_us=18433.889 chain_us=18961.997 rq_us=493.420 rq_single_us=2906.493
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN scalar-round1-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=868.142 i32_us=73829.479 chain_us=75856.840 rq_us=2049.618 rq_single_us=12969.392
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=863.559 i32_us=73528.038 chain_us=75519.965 rq_us=2047.795 rq_single_us=12966.979
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=864.931 i32_us=73613.316 chain_us=75902.170 rq_us=2049.948 rq_single_us=12971.563
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=866.059 i32_us=73822.257 chain_us=75845.642 rq_us=2047.917 rq_single_us=12971.441
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=870.816 i32_us=73628.906 chain_us=75857.083 rq_us=2051.788 rq_single_us=12975.469
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=876.215 i32_us=73855.174 chain_us=75870.434 rq_us=2062.101 rq_single_us=12762.813
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round1-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1223.854 i32_us=110730.503 chain_us=113784.271 rq_us=3076.181 rq_single_us=19161.319
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1227.674 i32_us=110305.035 chain_us=113824.722 rq_us=3093.403 rq_single_us=19152.760
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1229.271 i32_us=110244.097 chain_us=113290.938 rq_us=3087.535 rq_single_us=19148.021
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1227.188 i32_us=110741.788 chain_us=113791.406 rq_us=3091.927 rq_single_us=19154.688
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1223.420 i32_us=110702.378 chain_us=114004.358 rq_us=3092.604 rq_single_us=19158.750
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1226.267 i32_us=110665.556 chain_us=113820.069 rq_us=3092.049 rq_single_us=19161.146
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round1-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=293.351 i32_us=18493.368 chain_us=19000.990 rq_us=481.875 rq_single_us=2877.170
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=288.056 i32_us=18466.736 chain_us=18977.257 rq_us=479.010 rq_single_us=2881.458
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=291.753 i32_us=18411.892 chain_us=18980.017 rq_us=501.979 rq_single_us=2852.951
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=291.354 i32_us=18413.924 chain_us=18890.747 rq_us=481.649 rq_single_us=2856.319
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=289.618 i32_us=18422.882 chain_us=18966.302 rq_us=488.073 rq_single_us=2858.403
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=278.351 i32_us=18401.007 chain_us=18893.438 rq_us=493.976 rq_single_us=2859.236
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round1-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1087.153 i32_us=73913.715 chain_us=75942.222 rq_us=2039.826 rq_single_us=12970.590
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1091.267 i32_us=73931.649 chain_us=75962.014 rq_us=2051.198 rq_single_us=12966.597
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1088.681 i32_us=73709.097 chain_us=75945.260 rq_us=2050.833 rq_single_us=12971.285
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1089.201 i32_us=73658.802 chain_us=75610.156 rq_us=2036.962 rq_single_us=12967.448
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1082.899 i32_us=73713.351 chain_us=75982.014 rq_us=2050.851 rq_single_us=12976.111
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1084.844 i32_us=73873.524 chain_us=75882.118 rq_us=2382.674 rq_single_us=12984.028
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round1-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=342.066 i32_us=972.622 chain_us=989.097 rq_us=16.372 rq_single_us=74.913
+TIME M=67 K=4160 N=256 rep=1 fp32_us=343.438 i32_us=965.712 chain_us=981.944 rq_us=14.792 rq_single_us=74.931
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.691 i32_us=970.625 chain_us=983.715 rq_us=15.903 rq_single_us=74.896
+TIME M=67 K=4160 N=256 rep=3 fp32_us=342.292 i32_us=966.615 chain_us=983.976 rq_us=15.174 rq_single_us=74.931
+TIME M=67 K=4160 N=256 rep=4 fp32_us=343.351 i32_us=971.094 chain_us=983.976 rq_us=14.826 rq_single_us=74.931
+TIME M=67 K=4160 N=256 rep=5 fp32_us=342.656 i32_us=965.625 chain_us=990.938 rq_us=15.104 rq_single_us=74.948
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK
+
+RUN scalar-round2-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=230.833 i32_us=18461.476 chain_us=18988.212 rq_us=484.028 rq_single_us=2854.115
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=233.698 i32_us=18390.868 chain_us=18884.705 rq_us=482.274 rq_single_us=2842.535
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=230.642 i32_us=18388.802 chain_us=18981.181 rq_us=497.882 rq_single_us=2823.142
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=231.528 i32_us=18493.750 chain_us=18978.646 rq_us=484.340 rq_single_us=2795.868
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=235.156 i32_us=18393.854 chain_us=18908.090 rq_us=485.000 rq_single_us=2795.590
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=231.788 i32_us=18420.260 chain_us=18962.049 rq_us=494.063 rq_single_us=2776.580
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN scalar-round2-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=863.976 i32_us=73557.083 chain_us=75565.156 rq_us=2048.333 rq_single_us=12762.361
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=862.726 i32_us=73668.247 chain_us=75872.760 rq_us=2061.840 rq_single_us=12771.858
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=871.389 i32_us=73542.535 chain_us=75532.274 rq_us=2063.385 rq_single_us=12766.892
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=868.941 i32_us=73821.736 chain_us=75920.955 rq_us=2055.104 rq_single_us=12766.354
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=871.285 i32_us=73838.160 chain_us=75895.295 rq_us=2061.927 rq_single_us=12768.819
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=865.816 i32_us=73783.767 chain_us=75889.618 rq_us=2061.042 rq_single_us=12772.639
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round2-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1219.653 i32_us=110225.156 chain_us=113812.153 rq_us=3080.469 rq_single_us=19162.552
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1228.385 i32_us=110337.969 chain_us=113782.326 rq_us=3090.816 rq_single_us=19164.427
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1217.309 i32_us=110643.438 chain_us=113854.670 rq_us=3813.455 rq_single_us=19159.948
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1227.118 i32_us=110755.608 chain_us=113709.427 rq_us=3089.149 rq_single_us=19158.090
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1226.285 i32_us=110402.969 chain_us=113705.330 rq_us=3090.608 rq_single_us=19177.101
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1227.344 i32_us=110665.313 chain_us=113802.986 rq_us=3574.358 rq_single_us=19170.833
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round2-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=292.847 i32_us=18485.625 chain_us=18993.403 rq_us=490.035 rq_single_us=2929.184
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=286.024 i32_us=18473.542 chain_us=19001.042 rq_us=480.451 rq_single_us=2961.250
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=290.295 i32_us=18485.816 chain_us=18995.313 rq_us=497.396 rq_single_us=2925.156
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=291.719 i32_us=18455.781 chain_us=18970.417 rq_us=484.844 rq_single_us=3002.135
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=286.337 i32_us=18453.993 chain_us=18984.149 rq_us=488.142 rq_single_us=2917.882
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=293.351 i32_us=18494.028 chain_us=18991.285 rq_us=496.632 rq_single_us=2928.819
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round2-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1081.441 i32_us=73950.313 chain_us=75949.080 rq_us=2051.406 rq_single_us=12852.691
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1080.347 i32_us=73701.719 chain_us=75929.340 rq_us=2218.003 rq_single_us=12821.892
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1080.139 i32_us=73898.524 chain_us=75909.080 rq_us=2055.503 rq_single_us=12833.385
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1077.240 i32_us=73608.941 chain_us=75644.462 rq_us=2042.552 rq_single_us=12854.670
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1083.073 i32_us=73689.965 chain_us=75965.590 rq_us=2055.608 rq_single_us=12813.160
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1085.538 i32_us=73637.413 chain_us=75622.500 rq_us=2057.014 rq_single_us=12812.951
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round2-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=342.483 i32_us=969.583 chain_us=984.826 rq_us=16.042 rq_single_us=74.878
+TIME M=67 K=4160 N=256 rep=1 fp32_us=344.792 i32_us=966.719 chain_us=987.552 rq_us=15.000 rq_single_us=74.896
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.969 i32_us=967.431 chain_us=988.785 rq_us=15.955 rq_single_us=74.913
+TIME M=67 K=4160 N=256 rep=3 fp32_us=343.420 i32_us=969.340 chain_us=983.281 rq_us=15.313 rq_single_us=74.931
+TIME M=67 K=4160 N=256 rep=4 fp32_us=343.663 i32_us=964.896 chain_us=992.031 rq_us=14.948 rq_single_us=74.931
+TIME M=67 K=4160 N=256 rep=5 fp32_us=342.969 i32_us=968.819 chain_us=982.500 rq_us=14.948 rq_single_us=74.931
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK
+
+RUN scalar-round3-shape0.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=2816 N=4096 rep=0 fp32_us=230.920 i32_us=18453.646 chain_us=18950.017 rq_us=484.705 rq_single_us=2907.257
+TIME M=128 K=2816 N=4096 rep=1 fp32_us=234.861 i32_us=18479.809 chain_us=18939.913 rq_us=488.264 rq_single_us=2913.385
+TIME M=128 K=2816 N=4096 rep=2 fp32_us=232.743 i32_us=18456.250 chain_us=18948.438 rq_us=497.917 rq_single_us=2910.330
+TIME M=128 K=2816 N=4096 rep=3 fp32_us=232.083 i32_us=18453.316 chain_us=18970.347 rq_us=487.986 rq_single_us=2907.726
+TIME M=128 K=2816 N=4096 rep=4 fp32_us=231.875 i32_us=18467.500 chain_us=18943.958 rq_us=482.292 rq_single_us=2890.590
+TIME M=128 K=2816 N=4096 rep=5 fp32_us=231.944 i32_us=18442.031 chain_us=18929.149 rq_us=583.576 rq_single_us=2692.170
+CHECK M=128 K=2816 N=4096 hash=1ff61dc5 fp32_max_abs=3.05175781e-05
+BENCH OK
+
+RUN scalar-round3-shape1.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=2816 N=4096 rep=0 fp32_us=867.118 i32_us=73806.319 chain_us=75864.045 rq_us=2050.660 rq_single_us=12991.354
+TIME M=512 K=2816 N=4096 rep=1 fp32_us=865.278 i32_us=73814.306 chain_us=75876.927 rq_us=2048.524 rq_single_us=12974.635
+TIME M=512 K=2816 N=4096 rep=2 fp32_us=868.941 i32_us=73812.240 chain_us=75889.201 rq_us=2055.122 rq_single_us=12988.490
+TIME M=512 K=2816 N=4096 rep=3 fp32_us=865.868 i32_us=73840.208 chain_us=75972.031 rq_us=2047.708 rq_single_us=12981.979
+TIME M=512 K=2816 N=4096 rep=4 fp32_us=873.507 i32_us=73854.236 chain_us=75879.323 rq_us=2051.076 rq_single_us=12983.385
+TIME M=512 K=2816 N=4096 rep=5 fp32_us=861.163 i32_us=73767.170 chain_us=75867.778 rq_us=2550.330 rq_single_us=12984.323
+CHECK M=512 K=2816 N=4096 hash=fb9679c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round3-shape2.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=768 K=2816 N=4096 rep=0 fp32_us=1228.889 i32_us=110722.205 chain_us=113768.038 rq_us=3089.271 rq_single_us=19158.906
+TIME M=768 K=2816 N=4096 rep=1 fp32_us=1229.115 i32_us=110681.042 chain_us=113797.847 rq_us=3091.615 rq_single_us=19154.497
+TIME M=768 K=2816 N=4096 rep=2 fp32_us=1231.597 i32_us=110244.826 chain_us=113291.267 rq_us=3581.806 rq_single_us=19154.844
+TIME M=768 K=2816 N=4096 rep=3 fp32_us=1227.882 i32_us=110740.260 chain_us=113819.566 rq_us=3090.885 rq_single_us=19150.417
+TIME M=768 K=2816 N=4096 rep=4 fp32_us=1225.069 i32_us=110695.486 chain_us=113761.684 rq_us=3092.170 rq_single_us=19173.750
+TIME M=768 K=2816 N=4096 rep=5 fp32_us=1232.049 i32_us=110380.260 chain_us=113743.576 rq_us=3089.653 rq_single_us=19157.917
+CHECK M=768 K=2816 N=4096 hash=176d07c5 fp32_max_abs=2.67028809e-05
+BENCH OK
+
+RUN scalar-round3-shape3.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=128 K=4096 N=4096 rep=0 fp32_us=291.684 i32_us=18485.538 chain_us=18980.104 rq_us=481.788 rq_single_us=2882.344
+TIME M=128 K=4096 N=4096 rep=1 fp32_us=290.052 i32_us=18484.983 chain_us=18992.274 rq_us=480.573 rq_single_us=2835.330
+TIME M=128 K=4096 N=4096 rep=2 fp32_us=287.170 i32_us=18438.438 chain_us=18960.347 rq_us=491.771 rq_single_us=2824.688
+TIME M=128 K=4096 N=4096 rep=3 fp32_us=291.406 i32_us=18474.201 chain_us=18983.698 rq_us=478.733 rq_single_us=2810.365
+TIME M=128 K=4096 N=4096 rep=4 fp32_us=292.083 i32_us=18462.813 chain_us=18999.774 rq_us=478.906 rq_single_us=2792.413
+TIME M=128 K=4096 N=4096 rep=5 fp32_us=282.188 i32_us=18377.378 chain_us=18909.115 rq_us=498.906 rq_single_us=2813.212
+CHECK M=128 K=4096 N=4096 hash=e3c39dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round3-shape4.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=512 K=4096 N=4096 rep=0 fp32_us=1081.771 i32_us=73896.285 chain_us=75899.896 rq_us=2380.938 rq_single_us=12823.021
+TIME M=512 K=4096 N=4096 rep=1 fp32_us=1077.344 i32_us=73733.993 chain_us=75964.201 rq_us=2054.896 rq_single_us=12813.490
+TIME M=512 K=4096 N=4096 rep=2 fp32_us=1078.281 i32_us=73871.528 chain_us=76101.354 rq_us=2054.080 rq_single_us=12819.271
+TIME M=512 K=4096 N=4096 rep=3 fp32_us=1077.639 i32_us=73931.337 chain_us=75950.399 rq_us=2219.184 rq_single_us=12825.347
+TIME M=512 K=4096 N=4096 rep=4 fp32_us=1087.847 i32_us=73678.576 chain_us=75975.122 rq_us=2053.750 rq_single_us=12855.313
+TIME M=512 K=4096 N=4096 rep=5 fp32_us=1081.858 i32_us=73704.340 chain_us=75953.264 rq_us=2219.861 rq_single_us=12844.410
+CHECK M=512 K=4096 N=4096 hash=7da49dc5 fp32_max_abs=0
+BENCH OK
+
+RUN scalar-round3-shape5.txt
+ARITHMETIC OK: requant 49664 values; widened combine both layouts
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+TIME M=67 K=4160 N=256 rep=0 fp32_us=342.882 i32_us=967.847 chain_us=982.153 rq_us=15.868 rq_single_us=74.896
+TIME M=67 K=4160 N=256 rep=1 fp32_us=343.889 i32_us=966.146 chain_us=984.063 rq_us=16.007 rq_single_us=74.878
+TIME M=67 K=4160 N=256 rep=2 fp32_us=342.743 i32_us=967.135 chain_us=988.715 rq_us=15.903 rq_single_us=74.948
+TIME M=67 K=4160 N=256 rep=3 fp32_us=343.507 i32_us=966.441 chain_us=984.045 rq_us=14.896 rq_single_us=74.948
+TIME M=67 K=4160 N=256 rep=4 fp32_us=343.576 i32_us=966.476 chain_us=985.191 rq_us=14.757 rq_single_us=74.948
+TIME M=67 K=4160 N=256 rep=5 fp32_us=343.177 i32_us=966.215 chain_us=981.563 rq_us=16.094 rq_single_us=74.931
+CHECK M=67 K=4160 N=256 hash=c7a95a90 fp32_max_abs=1.52587891e-05
+BENCH OK

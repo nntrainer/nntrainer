@@ -738,5 +738,31 @@ static inline HVX_Vector Q6_Vb_vpacke_VhVh(HVX_Vector u, HVX_Vector v) {
   memcpy(r.w, b, sizeof(b));
   return r;
 }
+/** @brief The odd (high) byte of every halfword, v's in the low half. */
+static inline HVX_Vector Q6_Vb_vpacko_VhVh(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  uint16_t hu[2 * HVX_EMU_LANES], hv[2 * HVX_EMU_LANES];
+  uint8_t b[4 * HVX_EMU_LANES];
+  memcpy(hu, u.w, sizeof(hu));
+  memcpy(hv, v.w, sizeof(hv));
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    b[i] = (uint8_t)(hv[i] >> 8);
+    b[2 * HVX_EMU_LANES + i] = (uint8_t)(hu[i] >> 8);
+  }
+  memcpy(r.w, b, sizeof(b));
+  return r;
+}
+/** @brief Words saturated to [0, 65535], v's in the low half. */
+static inline HVX_Vector Q6_Vuh_vpack_VwVw_sat(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  uint16_t h[2 * HVX_EMU_LANES];
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const int32_t a = (int32_t)v.w[i], b = (int32_t)u.w[i];
+    h[i] = (uint16_t)(a < 0 ? 0 : a > 65535 ? 65535 : a);
+    h[HVX_EMU_LANES + i] = (uint16_t)(b < 0 ? 0 : b > 65535 ? 65535 : b);
+  }
+  memcpy(r.w, h, sizeof h);
+  return r;
+}
 
 #endif /* __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__ */

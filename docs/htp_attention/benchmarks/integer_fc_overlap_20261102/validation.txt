@@ -1,0 +1,6 @@
+All 36 device processes passed.
+Host legacy FC, integer FC, fused requant, HVX byte-pack emulation and mutation check passed.
+Integer FC ASan/UBSan passed.
+DSP builds: v79 and v81 passed with -Wall -Werror.
+Device arithmetic: all requant shifts, per-channel params, guarded paired stores, tails, three readouts.
+Actual HMX: K=4096/4160/8192/32768, positive/negative four-plane readout, cancellation and overflow.

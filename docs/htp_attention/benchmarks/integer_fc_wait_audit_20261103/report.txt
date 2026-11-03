@@ -1,0 +1,109 @@
+W4A16 FC wait audit, 2026-11-03
+
+Scope: yesterday's final integer FC, original PR base 3881042471377ec3c083afd06e55a04ab6934cbe.
+Production sources match integer_fc_max_20261102/source.sha256.
+Instrumented source: /tmp/nntr-w4a16-waits-20261103/source.
+No production kernel change was made.
+
+Device: S26 Ultra SM-S948N / SM8850, v81, serial R5KL30G6MCX.
+SDK 6.4.0.1, Hexagon compiler 19.0.04, HexKL 6.4.0.2, -O3.
+VTCM 8388608 bytes, usable arena 8372224 bytes, seven HVX workers.
+Offline WH weights, 256 output columns per handle, input zero-point 30000,
+per-tensor requant {multiplier=3, shift=8, zero_point=30000}.
+INT32 and UINT16 output both retained. Weight packing/registration and FastRPC excluded.
+No other run_main_on_hexagon or CausalLM benchmark process was present before the run.
+
+Method:
+Three independent processes per shape, six shapes. Each process uses the existing
+benchmark correctness tests and timings, followed by five warmed coarse profiles and
+three warmed detailed profiles: 15 coarse and 9 detailed samples per shape.
+Legacy probes disabled. New counters use 19.2 MHz QTimer ticks, summed before conversion.
+Counters measure elapsed main-thread phases, NOT summed worker compute time.
+A pack wait can include caller-assisted packing. Worker jobs and DMA run concurrently.
+Fine profiles time sweep and convert-issue paths separately; those are software issue
+intervals, not isolated hardware matrix/convert durations. Do not add detailed and
+coarse counters together or treat read_issue as a fully removable cost.
+All times below are microseconds. Independently computed medians do not add exactly.
+This diagnostic build is for attribution, not a replacement for yesterday's clean
+latency benchmark. Instrumentation affects timing and overlap.
+
+Coarse median phases                     128x4096x4096  512x2816x4096  512x4096x4096
+Whole call                                   286.563        719.844        960.781
+HMX sweep + accumulator readout              160.104        448.542        651.198
+First weight-panel DMA wait                   17.708         71.615         59.323
+Later DMA drain waits                         42.969          1.979          2.240
+Activation readiness wait / caller help       14.948         10.677         94.375
+Previous epilogue wait inside loop             0.625         40.365          3.750
+Final epilogue wait                           11.563         10.677         10.625
+Repeated overflow status scan                 8.958         38.021         37.813
+Readout completion fence                      0.365          1.094          1.406
+Setup + cleanup                              12.344         39.791         41.198
+Foreground/background job submit              2.968         15.729         15.730
+Control flow + DMA enqueue                    9.323         30.729         34.739
+The wrapper interval includes API parameter validation before fc_layer_run.
+
+Readout detail for 512x2816x4096: sweep issue 363.906 us, convert issue 85.104 us,
+plus 6.094 us loop control inside the core section, in a separate fine-profile run.
+2048 sweeps = 2 * 8 row blocks * 128 output tiles. Each sweep reads three byte planes.
+The final fence is small; most readout ordering is already paid within the core path.
+
+Why the caller waits:
+- All weights in the first panel must be DMA-complete before any HMX starts.
+  The representative case waits for four 256-column handles, 1.375 MiB total.
+  Later panels are double-buffered and nearly hidden for large M.
+  At M=128 there are only two row blocks; later transfers still exceed available compute.
+- First-panel processing requires all 16 four-row packing jobs of the next 64-row band.
+  Packing and epilogues share seven workers; foreground epilogues have priority.
+  The caller also claims background packing work during wait_bg. This is not pure idle.
+  K=4096 exposes substantially more packing than K=2816 in the measured geometry.
+- Two accumulator staging banks feed a pool with one foreground job in flight.
+  Before submitting a full bank, the caller waits for the prior job. It cannot indefinitely
+  issue more HMX work while both banks are occupied. The final output job must also finish.
+- Status scanning is real serial work, not a wait. Both banks' per-row flags are rescanned
+  at each submit, even though only the newly completed job's result needs retirement.
+
+Producer stores in the next HMX activation layout:
+Possible after high/low accumulator recombination, zero-point/bias correction and exact
+requantization. Pack four rows of output codes straight into aligned low/high AH vectors.
+For logical output width N, the byte-plane offset is
+  (row/64)*64*N + (column/32)*2048 + (row%64)*32 + column%32.
+Each plane has ceil(M/64)*64*N bytes. A next integer FC needs a prepacked-input API,
+preserving zero-point and encoding metadata and buffer lifetime. The current integer
+API only accepts row-layout UINT16 and always submits packing. The float FC's existing
+prepacked option does not provide an integer resident handoff.
+Multiple weight handles currently produce handle-major concatenated segments; direct
+next-input stores must use the next FC's global channel offsets, not each handle's local N.
+Padding rows must be initialized and readiness published only after all required channels
+are complete. Intervening nonlinearity/residual/normalization may require fused producers
+or additional layout-aware kernels. No whole-model speedup is established here.
+
+DDR AH output removes the next HVX packing pass but still requires DDR-to-VTCM transfer.
+Resident VTCM AH output can remove the intermediate DDR round trip; needs arena planning.
+For 512x2816x4096 the current arena uses input planes 2.75 MiB, double weight panels
+2.75 MiB, double accumulator staging 1 MiB, convert blocks 4 KiB.
+Only 1.4805 MiB is free, while full next-input AH output requires 4 MiB.
+A 64-row output band is 0.5 MiB and fits, but panel-major scheduling does not finish every
+output channel in that band until the final weight panel. Changing loop order may reload
+weights. The next call also reuses input offset zero, so simply passing an internal VTCM
+pointer without changing ownership/lifetime is unsafe.
+
+Optimization candidates, not implemented or performance-claimed:
+1. Per-batch/per-worker overflow summary, retire each completed result once, reusable
+   scratch/job state. Preserve exact overflow failure semantics.
+2. Start from the first ready weight handle or smaller startup panel; use descriptor-level
+   waits instead of draining the complete startup panel. Potential cross-layer prefetch.
+3. Producer writes next-input AH planes, first via DDR, then resident/row-band handoff with
+   explicit lifetime and channel-readiness tracking. Measure a two-FC chain, not FC alone.
+4. Hoist bias-zp*colsum and fixed requant metadata out of per-worker repeated work.
+   Adjust epilogue batch size/dispatch. A deeper buffer queue only hides transient imbalance,
+   not sustained epilogue-throughput deficit. Current pool would need queue support.
+5. Prioritize the demanded next packing band and limit speculative caller work; do not
+   steal epilogue throughput blindly. Eliminate packing at the producer when the model's
+   operation sequence and memory layout permit it.
+
+Validation: 18/18 device processes passed; all INT32 hashes match yesterday's integer
+kernel, UINT16 outputs match the integer reference, direct INT64 samples and existing
+extreme/overflow arithmetic checks passed. v81 diagnostic build passed.
+
+Artifacts: trace_samples.csv, trace_medians.csv, raw round logs, diagnostic-only.patch,
+instrument.py, run.py, build logs, source/binary hashes, validation.txt.

@@ -78,6 +78,20 @@ typedef struct {
   const float *act16_enc;
   uint32_t act16_hd;
 
+  /** Nonzero: a16w4 -- the activation (act_f32, or act_u16 above) is kept
+      at 16 bits instead of quantized to u8: per-row u16 codes, or with
+      act16_hd == K act_u16's own codes (no pre_scratch needed then), as
+      two u8 planes multiplied in two HMX sweeps and combined as
+      256 hi + lo in the dequant (hvx_quant_params_pack_u16_ah). Twice the
+      activation's VTCM and twice the HMX work of the u8 path. With
+      act_ah_prepacked (and act_scale / act_zp) the two planes come
+      prepacked, the low plane's m_pad * K bytes then the high plane's --
+      a producer that knows the encoding (a fixed, calibrated one) wrote
+      them -- and only a DMA brings them in. Not with pre_gamma or
+      accumulate; needs the in-place accumulator layout
+      (AEE_EUNSUPPORTED otherwise). */
+  int act16;
+
   /** Both NULL, or both n_handles entries: handle i's row m goes to
       out_cat + out_off[i] + m * out_ld[i] instead of the packed [M x N_i]
       blocks, so the column slices of one weight land as its row-major

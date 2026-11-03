@@ -9,6 +9,7 @@
 #include "hexkl_mm_opts.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_probe.h"
+#include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 #include "hvx_scalar_stubs.h"
@@ -52,6 +53,48 @@ static int compare(const char *what, const float *got, const float *want,
   }
   printf("%-18s: mismatches=%zu of %zu   worst_rel=%g\n", what, bad, n, worst);
   return bad != 0;
+}
+
+/** a16 reference: row m's u16 codes q (given), then per column the two
+    exact sweeps hi = sum (q >> 8) w, lo = sum (q & 255) w and the kernel's
+    f32 combine (256 hi + lo - zp cs) s ws + b. */
+static void ref16(const W *w, const uint16_t *q, float s, int32_t zp,
+                  float *out) {
+  const uint32_t kt_n = w->K / 32u, nt_n = w->N / 32u;
+  for (uint32_t nt = 0; nt < nt_n; ++nt)
+    for (uint32_t c = 0; c < 32; ++c) {
+      int32_t hi = 0, lo = 0;
+      for (uint32_t kt = 0; kt < kt_n; ++kt)
+        for (uint32_t k = 0; k < 32; ++k) {
+          const int wv = wh_value(
+            (const uint8_t *)w->nib + (size_t)(kt * nt_n + nt) * 512u, k, c);
+          hi += (int32_t)(q[kt * 32 + k] >> 8) * wv;
+          lo += (int32_t)(q[kt * 32 + k] & 255u) * wv;
+        }
+      const uint32_t col = nt * 32 + c;
+      out[col] =
+        ((float)hi * 256.0f + (float)lo - (float)zp * (float)w->cs[col]) * s *
+          w->ws[col] +
+        w->bias[col];
+    }
+}
+
+/* Row x's u16 codes over [0, 65535], the pack's parameter formula. */
+static void quant16(const float *x, uint32_t k, uint16_t *q, float *s,
+                    int32_t *zp) {
+  float lo = 0.f, hi = 0.f;
+  for (uint32_t j = 0; j < k; ++j) {
+    lo = x[j] < lo ? x[j] : lo;
+    hi = x[j] > hi ? x[j] : hi;
+  }
+  *s = lo != hi ? (hi - lo) / 65535.0f : 1.0f;
+  long z = lo != hi ? (long)nearbyintf(-lo / *s) : 0;
+  *zp = (int32_t)(z < 0 ? 0 : (z > 65535 ? 65535 : z));
+  const float inv = 1.0f / *s;
+  for (uint32_t j = 0; j < k; ++j) {
+    long v = (long)nearbyintf(x[j] * inv) + *zp;
+    q[j] = (uint16_t)(v < 0 ? 0 : (v > 65535 ? 65535 : v));
+  }
 }
 
 int main(void) {
@@ -161,7 +204,9 @@ int main(void) {
     const uint32_t k_tiles = K / 32u, m_pad = 192u;
     const uint32_t act = (m_pad / 64u) * k_tiles * 2048u;
     const uint32_t wb = k_tiles * (N[0] / 32u) * 512u;
-    const uint32_t result_off = act + 2u * wb;
+    /** the weight double buffer, then the byte-plane readout's three 1 KiB
+        convert blocks rounded up to the 2 KiB activation alignment */
+    const uint32_t result_off = act + 2u * wb + 4096u;
     rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, result_off + 2u * 8192u,
                                  result_off + 2u * 8192u, M, K, handles, 3, x,
                                  got, NULL);
@@ -282,6 +327,142 @@ int main(void) {
     free(got16);
     free(gotf);
     free(wantu);
+  }
+
+  /** a16 (hexkl_mm_opts.act16): two handles with nonzero colsums (the zero
+      point term), 150 rows (a short last row block), K = 128 so the u16
+      input can carry two heads. Three sources: f32 rows, u16 rows with one
+      encoding (their codes used as they are) and u16 rows with a head each
+      (requantized per row); then the flags it must refuse. */
+  {
+    const uint32_t AK = 128u, AN[2] = {1056u, 512u}, AH = 64u;
+    W aw[2];
+    uint32_t ah[2] = {3u, 4u};
+    for (uint32_t i = 0; i < 2; ++i) {
+      make_weight(ah[i], AK, AN[i], &aw[i]);
+      for (uint32_t c = 0; c < AN[i]; ++c)
+        aw[i].cs[c] = (int32_t)(rnd() % 2001u) - 1000;
+    }
+    const size_t an = (size_t)M * (AN[0] + AN[1]);
+    float *ax = (float *)malloc(sizeof(float) * M * AK);
+    uint16_t *a16 = (uint16_t *)malloc(sizeof(uint16_t) * M * AK);
+    uint16_t *q = (uint16_t *)malloc(sizeof(uint16_t) * AK);
+    float *ag = (float *)malloc(sizeof(float) * an);
+    float *aw_ = (float *)malloc(sizeof(float) * an);
+    float *dq = (float *)malloc(sizeof(float) * AK);
+    float *asc = (float *)malloc(sizeof(float) * 8u * AK);
+    for (uint32_t i = 0; i < M * AK; ++i) {
+      ax[i] = rndf();
+      a16[i] = (uint16_t)(rnd() & 0xffffu);
+    }
+    hexkl_mm_opts o = {0};
+    o.act16 = 1;
+
+    /* f32 rows */
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK,
+                                 ah, 2, ax, ag, &o);
+    size_t off = 0;
+    for (uint32_t i = 0; i < 2; ++i) {
+      for (uint32_t t = 0; t < M; ++t) {
+        float s;
+        int32_t z;
+        quant16(ax + (size_t)t * AK, AK, q, &s, &z);
+        ref16(&aw[i], q, s, z, aw_ + off + (size_t)t * AN[i]);
+      }
+      off += (size_t)M * AN[i];
+    }
+    fail |= (rc != 0) | compare("a16 f32 rows", ag, aw_, an);
+
+    /* u16 rows, one encoding: zp 30000.4 rounds to 30000 */
+    const float enc1[2] = {0.0123f, 30000.4f};
+    o.act_u16 = a16;
+    o.act16_enc = enc1;
+    o.act16_hd = AK;
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK,
+                                 ah, 2, NULL, ag, &o);
+    off = 0;
+    for (uint32_t i = 0; i < 2; ++i) {
+      for (uint32_t t = 0; t < M; ++t)
+        ref16(&aw[i], a16 + (size_t)t * AK, enc1[0], 30000,
+              aw_ + off + (size_t)t * AN[i]);
+      off += (size_t)M * AN[i];
+    }
+    fail |= (rc != 0) | compare("a16 u16 direct", ag, aw_, an);
+
+    /**
+     * the same rows prepacked (hexkl_mm_opts.act_ah_prepacked with act16):
+     * both planes, low then high, and the fixed encoding as act_scale /
+     * act_zp, must give the bytes of the direct run
+     */
+    {
+      const uint32_t mp = (M + 63u) / 64u * 64u;
+      uint8_t *pre = (uint8_t *)malloc(2u * (size_t)mp * AK);
+      float *psc = (float *)malloc(sizeof(float) * mp);
+      int32_t *pzp = (int32_t *)malloc(sizeof(int32_t) * mp);
+      float *ag2 = (float *)malloc(sizeof(float) * an);
+      int prc =
+        hvx_quant_params_pack_u16_ah(NULL, a16, enc1, AK, M, mp, AK, NULL, psc,
+                                     pzp, pre, pre + (size_t)mp * AK, NULL);
+      hexkl_mm_opts op = {0};
+      op.act16 = 1;
+      op.act_ah_prepacked = pre;
+      op.act_scale = psc;
+      op.act_zp = pzp;
+      prc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                     AK, ah, 2, NULL, ag2, &op);
+      const int same = prc == 0 && !memcmp(ag, ag2, sizeof(float) * an);
+      op.act_scale = NULL;
+      op.act_zp = NULL;
+      const int r0 = hexkl_mm_u8i4_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, NULL, ag2, &op);
+      printf("a16 prepacked     : rc=%d %s; without its encoding rc=%d\n", prc,
+             same ? "bit-identical to the direct run" : "DIFFERS", r0);
+      fail |= !same | (r0 != AEE_EBADPARM);
+      free(pre);
+      free(psc);
+      free(pzp);
+      free(ag2);
+    }
+
+    /* u16 rows, a (scale, zp) per head of 64 */
+    const float enc2[4] = {0.002f, 31000.f, 0.0007f, 12000.f};
+    o.act16_enc = enc2;
+    o.act16_hd = AH;
+    o.pre_scratch = asc;
+    rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK,
+                                 ah, 2, NULL, ag, &o);
+    off = 0;
+    for (uint32_t i = 0; i < 2; ++i) {
+      for (uint32_t t = 0; t < M; ++t) {
+        for (uint32_t j = 0; j < AK; ++j)
+          dq[j] = ((float)a16[(size_t)t * AK + j] - enc2[2u * (j / AH) + 1u]) *
+                  enc2[2u * (j / AH)];
+        float s;
+        int32_t z;
+        quant16(dq, AK, q, &s, &z);
+        ref16(&aw[i], q, s, z, aw_ + off + (size_t)t * AN[i]);
+      }
+      off += (size_t)M * AN[i];
+    }
+    fail |= (rc != 0) | compare("a16 u16 per head", ag, aw_, an);
+
+    /* refused: a16 with accumulate, and per-head u16 without a scratch */
+    o.accumulate = 1;
+    const int r1 = hexkl_mm_u8i4_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, NULL, ag, &o);
+    o.accumulate = 0;
+    o.pre_scratch = NULL;
+    const int r2 = hexkl_mm_u8i4_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, NULL, ag, &o);
+    printf("a16 refusals      : accumulate rc=%d, no scratch rc=%d\n", r1, r2);
+    fail |= (r1 != AEE_EBADPARM) | (r2 != AEE_EBADPARM);
+    free(ax);
+    free(a16);
+    free(q);
+    free(ag);
+    free(aw_);
+    free(dq);
+    free(asc);
   }
 
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");

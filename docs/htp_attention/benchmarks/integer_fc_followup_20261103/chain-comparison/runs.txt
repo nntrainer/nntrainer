@@ -1,0 +1,593 @@
+--- after-round0-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=317.101 packed_us=220.243
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=322.726 packed_us=222.170
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=313.108 packed_us=221.181
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=317.049 packed_us=220.573
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=313.455 packed_us=219.983
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=315.833 packed_us=221.684
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=226.953 join_us=38.915 consumer_us=54.384
+COMPONENT M=128 K=2816 N=4096 mode=1 producer_us=193.793 join_us=0.043 consumer_us=45.903
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- after-round0-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1130.104 packed_us=837.309
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1131.094 packed_us=836.736
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1126.649 packed_us=834.896
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1127.882 packed_us=831.076
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1128.542 packed_us=834.080
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1127.292 packed_us=838.038
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=642.083 join_us=284.939 consumer_us=207.361
+COMPONENT M=512 K=2816 N=4096 mode=1 producer_us=690.174 join_us=0.043 consumer_us=148.889
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- after-round0-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1615.052 packed_us=1168.403
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1603.420 packed_us=1169.601
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1613.438 packed_us=1176.476
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1614.549 packed_us=1164.149
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1615.087 packed_us=1168.767
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1616.250 packed_us=1168.889
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=904.462 join_us=424.731 consumer_us=295.391
+COMPONENT M=768 K=2816 N=4096 mode=1 producer_us=963.047 join_us=0.043 consumer_us=208.715
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- after-round0-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=418.177 packed_us=312.083
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=406.059 packed_us=312.934
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=408.750 packed_us=311.389
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=405.868 packed_us=311.684
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=407.031 packed_us=310.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=408.507 packed_us=309.306
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=316.102 join_us=41.658 consumer_us=60.139
+COMPONENT M=128 K=4096 N=4096 mode=1 producer_us=282.023 join_us=0.061 consumer_us=48.472
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- after-round0-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1362.813 packed_us=1050.382
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1359.653 packed_us=1045.972
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1358.733 packed_us=1052.795
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1362.656 packed_us=1047.517
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1371.476 packed_us=1050.660
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1363.594 packed_us=1051.493
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=875.877 join_us=288.906 consumer_us=209.740
+COMPONENT M=512 K=4096 N=4096 mode=1 producer_us=902.457 join_us=0.043 consumer_us=151.632
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- after-round0-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=42.587 packed_us=42.240
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=42.934 packed_us=42.587
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.455 packed_us=43.472
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=43.351 packed_us=42.674
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=43.646 packed_us=43.351
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=42.622 packed_us=42.951
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=33.307 join_us=0.260 consumer_us=13.003
+COMPONENT M=67 K=4160 N=256 mode=1 producer_us=32.821 join_us=0.130 consumer_us=12.569
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK
+
+--- after-round1-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=315.486 packed_us=220.503
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=320.625 packed_us=222.326
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=312.049 packed_us=222.396
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=320.486 packed_us=221.701
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=313.993 packed_us=221.458
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=318.924 packed_us=223.229
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=230.286 join_us=36.563 consumer_us=55.104
+COMPONENT M=128 K=2816 N=4096 mode=1 producer_us=195.035 join_us=0.052 consumer_us=45.703
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- after-round1-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1129.479 packed_us=832.135
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1129.566 packed_us=833.837
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1132.986 packed_us=829.983
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1128.160 packed_us=836.354
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1131.458 packed_us=832.378
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1127.431 packed_us=840.104
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=640.642 join_us=289.054 consumer_us=207.214
+COMPONENT M=512 K=2816 N=4096 mode=1 producer_us=688.559 join_us=0.035 consumer_us=146.076
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- after-round1-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1606.979 packed_us=1164.983
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1610.191 packed_us=1169.583
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1613.785 packed_us=1171.962
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1615.122 packed_us=1160.868
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1614.479 packed_us=1169.861
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1615.052 packed_us=1159.410
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=901.137 join_us=425.217 consumer_us=294.123
+COMPONENT M=768 K=2816 N=4096 mode=1 producer_us=962.300 join_us=0.043 consumer_us=208.003
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- after-round1-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=417.396 packed_us=321.858
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=407.135 packed_us=325.399
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=406.771 packed_us=320.851
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=403.351 packed_us=324.722
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=408.750 packed_us=319.271
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=402.622 packed_us=322.448
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=314.071 join_us=40.764 consumer_us=56.215
+COMPONENT M=128 K=4096 N=4096 mode=1 producer_us=288.116 join_us=0.052 consumer_us=47.865
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- after-round1-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1362.083 packed_us=1045.833
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1356.875 packed_us=1051.944
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1366.424 packed_us=1053.160
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1355.955 packed_us=1049.097
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1366.701 packed_us=1051.615
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1357.396 packed_us=1051.788
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=876.997 join_us=287.830 consumer_us=205.747
+COMPONENT M=512 K=4096 N=4096 mode=1 producer_us=902.595 join_us=0.043 consumer_us=148.689
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- after-round1-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=41.927 packed_us=41.875
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=42.431 packed_us=42.604
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.056 packed_us=42.292
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=42.795 packed_us=42.483
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=42.101 packed_us=41.910
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=43.333 packed_us=42.552
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=32.222 join_us=0.174 consumer_us=13.247
+COMPONENT M=67 K=4160 N=256 mode=1 producer_us=31.285 join_us=0.130 consumer_us=12.448
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK
+
+--- after-round2-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=320.764 packed_us=220.990
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=323.229 packed_us=222.378
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=318.750 packed_us=220.660
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=324.913 packed_us=221.389
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=318.733 packed_us=220.868
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=324.896 packed_us=222.569
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=230.668 join_us=40.477 consumer_us=55.851
+COMPONENT M=128 K=2816 N=4096 mode=1 producer_us=195.226 join_us=0.069 consumer_us=45.486
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- after-round2-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1122.240 packed_us=828.420
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1122.639 packed_us=826.250
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1124.618 packed_us=825.903
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1122.014 packed_us=830.330
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1126.563 packed_us=826.337
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1126.007 packed_us=833.750
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=638.177 join_us=286.424 consumer_us=205.174
+COMPONENT M=512 K=2816 N=4096 mode=1 producer_us=684.436 join_us=0.052 consumer_us=147.101
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- after-round2-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1617.170 packed_us=1170.087
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1626.528 packed_us=1168.385
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1626.545 packed_us=1169.340
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1619.497 packed_us=1168.976
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1620.712 packed_us=1168.976
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1615.399 packed_us=1169.167
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=903.698 join_us=429.679 consumer_us=293.212
+COMPONENT M=768 K=2816 N=4096 mode=1 producer_us=963.490 join_us=0.035 consumer_us=207.899
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- after-round2-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=419.253 packed_us=320.122
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=402.049 packed_us=322.882
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=411.458 packed_us=321.476
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=406.892 packed_us=320.938
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=409.583 packed_us=321.285
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=402.847 packed_us=319.340
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=322.535 join_us=39.861 consumer_us=58.429
+COMPONENT M=128 K=4096 N=4096 mode=1 producer_us=287.144 join_us=0.061 consumer_us=48.359
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- after-round2-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1360.417 packed_us=1045.833
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1360.694 packed_us=1057.222
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1361.875 packed_us=1045.781
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1366.181 packed_us=1046.580
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1364.184 packed_us=1049.497
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1366.806 packed_us=1045.625
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=874.792 join_us=289.470 consumer_us=209.167
+COMPONENT M=512 K=4096 N=4096 mode=1 producer_us=896.875 join_us=0.113 consumer_us=151.484
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- after-round2-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=42.500 packed_us=43.038
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=43.663 packed_us=42.552
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.819 packed_us=42.118
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=42.691 packed_us=43.420
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=44.201 packed_us=42.257
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=42.813 packed_us=42.743
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=32.865 join_us=0.252 consumer_us=13.307
+COMPONENT M=67 K=4160 N=256 mode=1 producer_us=31.884 join_us=0.122 consumer_us=12.682
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK
+
+--- before-round0-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=320.017 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=321.632 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=320.677 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=322.639 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=321.267 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=320.469 packed_us=0.000
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=235.599 join_us=37.448 consumer_us=52.986
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- before-round0-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1162.326 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1165.781 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1162.760 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1166.771 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1166.840 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1165.503 packed_us=0.000
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=675.668 join_us=289.054 consumer_us=203.819
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- before-round0-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1671.979 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1671.858 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1671.858 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1671.528 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1667.882 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1667.413 packed_us=0.000
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=955.130 join_us=432.969 consumer_us=291.128
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- before-round0-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=411.111 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=412.465 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=409.861 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=410.781 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=408.663 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=412.188 packed_us=0.000
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=323.186 join_us=37.743 consumer_us=56.085
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- before-round0-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1390.000 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1398.038 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1390.938 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1388.941 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1393.837 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1389.583 packed_us=0.000
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=916.589 join_us=289.783 consumer_us=205.095
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- before-round0-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=42.847 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=44.167 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.177 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=43.368 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=42.847 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=43.490 packed_us=0.000
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=31.875 join_us=0.139 consumer_us=13.281
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK
+
+--- before-round1-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=317.708 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=319.115 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=319.340 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=317.517 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=318.281 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=318.611 packed_us=0.000
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=235.035 join_us=36.675 consumer_us=54.835
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- before-round1-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1167.934 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1170.069 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1173.750 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1170.156 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1170.851 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1172.344 packed_us=0.000
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=675.556 join_us=296.571 consumer_us=202.639
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- before-round1-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1667.760 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1669.271 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1671.701 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1669.236 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1669.375 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1672.708 packed_us=0.000
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=959.115 join_us=425.738 consumer_us=293.863
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- before-round1-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=415.990 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=407.153 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=408.924 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=407.951 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=410.000 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=408.698 packed_us=0.000
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=321.241 join_us=41.059 consumer_us=56.502
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- before-round1-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1395.747 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1391.285 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1391.128 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1395.972 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1410.920 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1390.608 packed_us=0.000
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=908.229 join_us=286.762 consumer_us=200.773
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- before-round1-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=43.403 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=44.010 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.160 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=43.003 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=43.281 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=43.576 packed_us=0.000
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=32.465 join_us=0.148 consumer_us=13.411
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK
+
+--- before-round2-shape0.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=2816 N=4096 O=256 rep=0 row_us=318.229 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=1 row_us=320.104 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=2 row_us=319.583 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=3 row_us=320.035 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=4 row_us=318.889 packed_us=0.000
+CHAIN M=128 K=2816 N=4096 O=256 rep=5 row_us=321.354 packed_us=0.000
+COMPONENT M=128 K=2816 N=4096 mode=0 producer_us=233.993 join_us=39.523 consumer_us=53.108
+CHAIN_CHECK M=128 K=2816 N=4096 hash=bfbfd85b
+BENCH OK
+
+--- before-round2-shape1.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=2816 N=4096 O=256 rep=0 row_us=1164.653 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=1 row_us=1163.125 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=2 row_us=1168.177 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=3 row_us=1163.455 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=4 row_us=1164.063 packed_us=0.000
+CHAIN M=512 K=2816 N=4096 O=256 rep=5 row_us=1164.080 packed_us=0.000
+COMPONENT M=512 K=2816 N=4096 mode=0 producer_us=676.016 join_us=291.128 consumer_us=206.415
+CHAIN_CHECK M=512 K=2816 N=4096 hash=880ad821
+BENCH OK
+
+--- before-round2-shape2.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=768 K=2816 N=4096 O=256 rep=0 row_us=1662.656 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=1 row_us=1664.306 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=2 row_us=1661.163 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=3 row_us=1663.351 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=4 row_us=1666.337 packed_us=0.000
+CHAIN M=768 K=2816 N=4096 O=256 rep=5 row_us=1663.038 packed_us=0.000
+COMPONENT M=768 K=2816 N=4096 mode=0 producer_us=959.210 join_us=423.594 consumer_us=289.835
+CHAIN_CHECK M=768 K=2816 N=4096 hash=500f2381
+BENCH OK
+
+--- before-round2-shape3.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=128 K=4096 N=4096 O=256 rep=0 row_us=414.878 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=1 row_us=409.757 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=2 row_us=409.167 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=3 row_us=408.420 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=4 row_us=407.031 packed_us=0.000
+CHAIN M=128 K=4096 N=4096 O=256 rep=5 row_us=410.295 packed_us=0.000
+COMPONENT M=128 K=4096 N=4096 mode=0 producer_us=318.776 join_us=39.592 consumer_us=57.873
+CHAIN_CHECK M=128 K=4096 N=4096 hash=b7aa5dc5
+BENCH OK
+
+--- before-round2-shape4.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=512 K=4096 N=4096 O=256 rep=0 row_us=1401.042 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=1 row_us=1407.535 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=2 row_us=1398.924 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=3 row_us=1403.090 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=4 row_us=1402.066 packed_us=0.000
+CHAIN M=512 K=4096 N=4096 O=256 rep=5 row_us=1398.542 packed_us=0.000
+COMPONENT M=512 K=4096 N=4096 mode=0 producer_us=919.314 join_us=302.622 consumer_us=200.616
+CHAIN_CHECK M=512 K=4096 N=4096 hash=9b94edc5
+BENCH OK
+
+--- before-round2-shape5.txt ---
+ARITHMETIC OK: exact requant; three readouts; paired stores and tails
+SESSION VTCM=8388608 workers=7 hmx=1
+POOLED OK: uneven rows, per-channel params, invalid params leave output intact
+EXTREME FC OK: K=4096/4160/8192/32768; cancellation and true overflow
+LATE OVERFLOW OK: last row/column of final partial batch
+CHAIN M=67 K=4160 N=256 O=256 rep=0 row_us=44.323 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=1 row_us=42.969 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=2 row_us=43.247 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=3 row_us=42.587 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=4 row_us=42.951 packed_us=0.000
+CHAIN M=67 K=4160 N=256 O=256 rep=5 row_us=42.726 packed_us=0.000
+COMPONENT M=67 K=4160 N=256 mode=0 producer_us=31.832 join_us=0.130 consumer_us=13.559
+CHAIN_CHECK M=67 K=4160 N=256 hash=602af9bd
+BENCH OK

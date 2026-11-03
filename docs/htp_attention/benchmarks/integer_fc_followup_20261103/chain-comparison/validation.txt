@@ -1,0 +1,1 @@
+36/36 processes passed. All six shapes have matching complete consumer INT32 hashes before/after. After runs also compare full producer and consumer INT32 buffers, all UINT16 codes and padding, common/per-channel requantization.

@@ -87,6 +87,44 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
                                 float *pre_scratch, float *scale, int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool);
 
+/** @brief Packs already-quantized UINT16 codes into low/high AH byte planes.
+ * No scale calculation, dequantization or floating-point operations.
+ * k must be a multiple of 64, m_pad a multiple of 64 >= m_valid.
+ * Input and both output planes must not overlap; pad rows contain zero. */
+/** @brief One independent group of four rows in an already-sized AH arena.
+ * Caller validates K (multiple of 64), group < m_pad/4, and buffer sizes.
+ * Both AH output planes must be 128-byte aligned. Input may be unaligned.
+ * Rows >= m_valid are zero-filled. Groups may execute in any order. */
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi);
+
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool);
+
+/**
+ * @brief The 16-bit activation of an a16 matmul as two u8 AH planes: row m
+ *        is scale[m] * (u - zp[m]) with u in [0, 65535], its low bytes in
+ *        @a out_lo and high bytes in @a out_hi, each laid out exactly as
+ *        hvx_quant_pack_u8_ah lays out its bytes (m_pad * k each).
+ *
+ * The source is one of
+ *  - @a x16 with @a x16_hd == k: one (scale, zp) a row, x16_enc[0..1] (zp
+ *    rounded to an integer); the codes are used as they are.
+ *  - @a x16 with several heads of @a x16_hd: dequantized per head into
+ *    @a pre_scratch (hvx_quant_params_pack_u8_ah's contract) and
+ *    requantized per row, since a scale that varies along K cannot be
+ *    taken out of the dot product.
+ *  - @a x (f32), quantized per row over [0, 65535].
+ * Padding rows get scale 1, zp 0 and zero bytes.
+ */
+int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
+                                 const float *x16_enc, uint32_t x16_hd,
+                                 uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                 float *pre_scratch, float *scale, int32_t *zp,
+                                 uint8_t *out_lo, uint8_t *out_hi,
+                                 hvx_worker_pool *pool);
+
 /**
  * @brief Same pack, but destination row d takes its input from source row
  *        @a row_map[d].

@@ -69,6 +69,38 @@ int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
   return 0;
 }
 
+void hexkl_fc_acc_read_planes32(uint8_t *base, uint32_t off) {
+  uint8_t *d = base + off;
+  for (uint32_t p = 0; p < 2048u; ++p) {
+    const uint32_t v = (uint32_t)g_acc[p / 32u][p % 32u];
+    for (uint32_t b = 0; b < 4u; ++b)
+      d[b * 2048u + p] = (uint8_t)(v >> (8u * b));
+  }
+}
+
+/** The FC's byte-plane readout (hexkl_mm_u8i4_dma.c acc_read_planes24):
+    bytes 0, 1, 2 of each element, element p = row p / 32, column p % 32,
+    one 2 KiB plane each -- what the three device converts write. */
+void hexkl_fc_acc_read_planes24(uint8_t *base, uint32_t off) {
+  uint8_t *d = base + off;
+  for (uint32_t p = 0; p < 2048u; ++p) {
+    const uint32_t v = (uint32_t)g_acc[p / 32u][p % 32u];
+    d[p] = (uint8_t)v;
+    d[2048u + p] = (uint8_t)(v >> 8);
+    d[4096u + p] = (uint8_t)(v >> 16);
+  }
+}
+
+/** @brief Element (r, c) of a staged tile in either readout format. */
+static int32_t staged_at(const hvx_dq_tiles_job *c, const uint8_t *tile,
+                         uint32_t r, uint32_t col) {
+  if (!c->planes24)
+    return ((const int32_t *)tile)[(size_t)r * c->row_stride + col];
+  const uint32_t p = r * 32u + col;
+  return (int32_t)tile[p] | ((int32_t)tile[2048u + p] << 8) |
+         ((int32_t)(int8_t)tile[4096u + p] << 16);
+}
+
 /* ---- the u8i4 GEMV: the same sum as the tile above, over the tiles the
    kernel points it at. rows1 picks between two HVX loops that compute
    the same int32 sums (hvx_gemm_u8i4_wh.c), so it is one function here;
@@ -355,6 +387,99 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
   return 0;
 }
 
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi) {
+  for (uint32_t m = group * 4u; m < (group + 1u) * 4u; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      const size_t d = (size_t)(m / 64u) * 64u * k + (size_t)(c / 32u) * 2048u +
+                       (m % 64u) * 32u + c % 32u;
+      const uint16_t q = m < m_valid ? x[(size_t)m * k + c] : 0;
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
+}
+
+/* Independent scalar stand-in for the byte-only pack. */
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !lo || !hi || !m_valid || !k || k % 64u || m_pad < m_valid ||
+      m_pad % 64u || (size_t)m_pad > SIZE_MAX / sizeof(uint16_t) / k)
+    return 14;
+  for (uint32_t m = 0; m < m_pad; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      size_t d = (size_t)(m / 64u) * 64u * k + (size_t)(c / 32u) * 2048u +
+                 (m % 64u) * 32u + c % 32u;
+      uint16_t q = m < m_valid ? x[(size_t)m * k + c] : 0;
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
+  return 0;
+}
+
+/** hvx_quant_params_pack_u16_ah: per row the codes (one encoding: the
+    row's own; several: dequantized, then requantized over [0, 65535] with
+    the kernel's parameter formula), low bytes to one plane and high bytes
+    to the other in the u8 AH layout; pad rows scale 1, zero point 0. */
+int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
+                                 const float *x16_enc, uint32_t x16_hd,
+                                 uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                 float *pre_scratch, float *scale, int32_t *zp,
+                                 uint8_t *out_lo, uint8_t *out_hi,
+                                 hvx_worker_pool *pool) {
+  (void)pool;
+  const int direct = x16 && x16_hd == k;
+  if ((!x && !x16) || k % 32u != 0u ||
+      (x16 && (!x16_enc || x16_hd == 0u || x16_hd % 64u != 0u ||
+               k % x16_hd != 0u || (!direct && !pre_scratch))))
+    return -1;
+  memset(out_lo, 0, (size_t)m_pad * k);
+  memset(out_hi, 0, (size_t)m_pad * k);
+  const uint32_t kt_n = k / 32u;
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    scale[m] = 1.0f;
+    zp[m] = 0;
+  }
+  for (uint32_t m = 0; m < m_valid; ++m) {
+    const float *row = x ? x + (size_t)m * k : NULL;
+    if (direct) {
+      scale[m] = x16_enc[0];
+      zp[m] = (int32_t)nearbyintf(x16_enc[1]);
+    } else {
+      if (x16) {
+        for (uint32_t j = 0; j < k; ++j)
+          pre_scratch[j] =
+            ((float)x16[(size_t)m * k + j] - x16_enc[2u * (j / x16_hd) + 1u]) *
+            x16_enc[2u * (j / x16_hd)];
+        row = pre_scratch;
+      }
+      float lo = 0.f, hi = 0.f;
+      for (uint32_t j = 0; j < k; ++j) {
+        lo = row[j] < lo ? row[j] : lo;
+        hi = row[j] > hi ? row[j] : hi;
+      }
+      if (lo != hi) {
+        scale[m] = (hi - lo) / 65535.0f;
+        long z = (long)nearbyintf(-lo / scale[m]);
+        zp[m] = (int32_t)(z < 0 ? 0 : (z > 65535 ? 65535 : z));
+      }
+    }
+    const float inv = 1.0f / scale[m];
+    for (uint32_t j = 0; j < k; ++j) {
+      long q = direct ? (long)x16[(size_t)m * k + j]
+                      : (long)nearbyintf(row[j] * inv) + zp[m];
+      q = q < 0 ? 0 : (q > 65535 ? 65535 : q);
+      const size_t d = (size_t)(m / 64u) * kt_n * 2048u +
+                       (size_t)(j / 32u) * 2048u + (size_t)(m % 64u) * 32u +
+                       j % 32u;
+      out_lo[d] = (uint8_t)(q & 0xff);
+      out_hi[d] = (uint8_t)(q >> 8);
+    }
+  }
+  return 0;
+}
+
 /* The tile dequant without the buffer hook: the pooled workers below call
    it on their own stack tiles, which lanes run one after another on the
    host share, so reporting those would be a false cross-lane race. */
@@ -457,6 +582,19 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
       const uint32_t c0 = (c->nt0 + j) * 32u;
       const int32_t *tile =
         (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+      if (c->lo_off || c->planes24) { /* the kernel's order */
+        const uint8_t *th = (const uint8_t *)tile;
+        for (uint32_t cc = 0; cc < 32u; ++cc) {
+          float af = (float)staged_at(c, th, m, cc);
+          if (c->lo_off) /* a16: 256 hi + lo in f32 */
+            af = af * 256.0f + (float)staged_at(c, th + c->lo_off, m, cc);
+          c->dst_a[(size_t)m * c->dst_stride + c0 + cc] =
+            (af - (float)c->act_zp[m] * (float)c->colsum_w[c0 + cc]) *
+              c->act_scale[m] * c->w_scale[c0 + cc] +
+            c->bias[c0 + cc];
+        }
+        continue;
+      }
       hvx_dequant_acc_tile_to_f32(
         tile + (size_t)m * c->row_stride, c->row_stride, 1u, c->act_scale + m,
         c->act_zp + m, c->colsum_w + c0, c->w_scale + c0, c->bias + c0,
@@ -493,10 +631,10 @@ void hvx_dequant_acc_tiles_to_f32(
   (void)pool;
   if (!tiles_base || n_tiles == 0u || m_count == 0u)
     return;
-  hvx_dq_tiles_job jb = {tiles_base, tile_stride, nt0,    row_stride,
-                         m_count,    act_scale,   act_zp, colsum_w,
-                         w_scale,    bias,        dst_a,  dst_b,
-                         split,      dst_stride,  n_tiles};
+  hvx_dq_tiles_job jb = {tiles_base, tile_stride, nt0,      row_stride, m_count,
+                         act_scale,  act_zp,      colsum_w, w_scale,    bias,
+                         dst_a,      dst_b,       split,    dst_stride, n_tiles,
+                         0u,         0u};
   hvx_dq_tiles_worker(1u, 0u, &jb);
 }
 /* Fused gate/up dequant + SwiGLU: staged slot j is gate column g0 + j and

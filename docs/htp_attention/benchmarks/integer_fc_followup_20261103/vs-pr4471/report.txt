@@ -1,0 +1,33 @@
+Direct original PR #4471 comparison, 2026-11-03.
+
+Baseline: saved unmodified PR commit 3881042471377ec3c083afd06e55a04ab6934cbe.
+Candidate: final 2026-11-03 direct-AH-capable integer library, same binary as
+fc-comparison and chain-comparison. Single-FC rows here use row-major output.
+Device: S26 Ultra SM-S948N, SM8850, Hexagon v81, serial R5KL30G6MCX.
+
+Three alternating processes/build/shape, six samples/process, three calls/sample;
+two warmup rounds. Medians of 18 samples. Profiling disabled for timed calls.
+Both builds use the same inputs, offline WH weights and single-FC shapes.
+Weight packing/registration and FastRPC excluded; DMA, activation preparation
+and final output completion included.
+
+Original API returns scaled FP32. Candidate returns corrected INT32, optionally
+with UINT16 requantization; chain_us in medians.csv is ONE FC plus requantization,
+not the two-FC chain from ../chain-comparison. This is a comparison of the two
+output APIs, not identical numerical-output contracts. Use comparison.csv for
+the derived percentages; the denominator is before.fp32_us. Hashes are stable
+within each API and all 36 device processes passed; hashes of different output
+types are not expected to match each other.
+
+Representative 512 x 2816 x 4096: 872.023 us original FP32 -> 677.673 us INT32
+(22.3% less time) or 676.562 us INT32 + UINT16 requant (22.4% less time, 1.289x).
+The earlier 28.6% two-FC improvement is relative to yesterday's integer kernel.
+No two-FC timing against the original PR is claimed here. No model-level timing.
+The K=4160 tail case benefits principally from removing scalar activation-tail
+stores; its 91.2% reduction should not be generalized to the larger FC shapes.
+
+Run command (from the integer-FC worktree):
+NNTR_BENCH_BASELINE_KIND=fp32 bash test/htp/compare_integer_fc_device_bench.sh \
+  R5KL30G6MCX /tmp/nntr-integer-overlap/pr4471-original \
+  /tmp/nntr-w4a16-opt-20261103/packed-unroll \
+  /tmp/nntr-w4a16-opt-20261103/vs-pr4471

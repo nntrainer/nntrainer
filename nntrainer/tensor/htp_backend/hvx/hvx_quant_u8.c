@@ -36,7 +36,7 @@
  *         every other row, which is what makes splitting this by row
  *         range across worker threads safe. */
 static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
-                                 float *scale, int32_t *zp) {
+                                 float *scale, int32_t *zp, float qmax) {
   const float *row = x + (size_t)m * k;
   const uint32_t n_vec = k / FLANES;
   float min0 = row[0];
@@ -79,15 +79,15 @@ static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
   if (rmin == rmax) {
     return; /* leaves scale 1, zp 0 */
   }
-  const float s = (rmax - rmin) / 255.0f;
+  const float s = (rmax - rmin) / qmax;
   /** nearbyintf, not roundf: the vectorized path rounds to nearest even
      and the host reference is written to match. */
   int32_t z = (int32_t)nearbyintf(-rmin / s);
   if (z < 0) {
     z = 0;
   }
-  if (z > 255) {
-    z = 255;
+  if (z > (int32_t)qmax) {
+    z = (int32_t)qmax;
   }
   scale[m] = s;
   zp[m] = z;
@@ -116,10 +116,10 @@ static void quant_rows_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
     const float *row = ctx->x + (size_t)m * ctx->k;
     if (sc) { /* the normed row never leaves this lane's cache */
       hvx_rmsnorm_row_f32(row, sc, ctx->pre_gamma, ctx->k, ctx->pre_eps);
-      quant_row_params_one(sc, 0u, ctx->k, ctx->scale + m, ctx->zp + m);
+      quant_row_params_one(sc, 0u, ctx->k, ctx->scale + m, ctx->zp + m, 255.0f);
       row = sc;
     } else {
-      quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp);
+      quant_row_params_one(ctx->x, m, ctx->k, ctx->scale, ctx->zp, 255.0f);
     }
     if (ctx->out_rm)
       quant_row_u8_rm(row, ctx->k, ctx->scale[m], ctx->zp[m],
@@ -507,7 +507,7 @@ static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
     const uint32_t m = 4u * g;
     if (!sc) {
       for (uint32_t r = 0; r < 4u; ++r)
-        quant_row_params_one(c->x, m + r, c->k, c->scale, c->zp);
+        quant_row_params_one(c->x, m + r, c->k, c->scale, c->zp, 255.0f);
       hvx_quant_pack_u8_ah_rows(c->x, NULL, m, m + 4u, c->k, c->scale, c->zp,
                                 c->out_ah);
       continue;
@@ -519,7 +519,7 @@ static void quant_params_pack_worker(uint32_t n_threads, uint32_t i,
       else
         hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k,
                             sc + (size_t)r * c->k, c->gamma, c->k, c->eps);
-      quant_row_params_one(sc, r, c->k, c->scale + m, c->zp + m);
+      quant_row_params_one(sc, r, c->k, c->scale + m, c->zp + m, 255.0f);
     }
     const float *const row[4] = {sc, sc + c->k, sc + 2u * c->k, sc + 3u * c->k};
     pack_group_rows(row, m, c->k / TILE_INNER, c->scale, c->zp, c->out_ah);
@@ -561,13 +561,263 @@ int hvx_quant_params_pack_u8_ah(const float *x, const uint16_t *x16,
       hvx_rmsnorm_row_f32(row, pre_scratch, pre_gamma, k, pre_eps);
       row = pre_scratch;
     }
-    quant_row_params_one(row, 0, k, scale + m, zp + m);
+    quant_row_params_one(row, 0, k, scale + m, zp + m, 255.0f);
     const uint32_t rb = m / TILE_ROW;
     const uint32_t r = m % TILE_ROW;
     quant_pack_row_scalar(
       row, n_ktiles, hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
       out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER,
       ACT_TILE_BYTES);
+  }
+  return AEE_SUCCESS;
+}
+
+/** ---- 16-bit activations as two byte planes (hvx_quant_params_pack_u16_ah)
+    ---- */
+
+typedef struct {
+  const float *x;
+  const uint16_t *x16;
+  const float *x16_enc;
+  uint32_t x16_hd;
+  uint32_t n_groups, k;
+  float *scale;
+  int32_t *zp;
+  uint8_t *out_lo, *out_hi;
+  float *scratch;
+} quant16_ctx;
+
+/** @brief Four rows' u16 codes of one k-tile, rows 0-1 in @a h01 and 2-3 in
+ *         @a h23 (32 each, in order): low bytes to @a dlo, high to @a dhi,
+ *         one 128-byte store each, as quant_pack_group4 lands its bytes. */
+static inline void store16_group4(HVX_Vector h01, HVX_Vector h23, uint8_t *dlo,
+                                  uint8_t *dhi) {
+  *(HVX_UVector *)dlo = Q6_Vb_vpacke_VhVh(h23, h01);
+  *(HVX_UVector *)dhi = Q6_Vb_vpacko_VhVh(h23, h01);
+}
+
+/** @brief 32 f32 of a row to u16 codes as int32: rne(x / s) + zp. */
+static inline HVX_Vector q16_run(const float *src, HVX_Vector vinv,
+                                 HVX_Vector vz) {
+  return Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)src, vinv)), vz);
+}
+
+/** @brief Rows m..m+3 from f32 rows @a row, at their scale and zp. */
+static void pack16_rows_f32(const float *const row[4], uint32_t m,
+                            uint32_t n_kt, const float *scale,
+                            const int32_t *zp, uint8_t *lo, uint8_t *hi) {
+  const size_t blk = (size_t)(m / TILE_ROW) * n_kt * ACT_TILE_BYTES +
+                     (m % TILE_ROW) * TILE_INNER;
+  HVX_Vector vinv[4], vz[4];
+  for (uint32_t r = 0; r < 4u; ++r) {
+    vinv[r] = hvx_splat_sf(1.0f / scale[m + r]);
+    vz[r] = Q6_V_vsplat_R(zp[m + r]);
+  }
+  for (uint32_t kt = 0; kt < n_kt; ++kt) {
+    const uint32_t o = kt * TILE_INNER;
+    /* vpack(Vu, Vv):sat puts Vv in the low half, as quant_pack_group4 */
+    const HVX_Vector h01 = Q6_Vuh_vpack_VwVw_sat(
+      q16_run(row[1] + o, vinv[1], vz[1]), q16_run(row[0] + o, vinv[0], vz[0]));
+    const HVX_Vector h23 = Q6_Vuh_vpack_VwVw_sat(
+      q16_run(row[3] + o, vinv[3], vz[3]), q16_run(row[2] + o, vinv[2], vz[2]));
+    const size_t d = blk + (size_t)kt * ACT_TILE_BYTES;
+    store16_group4(h01, h23, lo + d, hi + d);
+  }
+}
+
+/** @brief Rows m..m+3 straight from consecutive u16 rows @a u (row m at
+ *         u, stride k): row 0's 32 codes of a k-tile land in the low 64
+ *         bytes, row 1's in the high, read 64 bytes early so they arrive
+ *         there; the reads stay inside rows m..m+3. */
+static void pack16_rows_u16(const uint16_t *u, uint32_t m, uint32_t n_kt,
+                            uint32_t k, uint8_t *lo, uint8_t *hi) {
+  const size_t blk = (size_t)(m / TILE_ROW) * n_kt * ACT_TILE_BYTES +
+                     (m % TILE_ROW) * TILE_INNER;
+  const HVX_VectorPred q = Q6_Q_vsetq2_R(VLEN / 2u);
+  const uint16_t *r0 = u, *r1 = u + k - TILE_INNER;
+  const uint16_t *r2 = u + 2u * k, *r3 = u + 3u * k - TILE_INNER;
+  for (uint32_t kt = 0; kt < n_kt; ++kt) {
+    const uint32_t o = kt * TILE_INNER;
+    const HVX_Vector h01 = Q6_V_vmux_QVV(q, *(const HVX_UVector *)(r0 + o),
+                                         *(const HVX_UVector *)(r1 + o));
+    const HVX_Vector h23 = Q6_V_vmux_QVV(q, *(const HVX_UVector *)(r2 + o),
+                                         *(const HVX_UVector *)(r3 + o));
+    const size_t d = blk + (size_t)kt * ACT_TILE_BYTES;
+    store16_group4(h01, h23, lo + d, hi + d);
+  }
+}
+
+void hvx_pack_u16_ah_group(const uint16_t *x, uint32_t group, uint32_t m_valid,
+                           uint32_t k, uint8_t *lo, uint8_t *hi) {
+  const uint32_t m = group * 4u;
+  const uint32_t count = m >= m_valid       ? 0u
+                         : m_valid - m < 4u ? m_valid - m
+                                            : 4u;
+  const size_t base =
+    (size_t)(m / TILE_ROW) * TILE_ROW * k + (m % TILE_ROW) * TILE_INNER;
+  if (count && k <= 32767u)
+    Q6_l2fetch_AP((void *)(x + (size_t)m * k), ((uint64_t)(2u * k) << 32) |
+                                                 ((uint64_t)(2u * k) << 16) |
+                                                 count);
+  const HVX_Vector zero = Q6_V_vzero();
+  for (uint32_t c = 0; c < k; c += 64u) {
+    // Read each 64-code vector once. Splitting its halves produces two
+    // consecutive K tiles, instead of overlapping 32-code input reads.
+    const HVX_Vector u0 =
+      count > 0u ? *(const HVX_UVector *)(x + (size_t)m * k + c) : zero;
+    const HVX_Vector u1 =
+      count > 1u ? *(const HVX_UVector *)(x + (size_t)(m + 1u) * k + c) : zero;
+    const HVX_Vector u2 =
+      count > 2u ? *(const HVX_UVector *)(x + (size_t)(m + 2u) * k + c) : zero;
+    const HVX_Vector u3 =
+      count > 3u ? *(const HVX_UVector *)(x + (size_t)(m + 3u) * k + c) : zero;
+    const HVX_VectorPair h01 = Q6_W_vshuff_VVR(u1, u0, -64);
+    const HVX_VectorPair h23 = Q6_W_vshuff_VVR(u3, u2, -64);
+    const size_t d = base + (size_t)(c / TILE_INNER) * ACT_TILE_BYTES;
+    // Each group owns whole aligned vectors, including partial/pad rows.
+    // No byte copies or read-modify-write stores touch neighboring groups.
+    *(HVX_Vector *)(lo + d) = Q6_Vb_vpacke_VhVh(Q6_V_lo_W(h23), Q6_V_lo_W(h01));
+    *(HVX_Vector *)(hi + d) = Q6_Vb_vpacko_VhVh(Q6_V_lo_W(h23), Q6_V_lo_W(h01));
+    *(HVX_Vector *)(lo + d + ACT_TILE_BYTES) =
+      Q6_Vb_vpacke_VhVh(Q6_V_hi_W(h23), Q6_V_hi_W(h01));
+    *(HVX_Vector *)(hi + d + ACT_TILE_BYTES) =
+      Q6_Vb_vpacko_VhVh(Q6_V_hi_W(h23), Q6_V_hi_W(h01));
+  }
+}
+
+/** @brief Byte splitting only: no encoding or float parameters. */
+static void pack16_worker(uint32_t threads, uint32_t lane, void *ctx) {
+  const quant16_ctx *c = (const quant16_ctx *)ctx;
+  const uint32_t begin = (uint32_t)((uint64_t)c->n_groups * lane / threads);
+  const uint32_t end =
+    (uint32_t)((uint64_t)c->n_groups * (lane + 1u) / threads);
+  for (uint32_t g = begin; g < end; ++g)
+    pack16_rows_u16(c->x16 + (size_t)4u * g * c->k, 4u * g, c->k / TILE_INNER,
+                    c->k, c->out_lo, c->out_hi);
+}
+
+int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
+                    uint32_t k, uint8_t *lo, uint8_t *hi,
+                    hvx_worker_pool *pool) {
+  if (!x || !lo || !hi || !m_valid || !k || k % 64u || m_pad < m_valid ||
+      m_pad % TILE_ROW || (size_t)m_pad > SIZE_MAX / sizeof(uint16_t) / k)
+    return AEE_EBADPARM;
+  const uint32_t end = m_valid / 4u * 4u;
+  if (m_valid < m_pad) {
+    const size_t block = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(lo + block * k, 0, (size_t)(m_pad - block) * k);
+    memset(hi + block * k, 0, (size_t)(m_pad - block) * k);
+  }
+  quant16_ctx ctx = {0};
+  ctx.x16 = x;
+  ctx.n_groups = end / 4u;
+  ctx.k = k;
+  ctx.out_lo = lo;
+  ctx.out_hi = hi;
+  if (ctx.n_groups)
+    hvx_worker_pool_run(pool, pack16_worker, &ctx, ctx.n_groups);
+  for (uint32_t m = end; m < m_valid; ++m)
+    for (uint32_t c = 0; c < k; ++c) {
+      const size_t d = (size_t)(m / TILE_ROW) * TILE_ROW * k +
+                       (size_t)(c / TILE_INNER) * ACT_TILE_BYTES +
+                       (m % TILE_ROW) * TILE_INNER + c % TILE_INNER;
+      const uint16_t q = x[(size_t)m * k + c];
+      lo[d] = (uint8_t)q;
+      hi[d] = (uint8_t)(q >> 8);
+    }
+  return AEE_SUCCESS;
+}
+
+/** @brief Row groups [lo, hi) of four, each one's parameters then its pack
+ *         while the rows are cached, as quant_params_pack_worker. */
+static void quant16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
+  const quant16_ctx *c = (const quant16_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
+  const uint32_t n_kt = c->k / TILE_INNER;
+  float *sc = c->scratch ? c->scratch + (size_t)i * 4u * c->k : NULL;
+  for (uint32_t g = lo; g < hi; ++g) {
+    const uint32_t m = 4u * g;
+    if (c->x16 && c->x16_hd == c->k) {
+      pack16_rows_u16(c->x16 + (size_t)m * c->k, m, n_kt, c->k, c->out_lo,
+                      c->out_hi);
+      continue;
+    }
+    const float *row[4];
+    for (uint32_t r = 0; r < 4u; ++r) {
+      if (c->x16) {
+        dequant16_row(c->x16 + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
+                      c->x16_enc, c->x16_hd, c->k);
+        row[r] = sc + (size_t)r * c->k;
+      } else {
+        row[r] = c->x + (size_t)(m + r) * c->k;
+      }
+      quant_row_params_one(row[r], 0u, c->k, c->scale + m + r, c->zp + m + r,
+                           65535.0f);
+    }
+    pack16_rows_f32(row, m, n_kt, c->scale, c->zp, c->out_lo, c->out_hi);
+  }
+}
+
+int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
+                                 const float *x16_enc, uint32_t x16_hd,
+                                 uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                 float *pre_scratch, float *scale, int32_t *zp,
+                                 uint8_t *out_lo, uint8_t *out_hi,
+                                 hvx_worker_pool *pool) {
+  const int direct = x16 && x16_hd == k;
+  if ((!x && !x16) || k % TILE_INNER != 0u ||
+      (x16 && (!x16_enc || x16_hd == 0u || x16_hd % (2u * FLANES) != 0u ||
+               k % x16_hd != 0u || (!direct && !pre_scratch)))) {
+    return AEE_EBADPARM;
+  }
+  /** One encoding for the whole row: the codes are the row's own, nothing
+      to requantize. Several (a head each): dequantized and requantized per
+      row, since a K-varying scale cannot leave the dot product. */
+  const float s0 = direct ? x16_enc[0] : 1.0f;
+  const int32_t z0 = direct ? (int32_t)nearbyintf(x16_enc[1]) : 0;
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    scale[m] = m < m_valid ? s0 : 1.0f;
+    zp[m] = m < m_valid ? z0 : 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_lo + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+    memset(out_hi + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  const uint32_t m_vec_end = (m_valid / 4u) * 4u;
+  if (m_vec_end > 0) {
+    quant16_ctx ctx = {x,     x16, x16_enc, x16_hd, m_vec_end / 4u, k,
+                       scale, zp,  out_lo,  out_hi, pre_scratch};
+    hvx_worker_pool_run(pool, quant16_worker, &ctx, m_vec_end / 4u);
+  }
+  /* 0-3 rows past the last group of four, scalar */
+  for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    const float *row = x ? x + (size_t)m * k : NULL;
+    if (x16 && !direct) {
+      dequant16_row(x16 + (size_t)m * k, pre_scratch, x16_enc, x16_hd, k);
+      row = pre_scratch;
+    }
+    if (!direct)
+      quant_row_params_one(row, 0u, k, scale + m, zp + m, 65535.0f);
+    const float inv = 1.0f / scale[m];
+    const size_t blk =
+      (size_t)(m / TILE_ROW) * (k / TILE_INNER) * ACT_TILE_BYTES +
+      (m % TILE_ROW) * TILE_INNER;
+    for (uint32_t j = 0; j < k; ++j) {
+      long q;
+      if (direct) {
+        q = x16[(size_t)m * k + j];
+      } else {
+        q = (long)nearbyintf(row[j] * inv) + zp[m];
+        q = q < 0 ? 0 : (q > 65535 ? 65535 : q);
+      }
+      const size_t d =
+        blk + (size_t)(j / TILE_INNER) * ACT_TILE_BYTES + j % TILE_INNER;
+      out_lo[d] = (uint8_t)(q & 0xff);
+      out_hi[d] = (uint8_t)(q >> 8);
+    }
   }
   return AEE_SUCCESS;
 }

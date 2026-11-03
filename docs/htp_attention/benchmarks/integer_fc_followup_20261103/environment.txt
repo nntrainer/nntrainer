@@ -1,0 +1,8 @@
+S26 Ultra SM-S948N / SM8850, serial R5KL30G6MCX, v81
+SDK 6.4.0.1; Hexagon tools 19.0.04; HexKL 6.4.0.2; -O3
+8 MiB VTCM, seven HVX workers. HMX/DSP power votes enabled, clocks not sampled.
+Baseline: /tmp/nntr-w4a16-opt-20261103/before, saved max-e integer kernel from 2026-11-02.
+Candidate: /tmp/nntr-w4a16-opt-20261103/packed-unroll.
+Single FC: existing compare_integer_fc_device_bench.sh, 36 processes.
+Chain: compare_chain.py, 36 processes. Before chain bench compiled with HEXKL_BENCH_ROW_ONLY and linked to the saved baseline skel.
+Chain baseline and candidate share the same parallel HVX handle-join implementation.
