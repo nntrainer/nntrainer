@@ -41,6 +41,17 @@
  *  - The yarn and proportional tables follow the layer's formulas (yarn
  *    without HF's default truncation of the ramp bounds), so those two cases
  *    pin the layer rather than check it against Hugging Face.
+ *
+ * Device mode (the #4452 harness, for step 7a of #4451, planned in #4466): run
+ * with NNTR_ENGINE=gpu in an enable-opencl and enable-fp16 build on a machine
+ * with an OpenCL device. Every case then runs the same steps against the same
+ * reference with its inputs, output and KV caches in the gpu context's shared
+ * virtual memory and its op table, and with NNTR_MHA_GPU=1 and
+ * NNTR_MHA_GPU_DECODE=1, which the test sets itself before the layer latches
+ * them, so a gemm case takes the layer's OpenCL arms (the device RoPE and KV
+ * write, the two_conv / flash / image attention kernels; an FP32 case through
+ * its FP16 device copies). The device arms compute in fp16, so every case is
+ * held to 1e-2 there. Without an OpenCL build or a device the cases skip.
  */
 
 #include <mha_core.h>
@@ -49,13 +60,22 @@
 #include <layer_context.h>
 #include <var_grad.h>
 #include <weight.h>
+#if defined(ENABLE_OPENCL)
+#include <basic_planner.h>
+#include <blas_kernels.h> // cl_svm_map_force
+#include <cl_context.h>
+#include <engine.h>
+#include <tensor_pool.h>
+#endif
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -89,7 +109,8 @@ struct MhaCase {
    * Whether the layer applies softcap on this path. The host flash arm
    * (gemm_attention) ignores attn_logit_softcapping today (#4461), while the
    * per-row arm and the OpenCL arms apply it. Pinned as-is; the #4461 fix
-   * flips softcap_gemm_not_applied to true.
+   * flips softcap_gemm_not_applied to true. In device mode the test sets it
+   * to true for every case, since the OpenCL arms apply the cap.
    */
   bool softcap_applied = true;
   /**
@@ -193,6 +214,57 @@ private:
   bool had_ = false;
   std::string old_;
 };
+
+/**
+ * @brief Device mode: NNTR_ENGINE=gpu (see the header). Latched once, as the
+ *        layer latches the engine.
+ */
+bool deviceMode() {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_ENGINE");
+    std::string engine = e ? e : "";
+    for (char &ch : engine)
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return engine == "gpu";
+  }();
+  return on;
+}
+
+#if defined(ENABLE_OPENCL)
+/**
+ * @brief The gpu context, or null when the OpenCL backend did not come up
+ *        (no device, or the engine was not asked for).
+ */
+nntrainer::Context *deviceContext() {
+  try {
+    return nntrainer::Engine::Global().getRegisteredContext("gpu");
+  } catch (const std::exception &) {
+    return nullptr;
+  }
+}
+
+/**
+ * @brief In device mode, turn the layer's device attention arms on before its
+ *        first forward latches the environment. A value already in the
+ *        environment is kept.
+ */
+struct DeviceArmEnv {
+  DeviceArmEnv() {
+    if (!deviceMode())
+      return;
+    for (const char *name : {"NNTR_MHA_GPU", "NNTR_MHA_GPU_DECODE"}) {
+      if (std::getenv(name))
+        continue;
+#ifdef _WIN32
+      _putenv_s(name, "1");
+#else
+      setenv(name, "1", 1);
+#endif
+    }
+  }
+};
+const DeviceArmEnv device_arm_env;
+#endif
 
 /** @brief Round a value through fp16 storage, as the KV cache does. */
 float roundFp16(float v) {
@@ -355,17 +427,35 @@ class MhaCoreHostPath : public ::testing::TestWithParam<MhaCase> {};
  * each step's output rows against referenceAttention().
  */
 TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
-  const MhaCase &c = GetParam();
+  MhaCase c = GetParam();
+  const bool device = deviceMode();
+  // The OpenCL arms apply the softcap (see MhaCase::softcap_applied), so in
+  // device mode the reference applies it for every case.
+  if (device)
+    c.softcap_applied = true;
+#if !defined(ENABLE_OPENCL)
+  if (device)
+    GTEST_SKIP() << "NNTR_ENGINE=gpu needs an enable-opencl build";
+#endif
+#if !defined(ENABLE_FP16)
+  // Without enable-fp16 the caches are UINT16, and no device arm takes a
+  // step over them: the case would pass on the host arms and test nothing.
+  if (device)
+    GTEST_SKIP() << "NNTR_ENGINE=gpu needs an enable-fp16 build";
+#endif
+  // In device mode the test owns the arm-selecting environment (see the
+  // header); otherwise an arm it did not pick is reported, not tested.
   for (const char *name : kArmSelectingEnv) {
-    if (std::getenv(name))
+    if (!device && std::getenv(name))
       GTEST_SKIP() << name << " is set; it changes which arm the layer runs";
   }
 #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||           \
       defined(_M_IX86))
   // min_prefill_thr() and host_decode_prefers_per_row() in mha_core.cpp: off
   // x86 the host flash arm needs a 32-row step and never takes a decode step,
-  // so with these step sizes a gemm case would re-test the per-row arm.
-  if (c.gemm)
+  // so with these step sizes a gemm case would re-test the per-row arm. In
+  // device mode the device arms take every step.
+  if (!device && c.gemm)
     GTEST_SKIP() << "the host flash arm is not selected for these step sizes "
                     "on this architecture";
 #endif
@@ -431,12 +521,57 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   std::vector<nntrainer::Var_Grad> tensors;
   for (const auto &spec : init_context.getTensorsSpec())
     tensors.emplace_back(spec, true);
+  const nntrainer::TensorDim out_dim =
+    init_context.getOutSpecs()[0].variable_spec.dim;
+#if defined(ENABLE_OPENCL)
+  // Device mode: the inputs, the output and the caches come from a pool on
+  // the gpu context's allocator (shared virtual memory, the only memory the
+  // layer's OpenCL arms accept) and carry its op table. The pool outlives the
+  // Var_Grads below, which only view its tensors.
+  std::unique_ptr<nntrainer::TensorPool> pool;
+  nntrainer::Context *gpu = device ? deviceContext() : nullptr;
+  if (device && gpu == nullptr)
+    GTEST_SKIP() << "NNTR_ENGINE=gpu, but the gpu context is not registered "
+                    "(no OpenCL device)";
+#endif
   std::vector<nntrainer::Var_Grad> inputs;
-  for (const auto &d : init_context.getInputDimensions())
-    inputs.emplace_back(d, nntrainer::Initializer::ZEROS, false, true, "in");
   std::vector<nntrainer::Var_Grad> outputs;
-  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
-                       nntrainer::Initializer::ZEROS, false, true, "out");
+#if defined(ENABLE_OPENCL)
+  if (device) {
+    pool = std::make_unique<nntrainer::TensorPool>(
+      false, "", "", ml::train::ExecutionMode::INFERENCE,
+      gpu->getMemAllocator());
+    const auto life = nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN;
+    const auto engine = ml::train::LayerComputeEngine::GPU;
+    const auto &in_dims = init_context.getInputDimensions();
+    for (size_t i = 0; i < in_dims.size(); ++i)
+      pool->request("in" + std::to_string(i), in_dims[i], {0}, life,
+                    nntrainer::Initializer::ZEROS, false, engine);
+    pool->request("out", out_dim, {0}, life, nntrainer::Initializer::ZEROS,
+                  false, engine);
+    pool->finalize(nntrainer::BasicPlanner(), 0, 1);
+    pool->allocate();
+    auto view = [&](const std::string &name) {
+      nntrainer::Tensor *t = pool->getTensor(name);
+      t->setContextData(gpu->getContextData());
+      nntrainer::Var_Grad vg(*t, nntrainer::Tensor(), name);
+      vg.getVariableRef().setContextData(gpu->getContextData());
+      return vg;
+    };
+    for (size_t i = 0; i < in_dims.size(); ++i)
+      inputs.push_back(view("in" + std::to_string(i)));
+    outputs.push_back(view("out"));
+    ASSERT_TRUE(inputs[0].getVariableRef().getMemoryData() &&
+                inputs[0].getVariableRef().getMemoryData()->isSVM())
+      << "the gpu allocator did not give shared virtual memory";
+  } else
+#endif
+  {
+    for (const auto &d : init_context.getInputDimensions())
+      inputs.emplace_back(d, nntrainer::Initializer::ZEROS, false, true, "in");
+    outputs.emplace_back(out_dim, nntrainer::Initializer::ZEROS, false, true,
+                         "out");
+  }
 
   std::mt19937 rng(0x5eed);
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -482,9 +617,21 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     for (auto &x : v)
       x = dist(rng);
 
-    std::copy(q.begin(), q.end(), run_context.getInput(0).getData<float>());
-    std::copy(k.begin(), k.end(), run_context.getInput(1).getData<float>());
-    std::copy(v.begin(), v.end(), run_context.getInput(2).getData<float>());
+    const std::vector<float> *step_in[] = {&q, &k, &v};
+    for (unsigned int i = 0; i < 3; ++i) {
+      nntrainer::Tensor &in = run_context.getInput(i);
+#if defined(ENABLE_OPENCL)
+      // In device mode the input is shared virtual memory: the host writes
+      // it only while mapped, and unmaps it for the layer's kernels.
+      if (device)
+        nntrainer::cl_svm_map_force(in.getData(), in.bytes(), false);
+#endif
+      std::copy(step_in[i]->begin(), step_in[i]->end(), in.getData<float>());
+#if defined(ENABLE_OPENCL)
+      if (device)
+        nntrainer::cl_svm_unmap_force(in.getData());
+#endif
+    }
 
     for (unsigned int r = 0; r < rows; ++r) {
       for (unsigned int h = 0; h < c.heads_kv; ++h) {
@@ -502,14 +649,28 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
 
     const std::vector<float> expected =
       referenceAttention(c, rope, q, k_hist, v_hist, sink, from, rows);
-    const float *actual = run_context.getOutput(0).getData<float>();
     // An Android fp16 build runs the FP16 path for these FP32 activations
     // (see the header), so it is held to fp16 precision; 8e-4 at most on a
-    // Galaxy S26. Every other build computes in FP32 and keeps 1e-4.
+    // Galaxy S26. Every other build computes in FP32 and keeps 1e-4. The
+    // device arms compute in fp16: every case is held to it in device mode.
 #if defined(ENABLE_FP16) && defined(__ANDROID__)
     const float tolerance = 1e-2f;
 #else
-    const float tolerance = 1e-4f;
+    const float tolerance = device ? 1e-2f : 1e-4f;
+#endif
+    nntrainer::Tensor &out = run_context.getOutput(0);
+#if defined(ENABLE_OPENCL)
+    // The device arms enqueue without a drain, and the output is shared
+    // virtual memory: map it for the host read (blocking, so it also waits
+    // for the kernels), copy it out, and hand it back.
+    if (device)
+      nntrainer::cl_svm_map_force(out.getData(), out.bytes(), true);
+#endif
+    const std::vector<float> actual(out.getData<float>(),
+                                    out.getData<float>() + expected.size());
+#if defined(ENABLE_OPENCL)
+    if (device)
+      nntrainer::cl_svm_unmap_force(out.getData());
 #endif
     for (size_t i = 0; i < expected.size(); ++i) {
       ASSERT_NEAR(actual[i], expected[i], tolerance)
