@@ -76,7 +76,12 @@ object NativeCausalLm {
         val generationDurationMs: Double,
         val totalDurationMs: Double,
         val initializationDurationMs: Double,
-        val peakMemoryKb: Long
+        val peakMemoryKb: Long,
+        val ttftMs: Double,
+        val firstTokenMs: Double,
+        val decodeSteadyMs: Double,
+        val decodeSteadyTokens: Int,
+        val prefillDrainMs: Double,
     )
 
 
@@ -395,3 +400,19 @@ object NativeCausalLm {
 
     private const val TAG = "NativeCausalLm"
 }
+
+/** The C struct's rows, including the perf-split ones, as the public type. */
+internal fun NativeCausalLm.MetricsResult.toPerformanceMetrics(): PerformanceMetrics = PerformanceMetrics(
+    prefillTokens = prefillTokens,
+    prefillDurationMs = prefillDurationMs,
+    generationTokens = generationTokens,
+    generationDurationMs = generationDurationMs,
+    totalDurationMs = totalDurationMs,
+    initializationDurationMs = initializationDurationMs,
+    peakMemoryKb = peakMemoryKb,
+    ttftMs = ttftMs,
+    firstTokenMs = firstTokenMs,
+    decodeSteadyMs = decodeSteadyMs,
+    decodeSteadyTokens = decodeSteadyTokens,
+    prefillDrainMs = prefillDrainMs,
+)

@@ -32,6 +32,7 @@ class NativeQuickDotAI(
     override var architecture: String? = null
         private set
 
+    /** Serializes cancel() against the moment close() retires the handle. */
     private val handleLock = Any()
     @Volatile private var handle: Long = 0L
     private var loaded: Boolean = false
@@ -144,17 +145,7 @@ class NativeQuickDotAI(
             if (m.errorCode != 0) {
                 BackendResult.Err(QuickAiError.fromNativeCode(m.errorCode))
             } else {
-                BackendResult.Ok(
-                    PerformanceMetrics(
-                        prefillTokens = m.prefillTokens,
-                        prefillDurationMs = m.prefillDurationMs,
-                        generationTokens = m.generationTokens,
-                        generationDurationMs = m.generationDurationMs,
-                        totalDurationMs = m.totalDurationMs,
-                        initializationDurationMs = m.initializationDurationMs,
-                        peakMemoryKb = m.peakMemoryKb
-                    )
-                )
+                BackendResult.Ok(m.toPerformanceMetrics())
             }
         } catch (t: Throwable) {
             Log.e(TAG, "getPerformanceMetricsHandleNative threw", t)
@@ -322,7 +313,7 @@ class NativeQuickDotAI(
     }
 
     override fun cancel() {
-        // The UI may cancel while the worker closes or replaces a model.
+        // The UI thread cancels while the worker may be closing the model.
         synchronized(handleLock) {
             if (handle != 0L) {
                 NativeCausalLm.cancelModelHandleNative(handle)
@@ -331,7 +322,8 @@ class NativeQuickDotAI(
     }
 
     override fun chatCancel() {
-        activeSession?.cancel()
+        // The session reads the handle through handleProvider: same guard as cancel().
+        synchronized(handleLock) { activeSession?.cancel() }
     }
 
     override fun chatRebuild(
@@ -549,14 +541,15 @@ class NativeQuickDotAI(
     override fun close() {
         activeSession?.close()
         activeSession = null
-        synchronized(handleLock) {
-            if (handle != 0L) {
-                try {
-                    NativeCausalLm.destroyModelHandleNative(handle)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "destroyModelHandleNative threw", t)
-                }
-                handle = 0L
+        // Retire the handle under the lock, destroy outside it: a concurrent
+        // cancel() then sees 0 and returns instead of touching a model that is
+        // being deleted, and never waits out a multi-gigabyte teardown.
+        val h = synchronized(handleLock) { handle.also { handle = 0L } }
+        if (h != 0L) {
+            try {
+                NativeCausalLm.destroyModelHandleNative(h)
+            } catch (t: Throwable) {
+                Log.w(TAG, "destroyModelHandleNative threw", t)
             }
         }
         loaded = false
