@@ -22,6 +22,8 @@
 
 #include <memory>
 
+#include <kv_cache/kv_cache_manager.h>
+
 #include <memory_pool.h>
 #include <tensor.h>
 #include <tensor_dim.h>
@@ -82,7 +84,17 @@ public:
   /**
    * @brief Whether at least one slab came from the shared allocator.
    */
-  bool usesSharedMemory() const { return !shared_blocks_.empty(); }
+  bool usesSharedMemory() const {
+    return core_shared_ != nullptr || !shared_blocks_.empty();
+  }
+
+  /** Use the core manager for shared host slabs. Call before allocate().
+   * The backend still owns its quantized cache and completes synchronous RPCs;
+   * window compaction and accelerator snapshots retain their existing path.
+   * This does not enable device prefix caching or session switching.
+   */
+  void setCoreSharedStorage(bool enabled);
+  bool usesCoreSharedStorage() const { return core_shared_ != nullptr; }
 
   /**
    * @brief Whether setSharedAllocator installed an allocator (a backend
@@ -507,6 +519,8 @@ private:
     nntrainer::Tensor value_cache; /**< (batch, 1, getLayerCap(i), kv_width) */
   };
 
+  bool core_shared_requested_ = false;
+  std::unique_ptr<nntrainer::kv::KvCacheManager> core_shared_;
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
   std::vector<bool> active_layers_;      /**< empty keeps every layer active */
 

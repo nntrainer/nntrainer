@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <kv_cache_manager.h>
+#include <mem_allocator.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 
@@ -841,4 +842,91 @@ TEST(KVCacheManagerShared, MovePreservesGeometryAndReleasesEachAllocationOnce) {
     EXPECT_FLOAT_EQ(destination.getKeyCache(0).getData<float>()[0], 7.0f);
   }
   EXPECT_EQ(released, allocated);
+}
+
+TEST(KVCacheManagerCoreShared, aliases_pin_slabs_and_move_keeps_ownership) {
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  size_t allocated = 0, freed = 0;
+  std::shared_ptr<nntrainer::MemoryData> held;
+  {
+    causallm::KVCacheManager source;
+    source.setCoreSharedStorage(true);
+    source.setSharedAllocator(
+      [&](size_t bytes) {
+        void *p = nullptr;
+        allocator->alloc(&p, bytes, 64);
+        ++allocated;
+        return p;
+      },
+      [&](void *p) {
+        ++freed;
+        allocator->free(p);
+      });
+    source.setLayerKVSources({-1, 0});
+    source.allocate(2, 1, 8, std::vector<unsigned int>{4, 4},
+                    ml::train::TensorDim::DataType::FP32);
+    ASSERT_TRUE(source.usesCoreSharedStorage());
+    ASSERT_TRUE(source.usesSharedMemory());
+    ASSERT_EQ(allocated, 2u);
+    EXPECT_EQ(source.getKeyCache(0).getData<float>(),
+              source.getKeyCache(1).getData<float>());
+    source.getKeyCache(0).getData<float>()[0] = 23.0f;
+    held = source.getKeyCache(1).getMemoryData();
+    source.setPosition(3);
+    causallm::KVCacheManager destination;
+    destination = std::move(source);
+    EXPECT_TRUE(destination.usesCoreSharedStorage());
+    EXPECT_EQ(destination.getPosition(), 3u);
+    EXPECT_FLOAT_EQ(destination.getKeyCache(0).getData<float>()[0], 23.0f);
+    destination.advance(2);
+    EXPECT_EQ(destination.getPosition(), 5u);
+    destination.reset();
+    EXPECT_EQ(destination.getPosition(), 0u);
+    EXPECT_EQ(freed, 0u);
+  }
+  EXPECT_EQ(freed, 1u);
+  EXPECT_FLOAT_EQ(held->getAddr<float>()[0], 23.0f);
+  held.reset();
+  EXPECT_EQ(freed, 2u);
+}
+
+TEST(KVCacheManagerCoreShared, null_shared_allocation_is_not_a_heap_fallback) {
+  causallm::KVCacheManager manager;
+  manager.setCoreSharedStorage(true);
+  manager.setSharedAllocator([](size_t) -> void * { return nullptr; },
+                             [](void *) {});
+  EXPECT_THROW(
+    manager.allocate(1, 1, 8, 1, 4, ml::train::TensorDim::DataType::FP32),
+    std::bad_alloc);
+}
+
+TEST(KVCacheManagerCoreShared, preserves_window_compaction_and_snapshot_bytes) {
+  auto allocator = std::make_shared<nntrainer::MemAllocator>();
+  causallm::KVCacheManager manager;
+  manager.setCoreSharedStorage(true);
+  manager.setSharedAllocator(
+    [allocator](size_t bytes) {
+      void *p = nullptr;
+      allocator->alloc(&p, bytes, 64);
+      return p;
+    },
+    [allocator](void *p) { allocator->free(p); });
+  manager.allocate(1, 1, 8, std::vector<unsigned int>{4},
+                   ml::train::TensorDim::DataType::UINT16,
+                   ml::train::TensorDim::Format::NCHW, {4}, {2});
+  auto *key = manager.getKeyCache(0).getData<uint16_t>();
+  auto *value = manager.getValueCache(0).getData<uint16_t>();
+  for (size_t i = 0; i < 16; ++i) {
+    key[i] = static_cast<uint16_t>(0x3c00u + i);
+    value[i] = static_cast<uint16_t>(0x4000u + i);
+  }
+  manager.setPosition(4);
+  ASSERT_TRUE(manager.compact(4));
+  EXPECT_EQ(manager.getBase(0), 2u);
+  EXPECT_EQ(key, manager.getKeyCache(0).getData<uint16_t>());
+  EXPECT_EQ(key[0], 0x3c08u);
+  EXPECT_EQ(value[0], 0x4008u);
+  EXPECT_EQ(manager.rowsToPersist(0, 4), 2u);
+  EXPECT_FALSE(manager.droppedAmaxK(0).empty());
+  EXPECT_THROW(manager.setCoreSharedStorage(false), std::logic_error);
 }

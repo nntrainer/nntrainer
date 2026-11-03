@@ -13,6 +13,7 @@
 #include "kv_cache_manager.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,34 @@
 
 namespace causallm {
 
+namespace {
+/** Shared slabs whose RPC registration and completion stay with the backend. */
+class SharedSlabAllocator final : public nntrainer::MemAllocator {
+public:
+  SharedSlabAllocator(KVCacheManager::SharedAlloc allocate,
+                      KVCacheManager::SharedFree release) :
+    allocate_(std::move(allocate)), release_(std::move(release)) {}
+  void alloc(void **ptr, size_t bytes, size_t alignment) override {
+    *ptr = allocate_(bytes);
+    if (!*ptr)
+      throw std::bad_alloc();
+    if (reinterpret_cast<uintptr_t>(*ptr) % alignment) {
+      release_(*ptr);
+      *ptr = nullptr;
+      throw std::invalid_argument("Shared KV allocation is not aligned");
+    }
+  }
+  void free(void *ptr) override { release_(ptr); }
+  bool isDeviceVisible() const override { return true; }
+  bool isSVM() const override { return false; }
+  std::string getName() override { return "htp-shared"; }
+
+private:
+  KVCacheManager::SharedAlloc allocate_;
+  KVCacheManager::SharedFree release_;
+};
+} // namespace
+
 KVCacheManager::~KVCacheManager() { releaseShared(); }
 
 KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
@@ -43,6 +72,8 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     // The tensors go first so nothing still points into the blocks the
     // allocator gets back.
     layer_caches_.clear();
+    core_shared_ = std::move(other.core_shared_);
+    core_shared_requested_ = other.core_shared_requested_;
     releaseShared();
     layer_caches_ = std::move(other.layer_caches_);
     active_layers_ = std::move(other.active_layers_);
@@ -68,6 +99,12 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     other.shared_blocks_.clear();
   }
   return *this;
+}
+
+void KVCacheManager::setCoreSharedStorage(bool enabled) {
+  if (isAllocated())
+    throw std::logic_error("Select core shared storage before allocate()");
+  core_shared_requested_ = enabled;
 }
 
 void KVCacheManager::setSharedAllocator(SharedAlloc alloc, SharedFree release) {
@@ -184,6 +221,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
 
   // Re-allocation: drop the old tensors before their blocks go back.
   layer_caches_.clear();
+  core_shared_.reset();
   releaseShared();
   layer_caches_.resize(num_layers);
 
@@ -191,6 +229,51 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // a source that is not strictly earlier, or whose geometry differs, would
   // produce a cache that reads the wrong plane without ever crashing.
   validateKVSources(num_layers);
+  if (core_shared_requested_) {
+    using namespace nntrainer::kv;
+    using DataType = ml::train::TensorDim::DataType;
+    if (!shared_alloc_ || !shared_free_ ||
+        (dtype != DataType::FP32 && dtype != DataType::FP16 &&
+         dtype != DataType::UINT16) ||
+        (!active_layers_.empty() &&
+         std::find(active_layers_.begin(), active_layers_.end(), false) !=
+           active_layers_.end()))
+      throw std::invalid_argument(
+        "Core shared KV requires a shared allocator and active float planes");
+    CacheSpec spec;
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      LayerSpec layer;
+      layer.batch = batch_size;
+      layer.head_dim = kv_widths[i];
+      layer.max_tokens = max_seq_len;
+      layer.capacity = getLayerCap(i);
+      layer.source = getLayerKVSource(i);
+      layer.encoding =
+        dtype == DataType::FP32 ? Encoding::Float32 : Encoding::Float16;
+      layer.storage_type = dtype == DataType::FP32   ? StorageType::Float32
+                           : dtype == DataType::FP16 ? StorageType::Float16
+                                                     : StorageType::UInt16;
+      spec.layers.push_back(layer);
+    }
+    auto core = std::make_unique<nntrainer::kv::KvCacheManager>();
+    core->initialize(
+      spec, std::make_shared<SharedSlabAllocator>(shared_alloc_, shared_free_));
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim dim({batch_size, 1, getLayerCap(i), kv_widths[i]},
+                               {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(dim, false);
+      layer_caches_[i].key_cache.setData(core->keyMemory(i), 0, false);
+      layer_caches_[i].value_cache.setData(core->valueMemory(i), 0, false);
+    }
+    const auto stats = core->stats();
+    core_shared_ = std::move(core);
+    std::fprintf(stderr,
+                 "[kv-htp-core] owners=%zu bytes=%zu shared=1 paged=0\n",
+                 stats.owner_layers, stats.backing_bytes);
+    reportKVShare(num_layers, batch_size, dtype, "core-htp-shared");
+    return;
+  }
   // An all-convolution model needs only the tensor metadata. In particular,
   // do not ask a backend MemoryPool to plan or allocate an empty set of slots.
   if (!active_layers_.empty() &&
@@ -561,6 +644,8 @@ void KVCacheManager::setPosition(unsigned int pos) {
     throw std::out_of_range(
       "KVCacheManager::setPosition: pos exceeds max_seq_len");
   }
+  if (core_shared_)
+    core_shared_->setPosition(pos);
   cache_pos_ = pos;
 }
 
@@ -569,10 +654,12 @@ void KVCacheManager::advance(unsigned int step_size) {
     throw std::out_of_range(
       "KVCacheManager::advance: position would exceed max_seq_len");
   }
-  cache_pos_ += step_size;
+  setPosition(cache_pos_ + step_size);
 }
 
 void KVCacheManager::reset() {
+  if (core_shared_)
+    core_shared_->reset();
   cache_pos_ = 0;
   bases_.assign(bases_.size(), 0u);
   for (auto *v : {&dropped_amax_k_, &dropped_amax_v_})

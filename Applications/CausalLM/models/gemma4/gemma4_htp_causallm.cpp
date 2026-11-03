@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include <app_context.h>
 #include <dense_ffn_layer.h>
@@ -1037,6 +1038,8 @@ void Gemma4HtpCausalLM::allocateAndBindKVCache() {
       kv_cache.setSharedAllocator(
         [ops](size_t bytes) { return ops->alloc_shared(bytes); },
         [ops](void *ptr) { ops->free_shared(ptr); });
+      const char *core = std::getenv("NNTR_HTP_KV_MANAGER");
+      kv_cache.setCoreSharedStorage(core && std::string(core) == "1");
     }
 #endif
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,

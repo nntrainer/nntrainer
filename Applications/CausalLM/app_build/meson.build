@@ -163,7 +163,8 @@ foreach _causallm_inc_root : [
   endif
 endforeach
 
-causallm_inc_args = ['-I' + causallm_root]
+causallm_inc_args = ['-I' + causallm_root,
+                     '-I' + nntrainer_root / 'nntrainer']
 foreach d : causallm_auto_inc_dirs
   causallm_inc_args += ['-I' + d]
 endforeach
