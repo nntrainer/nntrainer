@@ -1251,8 +1251,14 @@ static bool tryMoeLayerOnAccelerator(
           pool->lru.acquire(need, load, evict);
         });
       ops->set_decode_pool_grow([pool](size_t n) { pool->lru.addCapacity(n); });
+      pool->warm.install(ops, pool->lru, pool->layers);
     }
   }
+
+  // moe.warm_experts: this layer's warm list, the last prefill call's
+  if (experts_virtual && extra_top_k != nullptr)
+    pool->warm.note(expert_layer_slot, *extra_top_k, expert_assignments,
+                    total_tokens);
 
   // Virtual experts: the ones this call routes to are made
   // resident through the shared LRU (a miss releases the least recently
@@ -1534,6 +1540,14 @@ static bool tryMoeLayerOnAccelerator(
     }
     pool->lru.refresh(recency);
   }
+  // moe.warm_experts: the prompt's last MoE call starts the warm-up's reads,
+  // under the lm head, the sampling and the first row's graph init rather
+  // than the graph init alone; no read-ahead batch is left to share the
+  // queue with.
+  if (experts_virtual && total_tokens > 1 && htpPrefillLastBlock() &&
+      expert_layer_slot + 1 == static_cast<int>(pool->layers.size()) &&
+      pool->prefetch_batches.empty())
+    ops->begin_decode_pool_warm();
   return true;
 }
 

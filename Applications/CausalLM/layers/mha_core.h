@@ -458,6 +458,18 @@ public:
     if (fp16_attention_)
       fp16_attention_->beginHtpPrompt();
   }
+  /** @brief Whether the layer's CPU KV rows are gone (its decode cache
+   *  holds them): the model's compaction moves this layer's base only. */
+  bool kvDetached() const {
+    return fp16_attention_ && fp16_attention_->kvDetached();
+  }
+  /** @brief The layer's attention ordinal and its decode cache's base, when
+   *  the decode caches are registered before the prefill (the KV
+   *  adoption); -1: the first token seeds from the CPU rows. */
+  void setHtpPrefillSeed(int ordinal, unsigned int decode_base) {
+    if (fp16_attention_)
+      fp16_attention_->setHtpPrefillSeed(ordinal, decode_base);
+  }
   void foldDroppedAmax(const std::vector<float> &k,
                        const std::vector<float> &v) {
     if (fp16_attention_)

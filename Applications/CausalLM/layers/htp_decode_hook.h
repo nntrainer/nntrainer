@@ -14,9 +14,12 @@ using nntrainer::htpDecodeBan;
 using nntrainer::htpDecodeConvGate;
 using nntrainer::htpDecodeHasTokenId;
 using nntrainer::htpDecodeKvAmaxFloor;
+using nntrainer::htpDecodeKvFillKvq;
+using nntrainer::htpDecodeKvPrepare;
 using nntrainer::htpDecodeKvSeed;
 using nntrainer::htpDecodeKvSeedF16;
 using nntrainer::htpDecodeKvSeedKvq;
+using nntrainer::htpDecodeKvSeedKvqLayer;
 using nntrainer::htpDecodeKvWindow;
 using nntrainer::htpDecodeLmHead;
 using nntrainer::htpDecodeOp;
@@ -26,4 +29,9 @@ using nntrainer::htpDecodeRouter;
 using nntrainer::htpDecodeRowResident;
 using nntrainer::htpDecodeTokenId;
 using nntrainer::htpDecodeWantLogits;
+
+using nntrainer::htpKvAdopt;
+using nntrainer::htpKvStaging;
+using nntrainer::htpPrefillEnd;
+using nntrainer::htpPrefillLastBlock;
 } // namespace causallm

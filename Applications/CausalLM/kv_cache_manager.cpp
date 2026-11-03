@@ -148,10 +148,18 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // its last keep rows contiguous at the front (compact()); the physical
   // capacity goes through the same per-layer cap the ring uses.
   keep_.assign(num_layers, 0u);
+  detached_.clear();
   bases_.assign(num_layers, 0u);
   dropped_amax_k_.assign(num_layers, {});
   dropped_amax_v_.assign(num_layers, {});
-  if (!rows.empty()) {
+  if (staging_rows_ > 0) {
+    // [C] every layer stages a step of up to staging_rows_ rows
+    if (staging_rows_ > max_seq_len || !layer_kv_sources_.empty())
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: staging needs rows <= max_seq_len and no "
+        "KV sharing");
+    layer_caps_.assign(num_layers, staging_rows_);
+  } else if (!rows.empty()) {
     layer_caps_.assign(num_layers, 0u);
     for (unsigned int i = 0; i < num_layers; ++i) {
       if (rows[i] == 0 || rows[i] >= max_seq_len)
@@ -378,6 +386,27 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       layer_caches_[i].key_cache.setZero();
       layer_caches_[i].value_cache.setZero();
 #endif
+    }
+  } else if (staging_rows_ > 0) {
+    // [C] one K and one V block for all layers, as wide as the widest
+    const unsigned int w =
+      *std::max_element(kv_widths_.begin(), kv_widths_.end());
+    ml::train::TensorDim block({batch_size, 1, staging_rows_, w},
+                               {format, dtype});
+    staging_k_ = makeCacheTensor(block);
+    staging_v_ = makeCacheTensor(block);
+    staging_k_.setZero();
+    staging_v_.setZero();
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim(
+        {batch_size, 1, staging_rows_, kv_widths_[i]}, {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+      if (!isLayerActive(i))
+        continue;
+      layer_caches_[i].key_cache.setData(staging_k_.getMemoryData(), 0, false);
+      layer_caches_[i].value_cache.setData(staging_v_.getMemoryData(), 0,
+                                           false);
     }
   } else {
     for (unsigned int i = 0; i < num_layers; ++i) {
@@ -649,6 +678,13 @@ bool KVCacheManager::compact(unsigned int pos) {
     const unsigned int from = liveFrom(l, pos);
     if (from <= bases_[l])
       continue;
+    // [C] the rows are gone (a detached layer) or were only staged: the
+    // base moves only
+    if (isLayerDetached(l) || staging_rows_ > 0) {
+      bases_[l] = from;
+      changed = true;
+      continue;
+    }
     const size_t w = kv_widths_[l];
     const unsigned int rows = getLayerCap(l);
     const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;

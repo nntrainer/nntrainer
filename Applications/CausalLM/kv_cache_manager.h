@@ -416,6 +416,66 @@ public:
     return getLayerKVSource(layer_idx) >= 0;
   }
 
+  /** @brief Whether any layer's K/V are views onto another layer's. */
+  bool hasKVAliasing() const {
+    for (int src : layer_kv_sources_)
+      if (src >= 0)
+        return true;
+    return false;
+  }
+
+  /** @brief Whether any layer is a ring (setLayerCaps: fewer rows than
+   *         max_seq_len, modulo-indexed) rather than a compacted window. */
+  bool hasRingLayer() const {
+    for (unsigned int l = 0; l < layer_caps_.size(); ++l)
+      if (layer_caps_[l] > 0 && layer_caps_[l] < max_seq_len_ && !windowed(l))
+        return true;
+    return false;
+  }
+
+  /**
+   * @brief [C] Marks a layer whose rows another owner holds now (an HTP
+   *        attention layer that freed them for its DSP int8 copy,
+   *        NNTR_HTP_KV_ADOPT): compact() moves its base and touches no row
+   *        -- no fold of the dropped rows' |max|, no memmove -- since the
+   *        storage is gone. Cleared by allocate().
+   */
+  void setLayerDetached(unsigned int layer_idx, bool detached) {
+    if (detached_.size() <= layer_idx)
+      detached_.resize(layer_idx + 1, false);
+    detached_[layer_idx] = detached;
+  }
+
+  /** @brief The base compact(@a pos) would leave the layer at, without
+   *         compacting: what the decode caches are sized and based by when
+   *         they are registered before the prefill that reaches @a pos. */
+  unsigned int baseAfterCompact(unsigned int layer_idx,
+                                unsigned int pos) const {
+    const unsigned int base = getBase(layer_idx);
+    if (!isLayerActive(layer_idx) || !windowed(layer_idx) ||
+        isLayerKVAliased(layer_idx))
+      return base;
+    const unsigned int from = liveFrom(layer_idx, pos);
+    return from > base ? from : base;
+  }
+
+  /** @brief setLayerDetached's flag. */
+  /**
+   * @brief [C] One KV store a layer: the accelerator keeps every layer's
+   *        rows (its int8 decode cache), so the CPU cache only stages a
+   *        step's rows on their way there. Every layer's K and V become
+   *        views of one block each, @a rows rows of the widest layer: the
+   *        layers run one after another and each reads its rows only in its
+   *        own step. compact(pos) moves every base to pos and moves no row.
+   *        Call before allocate(); 0 turns it off.
+   */
+  void setStaging(unsigned int rows) { staging_rows_ = rows; }
+  bool isStaging() const { return staging_rows_ > 0; }
+
+  bool isLayerDetached(unsigned int layer_idx) const {
+    return layer_idx < detached_.size() && detached_[layer_idx];
+  }
+
   /**
    * @brief [kv-window-ring] Set the per-layer physical row capacity. A
    * sliding-window layer under the ring stores only Wcap rows instead of
@@ -548,6 +608,9 @@ private:
   std::vector<unsigned int> layer_caps_;
   /** [HTP window] per-layer window of a compacting layer (0 = ring or full) */
   std::vector<unsigned int> keep_;
+  std::vector<bool> detached_;              /**< setLayerDetached */
+  unsigned int staging_rows_ = 0;           /**< [C] setStaging */
+  nntrainer::Tensor staging_k_, staging_v_; /**< [C] the shared blocks */
   /** [HTP window] per-layer absolute position of row 0 */
   std::vector<unsigned int> bases_;
   /** [HTP window] per-layer droppedAmaxK / V (empty: nothing dropped) */
@@ -560,12 +623,14 @@ private:
 
   /** @brief Whether the layer compacts a window (allocate()'s rows / keep). */
   bool windowed(unsigned int l) const {
-    return l < keep_.size() && keep_[l] > 0;
+    return (l < keep_.size() && keep_[l] > 0) || staging_rows_ > 0;
   }
 
   /** @brief First absolute position a dump of rows [.., pos) holds for the
    *         layer: a windowed layer's last keep rows, else all of them. */
   unsigned int liveFrom(unsigned int l, unsigned int pos) const {
+    if (staging_rows_ > 0)
+      return pos; // [C] a staging layer keeps no row past its step
     return windowed(l) && pos > keep_[l] ? pos - keep_[l] : 0u;
   }
 

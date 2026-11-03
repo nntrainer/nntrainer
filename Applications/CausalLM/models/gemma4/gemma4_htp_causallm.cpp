@@ -19,6 +19,7 @@
 #include <dense_ffn_layer.h>
 #include <engine.h>
 #include <htp_cache_inputs.h>
+#include <htp_decode_hook.h>
 #include <htp_mha_core.h>
 #include <htp_model_config.h>
 #include <htp_qkv_layer.h>
@@ -56,7 +57,26 @@ bool Gemma4HtpTransformer::isKVSharedLayer(int layer_id) const {
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
 }
 
+bool Gemma4HtpTransformer::kvStaging() const {
+  // [C] the only KV layout with HTP attention: what keeps a CPU cache is a
+  // configuration whose CPU rows are read (KV sharing, a KV cache file) or
+  // one without the decode seed (NNTR_HTP_KV_ADOPT=0)
+  return htpKvAdopt() && ATTENTION_ENGINE == "htp" &&
+         NUM_KV_SHARED_LAYERS == 0 && !kv_cache_file_;
+}
+
+unsigned int Gemma4HtpTransformer::stagingRows() const {
+  // a prefill block is at most the chunk or, unchunked, INIT_SEQ_LEN rows
+  const unsigned int rows =
+    std::max({static_cast<unsigned int>(INIT_SEQ_LEN), prefillDriveChunk(),
+              static_cast<unsigned int>(NUM_TO_GENERATE)});
+  return std::min((rows + 63u) / 64u * 64u,
+                  static_cast<unsigned int>(MAX_SEQ_LEN));
+}
+
 unsigned int Gemma4HtpTransformer::getKVCacheRows(int layer_id) const {
+  if (kvStaging())
+    return stagingRows(); // [C] every layer stages one block
   // A sliding layer reads its window and writes one prefill chunk or the
   // generated tokens behind it: at a long max_seq_len (23k: 5 GB of fp16
   // rows over 25 layers otherwise) that is all its cache holds, and
@@ -115,6 +135,8 @@ void Gemma4HtpTransformer::setupParameters(json &cfg, json &generation_cfg,
   Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
   ATTENTION_ENGINE = nntr_cfg.value("attention_engine", std::string());
   ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
+  kv_cache_file_ = nntr_cfg.contains("system_prompt") &&
+                   nntr_cfg["system_prompt"].contains("kvcache");
   FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
   FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
 
@@ -1039,10 +1061,14 @@ void Gemma4HtpCausalLM::allocateAndBindKVCache() {
         [ops](void *ptr) { ops->free_shared(ptr); });
     }
 #endif
+    // [C] the int8 decode caches keep the rows; the CPU stages a step's
+    // in one block all layers share (some 16 MiB, not 450-550)
+    kv_cache.setStaging(kvStaging() ? stagingRows() : 0u);
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
                       cache_dtype, ml::train::TensorDim::Format::NCHW, rows,
                       keep);
+    htpKvStaging() = kv_cache.isStaging();
     kv_cache_bound = false;
   }
 

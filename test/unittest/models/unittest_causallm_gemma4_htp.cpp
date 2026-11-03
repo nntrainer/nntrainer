@@ -13,6 +13,11 @@
 #include <gtest/gtest.h>
 #include <llm_util.hpp>
 #include <model_registry.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 namespace {
 class ReferenceGemma4Htp final
   : public causallm_test::CausalLMTestAdapter<causallm::Gemma4HtpMoECausalLM> {
@@ -98,5 +103,88 @@ TEST(Gemma4HtpContract, RejectsTruncatedWeightBeforeInference) {
     file.put('x');
   }
   EXPECT_THROW(model.loadWeight(path.string()), std::runtime_error);
+}
+
+/** @brief The "[PPL] decode tokens=" summary line of one run() with
+ *         NNTR_PPL_DECODE=@a ids, or "" when the run printed none. */
+std::string pplDecodeRun(FixtureConfig &f, const std::string &ids) {
+  ReferenceGemma4Htp model(f.model, f.generation, f.nntr);
+  model.initializeModel();
+  model.loadWeight(
+    (f.dir / f.nntr["model_file_name"].get<std::string>()).string());
+  setenv("NNTR_PPL_DECODE", ids.c_str(), 1);
+  testing::internal::CaptureStderr();
+  model.runPrompt("hello tok4");
+  const std::string err = testing::internal::GetCapturedStderr();
+  unsetenv("NNTR_PPL_DECODE");
+  const size_t at = err.find("[PPL] decode tokens=");
+  return at == std::string::npos ? "" : err.substr(at, err.find('\n', at) - at);
+}
+
+/** @brief Field @a key ("tokens=", "top1=", ...) of a summary line. */
+std::string pplField(const std::string &line, const std::string &key) {
+  const size_t at = line.find(" " + key);
+  if (at == std::string::npos)
+    return "";
+  const size_t from = at + 1 + key.size();
+  return line.substr(from, line.find(' ', from) - from);
+}
+
+/**
+ * NNTR_PPL_DECODE (ported from a21cae045 / fead3371b): a self run scores
+ * its own greedy path and writes it; a forced run on that file scores the
+ * same logits (nll_sum equal, every top1 the target); a changed id is read
+ * (the forced run's top1 count drops). With the prefill's pick and with
+ * skip_prefill, where decode step 0 produces the first id.
+ */
+TEST(Gemma4HtpPplDecode, ForcedRunScoresTheSelfRunsPath) {
+  for (const bool skip : {false, true}) {
+    FixtureConfig f;
+    f.nntr["max_seq_len"] = 16;
+    f.nntr["num_to_generate"] = 4;
+    f.nntr["skip_prefill"] = skip;
+    const std::string ids = (std::filesystem::temp_directory_path() /
+                             ("nntr-ppl-decode-" + std::to_string(skip)))
+                              .string();
+    std::remove(ids.c_str());
+    const std::string self = pplDecodeRun(f, ids);
+    ASSERT_FALSE(self.empty()) << "skip_prefill=" << skip;
+    EXPECT_EQ(pplField(self, "source="), "self") << self;
+    const std::string n = pplField(self, "tokens=");
+    ASSERT_FALSE(n.empty()) << self;
+    EXPECT_EQ(pplField(self, "top1="), n + "/" + n) << self;
+
+    std::vector<unsigned int> path;
+    {
+      std::ifstream in(ids);
+      for (unsigned int id; in >> id;)
+        path.push_back(id);
+    }
+    // the prefill's pick (when there is one) plus one id a scored step
+    ASSERT_EQ(path.size(), std::stoul(n) + (skip ? 0u : 1u)) << self;
+
+    const std::string forced = pplDecodeRun(f, ids);
+    EXPECT_EQ(pplField(forced, "source="), "file") << forced;
+    EXPECT_EQ(pplField(forced, "tokens="), n) << forced;
+    EXPECT_EQ(pplField(forced, "top1="), n + "/" + n) << forced;
+    EXPECT_EQ(pplField(forced, "nll_sum="), pplField(self, "nll_sum="))
+      << self << "\n"
+      << forced;
+
+    // a different target at the last scored step: read, not the greedy one
+    path.back() = path.back() == 0u ? 1u : path.back() - 1u;
+    {
+      std::ofstream out(ids);
+      for (unsigned int id : path)
+        out << id << '\n';
+    }
+    const std::string changed = pplDecodeRun(f, ids);
+    EXPECT_EQ(pplField(changed, "top1="),
+              std::to_string(std::stoul(n) - 1u) + "/" + n)
+      << changed;
+    EXPECT_NE(pplField(changed, "nll_sum="), pplField(self, "nll_sum="))
+      << changed;
+    std::remove(ids.c_str());
+  }
 }
 } // namespace
