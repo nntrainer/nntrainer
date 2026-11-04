@@ -147,6 +147,14 @@ class ResidueRules(unittest.TestCase):
         self.assertTrue(any("libmissing.so" in p for p in run("cpu", "public", files)))
 
 
+class DescribeStage(unittest.TestCase):
+    def test_marker_and_gitkeep_are_not_stage_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ns.NOT_SHIPPED:
+                (Path(tmp) / name).write_text("")
+            self.assertEqual(ns.describe_stage(Path(tmp), "unused-readelf"), {})
+
+
 class ManifestDrift(unittest.TestCase):
     def test_stale_and_changed_files_are_reported(self):
         files = {"a.so": {"sha256": "1"}, "stale.so": {"sha256": "2"}}

@@ -49,6 +49,10 @@ PAGE_16K = 0x4000
 # Written by the script that created the directory, so it can be recreated
 # safely; not part of what the variant ships.
 STAGE_MARKER = ".nntr-stage"
+# Files in a stage directory that are not part of what the variant ships: the
+# marker above and the tracked placeholder that keeps the default
+# QuickDotAI/prebuilt_libs in git.
+NOT_SHIPPED = (STAGE_MARKER, ".gitkeep")
 
 # The libraries every variant carries: the engine, its C++ API, the CausalLM
 # host and the C API.
@@ -227,7 +231,7 @@ def describe_stage(stage, readelf):
     """One record per file in the stage, plus what `check` needs."""
     files = {}
     for entry in sorted(stage.iterdir(), key=lambda p: p.name):
-        if entry.name == STAGE_MARKER:
+        if entry.name in NOT_SHIPPED:
             continue
         if entry.is_dir():
             files[entry.name] = {"kind": "directory"}
