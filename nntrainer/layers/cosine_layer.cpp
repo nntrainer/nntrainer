@@ -33,7 +33,8 @@ void CosineLayer::forwarding_operation(const Tensor &input, Tensor &hidden) {
 void CosineLayer::calcDerivative(RunLayerContext &context) {
   auto &deriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   context.getInput(SINGLE_INOUT_IDX).sin(deriv);
-  deriv.multiply(context.getIncomingDerivative(SINGLE_INOUT_IDX));
+  deriv.multiply_i(context.getIncomingDerivative(SINGLE_INOUT_IDX));
+  deriv.multiply_i(-1.0f);
 }
 
 void CosineLayer::setProperty(const std::vector<std::string> &values) {

@@ -80,6 +80,9 @@ test_target = [
   # decision table is covered on every runner rather than only where OpenCL
   # and a device are available.
   ['unittest_residency_planner', []],
+  # Manager's input-lifespan rule (resolveInputLifespans) vs. the old
+  # type-name checks, and its wiring to real LayerNodes (inputLifespansFor).
+  ['unittest_nntrainer_manager_lifespan', []],
   ['unittest_nntrainer_lr_scheduler', []],
   ['unittest_nntrainer_save_with_dtype', []],
   ['unittest_safetensors_quantize', []],

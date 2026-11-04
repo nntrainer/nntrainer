@@ -24,6 +24,7 @@
 #ifdef __cplusplus
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -597,6 +598,29 @@ public:
         }
       }
     }
+  }
+
+  /**
+   * @brief  lifespan this layer needs for its input tensors, when it differs
+   * from the one the Manager would otherwise choose
+   * @note   The Manager plans how long each input tensor stays valid. A layer
+   * that needs its inputs for a different span than the default says so here,
+   * instead of the Manager recognising it by its type name. A declaration
+   * takes precedence over both the training/inference default and the
+   * FORWARD_FUNC_LIFESPAN a non-trainable node otherwise gets.
+   * @return the lifespan, or std::nullopt to keep the Manager default
+   */
+  virtual std::optional<TensorLifespan> getInputLifespan() const {
+    return std::nullopt;
+  }
+
+  /**
+   * @brief  lifespan this layer needs for the gradients of its input tensors,
+   * when it differs from the one the Manager would otherwise choose
+   * @return the lifespan, or std::nullopt to keep the Manager default
+   */
+  virtual std::optional<TensorLifespan> getInputGradLifespan() const {
+    return std::nullopt;
   }
 
 protected:

@@ -101,6 +101,13 @@ public:
   bool supportBackwarding() const override { return true; }
 
   /**
+   * @copydoc Layer::getInputLifespan()
+   */
+  std::optional<TensorLifespan> getInputLifespan() const override {
+    return TensorLifespan::FORWARD_FUNC_LIFESPAN;
+  }
+
+  /**
    * @brief Initialize the in-place settings of the layer
    * @return InPlaceType
    */

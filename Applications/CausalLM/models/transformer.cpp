@@ -987,21 +987,10 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  // A positional .bin is read in graph order, and the graph is collected by
-  // walking back from the output through each layer's inputs in order, so
-  // swiglu({gate, up}) loads ffn_gate before ffn_up whatever order the two
-  // are created in. The converters therefore write gate_proj -> up_proj ->
-  // down_proj (the HF order, as for Gemma's createMlp). A file written up ->
-  // gate loads each projection into the other and computes silu(up) * gate:
-  // plausible-looking text that is wrong.
-  LayerHandle ffn_gate(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"),
-     withKey("engine", causallm_engine())}));
-  Tensor gate = ffn_gate(input);
-
+  // WARNING: legacy .bin compatibility. Existing files store the FFN weights
+  // in up, gate, down order, so up is created first and the swiglu slot map
+  // {1, 0} makes input[0] = gate, input[1] = up. A model whose file uses
+  // gate, up, down must override createMlp() instead of changing this order.
   LayerHandle ffn_up(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
@@ -1010,11 +999,19 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
+  LayerHandle ffn_gate(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
+  Tensor gate = ffn_gate(input);
+
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
      withKey("engine", causallm_engine())}));
-  Tensor act = swiglu({gate, up});
+  Tensor act = swiglu({up, gate}, {1, 0});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",

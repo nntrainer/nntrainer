@@ -200,9 +200,9 @@ def save_nntrainer_bin(W: dict, path: pathlib.Path) -> None:
 
     Follows make_weight_map(["attention","conv"]) from weight_converter.py:
       attention layer: operator_norm, q.T, q_norm, k.T, k_norm, v.T, out.T,
-                       ffn_norm, w1.T, w3.T, w2.T
+                       ffn_norm, w3.T, w1.T, w2.T
       conv layer:      operator_norm, in_proj.T, conv_conv (as-is), out_proj.T,
-                       ffn_norm, w1.T, w3.T, w2.T
+                       ffn_norm, w3.T, w1.T, w2.T
       always last:     embedding_norm, embed_tokens.T
 
     FC weights are transposed on save because nntrainer stores them as
@@ -231,8 +231,8 @@ def save_nntrainer_bin(W: dict, path: pathlib.Path) -> None:
                 write(f, W[f"layers.{i}.self_attn.v_proj.weight"].T)
                 write(f, W[f"layers.{i}.self_attn.out_proj.weight"].T)
                 write(f, W[f"layers.{i}.ffn_norm.weight"])
-                write(f, W[f"layers.{i}.feed_forward.w1.weight"].T)   # gate
                 write(f, W[f"layers.{i}.feed_forward.w3.weight"].T)   # up
+                write(f, W[f"layers.{i}.feed_forward.w1.weight"].T)   # gate
                 write(f, W[f"layers.{i}.feed_forward.w2.weight"].T)   # down
             elif lt == "conv":
                 write(f, W[f"layers.{i}.operator_norm.weight"])
@@ -240,8 +240,8 @@ def save_nntrainer_bin(W: dict, path: pathlib.Path) -> None:
                 write(f, W[f"layers.{i}.conv.conv.weight"])            # [K, F] as-is
                 write(f, W[f"layers.{i}.conv.out_proj.weight"].T)
                 write(f, W[f"layers.{i}.ffn_norm.weight"])
-                write(f, W[f"layers.{i}.feed_forward.w1.weight"].T)
                 write(f, W[f"layers.{i}.feed_forward.w3.weight"].T)
+                write(f, W[f"layers.{i}.feed_forward.w1.weight"].T)
                 write(f, W[f"layers.{i}.feed_forward.w2.weight"].T)
 
         # Output norm last (before the tied lm_head which saves nothing)

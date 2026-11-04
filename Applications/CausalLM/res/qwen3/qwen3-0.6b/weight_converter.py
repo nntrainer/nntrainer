@@ -89,8 +89,8 @@ def save_qwen3_for_nntrainer(
         """Save feed-forward layer weights."""
         save_weight(params[f"{layer_name}post_attention_layernorm.weight"])
 
-        # gate, up, down: the order Transformer::createMlp loads them in.
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
+        # Keep the existing nntrainer binary weight order.
+        for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(layer_name, f"mlp.{proj}")
 
     save_weight(params["model.embed_tokens.weight"])

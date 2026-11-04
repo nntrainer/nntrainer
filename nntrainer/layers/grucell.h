@@ -87,6 +87,13 @@ public:
   bool supportBackwarding() const override { return true; }
 
   /**
+   * @copydoc Layer::getInputGradLifespan()
+   */
+  std::optional<TensorLifespan> getInputGradLifespan() const override {
+    return TensorLifespan::CALC_GRAD_DERIV_LIFESPAN;
+  }
+
+  /**
    * @copydoc Layer::setProperty(const PropertyType type, const std::string
    * &value)
    */

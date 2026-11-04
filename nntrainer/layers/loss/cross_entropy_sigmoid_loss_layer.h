@@ -47,6 +47,13 @@ public:
   void calcDerivative(RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::getInputLifespan()
+   */
+  std::optional<TensorLifespan> getInputLifespan() const override {
+    return TensorLifespan::FORWARD_DERIV_LIFESPAN;
+  }
+
+  /**
    * @copydoc Layer::getType()
    */
   const std::string getType() const override {

@@ -10,9 +10,14 @@
  * @bug         No known bugs
  */
 
+#include <functional>
+#include <optional>
+#include <string>
+
 #include <gtest/gtest.h>
 
 #include <identity_layer.h>
+#include <kld_loss_layer.h>
 #include <layer_node.h>
 #include <nntrainer_error.h>
 #include <tensor_dim.h>
@@ -432,3 +437,84 @@ TEST(nntrainer_LayerNode, setBatch_01_n) {
 
   EXPECT_THROW(lnode->setBatch(0), std::invalid_argument);
 }
+
+namespace {
+
+using LS = nntrainer::TensorLifespan;
+
+/**
+ * @brief what a layer node is expected to report for its input lifespans
+ */
+struct InputLifespanCase {
+  std::string name; /**< test name suffix */
+  std::function<std::unique_ptr<nntrainer::LayerNode>()> make; /**< node */
+  std::optional<LS> var;  /**< expected getInputLifespan() */
+  std::optional<LS> grad; /**< expected getInputGradLifespan() */
+};
+
+/**
+ * @brief make a node of a registered layer type
+ */
+std::function<std::unique_ptr<nntrainer::LayerNode>()>
+byType(const std::string &type) {
+  return [type] { return nntrainer::createLayerNode(type); };
+}
+
+/**
+ * @brief print a case by its name in gtest output
+ */
+std::string caseName(const ::testing::TestParamInfo<InputLifespanCase> &info) {
+  return info.param.name;
+}
+
+} // namespace
+
+/**
+ * @brief parameterized fixture for the input lifespan trait
+ */
+class InputLifespanTrait : public ::testing::TestWithParam<InputLifespanCase> {
+};
+
+/**
+ * @brief a layer node reports the input lifespans its layer declares
+ */
+TEST_P(InputLifespanTrait, declared_lifespans_p) {
+  const InputLifespanCase &c = GetParam();
+  std::unique_ptr<nntrainer::LayerNode> lnode;
+  ASSERT_NO_THROW(lnode = c.make());
+  EXPECT_EQ(lnode->getInputLifespan(), c.var);
+  EXPECT_EQ(lnode->getInputGradLifespan(), c.grad);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  nntrainer_LayerNode, InputLifespanTrait,
+  ::testing::Values(
+    InputLifespanCase{"activation", byType("activation"),
+                      LS::FORWARD_FUNC_LIFESPAN, std::nullopt},
+    InputLifespanCase{"multiout", byType("multiout"), LS::FORWARD_FUNC_LIFESPAN,
+                      std::nullopt},
+    InputLifespanCase{"batch_normalization", byType("batch_normalization"),
+                      LS::FORWARD_FUNC_LIFESPAN, std::nullopt},
+    InputLifespanCase{"layer_normalization", byType("layer_normalization"),
+                      LS::FORWARD_FUNC_LIFESPAN, std::nullopt},
+    InputLifespanCase{"mse", byType("mse"), LS::FORWARD_DERIV_LIFESPAN,
+                      std::nullopt},
+    InputLifespanCase{"cross_softmax", byType("cross_softmax"),
+                      LS::FORWARD_DERIV_LIFESPAN, std::nullopt},
+    InputLifespanCase{"cross_sigmoid", byType("cross_sigmoid"),
+                      LS::FORWARD_DERIV_LIFESPAN, std::nullopt},
+    InputLifespanCase{"grucell", byType("grucell"), std::nullopt,
+                      LS::CALC_GRAD_DERIV_LIFESPAN},
+    InputLifespanCase{"fully_connected", byType("fully_connected"),
+                      std::nullopt, std::nullopt},
+    InputLifespanCase{"constant_derivative", byType("constant_derivative"),
+                      std::nullopt, std::nullopt},
+    InputLifespanCase{"input", byType("input"), std::nullopt, std::nullopt},
+    /** kld is built but not registered, so it is made from the class */
+    InputLifespanCase{"kld",
+                      [] {
+                        return nntrainer::createLayerNode(
+                          std::make_unique<nntrainer::KLDLossLayer>(), {});
+                      },
+                      std::nullopt, std::nullopt}),
+  caseName);

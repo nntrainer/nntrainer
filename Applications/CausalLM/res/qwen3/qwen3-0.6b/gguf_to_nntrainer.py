@@ -681,8 +681,8 @@ def convert(args):
             write_fc(n("attn_v"),       kv_size, hidden,  fc_dtype)
             write_fc(n("attn_output"),  hidden,  q_size,  fc_dtype)
             write_norm(out, reader, n("ffn_norm"), hidden)
-            write_fc(n("ffn_gate"),     ff_dim,  hidden,  fc_dtype)
             write_fc(n("ffn_up"),       ff_dim,  hidden,  fc_dtype)
+            write_fc(n("ffn_gate"),     ff_dim,  hidden,  fc_dtype)
             write_fc(n("ffn_down"),     hidden,  ff_dim,  ffn_down_dtype)
             print(f"  layer {i:2d}/{n_layers} written")
 

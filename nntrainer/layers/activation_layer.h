@@ -68,6 +68,13 @@ public:
   bool supportBackwarding() const override { return true; };
 
   /**
+   * @copydoc Layer::getInputLifespan()
+   */
+  std::optional<TensorLifespan> getInputLifespan() const override {
+    return TensorLifespan::FORWARD_FUNC_LIFESPAN;
+  }
+
+  /**
    * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
    * method)
    */

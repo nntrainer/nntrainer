@@ -47,11 +47,11 @@ void KLDLossLayer::calcDerivative(RunLayerContext &context) {
    * d/dQ = -P/Q
    */
   nntrainer::Tensor &predicted = context.getInput(SINGLE_INOUT_IDX); // Q
-  nntrainer::Tensor &label = context.getLabel(SINGLE_INOUT_IDX);     // P
+  const nntrainer::Tensor &label = context.getLabel(SINGLE_INOUT_IDX); // P
   nntrainer::Tensor &deriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
-  label.multiply_i(-1.0f);
-  label.divide(predicted, deriv);
+  label.multiply(-1.0f, deriv);
+  deriv.divide_i(predicted);
 }
 
 } // namespace nntrainer

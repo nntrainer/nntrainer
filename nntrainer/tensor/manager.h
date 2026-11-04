@@ -25,6 +25,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -101,6 +102,16 @@ private:
   size_t buf_size;  /**< buffer size */
   bool allocate_fd; /**< option to choose to allocate an fd */
 };
+
+class LayerNode; /**< used by Manager::inputLifespansFor() only */
+
+/**
+ * @brief forward declaration only: defined in
+ * test/unittest/unittest_nntrainer_manager_lifespan.cpp and friended by
+ * Manager below, so the private input-lifespan rule stays testable without
+ * widening Manager's public API.
+ */
+class ManagerInputLifespanTest;
 
 /**
  * @class   Manager
@@ -616,6 +627,47 @@ public:
   }
 
 private:
+  friend class ManagerInputLifespanTest;
+
+  /**
+   * @brief  decide the lifespans of a node's input tensors and of their
+   * gradients
+   * @param  is_train      the graph runs in ExecutionMode::TRAIN
+   * @param  trainable     the node is trainable
+   * @param  var_override  what the layer declares for its inputs, see
+   * Layer::getInputLifespan()
+   * @param  grad_override what the layer declares for its input gradients,
+   * see Layer::getInputGradLifespan()
+   * @return {input lifespan, input gradient lifespan}
+   */
+  static std::pair<TensorLifespan, TensorLifespan>
+  resolveInputLifespans(bool is_train, bool trainable,
+                        std::optional<TensorLifespan> var_override,
+                        std::optional<TensorLifespan> grad_override) {
+    TensorLifespan var = is_train ? TensorLifespan::FORWARD_GRAD_LIFESPAN
+                                  : TensorLifespan::FORWARD_FUNC_LIFESPAN;
+    if (!trainable)
+      var = TensorLifespan::FORWARD_FUNC_LIFESPAN;
+    if (var_override)
+      var = *var_override;
+    return {var, grad_override.value_or(TensorLifespan::CALC_DERIV_LIFESPAN)};
+  }
+
+  /**
+   * @brief  read a node's declared input lifespans and resolve them -- the
+   * exact step Manager::requestInputs() performs, extracted so it can be
+   * tested with real layers instead of only through resolveInputLifespans()
+   * directly
+   * @param  consumer_lnode the node, already downcast by the caller (nullptr
+   * if the GraphNode is not a LayerNode)
+   * @param  is_train       the graph runs in ExecutionMode::TRAIN
+   * @param  trainable      the node's getTrainable()
+   * @return {input lifespan, input gradient lifespan}
+   */
+  static std::pair<TensorLifespan, TensorLifespan>
+  inputLifespansFor(const LayerNode *consumer_lnode, bool is_train,
+                    bool trainable);
+
   /** @todo: merge this list to one */
   std::vector<std::unique_ptr<Weight>> weights_v2; /**< weights for the layers
                                                     */

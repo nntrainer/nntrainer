@@ -33,16 +33,9 @@
 #include <unistd.h>
 #endif
 
-#include <activation_layer.h>
 #include <basic_planner.h>
-#include <bn_layer.h>
 #include <graph_node.h>
-#include <grucell.h>
 #include <layer_node.h>
-#include <layer_normalization_layer.h>
-#include <loss/cross_entropy_sigmoid_loss_layer.h>
-#include <loss/cross_entropy_softmax_loss_layer.h>
-#include <loss/mse_loss_layer.h>
 #include <manager.h>
 #include <multiout_layer.h>
 #include <nntrainer_log.h>
@@ -638,6 +631,15 @@ std::vector<Var_Grad *> Manager::requestTensors(
   return ret;
 }
 
+std::pair<TensorLifespan, TensorLifespan>
+Manager::inputLifespansFor(const LayerNode *consumer_lnode, bool is_train,
+                           bool trainable) {
+  return resolveInputLifespans(
+    is_train, trainable,
+    consumer_lnode ? consumer_lnode->getInputLifespan() : std::nullopt,
+    consumer_lnode ? consumer_lnode->getInputGradLifespan() : std::nullopt);
+}
+
 /**
  * @brief     Create tensors with the given spec
  */
@@ -649,29 +651,14 @@ Manager::requestInputs(const GraphNode &node,
 
   bool is_train_mode = exec_mode == ExecutionMode::TRAIN;
 
+  /** the layer, not its type name, says how long its inputs must live */
+  const auto *consumer_lnode = dynamic_cast<const LayerNode *>(&node);
+
   TensorSpecV2 var_common_spec, grad_common_spec;
-  if (is_train_mode) {
-    var_common_spec.ls = TensorLifespan::FORWARD_GRAD_LIFESPAN;
-  } else {
-    var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
-  }
-
-  grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
-  /// @todo handle this inside layer
-  if (node.getType() == ActivationLayer::type or
-      node.getType() == MultiOutLayer::type or
-      node.getType() == BatchNormalizationLayer::type or
-      node.getType() == LayerNormalizationLayer::type or !node.getTrainable())
-    var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
-
-  if (node.getType() == MSELossLayer::type or
-      node.getType() == CrossEntropySoftmaxLossLayer::type or
-      node.getType() == CrossEntropySigmoidLossLayer::type)
-    var_common_spec.ls = TensorLifespan::FORWARD_DERIV_LIFESPAN;
-
-  if (node.getType() == GRUCellLayer::type) {
-    grad_common_spec.ls = TensorLifespan::CALC_GRAD_DERIV_LIFESPAN;
-  }
+  const auto [var_ls, grad_ls] =
+    inputLifespansFor(consumer_lnode, is_train_mode, node.getTrainable());
+  var_common_spec.ls = var_ls;
+  grad_common_spec.ls = grad_ls;
 
   std::vector<Var_Grad *> ret;
   size_t current_size = inputs_v2.size();
@@ -684,7 +671,6 @@ Manager::requestInputs(const GraphNode &node,
    *  resolve to the same source, so it must not vote. An application may
    *  declare further neutral layer types (see residency_policy.h) for layers
    *  registered on one engine that bind their inputs on another. */
-  const auto *consumer_lnode = dynamic_cast<const LayerNode *>(&node);
   const bool engine_neutral =
     node.getType() == MultiOutLayer::type ||
     ResidencyPolicy::global().isEngineNeutral(node.getType());

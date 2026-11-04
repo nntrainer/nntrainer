@@ -61,6 +61,17 @@
 %define fp16_support -Denable-fp16=false
 %endif # enable_fp16
 
+## ARM base ISA and per-extension ISA toggles.
+## meson composes the -march flag from arm-arch + each extension toggle, so
+## every option below can be turned on/off individually from gbs, e.g.:
+##   gbs build --define "arm_arch armv8-a"       # base ISA: armv7-a / armv8-a / armv8.2-a
+##   gbs build --define "enable_sve true"        # extensions take true / false
+## Only options given via --define are passed; defaults live in meson_options.txt
+## (arm-arch=auto: armv8.2-a+dotprod+i8mm on aarch64, armv7-a+neon on armv7l).
+## @todo Tizen optflags -march is placed after meson's -march and wins, so
+## these toggles don't change the compiled ISA until optflags -march is stripped.
+%define arm_isa_support %{?arm_arch:-Darm-arch=%{arm_arch}} %{?enable_neon:-Denable-neon=%{enable_neon}} %{?enable_dotprod:-Denable-dotprod=%{enable_dotprod}} %{?enable_i8mm:-Denable-i8mm=%{enable_i8mm}} %{?enable_fp16fml:-Denable-fp16fml=%{enable_fp16fml}} %{?enable_sve:-Denable-sve=%{enable_sve}} %{?enable_sve2:-Denable-sve2=%{enable_sve2}} %{?enable_sme:-Denable-sme=%{enable_sme}} %{?enable_sme2:-Denable-sme2=%{enable_sme2}}
+
 
 ## GPU flag
 ## To enable OpenCL, pass the flag to gbs build with: --define "_with_gpu 1"
@@ -423,6 +434,8 @@ export CFLAGS+=" -fprofile-arcs -ftest-coverage"
 export CXXFLAGS+=" -fprofile-arcs -ftest-coverage"
 %endif
 
+# Tizen optflags carry their own -march, which overrides meson's project args
+# @todo drop once optflags -march is stripped and meson owns the ISA flags
 %if 0%{?enable_fp16}
 export CFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
 export CXXFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
@@ -450,7 +463,7 @@ meson --buildtype=plain --prefix=%{_prefix} --sysconfdir=%{_sysconfdir} \
       %{enable_reduce_tolerance} %{configure_subplugin_install_path} %{enable_debug} \
       -Dml-api-support=enabled -Denable-nnstreamer-tensor-filter=enabled \
       -Denable-nnstreamer-tensor-trainer=enabled -Denable-capi=enabled \
-      %{fp16_support} %{opencl_support} build --wrap-mode=nodownload
+      %{fp16_support} %{arm_isa_support} %{opencl_support} build --wrap-mode=nodownload
 
 ninja -C build %{?_smp_mflags}
 

@@ -32,7 +32,8 @@ void TangentLayer::forwarding_operation(const Tensor &input, Tensor &hidden) {
 void TangentLayer::calcDerivative(RunLayerContext &context) {
   auto &deriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   context.getInput(SINGLE_INOUT_IDX).cos(deriv);
-  deriv.pow(-2).multiply(context.getIncomingDerivative(SINGLE_INOUT_IDX));
+  deriv.pow_i(-2.0f);
+  deriv.multiply_i(context.getIncomingDerivative(SINGLE_INOUT_IDX));
 }
 
 void TangentLayer::setProperty(const std::vector<std::string> &values) {
