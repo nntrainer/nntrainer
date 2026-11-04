@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+/** @file check_htp_page_prefix.cpp
+ * @brief Real-model partial page-prefix reuse and source-session preservation.
+ * Usage: check_htp_page_prefix MODEL_DIR FIXTURE_JSON OUTPUT_JSON
+ */
+#include <causal_lm.h>
+#include <chrono>
+#include <factory.h>
+#include <filesystem>
+#include <fstream>
+#include <htp_model_config.h>
+#include <htp_runtime_config.h>
+#include <iostream>
+#include <model_registry.h>
+#include <streamer.h>
+
+using json = causallm::json;
+using Clock = std::chrono::steady_clock;
+static json read(const std::filesystem::path &path) {
+  std::ifstream file(path);
+  if (!file)
+    throw std::runtime_error("Cannot read " + path.string());
+  json result;
+  file >> result;
+  return result;
+}
+static void require(bool ok, const char *message) {
+  if (!ok)
+    throw std::runtime_error(message);
+}
+struct Observer {
+  BaseStreamer base;
+  Clock::time_point first{};
+  static int put(BaseStreamer *b, const char *s) {
+    auto *self = reinterpret_cast<Observer *>(b);
+    if (s && *s && self->first == Clock::time_point{})
+      self->first = Clock::now();
+    return 0;
+  }
+  static void end(BaseStreamer *) {}
+};
+int main(int argc, char **argv) {
+  if (argc != 4)
+    return 2;
+  try {
+    const std::filesystem::path dir = argv[1];
+    auto cfg = read(dir / "config.json"),
+         gen = read(dir / "generation_config.json"),
+         nc = read(dir / "nntr_config.json");
+    const auto fixture = read(argv[2]);
+    nntrainer::configureHtpRuntime(causallm::normalizeHtpRuntimeConfig(nc));
+    causallm::registerAllModels();
+    auto model =
+      causallm::Factory::Instance().create("Gemma4ForCausalLM", cfg, gen, nc);
+    model->initialize();
+    model->load_weight(nc["model_file_name"].get<std::string>());
+    model->repack_weight();
+    auto *c = dynamic_cast<causallm::CausalLM *>(model.get());
+    require(c, "CausalLM unavailable");
+    const unsigned common = fixture.value("common_tokens", 768u);
+    const std::string source = fixture["source"];
+    auto source_ids = model->getTokenizer()->Encode(source, true);
+    require(source_ids.size() == 1024, "Source is not 1024 tokens");
+    std::vector<std::string> branches;
+    for (const auto &item : fixture["suffixes"]) {
+      const auto suffix =
+        model->getTokenizer()->Encode(item.get<std::string>(), false);
+      std::vector<int> ids(source_ids.begin(), source_ids.begin() + common);
+      ids.insert(ids.end(), suffix.begin(), suffix.end());
+      const auto text = model->getTokenizer()->Decode(ids);
+      require(model->getTokenizer()->Encode(text, true) == ids,
+              "Branch retokenization differs");
+      unsigned matched = 0;
+      while (matched < ids.size() && matched < source_ids.size() &&
+             ids[matched] == source_ids[matched])
+        ++matched;
+      require(matched == common,
+              "Branch does not diverge exactly at requested token");
+      branches.push_back(text);
+    }
+    const std::string query = fixture["follow_up"];
+    json report = {{"config", nc},
+                   {"fixture", fixture},
+                   {"source_ids", source_ids},
+                   {"branches", branches},
+                   {"baseline", json::array()},
+                   {"reused", json::array()}};
+    auto write = [&] {
+      std::ofstream out(argv[3]);
+      out << report.dump(2) << '\n';
+    };
+    static const BaseStreamerVTable vtable = {Observer::put, Observer::end};
+    auto run = [&](const std::string &text, bool reset) {
+      if (reset)
+        c->setSessionTokenPosition(0);
+      Observer observer;
+      observer.base.vtable = &vtable;
+      c->setStreamer(&observer.base);
+      const auto start = Clock::now();
+      model->run(text, false, "", "", false);
+      const auto end = Clock::now();
+      c->setStreamer(nullptr);
+      require(observer.first != Clock::time_point{}, "No first delta");
+      const auto m = c->getPerformanceMetrics();
+      require(!m.prompt_truncated_tokens, "Prompt truncated");
+      return json{
+        {"input_ids", model->getTokenizer()->Encode(text, reset)},
+        {"ids", c->getLastGeneratedTokenIds()},
+        {"output", c->getOutput()},
+        {"position", c->getKvLen()},
+        {"prefill_tokens", m.prefill_tokens},
+        {"request_to_first_delta_ms",
+         std::chrono::duration<double, std::milli>(observer.first - start)
+           .count()},
+        {"metrics_ttft_ms", m.ttft_ms},
+        {"decode_ms_per_token", m.decode_steady_ms},
+        {"steady_steps", m.decode_steady_tokens},
+        {"kv_bytes", c->getDeviceKVCacheBytes()},
+        {"wall_ms",
+         std::chrono::duration<double, std::milli>(end - start).count()}};
+    };
+    run("<bos><|turn>user\nSay READY.<turn|>\n<|turn>model\n", true);
+    report["source_reference"] = run(source, true);
+    report["source_continuation_reference"] = run(query, false);
+    for (const auto &text : branches) {
+      report["baseline"].push_back(run(text, true));
+      write();
+    }
+    if (!nc.at("htp").value("kv_paged", false)) {
+      report["baseline_only"] = true;
+      report["passed"] = true;
+      write();
+      return 0;
+    }
+    c->setSessionTokenPosition(0);
+    c->enableDeviceKVManager(8, 8);
+    const auto source_result = run(source, false);
+    require(source_result["ids"] == report["source_reference"]["ids"],
+            "Source reference changed");
+    const auto source_fork = c->forkDeviceKVSession();
+    bool fresh_ids_equal = true;
+    for (size_t i = 0; i < branches.size(); ++i) {
+      const auto session = c->createDeviceKVSession();
+      c->selectDeviceKVSession(session);
+      const auto before = c->deviceKVManagerStats();
+      auto result = run(branches[i], false);
+      const auto after = c->deviceKVManagerStats();
+      result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
+      require(after.hits == before.hits + 1 &&
+                result["reused_tokens"] == common,
+              "Partial page prefix was not reused");
+      const auto suffix_tokens =
+        model->getTokenizer()->Encode(branches[i], true).size() - common;
+      const unsigned last_prompt_decode =
+        nc.value("skip_prefill", false) && suffix_tokens > 1 ? 1u : 0u;
+      result["processed_suffix_tokens"] =
+        result["prefill_tokens"].get<unsigned>() + last_prompt_decode;
+      require(result["processed_suffix_tokens"].get<size_t>() == suffix_tokens,
+              "Wrong suffix length");
+      result["matches_fresh_ids"] =
+        result["ids"] == report["baseline"][i]["ids"];
+      report["reused"].push_back(result);
+      write();
+      fresh_ids_equal =
+        fresh_ids_equal && result["matches_fresh_ids"].get<bool>();
+      if (fixture.contains("expected_codes")) {
+        result["contains_expected_code"] =
+          result["output"].get<std::string>().find(
+            fixture["expected_codes"][i].get<std::string>()) !=
+          std::string::npos;
+        require(result["contains_expected_code"].get<bool>(),
+                "Branch reused a stale answer");
+      }
+      report["reused"].back() = result;
+      write();
+    }
+    c->selectDeviceKVSession(source_fork);
+    report["source_after_branches"] = run(query, false);
+    require(report["source_after_branches"]["ids"] ==
+              report["source_continuation_reference"]["ids"],
+            "Original 1024-token source was overwritten");
+    report["prefix_checks_passed"] = true;
+    report["fresh_output_ids_match"] = fresh_ids_equal;
+    report["passed"] = fresh_ids_equal;
+    write();
+    std::cout << "PAGE_PREFIX_RESULT " << report.dump() << '\n';
+    if (!fresh_ids_equal) {
+      std::cerr << "PAGE_PREFIX_FRESH_OUTPUT_MISMATCH: structural prefix and "
+                   "source checks passed; fresh greedy IDs differ\n";
+      return 3;
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "PAGE_PREFIX_ERROR " << e.what() << '\n';
+    return 1;
+  }
+}

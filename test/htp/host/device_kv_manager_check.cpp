@@ -18,7 +18,7 @@ int main() {
         live.insert(next);
         return next++;
       },
-      [&](uint32_t id) {
+      [&](uint32_t id, unsigned) {
         if (fail_restore)
           throw std::runtime_error("failure");
         assert(live.count(id));
@@ -68,6 +68,58 @@ int main() {
     fail_restore = false;
     m.clearPrefixes();
     assert(m.stats().prefixes == 0 && m.stats().radix_nodes == 0);
+  }
+  assert(live.empty());
+  {
+    unsigned selected_length = 0;
+    uint32_t capture_calls = 0;
+    std::map<uint32_t, unsigned> first;
+    Manager m(
+      [&](unsigned position, unsigned) {
+        ++capture_calls;
+        first[next] = position > 1024 ? 2048 : 0;
+        live.insert(next);
+        return next++;
+      },
+      [&](uint32_t id, unsigned length) {
+        assert(live.count(id));
+        restored = id;
+        selected_length = length;
+      },
+      [&](uint32_t id) { assert(live.erase(id)); }, [] {}, 2, 3,
+      [&](uint32_t id) { return first.at(id); });
+    Manager::Tokens source(1024);
+    for (unsigned i = 0; i < source.size(); ++i)
+      source[i] = i + 1;
+    m.publish(source, 1024, 9);
+    const uint32_t original = next - 1;
+    assert(capture_calls == 1 && m.stats().radix_nodes == 16);
+    Manager::Tokens divergent(source.begin(), source.begin() + 768);
+    divergent.insert(divergent.end(), 100, 99999);
+    assert(m.reuse(divergent) == 768);
+    assert(restored == original && selected_length == 768);
+    assert(m.tokens() == Manager::Tokens(source.begin(), source.begin() + 768));
+    assert(capture_calls == 1); // no independently captured 768-token state
+    divergent[750] = 77777;
+    assert(m.reuse(divergent) == 704);
+    assert(selected_length == 704);
+    assert(m.reuse(source) == 960); // fresh logits require an input suffix
+    Manager::Tokens long_source(3072);
+    for (unsigned i = 0; i < long_source.size(); ++i)
+      long_source[i] = i + 1;
+    m.publish(long_source, 3072, 9);
+    const uint32_t windowed = next - 1;
+    divergent.assign(long_source.begin(), long_source.begin() + 2304);
+    divergent.push_back(99999);
+    assert(m.reuse(divergent) == 2304 && restored == windowed);
+    // The newer windowed state cannot supply old sliding rows. The older
+    // retained state still supplies its full-page terminals.
+    divergent.assign(source.begin(), source.begin() + 768);
+    divergent.push_back(99999);
+    assert(m.reuse(divergent) == 768 && restored == original);
+    m.clearPrefixes();
+    m.publish(long_source, 3072, 9);
+    assert(m.reuse(divergent) == 0); // required rows were actually evicted
   }
   assert(live.empty());
   std::cout

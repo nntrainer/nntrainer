@@ -1149,8 +1149,9 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
       return nntrainer::get_htp_ops()->retain_decode_kv(
         {position, 0u, pending});
     },
-    [this](uint32_t handle) {
-      const auto app = nntrainer::get_htp_ops()->select_decode_kv(handle);
+    [this](uint32_t handle, unsigned prefix) {
+      const auto app =
+        nntrainer::get_htp_ops()->select_decode_kv(handle, prefix);
       global_token_len = app[0];
       SYS_PROMP_LEN = app[1];
       // An independent run drops host slabs before its radix lookup. The
@@ -1167,7 +1168,10 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
     [](uint32_t handle) {
       nntrainer::get_htp_ops()->release_decode_kv(handle);
     },
-    [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes);
+    [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes,
+    [](uint32_t handle) {
+      return nntrainer::get_htp_ops()->decode_kv_prefix_min(handle);
+    });
 #else
   throw std::logic_error("HTP backend is unavailable");
 #endif

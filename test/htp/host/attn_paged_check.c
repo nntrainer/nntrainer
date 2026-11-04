@@ -95,7 +95,84 @@ static void check(uint32_t nk, uint32_t gqa, uint32_t hd, uint32_t flags,
   free(frozen);
   free(copy);
 }
-int main(void) {
+static void check_prefix(uint32_t flags) {
+  int err;
+  const uint32_t hd = 256, nk = 2, gqa = 2;
+  const size_t row = (size_t)nk * hd, output_bytes = row * gqa * sizeof(float);
+  float *k = malloc(1024 * row * sizeof(float));
+  float *v = malloc(1024 * row * sizeof(float));
+  float *q = malloc(output_bytes), *x = malloc(output_bytes),
+        *y = malloc(output_bytes);
+  for (size_t i = 0; i < 1024 * row; ++i) {
+    k[i] = ((int)(i % 113) - 56) * 0.0125f;
+    v[i] = ((int)(i % 71) - 35) * 0.025f;
+  }
+  for (size_t i = 0; i < row * gqa; ++i)
+    q[i] = ((int)(i % 37) - 18) * 0.02f;
+  hvx_attn_m1_ctx *source = hvx_attn_m1_create(
+    1, nk, gqa, hd, 1088 | HVX_ATTN_M1_Q8 | HVX_ATTN_M1_PAGED | flags, NULL,
+    &err);
+  hvx_attn_m1_ctx *reference = hvx_attn_m1_create(
+    1, nk, gqa, hd, 1088 | HVX_ATTN_M1_Q8 | flags, NULL, &err);
+  assert(source && reference);
+  assert(!hvx_attn_m1_kv_append(source, 0, 0, 1024, k, v));
+  assert(!hvx_attn_m1_kv_append(reference, 0, 0, 1024, k, v));
+  equal_layer(source, reference);
+  // A global boundary can end inside a sliding cache's local tile. Reusing
+  // that partial tile must not expose its stale suffix or overwrite source.
+  hvx_attn_m1_ctx *partial = hvx_attn_m1_clone(source, &err);
+  assert(partial && !err && !hvx_attn_m1_truncate(partial, 0, 769));
+  reference->kv_len[0] = 769;
+  equal_layer(partial, reference);
+  assert(partial->pages[12] == source->pages[12]);
+  assert(!hvx_attn_m1_forward(partial, 0, 769, 0, 0.0625f, q, k, v, x, NULL));
+  assert(!hvx_attn_m1_forward(reference, 0, 769, 0, 0.0625f, q, k, v, y, NULL));
+  assert(!memcmp(x, y, output_bytes));
+  assert(partial->pages[12] != source->pages[12] && source->kv_len[0] == 1024);
+  hvx_attn_m1_free(partial);
+  hvx_attn_m1_ctx *prefix = hvx_attn_m1_clone(source, &err);
+  assert(prefix && !err);
+  assert(hvx_attn_m1_truncate(prefix, 0, 1025) == AEE_EINVALIDFORMAT);
+  assert(prefix->kv_len[0] == 1024);
+  assert(!hvx_attn_m1_truncate(prefix, 0, 768));
+  reference->kv_len[0] = 768; // independent linear view of the encoded prefix
+  equal_layer(prefix, reference);
+  assert(source->kv_len[0] == 1024 && prefix->pages[0] == source->pages[0]);
+  assert(hvx_attn_m1_payload_bytes(prefix) == 2u * 768u * row);
+  for (uint32_t h = 0; h < nk; ++h) {
+    const size_t base = (size_t)h * (prefix->seq / 64u);
+    for (uint32_t t = 12; t < prefix->seq / 64u; ++t)
+      assert(!prefix->pages[base + t]);
+  }
+  for (uint32_t pos = 768; pos < 771; ++pos) {
+    assert(!hvx_attn_m1_forward(prefix, 0, pos, 0, 0.0625f, q, k, v, x, NULL));
+    assert(
+      !hvx_attn_m1_forward(reference, 0, pos, 0, 0.0625f, q, k, v, y, NULL));
+    assert(!memcmp(x, y, output_bytes));
+  }
+  // Recomputed suffix owns new pages; the original source remains usable.
+  assert(prefix->pages[12] != source->pages[12]);
+  assert(source->kv_len[0] == 1024);
+  hvx_attn_m1_free(source);
+  hvx_attn_m1_free(prefix);
+  hvx_attn_m1_free(reference);
+  free(k);
+  free(v);
+  free(q);
+  free(x);
+  free(y);
+}
+
+int main(int argc, char **argv) {
+  check_prefix(0);
+  check_prefix(HVX_ATTN_M1_FAST);
+  check_prefix(HVX_ATTN_M1_FAST | HVX_ATTN_M1_QK_I8);
+  if (argc == 2 && !strcmp(argv[1], "--prefix-only")) {
+    puts("1024 -> 768 page prefix, exact encoded attention, source "
+         "preservation: PASS");
+    return 0;
+  }
+
   check(2, 2, 64, 0, 0);
   check(8, 2, 256, 0, 3);
   check(2, 8, 512, 0, 3);

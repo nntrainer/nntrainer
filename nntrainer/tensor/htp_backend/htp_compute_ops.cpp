@@ -2429,7 +2429,8 @@ public:
     return id;
   }
 
-  std::vector<uint32_t> select_decode_kv(uint32_t id) override {
+  std::vector<uint32_t> select_decode_kv(uint32_t id,
+                                         unsigned prefix = 0) override {
     std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
     auto it = device_kv_states_.find(id);
     if (it == device_kv_states_.end())
@@ -2437,20 +2438,42 @@ public:
     // Allocate all host return/counter state before the DSP transaction.
     auto lengths = it->second.lengths;
     auto app = it->second.app;
+    const auto &state = it->second;
+    const uint32_t position = prefix ? prefix : state.position + 1u;
+    if (position > state.position + 1u || !position ||
+        (position != state.position + 1u && position % 64u) ||
+        (prefix && position < decode_kv_prefix_min(id)))
+      throw std::invalid_argument("Device prefix is outside retained KV pages");
+    size_t ordinal = 0;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+      (void)op;
+      if (state.bases[ordinal] > position ||
+          position - state.bases[ordinal] > lengths[ordinal])
+        throw std::invalid_argument("Device prefix layer is incomplete");
+      lengths[ordinal] = position - state.bases[ordinal];
+      ++ordinal;
+    }
+    if (prefix) {
+      app[0] = position;
+      app[1] = 0;
+      // The caller supplies the new suffix, so it must not feed the saved
+      // state's generated token at this newly selected position.
+      app[2] = 0;
+    }
     if (cpu_predictor_)
       cpu_predictor_->drain();
     if (pool_prefetch_)
       pool_prefetch_->drain();
+    const uint32_t metadata[2] = {id, prefix};
     const int rc = nntr_hvx_attn_m1_snapshot_control(
-      HtpBackend::global().handle(), 6, &id, 1, nullptr, 0);
+      HtpBackend::global().handle(), 6, metadata, prefix ? 2 : 1, nullptr, 0);
     if (rc)
       throw std::runtime_error("HTP KV select: " + graphErr(rc));
-    const auto &state = it->second;
     size_t i = 0;
     for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1])
       htp_graph_op_at(decode_.graph_words_.data(), op)->n_experts =
         state.bases[i++];
-    decode_.cur_pos_ = state.position;
+    decode_.cur_pos_ = position - 1u;
     decode_.request_end_ = state.end;
     decode_.attn_window_rows_ = state.window;
     decode_.attn_capacity_[0] = state.capacity[0];
@@ -2465,6 +2488,22 @@ public:
     std::fill(std::begin(decode_.kind_next_), std::end(decode_.kind_next_), 0u);
     htp_router_handoff_invalidate(&staging_.router_handoff_);
     return app;
+  }
+
+  unsigned decode_kv_prefix_min(uint32_t id) const override {
+    const auto &state = device_kv_states_.at(id);
+    unsigned first = 0;
+    size_t i = 0;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+      const auto *rec = decode_.graphOp(op);
+      if (state.bases[i]) {
+        if (!rec->top_k || state.bases[i] > UINT32_MAX - rec->top_k)
+          throw std::logic_error("Invalid retained sliding prefix range");
+        first = std::max(first, state.bases[i] + rec->top_k);
+      }
+      ++i;
+    }
+    return first;
   }
 
   void release_decode_kv(uint32_t id) override {

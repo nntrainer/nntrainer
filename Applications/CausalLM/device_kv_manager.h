@@ -19,16 +19,17 @@
 namespace causallm {
 
 /** The backend owns page tables, scales and window positions behind handles.
- * A terminal radix node denotes a complete device state, including all layer
- * scales. Arbitrary token branch points are NOT independently restorable:
- * quantizer/window state must have been captured at that position.
+ * Full-page radix terminals reference a retained state's immutable prefix
+ * pages. A hit selects only the matched page range with that state's encoding
+ * scales. Terminals whose required sliding history was released are excluded.
  * Thread confined; all operations occur between synchronous inference calls.
  */
 class DeviceKVManager {
 public:
   using Tokens = std::vector<unsigned int>;
   using Capture = std::function<uint32_t(unsigned, unsigned)>;
-  using Restore = std::function<void(uint32_t)>;
+  using Restore = std::function<void(uint32_t, unsigned)>;
+  using PrefixMin = std::function<unsigned(uint32_t)>;
   using Release = std::function<void(uint32_t)>;
   struct Session {
     uint32_t handle = 0;
@@ -41,11 +42,12 @@ public:
 
   DeviceKVManager(Capture capture, Restore restore, Release release,
                   std::function<void()> reset, size_t max_sessions,
-                  size_t max_prefixes) :
+                  size_t max_prefixes, PrefixMin prefix_min = {}) :
     capture_(std::move(capture)),
     restore_(std::move(restore)),
     release_(std::move(release)),
     reset_(std::move(reset)),
+    prefix_min_(std::move(prefix_min)),
     max_sessions_(max_sessions),
     max_prefixes_(max_prefixes) {
     if (!max_sessions || max_sessions > 120u ||
@@ -92,7 +94,7 @@ public:
     uint32_t outgoing = position ? capture_(position, pending) : 0;
     try {
       if (target->second.handle)
-        restore_(target->second.handle);
+        restore_(target->second.handle, 0);
       else {
         Tokens old_tokens = sessions_.at(active_).tokens;
         reset_();
@@ -132,6 +134,7 @@ public:
     const Node *node = &root_;
     size_t offset = 0;
     uint32_t best = 0;
+    size_t best_count = 0;
     while (offset < tokens.size()) {
       auto it = node->children.find(tokens[offset]);
       if (it == node->children.end())
@@ -142,22 +145,25 @@ public:
                       tokens.begin() + offset))
         break;
       offset += node->edge.size();
-      if (node->terminal && offset < tokens.size())
+      if (node->terminal && offset < tokens.size()) {
         best = node->terminal;
+        best_count = offset;
+      }
     }
     if (!best)
       return 0;
     auto &p = prefixes_.at(best);
-    Tokens adopted = p.tokens;
-    restore_(p.handle);
+    Tokens adopted(p.tokens.begin(), p.tokens.begin() + best_count);
+    restore_(p.handle, static_cast<unsigned>(best_count));
     sessions_.at(active_).tokens = std::move(adopted);
     p.used = ++clock_;
     ++stats_.hits;
-    stats_.reused_tokens += p.tokens.size();
-    return p.tokens.size();
+    stats_.reused_tokens += best_count;
+    return best_count;
   }
 
-  /** Publish a complete processed state; no per-token work or page export. */
+  /** Publish full-page prefix terminals plus the completed endpoint. Each
+   * terminal borrows one retained handle: no extra KV copy/handle per page. */
   void publish(const Tokens &tokens, unsigned position, unsigned pending) {
     if (!max_prefixes_ || tokens.empty() || tokens.size() != position)
       return;
@@ -178,9 +184,11 @@ public:
       release_(victim->second.handle);
       erase(root_, victim->first);
       prefixes_.erase(victim);
+      rebuild();
     }
-    Prefix p{tokens, capture_(position, pending), ++clock_};
+    Prefix p{tokens, capture_(position, pending), ++clock_, 0};
     try {
+      p.first = prefix_min_ ? prefix_min_(p.handle) : 0;
       prefixes_.emplace(p.handle, p);
       rebuild();
     } catch (...) {
@@ -217,6 +225,7 @@ private:
     Tokens tokens;
     uint32_t handle;
     uint64_t used;
+    unsigned first; /**< Minimum prefix with all required sliding rows. */
   };
   static size_t nodes(const Node &n) {
     size_t count = 0;
@@ -224,21 +233,22 @@ private:
       count += 1 + nodes(*c.second);
     return count;
   }
-  static void insert(Node &root, const Tokens &tokens, uint32_t id) {
+  static void insert(Node &root, const Tokens &tokens, size_t count,
+                     uint32_t id) {
     Node *node = &root;
     size_t offset = 0;
-    while (offset < tokens.size()) {
+    while (offset < count) {
       auto it = node->children.find(tokens[offset]);
       if (it == node->children.end()) {
         auto leaf = std::make_unique<Node>();
-        leaf->edge.assign(tokens.begin() + offset, tokens.end());
+        leaf->edge.assign(tokens.begin() + offset, tokens.begin() + count);
         leaf->terminal = id;
         node->children.emplace(tokens[offset], std::move(leaf));
         return;
       }
       Node *child = it->second.get();
       size_t common = 0;
-      while (common < child->edge.size() && offset + common < tokens.size() &&
+      while (common < child->edge.size() && offset + common < count &&
              child->edge[common] == tokens[offset + common])
         ++common;
       if (common < child->edge.size()) {
@@ -266,8 +276,16 @@ private:
   }
   void rebuild() {
     Node next;
-    for (const auto &p : prefixes_)
-      insert(next, p.second.tokens, p.first);
+    for (const auto &p : prefixes_) {
+      const auto &entry = p.second;
+      size_t first =
+        std::max<size_t>(64, (size_t(entry.first) + 63u) / 64u * 64u);
+      for (size_t count = first; count <= entry.tokens.size(); count += 64u)
+        insert(next, entry.tokens, count, p.first);
+      // A completed state may end in a partial page and is also reusable.
+      if (entry.tokens.size() >= entry.first)
+        insert(next, entry.tokens, entry.tokens.size(), p.first);
+    }
     root_ = std::move(next);
   }
   void releaseNoThrow(uint32_t handle) noexcept {
@@ -281,6 +299,7 @@ private:
   Restore restore_;
   Release release_;
   std::function<void()> reset_;
+  PrefixMin prefix_min_;
   size_t max_sessions_, max_prefixes_;
   uint32_t next_session_ = 1, active_ = 0;
   uint64_t clock_ = 0;

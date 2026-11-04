@@ -451,6 +451,19 @@ hvx_attn_m1_ctx *hvx_attn_m1_clone(const hvx_attn_m1_ctx *src, int *err) {
   return hvx_attn_m1_reserve(src, src->seq, 0, err);
 }
 
+int hvx_attn_m1_truncate(hvx_attn_m1_ctx *c, uint32_t layer, uint32_t length) {
+  if (!c || !c->paged || layer >= c->n_layers || length > c->kv_len[layer])
+    return AEE_EINVALIDFORMAT;
+  for (uint32_t h = 0; h < c->n_kv; ++h)
+    for (uint32_t t = tiles_of(length); t < c->seq / TILE; ++t) {
+      hvx_kv_page **slot = &c->pages[page_index(c, layer, h, t)];
+      page_release(*slot);
+      *slot = NULL;
+    }
+  c->kv_len[layer] = length;
+  return AEE_SUCCESS;
+}
+
 size_t hvx_attn_m1_snapshot_bytes(const hvx_attn_m1_ctx *c, uint32_t l) {
   if (!c || !c->q8 || l >= c->n_layers || c->kv_len[l] > c->max_seq)
     return 0;
@@ -501,6 +514,17 @@ int hvx_attn_m1_snapshot_export(const hvx_attn_m1_ctx *c, uint32_t l,
         const size_t tile_bytes = (size_t)TILE * c->head_dim;
         memcpy(data, v ? v8_row(c, l, h, t * TILE) : kt8_tile(c, l, h, t),
                tile_bytes);
+        // A shared truncated tail may still contain another branch's suffix.
+        // Serialize only live rows without modifying the shared allocation.
+        const uint32_t live = header[0] - t * TILE;
+        if (live < TILE) {
+          if (v)
+            memset(data + (size_t)live * c->head_dim, 0,
+                   (size_t)(TILE - live) * c->head_dim);
+          else
+            for (uint32_t d = 0; d < c->head_dim; ++d)
+              memset(data + (size_t)d * TILE + live, 0, TILE - live);
+        }
         data += tile_bytes;
       }
     }

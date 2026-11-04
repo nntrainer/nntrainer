@@ -127,7 +127,9 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
   // handle. Both shapes are cloned before publication; an allocation failure
   // leaves active and saved conversations untouched. No KV bytes cross FastRPC.
   if (action >= 5u && action <= 7u) {
-    if (!metadata || metadataLen != 1 || !metadata[0] || s->kv_restore_mask)
+    if (!metadata ||
+        (metadataLen != 1 && !(action == 6u && metadataLen == 2)) ||
+        !metadata[0] || s->kv_restore_mask)
       return AEE_EINVALIDFORMAT;
     nntr_kv_saved **link = &s->kv_saved;
     uint32_t count = 0;
@@ -149,6 +151,27 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
       return AEE_EBADSTATE;
     if (action == 5u && count >= 128u)
       return AEE_ENOMEMORY;
+    const uint32_t prefix = action == 6u && metadataLen == 2 ? metadata[1] : 0;
+    if (prefix) {
+      for (uint32_t c = 0; c < 2u; ++c) {
+        const hvx_attn_m1_ctx *a = saved->cache[c];
+        if (!a)
+          continue;
+        if (prefix < saved->base[c])
+          return AEE_EINVALIDFORMAT;
+        const uint32_t live = prefix - saved->base[c];
+        for (uint32_t l = 0; l < a->n_layers; ++l)
+          if (live > a->kv_len[l])
+            return AEE_EINVALIDFORMAT;
+        for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+          const htp_graph_op *op = &s->graph->ops[i];
+          if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == a->n_kv &&
+              op->gqa == a->gqa && op->head_dim == a->head_dim &&
+              saved->base[c] && (!op->top_k || live < op->top_k))
+            return AEE_EINVALIDFORMAT;
+        }
+      }
+    }
     nntr_kv_saved *next = calloc(1, sizeof(*next));
     if (!next)
       return AEE_ENOMEMORY;
@@ -162,6 +185,14 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
       if (!next->cache[c])
         break;
       next->base[c] = action == 6u ? saved->base[c] : 0;
+      if (prefix)
+        for (uint32_t l = 0; l < next->cache[c]->n_layers; ++l) {
+          rc = hvx_attn_m1_truncate(next->cache[c], l, prefix - next->base[c]);
+          if (rc != AEE_SUCCESS)
+            break;
+        }
+      if (rc != AEE_SUCCESS)
+        break;
       if (action == 5u)
         for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
           const htp_graph_op *op = &s->graph->ops[i];

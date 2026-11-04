@@ -3,12 +3,17 @@
 This opt-in path manages the authoritative DSP INT8 KV of the fully resident
 Gemma4 MoE graph. The existing contiguous DSP path remains the default.
 
+Full-page prefix selection is implemented, but the new divergent-input model
+check found fresh/reused greedy output differences. Its structural/source checks
+pass; the full output-equality check fails. See the partial-prefix result below
+before treating this path as output-preserving or quoting a speed benefit.
+
 | Feature | Implementation |
 | --- | --- |
 | Sessions | Create, select, delete and fork independent conversations in one loaded model. One conversation executes at a time. |
 | Paged KV | Native DSP page tables. Each physical page stores one layer/head's 64-token K tile and V rows. Attention reads the pages directly, without gathering history. |
 | Sharing | Retained states share immutable physical pages. Append detaches the pages it modifies before dispatching workers. Quantizer state and runtime positions belong to each state. |
-| Radix prefix index | Compressed token edges identify the longest **published complete state** before the last input token. A hit shares device pages and restores scales, window bases and counters. |
+| Radix prefix index | Compressed token edges identify the longest available full-page prefix before the last input token, plus completed endpoints. A hit shares only the matched pages and restores their encoding scales, window bases and counters. |
 | Global / Sliding | Global grows by pages. Sliding reserve releases whole old tiles and remaps retained pages without copying their KV payload. |
 | Flash | Existing transactional INT8 snapshots also export/import paged caches. Parking releases the active page table's references. Pages pinned by other sessions/prefixes remain resident. |
 
@@ -76,35 +81,40 @@ The existing `nntr_causallm MODEL_DIR --requests FILE` interface accepts names:
 
 The first use of each name creates an empty session. Requests without a name
 use `default`. Results include switch latency, active KV payload bytes, session
-count, radix node/terminal counts, prefix hits and reused token count.
+count, retained-prefix state count, radix node count, prefix hits and reused token count.
 This is the native request sequence interface; HTTP serving is a separate layer.
 
 ## Prefix semantics and bounds
 
 On an empty conversation, `run()` tokenizes its complete input and searches the
-radix index. Completed requests publish their processed token sequence, excluding
-the final emitted token still waiting for feedback. With `skip_prefill=true`,
-the first completed decode row can additionally publish the complete prompt
-boundary. A hit restores that state and computes only the remaining input.
-At least one input token is retained for fresh logits and the current sampling
-policy. Continued conversations already have their own history and do not search
-the index.
+radix index. Each retained state publishes terminals at every available 64-token
+page boundary, plus its completed endpoint. All those terminals borrow the same
+retained handle; there is no checkpoint or KV copy per page. A hit selects the
+matched pages, shortens all layer lengths/absolute counters, releases the new
+active table's suffix references, and computes the remaining input. The original
+retained state remains intact. Continued conversations already own their history
+and do not search the index. At least one input token is left for fresh logits.
 
-Only captured state boundaries are restorable. A token branch inside a compressed
-edge does not manufacture a snapshot at that position. This differs from the
-CPU prefix cache's independent full-page terminals: the DSP state also needs the
-corresponding per-layer quantizers and sliding bases. Prefixes from different
-states are never combined with another state's scales. Greedy output checks
-compare resumed runs to the same uninterrupted resident history; recomputing a
-whole prompt may use different prefill quantization/chunking.
+For example, one retained 1024-token state supplies a 768-token hit when the next
+input diverges at token 769: the new active table shares the first 12 pages and
+allocates new pages for its suffix. No separate 768-token checkpoint is required.
+A divergence after token 750 reuses the first 704 tokens (11 full pages). An input
+identical to all 1024 saved tokens reuses 960, leaving the last page to produce
+fresh logits. If there is also a completed endpoint between two page boundaries,
+it can supply a longer hit, provided it precedes the final input token.
 
-For example, a state captured at token 1024 can serve a new 1536-token input
-whose first 1024 tokens match: restore the complete 1024-token state and compute
-the remaining 512 tokens. If the input diverges at token 769 and no earlier
-state was captured, the 1024-token checkpoint cannot supply a 768-token hit.
-Physical 64-token pages alone do not create restorable terminals at 64, 128,
-192, and so on. The current NPU index therefore provides checkpoint-granularity
-prefix reuse; it is not the CPU cache's independently published per-page index.
+A sliding cache can actually have released old rows before the retained state
+was captured. Such a state cannot supply an earlier prefix that needs those rows:
+the index excludes its unavailable boundaries. An older retained state can still
+supply them. This is missing cached payload, not a requirement to have captured a
+checkpoint at every prefix length. Global layers keep their full history.
+
+The retained INT8 bytes stay paired with their original encoding scales; reuse
+does not recalibrate/requantize them at the shorter prefix. Fresh prefill of a
+different complete input can choose different quantizers or chunking, so universal
+bit equality with fresh recomputation is not claimed. Tests check exact encoded
+attention and source preservation, and compare unmodified greedy outputs against
+fresh model runs for the recorded divergent-input fixtures.
 
 Limits are counts of sessions and published prefixes; their sum must be at most
 120. Prefix terminals use LRU eviction. This bounds retained handles, **not total
@@ -198,3 +208,48 @@ prove zero overhead. It also cannot attribute a difference specifically to
 page lookup, COW or the manager. Prefix-hit timings (1768/1958 ms) were not
 paired with full-history recomputation of the same complete inputs, so they
 must not be quoted as a measured recomputation speedup.
+
+
+## Full-page prefix validation
+
+`tools/kv_cache/check_htp_page_prefix.cpp` checks the case that a complete
+1024-token source is retained once and a new input diverges after token 768.
+The host manager check requires 768 tokens to be reused without capturing an
+independent 768-token state. The DSP kernel check verifies byte-exact attention
+against the same encoded prefix, release of active suffix references and
+preservation of the original 1024-token source. ASan/UBSan covers this truncation
+and branching path. Sliding coverage tests keep an older available source and
+exclude only boundaries whose required rows were actually released.
+
+
+### Android partial-prefix result and unresolved output mismatch
+
+The page-prefix fix was checked separately from the earlier checkpoint-only
+measurements. One 1024-token prompt was retained. Each of two new inputs shared
+only its first 768 tokens, then supplied a distinct 32-token suffix. Neither had
+an independently captured 768-token checkpoint. Both reused 768 tokens and
+computed 32 suffix tokens (31 in the prefill metric plus one final input token
+in decode with `skip_prefill=true`). The original source conversation resumed
+with exactly the same IDs as its independent resident continuation reference.
+Host encoded-attention checks and ASan/UBSan also pass, including an unaligned
+sliding-local tail and zeroing uncommitted tail rows in exported snapshots.
+
+**Fresh greedy output equality failed.** The native checker records this and
+exits 3 after completing the structural/source checks. It does not label the
+whole model validation as passed. Fresh contiguous and paged runs had identical
+IDs for both inputs; the difference appears between fresh execution and reuse.
+The cause within the differing execution/quantizer histories is not isolated.
+
+| Branch | Fresh contiguous TTFT (ms) | Fresh paged TTFT (ms) | Reuse TTFT (ms) | Fresh output | Reuse output |
+| --- | ---: | ---: | ---: | --- | --- |
+| 1 | 2287 | 2291 | 2662 | DIAMOND-123<turn\|> | <\|channel>thought <channel\|>DIAMOND-123<turn\|> |
+| 2 | 2387 | 2374 | 2630 | <eos> | <\|channel>thought <channel\|>RUBY-456<turn\|> |
+
+These samples show no latency benefit for this short-suffix case, and their
+output differences prevent a controlled same-output speed claim. The normal
+fresh path can process multiple input tokens in HMX, whereas resident suffix
+continuation currently runs through the token decode path. This route difference
+is relevant to the timing, but its separate cost was not isolated. An earlier
+`skip_prefill=false` trial also differed and is retained in the evidence.
+Full data and the failed equality outcome are in
+[partial-prefix validation](validation/gemma4-dsp-page-prefix-20261104.json).

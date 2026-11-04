@@ -1959,10 +1959,15 @@ public:
   virtual uint32_t retain_decode_kv(const std::vector<uint32_t> &) {
     throw std::logic_error("Device KV page sharing is unsupported");
   }
-  virtual std::vector<uint32_t> select_decode_kv(uint32_t) {
+  virtual std::vector<uint32_t> select_decode_kv(uint32_t, unsigned = 0) {
     throw std::logic_error("Device KV page sharing is unsupported");
   }
   virtual void release_decode_kv(uint32_t) {
+    throw std::logic_error("Device KV page sharing is unsupported");
+  }
+  /** Earliest prefix position whose sliding history is still present.
+   * Zero means every full page boundary is available. Host metadata only. */
+  virtual unsigned decode_kv_prefix_min(uint32_t) const {
     throw std::logic_error("Device KV page sharing is unsupported");
   }
 

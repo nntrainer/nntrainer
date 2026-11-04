@@ -169,6 +169,11 @@ hvx_attn_m1_ctx *hvx_attn_m1_reserve(const hvx_attn_m1_ctx *src, uint32_t rows,
  * Subsequent appends detach the modified tiles before starting workers. */
 hvx_attn_m1_ctx *hvx_attn_m1_clone(const hvx_attn_m1_ctx *src, int *err);
 size_t hvx_attn_m1_payload_bytes(const hvx_attn_m1_ctx *ctx);
+/** Shorten an unpublished paged layer, preserving its encoding scales.
+ * Global page boundaries may fall inside a sliding cache's local tile when
+ * its absolute base is unaligned. The partial tail stays shared until COW;
+ * only suffix references are released. No shared payload is written. */
+int hvx_attn_m1_truncate(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t length);
 
 /** Versioned caller-owned layer payload: live length, scaled flag, six
  * scale arrays and K/V bytes through the final 64-row tile. No pointers or

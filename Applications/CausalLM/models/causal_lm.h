@@ -262,7 +262,8 @@ public:
    * Requires htp.kv_session=true and htp.kv_paged=true. Serialized use only.
    * Session 0 is the current conversation when enabled. New runs on an empty
    * session search published prefixes automatically; continuation takes new
-   * text only. Prefixes are published at completed prompt/request boundaries.
+   * text only. Retained states expose all available full-page prefixes and
+   * their completed endpoints; selection preserves the source state.
    */
   WIN_EXPORT void enableDeviceKVManager(size_t max_sessions = 32,
                                         size_t max_prefixes = 8);
