@@ -277,7 +277,7 @@ stage_qprep_kd(ctx *c, uint32_t i, const int kd) {
   const HVX_Vector vinv = hvx_splat_sf(f32 ? c->io->q_inv[it->h] : 0.0f);
   const HVX_Vector vzp =
     hvx_splat_sf(f32 ? c->io->q_enc[2u * it->h + 1u] + 0.5f : 0.0f);
-  /* K per dim: the dims' fs_kd / fs_k folded into Q's inverse step, so the
+  /** K per dim: the dims' fs_kd / fs_k folded into Q's inverse step, so the
      scores stay s_q fs_k sum(q' k8) and alpha keeps fs_k (setup_head).
      kd is a constant at each call: with 0 the array and the selects fold
      away and the loop is the per-head one, vinv for both halves. */

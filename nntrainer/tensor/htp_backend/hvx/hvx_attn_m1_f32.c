@@ -302,7 +302,7 @@ static void pre_thread(void *arg) {
     if (layer_alloc_raw(p->ctx, (uint32_t)l, 0) == AEE_SUCCESS) {
       p->ctx->unfilled[l] = 1u;
     }
-    /* ponytail: read by session_info after the graph init's reap, which
+    /** ponytail: read by session_info after the graph init's reap, which
        waits for this thread to be idle; a read mid-prefill could tear */
     p->ctx->pre_us +=
       HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);

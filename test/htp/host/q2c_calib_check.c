@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
  * @file   q2c_calib_check.c
+ * @date   3 Nov 2026
  * @brief  The q2 attention calibration's lane workers (nntr_hvx_attn_q.c
  *         q2c_worker, q2c_worker_kd, q2c_worker_kd_q, extracted by
  *         q2c_workers_extract.py) on hvx_emu against a scalar reference,
@@ -11,6 +14,9 @@
  *         the ratio that it replaced, bit for bit. Lanes past the rows (a
  *         prompt shorter than the pool) are run as the pool runs them: n =
  *         min(units, lanes).
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -144,7 +150,7 @@ static int check_case(uint32_t n_kv, uint32_t hd, uint32_t n_hq,
 
 int main(void) {
   int bad = 0;
-  /* Gemma 4's sliding (8 x 256) and full (2 x 512, two Q blocks) shapes;
+  /** Gemma 4's sliding (8 x 256) and full (2 x 512, two Q blocks) shapes;
      rows below, at and past the 8 lanes; a pool of 3 */
   bad += check_case(8u, 256u, 16u, 130u, 130u, 8u);
   bad += check_case(2u, 512u, 16u, 70u, 70u, 8u);

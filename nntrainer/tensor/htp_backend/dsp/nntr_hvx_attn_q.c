@@ -91,7 +91,7 @@ int nntr_hvx_kv_register_q(remote_handle64 handle, uint32 kind, uint32 max_rows,
   if (!s || !kv_handle) {
     return AEE_EBADPARM;
   }
-  /* [C] the caches the background seeds are done with go before this one
+  /** [C] the caches the background seeds are done with go before this one
      comes, so the heap can place it in their room */
   hvx_attn_m1_seed_reap(s->attn_m1, 0);
   hvx_attn_m1_seed_reap(s->attn_m1_b, 0);
@@ -780,7 +780,7 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
   float *qlo = (float *)malloc((size_t)lanes * nq * sizeof(float) * 2u);
   float *s_k = calib, *s_v = calib + nk;
   float *q_enc = s_v + stride, *out_enc = q_enc + 2u * n_head_q;
-  /* kd: fs_kd / fs_k per (KV head, dim), as hexkl_kv_q_set_fixed_scales_kd
+  /** kd: fs_kd / fs_k per (KV head, dim), as hexkl_kv_q_set_fixed_scales_kd
      forms fk_ratio, for the Q pass */
   float *ratio = kd ? (float *)malloc((size_t)stride * sizeof(float)) : NULL;
   float q_inv[64];
@@ -818,7 +818,7 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
       m = vmax[(size_t)l * stride + e] > m ? vmax[(size_t)l * stride + e] : m;
     s_v[e] = hexkl_kv_q_hf_to_f32(m);
   }
-  /* per dim: Q's range is that of q * fs_kd / fs_k, the Q the kernel
+  /** per dim: Q's range is that of q * fs_kd / fs_k, the Q the kernel
      quantizes (stage_qprep): K's scales first, then the Q pass with them
      (q2c_worker_kd_q), whose lanes merge as q2c_worker's */
   if (kd) {

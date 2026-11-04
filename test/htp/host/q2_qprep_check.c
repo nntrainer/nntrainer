@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
  * @file   q2_qprep_check.c
+ * @date   3 Nov 2026
  * @brief  hexkl_attn_q2's stage_qprep_kd (extracted by
  *         q2c_workers_extract.py) on hvx_emu: the f32 Q it quantizes in
  *         VTCM, with K's scale per dim folded in (fk_ratio), against the
@@ -9,6 +12,9 @@
  * inv[d] + (zp + 0.5), clamped, truncated). The u16 path moves bytes only, so
  * the two runs' tiles must be equal byte for byte, whatever the tile layout.
  * Rows past n_rows and a head past the first KV head's group are covered.
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -127,7 +133,7 @@ static int check_case(uint32_t hd, uint32_t n_kv, uint32_t n_hq, uint32_t h,
 
 int main(void) {
   int bad = 0;
-  /* Gemma 4's sliding (8 x 256) and full (2 x 512) heads, a short block,
+  /** Gemma 4's sliding (8 x 256) and full (2 x 512) heads, a short block,
      a head of the second group, a small head (hd 128) */
   bad += check_case(256u, 8u, 16u, 0u, 64u);
   bad += check_case(256u, 8u, 16u, 5u, 17u);
