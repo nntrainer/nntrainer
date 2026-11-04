@@ -704,7 +704,10 @@ done
 "${ADB[@]}" shell "cat > $DEVICE_DIR/run_test.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$DEVICE_DIR:\$LD_LIBRARY_PATH
-export ADSP_LIBRARY_PATH=$DEVICE_DIR:\$ADSP_LIBRARY_PATH
+# the HTP models need native_lib_dir, and ADSP_LIBRARY_PATH exactly equal to
+# it: the API refuses any other value
+export QUICKAI_NATIVE_LIB_DIR=$DEVICE_DIR
+export ADSP_LIBRARY_PATH=$DEVICE_DIR
 export NNTR_NUM_THREADS=$NNTR_THREADS
 cd $DEVICE_DIR
 ./quick_dot_ai_test \"\$@\"
