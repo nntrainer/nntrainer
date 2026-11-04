@@ -39,7 +39,8 @@ public:
   bool ownsCache() const { return htp_owns_cache_; }
   void markResident() { htp_owns_cache_ = true; }
   void beginHtpPrompt();
-  std::shared_ptr<const HtpPrefixCalibration> capturePrefixCalibration() const;
+  std::shared_ptr<const HtpPrefixCalibration>
+  capturePrefixCalibration(unsigned position = 0) const;
   void restorePrefixCalibration(const HtpPrefixCalibration &state);
   bool htpDecodeAttention(
     Tensor &query, Tensor &key, Tensor &value, Tensor &output, Tensor &ck,
@@ -78,6 +79,9 @@ public:
                                const nntrainer::Tensor *sink);
 
 private:
+  bool prefix_dispatching_ = false;
+  std::map<unsigned, std::shared_ptr<const HtpPrefixCalibration>>
+    prefix_calibrations_;
   AttentionConfig &config_;
   std::vector<int> q_cache_handles;
   std::vector<unsigned int> q_cache_synced;

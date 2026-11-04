@@ -226,7 +226,7 @@ public:
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
   WIN_EXPORT std::shared_ptr<const HtpPrefixCalibration>
-  capturePrefixCalibration() const;
+  capturePrefixCalibration(unsigned position = 0) const;
   WIN_EXPORT void restorePrefixCalibration(const HtpPrefixCalibration &state);
 
 private:

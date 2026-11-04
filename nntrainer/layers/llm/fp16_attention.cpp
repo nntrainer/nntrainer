@@ -1808,8 +1808,8 @@ void Fp16Attention::registerQuantizedCache(RunLayerContext &context) {
 }
 void Fp16Attention::beginHtpPrompt() { state_->beginHtpPrompt(); }
 std::shared_ptr<const HtpPrefixCalibration>
-Fp16Attention::capturePrefixCalibration() const {
-  return state_->capturePrefixCalibration();
+Fp16Attention::capturePrefixCalibration(unsigned position) const {
+  return state_->capturePrefixCalibration(position);
 }
 void Fp16Attention::restorePrefixCalibration(
   const HtpPrefixCalibration &state) {

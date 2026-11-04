@@ -89,6 +89,11 @@ int main() {
     assert(m.reuse(source) == 64 && selected == 64);
     source.resize(64);
     assert(m.reuse(source) == 0);
+    m.setMinimumSuffix(3);
+    source.resize(130, 7);
+    assert(m.reuse(source) == 64);
+    source.resize(131, 7);
+    assert(m.reuse(source) == 128);
   }
   assert(live.empty());
   {

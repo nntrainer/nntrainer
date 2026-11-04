@@ -62,9 +62,7 @@ int main(int argc, char **argv) {
     auto source_ids = model->getTokenizer()->Encode(source, true);
     require(source_ids.size() == fixture.value("source_tokens", 1024u),
             "Source token length differs from fixture");
-    const unsigned expected_hit = common / 64u * 64u;
-    require(expected_hit > 0 && common < source_ids.size(),
-            "Invalid common prefix length");
+    require(common < source_ids.size(), "Invalid common prefix length");
     std::vector<std::string> branches;
     for (const auto &item : fixture["suffixes"]) {
       const auto suffix =
@@ -113,6 +111,7 @@ int main(int argc, char **argv) {
         {"output", c->getOutput()},
         {"position", c->getKvLen()},
         {"prefill_tokens", m.prefill_tokens},
+        {"prefill_ms", m.prefill_duration_ms},
         {"request_to_first_delta_ms",
          std::chrono::duration<double, std::milli>(observer.first - start)
            .count()},
@@ -151,10 +150,15 @@ int main(int argc, char **argv) {
       const auto session = c->createDeviceKVSession();
       c->selectDeviceKVSession(session);
       const auto before = c->deviceKVManagerStats();
+      const auto input_tokens =
+        model->getTokenizer()->Encode(branches[i], true).size();
+      unsigned expected_hit = common / 256u * 256u;
+      while (expected_hit && input_tokens - expected_hit < 3u)
+        expected_hit -= 256u;
       auto result = run(branches[i], false);
       const auto after = c->deviceKVManagerStats();
       result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
-      require(after.hits == before.hits + 1 &&
+      require(after.hits == before.hits + (expected_hit ? 1u : 0u) &&
                 result["reused_tokens"] == expected_hit,
               "Partial page prefix was not reused");
       const auto suffix_tokens =

@@ -129,6 +129,7 @@ struct Backend : nntrainer::HtpStaging<HtpRpcBuffer, StagingTransfer> {
   enum { AEE_SUCCESS = 0 };
   // clang-format off
 #include "attn_q.inc"
+#include "collect_attention.inc"
 #include "attn_f16.inc"
 #include "take_id.inc"
   // clang-format on
@@ -689,6 +690,54 @@ static void direct_writer_checks() {
     ++tests;
   }
 }
+static void encoded_attention_slice_checks() {
+  Backend b;
+  constexpr unsigned total = 513, width = 32;
+  std::vector<float> output(total * width, -1.0f);
+  std::vector<uint16_t> expected(total * width);
+  unsigned row = 0;
+  for (unsigned n : {256u, 256u, 1u}) {
+    auto *u = reinterpret_cast<uint16_t *>(
+      b.stage(b.attn_out_pool_, size_t(n) * width * 2).data());
+    for (unsigned i = 0; i < n * width; ++i)
+      expected[size_t(row) * width + i] = u[i] =
+        uint16_t(101 + row * width + i);
+    b.attn_out16_.host = output.data() + size_t(row) * width;
+    b.attn_out16_.ion = u;
+    b.attn_out16_.rows = n;
+    b.attn_out16_.width = width;
+    b.attn_out16_.head_dim = 16;
+    b.attn_out16_.enc = {0.125f + float(row), 32768.0f, 0.25f, 32768.0f};
+    check(b.collect_attention_slice(output.data(), total, row, n, width),
+          "collect encoded attention slice");
+    row += n;
+  }
+  check(b.attn_out16_.host == output.data() && b.attn_out16_.rows == total,
+        "encoded attention slice owner/shape");
+  check(!std::memcmp(b.attn_out16_.ion, expected.data(), expected.size() * 2),
+        "encoded attention was overwritten by a later slice");
+  check(b.attn_out16_.slices.size() == 3 &&
+          b.attn_out16_.slices[0].enc[0] == 0.125f &&
+          b.attn_out16_.slices[1].enc[0] == 256.125f,
+        "encoded attention lost per-slice scales");
+  std::vector<float> host(8192, -123.0f), ion(8192);
+  for (unsigned i = 0; i < ion.size(); ++i)
+    ion[i] = float(i % 119);
+  Backend::sampledCopy(host.data(), ion.data(), ion.size() * 4);
+  b.noteIonAlias(host.data(), ion.data(), ion.size() * 4, false);
+  check(b.ionAlias(host.data() + 256, 512 * 4, nullptr, true) ==
+          ion.data() + 256,
+        "partial Q must use validated parent ION, not stale host windows");
+  host[0] = -999.0f;
+  check(!b.ionAlias(host.data() + 256, 512 * 4, nullptr, true),
+        "partial Q accepted a stale parent generation");
+  static_cast<nntrainer::HtpStaging<HtpRpcBuffer, StagingTransfer> &>(b)
+    .releasePrefillStaging();
+  check(!b.attn_out16_.host && b.attn_slices_.empty(),
+        "encoded attention retention after release");
+  tests += 7;
+}
+
 static void quant_attention_staging_checks() {
   for (unsigned rows : {1u, 127u, 128u, 129u, 1024u}) {
     Backend b;
@@ -876,6 +925,7 @@ int main() {
   sync_ion_checks();
   direct_writer_checks();
   quant_attention_staging_checks();
+  encoded_attention_slice_checks();
 #if defined(__linux__)
   remapped_ion_checks();
 #endif

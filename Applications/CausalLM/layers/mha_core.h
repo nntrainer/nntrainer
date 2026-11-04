@@ -459,10 +459,10 @@ public:
       fp16_attention_->beginHtpPrompt();
   }
   std::shared_ptr<const nntrainer::HtpPrefixCalibration>
-  capturePrefixCalibration() const {
+  capturePrefixCalibration(unsigned position = 0) const {
     if (!fp16_attention_)
       throw std::logic_error("HTP prefix requires FP16 prefill attention");
-    return fp16_attention_->capturePrefixCalibration();
+    return fp16_attention_->capturePrefixCalibration(position);
   }
   void restorePrefixCalibration(const nntrainer::HtpPrefixCalibration &state) {
     if (!fp16_attention_)

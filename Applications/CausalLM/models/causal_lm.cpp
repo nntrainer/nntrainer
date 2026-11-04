@@ -1220,6 +1220,9 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
         positions.push_back(entry.first);
     return positions;
   });
+  // skip_prefill reserves the last row for decode; the remaining prefill
+  // must enter the same multi-row graph as independent full recomputation.
+  device_kv_manager_->setMinimumSuffix(3);
 #else
   throw std::logic_error("HTP backend is unavailable");
 #endif
@@ -1679,31 +1682,28 @@ void CausalLM::captureDevicePrefill(unsigned position) {
     return;
   if (!device_prefill_history_)
     device_prefill_history_ = std::make_shared<DevicePrefillHistory>();
-  std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
-    calibration;
-  model->forEachLayer(
-    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
-      auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
-      auto *mha =
-        node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
-      if (mha)
-        calibration.push_back(mha->capturePrefixCalibration());
-    },
-    nullptr);
-  if (calibration.size() != kv_cache.getNumLayers())
-    throw std::logic_error("Incomplete DSP prefill calibration");
   unsigned first = device_prefill_history_->empty()
-                     ? 64u
-                     : device_prefill_history_->rbegin()->first + 64u;
-  first = std::max(first, (kv_cache.prefixMinPosition() + 63u) / 64u * 64u);
-  for (unsigned p = first; p <= position; p += 64u) {
+                     ? 256u
+                     : device_prefill_history_->rbegin()->first + 256u;
+  first = std::max(first, (kv_cache.prefixMinPosition() + 255u) / 256u * 256u);
+  for (unsigned p = first; p <= position; p += 256u) {
     DevicePrefillFrame frame;
+    model->forEachLayer(
+      [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+        auto *mha =
+          node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
+        if (mha)
+          frame.calibration.push_back(mha->capturePrefixCalibration(p));
+      },
+      nullptr);
+    if (frame.calibration.size() != kv_cache.getNumLayers())
+      throw std::logic_error("Incomplete Q2 prefix calibration");
     const auto *previous =
       device_prefill_history_->empty()
         ? nullptr
         : device_prefill_history_->rbegin()->second.kv.get();
     frame.kv = kv_cache.capturePrefix(p, previous);
-    frame.calibration = calibration;
     device_prefill_history_->emplace(p, std::move(frame));
   }
 }

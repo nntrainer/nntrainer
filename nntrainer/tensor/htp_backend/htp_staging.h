@@ -395,14 +395,17 @@ public:
   }
   /** @brief The staging bytes that hold [host, host + bytes), or null. */
   const void *ionAlias(const void *host, size_t bytes,
-                       bool *host_complete = nullptr) const {
+                       bool *host_complete = nullptr,
+                       bool validate_parent = false) const {
     const char *h = static_cast<const char *>(host);
     for (const IonAlias &a : ion_alias_) {
       const char *b = static_cast<const char *>(a.host);
       if (!b || h < b || h + bytes > b + a.bytes)
         continue;
       const void *ion = static_cast<const char *>(a.ion) + (h - b);
-      if (sampledSame(host, ion, bytes)) {
+      if (sampledSame(validate_parent ? a.host : host,
+                      validate_parent ? a.ion : ion,
+                      validate_parent ? a.bytes : bytes)) {
         if (host_complete)
           *host_complete = a.host_complete;
         return ion;
@@ -418,19 +421,27 @@ public:
    *  o-proj. a CPU consumer of that f32 tensor, or another
    *  attention call before the o-proj, is not covered -- the builder sets
    *  mha_core's attn_out_u16 only for the folded o-proj on this engine. */
+  struct AttnSlice {
+    unsigned row = 0, rows = 0;
+    std::vector<float> enc;
+  };
   struct AttnOut16 {
     const float *host = nullptr;
     const uint16_t *ion = nullptr;
     unsigned int rows = 0, width = 0, head_dim = 0;
     std::vector<float> enc;
+    std::vector<AttnSlice> slices;
   } attn_out16_;
+  std::vector<AttnSlice> attn_slices_;
   htp_router_handoff router_handoff_{};
   StagingPool act_pool_;
   StagingPool out_pool_;
-  StagingPool rope_pool_;     /**< the fused projection call's RoPE rows */
-  StagingPool x2_pool_;       /**< the MoE call's post-FFN second addend */
-  StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
-  StagingPool attn_out_pool_; /**< and its f32 output */
+  StagingPool rope_pool_;        /**< the fused projection call's RoPE rows */
+  StagingPool x2_pool_;          /**< the MoE call's post-FFN second addend */
+  StagingPool attn_q_pool_;      /**< the row-blocked attention's f32 Q */
+  StagingPool attn_out_pool_;    /**< and its f32 output */
+  StagingPool attn_slices_pool_; /**< encoded Q2 slices before folded O */
+  StagingPool attn_k_pool_, attn_v_pool_; /**< live append spans for RPC */
   std::unique_ptr<Buffer> act_ah_buf_;
   std::vector<float> act_scale_scratch_;
   std::vector<int32_t> act_zp_scratch_;
@@ -442,8 +453,9 @@ public:
     htp_router_handoff_invalidate(&router_handoff_);
     constexpr size_t keep_bytes = size_t(64) << 10;
     size_t freed = 0;
-    for (StagingPool *pool : {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_,
-                              &attn_q_pool_, &attn_out_pool_}) {
+    for (StagingPool *pool :
+         {&act_pool_, &out_pool_, &rope_pool_, &x2_pool_, &attn_q_pool_,
+          &attn_out_pool_, &attn_slices_pool_, &attn_k_pool_, &attn_v_pool_}) {
       for (auto it = pool->by_class.upper_bound(keep_bytes);
            it != pool->by_class.end();) {
         freed += it->second ? it->second->size() : 0;
@@ -458,6 +470,7 @@ public:
     lost_ = {};
     lost_next_ = 0;
     attn_out16_ = {};
+    attn_slices_.clear();
     if (act_ah_buf_ && act_ah_buf_->size() > keep_bytes) {
       freed += act_ah_buf_->size();
       act_ah_buf_.reset();

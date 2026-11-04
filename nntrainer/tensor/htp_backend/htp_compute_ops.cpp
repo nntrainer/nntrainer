@@ -715,10 +715,15 @@ public:
       for (unsigned r = 0; r < a.rows; ++r)
         for (unsigned h = 0; h < a.width / a.head_dim; ++h) {
           const size_t base = static_cast<size_t>(r) * a.width + h * a.head_dim;
-          for (unsigned i = 0; i < a.head_dim; ++i)
+          for (unsigned i = 0; i < a.head_dim; ++i) {
+            const auto *enc = &a.enc;
+            for (const auto &page : a.slices)
+              if (r >= page.row && r < page.row + page.rows)
+                enc = &page.enc;
             dst[base + i] =
-              (static_cast<float>(a.ion[base + i]) - a.enc[2 * h + 1]) *
-              a.enc[2 * h];
+              (static_cast<float>(a.ion[base + i]) - (*enc)[2 * h + 1]) *
+              (*enc)[2 * h];
+          }
         }
     }
     staging_.releasePrefillStaging();
@@ -1269,7 +1274,8 @@ public:
   // norms, adds the residual and scales, so the FC output never comes back.
   const void *host_view(const void *host, size_t bytes) override {
     std::lock_guard<std::mutex> lock(invoke_mutex_);
-    const void *ion = staging_.ionAlias(host, bytes);
+    const void *ion = staging_.ionAlias(host, bytes, nullptr,
+                                        htpRuntimeConfig().htp.kv_prefix_cache);
     if (ion)
       return ion;
     const bool prefill_views = htpRuntimeConfig().htp.lfm2_prefill_views;
@@ -1327,8 +1333,11 @@ public:
       const unsigned int hd = staging_.attn_out16_.head_dim;
       for (unsigned int r = 0; r < M; ++r)
         for (unsigned int h = 0; h < K / hd; ++h) {
-          const float sc = staging_.attn_out16_.enc[2 * h],
-                      zp = staging_.attn_out16_.enc[2 * h + 1];
+          const auto *enc = &staging_.attn_out16_.enc;
+          for (const auto &page : staging_.attn_out16_.slices)
+            if (r >= page.row && r < page.row + page.rows)
+              enc = &page.enc;
+          const float sc = (*enc)[2 * h], zp = (*enc)[2 * h + 1];
           const uint16_t *u =
             staging_.attn_out16_.ion + static_cast<size_t>(r) * K + h * hd;
           float *d = dst + static_cast<size_t>(r) * K + h * hd;
@@ -9659,8 +9668,7 @@ public:
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > (htpRuntimeConfig().htp.kv_prefix_cache ? 512u : 256u) ||
-        cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
+        head_dim > 256 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
         q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
         (append_rows != 0 &&
          (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
@@ -9742,26 +9750,10 @@ public:
       out_rpc = reinterpret_cast<float *>(
         staging_.stage(staging_.attn_out_pool_, q_bytes).data());
     }
-    int err;
-    if (htpRuntimeConfig().htp.kv_prefix_cache) {
-      // Per-row K/V quantizers plus a fixed KV reduction tile make a page's
-      // prefill result independent of a later suffix and total query length.
-      // Keep the existing wide projection/FFN calls; only attention is tiled.
-      err = append_rows ? nntr_hvx_kv_append_q(h, static_cast<uint32_t>(handle),
-                                               append_row0, k_rows, rows_len,
-                                               v_rows, rows_len)
-                        : AEE_SUCCESS;
-      if (err == AEE_SUCCESS)
-        err = nntr_hvx_attn_q_prefill(
-          h, static_cast<uint32_t>(handle), n_q, cache_from, cache_to, n_head_q,
-          window, 64u / (n_head_q / n_head_kv), 256u, softcap, q_rpc, q_len,
-          sinks, sinks_len, out_rpc, q_len, stats, 20);
-    } else {
-      err = nntr_hvx_attn_q_step(
-        h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-        rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
-        q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
-    }
+    const int err = nntr_hvx_attn_q_step(
+      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+      rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
+      q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
     if (staged && err == AEE_SUCCESS) {
       if (ion_handoff)
         staging_.copyOutOf(staging_.attn_out_pool_, out, q_bytes, true);
@@ -9876,6 +9868,44 @@ public:
     return true;
   }
 
+  bool collect_attention_slice(float *output, unsigned full_rows, unsigned row,
+                               unsigned rows, unsigned width) override {
+    std::lock_guard<std::mutex> lock(invoke_mutex_);
+    auto &a = staging_.attn_out16_;
+    if (!output || !rows || row > full_rows || rows > full_rows - row ||
+        a.host != output + size_t(row) * width || a.rows != rows ||
+        a.width != width || rows != std::min(256u, full_rows - row))
+      return false;
+    if (row &&
+        (staging_.attn_slices_.empty() ||
+         staging_.attn_slices_.back().row + staging_.attn_slices_.back().rows !=
+           row))
+      return false;
+    htp_router_handoff_invalidate(&staging_.router_handoff_);
+    if (!row)
+      staging_.attn_slices_.clear();
+    auto *dst = reinterpret_cast<uint16_t *>(
+      staging_
+        .stage(staging_.attn_slices_pool_,
+               size_t(full_rows) * width * sizeof(uint16_t))
+        .data());
+    stagedMemcpy(dst + size_t(row) * width, a.ion,
+                 size_t(rows) * width * sizeof(uint16_t));
+    staging_.attn_slices_.push_back({row, rows, a.enc});
+    if (row + rows == full_rows) {
+      a.host = output;
+      a.ion = dst;
+      a.rows = full_rows;
+      a.slices = std::move(staging_.attn_slices_);
+      a.enc.clear();
+      for (const auto &page : a.slices)
+        a.enc.insert(a.enc.end(), page.enc.begin(), page.enc.end());
+    } else {
+      a = {};
+    }
+    return true;
+  }
+
   bool sdpa_q2_kvcache_f32(int handle, unsigned int append_row0,
                            unsigned int append_rows, unsigned int kv_stride,
                            const uint16_t *k_rows, const uint16_t *v_rows,
@@ -9907,12 +9937,13 @@ public:
     // buffer when it still holds it; the DSP's pool quantizes), the u16
     // context left in its buffer for the o-proj: no ARM pass either way.
     const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
-    const float *q_ion =
-      static_cast<const float *>(staging_.ionAlias(q, q_bytes));
-    if (!q_ion) {
+    const float *q_ion = static_cast<const float *>(staging_.ionAlias(
+      q, q_bytes, nullptr, htpRuntimeConfig().htp.kv_prefix_cache));
+    if (!q_ion || htpRuntimeConfig().htp.kv_prefix_cache) {
+      const float *source = q_ion ? q_ion : q;
       float *b = reinterpret_cast<float *>(
         staging_.stage(staging_.attn_q_pool_, q_bytes).data());
-      stagedMemcpy(b, q, q_bytes);
+      stagedMemcpy(b, source, q_bytes);
       q_ion = b;
     }
     const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
@@ -9926,6 +9957,19 @@ public:
                 "an o-proj on the accelerator (its f32 tensor was not "
                 "written); check attn_out_u16 against the o-proj's engine");
       }
+    }
+    // Avoid cache maintenance over a whole over-reserved FP16 slab on
+    // every causal sub-call. The payload and the Q2 kernel are unchanged.
+    if (htpRuntimeConfig().htp.kv_prefix_cache && rows_len) {
+      const size_t bytes = size_t(rows_len) * sizeof(uint16_t);
+      auto *k_rpc = reinterpret_cast<uint16_t *>(
+        staging_.stage(staging_.attn_k_pool_, bytes).data());
+      auto *v_rpc = reinterpret_cast<uint16_t *>(
+        staging_.stage(staging_.attn_v_pool_, bytes).data());
+      stagedMemcpy(k_rpc, k_rows, bytes);
+      stagedMemcpy(v_rpc, v_rows, bytes);
+      k_rows = k_rpc;
+      v_rows = v_rpc;
     }
     const int err = nntr_hvx_attn_q2_step_fq(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
@@ -9988,18 +10032,32 @@ public:
     uint32_t stats[12] = {0};
     const int64_t t0 = now_us();
     const size_t q_bytes = static_cast<size_t>(q_len) * sizeof(float);
-    const float *q_ion =
-      static_cast<const float *>(staging_.ionAlias(q, q_bytes));
-    if (!q_ion) {
+    const float *q_ion = static_cast<const float *>(staging_.ionAlias(
+      q, q_bytes, nullptr, htpRuntimeConfig().htp.kv_prefix_cache));
+    if (!q_ion || htpRuntimeConfig().htp.kv_prefix_cache) {
+      const float *source = q_ion ? q_ion : q;
       float *b = reinterpret_cast<float *>(
         staging_.stage(staging_.attn_q_pool_, q_bytes).data());
-      stagedMemcpy(b, q, q_bytes);
+      stagedMemcpy(b, source, q_bytes);
       q_ion = b;
     }
     const size_t out_bytes = static_cast<size_t>(q_len) * sizeof(uint16_t);
     uint16_t *out_ion = reinterpret_cast<uint16_t *>(
       staging_.stage(staging_.attn_out_pool_, out_bytes).data());
     std::vector<float> calib(n_head_kv + kv_stride + 4 * n_head_q);
+    // Avoid cache maintenance over a whole over-reserved FP16 slab on
+    // every causal sub-call. The payload and the Q2 kernel are unchanged.
+    if (htpRuntimeConfig().htp.kv_prefix_cache && rows_len) {
+      const size_t bytes = size_t(rows_len) * sizeof(uint16_t);
+      auto *k_rpc = reinterpret_cast<uint16_t *>(
+        staging_.stage(staging_.attn_k_pool_, bytes).data());
+      auto *v_rpc = reinterpret_cast<uint16_t *>(
+        staging_.stage(staging_.attn_v_pool_, bytes).data());
+      stagedMemcpy(k_rpc, k_rows, bytes);
+      stagedMemcpy(v_rpc, v_rows, bytes);
+      k_rows = k_rpc;
+      v_rows = v_rpc;
+    }
     const int err = nntr_hvx_attn_q2_step_fqc(
       h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
       rows_len, n_q, cache_from, cache_to, n_head_q, window, q_ion, q_len,

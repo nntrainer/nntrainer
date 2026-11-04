@@ -68,6 +68,12 @@ public:
   void setPrefixCapture(Capture capture) {
     prefix_capture_ = std::move(capture);
   }
+  /** Leave enough input rows for the backend's block-prefill entry. */
+  void setMinimumSuffix(size_t rows) {
+    if (!rows)
+      throw std::invalid_argument("A prefix hit must leave input rows");
+    minimum_suffix_ = rows;
+  }
   ~DeviceKVManager() {
     for (const auto &s : sessions_)
       releaseNoThrow(s.second.handle);
@@ -158,7 +164,7 @@ public:
                       tokens.begin() + offset))
         break;
       offset += node->edge.size();
-      if (node->terminal && offset < tokens.size()) {
+      if (node->terminal && minimum_suffix_ <= tokens.size() - offset) {
         best = node->terminal;
         best_count = offset;
       }
@@ -326,6 +332,7 @@ private:
   PrefixMin prefix_min_;
   PrefixLengths prefix_lengths_;
   size_t max_sessions_, max_prefixes_;
+  size_t minimum_suffix_ = 1;
   uint32_t next_session_ = 1, active_ = 0;
   uint64_t clock_ = 0;
   std::map<uint32_t, Session> sessions_;
