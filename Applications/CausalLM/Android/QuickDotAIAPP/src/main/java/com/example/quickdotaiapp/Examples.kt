@@ -30,6 +30,7 @@ class Examples {
             ModelIds.FUNCTION_GEMMA to "function_gemma",
             ModelIds.GEMMA4_CPU to "gemma4_cpu",
             ModelIds.GEMMA4_26B_A4B_HTP to "gemma4-26b-a4b-htp-w4a32",
+            "gemma4-26b-a4b-htp-2bit-4bit" to "gemma4-26b-a4b-2bit-4bit",
             ModelIds.LFM2_24BA2B_HTP to "lfm2-24ba2b-htp-w4a32",
             ModelIds.GEMMA4_E2B_QNN to "gemma-4-e2b-qnn",
             ModelIds.VJEPA_QNN to "vjepa2-qnn",
@@ -37,7 +38,8 @@ class Examples {
 
         /** The HTP packs: 1,280 positions and a prompt whose tail is truncated silently when it does
          *  not fit (nntrainer #4474), so their chat sends only the newest user turn, as the View sample did. */
-        val oneShotIds: Set<String> = setOf(ModelIds.GEMMA4_26B_A4B_HTP, ModelIds.LFM2_24BA2B_HTP)
+        val oneShotIds: Set<String> = setOf(ModelIds.GEMMA4_26B_A4B_HTP,
+            "gemma4-26b-a4b-htp-2bit-4bit", ModelIds.LFM2_24BA2B_HTP)
 
         fun isOneShot(descriptor: ModelDescriptor?): Boolean = descriptor?.id in oneShotIds
 

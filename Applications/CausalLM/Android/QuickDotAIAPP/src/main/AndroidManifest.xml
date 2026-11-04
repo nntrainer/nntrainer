@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      QuickDotAIAPP runs the QuickDotAI AAR in-process: no remote service,
-      no REST server, no sockets. We therefore do not need INTERNET or
+      Native inference runs in a private worker process; there is no REST
+      server or socket. We therefore do not need INTERNET or
       FOREGROUND_SERVICE permissions.
 
       The <uses-native-library> entries required by LiteRT-LM's GPU backend
@@ -24,6 +24,10 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.QuickDotAIAPP">
+        <service
+            android:name=".SampleNativeWorkerService"
+            android:exported="false"
+            android:process=":quickai_native" />
         <activity
             android:name=".MainActivity"
             android:exported="true">

@@ -28,6 +28,7 @@ data class ModelSelection(
     val backend: BackendType = BackendType.CPU,
     val sdEnabled: Boolean = false,
     val basePath: String = DEFAULT_BASE_PATH,
+    val variantId: String? = null,
 )
 
 sealed interface LoadState {
@@ -108,9 +109,20 @@ data class UiState(
     val draftRevision: Int = 0,
     val rawRevision: Int = 0,
 ) {
+    val variants: List<ModelDescriptor>
+        get() {
+            val sdIds = catalog.mapNotNull { it.sdVariantId }.toSet()
+            return catalog.filter {
+                it.family == selection.family && it.runtime == selection.runtime &&
+                    selection.backend in it.backends && it.id !in sdIds
+            }
+        }
     val descriptor: ModelDescriptor?
-        get() = catalog.firstOrNull {
-            it.family == selection.family && it.runtime == selection.runtime && selection.backend in it.backends
+        get() = variants.firstOrNull { it.id == selection.variantId } ?: variants.firstOrNull()
+    val effectiveDescriptor: ModelDescriptor?
+        get() = descriptor?.let { d ->
+            if (selection.sdEnabled && d.sdVariantId != null) catalog.firstOrNull { it.id == d.sdVariantId }
+            else d
         }
     val families: List<String> get() = catalog.map { it.family }.distinct()
     fun runtimesFor(family: String): List<RuntimeKind> =

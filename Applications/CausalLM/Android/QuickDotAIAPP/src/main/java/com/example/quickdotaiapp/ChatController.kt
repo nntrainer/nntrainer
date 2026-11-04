@@ -72,7 +72,7 @@ class ChatController(
                 copy(
                     catalog = catalog,
                     selection = initial?.let {
-                        selection.copy(family = it.family, runtime = it.runtime, backend = it.backends.first())
+                        selection.copy(family = it.family, runtime = it.runtime, backend = it.backends.first(), variantId = it.id)
                     } ?: selection,
                 )
             }
@@ -86,17 +86,20 @@ class ChatController(
         val s = state.value
         val runtime = s.runtimesFor(family).firstOrNull() ?: s.selection.runtime
         val backend = s.backendsFor(family, runtime).firstOrNull() ?: s.selection.backend
-        applySelection(s.selection.copy(family = family, runtime = runtime, backend = backend, sdEnabled = false))
+        applySelection(s.selection.copy(family = family, runtime = runtime, backend = backend, sdEnabled = false, variantId = null))
     }
 
     fun selectRuntime(runtime: RuntimeKind) {
         val s = state.value
         val backend = s.backendsFor(s.selection.family, runtime).firstOrNull() ?: s.selection.backend
-        applySelection(s.selection.copy(runtime = runtime, backend = backend, sdEnabled = false))
+        applySelection(s.selection.copy(runtime = runtime, backend = backend, sdEnabled = false, variantId = null))
     }
 
     fun selectBackend(backend: BackendType) =
-        applySelection(state.value.selection.copy(backend = backend, sdEnabled = false))
+        applySelection(state.value.selection.copy(backend = backend, sdEnabled = false, variantId = null))
+
+    fun selectVariant(id: String) =
+        applySelection(state.value.selection.copy(variantId = id, sdEnabled = false))
 
     fun setSdEnabled(enabled: Boolean) = update { copy(selection = selection.copy(sdEnabled = enabled)) }
     fun setBasePath(path: String) = update { copy(selection = selection.copy(basePath = path)) }
@@ -141,13 +144,12 @@ class ChatController(
             val e = engine ?: run { setStatus("Nothing to unload."); return@launch }
             if (state.value.streaming) { cancelRequested = true; e.cancel(); e.chatCancel() }
             setStatus("Unloading…")
-            withContext(engineDispatcher) {
+            val failure = withContext(engineDispatcher) {
                 runCatching { if (e.chatSessionId != null) e.closeChatSession() }
                 runCatching { e.unload() }
-                runCatching { e.close() }
-                engine = null
+                runCatching { e.close() }.exceptionOrNull().also { if (it == null) engine = null }
             }
-            update { copy(load = LoadState.Idle, status = "Unloaded.") }
+            update { copy(load = LoadState.Idle, status = failure?.let { "Unload failed: ${it.message}" } ?: "Unloaded.") }
         }
     }
 
@@ -161,12 +163,11 @@ class ChatController(
 
     internal fun buildRequest(): LoadModelRequest {
         val s = state.value
-        val d = s.descriptor
+        val d = s.effectiveDescriptor
         val base = s.selection.basePath.trim().ifEmpty { DEFAULT_BASE_PATH }
-        val id = if (s.selection.sdEnabled) (d?.sdVariantId ?: d?.id) else d?.id
         return LoadModelRequest(
             backend = s.selection.backend,
-            modelId = id ?: s.selection.family,
+            modelId = d?.id ?: s.selection.family,
             quantization = QuantizationType.W4A32,
             modelPath = d?.let { Examples.modelPath(it, base) },
             visionBackend = d?.takeIf { Capability.MULTIMODAL in it.capabilities }?.let { s.selection.backend },
@@ -178,7 +179,7 @@ class ChatController(
 
     /** Returns the engine for [req], loading or replacing as needed; null and a status on failure. */
     internal suspend fun loadInternal(req: LoadModelRequest, force: Boolean): QuickDotAI? {
-        val d = state.value.descriptor ?: run { setStatus("Load failed: no model selected"); return null }
+        val d = state.value.effectiveDescriptor ?: run { setStatus("Load failed: selected model variant unavailable"); return null }
         val current = engine
         if (current != null && !force && state.value.loadedRequest == req) return current
         val required = Examples.requiredPath(d, req.modelBasePath ?: DEFAULT_BASE_PATH)
@@ -195,7 +196,11 @@ class ChatController(
         }
         update { copy(load = LoadState.Loading(req.modelKey), status = "Loading ${req.modelKey}…") }
         return withContext(engineDispatcher) {
-            current?.let { runCatching { it.close() } }
+            val closeFailure = current?.let { runCatching { it.close() }.exceptionOrNull() }
+            if (closeFailure != null) {
+                update { copy(load = LoadState.Idle, status = "Unload failed: ${closeFailure.message}") }
+                return@withContext null
+            }
             engine = null
             val e = engineFactory(d, req.modelBasePath ?: DEFAULT_BASE_PATH)
             when (val r = e.load(req)) {
@@ -343,7 +348,7 @@ class ChatController(
         scope.launch {
             // A failed load returns here with the draft and images untouched.
             val e = loadInternal(buildRequest(), force = false) ?: return@launch
-            val d = state.value.descriptor ?: return@launch
+            val d = state.value.effectiveDescriptor ?: return@launch
             onStarted()
             val assistantId = nextId()
             cancelRequested = false
