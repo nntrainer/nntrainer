@@ -964,7 +964,7 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
                  [](const Var_Grad *vg) { return vg->getDim(); });
 
   /** refinalize the layer and get the final context */
-  auto init_context = lnode->refinalize(input_dims);
+  auto init_context = lnode->refinalize(input_dims, exec_mode);
   const auto &ct_engine = nntrainer::Engine::Global();
 
   /**

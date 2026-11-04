@@ -499,6 +499,19 @@ if get_option('enable-test')
 
   test('unittest_kv_cache_manager', unittest_kv_cache_manager,
     args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_cache_manager'),
+    env: ['NNTR_ENGINE=cpu', 'NNTR_CPU_KV_LEGACY=0'],
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # Reuse common facade fixtures against the legacy allocation path too.
+  # Core-only transaction tests remain in the default CPU-core invocation.
+  test('unittest_kv_cache_manager_legacy', unittest_kv_cache_manager,
+    args: [
+      '--gtest_filter=-*.cpu_*:KVCacheManagerCpu.*:*.active_step*',
+      '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_cache_manager_legacy')
+    ],
+    env: ['NNTR_ENGINE=cpu', 'NNTR_CPU_KV_LEGACY=1'],
     timeout: 60,
     suite: 'unittests'
   )
