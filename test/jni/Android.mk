@@ -471,6 +471,27 @@ include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
+LOCAL_MODULE := unittest_nntrainer_manager_lifespan
+LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DENABLE_FP16=1
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS        := -llog -landroid
+
+LOCAL_SRC_FILES := \
+    ../unittest/unittest_nntrainer_manager_lifespan.cpp
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest_main test_util
+
+ifeq ($(MESON_ENABLE_OPENCL), 1)
+LOCAL_SHARED_LIBRARIES += opencl
+endif
+
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+
 LOCAL_MODULE := unittest_compiler
 LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/compiler -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
@@ -584,6 +605,7 @@ LOCAL_SRC_FILES := \
 	 ../unittest/layers/layers_standalone_common_tests.cpp \
 	 ../unittest/layers/layers_golden_tests.cpp \
 	 ../unittest/layers/unittest_layer_node.cpp \
+	 ../unittest/layers/unittest_plugged_layer.cpp \
 	 ../unittest/layers/unittest_layers.cpp \
 	 ../unittest/layers/unittest_layers_impl.cpp \
 	 ../unittest/layers/unittest_layers_input.cpp \

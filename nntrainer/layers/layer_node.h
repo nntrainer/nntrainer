@@ -422,6 +422,25 @@ public:
   bool supportBackwarding() const { return getLayer()->supportBackwarding(); }
 
   /**
+   * @brief     Get the lifespan the underlying layer needs for its inputs
+   *
+   * @return the lifespan, or std::nullopt to keep the Manager default
+   */
+  std::optional<TensorLifespan> getInputLifespan() const {
+    return getLayer()->getInputLifespan();
+  }
+
+  /**
+   * @brief     Get the lifespan the underlying layer needs for the gradients
+   * of its inputs
+   *
+   * @return the lifespan, or std::nullopt to keep the Manager default
+   */
+  std::optional<TensorLifespan> getInputGradLifespan() const {
+    return getLayer()->getInputGradLifespan();
+  }
+
+  /**
    * @brief     Pack the underlying layer's weights
    * @details   Delegates to the wrapped layer so each layer type decides how
    *            (and whether) to repack its own weights.

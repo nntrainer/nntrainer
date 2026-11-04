@@ -88,10 +88,10 @@ def save_kalm_embedding_for_nntrainer(params, n_layers, dtype, file):
                 save_weight(params[bias_key])
 
     def save_feed_forward(layer_name):
-        """Save feed-forward layer weights in nntrainer gate, up, down order."""
+        """Save feed-forward layer weights in nntrainer up, gate, down order."""
         save_weight(params[f"{layer_name}post_attention_layernorm.weight"])
 
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
+        for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(layer_name, f"mlp.{proj}")
 
     save_weight(params[f"{prefix}embed_tokens.weight"])

@@ -134,6 +134,20 @@ public:
     return layerImpl->supportBackwarding();
   }
 
+  /**
+   * @copydoc Layer::getInputLifespan()
+   */
+  std::optional<TensorLifespan> getInputLifespan() const override {
+    return layerImpl->getInputLifespan();
+  }
+
+  /**
+   * @copydoc Layer::getInputGradLifespan()
+   */
+  std::optional<TensorLifespan> getInputGradLifespan() const override {
+    return layerImpl->getInputGradLifespan();
+  }
+
 private:
   nntrainer::Layer *layerImpl;
   nntrainer::DestroyLayerFunc destroy_func;
