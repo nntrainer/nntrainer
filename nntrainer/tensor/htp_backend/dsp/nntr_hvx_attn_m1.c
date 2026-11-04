@@ -217,7 +217,7 @@ int nntr_hvx_attn_m1_seed_kvq_tiles(remote_handle64 handle, uint32 layer,
          (unsigned)kv_handle, (unsigned)layer);
     return AEE_EBADSTATE;
   }
-  /* [C] on the pool's background lane: the tiles are built under the
+  /** [C] on the pool's background lane: the tiles are built under the
      prefill's next calls, and the cache is released once they are
      (seed_release_kvq, from a reap or the layer's first forward) */
   const uint64_t t0 = HAP_perf_get_time_us();
