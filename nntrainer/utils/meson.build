@@ -13,6 +13,7 @@ util_sources = [
   'thread_manager_util.cpp',
   'safetensors_util.cpp',
   'driver_version.cpp',
+  'engine_request.cpp',
 ]
 
 util_headers = [

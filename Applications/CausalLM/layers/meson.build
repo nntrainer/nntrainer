@@ -4,6 +4,9 @@
 causallm_layer_inc_abs = [meson.current_source_dir(), meson.current_source_dir() / '..']
 causallm_layer_inc = [include_directories('.'), include_directories('..')]
 
+# Windows embeds layers with the static engine in the final module.
+causallm_layer_type = host_machine.system() == 'windows' ? 'static_library' : 'shared_library'
+
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
 causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp']
 causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d_layer.cpp']
@@ -21,9 +24,10 @@ causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_m
 causallm_dense_ffn_layer_src_abs = [meson.current_source_dir() / 'dense_ffn_layer.cpp']
 causallm_conv_block_layer_src_abs = [meson.current_source_dir() / 'conv_block_layer.cpp']
 
-causallm_rms_norm = shared_library(
+causallm_rms_norm = build_target(
     'rms_norm_layer', 
     causallm_rms_norm_src_abs, 
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc, 
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -36,9 +40,10 @@ causallm_rms_norm_dep = declare_dependency(
 
 # GPU-routed RMSNorm (RMSNormLayerGPU). Referenced unconditionally by
 # transformer.cpp; the GPU dispatch inside it only fires under enable-opencl.
-causallm_rms_norm_gpu = shared_library(
+causallm_rms_norm_gpu = build_target(
     'rms_norm_gpu_layer',
     causallm_rms_norm_gpu_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -50,9 +55,10 @@ causallm_rms_norm_gpu_dep = declare_dependency(
 )
 
 
-causallm_causal_conv1d = shared_library(
+causallm_causal_conv1d = build_target(
     'causal_conv1d_layer',
     causallm_causal_conv1d_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -65,9 +71,10 @@ causallm_causal_conv1d_dep = declare_dependency(
 
 
 
-causallm_mha_core = shared_library(
+causallm_mha_core = build_target(
     'mha_core_layer',
     causallm_mha_core_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -78,9 +85,10 @@ causallm_mha_core_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_embedding_layer = shared_library(
+causallm_embedding_layer = build_target(
     'embedding_layer',
     causallm_embedding_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -91,9 +99,10 @@ causallm_embedding_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_embedding_pooling_layer = shared_library(
+causallm_embedding_pooling_layer = build_target(
     'embedding_pooling_layer',
     causallm_embedding_pooling_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -104,9 +113,10 @@ causallm_embedding_pooling_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_embedding_normalize_layer = shared_library(
+causallm_embedding_normalize_layer = build_target(
     'embedding_normalize_layer',
     causallm_embedding_normalize_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -118,9 +128,10 @@ causallm_embedding_normalize_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_reshaped_rms_norm = shared_library(
+causallm_reshaped_rms_norm = build_target(
     'reshaped_rms_norm_layer', 
     causallm_reshaped_rms_norm_src_abs, 
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc, 
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -132,9 +143,10 @@ causallm_reshaped_rms_norm_dep = declare_dependency(
 )
 
 
-causallm_residual_add = shared_library(
+causallm_residual_add = build_target(
     'residual_add',
     causallm_residual_add_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -146,9 +158,10 @@ causallm_residual_add_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_dense_ffn_layer = shared_library(
+causallm_dense_ffn_layer = build_target(
     'dense_ffn_layer',
     causallm_dense_ffn_layer_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -160,9 +173,10 @@ causallm_dense_ffn_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_conv_block_layer = shared_library(
+causallm_conv_block_layer = build_target(
     'conv_block_layer',
     causallm_conv_block_layer_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -174,9 +188,10 @@ causallm_conv_block_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_deberta_attention_layer = shared_library(
+causallm_deberta_attention_layer = build_target(
     'deberta_attention_layer',
     causallm_deberta_attention_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -188,9 +203,10 @@ causallm_deberta_attention_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_shared_fully_connected_layer = shared_library(
+causallm_shared_fully_connected_layer = build_target(
     'shared_fully_connected_layer',
     causallm_shared_fully_connected_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -202,9 +218,10 @@ causallm_shared_fully_connected_layer_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_rms_reverse_norm = shared_library(
+causallm_rms_reverse_norm = build_target(
     'rms_reverse_norm_layer',
     causallm_rms_reverse_norm_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -216,9 +233,10 @@ causallm_rms_reverse_norm_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_per_layer_slice = shared_library(
+causallm_per_layer_slice = build_target(
     'per_layer_slice_layer',
     causallm_per_layer_slice_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
@@ -232,9 +250,10 @@ causallm_per_layer_slice_dep = declare_dependency(
 
 
 
-causallm_custom_multiply_layer = shared_library(
+causallm_custom_multiply_layer = build_target(
     'custom_multiply',
     causallm_custom_multiply_layer_src_abs,
+    target_type: causallm_layer_type,
     include_directories: causallm_layer_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

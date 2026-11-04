@@ -9,7 +9,7 @@
 #ifndef GRAPH_PARSER_H
 #define GRAPH_PARSER_H
 
-#include "../../../nntrainer/Applications/CausalLM/json.hpp"
+#include "../json.hpp"
 #include <map>
 #include <string>
 #include <vector>

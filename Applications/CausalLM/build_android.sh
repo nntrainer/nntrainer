@@ -12,7 +12,18 @@ Options:
   --install               Push native artifacts; with --app, install the APK
   --htp                   Build the native Hexagon HTP variant (requires Hexagon SDK/HexKL)
   --qnn                   Build the QNN-enabled native/app variant (default: CPU-only)
+                          Combine --qnn --htp to package both backends together
+  --disable-opencl        Build the engine without the OpenCL/GPU backend
+                          (default: OpenCL on; recorded in the engine metadata,
+                          so --cache never reuses an engine of the other kind)
   --cache                 Reuse a compatible engine build; build on cache miss
+  --stage[=DIR]           Assemble the variant's PUBLIC stage in DIR (default:
+                          builddir_app_stage/public/<variant>): one flat
+                          directory with exactly the files the variant ships,
+                          residue-checked, plus DIR.manifest.json. DIR is
+                          recreated on every run; it never holds a
+                          model-extension plugin (downstream builds copy the
+                          stage and add theirs)
   --clean                 Recreate the selected CausalLM build outputs
   --nntr-threads=N        Set the nntrainer compute thread count (default: 7)
   --help, -h              Show this help
@@ -32,9 +43,12 @@ CLEAN=false
 USE_BUILD_CACHE=false
 ENABLE_QNN=false
 ENABLE_HTP=false
+ENABLE_OPENCL=true
 INSTALL=false
 BUILD_APP=false
 NNTR_THREADS="${NNTR_THREADS:-}"
+STAGE=false
+STAGE_DIR=""
 ENGINE_ARGS=()
 
 deprecated_option() {
@@ -55,6 +69,9 @@ while [[ $# -gt 0 ]]; do
         --qnn)
             ENABLE_QNN=true
             ;;
+        --disable-opencl)
+            ENABLE_OPENCL=false
+            ;;
         --assemble-aar|--aar)
             deprecated_option "$1" "--app"
             BUILD_APP=true
@@ -64,6 +81,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clean)
             CLEAN=true
+            ;;
+        --stage)
+            STAGE=true
+            ;;
+        --stage=*)
+            STAGE=true
+            STAGE_DIR="${1#*=}"
+            if [[ -z "$STAGE_DIR" ]]; then
+                echo "Error: --stage= needs a directory." >&2
+                exit 2
+            fi
             ;;
         --nntr-threads=*)
             NNTR_THREADS="${1#*=}"
@@ -77,6 +105,17 @@ while [[ $# -gt 0 ]]; do
             if [[ "$1" == -Denable-npu=* ]]; then
                 echo "Error: -Denable-npu is controlled by --qnn." >&2
                 exit 2
+            fi
+            if [[ "$1" == -Denable-opencl=* ]]; then
+                # Same switch as --disable-opencl; kept because README_GPU.md
+                # documents -Denable-opencl=true. It is recorded in the engine
+                # metadata like the flag, not forwarded as an opaque engine arg.
+                case "${1#*=}" in
+                    true|false) ENABLE_OPENCL="${1#*=}" ;;
+                    *) echo "Error: -Denable-opencl must be true or false." >&2; exit 2 ;;
+                esac
+                shift
+                continue
             fi
             ENGINE_ARGS+=("$1")
             ;;
@@ -103,10 +142,8 @@ if ! [[ "$NNTR_THREADS" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 if [[ "$ENABLE_HTP" == true && "$ENABLE_QNN" == true ]]; then
-    echo "Error: --htp and --qnn select separate native variants." >&2
-    exit 2
-fi
-if [[ "$ENABLE_HTP" == true ]]; then
+    BUILD_VARIANT="qnn-htp"
+elif [[ "$ENABLE_HTP" == true ]]; then
     BUILD_VARIANT="htp"
 elif [[ "$ENABLE_QNN" == true ]]; then
     BUILD_VARIANT="qnn"
@@ -221,6 +258,7 @@ echo "=== nntrainer CausalLM Android build ==="
 echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK:    $ANDROID_NDK"
 echo "Variant:        $BUILD_VARIANT"
+echo "OpenCL:         $ENABLE_OPENCL"
 echo "App:            $BUILD_APP"
 echo "Install:        $INSTALL"
 echo "Engine cache:   $USE_BUILD_CACHE"
@@ -285,10 +323,12 @@ NNTRAINER_PREBUILT_MK="$NNTRAINER_ANDROID_RESULT/Android.mk"
 NNTRAINER_MODE_FILE="$NNTRAINER_ANDROID_RESULT/causallm-build-mode.ini"
 
 engine_mode_text() {
-    # Schema 2 invalidates engines built with the former mmap-read override.
-    printf 'schema=2\n'
+    # Schema 3 adds enable_opencl; schema 2 invalidated engines built with the
+    # former mmap-read override.
+    printf 'schema=3\n'
     printf 'variant=%s\n' "$BUILD_VARIANT"
     printf 'enable_qnn=%s\n' "$ENABLE_QNN"
+    printf 'enable_opencl=%s\n' "$ENABLE_OPENCL"
     printf 'enable_htp=%s\n' "$ENABLE_HTP"
     if [[ "$ENABLE_HTP" == true ]]; then
         printf 'hex_arch=%s\nhexagon_sdk=%s\nhexkl_root=%s\nhexkl_lib=%s\n' \
@@ -380,6 +420,7 @@ else
         ./tools/package_android.sh \
             -Dnntr-num-threads="$NNTR_THREADS" \
             -Denable-npu="$ENABLE_QNN" \
+            -Denable-opencl="$ENABLE_OPENCL" \
             -Denable-htp="$ENABLE_HTP" \
             "${HTP_ENGINE_ARGS[@]}" \
             "${ENGINE_ARGS[@]}"
@@ -612,6 +653,42 @@ stage_runtime_libraries() {
     fi
 }
 
+stage_public() {
+    local stage_dir="$1" marker=".nntr-stage"
+    # The directory is wiped on every run so that nothing of an earlier
+    # variant survives (cpu -> qnn -> cpu). Refuse to wipe anything that is
+    # not a previous stage of ours.
+    if [[ -e "$stage_dir" ]]; then
+        if [[ ! -d "$stage_dir" ]]; then
+            echo "Error: stage path exists and is not a directory: $stage_dir" >&2
+            exit 1
+        fi
+        if [[ -n "$(ls -A "$stage_dir")" && ! -f "$stage_dir/$marker" ]]; then
+            echo "Error: refusing to recreate $stage_dir: not empty and not a stage." >&2
+            exit 1
+        fi
+        rm -rf "$stage_dir"
+    fi
+    rm -f "$stage_dir.manifest.json"
+    mkdir -p "$stage_dir"
+    echo "[6] Staging the public $BUILD_VARIANT variant in $stage_dir."
+    local source
+    for source in "${RUNTIME_LIBRARIES[@]}" "${NATIVE_EXECUTABLES[@]}"; do
+        cp "$source" "$stage_dir/"
+    done
+    printf '%s\n' "$BUILD_VARIANT" > "$stage_dir/$marker"
+    python3 "$CAUSALLM_ROOT/Android/native_stage.py" manifest \
+        --variant "$BUILD_VARIANT" --kind public --stage-dir "$stage_dir" \
+        --nntrainer-root "$NNTRAINER_ROOT" \
+        --abi-file "$NNTRAINER_ABI_FILE" --mode-file "$NNTRAINER_MODE_FILE" \
+        --readelf "$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/bin/llvm-readelf" \
+        --output "$stage_dir.manifest.json"
+}
+
+if [[ "$STAGE" == true ]]; then
+    stage_public "${STAGE_DIR:-$NNTRAINER_ROOT/builddir_app_stage/public/$BUILD_VARIANT}"
+fi
+
 AAR=""
 APK=""
 if [[ "$BUILD_APP" == true ]]; then
@@ -644,6 +721,8 @@ if [[ "$INSTALL" == false ]]; then
     else
         echo "=== Done (native $BUILD_VARIANT build) ==="
         echo "Artifacts: $NATIVE_BUILD"
+        [[ "$STAGE" == true ]] && \
+            echo "Public stage: ${STAGE_DIR:-$NNTRAINER_ROOT/builddir_app_stage/public/$BUILD_VARIANT}"
     fi
     exit 0
 fi

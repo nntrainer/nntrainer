@@ -12,6 +12,8 @@
 
 #include "quick_dot_ai_api.h"
 #include "htp_model_runtime.h"
+#include "htp_pack_gate.h"
+#include "kv_prefix_path.h"
 #ifdef ENABLE_QNN_MODELS
 #include "quick_dot_ai_qnn.h"
 #endif
@@ -34,6 +36,9 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "env_compat.h"
+#include "ext_model_loader.h"
+#include "footprint_sampler.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
@@ -70,6 +75,7 @@
 #endif
 
 #endif
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -129,7 +135,18 @@ struct CausalLmModel {
   std::vector<double> initialization_duration_ms;
   bool initialized = false;
   int kv_len = 0;
+  // Human-readable description of the most recent failure on this handle
+  // (exception text, or the guard that rejected the call). Cleared when a
+  // run starts. Callers otherwise only see an ErrorCode. Guarded by its own
+  // mutex so it can be read while a run holds `mtx`.
+  std::mutex err_mtx;
+  std::string last_error;
 };
+
+static void set_last_error(CausalLmModel &h, const std::string &msg) {
+  std::lock_guard<std::mutex> lock(h.err_mtx);
+  h.last_error = msg;
+}
 
 // Globals shared across all handles — options set via setOptions() apply
 // process-wide regardless of which handle is active.
@@ -205,12 +222,20 @@ static causallm::Quick_Dot_AI_QNN *as_qnn_model(causallm::Transformer *model) {
 
 /**
  * @brief Decoding mode for a request that does not choose one itself: the
- *        model's generation_config.json "do_sample" (false when the key is
- *        missing, and for models that are not a CausalLM).
+ *        model's generation_config.json "do_sample" as the engine read it
+ *        (false when the key is missing, the Hugging Face default).
+ *        The QNN lanes read the key themselves and only sample when both the
+ *        caller and their config allow it, so for them "the model decides"
+ *        means passing true. Anything else decodes with its own runtime's
+ *        rule.
  */
 static bool model_do_sample(causallm::Transformer *model) {
   if (auto *causal_model = as_causal_lm(model))
     return causal_model->getDoSample();
+#ifdef ENABLE_QNN_MODELS
+  if (as_qnn_model(model) != nullptr)
+    return true;
+#endif
   return false;
 }
 
@@ -274,7 +299,12 @@ static std::map<std::string, std::string> g_model_path_map = {
   {"TINY_BERT", "tiny_bert"},
   {"FUNCTION_GEMMA", "function_gemma"},
   {"GEMMA4_CPU", "gemma4_cpu"},
-  {"OURO_EMBEDDING", "ouro_embedding"},
+#ifdef ENABLE_OPENCL
+  // Packs the GPU descriptors (model_descriptors_public.cpp) read: the QS4CX
+  // E2B pack, and the 26B-A4B MoE pack with its own directory.
+  {"GEMMA4_GPU", "gemma4_gpu"},
+  {"GEMMA4_MOE_GPU", "gemma4_26b_moe_gpu"},
+#endif
 #ifdef ENABLE_QNN_MODELS
   {"GEMMA4-E2B-QNN", "gemma-4-e2b-qnn"},
   {"VJEPA2-QNN", "vjepa2-qnn"},
@@ -344,6 +374,14 @@ void register_model_descriptor(const ModelDescriptor *desc) {
   }
   descriptor_registry().push_back(*desc);
 }
+
+void register_model_path(const char *config_name, const char *directory) {
+  if (config_name == nullptr || directory == nullptr)
+    return;
+  std::string key(config_name);
+  std::transform(key.begin(), key.end(), key.begin(), ::toupper);
+  g_model_path_map[key] = directory;
+}
 } // namespace quick_dot_ai
 
 /** Find a descriptor by string id. Returns a copy while locked, or nullopt. */
@@ -360,6 +398,12 @@ static std::optional<ModelDescriptor> find_descriptor_by_id(const char *id) {
 // Library-owned buffer: rebuilt on every call and returned via c_str().
 // The pointer is valid only until the next call to getModelCatalogJson().
 static std::string g_catalog_json_cache;
+static std::string g_extension_status_cache;
+
+extern "C" const char *getExtensionModelStatus(void) {
+  g_extension_status_cache = quick_dot_ai::ensureExtensionModels().message;
+  return g_extension_status_cache.c_str();
+}
 
 /**
  * Returns a pointer to a library-owned buffer containing a JSON array of
@@ -369,6 +413,9 @@ static std::string g_catalog_json_cache;
  * Not safe for concurrent access to the returned pointer.
  */
 extern "C" const char *getModelCatalogJson(void) {
+  // Before the lock: a plugin registers its descriptors through
+  // register_model_descriptor(), which takes it.
+  quick_dot_ai::ensureExtensionModels();
   auto json_escape = [](const char *s) -> std::string {
     if (!s)
       return "";
@@ -411,14 +458,17 @@ extern "C" const char *getModelCatalogJson(void) {
 static void register_models() {
   static std::once_flag flag;
   std::call_once(flag, []() {
+    // The optional model-extension plugin goes first so its architectures are
+    // in the Factory like the built-in ones. Absence is the public build.
+    quick_dot_ai::ensureExtensionModels();
+
     // The core model set is the shared causallm::registerAllModels()
     // (models/model_registry.h), the same list main.cpp registers, so the two
     // entry points cannot drift apart. Only the API-specific extras follow.
     causallm::registerAllModels();
 
-    // Ouro (Universal-Transformer) self-registers "OuroModel" from its own
-    // TU (src/models/ouro/ouro_embedding.cpp) via __attribute__((constructor)),
-    // same pattern as the QNN models below.
+    // Models outside this library are added by the model-extension plugin
+    // (ext_model_abi.h), loaded by ensureExtensionModels() above.
 
     // V-JEPA2 + LFM2 fused video-language model (CPU). Sub-models (ViT,
     // projector, LFM2) are constructed internally, so only the combined
@@ -457,8 +507,8 @@ static const char *get_model_name_from_type(ModelType type) {
     return "FUNCTION_GEMMA";
   case CAUSAL_LM_MODEL_GEMMA4_CPU:
     return "GEMMA4_CPU";
-  case CAUSAL_LM_MODEL_OURO_EMBEDDING:
-    return "OURO_EMBEDDING";
+    // Legacy enum slot 14 has no built-in model; extension models load by
+    // catalog id (ext_model_abi.h).
 #ifdef ENABLE_QNN_MODELS
   case CAUSAL_LM_MODEL_GEMMA4_E2B_QNN:
     return "GEMMA4-E2B-QNN";
@@ -535,15 +585,76 @@ static size_t text_generation_model_index(const CausalLmModel &h) {
 
 static void reset_handle_session_state(CausalLmModel &h) { h.kv_len = 0; }
 
+/**
+ * @brief Read this handle's KV position back after a run.
+ *
+ * Two sources, in order:
+ *   1. the architecture's read_kv_len callback, registered by the QNN TUs;
+ *   2. Transformer::getKvLen(), which causallm::CausalLM overrides to return
+ *      its KV manager's position and which the base returns 0 from.
+ *
+ * (2) is what lets the API see a CausalLM session at all. Before it, h.kv_len
+ * stayed 0 forever for every non-QNN model, so the API believed every request
+ * was the first one while the engine kept accumulating its own token position
+ * across run() calls.
+ */
 static void update_handle_session_after_run(CausalLmModel &h,
                                             size_t model_index) {
   if (model_index >= h.models.size() || model_index >= h.architectures.size())
     return;
   const auto *cb =
     ModelCallbackRegistry::instance().lookup(h.architectures[model_index]);
-  if (!cb || !cb->read_kv_len)
+  if (cb && cb->read_kv_len) {
+    h.kv_len = cb->read_kv_len(h.models[model_index].get());
     return;
-  h.kv_len = cb->read_kv_len(h.models[model_index].get());
+  }
+  auto *model = h.models[model_index].get();
+  if (model != nullptr)
+    h.kv_len = model->getKvLen();
+}
+
+/**
+ * @brief Rewind the conversation of a loaded nntrainer model without unloading
+ *        it: the next run prefills from position 0, and any armed KV-cache
+ *        resume is disarmed.
+ *
+ * Weights, compiled graph and buffers all stay resident. The stale KV rows past
+ * the new position are simply never attended, so nothing has to be zeroed.
+ *
+ * @return false when this model has no such lever (a non-CausalLM model, e.g. a
+ *         pure QNN graph -- those go through reset_qnn_kv_cache_on_handle).
+ */
+static bool reset_session_on_model(causallm::Transformer *model) {
+  auto *clm = as_causal_lm(model);
+  if (clm == nullptr)
+    return false;
+  clm->setPrecomputedKVCache("", 0);
+  clm->resetLogitsProcessor();
+  return true;
+}
+
+/**
+ * @brief Start the run on a fresh session unless the caller asked to continue.
+ *
+ * The engine accumulates its own token position across run() calls, so a run
+ * that re-sends a whole prompt on a model that is not rewound prefills it at
+ * the wrong offset (and a second request is answered from the first's KV).
+ * N independent requests on one loaded handle must each behave like the first,
+ * so the default is stateless. A run that sends only the new turn of a
+ * conversation opts out with "continue_session" (JSON request).
+ *
+ * A model without the lever (QNN) keeps its own KV; h.kv_len is then left as
+ * the QNN callbacks last reported it, which is what selects its incremental
+ * prompt.
+ */
+static void prepare_session_for_run(CausalLmModel &h, size_t model_index,
+                                    bool continue_session) {
+  if (continue_session)
+    return;
+  if (model_index >= h.models.size())
+    return;
+  if (reset_session_on_model(h.models[model_index].get()))
+    reset_handle_session_state(h);
 }
 
 static constexpr size_t kAutoTextGenerationModelIndex =
@@ -699,6 +810,10 @@ static std::string resolve_model_path(const std::string &model_key,
 
   if (path_upper == "GEMMA4-26B-A4B-HTP")
     return "/gemma4-26b-a4b-htp-w4a32";
+  if (path_upper == "GEMMA4-26B-A4B-HTP-LONG")
+    return "/gemma4-26b-a4b-htp-long-w4a32";
+  if (path_upper == "GEMMA4-26B-A4B-HTP-2BIT-4BIT")
+    return "/gemma4-26b-a4b-2bit-4bit";
   if (path_upper == "LFM2-24BA2B-HTP")
     return "/lfm2-24ba2b-htp-w4a32";
   std::string base_dir_name = "";
@@ -945,6 +1060,102 @@ static void ensure_qnn_backend_ext_config(const std::string &base_dir) {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// BackendType -> nntrainer compute engine
+// ---------------------------------------------------------------------------
+//
+// The engine picks its compute backend once per process, from one place: the
+// Engine brings up the OpenCL "gpu" Context (or not) and every CausalLM model
+// stamps `engine=` on its layers from causallm_engine(), and both read it
+// through nntr_engine_env() (nntrainer/utils/env_compat.h), the first time
+// either runs. Until this function existed, load_into_handle() only LOGGED its
+// BackendType argument: a CAUSAL_LM_BACKEND_CPU request on an OpenCL build
+// changed nothing, and ran on the GPU because "gpu" is that build's default.
+//
+// This library must not change the process environment, so the request goes
+// through nntrainer::requestEngine(), which nntr_engine_env() answers ahead of
+// NNTR_ENGINE. Two rules follow from how the engine works:
+//
+//   * An NNTR_ENGINE exported by the caller wins. It is the way a measurement
+//     or a bug-report reproduction pins the engine from outside, so the
+//     request does not override it (and says so).
+//
+//   * The engine is first-load-wins. Loading a second model with another
+//     BackendType cannot move it; say so loudly rather than report a backend
+//     the graph is not on.
+//
+// Only CPU and GPU select an engine. NPU models are their own runtime (QNN
+// graphs, HTP session); the engine string does not apply to them, so an NPU
+// load leaves whatever the CPU/GPU loads established untouched.
+namespace {
+
+/** nntrainer engine name for a BackendType; nullptr = leave it alone. */
+const char *engine_of(BackendType compute) {
+  switch (compute) {
+  case CAUSAL_LM_BACKEND_CPU:
+    return "cpu";
+  case CAUSAL_LM_BACKEND_GPU:
+    return "gpu";
+  case CAUSAL_LM_BACKEND_NPU:
+  default:
+    return nullptr;
+  }
+}
+
+const char *backend_name(BackendType compute) {
+  switch (compute) {
+  case CAUSAL_LM_BACKEND_CPU:
+    return "CPU";
+  case CAUSAL_LM_BACKEND_GPU:
+    return "GPU";
+  case CAUSAL_LM_BACKEND_NPU:
+  default:
+    return "NPU";
+  }
+}
+
+} // namespace
+
+static void apply_compute_backend(BackendType compute) {
+  const char *want = engine_of(compute);
+  if (want == nullptr)
+    return;
+
+#if !defined(ENABLE_OPENCL)
+  if (compute == CAUSAL_LM_BACKEND_GPU) {
+    LOGE("[backend] GPU requested but this build has no OpenCL (nntrainer not "
+         "configured with -Denable-opencl=true); running on CPU");
+    return;
+  }
+#endif
+
+  const char *pinned = getenv("NNTR_ENGINE");
+  if (pinned != nullptr && pinned[0] != '\0') {
+    LOGD("[backend] NNTR_ENGINE=%s is set in the environment and wins over "
+         "the %s request",
+         pinned, backend_name(compute));
+    return;
+  }
+
+  static std::mutex m;
+  std::lock_guard<std::mutex> lk(m);
+  std::string effective;
+  switch (nntrainer::requestEngine(want, &effective)) {
+  case nntrainer::EngineRequestResult::APPLIED:
+    LOGD("[backend] compute engine = %s (requested %s)", want,
+         backend_name(compute));
+    break;
+  case nntrainer::EngineRequestResult::UNCHANGED:
+    break;
+  case nntrainer::EngineRequestResult::TOO_LATE:
+    LOGE("[backend] %s requested, but this process already built its graph on "
+         "'%s'. The engine is a process-wide, first-load-wins choice; the "
+         "request is IGNORED. Load the other backend in a fresh process.",
+         backend_name(compute), effective.c_str());
+    break;
+  }
+}
+
 /** Internal overload: config_name already resolved (T4 byName path). */
 static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                                   const char *target_model_name,
@@ -953,6 +1164,17 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                                   const char *model_base_path) {
   LOGD("[DEBUG] load_into_handle: START");
   LOGD("[DEBUG]   compute: %d", compute);
+
+  /** Arm the honest-footprint sampler here and do NOT stop it: the app loads
+   *  the weights lazily inside the first request, so the load's transient is
+   *  part of that request's peak. The generation arms it again, which is a
+   *  no-op while it is already running, and reads the peak out on its way
+   *  out. */
+  causallm::FootprintSampler::get().arm();
+
+  // Turn the BackendType argument into an actual engine selection before any
+  // model is constructed -- the engine latches on its first read.
+  apply_compute_backend(compute);
   LOGD("[DEBUG]   target_model_name: %s",
        target_model_name ? target_model_name : "(null)");
   LOGD("[DEBUG]   quant_type: %d", quant_type);
@@ -1166,6 +1388,8 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
            top_nntr["architectures"].size(), top_nntr["model_dirs"].size());
 
       if (is_multi && (input_name_upper == "GEMMA4-26B-A4B-HTP" ||
+                       input_name_upper == "GEMMA4-26B-A4B-HTP-LONG" ||
+                       input_name_upper == "GEMMA4-26B-A4B-HTP-2BIT-4BIT" ||
                        input_name_upper == "LFM2-24BA2B-HTP"))
         throw std::invalid_argument("HTP supports a single model per handle");
       if (is_multi) {
@@ -1324,65 +1548,17 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       }
     }
 
-    const bool lfm2_htp_model = input_name_upper == "LFM2-24BA2B-HTP";
-    const bool lfm2_htp_profile =
-      nntr_cfg.value("lfm2_execution_profile", std::string()) == "htp_fused";
-    if (lfm2_htp_model || lfm2_htp_profile) {
+    // Validate the HTP pack contract in every build variant, so a CPU build
+    // rejects the same requests with the same reasons; only an accepted HTP
+    // pack needs the HTP runtime.
+    const quick_dot_ai::HtpPackKind htp_kind = quick_dot_ai::validate_htp_pack(
+      input_name_upper, compute, quant_type, cfg, nntr_cfg);
+    if (htp_kind != quick_dot_ai::HtpPackKind::NONE) {
 #ifndef ENABLE_HEXKL
-      throw std::invalid_argument("LFM2 HTP requires an HTP build");
+      throw std::invalid_argument(htp_kind == quick_dot_ai::HtpPackKind::LFM2
+                                    ? "LFM2 HTP requires an HTP build"
+                                    : "Gemma4 HTP requires an HTP build");
 #else
-      if (!lfm2_htp_model || !lfm2_htp_profile ||
-          compute != CAUSAL_LM_BACKEND_NPU ||
-          quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
-          cfg.value("architectures", std::vector<std::string>{}) !=
-            std::vector<std::string>{"Lfm2MoeForCausalLM"} ||
-          nntr_cfg.value("lfm2_weight_format", std::string()) != "sr15_v2" ||
-          nntr_cfg.value("use_kvcache", false) ||
-          nntr_cfg.value("save_kvcache", false))
-        throw std::invalid_argument(
-          "LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack");
-      fix_paths(nntr_cfg, abs_model_dir);
-      causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, abs_model_dir);
-      h.htp_runtime = std::make_unique<quick_dot_ai::HtpModelRuntime>(
-        native_lib_dir, causallm::normalizeHtpRuntimeConfig(nntr_cfg));
-#endif
-    }
-    const bool htp_model = input_name_upper == "GEMMA4-26B-A4B-HTP";
-    const bool htp_profile =
-      nntr_cfg.value("gemma4_execution_profile", std::string()) == "htp_fused";
-    if (htp_model || htp_profile) {
-#ifndef ENABLE_HEXKL
-      throw std::invalid_argument("Gemma4 HTP requires an HTP build");
-#else
-      if (!htp_model || !htp_profile || compute != CAUSAL_LM_BACKEND_NPU ||
-          quant_type != CAUSAL_LM_QUANTIZATION_W4A32 ||
-          nntr_cfg.value("gemma4_weight_format", std::string()) !=
-            "htp_fused_v1" ||
-          nntr_cfg.value("moe_engine", std::string()) != "htp" ||
-          nntr_cfg.value("attention_engine", std::string()) != "htp" ||
-          nntr_cfg.value("attn_proj_engine", std::string()) != "htp" ||
-          nntr_cfg.value("dense_ffn_engine", std::string()) != "htp")
-        throw std::invalid_argument(
-          "Gemma4 HTP requires the validated NPU/W4A32 preset");
-      if (cfg.value("architectures", std::vector<std::string>{}) !=
-            std::vector<std::string>{"Gemma4ForCausalLM"} ||
-          cfg.value("hidden_size", 0) != 2816 ||
-          cfg.value("num_hidden_layers", 0) != 30 ||
-          cfg.value("num_experts", 0) != 128 ||
-          !((nntr_cfg.value("moe_layer_dtype", std::string()) == "QS2CX_WH" &&
-             nntr_cfg.value("fc_layer_dtype", std::string()) == "QS4CX" &&
-             nntr_cfg.value("lmhead_dtype", std::string()) == "Q4_0") ||
-            (nntr_cfg.value("moe_layer_dtype", std::string()) == "TL2CX_WH" &&
-             nntr_cfg.value("fc_layer_dtype", std::string()) ==
-               "QS4CX_WH_AFFINE" &&
-             nntr_cfg.value("lmhead_dtype", std::string()) ==
-               "QS4CX_WH_AFFINE" &&
-             nntr_cfg.value("lmhead_engine", std::string()) == "htp")) ||
-          nntr_cfg.value("embedding_dtype", std::string()) != "Q4_0" ||
-          nntr_cfg.value("use_kvcache", false) ||
-          nntr_cfg.value("save_kvcache", false))
-        throw std::invalid_argument(
-          "Unsupported Gemma4 HTP pack or KV snapshot option");
       fix_paths(nntr_cfg, abs_model_dir);
       causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, abs_model_dir);
       h.htp_runtime = std::make_unique<quick_dot_ai::HtpModelRuntime>(
@@ -1490,8 +1666,8 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       h.models.push_back(std::move(m));
     }
     LOGD("[DEBUG] load_into_handle: Calling model->initialize()...");
-    if (!htp_model && !lfm2_htp_model && native_lib_dir != nullptr &&
-        strlen(native_lib_dir) > 0) {
+    if (htp_kind == quick_dot_ai::HtpPackKind::NONE &&
+        native_lib_dir != nullptr && strlen(native_lib_dir) > 0) {
       setenv("ADSP_LIBRARY_PATH", native_lib_dir, 1);
     }
     model_to_load->initialize();
@@ -1601,6 +1777,10 @@ run_on_handle(CausalLmModel &h, const char *inputTextPrompt,
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
+  /** One request, one peak: armed here (or already armed by the load) and read
+   *  back in metrics_on_handle. */
+  causallm::FootprintRun footprint_run;
+
   std::lock_guard<std::mutex> lock(h.mtx);
   if (model_index == kAutoTextGenerationModelIndex)
     model_index = text_generation_model_index(h);
@@ -1653,6 +1833,9 @@ run_on_handle(CausalLmModel &h, const char *inputTextPrompt,
       model->setLogitsProcessor(grammar_processor.get());
       scoped_processor.detach_logits = true;
     }
+
+    // Every run is a fresh session; see prepare_session_for_run().
+    prepare_session_for_run(h, model_index, /*continue_session=*/false);
 
     std::string input = prepare_input_for_model(
       h, model_index, std::string(inputTextPrompt), input_already_formatted);
@@ -1708,7 +1891,15 @@ static ErrorCode metrics_on_handle(CausalLmModel &h,
     metrics->generation_tokens = im.generation_tokens;
     metrics->generation_duration_ms = im.generation_duration_ms;
     metrics->total_duration_ms = im.total_duration_ms;
-    metrics->peak_memory_kb = im.peak_memory_kb;
+    /** The QNN models fill peak_memory_kb with getrusage ru_maxrss, which
+     *  cannot see the dma-buf their weights live in and which never comes back
+     *  down between requests. Where the sampler produced a number, that is the
+     *  one to report: this request's max of RssAnon plus the accelerator bytes
+     *  this process holds. See models/footprint_sampler.h. (CausalLM::run()
+     *  already reports the same number; the sampler is process-wide, so both
+     *  agree.) */
+    metrics->peak_memory_kb = causallm::resolvePeakMemoryKb(
+      causallm::FootprintSampler::get().peakKb(), im.peak_memory_kb);
     /* [perf-split] the honest rows */
     metrics->ttft_ms = im.ttft_ms;
     metrics->first_token_ms = im.first_token_ms;
@@ -2144,11 +2335,12 @@ ErrorCode configureSpeculativeDecoding(CausalLmHandle h, bool use_sd) {
     return CAUSAL_LM_ERROR_NONE;
   if (h->models.empty() || h->architectures.empty())
     return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
-  const auto *cb =
-    ModelCallbackRegistry::instance().lookup(h->architectures[0]);
-  if (!cb || !cb->configure_speculative_decoding)
+  auto &registry = ModelCallbackRegistry::instance();
+  const int index = findSpeculativeDecodingModel(h->architectures, registry);
+  if (index < 0 || static_cast<size_t>(index) >= h->models.size())
     return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
-  return cb->configure_speculative_decoding(h->models[0].get(), use_sd);
+  const auto *cb = registry.lookup(h->architectures[index]);
+  return cb->configure_speculative_decoding(h->models[index].get(), use_sd);
 }
 
 ErrorCode loadMultimodalHandleByName(
@@ -2256,6 +2448,16 @@ ErrorCode resetQnnKvCacheHandle(CausalLmHandle handle) {
   return reset_qnn_kv_cache_on_handle(*handle);
 }
 
+ErrorCode getLastErrorMessageHandle(CausalLmHandle handle, char *buffer,
+                                    size_t buffer_len) {
+  if (handle == nullptr || buffer == nullptr || buffer_len == 0) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  std::lock_guard<std::mutex> lock(handle->err_mtx);
+  snprintf(buffer, buffer_len, "%s", handle->last_error.c_str());
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
                                       PerformanceMetrics *metrics) {
   if (handle == nullptr) {
@@ -2268,20 +2470,159 @@ ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
  * Internal streaming helper
  *============================================================================*/
 
-static ErrorCode run_model_streaming_on_handle(CausalLmModel &h,
-                                               const std::string &raw_input,
-                                               CausalLmTokenCallback callback,
-                                               void *user_data,
-                                               bool input_already_formatted,
-                                               size_t model_index) {
+/** What a JSON request's "kv_prefix" asks for. */
+struct KvPrefix {
+  std::string text; ///< the static prefix, pre-formatted
+  std::string mode; ///< "" (auto), "save" or "load"
+};
+
+/**
+ * @brief Read and check a JSON request's "kv_prefix" object.
+ *
+ *   {"kv_prefix": {"static": <text>, "dynamic": <text>, "mode": <mode>}}
+ *
+ * Both texts are pre-formatted (the chat template is not applied to them).
+ * "mode" is "auto" (or absent / ""), "save" or "load". "dynamic" may be absent
+ * only for "save", which prefills the prefix, saves its KV and stops.
+ *
+ * @param request the whole request
+ * @param[out] prefix the static text and mode
+ * @param[out] dynamic the text prefilled behind the prefix
+ * @return "" when the request is accepted, else why it is not. Anything the
+ *         run would otherwise ignore is refused rather than dropped silently.
+ */
+static std::string parse_kv_prefix(const json &request, KvPrefix &prefix,
+                                   std::string &dynamic) {
+  const json &kp = request.at("kv_prefix");
+  if (!kp.is_object())
+    return "kv_prefix must be an object";
+  for (const char *ignored : {"messages", "tools", "functions"})
+    if (request.contains(ignored))
+      return std::string("kv_prefix cannot be combined with \"") + ignored +
+             "\": its texts are sent as given, with no chat template";
+  if (request.value("continue_session", false))
+    return "kv_prefix is one stateless turn; it cannot be combined with "
+           "continue_session";
+  for (auto it = kp.begin(); it != kp.end(); ++it)
+    if (it.key() != "static" && it.key() != "dynamic" && it.key() != "mode")
+      return "kv_prefix: unknown key \"" + it.key() + "\"";
+  if (!kp.contains("static") || !kp["static"].is_string() ||
+      kp["static"].get_ref<const std::string &>().empty())
+    return "kv_prefix.static must be a non-empty string";
+  prefix.text = kp["static"].get<std::string>();
+
+  if (kp.contains("mode") && !kp["mode"].is_string())
+    return "kv_prefix.mode must be a string";
+  prefix.mode = kp.value("mode", std::string());
+  if (prefix.mode == "auto")
+    prefix.mode.clear();
+  if (!prefix.mode.empty() && prefix.mode != "save" && prefix.mode != "load")
+    return "kv_prefix.mode must be \"auto\", \"save\" or \"load\", not \"" +
+           prefix.mode + "\"";
+
+  if (kp.contains("dynamic") && !kp["dynamic"].is_string())
+    return "kv_prefix.dynamic must be a string";
+  dynamic = kp.value("dynamic", std::string());
+  if (prefix.mode != "save" && dynamic.empty())
+    return "kv_prefix.dynamic must be a non-empty string unless mode is "
+           "\"save\"";
+  return "";
+}
+
+/** Token count a saved KV-cache file holds, from its header. */
+static unsigned int kv_file_tokens(const std::string &path) {
+  // Read out of describeFile()'s one line; a header accessor on KVCacheManager
+  // would be the cleaner source if this outgrows the demo.
+  const std::string d = causallm::KVCacheManager::describeFile(path);
+  const long long tokens = quick_dot_ai::kv_describe_tokens(d);
+  if (tokens <= 0)
+    throw std::runtime_error("kv_prefix: unreadable or empty KV file: " + d);
+  return static_cast<unsigned int>(tokens);
+}
+
+/**
+ * Demo only (a JSON request's "kv_prefix"): run @p dynamic after the KV of
+ * the static prefix. Both are pre-formatted text. The KV is saved next to the
+ * model (the engine's SAVE mode), one file per prefix text, at
+ * quick_dot_ai::kv_prefix_path(). Modes:
+ *  - ""     the first request with a prefix saves it, every request then
+ *           loads it and prefills only @p dynamic;
+ *  - "save" (re)save the prefix's KV and stop: no generation;
+ *  - "load" load the saved KV (an error when there is none), prefill only
+ *           @p dynamic.
+ *
+ * A saved file is only believed once its save finished: a save that fails
+ * midway removes what it wrote, so the next request does not "load" half a
+ * file. The KV range of a save is checked by the engine before it writes
+ * (KVCacheManager::validateSaveRange); a prefix that does not fit the model's
+ * window fails there, with the numbers.
+ */
+static void run_with_kv_prefix(CausalLmModel &h, size_t model_index,
+                               causallm::Transformer *m,
+                               const std::string &dynamic, const KvPrefix &kp,
+                               bool do_sample) {
+  const std::string &prefix = kp.text;
+  if (!kp.mode.empty() && kp.mode != "save" && kp.mode != "load")
+    throw std::invalid_argument("kv_prefix: unknown mode " + kp.mode);
+  auto *clm = as_causal_lm(m);
+  if (clm == nullptr)
+    throw std::invalid_argument("kv_prefix needs a CausalLM model");
+  const std::string path =
+    quick_dot_ai::kv_prefix_path(h.model_dirs[model_index], prefix);
+  std::filesystem::create_directories(
+    std::filesystem::path(path).parent_path());
+  if (kp.mode == "save") {
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".q2");
+  }
+  if (!std::filesystem::exists(path)) {
+    if (kp.mode == "load")
+      throw std::runtime_error("kv_prefix: no saved KV for this prefix (" +
+                               path + "); run the save mode first");
+    clm->setPrecomputedKVCache(path, 0);
+    try {
+      m->run("", false, prefix, "", g_verbose); // SAVE: prefix only, no output
+    } catch (...) {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+      std::filesystem::remove(path + ".q2", ec);
+      throw;
+    }
+    LOGD("[kv_prefix] saved %s", path.c_str());
+  }
+  if (kp.mode == "save")
+    return;
+  clm->setPrecomputedKVCache(path, kv_file_tokens(path));
+  m->run(dynamic, do_sample, prefix, "", g_verbose);
+}
+
+/**
+ * @param kv_prefix when set, run the request behind a saved KV prefix
+ *        instead of as an ordinary prompt (see run_with_kv_prefix)
+ * @param continue_session keep the KV this handle already holds instead of
+ *        starting a fresh session (see prepare_session_for_run)
+ */
+static ErrorCode
+run_model_streaming_on_handle(CausalLmModel &h, const std::string &raw_input,
+                              CausalLmTokenCallback callback, void *user_data,
+                              bool input_already_formatted, size_t model_index,
+                              const KvPrefix *kv_prefix = nullptr,
+                              bool continue_session = false) {
   if (model_index >= h.models.size() || !h.models[model_index]) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
+  causallm::FootprintRun footprint_run;
   auto *m = h.models[model_index].get();
   if (!model_supports_text_output(m)) {
     LOGE("[DEBUG] run_model_streaming_on_handle: model[%zu] does not expose "
          "text output",
          model_index);
+    return CAUSAL_LM_ERROR_UNSUPPORTED;
+  }
+  set_last_error(h, "");
+  if (kv_prefix != nullptr && as_causal_lm(m) == nullptr) {
+    set_last_error(h, "kv_prefix needs a CausalLM model (the saved KV is the "
+                      "engine's own)");
     return CAUSAL_LM_ERROR_UNSUPPORTED;
   }
 
@@ -2296,6 +2637,8 @@ static ErrorCode run_model_streaming_on_handle(CausalLmModel &h,
   } detach_guard{m};
 
   try {
+    prepare_session_for_run(h, model_index, continue_session);
+
     std::string input = prepare_input_for_model(h, model_index, raw_input,
                                                 input_already_formatted);
 
@@ -2311,12 +2654,17 @@ static ErrorCode run_model_streaming_on_handle(CausalLmModel &h,
       LOGD("[DEBUG]   model input: %s", input.c_str());
     }
 
+    if (kv_prefix != nullptr) {
+      run_with_kv_prefix(h, model_index, m, input, *kv_prefix,
+                         model_do_sample(m));
+    } else {
 #if defined(_WIN32)
-    m->run(std::wstring(input.begin(), input.end()), model_do_sample(m), L"",
-           L"", g_verbose);
+      m->run(std::wstring(input.begin(), input.end()), model_do_sample(m), L"",
+             L"", g_verbose);
 #else
-    m->run(input, model_do_sample(m), "", "", true);
+      m->run(input, model_do_sample(m), "", "", true);
 #endif
+    }
 
     if (!get_model_output(m, h.last_output))
       return CAUSAL_LM_ERROR_UNSUPPORTED;
@@ -2351,9 +2699,12 @@ static ErrorCode run_model_streaming_on_handle(CausalLmModel &h,
   } catch (const std::exception &e) {
     LOGE("[DEBUG] run_model_streaming_on_handle: Exception caught: %s",
          e.what());
+    set_last_error(h,
+                   std::string("run_model_streaming_on_handle: ") + e.what());
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   } catch (...) {
     LOGE("[DEBUG] run_model_streaming_on_handle: Unknown exception caught");
+    set_last_error(h, "run_model_streaming_on_handle: unknown exception");
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 
@@ -2536,9 +2887,28 @@ ErrorCode cancelModelHandle(CausalLmHandle handle) {
 #if defined(ENABLE_QNN_MODELS) &&                                              \
   defined(QUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API)
 /**
+ * Callbacks of the producer (models[0]) and consumer (models[1]) of a
+ * multimodal handle; either may be null. See MultimodalCallbacks for the
+ * contract.
+ */
+static const MultimodalCallbacks *multimodal_hooks(const CausalLmModel &h,
+                                                   size_t model_index) {
+  if (model_index >= h.architectures.size())
+    return nullptr;
+  const auto *cb =
+    ModelCallbackRegistry::instance().lookup(h.architectures[model_index]);
+  return cb != nullptr ? &cb->multimodal : nullptr;
+}
+
+/**
  * Model-agnostic multimodal composer. Works through base Transformer virtuals
  * only (no concrete-model casts), so any [vision producer, LLM consumer] pair
- * (e.g. future vJEPA/siglip+LFM) is driven identically.
+ * (e.g. future vJEPA/siglip+LFM) is driven identically. Whatever a particular
+ * pair needs beyond that -- delimiter tokens around the image span, a
+ * different per-position id for some rows, state handed from the producer to
+ * the consumer -- comes from the MultimodalCallbacks that the pair's
+ * architectures registered; with none registered this is the plain
+ * [text | image | text] splice.
  *
  *   llm:          embedding CONSUMER (lookupEmbedding / run_with_embeddings)
  *   image_embeds: producer output; ownership taken here (freed before return)
@@ -2555,8 +2925,22 @@ static ErrorCode execute_multimodal(CausalLmModel &h,
     std::free(image_embeds.first);
     return CAUSAL_LM_ERROR_UNSUPPORTED;
   }
+  const MultimodalCallbacks *producer_hooks = multimodal_hooks(h, 0);
+  const MultimodalCallbacks *consumer_hooks = multimodal_hooks(h, 1);
+
+  causallm::FootprintRun footprint_run;
   std::vector<int> text_ids = tok->Encode(prompt);
   int32_t image_token_id = tok->TokenToId("<|image|>");
+  // Optional delimiter tokens around the image span, named by the consumer's
+  // architecture (a model trained with them degrades without them). Both must
+  // exist in the tokenizer.
+  int32_t boi_token_id = -1;
+  int32_t eoi_token_id = -1;
+  if (consumer_hooks != nullptr && !consumer_hooks->image_begin_token.empty() &&
+      !consumer_hooks->image_end_token.empty()) {
+    boi_token_id = tok->TokenToId(consumer_hooks->image_begin_token);
+    eoi_token_id = tok->TokenToId(consumer_hooks->image_end_token);
+  }
 
   const size_t bpt = llm->embeddingBytesPerToken();
   if (bpt == 0) {
@@ -2581,38 +2965,86 @@ static ErrorCode execute_multimodal(CausalLmModel &h,
     has_placeholder
       ? static_cast<size_t>(std::distance(text_ids.begin(), it_img))
       : 0;
+  const bool wrap_image = boi_token_id >= 0 && eoi_token_id >= 0;
   const size_t n_text_kept = text_ids.size() - (has_placeholder ? 1 : 0);
-  const size_t n_total = n_text_kept + n_image;
-  LOGD("[MM] text=%zu image=%zu total=%zu placeholder=%d pos=%zu",
-       text_ids.size(), n_image, n_total, has_placeholder, img_pos);
+  const size_t n_total = n_text_kept + n_image + (wrap_image ? 2 : 0);
+  // Image rows start after the begin delimiter (when present).
+  const size_t img_span_start = img_pos + (wrap_image ? 1 : 0);
+  LOGD("[MM] text=%zu image=%zu total=%zu placeholder=%d pos=%zu wrap=%d",
+       text_ids.size(), n_image, n_total, has_placeholder, img_pos,
+       wrap_image ? 1 : 0);
 
   std::vector<uint8_t> combined(n_total * bpt);
   uint8_t *dst = combined.data();
-  auto copy_text_range = [&](size_t start, size_t end) -> bool {
-    for (size_t i = start; i < end; ++i) {
-      const void *e = llm->lookupEmbedding(text_ids[i]);
-      if (e == nullptr) {
-        LOGE("[MM] lookupEmbedding(%d) null", text_ids[i]);
-        return false;
-      }
-      std::memcpy(dst, e, bpt);
-      dst += bpt;
+  auto copy_token_embed = [&](int32_t token_id) -> bool {
+    const void *e = llm->lookupEmbedding(token_id);
+    if (e == nullptr) {
+      LOGE("[MM] lookupEmbedding(%d) null", token_id);
+      return false;
     }
+    std::memcpy(dst, e, bpt);
+    dst += bpt;
     return true;
   };
-  if (!copy_text_range(0, img_pos)) {
-    std::free(image_embeds.first);
-    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  auto copy_text_range = [&](size_t start, size_t end) -> bool {
+    for (size_t i = start; i < end; ++i)
+      if (!copy_token_embed(text_ids[i]))
+        return false;
+    return true;
+  };
+  bool ok = copy_text_range(0, img_pos);
+  if (ok && wrap_image)
+    ok = copy_token_embed(boi_token_id);
+  if (ok) {
+    std::memcpy(dst, image_embeds.first, n_image * bpt);
+    dst += n_image * bpt;
   }
-  std::memcpy(dst, image_embeds.first, n_image * bpt);
-  dst += n_image * bpt;
+  if (ok && wrap_image)
+    ok = copy_token_embed(eoi_token_id);
   const size_t after_start = has_placeholder ? img_pos + 1 : img_pos;
-  if (!copy_text_range(after_start, text_ids.size())) {
-    std::free(image_embeds.first);
-    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
-  }
+  if (ok)
+    ok = copy_text_range(after_start, text_ids.size());
   std::free(image_embeds.first);
   image_embeds.first = nullptr;
+  if (!ok)
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+
+  // Per-position token ids of the combined sequence: the consumer may use them
+  // to pick per-layer rows for every position and to prime generation with the
+  // last prompt token. Image rows carry the placeholder id unless the producer
+  // says some rows differ.
+  std::vector<int> image_row_ids(n_image,
+                                 image_token_id >= 0 ? image_token_id : -1);
+  if (producer_hooks != nullptr && producer_hooks->image_row_token_ids)
+    producer_hooks->image_row_token_ids(h.models[0].get(), n_image,
+                                        image_token_id, image_row_ids);
+  std::vector<int> position_tokens;
+  position_tokens.reserve(n_total);
+  for (size_t i = 0; i < img_pos; ++i)
+    position_tokens.push_back(text_ids[i]);
+  if (wrap_image)
+    position_tokens.push_back(boi_token_id);
+  position_tokens.insert(position_tokens.end(), image_row_ids.begin(),
+                         image_row_ids.end());
+  if (wrap_image)
+    position_tokens.push_back(eoi_token_id);
+  for (size_t i = after_start; i < text_ids.size(); ++i)
+    position_tokens.push_back(text_ids[i]);
+
+  // Let the consumer take whatever state the producer retained for this span;
+  // released when the run ends, on every exit path.
+  struct SpanBinding {
+    std::function<void()> release;
+    ~SpanBinding() {
+      if (release)
+        release();
+    }
+  } span_binding;
+  if (consumer_hooks != nullptr && consumer_hooks->bind_image_span) {
+    MultimodalSpan span{img_span_start, n_image};
+    span_binding.release =
+      consumer_hooks->bind_image_span(h.models[0].get(), llm, span);
+  }
 
   CallbackStreamer streamer;
   callback_streamer_init(&streamer, callback, user_data);
@@ -2625,7 +3057,7 @@ static ErrorCode execute_multimodal(CausalLmModel &h,
   } detach_guard{llm};
 
   try {
-    llm->run_with_embeddings(combined.data(), n_total, text_ids,
+    llm->run_with_embeddings(combined.data(), n_total, position_tokens,
                              model_do_sample(llm), /*log_output=*/g_verbose);
     h.kv_len = llm->getKvLen();
   } catch (const std::exception &e) {
@@ -2637,7 +3069,10 @@ static ErrorCode execute_multimodal(CausalLmModel &h,
 
 /**
  * Run the vision encoder (producer) on raw pixels and return its image
- * embeddings, after matching its quant space to the LLM consumer.
+ * embeddings, after matching its quant space to the LLM consumer. A producer
+ * whose architecture registered MultimodalCallbacks::encode_image encodes
+ * through it (e.g. to retain side state for the consumer); otherwise this is
+ * Transformer::run_image.
  * @return image_embeds (ownership transferred to caller) or {nullptr,0}.
  */
 static causallm::multimodal_pointer
@@ -2655,6 +3090,11 @@ run_vision_encoder(CausalLmModel &h, const char *prompt,
                              PATCH_SIZE * sizeof(float);
   causallm::multimodal_pointer image_in{const_cast<float *>(pixelValues),
                                         pixel_bytes};
+  const MultimodalCallbacks *hooks = multimodal_hooks(h, 0);
+  if (hooks != nullptr && hooks->encode_image)
+    return hooks->encode_image(vision, llm, std::string(prompt ? prompt : ""),
+                               image_in, originalHeight, originalWidth,
+                               g_verbose);
   return vision->run_image(std::string(prompt ? prompt : ""), image_in,
                            originalHeight, originalWidth, /*do_sample=*/false,
                            "", "", g_verbose);
@@ -2822,6 +3262,7 @@ ErrorCode runMultimodalHandleStreaming(CausalLmHandle handle,
                                       originalHeight, originalWidth);
   } catch (const std::exception &e) {
     LOGE("[DEBUG] runMultimodalHandleStreaming: vision threw: %s", e.what());
+    set_last_error(h, std::string("vision encoder: ") + e.what());
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 
@@ -2924,6 +3365,7 @@ ErrorCode runMultimodalHandleWithMessages(
                          originalHeight, originalWidth);
   } catch (const std::exception &e) {
     LOGE("[DEBUG] runMultimodalHandleWithMessages: vision threw: %s", e.what());
+    set_last_error(h, std::string("vision encoder: ") + e.what());
     *outputText = nullptr;
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
@@ -3011,10 +3453,14 @@ ErrorCode runModelHandleWithMessagesStreaming(
   } catch (const std::exception &e) {
     LOGE("[DEBUG] runModelHandleWithMessagesStreaming: Exception caught: %s",
          e.what());
+    set_last_error(
+      *handle, std::string("runModelHandleWithMessagesStreaming: ") + e.what());
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   } catch (...) {
     LOGE(
       "[DEBUG] runModelHandleWithMessagesStreaming: Unknown exception caught");
+    set_last_error(*handle,
+                   "runModelHandleWithMessagesStreaming: unknown exception");
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 }
@@ -3080,10 +3526,15 @@ ErrorCode runMultimodalHandleWithMessagesStreaming(
     LOGE(
       "[DEBUG] runMultimodalHandleWithMessagesStreaming: Exception caught: %s",
       e.what());
+    set_last_error(*handle,
+                   std::string("runMultimodalHandleWithMessagesStreaming: ") +
+                     e.what());
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   } catch (...) {
     LOGE("[DEBUG] runMultimodalHandleWithMessagesStreaming: Unknown exception "
          "caught");
+    set_last_error(
+      *handle, "runMultimodalHandleWithMessagesStreaming: unknown exception");
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 }
@@ -3126,6 +3577,33 @@ ErrorCode runModelHandleWithJsonStreaming(CausalLmHandle handle,
     json request = json::parse(jsonRequest);
     LOGD("[DEBUG]   JSON parsed successfully");
 
+    // {"continue_session": true}: keep the KV the handle already holds and send
+    // only the new turn. Absent or false, the run starts a fresh session.
+    if (request.contains("continue_session") &&
+        !request["continue_session"].is_boolean()) {
+      set_last_error(*handle, "runModelHandleWithJsonStreaming: "
+                              "continue_session must be a boolean");
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
+    const bool continue_session = request.value("continue_session", false);
+
+    // Demo extension: {"kv_prefix": {"static": ..., "dynamic": ...,
+    // "mode": ...}}, both texts pre-formatted; see run_with_kv_prefix.
+    if (request.contains("kv_prefix")) {
+      KvPrefix prefix;
+      std::string dynamic;
+      const std::string why = parse_kv_prefix(request, prefix, dynamic);
+      if (!why.empty()) {
+        LOGE("[DEBUG] runModelHandleWithJsonStreaming: %s", why.c_str());
+        set_last_error(*handle,
+                       std::string("runModelHandleWithJsonStreaming: ") + why);
+        return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+      }
+      return run_model_streaming_on_handle(h, dynamic, callback, user_data,
+                                           /*input_already_formatted=*/true,
+                                           model_index, &prefix);
+    }
+
     // Apply chat template using the existing g_chat_template
     // The chat_template.apply() method handles messages, tools, functions, etc.
     std::string formattedInput;
@@ -3145,17 +3623,25 @@ ErrorCode runModelHandleWithJsonStreaming(CausalLmHandle handle,
     LOGD("[DEBUG] runModelHandleWithJsonStreaming: Running inference...");
     return run_model_streaming_on_handle(h, formattedInput, callback, user_data,
                                          /*input_already_formatted=*/true,
-                                         model_index);
+                                         model_index, /*kv_prefix=*/nullptr,
+                                         continue_session);
   } catch (const json::exception &e) {
     LOGE("[DEBUG] runModelHandleWithJsonStreaming: JSON parse error: %s",
          e.what());
+    set_last_error(*handle, std::string("runModelHandleWithJsonStreaming: "
+                                        "JSON parse error: ") +
+                              e.what());
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   } catch (const std::exception &e) {
     LOGE("[DEBUG] runModelHandleWithJsonStreaming: Exception caught: %s",
          e.what());
+    set_last_error(*handle,
+                   std::string("runModelHandleWithJsonStreaming: ") + e.what());
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   } catch (...) {
     LOGE("[DEBUG] runModelHandleWithJsonStreaming: Unknown exception caught");
+    set_last_error(*handle, "runModelHandleWithJsonStreaming: unknown "
+                            "exception");
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 }

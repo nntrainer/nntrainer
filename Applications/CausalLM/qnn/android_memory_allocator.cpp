@@ -14,6 +14,8 @@
 #define RPCMEM_HEAP_ID_SYSTEM 25
 #define RPCMEM_DEFAULT_FLAGS 1
 
+namespace {
+
 typedef void *(*RpcMemAllocFn_t)(int, unsigned int, int);
 typedef void (*RpcMemFreeFn_t)(void *);
 
@@ -24,7 +26,6 @@ enum {
 };
 
 bool inited = false;
-void *handle;
 RpcMemAllocFn_t rpcmem_alloc;
 RpcMemFreeFn_t rpcmem_free;
 
@@ -40,6 +41,8 @@ void init_RPCMEM() {
     std::cerr << "open rpc mem failed" << std::endl;
   }
 }
+
+} // namespace
 
 void *allocate(size_t fileSize) {
   if (!inited) {

@@ -5,9 +5,10 @@ gemma4_src = [
 
 gemma4_inc = include_directories('.')
 
-gemma4_moe_layer = shared_library(
+gemma4_moe_layer = build_target(
     'gemma4_moe_layer',
     meson.current_source_dir() / 'gemma4_moe_layer.cpp',
+    target_type: causallm_layer_type,
     include_directories: [causallm_layer_inc, gemma4_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

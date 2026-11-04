@@ -22,6 +22,8 @@
 #include <util_func.h>
 namespace nntrainer {
 
+Layer::~Layer() = default;
+
 LayerImpl::LayerImpl() :
   layer_impl_props(
     std::make_unique<

@@ -36,6 +36,9 @@
 #include "chat_template.h"
 #include "lfm2_runtime_defaults.h"
 #include "model_registry.h"
+#ifdef NNTR_STATIC_MODEL_EXTENSION
+#include "api/ext_model_loader.h"
+#endif
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -200,6 +203,10 @@ std::string resolve_architecture(std::string model_type,
  * @brief Entry point for loading, initializing, and running a CausalLM model.
  */
 int main(int argc, char *argv[]) {
+#ifdef NNTR_STATIC_MODEL_EXTENSION
+  // Drain the archive's registration queue only after every TU initialized.
+  quick_dot_ai::ensureExtensionModels();
+#endif
 
   auto start_time = std::chrono::high_resolution_clock::now();
 

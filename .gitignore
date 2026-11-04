@@ -6,6 +6,7 @@
 /builddir
 /builddir_app
 /builddir_app_machine
+/builddir_app_stage
 .cache/
 .idea/
 
