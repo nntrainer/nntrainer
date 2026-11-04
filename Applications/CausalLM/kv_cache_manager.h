@@ -14,6 +14,7 @@
 #define __KV_CACHE_MANAGER_H__
 
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <stdexcept>
@@ -442,8 +443,8 @@ public:
    */
   void setLayerDetached(unsigned int layer_idx, bool detached) {
     if (detached_.size() <= layer_idx)
-      detached_.resize(layer_idx + 1, false);
-    detached_[layer_idx] = detached;
+      detached_.resize(layer_idx + 1, 0);
+    detached_[layer_idx] = detached ? 1 : 0;
   }
 
   /** @brief The base compact(@a pos) would leave the layer at, without
@@ -473,7 +474,7 @@ public:
   bool isStaging() const { return staging_rows_ > 0; }
 
   bool isLayerDetached(unsigned int layer_idx) const {
-    return layer_idx < detached_.size() && detached_[layer_idx];
+    return layer_idx < detached_.size() && detached_[layer_idx] != 0;
   }
 
   /**
@@ -608,7 +609,9 @@ private:
   std::vector<unsigned int> layer_caps_;
   /** [HTP window] per-layer window of a compacting layer (0 = ring or full) */
   std::vector<unsigned int> keep_;
-  std::vector<bool> detached_;              /**< setLayerDetached */
+  /** setLayerDetached; bytes, not vector<bool>: GCC 13 -Warray-bounds
+   *  misfires on vector<bool>::resize inlined into the callers */
+  std::vector<uint8_t> detached_;
   unsigned int staging_rows_ = 0;           /**< [C] setStaging */
   nntrainer::Tensor staging_k_, staging_v_; /**< [C] the shared blocks */
   /** [HTP window] per-layer absolute position of row 0 */
