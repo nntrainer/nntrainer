@@ -123,7 +123,8 @@ void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
-  bool is_prefill = !from;
+  // a later chunk of a chunked prompt (from > 0) is prefill too
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
