@@ -3,17 +3,18 @@
 This opt-in path manages the authoritative DSP INT8 KV of the fully resident
 Gemma4 MoE graph. The existing contiguous DSP path remains the default.
 
-Full-page prefix selection is implemented, but the new divergent-input model
-check found fresh/reused greedy output differences. Its structural/source checks
-pass; the full output-equality check fails. See the partial-prefix result below
-before treating this path as output-preserving or quoting a speed benefit.
+Exact fresh/reused output-ID checks now pass in the opt-in `q8_row` radix
+mode. See [current implementation and validation](gemma4-htp-radix-prefix.md)
+for its configuration, memory cost and measured TTFT. The historical model
+measurements below used the earlier INT8-state slicing path and must not be
+interpreted as validation of the new prefill policy.
 
 | Feature | Implementation |
 | --- | --- |
 | Sessions | Create, select, delete and fork independent conversations in one loaded model. One conversation executes at a time. |
 | Paged KV | Native DSP page tables. Each physical page stores one layer/head's 64-token K tile and V rows. Attention reads the pages directly, without gathering history. |
 | Sharing | Retained states share immutable physical pages. Append detaches the pages it modifies before dispatching workers. Quantizer state and runtime positions belong to each state. |
-| Radix prefix index | Compressed token edges identify the longest available full-page prefix before the last input token, plus completed endpoints. A hit shares only the matched pages and restores their encoding scales, window bases and counters. |
+| Radix prefix index | Compressed token edges select causally reproducible FP16 prefill pages. A hit restores the matched pages and processes the unmatched suffix in HMX before seeding DSP INT8 decode. |
 | Global / Sliding | Global grows by pages. Sliding reserve releases whole old tiles and remaps retained pages without copying their KV payload. |
 | Flash | Existing transactional INT8 snapshots also export/import paged caches. Parking releases the active page table's references. Pages pinned by other sessions/prefixes remain resident. |
 
@@ -24,7 +25,11 @@ Use the fully resident `htp_fused` Gemma4 MoE profile and configure:
 
 ```json
 {
+  "attention_kv_dtype": "q8_row",
+  "skip_prefill": true,
+  "init_seq_len": 4096,
   "htp": {
+    "kv_prefix_cache": true,
     "kv_session": true,
     "kv_paged": true,
     "kv_request_reserve": true
@@ -86,43 +91,32 @@ This is the native request sequence interface; HTTP serving is a separate layer.
 
 ## Prefix semantics and bounds
 
-On an empty conversation, `run()` tokenizes its complete input and searches the
-radix index. Each retained state publishes terminals at every available 64-token
-page boundary, plus its completed endpoint. All those terminals borrow the same
-retained handle; there is no checkpoint or KV copy per page. A hit selects the
-matched pages, shortens all layer lengths/absolute counters, releases the new
-active table's suffix references, and computes the remaining input. The original
-retained state remains intact. Continued conversations already own their history
-and do not search the index. At least one input token is left for fresh logits.
+The radix index publishes the available 64-token boundaries of the computed
+prefill. A retained 1024-token prompt can supply its first 768 tokens without
+executing a separate 768-token prompt. Host FP16 pages are immutable and shared;
+boundary metadata contains their layout and attention state. Unlike a decode
+snapshot's INT8 pages, these preserve the input precision needed to reproduce
+fresh prefill and its final decode quantization. Prefix eviction releases these
+pins; decode sessions retain their own INT8 state.
 
-For example, one retained 1024-token state supplies a 768-token hit when the next
-input diverges at token 769: the new active table shares the first 12 pages and
-allocates new pages for its suffix. No separate 768-token checkpoint is required.
-A divergence after token 750 reuses the first 704 tokens (11 full pages). An input
-identical to all 1024 saved tokens reuses 960, leaving the last page to produce
-fresh logits. If there is also a completed endpoint between two page boundaries,
-it can supply a longer hit, provided it precedes the final input token.
+A new complete input searches for the longest available prefix strictly before
+its final token. A divergence after 750 tokens reuses 704 tokens. A continuation
+of an existing conversation uses its resident state instead of radix lookup.
+The unmatched suffix runs as HMX prefill, then the last prompt token seeds and
+starts DSP decode. The source session remains unchanged.
 
-A sliding cache can actually have released old rows before the retained state
-was captured. Such a state cannot supply an earlier prefix that needs those rows:
-the index excludes its unavailable boundaries. An older retained state can still
-supply them. This is missing cached payload, not a requirement to have captured a
-checkpoint at every prefix length. Global layers keep their full history.
+This requires `htp.kv_prefix_cache=true` and `attention_kv_dtype=q8_row`.
+Per-row quantization and fixed attention reduction tiles remove dependence on
+future suffix rows. The original `q8` whole-block quantization remains available
+for sessions with prefix caching disabled. Configuration or attention failures
+in radix mode raise an error instead of changing the prefill policy silently.
 
-The retained INT8 bytes stay paired with their original encoding scales; reuse
-does not recalibrate/requantize them at the shorter prefix. Fresh prefill of a
-different complete input can choose different quantizers or chunking, so universal
-bit equality with fresh recomputation is not claimed. Tests check exact encoded
-attention and source preservation, and compare unmodified greedy outputs against
-fresh model runs for the recorded divergent-input fixtures.
-
-Limits are counts of sessions and published prefixes; their sum must be at most
-120. Prefix terminals use LRU eviction. This bounds retained handles, **not total
-DRAM bytes**. There is no automatic device DRAM budget or Flash demotion policy
-in this manager. Explicit Flash save/load remains available. Clear prefix pins
-with `clearDeviceKVPrefixes()` and delete unused sessions to release their pages.
-`getDeviceKVCacheBytes()` reports the active table's referenced K/V payload;
-it excludes scratch/scales and does not measure the union of all retained states.
+Limits are counts of sessions and retained prefixes, totalling at most 120.
+Prefix retention uses LRU. These limits do **not** constitute a DRAM byte
+budget. Explicit DSP Flash snapshots remain supported; the host prefill radix
+index is not persisted in those snapshots. `getDeviceKVCacheBytes()` reports
+active DSP K/V payload, while `getDeviceKVPrefixBytes()` counts unique retained
+host prefill K/V pages. See the current validation for their separate costs.
 
 ## Checks
 
@@ -144,12 +138,12 @@ prefix terminals, LRU, session branching and failed restore isolation.
 `tools/kv_cache/check_htp_sessions.cpp` is a native Android integration checker.
 It uses the model's tokenizer and unmodified greedy generation, checks repeated
 A/B switches and fork continuation against independent references, checks radix
-hits, and checks paged Flash restore. Its optional fourth argument is a baseline
-JSON from the same executable with `htp.kv_paged=false`; outputs and positions
-must match before comparisons are accepted. Runtime metrics report steady decode
+hits against independent full-history prefill, and checks paged Flash restore.
+The current native checker targets build through `app_build` with
+`-Denable-htp-device-check=true`. Runtime metrics report steady decode
 as median ms/token; convert to TPS with `1000 / decode_steady_ms`.
 
-## Android result — 2026-11-04
+## Historical Android result — before exact prefill reuse
 
 SM-S948N, Android 16, SM8850/v81; Gemma4 26B A4B HTP fused, 8 ARM threads,
 8 requested decode steps, no forced tokens/logits instrumentation. Seed lengths
@@ -179,7 +173,7 @@ Full fixture, configuration, per-request IDs/positions/metrics, CLI output and
 binary hashes: [validation JSON](validation/gemma4-dsp-paged-sessions-20261104.json).
 
 
-## Speed comparison with session management enabled
+## Historical speed comparison with session management enabled
 
 The earlier contiguous/paged comparison isolates the page layout, with the
 session manager disabled in both reference phases. The table below instead
@@ -210,7 +204,7 @@ paired with full-history recomputation of the same complete inputs, so they
 must not be quoted as a measured recomputation speedup.
 
 
-## Full-page prefix validation
+## Historical INT8 page-prefix validation
 
 `tools/kv_cache/check_htp_page_prefix.cpp` checks the case that a complete
 1024-token source is retained once and a new input diverges after token 768.
@@ -222,7 +216,7 @@ and branching path. Sliding coverage tests keep an older available source and
 exclude only boundaries whose required rows were actually released.
 
 
-### Android partial-prefix result and unresolved output mismatch
+### Earlier Android partial-prefix output mismatch
 
 The page-prefix fix was checked separately from the earlier checkpoint-only
 measurements. One 1024-token prompt was retained. Each of two new inputs shared
