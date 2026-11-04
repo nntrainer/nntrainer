@@ -120,6 +120,9 @@ private:
 void HtpAttentionState::beginHtpPrompt() {
   release_quantized_cache();
   config_.cache_index = 0;
+  // the new prompt's KV manager starts every layer at row 0; compact() only
+  // moves a base forward, so the previous prompt's base would stay here
+  config_.cache_base = 0;
   htp_owns_cache_ = false;
   q_cache_failed = false;
   q2_calibrated = false;
