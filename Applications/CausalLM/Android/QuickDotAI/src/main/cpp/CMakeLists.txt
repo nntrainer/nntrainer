@@ -15,7 +15,8 @@ set(CAUSALLM_API_DIR
 
 # Staged arm64-v8a native libraries.
 set(PREBUILT_LIBS_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt_libs")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt_libs"
+    CACHE PATH "Directory containing the selected native stage")
 
 add_library(quick_dot_ai_api SHARED IMPORTED)
 set_target_properties(quick_dot_ai_api PROPERTIES

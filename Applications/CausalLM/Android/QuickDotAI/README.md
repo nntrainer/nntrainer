@@ -33,6 +33,12 @@ without `--htp` for a CPU-only package); see
 [Build from source](../../../../docs/quickai/build.md). A direct Gradle build
 must pass `-PnntrainerNdkPath=<absolute NDK path>`.
 
+The same sources can package a native stage assembled elsewhere: pass
+`-PnntrainerPrebuiltDir=<absolute stage directory>` to Gradle (default
+`QuickDotAI/prebuilt_libs`). A public stage has no model-extension plugin; an
+internal stage adds its plugin to the otherwise identical runtime. The `Sync`
+task removes libraries left by the previously selected stage.
+
 ### Packaging rules for the consuming app
 
 The HTP build needs two settings in the app's `build.gradle.kts`, which the
@@ -117,6 +123,13 @@ library boundary.
 `useSpeculativeDecoding`, and for LiteRT `modelPath`, `visionBackend`,
 `cacheDir`, `maxNumTokens`. `htpBackendConfigPath` is accepted but not
 forwarded by the native engine.
+
+QNN models need `htp_backend_ext_config.json` provisioned next to the model
+files; the AAR does not create it. The by-name load honors an existing
+`QUICK_DOT_AI_QNN_BACKEND_EXT_CONFIG_PATH`; otherwise it takes `modelBasePath`,
+removes a trailing `/models` and appends `/htp_backend_ext_config.json`. With
+`modelBasePath=<filesDir>/models` the file goes to
+`<filesDir>/htp_backend_ext_config.json`.
 
 ### Streaming, threads and cancellation
 

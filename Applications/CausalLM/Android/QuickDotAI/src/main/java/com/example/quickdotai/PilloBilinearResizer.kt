@@ -3,183 +3,181 @@ package com.example.quickdotai
 import kotlin.math.abs
 import kotlin.math.ceil
 
-class PillowBilinearResizer {
-    companion object {
+/**
+ * Pillow's `ImagingResample` in Kotlin: a separable two-pass resample with
+ * support scaling (i.e. antialiasing on downscale) and 22-bit fixed-point
+ * weights, so the output matches `PIL.Image.resize()` to within a LSB.
+ *
+ * The filter is a (kernel, support) pair, exactly as Pillow models it:
+ *   BILINEAR -> support 1.0,  BICUBIC -> support 2.0 (Catmull-Rom a = -0.5).
+ *
+ * [PillowBicubicResizer] implements `resample: 3` and
+ * [PillowBilinearResizer] implements `resample: 2` from processor configs.
+ */
+internal object PillowResample {
 
-        // Bilinear kernel
-        private fun bilinearKernel(x: Double): Double {
-            val absX = abs(x)
-            if (absX < 1.0) {
-                return 1.0 - absX
+    /** A resample filter: the kernel and its (unscaled) support radius. */
+    internal class Filter(val support: Double, val kernel: (Double) -> Double)
+
+    val BILINEAR = Filter(1.0) { x ->
+        val absX = abs(x)
+        if (absX < 1.0) 1.0 - absX else 0.0
+    }
+
+    /**
+     * Pillow's BICUBIC: the Keys cubic with a = -0.5 (Catmull-Rom), the same
+     * kernel torchvision/PIL use for `resample=3`.
+     */
+    val BICUBIC = Filter(2.0) { x ->
+        val a = -0.5
+        val absX = abs(x)
+        when {
+            absX < 1.0 -> ((a + 2.0) * absX - (a + 3.0)) * absX * absX + 1.0
+            absX < 2.0 -> (((absX - 5.0) * absX + 8.0) * absX - 4.0) * a
+            else -> 0.0
+        }
+    }
+
+    private const val PRECISION_BITS = 22
+
+    /** Precomputed per-output-pixel bounds + fixed-point weights for one axis. */
+    private class Coeffs(val bounds: IntArray, val kk: IntArray, val kSize: Int)
+
+    private fun computeCoeffs(inSize: Int, outSize: Int, filter: Filter): Coeffs {
+        val scale = inSize.toDouble() / outSize
+        val filterScale = if (scale < 1.0) 1.0 else scale
+        val support = filter.support * filterScale
+        val invFilterScale = 1.0 / filterScale
+
+        val kSize = ceil(support).toInt() * 2 + 1
+        val bounds = IntArray(outSize * 2)
+        val kk = IntArray(outSize * kSize)
+
+        for (o in 0 until outSize) {
+            val center = (o + 0.5) * scale
+            var min = (center - support + 0.5).toInt()
+            var max = (center + support + 0.5).toInt()
+            if (min < 0) min = 0
+            if (max > inSize) max = inSize
+            val count = max - min
+
+            bounds[o * 2] = min
+            bounds[o * 2 + 1] = count
+
+            var ww = 0.0
+            val weights = DoubleArray(count)
+            for (i in 0 until count) {
+                val w = filter.kernel((min + i + 0.5 - center) * invFilterScale)
+                weights[i] = w
+                ww += w
             }
-            return 0.0
+            for (i in 0 until count) {
+                if (ww != 0.0) weights[i] /= ww
+                kk[o * kSize + i] = if (weights[i] < 0) {
+                    (weights[i] * (1 shl PRECISION_BITS) - 0.5).toInt()
+                } else {
+                    (weights[i] * (1 shl PRECISION_BITS) + 0.5).toInt()
+                }
+            }
+        }
+        return Coeffs(bounds, kk, kSize)
+    }
+
+    fun resize(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        newWidth: Int,
+        newHeight: Int,
+        filter: Filter
+    ): IntArray {
+        val halfOne = 1 shl (PRECISION_BITS - 1)
+
+        // 1. Horizontal pass: (width, height) -> (newWidth, height)
+        val cx = computeCoeffs(width, newWidth, filter)
+        val tempPixels = IntArray(newWidth * height)
+        for (y in 0 until height) {
+            for (x in 0 until newWidth) {
+                val xMin = cx.bounds[x * 2]
+                val count = cx.bounds[x * 2 + 1]
+                var r = halfOne
+                var g = halfOne
+                var b = halfOne
+                var a = halfOne
+                for (i in 0 until count) {
+                    val weight = cx.kk[x * cx.kSize + i]
+                    val pixel = pixels[y * width + xMin + i]
+                    a += ((pixel shr 24) and 0xFF) * weight
+                    r += ((pixel shr 16) and 0xFF) * weight
+                    g += ((pixel shr 8) and 0xFF) * weight
+                    b += (pixel and 0xFF) * weight
+                }
+                tempPixels[y * newWidth + x] =
+                    (((a shr PRECISION_BITS).coerceIn(0, 255)) shl 24) or
+                        (((r shr PRECISION_BITS).coerceIn(0, 255)) shl 16) or
+                        (((g shr PRECISION_BITS).coerceIn(0, 255)) shl 8) or
+                        ((b shr PRECISION_BITS).coerceIn(0, 255))
+            }
         }
 
+        // 2. Vertical pass: (newWidth, height) -> (newWidth, newHeight)
+        val cy = computeCoeffs(height, newHeight, filter)
+        val finalPixels = IntArray(newWidth * newHeight)
+        for (x in 0 until newWidth) {
+            for (y in 0 until newHeight) {
+                val yMin = cy.bounds[y * 2]
+                val count = cy.bounds[y * 2 + 1]
+                var r = halfOne
+                var g = halfOne
+                var b = halfOne
+                var a = halfOne
+                for (i in 0 until count) {
+                    val weight = cy.kk[y * cy.kSize + i]
+                    val pixel = tempPixels[(yMin + i) * newWidth + x]
+                    a += ((pixel shr 24) and 0xFF) * weight
+                    r += ((pixel shr 16) and 0xFF) * weight
+                    g += ((pixel shr 8) and 0xFF) * weight
+                    b += (pixel and 0xFF) * weight
+                }
+                finalPixels[y * newWidth + x] =
+                    (((a shr PRECISION_BITS).coerceIn(0, 255)) shl 24) or
+                        (((r shr PRECISION_BITS).coerceIn(0, 255)) shl 16) or
+                        (((g shr PRECISION_BITS).coerceIn(0, 255)) shl 8) or
+                        ((b shr PRECISION_BITS).coerceIn(0, 255))
+            }
+        }
+        return finalPixels
+    }
+}
+
+/** `PIL.Image.resize(..., Image.BILINEAR)`. */
+class PillowBilinearResizer {
+    companion object {
         fun resize(
             pixels: IntArray,
             width: Int,
             height: Int,
             newWidth: Int,
             newHeight: Int
-        ): IntArray {
-            // Pillow uses fixed point arithmetic with 22 bits of precision for weights
-            val precisionBits = 22
-            val halfOne = 1 shl (precisionBits - 1)
+        ): IntArray = PillowResample.resize(
+            pixels, width, height, newWidth, newHeight, PillowResample.BILINEAR
+        )
+    }
+}
 
-            // 1. Horizontal Pass: (width, height) -> (newWidth, height)
-            val tempPixels = IntArray(newWidth * height)
-            val xScale = width.toDouble() / newWidth
-            val filterScaleX = if (xScale < 1.0) 1.0 else xScale
-            val supportX = 1.0 * filterScaleX // Support is 1.0 for Bilinear
-            val scaleFactorX = 1.0 / filterScaleX
-
-            // Precompute weights for horizontal pass
-            val kSizeX = (ceil(supportX).toInt() * 2 + 1)
-            val boundsX = IntArray(newWidth * 2)
-            val kkX = IntArray(newWidth * kSizeX)
-
-            for (x in 0 until newWidth) {
-                val center = (x + 0.5) * xScale
-                var xMin = (center - supportX + 0.5).toInt()
-                var xMax = (center + supportX + 0.5).toInt()
-
-                if (xMin < 0) xMin = 0
-                if (xMax > width) xMax = width
-
-                val count = xMax - xMin
-
-                boundsX[x * 2] = xMin
-                boundsX[x * 2 + 1] = count
-
-                var ww = 0.0
-                val weights = DoubleArray(count)
-                for (i in 0 until count) {
-                    val srcX = xMin + i
-                    val w = bilinearKernel((srcX + 0.5 - center) * scaleFactorX)
-                    weights[i] = w
-                    ww += w
-                }
-
-                // Normalize and convert to fixed point
-                for (i in 0 until count) {
-                    if (ww != 0.0) weights[i] /= ww
-                    val fw = if (weights[i] < 0) {
-                        (weights[i] * (1 shl precisionBits) - 0.5).toInt()
-                    } else {
-                        (weights[i] * (1 shl precisionBits) + 0.5).toInt()
-                    }
-                    kkX[x * kSizeX + i] = fw
-                }
-            }
-
-            for (y in 0 until height) {
-                for (x in 0 until newWidth) {
-                    val xMin = boundsX[x * 2]
-                    val count = boundsX[x * 2 + 1]
-
-                    var r = halfOne
-                    var g = halfOne
-                    var b = halfOne
-                    var a = halfOne
-
-                    for (i in 0 until count) {
-                        val weight = kkX[x * kSizeX + i]
-                        val srcX = xMin + i
-                        val pixel = pixels[y * width + srcX]
-
-                        a += ((pixel shr 24) and 0xFF) * weight
-                        r += ((pixel shr 16) and 0xFF) * weight
-                        g += ((pixel shr 8) and 0xFF) * weight
-                        b += (pixel and 0xFF) * weight
-                    }
-
-                    val rInt = (r shr precisionBits).coerceIn(0, 255)
-                    val gInt = (g shr precisionBits).coerceIn(0, 255)
-                    val bInt = (b shr precisionBits).coerceIn(0, 255)
-                    val aInt = (a shr precisionBits).coerceIn(0, 255)
-
-                    tempPixels[y * newWidth + x] =
-                        (aInt shl 24) or (rInt shl 16) or (gInt shl 8) or bInt
-                }
-            }
-
-            // 2. Vertical Pass: (newWidth, height) -> (newWidth, newHeight)
-            val finalPixels = IntArray(newWidth * newHeight)
-            val yScale = height.toDouble() / newHeight
-            val filterScaleY = if (yScale < 1.0) 1.0 else yScale
-            val supportY = 1.0 * filterScaleY // Support is 1.0 for Bilinear
-            val scaleFactorY = 1.0 / filterScaleY
-
-            val kSizeY = (ceil(supportY).toInt() * 2 + 1)
-            val boundsY = IntArray(newHeight * 2)
-            val kkY = IntArray(newHeight * kSizeY)
-
-            for (y in 0 until newHeight) {
-                val center = (y + 0.5) * yScale
-                var yMin = (center - supportY + 0.5).toInt()
-                var yMax = (center + supportY + 0.5).toInt()
-
-                if (yMin < 0) yMin = 0
-                if (yMax > height) yMax = height
-
-                val count = yMax - yMin
-
-                boundsY[y * 2] = yMin
-                boundsY[y * 2 + 1] = count
-
-                var ww = 0.0
-                val weights = DoubleArray(count)
-                for (i in 0 until count) {
-                    val srcY = yMin + i
-                    val w = bilinearKernel((srcY + 0.5 - center) * scaleFactorY)
-                    weights[i] = w
-                    ww += w
-                }
-
-                for (i in 0 until count) {
-                    if (ww != 0.0) weights[i] /= ww
-                    val fw = if (weights[i] < 0) {
-                        (weights[i] * (1 shl precisionBits) - 0.5).toInt()
-                    } else {
-                        (weights[i] * (1 shl precisionBits) + 0.5).toInt()
-                    }
-                    kkY[y * kSizeY + i] = fw
-                }
-            }
-
-            for (x in 0 until newWidth) {
-                for (y in 0 until newHeight) {
-                    val yMin = boundsY[y * 2]
-                    val count = boundsY[y * 2 + 1]
-
-                    var r = halfOne
-                    var g = halfOne
-                    var b = halfOne
-                    var a = halfOne
-
-                    for (i in 0 until count) {
-                        val weight = kkY[y * kSizeY + i]
-                        val srcY = yMin + i
-                        val pixel = tempPixels[srcY * newWidth + x]
-
-                        a += ((pixel shr 24) and 0xFF) * weight
-                        r += ((pixel shr 16) and 0xFF) * weight
-                        g += ((pixel shr 8) and 0xFF) * weight
-                        b += (pixel and 0xFF) * weight
-                    }
-
-                    val rInt = (r shr precisionBits).coerceIn(0, 255)
-                    val gInt = (g shr precisionBits).coerceIn(0, 255)
-                    val bInt = (b shr precisionBits).coerceIn(0, 255)
-                    val aInt = (a shr precisionBits).coerceIn(0, 255)
-
-                    finalPixels[y * newWidth + x] =
-                        (aInt shl 24) or (rInt shl 16) or (gInt shl 8) or bInt
-                }
-            }
-
-            return finalPixels
-        }
-
+/**
+ * `PIL.Image.resize(..., Image.BICUBIC)` (`processor_config.json` `"resample": 3`).
+ */
+class PillowBicubicResizer {
+    companion object {
+        fun resize(
+            pixels: IntArray,
+            width: Int,
+            height: Int,
+            newWidth: Int,
+            newHeight: Int
+        ): IntArray = PillowResample.resize(
+            pixels, width, height, newWidth, newHeight, PillowResample.BICUBIC
+        )
     }
 }

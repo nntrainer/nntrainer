@@ -156,7 +156,16 @@ data class LoadModelRequest(
      * Only honored by [NativeQuickDotAI]; [LiteRTLm] ignores it.
      */
     @SerialName("htp_backend_config_path") val htpBackendConfigPath: String? = null,
-    val useSpeculativeDecoding: Boolean = false,
+    /**
+     * Speculative decoding, three-state:
+     *  - null (default): AUTO — enable SD when the loaded model supports
+     *    it, silently run without it otherwise. This is the recommended
+     *    setting; SD is lossless (the target model verifies every token)
+     *    and roughly 2-6x faster where available.
+     *  - true: REQUIRE — fail the load if the model cannot run SD.
+     *  - false: OFF — single-token generation even on SD-capable models.
+     */
+    val useSpeculativeDecoding: Boolean? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per

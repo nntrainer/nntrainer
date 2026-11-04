@@ -52,9 +52,12 @@ class NativeQuickDotAI(
             "load() entered: modelId=${req.modelId} backend=${req.backend} " +
                 "quant=${req.quantization}"
         )
-        if (req.modelId == ModelIds.GEMMA4_26B_A4B_HTP &&
+        if (req.modelId in HTP_MODEL_IDS &&
             (req.backend != BackendType.NPU || req.quantization != QuantizationType.W4A32)) {
-            return BackendResult.Err(QuickAiError.INVALID_PARAMETER, "Gemma4 HTP requires NPU / W4A32")
+            return BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "HTP model '${req.modelId}' requires NPU / W4A32"
+            )
         }
         if (loaded) {
             Log.i(TAG, "load(): already loaded, returning Ok")
@@ -109,14 +112,19 @@ class NativeQuickDotAI(
                     }
                 )
             } else {
-                val sdResult = NativeCausalLm.configureSpeculativeDecodingNative(h, req.useSpeculativeDecoding)
-                if (sdResult != 0) {
+                // null = AUTO: try to enable SD, keep going without it when
+                // the model has no draft. Explicit true still fails hard.
+                val sdWanted = req.useSpeculativeDecoding ?: true
+                val sdResult = NativeCausalLm.configureSpeculativeDecodingNative(h, sdWanted)
+                if (sdResult != 0 && req.useSpeculativeDecoding == true) {
                     Log.e(TAG, "load(): configureSpeculativeDecoding failed (code=$sdResult) for '${req.modelId}'")
                     NativeCausalLm.destroyModelHandleNative(h)
                     return BackendResult.Err(
                         QuickAiError.MODEL_LOAD_FAILED,
                         "Speculative decoding not supported for '${req.modelId}'"
                     )
+                } else if (sdResult != 0) {
+                    Log.i(TAG, "load(): '${req.modelId}' has no speculative decoding; continuing without (auto mode)")
                 }
                 handle = h
                 loaded = true
@@ -124,8 +132,8 @@ class NativeQuickDotAI(
                 currentModelId = req.modelId
                 visionBackend = req.visionBackend
                 if (req.visionBackend != null) {
-                    imageProcessor = LlavaNextImageProcessor(appContext)
-                    Log.i(TAG, "load(): visionBackend=${req.visionBackend}, image processor initialized")
+                    imageProcessor = createImageProcessor(req.modelId)
+                    Log.i(TAG, "load(): visionBackend=${req.visionBackend}, image processor initialized (modelId=${req.modelId})")
                 }
                 Log.i(TAG, "load(): SUCCESS, handle=0x${h.toString(16)}, sd=${req.useSpeculativeDecoding}")
                 BackendResult.Ok(Unit)
@@ -135,6 +143,26 @@ class NativeQuickDotAI(
             BackendResult.Err(QuickAiError.MODEL_LOAD_FAILED, t.message)
         }
     }
+
+    /** Best-effort native failure detail for error messages ("" if none). */
+    private fun nativeErrorDetail(): String = try {
+        // Under handleLock so a concurrent close() cannot destroy the handle
+        // while the native side copies the message out of it.
+        val msg = synchronized(handleLock) {
+            if (handle == 0L) "" else NativeCausalLm.getLastErrorMessageHandleNative(handle)
+        }
+        if (msg.isBlank()) "" else " — $msg"
+    } catch (t: Throwable) {
+        ""
+    }
+
+    /** Select the pixel layout declared by the encoder's catalog descriptor. */
+    private fun createImageProcessor(modelId: String): LlavaNextImageProcessor =
+        if (ModelCatalog.byId(modelId)?.capabilities?.contains(Capability.PLANAR_CHW) == true) {
+            LlavaNextImageProcessor(appContext, planarChw = true)
+        } else {
+            LlavaNextImageProcessor(appContext)
+        }
 
     override fun metrics(): BackendResult<PerformanceMetrics> {
         if (!loaded || handle == 0L) {
@@ -365,8 +393,8 @@ class NativeQuickDotAI(
             )
             if (errorCode != 0) {
                 val err = QuickAiError.fromNativeCode(errorCode)
-                sink.onError(err, "runModelHandleWithMessagesStreaming failed (errorCode=$errorCode)")
-                BackendResult.Err(err, "runModelHandleWithMessagesStreaming failed (errorCode=$errorCode)")
+                sink.onError(err, "runModelHandleWithMessagesStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
+                BackendResult.Err(err, "runModelHandleWithMessagesStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
             } else {
                 sink.onDone()
                 BackendResult.Ok(Unit)
@@ -426,8 +454,8 @@ class NativeQuickDotAI(
             )
             if (errorCode != 0) {
                 val err = QuickAiError.fromNativeCode(errorCode)
-                sink.onError(err, "runModelHandleWithJsonStreaming failed (errorCode=$errorCode)")
-                BackendResult.Err(err, "runModelHandleWithJsonStreaming failed (errorCode=$errorCode)")
+                sink.onError(err, "runModelHandleWithJsonStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
+                BackendResult.Err(err, "runModelHandleWithJsonStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
             } else {
                 sink.onDone()
                 BackendResult.Ok(Unit)
@@ -477,7 +505,13 @@ class NativeQuickDotAI(
             return err
         }
 
-        val multimodalInput = prepareMultimodalInput(allParts, processor)
+        val multimodalInput = try {
+            prepareMultimodalInput(allParts, processor)
+        } catch (t: Throwable) {
+            val err = BackendResult.Err(QuickAiError.INVALID_PARAMETER, t.message)
+            sink.onError(err.error, err.message)
+            return err
+        }
         if (multimodalInput == null) {
             val err = BackendResult.Err(
                 QuickAiError.INVALID_PARAMETER,
@@ -526,8 +560,8 @@ class NativeQuickDotAI(
             }
             if (errorCode != 0) {
                 val err = QuickAiError.fromNativeCode(errorCode)
-                sink.onError(err, "runMultimodalHandleWithMessagesStreaming failed (errorCode=$errorCode)")
-                BackendResult.Err(err, "runMultimodalHandleWithMessagesStreaming failed (errorCode=$errorCode)")
+                sink.onError(err, "runMultimodalHandleWithMessagesStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
+                BackendResult.Err(err, "runMultimodalHandleWithMessagesStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
             } else {
                 sink.onDone()
                 BackendResult.Ok(Unit)
@@ -583,7 +617,11 @@ class NativeQuickDotAI(
         }
 
         // Extract image and text from parts
-        val multimodalInput = prepareMultimodalInput(parts, processor)
+        val multimodalInput = try {
+            prepareMultimodalInput(parts, processor)
+        } catch (t: Throwable) {
+            return BackendResult.Err(QuickAiError.INVALID_PARAMETER, t.message)
+        }
             ?: return BackendResult.Err(
                 QuickAiError.INVALID_PARAMETER,
                 "No valid image found in parts"
@@ -616,7 +654,7 @@ class NativeQuickDotAI(
             if (errorCode != 0) {
                 val err = QuickAiError.fromNativeCode(errorCode)
                 Log.e(TAG, "runMultimodal(): failed with errorCode=$errorCode")
-                BackendResult.Err(err, "runMultimodalHandle failed (errorCode=$errorCode)")
+                BackendResult.Err(err, "runMultimodalHandle failed (errorCode=$errorCode)${nativeErrorDetail()}")
             } else {
                 val output = accumulated.toString()
                 Log.i(TAG, "runMultimodal(): success, output length=${output.length}")
@@ -663,7 +701,13 @@ class NativeQuickDotAI(
         }
 
         // Extract image and text from parts
-        val multimodalInput = prepareMultimodalInput(parts, processor)
+        val multimodalInput = try {
+            prepareMultimodalInput(parts, processor)
+        } catch (t: Throwable) {
+            val err = BackendResult.Err(QuickAiError.INVALID_PARAMETER, t.message)
+            sink.onError(err.error, err.message)
+            return err
+        }
         if (multimodalInput == null) {
             val err = BackendResult.Err(
                 QuickAiError.INVALID_PARAMETER,
@@ -715,8 +759,8 @@ class NativeQuickDotAI(
             if (errorCode != 0) {
                 val err = QuickAiError.fromNativeCode(errorCode)
                 Log.e(TAG, "runMultimodalStreaming(): failed with errorCode=$errorCode")
-                sink.onError(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)")
-                BackendResult.Err(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)")
+                sink.onError(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
+                BackendResult.Err(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)${nativeErrorDetail()}")
             } else {
                 Log.i(TAG, "runMultimodalStreaming(): success")
                 sink.onDone()
@@ -776,7 +820,21 @@ class NativeQuickDotAI(
             return preprocessSingleImage(imageParts[0], processor)
         }
 
-        // Multiple images: preprocess each and concatenate
+        // Only the V-JEPA engines consume several images per request. The
+        // single-span vision encoders wire exactly one image
+        // into the prompt, and concatenated tiles fail deep inside the
+        // encoder with an opaque "Tile count N does not match the selected
+        // grid" error (integration feedback 2026-08-28 #9) — fail fast
+        // with an error the caller can act on instead.
+        if (currentModelId?.contains("vjepa") != true) {
+            throw IllegalArgumentException(
+                "Model '$currentModelId' supports exactly one image per " +
+                    "request (got ${imageParts.size}). Send additional " +
+                    "images in separate requests."
+            )
+        }
+
+        // Multiple images (V-JEPA): preprocess each and concatenate.
         val allPixelValues = mutableListOf<Float>()
         val patchesPerImageList = mutableListOf<Int>()
         val heightsList = mutableListOf<Int>()
@@ -846,13 +904,24 @@ class NativeQuickDotAI(
             is PromptPart.ImageFile -> {
                 val file = File(part.absolutePath)
                 if (!file.exists() || !file.canRead()) {
-                    Log.w(TAG, "Image file not readable: ${part.absolutePath}")
-                    return null
+                    // Since v0.5.4 the AAR no longer injects storage
+                    // permissions into the host app (integration feedback
+                    // 2026-08-28 #15), so files outside app-owned storage
+                    // are unreadable unless the host holds the permission
+                    // itself. Say so, instead of silently degrading to a
+                    // text-only run.
+                    throw IllegalArgumentException(
+                        "Image file not readable: ${part.absolutePath}. " +
+                            "The host app must hold the storage permission " +
+                            "for this path (the AAR no longer injects one) " +
+                            "— or pass the image as ImageBytes."
+                    )
                 }
                 val bitmap = BitmapFactory.decodeFile(part.absolutePath)
                 if (bitmap == null) {
-                    Log.w(TAG, "Failed to decode image: ${part.absolutePath}")
-                    return null
+                    throw IllegalArgumentException(
+                        "Failed to decode image file: ${part.absolutePath}"
+                    )
                 }
                 val modelInput = processor.preprocess(bitmap)
                 return NativeCausalLm.MultimodalInput(
@@ -864,13 +933,14 @@ class NativeQuickDotAI(
             }
             is PromptPart.ImageBytes -> {
                 if (part.bytes.isEmpty()) {
-                    Log.w(TAG, "Image bytes are empty")
-                    return null
+                    throw IllegalArgumentException("Image bytes are empty")
                 }
                 val bitmap = BitmapFactory.decodeByteArray(part.bytes, 0, part.bytes.size)
                 if (bitmap == null) {
-                    Log.w(TAG, "Failed to decode image from bytes")
-                    return null
+                    throw IllegalArgumentException(
+                        "Failed to decode image from ${part.bytes.size} bytes " +
+                            "(unsupported or corrupt encoding)"
+                    )
                 }
                 val modelInput = processor.preprocess(bitmap)
                 return NativeCausalLm.MultimodalInput(
@@ -911,5 +981,17 @@ class NativeQuickDotAI(
 
     companion object {
         private const val TAG = "NativeQuickDotAI"
+
+        /**
+         * Every HTP model id the native catalog can return. These packs only
+         * exist as W4A32 NPU packs, so any other backend/quantization is
+         * rejected before the native load is attempted.
+         */
+        private val HTP_MODEL_IDS = setOf(
+            ModelIds.GEMMA4_26B_A4B_HTP,
+            "gemma4-26b-a4b-htp-long",
+            "gemma4-26b-a4b-htp-2bit-4bit",
+            ModelIds.LFM2_24BA2B_HTP,
+        )
     }
 }
