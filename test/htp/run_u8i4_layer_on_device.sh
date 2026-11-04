@@ -17,11 +17,11 @@
 #      asserted -- see the ReportPerCallCost* tests' comments)
 #
 # Override any of these if your paths differ:
-: "${HEXAGON_SDK_ROOT:=$HOME/workspace/Hexagon_SDK/6.4.0.2}"
+: "${HEXAGON_SDK_ROOT:=$HOME/workspace/Hexagon_SDK/6.4.0.1}"
 : "${HEXKL_ROOT:=$HOME/workspace/hxkl-beta2/hexkl_addon}"   # beta2, NOT the
                                                             # one under
                                                             # Hexagon_SDK/*/addons/
-: "${HEXKL_SDK_VER:=6.4.0.2}"
+: "${HEXKL_SDK_VER:=6.4.0.1}"
 : "${ANDROID_NDK:=$HOME/workspace/android-ndk-r26d}"
 : "${DEVICE_TMP:=/data/local/tmp/htp_u8i4_layer_test}"
 

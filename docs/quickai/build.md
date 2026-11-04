@@ -13,8 +13,8 @@ how to build and test the host side on a Linux PC. One script,
 | Android NDK | r30 is the tested version. Set `ANDROID_NDK` (or `NDK_ROOT`). |
 | Rust toolchain | `cargo` and `rustc`, used once to build the tokenizer library for Android from the in-tree crate. |
 | JDK 17 and an Android SDK | Only for `--app` (Gradle): platform 36, build-tools 36.0.0, cmake 3.22.1, platform-tools. Gradle finds them through its own configuration; the repository's Gradle files take only the NDK path. |
-| Hexagon SDK | 6.4.0.1 with Hexagon Tools 19.0.04 is the tested version. From Qualcomm, not part of this repository. |
-| HexKL | 1.0 beta 2, whose `lib/6.4.0.2` directory holds `hexagon_toolv19_v81` and `armv8_android26`. From Qualcomm. |
+| Hexagon SDK | 6.4.0.1 with Hexagon Tools 19.0.04 is the tested version. Use the same version for HexKL below. From Qualcomm, not part of this repository. |
+| HexKL | 1.0 beta 2. Its `lib/<SDK version>` directories are per Hexagon SDK version; `lib/6.4.0.1` holds `hexagon_toolv19_v81` and `armv8_android26`. From Qualcomm. |
 | Phone | A Snapdragon device with a Hexagon **v81** DSP (Galaxy S26 Ultra, SM8850) running Android 16 with 4 KB pages, USB debugging on. Other DSP generations are refused by the build. |
 | Model pack | See [Model packs](model-packs.md); the pack is not part of the build. |
 
@@ -36,8 +36,8 @@ Set the environment once per shell. The Hexagon SDK ships a script that sets
 
 ```bash
 source /path/to/Hexagon_SDK/6.4.0.1/setup_sdk_env.source
-export HEXKL_ROOT=/path/to/hexkl_addon      # contains lib/6.4.0.2/...
-export HEXKL_SDK_VER=6.4.0.2                # default; the lib/<ver> subtree to use
+export HEXKL_ROOT=/path/to/hexkl_addon      # contains lib/6.4.0.1/...
+export HEXKL_SDK_VER=6.4.0.1                # default; must equal the Hexagon SDK version
 export HEX_ARCH=v81                         # required; only v81 is accepted
 export ANDROID_NDK=/path/to/android-ndk-r30
 

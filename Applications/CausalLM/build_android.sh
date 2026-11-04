@@ -240,7 +240,7 @@ if [[ "$ENABLE_HTP" == true ]]; then
         echo "Error: the Gemma4 HTP runtime requires HEX_ARCH=v81." >&2
         exit 1
     fi
-    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.2}"
+    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.1}"
     export HEXKL_SDK_VER HEX_ARCH
     HEXKL_LIB_SUBDIR="$HEXKL_SDK_VER/${HEXKL_ARCH:-armv8_android26}"
     if [[ ! -f "$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" ]]; then

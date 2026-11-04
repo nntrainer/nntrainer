@@ -5,7 +5,8 @@
 #
 # Prerequisite: source $HEXAGON_SDK_ROOT/setup_sdk_env.source
 #   The SDK must be 6.1.1.0 or newer: HexKL ships libhexkl_micro.a for v79
-#   only from lib/6.1.1.0 up. 6.4.0.1 is the verified combination.
+#   only from lib/6.1.1.0 up. HEXKL_SDK_VER picks HexKL's lib/<SDK version>
+#   and must equal the SDK version; 6.4.0.1 for both is the verified pair.
 # Override the target with: HEX_ARCH=v81 ./build.sh (the S26 Ultra; v79 = S25)
 # Override HexKL with:      HEXKL_ROOT=/path/to/hexkl_addon ./build.sh
 
@@ -26,11 +27,9 @@ if [ -z "${HEXKL_ROOT:-}" ]; then
         HEXKL_ROOT="$HOME/Downloads/hexkl_addon"
     fi
 fi
-# Likewise the SDK version: fall back to the newest one this install ships.
-if [ -z "${HEXKL_SDK_VER:-}" ]; then
-    HEXKL_SDK_VER="$(ls -1 "$HEXKL_ROOT/lib" 2>/dev/null | sort -V | tail -1 || true)"
-    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.2}"
-fi
+# The HexKL lib/<ver> must match the Hexagon SDK version. The full HexKL
+# package ships every version up to 6.6.0.0, so "the newest one" is not it.
+HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.1}"
 HEXKL_TOOLS_VARIANT="${HEXKL_TOOLS_VARIANT:-toolv19}"
 HEXKL_LIB="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_${HEXKL_TOOLS_VARIANT}_${HEX_ARCH}/libhexkl_micro.a"
 
@@ -46,7 +45,7 @@ if [ ! -f "$HEXKL_LIB" ]; then
     if [ ! -d "$HEXKL_ROOT" ]; then
         echo "HEXKL_ROOT does not exist: $HEXKL_ROOT" >&2
         echo "Pass the real one, e.g." >&2
-        echo "  HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon HEXKL_SDK_VER=6.4.0.2 ./build.sh" >&2
+        echo "  HEXKL_ROOT=~/workspace/hxkl-beta2/hexkl_addon HEXKL_SDK_VER=6.4.0.1 ./build.sh" >&2
     elif [ ! -d "$HEXKL_ROOT/lib/$HEXKL_SDK_VER" ]; then
         echo "HEXKL_SDK_VER=$HEXKL_SDK_VER is not under $HEXKL_ROOT/lib. Available:" >&2
         ls -1 "$HEXKL_ROOT/lib" 2>/dev/null | sed 's/^/  /' >&2

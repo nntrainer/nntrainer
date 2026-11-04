@@ -67,7 +67,7 @@ command-line tool prints them. The app shows load errors as
 | `--htp requires HEXAGON_SDK_ROOT` (or `DEFAULT_HEXAGON_TOOLS_ROOT`, `HEXKL_ROOT`, `an explicit DSP target`) | Source the Hexagon SDK's `setup_sdk_env.source` and export `HEXKL_ROOT` and `HEX_ARCH=v81`. |
 | `Error: the Gemma4 HTP runtime requires HEX_ARCH=v81.` | Only v81 is supported. |
 | `Error: --htp and --qnn select separate native variants.` | Build the two variants separately. |
-| `Error: missing …/libsdkl.so` | `HEXKL_SDK_VER` (default `6.4.0.2`) does not match the `lib/<ver>` directory of your HexKL. |
+| `Error: missing …/libsdkl.so` | `HEXKL_SDK_VER` (default `6.4.0.1`, the Hexagon SDK version) does not match the `lib/<ver>` directory of your HexKL. |
 | `enable-htp=true requires the generated FastRPC stub …` or `The generated FastRPC stub is older than …` | Run `nntrainer/tensor/htp_backend/generate_stub.sh` after changing the IDL; the Android script does this itself. |
 | `Error: skel has undefined symbols the DSP image will not provide` | A DSP source uses a symbol outside the allowed runtime set; the skel build refuses rather than failing on the phone. |
 | `verify_native_package.py` reports `HTP runtime is incomplete`, `Missing libraries`, `DSP image changed`, `Expected v81` | The AAR or APK does not carry every staged library, the skel in the package is not byte-identical to the built one (stripped or replaced), or it is not a v81 image. Check `jniLibs.useLegacyPackaging` and `keepDebugSymbols` in the consuming app. |
