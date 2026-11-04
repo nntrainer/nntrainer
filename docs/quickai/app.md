@@ -80,7 +80,8 @@ token, the speed and the token count.
   shows them; the token trace does (Gemma4's `<turn|>` is id 106).
 
 **The NPU models have no conversation memory in the app.** Their packs hold
-1,280 positions for the Gemma4 chat preset, and a prompt that does not fit
+2,304 positions for the Gemma4 chat preset (a prompt of up to 2,048 tokens
+and an answer of up to 256), and a prompt that does not fit
 is cut at the end without a warning (nntrainer issue #4474). The app
 therefore sends only your newest message to these models, with the pack's
 template, and nothing from earlier turns. Each question stands alone. The

@@ -36,7 +36,7 @@ class Examples {
             ModelIds.VJEPA_QNN to "vjepa2-qnn",
         )
 
-        /** The HTP packs: 1,280 positions and a prompt whose tail is truncated silently when it does
+        /** The HTP packs: a fixed context and a prompt whose tail is truncated silently when it does
          *  not fit (nntrainer #4474), so their chat sends only the newest user turn, as the View sample did. */
         val oneShotIds: Set<String> = setOf(ModelIds.GEMMA4_26B_A4B_HTP,
             "gemma4-26b-a4b-htp-2bit-4bit", ModelIds.LFM2_24BA2B_HTP)

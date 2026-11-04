@@ -546,7 +546,7 @@ class ChatControllerTest {
         assertEquals(htp, c.state.value.descriptor)
     }
 
-    /** The HTP packs hold 1,280 positions and truncate a long prompt's tail silently (nntrainer #4474):
+    /** The HTP packs have a fixed context and truncate a long prompt's tail silently (nntrainer #4474):
      *  the chat sends only the newest user turn, like the View sample did, while the transcript keeps everything. */
     @Test
     fun anHtpChatSendsOnlyTheLastUserTurn() {

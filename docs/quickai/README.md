@@ -64,7 +64,7 @@ Nothing is tuned through environment variables.
 
 | Configuration | Status |
 |---|---|
-| Gemma4 26B-A4B, 2-bit palette pack, chat preset (1,280 positions), app and command line, S26 Ultra | Validated: identical token IDs across the command line, the C API test and the app; lifecycle tests pass |
+| Gemma4 26B-A4B, 2-bit palette pack, chat preset (2,304 positions), app and command line, S26 Ultra | Validated: identical token IDs across the command line, the C API test and the app; lifecycle tests pass |
 | Gemma4 26B-A4B, native ternary pack (rotated checkpoint), app lifecycle test, S26 Ultra | Validated: seven identical runs of the summary prompt |
 | LFM2 24B-A2B SR15 pack, command line with the automatic preset, 2,048-token prompt, S26 Ultra | Validated: three runs, identical IDs |
 | Hexagon v79 (Galaxy S25 Ultra) | Not supported by the current build |

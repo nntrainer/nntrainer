@@ -159,8 +159,8 @@ sends only that one user message through the pack's template, and
 between calls. To give a native model history, pass the whole transcript
 through `runModelHandleWithMessagesStreaming`.
 
-For the HTP models, do **not** pass the transcript. Their packs hold 1,280
-positions (Gemma4 chat preset) and a prompt that does not fit is cut at the
+For the HTP models, do **not** pass the transcript. Their packs hold 2,304
+positions (Gemma4 chat preset, 2,048 for the prompt) and a prompt that does not fit is cut at the
 end without an error (nntrainer issue #4474). The sample app sends only the
 newest user message to `ModelIds.GEMMA4_26B_A4B_HTP` and
 `ModelIds.LFM2_24BA2B_HTP`.

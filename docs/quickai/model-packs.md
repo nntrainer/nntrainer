@@ -97,7 +97,7 @@ The remaining `nntr_config.json` keys of a Gemma4 pack:
 | `model_tensor_type` | `Q4_0-FP32` | The part after the last `-` is the activation type and must be `FP32`. |
 | `moe_engine`, `attention_engine`, `attn_proj_engine`, `dense_ffn_engine` | `htp` | Which blocks run on the DSP. The C API requires all four. |
 | `moe_htp_layers`, `attn_proj_htp_layers`, `dense_ffn_htp_layers` | absent | Comma-separated layer ids that restrict an engine to some layers. Must be absent for WH expert formats. |
-| `init_seq_len`, `max_seq_len` | `1280`, `1280` in the chat preset | Prompt capacity and total context. `max_seq_len` is clamped to the checkpoint's `max_position_embeddings`. A prompt whose rendered length exceeds the capacity is **truncated silently** (nntrainer issue #4474), which is why the app sends only the newest message to this model. Raise both for longer prompts; memory grows with them. |
+| `init_seq_len`, `max_seq_len` | `2048`, `2304` in the chat preset | Prompt capacity and total context. A prompt may use `min(init_seq_len, max_seq_len - num_to_generate)` tokens, 2,048 in the chat preset. `max_seq_len` is clamped to the checkpoint's `max_position_embeddings`. A prompt whose rendered length exceeds the capacity is **truncated silently** (nntrainer issue #4474), which is why the app sends only the newest message to this model. Raise both for longer prompts; memory grows with them. |
 | `num_to_generate` | `127` in the preset | Generation budget per call. |
 | `bad_word_ids` | `[]` | Token ids never generated. A fixed-length benchmark puts the EOS ids here. |
 | `tokenizer_file` | `tokenizer.json` | The C API rewrites it to the pack's absolute path. |
@@ -123,7 +123,7 @@ the palette pack usable for conversation. Copy them into the pack directory:
 
 | File | What it sets |
 |---|---|
-| `nntr_config.json` | The keys above with the 2-bit palette dtypes, 1,280 positions, 127 tokens per answer, EOS stopping enabled. |
+| `nntr_config.json` | The keys above with the 2-bit palette dtypes, 2,304 positions, prompts up to 2,048 tokens, 256 tokens per answer, EOS stopping enabled. |
 | `generation_config.json` | Greedy decoding (`do_sample` false), EOS ids `[1, 106, 50]`, BOS 2. |
 | `chat_template.jinja` | Google's canonical Gemma 4 template, which closes the thought channel when thinking is off. Take it from here, not from another pack: a variant that splits one string literal over several lines is rejected by the built-in template engine, the API then falls back to a bare `<|turn>user … <|turn>model` format, and the model starts its answer with `<|channel>thought`. The only symptom is a `Chat template apply failed` line in logcat. |
 

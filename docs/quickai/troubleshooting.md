@@ -44,7 +44,7 @@ command-line tool prints them. The app shows load errors as
 |---|---|
 | The answer starts with `<|channel>thought` or rambles past the summary | The pack's `chat_template.jinja` is not the one from `Applications/CausalLM/res/gemma4/htp_chat/`. The built-in template engine rejected a variant and fell back to a bare turn format; logcat shows `Chat template apply failed`. Copy the preset's template into the pack. |
 | The answer never stops, or always runs to the same length | The pack is a benchmark configuration with EOS disabled (`bad_word_ids` containing the EOS ids, or a `generation_config.json` without `eos_token_id`). Use the chat preset's `generation_config.json` (EOS `[1, 106, 50]`). |
-| A long prompt gives an answer that ignores its end | The rendered prompt exceeded the pack's positions (1,280 in the Gemma4 chat preset) and was truncated at the end without an error (nntrainer issue #4474). Shorten the prompt or raise `init_seq_len` / `max_seq_len` in the pack. In the app, the HTP models receive only the newest message for this reason. |
+| A long prompt gives an answer that ignores its end | The rendered prompt exceeded the pack's positions (2,304 in the Gemma4 chat preset, of which a prompt may use 2,048) and was truncated at the end without an error (nntrainer issue #4474). Shorten the prompt or raise `init_seq_len` / `max_seq_len` in the pack. In the app, the HTP models receive only the newest message for this reason. |
 | The model answers as if earlier turns never happened | By design in the app for the HTP models (see above). Pass the transcript yourself through the messages API if your prompt fits. |
 | Two runs of the same prompt give different token IDs | Check that nothing changed between them: `htp.profile` 2 or 3 alters the execution path and can change IDs; a KV snapshot run differs from a single prefill because the int8 KV scales are calibrated on the rows present. Ordinary greedy runs reproduce the same IDs. |
 | Much slower than the numbers in [Performance](performance.md) | On the command line: the DSP image was not found and the model silently fell back to the CPU; look for `nntr_hvx_open failed … falling back to CPU` in the log and set `ADSP_LIBRARY_PATH`. In the app: the phone is hot (the Power tab shows thermal status), or `htp.page_cache` is `0` with a small expert cache. |
@@ -82,8 +82,8 @@ command-line tool prints them. The app shows load errors as
   DSP targets. 16 KB-page devices are not validated.
 - **One HTP model per process**, loaded through one handle. Unload before
   loading another.
-- **Context.** The Gemma4 chat preset holds 1,280 positions; prompts that do
-  not fit are truncated at the end without an error (nntrainer issue
+- **Context.** The Gemma4 chat preset holds 2,304 positions, 2,048 of them for
+  the prompt; prompts that do not fit are truncated at the end without an error (nntrainer issue
   #4474). The app sends only the newest message to the HTP models.
 - **No conversation memory** across calls in the native engine; every run
   is an independent prompt. KV snapshot and resume are available only to

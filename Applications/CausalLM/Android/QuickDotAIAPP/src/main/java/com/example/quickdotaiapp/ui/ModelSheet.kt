@@ -176,7 +176,7 @@ fun ModelSheet(state: UiState, controller: ChatController, onDismiss: () -> Unit
             } else {
                 Text(
                     if (Examples.isOneShot(state.descriptor))
-                        "This engine does not support session settings. Only the newest message is sent with the model's own template: the HTP pack holds 1,280 positions."
+                        "This engine does not support session settings. Only the newest message is sent with the model's own template: the HTP packs have a fixed context and cut a longer prompt silently."
                     else
                         "This engine does not support session settings. Each turn is sent with the full conversation and the model's own template.",
                     style = MaterialTheme.typography.bodySmall,

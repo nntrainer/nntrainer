@@ -139,8 +139,8 @@ Rules specific to these models:
   the weights stay resident. KV snapshot and resume are not exposed for
   these models. Multi-model packs (`architectures[]` with `model_dirs[]`)
   are rejected for the HTP ids (`HTP supports a single model per handle`).
-- **Context.** The Gemma4 chat preset holds 1,280 positions; a longer
-  rendered prompt is truncated at the end without an error (nntrainer issue
+- **Context.** The Gemma4 chat preset holds 2,304 positions, 2,048 of them for
+  the prompt; a longer rendered prompt is truncated at the end without an error (nntrainer issue
   #4474). Size the pack's `init_seq_len` / `max_seq_len` to your prompts,
   or send only what fits.
 - **Chat input is plain text or messages**; the API applies the pack's
