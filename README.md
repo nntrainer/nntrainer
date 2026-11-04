@@ -52,6 +52,8 @@ With FSU, NNTrainer loads only the active experts during inference — reducing 
 | **GPT-OSS** | 20B-A3.6B, 120B-5.1B | Full / Cached-Slim |
 | **Gemma3** | - | Standard |
 | **Qwen2** | - | Standard |
+| **Gemma4** | 26B-A4B | Hexagon NPU (HTP) through [Quick.AI](docs/quickai/README.md) |
+| **LFM2** | 24B-A2B | Hexagon NPU (HTP) through [Quick.AI](docs/quickai/README.md) |
 
 ### Core Optimizations
 
@@ -70,6 +72,7 @@ cd Applications/CausalLM
 # Android
 ./build_android.sh
 # Add --app for the QuickDotAI AAR/APK and --install for device deployment.
+# Add --htp for the Hexagon NPU variant (Gemma4 / LFM2 MoE); see docs/quickai/.
 
 # Linux / PC
 meson build && ninja -C build
@@ -137,6 +140,7 @@ Complete Deep Q-Learning with experience replay and dual network architecture �
 
 | Feature | Description |
 |---------|-------------|
+| **Quick.AI on the Hexagon NPU** | Gemma4 26B-A4B and LFM2 24B-A2B MoE inference on the Snapdragon Hexagon HTP, through the Quick.AI Android app, the QuickDotAI library and the C API ([docs](docs/quickai/README.md)) |
 | **Qwen3 / Qwen3-MoE Support** | Full support for Qwen3 family including 30B MoE with on-device expert loading |
 | **GPT-OSS 120B-5.1B** | Run 120B-parameter MoE models with cached-slim expert loading |
 | **Gemma3 Support** | Google's Gemma3 architecture added to CausalLM |
@@ -194,6 +198,7 @@ NNTrainer provides **20+ ready-to-run example applications**:
 ## Getting Started
 
 - **[Installation Guide](https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md)** — Build & install on Linux, Android, or Windows
+- **[Quick.AI on the Hexagon NPU](https://github.com/nntrainer/nntrainer/blob/main/docs/quickai/README.md)** — Run Gemma4 and LFM2 on the Snapdragon NPU: the app, the Android library, the C API, build and model packs
 - **[Create Your Model](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-create-model.md)** — Tutorial for building custom models
 - **[Run Examples](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-run-examples.md)** — Step-by-step guide for running applications
 - **[Supported Components](https://github.com/nntrainer/nntrainer/blob/main/docs/components.md)** — Full list of layers, optimizers, loss functions, and activations

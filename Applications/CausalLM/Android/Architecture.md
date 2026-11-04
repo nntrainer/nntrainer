@@ -31,7 +31,7 @@ positions and truncate a longer prompt's tail silently (nntrainer #4474).
 The validated summarization prompt is bundled as `res/raw/gemma4_moe_messages.json`
 and offered as the Power tab's `HTP 1K` preset. `HtpAppLifecycleTest` under
 `src/androidTest` drives the HTP presets on a device (opt-in, see
-`docs/gemma4-htp-user-guide.md`).
+[`docs/quickai/app.md`](../../../docs/quickai/app.md#device-tests)).
 
 ## 🧱 QuickDotAI AAR
 
@@ -190,6 +190,7 @@ compatible engine build when available and rebuilds it on a cache miss.
 
 ## 📎 Related Docs
 
-- [QuickDotAI AAR API](QuickDotAI/README.md)
+- [QuickDotAI Android library](QuickDotAI/README.md)
 - [Android Native Async & Streaming](AsyncAndStreaming.md)
+- [Quick.AI on the Hexagon NPU](../../../docs/quickai/README.md): the app, packs, build, command line, configuration
 - [Main README](../README.md)

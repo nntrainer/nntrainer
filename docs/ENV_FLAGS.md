@@ -52,7 +52,7 @@ give it a working default so that a bare run needs no environment at all.
 
 Native HTP/MoE/LFM2 runtime tuning now uses the `htp` and `moe` objects in
 `nntr_config.json`. The former runtime environment variables are no longer
-read; see the [configuration reference](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)
+read; see the [configuration reference](quickai/configuration.md)
 for defaults, migration and strict validation. `ADSP_LIBRARY_PATH` remains
 the DSP library search path. `NNTR_HTP_DIAGNOSTICS` is a build-script option,
 not a runtime setting.

@@ -9,13 +9,13 @@ Ultra(v79)에서 처음 실행한 기록이다. S26 Ultra가 없어서 S25 Ultra
 `htp`·`moe` 항목을 사용한다. 예를 들어 `NNTR_MOE_CACHE_GROW=0`은
 `"moe": {"cache_grow": 0}`, `NNTR_HTP_PAGE_CACHE=0`은
 `"htp": {"page_cache": 0}`으로 옮긴다.
-[현재 설정 안내](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)를
+[현재 설정 안내](../quickai/configuration.md)를
 따르고, 아래 명령과 옵션 이름은 측정 당시의 기록으로 읽는다.
 
 **2026-10-18 상태:** 현재 native CLI는 KV snapshot과 chunked prefill을
 지원하며, public QuickDotAI API는 snapshot/resume을 노출하지 않는다.
 최신 native TL2/affine 런타임, compact expert 저장, 메모리 회수와 S26 검증
-결과는 [TL2 가이드](gemma4-htp-tl2-guide.md#current-validation-coverage)를 따른다.
+결과는 [TL2 가이드](../quickai/performance.md)를 따른다.
 아래의 S25 장문 측정은 최신 코드로 다시 실행한 결과가 아니다. 이후 S26
 snapshot/demo 조사에서는 expert-load rebind 실패가 한 번 발생하고 11회
 반복에서 재현되지 않았으며 원인은 미확정이다. int8 KV scale은 calibration에

@@ -6,6 +6,14 @@ index.md
 		docs/configuration-ini.md
 		docs/coding-convention.md
 		docs/contributing.md
+		docs/quickai/README.md
+			docs/quickai/app.md
+			docs/quickai/build.md
+			docs/quickai/model-packs.md
+			docs/quickai/cli.md
+			docs/quickai/configuration.md
+			docs/quickai/performance.md
+			docs/quickai/troubleshooting.md
 		CODE_OF_CONDUCT.md
 	Applications/README.md
 		Applications/KNN/README.md

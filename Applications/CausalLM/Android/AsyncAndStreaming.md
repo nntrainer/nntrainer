@@ -94,5 +94,7 @@ Native non-zero `ErrorCode` values are mapped through `QuickAiError.fromNativeCo
 
 - [QuickDotAI AAR API](QuickDotAI/README.md)
 - [Android Architecture](Architecture.md)
-- [Chat and OpenAI Usage Examples](../docs/ChatAndOpenAIUsage.md)
+End-to-end Chat and JSON request examples live in the sample app
+([`QuickDotAIAPP`](QuickDotAIAPP/README.md)); how to use it is in
+[`docs/quickai/app.md`](../../../docs/quickai/app.md).
 - [C API Reference](../api/README.md)

@@ -1,179 +1,154 @@
 # QuickDotAI C API
 
-This directory contains the public, handle-based C API used by the CausalLM
-command-line test and the QuickDotAI Android AAR. The canonical header is
-`quick_dot_ai_api.h`; it is self-contained for both C and C++ consumers.
+The public, handle-based C API of nntrainer's CausalLM engine. The canonical
+header is `quick_dot_ai_api.h`; it is self-contained for C and C++
+consumers. The Android library ([QuickDotAI](../Android/QuickDotAI/README.md))
+and the command-line test tool `quick_dot_ai_test` are built on it.
 
-The API supports model-catalog discovery, model load and destruction,
-streaming text and multimodal inference, cancellation, chat sessions, tool
-constraints through xgrammar, and performance metrics. Model selection uses
-stable string catalog identifiers rather than the removed global `ModelType`
-API.
+The API covers model discovery through a catalog of string ids, load and
+destroy, streaming text generation from a prompt, from OpenAI-style
+messages or from a raw OpenAI JSON request, cancellation, grammar-constrained
+tool output through xgrammar, multimodal input for vision models,
+performance metrics, and a load diagnostic string.
 
 ## Build and link
 
-The standalone Android build produces:
+`Applications/CausalLM/build_android.sh --htp` (or without `--htp` for the
+CPU variant) produces, under `builddir_app/<variant>/`:
 
-- `libcausallm.so`: models, layers, tokenizer integration, and xgrammar.
 - `libquick_dot_ai_api.so`: the public C ABI in this directory.
-- `libnntrainer.so` and `libccapi-nntrainer.so`: engine dependencies.
+- `libcausallm.so`: models, layers, tokenizer, xgrammar.
+- `libnntrainer.so`, `libccapi-nntrainer.so` (under
+  `builddir/android_build_result/lib/arm64-v8a/`): the engine.
 
-From `Applications/CausalLM`, run `./build_android.sh --app`. The AAR
-mode is CPU-only unless QNN is explicitly enabled and never installs to a
-device without `--install`. See the parent
-[README](../README.md#4-android-build--test) for cache, QNN, and
-device-install options. The no-option command builds the same canonical
-CPU-native libraries and tools without Gradle.
-
-Native consumers should include `quick_dot_ai_api.h` and link
-`libquick_dot_ai_api.so`. Its transitive shared libraries must be available to
-the platform loader. Android packages built by `build_android.sh` stage those
-dependencies automatically.
+A native consumer includes `quick_dot_ai_api.h` and links
+`libquick_dot_ai_api.so`. At run time the four libraries above plus
+`libc++_shared.so` must be on the library path; the HTP build also needs
+`libsdkl.so` (HexKL) on the library path and `libnntr_hvx_skel.so` in the
+directory passed as `native_lib_dir`. See
+[Build from source](../../../docs/quickai/build.md).
 
 ## Lifecycle
 
-The normal handle-based lifecycle is:
-
 1. Inspect `getModelCatalogJson()` or choose a known catalog id.
-2. Load with `loadModelHandleByName()`.
-3. Run a handle-based streaming or chat-session entry point.
-4. Use `cancelModelHandle()` when cancellation is required.
-5. Release the model with `destroyModelHandle()`.
+2. `loadModelHandleByName(backend, model_id, quantization, native_lib_dir, model_base_path, &handle)`.
+3. Run a streaming entry point as often as needed; each call is an
+   independent prompt.
+4. `cancelModelHandle(handle)` from any thread to stop at the next token.
+5. `unloadModelHandle(handle)` to drop the weights and keep the handle, or
+   `destroyModelHandle(handle)` to release everything.
 
-Refer to declarations and ownership comments in
-[`quick_dot_ai_api.h`](quick_dot_ai_api.h) for the complete API contract.
+Every function returns an `ErrorCode`: `CAUSAL_LM_ERROR_NONE` (0),
+`INVALID_PARAMETER` (1), `MODEL_LOAD_FAILED` (2), `INFERENCE_FAILED` (3),
+`NOT_INITIALIZED` (4), `INFERENCE_NOT_RUN` (5), `UNSUPPORTED` (6),
+`UNKNOWN` (99). After `MODEL_LOAD_FAILED`, `getLastModelLoadError()` returns
+the engine's reason (thread-local, valid until the next load on that
+thread).
 
-## Gemma4 MoE on native HTP
+| Group | Functions |
+|---|---|
+| Catalog | `getModelCatalogJson()`: JSON array of `{id, family, display_name, runtime, backend_mask, capabilities}` |
+| Load, unload | `loadModelHandleByName`, `unloadModelHandle`, `destroyModelHandle`, `configureSpeculativeDecoding`, `setOptions` (process-wide `use_chat_template`, `debug_mode`, `verbose`, `chat_template_name`), `loadModelHandle` / `loadModel` (deprecated enum-based forms) |
+| Generate | `runModelHandleStreaming(h, prompt, cb, user)`, `runModelHandleWithMessages(h, msgs, n, add_generation_prompt, &out)`, `runModelHandleWithMessagesStreaming(...)`, `runModelHandleWithJsonStreaming(h, json, cb, user)`, `applyChatTemplate(msgs, n, add_generation_prompt, &formatted)` |
+| Tools | `runModelHandleWithTool(h, prompt, &out, tool_name, tool_schema)`: output constrained to the tool's JSON schema |
+| Multimodal | `runMultimodalHandleStreaming`, `runMultimodalHandleWithMessages[Streaming]`, `runMultimodalMultiImageHandle[WithMessages]Streaming`, `encodeModelHandle` / `freeEmbedding`, `encodeImageModelHandle` / `freeImageEmbedding` |
+| Control | `cancelModelHandle(h)` |
+| Metrics | `getPerformanceMetricsHandle(h, &m)`: `prefill_tokens`, `prefill_duration_ms`, `generation_tokens`, `generation_duration_ms`, `total_duration_ms`, `initialization_duration_ms`, `peak_memory_kb`, `ttft_ms`, `first_token_ms`, `decode_steady_ms`, `decode_steady_tokens`, `prefill_drain_ms` |
+| Errors | `getLastModelLoadError()` |
+| QNN KV cache | `save/load/resetQnnKvCacheHandle`: QNN models only; `UNSUPPORTED` otherwise |
 
-The Android `--htp` native build registers `gemma4-26b-a4b-htp`, a
-`NATIVE` model with the `NPU` backend and streaming/messages capabilities. Load it with
-`CAUSAL_LM_QUANTIZATION_W4A32`; its directory is
-`<model_base_path>/gemma4-26b-a4b-htp-w4a32`. This descriptor uses the validated
-Gemma4 26B A4B pack: `gemma4_execution_profile=htp_fused`,
-`gemma4_weight_format=htp_fused_v1`, QS2CX_WH experts, QS4CX FCs and Q4_0
-embedding/head. The metadata does not convert another pack into this format.
+Streaming callbacks (`CausalLmTokenCallback`) receive each delta on the
+calling thread; returning nonzero from the callback cancels at the next
+token boundary. Chat sessions are a Kotlin-level feature of the Android
+library; the C API has no session object. Each run is one prompt.
 
-Pass an absolute `native_lib_dir` containing the matching v81
-`libnntr_hvx_skel.so`. The API sets the DSP search path and required runtime
-options before opening HTP, and returns a load error if initialization fails.
-Settings and the library directory remain fixed for the process. Conflicting
-environment values and a second active HTP handle are rejected. Destroying or
-unloading the active handle releases its workers, DSP session and weight
-registries so another handle can load the model.
+## The HTP models
 
-Each streaming run starts an independent prompt and rebuilds its KV caches;
-the loaded weights stay resident. KV snapshot/resume is not supported by this
-preset. Returning nonzero from the streaming callback or calling
-`cancelModelHandle()` stops at a token boundary. Unload waits for any active
-run to return; cancel first when an early stop is needed. The CPU prefill head
-is retained for repeated runs (about 396 MiB for the validated untied pack).
+The HTP build (`ENABLE_HEXKL`) registers two `NATIVE` descriptors with the
+`NPU` backend and the `STREAMING` and `MESSAGES_API` capabilities:
 
-Device checks and build commands are recorded in the
-[QuickDotAI HTP guide](../../../docs/gemma4-htp-quickdotai.md).
-Build the AAR/APK with `build_android.sh --htp --app`. The native SDK environment
-must specify `HEX_ARCH=v81`, `HEXAGON_SDK_ROOT`, `DEFAULT_HEXAGON_TOOLS_ROOT`,
-`HEXKL_ROOT` and the matching `HEXKL_SDK_VER`. Android packaging requires a JDK
-and Android SDK. HTP and QNN are separate variants; do not combine their flags.
-The package verifier checks ARM dependencies and preserves the DSP ELF bytes.
+| Catalog id | Directory under `model_base_path` |
+|---|---|
+| `gemma4-26b-a4b-htp` | `gemma4-26b-a4b-htp-w4a32/` |
+| `lfm2-24ba2b-htp` | `lfm2-24ba2b-htp-w4a32/` |
 
-QuickDotAIAPP exposes the `gemma4-26b-a4b` family with `Quick.AI / NPU / W4A32`
-and selects it by default. Set an app-readable model base directory in the model
-sheet, tap Load model, then Send a message or an OpenAI messages array from the
-composer's JSON mode. The validated summarization prompt is bundled as
-`res/raw/gemma4_moe_messages.json` and offered as the Power tab's `HTP 1K` preset.
+`model_base_path` NULL or empty means `/sdcard/Download/aistudio-mobile/models/`.
+Load with `CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`; other
+combinations return `INVALID_PARAMETER`.
 
-For interactive use, copy `chat_template.jinja`, `generation_config.json` and
-`nntr_config.json` from [the HTP chat preset](../res/gemma4/htp_chat/) into the
-validated model directory alongside its weights and tokenizer. The template is
-Google's Gemma4 26B template at `35b4173`, with adjacent error-message string
-literals joined for the current minja parser. It adds the empty thought channel
-used when thinking is off. The preset restores EOS IDs `[1, 106, 50]`, retains
-greedy sampling, and provides 1,280 context positions so the 1,028-token default
-prompt and its generation budget fit without truncating the template suffix.
-The earlier 1,024/128 benchmark pack deliberately disabled EOS; retain that pack
-only for reproducing those measurements. Its fallback template is not the
-recommended interactive configuration.
+Rules specific to these models:
 
-Chat input is plain message text; the API applies the template. The chat bubble
-hides the final `<turn|>` marker; the Metrics screen's raw output and the token
-trace show it. Each native HTP request is independent: for the HTP presets the
-app sends only the newest user message, not the transcript, because the pack's
-1,280 positions would overflow and the tail would be truncated silently
-(nntrainer #4474).
-See [the Chat verification results](../../../docs/gemma4-htp-quickdotai.md#validation)
-for the exact template source, model settings and device results.
+- **`native_lib_dir` is required** and must be an absolute directory that
+  contains the matching v81 `libnntr_hvx_skel.so`. The API sets
+  `ADSP_LIBRARY_PATH` to it before opening the DSP. Errors: `HTP requires
+  native_lib_dir with the v81 DSP skel`, `HTP native_lib_dir is missing
+  libnntr_hvx_skel.so`, `Conflicting HTP runtime option: ADSP_LIBRARY_PATH`
+  (the variable was already set to a different directory).
+- **One active HTP model per process.** A second load while one is active
+  fails with `Only one active QuickDotAI HTP model is supported`. Unloading
+  or destroying the active handle stops its workers, releases the DSP
+  session and the weight registries, and resets the runtime configuration,
+  so another handle can load.
+- **The pack is checked before loading.** The pack's `nntr_config.json`
+  must declare the model's profile and format (`gemma4_execution_profile`
+  `htp_fused` with `gemma4_weight_format` `htp_fused_v1`, or
+  `lfm2_execution_profile` `htp_fused` with `lfm2_weight_format` `sr15_v2`),
+  all engines on `htp`, one of the accepted dtype sets, and no KV snapshot
+  keys (`use_kvcache`, `save_kvcache`). `config.json` must be the flat text
+  config (`Gemma4ForCausalLM`, hidden 2816, 30 layers, 128 experts;
+  `Lfm2MoeForCausalLM`). A mismatch fails with `Gemma4 HTP requires the
+  validated NPU/W4A32 preset`, `Unsupported Gemma4 HTP pack or KV snapshot
+  option` or `LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack`. The
+  contract is in [Model packs](../../../docs/quickai/model-packs.md).
+- **Runtime settings come from the pack.** The `htp` and `moe` objects of
+  `nntr_config.json` are parsed and validated before the DSP opens; an
+  unknown key or wrong type fails the load with the key named (see
+  [Configuration](../../../docs/quickai/configuration.md)). The configuration
+  is fixed while the model is loaded. The API never applies the LFM2
+  command-line preset.
+- **Each run is an independent prompt.** The KV caches are rebuilt per run;
+  the weights stay resident. KV snapshot and resume are not exposed for
+  these models. Multi-model packs (`architectures[]` with `model_dirs[]`)
+  are rejected for the HTP ids (`HTP supports a single model per handle`).
+- **Context.** The Gemma4 chat preset holds 1,280 positions; a longer
+  rendered prompt is truncated at the end without an error (nntrainer issue
+  #4474). Size the pack's `init_seq_len` / `max_seq_len` to your prompts,
+  or send only what fits.
+- **Chat input is plain text or messages**; the API applies the pack's
+  template (`chat_template.jinja`). The output ends with the end-of-turn
+  marker `<turn|>`, which a UI usually hides.
 
-Load failures include the native diagnostic returned by
-`getLastModelLoadError()` on the worker thread. The app compares the complete
-load request before reusing a handle, and Reload always replaces the handle.
+Example (Gemma4, messages API):
 
-See the [sample app validation results](../../../docs/gemma4-htp-quickdotai.md#validation)
-for device checks and the current 16 KB compatibility limitation of the SDK
-runtime/DSP packaging. Keep `jniLibs.useLegacyPackaging = true` and exclude
-`libnntr_hvx_skel.so` from stripping in downstream applications.
+```c
+CausalLmHandle h = NULL;
+ErrorCode rc = loadModelHandleByName(CAUSAL_LM_BACKEND_NPU, "gemma4-26b-a4b-htp",
+                                     CAUSAL_LM_QUANTIZATION_W4A32,
+                                     "/data/app/.../lib/arm64",            /* holds libnntr_hvx_skel.so */
+                                     "/sdcard/Download/aistudio-mobile/models", &h);
+if (rc != CAUSAL_LM_ERROR_NONE) { fputs(getLastModelLoadError(), stderr); return rc; }
 
-## LFM2 MoE on native HTP
+CausalLMChatMessage msg = { .role = "user", .content = "Summarize the text above in three sentences." };
+rc = runModelHandleWithMessagesStreaming(h, &msg, 1, true, on_token, user_data);
+/* on_token(const char *delta, void *user) returns 0 to continue, nonzero to cancel */
 
-The `--htp` build also registers `lfm2-24ba2b-htp` with the NPU backend.
-Load it with `CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`
-from `<model_base_path>/lfm2-24ba2b-htp-w4a32`.
-
-The only supported LFM2 HTP format is `lfm2_weight_format=sr15_v2`, with
-`lfm2_execution_profile=htp_fused`: TL2 experts, affine WH projections and
-router, Q4_0 embedding and DW3_INT4 short convolutions. Keep the generated
-`conversion_report.json` alongside the weights; the loader requires both
-checkpoint rotation records. The legacy unrotated LFM2 pack is rejected.
-
-Pass the absolute directory containing the matching v81 DSP library as
-`native_lib_dir`. HTP runtime ownership follows the lifecycle above: only
-one active HTP handle is supported, and each streaming call starts an
-independent prompt. Public KV snapshot/resume remains unsupported. The
-SR15 performance defaults in `lfm2_runtime_defaults.h` are selected by the
-native CLI only; the API does not install those process-wide settings.
-See the [LFM2 guide](../../../docs/lfm2-htp-user-guide.md) for conversion and
-runtime requirements.
-
-The standalone `test/htp/quick_dot_ai_validation.cpp` device check accepts
-`lfm2 <legacy-base> <lib-dir> <sr15-base> <prompt-file>`. It checks legacy
-format rejection, SR15 load, two identical greedy streaming requests and
-unload. Each base contains the `lfm2-24ba2b-htp-w4a32` directory; the prompt
-file contains an already formatted prompt.
-
-For QuickDotAIAPP, select family `lfm2`, runtime `Quick.AI` and backend `NPU`.
-The model base path must contain the same `lfm2-24ba2b-htp-w4a32` directory.
-The APK does not include model weights. Normal launches use
-`/sdcard/Download/aistudio-mobile/models/`; stage the model there to tap
-**Load model** in the model sheet without editing the path. A path
-supplied to an instrumentation test is temporary and is not saved for the
-next app launch.
-The opt-in app lifecycle test accepts `htpModelId=lfm2-24ba2b-htp`; its
-default remains Gemma4. After installing the HTP app and instrumentation
-APKs, granting model-file access and acknowledging any first-launch system
-dialogs, run:
-
-```bash
-adb -s "$DEVICE" shell am instrument -w -r \
-  -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
-  -e htpModelId lfm2-24ba2b-htp \
-  -e htpModelBase /sdcard/Download/aistudio-mobile/models \
-  -e htpMessages /sdcard/Download/lfm2/messages.json \
-  com.example.quickdotaiapp.test/androidx.test.runner.AndroidJUnitRunner
+PerformanceMetrics m; getPerformanceMetricsHandle(h, &m);
+destroyModelHandle(h);
 ```
 
-`messages.json` is an OpenAI messages array. Use greedy generation and a
-prompt/output limit long enough to exercise cancellation (for example,
-96 generated tokens). The test checks repeatability, stop, unload during
-generation, reload and recovery from an invalid model path. Reports and
-native token traces are written under the app's `files/htp-app-validation`.
+## Testing the API on a device
 
-Also verify the normal-launch path with
-`-e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' -e htpDefaultPathCheck true`.
-This test uses the default model path and LFM2 prompt. It opens Chat and
-generates an answer, compares the OpenAI output and repeats after restarting the
-Activity. Reports are stored in `files/htp-default-path-validation`.
+`quick_dot_ai_test` (built with `-Denable-api-test=true`, which the Android
+script enables) runs one generation through the API, or with
+`QDA_HTP_LIFECYCLE=1` the HTP lifecycle check: load, repeat parity,
+cancellation from the callback and from another thread, unload during
+generation, reload, and a bad pack. See
+[Command line](../../../docs/quickai/cli.md#the-c-api-lifecycle-test).
 
 ## Compatibility
 
 Consumers must use `quick_dot_ai_api.h` and `libquick_dot_ai_api.so`; the
-former `causal_lm_api.h` ABI is not provided. Android builds use the same
-canonical `libcausallm.so` core for native tools and app packaging.
+former `causal_lm_api.h` ABI is not provided and the enum-based `ModelType`
+is a deprecated compatibility shim (string catalog ids are canonical).
+Android builds use the same `libcausallm.so` core for the native tools and
+the app packaging.
