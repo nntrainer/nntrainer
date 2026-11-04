@@ -417,3 +417,211 @@ contains a loaded-graph cookie; unrelated models cannot adopt it.
 [Measured data, configuration and checks](validation/gemma4-dsp-flash-20261104.json)
 include raw per-trial values and binary hashes. Native benchmark sources,
 commands, logs and CSV are in `/tmp/nntr-dsp-flash-20261104/`.
+
+## Alternating independent DSP conversations (2026-11-04)
+
+Gemma4 26B A4B HTP fused was tested on SM-S948N / Android 16 / Hexagon v81
+using the committed DSP checkpoint implementation (`93aef5b15`). The same
+loaded model alternated two independent conversations. A remembered
+`ZEBRA-731`; B remembered `ORCHID-842`.
+
+For each scenario, the reference process ran A0/A1/A2/A3, reset, then
+B0/B1/B2/B3 without checkpoints. The switched process ran
+A0/B0/A1/B1/A2/B2/A3/B3. Each switched request saved and parked its updated
+snapshot; each continuation restored its own latest snapshot first.
+
+| Scenario | Initial A/B tokens | Matching switched requests | Flash restores | Final A/B positions | Final sliding A/B bases |
+| --- | --- | --- | --- | --- | --- |
+| Short | 25 / 25 | 8 / 8 | 6 | 132 / 135 | 0 / 0 |
+| Different history lengths | 2040 / 506 | 8 / 8 | 6 | 2158 / 617 | 1080 / 0 |
+
+Every switched response's token IDs, committed before/after positions,
+pending-token state and prefill token count matched its independent
+reference. All continuation replies contained their own code and none
+contained the other conversation's code. Every park reported zero device
+K/V payload. Snapshot headers confirmed that A and B used the same loaded
+graph cookie and retained distinct positions and sliding bases; the long A
+conversation also executed a 64-row sliding compaction.
+
+Across both scenarios, 16 reference requests and 16 switched requests ran,
+including 12 Flash restores and 16 parks. This verifies explicit sequential
+snapshot switching within one loaded model process. OS file caches were
+not evicted; this correctness check is separate from the cold-storage
+latency measurements above. Concurrent inference, automatic session-ID
+management and automatic DSP LRU policies are outside this check.
+
+[Per-request results, request fixtures and binary hashes](validation/gemma4-dsp-session-switch-20261104.json)
+are recorded with the validation. Runner, commands and raw logs are in
+`/tmp/nntr-dsp-multisession-20261104/`.
+
+## A/B switching latency versus full recomputation (2026-11-04)
+
+A native C++ trace replay compared A/B Flash switching with rebuilding the
+same complete token history before every request. The inputs and expected
+resident outputs come from the independent-conversation test above. Native
+retokenization must match every recorded input ID. Model/graph loading is
+excluded; a BaseStreamer timestamps the first decoded delta without enabling
+a logits processor or changing the normal DSP token-ID path. Its external
+clock includes independent-prompt reset/cleanup before `CausalLM::run()`.
+
+Each configuration replays A0/B0/A1/B1/A2/B2/A3/B3 three times in both modes,
+alternating mode order by repetition. Initial A0/B0 seeds are excluded from
+the latency summary. Each direction has nine samples (three different follow-up
+turns, each repeated three times), rather than nine copies of one prompt.
+
+Cold switching saves/parks and fsyncs the outgoing conversation. Before
+restoring an incoming file it requests `FADV_DONTNEED`; process I/O counters
+verify at least the complete snapshot size as storage reads on all 54 restores.
+"Full switch TTFT" sums the previous other conversation's save/park and fsync,
+incoming cache advice, restore, and run-to-first-delta. It assumes serialized
+outgoing I/O and excludes generation of the previous response and benchmark
+logging. Durability synchronization is stronger than the save API's default.
+
+For the long scenario, a 4096-row prefill plane lets the recompute history fit
+one prefill chunk. This is the primary comparison; the original 2048-row
+configuration is retained as a sensitivity result. Medians in milliseconds:
+
+| Scenario / direction | Incoming history tokens | Recompute TTFT | Restore + new-input TTFT | Full switch TTFT | Full-switch faster samples |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short B to A, plane 128 | 54–122 | 1,667.90 | 1,737.25 | 1,765.84 | 3/9 |
+| Short A to B, plane 128 | 54–124 | 1,674.39 | 1,637.66 | 1,670.17 | 3/9 |
+| Short B to long A, plane 4096 | 2080–2148 | 4,520.13 | 2,688.10 | 3,125.72 | 9/9 |
+| Long A to short B, plane 4096 | 536–606 | 2,260.16 | 2,174.94 | 2,979.99 | 0/9 |
+
+Across each six-continuation trace, full switch costs are 2.6–4.4% higher
+than recomputation in the short scenario. With a long A and short B and the
+4096-row plane, they are 4.7–11.0% lower (paired reduction median 8.75%).
+These are sums of first-token latencies over the six continuations, not
+throughput or complete-response wall times. At plane 2048, long-A recompute
+crosses a chunk boundary and the paired reduction increases to 24.2–29.3%;
+that configuration would overstate the advantage over the larger prefill
+block and is not the primary result.
+
+Restoring a long conversation benefits from avoiding its full prefill, but
+saving the outgoing long conversation can make the next short conversation
+slower. In the 4096-plane case the outgoing save/park plus fsync median is
+382.58 ms for B-to-A and 760.27 ms for A-to-B. In addition, resident continuation
+currently processes the 20-plus new input tokens through the single-row DSP
+path. Short full-history prompts use batched prefill, so reuse need not save
+time even before outgoing I/O is charged. These observations motivate
+comparing reuse and recompute costs rather than treating every Flash hit as
+a guaranteed latency improvement.
+
+All 72 switched requests (including seeds) match resident reference output
+IDs and positions. Of 72 recomputed requests, 69 match the reference IDs;
+short B turn 3 adds a repeated thought-channel marker in all three repeats
+while retaining the correct code. Inputs are identical, but full-history
+INT8 calibration can differ from retained-cache continuation. This comparison
+therefore measures TTFT and does not claim equivalent complete-generation
+cost. No session-code leakage was observed in the previously validated
+switched traces. Clocks are unlocked and samples are exploratory; no
+production percentile or universal benefit is established.
+
+[Raw trials, per-turn and per-trace comparisons, settings and hashes](validation/gemma4-dsp-switch-performance-20261104.json)
+are recorded. Native runner, build commands, logs and CSV are in
+`/tmp/nntr-dsp-switch-perf-20261104/`. No inference implementation changes were
+needed for this measurement.
+
+## Direct request-triggered dump and restore (2026-11-04)
+
+The preceding A/B performance test saved/parked after each response and summed
+that outgoing cost with the next request's restore and TTFT. It did not start
+one timer with the outgoing KV still resident. This follow-up implements the
+literal arrival-triggered sequence:
+
+1. Leave A's K/V allocated after A's response; do not dump or park it yet.
+2. At B request arrival, verify the outgoing K/V payload is nonzero and start
+   one monotonic request timer.
+3. Dump/park A and fsync its file, then restore B's snapshot.
+4. Process B's new input and stop that same timer at the first streamed delta.
+5. Leave B's K/V resident until the next A request arrives.
+
+Target file-cache eviction is prepared before arrival without changing the
+outgoing resident KV. All 18 target restores read at least the complete file
+size from storage. This test enforces an outgoing resident conversation; it
+does not saturate all physical DRAM or simulate an OOM budget.
+
+The same frozen input histories and model configuration were compared across
+three profiles, rotating profile order over three repetitions. Each direction
+has nine continuation samples. Gemma4 HTP fused on SM-S948N / Android 16 / v81,
+4096-row prefill plane, fixed 16 experts/layer, no expert growth. Medians are
+request-arrival-to-first-delta milliseconds:
+
+| Direction | Discard outgoing, recompute incoming | Dump outgoing, recompute incoming | Dump outgoing, restore incoming |
+| --- | ---: | ---: | ---: |
+| Long A to short B | 2,120.72 | 2,712.59 | 2,836.52 |
+| Short B to long A | 4,398.18 | 4,470.61 | 2,954.86 |
+
+Incoming A histories contain 2080–2148 tokens; B histories contain 536–606.
+The first alternative permits losing the outgoing KV. The latter two preserve
+it on Flash, so they isolate the choice of recomputing or restoring the target
+under that preservation requirement. For A-to-B, restore is about 4.6% slower
+than preserving A and recomputing B in this measurement. For B-to-A, restore
+is about 33.9% faster than preserving B and recomputing A. Clocks are unlocked
+and these small samples do not establish universal latency guarantees.
+
+In total, 72 inference requests (excluding warmup) ran, including 54 summarized
+continuations, 42 outgoing dump/park operations and 18 storage-backed restores.
+All restored outputs and positions match the independent resident reference.
+Every successful request leaves target K/V resident for the next arrival, and
+every dump verifies that outgoing K/V allocations were released. No inference
+implementation change was needed; only the native benchmark's timing and
+checkpoint scheduling changed.
+
+[Direct intervals, stage timings, protocol and settings](validation/gemma4-dsp-direct-switch-20261104.json)
+are recorded. Native runner, compilation command, logs and CSV are in
+`/tmp/nntr-dsp-direct-switch-20261104/`.
+
+## Crossed outgoing/incoming history lengths (2026-11-04)
+
+A 3x3 experiment varied A and B initial user-history prompts independently
+across exactly 128, 1024 and 3072 tokens. The resulting resident KV lengths
+were 129, 1026 and 3074 tokens; B's complete recompute inputs, including its
+initial generated reply and the fixed new question, were 153, 1050 and 3098
+tokens. Every input fits the same 4096-row prefill plane in one chunk.
+
+Both timed policies preserve A: dump/park/fsync A, then either fully
+recompute B or restore B's snapshot and process the new question. Before
+each policy A actually runs and finishes a response, leaving its KV resident.
+A single request timer starts before dumping A and stops at B's first decoded
+delta. B's file cache is dropped before arrival, and all 27 restores verify
+storage reads at least the full snapshot size. B continuation output IDs and
+positions must equal its independent resident reference. These are not sums
+of separately measured intervals and do not use a discard-A baseline.
+
+Gemma4 HTP fused, SM-S948N / Android 16 / Hexagon v81, 8 threads, fixed 16
+experts/layer, growth disabled, default attention arithmetic. Three repetitions
+per cell, rotating source/target order and alternating policy order. Values
+below are medians in seconds, shown as save+recompute to save+restore:
+
+| A initial tokens / B initial tokens | 128 | 1024 | 3072 |
+| --- | --- | --- | --- |
+| 128 | 1.964 → 1.971 | 2.709 → 2.508 | 5.675 → 2.610 |
+| 1024 | 2.498 → 2.466 | 3.192 → 2.904 | 6.180 → 3.096 |
+| 3072 | 2.589 → 2.561 | 3.360 → 3.165 | 6.533 → 3.282 |
+
+Median-based time reduction from restoring B instead of recomputing it:
+
+| A initial tokens / B initial tokens | 128 | 1024 | 3072 |
+| --- | ---: | ---: | ---: |
+| 128 | -0.3% | 7.4% | 54.0% |
+| 1024 | 1.2% | 9.0% | 49.9% |
+| 3072 | 1.1% | 5.8% | 49.8% |
+
+Small B histories show essentially no advantage in these samples. Around
+1024 initial tokens the advantage is modest; at 3072 it is substantial.
+Longer A adds a common dump cost to both policies and raises both absolute
+latencies. The fixed new question, initial reply format and one-resume
+protocol differ from the preceding progressive multi-turn trace; its precise
+crossover must not be generalized to other prompts or generation policies.
+Clocks are unlocked, with only three samples per cell, so small differences
+near zero are not production guarantees.
+
+All 54 timed requests passed their input/state checks, all 27 cold restores
+matched resident output IDs and positions, and each pair started from matching
+A committed lengths and snapshot sizes. Initial target seeding, independent
+reference continuation and preparing A are outside the B request timer.
+
+[All samples, actual lengths, stage times, inputs and binary hashes](validation/gemma4-dsp-length-grid-20261104.json)
+are archived. Native runner, build commands, raw logs and CSV are in
+`/tmp/nntr-dsp-length-grid-20261104/`.
