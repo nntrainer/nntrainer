@@ -5,7 +5,8 @@ Every runtime setting of the HTP path lives in the model pack's
 kernels, attention, diagnostics) and `moe` (expert caching, reads,
 prediction, expert kernels, rotation). The command line and the QuickDotAI
 API read the same file, so a setting made once in the pack applies to both.
-No environment variable tunes the HTP runtime.
+No environment variable tunes the HTP runtime; the few that remain are
+listed below.
 
 The schema is `nntrainer/tensor/htp_backend/htp_runtime_config.h`, its
 validation `htp_runtime_config.cpp`, and the parser
@@ -254,10 +255,11 @@ build default.
 | `NNTR_NUM_THREADS` | CPU compute threads, overrides `num_threads`. |
 | `NNTR_GENERATED_IDS` | Command line: path to write the generated token IDs. |
 | `NNTR_INIT_TRACE` | Command line: load-phase timing trace. |
+| `NNTR_MOE_PROFILE` | Gemma4: per-phase timing and expert cache hit / miss tallies of the MoE layer, printed to the log. Diagnostic only; does not change the output. |
 | `NNTR_HTP_DIAGNOSTICS` | A **build** option of the DSP skel that compiles in the diagnostic probes. Not a runtime setting. |
 
-The old `NNTR_HTP_*`, `NNTR_MOE_*` and `NNTR_LFM2_*` runtime variables are
-not read. Their replacements:
+Apart from `NNTR_MOE_PROFILE`, the old `NNTR_HTP_*`, `NNTR_MOE_*` and
+`NNTR_LFM2_*` runtime variables are not read. Their replacements:
 
 | Former variable | Key |
 |---|---|

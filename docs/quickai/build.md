@@ -78,8 +78,8 @@ Outputs:
 
 | Artifact | Path |
 |---|---|
-| `nntr_causallm`, `quick_dot_ai_test`, `nntr_quantize`, `nntr_safetensors_info` | `Applications/CausalLM/builddir_app/htp/` |
-| `libcausallm.so`, `libquick_dot_ai_api.so` | `Applications/CausalLM/builddir_app/htp/` |
+| `nntr_causallm`, `quick_dot_ai_test`, `nntr_quantize`, `nntr_safetensors_info` | `builddir_app/htp/` (repository root) |
+| `libcausallm.so`, `libquick_dot_ai_api.so` | `builddir_app/htp/` (repository root) |
 | `libnntrainer.so`, `libccapi-nntrainer.so` | `builddir/android_build_result/lib/arm64-v8a/` |
 | `libnntr_hvx_skel.so` (DSP skel) | `nntrainer/tensor/htp_backend/dsp/build/` |
 | `libsdkl.so` (HexKL ARM runtime) | `$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/` |

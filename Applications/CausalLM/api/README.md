@@ -74,7 +74,8 @@ The HTP build (`ENABLE_HEXKL`) registers two `NATIVE` descriptors with the
 
 `model_base_path` NULL or empty means `/sdcard/Download/aistudio-mobile/models/`.
 Load with `CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`; other
-combinations return `INVALID_PARAMETER`.
+combinations return `MODEL_LOAD_FAILED`; `getLastModelLoadError()` gives the
+reason.
 
 Rules specific to these models:
 
@@ -93,8 +94,9 @@ Rules specific to these models:
   must declare the model's profile and format (`gemma4_execution_profile`
   `htp_fused` with `gemma4_weight_format` `htp_fused_v1`, or
   `lfm2_execution_profile` `htp_fused` with `lfm2_weight_format` `sr15_v2`),
-  all engines on `htp`, one of the accepted dtype sets, and no KV snapshot
-  keys (`use_kvcache`, `save_kvcache`). `config.json` must be the flat text
+  for Gemma4 all four engines (`moe_engine`, `attention_engine`,
+  `attn_proj_engine`, `dense_ffn_engine`) on `htp`, one of the accepted
+  dtype sets, and no KV snapshot keys (`use_kvcache`, `save_kvcache`). `config.json` must be the flat text
   config (`Gemma4ForCausalLM`, hidden 2816, 30 layers, 128 experts;
   `Lfm2MoeForCausalLM`). A mismatch fails with `Gemma4 HTP requires the
   validated NPU/W4A32 preset`, `Unsupported Gemma4 HTP pack or KV snapshot

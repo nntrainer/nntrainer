@@ -22,9 +22,9 @@ command-line tool prints them. The app shows load errors as
 | `Load failed: [MODEL_LOAD_FAILED] Failed to open file …` | The directory exists but a file in it is missing or unreadable (weights, tokenizer, `config.json`). The previous model has already been released. |
 | `HTP requires native_lib_dir with the v81 DSP skel` | The API was called without `native_lib_dir`. Pass the app's `applicationInfo.nativeLibraryDir`. |
 | `HTP native_lib_dir is missing libnntr_hvx_skel.so` | The DSP image is not in that directory: the APK was built without `jniLibs.useLegacyPackaging = true`, or the skel was stripped (`keepDebugSymbols`), or the build was not `--htp`. |
-| `Conflicting HTP runtime option: ADSP_LIBRARY_PATH` | The variable was already set to a different directory in this process. |
+| `Conflicting HTP runtime option: ADSP_LIBRARY_PATH` | The variable was already set to a different value in this process, for example a different directory or the same one with a trailing `:` (the `run_test.sh` wrapper does this). Set it to exactly `native_lib_dir`, or leave it unset. |
 | `Only one active QuickDotAI HTP model is supported` | Unload or destroy the active HTP handle before loading another. |
-| `Gemma4 HTP requires NPU / W4A32` (library) or `INVALID_PARAMETER` (API) | The request asked for another backend or quantization. The HTP models are NPU + W4A32 only. |
+| `Gemma4 HTP requires NPU / W4A32` (library) or `MODEL_LOAD_FAILED` (API) | The request asked for another backend or quantization. The HTP models are NPU + W4A32 only. |
 | `Gemma4 HTP requires the validated NPU/W4A32 preset`, `Unsupported Gemma4 HTP pack or KV snapshot option`, `LFM2 HTP requires the NPU/W4A32 sr15_v2 fused pack` | The pack's `nntr_config.json` does not match the contract: missing profile or format key, an engine not set to `htp`, a dtype set that is not one of the accepted ones, or `use_kvcache` / `save_kvcache` present. See [Model packs](model-packs.md). |
 | `Gemma4 HTP requires an HTP build`, `LFM2 HTP requires an HTP build` | The library was built without `--htp`. |
 | `Unknown runtime configuration: <section>.<key>` | A key in the `htp` or `moe` object is misspelled or does not exist in this build. See [Configuration](configuration.md). |
@@ -73,7 +73,7 @@ command-line tool prints them. The app shows load errors as
 | `verify_native_package.py` reports `HTP runtime is incomplete`, `Missing libraries`, `DSP image changed`, `Expected v81` | The AAR or APK does not carry every staged library, the skel in the package is not byte-identical to the built one (stripped or replaced), or it is not a v81 image. Check `jniLibs.useLegacyPackaging` and `keepDebugSymbols` in the consuming app. |
 | Host model tests fail with `Key is not found … fully_connected` | An OpenCL-enabled host build defaults to the GPU engine. Run the tests with `NNTR_ENGINE=cpu`. |
 | `CausalLM tokenizer library not found` | The arm64 tokenizer archive was not built; the script builds it with `build_tokenizer_android.sh`, which needs `cargo`. |
-| `HTP_GRAPH_E_VERSION` at the first decode | The DSP image and the ARM library come from different builds. Rebuild and redeploy the stub, the skel and the libraries together. |
+| `HTP_GRAPH_E_UNSUPPORTED` at the first decode | The DSP image and the ARM library come from different builds. Rebuild and redeploy the stub, the skel and the libraries together. |
 
 ## Known limits
 

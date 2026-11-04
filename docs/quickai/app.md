@@ -103,7 +103,7 @@ get a median.
 2. Choose **PROMPT** (the composer's text, 256 / 1K / 2K / 4K tokens of
    bundled text, or `HTP 1K`, the validated Gemma4 summarization request),
    **WINDOW TOKENS** (64 / 512 / 1024 tokens of decoding to measure),
-   **REPEATS** (1 to 5) and **BASELINE** (5 / 10 / 20 seconds of idle power
+   **REPEATS** (1, 2, 3 or 5) and **BASELINE** (5 / 10 / 20 seconds of idle power
    before each run).
 3. Tap **Measure**. Each repeat waits until the phone is cool (thermal
    status nominal, headroom below 0.80, up to 90 s), records the baseline,

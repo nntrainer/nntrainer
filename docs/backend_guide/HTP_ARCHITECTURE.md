@@ -8,7 +8,7 @@ details. If you only want to build and run a model, start with the
 
 Two models use this backend today: Gemma4 26B-A4B (`Gemma4HtpMoECausalLM`,
 `Applications/CausalLM/models/gemma4/`) and LFM2 24B-A2B
-(`Lfm2HtpMoeCausalLM`, `Applications/CausalLM/models/lfm2_moe/`). They share
+(`Lfm2HtpMoECausalLM`, `Applications/CausalLM/models/lfm2_moe/`). They share
 the backend, the routed-expert layer and the attention path; the LFM2 model
 adds the short-convolution block of its hybrid architecture.
 
@@ -19,7 +19,7 @@ flowchart LR
   subgraph app [Android app process]
     K[QuickDotAIAPP / QuickDotAI Kotlin] --> J[JNI quickai_jni.cpp]
     J --> C[QuickDotAI C API<br/>quick_dot_ai_api.cpp<br/>htp_model_runtime.h]
-    C --> M[Gemma4HtpMoECausalLM / Lfm2HtpMoeCausalLM<br/>Applications/CausalLM/models]
+    C --> M[Gemma4HtpMoECausalLM / Lfm2HtpMoECausalLM<br/>Applications/CausalLM/models]
     M --> G[nntrainer graph<br/>htp_qkv, htp_mha_core, residual_add,<br/>dense_ffn, lfm2_moe, conv_block, lm_head ...]
     G --> O[HtpComputeOps<br/>nntrainer/tensor/htp_backend]
     O --> S[HtpBackend session<br/>FastRPC + dspqueue]
@@ -66,8 +66,8 @@ No CPU kernel reads a WH tensor: `FloatTensor::dot` throws a named error, so
 a model that carries them must route those layers to the HTP. Packing is
 done offline by the converters described in
 [Model packs](../quickai/model-packs.md); the loaders
-(`gemma4_htp_weights.cpp`, the LFM2 model) validate the manifest and hand
-each tensor to the backend without re-packing. Changing a dtype name in
+(`htp_weight_preparation.cpp`, shared by both models) validate the
+manifest and hand each tensor to the backend without re-packing. Changing a dtype name in
 `nntr_config.json` does not convert the binary.
 
 Native TL2 expert slots in the arena hold the packed payload and metadata
@@ -223,7 +223,7 @@ Hexagon toolchain and links HexKL. Production `nntr_hvx_*.c` files and
 |---|---|---|
 | session and memory | `session_info`, `arena_attach`, `arena_probe`, `mem_probe_*` | `nntr_hvx_session.h`, `nntr_hvx_small_ops.c` |
 | weights | `weight_register_u8i4_arena`, `weight_register_u2i4_arena`, `weight_swap_batch_*` (u8i4, u2i4, TL2 stable and compact), `weights_tl2`, `weight_set_offsets_batch`, `weight_set_static_quant`, `expand_i2i4` | `nntr_hvx_mm_u8i4.c`, `hmx/hexkl_mm_u8i4_dma.c`, `hvx/hvx_expand_i2i4.c` |
-| projections and FFN | `mm_u8i4_layer*` (`_norm`, `_norm_ld`, `_res_add`, `_fused`, `_gate_up_swiglu`), `mm_u8i4_conv_block`, `fc_q4m1_f32`, `lm_head_q4m1_f32`, `lm_head_wh_f32` | `nntr_hvx_mm_u8i4.c`, `nntr_hvx_fc_q4.c`, `hmx/hexkl_mm_u8i4.c`, `hmx/hexkl_conv_block.c` |
+| projections and FFN | `mm_u8i4_layer*` (`_norm`, `_norm_ld`, `_res_add`, `_fused`, `_u8in`), `mm_u8i4_gate_up_swiglu`, `mm_u8i4_conv_block`, `fc_q4m1_f32`, `lm_head_q4m1_f32`, `lm_head_wh_f32` | `nntr_hvx_mm_u8i4.c`, `nntr_hvx_fc_q4.c`, `hmx/hexkl_mm_u8i4.c`, `hmx/hexkl_conv_block.c` |
 | MoE | `router_logits_f32`, `router_topk_det_f32`, `mm_u8i4_moe_layer*` | `hmx/hexkl_mm_u8i4_moe.c`, `hvx/hvx_router_rows_f32.c` |
 | attention | `attn_q2_prefill`, `attn_q2_step*`, `kv_register_q`, `kv_append_q`, `attn_m1_*` (decode), `attn_f16_*` (FP16 path) | `nntr_hvx_attn_q.c`, `nntr_hvx_attn_m1.c`, `nntr_hvx_attn_f16.c`, `hmx/hexkl_attn_q2.c`, `hmx/hexkl_kv_q.c` |
 | small ops | `rmsnorm_det_f32`, `rmsnorm_add_f32`, `rope64_det_f32`, `softmax_*`, `swiglu_*`, `argmax_f32`, `q8_quant_f32` | `nntr_hvx_small_ops.c`, `hvx/hvx_*_rows_f32.c` |
@@ -244,7 +244,7 @@ The ARM library, the generated IDL stub and the DSP skel describe one wire
 contract (`HTP_GRAPH_VERSION`, the compact TL2 registration, the affine
 registration, the `lm_head_wh_f32` entry). Rebuild and stage all three
 together; a skel built for an older contract refuses a newer graph with
-`HTP_GRAPH_E_VERSION` instead of misreading it.
+`HTP_GRAPH_E_UNSUPPORTED` instead of misreading it.
 
 ## 7. Online rotation and static activation quantization
 
@@ -319,7 +319,7 @@ it.
 To support another model on this path: reuse the HTP layers through a new
 `*CausalLM` subclass (most of the Gemma4 one is the graph description), add
 its weight layout to a converter and to loader validation in the style of
-`gemma4_htp_weights.cpp`, and start from a tiny-reference test so that
+`htp_weight_preparation.cpp`, and start from a tiny-reference test so that
 correctness is pinned before the first device run. Runtime policy belongs in
 the `htp` / `moe` schema (`htp_runtime_config.h`), never in environment
 variables: the parser rejects unknown keys, so a new knob is added to the

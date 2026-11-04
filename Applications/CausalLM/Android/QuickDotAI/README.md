@@ -87,7 +87,7 @@ The model directory is `<modelBasePath>/gemma4-26b-a4b-htp-w4a32` (or
 `lfm2-24ba2b-htp-w4a32`); `modelBasePath` null means
 `/sdcard/Download/aistudio-mobile/models/`. The HTP models accept only
 `BackendType.NPU` with `QuantizationType.W4A32`; anything else fails with
-`INVALID_PARAMETER`. See [Model packs](../../../../docs/quickai/model-packs.md)
+`MODEL_LOAD_FAILED`. See [Model packs](../../../../docs/quickai/model-packs.md)
 for the pack contents.
 
 ## The `QuickDotAI` interface

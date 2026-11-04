@@ -12,24 +12,29 @@ The easiest way is `build_android.sh --htp --install` (see
 
 ```bash
 adb shell sh /data/local/tmp/Quick.AI/run_causallm.sh /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
-adb shell sh /data/local/tmp/Quick.AI/run_test.sh gemma4-26b-a4b-htp   # quick_dot_ai_test
 ```
 
 The wrappers `cd` into that directory and export `LD_LIBRARY_PATH`,
-`ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS` (8 for the HTP build). To stage
-by hand instead, push these files into one directory and set the same three
+`ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS` (8 for the HTP build). The second
+wrapper, `run_test.sh` for `quick_dot_ai_test`, does not load the HTP models
+yet: it exports `ADSP_LIBRARY_PATH` with a trailing `:`, which the API refuses
+with `Conflicting HTP runtime option: ADSP_LIBRARY_PATH`. Run
+`quick_dot_ai_test` with the explicit command in
+[The C API lifecycle test](#the-c-api-lifecycle-test) instead.
+
+To stage by hand, push these files into one directory and set the same three
 variables yourself:
 
 ```bash
 D=/data/local/tmp/Quick.AI
 adb shell mkdir -p $D
-cd Applications/CausalLM
+# from the repository root
 for f in builddir_app/htp/nntr_causallm builddir_app/htp/quick_dot_ai_test \
          builddir_app/htp/libcausallm.so builddir_app/htp/libquick_dot_ai_api.so \
-         ../../builddir/android_build_result/lib/arm64-v8a/libnntrainer.so \
-         ../../builddir/android_build_result/lib/arm64-v8a/libccapi-nntrainer.so \
+         builddir/android_build_result/lib/arm64-v8a/libnntrainer.so \
+         builddir/android_build_result/lib/arm64-v8a/libccapi-nntrainer.so \
          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so \
-         ../../nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so \
+         nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so \
          $HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so; do adb push $f $D/; done
 adb shell chmod 755 $D/nntr_causallm $D/quick_dot_ai_test
 
@@ -58,7 +63,7 @@ There are no other flags. Everything else is read from the pack's
 
 | What | Where it comes from |
 |---|---|
-| The prompt | The second argument, rendered through the pack's chat template. Without it, `chat_input` from `nntr_config.json` (also templated), else the raw `sample_input`. |
+| The prompt | The second argument, used as given: it is **not** rendered through the chat template, so include the model's turn markup yourself. Without it, `chat_input` from `nntr_config.json` rendered through the pack's chat template, else the raw `sample_input`. |
 | Generation length | `num_to_generate`; the context is `init_seq_len` (prompt capacity) and `max_seq_len` (prompt plus generation). The environment variables `NNTR_MAX_SEQ_LEN` and `NNTR_INIT_SEQ_LEN` override them for one run. |
 | Sampling | `generation_config.json` (`do_sample`, EOS ids). `bad_word_ids` in `nntr_config.json` suppresses ids, which is how a fixed-length benchmark disables the end-of-turn stop. |
 | Runtime policy | The `htp` and `moe` objects; see [Configuration](configuration.md). Values are fixed until the process ends. |
