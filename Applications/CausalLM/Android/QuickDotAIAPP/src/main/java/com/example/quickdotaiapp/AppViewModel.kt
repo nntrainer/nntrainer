@@ -15,6 +15,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.quickdotai.ModelCatalog
+import com.example.quickdotai.RuntimeKind
 import com.example.quickdotai.createEngine
 import com.example.quickdotaiapp.power.BatterySampler
 import com.example.quickdotaiapp.power.PowerFiles
@@ -40,7 +41,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         scope = viewModelScope,
         engineDispatcher = engineExecutor.asCoroutineDispatcher(),
         catalogProvider = { ModelCatalog.selectable() },   // first access dlopens the native libraries
-        engineFactory = { descriptor, basePath -> createEngine(app, descriptor, basePath) },
+        engineFactory = { descriptor, basePath ->
+            if (descriptor.runtime == RuntimeKind.NATIVE) SampleNativeEngine(app)
+            else createEngine(app, descriptor, basePath)
+        },
         nativeLibDir = app.applicationInfo.nativeLibraryDir,
         examples = Examples(),
         initialTheme = ThemeMode.entries.firstOrNull { it.name == prefs.getString("theme", null) } ?: ThemeMode.SYSTEM,
@@ -76,7 +80,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun startPower() {
         val s = controller.state.value
-        val d = s.descriptor
+        val d = s.effectiveDescriptor
         power.start(SessionMeta(
             startedAt = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(OffsetDateTime.now()),
             device = Build.MODEL,

@@ -100,6 +100,19 @@ fun ModelSheet(state: UiState, controller: ChatController, onDismiss: () -> Unit
                 }
             }
 
+            if (state.variants.size > 1) {
+                Label("MODEL VARIANT")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    state.variants.forEach { variant ->
+                        FilterChip(
+                            selected = variant.id == state.descriptor?.id,
+                            onClick = { controller.selectVariant(variant.id) },
+                            label = { Text(variant.displayName) },
+                        )
+                    }
+                }
+            }
+
             Label("BASE PATH")
             var basePath by rememberLocalText(Unit) { controller.state.value.selection.basePath }
             OutlinedTextField(
@@ -110,9 +123,10 @@ fun ModelSheet(state: UiState, controller: ChatController, onDismiss: () -> Unit
                 modifier = Modifier.fillMaxWidth().testTag(Tags.BASE_PATH),
             )
             val descriptor = state.descriptor
-            if (descriptor != null) {
+            val effectiveDescriptor = state.effectiveDescriptor
+            if (effectiveDescriptor != null) {
                 val base = state.selection.basePath.ifBlank { DEFAULT_BASE_PATH }
-                val required = Examples.requiredPath(descriptor, base)
+                val required = Examples.requiredPath(effectiveDescriptor, base)
                 // ponytail: a stat() during composition; fine for a test app, a flow from the
                 // ViewModel is the upgrade path if the base path ever points at slow storage.
                 val exists = remember(required) { File(required).exists() }
@@ -130,7 +144,7 @@ fun ModelSheet(state: UiState, controller: ChatController, onDismiss: () -> Unit
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                AssistChip(onClick = {}, label = { Text("${Examples.badge(descriptor)} · W4A32 · ${descriptor.displayName}") })
+                AssistChip(onClick = {}, label = { Text("${Examples.badge(effectiveDescriptor)} · W4A32 · ${effectiveDescriptor.displayName}") })
             }
 
             if (Examples.isSdCapable(descriptor)) {

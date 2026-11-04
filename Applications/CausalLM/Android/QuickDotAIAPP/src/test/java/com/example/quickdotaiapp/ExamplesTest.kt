@@ -55,5 +55,10 @@ class ExamplesTest {
         assertTrue(Examples.isOneShot(lfm2Htp))
         assertFalse(Examples.isOneShot(npu))
         assertFalse(Examples.isOneShot(null))
+        val rotated = htp.copy(id = "gemma4-26b-a4b-htp-2bit-4bit")
+        assertEquals("/m/gemma4-26b-a4b-2bit-4bit/nntr_config.json", Examples.requiredPath(rotated, "/m"))
+        assertTrue(Examples.isOneShot(rotated))
+        val vision = npu.copy(id = "external-vision-qnn")
+        assertEquals("/m/external-vision-qnn/nntr_config.json", Examples.requiredPath(vision, "/m"))
     }
 }

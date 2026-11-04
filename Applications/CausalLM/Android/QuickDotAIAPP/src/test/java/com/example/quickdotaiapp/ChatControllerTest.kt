@@ -130,6 +130,21 @@ class ChatControllerTest {
     }
 
     @Test
+    fun failedWorkerClosePreventsReplacementUntilCleanupSucceeds() {
+        val c = controller(); c.selectNpu(); c.load(); c.awaitIdle()
+        engines[0].closeError = "worker still running"
+        c.load(force = true); c.awaitIdle()
+        assertEquals(1, engines.size)
+        assertEquals("Unload failed: worker still running", c.state.value.status)
+        c.unload(); c.awaitIdle()
+        assertEquals("Unload failed: worker still running", c.state.value.status)
+        engines[0].closeError = null
+        c.load(); c.awaitIdle()
+        assertTrue(engines[0].closed)
+        assertEquals(2, engines.size)
+    }
+
+    @Test
     fun selectionChangeAfterLoadMakesNextLoadReplace() {
         val c = controller(); c.selectNpu()
         c.load(); c.awaitIdle()
@@ -138,6 +153,35 @@ class ChatControllerTest {
         assertEquals(2, engines.size)
         assertEquals("load:qwen3-0.6b", engines[1].calls.first())
         assertTrue(engines[0].closed)
+    }
+
+    @Test
+    fun externalSdUsesItsOwnModelAndFolderAndVariantSelectionIsExplicit() {
+        val external = ModelDescriptor("external-qnn", "external", "External QNN", RuntimeKind.NATIVE,
+            setOf(BackendType.NPU), setOf(Capability.STREAMING, Capability.SPECULATIVE), "external-sd-qnn")
+        val sd = ModelDescriptor("external-sd-qnn", "external", "External SD", RuntimeKind.NATIVE,
+            setOf(BackendType.NPU), setOf(Capability.STREAMING))
+        val other = ModelDescriptor("external-v2-qnn", "external", "External v2", RuntimeKind.NATIVE,
+            setOf(BackendType.NPU), setOf(Capability.STREAMING))
+        catalog = listOf(external, sd, other)
+        existing += "/m/external-qnn/nntr_config.json"
+        val c = controller(); c.setBasePath("/m")
+        assertEquals(listOf(external, other), c.state.value.variants)
+        assertEquals("/m/external-qnn", c.buildRequest().modelPath)
+        c.load(); c.awaitIdle()
+        c.setSdEnabled(true)
+        assertEquals("external-sd-qnn", c.buildRequest().modelId)
+        assertEquals("/m/external-sd-qnn", c.buildRequest().modelPath)
+        c.load(); c.awaitIdle()
+        assertEquals(1, engines.size) // missing SD pack must preserve the loaded engine
+        assertFalse(engines[0].closed)
+        existing += "/m/external-sd-qnn/nntr_config.json"
+        c.load(); c.awaitIdle()
+        assertEquals("load:external-sd-qnn", engines[1].calls.first())
+        c.selectVariant(other.id)
+        assertEquals(other, c.state.value.descriptor)
+        assertFalse(c.state.value.selection.sdEnabled)
+        assertEquals("/m/external-v2-qnn", c.buildRequest().modelPath)
     }
 
     fun ChatController.loadedNpu(): ChatController { selectNpu(); load(); awaitIdle(); return this }

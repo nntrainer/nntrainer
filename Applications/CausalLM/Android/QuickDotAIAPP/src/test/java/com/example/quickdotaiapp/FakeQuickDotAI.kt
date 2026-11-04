@@ -17,6 +17,7 @@ class FakeQuickDotAI(
     override val kind: String = "native",
     var deltas: List<String> = listOf("Hello", " world", "<turn|>"),
     var loadResult: BackendResult<Unit> = BackendResult.Ok(Unit),
+    var closeError: String? = null,
 ) : QuickDotAI {
     override var architecture: String? = "fake-arch"
     val calls: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
@@ -43,7 +44,7 @@ class FakeQuickDotAI(
     @Volatile var releaseGateOnCancel = true
     override fun cancel() { cancelled = true; if (releaseGateOnCancel) gate?.countDown() }
     override fun chatCancel() = cancel()
-    override fun close() { closed = true; calls += "close" }
+    override fun close() { calls += "close"; closeError?.let { error(it) }; closed = true }
     override fun openChatSession(config: QuickAiChatSessionConfig?): BackendResult<String> {
         lastSessionConfig = config; sessionId = "s1"; calls += "open"; return BackendResult.Ok("s1")
     }
