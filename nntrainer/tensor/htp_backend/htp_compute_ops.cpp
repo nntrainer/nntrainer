@@ -9659,7 +9659,8 @@ public:
     HtpBackend &hb = HtpBackend::global();
     if (!hb.enabled() || handle < 0 || n_q == 0 || n_head_kv == 0 ||
         (n_head_q % n_head_kv) != 0 || head_dim == 0 || (head_dim % 32) != 0 ||
-        head_dim > 256 || cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
+        head_dim > (htpRuntimeConfig().htp.kv_prefix_cache ? 512u : 256u) ||
+        cache_to < cache_from + n_q || cache_to > 0xFFFFu ||
         q_stride != n_head_q * head_dim || out_stride != n_head_q * head_dim ||
         (append_rows != 0 &&
          (kv_stride != n_head_kv * head_dim || !k_rows || !v_rows))) {
@@ -9741,10 +9742,26 @@ public:
       out_rpc = reinterpret_cast<float *>(
         staging_.stage(staging_.attn_out_pool_, q_bytes).data());
     }
-    const int err = nntr_hvx_attn_q_step(
-      h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
-      rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
-      q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
+    int err;
+    if (htpRuntimeConfig().htp.kv_prefix_cache) {
+      // Per-row K/V quantizers plus a fixed KV reduction tile make a page's
+      // prefill result independent of a later suffix and total query length.
+      // Keep the existing wide projection/FFN calls; only attention is tiled.
+      err = append_rows ? nntr_hvx_kv_append_q(h, static_cast<uint32_t>(handle),
+                                               append_row0, k_rows, rows_len,
+                                               v_rows, rows_len)
+                        : AEE_SUCCESS;
+      if (err == AEE_SUCCESS)
+        err = nntr_hvx_attn_q_prefill(
+          h, static_cast<uint32_t>(handle), n_q, cache_from, cache_to, n_head_q,
+          window, 64u / (n_head_q / n_head_kv), 256u, softcap, q_rpc, q_len,
+          sinks, sinks_len, out_rpc, q_len, stats, 20);
+    } else {
+      err = nntr_hvx_attn_q_step(
+        h, static_cast<uint32_t>(handle), append_row0, k_rows, rows_len, v_rows,
+        rows_len, n_q, cache_from, cache_to, n_head_q, window, softcap, q_rpc,
+        q_len, sinks, sinks_len, out_rpc, q_len, stats, trace ? 20 : 8);
+    }
     if (staged && err == AEE_SUCCESS) {
       if (ion_handoff)
         staging_.copyOutOf(staging_.attn_out_pool_, out, q_bytes, true);

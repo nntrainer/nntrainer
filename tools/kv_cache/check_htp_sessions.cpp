@@ -113,6 +113,21 @@ int main(int argc, char **argv) {
                       baseline["reference"][i][t]["position"],
                   "Paged/linear model output or position differs");
     }
+    // A complete-history prefill is a different reference from a resident
+    // M1 continuation. Prefix hits must match the former exactly.
+    std::vector<json> prefix_refs;
+    json flash_ref;
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      auto full = seed_histories[i];
+      const auto delta = model->getTokenizer()->Encode(query, false);
+      full.insert(full.end(), delta.begin(), delta.end());
+      const auto text = model->getTokenizer()->Decode(full);
+      prefix_refs.push_back(run(text, true));
+      if (i + 1 == prompts.size())
+        flash_ref = run(query, false);
+    }
+    report["prefix_reference"] = prefix_refs;
+    report["flash_reference"] = flash_ref;
     c->setSessionTokenPosition(0);
     c->enableDeviceKVManager(8, 8);
     std::vector<uint32_t> sessions{0};
@@ -160,7 +175,9 @@ int main(int argc, char **argv) {
       require(after.hits == before.hits + 1 &&
                 after.reused_tokens > before.reused_tokens,
               "Expected radix prefix hit missing");
-      require(result["ids"] == refs[i][1]["ids"], "Prefix output changed");
+      require(result["ids"] == prefix_refs[i]["ids"] &&
+                result["position"] == prefix_refs[i]["position"],
+              "Prefix output or position differs from fresh full history");
       result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
       report["prefix"].push_back(result);
       write();
@@ -170,7 +187,8 @@ int main(int argc, char **argv) {
     require(!c->getDeviceKVCacheBytes(), "Park did not release active pages");
     c->loadDeviceKVCache(snapshot);
     const auto restored = run(query, false);
-    require(restored["ids"] == refs.back()[2]["ids"],
+    require(restored["ids"] == flash_ref["ids"] &&
+              restored["position"] == flash_ref["position"],
             "Paged Flash continuation changed");
     std::filesystem::remove(snapshot);
     report["flash"] = restored;

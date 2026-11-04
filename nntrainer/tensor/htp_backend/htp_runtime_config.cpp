@@ -68,6 +68,8 @@ const HtpRuntimeConfig &htpRuntimeConfig() { return state().config; }
 void validateHtpRuntimeConfig(const HtpRuntimeConfig &config) {
   const auto &h = config.htp;
   const auto &m = config.moe;
+  require(!h.kv_prefix_cache || (h.kv_paged && h.kv_session),
+          "htp.kv_prefix_cache requires paged KV sessions");
   require(h.profile <= 3, "htp.profile must be 0..3");
   require(h.page_cache >= -1 && h.page_cache <= 1,
           "htp.page_cache must be -1, 0 or 1");

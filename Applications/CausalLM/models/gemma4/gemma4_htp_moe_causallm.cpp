@@ -99,6 +99,20 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   // Build the full decode graph after loading its weights.
   htp_e2e = MOE_ENGINE == "htp";
   htp_session_enabled_ = runtime_config.htp.kv_session;
+  device_prefix_mode_ = runtime_config.htp.kv_prefix_cache;
+  if (device_prefix_mode_ &&
+      (BATCH_SIZE != 1 || !SKIP_PREFILL || INIT_SEQ_LEN < 64 ||
+       INIT_SEQ_LEN % 64 || ATTENTION_KV_DTYPE != "q8_row"))
+    throw std::invalid_argument(
+      "Gemma4 radix prefill requires batch one, "
+      "skip_prefill, q8_row attention and a 64-row-aligned prefill plane");
+  if (device_prefix_mode_)
+    for (unsigned l = 0; l < NUM_LAYERS; ++l) {
+      const auto kv_heads = getKVHeadCount(l);
+      if (!kv_heads || NUM_HEADS <= 0 || NUM_HEADS % kv_heads ||
+          NUM_HEADS / kv_heads > 64u || 64u % (NUM_HEADS / kv_heads))
+        throw std::invalid_argument("Radix query groups must divide a KV page");
+    }
   if (htp_session_enabled_ &&
       (!htp_e2e || ATTENTION_ENGINE != "htp" || ATTN_PROJ_ENGINE != "htp" ||
        FFN_ENGINE != "htp" || LMHEAD_ENGINE != "htp"))

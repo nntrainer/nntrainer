@@ -18,10 +18,10 @@
 
 namespace causallm {
 
-/** The backend owns page tables, scales and window positions behind handles.
- * Full-page radix terminals reference a retained state's immutable prefix
- * pages. A hit selects only the matched page range with that state's encoding
- * scales. Terminals whose required sliding history was released are excluded.
+/** The backend owns page tables, calibration and positions behind handles.
+ * Radix terminals reference immutable prefix pages. A backend can supply only
+ * its causally reproducible prefill boundaries and retain their payload apart
+ * from decode session pages. Missing sliding history is never indexed.
  * Thread confined; all operations occur between synchronous inference calls.
  */
 class DeviceKVManager {
@@ -30,6 +30,7 @@ public:
   using Capture = std::function<uint32_t(unsigned, unsigned)>;
   using Restore = std::function<void(uint32_t, unsigned)>;
   using PrefixMin = std::function<unsigned(uint32_t)>;
+  using PrefixLengths = std::function<std::vector<unsigned>(uint32_t)>;
   using Release = std::function<void(uint32_t)>;
   struct Session {
     uint32_t handle = 0;
@@ -54,6 +55,18 @@ public:
         max_prefixes > 120u - max_sessions)
       throw std::invalid_argument("Device KV handle limit is 120");
     sessions_.emplace(0, Session{});
+  }
+  /** Backend-supplied safe boundaries, e.g. causally calibrated prefill pages.
+   * Install before publishing. The retained decode endpoint alone need not
+   * be a valid prefill prefix. */
+  void setPrefixLengths(PrefixLengths lengths) {
+    if (!prefixes_.empty())
+      throw std::logic_error("Set prefix boundaries before publication");
+    prefix_lengths_ = std::move(lengths);
+  }
+  /** Prefill payload pins belong to the prefix LRU, not to decode sessions. */
+  void setPrefixCapture(Capture capture) {
+    prefix_capture_ = std::move(capture);
   }
   ~DeviceKVManager() {
     for (const auto &s : sessions_)
@@ -162,8 +175,8 @@ public:
     return best_count;
   }
 
-  /** Publish full-page prefix terminals plus the completed endpoint. Each
-   * terminal borrows one retained handle: no extra KV copy/handle per page. */
+  /** Publish the backend's safe prefixes (or full pages plus the endpoint).
+   * Terminals borrow one handle; pages and boundary metadata can be shared. */
   void publish(const Tokens &tokens, unsigned position, unsigned pending) {
     if (!max_prefixes_ || tokens.empty() || tokens.size() != position)
       return;
@@ -186,7 +199,9 @@ public:
       prefixes_.erase(victim);
       rebuild();
     }
-    Prefix p{tokens, capture_(position, pending), ++clock_, 0};
+    Prefix p{tokens,
+             (prefix_capture_ ? prefix_capture_ : capture_)(position, pending),
+             ++clock_, 0};
     try {
       p.first = prefix_min_ ? prefix_min_(p.handle) : 0;
       prefixes_.emplace(p.handle, p);
@@ -278,6 +293,14 @@ private:
     Node next;
     for (const auto &p : prefixes_) {
       const auto &entry = p.second;
+      if (prefix_lengths_) {
+        for (unsigned count : prefix_lengths_(entry.handle)) {
+          if (count == 0 || count > entry.tokens.size() || count % 64u)
+            throw std::logic_error("Invalid backend prefix boundary");
+          insert(next, entry.tokens, count, p.first);
+        }
+        continue;
+      }
       size_t first =
         std::max<size_t>(64, (size_t(entry.first) + 63u) / 64u * 64u);
       for (size_t count = first; count <= entry.tokens.size(); count += 64u)
@@ -296,10 +319,12 @@ private:
       }
   }
   Capture capture_;
+  Capture prefix_capture_;
   Restore restore_;
   Release release_;
   std::function<void()> reset_;
   PrefixMin prefix_min_;
+  PrefixLengths prefix_lengths_;
   size_t max_sessions_, max_prefixes_;
   uint32_t next_session_ = 1, active_ = 0;
   uint64_t clock_ = 0;

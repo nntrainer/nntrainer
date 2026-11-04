@@ -446,6 +446,19 @@ executable('nntr_safetensors_info',
 )
 
 if get_option('enable-htp-device-check')
+  foreach check_name, check_source : {
+    'htp_page_prefix_check': 'tools/kv_cache/check_htp_page_prefix.cpp',
+    'htp_sessions_check': 'tools/kv_cache/check_htp_sessions.cpp',
+    'htp_prefill_check': 'test/htp/host/prefill_prefix_check.cpp',
+    'htp_calibration_check': 'test/htp/host/attention_calibration_check.cpp',
+  }
+    executable(check_name,
+        nntrainer_root / check_source,
+        dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+        cpp_args: causallm_inc_args + ['-fno-fast-math'],
+        install: false,
+    )
+  endforeach
   executable('htp_continuation_check',
       nntrainer_root / 'test' / 'htp' / 'htp_continuation_device_check.cpp',
       dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],

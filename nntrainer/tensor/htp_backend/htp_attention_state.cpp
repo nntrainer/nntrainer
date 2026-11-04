@@ -139,6 +139,28 @@ void HtpAttentionState::beginHtpPrompt() {
   htp_rope_table_.clear();
 }
 
+std::shared_ptr<const HtpPrefixCalibration>
+HtpAttentionState::capturePrefixCalibration() const {
+  return std::make_shared<const HtpPrefixCalibration>(HtpPrefixCalibration{
+    q2_calibrated, q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc, q2_kmax,
+    q2_vmax, kv_floor_k_, kv_floor_v_});
+}
+
+void HtpAttentionState::restorePrefixCalibration(
+  const HtpPrefixCalibration &state) {
+  beginHtpPrompt();
+  q2_calibrated = state.calibrated;
+  q2_scale_k = state.scale_k;
+  q2_scale_v = state.scale_v;
+  q2_q_enc = state.q_enc;
+  q2_out_enc = state.out_enc;
+  q2_kmax = state.kmax;
+  q2_vmax = state.vmax;
+  kv_floor_k_ = state.floor_k;
+  kv_floor_v_ = state.floor_v;
+  q2_keep();
+}
+
 bool HtpAttentionState::htpDecodeAttention(
   Tensor &query, Tensor &key, Tensor &value, Tensor &output, Tensor &ck,
   Tensor &cv, unsigned int pos,
@@ -676,7 +698,8 @@ bool HtpAttentionState::try_quantized_attention(
     htpRuntimeConfig().htp.attn_q2 &&
     config_.compute_ops_->supports_kv_cache_q2() &&
     config_.attn_logit_softcapping <= 0.0f && io.sinks == nullptr;
-  if (!use_q2 && config_.head_dim > 256) {
+  if (!use_q2 && config_.head_dim >
+                   (htpRuntimeConfig().htp.kv_prefix_cache ? 512u : 256u)) {
     return false;
   }
   if (handle < 0) {

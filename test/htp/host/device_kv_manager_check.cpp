@@ -71,6 +71,27 @@ int main() {
   }
   assert(live.empty());
   {
+    unsigned selected = 0;
+    Manager m(
+      [&](unsigned, unsigned) {
+        live.insert(next);
+        return next++;
+      },
+      [&](uint32_t, unsigned length) { selected = length; },
+      [&](uint32_t id) { assert(live.erase(id)); }, [] {}, 2, 2);
+    m.setPrefixLengths([](uint32_t) { return std::vector<unsigned>{64, 128}; });
+    Manager::Tokens source(256, 7);
+    m.publish(source, 256, 9);
+    // Decode-only endpoint and unavailable boundaries must not enter radix.
+    source.push_back(8);
+    assert(m.reuse(source) == 128 && selected == 128);
+    source.resize(65);
+    assert(m.reuse(source) == 64 && selected == 64);
+    source.resize(64);
+    assert(m.reuse(source) == 0);
+  }
+  assert(live.empty());
+  {
     unsigned selected_length = 0;
     uint32_t capture_calls = 0;
     std::map<uint32_t, unsigned> first;

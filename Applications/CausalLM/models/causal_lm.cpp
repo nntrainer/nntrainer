@@ -1119,6 +1119,8 @@ void CausalLM::setSessionTokenPosition(unsigned int pos) {
   if (pos == 0u) {
     if (device_kv_manager_)
       device_kv_manager_->forgetTokens();
+    device_prefill_history_.reset();
+    device_prefill_restored_ = false;
     htp_pending_tokens_.clear();
     htp_session_failed_ = false;
   }
@@ -1138,20 +1140,48 @@ size_t CausalLM::getDeviceKVCacheBytes() const {
 #endif
 }
 
+size_t CausalLM::getDeviceKVPrefixBytes() const {
+  std::unordered_set<const KVCacheManager::PrefixSnapshot::Page *> pages;
+  size_t bytes = 0;
+  auto count = [&](const DevicePrefillHistory *history) {
+    if (!history)
+      return;
+    for (const auto &frame : *history)
+      for (const auto &layer : frame.second.kv->layers)
+        for (const auto &page : layer.pages)
+          if (pages.insert(page.get()).second)
+            bytes += page->key.size() + page->value.size();
+  };
+  count(device_prefill_history_.get());
+  for (const auto &state : device_prefill_states_)
+    count(state.second.get());
+  return bytes;
+}
+
 void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
 #ifdef ENABLE_HEXKL
   if (!htp_session_enabled_ || !nntrainer::htpRuntimeConfig().htp.kv_paged)
     throw std::logic_error("Device KV manager requires resident paged HTP KV");
   if (device_kv_manager_)
     throw std::logic_error("Device KV manager is already enabled");
+  if (max_prefixes && !device_prefix_mode_)
+    throw std::logic_error(
+      "Exact DSP radix reuse requires htp.kv_prefix_cache");
+  device_prefill_capture_ = max_prefixes != 0;
   device_kv_manager_ = std::make_unique<DeviceKVManager>(
     [](unsigned position, unsigned pending) {
       return nntrainer::get_htp_ops()->retain_decode_kv(
         {position, 0u, pending});
     },
     [this](uint32_t handle, unsigned prefix) {
+      if (prefix) {
+        restoreDevicePrefill(handle, prefix);
+        return;
+      }
       const auto app =
         nntrainer::get_htp_ops()->select_decode_kv(handle, prefix);
+      device_prefill_history_.reset();
+      device_prefill_restored_ = false;
       global_token_len = app[0];
       SYS_PROMP_LEN = app[1];
       // An independent run drops host slabs before its radix lookup. The
@@ -1165,13 +1195,31 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
       PRE_COMPUTED_CACHE_PATH.clear();
       retire_decode_capture();
     },
-    [](uint32_t handle) {
+    [this](uint32_t handle) {
       nntrainer::get_htp_ops()->release_decode_kv(handle);
+      device_prefill_states_.erase(handle);
     },
-    [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes,
-    [](uint32_t handle) {
-      return nntrainer::get_htp_ops()->decode_kv_prefix_min(handle);
+    [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes);
+  device_kv_manager_->setPrefixCapture(
+    [this](unsigned position, unsigned pending) {
+      const auto id =
+        nntrainer::get_htp_ops()->retain_decode_kv({position, 0u, pending});
+      try {
+        device_prefill_states_.emplace(id, device_prefill_history_);
+      } catch (...) {
+        nntrainer::get_htp_ops()->release_decode_kv(id);
+        throw;
+      }
+      return id;
     });
+  device_kv_manager_->setPrefixLengths([this](uint32_t handle) {
+    std::vector<unsigned> positions;
+    const auto &history = device_prefill_states_.at(handle);
+    if (history)
+      for (const auto &entry : *history)
+        positions.push_back(entry.first);
+    return positions;
+  });
 #else
   throw std::logic_error("HTP backend is unavailable");
 #endif
@@ -1221,6 +1269,7 @@ DeviceKVManager::Stats CausalLM::deviceKVManagerStats() const {
 void CausalLM::clearDeviceKVPrefixes() {
   if (device_kv_manager_)
     device_kv_manager_->clearPrefixes();
+  device_prefill_history_.reset();
 }
 
 void CausalLM::saveDeviceKVCache(const std::string &path, bool park) {
@@ -1625,6 +1674,58 @@ void CausalLM::registerCustomLayers() {
 }
 
 #ifdef ENABLE_HEXKL
+void CausalLM::captureDevicePrefill(unsigned position) {
+  if (!device_prefill_capture_ || position < 64u)
+    return;
+  if (!device_prefill_history_)
+    device_prefill_history_ = std::make_shared<DevicePrefillHistory>();
+  std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
+    calibration;
+  model->forEachLayer(
+    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+      auto *mha =
+        node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
+      if (mha)
+        calibration.push_back(mha->capturePrefixCalibration());
+    },
+    nullptr);
+  if (calibration.size() != kv_cache.getNumLayers())
+    throw std::logic_error("Incomplete DSP prefill calibration");
+  unsigned first = device_prefill_history_->empty()
+                     ? 64u
+                     : device_prefill_history_->rbegin()->first + 64u;
+  first = std::max(first, (kv_cache.prefixMinPosition() + 63u) / 64u * 64u);
+  for (unsigned p = first; p <= position; p += 64u) {
+    DevicePrefillFrame frame;
+    const auto *previous =
+      device_prefill_history_->empty()
+        ? nullptr
+        : device_prefill_history_->rbegin()->second.kv.get();
+    frame.kv = kv_cache.capturePrefix(p, previous);
+    frame.calibration = calibration;
+    device_prefill_history_->emplace(p, std::move(frame));
+  }
+}
+
+void CausalLM::restoreDevicePrefill(uint32_t handle, unsigned position) {
+  const auto &saved = device_prefill_states_.at(handle);
+  if (!saved || !saved->count(position))
+    throw std::invalid_argument("Unavailable causally calibrated prefix");
+  // Fork metadata and shared immutable pages. No source state is shortened.
+  auto history = std::make_shared<DevicePrefillHistory>(
+    saved->begin(), saved->upper_bound(position));
+  device_prefill_history_ = std::move(history);
+  global_token_len = position;
+  SYS_PROMP_LEN = 0;
+  device_prefill_restored_ = true;
+  htp_pending_tokens_.clear();
+  htp_session_failed_ = false;
+  USE_KVCACHE = false;
+  PRE_COMPUTED_CACHE_PATH.clear();
+  retire_decode_capture();
+}
+
 void CausalLM::beginIndependentHtpPrompt(
   bool repeated,
   const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
@@ -1831,6 +1932,24 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // position below. Sized from the plane settled just above.
   allocateAndBindKVCache();
 
+#ifdef ENABLE_HEXKL
+  if (device_prefill_restored_) {
+    const auto &frame = device_prefill_history_->at(global_token_len);
+    kv_cache.restorePrefix(*frame.kv);
+    size_t layer_index = 0;
+    model->forEachLayer(
+      [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+        auto *mha =
+          node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
+        if (mha)
+          mha->restorePrefixCalibration(*frame.calibration.at(layer_index++));
+      },
+      nullptr);
+    compactKVCache(global_token_len, true);
+  }
+#endif
+
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
   // |<-- System prompt -->||<-- input -->||<-- generate -->|
@@ -1932,7 +2051,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       unlimited_generation ? MAX_SEQ_LEN
                            : prefix_rows + text_len + reserved_for_generation;
     resident_continuation = nntrainer::get_htp_ops()->prepare_decode_kv_request(
-      htp_session_enabled_ && global_token_len != 0 ? prefix_rows : 0u, end);
+      htp_session_enabled_ && global_token_len != 0 && !device_prefill_restored_
+        ? prefix_rows
+        : 0u,
+      end);
   }
 #endif
 
@@ -2315,8 +2437,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
     if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
       beforePrefillBlock(from_pos, from_pos + n_tok);
-      return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
-                                  from_pos + n_tok);
+      auto result = incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
+                                         from_pos + n_tok);
+#ifdef ENABLE_HEXKL
+      if (!resident_continuation)
+        captureDevicePrefill(from_pos + n_tok);
+#endif
+      return result;
     }
     // Chunked forward prefill.
     std::vector<float *> out;
@@ -2336,6 +2463,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         compactKVCache(cf);
       beforePrefillBlock(cf, cf + clen);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
+#ifdef ENABLE_HEXKL
+      if (!resident_continuation)
+        captureDevicePrefill(cf + clen);
+#endif
       if (o + clen < n_tok)
         for (auto &oo : so)
           releaseLogitsBuf(oo);
@@ -2611,8 +2742,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
-    if (device_kv_manager_ && token_generation_idx == generation_begin &&
-        skipped_prefill_token && !device_run_tokens.empty() &&
+    if (device_kv_manager_ && !resident_continuation &&
+        device_prefill_history_ && !device_prefill_history_->empty() &&
+        token_generation_idx == generation_begin && skipped_prefill_token &&
+        !device_run_tokens.empty() &&
         device_run_tokens.size() == token_generation_idx + global_token_len) {
       device_kv_manager_->publish(device_run_tokens,
                                   token_generation_idx + global_token_len,
@@ -2666,6 +2799,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // the loop exited early (EOS found) or ran to the maximum token limit.
   if (htp_session_enabled_)
     htp_pending_tokens_ = {static_cast<unsigned>(input_sample[0])};
+  device_prefill_restored_ = false;
   free(input_sample);
 
   global_token_len += (generation_cnt + init_len);
@@ -2677,9 +2811,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         device_run_tokens.clear();
     }
     device_kv_manager_->setTokens(std::move(device_run_tokens));
-    device_kv_manager_->publish(device_kv_manager_->tokens(),
-                                getSessionTokenPosition(),
-                                htp_pending_tokens_[0]);
+    // The prompt endpoint was published at its first decode step. Sessions
+    // pin only INT8 pages; further generated endpoints add no prefill pages.
   }
 
   if (generated_ids_path) {

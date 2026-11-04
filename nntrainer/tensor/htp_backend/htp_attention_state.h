@@ -9,10 +9,17 @@
 #include <attention_config.h>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <tensor.h>
 #include <vector>
 namespace nntrainer {
+/** Exact prefill calibration, including unrounded running maxima. */
+struct HtpPrefixCalibration {
+  bool calibrated = false;
+  std::vector<float> scale_k, scale_v, q_enc, out_enc, kmax, vmax;
+  std::vector<float> floor_k, floor_v;
+};
 class HtpAttentionState {
 public:
   explicit HtpAttentionState(AttentionConfig &config) : config_(config) {}
@@ -32,6 +39,8 @@ public:
   bool ownsCache() const { return htp_owns_cache_; }
   void markResident() { htp_owns_cache_ = true; }
   void beginHtpPrompt();
+  std::shared_ptr<const HtpPrefixCalibration> capturePrefixCalibration() const;
+  void restorePrefixCalibration(const HtpPrefixCalibration &state);
   bool htpDecodeAttention(
     Tensor &query, Tensor &key, Tensor &value, Tensor &output, Tensor &ck,
     Tensor &cv, unsigned int pos,

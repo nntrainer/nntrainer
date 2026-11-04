@@ -883,6 +883,9 @@ void Fp16Attention::one_batch_incremental_forwarding(
   bool done = state_->try_quantized_attention(
     batch, query_step, cache_key, cache_value, cache_key_dim,
     attention_output_step, cache_from, cache_to, nullptr);
+  NNTR_THROW_IF(!done && htpRuntimeConfig().htp.kv_prefix_cache,
+                std::runtime_error)
+    << "HTP radix prefill cannot fall back to a different attention policy";
   if (!done) {
     // every path below reads Q in the host tensor
     if (compute_ops_ &&
@@ -1028,12 +1031,15 @@ void Fp16Attention::one_batch_incremental_forwarding(
 
   // The sink weight goes as a tensor: it is fp16 on Android with fp16
   // enabled, and the accelerated paths take f32 (staged inside).
-  if (state_->try_quantized_attention(batch, query_step, cache_key, cache_value,
-                                      cache_key_dim, attention_output_step,
-                                      from, to, &sink_step) ||
-      state_->try_accelerated_attention(query_step, b_cached_key,
-                                        b_cached_value, attention_output_step,
-                                        from, to, &sink_step)) {
+  const bool quantized = state_->try_quantized_attention(
+    batch, query_step, cache_key, cache_value, cache_key_dim,
+    attention_output_step, from, to, &sink_step);
+  NNTR_THROW_IF(!quantized && htpRuntimeConfig().htp.kv_prefix_cache,
+                std::runtime_error)
+    << "HTP radix prefill cannot fall back to a different attention policy";
+  if (quantized || state_->try_accelerated_attention(
+                     query_step, b_cached_key, b_cached_value,
+                     attention_output_step, from, to, &sink_step)) {
     return;
   }
 
@@ -1801,6 +1807,14 @@ void Fp16Attention::registerQuantizedCache(RunLayerContext &context) {
   state_->registerQuantizedCache(key.height());
 }
 void Fp16Attention::beginHtpPrompt() { state_->beginHtpPrompt(); }
+std::shared_ptr<const HtpPrefixCalibration>
+Fp16Attention::capturePrefixCalibration() const {
+  return state_->capturePrefixCalibration();
+}
+void Fp16Attention::restorePrefixCalibration(
+  const HtpPrefixCalibration &state) {
+  state_->restorePrefixCalibration(state);
+}
 void Fp16Attention::setCacheIndex(unsigned int index) {
   cache_index = index;
   state_->invalidate();

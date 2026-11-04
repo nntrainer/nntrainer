@@ -45,6 +45,7 @@
 
 namespace nntrainer {
 class HtpAttentionState;
+struct HtpPrefixCalibration;
 
 namespace attention_props {
 using namespace nntrainer::props;
@@ -224,6 +225,9 @@ public:
 
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
+  WIN_EXPORT std::shared_ptr<const HtpPrefixCalibration>
+  capturePrefixCalibration() const;
+  WIN_EXPORT void restorePrefixCalibration(const HtpPrefixCalibration &state);
 
 private:
   std::tuple<

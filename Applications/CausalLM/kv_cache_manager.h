@@ -13,6 +13,7 @@
 #ifndef __KV_CACHE_MANAGER_H__
 #define __KV_CACHE_MANAGER_H__
 
+#include <algorithm>
 #include <cstddef>
 #include <fstream>
 #include <functional>
@@ -165,6 +166,33 @@ public:
    * @return true when a base changed
    */
   bool compact(unsigned int pos);
+
+  /** Immutable host prefill pages. Unlike decode INT8 pages these preserve
+   * the precision needed to resume an HMX prefill block. Batch one only. */
+  struct PrefixSnapshot {
+    struct Page {
+      std::vector<unsigned char> key, value;
+    };
+    struct Layer {
+      unsigned base = 0, width = 0;
+      std::vector<std::shared_ptr<const Page>> pages;
+      std::vector<float> dropped_k, dropped_v;
+    };
+    unsigned position = 0;
+    size_t element_bytes = 0;
+    std::vector<Layer> layers;
+  };
+  std::shared_ptr<const PrefixSnapshot>
+  capturePrefix(unsigned position,
+                const PrefixSnapshot *previous = nullptr) const;
+  void restorePrefix(const PrefixSnapshot &snapshot);
+  unsigned prefixMinPosition() const {
+    unsigned first = 0;
+    for (unsigned l = 0; l < bases_.size(); ++l)
+      if (bases_[l])
+        first = std::max(first, bases_[l] + keep_[l]);
+    return first;
+  }
 
   /**
    * @brief Validate a snapshot's position against the allocated cache ranges.

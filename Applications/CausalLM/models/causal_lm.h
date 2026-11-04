@@ -48,12 +48,16 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 extern "C" {
 struct BaseStreamer;
+}
+namespace nntrainer {
+struct HtpPrefixCalibration;
 }
 
 namespace causallm {
@@ -89,6 +93,19 @@ public:
 
 protected:
   bool htp_execution_profile_ = false;
+  struct DevicePrefillFrame {
+    std::shared_ptr<const KVCacheManager::PrefixSnapshot> kv;
+    std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
+      calibration;
+  };
+  using DevicePrefillHistory = std::map<unsigned, DevicePrefillFrame>;
+  // Declared before the manager: its release callbacks erase these handles.
+  std::shared_ptr<DevicePrefillHistory> device_prefill_history_;
+  std::map<uint32_t, std::shared_ptr<const DevicePrefillHistory>>
+    device_prefill_states_;
+  bool device_prefix_mode_ = false;
+  bool device_prefill_capture_ = false;
+  bool device_prefill_restored_ = false;
   std::unique_ptr<DeviceKVManager> device_kv_manager_;
   bool htp_session_enabled_ = false;
   bool htp_session_failed_ = false;
@@ -96,6 +113,8 @@ protected:
   std::vector<unsigned int> htp_pending_tokens_;
   std::vector<unsigned int> last_generated_ids_;
 #ifdef ENABLE_HEXKL
+  void captureDevicePrefill(unsigned position);
+  void restoreDevicePrefill(uint32_t handle, unsigned position);
   /** Start an independent request; continuation steps must not call this. */
   void beginIndependentHtpPrompt(
     bool repeated,
@@ -258,12 +277,15 @@ public:
   WIN_EXPORT void loadDeviceKVCache(const std::string &path);
   /** Device INT8 K+V payload; zero before registration or while parked. */
   WIN_EXPORT size_t getDeviceKVCacheBytes() const;
-  /** Opt-in DSP COW sessions and a radix index of complete device states.
+  /** Unique retained host prefill K/V bytes, excluding metadata and scratch. */
+  WIN_EXPORT size_t getDeviceKVPrefixBytes() const;
+  /** Opt-in DSP COW sessions and a radix index of prefill pages.
    * Requires htp.kv_session=true and htp.kv_paged=true. Serialized use only.
    * Session 0 is the current conversation when enabled. New runs on an empty
    * session search published prefixes automatically; continuation takes new
-   * text only. Retained states expose all available full-page prefixes and
-   * their completed endpoints; selection preserves the source state.
+   * text only. Prefix caching additionally requires htp.kv_prefix_cache and
+   * q8_row attention. It retains immutable FP16 prefill pages independently
+   * of DSP INT8 session pages, and recomputes only the unmatched suffix.
    */
   WIN_EXPORT void enableDeviceKVManager(size_t max_sessions = 32,
                                         size_t max_prefixes = 8);

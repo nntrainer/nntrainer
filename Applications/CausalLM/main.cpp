@@ -436,7 +436,9 @@ int main(int argc, char *argv[]) {
                     [](const auto &r) { return r.contains("device_session"); });
       std::map<std::string, uint32_t> device_session_ids;
       if (device_sessions) {
-        causal->enableDeviceKVManager();
+        const bool prefixes = nntr_cfg.contains("htp") &&
+                              nntr_cfg["htp"].value("kv_prefix_cache", false);
+        causal->enableDeviceKVManager(32, prefixes ? 8 : 0);
         device_session_ids.emplace("default", 0);
       }
       size_t index = 0;
@@ -470,16 +472,18 @@ int main(int argc, char *argv[]) {
         const auto before = causal->getSessionTokenPosition();
         run_prompt(request["prompt"].get<std::string>());
         const auto metrics = causal->getPerformanceMetrics();
-        json result = {{"index", index++},
-                       {"cached_before", before},
-                       {"cached_after", causal->getKvLen()},
-                       {"pending_token", causal->hasPendingSessionToken()},
-                       {"device_kv_bytes", causal->getDeviceKVCacheBytes()},
-                       {"prefill_tokens", metrics.prefill_tokens},
-                       {"ttft_ms", metrics.ttft_ms},
-                       {"decode_ms", metrics.decode_steady_ms},
-                       {"peak_memory_kb", metrics.peak_memory_kb},
-                       {"output", causal->getOutput()}};
+        json result = {
+          {"index", index++},
+          {"cached_before", before},
+          {"cached_after", causal->getKvLen()},
+          {"pending_token", causal->hasPendingSessionToken()},
+          {"device_kv_bytes", causal->getDeviceKVCacheBytes()},
+          {"device_kv_prefix_host_bytes", causal->getDeviceKVPrefixBytes()},
+          {"prefill_tokens", metrics.prefill_tokens},
+          {"ttft_ms", metrics.ttft_ms},
+          {"decode_ms", metrics.decode_steady_ms},
+          {"peak_memory_kb", metrics.peak_memory_kb},
+          {"output", causal->getOutput()}};
         if (device_sessions) {
           const auto stats = causal->deviceKVManagerStats();
           result["device_session"] =

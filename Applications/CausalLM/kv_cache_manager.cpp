@@ -724,6 +724,91 @@ void KVCacheManager::validateSaveRange(unsigned int seq_len) const {
   validateRange(seq_len, false);
 }
 
+std::shared_ptr<const KVCacheManager::PrefixSnapshot>
+KVCacheManager::capturePrefix(unsigned position,
+                              const PrefixSnapshot *previous) const {
+  if (!isAllocated() || batch_size_ != 1 || position == 0 || position % 64u ||
+      position > max_seq_len_ || position > cache_pos_)
+    throw std::invalid_argument("Prefill prefix requires a full 64-row page");
+  auto state = std::make_shared<PrefixSnapshot>();
+  state->position = position;
+  state->element_bytes =
+    layer_caches_.front().key_cache.getDim().getDataTypeSize();
+  state->layers.resize(layer_caches_.size());
+  for (unsigned l = 0; l < state->layers.size(); ++l) {
+    auto &dst = state->layers[l];
+    dst.base = getBase(l);
+    dst.width = kv_widths_[l];
+    if (dst.base % 64u || position < dst.base ||
+        position - dst.base > getLayerCap(l) || !isLayerActive(l))
+      throw std::invalid_argument("Prefill prefix has an unavailable layer");
+    dst.dropped_k = droppedAmaxK(l);
+    dst.dropped_v = droppedAmaxV(l);
+    const size_t page_bytes = 64u * dst.width * state->element_bytes;
+    const auto &src = layer_caches_[l];
+    for (unsigned p = dst.base; p < position; p += 64u) {
+      if (previous && l < previous->layers.size() &&
+          previous->element_bytes == state->element_bytes &&
+          previous->layers[l].width == dst.width &&
+          p >= previous->layers[l].base && p < previous->position) {
+        dst.pages.push_back(
+          previous->layers[l].pages.at((p - previous->layers[l].base) / 64u));
+      } else {
+        auto page = std::make_shared<PrefixSnapshot::Page>();
+        const size_t off =
+          size_t(p - dst.base) * dst.width * state->element_bytes;
+        const auto *k = src.key_cache.getData<unsigned char>();
+        const auto *v = src.value_cache.getData<unsigned char>();
+        page->key.assign(k + off, k + off + page_bytes);
+        page->value.assign(v + off, v + off + page_bytes);
+        dst.pages.push_back(std::move(page));
+      }
+    }
+  }
+  return state;
+}
+
+void KVCacheManager::restorePrefix(const PrefixSnapshot &state) {
+  if (!isAllocated() || batch_size_ != 1 || !state.position ||
+      state.position % 64u || state.position > max_seq_len_ ||
+      state.layers.size() != layer_caches_.size() ||
+      state.element_bytes !=
+        layer_caches_.front().key_cache.getDim().getDataTypeSize())
+    throw std::invalid_argument("Incompatible prefill prefix geometry");
+  // Validate and allocate metadata before changing any live payload.
+  auto bases = bases_;
+  auto dropped_k = dropped_amax_k_, dropped_v = dropped_amax_v_;
+  for (unsigned l = 0; l < state.layers.size(); ++l) {
+    const auto &src = state.layers[l];
+    if (src.base % 64u || src.base > state.position ||
+        state.position - src.base > getLayerCap(l) ||
+        src.width != kv_widths_[l] ||
+        src.pages.size() != (state.position - src.base) / 64u)
+      throw std::invalid_argument("Incompatible prefill prefix layer");
+    const size_t bytes = 64u * src.width * state.element_bytes;
+    for (const auto &page : src.pages)
+      if (!page || page->key.size() != bytes || page->value.size() != bytes)
+        throw std::invalid_argument("Incomplete prefill prefix page");
+    bases[l] = src.base;
+    dropped_k[l] = src.dropped_k;
+    dropped_v[l] = src.dropped_v;
+  }
+  for (unsigned l = 0; l < state.layers.size(); ++l) {
+    auto *k = layer_caches_[l].key_cache.getData<unsigned char>();
+    auto *v = layer_caches_[l].value_cache.getData<unsigned char>();
+    for (const auto &page : state.layers[l].pages) {
+      std::memcpy(k, page->key.data(), page->key.size());
+      std::memcpy(v, page->value.data(), page->value.size());
+      k += page->key.size();
+      v += page->value.size();
+    }
+  }
+  bases_.swap(bases);
+  dropped_amax_k_.swap(dropped_k);
+  dropped_amax_v_.swap(dropped_v);
+  cache_pos_ = state.position;
+}
+
 bool KVCacheManager::compact(unsigned int pos) {
   if (!isAllocated())
     return false;

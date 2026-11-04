@@ -458,6 +458,17 @@ public:
     if (fp16_attention_)
       fp16_attention_->beginHtpPrompt();
   }
+  std::shared_ptr<const nntrainer::HtpPrefixCalibration>
+  capturePrefixCalibration() const {
+    if (!fp16_attention_)
+      throw std::logic_error("HTP prefix requires FP16 prefill attention");
+    return fp16_attention_->capturePrefixCalibration();
+  }
+  void restorePrefixCalibration(const nntrainer::HtpPrefixCalibration &state) {
+    if (!fp16_attention_)
+      throw std::logic_error("HTP prefix requires FP16 prefill attention");
+    fp16_attention_->restorePrefixCalibration(state);
+  }
   void foldDroppedAmax(const std::vector<float> &k,
                        const std::vector<float> &v) {
     if (fp16_attention_)

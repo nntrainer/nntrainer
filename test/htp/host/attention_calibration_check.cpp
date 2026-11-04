@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <htp_attention_state.h>
+#include <htp_runtime_config.h>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -13,6 +14,16 @@
 #include <vector>
 
 int main() {
+  nntrainer::HtpRuntimeConfig runtime;
+  runtime.htp.kv_prefix_cache = true;
+  try {
+    nntrainer::validateHtpRuntimeConfig(runtime);
+    std::cerr << "FAIL: radix was enabled without paged sessions\n";
+    return 1;
+  } catch (const std::invalid_argument &) {
+  }
+  runtime.htp.kv_session = runtime.htp.kv_paged = true;
+  nntrainer::validateHtpRuntimeConfig(runtime);
   nntrainer::AttentionConfig config;
   config.num_heads_Q = 2;
   config.num_heads_KV = 1;
@@ -32,6 +43,22 @@ int main() {
   reused.calibrate_q2_scales(kv.data(), kv.data(), 1, 64, narrow.data(), 128,
                              1);
   fresh.calibrate_q2_scales(kv.data(), kv.data(), 1, 64, narrow.data(), 128, 1);
+  const auto checkpoint = fresh.capturePrefixCalibration();
+  nntrainer::HtpAttentionState resumed(config);
+  resumed.name("resumed");
+  resumed.calibrate_q2_scales(kv.data(), kv.data(), 1, 64, wide.data(), 128, 1);
+  resumed.restorePrefixCalibration(*checkpoint);
+  const auto restored = resumed.capturePrefixCalibration();
+  if (restored->scale_k != checkpoint->scale_k ||
+      restored->scale_v != checkpoint->scale_v ||
+      restored->kmax != checkpoint->kmax ||
+      restored->vmax != checkpoint->vmax ||
+      restored->q_enc != checkpoint->q_enc ||
+      restored->out_enc != checkpoint->out_enc ||
+      restored->calibrated != checkpoint->calibrated) {
+    std::cerr << "FAIL: prefix calibration was not restored exactly\n";
+    return 1;
+  }
   std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
   nntrainer::HtpAttentionState::saveQ2Calibration(stream);
   auto get = [&] {

@@ -60,7 +60,11 @@ int main(int argc, char **argv) {
     const unsigned common = fixture.value("common_tokens", 768u);
     const std::string source = fixture["source"];
     auto source_ids = model->getTokenizer()->Encode(source, true);
-    require(source_ids.size() == 1024, "Source is not 1024 tokens");
+    require(source_ids.size() == fixture.value("source_tokens", 1024u),
+            "Source token length differs from fixture");
+    const unsigned expected_hit = common / 64u * 64u;
+    require(expected_hit > 0 && common < source_ids.size(),
+            "Invalid common prefix length");
     std::vector<std::string> branches;
     for (const auto &item : fixture["suffixes"]) {
       const auto suffix =
@@ -116,6 +120,8 @@ int main(int argc, char **argv) {
         {"decode_ms_per_token", m.decode_steady_ms},
         {"steady_steps", m.decode_steady_tokens},
         {"kv_bytes", c->getDeviceKVCacheBytes()},
+        {"prefix_host_bytes", c->getDeviceKVPrefixBytes()},
+        {"peak_memory_kb", m.peak_memory_kb},
         {"wall_ms",
          std::chrono::duration<double, std::milli>(end - start).count()}};
     };
@@ -126,7 +132,7 @@ int main(int argc, char **argv) {
       report["baseline"].push_back(run(text, true));
       write();
     }
-    if (!nc.at("htp").value("kv_paged", false)) {
+    if (!nc.at("htp").value("kv_prefix_cache", false)) {
       report["baseline_only"] = true;
       report["passed"] = true;
       write();
@@ -135,10 +141,12 @@ int main(int argc, char **argv) {
     c->setSessionTokenPosition(0);
     c->enableDeviceKVManager(8, 8);
     const auto source_result = run(source, false);
+    report["source_cache_miss"] = source_result;
     require(source_result["ids"] == report["source_reference"]["ids"],
             "Source reference changed");
     const auto source_fork = c->forkDeviceKVSession();
     bool fresh_ids_equal = true;
+    bool quality_checks_passed = true;
     for (size_t i = 0; i < branches.size(); ++i) {
       const auto session = c->createDeviceKVSession();
       c->selectDeviceKVSession(session);
@@ -147,10 +155,10 @@ int main(int argc, char **argv) {
       const auto after = c->deviceKVManagerStats();
       result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
       require(after.hits == before.hits + 1 &&
-                result["reused_tokens"] == common,
+                result["reused_tokens"] == expected_hit,
               "Partial page prefix was not reused");
       const auto suffix_tokens =
-        model->getTokenizer()->Encode(branches[i], true).size() - common;
+        model->getTokenizer()->Encode(branches[i], true).size() - expected_hit;
       const unsigned last_prompt_decode =
         nc.value("skip_prefill", false) && suffix_tokens > 1 ? 1u : 0u;
       result["processed_suffix_tokens"] =
@@ -159,6 +167,10 @@ int main(int argc, char **argv) {
               "Wrong suffix length");
       result["matches_fresh_ids"] =
         result["ids"] == report["baseline"][i]["ids"];
+      result["matches_fresh_position"] =
+        result["position"] == report["baseline"][i]["position"];
+      require(result["matches_fresh_position"].get<bool>(),
+              "Prefix final position differs from fresh");
       report["reused"].push_back(result);
       write();
       fresh_ids_equal =
@@ -168,7 +180,16 @@ int main(int argc, char **argv) {
           result["output"].get<std::string>().find(
             fixture["expected_codes"][i].get<std::string>()) !=
           std::string::npos;
-        require(result["contains_expected_code"].get<bool>(),
+        result["fresh_contains_expected_code"] =
+          report["baseline"][i]["output"].get<std::string>().find(
+            fixture["expected_codes"][i].get<std::string>()) !=
+          std::string::npos;
+        quality_checks_passed =
+          quality_checks_passed &&
+          result["fresh_contains_expected_code"].get<bool>() &&
+          result["contains_expected_code"].get<bool>();
+        require(!result["fresh_contains_expected_code"].get<bool>() ||
+                  result["contains_expected_code"].get<bool>(),
                 "Branch reused a stale answer");
       }
       report["reused"].back() = result;
@@ -179,8 +200,14 @@ int main(int argc, char **argv) {
     require(report["source_after_branches"]["ids"] ==
               report["source_continuation_reference"]["ids"],
             "Original 1024-token source was overwritten");
+    report["prefix_host_before_clear"] = c->getDeviceKVPrefixBytes();
+    c->clearDeviceKVPrefixes();
+    report["prefix_host_after_clear"] = c->getDeviceKVPrefixBytes();
+    require(c->getDeviceKVPrefixBytes() == 0 && c->getDeviceKVCacheBytes() > 0,
+            "Clearing prefixes must free host pins and preserve active DSP KV");
     report["prefix_checks_passed"] = true;
     report["fresh_output_ids_match"] = fresh_ids_equal;
+    report["quality_checks_passed"] = quality_checks_passed;
     report["passed"] = fresh_ids_equal;
     write();
     std::cout << "PAGE_PREFIX_RESULT " << report.dump() << '\n';
