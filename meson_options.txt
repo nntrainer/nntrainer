@@ -105,8 +105,12 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
+option('causallm-only', type: 'boolean', value: false,
+       description: 'Configure only the CausalLM application, without unrelated example applications or their resources.')
 # Builds libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe)
 option('enable-api', type: 'boolean', value: false)
+option('causallm-extension-archive', type: 'string', value: '',
+       description: 'Optional model-extension static archive for the API library and the separate Windows direct CLI process; empty keeps the public build free of private models.')
 option('enable-qnn-models', type: 'boolean', value: false)
 option('causallm-tokenizer-lib', type: 'string', value: '',
        description: 'Path to a prebuilt CausalLM tokenizer library to link instead of the default. Windows generates its default under <builddir>/tokenizers_c_win/target; elsewhere the tracked Applications/CausalLM/lib/libtokenizers_c.a is staged into the build directory. Use this option for a locally built archive - never overwrite the tracked one.')

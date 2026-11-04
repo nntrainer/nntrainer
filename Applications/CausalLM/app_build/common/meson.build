@@ -44,6 +44,7 @@ if causallm_enable_qnn
     causallm_root / 'qnn' / 'graph_parser.cpp',
     causallm_root / 'qnn' / 'generate_qnn_utils.cpp',
     causallm_root / 'qnn' / 'qnn_kv_cache_manager.cpp',
+    causallm_root / 'qnn' / 'qnn_row_readahead.cpp',
     causallm_root / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
   ]
 endif

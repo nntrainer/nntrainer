@@ -51,6 +51,9 @@ struct QNNModelInfo {
  * @brief Quick_Dot_AI_QNN_Base class
  * @note  This is the base class for QNN.
  */
+#if defined(__GNUC__)
+#pragma GCC visibility push(default)
+#endif
 class Quick_Dot_AI_QNN : public Transformer {
 
 public:
@@ -249,6 +252,10 @@ protected:
    */
   static std::string promptToUtf8(const WSTR &prompt);
 };
+
+#if defined(__GNUC__)
+#pragma GCC visibility pop
+#endif
 
 } // namespace causallm
 

@@ -83,10 +83,14 @@ endif
 
 subdir('models')
 
-if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
-    run_command(powershell_prog, '-ExecutionPolicy', 'Bypass', '-File', join_paths(meson.source_root(), 'jni', 'prepare_encoder.ps1'), meson.build_root(), '0.2', check: true)
-elif get_option('platform') != 'tizen'
-    run_command([meson.source_root() / 'jni' / 'prepare_encoder.sh', meson.build_root(), '0.2'], check: true)
+# CausalLM only consumes json.hpp from this legacy resource bundle. Reuse an
+# existing header instead of downloading and writing unrelated LLaMA headers.
+if not (get_option('causallm-only') and fs.exists(meson.current_source_dir() / 'json.hpp'))
+    if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
+        run_command(powershell_prog, '-ExecutionPolicy', 'Bypass', '-File', join_paths(meson.source_root(), 'jni', 'prepare_encoder.ps1'), meson.build_root(), '0.2', check: true)
+    elif get_option('platform') != 'tizen'
+        run_command([meson.source_root() / 'jni' / 'prepare_encoder.sh', meson.build_root(), '0.2'], check: true)
+    endif
 endif
 
 tokenizer_dependencies = []
@@ -292,10 +296,41 @@ causallm_dep = declare_dependency(
     link_args: get_option('platform') == 'windows' ? tokenizer_link_args : []
 )
 
+extension_archive = get_option('causallm-extension-archive')
+extension_link_args = []
+if extension_archive != ''
+  if not fs.exists(extension_archive)
+    error('Model-extension archive does not exist: ' + extension_archive)
+  endif
+  if cxx.get_id() == 'msvc'
+    extension_link_args += ['/WHOLEARCHIVE:' + extension_archive]
+  else
+    extension_link_args += ['-Wl,--whole-archive', extension_archive, '-Wl,--no-whole-archive']
+  endif
+endif
+
+cli_extension_args = []
+cli_extension_link_args = []
+if host_machine.system() != 'windows' or extension_archive != ''
+  executable_src += [
+    meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
+    meson.current_source_dir() / 'api' / 'ext_model_cli_load.cpp',
+  ]
+endif
+if host_machine.system() == 'windows' and extension_archive != ''
+  # This standalone process owns its static core and callbacks. It never
+  # imports the API DLL (which owns a different process's API registries).
+  executable_src += meson.current_source_dir() / 'api' / 'model_callbacks.cpp'
+  cli_extension_args += ['-DNNTR_STATIC_MODEL_EXTENSION=1', '-DQUICK_DOT_AI_STATIC=1']
+  cli_extension_link_args += extension_link_args
+endif
 e = executable('nntr_causallm',
     executable_src,
     include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    cpp_args: cli_extension_args,
+    link_args: cli_extension_link_args,
+    link_depends: cli_extension_link_args.length() == 0 ? [] : [extension_archive],
 )
 
 
@@ -341,7 +376,10 @@ if get_option('enable-api')
     include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
   ]
 
-  quick_dot_ai_api_cpp_args = []
+  quick_dot_ai_api_cpp_args = ['-DQUICK_DOT_AI_BUILDING_LIBRARY=1']
+  if extension_archive != ''
+    quick_dot_ai_api_cpp_args += ['-DNNTR_STATIC_MODEL_EXTENSION=1']
+  endif
   if get_option('enable-qnn-models')
     quick_dot_ai_api_inc += [
       include_directories('qnn'),
@@ -355,6 +393,8 @@ if get_option('enable-api')
     meson.current_source_dir() / 'api' / 'model_callbacks.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
     meson.current_source_dir() / 'api' / 'model_descriptors_public.cpp',
+    meson.current_source_dir() / 'api' / 'htp_pack_gate.cpp',
+    meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
   ]
@@ -364,13 +404,14 @@ if get_option('enable-api')
     include_directories: quick_dot_ai_api_inc,
     dependencies: [nntrainer_dep, causallm_dep, dependency('threads')],
     cpp_args: quick_dot_ai_api_cpp_args,
+    link_args: extension_link_args,
+    link_depends: extension_archive == '' ? [] : [extension_archive],
     install: true,
   )
 
   quick_dot_ai_api_dep = declare_dependency(
     link_with: quick_dot_ai_api_lib,
     include_directories: include_directories('api'),
-    dependencies: [causallm_dep],
   )
 
   executable('quick_dot_ai_test',
@@ -505,6 +546,102 @@ if get_option('enable-test')
 
   test('unittest_callback_streamer', unittest_callback_streamer,
     args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_callback_streamer'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_htp_pack_gate = executable(
+    'unittest_htp_pack_gate',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_htp_pack_gate.cpp',
+      meson.current_source_dir() / 'api' / 'htp_pack_gate.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [causallm_inc, causallm_inc_nlohmann_inc,
+                          include_directories('api')],
+    # The fixture is read from the source tree, so the test runs from any
+    # build directory.
+    cpp_args: ['-DHTP_PACK_FIXTURES="@0@"'.format(
+      meson.current_source_dir() / 'api' / 'testdata' / 'htp_pack_fixtures.json')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_htp_pack_gate', unittest_htp_pack_gate,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_htp_pack_gate'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # The model-extension plugin loader and the speculative-decoding model
+  # search; both are host-only (the test builds its own tiny plugin).
+  ext_fixture_src = meson.current_source_dir() / 'api' / 'testdata' / 'ext_plugin_fixture.cpp'
+  ext_fixture_inc = [include_directories('api')]
+  ext_fixture_good = shared_library('ext_fixture_good', ext_fixture_src,
+    include_directories: ext_fixture_inc, override_options: ['b_lundef=false'],
+    install: false)
+  ext_fixture_stale = shared_library('ext_fixture_stale', ext_fixture_src,
+    include_directories: ext_fixture_inc, cpp_args: ['-DFIXTURE_STALE_ABI'],
+    override_options: ['b_lundef=false'], install: false)
+  ext_fixture_no_abi = shared_library('ext_fixture_no_abi', ext_fixture_src,
+    include_directories: ext_fixture_inc, cpp_args: ['-DFIXTURE_NO_ABI_INFO'],
+    override_options: ['b_lundef=false'], install: false)
+
+  unittest_ext_model = executable(
+    'unittest_ext_model',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_ext_model.cpp',
+      meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
+      meson.current_source_dir() / 'api' / 'model_callbacks.cpp',
+    ],
+    dependencies: [gtest_main_dep, dependency('dl', required: false)],
+    include_directories: [include_directories('api')],
+    cpp_args: ['-DEXT_GOOD_PLUGIN="@0@"'.format(ext_fixture_good.full_path()),
+               '-DEXT_STALE_PLUGIN="@0@"'.format(ext_fixture_stale.full_path()),
+               '-DEXT_NO_ABI_PLUGIN="@0@"'.format(ext_fixture_no_abi.full_path())],
+    # The fixture plugins bind register_model_descriptor to this executable.
+    export_dynamic: true,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_ext_model', unittest_ext_model,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ext_model'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_kv_prefix_path = executable(
+    'unittest_kv_prefix_path',
+    [meson.current_source_dir() / 'api' / 'unittest_kv_prefix_path.cpp'],
+    dependencies: [gtest_main_dep],
+    include_directories: [include_directories('api')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_prefix_path', unittest_kv_prefix_path,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_prefix_path'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # The engine request is process-wide state in nntrainer/utils; the test
+  # compiles its one source in so it does not need the whole engine linked.
+  unittest_engine_request = executable(
+    'unittest_engine_request',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_engine_request.cpp',
+      meson.source_root() / 'nntrainer' / 'utils' / 'engine_request.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [include_directories('../../nntrainer/utils')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_engine_request', unittest_engine_request,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_engine_request'),
     timeout: 60,
     suite: 'unittests'
   )

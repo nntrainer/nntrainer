@@ -387,6 +387,8 @@ if get_option('enable-api')
       causallm_root / 'api' / 'model_callbacks.cpp',
       causallm_root / 'api' / 'model_config.cpp',
       causallm_root / 'api' / 'model_descriptors_public.cpp',
+      causallm_root / 'api' / 'htp_pack_gate.cpp',
+      causallm_root / 'api' / 'ext_model_loader.cpp',
       causallm_root / 'api' / 'streamer.cpp',
       causallm_root / 'api' / 'callback_streamer.cpp',
       dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
@@ -421,11 +423,19 @@ endif
 # loading config.json / nntr_config.json from that directory (mirrors the
 # in-tree Applications/CausalLM/meson.build target). Public CPU models only —
 # the architectures main.cpp registers; proprietary/QNN models are not
-# registered here.
+# registered here (see the plugin note below).
+#
+# A downstream build can add models as a plugin (libqai_ext_model.so, see
+# api/ext_model_abi.h). The CLI asks the loader for it before main(), like the C
+# API does on first use, so those models are reachable by path too; with no
+# plugin on the library path the loader reports "absent" and nothing changes.
 executable('nntr_causallm',
     causallm_root / 'main.cpp',
+    causallm_root / 'api' / 'ext_model_loader.cpp',
+    causallm_root / 'api' / 'ext_model_cli_load.cpp',
     dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
     cpp_args: causallm_inc_args,
+    link_args: ['-ldl'],
     install: false,
 )
 

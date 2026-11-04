@@ -43,6 +43,31 @@ The normal handle-based lifecycle is:
 Refer to declarations and ownership comments in
 [`quick_dot_ai_api.h`](quick_dot_ai_api.h) for the complete API contract.
 
+### Behaviour every run call shares
+
+- **Backend.** `BackendType` takes effect. `CPU` and `GPU` select the
+  nntrainer compute engine for the process on the first load, through
+  `nntrainer::requestEngine()` (`nntrainer/utils/env_compat.h`); the API sets
+  no environment variable. A `CPU` request does not bring up the OpenCL
+  context. A later load asking for the other engine is logged and runs on the
+  first. An `NNTR_ENGINE` exported by the caller wins over the request. `NPU`
+  models leave the engine alone.
+- **Sessions.** Each run starts a fresh session: the KV position of a CausalLM
+  model is rewound first, so N requests on one handle each behave like the
+  first. A JSON request opts out with `"continue_session": true` and sends only
+  the new turn.
+- **Stream filter.** The callback never sees the chat turn markers
+  (`<turn|>`, `<|turn>`, `<|im_end|>`, `<|im_start|>`), and eight consecutive
+  `<pad>` deltas cancel the generation.
+- **Saved KV prefix.** `runModelHandleWithJsonStreaming()` accepts
+  `{"kv_prefix": {"static", "dynamic", "mode"}}` (see the header). The dump is
+  `<model_dir>/kv_prefix/<hash>.kv`; `kv_prefix_path.h` defines the name and is
+  tested against the reference value (`unittest_kv_prefix_path`).
+- **Peak memory.** `PerformanceMetrics::peak_memory_kb` is the request's peak of
+  anonymous RSS plus accelerator memory (`models/footprint_sampler.h`), which
+  includes the load when the first request loads the model; `ru_maxrss` only
+  when `/proc` gives no number.
+
 ## Gemma4 MoE on native HTP
 
 The Android `--htp` native build registers `gemma4-26b-a4b-htp`, a
@@ -171,6 +196,51 @@ Also verify the normal-launch path with
 This test uses the default model path and LFM2 prompt. It opens Chat and
 generates an answer, compares the OpenAI output and repeats after restarting the
 Activity. Reports are stored in `files/htp-default-path-validation`.
+
+## Model extensions
+
+A downstream project can add models this library does not implement by shipping
+`libqai_ext_model.so` next to the other native libraries. The host holds the
+single Factory, descriptor registry and callback registry; the plugin imports
+them and registers into them. Nothing about a plugin's models is known here.
+
+| Extension point | Where | Purpose |
+|---|---|---|
+| `Factory::registerModel` | `factory.h` | architecture string to class |
+| `register_model_descriptor` | `model_descriptor.h` | catalog entry (id, backends, `QDA_CAP_*`, `sd_variant_id`) |
+| `register_model_path` | `model_descriptor.h` | pack directory when it is not `config_name` lower-cased |
+| `ModelCallbackRegistry::register_for` | `model_callbacks.h` | per-architecture prompt format, KV length, speculative decoding, multimodal |
+
+**Load protocol** (`ext_model_abi.h`, `ext_model_loader.h`). On the first read of
+the model registry the host `dlopen`s `libqai_ext_model.so` (or the path in
+`QAI_EXT_MODEL_PATH`), calls `qai_ext_model_abi_info()` and compares the plugin's
+`QDA_EXT_ABI_VERSION`, `sizeof(ModelDescriptor)` and `sizeof(ModelCallbacks)`
+with its own. Only on a match does it call `qai_ext_model_register()`. A plugin
+must not register from a static constructor: loading it has to be harmless
+until the ABI is accepted. `ModelDescriptor` and `ModelCallbacks` are copied by
+value across the boundary; change either only together with
+`QDA_EXT_ABI_VERSION` and a rebuild of the plugin.
+
+**Diagnostics.** `getExtensionModelStatus()` returns one line:
+`absent: ...` (no plugin on the library path: a normal public build),
+`loaded: ...` or `failed: ...` (a plugin is present but refused or broken: ABI
+mismatch, missing symbol, unresolved dependency). The Kotlin SDK exposes the
+same through `NativeCausalLm.extensionStatus()` and logs a failure at error
+level; only a plugin file that is not there counts as absent.
+
+**Hooks.**
+
+- *Speculative decoding.* `configureSpeculativeDecoding` uses the first
+  sub-model of the handle whose architecture registered
+  `configure_speculative_decoding`, so a `[vision encoder, LLM]` handle reaches
+  the LLM's callback.
+- *Multimodal.* The `[producer, consumer]` composer (QNN builds with the
+  experimental multimodal API) calls `ModelCallbacks::multimodal` when the
+  architectures registered it: `encode_image` and `image_row_token_ids` on the
+  producer; `image_begin_token`/`image_end_token` and `bind_image_span` on the
+  consumer. With none registered it is the plain text/image/text splice.
+- *Planar input.* `QDA_CAP_PLANAR_CHW` marks a vision encoder that takes planar
+  CHW pixels; the Kotlin SDK reads it as `Capability.PLANAR_CHW`.
 
 ## Compatibility
 

@@ -17,9 +17,10 @@ if get_option('default_library') == 'static'
         install_dir: application_install_dir
     )
 else
-    causallm_gptoss_moe_layer = shared_library(
+    causallm_gptoss_moe_layer = build_target(
         'gptoss_moe_layer',
         causallm_gptoss_moe_layer_src_abs,
+        target_type: causallm_layer_type,
         include_directories: [causallm_layer_inc, gpt_oss_inc],
         dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
         install: true,

@@ -16,9 +16,10 @@ if get_option('default_library') == 'static'
         install_dir: application_install_dir
     )
 else
-    causallm_slim_moe_layer = shared_library(
+    causallm_slim_moe_layer = build_target(
         'qwen_moe_layer_fsu',
         causallm_slim_moe_layer_src_abs,
+        target_type: causallm_layer_type,
         include_directories: [causallm_layer_inc, qwen3_slim_moe_inc],
         dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
         install: true,

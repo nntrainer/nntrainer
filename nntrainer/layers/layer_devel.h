@@ -169,7 +169,7 @@ public:
   /**
    * @brief     Destructor of Layer Class
    */
-  virtual ~Layer() = default;
+  virtual ~Layer();
 
   /**
    * @brief Get the layer type

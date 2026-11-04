@@ -318,6 +318,15 @@ The most useful options are:
 | `--cache` | Reuse a compatible existing nntrainer Android engine build, or build it when absent. |
 | `--clean` | Recreate the selected CPU or QNN CausalLM build directory. |
 | `--nntr-threads=N` | Set the positive nntrainer compute-thread count. |
+| `--disable-opencl` | Build the engine without the OpenCL/GPU backend (default: on; same as `-Denable-opencl=false`). Recorded in the engine metadata, so `--cache` never reuses an engine of the other kind. |
+| `--stage[=DIR]` | Assemble the variant's public stage (default `builddir_app_stage/public/<variant>`): the libraries, runtime dependencies and tools the variant ships in one flat directory, residue-checked, with `<DIR>.manifest.json` (source SHAs, toolchain, ABI defines from `nntrainer-abi.ini`, per-file sha256 and `DT_NEEDED`, DSP images). The directory is recreated on every run, so a CPU stage never holds QNN/HTP files of an earlier build. |
+
+A downstream build can take the stage as its input: it copies it into its own
+directory, adds a model-extension plugin (`libqai_ext_model.so`, see
+`api/ext_model_abi.h`) and runs `Android/native_stage.py manifest --kind internal`
+on the result. Never put the plugin into the public stage. `nntr_causallm` and
+`quick_dot_ai_test` both ask the loader for the plugin before running; with none
+on the library path nothing changes.
 
 `--app`, `--install`, and QNN selection are independent. For example,
 `--install` pushes only native artifacts, while `--app --install` also installs
