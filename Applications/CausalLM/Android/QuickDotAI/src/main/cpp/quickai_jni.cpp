@@ -256,6 +256,13 @@ Java_com_example_quickdotai_NativeCausalLm_nativeQueryCatalog(
   return env->NewStringUTF(getModelCatalogJson());
 }
 
+// ---- extension plugin diagnostics -----------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_quickdotai_NativeCausalLm_extensionModelStatusNative(
+  JNIEnv *env, jobject /*thiz*/) {
+  return env->NewStringUTF(getExtensionModelStatus());
+}
+
 // ---- encodeModelHandle (embedding vector) ---------------------------------
 extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_example_quickdotai_NativeCausalLm_encodeModelHandleNative(
@@ -315,6 +322,56 @@ Java_com_example_quickdotai_NativeCausalLm_getPerformanceMetricsHandleNative(
     static_cast<jdouble>(m.decode_steady_ms),
     static_cast<jint>(m.decode_steady_tokens),
     static_cast<jdouble>(m.prefill_drain_ms));
+}
+
+// ---------------------------------------------------------------------------
+// getLastErrorMessageHandle — human-readable text for the most recent
+// failure on this handle (empty when nothing failed). Complements the
+// numeric error codes, which cannot say WHY a call failed.
+// ---------------------------------------------------------------------------
+namespace {
+/**
+ * The native message is truncated to the buffer size, which can cut a
+ * multi-byte character in half, and may carry arbitrary bytes from an
+ * exception text. NewStringUTF() requires well-formed modified UTF-8, so
+ * replace anything that is not a complete 1-3 byte sequence with '?'.
+ */
+std::string sanitizeModifiedUtf8(const char *in) {
+  std::string out;
+  const auto *p = reinterpret_cast<const unsigned char *>(in);
+  while (*p != 0) {
+    size_t len = 0;
+    if (*p < 0x80)
+      len = 1;
+    else if ((*p & 0xE0) == 0xC0)
+      len = 2;
+    else if ((*p & 0xF0) == 0xE0)
+      len = 3;
+    bool ok = len != 0;
+    for (size_t i = 1; ok && i < len; ++i)
+      ok = (p[i] & 0xC0) == 0x80;
+    if (ok) {
+      out.append(reinterpret_cast<const char *>(p), len);
+      p += len;
+    } else {
+      out.push_back('?');
+      ++p;
+    }
+  }
+  return out;
+}
+} // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_quickdotai_NativeCausalLm_getLastErrorMessageHandleNative(
+  JNIEnv *env, jobject /*thiz*/, jlong handleJlong) {
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  char buf[1024] = {0};
+  ErrorCode ec = getLastErrorMessageHandle(handle, buf, sizeof(buf));
+  if (ec != CAUSAL_LM_ERROR_NONE) {
+    return env->NewStringUTF("");
+  }
+  return env->NewStringUTF(sanitizeModifiedUtf8(buf).c_str());
 }
 
 // ---------------------------------------------------------------------------

@@ -50,11 +50,13 @@ val nntrainerNdkRevision =
         )
 
 // Sync transitive prebuilts into jniLibs, removing stale files.
+val nativePrebuiltDir = providers.gradleProperty("nntrainerPrebuiltDir").orNull
+    ?.let { project.file(it) } ?: project.file("prebuilt_libs")
 val prebuiltNativeLibsDir =
     layout.buildDirectory.dir("generated/jniLibs/arm64-v8a")
 
 val copyPrebuiltNativeLibs = tasks.register<Sync>("copyPrebuiltNativeLibs") {
-    from(project.file("prebuilt_libs"))
+    from(nativePrebuiltDir)
     include("*.so")
     include("htp_backend_ext_config.json")
     // externalNativeBuild already packages the API library and C++ runtime.
@@ -76,7 +78,10 @@ android {
 
 
     defaultConfig {
-        minSdk = 33
+        // 28, not 33: the NPU engine is an optional add-on and must not
+        // raise the host app's minSdk (integration feedback 2026-08-28
+        // #14). Anything newer than 28 that we call is runtime-guarded.
+        minSdk = 28
 
         ndk {
             // Only arm64-v8a is supported by the prebuilt CausalLM libraries.
@@ -88,6 +93,11 @@ android {
                 cppFlags += "-std=c++17 -frtti -fexceptions"
                 // Match prebuilts and package one shared C++ runtime.
                 arguments += "-DANDROID_STL=c++_shared"
+                arguments += "-DPREBUILT_LIBS_DIR=${nativePrebuiltDir.canonicalPath}"
+                // 16KB page-size alignment for Play's requirement
+                // (integration feedback #13); prebuilt .so files get the
+                // same flag from their own build systems.
+                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
         }
 
