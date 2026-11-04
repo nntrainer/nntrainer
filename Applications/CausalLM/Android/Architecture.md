@@ -154,7 +154,10 @@ Apps that update UI must marshal callbacks to the main thread.
 
 `QuickDotAIAPP` is the current runnable Android sample. It links the
 `:QuickDotAI` module directly; it does not start a REST service and does not
-communicate over sockets. Its three destinations are Chat (with the JSON composer mode), Metrics and Power;
+communicate over sockets. Native (`NATIVE` runtime) models run in
+`SampleNativeWorkerService`, a private same-UID process (`:quickai_native`)
+that the app recycles and waits for before it loads another native model, so
+`logcat` shows the engine under that process name. Its three destinations are Chat (with the JSON composer mode), Metrics and Power;
 `ChatController` is covered by JVM unit tests under `src/test`, and there is
 no device test on this branch.
 

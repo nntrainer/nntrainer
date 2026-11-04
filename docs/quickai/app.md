@@ -34,7 +34,8 @@ choices:
 |---|---|---|
 | **FAMILY** | `gemma4-26b-a4b`, `lfm2`, `qwen3`, … | The model. The list contains only the models the installed build can run. |
 | **RUNTIME** | `Quick.AI`, `LiteRT` | `Quick.AI` is the native nntrainer engine. `LiteRT` appears for the Gemma4 E2B `.litertlm` file. |
-| **BACKEND** | `NPU`, `CPU`, `GPU` | The processor. The two HTP models offer `NPU` only. |
+| **BACKEND** | `NPU`, `CPU`, `GPU` | The processor. The HTP models offer `NPU` only. |
+| **MODEL VARIANT** | e.g. `Gemma4 26B A4B MoE (HTP)`, `… (HTP, 30k demo)` | Shown only when one family/runtime/backend choice has several packs. It picks the exact pack; the folder check and the load follow it. |
 
 The chip under the rows reads `HTP · W4A32 · <model name>` for the NPU
 models. **BASE PATH** is the directory that contains the pack directory,

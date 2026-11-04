@@ -89,12 +89,14 @@ library; the C API has no session object.
 
 ## The HTP models
 
-The HTP build (`ENABLE_HEXKL`) registers two `NATIVE` descriptors with the
+The HTP build (`ENABLE_HEXKL`) registers four `NATIVE` descriptors with the
 `NPU` backend and the `STREAMING` and `MESSAGES_API` capabilities:
 
 | Catalog id | Directory under `model_base_path` |
 |---|---|
 | `gemma4-26b-a4b-htp` | `gemma4-26b-a4b-htp-w4a32/` |
+| `gemma4-26b-a4b-htp-long` | `gemma4-26b-a4b-htp-long-w4a32/` (same weights, 30k-context pack for the KV-prefix demo) |
+| `gemma4-26b-a4b-htp-2bit-4bit` | `gemma4-26b-a4b-2bit-4bit/` (rotated checkpoint, 2-bit TL2 experts, 4-bit layers 28-29) |
 | `lfm2-24ba2b-htp` | `lfm2-24ba2b-htp-w4a32/` |
 
 `model_base_path` NULL or empty means `/sdcard/Download/aistudio-mobile/models/`.

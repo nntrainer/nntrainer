@@ -15,6 +15,8 @@ is given, is `/sdcard/Download/aistudio-mobile/models/`.
 | Model | Catalog id | Directory under the base path |
 |---|---|---|
 | Gemma4 26B-A4B | `gemma4-26b-a4b-htp` | `gemma4-26b-a4b-htp-w4a32/` |
+| Gemma4 26B-A4B, 30k context | `gemma4-26b-a4b-htp-long` | `gemma4-26b-a4b-htp-long-w4a32/` |
+| Gemma4 26B-A4B, rotated 2/4-bit | `gemma4-26b-a4b-htp-2bit-4bit` | `gemma4-26b-a4b-2bit-4bit/` |
 | LFM2 24B-A2B | `lfm2-24ba2b-htp` | `lfm2-24ba2b-htp-w4a32/` |
 
 To stage a pack:

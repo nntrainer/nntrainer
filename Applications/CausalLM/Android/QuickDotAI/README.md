@@ -180,8 +180,10 @@ LiteRT entry. It is read from the C API (`getModelCatalogJson`) when
 A `ModelDescriptor` has `id`, `family`, `displayName`, `runtime`
 (`NATIVE` or `LITERT`), `backends` and `capabilities` (`STREAMING`,
 `MESSAGES_API`, `MULTIMODAL`, `TOOL_USE`, `EMBEDDING`, `MULTI_IMAGE`,
-`SPECULATIVE`). The HTP descriptors are `gemma4-26b-a4b-htp` (family
-`gemma4-26b-a4b`) and `lfm2-24ba2b-htp` (family `lfm2`), both `NATIVE`,
+`SPECULATIVE`, `PLANAR_CHW`, `VISION_ENCODER`). The HTP descriptors are
+`gemma4-26b-a4b-htp` and `gemma4-26b-a4b-htp-long` (family `gemma4-26b-a4b`),
+`gemma4-26b-a4b-htp-2bit-4bit` (family `gemma4-26b-a4b-2bit-4bit`) and
+`lfm2-24ba2b-htp` (family `lfm2`), all `NATIVE`,
 backend `NPU`, capabilities `STREAMING` and `MESSAGES_API`. `ModelIds`
 holds the id constants.
 
