@@ -12,15 +12,14 @@ The easiest way is `build_android.sh --htp --install` (see
 
 ```bash
 adb shell sh /data/local/tmp/Quick.AI/run_causallm.sh /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
+adb shell "QDA_HTP_LIFECYCLE=1 sh /data/local/tmp/Quick.AI/run_test.sh gemma4-26b-a4b-htp 'I bought a red car yesterday' true W4A32 1 /sdcard/Download/aistudio-mobile/models"
 ```
 
 The wrappers `cd` into that directory and export `LD_LIBRARY_PATH`,
-`ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS` (8 for the HTP build). The second
-wrapper, `run_test.sh` for `quick_dot_ai_test`, does not load the HTP models
-yet: it exports `ADSP_LIBRARY_PATH` with a trailing `:`, which the API refuses
-with `Conflicting HTP runtime option: ADSP_LIBRARY_PATH`. Run
-`quick_dot_ai_test` with the explicit command in
-[The C API lifecycle test](#the-c-api-lifecycle-test) instead.
+`ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS` (8 for the HTP build);
+`run_test.sh` also sets `QUICKAI_NATIVE_LIB_DIR`, which the C API needs for
+the HTP models; the second command above runs
+[the C API lifecycle test](#the-c-api-lifecycle-test) through it.
 
 To stage by hand, push these files into one directory and set the same three
 variables yourself:

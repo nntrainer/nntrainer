@@ -101,7 +101,7 @@ Other options:
 
 | Option | Effect |
 |---|---|
-| `--install` | Pushes the four executables and the runtime libraries to `/data/local/tmp/Quick.AI` on the phone and writes `run_causallm.sh` / `run_test.sh` wrappers there that export `LD_LIBRARY_PATH`, `ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS`. With `--app`, also installs the APK. Needs `adb`; set `ANDROID_SERIAL` when more than one device is attached. |
+| `--install` | Pushes the four executables and the runtime libraries to `/data/local/tmp/Quick.AI` on the phone and writes `run_causallm.sh` / `run_test.sh` wrappers there that export `LD_LIBRARY_PATH`, `ADSP_LIBRARY_PATH` and `NNTR_NUM_THREADS` (`run_test.sh` also `QUICKAI_NATIVE_LIB_DIR`). With `--app`, also installs the APK. Needs `adb`; set `ANDROID_SERIAL` when more than one device is attached. |
 | `--nntr-threads=N` | CPU compute threads baked into the engine and the wrappers. Default 8 for the HTP variant. |
 | `--cache` | Reuses a compatible engine build in `builddir/android_build_result`. |
 | `--clean` | Recreates `builddir_app/htp` before configuring. |
