@@ -56,6 +56,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
 import com.example.quickdotai.Capability
 import com.example.quickdotai.ModelDescriptor
 import com.example.quickdotaiapp.AppViewModel
@@ -69,9 +70,12 @@ import com.example.quickdotaiapp.UiState
 @Composable
 fun QuickAiApp(vm: AppViewModel) {
     val controller = vm.controller
-    val state by controller.state.collectAsStateWithLifecycle()
-    val power by vm.power.state.collectAsStateWithLifecycle()
-    val bench by vm.bench.state.collectAsStateWithLifecycle()
+    // The flows are written from binder and IO threads (the native worker's token callbacks, the runners).
+    // Collect on Main: under the Compose test clock a resumption on the writer's thread ran a frame there,
+    // and layout on a binder thread failed the device tests ("multithreaded access to SnapshotStateObserver").
+    val state by controller.state.collectAsStateWithLifecycle(context = Dispatchers.Main.immediate)
+    val power by vm.power.state.collectAsStateWithLifecycle(context = Dispatchers.Main.immediate)
+    val bench by vm.bench.state.collectAsStateWithLifecycle(context = Dispatchers.Main.immediate)
     QuickAiTheme(state.theme) {
         // The splash cross-fades into the app instead of being swapped out.
         Crossfade(targetState = state.splashShown, animationSpec = tween(350), label = "splash") { shown ->
