@@ -1,73 +1,65 @@
-# Gemma4 HTP radix prefix reuse
+# Gemma4 radix prefixes on the optimized q8 backend
 
-The NPU MoE path can reuse a partial prompt prefix while preserving the greedy
-output IDs and final token position of a fresh run **under the same prefill
-policy**. The Android validation uses Gemma4 26B A4B, SM8850/v81, Android 16,
-eight ARM threads, and unmodified greedy generation.
+The Gemma4 26B A4B NPU path uses the existing optimized **q8/Q2 attention and
+encoded U16 context → folded O projection**. `q8_row` is no longer the radix
+policy. Projection, FFN and MoE keep their original large prefill batches.
+The earlier 9-second `q8_row` result is a superseded implementation, not an
+appropriate baseline for the optimized backend.
 
-## Cache ownership and execution
+## Cache and quantization contract
+
+Whole-request calibration depends on tokens after a proposed common prefix.
+Cropping an old decode snapshot cannot reproduce a fresh shorter request.
+The optimized Q2 kernels now expose **256-query calibration domains** when
+`htp.kv_prefix_cache=true`. Each domain considers the causal KV prefix and
+preserves its exact K/V scales, running maxima, Q/output encoding and window
+metadata. These are the existing Q16/K8/V8 computations, not a switch to
+row-quantized attention or a lower-precision query kernel.
+
+The calibration grouping differs from the legacy whole-call grouping. Thus
+fresh/reused parity is checked under the same cache-compatible q8 policy;
+bit equality with the old whole-call policy is **not** claimed. With prefix
+mode disabled, the original whole-call q8 path remains in use.
+
+Host FP16 prefill pages are immutable and shared between prefix boundaries.
+Physical DSP pages remain 64 tokens, while independently reusable prefill
+boundaries are 256 tokens. A 1024-token source supplies a 768-token hit without
+running a separate 768-token inference or copying a complete KV image per
+terminal. A 750-token common prefix supplies 512 tokens, not 704. The radix
+index publishes only boundaries whose payload and calibration are available.
+
+At least three input tokens are left after a hit: `skip_prefill` reserves the
+last for decode and the remaining prefill must enter the same block graph as
+the independent reference. A shorter suffix falls back to an earlier safe
+boundary. Prefixes smaller than one calibration domain are recomputed.
 
 ```mermaid
 flowchart LR
-  T[Complete input token IDs] --> R[Compressed radix tree]
-  R -->|hit| P[Immutable host FP16 prefill pages]
-  R -->|miss| F[HMX full prefill]
-  P --> S[Restore matching pages and prefill the suffix in HMX]
-  F --> I[DSP INT8 paged decode KV]
-  S --> I
-  F --> L[Publish 64-token boundaries into prefix LRU]
-  S --> L
-  I --> C[Independent resident sessions and COW forks]
-  I <--> D[Explicit Flash save / park / restore]
+  I[Complete token IDs] --> R[Radix safe-prefix lookup]
+  R --> P[Restore immutable FP16 pages and calibration]
+  P --> Q[Existing Q2 attention on the suffix]
+  Q --> U[Gather encoded U16 domains]
+  U --> O[Existing folded O projection: one wide RPC]
+  O --> M[Existing batched FFN / MoE]
+  M --> D[Native DSP INT8 paged decode]
+  D --> S[Sessions / COW forks / Flash snapshots]
 ```
 
-DSP sessions retain their native INT8 pages, scales, positions and pending
-feedback token. Prefix caching independently retains FP16 prefill pages and
-boundary metadata. Prefix pages are shared across boundaries and forks; there
-is no full-payload copy per radix terminal. Session retention does not pin host
-prefill pages indefinitely: those pins belong to the prefix LRU. Clearing the
-prefix index releases its host payload while preserving active DSP KV.
+O projection receives per-domain encodings in the existing variable-length RPC
+argument and consumes the entire activation batch in one call. Its existing
+kernel runs the encoded domains internally. Q and KV input staging carries
+only each live span, avoiding repeated cache maintenance of the full reserved
+FP16 slabs. Partial Q views validate their parent ION generation; they must
+not read the host tensor's sampled-only copy.
 
-For example, one 1024-token prefill supplies a 768-token hit without separately
-running or capturing a complete 768-token inference. The index selects twelve
-64-token pages; only the unmatched suffix is forwarded. A 750-token common
-prefix selects 704 tokens and recomputes the remaining 46 shared tokens with
-the divergent suffix. At least one input token remains for fresh logits.
+## Enable
 
-Global and sliding attention retain their existing layouts. Prefix metadata
-preserves host cache bases and dropped-row maxima. Only boundaries whose
-required sliding rows are actually available are indexed; older retained
-prefixes can preserve earlier windows. DSP decode retains its separate
-window compaction and native page management.
-
-## Why decode snapshots alone were insufficient
-
-The earlier path cut the first pages out of an existing INT8 decode snapshot
-and continued the suffix using M1 decode. Its KV and quantizer could depend on
-rows after the common prefix. A fresh request instead ran HMX prefill with a
-different calibration and reduction geometry. Encoded-page isolation passed,
-but complete-model greedy IDs differed.
-
-The new mode uses the existing `q8_row` prefill quantization: each K/V row has
-its own scale. Attention uses fixed query groups (`Br = 64 / GQA`) and a fixed
-256-key reduction tile, including the 512-dimensional global layers. Projection
-and FFN still process wide prefill blocks. The suffix resumes through that same
-HMX path, and the resulting FP16 KV seeds DSP decode as on the fresh reference.
-An incompatible configuration or attention fallback raises an error.
-
-This changes the prefill quantization policy relative to `attention_kv_dtype=q8`.
-It is opt-in. The validation does not assert bit equality or task accuracy
-equivalence between those two policies. No tokens, logits, EOS decisions or
-channel markers are edited to make equality checks pass.
-
-## Enable and inspect
-
-Keep the pack's existing model/weights settings and use a fully resident HTP
-graph for attention, projections, FFN, MoE and LM head:
+Keep the optimized pack's weights and engine settings. Use fully resident HTP
+attention, projections, FFN, MoE and LM head:
 
 ```json
 {
-  "attention_kv_dtype": "q8_row",
+  "attention_kv_dtype": "q8",
   "skip_prefill": true,
   "init_seq_len": 4096,
   "htp": {
@@ -79,117 +71,114 @@ graph for attention, projections, FFN, MoE and LM head:
 }
 ```
 
-The prefill plane must be a positive multiple of 64; supported query group
-counts divide 64. The tested model has GQA 2 for sliding and 8 for global.
-Build and deploy matching ARM engine/application libraries. This path uses
-existing DSP append/prefill RPCs; no new wire method is required.
+The prefill plane must be a positive multiple of 256. Deploy matching ARM
+engine/application libraries **and the updated DSP skeleton**: the U16
+O-projection RPC accepts either one legacy encoding or one per 256 rows.
+The wire method and existing arithmetic kernels are unchanged. An older
+skeleton rejects the expanded encoding argument; it must not silently fall
+back to another attention implementation.
 
 ```cpp
-causal->enableDeviceKVManager(/*sessions=*/8, /*prefixes=*/8);
-const auto original = causal->activeDeviceKVSession();
+causal->enableDeviceKVManager(8, 8);
+const auto a = causal->activeDeviceKVSession();
 model->run(full_prompt_a, false);
-const auto branch = causal->createDeviceKVSession();
-causal->selectDeviceKVSession(branch);
-model->run(full_prompt_b, false); // automatic longest-prefix lookup
-causal->selectDeviceKVSession(original);
-model->run(new_turn_a, false);   // resident continuation
+const auto b = causal->createDeviceKVSession();
+causal->selectDeviceKVSession(b);
+model->run(full_prompt_b, false); // automatic safe radix reuse
+causal->selectDeviceKVSession(a);
+model->run(new_turn_a, false);   // native resident continuation
 ```
 
-With `kv_prefix_cache=false`, use `enableDeviceKVManager(8, 0)` for sessions
-without prefix retention. The `--requests` CLI chooses this automatically;
-named `device_session` requests use eight retained prefixes when the flag is
-enabled. It reports `device_kv_manager`, `output_ids`, `device_kv_bytes`, and
-`device_kv_prefix_host_bytes`. This is the native C++/request-sequence path.
+For sessions without prefix retention use `kv_prefix_cache=false` and
+`enableDeviceKVManager(8, 0)`. Named `--requests` sessions select these limits
+automatically. Results include token IDs, radix hits/reused tokens,
+`device_kv_bytes`, and `device_kv_prefix_host_bytes`.
 
-`deviceKVManagerStats()` reports hits, reused tokens and radix nodes.
-`getDeviceKVPrefixBytes()` deduplicates the retained host K/V pages;
-`getDeviceKVCacheBytes()` reports active DSP INT8 payload. Neither includes
-all scratch or all device states. Prefix/session limits bound handle counts,
-not a DRAM byte budget. Host prefix pages and the radix token index are not
-part of the DSP Flash snapshot format; Flash restore supports resident
-continuation without publishing unknown token history into the radix tree.
+## Measurement and validation
 
-## Validation and timing
+[Current raw results](validation/gemma4-htp-q8-radix-20261104.json) retain the
+configuration, complete IDs, positions, fixtures, binary hashes and comparison
+methods. They separate **prefill time** from **TTFT**; the old 9-second result
+was TTFT in the discarded q8_row implementation.
 
-Full inputs, output IDs, positions, configuration, timings and binary hashes
-are retained in [the validation record](validation/gemma4-htp-radix-20261104.json).
-It separates the length matrix, the final guarded build, and a diagnostic hash
-run. Hash-run timings must not be used as performance measurements.
+Android SM8850/v81; milliseconds, two branch means. Fresh and reuse rows
+use the same causal q8 calibration policy. The 64-token case safely misses:
+its timing difference is run variation, not a reuse gain.
 
-The checks compare each reused input to independent full-history prefill.
-Resident A/B continuation is compared to its own independent resident
-reference, and Flash restore to the corresponding saved-state continuation.
-These references cannot be substituted for one another.
+| Input / common prefix | Reused | Fresh prefill | Reuse prefill | Fresh TTFT | Reuse TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 96 / 64 | 0 | 1718 | 1696 | 2112 | 2071 |
+| 288 / 256 | 256 | 1772 | 1532 | 2152 | 1932 |
+| 782 / 750 | 512 | 2130 | 1702 | 2546 | 2129 |
+| 800 / 768 | 768 | 2036 | 1582 | 2423 | 1955 |
+| 992 / 960 | 768 | 2507 | 1775 | 3032 | 2293 |
+| 2080 / 2048 | 2048 | 4364 | 1538 | 4793 | 2015 |
 
-Some fresh reference outputs contain EOS immediately or stop at the generation
-limit. Their reused IDs must still match exactly. `quality_checks_passed` is
-recorded separately: it is false when a fresh reference itself fails the code
-recall task. Numerical cache parity does not establish general model quality.
+A separate native CLI comparison used the same final binaries, one short warmup
+and four independent 2080-token requests per policy, without prefix retention:
 
-| Input tokens | Reused tokens | Fresh `q8_row` TTFT (ms) | Radix hit TTFT (ms) | Same-policy ratio | Legacy `q8` fresh TTFT (ms) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 800 | 768 | 4014 | 2507 | 1.60× | 2821 |
-| 2080 | 2048 | 9029 | 3263 | 2.77× | 4779 |
+| q8 policy | Mean prefill | Prefill TPS | Mean TTFT |
+| --- | ---: | ---: | ---: |
+| Existing whole-call calibration | 3800 ms | 547 | 4217 ms |
+| Causal 256-query domains | 4506 ms | 462 | 4999 ms |
 
-The ratios compare identical outputs under the new policy. The legacy column
-uses a different policy; its output IDs can differ. In particular the long
-RUBY fixture recalls the code on legacy `q8` but repeats channel markers to the
-generation cap on `q8_row`. This is an observed task regression, even though
-fresh/reused IDs within `q8_row` match. General quality parity is unverified.
+The final comparison has **18.6% additional cold prefill time**. An earlier
+run of the same final radix binary measured 4181–4425 ms, so this is not a
+frequency-controlled estimate. Removing q8_row restored the optimized kernels,
+but has not achieved zero cold overhead. The prefix-hit table and the CLI
+policy comparison are separate experiments.
 
-The final retained host prefix payload was **206.25 MiB** for the 1024-token
-source and **646.25 MiB** for the 3072-token source. Clearing prefixes reduced
-both to zero and preserved active DSP KV. On these source inputs, adding
-prefix capture increased cold TTFT from 4811→5002 ms and 12798→13215 ms,
-respectively. These individual samples do not establish a fixed overhead.
+Android checks passed all 15 prefix/safe-suffix ID and position comparisons,
+six A/B resident turns, fork continuation, Flash restore and four named CLI
+requests. Source/fresh/reused FP16 K/V hashes match in all 30 layers for the
+first 768 tokens; the diagnostic hash run is excluded from timings. Clearing
+prefixes releases the retained host K/V pages while preserving active DSP KV.
+Typical retained host payload is 165 MiB for the 1024-token source and 605 MiB
+for the 3072-token source. Divergent recomputed domains can retain more pages.
 
-All twelve branch comparisons in the six-length matrix passed; the final
-guarded build rechecked four branches, two-conversation switching, forks and
-Flash restore. The final CLI also passed four A/B/A/B ID/position comparisons.
-The first 768 K/V rows matched source/fresh/reused hashes in
-all thirty layers. Five nontrivial resident switches in the final session
-check took 5.54–15.93 ms (median 12.37 ms).
+Runs are sequential and the phone's frequency is not locked. These timings
+establish neither zero overhead nor a steady decode TPS improvement. Some
+references emit EOS or stop at the generation limit; those outputs are kept
+verbatim. Code recall/task quality is recorded separately from cache parity.
+The long RUBY input can differ from the legacy whole-call q8 output, so
+legacy task-quality equivalence and corpus/perplexity parity remain unverified.
 
-Timings include request setup, KV restoration, suffix prefill and first-token
-delivery, as measured by the native checker. These are sequential integration
-runs without frequency locking or randomized interleaving; expert-cache I/O,
-page-cache warmth and thermal state can affect them. Short or zero steady
-decode samples do not establish a TPS improvement or zero decode overhead.
+Comparisons use the same input IDs and unmodified greedy generation. Prefix
+hits are compared with independent full-history prefill; resident A/B turns
+with independent resident references; Flash restore with the corresponding
+saved-state continuation. They are different reference scenarios.
 
-## Reproduce
+The host checks cover encoded-slice preservation, parent ION ownership,
+radix eligibility, COW/Flash and window behavior. Ubuntu also runs the existing
+36 KV-manager unit tests. ASan/UBSan uses `detect_leaks=0` because LeakSanitizer
+is unavailable in the sandbox's ptrace environment.
 
-After building/installing the Android HTP engine with the existing SDK setup:
+## Limits and reproduction
+
+Prefix retention uses LRU and count limits, not a DRAM byte budget. It keeps
+additional FP16 prefill pages; DSP sessions retain separate INT8 state.
+`getDeviceKVPrefixBytes()` deduplicates host K/V page payload only;
+`getDeviceKVCacheBytes()` reports active DSP payload. Neither includes all
+metadata/scratch or the union of every DSP session. Clearing prefixes releases
+host page pins and preserves active DSP KV.
+
+DSP Flash snapshots preserve resident continuation, not the host prefill radix
+index or token history. Automatic NPU Flash demotion is not added by this work.
 
 ```sh
+# Build/install the Android HTP engine and matching v81 skeleton first.
 meson configure builddir_app/htp -Denable-htp-device-check=true
 ninja -C builddir_app/htp nntr_causallm htp_page_prefix_check \
   htp_sessions_check htp_prefill_check htp_calibration_check
-```
 
-Deploy the matching libraries, DSP skeleton/provider, check executables, model
-pack and fixtures. The fixtures are embedded in the validation JSON. On-device:
-
-```sh
+# In the deployed Android runtime directory:
 export LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64
 export ADSP_LIBRARY_PATH=$PWD
 export NNTR_NUM_THREADS=8 NNTR_HTP_KV_MANAGER=1
-./htp_prefill_check
-./htp_calibration_check
 ./htp_page_prefix_check pack fixture-768.json result.json
 ./htp_sessions_check pack sessions-fixture.json sessions.json
 ```
 
-Host page/session/Flash checks, including ASan/UBSan:
-
-```sh
-CC=gcc-12 test/htp/host/run_device_kv_checks.sh
-CC=gcc-12 SANITIZE=1 ASAN_OPTIONS=detect_leaks=0 \
-  test/htp/host/run_device_kv_checks.sh
-```
-
-The Ubuntu app KV-cache unit suite and the native prefill/calibration checks
-also run against the CPU build. No model or DSP is needed for those checks.
-
-Earlier failed INT8-slicing experiments remain recorded in
-[the historical session document](gemma4-htp-paged-sessions.md) and its linked
-validation files.
+`NNTR_HTP_PREFIX_HASH` is diagnostic only; its run timings are excluded.
+Historical q8_row and INT8-cropping measurements remain in their original
+validation files and are not current performance claims.
