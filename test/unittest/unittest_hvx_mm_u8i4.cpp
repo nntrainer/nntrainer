@@ -918,6 +918,238 @@ TEST_F(HmxMmU8I4Layer, SmallMGemvMatchesHmxRows) {
   }
 }
 
+/**
+ * @brief Host reference of an a16 weight (weight_set_act16): every row's
+ *        u16 codes at the one static (s, zp), the two u8 planes' exact
+ *        integer sweeps, (256 hi + lo - zp colsum) s d + b.
+ */
+static void a16_reference(const std::vector<int8_t> &q_w,
+                          const std::vector<float> &d,
+                          const std::vector<int32_t> &colsum,
+                          const std::vector<float> &bias, const float *x,
+                          uint32_t M, uint32_t K, uint32_t N, float s, float zp,
+                          float *out) {
+  const float inv = 1.0f / s;
+  std::vector<int32_t> q(K);
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t k = 0; k < K; ++k) {
+      const long v =
+        std::lrint(x[static_cast<size_t>(m) * K + k] * inv) + std::lrint(zp);
+      q[k] = static_cast<int32_t>(std::min(65535L, std::max(0L, v)));
+    }
+    for (uint32_t n = 0; n < N; ++n) {
+      int32_t hi = 0, lo = 0;
+      for (uint32_t k = 0; k < K; ++k) {
+        const int32_t w = q_w[static_cast<size_t>(k) * N + n];
+        hi += (q[k] >> 8) * w;
+        lo += (q[k] & 255) * w;
+      }
+      out[static_cast<size_t>(m) * N + n] =
+        (static_cast<float>(hi) * 256.0f + static_cast<float>(lo) -
+         std::lrint(zp) * static_cast<float>(colsum[n])) *
+          s * d[n] +
+        bias[n];
+    }
+  }
+}
+
+/** @brief |got - want| within tol of the largest |want|: a code that rounds
+ *  the other way moves an output by s * d, a plane bug by far more. */
+static size_t a16_mismatches(const float *got, const float *want, size_t n,
+                             float tol) {
+  float peak = 0.0f;
+  for (size_t i = 0; i < n; ++i)
+    peak = std::max(peak, std::abs(want[i]));
+  size_t bad = 0;
+  for (size_t i = 0; i < n; ++i)
+    bad += !(std::abs(got[i] - want[i]) <= tol * peak);
+  return bad;
+}
+
+/**
+ * @brief a16w4 at a static encoding (weight_set_act16): the HMX rows at 64
+ *        and the GEMV's 1..4 against the host reference, and the GEMV rows
+ *        bit-identical to the HMX ones, the rule the u8 path keeps.
+ */
+TEST_F(HmxMmU8I4Layer, A16StaticMatchesReference) {
+  const uint32_t K = 1536, N = 512, M_full = 64;
+  const float s = 2.0f / 65535.0f, zp = 32768.0f;
+  std::vector<Weight> ws(2);
+  std::vector<uint32_t> hs;
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xA16A0000u + i, ws[i]));
+    ASSERT_EQ(nntr_hvx_weight_set_act16(handle_, ws[i].handle, s, zp),
+              AEE_SUCCESS);
+    hs.push_back(ws[i].handle);
+  }
+  std::vector<float> x(static_cast<size_t>(M_full) * K);
+  fill_deterministic(x, 0x5EEDA160u);
+  std::vector<float> full(static_cast<size_t>(M_full) * 2 * N, 0.0f);
+  ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M_full, K, hs.data(), 2, x.data(),
+                                   static_cast<int>(x.size()), full.data(),
+                                   static_cast<int>(full.size())),
+            AEE_SUCCESS);
+  std::vector<float> want(static_cast<size_t>(M_full) * N);
+  for (int i = 0; i < 2; ++i) {
+    a16_reference(ws[i].q_w, ws[i].d, ws[i].colsum, ws[i].bias, x.data(),
+                  M_full, K, N, s, zp, want.data());
+    EXPECT_EQ(a16_mismatches(full.data() + static_cast<size_t>(i) * M_full * N,
+                             want.data(), want.size(), 1e-4f),
+              0u)
+      << "weight " << i;
+  }
+  for (uint32_t M = 1; M <= 4; ++M) {
+    std::vector<float> got(static_cast<size_t>(M) * 2 * N, -1.0f);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M, K, hs.data(), 2, x.data(),
+                                     static_cast<int>(M * K), got.data(),
+                                     static_cast<int>(got.size())),
+              AEE_SUCCESS)
+      << "M=" << M;
+    size_t bad = 0;
+    for (uint32_t w = 0; w < 2; ++w)
+      bad += std::memcmp(got.data() + static_cast<size_t>(M) * N * w,
+                         full.data() + static_cast<size_t>(M_full) * N * w,
+                         sizeof(float) * M * N) != 0;
+    EXPECT_EQ(bad, 0u) << "GEMV rows differing from the 64-row call at M=" << M;
+  }
+  for (const auto &w : ws)
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
+/**
+ * @brief a16 on the column slices Gemma-4's kv-shared FFN registers
+ *        (fcSliceCols): gate / up 1536 x 12288 as 4 x 2560 + 2048, down
+ *        12288 x 1536 as 9 x 160 + 96, at M = 1 and 64 against the
+ *        reference.
+ */
+TEST_F(HmxMmU8I4Layer, A16SlicedFfnShapes) {
+  const float s = 2.0f / 65535.0f, zp = 32768.0f;
+  struct Shape {
+    uint32_t K;
+    std::vector<uint32_t> cols;
+  };
+  const std::vector<Shape> shapes = {
+    {1536, {2560, 2560, 2560, 2560, 2048}},
+    {12288, {160, 160, 160, 160, 160, 160, 160, 160, 160, 96}}};
+  for (const Shape &sh : shapes) {
+    SCOPED_TRACE("K=" + std::to_string(sh.K));
+    std::vector<Weight> ws(sh.cols.size());
+    std::vector<uint32_t> hs;
+    uint32_t N = 0;
+    for (size_t i = 0; i < ws.size(); ++i) {
+      ASSERT_NO_FATAL_FAILURE(
+        MakeAndRegister(sh.K, sh.cols[i], 0xA16C0000u + i, ws[i]));
+      ASSERT_EQ(nntr_hvx_weight_set_act16(handle_, ws[i].handle, s, zp),
+                AEE_SUCCESS);
+      hs.push_back(ws[i].handle);
+      N += sh.cols[i];
+    }
+    for (uint32_t M : {1u, 64u}) {
+      SCOPED_TRACE("M=" + std::to_string(M));
+      std::vector<float> x(static_cast<size_t>(M) * sh.K);
+      fill_deterministic(x, 0x5EEDA16Cu);
+      std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
+      ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M, sh.K, hs.data(),
+                                       static_cast<int>(hs.size()), x.data(),
+                                       static_cast<int>(x.size()), got.data(),
+                                       static_cast<int>(got.size())),
+                AEE_SUCCESS);
+      size_t off = 0;
+      for (size_t i = 0; i < ws.size(); ++i) {
+        std::vector<float> want(static_cast<size_t>(M) * sh.cols[i]);
+        a16_reference(ws[i].q_w, ws[i].d, ws[i].colsum, ws[i].bias, x.data(), M,
+                      sh.K, sh.cols[i], s, zp, want.data());
+        EXPECT_EQ(
+          a16_mismatches(got.data() + off, want.data(), want.size(), 1e-4f), 0u)
+          << "slice " << i;
+        off += want.size();
+      }
+    }
+    for (const auto &w : ws)
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+  }
+}
+
+/**
+ * @brief The dense FFN entry (mm_u8i4_moe_layer, every row of every chunk
+ *        at weight 1) on a16 handles: gate_up at the input encoding, GeGLU,
+ *        the full-K down at the middle one as C column slices (as the host
+ *        registers it) -- against the same composition on the host, at 64
+ *        rows, at 5 (the GLU's own u16 planes, a tail group and a padded
+ *        block) and at 1 (the GEMV).
+ */
+TEST_F(HmxMmU8I4Layer, A16DenseMatchesHostComposition) {
+  const uint32_t K = 512, W = 256, C = 2, N = 512;
+  const float s_in = 2.0f / 65535.0f, zp_in = 32768.0f;
+  const uint32_t NS = N / C;
+  std::vector<Weight> gu(C), dn(C);
+  std::vector<uint32_t> h_gu, h_dn;
+  for (uint32_t c = 0; c < C; ++c) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * W, 0xDE16A000u + c, gu[c]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(C * W, NS, 0xDE16B000u + c, dn[c]));
+    h_gu.push_back(gu[c].handle);
+    h_dn.push_back(dn[c].handle);
+  }
+  for (uint32_t M : {64u, 5u, 1u}) {
+    SCOPED_TRACE("M=" + std::to_string(M));
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EEDDE16u);
+    // the host composition, which also calibrates the middle encoding
+    std::vector<float> g(static_cast<size_t>(M) * 2 * W);
+    std::vector<float> mid(size_t(M) * C * W); /* chunk c at columns c W */
+    float lo = 0.0f, hi = 0.0f;
+    for (uint32_t c = 0; c < C; ++c) {
+      a16_reference(gu[c].q_w, gu[c].d, gu[c].colsum, gu[c].bias, x.data(), M,
+                    K, 2 * W, s_in, zp_in, g.data());
+      for (uint32_t m = 0; m < M; ++m)
+        for (uint32_t j = 0; j < W; ++j) {
+          const float a = g[size_t(m) * 2 * W + j];
+          const float u = g[size_t(m) * 2 * W + W + j];
+          const float v =
+            0.5f * a *
+            (1.0f + std::tanh(0.7978845608f * (a + 0.044715f * a * a * a))) * u;
+          mid[size_t(m) * C * W + size_t(c) * W + j] = v;
+          lo = std::min(lo, v);
+          hi = std::max(hi, v);
+        }
+    }
+    const float s_mid = (hi - lo) / 65535.0f;
+    const float zp_mid = std::nearbyint(-lo / s_mid);
+    std::vector<float> want(static_cast<size_t>(M) * N), ws(size_t(M) * NS);
+    for (uint32_t c = 0; c < C; ++c) {
+      ASSERT_EQ(nntr_hvx_weight_set_act16(handle_, h_gu[c], s_in, zp_in),
+                AEE_SUCCESS);
+      ASSERT_EQ(nntr_hvx_weight_set_act16(handle_, h_dn[c], s_mid, zp_mid),
+                AEE_SUCCESS);
+      a16_reference(dn[c].q_w, dn[c].d, dn[c].colsum, dn[c].bias, mid.data(), M,
+                    C * W, NS, s_mid, zp_mid, ws.data());
+      for (uint32_t m = 0; m < M; ++m)
+        std::copy_n(ws.data() + size_t(m) * NS, NS,
+                    want.data() + size_t(m) * N + size_t(c) * NS);
+    }
+    std::vector<uint32_t> row_index(size_t(C) * M), row_count(C, M);
+    std::vector<float> row_weight(row_index.size(), 1.0f);
+    for (uint32_t c = 0; c < C; ++c)
+      for (uint32_t r = 0; r < M; ++r)
+        row_index[size_t(c) * M + r] = r;
+    std::vector<float> got(want.size(), -1.0f);
+    ASSERT_EQ(
+      nntr_hvx_mm_u8i4_moe_layer(
+        handle_, M, K, W, N, 1u /* gelu tanh */, h_gu.data(), C, h_dn.data(), C,
+        row_index.data(), static_cast<int>(row_index.size()), row_count.data(),
+        C, row_weight.data(), static_cast<int>(row_weight.size()), x.data(),
+        static_cast<int>(x.size()), got.data(), static_cast<int>(got.size())),
+      AEE_SUCCESS);
+    // the host GeGLU is libm's tanh, not the kernel's: a middle value a few
+    // ulp off can round to the next code, s_mid * d at the output
+    EXPECT_EQ(a16_mismatches(got.data(), want.data(), want.size(), 1e-3f), 0u);
+  }
+  for (uint32_t c = 0; c < C; ++c) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[c]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[c]), AEE_SUCCESS);
+  }
+}
+
 TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   const uint32_t M = 64, K = 1024, N = 1024;
   const int kReps = 20;

@@ -32,6 +32,7 @@
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 #include "hvx_router_rows_f32.h"
+#include "hvx_swiglu_f32.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -141,6 +142,15 @@ int nntr_hvx_weight_bake_export(remote_handle64 handle, uint32 w_handle,
   }
   return hexkl_weight_u8i4_export(&s->weights_u8i4, w_handle, wh_out,
                                   (uint32_t)wh_outLen);
+}
+
+int nntr_hvx_weight_set_act16(remote_handle64 handle, uint32 w_handle,
+                              float scale, float zp) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_set_act16(&s->weights_u8i4, w_handle, scale, zp);
 }
 
 int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
@@ -884,7 +894,7 @@ static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
  *  call, 2.2 an o-proj call, two to four calls a 2048-row layer). */
 static uint32_t fc_rows_a_call(const nntr_hvx_session *s, uint32_t K,
                                const uint32 *w_handles, int w_handlesLen) {
-  uint32_t n_max = 0;
+  uint32_t n_max = 0, a16 = 0;
   for (int i = 0; i < w_handlesLen; ++i) {
     if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
         !s->weights_u8i4.slots[w_handles[i]].in_use) {
@@ -892,14 +902,17 @@ static uint32_t fc_rows_a_call(const nntr_hvx_session *s, uint32_t K,
     }
     const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
     n_max = n_i > n_max ? n_i : n_max;
+    a16 |= (uint32_t)s->weights_u8i4.slots[w_handles[i]].a16;
   }
+  /* an a16 row is two planes of K bytes */
+  const size_t row = (size_t)K * (a16 ? 2u : 1u);
   const size_t arena =
     s->vtcm_size < s->config_off ? s->vtcm_size : s->config_off;
   const size_t fixed = (size_t)K * n_max + ((size_t)512u << 10);
-  if (K == 0u || arena < fixed + (size_t)64u * K) {
+  if (K == 0u || arena < fixed + (size_t)64u * row) {
     return 64u;
   }
-  const uint32_t rows = (uint32_t)((arena - fixed) / K);
+  const uint32_t rows = (uint32_t)((arena - fixed) / row);
   return rows - rows % 64u;
 }
 
@@ -1707,6 +1720,149 @@ static int check_moe_row_totals(const uint32 *row_count, int n_experts,
   return AEE_SUCCESS;
 }
 
+/** @brief Rows a dense a16 pass takes at most: its gate_up output and GLU
+ *  rows are M x 3 I floats of heap (12 MiB at 256 rows of I = 4 x 1536). */
+#define DENSE_A16_MAX_ROWS 256u
+/** @brief Chunks of a dense a16 pass: the down's column slices' offsets
+ *  sit on the stack. */
+#define DENSE_A16_MAX_CHUNKS 16u
+/** @brief Rows hexkl_mm_u8i4_layer_run keeps on the HVX GEMV (its
+ *  LAYER_GEMV_MAX_ROWS), which takes no prepacked a16 planes. */
+#define DENSE_A16_GEMV_ROWS 4u
+
+/**
+ * @brief The dense FFN (every "expert" a chunk of the intermediate
+ *        dimension that takes every row at weight 1) on a16w4 handles:
+ *        gate_up of every chunk in one layer call (the pre norm and the
+ *        static encoding in its quant pass), each chunk's GLU into its
+ *        columns of one [m x n inter] row, then one down over all of them:
+ *        h_dn holds that full-K down (K = n inter) as n column slices, which
+ *        the host registers instead of the MoE kernel's row slices. Past the
+ *        GEMV's rows that row exists only as the down's two u16 planes
+ *        (hvx_glu_pack_u16_ah).
+ *
+ * 1 when the handles are not a16 (the MoE kernel takes the call), else
+ * the AEE code. The MoE kernel's fused epilogues are u8; this is the
+ * a16 FC path's composition instead. Routed MoE layers stay on the
+ * kernel, u8.
+ */
+static int dense_a16_run(nntr_hvx_session *s, uint32 M, uint32 K, uint32 inter,
+                         uint32 N_out, uint32 act, const uint32 *h_gu, uint32 n,
+                         const uint32 *h_dn, const uint32 *row_index,
+                         const uint32 *row_count, const float *row_weight,
+                         const float *act_f32, float *out_f32) {
+  const hexkl_weight_u8i4_table *tbl = &s->weights_u8i4;
+  if (n == 0 || h_gu[0] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !tbl->slots[h_gu[0]].in_use || !tbl->slots[h_gu[0]].a16) {
+    return 1;
+  }
+  for (uint32_t c = 0; c < n; ++c) {
+    if (h_gu[c] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        h_dn[c] >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h_dn[c]].a16 ||
+        tbl->slots[h_gu[c]].N != 2u * inter ||
+        tbl->slots[h_dn[c]].K != n * inter || row_count[c] != M) {
+      FARF(ERROR, "dense_a16: chunk %u is not a dense a16 pair", (unsigned)c);
+      return AEE_EUNSUPPORTED;
+    }
+    for (uint32_t r = 0; r < M; ++r) {
+      if (row_index[(size_t)c * M + r] != r ||
+          row_weight[(size_t)c * M + r] != 1.0f) {
+        FARF(ERROR, "dense_a16: routed rows are not supported");
+        return AEE_EUNSUPPORTED;
+      }
+    }
+  }
+  uint32_t dn_off[DENSE_A16_MAX_CHUNKS], dn_ld[DENSE_A16_MAX_CHUNKS];
+  uint32_t cols = 0;
+  for (uint32_t c = 0; c < n && n <= DENSE_A16_MAX_CHUNKS; ++c) {
+    dn_off[c] = cols;
+    dn_ld[c] = N_out;
+    cols += tbl->slots[h_dn[c]].N;
+  }
+  if (n > DENSE_A16_MAX_CHUNKS || cols != N_out) {
+    FARF(ERROR, "dense_a16: the down slices are not %u columns",
+         (unsigned)N_out);
+    return AEE_EUNSUPPORTED;
+  }
+  const uint32_t ki = n * inter;
+  uint32_t step = fc_rows_a_call(s, K, h_gu, (int)n);
+  const uint32_t d = fc_rows_a_call(s, ki, h_dn, (int)n);
+  step = d < step ? d : step;
+  step = step < DENSE_A16_MAX_ROWS ? step : DENSE_A16_MAX_ROWS;
+  const uint32_t mc = M < step ? M : step;
+  /* past the GEMV's rows the GLU packs the down's two u16 planes itself, at
+     the down's static encoding: the [m x ki] f32 is never stored and the
+     down only DMAs the planes in */
+  const uint32_t pmax = (mc + 63u) / 64u * 64u;
+  const size_t planes = (size_t)pmax * ki / 2u + 2u * pmax;
+  const size_t need = (size_t)mc * 2u * ki +
+                      ((size_t)mc * ki > planes ? (size_t)mc * ki : planes);
+  if (s->dense16_n < need) {
+    free(s->dense16);
+    s->dense16 = (float *)memalign(128, need * sizeof(float));
+    s->dense16_n = s->dense16 ? need : 0u;
+    if (!s->dense16) {
+      FARF(ERROR, "dense_a16: no heap for %u floats", (unsigned)need);
+      return AEE_ENOMEMORY;
+    }
+  }
+  float *gu = s->dense16;                 /* n blocks [m x 2 inter] */
+  float *mid = gu + (size_t)mc * 2u * ki; /* [m x ki], or the planes */
+  const size_t gsc = pre_scratch_floats(s, mc, K);
+  const size_t dsc = pre_scratch_floats(s, mc, ki);
+  if (!norm_rows_reserve(s, gsc > dsc ? gsc : dsc)) {
+    return AEE_ENOMEMORY;
+  }
+  hexkl_mm_opts gopt = {.pool = s->quant_pool};
+  if (s->moe_scratch.pre_gamma) {
+    gopt.pre_scratch = s->norm_rows;
+    gopt.pre_gamma = s->moe_scratch.pre_gamma;
+    gopt.pre_eps = s->moe_scratch.pre_eps;
+  }
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    int rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base,
+                                     s->vtcm_size, s->config_off, m, K, h_gu, n,
+                                     act_f32 + (size_t)m0 * K, gu, &gopt);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    hexkl_mm_opts dopt = {
+      .pool = s->quant_pool, .out_off = dn_off, .out_ld = dn_ld};
+    if (m > DENSE_A16_GEMV_ROWS) {
+      const uint32_t m_pad = (m + 63u) / 64u * 64u;
+      uint8_t *lo = (uint8_t *)mid;
+      float *scale = (float *)(lo + (size_t)2u * m_pad * ki);
+      int32_t *zp = (int32_t *)(scale + m_pad);
+      if (hvx_glu_pack_u16_ah(
+            gu, (size_t)m * 2u * inter, 2u * inter, inter, n, inter, (int)act,
+            tbl->slots[h_dn[0]].a16_enc, m, m_pad, s->norm_rows, scale, zp, lo,
+            lo + (size_t)m_pad * ki, s->quant_pool) != AEE_SUCCESS) {
+        return AEE_EBADPARM;
+      }
+      dopt.act16 = 1;
+      dopt.act_ah_prepacked = lo;
+      dopt.act_scale = scale;
+      dopt.act_zp = zp;
+    } else {
+      for (uint32_t c = 0; c < n; ++c) {
+        if (hvx_glu_rows_f32(gu + (size_t)c * m * 2u * inter, 2u * inter, inter,
+                             mid + (size_t)c * inter, ki, m, inter, (int)act,
+                             s->quant_pool) != 0) {
+          return AEE_EBADPARM;
+        }
+      }
+    }
+    rc = hexkl_mm_u8i4_layer_run(
+      &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, ki, h_dn,
+      n, dopt.act16 ? NULL : mid, out_f32 + (size_t)m0 * N_out, &dopt);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
                                uint32 inter, uint32 N_out, uint32 act,
                                const uint32 *h_gate_up, int h_gate_upLen,
@@ -1729,6 +1885,12 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
   }
   if (act > 1u) {
     return AEE_EBADPARM;
+  }
+  rc =
+    dense_a16_run(s, M, K, inter, N_out, act, h_gate_up, (uint32_t)h_gate_upLen,
+                  h_down, row_index, row_count, row_weight, act_f32, out_f32);
+  if (rc != 1) {
+    return rc;
   }
   return hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
@@ -1983,13 +2145,22 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
     return AEE_EBADPARM;
   }
 
+  if (act > 1u) {
+    return AEE_EBADPARM;
+  }
   hexkl_probe_reset(1);
   t0 = hexkl_probe_now();
-  rc = hexkl_mm_u8i4_moe_layer_run(
-    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
-    N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
-    s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
+  /* a16: the FC layer calls' probes fill the same columns */
+  rc =
+    dense_a16_run(s, M, K, inter, N_out, act, h_gate_up, (uint32_t)h_gate_upLen,
+                  h_down, row_index, row_count, row_weight, act_f32, out_f32);
+  if (rc == 1) {
+    rc = hexkl_mm_u8i4_moe_layer_run(
+      &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
+      N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
+      row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch,
+      s->moe_flags | (act ? HEXKL_MOE_FLAG_GELU_TANH : 0u));
+  }
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
   return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);

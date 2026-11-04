@@ -226,6 +226,14 @@ static inline void dq_store(float *p, HVX_Vector v, int al) {
   }
 }
 
+/** @brief dq_store, or (@a acc) the add into what @a p holds. */
+static inline void dq_put(float *p, HVX_Vector v, int al, uint32_t acc) {
+  if (acc) {
+    v = Q6_Vsf_vadd_VsfVsf(*(const HVX_UVector *)p, v);
+  }
+  dq_store(p, v, al);
+}
+
 /** @brief True when every row the job writes starts on a vector boundary. */
 static inline int dq_dst_aligned(const hvx_dq_tiles_job *c) {
   return ((uintptr_t)(c->dst_a + c->nt0 * HEXKL_ACC_TILE_COLS) & 127u) == 0u &&
@@ -288,8 +296,9 @@ static void dq_rows_planes(const hvx_dq_rows_job *jb, uint32_t n_threads,
           af = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(af, v256),
                                   Q6_Vsf_equals_Vw(b[r]));
         }
-        dq_store(c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0 + 32u * j,
-                 dq_formula(af, vs[r], vz[r], cs[j], ws[j], bs[j]), al);
+        dq_put(c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0 + 32u * j,
+               dq_formula(af, vs[r], vz[r], cs[j], ws[j], bs[j]), al,
+               c->accumulate);
       }
     }
     if (jb->row_done) {
@@ -334,11 +343,36 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
           Q6_Vsf_equals_Vw(
             ((const HVX_UVector *)(tlo + (size_t)m * c->row_stride))[0]));
       }
-      dq_store(seg + 32u * j, dq_formula(af, vs, vz, cs[j], ws[j], bs[j]), al);
+      dq_put(seg + 32u * j, dq_formula(af, vs, vz, cs[j], ws[j], bs[j]), al,
+             c->accumulate);
     }
     if (jb->row_done) {
       jb->row_done(jb->ctx, seg, m);
     }
+  }
+}
+
+void hvx_dequant_acc16_tile_to_f32(
+  const int32_t *hi, const int32_t *lo, uint32_t row_stride, uint32_t m_count,
+  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
+  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
+  int accumulate) {
+  const HVX_Vector cs = ((const HVX_UVector *)colsum_w)[0];
+  const HVX_Vector ws = ((const HVX_UVector *)w_scale)[0];
+  const HVX_Vector bs = ((const HVX_UVector *)bias)[0];
+  const HVX_Vector v256 = hvx_splat_sf(256.0f);
+  for (uint32_t m = 0; m < m_count; ++m) {
+    const HVX_Vector af = Q6_Vsf_vadd_VsfVsf(
+      Q6_Vsf_vmpy_VsfVsf(
+        Q6_Vsf_equals_Vw(
+          ((const HVX_UVector *)(hi + (size_t)m * row_stride))[0]),
+        v256),
+      Q6_Vsf_equals_Vw(
+        ((const HVX_UVector *)(lo + (size_t)m * row_stride))[0]));
+    dq_put(out + (size_t)m * out_stride,
+           dq_formula(af, hvx_splat_sf(act_scale[m]),
+                      Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m])), cs, ws, bs),
+           0, (uint32_t)accumulate);
   }
 }
 
@@ -354,7 +388,7 @@ void hvx_dequant_acc_tiles_to_f32(
   hvx_dq_tiles_job c = {tiles_base, tile_stride, nt0,      row_stride, m_count,
                         act_scale,  act_zp,      colsum_w, w_scale,    bias,
                         dst_a,      dst_b,       split,    dst_stride, n_tiles,
-                        0u,         0u};
+                        0u,         0u,          0u};
   hvx_worker_pool_run(pool, hvx_dq_tiles_worker, &c, n_tiles);
 }
 

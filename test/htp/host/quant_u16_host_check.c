@@ -11,9 +11,10 @@
  * @author Haehun Yang <haehun.yang@ax.samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * The pack: 67 rows (16 groups of four and a 3-row scalar tail, a short
+ * The pack: 67 rows (16 groups of four and a 3-row tail group, a short
  * last 64-row block) of K = 128 from each source -- f32 rows, u16 rows
- * with one encoding, u16 rows with a head each -- against per-row codes
+ * with one encoding, u16 rows with a head each, and a static encoding from
+ * f32 rows, normed f32 rows and u16 heads -- against per-row codes
  * rne(x / s) + zp over [0, 65535], low bytes to one AH plane and high
  * bytes to the other. The combine: (256 f(hi) + f(lo) - f(zp) f(cs)) s ws
  * + b, the kernel's operation order, per element.
@@ -27,6 +28,7 @@
 #include "hexkl_acc_tile.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
+#include "hvx_rmsnorm_rows_f32.h"
 
 #define M 67u
 #define MP 128u
@@ -140,16 +142,16 @@ int main(void) {
   /* f32 rows */
   memset(lo, 0xa5, sizeof lo);
   memset(hi, 0x5a, sizeof hi);
-  int rc = hvx_quant_params_pack_u16_ah(x, NULL, NULL, 0u, M, MP, KK, NULL, s,
-                                        z, lo, hi, NULL);
+  int rc = hvx_quant_params_pack_u16_ah(x, NULL, NULL, 0u, NULL, M, MP, KK,
+                                        NULL, 0.f, NULL, s, z, lo, hi, NULL);
   for (uint32_t m = 0; m < M; ++m)
     spec_row(x + (size_t)m * KK, &ws[m], &wz[m], q[m]);
   fail |= rc != 0 || check("f32 rows", lo, hi, s, z, q, ws, wz);
 
   /* u16 rows, one encoding: the codes as they are, zp rounded */
   const float e1[2] = {0.01f, 1234.6f};
-  rc = hvx_quant_params_pack_u16_ah(NULL, x16, e1, KK, M, MP, KK, NULL, s, z,
-                                    lo, hi, NULL);
+  rc = hvx_quant_params_pack_u16_ah(NULL, x16, e1, KK, NULL, M, MP, KK, NULL,
+                                    0.f, NULL, s, z, lo, hi, NULL);
   for (uint32_t m = 0; m < M; ++m) {
     memcpy(q[m], x16 + (size_t)m * KK, sizeof q[m]);
     ws[m] = e1[0];
@@ -159,8 +161,8 @@ int main(void) {
 
   /* u16 rows, a head each: dequantized, then requantized per row */
   const float e2[4] = {0.002f, 31000.f, 0.0007f, 12000.f};
-  rc = hvx_quant_params_pack_u16_ah(NULL, x16, e2, HD, M, MP, KK, scratch, s, z,
-                                    lo, hi, NULL);
+  rc = hvx_quant_params_pack_u16_ah(NULL, x16, e2, HD, NULL, M, MP, KK, NULL,
+                                    0.f, scratch, s, z, lo, hi, NULL);
   for (uint32_t m = 0; m < M; ++m) {
     for (uint32_t j = 0; j < KK; ++j)
       dq[j] = ((float)x16[(size_t)m * KK + j] - e2[2u * (j / HD) + 1u]) *
@@ -168,6 +170,43 @@ int main(void) {
     spec_row(dq, &ws[m], &wz[m], q[m]);
   }
   fail |= rc != 0 || check("u16 per head", lo, hi, s, z, q, ws, wz);
+
+  /** a static per-tensor encoding (fix_enc): every row at it, from f32
+      rows, f32 rows RMS-normed on the way, and u16 rows a head each */
+  const float ef[2] = {0.00031f, 30461.7f};
+  for (int src = 0; src < 3; ++src) {
+    static const char *name[3] = {"fixed f32", "fixed f32 normed",
+                                  "fixed u16 per head"};
+    float gamma[KK];
+    for (uint32_t j = 0; j < KK; ++j)
+      gamma[j] = 0.5f + 0.01f * (float)(j % 17u);
+    memset(lo, 0xa5, sizeof lo);
+    memset(hi, 0x5a, sizeof hi);
+    rc = hvx_quant_params_pack_u16_ah(
+      src == 2 ? NULL : x, src == 2 ? x16 : NULL, src == 2 ? e2 : NULL,
+      src == 2 ? HD : 0u, ef, M, MP, KK, src == 1 ? gamma : NULL, 1e-6f,
+      src == 0 ? NULL : scratch, s, z, lo, hi, NULL);
+    for (uint32_t m = 0; m < M; ++m) {
+      const float *row = x + (size_t)m * KK;
+      if (src == 1) {
+        hvx_rmsnorm_row_f32(row, dq, gamma, KK, 1e-6f);
+        row = dq;
+      } else if (src == 2) {
+        for (uint32_t j = 0; j < KK; ++j)
+          dq[j] = ((float)x16[(size_t)m * KK + j] - e2[2u * (j / HD) + 1u]) *
+                  e2[2u * (j / HD)];
+        row = dq;
+      }
+      ws[m] = ef[0];
+      wz[m] = 30462;
+      const float inv = 1.0f / ef[0];
+      for (uint32_t j = 0; j < KK; ++j) {
+        long v = (long)nearbyintf(row[j] * inv) + wz[m];
+        q[m][j] = (uint16_t)(v < 0 ? 0 : (v > 65535 ? 65535 : v));
+      }
+    }
+    fail |= rc != 0 || check(name[src], lo, hi, s, z, q, ws, wz);
+  }
 
   /* the a16 combine: two staged int32 tiles a result tile, 3 tiles */
   {

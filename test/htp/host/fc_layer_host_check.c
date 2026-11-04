@@ -400,9 +400,9 @@ int main(void) {
       float *psc = (float *)malloc(sizeof(float) * mp);
       int32_t *pzp = (int32_t *)malloc(sizeof(int32_t) * mp);
       float *ag2 = (float *)malloc(sizeof(float) * an);
-      int prc =
-        hvx_quant_params_pack_u16_ah(NULL, a16, enc1, AK, M, mp, AK, NULL, psc,
-                                     pzp, pre, pre + (size_t)mp * AK, NULL);
+      int prc = hvx_quant_params_pack_u16_ah(NULL, a16, enc1, AK, NULL, M, mp,
+                                             AK, NULL, 0.f, NULL, psc, pzp, pre,
+                                             pre + (size_t)mp * AK, NULL);
       hexkl_mm_opts op = {0};
       op.act16 = 1;
       op.act_ah_prepacked = pre;
@@ -446,16 +446,80 @@ int main(void) {
     }
     fail |= (rc != 0) | compare("a16 u16 per head", ag, aw_, an);
 
-    /* refused: a16 with accumulate, and per-head u16 without a scratch */
+    /* accumulate: the same call again adds the same floats, v + v */
     o.accumulate = 1;
+    memcpy(aw_, ag, sizeof(float) * an);
     const int r1 = hexkl_mm_u8i4_layer_run(
       &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, NULL, ag, &o);
+    size_t abad = 0;
+    for (size_t i = 0; i < an; ++i) {
+      const float v2 = aw_[i] + aw_[i];
+      abad += memcmp(&v2, &ag[i], sizeof v2) != 0;
+    }
+    printf("a16 accumulate    : rc=%d, %zu of %zu not v + v\n", r1, abad, an);
+    fail |= (r1 != 0) | (abad != 0);
+    /* refused: per-head u16 without a scratch */
     o.accumulate = 0;
     o.pre_scratch = NULL;
     const int r2 = hexkl_mm_u8i4_layer_run(
       &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, NULL, ag, &o);
-    printf("a16 refusals      : accumulate rc=%d, no scratch rc=%d\n", r1, r2);
-    fail |= (r1 != AEE_EBADPARM) | (r2 != AEE_EBADPARM);
+    printf("a16 refusals      : no scratch rc=%d\n", r2);
+    fail |= r2 != AEE_EBADPARM;
+
+    /**
+     * a16 from the handles (hexkl_weight_u8i4_set_act16): a plain f32 call
+     * at their static encoding, rows RMS-normed on the way (pre_gamma), at
+     * M rows on the HMX and 1..4 rows on the GEMV, which must give the
+     * HMX rows' floats; mixed handles refused
+     */
+    {
+      const float fs = 0.00071f, fz = 30461.f;
+      float gamma[128];
+      for (uint32_t j = 0; j < AK; ++j)
+        gamma[j] = 0.5f + 0.01f * (float)(j % 17u);
+      fail |= hexkl_weight_u8i4_set_act16(&g_tbl, ah[0], fs, fz) != 0;
+      fail |= hexkl_weight_u8i4_set_act16(&g_tbl, ah[1], fs, fz) != 0;
+      hexkl_mm_opts on = {0};
+      on.pre_scratch = asc;
+      on.pre_gamma = gamma;
+      on.pre_eps = 1e-6f;
+      rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                   AK, ah, 2, ax, ag, &on);
+      off = 0;
+      for (uint32_t i = 0; i < 2; ++i) {
+        for (uint32_t t = 0; t < M; ++t) {
+          hvx_rmsnorm_row_f32(ax + (size_t)t * AK, dq, gamma, AK, 1e-6f);
+          for (uint32_t j = 0; j < AK; ++j) {
+            long v = (long)nearbyintf(dq[j] * (1.0f / fs)) + (long)fz;
+            q[j] = (uint16_t)(v < 0 ? 0 : (v > 65535 ? 65535 : v));
+          }
+          ref16(&aw[i], q, fs, (int32_t)fz, aw_ + off + (size_t)t * AN[i]);
+        }
+        off += (size_t)M * AN[i];
+      }
+      fail |= (rc != 0) | compare("a16 static normed", ag, aw_, an);
+      size_t gbad = 0;
+      for (uint32_t m = 1; m <= 4u; ++m) {
+        float *g = (float *)malloc(sizeof(float) * m * (AN[0] + AN[1]));
+        rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, m,
+                                      AK, ah, 2, ax, g, &on);
+        for (uint32_t i = 0, o0 = 0, g0 = 0; i < 2; ++i) {
+          gbad += memcmp(g + g0, ag + o0, sizeof(float) * m * AN[i]) != 0;
+          o0 += M * AN[i];
+          g0 += m * AN[i];
+        }
+        free(g);
+      }
+      printf("a16 static GEMV   : rc=%d, %zu of 8 row runs differ from HMX\n",
+             rc, gbad);
+      fail |= (rc != 0) | (gbad != 0);
+      fail |= hexkl_weight_u8i4_set_act16(&g_tbl, ah[1], 0.f, 0.f) != 0;
+      const int r3 = hexkl_mm_u8i4_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, ax, ag, &on);
+      printf("a16 mixed handles : rc=%d\n", r3);
+      fail |= r3 != AEE_EBADPARM;
+      hexkl_weight_u8i4_set_act16(&g_tbl, ah[0], 0.f, 0.f);
+    }
     free(ax);
     free(a16);
     free(q);

@@ -82,6 +82,18 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
                                  int accumulate);
 
 /**
+ * @brief hvx_dequant_acc_tile_to_f32 for an a16 activation: the tile's
+ *        accumulator is 256 @a hi + @a lo (the high- and low-byte sweeps),
+ *        combined in f32 -- hvx_dq_tiles_rows_worker's lo_off arithmetic,
+ *        so a row's floats are the HMX epilogue's bit for bit.
+ */
+void hvx_dequant_acc16_tile_to_f32(
+  const int32_t *hi, const int32_t *lo, uint32_t row_stride, uint32_t m_count,
+  const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,
+  const float *w_scale, const float *bias, float *out, uint32_t out_stride,
+  int accumulate);
+
+/**
  * @brief Rows [m0, m1) of a run of @a n_tiles adjacent staged tiles,
  *        dequantized (hvx_dequant_acc_tile_to_f32's operations) into
  *        registers and added into out row @a rows[m] times @a weights[m]
@@ -169,6 +181,9 @@ typedef struct {
    *  int24 value, element p at row p / 32, column p % 32, the convert
    *  unit's layout (hexkl_cvt.h) -- instead of int32 at row_stride */
   uint32_t planes24;
+  /** 0, or (hvx_dq_tiles_rows_worker only) add into dst_a instead of
+   *  storing, one add per element (hvx_dequant_acc_tile_to_f32's rule) */
+  uint32_t accumulate;
 } hvx_dq_tiles_job;
 
 /** @brief Bytes of one accumulator byte plane (hvx_dq_tiles_job.planes24). */

@@ -22,6 +22,7 @@
 #include "hvx_convert.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_swiglu_f32.h"
 
 /** @brief HMX activation tile geometry, mirrored from hexkl_micro.h. */
 #define TILE_ROW 64u
@@ -585,6 +586,9 @@ typedef struct {
   int32_t *zp;
   uint8_t *out_lo, *out_hi;
   float *scratch;
+  const float *gamma;
+  float eps;
+  int fixed; /**< scale / zp already hold the one encoding of every row */
 } quant16_ctx;
 
 /** @brief Four rows' u16 codes of one k-tile, rows 0-1 in @a h01 and 2-3 in
@@ -603,17 +607,23 @@ static inline HVX_Vector q16_run(const float *src, HVX_Vector vinv,
     hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)src, vinv)), vz);
 }
 
-/** @brief Rows m..m+3 from f32 rows @a row, at their scale and zp. */
+/** @brief Rows m..m+3 from f32 rows @a row, at their scale and zp. Only
+ *         the first @a count rows are read; the rest are padding and get
+ *         code 0 (the last row times 0, plus 0). */
 static void pack16_rows_f32(const float *const row[4], uint32_t m,
-                            uint32_t n_kt, const float *scale,
+                            uint32_t count, uint32_t n_kt, const float *scale,
                             const int32_t *zp, uint8_t *lo, uint8_t *hi) {
   const size_t blk = (size_t)(m / TILE_ROW) * n_kt * ACT_TILE_BYTES +
                      (m % TILE_ROW) * TILE_INNER;
   HVX_Vector vinv[4], vz[4];
+  const float *rw[4];
   for (uint32_t r = 0; r < 4u; ++r) {
-    vinv[r] = hvx_splat_sf(1.0f / scale[m + r]);
-    vz[r] = Q6_V_vsplat_R(zp[m + r]);
+    const int pad = r >= count;
+    rw[r] = row[pad ? count - 1u : r];
+    vinv[r] = pad ? Q6_V_vzero() : hvx_splat_sf(1.0f / scale[m + r]);
+    vz[r] = pad ? Q6_V_vzero() : Q6_V_vsplat_R(zp[m + r]);
   }
+  row = rw;
   for (uint32_t kt = 0; kt < n_kt; ++kt) {
     const uint32_t o = kt * TILE_INNER;
     /* vpack(Vu, Vv):sat puts Vv in the low half, as quant_pack_group4 */
@@ -729,6 +739,33 @@ int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
   return AEE_SUCCESS;
 }
 
+/** @brief Rows m..m+count-1 (count <= 4) as f32 rows: x16 dequantized or
+ *         x normed into @a sc (four rows of k) when asked, each row's own
+ *         parameters unless the encoding is fixed, then the pack. */
+static void quant16_group(const quant16_ctx *c, uint32_t m, uint32_t count,
+                          float *sc) {
+  const float *row[4];
+  for (uint32_t r = 0; r < count; ++r) {
+    float *s = sc ? sc + (size_t)r * c->k : NULL;
+    if (c->x16) {
+      dequant16_row(c->x16 + (size_t)(m + r) * c->k, s, c->x16_enc, c->x16_hd,
+                    c->k);
+      row[r] = s;
+    } else if (s) {
+      hvx_rmsnorm_row_f32(c->x + (size_t)(m + r) * c->k, s, c->gamma, c->k,
+                          c->eps);
+      row[r] = s;
+    } else {
+      row[r] = c->x + (size_t)(m + r) * c->k;
+    }
+    if (!c->fixed)
+      quant_row_params_one(row[r], 0u, c->k, c->scale + m + r, c->zp + m + r,
+                           65535.0f);
+  }
+  pack16_rows_f32(row, m, count, c->k / TILE_INNER, c->scale, c->zp, c->out_lo,
+                  c->out_hi);
+}
+
 /** @brief Row groups [lo, hi) of four, each one's parameters then its pack
  *         while the rows are cached, as quant_params_pack_worker. */
 static void quant16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
@@ -739,44 +776,34 @@ static void quant16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   float *sc = c->scratch ? c->scratch + (size_t)i * 4u * c->k : NULL;
   for (uint32_t g = lo; g < hi; ++g) {
     const uint32_t m = 4u * g;
-    if (c->x16 && c->x16_hd == c->k) {
+    if (c->x16 && c->x16_hd == c->k && !c->fixed) {
       pack16_rows_u16(c->x16 + (size_t)m * c->k, m, n_kt, c->k, c->out_lo,
                       c->out_hi);
       continue;
     }
-    const float *row[4];
-    for (uint32_t r = 0; r < 4u; ++r) {
-      if (c->x16) {
-        dequant16_row(c->x16 + (size_t)(m + r) * c->k, sc + (size_t)r * c->k,
-                      c->x16_enc, c->x16_hd, c->k);
-        row[r] = sc + (size_t)r * c->k;
-      } else {
-        row[r] = c->x + (size_t)(m + r) * c->k;
-      }
-      quant_row_params_one(row[r], 0u, c->k, c->scale + m + r, c->zp + m + r,
-                           65535.0f);
-    }
-    pack16_rows_f32(row, m, n_kt, c->scale, c->zp, c->out_lo, c->out_hi);
+    quant16_group(c, m, 4u, sc);
   }
 }
 
-int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
-                                 const float *x16_enc, uint32_t x16_hd,
-                                 uint32_t m_valid, uint32_t m_pad, uint32_t k,
-                                 float *pre_scratch, float *scale, int32_t *zp,
-                                 uint8_t *out_lo, uint8_t *out_hi,
-                                 hvx_worker_pool *pool) {
-  const int direct = x16 && x16_hd == k;
-  if ((!x && !x16) || k % TILE_INNER != 0u ||
+int hvx_quant_params_pack_u16_ah(
+  const float *x, const uint16_t *x16, const float *x16_enc, uint32_t x16_hd,
+  const float *fix_enc, uint32_t m_valid, uint32_t m_pad, uint32_t k,
+  const float *pre_gamma, float pre_eps, float *pre_scratch, float *scale,
+  int32_t *zp, uint8_t *out_lo, uint8_t *out_hi, hvx_worker_pool *pool) {
+  const int direct = x16 && x16_hd == k && !fix_enc;
+  if ((!x && !x16) || k % TILE_INNER != 0u || (x16 && pre_gamma) ||
+      (fix_enc && !(fix_enc[0] > 0.0f)) ||
       (x16 && (!x16_enc || x16_hd == 0u || x16_hd % (2u * FLANES) != 0u ||
                k % x16_hd != 0u || (!direct && !pre_scratch)))) {
     return AEE_EBADPARM;
   }
   /** One encoding for the whole row: the codes are the row's own, nothing
       to requantize. Several (a head each): dequantized and requantized per
-      row, since a K-varying scale cannot leave the dot product. */
-  const float s0 = direct ? x16_enc[0] : 1.0f;
-  const int32_t z0 = direct ? (int32_t)nearbyintf(x16_enc[1]) : 0;
+      row, since a K-varying scale cannot leave the dot product. A fixed
+      encoding (fix_enc) is every row's, whatever the source. */
+  const float *enc1 = fix_enc ? fix_enc : (direct ? x16_enc : NULL);
+  const float s0 = enc1 ? enc1[0] : 1.0f;
+  const int32_t z0 = enc1 ? (int32_t)nearbyintf(enc1[1]) : 0;
   for (uint32_t m = 0; m < m_pad; ++m) {
     scale[m] = m < m_valid ? s0 : 1.0f;
     zp[m] = m < m_valid ? z0 : 0;
@@ -787,37 +814,103 @@ int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
     memset(out_hi + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
   }
   const uint32_t m_vec_end = (m_valid / 4u) * 4u;
-  if (m_vec_end > 0) {
-    quant16_ctx ctx = {x,     x16, x16_enc, x16_hd, m_vec_end / 4u, k,
-                       scale, zp,  out_lo,  out_hi, pre_scratch};
+  quant16_ctx ctx = {
+    x,  x16,    x16_enc, x16_hd,      m_vec_end / 4u, k,       scale,
+    zp, out_lo, out_hi,  pre_scratch, pre_gamma,      pre_eps, fix_enc != NULL};
+  if (m_vec_end > 0)
     hvx_worker_pool_run(pool, quant16_worker, &ctx, m_vec_end / 4u);
+  if (m_vec_end == m_valid)
+    return AEE_SUCCESS;
+  /* 1-3 rows past the last group of four: one more group, the pool done
+     with the scratch */
+  if (!direct) {
+    quant16_group(&ctx, m_vec_end, m_valid - m_vec_end, pre_scratch);
+    return AEE_SUCCESS;
   }
-  /* 0-3 rows past the last group of four, scalar */
   for (uint32_t m = m_vec_end; m < m_valid; ++m) {
-    const float *row = x ? x + (size_t)m * k : NULL;
-    if (x16 && !direct) {
-      dequant16_row(x16 + (size_t)m * k, pre_scratch, x16_enc, x16_hd, k);
-      row = pre_scratch;
-    }
-    if (!direct)
-      quant_row_params_one(row, 0u, k, scale + m, zp + m, 65535.0f);
-    const float inv = 1.0f / scale[m];
     const size_t blk =
       (size_t)(m / TILE_ROW) * (k / TILE_INNER) * ACT_TILE_BYTES +
       (m % TILE_ROW) * TILE_INNER;
     for (uint32_t j = 0; j < k; ++j) {
-      long q;
-      if (direct) {
-        q = x16[(size_t)m * k + j];
-      } else {
-        q = (long)nearbyintf(row[j] * inv) + zp[m];
-        q = q < 0 ? 0 : (q > 65535 ? 65535 : q);
-      }
+      const uint16_t q = x16[(size_t)m * k + j];
       const size_t d =
         blk + (size_t)(j / TILE_INNER) * ACT_TILE_BYTES + j % TILE_INNER;
       out_lo[d] = (uint8_t)(q & 0xff);
       out_hi[d] = (uint8_t)(q >> 8);
     }
   }
+  return AEE_SUCCESS;
+}
+
+typedef struct {
+  const float *src;
+  size_t chunk_stride;
+  uint32_t src_ld, up_off, n_chunks, n, k, n_groups;
+  int geglu;
+  const float *scale;
+  const int32_t *zp;
+  uint8_t *lo, *hi;
+  float *scratch;
+} glu16_ctx;
+
+/** @brief Rows m..m+count-1 (count <= 4): each chunk's GLU into its n
+ *         columns of the row in @a sc, then the pack of the four rows. */
+static void glu16_group(const glu16_ctx *c, uint32_t m, uint32_t count,
+                        float *sc) {
+  const float *row[4];
+  for (uint32_t r = 0; r < count; ++r) {
+    float *d = sc + (size_t)r * c->k;
+    for (uint32_t ch = 0; ch < c->n_chunks; ++ch) {
+      const float *g =
+        c->src + ch * c->chunk_stride + (size_t)(m + r) * c->src_ld;
+      hvx_glu_row_f32(g, g + c->up_off, d + (size_t)ch * c->n, c->n, c->geglu);
+    }
+    row[r] = d;
+  }
+  pack16_rows_f32(row, m, count, c->k / TILE_INNER, c->scale, c->zp, c->lo,
+                  c->hi);
+}
+
+static void glu16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
+  const glu16_ctx *c = (const glu16_ctx *)ctx_;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
+  float *sc = c->scratch + (size_t)i * 4u * c->k;
+  for (uint32_t g = lo; g < hi; ++g)
+    glu16_group(c, 4u * g, 4u, sc);
+}
+
+int hvx_glu_pack_u16_ah(const float *src, size_t chunk_stride, uint32_t src_ld,
+                        uint32_t up_off, uint32_t n_chunks, uint32_t n,
+                        int geglu, const float *fix_enc, uint32_t m_valid,
+                        uint32_t m_pad, float *scratch, float *scale,
+                        int32_t *zp, uint8_t *out_lo, uint8_t *out_hi,
+                        hvx_worker_pool *pool) {
+  const uint32_t k = n_chunks * n;
+  if (!src || !scratch || !fix_enc || !(fix_enc[0] > 0.0f) || !m_valid ||
+      !n_chunks || n % TILE_INNER != 0u || up_off < n || src_ld < up_off + n ||
+      m_pad < m_valid || m_pad % TILE_ROW != 0u) {
+    return AEE_EBADPARM;
+  }
+  const float s0 = fix_enc[0];
+  const int32_t z0 = (int32_t)nearbyintf(fix_enc[1]);
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    scale[m] = m < m_valid ? s0 : 1.0f;
+    zp[m] = m < m_valid ? z0 : 0;
+  }
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_lo + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+    memset(out_hi + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
+  const uint32_t end = m_valid / 4u * 4u;
+  glu16_ctx ctx = {src,    chunk_stride, src_ld, up_off, n_chunks, n,
+                   k,      end / 4u,     geglu,  scale,  zp,       out_lo,
+                   out_hi, scratch};
+  if (end)
+    hvx_worker_pool_run(pool, glu16_worker, &ctx, end / 4u);
+  /* 1-3 rows past the last group of four, the pool done with the scratch */
+  if (end < m_valid)
+    glu16_group(&ctx, end, m_valid - end, scratch);
   return AEE_SUCCESS;
 }

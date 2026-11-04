@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -162,6 +163,7 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
   FC_WH_FILE_NAME = nntr_cfg.value("fc_wh_file_name", std::string());
   FC_WH_FORMAT = nntr_cfg.value("fc_wh_format", std::string());
+  ACT16_ENC_FILE = nntr_cfg.value("act16_enc_file", std::string());
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -441,11 +443,38 @@ void Transformer::repack_weight() {
   // lm_head for the same reason it waits: they are DSP heap.
   std::vector<std::pair<MHACoreLayer *, nntrainer::RunLayerContext *>>
     mha_pending;
+  // a16: each QS4CX weight's input encoding, by weight name, handed to its
+  // layer's ops in the walk -- before any of the registrations below
+  std::map<std::string, std::array<float, 2>> act16;
+  if (!ACT16_ENC_FILE.empty()) {
+    const std::filesystem::path p(ACT16_ENC_FILE);
+    std::ifstream f(p.is_absolute() ? p
+                                    : std::filesystem::path(WEIGHT_DIR) / p);
+    NNTR_THROW_IF(!f, std::runtime_error)
+      << "act16_enc_file " << ACT16_ENC_FILE << " cannot be read";
+    // named: items() iterates the json it is called on
+    const nlohmann::json enc = nlohmann::json::parse(f);
+    for (const auto &[name, e] : enc.items())
+      act16[name] = {e.at(0).get<float>(), e.at(1).get<float>()};
+  }
+  unsigned int act16_bound = 0;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [&fc_pending, &dense_pending, &conv_pending, &moe_warm, &tie_pending,
-          &mha_pending](ml::train::Layer &l,
-                        nntrainer::RunLayerContext &context, void *) {
+          &mha_pending, &act16, &act16_bound](
+           ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      if (!act16.empty() && context.getComputeOps()) {
+        for (auto *w : context.getWeights()) {
+          auto &t = w->getVariableRef();
+          auto e = act16.find(w->getName());
+          if (e == act16.end() || t.isVirtual() ||
+              t.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+            continue;
+          context.getComputeOps()->set_act16_enc(t.getData<char>(),
+                                                 e->second[0], e->second[1]);
+          ++act16_bound;
+        }
+      }
       // forEachLayer hands out LayerNodes.
       if (l.getType() == MHACoreLayer::type) {
         if (auto *m = dynamic_cast<MHACoreLayer *>(
@@ -662,6 +691,9 @@ void Transformer::repack_weight() {
     };
   try {
     model->forEachLayer(fn, nullptr);
+    if (!act16.empty())
+      std::cout << "act16: " << act16_bound << " QS4CX weights at a static "
+                << "u16 input encoding (" << ACT16_ENC_FILE << ")" << std::endl;
     // [#225] The FC WH sidecar, handed to every backend that registers a
     // pending FC before it registers any. A CPU-engine layer's ops are
     // pending too and answer false, so a model whose keys route no FC to

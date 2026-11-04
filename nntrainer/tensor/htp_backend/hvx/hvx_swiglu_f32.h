@@ -36,4 +36,23 @@
 void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m_valid,
                             uint32_t n_out, hvx_worker_pool *pool);
 
+/**
+ * @brief One row of hvx_glu_rows_f32: d[j] = glu(g[j], u[j]) for j < n,
+ *        @a n a multiple of 32, on the calling thread.
+ */
+void hvx_glu_row_f32(const float *g, const float *u, float *d, uint32_t n,
+                     int geglu);
+
+/**
+ * @brief dst[r][j] = glu(src[r][j], src[r][up_off + j]) for j < n: the
+ *        gate and up columns side by side in one row of @a src (a gate_up
+ *        FC's output), the result rows packed at @a dst_ld. glu is
+ *        hvx_geglu_det_sf (gelu_tanh(g) u) with @a geglu, else
+ *        hvx_swiglu_det_sf. @a n a multiple of 32.
+ * @return 0, or -1 for a bad shape
+ */
+int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
+                     float *dst, uint32_t dst_ld, uint32_t rows, uint32_t n,
+                     int geglu, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_SWIGLU_F32_H__ */

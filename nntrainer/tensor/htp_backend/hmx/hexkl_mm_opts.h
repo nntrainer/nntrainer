@@ -87,10 +87,14 @@ typedef struct {
       act_ah_prepacked (and act_scale / act_zp) the two planes come
       prepacked, the low plane's m_pad * K bytes then the high plane's --
       a producer that knows the encoding (a fixed, calibrated one) wrote
-      them -- and only a DMA brings them in. Not with pre_gamma or
-      accumulate; needs the in-place accumulator layout
-      (AEE_EUNSUPPORTED otherwise). */
+      them -- and only a DMA brings them in. Needs the in-place
+      accumulator layout (AEE_EUNSUPPORTED otherwise). Set by the call
+      itself, with act16_fix, when its handles are a16
+      (hexkl_weight_u8i4_set_act16). */
   int act16;
+  /** NULL, or {scale, zp}: every row at this one static encoding
+      (hvx_quant_params_pack_u16_ah's fix_enc) instead of its own. */
+  const float *act16_fix;
 
   /** Both NULL, or both n_handles entries: handle i's row m goes to
       out_cat + out_off[i] + m * out_ld[i] instead of the packed [M x N_i]

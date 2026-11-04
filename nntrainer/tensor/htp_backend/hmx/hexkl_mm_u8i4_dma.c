@@ -333,6 +333,7 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
      sets 2 after this returns). */
   h->bits = 4u;
+  h->a16 = 0;
   h->in_use = 1;
   return AEE_SUCCESS;
 }
@@ -553,6 +554,19 @@ int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
   return AEE_SUCCESS;
 }
 
+int hexkl_weight_u8i4_set_act16(hexkl_weight_u8i4_table *tbl, uint32_t handle,
+                                float scale, float zp) {
+  if (!tbl || handle >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !tbl->slots[handle].in_use || !(zp >= 0.0f && zp <= 65535.0f)) {
+    return AEE_EBADPARM;
+  }
+  hexkl_weight_u8i4 *h = &tbl->slots[handle];
+  h->a16 = scale > 0.0f;
+  h->a16_enc[0] = h->a16 ? scale : 0.0f;
+  h->a16_enc[1] = h->a16 ? zp : 0.0f;
+  return AEE_SUCCESS;
+}
+
 int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
   if (!tbl || handle >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
       !tbl->slots[handle].in_use) {
@@ -594,6 +608,7 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
 /** @brief One weight's columns on the HVX GEMV, split over the pool. */
 typedef struct {
   const uint8_t *act_ah; /**< cached memory: the rows' AH tiles */
+  const uint8_t *act_lo; /**< a16: the low-byte plane (act_ah the high) */
   const uint8_t *wh;     /**< VTCM: the weight's WH tiles */
   const hexkl_weight_u8i4 *h;
   uint32_t M, k_tiles, nt_n, ld;
@@ -609,10 +624,21 @@ static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const uint32_t hi = (uint32_t)((uint64_t)j->nt_n * (i + 1) / n_threads);
   int32_t acc[LAYER_GEMV_MAX_ROWS * HEXKL_ACC_TILE_COLS]
     __attribute__((aligned(128)));
+  int32_t acc_lo[LAYER_GEMV_MAX_ROWS * HEXKL_ACC_TILE_COLS]
+    __attribute__((aligned(128)));
   for (uint32_t nt = lo; nt < hi; ++nt) {
     const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
     hvx_gemm_u8i4_wh_col_nopf(j->act_ah, j->M, j->k_tiles, j->wh, j->nt_n, nt,
                               /*rows1=*/1, acc);
+    if (j->act_lo != NULL) {
+      hvx_gemm_u8i4_wh_col_nopf(j->act_lo, j->M, j->k_tiles, j->wh, j->nt_n, nt,
+                                /*rows1=*/1, acc_lo);
+      hvx_dequant_acc16_tile_to_f32(
+        acc, acc_lo, HEXKL_ACC_TILE_COLS, j->M, j->act_scale, j->act_zp,
+        j->h->colsum_w + c0, j->h->w_scale + c0, j->h->bias + c0, j->out + c0,
+        j->ld, j->accumulate);
+      continue;
+    }
     hvx_dequant_acc_tile_to_f32(acc, HEXKL_ACC_TILE_COLS, j->M, j->act_scale,
                                 j->act_zp, j->h->colsum_w + c0,
                                 j->h->w_scale + c0, j->h->bias + c0,
@@ -717,17 +743,23 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
      VTCM copy made the M = 1 call six times slower than the HMX block).
      The AH tile stride is kept; only rows 0..M-1 of each tile are written
      or read. */
+  /* a16: the low-byte plane, then the high-byte one, a block each */
   uint8_t *act_ah = (uint8_t *)o->act_ah_prepacked;
   uint8_t *act_own = NULL;
   if (act_ah == NULL) {
-    act_own = (uint8_t *)memalign(128, act_bytes);
+    act_own = (uint8_t *)memalign(128, (o->act16 ? 2u : 1u) * act_bytes);
     if (!act_own) {
       return AEE_ENOMEMORY;
     }
     act_ah = act_own;
     /* m_pad = M: the GEMV reads rows 0..M-1 only, so no padding to zero */
     HEXKL_PROBE_T0(p0);
-    rc = o->act_scale == NULL
+    rc = o->act16
+           ? hvx_quant_params_pack_u16_ah(
+               act_f32, o->act_u16, o->act16_enc, o->act16_hd, o->act16_fix, M,
+               M, K, o->pre_gamma, o->pre_eps, o->pre_scratch, loc_scale,
+               loc_zp, act_own, act_own + act_bytes, o->pool)
+         : o->act_scale == NULL
            ? hvx_quant_params_pack_u8_ah(act_f32, o->act_u16, o->act16_enc,
                                          o->act16_hd, M, M, K, o->pre_gamma,
                                          o->pre_eps, o->pre_scratch, loc_scale,
@@ -765,7 +797,8 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     if (i > 0u) {
       const uint32_t c = i - 1u;
       const hexkl_weight_u8i4 *h = &tbl->slots[handles[c]];
-      job.act_ah = act_ah;
+      job.act_ah = o->act16 ? act_ah + act_bytes : act_ah;
+      job.act_lo = o->act16 ? act_ah : NULL;
       job.wh = vtcm_base + wbuf[c & 1u];
       job.h = h;
       job.M = M;
@@ -835,6 +868,30 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                         const hexkl_u16_ah_io *ah) {
   static const hexkl_mm_opts kDefaults = {0};
   const hexkl_mm_opts *o = opts ? opts : &kDefaults;
+  /** a16w4 handles (hexkl_weight_u8i4_set_act16): a float call takes its
+      activation as u16 at their one static encoding. All or none of the
+      handles, at the same encoding: the activation is shared. */
+  hexkl_mm_opts o16;
+  if (tbl && handles && n_handles && !o->act16 && !act_i16 && !out_i32 && !ah &&
+      handles[0] < HEXKL_MM_U8I4_MAX_WEIGHTS && tbl->slots[handles[0]].in_use &&
+      tbl->slots[handles[0]].a16) {
+    const float *enc = tbl->slots[handles[0]].a16_enc;
+    for (uint32_t i = 1; i < n_handles; ++i) {
+      const hexkl_weight_u8i4 *hi =
+        handles[i] < HEXKL_MM_U8I4_MAX_WEIGHTS ? &tbl->slots[handles[i]] : NULL;
+      if (!hi || !hi->a16 || hi->a16_enc[0] != enc[0] ||
+          hi->a16_enc[1] != enc[1]) {
+        return AEE_EBADPARM;
+      }
+    }
+    if (o->act_scale != NULL || o->act_ah_prepacked != NULL) {
+      return AEE_EBADPARM; // the caller's u8 parameters, for an a16 weight
+    }
+    o16 = *o;
+    o16.act16 = 1;
+    o16.act16_fix = enc;
+    o = &o16;
+  }
   const uint8_t *input_ah = ah ? ah->input : NULL;
   uint8_t *output_ah = ah ? ah->output : NULL;
 
@@ -846,7 +903,8 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
   /** an a16 activation with one encoding a row needs no scratch: its codes
       go to the two byte planes as they are */
-  const int act16_direct = o->act16 && o->act_u16 != NULL && o->act16_hd == K;
+  const int act16_direct =
+    o->act16 && o->act_u16 != NULL && o->act16_hd == K && o->act16_fix == NULL;
   if (o->act_u16 != NULL &&
       ((o->pre_scratch == NULL && !act16_direct) || o->pre_gamma != NULL ||
        o->act_scale != NULL || o->act_ah_prepacked != NULL ||
@@ -857,7 +915,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     return AEE_EBADPARM; // both or neither, per hexkl_mm_opts.h
   }
   if (o->act16 && ((o->act_scale != NULL) != (o->act_ah_prepacked != NULL) ||
-                   o->pre_gamma != NULL || o->accumulate)) {
+                   (o->pre_gamma != NULL && o->pre_scratch == NULL))) {
     return AEE_EBADPARM; // a16 packs its own rows, or takes both planes
   }
   if (o->act_ah_prepacked != NULL && o->act_scale == NULL) {
@@ -907,8 +965,9 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
      (whose codes the HMX path expands in VTCM), the a16 two-plane sweep
      or the integer entries. */
   {
-    int gemv = M <= LAYER_GEMV_MAX_ROWS && o->post_done == NULL && !o->act16 &&
-               !act_i16 && !out_i32 && !ah;
+    int gemv = M <= LAYER_GEMV_MAX_ROWS && o->post_done == NULL &&
+               !(o->act16 && o->act_ah_prepacked) && !act_i16 && !out_i32 &&
+               !ah;
     for (uint32_t i = 0; gemv && i < n_handles; ++i) {
       gemv = tbl->slots[handles[i]].bits != 2u;
     }
@@ -1103,9 +1162,9 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     HEXKL_PROBE_T0(p0);
     if (o->act16) {
       rc0 = hvx_quant_params_pack_u16_ah(
-        act_f32, o->act_u16, o->act16_enc, o->act16_hd, M, m_pad, K,
-        o->pre_scratch, loc_scale, loc_zp, vtcm_base + act_off,
-        vtcm_base + act_hi_off, o->pool);
+        act_f32, o->act_u16, o->act16_enc, o->act16_hd, o->act16_fix, M, m_pad,
+        K, o->pre_gamma, o->pre_eps, o->pre_scratch, loc_scale, loc_zp,
+        vtcm_base + act_off, vtcm_base + act_hi_off, o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
     } else if (act_scale == NULL) {
@@ -1147,10 +1206,11 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   size_t out_off = 0;
   /* The pooled epilogue: one job per staging buffer, each alive from its
      submit to the wait one batch later, and the staging parity runs across
-     row blocks and handles. Not with accumulate (the attention paths add
-     into out_cat and the job has no flag for it) nor without the in-place
-     tile layout; those keep the synchronous tile-at-a-time path. */
-  const int pipelined = acc_layout->usable && !o->accumulate;
+     row blocks and handles. Not with accumulate on u8 (the attention paths
+     add into out_cat; a16 has only this path, so its job adds) nor without
+     the in-place tile layout; those keep the synchronous tile-at-a-time
+     path. */
+  const int pipelined = acc_layout->usable && (!o->accumulate || o->act16);
   /** Three byte planes suffice when |acc| <= 255 * 8 * K < 2^23. Deeper
       integer FCs use four planes; their zip also runs in the HVX worker,
       leaving the caller free to issue the next HMX batch. */
@@ -1418,6 +1478,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               jb->n_tiles = nb;
               jb->lo_off = o->act16 ? acc_tiles * ACC_TILE_BYTES : 0u;
               jb->planes24 = (uint32_t)planes24;
+              jb->accumulate = (uint32_t)o->accumulate;
               if (planes24) { /* the batch's last planes, written last */
                 planes24_fence(vtcm_base,
                                stage_off +

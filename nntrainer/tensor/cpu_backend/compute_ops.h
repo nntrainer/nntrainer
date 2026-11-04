@@ -619,6 +619,17 @@ public:
     return false;
   }
 
+  // A16: the static u16 encoding (x = scale * (q - zp)) of the activation
+  // that the QS4CX weight at data multiplies, from a calibrated model
+  // (act16_enc_file). Called at load before that weight registers; a
+  // backend that registers it after this keeps the activation at 16 bits
+  // for it. A backend without a 16-bit path ignores it.
+  virtual void set_act16_enc(const void *data, float scale, float zp) {
+    (void)data;
+    (void)scale;
+    (void)zp;
+  }
+
   // The Q4_0 twin, for a fully_connected layer under engine=htp: its
   // weight is otherwise converted and registered by the first dot() that
   // reaches gemm_q4_0_accel_fp32, which is inside the first prefill (doc

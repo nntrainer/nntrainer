@@ -1309,16 +1309,17 @@ public:
    * VTCM next to the widest handle's double buffer -- 2 x 2 MiB once
    * fcSliceCols has sized the handles -- a result tile and the HMX config.
    * Budgeted at 7.75 MiB of the 8 MiB VTCM, so 3.75 MiB of rows: 1,920 at
-   * K = 2048, 512 at K = 7168. Whole 64-row blocks, at least one.
+   * K = 2048, 512 at K = 7168. Whole 64-row blocks, at least one. An a16
+   * weight's rows are two u8 planes, twice the bytes.
    * ponytail: 7.75 MiB stands in for the session's real vtcm_size less
    * hexkl_micro_hmx_config_size(), which the host does not see; a kernel
    * that walked 64-row blocks like hexkl_mm_u8i4_moe.c would need no cap. */
-  static unsigned int fcMaxRows(unsigned int K) {
+  static unsigned int fcMaxRows(unsigned int K, bool a16 = false) {
     constexpr size_t kVtcmBudget = (size_t(8) << 20) - (size_t(256) << 10);
     // the widest handle's double buffer: fcSliceCols's slice, int4
     const size_t slice_double = size_t(2) * fcSliceCols(K) * K / 2;
-    unsigned int rows =
-      static_cast<unsigned int>((kVtcmBudget - slice_double) / K);
+    unsigned int rows = static_cast<unsigned int>(
+      (kVtcmBudget - slice_double) / (size_t(K) * (a16 ? 2u : 1u)));
     rows -= rows % 64u;
     return rows < 64u ? 64u : rows;
   }
@@ -2531,6 +2532,10 @@ public:
         const DenseHandles &dh =
           get_or_register_dense(key(u), key(g), key(d), session, op->K, op->N,
                                 op->N_out, u.scale, g.scale, d.scale);
+        if (dh.a16)
+          throw std::runtime_error("set_decode_graph_desc: DENSE_FFN op " +
+                                   std::to_string(i) +
+                                   " is a16, which the M=1 kernel is not");
         if (dh.h_gu.size() > HTP_GRAPH_WH_DENSE_MAX_CHUNKS)
           throw std::runtime_error(
             "set_decode_graph_desc: DENSE_FFN op " + std::to_string(i) +
@@ -6534,13 +6539,14 @@ private:
   struct FcHandles {
     std::vector<uint32_t> handles;
     std::vector<unsigned int> cols; /**< N of each handle */
+    bool a16 = false; /**< set_act16_enc gave the weight an encoding */
   };
 
   /** @brief One FC weight's layer calls, in fcMaxRows row chunks. */
   void invokeFc(remote_handle64 session, const FcHandles &fh, float *matBdata,
                 float *matCdata, unsigned int M, unsigned int N,
                 unsigned int K) {
-    const unsigned int step = fcMaxRows(K);
+    const unsigned int step = fcMaxRows(K, fh.a16);
     for (unsigned int m0 = 0; m0 < M; m0 += step) {
       const unsigned int m = std::min(step, M - m0);
       invokeLayer(session, fh.handles.data(),
@@ -6650,7 +6656,34 @@ private:
         convert_us = 0; // counted once, on the first slice
       }
     }
+    fh.a16 = setAct16(session, matAdata, fh.handles);
     return fc_cache_.emplace(matAdata, std::move(fh)).first->second;
+  }
+
+  /** @brief A16: the static encoding set_act16_enc keeps for @a key onto
+   *  the handles it was registered as. False when it has none (u8, as
+   *  before). @note Call with handle_mutex_ already held. */
+  bool setAct16(remote_handle64 session, const void *key,
+                const std::vector<uint32_t> &handles) {
+    auto e = act16_enc_.find(key);
+    if (e == act16_enc_.end())
+      return false;
+    for (uint32_t h : handles) {
+      const int err =
+        nntr_hvx_weight_set_act16(session, h, e->second[0], e->second[1]);
+      if (err != AEE_SUCCESS)
+        throw std::runtime_error("weight_set_act16 failed: err=" +
+                                 std::to_string(err));
+    }
+    return true;
+  }
+
+  void set_act16_enc(const void *data, float scale, float zp) override {
+    std::lock_guard<std::mutex> lock(handle_mutex_);
+    if (fc_cache_.count(data) || dense_cache_.count(data))
+      throw std::logic_error(
+        "set_act16_enc: the weight is registered already, at u8");
+    act16_enc_[data] = {scale, zp};
   }
 
   /** @brief [#225] The sidecar image of the Q4_0 weight at @a q4, or
@@ -6862,6 +6895,7 @@ private:
   struct DenseHandles {
     std::vector<uint32_t> h_gu, h_dn;
     unsigned int w = 0; /**< columns of I per chunk */
+    bool a16 = false;   /**< h_dn: column slices of the full-K down */
   };
 
   /** @brief Columns of the intermediate dimension per chunk: the largest
@@ -6936,6 +6970,11 @@ private:
     }
     uint64_t convert_us = HtpProfile::nowUs() - t_begin;
 
+    const bool dn16 = act16_enc_.count(down) != 0;
+    if (dn16 && N % (I / w * 32u) != 0)
+      throw std::invalid_argument("dense FFN: a16 splits the down's " +
+                                  std::to_string(N) + " columns into " +
+                                  std::to_string(I / w) + " 32-column slices");
     for (uint32_t c0 = 0; c0 < I; c0 += w) {
       // gate_up chunk: [K x 2w], gate columns then up columns -- the pair
       // layout hexkl_mm_u8i4_moe.c's epilogue reads (gate j with up w+j).
@@ -6957,6 +6996,27 @@ private:
                                    convert_us));
       convert_us = 0;
 
+      if (dn16) {
+        // a16: column slice c0 / w of the whole down, all I rows, so the
+        // skel runs one full-K down over the slices instead of one a chunk
+        // (the whole 6144 x 1536 down is too wide for the FC call's double
+        // buffer)
+        const uint32_t ns = N / (I / w), n0 = c0 / w * ns;
+        std::vector<int8_t> ds(static_cast<size_t>(I) * ns);
+        std::vector<int32_t> dsc(ns, 0);
+        for (uint32_t r = 0; r < I; ++r) {
+          const int8_t *row = down_rm.data() + static_cast<size_t>(r) * N + n0;
+          std::memcpy(ds.data() + static_cast<size_t>(r) * ns, row, ns);
+          for (uint32_t n = 0; n < ns; ++n)
+            dsc[n] += row[n];
+        }
+        std::vector<float> dss(down_s_v.begin() + n0,
+                               down_s_v.begin() + n0 + ns);
+        dh.h_dn.push_back(registerRm(static_cast<char *>(down) + n0, session,
+                                     ds.data(), I, ns, dss, dsc,
+                                     HtpProfile::nowUs(), 0));
+        continue;
+      }
       // down chunk: rows c0 .. c0 + w, contiguous in the row-major weight.
       const int8_t *dn = down_rm.data() + static_cast<size_t>(c0) * N;
       std::vector<int32_t> dnc(N, 0);
@@ -6968,6 +7028,12 @@ private:
       dh.h_dn.push_back(registerRm(static_cast<char *>(down) + c0, session, dn,
                                    w, N, dns, dnc, HtpProfile::nowUs(), 0));
     }
+    // a16 all three or none: the skel composes the a16 chunks from FC calls
+    // and leaves the u8 ones to the MoE kernel
+    dh.a16 = setAct16(session, up, dh.h_gu);
+    if (dh.a16 != dn16 || dh.a16 != setAct16(session, down, dh.h_dn))
+      throw std::invalid_argument(
+        "dense FFN: an act16 encoding for gate_up or down, not both");
     return dense_cache_.emplace(up, std::move(dh)).first->second;
   }
 
@@ -8506,6 +8572,8 @@ private:
    *  Values are never erased or moved, so the references it hands out stay
    *  valid (std::unordered_map keeps node addresses across rehash). */
   std::unordered_map<const void *, FcHandles> fc_cache_;
+  /** set_act16_enc's {scale, zp} by weight data pointer */
+  std::unordered_map<const void *, std::array<float, 2>> act16_enc_;
   /** Dense FFNs by their up weight's pointer; see get_or_register_dense. */
   std::unordered_map<const void *, DenseHandles> dense_cache_;
   /** Conv blocks by their in_proj's pointer; see get_or_register_conv. */

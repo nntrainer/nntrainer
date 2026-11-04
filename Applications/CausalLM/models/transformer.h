@@ -409,6 +409,11 @@ protected:
    *  set by load_weight) unless absolute; empty when the model has none. */
   std::string FC_WH_FILE_NAME;
   std::string FC_WH_FORMAT;
+  /** "act16_enc_file": json of {weight name: [scale, zero point]}, the
+   *  static u16 encodings of the FC inputs of a calibrated (a16w4) model,
+   *  relative to WEIGHT_DIR unless absolute; empty keeps the activations
+   *  at u8. */
+  std::string ACT16_ENC_FILE;
   std::string WEIGHT_DIR;
   /** Engine of createMlp's three FCs (ffn_up, ffn_gate, ffn_down): "cpu"
    *  (default) or "htp", bounded to FFN_HTP_LAYERS when that set is not

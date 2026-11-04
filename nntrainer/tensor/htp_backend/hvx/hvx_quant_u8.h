@@ -115,15 +115,35 @@ int hvx_pack_u16_ah(const uint16_t *x, uint32_t m_valid, uint32_t m_pad,
  *    @a pre_scratch (hvx_quant_params_pack_u8_ah's contract) and
  *    requantized per row, since a scale that varies along K cannot be
  *    taken out of the dot product.
- *  - @a x (f32), quantized per row over [0, 65535].
- * Padding rows get scale 1, zp 0 and zero bytes.
+ *  - @a x (f32), quantized per row over [0, 65535]; with @a pre_scratch,
+ *    hvx_rmsnorm_row_f32(row, pre_gamma, pre_eps) of it instead, normed
+ *    into pre_scratch as hvx_quant_params_pack_u8_ah does.
+ * @a fix_enc non-NULL: every row at that one (scale, zp), a static
+ * per-tensor encoding, instead of its own parameters (x16 is then always
+ * dequantized, needing pre_scratch). Padding rows get scale 1, zp 0 and
+ * zero bytes.
  */
-int hvx_quant_params_pack_u16_ah(const float *x, const uint16_t *x16,
-                                 const float *x16_enc, uint32_t x16_hd,
-                                 uint32_t m_valid, uint32_t m_pad, uint32_t k,
-                                 float *pre_scratch, float *scale, int32_t *zp,
-                                 uint8_t *out_lo, uint8_t *out_hi,
-                                 hvx_worker_pool *pool);
+int hvx_quant_params_pack_u16_ah(
+  const float *x, const uint16_t *x16, const float *x16_enc, uint32_t x16_hd,
+  const float *fix_enc, uint32_t m_valid, uint32_t m_pad, uint32_t k,
+  const float *pre_gamma, float pre_eps, float *pre_scratch, float *scale,
+  int32_t *zp, uint8_t *out_lo, uint8_t *out_hi, hvx_worker_pool *pool);
+
+/**
+ * @brief hvx_quant_params_pack_u16_ah's planes at the static encoding
+ *        @a fix_enc straight from a gate_up FC's output: row m of the
+ *        k = n_chunks * n activation is, for each chunk c, its n columns
+ *        hvx_glu_row_f32(g, g + up_off) with g = src + c * chunk_stride +
+ *        m * src_ld. The GLU rows go through @a scratch (4 * k floats a
+ *        pool lane, hvx_worker_pool_workers + 1 of them) and are never
+ *        stored, the bytes those of the pack of the stored rows.
+ */
+int hvx_glu_pack_u16_ah(const float *src, size_t chunk_stride, uint32_t src_ld,
+                        uint32_t up_off, uint32_t n_chunks, uint32_t n,
+                        int geglu, const float *fix_enc, uint32_t m_valid,
+                        uint32_t m_pad, float *scratch, float *scale,
+                        int32_t *zp, uint8_t *out_lo, uint8_t *out_hi,
+                        hvx_worker_pool *pool);
 
 /**
  * @brief Same pack, but destination row d takes its input from source row

@@ -96,3 +96,57 @@ void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m_valid,
   hvx_swiglu_ctx c = {gate, up, m_valid, n_out};
   hvx_worker_pool_run(pool, hvx_swiglu_worker, &c, m_valid);
 }
+
+void hvx_glu_row_f32(const float *g, const float *u, float *d, uint32_t n,
+                     int geglu) {
+  uint32_t j = 0;
+  /* Four independent vectors a step: one det chain is ~35 dependent sf
+     ops, latency bound on its own (Gemma-4 E2B's a16 GeGLU, 256 x 6144:
+     2326 -> 1329 us on the S25 Ultra; eight spill, 2228). */
+  for (; j + 4u * LANES <= n; j += 4u * LANES) {
+    HVX_Vector rv[4];
+    for (uint32_t q = 0; q < 4u; ++q) {
+      const HVX_Vector gv = ((const HVX_UVector *)(g + j + q * LANES))[0];
+      const HVX_Vector uv = ((const HVX_UVector *)(u + j + q * LANES))[0];
+      rv[q] = geglu ? hvx_geglu_det_sf(gv, uv) : hvx_swiglu_det_sf(gv, uv);
+    }
+    for (uint32_t q = 0; q < 4u; ++q)
+      ((HVX_UVector *)(d + j + q * LANES))[0] = rv[q];
+  }
+  for (; j < n; j += LANES) {
+    const HVX_Vector gv = ((const HVX_UVector *)(g + j))[0];
+    const HVX_Vector uv = ((const HVX_UVector *)(u + j))[0];
+    ((HVX_UVector *)(d + j))[0] =
+      geglu ? hvx_geglu_det_sf(gv, uv) : hvx_swiglu_det_sf(gv, uv);
+  }
+}
+
+typedef struct {
+  const float *src;
+  float *dst;
+  uint32_t src_ld, up_off, dst_ld, rows, n;
+  int geglu;
+} hvx_glu_ctx;
+
+static void hvx_glu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const hvx_glu_ctx *c = (const hvx_glu_ctx *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->rows * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->rows * (i + 1) / n_threads);
+  for (uint32_t r = lo; r < hi; ++r) {
+    const float *g = c->src + (size_t)r * c->src_ld;
+    hvx_glu_row_f32(g, g + c->up_off, c->dst + (size_t)r * c->dst_ld, c->n,
+                    c->geglu);
+  }
+}
+
+int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
+                     float *dst, uint32_t dst_ld, uint32_t rows, uint32_t n,
+                     int geglu, hvx_worker_pool *pool) {
+  if (!src || !dst || rows == 0 || n == 0 || n % LANES != 0 || up_off < n ||
+      src_ld < up_off + n || dst_ld < n) {
+    return -1;
+  }
+  hvx_glu_ctx c = {src, dst, src_ld, up_off, dst_ld, rows, n, geglu};
+  hvx_worker_pool_run(pool, hvx_glu_worker, &c, rows);
+  return 0;
+}

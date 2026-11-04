@@ -62,6 +62,12 @@ typedef struct {
       (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
   uint32_t bits;
   int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
+  /** Nonzero: an a16w4 weight (hexkl_weight_u8i4_set_act16). A float
+      layer call on it takes its activation as u16 at the one static
+      encoding a16_enc = {scale, zp}, x = scale (q - zp), q in [0, 65535],
+      instead of u8 with each row's own parameters. */
+  int a16;
+  float a16_enc[2];
 } hexkl_weight_u8i4;
 
 typedef struct {
@@ -170,6 +176,14 @@ int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
                              uint32_t wh_out_len);
 
 /** @brief Frees a registered weight's resident bytes. */
+/**
+ * @brief Marks @a handle a16w4 with the static input encoding (@a scale,
+ *        @a zp) -- an AIMET per-tensor activation encoding, zp = -offset.
+ *        @a scale <= 0 clears it (back to dynamic u8).
+ */
+int hexkl_weight_u8i4_set_act16(hexkl_weight_u8i4_table *tbl, uint32_t handle,
+                                float scale, float zp);
+
 int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle);
 
 /**

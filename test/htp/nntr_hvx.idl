@@ -1375,4 +1375,11 @@ interface nntr_hvx : remote_handle64 {
                                        in sequence<float> act_enc,
                                        in uint32 act_hd, in sequence<float> res,
                                        rout sequence<float> out_f32);
+
+   // Marks w_handle a16w4: a float layer call on it (mm_u8i4_layer*, the
+   // dense FFN through mm_u8i4_moe_layer*) takes its activation as u16 at
+   // this one static per-tensor encoding, x = scale (q - zp), instead of
+   // u8 with each row's own. scale <= 0 clears it.
+   AEEResult weight_set_act16(in uint32 w_handle, in float scale,
+                              in float zp);
 };

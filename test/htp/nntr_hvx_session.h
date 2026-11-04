@@ -124,6 +124,10 @@ typedef struct {
   float *moe_res;       /**< mm_u8i4_moe_layer_norm_add's MoE output, before
                              the epilogue writes the call's out (heap) */
   uint32_t moe_res_n;   /**< floats moe_res holds */
+  float *dense16;       /**< the a16 dense FFN's gate_up output and GLU rows
+                             or the down's u16 planes (dense_a16_run,
+                             heap), freed in close() */
+  size_t dense16_n;     /**< floats dense16 holds */
   uint16_t *attn_q16;   /**< attn_q2_step_fq's Q, converted to u16 by the
                              pool before the kernel (heap), freed in close() */
   uint32_t attn_q16_n;  /**< elements attn_q16 holds */
