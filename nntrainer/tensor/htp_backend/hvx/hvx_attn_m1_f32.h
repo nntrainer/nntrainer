@@ -155,6 +155,17 @@ typedef struct {
 hvx_attn_m1_ctx *hvx_attn_m1_reserve(const hvx_attn_m1_ctx *src, uint32_t rows,
                                      uint32_t drop, int *err);
 
+/** Versioned caller-owned layer payload: live length, scaled flag, six
+ * scale arrays and K/V bytes through the final 64-row tile. No pointers or
+ * scratch are serialized. INT8 only; caller provides exclusive access. */
+size_t hvx_attn_m1_snapshot_bytes(const hvx_attn_m1_ctx *ctx, uint32_t layer);
+int hvx_attn_m1_snapshot_export(const hvx_attn_m1_ctx *ctx, uint32_t layer,
+                                uint8_t *data, size_t bytes);
+int hvx_attn_m1_snapshot_import(hvx_attn_m1_ctx *ctx, uint32_t layer,
+                                const uint8_t *data, size_t bytes);
+/** Release K/V allocations; retain shape and scratch for a later restore. */
+void hvx_attn_m1_park(hvx_attn_m1_ctx *ctx);
+
 /**
  * @brief Allocates and zero-fills the cache for a fixed shape.
  *

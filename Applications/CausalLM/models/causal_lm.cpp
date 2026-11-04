@@ -1070,7 +1070,7 @@ void CausalLM::compactKVCache(unsigned int pos, bool force) {
 }
 
 void CausalLM::save_kvcache(std::string path, int to_) {
-  if (htp_session_enabled_ && getDeviceKVCacheBytes())
+  if (htp_session_enabled_)
     throw std::logic_error(
       "Resident DSP KV cannot be saved through the host FP16 snapshot API");
   if (!kv_cache.isAllocated()) {
@@ -1136,8 +1136,40 @@ size_t CausalLM::getDeviceKVCacheBytes() const {
 #endif
 }
 
+void CausalLM::saveDeviceKVCache(const std::string &path, bool park) {
+#ifdef ENABLE_HEXKL
+  if (!htp_session_enabled_ || htp_session_failed_ ||
+      htp_pending_tokens_.size() != 1u)
+    throw std::logic_error("DSP snapshot requires a valid resident session");
+  nntrainer::get_htp_ops()->save_decode_kv(
+    path, {global_token_len, SYS_PROMP_LEN, htp_pending_tokens_[0]}, park);
+#else
+  throw std::logic_error("HTP backend is unavailable");
+#endif
+}
+
+void CausalLM::loadDeviceKVCache(const std::string &path) {
+#ifdef ENABLE_HEXKL
+  if (!htp_session_enabled_)
+    throw std::logic_error("DSP snapshot requires resident sessions");
+  const auto app = nntrainer::get_htp_ops()->load_decode_kv(path);
+  global_token_len = app[0];
+  SYS_PROMP_LEN = app[1];
+  kv_cache.setPosition(app[0] + app[1]);
+  htp_pending_tokens_ = {app[2]};
+  htp_session_failed_ = false;
+  USE_KVCACHE = false;
+  PRE_COMPUTED_CACHE_PATH.clear();
+  retire_decode_capture();
+#else
+  throw std::logic_error("HTP backend is unavailable");
+#endif
+}
+
 void CausalLM::setPrecomputedKVCache(const std::string &path,
                                      unsigned int sys_prompt_token_len) {
+  if (htp_session_enabled_ && !path.empty())
+    throw std::logic_error("Use loadDeviceKVCache for resident DSP sessions");
   htp_pending_tokens_.clear();
   htp_session_failed_ = false;
   USE_KVCACHE = !path.empty();
@@ -1148,7 +1180,7 @@ void CausalLM::setPrecomputedKVCache(const std::string &path,
 }
 
 void CausalLM::load_kvcache(std::string path, int to_) {
-  if (htp_session_enabled_ && getDeviceKVCacheBytes())
+  if (htp_session_enabled_)
     throw std::logic_error("Resident DSP KV cannot be overwritten through the "
                            "host FP16 snapshot API");
   if (!kv_cache.isAllocated()) {
@@ -1170,6 +1202,8 @@ void CausalLM::load_kvcache(std::string path, int to_) {
 
 unsigned int CausalLM::resumeFromKVCacheFile(const std::string &path,
                                              unsigned int token_len) {
+  if (htp_session_enabled_)
+    throw std::logic_error("Use loadDeviceKVCache for resident DSP sessions");
   if (!kv_cache.isAllocated()) {
     allocateAndBindKVCache();
   }

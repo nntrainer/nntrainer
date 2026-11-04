@@ -340,6 +340,100 @@ out:
   return dst;
 }
 
+size_t hvx_attn_m1_snapshot_bytes(const hvx_attn_m1_ctx *c, uint32_t l) {
+  if (!c || !c->q8 || l >= c->n_layers || c->kv_len[l] > c->max_seq)
+    return 0;
+  return 8u + (size_t)c->n_kv * c->head_dim * 6u * sizeof(float) +
+         2u * (size_t)c->n_kv * c->head_dim * tiles_of(c->kv_len[l]) * TILE;
+}
+
+void hvx_attn_m1_park(hvx_attn_m1_ctx *c) {
+  if (!c)
+    return;
+  for (uint32_t l = 0; l < c->n_layers; ++l) {
+    free(c->kt[l]);
+    free(c->v[l]);
+    c->kt[l] = c->v[l] = NULL;
+    c->kv_len[l] = 0;
+    if (c->scaled)
+      c->scaled[l] = 0;
+  }
+}
+
+int hvx_attn_m1_snapshot_export(const hvx_attn_m1_ctx *c, uint32_t l,
+                                uint8_t *data, size_t bytes) {
+  if (!data || !hvx_attn_m1_snapshot_bytes(c, l) ||
+      bytes != hvx_attn_m1_snapshot_bytes(c, l))
+    return AEE_EINVALIDFORMAT;
+  const uint32_t header[2] = {c->kv_len[l], c->scaled[l]};
+  const size_t n = (size_t)c->n_kv * c->head_dim;
+  const size_t plane = (size_t)tiles_of(header[0]) * TILE * c->head_dim;
+  if (header[0] && (!c->kt[l] || !c->v[l] || header[1] != 1u))
+    return AEE_EBADSTATE;
+  memcpy(data, header, sizeof(header));
+  data += sizeof(header);
+  const float *scales[6] = {c->sk,     c->sk_inv,   c->sv,
+                            c->sv_inv, c->sk_floor, c->sv_floor};
+  for (uint32_t i = 0; i < 6u; ++i) {
+    memcpy(data, scales[i] + l * n, n * sizeof(float));
+    data += n * sizeof(float);
+  }
+  for (uint32_t v = 0; v < 2u; ++v)
+    for (uint32_t h = 0; h < c->n_kv; ++h) {
+      if (plane)
+        memcpy(data,
+               (const uint8_t *)(v ? c->v[l] : c->kt[l]) +
+                 (size_t)h * c->seq * c->head_dim,
+               plane);
+      data += plane;
+    }
+  return AEE_SUCCESS;
+}
+
+int hvx_attn_m1_snapshot_import(hvx_attn_m1_ctx *c, uint32_t l,
+                                const uint8_t *data, size_t bytes) {
+  if (!c || !c->q8 || l >= c->n_layers || !data || bytes < 8u)
+    return AEE_EINVALIDFORMAT;
+  uint32_t header[2];
+  memcpy(header, data, sizeof(header));
+  const size_t n = (size_t)c->n_kv * c->head_dim;
+  const size_t plane = (size_t)tiles_of(header[0]) * TILE * c->head_dim;
+  if (header[0] > c->max_seq || header[1] > 1u || (header[0] && !header[1]) ||
+      bytes != 8u + n * 6u * sizeof(float) + 2u * c->n_kv * plane)
+    return AEE_EINVALIDFORMAT;
+  data += sizeof(header);
+  // Check float encodings with integer bits: DSP builds may use fast-math.
+  for (size_t i = 0; i < 6u * n; ++i) {
+    uint32_t bits;
+    memcpy(&bits, data + i * sizeof(float), sizeof(bits));
+    if ((bits & 0x7f800000u) == 0x7f800000u || (bits >> 31) ||
+        (header[1] && i < 4u * n && !bits))
+      return AEE_EINVALIDFORMAT;
+  }
+  if (header[0]) {
+    const int rc = layer_alloc(c, l);
+    if (rc != AEE_SUCCESS)
+      return rc;
+  }
+  float *scales[6] = {c->sk,     c->sk_inv,   c->sv,
+                      c->sv_inv, c->sk_floor, c->sv_floor};
+  for (uint32_t i = 0; i < 6u; ++i) {
+    memcpy(scales[i] + l * n, data, n * sizeof(float));
+    data += n * sizeof(float);
+  }
+  for (uint32_t v = 0; v < 2u; ++v)
+    for (uint32_t h = 0; h < c->n_kv; ++h) {
+      if (plane)
+        memcpy((uint8_t *)(v ? c->v[l] : c->kt[l]) +
+                 (size_t)h * c->seq * c->head_dim,
+               data, plane);
+      data += plane;
+    }
+  c->kv_len[l] = header[0];
+  c->scaled[l] = (uint8_t)header[1];
+  return AEE_SUCCESS;
+}
+
 /** @brief Kt of one (layer, kv head): [tiles][head_dim][TILE] fp16. */
 static inline uint16_t *kt_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                 uint32_t h) {

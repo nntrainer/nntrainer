@@ -106,6 +106,155 @@ int nntr_hvx_attn_m1_reserve(remote_handle64 handle, uint32 cache, uint32 rows,
   return AEE_SUCCESS;
 }
 
+static void snapshot_abort(nntr_hvx_session *s) {
+  for (uint32_t c = 0; c < 2u; ++c) {
+    hvx_attn_m1_free(s->kv_restore[c]);
+    s->kv_restore[c] = NULL;
+    s->kv_restore_next[c] = 0;
+  }
+  s->kv_restore_mask = 0;
+}
+
+int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
+                                      const uint32 *metadata, int metadataLen,
+                                      uint32 *result, int resultLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !s->graph || !s->attn_m1)
+    return AEE_EBADSTATE;
+  hvx_attn_m1_ctx *active[2] = {s->attn_m1, s->attn_m1_b};
+  if (action == 4u) {
+    snapshot_abort(s);
+    return AEE_SUCCESS;
+  }
+  if (action == 0u) {
+    if (!result || resultLen != 17)
+      return AEE_EINVALIDFORMAT;
+    memset(result, 0, 17u * sizeof(uint32_t));
+    for (uint32_t c = 0; c < 2u; ++c) {
+      const hvx_attn_m1_ctx *a = active[c];
+      if (!a)
+        continue;
+      if (!a->q8)
+        return AEE_EBADSTATE;
+      result[0] |= 1u << c;
+      uint32_t *r = result + 1u + 8u * c;
+      r[0] = a->n_layers;
+      r[1] = a->n_kv;
+      r[2] = a->gqa;
+      r[3] = a->head_dim;
+      r[4] = a->max_seq;
+      r[5] = HVX_ATTN_M1_Q8 | (a->fast ? HVX_ATTN_M1_FAST : 0u) |
+             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u);
+      for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+        const htp_graph_op *op = &s->graph->ops[i];
+        if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == a->n_kv &&
+            op->gqa == a->gqa && op->head_dim == a->head_dim)
+          r[6] = op->n_experts;
+      }
+    }
+    return AEE_SUCCESS;
+  }
+  if (action == 1u) {
+    if (s->kv_restore_mask)
+      return AEE_EBADSTATE;
+    hvx_attn_m1_park(active[0]);
+    hvx_attn_m1_park(active[1]);
+    return AEE_SUCCESS;
+  }
+  if (action == 2u) {
+    snapshot_abort(s);
+    if (!metadata || metadataLen != 17 || metadata[0] != (active[1] ? 3u : 1u))
+      return AEE_EINVALIDFORMAT;
+    int rc = AEE_SUCCESS;
+    for (uint32_t c = 0; c < 2u; ++c) {
+      if (!active[c])
+        continue;
+      const uint32_t *r = metadata + 1u + 8u * c;
+      const hvx_attn_m1_ctx *a = active[c];
+      const uint32_t flags = HVX_ATTN_M1_Q8 |
+                             (a->fast ? HVX_ATTN_M1_FAST : 0u) |
+                             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u);
+      if (r[0] != a->n_layers || r[1] != a->n_kv || r[2] != a->gqa ||
+          r[3] != a->head_dim || r[5] != flags || r[7] || !r[4] ||
+          r[4] > s->graph->max_seq || r[4] % 64u || r[6] > s->graph->max_seq) {
+        rc = AEE_EINVALIDFORMAT;
+        break;
+      }
+      s->kv_restore[c] =
+        hvx_attn_m1_create(r[0], r[1], r[2], r[3],
+                           r[4] | flags | HVX_ATTN_M1_LAZY, s->quant_pool, &rc);
+      if (!s->kv_restore[c])
+        break;
+      s->kv_restore_base[c] = r[6];
+    }
+    if (rc != AEE_SUCCESS) {
+      snapshot_abort(s);
+      return rc;
+    }
+    s->kv_restore_mask = metadata[0];
+    return AEE_SUCCESS;
+  }
+  if (action == 3u) {
+    if (!s->kv_restore_mask)
+      return AEE_EBADSTATE;
+    for (uint32_t c = 0; c < 2u; ++c)
+      if (s->kv_restore[c] &&
+          s->kv_restore_next[c] != s->kv_restore[c]->n_layers)
+        return AEE_EBADSTATE;
+    // No failure points after validation: both shapes become visible together.
+    for (uint32_t c = 0; c < 2u; ++c) {
+      const hvx_attn_m1_ctx *a = active[c];
+      if (!a)
+        continue;
+      for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+        htp_graph_op *op = &s->graph->ops[i];
+        if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == a->n_kv &&
+            op->gqa == a->gqa && op->head_dim == a->head_dim)
+          op->n_experts = s->kv_restore_base[c];
+      }
+      if (c)
+        s->attn_m1_b = s->kv_restore[c];
+      else
+        s->attn_m1 = s->kv_restore[c];
+      s->kv_restore[c] = NULL;
+      hvx_attn_m1_free(active[c]);
+    }
+    snapshot_abort(s);
+    return AEE_SUCCESS;
+  }
+  return AEE_EINVALIDFORMAT;
+}
+
+int nntr_hvx_attn_m1_snapshot_layer(remote_handle64 handle, uint32 action,
+                                    uint32 cache, uint32 layer,
+                                    const uint8 *input, int inputLen,
+                                    uint8 *output, int outputLen,
+                                    uint32 *bytes) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || cache > 1u || !bytes || inputLen < 0 || outputLen < 0)
+    return AEE_EINVALIDFORMAT;
+  hvx_attn_m1_ctx *a =
+    action == 2u ? s->kv_restore[cache] : (cache ? s->attn_m1_b : s->attn_m1);
+  if (!a || layer >= a->n_layers)
+    return AEE_EBADSTATE;
+  if (action == 2u) {
+    if (!s->kv_restore_mask || layer != s->kv_restore_next[cache])
+      return AEE_EBADSTATE;
+    const int rc =
+      hvx_attn_m1_snapshot_import(a, layer, input, (size_t)inputLen);
+    if (rc == AEE_SUCCESS)
+      ++s->kv_restore_next[cache];
+    *bytes = (uint32)inputLen;
+    return rc;
+  }
+  *bytes = (uint32)hvx_attn_m1_snapshot_bytes(a, layer);
+  if (action == 0u)
+    return *bytes ? AEE_SUCCESS : AEE_EBADSTATE;
+  if (action != 1u)
+    return AEE_EINVALIDFORMAT;
+  return hvx_attn_m1_snapshot_export(a, layer, output, (size_t)outputLen);
+}
+
 int nntr_hvx_attn_m1_release(remote_handle64 handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
@@ -114,6 +263,7 @@ int nntr_hvx_attn_m1_release(remote_handle64 handle) {
   if (!s->attn_m1) {
     return AEE_EBADSTATE;
   }
+  snapshot_abort(s);
   hvx_attn_m1_free(s->attn_m1);
   s->attn_m1 = NULL;
   hvx_attn_m1_free(s->attn_m1_b);

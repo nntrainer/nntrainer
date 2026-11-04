@@ -277,7 +277,13 @@ int main(int argc, char *argv[]) {
       for (const auto &request : requests)
         if (!request.is_object() || !request.contains("prompt") ||
             !request["prompt"].is_string() ||
-            (request.contains("reset") && !request["reset"].is_boolean()))
+            (request.contains("reset") && !request["reset"].is_boolean()) ||
+            (request.contains("device_kv_save") &&
+             !request["device_kv_save"].is_string()) ||
+            (request.contains("device_kv_load") &&
+             !request["device_kv_load"].is_string()) ||
+            (request.contains("device_kv_park") &&
+             !request["device_kv_park"].is_boolean()))
           throw std::invalid_argument(
             "Each request requires a string prompt and optional boolean reset");
     }
@@ -425,6 +431,15 @@ int main(int argc, char *argv[]) {
       for (const auto &request : requests) {
         if (request.value("reset", false))
           causal->setSessionTokenPosition(0);
+        double restore_ms = 0;
+        if (request.contains("device_kv_load")) {
+          const auto started = std::chrono::steady_clock::now();
+          causal->loadDeviceKVCache(
+            request.at("device_kv_load").get<std::string>());
+          restore_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+        }
         const auto before = causal->getSessionTokenPosition();
         run_prompt(request["prompt"].get<std::string>());
         const auto metrics = causal->getPerformanceMetrics();
@@ -439,6 +454,20 @@ int main(int argc, char *argv[]) {
                        {"peak_memory_kb", metrics.peak_memory_kb},
                        {"output", causal->getOutput()}};
         result["output_ids"] = causal->getLastGeneratedTokenIds();
+        result["device_kv_restore_ms"] = restore_ms;
+        if (request.contains("device_kv_save")) {
+          const auto path = request.at("device_kv_save").get<std::string>();
+          const auto started = std::chrono::steady_clock::now();
+          causal->saveDeviceKVCache(path,
+                                    request.value("device_kv_park", true));
+          result["device_kv_save_ms"] =
+            std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - started)
+              .count();
+          result["device_kv_file_bytes"] = std::filesystem::file_size(path);
+          result["device_kv_bytes_after_save"] =
+            causal->getDeviceKVCacheBytes();
+        }
         std::cout << "[REQUEST] " << result.dump() << std::endl;
       }
     }

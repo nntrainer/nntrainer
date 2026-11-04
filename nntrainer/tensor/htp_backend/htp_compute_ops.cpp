@@ -71,6 +71,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -465,6 +467,7 @@ public:
     pool_dirty_ = true;
     t1_printed_ = false;
     decode_.prompt_tokens_ = 0;
+    decode_.kv_parked_ = false;
     seed_rpc_us_ = seed_calls_ = seed_kvq_ = 0;
   }
 
@@ -1603,6 +1606,7 @@ public:
     decode_.q4_pending_.clear();
     decode_.q4m1_bound_ = false;
     decode_.graph_words_ = words;
+    decode_.snapshot_cookie_ = HtpProfile::nowUs();
     e2e_ = true;
     if (!e2e_st_) {
       e2e_st_ = std::make_shared<E2eState>();
@@ -2367,7 +2371,7 @@ public:
   }
 
   size_t decode_kv_bytes() const override {
-    if (!decode_.attn_registered_)
+    if (!decode_.attn_registered_ || decode_.kv_parked_)
       return 0;
     size_t bytes = 0;
     for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
@@ -2377,6 +2381,215 @@ public:
                rec->n_kv * rec->head_dim * 2u;
     }
     return bytes;
+  }
+
+  /** The checksum covers framing, scales and payload; restored DSP objects
+   * stay unpublished until the footer validates. One layer of rpcmem staging.
+   */
+  struct KvCheckpointIO {
+    uint64_t hash = 14695981039346656037ull;
+    void update(const void *data, size_t n) {
+      const auto *p = static_cast<const uint8_t *>(data);
+      for (size_t i = 0; i < n; ++i)
+        hash = (hash ^ p[i]) * 1099511628211ull;
+    }
+    void write(std::ostream &f, const void *p, size_t n) {
+      f.write(static_cast<const char *>(p), n);
+      update(p, n);
+    }
+    void read(std::istream &f, void *p, size_t n) {
+      f.read(static_cast<char *>(p), n);
+      update(p, n);
+    }
+  };
+
+  void snapshotReady(bool saving) {
+    if (!decode_.graph_inited_ || !decode_.attn_registered_ ||
+        !decode_.kind_ops_[HTP_OP_CONV1D_GATE].empty() ||
+        (saving && !decode_.canContinue(decode_.cur_pos_ + 1u)))
+      throw std::logic_error("HTP KV checkpoint needs a completed resident "
+                             "attention-only conversation");
+    if (cpu_predictor_)
+      cpu_predictor_->drain();
+    if (pool_prefetch_)
+      pool_prefetch_->drain();
+  }
+
+  void save_decode_kv(const std::string &path, const std::vector<uint32_t> &app,
+                      bool park) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    snapshotReady(true);
+    if (app.size() != 3u || app[0] + app[1] != decode_.cur_pos_ + 1u)
+      throw std::invalid_argument("HTP KV checkpoint position mismatch");
+    if (!decode_.snapshot_cookie_)
+      decode_.snapshot_cookie_ = HtpProfile::nowUs();
+    const auto session = HtpBackend::global().handle();
+    uint32_t meta[17] = {};
+    int rc =
+      nntr_hvx_attn_m1_snapshot_control(session, 0, nullptr, 0, meta, 17);
+    if (rc)
+      throw std::runtime_error("HTP KV snapshot query: " + graphErr(rc));
+    const uint32_t header[] = {0x4e4b5631u,
+                               1u,
+                               uint32_t(decode_.snapshot_cookie_),
+                               uint32_t(decode_.snapshot_cookie_ >> 32),
+                               decode_.cur_pos_,
+                               decode_.request_end_,
+                               decode_.attn_window_rows_,
+                               uint32_t(decode_.prompt_tokens_),
+                               uint32_t(decode_.prompt_tokens_ >> 32),
+                               uint32_t(decode_.kv_len_.size())};
+    const std::string temporary = path + ".tmp";
+    try {
+      std::ofstream f(temporary, std::ios::binary | std::ios::trunc);
+      f.exceptions(std::ios::failbit | std::ios::badbit);
+      KvCheckpointIO io;
+      io.write(f, header, sizeof(header));
+      io.write(f, app.data(), 12u);
+      io.write(f, meta, sizeof(meta));
+      io.write(f, decode_.kv_len_.data(), decode_.kv_len_.size() * 4u);
+      std::unique_ptr<HtpRpcBuffer> staging;
+      for (uint32_t c = 0; c < 2u; ++c) {
+        if (!(meta[0] & (1u << c)))
+          continue;
+        for (uint32_t l = 0; l < meta[1u + 8u * c]; ++l) {
+          uint32_t bytes = 0;
+          rc = nntr_hvx_attn_m1_snapshot_layer(session, 0, c, l, nullptr, 0,
+                                               nullptr, 0, &bytes);
+          if (rc || !bytes || bytes > 64u * 1024u * 1024u)
+            throw std::runtime_error("HTP KV layer query: " + graphErr(rc));
+          if (!staging || staging->size() < bytes)
+            staging = std::make_unique<HtpRpcBuffer>(bytes);
+          if (!staging->data())
+            throw std::bad_alloc();
+          rc = nntr_hvx_attn_m1_snapshot_layer(session, 1, c, l, nullptr, 0,
+                                               staging->data(), bytes, &bytes);
+          if (rc)
+            throw std::runtime_error("HTP KV export: " + graphErr(rc));
+          io.write(f, &bytes, 4u);
+          io.write(f, staging->data(), bytes);
+        }
+      }
+      f.write(reinterpret_cast<const char *>(&io.hash), sizeof(io.hash));
+      f.close();
+      std::filesystem::rename(temporary, path);
+      if (park) {
+        rc =
+          nntr_hvx_attn_m1_snapshot_control(session, 1, nullptr, 0, nullptr, 0);
+        if (rc)
+          throw std::runtime_error("HTP KV park: " + graphErr(rc));
+        decode_.kv_parked_ = true;
+      }
+    } catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+      throw;
+    }
+  }
+
+  std::vector<uint32_t> load_decode_kv(const std::string &path) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    snapshotReady(false);
+    const auto session = HtpBackend::global().handle();
+    std::ifstream f(path, std::ios::binary);
+    f.exceptions(std::ios::failbit | std::ios::badbit);
+    KvCheckpointIO io;
+    uint32_t h[10], meta[17];
+    std::vector<uint32_t> app(3);
+    io.read(f, h, sizeof(h));
+    io.read(f, app.data(), 12u);
+    io.read(f, meta, sizeof(meta));
+    if (h[0] != 0x4e4b5631u || h[1] != 1u ||
+        (uint64_t(h[2]) | (uint64_t(h[3]) << 32)) != decode_.snapshot_cookie_ ||
+        h[9] != decode_.kv_len_.size() || h[4] >= decode_.graph_words_[6] ||
+        app[0] > h[4] + 1u || app[1] != h[4] + 1u - app[0] || h[5] <= h[4] ||
+        h[5] > decode_.graph_words_[6] || !meta[0] || (meta[0] & ~3u))
+      throw std::runtime_error("HTP KV checkpoint belongs to another loaded "
+                               "graph or has invalid metadata");
+    std::vector<uint32_t> lengths(h[9]);
+    io.read(f, lengths.data(), lengths.size() * 4u);
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+      const auto ord = decode_.attn_ordinal_[op];
+      const uint32_t c = decode_.attn_cache_[ord];
+      const uint32_t *m = meta + 1u + 8u * c;
+      const auto *rec = decode_.graphOp(op);
+      if (!(meta[0] & (1u << c)) || m[6] > h[4] + 1u ||
+          lengths[ord] != h[4] + 1u - m[6] || lengths[ord] > m[4] ||
+          (!rec->top_k && m[6]))
+        throw std::runtime_error("HTP KV checkpoint window/length mismatch");
+    }
+    int rc =
+      nntr_hvx_attn_m1_snapshot_control(session, 2, meta, 17, nullptr, 0);
+    if (rc)
+      throw std::runtime_error("HTP KV import begin: " + graphErr(rc));
+    try {
+      std::unique_ptr<HtpRpcBuffer> staging;
+      for (uint32_t c = 0; c < 2u; ++c) {
+        if (!(meta[0] & (1u << c)))
+          continue;
+        const uint32_t *m = meta + 1u + 8u * c;
+        for (uint32_t l = 0; l < m[0]; ++l) {
+          uint32_t bytes;
+          io.read(f, &bytes, 4u);
+          const uint64_t bound = 8u + uint64_t(m[1]) * m[3] * 24u +
+                                 2u * uint64_t(m[1]) * m[3] * m[4];
+          if (bytes < 8u || bytes > bound || bytes > 64u * 1024u * 1024u)
+            throw std::runtime_error("HTP KV checkpoint layer size invalid");
+          if (!staging || staging->size() < bytes)
+            staging = std::make_unique<HtpRpcBuffer>(bytes);
+          if (!staging->data())
+            throw std::bad_alloc();
+          io.read(f, staging->data(), bytes);
+          uint32_t live;
+          std::memcpy(&live, staging->data(), 4u);
+          bool matched = false;
+          for (size_t ord = 0; ord < lengths.size(); ++ord)
+            if (decode_.attn_cache_[ord] == c &&
+                decode_.attn_cache_ord_[ord] == l)
+              matched = live == lengths[ord];
+          if (!matched)
+            throw std::runtime_error("HTP KV layer length mismatch");
+          uint32_t transferred = 0;
+          rc = nntr_hvx_attn_m1_snapshot_layer(
+            session, 2, c, l, staging->data(), bytes, nullptr, 0, &transferred);
+          if (rc || transferred != bytes)
+            throw std::runtime_error("HTP KV import layer: " + graphErr(rc));
+        }
+      }
+      uint64_t expected;
+      f.read(reinterpret_cast<char *>(&expected), 8u);
+      if (expected != io.hash ||
+          f.rdbuf()->sgetc() != std::char_traits<char>::eof())
+        throw std::runtime_error("HTP KV checkpoint checksum/trailing bytes");
+      rc =
+        nntr_hvx_attn_m1_snapshot_control(session, 3, nullptr, 0, nullptr, 0);
+      if (rc)
+        throw std::runtime_error("HTP KV import commit: " + graphErr(rc));
+    } catch (...) {
+      nntr_hvx_attn_m1_snapshot_control(session, 4, nullptr, 0, nullptr, 0);
+      throw;
+    }
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+      const uint32_t c = decode_.attn_cache_[decode_.attn_ordinal_[op]];
+      htp_graph_op_at(decode_.graph_words_.data(), op)->n_experts =
+        meta[7u + 8u * c];
+    }
+    decode_.cur_pos_ = h[4];
+    decode_.request_end_ = h[5];
+    decode_.attn_window_rows_ = h[6];
+    decode_.prompt_tokens_ = uint64_t(h[7]) | (uint64_t(h[8]) << 32);
+    decode_.kv_len_.swap(lengths);
+    for (uint32_t c = 0; c < 2u; ++c)
+      decode_.attn_capacity_[c] = meta[0] & (1u << c) ? meta[5u + 8u * c] : 0u;
+    htp_router_handoff_invalidate(&staging_.router_handoff_);
+    decode_.kv_parked_ = false;
+    decode_.kv_bases_dirty_ = false;
+    decode_.pending_op_ = HTP_GRAPH_NO_OP;
+    decode_.have_id_ = false;
+    decode_.row_bound_ = false;
+    decode_.seed_ordinal_ = HTP_GRAPH_NO_OP;
+    std::fill(std::begin(decode_.kind_next_), std::end(decode_.kind_next_), 0u);
+    return app;
   }
 
   bool prepare_decode_kv_request(unsigned from, unsigned end) override {

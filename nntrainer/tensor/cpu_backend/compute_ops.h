@@ -844,6 +844,14 @@ public:
   }
   /** Allocated device K+V payload bytes, excluding scratch and scales. */
   virtual size_t decode_kv_bytes() const { return 0; }
+  /** Synchronous, same-loaded-model INT8 device checkpoints. */
+  virtual void save_decode_kv(const std::string &,
+                              const std::vector<uint32_t> &, bool) {
+    throw std::logic_error("Device KV checkpoints are unsupported");
+  }
+  virtual std::vector<uint32_t> load_decode_kv(const std::string &) {
+    throw std::logic_error("Device KV checkpoints are unsupported");
+  }
   // [#4416 D6] The same seed from the cache's fp16 bits, widened on the
   // accelerator (exactly, as compute_fp16_to_fp32): no CPU conversion.
   virtual bool decode_kv_seed_f16(unsigned n_rows, const uint16_t *k_rows,

@@ -250,7 +250,11 @@ public:
     return SYS_PROMP_LEN + global_token_len;
   }
 
-  /** Device INT8 K+V payload; zero before decode registration. */
+  /** Same-loaded-model DSP INT8 checkpoints, including pending feedback.
+   * park releases device K/V after a successful save. Restore before run(). */
+  WIN_EXPORT void saveDeviceKVCache(const std::string &path, bool park = true);
+  WIN_EXPORT void loadDeviceKVCache(const std::string &path);
+  /** Device INT8 K+V payload; zero before registration or while parked. */
   WIN_EXPORT size_t getDeviceKVCacheBytes() const;
   bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
   const std::vector<unsigned int> &getLastGeneratedTokenIds() const {

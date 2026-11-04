@@ -132,6 +132,8 @@ typedef struct {
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq
                        thread that runs it */
+  hvx_attn_m1_ctx *kv_restore[2]; /**< Unpublished transactional snapshot. */
+  uint32_t kv_restore_next[2], kv_restore_base[2], kv_restore_mask;
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with

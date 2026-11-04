@@ -1510,4 +1510,12 @@ interface nntr_hvx : remote_handle64 {
    // bytes. No token may be running. Existing RPC ordinals stay unchanged.
    AEEResult attn_m1_reserve(in uint32 cache, in uint32 rows, in uint32 drop,
                            in uint32 base);
+   // Same-process INT8 KV snapshots, exclusive request-boundary access.
+   // control: 0=query, 1=park, 2=begin import, 3=commit, 4=abort.
+   AEEResult attn_m1_snapshot_control(in uint32 action,
+      in sequence<uint32> metadata, rout sequence<uint32> result);
+   // query/import/export one layer; 0=query bytes, 1=export, 2=import.
+   AEEResult attn_m1_snapshot_layer(in uint32 action, in uint32 cache,
+      in uint32 layer, in sequence<uint8> input,
+      rout sequence<uint8> output, rout uint32 bytes);
 };

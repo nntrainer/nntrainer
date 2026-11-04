@@ -51,6 +51,8 @@ public:
   std::vector<uint32_t> kv_len_;
   bool attn_registered_ = false;
   uint32_t attn_window_rows_ = 0; /**< set_decode_kv_window, 0: none */
+  bool kv_parked_ = false;
+  uint64_t snapshot_cookie_ = 0;
   uint32_t request_end_ = 0; /**< Absolute end reserved outside token loops. */
   uint32_t attn_capacity_[2] = {0, 0}; /**< Rows per device cache shape. */
   bool kv_bases_dirty_ = false; /**< Reused graph needs fresh cache bases. */
@@ -112,7 +114,7 @@ public:
    *  Initial prefill, an unfinished row and non-contiguous positions keep the
    *  existing graph-walk contract. */
   bool canContinue(unsigned from) const {
-    return graph_inited_ && q4m1_bound_ && prompt_tokens_ != 0 &&
+    return !kv_parked_ && graph_inited_ && q4m1_bound_ && prompt_tokens_ != 0 &&
            (resident_mask_ & HTP_GRAPH_KINDS_Q4M1) != 0 &&
            cur_pos_ != HTP_GRAPH_NO_OP && cur_pos_ + 1u == from &&
            pending_op_ == HTP_GRAPH_NO_OP && !have_id_;
