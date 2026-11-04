@@ -13,97 +13,108 @@
   <a href="https://www.bestpractices.dev/projects/9179"><img src="https://www.bestpractices.dev/projects/9179/badge" alt="OpenSSF best practices"/></a>
 </p>
 
-NNTrainer is a C++ framework for running and training neural networks on
-devices with limited memory: phones, TVs, appliances. It ships an LLM
-inference engine (`Applications/CausalLM`) that runs mixture-of-experts
-models of 20 to 30 billion parameters on a phone, on the CPU or on the
-Hexagon NPU, and a training runtime that fine-tunes models on the device
-without sending data anywhere. Apache License 2.0.
+NNTrainer is a C++ framework for neural networks on devices with little
+memory: phones, TVs, appliances.
+
+- **Run LLMs on a phone.** Mixture-of-experts models of 20 to 30 billion
+  parameters, on the CPU or on the Hexagon NPU.
+- **Train on the device.** Fine-tune and personalize models without sending
+  data anywhere.
+- **Embed it.** C++ and C APIs, the QuickDotAI Android library and the
+  Quick.AI app.
 
 ## Try it
 
-Pick the path that matches what you have. Each one is a complete, copyable
-sequence; the linked page has the details and the troubleshooting.
+| | Path | You need |
+|--:|---|---|
+| 1 | [An LLM on your PC](#1-an-llm-on-your-pc) | Ubuntu, `meson`, a C++17 compiler |
+| 2 | [An LLM on an Android phone](#2-an-llm-on-an-android-phone) | Android NDK, a phone |
+| 3 | [Gemma4 26B or LFM2 24B on the NPU](#3-gemma4-26b-or-lfm2-24b-on-the-npu) | Galaxy S26 Ultra, Hexagon SDK, HexKL, a model pack |
+| 4 | [Train a model](#4-train-a-model) | the host build |
+| 5 | [Use it from your program](#5-use-it-from-your-program) | C++, C, Kotlin or Python |
 
-### Run an LLM on your PC
+### 1. An LLM on your PC
 
-Needs Ubuntu 22.04 or 24.04 with `meson`, `ninja`, a C++17 compiler and
-Python 3 ([build prerequisites](docs/getting-started.md#build-with-meson)).
+Build with the transformer option ([prerequisites](docs/getting-started.md#build-with-meson)):
 
 ```bash
 git clone https://github.com/nntrainer/nntrainer.git && cd nntrainer
 git submodule sync && git submodule update --init --depth 1
-meson setup build -Denable-transformer=true
-ninja -C build
+meson setup build -Denable-transformer=true && ninja -C build
+```
 
-# A small model: Qwen3-0.6B from a GGUF file, with the config and tokenizer
-# JSON files of the Hugging Face repository copied next to it.
-mkdir -p ~/models/qwen3-0.6b && cd ~/models/qwen3-0.6b
+Prepare a small model. Put `config.json`, `generation_config.json`,
+`tokenizer.json` and `tokenizer_config.json` from the Qwen3-0.6B Hugging
+Face repository in a directory, then convert the GGUF file into it:
+
+```bash
+cd ~/models/qwen3-0.6b
 python3 ~/nntrainer/Applications/CausalLM/res/qwen3/qwen3-0.6b/gguf_to_nntrainer.py \
   /path/to/qwen3-0.6b.gguf -o nntr_qwen3_0.6b_q40_embdq6k.bin --target x86 --emit-nntr-config
+```
 
+Ask it something:
+
+```bash
 NNTR_NUM_THREADS=4 ~/nntrainer/build/Applications/CausalLM/nntr_causallm ~/models/qwen3-0.6b "What is on-device AI?"
 ```
 
 The tool prints the answer with its prefill and generation speeds.
-[More models, quantization and the GPU path](Applications/CausalLM/README.md).
+Next: [more models, quantization, the GPU path](Applications/CausalLM/README.md).
 
-### Run an LLM on an Android phone
+### 2. An LLM on an Android phone
 
-Needs the Android NDK and a phone with USB debugging on.
+Build for arm64 and push the tool to the phone:
 
 ```bash
 export ANDROID_NDK=/path/to/android-ndk
-cd Applications/CausalLM
-./build_android.sh --install          # builds for arm64 and pushes the tool to /data/local/tmp/Quick.AI
+cd Applications/CausalLM && ./build_android.sh --install
+```
 
-# convert the model for ARM (--target arm) and push it
+Convert the model as in path 1 with `--target arm`, push it, run it:
+
+```bash
 adb push ~/models/qwen3-0.6b-arm /sdcard/Download/qwen3-0.6b
 adb shell sh /data/local/tmp/Quick.AI/run_causallm.sh /sdcard/Download/qwen3-0.6b "What is on-device AI?"
 ```
 
-[Android build options, the QuickDotAI library and the sample app](Applications/CausalLM/README.md#4-android-build--test).
+Next: [Android build options](Applications/CausalLM/README.md#4-android-build--test).
 
-### Run Gemma4 26B or LFM2 24B on the Hexagon NPU
+### 3. Gemma4 26B or LFM2 24B on the NPU
 
-Needs a Galaxy S26 Ultra (Hexagon v81), the Qualcomm Hexagon SDK 6.4 and
-HexKL, and a model pack ([where packs come from](docs/quickai/model-packs.md#where-packs-come-from)).
+Build the DSP image, the libraries and the Quick.AI app, and install them:
 
 ```bash
 source /path/to/Hexagon_SDK/6.4.0.1/setup_sdk_env.source
 export HEXKL_ROOT=/path/to/hexkl_addon HEX_ARCH=v81 ANDROID_NDK=/path/to/android-ndk-r30
-cd Applications/CausalLM
-./build_android.sh --htp --app --install      # DSP image, libraries, Quick.AI app, all on the phone
+cd Applications/CausalLM && ./build_android.sh --htp --app --install
+```
 
+Put the model pack on the phone ([where packs come from](docs/quickai/model-packs.md#where-packs-come-from)):
+
+```bash
 adb push gemma4-26b-a4b-htp-w4a32 /sdcard/Download/aistudio-mobile/models/
 ```
 
-Open **Quick.AI** on the phone, tap the model chip, choose
-`gemma4-26b-a4b` · `Quick.AI` · `NPU`, tap **Load model** and ask a
-question. Decode runs at 12 to 19 tokens per second on the S26 Ultra.
-[The Quick.AI documentation](docs/quickai/README.md) covers the app, the
-Android library, the C API, packs, the command line and the configuration.
+Open **Quick.AI**, tap the model chip, pick `gemma4-26b-a4b` · `Quick.AI` ·
+`NPU`, tap **Load model**, ask a question. Decode runs at 12 to 19 tokens
+per second on the S26 Ultra.
+Next: [the Quick.AI documentation](docs/quickai/README.md): app, library, C
+API, packs, command line, configuration, performance.
 
-### Train a model on device
+### 4. Train a model
 
-The training runtime builds with the default options; the examples under
-`Applications/` build with it.
+The training runtime and the examples build with the default options:
 
 ```bash
-meson setup build
-ninja -C build
-cd build
+meson setup build && ninja -C build && cd build
 export MNIST_RES=$PWD/res/app/MNIST
 ./Applications/MNIST/jni/nntrainer_mnist $MNIST_RES/mnist.ini $MNIST_RES/mnist_trainingSet.dat
 ```
 
-The same thing from C++ ([full tutorial](docs/how-to-create-model.md)):
+The same model from C++ ([full program](docs/how-to-create-model.md)):
 
 ```cpp
-#include <layer.h>
-#include <model.h>
-#include <optimizer.h>
-
 auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
 model->addLayer(ml::train::createLayer("input", {"input_shape=1:1:10"}));
 model->addLayer(ml::train::createLayer("fully_connected", {"unit=5", "activation=softmax"}));
@@ -111,65 +122,80 @@ model->setProperty({"batch_size=4", "epochs=10", "save_path=my_model.bin"});
 model->setOptimizer(ml::train::createOptimizer("SGD", {"learning_rate=0.001"}));
 model->compile();
 model->initialize();
-model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, std::move(dataset)); // a file or a generator callback
+model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, std::move(dataset));
 model->train();
 ```
 
-Models can also be described in an INI file (`Applications/MNIST/res/mnist.ini`)
-and loaded without code. Transfer learning, few-shot learning and
-reinforcement learning examples are in
+A model can also be an INI file, no code
+([example](Applications/MNIST/res/mnist.ini), [reference](docs/configuration-ini.md)).
+Next: transfer learning, few-shot and reinforcement learning examples in
 [`Applications/`](Applications/README.md).
 
-### Use NNTrainer from your own program
+### 5. Use it from your program
 
-| You write | Use | Start at |
-|---|---|---|
-| C++ | `ml::train` API: `model.h`, `layer.h`, `optimizer.h`, `dataset.h`, and the tensor graph API `tensor_api.h` | [api/ccapi](api/ccapi/README.md) |
-| C | `nntrainer.h` (Tizen's official ML training API) | [api/capi/include/nntrainer.h](api/capi/include/nntrainer.h) |
-| Kotlin / Java (LLM) | the QuickDotAI AAR: load a model by catalog id, stream the answer | [QuickDotAI library](Applications/CausalLM/Android/QuickDotAI/README.md) |
-| C / C++ (LLM) | `quick_dot_ai_api.h`: the handle-based LLM API under the AAR | [QuickDotAI C API](Applications/CausalLM/api/README.md) |
-| Python (model prep) | the converters under `Applications/CausalLM/res/<model>/` and `nntr_quantize` | [CausalLM README](Applications/CausalLM/README.md#quantizing-models) |
+- **C++**: the `ml::train` API (`model.h`, `layer.h`, `optimizer.h`,
+  `dataset.h`) and the tensor graph API `tensor_api.h`. Start at
+  [api/ccapi](api/ccapi/README.md).
+- **C**: `nntrainer.h`, Tizen's ML training API.
+  [api/capi/include/nntrainer.h](api/capi/include/nntrainer.h).
+- **Kotlin or Java, LLM**: the QuickDotAI AAR. Load a model by catalog id,
+  stream the answer. [QuickDotAI library](Applications/CausalLM/Android/QuickDotAI/README.md).
+- **C or C++, LLM**: `quick_dot_ai_api.h`, the handle-based API under the
+  AAR. [QuickDotAI C API](Applications/CausalLM/api/README.md).
+- **Python, model preparation**: the converters under
+  `Applications/CausalLM/res/<model>/` and `nntr_quantize`.
+  [Quantizing models](Applications/CausalLM/README.md#quantizing-models).
 
 ## What runs where
 
-| Model | Sizes | CPU | GPU (OpenCL) | NPU | Notes |
-|---|---|:-:|:-:|:-:|---|
-| Qwen3 | 0.6B – 32B | ✓ | ✓ | | Q4_0 / QS4CX weights, FP16 or FP32 activations |
-| Qwen3-MoE | 30B-A3B | ✓ | | | experts loaded from flash on demand (`slim`), with caching (`cached_slim`) |
-| GPT-OSS | 20B-A3.6B, 120B-5.1B | ✓ | | | `cached_slim` expert loading |
-| Gemma2, Gemma3 | 2B and up | ✓ | ✓ (Gemma2) | | |
-| Gemma4 E2B | 2B | ✓ | ✓ | ✓ QNN | also through LiteRT-LM in the Quick.AI app |
-| **Gemma4** | **26B-A4B** | | | **✓ Hexagon HTP** | 2-bit or ternary experts, int4 projections, int8 KV cache |
-| **LFM2** | **24B-A2B** | | | **✓ Hexagon HTP** | ternary experts, affine int4 projections |
-| LLaMA, Qwen2 | | ✓ | | | |
-| Encoders and vision | BERT, XLM-RoBERTa, DeBERTa-v2, sentence embeddings, timm ViT, V-JEPA 2 | ✓ | | ✓ QNN (V-JEPA 2) | |
+| Model | Sizes | Runs on |
+|---|---|---|
+| Qwen3 | 0.6B to 32B | CPU, GPU |
+| Qwen3-MoE | 30B-A3B | CPU, experts streamed from flash |
+| GPT-OSS | 20B-A3.6B, 120B-5.1B | CPU, experts streamed from flash |
+| Gemma2, Gemma3 | 2B and up | CPU; Gemma2 also GPU |
+| Gemma4 E2B | 2B | CPU, GPU, QNN NPU; LiteRT-LM in the app |
+| **Gemma4** | **26B-A4B** | **Hexagon NPU** |
+| **LFM2** | **24B-A2B** | **Hexagon NPU** |
+| LLaMA, Qwen2 | | CPU |
+| BERT, XLM-RoBERTa, DeBERTa-v2, sentence embeddings, timm ViT, V-JEPA 2 | | CPU; V-JEPA 2 also QNN NPU |
 
-Training: CNNs, RNNs (LSTM, GRU), transformers and reinforcement learning on
-the CPU; optimizers SGD, Adam, AdamW with constant, exponential, step,
-cosine and linear schedules; see [supported components](docs/components.md).
+GPU means OpenCL (Adreno, Intel Arc). Training runs on the CPU: CNNs, RNNs
+(LSTM, GRU), transformers and reinforcement learning, with SGD, Adam and
+AdamW ([all components](docs/components.md)).
 
 ## Documentation
 
-| | |
-|---|---|
-| Build and install on Linux, Tizen, Windows | [docs/getting-started.md](docs/getting-started.md), [Windows](docs/getting-started-windows.md) |
-| LLM inference engine: models, quantization, PC and Android builds, GPU | [Applications/CausalLM/README.md](Applications/CausalLM/README.md), [README_GPU.md](Applications/CausalLM/README_GPU.md) |
-| Quick.AI on the Hexagon NPU: app, library, C API, packs, command line, configuration, performance | [docs/quickai/README.md](docs/quickai/README.md) |
-| Building a model in C++ or INI | [docs/how-to-create-model.md](docs/how-to-create-model.md), [docs/configuration-ini.md](docs/configuration-ini.md) |
-| Running the example applications | [docs/how-to-run-examples.md](docs/how-to-run-examples.md), [on Android](docs/how-to-run-example-android.md) |
-| Layers, optimizers, losses, activations | [docs/components.md](docs/components.md) |
-| Backend internals: dispatch, vendor backends, the HTP backend | [docs/backend_guide/ARCHITECTURE.md](docs/backend_guide/ARCHITECTURE.md), [HTP_ARCHITECTURE.md](docs/backend_guide/HTP_ARCHITECTURE.md) |
-| Runtime environment variables | [docs/ENV_FLAGS.md](docs/ENV_FLAGS.md) |
-| Contributing | [docs/contributing.md](docs/contributing.md), [coding convention](docs/coding-convention.md) |
+- **Install and build**: [Linux and Tizen](docs/getting-started.md),
+  [Windows](docs/getting-started-windows.md)
+- **LLM engine**: [Applications/CausalLM](Applications/CausalLM/README.md),
+  [GPU guide](Applications/CausalLM/README_GPU.md)
+- **Quick.AI on the Hexagon NPU**: [docs/quickai](docs/quickai/README.md)
+- **Build a model**: [in C++](docs/how-to-create-model.md),
+  [in INI](docs/configuration-ini.md)
+- **Run the examples**: [on Linux](docs/how-to-run-examples.md),
+  [on Android](docs/how-to-run-example-android.md)
+- **Components**: [layers, optimizers, losses, activations](docs/components.md)
+- **Internals**: [backend dispatch](docs/backend_guide/ARCHITECTURE.md),
+  [the HTP backend](docs/backend_guide/HTP_ARCHITECTURE.md),
+  [environment variables](docs/ENV_FLAGS.md)
+- **Contributing**: [guide](docs/contributing.md),
+  [coding convention](docs/coding-convention.md)
 
-## Builds and packages
+## Platforms
 
-| | Tizen | Ubuntu | Android | Windows |
-|:--|:--:|:--:|:--:|:--:|
-| Versions | 7.0 M2 and later | 22.04 / 24.04 | 10 and later (API 29); the Quick.AI app needs 13 | Windows 11 |
-| arm64 | [![Tizen ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) | [![Android](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml) | [![Windows ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml) |
-| x86_64 | [![Tizen x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) | – | [![Windows x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml) |
-| Packages | [Tizen repository](http://download.tizen.org/snapshots/tizen/unified/latest/repos/standard/packages/) | [PPA `nnstreamer/ppa`](https://launchpad.net/~nnstreamer/+archive/ubuntu/ppa) | build from source | build from source |
+- **Ubuntu 22.04 / 24.04**
+  [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml)
+  Packages: [PPA `nnstreamer/ppa`](https://launchpad.net/~nnstreamer/+archive/ubuntu/ppa)
+- **Android 10 and later** (API 29; the Quick.AI app needs Android 13)
+  [![Android](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml)
+- **Tizen 7.0 M2 and later**
+  [![Tizen ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml)
+  [![Tizen x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml)
+  Packages: [Tizen repository](http://download.tizen.org/snapshots/tizen/unified/latest/repos/standard/packages/)
+- **Windows 11**
+  [![Windows ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml)
+  [![Windows x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml)
 
 ## Publications
 
@@ -177,13 +203,13 @@ cosine and linear schedules; see [supported components](docs/components.md).
 - [A New Frontier of AI: On-Device AI Training and Personalization](https://dl.acm.org/doi/abs/10.1145/3639477.3639716), ICSE-SEIP 2024
 - [NNTrainer: Light-Weight On-Device Training Framework](https://arxiv.org/pdf/2206.04688.pdf), arXiv 2022
 
-## Contributing and license
+## License
 
-Contributions are welcome; see the [contributing guide](docs/contributing.md)
-(DCO sign-off, `clang-format`). NNTrainer is released under the Apache
-License 2.0.
+Apache License 2.0. Contributions are welcome: see the
+[contributing guide](docs/contributing.md).
 
-If NNTrainer is useful in your research, please cite:
+<details>
+<summary>Cite NNTrainer</summary>
 
 ```bibtex
 @inproceedings{10.1145/3639477.3639716,
@@ -201,3 +227,5 @@ If NNTrainer is useful in your research, please cite:
   series = {ICSE-SEIP '24}
 }
 ```
+
+</details>
