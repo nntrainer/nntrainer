@@ -54,6 +54,11 @@ class HtpAppLifecycleTest {
     private var originalConfig: ByteArray? = null
     private lateinit var liveTrace: File
 
+    private companion object {
+        /** Gemma4's <turn|> token id. */
+        const val GEMMA4_END_OF_TURN = 106
+    }
+
     private val controller: ChatController get() = activity.viewModel.controller
     private val state: UiState get() = controller.state.value
     private fun status() = state.status
@@ -275,9 +280,14 @@ class HtpAppLifecycleTest {
                 val text = runChat(name, prompt)
                 assertFalse("Unexpected thought channel in $name", text.contains("<|channel>"))
                 assertFalse("Incomplete thought prefix in $name", text.contains("<channel|>"))
-                assertTrue("Missing end of turn in $name", text.endsWith("<turn|>"))
+                // The API's stream filter keeps <turn|> out of the text, so
+                // the end of turn is checked on the native token trace.
+                assertFalse("Turn marker reached the transcript in $name", text.contains("<turn|>"))
+                val ids = JSONObject(File(report, "trace-$name.json").readText()).getJSONArray("output_ids")
+                val last = ids.length() - 1
+                assertEquals("Missing end of turn in $name", GEMMA4_END_OF_TURN, ids.getInt(last))
                 assertEquals("Generation continued past the first end of turn in $name",
-                    text.length - "<turn|>".length, text.indexOf("<turn|>"))
+                    last, (0..last).first { ids.getInt(it) == GEMMA4_END_OF_TURN })
             }
             val chatSummary = File(report, "summary-output.txt").readText()
             assertEquals("JSON and Chat must render the same prompt", chatSummary, runJson("openai-summary", messages))

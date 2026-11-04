@@ -75,8 +75,9 @@ token, the speed and the token count.
 - The **attach** button inserts a text file (`.txt`, up to 1 MB) into the
   message, loads a `.json` request, or attaches an image for a vision model
   (the NPU models are text only).
-- The end-of-turn marker `<turn|>` is hidden in the bubble; the Metrics
-  screen's raw output and the token trace show it.
+- The library removes the chat turn markers (`<turn|>` and the like) from
+  the stream, so neither the bubble nor the Metrics screen's raw output
+  shows them; the token trace does (Gemma4's `<turn|>` is id 106).
 
 **The NPU models have no conversation memory in the app.** Their packs hold
 1,280 positions for the Gemma4 chat preset, and a prompt that does not fit
