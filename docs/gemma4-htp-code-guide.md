@@ -284,9 +284,12 @@ existing allocation policy and are released after DSP seeding.
 
 Use `setSessionTokenPosition(0)` to start an independent conversation on the
 next call. A failed run requires this reset before another continuation.
-Rewind, device snapshots, multiple resident conversation IDs and radix hits
-on device KV are not implemented by this option. Host FP16 snapshot APIs
-reject an active resident session rather than read released host storage.
+Rewind is not supported by this option. DSP snapshots are described below.
+Optional native page tables, conversation IDs and a token radix index are
+available through `htp.kv_paged` and `enableDeviceKVManager()`; see
+[device sessions and prefix reuse](gemma4-htp-paged-sessions.md) for the supported
+state boundaries and limits. Host FP16 snapshot APIs reject an active resident
+session rather than read released host storage.
 `getDeviceKVCacheBytes()` reports allocated INT8 K+V payload, excluding
 scales and temporary attention buffers. Existing `moe.cache_grow` policy
 remains separate; `0` still disables expert pool growth.
@@ -445,3 +448,9 @@ storage, enforce an aggregate file budget, or permit concurrent inference
 and checkpoint I/O. Convolution/recurrent-state graphs are rejected. Host
 FP16 snapshot APIs remain separate. Both the ARM stub and v81 DSP skeleton
 must be rebuilt for the appended checkpoint RPCs.
+
+Explicit A/B checkpoint switching has also been validated against independent
+resident conversations: save/park A, start and save/park B, then repeatedly
+load and update each conversation's own file. Both short conversations and
+unequal histories with different sliding bases preserve exact output IDs and
+positions. See the [alternating conversation validation](gemma4-htp-kv-manager-validation.md#alternating-independent-dsp-conversations-2026-11-04).

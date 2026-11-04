@@ -1632,6 +1632,7 @@ public:
         op->feed = (feed_s == "l2" ? HTP_GRAPH_FEED_L2 : 0u) | fc_lanes |
                    ((levers & 0x2u) ? HTP_GRAPH_FEED_NATIVE : 0u);
     }
+    device_kv_states_.clear();
     decode_.indexGraph(mask);
     HtpProfile::global().setGraphResident(mask);
     char names[128];
@@ -2373,6 +2374,14 @@ public:
   size_t decode_kv_bytes() const override {
     if (!decode_.attn_registered_ || decode_.kv_parked_)
       return 0;
+    if (htpRuntimeConfig().htp.kv_paged) {
+      uint32_t bytes = 0;
+      const int rc = nntr_hvx_attn_m1_snapshot_control(
+        HtpBackend::global().handle(), 8, nullptr, 0, &bytes, 1);
+      if (rc)
+        throw std::runtime_error("HTP KV byte query: " + graphErr(rc));
+      return bytes;
+    }
     size_t bytes = 0;
     for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
       const auto *rec = decode_.graphOp(op);
@@ -2381,6 +2390,92 @@ public:
                rec->n_kv * rec->head_dim * 2u;
     }
     return bytes;
+  }
+
+  struct DeviceKvState {
+    std::vector<uint32_t> app, lengths, bases;
+    uint32_t position, end, window, capacity[2];
+    uint64_t prompt;
+  };
+  std::map<uint32_t, DeviceKvState> device_kv_states_;
+  uint32_t next_device_kv_id_ = 1;
+
+  uint32_t retain_decode_kv(const std::vector<uint32_t> &app) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    snapshotReady(true);
+    if (!htpRuntimeConfig().htp.kv_paged || app.size() != 3u ||
+        uint64_t(app[0]) + app[1] != uint64_t(decode_.cur_pos_) + 1u ||
+        !next_device_kv_id_)
+      throw std::logic_error("Device KV handles require paged resident state");
+    DeviceKvState state;
+    state.app = app;
+    state.lengths = decode_.kv_len_;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1])
+      state.bases.push_back(decode_.graphOp(op)->n_experts);
+    state.position = decode_.cur_pos_;
+    state.end = decode_.request_end_;
+    state.window = decode_.attn_window_rows_;
+    state.capacity[0] = decode_.attn_capacity_[0];
+    state.capacity[1] = decode_.attn_capacity_[1];
+    state.prompt = decode_.prompt_tokens_;
+    const uint32_t id = next_device_kv_id_++;
+    auto it = device_kv_states_.emplace(id, std::move(state)).first;
+    const int rc = nntr_hvx_attn_m1_snapshot_control(
+      HtpBackend::global().handle(), 5, &id, 1, nullptr, 0);
+    if (rc) {
+      device_kv_states_.erase(it);
+      throw std::runtime_error("HTP KV retain: " + graphErr(rc));
+    }
+    return id;
+  }
+
+  std::vector<uint32_t> select_decode_kv(uint32_t id) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    auto it = device_kv_states_.find(id);
+    if (it == device_kv_states_.end())
+      throw std::invalid_argument("Unknown device KV handle");
+    // Allocate all host return/counter state before the DSP transaction.
+    auto lengths = it->second.lengths;
+    auto app = it->second.app;
+    if (cpu_predictor_)
+      cpu_predictor_->drain();
+    if (pool_prefetch_)
+      pool_prefetch_->drain();
+    const int rc = nntr_hvx_attn_m1_snapshot_control(
+      HtpBackend::global().handle(), 6, &id, 1, nullptr, 0);
+    if (rc)
+      throw std::runtime_error("HTP KV select: " + graphErr(rc));
+    const auto &state = it->second;
+    size_t i = 0;
+    for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1])
+      htp_graph_op_at(decode_.graph_words_.data(), op)->n_experts =
+        state.bases[i++];
+    decode_.cur_pos_ = state.position;
+    decode_.request_end_ = state.end;
+    decode_.attn_window_rows_ = state.window;
+    decode_.attn_capacity_[0] = state.capacity[0];
+    decode_.attn_capacity_[1] = state.capacity[1];
+    decode_.prompt_tokens_ = state.prompt;
+    decode_.kv_len_.swap(lengths);
+    decode_.kv_parked_ = decode_.kv_bases_dirty_ = false;
+    decode_.attn_registered_ = true;
+    decode_.clearPending();
+    decode_.have_id_ = decode_.row_bound_ = false;
+    decode_.seed_ordinal_ = HTP_GRAPH_NO_OP;
+    std::fill(std::begin(decode_.kind_next_), std::end(decode_.kind_next_), 0u);
+    htp_router_handoff_invalidate(&staging_.router_handoff_);
+    return app;
+  }
+
+  void release_decode_kv(uint32_t id) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    if (!device_kv_states_.count(id))
+      throw std::invalid_argument("Unknown device KV handle");
+    const int rc = nntr_hvx_attn_m1_snapshot_control(
+      HtpBackend::global().handle(), 7, &id, 1, nullptr, 0);
+    if (rc)
+      throw std::runtime_error("HTP KV release: " + graphErr(rc));
+    device_kv_states_.erase(id);
   }
 
   /** The checksum covers framing, scales and payload; restored DSP objects
@@ -3798,7 +3893,8 @@ public:
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
         max_seq | (q8 ? 0x80000000u : 0u) | (kvSeedQ() ? 0x40000000u : 0u) |
-          (fast ? 0x20000000u : 0u) | (qk_i8 ? 0x10000000u : 0u));
+          (fast ? 0x20000000u : 0u) | (qk_i8 ? 0x10000000u : 0u) |
+          (runtime.kv_paged ? 0x08000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));

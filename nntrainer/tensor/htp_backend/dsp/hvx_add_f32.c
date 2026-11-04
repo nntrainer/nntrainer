@@ -329,6 +329,13 @@ int nntr_hvx_close(remote_handle64 handle) {
   free(s->had_sign_down);
   s->had_sign_in = s->had_sign_down = NULL;
   /* [#81] The attention cache borrows the pool, so it goes first. */
+  while (s->kv_saved) {
+    nntr_kv_saved *saved = s->kv_saved;
+    s->kv_saved = saved->next;
+    hvx_attn_m1_free(saved->cache[0]);
+    hvx_attn_m1_free(saved->cache[1]);
+    free(saved);
+  }
   hvx_attn_m1_free(s->kv_restore[0]);
   hvx_attn_m1_free(s->kv_restore[1]);
   hvx_attn_m1_free(s->attn_m1);

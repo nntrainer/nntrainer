@@ -104,6 +104,8 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
        FFN_ENGINE != "htp" || LMHEAD_ENGINE != "htp"))
     throw std::invalid_argument(
       "Gemma4 KV sessions require a fully resident HTP graph");
+  if (runtime_config.htp.kv_paged && !htp_session_enabled_)
+    throw std::invalid_argument("Gemma4 paged KV requires htp.kv_session");
   NNTR_THROW_IF(htp_e2e && (HIDDEN_SIZE_PER_LAYER_INPUT > 0 ||
                             ATTN_LOGIT_SOFTCAPPING > 0.0f),
                 std::invalid_argument)

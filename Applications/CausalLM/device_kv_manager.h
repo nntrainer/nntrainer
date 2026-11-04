@@ -1,0 +1,293 @@
+// SPDX-License-Identifier: Apache-2.0
+/** @file device_kv_manager.h
+ * @brief Serialized device sessions and token radix index of immutable states.
+ * @author Codex <noreply@openai.com>
+ */
+#ifndef NNTR_DEVICE_KV_MANAGER_H
+#define NNTR_DEVICE_KV_MANAGER_H
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace causallm {
+
+/** The backend owns page tables, scales and window positions behind handles.
+ * A terminal radix node denotes a complete device state, including all layer
+ * scales. Arbitrary token branch points are NOT independently restorable:
+ * quantizer/window state must have been captured at that position.
+ * Thread confined; all operations occur between synchronous inference calls.
+ */
+class DeviceKVManager {
+public:
+  using Tokens = std::vector<unsigned int>;
+  using Capture = std::function<uint32_t(unsigned, unsigned)>;
+  using Restore = std::function<void(uint32_t)>;
+  using Release = std::function<void(uint32_t)>;
+  struct Session {
+    uint32_t handle = 0;
+    Tokens tokens; /**< Known processed tokens; excludes pending feedback. */
+  };
+  struct Stats {
+    size_t sessions = 0, prefixes = 0, radix_nodes = 0;
+    uint64_t lookups = 0, hits = 0, reused_tokens = 0;
+  };
+
+  DeviceKVManager(Capture capture, Restore restore, Release release,
+                  std::function<void()> reset, size_t max_sessions,
+                  size_t max_prefixes) :
+    capture_(std::move(capture)),
+    restore_(std::move(restore)),
+    release_(std::move(release)),
+    reset_(std::move(reset)),
+    max_sessions_(max_sessions),
+    max_prefixes_(max_prefixes) {
+    if (!max_sessions || max_sessions > 120u ||
+        max_prefixes > 120u - max_sessions)
+      throw std::invalid_argument("Device KV handle limit is 120");
+    sessions_.emplace(0, Session{});
+  }
+  ~DeviceKVManager() {
+    for (const auto &s : sessions_)
+      releaseNoThrow(s.second.handle);
+    for (const auto &p : prefixes_)
+      releaseNoThrow(p.second.handle);
+  }
+  DeviceKVManager(const DeviceKVManager &) = delete;
+  DeviceKVManager &operator=(const DeviceKVManager &) = delete;
+
+  uint32_t create() {
+    if (sessions_.size() >= max_sessions_ || !next_session_)
+      throw std::length_error("Device KV session limit reached");
+    const uint32_t id = next_session_++;
+    sessions_.emplace(id, Session{});
+    return id;
+  }
+  uint32_t fork(unsigned position, unsigned pending) {
+    const uint32_t id = create();
+    try {
+      Session child;
+      child.tokens = sessions_.at(active_).tokens;
+      if (position)
+        child.handle = capture_(position, pending);
+      sessions_.at(id) = std::move(child);
+    } catch (...) {
+      sessions_.erase(id);
+      throw;
+    }
+    return id;
+  }
+  void select(uint32_t id, unsigned position, unsigned pending) {
+    auto target = sessions_.find(id);
+    if (target == sessions_.end())
+      throw std::invalid_argument("Unknown device KV session");
+    if (id == active_)
+      return;
+    uint32_t outgoing = position ? capture_(position, pending) : 0;
+    try {
+      if (target->second.handle)
+        restore_(target->second.handle);
+      else {
+        Tokens old_tokens = sessions_.at(active_).tokens;
+        reset_();
+        sessions_.at(active_).tokens = std::move(old_tokens);
+      }
+    } catch (...) {
+      releaseNoThrow(outgoing);
+      throw;
+    }
+    auto &old = sessions_.at(active_);
+    releaseNoThrow(old.handle);
+    old.handle = outgoing;
+    active_ = id;
+  }
+  void destroy(uint32_t id) {
+    if (id == active_)
+      throw std::logic_error("Select another session before deleting it");
+    auto it = sessions_.find(id);
+    if (it == sessions_.end())
+      throw std::invalid_argument("Unknown device KV session");
+    if (it->second.handle)
+      release_(it->second.handle);
+    sessions_.erase(it);
+  }
+  uint32_t active() const { return active_; }
+  const Tokens &tokens() const { return sessions_.at(active_).tokens; }
+  void setTokens(Tokens tokens) {
+    sessions_.at(active_).tokens = std::move(tokens);
+  }
+  void forgetTokens() { sessions_.at(active_).tokens.clear(); }
+
+  /** Longest published state strictly before the final prompt token.
+   * Leaves at least one token to produce fresh logits under this request's
+   * sampling policy. Only use for a new conversation's complete input IDs. */
+  size_t reuse(const Tokens &tokens) {
+    ++stats_.lookups;
+    const Node *node = &root_;
+    size_t offset = 0;
+    uint32_t best = 0;
+    while (offset < tokens.size()) {
+      auto it = node->children.find(tokens[offset]);
+      if (it == node->children.end())
+        break;
+      node = it->second.get();
+      if (node->edge.size() > tokens.size() - offset ||
+          !std::equal(node->edge.begin(), node->edge.end(),
+                      tokens.begin() + offset))
+        break;
+      offset += node->edge.size();
+      if (node->terminal && offset < tokens.size())
+        best = node->terminal;
+    }
+    if (!best)
+      return 0;
+    auto &p = prefixes_.at(best);
+    Tokens adopted = p.tokens;
+    restore_(p.handle);
+    sessions_.at(active_).tokens = std::move(adopted);
+    p.used = ++clock_;
+    ++stats_.hits;
+    stats_.reused_tokens += p.tokens.size();
+    return p.tokens.size();
+  }
+
+  /** Publish a complete processed state; no per-token work or page export. */
+  void publish(const Tokens &tokens, unsigned position, unsigned pending) {
+    if (!max_prefixes_ || tokens.empty() || tokens.size() != position)
+      return;
+    // Equal token histories can have different quantizer states depending on
+    // prefill chunking. Retain the first valid state; never combine its pages
+    // with another state's scales.
+    for (auto &entry : prefixes_)
+      if (entry.second.tokens == tokens) {
+        entry.second.used = ++clock_;
+        return;
+      }
+    // Evict BEFORE retaining to bound temporary handles as well as residency.
+    if (prefixes_.size() == max_prefixes_) {
+      auto victim = std::min_element(prefixes_.begin(), prefixes_.end(),
+                                     [](const auto &a, const auto &b) {
+                                       return a.second.used < b.second.used;
+                                     });
+      release_(victim->second.handle);
+      erase(root_, victim->first);
+      prefixes_.erase(victim);
+    }
+    Prefix p{tokens, capture_(position, pending), ++clock_};
+    try {
+      prefixes_.emplace(p.handle, p);
+      rebuild();
+    } catch (...) {
+      prefixes_.erase(p.handle);
+      releaseNoThrow(p.handle);
+      // Tree publication is rebuilt atomically, so an older index cannot
+      // contain this unpublished handle.
+      throw;
+    }
+  }
+  void clearPrefixes() {
+    for (auto it = prefixes_.begin(); it != prefixes_.end();) {
+      release_(it->second.handle);
+      erase(root_, it->first);
+      it = prefixes_.erase(it);
+    }
+    root_ = Node{};
+  }
+  Stats stats() const {
+    Stats out = stats_;
+    out.sessions = sessions_.size();
+    out.prefixes = prefixes_.size();
+    out.radix_nodes = nodes(root_);
+    return out;
+  }
+
+private:
+  struct Node {
+    Tokens edge;
+    uint32_t terminal = 0;
+    std::map<unsigned, std::unique_ptr<Node>> children;
+  };
+  struct Prefix {
+    Tokens tokens;
+    uint32_t handle;
+    uint64_t used;
+  };
+  static size_t nodes(const Node &n) {
+    size_t count = 0;
+    for (const auto &c : n.children)
+      count += 1 + nodes(*c.second);
+    return count;
+  }
+  static void insert(Node &root, const Tokens &tokens, uint32_t id) {
+    Node *node = &root;
+    size_t offset = 0;
+    while (offset < tokens.size()) {
+      auto it = node->children.find(tokens[offset]);
+      if (it == node->children.end()) {
+        auto leaf = std::make_unique<Node>();
+        leaf->edge.assign(tokens.begin() + offset, tokens.end());
+        leaf->terminal = id;
+        node->children.emplace(tokens[offset], std::move(leaf));
+        return;
+      }
+      Node *child = it->second.get();
+      size_t common = 0;
+      while (common < child->edge.size() && offset + common < tokens.size() &&
+             child->edge[common] == tokens[offset + common])
+        ++common;
+      if (common < child->edge.size()) {
+        auto branch = std::make_unique<Node>();
+        branch->edge.assign(child->edge.begin(), child->edge.begin() + common);
+        child->edge.erase(child->edge.begin(), child->edge.begin() + common);
+        branch->children.emplace(child->edge[0], std::move(it->second));
+        it->second = std::move(branch);
+      }
+      node = it->second.get();
+      offset += common;
+    }
+    node->terminal = id;
+  }
+  static void erase(Node &node, uint32_t handle) noexcept {
+    if (node.terminal == handle)
+      node.terminal = 0;
+    for (auto it = node.children.begin(); it != node.children.end();) {
+      erase(*it->second, handle);
+      if (!it->second->terminal && it->second->children.empty())
+        it = node.children.erase(it);
+      else
+        ++it;
+    }
+  }
+  void rebuild() {
+    Node next;
+    for (const auto &p : prefixes_)
+      insert(next, p.second.tokens, p.first);
+    root_ = std::move(next);
+  }
+  void releaseNoThrow(uint32_t handle) noexcept {
+    if (handle)
+      try {
+        release_(handle);
+      } catch (...) { /* DSP teardown also frees handles. */
+      }
+  }
+  Capture capture_;
+  Restore restore_;
+  Release release_;
+  std::function<void()> reset_;
+  size_t max_sessions_, max_prefixes_;
+  uint32_t next_session_ = 1, active_ = 0;
+  uint64_t clock_ = 0;
+  std::map<uint32_t, Session> sessions_;
+  std::map<uint32_t, Prefix> prefixes_;
+  Node root_;
+  Stats stats_;
+};
+} // namespace causallm
+#endif

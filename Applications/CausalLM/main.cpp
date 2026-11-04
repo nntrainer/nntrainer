@@ -41,11 +41,13 @@
 #include <sys/resource.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <thread>
 
 using json = nlohmann::json;
@@ -278,6 +280,8 @@ int main(int argc, char *argv[]) {
         if (!request.is_object() || !request.contains("prompt") ||
             !request["prompt"].is_string() ||
             (request.contains("reset") && !request["reset"].is_boolean()) ||
+            (request.contains("device_session") &&
+             !request["device_session"].is_string()) ||
             (request.contains("device_kv_save") &&
              !request["device_kv_save"].is_string()) ||
             (request.contains("device_kv_load") &&
@@ -427,8 +431,31 @@ int main(int argc, char *argv[]) {
       if (!causal)
         throw std::invalid_argument(
           "Request sequences require a causal language model");
+      const bool device_sessions =
+        std::any_of(requests.begin(), requests.end(),
+                    [](const auto &r) { return r.contains("device_session"); });
+      std::map<std::string, uint32_t> device_session_ids;
+      if (device_sessions) {
+        causal->enableDeviceKVManager();
+        device_session_ids.emplace("default", 0);
+      }
       size_t index = 0;
       for (const auto &request : requests) {
+        double switch_ms = 0;
+        if (device_sessions) {
+          const auto name =
+            request.value("device_session", std::string("default"));
+          auto it = device_session_ids.find(name);
+          if (it == device_session_ids.end())
+            it =
+              device_session_ids.emplace(name, causal->createDeviceKVSession())
+                .first;
+          const auto started = std::chrono::steady_clock::now();
+          causal->selectDeviceKVSession(it->second);
+          switch_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+        }
         if (request.value("reset", false))
           causal->setSessionTokenPosition(0);
         double restore_ms = 0;
@@ -453,6 +480,18 @@ int main(int argc, char *argv[]) {
                        {"decode_ms", metrics.decode_steady_ms},
                        {"peak_memory_kb", metrics.peak_memory_kb},
                        {"output", causal->getOutput()}};
+        if (device_sessions) {
+          const auto stats = causal->deviceKVManagerStats();
+          result["device_session"] =
+            request.value("device_session", std::string("default"));
+          result["device_session_switch_ms"] = switch_ms;
+          result["device_kv_manager"] = {
+            {"sessions", stats.sessions},
+            {"prefixes", stats.prefixes},
+            {"radix_nodes", stats.radix_nodes},
+            {"hits", stats.hits},
+            {"reused_tokens", stats.reused_tokens}};
+        }
         result["output_ids"] = causal->getLastGeneratedTokenIds();
         result["device_kv_restore_ms"] = restore_ms;
         if (request.contains("device_kv_save")) {

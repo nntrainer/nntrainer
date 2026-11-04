@@ -1512,6 +1512,8 @@ interface nntr_hvx : remote_handle64 {
                            in uint32 base);
    // Same-process INT8 KV snapshots, exclusive request-boundary access.
    // control: 0=query, 1=park, 2=begin import, 3=commit, 4=abort.
+   // Resident paged states: 5=retain, 6=select, 7=release (metadata: handle).
+   // 8=active K/V payload bytes (one result word).
    AEEResult attn_m1_snapshot_control(in uint32 action,
       in sequence<uint32> metadata, rout sequence<uint32> result);
    // query/import/export one layer; 0=query bytes, 1=export, 2=import.

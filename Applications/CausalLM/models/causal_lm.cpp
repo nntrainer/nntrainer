@@ -1117,6 +1117,8 @@ void CausalLM::setSessionTokenPosition(unsigned int pos) {
     throw std::invalid_argument(
       "Resident HTP KV can resume only at its current position");
   if (pos == 0u) {
+    if (device_kv_manager_)
+      device_kv_manager_->forgetTokens();
     htp_pending_tokens_.clear();
     htp_session_failed_ = false;
   }
@@ -1136,6 +1138,87 @@ size_t CausalLM::getDeviceKVCacheBytes() const {
 #endif
 }
 
+void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
+#ifdef ENABLE_HEXKL
+  if (!htp_session_enabled_ || !nntrainer::htpRuntimeConfig().htp.kv_paged)
+    throw std::logic_error("Device KV manager requires resident paged HTP KV");
+  if (device_kv_manager_)
+    throw std::logic_error("Device KV manager is already enabled");
+  device_kv_manager_ = std::make_unique<DeviceKVManager>(
+    [](unsigned position, unsigned pending) {
+      return nntrainer::get_htp_ops()->retain_decode_kv(
+        {position, 0u, pending});
+    },
+    [this](uint32_t handle) {
+      const auto app = nntrainer::get_htp_ops()->select_decode_kv(handle);
+      global_token_len = app[0];
+      SYS_PROMP_LEN = app[1];
+      // An independent run drops host slabs before its radix lookup. The
+      // device state is authoritative; the following allocation/bind and
+      // setKVCachePosition() initialize the fresh host placeholders.
+      if (kv_cache.isAllocated())
+        kv_cache.setPosition(app[0] + app[1]);
+      htp_pending_tokens_ = {app[2]};
+      htp_session_failed_ = false;
+      USE_KVCACHE = false;
+      PRE_COMPUTED_CACHE_PATH.clear();
+      retire_decode_capture();
+    },
+    [](uint32_t handle) {
+      nntrainer::get_htp_ops()->release_decode_kv(handle);
+    },
+    [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes);
+#else
+  throw std::logic_error("HTP backend is unavailable");
+#endif
+}
+
+uint32_t CausalLM::createDeviceKVSession() {
+  if (!device_kv_manager_)
+    throw std::logic_error("Enable the device KV manager first");
+  return device_kv_manager_->create();
+}
+
+uint32_t CausalLM::forkDeviceKVSession() {
+  if (!device_kv_manager_ || htp_session_failed_ ||
+      (getSessionTokenPosition() && htp_pending_tokens_.size() != 1u))
+    throw std::logic_error("Device KV session is not ready to fork");
+  return device_kv_manager_->fork(
+    getSessionTokenPosition(),
+    htp_pending_tokens_.empty() ? 0u : htp_pending_tokens_[0]);
+}
+
+void CausalLM::selectDeviceKVSession(uint32_t id) {
+  if (!device_kv_manager_ || htp_session_failed_ ||
+      (getSessionTokenPosition() && htp_pending_tokens_.size() != 1u))
+    throw std::logic_error("Device KV session is not ready to switch");
+  device_kv_manager_->select(
+    id, getSessionTokenPosition(),
+    htp_pending_tokens_.empty() ? 0u : htp_pending_tokens_[0]);
+}
+
+void CausalLM::destroyDeviceKVSession(uint32_t id) {
+  if (!device_kv_manager_)
+    throw std::logic_error("Enable the device KV manager first");
+  device_kv_manager_->destroy(id);
+}
+
+uint32_t CausalLM::activeDeviceKVSession() const {
+  if (!device_kv_manager_)
+    throw std::logic_error("Enable the device KV manager first");
+  return device_kv_manager_->active();
+}
+
+DeviceKVManager::Stats CausalLM::deviceKVManagerStats() const {
+  return device_kv_manager_ ? device_kv_manager_->stats()
+                            : DeviceKVManager::Stats{};
+}
+
+void CausalLM::clearDeviceKVPrefixes() {
+  if (device_kv_manager_)
+    device_kv_manager_->clearPrefixes();
+}
+
 void CausalLM::saveDeviceKVCache(const std::string &path, bool park) {
 #ifdef ENABLE_HEXKL
   if (!htp_session_enabled_ || htp_session_failed_ ||
@@ -1153,6 +1236,8 @@ void CausalLM::loadDeviceKVCache(const std::string &path) {
   if (!htp_session_enabled_)
     throw std::logic_error("DSP snapshot requires resident sessions");
   const auto app = nntrainer::get_htp_ops()->load_decode_kv(path);
+  if (device_kv_manager_)
+    device_kv_manager_->forgetTokens();
   global_token_len = app[0];
   SYS_PROMP_LEN = app[1];
   kv_cache.setPosition(app[0] + app[1]);
@@ -1703,10 +1788,27 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto _input = tokenizer->Encode(
     prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE) &&
                !(htp_session_enabled_ && global_token_len != 0));
-  if (htp_session_enabled_ && global_token_len != 0) {
+  size_t device_prefix_hit = 0;
+  if (device_kv_manager_ && global_token_len == 0 && SYS_PROMP_LEN == 0) {
+    device_prefix_hit = device_kv_manager_->reuse(
+      DeviceKVManager::Tokens(_input.begin(), _input.end()));
+    if (device_prefix_hit)
+      _input.erase(_input.begin(), _input.begin() + device_prefix_hit);
+  }
+  if (htp_session_enabled_ && global_token_len != 0 && !device_prefix_hit) {
     NNTR_THROW_IF(htp_pending_tokens_.size() != 1u, std::logic_error)
       << "Resident HTP session has no pending feedback token";
     _input.insert(_input.begin(), htp_pending_tokens_[0]);
+  }
+
+  DeviceKVManager::Tokens device_run_tokens;
+  if (device_kv_manager_) {
+    device_run_tokens = device_kv_manager_->tokens();
+    if (device_run_tokens.size() == getSessionTokenPosition())
+      device_run_tokens.insert(device_run_tokens.end(), _input.begin(),
+                               _input.end());
+    else
+      device_run_tokens.clear(); // e.g. a Flash snapshot without token IDs
   }
 
   // [prefill-plane] Now that the prompt's real token count is known, give this
@@ -2505,6 +2607,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
+    if (device_kv_manager_ && token_generation_idx == generation_begin &&
+        skipped_prefill_token && !device_run_tokens.empty() &&
+        device_run_tokens.size() == token_generation_idx + global_token_len) {
+      device_kv_manager_->publish(device_run_tokens,
+                                  token_generation_idx + global_token_len,
+                                  static_cast<unsigned>(input_sample[0]));
+    }
     {
       const auto step_end = std::chrono::high_resolution_clock::now();
       decode_step_ms.push_back(
@@ -2556,6 +2665,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   free(input_sample);
 
   global_token_len += (generation_cnt + init_len);
+  if (device_kv_manager_) {
+    if (!device_run_tokens.empty() && !generated_ids.empty()) {
+      device_run_tokens.insert(device_run_tokens.end(), generated_ids.begin(),
+                               generated_ids.end() - 1);
+      if (device_run_tokens.size() != getSessionTokenPosition())
+        device_run_tokens.clear();
+    }
+    device_kv_manager_->setTokens(std::move(device_run_tokens));
+    device_kv_manager_->publish(device_kv_manager_->tokens(),
+                                getSessionTokenPosition(),
+                                htp_pending_tokens_[0]);
+  }
 
   if (generated_ids_path) {
     std::ofstream ids_file(generated_ids_path);

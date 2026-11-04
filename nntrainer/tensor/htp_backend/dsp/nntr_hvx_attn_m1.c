@@ -22,6 +22,7 @@
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
 #include <remote.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nntr_hvx.h"
@@ -119,9 +120,89 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
                                       const uint32 *metadata, int metadataLen,
                                       uint32 *result, int resultLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !s->graph || !s->attn_m1)
+  if (!s || !s->graph || (!s->attn_m1 && action < 5u))
     return AEE_EBADSTATE;
   hvx_attn_m1_ctx *active[2] = {s->attn_m1, s->attn_m1_b};
+  // 5 retains immutable page tables, 6 restores by sharing, 7 releases a
+  // handle. Both shapes are cloned before publication; an allocation failure
+  // leaves active and saved conversations untouched. No KV bytes cross FastRPC.
+  if (action >= 5u && action <= 7u) {
+    if (!metadata || metadataLen != 1 || !metadata[0] || s->kv_restore_mask)
+      return AEE_EINVALIDFORMAT;
+    nntr_kv_saved **link = &s->kv_saved;
+    uint32_t count = 0;
+    while (*link && (*link)->id != metadata[0]) {
+      link = &(*link)->next;
+      ++count;
+    }
+    nntr_kv_saved *saved = *link;
+    if (action == 7u) {
+      if (!saved)
+        return AEE_EBADSTATE;
+      *link = saved->next;
+      hvx_attn_m1_free(saved->cache[0]);
+      hvx_attn_m1_free(saved->cache[1]);
+      free(saved);
+      return AEE_SUCCESS;
+    }
+    if ((action == 6u && !saved) || (action == 5u && (!active[0] || saved)))
+      return AEE_EBADSTATE;
+    if (action == 5u && count >= 128u)
+      return AEE_ENOMEMORY;
+    nntr_kv_saved *next = calloc(1, sizeof(*next));
+    if (!next)
+      return AEE_ENOMEMORY;
+    next->id = metadata[0];
+    int rc = AEE_SUCCESS;
+    for (uint32_t c = 0; c < 2u; ++c) {
+      const hvx_attn_m1_ctx *src = action == 5u ? active[c] : saved->cache[c];
+      if (!src)
+        continue;
+      next->cache[c] = hvx_attn_m1_clone(src, &rc);
+      if (!next->cache[c])
+        break;
+      next->base[c] = action == 6u ? saved->base[c] : 0;
+      if (action == 5u)
+        for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+          const htp_graph_op *op = &s->graph->ops[i];
+          if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == src->n_kv &&
+              op->gqa == src->gqa && op->head_dim == src->head_dim)
+            next->base[c] = op->n_experts;
+        }
+    }
+    if (rc != AEE_SUCCESS) {
+      hvx_attn_m1_free(next->cache[0]);
+      hvx_attn_m1_free(next->cache[1]);
+      free(next);
+      return rc;
+    }
+    if (action == 5u) {
+      *link = next;
+    } else {
+      for (uint32_t c = 0; c < 2u; ++c) {
+        hvx_attn_m1_ctx *a = next->cache[c];
+        if (a)
+          for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
+            htp_graph_op *op = &s->graph->ops[i];
+            if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == a->n_kv &&
+                op->gqa == a->gqa && op->head_dim == a->head_dim)
+              op->n_experts = next->base[c];
+          }
+        hvx_attn_m1_free(active[c]);
+      }
+      s->attn_m1 = next->cache[0];
+      s->attn_m1_b = next->cache[1];
+      free(next);
+    }
+    return AEE_SUCCESS;
+  }
+  if (action == 8u) {
+    if (!result || resultLen != 1)
+      return AEE_EINVALIDFORMAT;
+    result[0] = (uint32_t)(hvx_attn_m1_payload_bytes(active[0]) +
+                           hvx_attn_m1_payload_bytes(active[1]));
+    return AEE_SUCCESS;
+  }
   if (action == 4u) {
     snapshot_abort(s);
     return AEE_SUCCESS;
@@ -144,7 +225,8 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
       r[3] = a->head_dim;
       r[4] = a->max_seq;
       r[5] = HVX_ATTN_M1_Q8 | (a->fast ? HVX_ATTN_M1_FAST : 0u) |
-             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u);
+             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u) |
+             (a->paged ? HVX_ATTN_M1_PAGED : 0u);
       for (uint32_t i = 0; i < s->graph->n_ops; ++i) {
         const htp_graph_op *op = &s->graph->ops[i];
         if (op->kind == HTP_OP_ATTN_M1 && op->n_kv == a->n_kv &&
@@ -173,7 +255,8 @@ int nntr_hvx_attn_m1_snapshot_control(remote_handle64 handle, uint32 action,
       const hvx_attn_m1_ctx *a = active[c];
       const uint32_t flags = HVX_ATTN_M1_Q8 |
                              (a->fast ? HVX_ATTN_M1_FAST : 0u) |
-                             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u);
+                             (a->qk_i8 ? HVX_ATTN_M1_QK_I8 : 0u) |
+                             (a->paged ? HVX_ATTN_M1_PAGED : 0u);
       if (r[0] != a->n_layers || r[1] != a->n_kv || r[2] != a->gqa ||
           r[3] != a->head_dim || r[5] != flags || r[7] || !r[4] ||
           r[4] > s->graph->max_seq || r[4] % 64u || r[6] > s->graph->max_seq) {

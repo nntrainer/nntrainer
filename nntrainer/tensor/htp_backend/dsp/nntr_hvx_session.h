@@ -57,9 +57,17 @@
  *  five full layers' v, plus the lm_head's 16 slices of 16384 rows). */
 #define NNTR_HVX_Q4M1_SLOTS 256
 
+/** Saved device page tables; ownership is independent of the active cache. */
+typedef struct nntr_kv_saved {
+  uint32_t id, base[2];
+  hvx_attn_m1_ctx *cache[2];
+  struct nntr_kv_saved *next;
+} nntr_kv_saved;
+
 /** @brief One Q4M1 weight on the DSP heap (memalign 128), or [#132 Part B
  *  E3] borrowed from an attached arena (q4m1_attach: never freed here).
  *  w NULL = free. */
+
 typedef struct {
   uint8_t *w;
   uint32_t K, N;
@@ -132,6 +140,7 @@ typedef struct {
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq
                        thread that runs it */
+  nntr_kv_saved *kv_saved;
   hvx_attn_m1_ctx *kv_restore[2]; /**< Unpublished transactional snapshot. */
   uint32_t kv_restore_next[2], kv_restore_base[2], kv_restore_mask;
 } nntr_hvx_session;

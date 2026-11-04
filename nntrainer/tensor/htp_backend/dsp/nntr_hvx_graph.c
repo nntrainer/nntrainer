@@ -131,6 +131,13 @@ int nntr_hvx_graph_release(remote_handle64 handle) {
   if (!s) {
     return AEE_EBADPARM;
   }
+  while (s->kv_saved) {
+    nntr_kv_saved *saved = s->kv_saved;
+    s->kv_saved = saved->next;
+    hvx_attn_m1_free(saved->cache[0]);
+    hvx_attn_m1_free(saved->cache[1]);
+    free(saved);
+  }
   hexkl_graph_free(s->graph);
   s->graph = NULL;
   return AEE_SUCCESS;

@@ -1955,6 +1955,17 @@ public:
   /** Borrow the runtime-owned expert policy; null without HTP slot support. */
   virtual HtpExpertPool *htpExpertPool() { return nullptr; }
 
+  /** Device-resident COW handles, valid only for this loaded graph. */
+  virtual uint32_t retain_decode_kv(const std::vector<uint32_t> &) {
+    throw std::logic_error("Device KV page sharing is unsupported");
+  }
+  virtual std::vector<uint32_t> select_decode_kv(uint32_t) {
+    throw std::logic_error("Device KV page sharing is unsupported");
+  }
+  virtual void release_decode_kv(uint32_t) {
+    throw std::logic_error("Device KV page sharing is unsupported");
+  }
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

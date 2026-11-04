@@ -40,6 +40,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <device_kv_manager.h>
 #include <kv_cache_manager.h>
 #include <token_sampler.h>
 #include <transformer.h>
@@ -88,6 +89,7 @@ public:
 
 protected:
   bool htp_execution_profile_ = false;
+  std::unique_ptr<DeviceKVManager> device_kv_manager_;
   bool htp_session_enabled_ = false;
   bool htp_session_failed_ = false;
   /** Last emitted token has not yet passed through attention. */
@@ -256,6 +258,22 @@ public:
   WIN_EXPORT void loadDeviceKVCache(const std::string &path);
   /** Device INT8 K+V payload; zero before registration or while parked. */
   WIN_EXPORT size_t getDeviceKVCacheBytes() const;
+  /** Opt-in DSP COW sessions and a radix index of complete device states.
+   * Requires htp.kv_session=true and htp.kv_paged=true. Serialized use only.
+   * Session 0 is the current conversation when enabled. New runs on an empty
+   * session search published prefixes automatically; continuation takes new
+   * text only. Prefixes are published at completed prompt/request boundaries.
+   */
+  WIN_EXPORT void enableDeviceKVManager(size_t max_sessions = 32,
+                                        size_t max_prefixes = 8);
+  WIN_EXPORT uint32_t createDeviceKVSession();
+  WIN_EXPORT uint32_t forkDeviceKVSession();
+  WIN_EXPORT void selectDeviceKVSession(uint32_t id);
+  WIN_EXPORT void destroyDeviceKVSession(uint32_t id);
+  WIN_EXPORT uint32_t activeDeviceKVSession() const;
+  WIN_EXPORT DeviceKVManager::Stats deviceKVManagerStats() const;
+  WIN_EXPORT void clearDeviceKVPrefixes();
+
   bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
   const std::vector<unsigned int> &getLastGeneratedTokenIds() const {
     return last_generated_ids_;

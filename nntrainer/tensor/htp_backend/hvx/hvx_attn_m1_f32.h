@@ -78,7 +78,15 @@
  *        two caches byte for byte through kt / v / cache_halves); create,
  *        kv_append and forward are the writers.
  */
+/** A reference-counted INT8 K/V tile. Only the request thread changes refs. */
 typedef struct {
+  uint32_t refs;
+  int8_t *data; /**< aligned K [hd][64], then V [64][hd] */
+} hvx_kv_page;
+
+typedef struct {
+  uint32_t paged;
+  hvx_kv_page **pages; /**< [layer][head][seq/64], allocated on append */
   uint32_t n_layers;
   uint32_t n_kv;
   uint32_t gqa;
@@ -145,6 +153,8 @@ typedef struct {
 #define HVX_ATTN_M1_FAST 0x20000000u
 /** @brief Experimental byte QK dot product; requires FAST and Q8. */
 #define HVX_ATTN_M1_QK_I8 0x10000000u
+/** Native DSP page table; INT8 only. No history gather in attention. */
+#define HVX_ATTN_M1_PAGED 0x08000000u
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 
@@ -154,6 +164,11 @@ typedef struct {
  * Must run between requests, with no outstanding worker or decode job. */
 hvx_attn_m1_ctx *hvx_attn_m1_reserve(const hvx_attn_m1_ctx *src, uint32_t rows,
                                      uint32_t drop, int *err);
+
+/** Fork all valid rows through shared tiles; scales and scratch are private.
+ * Subsequent appends detach the modified tiles before starting workers. */
+hvx_attn_m1_ctx *hvx_attn_m1_clone(const hvx_attn_m1_ctx *src, int *err);
+size_t hvx_attn_m1_payload_bytes(const hvx_attn_m1_ctx *ctx);
 
 /** Versioned caller-owned layer payload: live length, scaled flag, six
  * scale arrays and K/V bytes through the final 64-row tile. No pointers or
