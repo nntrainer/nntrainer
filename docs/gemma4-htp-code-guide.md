@@ -397,3 +397,51 @@ To support another model on this path: reuse the HTP layers through a new
 description), add its weight layout to the converter and to
 `gemma4_htp_weights.cpp`-style validation, and start from the tiny-reference
 test so that correctness is pinned before the first device run.
+
+### DSP INT8 checkpoints on Flash
+
+With `htp.kv_session=true`, C++ callers can park and restore a resident
+conversation at a completed request boundary:
+
+```cpp
+model.saveDeviceKVCache("/data/local/tmp/conversation.kv", true);
+// Device K/V allocations are released; getDeviceKVCacheBytes() returns zero.
+model.loadDeviceKVCache("/data/local/tmp/conversation.kv");
+model.run(new_user_input, false, "", "", false);
+```
+
+The methods are on `CausalLM`. Files contain both cache shapes, the live
+INT8 K/V tiles, fixed scales and inverses, scale floors, valid lengths,
+sliding bases, backend progression and the pending feedback token. K/V is
+copied in its existing DSP layout without dequantization or requantization.
+Unused capacity is omitted; the final tile is rounded to 64 rows. Export and
+import stage one layer in rpcmem rather than a full-cache host copy.
+
+A version and a per-loaded-graph cookie restrict restoration to the same
+loaded model in the same process. The checksum covers metadata and payload.
+Import builds unpublished DSP caches and commits both shapes together after
+all layers, the checksum and end-of-file validate. A failed import discards
+its staging and preserves the current active or parked conversation. Peak
+memory includes the old and replacement caches when loading without parking.
+Saving uses a temporary file and rename, and parks only after successful
+file close and rename. It does not issue a durability `fsync`; a caller that
+requires durable storage must synchronize the file separately.
+
+The CLI request-sequence format also accepts `device_kv_save` (after the
+request), `device_kv_park` (default true) and `device_kv_load` (before the
+request). It reports file bytes and save/restore durations separately from
+request TTFT. For a hit's end-to-end TTFT, include restore time.
+
+```json
+[
+  {"prompt": "<bos>...", "device_kv_save": "/data/local/tmp/chat.kv"},
+  {"prompt": "...new input...", "device_kv_load": "/data/local/tmp/chat.kv"}
+]
+```
+
+These synchronous checkpoints support explicit session parking and recovery.
+They do not automatically connect the CPU radix/LRU/Flash policies to DSP
+storage, enforce an aggregate file budget, or permit concurrent inference
+and checkpoint I/O. Convolution/recurrent-state graphs are rejected. Host
+FP16 snapshot APIs remain separate. Both the ARM stub and v81 DSP skeleton
+must be rebuilt for the appended checkpoint RPCs.

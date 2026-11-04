@@ -351,3 +351,69 @@ The committed [evidence record](validation/gemma4-htp-kv-session-20261103.json)
 contains the exact measurements, configuration, device binary hashes,
 implementation revision and correctness checks. Local raw evidence remains
 under `/tmp/nntr-kv-session-20261103`.
+
+## DSP INT8 Flash checkpoints (2026-11-04)
+
+The new C++ `saveDeviceKVCache(path, park)` / `loadDeviceKVCache(path)`
+path was validated on the Gemma4 26B A4B HTP fused model on SM-S948N,
+Android 16, Hexagon v81. These measurements use the actual NPU/DSP model,
+not the Qwen CPU Flash path. Expert capacity was fixed at 16 per layer,
+expert growth disabled, existing attention arithmetic retained, and resident
+sessions and request reservations enabled.
+
+Each case has three measured trials after model/graph warmup. The original
+prompt has N-2 tokens and generates two tokens. A checkpoint contains N-1
+committed INT8 KV rows plus one pending feedback token. The recompute request
+prefills exactly the same N input IDs. Resident and restored requests consume
+the pending token, and their output IDs and committed positions match exactly.
+At 4096 an assistant-turn delimiter prevents decoded generated text from
+merging with the original prompt during re-tokenization. Token identity is
+checked before any sample is accepted. Rebuilding INT8 scales during full
+recomputation is allowed; its output is recorded independently.
+
+| History tokens | Snapshot MiB | Recompute TTFT ms | Cold restore ms | Cold restore + request TTFT ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 15.04 | 1,696.55 | 44.14 | 115.60 |
+| 512 | 56.29 | 1,890.64 | 175.03 | 326.89 |
+| 1024 | 111.29 | 2,250.09 | 361.43 | 583.52 |
+| 4096 | 147.54 | 6,749.82 | 509.38 | 672.36 |
+
+Values are medians. Cold preparation uses file `fsync` followed by
+`POSIX_FADV_DONTNEED`; `/proc/self/io` records at least the full snapshot's
+bytes as storage reads on every cold restore. Restore time includes reads,
+checksum, RPC transfer, DSP allocation/import and atomic commit. Model loading
+and prior export are excluded from hit TTFT. Including measured export/park,
+file synchronization/advice, restore and resumed TTFT gives 965.47 ms at
+1024 and 1,230.46 ms at 4096. This is observed latency, not a NAND durability
+or energy measurement. Clocks are not locked; three trials do not establish
+production latency percentiles. Expert-cache residency can change between
+paths. Recompute and warm/cold order alternate by repetition.
+
+The size increase from 1024 to 4096 is limited by retaining sliding-layer
+windows while global layers retain the longer history. Relative savings
+are consequently not monotonic across lengths. Unaligned N+2-token cases
+were also measured separately; they require an additional prefill chunk and
+are not used in the table above.
+
+Validation includes:
+
+- All restored output IDs and committed positions match resident continuation.
+- Park releases device K/V allocations; the reported K+V payload becomes zero.
+  Quantizer metadata and decode scratch remain in the parked context.
+- A corrupted KV payload fails checksum verification after candidate import;
+  full before/after active checkpoint files are byte-identical. A subsequent
+  healthy restore and continuation succeed.
+- Four host FP16 snapshot entry points reject parked resident DSP sessions.
+- Host round trips preserve bytes and exact attention outputs in ordinary,
+  integer and Q8 query modes, including a 64-row sliding compaction.
+- Targeted ASan/UBSan checks pass (`detect_leaks=0`, matching the sandbox's
+  LeakSanitizer limitation). ARM engine/application and v81 DSP builds pass.
+
+This provides explicit, synchronous checkpoints in the same loaded model
+process. Automatic DSP radix/LRU/Flash budget integration and restoration
+across model processes are not implemented. The checksum-protected file
+contains a loaded-graph cookie; unrelated models cannot adopt it.
+
+[Measured data, configuration and checks](validation/gemma4-dsp-flash-20261104.json)
+include raw per-trial values and binary hashes. Native benchmark sources,
+commands, logs and CSV are in `/tmp/nntr-dsp-flash-20261104/`.
