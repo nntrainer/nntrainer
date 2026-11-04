@@ -53,7 +53,23 @@
     "host_device_kv_checks": "PASS",
     "asan_ubsan_device_kv_checks": "PASS",
     "clang_format_14": "PASS",
-    "git_diff_check": "PASS"
+    "git_diff_check": "PASS",
+    "additional_htp_followup": {
+      "status": "PASS in resumed tail after fixture repair",
+      "initial_failure": "Broad host script reached the LFM2 extraction fixture, whose stubs lacked declarations for the two existing RPCs now referenced by the opt-in radix branch.",
+      "repair": "Added rejecting append/prefill stubs; LFM2 must continue through its original combined RPC. Production code and validated Android binaries did not change.",
+      "fixture": "test/htp/host/lfm2_router_handoff_check.cpp",
+      "fixture_sha256": "e594bf1abca71abf1a89d91c38c39ff669b5f97863b3297138860b2092f4602e",
+      "results": {
+        "router_handoff_cases": 194,
+        "tl2_refresh_pair": "PASS",
+        "abs_max_cases": 1800,
+        "quant_values": 164800,
+        "bad_values": 0
+      },
+      "sanitizers": "ASan/UBSan, ASAN_OPTIONS=detect_leaks=0; LeakSanitizer is unavailable under this sandbox ptrace environment.",
+      "not_run": "Optional qemu-aarch64 NEON path: compiler/emulator unavailable."
+    }
   },
   "length_matrix": {
     "binary_sha256": {

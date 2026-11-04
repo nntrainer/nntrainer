@@ -93,6 +93,14 @@ template <typename... Args> static int nntr_hvx_attn_q_step(Args... args) {
   direct_q_input = std::get<13>(std::make_tuple(args...));
   return direct_rpc<17>(args...);
 }
+// Gemma radix prefill has separate append/tiled entries. The LFM2 policy
+// under test must continue to use its existing combined attention RPC.
+template <typename... Args> static int nntr_hvx_kv_append_q(Args...) {
+  throw std::runtime_error("Unexpected radix append in LFM2 handoff check");
+}
+template <typename... Args> static int nntr_hvx_attn_q_prefill(Args...) {
+  throw std::runtime_error("Unexpected radix prefill in LFM2 handoff check");
+}
 template <typename... Args> static int nntr_hvx_attn_f16_decode(Args... args) {
   return direct_rpc<17>(args...);
 }
