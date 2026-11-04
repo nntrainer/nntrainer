@@ -68,7 +68,7 @@ import com.example.quickdotaiapp.power.PowerUi
 import com.example.quickdotaiapp.power.PromptSource
 import java.util.Locale
 
-private fun fmt(v: Double?, pattern: String): String = v?.let { String.format(Locale.US, pattern, it) } ?: "—"
+internal fun fmt(v: Double?, pattern: String): String = v?.let { String.format(Locale.US, pattern, it) } ?: "—"
 
 internal val PowerPhase.measuring: Boolean get() = this != PowerPhase.IDLE && this != PowerPhase.DONE
 
@@ -158,12 +158,16 @@ private fun Setup(chat: UiState, power: PowerUi, runner: PowerRunner, onMeasure:
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun <T> Choice(label: String, options: List<Pair<T, String>>, selected: T, onSelect: (T) -> Unit) {
+internal fun <T> Choice(
+    label: String, options: List<Pair<T, String>>, selected: T,
+    enabled: (T) -> Boolean = { true }, onSelect: (T) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             options.forEach { (value, text) ->
-                FilterChip(selected = value == selected, onClick = { onSelect(value) }, label = { Text(text, maxLines = 1) })
+                FilterChip(selected = value == selected, onClick = { onSelect(value) }, enabled = enabled(value),
+                    label = { Text(text, maxLines = 1) })
             }
         }
     }

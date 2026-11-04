@@ -344,7 +344,7 @@ class ChatControllerTest {
     }
 
     @Test
-    fun metricsFillTurnAndRuns() {
+    fun metricsFillTheTurn() {
         val c = controller().loadedNpu()
         c.setDraft("go"); c.send(); c.awaitIdle()
         val m = c.state.value.turns.last().metrics!!
@@ -352,9 +352,7 @@ class ChatControllerTest {
         assertEquals(10.0, m.tokensPerSec, 1e-9)
         assertEquals(3, m.generationTokens)
         assertEquals("Quick.AI", m.engineLabel)
-        val run = c.state.value.runs.single()
-        assertEquals("chat", run.mode); assertEquals(10, run.prefillTokens); assertEquals("Hello world<turn|>", run.output)
-        assertEquals(120.0, c.state.value.lastMetrics!!.ttftMs, 1e-9)
+        assertEquals(10, m.prefillTokens)
     }
 
     @Test
@@ -394,18 +392,6 @@ class ChatControllerTest {
         assertEquals("""{"a":1}""", c.state.value.draft)
         c.loadJsonFile("bad.json", "{")
         assertTrue(c.state.value.notice!!.startsWith("bad.json is not valid JSON"))
-    }
-
-    @Test
-    fun clearRunsEmptiesHistoryAndLastMetrics() {
-        val c = controller().loadedNpu()
-        c.setDraft("go"); c.send(); c.awaitIdle()
-        assertEquals(1, c.state.value.runs.size)
-        c.clearRuns()
-        assertTrue(c.state.value.runs.isEmpty())
-        assertEquals(null, c.state.value.lastMetrics)
-        c.setDraft("again"); c.send(); c.awaitIdle()
-        assertEquals(2, c.state.value.runs.single().index)        // indices stay unique after a clear
     }
 
     // ----- final-review findings -------------------------------------------
@@ -494,7 +480,6 @@ class ChatControllerTest {
         engines.lastOrNull()?.metricsToReturn = engines.last().metricsToReturn.copy(decodeSteadyMs = 42.0)
         assertTrue(c.sendPrompt("measure me")); c.awaitIdle()
         assertEquals(listOf("send", "first", "tok1", "tok2", "tok3", "engine:100.0:42.0", "done:3:10:false"), events)
-        assertEquals("power", c.state.value.runs.last().mode)
         assertEquals("measure me", c.state.value.turns.first { it.role == TurnRole.USER }.text)
     }
 

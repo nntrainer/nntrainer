@@ -3,8 +3,9 @@
  * @file  AppViewModel.kt
  * @brief Android glue around ChatController: the engine executor, the
  *        native catalog, file reading through ContentResolver, the theme
- *        preference and the Power tab's runner with its gauge sampler,
- *        prompt presets and session files. Survives rotation.
+ *        preference, the Power tab's runner with its gauge sampler,
+ *        prompt presets and session files, and the Metrics tab's
+ *        benchmark runner. Survives rotation.
  */
 package com.example.quickdotaiapp
 
@@ -18,15 +19,18 @@ import com.example.quickdotai.ModelCatalog
 import com.example.quickdotai.RuntimeKind
 import com.example.quickdotai.createEngine
 import com.example.quickdotaiapp.power.BatterySampler
+import com.example.quickdotaiapp.power.PackLimits
 import com.example.quickdotaiapp.power.PowerFiles
 import com.example.quickdotaiapp.power.PowerPrompts
 import com.example.quickdotaiapp.power.PowerRunner
+import com.example.quickdotaiapp.power.PowerSettings
 import com.example.quickdotaiapp.power.PromptSource
 import com.example.quickdotaiapp.power.SessionMeta
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import java.io.File
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
@@ -61,6 +65,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         onSessionDone = files::write,
     )
 
+    /** The Metrics tab: the same runner with the gauge parts off (no cable wait, baseline or cool-down), speeds only. */
+    val bench = PowerRunner(
+        scope = CoroutineScope(viewModelScope.coroutineContext + Dispatchers.IO),
+        chat = controller,
+        sampler = sampler::sample,
+        prompts = ::prompt,
+        onSessionDone = files::writeBench,
+    ).apply {
+        setSettings(PowerSettings(prompt = PromptSource.Bench(1024), windowTokens = 128, repeats = 3,
+            baselineSec = 0, cooldownSec = 0, measurePower = false, thermalGate = false))
+    }
+
     private fun prompt(source: PromptSource): String? = when (source) {
         PromptSource.Composer -> controller.composerText().ifBlank { null }
         PromptSource.HtpSummary -> runCatching {
@@ -69,6 +85,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         is PromptSource.Fixed -> runCatching {
             getApplication<Application>().resources.openRawResource(rawPrompt(source.tokens)).bufferedReader().readText()
         }.getOrNull()
+        is PromptSource.Bench -> runCatching {
+            getApplication<Application>().resources.openRawResource(R.raw.power_prompt_4k).bufferedReader().readText()
+        }.getOrNull()?.let { PowerPrompts.bench(it, source.tokens) }
     }
 
     private fun rawPrompt(tokens: Int): Int = when (PowerPrompts.resourceName(tokens)) {
@@ -78,17 +97,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         else -> R.raw.power_prompt_4k
     }
 
-    fun startPower() {
+    fun startPower() = power.start(sessionMeta())
+    fun startBench() = bench.start(sessionMeta())
+
+    private fun sessionMeta(): SessionMeta {
         val s = controller.state.value
         val d = s.effectiveDescriptor
-        power.start(SessionMeta(
+        return SessionMeta(
             startedAt = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(OffsetDateTime.now()),
             device = Build.MODEL,
             android = Build.VERSION.RELEASE,
             modelId = d?.id ?: "?",
             runtime = d?.let { Examples.runtimeLabel(it.runtime) } ?: "?",
             backend = (s.loadedRequest?.backend ?: s.selection.backend).name,
-        ))
+        )
+    }
+
+    /** The loaded native pack's prompt and answer budget from its nntr_config.json; null for LiteRT or an unreadable file. */
+    fun loadedPackLimits(): PackLimits? {
+        val path = controller.state.value.loadedRequest?.modelPath ?: return null
+        return runCatching { File(path, "nntr_config.json").readText() }.getOrNull()?.let(PowerPrompts::packLimits)
     }
 
     fun setTheme(mode: ThemeMode) {
@@ -145,6 +173,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         power.stop()
+        bench.stop()
         controller.shutdown()?.let { e -> engineExecutor.execute { runCatching { e.close() } } }
         engineExecutor.shutdown()
     }

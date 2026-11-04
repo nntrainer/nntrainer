@@ -3,7 +3,8 @@
  * @file  HtpAppLifecycleTest.kt
  * @brief Opt-in device test of the HTP presets through the Compose sample:
  *        load, generate, stop, repeat, reload, active unload, invalid path,
- *        the Gemma4 prompt format and the LFM2 default-path restart. Needs
+ *        the Gemma4 prompt format, the LFM2 default-path restart and the
+ *        Metrics tab's benchmark. Needs
  *        the v81 HTP build, a staged pack and the -e arguments; without
  *        them every test is skipped. Inference always starts through the
  *        same controls as a user; the controller is read, never driven,
@@ -16,6 +17,7 @@ import android.view.WindowManager
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextReplacement
@@ -25,6 +27,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.example.quickdotai.BackendType
 import com.example.quickdotai.ModelCatalog
 import com.example.quickdotai.ModelIds
+import com.example.quickdotaiapp.power.PowerPhase
 import com.example.quickdotaiapp.ui.Tags
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -32,6 +35,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -293,6 +298,53 @@ class HtpAppLifecycleTest {
             assertEquals("JSON and Chat must render the same prompt", chatSummary, runJson("openai-summary", messages))
             unloadFromSheet()
             File(report, "result.json").writeText(JSONObject().put("status", "passed").toString())
+        } finally {
+            finish()
+        }
+    }
+
+    /** The Metrics tab: pick 1K and 64 with the chips, Run, and get three runs whose window was filled. */
+    @Test
+    fun metricsBenchmarkRunsTheChosenLengths() {
+        val modelId = args.getString("htpModelId") ?: ModelIds.GEMMA4_26B_A4B_HTP
+        val base = args.getString("htpModelBase")
+        assumeTrue("Supply htpModelBase for the v81 device test", base != null)
+        report = File(context.filesDir, "htp-bench-validation").apply { mkdirs() }
+        launch()
+        try {
+            selectModel(modelId)
+            loadFromSheet(base!!)
+            assertTrue(status(), status().startsWith("Loaded "))
+            tap(Tags.NAV_METRICS)
+            rule.onNodeWithText("1K").performSemanticsAction(SemanticsActions.OnClick)
+            rule.onNodeWithText("64").performSemanticsAction(SemanticsActions.OnClick)
+            rule.waitForIdle()
+            val bench = activity.viewModel.bench
+            tap(Tags.BENCH_RUN)
+            await("benchmark") { bench.state.value.phase == PowerPhase.DONE }
+            screenshot("metrics")
+            val ui = bench.state.value
+            File(report, "result.json").writeText(JSONObject().apply {
+                put("modelId", modelId)
+                put("error", ui.error ?: JSONObject.NULL)
+                put("savedPath", ui.savedPath ?: JSONObject.NULL)
+                put("runs", JSONArray(ui.runs.map { r ->
+                    JSONObject().put("prompt", r.marks?.promptTokens).put("generated", r.marks?.generatedTokens)
+                        .put("ttftMs", r.ttftMs).put("prefillTps", r.enginePrefillTps).put("decodeTps", r.tokensPerSec)
+                        .put("skipped", r.skipped)
+                }))
+            }.toString(2))
+            assertNull(ui.error)
+            assertEquals(3, ui.runs.size)
+            ui.runs.forEach { r ->
+                assertNull(r.skipped)
+                val m = requireNotNull(r.marks)
+                assertTrue("window not filled: ${m.generatedTokens}", m.generatedTokens >= 64)
+                assertTrue("prompt tokens ${m.promptTokens}", (m.promptTokens ?: 0) in 600..1300)
+                assertNotNull(r.tokensPerSec)
+                assertNotNull(r.enginePrefillTps)
+            }
+            assertTrue("bench.csv: ${ui.savedPath}", ui.savedPath?.endsWith("bench.csv") == true)
         } finally {
             finish()
         }

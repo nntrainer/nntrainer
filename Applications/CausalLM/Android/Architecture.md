@@ -22,7 +22,8 @@ Android/
 `ChatController` (pure Kotlin, JVM-tested) holds all state in one
 `StateFlow<UiState>` and makes every engine call on that executor. Screens:
 Chat (transcript, attach sheet, a composer that takes a message or OpenAI
-JSON), Metrics and Power (whole-device energy per token from the battery
+JSON), Metrics (a speed benchmark of nominal prompt and answer lengths on a
+bundled text, `bench.csv`) and Power (whole-device energy per token from the battery
 gauge, with a thermal gate between repeats and CSV / JSON files under
 Download/QuickAI/power); the model sheet opens from the top-bar chip.
 The Gemma4 HTP preset is selected first when the build has it, and the HTP

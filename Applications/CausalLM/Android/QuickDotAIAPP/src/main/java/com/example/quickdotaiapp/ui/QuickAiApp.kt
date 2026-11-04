@@ -71,22 +71,26 @@ fun QuickAiApp(vm: AppViewModel) {
     val controller = vm.controller
     val state by controller.state.collectAsStateWithLifecycle()
     val power by vm.power.state.collectAsStateWithLifecycle()
+    val bench by vm.bench.state.collectAsStateWithLifecycle()
     QuickAiTheme(state.theme) {
         // The splash cross-fades into the app instead of being swapped out.
         Crossfade(targetState = state.splashShown, animationSpec = tween(350), label = "splash") { shown ->
-            if (shown) AppScaffold(state, power, vm) else Splash(onDone = controller::splashDone)
+            if (shown) AppScaffold(state, power, bench, vm) else Splash(onDone = controller::splashDone)
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppScaffold(state: UiState, power: com.example.quickdotaiapp.power.PowerUi, vm: AppViewModel) {
+private fun AppScaffold(
+    state: UiState, power: com.example.quickdotaiapp.power.PowerUi, bench: com.example.quickdotaiapp.power.PowerUi, vm: AppViewModel,
+) {
     val controller = vm.controller
     val context = LocalContext.current
-    // The gauge must see the screen on for the whole Power session, whichever tab is shown.
+    // The gauge must see the screen on for the whole Power session, whichever tab is shown; a benchmark
+    // must not lose speed to a screen-off either.
     val view = LocalView.current
-    val measuring = power.phase.measuring
+    val measuring = power.phase.measuring || bench.phase.measuring
     DisposableEffect(measuring) {
         view.keepScreenOn = measuring
         onDispose { view.keepScreenOn = false }
@@ -161,7 +165,10 @@ private fun AppScaffold(state: UiState, power: com.example.quickdotaiapp.power.P
             when (state.screen) {
                 Screen.CHAT -> ChatScreen(state, controller, onAttach = { attachSheetOpen = true },
                     onLoadJson = { pickJson.launch(arrayOf("application/json", "text/*")) }, modifier = Modifier.weight(1f))
-                Screen.METRICS -> MetricsScreen(state, controller, modifier = Modifier.weight(1f))
+                Screen.METRICS -> {
+                    val limits = remember(state.loadedRequest) { vm.loadedPackLimits() }
+                    MetricsScreen(state, bench, vm.bench, limits, onRun = vm::startBench, modifier = Modifier.weight(1f))
+                }
                 Screen.POWER -> PowerScreen(
                     state, power, vm.power, onMeasure = vm::startPower,
                     onCopy = { text ->

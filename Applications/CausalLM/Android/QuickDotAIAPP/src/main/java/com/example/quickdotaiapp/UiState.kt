@@ -10,7 +10,6 @@ package com.example.quickdotaiapp
 import com.example.quickdotai.BackendType
 import com.example.quickdotai.LoadModelRequest
 import com.example.quickdotai.ModelDescriptor
-import com.example.quickdotai.PerformanceMetrics
 import com.example.quickdotai.RuntimeKind
 
 enum class Screen { CHAT, METRICS, POWER }
@@ -59,19 +58,6 @@ data class ChatTurn(
     val metrics: TurnMetrics? = null,
 )
 
-/** One row of the Metrics screen's history. */
-data class RunRecord(
-    val index: Int,
-    val modelId: String,
-    val mode: String,
-    val prefillTokens: Int,
-    val generationTokens: Int,
-    val ttftMs: Double,
-    val tokensPerSec: Double,
-    val totalMs: Double,
-    val output: String,
-)
-
 /** LiteRT session settings; strings because they come straight from text fields. */
 data class SessionSettings(
     val systemPrompt: String = "",
@@ -94,8 +80,6 @@ data class UiState(
     val rawJson: String = "",
     /** The composer takes OpenAI JSON ([rawJson]) instead of a message ([draft]). */
     val rawMode: Boolean = false,
-    val lastMetrics: PerformanceMetrics? = null,
-    val runs: List<RunRecord> = emptyList(),
     val status: String = "Idle.",
     val screen: Screen = Screen.CHAT,
     val theme: ThemeMode = ThemeMode.SYSTEM,

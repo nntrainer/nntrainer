@@ -21,6 +21,8 @@ object Tags {
     const val POWER_AGAIN = "powerAgain"
     const val POWER_COPY = "powerCopy"
     const val POWER_ALLOW_PLUGGED = "powerAllowPlugged"
+    const val BENCH_RUN = "benchRun"
+    const val BENCH_STOP = "benchStop"
     const val BASE_PATH = "basePath"
     const val LOAD = "load"
     const val UNLOAD = "unload"

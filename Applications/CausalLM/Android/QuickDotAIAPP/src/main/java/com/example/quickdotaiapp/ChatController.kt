@@ -36,7 +36,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class ChatController(
@@ -61,7 +60,6 @@ class ChatController(
     @Volatile override var observer: GenerationObserver? = null
     // Turn ids are LazyColumn keys: unique across threads, never minted inside update {}.
     private val nextTurnId = AtomicLong(1)
-    private val runIndex = AtomicInteger(0)
 
     init {
         scope.launch {
@@ -121,7 +119,6 @@ class ChatController(
     fun removeDraftImage(index: Int) = update { copy(draftImages = draftImages.filterIndexed { i, _ -> i != index }) }
     fun setRawJson(text: String) = update { copy(rawJson = text) }
     fun resetRawJson() = update { copy(rawJson = examples.rawJsonFor(descriptor), rawRevision = rawRevision + 1) }
-    fun clearRuns() = update { copy(runs = emptyList(), lastMetrics = null) }
     fun setScreen(screen: Screen) = update { copy(screen = screen) }
     override val isLiteRt: Boolean get() = state.value.descriptor?.runtime == RuntimeKind.LITERT
     override val isLoaded: Boolean get() = state.value.load is LoadState.Loaded
@@ -368,7 +365,7 @@ class ChatController(
             }
             collector.flush()
             val metrics = withContext(engineDispatcher) { (e.metrics() as? BackendResult.Ok)?.value }
-            finishTurn(e, assistantId, result, collector.error, metrics, mode, startedMs, d, collector.tokens, obs)
+            finishTurn(e, assistantId, result, collector.error, metrics, startedMs, d, collector.tokens, obs)
         }
     }
 
@@ -418,7 +415,7 @@ class ChatController(
 
     private fun finishTurn(
         ran: QuickDotAI, turnId: Long, result: BackendResult<*>, sinkError: String?, metrics: PerformanceMetrics?,
-        mode: String, startedMs: Long, d: ModelDescriptor, generatedTokens: Int, obs: GenerationObserver?,
+        startedMs: Long, d: ModelDescriptor, generatedTokens: Int, obs: GenerationObserver?,
     ) {
         val stopped = cancelRequested
         cancelRequested = false
@@ -435,22 +432,13 @@ class ChatController(
             )
         }
         val note = error?.let { ChatTurn(nextId(), TurnRole.NOTE, "Error: $it") }
-        val index = runIndex.incrementAndGet()
         val replaced = engine !== ran
         update {
-            val text = turns.firstOrNull { it.id == turnId }?.text ?: ""
             copy(
                 turns = turns.map { if (it.id == turnId) it.copy(streaming = false, stopped = stopped, metrics = turnMetrics) else it } + listOfNotNull(note),
                 streaming = false,
                 // An unload or reload that raced the run already wrote its status; keep it.
                 status = when { error != null -> "Failed: $error"; replaced -> status; else -> "Done." },
-                lastMetrics = metrics ?: lastMetrics,
-                runs = (runs + RunRecord(
-                    index = index, modelId = d.id, mode = mode,
-                    prefillTokens = metrics?.prefillTokens ?: 0, generationTokens = metrics?.generationTokens ?: 0,
-                    ttftMs = metrics?.ttftMs ?: 0.0, tokensPerSec = turnMetrics?.tokensPerSec ?: 0.0,
-                    totalMs = wallMs, output = text,
-                )).takeLast(20),
             )
         }
         obs?.onEngineMetrics(metrics?.prefillDurationMs, metrics?.decodeSteadyMs)

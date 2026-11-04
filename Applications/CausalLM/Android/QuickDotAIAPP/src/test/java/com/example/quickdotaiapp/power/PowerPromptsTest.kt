@@ -40,4 +40,32 @@ class PowerPromptsTest {
         assertNull(PowerPrompts.firstUserContent("[]"))
         assertNull(PowerPrompts.firstUserContent("""[{"role": "assistant", "content": "x"}]"""))
     }
+
+    /** Every benchmark size is cut from the 4K text, about four characters per token, and asks for a long answer. */
+    @Test fun benchPromptsAreCutFromTheFourKTextAndAskForALongAnswer() {
+        val source = File("src/main/res/raw/${PowerPrompts.resourceName(4096)}.txt").readText()
+        for (tokens in PowerPrompts.benchPrefill) {
+            val p = PowerPrompts.bench(source, tokens)
+            val want = PowerPrompts.charsFor(tokens)
+            assertTrue("$tokens: ${p.length} chars for $want", p.length in (want * 0.9).toInt()..want)
+            assertTrue(p.endsWith("\n\n" + PowerPrompts.BENCH_INSTRUCTION))
+            assertTrue("$tokens: the summary instruction must be gone", !p.contains(PowerPrompts.INSTRUCTION))
+        }
+        assertEquals("a b\n\n" + PowerPrompts.BENCH_INSTRUCTION, PowerPrompts.bench("a b", 1024))
+    }
+
+    /** The engine's ceiling: max_seq_len - num_to_generate prompt tokens, num_to_generate answer tokens. */
+    @Test fun packLimitsFollowTheEngineBudget() {
+        assertEquals(PackLimits(2048, 256),
+            PowerPrompts.packLimits("""{"init_seq_len": 2048, "max_seq_len": 2304, "num_to_generate": 256}"""))
+        assertEquals(PackLimits(1153, 127),
+            PowerPrompts.packLimits("""{"init_seq_len": 1280, "max_seq_len": 1280, "num_to_generate": 127}"""))
+        assertEquals(PackLimits(8576, 128),        // LFM2 HTP: the prefill is chunked, init_seq_len is no bound
+            PowerPrompts.packLimits("""{"init_seq_len": 64, "max_seq_len": 8704, "num_to_generate": 128}"""))
+        assertNull(PowerPrompts.packLimits("""{"init_seq_len": 64, "max_seq_len": 8704}"""))
+        assertNull(PowerPrompts.packLimits("not json"))
+        val preset = File("../../res/gemma4/htp_chat/nntr_config.json")
+        assertTrue(preset.path, preset.exists())
+        assertEquals(PackLimits(2048, 256), PowerPrompts.packLimits(preset.readText()))
+    }
 }

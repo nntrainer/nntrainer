@@ -76,8 +76,8 @@ token, the speed and the token count.
   message, loads a `.json` request, or attaches an image for a vision model
   (the NPU models are text only).
 - The library removes the chat turn markers (`<turn|>` and the like) from
-  the stream, so neither the bubble nor the Metrics screen's raw output
-  shows them; the token trace does (Gemma4's `<turn|>` is id 106).
+  the stream, so the bubble does not show them; the token trace does
+  (Gemma4's `<turn|>` is id 106).
 
 **The NPU models have no conversation memory in the app.** Their packs hold
 2,304 positions for the Gemma4 chat preset (a prompt of up to 2,048 tokens
@@ -89,11 +89,28 @@ other engines receive the whole transcript.
 
 ## Metrics
 
-The Metrics screen shows the last run's time to first token, steady decode
-time per token (median over tokens 2 to N), generation and prefill speeds
-with their token counts and durations, and peak memory with the
-initialisation time. A table lists the recent runs, and a collapsible panel
-shows the raw output of the last run, end-of-turn marker included.
+The Metrics screen is a speed benchmark for the loaded model. Pick a prompt
+length (128 to 4K tokens), an answer length (32 to 256 tokens) and the number
+of repeats, then **Run**. The app sends a bundled English text cut to the
+chosen length, asks for a long answer and stops it after the chosen number
+of tokens; nothing typed in Chat is used.
+
+- **Lengths are nominal**: four characters per token. Each run shows the
+  prompt and answer tokens the engine counted (the 1K prompt is about 830
+  Gemma4 tokens). A run whose answer ended before the chosen length is
+  marked.
+- **Results**: the median time to first token (send to the first token in
+  the app), the engine's prefill speed and the decode speed (first token to
+  the last, wall clock), plus one row per run. Every run is appended to
+  `Download/QuickAI/power/bench.csv`.
+- **Limits of the pack**: for native models the app reads the pack's
+  `nntr_config.json` and disables the lengths that do not fit
+  (`max_seq_len - num_to_generate` for the prompt, `num_to_generate` for the
+  answer).
+- **Wait for a cool phone** (off by default) waits up to 90 s before each run
+  for the thermal status to return to normal.
+- The first run after a load is slower to its first token (the HTP graph
+  warms up); the median absorbs it.
 
 ## Power
 

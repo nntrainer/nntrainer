@@ -40,12 +40,15 @@ sealed interface PromptSource {
     @Serializable @SerialName("fixed") data class Fixed(val tokens: Int) : PromptSource
     /** The validated HTP summarization prompt (res/raw/gemma4_moe_messages.json, about 1K tokens). */
     @Serializable @SerialName("htp-summary") data object HtpSummary : PromptSource
+    /** The Metrics benchmark: the bundled 4K text cut to [tokens] nominal tokens, asking for a long answer. */
+    @Serializable @SerialName("bench") data class Bench(val tokens: Int) : PromptSource
 }
 
 fun PromptSource.label(): String = when (this) {
     PromptSource.Composer -> "composer"
     is PromptSource.Fixed -> "fixed-$tokens"
     PromptSource.HtpSummary -> "htp-summary"
+    is PromptSource.Bench -> "bench-$tokens"
 }
 
 @Serializable
