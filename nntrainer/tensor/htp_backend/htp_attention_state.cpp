@@ -126,6 +126,14 @@ void HtpAttentionState::beginHtpPrompt() {
   htp_owns_cache_ = false;
   q_cache_failed = false;
   q2_calibrated = false;
+  // A fresh prompt must not widen its Q range from the preceding request.
+  // Explicit snapshot calibration is loaded after this reset.
+  q2_scale_k.clear();
+  q2_scale_v.clear();
+  q2_q_enc.clear();
+  q2_out_enc.clear();
+  q2_kmax.clear();
+  q2_vmax.clear();
   kv_floor_k_.clear();
   kv_floor_v_.clear();
   htp_rope_table_.clear();
@@ -232,6 +240,24 @@ bool HtpAttentionState::htpDecodeAttention(
       << config_.cache_base;
     const unsigned int seed_rows = pos - config_.cache_base;
     const size_t n = static_cast<size_t>(seed_rows) * wk;
+    if (const char *trace = std::getenv("NNTR_HTP_PREFIX_HASH")) {
+      auto hash = [](const void *data, size_t bytes) {
+        const auto *p = static_cast<const unsigned char *>(data);
+        uint64_t value = 14695981039346656037ull;
+        for (size_t i = 0; i < bytes; ++i)
+          value = (value ^ p[i]) * 1099511628211ull;
+        return value;
+      };
+      const size_t rows = std::min<size_t>(768, seed_rows);
+      const size_t bytes =
+        rows * wk *
+        (ck.getDataType() == ml::train::TensorDim::DataType::FP32 ? 4u : 2u);
+      std::ofstream file(trace, std::ios::app);
+      file << q2_name_ << ',' << pos << ',' << config_.cache_base << ',' << rows
+           << ',' << hash(ck.getData<uint16_t>(), bytes) << ','
+           << hash(cv.getData<uint16_t>(), bytes) << ','
+           << hash(q2_q_enc.data(), q2_q_enc.size() * sizeof(float)) << '\n';
+    }
     auto t_conv = t_seed;
     // The rows the host cache dropped are not in the seed:
     // their |max| goes ahead of it, so the scales cover the whole context
