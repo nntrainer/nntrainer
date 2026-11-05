@@ -453,6 +453,7 @@ if get_option('enable-htp-device-check')
     'htp_prefix_flash_check': 'test/htp/host/prefix_flash_check.cpp',
     'htp_prefill_check': 'test/htp/host/prefill_prefix_check.cpp',
     'htp_calibration_check': 'test/htp/host/attention_calibration_check.cpp',
+    'htp_prefix_grid_bench': 'tools/kv_cache/benchmark_htp_prefix_grid.cpp',
     'htp_prefix_cold_bench': 'tools/kv_cache/benchmark_htp_prefix_cold.cpp',
   }
     executable(check_name,
