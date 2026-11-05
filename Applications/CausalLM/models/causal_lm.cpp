@@ -1207,23 +1207,21 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
       PRE_COMPUTED_CACHE_PATH.clear();
       retire_decode_capture();
     },
-    [this](uint32_t handle) {
+    [](uint32_t handle) {
       nntrainer::get_htp_ops()->release_decode_kv(handle);
-      device_prefill_states_.erase(handle);
     },
     [this]() { setSessionTokenPosition(0); }, max_sessions, max_prefixes);
-  device_kv_manager_->setPrefixCapture(
-    [this](unsigned position, unsigned pending) {
-      const auto id =
-        nntrainer::get_htp_ops()->retain_decode_kv({position, 0u, pending});
-      try {
-        device_prefill_states_.emplace(id, device_prefill_history_);
-      } catch (...) {
-        nntrainer::get_htp_ops()->release_decode_kv(id);
-        throw;
-      }
-      return id;
-    });
+  device_kv_manager_->setPrefixCapture([this](unsigned, unsigned) {
+    // A prefill restore uses host FP16/calibration, never a decode snapshot.
+    // Keep its identity separate from the DSP session handle namespace.
+    uint32_t id = 1;
+    while (device_prefill_states_.count(id))
+      ++id;
+    device_prefill_states_.emplace(id, device_prefill_history_);
+    return id;
+  });
+  device_kv_manager_->setPrefixRelease(
+    [this](uint32_t handle) { device_prefill_states_.erase(handle); });
   device_kv_manager_->setPrefixLengths([this](uint32_t handle) {
     std::vector<unsigned> positions;
     const auto &history = device_prefill_states_.at(handle);

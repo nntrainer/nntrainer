@@ -74,6 +74,11 @@ public:
   void setPrefixCapture(Capture capture) {
     prefix_capture_ = std::move(capture);
   }
+  /** Prefix handles may use a host-only namespace, separate from DSP sessions.
+   */
+  void setPrefixRelease(Release release) {
+    prefix_release_ = std::move(release);
+  }
   /** Leave enough input rows for the backend's block-prefill entry. */
   void setMinimumSuffix(size_t rows) {
     if (!rows)
@@ -84,7 +89,7 @@ public:
     for (const auto &s : sessions_)
       releaseNoThrow(s.second.handle);
     for (const auto &p : prefixes_)
-      releaseNoThrow(p.second.handle);
+      releasePrefixNoThrow(p.second.handle);
   }
   DeviceKVManager(const DeviceKVManager &) = delete;
   DeviceKVManager &operator=(const DeviceKVManager &) = delete;
@@ -209,7 +214,7 @@ public:
                                      [](const auto &a, const auto &b) {
                                        return a.second.used < b.second.used;
                                      });
-      release_(victim->second.handle);
+      releasePrefix(victim->second.handle);
       erase(root_, victim->first);
       prefixes_.erase(victim);
       rebuild();
@@ -223,7 +228,7 @@ public:
       rebuild();
     } catch (...) {
       prefixes_.erase(p.handle);
-      releaseNoThrow(p.handle);
+      releasePrefixNoThrow(p.handle);
       // Tree publication is rebuilt atomically, so an older index cannot
       // contain this unpublished handle.
       throw;
@@ -231,7 +236,7 @@ public:
   }
   void clearPrefixes() {
     for (auto it = prefixes_.begin(); it != prefixes_.end();) {
-      release_(it->second.handle);
+      releasePrefix(it->second.handle);
       erase(root_, it->first);
       it = prefixes_.erase(it);
     }
@@ -333,10 +338,21 @@ private:
       } catch (...) { /* DSP teardown also frees handles. */
       }
   }
+  void releasePrefix(uint32_t handle) {
+    (prefix_release_ ? prefix_release_ : release_)(handle);
+  }
+  void releasePrefixNoThrow(uint32_t handle) noexcept {
+    if (handle)
+      try {
+        releasePrefix(handle);
+      } catch (...) {
+      }
+  }
   Capture capture_;
   Capture prefix_capture_;
   Restore restore_;
   Release release_;
+  Release prefix_release_;
   std::function<void()> reset_;
   PrefixMin prefix_min_;
   PrefixLengths prefix_lengths_;

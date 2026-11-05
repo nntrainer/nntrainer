@@ -92,6 +92,38 @@ int main() {
   }
   assert(live.empty());
   {
+    std::set<uint32_t> device, host;
+    uint32_t next_device = 1;
+    {
+      Manager m(
+        [&](unsigned, unsigned) {
+          device.insert(next_device);
+          return next_device++;
+        },
+        [&](uint32_t id, unsigned position) {
+          assert(position ? host.count(id) : device.count(id));
+        },
+        [&](uint32_t id) { assert(device.erase(id)); }, [] {}, 2, 1);
+      m.setPrefixCapture([&](unsigned, unsigned) {
+        assert(host.insert(1).second);
+        return 1;
+      });
+      m.setPrefixRelease([&](uint32_t id) { assert(host.erase(id)); });
+      m.publish({10, 20, 30}, 3, 9);
+      assert(m.reuse({10, 20, 30, 40}) == 3);
+      const auto child =
+        m.fork(3, 9); // DSP handle 1 collides with host prefix 1
+      m.select(child, 3, 9);
+      m.clearPrefixes();
+      assert(host.empty() && device.count(1));
+      m.publish({40, 50, 60}, 3, 9);
+      m.publish({70, 80, 90}, 3, 9); // host LRU eviction must not release DSP 1
+      assert(device.count(1) && host.count(1));
+    }
+    assert(device.empty() && host.empty());
+  }
+  assert(live.empty());
+  {
     unsigned selected = 0;
     Manager m(
       [&](unsigned, unsigned) {
