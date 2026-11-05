@@ -1,0 +1,226 @@
+[
+  {
+    "input_tokens": 1024,
+    "output_tokens": 128,
+    "runs": 3,
+    "output_ids_identical": true,
+    "prefill_tps": {
+      "median": 599.883,
+      "min": 573.027,
+      "max": 627.451
+    },
+    "prefill_ms": {
+      "median": 1707.0,
+      "min": 1632.0,
+      "max": 1787.0
+    },
+    "decode_tps": {
+      "median": 18.4272,
+      "min": 18.2288,
+      "max": 18.9439
+    },
+    "decode_ms": {
+      "median": 6892.0,
+      "min": 6704.0,
+      "max": 6967.0
+    },
+    "peak_memory_kib": {
+      "median": 3896152,
+      "min": 3895820,
+      "max": 3896692
+    },
+    "honest_peak_kib": {
+      "median": 3896152,
+      "min": 3895820,
+      "max": 3896692
+    },
+    "ttft_ms": {
+      "median": 1713.61,
+      "min": 1636.41,
+      "max": 1788.86
+    },
+    "first_token_ms": {
+      "median": 215.176,
+      "min": 205.099,
+      "max": 217.332
+    },
+    "steady_ms": {
+      "median": 51.1985,
+      "min": 49.3139,
+      "max": 51.7166
+    },
+    "e2e_ms": {
+      "median": 8683.0,
+      "min": 8342.0,
+      "max": 8683.0
+    }
+  },
+  {
+    "input_tokens": 2048,
+    "output_tokens": 128,
+    "runs": 3,
+    "output_ids_identical": true,
+    "prefill_tps": {
+      "median": 665.367,
+      "min": 655.15,
+      "max": 670.157
+    },
+    "prefill_ms": {
+      "median": 3078.0,
+      "min": 3056.0,
+      "max": 3126.0
+    },
+    "decode_tps": {
+      "median": 18.068,
+      "min": 18.0398,
+      "max": 18.787
+    },
+    "decode_ms": {
+      "median": 7029.0,
+      "min": 6760.0,
+      "max": 7040.0
+    },
+    "peak_memory_kib": {
+      "median": 3996552,
+      "min": 3996444,
+      "max": 3996572
+    },
+    "honest_peak_kib": {
+      "median": 3996552,
+      "min": 3996444,
+      "max": 3996572
+    },
+    "ttft_ms": {
+      "median": 3077.07,
+      "min": 3057.16,
+      "max": 3127.78
+    },
+    "first_token_ms": {
+      "median": 210.975,
+      "min": 205.505,
+      "max": 214.133
+    },
+    "steady_ms": {
+      "median": 52.0539,
+      "min": 50.2184,
+      "max": 52.1355
+    },
+    "e2e_ms": {
+      "median": 10102.0,
+      "min": 9891.0,
+      "max": 10112.0
+    }
+  },
+  {
+    "input_tokens": 4096,
+    "output_tokens": 128,
+    "runs": 3,
+    "output_ids_identical": true,
+    "prefill_tps": {
+      "median": 615.477,
+      "min": 615.385,
+      "max": 620.7
+    },
+    "prefill_ms": {
+      "median": 6655.0,
+      "min": 6599.0,
+      "max": 6656.0
+    },
+    "decode_tps": {
+      "median": 17.3758,
+      "min": 17.2601,
+      "max": 17.8096
+    },
+    "decode_ms": {
+      "median": 7309.0,
+      "min": 7131.0,
+      "max": 7358.0
+    },
+    "peak_memory_kib": {
+      "median": 4171472,
+      "min": 4171328,
+      "max": 4171700
+    },
+    "honest_peak_kib": {
+      "median": 4171472,
+      "min": 4171328,
+      "max": 4171700
+    },
+    "ttft_ms": {
+      "median": 6661.35,
+      "min": 6600.93,
+      "max": 6662.21
+    },
+    "first_token_ms": {
+      "median": 219.203,
+      "min": 207.944,
+      "max": 228.233
+    },
+    "steady_ms": {
+      "median": 54.2658,
+      "min": 53.2959,
+      "max": 54.5059
+    },
+    "e2e_ms": {
+      "median": 13916.0,
+      "min": 13799.0,
+      "max": 14025.0
+    }
+  },
+  {
+    "input_tokens": 8192,
+    "output_tokens": 128,
+    "runs": 3,
+    "output_ids_identical": true,
+    "prefill_tps": {
+      "median": 560.482,
+      "min": 558.838,
+      "max": 564.11
+    },
+    "prefill_ms": {
+      "median": 14616.0,
+      "min": 14522.0,
+      "max": 14659.0
+    },
+    "decode_tps": {
+      "median": 15.9028,
+      "min": 15.6231,
+      "max": 15.9608
+    },
+    "decode_ms": {
+      "median": 7986.0,
+      "min": 7957.0,
+      "max": 8129.0
+    },
+    "peak_memory_kib": {
+      "median": 4519592,
+      "min": 4519032,
+      "max": 4519692
+    },
+    "honest_peak_kib": {
+      "median": 4519592,
+      "min": 4519032,
+      "max": 4519692
+    },
+    "ttft_ms": {
+      "median": 14625.6,
+      "min": 14529.6,
+      "max": 14666.5
+    },
+    "first_token_ms": {
+      "median": 224.536,
+      "min": 217.734,
+      "max": 234.925
+    },
+    "steady_ms": {
+      "median": 59.2641,
+      "min": 59.2203,
+      "max": 59.7504
+    },
+    "e2e_ms": {
+      "median": 22630.0,
+      "min": 22521.0,
+      "max": 22761.0
+    }
+  }
+]

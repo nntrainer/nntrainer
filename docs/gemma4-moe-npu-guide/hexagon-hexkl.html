@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Hexagon SDK &amp; HexKL — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>Hexagon SDK &amp; HexKL — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="hexagon-hexkl.html">
+<link rel="alternate" hreflang="ko" href="ko/hexagon-hexkl.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/hexagon-hexkl.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="hexagon-hexkl.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/hexagon-hexkl.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="hexagon-hexkl.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li class="nav-parent-active"><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html" aria-current="page">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Get started</span><span aria-hidden="true">/</span><span>Hexagon SDK &amp; HexKL</span></div>
+<article><h1 id="3-install-hexagon-sdk-and-hexkl-beta2">3. Install Hexagon SDK and HexKL beta2</h1>
+<h2 id="get-the-qualcomm-packages">Get the Qualcomm packages</h2>
+<p>Use the official <a href="https://softwarecenter.qualcomm.com/catalog/item/Hexagon_SDK">Qualcomm Software Center Hexagon SDK catalog</a>
+and <a href="https://qpm.qualcomm.com/">Qualcomm Package Manager</a> entry points.
+Sign in with your Qualcomm account when requested. Select <strong>Hexagon SDK
+6.4.0.1</strong> for Linux and install its <strong>Hexagon Tools 19.0.04</strong> component. Use the
+installer's reported destination; the examples below use
+<code>$HOME/Qualcomm/Hexagon_SDK/6.4.0.1</code>.</p>
+<p>If the portal requires the Linux Package Manager application, download its
+Debian package, install that downloaded file, then open the application and
+sign in:</p>
+<pre tabindex="0"><code class="language-bash"># Replace the filename with the package you actually downloaded.
+sudo apt install &quot;$HOME/Downloads/QualcommPackageManager3.3.0.133.0.Linux-x86.deb&quot;
+</code></pre>
+<p>In the Qualcomm catalog, also locate <strong>Hexagon Kernel Library (HexKL)</strong> and
+select <strong>1.0 beta2</strong>. It is distributed separately from the SDK. The
+<a href="https://softwarecenter.qualcomm.com/catalog/catalog-suite/Qualcomm%C2%AE%20AI%20Stack">Qualcomm AI Stack catalog</a>
+is another entry point to this package. Portal screens and version availability
+depend on your account. If the required version is unavailable, request access
+from Qualcomm or your package provider; do not silently replace it with another
+release. There is no anonymous package-download URL assumed by this guide.</p>
+<p>Extract the supplied beta2 ZIP. This example uses the archive name
+<code>hexkl-1.0-beta.2.zip</code>, whose top-level directory is <code>hexkl_addon</code>:</p>
+<pre tabindex="0"><code class="language-bash">mkdir -p &quot;$HOME/Qualcomm/HexKL/1.0-beta2&quot;
+unzip &quot;$HOME/Downloads/hexkl-1.0-beta.2.zip&quot; -d &quot;$HOME/Qualcomm/HexKL/1.0-beta2&quot;
+export HEXKL_ROOT=&quot;$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon&quot;
+head -n 8 &quot;$HEXKL_ROOT/README.md&quot;
+</code></pre>
+<p>The README should identify <strong>1.0 Beta.2</strong>. If your download has an additional
+outer archive, extract it first and point <code>HEXKL_ROOT</code> at the directory that
+actually contains <code>include/</code> and <code>lib/</code>.</p>
+<h2 id="set-the-environment">Set the environment</h2>
+<p>On the <strong>host</strong>, source the installed SDK's environment script first, then set
+the Android and HexKL paths explicitly:</p>
+<pre tabindex="0"><code class="language-bash">source &quot;$HOME/Qualcomm/Hexagon_SDK/6.4.0.1/setup_sdk_env.source&quot;
+
+export HEXKL_ROOT=&quot;$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon&quot;
+export HEXKL_SDK_VER=6.4.0.1
+export HEXKL_TOOLS_VARIANT=toolv19
+export HEXKL_ARCH=armv8_android26
+export HEX_ARCH=v81
+export ANDROID_HOME=&quot;$HOME/Android/Sdk&quot;
+export ANDROID_NDK=&quot;$ANDROID_HOME/ndk/30.0.16248370&quot;
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=&quot;$JAVA_HOME/bin:$HOME/.cargo/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH&quot;
+</code></pre>
+<p><code>setup_sdk_env.source</code> supplies <code>HEXAGON_SDK_ROOT</code> and
+<code>DEFAULT_HEXAGON_TOOLS_ROOT</code>. If you installed the SDK elsewhere, change the
+<code>source</code> path. Re-run this block whenever you start a fresh terminal, or save
+these commands in a shell file outside the source checkout and source it.</p>
+<blockquote>
+<p><strong>Use 6.4.0.1 for both the Hexagon SDK and the HexKL library selection.</strong>
+HexKL's <code>lib/&lt;version&gt;</code> directory names the SDK version the libraries target.
+<code>HEXKL_SDK_VER=6.4.0.1</code> selects <code>lib/6.4.0.1</code>: the Android runtime is
+<code>armv8_android26/libsdkl.so</code>, and the DSP build links
+<code>hexagon_toolv19_v81/libhexkl_micro.a</code> below it. Both build scripts default
+to this version. The DSP script no longer selects the newest available
+directory automatically. Check that the matching directory exists; do not
+rename a different version's directory to make the path check pass.</p>
+</blockquote>
+<p>Check the paths before building:</p>
+<pre tabindex="0"><code class="language-bash">printf 'SDK: %s\nTools: %s\nHexKL: %s\n' \
+  &quot;$HEXAGON_SDK_ROOT&quot; &quot;$DEFAULT_HEXAGON_TOOLS_ROOT&quot; &quot;$HEXKL_ROOT&quot;
+
+ls &quot;$HEXAGON_SDK_ROOT/setup_sdk_env.source&quot; \
+   &quot;$HEXAGON_SDK_ROOT/rtos/qurt/computev81/include/qurt&quot; \
+   &quot;$HEXKL_ROOT/include/hexkl_micro.h&quot; \
+   &quot;$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so&quot; \
+   &quot;$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_toolv19_v81/libhexkl_micro.a&quot;
+
+&quot;$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang&quot; --version
+</code></pre>
+<p>Every path must exist, and the compiler must be the Tools 19.0.04 installation.
+<code>DEFAULT_HEXAGON_TOOLS_ROOT</code> names the directory <strong>above <code>Tools/</code></strong>, not <code>Tools/bin</code>.
+HexKL provides prebuilt libraries: building all of its examples is not required
+for nntrainer. Its generic <code>libhexkl_skel.so</code> is not a substitute for nntrainer's
+<code>libnntr_hvx_skel.so</code>.</p>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="linux-android-tools.html"><small>Previous</small><span>Linux &amp; Android tools</span></a><a class="pager-next" href="source-device.html"><small>Next</small><span>Source &amp; device setup</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 5, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#get-the-qualcomm-packages">Get the Qualcomm packages</a></li><li><a href="#set-the-environment">Set the environment</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

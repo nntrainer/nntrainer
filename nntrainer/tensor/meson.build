@@ -16,6 +16,11 @@ tensor_sources = [
   'q6_k_tensor.cpp',
   'q4_0_tensor.cpp',
   'q4_0_utils.cpp',
+  'htp_backend/htp_q4_0_convert.cpp',
+  'htp_backend/htp_act_quant.cpp',
+  'htp_backend/htp_runtime_config.cpp',
+  # SDK-free attention dispatch also supports CPU fallback and fake-op tests.
+  'htp_backend/htp_attention_state.cpp',
   'qs4cx_tensor.cpp',
   'tensor_dim.cpp',
   'var_grad.cpp',
@@ -46,6 +51,13 @@ tensor_headers = [
   'q4_k_tensor.h',
   'q4_0_tensor.h',
   'q4_0_utils.h',
+  'htp_backend/htp_q4_0_convert.h',
+  'htp_wh_layout.h',
+  'htp_wh_palette.h',
+  'htp_backend/htp_runtime_config.h',
+  'htp_backend/htp_expert_pool.h',
+  'swiglu_det.h',
+  'htp_backend/htp_act_quant.h',
   'qs4cx_tensor.h',
   'weight.h',
   'var_grad.h',    
@@ -63,6 +75,12 @@ tensor_headers = [
   'swap_device.h',
   'task.h'
 ]
+
+# htp_wh_palette.h includes "htp_backend/hvx/hvx_expand_i2i4.h" (stdint only).
+# Installed headers are flat, so install it under htp_backend/hvx/ next to them
+# to make that relative include resolve for out-of-tree consumers.
+install_headers('htp_backend/hvx/hvx_expand_i2i4.h',
+  install_dir: nntrainer_includedir / 'htp_backend' / 'hvx')
 
 subdir('cpu_backend')
 nntrainer_inc += include_directories('cpu_backend')
@@ -95,8 +113,9 @@ if get_option('enable-htp')
   subdir('htp_backend')
   nntrainer_inc += include_directories('htp_backend')
   nntrainer_inc_abs += meson.current_source_dir() / 'htp_backend'
-  # Hexagon SDK system headers needed by htp_backend.cpp (<remote.h>, <AEEStdErr.h>,
-  # <sdkl.h>).  hexagon_sdk_root is set in the top-level meson.build HTP block
+  # Hexagon SDK system headers (<remote.h>, <AEEStdErr.h>) that the Stage 2
+  # FastRPC client stub (docs/htp_attention/40_moe_ffn_htp_task.md) will need.
+  # hexagon_sdk_root is set in the top-level meson.build HTP block
   # (fs.parent(fs.parent(hexkl_root))) and is in meson's flat scope here.
   nntrainer_inc_abs += hexagon_sdk_root / 'incs'
   nntrainer_inc_abs += hexagon_sdk_root / 'incs' / 'stddef'

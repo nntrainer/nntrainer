@@ -18,6 +18,10 @@
 #include <compute_ops.h>
 #include <context_data.h>
 #include <htp_backend.h>
+#include <htp_decode_runtime.h>
+#include <neuralnet.h>
+#include <nntr_htp_decode_hook.h>
+#include <tensor.h>
 
 namespace nntrainer {
 
@@ -34,6 +38,57 @@ HtpContext::createLayerObject(const int int_key,
   return AppContext::Global().createLayerObject(int_key, properties);
 }
 
+sharedConstTensors HtpContext::runDecode(NeuralNetwork &nn, unsigned int from,
+                                         unsigned int to,
+                                         const sharedConstTensors &input,
+                                         const sharedConstTensors &label) {
+  // Keep initial prefill and single-row decode on their original hot paths.
+  auto *runtime = to > from && to - from > 1u && htpDecodeActive()
+                    ? getHtpDecodeRuntime()
+                    : nullptr;
+  if (!runtime || !runtime->canContinue(from) || !label.empty())
+    return Context::runDecode(nn, from, to, input, label);
+
+  // The supported causal graph has one token-ID vector and one vocabulary row.
+  // Cache inputs retain their original MemoryData and are never reseeded here.
+  size_t token_input = input.size();
+  for (size_t i = 0; i < input.size(); ++i) {
+    const auto &t = *input[i];
+    if (t.getDataType() == Tdatatype::FP32 && t.batch() == 1u &&
+        t.channel() == 1u && t.height() == 1u && t.width() >= to - from) {
+      if (token_input != input.size())
+        return Context::runDecode(nn, from, to, input, label);
+      token_input = i;
+    }
+  }
+  if (token_input == input.size())
+    return Context::runDecode(nn, from, to, input, label);
+  runtime->checkContinuationRange(from, to);
+
+  auto token = std::make_shared<Tensor>(input[token_input]->getDim(), true);
+  auto step_input = input;
+  step_input[token_input] = token;
+  const float *ids = input[token_input]->getData<float>();
+  HtpDecodeRuntime::LogitsRequest logits(*runtime);
+  sharedConstTensors result;
+  for (unsigned pos = from; pos < to; ++pos) {
+    token->getData<float>()[0] = ids[pos - from];
+    // Intermediate rows need no vocabulary copy. The last row fulfils the
+    // tensor-output contract of multi-token prefill, including sampling.
+    logits.set(pos + 1u == to);
+    result = nn.incremental_forwarding(pos, pos + 1u, step_input, label, false);
+    if (result.size() != 1u || result[0]->size() != runtime->graph_words_[5] ||
+        result[0]->getDataType() != Tdatatype::FP32)
+      throw std::logic_error(
+        "HTP continuation: expected one FP32 vocabulary row");
+    if (runtime->have_id_) {
+      unsigned int unused;
+      get_htp_ops()->take_decode_token_id(&unused);
+    }
+  }
+  return result;
+}
+
 void HtpContext::initialize() noexcept {
   // Ensure the CPU backend ops table exists — it is both the fallback
   // and the base class of HtpComputeOps. Go through ensureComputeOps()
@@ -47,24 +102,12 @@ void HtpContext::initialize() noexcept {
   if (!cd)
     return;
 
-  // Wrap the NPU ops installation in try/catch so that a late exception from
-  // HtpBackend::global() or get_htp_ops() (e.g., missing skel, driver error)
-  // degrades to CPU rather than propagating out of this noexcept function
-  // and hitting std::terminate.  Pattern mirrors ClContext::initialize().
+  // Bind the ops table lazily. A CPU-only API handle must not open the DSP
+  // before a later HTP load supplies its library directory and fixed options.
+  // The accelerated operations themselves check HtpBackend::enabled().
   try {
-    // NPU up -> HTP ops (shgemm on NPU, rest delegated to CPU via
-    // inheritance). NPU down -> plain CPU ops, so an engine="htp" model
-    // still runs, transparently, on the CPU.
-    if (HtpBackend::global().enabled()) {
-      cd->setComputeOps(get_htp_ops());
-      // Model tensors (weights, activations) keep the default CPU allocator.
-      // The kernels stage into NPU-accessible buffers per call via
-      // sdkl_npu_alloc; routing every model tensor through an NPU allocator
-      // exhausts the DMA pool on a full transformer model.
-    } else
-      cd->setComputeOps(get_cpu_ops());
+    cd->setComputeOps(get_htp_ops());
   } catch (...) {
-    // HtpBackend::global() or get_htp_ops() threw — degrade to CPU.
     cd->setComputeOps(get_cpu_ops());
   }
 }

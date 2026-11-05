@@ -401,7 +401,42 @@ TEST_P(MemoryPlannerValidate, validate_memory_partial_overlap) {
   pool.deallocate();
 }
 
+/**
+ * @brief Reuse and split a larger expired block below a live residual.
+ */
+TEST(MemoryPlanner, reuse_larger_expired_block) {
+  nntrainer::OptimizedV1Planner planner(true);
+  const std::vector<size_t> sizes{128, 32, 48, 80};
+  const std::vector<std::pair<unsigned int, unsigned int>> validity{
+    {0, 1}, {0, 4}, {1, 3}, {1, 3}};
+  std::vector<size_t> offsets;
+  std::vector<bool> gradients;
+  const size_t bytes =
+    planner.planLayout(sizes, validity, offsets, gradients, 0);
+  EXPECT_EQ(bytes, 160u);
+  EXPECT_TRUE(validateIntervalOverlap(validity, sizes, offsets));
+  EXPECT_TRUE(validateOverflow(sizes, offsets, bytes));
+}
+
+/**
+ * @brief Adjacent expired blocks form one reusable gap.
+ */
+TEST(MemoryPlanner, coalesce_expired_blocks) {
+  nntrainer::OptimizedV1Planner planner(true);
+  const std::vector<size_t> sizes{32, 48, 16, 64};
+  const std::vector<std::pair<unsigned int, unsigned int>> validity{
+    {0, 1}, {0, 2}, {0, 4}, {2, 3}};
+  std::vector<size_t> offsets;
+  std::vector<bool> gradients;
+  const size_t bytes =
+    planner.planLayout(sizes, validity, offsets, gradients, 0);
+  EXPECT_EQ(bytes, 96u);
+  EXPECT_TRUE(validateIntervalOverlap(validity, sizes, offsets));
+  EXPECT_TRUE(validateOverflow(sizes, offsets, bytes));
+}
+
 GTEST_PARAMETER_TEST(
   MemoryPlanner, MemoryPlannerValidate,
   ::testing::Values(std::make_shared<nntrainer::BasicPlanner>(),
-                    std::make_shared<nntrainer::OptimizedV1Planner>()));
+                    std::make_shared<nntrainer::OptimizedV1Planner>(),
+                    std::make_shared<nntrainer::OptimizedV1Planner>(true)));

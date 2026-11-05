@@ -41,6 +41,45 @@ __attribute__((constructor)) static void register_public_descriptors() {
      QDA_CAP_STREAMING,
      "GEMMA4_CPU", /* get_model_name_from_type(CAUSAL_LM_MODEL_GEMMA4_CPU) */
      "Gemma4ForCausalLM" /* Factory registration pending */},
+  /* GPU (OpenCL/Adreno) arm of the same architecture. A separate entry
+     rather than B(0)|B(1) on the one above, because the two backends read
+     DIFFERENT on-device packs -- the GPU arm is the QS4CX + fp16-sidecar
+     pack with its pre-packed .v8cpack -- and config_name is what selects the
+     directory (g_model_path_map: GEMMA4_GPU -> gemma4_gpu). Present only on
+     an OpenCL build; advertising GPU on a CPU-only library would be an empty
+     claim. */
+#ifdef ENABLE_OPENCL
+    {"gemma4-gpu", "gemma4", "Gemma4 (GPU)", QDA_RUNTIME_NATIVE, B(1),
+     QDA_CAP_STREAMING, "GEMMA4_GPU", "Gemma4ForCausalLM"},
+    /* Gemma4 26B-A4B MoE (TQ2CX experts + QS4ACX dense) on the GPU, experts
+       streamed from the pack (moe_fsu). Its own directory
+       (GEMMA4_MOE_GPU -> gemma4_26b_moe_gpu) so it does not collide with the
+       E2B pack; the MoE class is picked from config.json
+       (text_config.enable_moe_block) by the Gemma4ForCausalLM factory. */
+    {"gemma4-26b-moe-gpu", "gemma4", "Gemma4 26B-A4B MoE (GPU)",
+     QDA_RUNTIME_NATIVE, B(1), QDA_CAP_STREAMING, "GEMMA4_MOE_GPU",
+     "Gemma4ForCausalLM"},
+#endif
+#ifdef ENABLE_HEXKL
+    {"lfm2-24ba2b-htp", "lfm2", "LFM2 24B A2B MoE (HTP)", QDA_RUNTIME_NATIVE,
+     B(2), QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API, "LFM2-24BA2B-HTP",
+     "Lfm2MoeForCausalLM"},
+    {"gemma4-26b-a4b-htp", "gemma4-26b-a4b", "Gemma4 26B A4B MoE (HTP)",
+     QDA_RUNTIME_NATIVE, B(2), QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API,
+     "GEMMA4-26B-A4B-HTP", "Gemma4ForCausalLM"},
+    /* Same weights, a 30k-context pack for the agent KV-prefix demo. */
+    {"gemma4-26b-a4b-htp-long", "gemma4-26b-a4b",
+     "Gemma4 26B A4B MoE (HTP, 30k demo)", QDA_RUNTIME_NATIVE, B(2),
+     QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API, "GEMMA4-26B-A4B-HTP-LONG",
+     "Gemma4ForCausalLM"},
+    /* The rotated checkpoint converted to TL2 / affine WH (2-bit experts,
+       4-bit tail layers 28-29, online Hadamard). Short context. */
+    /* The sample resolves one model per family/runtime/backend tuple. */
+    {"gemma4-26b-a4b-htp-2bit-4bit", "gemma4-26b-a4b-2bit-4bit",
+     "Gemma4 26B A4B MoE (HTP, rotated 2/4-bit)", QDA_RUNTIME_NATIVE, B(2),
+     QDA_CAP_STREAMING | QDA_CAP_MESSAGES_API, "GEMMA4-26B-A4B-HTP-2BIT-4BIT",
+     "Gemma4ForCausalLM"},
+#endif
     {"vjepa-lfm2", "vjepa", "V-JEPA 2 + LFM2 (CPU)", QDA_RUNTIME_NATIVE, B(0),
      QDA_CAP_STREAMING | QDA_CAP_MULTIMODAL | QDA_CAP_MESSAGES_API |
        QDA_CAP_MULTI_IMAGE,

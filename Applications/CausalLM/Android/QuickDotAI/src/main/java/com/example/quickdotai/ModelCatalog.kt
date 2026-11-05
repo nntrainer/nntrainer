@@ -17,9 +17,9 @@ import android.util.Log
 import org.json.JSONArray
 
 enum class RuntimeKind { NATIVE, LITERT }
-enum class Capability { STREAMING, MESSAGES_API, MULTIMODAL, TOOL_USE, EMBEDDING, MULTI_IMAGE, SPECULATIVE }
+enum class Capability { STREAMING, MESSAGES_API, MULTIMODAL, TOOL_USE, EMBEDDING, MULTI_IMAGE, SPECULATIVE, PLANAR_CHW, VISION_ENCODER }
 
-data class ModelDescriptor(
+data class ModelDescriptor @JvmOverloads constructor(
     val id: String,
     val family: String,
     val displayName: String,
@@ -27,7 +27,25 @@ data class ModelDescriptor(
     val backends: Set<BackendType>,
     val capabilities: Set<Capability>,
     val sdVariantId: String? = null,
-)
+) {
+    /**
+     * Source/binary compatibility with the six-field descriptor of the 0.5.x
+     * SDK: callers compiled against `copy(id, ..., capabilities)` keep
+     * linking. The extra [sdVariantId] field is carried over unchanged. The
+     * six-parameter overload is the more specific one, so a call that omits
+     * [sdVariantId] resolves here, not to the generated seven-parameter copy.
+     */
+    fun copy(
+        id: String = this.id,
+        family: String = this.family,
+        displayName: String = this.displayName,
+        runtime: RuntimeKind = this.runtime,
+        backends: Set<BackendType> = this.backends,
+        capabilities: Set<Capability> = this.capabilities,
+    ): ModelDescriptor = copy(
+        id, family, displayName, runtime, backends, capabilities, this.sdVariantId
+    )
+}
 
 /** String constants for public model ids. */
 object ModelIds {
@@ -37,6 +55,8 @@ object ModelIds {
     const val FUNCTION_GEMMA    = "function-gemma"
     const val GEMMA4            = "gemma4"       // LiteRT only
     const val GEMMA4_CPU        = "gemma4-cpu"
+    const val GEMMA4_26B_A4B_HTP = "gemma4-26b-a4b-htp"
+    const val LFM2_24BA2B_HTP    = "lfm2-24ba2b-htp"
     const val GEMMA4_E2B_QNN    = "gemma4-e2b-qnn"
     const val VJEPA_QNN         = "vjepa2-qnn"   // V-JEPA 2 multi-image (QNN)
     const val VJEPA_LFM2        = "vjepa-lfm2"        // V-JEPA 2 + LFM2 video (CPU)
@@ -73,7 +93,17 @@ object ModelCatalog {
     private fun build(): List<ModelDescriptor> {
         val native = if (NativeCausalLm.ensureLoaded()) {
             try {
-                parse(NativeCausalLm.nativeQueryCatalog())
+                val parsed = parse(NativeCausalLm.nativeQueryCatalog())
+                // Query after the catalog: the first catalog read is what loads
+                // the plugin, so its outcome is only known now. A plugin that
+                // was shipped but failed must not look like a public build.
+                val ext = NativeCausalLm.extensionStatus()
+                if (ext.state == NativeCausalLm.ExtensionState.FAILED) {
+                    Log.e(TAG, "model-extension plugin unusable, catalog is public models only: ${ext.message}")
+                } else {
+                    Log.i(TAG, "model-extension plugin: ${ext.message}")
+                }
+                parsed
             } catch (t: Throwable) {
                 Log.e(TAG, "nativeQueryCatalog failed; using fallback", t)
                 nativeFallback
@@ -112,6 +142,8 @@ object ModelCatalog {
         if (bits and 0b010000 != 0) add(Capability.EMBEDDING)
         if (bits and 0b100000 != 0) add(Capability.MULTI_IMAGE)
         if (bits and 0b10000000 != 0) add(Capability.SPECULATIVE)
+        if (bits and 0b1000000 != 0) add(Capability.VISION_ENCODER)
+        if (bits and 0b100000000 != 0) add(Capability.PLANAR_CHW)
     }
 
     fun byId(id: String): ModelDescriptor? = all().firstOrNull { it.id == id }
@@ -130,9 +162,9 @@ object ModelCatalog {
         Capability.MULTIMODAL, Capability.TOOL_USE
     )
 
-    /** 생성/실행 가능한 모델인지(EMBEDDING 전용 모델은 false). */
+    /** 생성/실행 가능한 모델인지(embedding 전용 모델과 vision encoder는 false). */
     fun isSelectable(d: ModelDescriptor): Boolean =
-        d.capabilities.any { it in SELECTABLE_CAPS }
+        Capability.VISION_ENCODER !in d.capabilities && d.capabilities.any { it in SELECTABLE_CAPS }
 
     /** 피커에 노출할 모델만. all()은 전체를 그대로 유지. */
     fun selectable(): List<ModelDescriptor> = all().filter { isSelectable(it) }

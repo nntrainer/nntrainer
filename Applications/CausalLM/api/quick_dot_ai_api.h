@@ -29,8 +29,12 @@
 
 #define __CAUSAL_LM_API_H__
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(QUICK_DOT_AI_STATIC)
+#ifdef QUICK_DOT_AI_BUILDING_LIBRARY
 #define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT __declspec(dllimport)
+#endif
 #else
 #define WIN_EXPORT
 #endif
@@ -55,6 +59,20 @@ typedef enum {
   CAUSAL_LM_ERROR_UNKNOWN = 99
 } ErrorCode;
 
+/**
+ * @brief Compute backend requested for a load.
+ *
+ * The values are indexed by the Kotlin/JNI side and by every ModelDescriptor
+ * `backend_mask` bit: never renumber them, append new ones.
+ *
+ * CPU and GPU select the nntrainer compute engine ("cpu" / "gpu") for the
+ * process, through nntrainer::requestEngine() -- no environment variable is
+ * set. The engine is chosen once per process by the first load; a later load
+ * that asks for the other one is logged and runs on the first. An NNTR_ENGINE
+ * exported by the caller takes priority over the request. A CPU request does
+ * not bring up the OpenCL context. GPU on a build without OpenCL runs on CPU
+ * (logged). NPU models are their own runtime and leave the engine alone.
+ */
 typedef enum {
   CAUSAL_LM_BACKEND_CPU = 0,
   CAUSAL_LM_BACKEND_GPU = 1,
@@ -228,6 +246,14 @@ WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
 #endif /* __TRANSFORMER_H__ */
 
 /**
+ * @brief Diagnostic for the last loadModelHandleByName call on the calling
+ * thread.
+ * @return Borrowed string, valid until the next load on this thread.
+ *         Empty after a successful load. Copy it before crossing threads.
+ */
+WIN_EXPORT const char *getLastModelLoadError(void);
+
+/**
  * @brief Load model by string id (T4 catalog path).
  *
  * Looks up the descriptor from the registry by @p model_id, validates the
@@ -336,6 +362,21 @@ WIN_EXPORT ErrorCode loadQnnKvCacheHandle(CausalLmHandle handle,
 WIN_EXPORT ErrorCode resetQnnKvCacheHandle(CausalLmHandle handle);
 
 /**
+ * @brief Copy a human-readable description of the most recent failure on
+ *        this handle into @p buffer (NUL-terminated, truncated to
+ *        @p buffer_len). Empty string when the last run succeeded or no
+ *        run has failed yet. Complements the ErrorCode return values,
+ *        which cannot say *why* a call failed.
+ * @param handle     Handle returned by loadModelHandle
+ * @param buffer     Caller-owned output buffer
+ * @param buffer_len Size of @p buffer in bytes
+ * @return CAUSAL_LM_ERROR_NONE, or CAUSAL_LM_ERROR_INVALID_PARAMETER when
+ *         @p handle or @p buffer is NULL or @p buffer_len is 0
+ */
+WIN_EXPORT ErrorCode getLastErrorMessageHandle(CausalLmHandle handle,
+                                               char *buffer, size_t buffer_len);
+
+/**
  * @brief Retrieve performance metrics of the last run for a given handle.
  * @param handle  Handle returned by loadModelHandle
  * @param metrics Pointer to a PerformanceMetrics struct to be filled
@@ -424,7 +465,8 @@ WIN_EXPORT ErrorCode runModelHandleStreaming(CausalLmHandle handle,
 
 /**
  * @brief Encode a single text prompt into a sentence-embedding vector using a
- *        handle whose models[0] is an embedding model (e.g. Ouro / "ouro").
+ *        handle whose models[0] is an embedding model (an embedding model from
+ * the catalog).
  *
  * On success, *out_embedding points to a freshly allocated array of *out_dim
  * floats (the batch-0 embedding). The caller OWNS this buffer and MUST release
@@ -666,6 +708,27 @@ WIN_EXPORT ErrorCode runMultimodalMultiImageHandleWithMessagesStreaming(
  *     {"type": "function", "function": {"name": "call", "description": "..."}}
  *   ]
  * }
+ *
+ * Every request starts a fresh session (the KV position is rewound before the
+ * run), like every other run call on a handle. "continue_session": true keeps
+ * the KV the handle already holds: send only the new turn.
+ *
+ * Saved KV prefix (instead of "messages"):
+ * {
+ *   "kv_prefix": {
+ *     "static":  "<pre-formatted static prompt>",
+ *     "dynamic": "<pre-formatted text prefilled behind it>",
+ *     "mode":    "auto" | "save" | "load"
+ *   }
+ * }
+ * The static prompt's KV is kept in <model_dir>/kv_prefix/<hash>.kv, <hash>
+ * being 16 hex digits of a 64-bit FNV-1a over the static text's bytes
+ * (api/kv_prefix_path.h). "auto" (the default) saves it on first use and
+ * loads it after; "save" (re)saves it and stops without generating; "load"
+ * requires the file to exist. Both texts are sent as given, with no chat
+ * template, so "messages"/"tools"/"functions" and "continue_session" are
+ * refused next to it (CAUSAL_LM_ERROR_INVALID_PARAMETER, reason in
+ * getLastErrorMessageHandle). CausalLM models only.
  *============================================================================*/
 
 /**
@@ -698,6 +761,24 @@ WIN_EXPORT ErrorCode runModelHandleWithJsonStreaming(
  * @return const char* JSON array string (never NULL)
  */
 WIN_EXPORT const char *getModelCatalogJson(void);
+
+/**
+ * @brief Outcome of looking for the optional model-extension plugin
+ *        (libqai_ext_model.so, see ext_model_abi.h).
+ *
+ * The plugin is looked up the first time the model registry is read
+ * (getModelCatalogJson, a model load). The result is one line starting with:
+ *   "absent: ..."  no plugin on the library path; the normal public build
+ *   "loaded: ..."  plugin found, ABI accepted, its models are in the catalog
+ *   "failed: ..."  plugin present but refused or broken (ABI mismatch, missing
+ *                  symbol, unresolved dependency); only public models are
+ *                  available and the reason is in the text
+ * Triggers the lookup when it has not happened yet. The pointer is valid until
+ * the next call.
+ *
+ * @return const char* status line (never NULL)
+ */
+WIN_EXPORT const char *getExtensionModelStatus(void);
 
 #ifdef __cplusplus
 }

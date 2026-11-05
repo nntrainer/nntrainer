@@ -26,6 +26,7 @@
 #include <node_exporter.h>
 #include <thread_manager.h>
 #include <util_func.h>
+#include <weight_file_reader.h>
 
 #include <cstdio>
 #include <vector>
@@ -93,6 +94,7 @@ void emb_stage_h2d_wait() {
 #include "../third_party/nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -337,9 +339,10 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
 }
 
 /**
- * @brief sfixed4 sidecar: packed signed-4bit nibbles (low nibble first, two's
- *        complement) with fp32 scales. Two scale layouts, keyed by the
- *        manifest's "quant-type":
+ * @brief Packed 4-bit sidecar with fp32 scales, low nibble first. sfixed4
+ *        uses signed two's-complement codes with symmetric scales; ufixed4
+ *        uses unsigned codes with a scale and zero point per group of 32.
+ *        The signed layouts are keyed by the manifest's "quant-type":
  *          - "per-row-symmetric" (default): ONE scale per row.
  *          - "per-row-per-block-symmetric": each row splits into equal-width
  *            blocks, one scale per (row, block) -- the folded per-layer table,
@@ -354,8 +357,10 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
  *        table) and parsing it would wreck init latency; when both are
  *        present the file wins.
  */
-std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
-                                              const nlohmann::json &json) {
+std::shared_ptr<QuantLut>
+loadPacked4BitManifest(const std::string &manifest_path,
+                       const nlohmann::json &json, bool affine = false) {
+  const char *datatype = affine ? "ufixed4" : "sfixed4";
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
@@ -364,23 +369,30 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     json.contains("quant-type")
       ? requireJsonStringField(json, "quant-type", manifest_path)
       : std::string("per-row-symmetric");
-  const bool per_block = quant_type == "per-row-per-block-symmetric";
-  NNTR_THROW_IF(!per_block && quant_type != "per-row-symmetric",
+  const bool per_block = affine ? quant_type == "per-row-per-block-asymmetric"
+                                : quant_type == "per-row-per-block-symmetric";
+  NNTR_THROW_IF(!per_block && (affine || quant_type != "per-row-symmetric"),
                 std::runtime_error)
-    << "Malformed LUT manifest " << manifest_path
-    << ": unsupported sfixed4 quant-type '" << quant_type << "'";
+    << "Malformed LUT manifest " << manifest_path << ": unsupported "
+    << datatype << " quant-type '" << quant_type << "'";
 
   const bool has_scale_path = quant_param.contains("scale-path");
   NNTR_THROW_IF(!has_scale_path && (!quant_param.contains("scale") ||
                                     !quant_param.at("scale").is_array()),
                 std::runtime_error)
-    << "Malformed LUT manifest " << manifest_path
-    << ": sfixed4 expects quant-param.scale array or quant-param.scale-path";
+    << "Malformed LUT manifest " << manifest_path << ": " << datatype
+    << " expects quant-param.scale array or quant-param.scale-path";
 
   auto lut = std::make_shared<QuantLut>();
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
   lut->is_raw_u16 = false;
-  lut->is_signed4 = true;
+  lut->is_signed4 = !affine;
+  lut->is_affine4 = affine;
+  lut->round_bf16 = json.value("round-bf16", false);
+  lut->bf16_scale_output = json.value("bf16-scale-output", false);
+  NNTR_THROW_IF(lut->bf16_scale_output && (!affine || !lut->round_bf16),
+                std::invalid_argument)
+    << "bf16-scale-output requires affine4 with round-bf16";
 
   // Per-block geometry. A block boundary MAY fall inside a nibble byte (each
   // nibble resolves its own column, unlike the QS4CX group decode), so no
@@ -413,8 +425,8 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
       nblocks = derived;
     }
     NNTR_THROW_IF(nblocks == 0, std::runtime_error)
-      << "Malformed LUT manifest " << manifest_path
-      << ": per-row-per-block-symmetric needs scale-shape or size-per-layer";
+      << "Malformed LUT manifest " << manifest_path << ": " << quant_type
+      << " needs scale-shape or size-per-layer";
     NNTR_THROW_IF(lut->out_dim % nblocks != 0, std::invalid_argument)
       << "Malformed LUT manifest " << manifest_path << ": " << nblocks
       << " blocks must tile size " << lut->out_dim;
@@ -432,7 +444,7 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
       readBinaryFile(resolveLutPath(manifest_path, scale_path));
     NNTR_THROW_IF(scale_bytes.size() != expected_scales * sizeof(float),
                   std::runtime_error)
-      << "sfixed4 scale file size " << scale_bytes.size()
+      << datatype << " scale file size " << scale_bytes.size()
       << " does not match rows*blocks*4 (" << expected_scales * sizeof(float)
       << ") for " << manifest_path;
     lut->row_scales.resize(expected_scales);
@@ -441,21 +453,40 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     lut->row_scales.reserve(quant_param.at("scale").size());
     for (const auto &scale : quant_param.at("scale")) {
       NNTR_THROW_IF(!scale.is_number(), std::runtime_error)
-        << "Malformed LUT manifest " << manifest_path
-        << ": sfixed4 row scale must be numeric";
+        << "Malformed LUT manifest " << manifest_path << ": " << datatype
+        << " row scale must be numeric";
       lut->row_scales.push_back(scale.get<float>());
     }
   }
 
   NNTR_THROW_IF(lut->row_scales.size() != expected_scales,
                 std::invalid_argument)
-    << "sfixed4 scale count " << lut->row_scales.size()
+    << datatype << " scale count " << lut->row_scales.size()
     << " does not match rows*blocks (" << lut->in_dim << "*"
     << lut->sfixed4_blocks << ") for " << manifest_path;
   NNTR_THROW_IF(shape_rows != 0 && shape_rows != lut->in_dim,
                 std::invalid_argument)
-    << "sfixed4 scale-shape rows " << shape_rows << " does not match payload "
-    << lut->in_dim << " for " << manifest_path;
+    << datatype << " scale-shape rows " << shape_rows
+    << " does not match payload " << lut->in_dim << " for " << manifest_path;
+
+  if (affine) {
+    NNTR_THROW_IF(lut->out_dim / lut->sfixed4_blocks != 32,
+                  std::invalid_argument)
+      << "ufixed4 requires 32 values per group";
+    const auto zero_path =
+      requireJsonStringField(quant_param, "zero-point-path", manifest_path);
+    lut->group_zero_points =
+      readBinaryFile(resolveLutPath(manifest_path, zero_path));
+    NNTR_THROW_IF(lut->group_zero_points.size() != expected_scales,
+                  std::invalid_argument)
+      << "ufixed4 zero-point count must match rows*groups";
+    for (size_t i = 0; i < expected_scales; ++i) {
+      NNTR_THROW_IF(!std::isfinite(lut->row_scales[i]) ||
+                      lut->row_scales[i] <= 0 || lut->group_zero_points[i] > 15,
+                    std::invalid_argument)
+        << "ufixed4 requires positive finite scales and zero points in [0,15]";
+    }
+  }
 
   return lut;
 }
@@ -583,7 +614,9 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   if (datatype == "ufixed8")
     return loadUfixed8Manifest(manifest_path, json);
   if (datatype == "sfixed4")
-    return loadSfixed4Manifest(manifest_path, json);
+    return loadPacked4BitManifest(manifest_path, json);
+  if (datatype == "ufixed4")
+    return loadPacked4BitManifest(manifest_path, json, true);
   if (datatype == "q4_0")
     return loadGgmlManifest(manifest_path, json,
                             nntrainer::TensorDim::DataType::Q4_0);
@@ -595,7 +628,7 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << " (expected ufixed8, sfixed4, q4_0, q6_k, or qs4cx)";
+    << " (expected ufixed8, ufixed4, sfixed4, q4_0, q6_k, or qs4cx)";
   return nullptr;
 }
 
@@ -671,6 +704,17 @@ void validateDecodeArgs(const QuantLut &lut, size_t token_idx,
     << lut.out_dim;
 }
 
+/// Round to BF16 with ties to even, retaining FP32 storage.
+float roundToBf16(float value) {
+  if (!std::isfinite(value))
+    return value;
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
 /// Decodes one packed-4-bit row, calling emit(col, value) for every column in
 /// order. The per-element overhead the old per-nibble helper paid on every
 /// value is hoisted: the scale-count check runs once per row (it is also
@@ -686,6 +730,25 @@ void forEachPacked4BitValue(const QuantLut &lut, size_t token_idx,
 
   const size_t bytes_per_row = lut.out_dim / 2;
   const uint8_t *row = lut.data() + token_idx * bytes_per_row;
+
+  if (lut.is_affine4) {
+    if (lut.bf16_scale_output)
+      layer_scale = roundToBf16(layer_scale);
+    const size_t base = token_idx * lut.sfixed4_blocks;
+    for (size_t col = 0; col < lut.out_dim; ++col) {
+      const size_t group = base + col / 32;
+      const int code = (row[col / 2] >> ((col % 2) * 4)) & 15;
+      float value = (code - static_cast<int>(lut.group_zero_points[group])) *
+                    lut.row_scales[group];
+      if (lut.round_bf16)
+        value = roundToBf16(value);
+      value *= layer_scale;
+      if (lut.bf16_scale_output)
+        value = roundToBf16(value);
+      emit(col, value);
+    }
+    return;
+  }
 
   if (lut.is_signed4) {
     NNTR_THROW_IF(lut.row_scales.size() != lut.in_dim * lut.sfixed4_blocks,
@@ -819,12 +882,72 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     });
 }
 
+// Per-layer LRU of at most 128 exact, unscaled file rows. FP32 rows use
+// 1 MiB at width 2048; packed Q4_0 rows use 144 KiB at the same width.
+// Only lookup/copy and insertion hold the lock; independent prefill misses
+// continue to use parallel direct I/O.
+class EmbeddingLayer::RowCache {
+public:
+  RowCache(size_t rows, size_t bytes) :
+    row_bytes(bytes),
+    keys(std::min<size_t>(rows, 128)),
+    ages(keys.size(), 0),
+    values(keys.size() * row_bytes) {}
+
+  int read(int fd, size_t offset, size_t index, void *out) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (fd != source_fd || offset != source_offset) {
+        source_fd = fd;
+        source_offset = offset;
+        std::fill(ages.begin(), ages.end(), 0);
+      }
+      for (size_t slot = 0; slot < keys.size(); ++slot) {
+        if (ages[slot] && keys[slot] == index) {
+          std::memcpy(out, values.data() + slot * row_bytes, row_bytes);
+          ages[slot] = ++clock;
+          return 0;
+        }
+      }
+    }
+    const int rc =
+      nntrainer::weightPread(fd, out, row_bytes, offset + index * row_bytes);
+    if (rc != 0 || keys.empty())
+      return rc;
+    std::lock_guard<std::mutex> lock(mutex);
+    // A different source must never receive an in-flight old source's row.
+    if (fd != source_fd || offset != source_offset)
+      return 0;
+    size_t slot = std::min_element(ages.begin(), ages.end()) - ages.begin();
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (ages[i] && keys[i] == index) {
+        slot = i;
+        break;
+      }
+    }
+    std::memcpy(values.data() + slot * row_bytes, out, row_bytes);
+    keys[slot] = index;
+    ages[slot] = ++clock;
+    return 0;
+  }
+
+private:
+  const size_t row_bytes;
+  std::vector<size_t> keys;
+  std::vector<uint64_t> ages;
+  std::vector<uint8_t> values;
+  std::mutex mutex;
+  uint64_t clock = 0;
+  int source_fd = -1;
+  size_t source_offset = 0;
+};
+
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
                   nntrainer::props::Scale(), props::QuantizedLutPath(),
                   props::OutputQuantScale(), props::OutputQuantOffset(),
-                  props::SidecarExportPath()),
+                  props::SidecarExportPath(), props::StreamFp32()),
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -838,6 +961,18 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   // wiring.]
   auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
   const bool has_quantized_lut = !quantized_lut_path.empty();
+  const bool stream_fp32 = std::get<props::StreamFp32>(embedding_props).get();
+  NNTR_THROW_IF(
+    stream_fp32 &&
+      (has_quantized_lut ||
+       context.getExecutionMode() != ml::train::ExecutionMode::INFERENCE ||
+       context.getWeightDataType() != nntrainer::TensorDim::DataType::FP32 ||
+       context.getActivationDataType() !=
+         nntrainer::TensorDim::DataType::FP32 ||
+       nntrainer::weightPageCachePolicy() != 0),
+    std::invalid_argument)
+    << "stream_fp32 requires FP32 inference without a sidecar and "
+       "htp.page_cache=0";
   context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
 
   const nntrainer::TensorDim &input_dim =
@@ -863,6 +998,16 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   size_t out_dim =
     static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
 
+  const bool stream_q4 =
+    !has_quantized_lut &&
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE &&
+    context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0 &&
+    nntrainer::weightPageCachePolicy() == 0;
+  const size_t row_bytes =
+    stream_fp32 ? out_dim * sizeof(float) : 18 * ((out_dim + 31) / 32);
+  row_cache = (stream_fp32 || stream_q4)
+                ? std::make_shared<RowCache>(in_dim, row_bytes)
+                : nullptr;
   quant_lut.reset();
   if (has_quantized_lut) {
     quant_lut =
@@ -920,7 +1065,11 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 
   weight_idx = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+    weight_decay, "Embedding", true,
+    context.getExecutionMode() == ml::train::ExecutionMode::INFERENCE &&
+      nntrainer::weightPageCachePolicy() >= 0 &&
+      (context.getWeightDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
+       stream_fp32));
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -1287,9 +1436,15 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       ggml_lut && wt == nntrainer::TensorDim::DataType::QS4CX;
     NNTR_THROW_IF(ggml_lut && !row_quant && !qs4cx_lut, std::runtime_error)
       << "GGML sidecar LUT supports only Q4_0/Q6_K/QS4CX payloads";
+    // Under the weight page-cache policy the Q4_0 table stays virtual: its
+    // rows are read from the file on demand instead of being resident.
+    const bool virt_q4 = !ggml_lut &&
+                         wt == nntrainer::TensorDim::DataType::Q4_0 &&
+                         weight_p->isVirtual();
     const uint8_t *quant_table =
       (row_quant || qs4cx_lut)
-        ? (ggml_lut ? quant_lut->data() : weight_p->getData<uint8_t>())
+        ? (ggml_lut ? quant_lut->data()
+                    : (virt_q4 ? nullptr : weight_p->getData<uint8_t>()))
         : nullptr;
     const size_t row_stride =
       qs4cx_lut ? quant_lut->row_bytes
@@ -1360,17 +1515,51 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     auto &tm = nntrainer::ThreadManager::Global();
     const size_t total = static_cast<size_t>(iter);
     const size_t max_workers = std::max<size_t>(1, tm.getComputeThreadCount());
-    const size_t njobs = std::min(total, max_workers);
+    const bool stream_fp32 = row_cache && !ggml_lut &&
+                             wt == nntrainer::TensorDim::DataType::FP32 &&
+                             weight_p->isVirtual();
+    // ThreadManager callbacks cannot propagate exceptions. Validate streaming
+    // IDs here and report direct-I/O errors only after every worker joins.
+    if (stream_fp32 || virt_q4) {
+      for (size_t i = 0; i < total; ++i) {
+        NNTR_THROW_IF(!(in_data[i] >= 0 && in_data[i] < in_dim),
+                      std::invalid_argument)
+          << "input word index is greater than in_dim";
+      }
+    }
+    // A prefill may repeat a row while its first direct read is still in
+    // flight. Resolve duplicates before dispatch so each distinct row has
+    // one owner, then copy its completed output after all readers join.
+    std::vector<size_t> unique_rows, source_rows;
+    if (virt_q4 && total > 1 &&
+        batchsliced_hidden.getDataType() ==
+          nntrainer::TensorDim::DataType::FP32) {
+      std::unordered_map<size_t, size_t> first;
+      source_rows.resize(total);
+      for (size_t i = 0; i < total; ++i) {
+        const auto entry = first.emplace(static_cast<size_t>(in_data[i]), i);
+        source_rows[i] = entry.first->second;
+        if (entry.second)
+          unique_rows.push_back(i);
+      }
+    }
+    const size_t work_rows = source_rows.empty() ? total : unique_rows.size();
+    const size_t njobs = std::min(work_rows, max_workers);
+    std::atomic<int> stream_error{0};
     tm.parallel_for(0, njobs, [&](size_t t) {
       // Chunked over tokens (prefill: total == prompt length) so each worker
       // reuses ONE fp32 scratch for its whole chunk instead of paying a heap
       // allocation per token; decode (total==1) stays on the caller thread.
-      const size_t chunk_begin = t * total / njobs;
-      const size_t chunk_end = (t + 1) * total / njobs;
+      const size_t chunk_begin = t * work_rows / njobs;
+      const size_t chunk_end = (t + 1) * work_rows / njobs;
       std::vector<float> tmp;
+      // One on-demand Q4_0 row per worker: shared across the workers it
+      // was torn by concurrent reads (page-cache policy, prefill).
+      std::vector<uint8_t> virt_row;
       if (row_quant || qs4cx_w || qs4cx_lut)
         tmp.resize(out_dim);
-      for (size_t i = chunk_begin; i < chunk_end; ++i) {
+      for (size_t job = chunk_begin; job < chunk_end; ++job) {
+        const size_t i = source_rows.empty() ? job : unique_rows[job];
         size_t embed_idx = static_cast<size_t>(in_data[i]);
         if (embed_idx >= in_dim) {
           throw std::invalid_argument(
@@ -1403,7 +1592,25 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             weight_p->getData(),
                                             weight_p->getScale(), tmp.data());
           } else {
-            const void *row = quant_table + row_stride * embed_idx;
+            const void *row;
+            if (virt_q4) {
+              virt_row.resize(row_stride);
+              const int rc =
+                row_cache
+                  ? row_cache->read(weight_p->getFd(),
+                                    weight_p->getFileOffset(), embed_idx,
+                                    virt_row.data())
+                  : nntrainer::weightPread(
+                      weight_p->getFd(), virt_row.data(), virt_row.size(),
+                      weight_p->getFileOffset() + row_stride * embed_idx);
+              if (rc != 0) {
+                stream_error.store(rc, std::memory_order_relaxed);
+                continue;
+              }
+              row = virt_row.data();
+            } else {
+              row = quant_table + row_stride * embed_idx;
+            }
             if (wt == nntrainer::TensorDim::DataType::Q6_K)
               nntrainer::dequantize_row_q6_K(const_cast<void *>(row),
                                              tmp.data(), out_dim);
@@ -1430,6 +1637,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
               o[k] = tmp[k] * scale;
           }
+        } else if (stream_fp32) {
+          const int rc =
+            row_cache->read(weight_p->getFd(), weight_p->getFileOffset(),
+                            embed_idx, out_tensor.getData<float>());
+          if (rc != 0) {
+            stream_error.store(rc, std::memory_order_relaxed);
+            continue;
+          }
+          if (scale != 1.0f)
+            out_tensor.multiply_i(scale);
         } else if (wt == nntrainer::TensorDim::DataType::FP32 &&
                    out_tensor.getDataType() ==
                      nntrainer::TensorDim::DataType::FP16) {
@@ -1460,6 +1677,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         }
       }
     });
+    const int stream_rc = stream_error.load(std::memory_order_relaxed);
+    NNTR_THROW_IF(stream_rc != 0, std::runtime_error)
+      << "Embedding row read failed: " << std::strerror(stream_rc);
+    if (!source_rows.empty()) {
+      float *out = batchsliced_hidden.getData<float>();
+      for (size_t i = 0; i < total; ++i)
+        if (source_rows[i] != i)
+          std::memcpy(out + i * out_dim, out + source_rows[i] * out_dim,
+                      out_dim * sizeof(float));
+    }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // Push the host-dequantized rows into the device-only output on the
@@ -1555,6 +1782,28 @@ void EmbeddingLayer::save(std::ofstream &file,
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {
       auto &weight = run_context.getWeight(i);
+      if (weight.isVirtual() &&
+          std::get<props::StreamFp32>(embedding_props).get()) {
+        NNTR_THROW_IF(dtype != nntrainer::TensorDim::DataType::NONE &&
+                        dtype != nntrainer::TensorDim::DataType::FP32,
+                      std::invalid_argument)
+          << "Streamed FP32 embedding export does not support quantization";
+        // A virtual table has no data pointer. Copy its exact payload with
+        // bounded staging, independently of the small inference row cache.
+        const size_t bytes = weight.bytes();
+        std::vector<char> buffer(std::min<size_t>(bytes, 64u << 10));
+        for (size_t offset = 0; offset < bytes; offset += buffer.size()) {
+          const size_t count = std::min(buffer.size(), bytes - offset);
+          const int rc =
+            nntrainer::weightPread(weight.getFd(), buffer.data(), count,
+                                   weight.getFileOffset() + offset);
+          NNTR_THROW_IF(rc != 0, std::runtime_error)
+            << "FP32 embedding export read failed: " << std::strerror(rc);
+          nntrainer::checkedWrite(out, buffer.data(), count,
+                                  "FP32 embedding export write failed");
+        }
+        continue;
+      }
       if (dtype == nntrainer::TensorDim::DataType::NONE ||
           weight.getDataType() == dtype)
         weight.save(out);

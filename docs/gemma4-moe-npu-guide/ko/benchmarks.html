@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="벤치마크 결과 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>벤치마크 결과 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../benchmarks.html">
+<link rel="alternate" hreflang="ko" href="benchmarks.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="benchmarks.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../benchmarks.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="benchmarks.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../benchmarks.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html" aria-current="page">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>참고 자료</span><span aria-hidden="true">/</span><span>벤치마크 결과</span></div>
+<article><h1 id="9-benchmark-results">9. 벤치마크 결과</h1>
+<p>2026년 11월 4일 <strong>최종 배포된 회전 TL2 팩</strong>으로 새로 측정한 결과입니다.
+설치된 Quick.AI 앱과 네이티브 라이브러리가 같은 CLI 런타임을 사용했습니다.
+입력은 <strong>1,024 / 2,048 / 4,096 / 8,192토큰</strong>, 출력은 매 실행 <strong>128토큰</strong>입니다.
+당시 배포된 런타임의 측정 기록이며, 업데이트된 SDK/HexKL 설정이나 앱의 Metrics
+기능으로 다시 측정한 결과가 아닙니다.</p>
+<p>같은 입력·출력 길이, 기기와 런타임으로 별도 측정한 결과는
+<a href="lfm2-benchmarks.html#appendix-a-lfm2-benchmark-results">LFM2 벤치마크 부록</a>에서 확인할 수 있습니다.</p>
+<h2 id="deployed-model-and-test-conditions">배포 모델과 측정 조건</h2>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>항목</th>
+<th>측정에 사용한 설정</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>기기</td>
+<td>Galaxy S26 Ultra <strong>SM-S948U</strong>, Snapdragon <strong>SM8850</strong>, Hexagon <strong>v81</strong>, Android <strong>16</strong>, 4 KB 페이지.</td>
+</tr>
+<tr>
+<td>모델 팩</td>
+<td><code>/sdcard/Download/aistudio-mobile/</code> 아래의 <code>models/gemma4-26b-a4b-htp-w4a32</code>.</td>
+</tr>
+<tr>
+<td>양자화</td>
+<td>Expert는 회전 <strong>TL2</strong>(<code>moe_layer_dtype=TL2CX_WH</code>), projection과 LM head는 affine 4-bit(<code>QS4CX_WH_AFFINE</code>), embedding은 <code>Q4_0</code>입니다. 모델 전체가 동일한 TL2 형식인 것은 아닙니다.</td>
+</tr>
+<tr>
+<td>가중치 파일</td>
+<td><code>nntr_gemma4_26b_a4b_tl2_rotated.bin</code>, <strong>6,604,561,848바이트</strong>(6.60 GB). 전체 SHA-256은 측정 manifest에 기록했습니다.</td>
+</tr>
+<tr>
+<td>런타임</td>
+<td>네이티브 <code>.so</code> 7개의 SHA-256이 설치된 Quick.AI 앱과 모두 일치합니다. CLI 실행 파일의 해시도 기록했습니다. 바이너리의 소스 커밋은 확인되지 않았으므로 해당 배포 빌드의 측정값으로 해석하세요.</td>
+</tr>
+<tr>
+<td>추론</td>
+<td>HTP fused 실행, batch 1, greedy decoding, CPU 스레드 8개. Attention, projection, dense FFN, MoE, LM head는 HTP를 사용하며 매 실행 NPU resident graph를 확인했습니다.</td>
+</tr>
+<tr>
+<td>컨텍스트·캐시</td>
+<td>배포 기본값인 <code>init_seq_len=2048</code>, <code>max_seq_len=8704</code>, attention KV <code>q8</code>, <code>moe_cache_experts=16</code>, <code>moe_decode_prefetch=true</code>를 유지했습니다. 8,192토큰 입력도 잘림 없이 모두 처리했습니다.</td>
+</tr>
+<tr>
+<td>프롬프트</td>
+<td>여러 문단을 반복한 영어 보고서와 요약 요청입니다. 채팅 템플릿 토큰과 길이를 맞추는 짧은 패딩까지 포함해 입력 수를 맞췄으며, 같은 길이의 반복 실행에는 동일한 입력을 사용했습니다.</td>
+</tr>
+<tr>
+<td>반복 횟수</td>
+<td>제외한 1K 워밍업 1회 이후, <strong>입력 길이마다 새 CLI 프로세스로 3회</strong>, 총 12회 측정했습니다. 회차마다 길이 순서를 바꾸고 OS 캐시는 유지했습니다.</td>
+</tr>
+<tr>
+<td>온도</td>
+<td>USB 연결 상태에서 실행 사이 최소 15초 대기했습니다. Thermal status 0, AP ≤34 °C, skin ≤35.5 °C일 때만 시작했으며 각 실행 전후의 온도를 저장했습니다.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="1k--2k--4k--8k-results">1K / 2K / 4K / 8K 결과</h2>
+<p>각 값은 <strong>3회 측정의 중앙값</strong>이며, 괄호는 최솟값–최댓값입니다.
+모든 행의 <strong>전체 출력은 128토큰</strong>입니다.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>입력 토큰</th>
+<th>Prefill (tok/s)</th>
+<th>Decode (tok/s)</th>
+<th>TTFT (초)</th>
+<th>최대 메모리 (GiB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1K (1,024)</td>
+<td><strong>599.9</strong> (573.0–627.5)</td>
+<td><strong>18.43</strong> (18.23–18.94)</td>
+<td><strong>1.71</strong> (1.64–1.79)</td>
+<td><strong>3.716</strong> (3.715–3.716)</td>
+</tr>
+<tr>
+<td>2K (2,048)</td>
+<td><strong>665.4</strong> (655.1–670.2)</td>
+<td><strong>18.07</strong> (18.04–18.79)</td>
+<td><strong>3.08</strong> (3.06–3.13)</td>
+<td><strong>3.811</strong> (3.811–3.811)</td>
+</tr>
+<tr>
+<td>4K (4,096)</td>
+<td><strong>615.5</strong> (615.4–620.7)</td>
+<td><strong>17.38</strong> (17.26–17.81)</td>
+<td><strong>6.66</strong> (6.60–6.66)</td>
+<td><strong>3.978</strong> (3.978–3.978)</td>
+</tr>
+<tr>
+<td>8K (8,192)</td>
+<td><strong>560.5</strong> (558.8–564.1)</td>
+<td><strong>15.90</strong> (15.62–15.96)</td>
+<td><strong>14.63</strong> (14.53–14.67)</td>
+<td><strong>4.310</strong> (4.310–4.310)</td>
+</tr>
+</tbody>
+</table></div>
+<p>각 입력 길이의 3회 실행에서 출력 토큰 ID도 모두 같았습니다. 이는 해당 프롬프트의
+반복 실행 일치를 확인한 결과입니다. 반복 문단으로 구성한 합성 입력은 처리량 측정용이며
+모델 정확도 평가용 데이터가 아닙니다. 실행 사이에 기기를 식혔으므로, 뜨거워진 기기의
+장시간 지속 성능을 나타내지는 않습니다.</p>
+<h2 id="token-counts-and-measurement-boundaries">토큰 수와 지표의 집계 범위</h2>
+<ul>
+<li><strong>출력 128토큰 = 프리필에서 선택한 첫 토큰 1개 + 디코딩 127단계</strong>입니다.
+이 CLI에서는 <code>num_to_generate=127</code>로 설정해야 전체 128개가 생성되므로,
+<code>generation:</code> 로그에는 <code>127 tokens</code>라고 나옵니다. 매 실행 네이티브 토큰
+트레이스에서 출력 ID 128개와 정확한 입력 ID를 모두 확인했습니다.</li>
+<li><strong>Prefill</strong>은 CLI가 보고한 입력 처리 속도입니다. <strong>Decode</strong>는
+<code>127 / generation_seconds</code>로 계산하며 첫 디코딩 단계도 포함합니다.
+Steady decode 중앙값의 역수로 계산한 값과는 다릅니다.</li>
+<li><strong>TTFT</strong>는 CLI의 <code>[PERF-SPLIT] ttft_ms</code>, 즉 추론 시작부터 첫 토큰 전달까지의
+시간입니다. 모델 로드와 프로세스 시작 시간은 제외하므로 앱 실행부터 답변까지의
+전체 지연 시간으로 해석하면 안 됩니다.</li>
+<li><strong>최대 메모리</strong>는 런타임이 샘플링한 <code>RssAnon + accelerator</code>의 최댓값을
+KiB에서 GiB로 환산한 값입니다. 파일 페이지 캐시는 제외하며, 휴대전화 전체 RAM
+사용량이나 가중치 파일에 필요한 저장 공간과는 다릅니다.</li>
+</ul>
+<p>벤치마크 전용으로 복사한 설정에서만 프롬프트, 출력 제한, greedy 설정, 트레이스 경로,
+EOS 억제(<code>bad_word_ids=[1,50,106]</code>)를 적용했습니다. EOS 억제는 출력 길이를
+128개로 고정하기 위한 조건이며, 일반 채팅은 제공자의 종료 설정을 유지하세요.
+배포 모델 팩과 앱 설정은 변경하지 않았습니다.</p>
+<h2 id="logs-and-reproduction">원본 기록과 재현 방법</h2>
+<p><a href="../assets/benchmarks/gemma4-tl2-20261104-summary.json">요약 JSON</a>,
+<a href="../assets/benchmarks/gemma4-tl2-20261104-runs.csv">개별 실행 CSV</a>,
+<a href="../assets/benchmarks/gemma4-tl2-20261104-records.zip">전체 측정 기록 ZIP</a>을
+내려받을 수 있습니다. ZIP에는 CLI 원본 로그, 실제 프롬프트와 예상 입력 토큰 ID,
+네이티브 토큰 트레이스, 실행별 설정, 온도 기록, 바이너리·가중치 체크섬과 측정 스크립트가
+들어 있습니다. 모델 가중치와 런타임 바이너리는 포함하지 않습니다.</p>
+<p>ZIP을 풀면 <code>gemma4_npu_final_pack_20261104/</code> 디렉터리가 생성됩니다.
+동일한 팩과 런타임으로 다시 측정하려면 압축에 포함된 <code>README.md</code>를 따르세요.
+같은 휴대전화에서 CLI를 실행하기 전에는 <a href="app.html#8-build-and-install-the-quickai-app">앱의 모델을 Unload</a>합니다.
+비교 측정에서는 입력 토큰 수, 출력 길이, 시작 온도, 캐시 설정과 스레드 수를 같게 유지하세요.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="app.html"><small>이전</small><span>Quick.AI 앱</span></a><a class="pager-next" href="troubleshooting.html"><small>다음</small><span>문제 해결</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#deployed-model-and-test-conditions">배포 모델과 측정 조건</a></li><li><a href="#1k--2k--4k--8k-results">1K / 2K / 4K / 8K 결과</a></li><li><a href="#token-counts-and-measurement-boundaries">토큰 수와 지표의 집계 범위</a></li><li><a href="#logs-and-reproduction">원본 기록과 재현 방법</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

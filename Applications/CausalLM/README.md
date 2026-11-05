@@ -8,7 +8,7 @@ It supports *inference* mode (text generation) on various devices, including And
 - **Standalone Application (`nntr_causallm`)**: A command-line tool to load models and generate text.
 - **C API (Optional)**: A lightweight C interface (`libquick_dot_ai_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
 - **Core Library**: The core implementation is separated into `libcausallm.so` for modularity.
-- **Supported Backends**: CPU, **GPU (OpenCL)** — Adreno (Android) and Intel Arc (x86) — and optional QNN on Android. See [README_GPU.md](README_GPU.md) for GPU build/run/env, per-platform performance, and tuning.
+- **Supported Backends**: CPU, **GPU (OpenCL)** — Adreno (Android) and Intel Arc (x86) — and optional QNN on Android. See [README_GPU.md](README_GPU.md) for GPU build/run/env, per-platform performance, and tuning. The **Hexagon NPU (HTP)** runs the Gemma4 and LFM2 MoE models natively on Android; see the [Quick.AI documentation](../../docs/quickai/README.md).
 
 ## Supported models
 
@@ -16,6 +16,7 @@ It supports *inference* mode (text generation) on various devices, including And
 - Qwen3 (0.6B, 1.7B, 4B, 7B, 14B, 32B) [[link](https://huggingface.co/Qwen/Qwen3-4B)]
 - Qwen3-MoE (30B-A3B) [[link](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507)]
 - GPT-OSS (MoE: 20B, 120B) [[link](https://huggingface.co/openai/gpt-oss-20b)]
+- Gemma4 26B-A4B and LFM2 24B-A2B on the Hexagon NPU [[docs](../../docs/quickai/README.md)]
 - You can try your own model with custom layers!
 - Feel free to contribute! 😊
 
@@ -315,9 +316,19 @@ The most useful options are:
 | `--app` | Add the QuickDotAI AAR and sample APK to the canonical native build. |
 | `--install` | Push the native libraries and tools; with `--app`, also install the built APK. |
 | `--qnn` | Build the QNN variant and include its runtime libraries; requires `QNN_SDK_ROOT`. CPU is the default. |
+| `--htp` | Build the native Hexagon NPU variant (Gemma4 / LFM2 MoE) with the DSP skel; requires the Hexagon SDK and HexKL. See [Build from source](../../docs/quickai/build.md). HTP and QNN are separate builds. |
 | `--cache` | Reuse a compatible existing nntrainer Android engine build, or build it when absent. |
 | `--clean` | Recreate the selected CPU or QNN CausalLM build directory. |
 | `--nntr-threads=N` | Set the positive nntrainer compute-thread count. |
+| `--disable-opencl` | Build the engine without the OpenCL/GPU backend (default: on; same as `-Denable-opencl=false`). Recorded in the engine metadata, so `--cache` never reuses an engine of the other kind. |
+| `--stage[=DIR]` | Assemble the variant's public stage (default `builddir_app_stage/public/<variant>`): the libraries, runtime dependencies and tools the variant ships in one flat directory, residue-checked, with `<DIR>.manifest.json` (source SHAs, toolchain, ABI defines from `nntrainer-abi.ini`, per-file sha256 and `DT_NEEDED`, DSP images). The directory is recreated on every run, so a CPU stage never holds QNN/HTP files of an earlier build. |
+
+A downstream build can take the stage as its input: it copies it into its own
+directory, adds a model-extension plugin (`libqai_ext_model.so`, see
+`api/ext_model_abi.h`) and runs `Android/native_stage.py manifest --kind internal`
+on the result. Never put the plugin into the public stage. `nntr_causallm` and
+`quick_dot_ai_test` both ask the loader for the plugin before running; with none
+on the library path nothing changes.
 
 `--app`, `--install`, and QNN selection are independent. For example,
 `--install` pushes only native artifacts, while `--app --install` also installs

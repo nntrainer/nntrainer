@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="모델 팩 준비 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>모델 팩 준비 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../model-pack.html">
+<link rel="alternate" hreflang="ko" href="model-pack.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="model-pack.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../model-pack.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="model-pack.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../model-pack.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html" aria-current="page">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>빌드</span><span aria-hidden="true">/</span><span>모델 팩 준비</span></div>
+<article><h1 id="6-prepare-and-copy-the-model-pack">6. 모델 팩 준비 및 복사</h1>
+<p>모델 제공자에게 <strong>이 PR과 호환되고 채팅 실행이 가능한 Gemma4 26B-A4B HTP 팩</strong>을
+요청하세요. 제공된 가중치, 회전 정보, 토크나이저, 설정 파일은 한 세트로 유지합니다.
+이 가이드에서는 가중치를 생성하거나 양자화하지 않습니다.</p>
+<p>최신 카탈로그에는 Gemma4 HTP 항목이 세 가지 있습니다. 이 가이드의 명령은 첫 번째
+항목을 사용하며, 다른 항목은 그에 맞는 팩을 제공받았을 때 선택하세요.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>카탈로그 ID</th>
+<th>앱 FAMILY / MODEL VARIANT</th>
+<th>BASE PATH 아래 디렉터리</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gemma4-26b-a4b-htp</code></td>
+<td><code>gemma4-26b-a4b</code> / <code>Gemma4 26B A4B MoE (HTP)</code></td>
+<td><code>gemma4-26b-a4b-htp-w4a32/</code></td>
+</tr>
+<tr>
+<td><code>gemma4-26b-a4b-htp-long</code></td>
+<td><code>gemma4-26b-a4b</code> / <code>Gemma4 26B A4B MoE (HTP, 30k demo)</code></td>
+<td><code>gemma4-26b-a4b-htp-long-w4a32/</code></td>
+</tr>
+<tr>
+<td><code>gemma4-26b-a4b-htp-2bit-4bit</code></td>
+<td><code>gemma4-26b-a4b-2bit-4bit</code> / <code>Gemma4 26B A4B MoE (HTP, rotated 2/4-bit)</code></td>
+<td><code>gemma4-26b-a4b-2bit-4bit/</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>30k demo를 선택한다고 일반 팩의 컨텍스트가 늘어나거나 기기의 RAM이 충분하다는
+뜻은 아닙니다. 제공받은 팩에 맞는 설정을 유지하세요.</p>
+<p>앱은 휴대전화에 다음 디렉터리 구조가 있다고 가정합니다.</p>
+<pre tabindex="0"><code class="language-text">/sdcard/Download/aistudio-mobile/models/       ← model base path
+└── gemma4-26b-a4b-htp-w4a32/                 ← model pack directory
+    ├── nntr_config.json
+    ├── config.json
+    ├── tokenizer.json
+    ├── chat_template.jinja
+    ├── generation_config.json
+    ├── &lt;weight file named by model_file_name&gt;
+    └── &lt;any sidecars named in nntr_config.json&gt;
+</code></pre>
+<p><code>config.json</code>에는 텍스트 모델 설정이 최상위에 있어야 합니다. <code>text_config</code>만을
+담은 래퍼 구조이면 안 됩니다. 제공자의 <code>nntr_config.json</code>에서 <code>htp_fused</code> /
+<code>htp_fused_v1</code>, 각 연산의 실행 엔진, 실제 가중치 형식을 지정합니다.</p>
+<p>이 PR에는 두 계열의 Gemma4 팩이 있습니다.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>팩</th>
+<th>Expert 형식</th>
+<th>Projection / head</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>제공되는 팔레트 팩</td>
+<td><code>QS2CX_WH</code></td>
+<td><code>QS4CX</code> projection, CPU에서 실행하는 임베딩 공유 <code>Q4_0</code> head</td>
+</tr>
+<tr>
+<td>네이티브 삼진 팩</td>
+<td><code>TL2CX_WH</code>, 일부 affine expert 레이어가 섞일 수 있음</td>
+<td><code>QS4CX_WH_AFFINE</code> projection과 임베딩을 공유하지 않는 HTP head</td>
+</tr>
+</tbody>
+</table></div>
+<p>앱의 <code>W4A32</code>는 카탈로그 선택값이며 모든 텐서의 가중치가 4비트라는 뜻은 아닙니다.
+이 표시에 맞추려고 dtype 이름을 변경하지 마세요. 특히 TL2 팩의 <code>nntr_config.json</code>을
+<code>Applications/CausalLM/res/gemma4/htp_chat/</code>의 팔레트 프리셋으로 덮어쓰면 안 됩니다.
+팔레트 팩에 채팅 프리셋이 필요하다면 설정 파일을 교체하기 전에 제공자에게 가중치와
+프리셋의 호환 여부를 확인하세요. 형식과 선택적 보조 파일(sidecar)은 PR의
+<a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/model-packs.md">모델 팩 규약</a>에
+자세히 설명되어 있습니다.</p>
+<p>이전 팩을 이 리비전에서 사용하려면
+<a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/configuration.md#removed-comparison-switches">삭제된 옵션의 설정 이행 안내</a>를
+따르세요. 삭제된 중첩 <code>htp</code> / <code>moe</code> 키는 로드 시 거부됩니다. 호환되는 팩 설정의
+복사본에서 나열된 키를 제거하고, TL2 설정을 팔레트 프리셋으로 바꾸지 마세요.
+체크포인트에 같은 회전이 필요하다면 삭제된 <code>moe.hadamard=both_scalar</code> 값은
+<code>both</code>로 변경합니다.</p>
+<p><strong>호스트 PC</strong>에서 제공받은 팩의 디렉터리를 설정하고 주요 파일을 확인합니다.</p>
+<pre tabindex="0"><code class="language-bash">export NNTR_MODEL_PACK=&quot;$HOME/models/gemma4-26b-a4b-htp-w4a32&quot;
+python3 - &lt;&lt;'PY'
+import json
+import os
+from pathlib import Path
+
+pack = Path(os.environ[&quot;NNTR_MODEL_PACK&quot;])
+for name in (&quot;nntr_config.json&quot;, &quot;config.json&quot;, &quot;tokenizer.json&quot;,
+             &quot;chat_template.jinja&quot;, &quot;generation_config.json&quot;):
+    path = pack / name
+    if not path.is_file():
+        raise SystemExit(f&quot;Missing chat-pack file: {path}&quot;)
+cfg = json.loads((pack / &quot;nntr_config.json&quot;).read_text())
+weights = pack / cfg[&quot;model_file_name&quot;]
+if not weights.is_file() or weights.stat().st_size == 0:
+    raise SystemExit(f&quot;Missing or empty weights: {weights}&quot;)
+print(&quot;Weight file:&quot;, weights.name)
+print(&quot;Weight bytes:&quot;, weights.stat().st_size)
+print(&quot;Expert format:&quot;, cfg.get(&quot;moe_layer_dtype&quot;))
+print(&quot;Execution profile:&quot;, cfg.get(&quot;gemma4_execution_profile&quot;))
+for key in (&quot;moe_engine&quot;, &quot;attention_engine&quot;, &quot;attn_proj_engine&quot;, &quot;dense_ffn_engine&quot;):
+    if cfg.get(key) != &quot;htp&quot;:
+        raise SystemExit(f&quot;Expected {key}=htp; ask the pack provider&quot;)
+print(&quot;Main files present. Also verify all sidecars from the provider's manifest.&quot;)
+PY
+
+du -sh &quot;$NNTR_MODEL_PACK&quot;
+</code></pre>
+<p>이 코드는 파일 존재 여부만 확인하며 가중치 내용 자체를 검증하지는 않습니다.
+제공된 체크섬과 보조 파일 목록도 확인하세요. 권장 채팅 파일을 갖춰 두면 템플릿
+fallback이나 벤치마크 전용 생성 설정을 사용하는 문제를 줄일 수 있습니다.</p>
+<p>보조 파일을 포함한 디렉터리 내용을 앱이 기대하는 경로로 복사합니다.</p>
+<pre tabindex="0"><code class="language-bash">adb shell mkdir -p /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
+adb push &quot;$NNTR_MODEL_PACK/.&quot; /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32/
+adb shell ls -lh /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
+</code></pre>
+<p><code>nntr_config.json</code>이 해당 디렉터리 바로 아래에 있는지 확인하세요. 팩 디렉터리가
+한 단계 더 중첩되면 안 됩니다. 수 GB를 전송하므로 시간이 걸릴 수 있습니다.
+셸과 앱에서 모두 읽을 수 있도록 <code>/sdcard/Download</code>를 사용합니다.
+<code>/data/local/tmp</code>는 CLI 바이너리에 적합하지만 일반 제품용 휴대전화에서는 앱이
+모델을 읽을 수 있는 위치가 아닙니다.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="build-install.html"><small>이전</small><span>빌드 및 설치</span></a><a class="pager-next" href="cli.html"><small>다음</small><span>CLI 추론</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

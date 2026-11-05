@@ -8,8 +8,10 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "../htp/host/attn_m1_cases.h"
 #include "int4_utils.h"
 #include "kleidiai_interface.h"
+#include "m1_ops_det.h"
 #include "nntrainer_test_util.h"
 #include <cfloat>
 #include <cpu_backend.h>
@@ -941,6 +943,210 @@ TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_32x1024x4096) {
 
 TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_1x3072x512) {
   run_gemm_benchmark_comparison(1, 3072, 512);
+}
+
+/* ---- [#152] the fp16 CPU attention equals attn_m1_det.h ----------------- */
+
+namespace {
+
+/** @brief LFM2.5's attention shape. */
+constexpr unsigned kF16Kv = 8, kF16Gqa = 4, kF16Hd = 64,
+                   kF16Nq = kF16Kv * kF16Gqa;
+
+uint32_t f16_bits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  return u;
+}
+
+/** @brief Bit mismatches of fp16 results widened to f32 against the spec;
+ *         the first one printed. */
+int f16_count_bad(const std::vector<_FP16> &cpu, const std::vector<float> &spec,
+                  const char *what) {
+  int bad = 0;
+  for (size_t i = 0; i < spec.size(); ++i) {
+    const float c = static_cast<float>(cpu[i]);
+    if (f16_bits(c) != f16_bits(spec[i])) {
+      if (bad == 0) {
+        std::cout << "ATTN_M1_F16 " << what << " first mismatch i=" << i
+                  << std::hexfloat << " cpu=" << c << " spec=" << spec[i]
+                  << std::defaultfloat << std::endl;
+      }
+      ++bad;
+    }
+  }
+  return bad;
+}
+
+/** @brief The cos | sin row of one position in f32, the CPU's formula (the
+ *         host check's rope_cs); the CPU's fp16 table is its (_FP16) cast. */
+void f16_rope_cs(float *cs, unsigned pos) {
+  for (unsigned i = 0; i < 32u; ++i) {
+    const double ang = (double)pos * std::pow(5e6, -(2.0 * i) / 64.0);
+    cs[i] = (float)std::cos(ang);
+    cs[32u + i] = (float)std::sin(ang);
+  }
+}
+
+/** @brief f32 -> fp16 with the conversion Tensor::copyData uses. */
+std::vector<_FP16> f16_copy(const float *x, size_t n) {
+  std::vector<_FP16> y(n);
+  nntrainer::scopy(static_cast<unsigned>(n), x, 1u, y.data(), 1u);
+  return y;
+}
+
+} // namespace
+
+/**
+ * @brief compute_rotary_emb_value(__fp16) against m1_rope64_det on 32 q +
+ *        8 k heads of every kind at positions 0, 1, 511, 1023, 4095.
+ */
+TEST(AttnM1F16Det, RopeMatchesNeonFp16) {
+  const unsigned heads = kF16Nq + kF16Kv, n = heads * kF16Hd;
+  amc_rng rng{0x15200301u};
+  std::vector<float> x(n), cs(64);
+  for (unsigned h = 0; h < heads; ++h) {
+    amc_fill_row(&rng, x.data() + h * kF16Hd, kF16Hd, h < 3u ? (int)h + 1 : 0);
+  }
+  for (unsigned pos : {0u, 1u, 511u, 1023u, 4095u}) {
+    f16_rope_cs(cs.data(), pos);
+    std::vector<_FP16> c16(32), s16(32);
+    for (unsigned i = 0; i < 32u; ++i) {
+      c16[i] = static_cast<_FP16>(cs[i]);
+      s16[i] = static_cast<_FP16>(cs[32u + i]);
+    }
+    std::vector<_FP16> x16 = f16_copy(x.data(), n);
+    nntrainer::compute_rotary_emb_value(n, kF16Hd, kF16Hd / 2u, x16.data(),
+                                        x16.data(), c16.data(), s16.data());
+    std::vector<float> y = x;
+    for (unsigned h = 0; h < heads; ++h) {
+      m1_rope64_det(y.data() + h * kF16Hd, cs.data());
+    }
+    const int bad = f16_count_bad(x16, y, "rope64");
+    std::cout << "ATTN_M1_F16 rope64 pos=" << pos << " bad=" << bad << " of "
+              << n << std::endl;
+    EXPECT_EQ(bad, 0) << "pos " << pos;
+  }
+}
+
+/**
+ * @brief The Android CPU's decode attention, chained as mha_core.cpp's
+ *        ENABLE_FP16 branch calls it (copyData, compute_rotary_emb_value
+ *        on q and on the new k row into the cache, compute_kcaches,
+ *        softmax_row_inplace, compute_fp16vcache_transposed), against
+ *        m1_rope64_det + attn_m1_det.h, bit for bit, at L = 1 .. 1536 with
+ *        attn_m1_cases.h's rows (the fused-FMA midpoint cases). Each L runs
+ *        twice: RoPE at position 0 (the identity, so the adversarial rows
+ *        survive it; the case counts are printed there only) and at
+ *        position L - 1.
+ */
+TEST(AttnM1F16Det, AttentionMatchesNeonFp16) {
+  const size_t row = (size_t)kF16Kv * kF16Hd, nq = (size_t)kF16Nq * kF16Hd;
+  for (unsigned L : {1u, 2u, 63u, 64u, 65u, 512u, 513u, 1024u, 1536u}) {
+    amc_rng rng{0x15200400u + L};
+    std::vector<float> q(nq), k(L * row), v(L * row), cs(64);
+    amc_fill_q(&rng, q.data(), kF16Nq, kF16Hd);
+    amc_fill_kv(&rng, k.data(), v.data(), L, kF16Kv, kF16Gqa, kF16Hd);
+    const uint32_t planted =
+      amc_plant_pv(q.data(), k.data(), v.data(), L, kF16Kv, kF16Gqa, kF16Hd);
+    for (unsigned pos : {0u, L - 1u}) {
+      f16_rope_cs(cs.data(), pos);
+      std::vector<_FP16> c16(32), s16(32);
+      for (unsigned i = 0; i < 32u; ++i) {
+        c16[i] = static_cast<_FP16>(cs[i]);
+        s16[i] = static_cast<_FP16>(cs[32u + i]);
+      }
+      /** The CPU: rows 0 .. L-2 of the caches as the earlier steps left
+         them (fp16), the new k row roped into the cache, q roped. */
+      std::vector<_FP16> q16 = f16_copy(q.data(), nq);
+      std::vector<_FP16> kc = f16_copy(k.data(), L * row);
+      std::vector<_FP16> vc = f16_copy(v.data(), L * row);
+      std::vector<_FP16> knew = f16_copy(k.data() + (L - 1u) * row, row);
+      nntrainer::compute_rotary_emb_value(row, kF16Hd, kF16Hd / 2u, knew.data(),
+                                          kc.data() + (L - 1u) * row,
+                                          c16.data(), s16.data());
+      nntrainer::compute_rotary_emb_value(nq, kF16Hd, kF16Hd / 2u, q16.data(),
+                                          q16.data(), c16.data(), s16.data());
+      std::vector<_FP16> sc((size_t)L * kF16Nq), o16(nq);
+      nntrainer::compute_kcaches(q16.data(), kc.data(), sc.data(), (int)L,
+                                 (int)kF16Kv, (int)kF16Hd, (int)kF16Gqa, 4);
+      nntrainer::softmax_row_inplace(sc.data(), 0, L, kF16Nq);
+      nntrainer::compute_fp16vcache_transposed((int)L - 1, sc.data(), vc.data(),
+                                               o16.data(), (int)kF16Kv,
+                                               (int)kF16Gqa, (int)kF16Hd);
+      /* The spec: the same rows, RoPE on q and on the last k row. */
+      std::vector<float> qs = q, ks = k, kt((size_t)kF16Kv * kF16Hd * L),
+                         vv((size_t)kF16Kv * L * kF16Hd), e(L), out(nq);
+      for (unsigned h = 0; h < kF16Nq; ++h) {
+        m1_rope64_det(qs.data() + h * kF16Hd, cs.data());
+      }
+      for (unsigned h = 0; h < kF16Kv; ++h) {
+        m1_rope64_det(ks.data() + (L - 1u) * row + h * kF16Hd, cs.data());
+      }
+      for (unsigned p = 0; p < L; ++p) {
+        for (unsigned h = 0; h < kF16Kv; ++h) {
+          attn_m1_det_append(kt.data() + (size_t)h * kF16Hd * L,
+                             vv.data() + (size_t)h * L * kF16Hd, kF16Hd, L, p,
+                             ks.data() + p * row + h * kF16Hd,
+                             v.data() + p * row + h * kF16Hd);
+        }
+      }
+      attn_m1_det_forward(qs.data(), kt.data(), vv.data(), kF16Kv, kF16Gqa,
+                          kF16Hd, L, L, 0.125f, e.data(), out.data(), nullptr);
+      const int bad = f16_count_bad(o16, out, "attention out");
+      std::cout << "ATTN_M1_F16 L=" << L << " rope_pos=" << pos
+                << " out bad=" << bad << " of " << nq
+                << " pv_cases=" << (pos == 0u ? planted : 0u)
+                << " score_cases=" << (pos == 0u && L > 3u ? 2u * (L - 3u) : 0u)
+                << std::endl;
+      EXPECT_EQ(bad, 0) << "L=" << L << " rope_pos=" << pos;
+    }
+  }
+}
+
+/**
+ * @brief exp16 through the CPU's own softmax: softmax_row_inplace(_FP16)
+ *        on two rows, 0 and d, one head per fp16 d <= 0 (all 31744 finite
+ *        values, -0 to -65504, which include plan 152's [-17.5, 0]). Then
+ *        p0 = 1 / (1 + e(d)) and p1 = e(d) / (1 + e(d)) against
+ *        attn_m1_det_softmax on {0, d}; for d < -7.6, 1 + e(d) rounds to 1
+ *        and p1 is e(d) itself, so the probe reads the exp directly.
+ */
+TEST(AttnM1F16Det, ExpProbeExhaustive) {
+  std::vector<float> d;
+  for (uint32_t b = 0x8000u; b < 0xFC00u; ++b) {
+    const uint16_t hb = static_cast<uint16_t>(b);
+    _FP16 h;
+    std::memcpy(&h, &hb, sizeof(h));
+    d.push_back(static_cast<float>(h));
+  }
+  const size_t heads = (d.size() + 7u) & ~(size_t)7u;
+  std::vector<_FP16> sc(2u * heads, static_cast<_FP16>(0.0f));
+  for (size_t i = 0; i < d.size(); ++i) {
+    sc[heads + i] = static_cast<_FP16>(d[i]);
+  }
+  nntrainer::softmax_row_inplace(sc.data(), 0, 2, heads);
+  int bad0 = 0, bad1 = 0, bad_range = 0;
+  for (size_t i = 0; i < d.size(); ++i) {
+    float s[2] = {0.0f, d[i]};
+    attn_m1_det_softmax(s, 2u, nullptr, nullptr);
+    const bool b0 = f16_bits(static_cast<float>(sc[i])) != f16_bits(s[0]);
+    const bool b1 =
+      f16_bits(static_cast<float>(sc[heads + i])) != f16_bits(s[1]);
+    if ((b0 || b1) && bad0 + bad1 == 0) {
+      std::cout << "ATTN_M1_F16 exp probe first mismatch d=" << std::hexfloat
+                << d[i] << " cpu=(" << static_cast<float>(sc[i]) << ", "
+                << static_cast<float>(sc[heads + i]) << ") spec=(" << s[0]
+                << ", " << s[1] << ")" << std::defaultfloat << std::endl;
+    }
+    bad0 += b0;
+    bad1 += b1;
+    bad_range += (b0 || b1) && d[i] >= -17.5f;
+  }
+  std::cout << "ATTN_M1_F16 exp probe d<=0 n=" << d.size() << " bad_p0=" << bad0
+            << " bad_p1=" << bad1 << " bad_in[-17.5,0]=" << bad_range
+            << std::endl;
+  EXPECT_EQ(bad0 + bad1, 0);
 }
 
 int main(int argc, char **argv) {

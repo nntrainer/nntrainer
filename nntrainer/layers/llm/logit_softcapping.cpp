@@ -12,6 +12,8 @@
 
 #include "logit_softcapping.h"
 
+#include <nntr_htp_decode_hook.h>
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -74,6 +76,16 @@ void LogitSoftCappingLayer::incremental_forwarding(
   bool training) {
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
+    return;
+
+  // The completed HTP id-only path leaves CPU logits stale. Sampling,
+  // teacher-forced NLL and other logit consumers still run the softcap.
+  const auto &input = context.getInput(SINGLE_INOUT_IDX);
+  if (!training && to - from == 1u && input.batch() == 1u &&
+      input.channel() == 1u &&
+      input.getDataType() == nntrainer::TensorDim::DataType::FP32 &&
+      std::get<props::ApplyRows>(logit_softcap_props).get() == 1u &&
+      htpDecodeHasTokenId(from))
     return;
 
   applyOnRange(context, from, to);

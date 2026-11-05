@@ -11,6 +11,7 @@
  *
  */
 
+#include <cstdlib>
 #include <embedding.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
@@ -71,9 +72,22 @@ void EmbeddingLayer::finalize(InitLayerContext &context) {
   dim.width(out_dim);
   dim.batch(1);
 
+  // [#4416 mem] NNTR_EMBEDDING_MMAP=1: the table stays in the model file
+  // and is mapped read-only at the first forward (a virtual tensor, as the
+  // FSU experts); only the rows a token reads become resident instead of
+  // the whole table (Gemma-4 26B: 415 MB of Q4_0 on the host for one row a
+  // token). ponytail: an environment knob, not a layer property; the model
+  // builder is the upgrade path.
+  static const bool mmap_weight = std::getenv("NNTR_EMBEDDING_MMAP") != nullptr;
   weight_idx = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+    weight_decay, "Embedding", true, mmap_weight);
+}
+
+/** @brief Maps a virtual (file-backed) table once; a no-op otherwise. */
+static void ensureMapped(Tensor &weight) {
+  if (weight.isVirtual() && !weight.isActivated())
+    weight.activate();
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -87,6 +101,7 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int out_dim = std::get<props::OutDim>(embedding_props);
 
   Tensor &weight = context.getWeight(weight_idx);
+  ensureMapped(weight);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   TensorDim out_tensor_dim =
@@ -103,10 +118,10 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * i);
+      Tensor cur_weight = weight.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * embed_idx);
+      Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * i);
       out_tensor.copyData(cur_weight);
     }
   }
@@ -127,6 +142,7 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
   }
 
   Tensor &weight = context.getWeight(weight_idx);
+  ensureMapped(weight);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
@@ -144,11 +160,11 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      Tensor cur_weight = weight.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * embed_idx);
 
       Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
-        out_tensor_dim, out_dim * (i - from));
+        out_tensor_dim, static_cast<size_t>(out_dim) * (i - from));
 
       out_tensor.copyData(cur_weight);
     }
@@ -194,7 +210,8 @@ void EmbeddingLayer::calcGradient(RunLayerContext &context) {
 
         float *djdw_data = djdw.getAddress<float>(embed_idx * out_dim);
         const float *grad_data = derivative_.getAddress<float>(
-          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+          b * derivative_.getDim().getFeatureLen() +
+          static_cast<size_t>(i) * out_dim);
 
         std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
                        std::plus<float>());
@@ -210,7 +227,8 @@ void EmbeddingLayer::calcGradient(RunLayerContext &context) {
 
         _FP16 *djdw_data = djdw.getAddress<_FP16>(embed_idx * out_dim);
         const _FP16 *grad_data = derivative_.getAddress<_FP16>(
-          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+          b * derivative_.getDim().getFeatureLen() +
+          static_cast<size_t>(i) * out_dim);
 
         std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
                        std::plus<_FP16>());

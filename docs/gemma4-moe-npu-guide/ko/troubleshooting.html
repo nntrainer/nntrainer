@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="문제 해결 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>문제 해결 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../troubleshooting.html">
+<link rel="alternate" hreflang="ko" href="troubleshooting.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="troubleshooting.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../troubleshooting.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="troubleshooting.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../troubleshooting.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html" aria-current="page">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>참고 자료</span><span aria-hidden="true">/</span><span>문제 해결</span></div>
+<article><h1 id="10-troubleshooting">10. 문제 해결</h1>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>증상</th>
+<th>확인 및 해결 방법</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>adb</code>에서 <code>unauthorized</code> 표시</td>
+<td>휴대전화 잠금을 해제하고 USB 디버깅을 승인합니다. 요청이 나타나지 않으면 케이블을 다시 연결하세요.</td>
+</tr>
+<tr>
+<td>Ubuntu에서 <code>adb</code> 권한 오류</td>
+<td>USB 규칙용 <code>android-sdk-platform-tools-common</code>을 설치하고 기기를 다시 연결합니다. 필요하면 배포판 안내에 따라 <code>plugdev</code> 그룹을 설정하세요.</td>
+</tr>
+<tr>
+<td><code>more than one device/emulator</code></td>
+<td>각 호스트 터미널에서 대상 기기의 시리얼을 <code>ANDROID_SERIAL</code>로 지정합니다.</td>
+</tr>
+<tr>
+<td><code>--htp requires ...</code></td>
+<td>현재 터미널에서 Hexagon SDK 환경을 불러오고 HexKL/Android 변수를 다시 내보냅니다.</td>
+</tr>
+<tr>
+<td><code>libsdkl.so</code> 또는 <code>libhexkl_micro.a</code> 누락</td>
+<td>압축 해제 루트와 <code>6.4.0.1</code>, <code>armv8_android26</code>, <code>hexagon_toolv19_v81</code> 하위 디렉터리를 확인합니다. ZIP이나 상위 디렉터리를 지정하지 마세요.</td>
+</tr>
+<tr>
+<td>빌드가 <code>HEX_ARCH</code>를 거부</td>
+<td>이 Android 경로는 <code>v81</code>이 필요합니다. 다른 값을 설정한다고 다른 기기를 지원하게 되지는 않습니다.</td>
+</tr>
+<tr>
+<td><code>cargo</code> 또는 Android 토크나이저 아카이브 누락</td>
+<td>Rust/Cargo가 <code>PATH</code>에 있고 <code>aarch64-linux-android</code> 타깃이 설치되었는지, <code>ANDROID_NDK</code>가 올바른지 확인한 뒤 다시 빌드합니다.</td>
+</tr>
+<tr>
+<td>Gradle이 SDK나 라이선스를 찾지 못함</td>
+<td><code>ANDROID_HOME</code>, 플랫폼 36/build-tools/CMake 설치 상태, <code>sdkmanager --licenses</code>를 확인합니다. 오래된 <code>local.properties</code>가 다른 SDK를 가리킬 수 있습니다.</td>
+</tr>
+<tr>
+<td>Gradle의 Java 또는 NDK 불일치</td>
+<td><code>java -version</code>, <code>JAVA_HOME</code>, <code>ANDROID_NDK/source.properties</code>를 확인합니다. <code>-PnntrainerNdkPath</code>를 전달하는 표준 빌드 스크립트를 사용하세요.</td>
+</tr>
+<tr>
+<td><code>--htp and --qnn select separate native variants</code></td>
+<td>이전 스크립트의 오류입니다. 기준 리비전은 <code>--qnn --htp</code>를 지원하며, 이 가이드에는 <code>--htp</code>만 필요합니다. 체크아웃을 확인하세요.</td>
+</tr>
+<tr>
+<td><code>CANNOT LINK EXECUTABLE</code> / <code>.so</code> 누락</td>
+<td><code>run_causallm.sh</code>를 사용하고 전체 런타임을 다시 배포한 뒤 <code>LD_LIBRARY_PATH</code>를 확인합니다.</td>
+</tr>
+<tr>
+<td>CLI가 매우 느림 / DSP 열기 실패 / CPU fallback</td>
+<td><code>ADSP_LIBRARY_PATH</code>, v81 skel, vendor FastRPC와 기기 호환성을 확인합니다. 터미널 출력과 logcat을 모두 살펴보세요.</td>
+</tr>
+<tr>
+<td><code>HTP_GRAPH_E_UNSUPPORTED</code></td>
+<td>ARM과 DSP 산출물이 서로 다른 빌드에서 왔을 수 있습니다. 같은 빌드의 전체 세트를 다시 빌드하고 배포하세요.</td>
+</tr>
+<tr>
+<td>API가 <code>ADSP_LIBRARY_PATH</code> 충돌 보고</td>
+<td>최신 <code>run_test.sh</code>를 빌드·설치하세요. 경로 끝에 콜론이 없어야 하며 <code>QUICKAI_NATIVE_LIB_DIR</code>와 같아야 합니다.</td>
+</tr>
+<tr>
+<td>두 번째 생성에서 <code>rows [...] do not fit a KV cache</code> 오류</td>
+<td>새 프롬프트마다 attention 캐시 기준 위치를 초기화하는 수정이 반영되었습니다. 같은 빌드의 런타임 라이브러리와 DSP 이미지를 다시 배포하고 7단계 수명 주기 명령으로 반복 생성을 확인하세요.</td>
+</tr>
+<tr>
+<td>앱에서 <code>Unload failed</code> 표시</td>
+<td>네이티브 작업 프로세스가 정상적으로 해제되지 않은 상태입니다. 표시된 오류를 해결하고 Unload를 다시 시도한 뒤 다른 모델을 로드하세요.</td>
+</tr>
+<tr>
+<td>앱이 모델 팩을 찾지 못함</td>
+<td>Base path, 정확한 디렉터리 이름, 모든 파일 접근 권한, <code>adb push</code> 후 디렉터리가 추가 중첩되었는지 확인합니다.</td>
+</tr>
+<tr>
+<td>앱이 설정을 찾았지만 로드 실패</td>
+<td>가중치 파일 이름과 크기, 최상위 텍스트 모델 설정, 참조된 보조 파일, 제공자의 체크섬을 확인합니다. 설정과 가중치는 같은 팩의 것을 사용하세요.</td>
+</tr>
+<tr>
+<td><code>INSTALL_FAILED_UPDATE_INCOMPATIBLE</code></td>
+<td>이미 설치된 APK의 서명 키가 다릅니다. 가능한 한 같은 키를 사용하세요. 교체해야 한다면 필요한 앱 데이터를 백업한 뒤 기존 앱을 삭제하고 새 APK를 설치합니다. 삭제 시 앱의 내부 데이터도 지워집니다.</td>
+</tr>
+<tr>
+<td>앱이 16 KB 메모리 페이지 경고 표시</td>
+<td>기준 기기는 4 KB 페이지를 사용합니다. 경고가 있다고 16 KB 기기와 호환되는 것은 아닙니다. <code>getconf PAGE_SIZE</code>가 4096인지 확인하세요.</td>
+</tr>
+<tr>
+<td>답변이 thought 채널 마커로 시작</td>
+<td>logcat에서 <code>Chat template apply failed</code>를 확인하고 제공자/프리셋의 맞는 채팅 템플릿을 복원합니다. 가중치 형식 설정을 다른 프리셋으로 덮어쓰지 마세요.</td>
+</tr>
+<tr>
+<td>답변이 멈추지 않거나 항상 같은 길이</td>
+<td>벤치마크용 팩일 수 있습니다. EOS 종료가 설정된 채팅 프리셋을 요청하세요. 팔레트 프리셋의 EOS ID는 <code>[1, 106, 50]</code>이고 <code>bad_word_ids</code>는 비어 있습니다.</td>
+</tr>
+<tr>
+<td>이전 메시지나 긴 프롬프트의 끝을 무시</td>
+<td>HTP 앱의 각 호출은 독립적이며 긴 프롬프트는 잘릴 수 있습니다. 짧고 독립적인 질문으로 확인하세요.</td>
+</tr>
+<tr>
+<td>로드 또는 생성 중 앱 종료</td>
+<td>제공자의 설정을 기준으로 컨텍스트/캐시 사용을 줄이고 메모리를 많이 쓰는 다른 앱을 종료합니다. CLI와 앱 추론을 동시에 시작하지 마세요.</td>
+</tr>
+</tbody>
+</table></div>
+<p>문제를 보고할 때 기준 소스 해시, SDK/HexKL/NDK 버전, 기기 모델/OS/페이지 크기,
+실패한 명령, 팩 형식, 관련 빌드 또는 실행 로그를 포함하세요.
+로그에는 프롬프트와 답변이 들어갈 수 있으므로 공유 전에 확인하세요.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="benchmarks.html"><small>이전</small><span>벤치마크 결과</span></a><a class="pager-next" href="maintaining-guide.html"><small>다음</small><span>문서 관리</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

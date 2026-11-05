@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="문서 관리 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>문서 관리 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../maintaining-guide.html">
+<link rel="alternate" hreflang="ko" href="maintaining-guide.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="maintaining-guide.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../maintaining-guide.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="maintaining-guide.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../maintaining-guide.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html" aria-current="page">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>참고 자료</span><span aria-hidden="true">/</span><span>문서 관리</span></div>
+<article><h1 id="11-open-and-maintain-the-html-guide">11. HTML 문서 열기 및 관리</h1>
+<p><code>gemma4-moe-npu-guide/index.html</code>은 소개, 11개 섹션과 LFM2 벤치마크 부록을 개별 페이지로 제공합니다.
+분류된 사이드바, 페이지별 목차, 이전/다음 링크, 본문 검색, 코드 복사, 밝은/어두운
+테마를 사용할 수 있습니다. 작은 화면에서는 메뉴 버튼으로 탐색 메뉴를 여세요.
+검색은 <strong>Ctrl+K</strong>, macOS에서는 <strong>Command+K</strong>로도 열 수 있습니다.</p>
+<p>페이지의 <strong>한국어 / English</strong> 선택으로 현재 섹션과 소제목 위치를 유지한 채 언어를
+바꿀 수 있습니다. 한국어 페이지는 <code>gemma4-moe-npu-guide/ko/index.html</code>에서 시작합니다.
+검색과 메뉴도 선택한 언어를 따릅니다. 기본 영어 시작 페이지를 여는 명령은 아래와 같으며,
+한국어로 바로 열려면 경로의 <code>index.html</code>을 <code>ko/index.html</code>로 바꾸세요.</p>
+<p>탐색 구조는 <a href="https://xgrammar.mlc.ai/docs/latest/">XGrammar 문서</a>의 방식을 참고했습니다.
+스타일, 스크립트, 검색 색인은 모두 로컬 파일이므로 CDN이나 온라인 검색 서비스가
+필요하지 않습니다.</p>
+<p>Linux 데스크톱에서 이 문서가 있는 체크아웃을 기준으로 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">xdg-open docs/gemma4-moe-npu-guide/index.html
+</code></pre>
+<p>localhost에서 보려면 가이드가 있는 체크아웃의 저장소 루트에서 다음 명령을 실행하고
+터미널을 유지합니다. 커밋된 HTML을 제공하는 데는 Python 3만 필요하며, 별도 패키지를
+설치하거나 HTML을 다시 생성할 필요가 없습니다.</p>
+<pre tabindex="0"><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py
+</code></pre>
+<p>영문은 <code>http://localhost:8765/</code>, 한국어는 <code>http://localhost:8765/ko/</code>를 엽니다.
+서버가 두 주소를 출력하며 기본으로 <code>127.0.0.1</code>에서 실행됩니다. 이 문서와 관련 리소스,
+Markdown 원본, 단일 페이지 보기를 제공합니다. 다른 포트를 쓰려면 <code>--port 9000</code>을
+추가하세요. 다른 기기에서도 접근하려면 <code>--bind 0.0.0.0</code>을 추가하고 해당 기기에서
+<code>http://&lt;host-ip&gt;:8765/</code>를 엽니다. <strong>Ctrl+C</strong>로 종료하고 같은 명령으로 다시 시작할 수
+있습니다. 포트가 사용 중이면 기존 가이드 서버를 종료하거나 다른 포트를 선택하세요.
+페이지를 재생성한 뒤에는 브라우저를 새로고침합니다.</p>
+<p>기존 <code>gemma4-moe-npu-guide.html</code>은 독립 파일로 유지됩니다.
+한국어 단일 페이지 파일은 <code>gemma4-moe-npu-guide.ko.html</code>입니다. 전체 내용과 스타일이
+한 파일에 들어 있습니다. 오프라인에서 스크린샷과 벤치마크 자료도 열려면 옆의
+<code>gemma4-moe-npu-guide/assets/</code> 디렉터리를 함께 유지하세요. 페이지별 사이트를
+복사하려면 <code>gemma4-moe-npu-guide/</code> 전체와 옆에 있는 영어·한국어 <code>.html</code>, <code>.md</code> 파일을
+함께 복사하세요. 브라우저의 <strong>인쇄 → PDF로 저장</strong>은 인쇄 스타일을 사용합니다.
+가이드 전체를 인쇄하려면 단일 페이지 보기를 선택하세요. 외부 참고 링크를 열려면
+인터넷 연결이 필요합니다.</p>
+<p>내용의 원본은 영어 <code>gemma4-moe-npu-guide.md</code>와 한국어 <code>gemma4-moe-npu-guide.ko.md</code>입니다.
+수정 후 같은 체크아웃에서 HTML을 재생성합니다. 렌더러는 기준 PR 소스가 아닌
+이번 문서 추가 작업에 포함된 도구입니다.</p>
+<pre tabindex="0"><code class="language-bash">python3 -m venv /tmp/nntr-guide-venv
+/tmp/nntr-guide-venv/bin/python -m pip install markdown-it-py==3.0.0
+/tmp/nntr-guide-venv/bin/python tools/render_gemma4_npu_guide.py
+/tmp/nntr-guide-venv/bin/python tools/render_gemma4_npu_guide.py --check
+</code></pre>
+<p>렌더러는 두 언어의 단일 페이지 HTML, 언어별 13개 페이지, 검색 색인을 함께 갱신합니다.
+본문은 각 언어의 Markdown에서, 표현과 동작은 사이트 디렉터리의 <code>assets/site.css</code>와
+<code>assets/site.js</code>에서 수정하세요. 두 원본의 제목 계층과 순서는 일치하게 유지합니다.
+명령 블록을 바꿀 때는 두 언어에 함께 반영하세요. 생성된 HTML과 각 언어의
+<code>assets/search-index.js</code>는 직접 수정하지 않습니다.</p>
+<h2 id="validation-boundaries-and-references">검증 범위 및 참고 자료</h2>
+<p>11월 5일에 기준 PR의 빌드 스크립트, CLI 파서, 앱 조작 화면, 벤치마크 실행기와
+팩 제한 파서를 대조했습니다. 두 빌드 스크립트가 HexKL <code>6.4.0.1</code>을 선택하는 것을
+확인했고, SM-S948U에서 Metrics 화면을 직접 확인해 다시 캡처했습니다.
+<strong>이번 문서 업데이트에서는 SDK 신규 설치, Android 빌드, 모델 벤치마크를 새로
+실행하지 않았습니다.</strong> 11월 4일 대화 예시는 당시 설치된 Quick.AI 2.0과 제공된
+TL2 팩을 사용했습니다. 설치된 APK의 소스 커밋은 확인하지 않았습니다.
+캡처와 PR의 기존 빌드·기기 검증 기록은 이 가이드 전체를 새로 실행한 결과가 아닙니다.</p>
+<p>11월 4일 벤치마크는 SM-S948U에 배포된 TL2 팩으로 별도 측정했습니다. 입력 1K·2K·4K·8K마다
+CLI를 3회씩 실행하고 모든 출력이 128토큰인지 확인했습니다. 런타임 라이브러리는
+설치된 앱과 SHA-256이 같은지 검증했으며, 원본 로그·토큰 트레이스·설정·바이너리 해시를
+결과와 함께 제공합니다.
+이 기록은 변경하지 않았으며 업데이트된 SDK/HexKL 설정이나 현재 앱의 Metrics
+동작으로 다시 측정한 결과가 아닙니다.</p>
+<p>차이가 발견되면 다음 고정 리비전의 소스를 참고하세요.</p>
+<ul>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/build_android.sh">Android 빌드 스크립트</a>: 지원 옵션, 필수 조건, 산출물, 배포.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/nntrainer/tensor/htp_backend/dsp/build.sh">DSP 빌드 스크립트</a>: HexKL 선택과 DSP 검사.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/main.cpp">CLI 구현</a>: 위치 인자와 프롬프트 처리.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/build.md">Quick.AI 빌드 문서</a>: 기록된 환경과 빌드 절차.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/cli.md">CLI 및 C API 테스트 문서</a>: 실행 명령과 수명 주기 테스트.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/app.md">앱 사용법</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/troubleshooting.md">알려진 제약</a>: 조작 방법, 권한, 오류 유형.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/ui/MetricsScreen.kt">Metrics 화면</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerPrompts.kt">프롬프트·팩 제한</a>: 길이 선택, 결과, 비활성화 조건.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerRunner.kt">측정 실행기</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerFiles.kt">결과 저장</a>: 온도 대기, 대화 초기화, CSV 경로.</li>
+</ul>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="troubleshooting.html"><small>이전</small><span>문제 해결</span></a><a class="pager-next" href="lfm2-benchmarks.html"><small>다음</small><span>LFM2 벤치마크 결과</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#validation-boundaries-and-references">검증 범위 및 참고 자료</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

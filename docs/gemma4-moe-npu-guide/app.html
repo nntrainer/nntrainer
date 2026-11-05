@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Quick.AI app — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>Quick.AI app — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="app.html">
+<link rel="alternate" hreflang="ko" href="ko/app.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/app.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="app.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/app.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="app.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html" aria-current="page">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Run</span><span aria-hidden="true">/</span><span>Quick.AI app</span></div>
+<article><h1 id="8-build-and-install-the-quickai-app">8. Build and install the Quick.AI app</h1>
+<p>The instructions follow the updated app at the source revision above. The
+model-selection and chat examples are real <strong>Quick.AI 2.0</strong> captures from
+November 4, 2026 (Galaxy S26 Ultra SM-S948N / SM-S948U, Android 16, 4 KB pages).
+The Metrics image was refreshed on November 5 on SM-S948U and shows the
+benchmark setup. The installed APKs' source commits were not established;
+the captures illustrate the controls, while the pinned source defines their
+behaviour. Click an image to open its full-resolution capture.</p>
+<h2 id="build-and-install-the-apk">Build and install the APK</h2>
+<p>On the <strong>host</strong>, reuse the same environment and source revision:</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT/Applications/CausalLM&quot;
+set -o pipefail
+./build_android.sh --htp --cache --app 2&gt;&amp;1 | tee &quot;$NNTR_ROOT/gemma4-app-build.log&quot;
+</code></pre>
+<p>This stages the native libraries, builds the library AAR and sample APK, and
+runs <code>verify_native_package.py</code>. That verification checks required libraries,
+the unmodified v81 DSP image and native library dependencies. It also rejects
+unwanted QNN or vendor <code>libcdsprpc.so</code> libraries in the HTP package.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Artifact</th>
+<th>Location relative to <code>NNTR_ROOT</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AAR for application developers</td>
+<td><code>Applications/CausalLM/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar</code></td>
+</tr>
+<tr>
+<td>Installable APK</td>
+<td><code>Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk</code></td>
+</tr>
+<tr>
+<td>Native package verification report</td>
+<td>The APK path followed by <code>.native-manifest.json</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The <strong>APK</strong> installs on the phone. The <strong>AAR</strong> is a library for building other
+apps and cannot be installed with <code>adb install</code>.</p>
+<p>Install the completed APK from the <strong>host</strong>:</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT&quot;
+adb install -r -t Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk
+adb shell appops set com.example.quickdotaiapp MANAGE_EXTERNAL_STORAGE allow
+adb shell pm path com.example.quickdotaiapp
+</code></pre>
+<p><code>adb install</code> should end with <code>Success</code>; <code>pm path</code> should return the installed
+APK location. The permission command allows reading the pack under <code>/sdcard</code>.
+You can instead grant <strong>All files access</strong> when the app opens the Android
+permission screen, or through Settings → Apps → Special access → All files
+access → Quick.AI (wording may vary).</p>
+<p>As an alternative to separate build/install commands,
+<code>./build_android.sh --htp --cache --app --install</code> builds the AAR/APK, installs
+the APK and also deploys the CLI runtime. Neither approach copies model weights;
+complete step 6 separately.</p>
+<h2 id="load-the-model-and-send-a-message">Load the model and send a message</h2>
+<p>Follow <strong>model selection → load confirmation → send a message</strong>. The model
+selection capture uses the default base path. The load and chat
+captures use a TL2 pack already available on the other phone under
+<code>/sdcard/Download/aistudio-mobile/models_1022</code>. If you copied your pack as in
+step 6, use <code>/sdcard/Download/aistudio-mobile/models</code> from the table below.</p>
+<h2 id="1-select-gemma4-npu-and-the-model-path">1. Select Gemma4 NPU and the model path</h2>
+<p>Tap the <strong>model chip</strong> below the top bar to open <strong>Model</strong>.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Select or check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>FAMILY</strong></td>
+<td><code>gemma4-26b-a4b</code></td>
+</tr>
+<tr>
+<td><strong>RUNTIME</strong></td>
+<td><code>Quick.AI</code></td>
+</tr>
+<tr>
+<td><strong>BACKEND</strong></td>
+<td><code>NPU</code></td>
+</tr>
+<tr>
+<td><strong>MODEL VARIANT</strong></td>
+<td><code>Gemma4 26B A4B MoE (HTP)</code> for this guide. This row appears when the selected family/runtime/backend offers multiple packs.</td>
+</tr>
+<tr>
+<td><strong>BASE PATH</strong></td>
+<td><code>/sdcard/Download/aistudio-mobile/models</code> — the parent containing <code>gemma4-26b-a4b-htp-w4a32</code></td>
+</tr>
+<tr>
+<td>Config status</td>
+<td><code>gemma4-26b-a4b-htp-w4a32/nntr_config.json found</code></td>
+</tr>
+<tr>
+<td>Model badge</td>
+<td><code>HTP · W4A32 · Gemma4 26B A4B MoE (HTP)</code></td>
+</tr>
+</tbody>
+</table></div>
+<figure class="app-screenshot"><a href="assets/screenshots/02-model-selection.png"><img src="assets/screenshots/02-model-selection.png" alt="Model sheet with Gemma4, Quick.AI, NPU, MODEL VARIANT and a found configuration file" loading="lazy" decoding="async"></a><figcaption>Screen 1. The SM-S948U capture includes MODEL VARIANT. Choose the standard HTP pack here; the 30k demo requires its own pack. Scroll down if Load model is partly below the screen.</figcaption></figure>
+<p>The <code>found</code> indicator only confirms a config file exists; the load can still
+fail if weights or sidecars are missing. If Gemma4 NPU is absent from the model
+list, check that the installed APK came from the <code>--htp</code> build.</p>
+<h2 id="2-confirm-the-model-has-loaded">2. Confirm the model has loaded</h2>
+<p>Tap <strong>Load model</strong> and wait. Once the <strong>Model</strong> sheet says <strong>Loaded</strong>, close
+it with <strong>×</strong> at the top right. The chat status should read
+<code>Loaded gemma4-26b-a4b-htp ...</code>, and the conversation area should say
+<strong>Model loaded · start a conversation</strong>. Load time depends on the pack and
+the phone's state.</p>
+<figure class="app-screenshot"><a href="assets/screenshots/03-model-loaded.png"><img src="assets/screenshots/03-model-loaded.png" alt="Chat screen with Loaded gemma4-26b-a4b-htp and the Model loaded message" loading="lazy" decoding="async"></a><figcaption>Screen 2. The model has loaded. Send remains disabled while the message field is empty.</figcaption></figure>
+<p>Resolve <strong>Load failed</strong> before sending a question. Check <strong>BASE PATH</strong> and
+permissions first; if the config is <strong>found</strong>, check pack compatibility with
+the installed app and the presence of all required files.</p>
+<h2 id="3-send-a-question-and-stop-generation">3. Send a question and stop generation</h2>
+<p>Enter <code>Explain neural networks in two sentences.</code> in <strong>Type a message…</strong>
+and tap the <strong>Send</strong> arrow on the right. The answer streams into the chat;
+the status becomes <strong>Done.</strong> when it finishes. Use Android's Back action to
+hide the keyboard if it covers the answer.</p>
+<figure class="app-screenshot"><a href="assets/screenshots/04-chat-response.png"><img src="assets/screenshots/04-chat-response.png" alt="Gemma4 response to a two-sentence neural-network question with Done status and token statistics" loading="lazy" decoding="async"></a><figcaption>Screen 3. An actual completed response. The line below it shows time to first token (TTFT), generation speed and output token count.</figcaption></figure>
+<p>During generation, <strong>Stop</strong> replaces Send. Cancelling marks the turn
+<strong>stopped</strong>. The top-bar trash icon, <strong>Clear conversation</strong>, clears the visible
+chat. To release the model, use <strong>Unload</strong> in the model sheet.</p>
+<p>At this revision the HTP app sends <strong>only the newest user message</strong>. Earlier
+chat bubbles are not conversation memory for this model. Keep initial prompts
+short: prompts beyond the configured context can be truncated without an
+error. The palette chat preset has 2,304 positions, a 2,048-token prompt limit
+and a 256-token answer budget; supplied TL2 packs can have different limits.
+Updating the app does not rewrite a previously copied pack's configuration.
+Increasing context can materially increase RAM use.
+These Gemma4 HTP packs are text-only; the app's image controls for other models
+do not make this path multimodal.</p>
+<h2 id="4-check-metrics-and-unload">4. Check Metrics and unload</h2>
+<p>Open <strong>Metrics</strong> to run a speed benchmark with bundled text. Load the model,
+choose the lengths and repetitions below, then scroll down and tap <strong>Run</strong>.
+The initial choices are <strong>1K / 128 / 3</strong>, with the thermal wait off.</p>
+<figure class="app-screenshot"><a href="assets/screenshots/05-metrics.png"><img src="assets/screenshots/05-metrics.png" alt="Updated Metrics benchmark with prefill and decode token choices, repeats and the thermal-wait switch" loading="lazy" decoding="async"></a><figcaption>Screen 4. Benchmark setup captured on SM-S948U on November 5. No model is loaded in this capture. Load a model, then scroll below the thermal switch to Run.</figcaption></figure>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Choices and behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PREFILL TOKENS</strong></td>
+<td>128, 256, 512, 1K, 2K or 4K nominal tokens of bundled text.</td>
+</tr>
+<tr>
+<td><strong>DECODE TOKENS</strong></td>
+<td>32, 64, 128 or 256; the app stops the answer at the selected length.</td>
+</tr>
+<tr>
+<td><strong>REPEATS</strong></td>
+<td>1, 3 or 5 runs.</td>
+</tr>
+<tr>
+<td><strong>Wait for a cool phone</strong></td>
+<td>Optional wait of up to 90 seconds before each run; off by default.</td>
+</tr>
+<tr>
+<td><strong>Run / Stop</strong></td>
+<td>Run requires a loaded, idle model and lengths that fit its pack. Stop ends the measurement.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The benchmark uses its own prompt, sized at roughly four characters per token,
+and asks for a detailed retelling. The per-run table reports the actual token
+counts. Each repeat clears the visible chat before sending that prompt; save
+any conversation text you need first.</p>
+<p>For native models the app reads <code>max_seq_len - num_to_generate</code> as the prompt
+budget and <code>num_to_generate</code> as the answer budget, disabling choices above
+them. The current palette preset therefore disables 4K prefill. An engine's
+prefill limit can further shorten the actual prompt; inspect the reported
+counts. Changing a choice does not change the pack's context configuration.</p>
+<p>Results show the median <strong>TIME TO FIRST TOKEN</strong> (send to first token in the
+app), <strong>PREFILL</strong> throughput from engine timing, and <strong>DECODE</strong> throughput
+from first to last token using wall time. Each row gives prompt/answer counts
+and timings. Early answers, skipped runs and decode windows shorter than one
+second are marked; eligible runs contribute to the displayed medians. The
+first run after loading can include warm-up and is not automatically excluded.</p>
+<p>With all-files access, the CSV is appended to
+<code>/sdcard/Download/QuickAI/power/bench.csv</code>; otherwise the app uses its own
+external-files directory. Check the displayed <strong>Saved to</strong> path. The former
+last-chat metrics, peak-memory tile and raw-output history have been removed.
+Per-answer chat statistics remain under the answers. The chat stream omits
+turn markers such as <code>&lt;turn|&gt;</code>; use the native token trace for Gemma4 end-of-turn
+ID <code>106</code>.</p>
+<h2 id="5-measure-power">5. Measure power</h2>
+<p>The <strong>Power</strong> tab measures whole-phone battery-gauge energy per output token.
+After loading a model, choose <strong>PROMPT</strong>, <strong>WINDOW TOKENS</strong>, <strong>REPEATS</strong> and
+<strong>BASELINE</strong>, then tap <strong>Measure</strong> and unplug the cable when prompted. The run
+waits for a cool phone, records idle power, generates the answer and cools down.
+Keep <strong>Measure while plugged</strong> off for power measurements; it is a debug option.</p>
+<p>Power results include baseline-adjusted <code>mJ/token</code>, power and per-run records.
+With all-files access, <code>runs.csv</code> and session JSON files go under
+<code>/sdcard/Download/QuickAI/power/</code>. Metrics can run with USB attached and has no
+power baseline or cool-down. Finish one measurement before starting the other.</p>
+<p>When finished, or before running the CLI, open the top model chip and tap
+<strong>Unload</strong>. Use <strong>Load model</strong> to start again, or <strong>Reload model</strong> to replace
+an already loaded instance. The latest app runs native inference in a private
+worker and waits for it to exit before loading the next model. Load one NPU
+model at a time.</p>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="cli.html"><small>Previous</small><span>CLI inference</span></a><a class="pager-next" href="benchmarks.html"><small>Next</small><span>Benchmark results</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 5, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#build-and-install-the-apk">Build and install the APK</a></li><li><a href="#load-the-model-and-send-a-message">Load the model and send a message</a></li><li><a href="#1-select-gemma4-npu-and-the-model-path">1. Select Gemma4 NPU and the model path</a></li><li><a href="#2-confirm-the-model-has-loaded">2. Confirm the model has loaded</a></li><li><a href="#3-send-a-question-and-stop-generation">3. Send a question and stop generation</a></li><li><a href="#4-check-metrics-and-unload">4. Check Metrics and unload</a></li><li><a href="#5-measure-power">5. Measure power</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

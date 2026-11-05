@@ -30,10 +30,15 @@
 #include "json.hpp"
 #include <app_context.h>
 #include <factory.h>
+#include <thread_manager.h>
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "lfm2_runtime_defaults.h"
 #include "model_registry.h"
+#ifdef NNTR_STATIC_MODEL_EXTENSION
+#include "api/ext_model_loader.h"
+#endif
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -198,6 +203,10 @@ std::string resolve_architecture(std::string model_type,
  * @brief Entry point for loading, initializing, and running a CausalLM model.
  */
 int main(int argc, char *argv[]) {
+#ifdef NNTR_STATIC_MODEL_EXTENSION
+  // Drain the archive's registration queue only after every TU initialized.
+  quick_dot_ai::ensureExtensionModels();
+#endif
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -242,12 +251,41 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+#ifdef ENABLE_HEXKL
+    if (causallm::configureLfm2HtpDefaults(
+          cfg.value("model_type", std::string()),
+          nntr_cfg.value("lfm2_weight_format", std::string()),
+          nntr_cfg.value("lfm2_execution_profile", std::string()), nntr_cfg))
+      std::cerr
+        << "[LFM2] SR15 HTP CLI defaults active; explicit configuration "
+           "values take precedence\n";
+
+#endif
+    if (nntr_cfg.contains("num_threads") &&
+        std::getenv("NNTR_NUM_THREADS") == nullptr) {
+      unsigned threads = 0;
+      causallm::detail::readHtpConfigValue(nntr_cfg.at("num_threads"), threads,
+                                           "num_threads");
+      if (threads == 0)
+        throw std::invalid_argument("num_threads must be positive");
+      nntrainer::ThreadManagerConfig threading;
+      threading.compute_threads = threads;
+      nntrainer::ThreadManager::setConfig(threading);
+    }
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "model_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
+#ifdef ENABLE_HEXKL
+    causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, model_path);
+    if (nntr_cfg.value("gemma4_execution_profile", std::string()) ==
+          "htp_fused" ||
+        cfg.value("model_type", std::string()) == "lfm2_moe")
+      nntrainer::configureHtpRuntime(
+        causallm::normalizeHtpRuntimeConfig(nntr_cfg));
+#endif
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =

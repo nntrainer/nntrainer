@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="소스 및 기기 준비 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>소스 및 기기 준비 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../source-device.html">
+<link rel="alternate" hreflang="ko" href="source-device.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="source-device.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../source-device.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="source-device.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../source-device.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li class="nav-parent-active"><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html" aria-current="page">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>시작하기</span><span aria-hidden="true">/</span><span>소스 및 기기 준비</span></div>
+<article><h1 id="4-get-the-pr-source-and-connect-the-phone">4. PR 소스 준비 및 휴대전화 연결</h1>
+<h2 id="use-a-separate-checkout">별도 디렉터리에 체크아웃</h2>
+<p><strong>호스트 PC</strong>에서 기존 프로젝트를 덮어쓰지 않도록 새 디렉터리를 사용합니다.</p>
+<pre tabindex="0"><code class="language-bash">mkdir -p &quot;$HOME/workspace&quot;
+cd &quot;$HOME/workspace&quot;
+git clone https://github.com/nntrainer/nntrainer.git nntrainer-gemma4-pr4480
+cd nntrainer-gemma4-pr4480
+git fetch origin pull/4480/head
+git switch --detach 67d2903a279a3f5604074f001bbf8f814dfb9f82
+git submodule sync --recursive
+git submodule update --init --recursive --depth 1
+export NNTR_ROOT=&quot;$PWD&quot;
+git rev-parse HEAD
+</code></pre>
+<p>출력 해시가 가이드 상단의 기준 소스와 일치해야 합니다. PR이 이후 변경되더라도
+이 절차는 지정된 리비전을 사용합니다. 서브모듈은 빌드에 필요하며, 초기화하는 것은
+벤더 소스를 수정하는 것과 다릅니다. 첫 토크나이저 및 Gradle 빌드에서도 다운로드가
+발생하므로 인터넷 연결을 유지하세요.</p>
+<h2 id="authorize-adb">ADB 연결 승인</h2>
+<p><strong>휴대전화</strong>에서 **빌드 번호(Build number)**를 일곱 번 눌러 개발자 옵션을 켭니다.
+삼성 기기는 설정 → 휴대전화 정보 → 소프트웨어 정보에 있습니다. 개발자 옵션에서
+<strong>USB 디버깅</strong>을 켜고 데이터 전송이 가능한 USB 케이블을 연결하세요. 잠금을 해제한
+휴대전화에서 디버깅 허용 요청을 승인합니다.</p>
+<p><strong>호스트 PC</strong>에서 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">adb devices -l
+</code></pre>
+<p>기기가 <code>unauthorized</code>나 <code>offline</code>이 아닌 <code>device</code> 상태여야 합니다.
+여러 기기나 에뮬레이터가 연결되어 있다면 출력에 표시된 시리얼을 지정합니다.</p>
+<pre tabindex="0"><code class="language-bash"># Replace this value with the serial from adb devices -l.
+export ANDROID_SERIAL=REPLACE_WITH_DEVICE_SERIAL
+adb get-state
+adb shell getprop ro.product.model
+adb shell getprop ro.soc.model
+adb shell getprop ro.build.version.release
+adb shell getconf PAGE_SIZE
+adb shell df -h /sdcard
+</code></pre>
+<p>기기가 하나뿐이면 <code>ANDROID_SERIAL</code>을 설정하지 않아도 됩니다. 기준 환경은
+S26 Ultra / SM8850, Android 16, 페이지 크기 <strong>4096</strong>입니다.
+빌드와 런타임 호환성은 펌웨어 및 FastRPC 지원에도 영향을 받으므로 이 속성만으로
+NPU 실행을 입증할 수는 없습니다. 이 절차에서 <code>adb root</code>는 필요하지 않습니다.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="hexagon-hexkl.html"><small>이전</small><span>Hexagon SDK와 HexKL</span></a><a class="pager-next" href="build-install.html"><small>다음</small><span>빌드 및 설치</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#use-a-separate-checkout">별도 디렉터리에 체크아웃</a></li><li><a href="#authorize-adb">ADB 연결 승인</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

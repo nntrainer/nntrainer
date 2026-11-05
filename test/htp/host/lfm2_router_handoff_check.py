@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Check actual ARM staging and DSP RPC/carve helpers without DSP arithmetic."""
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+import shutil
+import subprocess
+
+p = argparse.ArgumentParser()
+p.add_argument('--repo', type=Path, required=True)
+p.add_argument('--output', type=Path, required=True)
+p.add_argument('--cxx', default='c++')
+a = p.parse_args()
+a.repo = a.repo.resolve()
+a.output = a.output.resolve()
+a.output.mkdir(parents=True, exist_ok=True)
+paths = {
+ 'arm': 'nntrainer/tensor/htp_backend/htp_compute_ops.cpp',
+ 'dsp': 'nntrainer/tensor/htp_backend/dsp/nntr_hvx_mm_u8i4.c',
+ 'lifecycle': 'nntrainer/tensor/htp_backend/hmx/hexkl_moe_scratch.c',
+ 'core': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.c',
+ 'scratch': 'nntrainer/tensor/htp_backend/hmx/hexkl_mm_u8i4_moe.h',
+ 'state': 'nntrainer/tensor/htp_backend/htp_router_handoff.h',
+ 'staging': 'nntrainer/tensor/htp_backend/htp_staging.h',
+}
+sources = {k: (a.repo / v).read_text() for k, v in paths.items()}
+original_sources = sources.copy()
+# The fixture inherits the same staging owner; remaining RPC hooks use its members.
+sources['arm'] = re.sub(r'\b(?:staging_|weights_|decode_)\s*\.\s*', '', sources['arm'])
+
+def block(s, begin, end):
+    at = s.index(begin)
+    return s[at:s.index(end, at)]
+
+def body(s, signature):
+    at = s.index(signature)
+    start = s.index('{', at)
+    depth = 1
+    i = start + 1
+    while depth:
+        depth += (s[i] == '{') - (s[i] == '}')
+        i += 1
+    return s[at:i] + '\n'
+
+parts = {}
+parts['htp_router_handoff.h'] = sources['state']
+parts['htp_staging.h'] = sources['staging']
+parts['producer.inc'] = block(sources['arm'], '    const uint32_t ticket =', '    const uint64_t t0 =')
+parts['sync.inc'] = body(sources['arm'], '  void sync_to_host(').replace(' override', '')
+parts['attn_q.inc'] = body(sources['arm'], '  bool sdpa_q_kvcache(').replace(' override', '')
+parts['attn_f16.inc'] = body(sources['arm'], '  bool sdpa_fp16_kvcache(').replace(' override', '')
+parts['take_id.inc'] = body(sources['arm'], '  bool take_decode_token_id(').replace(' override', '')
+# Check before-write anchoring in the large queue/materialization methods.
+writer_anchors = {
+    'release_prefill_scratch': ('  void release_prefill_scratch()', 'stagedMemcpy('),
+    'tokenForward': ('  void tokenForward(', 'std::memcpy(q.act->data(),'),
+    'oprojection_materialize': ('    if (u16_in && u16_off) {', 'float *dst ='),
+}
+for name, (begin, write) in writer_anchors.items():
+    section = block(sources['arm'], begin, write)
+    start = section.index('    std::lock_guard<std::mutex> lock(invoke_mutex_);')
+    guard = '    htp_router_handoff_invalidate(&router_handoff_);'
+    assert guard in section[start:], name
+    parts[name + '.inc'] = section[start:section.index(guard, start) + len(guard)]
+parts['select.inc'] = block(sources['arm'], '    HtpRpcBuffer &act_stage =\n      via_dspq', '    // moe.debug=')
+parts['wire.inc'] = block(sources['arm'], '                        handoff_plain && rep == 0', ',\n                        h_gu.data()').strip()
+for method in ['beginPrompt', 'releasePrefillStaging']:
+    s = body(sources['staging' if method == 'releasePrefillStaging' else 'arm'], '  void ' + method + '()')
+    assert s[s.index('{') + 1:].lstrip().startswith('htp_router_handoff_invalidate(&router_handoff_);')
+    parts[method + '.inc'] = s[s.index('{') + 1:s.index(';') + 1]
+h = sources['scratch']
+end = h.index('} hexkl_moe_scratch;') + len('} hexkl_moe_scratch;')
+rotation_end = h.index('} hexkl_moe_rotated_input;') + len('} hexkl_moe_rotated_input;')
+parts['scratch.inc'] = h[h.rindex('typedef struct {', 0, rotation_end):rotation_end] + '\n'
+parts['scratch.inc'] += h[h.rindex('typedef struct {', 0, end):end]
+parts['had_flags.inc'] = block(h, '#define HEXKL_MOE_FLAG_HAD_UP', '/** @brief Every bit')
+parts['reserve.inc'] = body(sources['lifecycle'], 'void hexkl_moe_scratch_free(')
+parts['reserve.inc'] += body(sources['lifecycle'], 'int hexkl_moe_scratch_reserve(')
+parts['reserve.inc'] += body(sources['core'], 'void *hexkl_moe_carve(')
+parts['rpc.inc'] = block(sources['dsp'], 'static int check_moe_layer_args(', 'int nntr_hvx_router_logits_u8i8_f32(')
+parts['core_enter.inc'] = block(sources['core'], '  const float *router_act = scratch ?', '  if (!tbl || !vtcm_base')
+parts['core_layout.inc'] = block(sources['core'], '  const size_t n_slots_cap =', '  moe_m1_ctx m1;')
+parts['core_slots.inc'] = block(sources['core'], '  {\n    uint32_t base = 0u, slot = 0u;', '  HEXKL_PROBE_T0(p0);')
+parts['core_copy.inc'] = block(sources['core'], '  if (router_reuse) {', '  /** The HMX path does not clear out:')
+# Keep the native compact-handle predicate anchored to actual validated handles.
+assert 'n_compact_tl2 += g->tl2_compact && d->tl2_compact;' in sources['core']
+assert 'n_compact_tl2 == n_with_rows' in parts['core_layout.inc']
+for name, text in parts.items():
+    (a.output / name).write_text(text)
+fixture = Path(__file__).with_suffix('.cpp')
+shutil.copy2(fixture, a.output / fixture.name)
+binpath = a.output / 'router_handoff_check'
+cmd = [a.cxx, '-std=c++17', '-O1', '-g', '-Wall', '-Wextra',
+       '-Wno-unused-variable', '-Wno-unused-parameter', '-Wno-unused-but-set-variable', '-pthread',
+       '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I' + str(a.output),
+       '-I' + str(a.repo / 'nntrainer/tensor/htp_backend'),
+       str(a.repo / 'nntrainer/tensor/htp_backend/htp_runtime_config.cpp'),
+       str(a.output / fixture.name), '-o', str(binpath)]
+manifest = {
+    'source_sha256': {paths[k]: hashlib.sha256(v.encode()).hexdigest() for k, v in original_sources.items()},
+    'extracted_sha256': {k: hashlib.sha256(v.encode()).hexdigest() for k, v in parts.items()},
+    'compile': cmd, 'run': [str(binpath)],
+    'limits': 'Real staging, ownership, RPC guards, reserve and carve helpers. Arithmetic, DMA and allocation are host stand-ins; no model-output or hardware-performance claim.',
+}
+(a.output / 'commands.json').write_text(json.dumps(manifest, indent=2) + '\n')
+subprocess.run(cmd, check=True)
+subprocess.run([str(binpath)], check=True)

@@ -6,9 +6,10 @@ qwen3_cached_slim_moe_inc = include_directories('.')
 
 causallm_cached_slim_moe_layer_src_abs = [meson.current_source_dir() / 'qwen_moe_layer_cached.cpp']
 
-causallm_cached_slim_moe_layer = shared_library(
+causallm_cached_slim_moe_layer = build_target(
     'qwen_moe_layer_cached',
     causallm_cached_slim_moe_layer_src_abs,
+    target_type: causallm_layer_type,
     include_directories: [causallm_layer_inc, qwen3_cached_slim_moe_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

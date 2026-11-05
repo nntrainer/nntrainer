@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Quick.AI bolt: a sky-to-deep-blue gradient on the white adaptive background. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:scaleX="2.4" android:scaleY="2.4" android:translateX="25.2" android:translateY="25.2">
+        <path android:pathData="M11,21h-1l1,-7L7.5,14c-0.58,0 -0.57,-0.32 -0.38,-0.66 0.19,-0.34 0.05,-0.08 0.07,-0.12C8.48,10.94 10.42,7.54 13,3h1l-1,7h3.5c0.49,0 0.56,0.33 0.47,0.51l-0.07,0.15C12.96,17.55 11,21 11,21z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear"
+                    android:startX="7" android:startY="3" android:endX="17.5" android:endY="21"
+                    android:startColor="#FF4FC3F7" android:endColor="#FF0369A1"/>
+            </aapt:attr>
+        </path>
+    </group>
+</vector>

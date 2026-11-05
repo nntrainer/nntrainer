@@ -323,11 +323,11 @@ public:
     auto [input, cache_inputs] = buildCacheInput(input_sample);
     std::vector<float *> label;
     this->setKVCachePosition(0);
-    auto output = this->model->incremental_inference(
-      this->BATCH_SIZE, input, label, init_len, 0, init_len, false);
+    auto output = this->incrementalInference(this->BATCH_SIZE, input, init_len,
+                                             0, init_len);
     std::vector<float> logits(output[0], output[0] + this->NUM_VOCAB);
     for (auto &out : output)
-      delete[] out;
+      this->releaseLogitsBuf(out);
 
     return logits;
   }
@@ -353,8 +353,8 @@ public:
     std::vector<float *> label;
 
     this->setKVCachePosition(0);
-    auto output = this->model->incremental_inference(
-      this->BATCH_SIZE, input, label, init_len, 0, init_len, false);
+    auto output = this->incrementalInference(this->BATCH_SIZE, input, init_len,
+                                             0, init_len);
 
     std::vector<unsigned int> generated;
     generated.reserve(n);
@@ -364,7 +364,7 @@ public:
         output[0], std::max_element(output[0], output[0] + this->NUM_VOCAB)));
       generated.push_back(next_tok);
       for (auto &out : output)
-        delete[] out;
+        this->releaseLogitsBuf(out);
       output.clear();
 
       if (step + 1 >= n)
@@ -376,8 +376,7 @@ public:
       unsigned int from = init_len + static_cast<unsigned int>(step);
       unsigned int to = from + 1;
       this->setKVCachePosition(from);
-      output = this->model->incremental_inference(this->BATCH_SIZE, input,
-                                                  label, 1, from, to, false);
+      output = this->incrementalInference(this->BATCH_SIZE, input, 1, from, to);
     }
 
     return generated;

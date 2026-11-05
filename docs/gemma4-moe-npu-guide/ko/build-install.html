@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="빌드 및 설치 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>빌드 및 설치 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../build-install.html">
+<link rel="alternate" hreflang="ko" href="build-install.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="build-install.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../build-install.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="build-install.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../build-install.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html" aria-current="page">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>빌드</span><span aria-hidden="true">/</span><span>빌드 및 설치</span></div>
+<article><h1 id="5-build-and-install-the-native-runtime">5. 네이티브 런타임 빌드 및 설치</h1>
+<h2 id="build-first">먼저 빌드하기</h2>
+<p><strong>호스트 PC</strong>에서 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT/Applications/CausalLM&quot;
+set -o pipefail
+./build_android.sh --htp 2&gt;&amp;1 | tee &quot;$NNTR_ROOT/gemma4-htp-build.log&quot;
+</code></pre>
+<p>스크립트는 FastRPC stub 생성, v81 DSP 이미지 빌드, Android 엔진과 토크나이저 빌드,
+CausalLM 도구 빌드를 순서대로 수행합니다. DSP 빌드는 심볼과 아키텍처를 확인하며,
+성공하면 <code>ARCH OK (V81)</code>이 출력됩니다. 마지막에는 산출물 디렉터리와 함께
+<code>Done (native htp build)</code>가 표시되어야 합니다. <code>pipefail</code>을 켰으므로 <code>tee</code>로 로그를
+저장하더라도 앞선 빌드 명령의 실패가 가려지지 않습니다.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>산출물</th>
+<th><code>NNTR_ROOT</code> 기준 위치</th>
+<th>용도</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nntr_causallm</code></td>
+<td><code>builddir_app/htp/</code></td>
+<td>모델 팩을 직접 실행하는 CLI</td>
+</tr>
+<tr>
+<td><code>quick_dot_ai_test</code></td>
+<td><code>builddir_app/htp/</code></td>
+<td>C API 실행 및 선택적 수명 주기 테스트</td>
+</tr>
+<tr>
+<td><code>libcausallm.so</code>, <code>libquick_dot_ai_api.so</code></td>
+<td><code>builddir_app/htp/</code></td>
+<td>모델 런타임과 공개 API</td>
+</tr>
+<tr>
+<td><code>libnntrainer.so</code>, <code>libccapi-nntrainer.so</code></td>
+<td><code>builddir/android_build_result/lib/arm64-v8a/</code></td>
+<td>nntrainer 엔진</td>
+</tr>
+<tr>
+<td><code>libnntr_hvx_skel.so</code></td>
+<td><code>nntrainer/tensor/htp_backend/dsp/build/</code></td>
+<td>v81 DSP 프로그램</td>
+</tr>
+<tr>
+<td><code>nntr_quantize</code>, <code>nntr_safetensors_info</code></td>
+<td><code>builddir_app/htp/</code></td>
+<td>추가 도구. 이 양자화 도구로 해당 HTP 팩을 생성할 수는 없음</td>
+</tr>
+</tbody>
+</table></div>
+<p>주요 실행 파일 두 개와 DSP 이미지를 확인합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT&quot;
+ls -lh builddir_app/htp/nntr_causallm \
+  builddir_app/htp/quick_dot_ai_test \
+  nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so
+file builddir_app/htp/nntr_causallm
+</code></pre>
+<p>CLI는 <strong>ARM aarch64</strong> 실행 파일입니다. x86-64 PC에서 직접 실행하지 말고
+휴대전화에서 실행하세요.</p>
+<h2 id="install-on-the-phone">휴대전화에 설치하기</h2>
+<p>ADB 승인이 완료된 휴대전화를 연결하고 <strong>호스트 PC</strong>에서 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT/Applications/CausalLM&quot;
+./build_android.sh --htp --cache --install
+adb shell ls -lh /data/local/tmp/Quick.AI
+</code></pre>
+<p><code>--cache</code>는 호환되는 엔진 빌드를 재사용하지만 나머지 빌드 단계는 수행합니다.
+<code>--install</code>은 실행 파일과 런타임 라이브러리를 <code>/data/local/tmp/Quick.AI</code>에 배포하고,
+이 경로에서 스크립트가 관리하는 런타임 파일을 교체합니다. <code>run_causallm.sh</code>와
+<code>run_test.sh</code> 실행 래퍼도 생성합니다. <strong>모델 팩은 복사하지 않습니다.</strong></p>
+<p>런타임에는 HexKL의 <code>libsdkl.so</code>와 NDK의 <code>libc++_shared.so</code>가 포함됩니다.
+<code>libcdsprpc.so</code>는 휴대전화의 vendor 파티션에서 제공합니다. ARM 라이브러리, stub,
+DSP 이미지는 함께 빌드하고 배포하세요. 새 빌드에 오래된 DSP 이미지만 복사하면
+서로 사용하는 프로토콜이 맞지 않을 수 있습니다.</p>
+<p><code>--clean</code>은 선택한 CausalLM 네이티브 빌드 디렉터리를 다시 만듭니다.
+모든 엔진 및 Gradle 캐시까지 지운다는 의미는 아닙니다. HTP의 기본 CPU 스레드 수는
+8이며 첫 실행에서는 그대로 사용하세요.</p>
+<p>최신 스크립트의 <code>--stage</code>는 공개 네이티브 파일을
+<code>builddir_app_stage/public/htp/</code>에 모으고 옆에 <code>.manifest.json</code> 보고서를 만듭니다.
+<code>--stage=DIR</code>로 지정한 전용 디렉터리는 실행할 때마다 다시 생성됩니다. 라이브러리를
+다른 앱에 통합할 때 사용하는 옵션이며, 일반 앱 빌드는 자체적으로 파일을 준비합니다.
+<code>--cache</code>는 OpenCL 설정도 확인하여 호환되는 엔진만 재사용합니다.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="source-device.html"><small>이전</small><span>소스 및 기기 준비</span></a><a class="pager-next" href="model-pack.html"><small>다음</small><span>모델 팩 준비</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#build-first">먼저 빌드하기</a></li><li><a href="#install-on-the-phone">휴대전화에 설치하기</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

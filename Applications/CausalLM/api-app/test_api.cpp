@@ -8,6 +8,7 @@
  *          It links against libquick_dot_ai_api.so.
  */
 
+#include "htp_lifecycle_test.h"
 #include "quick_dot_ai_api.h"
 
 #include <algorithm>
@@ -17,8 +18,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -101,7 +104,8 @@ static void print_usage(const char *prog) {
             << prog << clr::reset << " <model> [prompt] [chat_tpl] [quant] "
             << "[verbose]\n";
   std::cout << clr::yellow << "│" << clr::reset << "\n";
-  print_kv("model", "qwen3-0.6b | gemma4-e2b-qnn | <catalog id>", clr::yellow);
+  print_kv("model", "qwen3-0.6b | gemma4-e2b-qnn | <catalog id> | --catalog",
+           clr::yellow);
   print_kv("", "ouro → embedding smoke (encodeModelHandle)", clr::yellow);
   print_kv("prompt", "\"Hello, how are you?\"", clr::yellow);
   print_kv("chat_tpl", "true | false  (default: true)", clr::yellow);
@@ -109,6 +113,15 @@ static void print_usage(const char *prog) {
   print_kv("verbose", "true | false  (default: true)", clr::yellow);
   print_kv("model_base_path",
            "Base directory for models (or set QUICKAI_MODEL_BASE_PATH)",
+           clr::yellow);
+  print_kv("QDA_BACKEND", "cpu | gpu | npu: BackendType of the load",
+           clr::yellow);
+  print_kv("QDA_STREAM=1", "free-text streaming run (runModelHandleStreaming)",
+           clr::yellow);
+  print_kv("QDA_RUNS=N", "with QDA_STREAM: send the prompt N times, one handle",
+           clr::yellow);
+  print_kv("QDA_KV_STATIC/_DYNAMIC",
+           "files for a JSON \"kv_prefix\" request; QDA_KV_MODE=auto|save|load",
            clr::yellow);
   print_section_end(clr::yellow);
 }
@@ -298,12 +311,38 @@ static bool run_vision_smoke(CausalLmHandle handle) {
 }
 #endif // ENABLE_QNN_MODELS
 
+/**
+ * @brief --catalog: print the model-extension plugin status and every catalog
+ *        id, one per line, then exit. Needs no model pack, so it works on a
+ *        device that has none: it shows whether libqai_ext_model.so was found,
+ *        accepted or refused, and which ids it contributed.
+ */
+static int print_catalog() {
+  std::cout << "extension: " << getExtensionModelStatus() << "\n";
+  const std::string json = getModelCatalogJson();
+  size_t count = 0;
+  for (size_t pos = json.find("\"id\":\""); pos != std::string::npos;
+       pos = json.find("\"id\":\"", pos)) {
+    pos += 6;
+    const size_t end = json.find('"', pos);
+    if (end == std::string::npos)
+      break;
+    std::cout << "catalog: " << json.substr(pos, end - pos) << "\n";
+    ++count;
+    pos = end;
+  }
+  std::cout << "catalog count: " << count << "\n";
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     print_error("Missing required argument: <model>");
     print_usage(argv[0]);
     return 1;
   }
+  if (std::string(argv[1]) == "--catalog")
+    return print_catalog();
 
   // ── Parse arguments ──────────────────────────────────────────────────────
   const char *model_name = argv[1];
@@ -396,9 +435,29 @@ int main(int argc, char *argv[]) {
   bool use_by_name = false;
   bool is_embedding = false;
   bool is_vision = false;
+  const char *native_lib_dir = std::getenv("QUICKAI_NATIVE_LIB_DIR");
   // Backend for loadModelHandleByName. Most catalog models accept CPU; QNN-only
   // descriptors (e.g. vjepa2-qnn, backend_mask = B(NPU)) require NPU.
   BackendType load_backend = CAUSAL_LM_BACKEND_CPU;
+  // QDA_BACKEND=cpu|gpu|npu overrides the backend of every load below (the
+  // enum models are otherwise always CPU).
+  bool backend_forced = false;
+  BackendType forced_backend = CAUSAL_LM_BACKEND_CPU;
+  if (const char *qb = std::getenv("QDA_BACKEND")) {
+    std::string b(qb);
+    std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+    if (b == "cpu")
+      forced_backend = CAUSAL_LM_BACKEND_CPU;
+    else if (b == "gpu")
+      forced_backend = CAUSAL_LM_BACKEND_GPU;
+    else if (b == "npu")
+      forced_backend = CAUSAL_LM_BACKEND_NPU;
+    else {
+      print_error("QDA_BACKEND must be cpu, gpu or npu, not '" + b + "'");
+      return 1;
+    }
+    backend_forced = true;
+  }
 
   if (model_name_str == "qwen3-0.6b") {
     model_type = CAUSAL_LM_MODEL_QWEN3_0_6B;
@@ -436,6 +495,12 @@ int main(int argc, char *argv[]) {
                 "' requires QNN support. Rebuild with -Denable-qnn=true.");
     return 1;
 #endif
+  } else if (model_name_str == "gemma4-26b-a4b-htp") {
+    catalog_id = model_name_str;
+    use_by_name = true;
+    load_backend = CAUSAL_LM_BACKEND_NPU;
+    if (std::getenv("QDA_HTP_LIFECYCLE"))
+      return run_htp_lifecycle_test(prompt, model_base_path, native_lib_dir);
   } else {
     // Generic fallback: any name that doesn't match a known branch above is
     // treated as a full catalog id and loaded via loadModelHandleByName, so
@@ -444,6 +509,8 @@ int main(int argc, char *argv[]) {
     catalog_id = model_name_str;
     use_by_name = true;
   }
+  if (backend_forced)
+    load_backend = forced_backend;
 
 #ifdef ENABLE_QNN
   print_kv("Speculative Dec.", use_sd ? "Enabled" : "Disabled", clr::cyan);
@@ -469,11 +536,12 @@ int main(int argc, char *argv[]) {
     // Load
     CausalLmHandle cycle_handle = nullptr;
     if (use_by_name) {
-      err = loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
-                                  nullptr, model_base_path, &cycle_handle);
+      err =
+        loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
+                              native_lib_dir, model_base_path, &cycle_handle);
     } else {
-      err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type,
-                            nullptr, model_base_path, &cycle_handle);
+      err = loadModelHandle(load_backend, model_type, quant_type,
+                            native_lib_dir, model_base_path, &cycle_handle);
     }
     if (err != CAUSAL_LM_ERROR_NONE) {
       print_error("loadModel failed at cycle " + std::to_string(i + 1) +
@@ -508,10 +576,10 @@ int main(int argc, char *argv[]) {
   CausalLmHandle handle = nullptr;
   if (use_by_name) {
     err = loadModelHandleByName(load_backend, catalog_id.c_str(), quant_type,
-                                nullptr, model_base_path, &handle);
+                                native_lib_dir, model_base_path, &handle);
   } else {
-    err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type,
-                          nullptr, model_base_path, &handle);
+    err = loadModelHandle(load_backend, model_type, quant_type, native_lib_dir,
+                          model_base_path, &handle);
   }
   if (err != CAUSAL_LM_ERROR_NONE) {
     print_error("Final loadModel failed (code " + std::to_string(err) + ")");
@@ -583,7 +651,48 @@ int main(int argc, char *argv[]) {
   // runModelHandleStreaming). The default tool/grammar path below produces only
   // a short constrained JSON, which never reaches the longer free-text
   // generation the app does.
-  if (std::getenv("QDA_STREAM")) {
+  // QDA_KV_STATIC=<file> QDA_KV_DYNAMIC=<file> [QDA_KV_MODE=auto|save|load]:
+  // the JSON "kv_prefix" request (pre-formatted static prefix saved or loaded
+  // as KV, dynamic prefilled behind it).
+  const char *kv_static = std::getenv("QDA_KV_STATIC");
+  const char *kv_dynamic = std::getenv("QDA_KV_DYNAMIC");
+  const char *kv_mode = std::getenv("QDA_KV_MODE");
+  if (kv_static && kv_dynamic) {
+    auto slurp = [](const char *p) {
+      std::ifstream f(p, std::ios::binary);
+      return std::string(std::istreambuf_iterator<char>(f), {});
+    };
+    auto quote = [](const std::string &s) {
+      std::string o = "\"";
+      for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+          o += '\\';
+          o += static_cast<char>(c);
+        } else if (c < 0x20) {
+          char u[8];
+          std::snprintf(u, sizeof(u), "\\u%04x", c);
+          o += u;
+        } else {
+          o += static_cast<char>(c);
+        }
+      }
+      return o + "\"";
+    };
+    const std::string req =
+      "{\"kv_prefix\":{\"static\":" + quote(slurp(kv_static)) +
+      ",\"dynamic\":" + quote(slurp(kv_dynamic)) +
+      ",\"mode\":" + quote(kv_mode ? kv_mode : "") + "}}";
+    struct Cb {
+      static int on_token(const char *delta, void *) {
+        if (delta)
+          std::cout << delta << std::flush;
+        return 0;
+      }
+    };
+    err = runModelHandleWithJsonStreaming(handle, req.c_str(), &Cb::on_token,
+                                          nullptr);
+    std::cout << "\n";
+  } else if (std::getenv("QDA_STREAM")) {
     struct Cb {
       static int on_token(const char *delta, void *) {
         if (delta) {
@@ -592,10 +701,17 @@ int main(int argc, char *argv[]) {
         return 0; // keep generating
       }
     };
-    std::cout << clr::green << "│" << clr::reset << "  " << clr::dim
-              << "Output (streaming):" << clr::reset << "\n";
-    err = runModelHandleStreaming(handle, prompt, &Cb::on_token, nullptr);
-    std::cout << "\n";
+    // QDA_RUNS=N: the same prompt N times on this handle (independent
+    // requests, as an app sends them).
+    const int runs =
+      std::getenv("QDA_RUNS") ? std::atoi(std::getenv("QDA_RUNS")) : 1;
+    for (int r = 0; r < runs && err == CAUSAL_LM_ERROR_NONE; ++r) {
+      std::cout << clr::green << "│" << clr::reset << "  " << clr::dim
+                << "Output (streaming) run " << (r + 1) << ":" << clr::reset
+                << "\n";
+      err = runModelHandleStreaming(handle, prompt, &Cb::on_token, nullptr);
+      std::cout << "\n";
+    }
   } else {
     // XGrammar Test
     auto tool_name = "web_search";

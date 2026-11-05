@@ -16,6 +16,7 @@ subdir('qwen3_slim_moe')
 subdir('gemma2')
 subdir('gemma3')
 subdir('gemma4')
+subdir('lfm2_moe')
 subdir('timm_vit')
 subdir('lfm2')
 if get_option('platform') != 'windows'

@@ -1031,6 +1031,8 @@ int main(int argc, char *argv[]) {
 
     model->initialize();
     std::cout << "  Model initialized successfully.\n";
+    // Weights only: no request will run, so no KV cache.
+    model->setPrepareRunAtLoad(false);
 
     // =========================================================================
     // Step 3: Load FP32 weights

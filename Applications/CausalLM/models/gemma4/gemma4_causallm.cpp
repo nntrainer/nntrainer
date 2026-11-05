@@ -757,6 +757,9 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     withKey("gpu_decode_rope",
             getModelFeatures().decode_rope_gpu ? "true" : "false"),
     withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
+    // The layer indexes the KV plane with the same ring default the model
+    // sized it with (Transformer::kvRingByDefault()).
+    withKey("kv_window_ring", kvRingByDefault() ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
@@ -932,6 +935,9 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("gpu_decode_rope",
             getModelFeatures().decode_rope_gpu ? "true" : "false"),
     withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
+    // The layer indexes the KV plane with the same ring default the model
+    // sized it with (Transformer::kvRingByDefault()).
+    withKey("kv_window_ring", kvRingByDefault() ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));

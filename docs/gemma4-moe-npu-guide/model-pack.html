@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Prepare the model pack — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>Prepare the model pack — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="model-pack.html">
+<link rel="alternate" hreflang="ko" href="ko/model-pack.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/model-pack.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="model-pack.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/model-pack.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="model-pack.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html" aria-current="page">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Build</span><span aria-hidden="true">/</span><span>Prepare the model pack</span></div>
+<article><h1 id="6-prepare-and-copy-the-model-pack">6. Prepare and copy the model pack</h1>
+<p>Ask your model provider for a <strong>chat-ready Gemma4 26B-A4B HTP pack compatible
+with this PR</strong>. Keep the delivered weights, rotations, tokenizer and config
+files together. This guide does not create or quantize weights.</p>
+<p>The latest catalog has three Gemma4 HTP entries. The commands in this guide
+use the first row; choose another only with its matching supplied pack.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Catalog ID</th>
+<th>App FAMILY / MODEL VARIANT</th>
+<th>Directory below BASE PATH</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gemma4-26b-a4b-htp</code></td>
+<td><code>gemma4-26b-a4b</code> / <code>Gemma4 26B A4B MoE (HTP)</code></td>
+<td><code>gemma4-26b-a4b-htp-w4a32/</code></td>
+</tr>
+<tr>
+<td><code>gemma4-26b-a4b-htp-long</code></td>
+<td><code>gemma4-26b-a4b</code> / <code>Gemma4 26B A4B MoE (HTP, 30k demo)</code></td>
+<td><code>gemma4-26b-a4b-htp-long-w4a32/</code></td>
+</tr>
+<tr>
+<td><code>gemma4-26b-a4b-htp-2bit-4bit</code></td>
+<td><code>gemma4-26b-a4b-2bit-4bit</code> / <code>Gemma4 26B A4B MoE (HTP, rotated 2/4-bit)</code></td>
+<td><code>gemma4-26b-a4b-2bit-4bit/</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Selecting the 30k demo does not expand an ordinary pack's context or establish
+that the phone has enough RAM. Keep the provider's matching settings.</p>
+<p>The app expects this layout on the phone:</p>
+<pre tabindex="0"><code class="language-text">/sdcard/Download/aistudio-mobile/models/       ← model base path
+└── gemma4-26b-a4b-htp-w4a32/                 ← model pack directory
+    ├── nntr_config.json
+    ├── config.json
+    ├── tokenizer.json
+    ├── chat_template.jinja
+    ├── generation_config.json
+    ├── &lt;weight file named by model_file_name&gt;
+    └── &lt;any sidecars named in nntr_config.json&gt;
+</code></pre>
+<p><code>config.json</code> must be the flat text-model configuration, not a wrapper containing
+only <code>text_config</code>. The provider's <code>nntr_config.json</code> selects <code>htp_fused</code> /
+<code>htp_fused_v1</code>, the engine assignments and the actual weight formats.</p>
+<p>Two Gemma4 pack families exist in this PR:</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Pack</th>
+<th>Expert format</th>
+<th>Projections / head</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delivered palette pack</td>
+<td><code>QS2CX_WH</code></td>
+<td><code>QS4CX</code> projections, tied <code>Q4_0</code> head on CPU</td>
+</tr>
+<tr>
+<td>Native ternary pack</td>
+<td><code>TL2CX_WH</code>, possibly mixed affine expert layers</td>
+<td><code>QS4CX_WH_AFFINE</code> projections and untied HTP head</td>
+</tr>
+</tbody>
+</table></div>
+<p>The app's <code>W4A32</code> label is a catalog selection, not a statement that every tensor
+has four-bit weights. Do not change dtype names to match that label. In
+particular, do not overwrite a TL2 pack's <code>nntr_config.json</code> with the palette
+preset from <code>Applications/CausalLM/res/gemma4/htp_chat/</code>. For a palette pack
+requiring a chat preset, confirm its weights match that preset with the provider
+before replacing config files. The PR's
+<a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/model-packs.md">model-pack contract</a>
+describes the formats and optional sidecars in detail.</p>
+<p>When updating an older pack for this revision, follow the
+<a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/configuration.md#removed-comparison-switches">removed-switch migration notes</a>.
+Retired nested <code>htp</code> / <code>moe</code> keys are rejected at load. Remove the listed keys
+from a compatible copy of the pack configuration; do not replace TL2 settings
+with a palette preset. The retired <code>moe.hadamard=both_scalar</code> value becomes
+<code>both</code> when that same rotation is required by the checkpoint.</p>
+<p>On the <strong>host</strong>, set the directory of the supplied pack and check the main files:</p>
+<pre tabindex="0"><code class="language-bash">export NNTR_MODEL_PACK=&quot;$HOME/models/gemma4-26b-a4b-htp-w4a32&quot;
+python3 - &lt;&lt;'PY'
+import json
+import os
+from pathlib import Path
+
+pack = Path(os.environ[&quot;NNTR_MODEL_PACK&quot;])
+for name in (&quot;nntr_config.json&quot;, &quot;config.json&quot;, &quot;tokenizer.json&quot;,
+             &quot;chat_template.jinja&quot;, &quot;generation_config.json&quot;):
+    path = pack / name
+    if not path.is_file():
+        raise SystemExit(f&quot;Missing chat-pack file: {path}&quot;)
+cfg = json.loads((pack / &quot;nntr_config.json&quot;).read_text())
+weights = pack / cfg[&quot;model_file_name&quot;]
+if not weights.is_file() or weights.stat().st_size == 0:
+    raise SystemExit(f&quot;Missing or empty weights: {weights}&quot;)
+print(&quot;Weight file:&quot;, weights.name)
+print(&quot;Weight bytes:&quot;, weights.stat().st_size)
+print(&quot;Expert format:&quot;, cfg.get(&quot;moe_layer_dtype&quot;))
+print(&quot;Execution profile:&quot;, cfg.get(&quot;gemma4_execution_profile&quot;))
+for key in (&quot;moe_engine&quot;, &quot;attention_engine&quot;, &quot;attn_proj_engine&quot;, &quot;dense_ffn_engine&quot;):
+    if cfg.get(key) != &quot;htp&quot;:
+        raise SystemExit(f&quot;Expected {key}=htp; ask the pack provider&quot;)
+print(&quot;Main files present. Also verify all sidecars from the provider's manifest.&quot;)
+PY
+
+du -sh &quot;$NNTR_MODEL_PACK&quot;
+</code></pre>
+<p>This is a presence check, not a validator for weight contents. Check any supplied
+checksums and sidecar manifest as well. The recommended chat files avoid template
+fallback and benchmark-only generation settings.</p>
+<p>Copy the directory's contents, including sidecars, to the exact app directory:</p>
+<pre tabindex="0"><code class="language-bash">adb shell mkdir -p /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
+adb push &quot;$NNTR_MODEL_PACK/.&quot; /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32/
+adb shell ls -lh /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32
+</code></pre>
+<p>Check that <code>nntr_config.json</code> is directly in that directory, not inside another
+nested pack directory. The multi-gigabyte transfer may take a while. Use
+<code>/sdcard/Download</code> so both the shell and the app can read the pack;
+<code>/data/local/tmp</code> is suitable for CLI binaries but is not an app-readable model
+location on a production phone.</p>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="build-install.html"><small>Previous</small><span>Build &amp; install</span></a><a class="pager-next" href="cli.html"><small>Next</small><span>CLI inference</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 5, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

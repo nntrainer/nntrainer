@@ -57,3 +57,23 @@ test(test_name, exe,
   timeout: test_timeout,
   suite: 'unittests'
 )
+
+if get_option('enable-transformer')
+  causallm_layers = meson.project_source_root() / 'Applications/CausalLM/layers'
+  attention_dispatch_test = executable(
+    'unittest_causallm_mha_core_dispatch',
+    'unittest_causallm_mha_core_dispatch.cpp',
+    causallm_layers / 'mha_core.cpp',
+    causallm_layers / 'dense_ffn_layer.cpp',
+    include_directories: include_directories(
+      '../../../Applications/CausalLM', '../../../Applications/CausalLM/layers'),
+    dependencies: [nntrainer_test_main_deps, nntrainer_ccapi_dep],
+    install: get_option('enable-test'),
+    install_dir: application_install_dir
+  )
+  test('unittest_causallm_mha_core_dispatch', attention_dispatch_test,
+    args: '--gtest_output=xml:@0@/unittest_causallm_mha_core_dispatch.xml'.format(meson.build_root()),
+    timeout: test_timeout,
+    suite: 'unittests'
+  )
+endif

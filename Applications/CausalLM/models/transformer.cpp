@@ -620,8 +620,8 @@ unsigned int Transformer::prefillPlaneFor(unsigned int prompt_tokens) const {
     static_cast<unsigned int>(MAX_SEQ_LEN));
 }
 
-bool Transformer::growPrefillPlane(unsigned int prompt_tokens) {
-  if (plane_pinned_ || !is_initialized || weight_path_.empty())
+bool Transformer::prefillPlaneCanGrow() const {
+  if (plane_pinned_)
     return false;
   /** The arm has to be one a bigger block pays off on -- see
    *  causallm::prefillBlockPays() for the measurement on each. */
@@ -636,6 +636,12 @@ bool Transformer::growPrefillPlane(unsigned int prompt_tokens) {
   if (!chunkLongPrompts())
     return false;
   if (MEMORY_SWAP) // FSU re-plans the swap around the graph; out of scope
+    return false;
+  return true;
+}
+
+bool Transformer::growPrefillPlane(unsigned int prompt_tokens) {
+  if (!is_initialized || weight_path_.empty() || !prefillPlaneCanGrow())
     return false;
 
   const unsigned int from = static_cast<unsigned int>(INIT_SEQ_LEN);

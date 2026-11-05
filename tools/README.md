@@ -32,3 +32,11 @@ $ cd /data/local/tmp/nntr_android_test/
 $ export LD_LIBRARY_PATH=.
 $ ./unittest_nntrainer_tensor
 ```
+
+
+## Model pack converters for the Hexagon NPU
+
+`tools/convert_lfm2_sr15.py` builds the LFM2 24B-A2B HTP pack and
+`tools/convert_tl2_model.cpp` is the native helper behind the Gemma4 TL2
+pack conversion. Both are documented in
+[Model packs](../docs/quickai/model-packs.md).

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="LFM2 benchmark results — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>LFM2 benchmark results — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="lfm2-benchmarks.html">
+<link rel="alternate" hreflang="ko" href="ko/lfm2-benchmarks.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/lfm2-benchmarks.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="lfm2-benchmarks.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/lfm2-benchmarks.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="lfm2-benchmarks.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html" aria-current="page">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Appendix</span><span aria-hidden="true">/</span><span>LFM2 benchmark results</span></div>
+<article><h1 id="appendix-a-lfm2-benchmark-results">Appendix A. LFM2 benchmark results</h1>
+<p>The deployed <strong>LFM2 24B-A2B SR15 pack (TL2/INT4)</strong> was measured on November 4,
+2026, on the same phone and runtime as the <a href="benchmarks.html#9-benchmark-results">Gemma4 benchmark</a>.
+Inputs are <strong>1,024 / 2,048 / 4,096 / 8,192 tokens</strong>, with <strong>128 output tokens</strong>
+per run. This appendix preserves those measurements.</p>
+<h2 id="lfm2-results">LFM2 results</h2>
+<p>Each value is the <strong>median of three runs</strong>, with minimum–maximum in parentheses.
+The 1K warm-up is excluded; there are <strong>12 measured runs</strong>.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Input tokens</th>
+<th>Prefill (tok/s)</th>
+<th>Decode (tok/s)</th>
+<th>TTFT (s)</th>
+<th>Peak memory (GiB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1K (1,024)</td>
+<td><strong>799.4</strong> (761.9–826.5)</td>
+<td><strong>18.60</strong> (18.34–19.31)</td>
+<td><strong>1.30</strong> (1.26–1.37)</td>
+<td><strong>2.146</strong> (2.145–2.146)</td>
+</tr>
+<tr>
+<td>2K (2,048)</td>
+<td><strong>1083.0</strong> (1083.0–1084.8)</td>
+<td><strong>18.19</strong> (18.04–18.33)</td>
+<td><strong>1.91</strong> (1.91–1.91)</td>
+<td><strong>2.213</strong> (2.213–2.229)</td>
+</tr>
+<tr>
+<td>4K (4,096)</td>
+<td><strong>768.8</strong> (766.0–769.5)</td>
+<td><strong>17.16</strong> (17.11–17.16)</td>
+<td><strong>5.35</strong> (5.34–5.37)</td>
+<td><strong>2.263</strong> (2.263–2.267)</td>
+</tr>
+<tr>
+<td>8K (8,192)</td>
+<td><strong>571.5</strong> (566.6–574.4)</td>
+<td><strong>15.26</strong> (15.19–15.29)</td>
+<td><strong>14.36</strong> (14.29–14.48)</td>
+<td><strong>2.264</strong> (2.264–2.266)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Native token traces confirmed the exact input IDs and 128 output IDs in every
+run, including the full 8,192-token input. Output IDs were identical across all
+three repeats at each length. Logs confirmed the resident NPU graph, including
+convolution, attention, MoE and LM head.</p>
+<h2 id="lfm2-model-and-conditions">LFM2 model and conditions</h2>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Measured configuration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Device</td>
+<td>Galaxy S26 Ultra <strong>SM-S948U</strong>, Snapdragon <strong>SM8850</strong>, Hexagon <strong>v81</strong>, Android <strong>16</strong>, 4 KB pages; the same phone used for Gemma4.</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>The CLI executable and all seven native libraries match the Gemma4 measurement by SHA-256. The libraries also match the installed Quick.AI app. Binary source commit is unverified; the archive identifies the measured artifacts by hash.</td>
+</tr>
+<tr>
+<td>Model pack</td>
+<td><code>/sdcard/Download/aistudio-mobile/models/lfm2-24ba2b-htp-w4a32</code>; <code>lfm2_weight_format=sr15_v2</code>, <code>lfm2_execution_profile=htp_fused</code>.</td>
+</tr>
+<tr>
+<td>Weight file</td>
+<td><code>LFM2-24B-A2B-Ternary-INT4.bin</code>, <strong>5,433,850,513 bytes</strong> (5.43 GB). The full checksum is in <code>manifest.json</code> inside the archive.</td>
+</tr>
+<tr>
+<td>Quantization</td>
+<td>Rotated TL2 experts (<code>TL2CX_WH</code>), affine INT4 projections/router/LM head (<code>QS4CX_WH_AFFINE</code>), <code>Q4_0</code> embeddings and <code>DW3_INT4</code> short convolutions.</td>
+</tr>
+<tr>
+<td>Shared settings</td>
+<td>Batch 1, greedy decoding, eight CPU threads, <code>moe_cache_experts=16</code>, <code>init_seq_len=2048</code>, <code>max_seq_len=8704</code>.</td>
+</tr>
+<tr>
+<td>LFM-specific settings</td>
+<td>LFM tokenizer/chat template, attention KV <code>q8_row</code>, EOS ID <code>7</code> and the automatic SR15 CLI preset are retained.</td>
+</tr>
+<tr>
+<td>Prompt</td>
+<td>The same original report paragraphs and summary request as Gemma4, tokenized with LFM's tokenizer and padded to each exact length. Different tokenizers mean different text lengths at the same token count.</td>
+</tr>
+<tr>
+<td>Repetition and cache</td>
+<td>One excluded 1K warm-up, then three fresh CLI processes per length. Pass order: 1K→2K→4K→8K; 8K→4K→2K→1K; 1K→4K→2K→8K. OS caches are retained.</td>
+</tr>
+<tr>
+<td>Temperature</td>
+<td>USB connected; at least 15 seconds between runs. Start only at thermal status 0, AP ≤34 °C and skin ≤35.5 °C, matching the Gemma4 procedure. Recorded starting ranges: AP 29.4–32.8 °C, skin 29.4–32.0 °C.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The deployed pack's <code>init_seq_len</code> was 64. Only isolated benchmark copies raised
+it to 2,048, removed <code>chat_input</code> so the exact <code>sample_input</code> was used, and set
+<code>num_to_generate=127</code>, <code>bad_word_ids=[7]</code>, greedy decoding and a token-trace path.
+The original model pack and app settings were unchanged. EOS suppression is
+for fixed-length measurement; retain the provider's stopping behavior for chat.</p>
+<h2 id="reading-the-lfm2-measurements">Reading the LFM2 measurements</h2>
+<ul>
+<li><strong>Output count:</strong> one token selected during prefill plus 127 decode steps
+gives 128 total output IDs. The CLI's <code>generation:</code> line reports 127 tokens.</li>
+<li><strong>Speed:</strong> Prefill is input tokens divided by prefill time; Decode is
+<code>127 / generation_seconds</code>, including the first decode step.</li>
+<li><strong>TTFT:</strong> native <code>[PERF-SPLIT] ttft_ms</code>, excluding process startup and model
+loading. It is not app launch-to-answer latency.</li>
+<li><strong>Peak memory:</strong> sampled <code>RssAnon + accelerator</code>, converted from KiB to GiB.
+File-backed page cache is excluded; this is not total phone RAM usage or
+weight-file storage size.</li>
+</ul>
+<p>The workload measures throughput on synthetic report prompts. It does not
+measure model accuracy or sustained performance on a hot phone. Gemma4 and
+LFM2 differ in architecture, active parameter count, tokenization, KV format
+and execution preset, even though the measurement procedure is aligned.</p>
+<h2 id="lfm2-measurement-records">LFM2 measurement records</h2>
+<p>Download the <a href="assets/benchmarks/lfm2-sr15-20261104-summary.json">LFM2 summary JSON</a>,
+<a href="assets/benchmarks/lfm2-sr15-20261104-runs.csv">individual runs CSV</a>,
+or <a href="assets/benchmarks/lfm2-sr15-20261104-records.zip">complete measurement records ZIP</a>.</p>
+<p>The ZIP preserves the November 4 records: raw CLI logs, exact prompts and
+expected IDs, native token traces, per-run configurations, thermal readings,
+binary/weight checksums and measurement scripts. It includes the excluded
+warm-up, marked separately in <code>results.json</code> and the CSV. Model weights and
+runtime binaries are not included. <code>summary.json</code> aggregates only the 12
+measured runs.</p>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="maintaining-guide.html"><small>Previous</small><span>Maintain this guide</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 5, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#lfm2-results">LFM2 results</a></li><li><a href="#lfm2-model-and-conditions">LFM2 model and conditions</a></li><li><a href="#reading-the-lfm2-measurements">Reading the LFM2 measurements</a></li><li><a href="#lfm2-measurement-records">LFM2 measurement records</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

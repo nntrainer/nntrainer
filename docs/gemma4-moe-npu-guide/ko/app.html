@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Quick.AI 앱 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>Quick.AI 앱 — Gemma4 NPU · Quick.AI</title>
+<link rel="icon" type="image/svg+xml" href="../assets/quickai-icon.svg">
+<link rel="alternate" hreflang="en" href="../app.html">
+<link rel="alternate" hreflang="ko" href="app.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="28" height="28" alt="">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="app.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../app.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><img class="brand-mark" src="../assets/quickai-icon.svg" width="35" height="35" alt=""><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="app.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../app.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html" aria-current="page">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>실행</span><span aria-hidden="true">/</span><span>Quick.AI 앱</span></div>
+<article><h1 id="8-build-and-install-the-quickai-app">8. Quick.AI 앱 빌드 및 설치</h1>
+<p>사용법은 위 기준 소스의 업데이트된 앱을 따릅니다. 모델 선택과 대화 예시는
+2026년 11월 4일 Galaxy S26 Ultra(SM-S948N / SM-S948U, Android 16, 4 KB 페이지)의
+<strong>Quick.AI 2.0</strong>에서 직접 캡처했습니다. Metrics 이미지는 11월 5일 SM-S948U에서
+벤치마크 설정 화면으로 갱신했습니다. 설치된 APK의 소스 커밋은 확인하지 않았으므로,
+캡처는 조작 화면을 보여 주고 동작 설명은 기준 소스와 대조했습니다.
+버튼 이름은 앱의 영어 표기를 유지하며, 이미지를 누르면 원본 크기로 볼 수 있습니다.</p>
+<h2 id="build-and-install-the-apk">APK 빌드 및 설치</h2>
+<p><strong>호스트 PC</strong>에서 앞서 설정한 환경과 같은 소스 리비전을 사용합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT/Applications/CausalLM&quot;
+set -o pipefail
+./build_android.sh --htp --cache --app 2&gt;&amp;1 | tee &quot;$NNTR_ROOT/gemma4-app-build.log&quot;
+</code></pre>
+<p>네이티브 라이브러리를 준비하고 라이브러리 AAR 및 예제 APK를 빌드한 뒤
+<code>verify_native_package.py</code>를 실행합니다. 이 검사는 필수 라이브러리, 변경되지 않은
+v81 DSP 이미지, 네이티브 라이브러리 의존성을 확인합니다. HTP 패키지에 불필요한
+QNN 라이브러리나 vendor의 <code>libcdsprpc.so</code>가 들어 있어도 실패합니다.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>산출물</th>
+<th><code>NNTR_ROOT</code> 기준 위치</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>앱 개발자용 AAR</td>
+<td><code>Applications/CausalLM/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar</code></td>
+</tr>
+<tr>
+<td>설치 가능한 APK</td>
+<td><code>Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk</code></td>
+</tr>
+<tr>
+<td>네이티브 패키지 검증 보고서</td>
+<td>APK 경로 뒤에 <code>.native-manifest.json</code>이 붙은 파일</td>
+</tr>
+</tbody>
+</table></div>
+<p>휴대전화에 설치하는 것은 <strong>APK</strong>입니다. <strong>AAR</strong>은 다른 앱을 빌드할 때 사용하는
+라이브러리이므로 <code>adb install</code>로 설치할 수 없습니다.</p>
+<p><strong>호스트 PC</strong>에서 완성된 APK를 설치합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT&quot;
+adb install -r -t Applications/CausalLM/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk
+adb shell appops set com.example.quickdotaiapp MANAGE_EXTERNAL_STORAGE allow
+adb shell pm path com.example.quickdotaiapp
+</code></pre>
+<p><code>adb install</code>이 <code>Success</code>로 끝나고, <code>pm path</code>가 설치된 APK 위치를 출력해야 합니다.
+권한 설정 명령은 <code>/sdcard</code>의 모델 팩을 읽을 수 있게 합니다. 대신 앱이 여는 Android
+권한 화면에서 **모든 파일 접근(All files access)**을 허용하거나, 설정 → 앱 →
+특별한 접근 → 모든 파일 접근 → Quick.AI에서 허용해도 됩니다. 메뉴 이름은 기기에 따라
+다를 수 있습니다.</p>
+<p>빌드와 설치를 따로 실행하는 대신 <code>./build_android.sh --htp --cache --app --install</code>을
+사용하면 AAR/APK 빌드, APK 설치, CLI 런타임 배포를 함께 수행합니다.
+어느 방법도 모델 가중치는 복사하지 않으므로 6단계를 별도로 완료하세요.</p>
+<h2 id="load-the-model-and-send-a-message">모델 로드 및 메시지 보내기</h2>
+<p>아래 순서대로 <strong>모델 선택 → 로드 완료 확인 → 메시지 전송</strong>을 진행합니다.
+모델 선택 화면은 기본 경로를 사용합니다. 로드·대화 캡처에서는 다른 기기에
+준비되어 있던 TL2 팩을 사용했으며 상위 경로는
+<code>/sdcard/Download/aistudio-mobile/models_1022</code>입니다. 6단계대로 모델을 복사했다면
+아래 표의 기본 경로인 <code>/sdcard/Download/aistudio-mobile/models</code>를 사용하세요.</p>
+<h2 id="1-select-gemma4-npu-and-the-model-path">1. Gemma4 NPU와 모델 경로 선택</h2>
+<p>상단 바 아래의 <strong>모델 선택 칩</strong>을 눌러 <strong>Model</strong> 화면을 엽니다.</p>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>화면 항목</th>
+<th>선택하거나 확인할 값</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>FAMILY</strong></td>
+<td><code>gemma4-26b-a4b</code></td>
+</tr>
+<tr>
+<td><strong>RUNTIME</strong></td>
+<td><code>Quick.AI</code></td>
+</tr>
+<tr>
+<td><strong>BACKEND</strong></td>
+<td><code>NPU</code></td>
+</tr>
+<tr>
+<td><strong>MODEL VARIANT</strong></td>
+<td>이 가이드에서는 <code>Gemma4 26B A4B MoE (HTP)</code>. 선택한 family/runtime/backend에 여러 팩이 있을 때 표시됩니다.</td>
+</tr>
+<tr>
+<td><strong>BASE PATH</strong></td>
+<td><code>/sdcard/Download/aistudio-mobile/models</code> — <code>gemma4-26b-a4b-htp-w4a32</code> 폴더가 들어 있는 상위 디렉터리</td>
+</tr>
+<tr>
+<td>설정 파일 상태</td>
+<td><code>gemma4-26b-a4b-htp-w4a32/nntr_config.json found</code></td>
+</tr>
+<tr>
+<td>모델 정보 칩</td>
+<td><code>HTP · W4A32 · Gemma4 26B A4B MoE (HTP)</code></td>
+</tr>
+</tbody>
+</table></div>
+<figure class="app-screenshot"><a href="../assets/screenshots/02-model-selection.png"><img src="../assets/screenshots/02-model-selection.png" alt="Model 화면에서 Gemma4, Quick.AI, NPU, MODEL VARIANT와 설정 파일 found를 확인한 모습" loading="lazy" decoding="async"></a><figcaption>화면 1. SM-S948U에서 캡처한 MODEL VARIANT 선택 화면입니다. 여기서는 기본 HTP 팩을 선택하며 30k demo는 별도 팩이 필요합니다. Load model이 아래에 가려지면 스크롤하세요.</figcaption></figure>
+<p><code>found</code>는 설정 파일이 있다는 뜻일 뿐입니다. 가중치나 보조 파일이 없으면 로드가
+실패할 수 있습니다. 모델 목록에 Gemma4 NPU가 없으면 설치한 APK가 <code>--htp</code> 빌드의
+산출물인지 확인하세요.</p>
+<h2 id="2-confirm-the-model-has-loaded">2. 모델 로드 완료 확인</h2>
+<p><strong>Load model</strong>을 누르고 기다립니다. <strong>Model</strong> 화면의 상태가 <strong>Loaded</strong>로 바뀌면
+오른쪽 위 <strong>×</strong>를 눌러 닫으세요. 채팅 화면의 상태 줄에
+<code>Loaded gemma4-26b-a4b-htp ...</code>, 본문에 <strong>Model loaded · start a conversation</strong>이
+보이면 질문을 입력할 수 있습니다. 로드 시간은 팩과 기기 상태에 따라 달라집니다.</p>
+<figure class="app-screenshot"><a href="../assets/screenshots/03-model-loaded.png"><img src="../assets/screenshots/03-model-loaded.png" alt="상태 줄에 Loaded gemma4-26b-a4b-htp와 Model loaded 안내가 표시된 채팅 화면" loading="lazy" decoding="async"></a><figcaption>화면 2. 모델 로드가 완료되었습니다. 입력창이 비어 있으면 보내기 버튼은 비활성 상태입니다.</figcaption></figure>
+<p><code>Load failed</code>가 표시되면 질문을 보내기 전에 오류를 해결하세요. 먼저 <strong>BASE PATH</strong>와
+권한을 확인하고, <code>found</code>인데도 실패하면 설치한 앱이 지원하는 팩인지와 필요한 파일이
+모두 있는지 확인합니다.</p>
+<h2 id="3-send-a-question-and-stop-generation">3. 질문 보내기와 생성 중지</h2>
+<p>하단 <strong>Type a message…</strong> 입력창에 <code>Explain neural networks in two sentences.</code>를
+입력한 뒤 오른쪽 <strong>Send</strong> 화살표를 누릅니다. 답변이 순차적으로 표시되고 완료되면
+상태 줄이 **Done.**으로 바뀝니다. 키보드가 답변을 가리면 Android의 뒤로 가기로
+키보드를 닫으세요.</p>
+<figure class="app-screenshot"><a href="../assets/screenshots/04-chat-response.png"><img src="../assets/screenshots/04-chat-response.png" alt="신경망을 두 문장으로 설명해 달라는 질문과 Gemma4의 답변, Done 상태 및 토큰 통계" loading="lazy" decoding="async"></a><figcaption>화면 3. 실제 질문과 완료된 응답입니다. 답변 아래에서 첫 토큰까지 걸린 시간(TTFT), 생성 속도, 출력 토큰 수를 확인할 수 있습니다.</figcaption></figure>
+<p>생성 중에는 보내기 버튼이 <strong>Stop</strong>으로 바뀝니다. 중지하면 해당 응답에 <strong>stopped</strong>가
+표시됩니다. 상단 휴지통의 <strong>Clear conversation</strong>은 화면의 대화를 지우는 기능이며,
+모델을 해제하려면 모델 메뉴의 <strong>Unload</strong>를 사용합니다.</p>
+<p>이 리비전의 HTP 앱은 <strong>가장 최근 사용자 메시지만</strong> 전달합니다. 이전 말풍선은
+이 모델의 대화 기억으로 사용되지 않습니다. 처음에는 짧은 프롬프트를 사용하세요.
+설정된 컨텍스트를 초과하는 프롬프트는 오류 없이 잘릴 수 있습니다. 팔레트 채팅
+프리셋은 컨텍스트 2,304개 위치, 프롬프트 최대 2,048토큰, 응답 예산 256토큰을
+사용하지만 제공받은 TL2 팩은 제한이 다를 수 있습니다. 앱을 업데이트해도 이전에
+복사한 팩의 설정은 자동으로 바뀌지 않습니다. 컨텍스트를 늘리면 RAM 사용량이
+크게 증가할 수 있습니다. 이 Gemma4 HTP 팩은
+텍스트 전용이며 앱에 다른 모델용 이미지 기능이 있어도 이 경로가 멀티모달로
+바뀌지는 않습니다.</p>
+<h2 id="4-check-metrics-and-unload">4. Metrics 확인 및 모델 해제</h2>
+<p><strong>Metrics</strong> 탭에서 앱에 포함된 텍스트로 속도 벤치마크를 실행합니다. 모델을 로드하고
+아래 길이와 반복 횟수를 선택한 다음, 아래로 스크롤해 <strong>Run</strong>을 누릅니다.
+초기 선택값은 <strong>1K / 128 / 3</strong>이며 온도 대기는 꺼져 있습니다.</p>
+<figure class="app-screenshot"><a href="../assets/screenshots/05-metrics.png"><img src="../assets/screenshots/05-metrics.png" alt="업데이트된 Metrics 벤치마크의 프리필·디코드 토큰 선택, 반복 횟수, 온도 대기 설정" loading="lazy" decoding="async"></a><figcaption>화면 4. 11월 5일 SM-S948U에서 캡처한 벤치마크 설정입니다. 이 캡처에서는 모델이 로드되지 않았습니다. 모델 로드 후 온도 대기 스위치 아래로 스크롤하면 Run이 있습니다.</figcaption></figure>
+<div class="table-wrap" tabindex="0"><table>
+<thead>
+<tr>
+<th>조작 항목</th>
+<th>선택값과 동작</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PREFILL TOKENS</strong></td>
+<td>포함된 텍스트의 명목상 길이: 128, 256, 512, 1K, 2K, 4K토큰.</td>
+</tr>
+<tr>
+<td><strong>DECODE TOKENS</strong></td>
+<td>32, 64, 128, 256토큰. 선택한 길이에 도달하면 앱이 응답을 중지합니다.</td>
+</tr>
+<tr>
+<td><strong>REPEATS</strong></td>
+<td>1, 3, 5회.</td>
+</tr>
+<tr>
+<td><strong>Wait for a cool phone</strong></td>
+<td>매 실행 전 최대 90초의 선택적 온도 대기. 기본값은 꺼짐입니다.</td>
+</tr>
+<tr>
+<td><strong>Run / Stop</strong></td>
+<td>로드된 모델이 대기 상태이고 길이가 팩 제한에 맞아야 Run이 활성화됩니다. Stop은 측정을 종료합니다.</td>
+</tr>
+</tbody>
+</table></div>
+<p>벤치마크는 토큰당 약 4글자로 길이를 맞춘 자체 프롬프트를 사용하고 자세한 재서술을
+요청합니다. 실행별 표에는 실제 토큰 수가 표시됩니다. 매 반복마다 화면의 대화를
+지우고 프롬프트를 전송하므로 필요한 대화 내용은 먼저 저장하세요.</p>
+<p>네이티브 모델에서는 <code>max_seq_len - num_to_generate</code>를 프롬프트 예산,
+<code>num_to_generate</code>를 응답 예산으로 읽고 이를 넘는 선택값을 비활성화합니다.
+현재 팔레트 프리셋에서는 4K 프리필을 선택할 수 없습니다. 엔진의 프리필 제한으로
+실제 입력이 더 짧아질 수 있으므로 보고된 토큰 수를 확인하세요. 화면의 길이를
+선택한다고 팩의 컨텍스트 설정이 바뀌지는 않습니다.</p>
+<p>결과에는 <strong>TIME TO FIRST TOKEN</strong>(전송부터 앱의 첫 토큰 수신까지), 엔진 시간으로
+계산한 <strong>PREFILL</strong> 속도, 첫 토큰부터 마지막 토큰까지 실제 경과 시간으로 계산한
+<strong>DECODE</strong> 속도의 중앙값이 표시됩니다. 각 행에는 입력·출력 토큰 수와 시간이 나옵니다.
+일찍 끝난 응답, 건너뛴 실행, 디코드 구간이 1초보다 짧은 실행은 이유가 표시되며,
+조건에 맞는 실행이 중앙값에 포함됩니다. 로드 직후 첫 실행은 준비 시간이 포함될 수
+있고 자동으로 제외되지 않습니다.</p>
+<p>모든 파일 접근 권한이 있으면 CSV를
+<code>/sdcard/Download/QuickAI/power/bench.csv</code>에 이어 쓰고, 권한이 없으면 앱 전용
+외부 파일 디렉터리를 사용합니다. 화면의 <strong>Saved to</strong> 경로를 확인하세요.
+이전의 마지막 대화 지표, 최대 메모리 타일, 원시 출력 기록은 제거되었습니다.
+답변 아래의 개별 대화 통계는 유지됩니다. 채팅 스트림에서는 <code>&lt;turn|&gt;</code> 같은 종료
+마커를 제거하므로 Gemma4 종료 토큰 ID <code>106</code>은 네이티브 토큰 트레이스로 확인합니다.</p>
+<h2 id="5-measure-power">5. 전력 측정</h2>
+<p><strong>Power</strong> 탭은 배터리 게이지를 이용해 출력 토큰당 휴대전화 전체 에너지를 측정합니다.
+모델 로드 후 <strong>PROMPT</strong>, <strong>WINDOW TOKENS</strong>, <strong>REPEATS</strong>, <strong>BASELINE</strong>을 선택하고
+<strong>Measure</strong>를 누른 다음 안내에 따라 케이블을 분리합니다. 기기가 식기를 기다리고,
+대기 전력을 측정한 뒤 응답을 생성하고 냉각 대기를 거칩니다.
+전력을 측정할 때는 디버그용 <strong>Measure while plugged</strong>를 꺼 두세요.</p>
+<p>결과에는 대기 전력을 차감한 <code>mJ/token</code>, 전력 및 실행별 기록이 표시됩니다.
+모든 파일 접근 권한이 있으면 <code>runs.csv</code>와 세션 JSON을
+<code>/sdcard/Download/QuickAI/power/</code>에 저장합니다. Metrics는 USB가 연결된 상태로
+실행할 수 있으며 대기 전력 측정과 실행 간 냉각 대기가 없습니다.
+한쪽 측정이 끝난 뒤 다른 측정을 시작하세요.</p>
+<p>사용을 마치거나 CLI를 다시 실행하려면 상단 모델 선택 칩 → <strong>Unload</strong>를 누릅니다.
+다시 시작할 때는 <strong>Load model</strong>, 이미 로드한 모델을 새로 열 때는 <strong>Reload model</strong>을
+사용합니다. 최신 앱은 네이티브 추론을 별도 작업 프로세스에서 실행하고, 해당 프로세스가
+종료된 뒤 다음 모델을 로드합니다. NPU 모델은 한 번에 하나만 로드하세요.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="cli.html"><small>이전</small><span>CLI 추론</span></a><a class="pager-next" href="benchmarks.html"><small>다음</small><span>벤치마크 결과</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#build-and-install-the-apk">APK 빌드 및 설치</a></li><li><a href="#load-the-model-and-send-a-message">모델 로드 및 메시지 보내기</a></li><li><a href="#1-select-gemma4-npu-and-the-model-path">1. Gemma4 NPU와 모델 경로 선택</a></li><li><a href="#2-confirm-the-model-has-loaded">2. 모델 로드 완료 확인</a></li><li><a href="#3-send-a-question-and-stop-generation">3. 질문 보내기와 생성 중지</a></li><li><a href="#4-check-metrics-and-unload">4. Metrics 확인 및 모델 해제</a></li><li><a href="#5-measure-power">5. 전력 측정</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>
