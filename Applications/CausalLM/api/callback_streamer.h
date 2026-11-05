@@ -49,6 +49,14 @@ typedef int (*CausalLmTokenCallback)(const char *delta, void *user_data);
  * @brief A BaseStreamer that forwards every put() to a
  *        CausalLmTokenCallback.
  *
+ * Two filters sit between the model and the callback, so every backend's
+ * stream is cleaned in one place:
+ *  - chat turn markers ("<turn|>", "<|turn>", "<|im_end|>", "<|im_start|>")
+ *    are removed from a delta; a delta that was only markers is dropped
+ *    without cancelling;
+ *  - a delta made only of literal "<pad>" tokens is dropped, and the eighth
+ *    one in a row cancels the generation (put() returns 1).
+ *
  * Layout note: @c base MUST be the first member so that a
  * `CallbackStreamer*` can be safely cast to `BaseStreamer*`.
  */
@@ -57,6 +65,7 @@ typedef struct {
   CausalLmTokenCallback callback;
   void *user_data;
   int cancelled; /**< sticky: once set to non-zero, put() becomes a no-op. */
+  int pad_run;   /**< consecutive "<pad>"-only deltas seen (never forwarded). */
 } CallbackStreamer;
 
 /**

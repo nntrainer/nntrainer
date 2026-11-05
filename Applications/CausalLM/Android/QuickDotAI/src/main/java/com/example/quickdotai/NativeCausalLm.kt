@@ -18,6 +18,58 @@ object NativeCausalLm {
     @Volatile
     private var loaded: Boolean = false
 
+    /** Set when libqai_ext_model.so exists but System.loadLibrary rejected it. */
+    @Volatile
+    private var extensionLoadError: String? = null
+
+    /** Outcome of looking for the optional model-extension plugin. */
+    enum class ExtensionState {
+        /** No plugin shipped: the normal public build. */
+        ABSENT,
+        /** Plugin loaded, ABI accepted, its models are in the catalog. */
+        LOADED,
+        /** A plugin is present but unusable; only public models are available. */
+        FAILED,
+    }
+
+    data class ExtensionStatus(val state: ExtensionState, val message: String)
+
+    /**
+     * True when [t] says the plugin FILE could not be found, which is how a
+     * public build (no plugin shipped) fails to load it. Bionic's wording is
+     * `couldn't find "libqai_ext_model.so"`; a dependency or symbol problem
+     * inside a present plugin reads differently.
+     */
+    internal fun isExtensionAbsent(t: UnsatisfiedLinkError): Boolean {
+        val msg = t.message ?: return false
+        return msg.contains("couldn't find \"libqai_ext_model.so\"") ||
+            (msg.contains("\"libqai_ext_model.so\" not found") && !msg.contains("needed by"))
+    }
+
+    /**
+     * @brief Whether the model-extension plugin is absent, loaded, or present
+     *        but failed (ABI mismatch, missing symbol, unresolved dependency).
+     *
+     * Combines the Kotlin-side load result with the native host's own check.
+     * Requires [ensureLoaded] to have succeeded for the native part.
+     */
+    fun extensionStatus(): ExtensionStatus {
+        extensionLoadError?.let {
+            return ExtensionStatus(ExtensionState.FAILED, "failed: libqai_ext_model.so: $it")
+        }
+        val native = try {
+            if (ensureLoaded()) extensionModelStatusNative() else "absent: native library not loaded"
+        } catch (t: Throwable) {
+            "failed: could not query the extension status: ${t.message}"
+        }
+        val state = when {
+            native.startsWith("loaded") -> ExtensionState.LOADED
+            native.startsWith("failed") -> ExtensionState.FAILED
+            else -> ExtensionState.ABSENT
+        }
+        return ExtensionStatus(state, native)
+    }
+
     /** @brief Load the required native libraries once. */
     @Synchronized
     fun ensureLoaded(): Boolean {
@@ -32,17 +84,32 @@ object NativeCausalLm {
             }
             System.loadLibrary("quickai_jni")
 
-            // Optional model-extension plugin. A downstream project may ship a
-            // self-registering plugin (libqai_ext_model.so) that adds extra models to
-            // the catalog; the public build ships without it and runs public models
-            // only. Loaded after quickai_jni so libcausallm.so/libquick_dot_ai_api.so
-            // (and their model/descriptor registries) are already present for the
-            // plugin's constructors to register into. Absence is normal -> ignore.
+            // Optional model-extension plugin. A downstream project may ship
+            // libqai_ext_model.so, which adds extra models to the catalog; the
+            // public build ships without it and runs public models only. It is
+            // loaded after quickai_jni so the host libraries (and the model
+            // registries it registers into) are already mapped. Loading does
+            // not register anything: the native host checks the plugin's ABI
+            // and then asks it to register (see getExtensionModelStatus in
+            // quick_dot_ai_api.h).
+            //
+            // Only "the file is not there" is the normal public build. Any other
+            // failure (a missing dependency, an unresolved symbol, a wrong ABI)
+            // means a plugin was shipped and is broken: it is recorded and
+            // reported by [extensionStatus], not swallowed.
             try {
                 System.loadLibrary("qai_ext_model")
                 android.util.Log.i(TAG, "Loaded optional model-extension plugin (qai_ext_model)")
             } catch (t: UnsatisfiedLinkError) {
-                android.util.Log.d(TAG, "No optional model-extension plugin present (public build)")
+                if (isExtensionAbsent(t)) {
+                    android.util.Log.d(TAG, "No optional model-extension plugin present (public build)")
+                } else {
+                    extensionLoadError = t.message ?: t.toString()
+                    android.util.Log.e(
+                        TAG,
+                        "Model-extension plugin (qai_ext_model) is present but failed to load: $extensionLoadError"
+                    )
+                }
             }
 
             loaded = true
@@ -76,7 +143,12 @@ object NativeCausalLm {
         val generationDurationMs: Double,
         val totalDurationMs: Double,
         val initializationDurationMs: Double,
-        val peakMemoryKb: Long
+        val peakMemoryKb: Long,
+        val ttftMs: Double,
+        val firstTokenMs: Double,
+        val decodeSteadyMs: Double,
+        val decodeSteadyTokens: Int,
+        val prefillDrainMs: Double,
     )
 
 
@@ -168,8 +240,15 @@ object NativeCausalLm {
         modelBasePath: String?,
     ): Long
 
+    /** Copy the diagnostic immediately after a failed load on the same worker. */
+    external fun lastModelLoadErrorNative(): String
+
     /** @brief Returns the registered model catalog as a JSON array string. */
     external fun nativeQueryCatalog(): String
+
+    /** Native host's one-line outcome of the plugin lookup: "absent: ...",
+     *  "loaded: ..." or "failed: ..." (getExtensionModelStatus). */
+    external fun extensionModelStatusNative(): String
 
     /**
      * Encode [text] into a sentence-embedding vector using an embedding handle
@@ -233,6 +312,13 @@ object NativeCausalLm {
 
     /** Forwards to `getPerformanceMetricsHandle` in quick_dot_ai_api.h. */
     external fun getPerformanceMetricsHandleNative(handle: Long): MetricsResult
+
+    /**
+     * Forwards to `getLastErrorMessageHandle` in quick_dot_ai_api.h:
+     * human-readable text for the most recent failure on this handle (empty
+     * when nothing failed). Complements the numeric error codes.
+     */
+    external fun getLastErrorMessageHandleNative(handle: Long): String
 
     /** Forwards to `unloadModelHandle` in quick_dot_ai_api.h. */
     external fun unloadModelHandleNative(handle: Long): Int
@@ -392,3 +478,19 @@ object NativeCausalLm {
 
     private const val TAG = "NativeCausalLm"
 }
+
+/** The C struct's rows, including the perf-split ones, as the public type. */
+internal fun NativeCausalLm.MetricsResult.toPerformanceMetrics(): PerformanceMetrics = PerformanceMetrics(
+    prefillTokens = prefillTokens,
+    prefillDurationMs = prefillDurationMs,
+    generationTokens = generationTokens,
+    generationDurationMs = generationDurationMs,
+    totalDurationMs = totalDurationMs,
+    initializationDurationMs = initializationDurationMs,
+    peakMemoryKb = peakMemoryKb,
+    ttftMs = ttftMs,
+    firstTokenMs = firstTokenMs,
+    decodeSteadyMs = decodeSteadyMs,
+    decodeSteadyTokens = decodeSteadyTokens,
+    prefillDrainMs = prefillDrainMs,
+)

@@ -9,6 +9,12 @@
 #define __QUICK_DOT_AI_MODEL_DESCRIPTOR_H__
 
 #ifdef __cplusplus
+#include <cstddef>
+#else
+#include <stddef.h>
+#endif
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -29,6 +35,10 @@ typedef enum {
   QDA_CAP_SPECULATIVE =
     1u
     << 7, /**< supports speculative decoding; load sd_variant_id when enabled */
+  QDA_CAP_PLANAR_CHW =
+    1u << 8, /**< the vision encoder consumes planar CHW (NCHW) pixels, not the
+                  interleaved HWC layout the other vision models take. Appended
+                  after QDA_CAP_SPECULATIVE: bit values never move. */
 } CapabilityFlag;
 
 /**
@@ -51,6 +61,25 @@ typedef struct {
                                   none */
 } ModelDescriptor;
 
+/*
+ * ModelDescriptor is copied BY VALUE into the host's registry, and a model
+ * extension (libqai_ext_model.so) is compiled separately from the host. A
+ * plugin built against a header with fewer fields would be over-read, one with
+ * more would be truncated. These asserts pin the layout; a change here is an
+ * ABI change and must bump QDA_EXT_ABI_VERSION (ext_model_abi.h), which the
+ * host checks when it loads a plugin.
+ */
+#ifdef __cplusplus
+static_assert(offsetof(ModelDescriptor, sd_variant_id) + sizeof(const char *) ==
+                sizeof(ModelDescriptor),
+              "sd_variant_id must stay the last ModelDescriptor field; append "
+              "new fields after it and bump QDA_EXT_ABI_VERSION");
+#if defined(__LP64__) || defined(_WIN64)
+static_assert(sizeof(ModelDescriptor) == 64,
+              "ModelDescriptor ABI changed: bump QDA_EXT_ABI_VERSION");
+#endif
+#endif
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -62,6 +91,15 @@ namespace quick_dot_ai {
  *        Duplicate id overwrites the existing entry (logs a warning).
  */
 void register_model_descriptor(const ModelDescriptor *desc);
+
+/**
+ * @brief Map a descriptor's config_name to the directory name its model pack
+ *        lives in, for packs whose directory is not simply config_name
+ *        lower-cased (which is what an unmapped name resolves to). The key is
+ *        compared case-insensitively. Used by model extensions to place their
+ *        packs without the host knowing their names.
+ */
+void register_model_path(const char *config_name, const char *directory);
 } // namespace quick_dot_ai
 #endif
 

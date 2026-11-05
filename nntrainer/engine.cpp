@@ -191,10 +191,13 @@ void Engine::add_default_object() {
 #if defined(ENABLE_NPU) && ENABLE_NPU == 1
   // QNN context is loaded as a plugin .so for decoupling from QNN SDK.
   // libqnn_context.so exports ml_train_context_pluggable symbol.
-  try {
-    registerContext("libqnn_context.so", "");
-  } catch (std::exception &e) {
-    ml_logw("QNN context plugin not available: %s", e.what());
+  // A native worker can defer QNN until its model explicitly registers it.
+  if (nntr_env_on_or("NNTR_QNN_EAGER_CTX", true)) {
+    try {
+      registerContext("libqnn_context.so", "");
+    } catch (std::exception &e) {
+      ml_logw("QNN context plugin not available: %s", e.what());
+    }
   }
 #endif
 }

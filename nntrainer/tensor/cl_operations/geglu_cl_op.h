@@ -46,6 +46,13 @@ bool registerGeGLUClKernels(ClContext &cl_context);
 void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
                  unsigned int active_rows, unsigned int row_offset);
 
+/**
+ * @brief out = gelu(gate) * up with the exact (erf) gelu, over rows
+ *        [row_offset, row_offset + active_rows).
+ */
+void geglu_erf_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset);
+
 } // namespace nntrainer
 
 #endif // __GEGLU_CL_OP_H__

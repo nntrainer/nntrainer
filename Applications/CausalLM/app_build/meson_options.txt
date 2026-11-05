@@ -10,3 +10,6 @@ option('enable-api-test', type: 'boolean', value: false,
        description: 'Build quick_dot_ai_test executable. Requires enable-api.')
 option('tokenizer-cache', type: 'feature', value: 'auto',
        description: 'Persistent tokenizer snapshot cache. auto = on when the tokenizer library exports the snapshot entry points (tools/build_tokenizers_c.sh).')
+
+option('enable-htp-device-check', type: 'boolean', value: false,
+       description: 'Build the resident HTP continuation device check')

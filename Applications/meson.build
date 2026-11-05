@@ -1,6 +1,11 @@
 fs = import('fs')
 
-if get_option('platform') == 'android'
+if get_option('causallm-only')
+  if not get_option('enable-transformer')
+    error('causallm-only requires enable-transformer')
+  endif
+  subdir('CausalLM')
+elif get_option('platform') == 'android'
   # nntrainer standalone app build (S1): only CausalLM is wired for a
   # meson-driven android build today. The legacy sample apps below
   # (LogisticRegression, MNIST, VGG, ...) build via ndk-build/Android.mk

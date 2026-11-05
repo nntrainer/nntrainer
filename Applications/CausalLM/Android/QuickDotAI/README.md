@@ -7,7 +7,12 @@ interface over two engine implementations:
   `libquickai_jni.so` and the native `quick_dot_ai_api.h` entry points.
 - `LiteRTLm`: LiteRT-LM path for Gemma-family `.litertlm` models.
 
-The current Gradle build includes `:QuickDotAI` and `:SampleTestAPP`.
+The current Gradle build includes `:QuickDotAI` and `:QuickDotAIAPP`.
+
+The sample groups models by family, runtime and backend. When a tuple contains
+multiple packs, **MODEL VARIANT** selects the exact descriptor without changing
+its model ID. A descriptor's SD variant stays behind the **SPECULATIVE DECODING**
+switch; the displayed folder and load request both follow that variant.
 
 ## 📦 Dependency
 
@@ -30,16 +35,58 @@ export ANDROID_NDK=/path/to/your/android-ndk
 
 The CPU-only AAR mode stages `libcausallm.so`,
 `libquick_dot_ai_api.so`, and the nntrainer runtime, builds
-`libquickai_jni.so`, and assembles the QuickDotAI AAR plus SampleTestAPP. It is
+`libquickai_jni.so`, and assembles the QuickDotAI AAR plus QuickDotAIAPP. It is
 build-only: a connected device is not modified unless `--install` is supplied.
 The script forwards the selected NDK to Gradle. Direct Gradle builds must pass
 `-PnntrainerNdkPath=<absolute-path>`.
 
+The same Android sources can consume a separately assembled native stage:
+pass `-PnntrainerPrebuiltDir=<absolute-stage-directory>` to Gradle. The default
+is `QuickDotAI/prebuilt_libs`. A public stage has no model-extension plugin;
+an internal stage adds its plugin to the otherwise identical runtime. The
+`Sync` task removes libraries left by the previously selected stage.
+
 Use `--qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package; CPU is the
 default. `--install` pushes the
-native tools and libraries, and installs SampleTestAPP only when combined with
+native tools and libraries, and installs QuickDotAIAPP only when combined with
 `--app`. `--cache` reuses a compatible engine when available and rebuilds it
 on a cache miss.
+
+### Gemma4 MoE HTP
+
+`build_android.sh --htp --app` assembles the native Hexagon variant. Set
+`HEX_ARCH=v81`, `HEXAGON_SDK_ROOT`, `DEFAULT_HEXAGON_TOOLS_ROOT`, `HEXKL_ROOT`,
+and `HEXKL_SDK_VER` for the matching DSP/ARM SDK libraries. HTP and `--qnn`
+are separate builds. The HTP package includes `libsdkl.so` and the byte-exact
+`libnntr_hvx_skel.so`; `libcdsprpc.so` comes from the device vendor namespace.
+
+Keep `jniLibs.useLegacyPackaging = true` and
+`jniLibs.keepDebugSymbols += "**/libnntr_hvx_skel.so"` in the consuming app.
+Pass `applicationInfo.nativeLibraryDir` in `LoadModelRequest.nativeLibDir`.
+Select `ModelIds.GEMMA4_26B_A4B_HTP`, `BackendType.NPU` and
+`QuantizationType.W4A32`. The model folder must be
+`<modelBasePath>/gemma4-26b-a4b-htp-w4a32`; use the validated HTP pack, not a
+CPU or QNN pack. Run text through `runModelHandleWithMessagesStreaming`.
+
+For the rotated 2/4-bit pack, select the sample's separate
+`gemma4-26b-a4b-2bit-4bit` family with NATIVE / NPU. Its model ID is
+`gemma4-26b-a4b-htp-2bit-4bit`, and its folder is
+`<modelBasePath>/gemma4-26b-a4b-2bit-4bit`. Keep the pack's own settings;
+the existing `gemma4-26b-a4b` family continues to select the other HTP pack.
+
+The current HexKL `libsdkl.so` has 4 KB LOAD alignment. The tested Android 16
+4 KB device runs the app, but displays a debug 16 KB compatibility warning
+that also lists the DSP ELF in the native library directory. This build is
+not certified for a 16 KB device. See the
+[device validation](../../../../docs/gemma4-htp-quickdotai.md#validation).
+
+The tested summary prompt ships with the sample as
+`QuickDotAIAPP/src/main/res/raw/gemma4_moe_messages.json` and as the Power
+tab's `HTP 1K` preset. For Chat, use the [HTP chat preset](../../res/gemma4/htp_chat/)
+in the model pack: it supplies the 26B template with an empty thought channel, real EOS
+tokens and enough context for the full default prompt. The fixed-length benchmark
+configuration is not suitable for interactive responses. See the
+[Chat configuration and validation](../../../../docs/gemma4-htp-quickdotai.md#chat-and-the-default-prompt).
 
 ## 🧭 API Surface
 
@@ -121,8 +168,8 @@ Use `runModelHandleWithMessagesStreaming()` for OpenAI-style message lists and
 `runModelHandleWithJsonStreaming()` for full OpenAI JSON requests containing
 `tools` or legacy `functions`.
 
-End-to-end Chat tab and OpenAI tab examples live in
-[`../../docs/ChatAndOpenAIUsage.md`](../../docs/ChatAndOpenAIUsage.md).
+End-to-end Chat and JSON request examples live in the sample app
+([`../QuickDotAIAPP`](../QuickDotAIAPP), described in [`../Architecture.md`](../Architecture.md)).
 
 ## 🖼️ Multimodal Usage
 
@@ -224,12 +271,15 @@ interface StreamSink {
 See `Types.kt` for the full DTO set, including `QuickAiChatSessionConfig`,
 sampling options, error codes, and metrics.
 
-For native QNN models, `htpBackendConfigPath` points to
-`htp_backend_ext_config.json`. Absolute paths are used as-is. Relative paths are
-resolved from the app external files directory, so
-`"configs/htp_backend_ext_config.json"` resolves to
-`<externalFilesDir>/configs/htp_backend_ext_config.json`. When omitted,
-`NativeQuickDotAI` uses `<externalFilesDir>/htp_backend_ext_config.json`.
+For native QNN models, provision the model files and
+`htp_backend_ext_config.json` separately; the AAR does not create or extract
+this runtime configuration into the app's files directory. The current by-name
+load path does not forward `htpBackendConfigPath`. It honors an existing
+`QUICK_DOT_AI_QNN_BACKEND_EXT_CONFIG_PATH` environment override; otherwise it
+derives the path from `modelBasePath`, removing a trailing `/models` before
+appending `/htp_backend_ext_config.json`. For example, with
+`modelBasePath=<filesDir>/models`, provision the JSON at
+`<filesDir>/htp_backend_ext_config.json`.
 
 ## ✅ Rules
 
@@ -240,6 +290,7 @@ resolved from the app external files directory, so
   `applicationInfo.nativeLibraryDir`.
 - Pass `modelBasePath` for native models when model files live outside the
   native default path.
-- Pass `htpBackendConfigPath` for QNN models when
-  `htp_backend_ext_config.json` lives outside the app external files root.
+- Provision the QNN backend configuration at the derived path, or set the
+  existing environment override before loading. The by-name load path does not
+  forward `htpBackendConfigPath`.
 - Pass `modelPath` for `LiteRTLm` / `GEMMA4` models.

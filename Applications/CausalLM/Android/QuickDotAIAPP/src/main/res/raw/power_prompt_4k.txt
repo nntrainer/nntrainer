@@ -1,0 +1,83 @@
+Section 1. Measuring the energy an on-device language model spends per generated token sounds simple and is not. The phone reports one current for the whole device, so the screen, the modem and the memory controller are inside every number, and the only way to attribute a part of it to the model is to measure the same phone twice: once idle with the model loaded, once while it answers, and subtract.
+
+Section 2. The battery gauge is a slow instrument. It integrates current over a window of a second or so and publishes a new reading when the window closes, which means a two-second prefill may be covered by two readings and a short answer by a handful. Long answers average well; short ones are noise. Sampling faster than the gauge updates only repeats the last value and should not be mistaken for resolution.
+
+Section 3. Thermal state matters more than most people expect. A phone that has answered three prompts in a row runs its skin sensor close to the first throttling threshold, and from there the governor lowers clocks in steps that are invisible to the application. Tokens per second fall, power may fall or rise, and the energy per token changes for reasons that have nothing to do with the model or the runtime being compared.
+
+Section 4. A fair comparison therefore starts every run from the same thermal state. Waiting for the system to report no throttling and a comfortable headroom before each run costs minutes but removes the largest source of drift. Recording the temperatures of the processor blocks alongside the result explains the runs that still look different.
+
+Section 5. Prefill and decode are different workloads and deserve separate numbers. Prefill is compute bound, short and intense; decode is memory bound, long and steady. A single average over both hides which one a new kernel improved, and a per-token figure computed over the whole answer rewards long outputs with a flattering denominator. Reporting the decode window on its own, after the first token, keeps the figure honest.
+
+Section 6. The baseline is not a constant. Screen brightness, a background sync, a notification arriving, a Wi-Fi scan: any of them moves the idle draw by tenths of a watt, which is the same order as the signal for a small model. Taking the median of ten seconds of idle readings rather than the mean makes a single spike harmless, and repeating the measurement makes a shifted baseline visible as an outlier.
+
+Section 7. Charging current is the one thing that cannot be subtracted. With a cable attached, the gauge sees the charger and the load together, and depending on the charge level the battery may be supplying, absorbing or idling. Every measurement that matters is taken with the cable out, which also means the results have to live on the phone until the cable goes back in.
+
+Section 8. Numbers that cannot be recomputed are not worth much. Keeping every sample with its timestamp, the moment the prompt was sent, the moment the first token arrived and the moment the window closed allows the same run to be analysed again later with a different baseline window or a different token count, and allows a second person to check the arithmetic without repeating the experiment.
+
+Section 9. Finally, a per-token figure is only comparable at the same speed. Two configurations can share an energy per token while one draws twice the power and finishes twice as fast; the user feels the difference as heat and battery life. The watts during decode, the tokens per second and the energy per token are three sides of the same measurement and belong in the same table.
+
+Section 10. None of this requires special hardware. The battery gauge, the thermal service and the sensors of the processor blocks are readable by an ordinary application on a production phone. What it requires is patience with the slow instrument, discipline about the thermal state, and the habit of writing down the raw samples rather than the summary alone.
+
+Section 11. Measuring the energy an on-device language model spends per generated token sounds simple and is not. The phone reports one current for the whole device, so the screen, the modem and the memory controller are inside every number, and the only way to attribute a part of it to the model is to measure the same phone twice: once idle with the model loaded, once while it answers, and subtract.
+
+Section 12. The battery gauge is a slow instrument. It integrates current over a window of a second or so and publishes a new reading when the window closes, which means a two-second prefill may be covered by two readings and a short answer by a handful. Long answers average well; short ones are noise. Sampling faster than the gauge updates only repeats the last value and should not be mistaken for resolution.
+
+Section 13. Thermal state matters more than most people expect. A phone that has answered three prompts in a row runs its skin sensor close to the first throttling threshold, and from there the governor lowers clocks in steps that are invisible to the application. Tokens per second fall, power may fall or rise, and the energy per token changes for reasons that have nothing to do with the model or the runtime being compared.
+
+Section 14. A fair comparison therefore starts every run from the same thermal state. Waiting for the system to report no throttling and a comfortable headroom before each run costs minutes but removes the largest source of drift. Recording the temperatures of the processor blocks alongside the result explains the runs that still look different.
+
+Section 15. Prefill and decode are different workloads and deserve separate numbers. Prefill is compute bound, short and intense; decode is memory bound, long and steady. A single average over both hides which one a new kernel improved, and a per-token figure computed over the whole answer rewards long outputs with a flattering denominator. Reporting the decode window on its own, after the first token, keeps the figure honest.
+
+Section 16. The baseline is not a constant. Screen brightness, a background sync, a notification arriving, a Wi-Fi scan: any of them moves the idle draw by tenths of a watt, which is the same order as the signal for a small model. Taking the median of ten seconds of idle readings rather than the mean makes a single spike harmless, and repeating the measurement makes a shifted baseline visible as an outlier.
+
+Section 17. Charging current is the one thing that cannot be subtracted. With a cable attached, the gauge sees the charger and the load together, and depending on the charge level the battery may be supplying, absorbing or idling. Every measurement that matters is taken with the cable out, which also means the results have to live on the phone until the cable goes back in.
+
+Section 18. Numbers that cannot be recomputed are not worth much. Keeping every sample with its timestamp, the moment the prompt was sent, the moment the first token arrived and the moment the window closed allows the same run to be analysed again later with a different baseline window or a different token count, and allows a second person to check the arithmetic without repeating the experiment.
+
+Section 19. Finally, a per-token figure is only comparable at the same speed. Two configurations can share an energy per token while one draws twice the power and finishes twice as fast; the user feels the difference as heat and battery life. The watts during decode, the tokens per second and the energy per token are three sides of the same measurement and belong in the same table.
+
+Section 20. None of this requires special hardware. The battery gauge, the thermal service and the sensors of the processor blocks are readable by an ordinary application on a production phone. What it requires is patience with the slow instrument, discipline about the thermal state, and the habit of writing down the raw samples rather than the summary alone.
+
+Section 21. Measuring the energy an on-device language model spends per generated token sounds simple and is not. The phone reports one current for the whole device, so the screen, the modem and the memory controller are inside every number, and the only way to attribute a part of it to the model is to measure the same phone twice: once idle with the model loaded, once while it answers, and subtract.
+
+Section 22. The battery gauge is a slow instrument. It integrates current over a window of a second or so and publishes a new reading when the window closes, which means a two-second prefill may be covered by two readings and a short answer by a handful. Long answers average well; short ones are noise. Sampling faster than the gauge updates only repeats the last value and should not be mistaken for resolution.
+
+Section 23. Thermal state matters more than most people expect. A phone that has answered three prompts in a row runs its skin sensor close to the first throttling threshold, and from there the governor lowers clocks in steps that are invisible to the application. Tokens per second fall, power may fall or rise, and the energy per token changes for reasons that have nothing to do with the model or the runtime being compared.
+
+Section 24. A fair comparison therefore starts every run from the same thermal state. Waiting for the system to report no throttling and a comfortable headroom before each run costs minutes but removes the largest source of drift. Recording the temperatures of the processor blocks alongside the result explains the runs that still look different.
+
+Section 25. Prefill and decode are different workloads and deserve separate numbers. Prefill is compute bound, short and intense; decode is memory bound, long and steady. A single average over both hides which one a new kernel improved, and a per-token figure computed over the whole answer rewards long outputs with a flattering denominator. Reporting the decode window on its own, after the first token, keeps the figure honest.
+
+Section 26. The baseline is not a constant. Screen brightness, a background sync, a notification arriving, a Wi-Fi scan: any of them moves the idle draw by tenths of a watt, which is the same order as the signal for a small model. Taking the median of ten seconds of idle readings rather than the mean makes a single spike harmless, and repeating the measurement makes a shifted baseline visible as an outlier.
+
+Section 27. Charging current is the one thing that cannot be subtracted. With a cable attached, the gauge sees the charger and the load together, and depending on the charge level the battery may be supplying, absorbing or idling. Every measurement that matters is taken with the cable out, which also means the results have to live on the phone until the cable goes back in.
+
+Section 28. Numbers that cannot be recomputed are not worth much. Keeping every sample with its timestamp, the moment the prompt was sent, the moment the first token arrived and the moment the window closed allows the same run to be analysed again later with a different baseline window or a different token count, and allows a second person to check the arithmetic without repeating the experiment.
+
+Section 29. Finally, a per-token figure is only comparable at the same speed. Two configurations can share an energy per token while one draws twice the power and finishes twice as fast; the user feels the difference as heat and battery life. The watts during decode, the tokens per second and the energy per token are three sides of the same measurement and belong in the same table.
+
+Section 30. None of this requires special hardware. The battery gauge, the thermal service and the sensors of the processor blocks are readable by an ordinary application on a production phone. What it requires is patience with the slow instrument, discipline about the thermal state, and the habit of writing down the raw samples rather than the summary alone.
+
+Section 31. Measuring the energy an on-device language model spends per generated token sounds simple and is not. The phone reports one current for the whole device, so the screen, the modem and the memory controller are inside every number, and the only way to attribute a part of it to the model is to measure the same phone twice: once idle with the model loaded, once while it answers, and subtract.
+
+Section 32. The battery gauge is a slow instrument. It integrates current over a window of a second or so and publishes a new reading when the window closes, which means a two-second prefill may be covered by two readings and a short answer by a handful. Long answers average well; short ones are noise. Sampling faster than the gauge updates only repeats the last value and should not be mistaken for resolution.
+
+Section 33. Thermal state matters more than most people expect. A phone that has answered three prompts in a row runs its skin sensor close to the first throttling threshold, and from there the governor lowers clocks in steps that are invisible to the application. Tokens per second fall, power may fall or rise, and the energy per token changes for reasons that have nothing to do with the model or the runtime being compared.
+
+Section 34. A fair comparison therefore starts every run from the same thermal state. Waiting for the system to report no throttling and a comfortable headroom before each run costs minutes but removes the largest source of drift. Recording the temperatures of the processor blocks alongside the result explains the runs that still look different.
+
+Section 35. Prefill and decode are different workloads and deserve separate numbers. Prefill is compute bound, short and intense; decode is memory bound, long and steady. A single average over both hides which one a new kernel improved, and a per-token figure computed over the whole answer rewards long outputs with a flattering denominator. Reporting the decode window on its own, after the first token, keeps the figure honest.
+
+Section 36. The baseline is not a constant. Screen brightness, a background sync, a notification arriving, a Wi-Fi scan: any of them moves the idle draw by tenths of a watt, which is the same order as the signal for a small model. Taking the median of ten seconds of idle readings rather than the mean makes a single spike harmless, and repeating the measurement makes a shifted baseline visible as an outlier.
+
+Section 37. Charging current is the one thing that cannot be subtracted. With a cable attached, the gauge sees the charger and the load together, and depending on the charge level the battery may be supplying, absorbing or idling. Every measurement that matters is taken with the cable out, which also means the results have to live on the phone until the cable goes back in.
+
+Section 38. Numbers that cannot be recomputed are not worth much. Keeping every sample with its timestamp, the moment the prompt was sent, the moment the first token arrived and the moment the window closed allows the same run to be analysed again later with a different baseline window or a different token count, and allows a second person to check the arithmetic without repeating the experiment.
+
+Section 39. Finally, a per-token figure is only comparable at the same speed. Two configurations can share an energy per token while one draws twice the power and finishes twice as fast; the user feels the difference as heat and battery life. The watts during decode, the tokens per second and the energy per token are three sides of the same measurement and belong in the same table.
+
+Section 40. None of this requires special hardware. The battery gauge, the thermal service and the sensors of the processor blocks are readable by an ordinary application on a production phone. What it requires is patience with the slow instrument, discipline about the thermal state, and the habit of writing down the raw samples rather than the summary alone.
+
+Section 41. Measuring the energy an on-device language model spends per generated token sounds simple and is not. The phone reports one current for the whole device, so the screen, the modem and the memory controller are inside every number, and the only way to attribute a part of it to the model is to measure the same phone twice: once idle with the model loaded, once while it answers, and subtract. Section 42. The battery gauge is a slow instrument.
+
+Summarize the text above in three sentences.

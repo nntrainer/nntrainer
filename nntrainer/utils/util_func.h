@@ -34,6 +34,7 @@
 #include <nntrainer_error.h>
 #include <random>
 #include <variant>
+#include <weight_file_reader.h>
 
 // /**
 //  * @brief     get the seed
@@ -42,7 +43,7 @@
 // unsigned int getSeed() { return 0; }
 
 namespace nntrainer {
-using ReadSource = std::variant<std::ifstream *, const char *>;
+using ReadSource = std::variant<std::ifstream *, const char *, FileReadSource>;
 
 #define NN_RETURN_STATUS()                                                     \
   do {                                                                         \

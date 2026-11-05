@@ -20,20 +20,33 @@
  *          - Llama
  */
 
+#if __has_include(<htp_runtime_config.h>)
+#include <htp_runtime_config.h>
+#else
+#include <htp_backend/htp_runtime_config.h>
+#endif
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+#ifdef ENABLE_HEXKL
+#include <htp_backend/htp_backend.h>
+#endif
 
 #include <compute_ops.h>
 #include <env_compat.h> // nntr_env_on: value-checked read of auto-injected flags
@@ -79,6 +92,9 @@ void clLaunchStatDump(const char *phase);
 #include <causal_lm.h>
 #include <embedding_layer.h> // [lmhead-tie-lut] QuantLut / get_or_load_quant_lut
 #include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
+#include <htp_decode_hook.h>
+#include <htp_mha_core.h>
+#include <layer_node.h>
 #include <llm_util.hpp>
 #if !defined(_WIN32)
 #include <sys/mman.h> // [lmhead-tie-lut] madvise the uploaded LUT mmap away
@@ -89,7 +105,7 @@ void clLaunchStatDump(const char *phase);
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_emb_gather.h> // [reload] gather LUT teardown
-#include <cuda_fc_qs4cx.h> // [lmhead-tie-lut] tied-head LUT registration
+#include <cuda_fc_qs4cx.h>   // [lmhead-tie-lut] tied-head LUT registration
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -225,6 +241,18 @@ bool sample_device_topk_enabled() {
 #include "api/streamer.h"
 
 namespace causallm {
+namespace {
+/** NNTR_PPL_DECODE: -log softmax(logits)[target], in double. */
+double nllOf(const float *logits, unsigned int vocab, unsigned int target) {
+  float mx = logits[0];
+  for (unsigned int v = 1; v < vocab; ++v)
+    mx = std::max(mx, logits[v]);
+  double sum = 0.0;
+  for (unsigned int v = 0; v < vocab; ++v)
+    sum += std::exp(static_cast<double>(logits[v]) - mx);
+  return std::log(sum) + mx - static_cast<double>(logits[target]);
+}
+} // namespace
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
@@ -401,65 +429,119 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
+CausalLM::KVCacheLayout CausalLM::planKVCache() {
+  KVCacheLayout layout;
+  layout.max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+
+  // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
+  // stores a Wcap-row ring, every other layer keeps max_seq. Same
+  // getKVCacheRows() hook the placeholder factories use, so the two shapes
+  // line up at bind time (the bind asserts they do).
+  std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
+  for (int i = 0; i < NUM_LAYERS; ++i)
+    layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
+  kv_cache.setLayerCaps(layer_caps);
+
+  // Per-layer width via the getKVCacheWidth() hook: uniform
+  // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
+  // variable-geometry models. One vector path now serves every model, so the
+  // per-model allocateAndBindKVCache overrides are gone. (The scalar
+  // allocate this used before only additionally set the KVCacheManager
+  // num_heads_kv_/head_dim_ members, which have no reader -- getKVWidth() is
+  // uncalled -- so this is behavior-identical.)
+  layout.widths.assign(static_cast<size_t>(NUM_LAYERS), 0u);
+  for (int i = 0; i < NUM_LAYERS; ++i)
+    layout.widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
+
+  // Second hook, same shape as the one above: which layers need storage at
+  // all. A KV-shared layer (gemma4 `num_kv_shared_layers`) has no wk/wv and
+  // no k_norm/v_norm of its own -- it attends over an earlier layer's K/V
+  // plane -- so the private slab it gets otherwise is filled with
+  // byte-identical values every step. Declaring the source makes those
+  // layers aliases of it (same MemoryData, same offset) instead of copies.
+  //
+  // The map comes from getKVSourceLayer(), which resolves through the SAME
+  // function the model's graph builder used to wire the shared attention, so
+  // the plane a layer reads is by construction the plane it was given.
+  //
+  // Declared only when some layer actually shares: a model that inherits the
+  // -1 default for every layer never calls setLayerKVSources at all, so it
+  // keeps the literal pre-aliasing path through KVCacheManager (empty map =>
+  // validate early-returns, both allocation loops are untouched, no witness
+  // line) rather than an all-(-1) map that merely behaves the same.
+  std::vector<int> kv_sources(static_cast<size_t>(NUM_LAYERS), -1);
+  bool any_kv_shared = false;
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    kv_sources[static_cast<size_t>(i)] = getKVSourceLayer(i);
+    any_kv_shared |= (kv_sources[static_cast<size_t>(i)] >= 0);
+  }
+  if (any_kv_shared)
+    kv_cache.setLayerKVSources(std::move(kv_sources));
+  return layout;
+}
+
+void CausalLM::allocateKVCacheStorage(const KVCacheLayout &layout) {
+  // dtype matches mha_core's cache placeholders so external cache storage
+  // is interpreted consistently across platforms.
+#ifdef ENABLE_FP16
+  const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+  kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                    layout.max_timestep, layout.widths, cache_dtype);
+}
+
+void CausalLM::load_weight(const std::string &weight_path) {
+  // NNTR_KV_EARLY: unset/anything else = allocate on a side thread during the
+  // load (default on the OpenCL gpu engine), "sync" = after the load on this
+  // thread, "0" = lazily in the first run() as before. Other engines keep the
+  // lazy path unless NNTR_KV_EARLY is set: the early build was measured on
+  // the gpu engine only. A model whose plane can still grow sizes its
+  // KV from the first prompt, so it keeps the lazy path whatever the env says.
+  // The CUDA engine always takes "sync": its KV zero fill is a kernel on the
+  // stream the weight upload is using, and its context sets environment
+  // variables lazily, which a getenv on another thread must not race.
+  enum class Mode { lazy, sync, overlap };
+  static const Mode mode = []() {
+    const char *e = std::getenv("NNTR_KV_EARLY");
+    if (e == nullptr && causallm_engine() != "gpu")
+      return Mode::lazy;
+    if (e != nullptr && e[0] == '0')
+      return Mode::lazy;
+    if (e != nullptr && std::strcmp(e, "sync") == 0)
+      return Mode::sync;
+    return Mode::overlap;
+  }();
+  const bool early = prepare_run_at_load_ && mode != Mode::lazy &&
+                     !kv_cache.isAllocated() && !prefillPlaneCanGrow();
+
+  const bool overlap = mode == Mode::overlap && causallm_engine() != "cuda";
+  std::future<void> kv_alloc;
+  if (early && overlap) {
+    // The hooks run here, on this thread, before the load starts; the side
+    // thread only allocates and zeroes kv_cache, which nothing in the weight
+    // load reads or writes. The future is joined below, or by its destructor
+    // if the load throws, so the thread never outlives this call.
+    KVCacheLayout layout = planKVCache();
+    kv_alloc = std::async(std::launch::async,
+                          [this, layout]() { allocateKVCacheStorage(layout); });
+  }
+
+  Transformer::load_weight(weight_path);
+
+  if (kv_alloc.valid())
+    kv_alloc.get(); // rethrows an allocation failure here, not in run()
+  if (early) {
+    // Binds the placeholders of the graph that was just loaded (and, in sync
+    // mode, allocates first). run() finds it done and skips both.
+    allocateAndBindKVCache();
+  }
+}
+
 void CausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
-    // dtype matches mha_core's cache placeholders so external cache storage
-    // is interpreted consistently across platforms.
-#ifdef ENABLE_FP16
-    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
-#else
-    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
-#endif
-
-    const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
-
-    // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
-    // stores a Wcap-row ring, every other layer keeps max_seq. Same
-    // getKVCacheRows() hook the placeholder factories use, so the two shapes
-    // line up at bind time (the bind asserts they do).
-    std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
-    for (int i = 0; i < NUM_LAYERS; ++i)
-      layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
-    kv_cache.setLayerCaps(layer_caps);
-
-    // Per-layer width via the getKVCacheWidth() hook: uniform
-    // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
-    // variable-geometry models. One vector path now serves every model, so the
-    // per-model allocateAndBindKVCache overrides are gone. (The scalar
-    // allocate this used before only additionally set the KVCacheManager
-    // num_heads_kv_/head_dim_ members, which have no reader -- getKVWidth() is
-    // uncalled -- so this is behavior-identical.)
-    std::vector<unsigned int> kv_widths(static_cast<size_t>(NUM_LAYERS), 0u);
-    for (int i = 0; i < NUM_LAYERS; ++i)
-      kv_widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
-
-    // Second hook, same shape as the one above: which layers need storage at
-    // all. A KV-shared layer (gemma4 `num_kv_shared_layers`) has no wk/wv and
-    // no k_norm/v_norm of its own -- it attends over an earlier layer's K/V
-    // plane -- so the private slab it gets otherwise is filled with
-    // byte-identical values every step. Declaring the source makes those
-    // layers aliases of it (same MemoryData, same offset) instead of copies.
-    //
-    // The map comes from getKVSourceLayer(), which resolves through the SAME
-    // function the model's graph builder used to wire the shared attention, so
-    // the plane a layer reads is by construction the plane it was given.
-    //
-    // Declared only when some layer actually shares: a model that inherits the
-    // -1 default for every layer never calls setLayerKVSources at all, so it
-    // keeps the literal pre-aliasing path through KVCacheManager (empty map =>
-    // validate early-returns, both allocation loops are untouched, no witness
-    // line) rather than an all-(-1) map that merely behaves the same.
-    std::vector<int> kv_sources(static_cast<size_t>(NUM_LAYERS), -1);
-    bool any_kv_shared = false;
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      kv_sources[static_cast<size_t>(i)] = getKVSourceLayer(i);
-      any_kv_shared |= (kv_sources[static_cast<size_t>(i)] >= 0);
-    }
-    if (any_kv_shared)
-      kv_cache.setLayerKVSources(std::move(kv_sources));
-
-    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
-                      max_timestep, kv_widths, cache_dtype);
+    allocateKVCacheStorage(planKVCache());
     kv_cache_bound = false;
   }
 
@@ -549,6 +631,11 @@ void CausalLM::releaseLogitsBuf(float *buf) {
 std::vector<float *> CausalLM::incrementalInference(
   unsigned int batch_size, const std::vector<float *> &input,
   unsigned int init_seq_len, unsigned int from, unsigned int to) {
+#ifdef ENABLE_HEXKL
+  // Shared CPU layers may also appear in an HTP model. Only this model's
+  // inference may enter its resident DSP graph, even with other handles live.
+  nntrainer::HtpDecodeScope htp_scope(htp_execution_profile_);
+#endif
   // Same contract as NeuralNetwork::incremental_inference(float* ...), except
   // inputs whose raw pointer belongs to a KVCacheManager cache tensor are fed
   // as the REAL tensor (sharing its MemoryData, so isSVM() set by the SVM
@@ -558,15 +645,23 @@ std::vector<float *> CausalLM::incrementalInference(
   // would clobber the SVM flag and drop attention to the host path.
   auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
 
-  std::unordered_map<const void *, nntrainer::Tensor *> cache_by_ptr;
-  if (kv_cache.isAllocated()) {
+  // Named KV inputs below normally resolve without a pointer lookup. A
+  // linear fallback avoids rebuilding a hash table for every decode token;
+  // key then value in layer order preserves the old map's first-match rule
+  // when two cache views share the same address.
+  auto cache_by_ptr = [&](const void *ptr) -> nntrainer::Tensor * {
+    if (!kv_cache.isAllocated())
+      return nullptr;
     for (unsigned int i = 0; i < kv_cache.getNumLayers(); ++i) {
       auto &kc = kv_cache.getKeyCache(i);
+      if (ptr == reinterpret_cast<const void *>(kc.getData()))
+        return &kc;
       auto &vc = kv_cache.getValueCache(i);
-      cache_by_ptr.emplace(reinterpret_cast<const void *>(kc.getData()), &kc);
-      cache_by_ptr.emplace(reinterpret_cast<const void *>(vc.getData()), &vc);
+      if (ptr == reinterpret_cast<const void *>(vc.getData()))
+        return &vc;
     }
-  }
+    return nullptr;
+  };
 
   auto in_dim = nn->getInputDimension();
   NNTR_THROW_IF(input.size() < in_dim.size(), std::invalid_argument)
@@ -611,10 +706,9 @@ std::vector<float *> CausalLM::incrementalInference(
         continue;
       }
     }
-    auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
-    if (it != cache_by_ptr.end()) {
+    if (auto *cached = cache_by_ptr(input[idx])) {
       // shallow copy: shares the cache's MemoryData (isSVM intact)
-      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*it->second));
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*cached));
     } else {
       in_dim[idx].batch(batch_size);
       input_tensors.emplace_back(MAKE_SHARED_TENSOR(nntrainer::Tensor::Map(
@@ -654,6 +748,19 @@ std::vector<float *> CausalLM::incrementalInference(
     // path); the pool recycles the row instead. Contents are as uninitialized
     // as a fresh new[] -- everything below either fills it or defers it.
     float *last_out_buf_data = acquireLogitsBuf(buf_size);
+
+    // The completed HTP greedy row returned its token ID, so its CPU logits
+    // are stale and generate() consumes only the ID. Preserve the pooled
+    // buffer's ownership without copying a vocabulary-sized unused row.
+    // Sampling, penalties and logit consumers request logits from the DSP;
+    // the non-consuming completed-row check is false for all of those paths.
+    if (htp_execution_profile_ && batch_size == 1u && to - from == 1u &&
+        output_tensors.size() == 1u && buf_size == NUM_VOCAB &&
+        out->getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        htpDecodeHasTokenId(from)) {
+      output.push_back(last_out_buf_data);
+      continue;
+    }
 
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -946,12 +1053,117 @@ std::string CausalLM::kvCacheModelTag() const {
   return std::string(buf);
 }
 
+void CausalLM::prepareKvAdopt(unsigned int end) {
+  adopt_window_end_ = 0;
+  // [C] staging: the decode caches hold every row from 0 (the int8 prefill
+  // refills its earlier rows from them); the sliding layers' attention still
+  // reads its window only (the record's top_k)
+  const bool staging = kv_cache.isStaging();
+  if (staging)
+    htpDecodeKvWindow(end + NUM_TO_GENERATE, 0);
+  // the windowed layers' decode cache, as the generation sets it below
+  for (unsigned int l = 0; !staging && l < kv_cache.getNumLayers(); ++l)
+    if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+      const unsigned int base = kv_cache.baseAfterCompact(l, end);
+      htpDecodeKvWindow(end - base + NUM_TO_GENERATE, base);
+      break;
+    }
+  const bool ready = htpDecodeKvPrepare();
+  // ponytail: the n-th HTP attention layer is attention ordinal n, as in
+  // compactKVCache
+  unsigned int n = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+      if (l.getType() != causallm::HtpMHACoreLayer::type ||
+          n >= kv_cache.getNumLayers())
+        return;
+      const unsigned int idx = n++;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      auto *mha =
+        node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+             : nullptr;
+      if (mha)
+        mha->setHtpPrefillSeed(ready ? static_cast<int>(idx) : -1,
+                               staging ? 0u
+                                       : kv_cache.baseAfterCompact(idx, end));
+    };
+  model->forEachLayer(fn, nullptr);
+  if (ready)
+    adopt_window_end_ = end;
+}
+
+void CausalLM::compactKVCache(unsigned int pos, bool force) {
+  // [C] NNTR_HTP_KV_ADOPT: a layer that freed its rows for its DSP int8
+  // copy has its base moved and no row touched
+  if (htpKvAdopt() && kv_cache.isAllocated()) {
+    unsigned int a = 0;
+    std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                       void *)>
+      mark = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+        if (l.getType() != causallm::HtpMHACoreLayer::type ||
+            a >= kv_cache.getNumLayers())
+          return;
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+        auto *mha =
+          node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+               : nullptr;
+        kv_cache.setLayerDetached(a++, mha && mha->kvDetached());
+      };
+    model->forEachLayer(mark, nullptr);
+  }
+  if (!kv_cache.compact(pos) && !force)
+    return;
+  // ponytail: the n-th HTP attention layer in graph order is attention
+  // layer n (the fused model builds them in that order); a model that shares
+  // or reorders them needs the layer's own index instead.
+  unsigned int n = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+      if (l.getType() != causallm::HtpMHACoreLayer::type ||
+          n >= kv_cache.getNumLayers())
+        return;
+      const unsigned int idx = n++;
+      l.setProperty({"cache_base=" + std::to_string(kv_cache.getBase(idx))});
+      // [#4428 window] the rows the compactions dropped so far: their |max|
+      // reaches the decode seed's int8 scales through the layer
+      if (kv_cache.droppedAmaxK(idx).empty())
+        return;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      auto *mha =
+        node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
+             : nullptr;
+      NNTR_THROW_IF(mha == nullptr, std::runtime_error)
+        << "compactKVCache: attention layer " << idx
+        << " is not an HtpMHACoreLayer";
+      mha->foldDroppedAmax(kv_cache.droppedAmaxK(idx),
+                           kv_cache.droppedAmaxV(idx));
+    };
+  model->forEachLayer(fn, nullptr);
+}
+
 void CausalLM::save_kvcache(std::string path, int to_) {
   if (!kv_cache.isAllocated()) {
     throw std::runtime_error(
       "save_kvcache called before allocateAndBindKVCache()");
   }
-  kv_cache.save(path, static_cast<unsigned int>(to_), kvCacheModelTag());
+  if (to_ < 0)
+    throw std::out_of_range("save_kvcache: position must not be negative");
+  const auto pos = static_cast<unsigned int>(to_);
+  // [C] staging: the rows live in the accelerator's int8 decode caches
+  NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
+    << "save_kvcache: the KV cache stages one step's rows (int8-only KV, "
+       "the rows are on the accelerator); a model configured with "
+       "system_prompt.kvcache keeps a CPU cache to save";
+  kv_cache.validateSaveRange(pos);
+  // [#4428 window] a windowed layer's rows before its window are not in
+  // the dump: their |max| is folded first and goes with the calibration
+  compactKVCache(pos);
+  kv_cache.save(path, pos, kvCacheModelTag());
+  // the int8 attention's scales of this prefill, for the run that loads it
+  std::ofstream q2(path + ".q2", std::ios::binary);
+  causallm::HtpMHACoreLayer::saveQ2Calibration(q2);
+  if (!q2)
+    throw std::runtime_error("save_kvcache: cannot write " + path + ".q2");
 }
 
 /** Retire a captured decode graph. A capture describes the host decisions taken
@@ -994,11 +1206,21 @@ void CausalLM::load_kvcache(std::string path, int to_) {
   if (!kv_cache.isAllocated()) {
     allocateAndBindKVCache();
   }
+  NNTR_THROW_IF(kv_cache.isStaging(), std::runtime_error)
+    << "load_kvcache: the KV cache stages one step's rows (int8-only KV, "
+       "the rows are on the accelerator); a model configured with "
+       "system_prompt.kvcache keeps a CPU cache to load into";
   const unsigned int loaded =
     kv_cache.load(path, static_cast<unsigned int>(to_), kvCacheModelTag());
+  // absent (a dump of an older build, a CPU run): the layers calibrate on
+  // their first step as before
+  if (std::ifstream q2(path + ".q2", std::ios::binary); q2)
+    causallm::HtpMHACoreLayer::loadQ2Calibration(q2);
   // mha_core layers each track their own cache_index; sync them all to the
   // newly-loaded position so the next forwarding() writes at the right slot.
   setKVCachePosition(loaded);
+  // a windowed layer's rows start at its base now
+  compactKVCache(loaded, true);
   retire_decode_capture();
 }
 
@@ -1018,6 +1240,12 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              float repetition_penalty,
                                              unsigned int *input_ids,
                                              unsigned int NUM_INPUT_IDS) {
+  if (htp_execution_profile_ && !do_sample && BATCH_SIZE == 1 &&
+      repetition_penalty == 1 && logits_processor == nullptr) {
+    unsigned int id = 0;
+    if (htpDecodeTokenId(&id))
+      return {id};
+  }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
@@ -1329,6 +1557,35 @@ void CausalLM::registerCustomLayers() {
 #endif
 }
 
+#ifdef ENABLE_HEXKL
+void CausalLM::beginIndependentHtpPrompt(
+  bool repeated,
+  const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
+    &reset_layer) {
+  if (repeated) {
+    nntrainer::htp_begin_prompt();
+    model->forEachLayer(
+      [&](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
+        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+        if (!node)
+          return;
+        if (auto *mha = dynamic_cast<HtpMHACoreLayer *>(node->getLayer()))
+          mha->beginHtpPrompt();
+        else if (node->getLayer() && reset_layer)
+          reset_layer(*node->getLayer(), rc);
+      },
+      nullptr);
+    // Decode may have dropped these host slabs after seeding the DSP.
+    kv_cache = KVCacheManager{};
+    kv_cache_bound = false;
+  }
+  if (USE_KVCACHE)
+    setPrecomputedKVCache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+  else
+    setSessionTokenPosition(0);
+}
+#endif
+
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
@@ -1383,6 +1640,72 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   unsigned int generation_cnt = 0;
   int64_t total_generation_duration = 0;
 
+  // Record generated IDs without requesting logits or forcing a continuation.
+  // This lets performance runs verify the normal DSP token-id path as well.
+  const char *generated_ids_path = std::getenv("NNTR_GENERATED_IDS");
+  std::vector<unsigned int> generated_ids;
+
+  // NNTR_PPL_DECODE=<ids file> (#134, ported from a21cae045 / fead3371b):
+  // the decode-side teacher-forced NLL of the logits each greedy pick is
+  // taken from. A missing file makes a normal greedy run that scores its
+  // own path and writes it there (whitespace-separated ids: the prefill's
+  // pick first when the prefill picks one, then one id per decode step);
+  // an existing file forces that continuation, so variant A writes the
+  // reference and B / C read it without a second knob. Off by default,
+  // never set in a tok/s run: it asks the DSP for the logits every step.
+  // ponytail: ids file only, batch 1, greedy, one run() per process, and
+  // the file does not record skip_prefill (score A and B with the same
+  // pack); upgrade = a header line naming the mode.
+  const char *ppl_dec_env = std::getenv("NNTR_PPL_DECODE");
+  bool ppl_dec = false, ppl_forced = false;
+  std::vector<unsigned int> ppl_cont; // forced: the targets; self: the path
+  unsigned int ppl_base = 0; // ppl_cont index of decode step 0's target
+  double ppl_dec_nll = 0.0;
+  unsigned int ppl_dec_n = 0, ppl_dec_top1 = 0;
+  if (ppl_dec_env != nullptr) {
+    if (BATCH_SIZE != 1 || logits_processor != nullptr || do_sample) {
+      std::cerr << "[PPL] decode unsupported (batch > 1, a logits processor "
+                   "or do_sample); running normally"
+                << std::endl;
+    } else {
+      ppl_dec = true;
+      std::ifstream f(ppl_dec_env);
+      if (f) {
+        ppl_forced = true;
+        long long id;
+        while (f >> id) {
+          if (id < 0 || id >= static_cast<long long>(NUM_VOCAB))
+            throw std::invalid_argument(
+              std::string("NNTR_PPL_DECODE: id out of vocab range in ") +
+              ppl_dec_env);
+          ppl_cont.push_back(static_cast<unsigned int>(id));
+        }
+        if (!f.eof() || ppl_cont.empty())
+          throw std::invalid_argument(
+            std::string("NNTR_PPL_DECODE: not a non-empty list of ids: ") +
+            ppl_dec_env);
+      }
+    }
+  }
+  // [#194] NNTR_PPL_DECODE_ALTS=<id,...> (at most 8, with NNTR_PPL_DECODE):
+  // each step line also prints those ids' logits.
+  std::vector<unsigned int> ppl_alts;
+  if (const char *a = std::getenv("NNTR_PPL_DECODE_ALTS")) {
+    std::stringstream ss(a);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      char *end = nullptr;
+      const unsigned long id = std::strtoul(tok.c_str(), &end, 10);
+      if (tok.empty() || *end != '\0' || id >= NUM_VOCAB ||
+          ppl_alts.size() == 8)
+        throw std::invalid_argument(
+          std::string("NNTR_PPL_DECODE_ALTS: want at most 8 comma-separated "
+                      "ids below the vocab size: ") +
+          a);
+      ppl_alts.push_back(static_cast<unsigned int>(id));
+    }
+  }
+
   /**
    * INPUT PREPARATION
    */
@@ -1414,8 +1737,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // (covers both Encode calls below and every later Decode this run).
   ensureTokenizer();
 
+  // the length the SAVE run prefilled: its Encode added the special tokens
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
-    SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
+    SYS_PROMP_LEN = tokenizer->Encode(system_prompt, true).size();
 
   ///@note add_special_tokens=true lets each model's OWN tokenizer decide
   /// whether
@@ -1428,7 +1752,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
   /// processor, add_bos_token=false) are byte-identical to the old behavior, so
   /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
-  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
+  /// A prompt continued from a loaded cache is the middle of a sequence:
+  /// a tokenizer that prepends a BOS (LFM2's <|startoftext|>) must not put
+  /// one there. Byte-identical for a tokenizer that adds none (Gemma4).
+  auto _input = tokenizer->Encode(
+    prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE));
 
   // [prefill-plane] Now that the prompt's real token count is known, give this
   // request the activation plane (== prefill block) it can use, and no more: a
@@ -1481,12 +1809,36 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // so a 29K-token prompt was cut to INIT_SEQ_LEN even though the prefill
   // could have fed it in chunks.
   const bool _prefill_chunking = prefillDriveChunk() > 0;
+  // Rows the cache holds before this prompt: a loaded prefix (USE mode) and
+  // a continued session. They are not the prompt's, but they are the
+  // window's, so the prompt's room is what they leave. A prompt past that
+  // room used to fail inside the first qkv step ("rows 1537..2482 past the
+  // RoPE table's 2304", the AI Studio app with a 1537-row prefix and a 946-
+  // token message) -- the budget below did not know the prefix.
+  const unsigned int prefix_rows =
+    (USE_KVCACHE && !SAVE_KVCACHE ? SYS_PROMP_LEN : 0u) + global_token_len;
+  const unsigned int prompt_room =
+    kv_budget > prefix_rows ? kv_budget - prefix_rows : 0u;
   unsigned int num_allow_str =
-    _prefill_chunking ? kv_budget
-                      : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
+    _prefill_chunking ? prompt_room
+                      : std::min<unsigned int>(INIT_SEQ_LEN, prompt_room);
   unsigned int text_len = _len;
 
   performance_metrics.prompt_truncated_tokens = 0;
+  // A continuation cut at its tail answers a message the user did not
+  // send: refuse it here, before the cache load and the prefill, with the
+  // numbers the caller needs (the app shows this message).
+  NNTR_THROW_IF(prefix_rows > 0 && _len > num_allow_str, std::runtime_error)
+    << "[causallm] the prompt (" << _len
+    << " tokens) does not fit behind the KV cache's " << prefix_rows
+    << " rows: "
+    << (_len > prompt_room
+          ? "prefix + prompt + num_to_generate (" +
+              std::to_string(reserved_for_generation) +
+              ") exceeds max_seq_len " + std::to_string(MAX_SEQ_LEN)
+          : "one prefill block holds init_seq_len " +
+              std::to_string(INIT_SEQ_LEN) + " rows")
+    << " (room for " << num_allow_str << " prompt tokens)";
   if (_len > num_allow_str) {
     text_len = num_allow_str;
     performance_metrics.prompt_truncated_tokens = _len - num_allow_str;
@@ -1570,6 +1922,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // model->resetInputDimension(input_dims);
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
+  FootprintSampler::get().phase(FootprintSampler::kPrefill);
 
   std::vector<float *> output;
 
@@ -1589,7 +1942,21 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
+    // a prompt past the activation plane goes in plane-height chunks, a
+    // windowed layer's window moved to the front before each
+    const unsigned int save_chunk = prefillDriveChunk();
+    for (unsigned int o = 0, step = 0; o < input_len; o += step) {
+      step = save_chunk ? std::min(save_chunk, input_len - o) : input_len - o;
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        for (unsigned int j = 0; j < step; ++j)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+            static_cast<float>(init_input[o + j]);
+      compactKVCache(o);
+      for (auto &so : output)
+        releaseLogitsBuf(so);
+      beforePrefillBlock(o, o + step);
+      output = incrementalInference(BATCH_SIZE, input, step, o, o + step);
+    }
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -1608,7 +1975,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   if (USE_KVCACHE) {
+    const auto t0 = std::chrono::steady_clock::now();
     load_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+    std::cerr << "[TIMING] kv_load_ms="
+              << std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count()
+              << " rows=" << SYS_PROMP_LEN << std::endl;
   } else {
     SYS_PROMP_LEN = 0;
   }
@@ -1851,6 +2224,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       SpanHint(unsigned int s) { setPrefillSpanHint(s); }
       ~SpanHint() { setPrefillSpanHint(0); }
     } _span_hint(from_pos + n_tok);
+    // [C] NNTR_HTP_KV_ADOPT: where the prompt ends, so each HTP attention
+    // layer knows its last call there; not where another layer reads its
+    // rows (KV sharing) or a ring keeps them modulo its capacity
+    struct EndHint {
+      EndHint(unsigned int e) { htpPrefillEnd() = e; }
+      ~EndHint() { htpPrefillEnd() = 0; }
+    } _end_hint(htpKvAdopt() && !kv_cache.hasKVAliasing() &&
+                    !kv_cache.hasRingLayer()
+                  ? from_pos + n_tok
+                  : 0u);
+    adopt_window_end_ = 0;
+    if (htpPrefillEnd() != 0 && kv_cache.isAllocated())
+      prepareKvAdopt(htpPrefillEnd());
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
     if (!resume_block_on && from_pos > 0 && n_tok > 1) {
       std::vector<float *> out;
@@ -1871,9 +2257,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // Single block (default) when chunking is off or the prompt fits one chunk.
     const bool one_block_on_grid =
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
-    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid))
+    // NNTR_MOE_WARM: the last block starts the warm-up's reads at its last
+    // MoE layer (htpPrefillLastBlock)
+    struct LastBlock {
+      LastBlock(bool on) { htpPrefillLastBlock() = on; }
+      ~LastBlock() { htpPrefillLastBlock() = false; }
+    };
+    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
+      // [C] staging: a later prompt's block starts at the staged block's
+      // front too (its rows past the generated ones would not fit)
+      if (kv_cache.isStaging())
+        compactKVCache(from_pos);
+      beforePrefillBlock(from_pos, from_pos + n_tok);
+      LastBlock last(true);
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
+    }
     // Chunked forward prefill.
     std::vector<float *> out;
     unsigned int clen = 0;
@@ -1887,6 +2286,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
             static_cast<float>(init_input[o + j]);
       const unsigned int cf = from_pos + o;
+      // a windowed (sliding) layer keeps its window in front of the chunk
+      compactKVCache(cf);
+      beforePrefillBlock(cf, cf + clen);
+      LastBlock last(o + clen == n_tok);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
       if (o + clen < n_tok)
         for (auto &oo : so)
@@ -1924,8 +2327,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
+    if (ppl_forced) { // the prefill's pick is the continuation's first id
+      if (id_list[0] != ppl_cont[0])
+        std::cerr << "[PPL] decode warning: prefill top1 != continuation[0]"
+                  << std::endl;
+      id_list[0] = ppl_cont[0];
+    } else if (ppl_dec) {
+      ppl_cont.push_back(id_list[0]);
+    }
+    ppl_base = 1;
 
-    if (init_len < INIT_SEQ_LEN) {
+    // The bound is ids_history's row stride (MAX_SEQ_LEN), not the prefill
+    // block height: a chunked prefill runs prompts longer than INIT_SEQ_LEN.
+    if (init_len < MAX_SEQ_LEN) {
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
       /** [perf-split] Without skip_prefill the FIRST token the caller sees
        *  is the one prefill's own logits produced, before the boundary below
@@ -1953,6 +2367,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   for (auto &out : output) {
     releaseLogitsBuf(out);
   }
+  if (generated_ids_path)
+    generated_ids.insert(generated_ids.end(), id_list.begin(), id_list.end());
+
+#ifdef ENABLE_HEXKL
+  // KV placeholders and persistent tensors keep their pages for continuation.
+  if (htp_execution_profile_ &&
+      nntrainer::htpRuntimeConfig().htp.release_prefill_scratch) {
+    if (auto *network = dynamic_cast<nntrainer::NeuralNetwork *>(model.get())) {
+      const size_t bytes = network->releaseInferenceScratch();
+      std::cerr << "[HTP] CPU prefill scratch discarded: " << (bytes >> 20)
+                << " MiB of virtual pages" << std::endl;
+    }
+  }
+#endif
 
   /** [perf-split] MEASUREMENT PATH ONLY. The host is here as soon as the last
    *  prefill chunk has been SUBMITTED; on both async backends the device is
@@ -1997,7 +2425,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
   }
 
+  // HTP inference has completed; release prompt-sized staging before the
+  // first decode step allocates its graph and expert cache.
+  std::unordered_set<nntrainer::ComputeOps *> prefill_backends;
+  model->forEachLayer(
+    [&prefill_backends](ml::train::Layer &, nntrainer::RunLayerContext &context,
+                        void *) {
+      if (auto *ops = context.getComputeOps())
+        prefill_backends.insert(ops);
+    },
+    nullptr);
+  for (auto *ops : prefill_backends)
+    ops->release_prefill_scratch();
   auto finish_prefill = std::chrono::high_resolution_clock::now();
+  FootprintSampler::get().phase(FootprintSampler::kFirstToken);
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
 
@@ -2054,15 +2495,66 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
       : generation_begin;
 
+  // The windowed layers' caches from here on: the window, then one row a
+  // generated token. The accelerator's decode caches of those layers are
+  // sized and based the same (before its first decode row).
+  // ponytail: one (rows, base) for all windowed layers -- they share one
+  // window and one DSP cache; per-layer values if a model ever mixes them.
+  compactKVCache(input_len + global_token_len);
+  // [C] prepareKvAdopt registered the decode caches with this window already
+  NNTR_THROW_IF(adopt_window_end_ != 0 &&
+                  adopt_window_end_ != input_len + global_token_len,
+                std::runtime_error)
+    << "NNTR_HTP_KV_ADOPT: the decode caches were registered for a prompt "
+       "ending at "
+    << adopt_window_end_ << ", the generation starts at "
+    << input_len + global_token_len;
+  if (adopt_window_end_ == 0 && kv_cache.isStaging())
+    htpDecodeKvWindow(input_len + global_token_len + NUM_TO_GENERATE, 0);
+  for (unsigned int l = 0; adopt_window_end_ == 0 && !kv_cache.isStaging() &&
+                           l < kv_cache.getNumLayers();
+       ++l)
+    if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+      const unsigned int base = kv_cache.getBase(l);
+      htpDecodeKvWindow(input_len + global_token_len - base + NUM_TO_GENERATE,
+                        base);
+      break;
+    }
+
+  struct HtpDecodeReset {
+    bool active;
+    ~HtpDecodeReset() {
+      if (active) {
+        htpDecodeWantLogits(true);
+        htpDecodeBan(nullptr, 0);
+      }
+    }
+  } htp_reset{htp_execution_profile_};
+  if (htp_execution_profile_) {
+    htpDecodeWantLogits(do_sample || BATCH_SIZE != 1 ||
+                        logits_processor != nullptr ||
+                        REPETITION_PENALTY != 1.0f || ppl_dec);
+    htpDecodeBan(BAD_WORD_IDS.data(), NUM_BADWORDS);
+  }
   for (unsigned int token_generation_idx = generation_begin;
        token_generation_idx < generation_end &&
        !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 
+    if (ppl_forced && ppl_base + generation_cnt >= ppl_cont.size())
+      break; // the continuation is used up
+
+    // the first token's split (one line after it): what first_token_ms
+    // holds besides the HTP lines' graph init, pool sync and token
+    using t1clk = std::chrono::high_resolution_clock;
+    const bool t1_split = generation_cnt == 0;
+    const auto t1_loop = t1clk::now();
     allocateAndBindKVCache();
+    const auto t1_bind = t1clk::now();
     auto output_interval = incrementalInference(
       BATCH_SIZE, input, input_len, token_generation_idx - 1 + global_token_len,
       token_generation_idx + global_token_len);
+    const auto t1_fwd = t1clk::now();
     // Repetition-penalty window. ids_history is one MAX_SEQ_LEN-strided row of
     // token ids per batch entry -- the same layout generate() walks with
     // `input_ids += MAX_SEQ_LEN` -- and registerOutputs() below has already
@@ -2087,7 +2579,46 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                  ? ids_history + (token_generation_idx - rep_window_len)
                  : nullptr,
                rep_window_len));
+    if (ppl_dec) {
+      // Scored after generate(), on the logits the pick is taken from (the
+      // bad-word ids are -inf there), so the self and the forced run score
+      // the same array.
+      const unsigned int top1 = ids_list[0];
+      const unsigned int target =
+        ppl_forced ? ppl_cont[ppl_base + generation_cnt] : top1;
+      const double nll = nllOf(output_interval[0], NUM_VOCAB, target);
+      ppl_dec_nll += nll;
+      ++ppl_dec_n;
+      ppl_dec_top1 += top1 == target;
+      std::string alts;
+      for (size_t i = 0; i < ppl_alts.size(); ++i) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%u:%.9g",
+                      i ? "," : " alts=", ppl_alts[i],
+                      output_interval[0][ppl_alts[i]]);
+        alts += buf;
+      }
+      // margin: the pick's logit over the runner-up's (a near tie flips on
+      // a small numeric change); gap: the pick's over the target's (0 when
+      // they agree). The accuracy gate reads both at the steps two paths
+      // disagree (ppl_eval.py).
+      const float *lg = output_interval[0];
+      float second = -std::numeric_limits<float>::infinity();
+      for (unsigned int i = 0; i < NUM_VOCAB; ++i)
+        if (i != top1 && lg[i] > second)
+          second = lg[i];
+      std::fprintf(stderr,
+                   "[PPL] decode step=%u target=%u nll=%.17g top1=%u "
+                   "margin=%.6g gap=%.6g%s\n",
+                   ppl_dec_n, target, nll, top1, lg[top1] - second,
+                   lg[top1] - lg[target], alts.c_str());
+      if (ppl_forced)
+        ids_list[0] = target;
+      else
+        ppl_cont.push_back(target);
+    }
 
+    const auto t1_gen = t1clk::now();
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
     // always in the auto-regressive generation phase here.
@@ -2095,6 +2626,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
         static_cast<float>(ids_list[b]);
     }
+    if (generated_ids_path)
+      generated_ids.insert(generated_ids.end(), ids_list.begin(),
+                           ids_list.end());
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
@@ -2103,9 +2637,24 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       decode_step_ms.push_back(
         std::chrono::duration<double, std::milli>(step_end - decode_step_mark)
           .count());
+      if (t1_split) {
+        auto ms = [](t1clk::time_point a, t1clk::time_point b) {
+          return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr,
+                     "[perf] first_token split: setup_ms=%.1f bind_ms=%.1f "
+                     "forward_ms=%.1f generate_ms=%.1f output_ms=%.1f\n",
+                     ms(decode_step_mark, t1_loop), ms(t1_loop, t1_bind),
+                     ms(t1_bind, t1_fwd), ms(t1_fwd, t1_gen),
+                     ms(t1_gen, step_end));
+      }
       decode_step_mark = step_end;
       if (perf_split_first_out.time_since_epoch().count() == 0)
         perf_split_first_out = step_end;
+      // the first step's end, whether or not a streamer already stamped
+      // perf_split_first_out (it does, at the token's hand-out)
+      if (t1_split)
+        FootprintSampler::get().phase(FootprintSampler::kDecode);
     }
 #if defined(ENABLE_OPENCL)
     nntrainer::opencl::clLaunchStatTick();
@@ -2117,8 +2666,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       releaseLogitsBuf(out);
     }
 
-    // check FINISH
-    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+    // check FINISH (a forced continuation runs to its end)
+    for (unsigned int j = 0; j < BATCH_SIZE && !ppl_forced; ++j) {
       if (!eos_list[j] && (std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
                                      ids_list[j]) != EOS_TOKEN_ID.end())) {
         eos_list[j] = true;
@@ -2146,8 +2695,36 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // the loop exited early (EOS found) or ran to the maximum token limit.
   free(input_sample);
 
+  if (ppl_dec && ppl_dec_n == 0) {
+    std::cerr << "[PPL] decode no steps scored (num_to_generate 0, a "
+                 "one-id file, or a stop request)"
+              << std::endl;
+  } else if (ppl_dec) {
+    const double x = ppl_dec_nll / ppl_dec_n;
+    std::fprintf(stderr,
+                 "[PPL] decode tokens=%u nll/token=%.6g ppl=%.6g top1=%u/%u "
+                 "source=%s nll_sum=%.17g\n",
+                 ppl_dec_n, x, std::exp(x), ppl_dec_top1, ppl_dec_n,
+                 ppl_forced ? "file" : "self", ppl_dec_nll);
+    if (!ppl_forced) {
+      std::ofstream f(ppl_dec_env);
+      for (unsigned int id : ppl_cont)
+        f << id << '\n';
+      if (!f)
+        std::cerr << "[PPL] decode cannot write " << ppl_dec_env << std::endl;
+    }
+  }
+
   global_token_len += (generation_cnt + init_len);
 
+  if (generated_ids_path) {
+    std::ofstream ids_file(generated_ids_path);
+    for (unsigned int id : generated_ids)
+      ids_file << id << '\n';
+    if (!ids_file)
+      throw std::runtime_error(std::string("Cannot write generated IDs: ") +
+                               generated_ids_path);
+  }
   auto finish_generation = std::chrono::high_resolution_clock::now();
   auto generation_duration =
     std::chrono::duration_cast<std::chrono::milliseconds>(finish_generation -
@@ -2180,6 +2757,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::cout << "peak memory: " << peak_memory << " KB\n";
     std::cout << "  (honest RssAnon+accel: " << honest_kb
               << " KB, ru_maxrss: " << maxrss_kb << " KB)\n";
+    {
+      // which phase sets the peak (each phase's own, sampled per tick)
+      FootprintSampler &fs = FootprintSampler::get();
+      std::cout << "  (peak by phase KB: load "
+                << fs.phasePeakKb(FootprintSampler::kLoad) << ", prefill "
+                << fs.phasePeakKb(FootprintSampler::kPrefill)
+                << ", first_token "
+                << fs.phasePeakKb(FootprintSampler::kFirstToken) << ", decode "
+                << fs.phasePeakKb(FootprintSampler::kDecode) << ")\n";
+    }
     std::cout << "==========================================================\n";
   }
 
@@ -2230,6 +2817,23 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               << " gen_tok=" << generation_cnt
               << " e2e_ms=" << total_duration.count() << "\n";
     std::cout.flush();
+  }
+
+  if (htp_execution_profile_) {
+    const auto &path = nntrainer::htpRuntimeConfig().htp.token_trace;
+    if (!path.empty()) {
+      json trace;
+      trace["input_ids"] = init_input;
+      const bool prefill_emitted = !SKIP_PREFILL && init_len < MAX_SEQ_LEN;
+      const size_t begin = input_len + (prefill_emitted ? 0u : 1u);
+      const size_t count = generation_cnt + (prefill_emitted ? 1u : 0u);
+      trace["output_ids"] = std::vector<unsigned int>(
+        ids_history + begin, ids_history + begin + count);
+      std::ofstream file(path);
+      if (!file)
+        throw std::runtime_error("Cannot open htp.token_trace");
+      file << trace.dump(2) << '\n';
+    }
   }
 
   has_run_ = true;

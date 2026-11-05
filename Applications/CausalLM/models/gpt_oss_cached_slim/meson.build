@@ -6,9 +6,10 @@ gpt_oss_cached_slim_inc = include_directories('.')
 
 causallm_gptoss_moe_layer_cached_src_abs = [meson.current_source_dir() / 'gpt_oss_moe_layer_cached.cpp']
 
-causallm_cached_slim_gptoss_moe_layer = shared_library(
+causallm_cached_slim_gptoss_moe_layer = build_target(
     'cached_slim_gptoss_moe_layer',
     causallm_gptoss_moe_layer_cached_src_abs,
+    target_type: causallm_layer_type,
     include_directories: [causallm_layer_inc, gpt_oss_cached_slim_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

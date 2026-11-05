@@ -10,7 +10,7 @@ import java.io.IOException
 import kotlin.math.ceil
 import kotlin.math.min
 import androidx.core.graphics.createBitmap
-import com.example.quickdotai.PillowBilinearResizer
+import com.example.quickdotai.PillowBicubicResizer
 
 
 /**
@@ -27,13 +27,20 @@ import com.example.quickdotai.PillowBilinearResizer
 class LlavaNextImageProcessor(
     private val context: Context,
     private val cropSize: Int = 512,
+    // Keep this grid in sync with the encoder's resolution selection.
     private val imageGridPinpoints: List<Pair<Int, Int>> = listOf(
-        Pair(512,1024),Pair(512,1536),Pair(512,2048),Pair(512,2560),Pair(512,3072),Pair(512,3584),Pair(512,4096),Pair(512,4608),Pair(512,5120),Pair(512,5632),Pair(512,6144),Pair(1024,512),Pair(1024,1024),Pair(1024,1536),Pair(1024,2048),Pair(1024,2560),Pair(1024,3072),Pair(1536,512),Pair(1536,1024),Pair(1536,1536),Pair(1536,2048),Pair(2048,512),Pair(2048,1024),Pair(2048,1536),Pair(2560,512),Pair(2560,1024),Pair(3072,512),Pair(3072,1024),Pair(3584,512),Pair(4096,512),Pair(4608,512),Pair(5120,512),Pair(5632,512),Pair(6144,512)
+        Pair(512,1024),Pair(512,1536),Pair(512,2048),Pair(512,2560),Pair(512,3072),Pair(512,3584),Pair(512,4096),
+        Pair(1024,512),Pair(1024,1024),Pair(1024,1536),Pair(1024,2048),
+        Pair(1536,512),Pair(1536,1024),
+        Pair(2048,512),Pair(2048,1024),
+        Pair(2560,512),Pair(3072,512),Pair(3584,512),Pair(4096,512)
     ),
     private val imageMean: FloatArray = floatArrayOf(0.5f, 0.5f, 0.5f),
     private val imageStd: FloatArray = floatArrayOf(0.5f, 0.5f, 0.5f),
     private val rescaleFactor: Double = 1.0 / 255.0,
-    private val patchMergeType: String = "nopad"
+    private val patchMergeType: String = "nopad",
+    // False = interleaved HWC (RGBRGB...), true = planar CHW (RRR...GGG...BBB).
+    private val planarChw: Boolean = false
 ) {
 
     fun resizeImage(inputBitmap: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
@@ -41,8 +48,8 @@ class LlavaNextImageProcessor(
         val height = inputBitmap.height
         val pixels = IntArray(width * height)
         inputBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-//        val resizedPixels = PillowBicubicResizer.resize(pixels, width, height, targetWidth, targetHeight)
-        val resizedPixels = PillowBilinearResizer.resize(pixels, width, height, targetWidth, targetHeight)
+        // Match Pillow's bicubic interpolation, including antialiasing on downscale.
+        val resizedPixels = PillowBicubicResizer.resize(pixels, width, height, targetWidth, targetHeight)
         return Bitmap.createBitmap(resizedPixels, targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
 
 //        return inputBitmap.scale(targetWidth, targetHeight, filter = true)
@@ -112,8 +119,10 @@ class LlavaNextImageProcessor(
      * @return A ModelInput object containing a list of float arrays (patches) and original image size.
      */
     fun preprocess(image: Bitmap): ModelInput {
-        val originalSize = Pair(image.height, image.width)
-        val imagePatches = getImagePatches(image)
+        // Select the grid from the decoded image dimensions.
+        val source = image
+        val originalSize = Pair(source.height, source.width)
+        val imagePatches = getImagePatches(source)
         val perImagePatchSize = cropSize * cropSize * 3
         val floatValues = FloatArray(imagePatches.size * perImagePatchSize)
 
@@ -273,6 +282,18 @@ class LlavaNextImageProcessor(
         val height = image.height
         val pixels = IntArray(width * height)
         image.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        if (planarChw) {
+            // CHW format: RRR...GGG...BBB (one plane per channel)
+            val plane = width * height
+            for (i in 0 until plane) {
+                val pixel = pixels[i]
+                floatValues[offset + i] = ((Color.red(pixel) / 255.0f) - imageMean[0]) / imageStd[0]
+                floatValues[offset + plane + i] = ((Color.green(pixel) / 255.0f) - imageMean[1]) / imageStd[1]
+                floatValues[offset + 2 * plane + i] = ((Color.blue(pixel) / 255.0f) - imageMean[2]) / imageStd[2]
+            }
+            return
+        }
 
         // HWC format: RGB...RGB...RGB...
 

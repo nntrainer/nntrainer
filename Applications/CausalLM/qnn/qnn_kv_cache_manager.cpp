@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <thread_manager.h>
 #include <utility>
 
 namespace causallm {
@@ -163,22 +164,23 @@ void QnnKvCacheManager::syncGenerationToPrefill() {
     return;
   }
 
-#pragma omp parallel for
-  for (int i = 0; i < static_cast<int>(prefill_caches_.size()); i++) {
-    const auto &prefill = prefill_caches_[i];
-    const int generation_idx = prefill.generation_index;
-    const int generation_layer_idx = generation_idx / 4;
-    if (generation_idx < 0 ||
-        generation_idx >= static_cast<int>(generation_caches_.size()) ||
-        generation_layer_idx < 0 ||
-        generation_layer_idx >= static_cast<int>(layer_row_lengths_.size())) {
-      continue;
-    }
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, prefill_caches_.size(), [&](size_t i) {
+      const auto &prefill = prefill_caches_[i];
+      const int generation_idx = prefill.generation_index;
+      const int generation_layer_idx = generation_idx / 4;
+      if (generation_idx < 0 ||
+          generation_idx >= static_cast<int>(generation_caches_.size()) ||
+          generation_layer_idx < 0 ||
+          generation_layer_idx >= static_cast<int>(layer_row_lengths_.size())) {
+        return;
+      }
 
-    copy_kv_cache_window(
-      prefill.data, prefill.row_length, generation_caches_[generation_idx].data,
-      layer_row_lengths_[generation_layer_idx], kv_len_, prefill.is_key);
-  }
+      copy_kv_cache_window(prefill.data, prefill.row_length,
+                           generation_caches_[generation_idx].data,
+                           layer_row_lengths_[generation_layer_idx], kv_len_,
+                           prefill.is_key);
+    });
 }
 
 void QnnKvCacheManager::syncGenerationToPrefillRing() {
@@ -188,75 +190,65 @@ void QnnKvCacheManager::syncGenerationToPrefillRing() {
     return;
   }
 
-#pragma omp parallel for
-  for (int i = 0; i < static_cast<int>(prefill_caches_.size()); i++) {
-    const auto &prefill = prefill_caches_[i];
-    const int generation_idx = prefill.generation_index;
-    const int generation_layer_idx = generation_idx / 4;
-    if (generation_idx < 0 ||
-        generation_idx >= static_cast<int>(generation_caches_.size()) ||
-        generation_layer_idx < 0 ||
-        generation_layer_idx >= static_cast<int>(layer_row_lengths_.size())) {
+  // Cap-overflow check hoisted out of the parallel region (a worker-thread
+  // throw would terminate the process).
+  for (const auto &pc : prefill_caches_) {
+    const int gl = pc.generation_index / 4;
+    if (pc.generation_index < 0 || gl < 0 ||
+        gl >= static_cast<int>(layer_row_lengths_.size()))
       continue;
-    }
-
-    const auto &generation = generation_caches_[generation_idx];
-    const int src_cap = layer_row_lengths_[generation_layer_idx];
-    const int dest_cap = prefill.row_length;
-    const int num_columns = kv_columns_per_layer_.empty()
-                              ? kKvNumColumns
-                              : kv_columns_per_layer_[generation_layer_idx];
-
-    // Slot-preserving copy: position p lives at src slot p % src_cap and must
-    // land at dest slot p % dest_cap so the ring prefill masks address it.
-    //  - src_cap == dest_cap (sliding layers): identical slots; copy the
-    //    occupied span ([0, kv_len) before wrap, the whole ring after).
-    //  - dest_cap != src_cap (full layers, prefill cap < generation cap):
-    //    slots coincide only while kv_len <= min cap (p % cap == p); beyond
-    //    that the two rings alias differently, so there is no slot-preserving
-    //    copy and the caller has to re-prefill instead.
-    int copy_length;
-    if (src_cap == dest_cap) {
-      copy_length = std::min(kv_len_, src_cap);
-    } else {
-      if (kv_len_ > std::min(src_cap, dest_cap)) {
-        throw std::runtime_error(
-          "syncGenerationToPrefillRing: kv_len " + std::to_string(kv_len_) +
-          " exceeds prefill cap " + std::to_string(dest_cap) +
-          " with mismatched generation cap " + std::to_string(src_cap));
-      }
-      copy_length = kv_len_;
-    }
-
-    if (prefill.is_key) {
-      // Head-major [num_columns, cap]: copy the first copy_length slots of
-      // every head_dim column.
-      for (int col = 0; col < num_columns; ++col) {
-        std::memcpy(prefill.data + static_cast<size_t>(col) * dest_cap,
-                    generation.data + static_cast<size_t>(col) * src_cap,
-                    copy_length);
-      }
-    } else {
-      // Seq-major [cap, num_columns]: slots are contiguous rows.
-      std::memcpy(prefill.data, generation.data,
-                  static_cast<size_t>(copy_length) * num_columns);
+    const int sc = layer_row_lengths_[gl];
+    if (sc != pc.row_length && kv_len_ > std::min(sc, pc.row_length)) {
+      throw std::runtime_error(
+        "syncGenerationToPrefillRing: kv_len " + std::to_string(kv_len_) +
+        " exceeds prefill cap " + std::to_string(pc.row_length) +
+        " with mismatched generation cap " + std::to_string(sc));
     }
   }
-}
 
-void QnnKvCacheManager::appendPrefillOutputs(
-  const std::vector<IO_TensorType> &step_outputs, int target_position, int rows,
-  int src_row_length, const std::string &graph_name) {
-  std::vector<uint8_t *> kvs;
-  kvs.reserve(generation_caches_.size());
-  for (const auto &cache : generation_caches_) {
-    kvs.push_back(cache.data);
-  }
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, prefill_caches_.size(), [&](size_t i) {
+      const auto &prefill = prefill_caches_[i];
+      const int generation_idx = prefill.generation_index;
+      const int generation_layer_idx = generation_idx / 4;
+      if (generation_idx < 0 ||
+          generation_idx >= static_cast<int>(generation_caches_.size()) ||
+          generation_layer_idx < 0 ||
+          generation_layer_idx >= static_cast<int>(layer_row_lengths_.size())) {
+        return;
+      }
 
-  append_outputs_to_kv_cache(
-    step_outputs, prefill_output_kv_bindings_, kvs, layer_row_lengths_,
-    target_position, rows, src_row_length, graph_name,
-    kv_columns_per_layer_.empty() ? nullptr : &kv_columns_per_layer_);
+      const auto &generation = generation_caches_[generation_idx];
+      const int src_cap = layer_row_lengths_[generation_layer_idx];
+      const int dest_cap = prefill.row_length;
+      const int num_columns = kv_columns_per_layer_.empty()
+                                ? kKvNumColumns
+                                : kv_columns_per_layer_[generation_layer_idx];
+
+      // Slot-preserving copy: position p lives at src slot p % src_cap and must
+      // land at dest slot p % dest_cap so the ring prefill masks address it.
+      //  - src_cap == dest_cap (sliding layers): identical slots; copy the
+      //    occupied span ([0, kv_len) before wrap, the whole ring after).
+      //  - dest_cap != src_cap (full layers, prefill cap < generation cap):
+      //    slots coincide only while kv_len <= min cap (p % cap == p); beyond
+      //    that the two rings alias differently; the caller must re-prefill.
+      const int copy_length =
+        (src_cap == dest_cap) ? std::min(kv_len_, src_cap) : kv_len_;
+
+      if (prefill.is_key) {
+        // Head-major [num_columns, cap]: copy the first copy_length slots of
+        // every head_dim column.
+        for (int col = 0; col < num_columns; ++col) {
+          std::memcpy(prefill.data + static_cast<size_t>(col) * dest_cap,
+                      generation.data + static_cast<size_t>(col) * src_cap,
+                      copy_length);
+        }
+      } else {
+        // Seq-major [cap, num_columns]: slots are contiguous rows.
+        std::memcpy(prefill.data, generation.data,
+                    static_cast<size_t>(copy_length) * num_columns);
+      }
+    });
 }
 
 void QnnKvCacheManager::appendPrefillOutputsRing(
@@ -277,36 +269,51 @@ void QnnKvCacheManager::appendPrefillOutputsRing(
     }
   }
 
-#pragma omp parallel for
-  for (int binding_idx = 0;
-       binding_idx < static_cast<int>(prefill_output_kv_bindings_.size());
-       binding_idx++) {
-    const auto &binding = prefill_output_kv_bindings_[binding_idx];
-    const int dest_row_length = layer_row_lengths_[binding.layer_index];
-    const int num_columns = kv_columns_per_layer_.empty()
-                              ? kKvNumColumns
-                              : kv_columns_per_layer_[binding.layer_index];
-    auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
-    auto dest = generation_caches_[binding.kv_index].data;
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, prefill_output_kv_bindings_.size(), [&](size_t binding_idx) {
+      const auto &binding = prefill_output_kv_bindings_[binding_idx];
+      const int dest_row_length = layer_row_lengths_[binding.layer_index];
+      const int num_columns = kv_columns_per_layer_.empty()
+                                ? kKvNumColumns
+                                : kv_columns_per_layer_[binding.layer_index];
+      auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
+      auto dest = generation_caches_[binding.kv_index].data;
 
-    for (int r = 0; r < rows; r++) {
-      const int slot =
-        (base_position + r) % dest_row_length; // ring slot (sliding wrap)
-      if (binding.is_key) {
-        // head-major [num_columns=head_dim, dest_row_length=seq]: write one
-        // slot column, gathering prefill-output column r from [head_dim,
-        // src_row_length].
-        for (int c = 0; c < num_columns; c++)
-          dest[static_cast<size_t>(c) * dest_row_length + slot] =
-            output[static_cast<size_t>(c) * src_row_length + r];
-      } else {
-        // seq-major [dest_row_length=seq, num_columns=head_dim]: write one slot
-        // row, gathering prefill-output row r from [src_row_length, head_dim].
-        std::memcpy(dest + static_cast<size_t>(slot) * num_columns,
-                    output + static_cast<size_t>(r) * num_columns, num_columns);
+      for (int r = 0; r < rows; r++) {
+        const int slot =
+          (base_position + r) % dest_row_length; // ring slot (sliding wrap)
+        if (binding.is_key) {
+          // head-major [num_columns=head_dim, dest_row_length=seq]: write one
+          // slot column, gathering prefill-output column r from
+          // [head_dim, src_row_length].
+          for (int c = 0; c < num_columns; c++)
+            dest[static_cast<size_t>(c) * dest_row_length + slot] =
+              output[static_cast<size_t>(c) * src_row_length + r];
+        } else {
+          // seq-major [dest_row_length=seq, num_columns=head_dim]: write one
+          // slot row, gathering prefill-output row r from
+          // [src_row_length, head_dim].
+          std::memcpy(dest + static_cast<size_t>(slot) * num_columns,
+                      output + static_cast<size_t>(r) * num_columns,
+                      num_columns);
+        }
       }
-    }
+    });
+}
+
+void QnnKvCacheManager::appendPrefillOutputs(
+  const std::vector<IO_TensorType> &step_outputs, int target_position, int rows,
+  int src_row_length, const std::string &graph_name) {
+  std::vector<uint8_t *> kvs;
+  kvs.reserve(generation_caches_.size());
+  for (const auto &cache : generation_caches_) {
+    kvs.push_back(cache.data);
   }
+
+  append_outputs_to_kv_cache(
+    step_outputs, prefill_output_kv_bindings_, kvs, layer_row_lengths_,
+    target_position, rows, src_row_length, graph_name,
+    kv_columns_per_layer_.empty() ? nullptr : &kv_columns_per_layer_);
 }
 
 void QnnKvCacheManager::appendGenerationOutputs(
@@ -344,37 +351,37 @@ void QnnKvCacheManager::appendAcceptedGenerationOutputsRing(
   }
 
   const int keep = static_cast<int>(accepted_indices.size());
-#pragma omp parallel for
-  for (int binding_idx = 0;
-       binding_idx < static_cast<int>(generation_output_kv_bindings_.size());
-       binding_idx++) {
-    const auto &binding = generation_output_kv_bindings_[binding_idx];
-    const int dest_row_length = layer_row_lengths_[binding.layer_index];
-    const int num_columns = kv_columns_per_layer_.empty()
-                              ? kKvNumColumns
-                              : kv_columns_per_layer_[binding.layer_index];
-    auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
-    auto dest = generation_caches_[binding.kv_index].data;
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, generation_output_kv_bindings_.size(), [&](size_t binding_idx) {
+      const auto &binding = generation_output_kv_bindings_[binding_idx];
+      const int dest_row_length = layer_row_lengths_[binding.layer_index];
+      const int num_columns = kv_columns_per_layer_.empty()
+                                ? kKvNumColumns
+                                : kv_columns_per_layer_[binding.layer_index];
+      auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
+      auto dest = generation_caches_[binding.kv_index].data;
 
-    for (int k = 0; k < keep; k++) {
-      const int a = accepted_indices[k]; // node column in the verify batch
-      const int slot =
-        (base_position + k) % dest_row_length; // ring slot (sliding wrap)
-      if (binding.is_key) {
-        // head-major [num_columns=head_dim, dest_row_length=seq]: write one
-        // slot column, gathering verify-output column a from [head_dim,
-        // src_row_len].
-        for (int c = 0; c < num_columns; c++)
-          dest[static_cast<size_t>(c) * dest_row_length + slot] =
-            output[static_cast<size_t>(c) * src_row_length + a];
-      } else {
-        // seq-major [dest_row_length=seq, num_columns=head_dim]: write one slot
-        // row, gathering verify-output row a from [src_row_len, head_dim].
-        std::memcpy(dest + static_cast<size_t>(slot) * num_columns,
-                    output + static_cast<size_t>(a) * num_columns, num_columns);
+      for (int k = 0; k < keep; k++) {
+        const int a = accepted_indices[k]; // node column in the verify batch
+        const int slot =
+          (base_position + k) % dest_row_length; // ring slot (sliding wrap)
+        if (binding.is_key) {
+          // head-major [num_columns=head_dim, dest_row_length=seq]: write one
+          // slot column, gathering verify-output column a from [head_dim,
+          // src_row_len].
+          for (int c = 0; c < num_columns; c++)
+            dest[static_cast<size_t>(c) * dest_row_length + slot] =
+              output[static_cast<size_t>(c) * src_row_length + a];
+        } else {
+          // seq-major [dest_row_length=seq, num_columns=head_dim]: write one
+          // slot row, gathering verify-output row a from [src_row_len,
+          // head_dim].
+          std::memcpy(dest + static_cast<size_t>(slot) * num_columns,
+                      output + static_cast<size_t>(a) * num_columns,
+                      num_columns);
+        }
       }
-    }
-  }
+    });
 }
 
 void QnnKvCacheManager::save(const std::string &path,

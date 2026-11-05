@@ -644,7 +644,7 @@ void causallm::Quick_Dot_AI_QNN::quantize_uint16_memcpy(float *src,
                                                         int offset) {
   for (int i = 0; i < count; i++) {
     if (std::isfinite(src[i])) {
-      float quantized_value = src[i] / scale - offset;
+      float quantized_value = std::round(src[i] / scale - offset);
       dest[i] = static_cast<uint16_t>(
         std::max(0.0f, std::min(65535.0f, quantized_value)));
     } else {

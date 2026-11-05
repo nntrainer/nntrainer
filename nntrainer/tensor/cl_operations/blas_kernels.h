@@ -507,11 +507,20 @@ bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
  *            unpadded row count with output_fp16 = the FC's planner
  *            sub-buffer (sized M_valid x N), so the M_pad padding rows
  *            cannot write out of bounds.
+ * @param[in] weight_zp optional int32 [N] per-channel zero point z[n] of a
+ *            per-channel ASYMMETRIC int4 weight w = s*(q - z), q in [0, 15],
+ *            stored in the symmetric layout unchanged (nibble q, scale s).
+ *            When set, the dispatch uses the -DV8C_ASYM build of the same
+ *            kernels (GEMV, dp4a GEMM, XMX GEMM), whose integer epilogue is
+ *            acc - z*row_sum_act - zp_act*(row_sum_w_int4 + (8 - z)*K): the
+ *            exact dequantised GEMM, no extra launch. nullptr (the default)
+ *            runs the unchanged program.
  */
 void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                       cl_mem scale_wgt, cl_mem row_sum_act, cl_mem zp_act,
                       cl_mem row_sum_w_int4, cl_mem output_fp16, unsigned int M,
-                      unsigned int N, unsigned int K, unsigned int M_valid = 0);
+                      unsigned int N, unsigned int K, unsigned int M_valid = 0,
+                      cl_mem weight_zp = nullptr);
 
 /**
  * @brief #46l: v8c GEMM with fused OHWI-reversed V scatter. Same compute as
@@ -748,12 +757,18 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
  *                        an SVM pointer
  * @param logits_host     output host buffer [N], written as fp16 (out_fp16) or
  *                        fp32
+ * @param weight_zp_clmem optional cl_mem: int32 per-channel zero point z[N]
+ *                        of an asymmetric int4 weight (see gemm_int8_v8c_cl):
+ *                        logits[n] = scale[n]*(sum act*(nibble-8)
+ *                        + (8 - z[n])*sum act). nullptr (default) runs the
+ *                        unchanged kernel.
  * @return false when the GPU path is unavailable (no CL context / kernel build
  *         failure) -- the caller falls back.
  */
 bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
                              void *act, bool act_is_clmem, void *logits_host,
-                             bool out_fp16, unsigned int N, unsigned int K);
+                             bool out_fp16, unsigned int N, unsigned int K,
+                             void *weight_zp_clmem = nullptr);
 
 /**
  * @brief Tell the NEXT decode lm_head GEMV whether the full-vocabulary host

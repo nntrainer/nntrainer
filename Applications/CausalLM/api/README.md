@@ -43,6 +43,205 @@ The normal handle-based lifecycle is:
 Refer to declarations and ownership comments in
 [`quick_dot_ai_api.h`](quick_dot_ai_api.h) for the complete API contract.
 
+### Behaviour every run call shares
+
+- **Backend.** `BackendType` takes effect. `CPU` and `GPU` select the
+  nntrainer compute engine for the process on the first load, through
+  `nntrainer::requestEngine()` (`nntrainer/utils/env_compat.h`); the API sets
+  no environment variable. A `CPU` request does not bring up the OpenCL
+  context. A later load asking for the other engine is logged and runs on the
+  first. An `NNTR_ENGINE` exported by the caller wins over the request. `NPU`
+  models leave the engine alone.
+- **Sessions.** Each run starts a fresh session: the KV position of a CausalLM
+  model is rewound first, so N requests on one handle each behave like the
+  first. A JSON request opts out with `"continue_session": true` and sends only
+  the new turn.
+- **Stream filter.** The callback never sees the chat turn markers
+  (`<turn|>`, `<|turn>`, `<|im_end|>`, `<|im_start|>`), and eight consecutive
+  `<pad>` deltas cancel the generation.
+- **Saved KV prefix.** `runModelHandleWithJsonStreaming()` accepts
+  `{"kv_prefix": {"static", "dynamic", "mode"}}` (see the header). The dump is
+  `<model_dir>/kv_prefix/<hash>.kv`; `kv_prefix_path.h` defines the name and is
+  tested against the reference value (`unittest_kv_prefix_path`).
+- **Peak memory.** `PerformanceMetrics::peak_memory_kb` is the request's peak of
+  anonymous RSS plus accelerator memory (`models/footprint_sampler.h`), which
+  includes the load when the first request loads the model; `ru_maxrss` only
+  when `/proc` gives no number.
+
+## Gemma4 MoE on native HTP
+
+The Android `--htp` native build registers `gemma4-26b-a4b-htp`, a
+`NATIVE` model with the `NPU` backend and streaming/messages capabilities. Load it with
+`CAUSAL_LM_QUANTIZATION_W4A32`; its directory is
+`<model_base_path>/gemma4-26b-a4b-htp-w4a32`. This descriptor uses the validated
+Gemma4 26B A4B pack: `gemma4_execution_profile=htp_fused`,
+`gemma4_weight_format=htp_fused_v1`, QS2CX_WH experts, QS4CX FCs and Q4_0
+embedding/head. The metadata does not convert another pack into this format.
+
+Pass an absolute `native_lib_dir` containing the matching v81
+`libnntr_hvx_skel.so`. The API sets the DSP search path and required runtime
+options before opening HTP, and returns a load error if initialization fails.
+Settings and the library directory remain fixed for the process. Conflicting
+environment values and a second active HTP handle are rejected. Destroying or
+unloading the active handle releases its workers, DSP session and weight
+registries so another handle can load the model.
+
+Each streaming run starts an independent prompt and rebuilds its KV caches;
+the loaded weights stay resident. KV snapshot/resume is not supported by this
+preset. Returning nonzero from the streaming callback or calling
+`cancelModelHandle()` stops at a token boundary. Unload waits for any active
+run to return; cancel first when an early stop is needed. The CPU prefill head
+is retained for repeated runs (about 396 MiB for the validated untied pack).
+
+Device checks and build commands are recorded in the
+[QuickDotAI HTP guide](../../../docs/gemma4-htp-quickdotai.md).
+Build the AAR/APK with `build_android.sh --htp --app`. The native SDK environment
+must specify `HEX_ARCH=v81`, `HEXAGON_SDK_ROOT`, `DEFAULT_HEXAGON_TOOLS_ROOT`,
+`HEXKL_ROOT` and the matching `HEXKL_SDK_VER`. Android packaging requires a JDK
+and Android SDK. HTP and QNN are separate variants; do not combine their flags.
+The package verifier checks ARM dependencies and preserves the DSP ELF bytes.
+
+QuickDotAIAPP exposes the `gemma4-26b-a4b` family with `Quick.AI / NPU / W4A32`
+and selects it by default. Set an app-readable model base directory in the model
+sheet, tap Load model, then Send a message or an OpenAI messages array from the
+composer's JSON mode. The validated summarization prompt is bundled as
+`res/raw/gemma4_moe_messages.json` and offered as the Power tab's `HTP 1K` preset.
+
+For interactive use, copy `chat_template.jinja`, `generation_config.json` and
+`nntr_config.json` from [the HTP chat preset](../res/gemma4/htp_chat/) into the
+validated model directory alongside its weights and tokenizer. The template is
+Google's Gemma4 26B template at `35b4173`, with adjacent error-message string
+literals joined for the current minja parser. It adds the empty thought channel
+used when thinking is off. The preset restores EOS IDs `[1, 106, 50]`, retains
+greedy sampling, and provides 1,280 context positions so the 1,028-token default
+prompt and its generation budget fit without truncating the template suffix.
+The earlier 1,024/128 benchmark pack deliberately disabled EOS; retain that pack
+only for reproducing those measurements. Its fallback template is not the
+recommended interactive configuration.
+
+Chat input is plain message text; the API applies the template. The chat bubble
+hides the final `<turn|>` marker; the Metrics screen's raw output and the token
+trace show it. Each native HTP request is independent: for the HTP presets the
+app sends only the newest user message, not the transcript, because the pack's
+1,280 positions would overflow and the tail would be truncated silently
+(nntrainer #4474).
+See [the Chat verification results](../../../docs/gemma4-htp-quickdotai.md#validation)
+for the exact template source, model settings and device results.
+
+Load failures include the native diagnostic returned by
+`getLastModelLoadError()` on the worker thread. The app compares the complete
+load request before reusing a handle, and Reload always replaces the handle.
+
+See the [sample app validation results](../../../docs/gemma4-htp-quickdotai.md#validation)
+for device checks and the current 16 KB compatibility limitation of the SDK
+runtime/DSP packaging. Keep `jniLibs.useLegacyPackaging = true` and exclude
+`libnntr_hvx_skel.so` from stripping in downstream applications.
+
+## LFM2 MoE on native HTP
+
+The `--htp` build also registers `lfm2-24ba2b-htp` with the NPU backend.
+Load it with `CAUSAL_LM_BACKEND_NPU` and `CAUSAL_LM_QUANTIZATION_W4A32`
+from `<model_base_path>/lfm2-24ba2b-htp-w4a32`.
+
+The only supported LFM2 HTP format is `lfm2_weight_format=sr15_v2`, with
+`lfm2_execution_profile=htp_fused`: TL2 experts, affine WH projections and
+router, Q4_0 embedding and DW3_INT4 short convolutions. Keep the generated
+`conversion_report.json` alongside the weights; the loader requires both
+checkpoint rotation records. The legacy unrotated LFM2 pack is rejected.
+
+Pass the absolute directory containing the matching v81 DSP library as
+`native_lib_dir`. HTP runtime ownership follows the lifecycle above: only
+one active HTP handle is supported, and each streaming call starts an
+independent prompt. Public KV snapshot/resume remains unsupported. The
+SR15 performance defaults in `lfm2_runtime_defaults.h` are selected by the
+native CLI only; the API does not install those process-wide settings.
+See the [LFM2 guide](../../../docs/lfm2-htp-user-guide.md) for conversion and
+runtime requirements.
+
+The standalone `test/htp/quick_dot_ai_validation.cpp` device check accepts
+`lfm2 <legacy-base> <lib-dir> <sr15-base> <prompt-file>`. It checks legacy
+format rejection, SR15 load, two identical greedy streaming requests and
+unload. Each base contains the `lfm2-24ba2b-htp-w4a32` directory; the prompt
+file contains an already formatted prompt.
+
+For QuickDotAIAPP, select family `lfm2`, runtime `Quick.AI` and backend `NPU`.
+The model base path must contain the same `lfm2-24ba2b-htp-w4a32` directory.
+The APK does not include model weights. Normal launches use
+`/sdcard/Download/aistudio-mobile/models/`; stage the model there to tap
+**Load model** in the model sheet without editing the path. A path
+supplied to an instrumentation test is temporary and is not saved for the
+next app launch.
+The opt-in app lifecycle test accepts `htpModelId=lfm2-24ba2b-htp`; its
+default remains Gemma4. After installing the HTP app and instrumentation
+APKs, granting model-file access and acknowledging any first-launch system
+dialogs, run:
+
+```bash
+adb -s "$DEVICE" shell am instrument -w -r \
+  -e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#loadGenerateStopRepeatReloadAndReportInvalidPath' \
+  -e htpModelId lfm2-24ba2b-htp \
+  -e htpModelBase /sdcard/Download/aistudio-mobile/models \
+  -e htpMessages /sdcard/Download/lfm2/messages.json \
+  com.example.quickdotaiapp.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+`messages.json` is an OpenAI messages array. Use greedy generation and a
+prompt/output limit long enough to exercise cancellation (for example,
+96 generated tokens). The test checks repeatability, stop, unload during
+generation, reload and recovery from an invalid model path. Reports and
+native token traces are written under the app's `files/htp-app-validation`.
+
+Also verify the normal-launch path with
+`-e class 'com.example.quickdotaiapp.HtpAppLifecycleTest#lfm2ChatOpensFromDefaultPathAfterActivityRestart' -e htpDefaultPathCheck true`.
+This test uses the default model path and LFM2 prompt. It opens Chat and
+generates an answer, compares the OpenAI output and repeats after restarting the
+Activity. Reports are stored in `files/htp-default-path-validation`.
+
+## Model extensions
+
+A downstream project can add models this library does not implement by shipping
+`libqai_ext_model.so` next to the other native libraries. The host holds the
+single Factory, descriptor registry and callback registry; the plugin imports
+them and registers into them. Nothing about a plugin's models is known here.
+
+| Extension point | Where | Purpose |
+|---|---|---|
+| `Factory::registerModel` | `factory.h` | architecture string to class |
+| `register_model_descriptor` | `model_descriptor.h` | catalog entry (id, backends, `QDA_CAP_*`, `sd_variant_id`) |
+| `register_model_path` | `model_descriptor.h` | pack directory when it is not `config_name` lower-cased |
+| `ModelCallbackRegistry::register_for` | `model_callbacks.h` | per-architecture prompt format, KV length, speculative decoding, multimodal |
+
+**Load protocol** (`ext_model_abi.h`, `ext_model_loader.h`). On the first read of
+the model registry the host `dlopen`s `libqai_ext_model.so` (or the path in
+`QAI_EXT_MODEL_PATH`), calls `qai_ext_model_abi_info()` and compares the plugin's
+`QDA_EXT_ABI_VERSION`, `sizeof(ModelDescriptor)` and `sizeof(ModelCallbacks)`
+with its own. Only on a match does it call `qai_ext_model_register()`. A plugin
+must not register from a static constructor: loading it has to be harmless
+until the ABI is accepted. `ModelDescriptor` and `ModelCallbacks` are copied by
+value across the boundary; change either only together with
+`QDA_EXT_ABI_VERSION` and a rebuild of the plugin.
+
+**Diagnostics.** `getExtensionModelStatus()` returns one line:
+`absent: ...` (no plugin on the library path: a normal public build),
+`loaded: ...` or `failed: ...` (a plugin is present but refused or broken: ABI
+mismatch, missing symbol, unresolved dependency). The Kotlin SDK exposes the
+same through `NativeCausalLm.extensionStatus()` and logs a failure at error
+level; only a plugin file that is not there counts as absent.
+
+**Hooks.**
+
+- *Speculative decoding.* `configureSpeculativeDecoding` uses the first
+  sub-model of the handle whose architecture registered
+  `configure_speculative_decoding`, so a `[vision encoder, LLM]` handle reaches
+  the LLM's callback.
+- *Multimodal.* The `[producer, consumer]` composer (QNN builds with the
+  experimental multimodal API) calls `ModelCallbacks::multimodal` when the
+  architectures registered it: `encode_image` and `image_row_token_ids` on the
+  producer; `image_begin_token`/`image_end_token` and `bind_image_span` on the
+  consumer. With none registered it is the plain text/image/text splice.
+- *Planar input.* `QDA_CAP_PLANAR_CHW` marks a vision encoder that takes planar
+  CHW pixels; the Kotlin SDK reads it as `Capability.PLANAR_CHW`.
+
 ## Compatibility
 
 Consumers must use `quick_dot_ai_api.h` and `libquick_dot_ai_api.so`; the

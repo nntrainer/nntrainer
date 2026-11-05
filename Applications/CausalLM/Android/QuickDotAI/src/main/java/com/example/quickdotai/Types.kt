@@ -156,7 +156,16 @@ data class LoadModelRequest(
      * Only honored by [NativeQuickDotAI]; [LiteRTLm] ignores it.
      */
     @SerialName("htp_backend_config_path") val htpBackendConfigPath: String? = null,
-    val useSpeculativeDecoding: Boolean = false,
+    /**
+     * Speculative decoding, three-state:
+     *  - null (default): AUTO — enable SD when the loaded model supports
+     *    it, silently run without it otherwise. This is the recommended
+     *    setting; SD is lossless (the target model verifies every token)
+     *    and roughly 2-6x faster where available.
+     *  - true: REQUIRE — fail the load if the model cannot run SD.
+     *  - false: OFF — single-token generation even on SD-capable models.
+     */
+    val useSpeculativeDecoding: Boolean? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per
@@ -369,5 +378,13 @@ data class PerformanceMetrics(
     @SerialName("generation_duration_ms") val generationDurationMs: Double = 0.0,
     @SerialName("total_duration_ms") val totalDurationMs: Double = 0.0,
     @SerialName("initialization_duration_ms") val initializationDurationMs: Double = 0.0,
-    @SerialName("peak_memory_kb") val peakMemoryKb: Long = 0
+    @SerialName("peak_memory_kb") val peakMemoryKb: Long = 0,
+    /** Prompt submit to the first token reaching the caller (the honest TTFT). */
+    @SerialName("ttft_ms") val ttftMs: Double = 0.0,
+    /** The first decode step alone. */
+    @SerialName("first_token_ms") val firstTokenMs: Double = 0.0,
+    /** Median per-token time over tokens 2..N. */
+    @SerialName("decode_steady_ms") val decodeSteadyMs: Double = 0.0,
+    @SerialName("decode_steady_tokens") val decodeSteadyTokens: Int = 0,
+    @SerialName("prefill_drain_ms") val prefillDrainMs: Double = 0.0,
 )

@@ -74,6 +74,16 @@ public:
   using prop_tag = nntrainer::str_prop_tag;
 };
 
+/** @brief Read FP32 inference rows from the weight file instead of retaining
+ *         the whole embedding table. Explicitly enabled by the LFM2 HTP graph.
+ */
+class StreamFp32 final : public nntrainer::Property<bool> {
+public:
+  StreamFp32() { set(false); }
+  static constexpr const char *key = "stream_fp32";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
 } // namespace props
 
 /**
@@ -97,6 +107,11 @@ struct QuantLut {
 
   bool is_raw_u16 = false;
   bool is_signed4 = false;
+  bool is_affine4 =
+    false; ///< unsigned group32 codes with per-group zero points
+  bool round_bf16 = false; ///< round restored weights before layer scaling
+  bool bf16_scale_output = false; ///< BF16 layer scale and scaled output
+  std::vector<uint8_t> group_zero_points; ///< one uint4 zero point per group
 
   /// Row-block payload (Q4_0/Q6_K/QS4CX); NONE for the packed-4bit/raw formats.
   nntrainer::TensorDim::DataType ggml_dtype =
@@ -269,10 +284,13 @@ private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Scale, props::QuantizedLutPath,
              props::OutputQuantScale, props::OutputQuantOffset,
-             props::SidecarExportPath>
+             props::SidecarExportPath, props::StreamFp32>
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+  class RowCache;
+  /// Bounded, exact file rows for FP32 streaming or virtual Q4_0 direct I/O.
+  std::shared_ptr<RowCache> row_cache;
   /** CUDA dev-act pinned staging (cudaHostAlloc), PER INSTANCE. This was a
    *  function-scope static, which was safe while only the PLE used this class;
    *  once embedding0 became an EmbeddingLayer too, both layers shared one

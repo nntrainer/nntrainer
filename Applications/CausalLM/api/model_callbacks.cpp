@@ -31,3 +31,13 @@ bool ModelCallbackRegistry::any_requires_htp() const {
   }
   return false;
 }
+
+int findSpeculativeDecodingModel(const std::vector<std::string> &architectures,
+                                 const ModelCallbackRegistry &registry) {
+  for (size_t i = 0; i < architectures.size(); ++i) {
+    const auto *cb = registry.lookup(architectures[i]);
+    if (cb != nullptr && cb->configure_speculative_decoding)
+      return static_cast<int>(i);
+  }
+  return -1;
+}

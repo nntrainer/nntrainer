@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; the platform theme only fixes the window
+         background to the light surface so nothing flashes before the first
+         frame (the splash is light in both modes). -->
+    <style name="Theme.QuickDotAIAPP" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F7F9FF</item>
+    </style>
+</resources>

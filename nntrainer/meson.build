@@ -12,9 +12,11 @@ nntrainer_inc_abs = [
 ]
 
 nntrainer_sources = []
-# Static libraries built with their own compiler flags (e.g. an ISA variant
-# picked at run time) and linked whole into libnntrainer.
+# Objects linked whole into the library and extra link arguments: the
+# in-process HTP build (tensor/htp_backend/meson.build) adds the skel
+# subset here so its entries are exported like the FastRPC stub's.
 nntrainer_link_whole = []
+nntrainer_link_args = []
 nntrainer_headers = [
    meson.current_source_dir() / 'nntrainer_log.h',
    meson.current_source_dir() / 'nntrainer_logger.h',
@@ -167,6 +169,7 @@ else
       link_whole: nntrainer_link_whole,
       dependencies: nntrainer_base_deps,
       include_directories: nntrainer_inc,
+      link_args: nntrainer_link_args,
       install: true,
       install_dir: nntrainer_libdir
     )

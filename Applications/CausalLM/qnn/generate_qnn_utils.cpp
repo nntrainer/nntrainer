@@ -8,7 +8,9 @@
  */
 
 #include "generate_qnn_utils.h"
+
 #include "android_memory_allocator.h"
+#include <thread_manager.h>
 
 #include <algorithm>
 #include <cmath>
@@ -26,10 +28,22 @@
 #include <model.h>
 #include <tokenizers_cpp.h>
 
-// One fixed seed shared with the CausalLM sampler; re-seeded per run.
-causallm::SamplingRng rng{causallm::kDefaultSamplingSeed};
+#include <cstdlib>
 
-void reseed_sampling_rng() { rng.seed(causallm::kDefaultSamplingSeed); }
+// Sampling RNG. One fixed seed everywhere (causallm::kDefaultSamplingSeed,
+// shared with the CausalLM sampler), re-seeded at the start of every run, so
+// the same input gives the same tokens on every run, in every process and on
+// every C++ runtime of the same hardware. QUICKAI_SAMPLE_SEED overrides the
+// seed. std::random_device is deliberately not used: a request must be
+// reproducible.
+static uint64_t sampling_seed() {
+  if (const char *s = std::getenv("QUICKAI_SAMPLE_SEED"))
+    return static_cast<uint64_t>(std::strtoull(s, nullptr, 10));
+  return causallm::kDefaultSamplingSeed;
+}
+causallm::SamplingRng rng{sampling_seed()};
+
+void reseed_sampling_rng() { rng.seed(sampling_seed()); }
 
 std::vector<IO_TensorType>
 run_qnn_inference(ModelHandle &model, unsigned int batch,
@@ -276,44 +290,63 @@ void append_outputs_to_kv_cache(const std::vector<IO_TensorType> &step_outputs,
     }
   }
 
-#pragma omp parallel for
-  for (int binding_idx = 0; binding_idx < static_cast<int>(bindings.size());
-       binding_idx++) {
-    const auto &binding = bindings[binding_idx];
-    const int dest_row_length = kv_row_lengths[binding.layer_index];
-    const int num_columns =
-      kv_columns ? (*kv_columns)[binding.layer_index] : kQnnKvNumColumns;
-    auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
-    auto dest = kvs[binding.kv_index];
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, bindings.size(), [&](size_t binding_idx) {
+      const auto &binding = bindings[binding_idx];
+      const int dest_row_length = kv_row_lengths[binding.layer_index];
+      const int num_columns =
+        kv_columns ? (*kv_columns)[binding.layer_index] : kQnnKvNumColumns;
+      auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
+      auto dest = kvs[binding.kv_index];
 
-    int target_idx = target_position;
-    const int valid_before = std::min(target_position, dest_row_length);
-    const int shift = valid_before + rows - dest_row_length;
-    if (shift > 0) {
-      target_idx = valid_before - shift;
-      if (binding.is_key) {
-        for (int col = 0; col < num_columns; ++col) {
-          uint8_t *col_base = dest + col * dest_row_length;
-          std::memmove(col_base, col_base + shift, dest_row_length - shift);
+      int target_idx = target_position;
+      const int valid_before = std::min(target_position, dest_row_length);
+      const int shift = valid_before + rows - dest_row_length;
+      if (shift > 0) {
+        target_idx = valid_before - shift;
+        if (binding.is_key) {
+          for (int col = 0; col < num_columns; ++col) {
+            uint8_t *col_base = dest + col * dest_row_length;
+            std::memmove(col_base, col_base + shift, dest_row_length - shift);
+          }
+        } else {
+          std::memmove(dest, dest + shift * num_columns,
+                       (dest_row_length - shift) * num_columns);
         }
-      } else {
-        std::memmove(dest, dest + shift * num_columns,
-                     (dest_row_length - shift) * num_columns);
       }
-    }
 
-    if (binding.is_key) {
-      process_key(output, rows, num_columns, dest, target_idx, dest_row_length,
-                  src_row_length);
-    } else {
-      process_value(output, rows, num_columns, dest, target_idx);
-    }
-  }
+      if (binding.is_key) {
+        process_key(output, rows, num_columns, dest, target_idx,
+                    dest_row_length, src_row_length);
+      } else {
+        process_value(output, rows, num_columns, dest, target_idx);
+      }
+    });
+}
+
+// NNTR_HOSTOPT=0 restores the pre-optimisation host paths exactly, so an A/B
+// runs one binary and cannot be confounded by codegen or layout differences.
+static bool host_fastpath_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_HOSTOPT");
+    return !(e && e[0] == '0');
+  }();
+  return on;
 }
 
 void process_key(uint8_t *pointer, int row, int column, uint8_t *dest, int idx,
                  int dest_row_length, int src_row_length) {
   // format: 1:1:col:row
+  // Decode appends exactly one position, and `row` is a runtime value, so the
+  // generic form below emits a real memcpy call per column - 4 608 libc calls
+  // per generated token across the 15 KV layers, each moving one byte. Store
+  // it directly instead; identical bytes, no call.
+  if (row == 1 && host_fastpath_enabled()) {
+    for (int i = 0; i < column; i++)
+      dest[(size_t)i * dest_row_length + idx] =
+        pointer[(size_t)i * src_row_length];
+    return;
+  }
   for (int i = 0; i < column; i++) {
     std::memcpy(dest + i * dest_row_length + idx, pointer + i * src_row_length,
                 row);
@@ -480,6 +513,60 @@ int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
            float logit_scale, int logit_offset, float repetition_penalty,
            float temperature, float top_p, int top_k,
            float final_logit_softcapping) {
+  // top_k == 1 (greedy) short circuit. With a single candidate the rest of
+  // this function cannot change the answer: dequant, soft-cap, repetition
+  // penalty, temperature and top-p are all monotone or point-mass operations
+  // on a one-element set, and the draw over {1.0} always yields index 0. So the
+  // result is exactly the argmax, and the general path's tie-break (a strict
+  // `<` against the running maximum, i.e. the *first* maximal logit wins) is
+  // reproduced here exactly.
+  //
+  // Worth short-circuiting because the general path walks 262 144 uint16
+  // logits through a std::priority_queue - a dependent branch per element
+  // that runs at ~1.8 GB/s. Reducing over blocks lets the compiler emit a
+  // vector max and only rescan the block that actually raised the maximum.
+  if (top_k == 1 && length > 0 && host_fastpath_enabled()) {
+    constexpr int kBlock = 512;
+    uint16_t best = 0;
+    int best_block = -1;
+    for (int base = 0; base < length; base += kBlock) {
+      const int end = std::min(base + kBlock, length);
+      // Eight independent accumulators. A single running max is a
+      // loop-carried dependency that measures *slower* than the priority
+      // queue it replaces (129 us vs 77 us per 262 144 logits on x86); split
+      // eight ways it vectorises to a umax chain and lands at 28 us.
+      uint16_t m0 = 0, m1 = 0, m2 = 0, m3 = 0, m4 = 0, m5 = 0, m6 = 0, m7 = 0;
+      int i = base;
+      for (; i + 8 <= end; i += 8) {
+        m0 = std::max(m0, pointer[i + 0]);
+        m1 = std::max(m1, pointer[i + 1]);
+        m2 = std::max(m2, pointer[i + 2]);
+        m3 = std::max(m3, pointer[i + 3]);
+        m4 = std::max(m4, pointer[i + 4]);
+        m5 = std::max(m5, pointer[i + 5]);
+        m6 = std::max(m6, pointer[i + 6]);
+        m7 = std::max(m7, pointer[i + 7]);
+      }
+      uint16_t block_max =
+        std::max(std::max(std::max(m0, m1), std::max(m2, m3)),
+                 std::max(std::max(m4, m5), std::max(m6, m7)));
+      for (; i < end; ++i)
+        block_max = std::max(block_max, pointer[i]);
+      // Strictly-greater keeps the FIRST block that attains the maximum,
+      // matching the priority queue's `<` replacement test.
+      if (best_block < 0 || block_max > best) {
+        best = block_max;
+        best_block = base;
+      }
+    }
+    (void)rng(); // Keep the generic sampler's one RNG step, even for top_k=1.
+    const int end = std::min(best_block + kBlock, length);
+    for (int i = best_block; i < end; ++i)
+      if (pointer[i] == best)
+        return i;
+    return best_block; // unreachable: `best` was taken from this block
+  }
+
   // Priority queue!
   std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>,
                       std::greater<std::pair<int, int>>>
@@ -583,9 +670,8 @@ int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
   for (int i = 0; i < length; ++i)
     logits[i] /= final_sum_exp;
 
-  // Sample
-  // Inverse CDF in double (token_sampler.h): identical on every C++ runtime,
-  // which std::discrete_distribution is not.
+  // Sample: inverse CDF in double over the kept weights (token_sampler.h),
+  // identical on every C++ runtime -- std::discrete_distribution is not.
   std::vector<double> weights(logits.begin(), logits.begin() + length);
   return indices[causallm::sampleIndex(weights.data(), weights.size(), rng)];
 }

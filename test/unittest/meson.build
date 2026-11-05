@@ -61,6 +61,9 @@ test_target = [
   # Closed-form contract for the fused sigmoid-gated whole-ops.
   ['unittest_sigmoid_gate_ops', []],
   ['unittest_nntrainer_fallback', []],
+  ['unittest_nntrainer_tensor_ternary', []],
+  ['unittest_nntrainer_qs4acx', []],
+  ['unittest_nntrainer_kv_snap', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
   ['unittest_nntrainer_exe_order', []],
@@ -113,6 +116,11 @@ if get_option('enable-opencl')
   # The backend is selected by NNTR_OPS_BACKEND so the two engines are compared
   # across separate processes.
   test_target += [['unittest_embedding_pool_ops', []]]
+  # The OpenCL backend's expert reader pool (reads a temporary file; no GPU).
+  test_target += [['unittest_expert_reader_pool', []]]
+  # The streamed-expert decode protocol without a host round trip
+  # (expert_fsu_flags.h): the device side emulated on a thread; no GPU.
+  test_target += [['unittest_expert_fsu_flags', []]]
 endif
 
 if get_option('enable-fp16')
@@ -153,9 +161,12 @@ foreach target: test_target
     install: get_option('enable-test'),
     install_dir: application_install_dir
   )
+  # The ternary GEMM suite runs 55 to 90 s on the CI runners (the host
+  # takes 5 s) and the CPU backend suite 60 to 70 s; against the default
+  # 90 s both time out on a busy runner.
   test(target[0], exe,
     args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), target[0])],
-    timeout: test_timeout,
+    timeout: (target[0] == 'unittest_nntrainer_tensor_ternary' or target[0] == 'unittest_nntrainer_cpu_backend') ? test_timeout * 3 : test_timeout,
     suite: 'unittests'
   )
 endforeach
@@ -208,6 +219,7 @@ test('unittest_ddtree', unittest_ddtree_exe,
 unittest_memory_pool_exe = executable(
   'unittest_memory_pool',
   'memory' / 'unittest_memory_pool.cpp',
+  'memory' / 'unittest_memory_planner.cpp',
   include_directories: include_directories('models', 'memory'),
   dependencies: nntrainer_test_main_deps,
   install: get_option('enable-test'),
@@ -215,6 +227,116 @@ unittest_memory_pool_exe = executable(
 )
 test('unittest_memory_pool', unittest_memory_pool_exe,
   args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_memory_pool')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The fp16 attention planner is plain C arithmetic shared with the DSP-side
+# kernel (nntrainer/tensor/htp_backend/hmx/hexkl_attn_f16_plan.h); it has no
+# Hexagon dependency, so it is tested on every host build, not only under
+# -Denable-htp. Standalone because the shared loop cannot add its include dir.
+unittest_hexkl_attn_f16_plan_exe = executable(
+  'unittest_hexkl_attn_f16_plan',
+  'unittest_hexkl_attn_f16_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_f16_plan', unittest_hexkl_attn_f16_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_f16_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The resident KV tile registry is plain C too (its AEE codes come from a
+# tiny shim off-target); tested on the host against the documented layout.
+unittest_hexkl_kv_tiles_f16_exe = executable(
+  'unittest_hexkl_kv_tiles_f16',
+  ['unittest_hexkl_kv_tiles_f16.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_tiles_f16.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  # The DSP sources are C11 (hexagon-clang builds them so); the project's
+  # default C standard predates for-loop declarations.
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_kv_tiles_f16', unittest_hexkl_kv_tiles_f16_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_tiles_f16')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The quantized (int8 / int4) KV cache registry: quantizer, master layouts
+# and append / dump bookkeeping are plain C; only the HexKL tile bake is
+# DSP-side and is exercised by the device test instead.
+unittest_hexkl_kv_q_exe = executable(
+  'unittest_hexkl_kv_q',
+  ['unittest_hexkl_kv_q.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+unittest_hexkl_attn_q_plan_exe = executable(
+  'unittest_hexkl_attn_q_plan',
+  'unittest_hexkl_attn_q_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_q_plan', unittest_hexkl_attn_q_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_q_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_q')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The integer softmax of the row-blocked attention kernel (plan 23, R3):
+# the scalar definition against an exact softmax, through a model of the
+# convert unit's int16 output.
+unittest_hvx_softmax_q_exe = executable(
+  'unittest_hvx_softmax_q',
+  ['unittest_hvx_softmax_q.cpp',
+   '../../nntrainer/tensor/htp_backend/hvx/hvx_softmax_q.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hvx'),
+  dependencies: nntrainer_test_main_deps,
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hvx_softmax_q', unittest_hvx_softmax_q_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hvx_softmax_q')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The CPU A8W8 attention over that registry (libnntrainer's CPU side of
+# attention_kv_dtype), against an exact f32 reference.
+unittest_cpu_kv_q_attention_exe = executable(
+  'unittest_cpu_kv_q_attention',
+  'unittest_cpu_kv_q_attention.cpp',
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_cpu_kv_q_attention', unittest_cpu_kv_q_attention_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cpu_kv_q_attention')],
   timeout: test_timeout,
   suite: 'unittests'
 )

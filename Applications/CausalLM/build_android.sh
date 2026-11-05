@@ -10,8 +10,20 @@ Usage: ./build_android.sh [options] [engine Meson options]
 Options:
   --app                   Also assemble the QuickDotAI AAR and sample APK
   --install               Push native artifacts; with --app, install the APK
+  --htp                   Build the native Hexagon HTP variant (requires Hexagon SDK/HexKL)
   --qnn                   Build the QNN-enabled native/app variant (default: CPU-only)
+                          Combine --qnn --htp to package both backends together
+  --disable-opencl        Build the engine without the OpenCL/GPU backend
+                          (default: OpenCL on; recorded in the engine metadata,
+                          so --cache never reuses an engine of the other kind)
   --cache                 Reuse a compatible engine build; build on cache miss
+  --stage[=DIR]           Assemble the variant's PUBLIC stage in DIR (default:
+                          builddir_app_stage/public/<variant>): one flat
+                          directory with exactly the files the variant ships,
+                          residue-checked, plus DIR.manifest.json. DIR is
+                          recreated on every run; it never holds a
+                          model-extension plugin (downstream builds copy the
+                          stage and add theirs)
   --clean                 Recreate the selected CausalLM build outputs
   --nntr-threads=N        Set the nntrainer compute thread count (default: 7)
   --help, -h              Show this help
@@ -30,9 +42,13 @@ EOF
 CLEAN=false
 USE_BUILD_CACHE=false
 ENABLE_QNN=false
+ENABLE_HTP=false
+ENABLE_OPENCL=true
 INSTALL=false
 BUILD_APP=false
-NNTR_THREADS="${NNTR_THREADS:-7}"
+NNTR_THREADS="${NNTR_THREADS:-}"
+STAGE=false
+STAGE_DIR=""
 ENGINE_ARGS=()
 
 deprecated_option() {
@@ -47,8 +63,14 @@ while [[ $# -gt 0 ]]; do
         --install)
             INSTALL=true
             ;;
+        --htp)
+            ENABLE_HTP=true
+            ;;
         --qnn)
             ENABLE_QNN=true
+            ;;
+        --disable-opencl)
+            ENABLE_OPENCL=false
             ;;
         --assemble-aar|--aar)
             deprecated_option "$1" "--app"
@@ -59,6 +81,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clean)
             CLEAN=true
+            ;;
+        --stage)
+            STAGE=true
+            ;;
+        --stage=*)
+            STAGE=true
+            STAGE_DIR="${1#*=}"
+            if [[ -z "$STAGE_DIR" ]]; then
+                echo "Error: --stage= needs a directory." >&2
+                exit 2
+            fi
             ;;
         --nntr-threads=*)
             NNTR_THREADS="${1#*=}"
@@ -72,6 +105,17 @@ while [[ $# -gt 0 ]]; do
             if [[ "$1" == -Denable-npu=* ]]; then
                 echo "Error: -Denable-npu is controlled by --qnn." >&2
                 exit 2
+            fi
+            if [[ "$1" == -Denable-opencl=* ]]; then
+                # Same switch as --disable-opencl; kept because README_GPU.md
+                # documents -Denable-opencl=true. It is recorded in the engine
+                # metadata like the flag, not forwarded as an opaque engine arg.
+                case "${1#*=}" in
+                    true|false) ENABLE_OPENCL="${1#*=}" ;;
+                    *) echo "Error: -Denable-opencl must be true or false." >&2; exit 2 ;;
+                esac
+                shift
+                continue
             fi
             ENGINE_ARGS+=("$1")
             ;;
@@ -88,11 +132,20 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# The HTP path was measured at 8 compute threads (its miss readers and the
+# prefill's CPU stages); the other variants keep 7.
+if [[ -z "$NNTR_THREADS" ]]; then
+    if [[ "$ENABLE_HTP" == true ]]; then NNTR_THREADS=8; else NNTR_THREADS=7; fi
+fi
 if ! [[ "$NNTR_THREADS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --nntr-threads must be a positive integer." >&2
     exit 2
 fi
-if [[ "$ENABLE_QNN" == true ]]; then
+if [[ "$ENABLE_HTP" == true && "$ENABLE_QNN" == true ]]; then
+    BUILD_VARIANT="qnn-htp"
+elif [[ "$ENABLE_HTP" == true ]]; then
+    BUILD_VARIANT="htp"
+elif [[ "$ENABLE_QNN" == true ]]; then
     BUILD_VARIANT="qnn"
 else
     BUILD_VARIANT="cpu"
@@ -177,10 +230,35 @@ if [[ "$ENABLE_QNN" == true ]]; then
     export QNN_SDK_ROOT="$QNN_SDK_ROOT_MESON"
 fi
 
+HTP_ENGINE_ARGS=()
+if [[ "$ENABLE_HTP" == true ]]; then
+    : "${HEXAGON_SDK_ROOT:?--htp requires HEXAGON_SDK_ROOT}"
+    : "${DEFAULT_HEXAGON_TOOLS_ROOT:?--htp requires DEFAULT_HEXAGON_TOOLS_ROOT}"
+    : "${HEXKL_ROOT:?--htp requires HEXKL_ROOT}"
+    : "${HEX_ARCH:?--htp requires an explicit DSP target, e.g. HEX_ARCH=v81}"
+    if [[ "$HEX_ARCH" != v81 ]]; then
+        echo "Error: the Gemma4 HTP runtime requires HEX_ARCH=v81." >&2
+        exit 1
+    fi
+    HEXKL_SDK_VER="${HEXKL_SDK_VER:-6.4.0.2}"
+    export HEXKL_SDK_VER HEX_ARCH
+    HEXKL_LIB_SUBDIR="$HEXKL_SDK_VER/${HEXKL_ARCH:-armv8_android26}"
+    if [[ ! -f "$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" ]]; then
+        echo "Error: missing $HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so" >&2
+        exit 1
+    fi
+    bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh"
+    NNTR_HTP_DIAGNOSTICS="${NNTR_HTP_DIAGNOSTICS:-0}" bash "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/dsp/build.sh"
+    HTP_ENGINE_ARGS=(-Dhexagon-sdk-root="$HEXAGON_SDK_ROOT"
+                     -Dhexkl-sdk-root="$HEXKL_ROOT"
+                     -Dhexkl-lib-subdir="$HEXKL_LIB_SUBDIR")
+fi
+
 echo "=== nntrainer CausalLM Android build ==="
 echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK:    $ANDROID_NDK"
 echo "Variant:        $BUILD_VARIANT"
+echo "OpenCL:         $ENABLE_OPENCL"
 echo "App:            $BUILD_APP"
 echo "Install:        $INSTALL"
 echo "Engine cache:   $USE_BUILD_CACHE"
@@ -245,10 +323,17 @@ NNTRAINER_PREBUILT_MK="$NNTRAINER_ANDROID_RESULT/Android.mk"
 NNTRAINER_MODE_FILE="$NNTRAINER_ANDROID_RESULT/causallm-build-mode.ini"
 
 engine_mode_text() {
-    # Schema 2 invalidates engines built with the former mmap-read override.
-    printf 'schema=2\n'
+    # Schema 3 adds enable_opencl; schema 2 invalidated engines built with the
+    # former mmap-read override.
+    printf 'schema=3\n'
     printf 'variant=%s\n' "$BUILD_VARIANT"
     printf 'enable_qnn=%s\n' "$ENABLE_QNN"
+    printf 'enable_opencl=%s\n' "$ENABLE_OPENCL"
+    printf 'enable_htp=%s\n' "$ENABLE_HTP"
+    if [[ "$ENABLE_HTP" == true ]]; then
+        printf 'hex_arch=%s\nhexagon_sdk=%s\nhexkl_root=%s\nhexkl_lib=%s\n' \
+            "$HEX_ARCH" "$HEXAGON_SDK_ROOT" "$HEXKL_ROOT" "$HEXKL_LIB_SUBDIR"
+    fi
     printf 'nntr_threads=%s\n' "$NNTR_THREADS"
     printf 'android_ndk=%s\n' "$ANDROID_NDK"
     if [[ "$ENABLE_QNN" == true ]]; then
@@ -335,6 +420,9 @@ else
         ./tools/package_android.sh \
             -Dnntr-num-threads="$NNTR_THREADS" \
             -Denable-npu="$ENABLE_QNN" \
+            -Denable-opencl="$ENABLE_OPENCL" \
+            -Denable-htp="$ENABLE_HTP" \
+            "${HTP_ENGINE_ARGS[@]}" \
             "${ENGINE_ARGS[@]}"
     )
     engine_mode_text > "$NNTRAINER_MODE_FILE"
@@ -488,6 +576,11 @@ QNN_SKEL_RELATIVE_PATHS=(
     hexagon-v81/unsigned/libQnnHtpV81Skel.so
 )
 
+if [[ "$ENABLE_HTP" == true ]]; then
+    RUNTIME_LIBRARIES+=("$HEXKL_ROOT/lib/$HEXKL_LIB_SUBDIR/libsdkl.so"
+                       "$NNTRAINER_ROOT/nntrainer/tensor/htp_backend/dsp/build/libnntr_hvx_skel.so")
+fi
+
 if [[ "$ENABLE_QNN" == true ]]; then
     RUNTIME_LIBRARIES+=("$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so")
     QNN_AARCH64_LIB_DIR="$QNN_SDK_ROOT_SHELL/lib/aarch64-android"
@@ -550,7 +643,7 @@ stage_runtime_libraries() {
     if [[ "$ENABLE_QNN" == false ]]; then
         if find "$PREBUILT_DIR" -maxdepth 1 -type f \
             \( -name 'libqnn_context.so' -o -name 'libQnn*.so' \) | grep -q .; then
-            echo "Error: a CPU-only stage contains QNN libraries." >&2
+            echo "Error: a $BUILD_VARIANT stage contains QNN libraries." >&2
             exit 1
         fi
     fi
@@ -560,6 +653,42 @@ stage_runtime_libraries() {
     fi
 }
 
+stage_public() {
+    local stage_dir="$1" marker=".nntr-stage"
+    # The directory is wiped on every run so that nothing of an earlier
+    # variant survives (cpu -> qnn -> cpu). Refuse to wipe anything that is
+    # not a previous stage of ours.
+    if [[ -e "$stage_dir" ]]; then
+        if [[ ! -d "$stage_dir" ]]; then
+            echo "Error: stage path exists and is not a directory: $stage_dir" >&2
+            exit 1
+        fi
+        if [[ -n "$(ls -A "$stage_dir")" && ! -f "$stage_dir/$marker" ]]; then
+            echo "Error: refusing to recreate $stage_dir: not empty and not a stage." >&2
+            exit 1
+        fi
+        rm -rf "$stage_dir"
+    fi
+    rm -f "$stage_dir.manifest.json"
+    mkdir -p "$stage_dir"
+    echo "[6] Staging the public $BUILD_VARIANT variant in $stage_dir."
+    local source
+    for source in "${RUNTIME_LIBRARIES[@]}" "${NATIVE_EXECUTABLES[@]}"; do
+        cp "$source" "$stage_dir/"
+    done
+    printf '%s\n' "$BUILD_VARIANT" > "$stage_dir/$marker"
+    python3 "$CAUSALLM_ROOT/Android/native_stage.py" manifest \
+        --variant "$BUILD_VARIANT" --kind public --stage-dir "$stage_dir" \
+        --nntrainer-root "$NNTRAINER_ROOT" \
+        --abi-file "$NNTRAINER_ABI_FILE" --mode-file "$NNTRAINER_MODE_FILE" \
+        --readelf "$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/bin/llvm-readelf" \
+        --output "$stage_dir.manifest.json"
+}
+
+if [[ "$STAGE" == true ]]; then
+    stage_public "${STAGE_DIR:-$NNTRAINER_ROOT/builddir_app_stage/public/$BUILD_VARIANT}"
+fi
+
 AAR=""
 APK=""
 if [[ "$BUILD_APP" == true ]]; then
@@ -568,16 +697,20 @@ if [[ "$BUILD_APP" == true ]]; then
     (
         cd "$CAUSALLM_ROOT/Android"
         ./gradlew "$GRADLE_NDK_ARG" \
-            :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
+            :QuickDotAI:assembleDebug :QuickDotAIAPP:assembleDebug
     )
     AAR="$CAUSALLM_ROOT/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar"
-    APK="$CAUSALLM_ROOT/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk"
+    APK="$CAUSALLM_ROOT/Android/QuickDotAIAPP/build/outputs/apk/debug/QuickDotAIAPP-debug.apk"
     for file in "$AAR" "$APK"; do
         if [[ ! -f "$file" ]]; then
             echo "Error: Gradle artifact missing: $file" >&2
             exit 1
         fi
     done
+    python3 "$CAUSALLM_ROOT/Android/verify_native_package.py" \
+        --variant "$BUILD_VARIANT" --prebuilt-dir "$PREBUILT_DIR" \
+        --readelf "$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/bin/llvm-readelf" \
+        --output "$APK.native-manifest.json" "$AAR" "$APK"
 fi
 
 if [[ "$INSTALL" == false ]]; then
@@ -588,6 +721,8 @@ if [[ "$INSTALL" == false ]]; then
     else
         echo "=== Done (native $BUILD_VARIANT build) ==="
         echo "Artifacts: $NATIVE_BUILD"
+        [[ "$STAGE" == true ]] && \
+            echo "Public stage: ${STAGE_DIR:-$NNTRAINER_ROOT/builddir_app_stage/public/$BUILD_VARIANT}"
     fi
     exit 0
 fi

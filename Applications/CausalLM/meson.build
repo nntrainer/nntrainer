@@ -83,10 +83,14 @@ endif
 
 subdir('models')
 
-if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
-    run_command(powershell_prog, '-ExecutionPolicy', 'Bypass', '-File', join_paths(meson.source_root(), 'jni', 'prepare_encoder.ps1'), meson.build_root(), '0.2', check: true)
-elif get_option('platform') != 'tizen'
-    run_command([meson.source_root() / 'jni' / 'prepare_encoder.sh', meson.build_root(), '0.2'], check: true)
+# CausalLM only consumes json.hpp from this legacy resource bundle. Reuse an
+# existing header instead of downloading and writing unrelated LLaMA headers.
+if not (get_option('causallm-only') and fs.exists(meson.current_source_dir() / 'json.hpp'))
+    if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
+        run_command(powershell_prog, '-ExecutionPolicy', 'Bypass', '-File', join_paths(meson.source_root(), 'jni', 'prepare_encoder.ps1'), meson.build_root(), '0.2', check: true)
+    elif get_option('platform') != 'tizen'
+        run_command([meson.source_root() / 'jni' / 'prepare_encoder.sh', meson.build_root(), '0.2'], check: true)
+    endif
 endif
 
 tokenizer_dependencies = []
@@ -185,24 +189,15 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-# Persistent tokenizer snapshot cache (tokenizer_cache.cpp). It needs the
-# snapshot entry points of the in-tree crate (tools/build_tokenizers_c.sh).
-# An archive built before they existed still links everything else, so
-# 'auto' probes the archive that is linked and, without them, builds the
-# cache out: every load then parses tokenizer.json as before.
-tokenizer_cache_opt = get_option('causallm-tokenizer-cache')
-tokenizer_cache = false
-if not tokenizer_cache_opt.disabled()
-    tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
-        args: [tokenizer_check_path] + tokenizer_system_libs,
-        dependencies: [thread_dep, libdl_dep])
-    if not tokenizer_cache and tokenizer_cache_opt.enabled()
-        error('causallm-tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with Applications/CausalLM/tools/build_tokenizers_c.sh.'.format(tokenizer_check_path))
-    endif
-endif
-if not tokenizer_cache
-    cpp_args += [ '-DCAUSALLM_DISABLE_TOKENIZER_CACHE' ]
-endif
+causallm_root = meson.current_source_dir()
+causallm_enable_qnn = get_option('enable-qnn-models')
+causallm_tokenizer_cache_name = 'causallm-tokenizer-cache'
+causallm_tokenizer_cache_opt = get_option(causallm_tokenizer_cache_name)
+causallm_tokenizer_probe_args = [tokenizer_check_path] + tokenizer_system_libs
+causallm_tokenizer_probe_deps = [thread_dep, libdl_dep]
+subdir('app_build/common')
+causallm_src += causallm_htp_model_src + causallm_qnn_src
+cpp_args += causallm_common_cpp_args
 
 # ── xgrammar (wrapper + vendored library), compiled into libcausallm.so ──
 # api/xgrammar_manager.cpp:26 defines a Meyers singleton
@@ -220,35 +215,6 @@ causallm_xgrammar_inc = [
     include_directories('xgrammar' / 'include'),
     include_directories('xgrammar' / '3rdparty' / 'picojson'),
     include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
-]
-
-causallm_xgrammar_src = [
-    # wrapper: bridges causallm::XGrammar to the xgrammar library.
-    meson.current_source_dir() / 'api' / 'xgrammar_wrapper.cpp',
-    meson.current_source_dir() / 'api' / 'xgrammar_manager.cpp',
-    # xgrammar library sources (from the xgrammar submodule checkout under
-    # this directory).
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'config.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'earley_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'regex_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'structural_tag.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'testing.cc',
-    # Support files (required for linking)
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
 ]
 
 causallm_xgrammar_lib = static_library('causallm_xgrammar',
@@ -276,23 +242,9 @@ if get_option('enable-qnn-models')
         error('enable-qnn-models requires enable-npu (the libqnn_context.so QNN backend)')
     endif
 
-    causallm_src += [
-        meson.current_source_dir() / 'qnn' / 'android_memory_allocator.cpp',
-        meson.current_source_dir() / 'qnn' / 'quick_dot_ai_qnn.cpp',
-        meson.current_source_dir() / 'qnn' / 'graph_parser.cpp',
-        meson.current_source_dir() / 'qnn' / 'generate_qnn_utils.cpp',
-        meson.current_source_dir() / 'qnn' / 'qnn_kv_cache_manager.cpp',
-        meson.current_source_dir() / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
-    ]
-
     causallm_extra_inc += [
         include_directories('qnn'),
         include_directories('qnn' / 'gemma4-e2b-qnn'),
-    ]
-
-    cpp_args += [
-        '-DENABLE_QNN=1',
-        '-DENABLE_QNN_MODELS=1',
     ]
 endif
 
@@ -344,10 +296,41 @@ causallm_dep = declare_dependency(
     link_args: get_option('platform') == 'windows' ? tokenizer_link_args : []
 )
 
+extension_archive = get_option('causallm-extension-archive')
+extension_link_args = []
+if extension_archive != ''
+  if not fs.exists(extension_archive)
+    error('Model-extension archive does not exist: ' + extension_archive)
+  endif
+  if cxx.get_id() == 'msvc'
+    extension_link_args += ['/WHOLEARCHIVE:' + extension_archive]
+  else
+    extension_link_args += ['-Wl,--whole-archive', extension_archive, '-Wl,--no-whole-archive']
+  endif
+endif
+
+cli_extension_args = []
+cli_extension_link_args = []
+if host_machine.system() != 'windows' or extension_archive != ''
+  executable_src += [
+    meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
+    meson.current_source_dir() / 'api' / 'ext_model_cli_load.cpp',
+  ]
+endif
+if host_machine.system() == 'windows' and extension_archive != ''
+  # This standalone process owns its static core and callbacks. It never
+  # imports the API DLL (which owns a different process's API registries).
+  executable_src += meson.current_source_dir() / 'api' / 'model_callbacks.cpp'
+  cli_extension_args += ['-DNNTR_STATIC_MODEL_EXTENSION=1', '-DQUICK_DOT_AI_STATIC=1']
+  cli_extension_link_args += extension_link_args
+endif
 e = executable('nntr_causallm',
     executable_src,
     include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    cpp_args: cli_extension_args,
+    link_args: cli_extension_link_args,
+    link_depends: cli_extension_link_args.length() == 0 ? [] : [extension_archive],
 )
 
 
@@ -393,7 +376,10 @@ if get_option('enable-api')
     include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
   ]
 
-  quick_dot_ai_api_cpp_args = []
+  quick_dot_ai_api_cpp_args = ['-DQUICK_DOT_AI_BUILDING_LIBRARY=1']
+  if extension_archive != ''
+    quick_dot_ai_api_cpp_args += ['-DNNTR_STATIC_MODEL_EXTENSION=1']
+  endif
   if get_option('enable-qnn-models')
     quick_dot_ai_api_inc += [
       include_directories('qnn'),
@@ -407,6 +393,8 @@ if get_option('enable-api')
     meson.current_source_dir() / 'api' / 'model_callbacks.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
     meson.current_source_dir() / 'api' / 'model_descriptors_public.cpp',
+    meson.current_source_dir() / 'api' / 'htp_pack_gate.cpp',
+    meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
   ]
@@ -416,13 +404,14 @@ if get_option('enable-api')
     include_directories: quick_dot_ai_api_inc,
     dependencies: [nntrainer_dep, causallm_dep, dependency('threads')],
     cpp_args: quick_dot_ai_api_cpp_args,
+    link_args: extension_link_args,
+    link_depends: extension_archive == '' ? [] : [extension_archive],
     install: true,
   )
 
   quick_dot_ai_api_dep = declare_dependency(
     link_with: quick_dot_ai_api_lib,
     include_directories: include_directories('api'),
-    dependencies: [causallm_dep],
   )
 
   executable('quick_dot_ai_test',
@@ -488,6 +477,24 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Expert slot residency (expert_residency.h): host-only, header-only. Pins
+  # the per-layer LRU that decides which device slot a streamed MoE expert
+  # is read into.
+  unittest_expert_residency = executable(
+    'unittest_expert_residency',
+    meson.current_source_dir() / 'layers' / 'unittest_expert_residency.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_expert_residency', unittest_expert_residency,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_expert_residency'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Portable token sampler (token_sampler.h): host-only, header-only. Pins the
   # RNG stream, same-seed reproducibility and the top-k / top-p tie rules.
   unittest_sampling = executable(
@@ -524,6 +531,7 @@ if get_option('enable-test')
   causallm_fixture_tars = [
     meson.source_root() / 'packaging' / 'causallm_reference_generation.tar.gz',
     meson.source_root() / 'packaging' / 'causallm_reference_embedding.tar.gz',
+    meson.source_root() / 'packaging' / 'causallm_reference_gemma4_htp.tar.gz',
   ]
   # The tarballs already contain a top-level `causallm_reference/` directory, so
   # extract into models/ (NOT models/causallm_reference/, which would double the
@@ -559,6 +567,102 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_htp_pack_gate = executable(
+    'unittest_htp_pack_gate',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_htp_pack_gate.cpp',
+      meson.current_source_dir() / 'api' / 'htp_pack_gate.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [causallm_inc, causallm_inc_nlohmann_inc,
+                          include_directories('api')],
+    # The fixture is read from the source tree, so the test runs from any
+    # build directory.
+    cpp_args: ['-DHTP_PACK_FIXTURES="@0@"'.format(
+      meson.current_source_dir() / 'api' / 'testdata' / 'htp_pack_fixtures.json')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_htp_pack_gate', unittest_htp_pack_gate,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_htp_pack_gate'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # The model-extension plugin loader and the speculative-decoding model
+  # search; both are host-only (the test builds its own tiny plugin).
+  ext_fixture_src = meson.current_source_dir() / 'api' / 'testdata' / 'ext_plugin_fixture.cpp'
+  ext_fixture_inc = [include_directories('api')]
+  ext_fixture_good = shared_library('ext_fixture_good', ext_fixture_src,
+    include_directories: ext_fixture_inc, override_options: ['b_lundef=false'],
+    install: false)
+  ext_fixture_stale = shared_library('ext_fixture_stale', ext_fixture_src,
+    include_directories: ext_fixture_inc, cpp_args: ['-DFIXTURE_STALE_ABI'],
+    override_options: ['b_lundef=false'], install: false)
+  ext_fixture_no_abi = shared_library('ext_fixture_no_abi', ext_fixture_src,
+    include_directories: ext_fixture_inc, cpp_args: ['-DFIXTURE_NO_ABI_INFO'],
+    override_options: ['b_lundef=false'], install: false)
+
+  unittest_ext_model = executable(
+    'unittest_ext_model',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_ext_model.cpp',
+      meson.current_source_dir() / 'api' / 'ext_model_loader.cpp',
+      meson.current_source_dir() / 'api' / 'model_callbacks.cpp',
+    ],
+    dependencies: [gtest_main_dep, dependency('dl', required: false)],
+    include_directories: [include_directories('api')],
+    cpp_args: ['-DEXT_GOOD_PLUGIN="@0@"'.format(ext_fixture_good.full_path()),
+               '-DEXT_STALE_PLUGIN="@0@"'.format(ext_fixture_stale.full_path()),
+               '-DEXT_NO_ABI_PLUGIN="@0@"'.format(ext_fixture_no_abi.full_path())],
+    # The fixture plugins bind register_model_descriptor to this executable.
+    export_dynamic: true,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_ext_model', unittest_ext_model,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ext_model'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_kv_prefix_path = executable(
+    'unittest_kv_prefix_path',
+    [meson.current_source_dir() / 'api' / 'unittest_kv_prefix_path.cpp'],
+    dependencies: [gtest_main_dep],
+    include_directories: [include_directories('api')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_prefix_path', unittest_kv_prefix_path,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_prefix_path'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # The engine request is process-wide state in nntrainer/utils; the test
+  # compiles its one source in so it does not need the whole engine linked.
+  unittest_engine_request = executable(
+    'unittest_engine_request',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_engine_request.cpp',
+      meson.source_root() / 'nntrainer' / 'utils' / 'engine_request.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [include_directories('../../nntrainer/utils')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_engine_request', unittest_engine_request,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_engine_request'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # NOTE: the 'unittest_cancel_api' target (api/unittest_cancel_api.cpp) was
   # removed here (UNVERIFIED — see note above test_api). It exercised the
   # removed causal_lm_api.{cpp,h} global cancel + '*ForTest' seams, which no
@@ -581,6 +685,9 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_htp.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_slim_moe.cpp',

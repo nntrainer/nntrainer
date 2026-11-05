@@ -179,6 +179,17 @@ unsigned int TensorDim::getDataTypeSize() const {
     return sizeof(uint8_t);
   case TensorDim::DataType::QS4CX:
     return sizeof(uint8_t);
+  case TensorDim::DataType::QS4ACX:
+  case TensorDim::DataType::TQ2CX:
+    /// TernaryTensor::size() is already the record size in bytes, so the
+    /// element size must be 1 for TensorBase::bytes() to be right.
+    return sizeof(uint8_t);
+  case TensorDim::DataType::QS4CX_WH:
+    return sizeof(uint8_t);
+  case TensorDim::DataType::QS2CX_WH:
+  case TensorDim::DataType::QS4CX_WH_AFFINE:
+  case TensorDim::DataType::TL2CX_WH:
+    return sizeof(uint8_t);
   default:
     return sizeof(float);
   }
@@ -420,6 +431,19 @@ std::ostream &operator<<(std::ostream &out, TensorDim const &d) {
     type_ = "Q4_0";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4CX) {
     type_ = "QS4CX";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::TQ2CX) {
+    type_ = "TQ2CX";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4ACX) {
+    type_ = "QS4ACX";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4CX_WH) {
+    type_ = "QS4CX_WH";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::QS2CX_WH) {
+    type_ = "QS2CX_WH";
+  } else if (d.getDataType() ==
+             ml::train::TensorDim::DataType::QS4CX_WH_AFFINE) {
+    type_ = "QS4CX_WH_AFFINE";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::TL2CX_WH) {
+    type_ = "TL2CX_WH";
   } else {
     type_ = "Unknown";
   }

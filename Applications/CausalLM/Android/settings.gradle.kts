@@ -34,6 +34,8 @@ pluginManagement {
                     useModule("org.jetbrains.kotlin:kotlin-gradle-plugin:$version")
                 id == "org.jetbrains.kotlin.plugin.serialization" ->
                     useModule("org.jetbrains.kotlin:kotlin-serialization:$version")
+                id == "org.jetbrains.kotlin.plugin.compose" ->
+                    useModule("org.jetbrains.kotlin:compose-compiler-gradle-plugin:$version")
             }
         }
     }
@@ -56,4 +58,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "QuickAI"
 include(":QuickDotAI")
-include(":SampleTestAPP")
+include(":QuickDotAIAPP")

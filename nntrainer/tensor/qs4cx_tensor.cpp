@@ -167,7 +167,7 @@ void QS4CX_Tensor::allocate() {
     // VirtualAlloc regions; running it on HeapAlloc pages corrupts the heap.
     // DiscardVirtualMemory (residency only) works on either. The deleter
     // releases the whole reservation.
-    if (qs4cxHeapBypassOn()) {
+    if (int4HeapBypassOn(getDataType())) {
       void *va =
         VirtualAlloc(nullptr, size(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
       if (va != nullptr) {
@@ -183,7 +183,7 @@ void QS4CX_Tensor::allocate() {
         // dead store that only faults the whole region resident. putData()
         // still runs, so the MemoryData invalidate hook fires exactly as
         // before.
-        if (qs4cxAllocUninitialized()) {
+        if (allocUninitialized()) {
           qs4cxPoisonIfRequested(mem_data->getAddr<uint8_t>(), size());
           putData();
         } else {
@@ -200,7 +200,7 @@ void QS4CX_Tensor::allocate() {
     // dead stores, and why the page faults they force are the thing that
     // matters -- they are not saved, they MOVE to the read() that fills the
     // buffer, which is what lets a load-time drop bound the residency peak.
-    const bool uninit = qs4cxAllocUninitialized();
+    const bool uninit = allocUninitialized();
     mem_data = new MemoryData(uninit ? (void *)(new uint8_t[size()])
                                      : (void *)(new uint8_t[size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
@@ -219,6 +219,18 @@ void QS4CX_Tensor::allocate() {
       initialize();
     }
   }
+}
+
+bool QS4CX_Tensor::allocUninitialized() const {
+  // QS4CX keeps its process-wide answer; a QS4ACX payload is load-destined
+  // under its own heap-bypass decision, on the same terms (see
+  // qs4cxAllocUninitialized: every reader writes all size() bytes).
+  if (getDataType() == ml::train::TensorDim::DataType::QS4ACX) {
+    static const bool v =
+      int4HeapBypassOn(getDataType()) && !nntr_env_on("NNTR_QS4CX_ALLOC_ZERO");
+    return v;
+  }
+  return qs4cxAllocUninitialized();
 }
 
 void *QS4CX_Tensor::getData() const {
@@ -538,6 +550,30 @@ bool qs4cxHeapBypassOn() {
 #else
     return false;
 #endif
+  }();
+  return on;
+}
+
+bool int4HeapBypassOn(ml::train::TensorDim::DataType dt) {
+  if (dt == ml::train::TensorDim::DataType::QS4CX)
+    return qs4cxHeapBypassOn();
+  if (dt != ml::train::TensorDim::DataType::QS4ACX)
+    return false;
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_QS4CX_HEAP_BYPASS");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+bool int4DropPlainOn(ml::train::TensorDim::DataType dt) {
+  if (dt == ml::train::TensorDim::DataType::QS4CX)
+    return qs4cxDropPlainOn();
+  if (dt != ml::train::TensorDim::DataType::QS4ACX)
+    return false;
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_DROP_PLAIN");
+    return e == nullptr || e[0] == '1';
   }();
   return on;
 }

@@ -570,6 +570,14 @@ public:
   }
 
   /**
+   * @brief     Get the compute ops this tensor dispatches through
+   * @note      Mirrors the internal op dispatch (per-tensor override if set,
+   *            else the global backend) so app-level callers route through
+   *            the same backend Tensor::dot() would pick.
+   */
+  ComputeOps *getOps() const { return itensor_->getOps(); }
+
+  /**
    * @brief     return scale pointer of Tensor
    * @retval    template T pointer
    */
@@ -2066,6 +2074,19 @@ public:
   bool isVirtual() const { return is_virtual; }
 
   /**
+   * @brief whether a virtual tensor is mapped now (activate() done)
+   */
+  bool isActivated() const { return mapped_ptr != nullptr; }
+
+  /**
+   * @brief The model file descriptor a virtual tensor captured at read()
+   *        time, or -1. What a backend needs, with getFileOffset(), to
+   *        read a virtual weight's bytes itself instead of through
+   *        activate()'s mmap.
+   */
+  int getFd() const { return fd; }
+
+  /**
    * @brief activate virtual tensor
    * @note if the tensor is virtual, this method activates virtual tensor, which
    * means allocate the tensor memory and read the corresponding value from the
@@ -2111,7 +2132,6 @@ public:
    * whole-op without a preprocessor branch at the call site, e.g.
    * `in.getOps()->layer_norm(...)`.
    */
-  ComputeOps *getOps() const { return itensor_->getOps(); }
 
   /**
    * @brief Propagate this tensor's ContextData to a result tensor.

@@ -1,0 +1,11 @@
+{
+  "source_commit": "48a6bbb22f96087f9b993cf87e33c70f9840fe26",
+  "gemma4_execution_profile": "htp_fused",
+  "gemma4_weight_format": "htp_fused_v1",
+  "files": {
+    "nntr_gemma4_moe_tiny_fp32.bin": {
+      "bytes": 600488,
+      "sha256": "c49ad8d88961f653543df9a7c0546edfd3fe5d60519a7b8167d2b39c40ce0427"
+    }
+  }
+}

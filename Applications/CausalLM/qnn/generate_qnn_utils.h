@@ -44,8 +44,8 @@ using IO_TensorType = causallm::IO_TensorType;
 extern causallm::SamplingRng rng;
 
 /**
- * @brief Re-seed rng with causallm::kDefaultSamplingSeed, so the same input
- *        gives the same tokens on every run of the same hardware.
+ * @brief Re-seed rng with QUICKAI_SAMPLE_SEED or kDefaultSamplingSeed; the same
+ * input gives the same tokens on every run of the same hardware.
  */
 void reseed_sampling_rng();
 

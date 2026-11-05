@@ -399,6 +399,27 @@ TEST(nntrainer_Tensor, QS4CXTensor_01_p) {
   EXPECT_EQ(tensor.q_scheme(), nntrainer::QScheme::QS4CX);
 }
 
+/** @brief WH tile records never inherit legacy QS4CX row padding. */
+TEST(nntrainer_Tensor, QS4CXWHTensor_layout_p) {
+  const unsigned int K = 64, N = 32;
+  nntrainer::Tensor tensor(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX_WH}},
+    true);
+  for (bool padded : {false, true}) {
+    tensor.setQs4cxRecordPadded(padded);
+    EXPECT_EQ(tensor.size(), K * N / 2 + 2 * N * sizeof(float));
+    EXPECT_EQ(tensor.getMemoryBytes(), tensor.size());
+    ASSERT_NE(tensor.getScale<float>(), nullptr);
+    EXPECT_EQ(reinterpret_cast<uint8_t *>(tensor.getScale<float>()) -
+                tensor.getData<uint8_t>(),
+              static_cast<ptrdiff_t>(K * N / 2));
+    tensor.getScale<float>()[2 * N - 1] = 7.0f;
+    EXPECT_FLOAT_EQ(reinterpret_cast<float *>(tensor.getData<uint8_t>() +
+                                              K * N / 2)[2 * N - 1],
+                    7.0f);
+  }
+}
+
 /**
  * @brief The dropped-payload registry: a released QS4CX payload is refused by
  *        every host reader, and forgotten again once the payload is freed so

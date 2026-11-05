@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <env_compat.h> // nntr_env_on_or(), nntr_deterministic()
 #include <map>
 #include <memory>
 #include <memory_pool.h>
@@ -495,6 +496,14 @@ int kv_img_write_mode() {
   return kv_img_write_latch.load(std::memory_order_relaxed) ? mode : 0;
 }
 
+static const std::string &ropeCopts();
+
+/** build options of the int8-KV snapping variants of the rope kernels */
+static const std::string &ropeSnapCopts() {
+  static const std::string opts = ropeCopts() + " -DKV_SNAP";
+  return opts;
+}
+
 static const std::string &ropeCopts() {
   static const std::string opts = [] {
     const char *e = std::getenv("NNTR_ROPE_TAIL_FIX");
@@ -728,6 +737,24 @@ __kernel void v_gather_ohwi_t_img(__read_only image2d_t src, __global half *dst,
 
 static const std::string rope_inplace_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef KV_SNAP
+// x / s rounded to nearest-even exactly like an IEEE division, built from
+// fma only (Markstein): the reciprocal is refined to the correctly rounded
+// 1/s, the quotient gets one residual correction. The snap kernels use it
+// instead of '/' so they need no -cl-fp32-correctly-rounded-divide-sqrt
+// (rejected by some drivers) and still match the CPU snap kernel bit for bit.
+inline float kv_snap_div(const float x, const float s) {
+  float y = 1.0f / s;
+  float e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  const float q = x * y;
+  const float r = fma(-s, q, x);
+  // an exact quotient keeps its own sign (-0 / s is -0)
+  return r == 0.0f ? q : fma(r, y, q);
+}
+#endif
 // 1 (default) = the fp32/fp16 rotation choice is a property of the SEQUENCE,
 // so a continuation chunk matches the chunks before it; 0 = the old rule,
 // chosen from this chunk's M alone. Set from NNTR_ROPE_TAIL_FIX; see the
@@ -741,7 +768,11 @@ __kernel void rope_inplace_f16(__global const half *in,
                                __global const half *sin_lut,
                                const int M, const int num_heads,
                                const int half_d, const int start_pos,
-                               const int write_off) {
+                               const int write_off
+#ifdef KV_SNAP
+                               , __global const float *snap_scale
+#endif
+                               ) {
   // write_off: when writing the rotated K into a STABLE base
   // (cache_key) instead of an offset-baked slice pointer, out[write_off + ..]
   // addresses the per-token row via a SCALAR (recordable) instead of an SVM
@@ -780,6 +811,21 @@ __kernel void rope_inplace_f16(__global const half *in,
   // unchanged), fp16 for a CONTINUATION chunk whatever its size -- which is
   // what every earlier chunk of that same prefill used. Large prefill chunks
   // are unchanged either way.
+#ifdef KV_SNAP
+  // int8-KV trained model: the rotated key is snapped to its head's int8
+  // grid, q = clamp(rint(x / s), -128, 127), x = q * s, in the same store
+  // (fp32 rotation, true division, round half to even -- the CPU kernel's
+  // rule).
+  {
+    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
+    const float sc = snap_scale[h];
+    out[write_off + row + k] =
+      (half)(clamp(rint(kv_snap_div(lof * cf - hif * sf, sc)), -128.0f, 127.0f) * sc);
+    out[write_off + row + k + half_d] =
+      (half)(clamp(rint(kv_snap_div(hif * cf + lof * sf, sc)), -128.0f, 127.0f) * sc);
+    return;
+  }
+#endif
   if (M == 1 || (M < 32 && (ROPE_TAIL_CONSISTENT == 0 || start_pos == 0))) {
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
     out[write_off + row + k]          = (half)(lof * cf - hif * sf);
@@ -789,10 +835,30 @@ __kernel void rope_inplace_f16(__global const half *in,
     out[write_off + row + k + half_d] = hi * c + lo * s;
   }
 }
+#ifdef KV_SNAP
+// int8-KV trained model: a value row is snapped to its kv head's int8 grid as
+// it is stored, x = clamp(rint(x / s), -128, 127) * s (true division, round
+// half to even), the rule of the CPU snap kernel. Row = row_len values of
+// head_dim each.
+inline half kv_snap_v(half x, const int i, const int row_len,
+                      const int head_dim, __global const float *snap_scale) {
+  const float sc = snap_scale[(i % row_len) / head_dim];
+  return (half)(clamp(rint(kv_snap_div((float)x, sc)), -128.0f, 127.0f) * sc);
+}
+#endif
 __kernel void scatter_copy_f16(__global const half *in, __global half *out,
-                               const int N) {
+                               const int N
+#ifdef KV_SNAP
+                               , const int row_len, const int head_dim,
+                               __global const float *snap_scale
+#endif
+                               ) {
   int i = get_global_id(0);
+#ifdef KV_SNAP
+  if (i < N) out[i] = kv_snap_v(in[i], i, row_len, head_dim, snap_scale);
+#else
   if (i < N) out[i] = in[i];
+#endif
 }
 // Row-offset variant: writes into a STABLE base at out[write_off + i] instead of
 // baking the destination offset into the pointer. write_off (= cache_index *
@@ -801,9 +867,19 @@ __kernel void scatter_copy_f16(__global const half *in, __global half *out,
 // override scalar args but NOT SVM pointers). Same address as the offset-baked
 // pointer form -> byte-identical output.
 __kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
-                                   const int N, const int write_off) {
+                                   const int N, const int write_off
+#ifdef KV_SNAP
+                                   , const int row_len, const int head_dim,
+                                   __global const float *snap_scale
+#endif
+                                   ) {
   int i = get_global_id(0);
+#ifdef KV_SNAP
+  if (i < N)
+    out[write_off + i] = kv_snap_v(in[i], i, row_len, head_dim, snap_scale);
+#else
   if (i < N) out[write_off + i] = in[i];
+#endif
 }
 // Decode-step Q/K/V commit in ONE launch: rope_inplace_f16 over Q (in place),
 // rope_inplace_f16 over K into the key cache at k_write_off, and the flat V
@@ -822,7 +898,12 @@ __kernel void qkv_rope_commit_f16(__global const half *q_in,
                                   __global const half *sin_lut,
                                   const int num_heads_q, const int num_heads_kv,
                                   const int half_d, const int start_pos,
-                                  const int k_write_off, const int v_write_off) {
+                                  const int k_write_off, const int v_write_off
+#ifdef KV_SNAP
+                                  , __global const float *snap_scale,
+                                  __global const float *v_snap_scale
+#endif
+                                  ) {
   const int h = get_global_id(1);
   const int k = get_global_id(2);
   if (k >= half_d) return;
@@ -839,14 +920,31 @@ __kernel void qkv_rope_commit_f16(__global const half *q_in,
     half lo = in[row + k];
     half hi = in[row + k + half_d];
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
-    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
-    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
+    float r0 = lof * cf - hif * sf, r1 = hif * cf + lof * sf;
+#ifdef KV_SNAP
+    if (h >= num_heads_q) { // a key head: snap to its int8 grid (see above)
+      const float sc = snap_scale[hh];
+      r0 = clamp(rint(kv_snap_div(r0, sc)), -128.0f, 127.0f) * sc;
+      r1 = clamp(rint(kv_snap_div(r1, sc)), -128.0f, 127.0f) * sc;
+    }
+#endif
+    out[write_off + row + k]          = (half)r0;
+    out[write_off + row + k + half_d] = (half)r1;
   } else {
     const int hv = h - num_heads_q - num_heads_kv;
     if (hv >= num_heads_kv) return;
     const long row = (long)hv * d;
+#ifdef KV_SNAP
+    // a value head: snapped to its int8 grid as it is stored
+    const float vs = v_snap_scale[hv];
+    v_out[v_write_off + row + k] =
+      (half)(clamp(rint(kv_snap_div((float)v_in[row + k], vs)), -128.0f, 127.0f) * vs);
+    v_out[v_write_off + row + k + half_d] = (half)(
+      clamp(rint(kv_snap_div((float)v_in[row + k + half_d], vs)), -128.0f, 127.0f) * vs);
+#else
     v_out[v_write_off + row + k] = v_in[row + k];
     v_out[v_write_off + row + k + half_d] = v_in[row + k + half_d];
+#endif
   }
 }
 // OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
@@ -957,7 +1055,7 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          unsigned int head_dim, unsigned int start_pos,
                          unsigned int max_positions, bool svm_inputs,
                          void *in_clmem, void *out_clmem, bool drain_svm_out,
-                         unsigned int write_off) {
+                         unsigned int write_off, void *snap_scales) {
   if (M == 0 || num_heads == 0 || head_dim == 0 || (head_dim & 1u))
     return false;
   if (in == nullptr || out == nullptr || cos_lut == nullptr ||
@@ -973,7 +1071,8 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "rope_inplace_f16", ropeCopts());
+    rope_inplace_kernel, "rope_inplace_f16",
+    snap_scales != nullptr ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1070,6 +1169,11 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
       !kp->SetKernelArguments(7, &sp, sizeof(int)) ||
       !kp->SetKernelArguments(8, &woff, sizeof(int)))
     return false;
+  if (snap_scales != nullptr) {
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    if (!kp->SetKernelArguments(9, &sh, sizeof(cl_mem)))
+      return false;
+  }
 
   constexpr size_t LWS_K = 64;
   const size_t kx_pad = (((size_t)half_d + LWS_K - 1) / LWS_K) * LWS_K;
@@ -1164,6 +1268,22 @@ ActStage &act_stage() {
 
 const std::string act_cast_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// x / s rounded to nearest-even exactly like an IEEE division, built from
+// fma only (Markstein): the reciprocal is refined to the correctly rounded
+// 1/s, the quotient gets one residual correction. The snap kernels use it
+// instead of '/' so they need no -cl-fp32-correctly-rounded-divide-sqrt
+// (rejected by some drivers) and still match the CPU snap kernel bit for bit.
+inline float kv_snap_div(const float x, const float s) {
+  float y = 1.0f / s;
+  float e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  const float q = x * y;
+  const float r = fma(-s, q, x);
+  // an exact quotient keeps its own sign (-0 / s is -0)
+  return r == 0.0f ? q : fma(r, y, q);
+}
 __kernel void cast_f32_to_f16(__global const float *in, __global half *out,
                               const int N) {
   const int i = get_global_id(0);
@@ -1175,6 +1295,21 @@ __kernel void cast_f16_to_f32(__global const half *in, __global float *out,
   const int i = get_global_id(0);
   if (i < N)
     out[i] = vload_half(i, in);
+}
+// The narrowing of an int8-KV trained model's value rows: each value is
+// snapped to its kv head's int8 grid before the fp16 store,
+// x = clamp(rint(x / s), -128, 127) * s (true division, round half to even,
+// as the CPU kernel). Row = num_heads * head_dim values.
+__kernel void cast_f32_to_f16_snap(__global const float *in,
+                                   __global half *out, const int N,
+                                   const int head_dim, const int num_heads,
+                                   __global const float *snap_scale) {
+  const int i = get_global_id(0);
+  if (i < N) {
+    const int h = (i % (num_heads * head_dim)) / head_dim;
+    const float sc = snap_scale[h];
+    vstore_half_rte(clamp(rint(kv_snap_div(in[i], sc)), -128.0f, 127.0f) * sc, i, out);
+  }
 }
 )CL";
 
@@ -1262,6 +1397,58 @@ bool gpu_cast_f32_to_f16_cl(const float *in, uint16_t *out, unsigned int N) {
                            const_cast<float *>(in), (size_t)N * sizeof(float));
 }
 
+bool gpu_cast_f32_to_f16_snap_cl(const float *in, uint16_t *out, unsigned int N,
+                                 unsigned int head_dim, unsigned int num_heads,
+                                 void *snap_scales) {
+  if (N == 0 || in == nullptr || out == nullptr || snap_scales == nullptr ||
+      head_dim == 0 || num_heads == 0)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(act_cast_kernel, "cast_f32_to_f16_snap");
+  if (!kp)
+    return false;
+  int Ni = static_cast<int>(N), hd = static_cast<int>(head_dim),
+      nh = static_cast<int>(num_heads);
+  cl_mem sh = static_cast<cl_mem>(snap_scales);
+  float *act = const_cast<float *>(in);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(act);
+  if (!kp->SetKernelSVMArguments(0, in) || !kp->SetKernelSVMArguments(1, out) ||
+      !kp->SetKernelArguments(2, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(3, &hd, sizeof(int)) ||
+      !kp->SetKernelArguments(4, &nh, sizeof(int)) ||
+      !kp->SetKernelArguments(5, &sh, sizeof(cl_mem)))
+    return false;
+  constexpr size_t LWS = 64;
+  std::array<size_t, 3> gws = {(((size_t)N + LWS - 1) / LWS) * LWS, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  blas_cc->command_queue_inst_.enqueueSVMMap(act, (size_t)N * sizeof(float),
+                                             /*read_only=*/true,
+                                             /*event=*/nullptr,
+                                             /*async=*/true);
+  return true;
+}
+
+void *kv_snap_scales_cl(const std::vector<float> &scales) {
+  if (scales.empty())
+    return nullptr;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return nullptr;
+  cl_int err = CL_SUCCESS;
+  cl_mem b = opencl::clCreateBufferT(
+    blas_cc->context_inst_.GetContextNoRetain(),
+    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, scales.size() * sizeof(float),
+    const_cast<float *>(scales.data()), &err);
+  return err == CL_SUCCESS ? b : nullptr;
+}
+
 bool gpu_cast_f16_to_f32_cl(const uint16_t *in, float *out, unsigned int N) {
   return act_cast_dispatch("cast_f16_to_f32", in, out, N, out,
                            (size_t)N * sizeof(float));
@@ -1275,16 +1462,18 @@ bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
                     CL_MEM_READ_WRITE);
 }
 
-bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
-                            void *k_clmem, uint16_t *k_dst,
-                            unsigned int k_write_off, const uint16_t *v,
-                            void *v_clmem, uint16_t *v_dst,
-                            unsigned int v_write_off, const uint16_t *cos_lut,
-                            const uint16_t *sin_lut, unsigned int num_heads_q,
-                            unsigned int num_heads_kv, unsigned int head_dim,
-                            unsigned int start_pos, unsigned int max_positions,
-                            bool flush) {
+bool qkv_rope_commit_f16_cl(
+  const uint16_t *q, void *q_clmem, const uint16_t *k, void *k_clmem,
+  uint16_t *k_dst, unsigned int k_write_off, const uint16_t *v, void *v_clmem,
+  uint16_t *v_dst, unsigned int v_write_off, const uint16_t *cos_lut,
+  const uint16_t *sin_lut, unsigned int num_heads_q, unsigned int num_heads_kv,
+  unsigned int head_dim, unsigned int start_pos, unsigned int max_positions,
+  bool flush, void *snap_scales, void *v_snap_scales) {
   if (num_heads_q == 0 || num_heads_kv == 0 || head_dim == 0 || (head_dim & 1u))
+    return false;
+  // The snapping variant snaps both K and V; a model that snaps only one of
+  // them takes the separate launches.
+  if ((snap_scales == nullptr) != (v_snap_scales == nullptr))
     return false;
   if (q == nullptr || k == nullptr || v == nullptr || k_dst == nullptr ||
       v_dst == nullptr || cos_lut == nullptr || sin_lut == nullptr)
@@ -1298,7 +1487,8 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q_ = blas_cc->command_queue_inst_.GetCommandQueue();
   ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "qkv_rope_commit_f16", ropeCopts());
+    rope_inplace_kernel, "qkv_rope_commit_f16",
+    snap_scales != nullptr ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1350,6 +1540,12 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
         kp->SetKernelArguments(11, &sp, sizeof(int)) &&
         kp->SetKernelArguments(12, &kwo, sizeof(int)) &&
         kp->SetKernelArguments(13, &vwo, sizeof(int));
+  if (okb && snap_scales != nullptr) {
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    cl_mem vh = static_cast<cl_mem>(v_snap_scales);
+    okb = kp->SetKernelArguments(14, &sh, sizeof(cl_mem)) &&
+          kp->SetKernelArguments(15, &vh, sizeof(cl_mem));
+  }
   if (!okb)
     return false;
 
@@ -1375,15 +1571,20 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
 
 bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
                      bool svm_inputs, void *in_clmem, void *out_clmem,
-                     bool drain) {
+                     bool drain, void *snap_scales, unsigned int row_len,
+                     unsigned int head_dim) {
   if (N == 0 || in == nullptr || out == nullptr)
+    return false;
+  const bool snap = snap_scales != nullptr;
+  if (snap && (!svm_inputs || row_len == 0 || head_dim == 0))
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "scatter_copy_f16", ropeCopts());
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16",
+                              snap ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1430,6 +1631,14 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
   int Ni = (int)N;
   if (!kp->SetKernelArguments(2, &Ni, sizeof(int)))
     return false;
+  if (snap) {
+    const int rl = (int)row_len, hd = (int)head_dim;
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    if (!kp->SetKernelArguments(3, &rl, sizeof(int)) ||
+        !kp->SetKernelArguments(4, &hd, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &sh, sizeof(cl_mem)))
+      return false;
+  }
   constexpr size_t LWS = 64;
   const size_t gws_x = (((size_t)N + LWS - 1) / LWS) * LWS;
   std::array<size_t, 3> gws = {gws_x, 1, 1};
@@ -1473,14 +1682,19 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
 // resident). Returns false for the non-SVM (host-readback) shape.
 bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
                          int write_off, bool svm_inputs, void *in_clmem,
-                         void *out_base_clmem, bool drain) {
+                         void *out_base_clmem, bool drain, void *snap_scales,
+                         unsigned int row_len, unsigned int head_dim) {
   if (N == 0 || in == nullptr || out_base == nullptr || !svm_inputs)
+    return false;
+  const bool snap = snap_scales != nullptr;
+  if (snap && (row_len == 0 || head_dim == 0))
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "scatter_copy_f16_row", ropeCopts());
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16_row",
+                              snap ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
   bool okb = true;
@@ -1499,6 +1713,13 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
   int Ni = (int)N;
   okb = okb && kp->SetKernelArguments(2, &Ni, sizeof(int));
   okb = okb && kp->SetKernelArguments(3, &write_off, sizeof(int));
+  if (okb && snap) {
+    const int rl = (int)row_len, hd = (int)head_dim;
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    okb = kp->SetKernelArguments(4, &rl, sizeof(int)) &&
+          kp->SetKernelArguments(5, &hd, sizeof(int)) &&
+          kp->SetKernelArguments(6, &sh, sizeof(cl_mem));
+  }
   if (!okb)
     return false;
   constexpr size_t LWS = 64;
@@ -1554,6 +1775,15 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
     ++gsh;
   if ((rows >> gsh) > max_h)
     return 0;
+  // The kernels carry ONE compile-time KIMG_GSH for the whole process, but
+  // layers of one model can need different shifts (KV heads x rows differ:
+  // e.g. 8 KV heads on the sliding layers, 2 on the full-attention ones).
+  // The published shift therefore only grows -- a larger shift still fits
+  // every smaller need -- and a layer whose mirror was packed with a smaller
+  // shift than the one finally published re-packs it before first use (see
+  // kimg_gsh_published()).
+  if (gsh < g_kimg_gsh)
+    gsh = g_kimg_gsh;
   if (gsh != 0 && g_kimg_gsh != gsh)
     ml_logi("[kimg-pack] K image: %zu rows > device max height %zu; packing "
             "%u rows per image row (KIMG_GSH=%u)",
@@ -1561,6 +1791,8 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
   g_kimg_gsh = gsh;
   return gsh;
 }
+
+unsigned int kimg_gsh_published() { return g_kimg_gsh; }
 
 // The V mirror image's row pitch is the mirror's row capacity, and
 // image2d_from_buffer wants that pitch to be a multiple of
@@ -4487,8 +4719,9 @@ bool flash_attention_prefill_f16_cl(
     // fixed LDS tree). Prefer the tree under the determinism contract unless
     // the user explicitly asked for SG. Cost: the +85% M=1024 attention lever
     // is lost (494 vs 136 ms) — prefill-only.
-    const char *det = std::getenv("NNTR_DETERMINISTIC");
-    if (det && det[0] == '1')
+    // nntr_deterministic(): the variable, or its platform default when unset
+    // (on on the Android gpu engine, see env_compat.h).
+    if (nntr_deterministic())
       return 0;
     return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
   }();
@@ -5257,6 +5490,1522 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
   return true;
 }
 
+// ===========================================================================
+// [afd] Fused split-K flash-decode for M=1 (NNTR_ADRENO_FLASH_DECODE=1).
+//
+// The Adreno image arm decodes with three passes over the K/V image mirrors
+// (qk_band -> softmax -> sv_tm2): a [hQ, 1, N_kv] fp16 score row is written,
+// re-read, normalized and read again, and each pass walks keys serially. This
+// is one pass over the fp16 SVM K/V cache instead:
+//
+//  - afd_partial: one SEGMENT of AFD_L lanes owns one (kv head, key block of
+//    AFD_KPP keys). It loads each key's K row once (16 B per lane, AFD_L lanes
+//    side by side = one coalesced row) and scores it against ALL AFD_G query
+//    heads that share the kv head, keeps an online softmax (running max m and
+//    sum l) per query head, and accumulates P*V in registers. The per-key dot
+//    is reduced across the segment with a fixed xor butterfly of
+//    sub_group_shuffle_xor: no __local tile and no barrier (the Adreno
+//    0842.19.8 driver miscomputes __local tiles at >= 2 work-groups per SP).
+//    It writes one unnormalized partial (m, l, acc[d]) per (block, q head).
+//  - afd_merge: one work-item per (q head, 8 output elements) folds the
+//    partials of its head in block order and writes O (fp16).
+//
+// Deterministic by construction: the block size, the lane split, the butterfly
+// and the merge order are all fixed, so a given (N_kv, window, shape) always
+// adds the same numbers in the same order. The order differs from the image
+// arm's (and from flash_decode_f16_cl's), so outputs are close, not identical.
+// A segment walks the same number of keys whatever its clip (masked keys get
+// p = 0), which keeps every lane of a sub-group in the same control flow
+// around the shuffles.
+// ===========================================================================
+static const std::string afd_kernel_src = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#if defined(AFD_INTEL_SG)
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#define AFD_SG_ATTR __attribute__((intel_reqd_sub_group_size(AFD_INTEL_SG)))
+#elif defined(cl_qcom_reqd_sub_group_size)
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define AFD_SG_ATTR __attribute__((qcom_reqd_sub_group_size("half")))
+#else
+#define AFD_SG_ATTR
+#endif
+
+// -cl-finite-math-only is in the default options: no infinities. Masked
+// scores use this sentinel and an explicit valid flag instead.
+#define AFD_NEG (-1.0e30f)
+#define AFD_NC (AFD_VPL / 8) // half8 chunks per lane
+#define AFD_D (AFD_L * AFD_VPL)
+
+inline float afd_hsum8(const float8 t) {
+  return ((t.s0 + t.s1) + (t.s2 + t.s3)) + ((t.s4 + t.s5) + (t.s6 + t.s7));
+}
+
+// Fixed xor butterfly over the AFD_L lanes of a segment. Lane i and lane i^m
+// add the same two values (a+b == b+a), so every lane ends with the same sum.
+inline float afd_seg_sum(float p) {
+#pragma unroll
+  for (uint m = AFD_L >> 1; m > 0; m >>= 1)
+    p += sub_group_shuffle_xor(p, m);
+  return p;
+}
+
+AFD_SG_ATTR __attribute__((reqd_work_group_size(AFD_WG, 1, 1))) __kernel void
+afd_probe(__global int *out) {
+  if (get_local_id(0) == 0) {
+    out[0] = (int)get_max_sub_group_size();
+    out[1] = (int)get_sub_group_size();
+    out[2] = (int)get_num_sub_groups();
+  }
+}
+
+AFD_SG_ATTR __attribute__((reqd_work_group_size(AFD_WG, 1, 1))) __kernel void
+afd_partial(__global const half *Q, __global const half *K,
+            __global const half *V, __global float *part_acc,
+            __global float *part_ml, const int N_kv, const int HD_KV,
+            const float scale, const int win_start, const int ring_cap,
+            const int part_base, const int n_parts, const int n_kv_heads) {
+  // Logical lane in the work-group, from the sub-group ids (no assumption on
+  // how the driver maps local ids onto sub-groups). The host checked that the
+  // sub-group size is a multiple of AFD_L, so a segment never straddles two
+  // sub-groups and lane = sub-group local id mod AFD_L.
+  const int wl = (int)(get_sub_group_id() * get_max_sub_group_size() +
+                       get_sub_group_local_id());
+  const int seg = (int)get_group_id(0) * (AFD_WG / AFD_L) + wl / AFD_L;
+  const int lane = (int)get_sub_group_local_id() % AFD_L;
+  const bool seg_ok = seg < n_kv_heads * n_parts;
+  const int sc = seg_ok ? seg : 0;
+  const int head_kv = sc / n_parts;
+  const int part_l = sc % n_parts;
+  const int kb = (part_base + part_l) * AFD_KPP; // first key on the abs grid
+  int n_lo = kb > win_start ? kb : win_start;
+  int n_hi = min(kb + AFD_KPP, N_kv);
+  if (!seg_ok)
+    n_hi = n_lo; // no live key: the segment still walks, fully masked
+
+  const long hoff = (long)head_kv * AFD_D;
+  half8 qv[AFD_G][AFD_NC];
+#pragma unroll
+  for (int g = 0; g < AFD_G; ++g)
+#pragma unroll
+    for (int c = 0; c < AFD_NC; ++c)
+      qv[g][c] =
+        vload8(0, Q + (long)(head_kv * AFD_G + g) * AFD_D + (c * AFD_L + lane) * 8);
+
+  float8 acc[AFD_G][AFD_NC];
+  float m_i[AFD_G], l_i[AFD_G];
+#pragma unroll
+  for (int g = 0; g < AFD_G; ++g) {
+    m_i[g] = AFD_NEG;
+    l_i[g] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < AFD_NC; ++c)
+      acc[g][c] = (float8)(0.0f);
+  }
+
+  for (int t0 = kb; t0 < kb + AFD_KPP; t0 += AFD_T) {
+    float s[AFD_T][AFD_G];
+    bool live[AFD_T];
+    long row[AFD_T];
+#pragma unroll
+    for (int j = 0; j < AFD_T; ++j) {
+      const int n = t0 + j;
+      live[j] = (n >= n_lo) && (n < n_hi);
+      // A masked key still reads a real row (its score is discarded).
+      const int nn = min(n, N_kv - 1);
+      row[j] = (long)(ring_cap > 0 ? (nn % ring_cap) : nn) * HD_KV + hoff;
+    }
+#pragma unroll
+    for (int j = 0; j < AFD_T; ++j) {
+      float8 kf[AFD_NC];
+#pragma unroll
+      for (int c = 0; c < AFD_NC; ++c)
+        kf[c] = convert_float8(vload8(0, K + row[j] + (c * AFD_L + lane) * 8));
+#pragma unroll
+      for (int g = 0; g < AFD_G; ++g) {
+        float p = 0.0f;
+#pragma unroll
+        for (int c = 0; c < AFD_NC; ++c)
+          p += afd_hsum8(convert_float8(qv[g][c]) * kf[c]);
+        p = afd_seg_sum(p);
+        s[j][g] = live[j] ? p * scale : AFD_NEG;
+      }
+    }
+    float8 vf[AFD_T][AFD_NC];
+#pragma unroll
+    for (int j = 0; j < AFD_T; ++j)
+#pragma unroll
+      for (int c = 0; c < AFD_NC; ++c)
+        vf[j][c] = convert_float8(vload8(0, V + row[j] + (c * AFD_L + lane) * 8));
+#pragma unroll
+    for (int g = 0; g < AFD_G; ++g) {
+      float mt = m_i[g];
+#pragma unroll
+      for (int j = 0; j < AFD_T; ++j)
+        mt = fmax(mt, s[j][g]);
+      const float alpha = exp(m_i[g] - mt);
+      float lsum = l_i[g] * alpha;
+      float pj[AFD_T];
+#pragma unroll
+      for (int j = 0; j < AFD_T; ++j) {
+        pj[j] = live[j] ? exp(s[j][g] - mt) : 0.0f;
+        lsum += pj[j];
+      }
+#pragma unroll
+      for (int c = 0; c < AFD_NC; ++c) {
+        float8 a = acc[g][c] * alpha;
+#pragma unroll
+        for (int j = 0; j < AFD_T; ++j)
+          a += pj[j] * vf[j][c];
+        acc[g][c] = a;
+      }
+      l_i[g] = lsum;
+      m_i[g] = mt;
+    }
+  }
+
+  if (!seg_ok)
+    return;
+#pragma unroll
+  for (int g = 0; g < AFD_G; ++g) {
+    const long ph = ((long)head_kv * n_parts + part_l) * AFD_G + g;
+#pragma unroll
+    for (int c = 0; c < AFD_NC; ++c)
+      vstore8(acc[g][c], 0, part_acc + ph * AFD_D + (c * AFD_L + lane) * 8);
+    if (lane == 0) {
+      part_ml[ph * 2 + 0] = m_i[g];
+      part_ml[ph * 2 + 1] = l_i[g];
+    }
+  }
+}
+
+// One work-item per (q head, 8 output elements); partials folded in block
+// order. O is fp16 [1, HD_Q].
+__kernel void afd_merge(__global const float *part_acc,
+                        __global const float *part_ml, __global half *O,
+                        const int n_parts, const int n_q_heads) {
+  const int gid = (int)get_global_id(0);
+  const int per = AFD_D / 8;
+  const int hq = gid / per;
+  const int e = gid % per;
+  if (hq >= n_q_heads)
+    return;
+  const int head_kv = hq / AFD_G;
+  const int g = hq % AFD_G;
+  float m_g = AFD_NEG;
+  for (int p = 0; p < n_parts; ++p) {
+    const long ph = ((long)head_kv * n_parts + p) * AFD_G + g;
+    if (part_ml[ph * 2 + 1] > 0.0f)
+      m_g = fmax(m_g, part_ml[ph * 2 + 0]);
+  }
+  float8 acc = (float8)(0.0f);
+  float l_g = 0.0f;
+  for (int p = 0; p < n_parts; ++p) {
+    const long ph = ((long)head_kv * n_parts + p) * AFD_G + g;
+    const float l_p = part_ml[ph * 2 + 1];
+    if (l_p > 0.0f) {
+      const float w = exp(part_ml[ph * 2 + 0] - m_g);
+      acc += w * vload8(0, part_acc + ph * AFD_D + e * 8);
+      l_g += w * l_p;
+    }
+  }
+  const float inv = (l_g > 0.0f) ? (1.0f / l_g) : 0.0f;
+  vstore8(convert_half8(acc * inv), 0, O + (long)hq * AFD_D + e * 8);
+}
+)CL";
+
+namespace {
+struct AfdScratch {
+  void *acc = nullptr, *ml = nullptr, *probe = nullptr;
+  size_t acc_cap = 0, ml_cap = 0, probe_cap = 0;
+  // copts -> 1 usable / 0 refused (sub-group size does not fit, or the
+  // program did not build). Probed once per variant.
+  std::map<std::string, int> verdict;
+};
+AfdScratch &afd_scratch() {
+  static AfdScratch s;
+  return s;
+}
+} // namespace
+
+// NNTR_ADRENO_FLASH_DECODE, value-checked (=0 is the opt-out). Unset, it is on
+// exactly where the reproducible arm is on by default (the Android gpu engine,
+// nntr_deterministic_default_on()) and that arm is in force: the mirror-free
+// arm's decode then never reaches the host. An explicit NNTR_DETERMINISTIC=0
+// there (the image arm) leaves it off, since the fused decode on the image arm
+// is not the validated configuration. Off elsewhere unless set.
+bool flash_decode_gqa_enabled() {
+  static const bool on =
+    nntr_env_on_or("NNTR_ADRENO_FLASH_DECODE",
+                   nntr_deterministic_default_on() && nntr_deterministic());
+  return on;
+}
+
+bool flash_decode_gqa_f16_cl(const uint16_t *Q_svm, const uint16_t *K_svm,
+                             const uint16_t *V_svm, uint16_t *O_svm,
+                             void *o_clmem, unsigned int N_kv,
+                             unsigned int num_heads_Q,
+                             unsigned int num_heads_KV, unsigned int head_dim,
+                             float attn_softcap, unsigned int local_window,
+                             unsigned int ring_cap) {
+  if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || N_kv == 0)
+    return false;
+  if (num_heads_Q % num_heads_KV != 0 || head_dim % 8 != 0)
+    return false;
+  if (attn_softcap > 0.0f)
+    return false; // no score cap in this kernel (Gemma4 has none)
+  const unsigned int G = num_heads_Q / num_heads_KV;
+  if (G > 16)
+    return false;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+  // Intel exposes required sub-group sizes {8,16,32}; Adreno runs a 64-lane
+  // half wave. The segment width is d/8 lanes (one half8 per lane per key)
+  // capped by the sub-group size.
+  const bool intel_sg = ClContext::Global().caps().subgroups;
+  const unsigned int l_cap = intel_sg ? 32u : 64u;
+  unsigned int L = head_dim / 8;
+  if (L > l_cap)
+    L = l_cap;
+  if (L < 8 || (L & (L - 1)) != 0 || head_dim % (8 * L) != 0 ||
+      head_dim / (8 * L) > 4)
+    return false;
+  const unsigned int VPL = head_dim / L;
+  const int kpp = head_dim >= 512 ? 64 : 32;
+  const int T = (G >= 8) ? 2 : 4;
+  const int WG = 64;
+
+  std::string copts =
+    "-DAFD_L=" + std::to_string(L) + " -DAFD_VPL=" + std::to_string(VPL) +
+    " -DAFD_G=" + std::to_string(G) + " -DAFD_KPP=" + std::to_string(kpp) +
+    " -DAFD_T=" + std::to_string(T) + " -DAFD_WG=" + std::to_string(WG);
+  if (intel_sg)
+    copts += " -DAFD_INTEL_SG=" + std::to_string(L < 16 ? 16 : L);
+
+  AfdScratch &sc = afd_scratch();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  auto vit = sc.verdict.find(copts);
+  if (vit != sc.verdict.end() && vit->second == 0)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(afd_kernel_src, "afd_partial", copts);
+  ClContext::SharedPtrClKernel km =
+    blas_cc->registerClKernel(afd_kernel_src, "afd_merge", copts);
+  if (vit == sc.verdict.end()) {
+    // First use of this variant: the segment layout needs every sub-group to
+    // hold whole segments. One blocking probe per variant per process.
+    int ok_v = 0;
+    ClContext::SharedPtrClKernel kpr =
+      blas_cc->registerClKernel(afd_kernel_src, "afd_probe", copts);
+    if (kp && km && kpr &&
+        ensure_cl_stage_buf(&sc.probe, &sc.probe_cap, 4 * sizeof(int))) {
+      cl_mem pm = (cl_mem)sc.probe;
+      int got[4] = {0, 0, 0, 0};
+      std::array<size_t, 1> g1 = {(size_t)WG}, l1 = {(size_t)WG};
+      bool rd = kpr->SetKernelArguments(0, &pm, sizeof(cl_mem));
+      if (rd) {
+        blas_cc->command_queue_inst_.enqueueKernel(
+          kpr->GetKernel(), 1, g1.data(), l1.data(), 0, nullptr, nullptr);
+        rd =
+          opencl::clEnqueueReadBuffer(q, pm, CL_TRUE, 0, 3 * sizeof(int), got,
+                                      0, nullptr, nullptr) == CL_SUCCESS;
+      }
+      if (rd) {
+        const int sgmax = got[0];
+        ok_v = (sgmax > 0 && sgmax % (int)L == 0) ? 1 : 0;
+      }
+      std::fprintf(stderr,
+                   "[AFD] variant L=%u VPL=%u G=%u KPP=%d T=%d intel=%d: "
+                   "sub-group max=%d size=%d num=%d -> %s\n",
+                   L, VPL, G, kpp, T, (int)intel_sg, got[0], got[1], got[2],
+                   ok_v ? "engaged" : "refused");
+    } else {
+      std::fprintf(stderr,
+                   "[AFD] variant L=%u VPL=%u G=%u: program did not build -> "
+                   "refused\n",
+                   L, VPL, G);
+    }
+    sc.verdict[copts] = ok_v;
+    if (!ok_v)
+      return false;
+  }
+  if (!kp || !km)
+    return false;
+
+  const int win_start =
+    (local_window > 0 && local_window < N_kv) ? (int)(N_kv - local_window) : 0;
+  const int part_base = win_start / kpp;
+  const int n_parts = (int)((N_kv + (unsigned int)kpp - 1) / kpp) - part_base;
+  const int segs = (int)num_heads_KV * n_parts;
+  const size_t acc_bytes = (size_t)segs * G * head_dim * sizeof(float);
+  const size_t ml_bytes = (size_t)segs * G * 2 * sizeof(float);
+  if (!ensure_cl_stage_buf(&sc.acc, &sc.acc_cap, acc_bytes) ||
+      !ensure_cl_stage_buf(&sc.ml, &sc.ml_cap, ml_bytes))
+    return false;
+  cl_mem acc_m = (cl_mem)sc.acc, ml_m = (cl_mem)sc.ml;
+
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  int Ni = (int)N_kv, hkv = (int)(num_heads_KV * head_dim);
+  int ws = win_start, rc = (int)ring_cap, pb = part_base, np = n_parts;
+  int nkh = (int)num_heads_KV, nqh = (int)num_heads_Q;
+  if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_svm)) ||
+      !kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_svm)) ||
+      !kp->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_svm)) ||
+      !kp->SetKernelArguments(3, &acc_m, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(4, &ml_m, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(5, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &hkv, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &scale, sizeof(float)) ||
+      !kp->SetKernelArguments(8, &ws, sizeof(int)) ||
+      !kp->SetKernelArguments(9, &rc, sizeof(int)) ||
+      !kp->SetKernelArguments(10, &pb, sizeof(int)) ||
+      !kp->SetKernelArguments(11, &np, sizeof(int)) ||
+      !kp->SetKernelArguments(12, &nkh, sizeof(int)))
+    return false;
+  {
+    const size_t lanes = (size_t)segs * L;
+    std::array<size_t, 1> gws = {(lanes + WG - 1) / WG * WG};
+    std::array<size_t, 1> lws = {(size_t)WG};
+    blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                               lws.data(), 0, nullptr, nullptr);
+  }
+  bool o_ok = km->SetKernelArguments(0, &acc_m, sizeof(cl_mem)) &&
+              km->SetKernelArguments(1, &ml_m, sizeof(cl_mem));
+  if (o_clmem != nullptr) {
+    cl_mem oh = static_cast<cl_mem>(o_clmem);
+    o_ok = o_ok && km->SetKernelArguments(2, &oh, sizeof(cl_mem));
+  } else {
+    o_ok = o_ok && km->SetKernelSVMArguments(2, O_svm);
+  }
+  o_ok = o_ok && km->SetKernelArguments(3, &np, sizeof(int)) &&
+         km->SetKernelArguments(4, &nqh, sizeof(int));
+  if (!o_ok)
+    return false;
+  {
+    const size_t items = (size_t)num_heads_Q * (head_dim / 8);
+    std::array<size_t, 1> gws = {(items + 63) / 64 * 64};
+    std::array<size_t, 1> lws = {64};
+    blas_cc->command_queue_inst_.enqueueKernel(km->GetKernel(), 1, gws.data(),
+                                               lws.data(), 0, nullptr, nullptr);
+  }
+  if (gh_mode() != 0) {
+    attn_gpuhash_note("aq", Q_svm, nullptr, (size_t)num_heads_Q * head_dim * 2,
+                      1);
+    attn_gpuhash_note("ao", O_svm, o_clmem, (size_t)num_heads_Q * head_dim * 2,
+                      1);
+  }
+  return true;
+}
+
+// ===========================================================================
+// [afp] Fused GQA flash prefill (NNTR_ADRENO_FLASH_PREFILL=1).
+//
+// The Adreno image arm runs prefill attention in three passes over the K/V
+// image mirrors (qk_band -> softmax -> sv_tm2): an [hQ, M, N_kv] fp16 score
+// tensor is written, re-read, normalized and read again, and every query head
+// reads its kv head's K/V on its own (gqa times per kv head). This is one pass
+// over the fp16 concat K/V cache instead.
+//
+// One work-group = ONE sub-group of AFP_NL lanes owns one (kv head, tile of
+// AFP_TQ query rows) and serves all AFP_G query heads of that kv head, i.e.
+// AFP_R = AFP_TQ * AFP_G (row, head) pairs; every K/V row is read once per
+// tile for all of them. Keys are walked in blocks of AFP_KB:
+//
+//  - Q.K^T: a step covers AFP_NL / AFP_LPK keys; AFP_LPK neighbouring lanes
+//    share one key and split its head dim (16 B loads, so AFP_LPK lanes read
+//    16 * AFP_LPK contiguous bytes of the K row). Each lane forms partial dots
+//    for the AFP_R pairs; a fixed xor butterfly (sub_group_shuffle_xor) over
+//    the AFP_LPK lanes completes them. AFP_NSTEP steps make a block.
+//  - online softmax per pair: the block max is a fixed xor butterfly over the
+//    whole sub-group; the running sum is kept per lane and reduced once at the
+//    end (same butterfly), so no per-block sum reduction.
+//  - P.V: lanes switch to a column split: AFP_RS row groups x (AFP_NL /
+//    AFP_RS) column slices of AFP_CPL columns, one coalesced V row per key.
+//    The probability of a key reaches the lanes through sub_group_broadcast
+//    (AFP_RS = 1) or sub_group_shuffle (AFP_RS > 1: the AFP_LPK lanes of a
+//    key expose different row groups). P stays fp32, accumulation is fp32.
+//
+// No __local memory and no barrier anywhere (the Adreno 0842.19.8 driver
+// miscomputes __local tiles at >= 2 work-groups per SP). Causal and sliding
+// window masks are block skips plus a per-(key, pair) test inside the
+// boundary blocks; masked keys get p = 0. Deterministic: fixed block size,
+// fixed lane split, fixed butterflies and fixed key order for a given
+// (M, N_kv, window) -- outputs are bit-identical run to run. Not identical to
+// the image arm (which rounds scores and probabilities to fp16) nor to the
+// flash/XMX arms (other summation orders).
+// ===========================================================================
+static const std::string afp_kernel_src = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#if defined(AFP_INTEL_SG)
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#define AFP_SG_ATTR __attribute__((intel_reqd_sub_group_size(AFP_INTEL_SG)))
+#elif defined(cl_qcom_reqd_sub_group_size)
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define AFP_SG_ATTR __attribute__((qcom_reqd_sub_group_size("half")))
+#else
+#define AFP_SG_ATTR
+#endif
+
+// -cl-finite-math-only is in the default options: no infinities. A masked
+// score is this sentinel; anything below AFP_NEG_T counts as masked.
+#define AFP_NEG (-1.0e30f)
+#define AFP_NEG_T (-1.0e29f)
+#define AFP_R (AFP_TQ * AFP_G)          // (row, head) pairs per tile
+#define AFP_KPS (AFP_NL / AFP_LPK)      // keys per Q.K step
+#define AFP_KB (AFP_KPS * AFP_NSTEP)    // keys per block
+#define AFP_NCH (AFP_D / (8 * AFP_LPK)) // half8 chunks per lane per key
+#define AFP_RPL (AFP_R / AFP_RS)        // P.V rows per lane
+#define AFP_CSL (AFP_NL / AFP_RS)       // P.V column slices
+#define AFP_CPL (AFP_D / AFP_CSL)       // P.V columns per lane
+#define AFP_C4 (AFP_CPL / 4)            // float4 accumulators per row
+
+inline float afp_dot8(const float8 a, const float8 b, float acc) {
+  acc = fma(a.s0, b.s0, acc);
+  acc = fma(a.s1, b.s1, acc);
+  acc = fma(a.s2, b.s2, acc);
+  acc = fma(a.s3, b.s3, acc);
+  acc = fma(a.s4, b.s4, acc);
+  acc = fma(a.s5, b.s5, acc);
+  acc = fma(a.s6, b.s6, acc);
+  return fma(a.s7, b.s7, acc);
+}
+
+AFP_SG_ATTR __attribute__((reqd_work_group_size(AFP_NL, 1, 1))) __kernel void
+afp_probe(__global int *out) {
+  if (get_local_id(0) == 0) {
+    out[0] = (int)get_max_sub_group_size();
+    out[1] = (int)get_sub_group_size();
+    out[2] = (int)get_num_sub_groups();
+  }
+}
+
+AFP_SG_ATTR __attribute__((reqd_work_group_size(AFP_NL, 1, 1))) __kernel void
+afp_prefill(__global const half *Q, __global const half *K,
+            __global const half *V, __global half *O, const int M,
+            const int N_kv, const int HD_Q, const int HD_KV, const float scale,
+            const int causal, const int local_window, const int ring_cap,
+            const int n_kv_heads) {
+  const int lane = (int)get_sub_group_local_id();
+  const int n_tiles = (M + AFP_TQ - 1) / AFP_TQ;
+  const int gid = (int)get_group_id(0);
+  // Heaviest (latest) causal tiles first, all kv heads interleaved.
+  const int head_kv = gid % n_kv_heads;
+  const int tile = n_tiles - 1 - gid / n_kv_heads;
+  const int m0 = tile * AFP_TQ;
+  const int q_off = N_kv - M; // absolute position of query row 0
+  const int m_last = min(m0 + AFP_TQ, M) - 1;
+
+  // Key range of the whole tile (block skip); per-pair masks below.
+  int n_end = N_kv;
+  if (causal)
+    n_end = min(N_kv, q_off + m_last + 1);
+  int n_beg = 0;
+  if (local_window > 0) {
+    n_beg = q_off + m0 - local_window + 1;
+    if (n_beg < 0)
+      n_beg = 0;
+    n_beg = (n_beg / AFP_KB) * AFP_KB;
+  }
+
+  // Q.K lane split: key a of a step, d-slice sl.
+  const int ka = lane / AFP_LPK;
+  const int sl = lane % AFP_LPK;
+  // P.V lane split: row group h, column slice cs.
+  const int ph = lane / AFP_CSL;
+  const int cs = lane % AFP_CSL;
+
+  // Q row offsets per pair (rows past M are clamped; never stored).
+  int q_base[AFP_R];
+  int q_pos[AFP_R];
+#pragma unroll
+  for (int r = 0; r < AFP_R; ++r) {
+    const int t = r / AFP_G, g = r % AFP_G;
+    const int m = min(m0 + t, M - 1);
+    q_base[r] = m * HD_Q + (head_kv * AFP_G + g) * AFP_D;
+    q_pos[r] = q_off + m;
+  }
+  const int kv_head_off = head_kv * AFP_D;
+
+  float m_i[AFP_R], l_i[AFP_R];
+#pragma unroll
+  for (int r = 0; r < AFP_R; ++r) {
+    m_i[r] = AFP_NEG;
+    l_i[r] = 0.0f;
+  }
+  float4 acc[AFP_RPL][AFP_C4];
+#pragma unroll
+  for (int i = 0; i < AFP_RPL; ++i)
+#pragma unroll
+    for (int c = 0; c < AFP_C4; ++c)
+      acc[i][c] = (float4)(0.0f);
+
+  for (int kb = n_beg; kb < n_end; kb += AFP_KB) {
+    // ---- scores for AFP_NSTEP steps of AFP_KPS keys. Every Q chunk is
+    // loaded once per block and used against the AFP_NSTEP keys of this
+    // lane; each (step, pair) dot is one sequential fma chain.
+    float s[AFP_NSTEP][AFP_R];
+    long koff[AFP_NSTEP];
+#pragma unroll
+    for (int st = 0; st < AFP_NSTEP; ++st) {
+      const int nn = min(kb + st * AFP_KPS + ka, N_kv - 1);
+      const int prow = ring_cap > 0 ? (nn % ring_cap) : nn;
+      koff[st] = (long)prow * HD_KV + kv_head_off + sl * 8;
+#pragma unroll
+      for (int r = 0; r < AFP_R; ++r)
+        s[st][r] = 0.0f;
+    }
+#pragma unroll
+    for (int c = 0; c < AFP_NCH; ++c) {
+      float8 kf[AFP_NSTEP];
+#pragma unroll
+      for (int st = 0; st < AFP_NSTEP; ++st)
+        kf[st] = convert_float8(vload8(0, K + koff[st] + c * AFP_LPK * 8));
+#pragma unroll
+      for (int r = 0; r < AFP_R; ++r) {
+        const float8 qf =
+          convert_float8(vload8(0, Q + q_base[r] + (c * AFP_LPK + sl) * 8));
+#pragma unroll
+        for (int st = 0; st < AFP_NSTEP; ++st)
+          s[st][r] = afp_dot8(qf, kf[st], s[st][r]);
+      }
+    }
+#pragma unroll
+    for (int st = 0; st < AFP_NSTEP; ++st) {
+      const int n = kb + st * AFP_KPS + ka;
+#pragma unroll
+      for (int r = 0; r < AFP_R; ++r) {
+        float p = s[st][r];
+#pragma unroll
+        for (int msk = AFP_LPK >> 1; msk > 0; msk >>= 1)
+          p += sub_group_shuffle_xor(p, (uint)msk);
+        bool live = n < n_end;
+        if (causal)
+          live = live && (n <= q_pos[r]);
+        if (local_window > 0)
+          live = live && (n + local_window > q_pos[r]);
+        s[st][r] = live ? p * scale : AFP_NEG;
+      }
+    }
+    // ---- online softmax: block max (whole sub-group), rescale, p
+    float alpha[AFP_R];
+#pragma unroll
+    for (int r = 0; r < AFP_R; ++r) {
+      float mx = s[0][r];
+#pragma unroll
+      for (int st = 1; st < AFP_NSTEP; ++st)
+        mx = fmax(mx, s[st][r]);
+#pragma unroll
+      for (int msk = AFP_NL >> 1; msk > 0; msk >>= 1)
+        mx = fmax(mx, sub_group_shuffle_xor(mx, (uint)msk));
+      const float m_new = fmax(m_i[r], mx);
+      alpha[r] = (m_i[r] < AFP_NEG_T) ? 0.0f : exp(m_i[r] - m_new);
+      float lsum = 0.0f;
+#pragma unroll
+      for (int st = 0; st < AFP_NSTEP; ++st) {
+        const float pv = (s[st][r] < AFP_NEG_T) ? 0.0f : exp(s[st][r] - m_new);
+        s[st][r] = pv;
+        lsum += pv;
+      }
+      // one lane per key adds to the running sum
+      l_i[r] = l_i[r] * alpha[r] + (sl == 0 ? lsum : 0.0f);
+      m_i[r] = m_new;
+    }
+    // ---- P.V: this lane's rows (group ph) and columns (slice cs)
+#pragma unroll
+    for (int i = 0; i < AFP_RPL; ++i) {
+      float a = alpha[i];
+#pragma unroll
+      for (int h = 1; h < AFP_RS; ++h)
+        a = (ph == h) ? alpha[h * AFP_RPL + i] : a;
+#pragma unroll
+      for (int c = 0; c < AFP_C4; ++c)
+        acc[i][c] *= a;
+    }
+#pragma unroll
+    for (int st = 0; st < AFP_NSTEP; ++st) {
+      // What this lane exposes to the P.V lanes: the probabilities of the
+      // row group equal to its d-slice index (AFP_RS <= AFP_LPK).
+      float x[AFP_RPL];
+#pragma unroll
+      for (int i = 0; i < AFP_RPL; ++i) {
+        float v = s[st][i];
+#pragma unroll
+        for (int h = 1; h < AFP_RS; ++h)
+          v = (sl == h) ? s[st][h * AFP_RPL + i] : v;
+        x[i] = v;
+      }
+      for (int a = 0; a < AFP_KPS; ++a) {
+        const int n = kb + st * AFP_KPS + a;
+        const int nn = min(n, N_kv - 1);
+        const int prow = ring_cap > 0 ? (nn % ring_cap) : nn;
+        __global const half *vp =
+          V + (long)prow * HD_KV + kv_head_off + cs * AFP_CPL;
+        float4 vf[AFP_C4];
+#pragma unroll
+        for (int c = 0; c < AFP_C4; ++c)
+          vf[c] = convert_float4(vload4(c, vp));
+#pragma unroll
+        for (int i = 0; i < AFP_RPL; ++i) {
+#if AFP_RS == 1
+          const float p = sub_group_broadcast(x[i], (uint)(a * AFP_LPK));
+#else
+          const float p = sub_group_shuffle(x[i], (uint)(a * AFP_LPK + ph));
+#endif
+#pragma unroll
+          for (int c = 0; c < AFP_C4; ++c)
+            acc[i][c] = fma((float4)(p), vf[c], acc[i][c]);
+        }
+      }
+    }
+  }
+
+  // ---- final row sums (fixed butterfly), normalize, store
+#pragma unroll
+  for (int r = 0; r < AFP_R; ++r) {
+    float l = l_i[r];
+#pragma unroll
+    for (int msk = AFP_NL >> 1; msk > 0; msk >>= 1)
+      l += sub_group_shuffle_xor(l, (uint)msk);
+    l_i[r] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < AFP_RPL; ++i) {
+    int r = i;
+    float l = l_i[i];
+#pragma unroll
+    for (int h = 1; h < AFP_RS; ++h) {
+      r = (ph == h) ? (h * AFP_RPL + i) : r;
+      l = (ph == h) ? l_i[h * AFP_RPL + i] : l;
+    }
+    const int t = r / AFP_G, g = r % AFP_G;
+    const int m = m0 + t;
+    if (m >= M)
+      continue;
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    __global half *op =
+      O + (long)m * HD_Q + (head_kv * AFP_G + g) * AFP_D + cs * AFP_CPL;
+#pragma unroll
+    for (int c = 0; c < AFP_C4; ++c)
+      vstore4(convert_half4(acc[i][c] * inv), c, op);
+  }
+}
+)CL";
+
+namespace {
+struct AfpScratch {
+  void *probe = nullptr;
+  size_t probe_cap = 0;
+  // copts -> 1 usable / 0 refused (sub-group layout does not hold, or the
+  // program did not build). Probed once per variant.
+  std::map<std::string, int> verdict;
+};
+AfpScratch &afp_scratch() {
+  static AfpScratch s;
+  return s;
+}
+} // namespace
+
+bool flash_prefill_gqa_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_ADRENO_FLASH_PREFILL");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+bool flash_prefill_gqa_f16_cl(const uint16_t *Q_svm, const uint16_t *K_svm,
+                              const uint16_t *V_svm, uint16_t *O_svm,
+                              void *o_clmem, unsigned int M, unsigned int N_kv,
+                              unsigned int num_heads_Q,
+                              unsigned int num_heads_KV, unsigned int head_dim,
+                              bool causal, float attn_softcap,
+                              unsigned int local_window,
+                              unsigned int ring_cap) {
+  if (M == 0 || N_kv == 0 || M > N_kv || num_heads_Q == 0 ||
+      num_heads_KV == 0 || head_dim == 0)
+    return false;
+  if (num_heads_Q % num_heads_KV != 0 || head_dim % 32 != 0)
+    return false;
+  if (attn_softcap > 0.0f)
+    return false; // no score cap in this kernel (Gemma4 has none)
+  if (ring_cap > 0 && N_kv > ring_cap &&
+      (local_window == 0 || local_window + M > ring_cap))
+    return false; // a ring slot this call reads may already be overwritten
+  const int G = (int)(num_heads_Q / num_heads_KV);
+  if (G > 16)
+    return false;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+
+  // Lanes per work-group = the sub-group: Adreno runs a 64-lane "half" wave
+  // (qcom_reqd_sub_group_size); Intel takes a required size of 32, which is
+  // how the same kernel is checked on Xe.
+  const bool intel_sg = ClContext::Global().caps().subgroups;
+  const int NL = intel_sg ? 32 : 64;
+  // Tile rows: AFP_TQ * G pairs per tile, 8 for both Gemma4-26B layer kinds
+  // (sliding G=2 -> 4 rows, full G=8 -> 1 row).
+  const int TQ = (G >= 8) ? 1 : 8 / G;
+  const int R = TQ * G;
+  const int LPK = 4;
+  const int NSTEP = 2;
+  int RS = 2;
+  auto pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+  if (!pow2(LPK) || LPK > NL || (int)head_dim % (8 * LPK) != 0)
+    return false;
+  if (NSTEP < 1 || NSTEP > 8)
+    return false;
+  if (!pow2(RS) || RS > LPK || R % RS != 0)
+    RS = 1;
+  if (((int)head_dim * RS) % (NL * 4) != 0)
+    RS = 1;
+  if (((int)head_dim) % (NL * 4) != 0 && RS == 1)
+    return false;
+  if (R > 32)
+    return false;
+
+  std::string copts =
+    "-DAFP_NL=" + std::to_string(NL) + " -DAFP_D=" + std::to_string(head_dim) +
+    " -DAFP_G=" + std::to_string(G) + " -DAFP_TQ=" + std::to_string(TQ) +
+    " -DAFP_LPK=" + std::to_string(LPK) +
+    " -DAFP_NSTEP=" + std::to_string(NSTEP) + " -DAFP_RS=" + std::to_string(RS);
+  if (intel_sg)
+    copts += " -DAFP_INTEL_SG=" + std::to_string(NL);
+
+  AfpScratch &sc = afp_scratch();
+  auto vit = sc.verdict.find(copts);
+  if (vit != sc.verdict.end() && vit->second == 0)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(afp_kernel_src, "afp_prefill", copts);
+  if (vit == sc.verdict.end()) {
+    // First use of this variant: the lane math needs the work-group to be
+    // exactly one sub-group of NL lanes. One blocking probe per variant.
+    int ok_v = 0;
+    int got[4] = {0, 0, 0, 0};
+    ClContext::SharedPtrClKernel kpr =
+      blas_cc->registerClKernel(afp_kernel_src, "afp_probe", copts);
+    if (kp && kpr &&
+        ensure_cl_stage_buf(&sc.probe, &sc.probe_cap, 4 * sizeof(int))) {
+      cl_mem pm = (cl_mem)sc.probe;
+      cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+      std::array<size_t, 1> g1 = {(size_t)NL}, l1 = {(size_t)NL};
+      bool rd = kpr->SetKernelArguments(0, &pm, sizeof(cl_mem));
+      if (rd) {
+        blas_cc->command_queue_inst_.enqueueKernel(
+          kpr->GetKernel(), 1, g1.data(), l1.data(), 0, nullptr, nullptr);
+        rd =
+          opencl::clEnqueueReadBuffer(q, pm, CL_TRUE, 0, 3 * sizeof(int), got,
+                                      0, nullptr, nullptr) == CL_SUCCESS;
+      }
+      if (rd)
+        ok_v = (got[1] == NL && got[2] == 1) ? 1 : 0;
+      std::fprintf(stderr,
+                   "[AFP] variant NL=%d d=%u G=%d TQ=%d LPK=%d NSTEP=%d RS=%d "
+                   "intel=%d: sub-group max=%d size=%d num=%d -> %s\n",
+                   NL, head_dim, G, TQ, LPK, NSTEP, RS, (int)intel_sg, got[0],
+                   got[1], got[2], ok_v ? "engaged" : "refused");
+    } else {
+      std::fprintf(stderr,
+                   "[AFP] variant NL=%d d=%u G=%d TQ=%d LPK=%d NSTEP=%d RS=%d: "
+                   "program did not build -> refused\n",
+                   NL, head_dim, G, TQ, LPK, NSTEP, RS);
+    }
+    sc.verdict[copts] = ok_v;
+    if (!ok_v)
+      return false;
+  }
+  if (!kp)
+    return false;
+
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  int Mi = (int)M, Ni = (int)N_kv, hdq = (int)(num_heads_Q * head_dim),
+      hdkv = (int)(num_heads_KV * head_dim), ca = causal ? 1 : 0;
+  int win = (local_window > 0 && local_window < N_kv) ? (int)local_window : 0;
+  int rc = (int)ring_cap, nkh = (int)num_heads_KV;
+  bool ok = kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_svm)) &&
+            kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_svm)) &&
+            kp->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_svm));
+  if (o_clmem != nullptr) {
+    cl_mem oh = static_cast<cl_mem>(o_clmem);
+    ok = ok && kp->SetKernelArguments(3, &oh, sizeof(cl_mem));
+  } else {
+    ok = ok && kp->SetKernelSVMArguments(3, O_svm);
+  }
+  ok = ok && kp->SetKernelArguments(4, &Mi, sizeof(int)) &&
+       kp->SetKernelArguments(5, &Ni, sizeof(int)) &&
+       kp->SetKernelArguments(6, &hdq, sizeof(int)) &&
+       kp->SetKernelArguments(7, &hdkv, sizeof(int)) &&
+       kp->SetKernelArguments(8, &scale, sizeof(float)) &&
+       kp->SetKernelArguments(9, &ca, sizeof(int)) &&
+       kp->SetKernelArguments(10, &win, sizeof(int)) &&
+       kp->SetKernelArguments(11, &rc, sizeof(int)) &&
+       kp->SetKernelArguments(12, &nkh, sizeof(int));
+  if (!ok)
+    return false;
+  const size_t n_tiles = (M + (unsigned int)TQ - 1) / (unsigned int)TQ;
+  std::array<size_t, 1> gws = {n_tiles * num_heads_KV * (size_t)NL};
+  std::array<size_t, 1> lws = {(size_t)NL};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  if (gh_mode() != 0) {
+    attn_gpuhash_note("aq", Q_svm, nullptr,
+                      (size_t)M * num_heads_Q * head_dim * 2, M);
+    attn_gpuhash_note("ao", O_svm, o_clmem,
+                      (size_t)M * num_heads_Q * head_dim * 2, M);
+  }
+  return true;
+}
+
+// ===========================================================================
+// [apa] Three-pass prefill attention over the fp16 concat K/V cache
+// (NNTR_ADRENO_PREFILL_ATTN=1).
+//
+// The mirror-free arm (NNTR_DETERMINISTIC=1) has no K/V image mirrors, and on
+// Adreno none of the buffer-arm prefill kernels takes Gemma4's d = 256 / 512:
+// flash_attention_prefill_f16_cl declines d > 128 off the Intel buffer path,
+// and two_conv_attention_prefill_f16_cl is gated off (and knows no window,
+// chunk offset or softcap). The prefill attention therefore ran on the host.
+//
+// This is the image arm's own chain (qk_matmul_f16_ohwi_img_band ->
+// softmax_row_band_f16 -> sv_matmul_f16_ohwi_img_tm2) with BUFFER operands:
+//
+//  - apa_qk_band: one thread computes APA_TM query rows x APA_TN keys of one
+//    query head, fp32 dot over half8 chunks (dot(lo) + dot(hi) per chunk, as
+//    the image kernel), scale, softcap, mask, fp32 score. K rows are read with
+//    vload8 from the concat slab (row n at n * HD_KV + head_kv * d, ring-mapped
+//    n % ring_cap), not from the OHWI K image. The grid covers each m-tile's
+//    score band (the same tca_score_band() contract as the image arm).
+//  - apa_softmax_band_f32: the image arm's softmax_row_band_f16 (band mode 1:
+//    the row pair's band, 64-aligned floor, 64-wide LDS tree) over fp32
+//    scores; e and p stay fp32.
+//  - apa_sv_tm2: one thread computes the row pair (m0, m0 + 1) x 8 output
+//    channels; per 8-key block it loads the two score half8s and the 8 keys'
+//    V half8s (channels x0..x0+7 of each V row, coalesced across the x
+//    threads) and accumulates in fp32. It reads only cells inside the pair's
+//    band, like the image kernel.
+//
+// fp32 scores, not the image arm's fp16 ones. Gemma4's scaled scores reach
+// ~25, where an fp16 score is off by up to 2^-7 and every probability by up
+// to ~0.8 %. Measured on the 1K P4 cell (Adreno 840, layer prefill dumps
+// against an f64 recomputation from the same Q/K/V): the fp16 chain's O is off
+// by up to 2.2e-2..4.3e-2 (mean 1.4e-4..3.3e-4) -- exactly the fp16-score
+// family's own error, and still half the host fp16 path's -- and that was
+// enough to send the greedy 26B-A4B continuation into a repetition loop with
+// no end of turn. With fp32 scores O sits at the fp16 output rounding floor
+// (max 3.9e-3..7.8e-3 for |O| up to 21, mean 5e-5..8e-5) and the text ends
+// cleanly. NNTR_APA_F32=0 keeps the fp16 chain (the image arm's numerics and
+// its own softmax_row_band_f16) for A/B.
+//
+// Masked scores are written as -65504 (fp16 lowest) instead of -INFINITY: the
+// default options carry -cl-finite-math-only, and exp(-65504 - max) is +0.0
+// in fp32 for every real row max, so the softmax output is the same.
+//
+// Every output element depends only on its own row's inputs in a fixed order,
+// so the result is bit-identical run to run and also independent of how the
+// rows are split into launches (the scores scratch is bounded by
+// NNTR_APA_SCORES_MB; a split starts on a multiple of 64 rows, which keeps the
+// qk tiles and the softmax/sv row pairs where they are). No image read (the
+// slab is written through buffers, and an image view of it would reopen the
+// stale-texel hazard this driver has), no sub-group operation, no __local
+// memory in the qk/sv K loops. The softmax's row reduction is the image arm's
+// LDS tree, unchanged.
+// ===========================================================================
+static const std::string apa_kernel_src = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifndef APA_TM
+#define APA_TM 4
+#endif
+#ifndef APA_TN
+#define APA_TN 8
+#endif
+// = SOFTMAX_LWS of softmax_row_band_f16: the band floor alignment.
+#define APA_BAND_ALIGN 64
+#define APA_MASKED (-65504.0f)
+// APA_F32 (the default): fp32 scores / probabilities in the scratch, softmax
+// apa_softmax_band_f32. Without it: fp16, the image arm's numerics.
+#ifdef APA_F32
+typedef float apa_s_t;
+typedef float8 apa_s8_t;
+#define APA_S8_F(x) (x)
+#else
+typedef half apa_s_t;
+typedef half8 apa_s8_t;
+#define APA_S8_F(x) convert_float8(x)
+#endif
+
+// Same integer arithmetic as tca_score_band() in two_conv_attention.cl.
+static inline void apa_score_band(const int M, const int N_kv,
+                                  const int causal, const int local_window,
+                                  const int pair_lo, const int pair_hi,
+                                  const int align_lo, int *n_lo, int *n_hi) {
+  int lo = 0;
+  int hi = N_kv;
+  if (causal) {
+    const int q_off = N_kv - M;
+    int tex_hi = (N_kv + 7) >> 3;
+    const int tex_hi_causal = ((q_off + pair_hi) >> 3) + 1;
+    if (tex_hi_causal < tex_hi)
+      tex_hi = tex_hi_causal;
+    if (local_window > 0) {
+      const int n_first = q_off + pair_lo - local_window + 1;
+      int t0 = 0;
+      if (n_first > 0)
+        t0 = n_first >> 3;
+      if (t0 > tex_hi)
+        t0 = tex_hi;
+      lo = t0 << 3;
+      if (align_lo > 1)
+        lo = lo & ~(align_lo - 1);
+    }
+    hi = tex_hi << 3;
+    if (hi > N_kv)
+      hi = N_kv;
+  }
+  if (lo > hi)
+    lo = hi;
+  *n_lo = lo;
+  *n_hi = hi;
+}
+
+static inline int apa_row(const int n, const int ring_cap) {
+  return ring_cap > 0 ? n % ring_cap : n;
+}
+
+// The read-only operands are `const restrict` (they never alias the output),
+// which lets the compiler take its read-only load path for them.
+// gws = (n-tiles of the widest band, ceil(M / APA_TM), num_heads_Q)
+__kernel void apa_qk_band(__global const half *restrict Q,
+                          __global const half *restrict K,
+                          __global apa_s_t *restrict scores, const int M,
+                          const int N_kv,
+                          const int q_row0, const int d, const int HD_Q,
+                          const int HD_KV, const int gqa, const int causal,
+                          const float scale, const float softcap,
+                          const int local_window, const int ring_cap) {
+  const int m0 = (int)get_global_id(1) * APA_TM;
+  const int head_q = (int)get_global_id(2);
+  const int head_kv = head_q / gqa;
+  if (m0 >= M)
+    return;
+  int band_lo, band_hi;
+  {
+    const int mlast = (m0 + APA_TM - 1 < M - 1) ? (m0 + APA_TM - 1) : (M - 1);
+    apa_score_band(M, N_kv, causal, local_window, m0, mlast, APA_BAND_ALIGN,
+                   &band_lo, &band_hi);
+  }
+  const int n0 = band_lo + (int)get_global_id(0) * APA_TN;
+  if (n0 >= band_hi || n0 >= N_kv)
+    return;
+  const int q_off = N_kv - M;
+  const long sb = (long)head_q * (long)M * (long)N_kv;
+
+  // Whole tile masked (above the causal diagonal, or below every row's
+  // window floor): no dot products.
+  if (causal && (n0 > q_off + m0 + (APA_TM - 1) ||
+                 (local_window > 0 &&
+                  (n0 + APA_TN - 1) + local_window <= q_off + m0))) {
+#pragma unroll
+    for (int i = 0; i < APA_TM; i++) {
+      const int m = m0 + i;
+      if (m >= M)
+        continue;
+#pragma unroll
+      for (int j = 0; j < APA_TN; j++) {
+        const int n = n0 + j;
+        if (n < N_kv)
+          scores[sb + (long)m * N_kv + n] = (apa_s_t)APA_MASKED;
+      }
+    }
+    return;
+  }
+
+  // Row offsets (rows past M / keys past N_kv are clamped to valid ones and
+  // never stored).
+  int qoff[APA_TM];
+#pragma unroll
+  for (int i = 0; i < APA_TM; i++) {
+    const int m = (m0 + i < M) ? (m0 + i) : (M - 1);
+    qoff[i] = (q_row0 + m) * HD_Q + head_q * d;
+  }
+  int koff[APA_TN];
+#pragma unroll
+  for (int j = 0; j < APA_TN; j++) {
+    const int n = (n0 + j < N_kv) ? (n0 + j) : (N_kv - 1);
+    koff[j] = apa_row(n, ring_cap) * HD_KV + head_kv * d;
+  }
+
+  float acc[APA_TM][APA_TN];
+#pragma unroll
+  for (int i = 0; i < APA_TM; i++)
+#pragma unroll
+    for (int j = 0; j < APA_TN; j++)
+      acc[i][j] = 0.0f;
+
+  for (int x = 0; x < d; x += 8) {
+    half8 qp[APA_TM];
+    half8 kp[APA_TN];
+#pragma unroll
+    for (int i = 0; i < APA_TM; i++)
+      qp[i] = vload8(0, Q + qoff[i] + x);
+#pragma unroll
+    for (int j = 0; j < APA_TN; j++)
+      kp[j] = vload8(0, K + koff[j] + x);
+#pragma unroll
+    for (int i = 0; i < APA_TM; i++) {
+      const float4 qlo = convert_float4(qp[i].s0123);
+      const float4 qhi = convert_float4(qp[i].s4567);
+#pragma unroll
+      for (int j = 0; j < APA_TN; j++) {
+        const float4 klo = convert_float4(kp[j].s0123);
+        const float4 khi = convert_float4(kp[j].s4567);
+        acc[i][j] += dot(qlo, klo) + dot(qhi, khi);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < APA_TM; i++) {
+    const int m = m0 + i;
+    if (m >= M)
+      continue;
+#pragma unroll
+    for (int j = 0; j < APA_TN; j++) {
+      const int n = n0 + j;
+      if (n >= N_kv)
+        continue;
+      float v = acc[i][j] * scale;
+      if (softcap > 0.0f)
+        v = softcap * tanh(v / softcap);
+      if (causal && (n > q_off + m ||
+                     (local_window > 0 && n + local_window <= q_off + m)))
+        v = APA_MASKED;
+      scores[sb + (long)m * N_kv + n] = (apa_s_t)v;
+    }
+  }
+}
+
+#ifdef APA_F32
+// The image arm's softmax_row_band_f16 (band mode 1: the row pair's band with
+// a 64-aligned floor, a 64-wide LDS tree for the max and the sum) over fp32
+// scores: e = exp(s - max) and p = e / sum stay fp32. gws = (64, M, H).
+__attribute__((reqd_work_group_size(APA_BAND_ALIGN, 1, 1))) __kernel void
+apa_softmax_band_f32(__global float *scores, const int M, const int N_kv,
+                     const int causal, const int local_window) {
+  const int tid = get_local_id(0);
+  const int m = get_group_id(1);
+  const int h = get_group_id(2);
+  if (m >= M)
+    return;
+  __global float *row = scores + (long)h * (long)M * N_kv + (long)m * N_kv;
+  int n_lo, n_hi;
+  {
+    const int mlo = m & ~1;
+    const int mhi = (mlo + 1 < M) ? (mlo + 1) : (M - 1);
+    apa_score_band(M, N_kv, causal, local_window, mlo, mhi, APA_BAND_ALIGN,
+                   &n_lo, &n_hi);
+  }
+  __local float lscratch[APA_BAND_ALIGN];
+  float pmax = APA_MASKED;
+  for (int n = n_lo + tid; n < n_hi; n += APA_BAND_ALIGN)
+    pmax = fmax(pmax, row[n]);
+  lscratch[tid] = pmax;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = APA_BAND_ALIGN / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lscratch[tid] = fmax(lscratch[tid], lscratch[tid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float row_max = lscratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float psum = 0.0f;
+  for (int n = n_lo + tid; n < n_hi; n += APA_BAND_ALIGN) {
+    const float e = exp(row[n] - row_max);
+    row[n] = e;
+    psum += e;
+  }
+  lscratch[tid] = psum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = APA_BAND_ALIGN / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lscratch[tid] += lscratch[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float row_sum = lscratch[0];
+  const float inv = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+  for (int n = n_lo + tid; n < n_hi; n += APA_BAND_ALIGN)
+    row[n] = row[n] * inv;
+}
+#endif
+
+// gws = (d / 8, ceil(M / 2), num_heads_Q)
+__kernel void apa_sv_tm2(__global const apa_s_t *restrict scores,
+                         __global const half *restrict V,
+                         __global half *restrict O, const int M, const int N_kv,
+                         const int q_row0, const int d, const int HD_Q,
+                         const int HD_KV, const int gqa, const int causal,
+                         const int local_window, const int ring_cap) {
+  const int x0 = (int)get_global_id(0) * 8;
+  const int m0 = (int)get_global_id(1) * 2;
+  const int head_q = (int)get_global_id(2);
+  if (m0 >= M || x0 >= d)
+    return;
+  const int m1 = m0 + 1;
+  const int has1 = (m1 < M);
+  const int head_kv = head_q / gqa;
+  const long sb0 = (long)head_q * (long)M * (long)N_kv + (long)m0 * (long)N_kv;
+  const long sb1 = sb0 + (has1 ? (long)N_kv : 0L);
+  // Key range of the row pair: the causal cap of m1 and the window floor of
+  // m0, in 8-key blocks -- the cells the pair's softmax band normalised.
+  int n_tex1 = (N_kv + 7) >> 3;
+  int n_tex0 = 0;
+  if (causal) {
+    const int q_off = N_kv - M;
+    const int cap_m = has1 ? m1 : m0;
+    const int tex_causal = ((q_off + cap_m) >> 3) + 1;
+    if (tex_causal < n_tex1)
+      n_tex1 = tex_causal;
+    if (local_window > 0) {
+      const int n_first = q_off + m0 - local_window + 1;
+      if (n_first > 0)
+        n_tex0 = n_first >> 3;
+      if (n_tex0 > n_tex1)
+        n_tex0 = n_tex1;
+    }
+  }
+  const int vcol = head_kv * d + x0;
+
+  float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
+  for (int t = n_tex0; t < n_tex1; t++) {
+    const int n0 = t * 8;
+    apa_s8_t s0, s1;
+    if (n0 + 8 <= N_kv) {
+      s0 = vload8(0, scores + sb0 + n0);
+      s1 = vload8(0, scores + sb1 + n0);
+    } else {
+      // Tail block: no private array (this driver demotes dynamically
+      // addressed private arrays to __local), element by element.
+#define APA_S(sb, k)                                                           \
+  ((n0 + (k) < N_kv) ? scores[(sb) + n0 + (k)] : (apa_s_t)0)
+      s0 = (apa_s8_t)(APA_S(sb0, 0), APA_S(sb0, 1), APA_S(sb0, 2),
+                      APA_S(sb0, 3), APA_S(sb0, 4), APA_S(sb0, 5),
+                      APA_S(sb0, 6), APA_S(sb0, 7));
+      s1 = (apa_s8_t)(APA_S(sb1, 0), APA_S(sb1, 1), APA_S(sb1, 2),
+                      APA_S(sb1, 3), APA_S(sb1, 4), APA_S(sb1, 5),
+                      APA_S(sb1, 6), APA_S(sb1, 7));
+#undef APA_S
+    }
+    const int nl = N_kv - 1;
+    const float8 v0 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 0, nl), ring_cap) * HD_KV + vcol));
+    const float8 v1 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 1, nl), ring_cap) * HD_KV + vcol));
+    const float8 v2 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 2, nl), ring_cap) * HD_KV + vcol));
+    const float8 v3 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 3, nl), ring_cap) * HD_KV + vcol));
+    const float8 v4 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 4, nl), ring_cap) * HD_KV + vcol));
+    const float8 v5 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 5, nl), ring_cap) * HD_KV + vcol));
+    const float8 v6 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 6, nl), ring_cap) * HD_KV + vcol));
+    const float8 v7 = convert_float8(
+      vload8(0, V + apa_row(min(n0 + 7, nl), ring_cap) * HD_KV + vcol));
+    const float8 p0 = APA_S8_F(s0);
+    const float8 p1 = APA_S8_F(s1);
+    acc0 += ((p0.s0 * v0 + p0.s1 * v1) + (p0.s2 * v2 + p0.s3 * v3)) +
+            ((p0.s4 * v4 + p0.s5 * v5) + (p0.s6 * v6 + p0.s7 * v7));
+    acc1 += ((p1.s0 * v0 + p1.s1 * v1) + (p1.s2 * v2 + p1.s3 * v3)) +
+            ((p1.s4 * v4 + p1.s5 * v5) + (p1.s6 * v6 + p1.s7 * v7));
+  }
+  vstore8(convert_half8(acc0), 0, O + (long)(q_row0 + m0) * HD_Q +
+                                     (long)head_q * d + x0);
+  if (has1)
+    vstore8(convert_half8(acc1), 0, O + (long)(q_row0 + m1) * HD_Q +
+                                       (long)head_q * d + x0);
+}
+)CL";
+
+namespace {
+struct ApaScratch {
+  // copts -> kernel handles (registerClKernel's own lookup is not free on a
+  // per-layer call), and the shapes already announced.
+  std::map<std::string, ClContext::SharedPtrClKernel> qk, sv, sm;
+  std::map<std::string, int> verdict; // copts -> 1 built / 0 did not build
+  std::map<std::string, int> logged;  // shape key -> announced
+};
+ApaScratch &apa_scratch() {
+  static ApaScratch s;
+  return s;
+}
+int apa_env_int(const char *name, int dflt) {
+  const char *e = std::getenv(name);
+  return (e != nullptr && e[0] != '\0') ? std::atoi(e) : dflt;
+}
+} // namespace
+
+// NNTR_ADRENO_PREFILL_ATTN, value-checked (=0 is the opt-out). Unset, it has
+// the same default as NNTR_ADRENO_FLASH_DECODE above: on where the
+// reproducible arm is on by default and in force (the Android gpu engine), so
+// the mirror-free arm's prefill attention runs on the GPU instead of the host.
+bool prefill_attn_apa_enabled() {
+  static const bool on =
+    nntr_env_on_or("NNTR_ADRENO_PREFILL_ATTN",
+                   nntr_deterministic_default_on() && nntr_deterministic());
+  return on;
+}
+
+bool prefill_attn_apa_f16_cl(const uint16_t *Q_svm, const uint16_t *K_svm,
+                             const uint16_t *V_svm, uint16_t *O_svm,
+                             void *o_clmem, unsigned int M, unsigned int N_kv,
+                             unsigned int num_heads_Q,
+                             unsigned int num_heads_KV, unsigned int head_dim,
+                             bool causal, float attn_softcap,
+                             unsigned int local_window, unsigned int ring_cap) {
+  if (M == 0 || N_kv == 0 || M > N_kv || num_heads_Q == 0 ||
+      num_heads_KV == 0 || head_dim == 0)
+    return false;
+  if (num_heads_Q % num_heads_KV != 0 || head_dim % 8 != 0)
+    return false;
+  const unsigned int win =
+    (local_window > 0 && local_window < N_kv) ? local_window : 0u;
+  // The band reads keys from a 64-aligned floor below the first row's window
+  // floor (their scores are masked) and the newest key of the call; with a
+  // ring every one of those slots must still hold its own row or a row the
+  // mask zeroes -- the same refusal as the fused prefill.
+  if (ring_cap > 0 && N_kv > ring_cap && (win == 0 || win + M > ring_cap))
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+
+  // Each qk work-item computes TM query rows x TN keys.
+  const int TM = 4;
+  const int TN = 8;
+  // Work-group shapes from a screen on the Adreno 840 at the 1K cell (wall
+  // time of the 25 sliding + 5 full calls, fp32 scores): qk 4 key tiles x 16
+  // row tiles and sv 32 channel groups x 2 row pairs give ~510-525 ms against
+  // ~740-750 ms for 8,8,1 / 8,8,1 (the image arm's shapes). sv takes 32
+  // channel groups only when d / 8 has them; the result does not depend on the
+  // shapes (every element is computed in a fixed order by one work-item).
+  const std::array<size_t, 3> qk_lws = {4, 16, 1};
+  const std::array<size_t, 3> sv_lws = head_dim / 8 >= 32
+                                         ? std::array<size_t, 3>{32, 2, 1}
+                                         : std::array<size_t, 3>{8, 8, 1};
+  // Scores scratch budget (MiB). Read per call so a test can split one call
+  // into several row blocks; the result does not depend on the split.
+  long budget_mb = apa_env_int("NNTR_APA_SCORES_MB", 48);
+  if (budget_mb <= 0)
+    budget_mb = 48;
+  const size_t budget = (size_t)budget_mb << 20;
+
+  // fp32 scores (default; NNTR_APA_F32=0 = the image arm's fp16 scores and
+  // its softmax_row_band_f16). Read per call, like the budget, so a test can
+  // run both.
+  const bool f32 = apa_env_int("NNTR_APA_F32", 1) != 0;
+  const std::string copts = "-DAPA_TM=" + std::to_string(TM) +
+                            " -DAPA_TN=" + std::to_string(TN) +
+                            (f32 ? " -DAPA_F32" : "");
+  const std::string sm_copts = f32 ? copts : tca_copts();
+  const size_t s_bytes = f32 ? 4u : 2u;
+  constexpr unsigned int SOFTMAX_LWS = 64; // softmax_row_band_f16
+
+  std::lock_guard<std::mutex> lock(tca_mtx());
+  ApaScratch &as = apa_scratch();
+  {
+    auto vit = as.verdict.find(copts);
+    if (vit != as.verdict.end() && vit->second == 0)
+      return false;
+  }
+  ClContext::SharedPtrClKernel &kqk = as.qk[copts];
+  ClContext::SharedPtrClKernel &ksv = as.sv[copts];
+  ClContext::SharedPtrClKernel &ksm = as.sm[sm_copts];
+  if (!kqk)
+    kqk = blas_cc->registerClKernel(apa_kernel_src, "apa_qk_band", copts);
+  if (!ksv)
+    ksv = blas_cc->registerClKernel(apa_kernel_src, "apa_sv_tm2", copts);
+  if (!ksm)
+    ksm = f32 ? blas_cc->registerClKernel(apa_kernel_src,
+                                          "apa_softmax_band_f32", sm_copts)
+              : blas_cc->registerClKernel(two_conv_attention_kernel,
+                                          "softmax_row_band_f16", sm_copts);
+  if (!kqk || !ksv || !ksm) {
+    if (as.verdict.find(copts) == as.verdict.end())
+      std::fprintf(stderr,
+                   "[APA] TM=%d TN=%d: program did not build (qk=%d sv=%d "
+                   "softmax=%d) -> refused\n",
+                   TM, TN, (int)(bool)kqk, (int)(bool)ksv, (int)(bool)ksm);
+    as.verdict[copts] = 0;
+    return false;
+  }
+  as.verdict[copts] = 1;
+
+  // Row blocks: the whole call when its scores fit the budget, else blocks of
+  // a multiple of 64 rows (the last block has the widest key span N_kv).
+  const size_t row_bytes = (size_t)num_heads_Q * (size_t)N_kv * s_bytes;
+  unsigned int rows_per = M;
+  if (row_bytes * (size_t)M > budget) {
+    rows_per = (unsigned int)(budget / row_bytes) & ~63u;
+    if (rows_per < 64u)
+      rows_per = 64u;
+    if (rows_per > M)
+      rows_per = M;
+  }
+  TcaScratch &sc = tca_scratch();
+  cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
+  if (!tca_ensure(ctx, &sc.scores, &sc.scores_bytes,
+                  row_bytes * (size_t)rows_per, CL_MEM_READ_WRITE))
+    return false;
+  cl_mem scores_buf = sc.scores;
+
+  const int d = (int)head_dim, HDq = (int)(num_heads_Q * head_dim),
+            HDkv = (int)(num_heads_KV * head_dim),
+            gqa = (int)(num_heads_Q / num_heads_KV), ca = causal ? 1 : 0,
+            lw = (int)win, rc = (int)ring_cap, bmode = 1;
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  const unsigned int q_off_all = N_kv - M;
+
+  auto pad = [](size_t v, size_t l) { return ((v + l - 1) / l) * l; };
+  bool ok = true;
+  unsigned int blocks = 0;
+  for (unsigned int a = 0; ok && a < M; a += rows_per) {
+    const unsigned int b = std::min(M, a + rows_per);
+    const int Ms = (int)(b - a), Ns = (int)(q_off_all + b), q0 = (int)a;
+    ++blocks;
+    // ---- qk over each m-tile's score band.
+    {
+      size_t nx = 0;
+      for (int m0 = 0; m0 < Ms; m0 += TM) {
+        const int ml = std::min(m0 + TM - 1, Ms - 1);
+        int blo = 0, bhi = 0;
+        tca_score_band_host(Ms, Ns, ca, lw, m0, ml, (int)SOFTMAX_LWS, &blo,
+                            &bhi);
+        if (bhi > blo)
+          nx = std::max(nx, (size_t)((bhi - blo + TN - 1) / TN));
+      }
+      if (nx == 0)
+        nx = 1;
+      const size_t mx = ((size_t)Ms + TM - 1) / TM;
+      std::array<size_t, 3> gws = {pad(nx, qk_lws[0]), pad(mx, qk_lws[1]),
+                                   pad(num_heads_Q, qk_lws[2])};
+      ok = kqk->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_svm)) &&
+           kqk->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_svm)) &&
+           kqk->SetKernelArguments(2, &scores_buf, sizeof(cl_mem)) &&
+           kqk->SetKernelArguments(3, &Ms, sizeof(int)) &&
+           kqk->SetKernelArguments(4, &Ns, sizeof(int)) &&
+           kqk->SetKernelArguments(5, &q0, sizeof(int)) &&
+           kqk->SetKernelArguments(6, &d, sizeof(int)) &&
+           kqk->SetKernelArguments(7, &HDq, sizeof(int)) &&
+           kqk->SetKernelArguments(8, &HDkv, sizeof(int)) &&
+           kqk->SetKernelArguments(9, &gqa, sizeof(int)) &&
+           kqk->SetKernelArguments(10, &ca, sizeof(int)) &&
+           kqk->SetKernelArguments(11, &scale, sizeof(float)) &&
+           kqk->SetKernelArguments(12, &attn_softcap, sizeof(float)) &&
+           kqk->SetKernelArguments(13, &lw, sizeof(int)) &&
+           kqk->SetKernelArguments(14, &rc, sizeof(int));
+      if (!ok)
+        break;
+      // gws.z is padded only if lws.z > 1; heads past num_heads_Q would read
+      // past Q, so the z extent must stay exact.
+      if (gws[2] != num_heads_Q) {
+        ok = false;
+        break;
+      }
+      blas_cc->command_queue_inst_.enqueueKernel(
+        kqk->GetKernel(), 3, gws.data(), qk_lws.data(), 0, nullptr, nullptr);
+    }
+    // ---- softmax over each row pair's band (the image arm's kernel).
+    {
+      ok = ksm->SetKernelArguments(0, &scores_buf, sizeof(cl_mem)) &&
+           ksm->SetKernelArguments(1, &Ms, sizeof(int)) &&
+           ksm->SetKernelArguments(2, &Ns, sizeof(int)) &&
+           ksm->SetKernelArguments(3, &ca, sizeof(int)) &&
+           ksm->SetKernelArguments(4, &lw, sizeof(int)) &&
+           (f32 || ksm->SetKernelArguments(5, &bmode, sizeof(int)));
+      if (!ok)
+        break;
+      std::array<size_t, 3> gws = {SOFTMAX_LWS, (size_t)Ms, num_heads_Q};
+      std::array<size_t, 3> lws = {SOFTMAX_LWS, 1, 1};
+      blas_cc->command_queue_inst_.enqueueKernel(
+        ksm->GetKernel(), 3, gws.data(), lws.data(), 0, nullptr, nullptr);
+    }
+    // ---- P*V for each row pair x 8 channels.
+    {
+      const size_t dx = (size_t)d / 8, pairs = ((size_t)Ms + 1) / 2;
+      std::array<size_t, 3> gws = {pad(dx, sv_lws[0]), pad(pairs, sv_lws[1]),
+                                   pad(num_heads_Q, sv_lws[2])};
+      if (gws[2] != num_heads_Q) {
+        ok = false;
+        break;
+      }
+      ok = ksv->SetKernelArguments(0, &scores_buf, sizeof(cl_mem)) &&
+           ksv->SetKernelSVMArguments(1, const_cast<uint16_t *>(V_svm));
+      if (ok && o_clmem != nullptr) {
+        cl_mem oh = static_cast<cl_mem>(o_clmem);
+        ok = ksv->SetKernelArguments(2, &oh, sizeof(cl_mem));
+      } else if (ok) {
+        ok = ksv->SetKernelSVMArguments(2, O_svm);
+      }
+      ok = ok && ksv->SetKernelArguments(3, &Ms, sizeof(int)) &&
+           ksv->SetKernelArguments(4, &Ns, sizeof(int)) &&
+           ksv->SetKernelArguments(5, &q0, sizeof(int)) &&
+           ksv->SetKernelArguments(6, &d, sizeof(int)) &&
+           ksv->SetKernelArguments(7, &HDq, sizeof(int)) &&
+           ksv->SetKernelArguments(8, &HDkv, sizeof(int)) &&
+           ksv->SetKernelArguments(9, &gqa, sizeof(int)) &&
+           ksv->SetKernelArguments(10, &ca, sizeof(int)) &&
+           ksv->SetKernelArguments(11, &lw, sizeof(int)) &&
+           ksv->SetKernelArguments(12, &rc, sizeof(int));
+      if (!ok)
+        break;
+      blas_cc->command_queue_inst_.enqueueKernel(
+        ksv->GetKernel(), 3, gws.data(), sv_lws.data(), 0, nullptr, nullptr);
+    }
+  }
+  if (!ok) {
+    // Something was refused after a launch may have been enqueued: the
+    // caller's fallback recomputes O in full, so nothing partial survives.
+    std::fprintf(stderr,
+                 "[APA] d=%u hQ=%u hKV=%u M=%u N_kv=%u: argument bind / grid "
+                 "check failed -> declined\n",
+                 head_dim, num_heads_Q, num_heads_KV, M, N_kv);
+    return false;
+  }
+  {
+    char key[160];
+    std::snprintf(key, sizeof(key), "%u/%u/%u/%d/%d/%d/%s", head_dim,
+                  num_heads_Q, num_heads_KV, win > 0 ? 1 : 0,
+                  attn_softcap > 0.0f ? 1 : 0, ring_cap > 0 ? 1 : 0,
+                  copts.c_str());
+    if (as.logged.emplace(key, 1).second)
+      std::fprintf(
+        stderr,
+        "[APA] d=%u hQ=%u hKV=%u G=%d M=%u N_kv=%u W=%u softcap=%.1f "
+        "ring=%u TM=%d TN=%d qk_lws=%zu,%zu,%zu sv_lws=%zu,%zu,%zu "
+        "scores=%zuMB blocks=%u -> engaged\n",
+        head_dim, num_heads_Q, num_heads_KV, gqa, M, N_kv, win, attn_softcap,
+        ring_cap, TM, TN, qk_lws[0], qk_lws[1], qk_lws[2], sv_lws[0], sv_lws[1],
+        sv_lws[2], (row_bytes * (size_t)rows_per) >> 20, blocks);
+  }
+  if (gh_mode() != 0) {
+    attn_gpuhash_note("aq", Q_svm, nullptr,
+                      (size_t)M * num_heads_Q * head_dim * 2, M);
+    attn_gpuhash_note("ao", O_svm, o_clmem,
+                      (size_t)M * num_heads_Q * head_dim * 2, M);
+  }
+  return true;
+}
+
 void cl_attention_release_caches() {
   // [reload] Model-teardown counterpart to what this file latches for the
   // process. No run is in flight at the call site and every item is rebuilt
@@ -5304,6 +7053,36 @@ void cl_attention_release_caches() {
       as.pool[i].reset();
       as.cap[i] = 0;
     }
+  }
+  // [afd] The fused decode's partial buffers and probe verdicts.
+  {
+    AfdScratch &as = afd_scratch();
+    for (void **b : {&as.acc, &as.ml, &as.probe}) {
+      if (*b)
+        opencl::clReleaseMemObjectT(static_cast<cl_mem>(*b));
+      *b = nullptr;
+    }
+    as.acc_cap = as.ml_cap = as.probe_cap = 0;
+  }
+  // [afp] The fused prefill's probe buffer and variant verdicts.
+  {
+    AfpScratch &as = afp_scratch();
+    if (as.probe)
+      opencl::clReleaseMemObjectT(static_cast<cl_mem>(as.probe));
+    as.probe = nullptr;
+    as.probe_cap = 0;
+    as.verdict.clear();
+  }
+  // [apa] The three-pass prefill's kernel handles, build verdicts and the
+  // shapes it announced (its scores live in the TcaScratch above).
+  {
+    std::lock_guard<std::mutex> lk(tca_mtx());
+    ApaScratch &as = apa_scratch();
+    as.qk.clear();
+    as.sv.clear();
+    as.sm.clear();
+    as.verdict.clear();
+    as.logged.clear();
   }
   // A teardown is a handle-epoch boundary for this file's memos too.
   opencl::clBumpHandleEpoch();
