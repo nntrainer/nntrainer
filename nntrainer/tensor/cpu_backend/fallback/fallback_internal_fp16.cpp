@@ -20,6 +20,7 @@
 #include <fallback_internal.h>
 #include <stdexcept>
 #include <tensor_dim.h>
+#include <vector>
 
 #define hgemv_loop(ci, cj, cM, cN)                                             \
   do {                                                                         \
@@ -208,6 +209,110 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
     }
     out[span] =
       static_cast<_FP16>(value * cos_[k] + transformed_value * sin_[k]);
+  }
+}
+
+void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                                         unsigned int half_, _FP16 *inout,
+                                         _FP16 *output, const _FP16 *cos_,
+                                         const _FP16 *sin_) {
+  // Same pairing as the NEON kernel; the products are taken in fp32 and
+  // rounded once, where NEON rounds each fp16 product.
+  _FP16 *dst = output != nullptr ? output : inout;
+  for (unsigned int w = 0; w < width; w += dim) {
+    for (unsigned int k = 0; k < half_; ++k) {
+      const float a = static_cast<float>(inout[w + k]);
+      const float b = static_cast<float>(inout[w + k + half_]);
+      const float c = static_cast<float>(cos_[k]);
+      const float s = static_cast<float>(sin_[k]);
+      dst[w + k] = static_cast<_FP16>(a * c - b * s);
+      dst[w + k + half_] = static_cast<_FP16>(a * s + b * c);
+    }
+  }
+}
+
+void __fallback_compute_kcaches(const _FP16 *in, const _FP16 *kcache,
+                                _FP16 *output, int num_rows, int num_cache_head,
+                                int head_dim, int gqa_size, int tile_size,
+                                size_t local_window_size, int head_start,
+                                int head_end) {
+  // The NEON kernel's arithmetic without its tiling, accumulating in fp32.
+  (void)tile_size;
+  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  const int start_row = ((size_t)num_rows < local_window_size)
+                          ? 0
+                          : num_rows - (int)local_window_size;
+  const int row_cnt =
+    ((size_t)num_rows < local_window_size) ? num_rows : (int)local_window_size;
+  const float inv = 1.0f / std::sqrt((float)head_dim);
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int r = 0; r < row_cnt; ++r) {
+      const int row = start_row + r;
+      const _FP16 *k_row =
+        kcache + (size_t)(row * num_cache_head + n) * head_dim;
+      for (int g = 0; g < gqa_size; ++g) {
+        const _FP16 *in_ptr = in + (size_t)(n * gqa_size + g) * head_dim;
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+          sum += (float)in_ptr[i] * (float)k_row[i];
+        output[(size_t)r * num_cache_head * gqa_size + n * gqa_size + g] =
+          (_FP16)(sum * inv);
+      }
+    }
+  }
+}
+
+void __fallback_compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                              const _FP16 *vcache,
+                                              _FP16 *output, int num_cache_head,
+                                              int gqa_size, int head_dim,
+                                              size_t local_window_size,
+                                              int head_start, int head_end) {
+  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  const int j_start = ((size_t)row_num < local_window_size)
+                        ? 0
+                        : row_num + 1 - (int)local_window_size;
+  std::vector<float> acc((size_t)gqa_size * head_dim);
+  for (int n = head_start; n < actual_head_end; ++n) {
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (int j = j_start; j <= row_num; ++j) {
+      const _FP16 *vptr = vcache + (size_t)(j * num_cache_head + n) * head_dim;
+      const int score_row =
+        ((size_t)row_num < local_window_size) ? j : j - j_start;
+      for (int h = 0; h < gqa_size; ++h) {
+        const float a = (float)
+          in[(size_t)score_row * gqa_size * num_cache_head + n * gqa_size + h];
+        float *acc_h = acc.data() + (size_t)h * head_dim;
+        for (int d = 0; d < head_dim; ++d)
+          acc_h[d] += a * (float)vptr[d];
+      }
+    }
+    for (int h = 0; h < gqa_size; ++h) {
+      _FP16 *out_h = output + (size_t)(n * gqa_size + h) * head_dim;
+      const float *acc_h = acc.data() + (size_t)h * head_dim;
+      for (int d = 0; d < head_dim; ++d)
+        out_h[d] = (_FP16)acc_h[d];
+    }
+  }
+}
+
+void __fallback_softmax_row_inplace(_FP16 *qk_out, size_t start_row,
+                                    size_t end_row, size_t num_heads,
+                                    _FP16 *sink) {
+  for (size_t c = 0; c < num_heads; ++c) {
+    float mx = sink ? (float)sink[c] : -INFINITY;
+    for (size_t r = start_row; r < end_row; ++r)
+      mx = std::max(mx, (float)qk_out[r * num_heads + c]);
+    float sum = sink ? std::exp((float)sink[c] - mx) : 0.0f;
+    for (size_t r = start_row; r < end_row; ++r) {
+      const float e = std::exp((float)qk_out[r * num_heads + c] - mx);
+      qk_out[r * num_heads + c] = (_FP16)e;
+      sum += e;
+    }
+    const float invsum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    for (size_t r = start_row; r < end_row; ++r)
+      qk_out[r * num_heads + c] =
+        (_FP16)((float)qk_out[r * num_heads + c] * invsum);
   }
 }
 

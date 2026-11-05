@@ -9,7 +9,8 @@
  * @bug    No known bugs except for NYI items
  * @brief  CUDA ComputeOps subclass (mirror of ClComputeOps). Overrides the
  *         copy ops and the whole-op entries that have a device kernel (GeGLU,
- *         SwiGLU, SigmoidGLU, SigmoidAdd, LayerNorm, activation, FC); every
+ *         SwiGLU, SigmoidGLU, SigmoidAdd, LayerNorm, activation, FC,
+ *         attention); every
  *         other op inherits the CpuComputeOps host implementation, which is
  *         correct on host-addressable (Unified/managed) engine=cuda tensors.
  */
@@ -20,14 +21,17 @@
 #include <env_compat.h>
 #include <nntrainer_log.h>
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 #include <tensor.h>
 
 #include <cuda_stream_manager.h>
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
 #include <cuda_blas_manager.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
@@ -655,6 +659,68 @@ public:
     // correct while the tensors ARE host-addressable -- see the FP16 arm above
     // for the case where they are not.
     CpuComputeOps::fc(input, weight, output);
+  }
+
+  // The CUDA attention arm, moved from MHACoreLayer::gemm_attention: the
+  // interleaved fp16 query and the fp16 KV cache feed a flash core on the
+  // device (scale 1/sqrt(d), causal + sliding mask, GQA, softcap, ring). Gated
+  // by NNTR_CUDA_ATTN, which the CudaContext device profile defaults on (=0
+  // disables), and by the caller allowing the flash-class arms (p.flash). The
+  // query and output must be device-resident (the kernel uses them directly);
+  // the KV cache may be host-heap (it is, on engine=cuda), the launcher
+  // mirrors it. A device kernel touching host memory faults and corrupts the
+  // context, so that guard is required.
+  //
+  // Otherwise the host arms (CpuComputeOps::attention), which read Q and the
+  // cache and write O on the host. A tensor in a device-only pool
+  // (NNTR_CUDA_DEV_ACT activations, NNTR_CUDA_KV_DEV cache) is not
+  // host-addressable, and reading it there is a SIGSEGV in a worker thread:
+  // stop with the reason instead. And the stream is settled first, so a Q/K
+  // produced on the device is read coherently under NNTR_CUDA_ASYNC (a no-op
+  // in sync mode).
+  void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
+                 const AttentionOpParams &p) override {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#ifdef ENABLE_FP16
+    using DataType = ml::train::TensorDim::DataType;
+    static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
+    if (p.flash && cuda_attn && p.sink == nullptr && kv.key != nullptr &&
+        kv.value != nullptr && kv.head_dim > 0 &&
+        q.getDataType() == DataType::FP16 &&
+        out.getDataType() == DataType::FP16 &&
+        kv.key->getDataType() != DataType::UINT8) {
+      const uint16_t *Q =
+        reinterpret_cast<const uint16_t *>(q.getData<_FP16>());
+      uint16_t *O = reinterpret_cast<uint16_t *>(out.getData<_FP16>());
+      if (Q && O && cuda::dev_accessible(Q) && cuda::dev_accessible(O)) {
+        // fp16 bits, whether the plane is FP16 or UINT16
+        const uint16_t *K = kv.key->getData<uint16_t>();
+        const uint16_t *V = kv.value->getData<uint16_t>();
+        const int num_heads_kv = (int)(kv.key->width() / kv.head_dim);
+        const int win = p.window < p.kv_len ? (int)p.window : INT_MAX;
+        if (cuda::cuda_attention_interleaved_fp16(
+              Q, K, V, O, (int)p.num_heads_q, num_heads_kv, (int)q.height(),
+              (int)p.kv_len, (int)p.q_pos, (int)kv.head_dim, win, p.softcap,
+              (int)kv.ring_cap))
+          return;
+      }
+    }
+#endif
+    auto device_only = [](const Tensor *t) {
+      const auto md = t != nullptr ? t->getMemoryData() : nullptr;
+      return md && !md->isHostAddressable();
+    };
+    if (device_only(&q) || device_only(kv.key) || device_only(kv.value) ||
+        device_only(&out))
+      throw std::runtime_error(
+        "CudaComputeOps::attention: the query, KV cache or output is in "
+        "device-only memory, which the host attention cannot read. On "
+        "NNTR_ENGINE=cuda the layer needs use_gemm_attention=true with "
+        "NNTR_CUDA_ATTN on, or NNTR_CUDA_DEV_ACT=0 / NNTR_CUDA_KV_DEV=0 for "
+        "host-readable buffers.");
+    cuda::drain_if_async();
+#endif
+    CpuComputeOps::attention(q, kv, out, p);
   }
 };
 

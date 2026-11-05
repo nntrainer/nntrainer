@@ -176,9 +176,12 @@ test-only ndk-build artifacts.
 [  PASSED  ] 55 tests.
 ```
 
-`unittest_mha_core` passes its per-row cases and skips its gemm cases: on ARM
-the host flash arm is not selected at their step sizes, so those skips are by
-design (the skip message says so), not a missing prerequisite.
+`unittest_mha_core` passes its per-row cases and skips the gemm cases whose
+steps are all shorter than 32 rows: on ARM the host flash arm is not selected
+at those step sizes, so those skips are by design (the skip message says so),
+not a missing prerequisite. `softcap_gemm_long_prefill` and
+`fp16_softcap_gemm_long_prefill` have a 40-row step, so they take the host
+flash arm on ARM and must pass.
 
 ### Required environment variables
 

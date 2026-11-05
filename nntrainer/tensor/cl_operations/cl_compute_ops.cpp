@@ -20,17 +20,20 @@
  * The second family is the whole-op table a backend-neutral layer calls
  * without asking a predicate first: fc, apply_activation, layer_norm,
  * activation, residual_op / residual_op2, geglu, swiglu, sigmoid_glu,
- * sigmoid_add, mean_rows, l2_normalize_rows and the scopy family. These have
- * no supports_*() escape hatch, so every op a layer registered on the gpu
- * engine can reach has to resolve here — the base ComputeOps default throws,
- * and a layer has nowhere to catch that. The list follows the layers this
- * context registers, among them FullyConnectedLayerCl (fc, apply_activation,
- * fc_prebuild_weight), AdditionLayer (residual_op), SwiGLULayer (swiglu),
- * GeGLULayer (geglu), SigmoidGluLayer / SigmoidAddLayer, LayerNormalization-
- * Layer (layer_norm), ActivationLayer (activation), plus Tensor::copy
- * (scopy). ActivationLayer does not throw either: a mode with no
+ * sigmoid_add, mean_rows, l2_normalize_rows, rotary_embedding and the scopy
+ * family. These have no supports_*() escape hatch, so every op a layer
+ * registered on the gpu engine can reach has to resolve here — the base
+ * ComputeOps default throws, and a layer has nowhere to catch that. The list
+ * follows the layers this context registers, among them FullyConnectedLayerCl
+ * (fc, apply_activation, fc_prebuild_weight), AdditionLayer (residual_op),
+ * SwiGLULayer (swiglu), GeGLULayer (geglu), SigmoidGluLayer / SigmoidAddLayer,
+ * LayerNormalizationLayer (layer_norm), ActivationLayer (activation), plus
+ * Tensor::copy (scopy) and CausalLM's MHACoreLayer (rotary_embedding).
+ * ActivationLayer does not throw either: a mode with no
  * OpenCL kernel runs on the host table, and supports_activation() reports
  * which modes are accelerated.
+ * MHACoreLayer's KV cache write (kv_cache_write) belongs to the same family.
+ * So does its host attention (attention).
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
@@ -125,6 +128,212 @@ private:
 };
 
 } // namespace
+
+#ifdef ENABLE_FP16
+/** NNTR_MHA_GPU: the layer's device arms are on. */
+static bool cl_mha_gpu_on() {
+  static const bool on = [] {
+    const char *e = std::getenv("NNTR_MHA_GPU");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+/** NNTR_MIN_PREFILL (default 1): rows a step needs for a device arm. */
+static unsigned int cl_device_min_rows() {
+  static const unsigned int min_rows = [] {
+    const char *e = std::getenv("NNTR_MIN_PREFILL");
+    const int v = e != nullptr ? std::atoi(e) : 0;
+    return v > 0 ? static_cast<unsigned int>(v) : 1u;
+  }();
+  return min_rows;
+}
+/** An FP16 tensor in shared virtual memory (not a planner cl_mem). */
+static bool cl_svm_fp16(const Tensor &t) {
+  const auto md = t.getMemoryData();
+  return md && md->isSVM() && !t.isClMem() &&
+         t.getDataType() == ml::train::TensorDim::DataType::FP16;
+}
+
+/**
+ * @brief The device RoPE MHACoreLayer ran itself on an FP16 SVM activation
+ *        (step 7a of #4466, second slice): rope_inplace_f16_cl over @p in
+ *        into @p out (which may alias it) with the fp16 table, drained, as
+ *        the layer's plain SVM path did. Taken when NNTR_MHA_GPU is on and
+ *        NNTR_NO_GPU_ROPE is not, the op rotates, both tensors are FP16 in
+ *        shared virtual memory, the table has fp16 rows for every position
+ *        and the step has NNTR_MIN_PREFILL rows (default 1) or is a single
+ *        row the table's device_decode admits (the layer's gpu_decode_rope
+ *        property or NNTR_MHA_GPU_DECODE). Declines otherwise; a shape the
+ *        formula rejects is left to the host arm, which reports it.
+ */
+static bool cl_device_rotary_arm(const Tensor &in, Tensor &out,
+                                 unsigned int head_dim,
+                                 const RotaryTable &table,
+                                 unsigned int start_pos, bool rotate) {
+  static const bool rope_off = std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
+  if (!cl_mha_gpu_on() || rope_off || !rotate || head_dim == 0 ||
+      (head_dim & 1u) || table.cos_fp16 == nullptr ||
+      table.sin_fp16 == nullptr || table.half != head_dim / 2 ||
+      !cl_svm_fp16(in) || !cl_svm_fp16(out) || in.width() % head_dim != 0 ||
+      out.width() != in.width() || out.size() != in.size())
+    return false;
+  const unsigned int rows = in.height();
+  if (rows == 0 || start_pos + rows > table.positions ||
+      !(rows >= cl_device_min_rows() || (rows == 1 && table.device_decode)))
+    return false;
+  return rope_inplace_f16_cl(
+    reinterpret_cast<const uint16_t *>(in.getData<_FP16>()),
+    reinterpret_cast<uint16_t *>(out.getData<_FP16>()), table.cos_fp16,
+    table.sin_fp16, rows, in.width() / head_dim, head_dim, start_pos,
+    table.positions, /*svm_inputs=*/true, /*in_clmem=*/nullptr,
+    /*out_clmem=*/nullptr, /*drain_svm_out=*/true);
+}
+
+/**
+ * @brief The device KV write MHACoreLayer ran itself into its concat FP16
+ *        cache (step 7a, second slice): K rotated by rope_inplace_f16_cl
+ *        straight into its cache rows and V copied there by gpu_copy_f16_cl,
+ *        both drained, as the layer's plain SVM path did. Taken under the
+ *        same gates as cl_device_rotary_arm, with a rope (the no-RoPE write
+ *        stays on the host, as it did), over FP16 SVM step and cache planes,
+ *        a concat K plane, rows that fit the cache (pos modulo ring_cap on a
+ *        ringed cache, as the host write). Declines otherwise, before writing
+ *        anything, except when the V copy fails after K is in place: then the
+ *        host write redoes both.
+ */
+static bool cl_device_kv_write_arm(const Tensor &k, const Tensor &v,
+                                   const KVCacheView &kv, unsigned int pos,
+                                   const RotaryTable *rope) {
+  static const bool rope_off = std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
+  if (!cl_mha_gpu_on() || rope_off || rope == nullptr ||
+      rope->cos_fp16 == nullptr || rope->sin_fp16 == nullptr ||
+      kv.key == nullptr || kv.value == nullptr ||
+      kv.layout != KVCacheLayout::Concat || kv.head_dim == 0 ||
+      (kv.head_dim & 1u) || rope->half != kv.head_dim / 2 || !cl_svm_fp16(k) ||
+      !cl_svm_fp16(v) || !cl_svm_fp16(*kv.key) || !cl_svm_fp16(*kv.value))
+    return false;
+  const unsigned int rows = k.height();
+  const unsigned int width = kv.key->width();
+  if (rows == 0 || v.height() != rows || k.width() != width ||
+      v.width() != width || kv.value->width() != width ||
+      width % kv.head_dim != 0 || k.size() != (size_t)rows * width ||
+      v.size() != (size_t)rows * width)
+    return false;
+  const unsigned int cap = kv.ring_cap ? kv.ring_cap : kv.key->height();
+  const unsigned int row = kv.ring_cap ? pos % kv.ring_cap : pos;
+  if (cap > kv.key->height() || cap > kv.value->height() || row + rows > cap ||
+      pos + rows > rope->positions ||
+      !(rows >= cl_device_min_rows() || (rows == 1 && rope->device_decode)))
+    return false;
+  uint16_t *kc = reinterpret_cast<uint16_t *>(kv.key->getData<_FP16>()) +
+                 (size_t)row * width;
+  uint16_t *vc = reinterpret_cast<uint16_t *>(kv.value->getData<_FP16>()) +
+                 (size_t)row * width;
+  if (!rope_inplace_f16_cl(
+        reinterpret_cast<const uint16_t *>(k.getData<_FP16>()), kc,
+        rope->cos_fp16, rope->sin_fp16, rows, width / kv.head_dim, kv.head_dim,
+        pos, rope->positions, /*svm_inputs=*/true,
+        /*in_clmem=*/nullptr, /*out_clmem=*/nullptr,
+        /*drain_svm_out=*/true))
+    return false;
+  return gpu_copy_f16_cl(reinterpret_cast<const uint16_t *>(v.getData<_FP16>()),
+                         vc, rows * width, /*svm_inputs=*/true,
+                         /*in_clmem=*/nullptr, /*out_clmem=*/nullptr,
+                         /*drain=*/true);
+}
+
+/**
+ * @brief The device attention arms MHACoreLayer ran itself over its concat
+ *        FP16 cache (step 7a of #4466, first slice): the flash kernels (a
+ *        decode form and a prefill form, over shared virtual memory) and the
+ *        two_conv kernels (over SVM or host copies), in the layer's order and
+ *        under its gates. Taken when p.flash allows a flash-class arm,
+ *        NNTR_MHA_GPU is on, the step has NNTR_MIN_PREFILL rows (default 1)
+ *        or is a single row p.device_decode admits, there is no sink, and q,
+ *        out and the cache are FP16 with a concat K plane. The kernels enqueue
+ *        without a drain: a host reader of out settles the queue first. The
+ *        two_conv kernels apply neither the softcap nor the window, as in the
+ *        layer; the flash kernels do. A step the gates admit but no kernel
+ *        takes returns false after one queue drain, so the host arms read
+ *        what the device wrote into these planes; a step the gates decline
+ *        returns false at once. A ringed cache's planes need only the rows
+ *        the ring holds (KVCacheView::rows_read): the flash kernels map the
+ *        logical range onto the ring, the two_conv kernels do not take it.
+ */
+static bool cl_device_attention_arm(const Tensor &q, const KVCacheView &kv,
+                                    Tensor &out, const AttentionOpParams &p) {
+  const bool gpu_on = cl_mha_gpu_on();
+  const unsigned int min_rows = cl_device_min_rows();
+  static const bool img_two_conv = std::getenv("NNTR_MHA_GPU_IMG") != nullptr;
+  using DataType = ml::train::TensorDim::DataType;
+  const unsigned int rows = q.height();
+  if (!gpu_on || !p.flash || p.sink != nullptr || kv.key == nullptr ||
+      kv.value == nullptr || kv.layout != KVCacheLayout::Concat ||
+      q.getDataType() != DataType::FP16 ||
+      out.getDataType() != DataType::FP16 ||
+      kv.key->getDataType() != DataType::FP16 ||
+      kv.value->getDataType() != DataType::FP16 || rows == 0 ||
+      !(rows >= min_rows || (rows == 1 && p.device_decode)))
+    return false;
+  const unsigned int head_dim = kv.head_dim;
+  if (head_dim == 0 || q.width() % head_dim != 0 ||
+      kv.key->width() % head_dim != 0)
+    return false;
+  const unsigned int num_heads_q = q.width() / head_dim;
+  const unsigned int num_heads_kv = kv.key->width() / head_dim;
+  // A shape the formula rejects is left to the host arms, which report it.
+  if (num_heads_q != p.num_heads_q || num_heads_kv == 0 ||
+      num_heads_q % num_heads_kv != 0 || out.size() != q.size() ||
+      p.kv_len != p.q_pos + rows || kv.rows_read(p.kv_len) > kv.key->height() ||
+      kv.rows_read(p.kv_len) > kv.value->height() ||
+      kv.value->width() != kv.key->width())
+    return false;
+  auto svm = [](const Tensor &t) {
+    const auto md = t.getMemoryData();
+    return md && md->isSVM();
+  };
+  const bool svm_ok = svm(q) && svm(out) && svm(*kv.key) && svm(*kv.value);
+  const uint16_t *Q = reinterpret_cast<const uint16_t *>(q.getData<_FP16>());
+  const uint16_t *K =
+    reinterpret_cast<const uint16_t *>(kv.key->getData<_FP16>());
+  const uint16_t *V =
+    reinterpret_cast<const uint16_t *>(kv.value->getData<_FP16>());
+  uint16_t *O = reinterpret_cast<uint16_t *>(out.getData<_FP16>());
+  const unsigned int kv_len = p.kv_len;
+  // The flash kernels take a window shorter than the context; UINT_MAX and
+  // any window from the context length up mean none.
+  const unsigned int win =
+    (p.window >= (size_t)kv_len) ? 0u : (unsigned int)p.window;
+  bool ok = false;
+  if (svm_ok) {
+    if (rows == 1)
+      ok =
+        flash_decode_f16_cl(Q, K, V, O, kv_len, num_heads_q, num_heads_kv,
+                            head_dim, /*max_seq_len=*/0u,
+                            /*svm_inputs=*/true, p.softcap, win, kv.ring_cap);
+    if (!ok)
+      ok = flash_attention_prefill_f16_cl(
+        Q, K, V, O, rows, kv_len, num_heads_q, num_heads_kv, head_dim,
+        /*max_seq_len=*/0u, p.causal, /*svm_inputs=*/true, p.softcap, win,
+        kv.ring_cap);
+  }
+  // two_conv indexes the cache linearly: not over a ring.
+  if (!ok && kv.ring_cap == 0) {
+    if (img_two_conv && head_dim % 8 == 0 &&
+        (num_heads_q * head_dim) % 8 == 0 && (num_heads_kv * head_dim) % 8 == 0)
+      ok = two_conv_attention_prefill_f16_img_cl(Q, K, V, O, rows, kv_len,
+                                                 num_heads_q, num_heads_kv,
+                                                 head_dim, p.causal);
+    if (!ok)
+      ok = two_conv_attention_prefill_f16_cl(Q, K, V, O, rows, kv_len,
+                                             num_heads_q, num_heads_kv,
+                                             head_dim, p.causal, svm_ok);
+  }
+  if (!ok)
+    cl_queue_finish();
+  return ok;
+}
+#endif
 
 /**
  * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
@@ -526,6 +735,42 @@ public:
   void l2_normalize_rows(const Tensor &in, Tensor &out,
                          float epsilon) override {
     l2_normalize_rows_cl_op(in, out, epsilon);
+  }
+  // The device RoPE over an FP16 SVM activation (cl_device_rotary_arm), then
+  // the host kernel. The layer's clmem-staged and image-arm RoPE forms stay
+  // in the layer (7b).
+  void rotary_embedding(const Tensor &in, Tensor &out, unsigned int head_dim,
+                        const RotaryTable &table, unsigned int start_pos,
+                        bool rotate) override {
+#ifdef ENABLE_FP16
+    if (cl_device_rotary_arm(in, out, head_dim, table, start_pos, rotate))
+      return;
+#endif
+    get_cpu_ops()->rotary_embedding(in, out, head_dim, table, start_pos,
+                                    rotate);
+  }
+  // The device write into a concat FP16 SVM cache (cl_device_kv_write_arm),
+  // then the host write. The OHWI, int8 and no-RoPE writes are the host's,
+  // as they were; the clmem-staged forms stay in the layer (7b).
+  void kv_cache_write(const Tensor &k, const Tensor &v, const KVCacheView &kv,
+                      unsigned int pos, const RotaryTable *rope) override {
+#ifdef ENABLE_FP16
+    if (cl_device_kv_write_arm(k, v, kv, pos, rope))
+      return;
+#endif
+    get_cpu_ops()->kv_cache_write(k, v, kv, pos, rope);
+  }
+
+  // The flash and two_conv device arms over a concat FP16 cache (see
+  // cl_device_attention_arm), then the host arms. The image arm and the
+  // device RoPE and cache writes are still the layer's (7b).
+  void attention(const Tensor &q, const KVCacheView &kv, Tensor &out,
+                 const AttentionOpParams &p) override {
+#ifdef ENABLE_FP16
+    if (cl_device_attention_arm(q, kv, out, p))
+      return;
+#endif
+    get_cpu_ops()->attention(q, kv, out, p);
   }
 
 #ifdef ENABLE_FP16
