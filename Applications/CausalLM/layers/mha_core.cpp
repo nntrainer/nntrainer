@@ -3177,6 +3177,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   } else {
     // No-RoPE path: host scatters/copies read K/V on the host -- lower first.
     lower_kv();
+#if defined(ENABLE_OPENCL)
+    // An FP32-activation layer staged K/V as FP16 planes on the device
+    // (attention_fp32_on_device), with narrowing kernels it did not drain.
+    // The RoPE path's device arms consume them on the same queue; this path
+    // reads them on the host, so map them first, as the host RoPE fallback
+    // does. Without it the host wrote the planes' stale bytes into the cache.
+    settle_act_stage_for_host();
+#endif
     const bool kv_ohwi_active =
       is_kv_ohwi_enabled() && !kv_int8 &&
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&

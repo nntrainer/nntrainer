@@ -13,7 +13,10 @@ Reference fixtures are shipped as tarballs under `packaging/`:
 `unittest_mha_core` (`layers/unittest_mha_core.cpp`) pins `MHACoreLayer`'s host
 attention path against a plain reference. Meson builds and runs it on the host;
 on Android the script below builds and runs it next to the model suite, because
-an fp16 Android build takes the layer's FP16 path there.
+an fp16 Android build takes the layer's FP16 path there. With `NNTR_ENGINE=gpu`
+in a `build_android.sh -Denable-opencl=true` build it runs the layer's OpenCL
+arms instead (see the test's header); the script builds the CPU engine, so that
+mode is run by hand.
 
 ---
 
