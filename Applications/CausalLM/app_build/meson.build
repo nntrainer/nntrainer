@@ -229,8 +229,10 @@ causallm_src = [
   causallm_root / 'tokenizer_cache.cpp',
   causallm_root / 'kv_cache_manager.cpp',
   causallm_root / 'prefix_flash_store.cpp',
+  causallm_root / 'baked_prefix.cpp',
   causallm_root / 'llm_util.cpp',
   causallm_root / 'models' / 'causal_lm.cpp',
+  causallm_root / 'models' / 'causal_lm_baked.cpp',
   causallm_root / 'models' / 'transformer.cpp',
   causallm_root / 'models' / 'sentence_transformer.cpp',
   causallm_root / 'models' / 'model_registry.cpp',
@@ -450,6 +452,7 @@ if get_option('enable-htp-device-check')
   foreach check_name, check_source : {
     'htp_page_prefix_check': 'tools/kv_cache/check_htp_page_prefix.cpp',
     'htp_sessions_check': 'tools/kv_cache/check_htp_sessions.cpp',
+    'htp_baked_prefix_check': 'test/htp/host/baked_prefix_check.cpp',
     'htp_prefix_flash_check': 'test/htp/host/prefix_flash_check.cpp',
     'htp_prefill_check': 'test/htp/host/prefill_prefix_check.cpp',
     'htp_calibration_check': 'test/htp/host/attention_calibration_check.cpp',

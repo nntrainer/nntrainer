@@ -40,6 +40,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <baked_prefix.h>
 #include <device_kv_manager.h>
 #include <kv_cache_manager.h>
 #include <prefix_flash_store.h>
@@ -77,6 +78,10 @@ public:
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+  struct SystemPrefixStats {
+    uint64_t loaded_assets = 0, hits = 0, reused_tokens = 0, errors = 0;
+    double restore_ms = 0;
+  };
 
   /**
    * @brief Model-teardown hook for the process-global device caches the
@@ -98,15 +103,20 @@ protected:
     unsigned from = 0, plane = 0, chunk = 0;
     std::shared_ptr<const KVCacheManager::PrefixSnapshot> kv;
     std::shared_ptr<PrefixFlashStore::Entry> flash;
+    std::shared_ptr<const BakedPrefix::Frame> baked;
     std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
       calibration;
   };
   using DevicePrefillHistory = std::map<unsigned, DevicePrefillFrame>;
   std::unique_ptr<PrefixFlashStore> device_prefix_flash_;
+  std::unique_ptr<BakedPrefix::Writer> system_prefix_writer_;
+  json system_prefix_config_, system_prefix_nntr_, system_prefix_identity_;
+  json deviceSystemPrefixIdentity();
   // Declared before the manager: its release callbacks erase these handles.
   std::shared_ptr<DevicePrefillHistory> device_prefill_history_;
   std::map<uint32_t, std::shared_ptr<const DevicePrefillHistory>>
     device_prefill_states_;
+  SystemPrefixStats system_prefix_stats_;
   bool device_prefix_mode_ = false;
   bool device_prefill_capture_ = false;
   bool device_prefix_flash_capture_ = true;
@@ -311,6 +321,19 @@ public:
                                             size_t staging_bytes);
   WIN_EXPORT PrefixFlashStore::Stats deviceKVPrefixFlashStats() const;
   WIN_EXPORT void drainDeviceKVPrefixFlash();
+  /** Offline bake, with an empty active session and loaded original q8 model.
+   * Complete native prefill boundaries only; never pad/split attention calls.
+   * The destination must not exist. Persistent files outlive prefix eviction.
+   */
+  WIN_EXPORT json bakeDeviceSystemPrefix(const std::string &system_prompt,
+                                         const std::string &directory);
+  /** Validate model/tokenizer/runtime identity and register disk-backed radix
+   * terminals. Payload is read lazily only on a compatible token hit.
+   */
+  WIN_EXPORT json loadDeviceSystemPrefix(const std::string &directory);
+  WIN_EXPORT SystemPrefixStats deviceSystemPrefixStats() const {
+    return system_prefix_stats_;
+  }
 
   bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
   const std::vector<unsigned int> &getLastGeneratedTokenIds() const {

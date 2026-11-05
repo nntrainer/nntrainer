@@ -34,6 +34,8 @@ causallm_src = [
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
     meson.current_source_dir() / 'prefix_flash_store.cpp',
+    meson.current_source_dir() / 'baked_prefix.cpp',
+    meson.current_source_dir() / 'models' / 'causal_lm_baked.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     # factory.cpp: the ONE out-of-line Factory::Instance() definition. Must be
     # compiled into libcausallm exactly once so every consumer .so (the api lib

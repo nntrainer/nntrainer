@@ -241,6 +241,8 @@ namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  system_prefix_config_ = cfg;
+  system_prefix_nntr_ = nntr_cfg;
   // Declare CausalLM's static-residency boundaries so the core planner
   // (tensor_pool / manager) needs no app-specific tensor/layer names. These are
   // byte-identical to the former hardcoded core defaults: the embedding output
@@ -478,6 +480,7 @@ void CausalLM::allocateKVCacheStorage(const KVCacheLayout &layout) {
 }
 
 void CausalLM::load_weight(const std::string &weight_path) {
+  system_prefix_identity_ = json();
   // NNTR_KV_EARLY: unset/anything else = allocate on a side thread during the
   // load (default on the OpenCL gpu engine), "sync" = after the load on this
   // thread, "0" = lazily in the first run() as before. Other engines keep the
@@ -1734,11 +1737,15 @@ void CausalLM::registerCustomLayers() {
 void CausalLM::captureDevicePrefill(unsigned from, unsigned position,
                                     unsigned earliest) {
   if (!device_prefill_capture_ || position < 64u ||
-      (position < earliest &&
+      (position < earliest && !system_prefix_writer_ &&
        (!device_prefix_flash_ || !device_prefix_flash_capture_)) ||
       REPETITION_PENALTY != 1.0f)
     return;
-  const bool archive = position < earliest;
+  if (system_prefix_writer_ &&
+      (position > system_prefix_writer_->limit() || !prefillDriveChunk() ||
+       position % prefillDriveChunk()))
+    return;
+  const bool archive = position < earliest && !system_prefix_writer_;
   if (device_prefill_history_ && device_prefill_history_->count(position))
     return;
   if (archive &&
@@ -1768,7 +1775,10 @@ void CausalLM::captureDevicePrefill(unsigned from, unsigned position,
                            ? nullptr
                            : device_prefill_history_->rbegin()->second.kv.get();
   auto snapshot = kv_cache.capturePrefix(position, previous, archive);
-  if (archive) {
+  if (system_prefix_writer_) {
+    frame.baked = system_prefix_writer_->add(from, frame.plane, frame.chunk,
+                                             *snapshot, frame.calibration);
+  } else if (archive) {
     const double staging_ms =
       std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - capture_start)
@@ -1789,6 +1799,21 @@ void CausalLM::restoreDevicePrefill(uint32_t handle, unsigned position) {
   auto payload = saved->at(position).kv;
   if (!payload && saved->at(position).flash)
     payload = saved->at(position).flash->load();
+  if (!payload && saved->at(position).baked) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+      const auto &baked = *saved->at(position).baked;
+      payload = PrefixFlashStore::loadSnapshot(baked.payload, *baked.layout);
+      ++system_prefix_stats_.hits;
+      system_prefix_stats_.reused_tokens += position;
+    } catch (const std::exception &) {
+      ++system_prefix_stats_.errors;
+    }
+    system_prefix_stats_.restore_ms +=
+      std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started)
+        .count();
+  }
   if (!payload)
     throw DeviceKVManager::PrefixUnavailable("Unavailable Flash boundary");
   // Fork metadata and shared immutable pages. No source state is shortened.
@@ -1977,7 +2002,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (!kv_cache.isAllocated())
     growPrefillPlane(static_cast<unsigned int>(_input.size()));
   size_t device_prefix_hit = 0;
-  if (device_kv_manager_ && global_token_len == 0 && SYS_PROMP_LEN == 0) {
+  if (device_kv_manager_ && !system_prefix_writer_ && global_token_len == 0 &&
+      SYS_PROMP_LEN == 0) {
     device_prefix_hit = device_kv_manager_->reuse(
       DeviceKVManager::Tokens(_input.begin(), _input.end()));
     if (device_prefix_hit)
@@ -2873,8 +2899,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
-    if (device_kv_manager_ && can_publish_device_prefill &&
-        device_prefill_history_ && !device_prefill_history_->empty() &&
+    if (device_kv_manager_ && !system_prefix_writer_ &&
+        can_publish_device_prefill && device_prefill_history_ &&
+        !device_prefill_history_->empty() &&
         token_generation_idx == generation_begin && skipped_prefill_token &&
         !device_run_tokens.empty() &&
         device_run_tokens.size() == token_generation_idx + global_token_len) {

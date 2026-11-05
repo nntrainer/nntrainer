@@ -47,6 +47,12 @@ public:
   bool canStage(size_t payload_bytes);
   std::shared_ptr<Entry> submit(std::shared_ptr<const Snapshot> snapshot,
                                 double staging_ms = 0);
+  /** Synchronous payload codec for persistent baked assets. Views are valid
+   * only until save returns. Layout metadata is supplied by the asset format.
+   */
+  static void saveSnapshot(const std::string &path, const Snapshot &snapshot);
+  static std::shared_ptr<const Snapshot> loadSnapshot(const std::string &path,
+                                                      const Snapshot &layout);
   Stats stats() const;
   /** Explicit diagnostic/request-boundary drain; inference never calls it. */
   void drain();

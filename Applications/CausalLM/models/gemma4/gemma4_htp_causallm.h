@@ -44,6 +44,9 @@ public:
   void repack_weight() override;
   LayerHandle createAttentionCore(const std::vector<std::string> &props) const;
 
+  /** Actual per-layer KV head count for cache layout validation. */
+  unsigned int getKVHeadCount(int layer_id) const;
+
 protected:
   std::string ATTENTION_ENGINE, ATTENTION_KV_DTYPE;
   std::string FC_WH_FILE_NAME, FC_WH_FORMAT, WEIGHT_DIR;
@@ -122,7 +125,7 @@ protected:
   bool isKVSharedLayer(int layer_id) const;
   bool isSlidingAttentionLayer(int layer_id) const;
   unsigned int getAttentionHeadDim(int layer_id) const;
-  unsigned int getKVHeadCount(int layer_id) const;
+
   unsigned int getKVCacheWidth(int layer_id) const;
 
   /** @brief Rows of a layer's KV cache: max_seq_len, or for a sliding layer

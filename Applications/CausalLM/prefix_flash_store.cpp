@@ -19,11 +19,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr uint64_t magic = 0x31464b5652544e4eULL;
 constexpr size_t overhead = 6 * sizeof(uint64_t);
-size_t bytesOf(const PrefixFlashStore::Snapshot &s) {
+size_t bytesOf(const PrefixFlashStore::Snapshot &s, bool owned = true) {
   size_t n = 0;
   for (const auto &l : s.layers)
     for (const auto &p : l.pages) {
-      if (!p || p->key_view || p->value_view ||
+      if (!p || (owned && (p->key_view || p->value_view)) ||
           p->keySize() != p->valueSize() || p->keySize() > (SIZE_MAX - n) / 2)
         throw std::invalid_argument("Flash staging requires owned KV pages");
       n += p->keySize() * 2;
@@ -45,9 +45,11 @@ void writeSnapshot(const std::string &path, const PrefixFlashStore::Snapshot &s,
   uint64_t hash = 14695981039346656037ULL;
   for (const auto &l : s.layers)
     for (const auto &p : l.pages)
-      for (const auto *v : {&p->key, &p->value}) {
-        hashBytes(hash, v->data(), v->size());
-        f.write(reinterpret_cast<const char *>(v->data()), v->size());
+      for (bool key : {true, false}) {
+        const auto *data = key ? p->keyData() : p->valueData();
+        const size_t size = key ? p->keySize() : p->valueSize();
+        hashBytes(hash, data, size);
+        f.write(reinterpret_cast<const char *>(data), size);
       }
   f.write(reinterpret_cast<const char *>(&hash), sizeof(hash));
   f.close();
@@ -332,6 +334,33 @@ PrefixFlashStore::Entry::load() const {
     }
   }
   return payload;
+}
+void PrefixFlashStore::saveSnapshot(const std::string &path,
+                                    const Snapshot &snapshot) {
+  try {
+    writeSnapshot(path, snapshot, bytesOf(snapshot, false));
+  } catch (...) {
+    removeFile(path + ".tmp");
+    throw;
+  }
+}
+std::shared_ptr<const PrefixFlashStore::Snapshot>
+PrefixFlashStore::loadSnapshot(const std::string &path,
+                               const Snapshot &layout) {
+  if (!layout.position || layout.layers.empty() ||
+      (layout.element_bytes != 2 && layout.element_bytes != 4))
+    throw std::invalid_argument("Invalid baked KV layout");
+  size_t bytes = 0;
+  for (const auto &layer : layout.layers) {
+    if (layer.base >= layout.position || !layer.width)
+      throw std::invalid_argument("Invalid baked KV layer");
+    const auto n = nntrainer::kv::checkedMultiply(
+      nntrainer::kv::checkedMultiply(size_t(layout.position - layer.base),
+                                     layer.width),
+      layout.element_bytes * 2u);
+    bytes = nntrainer::kv::checkedAdd(bytes, n);
+  }
+  return readSnapshot(path, layout, bytes);
 }
 PrefixFlashStore::Stats PrefixFlashStore::stats() const {
   std::lock_guard<std::mutex> lock(state_->mutex);

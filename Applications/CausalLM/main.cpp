@@ -248,7 +248,9 @@ int main(int argc, char *argv[]) {
               << "  [input_prompt] : Optional input text (uses sample_input or "
                  "chat_input if omitted)\n"
               << "  --requests FILE : JSON array of {prompt, reset?}; one "
-                 "loaded model\n";
+                 "loaded model\n"
+              << "  --bake-system-prefix TEXT_FILE NEW_DIRECTORY : bake "
+                 "compatible native system-prefix boundaries\n";
     return EXIT_FAILURE;
   }
 
@@ -270,6 +272,11 @@ int main(int argc, char *argv[]) {
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
     json requests;
     const bool request_mode = argc >= 3 && std::string(argv[2]) == "--requests";
+    const bool bake_mode =
+      argc >= 3 && std::string(argv[2]) == "--bake-system-prefix";
+    if (bake_mode && argc != 5)
+      throw std::invalid_argument(
+        "--bake-system-prefix requires TEXT_FILE NEW_DIRECTORY");
     if (request_mode) {
       if (argc != 4)
         throw std::invalid_argument("--requests requires one JSON file");
@@ -280,6 +287,8 @@ int main(int argc, char *argv[]) {
         if (!request.is_object() || !request.contains("prompt") ||
             !request["prompt"].is_string() ||
             (request.contains("reset") && !request["reset"].is_boolean()) ||
+            (request.contains("clear_prefixes") &&
+             !request["clear_prefixes"].is_boolean()) ||
             (request.contains("device_session") &&
              !request["device_session"].is_string()) ||
             (request.contains("device_kv_save") &&
@@ -411,6 +420,57 @@ int main(int argc, char *argv[]) {
     model->repack_weight();
     _ilap("model->repack_weight");
 
+    auto *device_causal = dynamic_cast<causallm::CausalLM *>(model.get());
+    bool device_manager_enabled = false;
+    auto enable_device_manager = [&] {
+      if (device_manager_enabled)
+        return;
+      if (!device_causal)
+        throw std::invalid_argument("Device KV requires a causal model");
+      const bool prefixes = nntr_cfg.contains("htp") &&
+                            nntr_cfg["htp"].value("kv_prefix_cache", false);
+      device_causal->enableDeviceKVManager(32, prefixes ? 8 : 0);
+      if (nntr_cfg.contains("kv_prefix_flash")) {
+        const auto &flash = nntr_cfg.at("kv_prefix_flash");
+        device_causal->enableDeviceKVPrefixFlash(
+          flash.at("directory"), flash.at("budget_bytes").get<size_t>(),
+          flash.at("staging_bytes").get<size_t>());
+      }
+      device_manager_enabled = true;
+    };
+    if (bake_mode) {
+      enable_device_manager();
+      std::ifstream text_file(argv[3], std::ios::binary);
+      if (!text_file)
+        throw std::invalid_argument("Cannot read system prompt file");
+      const std::string text((std::istreambuf_iterator<char>(text_file)), {});
+      const auto result = device_causal->bakeDeviceSystemPrefix(text, argv[4]);
+      std::cout << "[SYSTEM_PREFIX_BAKE] " << result.dump() << '\n';
+      return EXIT_SUCCESS;
+    }
+    if (nntr_cfg.contains("kv_prebaked_prefixes")) {
+      const auto &assets = nntr_cfg.at("kv_prebaked_prefixes");
+      if (!assets.is_array())
+        throw std::invalid_argument("kv_prebaked_prefixes must be an array");
+      if (!assets.empty())
+        enable_device_manager();
+      for (const auto &asset : assets) {
+        if (!asset.is_string())
+          throw std::invalid_argument("Baked prefix path must be a string");
+        auto path = std::filesystem::path(asset.get<std::string>());
+        if (path.is_relative())
+          path = std::filesystem::path(model_path) / path;
+        try {
+          std::cout
+            << "[SYSTEM_PREFIX_LOAD] "
+            << device_causal->loadDeviceSystemPrefix(path.string()).dump()
+            << '\n';
+        } catch (const std::exception &e) {
+          std::cerr << "[SYSTEM_PREFIX_REJECT] " << e.what() << '\n';
+        }
+      }
+    }
+
     bool do_sample = generation_cfg.value("do_sample", false);
 
 #ifdef PROFILE
@@ -436,15 +496,7 @@ int main(int argc, char *argv[]) {
                     [](const auto &r) { return r.contains("device_session"); });
       std::map<std::string, uint32_t> device_session_ids;
       if (device_sessions) {
-        const bool prefixes = nntr_cfg.contains("htp") &&
-                              nntr_cfg["htp"].value("kv_prefix_cache", false);
-        causal->enableDeviceKVManager(32, prefixes ? 8 : 0);
-        if (nntr_cfg.contains("kv_prefix_flash")) {
-          const auto &flash = nntr_cfg.at("kv_prefix_flash");
-          causal->enableDeviceKVPrefixFlash(
-            flash.at("directory"), flash.at("budget_bytes").get<size_t>(),
-            flash.at("staging_bytes").get<size_t>());
-        }
+        enable_device_manager();
         device_session_ids.emplace("default", 0);
       }
       size_t index = 0;
@@ -464,6 +516,8 @@ int main(int argc, char *argv[]) {
                         std::chrono::steady_clock::now() - started)
                         .count();
         }
+        if (request.value("clear_prefixes", false))
+          causal->clearDeviceKVPrefixes();
         if (request.value("reset", false))
           causal->setSessionTokenPosition(0);
         double restore_ms = 0;
@@ -519,6 +573,14 @@ int main(int argc, char *argv[]) {
             {"write_ms", flash.write_ms},
             {"read_ms", flash.read_ms}};
         }
+        const auto baked = causal->deviceSystemPrefixStats();
+        if (baked.loaded_assets || baked.errors)
+          result["system_prefix_cache"] = {
+            {"loaded_assets", baked.loaded_assets},
+            {"hits", baked.hits},
+            {"reused_tokens", baked.reused_tokens},
+            {"errors", baked.errors},
+            {"restore_ms", baked.restore_ms}};
         result["output_ids"] = causal->getLastGeneratedTokenIds();
         result["device_kv_restore_ms"] = restore_ms;
         if (request.contains("device_kv_save")) {
