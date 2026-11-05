@@ -46,6 +46,14 @@ bool Gemma4Transformer::isKVSharedLayer(int layer_id) const {
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
 }
 
+// The layer just before the KV-shared ones: with those skipping prefill,
+// only its K / V have a reader there (the shared layers' caches), so its
+// attention core only appends them and the rest of the layer is skipped.
+bool Gemma4Transformer::isPrefillKVOnlyLayer(int layer_id) const {
+  return NUM_KV_SHARED_LAYERS > 0 && isKVSharedLayer(layer_id + 1) &&
+         !isKVSharedLayer(layer_id);
+}
+
 bool Gemma4Transformer::isSlidingAttentionLayer(int layer_id) const {
   if (!layer_types.empty() && layer_id < static_cast<int>(layer_types.size())) {
     return layer_types[layer_id] == "sliding_attention";
@@ -376,6 +384,8 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // Gemma4TextRMSNorm scales by `weight` (initialized to ones), which matches
   // NNTrainer `rms_norm` behavior used here.
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
+  // everything past the attention core skips prefill there too
+  const bool skip_out = is_kv_shared_layer || isPrefillKVOnlyLayer(layer_id);
   // The norms around the projections ride the fused layers (qkv_layer's
   // in_norm, dense_ffn's in_norm / out_norm, the MoE layer's three), where
   // one accelerator call covers norm and matmul (doc 57 section 5 step 4).
@@ -460,7 +470,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     block_on_htp && layer_id + 1 < NUM_LAYERS &&
     !isKVSharedLayer(layer_id + 1) &&
     engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id + 1) == "htp";
-  appendSkipPrefillIfNeeded(post_attn_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(post_attn_props, skip_out);
   LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
   Tensor post_attention = post_attention_add({input, att_out});
 
@@ -502,7 +512,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("use_weight", fold_scalar ? "true" : "false"),
     withKey("engine", engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id))};
-  appendSkipPrefillIfNeeded(post_ffn_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(post_ffn_props, skip_out);
   LayerHandle post_ffn_add(createLayer("residual_add", post_ffn_props));
   Tensor decoder_output_base = post_ffn_add(ffn_terms);
 
@@ -514,7 +524,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("packed", "false"),
     withKey("use_weight", "true"),
   };
-  appendSkipPrefillIfNeeded(layer_scalar_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(layer_scalar_props, skip_out);
   LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
 
   // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
@@ -523,7 +533,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name", "layer" + std::to_string(layer_id) + "_per_layer_input"),
     withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
     withKey("layer_index", std::to_string(layer_id))};
-  appendSkipPrefillIfNeeded(per_layer_slice_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(per_layer_slice_props, skip_out);
   LayerHandle per_layer_slice(
     createLayer("per_layer_slice", per_layer_slice_props));
   Tensor per_layer_input_slice = per_layer_slice(per_layer_input);
@@ -534,7 +544,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("unit", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
     withKey("weight_dtype", FC_LAYER_DTYPE)};
-  appendSkipPrefillIfNeeded(per_layer_input_gate_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(per_layer_input_gate_props, skip_out);
   LayerHandle per_layer_input_gate(
     createLayer("fully_connected", per_layer_input_gate_props));
   Tensor per_layer_input_gate_out = per_layer_input_gate(decoder_output_base);
@@ -543,7 +553,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name",
             "layer" + std::to_string(layer_id) + "_per_layer_input_act"),
     withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(per_layer_input_act_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(per_layer_input_act_props, skip_out);
   LayerHandle per_layer_input_act(
     createLayer("activation", per_layer_input_act_props));
   Tensor per_layer_input_activated =
@@ -551,7 +561,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   std::vector<std::string> per_layer_input_mul_props = {withKey(
     "name", "layer" + std::to_string(layer_id) + "_per_layer_input_mul")};
-  appendSkipPrefillIfNeeded(per_layer_input_mul_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(per_layer_input_mul_props, skip_out);
   LayerHandle per_layer_input_mul(
     createLayer("multiply", per_layer_input_mul_props));
   Tensor per_layer_input_multiplied =
@@ -563,7 +573,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("unit", std::to_string(DIM)), withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
     withKey("weight_dtype", FC_LAYER_DTYPE)};
-  appendSkipPrefillIfNeeded(per_layer_input_proj_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(per_layer_input_proj_props, skip_out);
   LayerHandle per_layer_input_proj(
     createLayer("fully_connected", per_layer_input_proj_props));
   Tensor per_layer_input_projected =
@@ -573,8 +583,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name",
             "layer" + std::to_string(layer_id) + "_post_per_layer_input_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(post_per_layer_input_norm_props,
-                            is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(post_per_layer_input_norm_props, skip_out);
   LayerHandle post_per_layer_input_norm(
     createLayer("rms_norm", post_per_layer_input_norm_props));
   Tensor per_layer_input_normed =
@@ -582,7 +591,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   std::vector<std::string> decoder_output_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")};
-  appendSkipPrefillIfNeeded(decoder_output_props, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(decoder_output_props, skip_out);
   LayerHandle decoder_output_layer(
     createLayer("addition", decoder_output_props));
   Tensor decoder_output =
@@ -841,7 +850,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   if (fold_o_proj_ &&
       engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
     a_params.push_back(withKey("attn_out_u16", "true"));
-  appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
+  appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer ||
+                                        isPrefillKVOnlyLayer(layer_id));
   LayerHandle mha(createAttentionCore(a_params));
   Tensor a = mha({q_scaled, k_normed, v_normed, cache_k, cache_v});
 
@@ -875,18 +885,21 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   // epilogue; the same three weights in the file's order (gate, up, down),
   // so a model file is read identically, and on the CPU the same GEMMs.
   // ponytail: a KV-shared layer keeps the three layers below, which carry
-  // skip_prefill; dense_ffn does not, and no model here has such a layer.
+  // skip_prefill; dense_ffn carries it too now, so they could be one call.
   if (!is_kv_shared_layer) {
-    LayerHandle ffn(createLayer(
-      "dense_ffn",
-      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
-       withKey("unit", curr_hidden_dim), withKey("gate_first", "true"),
-       withKey("glu_activation", "tanh_gelu"), withKey("in_norm", "true"),
-       withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
-       withKey("epsilon", std::to_string(NORM_EPS)),
-       withKey("weight_dtype", FC_LAYER_DTYPE),
-       withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
-       withKey("engine", ffn_engine)}));
+    std::vector<std::string> ffn_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
+      withKey("unit", curr_hidden_dim),
+      withKey("gate_first", "true"),
+      withKey("glu_activation", "tanh_gelu"),
+      withKey("in_norm", "true"),
+      withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
+      withKey("epsilon", std::to_string(NORM_EPS)),
+      withKey("weight_dtype", FC_LAYER_DTYPE),
+      withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
+      withKey("engine", ffn_engine)};
+    appendSkipPrefillIfNeeded(ffn_props, isPrefillKVOnlyLayer(layer_id));
+    LayerHandle ffn(createLayer("dense_ffn", ffn_props));
     return ffn(input);
   }
 

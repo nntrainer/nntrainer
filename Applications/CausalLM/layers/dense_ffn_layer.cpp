@@ -64,6 +64,9 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   in_norm = std::get<props::InNorm>(dense_props).get();
   out_norm = std::get<props::OutNorm>(dense_props).get();
   out_to_host = std::get<props::OutToHost>(dense_props).get();
+  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
 
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
@@ -169,6 +172,8 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
 
   const unsigned int rows = to - from;
+  if (skip_prefill && (!from || rows > 1))
+    return;
   // [#222] every kind resident: the HTP runs this row's FFN (DENSE_FFN),
   // and nothing reads this output before the lm_head hook -- skipped as
   // the per-FC form's three fully_connected layers skip theirs

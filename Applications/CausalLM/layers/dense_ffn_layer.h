@@ -100,6 +100,7 @@ private:
   bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
   bool in_norm = false, out_norm = false;
   bool out_to_host = true; /**< props::OutToHost */
+  bool skip_prefill = false;
   std::array<unsigned int, 5>
     weight_idx; /**< up, gate, down, [in_gamma, out_gamma] */
   std::array<unsigned int, 4>

@@ -101,6 +101,7 @@ protected:
   bool ENABLE_SKIP_PREFILL_OPT = false;
 
   bool isKVSharedLayer(int layer_id) const;
+  bool isPrefillKVOnlyLayer(int layer_id) const;
   bool isSlidingAttentionLayer(int layer_id) const;
   unsigned int getAttentionHeadDim(int layer_id) const;
   unsigned int getKVHeadCount(int layer_id) const;
