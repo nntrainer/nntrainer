@@ -204,14 +204,16 @@ public:
 
   /** Publish the backend's safe prefixes (or full pages plus the endpoint).
    * Terminals borrow one handle; pages and boundary metadata can be shared. */
-  void publish(const Tokens &tokens, unsigned position, unsigned pending) {
+  void publish(const Tokens &tokens, unsigned position, unsigned pending,
+               Capture capture_override = {}) {
     if (!max_prefixes_ || tokens.empty() || tokens.size() != position)
       return;
     // Equal token histories can have different quantizer states depending on
     // prefill chunking. Retain the first valid state; never combine its pages
     // with another state's scales.
     for (auto &entry : prefixes_)
-      if (entry.second.tokens == tokens) {
+      if (entry.second.tokens == tokens &&
+          entry.second.external == static_cast<bool>(capture_override)) {
         entry.second.used = ++clock_;
         return;
       }
@@ -226,9 +228,11 @@ public:
       prefixes_.erase(victim);
       rebuild();
     }
-    Prefix p{tokens,
-             (prefix_capture_ ? prefix_capture_ : capture_)(position, pending),
-             ++clock_, 0};
+    const auto &capture = capture_override  ? capture_override
+                          : prefix_capture_ ? prefix_capture_
+                                            : capture_;
+    Prefix p{tokens, capture(position, pending), ++clock_, 0,
+             static_cast<bool>(capture_override)};
     try {
       p.first = prefix_min_ ? prefix_min_(p.handle) : 0;
       prefixes_.emplace(p.handle, p);
@@ -268,6 +272,7 @@ private:
     uint32_t handle;
     uint64_t used;
     unsigned first; /**< Minimum prefix with all required sliding rows. */
+    bool external;  /**< Captured using a caller-supplied backend. */
   };
   static size_t nodes(const Node &n) {
     size_t count = 0;

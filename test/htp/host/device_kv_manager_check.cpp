@@ -71,6 +71,54 @@ int main() {
   }
   assert(live.empty());
   {
+    std::set<uint32_t> prefix_handles;
+    unsigned selected = 0;
+    Manager m([](unsigned, unsigned) -> uint32_t { return 1; },
+              [&](uint32_t id, unsigned pos) {
+                assert(prefix_handles.count(id));
+                selected = pos;
+              },
+              [](uint32_t) {}, [] {}, 2, 2);
+    m.setPrefixLengths([](uint32_t) { return std::vector<unsigned>{4096}; });
+    m.setPrefixRelease([&](uint32_t id) { assert(prefix_handles.erase(id)); });
+    Manager::Tokens tokens(4096, 7);
+    m.publish(tokens, 4096, 9, [&](unsigned pos, unsigned pending) {
+      assert(pos == 4096 && pending == 9);
+      prefix_handles.insert(42);
+      return 42;
+    });
+    tokens.push_back(8);
+    assert(m.reuse(tokens) == 4096 && selected == 4096);
+    m.clearPrefixes();
+    assert(prefix_handles.empty());
+  }
+  {
+    std::set<uint32_t> handles;
+    uint32_t selected = 0;
+    Manager m([](unsigned, unsigned) -> uint32_t { return 1; },
+              [&](uint32_t id, unsigned) { selected = id; }, [](uint32_t) {},
+              [] {}, 2, 3);
+    m.setPrefixCapture([&](unsigned, unsigned) {
+      handles.insert(1);
+      return 1;
+    });
+    m.setPrefixRelease([&](uint32_t id) { assert(handles.erase(id)); });
+    m.setPrefixLengths([](uint32_t id) {
+      return id == 1 ? std::vector<unsigned>{4095}
+                     : std::vector<unsigned>{4096};
+    });
+    Manager::Tokens tokens(4096, 7);
+    m.publish(tokens, 4096, 9);
+    m.publish(tokens, 4096, 9, [&](unsigned, unsigned) {
+      handles.insert(0x80000000u);
+      return 0x80000000u;
+    });
+    tokens.push_back(8);
+    assert(m.reuse(tokens) == 4096 && selected == 0x80000000u);
+    m.clearPrefixes();
+    assert(handles.empty());
+  }
+  {
     Manager m(
       [&](unsigned, unsigned) {
         live.insert(next);

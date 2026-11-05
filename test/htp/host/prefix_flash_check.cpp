@@ -104,6 +104,17 @@ int main() {
     }
     check(!retired->available() && !retired->load());
     {
+      Store blobs(dir.string(), 16384, 8192);
+      for (const std::string &input :
+           {std::string(), std::string("x"), std::string("a\0b\xff", 4),
+            std::string(4097, 'z')}) {
+        auto entry = blobs.submitBlob(input);
+        check(entry && entry->loadBlob() == input);
+        blobs.drain();
+        check(entry->loadBlob() == input);
+      }
+    }
+    {
       Store failed_writer(dir.string(), bytes, bytes);
       for (const auto &sub : std::filesystem::directory_iterator(dir))
         check(std::filesystem::remove(sub.path()));

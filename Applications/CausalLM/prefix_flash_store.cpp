@@ -4,6 +4,7 @@
  */
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <list>
@@ -276,6 +277,45 @@ PrefixFlashStore::submit(std::shared_ptr<const Snapshot> snapshot,
   state_->wake.notify_one();
   return entry;
 }
+std::shared_ptr<PrefixFlashStore::Entry>
+PrefixFlashStore::submitBlob(const std::string &bytes, double staging_ms) {
+  const auto start = Clock::now();
+  if (bytes.size() > SIZE_MAX - 9u)
+    throw std::length_error("Accelerator checkpoint is too large");
+  const size_t half = (bytes.size() + 9u) / 2u;
+  if (half > UINT32_MAX || half > SIZE_MAX / 2u)
+    throw std::length_error("Accelerator checkpoint is too large");
+  if (!canStage(half * 2u))
+    return {};
+  auto snapshot = std::make_shared<Snapshot>();
+  snapshot->position = 1;
+  snapshot->element_bytes = 1;
+  snapshot->layers.resize(1);
+  snapshot->layers[0].width = static_cast<unsigned>(half);
+  auto page = std::make_shared<Snapshot::Page>();
+  page->key.resize(half);
+  page->value.resize(half);
+  const uint64_t len = bytes.size();
+  auto copy = [&](size_t offset, const void *source, size_t size) {
+    const auto *data = static_cast<const unsigned char *>(source);
+    if (offset < half) {
+      const size_t n = std::min(size, half - offset);
+      std::memcpy(page->key.data() + offset, data, n);
+      data += n;
+      size -= n;
+      offset += n;
+    }
+    if (size)
+      std::memcpy(page->value.data() + offset - half, data, size);
+  };
+  copy(0, &len, sizeof(len));
+  if (!bytes.empty())
+    copy(sizeof(len), bytes.data(), bytes.size());
+  snapshot->layers[0].pages.push_back(std::move(page));
+  staging_ms +=
+    std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  return submit(std::move(snapshot), staging_ms);
+}
 PrefixFlashStore::Entry::~Entry() {
   const auto state = state_.lock();
   if (!state || !record_)
@@ -334,6 +374,24 @@ PrefixFlashStore::Entry::load() const {
     }
   }
   return payload;
+}
+std::string PrefixFlashStore::Entry::loadBlob() const {
+  const auto payload = load();
+  if (!payload || payload->position != 1 || payload->element_bytes != 1 ||
+      payload->layers.size() != 1 || payload->layers[0].pages.size() != 1)
+    throw std::runtime_error("Accelerator checkpoint is unavailable");
+  const auto &page = payload->layers[0].pages[0];
+  std::string framed(reinterpret_cast<const char *>(page->keyData()),
+                     page->keySize());
+  framed.append(reinterpret_cast<const char *>(page->valueData()),
+                page->valueSize());
+  uint64_t len = 0;
+  if (framed.size() < sizeof(len))
+    throw std::runtime_error("Invalid accelerator checkpoint framing");
+  std::memcpy(&len, framed.data(), sizeof(len));
+  if (len > framed.size() - sizeof(len))
+    throw std::runtime_error("Invalid accelerator checkpoint size");
+  return framed.substr(sizeof(len), static_cast<size_t>(len));
 }
 void PrefixFlashStore::saveSnapshot(const std::string &path,
                                     const Snapshot &snapshot) {

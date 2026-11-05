@@ -77,6 +77,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2549,9 +2550,8 @@ public:
       pool_prefetch_->drain();
   }
 
-  void save_decode_kv(const std::string &path, const std::vector<uint32_t> &app,
-                      bool park) override {
-    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+  void writeDecodeCheckpoint(std::ostream &f,
+                             const std::vector<uint32_t> &app) {
     snapshotReady(true);
     if (app.size() != 3u || app[0] + app[1] != decode_.cur_pos_ + 1u)
       throw std::invalid_argument("HTP KV checkpoint position mismatch");
@@ -2573,43 +2573,57 @@ public:
                                uint32_t(decode_.prompt_tokens_),
                                uint32_t(decode_.prompt_tokens_ >> 32),
                                uint32_t(decode_.kv_len_.size())};
+    KvCheckpointIO io;
+    io.write(f, header, sizeof(header));
+    io.write(f, app.data(), 12u);
+    io.write(f, meta, sizeof(meta));
+    io.write(f, decode_.kv_len_.data(), decode_.kv_len_.size() * 4u);
+    std::unique_ptr<HtpRpcBuffer> staging;
+    for (uint32_t c = 0; c < 2u; ++c) {
+      if (!(meta[0] & (1u << c)))
+        continue;
+      for (uint32_t l = 0; l < meta[1u + 8u * c]; ++l) {
+        uint32_t bytes = 0;
+        rc = nntr_hvx_attn_m1_snapshot_layer(session, 0, c, l, nullptr, 0,
+                                             nullptr, 0, &bytes);
+        if (rc || !bytes || bytes > 64u * 1024u * 1024u)
+          throw std::runtime_error("HTP KV layer query: " + graphErr(rc));
+        if (!staging || staging->size() < bytes)
+          staging = std::make_unique<HtpRpcBuffer>(bytes);
+        if (!staging->data())
+          throw std::bad_alloc();
+        rc = nntr_hvx_attn_m1_snapshot_layer(session, 1, c, l, nullptr, 0,
+                                             staging->data(), bytes, &bytes);
+        if (rc)
+          throw std::runtime_error("HTP KV export: " + graphErr(rc));
+        io.write(f, &bytes, 4u);
+        io.write(f, staging->data(), bytes);
+      }
+    }
+    f.write(reinterpret_cast<const char *>(&io.hash), sizeof(io.hash));
+  }
+
+  std::string export_decode_kv(const std::vector<uint32_t> &app) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    std::ostringstream stream(std::ios::out | std::ios::binary);
+    stream.exceptions(std::ios::failbit | std::ios::badbit);
+    writeDecodeCheckpoint(stream, app);
+    return stream.str();
+  }
+
+  void save_decode_kv(const std::string &path, const std::vector<uint32_t> &app,
+                      bool park) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
     const std::string temporary = path + ".tmp";
     try {
       std::ofstream f(temporary, std::ios::binary | std::ios::trunc);
       f.exceptions(std::ios::failbit | std::ios::badbit);
-      KvCheckpointIO io;
-      io.write(f, header, sizeof(header));
-      io.write(f, app.data(), 12u);
-      io.write(f, meta, sizeof(meta));
-      io.write(f, decode_.kv_len_.data(), decode_.kv_len_.size() * 4u);
-      std::unique_ptr<HtpRpcBuffer> staging;
-      for (uint32_t c = 0; c < 2u; ++c) {
-        if (!(meta[0] & (1u << c)))
-          continue;
-        for (uint32_t l = 0; l < meta[1u + 8u * c]; ++l) {
-          uint32_t bytes = 0;
-          rc = nntr_hvx_attn_m1_snapshot_layer(session, 0, c, l, nullptr, 0,
-                                               nullptr, 0, &bytes);
-          if (rc || !bytes || bytes > 64u * 1024u * 1024u)
-            throw std::runtime_error("HTP KV layer query: " + graphErr(rc));
-          if (!staging || staging->size() < bytes)
-            staging = std::make_unique<HtpRpcBuffer>(bytes);
-          if (!staging->data())
-            throw std::bad_alloc();
-          rc = nntr_hvx_attn_m1_snapshot_layer(session, 1, c, l, nullptr, 0,
-                                               staging->data(), bytes, &bytes);
-          if (rc)
-            throw std::runtime_error("HTP KV export: " + graphErr(rc));
-          io.write(f, &bytes, 4u);
-          io.write(f, staging->data(), bytes);
-        }
-      }
-      f.write(reinterpret_cast<const char *>(&io.hash), sizeof(io.hash));
+      writeDecodeCheckpoint(f, app);
       f.close();
       std::filesystem::rename(temporary, path);
       if (park) {
-        rc =
-          nntr_hvx_attn_m1_snapshot_control(session, 1, nullptr, 0, nullptr, 0);
+        const int rc = nntr_hvx_attn_m1_snapshot_control(
+          HtpBackend::global().handle(), 1, nullptr, 0, nullptr, 0);
         if (rc)
           throw std::runtime_error("HTP KV park: " + graphErr(rc));
         decode_.kv_parked_ = true;
@@ -2621,12 +2635,9 @@ public:
     }
   }
 
-  std::vector<uint32_t> load_decode_kv(const std::string &path) override {
-    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+  std::vector<uint32_t> readDecodeCheckpoint(std::istream &f) {
     snapshotReady(false);
     const auto session = HtpBackend::global().handle();
-    std::ifstream f(path, std::ios::binary);
-    f.exceptions(std::ios::failbit | std::ios::badbit);
     KvCheckpointIO io;
     uint32_t h[10], meta[17];
     std::vector<uint32_t> app(3);
@@ -2724,6 +2735,20 @@ public:
     decode_.seed_ordinal_ = HTP_GRAPH_NO_OP;
     std::fill(std::begin(decode_.kind_next_), std::end(decode_.kind_next_), 0u);
     return app;
+  }
+
+  std::vector<uint32_t> import_decode_kv(const std::string &bytes) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    std::istringstream stream(bytes, std::ios::in | std::ios::binary);
+    stream.exceptions(std::ios::failbit | std::ios::badbit);
+    return readDecodeCheckpoint(stream);
+  }
+
+  std::vector<uint32_t> load_decode_kv(const std::string &path) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    std::ifstream stream(path, std::ios::binary);
+    stream.exceptions(std::ios::failbit | std::ios::badbit);
+    return readDecodeCheckpoint(stream);
   }
 
   bool prepare_decode_kv_request(unsigned from, unsigned end) override {

@@ -1126,6 +1126,7 @@ void CausalLM::setSessionTokenPosition(unsigned int pos) {
       device_kv_manager_->forgetTokens();
     device_prefill_history_.reset();
     device_prefill_restored_ = false;
+    device_decode_prefix_restored_ = false;
     htp_pending_tokens_.clear();
     htp_session_failed_ = false;
   }
@@ -1194,6 +1195,33 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
     },
     [this](uint32_t handle, unsigned prefix) {
       if (prefix) {
+        const auto decode = device_decode_prefixes_.find(handle);
+        if (decode != device_decode_prefixes_.end()) {
+          std::string bytes;
+          try {
+            bytes = decode->second.flash->loadBlob();
+          } catch (const std::exception &) {
+            throw DeviceKVManager::PrefixUnavailable(
+              "Unavailable decode Flash boundary");
+          }
+          const auto app = nntrainer::get_htp_ops()->import_decode_kv(bytes);
+          if (app.size() != 3 || app[0] + app[1] != prefix)
+            throw std::runtime_error("Decode prefix position mismatch");
+          device_prefill_history_.reset();
+          device_prefill_restored_ = false;
+          device_decode_prefix_restored_ = true;
+          global_token_len = prefix;
+          SYS_PROMP_LEN = 0;
+          if (kv_cache.isAllocated())
+            kv_cache.setPosition(prefix);
+          htp_pending_tokens_.clear();
+          htp_session_failed_ = false;
+          USE_KVCACHE = false;
+          PRE_COMPUTED_CACHE_PATH.clear();
+          retire_decode_capture();
+          return;
+        }
+        device_decode_prefix_restored_ = false;
         restoreDevicePrefill(handle, prefix);
         return;
       }
@@ -1227,10 +1255,17 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
     device_prefill_states_.emplace(id, device_prefill_history_);
     return id;
   });
-  device_kv_manager_->setPrefixRelease(
-    [this](uint32_t handle) { device_prefill_states_.erase(handle); });
+  device_kv_manager_->setPrefixRelease([this](uint32_t handle) {
+    device_prefill_states_.erase(handle);
+    device_decode_prefixes_.erase(handle);
+  });
   device_kv_manager_->setPrefixLengths([this](uint32_t handle) {
     std::vector<unsigned> positions;
+    const auto decode = device_decode_prefixes_.find(handle);
+    if (decode != device_decode_prefixes_.end()) {
+      positions.push_back(decode->second.position);
+      return positions;
+    }
     const auto &history = device_prefill_states_.at(handle);
     if (history)
       for (const auto &entry : *history)
@@ -1239,6 +1274,10 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
   });
   device_kv_manager_->setPrefixCompatible(
     [this](uint32_t handle, unsigned position, size_t input_rows) {
+      const auto decode = device_decode_prefixes_.find(handle);
+      if (decode != device_decode_prefixes_.end())
+        return position == decode->second.position && input_rows > position &&
+               REPETITION_PENALTY == 1.0f && decode->second.flash->available();
       const auto &history = device_prefill_states_.at(handle);
       if (!history || input_rows < 3 || input_rows > MAX_SEQ_LEN ||
           REPETITION_PENALTY != 1.0f)
@@ -1322,6 +1361,11 @@ void CausalLM::enableDeviceKVPrefixFlash(const std::string &directory,
       "Flash prefixes require an enabled original q8 radix manager");
   device_prefix_flash_ =
     std::make_unique<PrefixFlashStore>(directory, flash_bytes, staging_bytes);
+}
+void CausalLM::enableDeviceKVDecodePrefixFlash() {
+  if (!device_kv_manager_ || !device_prefix_flash_)
+    throw std::logic_error("Decode prefixes require Flash radix backing");
+  device_decode_prefix_enabled_ = true;
 }
 PrefixFlashStore::Stats CausalLM::deviceKVPrefixFlashStats() const {
   return device_prefix_flash_ ? device_prefix_flash_->stats()
@@ -1836,7 +1880,12 @@ void CausalLM::beginIndependentHtpPrompt(
   const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
     &reset_layer) {
   if (repeated) {
-    nntrainer::htp_begin_prompt();
+    // A decode checkpoint needs the existing DSP attention registrations as
+    // the import shape. Defer releasing them until the radix lookup decides
+    // whether this independent request restores a decode checkpoint.
+    device_deferred_prompt_reset_ = !device_decode_prefixes_.empty();
+    if (!device_deferred_prompt_reset_)
+      nntrainer::htp_begin_prompt();
     model->forEachLayer(
       [&](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *) {
         auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
@@ -2009,6 +2058,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (device_prefix_hit)
       _input.erase(_input.begin(), _input.begin() + device_prefix_hit);
   }
+#ifdef ENABLE_HEXKL
+  if (device_deferred_prompt_reset_) {
+    if (!device_decode_prefix_restored_)
+      nntrainer::htp_begin_prompt();
+    device_deferred_prompt_reset_ = false;
+  }
+#endif
   if (htp_session_enabled_ && global_token_len != 0 && !device_prefix_hit) {
     NNTR_THROW_IF(htp_pending_tokens_.size() != 1u, std::logic_error)
       << "Resident HTP session has no pending feedback token";
@@ -2553,7 +2609,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       ~SpanHint() { setPrefillSpanHint(0); }
     } _span_hint(from_pos + n_tok);
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
-    if (!resume_block_on && from_pos > 0 && n_tok > 1) {
+    if ((!resume_block_on || device_decode_prefix_restored_) && from_pos > 0 &&
+        n_tok > 1) {
       std::vector<float *> out;
       for (unsigned int i = 0; i < n_tok; ++i) {
         for (unsigned int b = 0; b < BATCH_SIZE; ++b)
@@ -2859,6 +2916,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 
+    const auto processed_token = static_cast<unsigned>(input_sample[0]);
     allocateAndBindKVCache();
     auto output_interval = incrementalInference(
       BATCH_SIZE, input, input_len, token_generation_idx - 1 + global_token_len,
@@ -2899,6 +2957,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
+    const unsigned device_position = token_generation_idx + global_token_len;
+    if (!device_run_tokens.empty() &&
+        device_run_tokens.size() + 1u == device_position)
+      device_run_tokens.push_back(processed_token);
     if (device_kv_manager_ && !system_prefix_writer_ &&
         can_publish_device_prefill && device_prefill_history_ &&
         !device_prefill_history_->empty() &&
@@ -2909,6 +2971,42 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                   token_generation_idx + global_token_len,
                                   static_cast<unsigned>(input_sample[0]));
     }
+#ifdef ENABLE_HEXKL
+    if (device_decode_prefix_enabled_ && device_kv_manager_ &&
+        device_prefix_flash_ && !system_prefix_writer_ &&
+        htp_execution_profile_ && BATCH_SIZE == 1 && device_position &&
+        device_position % 4096u == 0 &&
+        device_run_tokens.size() == device_position) {
+      try {
+        device_kv_manager_->publish(
+          device_run_tokens, device_position,
+          static_cast<unsigned>(input_sample[0]),
+          [this](unsigned position, unsigned pending) {
+            const size_t resident = getDeviceKVCacheBytes();
+            constexpr size_t metadata_reserve = 1024u * 1024u;
+            if (resident > SIZE_MAX - metadata_reserve ||
+                !device_prefix_flash_->canStage(resident + metadata_reserve))
+              throw std::runtime_error("Decode prefix staging is full");
+            const auto start = std::chrono::steady_clock::now();
+            const auto bytes = nntrainer::get_htp_ops()->export_decode_kv(
+              {position, 0u, pending});
+            const double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+            auto entry = device_prefix_flash_->submitBlob(bytes, ms);
+            if (!entry || !next_decode_prefix_)
+              throw std::runtime_error("Decode prefix staging is full");
+            const uint32_t id = next_decode_prefix_++;
+            device_decode_prefixes_.emplace(
+              id, DeviceDecodePrefix{position, std::move(entry)});
+            return id;
+          });
+      } catch (const std::exception &e) {
+        std::cerr << "[DEVICE_DECODE_PREFIX] capture skipped: " << e.what()
+                  << std::endl;
+      }
+    }
+#endif
     {
       const auto step_end = std::chrono::high_resolution_clock::now();
       decode_step_ms.push_back(
@@ -2958,16 +3056,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (htp_session_enabled_)
     htp_pending_tokens_ = {static_cast<unsigned>(input_sample[0])};
   device_prefill_restored_ = false;
+  device_decode_prefix_restored_ = false;
   free(input_sample);
 
   global_token_len += (generation_cnt + init_len);
   if (device_kv_manager_) {
-    if (!device_run_tokens.empty() && !generated_ids.empty()) {
-      device_run_tokens.insert(device_run_tokens.end(), generated_ids.begin(),
-                               generated_ids.end() - 1);
-      if (device_run_tokens.size() != getSessionTokenPosition())
-        device_run_tokens.clear();
-    }
+    if (device_run_tokens.size() != getSessionTokenPosition())
+      device_run_tokens.clear();
     device_kv_manager_->setTokens(std::move(device_run_tokens));
     // The prompt endpoint was published at its first decode step. Sessions
     // pin only INT8 pages; further generated endpoints add no prefill pages.

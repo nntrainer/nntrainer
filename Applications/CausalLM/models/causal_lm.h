@@ -116,11 +116,20 @@ protected:
   std::shared_ptr<DevicePrefillHistory> device_prefill_history_;
   std::map<uint32_t, std::shared_ptr<const DevicePrefillHistory>>
     device_prefill_states_;
+  struct DeviceDecodePrefix {
+    unsigned position;
+    std::shared_ptr<PrefixFlashStore::Entry> flash;
+  };
+  std::map<uint32_t, DeviceDecodePrefix> device_decode_prefixes_;
+  uint32_t next_decode_prefix_ = 0x80000000u;
   SystemPrefixStats system_prefix_stats_;
   bool device_prefix_mode_ = false;
   bool device_prefill_capture_ = false;
   bool device_prefix_flash_capture_ = true;
   bool device_prefill_restored_ = false;
+  bool device_decode_prefix_enabled_ = false;
+  bool device_decode_prefix_restored_ = false;
+  bool device_deferred_prompt_reset_ = false;
   std::unique_ptr<DeviceKVManager> device_kv_manager_;
   bool htp_session_enabled_ = false;
   bool htp_session_failed_ = false;
@@ -319,6 +328,9 @@ public:
   WIN_EXPORT void enableDeviceKVPrefixFlash(const std::string &directory,
                                             size_t flash_bytes,
                                             size_t staging_bytes);
+  /** Opt in to checkpoints of the original INT8 decode trajectory. A hit
+   * reproduces that trajectory; full prefill can produce different values. */
+  WIN_EXPORT void enableDeviceKVDecodePrefixFlash();
   WIN_EXPORT PrefixFlashStore::Stats deviceKVPrefixFlashStats() const;
   WIN_EXPORT void drainDeviceKVPrefixFlash();
   /** Offline bake, with an empty active session and loaded original q8 model.

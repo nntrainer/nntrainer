@@ -32,6 +32,8 @@ public:
     Entry &operator=(const Entry &) = delete;
     bool available() const;
     std::shared_ptr<const Snapshot> load() const;
+    /** Load a blob submitted with submitBlob(). */
+    std::string loadBlob() const;
 
   private:
     friend class PrefixFlashStore;
@@ -47,6 +49,10 @@ public:
   bool canStage(size_t payload_bytes);
   std::shared_ptr<Entry> submit(std::shared_ptr<const Snapshot> snapshot,
                                 double staging_ms = 0);
+  /** Back an immutable accelerator checkpoint using the same worker and
+   * capacity limits as native prefill frames. */
+  std::shared_ptr<Entry> submitBlob(const std::string &bytes,
+                                    double staging_ms = 0);
   /** Synchronous payload codec for persistent baked assets. Views are valid
    * only until save returns. Layout metadata is supplied by the asset format.
    */

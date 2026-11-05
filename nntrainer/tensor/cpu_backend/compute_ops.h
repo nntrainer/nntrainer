@@ -850,6 +850,14 @@ public:
                               const std::vector<uint32_t> &, bool) {
     throw std::logic_error("Device KV checkpoints are unsupported");
   }
+  /** Export a stable checkpoint on the inference thread. The returned bytes
+   * can be written asynchronously without touching live accelerator state. */
+  virtual std::string export_decode_kv(const std::vector<uint32_t> &) {
+    throw std::logic_error("Device KV checkpoint export is unsupported");
+  }
+  virtual std::vector<uint32_t> import_decode_kv(const std::string &) {
+    throw std::logic_error("Device KV checkpoint import is unsupported");
+  }
   virtual std::vector<uint32_t> load_decode_kv(const std::string &) {
     throw std::logic_error("Device KV checkpoints are unsupported");
   }

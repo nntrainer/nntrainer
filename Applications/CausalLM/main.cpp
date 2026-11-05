@@ -435,6 +435,8 @@ int main(int argc, char *argv[]) {
         device_causal->enableDeviceKVPrefixFlash(
           flash.at("directory"), flash.at("budget_bytes").get<size_t>(),
           flash.at("staging_bytes").get<size_t>());
+        if (flash.value("decode_checkpoints", false))
+          device_causal->enableDeviceKVDecodePrefixFlash();
       }
       device_manager_enabled = true;
     };
