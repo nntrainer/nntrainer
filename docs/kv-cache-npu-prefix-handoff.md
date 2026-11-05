@@ -1,0 +1,202 @@
+# NPU KV radix 인수인계 — 2026-11-05
+
+## 현재 구현
+
+- 작업 경로: `/tmp/nntr-pr4428-validation`
+- 브랜치: `kv/pr4428-dsp-flash-20261104`, 원격 `baek2sm/nntrainer`
+- 최신 구현 커밋: `c40756f8c` (영속 시스템 prefix baking).
+  기존 비동기 prefix Flash 구현: `f2e43d820`.
+- 기존 q8/Q2 calibration·Q16/K8/V8·U16 O projection 및 projection/FFN/MoE 배치 유지.
+- **256-token calibration 정책은 제거했다.** prefix 옵션이 계산 dispatch를 바꾸던
+  과거 q8_row 분기도 제거했고 Q2/U16 구성이 아니면 명시적으로 거부한다.
+- [구현·설정](gemma4-htp-radix-prefix.md),
+  [전체 입력/출력 ID·위치·성능·바이너리 해시](validation/gemma4-htp-native-radix-20261105.json).
+
+## 재사용 의미
+
+Radix는 토큰과 **원래 prefill 호출 경계**가 모두 맞는 상태만 재사용한다.
+새로 계산하는 긴 요청은 마지막 완전한 native 호출 경계와 최종 multi-row
+prefill endpoint를 DRAM에 보존한다. **새 opt-in 비동기 prefix Flash 모드에서는
+더 이른 native 경계의 global/sliding KV도 저장·복원한다.**
+
+- 4608-token source → 공통 4096-token prefix 재사용.
+- 8704-token source → 공통 8192-token prefix 재사용. 실제 계산 배치는 기존대로
+  4096-token 두 호출이며, 8192는 저장된 위치다.
+- 2080-token 동일 입력 반복 → 기존 전체 2079-token prefill 재사용, 마지막 입력은
+  원래 DSP decode로 처리.
+- 한 호출로 계산한 1024-token source에서 768-token만 자르는 요청은 miss.
+  계산을 바꾸어 hit를 만들지 않는다.
+- 한 토큰 prefill 꼬리는 DSP window를 seed **전에** 설정한다. 기존 4098-token
+  경계의 seed-twice 오류를 고쳤다. 이 경우 host checkpoint는 앞선 4096-token이다.
+
+FP16 RPC slab을 page view로 pin한다. 마지막 sliding window는 memmove 대신
+read-only offset으로 seed한다. 원래 compact 결과와 KV bytes·dropped maxima가
+같음을 Ubuntu/Android에서 확인했다. 첫 seed 후에는 일반 decode entry를 쓴다.
+DSP INT8 page/COW/session/Flash 경로는 유지했다.
+Radix의 host ID·release namespace를 DSP 세션과 분리했다. 사용하지 않는
+DSP prefix checkpoint retain RPC와 그로 인한 decode tail COW는 제거했다.
+실제 session select/fork만 DSP checkpoint를 보존한다.
+
+## 검증 완료
+
+- Android SM-S948N / Android 16 / SM8850 v81, serial `R5KL20NFRCK` 실제 모델 구동.
+- 분기 11개와 source 반복 5개, cold source·parent 보존의
+  전체 출력 ID 및 위치 일치. suffix 1/2/3-token, 4K/8K 경계, 안전한 miss 포함.
+- 긴 RUBY 출력은 기존 working legacy의 전체 출력 ID와 일치. 과거 `tool_response`
+  회귀는 해소됐다. 일부 다른 baseline fixture 자체의 EOS는 그대로 기록했다.
+- 서로 다른 A/B 6턴 전환, fork, paged Flash save/park/restore 통과.
+- native CLI 4098-token cold → repeat: ID/위치 동일, 4096-token 재사용 확인.
+- Ubuntu build, 기존 KV unit test 36개, Ubuntu/Android page/view/lifetime 및 독립
+  calibration 검사 통과. DSP page/COW/Flash host 검사와 ASan/UBSan 통과
+  (`detect_leaks=0`). clang-format 14와 git diff 검사 통과.
+
+동일한 모델 하나를 유지하고 저장 보존만 OFF/ON 교차한 cold 측정이다. 두 길이마다
+모드별 4회, hit=0. 단위 ms, 각 셀은 OFF / ON:
+
+| 입력 토큰 | Prefill | TTFT |
+| --- | ---: | ---: |
+| 2080 | 3886.0 / 3941.8 | 4333.0 / 4375.7 |
+| 4608 | 9007.2 / 9026.8 | 9466.6 / 9501.8 |
+
+실제 hit의 독립 재계산 대비 TTFT, 단위 ms:
+
+| 입력 / 재사용 토큰 | 재계산 | 재사용 |
+| --- | ---: | ---: |
+| 2080 / 2079 | 3959.6 | 316.8 |
+| 4128 / 4096 | 8728.2 | 2116.9 |
+| 8224 / 8192 | 15848.4 | 2224.6 |
+
+프로세스를 나눈 앞선 측정에서 2K +2.36%가 관측됐고 원본 수치를 JSON에 남겼다.
+동일 모델의 storage-only 비교에서도 약 1% 이하 차이가 관측됐다. 사용자는 이 차이를 측정 오차 내 무시 가능한 수준으로 수용했다. 사용하지 않는 DSP prefix
+snapshot을 제거하기 전의 same-model 원본도 JSON에 보존했다. CPU/DSP 주파수를 고정하지 않았다.
+이 결과를 모든 상황의 절대 0% overhead 또는 sustained decode TPS 보장으로
+확대 해석하지 말 것. 과거 18.6%와 9초 수치는 폐기된 다른 계산 정책의 결과다.
+
+## 남은 범위와 주의할 점
+
+- 세션/프리픽스 수와 LRU 제한만 있으며 host prefix **byte budget은 없다**.
+  RPC slab 전체 pin으로 작은 pack은 1160 MiB, 긴 pack은 1240 MiB/source를
+  보존한다. 여유 DRAM에 맞춰 prefix 수를 설정해야 한다.
+- `htp.kv_seed_q=true`의 직접 양자화 seed는 기존 경로를 보존하고 prefix는 miss 처리한다. 기본 검증 pack은 `false`다.
+- DSP Flash snapshot은 host FP16 radix index를 저장하지 않는다. 새 prefix Flash
+  backing은 별도 경로로, scale/layout/token index는 모델의 DRAM metadata에 남는다.
+- 첫 seed에서 tensor의 RPC slab 소유권을 반납하며 radix pin만 유지한다. clear 후 논리 pin은 0이다. 실제 OS MemAvailable 즉시 증가량은 driver/allocator 상태에 따라 다르며 전체 payload 즉시 반환을 주장하지 않는다.
+- 비기본 repetition penalty와 `NNTR_RESUME_BLOCK=0`은 재사용 대신 원래 계산.
+- corpus 품질 또는 긴 steady decode TPS는 별도 검증 범위다. 현재 결과는 기존
+  계산 유지와 검사한 요청의 정확한 ID·위치 및 cold/hit TTFT 검증이다.
+
+## 실행 재현
+
+기기 경로: `/data/local/tmp/nntr_pr4428_kv_validation/native-q8-complete-20261105`
+로컬 원본: `/tmp/nntr-original-q8-20261105/complete-raw`
+가중치: 기존 `/data/local/tmp/nntr_pr4428_kv_validation/models/gemma4/`.
+
+```sh
+source /home/seungbaek/toolchain/nntrainer-htp-20261103/env.sh
+ninja -C builddir install
+ninja -C builddir_app/htp nntr_causallm htp_page_prefix_check htp_sessions_check \
+  htp_prefill_check htp_calibration_check htp_prefix_cold_bench
+```
+
+실행은 `LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64`,
+`ADSP_LIBRARY_PATH=$PWD`, `NNTR_NUM_THREADS=8`, `NNTR_HTP_KV_MANAGER=1`.
+`htp_page_prefix_check pack fixture-4096.json result.json`,
+`htp_page_prefix_check long-pack fixture-8192.json result.json`,
+`htp_prefix_cold_bench pack paired-fixture.json cold.json`을 사용한다.
+fixture 원본은 evidence JSON의 `length_cases` 및 `cold_same_model_raw` 안에 있다.
+ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
+
+## 추가 완료: 과거 native 경계의 비동기 Flash 보존
+
+- 구현 커밋 `f2e43d820`, 기존 q8/Q2·배치·DSP 연산 변경 없음.
+- `enableDeviceKVPrefixFlash(directory, flash_bytes, staging_bytes)` 또는
+  top-level `kv_prefix_flash` JSON으로 opt-in. 기본값은 OFF.
+- 8704-token source가 끝나도 과거 4096-token 경계를 Flash에서 복원한다.
+  마지막 native 경계/최종 상태는 기존 DRAM 경로를 유지한다.
+- earlier boundary의 live global KV + sliding window를 owned staging에 복사하고
+  worker가 checksum/write/fdatasync한다. 완료 후 staging 해제. calibration은
+  원본 그대로 DRAM frame에 남는다. 현재 file 간 global page dedup은 없다.
+- staging byte budget이 차면 추론을 기다리지 않고 그 경계 백업 skip. 파일은
+  budget/LRU로 퇴출하고, evicted/missing/corrupt 상태는 이전 경계 또는 재계산.
+- native CLI A→B와 독립 재계산의 RUBY 답변 전체 11개 ID/위치 일치.
+- cold 8704-token 저장 OFF/ON 모드별 4회: TTFT 17.204 / 17.272초 (+0.39%).
+  staging 평균 107.9ms, background write/sync 평균 971.4ms. 모든 ON 표본에서
+  요청 종료 시 pending=0, skip/failure=0. 주파수 고정 없이 측정.
+- 실제 A→B: 4123-token B 중 4096 재사용. 재계산 8.453초 → 복원 TTFT 3.223초.
+  file read/checksum 985.3ms, 세션 전환 7.8ms는 TTFT와 별도.
+- synthetic branch 2개, 기존 8192 DRAM 경계, 세션 6턴/fork/DSP Flash 복원 통과.
+  synthetic baseline의 EOS를 품질 성공으로 포장하지 않았으며 RUBY로 보강했다.
+- Ubuntu 36 unit, Android/Ubuntu owned-stage/view, Flash LRU/budget/checksum/
+  cancellation/failed-write 검사 및 host ASan/UBSan 통과 (detect_leaks=0).
+- staging/file budget은 기존 latest-prefix RPC slab을 포함한 전체 DRAM 제한이 아니다.
+  최신 DRAM prefix 크기 문제 및 cross-file page dedup은 후속 최적화 범위.
+- backing은 process-local. 정상 clear/LRU/destruction 시 정리되지만 비정상 종료 후
+  private cache directory 잔여물 정리는 호출 애플리케이션이 담당해야 한다.
+- [설정·제약·측정 설명](gemma4-htp-radix-prefix.md),
+  [전체 원본 데이터](validation/gemma4-htp-prefix-flash-20261105.json).
+
+재현 bundle: `/tmp/nntr-prefix-flash-20261105` (기기에도 같은 basename).
+`run-final.sh`는 기능/교차 성능/기존 세션 검증, `run-quality.sh`는 실제 CLI RUBY
+재계산과 A→B Flash hit를 실행한다. 로컬 `raw/`에 모든 결과와 로그가 있다.
+
+## 추가 검증: 4K–20K core 기능/효과 표
+
+- 제품 구현은 `286abec4e` 그대로 유지. 측정 도구 커밋 `f258e8629`.
+- `htp_prefix_grid_bench`: 4K/8K/12K/16K/20K 각 DRAM/Flash 2회 paired 비교,
+  20개 case 전체 11개 출력 ID·위치 일치, 모든 답변 RUBY-456.
+- 발표 표의 Before는 각 길이의 전체 재계산 4개 표본 중 최솟값으로 통일.
+  hit는 각 tier의 기존 2회 평균 유지. 원래 paired 평균·표본은 원본에 보존.
+- 20K 공통 Before46.829초 → DRAM2.752초 (17.01×), Flash5.325초 (8.79×).
+- 동일 길이의 입력·prefill 토큰 수·forward 경로는 동일하며 DRAM 재계산에 추가
+  forward/백업은 없다. 구간별 온도·주파수·producer 메모리 상태 차이의 원인은
+  분리하지 못했으므로 느린 Before를 개선률 산정에 사용하지 않는다.
+- Flash source는 25,088토큰. 24K까지 진행한 뒤에도 4K..20K의 5개 과거 경계를
+  실제 파일에서 복원했다. 모든 Flash hit 전 clean-file-cache eviction advice를
+  실행했으며 완전한 UFS device-cache cold 보장은 아니다.
+- 20,992-token cold 백업 OFF/ON/ON/OFF: OFF 평균57.819초, ON60.300초
+  (+4.29%). staging 880.7ms, background write/sync8325.1ms, 요청 종료
+  pending=0, skip/failure=0. **저장 비용이 완전히 숨겨졌다는 결론은 금지.**
+- 중간 thermal status2 / HAL SKIN44.6°C, 주파수 미고정. 각 tier의 대응 control을
+  사용한 원래 paired 값과, 발표용 공통 최솟값을 모두 기록했다. 표본·min/max·온도 원문도 보존했다. 새 구현 품질회귀는 관측되지
+  않았지만 전체 속도 무회귀를 보장한 결과가 아니다.
+- 활성 DSP INT8 KV payload: 4K146.875MiB → 20K306.875MiB. 가중치·host
+  prefix slab·staging은 제외. 이 pack의 최신 host-prefix pin 카운터는1560MiB.
+- 후속 최적화 후보: staging payload 복사/중복 저장 축소와 I/O·DDR 경쟁 완화.
+  정적 scale 변경은 다른 작업 범위로 유지한다.
+- [핵심 기능·속도·메모리·저장 비용 표](kv-cache-manager-feature-results.md),
+  [전체 원본과 입력 token pool/출력 ID](validation/gemma4-htp-prefix-grid-20261105.json).
+- 로컬 원본 `/tmp/nntr-prefix-grid-20261105`, 기기에도 같은 basename.
+  benchmark 종료 후 cache backing은 정리됐고 기기 Flash 여유는 약4.1GiB로 복귀.
+
+## 추가 완료: 시스템 프롬프트의 영속 Flash pre-baking
+
+- C++ 구현 `c40756f8c`. 기존 q8/Q2·U16·배치·calibration 연산은 변경하지 않았다.
+- `nntr_causallm MODEL_DIR --bake-system-prefix system.txt NEW_DIRECTORY`로
+  실제 요청과 같은 직렬화 prefix를 저장. `kv_prebaked_prefixes: [path, ...]`
+  설정으로 새 프로세스에서 radix에 등록하고, hit 시 필요한 경계만 파일에서 로드.
+- native 4K 경계마다 FP16 KV + 정확한 scale/maxima + sliding 위치/퇴출 maxima +
+  토큰을 저장. 기존 seed로 DSP INT8 복원. 8K 저장본에 4K/8K 경계 모두 포함.
+  4280-token system은 4096 재사용 + 나머지 정상 계산. **4K 미만은 명시적 거부**.
+- 4K/8K 각 재계산·hit 2회. 가장 빠른 재계산 대비 hit 평균:
+  8.332→2.747초(3.03×), 16.166→2.623초(6.16×).
+  4280-token system 한 쌍은 9.579→3.065초. 모든 11개 출력 ID/위치 일치.
+- 별도 8K 저장본만으로 내부 4K 복원, 같은 크기의 파일 손상 시 전체 재계산,
+  prefix miss ID 일치까지 총8쌍 검증. 기존 세션 A/B 6턴·fork·DSP Flash 재개 통과.
+- Ubuntu shared-library build·36 KV unit·영속 codec normal/ASan/UBSan,
+  Android 영속/동적 Flash codec·prefill layout 검사 통과. leak 검사 제외.
+- **시작 비용을 숨기지 말 것:** 첫 import의 모델 파일 전체 fingerprint/metadata
+  검증8.709~19.415초는 hit TTFT와 별도. 후속 asset import34~75ms.
+  8K offline bake16.084초 + identity9.001초, 파일합계678,182,125 bytes.
+- 일반 miss 무회귀/DRAM budget 완성은 미보장. 세 hit 누적 후 miss7.869초와
+  매번 index clear control1.796초가 관측됐고 host prefix pin은4.865GB 대0.
+  기존 동적 prefix publication의 slab 보존을 포함해 메모리 조건이 달라
+  신규 baking 자체 비용으로 단정하지 않는다. 원본 수치를 보고서에 보존했다.
+- 영속 asset은 앱 소유이며 prefix clear/LRU/프로세스 종료가 지우지 않는다.
+  기존 임시 Flash LRU budget과 별도. 삭제는 앱이 디렉터리를 제거해야 한다.
+- 기기 asset 경로 `/data/local/tmp/nntr_pr4428_kv_validation/system-bake-assets/`:
+  `sys4k`, `sys8k`, `sys-nonaligned` 보존. 손상 검사 사본만 삭제. 여유 약2.9GiB.
+- 재현 bundle `/tmp/nntr-system-bake-20261105` (기기에도 동일 basename).
+  [사용법·비용·제약](gemma4-htp-radix-prefix.md#persistent-system-prompt-baking),
+  [전체 입력·ID·위치·실측·해시](validation/gemma4-htp-system-prefix-20261105.json).
+- 다음 최적화 후보는 기존 dynamic prefix의 host slab 중복 pin/DRAM byte 예산과
+  시작 fingerprint 비용. 정적 scale 통일은 다른 작업 범위로 유지한다.

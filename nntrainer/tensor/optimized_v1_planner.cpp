@@ -191,8 +191,42 @@ size_t OptimizedV1Planner::planLayout(
     sorted_req.push_back(&req);
   }
 
-  //   validateIntervalOverlap(memory_validity, memory_size, memory_offset,
-  //   memory_req);
+  if (!reuse_gaps_)
+    return memory_req;
+
+  // The exact-size reuse above can strand large expired blocks below a
+  // long-lived tensor (for example a transformer residual). Try a second
+  // layout that reuses every free gap, including adjacent expired blocks.
+  // Keep the smaller layout: first-fit may otherwise fragment later requests
+  // differently and increase the high-water mark for some training graphs.
+  std::vector<size_t> compact_offsets(memory_size.size());
+  size_t compact_size = 0;
+  sorted_req.clear();
+  for (auto &req : requests) {
+    sorted_req.erase(std::remove_if(sorted_req.begin(), sorted_req.end(),
+                                    [&req](const auto *active) {
+                                      return active->end <= req.start;
+                                    }),
+                     sorted_req.end());
+
+    size_t offset = 0;
+    auto position = sorted_req.begin();
+    for (; position != sorted_req.end(); ++position) {
+      const auto *active = *position;
+      if (active->offset - offset >= req.size)
+        break;
+      offset = active->offset + active->size;
+    }
+    req.offset = offset;
+    compact_offsets[req.loc] = offset;
+    compact_size = std::max(compact_size, offset + req.size);
+    sorted_req.insert(position, &req);
+  }
+  if (compact_size < memory_req) {
+    memory_offset.swap(compact_offsets);
+    memory_req = compact_size;
+  }
+
   return memory_req;
 }
 

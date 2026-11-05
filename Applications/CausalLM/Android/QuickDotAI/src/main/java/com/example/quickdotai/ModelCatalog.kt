@@ -37,6 +37,8 @@ object ModelIds {
     const val FUNCTION_GEMMA    = "function-gemma"
     const val GEMMA4            = "gemma4"       // LiteRT only
     const val GEMMA4_CPU        = "gemma4-cpu"
+    const val GEMMA4_26B_A4B_HTP = "gemma4-26b-a4b-htp"
+    const val LFM2_24BA2B_HTP    = "lfm2-24ba2b-htp"
     const val GEMMA4_E2B_QNN    = "gemma4-e2b-qnn"
     const val VJEPA_QNN         = "vjepa2-qnn"   // V-JEPA 2 multi-image (QNN)
     const val VJEPA_LFM2        = "vjepa-lfm2"        // V-JEPA 2 + LFM2 video (CPU)

@@ -33,6 +33,9 @@ causallm_src = [
     meson.current_source_dir() / 'tokenizer_cache.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
+    meson.current_source_dir() / 'prefix_flash_store.cpp',
+    meson.current_source_dir() / 'baked_prefix.cpp',
+    meson.current_source_dir() / 'models' / 'causal_lm_baked.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     # factory.cpp: the ONE out-of-line Factory::Instance() definition. Must be
     # compiled into libcausallm exactly once so every consumer .so (the api lib
@@ -185,24 +188,15 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-# Persistent tokenizer snapshot cache (tokenizer_cache.cpp). It needs the
-# snapshot entry points of the in-tree crate (tools/build_tokenizers_c.sh).
-# An archive built before they existed still links everything else, so
-# 'auto' probes the archive that is linked and, without them, builds the
-# cache out: every load then parses tokenizer.json as before.
-tokenizer_cache_opt = get_option('causallm-tokenizer-cache')
-tokenizer_cache = false
-if not tokenizer_cache_opt.disabled()
-    tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
-        args: [tokenizer_check_path] + tokenizer_system_libs,
-        dependencies: [thread_dep, libdl_dep])
-    if not tokenizer_cache and tokenizer_cache_opt.enabled()
-        error('causallm-tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with Applications/CausalLM/tools/build_tokenizers_c.sh.'.format(tokenizer_check_path))
-    endif
-endif
-if not tokenizer_cache
-    cpp_args += [ '-DCAUSALLM_DISABLE_TOKENIZER_CACHE' ]
-endif
+causallm_root = meson.current_source_dir()
+causallm_enable_qnn = get_option('enable-qnn-models')
+causallm_tokenizer_cache_name = 'causallm-tokenizer-cache'
+causallm_tokenizer_cache_opt = get_option(causallm_tokenizer_cache_name)
+causallm_tokenizer_probe_args = [tokenizer_check_path] + tokenizer_system_libs
+causallm_tokenizer_probe_deps = [thread_dep, libdl_dep]
+subdir('app_build/common')
+causallm_src += causallm_htp_model_src + causallm_qnn_src
+cpp_args += causallm_common_cpp_args
 
 # ── xgrammar (wrapper + vendored library), compiled into libcausallm.so ──
 # api/xgrammar_manager.cpp:26 defines a Meyers singleton
@@ -220,35 +214,6 @@ causallm_xgrammar_inc = [
     include_directories('xgrammar' / 'include'),
     include_directories('xgrammar' / '3rdparty' / 'picojson'),
     include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
-]
-
-causallm_xgrammar_src = [
-    # wrapper: bridges causallm::XGrammar to the xgrammar library.
-    meson.current_source_dir() / 'api' / 'xgrammar_wrapper.cpp',
-    meson.current_source_dir() / 'api' / 'xgrammar_manager.cpp',
-    # xgrammar library sources (from the xgrammar submodule checkout under
-    # this directory).
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'config.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'earley_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'regex_converter.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'structural_tag.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'testing.cc',
-    # Support files (required for linking)
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
-    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
 ]
 
 causallm_xgrammar_lib = static_library('causallm_xgrammar',
@@ -276,23 +241,9 @@ if get_option('enable-qnn-models')
         error('enable-qnn-models requires enable-npu (the libqnn_context.so QNN backend)')
     endif
 
-    causallm_src += [
-        meson.current_source_dir() / 'qnn' / 'android_memory_allocator.cpp',
-        meson.current_source_dir() / 'qnn' / 'quick_dot_ai_qnn.cpp',
-        meson.current_source_dir() / 'qnn' / 'graph_parser.cpp',
-        meson.current_source_dir() / 'qnn' / 'generate_qnn_utils.cpp',
-        meson.current_source_dir() / 'qnn' / 'qnn_kv_cache_manager.cpp',
-        meson.current_source_dir() / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
-    ]
-
     causallm_extra_inc += [
         include_directories('qnn'),
         include_directories('qnn' / 'gemma4-e2b-qnn'),
-    ]
-
-    cpp_args += [
-        '-DENABLE_QNN=1',
-        '-DENABLE_QNN_MODELS=1',
     ]
 endif
 
@@ -488,6 +439,24 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Expert slot residency (expert_residency.h): host-only, header-only. Pins
+  # the per-layer LRU that decides which device slot a streamed MoE expert
+  # is read into.
+  unittest_expert_residency = executable(
+    'unittest_expert_residency',
+    meson.current_source_dir() / 'layers' / 'unittest_expert_residency.cpp',
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_expert_residency', unittest_expert_residency,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_expert_residency'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Portable token sampler (token_sampler.h): host-only, header-only. Pins the
   # RNG stream, same-seed reproducibility and the top-k / top-p tie rules.
   unittest_sampling = executable(
@@ -524,6 +493,7 @@ if get_option('enable-test')
   causallm_fixture_tars = [
     meson.source_root() / 'packaging' / 'causallm_reference_generation.tar.gz',
     meson.source_root() / 'packaging' / 'causallm_reference_embedding.tar.gz',
+    meson.source_root() / 'packaging' / 'causallm_reference_gemma4_htp.tar.gz',
   ]
   # The tarballs already contain a top-level `causallm_reference/` directory, so
   # extract into models/ (NOT models/causallm_reference/, which would double the
@@ -581,6 +551,9 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_htp.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_expert_lru.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_mha_core_dispatch.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_slim_moe.cpp',

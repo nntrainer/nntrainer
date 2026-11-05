@@ -14,6 +14,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 
 #include <app_context.h>
 #include <engine.h>
@@ -23,6 +28,7 @@
 #include <cuda_context.h>
 #endif
 #include <model.h>
+#include <nntrainer_log.h>
 #include <per_layer_slice.h>
 #include <reshaped_rms_norm.h>
 
@@ -263,6 +269,86 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
         !rope_params["sliding_attention"]["partial_rotary_factor"].is_null()) {
       SLIDING_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR =
         rope_params["sliding_attention"]["partial_rotary_factor"].get<float>();
+    }
+  }
+
+  // HF names the GeGLU activation hidden_activation (older configs:
+  // hidden_act). gelu_pytorch_tanh / gelu_new are the tanh approximation,
+  // gelu is the exact erf form.
+  const std::string hf_act =
+    cfg.contains("hidden_activation") && cfg["hidden_activation"].is_string()
+      ? cfg["hidden_activation"].get<std::string>()
+    : cfg.contains("hidden_act") && cfg["hidden_act"].is_string()
+      ? cfg["hidden_act"].get<std::string>()
+      : std::string("gelu_pytorch_tanh");
+  if (hf_act == "gelu_pytorch_tanh" || hf_act == "gelu_new" ||
+      hf_act == "gelu_fast")
+    HIDDEN_ACTIVATION = "tanh_gelu";
+  else if (hf_act == "gelu")
+    HIDDEN_ACTIVATION = "gelu";
+  else
+    NNTR_THROW_IF(true, std::invalid_argument)
+      << "[Gemma4] unsupported hidden_activation: " << hf_act;
+
+  // Checkpoints trained with an int8 KV cache depend on its clipping:
+  // nntr_config "kv_quant_file" names a file with, per layer, one symmetric
+  // int8 scale per kv head for the keys (after RoPE) and the values, applied
+  // when K / V are written to the cache.
+  K_CACHE_INT8_SCALES.clear();
+  V_CACHE_INT8_SCALES.clear();
+  if (nntr_cfg.contains("kv_quant_file") &&
+      nntr_cfg["kv_quant_file"].is_string()) {
+    // A relative name is resolved against the CWD first (CLI harnesses cd
+    // into the model dir), then against the directory of the other pack
+    // files: an app process runs with CWD "/" and a loader that did not
+    // rebase this key would otherwise fail here.
+    std::string path = nntr_cfg["kv_quant_file"].get<std::string>();
+    std::ifstream f(path);
+    if (!f.is_open() && std::filesystem::path(path).is_relative()) {
+      for (const char *key :
+           {"model_file_name", "embedding_file_name", "tokenizer_file"}) {
+        if (!nntr_cfg.contains(key) || !nntr_cfg[key].is_string())
+          continue;
+        const std::filesystem::path dir =
+          std::filesystem::path(nntr_cfg[key].get<std::string>()).parent_path();
+        if (dir.empty())
+          continue;
+        const std::string cand = (dir / path).string();
+        f.clear();
+        f.open(cand);
+        if (f.is_open()) {
+          path = cand;
+          std::cerr << "[Gemma4] kv_quant_file resolved to " << path << "\n";
+          break;
+        }
+      }
+    }
+    NNTR_THROW_IF(!f.is_open(), std::invalid_argument)
+      << "[Gemma4] cannot open kv_quant_file " << path;
+    ml_logi("[Gemma4] kv_quant_file: %s", path.c_str());
+    json kvq = json::parse(f);
+    NNTR_THROW_IF(kvq.value("bw", 0) != 8 || !kvq.value("symmetric", false),
+                  std::invalid_argument)
+      << "[Gemma4] kv_quant_file supports symmetric 8-bit only: " << path;
+    const auto &layers = kvq.at("layers");
+    NNTR_THROW_IF(!layers.is_array() ||
+                    layers.size() != static_cast<size_t>(NUM_LAYERS),
+                  std::invalid_argument)
+      << "[Gemma4] kv_quant_file must list " << NUM_LAYERS << " layers";
+    auto join = [](const json &arr) {
+      std::ostringstream ss;
+      for (size_t i = 0; i < arr.size(); ++i)
+        ss << (i ? "," : "") << std::setprecision(9) << arr[i].get<float>();
+      return ss.str();
+    };
+    K_CACHE_INT8_SCALES.assign(NUM_LAYERS, std::string());
+    V_CACHE_INT8_SCALES.assign(NUM_LAYERS, std::string());
+    for (const auto &l : layers) {
+      const int id = l.at("layer").get<int>();
+      NNTR_THROW_IF(id < 0 || id >= NUM_LAYERS, std::invalid_argument)
+        << "[Gemma4] kv_quant_file: bad layer " << id;
+      K_CACHE_INT8_SCALES[id] = join(l.at("k_scale"));
+      V_CACHE_INT8_SCALES[id] = join(l.at("v_scale"));
     }
   }
 
@@ -513,27 +599,41 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   post_attn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_attn_norm_props, is_kv_shared_layer);
   LayerHandle post_attn_norm(createLayer("rms_norm", post_attn_norm_props));
-  Tensor post_normed = post_attn_norm(att_out);
 
-  std::vector<std::string> post_attention_add_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_post_attention")};
-  post_attention_add_props.push_back(withKey("engine", causallm_engine()));
-  appendSkipPrefillIfNeeded(post_attention_add_props, is_kv_shared_layer);
-  LayerHandle post_attention_add(
-    createLayer("addition", post_attention_add_props));
-  Tensor post_attention = post_attention_add({input, post_normed});
+  // Fused form (see fuseNormResidualAdd()): the norm adds the block input in
+  // its own kernel, and the FFN block returns its output with post_attention
+  // already added, so neither residual addition layer exists.
+  const bool fuse_norm_add = fuseNormResidualAdd();
+  Tensor post_attention;
+  if (fuse_norm_add) {
+    post_attention = post_attn_norm({att_out, input});
+  } else {
+    Tensor post_normed = post_attn_norm(att_out);
+
+    std::vector<std::string> post_attention_add_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_post_attention")};
+    post_attention_add_props.push_back(withKey("engine", causallm_engine()));
+    appendSkipPrefillIfNeeded(post_attention_add_props, is_kv_shared_layer);
+    LayerHandle post_attention_add(
+      createLayer("addition", post_attention_add_props));
+    post_attention = post_attention_add({input, post_normed});
+  }
 
   Tensor post_ffn =
     createFeedForwardBlock(layer_id, post_attention, is_kv_shared_layer);
 
-  std::vector<std::string> decoder_output_base_props = {withKey(
-    "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
-  decoder_output_base_props.push_back(withKey("engine", causallm_engine()));
-  appendSkipPrefillIfNeeded(decoder_output_base_props, is_kv_shared_layer);
-  LayerHandle decoder_output_base_layer(
-    createLayer("addition", decoder_output_base_props));
-  Tensor decoder_output_base =
-    decoder_output_base_layer({post_attention, post_ffn});
+  Tensor decoder_output_base;
+  if (fuse_norm_add) {
+    decoder_output_base = post_ffn;
+  } else {
+    std::vector<std::string> decoder_output_base_props = {withKey(
+      "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
+    decoder_output_base_props.push_back(withKey("engine", causallm_engine()));
+    appendSkipPrefillIfNeeded(decoder_output_base_props, is_kv_shared_layer);
+    LayerHandle decoder_output_base_layer(
+      createLayer("addition", decoder_output_base_props));
+    decoder_output_base = decoder_output_base_layer({post_attention, post_ffn});
+  }
 
   Tensor decoder_output = decoder_output_base;
   if (HIDDEN_SIZE_PER_LAYER_INPUT > 0) {
@@ -569,7 +669,9 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     std::vector<std::string> per_layer_input_mul_props = {
       withKey("name",
               "layer" + std::to_string(layer_id) + "_per_layer_input_mul"),
-      withKey("engine", causallm_engine())};
+      withKey("engine", causallm_engine()),
+      withKey("gelu_approximate",
+              HIDDEN_ACTIVATION == "gelu" ? "none" : "tanh")};
     appendSkipPrefillIfNeeded(per_layer_input_mul_props, is_kv_shared_layer);
     LayerHandle per_layer_input_mul(
       createLayer("geglu", per_layer_input_mul_props));
@@ -644,6 +746,8 @@ Tensor Gemma4Transformer::createFeedForwardBlock(const int layer_id,
   post_ffn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_ffn_norm_props, is_kv_shared_layer);
   LayerHandle post_ffn_norm(createLayer("rms_norm", post_ffn_norm_props));
+  if (fuseNormResidualAdd())
+    return post_ffn_norm({ffn_out, post_attention});
   return post_ffn_norm(ffn_out);
 }
 
@@ -757,6 +861,9 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     withKey("gpu_decode_rope",
             getModelFeatures().decode_rope_gpu ? "true" : "false"),
     withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
+    // The layer indexes the KV plane with the same ring default the model
+    // sized it with (Transformer::kvRingByDefault()).
+    withKey("kv_window_ring", kvRingByDefault() ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
@@ -932,7 +1039,16 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("gpu_decode_rope",
             getModelFeatures().decode_rope_gpu ? "true" : "false"),
     withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
+    // The layer indexes the KV plane with the same ring default the model
+    // sized it with (Transformer::kvRingByDefault()).
+    withKey("kv_window_ring", kvRingByDefault() ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
+  if (!K_CACHE_INT8_SCALES.empty()) {
+    a_params.push_back(
+      withKey("k_cache_int8_scales", K_CACHE_INT8_SCALES[layer_id]));
+    a_params.push_back(
+      withKey("v_cache_int8_scales", V_CACHE_INT8_SCALES[layer_id]));
+  }
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
   Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q_scaled, k_normed,
@@ -984,7 +1100,8 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   // residency.
   std::vector<std::string> ffn_geglu_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
-    withKey("engine", causallm_engine())};
+    withKey("engine", causallm_engine()),
+    withKey("gelu_approximate", HIDDEN_ACTIVATION == "gelu" ? "none" : "tanh")};
   appendSkipPrefillIfNeeded(ffn_geglu_props, is_kv_shared_layer);
   LayerHandle ffn_geglu(createLayer("geglu", ffn_geglu_props));
   Tensor geglu = ffn_geglu({gate, up});

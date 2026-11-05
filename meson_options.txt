@@ -30,7 +30,22 @@ option('qnn-sdk-root', type: 'string', value: '')
 # so it needs a Qualcomm SoC with an HTP/HMX block -- not ARM in general, and
 # there is no x86 build of it.
 option('enable-htp', type: 'boolean', value: false)
+# Host twin of the HTP backend (#84): the DSP skel sources compiled for the
+# build machine and linked into libnntrainer.so in place of the FastRPC
+# client stub, with scalar stand-ins for the HMX unit and the FastRPC
+# runtime (test/htp/host/inproc, standin, hvx_emu, stub). Needs only the
+# Hexagon SDK headers (-Dhexagon-sdk-root) and the qaic-generated
+# nntr_hvx.h, not libsdkl or HexKL. A gate, not a benchmark: no number it
+# prints means anything on the device.
+option('htp-inproc', type: 'boolean', value: false)
 option('hexkl-sdk-root', type: 'string', value: '')
+
+# The Hexagon SDK itself, for remote.h and AEEStdErr.h under <root>/incs.
+# Left empty this is derived as two levels up from hexkl-sdk-root, which is
+# right when the addon sits in Hexagon_SDK/<ver>/addons/hexkl_addon and wrong
+# for a standalone drop -- the beta2 this project uses unpacks to its own
+# directory, where the derivation lands on the parent of the checkout.
+option('hexagon-sdk-root', type: 'string', value: '')
 # Which prebuilt libsdkl.so to link (lib/<subdir>/libsdkl.so). Keep the CPU-side
 # SDKL helper on armv8: the armv9 prebuilt may use instructions unavailable to
 # the Android app process on current SM8750/V79 devices.

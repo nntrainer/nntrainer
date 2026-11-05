@@ -1,0 +1,29 @@
+Running main() from ./googletest/src/gtest_main.cc
+Note: Google Test filter = Gemma4HtpContract.*:Gemma4HtpDifferential.*
+[==========] Running 4 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from Gemma4HtpDifferential
+[ RUN      ] Gemma4HtpDifferential.FusedFP32MatchesPinnedReference
+nntrainer: cannot write log files under /home/seungbaek/.cache/nntrainer/logs; file logging disabled, warnings and errors go to stderr
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/app_context.cpp:getConfig:156) [AppContext]  conf path does not exist, skip getting plugin path from the conf
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/layers/layer_context.cpp:requestOutputs:123) given output is being dangled: out0 in context: output_of_causallm
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/models/neuralnet.cpp:load:1781) weight file '/tmp/nntr-pr4428-validation/test/unittest/models/causallm_reference/gemma4_htp_moe_tiny/nntr_gemma4_moe_tiny_fp32.bin' is 8192 bytes longer than the 592296 bytes this graph accounts for; reading the leading 592296 and ignoring the tail
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/layers/layer_context.cpp:requestOutputs:123) given output is being dangled: out0 in context: output_of_causallm
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/models/neuralnet.cpp:load:1781) weight file '/tmp/nntr-pr4428-validation/test/unittest/models/causallm_reference/gemma4_htp_moe_tiny/nntr_gemma4_moe_tiny_fp32.bin' is 8192 bytes longer than the 592296 bytes this graph accounts for; reading the leading 592296 and ignoring the tail
+[       OK ] Gemma4HtpDifferential.FusedFP32MatchesPinnedReference (56 ms)
+[----------] 1 test from Gemma4HtpDifferential (56 ms total)
+
+[----------] 3 tests from Gemma4HtpContract
+[ RUN      ] Gemma4HtpContract.FactoryRequiresExplicitProfileAndFormat
+[       OK ] Gemma4HtpContract.FactoryRequiresExplicitProfileAndFormat (1 ms)
+[ RUN      ] Gemma4HtpContract.RejectsUnsupportedCacheEngineAndDtypes
+[       OK ] Gemma4HtpContract.RejectsUnsupportedCacheEngineAndDtypes (2 ms)
+[ RUN      ] Gemma4HtpContract.RejectsTruncatedWeightBeforeInference
+[NNTRAINER WARN  2026-11-05 18:38:47] (/tmp/nntr-pr4428-validation/nntrainer/layers/layer_context.cpp:requestOutputs:123) given output is being dangled: out0 in context: output_of_causallm
+[       OK ] Gemma4HtpContract.RejectsTruncatedWeightBeforeInference (3 ms)
+[----------] 3 tests from Gemma4HtpContract (7 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 2 test suites ran. (63 ms total)
+[  PASSED  ] 4 tests.
+INPROC rpc exit: mapped_kib=0 freed_while_mapped=0

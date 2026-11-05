@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 SeungHui Lee <shsh1004.lee@samsung.com>
+ *
+ * @file   hvx_gemm_u8i4_wh.h
+ * @date   16 Sep 2026
+ * @brief  HVX u8 x i4 matmul over HMX-layout tiles, bit-identical to HMX
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author SeungHui Lee <shsh1004.lee@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#ifndef __NNTRAINER_HVX_GEMM_U8I4_WH_H__
+#define __NNTRAINER_HVX_GEMM_U8I4_WH_H__
+
+#include <stdint.h>
+
+/** @brief Most activation rows one call handles. The MoE kernel's tail
+ *         blocks are at most this many rows (hexkl_mm_u8i4_moe.c); the
+ *         HMX unit's own block is 64 and that is what a bigger block goes
+ *         to. */
+#define HVX_GEMM_U8I4_MAX_ROWS 16u
+
+/**
+ * @brief One n-tile column of C = A x W for @a m rows, exact int32 --
+ *        the same numbers the HMX unit produces for the same tiles, since
+ *        both are plain integer sums of u8 x i4 products (no rounding
+ *        anywhere), so a row computed here and a row computed by the HMX
+ *        dequantize to identical bytes.
+ *
+ * Reads the operands as the HMX sees them: @a act_ah in AH tiles (64 rows
+ * x 32 bytes per k-tile at a 2048-byte stride, row r at r*32) and @a wh in
+ * WH tiles (32x32 i4, 512 bytes, tile (kt, nt) at (kt*n_col + nt)*512,
+ * nibble layout per htp_wh_layout.h: byte (r/8)*128 + c*4 + r%4, low
+ * nibble for rows 8g..8g+3, high for 8g+4..8g+7). That layout is what
+ * makes this cheap: each 128-byte quarter of a tile is one HVX vector
+ * whose lane c already holds the four consecutive k values of column c,
+ * which is exactly what vrmpy multiplies against four activation bytes.
+ *
+ * @param act_ah   the row block's AH tiles, k_tiles of them
+ * @param m        rows to compute, 1..HVX_GEMM_U8I4_MAX_ROWS
+ * @param k_tiles  reduction length in 32-wide tiles
+ * @param wh       the weight's WH bytes (DDR is fine; a column is 2D
+ *                 prefetched)
+ * @param n_col    the weight's n-tile count (tile row stride)
+ * @param nt       the n-tile column to compute
+ * @param rows1    non-zero: a lone last row (m = 1, 5, 9, 13) runs the
+ *                 one-accumulator loop gemm_row1; zero: every row group
+ *                 runs gemm_rows4. The two knobs of #113 -- this one and
+ *                 the caller's l2fetch lead -- are independent, so the
+ *                 (loop, lead) matrix can be swept; LEDGER rule 26 says
+ *                 the choice is a latency-hiding question, not a compute
+ *                 one, so there is no a-priori winner.
+ * Accumulation order, per output int32: kt ascending, then the four
+ * 128-byte quarters g ascending, then the quarter's low-nibble rows before
+ * its high-nibble rows, all into one accumulator per row, then one
+ * arithmetic shift by 4. Rows go four at a time (gemm_rows4) and, when
+ * @a rows1 is set, a lone last row alone (gemm_row1); both follow that
+ * order. The integer sums are exact either way, so @a rows1 changes no
+ * result bit and the order is documented for the review list, not needed
+ * for the equality.
+ *
+ * @param out      m x 32 int32, row-major, row stride 32 -- the same shape
+ *                 hexkl_micro_hmx_acc_read_int32 lands with row_stride 32,
+ *                 so the existing dequant passes read it unchanged
+ */
+void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, int32_t *out);
+
+/** @brief hvx_gemm_u8i4_wh_col without its own l2fetch: for a caller that
+ *         already issued hvx_gemm_u8i4_wh_prefetch over this column ahead
+ *         of time. Same arguments, same result. */
+void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, uint32_t rows1,
+                               int32_t *out);
+
+/** @brief One M=1 projection without prefetch, with 128-byte aligned wh/out.
+ * The caller provides an aligned VTCM weight slab and output tiles. */
+void hvx_gemv_u8i4_wh_col_aligned_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                       const uint8_t *wh, uint32_t n_col,
+                                       uint32_t nt, int32_t *out);
+
+/** @brief Three M=1 projections sharing one activation row. The WH planes
+ * are plane_bytes apart and use the same column stride. Reuses activation
+ * loads/broadcasts while preserving each projection's integer sum order.
+ * Output is three consecutive 32-column int32 tiles; no prefetch is issued.
+ * wh and out must be 128-byte aligned; plane_bytes must be a multiple of 512.
+ * Adjacent output tiles use plane_bytes = 512; separate planes may also be
+ * used. */
+void hvx_gemv_u8i4_wh_3col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out);
+
+/** @brief Four M=1 projections with the same layout and alignment contract
+ * as hvx_gemv_u8i4_wh_3col_nopf. Writes four 32-column int32 tiles. */
+void hvx_gemv_u8i4_wh_4col_nopf(const uint8_t *act_ah, uint32_t k_tiles,
+                                const uint8_t *wh, uint32_t plane_bytes,
+                                uint32_t n_col, uint32_t nt, int32_t *out);
+
+/**
+ * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)
+ *        over all @a k_tiles: n_tiles*512 bytes every n_col*512, k_tiles
+ *        times. A hint only; it changes no result. The hardware queues
+ *        three per thread and stalls the thread on a fourth (V79 PRM,
+ *        "Software-based l2fetch"), so a caller keeps at most three
+ *        outstanding. Width, stride and height are 16-bit fields:
+ *        n_tiles*512 and n_col*512 must be below 65536.
+ */
+void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles);
+
+/**
+ * @brief Native packed-2-bit counterpart of hvx_gemm_u8i4_wh_col_nopf.
+ *
+ * @a wh contains QS2CX_WH codes in whPack2 order (256 bytes per 32x32
+ * tile), not expanded int4 WH bytes. @a table is the 128-byte, replicated
+ * code-pair LUT from hvx_expand_i2i4_table. It is loaded into an HVX
+ * register once and each lookup result feeds vrmpyacc directly; no expanded
+ * weight is written to VTCM.
+ */
+void hvx_gemm_u8i2_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, uint32_t rows1,
+                               const uint8_t *table, int32_t *out);
+
+/**
+ * @brief Compute two packed-2-bit columns while sharing activation loads,
+ *        splats and the register LUT. The optimized kernel is used for M=1;
+ *        larger M falls back to two exact single-column calls.
+ */
+void hvx_gemm_u8i2_wh_cols2_nopf(const uint8_t *act_ah, uint32_t m,
+                                 uint32_t k_tiles, const uint8_t *wh,
+                                 uint32_t n_col, uint32_t nt0, uint32_t nt1,
+                                 uint32_t rows1, const uint8_t *table,
+                                 int32_t *out0, int32_t *out1);
+
+/** @brief Native packed-2-bit GEMV with one packed-layout l2fetch. */
+void hvx_gemm_u8i2_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t rows1, const uint8_t *table, int32_t *out);
+
+/** @brief l2fetch for adjacent 256-byte packed-2-bit WH tiles. */
+void hvx_gemm_u8i2_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles);
+
+#endif /* __NNTRAINER_HVX_GEMM_U8I4_WH_H__ */

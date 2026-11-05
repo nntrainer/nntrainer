@@ -40,18 +40,26 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <baked_prefix.h>
+#include <device_kv_manager.h>
 #include <kv_cache_manager.h>
+#include <prefix_flash_store.h>
 #include <token_sampler.h>
 #include <transformer.h>
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 extern "C" {
 struct BaseStreamer;
+}
+namespace nntrainer {
+struct HtpPrefixCalibration;
 }
 
 namespace causallm {
@@ -70,6 +78,10 @@ public:
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+  struct SystemPrefixStats {
+    uint64_t loaded_assets = 0, hits = 0, reused_tokens = 0, errors = 0;
+    double restore_ms = 0;
+  };
 
   /**
    * @brief Model-teardown hook for the process-global device caches the
@@ -85,7 +97,64 @@ public:
    */
   static void releaseDeviceCaches();
 
+  struct DecodePrefixRestoreStats {
+    unsigned prefix_tokens = 0, suffix_tokens = 0, prefill_calls = 0;
+    double read_ms = 0, conversion_ms = 0, bind_ms = 0, prefill_ms = 0;
+  };
+
 protected:
+  bool htp_execution_profile_ = false;
+  struct DevicePrefillFrame {
+    unsigned from = 0, plane = 0, chunk = 0;
+    std::shared_ptr<const KVCacheManager::PrefixSnapshot> kv;
+    std::shared_ptr<PrefixFlashStore::Entry> flash;
+    std::shared_ptr<const BakedPrefix::Frame> baked;
+    std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
+      calibration;
+  };
+  using DevicePrefillHistory = std::map<unsigned, DevicePrefillFrame>;
+  std::unique_ptr<PrefixFlashStore> device_prefix_flash_;
+  std::unique_ptr<BakedPrefix::Writer> system_prefix_writer_;
+  json system_prefix_config_, system_prefix_nntr_, system_prefix_identity_;
+  json deviceSystemPrefixIdentity();
+  // Declared before the manager: its release callbacks erase these handles.
+  std::shared_ptr<DevicePrefillHistory> device_prefill_history_;
+  std::map<uint32_t, std::shared_ptr<const DevicePrefillHistory>>
+    device_prefill_states_;
+  struct DeviceDecodePrefix {
+    unsigned position;
+    std::shared_ptr<PrefixFlashStore::Entry> flash;
+    std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
+      calibration;
+  };
+  std::map<uint32_t, DeviceDecodePrefix> device_decode_prefixes_;
+  uint32_t next_decode_prefix_ = 0x80000000u;
+  SystemPrefixStats system_prefix_stats_;
+  bool device_prefix_mode_ = false;
+  bool device_prefill_capture_ = false;
+  bool device_prefix_flash_capture_ = true;
+  bool device_prefill_restored_ = false;
+  bool device_decode_prefix_enabled_ = false;
+  DecodePrefixRestoreStats decode_prefix_restore_stats_;
+  std::unique_ptr<DeviceKVManager> device_kv_manager_;
+  bool htp_session_enabled_ = false;
+  bool htp_session_failed_ = false;
+  /** Last emitted token has not yet passed through attention. */
+  std::vector<unsigned int> htp_pending_tokens_;
+  std::vector<unsigned int> last_generated_ids_;
+#ifdef ENABLE_HEXKL
+  void captureDevicePrefill(unsigned from, unsigned position,
+                            unsigned earliest);
+  void restoreDevicePrefill(uint32_t handle, unsigned position);
+  /** Start an independent request; continuation steps must not call this. */
+  void beginIndependentHtpPrompt(
+    bool repeated,
+    const std::function<void(nntrainer::Layer &, nntrainer::RunLayerContext &)>
+      &reset_layer = {});
+#endif
+  /** Model-local preparation immediately before a timed prefill block.
+   * The default is empty; loaders and decode steps never call this hook. */
+  virtual void beforePrefillBlock(unsigned int, unsigned int) {}
   /**
    * @brief One-shot CUDA prewarm guard, PER MODEL OBJECT. A function-local
    *        static was process-lifetime, so the second load of a load/destroy
@@ -113,6 +182,18 @@ public:
     for (auto &kv : logits_pool_sizes_)
       delete[] kv.first;
   }
+
+  /**
+   * @brief Load the weights, and build the KV cache while they load.
+   * @details The KV cache used to be allocated and bound inside the first
+   * run(), i.e. inside TTFT. Its size does not depend on the prompt unless the
+   * prefill plane can still grow (prefillPlaneCanGrow()), so in every other
+   * case it is allocated here, on a side thread that overlaps the weight load,
+   * and bound once the load is done. NNTR_KV_EARLY=0 (or
+   * setPrepareRunAtLoad(false)) restores the lazy allocation in run();
+   * NNTR_KV_EARLY=sync allocates after the load on the calling thread.
+   */
+  void load_weight(const std::string &weight_path) override;
 
   /**
    * @brief run the CausalLM model
@@ -214,9 +295,70 @@ public:
    * @brief Absolute token position the next run() would continue from.
    * @note Equal to getKvLen() after a completed run; the two differ only while
    *       a resume has been armed but not yet consumed.
+   *       A resident HTP session keeps its final emitted token separately;
+   *       the next run consumes it before the new prompt's token IDs.
    */
   unsigned int getSessionTokenPosition() const {
     return SYS_PROMP_LEN + global_token_len;
+  }
+
+  /** Same-loaded-model DSP INT8 checkpoints, including pending feedback.
+   * park releases device K/V after a successful save. Restore before run(). */
+  WIN_EXPORT void saveDeviceKVCache(const std::string &path, bool park = true);
+  WIN_EXPORT void loadDeviceKVCache(const std::string &path);
+  /** Device INT8 K+V payload; zero before registration or while parked. */
+  WIN_EXPORT size_t getDeviceKVCacheBytes() const;
+  /** Unique retained host prefill K/V bytes, excluding metadata and scratch. */
+  WIN_EXPORT size_t getDeviceKVPrefixBytes() const;
+  /** Opt-in DSP COW sessions and a radix index of prefill pages.
+   * Requires htp.kv_session=true and htp.kv_paged=true. Serialized use only.
+   * Session 0 is the current conversation when enabled. New runs on an empty
+   * session search published prefixes automatically; continuation takes new
+   * text only. Prefix caching additionally requires htp.kv_prefix_cache and
+   * original q8/Q2 U16 attention. It retains immutable FP16 prefill pages
+   * independently of DSP INT8 session pages, and recomputes only the unmatched
+   * suffix.
+   */
+  WIN_EXPORT void enableDeviceKVManager(size_t max_sessions = 32,
+                                        size_t max_prefixes = 8);
+  WIN_EXPORT uint32_t createDeviceKVSession();
+  WIN_EXPORT uint32_t forkDeviceKVSession();
+  WIN_EXPORT void selectDeviceKVSession(uint32_t id);
+  WIN_EXPORT void destroyDeviceKVSession(uint32_t id);
+  WIN_EXPORT uint32_t activeDeviceKVSession() const;
+  WIN_EXPORT DeviceKVManager::Stats deviceKVManagerStats() const;
+  WIN_EXPORT void clearDeviceKVPrefixes();
+  /** Back up earlier native boundaries without blocking on Flash writes.
+   * Enable before inference. Staging overflow skips a backup, not inference.
+   */
+  WIN_EXPORT void enableDeviceKVPrefixFlash(const std::string &directory,
+                                            size_t flash_bytes,
+                                            size_t staging_bytes);
+  /** Checkpoint decode boundaries for radix reuse. A hit reconstructs host
+   * FP16 history and runs the suffix with native batched HMX prefill. */
+  WIN_EXPORT void enableDeviceKVDecodePrefixFlash();
+  const DecodePrefixRestoreStats &decodePrefixRestoreStats() const {
+    return decode_prefix_restore_stats_;
+  }
+  WIN_EXPORT PrefixFlashStore::Stats deviceKVPrefixFlashStats() const;
+  WIN_EXPORT void drainDeviceKVPrefixFlash();
+  /** Offline bake, with an empty active session and loaded original q8 model.
+   * Complete native prefill boundaries only; never pad/split attention calls.
+   * The destination must not exist. Persistent files outlive prefix eviction.
+   */
+  WIN_EXPORT json bakeDeviceSystemPrefix(const std::string &system_prompt,
+                                         const std::string &directory);
+  /** Validate model/tokenizer/runtime identity and register disk-backed radix
+   * terminals. Payload is read lazily only on a compatible token hit.
+   */
+  WIN_EXPORT json loadDeviceSystemPrefix(const std::string &directory);
+  WIN_EXPORT SystemPrefixStats deviceSystemPrefixStats() const {
+    return system_prefix_stats_;
+  }
+
+  bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
+  const std::vector<unsigned int> &getLastGeneratedTokenIds() const {
+    return last_generated_ids_;
   }
 
   /**
@@ -462,6 +604,36 @@ protected:
    *        Idempotent — safe to call once after initialize().
    */
   virtual void allocateAndBindKVCache();
+
+  /**
+   * @brief Before a step at absolute position pos: the windowed layers of
+   *        kv_cache move their window to the front (KVCacheManager::compact)
+   *        and the HTP attention layers get the new row bases.
+   * @param[in] pos absolute position of the next row
+   * @param[in] force hand the bases over even when none moved (after a load)
+   */
+  void compactKVCache(unsigned int pos, bool force = false,
+                      bool decode_view = false);
+
+  /**
+   * @brief Per-layer KV geometry, read from the model's hooks.
+   */
+  struct KVCacheLayout {
+    std::vector<unsigned int> widths; /**< per-layer K/V row width */
+    unsigned int max_timestep = 0;    /**< MAX_SEQ_LEN */
+  };
+
+  /**
+   * @brief Read the KV geometry hooks and declare the per-layer row caps and
+   *        the KV-sharing map on kv_cache. Model-side only, no allocation.
+   */
+  KVCacheLayout planKVCache();
+
+  /**
+   * @brief Allocate (and zero) kv_cache for @a layout. Touches only kv_cache,
+   *        so load_weight() can run it on a side thread.
+   */
+  void allocateKVCacheStorage(const KVCacheLayout &layout);
 
   /**
    * @brief incremental_inference wrapper that feeds the REAL KV-cache tensors

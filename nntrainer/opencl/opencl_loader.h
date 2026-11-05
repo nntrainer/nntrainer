@@ -178,6 +178,11 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueNDRangeKernel)(
   cl_uint /**< num_events_in_wait_list */,
   const cl_event * /**< event_wait_list */, cl_event * /**< event */);
 
+typedef cl_int(CL_API_CALL *PFN_clGetEventInfo)(
+  cl_event /**< event */, cl_event_info /**< param_name */,
+  size_t /**< param_value_size */, void * /**< param_value */,
+  size_t * /**< param_value_size_ret */);
+
 typedef cl_int(CL_API_CALL *PFN_clGetEventProfilingInfo)(
   cl_event /**< event */, cl_profiling_info /**< param_name */,
   size_t /**< param_value_size */, void * /**< param_value */,
@@ -229,6 +234,19 @@ typedef cl_int(CL_API_CALL *PFN_clWaitForEvents)(cl_uint num_events,
 
 typedef cl_int(CL_API_CALL *PFN_clReleaseEvent)(cl_event /**< event */);
 
+typedef cl_int(CL_API_CALL *PFN_clRetainEvent)(cl_event /**< event */);
+
+typedef cl_event(CL_API_CALL *PFN_clCreateUserEvent)(
+  cl_context /**< context */, cl_int * /**< errcode_ret */);
+
+typedef cl_int(CL_API_CALL *PFN_clSetUserEventStatus)(
+  cl_event /**< event */, cl_int /**< execution_status */);
+
+typedef cl_int(CL_API_CALL *PFN_clSetEventCallback)(
+  cl_event /**< event */, cl_int /**< command_exec_callback_type */,
+  void(CL_CALLBACK * /**< pfn_notify */)(cl_event, cl_int, void *),
+  void * /**< user_data */);
+
 typedef cl_int(CL_API_CALL *PFN_clEnqueueBarrierWithWaitList)(
   cl_command_queue /**< command_queue */,
   cl_uint /**< num_events_in_wait_list */,
@@ -238,6 +256,11 @@ typedef cl_int(CL_API_CALL *PFN_clGetKernelInfo)(
   cl_kernel /**< kernel */, cl_kernel_info /**< param_name */,
   size_t /**< param_value_size */, void * /**< param_value */,
   size_t * /**< param_value_size_ret */);
+
+typedef cl_int(CL_API_CALL *PFN_clGetKernelWorkGroupInfo)(
+  cl_kernel /**< kernel */, cl_device_id /**< device */,
+  cl_kernel_work_group_info /**< param_name */, size_t /**< param_value_size */,
+  void * /**< param_value */, size_t * /**< param_value_size_ret */);
 
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
@@ -264,6 +287,7 @@ extern PFN_clRetainProgram clRetainProgram;
 extern PFN_clCreateKernel clCreateKernel;
 extern PFN_clSetKernelArg clSetKernelArg;
 extern PFN_clEnqueueNDRangeKernel clEnqueueNDRangeKernel;
+extern PFN_clGetEventInfo clGetEventInfo;
 extern PFN_clGetEventProfilingInfo clGetEventProfilingInfo;
 extern PFN_clRetainContext clRetainContext;
 extern PFN_clReleaseContext clReleaseContext;
@@ -288,8 +312,13 @@ extern PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 extern PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 extern PFN_clWaitForEvents clWaitForEvents;
 extern PFN_clReleaseEvent clReleaseEvent;
+extern PFN_clRetainEvent clRetainEvent;
+extern PFN_clCreateUserEvent clCreateUserEvent;
+extern PFN_clSetUserEventStatus clSetUserEventStatus;
+extern PFN_clSetEventCallback clSetEventCallback;
 extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 extern PFN_clGetKernelInfo clGetKernelInfo;
+extern PFN_clGetKernelWorkGroupInfo clGetKernelWorkGroupInfo;
 
 /**
  * @brief Launch ledger -- what the host asked the queue for, per kernel name.

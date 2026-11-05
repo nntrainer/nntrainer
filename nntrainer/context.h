@@ -106,6 +106,16 @@ struct DeviceCaps {
                           this change, so there is no older layout to be
                           compatible with yet — the rule is for the next
                           field, not this one. */
+  bool int_dot_product = false; /**< OpenCL cl_khr_integer_dot_product
+                                     (packed int8 dot, dot_4x8packed_*): the
+                                     int8 kernels without a matrix engine. */
+  bool fp32_fma = true; /**< fp32 fma() is a hardware instruction (OpenCL
+                             CL_DEVICE_SINGLE_FP_CONFIG has CL_FP_FMA). When
+                             false the device runs fma() as a slow library
+                             routine (Adreno), so a kernel that needs a
+                             correctly rounded fma builds it from multiplies
+                             and adds instead. True when unknown: fma() is
+                             correct either way. */
 
   /**
    * @brief One-line human-readable dump for the init-time log.
@@ -117,6 +127,7 @@ struct DeviceCaps {
        << std::hex << vendor_id << std::dec << ", integrated=" << integrated
        << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
        << ", image_v8c=" << image_v8c << ", dpas=" << dpas
+       << ", int_dot_product=" << int_dot_product << ", fp32_fma=" << fp32_fma
        << ", compute_units=" << compute_units
        << ", max_alloc_bytes=" << max_alloc_bytes << "}";
     return os.str();

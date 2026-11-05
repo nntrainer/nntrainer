@@ -1,0 +1,477 @@
+{
+  "config": {
+    "act_scale_bytes": 2368,
+    "act_scale_json": "/data/local/tmp/nntr_pr4428_kv_validation/models/gemma4/act_scales.json",
+    "act_scale_offset": 6604559480,
+    "act_scale_sites": 296,
+    "attention_engine": "htp",
+    "attention_kv_dtype": "q8",
+    "attn_proj_engine": "htp",
+    "bad_word_ids": [],
+    "batch_size": 1,
+    "dense_ffn_engine": "htp",
+    "embedding_dtype": "Q4_0",
+    "fc_layer_dtype": "QS4CX_WH_AFFINE",
+    "gemma4_execution_profile": "htp_fused",
+    "gemma4_weight_format": "htp_fused_v1",
+    "htp": {
+      "attn_m1_fast": false,
+      "attn_m1_fast_scope": "global",
+      "attn_m1_q_bits": 16,
+      "attn_trace": false,
+      "kv_paged": true,
+      "kv_prefix_cache": true,
+      "kv_request_reserve": true,
+      "kv_seed_q": false,
+      "kv_session": true,
+      "page_cache": 0,
+      "profile": 0
+    },
+    "init_seq_len": 4096,
+    "lmhead_dtype": "QS4CX_WH_AFFINE",
+    "lmhead_engine": "htp",
+    "max_seq_len": 8192,
+    "model_file_name": "/data/local/tmp/nntr_pr4428_kv_validation/models/gemma4/nntr_gemma4_26b_a4b_tl2_rotated.bin",
+    "model_tensor_type": "Q4_0-FP32",
+    "model_type": "CausalLM",
+    "moe": {
+      "cache_grow": 0
+    },
+    "moe_cache_experts": 16,
+    "moe_decode_prefetch": true,
+    "moe_engine": "htp",
+    "moe_hadamard": "both",
+    "moe_hadamard_scope": "all",
+    "moe_hadamard_signs": "/data/local/tmp/nntr_pr4428_kv_validation/models/gemma4/rotation_signs.json",
+    "moe_layer_dtype": "TL2CX_WH",
+    "num_to_generate": 24,
+    "repetition_penalty": 1.0,
+    "sample_input": "<bos><|turn>user\nRead this record: The parcel code is ZEBRA-731 and the destination is Seoul. What is the parcel code? Answer with the code only.<turn|>\n<|turn>model\n<|channel>final\n<channel|>\n",
+    "skip_prefill": true,
+    "tokenizer_file": "/data/local/tmp/nntr_pr4428_kv_validation/models/gemma4/tokenizer.json"
+  },
+  "flash": {
+    "decode_steady_ms": 89.025156,
+    "decode_steady_tokens": 14,
+    "ids": [
+      100,
+      45518,
+      107,
+      100,
+      45518,
+      107,
+      101,
+      1579,
+      2293,
+      1735,
+      236772,
+      236828,
+      236812,
+      236778,
+      106
+    ],
+    "kv_bytes": 144179200,
+    "position": 3145,
+    "prefill_tokens": 23,
+    "ttft_ms": 2259.145312,
+    "wall_ms": 3550.974322
+  },
+  "flash_reference": {
+    "decode_steady_ms": 83.308255,
+    "decode_steady_tokens": 14,
+    "ids": [
+      100,
+      45518,
+      107,
+      100,
+      45518,
+      107,
+      101,
+      1579,
+      2293,
+      1735,
+      236772,
+      236828,
+      236812,
+      236778,
+      106
+    ],
+    "kv_bytes": 144179200,
+    "position": 3145,
+    "prefill_tokens": 23,
+    "ttft_ms": 2179.777499,
+    "wall_ms": 3391.615103
+  },
+  "passed": true,
+  "prefix": [
+    {
+      "decode_steady_ms": 90.34411449999999,
+      "decode_steady_tokens": 10,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        7942,
+        82859,
+        236772,
+        236832,
+        236800,
+        236770,
+        106
+      ],
+      "kv_bytes": 21626880,
+      "position": 163,
+      "prefill_tokens": 152,
+      "reused_tokens": 0,
+      "ttft_ms": 2396.74927,
+      "wall_ms": 3264.631093
+    },
+    {
+      "decode_steady_ms": 93.2725,
+      "decode_steady_tokens": 11,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        1579,
+        2293,
+        1735,
+        236772,
+        236828,
+        236812,
+        236778,
+        106
+      ],
+      "kv_bytes": 143523840,
+      "position": 3107,
+      "prefill_tokens": 3095,
+      "reused_tokens": 0,
+      "ttft_ms": 9691.323433,
+      "wall_ms": 10740.264579
+    }
+  ],
+  "prefix_reference": [
+    {
+      "decode_steady_ms": 87.2498175,
+      "decode_steady_tokens": 10,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        7942,
+        82859,
+        236772,
+        236832,
+        236800,
+        236770,
+        106
+      ],
+      "kv_bytes": 21626880,
+      "position": 163,
+      "prefill_tokens": 152,
+      "ttft_ms": 2269.8269259999997,
+      "wall_ms": 3127.332915
+    },
+    {
+      "decode_steady_ms": 92.20635399999999,
+      "decode_steady_tokens": 11,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        1579,
+        2293,
+        1735,
+        236772,
+        236828,
+        236812,
+        236778,
+        106
+      ],
+      "kv_bytes": 143523840,
+      "position": 3107,
+      "prefill_tokens": 3095,
+      "ttft_ms": 7457.168747,
+      "wall_ms": 8453.641924
+    }
+  ],
+  "reference": [
+    [
+      {
+        "decode_steady_ms": 94.677292,
+        "decode_steady_tokens": 1,
+        "ids": [
+          156274,
+          106
+        ],
+        "kv_bytes": 21626880,
+        "position": 129,
+        "prefill_tokens": 127,
+        "ttft_ms": 2235.837968,
+        "wall_ms": 2332.668697
+      },
+      {
+        "decode_steady_ms": 90.170052,
+        "decode_steady_tokens": 10,
+        "ids": [
+          100,
+          45518,
+          107,
+          101,
+          7942,
+          82859,
+          236772,
+          236832,
+          236800,
+          236770,
+          106
+        ],
+        "kv_bytes": 21626880,
+        "position": 163,
+        "prefill_tokens": 23,
+        "ttft_ms": 1925.805625,
+        "wall_ms": 2776.397239
+      },
+      {
+        "decode_steady_ms": 73.257448,
+        "decode_steady_tokens": 13,
+        "ids": [
+          100,
+          45518,
+          107,
+          100,
+          45518,
+          107,
+          101,
+          7942,
+          82859,
+          236772,
+          236832,
+          236800,
+          236770,
+          106
+        ],
+        "kv_bytes": 28835840,
+        "position": 200,
+        "prefill_tokens": 23,
+        "ttft_ms": 1816.544166,
+        "wall_ms": 2779.971613
+      }
+    ],
+    [
+      {
+        "decode_steady_ms": 0.0,
+        "decode_steady_tokens": 0,
+        "ids": [
+          1
+        ],
+        "kv_bytes": 142868480,
+        "position": 3072,
+        "prefill_tokens": 3071,
+        "ttft_ms": 7458.703331,
+        "wall_ms": 7463.203591
+      },
+      {
+        "decode_steady_ms": 95.050364,
+        "decode_steady_tokens": 11,
+        "ids": [
+          100,
+          45518,
+          107,
+          101,
+          1579,
+          2293,
+          1735,
+          236772,
+          236828,
+          236812,
+          236812,
+          106
+        ],
+        "kv_bytes": 143523840,
+        "position": 3107,
+        "prefill_tokens": 23,
+        "ttft_ms": 2076.347551,
+        "wall_ms": 3126.495311
+      },
+      {
+        "decode_steady_ms": 91.547448,
+        "decode_steady_tokens": 14,
+        "ids": [
+          100,
+          45518,
+          107,
+          100,
+          45518,
+          107,
+          101,
+          1579,
+          2293,
+          1735,
+          236772,
+          236828,
+          236812,
+          236812,
+          106
+        ],
+        "kv_bytes": 150732800,
+        "position": 3145,
+        "prefill_tokens": 23,
+        "ttft_ms": 2062.469478,
+        "wall_ms": 3337.436457
+      }
+    ]
+  ],
+  "stats": {
+    "hits": 0,
+    "prefixes": 4,
+    "radix_nodes": 5,
+    "reused_tokens": 0,
+    "sessions": 5
+  },
+  "switched": [
+    {
+      "decode_steady_ms": 101.193073,
+      "decode_steady_tokens": 1,
+      "ids": [
+        156274,
+        106
+      ],
+      "kv_bytes": 21626880,
+      "position": 129,
+      "prefill_tokens": 127,
+      "session": 0,
+      "switch_ms": 0.000105,
+      "ttft_ms": 2255.969374,
+      "turn": 0,
+      "wall_ms": 2373.000468
+    },
+    {
+      "decode_steady_ms": 0.0,
+      "decode_steady_tokens": 0,
+      "ids": [
+        1
+      ],
+      "kv_bytes": 142868480,
+      "position": 3072,
+      "prefill_tokens": 3071,
+      "session": 1,
+      "switch_ms": 9.68599,
+      "ttft_ms": 7919.495674,
+      "turn": 0,
+      "wall_ms": 7922.494997
+    },
+    {
+      "decode_steady_ms": 93.06875,
+      "decode_steady_tokens": 10,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        7942,
+        82859,
+        236772,
+        236832,
+        236800,
+        236770,
+        106
+      ],
+      "kv_bytes": 21626880,
+      "position": 163,
+      "prefill_tokens": 23,
+      "session": 0,
+      "switch_ms": 18.245208,
+      "ttft_ms": 1990.1877069999998,
+      "turn": 1,
+      "wall_ms": 2856.041093
+    },
+    {
+      "decode_steady_ms": 93.983229,
+      "decode_steady_tokens": 11,
+      "ids": [
+        100,
+        45518,
+        107,
+        101,
+        1579,
+        2293,
+        1735,
+        236772,
+        236828,
+        236812,
+        236812,
+        106
+      ],
+      "kv_bytes": 143523840,
+      "position": 3107,
+      "prefill_tokens": 23,
+      "session": 1,
+      "switch_ms": 19.356042,
+      "ttft_ms": 2123.743854,
+      "turn": 1,
+      "wall_ms": 3188.541666
+    },
+    {
+      "decode_steady_ms": 74.903177,
+      "decode_steady_tokens": 13,
+      "ids": [
+        100,
+        45518,
+        107,
+        100,
+        45518,
+        107,
+        101,
+        7942,
+        82859,
+        236772,
+        236832,
+        236800,
+        236770,
+        106
+      ],
+      "kv_bytes": 28835840,
+      "position": 200,
+      "prefill_tokens": 23,
+      "session": 0,
+      "switch_ms": 20.067709,
+      "ttft_ms": 1912.897448,
+      "turn": 2,
+      "wall_ms": 2903.769009
+    },
+    {
+      "decode_steady_ms": 95.56950499999999,
+      "decode_steady_tokens": 14,
+      "ids": [
+        100,
+        45518,
+        107,
+        100,
+        45518,
+        107,
+        101,
+        1579,
+        2293,
+        1735,
+        236772,
+        236828,
+        236812,
+        236812,
+        106
+      ],
+      "kv_bytes": 150732800,
+      "position": 3145,
+      "prefill_tokens": 23,
+      "session": 1,
+      "switch_ms": 18.285781,
+      "ttft_ms": 2125.2395309999997,
+      "turn": 2,
+      "wall_ms": 3460.821457
+    }
+  ]
+}

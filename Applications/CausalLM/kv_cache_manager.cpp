@@ -12,10 +12,17 @@
 
 #include "kv_cache_manager.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <utility>
+
+#include <fp16.h>
+#include <memory_data.h>
 
 #include <basic_planner.h>
 #include <engine.h>
@@ -29,6 +36,119 @@
 #endif
 
 namespace causallm {
+
+namespace {
+/** Shared slabs whose RPC registration and completion stay with the backend. */
+class SharedSlabAllocator final : public nntrainer::MemAllocator {
+public:
+  SharedSlabAllocator(KVCacheManager::SharedAlloc allocate,
+                      KVCacheManager::SharedFree release) :
+    allocate_(std::move(allocate)), release_(std::move(release)) {}
+  void alloc(void **ptr, size_t bytes, size_t alignment) override {
+    *ptr = allocate_(bytes);
+    if (!*ptr)
+      throw std::bad_alloc();
+    if (reinterpret_cast<uintptr_t>(*ptr) % alignment) {
+      release_(*ptr);
+      *ptr = nullptr;
+      throw std::invalid_argument("Shared KV allocation is not aligned");
+    }
+  }
+  void free(void *ptr) override { release_(ptr); }
+  bool isDeviceVisible() const override { return true; }
+  bool isSVM() const override { return false; }
+  std::string getName() override { return "htp-shared"; }
+
+private:
+  KVCacheManager::SharedAlloc allocate_;
+  KVCacheManager::SharedFree release_;
+};
+} // namespace
+
+KVCacheManager::~KVCacheManager() { releaseShared(); }
+
+KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
+  if (this != &other) {
+    // The tensors go first so nothing still points into the blocks the
+    // allocator gets back.
+    layer_caches_.clear();
+    core_shared_ = std::move(other.core_shared_);
+    core_shared_requested_ = other.core_shared_requested_;
+    releaseShared();
+    layer_caches_ = std::move(other.layer_caches_);
+    active_layers_ = std::move(other.active_layers_);
+    svm_pool_ = std::move(other.svm_pool_);
+    cache_pos_ = other.cache_pos_;
+    batch_size_ = other.batch_size_;
+    max_seq_len_ = other.max_seq_len_;
+    num_heads_kv_ = other.num_heads_kv_;
+    head_dim_ = other.head_dim_;
+    kv_width_ = other.kv_width_;
+    kv_widths_ = std::move(other.kv_widths_);
+    layer_kv_sources_ = std::move(other.layer_kv_sources_);
+    layer_caps_ = std::move(other.layer_caps_);
+    keep_ = std::move(other.keep_);
+    bases_ = std::move(other.bases_);
+    dropped_amax_k_ = std::move(other.dropped_amax_k_);
+    dropped_amax_v_ = std::move(other.dropped_amax_v_);
+    dtype_ = other.dtype_;
+    format_ = other.format_;
+    shared_retain_ = std::move(other.shared_retain_);
+    prefix_views_ = std::move(other.prefix_views_);
+    decode_offsets_ = std::move(other.decode_offsets_);
+    shared_alloc_ = std::move(other.shared_alloc_);
+    shared_free_ = std::move(other.shared_free_);
+    shared_blocks_ = std::move(other.shared_blocks_);
+    other.shared_blocks_.clear();
+  }
+  return *this;
+}
+
+void KVCacheManager::setCoreSharedStorage(bool enabled) {
+  if (isAllocated())
+    throw std::logic_error("Select core shared storage before allocate()");
+  core_shared_requested_ = enabled;
+}
+
+void KVCacheManager::setSharedAllocator(SharedAlloc alloc, SharedFree release) {
+  if (isAllocated()) {
+    throw std::logic_error(
+      "KVCacheManager::setSharedAllocator: call before allocate()");
+  }
+  if (static_cast<bool>(alloc) != static_cast<bool>(release)) {
+    throw std::invalid_argument(
+      "KVCacheManager::setSharedAllocator: need both alloc and release");
+  }
+  shared_alloc_ = std::move(alloc);
+  shared_free_ = std::move(release);
+}
+
+nntrainer::Tensor
+KVCacheManager::makeCacheTensor(const ml::train::TensorDim &dim) {
+  if (shared_alloc_) {
+    const size_t bytes = dim.getDataLen() * dim.getDataTypeSize();
+    void *block = shared_alloc_(bytes);
+    if (block) {
+      shared_blocks_.push_back(block);
+      // An unallocated tensor of this shape, then bound to the block: the
+      // same setData() path the memory pool uses, so every view built from
+      // it (getSharedDataTensor) resolves into the block.
+      nntrainer::Tensor t(dim, false);
+      t.setData(std::make_shared<nntrainer::MemoryData>(block), 0, false);
+      return t;
+    }
+  }
+  return nntrainer::Tensor(dim, true);
+}
+
+void KVCacheManager::releaseShared() {
+  if (shared_free_) {
+    for (void *block : shared_blocks_) {
+      shared_free_(block);
+    }
+  }
+  shared_blocks_.clear();
+}
 
 void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
@@ -52,11 +172,38 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
                               const std::vector<unsigned int> &kv_widths,
                               ml::train::TensorDim::DataType dtype,
-                              ml::train::TensorDim::Format format) {
+                              ml::train::TensorDim::Format format,
+                              const std::vector<unsigned int> &rows,
+                              const std::vector<unsigned int> &keep) {
   if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
-      kv_widths.size() != num_layers) {
+      kv_widths.size() != num_layers ||
+      (!active_layers_.empty() && active_layers_.size() != num_layers) ||
+      (!rows.empty() &&
+       (rows.size() != num_layers || keep.size() != num_layers))) {
     throw std::invalid_argument(
       "KVCacheManager::allocate: invalid layer, batch, or KV width count");
+  }
+
+  // [HTP window] rows / keep: a layer with fewer rows than max_seq_len keeps
+  // its last keep rows contiguous at the front (compact()); the physical
+  // capacity goes through the same per-layer cap the ring uses.
+  keep_.assign(num_layers, 0u);
+  bases_.assign(num_layers, 0u);
+  decode_offsets_.assign(num_layers, 0u);
+  dropped_amax_k_.assign(num_layers, {});
+  dropped_amax_v_.assign(num_layers, {});
+  if (!rows.empty()) {
+    layer_caps_.assign(num_layers, 0u);
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      if (rows[i] == 0 || rows[i] >= max_seq_len)
+        continue;
+      // a step must fit behind the window it attends to
+      if (keep[i] == 0 || keep[i] >= rows[i])
+        throw std::invalid_argument(
+          "KVCacheManager::allocate: a windowed layer needs 0 < keep < rows");
+      layer_caps_[i] = rows[i];
+      keep_[i] = keep[i];
+    }
   }
 
   for (auto kv_width : kv_widths) {
@@ -76,12 +223,75 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   format_ = format;
   cache_pos_ = 0;
 
+  // Re-allocation: drop the old tensors before their blocks go back.
+  layer_caches_.clear();
+  core_shared_.reset();
+  releaseShared();
   layer_caches_.resize(num_layers);
 
   // [kv-share] Reject an unusable alias map BEFORE a single byte is requested:
   // a source that is not strictly earlier, or whose geometry differs, would
   // produce a cache that reads the wrong plane without ever crashing.
   validateKVSources(num_layers);
+  if (core_shared_requested_) {
+    using namespace nntrainer::kv;
+    using DataType = ml::train::TensorDim::DataType;
+    if (!shared_alloc_ || !shared_free_ ||
+        (dtype != DataType::FP32 && dtype != DataType::FP16 &&
+         dtype != DataType::UINT16) ||
+        (!active_layers_.empty() &&
+         std::find(active_layers_.begin(), active_layers_.end(), false) !=
+           active_layers_.end()))
+      throw std::invalid_argument(
+        "Core shared KV requires a shared allocator and active float planes");
+    CacheSpec spec;
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      LayerSpec layer;
+      layer.batch = batch_size;
+      layer.head_dim = kv_widths[i];
+      layer.max_tokens = max_seq_len;
+      layer.capacity = getLayerCap(i);
+      layer.source = getLayerKVSource(i);
+      layer.encoding =
+        dtype == DataType::FP32 ? Encoding::Float32 : Encoding::Float16;
+      layer.storage_type = dtype == DataType::FP32   ? StorageType::Float32
+                           : dtype == DataType::FP16 ? StorageType::Float16
+                                                     : StorageType::UInt16;
+      spec.layers.push_back(layer);
+    }
+    auto core = std::make_unique<nntrainer::kv::KvCacheManager>();
+    core->initialize(
+      spec, std::make_shared<SharedSlabAllocator>(shared_alloc_, shared_free_));
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim dim({batch_size, 1, getLayerCap(i), kv_widths[i]},
+                               {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(dim, false);
+      layer_caches_[i].key_cache.setData(core->keyMemory(i), 0, false);
+      layer_caches_[i].value_cache.setData(core->valueMemory(i), 0, false);
+    }
+    const auto stats = core->stats();
+    core_shared_ = std::move(core);
+    std::fprintf(stderr,
+                 "[kv-htp-core] owners=%zu bytes=%zu shared=1 paged=0\n",
+                 stats.owner_layers, stats.backing_bytes);
+    reportKVShare(num_layers, batch_size, dtype, "core-htp-shared");
+    return;
+  }
+  // An all-convolution model needs only the tensor metadata. In particular,
+  // do not ask a backend MemoryPool to plan or allocate an empty set of slots.
+  if (!active_layers_.empty() &&
+      std::none_of(active_layers_.begin(), active_layers_.end(),
+                   [](bool active) { return active; })) {
+    svm_pool_.reset();
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim(
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+    }
+    return;
+  }
   {
     // [kv-window-ring] one-time diagnostic, printed only when the ring is
     // actually engaged: KV rows allocated vs the full-max_seq baseline.
@@ -185,7 +395,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     // (non-overlapping) region so the total pool is the sum. Size each region
     // per-layer so models with non-uniform KV widths stay correct.
     for (unsigned int i = 0; i < num_layers; ++i) {
-      if (isLayerKVAliased(i))
+      if (!isLayerActive(i) || isLayerKVAliased(i))
         continue;
       // [kv-window-ring] a ring layer only needs its Wcap rows.
       const size_t bytes =
@@ -199,6 +409,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      if (!isLayerActive(i)) {
+        layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+        layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+        continue;
+      }
       // [kv-share] The source is strictly earlier, so its storage is already
       // in place -- one pass suffices, no second fixup loop. The source's
       // plane was zeroed when the source itself was set up, so the sharer must
@@ -255,6 +470,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
+      if (!isLayerActive(i)) {
+        layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+        layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+        continue;
+      }
       // [kv-share] Same rule as the pool branch above: an aliased layer gets a
       // view, never an allocation. Tensor(dim, /*alloc=*/false) + setData()
       // shares the source's MemoryData shared_ptr, so the host buffer outlives
@@ -264,8 +484,8 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
         aliasLayerCache(i, static_cast<unsigned int>(src), cache_dim);
         continue;
       }
-      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
-      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+      layer_caches_[i].key_cache = makeCacheTensor(cache_dim);
+      layer_caches_[i].value_cache = makeCacheTensor(cache_dim);
       layer_caches_[i].key_cache.setZero();
       layer_caches_[i].value_cache.setZero();
     }
@@ -297,6 +517,9 @@ void KVCacheManager::validateKVSources(unsigned int num_layers) const {
       throw std::invalid_argument(
         "KVCacheManager::allocate: KV source layer " + std::to_string(src) +
         " for layer " + std::to_string(i) + " must be strictly earlier");
+    if (!isLayerActive(i) || !isLayerActive(static_cast<unsigned int>(src)))
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: inactive layers cannot share KV storage");
 
     // Same physical plane means same physical geometry. KV width is
     // per-layer, so a source/sharer drift (e.g. a narrow layer pointed at a
@@ -425,6 +648,8 @@ void KVCacheManager::setPosition(unsigned int pos) {
     throw std::out_of_range(
       "KVCacheManager::setPosition: pos exceeds max_seq_len");
   }
+  if (core_shared_)
+    core_shared_->setPosition(pos);
   cache_pos_ = pos;
 }
 
@@ -433,10 +658,278 @@ void KVCacheManager::advance(unsigned int step_size) {
     throw std::out_of_range(
       "KVCacheManager::advance: position would exceed max_seq_len");
   }
-  cache_pos_ += step_size;
+  setPosition(cache_pos_ + step_size);
 }
 
-void KVCacheManager::reset() { cache_pos_ = 0; }
+void KVCacheManager::reset() {
+  for (unsigned l = 0; l < prefix_views_.size(); ++l)
+    freezePrefixViews(l);
+  if (core_shared_)
+    core_shared_->reset();
+  cache_pos_ = 0;
+  bases_.assign(bases_.size(), 0u);
+  decode_offsets_.assign(bases_.size(), 0u);
+  for (auto *v : {&dropped_amax_k_, &dropped_amax_v_})
+    for (auto &a : *v)
+      a.clear();
+}
+
+void KVCacheManager::foldDroppedRows(unsigned int l, unsigned int n_rows) {
+  // fp16 magnitudes order as their bit patterns, so the max is taken on
+  // the bits (one compare a value, vectorizable) and widened once a column
+  const size_t w = kv_widths_[l];
+  const size_t rows = getLayerCap(l);
+  std::vector<uint16_t> mk(w, 0u), mv(w, 0u);
+  for (auto [t, m] : {std::pair{&layer_caches_[l].key_cache, &mk},
+                      std::pair{&layer_caches_[l].value_cache, &mv}}) {
+    for (unsigned int b = 0; b < batch_size_; ++b) {
+      const uint16_t *d = t->getData<uint16_t>() + b * rows * w;
+      uint16_t *mm = m->data();
+      for (unsigned int r = 0; r < n_rows; ++r, d += w)
+        for (size_t c = 0; c < w; ++c)
+          mm[c] = std::max<uint16_t>(mm[c], d[c] & 0x7FFFu);
+    }
+  }
+  for (auto [m, a] : {std::pair{&mk, &dropped_amax_k_[l]},
+                      std::pair{&mv, &dropped_amax_v_[l]}}) {
+    if (a->empty())
+      a->assign(w, 0.0f);
+    for (size_t c = 0; c < w; ++c)
+      (*a)[c] = std::max((*a)[c], nntrainer::compute_fp16_to_fp32((*m)[c]));
+  }
+}
+
+void KVCacheManager::validateRange(unsigned int pos, bool compacting) const {
+  if (pos > max_seq_len_)
+    throw std::out_of_range("KVCacheManager: position exceeds max_seq_len");
+
+  for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
+    if (!isLayerActive(l) || !windowed(l) ||
+        (compacting && isLayerKVAliased(l)))
+      continue;
+    const unsigned int from = liveFrom(l, pos);
+    if (from < bases_[l] || pos - bases_[l] > getLayerCap(l))
+      throw std::out_of_range("KVCacheManager: layer " + std::to_string(l) +
+                              " does not hold rows [" + std::to_string(from) +
+                              ", " + std::to_string(pos) + ")");
+    if (compacting && from > bases_[l]) {
+      for (const auto *t :
+           {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
+        const auto md = t->getMemoryData();
+        if (md && !md->isHostAddressable())
+          throw std::runtime_error(
+            "KVCacheManager::compact: a windowed layer's "
+            "cache must be host addressable");
+      }
+    }
+  }
+}
+
+void KVCacheManager::validateSaveRange(unsigned int seq_len) const {
+  if (!isAllocated())
+    throw std::runtime_error("KVCacheManager::save: not allocated");
+  validateRange(seq_len, false);
+}
+
+std::shared_ptr<const KVCacheManager::PrefixSnapshot>
+KVCacheManager::capturePrefix(unsigned position, const PrefixSnapshot *previous,
+                              bool owned) const {
+  if (!isAllocated() || batch_size_ != 1 || position == 0 ||
+      position > max_seq_len_ || position > cache_pos_)
+    throw std::invalid_argument(
+      "Prefill prefix requires an available original-call endpoint");
+  auto state = std::make_shared<PrefixSnapshot>();
+  state->position = position;
+  state->element_bytes =
+    layer_caches_.front().key_cache.getDim().getDataTypeSize();
+  state->layers.resize(layer_caches_.size());
+  prefix_views_.resize(layer_caches_.size());
+  for (unsigned l = 0; l < state->layers.size(); ++l) {
+    auto &dst = state->layers[l];
+    dst.base = getBase(l);
+    dst.width = kv_widths_[l];
+    if (position < dst.base ||
+        position - dst.base + getDecodeOffset(l) > getLayerCap(l) ||
+        !isLayerActive(l))
+      throw std::invalid_argument("Prefill prefix has an unavailable layer");
+    dst.dropped_k = droppedAmaxK(l);
+    dst.dropped_v = droppedAmaxV(l);
+    const auto &src = layer_caches_[l];
+    auto *k = src.key_cache.getData<unsigned char>();
+    auto *v = src.value_cache.getData<unsigned char>();
+    const auto key_owner =
+      !owned && shared_retain_ ? shared_retain_(k) : nullptr;
+    const auto value_owner =
+      !owned && shared_retain_ ? shared_retain_(v) : nullptr;
+    for (unsigned p = dst.base; p < position; p += 64u) {
+      if (previous && l < previous->layers.size() &&
+          previous->element_bytes == state->element_bytes &&
+          previous->layers[l].width == dst.width &&
+          p >= previous->layers[l].base &&
+          (p - previous->layers[l].base) % 64u == 0 &&
+          p + 64u <= previous->position &&
+          (!owned || !previous->layers[l]
+                        .pages.at((p - previous->layers[l].base) / 64u)
+                        ->key_view)) {
+        dst.pages.push_back(
+          previous->layers[l].pages.at((p - previous->layers[l].base) / 64u));
+      } else {
+        auto page = std::make_shared<PrefixSnapshot::Page>();
+        const size_t page_bytes =
+          std::min(64u, position - p) * dst.width * state->element_bytes;
+        const size_t off = size_t(p - dst.base + getDecodeOffset(l)) *
+                           dst.width * state->element_bytes;
+        if (key_owner && value_owner) {
+          page->key_view = k + off;
+          page->value_view = v + off;
+          page->view_bytes = page_bytes;
+          page->slab_bytes =
+            size_t(getLayerCap(l)) * dst.width * state->element_bytes;
+          page->key_owner = key_owner;
+          page->value_owner = value_owner;
+          prefix_views_[l].push_back(page);
+        } else {
+          page->key.assign(k + off, k + off + page_bytes);
+          page->value.assign(v + off, v + off + page_bytes);
+        }
+        dst.pages.push_back(std::move(page));
+      }
+    }
+  }
+  return state;
+}
+
+size_t KVCacheManager::prefixPayloadBytes(unsigned position) const {
+  if (!isAllocated() || position > cache_pos_)
+    throw std::invalid_argument("Unavailable prefix payload");
+  size_t bytes = 0;
+  for (unsigned l = 0; l < layer_caches_.size(); ++l) {
+    if (position < getBase(l))
+      throw std::invalid_argument("Unavailable prefix window");
+    bytes += size_t(position - getBase(l)) * kv_widths_[l] *
+             layer_caches_[l].key_cache.getDim().getDataTypeSize() * 2u;
+  }
+  return bytes;
+}
+
+void KVCacheManager::restorePrefix(const PrefixSnapshot &state) {
+  if (!isAllocated() || batch_size_ != 1 || !state.position ||
+      state.position > max_seq_len_ ||
+      state.layers.size() != layer_caches_.size() ||
+      state.element_bytes !=
+        layer_caches_.front().key_cache.getDim().getDataTypeSize())
+    throw std::invalid_argument("Incompatible prefill prefix geometry");
+  // Validate and allocate metadata before changing any live payload.
+  auto bases = bases_;
+  auto dropped_k = dropped_amax_k_, dropped_v = dropped_amax_v_;
+  for (unsigned l = 0; l < state.layers.size(); ++l) {
+    const auto &src = state.layers[l];
+    if (src.base > state.position ||
+        state.position - src.base > getLayerCap(l) ||
+        src.width != kv_widths_[l] ||
+        src.pages.size() != (state.position - src.base + 63u) / 64u)
+      throw std::invalid_argument("Incompatible prefill prefix layer");
+    unsigned row = src.base;
+    for (const auto &page : src.pages) {
+      const size_t bytes =
+        std::min(64u, state.position - row) * src.width * state.element_bytes;
+      if (!page || page->keySize() != bytes || page->valueSize() != bytes)
+        throw std::invalid_argument("Incomplete prefill prefix page");
+      row += std::min(64u, state.position - row);
+    }
+    bases[l] = src.base;
+    dropped_k[l] = src.dropped_k;
+    dropped_v[l] = src.dropped_v;
+  }
+  for (unsigned l = 0; l < state.layers.size(); ++l)
+    freezePrefixViews(l);
+  for (unsigned l = 0; l < state.layers.size(); ++l) {
+    auto *k = layer_caches_[l].key_cache.getData<unsigned char>();
+    auto *v = layer_caches_[l].value_cache.getData<unsigned char>();
+    for (const auto &page : state.layers[l].pages) {
+      std::memcpy(k, page->keyData(), page->keySize());
+      std::memcpy(v, page->valueData(), page->valueSize());
+      k += page->keySize();
+      v += page->valueSize();
+    }
+  }
+  bases_.swap(bases);
+  dropped_amax_k_.swap(dropped_k);
+  dropped_amax_v_.swap(dropped_v);
+  cache_pos_ = state.position;
+  decode_offsets_.assign(bases_.size(), 0u);
+}
+
+void KVCacheManager::freezePrefixViews(unsigned layer) {
+  if (layer >= prefix_views_.size())
+    return;
+  for (auto &weak : prefix_views_[layer])
+    if (auto page = weak.lock())
+      page->freeze();
+  prefix_views_[layer].clear();
+}
+
+void KVCacheManager::prepareDecodeView(unsigned int pos) {
+  if (!isAllocated() || batch_size_ != 1)
+    throw std::logic_error("Decode views require allocated batch-one KV");
+  validateRange(pos, true);
+  for (unsigned l = 0; l < layer_caches_.size(); ++l)
+    if (getDecodeOffset(l))
+      throw std::logic_error("Host KV is already a read-only decode view");
+  decode_offsets_.assign(layer_caches_.size(), 0u);
+  for (unsigned l = 0; l < layer_caches_.size(); ++l) {
+    if (!isLayerActive(l) || !windowed(l) || isLayerKVAliased(l))
+      continue;
+    const unsigned from = liveFrom(l, pos);
+    if (from <= bases_[l])
+      continue;
+    const unsigned skip = from - bases_[l];
+    // Identical dropped-row maxima and logical window as compact(), while
+    // preserving the shared prefill bytes for radix snapshots.
+    foldDroppedRows(l, skip);
+    decode_offsets_[l] = skip;
+    bases_[l] = from;
+  }
+}
+
+bool KVCacheManager::compact(unsigned int pos) {
+  if (!isAllocated())
+    return false;
+  for (unsigned l = 0; l < layer_caches_.size(); ++l)
+    if (getDecodeOffset(l))
+      throw std::logic_error(
+        "Restore or reset the read-only decode view before prefill");
+  // Validate every layer before folding dropped rows or moving any buffer.
+  validateRange(pos, true);
+  bool changed = false;
+  for (unsigned int l = 0; l < layer_caches_.size(); ++l) {
+    if (!isLayerActive(l) || !windowed(l) || isLayerKVAliased(l))
+      continue;
+    const unsigned int from = liveFrom(l, pos);
+    if (from <= bases_[l])
+      continue;
+    // A later sliding compaction may overwrite an immutable borrowed prefix.
+    // Materialize only that layer's live pinned pages before the original move.
+    freezePrefixViews(l);
+    const size_t w = kv_widths_[l];
+    const unsigned int rows = getLayerCap(l);
+    const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;
+    // [#4428 window] the rows about to go: their |max| for the decode seed
+    foldDroppedRows(l, from - bases_[l]);
+    for (auto *t :
+         {&layer_caches_[l].key_cache, &layer_caches_[l].value_cache}) {
+      for (unsigned int b = 0; b < batch_size_; ++b) {
+        // fp16 bits on every build (FP16 or UINT16 storage)
+        uint16_t *d =
+          t->getData<uint16_t>() + b * static_cast<size_t>(rows) * w;
+        std::memmove(d, d + skip, live * sizeof(uint16_t));
+      }
+    }
+    bases_[l] = from;
+    changed = true;
+  }
+  return changed;
+}
 
 nntrainer::Tensor &KVCacheManager::getKeyCache(unsigned int layer_idx) {
   if (layer_idx >= layer_caches_.size()) {
@@ -463,6 +956,8 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: would exceed max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -483,6 +978,8 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
     throw std::out_of_range(
       "KVCacheManager::getValueCacheWriteView: would exceed max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -504,6 +1001,8 @@ nntrainer::Tensor KVCacheManager::getKeyCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: read_len exceeds max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -525,6 +1024,8 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getValueCacheReadView: read_len exceeds max_seq_len");
   }
+  if (!isLayerActive(layer_idx))
+    throw std::logic_error("KVCacheManager: inactive layer has no cache view");
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
@@ -619,6 +1120,7 @@ unsigned int KVCacheManager::geometryDigest() const {
   for (unsigned int i = 0; i < n; ++i) {
     mix(i < kv_widths_.size() ? kv_widths_[i] : 0u);
     mix(getLayerCap(i));
+    mix(windowed(i) ? keep_[i] : 0u);
     mix(static_cast<unsigned int>(getLayerKVSource(i) + 1));
   }
   return hash;
@@ -660,13 +1162,7 @@ void KVCacheManager::save(const std::string &path) const {
 
 void KVCacheManager::save(const std::string &path, unsigned int seq_len,
                           const std::string &model_tag) const {
-  if (layer_caches_.empty()) {
-    throw std::runtime_error("KVCacheManager::save: not allocated");
-  }
-  if (seq_len > max_seq_len_) {
-    throw std::out_of_range(
-      "KVCacheManager::save: seq_len exceeds max_seq_len");
-  }
+  validateSaveRange(seq_len);
 
   std::ofstream f(path, std::ios::binary);
   if (!f.is_open()) {
@@ -717,11 +1213,28 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len,
     // re-derive which row is which. A full layer is unchanged: rowsToPersist ==
     // seq_len.
     save_dim.height(rowsToPersist(li, seq_len));
+    if (!isLayerActive(li)) {
+      // Preserve the dense file layout, including dtype-specific metadata.
+      // This temporary plane exists only during an explicit cache save.
+      nntrainer::Tensor padding(save_dim, true);
+      padding.setZero();
+      padding.save(f);
+      padding.save(f);
+      continue;
+    }
+    // [HTP window] a windowed layer's live rows start at liveFrom - base
+    size_t save_off = 0;
+    if (windowed(li)) {
+      const unsigned int from = liveFrom(li, seq_len);
+      save_off = static_cast<size_t>(from - bases_[li]) * kv_widths_[li];
+    }
 
-    nntrainer::Tensor k_slice = const_cast<nntrainer::Tensor &>(lc.key_cache)
-                                  .getSharedDataTensor(save_dim, 0, true);
-    nntrainer::Tensor v_slice = const_cast<nntrainer::Tensor &>(lc.value_cache)
-                                  .getSharedDataTensor(save_dim, 0, true);
+    nntrainer::Tensor k_slice =
+      const_cast<nntrainer::Tensor &>(lc.key_cache)
+        .getSharedDataTensor(save_dim, save_off, true);
+    nntrainer::Tensor v_slice =
+      const_cast<nntrainer::Tensor &>(lc.value_cache)
+        .getSharedDataTensor(save_dim, save_off, true);
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // Device-only KV: Tensor::save reads on the host -- stage D2H first.
@@ -856,6 +1369,17 @@ unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
     auto &lc = layer_caches_[i];
     ml::train::TensorDim load_dim = lc.key_cache.getDim();
     load_dim.height(versioned ? rowsToPersist(i, seq_len) : seq_len);
+    if (!isLayerActive(i)) {
+      // Consume the old dense slot without retaining unused convolution KV.
+      nntrainer::Tensor padding(load_dim, true);
+      padding.read(f);
+      padding.read(f);
+      continue;
+    }
+    // [HTP window] the loaded rows land at row 0; the base says which
+    // absolute position that is
+    if (windowed(i))
+      bases_[i] = liveFrom(i, seq_len);
 
     nntrainer::Tensor k_slice =
       lc.key_cache.getSharedDataTensor(load_dim, 0, true);

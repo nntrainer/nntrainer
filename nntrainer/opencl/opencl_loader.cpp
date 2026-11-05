@@ -263,6 +263,7 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clCreateKernel);
   LoadFunction(clSetKernelArg);
   LoadRawFunction(clEnqueueNDRangeKernel);
+  LoadFunction(clGetEventInfo);
   LoadFunction(clGetEventProfilingInfo);
   LoadFunction(clRetainContext);
   LoadFunction(clReleaseContext);
@@ -278,8 +279,13 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clSetKernelArgSVMPointer);
   LoadRawFunction(clWaitForEvents);
   LoadFunction(clReleaseEvent);
+  LoadFunction(clRetainEvent);
+  LoadFunction(clCreateUserEvent);
+  LoadFunction(clSetUserEventStatus);
+  LoadFunction(clSetEventCallback);
   LoadRawFunction(clEnqueueBarrierWithWaitList);
   LoadFunction(clGetKernelInfo);
+  LoadFunction(clGetKernelWorkGroupInfo);
   InstallLaunchStatWrappers();
 }
 
@@ -308,6 +314,7 @@ PFN_clRetainProgram clRetainProgram;
 PFN_clCreateKernel clCreateKernel;
 PFN_clSetKernelArg clSetKernelArg;
 PFN_clEnqueueNDRangeKernel clEnqueueNDRangeKernel;
+PFN_clGetEventInfo clGetEventInfo;
 PFN_clGetEventProfilingInfo clGetEventProfilingInfo;
 PFN_clRetainContext clRetainContext;
 PFN_clReleaseContext clReleaseContext;
@@ -323,8 +330,13 @@ PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
 PFN_clReleaseEvent clReleaseEvent;
+PFN_clRetainEvent clRetainEvent;
+PFN_clCreateUserEvent clCreateUserEvent;
+PFN_clSetUserEventStatus clSetUserEventStatus;
+PFN_clSetEventCallback clSetEventCallback;
 PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 PFN_clGetKernelInfo clGetKernelInfo;
+PFN_clGetKernelWorkGroupInfo clGetKernelWorkGroupInfo;
 
 // ---------------------------------------------------------------------------
 // Handle epoch.

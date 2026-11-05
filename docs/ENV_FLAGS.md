@@ -48,6 +48,21 @@ give it a working default so that a bare run needs no environment at all.
 | `NNTR_LOAD_PREFETCH` | `0`: do not read the weight file ahead of the load workers. Otherwise, when the loader reads `.bin` weights through a file mapping (`-Dmmap-read=true`, not FSU), one helper thread issues `posix_fadvise(POSIX_FADV_WILLNEED)` over the file front to back, up to half of `MemAvailable`, until the workers finish. POSIX only. | unset = on | `nntrainer/models/neuralnet.cpp: WeightFileReadAhead` |
 | `NNTRAINER_PATH` | A **single** directory searched for dynamically loadable layer and optimizer plugins, in addition to the build-time configured plugin path. Ignored with a warning if the path does not exist. | unset | `nntrainer/app_context.cpp: getPluginPaths` |
 
+## Native HTP and MoE configuration
+
+Native HTP/MoE/LFM2 runtime tuning now uses the `htp` and `moe` objects in
+`nntr_config.json`. The former runtime environment variables are no longer
+read; see the [configuration reference](gemma4-htp-code-guide.md#7-runtime-configuration-and-options)
+for defaults, migration and strict validation. `ADSP_LIBRARY_PATH` remains
+the DSP library search path. `NNTR_HTP_DIAGNOSTICS` is a build-script option,
+not a runtime setting.
+
+`htp.load_prefetch` overrides `NNTR_LOAD_PREFETCH` when explicitly set;
+otherwise the shared loader retains its environment fallback. LFM2's CLI
+sets the config override to `false` by default. Its `num_threads` JSON preset
+also controls the compute thread count; it does not write process environment
+variables. The public API does not install the CLI preset.
+
 ## QNN backend
 
 Both are path overrides for the QNN backend's on-device assets; both are optional and both fall

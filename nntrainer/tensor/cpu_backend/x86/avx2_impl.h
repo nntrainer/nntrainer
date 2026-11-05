@@ -21,6 +21,10 @@
 #include <stddef.h>
 #include <tensor_dim.h>
 
+namespace nntrainer {
+struct Tq2cxLayout;
+}
+
 namespace nntrainer::avx2 {
 
 #ifdef ENABLE_FP16
@@ -53,6 +57,15 @@ void vcvt_f32_f16(unsigned int N, const float *input, _FP16 *output);
  */
 bool is_valid(const unsigned int N, const _FP16 *X);
 #endif
+
+/**
+ * @brief AVX2 TQ2CX tile, bit-identical to tq2cx_tile_ref for finite
+ * activations.
+ */
+void tq2cx_tile(const float *A, unsigned int lda, unsigned int m0,
+                unsigned int m1, const void *W, unsigned int N, unsigned int K,
+                unsigned int n0, unsigned int n1, float *C, unsigned int ldc,
+                const Tq2cxLayout &lay);
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h
@@ -301,6 +314,32 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,
                               bool only_convert_to_fp16);
+
+/**
+ * @brief RoPE (optional) + symmetric int8 snap + fp16 store, one pass: the
+ *        KV-cache write of a model trained with an int8 KV cache.
+ *
+ * For every head h (columns [h * dim, (h + 1) * dim) of each row) and
+ * element x (rotated with cos_ / sin_ first when cos_ != nullptr, using the
+ * rotate-half form of compute_rotary_emb_value):
+ *   q = nearbyint(x / head_scales[h])   (round half to even)
+ *   x = clamp(q, -128, 127) * head_scales[h]
+ * and x is stored to @a output as IEEE fp16. Every implementation must use
+ * true division and round-half-to-even so all paths give identical bits.
+ *
+ * @param[in] width row width (number of heads * dim)
+ * @param[in] dim head dimension
+ * @param[in] half_ dim / 2
+ * @param[in] input fp32 row (not modified)
+ * @param[out] output fp16 (uint16_t bits) row
+ * @param[in] cos_ cos table of this position or nullptr (no RoPE)
+ * @param[in] sin_ sin table of this position (ignored when cos_ == nullptr)
+ * @param[in] head_scales one scale per head
+ */
+void compute_rotary_emb_value_snap(unsigned int width, unsigned int dim,
+                                   unsigned int half_, const float *input,
+                                   uint16_t *output, const float *cos_,
+                                   const float *sin_, const float *head_scales);
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
  *

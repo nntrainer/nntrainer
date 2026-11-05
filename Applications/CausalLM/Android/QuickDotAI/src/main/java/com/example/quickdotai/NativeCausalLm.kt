@@ -168,6 +168,9 @@ object NativeCausalLm {
         modelBasePath: String?,
     ): Long
 
+    /** Copy the diagnostic immediately after a failed load on the same worker. */
+    external fun lastModelLoadErrorNative(): String
+
     /** @brief Returns the registered model catalog as a JSON array string. */
     external fun nativeQueryCatalog(): String
 

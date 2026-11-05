@@ -923,7 +923,7 @@ public:
    */
   float getRegularizationLoss() const {
     float loss_ = 0;
-    for (unsigned int idx = 0; idx < getNumWeights(); idx++) {
+    for (unsigned int idx : regularization_weights) {
       loss_ += getWeightRegularizationLoss(idx);
     }
     return loss_;
@@ -1053,6 +1053,9 @@ private:
   std::map<std::string, const void *>
     tensor_map; /**< map of tensor name to tensor address */
 #endif
+
+  /** Weight indices with an L2 regularizer, in their original order. */
+  std::vector<unsigned int> regularization_weights;
 
   /**
    * @brief Get regularization loss for the weight

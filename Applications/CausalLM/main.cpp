@@ -30,20 +30,24 @@
 #include "json.hpp"
 #include <app_context.h>
 #include <factory.h>
+#include <thread_manager.h>
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "lfm2_runtime_defaults.h"
 #include "model_registry.h"
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <thread>
 
 using json = nlohmann::json;
@@ -201,6 +205,26 @@ int main(int argc, char *argv[]) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
+#if defined(__ANDROID__)
+  // OpenCL kernel binary cache. On Android the library resolves its cache path
+  // against the working directory (there is no per-user cache directory to
+  // put it under), so every new run directory recompiled every kernel: +1.6 s
+  // init and +1.7 s TTFT on the first run in a fresh directory, measured on
+  // an Adreno 840. Pin the cache to one directory next to this executable
+  // unless the caller named one; NNTR_KERNEL_CACHE_DIR=off still disables
+  // it. The binary key already folds in the source, the per-kernel build
+  // options (every -D define included) and the device + driver, so one
+  // directory shared by all runs cannot hand out a mismatched binary.
+  if (std::getenv("NNTR_KERNEL_CACHE_DIR") == nullptr) {
+    std::error_code ec;
+    const std::filesystem::path exe =
+      std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && exe.has_parent_path())
+      setenv("NNTR_KERNEL_CACHE_DIR",
+             (exe.parent_path() / "nntr_kernel_cache").string().c_str(), 0);
+  }
+#endif
+
   /* INITBISECT_MARKS: env-gated init-phase trace (NNTR_INIT_TRACE). */
   static const bool _itrace = std::getenv("NNTR_INIT_TRACE") != nullptr;
   auto _ilap = [&](const char *what) {
@@ -222,7 +246,11 @@ int main(int argc, char *argv[]) {
     std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"
               << "  <model_path>   : Path to model directory\n"
               << "  [input_prompt] : Optional input text (uses sample_input or "
-                 "chat_input if omitted)\n";
+                 "chat_input if omitted)\n"
+              << "  --requests FILE : JSON array of {prompt, reset?}; one "
+                 "loaded model\n"
+              << "  --bake-system-prefix TEXT_FILE NEW_DIRECTORY : bake "
+                 "compatible native system-prefix boundaries\n";
     return EXIT_FAILURE;
   }
 
@@ -242,12 +270,72 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    json requests;
+    const bool request_mode = argc >= 3 && std::string(argv[2]) == "--requests";
+    const bool bake_mode =
+      argc >= 3 && std::string(argv[2]) == "--bake-system-prefix";
+    if (bake_mode && argc != 5)
+      throw std::invalid_argument(
+        "--bake-system-prefix requires TEXT_FILE NEW_DIRECTORY");
+    if (request_mode) {
+      if (argc != 4)
+        throw std::invalid_argument("--requests requires one JSON file");
+      requests = causallm::LoadJsonFile(argv[3]);
+      if (!requests.is_array() || requests.empty())
+        throw std::invalid_argument("Requests must be a nonempty JSON array");
+      for (const auto &request : requests)
+        if (!request.is_object() || !request.contains("prompt") ||
+            !request["prompt"].is_string() ||
+            (request.contains("reset") && !request["reset"].is_boolean()) ||
+            (request.contains("clear_prefixes") &&
+             !request["clear_prefixes"].is_boolean()) ||
+            (request.contains("device_session") &&
+             !request["device_session"].is_string()) ||
+            (request.contains("device_kv_save") &&
+             !request["device_kv_save"].is_string()) ||
+            (request.contains("device_kv_load") &&
+             !request["device_kv_load"].is_string()) ||
+            (request.contains("device_kv_park") &&
+             !request["device_kv_park"].is_boolean()))
+          throw std::invalid_argument(
+            "Each request requires a string prompt and optional boolean reset");
+    }
+#ifdef ENABLE_HEXKL
+    if (causallm::configureLfm2HtpDefaults(
+          cfg.value("model_type", std::string()),
+          nntr_cfg.value("lfm2_weight_format", std::string()),
+          nntr_cfg.value("lfm2_execution_profile", std::string()), nntr_cfg))
+      std::cerr
+        << "[LFM2] SR15 HTP CLI defaults active; explicit configuration "
+           "values take precedence\n";
+
+#endif
+    if (nntr_cfg.contains("num_threads") &&
+        std::getenv("NNTR_NUM_THREADS") == nullptr) {
+      unsigned threads = 0;
+      causallm::detail::readHtpConfigValue(nntr_cfg.at("num_threads"), threads,
+                                           "num_threads");
+      if (threads == 0)
+        throw std::invalid_argument("num_threads must be positive");
+      nntrainer::ThreadManagerConfig threading;
+      threading.compute_threads = threads;
+      nntrainer::ThreadManager::setConfig(threading);
+    }
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "model_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
+    resolveNntrConfigPath(nntr_cfg, "kv_quant_file", model_path);
+#ifdef ENABLE_HEXKL
+    causallm::resolveHtpRuntimeConfigPaths(nntr_cfg, model_path);
+    if (nntr_cfg.value("gemma4_execution_profile", std::string()) ==
+          "htp_fused" ||
+        cfg.value("model_type", std::string()) == "lfm2_moe")
+      nntrainer::configureHtpRuntime(
+        causallm::normalizeHtpRuntimeConfig(nntr_cfg));
+#endif
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
@@ -291,7 +379,9 @@ int main(int argc, char *argv[]) {
     }
 
     // Determine input text
-    if (argc >= 3) {
+    if (request_mode) {
+      input_text = requests[0]["prompt"].get<std::string>();
+    } else if (argc >= 3) {
       input_text = argv[2];
     } else {
       if (nntr_cfg.contains("chat_input")) {
@@ -330,17 +420,187 @@ int main(int argc, char *argv[]) {
     model->repack_weight();
     _ilap("model->repack_weight");
 
+    auto *device_causal = dynamic_cast<causallm::CausalLM *>(model.get());
+    bool device_manager_enabled = false;
+    auto enable_device_manager = [&] {
+      if (device_manager_enabled)
+        return;
+      if (!device_causal)
+        throw std::invalid_argument("Device KV requires a causal model");
+      const bool prefixes = nntr_cfg.contains("htp") &&
+                            nntr_cfg["htp"].value("kv_prefix_cache", false);
+      device_causal->enableDeviceKVManager(32, prefixes ? 8 : 0);
+      if (nntr_cfg.contains("kv_prefix_flash")) {
+        const auto &flash = nntr_cfg.at("kv_prefix_flash");
+        device_causal->enableDeviceKVPrefixFlash(
+          flash.at("directory"), flash.at("budget_bytes").get<size_t>(),
+          flash.at("staging_bytes").get<size_t>());
+        if (flash.value("decode_checkpoints", false))
+          device_causal->enableDeviceKVDecodePrefixFlash();
+      }
+      device_manager_enabled = true;
+    };
+    if (bake_mode) {
+      enable_device_manager();
+      std::ifstream text_file(argv[3], std::ios::binary);
+      if (!text_file)
+        throw std::invalid_argument("Cannot read system prompt file");
+      const std::string text((std::istreambuf_iterator<char>(text_file)), {});
+      const auto result = device_causal->bakeDeviceSystemPrefix(text, argv[4]);
+      std::cout << "[SYSTEM_PREFIX_BAKE] " << result.dump() << '\n';
+      return EXIT_SUCCESS;
+    }
+    if (nntr_cfg.contains("kv_prebaked_prefixes")) {
+      const auto &assets = nntr_cfg.at("kv_prebaked_prefixes");
+      if (!assets.is_array())
+        throw std::invalid_argument("kv_prebaked_prefixes must be an array");
+      if (!assets.empty())
+        enable_device_manager();
+      for (const auto &asset : assets) {
+        if (!asset.is_string())
+          throw std::invalid_argument("Baked prefix path must be a string");
+        auto path = std::filesystem::path(asset.get<std::string>());
+        if (path.is_relative())
+          path = std::filesystem::path(model_path) / path;
+        try {
+          std::cout
+            << "[SYSTEM_PREFIX_LOAD] "
+            << device_causal->loadDeviceSystemPrefix(path.string()).dump()
+            << '\n';
+        } catch (const std::exception &e) {
+          std::cerr << "[SYSTEM_PREFIX_REJECT] " << e.what() << '\n';
+        }
+      }
+    }
+
     bool do_sample = generation_cfg.value("do_sample", false);
 
 #ifdef PROFILE
     start_peak_tracker();
 #endif
+    auto run_prompt = [&](const std::string &text) {
 #if defined(_WIN32)
-    model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
-               system_tail_prompt.c_str());
+      model->run(text.c_str(), do_sample, system_head_prompt.c_str(),
+                 system_tail_prompt.c_str());
 #else
-    model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
+      model->run(text, do_sample, system_head_prompt, system_tail_prompt);
 #endif
+    };
+    if (!request_mode) {
+      run_prompt(input_text);
+    } else {
+      auto *causal = dynamic_cast<causallm::CausalLM *>(model.get());
+      if (!causal)
+        throw std::invalid_argument(
+          "Request sequences require a causal language model");
+      const bool device_sessions =
+        std::any_of(requests.begin(), requests.end(),
+                    [](const auto &r) { return r.contains("device_session"); });
+      std::map<std::string, uint32_t> device_session_ids;
+      if (device_sessions) {
+        enable_device_manager();
+        device_session_ids.emplace("default", 0);
+      }
+      size_t index = 0;
+      for (const auto &request : requests) {
+        double switch_ms = 0;
+        if (device_sessions) {
+          const auto name =
+            request.value("device_session", std::string("default"));
+          auto it = device_session_ids.find(name);
+          if (it == device_session_ids.end())
+            it =
+              device_session_ids.emplace(name, causal->createDeviceKVSession())
+                .first;
+          const auto started = std::chrono::steady_clock::now();
+          causal->selectDeviceKVSession(it->second);
+          switch_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+        }
+        if (request.value("clear_prefixes", false))
+          causal->clearDeviceKVPrefixes();
+        if (request.value("reset", false))
+          causal->setSessionTokenPosition(0);
+        double restore_ms = 0;
+        if (request.contains("device_kv_load")) {
+          const auto started = std::chrono::steady_clock::now();
+          causal->loadDeviceKVCache(
+            request.at("device_kv_load").get<std::string>());
+          restore_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+        }
+        const auto before = causal->getSessionTokenPosition();
+        run_prompt(request["prompt"].get<std::string>());
+        const auto metrics = causal->getPerformanceMetrics();
+        json result = {
+          {"index", index++},
+          {"cached_before", before},
+          {"cached_after", causal->getKvLen()},
+          {"pending_token", causal->hasPendingSessionToken()},
+          {"device_kv_bytes", causal->getDeviceKVCacheBytes()},
+          {"device_kv_prefix_host_bytes", causal->getDeviceKVPrefixBytes()},
+          {"prefill_tokens", metrics.prefill_tokens},
+          {"ttft_ms", metrics.ttft_ms},
+          {"decode_ms", metrics.decode_steady_ms},
+          {"peak_memory_kb", metrics.peak_memory_kb},
+          {"output", causal->getOutput()}};
+        if (device_sessions) {
+          const auto stats = causal->deviceKVManagerStats();
+          result["device_session"] =
+            request.value("device_session", std::string("default"));
+          result["device_session_switch_ms"] = switch_ms;
+          result["device_kv_manager"] = {
+            {"sessions", stats.sessions},
+            {"prefixes", stats.prefixes},
+            {"radix_nodes", stats.radix_nodes},
+            {"hits", stats.hits},
+            {"reused_tokens", stats.reused_tokens}};
+        }
+        if (nntr_cfg.contains("kv_prefix_flash")) {
+          const auto flash = causal->deviceKVPrefixFlashStats();
+          result["device_kv_prefix_flash"] = {
+            {"pending_bytes", flash.pending_bytes},
+            {"peak_pending_bytes", flash.peak_pending_bytes},
+            {"reserved_flash_bytes", flash.flash_bytes},
+            {"submitted", flash.submitted},
+            {"written", flash.written},
+            {"skipped", flash.skipped},
+            {"failed", flash.failed},
+            {"evicted", flash.evicted},
+            {"flash_hits", flash.flash_hits},
+            {"staging_hits", flash.staging_hits},
+            {"staging_ms", flash.staging_ms},
+            {"write_ms", flash.write_ms},
+            {"read_ms", flash.read_ms}};
+        }
+        const auto baked = causal->deviceSystemPrefixStats();
+        if (baked.loaded_assets || baked.errors)
+          result["system_prefix_cache"] = {
+            {"loaded_assets", baked.loaded_assets},
+            {"hits", baked.hits},
+            {"reused_tokens", baked.reused_tokens},
+            {"errors", baked.errors},
+            {"restore_ms", baked.restore_ms}};
+        result["output_ids"] = causal->getLastGeneratedTokenIds();
+        result["device_kv_restore_ms"] = restore_ms;
+        if (request.contains("device_kv_save")) {
+          const auto path = request.at("device_kv_save").get<std::string>();
+          const auto started = std::chrono::steady_clock::now();
+          causal->saveDeviceKVCache(path,
+                                    request.value("device_kv_park", true));
+          result["device_kv_save_ms"] =
+            std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - started)
+              .count();
+          result["device_kv_file_bytes"] = std::filesystem::file_size(path);
+          result["device_kv_bytes_after_save"] =
+            causal->getDeviceKVCacheBytes();
+        }
+        std::cout << "[REQUEST] " << result.dump() << std::endl;
+      }
+    }
 #ifdef PROFILE
     stop_and_print_peak();
 #endif

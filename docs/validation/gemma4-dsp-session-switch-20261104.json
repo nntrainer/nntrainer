@@ -1,0 +1,1416 @@
+{
+  "device": "SM-S948N / Android 16 / SM8850 / v81",
+  "runtime": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104",
+  "codes": {
+    "A": "ZEBRA-731",
+    "B": "ORCHID-842"
+  },
+  "followups": [
+    "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n",
+    "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n",
+    "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n"
+  ],
+  "scenarios": [
+    {
+      "name": "short",
+      "initial_tokens": {
+        "A": 25,
+        "B": 25
+      },
+      "reference_order": [
+        [
+          "A",
+          0
+        ],
+        [
+          "A",
+          1
+        ],
+        [
+          "A",
+          2
+        ],
+        [
+          "A",
+          3
+        ],
+        [
+          "B",
+          0
+        ],
+        [
+          "B",
+          1
+        ],
+        [
+          "B",
+          2
+        ],
+        [
+          "B",
+          3
+        ]
+      ],
+      "switched_order": [
+        [
+          "A",
+          0
+        ],
+        [
+          "B",
+          0
+        ],
+        [
+          "A",
+          1
+        ],
+        [
+          "B",
+          1
+        ],
+        [
+          "A",
+          2
+        ],
+        [
+          "B",
+          2
+        ],
+        [
+          "A",
+          3
+        ],
+        [
+          "B",
+          3
+        ]
+      ],
+      "runs": {
+        "reference": [
+          {
+            "session": "A",
+            "turn": 0,
+            "cached_after": 30,
+            "cached_before": 0,
+            "decode_ms": 83.024558,
+            "device_kv_bytes": 7208960,
+            "device_kv_restore_ms": 0.0,
+            "index": 0,
+            "output": "<|channel>thought\n<channel|>READY<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              106
+            ],
+            "peak_memory_kb": 3219296,
+            "pending_token": true,
+            "prefill_tokens": 25,
+            "ttft_ms": 1691.871406
+          },
+          {
+            "session": "A",
+            "turn": 1,
+            "cached_after": 64,
+            "cached_before": 30,
+            "decode_ms": 90.086198,
+            "device_kv_bytes": 14417920,
+            "device_kv_restore_ms": 0.0,
+            "index": 1,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2893808,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1743.9911969999998
+          },
+          {
+            "session": "A",
+            "turn": 2,
+            "cached_after": 96,
+            "cached_before": 64,
+            "decode_ms": 73.22812499999999,
+            "device_kv_bytes": 14417920,
+            "device_kv_restore_ms": 0.0,
+            "index": 2,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2893796,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1487.869426
+          },
+          {
+            "session": "A",
+            "turn": 3,
+            "cached_after": 132,
+            "cached_before": 96,
+            "decode_ms": 77.764062,
+            "device_kv_bytes": 21626880,
+            "device_kv_restore_ms": 0.0,
+            "index": 3,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2894820,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1824.0387489999998
+          },
+          {
+            "session": "B",
+            "turn": 0,
+            "cached_after": 30,
+            "cached_before": 0,
+            "decode_ms": 74.4555465,
+            "device_kv_bytes": 7208960,
+            "device_kv_restore_ms": 0.0,
+            "index": 4,
+            "output": "<|channel>thought\n<channel|>READY<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              106
+            ],
+            "peak_memory_kb": 3147684,
+            "pending_token": true,
+            "prefill_tokens": 25,
+            "ttft_ms": 1548.5236969999999
+          },
+          {
+            "session": "B",
+            "turn": 1,
+            "cached_after": 65,
+            "cached_before": 30,
+            "decode_ms": 82.730729,
+            "device_kv_bytes": 14417920,
+            "device_kv_restore_ms": 0.0,
+            "index": 5,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2755184,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1639.978697
+          },
+          {
+            "session": "B",
+            "turn": 2,
+            "cached_after": 98,
+            "cached_before": 65,
+            "decode_ms": 80.009531,
+            "device_kv_bytes": 14417920,
+            "device_kv_restore_ms": 0.0,
+            "index": 6,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2755184,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1447.757917
+          },
+          {
+            "session": "B",
+            "turn": 3,
+            "cached_after": 135,
+            "cached_before": 98,
+            "decode_ms": 78.90570299999999,
+            "device_kv_bytes": 21626880,
+            "device_kv_restore_ms": 0.0,
+            "index": 7,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2762352,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1832.9516139999998
+          }
+        ],
+        "switched": [
+          {
+            "session": "A",
+            "turn": 0,
+            "cached_after": 30,
+            "cached_before": 0,
+            "decode_ms": 82.43312499999999,
+            "device_kv_bytes": 7208960,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 8561248,
+            "device_kv_restore_ms": 0.0,
+            "device_kv_save_ms": 23.620053,
+            "index": 0,
+            "output": "<|channel>thought\n<channel|>READY<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              106
+            ],
+            "peak_memory_kb": 3208444,
+            "pending_token": true,
+            "prefill_tokens": 25,
+            "ttft_ms": 1643.6829679999998
+          },
+          {
+            "session": "B",
+            "turn": 0,
+            "cached_after": 30,
+            "cached_before": 0,
+            "decode_ms": 79.4122915,
+            "device_kv_bytes": 7208960,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 8561248,
+            "device_kv_restore_ms": 0.0,
+            "device_kv_save_ms": 23.813698,
+            "index": 1,
+            "output": "<|channel>thought\n<channel|>READY<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              106
+            ],
+            "peak_memory_kb": 3273704,
+            "pending_token": true,
+            "prefill_tokens": 25,
+            "ttft_ms": 1554.3937489999998
+          },
+          {
+            "session": "A",
+            "turn": 1,
+            "cached_after": 64,
+            "cached_before": 30,
+            "decode_ms": 87.748594,
+            "device_kv_bytes": 14417920,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 8561248,
+            "device_kv_restore_ms": 26.270363999999997,
+            "device_kv_save_ms": 26.115416,
+            "index": 2,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2750432,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1732.7099469999998
+          },
+          {
+            "session": "B",
+            "turn": 1,
+            "cached_after": 65,
+            "cached_before": 30,
+            "decode_ms": 82.3386455,
+            "device_kv_bytes": 14417920,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 15770208,
+            "device_kv_restore_ms": 25.601354999999998,
+            "device_kv_save_ms": 42.738853999999996,
+            "index": 3,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2750432,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1647.8568739999998
+          },
+          {
+            "session": "A",
+            "turn": 2,
+            "cached_after": 96,
+            "cached_before": 64,
+            "decode_ms": 73.717395,
+            "device_kv_bytes": 14417920,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 15770208,
+            "device_kv_restore_ms": 28.132134999999998,
+            "device_kv_save_ms": 46.675052,
+            "index": 4,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2744292,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1534.0681769999999
+          },
+          {
+            "session": "B",
+            "turn": 2,
+            "cached_after": 98,
+            "cached_before": 65,
+            "decode_ms": 76.65645849999999,
+            "device_kv_bytes": 14417920,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 15770208,
+            "device_kv_restore_ms": 42.44375,
+            "device_kv_save_ms": 47.536406,
+            "index": 5,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2744292,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1436.673437
+          },
+          {
+            "session": "A",
+            "turn": 3,
+            "cached_after": 132,
+            "cached_before": 96,
+            "decode_ms": 78.39588499999999,
+            "device_kv_bytes": 21626880,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 22979168,
+            "device_kv_restore_ms": 43.834218,
+            "device_kv_save_ms": 62.626093999999995,
+            "index": 6,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2757612,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1822.5256239999999
+          },
+          {
+            "session": "B",
+            "turn": 3,
+            "cached_after": 135,
+            "cached_before": 98,
+            "decode_ms": 78.69135399999999,
+            "device_kv_bytes": 21626880,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 22979168,
+            "device_kv_restore_ms": 41.312188,
+            "device_kv_save_ms": 62.571926999999995,
+            "index": 7,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2757616,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1807.1221859999998
+          }
+        ]
+      },
+      "checks": {
+        "exact_output_ids_match": true,
+        "positions_pending_and_prefill_counts_match": true,
+        "all_parks_release_kv": true,
+        "no_code_leakage": true,
+        "restores": 6,
+        "completed_requests": 8
+      },
+      "snapshot_headers": {
+        "A": {
+          "graph_cookie": 2053606363926,
+          "position": 132,
+          "pending_token": 106,
+          "caches": [
+            {
+              "cache": 0,
+              "layers": 25,
+              "kv_heads": 8,
+              "gqa": 2,
+              "head_dim": 256,
+              "capacity_rows": 192,
+              "flags": 2147483648,
+              "base": 0
+            },
+            {
+              "cache": 1,
+              "layers": 5,
+              "kv_heads": 2,
+              "gqa": 8,
+              "head_dim": 512,
+              "capacity_rows": 192,
+              "flags": 2147483648,
+              "base": 0
+            }
+          ]
+        },
+        "B": {
+          "graph_cookie": 2053606363926,
+          "position": 135,
+          "pending_token": 106,
+          "caches": [
+            {
+              "cache": 0,
+              "layers": 25,
+              "kv_heads": 8,
+              "gqa": 2,
+              "head_dim": 256,
+              "capacity_rows": 192,
+              "flags": 2147483648,
+              "base": 0
+            },
+            {
+              "cache": 1,
+              "layers": 5,
+              "kv_heads": 2,
+              "gqa": 8,
+              "head_dim": 512,
+              "capacity_rows": 192,
+              "flags": 2147483648,
+              "base": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "windowed",
+      "initial_tokens": {
+        "A": 2040,
+        "B": 506
+      },
+      "reference_order": [
+        [
+          "A",
+          0
+        ],
+        [
+          "A",
+          1
+        ],
+        [
+          "A",
+          2
+        ],
+        [
+          "A",
+          3
+        ],
+        [
+          "B",
+          0
+        ],
+        [
+          "B",
+          1
+        ],
+        [
+          "B",
+          2
+        ],
+        [
+          "B",
+          3
+        ]
+      ],
+      "switched_order": [
+        [
+          "A",
+          0
+        ],
+        [
+          "B",
+          0
+        ],
+        [
+          "A",
+          1
+        ],
+        [
+          "B",
+          1
+        ],
+        [
+          "A",
+          2
+        ],
+        [
+          "B",
+          2
+        ],
+        [
+          "A",
+          3
+        ],
+        [
+          "B",
+          3
+        ]
+      ],
+      "runs": {
+        "reference": [
+          {
+            "session": "A",
+            "turn": 0,
+            "cached_after": 2056,
+            "cached_before": 0,
+            "decode_ms": 53.253541999999996,
+            "device_kv_bytes": 133038080,
+            "device_kv_restore_ms": 0.0,
+            "index": 0,
+            "output": "-\n-\n-\n-\n-\n-\n-\n-\n-",
+            "output_ids": [
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772
+            ],
+            "peak_memory_kb": 3899024,
+            "pending_token": true,
+            "prefill_tokens": 2040,
+            "ttft_ms": 3217.4163009999997
+          },
+          {
+            "session": "A",
+            "turn": 1,
+            "cached_after": 2090,
+            "cached_before": 2056,
+            "decode_ms": 91.360677,
+            "device_kv_bytes": 133038080,
+            "device_kv_restore_ms": 0.0,
+            "index": 1,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2977720,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1939.642552
+          },
+          {
+            "session": "A",
+            "turn": 2,
+            "cached_after": 2122,
+            "cached_before": 2090,
+            "decode_ms": 81.169479,
+            "device_kv_bytes": 140247040,
+            "device_kv_restore_ms": 0.0,
+            "index": 2,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 3078060,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1834.890052
+          },
+          {
+            "session": "A",
+            "turn": 3,
+            "cached_after": 2158,
+            "cached_before": 2122,
+            "decode_ms": 76.82151,
+            "device_kv_bytes": 133693440,
+            "device_kv_restore_ms": 0.0,
+            "index": 3,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 3049416,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 2121.308541
+          },
+          {
+            "session": "B",
+            "turn": 0,
+            "cached_after": 512,
+            "cached_before": 0,
+            "decode_ms": 70.59020799999999,
+            "device_kv_bytes": 64880640,
+            "device_kv_restore_ms": 0.0,
+            "index": 4,
+            "output": "<|channel>thought\n<channel|>READY.<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              236761,
+              106
+            ],
+            "peak_memory_kb": 3655252,
+            "pending_token": true,
+            "prefill_tokens": 506,
+            "ttft_ms": 1817.787656
+          },
+          {
+            "session": "B",
+            "turn": 1,
+            "cached_after": 547,
+            "cached_before": 512,
+            "decode_ms": 84.3764845,
+            "device_kv_bytes": 64880640,
+            "device_kv_restore_ms": 0.0,
+            "index": 5,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2865424,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1718.3093219999998
+          },
+          {
+            "session": "B",
+            "turn": 2,
+            "cached_after": 580,
+            "cached_before": 547,
+            "decode_ms": 82.072578,
+            "device_kv_bytes": 72089600,
+            "device_kv_restore_ms": 0.0,
+            "index": 6,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2883532,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1616.443593
+          },
+          {
+            "session": "B",
+            "turn": 3,
+            "cached_after": 617,
+            "cached_before": 580,
+            "decode_ms": 77.9109895,
+            "device_kv_bytes": 72089600,
+            "device_kv_restore_ms": 0.0,
+            "index": 7,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2881484,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1870.34177
+          }
+        ],
+        "switched": [
+          {
+            "session": "A",
+            "turn": 0,
+            "cached_after": 2056,
+            "cached_before": 0,
+            "decode_ms": 53.283178,
+            "device_kv_bytes": 133038080,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 134390368,
+            "device_kv_restore_ms": 0.0,
+            "device_kv_save_ms": 397.385052,
+            "index": 0,
+            "output": "-\n-\n-\n-\n-\n-\n-\n-\n-",
+            "output_ids": [
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772,
+              107,
+              236772
+            ],
+            "peak_memory_kb": 3838296,
+            "pending_token": true,
+            "prefill_tokens": 2040,
+            "ttft_ms": 3277.5582799999997
+          },
+          {
+            "session": "B",
+            "turn": 0,
+            "cached_after": 512,
+            "cached_before": 0,
+            "decode_ms": 75.929063,
+            "device_kv_bytes": 64880640,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 59023968,
+            "device_kv_restore_ms": 0.0,
+            "device_kv_save_ms": 176.497604,
+            "index": 1,
+            "output": "<|channel>thought\n<channel|>READY.<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              156274,
+              236761,
+              106
+            ],
+            "peak_memory_kb": 3677912,
+            "pending_token": true,
+            "prefill_tokens": 506,
+            "ttft_ms": 1803.302031
+          },
+          {
+            "session": "A",
+            "turn": 1,
+            "cached_after": 2090,
+            "cached_before": 2056,
+            "decode_ms": 92.639896,
+            "device_kv_bytes": 133038080,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 134390368,
+            "device_kv_restore_ms": 361.69890599999997,
+            "device_kv_save_ms": 416.302239,
+            "index": 2,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 2978568,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1926.955573
+          },
+          {
+            "session": "B",
+            "turn": 1,
+            "cached_after": 547,
+            "cached_before": 512,
+            "decode_ms": 82.9144535,
+            "device_kv_bytes": 64880640,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 66232928,
+            "device_kv_restore_ms": 160.515833,
+            "device_kv_save_ms": 208.479896,
+            "index": 3,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2864604,
+            "pending_token": true,
+            "prefill_tokens": 24,
+            "ttft_ms": 1715.3066139999999
+          },
+          {
+            "session": "A",
+            "turn": 2,
+            "cached_after": 2122,
+            "cached_before": 2090,
+            "decode_ms": 81.63317699999999,
+            "device_kv_bytes": 140247040,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 141599328,
+            "device_kv_restore_ms": 353.02687499999996,
+            "device_kv_save_ms": 457.229739,
+            "index": 4,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 3077596,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1821.1943749999998
+          },
+          {
+            "session": "B",
+            "turn": 2,
+            "cached_after": 580,
+            "cached_before": 547,
+            "decode_ms": 78.277005,
+            "device_kv_bytes": 72089600,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 73441888,
+            "device_kv_restore_ms": 191.465833,
+            "device_kv_save_ms": 238.372031,
+            "index": 5,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2882016,
+            "pending_token": true,
+            "prefill_tokens": 22,
+            "ttft_ms": 1594.5241139999998
+          },
+          {
+            "session": "A",
+            "turn": 3,
+            "cached_after": 2158,
+            "cached_before": 2122,
+            "decode_ms": 77.671667,
+            "device_kv_bytes": 133693440,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 135045728,
+            "device_kv_restore_ms": 391.598282,
+            "device_kv_save_ms": 444.585,
+            "index": 6,
+            "output": "<|channel>thought\n<channel|>ZEBRA-731<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              7942,
+              82859,
+              236772,
+              236832,
+              236800,
+              236770,
+              106
+            ],
+            "peak_memory_kb": 3079648,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 2098.030676
+          },
+          {
+            "session": "B",
+            "turn": 3,
+            "cached_after": 617,
+            "cached_before": 580,
+            "decode_ms": 79.756198,
+            "device_kv_bytes": 72089600,
+            "device_kv_bytes_after_save": 0,
+            "device_kv_file_bytes": 73441888,
+            "device_kv_restore_ms": 201.503593,
+            "device_kv_save_ms": 258.70151,
+            "index": 7,
+            "output": "<|channel>thought\n<channel|>ORCHID-842<turn|>",
+            "output_ids": [
+              100,
+              45518,
+              107,
+              101,
+              1579,
+              2293,
+              1735,
+              236772,
+              236828,
+              236812,
+              236778,
+              106
+            ],
+            "peak_memory_kb": 2870768,
+            "pending_token": true,
+            "prefill_tokens": 26,
+            "ttft_ms": 1842.411666
+          }
+        ]
+      },
+      "checks": {
+        "exact_output_ids_match": true,
+        "positions_pending_and_prefill_counts_match": true,
+        "all_parks_release_kv": true,
+        "no_code_leakage": true,
+        "restores": 6,
+        "completed_requests": 8,
+        "distinct_sliding_bases_verified": true
+      },
+      "snapshot_headers": {
+        "A": {
+          "graph_cookie": 2053652229089,
+          "position": 2158,
+          "pending_token": 106,
+          "caches": [
+            {
+              "cache": 0,
+              "layers": 25,
+              "kv_heads": 8,
+              "gqa": 2,
+              "head_dim": 256,
+              "capacity_rows": 1088,
+              "flags": 2147483648,
+              "base": 1080
+            },
+            {
+              "cache": 1,
+              "layers": 5,
+              "kv_heads": 2,
+              "gqa": 8,
+              "head_dim": 512,
+              "capacity_rows": 2176,
+              "flags": 2147483648,
+              "base": 0
+            }
+          ]
+        },
+        "B": {
+          "graph_cookie": 2053652229089,
+          "position": 617,
+          "pending_token": 106,
+          "caches": [
+            {
+              "cache": 0,
+              "layers": 25,
+              "kv_heads": 8,
+              "gqa": 2,
+              "head_dim": 256,
+              "capacity_rows": 640,
+              "flags": 2147483648,
+              "base": 0
+            },
+            {
+              "cache": 1,
+              "layers": 5,
+              "kv_heads": 2,
+              "gqa": 8,
+              "head_dim": 512,
+              "capacity_rows": 640,
+              "flags": 2147483648,
+              "base": 0
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "model": "Gemma4 26B A4B TL2 rotated HTP fused",
+  "protocol": "Compare A0/A1/A2/A3 then reset B0/B1/B2/B3 with A0/B0/A1/B1/A2/B2/A3/B3. Each switched turn restores its own latest snapshot, then saves and parks the updated state.",
+  "binary_sha256": "1e6800023568bb9b5d692f03964aa767f21b83958394c1ee0815ae64042c40c8  nntr_causallm\n91ae44b3ca141b11be48c129b5517fbdbad433c5533d2ff864a44656e5926443  libcausallm.so\nf9fd10389b1901bad4552816c1729b7443bb06b660e7c11c41e2fa6ff969af8f  libnntrainer.so\n7013f1297445dd23dbd761646523b246bafdc2e7511a08c39db45ad27742736c  libnntr_hvx_skel.so\n",
+  "scope": "Same-loaded-model process, synchronous explicit Flash checkpoints; one resident conversation at a time. No concurrent inference, automatic session-ID API or automatic DSP LRU policy. OS file caches were not evicted; this is a correctness check, not cold Flash latency measurement.",
+  "request_fixtures": {
+    "short-reference-requests.json": [
+      {
+        "prompt": "<bos><|turn>user\nRemember the code ZEBRA-731. Reply only with READY.<turn|>\n<|turn>model\n",
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<bos><|turn>user\nRemember the code ORCHID-842. Reply only with READY.<turn|>\n<|turn>model\n",
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n"
+      }
+    ],
+    "windowed-switched-requests.json": [
+      {
+        "prompt": "<bos><|turn>user\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nRemember the code ZEBRA-731. Reply only with READY.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv",
+        "device_kv_park": true,
+        "reset": true
+      },
+      {
+        "prompt": "<bos><|turn>user\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nRemember the code ORCHID-842. Reply only with READY.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv",
+        "device_kv_park": true,
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/windowed-B.kv"
+      }
+    ],
+    "windowed-reference-requests.json": [
+      {
+        "prompt": "<bos><|turn>user\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nThe harbour has fishing boats, a school and a bakery.\nRemember the code ZEBRA-731. Reply only with READY.<turn|>\n<|turn>model\n",
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<bos><|turn>user\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nThe mountain village has orchards, a bridge and a library.\nRemember the code ORCHID-842. Reply only with READY.<turn|>\n<|turn>model\n",
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n"
+      }
+    ],
+    "short-switched-requests.json": [
+      {
+        "prompt": "<bos><|turn>user\nRemember the code ZEBRA-731. Reply only with READY.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv",
+        "device_kv_park": true,
+        "reset": true
+      },
+      {
+        "prompt": "<bos><|turn>user\nRemember the code ORCHID-842. Reply only with READY.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv",
+        "device_kv_park": true,
+        "reset": true
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nWhat code did I give you? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nRepeat my code again. Reply only with that code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-A.kv"
+      },
+      {
+        "prompt": "<turn|>\n<|turn>user\nOne final check: what is my code? Reply only with the code.<turn|>\n<|turn>model\n",
+        "device_kv_save": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv",
+        "device_kv_park": true,
+        "device_kv_load": "/data/local/tmp/nntr_pr4428_kv_validation/kv-flash-20261104/short-B.kv"
+      }
+    ]
+  },
+  "git_commit": "93aef5b159b2ee2e677886a615596720a7e5e0f5",
+  "totals": {
+    "reference_requests": 16,
+    "switched_requests": 16,
+    "restores": 12,
+    "park_operations": 16,
+    "exact_output_and_position_matches": 16
+  }
+}

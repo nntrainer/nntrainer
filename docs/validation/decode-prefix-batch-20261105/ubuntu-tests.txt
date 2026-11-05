@@ -1,0 +1,15 @@
+1/5 nntrainer:unittests / unittest_nntrainer_kv_snap          OK              0.02s
+2/5 nntrainer:unittests / unittest_kv_cache_manager           OK              0.07s
+3/5 nntrainer:unittests / unittest_kv_cache_core              OK              0.10s
+4/5 nntrainer:unittests / unittest_cpu_kv_q_attention         OK              0.30s
+5/5 nntrainer:unittests / unittest_causallm_mha_core_dispatch OK              0.31s
+
+
+Ok:                 5
+Expected Fail:      0
+Fail:               0
+Unexpected Pass:    0
+Skipped:            0
+Timeout:            0
+
+Full log written to /tmp/nntr-pr4428-validation/build-inproc/meson-logs/testlog.txt

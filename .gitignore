@@ -23,6 +23,9 @@ Applications/**/data
 cifar-100-binary*
 Applications/**/*.bin
 Applications/**/res/*
+!Applications/CausalLM/Android/SampleTestAPP/src/main/res/raw/
+Applications/CausalLM/Android/SampleTestAPP/src/main/res/raw/*
+!Applications/CausalLM/Android/SampleTestAPP/src/main/res/raw/gemma4_moe_messages.json
 !Applications/CausalLM/res/deberta_v2/
 Applications/CausalLM/res/deberta_v2/*
 !Applications/CausalLM/res/deberta_v2/weight_converter.py
@@ -33,6 +36,8 @@ Applications/CausalLM/res/xlm_roberta/*
 !Applications/CausalLM/res/gemma4/
 Applications/CausalLM/res/gemma4/*
 !Applications/CausalLM/res/gemma4/weight_converter.py
+!Applications/CausalLM/res/gemma4/htp_weight_converter.py
+!Applications/CausalLM/res/gemma4/htp_chat/
 !Applications/CausalLM/res/gemma4/nntr_config.json
 !Applications/CausalLM/res/gemma4/test/
 Applications/CausalLM/res/gemma4/test/*
@@ -117,3 +122,6 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+gemma4-26b-*
+hexkl-1.0-beta.2/
+lfm2-24ba2b*

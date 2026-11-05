@@ -13,13 +13,17 @@
 #ifndef __KV_CACHE_MANAGER_H__
 #define __KV_CACHE_MANAGER_H__
 
+#include <algorithm>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <memory>
+
+#include <kv_cache/kv_cache_manager.h>
 
 #include <memory_pool.h>
 #include <tensor.h>
@@ -48,14 +52,60 @@ namespace causallm {
  */
 class KVCacheManager {
 public:
+  /** @brief Allocator for cache slabs that an accelerator reads in place
+   *         (ComputeOps::alloc_shared); nullptr means "heap for this slab". */
+  using SharedAlloc = std::function<void *(size_t bytes)>;
+  /** @brief Matching release (ComputeOps::free_shared). */
+  using SharedFree = std::function<void(void *block)>;
+
   KVCacheManager() = default;
-  ~KVCacheManager() = default;
+  ~KVCacheManager();
 
   // Non-copyable, movable
   KVCacheManager(const KVCacheManager &) = delete;
   KVCacheManager &operator=(const KVCacheManager &) = delete;
   KVCacheManager(KVCacheManager &&) = default;
-  KVCacheManager &operator=(KVCacheManager &&) = default;
+  KVCacheManager &operator=(KVCacheManager &&other) noexcept;
+
+  /**
+   * @brief Route every cache slab through an accelerator-visible allocator.
+   *
+   * Call before allocate(). Each layer's key and value slab is then one
+   * block from @a alloc, wrapped by the cache tensors without a copy, and
+   * handed back to @a release when the manager is destroyed or
+   * re-allocated. A nullptr from @a alloc puts that slab on the heap
+   * instead, so a backend with limited shared memory degrades to the
+   * per-call copy rather than failing. Views, save and load are unchanged.
+   *
+   * @param alloc   block allocator, e.g. ComputeOps::alloc_shared
+   * @param release block release, e.g. ComputeOps::free_shared
+   */
+  void setSharedAllocator(SharedAlloc alloc, SharedFree release);
+  using SharedRetain = std::function<std::shared_ptr<void>(void *)>;
+  void setSharedRetain(SharedRetain retain) {
+    shared_retain_ = std::move(retain);
+  }
+
+  /**
+   * @brief Whether at least one slab came from the shared allocator.
+   */
+  bool usesSharedMemory() const {
+    return core_shared_ != nullptr || !shared_blocks_.empty();
+  }
+
+  /** Use the core manager for shared host slabs. Call before allocate().
+   * The backend still owns its quantized cache and completes synchronous RPCs;
+   * window compaction and accelerator snapshots retain their existing path.
+   * This does not enable device prefix caching or session switching.
+   */
+  void setCoreSharedStorage(bool enabled);
+  bool usesCoreSharedStorage() const { return core_shared_ != nullptr; }
+
+  /**
+   * @brief Whether setSharedAllocator installed an allocator (a backend
+   *        may still hand back nullptr and leave the slabs on the heap).
+   */
+  bool hasSharedAllocator() const { return static_cast<bool>(shared_alloc_); }
 
   /**
    * @brief Allocate KV cache for all layers
@@ -86,7 +136,120 @@ public:
     unsigned int num_layers, unsigned int batch_size, unsigned int max_seq_len,
     const std::vector<unsigned int> &kv_widths,
     ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::FP16,
-    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW);
+    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW,
+    const std::vector<unsigned int> &rows = {},
+    const std::vector<unsigned int> &keep = {});
+
+  /**
+   * @brief [HTP window] A windowed layer -- one allocated with fewer rows
+   *        than max_seq_len through allocate()'s rows / keep -- holds
+   *        absolute position a at row a - getBase(): a sliding-window
+   *        attention never reads past its window, so only the last keep rows
+   *        before the step have to stay. Unlike the ring (setLayerCaps), the
+   *        rows are contiguous and compact() moves the window to the front.
+   * @param[in] layer_idx attention layer index
+   * @return absolute position of the layer's row 0 (0 for a full layer)
+   */
+  unsigned int getBase(unsigned int layer_idx) const {
+    return layer_idx < bases_.size() ? bases_[layer_idx] : 0u;
+  }
+
+  /**
+   * @brief Rows a layer's cache was allocated with.
+   */
+  unsigned int getRows(unsigned int layer_idx) const {
+    return getLayerCap(layer_idx);
+  }
+
+  /**
+   * @brief Before a step that starts at absolute position pos: every
+   *        windowed layer moves its last keep rows to the front and its
+   *        base to pos - keep. The caller hands the new bases to the
+   *        attention layers (they index and mirror the rows).
+   * @param[in] pos absolute position of the next row to be written
+   * @return true when a base changed
+   */
+  bool compact(unsigned int pos);
+  /** Read-only final host window; the next step must transfer KV to decode. */
+  void prepareDecodeView(unsigned int pos);
+  unsigned getDecodeOffset(unsigned layer) const {
+    return layer < decode_offsets_.size() ? decode_offsets_[layer] : 0u;
+  }
+
+  /** Immutable host prefill pages. Unlike decode INT8 pages these preserve
+   * the precision needed to resume an HMX prefill block. Batch one only. */
+  struct PrefixSnapshot {
+    struct Page {
+      std::vector<unsigned char> key, value;
+      const unsigned char *key_view = nullptr, *value_view = nullptr;
+      size_t view_bytes = 0, slab_bytes = 0;
+      std::shared_ptr<void> key_owner, value_owner;
+      const unsigned char *keyData() const {
+        return key_view ? key_view : key.data();
+      }
+      const unsigned char *valueData() const {
+        return value_view ? value_view : value.data();
+      }
+      size_t keySize() const { return key_view ? view_bytes : key.size(); }
+      size_t valueSize() const {
+        return value_view ? view_bytes : value.size();
+      }
+      void freeze() {
+        if (!key_view)
+          return;
+        key.assign(key_view, key_view + view_bytes);
+        value.assign(value_view, value_view + view_bytes);
+        key_view = value_view = nullptr;
+        key_owner.reset();
+        value_owner.reset();
+      }
+    };
+    struct Layer {
+      unsigned base = 0, width = 0;
+      std::vector<std::shared_ptr<const Page>> pages;
+      std::vector<float> dropped_k, dropped_v;
+    };
+    unsigned position = 0;
+    size_t element_bytes = 0;
+    std::vector<Layer> layers;
+  };
+  std::shared_ptr<const PrefixSnapshot>
+  capturePrefix(unsigned position, const PrefixSnapshot *previous = nullptr,
+                bool owned = false) const;
+  size_t prefixPayloadBytes(unsigned position) const;
+  void restorePrefix(const PrefixSnapshot &snapshot);
+  unsigned prefixMinPosition() const {
+    unsigned first = 0;
+    for (unsigned l = 0; l < bases_.size(); ++l)
+      if (bases_[l])
+        first = std::max(first, bases_[l] + keep_[l]);
+    return first;
+  }
+
+  /**
+   * @brief Validate a snapshot's position against the allocated cache ranges.
+   *        Does not change cache data, bases, calibration, or files. Call
+   * before compacting a cache for save().
+   * @param[in] seq_len absolute token position to save
+   */
+  void validateSaveRange(unsigned int seq_len) const;
+
+  /**
+   * @brief [HTP window] |max| per column (the layer's kv width) of every K
+   *        row compact() has dropped from the layer so far, as f32 of the
+   *        fp16 bits; empty while nothing was dropped. The decode seed's
+   *        int8 scales take it (HtpMHACoreLayer::foldDroppedAmax), so a
+   *        windowed cache quantizes as the full one would.
+   */
+  const std::vector<float> &droppedAmaxK(unsigned int layer_idx) const {
+    return layer_idx < dropped_amax_k_.size() ? dropped_amax_k_[layer_idx]
+                                              : no_amax_;
+  }
+  /** @brief droppedAmaxK for the V rows. */
+  const std::vector<float> &droppedAmaxV(unsigned int layer_idx) const {
+    return layer_idx < dropped_amax_v_.size() ? dropped_amax_v_[layer_idx]
+                                              : no_amax_;
+  }
 
   /**
    * @brief Check if the manager has been allocated
@@ -287,6 +450,25 @@ public:
   }
 
   /**
+   * @brief Allocate storage only for active layers of a hybrid model.
+   *
+   * Call before allocate(). An empty mask keeps the default dense layout.
+   * Inactive layers retain tensor dimensions and cache-file slots, but own
+   * no data. This is separate from KV sharing: they never read another layer.
+   */
+  void setActiveLayers(std::vector<bool> active) {
+    if (isAllocated())
+      throw std::logic_error(
+        "KVCacheManager::setActiveLayers: call before allocate()");
+    active_layers_ = std::move(active);
+  }
+
+  /** @brief Whether this layer participates in attention. */
+  bool isLayerActive(unsigned int layer_idx) const {
+    return active_layers_.empty() || active_layers_.at(layer_idx);
+  }
+
+  /**
    * @brief The layer whose K/V storage layer_idx aliases, or -1 when the layer
    *        owns its own cache.
    * @param[in] layer_idx attention layer index
@@ -342,11 +524,17 @@ public:
    */
   unsigned int rowsToPersist(unsigned int layer_idx,
                              unsigned int seq_len) const {
+    // [HTP window] a windowed (compacting) layer saves its last keep rows
+    if (windowed(layer_idx))
+      return seq_len - liveFrom(layer_idx, seq_len);
     const unsigned int cap = getLayerCap(layer_idx);
     return seq_len < cap ? seq_len : cap;
   }
 
 private:
+  /** @brief Check all ranges before save or compaction changes any state. */
+  void validateRange(unsigned int pos, bool compacting) const;
+
   /**
    * @brief FNV-1a over the per-layer geometry vectors, so the header can refuse
    *        a file whose widths / ring capacities / alias map differ without
@@ -391,7 +579,10 @@ private:
     nntrainer::Tensor value_cache; /**< (batch, 1, getLayerCap(i), kv_width) */
   };
 
+  bool core_shared_requested_ = false;
+  std::unique_ptr<nntrainer::kv::KvCacheManager> core_shared_;
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
+  std::vector<bool> active_layers_;      /**< empty keeps every layer active */
 
   /**
    * @brief Optional device-accessible memory pool for the KV caches. On the
@@ -402,6 +593,26 @@ private:
    * (NNTR_CUDA_KV_UVM) allocator. Null on the host (CPU) path.
    */
   std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
+
+  /**
+   * @brief One cache slab: from the shared allocator when one is set and
+   *        it delivers, otherwise an ordinary allocation.
+   */
+  nntrainer::Tensor makeCacheTensor(const ml::train::TensorDim &dim);
+
+  /**
+   * @brief Hands every shared block back to the allocator.
+   */
+  void releaseShared();
+
+  void freezePrefixViews(unsigned layer);
+  std::vector<unsigned> decode_offsets_;
+  SharedRetain shared_retain_;
+  mutable std::vector<std::vector<std::weak_ptr<PrefixSnapshot::Page>>>
+    prefix_views_;
+  SharedAlloc shared_alloc_;          /**< see setSharedAllocator */
+  SharedFree shared_free_;            /**< see setSharedAllocator */
+  std::vector<void *> shared_blocks_; /**< blocks owned via shared_alloc_ */
 
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */
@@ -414,6 +625,28 @@ private:
   std::vector<int> layer_kv_sources_;
   /** [kv-window-ring] per-layer physical row capacity (0 = full max_seq_len) */
   std::vector<unsigned int> layer_caps_;
+  /** [HTP window] per-layer window of a compacting layer (0 = ring or full) */
+  std::vector<unsigned int> keep_;
+  /** [HTP window] per-layer absolute position of row 0 */
+  std::vector<unsigned int> bases_;
+  /** [HTP window] per-layer droppedAmaxK / V (empty: nothing dropped) */
+  std::vector<std::vector<float>> dropped_amax_k_, dropped_amax_v_;
+  inline static const std::vector<float> no_amax_{};
+
+  /** @brief compact()'s fold of the layer's first n_rows rows (the ones it
+   *         is about to drop) into dropped_amax_k_ / v_. */
+  void foldDroppedRows(unsigned int l, unsigned int n_rows);
+
+  /** @brief Whether the layer compacts a window (allocate()'s rows / keep). */
+  bool windowed(unsigned int l) const {
+    return l < keep_.size() && keep_[l] > 0;
+  }
+
+  /** @brief First absolute position a dump of rows [.., pos) holds for the
+   *         layer: a windowed layer's last keep rows, else all of them. */
+  unsigned int liveFrom(unsigned int l, unsigned int pos) const {
+    return windowed(l) && pos > keep_[l] ? pos - keep_[l] : 0u;
+  }
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;

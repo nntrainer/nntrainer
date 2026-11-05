@@ -14,11 +14,79 @@
 #include <random>
 #include <vector>
 
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include <basic_planner.h>
 #include <optimized_v1_planner.h>
 #include <tensor_pool.h>
+
+TEST(TensorPool, release_inference_scratch_preserves_state_and_shared_pages) {
+  using namespace nntrainer;
+#if defined(__linux__)
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#else
+  const size_t page = 4096;
+#endif
+  const unsigned words = static_cast<unsigned>(page / sizeof(float));
+  TensorPool pool;
+  EXPECT_EQ(pool.releaseInferenceScratch(), 0u);
+  auto *head = pool.request("head", TensorDim({words + 1}), {0},
+                            TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  auto *state = pool.request("state", TensorDim({8}), {0},
+                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  auto *alias = pool.view("state_alias", "state", TensorDim({8}), {1},
+                          TensorLifespan::MAX_LIFESPAN);
+  auto *tail = pool.request("tail", TensorDim({3 * words + 1}), {1},
+                            TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  pool.finalize(BasicPlanner(), 0, 2);
+  pool.allocate();
+  std::fill_n(head->getData(), words + 1, 11.0f);
+  std::fill_n(state->getData(), 8, 77.0f);
+  std::fill_n(tail->getData(), 3 * words + 1, 22.0f);
+  float *const address = head->getData();
+#if defined(__linux__)
+  EXPECT_EQ(pool.releaseInferenceScratch(), 3 * page);
+  EXPECT_EQ(head->getData()[0], 0.0f);
+  EXPECT_EQ(tail->getData()[words], 0.0f);
+#else
+  EXPECT_EQ(pool.releaseInferenceScratch(), 0u);
+  EXPECT_EQ(head->getData()[0], 11.0f);
+#endif
+  EXPECT_EQ(head->getData(), address);
+  // A live tensor protects its entire page, including scratch sharing it.
+  EXPECT_EQ(head->getData()[words], 11.0f);
+  EXPECT_EQ(tail->getData()[0], 22.0f);
+  // The allocation's partial last page may contain allocator metadata.
+  EXPECT_EQ(tail->getData()[3 * words], 22.0f);
+  for (unsigned i = 0; i < 8; ++i) {
+    EXPECT_EQ(state->getData()[i], 77.0f);
+    EXPECT_EQ(alias->getData()[i], 77.0f);
+  }
+  pool.deallocate();
+  EXPECT_EQ(pool.releaseInferenceScratch(), 0u);
+}
+
+TEST(TensorPool, release_inference_scratch_leaves_device_allocator_untouched) {
+  class DeviceAllocator : public nntrainer::MemAllocator {
+  public:
+    std::string getName() override { return "test-device"; }
+  };
+  nntrainer::TensorPool pool(false, "", "", ml::train::ExecutionMode::INFERENCE,
+                             std::make_shared<DeviceAllocator>());
+  auto *scratch =
+    pool.request("scratch", nntrainer::TensorDim({8192}), {0},
+                 nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 1);
+  pool.allocate();
+  std::fill_n(scratch->getData(), 8192, 33.0f);
+  EXPECT_EQ(pool.releaseInferenceScratch(), 0u);
+  for (unsigned i = 0; i < 8192; ++i)
+    EXPECT_EQ(scratch->getData()[i], 33.0f);
+}
 
 constexpr unsigned int MEM_BYTES = 128;
 constexpr unsigned int MEM_QUANT = 100;

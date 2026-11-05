@@ -10,6 +10,7 @@
  */
 
 #include <gemma4_moe_layer.h>
+#include <moe_route_det.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <list>
 #include <mutex>
 #include <node_exporter.h>
+#include <quantizer.h>
 #include <stdexcept>
 #include <string>
 #include <thread_manager.h>
@@ -389,7 +391,8 @@ Gemma4MoELayer::Gemma4MoELayer() :
   epsilon(1.0e-6f),
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
             nntrainer::props::Unit(), props::MoEActivation(),
-            nntrainer::props::Epsilon(1.0e-6f), props::Gemma4MoECacheSize()),
+            nntrainer::props::Epsilon(1.0e-6f), props::Gemma4MoECacheSize(),
+            props::Gemma4RouterNormWeight(), props::Gemma4MoEFsu()),
   expert_cache(std::make_unique<Gemma4ExpertCache>()),
   expert_gate_proj_indices(),
   expert_up_proj_indices(),
@@ -397,6 +400,7 @@ Gemma4MoELayer::Gemma4MoELayer() :
   router_idx(std::numeric_limits<unsigned int>::max()),
   router_scale_idx(std::numeric_limits<unsigned int>::max()),
   per_expert_scale_idx(std::numeric_limits<unsigned int>::max()),
+  router_norm_idx(std::numeric_limits<unsigned int>::max()),
   router_input_scaled_idx(std::numeric_limits<unsigned int>::max()),
   router_logits_idx(std::numeric_limits<unsigned int>::max()),
   scratch_capacity(0) {}
@@ -411,10 +415,13 @@ void Gemma4MoELayer::finalize(nntrainer::InitLayerContext &context) {
   const auto &router_dim = context.getInputDimensions()[ROUTER_INPUT_IDX];
   NNTR_THROW_IF(expert_dim != router_dim, std::invalid_argument)
     << "Gemma4 MoE expert and router input dimensions must match";
-  NNTR_THROW_IF(context.getActivationDataType() !=
-                  ml::train::TensorDim::DataType::FP32,
+  const auto act_dtype = expert_dim.getDataType();
+  NNTR_THROW_IF(act_dtype != ml::train::TensorDim::DataType::FP32 &&
+                  !(act_dtype == ml::train::TensorDim::DataType::FP16 &&
+                    acceptsFp16Activations()),
                 std::invalid_argument)
-    << "Gemma4 MoE currently requires FP32 activations";
+    << "Gemma4 MoE on this engine requires FP32 activations (FP16 runs on "
+       "the gpu engine only)";
 
   context.setOutputDimensions({expert_dim});
 
@@ -470,6 +477,13 @@ void Gemma4MoELayer::finalize(nntrainer::InitLayerContext &context) {
                           nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f,
                           "router_per_expert_scale", true);
 
+  if (std::get<props::Gemma4RouterNormWeight>(moe_props).get()) {
+    nntrainer::TensorDim router_norm_dim(1, 1, 1, hidden_size, fp32_type);
+    router_norm_idx = context.requestWeight(
+      router_norm_dim, nntrainer::Initializer::ONES,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "router_norm", true);
+  }
+
   expert_gate_proj_indices.reserve(num_experts);
   expert_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
@@ -513,6 +527,74 @@ void Gemma4MoELayer::finalize(nntrainer::InitLayerContext &context) {
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
+void Gemma4MoELayer::routeTokens(nntrainer::RunLayerContext &context,
+                                 nntrainer::Tensor &router_input,
+                                 nntrainer::Tensor &router_input_scaled,
+                                 nntrainer::Tensor &router_logits,
+                                 unsigned int total_tokens,
+                                 unsigned int hidden_size, Routing &routing) {
+  // The deterministic router (moe_route_det.h): fixed op order and no
+  // BLAS / libm, so the cpu layer, the gpu layer's host fallback and the
+  // device router kernels select the same experts with the same weights.
+  // router_input_scaled is not used by it; router_logits receives the
+  // softmax probabilities.
+  (void)router_input_scaled;
+  router_logits.reshape({total_tokens, 1, 1, num_experts});
+  const bool pre_profile = moeProfileEnabled();
+  auto &pre_stats = moePhaseStats();
+  uint64_t tp = pre_profile ? nowNs() : 0;
+
+  const float *gamma =
+    router_norm_idx != std::numeric_limits<unsigned int>::max()
+      ? context.getWeight(router_norm_idx).getData<float>()
+      : nullptr;
+  const float *router_scale =
+    context.getWeight(router_scale_idx).getData<float>();
+  const float *W = context.getWeight(router_idx).getData<float>();
+  const float *per_expert_scale =
+    context.getWeight(per_expert_scale_idx).getData<float>();
+  const float hidden_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
+  const float *x = router_input.getData<float>();
+  float *probs = router_logits.getData<float>();
+
+  auto &expert_assignments = routing.assignments;
+  expert_assignments.assign(num_experts, {});
+  // rows are independent: route them in parallel, then bucket in token order
+  std::vector<uint32_t> ids((size_t)total_tokens * topk);
+  std::vector<float> w((size_t)total_tokens * topk);
+  auto route_row = [&](size_t token) {
+    nntrainer::moe_route_det_row(
+      x + token * hidden_size, hidden_size, gamma, router_scale, hidden_scale,
+      W, per_expert_scale, num_experts, topk, epsilon,
+      ids.data() + token * topk, w.data() + token * topk,
+      probs + token * num_experts);
+  };
+  if (total_tokens > 1)
+    nntrainer::ThreadManager::Global().parallel_for(0, total_tokens, route_row);
+  else
+    route_row(0);
+  for (unsigned int token = 0; token < total_tokens; ++token)
+    for (unsigned int k = 0; k < topk; ++k)
+      expert_assignments[ids[(size_t)token * topk + k]].emplace_back(
+        token, w[(size_t)token * topk + k]);
+  if (pre_profile) {
+    uint64_t t = nowNs();
+    pre_stats.rdot_ns += t - tp;
+    tp = t;
+  }
+
+  auto &active_experts = routing.active;
+  active_experts.clear();
+  active_experts.reserve(num_experts);
+  for (unsigned int expert = 0; expert < num_experts; ++expert) {
+    if (!expert_assignments[expert].empty())
+      active_experts.push_back(expert);
+  }
+
+  if (pre_profile)
+    pre_stats.bucket_ns += nowNs() - tp;
+}
+
 void Gemma4MoELayer::forwardTensors(nntrainer::RunLayerContext &context,
                                     nntrainer::Tensor &expert_input,
                                     nntrainer::Tensor &router_input,
@@ -526,8 +608,6 @@ void Gemma4MoELayer::forwardTensors(nntrainer::RunLayerContext &context,
   expert_input.reshape({total_tokens, 1, 1, hidden_size});
   router_input.reshape({total_tokens, 1, 1, hidden_size});
   output.reshape({total_tokens, 1, 1, hidden_size});
-  router_input_scaled.reshape({total_tokens, 1, 1, hidden_size});
-  router_logits.reshape({total_tokens, 1, 1, num_experts});
   const bool pre_profile = moeProfileEnabled();
   auto &pre_stats = moePhaseStats();
   if (pre_profile)
@@ -541,92 +621,11 @@ void Gemma4MoELayer::forwardTensors(nntrainer::RunLayerContext &context,
     tp = t;
   }
 
-  nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-    router_input.getData<float>(), router_input_scaled.getData<float>(),
-    total_tokens, hidden_size, epsilon);
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.rmsnorm_ns += t - tp;
-    tp = t;
-  }
-
-  const float *router_scale =
-    context.getWeight(router_scale_idx).getData<float>();
-  float *scaled_data = router_input_scaled.getData<float>();
-  const float hidden_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
-  for (unsigned int token = 0; token < total_tokens; ++token) {
-    float *row = scaled_data + token * hidden_size;
-    for (unsigned int feature = 0; feature < hidden_size; ++feature)
-      row[feature] *= router_scale[feature] * hidden_scale;
-  }
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.rscale_ns += t - tp;
-    tp = t;
-  }
-
-  router_input_scaled.dot(context.getWeight(router_idx), router_logits);
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.rdot_ns += t - tp;
-    tp = t;
-  }
-
-  router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.softmax_ns += t - tp;
-    tp = t;
-  }
-
-  auto topk_result = router_logits.topK(topk);
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.topk_ns += t - tp;
-    tp = t;
-  }
-  auto topk_values = std::get<0>(topk_result);
-  auto topk_indices = std::get<1>(topk_result);
-
-  const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-  float *values_data = topk_values.getData<float>();
-  const float *per_expert_scale =
-    context.getWeight(per_expert_scale_idx).getData<float>();
-  for (unsigned int token = 0; token < total_tokens; ++token) {
-    float sum = 0.0f;
-    for (unsigned int k = 0; k < topk; ++k)
-      sum += values_data[token * topk + k];
-    for (unsigned int k = 0; k < topk; ++k) {
-      const unsigned int offset = token * topk + k;
-      values_data[offset] =
-        values_data[offset] / sum * per_expert_scale[indices_data[offset]];
-    }
-  }
-  if (pre_profile) {
-    uint64_t t = nowNs();
-    pre_stats.renorm_ns += t - tp;
-    tp = t;
-  }
-
-  std::vector<std::vector<std::pair<unsigned int, float>>> expert_assignments(
-    num_experts);
-  for (unsigned int token = 0; token < total_tokens; ++token) {
-    for (unsigned int k = 0; k < topk; ++k) {
-      const unsigned int offset = token * topk + k;
-      expert_assignments[indices_data[offset]].emplace_back(
-        token, values_data[offset]);
-    }
-  }
-
-  std::vector<unsigned int> active_experts;
-  active_experts.reserve(num_experts);
-  for (unsigned int expert = 0; expert < num_experts; ++expert) {
-    if (!expert_assignments[expert].empty())
-      active_experts.push_back(expert);
-  }
-
-  if (pre_profile)
-    pre_stats.bucket_ns += nowNs() - tp;
+  Routing routing;
+  routeTokens(context, router_input, router_input_scaled, router_logits,
+              total_tokens, hidden_size, routing);
+  const auto &expert_assignments = routing.assignments;
+  const auto &active_experts = routing.active;
 
   if (cache_size > 0 && !active_experts.empty())
     expert_cache->prefetch(active_experts.front());
@@ -637,7 +636,15 @@ void Gemma4MoELayer::forwardTensors(nntrainer::RunLayerContext &context,
   if (moe_profile)
     loop_start = nowNs();
 
-  for (size_t active = 0; active < active_experts.size(); ++active) {
+  const bool grouped_decode =
+    total_tokens == 1 && cache_size == 0 && active_experts.size() > 1 &&
+    context.getWeight(expert_gate_proj_indices[active_experts.front()])
+        .getDataType() == nntrainer::TensorDim::DataType::TQ2CX &&
+    computeGroupedDecode(context, expert_input, output, active_experts,
+                         expert_assignments, hidden_size);
+
+  for (size_t active = 0; !grouped_decode && active < active_experts.size();
+       ++active) {
     const unsigned int expert = active_experts[active];
     if (cache_size > 0)
       expert_cache->acquire(expert);
@@ -714,6 +721,100 @@ void Gemma4MoELayer::ensureExpertScratch(
     nntrainer::Tensor(1, 1, tokens, intermediate_size, tensor_type);
   scratch_down_out = nntrainer::Tensor(1, 1, tokens, hidden_size, tensor_type);
   scratch_capacity = tokens;
+}
+
+bool Gemma4MoELayer::computeGroupedDecode(
+  nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+  nntrainer::Tensor &output, const std::vector<unsigned int> &active_experts,
+  const std::vector<std::vector<std::pair<unsigned int, float>>>
+    &expert_assignments,
+  unsigned int hidden_size) {
+  nntrainer::ComputeOps *ops = context.getComputeOps();
+  if (ops == nullptr)
+    ops = nntrainer::getComputeOps();
+  if (ops == nullptr || !ops->supports_gemm_tq2cx_batch_fp32())
+    return false;
+
+  const bool profile = moeProfileEnabled();
+  auto &stats = moePhaseStats();
+  uint64_t t0 = profile ? nowNs() : 0;
+
+  const unsigned int num = static_cast<unsigned int>(active_experts.size());
+  const unsigned int intermediate_size =
+    context.getWeight(expert_gate_proj_indices[active_experts.front()]).width();
+  const auto tensor_type = input.getTensorType();
+  ensureExpertScratch(1, hidden_size, intermediate_size, tensor_type);
+  if (scratch_grouped_gate_up.empty() ||
+      scratch_grouped_gate_up.height() < 2 * num ||
+      scratch_grouped_gate_up.width() != intermediate_size)
+    scratch_grouped_gate_up =
+      nntrainer::Tensor(1, 1, 2 * num, intermediate_size, tensor_type);
+
+  // [gate_0, up_0, gate_1, up_1, ...] in one call, M = 1
+  float *gate_up = scratch_grouped_gate_up.getData<float>();
+  std::vector<void *> weights;
+  std::vector<float *> outputs;
+  weights.reserve(2 * num);
+  outputs.reserve(2 * num);
+  for (unsigned int i = 0; i < num; ++i) {
+    const unsigned int expert = active_experts[i];
+    weights.push_back(
+      context.getWeight(expert_gate_proj_indices[expert]).getData<uint8_t>());
+    outputs.push_back(gate_up + static_cast<size_t>(2 * i) * intermediate_size);
+    weights.push_back(
+      context.getWeight(expert_up_proj_indices[expert]).getData<uint8_t>());
+    outputs.push_back(gate_up +
+                      static_cast<size_t>(2 * i + 1) * intermediate_size);
+  }
+  ops->gemm_tq2cx_batch_fp32(
+    weights, const_cast<float *>(input.getData<float>()), outputs, 1,
+    std::vector<unsigned int>(2 * num, intermediate_size), hidden_size);
+  if (profile) {
+    uint64_t t = nowNs();
+    stats.gemm_ns += t - t0;
+    t0 = t;
+  }
+
+  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
+                                        tensor_type);
+  nntrainer::TensorDim hidden_dim({1, 1, 1, hidden_size}, tensor_type);
+  nntrainer::Tensor activated =
+    scratch_activated.getSharedDataTensor(intermediate_dim, 0, true);
+  nntrainer::Tensor down_out =
+    scratch_down_out.getSharedDataTensor(hidden_dim, 0, true);
+  float *output_data = output.getData<float>();
+  for (unsigned int i = 0; i < num; ++i) {
+    const unsigned int expert = active_experts[i];
+    nntrainer::Tensor gate_out = scratch_grouped_gate_up.getSharedDataTensor(
+      intermediate_dim, static_cast<size_t>(2 * i) * intermediate_size, true);
+    nntrainer::Tensor up_out = scratch_grouped_gate_up.getSharedDataTensor(
+      intermediate_dim, static_cast<size_t>(2 * i + 1) * intermediate_size,
+      true);
+    acti_func.run_fn(gate_out, activated);
+    activated.multiply_i(up_out);
+    if (profile) {
+      uint64_t t = nowNs();
+      stats.acti_ns += t - t0;
+      t0 = t;
+    }
+
+    activated.dot(context.getWeight(expert_down_proj_indices[expert]),
+                  down_out);
+    if (profile) {
+      uint64_t t = nowNs();
+      stats.gemm_ns += t - t0;
+      t0 = t;
+    }
+
+    nntrainer::saxpy(hidden_size, expert_assignments[expert][0].second,
+                     down_out.getData<float>(), 1, output_data, 1);
+    if (profile) {
+      uint64_t t = nowNs();
+      stats.scatter_ns += t - t0;
+      t0 = t;
+    }
+  }
+  return true;
 }
 
 void Gemma4MoELayer::computeExpertForward(
@@ -921,8 +1022,9 @@ void Gemma4MoELayer::save(std::ofstream &file,
       continue;
 
     auto &weight = run_context.getWeight(i);
-    const bool is_router_weight =
-      i == router_idx || i == router_scale_idx || i == per_expert_scale_idx;
+    const bool is_router_weight = i == router_idx || i == router_scale_idx ||
+                                  i == per_expert_scale_idx ||
+                                  i == router_norm_idx;
     const bool activate_for_save = weight.isVirtual() && !weight.isAllocated();
     if (activate_for_save)
       weight.activate();
@@ -931,10 +1033,25 @@ void Gemma4MoELayer::save(std::ofstream &file,
       if (is_router_weight || dtype == nntrainer::TensorDim::DataType::NONE ||
           weight.getDataType() == dtype) {
         weight.save(file);
+      } else if (dtype == nntrainer::TensorDim::DataType::TQ2CX) {
+        NNTR_THROW_IF(true, std::runtime_error)
+          << "Gemma4 MoE cannot quantize expert '" << weight.getName()
+          << "' to TQ2CX: ternary experts come from an offline packer";
+      } else if (dtype == nntrainer::TensorDim::DataType::QS4CX) {
+        // Per-output-channel int4, the expert format the OpenCL / CUDA FC
+        // kernels consume directly.
+        NNTR_THROW_IF(weight.getDataType() !=
+                        nntrainer::TensorDim::DataType::FP32,
+                      std::runtime_error)
+          << "Gemma4 MoE quantization requires FP32 source weights";
+        nntrainer::QS4CXQuantizer quantizer;
+        nntrainer::Tensor quantized =
+          quantizer.quantize(weight, nntrainer::TensorDim::DataType::QS4CX);
+        quantized.save(file);
       } else {
         NNTR_THROW_IF(dtype != nntrainer::TensorDim::DataType::Q4_0,
                       std::runtime_error)
-          << "Gemma4 MoE save supports only Q4_0 quantization";
+          << "Gemma4 MoE save supports only Q4_0 and QS4CX quantization";
         NNTR_THROW_IF(weight.getDataType() !=
                         nntrainer::TensorDim::DataType::FP32,
                       std::runtime_error)

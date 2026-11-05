@@ -180,6 +180,7 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var engine: QuickDotAI? = null
     @Volatile private var loadedKey: String? = null
+    @Volatile private var loadedRequest: LoadModelRequest? = null
     @Volatile private var selectedImageBytesList: MutableList<ByteArray> = mutableListOf()
 
     /** Convenience: first selected image (or null) — for single-image code paths. */
@@ -296,6 +297,21 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         checkAllFilesAccess()
+        // Pick a descriptor actually present in this native build.
+        if (selDescriptor == null) {
+            val initial = ModelCatalog.byId(ModelIds.GEMMA4_26B_A4B_HTP)
+                ?: ModelCatalog.selectable().firstOrNull()
+            if (initial != null) {
+                selFamily = initial.family
+                selRuntime = initial.runtime
+                selBackend = initial.backends.first()
+                chatSelFamily = selFamily
+                chatSelRuntime = selRuntime
+                chatSelBackend = selBackend
+            }
+        }
+        selDescriptor?.let { loadDefaultOpenAIExampleFor(it.id) }
+        loadDefaultChatPromptFor(chatSelDescriptor)
         // Seed the path field so a single Load tap works without typing.
         modelPathText = defaultModelPathFor(selDescriptor, selectedQuant) ?: ""
         rebuildUi()
@@ -575,6 +591,7 @@ class MainActivity : AppCompatActivity() {
                 selRuntime = ModelCatalog.runtimesFor(selFamily).firstOrNull() ?: selRuntime
                 selBackend = ModelCatalog.backendsFor(selFamily, selRuntime).firstOrNull() ?: selBackend
                 selSdEnabled = false
+                selDescriptor?.let { loadDefaultOpenAIExampleFor(it.id) }
                 modelPathText = defaultModelPathFor(selDescriptor, selectedQuant) ?: ""
                 rebuildUi(resetModelPath = true)
             })
@@ -585,6 +602,7 @@ class MainActivity : AppCompatActivity() {
                 selRuntime = RuntimeKind.valueOf(picked)
                 selBackend = ModelCatalog.backendsFor(selFamily, selRuntime).firstOrNull() ?: selBackend
                 selSdEnabled = false
+                selDescriptor?.let { loadDefaultOpenAIExampleFor(it.id) }
                 modelPathText = defaultModelPathFor(selDescriptor, selectedQuant) ?: ""
                 rebuildUi(resetModelPath = true)
             })
@@ -594,10 +612,16 @@ class MainActivity : AppCompatActivity() {
             body.addView(chipRow(t, ModelCatalog.backendsFor(selFamily, selRuntime).map { it.name }, selBackend.name) { picked ->
                 selBackend = BackendType.valueOf(picked)
                 selSdEnabled = false
+                selDescriptor?.let { loadDefaultOpenAIExampleFor(it.id) }
                 modelPathText = defaultModelPathFor(selDescriptor, selectedQuant) ?: ""
                 rebuildUi(resetModelPath = true)
             })
             spacer(body, 12)
+
+            if (selDescriptor?.id == ModelIds.GEMMA4_26B_A4B_HTP) {
+                body.addView(labelView(t, "HTP · W4A32 · text generation"))
+                spacer(body, 12)
+            }
 
             // MODEL BASE PATH — editable root directory for model files.
             body.addView(labelView(t, "MODEL BASE PATH"))
@@ -818,6 +842,7 @@ class MainActivity : AppCompatActivity() {
             chatSelRuntime = ModelCatalog.runtimesFor(chatSelFamily).firstOrNull() ?: chatSelRuntime
             chatSelBackend = ModelCatalog.backendsFor(chatSelFamily, chatSelRuntime).firstOrNull() ?: chatSelBackend
             chatSelSdEnabled = false
+            loadDefaultChatPromptFor(chatSelDescriptor)
             clearChatSessionState()
             rebuildUi()
         })
@@ -828,6 +853,7 @@ class MainActivity : AppCompatActivity() {
             chatSelRuntime = RuntimeKind.valueOf(picked)
             chatSelBackend = ModelCatalog.backendsFor(chatSelFamily, chatSelRuntime).firstOrNull() ?: chatSelBackend
             chatSelSdEnabled = false
+            loadDefaultChatPromptFor(chatSelDescriptor)
             clearChatSessionState()
             rebuildUi()
         })
@@ -837,6 +863,7 @@ class MainActivity : AppCompatActivity() {
         modelCard.addView(chipRow(t, ModelCatalog.backendsFor(chatSelFamily, chatSelRuntime).map { it.name }, chatSelBackend.name) { picked ->
             chatSelBackend = BackendType.valueOf(picked)
             chatSelSdEnabled = false
+            loadDefaultChatPromptFor(chatSelDescriptor)
             clearChatSessionState()
             rebuildUi()
         })
@@ -2002,7 +2029,8 @@ class MainActivity : AppCompatActivity() {
     private fun badgeLabel(d: ModelDescriptor): String = when {
         Capability.MULTIMODAL in d.capabilities -> "[MULTIMODAL]  ${d.displayName}"
         Capability.EMBEDDING in d.capabilities  -> "[EMBEDDING]   ${d.displayName}"
-        d.backends == setOf(BackendType.NPU)    -> "[QNN]         ${d.displayName}"
+        d.id == ModelIds.GEMMA4_26B_A4B_HTP      -> "[HTP]         ${d.displayName}"
+        d.backends == setOf(BackendType.NPU)    -> "[NPU]         ${d.displayName}"
         else -> "[TEXT]        ${d.displayName}"
     }
 
@@ -2023,7 +2051,9 @@ class MainActivity : AppCompatActivity() {
         val e = engine
         engine = null
         loadedKey = null
+        loadedRequest = null
         if (e != null) {
+            e.cancel()
             engineExecutor.execute {
                 try { e.close() } catch (_: Throwable) { /* best effort */ }
             }
@@ -2037,7 +2067,7 @@ class MainActivity : AppCompatActivity() {
         setStatus("Loading ${req.modelKey}…  (vision=${req.visionBackend?.name ?: "off"})")
         outputText = ""
         mainHandler.post { rebuildUi() }
-        engineExecutor.execute { loadModelInternal(req) }
+        engineExecutor.execute { loadModelInternal(req, forceReload = true) }
     }
 
     private fun onCancelClicked() {
@@ -2111,18 +2141,18 @@ class MainActivity : AppCompatActivity() {
      * @brief Core model loading logic. Must be called from [engineExecutor].
      * Returns the loaded [QuickDotAI] engine, or null on failure.
      */
-    private fun loadModelInternal(req: LoadModelRequest): QuickDotAI? {
-        if (loadedKey != null && loadedKey != req.modelKey) {
+    private fun loadModelInternal(req: LoadModelRequest, forceReload: Boolean = false): QuickDotAI? {
+        if (engine != null && (forceReload || loadedRequest != req)) {
             try { engine?.close() } catch (_: Throwable) { /* best effort */ }
             engine = null
             loadedKey = null
+            loadedRequest = null
             clearChatSessionState()
         }
-        if (engine != null && loadedKey == req.modelKey) {
+        if (engine != null && loadedRequest == req) {
             if (activeSessionKey != null && activeSessionKey != req.modelKey) {
                 clearChatSessionState()
             }
-            loadDefaultOpenAIExampleFor(req.modelId)
             loadStatus = "loaded"
             loadedLabel = req.modelKey
             setStatus("Already loaded: ${req.modelKey}")
@@ -2141,8 +2171,8 @@ class MainActivity : AppCompatActivity() {
             is BackendResult.Ok -> {
                 engine = newEngine
                 loadedKey = req.modelKey
+                loadedRequest = req
                 clearChatSessionState()
-                loadDefaultOpenAIExampleFor(req.modelId)
                 loadStatus = "loaded"
                 loadedLabel = req.modelKey
                 setStatus("Loaded ${req.modelKey} (${newEngine.kind}, arch=${newEngine.architecture ?: "?"})")
@@ -2256,6 +2286,7 @@ class MainActivity : AppCompatActivity() {
             when (val r = e.unload()) {
                 is BackendResult.Ok -> {
                     loadedKey = null
+                    loadedRequest = null
                     loadStatus = "idle"
                     loadedLabel = ""
                     clearChatSessionState()
@@ -2591,7 +2622,7 @@ class MainActivity : AppCompatActivity() {
         engineExecutor.execute {
             val e = loadModelInternal(req)
             if (e == null) {
-                streaming = false; setStatus("Model load failed.")
+                streaming = false
                 mainHandler.post { rebuildUi() }; return@execute
             }
             if (e.chatSessionId != null) {
@@ -2787,6 +2818,9 @@ class MainActivity : AppCompatActivity() {
         text.replace("<|image_strart|>", "<|image_start|>")
 
     private val exampleByModelId: Map<String, String> = mapOf(
+        ModelIds.LFM2_24BA2B_HTP to """[
+  {"role": "user", "content": "Explain three practical ways to conserve water at home. Use a numbered list with two sentences per item."}
+]""",
         ModelIds.GEMMA4 to """[
   {"role": "system", "content": "You are a concise vision assistant."},
   {"role": "user", "content": [{"type": "text", "text": "Describe this image."}, {"type": "image_url", "image_url": {"url": "sampletestapp://selected-image"}}]}
@@ -2814,7 +2848,24 @@ class MainActivity : AppCompatActivity() {
   ]
 }"""
 
+    private val gemma4MoeExample: String by lazy {
+        resources.openRawResource(R.raw.gemma4_moe_messages).bufferedReader().use { it.readText().trim() }
+    }
+
+    private fun loadDefaultChatPromptFor(descriptor: ModelDescriptor?) {
+        val example = when (descriptor?.id) {
+            ModelIds.GEMMA4_26B_A4B_HTP -> gemma4MoeExample
+            ModelIds.LFM2_24BA2B_HTP -> exampleByModelId.getValue(ModelIds.LFM2_24BA2B_HTP)
+            else -> return
+        }
+        val prompt = Json.parseToJsonElement(example).jsonArray[0]
+            .jsonObject.getValue("content").jsonPrimitive.content
+        chatPromptText = prompt
+        if (::chatPromptField.isInitialized) chatPromptField.setText(prompt)
+    }
+
     private fun defaultOpenAIExampleForId(modelId: String): String {
+        if (modelId == ModelIds.GEMMA4_26B_A4B_HTP) return gemma4MoeExample
         exampleByModelId[modelId]?.let { return it }
         val d = ModelCatalog.byId(modelId)
         return when {
@@ -2824,9 +2875,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadDefaultOpenAIExampleFor(modelId: String) {
-        openAiJsonText = defaultOpenAIExampleForId(modelId)
-        if (::openAIMessagesField.isInitialized) {
-            mainHandler.post { openAIMessagesField.setText(openAiJsonText) }
+        val example = defaultOpenAIExampleForId(modelId)
+        runOnUiThread {
+            // Update the field before rebuilding so the UI snapshot retains it.
+            openAiJsonText = example
+            if (::openAIMessagesField.isInitialized) openAIMessagesField.setText(example)
         }
     }
 
@@ -2868,6 +2921,8 @@ class MainActivity : AppCompatActivity() {
         ModelIds.TINY_BERT      to "tiny-bert",
         ModelIds.FUNCTION_GEMMA to "function_gemma",
         ModelIds.GEMMA4_CPU     to "gemma4_cpu",
+        ModelIds.GEMMA4_26B_A4B_HTP to "gemma4-26b-a4b-htp-w4a32",
+        ModelIds.LFM2_24BA2B_HTP to "lfm2-24ba2b-htp-w4a32",
         ModelIds.GEMMA4_E2B_QNN to "gemma-4-e2b-qnn",
         ModelIds.VJEPA_QNN      to "vjepa2-qnn",
     )

@@ -163,7 +163,8 @@ foreach _causallm_inc_root : [
   endif
 endforeach
 
-causallm_inc_args = ['-I' + causallm_root]
+causallm_inc_args = ['-I' + causallm_root,
+                     '-I' + nntrainer_root / 'nntrainer']
 foreach d : causallm_auto_inc_dirs
   causallm_inc_args += ['-I' + d]
 endforeach
@@ -195,6 +196,9 @@ if not fs.exists(tokenizer_path)
   error('CausalLM tokenizer library not found: @0@'.format(tokenizer_path))
 endif
 
+causallm_inc_args += ['-I' + causallm_root / 'models' / 'lfm2_moe',
+                       '-I' + nntrainer_root / 'nntrainer' / 'tensor' / 'htp_backend']
+
 # ── libcausallm.so sources ────────────────────────────────────────────────
 # NOTE: Do NOT include causallm_root / 'api' sources here (besides streamer) -
 # the API layer is provided by libquick_dot_ai_api.so below; compiling it
@@ -205,14 +209,30 @@ endif
 # models/. This is the canonical Android core source manifest. The shared
 # LLM layers (lm_head, qkv, scalar_multiply, logit_softcapping, swiglu,
 # tie_word_embedding) live in libnntrainer (nntrainer/layers/llm), not here.
+causallm_enable_qnn = enable_qnn
+causallm_tokenizer_cache_name = 'tokenizer-cache'
+causallm_tokenizer_cache_opt = get_option(causallm_tokenizer_cache_name)
+causallm_tokenizer_probe_args = [tokenizer_path]
+causallm_tokenizer_probe_deps = [thread_dep, log_dep]
+subdir('common')
+
+causallm_htp_src = causallm_htp_model_src + [
+  causallm_root / 'layers' / 'dense_ffn_layer.cpp',
+  causallm_root / 'layers' / 'residual_add.cpp',
+  causallm_root / 'layers' / 'conv_block_layer.cpp',
+]
+
 causallm_src = [
   causallm_root / 'chat_template.cpp',
   causallm_root / 'factory.cpp',
   causallm_root / 'huggingface_tokenizer.cpp',
   causallm_root / 'tokenizer_cache.cpp',
   causallm_root / 'kv_cache_manager.cpp',
+  causallm_root / 'prefix_flash_store.cpp',
+  causallm_root / 'baked_prefix.cpp',
   causallm_root / 'llm_util.cpp',
   causallm_root / 'models' / 'causal_lm.cpp',
+  causallm_root / 'models' / 'causal_lm_baked.cpp',
   causallm_root / 'models' / 'transformer.cpp',
   causallm_root / 'models' / 'sentence_transformer.cpp',
   causallm_root / 'models' / 'model_registry.cpp',
@@ -237,6 +257,7 @@ causallm_src = [
   causallm_root / 'models' / 'gemma4' / 'gemma4_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_moe_causallm.cpp',
   causallm_root / 'models' / 'gemma4' / 'gemma4_moe_layer.cpp',
+  causallm_root / 'models' / 'gemma4' / 'gemma4_moe_layer_gpu.cpp',
   causallm_root / 'models' / 'lfm2' / 'lfm2_causallm.cpp',
   causallm_root / 'models' / 'timm_vit' / 'timm_vit_transformer.cpp',
   causallm_root / 'models' / 'deberta_v2' / 'deberta_v2.cpp',
@@ -260,34 +281,13 @@ causallm_src = [
   causallm_root / 'api' / 'streamer.cpp',
 ]
 
-causallm_core_cpp_args = []
+causallm_core_cpp_args = causallm_common_cpp_args
 quick_dot_ai_api_cpp_args = []
 quick_dot_ai_test_cpp_args = []
-
-# Persistent tokenizer snapshot cache: on only when the tokenizer archive
-# exports the snapshot entry points (an older archive still links without
-# them and every load parses tokenizer.json). See ../meson.build.
-tokenizer_cache_opt = get_option('tokenizer-cache')
-tokenizer_cache = false
-if not tokenizer_cache_opt.disabled()
-  tokenizer_cache = cxx.has_function('tokenizers_new_from_snapshot',
-    args: [tokenizer_path],
-    dependencies: [thread_dep, log_dep])
-  if not tokenizer_cache and tokenizer_cache_opt.enabled()
-    error('tokenizer-cache is enabled, but @0@ does not export the snapshot entry points. Rebuild it with ../tools/build_tokenizers_c.sh.'.format(tokenizer_path))
-  endif
-endif
-if not tokenizer_cache
-  causallm_core_cpp_args += ['-DCAUSALLM_DISABLE_TOKENIZER_CACHE']
-endif
 
 # Single QNN switch. Keep the QNN ABI-affecting definitions on the targets
 # that consume them instead of applying them to the whole Meson project.
 if enable_qnn
-  causallm_core_cpp_args += [
-    '-DENABLE_QNN=1',
-    '-DENABLE_QNN_MODELS=1',
-  ]
   quick_dot_ai_api_cpp_args += [
     '-DENABLE_QNN_MODELS=1',
     '-DQUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API=1',
@@ -295,23 +295,6 @@ if enable_qnn
   quick_dot_ai_test_cpp_args += [
     '-DENABLE_QNN=1',
     '-DENABLE_QNN_MODELS=1',
-  ]
-endif
-
-# ── QNN model-runtime infra + public gemma4-e2b-qnn model (gated) ────────
-# quick_dot_ai_qnn.cpp registers the QNN backend at runtime
-# (Engine::Global().registerContext("libqnn_context.so", ...)) rather than
-# linking the QNN SDK directly, so no QNN SDK headers are needed to compile
-# these sources.
-causallm_qnn_src = []
-if enable_qnn
-  causallm_qnn_src += [
-    causallm_root / 'qnn' / 'android_memory_allocator.cpp',
-    causallm_root / 'qnn' / 'quick_dot_ai_qnn.cpp',
-    causallm_root / 'qnn' / 'graph_parser.cpp',
-    causallm_root / 'qnn' / 'generate_qnn_utils.cpp',
-    causallm_root / 'qnn' / 'qnn_kv_cache_manager.cpp',
-    causallm_root / 'qnn' / 'gemma4-e2b-qnn' / 'gemma4_e2b_qnn.cpp',
   ]
 endif
 
@@ -330,34 +313,6 @@ endif
 # hand-picked subset.
 causallm_xgrammar_inc_args = causallm_inc_args
 
-causallm_xgrammar_src = [
-  # wrapper: bridges causallm::XGrammar to the xgrammar library.
-  causallm_root / 'api' / 'xgrammar_wrapper.cpp',
-  causallm_root / 'api' / 'xgrammar_manager.cpp',
-  # xgrammar library sources (vendored xgrammar submodule checkout).
-  causallm_root / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'config.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'earley_parser.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'fsm.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'grammar.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'regex_converter.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'structural_tag.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'testing.cc',
-  # Support files (required for linking)
-  causallm_root / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
-  causallm_root / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
-]
-
 causallm_xgrammar_lib = static_library('causallm_xgrammar',
   causallm_xgrammar_src,
   dependencies: [nntrainer_dep],
@@ -368,6 +323,29 @@ causallm_xgrammar_lib = static_library('causallm_xgrammar',
   override_options: ['werror=false'],
 )
 
+# PR 4416's Android fused graph was compiled with fast-math. Keep that
+# arithmetic local to its opt-in model/layers; main models retain their flags.
+causallm_htp_cpp_args = []
+if host_machine.system() == 'android'
+  causallm_htp_cpp_args += ['-ffast-math']
+endif
+causallm_htp_lib = static_library('causallm_htp',
+  causallm_htp_src,
+  dependencies: [nntrainer_dep, openmp_dep, log_dep],
+  cpp_args: causallm_inc_args + causallm_core_cpp_args + causallm_htp_cpp_args,
+)
+
+# The exact ARM router must not inherit the fused model's contraction flags.
+lfm2_router_arm_cpp_args = []
+if cxx.get_id() in ['gcc', 'clang', 'apple-clang']
+  lfm2_router_arm_cpp_args += ['-fno-fast-math', '-ffp-contract=off']
+endif
+lfm2_router_arm_lib = static_library('lfm2_router_arm',
+  causallm_root / 'models' / 'lfm2_moe' / 'lfm2_router_arm.cpp',
+  dependencies: [nntrainer_dep],
+  cpp_args: causallm_inc_args + lfm2_router_arm_cpp_args,
+)
+
 # ── Build libcausallm.so ─────────────────────────────────────────────────
 causallm_lib = shared_library('causallm',
     causallm_src,
@@ -375,7 +353,7 @@ causallm_lib = shared_library('causallm',
     dependencies: [nntrainer_dep, openmp_dep, log_dep],
     cpp_args: causallm_inc_args + causallm_core_cpp_args,
     link_args: [tokenizer_path],
-    link_whole: [causallm_xgrammar_lib],
+    link_whole: [causallm_xgrammar_lib, causallm_htp_lib, lfm2_router_arm_lib],
     install: true,
 )
 
@@ -469,3 +447,31 @@ executable('nntr_safetensors_info',
     cpp_args: causallm_inc_args,
     install: false,
 )
+
+if get_option('enable-htp-device-check')
+  foreach check_name, check_source : {
+    'htp_page_prefix_check': 'tools/kv_cache/check_htp_page_prefix.cpp',
+    'htp_sessions_check': 'tools/kv_cache/check_htp_sessions.cpp',
+    'htp_decode_kv_convert_check': 'test/htp/host/decode_kv_convert_check.cpp',
+    'htp_decode_prefix_check': 'tools/kv_cache/check_htp_decode_prefix.cpp',
+    'htp_baked_prefix_check': 'test/htp/host/baked_prefix_check.cpp',
+    'htp_prefix_flash_check': 'test/htp/host/prefix_flash_check.cpp',
+    'htp_prefill_check': 'test/htp/host/prefill_prefix_check.cpp',
+    'htp_calibration_check': 'test/htp/host/attention_calibration_check.cpp',
+    'htp_prefix_grid_bench': 'tools/kv_cache/benchmark_htp_prefix_grid.cpp',
+    'htp_prefix_cold_bench': 'tools/kv_cache/benchmark_htp_prefix_cold.cpp',
+  }
+    executable(check_name,
+        nntrainer_root / check_source,
+        dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+        cpp_args: causallm_inc_args + ['-fno-fast-math'],
+        install: false,
+    )
+  endforeach
+  executable('htp_continuation_check',
+      nntrainer_root / 'test' / 'htp' / 'htp_continuation_device_check.cpp',
+      dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+      cpp_args: causallm_inc_args,
+      install: false,
+  )
+endif

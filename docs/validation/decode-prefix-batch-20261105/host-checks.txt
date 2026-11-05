@@ -1,0 +1,4 @@
+Device sessions, compressed radix, LRU, failure isolation: PASS
+Decode KV to prefill: tile/head/row tails and FP16 bits PASS
+INT8 snapshot round trips, corruption rejection, park and exact decode: PASS
+DSP paged/linear exact attention, COW, window, snapshot: PASS

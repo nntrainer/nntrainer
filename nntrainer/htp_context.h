@@ -44,6 +44,10 @@ public:
 
   std::string getName() override { return "htp"; }
 
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::HTP;
+  }
+
   std::unique_ptr<nntrainer::Layer>
   createLayerObject(const std::string &type,
                     const std::vector<std::string> &properties = {}) override;
@@ -51,6 +55,11 @@ public:
   std::unique_ptr<nntrainer::Layer>
   createLayerObject(const int int_key,
                     const std::vector<std::string> &properties = {}) override;
+
+  std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label) override;
 
 protected:
   void initialize() noexcept override;

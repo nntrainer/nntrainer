@@ -5,9 +5,15 @@ gemma4_src = [
 
 gemma4_inc = include_directories('.')
 
+gemma4_moe_layer_src_abs = [meson.current_source_dir() / 'gemma4_moe_layer.cpp']
+# The gpu-engine variant of the layer (experts on the OpenCL device).
+if get_option('enable-opencl')
+    gemma4_moe_layer_src_abs += meson.current_source_dir() / 'gemma4_moe_layer_gpu.cpp'
+endif
+
 gemma4_moe_layer = shared_library(
     'gemma4_moe_layer',
-    meson.current_source_dir() / 'gemma4_moe_layer.cpp',
+    gemma4_moe_layer_src_abs,
     include_directories: [causallm_layer_inc, gemma4_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,

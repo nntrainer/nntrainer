@@ -1,0 +1,364 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   hvx_dequant_i32.h
+ * @date   03 Aug 2026
+ * @brief  int32 accumulator to f32 dequantization for the A8W4 path
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#ifndef __NNTRAINER_HVX_DEQUANT_I32_H__
+#define __NNTRAINER_HVX_DEQUANT_I32_H__
+
+#include <stdint.h>
+
+#include "hvx_worker_pool.h"
+
+/**
+ * @brief Turns HMX int32 accumulators back into f32 (K3).
+ *
+ * out[m][n] = (acc[m][n] - act_zp[m]*colsum_w[n]) * act_scale[m]
+ *             * w_scale[n] + bias[n]
+ *
+ * The zp*colsum term corrects for HMX taking unsigned activations: with
+ * x = s*(u - zp), the dot product expands to s*d*(sum u*q_w - zp*sum q_w),
+ * and sum q_w over the reduction depends only on the weights, so it is a
+ * precomputed table rather than runtime work.
+ *
+ * HexKL micro exposes no bias, scale or zero-point registers, which is why
+ * this pass exists at all.
+ *
+ * @param[in]  acc      m_pad by n int32, row-major
+ * @param[in]  m_valid  rows to emit; padded rows are skipped because their
+ *                      quantization parameters are synthetic
+ * @param[in]  colsum_w per-channel sum of the int4 weights, n entries
+ * @param[in]  w_scale  per-channel dequantization multiplier, n entries
+ * @param[out] out      m_valid by n f32, row-major
+ */
+void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
+                            uint32_t m_pad, uint32_t n, const float *act_scale,
+                            const int32_t *act_zp, const int32_t *colsum_w,
+                            const float *w_scale, const float *bias, float *out,
+                            int accumulate);
+
+/**
+ * @brief Same dequantization, applied to ONE 64x32 accumulator tile still
+ *        sitting in VTCM.
+ *
+ * The formula, the intrinsics and their order are hvx_dequant_i32_to_f32's,
+ * element for element -- this is where the tile comes from and where the
+ * result goes that differ, never the arithmetic. Results are therefore
+ * bitwise identical to dequantizing the same tile after a round trip through
+ * a DDR scratch, which is what makes the existing bit-exactness gates a valid
+ * check on this path (hexkl_acc_tile.h explains why the round trip existed).
+ *
+ * A tile column count of 32 is exactly one HVX f32 vector, so each row is a
+ * single load, a single store and no tail loop.
+ *
+ * @param[in]  tile       first element of the tile's row 0, i.e. the VTCM
+ *                        result tile advanced by hexkl_acc_layout::base
+ * @param[in]  row_stride int32 elements between tile rows (from the probe)
+ * @param[in]  m_count    tile rows carrying real data; padded rows are
+ *                        skipped, same rule as m_valid above
+ * @param[in]  act_scale  m_count entries, already offset to this row block
+ * @param[in]  act_zp     m_count entries, already offset to this row block
+ * @param[in]  colsum_w   32 entries, already offset to this column tile
+ * @param[in]  w_scale    32 entries, already offset to this column tile
+ * @param[in]  bias       32 entries, already offset to this column tile
+ * @param[out] out        first output element of this tile
+ * @param[in]  out_stride f32 elements between output rows (the full N)
+ * @param[in]  accumulate nonzero adds into @a out instead of storing; one
+ *                        add per element per call either way, so this is
+ *                        bitwise the staged add it replaces
+ */
+void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
+                                 uint32_t m_count, const float *act_scale,
+                                 const int32_t *act_zp, const int32_t *colsum_w,
+                                 const float *w_scale, const float *bias,
+                                 float *out, uint32_t out_stride,
+                                 int accumulate);
+
+/**
+ * @brief Dequantizes three adjacent 32-column FC tiles of one token.
+ *
+ * Each input and output contains 96 elements. The float operation order
+ * matches three non-accumulating hvx_dequant_acc_tile_to_f32 calls, with
+ * shared activation parameters and independent column dependency chains.
+ */
+void hvx_dequant_acc_3tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *colsum_w,
+                                   const float *w_scale, const float *bias,
+                                   float *out);
+
+/** @brief Four-tile counterpart of hvx_dequant_acc_3tiles_m1_f32, with 128
+ * input/output elements and the same floating-point operation order. */
+void hvx_dequant_acc_4tiles_m1_f32(const int32_t *tiles, float act_scale,
+                                   int32_t act_zp, const int32_t *colsum_w,
+                                   const float *w_scale, const float *bias,
+                                   float *out);
+
+/**
+ * @brief Rows [m0, m1) of a run of @a n_tiles adjacent staged tiles,
+ *        dequantized (hvx_dequant_acc_tile_to_f32's operations) into
+ *        registers and added into out row @a rows[m] times @a weights[m]
+ *        (hvx_scale_add_rows_f32's operations): the MoE down epilogue's
+ *        dequant and scatter without the f32 round trip between them, so
+ *        the same floats land. Row-major -- an output row's n_tiles vectors
+ *        are one contiguous run behind an l2fetch -- because tile-major
+ *        every (row, tile) add was a DDR miss once the output outgrew the
+ *        L2: 128 of a 2048-row call's 226 ms of worker time on the S26
+ *        Ultra. colsum_w, w_scale, bias and out are offset to the first
+ *        tile's column. @a rows must not repeat within [m0, m1) nor across
+ *        concurrent calls (one expert's tokens).
+ *
+ *        @a seen, when not NULL, is one byte per out row for these columns:
+ *        a row whose byte is 0 is taken as zeros (0 + the product, the add
+ *        a zeroed row would have made) without reading it, and its byte is
+ *        set. The caller then need not clear @a out first, only the rows
+ *        whose byte is still 0 at the end.
+ */
+void hvx_dequant_acc_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights, uint8_t *seen);
+
+/** @brief The scatter epilogue with int32 offset[n] * sums[m] fused before
+ * conversion to float. Offsets are relative to the first staged tile,
+ * while sums use the same row indices as act_zp. Input tiles stay read-only.
+ * NULL offset is equivalent to hvx_dequant_acc_tiles_scatter_rows_f32. */
+void hvx_dequant_acc_tiles_scatter_rows_affine_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t row_stride, uint32_t m0, uint32_t m1, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *out, uint32_t out_stride, const uint32_t *rows,
+  const float *weights, uint8_t *seen, const int32_t *offset,
+  const int32_t *sums);
+
+/** @brief Native signed24 planes directly to the scatter epilogue. Every
+ * ring tile contains low/middle/high byte planes of 2048 bytes each. The
+ * complete signed int32 is reconstructed before dequantization. Callers
+ * establish hexkl_acc_i24_range for the source weights and use u8 zero
+ * points in [0, 255]; these bounds make integer zero-point correction
+ * bit-identical to the original float operations. Row layout is fixed at
+ * 64x32; there are no affine offsets. */
+void hvx_dequant_i24_tiles_scatter_rows_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t m0, uint32_t m1, const float *act_scale, const int32_t *act_zp,
+  const int32_t *colsum_w, const float *w_scale, const float *bias, float *out,
+  uint32_t out_stride, const uint32_t *rows, const float *weights,
+  uint8_t *seen);
+
+/**
+ * @brief Dequantizes a RUN of accumulator tiles in one pooled pass.
+ *
+ * Same arithmetic as hvx_dequant_acc_tile_to_f32, tile for tile -- this
+ * calls it -- so the bytes are identical to dequantizing the same tiles one
+ * at a time. What changes is who runs it and how often: the per-tile form
+ * is invoked once per n-tile from the matmul loop, on the calling thread
+ * only, 176 times per 64-row block. That leaves the pool's other workers
+ * idle through the whole epilogue and pays a call's worth of setup for
+ * 2048 elements of work. Here the caller stages several tiles in VTCM
+ * first and hands them over together, so the split is across tiles and the
+ * pool forks twice a block instead of 176 times.
+ *
+ * Tiles are consecutive n-tiles starting at @a nt0, each
+ * HEXKL_ACC_TILE_COLS wide. A tile whose first column is below @a split
+ * lands in @a dst_a at that column; at or above it, in @a dst_b at
+ * (column - split). That is the gate/up halves of a gate_up result; pass
+ * @a split >= the total width and @a dst_b NULL when there is only one
+ * destination, as the down matmul has.
+ *
+ * @param tiles_base  first staged tile, already advanced by
+ *                    hexkl_acc_layout::base
+ * @param tile_stride bytes between consecutive staged tiles
+ * @param n_tiles     how many are staged
+ * @param nt0         n-tile index of the first staged tile
+ * @param dst_stride  f32 elements between consecutive rows of dst_a/dst_b
+ */
+void hvx_dequant_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *dst_a, float *dst_b, uint32_t split,
+  uint32_t dst_stride, hvx_worker_pool *pool);
+
+/**
+ * @brief The batch dequant as a job the caller owns, so it can run on the
+ *        pool's workers (hvx_worker_pool_submit) while the caller issues
+ *        the next batch's HMX tiles. Fields are
+ *        hvx_dequant_acc_tiles_to_f32's arguments; that function is this
+ *        job run synchronously. Units for the submit: n_tiles.
+ */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t nt0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  float *dst_a;
+  float *dst_b;
+  uint32_t split;
+  uint32_t dst_stride;
+  uint32_t n_tiles;
+} hvx_dq_tiles_job;
+
+/** @brief hvx_worker_pool_func over an hvx_dq_tiles_job. */
+void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/** @brief An hvx_dq_tiles_job taken row-major (dst_a only): a lane takes a
+ *         run of rows and writes each row's n_tiles vectors as one
+ *         contiguous run, then hands the row to @a row_done while it is
+ *         still in the cache (a norm, a rotation: the FC call's per-head
+ *         passes). The floats are hvx_dq_tiles_worker's. Units for the
+ *         submit: m_count. */
+typedef struct {
+  hvx_dq_tiles_job t;
+  /** NULL, or called once per row with the row's first written element
+   *  and its index in [0, m_count) */
+  void (*row_done)(void *ctx, float *seg, uint32_t row);
+  void *ctx;
+} hvx_dq_rows_job;
+
+void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/**
+ * @brief Row-major dequant with an exact affine correction in registers.
+ *
+ * Adds offset[n] * sums[m] to the int32 accumulator before the existing
+ * float conversion and dequant operations. The staged tiles are read-only.
+ * Offsets use full output-column indices, and sums use this job's row
+ * indices. Offsets must be in [-15, 15], as checked at registration.
+ * NULL offset retains the ordinary row-major worker's behavior.
+ */
+void hvx_dq_tiles_rows_affine(uint32_t n_threads, uint32_t i,
+                              const hvx_dq_rows_job *job, const int32_t *offset,
+                              const int32_t *sums);
+
+/** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
+ *         the submit: n_pairs. */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t n_pairs;
+  uint32_t g0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  uint32_t inter;
+  float *dst;
+  uint32_t dst_stride;
+  uint32_t act; /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
+} hvx_dq_swiglu_job;
+
+/** @brief The gated activation the gate/up epilogue applies: silu(g)*u
+ *         (LFM2) or gelu_tanh(g)*u (Gemma-4). The same code is the one
+ *         value the layer call carries (nntr_hvx.idl mm_u8i4_moe_layer act). */
+#define HVX_GLU_SILU 0u
+#define HVX_GLU_GELU_TANH 1u
+
+/** @brief hvx_worker_pool_func over an hvx_dq_swiglu_job. */
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/** @brief The gate/up epilogue with int32 affine correction before float
+ * conversion. Offsets index the full gate/up width, sums the job's rows.
+ * NULL offset retains hvx_dq_swiglu_worker's behavior. The input tiles stay
+ * read-only, and each row's floating-point operation order is unchanged. */
+void hvx_dq_swiglu_affine(uint32_t n_threads, uint32_t i,
+                          const hvx_dq_swiglu_job *job, const int32_t *offset,
+                          const int32_t *sums);
+
+/** @brief Native signed24 planes to the gate/up epilogue. Each tile holds
+ * three 2048-byte planes, while tile_stride still names its full ring slot.
+ * Callers establish hexkl_acc_i24_range for the source weights and use u8
+ * zero points in [0, 255], making integer zero-point correction exact.
+ * Scale, bias and activation retain their original float operation order. */
+void hvx_dq_swiglu_i24(uint32_t n_threads, uint32_t i,
+                       const hvx_dq_swiglu_job *job);
+
+/** Whole-job alternative: distribute leftover column pairs by aligned row
+ * groups. Individual workers no longer own their original complete columns;
+ * callers must wait for all workers before reading or further transforming
+ * any output. Other arithmetic and output ownership remain disjoint. */
+void hvx_dq_swiglu_i24_balanced(uint32_t n_threads, uint32_t i,
+                                const hvx_dq_swiglu_job *job);
+
+/**
+ * @brief Dequantizes gate/up tile PAIRS and applies SwiGLU before anything
+ *        is stored: dst = silu(gate) * up, one vector at a time.
+ *
+ * The staged run holds @a n_pairs gate tiles (columns g0.. of the gate
+ * half) followed by the @a n_pairs up tiles opposite them (the same
+ * columns, @a inter further along), which is how the matmul loop issues
+ * them. Each row's gate and up vectors are dequantized with exactly
+ * hvx_dequant_acc_tile_to_f32's operations and then handed to
+ * hvx_swiglu_det_sf -- the same function hvx_swiglu_inplace_f32 applies to
+ * the same two vectors after they have been through VTCM -- so the bytes
+ * are identical to the dequant-store-swiglu sequence this replaces, and
+ * the ARM parity gate on swiglu_det.h still holds. What changes is that
+ * [64 x inter] f32 of gate and of up are never written or read back:
+ * measured, that separate SwiGLU pass was 2.05 ms of a 22.6 ms prefill
+ * call (doc 47).
+ *
+ * @param g0          first gate n-tile in the run (its column is g0 * 32)
+ * @param colsum_w, w_scale, bias  the FULL gate_up tables (2 * inter);
+ *                    the up half is found at inter + column
+ * @param dst         the [rows x inter] SwiGLU output; column g0 * 32 of it
+ *                    is where this run's first pair lands
+ * @param geglu       1: hvx_geglu_det_sf (gelu_tanh(gate) * up) instead
+ */
+/**
+ * @brief Fused dequant + elementwise product over tile PAIRS from two
+ *        weights that share the activation: staged slot j is the first
+ *        weight's tile at column c0 + 32 j, slot n_pairs + j the second's
+ *        at the same column, and dst gets dq(first) * dq(second).
+ *
+ * The conv block's pre-conv gate (doc 51 section 2): in_proj's a and c
+ * column slices are two registered weights, and a * c is the only thing
+ * the block needs of them, so neither is ever stored. Same shape of job
+ * as hvx_dq_swiglu_job, with the second weight's constants separate
+ * because they come from a different handle.
+ */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t n_pairs;
+  uint32_t c0; /**< first COLUMN of the batch (a multiple of 32) */
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_a; /**< the first weight's, at column 0 */
+  const float *w_scale_a;
+  const float *bias_a;
+  const int32_t *colsum_b; /**< the second weight's, at column 0 */
+  const float *w_scale_b;
+  const float *bias_b;
+  float *dst;
+  uint32_t dst_stride;
+} hvx_dq_mul_job;
+
+/** @brief hvx_worker_pool_func over an hvx_dq_mul_job; units are pairs. */
+void hvx_dq_mul_worker(uint32_t n_threads, uint32_t i, void *job);
+
+void hvx_dequant_swiglu_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
+  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, uint32_t inter, uint32_t act, float *dst,
+  uint32_t dst_stride, hvx_worker_pool *pool);
+
+#endif /* __NNTRAINER_HVX_DEQUANT_I32_H__ */

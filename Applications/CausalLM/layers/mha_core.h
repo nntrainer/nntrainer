@@ -37,6 +37,8 @@
 #include <acti_func.h>
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <fp16_attention.h>
+#include <fused_llm_properties.h>
 #include <layer_impl.h>
 #include <limits.h>
 #include <util_simd.h>
@@ -55,27 +57,12 @@ namespace props {
  * @brief NumHeads property, NumHeads is number of head in multi head attention
  * of Q
  */
-class NumHeads_KV : public nntrainer::PositiveIntegerProperty {
-public:
-  /**
-   * @brief Construct a new NumHeads object with default value 1
-   */
-  NumHeads_KV(unsigned int value = 1) { set(value); };
-  static constexpr const char *key =
-    "num_heads_KV";                          /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::NumHeads_KV;
 
 /**
  * @brief SlidingWindow
  */
-class SlidingWindow : public nntrainer::Property<unsigned int> {
-public:
-  SlidingWindow(unsigned int value = UINT_MAX) { set(value); };
-  static constexpr const char *key =
-    "sliding_window";                        /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::SlidingWindow;
 
 /**
  * @brief InitSeqLen -- the model's activation-plane height in query rows.
@@ -97,76 +84,38 @@ public:
 /**
  * @brief MaxNewTokens
  */
-class MaxNewTokens : public nntrainer::Property<unsigned int> {
-public:
-  MaxNewTokens(unsigned int value = 1) { set(value); };
-  static constexpr const char *key =
-    "max_new_tokens";                        /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::MaxNewTokens;
 
 /**
  * @brief MaxNewTokens
  */
-class MaxPositionEmbeddings : public nntrainer::Property<unsigned int> {
-public:
-  MaxPositionEmbeddings(unsigned int value = 40960) { set(value); };
-  static constexpr const char *key =
-    "max_position_embeddings";               /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::MaxPositionEmbeddings;
 
 /**
  * @brief RopeTheta
  */
-class RopeTheta : public nntrainer::Property<unsigned int> {
-public:
-  RopeTheta(unsigned int value = 500000) { set(value); };
-  static constexpr const char *key = "rope_theta"; /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
-};
+using nntrainer::props::RopeTheta;
 
 /**
  * @brief UseRope property (Gemma4/Gemma3n). Accepted but our mha_core derives
  *        rope-enable from theta>0, so it is informational here.
  */
-class UseRope : public nntrainer::Property<bool> {
-public:
-  UseRope(bool value = true) { set(value); };
-  static constexpr const char *key = "use_rope"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
-};
+using nntrainer::props::UseRope;
 
 /**
  * @brief UseSink property
  */
-class UseSink : public nntrainer::Property<bool> {
-public:
-  UseSink(bool value = false) { set(value); };
-  static constexpr const char *key = "use_sink"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
-};
+using nntrainer::props::UseSink;
 
 /**
  * @brief AttnLogitSoftcapping
  */
-class AttnLogitSoftcapping : public nntrainer::Property<float> {
-public:
-  AttnLogitSoftcapping(float value = 0.0f) { set(value); };
-  static constexpr const char *key =
-    "attn_logit_softcapping";                 /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::AttnLogitSoftcapping;
 
 /**
  * @brief IsCausal property
  */
-class IsCausal : public nntrainer::Property<bool> {
-public:
-  IsCausal(bool value = true) { set(value); };
-  static constexpr const char *key = "is_causal"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;      /**< property type */
-};
+using nntrainer::props::IsCausal;
 
 /**
  * @brief UseGemmAttention property
@@ -253,23 +202,35 @@ public:
  * - default
  * - yarn
  */
-class RopeScalingType : public nntrainer::Property<std::string> {
+using nntrainer::props::RopeScalingType;
+/**
+ * @brief Per kv-head int8 scales of the key cache, "s0,s1,..." (empty: off)
+ *
+ * When set, every key written to the cache (after RoPE) is fake-quantized
+ * per kv head to symmetric int8, x = clamp(round(x / s), -128, 127) * s, as
+ * for checkpoints trained with an int8 KV cache.
+ */
+class KCacheInt8Scales : public nntrainer::Property<std::string> {
 public:
-  RopeScalingType(std::string value = "default") { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_type";                    /**< unique key to access */
-  using prop_tag = nntrainer::str_prop_tag; /**< property type */
+  KCacheInt8Scales(const std::string &value = "") { set(value); };
+  static constexpr const char *key = "k_cache_int8_scales";
+  using prop_tag = nntrainer::str_prop_tag;
 };
+
+/**
+ * @brief Per kv-head int8 scales of the value cache, "s0,s1,..." (empty: off)
+ */
+class VCacheInt8Scales : public nntrainer::Property<std::string> {
+public:
+  VCacheInt8Scales(const std::string &value = "") { set(value); };
+  static constexpr const char *key = "v_cache_int8_scales";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
 /**
  * @brief RopeScalingFactor
  */
-class RopeScalingFactor : public nntrainer::Property<float> {
-public:
-  RopeScalingFactor(float value = 1.0) { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_factor";                    /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::RopeScalingFactor;
 
 /**
  * @brief RopePartialRotaryFactor (Gemma4/Gemma3n). Outside yarn, a factor
@@ -277,25 +238,12 @@ public:
  *        which gives rotary frequencies to only factor * head_dim / 2 of the
  *        head_dim / 2 pairs; the rest pass through unrotated.
  */
-class RopePartialRotaryFactor : public nntrainer::Property<float> {
-public:
-  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
-  static constexpr const char *key =
-    "rope_partial_rotary_factor";             /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
+using nntrainer::props::RopePartialRotaryFactor;
 
 /**
  * @brief RopeScalingMaxPositionEmbeddings
  */
-class RopeScalingMaxPositionEmbeddings
-  : public nntrainer::Property<unsigned int> {
-public:
-  RopeScalingMaxPositionEmbeddings(unsigned int value = 4096) { set(value); };
-  static constexpr const char *key =
-    "rope_scaling_max_position_embeddings";  /**< unique key to access */
-  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
-};
+using nntrainer::props::RopeScalingMaxPositionEmbeddings;
 
 }; // namespace props
 
@@ -356,6 +304,7 @@ public:
    * @brief Constructor of MhaCore Layer
    */
   WIN_EXPORT MHACoreLayer();
+  WIN_EXPORT explicit MHACoreLayer(bool fp16_cache);
 
   /**
    * @brief Destructor of MhaCore Layer
@@ -491,16 +440,62 @@ public:
    *        Must be called before forwarding() when use_external_cache is true.
    * @param[in] idx current write position in the KV cache
    */
-  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+  WIN_EXPORT void setCacheIndex(unsigned int idx) {
+    if (fp16_attention_)
+      fp16_attention_->setCacheIndex(idx);
+    else
+      cache_index = idx;
+  }
+  void setCacheBase(unsigned int base) {
+    if (fp16_attention_)
+      fp16_attention_->setCacheBase(base);
+  }
+  void setDecodeCacheOffset(unsigned offset) {
+    if (fp16_attention_)
+      fp16_attention_->setDecodeCacheOffset(offset);
+  }
+  void registerQuantizedCache(nntrainer::RunLayerContext &context) {
+    if (fp16_attention_)
+      fp16_attention_->registerQuantizedCache(context);
+  }
+  void beginHtpPrompt() {
+    if (fp16_attention_)
+      fp16_attention_->beginHtpPrompt();
+  }
+  std::shared_ptr<const nntrainer::HtpPrefixCalibration>
+  capturePrefixCalibration() const {
+    if (!fp16_attention_)
+      throw std::logic_error("HTP prefix requires FP16 prefill attention");
+    return fp16_attention_->capturePrefixCalibration();
+  }
+  void restorePrefixCalibration(const nntrainer::HtpPrefixCalibration &state) {
+    if (!fp16_attention_)
+      throw std::logic_error("HTP prefix requires FP16 prefill attention");
+    fp16_attention_->restorePrefixCalibration(state);
+  }
+  void foldDroppedAmax(const std::vector<float> &k,
+                       const std::vector<float> &v) {
+    if (fp16_attention_)
+      fp16_attention_->foldDroppedAmax(k, v);
+  }
+  static void saveQ2Calibration(std::ostream &file) {
+    nntrainer::Fp16Attention::saveQ2Calibration(file);
+  }
+  static void loadQ2Calibration(std::istream &file) {
+    nntrainer::Fp16Attention::loadQ2Calibration(file);
+  }
 
   /**
    * @brief Get the current cache index
    */
-  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+  WIN_EXPORT unsigned int getCacheIndex() const {
+    return fp16_attention_ ? fp16_attention_->getCacheIndex() : cache_index;
+  }
 
   inline static const std::string type = "mha_core";
 
 private:
+  std::unique_ptr<nntrainer::Fp16Attention> fp16_attention_;
   std::tuple<
     nntrainer::props::NumHeads, props::NumHeads_KV,
     nntrainer::props::ProjectedKeyDim, nntrainer::props::ProjectedValueDim,
@@ -513,8 +508,30 @@ private:
     props::RopePartialRotaryFactor, props::RopeScalingMaxPositionEmbeddings,
     props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention,
     props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope,
-    props::KvWindowRing>
+    props::KvWindowRing, props::KCacheInt8Scales, props::VCacheInt8Scales>
     mha_core_props; /**< mha_core layer properties */
+
+  std::vector<float> k_cache_int8_scales; /**< per kv head, empty: off */
+  std::vector<float> v_cache_int8_scales; /**< per kv head, empty: off */
+  void *k_snap_cl = nullptr; /**< device copy of k_cache_int8_scales */
+  void *v_snap_cl = nullptr; /**< device copy of v_cache_int8_scales */
+
+  /**
+   * @brief The device copy of the key / value int8 scales (uploaded on first
+   *        use), or nullptr when this layer has none or there is no OpenCL
+   *        device. The device RoPE / narrowing kernels take it to snap the
+   *        cache rows they write.
+   */
+  void *k_snap_device();
+  void *v_snap_device();
+
+  /**
+   * @brief Host store of FP16 value rows into their cache slice: a plain copy,
+   *        or for an int8-KV model the snapping store (the CPU snap kernel)
+   * @param from sequence position of the first row
+   */
+  void storeValueRows(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                      unsigned int from);
 
   /** softmax activation operation */
   nntrainer::ActiFunc sm;
@@ -857,9 +874,11 @@ private:
    * @param[in] apply_rope true to apply rotary embedding, false to only store
    *                       the tensor into the cache dtype
    */
-  void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
-                                  unsigned int dim, unsigned int from,
-                                  bool apply_rope = true);
+  void
+  apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                             unsigned int dim, unsigned int from,
+                             bool apply_rope = true,
+                             const std::vector<float> *snap_scales = nullptr);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

@@ -1,0 +1,140 @@
+{
+  "date": "2026-11-03",
+  "source": {
+    "branch": "kv/pr4428-htp-cache",
+    "revision": "729cabcaa89df72677a70f110885aee9499c4b17",
+    "base_pull_request": 4428
+  },
+  "environment": {
+    "model": "Gemma4 26B A4B, TL2 rotated",
+    "device": "SM-S948N",
+    "android_version": 16,
+    "hexagon_architecture": "v81",
+    "hexagon_sdk": "6.4.0.2",
+    "android_ndk": "27.2.12479018",
+    "threads": 8,
+    "binary_sha256": {
+      "nntr_causallm": "7d452a9545810698f63affe796a929d90c93428083d9cad5dfc09320a50b515a",
+      "libcausallm.so": "6ffbc189d2264e0885734952e871b4a1d51e86bc117b5153c13e02dd51b63d2e",
+      "libnntrainer.so": "c9111e94656895f3390a0c1fc53a7ea5da6cc4429a20e0b018ccd712f18933bd",
+      "libnntr_hvx_skel.so": "7f575617dd5600892fb3cb4001f1ee50f1732aea8bb6b53a6463a1192af57aa8"
+    }
+  },
+  "configuration": {
+    "max_seq_len": 16384,
+    "num_to_generate": 16,
+    "kv_session": true,
+    "kv_request_reserve": true,
+    "kv_manager_enabled": true,
+    "attn_m1_fast": false,
+    "expert_cache_growth": 0,
+    "capacity_reference_overrides": {
+      "kv_request_reserve": false,
+      "kv_session": true
+    },
+    "ttft_reference_resets_conversation_before_full_recomputation": true
+  },
+  "ttft": {
+    "comparison_samples": 1,
+    "initial_prompt_tokens": 8194,
+    "new_user_tokens": 21,
+    "pending_feedback_tokens": 1,
+    "processed_tokens_reused_request": 22,
+    "processed_tokens_full_recomputation": 8226,
+    "full_recomputation_ms": 23251.057231,
+    "resident_reuse_ms": 1969.968385,
+    "reduction_percent": 91.5274029674079,
+    "baseline_preparation": "An already loaded model first processes the initial request, then resets and recomputes the complete matching token history.",
+    "same_input_token_history_verified": true,
+    "output_token_ids_identical": true,
+    "output_token_ids": [
+      100,
+      45518,
+      107,
+      101,
+      7942,
+      82859,
+      236772,
+      236832,
+      236800,
+      236770,
+      106
+    ]
+  },
+  "dsp_kv_payload": {
+    "bytes_per_element": 1,
+    "planes": [
+      "K",
+      "V"
+    ],
+    "full_capacity_bytes": 279183360,
+    "request_reserved_bytes": 195952640,
+    "saved_bytes": 83230720,
+    "full_capacity_mib": 266.25,
+    "request_reserved_mib": 186.875,
+    "saved_mib": 79.375,
+    "reduction_percent": 29.812206572769952,
+    "global_layers": 5,
+    "global_kv_heads": 2,
+    "global_head_dim": 512,
+    "global_full_rows": 16384,
+    "global_request_rows": 8256,
+    "sliding_layers": 25,
+    "sliding_kv_heads": 8,
+    "sliding_head_dim": 256,
+    "sliding_reserved_rows": 1088,
+    "scope": "Allocated DSP INT8 K+V payload only; excludes scales, attention scratch and host FP16 prefill buffers."
+  },
+  "correctness": {
+    "four_turns": [
+      {
+        "turn": 1,
+        "committed_rows_before": 0,
+        "committed_rows_after": 8204,
+        "output_token_ids_identical_across_capacity_modes": true,
+        "expected_code_present": true
+      },
+      {
+        "turn": 2,
+        "committed_rows_before": 8204,
+        "committed_rows_after": 8236,
+        "output_token_ids_identical_across_capacity_modes": true,
+        "expected_code_present": true
+      },
+      {
+        "turn": 3,
+        "committed_rows_before": 8236,
+        "committed_rows_after": 8268,
+        "output_token_ids_identical_across_capacity_modes": true,
+        "expected_code_present": true
+      },
+      {
+        "turn": 4,
+        "committed_rows_before": 8268,
+        "committed_rows_after": 8300,
+        "output_token_ids_identical_across_capacity_modes": true,
+        "expected_code_present": true
+      }
+    ],
+    "global_cache_growth_exercised": true,
+    "sliding_drop_rows_exercised": 64,
+    "long_context_reset_verified": true,
+    "independent_mode_with_options_disabled_verified": true
+  },
+  "validation": {
+    "host_attention_suite": "passed",
+    "reservation_state_and_config": "passed",
+    "address_and_undefined_sanitizers": "passed; leak detection excluded because the execution environment prevents LeakSanitizer under ptrace",
+    "v81_dsp_build": "passed",
+    "android_engine_app_cli_build": "passed",
+    "clang_format_version": 14
+  },
+  "scope": [
+    "One synchronous resident conversation per model instance.",
+    "Additional prompt tokens use the existing resident single-token path.",
+    "Host FP16 prefill allocation policy is unchanged.",
+    "Resize and compaction occur between requests and temporarily retain old and replacement allocations.",
+    "No device snapshots, arbitrary rewind, concurrent session switching or device radix prefix reuse is claimed."
+  ],
+  "local_evidence_directory": "/tmp/nntr-kv-session-20261103"
+}
