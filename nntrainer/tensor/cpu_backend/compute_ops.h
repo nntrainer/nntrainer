@@ -752,15 +752,18 @@ public:
   // eps: the RMSNorms before and after the block, folded into the call as
   // gemm_q4_0_batch_norm_fp32 folds them. up_scale / gate_scale /
   // down_scale: non-null when the three weights are QS4CX (their
-  // per-channel scales), null for Q4_0.
+  // per-channel scales), null for Q4_0. out_add: out = act + the post-normed
+  // block, the decoder block's residual (pre_gamma and post_gamma set,
+  // K == N).
   virtual void gemm_q4_0_dense_ffn_fp32(
     void *up, void *gate, void *down, const float *act, float *out,
     unsigned int M, unsigned int K, unsigned int I, unsigned int N,
     bool gelu = false, const float *pre_gamma = nullptr,
     const float *post_gamma = nullptr, float eps = 0.0f,
     const float *up_scale = nullptr, const float *gate_scale = nullptr,
-    const float *down_scale = nullptr, bool out_to_host = true) {
-    (void)gelu, (void)out_to_host;
+    const float *down_scale = nullptr, bool out_to_host = true,
+    bool out_add = false) {
+    (void)gelu, (void)out_to_host, (void)out_add;
     (void)pre_gamma;
     (void)post_gamma;
     (void)eps;

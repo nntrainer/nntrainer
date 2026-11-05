@@ -1234,7 +1234,8 @@ interface nntr_hvx : remote_handle64 {
    //   out = scale2 * (act + rmsnorm(moe + x2) * gamma2)
    // with act the call's own raw input (pre_gamma norms it for the experts;
    // the residual is the same rows, K == N_out) and x2 the dense branch's
-   // output. One call instead of the MoE call and rmsnorm_add_f32.
+   // output, or empty (a dense FFN's own epilogue: moe is its output).
+   // One call instead of the MoE call and rmsnorm_add_f32.
    AEEResult mm_u8i4_moe_layer_norm_add(in uint32 M, in uint32 K,
                                         in uint32 inter, in uint32 N_out,
                                         in uint32 act, in float eps,

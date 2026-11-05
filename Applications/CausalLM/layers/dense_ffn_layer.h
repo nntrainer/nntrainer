@@ -95,10 +95,11 @@ private:
    *  swish (default) or tanh_gelu; gate_first for the file's weight order */
   std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst,
              props::InNorm, props::OutNorm, nntrainer::props::Epsilon,
-             props::OutToHost>
+             props::OutToHost, props::OutAdd>
     dense_props;
   bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
   bool in_norm = false, out_norm = false;
+  bool out_add = false;    /**< props::OutAdd: + the input after out_norm */
   bool out_to_host = true; /**< props::OutToHost */
   bool skip_prefill = false;
   std::array<unsigned int, 5>

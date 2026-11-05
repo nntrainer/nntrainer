@@ -284,6 +284,8 @@ public:
  *        epilogue: out = scalar * (input + rmsnorm(moe + input 1) * gamma),
  *        input 1 being the dense branch's output (gamma and the scalar the
  *        last two weights in the file, as the residual_add they replace).
+ *        dense_ffn's form has no input 1 and no scalar: out = input +
+ *        out_norm(ffn), out_norm's gamma being that residual_add's.
  */
 class OutAdd : public nntrainer::Property<bool> {
 public:

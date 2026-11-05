@@ -32,7 +32,8 @@ DenseFfnLayer::DenseFfnLayer() :
   LayerImpl(),
   dense_props(nntrainer::props::Unit(), props::GluActivation(),
               props::GateFirst(), props::InNorm(), props::OutNorm(),
-              nntrainer::props::Epsilon(), props::OutToHost()) {
+              nntrainer::props::Epsilon(), props::OutToHost(),
+              props::OutAdd()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -64,6 +65,9 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   in_norm = std::get<props::InNorm>(dense_props).get();
   out_norm = std::get<props::OutNorm>(dense_props).get();
   out_to_host = std::get<props::OutToHost>(dense_props).get();
+  out_add = std::get<props::OutAdd>(dense_props).get();
+  NNTR_THROW_IF(out_add && !(in_norm && out_norm), std::invalid_argument)
+    << "dense_ffn: out_add takes the raw rows and adds them after out_norm";
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
       std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
@@ -221,7 +225,8 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       gelu, in_gamma, out_gamma, epsilon,
       scaled ? up_w.getScale<float>() : nullptr,
       scaled ? gate_w.getScale<float>() : nullptr,
-      scaled ? down_w.getScale<float>() : nullptr, out_to_host || rows == 1);
+      scaled ? down_w.getScale<float>() : nullptr, out_to_host || rows == 1,
+      out_add);
     return;
   }
 
@@ -238,6 +243,7 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     normed.multiply_i(context.getWeight(gamma_idx));
     return normed;
   };
+  const nntrainer::Tensor raw_in = in_step;
   if (in_norm)
     in_step = norm_rows(in_step, weight_idx[IN_GAMMA]);
 
@@ -281,6 +287,8 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   act.dot(down_w, out_step, false, false);
   if (out_norm)
     out_step.copyData(norm_rows(out_step, weight_idx[OUT_GAMMA]));
+  if (out_add)
+    out_step.add_i(raw_in);
 }
 
 void DenseFfnLayer::updateTensorsByInputDimensions(

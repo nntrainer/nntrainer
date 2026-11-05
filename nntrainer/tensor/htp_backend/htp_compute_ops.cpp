@@ -6093,14 +6093,16 @@ private:
       via_dspq       ? *dspq_->act
       : host_prenorm ? stage(act_pool_, act_bytes)
                      : stageInput(act_pool_, act, act_bytes, &out_pool_);
-    // The post-FFN epilogue's second addend rides its own staging buffer,
-    // staged before out_stage: it may be swapped in from out_pool_.
+    // The post-FFN epilogue (a dense FFN's own has a gamma and no x2). Its
+    // second addend rides its own staging buffer, staged before out_stage:
+    // it may be swapped in from out_pool_.
+    const bool epilogue = add_x2 != nullptr || add_gamma != nullptr;
     float *x2_f32 = nullptr;
+    if (epilogue && (pre_gamma == nullptr || K != N_out || via_dspq))
+      throw std::invalid_argument(
+        "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
+        "(pre_gamma) and K == N_out");
     if (add_x2 != nullptr) {
-      if (pre_gamma == nullptr || K != N_out || via_dspq)
-        throw std::invalid_argument(
-          "gemm_qs4cx_moe_layer_fp32: the epilogue needs the raw rows "
-          "(pre_gamma) and K == N_out");
       x2_f32 = reinterpret_cast<float *>(
         stageInput(x2_pool_, add_x2, out_bytes, &out_pool_).data());
     }
@@ -6153,7 +6155,7 @@ private:
       err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                                 row_count, row_weight, act_bytes, out_bytes,
                                 glu, timed ? rep_stage : nullptr)
-            : add_x2 != nullptr && !host_norms
+            : epilogue && !host_norms
               ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
                   session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
                   static_cast<int>(K), post_gamma,
@@ -6164,7 +6166,7 @@ private:
                   static_cast<int>(row_index.size()), row_count.data(),
                   static_cast<int>(row_count.size()), row_weight.data(),
                   static_cast<int>(row_weight.size()), act_f32, act_len, x2_f32,
-                  out_len, out_f32, out_len)
+                  x2_f32 ? out_len : 0, out_f32, out_len)
             : norm_entry
               ? nntr_hvx_mm_u8i4_moe_layer_norm(
                   session, M, K, inter, N_out, glu, eps, pre_gamma,
@@ -6236,18 +6238,21 @@ private:
         for (unsigned int n = 0; n < N_out; ++n)
           out[static_cast<size_t>(r) * N_out + n] *= post_gamma[n];
     }
-    if (host_norms && add_x2) {
+    if (host_norms && epilogue) {
       // out = scale * (act + rmsnorm(out + x2) * gamma), as the epilogue.
       for (unsigned int r = 0; r < M; ++r) {
         float *o = out + static_cast<size_t>(r) * N_out;
-        const float *x2 = add_x2 + static_cast<size_t>(r) * N_out;
+        const float *x2 =
+          add_x2 ? add_x2 + static_cast<size_t>(r) * N_out : nullptr;
         const float *res = act + static_cast<size_t>(r) * K;
         float ss = 0.0f;
-        for (unsigned int n = 0; n < N_out; ++n)
-          ss += (o[n] + x2[n]) * (o[n] + x2[n]);
+        for (unsigned int n = 0; n < N_out; ++n) {
+          const float a = o[n] + (x2 ? x2[n] : 0.0f);
+          ss += a * a;
+        }
         const float rs = 1.0f / std::sqrt(ss / N_out + eps);
         for (unsigned int n = 0; n < N_out; ++n)
-          o[n] = add_scale * (res[n] + (o[n] + x2[n]) * rs *
+          o[n] = add_scale * (res[n] + (o[n] + (x2 ? x2[n] : 0.0f)) * rs *
                                          (add_gamma ? add_gamma[n] : 1.0f));
       }
     }
@@ -7045,8 +7050,8 @@ private:
                                 bool gelu, const float *pre_gamma,
                                 const float *post_gamma, float eps,
                                 const float *up_scale, const float *gate_scale,
-                                const float *down_scale,
-                                bool out_to_host) override {
+                                const float *down_scale, bool out_to_host,
+                                bool out_add) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     // The chunks run on the MoE kernel, whose M=1 GEMV is a session option:
@@ -7056,7 +7061,8 @@ private:
       up, gate, down, session, K, I, N, up_scale, gate_scale, down_scale);
     // Every chunk is an "expert" that takes every row with weight 1: the
     // kernel zero-fills out and scatter-adds each chunk's down result into
-    // it, which is exactly the sum over the intermediate dimension.
+    // it, which is exactly the sum over the intermediate dimension. With
+    // out_add the post norm is the epilogue's, the residual add after it.
     const size_t chunks = dh.h_gu.size();
     std::vector<unsigned int> row_index(chunks * M), row_count(chunks, M);
     std::vector<float> row_weight(chunks * M, 1.0f);
@@ -7066,8 +7072,8 @@ private:
     }
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
                    act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u,
-                   pre_gamma, post_gamma, eps, nullptr, nullptr, 1.0f,
-                   out_to_host);
+                   pre_gamma, out_add ? nullptr : post_gamma, eps, nullptr,
+                   out_add ? post_gamma : nullptr, 1.0f, out_to_host);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,

@@ -2101,9 +2101,10 @@ int nntr_hvx_mm_u8i4_moe_layer_norm_add(
     return AEE_EBADPARM;
   }
   const uint64_t n = (uint64_t)M * N_out;
-  /* The residual is the call's own input rows, so K == N_out. */
+  /* The residual is the call's own input rows, so K == N_out; no x2 for a
+     dense FFN alone. */
   if (M == 0u || K != N_out || N_out % 32u != 0u || n > 0x7FFFFFFFu ||
-      (uint64_t)act_f32Len != n || (uint64_t)x2Len != n ||
+      (uint64_t)act_f32Len != n || (x2Len != 0 && (uint64_t)x2Len != n) ||
       (uint64_t)out_f32Len != n ||
       (gamma2Len != 0 && (uint32_t)gamma2Len != N_out)) {
     FARF(ERROR, "mm_u8i4_moe_layer_norm_add: bad shape (M=%u K=%u N=%u)",
@@ -2127,8 +2128,8 @@ int nntr_hvx_mm_u8i4_moe_layer_norm_add(
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  if (hvx_rmsnorm_add_res_f32(out_f32, act_f32, s->moe_res, x2, M, N_out,
-                              gamma2Len ? gamma2 : NULL, eps, scale2,
+  if (hvx_rmsnorm_add_res_f32(out_f32, act_f32, s->moe_res, x2Len ? x2 : NULL,
+                              M, N_out, gamma2Len ? gamma2 : NULL, eps, scale2,
                               s->quant_pool) != 0) {
     return AEE_EINVALIDFORMAT;
   }

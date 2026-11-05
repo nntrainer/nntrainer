@@ -484,13 +484,20 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     pre_ffn = pre_ffn_norm(post_attention);
   }
 
-  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
-
   // post_attention + post_ffn_norm(ffn [+ moe]), then the layer scalar: one
   // residual_add, so the sum, the norm, the add and the scalar are one
   // accelerator call. With a per-layer input the scalar comes after that
   // path instead and stays its own layer.
   const bool fold_scalar = HIDDEN_SIZE_PER_LAYER_INPUT == 0;
+  // ... and with neither the MoE block nor the scalar, the dense FFN's call
+  // takes the norm and the add itself (out_add), its out_norm's gamma the
+  // residual_add's in the file.
+  const bool ffn_adds =
+    !ENABLE_MOE_BLOCK && !fold_scalar && !is_kv_shared_layer;
+  dense_out_add_ = ffn_adds;
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
+  dense_out_add_ = false;
+
   // With the MoE block and the scalar folded, the MoE layer takes the whole
   // epilogue (out_add): its input is the residual, so the DSP call that
   // runs the experts adds the dense branch, norms, adds and scales, and the
@@ -507,14 +514,17 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     // holds the other three (in_norm, router_norm, out_norm).
     ffn_terms.push_back(createMoe(layer_id, post_attention));
   }
-  std::vector<std::string> post_ffn_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
-    withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("use_weight", fold_scalar ? "true" : "false"),
-    withKey("engine", engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id))};
-  appendSkipPrefillIfNeeded(post_ffn_props, skip_out);
-  LayerHandle post_ffn_add(createLayer("residual_add", post_ffn_props));
-  Tensor decoder_output_base = post_ffn_add(ffn_terms);
+  Tensor decoder_output_base = ffn_out;
+  if (!ffn_adds) {
+    std::vector<std::string> post_ffn_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
+      withKey("in_norm", "true"), withKey("epsilon", std::to_string(NORM_EPS)),
+      withKey("use_weight", fold_scalar ? "true" : "false"),
+      withKey("engine", engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id))};
+    appendSkipPrefillIfNeeded(post_ffn_props, skip_out);
+    LayerHandle post_ffn_add(createLayer("residual_add", post_ffn_props));
+    decoder_output_base = post_ffn_add(ffn_terms);
+  }
 
   if (fold_scalar)
     return decoder_output_base;
@@ -893,7 +903,9 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
       withKey("gate_first", "true"),
       withKey("glu_activation", "tanh_gelu"),
       withKey("in_norm", "true"),
-      withKey("out_norm", ENABLE_MOE_BLOCK ? "true" : "false"),
+      withKey("out_norm",
+              ENABLE_MOE_BLOCK || dense_out_add_ ? "true" : "false"),
+      withKey("out_add", dense_out_add_ ? "true" : "false"),
       withKey("epsilon", std::to_string(NORM_EPS)),
       withKey("weight_dtype", FC_LAYER_DTYPE),
       withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
