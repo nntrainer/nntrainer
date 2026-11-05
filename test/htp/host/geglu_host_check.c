@@ -281,6 +281,90 @@ int main(void) {
     free(ref);
   }
 
+  /* 5. the GLU epilogue straight to u16 planes (hvx_dq_glu16_worker): a16
+     byte-plane tiles, three pairs from gate n-tile 1 of a 128-column half,
+     seven rows (a short group), into columns 64.. of 192-column planes:
+     the bytes of the rows worker, the GLU's spec and the fixed-encoding
+     pack, and nothing else of the planes touched */
+  {
+    enum { GP = 3, GM = 7, GI = 128, GW = 192, TS = 3 * 2048 };
+    static uint8_t pt[2 * 2 * GP * TS] __attribute__((aligned(128)));
+    static float f[GM * 2 * GI] __attribute__((aligned(128)));
+    static float y[GM * GP * 32];
+    static uint8_t want[2 * 64 * GP * 32], got[2 * 64 * GW];
+    static int32_t gcs[2 * GI];
+    static float gws[2 * GI], gb[2 * GI];
+    float gas[8], wsc16[64];
+    int32_t gaz[8], wzp16[64];
+    for (uint32_t t = 0; t < 2u * 2u * GP; ++t)
+      for (uint32_t p = 0; p < 2048u; ++p) {
+        const int32_t v = t < 2u * GP ? (int32_t)(RND() % 20001u) - 10000
+                                      : (int32_t)(RND() % 2000001u) - 1000000;
+        for (uint32_t b = 0; b < 3u; ++b)
+          pt[(size_t)t * TS + b * 2048u + p] = (uint8_t)((uint32_t)v >> 8u * b);
+      }
+    for (uint32_t c = 0; c < 2u * GI; ++c) {
+      gcs[c] = (int32_t)(RND() % 4001u) - 2000;
+      gws[c] = 0.5f + 0.01f * (float)(RND() % 50u);
+      gb[c] = 0.01f * ((float)(RND() % 201u) - 100.f);
+    }
+    for (uint32_t m = 0; m < 8u; ++m) {
+      gas[m] = 1e-6f * (1.0f + 0.1f * (float)m);
+      gaz[m] = 3000 + 7 * (int32_t)m;
+    }
+    const float genc[2] = {8.0f / 65535.0f, 32768.f};
+    for (uint32_t act = 0; act < 2u; ++act) {
+      /* the composition: each half by the rows worker, GLU, pack */
+      for (uint32_t h = 0; h < 2u; ++h) {
+        hvx_dq_rows_job rj = {{pt + (size_t)h * GP * TS, TS, h * GI / 32u + 1u,
+                               0u, GM, gas, gaz, gcs, gws, gb, f, NULL, 2u * GI,
+                               2u * GI, GP, 2u * GP * TS, 1u, 0u},
+                              NULL,
+                              NULL};
+        hvx_dq_tiles_rows_worker(1u, 0u, &rj);
+      }
+      for (uint32_t m = 0; m < GM; ++m)
+        for (uint32_t c = 0; c < GP * 32u; ++c) {
+          const float gv = f[m * 2u * GI + 32u + c];
+          const float uv = f[m * 2u * GI + GI + 32u + c];
+          y[m * GP * 32u + c] =
+            act ? geglu_det_one(gv, uv) : swiglu_det_one(gv, uv);
+        }
+      int rc = hvx_quant_params_pack_u16_ah(
+        y, NULL, NULL, 0u, genc, GM, 64u, GP * 32u, NULL, 0.f, NULL, wsc16,
+        wzp16, want, want + 64u * GP * 32u, NULL);
+      /* the worker, over two lanes */
+      memset(got, 0x5a, sizeof got);
+      hvx_dq_glu16_job gj = {{pt, TS, 1u, 0u, GM, gas, gaz, gcs, gws, gb, NULL,
+                              NULL, 0u, 0u, GP, 2u * GP * TS, 1u, 0u},
+                             GI,
+                             act ? HVX_GLU_GELU_TANH : HVX_GLU_SILU,
+                             genc[0],
+                             (int32_t)genc[1],
+                             got,
+                             got + 64u * GW,
+                             64u};
+      hvx_dq_glu16_worker(2u, 0u, &gj);
+      hvx_dq_glu16_worker(2u, 1u, &gj);
+      size_t bad = 0, touched = 0;
+      for (uint32_t pl = 0; pl < 2u; ++pl)
+        for (uint32_t t = 0; t < GW / 32u; ++t)
+          for (uint32_t b = 0; b < 2048u; ++b) {
+            const uint8_t g8 = got[pl * 64u * GW + t * 2048u + b];
+            if (t >= 2u && t < 2u + GP && b < 256u)
+              bad += g8 != want[pl * 64u * GP * 32u + (t - 2u) * 2048u + b];
+            else
+              touched += g8 != 0x5a;
+          }
+      printf("GLU16 EPILOGUE hvx_dequant_i32.c %s: rc=%d, %zu bytes differ, "
+             "%zu outside touched\n",
+             act ? "geglu" : "swiglu", rc, bad, touched);
+      CHECK(rc == 0 && bad == 0 && touched == 0,
+            "GLU16 epilogue (act=%u) differs from rows worker + GLU + pack",
+            act);
+    }
+  }
+
   printf(g_fail ? "GEGLU CHECK FAILED\n" : "GEGLU OK\n");
   return g_fail;
 }

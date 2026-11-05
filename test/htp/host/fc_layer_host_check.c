@@ -13,6 +13,7 @@
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 #include "hvx_scalar_stubs.h"
+#include "swiglu_det.h"
 #include <AEEStdErr.h>
 #include <math.h>
 #include <stdio.h>
@@ -513,6 +514,77 @@ int main(void) {
       printf("a16 static GEMV   : rc=%d, %zu of 8 row runs differ from HMX\n",
              rc, gbad);
       fail |= (rc != 0) | (gbad != 0);
+
+      /**
+       * the GLU epilogue (hexkl_mm_opts.glu_lo): two gate_up handles, 36
+       * n-tiles (a batch of 32 splits its pairs 16 + 2) and 4, must give
+       * the planes of the plain run, its GLU, then the fixed-encoding pack
+       * -- pad rows and all, over planes that start as garbage
+       */
+      {
+        const uint32_t GN[2] = {1152u, 128u}, GK = 640u;
+        const uint32_t mp = (M + 63u) / 64u * 64u;
+        uint32_t gh[2] = {5u, 6u};
+        W gw[2];
+        for (uint32_t i = 0; i < 2; ++i) {
+          make_weight(gh[i], AK, GN[i], &gw[i]);
+          for (uint32_t c = 0; c < GN[i]; ++c)
+            gw[i].cs[c] = (int32_t)(rnd() % 2001u) - 1000;
+          fail |= hexkl_weight_u8i4_set_act16(&g_tbl, gh[i], fs, fz) != 0;
+        }
+        const float genc[2] = {0.0011f, 31000.f};
+        float *gf = (float *)malloc(sizeof(float) * M * (GN[0] + GN[1]));
+        float *gy = (float *)malloc(sizeof(float) * M * GK);
+        uint8_t *gp = (uint8_t *)malloc(4u * (size_t)mp * GK);
+        float *gsc = (float *)malloc(sizeof(float) * mp);
+        int32_t *gzp = (int32_t *)malloc(sizeof(int32_t) * mp);
+        for (uint32_t act = 0; act < 2u; ++act) {
+          rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                       M, AK, gh, 2, ax, gf, &on);
+          for (uint32_t i = 0, o0 = 0, c0 = 0; i < 2; ++i) {
+            const uint32_t in = GN[i] / 2u;
+            for (uint32_t t = 0; t < M; ++t)
+              for (uint32_t c = 0; c < in; ++c) {
+                const float *r = gf + o0 + (size_t)t * GN[i];
+                gy[(size_t)t * GK + c0 + c] =
+                  act ? geglu_det_one(r[c], r[in + c])
+                      : swiglu_det_one(r[c], r[in + c]);
+              }
+            o0 += M * GN[i];
+            c0 += in;
+          }
+          rc |= hvx_quant_params_pack_u16_ah(gy, NULL, NULL, 0u, genc, M, mp,
+                                             GK, NULL, 0.f, NULL, gsc, gzp, gp,
+                                             gp + (size_t)mp * GK, NULL);
+          memset(gp + 2u * (size_t)mp * GK, 0xa5, 2u * (size_t)mp * GK);
+          hexkl_mm_opts og = on;
+          og.glu_lo = gp + 2u * (size_t)mp * GK;
+          og.glu_hi = og.glu_lo + (size_t)mp * GK;
+          og.glu_enc = genc;
+          og.glu_k = GK;
+          og.glu_act = act;
+          rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                        M, AK, gh, 2, ax, NULL, &og);
+          size_t bad = 0;
+          for (size_t b = 0; b < 2u * (size_t)mp * GK; ++b)
+            bad += gp[b] != og.glu_lo[b];
+          og.glu_k = GK - 32u;
+          const int r4 =
+            hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                    AK, gh, 2, ax, NULL, &og);
+          printf("a16 GLU planes %s: rc=%d, %zu of %zu bytes differ; "
+                 "short glu_k rc=%d\n",
+                 act ? "gelu" : "silu", rc, bad, 2u * (size_t)mp * GK, r4);
+          fail |= (rc != 0) | (bad != 0) | (r4 != AEE_EBADPARM);
+        }
+        for (uint32_t i = 0; i < 2; ++i)
+          hexkl_weight_u8i4_set_act16(&g_tbl, gh[i], 0.f, 0.f);
+        free(gf);
+        free(gy);
+        free(gp);
+        free(gsc);
+        free(gzp);
+      }
       fail |= hexkl_weight_u8i4_set_act16(&g_tbl, ah[1], 0.f, 0.f) != 0;
       const int r3 = hexkl_mm_u8i4_layer_run(
         &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, AK, ah, 2, ax, ag, &on);

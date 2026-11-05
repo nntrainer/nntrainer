@@ -352,6 +352,73 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   }
 }
 
+/** @brief Rows 4g..4g+3 of byte-plane tile @a tile as dq_rows_planes makes
+ *         them: f32, the a16 low sweep (lo_off) combined. */
+static inline void dq_rows4_f32(const hvx_dq_tiles_job *c, const uint8_t *tile,
+                                uint32_t g, const HVX_Vector cs,
+                                const HVX_Vector ws, const HVX_Vector bs,
+                                HVX_Vector out[4]) {
+  HVX_Vector a[4], b[4];
+  planes_rows4(tile, g, a);
+  if (c->lo_off) {
+    planes_rows4(tile + c->lo_off, g, b);
+  }
+  for (uint32_t r = 0; r < 4u; ++r) {
+    HVX_Vector af = Q6_Vsf_equals_Vw(a[r]);
+    if (c->lo_off) {
+      af = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(af, hvx_splat_sf(256.0f)),
+                              Q6_Vsf_equals_Vw(b[r]));
+    }
+    out[r] = dq_formula(af, hvx_splat_sf(c->act_scale[4u * g + r]),
+                        Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[4u * g + r])),
+                        cs, ws, bs);
+  }
+}
+
+void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const hvx_dq_glu16_job *jb = (const hvx_dq_glu16_job *)vjob;
+  const hvx_dq_tiles_job *c = &jb->t;
+  const uint32_t np = c->n_tiles;
+  const uint32_t n = (c->m_count + 3u) / 4u * np;
+  const uint32_t lo = (uint32_t)((uint64_t)n * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)n * (i + 1) / n_threads);
+  /* hvx_quant_u8.c's q16_run: rne(x / s) + zp */
+  const HVX_Vector vinv = hvx_splat_sf(1.0f / jb->scale);
+  const HVX_Vector vzp = Q6_V_vsplat_R(jb->zp);
+  /* (group, pair) units, a group's pairs in a run: four independent GLU
+     chains a unit, the rows' own pad rows computed and then dropped */
+  for (uint32_t u = lo; u < hi; ++u) {
+    const uint32_t g = u / np, j = u % np;
+    const uint32_t cg = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
+    const uint32_t cu = jb->inter + cg;
+    HVX_Vector gv[4], uv[4], q[4];
+    dq_rows4_f32(c, c->tiles_base + (size_t)j * c->tile_stride, g,
+                 *(const HVX_UVector *)(c->colsum_w + cg),
+                 *(const HVX_UVector *)(c->w_scale + cg),
+                 *(const HVX_UVector *)(c->bias + cg), gv);
+    dq_rows4_f32(c, c->tiles_base + (size_t)(np + j) * c->tile_stride, g,
+                 *(const HVX_UVector *)(c->colsum_w + cu),
+                 *(const HVX_UVector *)(c->w_scale + cu),
+                 *(const HVX_UVector *)(c->bias + cu), uv);
+    for (uint32_t r = 0; r < 4u; ++r) {
+      const HVX_Vector y = jb->act == HVX_GLU_GELU_TANH
+                             ? hvx_geglu_det_sf(gv[r], uv[r])
+                             : hvx_swiglu_det_sf(gv[r], uv[r]);
+      q[r] =
+        4u * g + r < c->m_count
+          ? Q6_Vw_vadd_VwVw(hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(y, vinv)), vzp)
+          : Q6_V_vzero();
+    }
+    /* hvx_quant_u8.c's store16_group4: rows 0-1 low half, 2-3 high */
+    const HVX_Vector h01 = Q6_Vuh_vpack_VwVw_sat(q[1], q[0]);
+    const HVX_Vector h23 = Q6_Vuh_vpack_VwVw_sat(q[3], q[2]);
+    /* AH tiles of 64 rows x 32 columns, 2 KiB each */
+    const size_t d = (size_t)(jb->col / 32u + j) * 2048u + (size_t)g * 128u;
+    *(HVX_UVector *)(jb->lo + d) = Q6_Vb_vpacke_VhVh(h23, h01);
+    *(HVX_UVector *)(jb->hi + d) = Q6_Vb_vpacko_VhVh(h23, h01);
+  }
+}
+
 void hvx_dequant_acc16_tile_to_f32(
   const int32_t *hi, const int32_t *lo, uint32_t row_stride, uint32_t m_count,
   const float *act_scale, const int32_t *act_zp, const int32_t *colsum_w,

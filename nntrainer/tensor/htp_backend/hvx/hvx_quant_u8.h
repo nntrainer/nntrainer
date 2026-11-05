@@ -130,22 +130,6 @@ int hvx_quant_params_pack_u16_ah(
   int32_t *zp, uint8_t *out_lo, uint8_t *out_hi, hvx_worker_pool *pool);
 
 /**
- * @brief hvx_quant_params_pack_u16_ah's planes at the static encoding
- *        @a fix_enc straight from a gate_up FC's output: row m of the
- *        k = n_chunks * n activation is, for each chunk c, its n columns
- *        hvx_glu_row_f32(g, g + up_off) with g = src + c * chunk_stride +
- *        m * src_ld. The GLU rows go through @a scratch (4 * k floats a
- *        pool lane, hvx_worker_pool_workers + 1 of them) and are never
- *        stored, the bytes those of the pack of the stored rows.
- */
-int hvx_glu_pack_u16_ah(const float *src, size_t chunk_stride, uint32_t src_ld,
-                        uint32_t up_off, uint32_t n_chunks, uint32_t n,
-                        int geglu, const float *fix_enc, uint32_t m_valid,
-                        uint32_t m_pad, float *scratch, float *scale,
-                        int32_t *zp, uint8_t *out_lo, uint8_t *out_hi,
-                        hvx_worker_pool *pool);
-
-/**
  * @brief Same pack, but destination row d takes its input from source row
  *        @a row_map[d].
  *

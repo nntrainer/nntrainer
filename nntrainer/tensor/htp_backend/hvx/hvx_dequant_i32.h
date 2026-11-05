@@ -208,6 +208,29 @@ typedef struct {
 
 void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *job);
 
+/**
+ * @brief The gate_up epilogue that stores no f32 (hexkl_mm_opts.glu_lo):
+ *        byte-plane tiles (t.planes24) only, t.n_tiles gate tiles from n-tile
+ *        t.nt0 and then the t.n_tiles up tiles opposite them. Each pair is
+ *        dequantized as hvx_dq_tiles_rows_worker does, gated by
+ *        hvx_geglu_det_sf / hvx_swiglu_det_sf and quantized at one
+ *        encoding into the two byte planes of AH tiles, four rows a store:
+ *        the bytes of that worker, hvx_glu_row_f32 and
+ *        hvx_quant_params_pack_u16_ah in a row. Units for the submit:
+ *        (m_count + 3) / 4 * n_tiles.
+ */
+typedef struct {
+  hvx_dq_tiles_job t; /**< dst_a, dst_b, split, dst_stride unused */
+  uint32_t inter;     /**< the up tiles' column offset in t's tables */
+  uint32_t act;       /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
+  float scale;        /**< the codes' encoding */
+  int32_t zp;
+  uint8_t *lo, *hi; /**< the planes' row block of t's row 0 */
+  uint32_t col; /**< the planes' column of gate tile t.nt0, a multiple of 32 */
+} hvx_dq_glu16_job;
+
+void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *job);
+
 /** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
  *         the submit: n_pairs. */
 typedef struct {

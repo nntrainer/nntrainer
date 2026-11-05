@@ -12,6 +12,7 @@
 
 #include "hexkl_mm_u8i4_dma.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -898,7 +899,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if (!tbl || !vtcm_base || !handles || n_handles == 0 ||
       (!act_f32 && !o->act_ah_prepacked && !o->act_u16 && !act_i16 &&
        !input_ah) ||
-      (!out_cat && !out_i32) || M == 0 || K == 0) {
+      (!out_cat && !out_i32 && !o->glu_lo) || M == 0 || K == 0) {
     return AEE_EBADPARM;
   }
   /** an a16 activation with one encoding a row needs no scratch: its codes
@@ -967,7 +968,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   {
     int gemv = M <= LAYER_GEMV_MAX_ROWS && o->post_done == NULL &&
                !(o->act16 && o->act_ah_prepacked) && !act_i16 && !out_i32 &&
-               !ah;
+               !ah && !o->glu_lo;
     for (uint32_t i = 0; gemv && i < n_handles; ++i) {
       gemv = tbl->slots[handles[i]].bits != 2u;
     }
@@ -1066,6 +1067,28 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     acc_layout->usable ? acc_layout->row_stride : 0u;
   if ((o->out_off || o->act16) && !acc_layout->usable) {
     return AEE_EUNSUPPORTED; // the fallback dequant writes packed blocks
+  }
+  /** the GLU epilogue (hexkl_mm_opts.glu_lo): whole gate/up pairs a batch,
+      on the byte-plane tiles */
+  const int glu = o->glu_lo != NULL;
+  if (glu) {
+    uint64_t cols = 0;
+    for (uint32_t i = 0; i < n_handles; ++i) {
+      const uint32_t n = tbl->slots[handles[i]].N;
+      cols += n / 2u;
+      if (n % (2u * HEXKL_ACC_TILE_COLS) != 0u) {
+        return AEE_EBADPARM;
+      }
+    }
+    if (!o->glu_hi || !o->glu_enc || !(o->glu_enc[0] > 0.0f) ||
+        o->glu_act > HVX_GLU_GELU_TANH || cols != o->glu_k || out_i32 || ah ||
+        o->accumulate || o->out_off || o->post_done) {
+      return AEE_EBADPARM;
+    }
+    if (!acc_layout->usable || acc_tiles < 2u ||
+        (uint64_t)K * 255u * 8u >= (1u << 23)) {
+      return AEE_EUNSUPPORTED;
+    }
   }
 
   /** Caller-supplied params (o->act_scale) skip the min/max scan; loc_* are
@@ -1202,6 +1225,13 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                0, (m_pad - M) * 32u);
   }
 
+  if (glu && M != m_pad) {
+    /* the last row block's rows past M: no group of four writes them */
+    const size_t tail = (size_t)(M / 64u) * 64u * o->glu_k;
+    memset(o->glu_lo + tail, 0, (size_t)m_pad * o->glu_k - tail);
+    memset(o->glu_hi + tail, 0, (size_t)m_pad * o->glu_k - tail);
+  }
+
   int rc = AEE_SUCCESS;
   size_t out_off = 0;
   /* The pooled epilogue: one job per staging buffer, each alive from its
@@ -1236,6 +1266,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     hexkl_cvt_block_set_uniform(
       vtcm_base + cvt_off + 3u * HEXKL_CVT_BLOCK_BYTES, 0);
   hvx_dq_rows_job dq_job[2];
+  hvx_dq_glu16_job glu_job[2];
   hexkl_i32_batch iq_job[2];
   uint32_t stage_used = 0;
   fc_post post[2];
@@ -1306,8 +1337,9 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
         }
         float *const out_h =
-          out_i32 ? NULL
-                  : (o->out_off ? out_cat + o->out_off[i] : out_cat + head_out);
+          out_i32 || glu
+            ? NULL
+            : (o->out_off ? out_cat + o->out_off[i] : out_cat + head_out);
         const uint32_t ld_h = o->out_ld ? o->out_ld[i] : h->N;
         /** The rows beyond M are the accumulator's padding: their
          * quantization parameters are synthetic, so emitting them would be
@@ -1321,7 +1353,13 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0) : HEXKL_ACC_TILE_ROWS);
         for (uint32_t nt0 = 0; nt0 < nt_n;) {
           const uint32_t room = acc_tiles - (out_i32 ? stage_used : 0u);
-          const uint32_t nb = nt_n - nt0 < room ? nt_n - nt0 : room;
+          /* glu: nb / 2 gate tiles from nt0 / 2, then the up tiles opposite
+             them, n-tile nt_w(j) in slot j */
+          const uint32_t nb =
+            nt_n - nt0 < room ? nt_n - nt0 : (glu ? room & ~1u : room);
+#define nt_w(j)                                                                \
+  (glu ? ((j) < nb / 2u ? nt0 / 2u + (j) : (nt_n + nt0 - nb) / 2u + (j))       \
+       : nt0 + (j))
           if (out_i32 && stage_used == 0u)
             iq_job[sb & 1u].n_jobs = 0;
           const uint32_t stage_off =
@@ -1351,7 +1389,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                     vtcm_base + plane +
                     rb * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
                   const uint8_t *w =
-                    vtcm_base + wcur + (nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
+                    vtcm_base + wcur + nt_w(j) * WEIGHT_TILE_BYTES_U8I4;
                   const uint32_t w_step = nt_n * WEIGHT_TILE_BYTES_U8I4;
                   for (uint32_t kt = 0; kt < k_tiles; ++kt) {
                     hexkl_hmx_mm_u8i4(a + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
@@ -1363,7 +1401,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                       plane +
                       (rb * k_tiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
                     const uint32_t w_tile_off =
-                      wcur + (kt * nt_n + nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
+                      wcur + (kt * nt_n + nt_w(j)) * WEIGHT_TILE_BYTES_U8I4;
                     rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
                     if (rc != AEE_SUCCESS) {
                       goto out;
@@ -1390,6 +1428,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               }
             }
           }
+#undef nt_w
           HEXKL_PROBE_ADD(HEXKL_PROBE_MM, mm_begin);
           if (out_i32) {
             hexkl_i32_batch *batch = &iq_job[sb & 1u];
@@ -1447,7 +1486,8 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
             if (cnt != 0u) {
               hvx_dq_rows_job *rj = &dq_job[sb & 1u];
-              hvx_dq_tiles_job *jb = &rj->t;
+              hvx_dq_glu16_job *gj = &glu_job[sb & 1u];
+              hvx_dq_tiles_job *jb = glu ? &gj->t : &rj->t;
               fc_post *pp = &post[sb & 1u];
               pp->chunk = fuse_post && o->post_chunk ? o->post_chunk[i] : 0u;
               pp->gamma = post_gamma;
@@ -1463,7 +1503,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                 (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                                   acc_layout->base);
               jb->tile_stride = ACC_TILE_BYTES;
-              jb->nt0 = nt0;
+              jb->nt0 = glu ? nt0 / 2u : nt0;
               jb->row_stride = acc_layout->row_stride;
               jb->m_count = cnt;
               jb->act_scale = act_scale + m0;
@@ -1471,11 +1511,11 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               jb->colsum_w = h->colsum_w;
               jb->w_scale = h->w_scale;
               jb->bias = h->bias;
-              jb->dst_a = out_h + (size_t)m0 * ld_h;
+              jb->dst_a = glu ? NULL : out_h + (size_t)m0 * ld_h;
               jb->dst_b = NULL;
               jb->split = h->N;
               jb->dst_stride = ld_h;
-              jb->n_tiles = nb;
+              jb->n_tiles = glu ? nb / 2u : nb;
               jb->lo_off = o->act16 ? acc_tiles * ACC_TILE_BYTES : 0u;
               jb->planes24 = (uint32_t)planes24;
               jb->accumulate = (uint32_t)o->accumulate;
@@ -1485,8 +1525,21 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                                  ((n_sweeps - 1u) * acc_tiles + nb - 1u) *
                                    ACC_TILE_BYTES);
               }
-              hvx_worker_pool_submit(o->pool, hvx_dq_tiles_rows_worker, rj,
-                                     cnt);
+              if (glu) {
+                const size_t blk = (size_t)m0 * o->glu_k;
+                gj->inter = h->N / 2u;
+                gj->act = o->glu_act;
+                gj->scale = o->glu_enc[0];
+                gj->zp = (int32_t)nearbyintf(o->glu_enc[1]);
+                gj->lo = o->glu_lo + blk;
+                gj->hi = o->glu_hi + blk;
+                gj->col = (uint32_t)(head_out / M / 2u) + nt0 / 2u * 32u;
+                hvx_worker_pool_submit(o->pool, hvx_dq_glu16_worker, gj,
+                                       (cnt + 3u) / 4u * (nb / 2u));
+              } else {
+                hvx_worker_pool_submit(o->pool, hvx_dq_tiles_rows_worker, rj,
+                                       cnt);
+              }
             }
           } else if (acc_layout->usable) {
             /* Dequantize each tile where it is, on this thread. */

@@ -121,6 +121,19 @@ typedef struct {
   float post_eps;
   uint32_t rope_hd, rope_handles;
   const float *rope_cs;
+
+  /** Non-NULL: every handle is a gate_up weight (gate columns, then as many
+      up columns) and the epilogue writes act(gate) * up (glu_act, HVX_GLU_*)
+      instead of the f32: as u16 codes at the one encoding glu_enc
+      {scale, zp} into the two byte planes glu_lo / glu_hi (m_pad x glu_k
+      each, AH tiles, the next matmul's act_ah_prepacked), handle i at the
+      columns after handle i - 1's N / 2. glu_k is the sum of those. out_cat
+      may be NULL. Not with accumulate, out_off or post_done.
+      AEE_EUNSUPPORTED, before any work, where the epilogue is not the
+      byte-plane one (255 * 8 * K >= 2^23) or a batch holds no tile pair. */
+  uint8_t *glu_lo, *glu_hi;
+  const float *glu_enc;
+  uint32_t glu_k, glu_act;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

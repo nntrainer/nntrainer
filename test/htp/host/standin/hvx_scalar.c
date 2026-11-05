@@ -24,7 +24,6 @@
 #include "swiglu_det.h"
 #include <math.h>
 #include <stddef.h>
-#include <stdlib.h>
 #include <string.h>
 
 hvx_scalar_hooks hvx_scalar_hook = {NULL, NULL, NULL, NULL};
@@ -769,26 +768,42 @@ int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
   }
   return 0;
 }
-/* GLU into a buffer of every row, then the fixed-encoding u16 pack. */
-int hvx_glu_pack_u16_ah(const float *src, size_t chunk_stride, uint32_t src_ld,
-                        uint32_t up_off, uint32_t n_chunks, uint32_t n,
-                        int geglu, const float *fix_enc, uint32_t m_valid,
-                        uint32_t m_pad, float *scratch, float *scale,
-                        int32_t *zp, uint8_t *out_lo, uint8_t *out_hi,
-                        hvx_worker_pool *pool) {
-  const uint32_t k = n_chunks * n;
-  if (!src || !scratch || !fix_enc || !m_valid || !n_chunks ||
-      m_pad < m_valid || m_pad % 64u != 0u)
-    return -1;
-  float *rows = (float *)malloc(sizeof(float) * m_valid * k);
-  int rc = rows ? 0 : -1;
-  for (uint32_t c = 0; rc == 0 && c < n_chunks; ++c)
-    rc = hvx_glu_rows_f32(src + c * chunk_stride, src_ld, up_off,
-                          rows + (size_t)c * n, k, m_valid, n, geglu, pool);
-  if (rc == 0)
-    rc = hvx_quant_params_pack_u16_ah(rows, NULL, NULL, 0u, fix_enc, m_valid,
-                                      m_pad, k, NULL, 0.0f, NULL, scale, zp,
-                                      out_lo, out_hi, pool);
-  free(rows);
-  return rc;
+/* The GLU epilogue (hexkl_mm_opts.glu_lo): slot j the gate n-tile nt0 + j,
+   slot n_tiles + j its up tile; the rows worker's dequant above, the GLU's
+   spec, then hvx_quant_params_pack_u16_ah's codes four rows a unit. */
+void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const hvx_dq_glu16_job *jb = (const hvx_dq_glu16_job *)vjob;
+  const hvx_dq_tiles_job *c = &jb->t;
+  const uint32_t np = c->n_tiles;
+  uint32_t lo, hi;
+  slice((c->m_count + 3u) / 4u * np, n_threads, i, &lo, &hi);
+  for (uint32_t u = lo; u < hi; ++u) {
+    const uint32_t g = u / np, j = u % np;
+    for (uint32_t r = 4u * g; r < 4u * g + 4u; ++r)
+      for (uint32_t cc = 0; cc < 32u; ++cc) {
+        float v[2];
+        for (uint32_t h = 0; h < 2u; ++h) {
+          const uint8_t *t =
+            c->tiles_base + (size_t)(h * np + j) * c->tile_stride;
+          const uint32_t col = h * jb->inter + (c->nt0 + j) * 32u + cc;
+          float af = (float)staged_at(c, t, r, cc);
+          if (c->lo_off)
+            af = af * 256.0f + (float)staged_at(c, t + c->lo_off, r, cc);
+          v[h] = (af - (float)c->act_zp[r] * (float)c->colsum_w[col]) *
+                   c->act_scale[r] * c->w_scale[col] +
+                 c->bias[col];
+        }
+        long q = 0;
+        if (r < c->m_count) {
+          const float y = jb->act == HVX_GLU_GELU_TANH
+                            ? geglu_det_one(v[0], v[1])
+                            : swiglu_det_one(v[0], v[1]);
+          q = (long)nearbyintf(y * (1.0f / jb->scale)) + jb->zp;
+          q = q < 0 ? 0 : (q > 65535 ? 65535 : q);
+        }
+        const size_t d = (size_t)(jb->col / 32u + j) * 2048u + r * 32u + cc;
+        jb->lo[d] = (uint8_t)(q & 0xff);
+        jb->hi[d] = (uint8_t)(q >> 8);
+      }
+  }
 }

@@ -22,7 +22,6 @@
 #include "hvx_convert.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
-#include "hvx_swiglu_f32.h"
 
 /** @brief HMX activation tile geometry, mirrored from hexkl_micro.h. */
 #define TILE_ROW 64u
@@ -839,78 +838,5 @@ int hvx_quant_params_pack_u16_ah(
       out_hi[d] = (uint8_t)(q >> 8);
     }
   }
-  return AEE_SUCCESS;
-}
-
-typedef struct {
-  const float *src;
-  size_t chunk_stride;
-  uint32_t src_ld, up_off, n_chunks, n, k, n_groups;
-  int geglu;
-  const float *scale;
-  const int32_t *zp;
-  uint8_t *lo, *hi;
-  float *scratch;
-} glu16_ctx;
-
-/** @brief Rows m..m+count-1 (count <= 4): each chunk's GLU into its n
- *         columns of the row in @a sc, then the pack of the four rows. */
-static void glu16_group(const glu16_ctx *c, uint32_t m, uint32_t count,
-                        float *sc) {
-  const float *row[4];
-  for (uint32_t r = 0; r < count; ++r) {
-    float *d = sc + (size_t)r * c->k;
-    for (uint32_t ch = 0; ch < c->n_chunks; ++ch) {
-      const float *g =
-        c->src + ch * c->chunk_stride + (size_t)(m + r) * c->src_ld;
-      hvx_glu_row_f32(g, g + c->up_off, d + (size_t)ch * c->n, c->n, c->geglu);
-    }
-    row[r] = d;
-  }
-  pack16_rows_f32(row, m, count, c->k / TILE_INNER, c->scale, c->zp, c->lo,
-                  c->hi);
-}
-
-static void glu16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
-  const glu16_ctx *c = (const glu16_ctx *)ctx_;
-  const uint32_t lo = (uint32_t)((uint64_t)c->n_groups * i / n_threads);
-  const uint32_t hi = (uint32_t)((uint64_t)c->n_groups * (i + 1) / n_threads);
-  float *sc = c->scratch + (size_t)i * 4u * c->k;
-  for (uint32_t g = lo; g < hi; ++g)
-    glu16_group(c, 4u * g, 4u, sc);
-}
-
-int hvx_glu_pack_u16_ah(const float *src, size_t chunk_stride, uint32_t src_ld,
-                        uint32_t up_off, uint32_t n_chunks, uint32_t n,
-                        int geglu, const float *fix_enc, uint32_t m_valid,
-                        uint32_t m_pad, float *scratch, float *scale,
-                        int32_t *zp, uint8_t *out_lo, uint8_t *out_hi,
-                        hvx_worker_pool *pool) {
-  const uint32_t k = n_chunks * n;
-  if (!src || !scratch || !fix_enc || !(fix_enc[0] > 0.0f) || !m_valid ||
-      !n_chunks || n % TILE_INNER != 0u || up_off < n || src_ld < up_off + n ||
-      m_pad < m_valid || m_pad % TILE_ROW != 0u) {
-    return AEE_EBADPARM;
-  }
-  const float s0 = fix_enc[0];
-  const int32_t z0 = (int32_t)nearbyintf(fix_enc[1]);
-  for (uint32_t m = 0; m < m_pad; ++m) {
-    scale[m] = m < m_valid ? s0 : 1.0f;
-    zp[m] = m < m_valid ? z0 : 0;
-  }
-  if (m_valid < m_pad) {
-    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
-    memset(out_lo + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
-    memset(out_hi + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
-  }
-  const uint32_t end = m_valid / 4u * 4u;
-  glu16_ctx ctx = {src,    chunk_stride, src_ld, up_off, n_chunks, n,
-                   k,      end / 4u,     geglu,  scale,  zp,       out_lo,
-                   out_hi, scratch};
-  if (end)
-    hvx_worker_pool_run(pool, glu16_worker, &ctx, end / 4u);
-  /* 1-3 rows past the last group of four, the pool done with the scratch */
-  if (end < m_valid)
-    glu16_group(&ctx, end, m_valid - end, scratch);
   return AEE_SUCCESS;
 }

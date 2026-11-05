@@ -442,7 +442,7 @@ geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" "$HERE/geglu_host_check.c" "$1" \
     "$BACKEND/hvx/hvx_quant_u8.c" "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" \
-    "$BACKEND/hvx/hvx_swiglu_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
 }
 geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
 "$OUT/geglu_host_check"
@@ -468,7 +468,7 @@ quant16_check() { # quant16_check <hvx_quant_u8.c> <exe>
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" "$HERE/quant_u16_host_check.c" "$1" \
     "$BACKEND/hvx/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_rmsnorm_rows_f32.c" \
-    "$BACKEND/hvx/hvx_swiglu_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
 }
 quant16_check "$BACKEND/hvx/hvx_quant_u8.c" "$OUT/quant_u16_host_check"
 "$OUT/quant_u16_host_check"

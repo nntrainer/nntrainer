@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1821,37 +1822,51 @@ static int dense_a16_run(nntr_hvx_session *s, uint32 M, uint32 K, uint32 inter,
   }
   for (uint32_t m0 = 0; m0 < M; m0 += step) {
     const uint32_t m = M - m0 < step ? M - m0 : step;
-    int rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base,
-                                     s->vtcm_size, s->config_off, m, K, h_gu, n,
-                                     act_f32 + (size_t)m0 * K, gu, &gopt);
-    if (rc != AEE_SUCCESS) {
-      return rc;
-    }
     hexkl_mm_opts dopt = {
       .pool = s->quant_pool, .out_off = dn_off, .out_ld = dn_ld};
+    int rc = AEE_EUNSUPPORTED;
     if (m > DENSE_A16_GEMV_ROWS) {
+      /* the gate_up epilogue writes the GLU as the down's two u16 planes at
+         its static encoding (hexkl_mm_opts.glu_lo) */
+      const float *enc = tbl->slots[h_dn[0]].a16_enc;
       const uint32_t m_pad = (m + 63u) / 64u * 64u;
       uint8_t *lo = (uint8_t *)mid;
       float *scale = (float *)(lo + (size_t)2u * m_pad * ki);
       int32_t *zp = (int32_t *)(scale + m_pad);
-      if (hvx_glu_pack_u16_ah(
-            gu, (size_t)m * 2u * inter, 2u * inter, inter, n, inter, (int)act,
-            tbl->slots[h_dn[0]].a16_enc, m, m_pad, s->norm_rows, scale, zp, lo,
-            lo + (size_t)m_pad * ki, s->quant_pool) != AEE_SUCCESS) {
-        return AEE_EBADPARM;
+      for (uint32_t r = 0; r < m_pad; ++r) {
+        scale[r] = r < m ? enc[0] : 1.0f;
+        zp[r] = r < m ? (int32_t)nearbyintf(enc[1]) : 0;
       }
-      dopt.act16 = 1;
-      dopt.act_ah_prepacked = lo;
-      dopt.act_scale = scale;
-      dopt.act_zp = zp;
-    } else {
-      for (uint32_t c = 0; c < n; ++c) {
+      hexkl_mm_opts g16 = gopt;
+      g16.glu_lo = lo;
+      g16.glu_hi = lo + (size_t)m_pad * ki;
+      g16.glu_enc = enc;
+      g16.glu_k = ki;
+      g16.glu_act = act;
+      rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                                   s->config_off, m, K, h_gu, n,
+                                   act_f32 + (size_t)m0 * K, NULL, &g16);
+      if (rc == AEE_SUCCESS) {
+        dopt.act16 = 1;
+        dopt.act_ah_prepacked = lo;
+        dopt.act_scale = scale;
+        dopt.act_zp = zp;
+      }
+    }
+    if (rc == AEE_EUNSUPPORTED) { /* the GEMV's rows, or no GLU epilogue */
+      rc = hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                                   s->config_off, m, K, h_gu, n,
+                                   act_f32 + (size_t)m0 * K, gu, &gopt);
+      for (uint32_t c = 0; rc == AEE_SUCCESS && c < n; ++c) {
         if (hvx_glu_rows_f32(gu + (size_t)c * m * 2u * inter, 2u * inter, inter,
                              mid + (size_t)c * inter, ki, m, inter, (int)act,
                              s->quant_pool) != 0) {
-          return AEE_EBADPARM;
+          rc = AEE_EBADPARM;
         }
       }
+    }
+    if (rc != AEE_SUCCESS) {
+      return rc;
     }
     rc = hexkl_mm_u8i4_layer_run(
       &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, ki, h_dn,
