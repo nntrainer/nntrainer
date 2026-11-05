@@ -856,19 +856,22 @@ From the checkout containing this documentation, on a Linux desktop:
 xdg-open docs/gemma4-moe-npu-guide/index.html
 ```
 
-To serve the pages over HTTP, run this from the checkout containing the guide
-and leave the terminal running:
+To serve the pages on localhost, run this from the repository root of the
+checkout containing the guide and leave the terminal running. Serving the
+committed HTML requires only Python 3; no packages or rendering step are needed:
 
 ```bash
-python3 tools/serve_gemma4_npu_guide.py --bind 0.0.0.0 --port 8765
+python3 tools/serve_gemma4_npu_guide.py
 ```
 
-Open `http://localhost:8765/` on that PC, or `http://<host-ip>:8765/` on a device
-that can reach it. The server exposes only this documentation, its assets, the
-Markdown source and the single-page view. Use `--bind 127.0.0.1` for access only
-from the host. Press **Ctrl+C** to stop it; run the same command to restart it.
-If the port is already in use, stop the earlier guide server or choose another
-port. Reload the browser after regenerating the pages.
+Open `http://localhost:8765/` for English or `http://localhost:8765/ko/` for Korean.
+The server prints both addresses and listens on `127.0.0.1` by default. It serves
+this documentation, its assets, Markdown sources and single-page views.
+Use `--port 9000` to select another port. To access the guide from another device,
+add `--bind 0.0.0.0` and open `http://<host-ip>:8765/` on that device.
+Press **Ctrl+C** to stop it; run the same command to restart it. If the port is
+already in use, stop the earlier guide server or choose another port. Reload
+the browser after regenerating the pages.
 
 The original `gemma4-moe-npu-guide.html` remains available as a standalone
 file. It contains the entire guide with an inline stylesheet. Keep the adjacent

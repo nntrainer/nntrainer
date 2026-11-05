@@ -42,6 +42,20 @@ v81. Exact figures and their conditions are in [Performance](performance.md).
 A first reading, in order: app → model packs → build → command line. The
 library and C API pages stand alone.
 
+## Read the HTML guide on localhost
+
+To read the separate Gemma4 walkthrough in English or Korean, run this from
+the repository root:
+
+```bash
+python3 tools/serve_gemma4_npu_guide.py
+```
+
+Open <http://localhost:8765/> for English or <http://localhost:8765/ko/> for Korean.
+Only Python 3 is required to serve the committed pages. Use `--port 9000` for
+another port and **Ctrl+C** to stop the server. The guide states the source
+revision used for its command examples.
+
 ## How it fits together
 
 ```mermaid

@@ -1097,16 +1097,19 @@ is required.</p>
 <p>From the checkout containing this documentation, on a Linux desktop:</p>
 <pre><code class="language-bash">xdg-open docs/gemma4-moe-npu-guide/index.html
 </code></pre>
-<p>To serve the pages over HTTP, run this from the checkout containing the guide
-and leave the terminal running:</p>
-<pre><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py --bind 0.0.0.0 --port 8765
+<p>To serve the pages on localhost, run this from the repository root of the
+checkout containing the guide and leave the terminal running. Serving the
+committed HTML requires only Python 3; no packages or rendering step are needed:</p>
+<pre><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py
 </code></pre>
-<p>Open <code>http://localhost:8765/</code> on that PC, or <code>http://&lt;host-ip&gt;:8765/</code> on a device
-that can reach it. The server exposes only this documentation, its assets, the
-Markdown source and the single-page view. Use <code>--bind 127.0.0.1</code> for access only
-from the host. Press <strong>Ctrl+C</strong> to stop it; run the same command to restart it.
-If the port is already in use, stop the earlier guide server or choose another
-port. Reload the browser after regenerating the pages.</p>
+<p>Open <code>http://localhost:8765/</code> for English or <code>http://localhost:8765/ko/</code> for Korean.
+The server prints both addresses and listens on <code>127.0.0.1</code> by default. It serves
+this documentation, its assets, Markdown sources and single-page views.
+Use <code>--port 9000</code> to select another port. To access the guide from another device,
+add <code>--bind 0.0.0.0</code> and open <code>http://&lt;host-ip&gt;:8765/</code> on that device.
+Press <strong>Ctrl+C</strong> to stop it; run the same command to restart it. If the port is
+already in use, stop the earlier guide server or choose another port. Reload
+the browser after regenerating the pages.</p>
 <p>The original <code>gemma4-moe-npu-guide.html</code> remains available as a standalone
 file. It contains the entire guide with an inline stylesheet. Keep the adjacent
 <code>gemma4-moe-npu-guide/assets/</code> directory for screenshots and benchmark downloads

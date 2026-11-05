@@ -1074,15 +1074,18 @@ EOS 억제(<code>bad_word_ids=[1,50,106]</code>)를 적용했습니다. EOS 억�
 <p>Linux 데스크톱에서 이 문서가 있는 체크아웃을 기준으로 실행합니다.</p>
 <pre><code class="language-bash">xdg-open docs/gemma4-moe-npu-guide/index.html
 </code></pre>
-<p>HTTP로 제공하려면 가이드가 있는 체크아웃에서 다음 명령을 실행하고 터미널을 유지합니다.</p>
-<pre><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py --bind 0.0.0.0 --port 8765
+<p>localhost에서 보려면 가이드가 있는 체크아웃의 저장소 루트에서 다음 명령을 실행하고
+터미널을 유지합니다. 커밋된 HTML을 제공하는 데는 Python 3만 필요하며, 별도 패키지를
+설치하거나 HTML을 다시 생성할 필요가 없습니다.</p>
+<pre><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py
 </code></pre>
-<p>같은 PC에서는 <code>http://localhost:8765/</code>, 접근 가능한 다른 기기에서는
-<code>http://&lt;host-ip&gt;:8765/</code>를 엽니다. 한국어 시작 주소는 <code>http://localhost:8765/ko/</code>입니다.
-서버는 이 문서와 관련 리소스, Markdown 원본, 단일 페이지 보기만 제공합니다.
-호스트 안에서만 접근하려면 <code>--bind 127.0.0.1</code>을 사용하세요. <strong>Ctrl+C</strong>로 종료하고
-같은 명령으로 다시 시작할 수 있습니다. 포트가 사용 중이면 기존 가이드 서버를
-종료하거나 다른 포트를 선택하세요. 페이지를 재생성한 뒤에는 브라우저를 새로고침합니다.</p>
+<p>영문은 <code>http://localhost:8765/</code>, 한국어는 <code>http://localhost:8765/ko/</code>를 엽니다.
+서버가 두 주소를 출력하며 기본으로 <code>127.0.0.1</code>에서 실행됩니다. 이 문서와 관련 리소스,
+Markdown 원본, 단일 페이지 보기를 제공합니다. 다른 포트를 쓰려면 <code>--port 9000</code>을
+추가하세요. 다른 기기에서도 접근하려면 <code>--bind 0.0.0.0</code>을 추가하고 해당 기기에서
+<code>http://&lt;host-ip&gt;:8765/</code>를 엽니다. <strong>Ctrl+C</strong>로 종료하고 같은 명령으로 다시 시작할 수
+있습니다. 포트가 사용 중이면 기존 가이드 서버를 종료하거나 다른 포트를 선택하세요.
+페이지를 재생성한 뒤에는 브라우저를 새로고침합니다.</p>
 <p>기존 <code>gemma4-moe-npu-guide.html</code>은 독립 파일로 유지됩니다.
 한국어 단일 페이지 파일은 <code>gemma4-moe-npu-guide.ko.html</code>입니다. 전체 내용과 스타일이
 한 파일에 들어 있습니다. 오프라인에서 스크린샷과 벤치마크 자료도 열려면 옆의

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Serve only the generated Gemma4 documentation and its source/print views."""
+"""Serve the Gemma4 HTML guide on localhost using Python's standard library."""
 
 import argparse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -9,9 +9,12 @@ from urllib.parse import unquote, urlsplit
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--bind", default="127.0.0.1", help="Listening address")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP port")
     args = parser.parse_args()
     docs = Path(__file__).resolve().parents[1] / "docs"
     site = docs / "gemma4-moe-npu-guide"
@@ -52,8 +55,11 @@ def main():
             super().end_headers()
 
     with ThreadingHTTPServer((args.bind, args.port), Handler) as server:
-        print(f"Gemma4 documentation: http://localhost:{args.port}/", flush=True)
-        print(f"Listening on {args.bind}:{args.port}; Ctrl+C stops the server.", flush=True)
+        address, port = server.server_address
+        host = "localhost" if address in ("127.0.0.1", "0.0.0.0") else address
+        print(f"English: http://{host}:{port}/", flush=True)
+        print(f"Korean:  http://{host}:{port}/ko/", flush=True)
+        print(f"Listening on {address}:{port}; Ctrl+C stops the server.", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
