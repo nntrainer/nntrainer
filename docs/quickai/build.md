@@ -48,9 +48,15 @@ cd Applications/CausalLM
 `--htp` selects the native Hexagon variant; `--app` adds the Gradle build of
 the AAR and the APK. The script stops with a clear message if a variable is
 missing (`--htp requires HEXKL_ROOT`), if the DSP target is not v81
-(`Error: the Gemma4 HTP runtime requires HEX_ARCH=v81.`) or if `--htp` is
-combined with `--qnn` (`Error: --htp and --qnn select separate native
-variants.`).
+(`Error: the Gemma4 HTP runtime requires HEX_ARCH=v81.`), or if the selected
+HexKL library directory is missing. Both Android and DSP builds default to
+`HEXKL_SDK_VER=6.4.0.1`; the DSP build does not fall back to the newest library
+directory. Rebuild and deploy the ARM libraries and DSP image together after
+changing this selection.
+
+`--qnn --htp` selects the combined `qnn-htp` variant and additionally requires
+a QNN SDK through `QNN_SDK_ROOT`. The steps and output paths below use `--htp`
+alone.
 
 What the script does, in order:
 

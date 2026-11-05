@@ -216,7 +216,7 @@ UI = {
         "pagination": "Previous and next pages", "back_top": "Back to top",
         "markdown": "Markdown source",
         "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme",
-        "reviewed": "Source baseline: PR #4480 · Reviewed November 4, 2026",
+        "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026",
         "search": "Search documentation", "close_search": "Close search",
         "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…",
         "search_empty": f"Type to search all {len(PAGES)} pages.", "search_count": "{count} matching sections",
@@ -235,7 +235,7 @@ UI = {
         "pagination": "이전 및 다음 페이지", "back_top": "맨 위로",
         "markdown": "Markdown 원본",
         "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환",
-        "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 4일",
+        "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일",
         "search": "문서 검색", "close_search": "검색 닫기",
         "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…",
         "search_empty": f"검색어를 입력하면 전체 {len(PAGES)}개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다",
@@ -385,7 +385,7 @@ def render_site(source, language="en", reference=None):
 <div class="sidebar-backdrop" hidden></div>
 <aside class="sidebar" id="sidebar">
 <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>{ui['guide']}</small></span></a>
-<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
 {language_links()}
 <button class="search-open" aria-haspopup="dialog"><span>{ui['search']}</span><kbd>⌘ / Ctrl K</kbd></button>
 <nav class="site-nav" aria-label="{ui['documentation']}">{"".join(sidebar)}</nav>

@@ -6,10 +6,11 @@ It covers installing the toolchains, building nntrainer, installing the runtime,
 copying a model pack, and checking that the NPU actually runs the model.
 
 **Source baseline:** [PR #4480](https://github.com/nntrainer/nntrainer/pull/4480),
-commit [`fa078c94d1d73609c5584e948931384d69f9364c`](https://github.com/nntrainer/nntrainer/tree/fa078c94d1d73609c5584e948931384d69f9364c),
-reviewed on 2026-11-04. Commands below target that revision, which includes
-QuickDotAIAPP and the HTP build script. A different checkout may have different
-commands or may not contain these features yet.
+commit [`67d2903a279a3f5604074f001bbf8f814dfb9f82`](https://github.com/nntrainer/nntrainer/tree/67d2903a279a3f5604074f001bbf8f814dfb9f82),
+reviewed on 2026-11-05. Commands below target that revision, including the
+SDK/HexKL 6.4.0.1 pairing, the updated Metrics benchmark and the 2,304-position
+Gemma4 chat preset. Screenshot and benchmark dates are recorded separately
+below. A different checkout may have different commands or features.
 
 > You need a separately supplied, ready-to-run **Gemma4 HTP model pack**.
 > Neither this repository nor the APK includes the weights. No public download
@@ -33,7 +34,7 @@ error before moving to the next step.
 | NPU compatibility | `HEX_ARCH=v81` is required. A Qualcomm NPU alone does not establish compatibility; other DSP generations and 16 KB-page devices are outside the validated baseline |
 | Minimum Android version | App installation requires API **33 (Android 13)** or newer. The NPU validation baseline is the phone environment above |
 | Hexagon SDK | **6.4.0.1**, including **Hexagon Tools 19.0.04** |
-| Hexagon Kernel Library (HexKL) | **1.0 beta2**, using its **`lib/6.4.0.2`** libraries |
+| Hexagon Kernel Library (HexKL) | **1.0 beta2**, using its **`lib/6.4.0.1`** libraries |
 | Android NDK | **r30**, package revision **30.0.16248370** |
 | Android app tools | **JDK 17**, SDK platform **36**, build-tools **36.0.0**, SDK CMake **3.22.1**, platform-tools |
 | Native build tools | GCC/G++, Meson, Ninja, CMake, Python 3, Rust/Cargo, Git |
@@ -192,7 +193,7 @@ the Android and HexKL paths explicitly:
 source "$HOME/Qualcomm/Hexagon_SDK/6.4.0.1/setup_sdk_env.source"
 
 export HEXKL_ROOT="$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon"
-export HEXKL_SDK_VER=6.4.0.2
+export HEXKL_SDK_VER=6.4.0.1
 export HEXKL_TOOLS_VARIANT=toolv19
 export HEXKL_ARCH=armv8_android26
 export HEX_ARCH=v81
@@ -207,14 +208,14 @@ export PATH="$JAVA_HOME/bin:$HOME/.cargo/bin:$ANDROID_HOME/cmdline-tools/latest/
 `source` path. Re-run this block whenever you start a fresh terminal, or save
 these commands in a shell file outside the source checkout and source it.
 
-> **These values reproduce the build configuration recorded in the PR.**
-> Hexagon SDK **6.4.0.1** supplies the compiler and SDK environment.
-> `HEXKL_SDK_VER=6.4.0.2` selects the HexKL beta2 package's `lib/6.4.0.2`
-> libraries; it does not change the installed SDK. The Android runtime comes
-> from `armv8_android26/libsdkl.so`, and the DSP build links
-> `hexagon_toolv19_v81/libhexkl_micro.a` below that directory. This documents
-> the PR's recipe, not a general cross-version compatibility guarantee.
-> Keep the package's directory names unchanged.
+> **Use 6.4.0.1 for both the Hexagon SDK and the HexKL library selection.**
+> HexKL's `lib/<version>` directory names the SDK version the libraries target.
+> `HEXKL_SDK_VER=6.4.0.1` selects `lib/6.4.0.1`: the Android runtime is
+> `armv8_android26/libsdkl.so`, and the DSP build links
+> `hexagon_toolv19_v81/libhexkl_micro.a` below it. Both build scripts default
+> to this version. The DSP script no longer selects the newest available
+> directory automatically. Check that the matching directory exists; do not
+> rename a different version's directory to make the path check pass.
 
 Check the paths before building:
 
@@ -249,7 +250,7 @@ cd "$HOME/workspace"
 git clone https://github.com/nntrainer/nntrainer.git nntrainer-gemma4-pr4480
 cd nntrainer-gemma4-pr4480
 git fetch origin pull/4480/head
-git switch --detach fa078c94d1d73609c5584e948931384d69f9364c
+git switch --detach 67d2903a279a3f5604074f001bbf8f814dfb9f82
 git submodule sync --recursive
 git submodule update --init --recursive --depth 1
 export NNTR_ROOT="$PWD"
@@ -414,8 +415,15 @@ particular, do not overwrite a TL2 pack's `nntr_config.json` with the palette
 preset from `Applications/CausalLM/res/gemma4/htp_chat/`. For a palette pack
 requiring a chat preset, confirm its weights match that preset with the provider
 before replacing config files. The PR's
-[model-pack contract](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/model-packs.md)
+[model-pack contract](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/model-packs.md)
 describes the formats and optional sidecars in detail.
+
+When updating an older pack for this revision, follow the
+[removed-switch migration notes](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/configuration.md#removed-comparison-switches).
+Retired nested `htp` / `moe` keys are rejected at load. Remove the listed keys
+from a compatible copy of the pack configuration; do not replace TL2 settings
+with a palette preset. The retired `moe.hadamard=both_scalar` value becomes
+`both` when that same rotation is required by the checkpoint.
 
 On the **host**, set the directory of the supplied pack and check the main files:
 
@@ -520,7 +528,10 @@ exit
 For this preset, the empty thought channel requests a direct answer. Use the
 provider's matching template if your pack differs. Generation length is read
 from `num_to_generate` in `nntr_config.json`, not a CLI flag. The palette chat
-preset uses 1,280 context positions and up to 127 generated tokens.
+preset sets `init_seq_len=2048`, `max_seq_len=2304` and `num_to_generate=256`:
+up to 2,048 prompt tokens with a 256-token answer budget. Supplied TL2 packs
+can use different settings. These defaults are separate from the fixed-output
+CLI configurations in the archived benchmark section.
 
 ### Check NPU execution
 
@@ -578,10 +589,13 @@ exit status. Unload the model in the app before running CLI/API tests.
 
 ## 8. Build and install the Quick.AI app
 
-These are real captures from **Quick.AI 2.0** on Galaxy S26 Ultra phones
-(SM-S948N / SM-S948U, Android 16, 4 KB pages), taken on November 4, 2026.
-The instructions use the English labels shown in the app. Click a screenshot
-to open its full-resolution image.
+The instructions follow the updated app at the source revision above. The
+model-selection and chat examples are real **Quick.AI 2.0** captures from
+November 4, 2026 (Galaxy S26 Ultra SM-S948N / SM-S948U, Android 16, 4 KB pages).
+The Metrics image was refreshed on November 5 on SM-S948U and shows the
+benchmark setup. The installed APKs' source commits were not established;
+the captures illustrate the controls, while the pinned source defines their
+behaviour. Click an image to open its full-resolution capture.
 
 ### Build and install the APK
 
@@ -630,7 +644,7 @@ complete step 6 separately.
 ### Load the model and send a message
 
 Follow **model selection → load confirmation → send a message**. The model
-selection capture uses the default base path. The load, chat and Metrics
+selection capture uses the default base path. The load and chat
 captures use a TL2 pack already available on the other phone under
 `/sdcard/Download/aistudio-mobile/models_1022`. If you copied your pack as in
 step 6, use `/sdcard/Download/aistudio-mobile/models` from the table below.
@@ -685,29 +699,67 @@ chat. To release the model, use **Unload** in the model sheet.
 At this revision the HTP app sends **only the newest user message**. Earlier
 chat bubbles are not conversation memory for this model. Keep initial prompts
 short: prompts beyond the configured context can be truncated without an
-error. The palette chat preset uses 1,280 positions, but supplied TL2 packs can
-have different limits. Increasing context can materially increase RAM use.
+error. The palette chat preset has 2,304 positions, a 2,048-token prompt limit
+and a 256-token answer budget; supplied TL2 packs can have different limits.
+Updating the app does not rewrite a previously copied pack's configuration.
+Increasing context can materially increase RAM use.
 These Gemma4 HTP packs are text-only; the app's image controls for other models
 do not make this path multimodal.
 
 ### 4. Check Metrics and unload
 
-Open **Metrics** in the bottom navigation to inspect the last run. The numbers
-shown are one capture run; they vary with the pack, prompt and phone state.
+Open **Metrics** to run a speed benchmark with bundled text. Load the model,
+choose the lengths and repetitions below, then scroll down and tap **Run**.
+The initial choices are **1K / 128 / 3**, with the thermal wait off.
 
-![Metrics showing time to first token, decode time, generation and prefill speeds, peak memory and recent runs](gemma4-moe-npu-guide/assets/screenshots/05-metrics.png "Screen 4. Metrics for the same response. Scroll down to expand the last run's raw output.")
+![Updated Metrics benchmark with prefill and decode token choices, repeats and the thermal-wait switch](gemma4-moe-npu-guide/assets/screenshots/05-metrics.png "Screen 4. Benchmark setup captured on SM-S948U on November 5. No model is loaded in this capture. Load a model, then scroll below the thermal switch to Run.")
 
-| Field | Meaning |
+| Control | Choices and behaviour |
 | --- | --- |
-| **TIME TO FIRST TOKEN** | Time from submitting the prompt until the app receives the first token. |
-| **STEADY DECODE** | Median generation time per token, from the second token through the last, in `ms/tok`. |
-| **GENERATION / PREFILL** | Output generation and input processing speed, token count and duration, respectively. |
-| **PEAK MEMORY** | Peak memory reported by the app; this is different from weight-file storage size. |
-| **Recent runs / Raw output of the last run** | Recent execution records and expandable text from the last response. |
+| **PREFILL TOKENS** | 128, 256, 512, 1K, 2K or 4K nominal tokens of bundled text. |
+| **DECODE TOKENS** | 32, 64, 128 or 256; the app stops the answer at the selected length. |
+| **REPEATS** | 1, 3 or 5 runs. |
+| **Wait for a cool phone** | Optional wait of up to 90 seconds before each run; off by default. |
+| **Run / Stop** | Run requires a loaded, idle model and lengths that fit its pack. Stop ends the measurement. |
 
-The latest library removes chat turn markers such as `<turn|>` from the
-stream. Neither the chat bubble nor Metrics raw output shows them; use the
-native token trace to inspect the end-of-turn token (Gemma4 ID `106`).
+The benchmark uses its own prompt, sized at roughly four characters per token,
+and asks for a detailed retelling. The per-run table reports the actual token
+counts. Each repeat clears the visible chat before sending that prompt; save
+any conversation text you need first.
+
+For native models the app reads `max_seq_len - num_to_generate` as the prompt
+budget and `num_to_generate` as the answer budget, disabling choices above
+them. The current palette preset therefore disables 4K prefill. An engine's
+prefill limit can further shorten the actual prompt; inspect the reported
+counts. Changing a choice does not change the pack's context configuration.
+
+Results show the median **TIME TO FIRST TOKEN** (send to first token in the
+app), **PREFILL** throughput from engine timing, and **DECODE** throughput
+from first to last token using wall time. Each row gives prompt/answer counts
+and timings. Early answers, skipped runs and decode windows shorter than one
+second are marked; eligible runs contribute to the displayed medians. The
+first run after loading can include warm-up and is not automatically excluded.
+
+With all-files access, the CSV is appended to
+`/sdcard/Download/QuickAI/power/bench.csv`; otherwise the app uses its own
+external-files directory. Check the displayed **Saved to** path. The former
+last-chat metrics, peak-memory tile and raw-output history have been removed.
+Per-answer chat statistics remain under the answers. The chat stream omits
+turn markers such as `<turn|>`; use the native token trace for Gemma4 end-of-turn
+ID `106`.
+
+### 5. Measure power
+
+The **Power** tab measures whole-phone battery-gauge energy per output token.
+After loading a model, choose **PROMPT**, **WINDOW TOKENS**, **REPEATS** and
+**BASELINE**, then tap **Measure** and unplug the cable when prompted. The run
+waits for a cool phone, records idle power, generates the answer and cools down.
+Keep **Measure while plugged** off for power measurements; it is a debug option.
+
+Power results include baseline-adjusted `mJ/token`, power and per-run records.
+With all-files access, `runs.csv` and session JSON files go under
+`/sdcard/Download/QuickAI/power/`. Metrics can run with USB attached and has no
+power baseline or cool-down. Finish one measurement before starting the other.
 
 When finished, or before running the CLI, open the top model chip and tap
 **Unload**. Use **Load model** to start again, or **Reload model** to replace
@@ -720,7 +772,8 @@ model at a time.
 Measured on November 4, 2026 with the **deployed rotated TL2 pack**, using the
 CLI runtime whose native libraries match the installed Quick.AI app. Input
 lengths are **1,024 / 2,048 / 4,096 / 8,192 tokens**, with **128 output tokens**
-in every run. These measurements replace the earlier historical PR results.
+in every run. These are archived measurements of the runtime deployed that
+day, not a rerun of the updated SDK/HexKL recipe or the app's Metrics workflow.
 
 The [LFM2 benchmark appendix](#appendix-a-lfm2-benchmark-results) records a
 separate sweep with the same input/output lengths, device and runtime.
@@ -805,7 +858,7 @@ results.
 | `adb` reports no permissions on Ubuntu | Install `android-sdk-platform-tools-common` for USB rules, reconnect the device and follow the distro's `plugdev` group setup if needed. |
 | `more than one device/emulator` | Set `ANDROID_SERIAL` to the intended serial in each host terminal. |
 | `--htp requires ...` | Source the Hexagon SDK environment and re-export HexKL/Android variables in this terminal. |
-| Missing `libsdkl.so` or `libhexkl_micro.a` | Check the extraction root and the exact `6.4.0.2`, `armv8_android26`, `hexagon_toolv19_v81` subdirectories. Do not point at the ZIP or its parent. |
+| Missing `libsdkl.so` or `libhexkl_micro.a` | Check the extraction root and the exact `6.4.0.1`, `armv8_android26`, `hexagon_toolv19_v81` subdirectories. Do not point at the ZIP or its parent. |
 | Build rejects `HEX_ARCH` | This Android workflow requires `v81`; selecting another value does not enable a different phone. |
 | `cargo` or Android tokenizer archive missing | Verify Rust/Cargo are on `PATH`, the `aarch64-linux-android` target is installed and `ANDROID_NDK` is correct; rerun the build. |
 | Gradle cannot find the SDK or licenses | Check `ANDROID_HOME`, installed platform 36/build-tools/CMake and `sdkmanager --licenses`. A stale `local.properties` can point Gradle at another SDK. |
@@ -905,28 +958,31 @@ Generated HTML and `assets/search-index.js` should not be edited by hand.
 ### Validation boundaries and references
 
 These instructions were checked against the pinned PR's scripts, CLI parser,
-app configuration, and Quick.AI documentation, plus the locally available HexKL
-beta2 archive layout. **A fresh SDK installation or Android build was not
-performed as part of writing this guide.** For the screenshots, an existing
-Quick.AI 2.0 installation and a supplied TL2 pack were used to check model
-loading, one short question, Metrics and unloading. The installed APK's source
-commit was not established: the captures document the interface, rather than
-a fresh build of this guide's pinned revision. The PR's own build and device
-validation records are also distinct from an end-to-end execution of this guide.
+app controls, benchmark runner and pack-limit parser on November 5. Both build
+scripts select HexKL `6.4.0.1`; the app's Metrics controls were also inspected
+on SM-S948U and captured again. **No fresh SDK installation, Android build or
+model benchmark was performed for this documentation update.** The November 4
+chat examples used an existing Quick.AI 2.0 installation and supplied TL2 pack.
+The installed APKs' source commits were not established. The captures and the
+PR's own build/device records are not a fresh end-to-end run of this guide.
 
-The benchmark section was separately measured on the deployed TL2 pack on
+The November 4 benchmark section was separately measured on the deployed TL2 pack on
 SM-S948U: three CLI trials each at 1K, 2K, 4K and 8K input, all with 128 output
 tokens. Runtime libraries were verified against the installed app by SHA-256;
 raw logs, token traces, configurations and binary hashes accompany the results.
+Those records remain unchanged. They do not measure the updated SDK/HexKL
+recipe or the current app's Metrics workflow.
 
 Use these pinned sources when resolving a discrepancy:
 
-- [Android build script](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/build_android.sh): accepted options, prerequisites, outputs and deployment.
-- [DSP build script](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/nntrainer/tensor/htp_backend/dsp/build.sh): HexKL selection and DSP checks.
-- [CLI implementation](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/main.cpp): positional arguments and prompt handling.
-- [Quick.AI build documentation](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/build.md): recorded environment and build procedure.
-- [CLI and C API test documentation](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/cli.md): runtime commands and lifecycle tests.
-- [App usage](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/app.md) and [known limitations](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/troubleshooting.md): controls, permissions and failure modes.
+- [Android build script](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/build_android.sh): accepted options, prerequisites, outputs and deployment.
+- [DSP build script](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/nntrainer/tensor/htp_backend/dsp/build.sh): HexKL selection and DSP checks.
+- [CLI implementation](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/main.cpp): positional arguments and prompt handling.
+- [Quick.AI build documentation](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/build.md): recorded environment and build procedure.
+- [CLI and C API test documentation](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/cli.md): runtime commands and lifecycle tests.
+- [App usage](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/app.md) and [known limitations](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/troubleshooting.md): controls, permissions and failure modes.
+- [Metrics screen](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/ui/MetricsScreen.kt) and [prompt/pack limits](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerPrompts.kt): selectable lengths, results and disabled choices.
+- [Measurement runner](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerRunner.kt) and [result files](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerFiles.kt): thermal waits, chat clearing and CSV destinations.
 
 ## Appendix A. LFM2 benchmark results
 

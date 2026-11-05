@@ -6,10 +6,11 @@ Quick.AI Android 앱으로 Gemma4 26B-A4B의 첫 응답을 생성하는 과정�
 순서대로 진행합니다.
 
 **기준 소스:** [PR #4480](https://github.com/nntrainer/nntrainer/pull/4480)의
-커밋 [`fa078c94d1d73609c5584e948931384d69f9364c`](https://github.com/nntrainer/nntrainer/tree/fa078c94d1d73609c5584e948931384d69f9364c).
-2026-11-04에 내용을 검토했습니다. 아래 명령은 QuickDotAIAPP과 HTP 빌드 스크립트가
-포함된 이 리비전을 기준으로 합니다. 다른 체크아웃에서는 명령이 달라지거나 해당 기능이
-아직 없을 수 있습니다.
+커밋 [`67d2903a279a3f5604074f001bbf8f814dfb9f82`](https://github.com/nntrainer/nntrainer/tree/67d2903a279a3f5604074f001bbf8f814dfb9f82).
+2026-11-05에 내용을 검토했습니다. 아래 명령은 SDK와 HexKL 6.4.0.1 조합,
+업데이트된 Metrics 벤치마크, 2,304개 위치의 Gemma4 채팅 프리셋이 포함된 이
+리비전을 기준으로 합니다. 화면 캡처와 벤치마크의 날짜는 아래에 따로 기록했습니다.
+다른 체크아웃에서는 명령이나 기능이 달라질 수 있습니다.
 
 > 별도로 제공되는 실행 가능한 **Gemma4 HTP 모델 팩**이 필요합니다.
 > 이 저장소와 APK에는 가중치가 포함되어 있지 않습니다. 이 PR에는 제공용 모델 팩의
@@ -32,7 +33,7 @@ Quick.AI Android 앱으로 Gemma4 26B-A4B의 첫 응답을 생성하는 과정�
 | NPU 호환성 | `HEX_ARCH=v81` 필수. Qualcomm NPU 탑재만으로 호환성이 보장되지는 않으며, 다른 DSP 세대와 16 KB 페이지 기기는 검증 범위 밖 |
 | Android 최소 버전 | 앱 설치 최소 API는 **33(Android 13)**. NPU 실행 검증 기준은 위 휴대전화 환경 |
 | Hexagon SDK | **6.4.0.1**, **Hexagon Tools 19.0.04** 포함 |
-| Hexagon Kernel Library(HexKL) | **1.0 beta2**, 이 패키지의 **`lib/6.4.0.2`** 라이브러리 사용 |
+| Hexagon Kernel Library(HexKL) | **1.0 beta2**, 이 패키지의 **`lib/6.4.0.1`** 라이브러리 사용 |
 | Android NDK | **r30**, 패키지 리비전 **30.0.16248370** |
 | Android 앱 도구 | **JDK 17**, SDK 플랫폼 **36**, build-tools **36.0.0**, SDK CMake **3.22.1**, platform-tools |
 | 네이티브 빌드 도구 | GCC/G++, Meson, Ninja, CMake, Python 3, Rust/Cargo, Git |
@@ -187,7 +188,7 @@ README에 **1.0 Beta.2**가 표시되어야 합니다. 다운로드 파일이 �
 source "$HOME/Qualcomm/Hexagon_SDK/6.4.0.1/setup_sdk_env.source"
 
 export HEXKL_ROOT="$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon"
-export HEXKL_SDK_VER=6.4.0.2
+export HEXKL_SDK_VER=6.4.0.1
 export HEXKL_TOOLS_VARIANT=toolv19
 export HEXKL_ARCH=armv8_android26
 export HEX_ARCH=v81
@@ -201,13 +202,14 @@ export PATH="$JAVA_HOME/bin:$HOME/.cargo/bin:$ANDROID_HOME/cmdline-tools/latest/
 설정합니다. SDK를 다른 곳에 설치했다면 `source` 경로를 바꾸세요. 새 터미널을
 열 때마다 이 블록을 다시 실행하거나, 소스 체크아웃 밖의 셸 파일에 저장해 불러오세요.
 
-> **이 값은 PR에 기록된 빌드 구성을 재현하는 설정입니다.**
-> Hexagon SDK **6.4.0.1**은 컴파일러와 SDK 환경을 제공합니다.
-> `HEXKL_SDK_VER=6.4.0.2`는 HexKL beta2의 `lib/6.4.0.2` 라이브러리를 선택하며,
-> 설치된 SDK 버전을 바꾸지 않습니다. 그 아래 `armv8_android26/libsdkl.so`는
-> Android 런타임으로 배포되고, `hexagon_toolv19_v81/libhexkl_micro.a`는 DSP 빌드에
-> 링크됩니다. 이 설명은 PR의 빌드 설정에 대한 것으로, 서로 다른 모든 SDK 버전의
-> 호환성을 보장하는 의미는 아닙니다. 패키지의 디렉터리 이름은 바꾸지 마세요.
+> **Hexagon SDK와 HexKL 라이브러리 선택에 모두 6.4.0.1을 사용하세요.**
+> HexKL의 `lib/<version>`은 라이브러리가 대상으로 하는 SDK 버전입니다.
+> `HEXKL_SDK_VER=6.4.0.1`로 `lib/6.4.0.1`을 선택합니다. 그 아래
+> `armv8_android26/libsdkl.so`는 Android 런타임으로 배포되고,
+> `hexagon_toolv19_v81/libhexkl_micro.a`는 DSP 빌드에 링크됩니다.
+> 두 빌드 스크립트의 기본값도 이 버전입니다. DSP 스크립트는 더 이상 가장 최신
+> 디렉터리를 자동으로 고르지 않습니다. 해당 디렉터리가 실제로 있는지 확인하고,
+> 경로 검사만 통과시키려고 다른 버전의 디렉터리 이름을 바꾸지 마세요.
 
 빌드 전에 경로를 확인합니다.
 
@@ -242,7 +244,7 @@ cd "$HOME/workspace"
 git clone https://github.com/nntrainer/nntrainer.git nntrainer-gemma4-pr4480
 cd nntrainer-gemma4-pr4480
 git fetch origin pull/4480/head
-git switch --detach fa078c94d1d73609c5584e948931384d69f9364c
+git switch --detach 67d2903a279a3f5604074f001bbf8f814dfb9f82
 git submodule sync --recursive
 git submodule update --init --recursive --depth 1
 export NNTR_ROOT="$PWD"
@@ -404,8 +406,15 @@ DSP 이미지는 함께 빌드하고 배포하세요. 새 빌드에 오래된 DS
 `Applications/CausalLM/res/gemma4/htp_chat/`의 팔레트 프리셋으로 덮어쓰면 안 됩니다.
 팔레트 팩에 채팅 프리셋이 필요하다면 설정 파일을 교체하기 전에 제공자에게 가중치와
 프리셋의 호환 여부를 확인하세요. 형식과 선택적 보조 파일(sidecar)은 PR의
-[모델 팩 규약](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/model-packs.md)에
+[모델 팩 규약](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/model-packs.md)에
 자세히 설명되어 있습니다.
+
+이전 팩을 이 리비전에서 사용하려면
+[삭제된 옵션의 설정 이행 안내](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/configuration.md#removed-comparison-switches)를
+따르세요. 삭제된 중첩 `htp` / `moe` 키는 로드 시 거부됩니다. 호환되는 팩 설정의
+복사본에서 나열된 키를 제거하고, TL2 설정을 팔레트 프리셋으로 바꾸지 마세요.
+체크포인트에 같은 회전이 필요하다면 삭제된 `moe.hadamard=both_scalar` 값은
+`both`로 변경합니다.
 
 **호스트 PC**에서 제공받은 팩의 디렉터리를 설정하고 주요 파일을 확인합니다.
 
@@ -510,7 +519,10 @@ exit
 이 프리셋에서는 비어 있는 thought 채널로 바로 답변하도록 요청합니다.
 다른 팩이라면 제공자가 지정한 템플릿을 사용하세요. 생성 길이는 CLI 옵션이 아닌
 `nntr_config.json`의 `num_to_generate`에서 읽습니다. 팔레트 채팅 프리셋은
-컨텍스트 1,280개 위치와 최대 127개 생성 토큰을 사용합니다.
+`init_seq_len=2048`, `max_seq_len=2304`, `num_to_generate=256`을 사용하며,
+프롬프트 최대 2,048토큰과 응답 예산 256토큰을 제공합니다. 제공받은 TL2 팩은 설정이
+다를 수 있습니다. 이 기본값은 과거 벤치마크에서 출력 길이를 고정한 CLI 설정과
+구분하세요.
 
 ### NPU 실행 확인
 
@@ -567,9 +579,12 @@ CLI/API 테스트 전에 앱의 모델을 언로드하세요.
 
 ## 8. Quick.AI 앱 빌드 및 설치
 
-아래 화면은 2026년 11월 4일 Galaxy S26 Ultra(SM-S948N / SM-S948U, Android 16,
-4 KB 페이지)에 설치된 **Quick.AI 2.0**에서 직접 캡처했습니다. 화면의 버튼 이름은
-앱에 표시되는 영어를 그대로 사용합니다. 이미지를 누르면 원본 크기로 볼 수 있습니다.
+사용법은 위 기준 소스의 업데이트된 앱을 따릅니다. 모델 선택과 대화 예시는
+2026년 11월 4일 Galaxy S26 Ultra(SM-S948N / SM-S948U, Android 16, 4 KB 페이지)의
+**Quick.AI 2.0**에서 직접 캡처했습니다. Metrics 이미지는 11월 5일 SM-S948U에서
+벤치마크 설정 화면으로 갱신했습니다. 설치된 APK의 소스 커밋은 확인하지 않았으므로,
+캡처는 조작 화면을 보여 주고 동작 설명은 기준 소스와 대조했습니다.
+버튼 이름은 앱의 영어 표기를 유지하며, 이미지를 누르면 원본 크기로 볼 수 있습니다.
 
 ### APK 빌드 및 설치
 
@@ -617,7 +632,7 @@ adb shell pm path com.example.quickdotaiapp
 ### 모델 로드 및 메시지 보내기
 
 아래 순서대로 **모델 선택 → 로드 완료 확인 → 메시지 전송**을 진행합니다.
-모델 선택 화면은 기본 경로를 사용합니다. 로드·대화·Metrics 캡처에서는 다른 기기에
+모델 선택 화면은 기본 경로를 사용합니다. 로드·대화 캡처에서는 다른 기기에
 준비되어 있던 TL2 팩을 사용했으며 상위 경로는
 `/sdcard/Download/aistudio-mobile/models_1022`입니다. 6단계대로 모델을 복사했다면
 아래 표의 기본 경로인 `/sdcard/Download/aistudio-mobile/models`를 사용하세요.
@@ -671,29 +686,66 @@ adb shell pm path com.example.quickdotaiapp
 이 리비전의 HTP 앱은 **가장 최근 사용자 메시지만** 전달합니다. 이전 말풍선은
 이 모델의 대화 기억으로 사용되지 않습니다. 처음에는 짧은 프롬프트를 사용하세요.
 설정된 컨텍스트를 초과하는 프롬프트는 오류 없이 잘릴 수 있습니다. 팔레트 채팅
-프리셋은 1,280개 위치를 사용하지만 제공받은 TL2 팩은 제한이 다를 수 있습니다.
-컨텍스트를 늘리면 RAM 사용량이 크게 증가할 수 있습니다. 이 Gemma4 HTP 팩은
+프리셋은 컨텍스트 2,304개 위치, 프롬프트 최대 2,048토큰, 응답 예산 256토큰을
+사용하지만 제공받은 TL2 팩은 제한이 다를 수 있습니다. 앱을 업데이트해도 이전에
+복사한 팩의 설정은 자동으로 바뀌지 않습니다. 컨텍스트를 늘리면 RAM 사용량이
+크게 증가할 수 있습니다. 이 Gemma4 HTP 팩은
 텍스트 전용이며 앱에 다른 모델용 이미지 기능이 있어도 이 경로가 멀티모달로
 바뀌지는 않습니다.
 
 ### 4. Metrics 확인 및 모델 해제
 
-하단 **Metrics** 탭을 열면 마지막 실행 결과가 표시됩니다. 숫자는 캡처한 한 번의
-실행 예시이며, 팩·프롬프트·기기 상태에 따라 달라집니다.
+**Metrics** 탭에서 앱에 포함된 텍스트로 속도 벤치마크를 실행합니다. 모델을 로드하고
+아래 길이와 반복 횟수를 선택한 다음, 아래로 스크롤해 **Run**을 누릅니다.
+초기 선택값은 **1K / 128 / 3**이며 온도 대기는 꺼져 있습니다.
 
-![Metrics 탭의 첫 토큰 시간, 디코딩 시간, 생성과 프리필 속도, 최대 메모리 및 실행 기록](gemma4-moe-npu-guide/assets/screenshots/05-metrics.png "화면 4. 같은 응답의 Metrics 화면입니다. 아래로 스크롤하면 마지막 실행의 원시 출력도 펼쳐 볼 수 있습니다.")
+![업데이트된 Metrics 벤치마크의 프리필·디코드 토큰 선택, 반복 횟수, 온도 대기 설정](gemma4-moe-npu-guide/assets/screenshots/05-metrics.png "화면 4. 11월 5일 SM-S948U에서 캡처한 벤치마크 설정입니다. 이 캡처에서는 모델이 로드되지 않았습니다. 모델 로드 후 온도 대기 스위치 아래로 스크롤하면 Run이 있습니다.")
 
-| 항목 | 읽는 방법 |
+| 조작 항목 | 선택값과 동작 |
 | --- | --- |
-| **TIME TO FIRST TOKEN** | 질문을 보낸 뒤 앱이 첫 토큰을 받기까지의 시간입니다. |
-| **STEADY DECODE** | 두 번째부터 마지막 토큰까지, 토큰당 생성 시간의 중앙값입니다. 단위는 `ms/tok`입니다. |
-| **GENERATION / PREFILL** | 각각 출력 생성과 입력 처리의 속도, 토큰 수, 소요 시간을 보여 줍니다. |
-| **PEAK MEMORY** | 앱이 보고한 최대 메모리 사용량입니다. 가중치 파일의 저장 공간과는 다른 값입니다. |
-| **Recent runs / Raw output of the last run** | 최근 실행 기록과 마지막 응답의 원시 텍스트입니다. 원시 출력은 펼쳐서 확인합니다. |
+| **PREFILL TOKENS** | 포함된 텍스트의 명목상 길이: 128, 256, 512, 1K, 2K, 4K토큰. |
+| **DECODE TOKENS** | 32, 64, 128, 256토큰. 선택한 길이에 도달하면 앱이 응답을 중지합니다. |
+| **REPEATS** | 1, 3, 5회. |
+| **Wait for a cool phone** | 매 실행 전 최대 90초의 선택적 온도 대기. 기본값은 꺼짐입니다. |
+| **Run / Stop** | 로드된 모델이 대기 상태이고 길이가 팩 제한에 맞아야 Run이 활성화됩니다. Stop은 측정을 종료합니다. |
 
-최신 라이브러리는 `<turn|>` 같은 대화 종료 마커를 스트림에서 제거합니다. 채팅
-말풍선과 Metrics의 원시 출력에는 표시되지 않으며, 종료 토큰은 네이티브 토큰
-트레이스에서 확인합니다(Gemma4 ID `106`).
+벤치마크는 토큰당 약 4글자로 길이를 맞춘 자체 프롬프트를 사용하고 자세한 재서술을
+요청합니다. 실행별 표에는 실제 토큰 수가 표시됩니다. 매 반복마다 화면의 대화를
+지우고 프롬프트를 전송하므로 필요한 대화 내용은 먼저 저장하세요.
+
+네이티브 모델에서는 `max_seq_len - num_to_generate`를 프롬프트 예산,
+`num_to_generate`를 응답 예산으로 읽고 이를 넘는 선택값을 비활성화합니다.
+현재 팔레트 프리셋에서는 4K 프리필을 선택할 수 없습니다. 엔진의 프리필 제한으로
+실제 입력이 더 짧아질 수 있으므로 보고된 토큰 수를 확인하세요. 화면의 길이를
+선택한다고 팩의 컨텍스트 설정이 바뀌지는 않습니다.
+
+결과에는 **TIME TO FIRST TOKEN**(전송부터 앱의 첫 토큰 수신까지), 엔진 시간으로
+계산한 **PREFILL** 속도, 첫 토큰부터 마지막 토큰까지 실제 경과 시간으로 계산한
+**DECODE** 속도의 중앙값이 표시됩니다. 각 행에는 입력·출력 토큰 수와 시간이 나옵니다.
+일찍 끝난 응답, 건너뛴 실행, 디코드 구간이 1초보다 짧은 실행은 이유가 표시되며,
+조건에 맞는 실행이 중앙값에 포함됩니다. 로드 직후 첫 실행은 준비 시간이 포함될 수
+있고 자동으로 제외되지 않습니다.
+
+모든 파일 접근 권한이 있으면 CSV를
+`/sdcard/Download/QuickAI/power/bench.csv`에 이어 쓰고, 권한이 없으면 앱 전용
+외부 파일 디렉터리를 사용합니다. 화면의 **Saved to** 경로를 확인하세요.
+이전의 마지막 대화 지표, 최대 메모리 타일, 원시 출력 기록은 제거되었습니다.
+답변 아래의 개별 대화 통계는 유지됩니다. 채팅 스트림에서는 `<turn|>` 같은 종료
+마커를 제거하므로 Gemma4 종료 토큰 ID `106`은 네이티브 토큰 트레이스로 확인합니다.
+
+### 5. 전력 측정
+
+**Power** 탭은 배터리 게이지를 이용해 출력 토큰당 휴대전화 전체 에너지를 측정합니다.
+모델 로드 후 **PROMPT**, **WINDOW TOKENS**, **REPEATS**, **BASELINE**을 선택하고
+**Measure**를 누른 다음 안내에 따라 케이블을 분리합니다. 기기가 식기를 기다리고,
+대기 전력을 측정한 뒤 응답을 생성하고 냉각 대기를 거칩니다.
+전력을 측정할 때는 디버그용 **Measure while plugged**를 꺼 두세요.
+
+결과에는 대기 전력을 차감한 `mJ/token`, 전력 및 실행별 기록이 표시됩니다.
+모든 파일 접근 권한이 있으면 `runs.csv`와 세션 JSON을
+`/sdcard/Download/QuickAI/power/`에 저장합니다. Metrics는 USB가 연결된 상태로
+실행할 수 있으며 대기 전력 측정과 실행 간 냉각 대기가 없습니다.
+한쪽 측정이 끝난 뒤 다른 측정을 시작하세요.
 
 사용을 마치거나 CLI를 다시 실행하려면 상단 모델 선택 칩 → **Unload**를 누릅니다.
 다시 시작할 때는 **Load model**, 이미 로드한 모델을 새로 열 때는 **Reload model**을
@@ -705,7 +757,8 @@ adb shell pm path com.example.quickdotaiapp
 2026년 11월 4일 **최종 배포된 회전 TL2 팩**으로 새로 측정한 결과입니다.
 설치된 Quick.AI 앱과 네이티브 라이브러리가 같은 CLI 런타임을 사용했습니다.
 입력은 **1,024 / 2,048 / 4,096 / 8,192토큰**, 출력은 매 실행 **128토큰**입니다.
-이전 PR의 과거 측정표를 아래 실측 결과로 교체했습니다.
+당시 배포된 런타임의 측정 기록이며, 업데이트된 SDK/HexKL 설정이나 앱의 Metrics
+기능으로 다시 측정한 결과가 아닙니다.
 
 같은 입력·출력 길이, 기기와 런타임으로 별도 측정한 결과는
 [LFM2 벤치마크 부록](#appendix-a-lfm2-benchmark-results)에서 확인할 수 있습니다.
@@ -786,7 +839,7 @@ ZIP을 풀면 `gemma4_npu_final_pack_20261104/` 디렉터리가 생성됩니다.
 | Ubuntu에서 `adb` 권한 오류 | USB 규칙용 `android-sdk-platform-tools-common`을 설치하고 기기를 다시 연결합니다. 필요하면 배포판 안내에 따라 `plugdev` 그룹을 설정하세요. |
 | `more than one device/emulator` | 각 호스트 터미널에서 대상 기기의 시리얼을 `ANDROID_SERIAL`로 지정합니다. |
 | `--htp requires ...` | 현재 터미널에서 Hexagon SDK 환경을 불러오고 HexKL/Android 변수를 다시 내보냅니다. |
-| `libsdkl.so` 또는 `libhexkl_micro.a` 누락 | 압축 해제 루트와 `6.4.0.2`, `armv8_android26`, `hexagon_toolv19_v81` 하위 디렉터리를 확인합니다. ZIP이나 상위 디렉터리를 지정하지 마세요. |
+| `libsdkl.so` 또는 `libhexkl_micro.a` 누락 | 압축 해제 루트와 `6.4.0.1`, `armv8_android26`, `hexagon_toolv19_v81` 하위 디렉터리를 확인합니다. ZIP이나 상위 디렉터리를 지정하지 마세요. |
 | 빌드가 `HEX_ARCH`를 거부 | 이 Android 경로는 `v81`이 필요합니다. 다른 값을 설정한다고 다른 기기를 지원하게 되지는 않습니다. |
 | `cargo` 또는 Android 토크나이저 아카이브 누락 | Rust/Cargo가 `PATH`에 있고 `aarch64-linux-android` 타깃이 설치되었는지, `ANDROID_NDK`가 올바른지 확인한 뒤 다시 빌드합니다. |
 | Gradle이 SDK나 라이선스를 찾지 못함 | `ANDROID_HOME`, 플랫폼 36/build-tools/CMake 설치 상태, `sdkmanager --licenses`를 확인합니다. 오래된 `local.properties`가 다른 SDK를 가리킬 수 있습니다. |
@@ -877,27 +930,31 @@ python3 -m venv /tmp/nntr-guide-venv
 
 ### 검증 범위 및 참고 자료
 
-이 안내는 기준 PR의 스크립트, CLI 파서, 앱 설정, Quick.AI 문서 및 로컬에 있는
-HexKL beta2 압축 파일 구조와 대조했습니다. **문서 작성 과정에서 SDK 신규 설치와
-Android 빌드는 수행하지 않았습니다.** 앱 화면을 추가할 때는 기존에 설치된
-Quick.AI 2.0과 기기에 준비된 TL2 팩으로 모델 로드, 짧은 질문 1회, Metrics 표시 및
-언로드를 확인했습니다. 설치된 APK의 소스 커밋은 확인하지 않았으므로, 이 캡처는
-화면 사용법의 근거이며 가이드의 고정 커밋을 처음부터 빌드해 검증한 결과는 아닙니다.
-PR의 빌드 및 기기 검증 기록도 이 가이드 전체를 새로 실행한 결과와 구분합니다.
+11월 5일에 기준 PR의 빌드 스크립트, CLI 파서, 앱 조작 화면, 벤치마크 실행기와
+팩 제한 파서를 대조했습니다. 두 빌드 스크립트가 HexKL `6.4.0.1`을 선택하는 것을
+확인했고, SM-S948U에서 Metrics 화면을 직접 확인해 다시 캡처했습니다.
+**이번 문서 업데이트에서는 SDK 신규 설치, Android 빌드, 모델 벤치마크를 새로
+실행하지 않았습니다.** 11월 4일 대화 예시는 당시 설치된 Quick.AI 2.0과 제공된
+TL2 팩을 사용했습니다. 설치된 APK의 소스 커밋은 확인하지 않았습니다.
+캡처와 PR의 기존 빌드·기기 검증 기록은 이 가이드 전체를 새로 실행한 결과가 아닙니다.
 
-벤치마크는 SM-S948U에 배포된 TL2 팩으로 별도 측정했습니다. 입력 1K·2K·4K·8K마다
+11월 4일 벤치마크는 SM-S948U에 배포된 TL2 팩으로 별도 측정했습니다. 입력 1K·2K·4K·8K마다
 CLI를 3회씩 실행하고 모든 출력이 128토큰인지 확인했습니다. 런타임 라이브러리는
 설치된 앱과 SHA-256이 같은지 검증했으며, 원본 로그·토큰 트레이스·설정·바이너리 해시를
 결과와 함께 제공합니다.
+이 기록은 변경하지 않았으며 업데이트된 SDK/HexKL 설정이나 현재 앱의 Metrics
+동작으로 다시 측정한 결과가 아닙니다.
 
 차이가 발견되면 다음 고정 리비전의 소스를 참고하세요.
 
-- [Android 빌드 스크립트](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/build_android.sh): 지원 옵션, 필수 조건, 산출물, 배포.
-- [DSP 빌드 스크립트](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/nntrainer/tensor/htp_backend/dsp/build.sh): HexKL 선택과 DSP 검사.
-- [CLI 구현](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/main.cpp): 위치 인자와 프롬프트 처리.
-- [Quick.AI 빌드 문서](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/build.md): 기록된 환경과 빌드 절차.
-- [CLI 및 C API 테스트 문서](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/cli.md): 실행 명령과 수명 주기 테스트.
-- [앱 사용법](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/app.md) 및 [알려진 제약](https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/troubleshooting.md): 조작 방법, 권한, 오류 유형.
+- [Android 빌드 스크립트](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/build_android.sh): 지원 옵션, 필수 조건, 산출물, 배포.
+- [DSP 빌드 스크립트](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/nntrainer/tensor/htp_backend/dsp/build.sh): HexKL 선택과 DSP 검사.
+- [CLI 구현](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/main.cpp): 위치 인자와 프롬프트 처리.
+- [Quick.AI 빌드 문서](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/build.md): 기록된 환경과 빌드 절차.
+- [CLI 및 C API 테스트 문서](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/cli.md): 실행 명령과 수명 주기 테스트.
+- [앱 사용법](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/app.md) 및 [알려진 제약](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/troubleshooting.md): 조작 방법, 권한, 오류 유형.
+- [Metrics 화면](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/ui/MetricsScreen.kt) 및 [프롬프트·팩 제한](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerPrompts.kt): 길이 선택, 결과, 비활성화 조건.
+- [측정 실행기](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerRunner.kt) 및 [결과 저장](https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerFiles.kt): 온도 대기, 대화 초기화, CSV 경로.
 
 ## 부록 A. LFM2 벤치마크 결과
 

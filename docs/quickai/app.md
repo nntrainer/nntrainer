@@ -93,24 +93,32 @@ The Metrics screen is a speed benchmark for the loaded model. Pick a prompt
 length (128 to 4K tokens), an answer length (32 to 256 tokens) and the number
 of repeats, then **Run**. The app sends a bundled English text cut to the
 chosen length, asks for a long answer and stops it after the chosen number
-of tokens; nothing typed in Chat is used.
+of tokens. The initial choices are 1K / 128 / 3. Each repeat clears the visible
+chat before sending the benchmark prompt; save any conversation text you need
+first. The benchmark uses its own text rather than the Chat composer.
 
 - **Lengths are nominal**: four characters per token. Each run shows the
   prompt and answer tokens the engine counted (the 1K prompt is about 830
   Gemma4 tokens). A run whose answer ended before the chosen length is
-  marked.
+  marked. Decode windows shorter than one second have no speed and are excluded
+  from the displayed medians, as are skipped runs.
 - **Results**: the median time to first token (send to the first token in
   the app), the engine's prefill speed and the decode speed (first token to
   the last, wall clock), plus one row per run. Every run is appended to
   `Download/QuickAI/power/bench.csv`.
+  Without all-files access, the app uses its own external-files directory;
+  check the displayed **Saved to** path.
 - **Limits of the pack**: for native models the app reads the pack's
   `nntr_config.json` and disables the lengths that do not fit
   (`max_seq_len - num_to_generate` for the prompt, `num_to_generate` for the
-  answer).
+  answer). The engine's prefill limit can further shorten the actual prompt;
+  the run's token count shows what was processed.
 - **Wait for a cool phone** (off by default) waits up to 90 s before each run
   for the thermal status to return to normal.
-- The first run after a load is slower to its first token (the HTP graph
-  warms up); the median absorbs it.
+- The first run after a load can be slower to its first token (the HTP graph
+  warms up); it is not automatically excluded from the median.
+- Metrics can run with USB attached. It has no power baseline or cool-down.
+  Finish a Metrics session before starting a Power measurement, or vice versa.
 
 ## Power
 

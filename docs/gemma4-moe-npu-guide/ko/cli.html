@@ -9,7 +9,7 @@
 <link rel="alternate" hreflang="ko" href="cli.html">
 <script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
 <link rel="stylesheet" href="../assets/site.css">
-<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 4일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
 <script src="assets/search-index.js" defer></script>
 <script src="../assets/site.js" defer></script>
 </head>
@@ -24,7 +24,7 @@
 <div class="sidebar-backdrop" hidden></div>
 <aside class="sidebar" id="sidebar">
 <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
-<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
 <div class="language-switch" role="group" aria-label="언어"><a href="cli.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../cli.html" lang="en" hreflang="en" data-language="en">English</a></div>
 <button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
 <nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html" aria-current="page">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
@@ -71,7 +71,10 @@ exit
 <p>이 프리셋에서는 비어 있는 thought 채널로 바로 답변하도록 요청합니다.
 다른 팩이라면 제공자가 지정한 템플릿을 사용하세요. 생성 길이는 CLI 옵션이 아닌
 <code>nntr_config.json</code>의 <code>num_to_generate</code>에서 읽습니다. 팔레트 채팅 프리셋은
-컨텍스트 1,280개 위치와 최대 127개 생성 토큰을 사용합니다.</p>
+<code>init_seq_len=2048</code>, <code>max_seq_len=2304</code>, <code>num_to_generate=256</code>을 사용하며,
+프롬프트 최대 2,048토큰과 응답 예산 256토큰을 제공합니다. 제공받은 TL2 팩은 설정이
+다를 수 있습니다. 이 기본값은 과거 벤치마크에서 출력 길이를 고정한 CLI 설정과
+구분하세요.</p>
 <h2 id="check-npu-execution">NPU 실행 확인</h2>
 <p>답변이 생성되었다는 사실만으로 <strong>NPU가 실행되었다고 볼 수는 없습니다.</strong>
 이 리비전은 DSP 열기에 실패하면 경고를 남기고 CLI가 CPU로 전환될 수 있습니다.
@@ -111,7 +114,7 @@ CPU를 사용합니다.</p>
 CLI/API 테스트 전에 앱의 모델을 언로드하세요.</p>
 </article>
 <nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="model-pack.html"><small>이전</small><span>모델 팩 준비</span></a><a class="pager-next" href="app.html"><small>다음</small><span>Quick.AI 앱</span></a></nav>
-<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 4일</footer>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
 </main>
 <aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#first-run-with-the-packs-default-prompt">팩의 기본 프롬프트로 첫 실행</a></li><li><a href="#give-the-cli-a-short-prompt">CLI에 짧은 프롬프트 전달</a></li><li><a href="#check-npu-execution">NPU 실행 확인</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
 </div>

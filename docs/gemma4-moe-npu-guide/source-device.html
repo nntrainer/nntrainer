@@ -9,7 +9,7 @@
 <link rel="alternate" hreflang="ko" href="ko/source-device.html">
 <script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
 <link rel="stylesheet" href="assets/site.css">
-<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 4, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 5, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
 <script src="assets/search-index.js" defer></script>
 <script src="assets/site.js" defer></script>
 </head>
@@ -24,7 +24,7 @@
 <div class="sidebar-backdrop" hidden></div>
 <aside class="sidebar" id="sidebar">
 <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
-<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
 <div class="language-switch" role="group" aria-label="Language"><a href="ko/source-device.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="source-device.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
 <button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
 <nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li class="nav-parent-active"><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html" aria-current="page">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
@@ -41,7 +41,7 @@ cd &quot;$HOME/workspace&quot;
 git clone https://github.com/nntrainer/nntrainer.git nntrainer-gemma4-pr4480
 cd nntrainer-gemma4-pr4480
 git fetch origin pull/4480/head
-git switch --detach fa078c94d1d73609c5584e948931384d69f9364c
+git switch --detach 67d2903a279a3f5604074f001bbf8f814dfb9f82
 git submodule sync --recursive
 git submodule update --init --recursive --depth 1
 export NNTR_ROOT=&quot;$PWD&quot;
@@ -78,7 +78,7 @@ properties alone do not prove NPU execution. No <code>adb root</code> step is re
 this workflow.</p>
 </article>
 <nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="hexagon-hexkl.html"><small>Previous</small><span>Hexagon SDK &amp; HexKL</span></a><a class="pager-next" href="build-install.html"><small>Next</small><span>Build &amp; install</span></a></nav>
-<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 4, 2026</footer>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 5, 2026</footer>
 </main>
 <aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#use-a-separate-checkout">Use a separate checkout</a></li><li><a href="#authorize-adb">Authorize ADB</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
 </div>

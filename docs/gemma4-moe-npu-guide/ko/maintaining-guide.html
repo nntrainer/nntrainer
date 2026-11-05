@@ -9,7 +9,7 @@
 <link rel="alternate" hreflang="ko" href="maintaining-guide.html">
 <script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
 <link rel="stylesheet" href="../assets/site.css">
-<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 4일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 5일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
 <script src="assets/search-index.js" defer></script>
 <script src="../assets/site.js" defer></script>
 </head>
@@ -24,7 +24,7 @@
 <div class="sidebar-backdrop" hidden></div>
 <aside class="sidebar" id="sidebar">
 <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
-<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="version">PR #4480 <span>·</span> 67d2903a</div>
 <div class="language-switch" role="group" aria-label="언어"><a href="maintaining-guide.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../maintaining-guide.html" lang="en" hreflang="en" data-language="en">English</a></div>
 <button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
 <nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html" aria-current="page">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
@@ -82,29 +82,33 @@ Markdown 원본, 단일 페이지 보기를 제공합니다. 다른 포트를 �
 명령 블록을 바꿀 때는 두 언어에 함께 반영하세요. 생성된 HTML과 각 언어의
 <code>assets/search-index.js</code>는 직접 수정하지 않습니다.</p>
 <h2 id="validation-boundaries-and-references">검증 범위 및 참고 자료</h2>
-<p>이 안내는 기준 PR의 스크립트, CLI 파서, 앱 설정, Quick.AI 문서 및 로컬에 있는
-HexKL beta2 압축 파일 구조와 대조했습니다. <strong>문서 작성 과정에서 SDK 신규 설치와
-Android 빌드는 수행하지 않았습니다.</strong> 앱 화면을 추가할 때는 기존에 설치된
-Quick.AI 2.0과 기기에 준비된 TL2 팩으로 모델 로드, 짧은 질문 1회, Metrics 표시 및
-언로드를 확인했습니다. 설치된 APK의 소스 커밋은 확인하지 않았으므로, 이 캡처는
-화면 사용법의 근거이며 가이드의 고정 커밋을 처음부터 빌드해 검증한 결과는 아닙니다.
-PR의 빌드 및 기기 검증 기록도 이 가이드 전체를 새로 실행한 결과와 구분합니다.</p>
-<p>벤치마크는 SM-S948U에 배포된 TL2 팩으로 별도 측정했습니다. 입력 1K·2K·4K·8K마다
+<p>11월 5일에 기준 PR의 빌드 스크립트, CLI 파서, 앱 조작 화면, 벤치마크 실행기와
+팩 제한 파서를 대조했습니다. 두 빌드 스크립트가 HexKL <code>6.4.0.1</code>을 선택하는 것을
+확인했고, SM-S948U에서 Metrics 화면을 직접 확인해 다시 캡처했습니다.
+<strong>이번 문서 업데이트에서는 SDK 신규 설치, Android 빌드, 모델 벤치마크를 새로
+실행하지 않았습니다.</strong> 11월 4일 대화 예시는 당시 설치된 Quick.AI 2.0과 제공된
+TL2 팩을 사용했습니다. 설치된 APK의 소스 커밋은 확인하지 않았습니다.
+캡처와 PR의 기존 빌드·기기 검증 기록은 이 가이드 전체를 새로 실행한 결과가 아닙니다.</p>
+<p>11월 4일 벤치마크는 SM-S948U에 배포된 TL2 팩으로 별도 측정했습니다. 입력 1K·2K·4K·8K마다
 CLI를 3회씩 실행하고 모든 출력이 128토큰인지 확인했습니다. 런타임 라이브러리는
 설치된 앱과 SHA-256이 같은지 검증했으며, 원본 로그·토큰 트레이스·설정·바이너리 해시를
-결과와 함께 제공합니다.</p>
+결과와 함께 제공합니다.
+이 기록은 변경하지 않았으며 업데이트된 SDK/HexKL 설정이나 현재 앱의 Metrics
+동작으로 다시 측정한 결과가 아닙니다.</p>
 <p>차이가 발견되면 다음 고정 리비전의 소스를 참고하세요.</p>
 <ul>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/build_android.sh">Android 빌드 스크립트</a>: 지원 옵션, 필수 조건, 산출물, 배포.</li>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/nntrainer/tensor/htp_backend/dsp/build.sh">DSP 빌드 스크립트</a>: HexKL 선택과 DSP 검사.</li>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/main.cpp">CLI 구현</a>: 위치 인자와 프롬프트 처리.</li>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/build.md">Quick.AI 빌드 문서</a>: 기록된 환경과 빌드 절차.</li>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/cli.md">CLI 및 C API 테스트 문서</a>: 실행 명령과 수명 주기 테스트.</li>
-<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/app.md">앱 사용법</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/troubleshooting.md">알려진 제약</a>: 조작 방법, 권한, 오류 유형.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/build_android.sh">Android 빌드 스크립트</a>: 지원 옵션, 필수 조건, 산출물, 배포.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/nntrainer/tensor/htp_backend/dsp/build.sh">DSP 빌드 스크립트</a>: HexKL 선택과 DSP 검사.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/main.cpp">CLI 구현</a>: 위치 인자와 프롬프트 처리.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/build.md">Quick.AI 빌드 문서</a>: 기록된 환경과 빌드 절차.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/cli.md">CLI 및 C API 테스트 문서</a>: 실행 명령과 수명 주기 테스트.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/app.md">앱 사용법</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/docs/quickai/troubleshooting.md">알려진 제약</a>: 조작 방법, 권한, 오류 유형.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/ui/MetricsScreen.kt">Metrics 화면</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerPrompts.kt">프롬프트·팩 제한</a>: 길이 선택, 결과, 비활성화 조건.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerRunner.kt">측정 실행기</a> 및 <a href="https://github.com/nntrainer/nntrainer/blob/67d2903a279a3f5604074f001bbf8f814dfb9f82/Applications/CausalLM/Android/QuickDotAIAPP/src/main/java/com/example/quickdotaiapp/power/PowerFiles.kt">결과 저장</a>: 온도 대기, 대화 초기화, CSV 경로.</li>
 </ul>
 </article>
 <nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="troubleshooting.html"><small>이전</small><span>문제 해결</span></a><a class="pager-next" href="lfm2-benchmarks.html"><small>다음</small><span>LFM2 벤치마크 결과</span></a></nav>
-<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 4일</footer>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 5일</footer>
 </main>
 <aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#validation-boundaries-and-references">검증 범위 및 참고 자료</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
 </div>
