@@ -170,7 +170,7 @@ static inline const char *htp_moe_opts_feed_name(uint32_t flags) {
  * @return the residue
  *
  * On the GEMV path the swiglu slot is the sum of every worker lane's wall
- * time inside the two GEMV stages (hexkl_mm_u8i4_moe.c moe_tail_probe_add),
+ * time inside the two GEMV stages (hexkl_mm_u8i4_moe.c moe_worker_probe_add),
  * not a stage on the caller's clock, so it is left out of the subtraction;
  * swiglu / mm then reads as the number of lanes busy over mm (#102).
  */

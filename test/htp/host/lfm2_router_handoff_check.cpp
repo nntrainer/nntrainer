@@ -202,25 +202,15 @@ enum {
 #define HEXKL_MOE_PACK_UNIT_ROWS 16u
 #define MOE_U8_GUARD 128u
 #define MOE_MAX_CHUNKS 16u
-#define MOE_TAIL_MAX_ROWS 0u
-#define MOE_TAIL_TILE_BYTES 0u
 #define MOE_M1_MAX_ROWS 4u
 #define MOE_M1_MAX_EXPERTS 16u
 #define MOE_M1_TILE_BYTES 512u
 #define HEXKL_DMA_SITE_COPY_IN 1u
-// Background job/context stand-ins reserve 64/256 bytes here (v81: 32/64).
+// The background job stand-in reserves 64 bytes here (v81: 32).
 // The extracted carve code tests ordering and input byte parity with those
 // same sizes on both paths; exact DSP capacity uses a separate v81 ABI check.
 struct hvx_bg_job {
   uint8_t bytes[64];
-};
-struct moe_tail_ctx {
-  uint8_t bytes[256];
-};
-struct moe_tail_shared {
-  int32_t *acc_gu, *acc_dn, *rq_zp;
-  float *gate_f32, *rq_scale;
-  uint8_t *mid_ah;
 };
 #include "scratch.inc"
 static void *fixture_malloc(size_t n) {

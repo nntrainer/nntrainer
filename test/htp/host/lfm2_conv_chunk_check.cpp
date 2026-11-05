@@ -491,15 +491,6 @@ static void guards() {
     check(f.ops.calls == 0, "rejected case started backend work");
     ++cases;
   }
-  f.ops.supported = true;
-  for (auto bounds : std::vector<std::array<unsigned, 2>>{
-         {2048, 2048}, {2049, 2050}, {1920, 2049}, {2048, 0}}) {
-    check(!candidate::lfmConvPostGatePrefillRange(f.g.data(), f.weights.data(),
-                                                  f.truth.data(), f.out.data(),
-                                                  M, C, bounds[0], bounds[1]),
-          "range guard failed");
-    ++cases;
-  }
 }
 static void failure() {
   for (unsigned which = 1; which <= 2; ++which)
@@ -640,7 +631,7 @@ static void app_guards() {
     ++cases;
   }
 }
-static void unchanged_and_ranges() {
+static void unchanged_full_rows() {
   Fixture f;
   f.prepare(1, 0);
   for (unsigned rows : {16u, 17u, 31u, 64u, 1024u, 2048u}) {
@@ -658,18 +649,6 @@ static void unchanged_and_ranges() {
           "old default path output/canary differs");
     ++cases;
   }
-  std::fill(f.out.begin(), f.out.end(), -9876);
-  for (auto range : std::vector<std::array<unsigned, 2>>{
-         {0, 16}, {16, 2047}, {2047, 2048}}) {
-    check(candidate::lfmConvPostGatePrefillRange(
-            f.refg.data(), f.weights.data(),
-            f.truth.data() + size_t(range[0]) * N, f.out.data(), M, C, range[0],
-            range[1]),
-          "valid ranged helper declined");
-  }
-  check(std::memcmp(f.out.data(), f.refout.data(), f.out.size() * 4) == 0,
-        "range partition loses global history or gate offset");
-  ++cases;
 }
 
 static void fused_gate_stripes() {
@@ -922,7 +901,7 @@ int main(int argc, char **argv) {
     guards();
     failure();
     app_guards();
-    unchanged_and_ranges();
+    unchanged_full_rows();
     fused_gate_stripes();
     std::printf("CONV_CHUNK stripe=%u %u cases PASS\n", stripe, cases);
     return 0;

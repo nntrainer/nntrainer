@@ -138,7 +138,7 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
 # (M1 GEMV VTCM FEED SCHEDULE OK). Exercise the v81 four-column FC
 # kernel and aligned DMA blocks against the same references and fallbacks.
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
-  -DMOE_TAIL_MAX_ROWS=16u -DHVX_FC_M1_COLS=4 \
+  -DHVX_FC_M1_COLS=4 \
   -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
@@ -149,7 +149,7 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 
 "$OUT/moe_layer_host_check"
-"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_moe_host_check" \
   "$HERE/tl2_moe_host_check.c" "$HERE/standin/hvx_scalar.c" \
@@ -157,7 +157,7 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hvx/hvx_hadamard_f32.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_moe_host_check"
-"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -DMOE_TAIL_MAX_ROWS=16u \
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" -o "$OUT/tl2_prefill_host_check" \
   "$HERE/tl2_prefill_host_check.c" "$HERE/standin/hvx_scalar.c" \
@@ -167,7 +167,7 @@ python3 "$HERE/tl2_model_conversion_check.py" "$OUT/convert_tl2_model"
   "$BACKEND/hvx/hvx_expand_i2i4.c" "$BACKEND/htp_tl2_codec.c" "$BACKEND/hvx/hvx_gemv_u8tl2.c" -lm
 "$OUT/tl2_prefill_host_check"
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
-  -ffunction-sections -fdata-sections -DMOE_TAIL_MAX_ROWS=16u \
+  -ffunction-sections -fdata-sections \
   -DHVX_FC_M1_COLS=4 \
   -DNNTR_FC_M1_ALIGN_BLOCKS=1 \
   -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$DSP" -I "$BACKEND/.." \

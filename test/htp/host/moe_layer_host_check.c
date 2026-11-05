@@ -547,10 +547,9 @@ uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
   (void)pool;
   return g_workers;
 }
-/** The background lane, likewise: every unit runs at submit, in order, and
-   the waits find them done. What this checks is that the kernel waits for
-   the right block before it queues it -- a wait for too few units cannot
-   show here, and a wait for too many only as a hang on device. */
+/** The background lane runs packing, expansion and down-epilogue units
+   synchronously. This exercises their data flow; device checks verify
+   asynchronous scheduling and waits. */
 void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
   (void)pool;
   for (uint32_t u = 0; u < job->n_units; ++u) {
@@ -1548,10 +1547,9 @@ int main(void) {
   for (uint32_t i = 0; i < M * K; ++i)
     act[i] = rndf();
 
-  /** Routing: expert 0 gets many rows (multi-block, a 6-row tail for the
-     HVX path), expert 2 gets none, expert 3 a tail of exactly the
-     threshold, expert 4 a second block too big for it (stays on the HMX);
-     rows repeat across experts the way top-k does. */
+  /** Routing covers multi-block experts, an empty expert and partial HMX
+     blocks with 6, 12, 16 and 26 rows. Rows repeat across experts the way
+     top-k does. */
   uint32_t rc_[8] = {70, 12, 0, 64 + HVX_GEMM_U8I4_MAX_ROWS,
                      64 + HVX_GEMM_U8I4_MAX_ROWS + 10};
   uint32_t n_rows = 0;
@@ -1654,13 +1652,10 @@ int main(void) {
            (unsigned long long)got_kb, active, (unsigned long long)want);
     if (got_kb != want)
       fail = 1;
-    /** HMX blocks only: 70 -> 1 + a 6-row tail on the HVX, 12 -> 1,
-       80 -> 1 + a 16-row tail, 90 -> 2 (its 26-row second block is over
-       the tail threshold). 6 would mean a tail went to the HMX after all,
-       4 that a full block was skipped. */
-    printf("HMX blocks        : %llu (want 5: two tails on the HVX)\n",
+    /** Full and partial HMX blocks: 70 -> 2, 12 -> 1, 80 -> 2, 90 -> 2. */
+    printf("HMX blocks        : %llu (want 7: full and partial blocks)\n",
            (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS]);
-    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 5u)
+    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 7u)
       fail = 1;
   }
 
@@ -1680,7 +1675,7 @@ int main(void) {
            (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_KB],
            (unsigned long long)kb_off,
            (unsigned long long)hexkl_probe_us[HEXKL_PROBE_PATH], same != 0);
-    fail |= (r != 0) || hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 5u ||
+    fail |= (r != 0) || hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 7u ||
             hexkl_probe_us[HEXKL_PROBE_DMA_KB] != kb_off ||
             hexkl_probe_us[HEXKL_PROBE_PATH] != 0u || same != 0;
     free(got_on);
@@ -1788,7 +1783,7 @@ int main(void) {
   }
 
   /** [plan 201 S4] HEXKL_MOE_FLAG_GELU_TANH on every path of the call. M=97
-     (HMX blocks plus two HVX tails) against the reference run with
+     (full and partial HMX blocks) against the reference run with
      geglu_det_one, and unlike the SwiGLU output above; then one token
      routed to four experts on the HMX loop, the M=1 GEMV with the VTCM
      feed and the GEMV on the arena read: the reference again, and the
@@ -1834,14 +1829,14 @@ int main(void) {
     printf("geglu M=97 bad=%u worst_rel=%g differs_from_swiglu=%d; M=1 "
            "hmx/gemv-vtcm/gemv-arena bad=%u same_path_bytes=%d rc=%d\n",
            bad37, w37, differs, bad1, ok1, r);
-    printf(ok ? "MOE GEGLU FLAG OK (HMX, tail, M=1 GEMV feed+arena)\n"
+    printf(ok ? "MOE GEGLU FLAG OK (HMX, M=1 GEMV feed+arena)\n"
               : "MOE GEGLU FLAG WRONG\n");
     fail |= !ok;
     free(gg);
     free(want_g);
   }
 
-  /** Rotation placement, routing reuse, padding, HMX, tails and GEMV.
+  /** Rotation placement, routing reuse, padding, full/partial HMX and GEMV.
    * The reference rotates each expert row independently, intentionally
    * unlike the shared pre-gather implementation. */
   /** Prefetch/DMA scheduling is tested above. Disable its diagnostic hook
@@ -1874,8 +1869,8 @@ int main(void) {
       double worst_h = 0;
       uint32_t bad = count_mismatches(rot_got, rot_want, M * N_out, &worst_h);
       fail |= r != 0 || bad != 0;
-      printf("HADAMARD HMX+TAIL norm=%u mask=%u rc=%d bad=%u worst=%g\n", norm,
-             mask, r, bad, worst_h);
+      printf("HADAMARD HMX norm=%u mask=%u rc=%d bad=%u worst=%g\n", norm, mask,
+             r, bad, worst_h);
       const uint32_t rc1[5] = {1, 1, 0, 1, 1};
       const uint32_t ridx1[4] = {0, 0, 0, 0};
       const float rw1[4] = {.4f, .3f, .2f, .1f};

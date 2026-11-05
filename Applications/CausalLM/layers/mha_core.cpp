@@ -4531,43 +4531,6 @@ static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
 #include <immintrin.h>
 #endif
 
-// Bulk convert N FP16-bits (uint16_t) values to FP32. Uses AVX2+F16C on x86
-// (_mm256_cvtph_ps, available on Ivy Bridge+) and NEON fp16<->fp32 instructions
-// on ARMv8.2+. Falls back to scalar nntrainer::compute_fp16_to_fp32. Treats the
-// uint16 input as raw IEEE 754 half-precision bits — this is how the KV cache
-// is stored regardless of ENABLE_FP16 build flag.
-static inline void
-mha_convert_fp16bits_to_fp32(unsigned int N, const uint16_t *src, float *dst) {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-  defined(_M_IX86)
-  unsigned int i = 0;
-  for (; i + 16 <= N; i += 16) {
-    __m256 a = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i)));
-    __m256 b = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i + 8)));
-    _mm256_storeu_ps(dst + i, a);
-    _mm256_storeu_ps(dst + i + 8, b);
-  }
-  for (; i + 8 <= N; i += 8) {
-    _mm256_storeu_ps(
-      dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i))));
-  }
-  for (; i < N; ++i)
-    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
-#elif defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
-  unsigned int i = 0;
-  for (; i + 8 <= N; i += 8) {
-    float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src + i));
-    vst1q_f32(dst + i, vcvt_f32_f16(vget_low_f16(h)));
-    vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
-  }
-  for (; i < N; ++i)
-    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
-#else
-  for (unsigned int i = 0; i < N; ++i)
-    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
-#endif
-}
-
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86)
 

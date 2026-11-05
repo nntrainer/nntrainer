@@ -247,55 +247,6 @@ static bool lfmConvFusedGatePrefill(const float *projection,
 #endif
 }
 
-#if defined(__aarch64__)
-// Chunk-local projection rows use the global gated history. The full helper
-// above stays separate so existing prompts keep their original row callback.
-static bool lfmConvPostGatePrefillRange(const float *gated,
-                                        const float *weights,
-                                        const float *projection, float *output,
-                                        unsigned int rows,
-                                        unsigned int channels,
-                                        unsigned int first, unsigned int last) {
-  if (last == 0)
-    last = rows;
-  if (rows < 16 || channels != 2048 || first >= last || last > rows)
-    return false;
-  const size_t bytes = static_cast<size_t>(rows) * channels * sizeof(float);
-  const uintptr_t dst = reinterpret_cast<uintptr_t>(output);
-  const auto overlaps = [&](const float *input, size_t size) {
-    const uintptr_t src = reinterpret_cast<uintptr_t>(input);
-    return dst <= src ? src - dst < bytes : dst - src < size;
-  };
-  if (!gated || !weights || !projection || !output || overlaps(gated, bytes) ||
-      overlaps(projection, static_cast<size_t>(last - first) * 3u * channels *
-                             sizeof(float)) ||
-      overlaps(weights, 3u * channels * sizeof(float)))
-    return false;
-  nntrainer::ThreadManager::Global().parallel_for(
-    static_cast<size_t>(first), static_cast<size_t>(last), [&](size_t r) {
-#if defined(__clang__)
-#pragma clang fp exceptions(strict)
-#endif
-      const float *cur = gated + r * channels;
-      const float *prev1 = r >= 1 ? cur - channels : nullptr;
-      const float *prev2 = r >= 2 ? cur - 2u * channels : nullptr;
-      const float *gate = projection + (r - first) * 3u * channels + channels;
-      float *dst_row = output + r * channels;
-      const float32x4_t zero = vdupq_n_f32(0.0f);
-      for (unsigned int c = 0; c < channels; c += 4) {
-        float32x4_t v = vmulq_f32(vld1q_f32(cur + c), vld1q_f32(weights + c));
-        v = vfmaq_f32(v, prev1 ? vld1q_f32(prev1 + c) : zero,
-                      vld1q_f32(weights + channels + c));
-        v = vfmaq_f32(v, prev2 ? vld1q_f32(prev2 + c) : zero,
-                      vld1q_f32(weights + 2u * channels + c));
-        vst1q_f32(dst_row + c, vmulq_f32(v, vld1q_f32(gate + c)));
-      }
-    });
-  return true;
-}
-
-#endif
-
 #if defined(__clang__)
 #pragma float_control(pop)
 #elif defined(__GNUC__)
