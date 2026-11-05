@@ -659,21 +659,6 @@ void hvx_rope_row_f32(float *x, uint32_t n, uint32_t hd, const float *cs) {
       *b = as + bc;
     }
 }
-void hvx_dequant_acc_tiles_to_f32(
-  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
-  uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
-  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, float *dst_a, float *dst_b, uint32_t split,
-  uint32_t dst_stride, hvx_worker_pool *pool) {
-  (void)pool;
-  if (!tiles_base || n_tiles == 0u || m_count == 0u)
-    return;
-  hvx_dq_tiles_job jb = {tiles_base, tile_stride, nt0,    row_stride,
-                         m_count,    act_scale,   act_zp, colsum_w,
-                         w_scale,    bias,        dst_a,  dst_b,
-                         split,      dst_stride,  n_tiles};
-  hvx_dq_tiles_worker(1u, 0u, &jb);
-}
 /** Fused gate/up dequant + SwiGLU: staged slot j is gate column g0 + j and
    slot n_pairs + j the up column opposite it. The SwiGLU itself is
    swiglu_det.h, which the HVX kernel matches bit for bit (rule 24); with

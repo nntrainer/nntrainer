@@ -30,8 +30,8 @@
  * blocks in dspqueue_read with a 100 ms timeout that re-checks the stop
  * flag. spin_us = 0 always blocks.
  *
- * The dspqueue_* symbols are weak (nntr_hvx_dspq_bench.c's five): a DSP
- * image without dspqueue still loads the skel and start returns
+ * The five dspqueue_* symbols are weak: a DSP image without dspqueue
+ * still loads the skel and start returns
  * AEE_EUNSUPPORTED, which the ARM side turns into its "dspq: off" line.
  *
  * Address space: a 64 KiB thread stack of DSP heap while a queue is open

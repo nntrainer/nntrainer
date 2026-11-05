@@ -269,14 +269,6 @@ int hexkl_kv_q_set_fixed_scales_kd(hexkl_kv_q_table *tbl, uint32_t handle,
                                    const float *s_k, const float *s_v);
 
 /**
- * @brief The int8 WH tile permutation the DSP derived from rm_to_wh_i8:
- *        element (r, k) of a 32x32 row-major tile lands at byte pos[r*32+k].
- *        DSP only (probes it on first use, clobbering 1 KiB at @a vtcm);
- *        NULL when the part's layout is not usable.
- */
-const uint16_t *hexkl_kv_q_wh_i8_pos(uint8_t *vtcm_base);
-
-/**
  * @brief Allocates a zeroed cache for up to @a max_rows rows.
  *
  * @param max_rows  rounded up to a multiple of 32

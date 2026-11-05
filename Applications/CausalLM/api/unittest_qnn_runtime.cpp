@@ -4,7 +4,6 @@
  */
 #include "../qnn/generate_qnn_utils.h"
 #include "../qnn/qnn_kv_cache_manager.h"
-#include "../qnn/qnn_row_readahead.h"
 #include "../qnn/quick_dot_ai_qnn.h"
 #include <gtest/gtest.h>
 #include <thread_manager.h>
@@ -91,20 +90,4 @@ TEST(QnnRuntime, PartialRopeLeavesNonRotaryLanesAtIdentity) {
   }
   deallocate(cosine);
   deallocate(sine);
-}
-
-TEST(QnnRuntime, ReadaheadDeduplicatesAndCapsWithoutBulkIo) {
-  int tokens[] = {2, -1, 2, 4, 8};
-  std::vector<char> mapping(8192);
-  auto stats = causallm::row_readahead_map(mapping.data(), mapping.size(),
-                                           tokens, 5, 32, 8, 0, "test");
-  EXPECT_EQ(stats.rows, 2u);
-  EXPECT_EQ(stats.bytes, 64u);
-  EXPECT_FALSE(stats.capped);
-  stats = causallm::row_readahead_map(mapping.data(), mapping.size(), tokens, 5,
-                                      causallm::row_readahead_cap_bytes(), 8, 0,
-                                      "test");
-  EXPECT_TRUE(stats.capped);
-  EXPECT_EQ(stats.bytes, 0u);
-  EXPECT_EQ(stats.pages, 0u);
 }

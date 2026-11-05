@@ -131,26 +131,16 @@ void hvx_expand_i2i4(const uint8_t *src, uint32_t src_bytes,
                      const uint8_t *table, uint8_t *dst);
 
 /**
- * @brief Same, split across the worker pool. NULL pool runs it inline.
- *
- * Split by whole 128-byte source vectors, so no worker ever writes a byte
- * another worker's shuffle also produces.
- */
-void hvx_expand_i2i4_pool(const uint8_t *src, uint32_t src_bytes,
-                          const uint8_t *table, uint8_t *dst,
-                          hvx_worker_pool *pool);
-
-/**
  * @brief Many in-place rows, ONE pool dispatch.
  *
  * Row r expands from @a base + r*stride + src_bytes into @a base +
  * r*stride -- the top-half placement the MoE kernel's DMA uses. Rows are
  * disjoint, so the split needs no synchronisation.
  *
- * This exists because the obvious loop -- call hvx_expand_i2i4_pool once a
- * row -- costs one worker wake-up per row. A gate_up chunk is 64 rows, and
- * at decode that turned a 21 MiB expansion into 1.26 ms a call, about
- * 17 GB/s against the 120 the op count predicts, and cost 42% of decode
+ * Dispatching the pool once per row costs one worker wake-up per row.
+ * A gate_up chunk is 64 rows, and at decode that turned a 21 MiB expansion
+ * into 1.26 ms a call, about 17 GB/s against the 120 the op count predicts,
+ * and cost 42% of decode
  * TPS (doc 54 5.10). One dispatch a chunk instead of sixty-four.
  */
 void hvx_expand_i2i4_rows(uint8_t *base, uint32_t stride, uint32_t src_bytes,

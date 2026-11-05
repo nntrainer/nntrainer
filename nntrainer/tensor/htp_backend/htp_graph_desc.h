@@ -94,37 +94,12 @@ enum {
   (HTP_GRAPH_KIND_BIT(HTP_OP_FC) | HTP_GRAPH_KIND_BIT(HTP_OP_DENSE_FFN) |      \
    HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD))
 
-/** @brief The kind's name, for log lines and NNTR_HTP_FORWARD_KINDS. */
+/** @brief The kind's name for log lines. */
 static inline const char *htp_graph_kind_name(uint32_t k) {
   static const char *const names[HTP_OP_KIND_N] = {
     "RMSNORM", "FC",          "CONV1D_GATE", "QK_NORM",   "ROPE",   "ATTN_M1",
     "ADD",     "ROUTER_TOPK", "MOE",         "DENSE_FFN", "LM_HEAD"};
   return k < HTP_OP_KIND_N ? names[k] : "?";
-}
-
-/** @brief Parses a comma-separated list of kind names ("MOE,RMSNORM")
- *  into a HTP_GRAPH_KIND_BIT mask. @return the mask, or 0 for an unknown
- *  or empty name (a caller with a default checks for NULL first). */
-static inline uint32_t htp_graph_kinds_parse(const char *s) {
-  uint32_t mask = 0;
-  while (s != NULL && *s != '\0') {
-    const char *e = s;
-    uint32_t k;
-    size_t n;
-    while (*e != '\0' && *e != ',')
-      ++e;
-    n = (size_t)(e - s);
-    for (k = 0; k < HTP_OP_KIND_N; ++k) {
-      const char *name = htp_graph_kind_name(k);
-      if (strlen(name) == n && strncmp(name, s, n) == 0)
-        break;
-    }
-    if (k == HTP_OP_KIND_N)
-      return 0u;
-    mask |= HTP_GRAPH_KIND_BIT(k);
-    s = (*e == ',') ? e + 1 : e;
-  }
-  return mask;
 }
 
 /** @brief Writes the mask as "MOE|RMSNORM|..." ("-" when empty) into

@@ -298,7 +298,7 @@ test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
   suite: 'unittests'
 )
 
-# The integer softmax of the row-blocked attention kernel (plan 23, R3):
+# The normalized u16 integer softmax of the row-blocked attention kernel:
 # the scalar definition against an exact softmax, through a model of the
 # convert unit's int16 output.
 unittest_hvx_softmax_q_exe = executable(

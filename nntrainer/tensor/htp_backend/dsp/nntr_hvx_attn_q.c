@@ -434,19 +434,6 @@ int nntr_hvx_attn_q2_prefill(remote_handle64 handle, uint32 kv_handle,
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_probe_hvx_rate(remote_handle64 handle, uint32 n, uint32 *stats,
-                            int statsLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || n == 0 || statsLen < 12) {
-    return AEE_EBADPARM;
-  }
-  uint32_t out[12];
-  hvx_softmax_q_rate(n, s->vtcm_base + OFF_SM_SCR, s->vtcm_base + OFF_SM_S,
-                     out);
-  memcpy(stats, out, sizeof(out));
-  return AEE_SUCCESS;
-}
-
 /** Both q2 entries: Q either u16 (q_u16) or f32 (q_f32 + q_inv, the pool
    converts), the lengths in elements. */
 static int attn_q2_step_impl(
@@ -881,64 +868,6 @@ int nntr_hvx_attn_q2_step_fqc(remote_handle64 handle, uint32 kv_handle,
     stats_us[2] = calib_us; /* the slot the DDR Q pass used to report */
   }
   return rc;
-}
-
-int nntr_hvx_probe_wh_i8_pos(remote_handle64 handle, uint16 *pos, int posLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || posLen != 1024) {
-    return AEE_EBADPARM;
-  }
-  const uint16_t *p = hexkl_kv_q_wh_i8_pos(s->vtcm_base);
-  if (!p) {
-    return AEE_EUNSUPPORTED;
-  }
-  memcpy(pos, p, 1024u * sizeof(uint16_t));
-  return AEE_SUCCESS;
-}
-
-int nntr_hvx_probe_softmax_q(remote_handle64 handle, uint32 n_col_tiles,
-                             uint32 col0, uint32 n_cols, uint32 row0,
-                             uint32 n_rows, uint32 window, uint32 rho_q15,
-                             uint32 frac_bits, const int16 *s_tiles,
-                             int s_tilesLen, const int16 *corr, int corrLen,
-                             uint8 *p_tiles, int p_tilesLen, int32 *rowsum,
-                             int rowsumLen, uint32 *stats, int statsLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || n_col_tiles == 0 || n_col_tiles > 128u || frac_bits == 0 ||
-      frac_bits > 8 || rho_q15 > 32767u) {
-    return AEE_EBADPARM;
-  }
-  if ((uint32_t)s_tilesLen != n_col_tiles * HVX_SOFTMAX_Q_TILE ||
-      (uint32_t)corrLen != (n_col_tiles + 1u) * 32u ||
-      (uint32_t)p_tilesLen != n_col_tiles * HVX_SOFTMAX_Q_TILE ||
-      (uint32_t)rowsumLen != HVX_SOFTMAX_Q_ROWSUM_WORDS || statsLen < 1) {
-    FARF(ERROR, "probe_softmax_q: bad lengths");
-    return AEE_EBADPARM;
-  }
-  uint8_t *vb = s->vtcm_base;
-  memcpy(vb + OFF_SM_S, s_tiles, (size_t)s_tilesLen * 2u);
-  memcpy(vb + OFF_SM_CORR, corr, (size_t)corrLen * 2u);
-  hvx_softmax_q_block b;
-  b.n_col_tiles = n_col_tiles;
-  b.col0 = col0;
-  b.n_cols = n_cols;
-  b.row0 = row0;
-  b.n_rows = n_rows;
-  b.window = window;
-  b.rho_q15 = (uint16_t)rho_q15;
-  b.frac_bits = (uint8_t)frac_bits;
-  const uint64_t c0 = HAP_perf_get_pcycles();
-  hvx_softmax_q(&b, (const int16_t *)(vb + OFF_SM_S),
-                (const int16_t *)(vb + OFF_SM_CORR), vb + OFF_SM_P,
-                (int32_t *)(vb + OFF_SM_RS), vb + OFF_SM_SCR);
-  const uint64_t c1 = HAP_perf_get_pcycles();
-  memcpy(p_tiles, vb + OFF_SM_P, (size_t)p_tilesLen);
-  memcpy(rowsum, vb + OFF_SM_RS, (size_t)rowsumLen * 4u);
-  stats[0] = (uint32)(c1 - c0);
-  for (int i = 1; i < statsLen && i < 5; ++i) {
-    stats[i] = 0;
-  }
-  return AEE_SUCCESS;
 }
 
 int nntr_hvx_probe_softmax_q16(remote_handle64 handle, uint32 n_col_tiles,

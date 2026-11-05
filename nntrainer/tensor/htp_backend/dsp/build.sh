@@ -154,7 +154,7 @@ if [ -n "$BAD" ]; then
 fi
 # [#141] dspqueue_* is optional in the DSP image. A non-weak import would stop
 # the whole skel from loading (0x80000406) where dspqueue is absent, taking
-# the production app down with the bench; weak, the bench's start returns
+# the production app down; weak, dspq_start returns
 # AEE_EUNSUPPORTED instead.
 STRONG_DSPQ=$("$READELF" --dyn-syms build/libnntr_hvx_skel.so |
     awk '$7=="UND" && $8 ~ /^dspqueue_/ && $5!="WEAK" {print $8}')

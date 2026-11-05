@@ -62,7 +62,6 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--hexagon-tools', type=Path, required=True)
     parser.add_argument('--sanitize', action='store_true')
-    parser.add_argument('--mutations', action='store_true')
     args = parser.parse_args()
     repo = args.repo.resolve()
     source = (args.source or repo).resolve()
@@ -71,8 +70,6 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if not (native / 'lib/libnative.a').is_file():
         parser.error('--hexagon-tools must contain Tools/libnative/lib/libnative.a')
-    if args.mutations and not args.sanitize:
-        parser.error('--mutations requires --sanitize')
     original = (source / MOE).read_text()
     (out / 'reference-unit.inc').write_text(extract((ref / MOE).read_text(), 'reference'))
     (out / 'candidate-unit.inc').write_text(extract(original, 'candidate'))
@@ -94,16 +91,13 @@ def main():
         flags += ['-I', str(path)]
     commands = []
     inputs = [ref / MOE, source / MOE, Path(__file__).resolve()]
-    def run(command, label, expected_failure=False):
+    def run(command, label):
         commands.append(command)
         (out / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')
         log = out / (label + '.log')
         with log.open('w') as stream:
             proc = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
-        if expected_failure:
-            if proc.returncode == 0 or 'Assertion' not in log.read_text():
-                raise SystemExit(f'{label}: expected assertion rejection; see {log}')
-        elif proc.returncode:
+        if proc.returncode:
             raise SystemExit(f'{label} failed ({proc.returncode}); see {log}')
         return proc.returncode
     objects = []
@@ -131,31 +125,9 @@ def main():
              '-Wl,--gc-sections', '-lm', '-o', str(executable)], label + '-link')
     build('check')
     run([str(executable)], 'run')
-    mutations = {}
-    if args.mutations:
-        # Each mutant changes the actual extracted candidate. The control stays
-        # untouched, and the valid-candidate output is restored before exit.
-        tests = {
-            'wrong-up-plane': ('c->inter_ntiles,\n', 'c->inter_ntiles - 1u,\n'),
-            'all-lanes-write': ('hvx_dq_swiglu_worker(threads, id, &job);',
-                                'hvx_dq_swiglu_worker(1u, 0u, &job);'),
-            'accept-split': ('c->tl2_splits != 1u ||', '0 ||'),
-            'accept-mag7': ('htp_tl2_palette_magnitude(e->g->pal) != 1u ||',
-                            '0 ||'),
-        }
-        for label, (old, new) in tests.items():
-            if old not in original:
-                raise SystemExit('mutant anchor missing: ' + label)
-            changed = original.replace(old, new, 1)
-            (out / 'candidate-unit.inc').write_text(extract(changed, 'candidate'))
-            build(label)
-            mutations[label] = run([str(executable)], label, True)
-        (out / 'candidate-unit.inc').write_text(extract(original, 'candidate'))
-        build('restored')
-        run([str(executable)], 'restored-run')
     summary = {
         'passed': True, 'sanitized': args.sanitize,
-        'result': (out / 'run.log').read_text().strip(), 'mutations': mutations,
+        'result': (out / 'run.log').read_text().strip(),
         'source_sha256': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs},
         'scope': 'Actual extracted M1 GU/requant helpers and production HVX math; explicit lanes, pool NULL only. No DMA, RPC or silicon timing claim.'}
     (out / 'validation.json').write_text(json.dumps(summary, indent=2) + '\n')

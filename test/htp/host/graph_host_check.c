@@ -63,9 +63,7 @@
    (MoE branch on the stand-in, dense GeGLU branch on the REAL GEMV, the
    branch sum, post norm, layer_scalar) against #4296's order; the
    262144-row head soft-capped; the soft-cap spec against f64 and its HVX
-   form and the dense GeGLU row bit for bit. run_host_checks.sh then
-   builds this file against mutants of hexkl_graph.c, each of which must
-   fail it. */
+   form and the dense GeGLU row bit for bit. */
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
@@ -511,17 +509,6 @@ static void check_validator(void) {
   printf("GRAPH VALIDATOR OK: LFM2.5-8B-A1B n_ops=%u moe=22 words=%u "
          "resident=%s\n",
          n_ops, n, htp_graph_kinds_str(resident_ok, names, sizeof(names)));
-  /* Graph-kind names and bit masks share one parser */
-  CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1") ==
-          ALL_KINDS,
-        "kinds parse (six)");
-  CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1,"
-                              "ADD,ROUTER_TOPK") == resident_ok,
-        "kinds parse (D)");
-  CHECK(htp_graph_kinds_parse("MOE") == HTP_GRAPH_KIND_BIT(HTP_OP_MOE) &&
-          htp_graph_kinds_parse("MOE,BOGUS") == 0u &&
-          htp_graph_kinds_parse("") == 0u,
-        "kinds parse (one, bad, empty)");
   /** the hd8 fixture with the attention kinds resident: the kernels'
      head_dim rule, end to end through the validator */
   {

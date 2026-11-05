@@ -9,7 +9,7 @@
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * The counterpart to unittest_hvx_attn.cpp's FusedForwardPerLayerCost, for the
+ * Per-layer cost checks for the
  * other half of the QNN comparison table: one fully connected layer, at
  * Qwen3-0.6B's q_proj shape (K = hidden_size 1024, N = heads 16 x head_dim
  * 128 = 2048), uint8 activation against int8 weight.

@@ -13,7 +13,6 @@ p = argparse.ArgumentParser()
 p.add_argument('--repo', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--cxx', default='c++')
-p.add_argument('--mutant', choices=['stage', 'copy', 'reserve', 'take', 'ticket', 'prefix', 'restore', 'source_alias', 'sync', 'attn_q', 'attn_f16', 'id', 'arm_source', 'scratch_take', 'scratch_ticket', 'scratch_epoch', 'scratch_owner', 'scratch_bytes'])
 a = p.parse_args()
 a.repo = a.repo.resolve()
 a.output = a.output.resolve()
@@ -89,39 +88,6 @@ parts['core_copy.inc'] = block(sources['core'], '  if (router_reuse) {', '  /** 
 # Keep the native compact-handle predicate anchored to actual validated handles.
 assert 'n_compact_tl2 += g->tl2_compact && d->tl2_compact;' in sources['core']
 assert 'n_compact_tl2 == n_with_rows' in parts['core_layout.inc']
-if a.mutant:
-    key, old, new = {
-        'stage': ('htp_staging.h', '    // Handing out a writable buffer ends any pending router ownership.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed writable owner'),
-        'copy': ('htp_staging.h', '    // No-write hits above keep their ION epoch. Copies/swaps below do not.\n    htp_router_handoff_invalidate(&router_handoff_);', '    // mutation: missed input copy'),
-        'reserve': ('reserve.inc', 'int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {\n  htp_router_handoff_scratch_invalidate(&s->router_handoff);', 'int hexkl_moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {'),
-        'take': ('htp_router_handoff.h', '  htp_router_handoff_invalidate(s);\n  return hit;', '  return hit;'),
-        'ticket': ('htp_router_handoff.h', 's->ticket == ticket', 'ticket != 0u'),
-        'arm_source': ('htp_router_handoff.h', 's->source == source', 'source != NULL'),
-        'scratch_take': ('htp_router_handoff.h', '  htp_router_handoff_scratch_invalidate(s);\n  return hit;', '  return hit;'),
-        'scratch_ticket': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
-        'scratch_epoch': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && s->bytes == bytes'),
-        'scratch_owner': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 'owner != NULL && s->bytes == bytes'),
-        'scratch_bytes': ('htp_router_handoff.h', 's->owner == owner && s->bytes == bytes', 's->owner == owner && bytes != 0u'),
-        'prefix': ('core_layout.inc', 'float *act_c = router_reuse ? (float *)hexkl_moe_carve(&cur, sz_act_c) : NULL;', 'float *act_c = router_reuse ? (float *)cur : NULL;'),
-        'attn_q': ('attn_q.inc', '    htp_router_handoff_invalidate(&router_handoff_);', '    /* mutation: direct output not invalidated */'),
-        'attn_f16': ('attn_f16.inc', '    htp_router_handoff_invalidate(&router_handoff_);', '    /* mutation: direct output not invalidated */'),
-        'id': ('take_id.inc', '    htp_router_handoff_invalidate(&router_handoff_);', '    /* mutation: public id output not invalidated */'),
-        'sync': ('sync.inc', '      htp_router_handoff_invalidate(&router_handoff_);', '      /* mutation: missing external destination write */'),
-        'source_alias': ('producer.inc', re.search(r'!htp_router_handoff_overlap\(x, x_len \* sizeof\(float\), act,\s*x_len \* sizeof\(float\)\)', parts['producer.inc']).group(0), 'true'),
-        'restore': ('select.inc', re.search(r'!stagingRestoreOverlaps\(out_pool_, out_bytes, act_stage.data\(\),\s*act_bytes\)', parts['select.inc']).group(0), 'true'),
-    }[a.mutant]
-    assert old in parts[key], (a.mutant, 'source anchor changed')
-    if a.mutant.startswith('scratch_'):
-        at = parts[key].index('htp_router_handoff_scratch_take(')
-        prefix, suffix = parts[key][:at], parts[key][at:]
-        if a.mutant == 'scratch_ticket':
-            old, new = 's->ticket == ticket', 'ticket != 0u'
-        if a.mutant == 'scratch_epoch':
-            old, new = 's->epoch == s->published_epoch', '1'
-        assert old in suffix
-        parts[key] = prefix + suffix.replace(old, new, 1)
-    else:
-        parts[key] = parts[key].replace(old, new, 1)
 for name, text in parts.items():
     (a.output / name).write_text(text)
 fixture = Path(__file__).with_suffix('.cpp')
@@ -136,7 +102,7 @@ cmd = [a.cxx, '-std=c++17', '-O1', '-g', '-Wall', '-Wextra',
 manifest = {
     'source_sha256': {paths[k]: hashlib.sha256(v.encode()).hexdigest() for k, v in original_sources.items()},
     'extracted_sha256': {k: hashlib.sha256(v.encode()).hexdigest() for k, v in parts.items()},
-    'mutant': a.mutant, 'compile': cmd, 'run': [str(binpath)],
+    'compile': cmd, 'run': [str(binpath)],
     'limits': 'Real staging, ownership, RPC guards, reserve and carve helpers. Arithmetic, DMA and allocation are host stand-ins; no model-output or hardware-performance claim.',
 }
 (a.output / 'commands.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -191,7 +191,7 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
  * order, and @a pal the four int4 codes they index. NULL arrays take the
  * scales and column sums from the arena after the codes. The HMX path
  * expands a chunk in place after its DMA lands, so no VTCM is set aside for
- * it -- see hexkl_moe_expand_chunk.
+ * it -- see moe_expand_chunk in hexkl_mm_u8i4_moe.c.
  */
 int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t vtcm_size, uint32_t K, uint32_t N,
@@ -237,9 +237,8 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle);
  * not assumed. Output is dequantized f32, one contiguous M x handle[i].N
  * block per handle in call order (not interleaved row-by-row).
  *
- * @param config_off  session-constant HMX config region offset (from
- *                     hexkl_mm_u8i4_plan; the same for every M/K/N because
- *                     it depends only on vtcm_size). The caller must have
+ * @param config_off  session-constant HMX config region offset, computed
+ *                     from vtcm_size when the session opens. The caller has
  *                     called hexkl_micro_hmx_setup_acc_read_int32 for it
  *                     once already -- this function does not repeat that
  *                     because it is session-scoped, not call-scoped.
@@ -253,49 +252,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             float *out_cat, const hexkl_mm_opts *opts);
 
 /**
- * @brief Runs ONE MoE expert FFN in a single call: gate_up matmul -> SwiGLU
- *        -> down matmul, with the SwiGLU intermediate never leaving the DSP.
- *
- * @a handles must be exactly two registered weights, [gate_up, down], with
- * gate_up baked at K x 2I and down at I x N_out -- down.K == gate_up.N / 2
- * is checked, not assumed (that ratio IS the SwiGLU contract: gate_up's
- * output row is [gate | up], silu(gate)*up feeds the down projection).
- * act_f32 is M x K f32; out is M x N_out f32, written (or accumulated into,
- * per opts->accumulate) directly -- there is no out_cat scatter, the fused
- * call has exactly one output matrix.
- *
- * The pipeline: quantize act into VTCM AH tiles, block on gate_up's weight,
- * stream down's weight in behind it (the cross-matmul prefetch pattern),
- * run gate_up's matmuls and dequantize each tile straight into two VTCM
- * regions (gate and up), SwiGLU them in place, requantize the gate half
- * into AH tiles, run down's matmuls, dequantize to out. What this deletes
- * versus two hexkl_mm_u8i4_layer_run calls is the M x 2I and M x I f32
- * intermediates crossing FastRPC twice, plus one round trip.
- *
- * opts: only pool and accumulate are honored. act_scale/act_zp/
- * act_ah_prepacked are rejected (AEE_EBADPARM) rather than silently
- * ignored -- the down matmul's quantization is inherently dynamic (it
- * quantizes the SwiGLU output, which the caller has never seen), so a
- * caller-supplied act_scale could only apply to stage 1, an accuracy
- * change dressed up as an option.
- *
- * Requires the in-place accumulator tile layout (hexkl_acc_layout usable);
- * returns AEE_EUNSUPPORTED otherwise -- the gate/up split of the dequant
- * has no vendor-copy fallback.
- */
-int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
-                            uint32_t vtcm_size, uint32_t config_off, uint32_t M,
-                            uint32_t K, const uint32_t *handles,
-                            const float *act_f32, float *out,
-                            const hexkl_mm_opts *opts);
-
-/**
- * @brief [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize to
- *        u8 AH, ONE weight -- see hexkl_mm_u8i4_dma.c's doc comment for why
- *        this exists alongside hexkl_mm_u8i4_fused_run rather than instead
- *        of it (smaller VTCM surface, reuses hexkl_mm_u8i4_layer_run's
- *        act_ah_prepacked path for the down matmul instead of reimplementing
- *        it). Feed out_ah/out_scale/out_zp straight into
+ * @brief Gate_up matmul -> SwiGLU -> requantize to u8 AH for one weight.
+ *        Feed out_ah/out_scale/out_zp straight into
  *        hexkl_mm_u8i4_layer_run via hexkl_mm_opts.act_ah_prepacked for the
  *        down matmul -- that path is already device-verified.
  *

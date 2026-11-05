@@ -178,7 +178,7 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     FARF(HIGH, "nntr_hvx_open: hexkl_micro_hw_init 0x%08x: lite open", res);
     lite_vtcm(s);
   } else {
-    // config_off depends only on vtcm_size (see hexkl_mm_u8i4_plan), so it
+    // config_off depends only on vtcm_size, so it
     // is computed once here rather than at every mm_u8i4_layer call.
     const uint32_t config_size = hexkl_micro_hmx_config_size();
     if (s->vtcm_size < config_size) {

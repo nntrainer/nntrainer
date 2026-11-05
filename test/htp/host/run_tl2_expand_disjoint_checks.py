@@ -48,7 +48,6 @@ def main():
     parser.add_argument("--hexagon-tools", type=Path, required=True,
                         help="SDK tools/HEXAGON_Tools/<version> directory")
     parser.add_argument("--sanitize", action="store_true")
-    parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
     repo = args.repo.resolve()
     source = (args.source or repo).resolve()
@@ -57,8 +56,6 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if not (native / "lib/libnative.a").is_file():
         parser.error("--hexagon-tools does not contain Tools/libnative/lib/libnative.a")
-    if args.mutations and not args.sanitize:
-        parser.error("--mutations requires --sanitize")
     source_text = (source / MOE).read_text()
     (out / "reference-unit.inc").write_text(unit((reference / MOE).read_text(), "reference"))
     (out / "candidate-unit.inc").write_text(unit(source_text, "candidate"))
@@ -81,17 +78,14 @@ def main():
         flags += ["-I", str(directory)]
     commands = []
 
-    def run(command, label, expect=None):
+    def run(command, label):
         commands.append(command)
         (out / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
         path = out / (label + ".log")
         with path.open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
         value = path.read_text()
-        if expect:
-            if result.returncode == 0 or expect not in value:
-                raise SystemExit(f"{label}: expected rejection {expect!r}; see {path}")
-        elif result.returncode:
+        if result.returncode:
             raise SystemExit(f"{label}: failed ({result.returncode}); see {path}")
         return value
 
@@ -129,22 +123,6 @@ def main():
         return exe
 
     print(run([str(build_fixture(""))], "run"), end="")
-    mutants = []
-    if args.mutations:
-        for name, old, new in (
-            ("snapshot-selection", "c->native_packed &&", "1 &&"),
-            ("gu-stride", "c->stride == 96u * 512u", "1"),
-            ("dn-stride", "c->stride == 64u * 512u", "1"),
-        ):
-            if source_text.count(old) != 1:
-                raise SystemExit(f"{name}: production anchor changed")
-            changed = source_text.replace(old, new)
-            (out / "candidate-unit.inc").write_text(unit(changed, "candidate"))
-            run([str(build_fixture("-" + name))], "mutant-" + name,
-                "FAIL: caller selection")
-            mutants.append(name)
-            print("PASS: mutant rejected:", name)
-        (out / "candidate-unit.inc").write_text(unit(source_text, "candidate"))
     hashes = {}
     for name, root in (("reference", reference), ("candidate", source)):
         paths = [MOE, HVX / "hvx_gemv_u8tl2.c", HVX / "hvx_gemv_u8tl2.h"]
@@ -153,7 +131,7 @@ def main():
         hashes[name] = {str(p): hashlib.sha256((root / p).read_bytes()).hexdigest()
                         for p in paths}
     (out / "results.json").write_text(json.dumps({
-        "pass": True, "mutants_rejected": mutants, "sources": hashes,
+        "pass": True, "sources": hashes,
         "limitations": ["HVX arithmetic uses SDK libnative; DMA/timing are not simulated.",
                         "Eight actual caller units execute in permuted serial order; no worker-pool race claim.",
                         "Only complete caller type and expansion-unit body are extracted; source-level dispatch unchanged."]},

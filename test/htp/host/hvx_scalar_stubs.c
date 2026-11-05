@@ -16,7 +16,6 @@
 #include "hexkl_mm_u8i8_dma.h"
 #include "hexkl_probe.h"
 #include "hvx_conv_gate_f32.h"
-#include "hvx_gather_ah_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 #include "hvx_router_rows_f32.h"
@@ -122,12 +121,6 @@ void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
   (void)pool;
   (void)job;
   (void)n;
-}
-
-void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
-                       hvx_worker_pool *pool) {
-  (void)pool;
-  memcpy(dst, src, (size_t)(k / 32u) * 2048u);
 }
 
 /** The row RMSNorm the *_norm layer entries fold in: plain f32, one row

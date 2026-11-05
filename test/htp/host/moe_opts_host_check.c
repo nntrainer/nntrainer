@@ -25,8 +25,6 @@
 #include <string.h>
 
 _Static_assert(HTP_N_STAGES == 7 && HTP_T_ACC_STRIDE == 6, "FC wire layout");
-_Static_assert(HTP_FU_N_STAGES == 8 && HTP_FU_T_ACC_COPY == 5,
-               "fused wire layout");
 _Static_assert(HTP_GU_N_STAGES == 7 && HTP_GU_T_DRAIN == 5,
                "gate/up wire layout");
 _Static_assert(HTP_MOE_N_STAGES == 31 && HTP_MOE_T_PATH == 29 &&

@@ -11,8 +11,8 @@ interface nntr_hvx : remote_handle64 {
    AEEResult add_f32(in sequence<float> a, in sequence<float> b,
                      rout sequence<float> c);
 
-   // Accuracy harness: the whole flow, quantization and dequantization on
-   // the DSP. Intermediate buffers come back so each stage is checkable.
+   // Retired per-call weight-baking matmul with scalar accumulator copy.
+   // Reserved for wire compatibility; returns unsupported.
    AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
                               in sequence<float> act_f32,
                               in sequence<int8> w_i4_rm,
@@ -154,40 +154,23 @@ interface nntr_hvx : remote_handle64 {
                                       rout sequence<float> out_cat,
                                       rout sequence<uint32> stage_us);
 
-   // Fused MoE expert FFN: gate_up matmul -> SwiGLU -> down matmul in ONE
-   // round trip. w_handles must be exactly two registered u8i4 weights,
-   // [gate_up (K x 2I), down (I x N_out)] -- down.K == gate_up.N / 2 is the
-   // SwiGLU contract and is checked, not assumed. The gate_up result
-   // dequantizes into VTCM, SwiGLU runs there, and the SwiGLU output is
-   // requantized and fed to the down matmul, so no intermediate crosses the
-   // wire: what this deletes versus two mm_u8i4_layer calls is the
-   // M x 2I + M x I f32 intermediates' round trips (doc 43 §[L2]).
+   // Retired single-call FFN prototype; returns unsupported. Current models
+   // use gate_up_swiglu followed by layer_u8in for the down projection.
    AEEResult mm_u8i4_layer_fused(in uint32 M, in uint32 K,
                                  in sequence<uint32> w_handles,
                                  in sequence<float> act_f32,
                                  rout sequence<float> out_f32);
 
-   // Same fused call, plus the DSP-side stage breakdown. Slots are the
-   // fused entry's own list (nntr_hvx_mm_u8i4.c's FU_T_* enum): the
-   // intermediate requant is a second QUANT pass and the SwiGLU is a stage
-   // the unfused call does not have, so this is not the FC_T_* layout.
-   // Separate entry rather than a flag, same reason as mm_u8i4_layer_timed.
+   // Reserved timed entry for the retired single-call FFN.
    AEEResult mm_u8i4_layer_fused_timed(in uint32 M, in uint32 K,
                                        in sequence<uint32> w_handles,
                                        in sequence<float> act_f32,
                                        rout sequence<float> out_f32,
                                        rout sequence<uint32> stage_us);
 
-   // [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize to u8
-   // AH tiles, ONE weight, no down matmul -- the smaller-surface
-   // alternative to mm_u8i4_layer_fused (doc 43 §7's L2 rows: the one-call
-   // fused kernel above produces wrong output on this model's real
-   // weights, root cause not found; this reuses mm_u8i4_layer_u8in's
-   // already-verified act_ah_prepacked path for the down side instead of
-   // reimplementing it). w_handle_gate_up.N must be even (gate|up split);
-   // out_ah/out_scale/out_zp are exactly mm_u8i4_layer_u8in's act_ah/
-   // act_scale/act_zp inputs for the caller's next call -- feed them
-   // straight through.
+   // Gate/up matmul -> SwiGLU -> requantize to u8 AH tiles.
+   // w_handle_gate_up.N must be even (gate|up split). The returned
+   // out_ah/out_scale/out_zp feed mm_u8i4_layer_u8in directly for down.
    AEEResult mm_u8i4_gate_up_swiglu(in uint32 M, in uint32 K,
                                     in uint32 w_handle_gate_up,
                                     in sequence<float> act_f32,
@@ -262,16 +245,10 @@ interface nntr_hvx : remote_handle64 {
                          in float scale, in sequence<float> x,
                          rout sequence<float> y);
 
-   // PHASE B of the fused attention loop, exposed on its own so it can be
-   // gated against the host model (test/unittest/mha_htp_host_model.cpp)
-   // before the attention endpoint that will call it in-process exists.
-   //
-   // The band arrives flattened as n_seg contiguous M x T blocks -- the same
-   // bytes hexkl_mm_u8iX_layer_run's out_cat holds, in the same order -- and
-   // comes back holding UNNORMALIZED exp values, plus l per row. Flattening
-   // it into one buffer is a marshalling convenience for this harness only;
-   // on device the blocks are already adjacent in VTCM and the kernel takes
-   // the pointer array directly. Pass an empty sink to mean "no sink".
+   // Retired u8 attention prototype. These entries always return
+   // AEE_EUNSUPPORTED, including in diagnostic builds. Keep their order and
+   // signatures: removing a slot renumbers every subsequent FastRPC method.
+   // Current inference uses attn_q2_*, attn_f16_* and attn_m1_*.
    AEEResult softmax_blocked_f32(in uint32 n_seg, in uint32 T, in uint32 M,
                                  in float scale, in sequence<float> band_in,
                                  in sequence<uint32> begin,
@@ -280,49 +257,25 @@ interface nntr_hvx : remote_handle64 {
                                  rout sequence<float> band_out,
                                  rout sequence<float> l_out);
 
-   // --- Attention (MHA_HTP_U8_TASKS.md Task 6) --------------------------
-   //
-   // ONE register entry taking both widths, not one entry per width: the
-   // combinations are four (K and V are independent, §0.2) and four copies of
-   // every attention entry point is not a surface worth carrying.
    AEEResult attn_register(in uint32 nch, in uint32 gqa, in uint32 head_dim,
                            in uint32 max_kv, in uint32 T, in uint32 M_band,
                            in uint32 w_k, in uint32 w_v, rout uint32 h);
 
    AEEResult attn_release(in uint32 h);
 
-   // Appends KV positions and re-registers only the blocks they land in.
    AEEResult attn_kv_append(in uint32 h, in uint32 kv_from, in uint32 n_rows,
                             in sequence<uint16> k_rows,
                             in sequence<uint16> v_rows);
 
-   // DEBUG ONLY, and stripped before the PR: returns the raw S band so it can
-   // be compared against mha_htp_host_forward's PHASE A. Without a per-stage
-   // output a wrong O gives no signal about which stage produced it
-   // (MHA_HTP_PLAN.md §9.5). Mirrors how mm_u8i4_from_f32 returns
-   // intermediates as an accuracy harness.
    AEEResult attn_scores_debug(in uint32 h, in uint32 head, in uint32 M,
                                in sequence<float> q_band,
                                rout sequence<float> out_s);
 
-   // The whole layer in ONE round trip: Q.Kt, masked softmax and P.V, with S
-   // and P never crossing the host boundary. An unfused seam would pay the
-   // ~404 us fixed FastRPC cost three times per layer instead of once, which
-   // is the entire reason softmax runs on the DSP (MHA_HTP_PLAN.md §2).
-   //
-   // This replaces exactly compute_kcaches + softmax_triangle +
-   // compute_fp16vcache_transposed in mha_core's incremental path. RoPE and
-   // the Q/K/V and output projections stay where they are.
    AEEResult attn_forward(in uint32 h, in uint32 kv_from, in uint32 n_query,
                           in float scale, in uint32 is_causal,
                           in uint32 window, in sequence<float> sink,
                           in sequence<float> q, rout sequence<float> attn_out);
 
-   // Same forward, plus the DSP-internal per-stage microseconds:
-   // [qk, softmax, pv, accum, gather, total, layer_run_calls]. DEBUG ONLY and
-   // stripped before the PR. The host times the whole call, this times the
-   // inside, and the difference is the FastRPC transport -- which is how §2's
-   // transport share gets checked rather than assumed.
    AEEResult attn_forward_timed(in uint32 h, in uint32 kv_from,
                                 in uint32 n_query, in float scale,
                                 in uint32 is_causal, in uint32 window,
@@ -470,35 +423,16 @@ interface nntr_hvx : remote_handle64 {
    AEEResult arena_probe(in int32 fd, in uint32 bytes, in uint32 dma_bytes,
                          rout sequence<uint32> res);
 
-   // Allocates chunk_mb-sized blocks on the DSP and touches one byte per 4 KB
-   // page of each (so they are committed, not just reserved) until an
-   // allocation fails, then frees them all. Reports how many succeeded and
-   // the sum of the touched bytes so nothing can be optimised away. Carries
-   // no large payload, unlike weight_register_u8i4, so it measures the PD's
-   // own allocatable memory rather than that plus a 3.67 MB input buffer.
+   // Retired memory-ceiling experiments. Reserved signatures/ordinals;
+   // both entries return AEE_EUNSUPPORTED in every build.
    AEEResult mem_probe_dsp_heap(in uint32 chunk_mb, in uint32 max_chunks,
                                 rout sequence<uint32> chunks_ok,
                                 rout sequence<uint64> touched_sum);
 
-   // Touches one byte per 4 KB page of a host-provided buffer. Called with
-   // rpcmem/ION memory, this is what proves the DSP can actually reach an
-   // ION mapping of a given size -- the design section 8.4 depends on.
    AEEResult mem_probe_touch(in sequence<uint8> buf,
                              rout sequence<uint64> touched_sum);
 
-   // [#77, doc 48 section 5 C] Streams bytes of an attached arena into VTCM
-   // with one DMA engine per worker thread (each worker issues its own
-   // dmstart on its own descriptors -- not the shared dmlinked ring), so
-   // the three axes of the arena bandwidth question can be moved one at a
-   // time: descriptor shape (row_size x nrows at src_stride), worker
-   // count, and the bus vote (a compile-time property of the skel,
-   // reported back as vote_state). The plan that splits the range into
-   // descriptors is test/htp/nntr_dma_probe_plan.h, checked on the host.
-   //
-   // res: [us, bytes_lo, bytes_hi, checksum, workers_used, vote_state,
-   //       n_descriptors, max_desc_bytes, vtcm_per_worker, passes]
-   // checksum sums worker 0's VTCM slice at a 64-byte stride after the
-   // run, so a mapping that reads as zeros is visible. DEBUG ONLY.
+   // Retired standalone DMA bandwidth experiment; returns unsupported.
    AEEResult dma_probe(in uint32 arena, in uint32 src_off, in uint32 bytes,
                        in uint32 row_size, in uint32 nrows,
                        in uint32 src_stride, in uint32 workers,
@@ -737,15 +671,9 @@ interface nntr_hvx : remote_handle64 {
                                  rout sequence<uint32> sel,
                                  rout sequence<float> weight);
 
-   // [#141] dspqueue microbench, DEBUG ONLY (no model path calls these).
-   // start imports the queue the ARM side exported and parks one DSP thread
-   // on it: mode 0 blocks in dspqueue_read (signalled), mode 1 spins on
-   // dspqueue_read_noblock (polling). AEE_EUNSUPPORTED: this DSP image has
-   // no dspqueue. AEE_EBADSTATE: a bench queue is already open.
-   // Never AEE_EBADPARM (the stale-skel symptom, rule 3).
+   // Retired standalone dspqueue echo experiment; returns unsupported.
    AEEResult dspq_bench_start(in uint64 queue_id, in uint32 mode);
-   // Stops the thread and closes the queue.
-   // res: [packets served, empty polls, bad packets, mode]
+   // Reserved stop entry for the retired echo experiment.
    AEEResult dspq_bench_stop(rout sequence<uint32> res);
 
    // [#141 step 2] The M==1 MoE layer call over dspqueue (plan
@@ -762,14 +690,11 @@ interface nntr_hvx : remote_handle64 {
    // res: [packets served, bad packets, empty polls, spin_us]
    AEEResult dspq_stop(rout sequence<uint32> res);
 
-   // [#170] DEBUG ONLY (no model path calls it): hvx_attn_m1_hf.h's
-   // fp16-lane primitives on silicon, and the cost of the kernel shapes
-   // plan 170 designs (test/htp/nntr_hvx_attn_m1_probe.c). op < 16: y[i] =
-   // f(a[i], b[i], c[i]) over n lanes (a, b, c, y all n long, n a multiple
-   // of 64), one thread. op >= 16: a kernel-shaped loop on lanes pool lanes,
-   // reps timed pool runs; a, b, c, y empty. Op codes and the prof words:
-   // test/htp/nntr_attn_m1_probe.h. A bad op, length, lane or rep count is
-   // AEE_EINVALIDFORMAT; never AEE_EBADPARM.
+   // DEBUG ONLY: hvx_attn_m1_hf.h's fp16 primitives on silicon. Ops 0..8
+   // compute y[i] = f(a[i], b[i], c[i]); all arrays have n elements and n
+   // is a multiple of 64. The former synthetic cost ops 16..26 are retired
+   // and return AEE_EUNSUPPORTED. Keep the signature and 12-word profile
+   // layout (test/htp/nntr_attn_m1_probe.h) for wire compatibility.
    AEEResult attn_m1_probe(in uint32 op, in uint32 lanes, in uint32 reps,
                            in sequence<uint16> a, in sequence<uint16> b,
                            in sequence<uint16> c, rout sequence<uint16> y,
@@ -852,22 +777,15 @@ interface nntr_hvx : remote_handle64 {
    // none), which bounds every fp16 / quantized attention plan.
    AEEResult session_info(rout sequence<uint32> res);
 
-   // One side of a DSP-to-DSP hop through a shared page (nntr_hvx_mailbox.c):
-   // fd is an ION buffer of bytes the caller fastrpc_mmap'd for this
-   // session. role 0 posts seq 1..n in the ping word (after copying payload
-   // bytes into its half, cache clean) and waits for the same seq in pong;
-   // role 1 mirrors. A wait spins spin_us, then polls every 50 us until
-   // spin_us + 1 s, which counts a timeout and ends the run. payload is 0
-   // or a multiple of 4 of at least 12 bytes; us_total is 0 when n_done is 0.
-   // res (5): [us_total, n_done, n_timeouts, payload_checksum, n_bad].
+   // Retired two-PD mailbox experiment; returns unsupported. The token
+   // driver uses its own mailbox protocol through token_driver_start.
    AEEResult mailbox_run(in int32 fd, in uint32 bytes, in uint32 role,
                          in uint32 n, in uint32 payload, in uint32 spin_us,
                          rout sequence<uint32> res);
 
-   // One f32 operation per element on the DSP (nntr_hvx_sf_probe.c), to
-   // name the operation a kernel disagrees on: op 0/1/2 the inline-asm
-   // IEEE vadd/vsub/vmpy .sf, 3/4/5 the Q6_Vsf_* intrinsics, 6 scalar a/b,
-   // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 0..5.
+   // Kernel arithmetic: op 3/4/5 Q6_Vsf_* intrinsics, 6 scalar a/b,
+   // 7 scalar sffma a*b + 1. o = op(a, b); a multiple of 32 for 3..5.
+   // Retired inline-assembly experiments 0..2 return unsupported.
    AEEResult sf_probe(in uint32 op, in sequence<float> a,
                       in sequence<float> b, rout sequence<float> o);
 
@@ -1001,11 +919,7 @@ interface nntr_hvx : remote_handle64 {
                            rout sequence<uint16> sub_qf16,
                            rout sequence<uint16> exp2_sub_hf);
 
-   // Decode-block probe: the first cache block of hvx_attn_decode_f16 for
-   // one (row, head), step by step. q is head_dim f32, k is kv rows of
-   // head_dim fp16 (kv <= 64, contiguous). Returns the f32 scores the dot
-   // products produced, the fp16 scores after narrowing + masking, the
-   // fp16 probabilities, and misc = { m (fp16 as f32), rowsum, scale }.
+   // Retired decode-block debug copy; reserved ABI slot, returns unsupported.
    AEEResult probe_f16_decode_block(in uint32 head_dim, in uint32 kv,
                                     in sequence<float> q,
                                     in sequence<uint16> k,
@@ -1201,9 +1115,7 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<uint16> out_u16,
                              rout sequence<uint32> stats_us);
 
-   // HVX issue-rate probe, n iterations each: stats = { cycles per vadd
-   // (8 independent chains), per Q15 vmpy (8 chains), per exp2 chain of the
-   // softmax (4 chains), per VTCM vector load (8 streams) }.
+   // Retired synthetic HVX issue-rate probe; returns unsupported.
    AEEResult probe_hvx_rate(in uint32 n, rout sequence<uint32> stats);
 
    // attn_q_step's counterpart for the row-blocked kernel over a cache in
@@ -1221,13 +1133,10 @@ interface nntr_hvx : remote_handle64 {
                           rout sequence<uint16> out_u16,
                           rout sequence<uint32> stats_us);
 
-   // The int8 WH tile permutation (hexkl_kv_q_wh_i8_pos), 1024 entries.
+   // Retired int8 WH permutation dump; returns unsupported.
    AEEResult probe_wh_i8_pos(rout sequence<uint16> pos);
 
-   // The HVX integer softmax of one 64-row block over int16 score tiles
-   // (hvx_softmax_q), for the bit-exact check against the scalar
-   // definition the host runs. corr has (n_col_tiles + 1) * 32 entries.
-   // stats = { cycles of the HVX call }.
+   // Retired 8-bit probability softmax experiment; returns unsupported.
    AEEResult probe_softmax_q(in uint32 n_col_tiles, in uint32 col0,
                              in uint32 n_cols, in uint32 row0, in uint32 n_rows,
                              in uint32 window, in uint32 rho_q15,
@@ -1237,7 +1146,7 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<int32> rowsum,
                              rout sequence<uint32> stats);
 
-   // The same for the 16-bit P of the a16 contract (hvx_softmax_q16):
+   // Bit-exact check for the 16-bit P of the a16 contract (hvx_softmax_q16):
    // P16 leaves as its low and high byte tiles, rowsum holds the P' sums.
    AEEResult probe_softmax_q16(in uint32 n_col_tiles, in uint32 col0,
                                in uint32 n_cols, in uint32 row0,
@@ -1418,8 +1327,7 @@ interface nntr_hvx : remote_handle64 {
                                        rout sequence<float> out_f32);
    // Retag an idle symmetric QS2 arena slot after its native payload is read.
    AEEResult weights_tl2(in sequence<uint32> handles, in uint32 enabled);
-   // Debug-only: 8*n VLUTs. mode=0/1 independent vlut32/vlut16,
-   // 2/3 dependent. stats: cycles lo/hi, microseconds lo/hi, checksum.
+   // Retired VLUT rate experiment; always AEE_EUNSUPPORTED.
    AEEResult vlut_probe(in uint32 mode, in uint32 n,
                        rout sequence<uint32> stats);
    // Debug-only native TL2 correctness and worker/DMA timing.

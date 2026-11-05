@@ -38,8 +38,6 @@
 #include "q4_gemv_native_det.h"
 #include "swiglu_det.h"
 
-#include "mha_htp_host_model.h"
-
 namespace {
 
 /**
@@ -1128,16 +1126,9 @@ TEST_F(HvxFcQ4, ScalarDivide) {
 }
 
 /**
- * @brief Why the first sitting's hvx_native and sffma variants read 0 on
- *        silicon (the ISS matched): each f32 operation on the DSP,
- *        sf_probe's IEEE-form asm vadd / vsub / vmpy (.sf = .sf op .sf)
- *        against the Q6_Vsf_* intrinsics (qf32 op + conversion) and the
- *        scalar sffma, (1) on 256 random normal pairs and (2) on the
- *        operands of the kernel's first failing step -- column group 0,
- *        block 0 of the 2048 x 32 G1 weight on row kind 0: the split
- *        product P1 = F1 * S1, P2 = F2 * S2 and uh = P1 + P2 (the
- *        Fast2Sum head), computed here by the host's IEEE ops. Prints per
- *        op the lanes that differ from the host and one lane in hex.
+ * @brief Checks the kernel's Q6_Vsf_* intrinsics and scalar sffma against
+ *        host arithmetic on random normal pairs and the split-product
+ *        operands of the Q4 FC kernel. All mismatches are asserted.
  */
 TEST_F(HvxFcQ4, SfProbe) {
   auto probe = [&](uint32_t op, const std::vector<float> &a,
@@ -1181,9 +1172,6 @@ TEST_F(HvxFcQ4, SfProbe) {
     int intrin_bad = report(set, "intrin_vadd", 3u, a, b, add);
     intrin_bad += report(set, "intrin_vsub", 4u, a, b, sub);
     intrin_bad += report(set, "intrin_vmpy", 5u, a, b, mul);
-    report(set, "asm_ieee_vadd", 0u, a, b, add);
-    report(set, "asm_ieee_vsub", 1u, a, b, sub);
-    report(set, "asm_ieee_vmpy", 2u, a, b, mul);
     if (sffma)
       intrin_bad += report(set, "scalar_sffma", 7u, a, b, fma1);
     return intrin_bad;
@@ -1659,184 +1647,4 @@ int main(int argc, char **argv) {
   }
 
   return result;
-}
-
-/**===========================================================================
- * Blocked masked softmax -- PHASE B of the fused attention loop.
- *
- * The oracle is mha_softmax_blocked_ref, the same host model the whole flash
- * loop is specified against, so this gates the DSP kernel against the
- * specification rather than against a second opinion written beside it.
- *
- * Nothing asserts per element: the whole matrix runs, the worst case is
- * carried out, and the bounds are checked once at the end. A per-element
- * assertion aborts at the first shape and then reports nothing about the
- * later ones, which is how a matrix silently stops covering what it claims.
- *=========================================================================*/
-
-class HvxSoftmaxBlocked : public HtpSession {};
-
-namespace {
-
-/** @brief Worst case seen across the matrix, with the shape that produced it.
- */
-struct BlockedWorst {
-  double p_abs = 0.0;    /**< max |p_dev - p_ref|, absolute */
-  double l_margin = 0.0; /**< max |l_dev - l_ref| / summation-order bound */
-  double l_abs = 0.0;    /**< the raw l difference behind l_margin */
-  std::string p_where, l_where;
-};
-
-/**
- * @brief Bound on how far two summation ORDERS of the same n non-negative f32
- *        values may legitimately land apart.
- *
- * Two terms, and the first device run showed both are needed:
- *
- *   n * eps * sum  -- reassociation. The host model adds in kv order, one
- *     scalar at a time; the kernel adds into 32 qf32 lanes and reduces at the
- *     end. Neither is "the" answer; both approximate the same exact sum.
- *     Dominates on long rows (kv=1023 landed 1.06e-6 relative here).
- *
- *   1e-6 * sum     -- hvx_exp_sf's own documented relative error. Every term
- *     of l is an exp, and on a SHORT row there is no reassociation at all, so
- *     this is the only term left. Leaving it out put the worst margin at
- *     0.998 on a two-term row -- passing, but one rounding away from red and
- *     for a reason that has nothing to do with summation order.
- *
- * A logic bug (a mask off by one, a dropped block, a mishandled sink) moves l
- * by whole terms, i.e. O(1/n) to O(1) relative, and is still caught by orders
- * of magnitude.
- */
-double sum_order_bound(uint32_t n_terms, double sum) {
-  return ((double)n_terms * 1.1920928955078125e-7 + 1e-6) * sum;
-}
-
-/** @brief One case of the blocked softmax matrix, device against host model. */
-void check_blocked(remote_handle64 handle, uint32_t kv, uint32_t T, uint32_t M,
-                   uint32_t window, bool with_sink, BlockedWorst *w) {
-  const uint32_t n_seg = (kv + T - 1u) / T;
-  const uint32_t band = n_seg * M * T;
-  const float scale = 0.125f;
-
-  std::mt19937 rng(kv * 7919u + T * 131u + M * 17u + window +
-                   (with_sink ? 1u : 0u));
-  std::uniform_real_distribution<float> d(-6.0f, 6.0f);
-
-  /** Poison the padded tail past kv: a masking bug reads a value that cannot
-   * be mistaken for a plausible score. */
-  std::vector<float> in(band, 1e30f);
-  for (uint32_t m = 0; m < M; ++m) {
-    for (uint32_t pos = 0; pos < kv; ++pos) {
-      in[(size_t)(pos / T) * M * T + (size_t)m * T + (pos % T)] = d(rng);
-    }
-  }
-
-  std::vector<uint32_t> begin(M), end(M);
-  for (uint32_t m = 0; m < M; ++m) {
-    const uint32_t e = kv - (m % kv);
-    end[m] = e;
-    begin[m] = (window != 0u && window < e) ? (e - window) : 0u;
-  }
-  std::vector<float> sink(M);
-  for (uint32_t m = 0; m < M; ++m) {
-    sink[m] = d(rng) * 0.3f;
-  }
-
-  std::vector<float> out(band, 0.0f), l(M, 0.0f);
-  const int err = nntr_hvx_softmax_blocked_f32(
-    handle, n_seg, T, M, scale, in.data(), (int)band, begin.data(), (int)M,
-    end.data(), (int)M, with_sink ? sink.data() : nullptr,
-    with_sink ? (int)M : 0, out.data(), (int)band, l.data(), (int)M);
-
-  std::ostringstream shape;
-  shape << "kv=" << kv << " T=" << T << " M=" << M << " window=" << window
-        << " sink=" << (with_sink ? 1 : 0);
-  ASSERT_EQ(err, AEE_SUCCESS) << shape.str() << " -> " << hex(err);
-
-  std::vector<const float *> seg(n_seg);
-  for (uint32_t j = 0; j < n_seg; ++j) {
-    seg[j] = in.data() + (size_t)j * M * T;
-  }
-  const MhaSoftmaxOut ref = mha_softmax_blocked_ref(
-    seg, n_seg, T, M, scale, begin, end, with_sink ? sink.data() : nullptr);
-
-  for (size_t i = 0; i < band; ++i) {
-    const double e = std::fabs((double)out[i] - (double)ref.p[i]);
-    if (e > w->p_abs) {
-      w->p_abs = e;
-      w->p_where = shape.str();
-    }
-  }
-  for (uint32_t m = 0; m < M; ++m) {
-    const double e = std::fabs((double)l[m] - (double)ref.l[m]);
-    const double bound = sum_order_bound(end[m] - begin[m], (double)ref.l[m]);
-    const double margin = (bound > 0.0) ? (e / bound) : e;
-    if (margin > w->l_margin) {
-      w->l_margin = margin;
-      w->l_abs = e;
-      w->l_where = shape.str() + " m=" + std::to_string(m);
-    }
-  }
-}
-
-} // namespace
-
-TEST_F(HvxSoftmaxBlocked, MatchesHostModelOverTheShapeMatrix) {
-  BlockedWorst w;
-  size_t cases = 0;
-
-  for (uint32_t kv : {1u, 31u, 32u, 33u, 255u, 256u, 257u, 1023u, 1024u}) {
-    for (uint32_t T : {32u, 256u}) {
-      for (uint32_t M : {1u, 7u, 64u}) {
-        /** window T-1, T, T+1 is the off-by-one trap in the block arithmetic
-         * and is mandatory; kv-1 and kv exercise the whole-band ends. */
-        for (uint32_t window : {0u, 1u, T - 1u, T, T + 1u, kv - 1u, kv}) {
-          for (int s = 0; s < 2; ++s) {
-            check_blocked(handle_, kv, T, M, window, s != 0, &w);
-            if (::testing::Test::HasFatalFailure()) {
-              return;
-            }
-            ++cases;
-          }
-        }
-      }
-    }
-  }
-
-  std::cout << "BLOCKED_FIELD path=softmax_blocked field=cases value=" << cases
-            << std::endl;
-  std::cout << "BLOCKED_FIELD path=softmax_blocked field=max_abs_err_p value="
-            << w.p_abs << std::endl;
-  std::cout << "BLOCKED_FIELD path=softmax_blocked field=max_abs_err_l value="
-            << w.l_abs << std::endl;
-  std::cout
-    << "BLOCKED_FIELD path=softmax_blocked field=l_sum_order_margin value="
-    << w.l_margin << std::endl;
-
-  /** p is bounded absolutely: values are in (0, 1] and hvx_exp_sf's own spec is
-   * a relative error of 1e-6 over this domain, so 1e-6 absolute is the kernel
-   * inheriting exactly its exp's accuracy and nothing worse. */
-  EXPECT_LE(w.p_abs, 1e-6) << "worst at " << w.p_where;
-  /** l is bounded by reassociation, not by a picked number -- see
-   * sum_order_bound. A margin at or under 1 means the two implementations
-   * differ only in the order they added the same values. */
-  EXPECT_LE(w.l_margin, 1.0)
-    << "worst at " << w.l_where << ", raw diff " << w.l_abs;
-}
-
-TEST_F(HvxSoftmaxBlocked, RejectsBadShapes) {
-  std::vector<float> band(4 * 8, 0.0f), out(4 * 8, 0.0f), l(4, 0.0f);
-  std::vector<uint32_t> b(4, 0u), e(4, 8u);
-
-  EXPECT_EQ(nntr_hvx_softmax_blocked_f32(handle_, 0u, 8u, 4u, 1.0f, band.data(),
-                                         32, b.data(), 4, e.data(), 4, nullptr,
-                                         0, out.data(), 32, l.data(), 4),
-            AEE_EBADPARM + kDspOffset)
-    << "n_seg = 0 must be rejected";
-  EXPECT_EQ(nntr_hvx_softmax_blocked_f32(handle_, 1u, 8u, 4u, 1.0f, band.data(),
-                                         31, b.data(), 4, e.data(), 4, nullptr,
-                                         0, out.data(), 32, l.data(), 4),
-            AEE_EBADPARM + kDspOffset)
-    << "band length must equal n_seg*M*T";
 }

@@ -44,7 +44,6 @@ constexpr uint32_t round_up(uint32_t v, uint32_t a) {
   return ((v + a - 1) / a) * a;
 }
 
-/** @brief HMX int8 tile geometry, mirrored from hexkl_micro.h. */
 /**
  * @brief Offset AEEStdErr.h adds to every AEE_* code on the DSP side.
  *
@@ -87,37 +86,7 @@ SdklRmToWh loadSdklRmToWh() {
   return reinterpret_cast<SdklRmToWh>(dlsym(lib, "sdkl_cpu_i4_rm_to_i4_wh"));
 }
 
-constexpr uint32_t kTileRow = 64;   // HEXKL_HMX_INT8_BLOCK_N_ROW
-constexpr uint32_t kTileInner = 32; // HEXKL_HMX_INT8_BLOCK_N_INNER
-constexpr uint32_t kTileCol = 32;   // HEXKL_HMX_INT8_BLOCK_N_COL
-constexpr uint32_t kActTileBytes = 2048;
-
-/**
- * @brief Byte offset of activation element (m, k) in AH layout.
- *
- * AH is a tiling, not a shuffle: each 64x32 tile is flat row-major, and
- * the tiles run in (row_block, inner_tile) order at a 2048-byte stride.
- */
-inline size_t ah_offset(uint32_t m, uint32_t k, uint32_t K) {
-  const uint32_t n_ktiles = K / kTileInner;
-  const uint32_t rb = m / kTileRow;
-  const uint32_t r = m % kTileRow;
-  const uint32_t kt = k / kTileInner;
-  const uint32_t c = k % kTileInner;
-  return static_cast<size_t>(rb * n_ktiles + kt) * kActTileBytes +
-         r * kTileInner + c;
-}
-
-/** @brief Scatters a row-major uint8 activation into AH layout. */
-void pack_ah_from_rowmajor(const std::vector<uint8_t> &u_rm, uint32_t m_pad,
-                           uint32_t K, std::vector<uint8_t> &out_ah) {
-  out_ah.assign(static_cast<size_t>(m_pad) * K, 0);
-  for (uint32_t m = 0; m < m_pad; ++m) {
-    for (uint32_t k = 0; k < K; ++k) {
-      out_ah[ah_offset(m, k, K)] = u_rm[static_cast<size_t>(m) * K + k];
-    }
-  }
-}
+constexpr uint32_t kTileRow = 64; // HEXKL_HMX_INT8_BLOCK_N_ROW
 
 /**
  * @brief Per-channel symmetric int4 weight quantization.
@@ -130,7 +99,7 @@ void pack_ah_from_rowmajor(const std::vector<uint8_t> &u_rm, uint32_t m_pad,
  *
  * std::round (half away from zero) is correct here: this runs on the host
  * only and the DSP consumes the result, so no rounding mismatch is
- * possible. Activation quantization uses RNE instead -- see quantize_act.
+ * possible. Activation quantization uses RNE instead -- see quantize_act_rows.
  *
  * @param[in]  w_f32 weight matrix, K rows by N columns, row-major
  * @param[out] q_w   quantized values in [-8, 7], K by N, row-major
@@ -363,11 +332,10 @@ void quantize_act_rows(const std::vector<float> &x, uint32_t m_valid,
 /**
  * @brief Per-row asymmetric uint8 activation quantization: the values.
  *
- * std::nearbyint, not std::round: this value is computed independently on
- * the DSP and compared byte for byte, and HVX's float add rounds to
- * nearest-even. std::round (half away from zero) would disagree at exact
- * .5. Weight quantization uses std::round because it runs on the host
- * only -- see quantize_weights_qs4cx.
+ * std::nearbyint, not std::round: the CPU reference must match the DSP
+ * activation quantizer, and HVX's float add rounds to nearest-even. std::round
+ * (half away from zero) would disagree at exact .5. Weight quantization uses
+ * std::round because it runs on the host only -- see quantize_weights_qs4cx.
  *
  * @param[out] u_rm row-major uint8, m_pad by K
  */
@@ -381,7 +349,7 @@ void quantize_act_values(const std::vector<float> &x, uint32_t m_valid,
     const float inv_s = 1.0f / scale[m];
     for (uint32_t k = 0; k < K; ++k) {
       // Reciprocal multiply, matching the DSP kernel: f32 a/b and a*(1/b)
-      // can differ by 1 ULP, which breaks the S1 byte-exact check.
+      // can differ by 1 ULP and change the quantized activation values.
       const float q = std::nearbyint(x[static_cast<size_t>(m) * K + k] * inv_s);
       int32_t v = static_cast<int32_t>(q) + zp[m];
       v = std::max(0, std::min(255, v));
@@ -421,12 +389,11 @@ protected:
   remote_handle64 handle_ = 0;
 
   /**
-   * @brief Runs S1 through S4 for one shape.
+   * @brief Checks one shape through the registered-weight DMA layer path.
    *
-   * S1 and S2 are bit-exact: integer arithmetic is deterministic, so any
-   * layout or wiring error shows up as an exact mismatch rather than
-   * being absorbed into a tolerance. S3 allows f32 ordering slack. S4 is
-   * reported, not gated.
+   * The CPU reference independently quantizes, multiplies integers and
+   * dequantizes. Output comparison allows f32 ordering slack; the original
+   * unquantized matmul supplies the reported SNR.
    */
   void CheckShape(uint32_t M, uint32_t K, uint32_t N) {
     SCOPED_TRACE("M=" + std::to_string(M) + " K=" + std::to_string(K) +
@@ -450,43 +417,27 @@ protected:
     quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
     std::vector<uint8_t> exp_u_rm;
     quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
-    std::vector<uint8_t> exp_ah;
-    pack_ah_from_rowmajor(exp_u_rm, m_pad, K, exp_ah);
     std::vector<int32_t> exp_acc;
     ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
     std::vector<float> exp_out;
     ref_dequant(exp_acc, M, N, exp_scale, exp_zp, colsum, d, bias, exp_out);
 
-    std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
-    std::vector<float> got_scale(m_pad, 0.0f);
-    std::vector<int32_t> got_zp(m_pad, -1);
-    std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
     std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
+    uint32_t weight = 0xFFFFFFFFu;
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4(
+                handle_, K, N, q_w.data(), static_cast<int>(q_w.size()),
+                d.data(), static_cast<int>(d.size()), colsum.data(),
+                static_cast<int>(colsum.size()), bias.data(),
+                static_cast<int>(bias.size()), &weight),
+              AEE_SUCCESS);
+    ASSERT_NE(weight, 0xFFFFFFFFu) << "handle not written";
+    const int err = nntr_hvx_mm_u8i4_layer(
+      handle_, M, K, &weight, 1, x.data(), static_cast<int>(x.size()),
+      got_out.data(), static_cast<int>(got_out.size()));
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, weight), AEE_SUCCESS);
+    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer failed: " << hex(err);
 
-    int err = nntr_hvx_mm_u8i4_from_f32(
-      handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
-      static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
-      colsum.data(), static_cast<int>(colsum.size()), bias.data(),
-      static_cast<int>(bias.size()), got_ah.data(),
-      static_cast<int>(got_ah.size()), got_scale.data(),
-      static_cast<int>(got_scale.size()), got_zp.data(),
-      static_cast<int>(got_zp.size()), got_acc.data(),
-      static_cast<int>(got_acc.size()), got_out.data(),
-      static_cast<int>(got_out.size()));
-    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
-
-    // S1
-    for (uint32_t m = 0; m < m_pad; ++m) {
-      EXPECT_NEAR(got_scale[m], exp_scale[m], std::abs(exp_scale[m]) * 1e-6f)
-        << "scale[" << m << "]";
-      EXPECT_EQ(got_zp[m], exp_zp[m]) << "zp[" << m << "]";
-    }
-    EXPECT_EQ(got_ah, exp_ah);
-
-    // S2
-    EXPECT_EQ(got_acc, exp_acc);
-
-    // S3
+    // Compare the registered layer output with the independent CPU reference.
     for (size_t i = 0; i < exp_out.size(); ++i) {
       EXPECT_NEAR(got_out[i], exp_out[i], std::abs(exp_out[i]) * 1e-5f + 1e-6f);
     }
@@ -522,7 +473,7 @@ TEST_F(HmxMmU8I4, Shape2_DecodeSingleToken) {
 }
 
 TEST_F(HmxMmU8I4, Shape3_PrefillQwen3Scale) {
-  // Weights alone need (1024/32)*(1024/32)*512 = 512 KiB of VTCM here.
+  // A 512 KiB WH weight exercises the registered layer's DMA tiling.
   CheckShape(64, 1024, 1024);
 }
 
@@ -533,12 +484,10 @@ TEST_F(HmxMmU8I4, Shape4_MultipleRowBlocks) {
 }
 
 /**
- * @brief The performance path: weights registered once, several matmuls
- *        per call sharing one activation.
+ * @brief Registered weights, several matmuls per call sharing one activation.
  *
- * Shares HmxMmU8I4's helpers rather than duplicating a reference: the
- * layer endpoint must produce exactly what calling the accuracy endpoint
- * once per weight would, so that is what these compare against.
+ * Uses the same independent CPU quantization, integer matmul and
+ * dequantization reference as the single-weight shape checks.
  */
 class HmxMmU8I4Layer : public HmxMmU8I4 {
 protected:
@@ -587,7 +536,7 @@ protected:
   }
 
   /** @brief Host reference for one weight's slice of the concatenated
-   *         output, via the same path the accuracy harness checks. */
+   *         output, using the same independent reference as CheckShape. */
   void ExpectedFor(const Weight &w, const std::vector<float> &x, uint32_t M,
                    uint32_t K, std::vector<float> &out) {
     const uint32_t m_pad = round_up(M, kTileRow);
@@ -805,224 +754,10 @@ TEST_F(HmxMmU8I4Layer, MismatchedKIsRejected) {
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
 }
 
-TEST_F(HmxMmU8I4Layer, BakeBitsDump) {
-  // Print-only: one registered weight at the MoE gate_up prefill shape, its
-  // layer output reduced to an FNV-1a hash of the raw f32 bytes. Comparing
-  // the printed value across two skel builds is the bit-identity gate doc
-  // 43 §5 L1 asks for ("compare a registered weight's matmul output against
-  // the current build") -- any WH byte a parallelised bake drops or
-  // transposes moves some accumulator, hence some output bit. The expected
-  // hash lives in the measurement log, not in an assertion: there is no
-  // independent oracle for it, only the previous build.
-  const uint32_t M = 64, K = 2048, N = 3584;
-
-  Weight w;
-  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xBA5E0001u, w));
-
-  std::vector<float> x(static_cast<size_t>(M) * K);
-  fill_deterministic(x, 0x5EED0002u);
-  const uint32_t handles[1] = {w.handle};
-  std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
-  int err = nntr_hvx_mm_u8i4_layer(handle_, M, K, handles, 1, x.data(),
-                                   static_cast<int>(x.size()), got.data(),
-                                   static_cast<int>(got.size()));
-  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer failed: " << hex(err);
-
-  uint64_t h = 1469598103934665603ull; // FNV-1a 64-bit offset basis
-  const auto *bytes = reinterpret_cast<const uint8_t *>(got.data());
-  for (size_t i = 0; i < got.size() * sizeof(float); ++i) {
-    h ^= bytes[i];
-    h *= 1099511628211ull;
-  }
-  std::cout << "U8I4_FIELD path=bake_bits field=out_f32_fnv1a value=0x"
-            << std::hex << h << std::dec << " (M=" << M << " K=" << K
-            << " N=" << N << ")" << std::endl;
-
-  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
-}
-
 /**
- * @brief Per-call cost of the harness endpoint against the layer endpoint.
- *
- * Printed, never asserted. Cross-matmul prefetch measured 1.7-2x on a
- * V79, but that was inside a standalone DSP program with no FastRPC in the
- * timed region, and thermal state moves these numbers between runs -- a
- * threshold here would encode the lab conditions rather
- * than a property of the code. Read the ratio, do not gate on it.
- */
-TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
-  const uint32_t M = 64, K = 1024, N = 1024;
-  const int kReps = 20;
-
-  std::vector<float> x(static_cast<size_t>(M) * K);
-  fill_deterministic(x, 0x5EED0002u);
-
-  Weight w;
-  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xF00D0001u, w));
-  const uint32_t handles[1] = {w.handle};
-
-  std::vector<float> out(static_cast<size_t>(M) * N, 0.0f);
-  auto time_us = [&](const std::function<void()> &fn) {
-    fn(); // warm-up, discarded
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < kReps; ++i) {
-      fn();
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::micro>(t1 - t0).count() / kReps;
-  };
-
-  const uint32_t m_pad = round_up(M, kTileRow);
-  std::vector<uint8_t> ah(static_cast<size_t>(m_pad) * K, 0);
-  std::vector<float> sc(m_pad, 0.0f);
-  std::vector<int32_t> zp(m_pad, 0);
-  std::vector<int32_t> acc(static_cast<size_t>(m_pad) * N, 0);
-  std::vector<float> harness_out(static_cast<size_t>(M) * N, 0.0f);
-
-  const double harness_us = time_us([&] {
-    nntr_hvx_mm_u8i4_from_f32(
-      handle_, M, K, N, x.data(), static_cast<int>(x.size()), w.q_w.data(),
-      static_cast<int>(w.q_w.size()), w.d.data(), static_cast<int>(w.d.size()),
-      w.colsum.data(), static_cast<int>(w.colsum.size()), w.bias.data(),
-      static_cast<int>(w.bias.size()), ah.data(), static_cast<int>(ah.size()),
-      sc.data(), static_cast<int>(sc.size()), zp.data(),
-      static_cast<int>(zp.size()), acc.data(), static_cast<int>(acc.size()),
-      harness_out.data(), static_cast<int>(harness_out.size()));
-  });
-
-  const double layer_us = time_us([&] {
-    nntr_hvx_mm_u8i4_layer(handle_, M, K, handles, 1, x.data(),
-                           static_cast<int>(x.size()), out.data(),
-                           static_cast<int>(out.size()));
-  });
-
-  std::cout << "U8I4_FIELD path=harness  field=us_per_matmul value="
-            << harness_us << std::endl;
-  std::cout << "U8I4_FIELD path=layer_x1 field=us_per_matmul value=" << layer_us
-            << std::endl;
-
-  // Several weights per call is where the prefetch has something to hide
-  // behind; x1 above cannot show it by construction -- with a single
-  // matmul there is nothing to overlap the transfer with, so it is parity.
-  std::vector<Weight> ws(4);
-  std::vector<uint32_t> hs;
-  uint32_t n_total = 0;
-  for (int i = 0; i < 4; ++i) {
-    ASSERT_NO_FATAL_FAILURE(
-      MakeAndRegister(K, N, 0xF00D1000u + i * 0x100u, ws[i]));
-    hs.push_back(ws[i].handle);
-    n_total += ws[i].N;
-  }
-  std::vector<float> out4(static_cast<size_t>(M) * n_total, 0.0f);
-  const double layer4_us = time_us([&] {
-    nntr_hvx_mm_u8i4_layer(
-      handle_, M, K, hs.data(), static_cast<int>(hs.size()), x.data(),
-      static_cast<int>(x.size()), out4.data(), static_cast<int>(out4.size()));
-  });
-  std::cout << "U8I4_FIELD path=layer_x4 field=us_per_matmul value="
-            << (layer4_us / 4.0) << std::endl;
-  std::cout << "U8I4_FIELD path=layer_x4 field=speedup_vs_harness value="
-            << (harness_us / (layer4_us / 4.0)) << std::endl;
-
-  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
-  for (const auto &ww : ws) {
-    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, ww.handle), AEE_SUCCESS);
-  }
-}
-
-/**
- * @brief [L2] fused gate_up -> SwiGLU -> down against the unfused two-call
- *        path.
- *
- * Reference: one mm_u8i4_layer call for gate_up, host SwiGLU (plain expf),
- * one mm_u8i4_layer call for down. The fused call requantizes ITS OWN HVX
- * SwiGLU output, so the intermediate's per-row scale comes from slightly
- * different values and bit equality is not expected even in principle --
- * the gate is SNR (doc 43 §[L2] accuracy rule), thresholded at 40 dB, the
- * u8 requantization floor this seam sits on. This is also the only check
- * that pins the gate/up split semantics: swapping gate and up changes
- * every output element, not a few.
- */
-TEST_F(HmxMmU8I4Layer, FusedSwigluMatchesTwoCallReference) {
-  // The real seam's shape: LFM2-A1B expert FFN at prefill (gate_up
-  // 2048x3584, down 1792x2048, 64 tokens) -- exercises the gate/up split
-  // at the real tile boundary (I = 1792 = 56 tiles) and the ~6.65 MB
-  // fused VTCM layout.
-  const uint32_t K = 2048, I = 1792, N = 2048;
-
-  Weight gu, dn;
-  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xBA5E0002u, gu));
-  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xBA5E0003u, dn));
-
-  // M sweep, not just 64: the fused kernel walks the rows in 64-row blocks,
-  // and M == 64 is the ONE value that exercises neither a partial block nor
-  // a second block. The real model never sees it -- 444 tokens x topk 4 over
-  // 32 experts averages M = 55.5, spread either side -- so 64-only coverage
-  // left the whole block loop untested (doc 43 §7's fused row).
-  for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
-    std::vector<float> x(static_cast<size_t>(M) * K);
-    fill_deterministic(x, 0x5EED0002u);
-
-    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
-    {
-      const uint32_t handles[1] = {gu.handle};
-      int err = nntr_hvx_mm_u8i4_layer(
-        handle_, M, K, handles, 1, x.data(), static_cast<int>(x.size()),
-        gu_out.data(), static_cast<int>(gu_out.size()));
-      ASSERT_EQ(err, AEE_SUCCESS) << "gate_up layer call failed: " << hex(err);
-    }
-
-    std::vector<float> inter(static_cast<size_t>(M) * I);
-    for (uint32_t m = 0; m < M; ++m) {
-      for (uint32_t j = 0; j < I; ++j) {
-        const float g = gu_out[static_cast<size_t>(m) * 2 * I + j];
-        const float u = gu_out[static_cast<size_t>(m) * 2 * I + I + j];
-        inter[static_cast<size_t>(m) * I + j] = g / (1.0f + std::exp(-g)) * u;
-      }
-    }
-
-    std::vector<float> dn_ref(static_cast<size_t>(M) * N, 0.0f);
-    {
-      const uint32_t handles[1] = {dn.handle};
-      int err = nntr_hvx_mm_u8i4_layer(
-        handle_, M, I, handles, 1, inter.data(), static_cast<int>(inter.size()),
-        dn_ref.data(), static_cast<int>(dn_ref.size()));
-      ASSERT_EQ(err, AEE_SUCCESS) << "down layer call failed: " << hex(err);
-    }
-
-    const uint32_t handles[2] = {gu.handle, dn.handle};
-    std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
-    int err = nntr_hvx_mm_u8i4_layer_fused(
-      handle_, M, K, handles, 2, x.data(), static_cast<int>(x.size()),
-      got.data(), static_cast<int>(got.size()));
-    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer_fused failed: " << hex(err);
-
-    const double snr = snr_db(dn_ref, got);
-    std::cout << "U8I4_FIELD path=fused_swiglu field=snr_db value=" << snr
-              << " (M=" << M << " K=" << K << " I=" << I << " N=" << N << ")"
-              << std::endl;
-    EXPECT_GT(snr, 40.0)
-      << "fused SwiGLU output below the u8 requantization floor, M=" << M;
-  } // M sweep
-
-  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
-  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
-}
-
-/**
- * @brief [L2, split-call variant] gate_up+SwiGLU+requant, checked in
- *        ISOLATION against the two-call reference's OWN intermediate --
- *        not just the final output.
- *
- * This is the gap the fused kernel's unit test had: SNR against a
- * two-call reference only ever checks the END of the pipeline, so a bug
- * anywhere upstream of the last matmul is invisible as long as it is
- * consistent between the path under test and the reference (which it is
- * not here -- the reference's intermediate is plain host f32, computed
- * independently of any DSP call). Comparing the SPLIT call's own
- * requantized intermediate against that host intermediate, before ever
- * touching the down matmul, localizes a divergence to stage 1 instead of
- * leaving it to be inferred from the end-to-end number.
+ * @brief Checks gate_up+SwiGLU+requant against an independent host
+ *        intermediate before the down matmul, so quantization errors can
+ *        be localized to the first stage of the production path.
  */
 TEST_F(HmxMmU8I4Layer, GateUpSwigluMatchesHostIntermediate) {
   for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
@@ -1034,9 +769,7 @@ TEST_F(HmxMmU8I4Layer, GateUpSwigluMatchesHostIntermediate) {
     std::vector<float> x(static_cast<size_t>(M) * K);
     fill_deterministic(x, 0x5EED0002u);
 
-    // Host reference: gate_up via the already-proven mm_u8i4_layer, SwiGLU
-    // on the host with expf (same reference formula as
-    // FusedSwigluMatchesTwoCallReference above).
+    // Host reference: gate_up via mm_u8i4_layer, then host SwiGLU with expf.
     std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
     {
       const uint32_t handles[1] = {gu.handle};
@@ -1107,12 +840,9 @@ TEST_F(HmxMmU8I4Layer, GateUpSwigluMatchesHostIntermediate) {
 }
 
 /**
- * @brief [L2, split-call variant] end to end: gate_up_swiglu's output fed
- *        straight into mm_u8i4_layer_u8in for the down matmul, compared
- *        against the same two-call reference FusedSwigluMatchesTwoCall
- *        Reference uses. Complements that test's stage-1-only sibling
- *        above: this one exercises the ACTUAL production call sequence
- *        (what ARM dispatch will do), not just stage 1 in isolation.
+ * @brief Checks the production gate_up_swiglu -> mm_u8i4_layer_u8in
+ *        sequence against two matmuls with an independent host SwiGLU
+ *        intermediate, complementing the stage-one check above.
  */
 TEST_F(HmxMmU8I4Layer, GateUpSwigluPlusU8InMatchesTwoCallReference) {
   for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
@@ -1630,7 +1360,7 @@ TEST_F(HmxMmU8I4Layer, MoeLayerSplitMatchesWhole) {
 }
 
 TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
-  const uint32_t K = 2048, I = 1792, N = 2048;
+  const uint32_t K = 2048, I = 1792;
 
   // Well past the clamp, not at it: gate = matmul + bias, and the matmul
   // term is O(10) for these fills, so -200 and beyond is past -88 with room
@@ -1638,10 +1368,9 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
   const std::vector<std::pair<uint32_t, float>> gate_overrides = {
     {37u, -200.0f}, {1000u, -300.0f}, {1791u, -400.0f}};
 
-  Weight gu, dn;
+  Weight gu;
   ASSERT_NO_FATAL_FAILURE(
     MakeAndRegister(K, 2 * I, 0xBA5E0007u, gu, gate_overrides));
-  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xBA5E0008u, dn));
 
   for (const uint32_t M : {55u, 64u}) {
     std::vector<float> x(static_cast<size_t>(M) * K);
@@ -1679,7 +1408,7 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
       }
     }
 
-    // Kernel 1: the split gate_up + SwiGLU + requant call.
+    // The production gate_up + SwiGLU + requant call.
     const uint32_t m_pad = round_up(M, kTileRow);
     const uint32_t n_ktiles = I / 32;
     std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * I, 0);
@@ -1724,88 +1453,14 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
          "gate, M="
       << M;
 
-    // Kernel 2: the one-call fused path, same gates, end to end.
-    std::vector<float> dn_ref(static_cast<size_t>(M) * N, 0.0f);
-    {
-      const uint32_t handles[1] = {dn.handle};
-      int e2 =
-        nntr_hvx_mm_u8i4_layer(handle_, M, I, handles, 1, inter_ref.data(),
-                               static_cast<int>(inter_ref.size()),
-                               dn_ref.data(), static_cast<int>(dn_ref.size()));
-      ASSERT_EQ(e2, AEE_SUCCESS) << "down layer call failed: " << hex(e2);
-    }
-    const uint32_t fused_handles[2] = {gu.handle, dn.handle};
-    std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
-    err = nntr_hvx_mm_u8i4_layer_fused(
-      handle_, M, K, fused_handles, 2, x.data(), static_cast<int>(x.size()),
-      got.data(), static_cast<int>(got.size()));
-    ASSERT_EQ(err, AEE_SUCCESS)
-      << "mm_u8i4_layer_fused failed: " << hex(err) << " M=" << M;
-
-    for (size_t i = 0; i < got.size(); ++i) {
-      ASSERT_TRUE(std::isfinite(got[i]))
-        << "fused output element " << i << " is " << got[i]
-        << " -- NaN reached the down matmul's output (M=" << M << ")";
-    }
-    const double snr_fused = snr_db(dn_ref, got);
-    std::cout << "U8I4_FIELD path=fused_swiglu_extreme field=snr_db value="
-              << snr_fused << " (M=" << M << ")" << std::endl;
-    EXPECT_GT(snr_fused, 40.0)
-      << "fused SwiGLU output degraded by an out-of-clamp gate, M=" << M;
   } // M sweep
 
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
-  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
 }
 
 /**
- * @brief u8i8's counterpart to HmxMmU8I4Layer. Same tests, same shapes,
- *        the wider weight quantizer, and the _u8i8 entry points --
- *        mirrored rather than templated on width for the same reason
- *        hexkl_mm_u8i8_dma.c mirrors hexkl_mm_u8i4_dma.c: the u8i4 side
- *        is proven, and a shared test fixture parametrised on width would
- *        need re-verifying that it still exercises u8i4 correctly to
- *        trust either.
- */
-/**
- * @brief [doc 45 Gate 0b] Which of the two memory limits stopped Gate 0.
- *
- * Gate 0 registered 1.89 GB of the 4.10 the whole-model plan needs and
- * failed with 0x8000040d -- raised before the registration function ran, so
- * the PD could not service the call rather than running out of the malloc
- * heap the baked weights sit in. Section 8.4's redesign moves those weights
- * into one ION arena the DSP maps and reads directly, which gets past a PD
- * heap limit but not past the DSP's virtual address space. This measures
- * three numbers that separate them:
- *
- *   dsp_heap_gb   what the DSP can malloc and touch with no payload in
- *                 flight -- the heap ceiling on its own
- *   ion_single_gb the largest single rpcmem buffer the DSP can touch every
- *                 page of; what the one-arena design needs to be >= 4.10
- *   ion_total_gb  how much rpcmem the host can allocate and have the DSP
- *                 touch across several buffers -- the fallback if one
- *                 arena is capped
- *
- * Not an assertion. Three branches follow from the numbers (doc 45 section
- * 8.5) and only one of them is a failure, so this reports and passes; the
- * decision is a design one, not a regression.
- */
-/**
- * @brief [doc 46 section 32.4] Gate 0c: can the DSP map a host ION buffer
- *        and DMA out of it?
- *
- * The converted-model plan rests on one mechanism this tree has never
- * exercised. Every weight path so far copies bytes to the DSP, which then
- * owns them in its own heap; the arena instead hands the DSP a file
- * descriptor, maps it once, and leaves the bytes where they are. Gate 0b
- * measured how much ION the host could allocate -- it said nothing about
- * whether the DSP can reach it.
- *
- * Reports rather than asserts, like the other two probes: a device that
- * cannot do this is a fact about the plan, not a broken build. The one
- * thing it does check is the checksum, because a mapping that succeeds and
- * reads as zeros would otherwise look like a pass with a very good
- * bandwidth number.
+ * @brief Maps a host ION buffer and checks the checksum after DSP DMA.
+ *        Reports mapping support and transfer timing for the device.
  */
 TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   auto field = [](const char *k, const std::string &v) {
@@ -3118,126 +2773,15 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
   ReleaseMoeExperts(x);
 }
 
-TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
-  const double need_gb = 4.10;
-
-  // --- 1. the DSP's own heap, no payload -------------------------------
-  {
-    const uint32_t chunk_mb = 64, max_chunks = 128; // stop past 8 GB
-    std::vector<uint32_t> chunks_ok(1, 0);
-    // unsigned long long, matching what the IDL's uint64 generates. The
-    // fixed-width alias is `unsigned long` on aarch64 -- same width, and
-    // C++ still refuses the pointer conversion.
-    std::vector<unsigned long long> touched(1, 0);
-    const int err = nntr_hvx_mem_probe_dsp_heap(
-      handle_, chunk_mb, max_chunks, chunks_ok.data(), 1, touched.data(), 1);
-    const double gb =
-      err == AEE_SUCCESS ? chunks_ok[0] * chunk_mb / 1024.0 : 0.0;
-    std::cout << "U8I4_FIELD path=mem field=dsp_heap_gb value=" << gb << "\n"
-              << "U8I4_FIELD path=mem field=dsp_heap_err value=" << hex(err)
-              << std::endl;
-  }
-
-  // --- 2. rpcmem/ION: one buffer, as large as it will go ---------------
-  // rpcmem_alloc's size argument is int, so 2 GB - 1 is the API's own
-  // ceiling regardless of the device; rpcmem_alloc2 takes size_t where it
-  // exists. Which one is available is itself part of the answer.
-  using AllocFn = void *(*)(int, uint32_t, int);
-  using Alloc2Fn = void *(*)(int, uint32_t, size_t);
-  using FreeFn = void (*)(void *);
-  auto init = (void (*)(void))dlsym(RTLD_DEFAULT, "rpcmem_init");
-  auto alloc = (AllocFn)dlsym(RTLD_DEFAULT, "rpcmem_alloc");
-  auto alloc2 = (Alloc2Fn)dlsym(RTLD_DEFAULT, "rpcmem_alloc2");
-  auto rfree = (FreeFn)dlsym(RTLD_DEFAULT, "rpcmem_free");
-  if (!alloc || !rfree) {
-    std::cout << "U8I4_FIELD path=mem field=rpcmem value=absent" << std::endl;
-    GTEST_SKIP() << "no rpcmem in this process -- ION cannot be measured";
-  }
-  if (init) {
-    init();
-  }
-  const int kHeapIdContig = 25; // RPCMEM_HEAP_ID_SYSTEM
-  const uint32_t kFlags = 1;    // RPCMEM_DEFAULT_FLAGS
-  std::cout << "U8I4_FIELD path=mem field=rpcmem_alloc2 value="
-            << (alloc2 ? "yes" : "no") << std::endl;
-
-  auto try_alloc = [&](size_t bytes) -> void * {
-    if (alloc2) {
-      return alloc2(kHeapIdContig, kFlags, bytes);
-    }
-    if (bytes > 0x7FFFFFFFull) {
-      return nullptr; // int would overflow; not a device limit, an API one
-    }
-    return alloc(kHeapIdContig, kFlags, static_cast<int>(bytes));
-  };
-  // The DSP side takes bufLen as int, so a single call cannot describe more
-  // than 2 GB - 1 no matter how the allocation went.
-  auto dsp_can_touch = [&](void *p, size_t bytes) -> bool {
-    if (bytes > 0x7FFFFFFFull) {
-      return false;
-    }
-    std::vector<unsigned long long> touched(1, 0);
-    return nntr_hvx_mem_probe_touch(handle_, static_cast<const uint8_t *>(p),
-                                    static_cast<int>(bytes), touched.data(),
-                                    1) == AEE_SUCCESS;
-  };
-
-  double single_gb = 0.0;
-  for (size_t mb : {256u, 512u, 1024u, 1536u, 2047u}) {
-    const size_t bytes = mb * 1024u * 1024u;
-    void *p = try_alloc(bytes);
-    if (!p) {
-      break;
-    }
-    const bool ok = dsp_can_touch(p, bytes);
-    rfree(p);
-    if (!ok) {
-      break;
-    }
-    single_gb = mb / 1024.0;
-  }
-  std::cout << "U8I4_FIELD path=mem field=ion_single_gb value=" << single_gb
-            << std::endl;
-
-  // --- 3. how much ION in total, across buffers, the DSP can reach -----
-  // FastRPC keeps an ION buffer's SMMU mapping across calls (htp_rpcmem.h),
-  // so buffers touched in earlier calls should still be mapped; if the
-  // ceiling here is the DSP's address space rather than the host's memory,
-  // this is where it shows.
-  {
-    // 24 x 256 MB = 6 GB, not 10: the first run of this test produced no
-    // ion_total_gb line at all, which is what an OOM kill looks like from
-    // the log's side. 6 GB is comfortably past the 4.10 the plan needs and
-    // leaves the phone room to keep the process alive.
-    const size_t chunk = 256u * 1024u * 1024u;
-    const size_t max_chunks = 24;
-    std::vector<void *> bufs;
-    while (bufs.size() < max_chunks) {
-      void *p = try_alloc(chunk);
-      if (!p) {
-        break;
-      }
-      if (!dsp_can_touch(p, chunk)) {
-        rfree(p);
-        break;
-      }
-      bufs.push_back(p);
-      // Printed as it goes, so a run that dies partway still leaves its
-      // last good value in the log rather than nothing.
-      std::cout << "U8I4_FIELD path=mem field=ion_total_gb value="
-                << bufs.size() * chunk / 1073741824.0 << std::endl;
-    }
-    const double total_gb = bufs.size() * chunk / 1073741824.0;
-    for (void *p : bufs) {
-      rfree(p);
-    }
-    std::cout << "U8I4_FIELD path=mem field=ion_total_final_gb value="
-              << total_gb << "\n"
-              << "U8I4_FIELD path=mem field=need_gb value=" << need_gb
-              << std::endl;
-  }
-}
-
+/**
+ * @brief u8i8's counterpart to HmxMmU8I4Layer. Same tests, same shapes,
+ *        the wider weight quantizer, and the _u8i8 entry points --
+ *        mirrored rather than templated on width for the same reason
+ *        hexkl_mm_u8i8_dma.c mirrors hexkl_mm_u8i4_dma.c: the u8i4 side
+ *        is proven, and a shared test fixture parametrised on width would
+ *        need re-verifying that it still exercises u8i4 correctly to
+ *        trust either.
+ */
 class HmxMmU8I8Layer : public HmxMmU8I4 {
 protected:
   struct Weight {
@@ -3385,10 +2929,10 @@ TEST_F(HmxMmU8I8Layer, MismatchedKIsRejected) {
 }
 
 /**
- * @brief Per-call cost, u8i4 vs u8i8, both through the layer endpoint --
- *        not against the (u8i4-only) accuracy harness this time, since
- *        there is no u8i8 harness to compare against. Printed, not
- *        asserted, for the same reason as HmxMmU8I4Layer.ReportPerCallCost.
+ * @brief Per-call cost, u8i4 vs u8i8, both through the layer endpoint.
+ *
+ * Printed without a timing assertion because thermal state changes the
+ * measured cost between runs.
  */
 TEST_F(HmxMmU8I8Layer, ReportPerCallCostVsU8I4) {
   const uint32_t M = 64, K = 1024, N = 1024;
@@ -3462,118 +3006,6 @@ TEST_F(HmxMmU8I8Layer, ReportPerCallCostVsU8I4) {
 /**
  * @brief Main gtest
  */
-/**
- * @brief Where the DSP's address space ends, and whether its heap is a
- *        separate budget from its mappings.
- *
- * The model needs 3.61 GiB of weights DSP-resident. A device run mapped
- * exactly 3.00 GiB with fastrpc_mmap and was then refused at every size down
- * to 64 MiB (doc 46 section 40), so the mapping budget is spent. The DSP heap
- * was untouched in that run -- every weight went to the arena -- and Gate 0
- * measured that heap reaching 1.89 GB, which is three times the 0.61 GiB
- * still needed.
- *
- * So: are the two the same exhausted address space, or two regions of it?
- * The answer decides between a small change (overflow the last weights onto
- * the heap) and a large one (a second PD, or a smaller model), and nothing
- * on the device reports it. This fills the mapping budget and then asks the
- * heap for weights until it refuses too.
- *
- * Not gated -- there is no right answer to assert, only a number to read.
- * Allocates and frees every buffer it takes; at 256 MiB a step it holds the
- * whole mapping budget at once, which is the point.
- */
-TEST_F(HmxMmU8I4Layer, ArenaCeilingThenHeapHeadroom) {
-  auto field = [](const char *k, const std::string &v) {
-    std::cout << "U8I4_FIELD path=ceiling field=" << k << " value=" << v
-              << "\n";
-  };
-
-  auto alloc =
-    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
-  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
-  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
-  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
-  using FastrpcMunmap = int (*)(int, int, void *, size_t);
-  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
-  auto fmunmap = (FastrpcMunmap)dlsym(RTLD_DEFAULT, "fastrpc_munmap");
-  if (!alloc || !rfree || !to_fd || !fmmap) {
-    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
-  }
-
-  // 256 MiB a step: fine enough to land within a quarter GiB of the real
-  // ceiling, coarse enough that filling ~3 GiB is a dozen calls.
-  const size_t kStep = size_t(256) << 20;
-  struct Mapped {
-    void *buf;
-    int fd;
-    size_t bytes;
-  };
-  std::vector<Mapped> mapped;
-  size_t total = 0;
-  int last_rc = 0;
-  for (int i = 0; i < 32; ++i) {
-    void *buf = alloc(25 /*RPCMEM_HEAP_ID_SYSTEM*/, 0 /*UNCACHED*/,
-                      static_cast<int>(kStep));
-    if (buf == nullptr) {
-      field("stopped_by", "rpcmem_alloc"); // host ION, not the DSP
-      break;
-    }
-    const int fd = to_fd(buf);
-    last_rc = fmmap(CDSP_DOMAIN_ID, fd, buf, 0, kStep,
-                    static_cast<int>(FASTRPC_MAP_FD));
-    if (last_rc != 0) {
-      rfree(buf);
-      field("stopped_by", "fastrpc_mmap");
-      field("last_mmap_rc", hex(last_rc));
-      break;
-    }
-    mapped.push_back(Mapped{buf, fd, kStep});
-    total += kStep;
-  }
-  field("mmap_ceiling_mib", std::to_string(total >> 20));
-
-  // Now the heap, with the mapping budget held. weight_register_u8i4 bakes,
-  // so each call leaves (K/32)*(N/32)*512 bytes on the DSP heap -- the
-  // model's largest weight, so the count converts straight to what the
-  // overflow would need (238 weights short, doc 46 section 40).
-  const uint32_t K = 2048, N = 3584;
-  const size_t wh_bytes = nntrainer::whBytes(K, N);
-  std::vector<int8_t> q_w(static_cast<size_t>(K) * N);
-  for (size_t i = 0; i < q_w.size(); ++i)
-    q_w[i] = static_cast<int8_t>((i % 15u) - 7);
-  std::vector<float> d(N, 0.01f), bias(N, 0.0f);
-  std::vector<int32_t> colsum(N, 0);
-
-  std::vector<uint32_t> heap_handles;
-  int heap_rc = AEE_SUCCESS;
-  for (int i = 0; i < 300; ++i) {
-    uint32_t h = 0xFFFFFFFFu;
-    heap_rc = nntr_hvx_weight_register_u8i4(
-      handle_, K, N, q_w.data(), static_cast<int>(q_w.size()), d.data(),
-      static_cast<int>(d.size()), colsum.data(),
-      static_cast<int>(colsum.size()), bias.data(),
-      static_cast<int>(bias.size()), &h);
-    if (heap_rc != AEE_SUCCESS)
-      break;
-    heap_handles.push_back(h);
-  }
-  field("heap_weights", std::to_string(heap_handles.size()));
-  field("heap_mib", std::to_string((heap_handles.size() * wh_bytes) >> 20));
-  field("heap_stop_rc", hex(heap_rc));
-  // 238 is what the model is short by; anything at or above it means the
-  // overflow fits and the fix is small.
-  field("covers_overflow", heap_handles.size() >= 238 ? "yes" : "no");
-
-  for (uint32_t h : heap_handles)
-    nntr_hvx_weight_release_u8i4(handle_, h);
-  for (const Mapped &m : mapped) {
-    if (fmunmap != nullptr)
-      fmunmap(CDSP_DOMAIN_ID, m.fd, m.buf, m.bytes);
-    rfree(m.buf);
-  }
-}
-
 int main(int argc, char **argv) {
   int result = -1;
 

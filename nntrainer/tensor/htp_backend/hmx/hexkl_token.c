@@ -12,9 +12,9 @@
  *
  * Plain C over volatile words, so test/htp/host/token_host_check.c runs
  * it against an owner pthread as it is: off the DSP the cache calls are
- * sequentially consistent fences and the poll sleep is nanosleep. The
- * waits, the posts and the stale checks are the #178 probe's
- * (nntr_hvx_mailbox.c), made per miss round of a token.
+ * sequentially consistent fences and the poll sleep is nanosleep.
+ * Each miss round posts a sequence-tagged request, waits for the ARM
+ * response and checks its sequence before consuming the updated weights.
  */
 
 #if !defined(__hexagon__) && !defined(_POSIX_C_SOURCE)
@@ -71,7 +71,7 @@ static void tk_clean(void *p, uint32_t n) {
 
 /** @brief The ARM's lines are re-read from DDR. Flush-invalidate, never a
  *  bare invalidate: a bare invalidate could drop a not-yet-cleaned store
- *  of ours on a shared line (the probe's rule). */
+ *  of ours on a shared line. */
 static void tk_refresh(void *p, uint32_t n) {
 #if defined(__hexagon__)
   qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)n,

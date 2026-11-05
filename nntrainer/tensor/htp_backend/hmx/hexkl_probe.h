@@ -18,9 +18,9 @@
  * the rest of the debug surface (MHA_HTP_PLAN.md 9.5).
  *
  * Globals, not parameters: threading a stats struct through the layer_run
- * signature would touch every caller for scaffolding. The DSP session is
- * single-threaded through these calls, and the counters are read only by
- * hexkl_attn_u8_forward, which resets them on entry.
+ * signature would touch every caller for scaffolding. The DSP session
+ * serializes these calls; timed layer and graph entries reset and collect
+ * the counters.
  */
 
 #ifndef __NNTRAINER_HEXKL_PROBE_H__
@@ -166,7 +166,7 @@ extern int hexkl_probe_on;
 /** @brief Zeroes every counter and sets whether the probes run at all. */
 void hexkl_probe_reset(int enable);
 
-/** @brief Same DSP-internal clock hexkl_attn_u8.c times stages with. */
+/** @brief DSP-internal clock for stage timings, in microseconds. */
 static inline uint64_t hexkl_probe_now(void) {
   return HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
 }

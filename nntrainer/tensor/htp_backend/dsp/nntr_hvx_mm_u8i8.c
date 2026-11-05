@@ -10,10 +10,8 @@
  * @bug    No known bugs except for NYI items
  *
  * Mirrors nntr_hvx_mm_u8i4.c's weight_register_u8i4/weight_release_u8i4/
- * mm_u8i4_layer trio, at the wider weight width. There is no u8i8
- * accuracy-harness endpoint to mirror nntr_hvx_mm_u8i4_from_f32: u8i8 was
- * never given one in #4236, and none is added here -- the layer endpoint
- * is checked directly against the same per-weight integer reference the
+ * mm_u8i4_layer trio, at the wider weight width. The layer endpoint is
+ * checked directly against the same per-weight integer reference the
  * u8i4 tests use (unittest_hvx_mm_u8i4.cpp's HmxMmU8I8Layer fixture).
  */
 

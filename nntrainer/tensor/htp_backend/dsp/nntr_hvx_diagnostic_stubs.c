@@ -7,24 +7,6 @@
 #include "nntr_hvx.h"
 #include <AEEStdErr.h>
 
-int nntr_hvx_dma_probe(remote_handle64 _h, uint32 arena, uint32 src_off,
-                       uint32 bytes, uint32 row_size, uint32 nrows,
-                       uint32 src_stride, uint32 workers, uint32 passes,
-                       uint32 *res, int resLen) {
-  (void)_h;
-  (void)arena;
-  (void)src_off;
-  (void)bytes;
-  (void)row_size;
-  (void)nrows;
-  (void)src_stride;
-  (void)workers;
-  (void)passes;
-  (void)res;
-  (void)resLen;
-  return AEE_EUNSUPPORTED;
-}
-
 int nntr_hvx_dma_replay(remote_handle64 _h, uint32 arena, uint32 region_bytes,
                         const uint32 *schedule, int scheduleLen, uint32 workers,
                         uint32 load, uint32 pace, uint32 fresh, uint32 gap_us,
@@ -40,21 +22,6 @@ int nntr_hvx_dma_replay(remote_handle64 _h, uint32 arena, uint32 region_bytes,
   (void)fresh;
   (void)gap_us;
   (void)calls;
-  (void)res;
-  (void)resLen;
-  return AEE_EUNSUPPORTED;
-}
-
-int nntr_hvx_dspq_bench_start(remote_handle64 _h, uint64 queue_id,
-                              uint32 mode) {
-  (void)_h;
-  (void)queue_id;
-  (void)mode;
-  return AEE_EUNSUPPORTED;
-}
-
-int nntr_hvx_dspq_bench_stop(remote_handle64 _h, uint32 *res, int resLen) {
-  (void)_h;
   (void)res;
   (void)resLen;
   return AEE_EUNSUPPORTED;
@@ -91,16 +58,6 @@ int nntr_hvx_sf_probe(remote_handle64 _h, uint32 op, const float *a, int aLen,
   (void)bLen;
   (void)o;
   (void)oLen;
-  return AEE_EUNSUPPORTED;
-}
-
-int nntr_hvx_vlut_probe(remote_handle64 _h, uint32 mode, uint32 n,
-                        uint32 *stats, int statsLen) {
-  (void)_h;
-  (void)mode;
-  (void)n;
-  (void)stats;
-  (void)statsLen;
   return AEE_EUNSUPPORTED;
 }
 

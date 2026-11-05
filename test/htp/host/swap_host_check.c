@@ -33,9 +33,6 @@
     abort();                                                                   \
   }
 NOT_HERE(hexkl_conv_block_run)
-NOT_HERE(hexkl_mm_u8i4_bake_weights)
-NOT_HERE(hexkl_mm_u8i4_plan)
-NOT_HERE(hexkl_mm_u8i4_run)
 /** [PR 4428] moe_set_hadamard_signs hands the kernel its masks; nothing
    here reads them back. */
 static const uint32_t *g_sign_in, *g_sign_down;

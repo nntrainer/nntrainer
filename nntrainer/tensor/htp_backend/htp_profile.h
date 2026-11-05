@@ -164,28 +164,7 @@ public:
     }
   }
 
-  /** Same buckets as addInvoke -- the fused call has its own K/N shape (the
-   * down matmul's output width, not gate_up's), so it lands in its own row
-   * and the two-dot path's numbers stay directly comparable across builds. */
-  void addInvokeFused(unsigned M, unsigned K, unsigned N, uint64_t host_us,
-                      const uint32_t *stage_us) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    Bucket &b = buckets_[std::make_tuple(K, N, M == 1, 0)];
-    ++b.calls;
-    b.rows += M;
-    b.host_us += host_us;
-    if (stage_us != nullptr) {
-      b.dsp_us += stage_us[HTP_FU_T_DSP_TOTAL];
-      b.quant_us += stage_us[HTP_FU_T_QUANT];
-      b.swiglu_us += stage_us[HTP_FU_T_SWIGLU];
-      b.dequant_us += stage_us[HTP_FU_T_DEQUANT];
-      b.acc_us += stage_us[HTP_FU_T_ACC_READ] + stage_us[HTP_FU_T_ACC_COPY];
-      b.drain_us += stage_us[HTP_FU_T_DRAIN];
-    }
-  }
-
-  /** Same buckets again, this call's own (smaller) stage layout -- see
-   * HTP_GU_T_*'s doc comment for why it is not HTP_FU_T_*. Bucketed under
+  /** Gate_up and SwiGLU use the HTP_GU_T_* stage layout. Bucketed under
    * (K, 2*inter, M==1) -- gate_up's own real shape -- not the down matmul's,
    * so this row is directly comparable to what a plain (unfused) gate_up
    * dot() would have shown for the same layer. */

@@ -4,58 +4,21 @@
  *
  * @file   hvx_softmax_q.h
  * @date   06 Oct 2026
- * @brief  Integer softmax over int16 log2-domain scores -> uint8 P'
+ * @brief  Integer softmax over int16 log2-domain scores -> normalized u16 P
  * @see    https://github.com/nntrainer/nntrainer
  * @author Haehun Yang <haehun.yang@ax.samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * Stage 2 of the row-blocked attention kernel (23_attention_v2_plan.md).
- * One 64-row block of query rows, every column tile it can see, in the
- * HMX activation tile layout: element (r, j) of tile c is at
- * tiles[c * 2048 + r * 32 + j] -- the same positions the convert unit
- * wrote the scores to and the same positions P.V will read P' from, so
- * the whole routine is elementwise except the row max and the row sum.
+ * Stage 2 of the row-blocked a16 attention kernel. One 64-row query block
+ * covers every visible column tile in the HMX activation layout:
+ * tiles[c * 2048 + r * 32 + j]. The int16 scores include the per-column
+ * Q zero-point correction. Masks are positional: causal, window, valid
+ * column count and padding rows; masked entries contribute neither to the
+ * maximum nor the sum, and their output is zero.
  *
- * Numbers. The score tile holds s = floor(acc * 2^k / 512) as int16, the
- * two convert planes zipped. With rho = alpha * 2^F * 512 / 2^k in
- * (0.5, 1], where alpha = s_q * s_k * log2(e) turns the accumulator into a
- * log2-domain logit, the logit in Q(15-F).F is u = s * rho. Then, with
- * every multiply the HVX vmpy(Vh,Vh):<<1:rnd:sat, i.e. Q15 x Q15 -> Q15
- * rounded and saturated,
- *
- *   t  = s - max_row(s)                     <= 0, saturating
- *   u  = t * rho_q15                        one vmpy
- *   e  = u >> F (floor), f = u & (2^F - 1)   integer and fraction of log2
- *   x  = f << (15 - F)                      the fraction as Q15
- *   m  = x * (A + x * (B + x * C))          2^x - 1 as Q15, cubic, error
- *                                           <= 5 Q15 units (1.5e-4)
- *   T  = 16384 + (m >> 1)                   2^x as Q14, in [16384, 32767]
- *   q  = T >> min(5 - e, 15)                per-lane arithmetic shift
- *   P' = sat_u8((q + 1) >> 1)               vasr(Vh,Vh,#1):rnd:sat
- *
- * so P' = round(2^(u / 2^F) * 256): T >> (5 - e) is 2^(u/2^F) * 512, the
- * final rounding shift halves it, the saturation turns the 256 at the row
- * maximum into 255, and the clamp of the shift at 15 makes everything
- * below 2^-9 (a shift of 17 or more) zero, which is what rounding gives.
- * Truncating instead of rounding measured 8.5 dB worse on P, because so
- * many entries sit in the lowest steps of the grid. On its 8-bit grid this
- * is as accurate as a float a8 P with the same fixed 1/256 scale: the host
- * test measures both and they agree within 0.1 dB. The row sum of P'
- * (int32) carries the normalization to the output stage.
- *
- * The zero-point term of Q.K^T, zq * colsum_k[column], is a per-column
- * constant in the same int16 units; corr[c * 32 + j] is subtracted from
- * the raw score before anything else. Because the convert truncates to 16
- * bits, raw score and correction are both modulo 2^16 and the difference
- * is exact as long as the true score fits int16.
- *
- * Masks are positions, not data: a column is masked for a row when it is
- * past the row (causal), more than window - 1 behind it, past n_cols, or
- * the row itself is padding (r >= n_rows). Masked entries get P' = 0 and
- * take no part in the max or the sum.
- *
- * hvx_softmax_q_ref is the scalar definition, compiled everywhere;
- * hvx_softmax_q (Hexagon only) matches it bit for bit.
+ * The scalar hvx_softmax_q16_ref defines the normalized u16 contract below.
+ * The Hexagon implementation matches it bit for bit and emits the low and
+ * high bytes as separate activation tiles for HMX's two P.V sweeps.
  */
 
 #ifndef __NNTRAINER_HVX_SOFTMAX_Q_H__
@@ -89,7 +52,7 @@ static inline uint32_t hvx_softmax_q_rowsum_index(uint32_t r) {
   return (r >> 2) * 32u + (r & 3u) * 8u;
 }
 
-/** @brief Bytes of VTCM scratch hvx_softmax_q / hvx_softmax_q16 need: the
+/** @brief Bytes of VTCM scratch hvx_softmax_q16 needs: the
  *         32 row-max vectors, 2 x 16 row-sum accumulators, 16 vectors of
  *         per-row reciprocals (the row-sum layout) and up to 128 staged
  *         per-tile correction vectors. */
@@ -137,19 +100,6 @@ int hvx_softmax_q_scale_k(float alpha, uint32_t frac_bits, int k_min, int k_max,
 /** @brief 2^(f / 2^F) as Q14 by the fixed-point cubic, f in [0, 2^F). */
 uint16_t hvx_softmax_q_exp2_q14(uint32_t f, uint32_t frac_bits);
 
-/**
- * @brief Scalar definition of the block softmax.
- *
- * @param s_tiles  [n_col_tiles][64][32] int16 scores as the convert
- *                 planes zipped (raw, before the zero-point correction)
- * @param corr     [n_col_tiles][32] per-column correction, or NULL
- * @param p_tiles  [n_col_tiles][64][32] uint8 P' out
- * @param rowsum   HVX_SOFTMAX_Q_ROWSUM_WORDS int32 out, see
- *                 hvx_softmax_q_rowsum_index
- */
-void hvx_softmax_q_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
-                       const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum);
-
 /** @brief The 16-bit P of the a16 contract: 65535 is 1.0. */
 #define HVX_SOFTMAX_Q16_ONE 65535u
 
@@ -189,25 +139,10 @@ void hvx_softmax_q16_ref(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                          int32_t *rowsum);
 
 #if defined(__hexagon__)
-/** @brief Micro-benchmark of the HVX primitives the softmax uses: cycles
- *         per vadd, per Q15 vmpy, per exp2 chain, per VTCM vector load,
- *         over @a n iterations. @a vtcm is 1 KiB of VTCM. */
-void hvx_softmax_q_rate(uint32_t n, void *vtcm, void *vtcm_big,
-                        uint32_t out[12]);
-
-/**
- * @brief The HVX implementation. All buffers in VTCM, 128-byte aligned;
- *        @a scratch is HVX_SOFTMAX_Q_SCRATCH_BYTES. Bit-exact with
- *        hvx_softmax_q_ref.
- */
-void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
-                   const int16_t *corr, uint8_t *p_tiles, int32_t *rowsum,
-                   void *scratch);
-
 /**
  * @brief The HVX implementation of hvx_softmax_q16_ref, bit-exact with
- *        it. Same buffer requirements as hvx_softmax_q; @a rowsum may be
- *        NULL.
+ *        it. All buffers are in VTCM, 128-byte aligned; @a scratch is
+ *        HVX_SOFTMAX_Q_SCRATCH_BYTES. @a rowsum may be NULL.
  */
 void hvx_softmax_q16(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                      const int16_t *corr, uint8_t *p_lo, uint8_t *p_hi,

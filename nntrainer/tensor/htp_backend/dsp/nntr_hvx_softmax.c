@@ -23,7 +23,6 @@
 
 #include "hvx_exp_f32.h"
 #include "hvx_expand_i2i4.h"
-#include "hvx_softmax_blocked_f32.h"
 #include "hvx_softmax_f32.h"
 #include "hvx_swiglu_det.h"
 
@@ -31,11 +30,6 @@
 #define VLEN 128u
 /** @brief f32 lanes per HVX vector. */
 #define LANES (VLEN / sizeof(float))
-
-/** @brief Bound on KV blocks per band, so the segment pointer array is a
- *         fixed-size local rather than a DSP-heap allocation. kv_len 8192 at
- *         the smallest useful T (64) needs 128. */
-#define NNTR_HVX_MAX_KV_BLOCKS 128u
 
 int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
                      int yLen) {
@@ -170,50 +164,5 @@ int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
   }
 
   hvx_softmax_rows_f32(x, y, m_first, M, K, scale);
-  return AEE_SUCCESS;
-}
-
-int nntr_hvx_softmax_blocked_f32(remote_handle64 handle, uint32 n_seg, uint32 T,
-                                 uint32 M, float scale, const float *band_in,
-                                 int band_inLen, const uint32 *begin,
-                                 int beginLen, const uint32 *end, int endLen,
-                                 const float *sink, int sinkLen,
-                                 float *band_out, int band_outLen, float *l_out,
-                                 int l_outLen) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  float *seg[NNTR_HVX_MAX_KV_BLOCKS];
-
-  if (!s) {
-    return AEE_EBADPARM;
-  }
-
-  if (n_seg == 0u || n_seg > NNTR_HVX_MAX_KV_BLOCKS || T == 0u || M == 0u) {
-    FARF(ERROR, "softmax_blocked: bad shape (n_seg=%u T=%u M=%u)",
-         (unsigned)n_seg, (unsigned)T, (unsigned)M);
-    return AEE_EBADPARM;
-  }
-  if ((uint32)band_inLen != n_seg * M * T || band_inLen != band_outLen) {
-    FARF(ERROR, "softmax_blocked: bad band length (%d, expected %u)",
-         band_inLen, (unsigned)(n_seg * M * T));
-    return AEE_EBADPARM;
-  }
-  if ((uint32)beginLen != M || (uint32)endLen != M || (uint32)l_outLen != M) {
-    FARF(ERROR, "softmax_blocked: begin/end/l must be M=%u", (unsigned)M);
-    return AEE_EBADPARM;
-  }
-  if (sinkLen != 0 && (uint32)sinkLen != M) {
-    FARF(ERROR, "softmax_blocked: sink must be empty or M=%u", (unsigned)M);
-    return AEE_EBADPARM;
-  }
-
-  /** The kernel is in place, and band_in is an `in` buffer FastRPC may map
-   * read-only, so copy across first and run on band_out. */
-  memcpy(band_out, band_in, (size_t)band_inLen * sizeof(float));
-  for (uint32 j = 0; j < n_seg; ++j) {
-    seg[j] = band_out + (size_t)j * M * T;
-  }
-
-  hvx_softmax_blocked_f32(seg, n_seg, T, 0u, M, M, scale, begin, end,
-                          sinkLen ? sink : NULL, l_out, NULL);
   return AEE_SUCCESS;
 }

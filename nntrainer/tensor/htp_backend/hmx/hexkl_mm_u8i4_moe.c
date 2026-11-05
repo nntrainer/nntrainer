@@ -48,7 +48,6 @@
 #include "hexkl_wh_affine.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_expand_i2i4.h"
-#include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_hadamard_f32.h"
 #if defined(__hexagon__)
@@ -481,13 +480,6 @@ static void moe_expand_chunk(uint8_t *vtcm_base, uint32_t dst_off,
      42% of decode TPS the first time this ran (doc 54 5.10). */
   hvx_expand_i2i4_rows(vtcm_base + dst_off + off, stride, row / 2u, k_tiles,
                        lut, pool);
-}
-
-void hexkl_moe_expand_chunk(uint8_t *vtcm_base, uint32_t dst_off,
-                            const hexkl_weight_u8i4 *h, uint32_t k_tiles,
-                            uint32_t n_col, uint32_t nt0, uint32_t cn,
-                            hvx_worker_pool *pool) {
-  moe_expand_chunk(vtcm_base, dst_off, NULL, h, k_tiles, n_col, nt0, cn, pool);
 }
 
 /** @brief hexkl_moe_push_weight_chunk with a #87 trace record. kind /

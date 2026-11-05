@@ -217,18 +217,29 @@ Hexagon toolchain and links HexKL. Production `nntr_hvx_*.c` files and
 `nntr_hvx_session.h` live in `dsp/`; diagnostic probes remain under
 `test/htp/` and are compiled in only with the build option
 `NNTR_HTP_DIAGNOSTICS=1`, their IDL ordinals otherwise kept by
-`AEE_EUNSUPPORTED` stubs. The entry points fall into groups:
+`AEE_EUNSUPPORTED` stubs. The retired u8 attention prototype and its blocked
+softmax also retain their IDL slots as unsupported stubs (`nntr_hvx_retired.c`)
+in every build; their kernels and scalar KV quantizer have been removed.
+The historical memory-ceiling, VLUT/HVX rate, layout-dump and copied decode-block
+probes, standalone DMA bandwidth, dspqueue echo and two-PD mailbox experiments are reserved the
+same way. The single-call FFN prototype is also retired; current models use
+`mm_u8i4_gate_up_swiglu` followed by `mm_u8i4_layer_u8in`.
+The old per-call weight-baking matmul and scalar accumulator copy are removed;
+its shape tests now exercise the registered-weight DMA path against a CPU reference.
+The unused 8-bit probability softmax experiment is also retired; the active
+16-bit probability kernel and its bit-exact tests remain.
+The entry points fall into groups:
 
 | Group | Entry points (prefix `nntr_hvx_`) | Implemented in |
 |---|---|---|
-| session and memory | `session_info`, `arena_attach`, `arena_probe`, `mem_probe_*` | `nntr_hvx_session.h`, `nntr_hvx_small_ops.c` |
+| session and memory | `session_info`, `arena_attach`, `arena_probe` | `nntr_hvx_session.h`, `nntr_hvx_small_ops.c` |
 | weights | `weight_register_u8i4_arena`, `weight_register_u2i4_arena`, `weight_swap_batch_*` (u8i4, u2i4, TL2 stable and compact), `weights_tl2`, `weight_set_offsets_batch`, `weight_set_static_quant`, `expand_i2i4` | `nntr_hvx_mm_u8i4.c`, `hmx/hexkl_mm_u8i4_dma.c`, `hvx/hvx_expand_i2i4.c` |
-| projections and FFN | `mm_u8i4_layer*` (`_norm`, `_norm_ld`, `_res_add`, `_fused`, `_u8in`), `mm_u8i4_gate_up_swiglu`, `mm_u8i4_conv_block`, `fc_q4m1_f32`, `lm_head_q4m1_f32`, `lm_head_wh_f32` | `nntr_hvx_mm_u8i4.c`, `nntr_hvx_fc_q4.c`, `hmx/hexkl_mm_u8i4.c`, `hmx/hexkl_conv_block.c` |
+| projections and FFN | `mm_u8i4_layer*` (`_norm`, `_norm_ld`, `_res_add`, `_u8in`), `mm_u8i4_gate_up_swiglu`, `mm_u8i4_conv_block`, `fc_q4m1_f32`, `lm_head_q4m1_f32`, `lm_head_wh_f32` | `nntr_hvx_mm_u8i4.c`, `nntr_hvx_fc_q4.c`, `hmx/hexkl_mm_u8i4.c`, `hmx/hexkl_conv_block.c` |
 | MoE | `router_logits_f32`, `router_topk_det_f32`, `mm_u8i4_moe_layer*` | `hmx/hexkl_mm_u8i4_moe.c`, `hvx/hvx_router_rows_f32.c` |
 | attention | `attn_q2_prefill`, `attn_q2_step*`, `kv_register_q`, `kv_append_q`, `attn_m1_*` (decode), `attn_f16_*` (FP16 path) | `nntr_hvx_attn_q.c`, `nntr_hvx_attn_m1.c`, `nntr_hvx_attn_f16.c`, `hmx/hexkl_attn_q2.c`, `hmx/hexkl_kv_q.c` |
 | small ops | `rmsnorm_det_f32`, `rmsnorm_add_f32`, `rope64_det_f32`, `softmax_*`, `swiglu_*`, `argmax_f32`, `q8_quant_f32` | `nntr_hvx_small_ops.c`, `hvx/hvx_*_rows_f32.c` |
-| resident decode | `graph_init`, `graph_set_param`, `graph_share_param`, `forward`, `token_driver_start/stop`, `mailbox_run`, `dspq_start/stop` | `nntr_hvx_graph.c`, `nntr_hvx_token.c`, `nntr_hvx_mailbox.c`, `nntr_hvx_dspq.c`, `hmx/hexkl_graph.c`, `hmx/hexkl_token.c` |
-| probes and benches (diagnostic builds) | `dma_probe`, `dspq_bench_*`, `probe_*`, `vlut_probe`, `tl2_gemv_probe` | `nntr_hvx_dma_probe.c`, `nntr_hvx_dspq_bench.c`, `nntr_hvx_*_probe.c` |
+| resident decode | `graph_init`, `graph_set_param`, `graph_share_param`, `forward`, `token_driver_start/stop`, `dspq_start/stop` | `nntr_hvx_graph.c`, `nntr_hvx_token.c`, `nntr_hvx_dspq.c`, `hmx/hexkl_graph.c`, `hmx/hexkl_token.c` |
+| probes and benches (diagnostic builds) | `dma_replay`, `probe_*`, `tl2_gemv_probe` | `nntr_hvx_dma_probe.c`, `nntr_hvx_*_probe.c` |
 
 Inside a kernel the pattern is always the same: a worker pool
 (`hvx/hvx_worker_pool.c`) runs one lane per HVX thread, a DMA ring

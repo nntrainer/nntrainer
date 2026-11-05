@@ -18,7 +18,6 @@
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_expand_i2i4.h"
-#include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_hadamard_f32.h"
 #include "hvx_rmsnorm_rows_f32.h"
@@ -564,12 +563,6 @@ void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
   (void)pool;
   (void)job;
   (void)n;
-}
-
-void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
-                       hvx_worker_pool *pool) {
-  (void)pool;
-  memcpy(dst, src, (size_t)(k / 32u) * 2048u);
 }
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
@@ -1531,15 +1524,6 @@ int main(void) {
   hvx_scalar_hook.gemv2 = hook_gemv2;
   hvx_scalar_hook.buf = hook_buf;
   static uint8_t vtcm[8u << 20];
-  /** [#225] the FC cells alone: run_host_checks.sh's mutants of
-     hexkl_mm_u8i4_fc_m1_run, which need nothing else */
-  if (getenv("MOE_CHECK_FC_WH_ONLY") != NULL) {
-    hexkl_moe_scratch fs = {NULL, NULL, 0};
-    const int f = run_fc_wh_cases(vtcm, sizeof vtcm, &fs);
-    hexkl_moe_scratch_free(&fs);
-    return f;
-  }
-
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, sizeof vtcm, &L);
   printf("layout rc=%d total=%u (act %u gu %u dn %u gate %u mid %u stage %u "

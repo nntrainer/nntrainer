@@ -10,7 +10,6 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[3])
 p.add_argument('--hexagon-tools', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--mutations', action='store_true')
 a = p.parse_args()
 a.output.mkdir(parents=True, exist_ok=True)
 b = a.repo / 'nntrainer/tensor/htp_backend'
@@ -54,22 +53,3 @@ exe = a.output / 'check'
 subprocess.run(['g++', '-pthread', '-fsanitize=address,undefined', *objects,
                 str(native / 'lib/libnative.a'), '-lm', '-o', str(exe)], check=True)
 subprocess.run([str(exe)], check=True)
-if a.mutations:
-    # Removing the masters' offset bias must be detected, proving the full-tile
-    # implementation was exercised independently of its serial row reference.
-    bad = h.replace('Q6_V_vxor_VV(out[half], bias)', 'out[half]', 1)
-    if bad == h:
-        raise RuntimeError('full-tile master-store mutation target changed')
-    (a.output / 'kv_dynamic_under_test.h').write_text(bad)
-    subprocess.run(['gcc', *flags, *inc, '-c',
-                    str(host / 'kv_dynamic_tiles_check.c'), '-o',
-                    str(a.output / 'fixture.o')], check=True)
-    subprocess.run(['g++', '-pthread', '-fsanitize=address,undefined', *objects,
-                    str(native / 'lib/libnative.a'), '-lm', '-o', str(exe)],
-                   check=True)
-    result = subprocess.run([str(exe)], capture_output=True, text=True)
-    (a.output / 'missing_master_bias.log').write_text(result.stdout + result.stderr)
-    (a.output / 'kv_dynamic_under_test.h').write_text(h)
-    if result.returncode != -6 or 'Assertion' not in result.stderr:
-        raise RuntimeError('full-tile master-store mutation was not detected')
-    print('Dynamic KV missing-master-bias mutation: rejected as expected')

@@ -4,14 +4,10 @@
  *
  * @file   hvx_softmax_util.h
  * @date   07 Aug 2026
- * @brief  Tail-staging and in-vector reduction helpers shared by the HVX
- *         softmax kernels
+ * @brief  Tail-staging and in-vector reduction helpers for HVX softmax
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
- *
- * Moved verbatim out of hvx_softmax_f32.c so hvx_softmax_blocked_f32.c can
- * reuse them instead of copying. No behaviour change.
  */
 
 #ifndef __NNTRAINER_HVX_SOFTMAX_UTIL_H__

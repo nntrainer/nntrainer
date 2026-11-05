@@ -429,21 +429,6 @@ void hvx_dq_tiles_rows_affine(uint32_t n_threads, uint32_t i,
   dq_tiles_rows(n_threads, i, job, offset, sums);
 }
 
-void hvx_dequant_acc_tiles_to_f32(
-  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
-  uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
-  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, float *dst_a, float *dst_b, uint32_t split,
-  uint32_t dst_stride, hvx_worker_pool *pool) {
-  if (!tiles_base || n_tiles == 0u || m_count == 0u) {
-    return;
-  }
-  hvx_dq_tiles_job c = {tiles_base, tile_stride, nt0,      row_stride, m_count,
-                        act_scale,  act_zp,      colsum_w, w_scale,    bias,
-                        dst_a,      dst_b,       split,    dst_stride, n_tiles};
-  hvx_worker_pool_run(pool, hvx_dq_tiles_worker, &c, n_tiles);
-}
-
 /* ---- fused dequant + SwiGLU over gate/up tile pairs ---------------------- */
 
 /**

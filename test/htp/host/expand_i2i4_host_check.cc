@@ -99,12 +99,19 @@ void roundTrip(uint32_t K, uint32_t N, unsigned seed, const char *label,
   std::snprintf(what, sizeof what, "%s expand == whPack", label);
   check(back == four, what);
 
-  /** The pool split must not change a byte: workers take whole vectors, so
-     a boundary that cut a shuffle in half would show up right here. */
+  /** Match the MoE staging layout: each K tile row holds its compressed
+     bytes in the top half, and one pool dispatch expands all rows. */
+  const uint32_t src_bytes = nntrainer::whBytes2(32, N);
+  const uint32_t stride = 2u * src_bytes;
+  const uint32_t nrows = K / 32u;
   std::vector<uint8_t> pooled(nntrainer::whBytes(K, N), 0x55);
-  hvx_expand_i2i4_pool(two.data(), static_cast<uint32_t>(two.size()),
-                       table.data(), pooled.data(), pool);
-  std::snprintf(what, sizeof what, "%s pooled == inline", label);
+  for (uint32_t r = 0; r < nrows; ++r) {
+    std::copy_n(two.data() + static_cast<size_t>(r) * src_bytes, src_bytes,
+                pooled.data() + static_cast<size_t>(r) * stride + src_bytes);
+  }
+  hvx_expand_i2i4_rows(pooled.data(), stride, src_bytes, nrows, table.data(),
+                       pool);
+  std::snprintf(what, sizeof what, "%s pooled rows == inline", label);
   check(pooled == back, what);
 }
 

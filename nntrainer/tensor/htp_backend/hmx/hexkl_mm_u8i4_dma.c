@@ -40,11 +40,7 @@
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
-/** @brief Bytes in one packed i4 weight tile (32x32 values). Matches
- *         hexkl_mm_u8i4.c's local definition -- both are file-scoped, so
- *         this is not a redefinition, just the same constant kept in sync
- *         by inspection. If HexKL ever exposes it from hexkl_micro.h, both
- *         files should switch to that instead of this comment. */
+/** @brief Bytes in one packed i4 weight tile (32x32 values). */
 #define WEIGHT_TILE_BYTES_U8I4 512u
 
 /** @brief One u8 x i4 tile multiply, the packet inline (hexkl_hmx_mm.h):
@@ -1247,248 +1243,6 @@ out:
   return rc;
 }
 
-int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
-                            uint32_t vtcm_size, uint32_t config_off, uint32_t M,
-                            uint32_t K, const uint32_t *handles,
-                            const float *act_f32, float *out,
-                            const hexkl_mm_opts *opts) {
-  static const hexkl_mm_opts kDefaults = {0};
-  const hexkl_mm_opts *o = opts ? opts : &kDefaults;
-
-  if (!tbl || !vtcm_base || !handles || !act_f32 || !out || M == 0 || K == 0) {
-    return AEE_EBADPARM;
-  }
-  /** The down matmul's quantization is inherently dynamic -- it quantizes
-   * the SwiGLU output the caller has never seen -- so caller-supplied act
-   * params could only cover stage 1, an accuracy change dressed up as an
-   * option. Reject rather than silently ignore (header doc). */
-  if (o->act_scale != NULL || o->act_zp != NULL ||
-      o->act_ah_prepacked != NULL) {
-    return AEE_EBADPARM;
-  }
-  if ((K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0) {
-    return AEE_EBADPARM;
-  }
-  if (handles[0] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
-      handles[1] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
-      !tbl->slots[handles[0]].in_use || !tbl->slots[handles[1]].in_use) {
-    return AEE_EBADPARM;
-  }
-  const hexkl_weight_u8i4 *h_gu = &tbl->slots[handles[0]];
-  const hexkl_weight_u8i4 *h_dn = &tbl->slots[handles[1]];
-  /** gate_up's output row is [gate | up]; that ratio IS the SwiGLU
-   * contract. inter a multiple of the 32-column tile also guarantees a
-   * result tile never straddles the gate/up boundary below. */
-  if (h_gu->K != K || h_gu->N != 2 * h_dn->K ||
-      (h_dn->K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0) {
-    return AEE_EBADPARM;
-  }
-
-  const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
-  const uint32_t inter = h_dn->K;
-  const uint32_t n_out = h_dn->N;
-  const uint32_t k1_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
-  const uint32_t n1_tiles = h_gu->N / HEXKL_HMX_INT8_BLOCK_N_COL;
-  const uint32_t k2_tiles = inter / HEXKL_HMX_INT8_BLOCK_N_INNER;
-  const uint32_t n2_tiles = n_out / HEXKL_HMX_INT8_BLOCK_N_COL;
-
-  // VTCM layout: act1 AH tiles | gate_up weight | SwiGLU gate | SwiGLU up |
-  // act2 AH tiles | down weight | one result tile -- sized for ONE 64-row
-  // block. The pipeline below loops over row blocks through those fixed
-  // regions, so an expert with M > 64 rows costs no extra VTCM (the
-  // full-M layout blew the 8.3 MB arena at m_pad = 128: AEE_ENOMEMORY).
-  // One block at the LFM2-A1B prefill shape (K=2048, I=1792, N_out=2048):
-  // 128K + 3.67M + 2x448K + 112K + 1.84M + 8K ~= 6.65 MB.
-  const uint32_t act1_bytes = k1_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-  const uint32_t wb1 = k1_tiles * n1_tiles * WEIGHT_TILE_BYTES_U8I4;
-  const uint32_t inter_bytes = HEXKL_HMX_INT8_BLOCK_N_ROW * inter * 4u;
-  const uint32_t act2_bytes = k2_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-  const uint32_t wb2 = k2_tiles * n2_tiles * WEIGHT_TILE_BYTES_U8I4;
-
-  const uint32_t act1_off = 0;
-  const uint32_t w1_off =
-    ROUND_UP_U32(act1_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  const uint32_t inter_gate_off =
-    ROUND_UP_U32(w1_off + wb1, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  const uint32_t inter_up_off =
-    ROUND_UP_U32(inter_gate_off + inter_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  const uint32_t act2_off =
-    ROUND_UP_U32(inter_up_off + inter_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  const uint32_t w2_off =
-    ROUND_UP_U32(act2_off + act2_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  const uint32_t result_off =
-    ROUND_UP_U32(w2_off + wb2, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  if (result_off + ACC_TILE_BYTES > config_off ||
-      result_off + ACC_TILE_BYTES > vtcm_size) {
-    return AEE_ENOMEMORY;
-  }
-
-  /** The fused pipeline only runs on the in-place accumulator tile layout:
-   * the gate/up split of the dequant has no vendor-copy counterpart, and
-   * no caller exists where a repack kernel would be worth it. */
-  const hexkl_acc_layout *acc_layout =
-    hexkl_acc_layout_get(vtcm_base, result_off);
-  hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE] =
-    acc_layout->usable ? acc_layout->row_stride : 0u;
-  if (!acc_layout->usable) {
-    return AEE_EUNSUPPORTED;
-  }
-
-  float *scale1 = (float *)malloc(sizeof(float) * m_pad);
-  int32_t *zp1 = (int32_t *)malloc(sizeof(int32_t) * m_pad);
-  float *scale2 = (float *)malloc(sizeof(float) * m_pad);
-  int32_t *zp2 = (int32_t *)malloc(sizeof(int32_t) * m_pad);
-  if (!scale1 || !zp1 || !scale2 || !zp2) {
-    free(scale1);
-    free(zp1);
-    free(scale2);
-    free(zp2);
-    return AEE_ENOMEMORY;
-  }
-
-  hexkl_dma_ring_reset();
-
-  uint64_t p0 = 0;
-  int rc = AEE_SUCCESS;
-
-  // gate_up's weight blocks (nothing to prefetch it behind), then down's
-  // weight starts streaming for real -- issued once; every row block below
-  // reuses them.
-  {
-    const uint32_t rs1 = dma_row_size_dividing(wb1);
-    hexkl_dma_ring_push2d(vtcm_base + w1_off, h_gu->wh_bytes, rs1, rs1, rs1,
-                          wb1 / rs1, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-
-    const uint32_t rs2 = dma_row_size_dividing(wb2);
-    hexkl_dma_ring_push2d(vtcm_base + w2_off, h_dn->wh_bytes, rs2, rs2, rs2,
-                          wb2 / rs2, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-  }
-
-  // The whole pipeline runs per 64-row block through the fixed one-block
-  // regions: quant -> gate_up matmul -> dequant to gate|up -> SwiGLU ->
-  // requant -> down matmul -> out. Blocks touch disjoint out rows, so the
-  // accumulate semantics are unchanged.
-  for (uint32_t mb = 0; mb < M; mb += HEXKL_HMX_INT8_BLOCK_N_ROW) {
-    const uint32_t m_blk = (M - mb < HEXKL_HMX_INT8_BLOCK_N_ROW)
-                             ? (M - mb)
-                             : HEXKL_HMX_INT8_BLOCK_N_ROW;
-    const float *act_blk = act_f32 + (size_t)mb * K;
-
-    // Stage 1: K1 on this block's activation, straight into AH tiles.
-    HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                             scale1, zp1, o->pool);
-    rc = hvx_quant_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                              scale1, zp1, vtcm_base + act1_off, o->pool);
-    HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-    if (rc != AEE_SUCCESS) {
-      goto out;
-    }
-
-    // Stage 2a: gate_up matmul. Each 64x32 result tile dequantizes straight
-    // into the gate or the up region -- gate occupies gate_up's output
-    // columns [0, inter), up [inter, 2*inter) -- and stays in VTCM.
-    for (uint32_t nt = 0; nt < n1_tiles; ++nt) {
-      hexkl_micro_hmx_acc_clear_int32();
-      for (uint32_t kt = 0; kt < k1_tiles; ++kt) {
-        const uint32_t act_tile_off =
-          act1_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-        const uint32_t w_tile_off =
-          w1_off + (kt * n1_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
-      }
-      HEXKL_PROBE_T0(p0);
-      rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
-      if (rc != AEE_SUCCESS) {
-        goto out;
-      }
-      const int32_t *tile =
-        (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
-      const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-      float *dst =
-        (float *)(vtcm_base + (c0 < inter ? inter_gate_off : inter_up_off)) +
-        (c0 < inter ? c0 : c0 - inter);
-      HEXKL_PROBE_T0(p0);
-      hvx_dequant_acc_tile_to_f32(tile, acc_layout->row_stride, m_blk, scale1,
-                                  zp1, h_gu->colsum_w + c0, h_gu->w_scale + c0,
-                                  h_gu->bias + c0, dst, inter,
-                                  /*accumulate=*/0);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
-    }
-
-    // down's weight has now had this block's gate_up matmul + dequant to
-    // land behind -- block 0 drains the whole prefetch; later blocks find
-    // the ring already empty.
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-
-    // Stage 2b: SwiGLU in place (gate half becomes the SwiGLU output; the up
-    // half is dead after this), then requantize it dynamically per row.
-    HEXKL_PROBE_T0(p0);
-    hvx_swiglu_inplace_f32((float *)(vtcm_base + inter_gate_off),
-                           (const float *)(vtcm_base + inter_up_off), m_blk,
-                           inter, o->pool);
-    HEXKL_PROBE_ADD(HEXKL_PROBE_SWIGLU, p0);
-
-    HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params((const float *)(vtcm_base + inter_gate_off), m_blk,
-                             HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2, zp2,
-                             o->pool);
-    rc = hvx_quant_pack_u8_ah((const float *)(vtcm_base + inter_gate_off),
-                              m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2,
-                              zp2, vtcm_base + act2_off, o->pool);
-    HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-    if (rc != AEE_SUCCESS) {
-      goto out;
-    }
-
-    // Stage 3: down matmul, dequant straight to the caller's out rows.
-    for (uint32_t nt = 0; nt < n2_tiles; ++nt) {
-      hexkl_micro_hmx_acc_clear_int32();
-      for (uint32_t kt = 0; kt < k2_tiles; ++kt) {
-        const uint32_t act_tile_off =
-          act2_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-        const uint32_t w_tile_off =
-          w2_off + (kt * n2_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-        rc = mm_u8i4_tile(vtcm_base, act_tile_off, w_tile_off);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
-      }
-      HEXKL_PROBE_T0(p0);
-      rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
-      if (rc != AEE_SUCCESS) {
-        goto out;
-      }
-      const int32_t *tile =
-        (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
-      const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-      HEXKL_PROBE_T0(p0);
-      hvx_dequant_acc_tile_to_f32(
-        tile, acc_layout->row_stride, m_blk, scale2, zp2, h_dn->colsum_w + c0,
-        h_dn->w_scale + c0, h_dn->bias + c0, out + (size_t)mb * n_out + c0,
-        n_out, o->accumulate);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
-    }
-  }
-
-out:
-  free(scale1);
-  free(zp1);
-  free(scale2);
-  free(zp2);
-  return rc;
-}
-
 /**
  * @brief gate_up matmul -> SwiGLU -> requantize to u8 AH tiles.
  *
@@ -1509,8 +1263,7 @@ out:
  * @return AEE_SUCCESS, AEE_EBADPARM on a shape violation, AEE_ENOMEMORY if
  *         the block layout does not fit VTCM, AEE_EUNSUPPORTED if the
  *         in-place accumulator tile layout is not available (no vendor-
- *         copy fallback exists for the split dequant, same restriction as
- *         hexkl_mm_u8i4_fused_run above).
+ *         copy fallback exists for the split dequant).
  */
 int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
                                      uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -1547,8 +1300,7 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
 
   // VTCM layout, sized for ONE 64-row block: activation | gate_up weight
   // (single-buffered -- one weight, nothing to prefetch it behind) |
-  // SwiGLU gate | SwiGLU up | one result tile. No down-side regions at
-  // all, unlike hexkl_mm_u8i4_fused_run's six.
+  // SwiGLU gate | SwiGLU up | one result tile.
   const uint32_t act_bytes = k1_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t wb1 = k1_tiles * n1_tiles * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t inter_row_bytes = HEXKL_HMX_INT8_BLOCK_N_ROW * inter * 4u;
@@ -1648,8 +1400,7 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
         (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
       const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
       // gate occupies gate_up's output columns [0, inter), up [inter,
-      // 2*inter) -- same convention hexkl_mm_u8i4_fused_run uses, and the
-      // one hvx_swiglu_inplace_f32's contract assumes.
+      // 2*inter), as hvx_swiglu_inplace_f32's contract requires.
       float *dst = (float *)(vtcm_base + (c0 < inter ? gate_off : up_off)) +
                    (c0 < inter ? c0 : c0 - inter);
       HEXKL_PROBE_T0(p0);

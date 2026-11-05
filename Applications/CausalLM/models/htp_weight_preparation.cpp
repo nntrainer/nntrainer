@@ -630,7 +630,4 @@ void prepareHtpWeights(ml::train::Model &model,
   }
 };
 
-/**
- * @brief Run a transformer model for a prompt.
- */
 } // namespace causallm

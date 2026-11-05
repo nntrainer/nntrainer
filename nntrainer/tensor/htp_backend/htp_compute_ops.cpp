@@ -1766,7 +1766,7 @@ public:
     uint32_t h = 0;
     if (e2e_) {
       // into the FC set's own arena chunks (place /
-      // tryChunk / arena_attach), written before the attach; the heap
+      // tryChunkOn / arena_attach), written before the attach; the heap
       // holds no weight (the #178 heap rule)
       E2eState &e = *e2e_st_;
       const uint32_t bytes = static_cast<uint32_t>(q4m1.size());
@@ -4652,135 +4652,6 @@ private:
     profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
   }
 
-  /** @brief Same call as invokeLayer, but the activation is quantized and
-   *  AH-tile-packed on the ARM side first (htp_act_quant.h) and sent as u8
-   *  instead of f32 -- see mm_u8i4_layer_u8in's IDL doc for what this buys.
-   *  Used by both accel entries, which the M > 1 gate means only ever run
-   *  at prefill shapes (accelerates_q4_0_at_m1() is false), matching this
-   *  path's scope: 41_moe_ffn_e2e_and_perf_task.md's P2. */
-  void invokeLayerU8In(remote_handle64 session, const uint32_t *handles,
-                       int num_handles, const float *matBdata, float *matCdata,
-                       unsigned int M, unsigned int N, unsigned int K) {
-    const uint32_t m_pad = htp_act_m_pad(M);
-    const size_t act_ah_bytes = static_cast<size_t>(m_pad) * K;
-    const int out_len = static_cast<int>(M) * static_cast<int>(N);
-
-    std::lock_guard<std::mutex> lock(invoke_mutex_);
-    staging_.ensureCapacity(staging_.act_ah_buf_, act_ah_bytes);
-    uint8_t *act_ah = staging_.act_ah_buf_->data();
-    float *out_cat = reinterpret_cast<float *>(
-      staging_
-        .stage(staging_.out_pool_, static_cast<size_t>(out_len) * sizeof(float))
-        .data());
-
-    if (staging_.act_scale_scratch_.size() < m_pad) {
-      staging_.act_scale_scratch_.resize(m_pad);
-      staging_.act_zp_scratch_.resize(m_pad);
-    }
-    htp_quant_pack_u8_ah(matBdata, M, K, act_ah,
-                         staging_.act_scale_scratch_.data(),
-                         staging_.act_zp_scratch_.data());
-
-    HtpProfile &profile = HtpProfile::global();
-    if (profile.level() == 0) {
-      const int err = nntr_hvx_mm_u8i4_layer_u8in(
-        session, M, K, handles, num_handles, act_ah,
-        static_cast<int>(act_ah_bytes), staging_.act_scale_scratch_.data(),
-        static_cast<int>(m_pad), staging_.act_zp_scratch_.data(),
-        static_cast<int>(m_pad), out_cat, out_len);
-      if (err != AEE_SUCCESS) {
-        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_u8in failed: err=" +
-                                 std::to_string(err));
-      }
-      stagedMemcpy(matCdata, out_cat,
-                   static_cast<size_t>(out_len) * sizeof(float));
-      return;
-    }
-
-    uint32_t stage_us[HTP_N_STAGES] = {0};
-    const bool timed = profile.level() >= 2;
-    const uint64_t t0 = HtpProfile::nowUs();
-    const int err =
-      timed
-        ? nntr_hvx_mm_u8i4_layer_u8in_timed(
-            session, M, K, handles, num_handles, act_ah,
-            static_cast<int>(act_ah_bytes), staging_.act_scale_scratch_.data(),
-            static_cast<int>(m_pad), staging_.act_zp_scratch_.data(),
-            static_cast<int>(m_pad), out_cat, out_len, stage_us, HTP_N_STAGES)
-        : nntr_hvx_mm_u8i4_layer_u8in(
-            session, M, K, handles, num_handles, act_ah,
-            static_cast<int>(act_ah_bytes), staging_.act_scale_scratch_.data(),
-            static_cast<int>(m_pad), staging_.act_zp_scratch_.data(),
-            static_cast<int>(m_pad), out_cat, out_len);
-    const uint64_t elapsed = HtpProfile::nowUs() - t0;
-    if (err != AEE_SUCCESS) {
-      throw std::runtime_error(
-        std::string(timed ? "nntr_hvx_mm_u8i4_layer_u8in_timed"
-                          : "nntr_hvx_mm_u8i4_layer_u8in") +
-        " failed: err=" + std::to_string(err));
-    }
-    stagedMemcpy(matCdata, out_cat,
-                 static_cast<size_t>(out_len) * sizeof(float));
-    profile.addInvoke(M, K, N, elapsed, timed ? stage_us : nullptr);
-  }
-
-  /** @brief The fused MoE expert FFN call: gate_up -> SwiGLU -> down in one
-   *  FastRPC round trip (doc 43 §[L2]). Same scratch-buffer reuse and
-   *  timed-entry split as invokeLayer; the SwiGLU stage gets its own
-   *  profile bucket via addInvokeFused. */
-  void invokeFused(remote_handle64 session, const uint32_t *handles,
-                   float *matBdata, float *matCdata, unsigned int M,
-                   unsigned int N, unsigned int K) {
-    const int act_len = static_cast<int>(M) * static_cast<int>(K);
-    const int out_len = static_cast<int>(M) * static_cast<int>(N);
-
-    std::lock_guard<std::mutex> lock(invoke_mutex_);
-    float *act_f32 = reinterpret_cast<float *>(
-      staging_
-        .stage(staging_.act_pool_, static_cast<size_t>(act_len) * sizeof(float))
-        .data());
-    float *out_f32 = reinterpret_cast<float *>(
-      staging_
-        .stage(staging_.out_pool_, static_cast<size_t>(out_len) * sizeof(float))
-        .data());
-    stagedMemcpy(act_f32, matBdata,
-                 static_cast<size_t>(act_len) * sizeof(float));
-
-    HtpProfile &profile = HtpProfile::global();
-    if (profile.level() == 0) {
-      const int err = nntr_hvx_mm_u8i4_layer_fused(
-        session, M, K, handles, 2, act_f32, act_len, out_f32, out_len);
-      if (err != AEE_SUCCESS) {
-        throw std::runtime_error("nntr_hvx_mm_u8i4_layer_fused failed: err=" +
-                                 std::to_string(err));
-      }
-      stagedMemcpy(matCdata, out_f32,
-                   static_cast<size_t>(out_len) * sizeof(float));
-      return;
-    }
-
-    uint32_t stage_us[HTP_FU_N_STAGES] = {0};
-    const bool timed = profile.level() >= 2;
-    const uint64_t t0 = HtpProfile::nowUs();
-    const int err =
-      timed
-        ? nntr_hvx_mm_u8i4_layer_fused_timed(session, M, K, handles, 2, act_f32,
-                                             act_len, out_f32, out_len,
-                                             stage_us, HTP_FU_N_STAGES)
-        : nntr_hvx_mm_u8i4_layer_fused(session, M, K, handles, 2, act_f32,
-                                       act_len, out_f32, out_len);
-    const uint64_t elapsed = HtpProfile::nowUs() - t0;
-    if (err != AEE_SUCCESS) {
-      throw std::runtime_error(
-        std::string(timed ? "nntr_hvx_mm_u8i4_layer_fused_timed"
-                          : "nntr_hvx_mm_u8i4_layer_fused") +
-        " failed: err=" + std::to_string(err));
-    }
-    stagedMemcpy(matCdata, out_f32,
-                 static_cast<size_t>(out_len) * sizeof(float));
-    profile.addInvokeFused(M, K, N, elapsed, timed ? stage_us : nullptr);
-  }
-
   /** @brief htp.dump_dir=<dir>: every MoE call's input (M x K f32)
    *  and output (M x N_out f32) as <dir>/moe_<call>_in.f32 / _out.f32, in
    *  call order, plus one line per call in <dir>/manifest.txt
@@ -6315,9 +6186,8 @@ private:
     }
   }
 
-  /** @brief [L2, split-call variant] gate_up matmul -> SwiGLU -> requantize
-   *  to u8 AH, ONE weight -- doc 43 §7's smaller-surface alternative to
-   *  invokeFused. Leaves its result in act_ah_buf_/act_scale_scratch_/
+  /** @brief Gate_up matmul -> SwiGLU -> requantize to u8 AH, one weight.
+   *  Leaves its result in act_ah_buf_/act_scale_scratch_/
    *  act_zp_scratch_ for invokeLayerU8InRaw (below) to consume immediately
    *  after -- both run under gemm_qs4cx_fused_swiglu_fp32's call, so there
    *  is no other caller between them to race with. */
@@ -6389,10 +6259,8 @@ private:
                                   timed ? stage_us : nullptr);
   }
 
-  /** @brief Down matmul via the u8in path, fed act_ah/scale/zp that are
-   *  ALREADY quantized (by invokeGateUpSwiglu, just above) -- unlike
-   *  invokeLayerU8In, this does not call htp_quant_pack_u8_ah itself; there
-   *  is nothing f32 left to quantize, the DSP produced the bytes directly. */
+  /** @brief Down matmul via the u8in path, consuming act_ah/scale/zp
+   *  produced directly on the DSP by invokeGateUpSwiglu. */
   void invokeLayerU8InRaw(remote_handle64 session, const uint32_t *handles,
                           int num_handles, unsigned int m_pad_in,
                           float *matCdata, unsigned int M, unsigned int N,
@@ -7481,7 +7349,7 @@ private:
     slot.bytes = slot_bytes;
     // A new chunk is sized to the slots still to come when the caller said
     // how many there will be (reserve_qs4cx_wh_expert_slots), else a full
-    // chunk as before. newChunk rounds up to its configured grain.
+    // chunk as before. newChunkOn rounds up to its configured grain.
     const size_t left = expert_slots_wanted_ > expert_slots_placed_
                           ? expert_slots_wanted_ - expert_slots_placed_
                           : 0;
@@ -8846,9 +8714,6 @@ private:
    *         things: rpcmem_alloc is the host's ION heap, fastrpc_mmap is the
    *         DSP's address space, arena_attach is the DSP's own arena table.
    */
-  bool tryChunk(remote_handle64 session, size_t size) {
-    return tryChunkOn(session, CDSP_DOMAIN_ID, arena_chunks_, size);
-  }
   bool tryChunkOn(remote_handle64 session, int domain,
                   std::vector<ArenaChunk> &chunks, size_t size) {
     const unsigned long long rss_before = rssKb();
@@ -8988,10 +8853,6 @@ private:
    * chunk. chunk_cap_ remembers refusals to avoid repeated allocations
    * and failed mappings on later weights.
    */
-  bool newChunk(remote_handle64 session, uint32_t bytes, size_t want) {
-    return newChunkOn(session, CDSP_DOMAIN_ID, arena_chunks_, chunk_cap_, bytes,
-                      want);
-  }
   bool newChunkOn(remote_handle64 session, int domain,
                   std::vector<ArenaChunk> &chunks, size_t &cap, uint32_t bytes,
                   size_t want) {
@@ -9133,7 +8994,7 @@ private:
    */
   enum ArenaState { ARENA_UNTRIED, ARENA_ON, ARENA_OFF };
   ArenaState arena_state_ = ARENA_UNTRIED;
-  /** Why the last newChunk refused, in words, for the throw that follows. */
+  /** Why the last newChunkOn refused, for the throw that follows. */
   std::string arena_fail_;
   /** Largest chunk still worth asking for; only ever shrinks. */
   size_t chunk_cap_ = kArenaChunkMax;

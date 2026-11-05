@@ -634,8 +634,7 @@ static void check_rope(void) {
  *        position) in double then rounded once, as the CPU's f32 table is.
  *        The kernel must equal m1_rope_det bit for bit, the identity pairs
  *        (zero angle) must pass x through, and the spec's SNR against the
- *        rotation in double is printed. A kernel pairing (i, i + 32) per
- *        64-lane chunk, LFM2's head reused, is run_host_checks.sh's mutant.
+ *        rotation in double is printed.
  */
 static void check_rope_gemma(void) {
   static const struct {

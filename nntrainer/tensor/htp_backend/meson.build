@@ -58,7 +58,7 @@ if get_option('htp-inproc')
   # entries, whose kernels already compile on hvx_emu, and the #141 MoE
   # dspqueue thread against inproc/dspqueue_standin.c. Left out, because
   # nothing here references them and their kernels need intrinsics
-  # hvx_emu does not emulate: nntr_hvx_softmax.c, nntr_hvx_attn.c,
+  # hvx_emu does not emulate: nntr_hvx_softmax.c,
   # nntr_hvx_mm_u8i8.c, nntr_hvx_dma_probe.c (device-gtest-only entries).
   # A skel entry the ARM calls but this list lacks is a link error
   # (--no-undefined below), the host twin of dsp/build.sh's guard.
@@ -68,6 +68,7 @@ if get_option('htp-inproc')
   inproc_sources = files(
     htp_dsp_dir / 'hvx_add_f32.c',
     htp_dsp_dir / 'nntr_hvx_prefill_scratch.c',
+    htp_dsp_dir / 'nntr_hvx_retired.c',
     htp_dsp_dir / 'nntr_hvx_mm_u8i4.c',
     htp_dsp_dir / 'nntr_hvx_graph.c',
     htp_dsp_dir / 'nntr_hvx_small_ops.c',
@@ -76,7 +77,6 @@ if get_option('htp-inproc')
     htp_dsp_dir / 'nntr_hvx_token.c',
     htp_dsp_dir / 'nntr_hvx_fc_q4.c',
     htp_test_dir / 'nntr_hvx_sf_probe.c',
-    'hmx/hexkl_mm_u8i4.c',
     'hmx/hexkl_mm_u8i4_dma.c',
     'hmx/hexkl_mm_u8i4_moe.c',
     'hmx/hexkl_moe_scratch.c',
@@ -97,7 +97,6 @@ if get_option('htp-inproc')
     'hvx/hvx_expand_i2i4.c',
     'htp_tl2_codec.c',
     'hvx/hvx_gemv_u8tl2.c',
-    'hvx/hvx_gather_ah_u8.c',
     'hvx/hvx_scale_add_f32.c',
     'hvx/hvx_conv_gate_f32.c',
     'hvx/hvx_m1_ops_f32.c',

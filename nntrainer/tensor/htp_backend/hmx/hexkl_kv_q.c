@@ -377,10 +377,6 @@ static int wh_i8_probe(uint8_t *vtcm_base) {
   return 1;
 }
 
-const uint16_t *hexkl_kv_q_wh_i8_pos(uint8_t *vtcm_base) {
-  return wh_i8_probe(vtcm_base) ? g_wh_i8_pos : NULL;
-}
-
 /** @brief Writes one quantized row of head n straight into its int8 WH
  *         tiles: cache row @a row is column row%32 of the K^T tiles and
  *         row row%32 of the V tiles of column tile row/32. */
@@ -453,7 +449,7 @@ static inline void xor80_copy(uint8_t *dst, const uint8_t *src, uint32_t n) {
  *        HVX from its 32 contiguous master rows.
  *
  * The int8 WH tile puts row-major element (r, k) at byte
- * (r/4)*128 + 4k + r%4 (hexkl_kv_q_wh_i8_pos, checked for all 1024). For
+ * (r/4)*128 + 4k + r%4 (wh_i8_probe checks all 1024 positions). For
  * the V tile r is the cache row and k the dim: each 128-byte segment is
  * four consecutive rows interleaved bytewise, two vshuff levels. For the
  * K^T tile r is the dim and k the cache row: segment j/4 holds, for every
@@ -876,11 +872,6 @@ static int bake_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
     }
   }
   return AEE_SUCCESS;
-}
-#else
-const uint16_t *hexkl_kv_q_wh_i8_pos(uint8_t *vtcm_base) {
-  (void)vtcm_base;
-  return NULL;
 }
 #endif
 

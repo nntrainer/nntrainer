@@ -10,7 +10,7 @@
  * @bug    No known bugs except for NYI items
  *
  * out = silu(gate) * up = gate / (1 + exp(-gate)) * up, row by row. The
- * fused layer (hexkl_mm_u8i4_fused_run) keeps gate_up's dequantized output
+ * gate_up kernel keeps its dequantized output
  * in VTCM and runs this on it before requantizing for the down matmul --
  * the intermediate never touches DDR.
  *

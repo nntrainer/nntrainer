@@ -126,29 +126,6 @@ void hvx_expand_i2i4(const uint8_t *src, uint32_t src_bytes,
 }
 
 typedef struct {
-  const uint8_t *src;
-  const uint8_t *table;
-  uint8_t *dst;
-  uint32_t src_bytes;
-} expand_ctx;
-
-static void expand_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  const expand_ctx *c = (const expand_ctx *)vctx;
-  /** Whole vectors each, so no two workers produce bytes of the same
-     shuffle. The last worker takes any remainder. */
-  const uint32_t vecs = c->src_bytes / EXPAND_VEC;
-  const uint32_t v0 = vecs * i / n_threads;
-  const uint32_t v1 = vecs * (i + 1u) / n_threads;
-  const uint32_t off = v0 * EXPAND_VEC;
-  /* The last worker absorbs any tail past the whole vectors. */
-  const uint32_t bytes =
-    (i + 1u == n_threads) ? (c->src_bytes - off) : ((v1 - v0) * EXPAND_VEC);
-  if (bytes) {
-    hvx_expand_i2i4(c->src + off, bytes, c->table, c->dst + 2u * (size_t)off);
-  }
-}
-
-typedef struct {
   uint8_t *base;
   const uint8_t *table;
   uint32_t stride;
@@ -181,17 +158,4 @@ void hvx_expand_i2i4_rows(uint8_t *base, uint32_t stride, uint32_t src_bytes,
     return;
   }
   hvx_worker_pool_run(pool, expand_rows_worker, &ctx, nrows);
-}
-
-void hvx_expand_i2i4_pool(const uint8_t *src, uint32_t src_bytes,
-                          const uint8_t *table, uint8_t *dst,
-                          hvx_worker_pool *pool) {
-  if (!pool) {
-    hvx_expand_i2i4(src, src_bytes, table, dst);
-    return;
-  }
-  expand_ctx ctx = {src, table, dst, src_bytes};
-  /** One unit a vector, so the pool caps at its own width and a transfer
-     too small to split runs inline. */
-  hvx_worker_pool_run(pool, expand_worker, &ctx, src_bytes / EXPAND_VEC);
 }

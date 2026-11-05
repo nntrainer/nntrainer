@@ -1094,14 +1094,11 @@ TEST(nntrainer_cpu_backend_standalone, htp_qs4cx_from_packed_accuracy) {
 /**
  * @brief htp_quant_pack_u8_ah's own math, checked in isolation.
  *
- * This cannot compare against the real HVX path bit-for-bit -- that only
- * exists on-device (nntr_hvx_mm_u8i4_from_f32 returns act_u8_ah/act_scale/
- * act_zp for exactly that comparison; see docs/htp_attention's u8-boundary
- * task for the device-side differential gate). What this test can check
- * without a device: every invariant the DSP path's own contract states --
- * per-row scale/zp bounds, the AH tile addressing formula, padding rows
- * zeroed, and that dequantizing the packed bytes reproduces the input
- * within one quantization step's error.
+ * Checks the CPU packer's contract without a device: per-row scale/zp
+ * bounds, the AH tile addressing formula, padding rows zeroed, and that
+ * dequantizing the packed bytes reproduces the input within one
+ * quantization step's error. The registered-layer device tests compare
+ * complete HMX matmul outputs against an independent CPU reference.
  */
 TEST(nntrainer_cpu_backend_standalone, htp_quant_pack_u8_ah_accuracy) {
   const uint32_t M = 37; // deliberately not a multiple of HTP_ACT_TILE_ROW
