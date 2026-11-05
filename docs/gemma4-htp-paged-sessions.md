@@ -13,10 +13,10 @@ interpreted as validation of the new prefill policy.
 | --- | --- |
 | Sessions | Create, select, delete and fork independent conversations in one loaded model. One conversation executes at a time. |
 | Paged KV | Native DSP page tables. Each physical page stores one layer/head's 64-token K tile and V rows. Attention reads the pages directly, without gathering history. |
-| Sharing | Retained states share immutable physical pages. Append detaches the pages it modifies before dispatching workers. Quantizer state and runtime positions belong to each state. |
-| Radix prefix index | Compressed token edges select causally reproducible FP16 prefill pages. A hit restores the matched pages and processes the unmatched suffix in HMX before seeding DSP INT8 decode. |
+| Sharing | DSP sessions/forks share immutable physical pages. Append detaches modified pages. Radix entries independently pin host FP16 slabs and exact calibration. |
+| Radix prefix index | Compressed token edges select completed original prefill calls with a compatible call plan. A hit restores the matched pages and processes the unmatched suffix in HMX before seeding DSP INT8 decode. |
 | Global / Sliding | Global grows by pages. Sliding reserve releases whole old tiles and remaps retained pages without copying their KV payload. |
-| Flash | Existing transactional INT8 snapshots also export/import paged caches. Parking releases the active page table's references. Pages pinned by other sessions/prefixes remain resident. |
+| Flash | Existing transactional INT8 snapshots also export/import paged caches. Parking releases the active page table's references. Pages pinned by other sessions/forks remain resident. |
 
 ## Enable
 
@@ -29,6 +29,9 @@ Use the fully resident `htp_fused` Gemma4 MoE profile and configure:
   "skip_prefill": true,
   "init_seq_len": 4096,
   "htp": {
+    "attn_q2": true,
+    "oproj_u16": true,
+    "kv_seed_q": false,
     "kv_prefix_cache": true,
     "kv_session": true,
     "kv_paged": true,
@@ -91,38 +94,32 @@ This is the native request sequence interface; HTTP serving is a separate layer.
 
 ## Prefix semantics and bounds
 
-The radix index publishes the available 256-token calibration boundaries of
-the computed prefill; physical DSP pages contain 64 tokens. A retained
-1024-token prompt can supply its first 768 tokens without executing a separate
-768-token prompt. Host FP16 pages are immutable and shared;
-boundary metadata contains their layout and attention state. Unlike a decode
-snapshot's INT8 pages, these preserve the input precision needed to reproduce
-fresh prefill and its final decode quantization. Prefix eviction releases these
-pins; decode sessions retain their own INT8 state.
+The compressed radix index publishes completed original prefill calls, not
+arbitrary physical-page boundaries. It retains the last completed full native
+block (4096 tokens for the 4608-token source, 8192 for the 8704-token source)
+plus the final multi-row prefill endpoint. A new request must match both token
+IDs and the original call plan. Repeated complete inputs can reuse their full
+prefill; a longer request can reuse completed full native chunks. A prefix inside
+a whole-call calibration group safely misses. For example, a single 1024-token
+source cannot supply an exact 768-token crop under the unchanged original q8
+policy. Physical DSP pages remain 64 tokens. Optional direct KVQ seed mode
+(`htp.kv_seed_q=true`) preserves its original computation and does not retain
+prefixes; the validated host snapshot path uses `false`.
 
-A new complete input searches for the longest available prefix strictly before
-its final token. A divergence after 750 tokens reuses 512 tokens in the current
-Q2 policy.
-At least three suffix tokens are left for the block-prefill graph. A
-continuation of an existing conversation uses its resident state instead of
-radix lookup.
-The unmatched suffix runs as HMX prefill, then the last prompt token seeds and
-starts DSP decode. The source session remains unchanged.
-
-This requires `htp.kv_prefix_cache=true` and `attention_kv_dtype=q8`.
-The existing Q2 kernels use causal 256-query calibration domains in prefix
-mode. This changes calibration grouping relative to whole-call q8: exact
-fresh/reused IDs are verified under the new grouping, while equivalence with
-legacy whole-call outputs is not claimed. The original q8 grouping remains
-available for sessions with prefix caching disabled. Configuration or
-attention failures in radix mode raise an error instead of changing the prefill policy silently.
+Host FP16 snapshots retain immutable shared slabs, exact calibration and sliding
+layout. A hit resumes the remaining original calls and the final prompt token's
+DSP decode. No 256-token calibration policy or per-domain O-projection encoding
+is used. Non-default repetition penalties and debug token-by-token resumed prefill
+fall back to the original computation. One-row native prefill tails initialize
+their KV window before transferring ownership to DSP. Resident conversations
+continue using their existing native DSP state.
 
 Limits are counts of sessions and retained prefixes, totalling at most 120.
-Prefix retention uses LRU. These limits do **not** constitute a DRAM byte
-budget. Explicit DSP Flash snapshots remain supported; the host prefill radix
-index is not persisted in those snapshots. `getDeviceKVCacheBytes()` reports
-active DSP K/V payload, while `getDeviceKVPrefixBytes()` counts unique retained
-host prefill K/V pages. See the current validation for their separate costs.
+Prefix retention uses LRU; there is no DRAM byte budget. Shared views pin entire
+RPC slabs, including unused reserved capacity. `getDeviceKVCacheBytes()` reports
+active DSP payload; `getDeviceKVPrefixBytes()` reports unique pinned host slabs
+and materialized page copies. Flash snapshots preserve DSP session state, not
+the host radix index. See [the current contract and evidence](gemma4-htp-radix-prefix.md).
 
 ## Checks
 
