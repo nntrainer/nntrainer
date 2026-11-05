@@ -4,7 +4,7 @@
 
 - 작업 경로: `/tmp/nntr-pr4428-validation`
 - 브랜치: `kv/pr4428-dsp-flash-20261104`, 원격 `baek2sm/nntrainer`
-- 구현 커밋: `b2b83cc2e363769222e09e5e6467ab29c9698dcb`
+- 구현 커밋: `f2e43d820`
 - 기존 q8/Q2 calibration·Q16/K8/V8·U16 O projection 및 projection/FFN/MoE 배치 유지.
 - **256-token calibration 정책은 제거했다.** prefix 옵션이 계산 dispatch를 바꾸던
   과거 q8_row 분기도 제거했고 Q2/U16 구성이 아니면 명시적으로 거부한다.
@@ -15,7 +15,8 @@
 
 Radix는 토큰과 **원래 prefill 호출 경계**가 모두 맞는 상태만 재사용한다.
 새로 계산하는 긴 요청은 마지막 완전한 native 호출 경계와 최종 multi-row
-prefill endpoint를 보존한다. 더 이른 sliding 상태를 유지하려고 추가 복사하지 않는다.
+prefill endpoint를 DRAM에 보존한다. **새 opt-in 비동기 prefix Flash 모드에서는
+더 이른 native 경계의 global/sliding KV도 저장·복원한다.**
 
 - 4608-token source → 공통 4096-token prefix 재사용.
 - 8704-token source → 공통 8192-token prefix 재사용. 실제 계산 배치는 기존대로
@@ -76,7 +77,8 @@ snapshot을 제거하기 전의 same-model 원본도 JSON에 보존했다. CPU/D
   RPC slab 전체 pin으로 작은 pack은 1160 MiB, 긴 pack은 1240 MiB/source를
   보존한다. 여유 DRAM에 맞춰 prefix 수를 설정해야 한다.
 - `htp.kv_seed_q=true`의 직접 양자화 seed는 기존 경로를 보존하고 prefix는 miss 처리한다. 기본 검증 pack은 `false`다.
-- DSP Flash snapshot은 host FP16 radix index를 저장하지 않는다.
+- DSP Flash snapshot은 host FP16 radix index를 저장하지 않는다. 새 prefix Flash
+  backing은 별도 경로로, scale/layout/token index는 모델의 DRAM metadata에 남는다.
 - 첫 seed에서 tensor의 RPC slab 소유권을 반납하며 radix pin만 유지한다. clear 후 논리 pin은 0이다. 실제 OS MemAvailable 즉시 증가량은 driver/allocator 상태에 따라 다르며 전체 payload 즉시 반환을 주장하지 않는다.
 - 비기본 repetition penalty와 `NNTR_RESUME_BLOCK=0`은 재사용 대신 원래 계산.
 - corpus 품질 또는 긴 steady decode TPS는 별도 검증 범위다. 현재 결과는 기존
@@ -102,3 +104,36 @@ ninja -C builddir_app/htp nntr_causallm htp_page_prefix_check htp_sessions_check
 `htp_prefix_cold_bench pack paired-fixture.json cold.json`을 사용한다.
 fixture 원본은 evidence JSON의 `length_cases` 및 `cold_same_model_raw` 안에 있다.
 ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
+
+## 추가 완료: 과거 native 경계의 비동기 Flash 보존
+
+- 구현 커밋 `f2e43d820`, 기존 q8/Q2·배치·DSP 연산 변경 없음.
+- `enableDeviceKVPrefixFlash(directory, flash_bytes, staging_bytes)` 또는
+  top-level `kv_prefix_flash` JSON으로 opt-in. 기본값은 OFF.
+- 8704-token source가 끝나도 과거 4096-token 경계를 Flash에서 복원한다.
+  마지막 native 경계/최종 상태는 기존 DRAM 경로를 유지한다.
+- earlier boundary의 live global KV + sliding window를 owned staging에 복사하고
+  worker가 checksum/write/fdatasync한다. 완료 후 staging 해제. calibration은
+  원본 그대로 DRAM frame에 남는다. 현재 file 간 global page dedup은 없다.
+- staging byte budget이 차면 추론을 기다리지 않고 그 경계 백업 skip. 파일은
+  budget/LRU로 퇴출하고, evicted/missing/corrupt 상태는 이전 경계 또는 재계산.
+- native CLI A→B와 독립 재계산의 RUBY 답변 전체 11개 ID/위치 일치.
+- cold 8704-token 저장 OFF/ON 모드별 4회: TTFT 17.204 / 17.272초 (+0.39%).
+  staging 평균 107.9ms, background write/sync 평균 971.4ms. 모든 ON 표본에서
+  요청 종료 시 pending=0, skip/failure=0. 주파수 고정 없이 측정.
+- 실제 A→B: 4123-token B 중 4096 재사용. 재계산 8.453초 → 복원 TTFT 3.223초.
+  file read/checksum 985.3ms, 세션 전환 7.8ms는 TTFT와 별도.
+- synthetic branch 2개, 기존 8192 DRAM 경계, 세션 6턴/fork/DSP Flash 복원 통과.
+  synthetic baseline의 EOS를 품질 성공으로 포장하지 않았으며 RUBY로 보강했다.
+- Ubuntu 36 unit, Android/Ubuntu owned-stage/view, Flash LRU/budget/checksum/
+  cancellation/failed-write 검사 및 host ASan/UBSan 통과 (detect_leaks=0).
+- staging/file budget은 기존 latest-prefix RPC slab을 포함한 전체 DRAM 제한이 아니다.
+  최신 DRAM prefix 크기 문제 및 cross-file page dedup은 후속 최적화 범위.
+- backing은 process-local. 정상 clear/LRU/destruction 시 정리되지만 비정상 종료 후
+  private cache directory 잔여물 정리는 호출 애플리케이션이 담당해야 한다.
+- [설정·제약·측정 설명](gemma4-htp-radix-prefix.md),
+  [전체 원본 데이터](validation/gemma4-htp-prefix-flash-20261105.json).
+
+재현 bundle: `/tmp/nntr-prefix-flash-20261105` (기기에도 같은 basename).
+`run-final.sh`는 기능/교차 성능/기존 세션 검증, `run-quality.sh`는 실제 CLI RUBY
+재계산과 A→B Flash hit를 실행한다. 로컬 `raw/`에 모든 결과와 로그가 있다.

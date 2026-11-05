@@ -5,9 +5,9 @@ Gemma4 MoE graph. The existing contiguous DSP path remains the default.
 
 Exact fresh/reused output-ID checks now pass in the opt-in `q8` radix
 mode. See [current implementation and validation](gemma4-htp-radix-prefix.md)
-for its configuration, memory cost and measured TTFT. The historical model
-measurements below used the earlier INT8-state slicing path and must not be
-interpreted as validation of the new prefill policy.
+for its configuration, memory cost, optional asynchronous Flash backing and
+measured TTFT. Earlier INT8-state slicing measurements are historical and do
+not describe the current original-call prefill policy.
 
 | Feature | Implementation |
 | --- | --- |
@@ -16,7 +16,7 @@ interpreted as validation of the new prefill policy.
 | Sharing | DSP sessions/forks share immutable physical pages. Append detaches modified pages. Radix entries independently pin host FP16 slabs and exact calibration. |
 | Radix prefix index | Compressed token edges select completed original prefill calls with a compatible call plan. A hit restores the matched pages and processes the unmatched suffix in HMX before seeding DSP INT8 decode. |
 | Global / Sliding | Global grows by pages. Sliding reserve releases whole old tiles and remaps retained pages without copying their KV payload. |
-| Flash | Existing transactional INT8 snapshots also export/import paged caches. Parking releases the active page table's references. Pages pinned by other sessions/forks remain resident. |
+| Flash | DSP INT8 session snapshots support explicit save/park/restore. Optional asynchronous host-prefix backing retains earlier native prefill boundaries for radix hits under byte budgets and file LRU. |
 
 ## Enable
 
@@ -97,7 +97,9 @@ This is the native request sequence interface; HTTP serving is a separate layer.
 The compressed radix index publishes completed original prefill calls, not
 arbitrary physical-page boundaries. It retains the last completed full native
 block (4096 tokens for the 4608-token source, 8192 for the 8704-token source)
-plus the final multi-row prefill endpoint. A new request must match both token
+plus the final multi-row prefill endpoint in DRAM. Optional asynchronous prefix
+Flash backing preserves earlier completed native boundaries; it does not change
+calibration or split native calls. A new request must match both token
 IDs and the original call plan. Repeated complete inputs can reuse their full
 prefill; a longer request can reuse completed full native chunks. A prefix inside
 a whole-call calibration group safely misses. For example, a single 1024-token
@@ -119,7 +121,8 @@ Prefix retention uses LRU; there is no DRAM byte budget. Shared views pin entire
 RPC slabs, including unused reserved capacity. `getDeviceKVCacheBytes()` reports
 active DSP payload; `getDeviceKVPrefixBytes()` reports unique pinned host slabs
 and materialized page copies. Flash snapshots preserve DSP session state, not
-the host radix index. See [the current contract and evidence](gemma4-htp-radix-prefix.md).
+the host radix index. Optional prefix Flash backing has its own staging/file
+byte budgets and process-local radix metadata. See [the current contract and evidence](gemma4-htp-radix-prefix.md).
 
 ## Checks
 
