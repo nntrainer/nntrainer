@@ -227,9 +227,33 @@ typedef struct {
   int32_t zp;
   uint8_t *lo, *hi; /**< the planes' row block of t's row 0 */
   uint32_t col; /**< the planes' column of gate tile t.nt0, a multiple of 32 */
+  /** NULL, or (act HVX_GLU_GELU_TANH) hvx_gelu_tab_build's tables in VTCM:
+      gelu(g) is then read off them instead of computed, through land's
+      HVX_GELU_TAB_LANE_BYTES a lane (VTCM too, for the gathers) */
+  const float *tab;
+  uint8_t *land;
 } hvx_dq_glu16_job;
 
 void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/**
+ * GeGLU's gelu by linear interpolation in a table of nodes g = k / 256 - 6,
+ * k < HVX_GELU_TAB_NODES, and g itself past 6 (where gelu(g) is g to 1e-8,
+ * as it is 0 below -6). On Gemma-4 E2B's real gate / up it moves 0.012% of
+ * the down's input codes, by one, against an exact GELU -- a tenth of the
+ * tanh / erf GELU gap -- where the 40 ops of hvx_geglu_det_sf were 10% of
+ * the prefill. The values, then the slopes T[k + 1] - T[k], each
+ * HVX_GELU_TAB_STRIDE floats.
+ */
+#define HVX_GELU_TAB_NODES 3073u
+#define HVX_GELU_TAB_STRIDE 3104u
+#define HVX_GELU_TAB_LANE_BYTES 1024u
+#define HVX_GELU_TAB_BYTES(lanes)                                              \
+  (2u * 4u * HVX_GELU_TAB_STRIDE + (lanes) * HVX_GELU_TAB_LANE_BYTES)
+
+/** @brief Fills @a tab (VTCM, 128-byte aligned, 2 * HVX_GELU_TAB_STRIDE
+ *         floats) with the tables: the nodes through hvx_geglu_det_sf. */
+void hvx_gelu_tab_build(float *tab);
 
 /** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
  *         the submit: n_pairs. */

@@ -33,6 +33,7 @@
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_swiglu_det.h"
+#include "standin/gelu_tab_det.h"
 #include "swiglu_det.h"
 
 static int g_fail;
@@ -285,7 +286,8 @@ int main(void) {
      byte-plane tiles, three pairs from gate n-tile 1 of a 128-column half,
      seven rows (a short group), into columns 64.. of 192-column planes:
      the bytes of the rows worker, the GLU's spec and the fixed-encoding
-     pack, and nothing else of the planes touched */
+     pack, and nothing else of the planes touched. act 2 is GeGLU by the
+     table (hvx_gelu_tab_build, the REAL one, against gelu_tab_det.h's) */
   {
     enum { GP = 3, GM = 7, GI = 128, GW = 192, TS = 3 * 2048 };
     static uint8_t pt[2 * 2 * GP * TS] __attribute__((aligned(128)));
@@ -313,7 +315,22 @@ int main(void) {
       gaz[m] = 3000 + 7 * (int32_t)m;
     }
     const float genc[2] = {8.0f / 65535.0f, 32768.f};
-    for (uint32_t act = 0; act < 2u; ++act) {
+    static float tab[2 * HVX_GELU_TAB_STRIDE] __attribute__((aligned(128)));
+    static float tab_want[2 * HVX_GELU_TAB_STRIDE];
+    static uint8_t land[2 * HVX_GELU_TAB_LANE_BYTES]
+      __attribute__((aligned(128)));
+    hvx_gelu_tab_build(tab);
+    gelu_tab_det_build(tab_want);
+    size_t tab_bad = 0;
+    for (uint32_t k = 0; k < HVX_GELU_TAB_NODES; ++k)
+      tab_bad += memcmp(&tab[k], &tab_want[k], 4) != 0 ||
+                 (k + 1u < HVX_GELU_TAB_NODES &&
+                  memcmp(&tab[HVX_GELU_TAB_STRIDE + k],
+                         &tab_want[HVX_GELU_TAB_STRIDE + k], 4) != 0);
+    printf("GELU TABLE hvx_gelu_tab_build: %zu of %u nodes differ\n", tab_bad,
+           HVX_GELU_TAB_NODES);
+    CHECK(tab_bad == 0, "the gelu table differs from gelu_tab_det_build");
+    for (uint32_t act = 0; act < 3u; ++act) {
       /* the composition: each half by the rows worker, GLU, pack */
       for (uint32_t h = 0; h < 2u; ++h) {
         hvx_dq_rows_job rj = {{pt + (size_t)h * GP * TS, TS, h * GI / 32u + 1u,
@@ -323,12 +340,15 @@ int main(void) {
                               NULL};
         hvx_dq_tiles_rows_worker(1u, 0u, &rj);
       }
+      uint32_t past = 0;
       for (uint32_t m = 0; m < GM; ++m)
         for (uint32_t c = 0; c < GP * 32u; ++c) {
           const float gv = f[m * 2u * GI + 32u + c];
           const float uv = f[m * 2u * GI + GI + 32u + c];
-          y[m * GP * 32u + c] =
-            act ? geglu_det_one(gv, uv) : swiglu_det_one(gv, uv);
+          past += fabsf(gv) > 6.0f;
+          y[m * GP * 32u + c] = act == 2u ? gelu_tab_det_one(tab_want, gv, uv)
+                                : act     ? geglu_det_one(gv, uv)
+                                          : swiglu_det_one(gv, uv);
         }
       int rc = hvx_quant_params_pack_u16_ah(
         y, NULL, NULL, 0u, genc, GM, 64u, GP * 32u, NULL, 0.f, NULL, wsc16,
@@ -343,7 +363,9 @@ int main(void) {
                              (int32_t)genc[1],
                              got,
                              got + 64u * GW,
-                             64u};
+                             64u,
+                             act == 2u ? tab : NULL,
+                             land};
       hvx_dq_glu16_worker(2u, 0u, &gj);
       hvx_dq_glu16_worker(2u, 1u, &gj);
       size_t bad = 0, touched = 0;
@@ -357,8 +379,11 @@ int main(void) {
               touched += g8 != 0x5a;
           }
       printf("GLU16 EPILOGUE hvx_dequant_i32.c %s: rc=%d, %zu bytes differ, "
-             "%zu outside touched\n",
-             act ? "geglu" : "swiglu", rc, bad, touched);
+             "%zu outside touched (%u gates past 6)\n",
+             act == 2u ? "geglu table"
+             : act     ? "geglu"
+                       : "swiglu",
+             rc, bad, touched, past);
       CHECK(rc == 0 && bad == 0 && touched == 0,
             "GLU16 epilogue (act=%u) differs from rows worker + GLU + pack",
             act);

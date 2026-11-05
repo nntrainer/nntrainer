@@ -11,6 +11,7 @@
  */
 
 #include <stddef.h>
+#include <string.h>
 
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
@@ -375,6 +376,64 @@ static inline void dq_rows4_f32(const hvx_dq_tiles_job *c, const uint8_t *tile,
   }
 }
 
+void hvx_gelu_tab_build(float *tab) {
+  HVX_Vector *t = (HVX_Vector *)tab,
+             *s = (HVX_Vector *)(tab + HVX_GELU_TAB_STRIDE);
+  float x0[32];
+  for (uint32_t k = 0; k < 32u; ++k) {
+    x0[k] = (float)((int32_t)k - 1536) * (1.0f / 256.0f);
+  }
+  /* k / 256 - 6 is exact in f32 here, and so is each step's sum; memcpy,
+     not a float store under a vector load, which strict aliasing lets the
+     compiler reorder */
+  HVX_Vector x;
+  memcpy(&x, x0, sizeof x);
+  HVX_Vector cur = hvx_geglu_det_sf(x, hvx_splat_sf(1.0f));
+  /* each slope from registers, the next vector's first node by valign: an
+     unaligned reload of the just-stored nodes read lane 31 wrong on the S25
+     (the emulator's was right; why, not pinned down) */
+  for (uint32_t v = 0; v < HVX_GELU_TAB_STRIDE / 32u; ++v) {
+    x = Q6_Vsf_vadd_VsfVsf(x, hvx_splat_sf(32.0f / 256.0f));
+    const HVX_Vector nxt = hvx_geglu_det_sf(x, hvx_splat_sf(1.0f));
+    t[v] = cur;
+    s[v] = Q6_Vsf_vsub_VsfVsf(Q6_V_valign_VVR(nxt, cur, 4), cur);
+    cur = nxt;
+  }
+}
+
+/** @brief gelu(g) * u of four rows by hvx_gelu_tab_build's tables: node
+ *         k = rne(x - 1/2) <= x = 256 g + 1536 (clamped to [0, 3072], so
+ *         k + f lands on node 3072 with f = 0 at most), T[k] + S[k] f,
+ *         both gathered from VTCM, and g past 6. */
+static inline void gelu_tab4(const float *tab, HVX_Vector *land,
+                             const HVX_Vector g[4], const HVX_Vector u[4],
+                             HVX_Vector y[4]) {
+  const uint32_t mu = 4u * HVX_GELU_TAB_NODES - 1u;
+  HVX_Vector f[4];
+  for (uint32_t r = 0; r < 4u; ++r) {
+    HVX_Vector x = Q6_Vsf_vadd_VsfVsf(
+      Q6_Vsf_vmpy_VsfVsf(g[r], hvx_splat_sf(256.0f)), hvx_splat_sf(1536.0f));
+    x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, Q6_V_vzero()),
+                           hvx_splat_sf(3072.0f));
+    const HVX_Vector k =
+      hvx_sf_to_w_rne(Q6_Vsf_vsub_VsfVsf(x, hvx_splat_sf(0.5f)));
+    f[r] = Q6_Vsf_vsub_VsfVsf(x, Q6_Vsf_equals_Vw(k));
+    const HVX_Vector off = Q6_Vw_vasl_VwR(k, 2);
+    Q6_vgather_ARMVw(land + 2u * r, (uintptr_t)tab, mu, off);
+    Q6_vgather_ARMVw(land + 2u * r + 1u, (uintptr_t)(tab + HVX_GELU_TAB_STRIDE),
+                     mu, off);
+  }
+  for (uint32_t r = 0; r < 4u; ++r) {
+    const HVX_Vector t = Q6_Vsf_vadd_VsfVsf(
+      land[2u * r], Q6_Vsf_vmpy_VsfVsf(land[2u * r + 1u], f[r]));
+    /* g > 6 on the bits: 6.0f is positive, so a negative g compares less */
+    y[r] = Q6_Vsf_vmpy_VsfVsf(
+      Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(g[r], Q6_V_vsplat_R(0x40c00000)), g[r],
+                    t),
+      u[r]);
+  }
+}
+
 void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const hvx_dq_glu16_job *jb = (const hvx_dq_glu16_job *)vjob;
   const hvx_dq_tiles_job *c = &jb->t;
@@ -400,14 +459,22 @@ void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
                  *(const HVX_UVector *)(c->colsum_w + cu),
                  *(const HVX_UVector *)(c->w_scale + cu),
                  *(const HVX_UVector *)(c->bias + cu), uv);
+    HVX_Vector y[4];
+    if (jb->tab) {
+      gelu_tab4(jb->tab,
+                (HVX_Vector *)(jb->land + (size_t)i * HVX_GELU_TAB_LANE_BYTES),
+                gv, uv, y);
+    } else {
+      for (uint32_t r = 0; r < 4u; ++r) {
+        y[r] = jb->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(gv[r], uv[r])
+                                            : hvx_swiglu_det_sf(gv[r], uv[r]);
+      }
+    }
     for (uint32_t r = 0; r < 4u; ++r) {
-      const HVX_Vector y = jb->act == HVX_GLU_GELU_TANH
-                             ? hvx_geglu_det_sf(gv[r], uv[r])
-                             : hvx_swiglu_det_sf(gv[r], uv[r]);
-      q[r] =
-        4u * g + r < c->m_count
-          ? Q6_Vw_vadd_VwVw(hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(y, vinv)), vzp)
-          : Q6_V_vzero();
+      q[r] = 4u * g + r < c->m_count
+               ? Q6_Vw_vadd_VwVw(
+                   hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(y[r], vinv)), vzp)
+               : Q6_V_vzero();
     }
     /* hvx_quant_u8.c's store16_group4: rows 0-1 low half, 2-3 high */
     const HVX_Vector h01 = Q6_Vuh_vpack_VwVw_sat(q[1], q[0]);

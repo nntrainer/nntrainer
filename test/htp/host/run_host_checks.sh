@@ -456,6 +456,18 @@ if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
   echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
 fi
 echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
+# The gelu table's interpolation dropped (the slope read as 0): GLU16's
+# table case must fail it.
+mut='s/land\[2u \* r + 1u\], f\[r\])/land[2u * r + 1u], Q6_V_vzero())/'
+sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
+if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
+  echo "GELU TABLE MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+geglu_check "$OUT/hvx_dequant_i32.c" "$OUT/geglu_tab_mutant"
+if "$OUT/geglu_tab_mutant" > "$OUT/geglu_tab_mutant.log"; then
+  echo "GELU TABLE MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "GELU TABLE MUTANT CAUGHT: no interpolation ($(grep -o 'geglu table: rc=0, [0-9]* bytes differ' "$OUT/geglu_tab_mutant.log"))"
 
 # The a16 activation pack (hvx_quant_params_pack_u16_ah) and the a16
 # dequant combine, the REAL HVX code on hvx_emu/, bit for bit against their

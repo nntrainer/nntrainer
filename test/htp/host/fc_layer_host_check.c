@@ -13,6 +13,7 @@
 #include "hvx_rmsnorm_rows_f32.h"
 #include "hvx_rope_rows_f32.h"
 #include "hvx_scalar_stubs.h"
+#include "standin/gelu_tab_det.h"
 #include "swiglu_det.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -519,7 +520,8 @@ int main(void) {
        * the GLU epilogue (hexkl_mm_opts.glu_lo): two gate_up handles, 36
        * n-tiles (a batch of 32 splits its pairs 16 + 2) and 4, must give
        * the planes of the plain run, its GLU, then the fixed-encoding pack
-       * -- pad rows and all, over planes that start as garbage
+       * -- pad rows and all, over planes that start as garbage; gelu is
+       * the table's (gelu_tab_det.h)
        */
       {
         const uint32_t GN[2] = {1152u, 128u}, GK = 640u;
@@ -538,6 +540,8 @@ int main(void) {
         uint8_t *gp = (uint8_t *)malloc(4u * (size_t)mp * GK);
         float *gsc = (float *)malloc(sizeof(float) * mp);
         int32_t *gzp = (int32_t *)malloc(sizeof(int32_t) * mp);
+        static float gtab[2 * HVX_GELU_TAB_STRIDE];
+        gelu_tab_det_build(gtab);
         for (uint32_t act = 0; act < 2u; ++act) {
           rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                        M, AK, gh, 2, ax, gf, &on);
@@ -547,7 +551,7 @@ int main(void) {
               for (uint32_t c = 0; c < in; ++c) {
                 const float *r = gf + o0 + (size_t)t * GN[i];
                 gy[(size_t)t * GK + c0 + c] =
-                  act ? geglu_det_one(r[c], r[in + c])
+                  act ? gelu_tab_det_one(gtab, r[c], r[in + c])
                       : swiglu_det_one(r[c], r[in + c]);
               }
             o0 += M * GN[i];

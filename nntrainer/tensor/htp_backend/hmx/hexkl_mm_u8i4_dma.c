@@ -1035,6 +1035,19 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   if (acc_tiles > 32u) {
     acc_tiles = 32u;
   }
+  /** GeGLU's gelu by the table (hvx_gelu_tab_build): the tables and a gather
+      landing a lane after the two staging buffers, the batch shrunk until
+      they fit */
+  const uint32_t stage_bytes = 2u * n_sweeps * ACC_TILE_BYTES;
+  const uint32_t lanes = hvx_worker_pool_workers(o->pool);
+  const uint32_t tab_bytes = HVX_GELU_TAB_BYTES(lanes > 0u ? lanes : 1u);
+  const int glu_tab = o->glu_lo != NULL && o->glu_act == HVX_GLU_GELU_TANH;
+  while (glu_tab && acc_tiles > 2u &&
+         result_off + acc_tiles * stage_bytes + 128u + tab_bytes > arena) {
+    --acc_tiles;
+  }
+  const uint32_t tab_off =
+    ROUND_UP_U32(result_off + acc_tiles * stage_bytes, 128u);
   /* With the per-head passes asked for (post_done), a batch of whole
      heads when the room allows one: the widest head's tiles divide it. */
   if (o->post_done != NULL) {
@@ -1086,8 +1099,12 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       return AEE_EBADPARM;
     }
     if (!acc_layout->usable || acc_tiles < 2u ||
-        (uint64_t)K * 255u * 8u >= (1u << 23)) {
+        (uint64_t)K * 255u * 8u >= (1u << 23) ||
+        (glu_tab && tab_off + tab_bytes > arena)) {
       return AEE_EUNSUPPORTED;
+    }
+    if (glu_tab) {
+      hvx_gelu_tab_build((float *)(vtcm_base + tab_off));
     }
   }
 
@@ -1534,6 +1551,8 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                 gj->lo = o->glu_lo + blk;
                 gj->hi = o->glu_hi + blk;
                 gj->col = (uint32_t)(head_out / M / 2u) + nt0 / 2u * 32u;
+                gj->tab = glu_tab ? (const float *)(vtcm_base + tab_off) : NULL;
+                gj->land = vtcm_base + tab_off + 2u * 4u * HVX_GELU_TAB_STRIDE;
                 hvx_worker_pool_submit(o->pool, hvx_dq_glu16_worker, gj,
                                        (cnt + 3u) / 4u * (nb / 2u));
               } else {

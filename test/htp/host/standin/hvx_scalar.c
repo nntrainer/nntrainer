@@ -13,6 +13,7 @@
 
 #include "hvx_scalar.h"
 
+#include "gelu_tab_det.h"
 #include "hexkl_micro.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_expand_i2i4.h"
@@ -768,6 +769,8 @@ int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
   }
   return 0;
 }
+void hvx_gelu_tab_build(float *tab) { gelu_tab_det_build(tab); }
+
 /* The GLU epilogue (hexkl_mm_opts.glu_lo): slot j the gate n-tile nt0 + j,
    slot n_tiles + j its up tile; the rows worker's dequant above, the GLU's
    spec, then hvx_quant_params_pack_u16_ah's codes four rows a unit. */
@@ -795,7 +798,8 @@ void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
         }
         long q = 0;
         if (r < c->m_count) {
-          const float y = jb->act == HVX_GLU_GELU_TANH
+          const float y = jb->tab ? gelu_tab_det_one(jb->tab, v[0], v[1])
+                          : jb->act == HVX_GLU_GELU_TANH
                             ? geglu_det_one(v[0], v[1])
                             : swiglu_det_one(v[0], v[1]);
           q = (long)nearbyintf(y * (1.0f / jb->scale)) + jb->zp;

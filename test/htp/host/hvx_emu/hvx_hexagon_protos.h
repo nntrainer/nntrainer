@@ -301,6 +301,19 @@ static inline HVX_Vector Q6_V_vror_VR(HVX_Vector a, int32_t bytes) {
   return r;
 }
 
+/* the PRM's Vd = (Vu:Vv) >> 8 Rt: Vv's bytes from Rt up, then Vu's */
+static inline HVX_Vector Q6_V_valign_VVR(HVX_Vector u, HVX_Vector v,
+                                         int32_t bytes) {
+  HVX_Vector r;
+  const uint8_t *hi = (const uint8_t *)u.w, *lo = (const uint8_t *)v.w;
+  uint8_t *dst = (uint8_t *)r.w;
+  const int n = 4 * HVX_EMU_LANES, b = bytes & (n - 1);
+  for (int i = 0; i < n; ++i) {
+    dst[i] = i + b < n ? lo[i + b] : hi[i + b - n];
+  }
+  return r;
+}
+
 static inline int32_t Q6_R_vextract_VR(HVX_Vector a, int32_t byte_off) {
   int32_t w;
   memcpy(&w, (const uint8_t *)a.w + (byte_off & (4 * HVX_EMU_LANES - 1)),
@@ -582,6 +595,22 @@ static inline void Q6_vmem_QRIV(HVX_VectorPred q, HVX_Vector *addr,
 static inline void Q6_l2fetch_AP(void *addr, uint64_t cfg) {
   (void)addr;
   (void)cfg;
+}
+
+/* vgather, words: lane i of *dst is the word at base + off.w[i] when that
+   word lies inside [base, base + mu], else left as it was. base is a
+   pointer-wide integer here (Word32 on the device). The emulation does
+   the gather at once; the device's is asynchronous, and the kernels rely
+   on a later vector load of *dst waiting for it (the device gtests are
+   what check that). */
+static inline void Q6_vgather_ARMVw(HVX_Vector *dst, uintptr_t base,
+                                    uint32_t mu, HVX_Vector off) {
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const uint32_t o = (uint32_t)off.w[i];
+    if (o <= mu && mu - o >= 3u) {
+      memcpy(&dst->w[i], (const uint8_t *)base + o, 4);
+    }
+  }
 }
 
 /* ==== byte / halfword integer ops and vlut16 (#170 round 3) ===============
