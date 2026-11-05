@@ -98,14 +98,15 @@ public:
    */
   void free_shared(void *block);
 
-  /** Retain an immutable view after the tensor owner releases its slab. */
+  /** Pin a live slab before drop_shared(); the pin survives tensor retirement.
+   */
   std::shared_ptr<void> retain_shared(void *block);
 
   /**
-   * @brief Frees a block from alloc_shared() before its owner does
-   *        (the prefill's KV cache once the DSP holds the rows); the owner's
-   *        later free_shared() of it is then a no-op. A pointer that is not
-   *        a live block is ignored.
+   * @brief Retires the tensor's ownership once DSP holds the KV rows.
+   *        Immutable prefix pins delay physical release until their last owner
+   *        is gone. The tensor's later free_shared() is a no-op. A pointer that
+   *        is not a live allocation base is ignored.
    */
   void drop_shared(void *block);
 

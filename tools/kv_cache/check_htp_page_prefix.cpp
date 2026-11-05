@@ -5,6 +5,7 @@
  */
 #include <causal_lm.h>
 #include <chrono>
+#include <cstdint>
 #include <factory.h>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <htp_runtime_config.h>
 #include <iostream>
 #include <model_registry.h>
+#include <sstream>
 #include <streamer.h>
 
 using json = causallm::json;
@@ -27,6 +29,19 @@ static json read(const std::filesystem::path &path) {
 static void require(bool ok, const char *message) {
   if (!ok)
     throw std::runtime_error(message);
+}
+static uint64_t availableMemoryKb() {
+#ifdef __ANDROID__
+  std::ifstream file("/proc/meminfo");
+  std::string line;
+  while (std::getline(file, line))
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      uint64_t value = 0;
+      std::istringstream(line.substr(13)) >> value;
+      return value;
+    }
+#endif
+  return 0;
 }
 struct Observer {
   BaseStreamer base;
@@ -233,7 +248,9 @@ int main(int argc, char **argv) {
               report["source_continuation_reference"]["ids"],
             "Original 1024-token source was overwritten");
     report["prefix_host_before_clear"] = c->getDeviceKVPrefixBytes();
+    report["available_kb_before_prefix_clear"] = availableMemoryKb();
     c->clearDeviceKVPrefixes();
+    report["available_kb_after_prefix_clear"] = availableMemoryKb();
     report["prefix_host_after_clear"] = c->getDeviceKVPrefixBytes();
     require(c->getDeviceKVPrefixBytes() == 0 && c->getDeviceKVCacheBytes() > 0,
             "Clearing prefixes must free host pins and preserve active DSP KV");

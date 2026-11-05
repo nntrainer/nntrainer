@@ -1879,8 +1879,14 @@ bool Fp16Attention::htpDecodeAttention(RunLayerContext &context,
       context.getOutput(OUTPUT), key, value, pos, make_rope);
     NNTR_THROW_IF(!seeded, std::runtime_error)
       << "Read-only host KV view requires resident DSP decode";
-    // The DSP owns the history from here on. Later tokens use the ordinary
-    // decode entry without constructing host views again.
+    // The state saw subviews, whose interior pointers cannot retire the
+    // original RPC allocations. Drop the tensor owners here; immutable
+    // prefix pins keep the slabs alive until their final release.
+    if (compute_ops_) {
+      compute_ops_->drop_shared(ck.getData<uint16_t>());
+      compute_ops_->drop_shared(cv.getData<uint16_t>());
+    }
+    // Later tokens use the ordinary decode entry without host views.
     decode_cache_offset_ = 0;
     return true;
   }

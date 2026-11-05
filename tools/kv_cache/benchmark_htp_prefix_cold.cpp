@@ -53,7 +53,11 @@ int main(int argc, char **argv) {
     auto cfg = read(dir / "config.json"),
          gen = read(dir / "generation_config.json"),
          nc = read(dir / "nntr_config.json"), fixture = read(argv[2]);
-    nntrainer::configureHtpRuntime(causallm::normalizeHtpRuntimeConfig(nc));
+    const auto runtime = causallm::normalizeHtpRuntimeConfig(nc);
+    if (runtime.htp.kv_seed_q)
+      throw std::invalid_argument(
+        "Cold prefix benchmark requires FP16 KV seeding");
+    nntrainer::configureHtpRuntime(runtime);
     causallm::registerAllModels();
     auto model = std::make_unique<causallm::PrefixColdBenchmark>(cfg, gen, nc);
     model->initialize();

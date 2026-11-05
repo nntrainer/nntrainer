@@ -163,7 +163,7 @@ void HtpBackend::drop_shared(void *block) {
   {
     std::lock_guard<std::mutex> lock(shared_mu_);
     const auto it = shared_.find(block);
-    if (it == shared_.end() || it->second.use_count() > 1)
+    if (it == shared_.end())
       return;
     dropped_.insert(block);
     owner = std::move(it->second);

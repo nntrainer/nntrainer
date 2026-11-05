@@ -1177,7 +1177,10 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
   if (max_prefixes && !device_prefix_mode_)
     throw std::logic_error(
       "Exact DSP radix reuse requires htp.kv_prefix_cache");
-  device_prefill_capture_ = max_prefixes != 0;
+  // Direct KVQ seeding consumes a quantized prefill state not represented by
+  // the host checkpoint. Preserve that original path with ordinary misses.
+  device_prefill_capture_ =
+    max_prefixes != 0 && !nntrainer::htpRuntimeConfig().htp.kv_seed_q;
   kv_cache.setSharedRetain(
     [](void *block) { return nntrainer::get_htp_ops()->retain_shared(block); });
   device_kv_manager_ = std::make_unique<DeviceKVManager>(
