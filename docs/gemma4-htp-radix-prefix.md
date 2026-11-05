@@ -271,8 +271,11 @@ sustained decode TPS or sustained write-saturation claim.
 
 [Current core feature matrix and the 4K–20K measurements](kv-cache-manager-feature-results.md)
 record two paired comparisons per tier/length, exact IDs and meaningful RUBY
-answers. At 20K the DRAM pair measured 53.349 → 2.752 s and the Flash pair
-46.906 → 5.325 s. Each uses its own corresponding recomputation control.
+answers. The primary report now takes the fastest recompute sample across
+both tiers as the shared baseline and keeps each hit time as its two-sample
+mean. At 20K this is 46.829 s recompute, 2.752 s DRAM hit (17.01×), and
+5.325 s Flash hit (8.79×). The original tier-specific paired means remain in
+the evidence for audit. This is a conservative reaggregation, not a new run.
 
 The longer 20,992-token cold backup comparison observed +4.29% TTFT
 (57.819 → 60.300 s), despite writes finishing before request end. Keep this

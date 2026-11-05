@@ -292,7 +292,8 @@
       "write_ms": 3732.977446,
       "written": 5
     },
-    "error": null
+    "error": null,
+    "paired_rows_note": "rows retain the original tier-specific paired means and ratios for audit; the primary report now uses conservative_presentation below."
   },
   "all_output_ID_position_checks_passed": true,
   "all_20_branch_answers_contain_RUBY_456": true,
@@ -178190,5 +178191,97 @@
       "wall_ms": 3071.998385,
       "input_ids_ref": "request_11"
     }
+  },
+  "conservative_presentation": {
+    "policy": "For each length, use the minimum application TTFT among all four recompute controls across both tiers as the shared Before. Keep each tier hit time as its unchanged two-sample arithmetic mean. Recalculate ratios from unrounded milliseconds.",
+    "purpose": "A deliberately favorable recomputation baseline and conservative description of cache-hit benefit; not proof of stable clocks or cross-device reproducibility.",
+    "measurements_unchanged": true,
+    "rows": [
+      {
+        "common_tokens": 4096,
+        "input_tokens": 4123,
+        "recompute_best_ms": 8647.742966,
+        "reference_sample_count": 4,
+        "reference_provenance": {
+          "tier": "flash",
+          "round": 0
+        },
+        "reuse_samples_per_tier": 2,
+        "dram_hit_mean_ms": 2361.6078639999996,
+        "dram_speedup": 3.6618030867126214,
+        "dram_reduction_percent": 72.69104929130013,
+        "flash_hit_mean_ms": 2511.7118474999997,
+        "flash_speedup": 3.4429677809607897,
+        "flash_reduction_percent": 70.95529021416107
+      },
+      {
+        "common_tokens": 8192,
+        "input_tokens": 8219,
+        "recompute_best_ms": 16115.700202999999,
+        "reference_sample_count": 4,
+        "reference_provenance": {
+          "tier": "flash",
+          "round": 0
+        },
+        "reuse_samples_per_tier": 2,
+        "dram_hit_mean_ms": 2310.8421605,
+        "dram_speedup": 6.973951089551276,
+        "dram_reduction_percent": 85.66092610689154,
+        "flash_hit_mean_ms": 2935.873671,
+        "flash_speedup": 5.489234895284429,
+        "flash_reduction_percent": 81.78252490417093
+      },
+      {
+        "common_tokens": 12288,
+        "input_tokens": 12315,
+        "recompute_best_ms": 24744.719938,
+        "reference_sample_count": 4,
+        "reference_provenance": {
+          "tier": "flash",
+          "round": 0
+        },
+        "reuse_samples_per_tier": 2,
+        "dram_hit_mean_ms": 2503.205103,
+        "dram_speedup": 9.88521472265471,
+        "dram_reduction_percent": 89.88388185733363,
+        "flash_hit_mean_ms": 3562.4878894999997,
+        "flash_speedup": 6.945909910580203,
+        "flash_reduction_percent": 85.60303814944716
+      },
+      {
+        "common_tokens": 16384,
+        "input_tokens": 16411,
+        "recompute_best_ms": 34583.62358,
+        "reference_sample_count": 4,
+        "reference_provenance": {
+          "tier": "flash",
+          "round": 0
+        },
+        "reuse_samples_per_tier": 2,
+        "dram_hit_mean_ms": 2630.3666919999996,
+        "dram_speedup": 13.147833602509747,
+        "dram_reduction_percent": 92.39418424181218,
+        "flash_hit_mean_ms": 4205.5021074999995,
+        "flash_speedup": 8.223423195609469,
+        "flash_reduction_percent": 87.83961403647686
+      },
+      {
+        "common_tokens": 20480,
+        "input_tokens": 20507,
+        "recompute_best_ms": 46828.957534,
+        "reference_sample_count": 4,
+        "reference_provenance": {
+          "tier": "flash",
+          "round": 0
+        },
+        "reuse_samples_per_tier": 2,
+        "dram_hit_mean_ms": 2752.2629934999995,
+        "dram_speedup": 17.014710310967967,
+        "dram_reduction_percent": 94.12273273112747,
+        "flash_hit_mean_ms": 5324.747524,
+        "flash_speedup": 8.794587409624569,
+        "flash_reduction_percent": 88.62936993604013
+      }
+    ]
   }
 }

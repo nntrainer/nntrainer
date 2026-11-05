@@ -143,8 +143,12 @@ ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
 - 제품 구현은 `286abec4e` 그대로 유지. 측정 도구 커밋 `f258e8629`.
 - `htp_prefix_grid_bench`: 4K/8K/12K/16K/20K 각 DRAM/Flash 2회 paired 비교,
   20개 case 전체 11개 출력 ID·위치 일치, 모든 답변 RUBY-456.
-- 20K DRAM: 대응 재계산 53.349초 → 2.752초 (19.38×).
-- 20K Flash: 대응 재계산 46.906초 → 5.325초 (8.81×).
+- 발표 표의 Before는 각 길이의 전체 재계산 4개 표본 중 최솟값으로 통일.
+  hit는 각 tier의 기존 2회 평균 유지. 원래 paired 평균·표본은 원본에 보존.
+- 20K 공통 Before46.829초 → DRAM2.752초 (17.01×), Flash5.325초 (8.79×).
+- 동일 길이의 입력·prefill 토큰 수·forward 경로는 동일하며 DRAM 재계산에 추가
+  forward/백업은 없다. 구간별 온도·주파수·producer 메모리 상태 차이의 원인은
+  분리하지 못했으므로 느린 Before를 개선률 산정에 사용하지 않는다.
 - Flash source는 25,088토큰. 24K까지 진행한 뒤에도 4K..20K의 5개 과거 경계를
   실제 파일에서 복원했다. 모든 Flash hit 전 clean-file-cache eviction advice를
   실행했으며 완전한 UFS device-cache cold 보장은 아니다.
@@ -152,7 +156,7 @@ ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
   (+4.29%). staging 880.7ms, background write/sync8325.1ms, 요청 종료
   pending=0, skip/failure=0. **저장 비용이 완전히 숨겨졌다는 결론은 금지.**
 - 중간 thermal status2 / HAL SKIN44.6°C, 주파수 미고정. 각 tier의 대응 control을
-  사용했으며 표본·min/max·온도 원문을 기록했다. 새 구현 품질회귀는 관측되지
+  사용한 원래 paired 값과, 발표용 공통 최솟값을 모두 기록했다. 표본·min/max·온도 원문도 보존했다. 새 구현 품질회귀는 관측되지
   않았지만 전체 속도 무회귀를 보장한 결과가 아니다.
 - 활성 DSP INT8 KV payload: 4K146.875MiB → 20K306.875MiB. 가중치·host
   prefix slab·staging은 제외. 이 pack의 최신 host-prefix pin 카운터는1560MiB.
