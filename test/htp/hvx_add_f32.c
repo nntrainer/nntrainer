@@ -336,6 +336,7 @@ int nntr_hvx_close(remote_handle64 handle) {
   free(s->moe_res);
   free(s->dense16);
   free(s->attn_q16);
+  free(s->ple_mid);
   if (s->vtcm_ctx) {
     HAP_compute_res_release(s->vtcm_ctx);
   }

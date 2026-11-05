@@ -132,6 +132,9 @@ private:
    *  block before it builds them. */
   bool keep_dense_out_ = false, keep_moe_out_ = false;
   bool dense_out_add_ = false; /**< the dense FFN takes the post-FFN add */
+  /** non-null: the dense FFN also takes the per-layer-input tail
+   *  (ple_tail) on these rows */
+  const Tensor *dense_ple_in_ = nullptr;
 
 public:
   Tensor createTransformerDecoderBlock(const int layer_id,

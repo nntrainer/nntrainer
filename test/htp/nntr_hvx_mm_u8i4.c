@@ -2136,6 +2136,71 @@ int nntr_hvx_mm_u8i4_moe_layer_norm_add(
   return AEE_SUCCESS;
 }
 
+int nntr_hvx_mm_u8i4_dense_ffn_ple(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 act,
+  float eps, const float *pre_gamma, int pre_gammaLen, const float *gamma2,
+  int gamma2Len, const uint32 *h_gate_up, int h_gate_upLen,
+  const uint32 *h_down, int h_downLen, const uint32 *row_index,
+  int row_indexLen, const uint32 *row_count, int row_countLen,
+  const float *row_weight, int row_weightLen, const float *act_f32,
+  int act_f32Len, uint32 h_ple_gate, const uint32 *h_ple_proj,
+  int h_ple_projLen, const float *ple_gamma, int ple_gammaLen, float ple_scale,
+  const float *ple, int pleLen, float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || M == 0u || h_ple_gate >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !s->weights_u8i4.slots[h_ple_gate].in_use ||
+      s->weights_u8i4.slots[h_ple_gate].K != K) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t P = s->weights_u8i4.slots[h_ple_gate].N;
+  const uint64_t n = (uint64_t)M * P;
+  if (P % 32u != 0u || (uint64_t)pleLen != n || n > 0x7FFFFFFFu) {
+    FARF(ERROR, "mm_u8i4_dense_ffn_ple: bad per-layer input (M=%u P=%u)",
+         (unsigned)M, (unsigned)P);
+    return AEE_EBADPARM;
+  }
+  /* y: the dense FFN with its post-FFN norm and add, in out_f32 */
+  int rc = nntr_hvx_mm_u8i4_moe_layer_norm_add(
+    handle, M, K, inter, K, act, eps, 1.0f, pre_gamma, pre_gammaLen, NULL, 0,
+    gamma2, gamma2Len, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, NULL, 0, out_f32, out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (s->ple_mid_n < n) {
+    free(s->ple_mid);
+    s->ple_mid = (float *)memalign(128, (size_t)n * sizeof(float));
+    s->ple_mid_n = s->ple_mid ? (uint32_t)n : 0u;
+    if (!s->ple_mid) {
+      FARF(ERROR, "dense_ffn_ple: no heap for %u floats", (unsigned)n);
+      return AEE_ENOMEMORY;
+    }
+  }
+  /* gelu_tanh(y . gate) * ple, in fc_rows_a_call chunks as the FC calls */
+  const uint32_t step = fc_rows_a_call(s, K, &h_ple_gate, 1);
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
+    rc = hexkl_mm_u8i4_layer_run(
+      &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, K,
+      &h_ple_gate, 1u, out_f32 + (size_t)m0 * K, s->ple_mid + (size_t)m0 * P,
+      &(const hexkl_mm_opts){.pool = s->quant_pool});
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+  }
+  if (hvx_glu_rows_sep_f32(s->ple_mid, P, ple, P, s->ple_mid, P, M, P, 1,
+                           s->quant_pool) != 0) {
+    return AEE_EBADPARM;
+  }
+  /* out = ple_scale * (y + rmsnorm(mid . proj) * ple_gamma), y read in
+     place */
+  return layer_res_add_impl(s, M, P, eps, ple_scale, ple_gamma, ple_gammaLen,
+                            h_ple_proj, h_ple_projLen, s->ple_mid, NULL, NULL,
+                            0u, (int)n, out_f32, out_f32Len, out_f32,
+                            out_f32Len);
+}
+
 int nntr_hvx_mm_u8i4_moe_layer_timed(
   remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
   uint32 act, const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,

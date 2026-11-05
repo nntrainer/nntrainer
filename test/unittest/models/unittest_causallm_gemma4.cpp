@@ -76,10 +76,12 @@ void setupGemma4DeterministicWeights(TinyGemma4CausalLM &model) {
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0, 0, 1, 0, 1.0f);
           weight.setValue(0, 0, 4, 0, 2.0f);
-        } else if (layer.getName().find("_layer_scalar") != std::string::npos) {
+        } else if (context.getWeightName(i).find("layer_scalar") !=
+                   std::string::npos) {
           // layer_scalar scales decoder_output (including residual) before the
           // next layer receives it.  A value of 0 zeros out the entire hidden
-          // state; 1 preserves it so the residual path is exercised.
+          // state; 1 preserves it so the residual path is exercised. By the
+          // weight's name: the dense FFN holds it with the per-layer tail.
           weight.setValue(1.0f);
         }
       }

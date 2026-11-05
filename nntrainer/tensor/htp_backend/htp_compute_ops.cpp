@@ -6052,6 +6052,8 @@ private:
    *  table rides along as three small arrays -- 1776 uint32 + 1776 float +
    *  32 uint32 for this model, about 14 KB against the 3.6 MB activation.
    */
+  struct FcHandles;
+
   void invokeMoeLayer(remote_handle64 session,
                       const std::vector<uint32_t> &h_gu,
                       const std::vector<uint32_t> &h_dn,
@@ -6064,7 +6066,9 @@ private:
                       const float *post_gamma = nullptr, float eps = 0.0f,
                       const float *add_x2 = nullptr,
                       const float *add_gamma = nullptr, float add_scale = 1.0f,
-                      bool out_to_host = true) {
+                      bool out_to_host = true, const DenseFfnPle *ple = nullptr,
+                      const FcHandles *ple_gate = nullptr,
+                      const FcHandles *ple_proj = nullptr) {
     const int act_len = static_cast<int>(M) * static_cast<int>(K);
     const int out_len = static_cast<int>(M) * static_cast<int>(N_out);
     const bool with_norms = pre_gamma != nullptr || post_gamma != nullptr;
@@ -6085,8 +6089,9 @@ private:
                           row_count.size() == h_gu.size() &&
                           row_weight.size() == row_index.size() &&
                           dspqReady(session, act_bytes, out_bytes, msg_bytes);
+    // the per-layer-input tail has no host twin: always the fused entry
     const bool host_prenorm = HtpProfile::global().level() >= 2 && with_norms &&
-                              !via_dspq && pre_gamma != nullptr;
+                              !via_dspq && pre_gamma != nullptr && !ple;
     // from out_pool_: the post-attention rows the res_add call left there
     // (the dense call), or the dense output the MoE call takes as act
     HtpRpcBuffer &act_stage =
@@ -6106,6 +6111,12 @@ private:
       x2_f32 = reinterpret_cast<float *>(
         stageInput(x2_pool_, add_x2, out_bytes, &out_pool_).data());
     }
+    // a dense FFN has no x2, so its per-layer input rows take that buffer
+    const int ple_len = ple ? static_cast<int>(M * ple->P) : 0;
+    const float *ple_f32 =
+      ple ? reinterpret_cast<float *>(
+              stageInput(x2_pool_, ple->rows, ple_len * sizeof(float)).data())
+          : nullptr;
     HtpRpcBuffer &out_stage =
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
@@ -6116,7 +6127,7 @@ private:
     // section 9.26), the post-FFN epilogue too (section 9.34). Measurement
     // only; the norms' and the epilogue's time is outside the call.
     const bool host_norms =
-      HtpProfile::global().level() >= 2 && with_norms && !via_dspq;
+      HtpProfile::global().level() >= 2 && with_norms && !via_dspq && !ple;
     if (host_prenorm) {
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(act, act_f32, M, K, eps);
       for (unsigned int r = 0; r < M; ++r)
@@ -6134,7 +6145,7 @@ private:
 
     HtpProfile &profile = HtpProfile::global();
     uint32_t stage_us[HTP_MOE_N_STAGES] = {0};
-    const bool timed = profile.level() >= 2;
+    const bool timed = profile.level() >= 2 && !ple;
     const bool host_post_norm = host_norms && post_gamma != nullptr;
     const bool norm_entry = with_norms && !host_norms;
     // NNTR_HTP_PROFILE=3 runs the call several times on the same input and
@@ -6152,48 +6163,61 @@ private:
     for (int rep = 0; rep < reps && err == AEE_SUCCESS; ++rep) {
       uint32_t rep_stage[HTP_MOE_N_STAGES] = {0};
       const uint64_t t0 = profile.level() ? HtpProfile::nowUs() : 0;
-      err = via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
-                                row_count, row_weight, act_bytes, out_bytes,
-                                glu, timed ? rep_stage : nullptr)
-            : epilogue && !host_norms
-              ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
-                  session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
-                  static_cast<int>(K), post_gamma,
-                  post_gamma ? static_cast<int>(N_out) : 0, add_gamma,
-                  add_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
-                  static_cast<int>(h_gu.size()), h_dn.data(),
-                  static_cast<int>(h_dn.size()), row_index.data(),
-                  static_cast<int>(row_index.size()), row_count.data(),
-                  static_cast<int>(row_count.size()), row_weight.data(),
-                  static_cast<int>(row_weight.size()), act_f32, act_len, x2_f32,
-                  x2_f32 ? out_len : 0, out_f32, out_len)
-            : norm_entry
-              ? nntr_hvx_mm_u8i4_moe_layer_norm(
-                  session, M, K, inter, N_out, glu, eps, pre_gamma,
-                  pre_gamma ? static_cast<int>(K) : 0, post_gamma,
-                  post_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
-                  static_cast<int>(h_gu.size()), h_dn.data(),
-                  static_cast<int>(h_dn.size()), row_index.data(),
-                  static_cast<int>(row_index.size()), row_count.data(),
-                  static_cast<int>(row_count.size()), row_weight.data(),
-                  static_cast<int>(row_weight.size()), act_f32, act_len,
-                  out_f32, out_len)
-            : timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
-                        session, M, K, inter, N_out, glu, h_gu.data(),
-                        static_cast<int>(h_gu.size()), h_dn.data(),
-                        static_cast<int>(h_dn.size()), row_index.data(),
-                        static_cast<int>(row_index.size()), row_count.data(),
-                        static_cast<int>(row_count.size()), row_weight.data(),
-                        static_cast<int>(row_weight.size()), act_f32, act_len,
-                        out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
-                    : nntr_hvx_mm_u8i4_moe_layer(
-                        session, M, K, inter, N_out, glu, h_gu.data(),
-                        static_cast<int>(h_gu.size()), h_dn.data(),
-                        static_cast<int>(h_dn.size()), row_index.data(),
-                        static_cast<int>(row_index.size()), row_count.data(),
-                        static_cast<int>(row_count.size()), row_weight.data(),
-                        static_cast<int>(row_weight.size()), act_f32, act_len,
-                        out_f32, out_len);
+      err =
+        via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
+                            row_count, row_weight, act_bytes, out_bytes, glu,
+                            timed ? rep_stage : nullptr)
+        : ple
+          ? nntr_hvx_mm_u8i4_dense_ffn_ple(
+              session, M, K, inter, glu, eps, pre_gamma, static_cast<int>(K),
+              add_gamma, add_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+              static_cast<int>(h_gu.size()), h_dn.data(),
+              static_cast<int>(h_dn.size()), row_index.data(),
+              static_cast<int>(row_index.size()), row_count.data(),
+              static_cast<int>(row_count.size()), row_weight.data(),
+              static_cast<int>(row_weight.size()), act_f32, act_len,
+              ple_gate->handles[0], ple_proj->handles.data(),
+              static_cast<int>(ple_proj->handles.size()), ple->gamma,
+              static_cast<int>(N_out), ple->scale, ple_f32, ple_len, out_f32,
+              out_len)
+        : epilogue && !host_norms
+          ? nntr_hvx_mm_u8i4_moe_layer_norm_add(
+              session, M, K, inter, N_out, glu, eps, add_scale, pre_gamma,
+              static_cast<int>(K), post_gamma,
+              post_gamma ? static_cast<int>(N_out) : 0, add_gamma,
+              add_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+              static_cast<int>(h_gu.size()), h_dn.data(),
+              static_cast<int>(h_dn.size()), row_index.data(),
+              static_cast<int>(row_index.size()), row_count.data(),
+              static_cast<int>(row_count.size()), row_weight.data(),
+              static_cast<int>(row_weight.size()), act_f32, act_len, x2_f32,
+              x2_f32 ? out_len : 0, out_f32, out_len)
+        : norm_entry ? nntr_hvx_mm_u8i4_moe_layer_norm(
+                         session, M, K, inter, N_out, glu, eps, pre_gamma,
+                         pre_gamma ? static_cast<int>(K) : 0, post_gamma,
+                         post_gamma ? static_cast<int>(N_out) : 0, h_gu.data(),
+                         static_cast<int>(h_gu.size()), h_dn.data(),
+                         static_cast<int>(h_dn.size()), row_index.data(),
+                         static_cast<int>(row_index.size()), row_count.data(),
+                         static_cast<int>(row_count.size()), row_weight.data(),
+                         static_cast<int>(row_weight.size()), act_f32, act_len,
+                         out_f32, out_len)
+        : timed ? nntr_hvx_mm_u8i4_moe_layer_timed(
+                    session, M, K, inter, N_out, glu, h_gu.data(),
+                    static_cast<int>(h_gu.size()), h_dn.data(),
+                    static_cast<int>(h_dn.size()), row_index.data(),
+                    static_cast<int>(row_index.size()), row_count.data(),
+                    static_cast<int>(row_count.size()), row_weight.data(),
+                    static_cast<int>(row_weight.size()), act_f32, act_len,
+                    out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
+                : nntr_hvx_mm_u8i4_moe_layer(
+                    session, M, K, inter, N_out,
+                    glu, h_gu.data(), static_cast<int>(h_gu.size()),
+                    h_dn.data(), static_cast<int>(h_dn.size()),
+                    row_index.data(), static_cast<int>(row_index.size()),
+                    row_count.data(), static_cast<int>(row_count.size()),
+                    row_weight.data(), static_cast<int>(row_weight.size()),
+                    act_f32, act_len, out_f32, out_len);
       const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
       // Fastest wins, stages and all, so the breakdown describes one real call
       // rather than a mix of a fast one and a slow one.
@@ -7051,7 +7075,7 @@ private:
                                 const float *post_gamma, float eps,
                                 const float *up_scale, const float *gate_scale,
                                 const float *down_scale, bool out_to_host,
-                                bool out_add) override {
+                                bool out_add, const DenseFfnPle *ple) override {
     const remote_handle64 session =
       static_cast<remote_handle64>(HtpBackend::global().handle());
     // The chunks run on the MoE kernel, whose M=1 GEMV is a session option:
@@ -7059,6 +7083,18 @@ private:
     sendMoeOptsOnce(session);
     const DenseHandles &dh = get_or_register_dense(
       up, gate, down, session, K, I, N, up_scale, gate_scale, down_scale);
+    if (ple != nullptr && (!out_add || K != N))
+      throw std::invalid_argument(
+        "gemm_q4_0_dense_ffn_fp32: the per-layer-input tail needs out_add");
+    const FcHandles *ple_gate =
+      ple ? &get_or_register_fc(ple->gate, session, N, ple->P, ple->gate_scale)
+          : nullptr;
+    const FcHandles *ple_proj =
+      ple ? &get_or_register_fc(ple->proj, session, ple->P, N, ple->proj_scale)
+          : nullptr;
+    if (ple_gate && ple_gate->handles.size() != 1)
+      throw std::invalid_argument(
+        "gemm_q4_0_dense_ffn_fp32: the per-layer-input gate is one handle");
     // Every chunk is an "expert" that takes every row with weight 1: the
     // kernel zero-fills out and scatter-adds each chunk's down result into
     // it, which is exactly the sum over the intermediate dimension. With
@@ -7073,7 +7109,8 @@ private:
     invokeMoeLayer(session, dh.h_gu, dh.h_dn, row_index, row_count, row_weight,
                    act, out, M, K, dh.w, N, /*kind=*/1, gelu ? 1u : 0u,
                    pre_gamma, out_add ? nullptr : post_gamma, eps, nullptr,
-                   out_add ? post_gamma : nullptr, 1.0f, out_to_host);
+                   out_add ? post_gamma : nullptr, 1.0f, out_to_host, ple,
+                   ple_gate, ple_proj);
   }
 
   bool register_q4_0_dense_ffn(void *up, void *gate, void *down, unsigned int K,

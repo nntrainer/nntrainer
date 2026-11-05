@@ -55,4 +55,15 @@ int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
                      float *dst, uint32_t dst_ld, uint32_t rows, uint32_t n,
                      int geglu, hvx_worker_pool *pool);
 
+/**
+ * @brief hvx_glu_rows_f32 with the gate and up rows in two matrices, @a g
+ *        and @a u, at their own strides (Gemma-4's per-layer input: the
+ *        gate FC's output times the layer's LUT rows). dst may be g.
+ * @return 0, or -1 for a bad shape
+ */
+int hvx_glu_rows_sep_f32(const float *g, uint32_t g_ld, const float *u,
+                         uint32_t u_ld, float *dst, uint32_t dst_ld,
+                         uint32_t rows, uint32_t n, int geglu,
+                         hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_SWIGLU_F32_H__ */

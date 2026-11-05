@@ -748,13 +748,25 @@ public:
   // "expert" whose down output is summed into out.
   // register_q4_0_dense_ffn is the load-time twin, like the two above.
   virtual bool supports_gemm_q4_0_dense_ffn_fp32() const { return false; }
+  /** Gemma-4's per-layer-input tail on an out_add call's result y:
+   *  out = scale * (y + rmsnorm((gelu_tanh(y . gate) * rows) . proj) *
+   *  gamma). gate [N x P] and proj [P x N] in the FFN's weight format
+   *  (their scales null for Q4_0), rows M x P f32, gamma N floats. */
+  struct DenseFfnPle {
+    void *gate, *proj;
+    const float *gate_scale, *proj_scale;
+    const float *rows, *gamma;
+    unsigned int P;
+    float scale;
+  };
   // pre_gamma (K floats) / post_gamma (N floats), nullptr for none, and
   // eps: the RMSNorms before and after the block, folded into the call as
   // gemm_q4_0_batch_norm_fp32 folds them. up_scale / gate_scale /
   // down_scale: non-null when the three weights are QS4CX (their
   // per-channel scales), null for Q4_0. out_add: out = act + the post-normed
   // block, the decoder block's residual (pre_gamma and post_gamma set,
-  // K == N).
+  // K == N). ple: that result also takes the per-layer-input tail (needs
+  // out_add).
   virtual void gemm_q4_0_dense_ffn_fp32(
     void *up, void *gate, void *down, const float *act, float *out,
     unsigned int M, unsigned int K, unsigned int I, unsigned int N,
@@ -762,8 +774,8 @@ public:
     const float *post_gamma = nullptr, float eps = 0.0f,
     const float *up_scale = nullptr, const float *gate_scale = nullptr,
     const float *down_scale = nullptr, bool out_to_host = true,
-    bool out_add = false) {
-    (void)gelu, (void)out_to_host, (void)out_add;
+    bool out_add = false, const DenseFfnPle *ple = nullptr) {
+    (void)gelu, (void)out_to_host, (void)out_add, (void)ple;
     (void)pre_gamma;
     (void)post_gamma;
     (void)eps;

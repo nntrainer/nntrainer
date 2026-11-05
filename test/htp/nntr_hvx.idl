@@ -1383,4 +1383,29 @@ interface nntr_hvx : remote_handle64 {
    // u8 with each row's own. scale <= 0 clears it.
    AEEResult weight_set_act16(in uint32 w_handle, in float scale,
                               in float zp);
+
+   // mm_u8i4_moe_layer_norm_add on a dense FFN (no x2, scale2 1), then
+   // Gemma-4's per-layer-input tail on its output y:
+   //   out = ple_scale * (y + rmsnorm((gelu_tanh(y . G) * ple) . P)
+   //                          * ple_gamma)
+   // G the one handle h_ple_gate (K x n_ple), P the handles h_ple_proj
+   // (n_ple x K), ple the layer's M x n_ple input rows. One call instead of
+   // the FFN call, the gate and proj FC calls and the five CPU ops around
+   // them.
+   AEEResult mm_u8i4_dense_ffn_ple(in uint32 M, in uint32 K, in uint32 inter,
+                                   in uint32 act, in float eps,
+                                   in sequence<float> pre_gamma,
+                                   in sequence<float> gamma2,
+                                   in sequence<uint32> h_gate_up,
+                                   in sequence<uint32> h_down,
+                                   in sequence<uint32> row_index,
+                                   in sequence<uint32> row_count,
+                                   in sequence<float> row_weight,
+                                   in sequence<float> act_f32,
+                                   in uint32 h_ple_gate,
+                                   in sequence<uint32> h_ple_proj,
+                                   in sequence<float> ple_gamma,
+                                   in float ple_scale,
+                                   in sequence<float> ple,
+                                   rout sequence<float> out_f32);
 };

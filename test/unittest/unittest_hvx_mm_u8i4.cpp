@@ -1150,6 +1150,78 @@ TEST_F(HmxMmU8I4Layer, A16DenseMatchesHostComposition) {
   }
 }
 
+/**
+ * @brief mm_u8i4_dense_ffn_ple against the calls it replaces: the dense
+ *        FFN's moe_layer_norm_add, the gate's mm_u8i4_layer, GeGLU with the
+ *        per-layer rows on the host, and mm_u8i4_layer_res_add on the
+ *        projection, at 64, 5 and 1 rows.
+ */
+TEST_F(HmxMmU8I4Layer, DenseFfnPleMatchesComposition) {
+  const uint32_t K = 512, W = 256, P = 64;
+  const float eps = 1e-6f, scale = 0.75f;
+  Weight gu, dn, pg, pp;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * W, 0xD1E00001u, gu));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(W, K, 0xD1E00002u, dn));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, P, 0xD1E00003u, pg));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(P, K, 0xD1E00004u, pp));
+  // a16 as production registers them (the dense entry is the a16 one); one
+  // wide encoding: both sides clamp alike
+  for (const Weight *w : {&gu, &dn, &pg, &pp})
+    ASSERT_EQ(
+      nntr_hvx_weight_set_act16(handle_, w->handle, 64.0f / 65535.0f, 32768.0f),
+      AEE_SUCCESS);
+  std::vector<float> pre_gamma(K), gamma2(K), ple_gamma(K);
+  fill_deterministic(pre_gamma, 0x5EEDD1E1u);
+  fill_deterministic(gamma2, 0x5EEDD1E2u);
+  fill_deterministic(ple_gamma, 0x5EEDD1E3u);
+  for (uint32_t M : {64u, 5u, 1u}) {
+    SCOPED_TRACE("M=" + std::to_string(M));
+    std::vector<float> x(size_t(M) * K), ple(size_t(M) * P);
+    fill_deterministic(x, 0x5EEDD1E4u);
+    fill_deterministic(ple, 0x5EEDD1E5u);
+    std::vector<uint32_t> row_index(M), row_count(1, M);
+    std::vector<float> row_weight(M, 1.0f);
+    for (uint32_t r = 0; r < M; ++r)
+      row_index[r] = r;
+    const int xn = static_cast<int>(x.size());
+    std::vector<float> base(x.size()), g(ple.size()), want(x.size());
+    ASSERT_EQ(nntr_hvx_mm_u8i4_moe_layer_norm_add(
+                handle_, M, K, W, K, 1u /* gelu tanh */, eps, 1.0f,
+                pre_gamma.data(), K, nullptr, 0, gamma2.data(), K, &gu.handle,
+                1, &dn.handle, 1, row_index.data(), M, row_count.data(), 1,
+                row_weight.data(), M, x.data(), xn, nullptr, 0, base.data(),
+                xn),
+              AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer(handle_, M, K, &pg.handle, 1, base.data(),
+                                     xn, g.data(), static_cast<int>(g.size())),
+              AEE_SUCCESS);
+    for (size_t i = 0; i < g.size(); ++i) {
+      const float a = g[i];
+      g[i] = 0.5f * a *
+             (1.0f + std::tanh(0.7978845608f * (a + 0.044715f * a * a * a))) *
+             ple[i];
+    }
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer_res_add(
+                handle_, M, P, eps, scale, ple_gamma.data(), K, &pp.handle, 1,
+                g.data(), static_cast<int>(g.size()), base.data(), xn,
+                want.data(), xn),
+              AEE_SUCCESS);
+    std::vector<float> got(x.size(), -1.0f);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_dense_ffn_ple(
+                handle_, M, K, W, 1u, eps, pre_gamma.data(), K, gamma2.data(),
+                K, &gu.handle, 1, &dn.handle, 1, row_index.data(), M,
+                row_count.data(), 1, row_weight.data(), M, x.data(), xn,
+                pg.handle, &pp.handle, 1, ple_gamma.data(), K, scale,
+                ple.data(), static_cast<int>(ple.size()), got.data(), xn),
+              AEE_SUCCESS);
+    // the host GeGLU is libm's tanh, not the kernel's: a middle value a few
+    // ulp off can round to the next code
+    EXPECT_EQ(a16_mismatches(got.data(), want.data(), want.size(), 1e-3f), 0u);
+  }
+  for (const Weight *w : {&gu, &dn, &pg, &pp})
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w->handle), AEE_SUCCESS);
+}
+
 TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   const uint32_t M = 64, K = 1024, N = 1024;
   const int kReps = 20;

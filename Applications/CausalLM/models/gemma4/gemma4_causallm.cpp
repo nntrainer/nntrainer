@@ -494,9 +494,36 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // residual_add's in the file.
   const bool ffn_adds =
     !ENABLE_MOE_BLOCK && !fold_scalar && !is_kv_shared_layer;
+  // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
+  // [B, S, num_layers*hidden_size_per_layer_input]
+  auto per_layer_input_slice = [&]() {
+    std::vector<std::string> per_layer_slice_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_per_layer_input"),
+      withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
+      withKey("layer_index", std::to_string(layer_id))};
+    appendSkipPrefillIfNeeded(per_layer_slice_props, skip_out);
+    LayerHandle per_layer_slice(
+      createLayer("per_layer_slice", per_layer_slice_props));
+    return per_layer_slice(per_layer_input);
+  };
+  // ... and then the per-layer-input tail too (ple_tail): the slice is the
+  // call's second input, the tail's weights its last, in the file's order.
+  // So the FFN call is the layer's last, instead of it, two FC calls and
+  // five CPU ops.
+  // ponytail: not layer 0 -- its file holds the per-layer input's embedding,
+  // projection and norm between ple_gate and ple_proj; a converter that
+  // writes them first would let it fuse too.
+  const bool ple_fused = ffn_adds && layer_id > 0;
+  Tensor ple_slice;
+  if (ple_fused)
+    ple_slice = per_layer_input_slice();
   dense_out_add_ = ffn_adds;
+  dense_ple_in_ = ple_fused ? &ple_slice : nullptr;
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
   dense_out_add_ = false;
+  dense_ple_in_ = nullptr;
+  if (ple_fused)
+    return ffn_out;
 
   // With the MoE block and the scalar folded, the MoE layer takes the whole
   // epilogue (out_add): its input is the residual, so the DSP call that
@@ -537,16 +564,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   appendSkipPrefillIfNeeded(layer_scalar_props, skip_out);
   LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
 
-  // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
-  // [B, S, num_layers*hidden_size_per_layer_input]
-  std::vector<std::string> per_layer_slice_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_per_layer_input"),
-    withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
-    withKey("layer_index", std::to_string(layer_id))};
-  appendSkipPrefillIfNeeded(per_layer_slice_props, skip_out);
-  LayerHandle per_layer_slice(
-    createLayer("per_layer_slice", per_layer_slice_props));
-  Tensor per_layer_input_slice = per_layer_slice(per_layer_input);
+  Tensor per_layer_input_slice_out = per_layer_input_slice();
 
   std::vector<std::string> per_layer_input_gate_props = {
     withKey("name",
@@ -575,7 +593,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle per_layer_input_mul(
     createLayer("multiply", per_layer_input_mul_props));
   Tensor per_layer_input_multiplied =
-    per_layer_input_mul({per_layer_input_activated, per_layer_input_slice});
+    per_layer_input_mul({per_layer_input_activated, per_layer_input_slice_out});
 
   std::vector<std::string> per_layer_input_proj_props = {
     withKey("name",
@@ -906,12 +924,15 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
       withKey("out_norm",
               ENABLE_MOE_BLOCK || dense_out_add_ ? "true" : "false"),
       withKey("out_add", dense_out_add_ ? "true" : "false"),
+      withKey("ple_tail", dense_ple_in_ ? "true" : "false"),
       withKey("epsilon", std::to_string(NORM_EPS)),
       withKey("weight_dtype", FC_LAYER_DTYPE),
       withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
       withKey("engine", ffn_engine)};
     appendSkipPrefillIfNeeded(ffn_props, isPrefillKVOnlyLayer(layer_id));
     LayerHandle ffn(createLayer("dense_ffn", ffn_props));
+    if (dense_ple_in_)
+      return ffn({input, *dense_ple_in_});
     return ffn(input);
   }
 

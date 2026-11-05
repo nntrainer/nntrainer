@@ -131,6 +131,9 @@ typedef struct {
   uint16_t *attn_q16;   /**< attn_q2_step_fq's Q, converted to u16 by the
                              pool before the kernel (heap), freed in close() */
   uint32_t attn_q16_n;  /**< elements attn_q16 holds */
+  float *ple_mid;       /**< mm_u8i4_dense_ffn_ple's gate rows and GeGLU
+                             (M x n_ple, heap), freed in close() */
+  uint32_t ple_mid_n;   /**< floats ple_mid holds */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq

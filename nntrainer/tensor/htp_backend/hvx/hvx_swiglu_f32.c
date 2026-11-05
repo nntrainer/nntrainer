@@ -122,9 +122,9 @@ void hvx_glu_row_f32(const float *g, const float *u, float *d, uint32_t n,
 }
 
 typedef struct {
-  const float *src;
+  const float *g, *u;
   float *dst;
-  uint32_t src_ld, up_off, dst_ld, rows, n;
+  uint32_t g_ld, u_ld, dst_ld, rows, n;
   int geglu;
 } hvx_glu_ctx;
 
@@ -133,20 +133,30 @@ static void hvx_glu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   const uint32_t lo = (uint32_t)((uint64_t)c->rows * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->rows * (i + 1) / n_threads);
   for (uint32_t r = lo; r < hi; ++r) {
-    const float *g = c->src + (size_t)r * c->src_ld;
-    hvx_glu_row_f32(g, g + c->up_off, c->dst + (size_t)r * c->dst_ld, c->n,
-                    c->geglu);
+    hvx_glu_row_f32(c->g + (size_t)r * c->g_ld, c->u + (size_t)r * c->u_ld,
+                    c->dst + (size_t)r * c->dst_ld, c->n, c->geglu);
   }
 }
 
 int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
                      float *dst, uint32_t dst_ld, uint32_t rows, uint32_t n,
                      int geglu, hvx_worker_pool *pool) {
-  if (!src || !dst || rows == 0 || n == 0 || n % LANES != 0 || up_off < n ||
-      src_ld < up_off + n || dst_ld < n) {
+  if (!src || up_off < n || src_ld < up_off + n) {
     return -1;
   }
-  hvx_glu_ctx c = {src, dst, src_ld, up_off, dst_ld, rows, n, geglu};
+  return hvx_glu_rows_sep_f32(src, src_ld, src + up_off, src_ld, dst, dst_ld,
+                              rows, n, geglu, pool);
+}
+
+int hvx_glu_rows_sep_f32(const float *g, uint32_t g_ld, const float *u,
+                         uint32_t u_ld, float *dst, uint32_t dst_ld,
+                         uint32_t rows, uint32_t n, int geglu,
+                         hvx_worker_pool *pool) {
+  if (!g || !u || !dst || rows == 0 || n == 0 || n % LANES != 0 || g_ld < n ||
+      u_ld < n || dst_ld < n) {
+    return -1;
+  }
+  hvx_glu_ctx c = {g, u, dst, g_ld, u_ld, dst_ld, rows, n, geglu};
   hvx_worker_pool_run(pool, hvx_glu_worker, &c, rows);
   return 0;
 }

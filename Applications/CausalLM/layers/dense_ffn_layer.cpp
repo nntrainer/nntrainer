@@ -25,22 +25,35 @@
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
-enum DenseFfnParams { UP, GATE, DOWN, IN_GAMMA, OUT_GAMMA };
-enum DenseFfnTensors { UP_OUT, GATE_OUT, ACT, NORMED };
+enum DenseFfnParams {
+  UP,
+  GATE,
+  DOWN,
+  IN_GAMMA,
+  OUT_GAMMA,
+  PLE_GATE,
+  PLE_PROJ,
+  PLE_GAMMA,
+  PLE_SCALAR
+};
+enum DenseFfnTensors { UP_OUT, GATE_OUT, ACT, NORMED, PLE_MID, PLE_OUT };
+static constexpr size_t PLE_IN_IDX = 1;
 
 DenseFfnLayer::DenseFfnLayer() :
   LayerImpl(),
   dense_props(nntrainer::props::Unit(), props::GluActivation(),
               props::GateFirst(), props::InNorm(), props::OutNorm(),
-              nntrainer::props::Epsilon(), props::OutToHost(),
-              props::OutAdd()) {
+              nntrainer::props::Epsilon(), props::OutToHost(), props::OutAdd(),
+              props::PleTail()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "dense_ffn takes exactly one input";
+  ple_tail = std::get<props::PleTail>(dense_props).get();
+  NNTR_THROW_IF(context.getNumInputs() != (ple_tail ? 2u : 1u),
+                std::invalid_argument)
+    << "dense_ffn takes one input, and the per-layer input with ple_tail";
   NNTR_THROW_IF(context.getFormat() != nntrainer::Tformat::NCHW,
                 std::invalid_argument)
     << "dense_ffn supports NCHW only";
@@ -68,12 +81,16 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   out_add = std::get<props::OutAdd>(dense_props).get();
   NNTR_THROW_IF(out_add && !(in_norm && out_norm), std::invalid_argument)
     << "dense_ffn: out_add takes the raw rows and adds them after out_norm";
+  NNTR_THROW_IF(ple_tail && !out_add, std::invalid_argument)
+    << "dense_ffn: ple_tail works on the out_add result";
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
       std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
 
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
+  for (unsigned int i = 0; i < context.getNumInputs(); ++i) {
+    context.setEffDimFlagInputDimension(i, 0b1001);
+    context.setDynDimFlagInputDimension(i, 0b1000);
+  }
 
   const auto &in_dim = context.getInputDimensions()[0];
   const unsigned int hidden = in_dim.width();
@@ -126,6 +143,23 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
     weight_decay, "down", true);
   if (out_norm)
     weight_idx[OUT_GAMMA] = request_gamma("out_norm_gamma");
+  const unsigned int ple_dim =
+    ple_tail ? context.getInputDimensions()[PLE_IN_IDX].width() : 0;
+  if (ple_tail) {
+    weight_idx[PLE_GATE] = context.requestWeight(
+      nntrainer::TensorDim(1, 1, hidden, ple_dim, w_up.getTensorType(), 0b0011),
+      weight_initializer, weight_regularizer, weight_regularizer_constant,
+      weight_decay, "ple_gate", true);
+    weight_idx[PLE_PROJ] = context.requestWeight(
+      nntrainer::TensorDim(1, 1, ple_dim, hidden, w_up.getTensorType(), 0b0011),
+      weight_initializer, weight_regularizer, weight_regularizer_constant,
+      weight_decay, "ple_proj", true);
+    weight_idx[PLE_GAMMA] = request_gamma("ple_norm_gamma");
+    weight_idx[PLE_SCALAR] = context.requestWeight(
+      nntrainer::TensorDim(1, 1, 1, 1, gamma_dim.getTensorType()),
+      nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "layer_scalar", true);
+  }
 
   // The CPU path's intermediates, sized for the graph's input length and
   // sliced per step below; the fused call never touches them.
@@ -145,6 +179,16 @@ void DenseFfnLayer::finalize(nntrainer::InitLayerContext &context) {
   if (in_norm || out_norm) {
     tensor_idx[NORMED] = context.requestTensor(
       out_dim, "normed", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  }
+  if (ple_tail) {
+    nntrainer::TensorDim ple_mid = mid;
+    ple_mid.width(ple_dim);
+    tensor_idx[PLE_MID] = context.requestTensor(
+      ple_mid, "ple_mid", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+    tensor_idx[PLE_OUT] = context.requestTensor(
+      out_dim, "ple_out", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
   }
 }
@@ -203,6 +247,13 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const float *out_gamma =
     out_norm ? context.getWeight(weight_idx[OUT_GAMMA]).getData<float>()
              : nullptr;
+  nntrainer::Tensor ple_in;
+  if (ple_tail) {
+    nntrainer::TensorDim ple_dim = context.getInput(PLE_IN_IDX).getDim();
+    ple_dim.batch(1);
+    ple_dim.height(rows);
+    ple_in = context.getInput(PLE_IN_IDX).getSharedDataTensor(ple_dim, 0, true);
+  }
 
   // The whole block as one accelerator call at prefill. Decode's single
   // row stays on the CPU below for the reason every FC gate has
@@ -213,12 +264,31 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   auto *ops = in_step.getOps();
   // Q4_0 or QS4CX weights, all three alike; decode's one row too when the
   // backend keeps QS4CX in its own format (accelerates_qs4cx_at_m1).
+  const bool ple_typed =
+    !ple_tail ||
+    (context.getWeight(weight_idx[PLE_GATE]).getDataType() == wtype &&
+     context.getWeight(weight_idx[PLE_PROJ]).getDataType() == wtype);
   if (ops != nullptr && ops->supports_gemm_q4_0_dense_ffn_fp32() &&
       (rows > 1 || (wtype == qs4cx && ops->accelerates_qs4cx_at_m1())) &&
       (wtype == q4 || wtype == qs4cx) && gate_w.getDataType() == wtype &&
-      down_w.getDataType() == wtype) {
-    // ... with the input and output norms folded into the same call.
+      down_w.getDataType() == wtype && ple_typed) {
+    // ... with the input and output norms folded into the same call, and
+    // the per-layer-input tail.
     const bool scaled = wtype == qs4cx;
+    nntrainer::ComputeOps::DenseFfnPle ple{};
+    if (ple_tail) {
+      nntrainer::Tensor &pg = context.getWeight(weight_idx[PLE_GATE]);
+      nntrainer::Tensor &pp = context.getWeight(weight_idx[PLE_PROJ]);
+      ple = {
+        pg.getData<char>(),
+        pp.getData<char>(),
+        scaled ? pg.getScale<float>() : nullptr,
+        scaled ? pp.getScale<float>() : nullptr,
+        ple_in.getData<float>(),
+        context.getWeight(weight_idx[PLE_GAMMA]).getData<float>(),
+        static_cast<unsigned int>(ple_in.width()),
+        context.getWeight(weight_idx[PLE_SCALAR]).getValue<float>(0, 0, 0, 0)};
+    }
     ops->gemm_q4_0_dense_ffn_fp32(
       up_w.getData<char>(), gate_w.getData<char>(), down_w.getData<char>(),
       in_step.getData<float>(), out_step.getData<float>(), rows, K, inter, N,
@@ -226,7 +296,7 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       scaled ? up_w.getScale<float>() : nullptr,
       scaled ? gate_w.getScale<float>() : nullptr,
       scaled ? down_w.getScale<float>() : nullptr, out_to_host || rows == 1,
-      out_add);
+      out_add, ple_tail ? &ple : nullptr);
     return;
   }
 
@@ -289,6 +359,28 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     out_step.copyData(norm_rows(out_step, weight_idx[OUT_GAMMA]));
   if (out_add)
     out_step.add_i(raw_in);
+  if (!ple_tail)
+    return;
+
+  // The per-layer-input tail, as its seven layers computed it: the gate
+  // FC, gelu_tanh(gate) * the input rows (the GeGLU above's form), the
+  // projection, its norm, the add and the layer scalar.
+  const unsigned int P = ple_in.width();
+  nntrainer::TensorDim ple_mid_dim = mid_step_dim;
+  ple_mid_dim.width(P);
+  nntrainer::Tensor ple_mid = context.getTensor(tensor_idx[PLE_MID])
+                                .getSharedDataTensor(ple_mid_dim, 0, true);
+  nntrainer::Tensor ple_out = context.getTensor(tensor_idx[PLE_OUT])
+                                .getSharedDataTensor(out_step_dim, 0, true);
+  out_step.dot(context.getWeight(weight_idx[PLE_GATE]), ple_mid, false, false);
+  float *mid_p = ple_mid.getData<float>();
+  const float *rows_p = ple_in.getData<float>();
+  for (size_t j = 0, n = static_cast<size_t>(rows) * P; j < n; ++j)
+    mid_p[j] = geglu_det_one(mid_p[j], rows_p[j]);
+  ple_mid.dot(context.getWeight(weight_idx[PLE_PROJ]), ple_out, false, false);
+  out_step.add_i(norm_rows(ple_out, weight_idx[PLE_GAMMA]));
+  out_step.multiply_i(
+    context.getWeight(weight_idx[PLE_SCALAR]).getValue<float>(0, 0, 0, 0));
 }
 
 void DenseFfnLayer::updateTensorsByInputDimensions(
@@ -301,6 +393,11 @@ void DenseFfnLayer::updateTensorsByInputDimensions(
   output_dim.height(input_dimensions[0].height());
   context.updateInput(SINGLE_INOUT_IDX, input_dim);
   context.updateOutput(SINGLE_INOUT_IDX, output_dim);
+  if (ple_tail) {
+    ml::train::TensorDim ple_dim = context.getInput(PLE_IN_IDX).getDim();
+    ple_dim.height(input_dimensions[0].height());
+    context.updateInput(PLE_IN_IDX, ple_dim);
+  }
   if (in_norm || out_norm)
     context.updateTensor(tensor_idx[NORMED], output_dim);
 }

@@ -757,15 +757,24 @@ void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m_valid,
 int hvx_glu_rows_f32(const float *src, uint32_t src_ld, uint32_t up_off,
                      float *dst, uint32_t dst_ld, uint32_t rows, uint32_t n,
                      int geglu, hvx_worker_pool *pool) {
+  if (!src || up_off < n || src_ld < up_off + n)
+    return -1;
+  return hvx_glu_rows_sep_f32(src, src_ld, src + up_off, src_ld, dst, dst_ld,
+                              rows, n, geglu, pool);
+}
+int hvx_glu_rows_sep_f32(const float *g, uint32_t g_ld, const float *u,
+                         uint32_t u_ld, float *dst, uint32_t dst_ld,
+                         uint32_t rows, uint32_t n, int geglu,
+                         hvx_worker_pool *pool) {
   (void)pool;
-  if (!src || !dst || rows == 0 || n == 0 || n % 32u != 0 || up_off < n ||
-      src_ld < up_off + n || dst_ld < n)
+  if (!g || !u || !dst || rows == 0 || n == 0 || n % 32u != 0 || g_ld < n ||
+      u_ld < n || dst_ld < n)
     return -1;
   for (uint32_t r = 0; r < rows; ++r) {
-    const float *g = src + (size_t)r * src_ld;
+    const float *gr = g + (size_t)r * g_ld, *ur = u + (size_t)r * u_ld;
     for (uint32_t j = 0; j < n; ++j)
-      dst[(size_t)r * dst_ld + j] = geglu ? geglu_det_one(g[j], g[up_off + j])
-                                          : swiglu_det_one(g[j], g[up_off + j]);
+      dst[(size_t)r * dst_ld + j] =
+        geglu ? geglu_det_one(gr[j], ur[j]) : swiglu_det_one(gr[j], ur[j]);
   }
   return 0;
 }

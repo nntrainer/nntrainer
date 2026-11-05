@@ -518,20 +518,32 @@ void Transformer::repack_weight() {
             return name.size() >= n &&
                    name.compare(name.size() - n, n, tail) == 0;
           };
+          auto &t = w->getVariableRef();
+          const auto dtype = t.getDataType();
+          // A CPU-engine dense_ffn reads QS4CX through the KleidiAI pack, so
+          // pack as the FC branch below does (a CPU layer has ComputeOps
+          // too, so the engine cannot be told from them here).
+          if (dtype == ml::train::TensorDim::DataType::QS4CX && !t.isVirtual())
+            t.pack();
           if (ends_with(":up"))
-            up_p = &w->getVariableRef();
+            up_p = &t;
           else if (ends_with(":gate"))
-            gate_p = &w->getVariableRef();
+            gate_p = &t;
           else if (ends_with(":down"))
-            down_p = &w->getVariableRef();
+            down_p = &t;
+          // the per-layer-input tail's two FCs (ple_tail) register as the
+          // FC weights they were
+          else if ((ends_with(":ple_gate") || ends_with(":ple_proj")) &&
+                   context.getComputeOps() &&
+                   (dtype == ml::train::TensorDim::DataType::Q4_0 ||
+                    dtype == ml::train::TensorDim::DataType::QS4CX))
+            fc_pending.push_back({context.getComputeOps(), t.getData<char>(),
+                                  dtype == ml::train::TensorDim::DataType::QS4CX
+                                    ? t.getScale<float>()
+                                    : nullptr,
+                                  static_cast<unsigned int>(t.height()),
+                                  static_cast<unsigned int>(t.width())});
         }
-        // A CPU-engine dense_ffn reads QS4CX through the KleidiAI pack, so
-        // pack as the FC branch below does (a CPU layer has ComputeOps too,
-        // so the engine cannot be told from them here).
-        for (auto *p : {up_p, gate_p, down_p})
-          if (p && p->getDataType() == ml::train::TensorDim::DataType::QS4CX &&
-              !p->isVirtual())
-            p->pack();
         if (up_p && gate_p && down_p && context.getComputeOps()) {
           auto &up = *up_p;
           auto &gate = *gate_p;

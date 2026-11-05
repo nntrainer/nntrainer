@@ -50,6 +50,19 @@ public:
   static constexpr const char *key = "gate_first";
 };
 
+/** ple_tail: Gemma-4's per-layer-input tail after out_add, on its result y:
+ *  out = scalar * (y + rmsnorm((gelu_tanh(y . ple_gate) * input 1) .
+ *  ple_proj) * gamma), input 1 the layer's per-layer input rows. The four
+ *  weights come last, in the file's order: ple_gate, ple_proj, gamma,
+ *  scalar -- the two fully_connected, the rms_norm and the scalar_multiply
+ *  layers they replace. */
+class PleTail : public nntrainer::Property<bool> {
+public:
+  PleTail(bool val = false) : nntrainer::Property<bool>(val) {}
+  using prop_tag = nntrainer::bool_prop_tag;
+  static constexpr const char *key = "ple_tail";
+};
+
 } // namespace props
 
 /**
@@ -95,17 +108,19 @@ private:
    *  swish (default) or tanh_gelu; gate_first for the file's weight order */
   std::tuple<nntrainer::props::Unit, props::GluActivation, props::GateFirst,
              props::InNorm, props::OutNorm, nntrainer::props::Epsilon,
-             props::OutToHost, props::OutAdd>
+             props::OutToHost, props::OutAdd, props::PleTail>
     dense_props;
   bool gelu = false; /**< tanh_gelu(gate) * up instead of silu(gate) * up */
   bool in_norm = false, out_norm = false;
   bool out_add = false;    /**< props::OutAdd: + the input after out_norm */
+  bool ple_tail = false;   /**< props::PleTail */
   bool out_to_host = true; /**< props::OutToHost */
   bool skip_prefill = false;
-  std::array<unsigned int, 5>
-    weight_idx; /**< up, gate, down, [in_gamma, out_gamma] */
-  std::array<unsigned int, 4>
-    tensor_idx; /**< up_out, gate_out, act, the normed input/output */
+  std::array<unsigned int, 9>
+    weight_idx; /**< up, gate, down, [in_gamma, out_gamma], [ple_gate,
+                     ple_proj, ple_gamma, ple_scalar] */
+  std::array<unsigned int, 6> tensor_idx; /**< up_out, gate_out, act, the normed
+                                             input/output, [ple_mid, ple_out] */
 };
 
 } // namespace causallm
