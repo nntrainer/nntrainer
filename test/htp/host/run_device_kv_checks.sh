@@ -14,6 +14,11 @@ ${CXX:-c++} -std=c++17 -O2 -Wall -Wextra -Werror $sanitizers \
   -I Applications/CausalLM test/htp/host/device_kv_manager_check.cpp \
   -o "$check_dir/manager"
 "$check_dir/manager"
+${CXX:-c++} -std=c++17 -O2 -Wall -Wextra -Werror $sanitizers \
+  -I nntrainer/utils -I nntrainer/tensor/htp_backend \
+  test/htp/host/decode_kv_convert_check.cpp nntrainer/utils/fp16.cpp \
+  -o "$check_dir/convert"
+"$check_dir/convert"
 for name in attn_snapshot_check attn_paged_check; do
   ${CC:-cc} -std=gnu11 -O2 -ffp-contract=off -pthread -include malloc.h \
     $sanitizers -I test/htp/host/hvx_emu -I test/htp/host/stub \

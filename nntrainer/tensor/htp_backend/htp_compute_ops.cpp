@@ -33,6 +33,7 @@
 #include <htp_arena_size.h>
 #include <htp_backend.h>
 #include <htp_context.h>
+#include <htp_decode_kv_convert.h>
 #include <htp_decode_runtime.h>
 #include <htp_dspq_wire.h>
 #include <htp_expert_pool.h>
@@ -2742,6 +2743,131 @@ public:
     std::istringstream stream(bytes, std::ios::in | std::ios::binary);
     stream.exceptions(std::ios::failbit | std::ios::badbit);
     return readDecodeCheckpoint(stream);
+  }
+
+  std::vector<DecodeKVHostLayer>
+  decode_kv_host_prefix(const std::string &bytes, unsigned position,
+                        bool checksum_verified) override {
+    std::lock_guard<std::mutex> lock(decode_.graph_mutex_);
+    // Validate the complete immutable image before exposing host rows. No DSP
+    // allocation/import is necessary: the next call uses the native HMX path.
+    if (bytes.size() < 128u || !decode_.graph_inited_)
+      throw std::runtime_error("Invalid decode prefill checkpoint");
+    KvCheckpointIO io;
+    const auto *cursor = reinterpret_cast<const uint8_t *>(bytes.data());
+    const auto *end = cursor + bytes.size() - sizeof(uint64_t);
+    auto read = [&](void *dst, size_t count) {
+      if (count > size_t(end - cursor))
+        throw std::runtime_error("Truncated decode prefill checkpoint");
+      std::memcpy(dst, cursor, count);
+      if (!checksum_verified)
+        io.update(cursor, count);
+      cursor += count;
+    };
+    uint32_t header[10], app[3], meta[17];
+    read(header, sizeof(header));
+    read(app, sizeof(app));
+    read(meta, sizeof(meta));
+    if (header[0] != 0x4e4b5631u || header[1] != 1u ||
+        (uint64_t(header[2]) | (uint64_t(header[3]) << 32)) !=
+          decode_.snapshot_cookie_ ||
+        header[9] != decode_.kv_len_.size() || !position ||
+        header[4] != position - 1u || position > decode_.graph_words_[6] ||
+        app[0] > position || app[1] != position - app[0] || !meta[0] ||
+        (meta[0] & ~3u))
+      throw std::runtime_error("Incompatible decode prefill checkpoint");
+    std::vector<uint32_t> lengths(header[9]);
+    read(lengths.data(), lengths.size() * sizeof(uint32_t));
+    std::vector<DecodeKVHostLayer> layers(lengths.size());
+    for (uint32_t c = 0; c < 2u; ++c) {
+      if (!(meta[0] & (1u << c)))
+        continue;
+      const auto *m = meta + 1u + 8u * c;
+      if (!m[0] || m[0] > layers.size() || !m[1] || !m[3] || m[6] >= position)
+        throw std::runtime_error("Invalid decode prefill cache shape");
+      for (uint32_t l = 0; l < m[0]; ++l) {
+        uint32_t count, live[2];
+        read(&count, sizeof(count));
+        const size_t width = size_t(m[1]) * m[3];
+        const unsigned rows = position - m[6];
+        const size_t padded = (uint64_t(rows) + 63u) / 64u * 64u;
+        const size_t plane = padded * width;
+        if (width > 65536u || rows > m[4] ||
+            count != 8u + width * 24u + plane * 2u ||
+            count > size_t(end - cursor))
+          throw std::runtime_error("Invalid decode prefill layer size");
+        read(live, sizeof(live));
+        if (live[0] != rows || live[1] != 1u)
+          throw std::runtime_error("Invalid decode prefill layer length");
+        std::vector<float> scales(width * 6u);
+        read(scales.data(), scales.size() * sizeof(float));
+        for (size_t i = 0; i < scales.size(); ++i)
+          if ((fp32_to_bits(scales[i]) & 0x7f800000u) == 0x7f800000u ||
+              (fp32_to_bits(scales[i]) >> 31u) ||
+              (i < width * 4u && !fp32_to_bits(scales[i])))
+            throw std::runtime_error("Invalid decode prefill scales");
+        size_t ordinal = layers.size();
+        unsigned keep = rows;
+        for (uint32_t op : decode_.kind_ops_[HTP_OP_ATTN_M1]) {
+          const auto ord = decode_.attn_ordinal_[op];
+          if (decode_.attn_cache_[ord] != c ||
+              decode_.attn_cache_ord_[ord] != l)
+            continue;
+          const auto *rec = decode_.graphOp(op);
+          if (rec->n_kv != m[1] || rec->head_dim != m[3] ||
+              lengths[ord] != rows || (!rec->top_k && m[6]))
+            throw std::runtime_error("Decode prefill graph shape mismatch");
+          ordinal = ord;
+          if (rec->top_k)
+            keep = std::min(rows, rec->top_k);
+        }
+        if (ordinal == layers.size())
+          throw std::runtime_error("Unknown decode prefill layer");
+        auto &dst = layers[ordinal];
+        const unsigned skip = (rows - keep) / 64u * 64u;
+        dst.base = m[6] + skip;
+        dst.width = static_cast<unsigned>(width);
+        dst.key.resize(size_t(rows - skip) * width);
+        dst.value.resize(size_t(rows - skip) * width);
+        dst.floor_k.assign(scales.begin() + width * 4u,
+                           scales.begin() + width * 5u);
+        dst.floor_v.assign(scales.begin() + width * 5u, scales.end());
+        const auto *key = reinterpret_cast<const int8_t *>(cursor);
+        const auto *value = key + plane;
+        if (!checksum_verified)
+          io.update(cursor, plane * 2u);
+        cursor += plane * 2u;
+        // Keep just the live sliding window after a long decode. Preserve
+        // dropped maxima for the next native decode seed.
+        for (unsigned h = 0; h < m[1]; ++h)
+          for (unsigned d = 0; skip && d < m[3]; ++d) {
+            unsigned max_k = 0, max_v = 0;
+            for (unsigned r = 0; r < skip; ++r) {
+              const size_t kt = size_t(h) * padded * m[3] +
+                                size_t(r / 64u) * m[3] * 64u + d * 64u +
+                                r % 64u;
+              const size_t vt = (size_t(h) * padded + r) * m[3] + d;
+              max_k = std::max(max_k, unsigned(std::abs(int(key[kt]))));
+              max_v = std::max(max_v, unsigned(std::abs(int(value[vt]))));
+            }
+            const size_t col = size_t(h) * m[3] + d;
+            dst.floor_k[col] = std::max(dst.floor_k[col], max_k * scales[col]);
+            dst.floor_v[col] =
+              std::max(dst.floor_v[col], max_v * scales[width * 2u + col]);
+          }
+        decodeKVToPrefill(key, value, scales.data(), scales.data() + width * 2u,
+                          rows, m[1], m[3], dst.key.data(), dst.value.data(),
+                          skip);
+      }
+    }
+    uint64_t expected;
+    std::memcpy(&expected, end, sizeof(expected));
+    if (cursor != end || (!checksum_verified && expected != io.hash))
+      throw std::runtime_error("Decode prefill checkpoint checksum mismatch");
+    for (const auto &layer : layers)
+      if (layer.key.empty())
+        throw std::runtime_error("Incomplete decode prefill checkpoint");
+    return layers;
   }
 
   std::vector<uint32_t> load_decode_kv(const std::string &path) override {

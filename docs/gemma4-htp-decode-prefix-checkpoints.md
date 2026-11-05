@@ -3,11 +3,16 @@
 Decode can cross a 4096-token boundary after its original prefill. With the
 option below, the radix manager captures the completed DSP INT8 state at each
 such absolute position, including per-layer scales, global and sliding KV,
-sliding bases and the processed token IDs. It exports an immutable checkpoint on
-the inference thread and submits it to the existing bounded Flash worker.
-The Flash worker writes and checksums in parallel with subsequent inference.
-An index hit loads the checkpoint, restores the DSP state and processes the
-unmatched input using the existing M1 decode path.
+sliding bases and processed token IDs. It exports an immutable checkpoint on
+the inference thread and submits it to the bounded Flash worker. The worker
+writes and checksums in parallel with subsequent inference.
+
+A radix hit reconstructs native FP16 host rows from the saved INT8 values and
+scales, restores the saved prefill calibration, and runs unmatched input through
+native batched HMX prefill. The following decode uses the existing FP16 seed
+handoff. See [batched restoration validation](gemma4-htp-decode-prefix-batch.md)
+for current measurements and output semantics. Direct DSP session snapshot
+save/load remains separate.
 
 ```json
 "kv_prefix_flash": {
@@ -27,15 +32,13 @@ to another available boundary or recomputation. Files are process-local.
 
 ## Semantics and limitations
 
-The checkpoint preserves the **original decode trajectory**. It does not claim
-bit-identical results to processing the same complete token sequence in HMX
-prefill: prefill and decode use different calculations and quantization state.
-The Android tests below observed different output IDs for complete prefill.
-Enable this option only when reproducing the saved decode trajectory is the
-desired semantics. Selection currently matches token IDs, not an explicit
-trajectory or session identifier; identical tokens from different execution
-histories may have different KV states. Existing prefill prefix behavior remains
-the default.
+A checkpoint stores the original INT8 history. Radix reuse now evaluates new
+queries with HMX prefill, so it does **not** promise bit-identical results to
+sequential M1 continuation or full recomputation. Reconstructed FP16 rows retain
+the saved INT8 precision; they cannot recover values discarded by quantization.
+Token-only matching also does not identify the original calculation history.
+Native FP16 prefill prefixes are kept separate: a reconstructed decode prefix
+is not republished as an original FP16 prefill boundary.
 
 Exporting DSP data and copying it into immutable host staging are synchronous.
 Only the subsequent checksum and Flash write are asynchronous. Thus a
@@ -43,7 +46,7 @@ boundary can cause a visible decode latency spike; the feature does not meet a
 zero-regression or fully hidden-capture requirement. Staging is bounded for
 queued bytes, but export and encoding also allocate temporary host buffers.
 
-## Android measurements
+## Historical Android measurements before batched restoration
 
 SM-S948N, SM8850 v81, Gemma4 26B A4B, original q8/Q2 HTP path. One run per
 boundary; a prompt ending one token before the boundary generated across it.

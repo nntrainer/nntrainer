@@ -381,17 +381,30 @@ std::string PrefixFlashStore::Entry::loadBlob() const {
       payload->layers.size() != 1 || payload->layers[0].pages.size() != 1)
     throw std::runtime_error("Accelerator checkpoint is unavailable");
   const auto &page = payload->layers[0].pages[0];
-  std::string framed(reinterpret_cast<const char *>(page->keyData()),
-                     page->keySize());
-  framed.append(reinterpret_cast<const char *>(page->valueData()),
-                page->valueSize());
+  const size_t total = page->keySize() + page->valueSize();
+  // The blob is split over the two planes. Copy directly into the result;
+  // concatenating and then substr() copied a large decode checkpoint twice.
+  auto copy = [&](size_t offset, void *destination, size_t count) {
+    auto *dst = static_cast<unsigned char *>(destination);
+    if (offset < page->keySize()) {
+      const size_t n = std::min(count, page->keySize() - offset);
+      std::memcpy(dst, page->keyData() + offset, n);
+      dst += n;
+      count -= n;
+      offset += n;
+    }
+    if (count)
+      std::memcpy(dst, page->valueData() + offset - page->keySize(), count);
+  };
   uint64_t len = 0;
-  if (framed.size() < sizeof(len))
+  if (total < sizeof(len))
     throw std::runtime_error("Invalid accelerator checkpoint framing");
-  std::memcpy(&len, framed.data(), sizeof(len));
-  if (len > framed.size() - sizeof(len))
+  copy(0, &len, sizeof(len));
+  if (len > total - sizeof(len))
     throw std::runtime_error("Invalid accelerator checkpoint size");
-  return framed.substr(sizeof(len), static_cast<size_t>(len));
+  std::string bytes(static_cast<size_t>(len), '\0');
+  copy(sizeof(len), bytes.data(), bytes.size());
+  return bytes;
 }
 void PrefixFlashStore::saveSnapshot(const std::string &path,
                                     const Snapshot &snapshot) {

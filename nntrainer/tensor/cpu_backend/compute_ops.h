@@ -858,6 +858,21 @@ public:
   virtual std::vector<uint32_t> import_decode_kv(const std::string &) {
     throw std::logic_error("Device KV checkpoint import is unsupported");
   }
+  /** Row-major FP16 history reconstructed from an immutable device checkpoint.
+   * Used to resume batched prefill after a radix hit on a decode boundary.
+   * checksum_verified permits skipping the embedded checksum only when an
+   * enclosing storage checksum has already verified every immutable byte. */
+  struct DecodeKVHostLayer {
+    unsigned base = 0, width = 0;
+    std::vector<uint16_t> key, value;
+    std::vector<float> floor_k, floor_v;
+  };
+  virtual std::vector<DecodeKVHostLayer>
+  decode_kv_host_prefix(const std::string &, unsigned,
+                        bool checksum_verified = false) {
+    (void)checksum_verified;
+    throw std::logic_error("Device KV prefill conversion is unsupported");
+  }
   virtual std::vector<uint32_t> load_decode_kv(const std::string &) {
     throw std::logic_error("Device KV checkpoints are unsupported");
   }

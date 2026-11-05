@@ -97,6 +97,11 @@ public:
    */
   static void releaseDeviceCaches();
 
+  struct DecodePrefixRestoreStats {
+    unsigned prefix_tokens = 0, suffix_tokens = 0, prefill_calls = 0;
+    double read_ms = 0, conversion_ms = 0, bind_ms = 0, prefill_ms = 0;
+  };
+
 protected:
   bool htp_execution_profile_ = false;
   struct DevicePrefillFrame {
@@ -119,6 +124,8 @@ protected:
   struct DeviceDecodePrefix {
     unsigned position;
     std::shared_ptr<PrefixFlashStore::Entry> flash;
+    std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
+      calibration;
   };
   std::map<uint32_t, DeviceDecodePrefix> device_decode_prefixes_;
   uint32_t next_decode_prefix_ = 0x80000000u;
@@ -128,8 +135,7 @@ protected:
   bool device_prefix_flash_capture_ = true;
   bool device_prefill_restored_ = false;
   bool device_decode_prefix_enabled_ = false;
-  bool device_decode_prefix_restored_ = false;
-  bool device_deferred_prompt_reset_ = false;
+  DecodePrefixRestoreStats decode_prefix_restore_stats_;
   std::unique_ptr<DeviceKVManager> device_kv_manager_;
   bool htp_session_enabled_ = false;
   bool htp_session_failed_ = false;
@@ -328,9 +334,12 @@ public:
   WIN_EXPORT void enableDeviceKVPrefixFlash(const std::string &directory,
                                             size_t flash_bytes,
                                             size_t staging_bytes);
-  /** Opt in to checkpoints of the original INT8 decode trajectory. A hit
-   * reproduces that trajectory; full prefill can produce different values. */
+  /** Checkpoint decode boundaries for radix reuse. A hit reconstructs host
+   * FP16 history and runs the suffix with native batched HMX prefill. */
   WIN_EXPORT void enableDeviceKVDecodePrefixFlash();
+  const DecodePrefixRestoreStats &decodePrefixRestoreStats() const {
+    return decode_prefix_restore_stats_;
+  }
   WIN_EXPORT PrefixFlashStore::Stats deviceKVPrefixFlashStats() const;
   WIN_EXPORT void drainDeviceKVPrefixFlash();
   /** Offline bake, with an empty active session and loaded original q8 model.

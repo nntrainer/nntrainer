@@ -2,7 +2,9 @@
 
 Starting point: `f1bbd0995`, branch `kv/decode-4k-prefix-flash`.
 
-Current status and measurements: [decode checkpoint report](gemma4-htp-decode-prefix-checkpoints.md).
+Current batched suffix restoration: [implementation and validation](gemma4-htp-decode-prefix-batch.md).
+
+Initial status and measurements: [decode checkpoint report](gemma4-htp-decode-prefix-checkpoints.md).
 4K and 8K device checkpoints and same-trajectory continuation pass on Android.
 Full-prefill output differs, and synchronous capture is measurable, so this is
 an opt-in implementation rather than an output- and latency-equivalent feature.
@@ -17,11 +19,11 @@ an opt-in implementation rather than an output- and latency-equivalent feature.
 3. Done: register each complete decode checkpoint in the existing token radix index.
    Give prefill and decode checkpoints distinct types, preserve the longest
    compatible match and manage their lifetime with the existing prefix LRU.
-4. Done for opt-in decode-trajectory semantics: restore the selected DSP
-   checkpoint with its metadata and feed the remaining
-   request tokens through a compatible continuation path. Ensure token identity,
+4. Done: reconstruct the selected INT8 checkpoint into native host FP16
+   history, restore calibration, and process the unmatched suffix with batched
+   HMX prefill. Direct session snapshot restoration retains the M1 path. Ensure token identity,
    session switches, forks, reset and snapshot cleanup remain correct.
-5. In progress: validate boundary cases around 4096 and 8192 positions, multiple branches,
+5. Validated in the initial implementation: validate boundary cases around 4096 and 8192 positions, multiple branches,
    sliding-window eviction, corrupt/evicted checkpoints and session switching.
    Compare exact output IDs and position to an uninterrupted decode reference,
    and report any differences against a full prefill recomputation separately.

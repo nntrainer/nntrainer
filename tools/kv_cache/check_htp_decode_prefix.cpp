@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /** Android end-to-end check for a decode checkpoint at the 4096 boundary. */
 #include <causal_lm.h>
+#include <cstdlib>
 #include <factory.h>
 #include <filesystem>
 #include <fstream>
@@ -32,7 +33,10 @@ int main(int argc, char **argv) {
     causallm::registerAllModels();
     auto model =
       causallm::Factory::Instance().create("Gemma4ForCausalLM", cfg, gen, nc);
+    std::cerr << "DECODE_PREFIX_PHASE initialize" << std::endl;
     model->initialize();
+    std::cerr << "DECODE_PREFIX_PHASE load " << nc["model_file_name"]
+              << std::endl;
     model->load_weight(nc["model_file_name"].get<std::string>());
     model->repack_weight();
     auto *c = dynamic_cast<causallm::CausalLM *>(model.get());
@@ -63,7 +67,12 @@ int main(int argc, char **argv) {
     require(seed_ids.size() >= 3, "Generation did not cross 4096");
     auto full = tokens;
     full.insert(full.end(), seed_ids.begin(), seed_ids.end());
-    const std::string suffix = " Continue with one more sentence.";
+    std::string suffix = " Continue with one more sentence.";
+    if (const char *path = std::getenv("NNTR_DECODE_PREFIX_SUFFIX_FILE")) {
+      std::ifstream f(path);
+      require(bool(f), "Cannot read suffix fixture");
+      suffix.assign(std::istreambuf_iterator<char>(f), {});
+    }
     const auto delta = model->getTokenizer()->Encode(suffix, false);
     full.insert(full.end(), delta.begin(), delta.end());
     const auto complete = model->getTokenizer()->Decode(full);
@@ -83,6 +92,7 @@ int main(int argc, char **argv) {
     const auto hit_ids = c->getLastGeneratedTokenIds();
     const auto hit_position = c->getKvLen();
     const auto hit_ttft = c->getPerformanceMetrics().ttft_ms;
+    const auto restore = c->decodePrefixRestoreStats();
     const auto after = c->deviceKVManagerStats();
     const auto flash = c->deviceKVPrefixFlashStats();
     c->selectDeviceKVSession(0);
@@ -91,6 +101,12 @@ int main(int argc, char **argv) {
     c->selectDeviceKVSession(other_session);
     require(c->getKvLen() == hit_position,
             "Restored session position changed after switching");
+    c->setSessionTokenPosition(0);
+    model->run(complete, false, "", "", false);
+    const auto repeated_ids = c->getLastGeneratedTokenIds();
+    const auto repeated_position = c->getKvLen();
+    const auto repeated_ttft = c->getPerformanceMetrics().ttft_ms;
+    const auto repeated_restore = c->decodePrefixRestoreStats();
     bool corrupted = false;
     for (const auto &file :
          std::filesystem::recursive_directory_iterator(argv[3])) {
@@ -117,11 +133,31 @@ int main(int argc, char **argv) {
     model->run(complete, false, "", "", false);
     const auto recompute_ids = c->getLastGeneratedTokenIds();
     const auto recompute_ttft = c->getPerformanceMetrics().ttft_ms;
+    auto textOf = [&](const std::vector<unsigned> &ids) {
+      return model->getTokenizer()->Decode(
+        std::vector<int32_t>(ids.begin(), ids.end()));
+    };
     json result = {
+      {"input_tokens", full.size()},
       {"seed_tokens", tokens.size()},
       {"seed_ids", seed_ids},
       {"reference_ids", reference_ids},
       {"hit_ids", hit_ids},
+      {"hit_text", textOf(hit_ids)},
+      {"reference_text", textOf(reference_ids)},
+      {"recompute_text", textOf(recompute_ids)},
+      {"repeated_ids", repeated_ids},
+      {"repeated_hit_ttft_ms", repeated_ttft},
+      {"repeated_restore_read_ms", repeated_restore.read_ms},
+      {"repeated_restore_conversion_ms", repeated_restore.conversion_ms},
+      {"repeated_suffix_prefill_calls", repeated_restore.prefill_calls},
+      {"repeated_prefix_tokens", repeated_restore.prefix_tokens},
+      {"restore_read_ms", restore.read_ms},
+      {"restore_conversion_ms", restore.conversion_ms},
+      {"restore_bind_ms", restore.bind_ms},
+      {"suffix_prefill_ms", restore.prefill_ms},
+      {"suffix_prefill_tokens", restore.suffix_tokens},
+      {"suffix_prefill_calls", restore.prefill_calls},
       {"recompute_ids", recompute_ids},
       {"corrupt_fallback_ids", corrupt_ids},
       {"corruption_failures", corruption_failures},
@@ -143,8 +179,20 @@ int main(int argc, char **argv) {
     std::cout << result.dump() << std::endl;
     require(after.reused_tokens - before.reused_tokens == boundary,
             "Decode checkpoint was not selected");
-    require(hit_ids == reference_ids && hit_position == reference_position,
-            "Decode checkpoint continuation differs");
+    require(hit_ids == repeated_ids && hit_position == repeated_position &&
+              hit_position == full.size() + hit_ids.size() - 1u,
+            "Batched decode prefix restoration is not deterministic");
+    require(restore.prefix_tokens == boundary && restore.prefill_calls == 1 &&
+              restore.suffix_tokens > 1,
+            "Restored suffix did not use one batched prefill call");
+    require(repeated_restore.prefix_tokens == boundary &&
+              repeated_restore.prefill_calls == 1,
+            "Repeated run did not restore the same decode boundary");
+    if (const char *expected = std::getenv("NNTR_DECODE_PREFIX_EXPECT"))
+      require(
+        textOf(hit_ids).find(expected) != std::string::npos &&
+          textOf(recompute_ids).find(expected) != std::string::npos,
+        "Restored or recomputed answer did not contain the expected text");
     require(corruption_failures && corrupt_ids == recompute_ids,
             "Corrupt checkpoint did not fall back to recomputation");
     return 0;
