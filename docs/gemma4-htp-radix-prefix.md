@@ -282,3 +282,130 @@ The longer 20,992-token cold backup comparison observed +4.29% TTFT
 cost visible alongside the earlier 8704-token +0.39% result: neither establishes
 zero overhead on arbitrary workloads. Thermal state and frequency were not
 fixed. The new benchmark changes no production inference/manager code.
+
+## Persistent system prompt baking
+
+Implementation `c40756f8c` adds offline baking for Gemma4 HTP and imports the
+result into the existing radix index after a model restart. Original q8/Q2
+calibration, U16 O-projection and native projection/FFN/MoE batches are retained.
+
+The input file must contain the **exact serialized prefix of future requests**,
+including BOS, role markers, whitespace and any system-turn terminator. The CLI
+does not invent a chat template. Requests must actually contain that prefix;
+loading an asset does not prepend its text. Use the same model configuration,
+weights, tokenizer, HTP/MoE runtime and thread setting for baking and inference.
+
+```sh
+export LD_LIBRARY_PATH=.:/system/lib64:/vendor/lib64
+export ADSP_LIBRARY_PATH="$PWD"
+export NNTR_NUM_THREADS=8 NNTR_HTP_KV_MANAGER=1
+
+# MODEL_DIR: existing original q8/Q2 HTP configuration. Output must not exist.
+./nntr_causallm MODEL_DIR --bake-system-prefix system.txt /data/local/tmp/system-kv
+```
+
+Add this top-level entry to the inference `nntr_config.json`:
+
+```json
+{
+  "kv_prebaked_prefixes": ["/data/local/tmp/system-kv"]
+}
+```
+
+Keep `htp.kv_session`, `htp.kv_paged`, `htp.kv_prefix_cache` enabled and
+`htp.kv_seed_q` disabled, as required by the original-calibration prefix path.
+The validated pack uses `init_seq_len=4096`, a stable native plane, and
+`repetition_penalty=1.0`. Then run the existing CLI normally, or use
+`./nntr_causallm MODEL_DIR --requests requests.json`. A fresh request/reset with
+a matching token prefix restores the longest valid stored native boundary and
+computes its remaining suffix. Native C++ callers can use
+`bakeDeviceSystemPrefix(text, new_directory)` and
+`loadDeviceSystemPrefix(directory)` after enabling the device KV manager.
+
+### Boundaries and storage lifetime
+
+Every complete original prefill boundary is stored, including boundaries whose
+sliding-window rows are no longer active later. For example, an 8192-token bake
+stores both 4096 and 8192 states. A 4280-token system prompt stores 4096 tokens
+and reports `remaining_system_tokens=184`; that remainder is computed normally.
+**A prompt shorter than the native chunk has no reusable boundary and is
+explicitly rejected.** In the validated configuration this minimum is 4096
+tokens. There is no padding, smaller calibration call or static-scale conversion.
+
+The asset contains FP16 native-prefix KV, exact unrounded calibration/maxima,
+dropped sliding-row maxima, layout and token IDs. Restore uses the existing
+q8 seed path to recreate DSP INT8 KV. This format differs from a DSP INT8
+decode-session snapshot. It preserves the original dynamic-scale execution;
+it does not claim an INT8-only persistent prefix representation.
+
+Payload files and a versioned, checksummed manifest are prepared in a private
+directory and published together. They survive process exit, prefix clear,
+index LRU and session deletion. The application owns their on-disk lifetime;
+remove the directory explicitly to delete a baked asset. These immutable files
+are separate from the bounded process-local `kv_prefix_flash` store and are not
+charged to its file budget. All native boundaries currently contain independent
+snapshots; there is no cross-file global-page deduplication. The existing CLI
+index holds at most eight prefix entries, and its count limit is not a complete
+host-DRAM byte budget.
+
+### Validation and costs
+
+Import checks full content fingerprints of weights, tokenizer and relevant
+sidecars, plus model/runtime/layout compatibility. Size and mtime alone are not
+accepted. The content scan is cached for subsequent imports on the same model
+instance. FNV-1a checksums detect accidental damage; they are not cryptographic
+authentication. Assets must come from a trusted application and a compatible
+implementation contract. Re-bake after numerical/backend format changes.
+
+KV payloads are loaded and checksum-verified lazily on a hit. Invalid manifests
+or incompatible identities are rejected before indexing. A missing or damaged
+payload falls back to an earlier available boundary or ordinary recomputation.
+`[SYSTEM_PREFIX_LOAD]`, `[SYSTEM_PREFIX_REJECT]` and request
+`system_prefix_cache` counters expose imports, hits, reused tokens, errors and
+payload read/checksum time. TTFT includes restore and suffix computation;
+startup identity verification and offline baking are reported separately.
+
+[Android restart validation, complete inputs, output IDs and timings](validation/gemma4-htp-system-prefix-20261105.json)
+records the measured effect and its limits. The pre-bake API is currently for
+Gemma4 HTP native C++/CLI; this change does not add an NPU HTTP endpoint.
+
+On SM-S948N / SM8850 v81, independent bake/import/inference processes produced
+the following results. For 4K and 8K, Before is the faster of two recompute
+samples and Hit is the mean of two Flash samples. The non-aligned system-role
+case has one pair. All returned IDs and final positions matched. Files existed
+before each inference process started; no producer request runs in the hit
+process. The controls import the same assets and then clear the radix index.
+
+| Prefix case | Reused tokens | Recompute TTFT | Flash hit TTFT | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 4K shared serialized prefix | 4096 | 8.332 s | 2.747 s | 3.03× |
+| 8K shared serialized prefix | 8192 | 16.166 s | 2.623 s | 6.16× |
+| 4280-token system-role prefix | 4096 | 9.579 s | 3.065 s | 3.13× |
+
+The two aligned hit pairs perform only 26 prefill rows; the non-aligned hit
+performs 212. These tests emit the same eleven IDs answering `RUBY-456`.
+An 8K asset **by itself** also restored its interior 4K boundary (3.002 s).
+A same-size corrupted payload reported one error, reused zero tokens and
+recomputed all 4122 rows (9.528 s), with the same eleven IDs. A short prompt
+was rejected with exit code 1 and no asset directory. Ubuntu/Android storage
+checks, host ASan/UBSan, 36 Ubuntu KV tests, and the original A/B six-turn,
+fork and DSP snapshot continuation checks passed.
+
+Keep startup costs separate: the first asset import, including full content
+verification, took **8.709–19.415 s** across these runs. Later imports on that
+model took 34–75 ms. Offline 8K baking took 16.084 s plus 9.001 s identity
+verification, producing 678,182,125 bytes including its two boundaries.
+The 4280-token bake took 8.349 s plus 9.971 s verification, producing
+297,151,184 bytes. The hit table excludes these costs and ordinary model
+initialization; it does not establish lower process-start-to-first-token time
+for every prompt length.
+
+General cold/miss overhead is **not** established as zero. In the accumulated
+three-hit process, a subsequent nonmatching 11-row prompt took 7.869 s versus
+1.796 s in a control clearing prefixes between requests. IDs matched, but the
+host-prefix pin counter was 4,865,392,640 versus zero bytes and the memory states
+were different. This comparison does not isolate new pre-bake overhead from
+existing dynamic radix publication/DRAM retention. Preserve this result rather
+than extending the hit speedup claim to misses or claiming a complete DRAM byte
+budget. Frequencies and thermal state were not fixed; no sustained TPS result
+is inferred from these short generations.

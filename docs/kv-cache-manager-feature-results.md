@@ -15,6 +15,7 @@
 | Global / Sliding KV 관리 | NPU global은 필요한 페이지까지 확장, sliding은 window 밖 tile 회수. CPU의 paged sliding은 mask 기반이며 같은 물리 회수 정책은 아님 | 오래된 sliding KV를 활성 메모리에서 회수하고, 필요 시 과거 경계의 window를 복원. 아래 활성 DSP payload 실측 참고 |
 | DRAM ↔ Flash 계층 | CPU prefix LRU demotion/restore. NPU는 DSP INT8 세션 snapshot과 별도의 FP16 native-prefix backing | DRAM에 남지 않은 과거 4K/8K/12K/16K/20K 경계도 Flash에서 복원하여 재계산 절감 |
 | 비동기 prefix 저장 | NPU native 경계의 live KV를 immutable staging으로 복사한 후 worker가 write/sync. 최신 경계는 기존 DRAM 경로 | 현재 요청과 저장을 겹침. 아래 20K cold OFF/ON으로 노출 비용을 별도 측정 |
+| 시스템 프롬프트 pre-baking | Gemma4 HTP의 완료된 native 경계를 KV·정확한 scale·토큰과 함께 영속 파일로 저장. 새 프로세스에서 radix에 등록하고 hit 시 로드 | 시스템 prefix의 재계산 생략. 현재 4K native 경계보다 짧은 프롬프트는 저장 불가. 시작 시 모델 내용 검증 비용이 별도 발생하며, 아래 기존 20K 수치는 이 기능의 측정치가 아님. [설정·신규 실측](gemma4-htp-radix-prefix.md#persistent-system-prompt-baking) |
 | 용량 제한·LRU·실패 복구 | CPU page pool/Flash byte budget. NPU staging/file byte budget·file LRU·prefix 수 제한 | staging 부족 시 백업 skip, 파일 퇴출/손상/읽기 실패 시 이전 유효 경계 또는 재계산. 기존 budget/LRU/checksum/cancel/failed-write 검사 통과. NPU 최신 DRAM prefix 전체 byte budget은 미지원 |
 | 관측 지표 | 요청별 TTFT·출력 ID·KV payload·prefix hit/reused tokens·staging/write/read·skip/failure | 캐시 효과, 저장 비용, 실패 및 메모리 사용을 분리해 확인 가능 |
 

@@ -4,7 +4,8 @@
 
 - 작업 경로: `/tmp/nntr-pr4428-validation`
 - 브랜치: `kv/pr4428-dsp-flash-20261104`, 원격 `baek2sm/nntrainer`
-- 구현 커밋: `f2e43d820`
+- 최신 구현 커밋: `c40756f8c` (영속 시스템 prefix baking).
+  기존 비동기 prefix Flash 구현: `f2e43d820`.
 - 기존 q8/Q2 calibration·Q16/K8/V8·U16 O projection 및 projection/FFN/MoE 배치 유지.
 - **256-token calibration 정책은 제거했다.** prefix 옵션이 계산 dispatch를 바꾸던
   과거 q8_row 분기도 제거했고 Q2/U16 구성이 아니면 명시적으로 거부한다.
@@ -166,3 +167,36 @@ ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
   [전체 원본과 입력 token pool/출력 ID](validation/gemma4-htp-prefix-grid-20261105.json).
 - 로컬 원본 `/tmp/nntr-prefix-grid-20261105`, 기기에도 같은 basename.
   benchmark 종료 후 cache backing은 정리됐고 기기 Flash 여유는 약4.1GiB로 복귀.
+
+## 추가 완료: 시스템 프롬프트의 영속 Flash pre-baking
+
+- C++ 구현 `c40756f8c`. 기존 q8/Q2·U16·배치·calibration 연산은 변경하지 않았다.
+- `nntr_causallm MODEL_DIR --bake-system-prefix system.txt NEW_DIRECTORY`로
+  실제 요청과 같은 직렬화 prefix를 저장. `kv_prebaked_prefixes: [path, ...]`
+  설정으로 새 프로세스에서 radix에 등록하고, hit 시 필요한 경계만 파일에서 로드.
+- native 4K 경계마다 FP16 KV + 정확한 scale/maxima + sliding 위치/퇴출 maxima +
+  토큰을 저장. 기존 seed로 DSP INT8 복원. 8K 저장본에 4K/8K 경계 모두 포함.
+  4280-token system은 4096 재사용 + 나머지 정상 계산. **4K 미만은 명시적 거부**.
+- 4K/8K 각 재계산·hit 2회. 가장 빠른 재계산 대비 hit 평균:
+  8.332→2.747초(3.03×), 16.166→2.623초(6.16×).
+  4280-token system 한 쌍은 9.579→3.065초. 모든 11개 출력 ID/위치 일치.
+- 별도 8K 저장본만으로 내부 4K 복원, 같은 크기의 파일 손상 시 전체 재계산,
+  prefix miss ID 일치까지 총8쌍 검증. 기존 세션 A/B 6턴·fork·DSP Flash 재개 통과.
+- Ubuntu shared-library build·36 KV unit·영속 codec normal/ASan/UBSan,
+  Android 영속/동적 Flash codec·prefill layout 검사 통과. leak 검사 제외.
+- **시작 비용을 숨기지 말 것:** 첫 import의 모델 파일 전체 fingerprint/metadata
+  검증8.709~19.415초는 hit TTFT와 별도. 후속 asset import34~75ms.
+  8K offline bake16.084초 + identity9.001초, 파일합계678,182,125 bytes.
+- 일반 miss 무회귀/DRAM budget 완성은 미보장. 세 hit 누적 후 miss7.869초와
+  매번 index clear control1.796초가 관측됐고 host prefix pin은4.865GB 대0.
+  기존 동적 prefix publication의 slab 보존을 포함해 메모리 조건이 달라
+  신규 baking 자체 비용으로 단정하지 않는다. 원본 수치를 보고서에 보존했다.
+- 영속 asset은 앱 소유이며 prefix clear/LRU/프로세스 종료가 지우지 않는다.
+  기존 임시 Flash LRU budget과 별도. 삭제는 앱이 디렉터리를 제거해야 한다.
+- 기기 asset 경로 `/data/local/tmp/nntr_pr4428_kv_validation/system-bake-assets/`:
+  `sys4k`, `sys8k`, `sys-nonaligned` 보존. 손상 검사 사본만 삭제. 여유 약2.9GiB.
+- 재현 bundle `/tmp/nntr-system-bake-20261105` (기기에도 동일 basename).
+  [사용법·비용·제약](gemma4-htp-radix-prefix.md#persistent-system-prompt-baking),
+  [전체 입력·ID·위치·실측·해시](validation/gemma4-htp-system-prefix-20261105.json).
+- 다음 최적화 후보는 기존 dynamic prefix의 host slab 중복 pin/DRAM byte 예산과
+  시작 fingerprint 비용. 정적 scale 통일은 다른 작업 범위로 유지한다.
