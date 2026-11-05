@@ -480,6 +480,10 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   size_t out_dim =
     static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
 
+  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
+
   quant_lut.reset();
   if (has_quantized_lut) {
     quant_lut =
@@ -642,6 +646,8 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
+  if (skip_prefill && (!from || to - from > 1))
+    return;
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);

@@ -221,6 +221,7 @@ private:
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+  bool skip_prefill = false;
 };
 } // namespace causallm
 
