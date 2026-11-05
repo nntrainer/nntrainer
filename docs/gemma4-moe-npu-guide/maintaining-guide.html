@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Maintain this guide — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>Maintain this guide — Gemma4 NPU · Quick.AI</title>
+<link rel="alternate" hreflang="en" href="maintaining-guide.html">
+<link rel="alternate" hreflang="ko" href="ko/maintaining-guide.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 4, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/maintaining-guide.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="maintaining-guide.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/maintaining-guide.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="maintaining-guide.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html" aria-current="page">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Reference</span><span aria-hidden="true">/</span><span>Maintain this guide</span></div>
+<article><h1 id="11-open-and-maintain-the-html-guide">11. Open and maintain the HTML guide</h1>
+<p>The documentation site at <code>gemma4-moe-npu-guide/index.html</code> splits this guide
+into an overview, eleven section pages and an LFM2 benchmark appendix. It has grouped sidebar navigation,
+page-local contents, previous/next links, full-text search, code-copy buttons,
+and light/dark themes. On small screens, open the navigation with the menu
+button. Search also opens with <strong>Ctrl+K</strong> (or <strong>Command+K</strong> on macOS).</p>
+<p>Use <strong>한국어 / English</strong> to switch languages while keeping the current section
+and subsection. Korean pages start at <code>gemma4-moe-npu-guide/ko/index.html</code> (or
+<code>http://localhost:8765/ko/</code> on the server). Navigation and search use the selected
+language. The command below opens English; replace <code>index.html</code> with
+<code>ko/index.html</code> to open Korean directly.</p>
+<p>The navigation layout follows the documentation pattern used by
+<a href="https://xgrammar.mlc.ai/docs/latest/">XGrammar's documentation</a>. All styles,
+scripts and the search index are local files; no CDN or online search service
+is required.</p>
+<p>From the checkout containing this documentation, on a Linux desktop:</p>
+<pre tabindex="0"><code class="language-bash">xdg-open docs/gemma4-moe-npu-guide/index.html
+</code></pre>
+<p>To serve the pages over HTTP, run this from the checkout containing the guide
+and leave the terminal running:</p>
+<pre tabindex="0"><code class="language-bash">python3 tools/serve_gemma4_npu_guide.py --bind 0.0.0.0 --port 8765
+</code></pre>
+<p>Open <code>http://localhost:8765/</code> on that PC, or <code>http://&lt;host-ip&gt;:8765/</code> on a device
+that can reach it. The server exposes only this documentation, its assets, the
+Markdown source and the single-page view. Use <code>--bind 127.0.0.1</code> for access only
+from the host. Press <strong>Ctrl+C</strong> to stop it; run the same command to restart it.
+If the port is already in use, stop the earlier guide server or choose another
+port. Reload the browser after regenerating the pages.</p>
+<p>The original <code>gemma4-moe-npu-guide.html</code> remains available as a standalone
+file. It contains the entire guide with an inline stylesheet. Keep the adjacent
+<code>gemma4-moe-npu-guide/assets/</code> directory for screenshots and benchmark downloads
+when copying it for offline reading. For the paginated
+site, copy the whole <code>gemma4-moe-npu-guide/</code> directory and the adjacent English
+and Korean <code>.html</code> and <code>.md</code> files (<code>gemma4-moe-npu-guide.*</code> and
+<code>gemma4-moe-npu-guide.ko.*</code>). Browser <strong>Print → Save as PDF</strong> uses
+the included print layout; choose the single-page view to print the full guide.
+External reference links naturally need internet access.</p>
+<p>The English <code>gemma4-moe-npu-guide.md</code> and Korean <code>gemma4-moe-npu-guide.ko.md</code>
+files are the content sources. After editing them, regenerate HTML from the
+same checkout (the renderer is part of this documentation addition, not the
+pinned PR source):</p>
+<pre tabindex="0"><code class="language-bash">python3 -m venv /tmp/nntr-guide-venv
+/tmp/nntr-guide-venv/bin/python -m pip install markdown-it-py==3.0.0
+/tmp/nntr-guide-venv/bin/python tools/render_gemma4_npu_guide.py
+/tmp/nntr-guide-venv/bin/python tools/render_gemma4_npu_guide.py --check
+</code></pre>
+<p>The renderer updates both languages' single-page HTML, thirteen site pages per
+language, and search indexes together. Keep the same heading structure and order
+in both Markdown files, and update command blocks in both when changing them.
+Edit each language's Markdown for content, or <code>assets/site.css</code> and
+<code>assets/site.js</code> inside the site directory for presentation and interactions.
+Generated HTML and <code>assets/search-index.js</code> should not be edited by hand.</p>
+<h2 id="validation-boundaries-and-references">Validation boundaries and references</h2>
+<p>These instructions were checked against the pinned PR's scripts, CLI parser,
+app configuration, and Quick.AI documentation, plus the locally available HexKL
+beta2 archive layout. <strong>A fresh SDK installation or Android build was not
+performed as part of writing this guide.</strong> For the screenshots, an existing
+Quick.AI 2.0 installation and a supplied TL2 pack were used to check model
+loading, one short question, Metrics and unloading. The installed APK's source
+commit was not established: the captures document the interface, rather than
+a fresh build of this guide's pinned revision. The PR's own build and device
+validation records are also distinct from an end-to-end execution of this guide.</p>
+<p>The benchmark section was separately measured on the deployed TL2 pack on
+SM-S948U: three CLI trials each at 1K, 2K, 4K and 8K input, all with 128 output
+tokens. Runtime libraries were verified against the installed app by SHA-256;
+raw logs, token traces, configurations and binary hashes accompany the results.</p>
+<p>Use these pinned sources when resolving a discrepancy:</p>
+<ul>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/build_android.sh">Android build script</a>: accepted options, prerequisites, outputs and deployment.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/nntrainer/tensor/htp_backend/dsp/build.sh">DSP build script</a>: HexKL selection and DSP checks.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/Applications/CausalLM/main.cpp">CLI implementation</a>: positional arguments and prompt handling.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/build.md">Quick.AI build documentation</a>: recorded environment and build procedure.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/cli.md">CLI and C API test documentation</a>: runtime commands and lifecycle tests.</li>
+<li><a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/app.md">App usage</a> and <a href="https://github.com/nntrainer/nntrainer/blob/fa078c94d1d73609c5584e948931384d69f9364c/docs/quickai/troubleshooting.md">known limitations</a>: controls, permissions and failure modes.</li>
+</ul>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="troubleshooting.html"><small>Previous</small><span>Troubleshooting</span></a><a class="pager-next" href="lfm2-benchmarks.html"><small>Next</small><span>LFM2 benchmark results</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 4, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#validation-boundaries-and-references">Validation boundaries and references</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

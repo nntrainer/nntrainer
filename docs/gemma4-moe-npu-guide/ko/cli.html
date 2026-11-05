@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CLI 추론 — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>CLI 추론 — Gemma4 NPU · Quick.AI</title>
+<link rel="alternate" hreflang="en" href="../cli.html">
+<link rel="alternate" hreflang="ko" href="cli.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 4일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="cli.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../cli.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="cli.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../cli.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html" aria-current="page">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>실행</span><span aria-hidden="true">/</span><span>CLI 추론</span></div>
+<article><h1 id="7-run-gemma4-from-the-command-line">7. 명령줄에서 Gemma4 실행</h1>
+<h2 id="first-run-with-the-packs-default-prompt">팩의 기본 프롬프트로 첫 실행</h2>
+<p><strong>호스트 PC</strong>에서 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$NNTR_ROOT&quot;
+set -o pipefail
+adb shell sh /data/local/tmp/Quick.AI/run_causallm.sh \
+  /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32 \
+  2&gt;&amp;1 | tee gemma4-cli.log
+</code></pre>
+<p>래퍼는 런타임 라이브러리 경로를 설정하고 <code>/data/local/tmp/Quick.AI</code>로 이동한 뒤
+<code>nntr_causallm</code>을 호출합니다. 두 번째 인자를 생략하면 <code>chat_input</code>이 있는 경우
+팩의 템플릿을 통해 처리하고, 없으면 <code>sample_input</code>을 그대로 사용합니다.
+제공되는 팔레트 채팅 프리셋에는 요약 프롬프트가 들어 있습니다.</p>
+<p>성공하면 답변과 실행 시간 정보가 출력됩니다. 여기에는 <code>[e2e time]: ... ms</code>와
+<code>Max Resident Set Size: ... KB</code>가 포함됩니다. 실제 답변 내용과 속도는 팩과 기기
+상태에 따라 달라집니다. 첫 로드에서는 토크나이저나 가중치 레이아웃 캐시를 생성할 수
+있어 이후보다 오래 걸릴 수 있습니다.</p>
+<h2 id="give-the-cli-a-short-prompt">CLI에 짧은 프롬프트 전달</h2>
+<p>인터페이스는 <code>nntr_causallm &lt;model_path&gt; [input_prompt]</code>입니다.
+<code>--model</code>, <code>--prompt</code>, <code>--npu</code> 옵션은 없습니다. 두 번째 인자는 <strong>모델에 바로 전달할
+원시 입력</strong>이며 CLI가 여기에 채팅 템플릿을 자동 적용하지 않습니다.</p>
+<p>호스트와 ADB 사이의 따옴표 처리를 혼동하지 않도록 <strong>호스트 PC</strong>에서 휴대전화 셸을 엽니다.</p>
+<pre tabindex="0"><code class="language-bash">adb shell
+</code></pre>
+<p>다음 블록은 <strong>휴대전화 셸 안에서</strong> 실행합니다. 따옴표로 묶은 텍스트 전체가 하나의
+인자입니다. 실제 줄바꿈과 Gemma turn 마커는 의도적으로 포함되어 있습니다.</p>
+<pre tabindex="0"><code class="language-sh">sh /data/local/tmp/Quick.AI/run_causallm.sh \
+  /sdcard/Download/aistudio-mobile/models/gemma4-26b-a4b-htp-w4a32 \
+  '&lt;bos&gt;&lt;|turn&gt;user
+Explain what a neural network is in two sentences.&lt;turn|&gt;
+&lt;|turn&gt;model
+&lt;|channel&gt;thought
+&lt;channel|&gt;'
+exit
+</code></pre>
+<p>이 프리셋에서는 비어 있는 thought 채널로 바로 답변하도록 요청합니다.
+다른 팩이라면 제공자가 지정한 템플릿을 사용하세요. 생성 길이는 CLI 옵션이 아닌
+<code>nntr_config.json</code>의 <code>num_to_generate</code>에서 읽습니다. 팔레트 채팅 프리셋은
+컨텍스트 1,280개 위치와 최대 127개 생성 토큰을 사용합니다.</p>
+<h2 id="check-npu-execution">NPU 실행 확인</h2>
+<p>답변이 생성되었다는 사실만으로 <strong>NPU가 실행되었다고 볼 수는 없습니다.</strong>
+이 리비전은 DSP 열기에 실패하면 경고를 남기고 CLI가 CPU로 전환될 수 있습니다.
+기기 로그도 함께 수집하세요. 두 번째 <strong>호스트 터미널</strong>에서 필요하면 같은
+<code>ANDROID_SERIAL</code>을 지정하고 다음 추론을 시작하기 전에 로그 수집을 시작합니다.</p>
+<pre tabindex="0"><code class="language-bash">cd &quot;$HOME/workspace/nntrainer-gemma4-pr4480&quot;
+adb logcat -v threadtime &gt; gemma4-device.log
+</code></pre>
+<p>추론이 끝나면 <strong>로그를 수집하는 터미널에서 Ctrl+C</strong>를 누릅니다.
+호스트에서 두 로그를 검색합니다.</p>
+<pre tabindex="0"><code class="language-bash">grep -Ei 'HTP|nntr_hvx|FastRPC|adsprpc|cdsprpc|falling back|CPU fallback' \
+  gemma4-cli.log gemma4-device.log
+</code></pre>
+<p><code>nntr_hvx_open failed</code>, <code>HTP backend disabled, falling back to CPU</code>, 또는 연산별
+<code>CPU fallback</code>이 보이면 NPU 확인이 실패한 것으로 판단하세요. 성능을 비교하기 전에
+skel/라이브러리 누락이나 기기 세션 오류를 해결해야 합니다. HTP arena 매핑과 그래프
+실행 로그는 참고가 되지만 <code>HTP</code>라는 표시만으로 offload 성공을 입증할 수는 없습니다.
+일부 CPU 연산은 의도된 동작입니다. 예를 들어 팔레트 팩의 임베딩 공유 언어 모델 head는
+CPU를 사용합니다.</p>
+<p><strong>앱과 같은 C API</strong>를 통해 추가로 확인하려면 CLI가 끝난 뒤 <strong>호스트 PC</strong>에서 실행합니다.</p>
+<pre tabindex="0"><code class="language-bash">adb shell 'sh /data/local/tmp/Quick.AI/run_test.sh \
+  gemma4-26b-a4b-htp &quot;Explain neural networks in two sentences.&quot; \
+  true W4A32 1 /sdcard/Download/aistudio-mobile/models'
+</code></pre>
+<p>여기서 <code>true</code>는 일반 텍스트 프롬프트에 채팅 템플릿을 적용합니다.
+최신 <code>run_test.sh</code>는 <code>QUICKAI_NATIVE_LIB_DIR</code>와 <code>ADSP_LIBRARY_PATH</code>를
+끝에 콜론 없이 <code>/data/local/tmp/Quick.AI</code>로 설정합니다. 네이티브 라이브러리 경로와
+스레드 수도 설정합니다. 소스를 업데이트한 뒤에는 빌드·설치 단계를 다시 수행하여
+기기에 남아 있는 이전 래퍼도 교체하세요.</p>
+<p>선택적으로 수명 주기 테스트를 실행하려면 다음 명령을 사용합니다.</p>
+<pre tabindex="0"><code class="language-bash">adb shell 'QDA_HTP_LIFECYCLE=1 sh /data/local/tmp/Quick.AI/run_test.sh \
+  gemma4-26b-a4b-htp &quot;Explain neural networks in two sentences.&quot; \
+  true W4A32 1 /sdcard/Download/aistudio-mobile/models'
+</code></pre>
+<p>반복 생성, 취소, 언로드/재로드, 잘못된 팩을 검사합니다. 성공한 항목은
+<code>[HTP-API-TEST] PASS ...</code>를 출력합니다. 로그를 보관하고 종료 코드도 확인하세요.
+CLI/API 테스트 전에 앱의 모델을 언로드하세요.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="model-pack.html"><small>이전</small><span>모델 팩 준비</span></a><a class="pager-next" href="app.html"><small>다음</small><span>Quick.AI 앱</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 4일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#first-run-with-the-packs-default-prompt">팩의 기본 프롬프트로 첫 실행</a></li><li><a href="#give-the-cli-a-short-prompt">CLI에 짧은 프롬프트 전달</a></li><li><a href="#check-npu-execution">NPU 실행 확인</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

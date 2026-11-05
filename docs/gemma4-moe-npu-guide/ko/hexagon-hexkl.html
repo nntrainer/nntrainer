@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Hexagon SDK와 HexKL — Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.">
+<title>Hexagon SDK와 HexKL — Gemma4 NPU · Quick.AI</title>
+<link rel="alternate" hreflang="en" href="../hexagon-hexkl.html">
+<link rel="alternate" hreflang="ko" href="hexagon-hexkl.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Hexagon NPU에서 Gemma4-MoE 실행하기", "guide": "Gemma4 NPU 가이드", "description": "Hexagon SDK와 HexKL 설치부터 nntrainer 빌드, Android CLI와 Quick.AI 앱에서 Gemma4-MoE 실행까지 안내합니다.", "skip": "본문으로 이동", "open_menu": "메뉴 열기", "close_menu": "메뉴 닫기", "documentation": "문서 탐색", "docs": "문서", "on_page": "이 페이지의 내용", "explore": "가이드 둘러보기", "previous": "이전", "next": "다음", "pagination": "이전 및 다음 페이지", "back_top": "맨 위로", "markdown": "Markdown 원본", "theme_dark": "어두운 테마로 전환", "theme_light": "밝은 테마로 전환", "reviewed": "기준 소스: PR #4480 · 검토일: 2026년 11월 4일", "search": "문서 검색", "close_search": "검색 닫기", "search_label": "전체 가이드 검색", "search_hint": "SDK, 빌드, 모델 팩…", "search_empty": "검색어를 입력하면 전체 13개 페이지에서 찾습니다.", "search_count": "{count}개 섹션에서 찾았습니다", "search_none": "검색 결과가 없습니다. SDK, HexKL, 빌드, 권한 등을 검색해 보세요.", "copy": "복사", "copy_label": "코드 블록 복사", "copied": "복사 완료!", "copy_select": "선택하여 복사", "copy_success": "코드를 복사했습니다.", "copy_failure": "자동 복사를 사용할 수 없습니다. 코드를 선택해 직접 복사하세요.", "heading_link": "{heading} 링크", "language": "언어"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.ko.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">본문으로 이동</a>
+<button class="theme-toggle" aria-label="어두운 테마로 전환" title="어두운 테마로 전환">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="언어"><a href="hexagon-hexkl.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../hexagon-hexkl.html" lang="en" hreflang="en" data-language="en">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU 가이드</small></span></a>
+<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="language-switch" role="group" aria-label="언어"><a href="hexagon-hexkl.html" lang="ko" hreflang="ko" data-language="ko" aria-current="true">한국어</a><a href="../hexagon-hexkl.html" lang="en" hreflang="en" data-language="en">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>문서 검색</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="문서 탐색"><p class="nav-group">시작하기</p><ul><li><a href="index.html">소개</a></li><li class="nav-parent-active"><a href="requirements.html">실행 환경</a><ul class="nav-children"><li><a href="linux-android-tools.html">Linux 및 Android 도구</a></li><li><a href="hexagon-hexkl.html" aria-current="page">Hexagon SDK와 HexKL</a></li><li><a href="source-device.html">소스 및 기기 준비</a></li></ul></li></ul><p class="nav-group">빌드</p><ul><li><a href="build-install.html">빌드 및 설치</a></li><li><a href="model-pack.html">모델 팩 준비</a></li></ul><p class="nav-group">실행</p><ul><li><a href="cli.html">CLI 추론</a></li><li><a href="app.html">Quick.AI 앱</a></li></ul><p class="nav-group">참고 자료</p><ul><li><a href="benchmarks.html">벤치마크 결과</a></li><li><a href="troubleshooting.html">문제 해결</a></li><li><a href="maintaining-guide.html">문서 관리</a></li></ul><p class="nav-group">부록</p><ul><li><a href="lfm2-benchmarks.html">LFM2 벤치마크 결과</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../../gemma4-moe-npu-guide.ko.md">Markdown 원본 ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">문서</a><span aria-hidden="true">/</span><span>시작하기</span><span aria-hidden="true">/</span><span>Hexagon SDK와 HexKL</span></div>
+<article><h1 id="3-install-hexagon-sdk-and-hexkl-beta2">3. Hexagon SDK와 HexKL beta2 설치</h1>
+<h2 id="get-the-qualcomm-packages">Qualcomm 패키지 받기</h2>
+<p>공식 <a href="https://softwarecenter.qualcomm.com/catalog/item/Hexagon_SDK">Qualcomm Software Center의 Hexagon SDK 카탈로그</a>와
+<a href="https://qpm.qualcomm.com/">Qualcomm Package Manager</a>를 이용합니다.
+로그인이 필요하면 Qualcomm 계정으로 로그인하세요. Linux용 <strong>Hexagon SDK 6.4.0.1</strong>을
+선택하고 <strong>Hexagon Tools 19.0.04</strong> 구성 요소를 설치합니다. 설치 프로그램에 표시된
+설치 경로를 사용하세요. 아래 예제에서는 <code>$HOME/Qualcomm/Hexagon_SDK/6.4.0.1</code>을
+사용합니다.</p>
+<p>포털에서 Linux용 Package Manager 앱을 요구한다면 Debian 패키지를 내려받아 설치한
+다음 앱을 열고 로그인합니다.</p>
+<pre tabindex="0"><code class="language-bash"># Replace the filename with the package you actually downloaded.
+sudo apt install &quot;$HOME/Downloads/QualcommPackageManager3.3.0.133.0.Linux-x86.deb&quot;
+</code></pre>
+<p>Qualcomm 카탈로그에서 **Hexagon Kernel Library(HexKL)**도 찾아 <strong>1.0 beta2</strong>를
+선택합니다. HexKL은 SDK와 별도로 배포됩니다.
+<a href="https://softwarecenter.qualcomm.com/catalog/catalog-suite/Qualcomm%C2%AE%20AI%20Stack">Qualcomm AI Stack 카탈로그</a>에서도
+해당 패키지를 찾을 수 있습니다. 포털 화면과 사용할 수 있는 버전은 계정에 따라
+달라집니다. 필요한 버전이 없다면 Qualcomm이나 패키지 제공자에게 접근 권한을
+요청하세요. 확인 없이 다른 릴리스로 대체하지 마세요. 이 가이드는 익명으로 접근할 수
+있는 패키지 다운로드 URL을 전제로 하지 않습니다.</p>
+<p>제공받은 beta2 ZIP을 풉니다. 아래 예제는 최상위 디렉터리가 <code>hexkl_addon</code>인
+<code>hexkl-1.0-beta.2.zip</code>을 사용합니다.</p>
+<pre tabindex="0"><code class="language-bash">mkdir -p &quot;$HOME/Qualcomm/HexKL/1.0-beta2&quot;
+unzip &quot;$HOME/Downloads/hexkl-1.0-beta.2.zip&quot; -d &quot;$HOME/Qualcomm/HexKL/1.0-beta2&quot;
+export HEXKL_ROOT=&quot;$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon&quot;
+head -n 8 &quot;$HEXKL_ROOT/README.md&quot;
+</code></pre>
+<p>README에 <strong>1.0 Beta.2</strong>가 표시되어야 합니다. 다운로드 파일이 한 번 더 압축되어
+있다면 바깥 압축부터 풀고, 실제 <code>include/</code>와 <code>lib/</code>가 들어 있는 디렉터리를
+<code>HEXKL_ROOT</code>로 지정하세요.</p>
+<h2 id="set-the-environment">환경 변수 설정</h2>
+<p><strong>호스트 PC</strong>에서 설치된 SDK의 환경 스크립트를 먼저 불러온 뒤, Android와 HexKL
+경로를 명시적으로 설정합니다.</p>
+<pre tabindex="0"><code class="language-bash">source &quot;$HOME/Qualcomm/Hexagon_SDK/6.4.0.1/setup_sdk_env.source&quot;
+
+export HEXKL_ROOT=&quot;$HOME/Qualcomm/HexKL/1.0-beta2/hexkl_addon&quot;
+export HEXKL_SDK_VER=6.4.0.2
+export HEXKL_TOOLS_VARIANT=toolv19
+export HEXKL_ARCH=armv8_android26
+export HEX_ARCH=v81
+export ANDROID_HOME=&quot;$HOME/Android/Sdk&quot;
+export ANDROID_NDK=&quot;$ANDROID_HOME/ndk/30.0.16248370&quot;
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=&quot;$JAVA_HOME/bin:$HOME/.cargo/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH&quot;
+</code></pre>
+<p><code>setup_sdk_env.source</code>가 <code>HEXAGON_SDK_ROOT</code>와 <code>DEFAULT_HEXAGON_TOOLS_ROOT</code>를
+설정합니다. SDK를 다른 곳에 설치했다면 <code>source</code> 경로를 바꾸세요. 새 터미널을
+열 때마다 이 블록을 다시 실행하거나, 소스 체크아웃 밖의 셸 파일에 저장해 불러오세요.</p>
+<blockquote>
+<p><strong>이 값은 PR에 기록된 빌드 구성을 재현하는 설정입니다.</strong>
+Hexagon SDK <strong>6.4.0.1</strong>은 컴파일러와 SDK 환경을 제공합니다.
+<code>HEXKL_SDK_VER=6.4.0.2</code>는 HexKL beta2의 <code>lib/6.4.0.2</code> 라이브러리를 선택하며,
+설치된 SDK 버전을 바꾸지 않습니다. 그 아래 <code>armv8_android26/libsdkl.so</code>는
+Android 런타임으로 배포되고, <code>hexagon_toolv19_v81/libhexkl_micro.a</code>는 DSP 빌드에
+링크됩니다. 이 설명은 PR의 빌드 설정에 대한 것으로, 서로 다른 모든 SDK 버전의
+호환성을 보장하는 의미는 아닙니다. 패키지의 디렉터리 이름은 바꾸지 마세요.</p>
+</blockquote>
+<p>빌드 전에 경로를 확인합니다.</p>
+<pre tabindex="0"><code class="language-bash">printf 'SDK: %s\nTools: %s\nHexKL: %s\n' \
+  &quot;$HEXAGON_SDK_ROOT&quot; &quot;$DEFAULT_HEXAGON_TOOLS_ROOT&quot; &quot;$HEXKL_ROOT&quot;
+
+ls &quot;$HEXAGON_SDK_ROOT/setup_sdk_env.source&quot; \
+   &quot;$HEXAGON_SDK_ROOT/rtos/qurt/computev81/include/qurt&quot; \
+   &quot;$HEXKL_ROOT/include/hexkl_micro.h&quot; \
+   &quot;$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so&quot; \
+   &quot;$HEXKL_ROOT/lib/$HEXKL_SDK_VER/hexagon_toolv19_v81/libhexkl_micro.a&quot;
+
+&quot;$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang&quot; --version
+</code></pre>
+<p>모든 경로가 존재해야 하며 컴파일러는 Tools 19.0.04에 포함된 것이어야 합니다.
+<code>DEFAULT_HEXAGON_TOOLS_ROOT</code>는 <code>Tools/bin</code>이 아니라 <strong><code>Tools/</code>의 상위 디렉터리</strong>를
+가리킵니다. HexKL은 미리 빌드된 라이브러리를 제공하므로 nntrainer를 위해 모든
+HexKL 예제를 빌드할 필요는 없습니다. 일반 <code>libhexkl_skel.so</code>는 nntrainer의
+<code>libnntr_hvx_skel.so</code>를 대체할 수 없습니다.</p>
+</article>
+<nav class="page-navigation" aria-label="이전 및 다음 페이지"><a class="pager-previous" href="linux-android-tools.html"><small>이전</small><span>Linux 및 Android 도구</span></a><a class="pager-next" href="source-device.html"><small>다음</small><span>소스 및 기기 준비</span></a></nav>
+<footer class="page-footer">Quick.AI · Hexagon NPU에서 Gemma4-MoE 실행하기<br>기준 소스: PR #4480 · 검토일: 2026년 11월 4일</footer>
+</main>
+<aside class="page-toc" aria-label="이 페이지의 내용"><p>이 페이지의 내용</p><ul><li><a href="#get-the-qualcomm-packages">Qualcomm 패키지 받기</a></li><li><a href="#set-the-environment">환경 변수 설정</a></li></ul><a class="back-top" href="#main-content">맨 위로 ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">문서 검색</h2><button class="search-close" aria-label="검색 닫기">✕</button></div>
+<label class="sr-only" for="search-input">전체 가이드 검색</label>
+<input id="search-input" type="search" placeholder="SDK, 빌드, 모델 팩…" autocomplete="off">
+<p id="search-status" role="status">검색어를 입력하면 전체 13개 페이지에서 찾습니다.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>

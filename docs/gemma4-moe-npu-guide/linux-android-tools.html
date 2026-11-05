@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Linux &amp; Android tools — Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.">
+<title>Linux &amp; Android tools — Gemma4 NPU · Quick.AI</title>
+<link rel="alternate" hreflang="en" href="linux-android-tools.html">
+<link rel="alternate" hreflang="ko" href="ko/linux-android-tools.html">
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('nntr-guide-theme') || 'light'; } catch {}</script>
+<link rel="stylesheet" href="assets/site.css">
+<script id="guide-i18n" type="application/json">{"guide_title": "Gemma4-MoE on the Hexagon NPU", "guide": "Gemma4 NPU guide", "description": "Install Hexagon SDK and HexKL, build nntrainer, and run Gemma4-MoE on an Android NPU through the CLI and Quick.AI app.", "skip": "Skip to content", "open_menu": "Open navigation", "close_menu": "Close navigation", "documentation": "Documentation", "docs": "Docs", "on_page": "On this page", "explore": "Explore the guide", "previous": "Previous", "next": "Next", "pagination": "Previous and next pages", "back_top": "Back to top", "markdown": "Markdown source", "theme_dark": "Switch to dark theme", "theme_light": "Switch to light theme", "reviewed": "Source baseline: PR #4480 · Reviewed November 4, 2026", "search": "Search documentation", "close_search": "Close search", "search_label": "Search all guide pages", "search_hint": "SDK, build, model pack…", "search_empty": "Type to search all 13 pages.", "search_count": "{count} matching sections", "search_none": "No results. Try SDK, HexKL, build or permissions.", "copy": "Copy", "copy_label": "Copy code block", "copied": "Copied!", "copy_select": "Select to copy", "copy_success": "Code copied.", "copy_failure": "Copy unavailable. Select the code and copy it manually.", "heading_link": "Link to {heading}", "language": "Language"}</script>
+<script src="assets/search-index.js" defer></script>
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<!-- Generated from docs/gemma4-moe-npu-guide.md. Do not edit this HTML. -->
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="theme-toggle" aria-label="Switch to dark theme" title="Switch to dark theme">
+<svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+<svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+<header class="mobile-header"><button class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">☰</button><a class="mobile-brand" href="index.html">Quick.AI <span>/ Gemma4 NPU</span></a><div class="language-switch" role="group" aria-label="Language"><a href="ko/linux-android-tools.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="linux-android-tools.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div></header>
+<div class="sidebar-backdrop" hidden></div>
+<aside class="sidebar" id="sidebar">
+<a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">Q</span><span>Quick.AI<small>Gemma4 NPU guide</small></span></a>
+<div class="version">PR #4480 <span>·</span> fa078c94</div>
+<div class="language-switch" role="group" aria-label="Language"><a href="ko/linux-android-tools.html" lang="ko" hreflang="ko" data-language="ko">한국어</a><a href="linux-android-tools.html" lang="en" hreflang="en" data-language="en" aria-current="true">English</a></div>
+<button class="search-open" aria-haspopup="dialog"><span>Search documentation</span><kbd>⌘ / Ctrl K</kbd></button>
+<nav class="site-nav" aria-label="Documentation"><p class="nav-group">Get started</p><ul><li><a href="index.html">Overview</a></li><li class="nav-parent-active"><a href="requirements.html">Requirements</a><ul class="nav-children"><li><a href="linux-android-tools.html" aria-current="page">Linux &amp; Android tools</a></li><li><a href="hexagon-hexkl.html">Hexagon SDK &amp; HexKL</a></li><li><a href="source-device.html">Source &amp; device setup</a></li></ul></li></ul><p class="nav-group">Build</p><ul><li><a href="build-install.html">Build &amp; install</a></li><li><a href="model-pack.html">Prepare the model pack</a></li></ul><p class="nav-group">Run</p><ul><li><a href="cli.html">CLI inference</a></li><li><a href="app.html">Quick.AI app</a></li></ul><p class="nav-group">Reference</p><ul><li><a href="benchmarks.html">Benchmark results</a></li><li><a href="troubleshooting.html">Troubleshooting</a></li><li><a href="maintaining-guide.html">Maintain this guide</a></li></ul><p class="nav-group">Appendix</p><ul><li><a href="lfm2-benchmarks.html">LFM2 benchmark results</a></li></ul></nav>
+<div class="sidebar-footer"><a href="../gemma4-moe-npu-guide.md">Markdown source ↗</a></div>
+</aside>
+<div class="page-shell">
+<main id="main-content" tabindex="-1">
+<div class="breadcrumbs"><a href="index.html">Docs</a><span aria-hidden="true">/</span><span>Get started</span><span aria-hidden="true">/</span><span>Linux &amp; Android tools</span></div>
+<article><h1 id="2-install-the-linux-and-android-tools">2. Install the Linux and Android tools</h1>
+<h2 id="linux-build-dependencies">Linux build dependencies</h2>
+<pre tabindex="0"><code class="language-bash">sudo apt update
+sudo apt install -y \
+  build-essential git curl wget unzip zip file pkg-config \
+  python3 python3-pip python3-venv meson ninja-build cmake \
+  openjdk-17-jdk autoconf automake libtool
+
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=&quot;$JAVA_HOME/bin:$PATH&quot;
+java -version
+python3 --version
+meson --version
+ninja --version
+cmake --version
+</code></pre>
+<p><code>java -version</code> should report Java 17. These commands install host build tools;
+the NDK supplies the Android compilers. Do not install a host nntrainer package
+as a substitute for the Android build below.</p>
+<p>Install Rust using the <a href="https://rustup.rs/">official rustup installer</a>, accepting
+the default installation when prompted:</p>
+<pre tabindex="0"><code class="language-bash">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/nntr-rustup-init.sh
+sh /tmp/nntr-rustup-init.sh
+source &quot;$HOME/.cargo/env&quot;
+rustup target add aarch64-linux-android
+rustc --version
+cargo --version
+</code></pre>
+<p>Rust builds the repository's tokenizer library. The build script manages the
+Android C/C++ compiler settings for that library; no separate tokenizer checkout
+or <code>cargo-ndk</code> installation is needed.</p>
+<h2 id="android-sdk-and-ndk">Android SDK and NDK</h2>
+<p>Download <strong>Command line tools only → Linux</strong> from the
+<a href="https://developer.android.com/studio#command-tools">Android Studio downloads page</a>.
+Extract the archive into a temporary directory. Place its contents so that the
+SDK manager is at <code>$HOME/Android/Sdk/cmdline-tools/latest/bin/sdkmanager</code>, as in
+Google's <a href="https://developer.android.com/tools/sdkmanager">SDK manager instructions</a>.
+For example, replacing the archive name with the one you downloaded:</p>
+<pre tabindex="0"><code class="language-bash">export ANDROID_HOME=&quot;$HOME/Android/Sdk&quot;
+export NNTR_ANDROID_TOOLS_ZIP=&quot;$HOME/Downloads/commandlinetools-linux-REPLACE_ME_latest.zip&quot;
+NNTR_ANDROID_TOOLS_TMP=$(mktemp -d)
+unzip &quot;$NNTR_ANDROID_TOOLS_ZIP&quot; -d &quot;$NNTR_ANDROID_TOOLS_TMP&quot;
+mkdir -p &quot;$ANDROID_HOME/cmdline-tools/latest&quot;
+cp -a &quot;$NNTR_ANDROID_TOOLS_TMP/cmdline-tools/.&quot; &quot;$ANDROID_HOME/cmdline-tools/latest/&quot;
+export PATH=&quot;$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH&quot;
+sdkmanager --version
+</code></pre>
+<p>If Android Studio already installed the SDK, use its SDK location instead and
+install <strong>Android SDK Command-line Tools</strong> from its SDK Manager. Keep
+<code>ANDROID_HOME</code> and any existing <code>ANDROID_SDK_ROOT</code> pointed at the same directory.
+The commands here use the SDK manager shipped in the command-line tools package.</p>
+<p>Install the pinned packages, review and accept the Android licenses:</p>
+<pre tabindex="0"><code class="language-bash">sdkmanager --sdk_root=&quot;$ANDROID_HOME&quot; --licenses
+sdkmanager --sdk_root=&quot;$ANDROID_HOME&quot; \
+  &quot;platform-tools&quot; &quot;platforms;android-36&quot; &quot;build-tools;36.0.0&quot; \
+  &quot;cmake;3.22.1&quot; &quot;ndk;30.0.16248370&quot;
+
+export ANDROID_NDK=&quot;$ANDROID_HOME/ndk/30.0.16248370&quot;
+cat &quot;$ANDROID_NDK/source.properties&quot;
+&quot;$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang&quot; --version
+adb version
+</code></pre>
+<p>The NDK revision should be <code>30.0.16248370</code>, corresponding to
+<a href="https://developer.android.com/ndk/downloads">NDK r30</a>. If using the standalone
+<code>android-ndk-r30-linux.zip</code> instead, extract it and set <code>ANDROID_NDK</code> to the
+resulting <code>android-ndk-r30</code> directory. The app build uses the same NDK path as the
+native build. The repository provides its Gradle wrapper; do not install a
+separate system Gradle.</p>
+</article>
+<nav class="page-navigation" aria-label="Previous and next pages"><a class="pager-previous" href="requirements.html"><small>Previous</small><span>Requirements</span></a><a class="pager-next" href="hexagon-hexkl.html"><small>Next</small><span>Hexagon SDK &amp; HexKL</span></a></nav>
+<footer class="page-footer">Quick.AI · Gemma4-MoE on the Hexagon NPU<br>Source baseline: PR #4480 · Reviewed November 4, 2026</footer>
+</main>
+<aside class="page-toc" aria-label="On this page"><p>On this page</p><ul><li><a href="#linux-build-dependencies">Linux build dependencies</a></li><li><a href="#android-sdk-and-ndk">Android SDK and NDK</a></li></ul><a class="back-top" href="#main-content">Back to top ↑</a></aside>
+</div>
+<dialog id="search-dialog" aria-labelledby="search-title">
+<div class="search-heading"><h2 id="search-title">Search documentation</h2><button class="search-close" aria-label="Close search">✕</button></div>
+<label class="sr-only" for="search-input">Search all guide pages</label>
+<input id="search-input" type="search" placeholder="SDK, build, model pack…" autocomplete="off">
+<p id="search-status" role="status">Type to search all 13 pages.</p><ul id="search-results"></ul>
+</dialog>
+<div class="sr-only" role="status" id="copy-status"></div>
+</body>
+</html>
