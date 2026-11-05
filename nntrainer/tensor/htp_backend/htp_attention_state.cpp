@@ -120,7 +120,6 @@ private:
 } // namespace
 
 void HtpAttentionState::beginHtpPrompt() {
-  prefix_calibrations_.clear();
   release_quantized_cache();
   config_.cache_index = 0;
   config_.cache_base = 0;
@@ -141,9 +140,7 @@ void HtpAttentionState::beginHtpPrompt() {
 }
 
 std::shared_ptr<const HtpPrefixCalibration>
-HtpAttentionState::capturePrefixCalibration(unsigned position) const {
-  if (position)
-    return prefix_calibrations_.at(position);
+HtpAttentionState::capturePrefixCalibration() const {
   return std::make_shared<const HtpPrefixCalibration>(HtpPrefixCalibration{
     q2_calibrated, q2_scale_k, q2_scale_v, q2_q_enc, q2_out_enc, q2_kmax,
     q2_vmax, kv_floor_k_, kv_floor_v_});
@@ -623,47 +620,6 @@ bool HtpAttentionState::try_quantized_attention(
   const ml::train::TensorDim &cache_key_dim,
   nntrainer::Tensor &attention_output_step, unsigned int cache_from,
   unsigned int cache_to, const nntrainer::Tensor *sink) {
-  // Keep Q2 attention and its encoded U16 folded O projection. Only attention
-  // calibration is tiled causally; the model's projection/FFN/MoE stay wide.
-  if (htpRuntimeConfig().htp.kv_prefix_cache && !prefix_dispatching_) {
-    NNTR_THROW_IF(
-      !config_.compute_ops_ || !config_.attn_out_u16 ||
-        !config_.kv_cache_fixed_scales || config_.kv_cache_quant_kind != 0 ||
-        query_step.getDataType() != ml::train::TensorDim::DataType::FP32,
-      std::runtime_error)
-      << "Radix requires optimized q8/Q2 U16 attention";
-    prefix_dispatching_ = true;
-    auto finish = [this](HtpAttentionState *) {
-      prefix_dispatching_ = false;
-      release_quantized_cache();
-    };
-    std::unique_ptr<HtpAttentionState, decltype(finish)> guard(this, finish);
-    const unsigned total = cache_to - cache_from;
-    const unsigned width = config_.num_heads_Q * config_.head_dim;
-    for (unsigned offset = 0; offset < total;) {
-      const unsigned absolute = config_.cache_base + cache_from + offset;
-      const unsigned rows = std::min(256u - absolute % 256u, total - offset);
-      auto dim = query_step.getDim();
-      dim.height(rows);
-      auto q =
-        query_step.getSharedDataTensor(dim, size_t(offset) * width, true);
-      auto o = attention_output_step.getSharedDataTensor(
-        dim, size_t(offset) * width, true);
-      if (!try_quantized_attention(batch, q, cache_key, cache_value,
-                                   cache_key_dim, o, cache_from + offset,
-                                   cache_from + offset + rows, sink))
-        return false;
-      if ((absolute + rows) % 256u == 0u)
-        prefix_calibrations_[absolute + rows] = capturePrefixCalibration();
-      NNTR_THROW_IF(
-        !config_.compute_ops_->collect_attention_slice(
-          attention_output_step.getData<float>(), total, offset, rows, width),
-        std::runtime_error)
-        << "Cannot retain optimized U16 attention slices";
-      offset += rows;
-    }
-    return true;
-  }
   if (config_.kv_cache_quant_kind < 0 || q_cache_failed ||
       !config_.compute_ops_ || !config_.compute_ops_->supports_kv_cache_q() ||
       !config_.is_causal) {
@@ -673,9 +629,9 @@ bool HtpAttentionState::try_quantized_attention(
   // Keep only this layer's temporary quantized layout during prefill. Reusing
   // calibration and resetting the synced row count also supports chunked
   // prefill: the next call rebuilds the layout from that history.
-  const bool release_prefill =
-    nntrainer::weightPageCachePolicy() >= 0 && cache_to - cache_from > 1 &&
-    !htpRuntimeConfig().htp.kv_seed_q && !prefix_dispatching_;
+  const bool release_prefill = nntrainer::weightPageCachePolicy() >= 0 &&
+                               cache_to - cache_from > 1 &&
+                               !htpRuntimeConfig().htp.kv_seed_q;
   auto release = [release_prefill](HtpAttentionState *layer) {
     if (release_prefill)
       layer->release_quantized_cache();
@@ -870,13 +826,8 @@ bool HtpAttentionState::try_quantized_attention(
       // and would clip at 127 (seen: V 2x at a third chunk). The scales
       // widen to them and every row is re-quantized: the mirror takes rows
       // [0, cache_to) again under the new scales.
-      const unsigned grow_from =
-        prefix_dispatching_ ? std::max(append_row0, cache_from) : append_row0;
-      const size_t grow_offset =
-        batch * cache_key_dim.getFeatureLen() + size_t(grow_from) * width;
       if (append_rows != 0 &&
-          q2_grow(k_base + grow_offset, v_base + grow_offset,
-                  cache_to - grow_from, width)) {
+          q2_grow(k_base + off, v_base + off, append_rows, width)) {
         if (runtime.attn_trace)
           ml_logi("mha_core trace: q2 scales grew at rows=%u from=%u; "
                   "re-quantizing %u rows",

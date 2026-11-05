@@ -129,7 +129,9 @@ void *HtpBackend::alloc_shared(size_t bytes) {
             bytes);
   } else {
     std::lock_guard<std::mutex> lock(shared_mu_);
-    shared_.insert(block);
+    shared_.emplace(block, std::shared_ptr<void>(block, [](void *p) {
+                      HtpRpcMemApi::get().free_(p);
+                    }));
   }
   return block;
 }
@@ -137,23 +139,36 @@ void *HtpBackend::alloc_shared(size_t bytes) {
 void HtpBackend::free_shared(void *block) {
   if (!block)
     return;
+  std::shared_ptr<void> owner;
   {
     std::lock_guard<std::mutex> lock(shared_mu_);
     if (dropped_.erase(block) != 0)
-      return; // drop_shared freed it
-    shared_.erase(block);
+      return;
+    const auto it = shared_.find(block);
+    if (it != shared_.end()) {
+      owner = std::move(it->second);
+      shared_.erase(it);
+    }
   }
-  HtpRpcMemApi::get().free_(block);
+}
+
+std::shared_ptr<void> HtpBackend::retain_shared(void *block) {
+  std::lock_guard<std::mutex> lock(shared_mu_);
+  const auto it = shared_.find(block);
+  return it == shared_.end() ? nullptr : it->second;
 }
 
 void HtpBackend::drop_shared(void *block) {
+  std::shared_ptr<void> owner;
   {
     std::lock_guard<std::mutex> lock(shared_mu_);
-    if (!block || shared_.erase(block) == 0)
+    const auto it = shared_.find(block);
+    if (it == shared_.end() || it->second.use_count() > 1)
       return;
     dropped_.insert(block);
+    owner = std::move(it->second);
+    shared_.erase(it);
   }
-  HtpRpcMemApi::get().free_(block);
 }
 
 HtpBackend::~HtpBackend() { close(); }

@@ -1038,8 +1038,10 @@ std::string CausalLM::kvCacheModelTag() const {
   return std::string(buf);
 }
 
-void CausalLM::compactKVCache(unsigned int pos, bool force) {
-  if (!kv_cache.compact(pos) && !force)
+void CausalLM::compactKVCache(unsigned int pos, bool force, bool decode_view) {
+  if (decode_view)
+    kv_cache.prepareDecodeView(pos);
+  else if (!kv_cache.compact(pos) && !force)
     return;
   // ponytail: the n-th HTP attention layer in graph order is attention
   // layer n (the fused model builds them in that order); a model that shares
@@ -1054,8 +1056,6 @@ void CausalLM::compactKVCache(unsigned int pos, bool force) {
       l.setProperty({"cache_base=" + std::to_string(kv_cache.getBase(idx))});
       // [#4428 window] the rows the compactions dropped so far: their |max|
       // reaches the decode seed's int8 scales through the layer
-      if (kv_cache.droppedAmaxK(idx).empty())
-        return;
       auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
       auto *mha =
         node ? dynamic_cast<causallm::HtpMHACoreLayer *>(node->getLayer())
@@ -1063,8 +1063,10 @@ void CausalLM::compactKVCache(unsigned int pos, bool force) {
       NNTR_THROW_IF(mha == nullptr, std::runtime_error)
         << "compactKVCache: attention layer " << idx
         << " is not an HtpMHACoreLayer";
-      mha->foldDroppedAmax(kv_cache.droppedAmaxK(idx),
-                           kv_cache.droppedAmaxV(idx));
+      mha->setDecodeCacheOffset(kv_cache.getDecodeOffset(idx));
+      if (!kv_cache.droppedAmaxK(idx).empty())
+        mha->foldDroppedAmax(kv_cache.droppedAmaxK(idx),
+                             kv_cache.droppedAmaxV(idx));
     };
   model->forEachLayer(fn, nullptr);
 }
@@ -1143,14 +1145,22 @@ size_t CausalLM::getDeviceKVCacheBytes() const {
 size_t CausalLM::getDeviceKVPrefixBytes() const {
   std::unordered_set<const KVCacheManager::PrefixSnapshot::Page *> pages;
   size_t bytes = 0;
+  std::unordered_set<const void *> slabs;
   auto count = [&](const DevicePrefillHistory *history) {
     if (!history)
       return;
     for (const auto &frame : *history)
       for (const auto &layer : frame.second.kv->layers)
         for (const auto &page : layer.pages)
-          if (pages.insert(page.get()).second)
-            bytes += page->key.size() + page->value.size();
+          if (pages.insert(page.get()).second) {
+            if (page->key_owner) {
+              for (const auto &owner : {page->key_owner, page->value_owner})
+                if (slabs.insert(owner.get()).second)
+                  bytes += page->slab_bytes;
+            } else {
+              bytes += page->keySize() + page->valueSize();
+            }
+          }
   };
   count(device_prefill_history_.get());
   for (const auto &state : device_prefill_states_)
@@ -1168,6 +1178,8 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
     throw std::logic_error(
       "Exact DSP radix reuse requires htp.kv_prefix_cache");
   device_prefill_capture_ = max_prefixes != 0;
+  kv_cache.setSharedRetain(
+    [](void *block) { return nntrainer::get_htp_ops()->retain_shared(block); });
   device_kv_manager_ = std::make_unique<DeviceKVManager>(
     [](unsigned position, unsigned pending) {
       return nntrainer::get_htp_ops()->retain_decode_kv(
@@ -1220,9 +1232,29 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
         positions.push_back(entry.first);
     return positions;
   });
-  // skip_prefill reserves the last row for decode; the remaining prefill
-  // must enter the same multi-row graph as independent full recomputation.
-  device_kv_manager_->setMinimumSuffix(3);
+  device_kv_manager_->setPrefixCompatible(
+    [this](uint32_t handle, unsigned position, size_t input_rows) {
+      const auto &history = device_prefill_states_.at(handle);
+      if (!history || input_rows < 3 || input_rows > MAX_SEQ_LEN ||
+          REPETITION_PENALTY != 1.0f)
+        return false;
+      const unsigned end = static_cast<unsigned>(input_rows - 1);
+      const char *resume = std::getenv("NNTR_RESUME_BLOCK");
+      if (position > end || (resume && resume[0] == '0'))
+        return false;
+      const auto &frame = history->at(position);
+      const unsigned chunk = prefillDriveChunk();
+      if (frame.plane != INIT_SEQ_LEN || frame.chunk != chunk)
+        return false;
+      // Independent requests start at zero, and every admitted restore has
+      // already matched this same native call grid. The final partial call
+      // is valid only at its original endpoint.
+      const unsigned expected_from =
+        chunk ? (position - 1) / chunk * chunk : 0u;
+      const unsigned expected_to =
+        chunk ? std::min(end, expected_from + chunk) : end;
+      return frame.from == expected_from && position == expected_to;
+    });
 #else
   throw std::logic_error("HTP backend is unavailable");
 #endif
@@ -1677,41 +1709,41 @@ void CausalLM::registerCustomLayers() {
 }
 
 #ifdef ENABLE_HEXKL
-void CausalLM::captureDevicePrefill(unsigned position) {
-  if (!device_prefill_capture_ || position < 64u)
+void CausalLM::captureDevicePrefill(unsigned from, unsigned position,
+                                    unsigned earliest) {
+  if (!device_prefill_capture_ || position < std::max(64u, earliest) ||
+      REPETITION_PENALTY != 1.0f)
     return;
   if (!device_prefill_history_)
     device_prefill_history_ = std::make_shared<DevicePrefillHistory>();
-  unsigned first = device_prefill_history_->empty()
-                     ? 256u
-                     : device_prefill_history_->rbegin()->first + 256u;
-  first = std::max(first, (kv_cache.prefixMinPosition() + 255u) / 256u * 256u);
-  for (unsigned p = first; p <= position; p += 256u) {
-    DevicePrefillFrame frame;
-    model->forEachLayer(
-      [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
-        auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
-        auto *mha =
-          node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
-        if (mha)
-          frame.calibration.push_back(mha->capturePrefixCalibration(p));
-      },
-      nullptr);
-    if (frame.calibration.size() != kv_cache.getNumLayers())
-      throw std::logic_error("Incomplete Q2 prefix calibration");
-    const auto *previous =
-      device_prefill_history_->empty()
-        ? nullptr
-        : device_prefill_history_->rbegin()->second.kv.get();
-    frame.kv = kv_cache.capturePrefix(p, previous);
-    device_prefill_history_->emplace(p, std::move(frame));
-  }
+  kv_cache.setSharedRetain(
+    [](void *block) { return nntrainer::get_htp_ops()->retain_shared(block); });
+  DevicePrefillFrame frame;
+  frame.from = from;
+  frame.plane = INIT_SEQ_LEN;
+  frame.chunk = prefillDriveChunk();
+  model->forEachLayer(
+    [&](ml::train::Layer &layer, nntrainer::RunLayerContext &, void *) {
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&layer);
+      auto *mha =
+        node ? dynamic_cast<HtpMHACoreLayer *>(node->getLayer()) : nullptr;
+      if (mha)
+        frame.calibration.push_back(mha->capturePrefixCalibration());
+    },
+    nullptr);
+  if (frame.calibration.size() != kv_cache.getNumLayers())
+    throw std::logic_error("Incomplete original-call Q2 calibration");
+  const auto *previous = device_prefill_history_->empty()
+                           ? nullptr
+                           : device_prefill_history_->rbegin()->second.kv.get();
+  frame.kv = kv_cache.capturePrefix(position, previous);
+  device_prefill_history_->emplace(position, std::move(frame));
 }
 
 void CausalLM::restoreDevicePrefill(uint32_t handle, unsigned position) {
   const auto &saved = device_prefill_states_.at(handle);
   if (!saved || !saved->count(position))
-    throw std::invalid_argument("Unavailable causally calibrated prefix");
+    throw std::invalid_argument("Unavailable original-call prefix");
   // Fork metadata and shared immutable pages. No source state is shortened.
   auto history = std::make_shared<DevicePrefillHistory>(
     saved->begin(), saved->upper_bound(position));
@@ -1893,6 +1925,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto _input = tokenizer->Encode(
     prompt_, /*add_special_tokens=*/!(USE_KVCACHE && !SAVE_KVCACHE) &&
                !(htp_session_enabled_ && global_token_len != 0));
+  // Settle the original full-request plane BEFORE matching cached call shapes.
+  if (!kv_cache.isAllocated())
+    growPrefillPlane(static_cast<unsigned int>(_input.size()));
   size_t device_prefix_hit = 0;
   if (device_kv_manager_ && global_token_len == 0 && SYS_PROMP_LEN == 0) {
     device_prefix_hit = device_kv_manager_->reuse(
@@ -2057,6 +2092,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       end);
   }
 #endif
+
+  const bool can_publish_device_prefill = !resident_continuation;
 
   ///@todo currently, the whole sequence may not be fed into the model
   /// This should be handled later.
@@ -2405,6 +2442,32 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         return prefill_chunk;
     return 0u;
   }();
+  // Keep the last completed native block plus the final partial endpoint.
+  // Earlier sliding windows would need extra payload copies to survive later
+  // prefill compactions. Choose coarser reuse instead of adding those copies.
+  const unsigned native_prefill_end =
+    prefill_from + init_len -
+    (SKIP_PREFILL && (init_len > 1 || device_prefix_hit) ? 1u : 0u);
+  const unsigned earliest_device_prefix =
+    prefill_chunk ? native_prefill_end / prefill_chunk * prefill_chunk
+                  : native_prefill_end;
+  unsigned last_device_prefill_from = prefill_from;
+  auto prepare_single_prefill_row = [&](unsigned from) {
+    if (!htp_execution_profile_ || resident_continuation)
+      return;
+    // A native chunk can end in one M1 row. Configure its original window
+    // before that row seeds DSP KV, rather than after prefill has finished.
+    compactKVCache(from);
+    for (unsigned l = 0; l < kv_cache.getNumLayers(); ++l)
+      if (kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
+        const unsigned base = kv_cache.getBase(l);
+        const unsigned end = unlimited_generation ? MAX_SEQ_LEN
+                                                  : prefix_rows + text_len +
+                                                      reserved_for_generation;
+        htpDecodeKvWindow(end - base, base);
+        break;
+      }
+  };
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // [prefill-long] Tell the attention layers the whole key span this prefill
@@ -2436,12 +2499,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     const bool one_block_on_grid =
       ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
     if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid)) {
+      if (n_tok == 1)
+        prepare_single_prefill_row(from_pos);
       beforePrefillBlock(from_pos, from_pos + n_tok);
       auto result = incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                          from_pos + n_tok);
+      if (n_tok == 1 && htp_execution_profile_)
+        resident_continuation = true;
 #ifdef ENABLE_HEXKL
-      if (!resident_continuation)
-        captureDevicePrefill(from_pos + n_tok);
+      last_device_prefill_from = from_pos;
 #endif
       return result;
     }
@@ -2461,11 +2527,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       // a windowed (sliding) layer keeps its window in front of the chunk
       if (!resident_continuation)
         compactKVCache(cf);
+#ifdef ENABLE_HEXKL
+      if (!resident_continuation && o)
+        captureDevicePrefill(last_device_prefill_from, cf,
+                             earliest_device_prefix);
+#endif
+      if (clen == 1)
+        prepare_single_prefill_row(cf);
       beforePrefillBlock(cf, cf + clen);
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
+      if (clen == 1 && htp_execution_profile_)
+        resident_continuation = true;
 #ifdef ENABLE_HEXKL
-      if (!resident_continuation)
-        captureDevicePrefill(cf + clen);
+      last_device_prefill_from = cf;
 #endif
       if (o + clen < n_tok)
         for (auto &oo : so)
@@ -2481,7 +2555,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  decode loop. See ttft_ms in performance_metrics.h. */
   std::chrono::high_resolution_clock::time_point perf_split_first_out{};
 
-  const bool skipped_prefill_token = SKIP_PREFILL && init_len > 1;
+  const bool skipped_prefill_token =
+    SKIP_PREFILL && (init_len > 1 || device_prefix_hit != 0);
   if (skipped_prefill_token) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
@@ -2489,7 +2564,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       static_cast<unsigned int>(init_input[init_len - 1]);
 
     setKVCachePosition(prefill_from);
-    output = do_prefill(init_len - 1, prefill_from);
+    if (init_len > 1)
+      output = do_prefill(init_len - 1, prefill_from);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -2669,7 +2745,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // ponytail: one (rows, base) for all windowed layers -- they share one
   // window and one DSP cache; per-layer values if a model ever mixes them.
   if (!resident_continuation)
-    compactKVCache(input_len + global_token_len);
+    compactKVCache(input_len + global_token_len, false,
+                   device_prefill_capture_ && device_prefix_mode_ &&
+                     skipped_prefill_token);
+#ifdef ENABLE_HEXKL
+  if (!resident_continuation && skipped_prefill_token && init_len)
+    captureDevicePrefill(last_device_prefill_from, input_len + global_token_len,
+                         earliest_device_prefix);
+#endif
   for (unsigned int l = 0; l < kv_cache.getNumLayers(); ++l)
     if (!resident_continuation &&
         kv_cache.getRows(l) < kv_cache.getMaxSeqLen()) {
@@ -2742,7 +2825,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                     log_output);
     ++generation_cnt;
-    if (device_kv_manager_ && !resident_continuation &&
+    if (device_kv_manager_ && can_publish_device_prefill &&
         device_prefill_history_ && !device_prefill_history_->empty() &&
         token_generation_idx == generation_begin && skipped_prefill_token &&
         !device_run_tokens.empty() &&

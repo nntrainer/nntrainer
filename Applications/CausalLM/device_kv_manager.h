@@ -31,6 +31,7 @@ public:
   using Restore = std::function<void(uint32_t, unsigned)>;
   using PrefixMin = std::function<unsigned(uint32_t)>;
   using PrefixLengths = std::function<std::vector<unsigned>(uint32_t)>;
+  using PrefixCompatible = std::function<bool(uint32_t, unsigned, size_t)>;
   using Release = std::function<void(uint32_t)>;
   struct Session {
     uint32_t handle = 0;
@@ -63,6 +64,11 @@ public:
     if (!prefixes_.empty())
       throw std::logic_error("Set prefix boundaries before publication");
     prefix_lengths_ = std::move(lengths);
+  }
+  /** A token match must also preserve the backend's original call boundaries.
+   */
+  void setPrefixCompatible(PrefixCompatible compatible) {
+    prefix_compatible_ = std::move(compatible);
   }
   /** Prefill payload pins belong to the prefix LRU, not to decode sessions. */
   void setPrefixCapture(Capture capture) {
@@ -164,7 +170,10 @@ public:
                       tokens.begin() + offset))
         break;
       offset += node->edge.size();
-      if (node->terminal && minimum_suffix_ <= tokens.size() - offset) {
+      if (node->terminal && minimum_suffix_ <= tokens.size() - offset &&
+          (!prefix_compatible_ ||
+           prefix_compatible_(node->terminal, static_cast<unsigned>(offset),
+                              tokens.size()))) {
         best = node->terminal;
         best_count = offset;
       }
@@ -301,7 +310,7 @@ private:
       const auto &entry = p.second;
       if (prefix_lengths_) {
         for (unsigned count : prefix_lengths_(entry.handle)) {
-          if (count == 0 || count > entry.tokens.size() || count % 64u)
+          if (count == 0 || count > entry.tokens.size())
             throw std::logic_error("Invalid backend prefix boundary");
           insert(next, entry.tokens, count, p.first);
         }
@@ -331,6 +340,7 @@ private:
   std::function<void()> reset_;
   PrefixMin prefix_min_;
   PrefixLengths prefix_lengths_;
+  PrefixCompatible prefix_compatible_;
   size_t max_sessions_, max_prefixes_;
   size_t minimum_suffix_ = 1;
   uint32_t next_session_ = 1, active_ = 0;

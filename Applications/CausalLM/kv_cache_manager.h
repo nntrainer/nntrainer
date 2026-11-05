@@ -81,6 +81,10 @@ public:
    * @param release block release, e.g. ComputeOps::free_shared
    */
   void setSharedAllocator(SharedAlloc alloc, SharedFree release);
+  using SharedRetain = std::function<std::shared_ptr<void>(void *)>;
+  void setSharedRetain(SharedRetain retain) {
+    shared_retain_ = std::move(retain);
+  }
 
   /**
    * @brief Whether at least one slab came from the shared allocator.
@@ -166,12 +170,39 @@ public:
    * @return true when a base changed
    */
   bool compact(unsigned int pos);
+  /** Read-only final host window; the next step must transfer KV to decode. */
+  void prepareDecodeView(unsigned int pos);
+  unsigned getDecodeOffset(unsigned layer) const {
+    return layer < decode_offsets_.size() ? decode_offsets_[layer] : 0u;
+  }
 
   /** Immutable host prefill pages. Unlike decode INT8 pages these preserve
    * the precision needed to resume an HMX prefill block. Batch one only. */
   struct PrefixSnapshot {
     struct Page {
       std::vector<unsigned char> key, value;
+      const unsigned char *key_view = nullptr, *value_view = nullptr;
+      size_t view_bytes = 0, slab_bytes = 0;
+      std::shared_ptr<void> key_owner, value_owner;
+      const unsigned char *keyData() const {
+        return key_view ? key_view : key.data();
+      }
+      const unsigned char *valueData() const {
+        return value_view ? value_view : value.data();
+      }
+      size_t keySize() const { return key_view ? view_bytes : key.size(); }
+      size_t valueSize() const {
+        return value_view ? view_bytes : value.size();
+      }
+      void freeze() {
+        if (!key_view)
+          return;
+        key.assign(key_view, key_view + view_bytes);
+        value.assign(value_view, value_view + view_bytes);
+        key_view = value_view = nullptr;
+        key_owner.reset();
+        value_owner.reset();
+      }
     };
     struct Layer {
       unsigned base = 0, width = 0;
@@ -573,6 +604,11 @@ private:
    */
   void releaseShared();
 
+  void freezePrefixViews(unsigned layer);
+  std::vector<unsigned> decode_offsets_;
+  SharedRetain shared_retain_;
+  mutable std::vector<std::vector<std::weak_ptr<PrefixSnapshot::Page>>>
+    prefix_views_;
   SharedAlloc shared_alloc_;          /**< see setSharedAllocator */
   SharedFree shared_free_;            /**< see setSharedAllocator */
   std::vector<void *> shared_blocks_; /**< blocks owned via shared_alloc_ */

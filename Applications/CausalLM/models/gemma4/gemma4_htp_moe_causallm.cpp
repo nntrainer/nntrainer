@@ -101,11 +101,12 @@ void Gemma4HtpMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   htp_session_enabled_ = runtime_config.htp.kv_session;
   device_prefix_mode_ = runtime_config.htp.kv_prefix_cache;
   if (device_prefix_mode_ &&
-      (BATCH_SIZE != 1 || !SKIP_PREFILL || INIT_SEQ_LEN < 256 ||
-       INIT_SEQ_LEN % 256 || ATTENTION_KV_DTYPE != "q8"))
-    throw std::invalid_argument(
-      "Gemma4 radix prefill requires batch one, "
-      "skip_prefill, q8 attention and a 256-row-aligned prefill plane");
+      (BATCH_SIZE != 1 || !SKIP_PREFILL || INIT_SEQ_LEN < 64 ||
+       INIT_SEQ_LEN % 64 || ATTENTION_KV_DTYPE != "q8" ||
+       !runtime_config.htp.attn_q2 || !runtime_config.htp.oproj_u16))
+    throw std::invalid_argument("Gemma4 radix prefill requires batch one, "
+                                "skip_prefill, original q8/Q2 U16 attention "
+                                "and a 64-row-aligned prefill plane");
   if (device_prefix_mode_)
     for (unsigned l = 0; l < NUM_LAYERS; ++l) {
       const auto kv_heads = getKVHeadCount(l);

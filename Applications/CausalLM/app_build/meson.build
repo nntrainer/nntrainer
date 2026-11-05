@@ -451,6 +451,7 @@ if get_option('enable-htp-device-check')
     'htp_sessions_check': 'tools/kv_cache/check_htp_sessions.cpp',
     'htp_prefill_check': 'test/htp/host/prefill_prefix_check.cpp',
     'htp_calibration_check': 'test/htp/host/attention_calibration_check.cpp',
+    'htp_prefix_cold_bench': 'tools/kv_cache/benchmark_htp_prefix_cold.cpp',
   }
     executable(check_name,
         nntrainer_root / check_source,

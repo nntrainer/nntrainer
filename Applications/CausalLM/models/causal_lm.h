@@ -94,6 +94,7 @@ public:
 protected:
   bool htp_execution_profile_ = false;
   struct DevicePrefillFrame {
+    unsigned from = 0, plane = 0, chunk = 0;
     std::shared_ptr<const KVCacheManager::PrefixSnapshot> kv;
     std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
       calibration;
@@ -113,7 +114,8 @@ protected:
   std::vector<unsigned int> htp_pending_tokens_;
   std::vector<unsigned int> last_generated_ids_;
 #ifdef ENABLE_HEXKL
-  void captureDevicePrefill(unsigned position);
+  void captureDevicePrefill(unsigned from, unsigned position,
+                            unsigned earliest);
   void restoreDevicePrefill(uint32_t handle, unsigned position);
   /** Start an independent request; continuation steps must not call this. */
   void beginIndependentHtpPrompt(
@@ -553,7 +555,8 @@ protected:
    * @param[in] pos absolute position of the next row
    * @param[in] force hand the bases over even when none moved (after a load)
    */
-  void compactKVCache(unsigned int pos, bool force = false);
+  void compactKVCache(unsigned int pos, bool force = false,
+                      bool decode_view = false);
 
   /**
    * @brief Per-layer KV geometry, read from the model's hooks.

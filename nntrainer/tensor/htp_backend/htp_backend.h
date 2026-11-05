@@ -27,7 +27,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -96,6 +98,9 @@ public:
    */
   void free_shared(void *block);
 
+  /** Retain an immutable view after the tensor owner releases its slab. */
+  std::shared_ptr<void> retain_shared(void *block);
+
   /**
    * @brief Frees a block from alloc_shared() before its owner does
    *        (the prefill's KV cache once the DSP holds the rows); the owner's
@@ -129,8 +134,8 @@ private:
   HtpBackend();
 
   bool enabled_ = false;
-  std::mutex shared_mu_;               /**< guards the two sets */
-  std::unordered_set<void *> shared_;  /**< live alloc_shared blocks */
+  std::mutex shared_mu_; /**< guards the two sets */
+  std::unordered_map<void *, std::shared_ptr<void>> shared_; /**< live blocks */
   std::unordered_set<void *> dropped_; /**< drop_shared()'s, till freed */
   uint64_t handle_ = 0; ///< remote_handle64 from nntr_hvx_open; opaque here
                         ///< so this header does not need <remote.h>.

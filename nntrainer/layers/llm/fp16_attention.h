@@ -189,6 +189,9 @@ public:
    *        only row numbers subtract the base.
    */
   WIN_EXPORT void setCacheBase(unsigned int base);
+  /** Physical row offset of the read-only final host window used to seed DSP.
+   */
+  void setDecodeCacheOffset(unsigned offset) { decode_cache_offset_ = offset; }
 
   /**
    * @brief |max| per column (kv head x head_dim) of the K
@@ -226,7 +229,7 @@ public:
   /** Discard mirrors from the previous independent HTP prompt. */
   WIN_EXPORT void beginHtpPrompt();
   WIN_EXPORT std::shared_ptr<const HtpPrefixCalibration>
-  capturePrefixCalibration(unsigned position = 0) const;
+  capturePrefixCalibration() const;
   WIN_EXPORT void restorePrefixCalibration(const HtpPrefixCalibration &state);
 
 private:
@@ -266,6 +269,7 @@ private:
   bool skip_prefill = false;
 
   std::unique_ptr<HtpAttentionState> state_;
+  unsigned decode_cache_offset_ = 0;
 
   enum INOUT_INDEX {
     /** input index */

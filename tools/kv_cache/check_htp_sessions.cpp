@@ -173,11 +173,12 @@ int main(int argc, char **argv) {
       auto result = run(text, true);
       const auto after = c->deviceKVManagerStats();
       const bool reusable =
-        model->getTokenizer()->Encode(prompts[i], true).size() > 256u;
+        model->getTokenizer()->Encode(prompts[i], true).size() - 1 >=
+        nc.at("init_seq_len").get<unsigned>();
       require(after.hits == before.hits + (reusable ? 1u : 0u) &&
                 (reusable ? after.reused_tokens > before.reused_tokens
                           : after.reused_tokens == before.reused_tokens),
-              "Unexpected quantization-safe prefix hit/miss");
+              "Unexpected original-call prefix hit/miss");
       require(result["ids"] == prefix_refs[i]["ids"] &&
                 result["position"] == prefix_refs[i]["position"],
               "Prefix output or position differs from fresh full history");

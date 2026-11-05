@@ -144,6 +144,24 @@ int main(int argc, char **argv) {
     require(source_result["ids"] == report["source_reference"]["ids"],
             "Source reference changed");
     const auto source_fork = c->forkDeviceKVSession();
+    const auto repeat_session = c->createDeviceKVSession();
+    c->selectDeviceKVSession(repeat_session);
+    const auto repeat_before = c->deviceKVManagerStats();
+    report["source_repeat"] = run(source, false);
+    report["source_repeat"]["reused_tokens"] =
+      c->deviceKVManagerStats().reused_tokens - repeat_before.reused_tokens;
+    require(report["source_repeat"]["ids"] ==
+                report["source_reference"]["ids"] &&
+              report["source_repeat"]["position"] ==
+                report["source_reference"]["position"],
+            "Repeated source differs from original whole-call inference");
+    const unsigned source_end = static_cast<unsigned>(source_ids.size() - 1);
+    const unsigned plane = nc.at("init_seq_len");
+    const unsigned repeated_hit =
+      source_end % plane == 1 ? source_end - 1 : source_end;
+    require(report["source_repeat"]["reused_tokens"].get<unsigned>() ==
+              repeated_hit,
+            "Original prefill endpoint was not reused");
     bool fresh_ids_equal = true;
     bool quality_checks_passed = true;
     for (size_t i = 0; i < branches.size(); ++i) {
@@ -152,9 +170,19 @@ int main(int argc, char **argv) {
       const auto before = c->deviceKVManagerStats();
       const auto input_tokens =
         model->getTokenizer()->Encode(branches[i], true).size();
-      unsigned expected_hit = common / 256u * 256u;
-      while (expected_hit && input_tokens - expected_hit < 3u)
-        expected_hit -= 256u;
+      // Fixtures use the unchanged 4096-row original prefill plane.
+      unsigned expected_hit = 0;
+      const unsigned plane = nc.at("init_seq_len");
+      const unsigned target_end = static_cast<unsigned>(input_tokens - 1);
+      const unsigned source_end = static_cast<unsigned>(source_ids.size() - 1);
+      const unsigned last_full = source_end / plane * plane;
+      for (unsigned to : {last_full, source_end}) {
+        if (to < 64 || to > common || to > target_end)
+          continue;
+        const unsigned call_from = (to - 1) / plane * plane;
+        if (to == std::min(target_end, call_from + plane))
+          expected_hit = std::max(expected_hit, to);
+      }
       auto result = run(branches[i], false);
       const auto after = c->deviceKVManagerStats();
       result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
@@ -164,7 +192,7 @@ int main(int argc, char **argv) {
       const auto suffix_tokens =
         model->getTokenizer()->Encode(branches[i], true).size() - expected_hit;
       const unsigned last_prompt_decode =
-        nc.value("skip_prefill", false) && suffix_tokens > 1 ? 1u : 0u;
+        nc.value("skip_prefill", false) ? 1u : 0u;
       result["processed_suffix_tokens"] =
         result["prefill_tokens"].get<unsigned>() + last_prompt_decode;
       require(result["processed_suffix_tokens"].get<size_t>() == suffix_tokens,

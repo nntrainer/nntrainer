@@ -1258,9 +1258,8 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
                               int gammaLen, const uint32 *w_handles,
                               int w_handlesLen, const float *act_f32,
                               const uint16 *act_u16, const float *act_enc,
-                              uint32 act_hd, uint32 enc_rows, int actLen,
-                              const float *res, int resLen, float *out_f32,
-                              int out_f32Len) {
+                              uint32 act_hd, int actLen, const float *res,
+                              int resLen, float *out_f32, int out_f32Len) {
   if (!s || w_handlesLen <= 0 || M == 0u || K == 0u) {
     return AEE_EBADPARM;
   }
@@ -1270,17 +1269,12 @@ static int layer_res_add_impl(nntr_hvx_session *s, uint32 M, uint32 K,
     return AEE_EBADPARM;
   }
   const uint32_t N = (uint32_t)resLen / M;
-  for (uint32_t m0 = 0, m = 0; m0 < M; m0 += m) {
-    m = M - m0 < step ? M - m0 : step;
-    if (enc_rows && m > enc_rows - m0 % enc_rows)
-      m = enc_rows - m0 % enc_rows;
-    const float *encoding = act_enc;
-    if (enc_rows)
-      encoding += (size_t)(m0 / enc_rows) * 2u * (K / act_hd);
+  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+    const uint32_t m = M - m0 < step ? M - m0 : step;
     const int rc = layer_res_add_chunk(
       s, m, K, eps, scale, gamma, gammaLen, w_handles, w_handlesLen,
       act_f32 ? act_f32 + (size_t)m0 * K : NULL,
-      act_u16 ? act_u16 + (size_t)m0 * K : NULL, encoding, act_hd, (int)(m * K),
+      act_u16 ? act_u16 + (size_t)m0 * K : NULL, act_enc, act_hd, (int)(m * K),
       res + (size_t)m0 * N, (int)(m * N), out_f32 + (size_t)m0 * N,
       (int)(m * N));
     if (rc != AEE_SUCCESS) {
@@ -1298,7 +1292,7 @@ int nntr_hvx_mm_u8i4_layer_res_add(remote_handle64 handle, uint32 M, uint32 K,
                                    float *out_f32, int out_f32Len) {
   return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
                             gammaLen, w_handles, w_handlesLen, act_f32, NULL,
-                            NULL, 0u, 0u, act_f32Len, res, resLen, out_f32,
+                            NULL, 0u, act_f32Len, res, resLen, out_f32,
                             out_f32Len);
 }
 
@@ -1307,20 +1301,16 @@ int nntr_hvx_mm_u8i4_layer_res_add_u16(
   const float *gamma, int gammaLen, const uint32 *w_handles, int w_handlesLen,
   const uint16 *act_u16, int act_u16Len, const float *act_enc, int act_encLen,
   uint32 act_hd, const float *res, int resLen, float *out_f32, int out_f32Len) {
-  const uint32_t per_encoding = act_hd ? 2u * (K / act_hd) : 0u;
-  const uint32_t pages = M / 256u + (M % 256u != 0u);
-  if (act_hd == 0u || K % act_hd != 0u || act_encLen < 0 ||
-      ((uint32_t)act_encLen != per_encoding &&
-       (uint64_t)act_encLen != (uint64_t)pages * per_encoding)) {
+  if (act_hd == 0u || K % act_hd != 0u ||
+      (uint32_t)act_encLen != 2u * (K / act_hd)) {
     FARF(ERROR, "mm_u8i4_layer_res_add_u16: act_hd %u of K %u, enc %d",
          (unsigned)act_hd, (unsigned)K, act_encLen);
     return AEE_EBADPARM;
   }
   return layer_res_add_impl((nntr_hvx_session *)handle, M, K, eps, scale, gamma,
                             gammaLen, w_handles, w_handlesLen, NULL, act_u16,
-                            act_enc, act_hd,
-                            (uint32_t)act_encLen == per_encoding ? 0u : 256u,
-                            act_u16Len, res, resLen, out_f32, out_f32Len);
+                            act_enc, act_hd, act_u16Len, res, resLen, out_f32,
+                            out_f32Len);
 }
 
 /** @brief The activation rows normed into the session's scratch (grown to

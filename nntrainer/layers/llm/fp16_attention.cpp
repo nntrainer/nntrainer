@@ -1806,13 +1806,17 @@ void Fp16Attention::registerQuantizedCache(RunLayerContext &context) {
       : context.getTensor(tensor_idx[AttentionParams::cache_key]);
   state_->registerQuantizedCache(key.height());
 }
-void Fp16Attention::beginHtpPrompt() { state_->beginHtpPrompt(); }
+void Fp16Attention::beginHtpPrompt() {
+  decode_cache_offset_ = 0;
+  state_->beginHtpPrompt();
+}
 std::shared_ptr<const HtpPrefixCalibration>
-Fp16Attention::capturePrefixCalibration(unsigned position) const {
-  return state_->capturePrefixCalibration(position);
+Fp16Attention::capturePrefixCalibration() const {
+  return state_->capturePrefixCalibration();
 }
 void Fp16Attention::restorePrefixCalibration(
   const HtpPrefixCalibration &state) {
+  decode_cache_offset_ = 0;
   state_->restorePrefixCalibration(state);
 }
 void Fp16Attention::setCacheIndex(unsigned int index) {
@@ -1862,6 +1866,24 @@ bool Fp16Attention::htpDecodeAttention(RunLayerContext &context,
   auto &cv = use_external_cache
                ? context.getInput(4)
                : context.getTensor(tensor_idx[AttentionParams::cache_value]);
+  if (decode_cache_offset_) {
+    auto dim = ck.getDim();
+    NNTR_THROW_IF(decode_cache_offset_ >= dim.height(), std::out_of_range)
+      << "HTP decode KV view exceeds host capacity";
+    dim.height(dim.height() - decode_cache_offset_);
+    const size_t offset = size_t(decode_cache_offset_) * dim.width();
+    auto key = ck.getSharedDataTensor(dim, offset, true);
+    auto value = cv.getSharedDataTensor(dim, offset, true);
+    const bool seeded = state_->htpDecodeAttention(
+      context.getInput(QUERY), context.getInput(KEY), context.getInput(VALUE),
+      context.getOutput(OUTPUT), key, value, pos, make_rope);
+    NNTR_THROW_IF(!seeded, std::runtime_error)
+      << "Read-only host KV view requires resident DSP decode";
+    // The DSP owns the history from here on. Later tokens use the ordinary
+    // decode entry without constructing host views again.
+    decode_cache_offset_ = 0;
+    return true;
+  }
   return state_->htpDecodeAttention(
     context.getInput(QUERY), context.getInput(KEY), context.getInput(VALUE),
     context.getOutput(OUTPUT), ck, cv, pos, make_rope);

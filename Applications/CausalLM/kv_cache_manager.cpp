@@ -93,6 +93,9 @@ KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
     dropped_amax_v_ = std::move(other.dropped_amax_v_);
     dtype_ = other.dtype_;
     format_ = other.format_;
+    shared_retain_ = std::move(other.shared_retain_);
+    prefix_views_ = std::move(other.prefix_views_);
+    decode_offsets_ = std::move(other.decode_offsets_);
     shared_alloc_ = std::move(other.shared_alloc_);
     shared_free_ = std::move(other.shared_free_);
     shared_blocks_ = std::move(other.shared_blocks_);
@@ -186,6 +189,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // capacity goes through the same per-layer cap the ring uses.
   keep_.assign(num_layers, 0u);
   bases_.assign(num_layers, 0u);
+  decode_offsets_.assign(num_layers, 0u);
   dropped_amax_k_.assign(num_layers, {});
   dropped_amax_v_.assign(num_layers, {});
   if (!rows.empty()) {
@@ -658,10 +662,13 @@ void KVCacheManager::advance(unsigned int step_size) {
 }
 
 void KVCacheManager::reset() {
+  for (unsigned l = 0; l < prefix_views_.size(); ++l)
+    freezePrefixViews(l);
   if (core_shared_)
     core_shared_->reset();
   cache_pos_ = 0;
   bases_.assign(bases_.size(), 0u);
+  decode_offsets_.assign(bases_.size(), 0u);
   for (auto *v : {&dropped_amax_k_, &dropped_amax_v_})
     for (auto &a : *v)
       a.clear();
@@ -727,40 +734,59 @@ void KVCacheManager::validateSaveRange(unsigned int seq_len) const {
 std::shared_ptr<const KVCacheManager::PrefixSnapshot>
 KVCacheManager::capturePrefix(unsigned position,
                               const PrefixSnapshot *previous) const {
-  if (!isAllocated() || batch_size_ != 1 || position == 0 || position % 64u ||
+  if (!isAllocated() || batch_size_ != 1 || position == 0 ||
       position > max_seq_len_ || position > cache_pos_)
-    throw std::invalid_argument("Prefill prefix requires a full 64-row page");
+    throw std::invalid_argument(
+      "Prefill prefix requires an available original-call endpoint");
   auto state = std::make_shared<PrefixSnapshot>();
   state->position = position;
   state->element_bytes =
     layer_caches_.front().key_cache.getDim().getDataTypeSize();
   state->layers.resize(layer_caches_.size());
+  prefix_views_.resize(layer_caches_.size());
   for (unsigned l = 0; l < state->layers.size(); ++l) {
     auto &dst = state->layers[l];
     dst.base = getBase(l);
     dst.width = kv_widths_[l];
-    if (dst.base % 64u || position < dst.base ||
-        position - dst.base > getLayerCap(l) || !isLayerActive(l))
+    if (position < dst.base ||
+        position - dst.base + getDecodeOffset(l) > getLayerCap(l) ||
+        !isLayerActive(l))
       throw std::invalid_argument("Prefill prefix has an unavailable layer");
     dst.dropped_k = droppedAmaxK(l);
     dst.dropped_v = droppedAmaxV(l);
-    const size_t page_bytes = 64u * dst.width * state->element_bytes;
     const auto &src = layer_caches_[l];
+    auto *k = src.key_cache.getData<unsigned char>();
+    auto *v = src.value_cache.getData<unsigned char>();
+    const auto key_owner = shared_retain_ ? shared_retain_(k) : nullptr;
+    const auto value_owner = shared_retain_ ? shared_retain_(v) : nullptr;
     for (unsigned p = dst.base; p < position; p += 64u) {
       if (previous && l < previous->layers.size() &&
           previous->element_bytes == state->element_bytes &&
           previous->layers[l].width == dst.width &&
-          p >= previous->layers[l].base && p < previous->position) {
+          p >= previous->layers[l].base &&
+          (p - previous->layers[l].base) % 64u == 0 &&
+          p + 64u <= previous->position) {
         dst.pages.push_back(
           previous->layers[l].pages.at((p - previous->layers[l].base) / 64u));
       } else {
         auto page = std::make_shared<PrefixSnapshot::Page>();
-        const size_t off =
-          size_t(p - dst.base) * dst.width * state->element_bytes;
-        const auto *k = src.key_cache.getData<unsigned char>();
-        const auto *v = src.value_cache.getData<unsigned char>();
-        page->key.assign(k + off, k + off + page_bytes);
-        page->value.assign(v + off, v + off + page_bytes);
+        const size_t page_bytes =
+          std::min(64u, position - p) * dst.width * state->element_bytes;
+        const size_t off = size_t(p - dst.base + getDecodeOffset(l)) *
+                           dst.width * state->element_bytes;
+        if (key_owner && value_owner) {
+          page->key_view = k + off;
+          page->value_view = v + off;
+          page->view_bytes = page_bytes;
+          page->slab_bytes =
+            size_t(getLayerCap(l)) * dst.width * state->element_bytes;
+          page->key_owner = key_owner;
+          page->value_owner = value_owner;
+          prefix_views_[l].push_back(page);
+        } else {
+          page->key.assign(k + off, k + off + page_bytes);
+          page->value.assign(v + off, v + off + page_bytes);
+        }
         dst.pages.push_back(std::move(page));
       }
     }
@@ -770,7 +796,7 @@ KVCacheManager::capturePrefix(unsigned position,
 
 void KVCacheManager::restorePrefix(const PrefixSnapshot &state) {
   if (!isAllocated() || batch_size_ != 1 || !state.position ||
-      state.position % 64u || state.position > max_seq_len_ ||
+      state.position > max_seq_len_ ||
       state.layers.size() != layer_caches_.size() ||
       state.element_bytes !=
         layer_caches_.front().key_cache.getDim().getDataTypeSize())
@@ -780,38 +806,81 @@ void KVCacheManager::restorePrefix(const PrefixSnapshot &state) {
   auto dropped_k = dropped_amax_k_, dropped_v = dropped_amax_v_;
   for (unsigned l = 0; l < state.layers.size(); ++l) {
     const auto &src = state.layers[l];
-    if (src.base % 64u || src.base > state.position ||
+    if (src.base > state.position ||
         state.position - src.base > getLayerCap(l) ||
         src.width != kv_widths_[l] ||
-        src.pages.size() != (state.position - src.base) / 64u)
+        src.pages.size() != (state.position - src.base + 63u) / 64u)
       throw std::invalid_argument("Incompatible prefill prefix layer");
-    const size_t bytes = 64u * src.width * state.element_bytes;
-    for (const auto &page : src.pages)
-      if (!page || page->key.size() != bytes || page->value.size() != bytes)
+    unsigned row = src.base;
+    for (const auto &page : src.pages) {
+      const size_t bytes =
+        std::min(64u, state.position - row) * src.width * state.element_bytes;
+      if (!page || page->keySize() != bytes || page->valueSize() != bytes)
         throw std::invalid_argument("Incomplete prefill prefix page");
+      row += std::min(64u, state.position - row);
+    }
     bases[l] = src.base;
     dropped_k[l] = src.dropped_k;
     dropped_v[l] = src.dropped_v;
   }
+  for (unsigned l = 0; l < state.layers.size(); ++l)
+    freezePrefixViews(l);
   for (unsigned l = 0; l < state.layers.size(); ++l) {
     auto *k = layer_caches_[l].key_cache.getData<unsigned char>();
     auto *v = layer_caches_[l].value_cache.getData<unsigned char>();
     for (const auto &page : state.layers[l].pages) {
-      std::memcpy(k, page->key.data(), page->key.size());
-      std::memcpy(v, page->value.data(), page->value.size());
-      k += page->key.size();
-      v += page->value.size();
+      std::memcpy(k, page->keyData(), page->keySize());
+      std::memcpy(v, page->valueData(), page->valueSize());
+      k += page->keySize();
+      v += page->valueSize();
     }
   }
   bases_.swap(bases);
   dropped_amax_k_.swap(dropped_k);
   dropped_amax_v_.swap(dropped_v);
   cache_pos_ = state.position;
+  decode_offsets_.assign(bases_.size(), 0u);
+}
+
+void KVCacheManager::freezePrefixViews(unsigned layer) {
+  if (layer >= prefix_views_.size())
+    return;
+  for (auto &weak : prefix_views_[layer])
+    if (auto page = weak.lock())
+      page->freeze();
+  prefix_views_[layer].clear();
+}
+
+void KVCacheManager::prepareDecodeView(unsigned int pos) {
+  if (!isAllocated() || batch_size_ != 1)
+    throw std::logic_error("Decode views require allocated batch-one KV");
+  validateRange(pos, true);
+  for (unsigned l = 0; l < layer_caches_.size(); ++l)
+    if (getDecodeOffset(l))
+      throw std::logic_error("Host KV is already a read-only decode view");
+  decode_offsets_.assign(layer_caches_.size(), 0u);
+  for (unsigned l = 0; l < layer_caches_.size(); ++l) {
+    if (!isLayerActive(l) || !windowed(l) || isLayerKVAliased(l))
+      continue;
+    const unsigned from = liveFrom(l, pos);
+    if (from <= bases_[l])
+      continue;
+    const unsigned skip = from - bases_[l];
+    // Identical dropped-row maxima and logical window as compact(), while
+    // preserving the shared prefill bytes for radix snapshots.
+    foldDroppedRows(l, skip);
+    decode_offsets_[l] = skip;
+    bases_[l] = from;
+  }
 }
 
 bool KVCacheManager::compact(unsigned int pos) {
   if (!isAllocated())
     return false;
+  for (unsigned l = 0; l < layer_caches_.size(); ++l)
+    if (getDecodeOffset(l))
+      throw std::logic_error(
+        "Restore or reset the read-only decode view before prefill");
   // Validate every layer before folding dropped rows or moving any buffer.
   validateRange(pos, true);
   bool changed = false;
@@ -821,6 +890,9 @@ bool KVCacheManager::compact(unsigned int pos) {
     const unsigned int from = liveFrom(l, pos);
     if (from <= bases_[l])
       continue;
+    // A later sliding compaction may overwrite an immutable borrowed prefix.
+    // Materialize only that layer's live pinned pages before the original move.
+    freezePrefixViews(l);
     const size_t w = kv_widths_[l];
     const unsigned int rows = getLayerCap(l);
     const size_t skip = (from - bases_[l]) * w, live = (pos - from) * w;

@@ -71,6 +71,27 @@ int main() {
   }
   assert(live.empty());
   {
+    Manager m(
+      [&](unsigned, unsigned) {
+        live.insert(next);
+        return next++;
+      },
+      [](uint32_t, unsigned) {}, [&](uint32_t id) { assert(live.erase(id)); },
+      [] {}, 2, 2);
+    m.setPrefixLengths([](uint32_t) { return std::vector<unsigned>{64, 95}; });
+    m.setPrefixCompatible([](uint32_t, unsigned p, size_t n) {
+      return p == 64 ? n > 96 : n == 96;
+    });
+    Manager::Tokens tokens(96, 7);
+    m.publish(tokens, 96, 9);
+    assert(m.reuse(tokens) == 95);
+    tokens.resize(100, 7);
+    assert(m.reuse(tokens) == 64); // reject longer token-only match
+    tokens.resize(80);
+    assert(m.reuse(tokens) == 0); // incompatible shorter call must miss
+  }
+  assert(live.empty());
+  {
     unsigned selected = 0;
     Manager m(
       [&](unsigned, unsigned) {

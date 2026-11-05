@@ -1408,9 +1408,7 @@ interface nntr_hvx : remote_handle64 {
    // mm_u8i4_layer_res_add over the attention's u16 output: act_u16 is
    // M x K with a (scale, zero point) per head of act_hd columns in act_enc
    // (the attention's out_enc), dequantized inside the quant pass (the
-   // CPU's dequant_u16_f32), so the f32 context never exists. act_enc is
-   // either one encoding for all M rows, or ceil(M/256) encodings, one
-   // per causal attention slice. The latter retains a single wide RPC.
+   // CPU's dequant_u16_f32), so the f32 context never exists.
    AEEResult mm_u8i4_layer_res_add_u16(in uint32 M, in uint32 K, in float eps,
                                        in float scale, in sequence<float> gamma,
                                        in sequence<uint32> w_handles,

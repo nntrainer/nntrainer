@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1226,6 +1227,13 @@ public:
    */
   virtual void free_shared(void *block) { (void)block; }
 
+  /** Pin a shared slab for immutable KV prefix views; default is unsupported.
+   */
+  virtual std::shared_ptr<void> retain_shared(void *block) {
+    (void)block;
+    return {};
+  }
+
   /**
    * @brief [#289] Frees an alloc_shared() block before its owner does; the
    *        owner's free_shared() of it is then a no-op. Not a live block:
@@ -1341,18 +1349,18 @@ public:
     (void)out_stride;
     return false;
   }
-  /** Preserve encoded attention slices for the existing folded O projection. */
-  virtual bool collect_attention_slice(float *output, unsigned full_rows,
-                                       unsigned row, unsigned rows,
-                                       unsigned width) {
-    (void)output;
-    (void)full_rows;
-    (void)row;
-    (void)rows;
-    (void)width;
-    return false;
-  }
-
+  /**
+   * @brief sdpa_q2_kvcache with f32 Q and the output left on the
+   *        accelerator: Q is quantized there (quant_u16_f32 with q_inv[h]
+   *        = 1 / q_enc[2h], the same u16) and the u16 context stays in the
+   *        accelerator's buffer for the o-proj that follows
+   *        (gemm_qs4cx_res_add_fp32 with @a out as its activation reads it
+   *        from there and dequantizes it on the way in). @a out is NOT
+   *        written: the caller must know the o-proj runs on this engine.
+   *        @a out_u16_copy, when given, receives the u16 context (n_q x
+   *        out_stride) for a host check. false = not available, the caller
+   *        converts.
+   */
   /**
    * @brief [P2] sdpa_q2_kvcache_f32 with the layer's calibration folded
    *        in: the accelerator scans this step's fp16 K / V rows and f32 Q
@@ -1379,18 +1387,6 @@ public:
     return false;
   }
 
-  /**
-   * @brief sdpa_q2_kvcache with f32 Q and the output left on the
-   *        accelerator: Q is quantized there (quant_u16_f32 with q_inv[h]
-   *        = 1 / q_enc[2h], the same u16) and the u16 context stays in the
-   *        accelerator's buffer for the o-proj that follows
-   *        (gemm_qs4cx_res_add_fp32 with @a out as its activation reads it
-   *        from there and dequantizes it on the way in). @a out is NOT
-   *        written: the caller must know the o-proj runs on this engine.
-   *        @a out_u16_copy, when given, receives the u16 context (n_q x
-   *        out_stride) for a host check. false = not available, the caller
-   *        converts.
-   */
   virtual bool sdpa_q2_kvcache_f32(
     int handle, unsigned int append_row0, unsigned int append_rows,
     unsigned int kv_stride, const uint16_t *k_rows, const uint16_t *v_rows,
