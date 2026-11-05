@@ -43,6 +43,45 @@ namespace nntrainer {
 class Tensor;
 
 /**
+ * @brief A rotary-embedding cos/sin table, laid out the way the
+ *        rotary_embedding() op reads it.
+ *
+ * Row p holds, for absolute position p, the cos (and sin) of the head_dim / 2
+ * rotation angles, row-major: row p starts at cos + p * half. Rotate-half
+ * pairs element i of a head with element i + half, so one half-width row
+ * serves both members of every pair.
+ *
+ * The pointers belong to the caller and must stay valid and unchanged for
+ * the table's life: a device backend may cache its upload of a table by
+ * pointer.
+ */
+struct RotaryTable {
+  const float *cos = nullptr; /**< [positions, half] fp32 cos */
+  const float *sin = nullptr; /**< [positions, half] fp32 sin */
+  /** [positions, half] fp16-bit cos / sin, read for an FP16 input */
+  const uint16_t *cos_fp16 = nullptr;
+  const uint16_t *sin_fp16 = nullptr;
+  unsigned int positions = 0; /**< number of rows */
+  unsigned int half = 0;      /**< head_dim / 2 */
+};
+
+/**
+ * @brief One batch's KV cache, as the kv_cache_write() op sees it.
+ *
+ * key and value are the batch's whole cache planes, [1, 1, rows, width]. A
+ * null plane is not written: its rows were written by the caller (a device
+ * arm, or the OHWI scatter of K) until those writers move behind the op.
+ */
+struct KVCacheView {
+  Tensor *key = nullptr;   /**< K plane, or null */
+  Tensor *value = nullptr; /**< V plane, or null */
+  unsigned int head_dim = 0;
+  /** 0 for a linear cache; otherwise absolute row n is stored at row
+   *  n % ring_cap and the cache holds ring_cap rows */
+  unsigned int ring_cap = 0;
+};
+
+/**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
  */
@@ -582,6 +621,52 @@ public:
    *        gamma).
    */
   virtual void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon);
+
+  /**
+   * @brief Rotary position embedding, rotate-half layout.
+   *
+   * Every row of @p in (batch, channel and height flattened) is a sequence of
+   * head_dim-wide heads; height index h is the token at absolute position
+   * start_pos + h. Each head's element pairs (i, i + head_dim / 2) are rotated
+   * by row (start_pos + h) of @p table and written to the same place in
+   * @p out:
+   *   out[i]        = x[i] * cos - x[i + half] * sin
+   *   out[i + half] = x[i] * sin + x[i + half] * cos
+   *
+   * An FP32 @p in reads the fp32 table. @p out is then FP32 (and may alias
+   * @p in) or FP16 / UINT16 holding fp16 bits, which is how a layer writes
+   * rotated keys straight into an fp16 KV cache. With @p rotate false the op
+   * only copies, or converts to fp16, without rotating -- the value side of
+   * that cache write.
+   *
+   * An FP16 @p in (enable-fp16 builds) reads the fp16 table and writes an
+   * FP16 @p out, which may alias @p in. It always rotates.
+   *
+   * @throws std::invalid_argument when a row's position falls outside the
+   *         table, or for a dtype combination the backend does not handle.
+   */
+  virtual void rotary_embedding(const Tensor &in, Tensor &out,
+                                unsigned int head_dim, const RotaryTable &table,
+                                unsigned int start_pos, bool rotate);
+
+  /**
+   * @brief Write one step's keys and values into a KV cache.
+   *
+   * @p k and @p v hold the step's rows, [1, 1, rows, num_heads_kv *
+   * head_dim]; height index h is absolute position pos + h. Each row goes to
+   * cache row pos + h (pos + h modulo ring_cap on a ringed cache) of the
+   * matching plane of @p kv. K is rotated there by row pos + h of @p rope
+   * when @p rope is set, as rotary_embedding() does; V is not rotated. Both
+   * are converted to the cache's fp16 element. A null plane of @p kv is
+   * skipped.
+   *
+   * @throws std::invalid_argument when the rows do not fit the cache (past
+   *         its last row, or across the ring seam), or for a dtype the
+   *         backend does not handle.
+   */
+  virtual void kv_cache_write(const Tensor &k, const Tensor &v,
+                              const KVCacheView &kv, unsigned int pos,
+                              const RotaryTable *rope);
 
 protected:
   /**

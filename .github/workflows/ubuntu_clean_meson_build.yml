@@ -67,7 +67,10 @@ jobs:
     - if: env.rebuild == '1'
       run: |
         causallm_option="-Denable-transformer=false"
-        if [ "${{ matrix.meson_options }}" = "-Denable-fp16=false" ]; then
+        # CausalLM tests: the fp16=true cell runs unittest_mha_core's FP16
+        # activation cases, which the fp16=false cell skips.
+        if [ "${{ matrix.meson_options }}" = "-Denable-fp16=false" ] ||
+           [ "${{ matrix.meson_options }}" = "-Denable-fp16=true" ]; then
           causallm_option="-Denable-transformer=true"
         fi
 
@@ -92,19 +95,23 @@ jobs:
           ${{ matrix.meson_options }} \
           build
     - name: Check CausalLM model tests are enabled
-      if: ${{ matrix.meson_options == '-Denable-fp16=false' && env.rebuild == '1' }}
+      if: ${{ (matrix.meson_options == '-Denable-fp16=false' || matrix.meson_options == '-Denable-fp16=true') && env.rebuild == '1' }}
+      env:
+        MESON_OPTIONS: ${{ matrix.meson_options }}
       run: |
         meson introspect build --tests > meson-tests.json
         python3 - <<'PY'
         import json
+        import os
 
         with open("meson-tests.json", encoding="utf-8") as test_file:
             tests = {test["name"] for test in json.load(test_file)}
 
-        required_tests = {
-            "unittest_causallm_models",
-            "unittest_mha_core",
-        }
+        # unittest_causallm_models is built without enable-fp16 only; the
+        # fp16=true cell is here for unittest_mha_core's FP16 cases.
+        required_tests = {"unittest_mha_core"}
+        if os.environ["MESON_OPTIONS"] == "-Denable-fp16=false":
+            required_tests.add("unittest_causallm_models")
         missing_tests = sorted(required_tests - tests)
         if missing_tests:
             raise SystemExit(

@@ -175,6 +175,19 @@ void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
                                     unsigned int w, _FP16 *in, _FP16 *out,
                                     float *cos_, float *sin_);
 /**
+ * @brief Rotate-half rotary embedding of fp16 rows by fp16 cos / sin rows
+ * @param[in] width row width (num_heads * dim)
+ * @param[in] dim head dimension
+ * @param[in] half_ dim / 2: element i of a head pairs with i + half_
+ * @param[in/out] inout _FP16* input, also the output when @p output is null
+ * @param[out] output _FP16* output, or nullptr to write @p inout
+ * @param[in] cos_ _FP16* cos of the half_ angles of this row's position
+ * @param[in] sin_ _FP16* sin of the half_ angles of this row's position
+ */
+void compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                              unsigned int half_, _FP16 *inout, _FP16 *output,
+                              const _FP16 *cos_, const _FP16 *sin_);
+/**
  * @brief swiglu function : X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X

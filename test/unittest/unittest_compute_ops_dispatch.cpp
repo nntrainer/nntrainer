@@ -17,6 +17,7 @@
 #include <common_properties.h>
 #include <compute_ops.h>
 #include <context_data.h>
+#include <fp16.h>
 #include <gtest/gtest.h>
 #include <quantizer.h>
 #include <tensor.h>
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #ifdef ENABLE_HEXKL
 #include <htp_backend.h>
@@ -49,6 +51,8 @@ struct CallCounters {
   std::atomic<int> activation{0};
   std::atomic<int> residual_op{0};
   std::atomic<int> swiglu{0};
+  std::atomic<int> rotary_embedding{0};
+  std::atomic<int> kv_cache_write{0};
 };
 
 /**
@@ -123,6 +127,19 @@ public:
               unsigned int row_offset) override {
     counters_->swiglu++;
     real_->swiglu(in1, in2, out, active_rows, row_offset);
+  }
+  void rotary_embedding(const nntrainer::Tensor &in, nntrainer::Tensor &out,
+                        unsigned int head_dim,
+                        const nntrainer::RotaryTable &table,
+                        unsigned int start_pos, bool rotate) override {
+    counters_->rotary_embedding++;
+    real_->rotary_embedding(in, out, head_dim, table, start_pos, rotate);
+  }
+  void kv_cache_write(const nntrainer::Tensor &k, const nntrainer::Tensor &v,
+                      const nntrainer::KVCacheView &kv, unsigned int pos,
+                      const nntrainer::RotaryTable *rope) override {
+    counters_->kv_cache_write++;
+    real_->kv_cache_write(k, v, kv, pos, rope);
   }
 
 private:
@@ -569,6 +586,374 @@ TEST_F(ComputeOpsDispatchTest, SwigluDispatchesThroughAttachedContextOps) {
       EXPECT_NEAR(got, (float)ref, 1e-5f);
     }
   }
+}
+
+namespace {
+
+/**
+ * @brief cos / sin rows for positions [0, positions) and angles
+ *        theta_i = 10000^(-2i / head_dim), in the RotaryTable layout.
+ */
+struct RotaryRows {
+  std::vector<float> cos, sin;
+  nntrainer::RotaryTable table;
+
+  RotaryRows(unsigned int positions, unsigned int head_dim) {
+    const unsigned int half = head_dim / 2;
+    for (unsigned int p = 0; p < positions; ++p) {
+      for (unsigned int i = 0; i < half; ++i) {
+        const double angle =
+          p * std::pow(10000.0, -2.0 * i / static_cast<double>(head_dim));
+        cos.push_back((float)std::cos(angle));
+        sin.push_back((float)std::sin(angle));
+      }
+    }
+    table.cos = cos.data();
+    table.sin = sin.data();
+    table.positions = positions;
+    table.half = half;
+  }
+};
+
+/** @brief Rotate-half reference of one element of a [rows, W] input. */
+float rotatedRef(const float *x, const RotaryRows &rows, unsigned int W,
+                 unsigned int head_dim, unsigned int start_pos, unsigned int r,
+                 unsigned int w) {
+  const unsigned int half = head_dim / 2;
+  const unsigned int head = w / head_dim * head_dim;
+  const unsigned int i = (w - head) % half;
+  const size_t t = (size_t)(start_pos + r) * half + i;
+  const float a = x[r * W + head + i];
+  const float b = x[r * W + head + i + half];
+  return (w - head) < half ? a * rows.cos[t] - b * rows.sin[t]
+                           : a * rows.sin[t] + b * rows.cos[t];
+}
+
+} // namespace
+
+/**
+ * @brief rotary_embedding reaches the attached table and rotates every head of
+ *        every row by the table row of its position, in place.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingDispatchesThroughAttachedOps) {
+  constexpr unsigned int H = 3, head_dim = 8, W = 2 * head_dim, start = 5;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(1, 1, H, W);
+  for (unsigned int i = 0; i < H * W; ++i)
+    x.getData<float>()[i] = 0.1f * i - 1.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + H * W);
+
+  x.setContextData(ct_data);
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+
+  EXPECT_EQ(counters->rotary_embedding.load(), 1);
+  for (unsigned int r = 0; r < H; ++r)
+    for (unsigned int w = 0; w < W; ++w)
+      EXPECT_NEAR(x.getData<float>()[r * W + w],
+                  rotatedRef(before.data(), rows, W, head_dim, start, r, w),
+                  1e-5f)
+        << "row " << r << " col " << w;
+}
+
+/**
+ * @brief Into fp16 bits (a KV-cache write): rotated with rotate == true,
+ *        converted unchanged with rotate == false. The input is left as is.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingWritesFp16Bits) {
+  constexpr unsigned int H = 2, head_dim = 8, W = head_dim, start = 3;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(1, 1, H, W);
+  for (unsigned int i = 0; i < H * W; ++i)
+    x.getData<float>()[i] = 0.25f * i - 2.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + H * W);
+  const nntrainer::TensorDim fp16_bits(
+    {1, 1, H, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16});
+  nntrainer::Tensor rotated(fp16_bits);
+  nntrainer::Tensor copied(fp16_bits);
+
+  x.getOps()->rotary_embedding(x, rotated, head_dim, rows.table, start, true);
+  x.getOps()->rotary_embedding(x, copied, head_dim, rows.table, start, false);
+
+  for (unsigned int r = 0; r < H; ++r) {
+    for (unsigned int w = 0; w < W; ++w) {
+      const unsigned int i = r * W + w;
+      EXPECT_FLOAT_EQ(x.getData<float>()[i], before[i]);
+      EXPECT_NEAR(
+        nntrainer::compute_fp16_to_fp32(rotated.getData<uint16_t>()[i]),
+        rotatedRef(before.data(), rows, W, head_dim, start, r, w), 2e-3f);
+      EXPECT_EQ(copied.getData<uint16_t>()[i],
+                nntrainer::compute_fp32_to_fp16(before[i]));
+    }
+  }
+}
+
+#ifdef ENABLE_FP16
+/**
+ * @brief An FP16 input reads the fp16 table and rotates into an FP16 output,
+ *        in place or not; it does not take the copy-only (rotate == false)
+ *        form, which exists for the FP32 value write.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRotatesFp16Input) {
+  constexpr unsigned int H = 3, head_dim = 16, W = 2 * head_dim, start = 4;
+  RotaryRows rows(start + H, head_dim);
+  std::vector<uint16_t> cos16, sin16;
+  for (float v : rows.cos)
+    cos16.push_back(nntrainer::compute_fp32_to_fp16(v));
+  for (float v : rows.sin)
+    sin16.push_back(nntrainer::compute_fp32_to_fp16(v));
+  rows.table.cos_fp16 = cos16.data();
+  rows.table.sin_fp16 = sin16.data();
+
+  const nntrainer::TensorDim dim(
+    {1, 1, H, W, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16});
+  nntrainer::Tensor x(dim), out(dim);
+  std::vector<float> before;
+  for (unsigned int i = 0; i < H * W; ++i) {
+    x.getData<_FP16>()[i] = static_cast<_FP16>(0.1f * i - 1.5f);
+    before.push_back(static_cast<float>(x.getData<_FP16>()[i]));
+  }
+
+  x.setContextData(ct_data);
+  x.getOps()->rotary_embedding(x, out, head_dim, rows.table, start, true);
+  EXPECT_EQ(counters->rotary_embedding.load(), 1);
+  for (unsigned int r = 0; r < H; ++r)
+    for (unsigned int w = 0; w < W; ++w)
+      EXPECT_NEAR(static_cast<float>(out.getData<_FP16>()[r * W + w]),
+                  rotatedRef(before.data(), rows, W, head_dim, start, r, w),
+                  2e-2f)
+        << "row " << r << " col " << w;
+
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+  for (unsigned int i = 0; i < H * W; ++i)
+    EXPECT_EQ(static_cast<float>(x.getData<_FP16>()[i]),
+              static_cast<float>(out.getData<_FP16>()[i]));
+
+  EXPECT_THROW(
+    x.getOps()->rotary_embedding(x, out, head_dim, rows.table, start, false),
+    std::invalid_argument);
+}
+#endif
+
+/**
+ * @brief A position past the end of the table is rejected instead of reading
+ *        beyond it.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRejectsPositionsPastTable) {
+  constexpr unsigned int H = 2, head_dim = 8;
+  const RotaryRows rows(4, head_dim);
+  nntrainer::Tensor x(1, 1, H, head_dim);
+  EXPECT_NO_THROW(
+    x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 2, true));
+  EXPECT_THROW(
+    x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 3, true),
+    std::invalid_argument);
+}
+
+/**
+ * @brief Each batch's rows start again at start_pos: height index h is at
+ *        position start_pos + h in every batch.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRestartsPositionsPerBatch) {
+  constexpr unsigned int B = 2, H = 3, head_dim = 8, W = head_dim, start = 2;
+  const RotaryRows rows(start + H, head_dim);
+  nntrainer::Tensor x(B, 1, H, W);
+  for (unsigned int i = 0; i < B * H * W; ++i)
+    x.getData<float>()[i] = 0.05f * i - 1.0f;
+  const std::vector<float> before(x.getData<float>(),
+                                  x.getData<float>() + B * H * W);
+
+  x.getOps()->rotary_embedding(x, x, head_dim, rows.table, start, true);
+
+  for (unsigned int b = 0; b < B; ++b)
+    for (unsigned int h = 0; h < H; ++h)
+      for (unsigned int w = 0; w < W; ++w)
+        EXPECT_NEAR(
+          x.getData<float>()[(b * H + h) * W + w],
+          rotatedRef(before.data() + b * H * W, rows, W, head_dim, start, h, w),
+          1e-5f)
+          << "batch " << b << " row " << h << " col " << w;
+}
+
+/**
+ * @brief A head_dim that cannot tile the row, or a missing fp32 table, is
+ *        rejected instead of looping or reading past the row.
+ */
+TEST_F(ComputeOpsDispatchTest, RotaryEmbeddingRejectsBadHeadDimOrTable) {
+  const RotaryRows rows(4, 8);
+  nntrainer::Tensor x(1, 1, 1, 12);
+  for (unsigned int head_dim : {0u, 5u, 8u})
+    EXPECT_THROW(
+      x.getOps()->rotary_embedding(x, x, head_dim, rows.table, 0, true),
+      std::invalid_argument)
+      << "head_dim " << head_dim;
+
+  // The copy-only form reads no table, so only the head_dim check stops a
+  // head_dim of 0 (the kernels' head loop would not advance) or an odd one
+  // that divides the row.
+  const nntrainer::TensorDim bits15(
+    {1, 1, 1, 15, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT16});
+  nntrainer::Tensor z(1, 1, 1, 15), z_bits(bits15);
+  for (unsigned int head_dim : {0u, 5u})
+    EXPECT_THROW(
+      x.getOps()->rotary_embedding(z, z_bits, head_dim, rows.table, 0, false),
+      std::invalid_argument)
+      << "copy-only, head_dim " << head_dim;
+
+  nntrainer::Tensor y(1, 1, 1, 8);
+  nntrainer::RotaryTable no_fp32 = rows.table;
+  no_fp32.cos = nullptr;
+  no_fp32.sin = nullptr;
+  EXPECT_THROW(x.getOps()->rotary_embedding(y, y, 8, no_fp32, 0, true),
+               std::invalid_argument);
+  EXPECT_NO_THROW(x.getOps()->rotary_embedding(y, y, 8, no_fp32, 0, false));
+}
+
+namespace {
+
+/** @brief A [1, 1, rows, width] cache plane of fp16 bits, every bit 0xABCD. */
+nntrainer::Tensor cachePlane(unsigned int rows, unsigned int width) {
+  nntrainer::Tensor t(
+    nntrainer::TensorDim({1, 1, rows, width, nntrainer::Tformat::NCHW,
+                          nntrainer::Tdatatype::UINT16}));
+  for (unsigned int i = 0; i < rows * width; ++i)
+    t.getData<uint16_t>()[i] = 0xABCD;
+  return t;
+}
+
+/** @brief A [1, 1, rows, width] FP32 step with distinct values. */
+nntrainer::Tensor stepRows(unsigned int rows, unsigned int width, float base) {
+  nntrainer::Tensor t(1, 1, rows, width);
+  for (unsigned int i = 0; i < rows * width; ++i)
+    t.getData<float>()[i] = base + 0.05f * i;
+  return t;
+}
+
+} // namespace
+
+/**
+ * @brief kv_cache_write reaches the attached table and writes rows
+ *        [pos, pos + rows): K rotated at its absolute positions, V converted
+ *        to fp16 bits, every other cache row left alone.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteDispatchesAndPlacesRows) {
+  constexpr unsigned int R = 2, head_dim = 8, W = 2 * head_dim, pos = 3;
+  const RotaryRows rows(pos + R, head_dim);
+  nntrainer::Tensor k = stepRows(R, W, -1.0f), v = stepRows(R, W, 0.5f);
+  nntrainer::Tensor key = cachePlane(6, W), value = cachePlane(6, W);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+
+  k.setContextData(ct_data);
+  k.getOps()->kv_cache_write(k, v, kv, pos, &rows.table);
+
+  EXPECT_EQ(counters->kv_cache_write.load(), 1);
+  for (unsigned int r = 0; r < 6; ++r) {
+    for (unsigned int w = 0; w < W; ++w) {
+      const uint16_t kb = key.getData<uint16_t>()[r * W + w];
+      const uint16_t vb = value.getData<uint16_t>()[r * W + w];
+      if (r < pos || r >= pos + R) {
+        EXPECT_EQ(kb, 0xABCD) << "row " << r;
+        EXPECT_EQ(vb, 0xABCD) << "row " << r;
+        continue;
+      }
+      const unsigned int s = r - pos;
+      // rotatedRef indexes the table by start + s, the absolute position.
+      EXPECT_NEAR(nntrainer::compute_fp16_to_fp32(kb),
+                  rotatedRef(k.getData<float>(), rows, W, head_dim, pos, s, w),
+                  2e-3f)
+        << "row " << r << " col " << w;
+      EXPECT_EQ(vb,
+                nntrainer::compute_fp32_to_fp16(v.getData<float>()[s * W + w]))
+        << "row " << r << " col " << w;
+    }
+  }
+}
+
+/**
+ * @brief On a ringed cache absolute row n lands in row n % ring_cap, while K
+ *        still rotates by its absolute position; a step that would cross the
+ *        ring seam is rejected.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteWrapsOnARing) {
+  constexpr unsigned int R = 2, head_dim = 8, W = head_dim, ring = 4, pos = 6;
+  const RotaryRows rows(pos + R + 1, head_dim);
+  nntrainer::Tensor k = stepRows(R, W, 0.25f), v = stepRows(R, W, -0.75f);
+  nntrainer::Tensor key = cachePlane(ring, W), value = cachePlane(ring, W);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+  kv.ring_cap = ring;
+
+  k.getOps()->kv_cache_write(k, v, kv, pos, &rows.table);
+
+  for (unsigned int r = 0; r < ring; ++r) {
+    for (unsigned int w = 0; w < W; ++w) {
+      const uint16_t kb = key.getData<uint16_t>()[r * W + w];
+      if (r < pos % ring) {
+        EXPECT_EQ(kb, 0xABCD) << "row " << r;
+        continue;
+      }
+      const unsigned int s = r - pos % ring;
+      EXPECT_NEAR(nntrainer::compute_fp16_to_fp32(kb),
+                  rotatedRef(k.getData<float>(), rows, W, head_dim, pos, s, w),
+                  2e-3f)
+        << "row " << r << " col " << w;
+    }
+  }
+
+  // Absolute 7 and 8 are ring rows 3 and 0: across the seam.
+  EXPECT_THROW(k.getOps()->kv_cache_write(k, v, kv, pos + 1, &rows.table),
+               std::invalid_argument);
+}
+
+/**
+ * @brief A null plane is left to the caller; a write past the last cache row
+ *        is rejected.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteSkipsNullPlaneAndRejects) {
+  constexpr unsigned int R = 2, head_dim = 8, W = head_dim;
+  nntrainer::Tensor k = stepRows(R, W, 0.0f), v = stepRows(R, W, 1.0f);
+  nntrainer::Tensor key = cachePlane(4, W), value = cachePlane(4, W);
+  nntrainer::KVCacheView kv;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+
+  k.getOps()->kv_cache_write(k, v, kv, 0, nullptr);
+  EXPECT_EQ(value.getData<uint16_t>()[0],
+            nntrainer::compute_fp32_to_fp16(v.getData<float>()[0]));
+  EXPECT_EQ(key.getData<uint16_t>()[0], 0xABCD);
+
+  kv.key = &key;
+  EXPECT_THROW(k.getOps()->kv_cache_write(k, v, kv, 3, nullptr),
+               std::invalid_argument);
+}
+
+/**
+ * @brief Without RoPE an odd head_dim is allowed, and every element of K
+ *        and V is still converted to fp16 bits.
+ */
+TEST_F(ComputeOpsDispatchTest, KvCacheWriteConvertsOddHeadDim) {
+  constexpr unsigned int R = 2, head_dim = 5, W = 3 * head_dim;
+  nntrainer::Tensor k = stepRows(R, W, -0.4f), v = stepRows(R, W, 0.3f);
+  nntrainer::Tensor key = cachePlane(3, W), value = cachePlane(3, W);
+  nntrainer::KVCacheView kv;
+  kv.key = &key;
+  kv.value = &value;
+  kv.head_dim = head_dim;
+
+  k.getOps()->kv_cache_write(k, v, kv, 1, nullptr);
+  for (unsigned int i = 0; i < R * W; ++i) {
+    EXPECT_EQ(key.getData<uint16_t>()[W + i],
+              nntrainer::compute_fp32_to_fp16(k.getData<float>()[i]));
+    EXPECT_EQ(value.getData<uint16_t>()[W + i],
+              nntrainer::compute_fp32_to_fp16(v.getData<float>()[i]));
+  }
+  EXPECT_EQ(key.getData<uint16_t>()[0], 0xABCD);
 }
 
 /**
