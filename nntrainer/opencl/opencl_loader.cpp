@@ -280,6 +280,7 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clReleaseEvent);
   LoadRawFunction(clEnqueueBarrierWithWaitList);
   LoadFunction(clGetKernelInfo);
+  LoadFunction(clGetKernelWorkGroupInfo);
   InstallLaunchStatWrappers();
 }
 
@@ -325,6 +326,7 @@ PFN_clWaitForEvents clWaitForEvents;
 PFN_clReleaseEvent clReleaseEvent;
 PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 PFN_clGetKernelInfo clGetKernelInfo;
+PFN_clGetKernelWorkGroupInfo clGetKernelWorkGroupInfo;
 
 // ---------------------------------------------------------------------------
 // Handle epoch.

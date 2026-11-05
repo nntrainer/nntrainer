@@ -239,6 +239,11 @@ typedef cl_int(CL_API_CALL *PFN_clGetKernelInfo)(
   size_t /**< param_value_size */, void * /**< param_value */,
   size_t * /**< param_value_size_ret */);
 
+typedef cl_int(CL_API_CALL *PFN_clGetKernelWorkGroupInfo)(
+  cl_kernel /**< kernel */, cl_device_id /**< device */,
+  cl_kernel_work_group_info /**< param_name */, size_t /**< param_value_size */,
+  void * /**< param_value */, size_t * /**< param_value_size_ret */);
+
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
 extern PFN_clGetDeviceInfo clGetDeviceInfo;
@@ -290,6 +295,7 @@ extern PFN_clWaitForEvents clWaitForEvents;
 extern PFN_clReleaseEvent clReleaseEvent;
 extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 extern PFN_clGetKernelInfo clGetKernelInfo;
+extern PFN_clGetKernelWorkGroupInfo clGetKernelWorkGroupInfo;
 
 /**
  * @brief Launch ledger -- what the host asked the queue for, per kernel name.

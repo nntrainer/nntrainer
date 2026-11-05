@@ -240,6 +240,12 @@ void ComputeOps::gemm_q4_0_batch_fp32(std::vector<void *>, float *,
                                       std::vector<unsigned int>, unsigned int) {
   NI(gemm_q4_0_batch_fp32);
 }
+void ComputeOps::gemm_tq2cx_batch_fp32(std::vector<void *>, float *,
+                                       std::vector<float *>, unsigned int,
+                                       std::vector<unsigned int>,
+                                       unsigned int) {
+  NI(gemm_tq2cx_batch_fp32);
+}
 void ComputeOps::gemm_q4_0_accel_fp32(void *, float *, float *, unsigned int,
                                       unsigned int, unsigned int) {
   NI(gemm_q4_0_accel_fp32);
@@ -414,6 +420,10 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
 void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                        unsigned int) {
   NI(geglu);
+}
+void ComputeOps::geglu_erf(const Tensor &, const Tensor &, Tensor &,
+                           unsigned int, unsigned int) {
+  NI(geglu_erf);
 }
 void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                         unsigned int) {

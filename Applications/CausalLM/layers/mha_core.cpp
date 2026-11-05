@@ -16,12 +16,14 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <engine.h>
 #include <env_compat.h>
 #include <kv_ring.h> // causallm::kvRingCap (shared with models/transformer.h)
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -37,13 +39,35 @@
 
 static std::mutex rope_init_mtx;
 
+static bool mha_device_attention_on();
+
+// NNTR_MHA_HOST_FALLBACK=1 (value-checked, off by default): let an OpenCL
+// gpu-engine run hand an attention step to the HOST attention when every
+// device arm declined it. Without it that is an error (see
+// mha_assert_no_silent_host_attention): on the gpu engine the attention is a
+// device op, and a host fallback is a silent 10-20x slowdown (the Gemma4-26B
+// MoE 1K prefill attention spent seconds on the CPU that way) that no output
+// check notices. The opt-in exists for debugging a new shape or kernel.
+[[maybe_unused]] static bool mha_host_fallback_allowed() {
+  static const bool on = nntr_env_on("NNTR_MHA_HOST_FALLBACK");
+  return on;
+}
+
 // Minimum prefill step_size for routing attention/RoPE onto the GPU paths.
 // Below the threshold the prefill falls to the host path. The threshold no
 // longer depends on head_dim (the parameter is ignored): x86 returns 1 for
 // every head_dim (see the note below on the former head_dim=128 issue), and
 // ARM returns 1 with NNTR_MHA_GPU on, else 32. Env override:
-// NNTR_MIN_PREFILL.
+// NNTR_MIN_PREFILL, except on an Android OpenCL gpu-engine run with the device
+// attention on, where the threshold is 1 whatever it says (a short prefill
+// step must not take the host attention there either) unless
+// NNTR_MHA_HOST_FALLBACK=1.
 static unsigned int min_prefill_thr(unsigned int head_dim) {
+#if defined(__ANDROID__) && defined(ENABLE_OPENCL)
+  if (mha_device_attention_on() && nntr_engine_env() != "cuda" &&
+      !mha_host_fallback_allowed())
+    return 1u;
+#endif
   static const int env = []() {
     const char *e = std::getenv("NNTR_MIN_PREFILL");
     return e ? std::atoi(e) : -1;
@@ -715,7 +739,8 @@ MHACoreLayer::MHACoreLayer() :
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
     props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope(),
-    props::KvWindowRing()),
+    props::KvWindowRing(), props::KCacheInt8Scales(),
+    props::VCacheInt8Scales()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -850,6 +875,66 @@ static void mha_ring_assert_host_path_ok(unsigned int ring_cap,
        "NNTR_CUDA_ATTN=1 on NNTR_ENGINE=cuda) or set NNTR_KV_WINDOW_RING=0.";
 }
 
+#if defined(ENABLE_OPENCL)
+// [no-host-attn] The OpenCL attention cascade on the gpu engine tried its
+// device arms for this step and every one declined; the next arm is the host
+// attention. That is never a silent step on the gpu engine: log the reason and
+// stop, unless NNTR_MHA_HOST_FALLBACK=1 asks for the host path explicitly
+// (logged once then). kv_int8 without NNTR_KV_INT8_GPU is the documented host
+// route for an int8 cache (no validated GPU arm for it), so it is logged once
+// and not stopped. The ring check (mha_ring_assert_host_path_ok) still applies
+// after this when the host path is allowed.
+[[maybe_unused]] static void mha_assert_no_silent_host_attention(
+  unsigned int step_size, unsigned int cache_to, unsigned int head_dim,
+  unsigned int num_heads_Q, unsigned int num_heads_KV, unsigned int ring_cap,
+  bool kv_int8, bool img_arm, int use_image_attn, bool svm_ok) {
+  const bool det = causallm::detArm() == causallm::DetArm::kPerLayer;
+  char why[640];
+  std::snprintf(
+    why, sizeof(why),
+    "every device attention arm declined a %s step (step_size %u, N_kv %u, "
+    "head_dim %u, heads %u/%u, ring_cap %u): image arm %s; %s; flash decode "
+    "(NNTR_ADRENO_FLASH_DECODE) %s; GPU prefill attention "
+    "(NNTR_ADRENO_PREFILL_ATTN) %s; reproducible arm %s; svm %d; kv_int8 %d",
+    step_size > 1 ? "prefill" : "decode", step_size, cache_to, head_dim,
+    num_heads_Q, num_heads_KV, ring_cap,
+    img_arm ? (use_image_attn == 1 ? "tried" : "wanted but not engaged")
+            : "off for this layer",
+    step_size > 1 ? "buffer flash / two_conv declined"
+                  : "flash_decode / buffer flash / two_conv declined",
+    nntrainer::flash_decode_gqa_enabled() ? "on" : "off",
+    nntrainer::prefill_attn_apa_enabled() ? "on" : "off", det ? "on" : "off",
+    (int)svm_ok, (int)kv_int8);
+  if (kv_int8) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      ml_loge("[no-host-attn] host attention for the int8 KV cache "
+              "(NNTR_KV_INT8_GPU unset): %s",
+              why);
+    }
+    return;
+  }
+  if (mha_host_fallback_allowed()) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      ml_loge("[no-host-attn] NNTR_MHA_HOST_FALLBACK=1: taking the HOST "
+              "attention: %s",
+              why);
+    }
+    return;
+  }
+  ml_loge("[no-host-attn] %s", why);
+  NNTR_THROW_IF(true, std::runtime_error)
+    << "[no-host-attn] the gpu engine would run this attention step on the "
+       "host: "
+    << why
+    << ". Fix the arm that should take this shape, or set "
+       "NNTR_MHA_HOST_FALLBACK=1 to allow the host attention explicitly.";
+}
+#endif // ENABLE_OPENCL
+
 // The host attention paths read Q and the K/V cache and write O on the CPU.
 // A tensor in a device-only pool (NNTR_CUDA_DEV_ACT activations,
 // NNTR_CUDA_KV_DEV cache) is not host-addressable, and reading it there is a
@@ -899,6 +984,35 @@ mha_report_image_mirror_refused(size_t num_heads_KV, size_t head_dim,
   ml_loge("%s", msg);
   std::fprintf(stderr, "%s\n", msg);
   std::fflush(stderr);
+}
+
+void *MHACoreLayer::k_snap_device() {
+#if defined(ENABLE_OPENCL)
+  if (k_snap_cl == nullptr && !k_cache_int8_scales.empty())
+    k_snap_cl = nntrainer::kv_snap_scales_cl(k_cache_int8_scales);
+  return k_snap_cl;
+#else
+  return nullptr;
+#endif
+}
+
+void MHACoreLayer::storeValueRows(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                                  unsigned int from) {
+  if (v_cache_int8_scales.empty())
+    out.copyData(in);
+  else
+    apply_rotary_emb_tensor_v2(in, out, head_dim, from, /*apply_rope=*/false,
+                               &v_cache_int8_scales);
+}
+
+void *MHACoreLayer::v_snap_device() {
+#if defined(ENABLE_OPENCL)
+  if (v_snap_cl == nullptr && !v_cache_int8_scales.empty())
+    v_snap_cl = nntrainer::kv_snap_scales_cl(v_cache_int8_scales);
+  return v_snap_cl;
+#else
+  return nullptr;
+#endif
 }
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -994,6 +1108,27 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<props::NumHeads_KV>(mha_core_props).empty()
       ? num_heads_Q
       : static_cast<size_t>(std::get<props::NumHeads_KV>(mha_core_props).get());
+
+  /** optional int8 KV cache emulation (k/v_cache_int8_scales) */
+  auto parse_scales = [this](const std::string &str, const char *what) {
+    std::vector<float> out;
+    std::stringstream ss(str);
+    std::string item;
+    while (std::getline(ss, item, ','))
+      if (!item.empty())
+        out.push_back(std::stof(item));
+    NNTR_THROW_IF(!out.empty() &&
+                    out.size() != static_cast<size_t>(num_heads_KV),
+                  std::invalid_argument)
+      << what << ": expected " << num_heads_KV << " scales, got " << out.size();
+    return out;
+  };
+  k_cache_int8_scales =
+    parse_scales(std::get<props::KCacheInt8Scales>(mha_core_props).get(),
+                 "k_cache_int8_scales");
+  v_cache_int8_scales =
+    parse_scales(std::get<props::VCacheInt8Scales>(mha_core_props).get(),
+                 "v_cache_int8_scales");
 
   // head_dim
   head_dim = static_cast<size_t>(query_width) / num_heads_Q;
@@ -1722,9 +1857,21 @@ bool MHACoreLayer::attention_fp32_on_device(
     half[i].setData(plane[i], 0);
   }
   for (unsigned int i = 0; i < 3; ++i) {
-    if (!nntrainer::gpu_cast_f32_to_f16_cl(
-          src[i]->getData<float>(), half[i].getData<uint16_t>(),
-          static_cast<unsigned int>(src[i]->size())))
+    // The value rows of an int8-KV trained model are snapped to their int8
+    // grid in this narrowing (one launch either way): every V cache write
+    // downstream copies these rows. The keys are snapped after RoPE, in the
+    // kernel that writes them to the cache.
+    void *vs = i == 2 ? v_snap_device() : nullptr;
+    const bool ok = vs != nullptr
+                      ? nntrainer::gpu_cast_f32_to_f16_snap_cl(
+                          src[i]->getData<float>(), half[i].getData<uint16_t>(),
+                          static_cast<unsigned int>(src[i]->size()),
+                          static_cast<unsigned int>(head_dim),
+                          static_cast<unsigned int>(num_heads_KV), vs)
+                      : nntrainer::gpu_cast_f32_to_f16_cl(
+                          src[i]->getData<float>(), half[i].getData<uint16_t>(),
+                          static_cast<unsigned int>(src[i]->size()));
+    if (!ok)
       return false;
   }
 
@@ -2194,6 +2341,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // consumer is a same-queue GPU kernel -- but the SVM/host fallbacks further
   // down are not on that queue, so they drain once when this is set.
   bool kv_write_undrained = false;
+  // Set when the flash-arm decode commit below wrote Q, K and V with one
+  // undrained launch. Its consumer is flash_decode on the same in-order queue;
+  // every other reader drains once first (see the attention dispatch).
+  bool flash_commit_undrained = false;
 #endif
 
   const double _mha_t_prelude = _kvst_on() ? _kvst_now() : 0;
@@ -2322,8 +2473,88 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       const auto md = t.getMemoryData();
       return t.isClMem() || (md && md->isSVM());
     };
-    if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
-        !kv_ohwi_now && _rope_len_ok &&
+    // [flash-commit] Decode step on the buffer/flash arm (Intel / any
+    // non-image lane): commit Q, K and V with the one-launch
+    // qkv_rope_commit_f16 the image arm already uses, instead of rope-Q into
+    // the FC's cl_mem + rope-K into the cache slice (drained) + V copy into
+    // the cache slice (drained) + the blocking lower_q read that lands the
+    // rotated Q in the SVM plane flash_decode binds. The commit kernel is
+    // byte-identical to those three launches (same rotation, same snap, same
+    // destinations); it reads Q from the FC's cl_mem and writes the rotated Q
+    // straight into the SVM plane, so lower_q has nothing left to do. All
+    // three writes stay undrained: their one consumer, flash_decode, is on
+    // the same in-order queue, and every other reader drains first
+    // (flash_commit_undrained). On Xe3 this removes 2 clFinish + 1 blocking
+    // read per layer per token. NNTR_FLASH_QKV_COMMIT=0 restores the
+    // separate drained launches.
+    static const bool _flash_commit_on = []() {
+      const char *e = std::getenv("NNTR_FLASH_QKV_COMMIT");
+      return e == nullptr || e[0] != '0';
+    }();
+    if (_flash_commit_on && !_gpu_rope_off && _mha_gpu_on &&
+        use_gemm_attention && !kv_int8 && !kv_ohwi_now && !_img_arm &&
+        use_image_attn != 1 && !kv_stage_on && (to - from) == 1 &&
+        _gpu_rope_decode &&
+        query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        value_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        cache_key.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        cache_value.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      const unsigned int mp = rope_lut_positions();
+      auto is_svm = [](const nntrainer::Tensor &t) {
+        const auto md = t.getMemoryData();
+        return md && md->isSVM();
+      };
+      const bool q_svm = is_svm(query_step);
+      const bool k_svm = is_svm(key_step);
+      const bool v_svm = is_svm(value_step);
+      void *k_snap = k_snap_device();
+      void *v_snap = v_snap_device();
+      if (mp >= cache_index + 1 && is_svm(b_cache_key_step) &&
+          is_svm(b_cache_value_step) && (q_cl != nullptr || q_svm) &&
+          (k_cl != nullptr || k_svm) && (v_cl != nullptr || v_svm) &&
+          (k_snap == nullptr) == (v_snap == nullptr)) {
+        ensure_rope_flat_lut();
+        uint16_t *q_p =
+          reinterpret_cast<uint16_t *>(query_step.getData<_FP16>());
+        const uint16_t *k_p =
+          reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>());
+        uint16_t *kc_p =
+          reinterpret_cast<uint16_t *>(b_cache_key_step.getData<_FP16>());
+        const uint16_t *v_in =
+          reinterpret_cast<const uint16_t *>(value_step.getData<_FP16>());
+        uint16_t *v_out =
+          reinterpret_cast<uint16_t *>(b_cache_value_step.getData<_FP16>());
+        // Same destinations as the separate launches: the step's cache
+        // slices, write offset 0.
+        if (nntrainer::qkv_rope_commit_f16_cl(
+              q_p, q_cl, k_p, k_cl, kc_p, 0u, v_in, v_cl, v_out, 0u,
+              rope_cos_flat_cur, rope_sin_flat_cur, num_heads_Q, num_heads_KV,
+              head_dim, cache_index, mp, /*flush=*/true, k_snap, v_snap)) {
+          // flash_decode binds the cache tensors' bases, below the step
+          // slices the commit declared: declare the whole planes at the
+          // consumer's scope (opt-in hazard check), and the Q plane.
+          nntrainer::opencl::Kernel::noteUndrainedSvmPlane(
+            cache_key.getData<_FP16>(), cache_key.bytes(),
+            /*declared_by_consumer_site=*/true);
+          nntrainer::opencl::Kernel::noteUndrainedSvmPlane(
+            cache_value.getData<_FP16>(), cache_value.bytes(),
+            /*declared_by_consumer_site=*/true);
+          nntrainer::opencl::Kernel::noteUndrainedSvmPlane(
+            q_p, (size_t)num_heads_Q * head_dim * sizeof(uint16_t),
+            /*declared_by_consumer_site=*/true);
+          // The rotated Q is in the SVM plane; the FC's cl_mem still holds
+          // the un-rotated Q and must never be lowered over it.
+          q_cl = nullptr;
+          k_cl = nullptr;
+          v_cl = nullptr;
+          flash_commit_undrained = true;
+          gpu_rope_done = true;
+        }
+      }
+    }
+    if (!gpu_rope_done && !_gpu_rope_off && _mha_gpu_on && use_gemm_attention &&
+        !kv_int8 && !kv_ohwi_now && _rope_len_ok &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         device_addressable(query_step) && device_addressable(key_step)) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
@@ -2489,7 +2720,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // Staged (k_out_stage != null) already skips the drain by writing
             // a cl_mem; unstaged writes the SVM cache slice and, on the image
             // chain, has the same all-GPU consumer set.
-            /*drain_svm_out=*/!kv_chain_gpu_only);
+            /*drain_svm_out=*/!kv_chain_gpu_only, /*write_off=*/0,
+            /*snap_scales=*/k_snap_device());
         if (ok && k_out_stage == nullptr && kv_chain_gpu_only) {
           kv_write_undrained = true;
           // The rotation above bound an OFFSET-BAKED destination (kc_p = the
@@ -2537,7 +2769,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             ok = nntrainer::rope_inplace_f16_cl(
               k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
               cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
-              /*out_clmem=*/nullptr);
+              /*out_clmem=*/nullptr, /*drain_svm_out=*/true, /*write_off=*/0,
+              /*snap_scales=*/k_snap_device());
           }
         }
         if (ok) {
@@ -2557,7 +2790,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // Staged chain: the cache write is a decode side-fill (drain
           // skipped); v_scatter reads this step's V straight from value_step
           // (same bytes, no dependency on the cache write).
-          const bool v_stage = kv_stage_on && v_svm;
+          // An int8-KV model's V is snapped as it is stored, so the staged
+          // chain (which reads value_step itself) is not taken for it.
+          void *v_snap = v_snap_device();
+          const unsigned int v_row = (unsigned int)num_heads_KV * head_dim;
+          const bool v_stage = kv_stage_on && v_svm && v_snap == nullptr;
           if (mha_clmem_mode && v_stage) {
             // MHA_CLMEM: mirror-only store; v_scatter reads value_step.
             v_stage_svm = v_in;
@@ -2567,7 +2804,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           } else if (nntrainer::gpu_copy_f16_cl(
                        v_in, v_out, v_n, v_svm, /*in_clmem=*/v_cl,
                        /*out_clmem=*/nullptr,
-                       /*drain=*/!(v_stage || kv_chain_gpu_only))) {
+                       /*drain=*/!(v_stage || kv_chain_gpu_only), v_snap, v_row,
+                       head_dim)) {
             if (v_stage) {
               v_stage_svm = v_in;
               v_stage_clmem = v_cl;
@@ -2588,7 +2826,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               nntrainer::clmem_lower_cl(value_step, 0);
               v_cl = nullptr;
             }
-            b_cache_value_step.copyData(value_step); // host fallback
+            storeValueRows(value_step, b_cache_value_step,
+                           cache_index); // host fallback
           }
           gpu_rope_done = true;
         }
@@ -2730,7 +2969,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             _kv_soff_k ? (unsigned int)_kc_step_off : 0u, v_in, v_cl,
             _kv_soff_v ? vc_base : v_out,
             _kv_soff_v ? (unsigned int)_vc_step_off : 0u, cos_lut, sin_lut,
-            num_heads_Q, num_heads_KV, head_dim, cache_index, mp, _qkv_flush);
+            num_heads_Q, num_heads_KV, head_dim, cache_index, mp, _qkv_flush,
+            /*snap_scales=*/k_snap_device(),
+            /*v_snap_scales=*/v_snap_device());
         }
         bool ok = fused;
         if (!fused)
@@ -2738,7 +2979,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             k_p, _kv_soff_k ? kc_base : kc_p, cos_lut, sin_lut, to - from,
             num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
             /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
-            /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u);
+            /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u,
+            /*snap_scales=*/k_snap_device());
         // Enqueued without a drain: the SVM/host fallbacks below must drain
         // once if the image attention ends up missing this step.
         if (ok)
@@ -2750,11 +2992,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                               v_in, vc_base, kv_n, (int)_vc_step_off,
                               /*svm_inputs=*/true,
                               /*in_clmem=*/v_cl, /*out_base_clmem=*/nullptr,
-                              /*drain=*/false)
-                          : nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
-                                                       /*in_clmem=*/v_cl,
-                                                       /*out_clmem=*/nullptr,
-                                                       /*drain=*/false);
+                              /*drain=*/false, v_snap_device(),
+                              (unsigned int)num_heads_KV * head_dim, head_dim)
+                          : nntrainer::gpu_copy_f16_cl(
+                              v_in, v_out, kv_n, v_svm,
+                              /*in_clmem=*/v_cl,
+                              /*out_clmem=*/nullptr,
+                              /*drain=*/false, v_snap_device(),
+                              (unsigned int)num_heads_KV * head_dim, head_dim);
         // Q LAST: in-place into the SVM shadow (the OHWI decode qk reads Q_p
         // with q_clmem=null). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
@@ -3097,14 +3342,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
 #endif
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                     cache_index, true);
+                                     cache_index, true, &k_cache_int8_scales);
         }
       }
 
       // append vcache without rotary embedding
       if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                                   cache_index, false);
+                                   cache_index, false, &v_cache_int8_scales);
       } else if (query_step.getDataType() ==
                  ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -3167,7 +3412,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
                "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
-          b_cache_value_step.copyData(value_step);
+          storeValueRows(value_step, b_cache_value_step, cache_index);
         }
 #else
         NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -3704,6 +3949,29 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             kv_mirror_rows_want ? kv_mirror_rows_want : cache_key_dim.height());
           if (mirror_cap >= 8 && mirror_cap < S_max)
             S_max = (mirror_cap + 7u) & ~7u;
+          // [kimg-pack] The K image kernels are compiled for the one shift
+          // the process published, which may have grown after this layer
+          // packed its K mirror (a later layer with more KV heads x rows):
+          // re-pack the K mirror with the published shift. Its rows are
+          // re-filled from the cache by the backfill below.
+          if (kv_mirror_init &&
+              kv_kimg_gsh != nntrainer::kimg_gsh_published()) {
+            nntrainer::release_cl_mem(k_image_ohwi);
+            nntrainer::release_cl_mem(k_buf_ohwi);
+            k_image_ohwi = nullptr;
+            k_buf_ohwi = nullptr;
+            kv_kimg_gsh = nntrainer::kimg_gsh_published();
+            if (nntrainer::create_ohwi_kv_mirror(
+                  /*is_v=*/false, num_heads_KV, head_dim, kv_mirror_S_max,
+                  reinterpret_cast<cl_mem *>(&k_buf_ohwi),
+                  reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh)) {
+              kv_k_valid_to = kv_mirror_base;
+            } else {
+              // no K mirror: leave the image arm for this layer
+              kv_mirror_init = false;
+              use_image_attn = 0;
+            }
+          }
           if (!kv_mirror_init) {
             kv_mirror_S_max = S_max;
             // Same derivation as the finalize prebuild (which is Android-only).
@@ -4180,10 +4448,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // 0.3B 16383 and +10.4% / +6.6% / +182 MiB on 1.5B 8103 (nothing on
             // a single-shot prefill like E2B's 923 tokens, which never splits),
             // so it stays opt-in and the throughput default keeps the budget.
-            static const bool scores_no_split = []() {
-              const char *d = std::getenv("NNTR_DETERMINISTIC");
-              return d != nullptr && d[0] != '0';
-            }();
+            static const bool scores_no_split = nntr_deterministic();
             const unsigned int _span = prefillSpanHint();
             const bool one_block =
               scores_no_split || (_span != 0u && _span <= step_size);
@@ -4203,7 +4468,54 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             {
               MhaAttnTimerScope _img_attn_timer(step_size, m_to,
                                                 local_window_size != UINT_MAX);
-              if (sub >= step_size) {
+              // [afd] NNTR_ADRENO_FLASH_DECODE=1: the decode step reads the
+              // fp16 SVM K/V cache in one fused split-K pass instead of the
+              // qk -> softmax -> sv chain over the mirrors. The slab is
+              // complete here (the unstaged RoPE/copy wrote this step's rows,
+              // which is also what the mirror scatter above read), and the
+              // in-order queue orders those writes before this launch. The
+              // staged chain (NNTR_KV_STAGE) leaves the slab stale, so it
+              // keeps the image kernels. The mirror is still maintained.
+              if (step_size == 1 && !kv_stage_on &&
+                  nntrainer::flash_decode_gqa_enabled()) {
+                const unsigned int win_abs =
+                  (local_window_size >= (size_t)cache_to)
+                    ? 0u
+                    : (unsigned int)local_window_size;
+                ok = nntrainer::flash_decode_gqa_f16_cl(
+                  Q_p, K_p, V_p, O_p, o_cl, cache_to, num_heads_Q, num_heads_KV,
+                  head_dim, attn_logit_softcapping, win_abs, kv_ring_cap);
+                if (ok && o_cl != nullptr)
+                  o_written_clmem = true;
+              }
+              // [afp] NNTR_ADRENO_FLASH_PREFILL=1: the prefill reads the fp16
+              // SVM K/V cache in one fused pass (one sub-group per kv head
+              // and query tile, all gqa heads at once) instead of the
+              // qk -> softmax -> sv chain over the mirrors. Unstaged chain
+              // only: there the RoPE/copy wrote this step's rows into the
+              // slab (the scatter above read them from there) and earlier
+              // rows are already in it; the in-order queue orders those
+              // writes before this launch. Q must be the rotated SVM plane
+              // (no staged Q handle). The mirrors are still maintained
+              // (decode reads them).
+              if (step_size > 1 && q_clmem_use == nullptr && !kv_stage_on &&
+                  k_stage == nullptr && v_stage_svm == nullptr &&
+                  v_stage_clmem == nullptr &&
+                  nntrainer::flash_prefill_gqa_enabled()) {
+                const unsigned int win_abs =
+                  (local_window_size >= (size_t)cache_to)
+                    ? 0u
+                    : (unsigned int)local_window_size;
+                ok = nntrainer::flash_prefill_gqa_f16_cl(
+                  Q_p, K_p, V_p, O_p, o_cl, step_size, cache_to, num_heads_Q,
+                  num_heads_KV, head_dim, is_causal, attn_logit_softcapping,
+                  win_abs, kv_ring_cap);
+                if (ok && o_cl != nullptr)
+                  o_written_clmem = true;
+              }
+              if (ok) {
+                // served by the fused decode / prefill above
+              } else if (sub >= step_size) {
                 ok =
                   nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
                     Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
@@ -4281,6 +4593,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           nntrainer::cl_queue_finish();
           q_cl = nullptr;
         }
+        if (!ok && flash_commit_undrained && !(svm_ok && step_size == 1)) {
+          // The flash-arm commit's consumer (flash_decode) will not run.
+          nntrainer::cl_queue_finish();
+          flash_commit_undrained = false;
+        }
         if (!ok && (kv_stage_on || k_stage != nullptr ||
                     v_stage_svm != nullptr || kv_write_undrained)) {
           // The staged K/V cache side-fills (and, in staged mode, the
@@ -4311,11 +4628,55 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // clips"), so a sliding layer's cost is one series across contexts.
           MhaAttnTimerScope _attn_timer(step_size, cache_to,
                                         local_window_size != UINT_MAX);
-          if (step_size == 1)
+          // [afd] NNTR_ADRENO_FLASH_DECODE=1 also takes the decode step on
+          // this arm (any lane: it is how Xe3 checks the kernel in-model).
+          if (step_size == 1 && nntrainer::flash_decode_gqa_enabled()) {
+            ok = nntrainer::flash_decode_gqa_f16_cl(
+              Q_p, K_p, V_p, O_p, o_cl, cache_to, num_heads_Q, num_heads_KV,
+              head_dim, attn_logit_softcapping, /*local_window=*/win,
+              /*ring_cap=*/kv_ring_cap);
+            if (ok && o_cl != nullptr)
+              o_written_clmem = true;
+          }
+          if (step_size == 1 && !ok)
             ok = nntrainer::flash_decode_f16_cl(
               Q_p, K_p, V_p, O_p, cache_to, num_heads_Q, num_heads_KV, head_dim,
               /*max_seq_len=*/0u, /*svm_inputs=*/true, attn_logit_softcapping,
               /*local_window=*/win, /*ring_cap=*/kv_ring_cap);
+          if (!ok && flash_commit_undrained) {
+            // flash_decode declined: settle the commit before the fallbacks.
+            nntrainer::cl_queue_finish();
+            flash_commit_undrained = false;
+          }
+          // [apa] NNTR_ADRENO_PREFILL_ATTN=1: on the reproducible arm
+          // (NNTR_DETERMINISTIC=1) a mirror-free layer's prefill runs the
+          // image arm's qk -> softmax -> sv chain over the fp16 concat K/V
+          // slab (buffer reads, no mirror). Without it the next two calls
+          // decline d = 256 / 512 on Adreno and the prefill attention runs on
+          // the host. The slab and Q are complete here: the staged / undrained
+          // writers were settled above (drain, sync_kv_slab, lower_q) and the
+          // in-order queue orders the rest before these launches. Any lane:
+          // it is how Xe3 checks the chain in-model.
+          if (!ok && step_size > 1 && !img_arm_want &&
+              causallm::detArm() == causallm::DetArm::kPerLayer &&
+              nntrainer::prefill_attn_apa_enabled()) {
+            ok = nntrainer::prefill_attn_apa_f16_cl(
+              Q_p, K_p, V_p, O_p, o_cl, step_size, cache_to, num_heads_Q,
+              num_heads_KV, head_dim, is_causal, attn_logit_softcapping,
+              /*local_window=*/win, /*ring_cap=*/kv_ring_cap);
+            if (ok && o_cl != nullptr)
+              o_written_clmem = true;
+          }
+          // [afp] NNTR_ADRENO_FLASH_PREFILL=1 also takes the prefill on this
+          // arm (any lane: it is how Xe3 checks the kernel in-model).
+          if (!ok && step_size > 1 && nntrainer::flash_prefill_gqa_enabled()) {
+            ok = nntrainer::flash_prefill_gqa_f16_cl(
+              Q_p, K_p, V_p, O_p, o_cl, step_size, cache_to, num_heads_Q,
+              num_heads_KV, head_dim, is_causal, attn_logit_softcapping,
+              /*local_window=*/win, /*ring_cap=*/kv_ring_cap);
+            if (ok && o_cl != nullptr)
+              o_written_clmem = true;
+          }
           if (!ok)
             ok = nntrainer::flash_attention_prefill_f16_cl(
               Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q,
@@ -4343,6 +4704,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             head_dim, is_causal, svm_ok);
         }
       }
+      // [no-host-attn] Prefill (step_size > 1) and decode alike: on the gpu
+      // engine a step every device arm declined does not go to the host
+      // attention below silently (NNTR_MHA_HOST_FALLBACK=1 to allow it).
+      if (!ok && mha_device_attention_on() && nntr_engine_env() != "cuda")
+        mha_assert_no_silent_host_attention(
+          step_size, cache_to, (unsigned int)head_dim, num_heads_Q,
+          num_heads_KV, kv_ring_cap, kv_int8, img_arm_want, use_image_attn,
+          svm_ok);
       if (ok) {
         // The wo FC consumes O through its static plane: raise it into the
         // planner sub-buffer when a non-cl_mem path (flash/two_conv/kvi8)
@@ -4412,7 +4781,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // A K/V cache write above may have been enqueued with a submission flush
     // and no drain (the image-attention GPU chain). This reader is on the
     // host, not on that queue: settle the queue once first.
-    if (kv_write_undrained)
+    if (kv_write_undrained || flash_commit_undrained)
       nntrainer::cl_queue_finish();
     settle_act_stage_for_host();
 #endif
@@ -4435,6 +4804,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   mha_assert_host_readable(query_step, b_cached_key, b_cached_value,
                            attention_output_step, "host per-row attention");
 #if defined(ENABLE_OPENCL)
+  if (flash_commit_undrained)
+    nntrainer::cl_queue_finish();
   settle_act_stage_for_host();
 #endif
   lower_q();
@@ -5345,14 +5716,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, true);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true);
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true,
+                             &k_cache_int8_scales);
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
     apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               false);
+                               false, &v_cache_int8_scales);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+    storeValueRows(value_step, b_cache_value_step, _from);
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
@@ -5632,11 +6004,14 @@ void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
   }
 }
 
-void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
-                                              nntrainer::Tensor &out,
-                                              unsigned int dim,
-                                              unsigned int from,
-                                              bool apply_rope) {
+void MHACoreLayer::apply_rotary_emb_tensor_v2(
+  nntrainer::Tensor &in, nntrainer::Tensor &out, unsigned int dim,
+  unsigned int from, bool apply_rope, const std::vector<float> *snap_scales) {
+  const bool snap = snap_scales != nullptr && !snap_scales->empty();
+  NNTR_THROW_IF(snap &&
+                  out.getDataType() == ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "int8 KV cache snapping needs an fp16 cache";
   unsigned int half_ = dim / 2;
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -5644,7 +6019,14 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, false);
+      // Positions this run can index (max_timestep), not
+      // max_position_embeddings: a 262144-position table is GBs per
+      // (head_dim, theta). Same cap as rope_lut_positions() on the fp16 path.
+      const unsigned int rope_len =
+        (max_timestep == 0 || max_timestep > max_position_embeddings)
+          ? max_position_embeddings
+          : max_timestep;
+      precompute_freqs(head_dim, rope_len, theta, false);
       cached_freqs_cos = freqs_cos;
       cached_freqs_sin = freqs_sin;
     }
@@ -5686,9 +6068,16 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                 c * out.height() * out.width() +
                                 h * out.width();
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), !apply_rope);
+            if (snap)
+              // int8 KV cache models: RoPE, snap and the fp16 store, one pass
+              nntrainer::compute_rotary_emb_value_snap(
+                in.width(), dim, half_, in_ptr, out_ptr,
+                apply_rope ? cos_->data() : nullptr, sin_->data(),
+                snap_scales->data());
+            else
+              nntrainer::compute_rotary_emb_value(in.width(), dim, half_,
+                                                  in_ptr, out_ptr, cos_->data(),
+                                                  sin_->data(), !apply_rope);
           }
         }
       }
@@ -5713,6 +6102,22 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
       cached_freqs_sin_fp16;
     std::vector<_FP16> *cos_ = nullptr;
     std::vector<_FP16> *sin_ = nullptr;
+    // int8-KV snap on FP16 rows: the fp32 tables of the same positions
+    std::vector<float> snap_row;
+    std::vector<float> *snap_cos = nullptr;
+    std::vector<float> *snap_sin = nullptr;
+    if (snap && cached_freqs_cos == nullptr) {
+      const std::lock_guard<std::mutex> lock(rope_init_mtx);
+      if (cached_freqs_cos == nullptr) {
+        const unsigned int rope_len =
+          (max_timestep == 0 || max_timestep > max_position_embeddings)
+            ? max_position_embeddings
+            : max_timestep;
+        precompute_freqs(head_dim, rope_len, theta, false);
+        cached_freqs_cos = freqs_cos;
+        cached_freqs_sin = freqs_sin;
+      }
+    }
 
     for (unsigned int b = 0; b < in.batch(); b++) {
       for (unsigned int c = 0; c < in.channel(); c++) {
@@ -5720,6 +6125,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
           if (from < max_timestep) {
             cos_ = &(*freqs_cos_fp16_local)[from + h];
             sin_ = &(*freqs_sin_fp16_local)[from + h];
+            if (snap) {
+              snap_cos = apply_rope ? &(*cached_freqs_cos)[from + h] : nullptr;
+              snap_sin = &(*cached_freqs_sin)[from + h];
+            }
           }
           _FP16 *in_ptr = in.getData<_FP16>() +
                           b * in.channel() * in.height() * in.width() +
@@ -5728,6 +6137,20 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                            b * out.channel() * out.height() * out.width() +
                            c * out.height() * out.width() + h * out.width();
 
+          if (snap) {
+            // FP16 rows (the device arm's narrowed planes on its host
+            // fallback): widen the row and take the fp32 snap kernel, so
+            // the rotation, the snap and the store follow the one rule.
+            snap_row.resize(in.width());
+            for (unsigned int i = 0; i < in.width(); ++i)
+              snap_row[i] = static_cast<float>(in_ptr[i]);
+            nntrainer::compute_rotary_emb_value_snap(
+              in.width(), dim, half_, snap_row.data(),
+              reinterpret_cast<uint16_t *>(out_ptr),
+              snap_cos != nullptr ? snap_cos->data() : nullptr,
+              snap_sin->data(), snap_scales->data());
+            continue;
+          }
           nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                               out_ptr, cos_->data(),
                                               sin_->data());

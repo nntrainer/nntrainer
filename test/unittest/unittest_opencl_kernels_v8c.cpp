@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <string>
@@ -271,6 +272,170 @@ TEST(v8cGemm, quant_cache_refused_when_pass_opens_with_a_new_weight_p) {
   out.setZero();
   ASSERT_TRUE(nntrainer::dotCl_v8c(input, wc, out));
   EXPECT_LT(relativeError(out, ref, M, N), kQuantTolerance);
+}
+
+namespace {
+
+/**
+ * @brief A per-channel ASYMMETRIC int4 weight in the QS4CX layout plus its
+ * zero-point correction.
+ * @details w[n][k] = s[n] * (q - z[n]) with q in [0, 15] and z[n] in [3, 12].
+ * The tensor carries nibble q (= signed code q - 8) and scale s[n]; `zp`
+ * holds the integer zero points as floats. `dense` is the exact [N][K]
+ * asymmetric weight and `dense_sym` the symmetric reading s * (q - 8) of the
+ * same bytes, both for the host reference.
+ */
+struct AsymWeight {
+  nntrainer::Tensor w;
+  std::vector<float> zp;
+  std::vector<double> dense, dense_sym;
+};
+
+AsymWeight makeAsymWeight(unsigned int K, unsigned int N,
+                          const std::string &name, uint32_t seed) {
+  AsymWeight a;
+  nntrainer::TensorDim dim(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX});
+  a.w = nntrainer::Tensor(dim, true, nntrainer::Initializer::NONE, name);
+  uint8_t *nib = a.w.getData<uint8_t>();
+  float *scales = a.w.getScale<float>();
+  const unsigned int Kh = (K + 1) / 2;
+  Lcg rng(seed);
+  a.zp.resize(N);
+  a.dense.assign((size_t)N * K, 0.0);
+  a.dense_sym.assign((size_t)N * K, 0.0);
+  for (unsigned int n = 0; n < N; ++n) {
+    const float s = rng.uniform(0.005f, 0.02f);
+    const int z = 3 + (int)(rng.next() % 10u); // [3, 12]
+    scales[n] = s;
+    a.zp[n] = (float)z;
+    for (unsigned int k = 0; k < K; ++k) {
+      const int q = (int)(rng.next() % 16u);
+      uint8_t &b = nib[(size_t)n * Kh + k / 2];
+      b = (k & 1u) ? (uint8_t)((b & 0x0Fu) | (q << 4))
+                   : (uint8_t)((b & 0xF0u) | q);
+      a.dense[(size_t)n * K + k] = (double)s * (q - z);
+      a.dense_sym[(size_t)n * K + k] = (double)s * (q - 8);
+    }
+  }
+  return a;
+}
+
+/** @brief y[m][n] = sum_k x[m][k] * W[n][k] in double. */
+std::vector<double> refDense(const float *x, const std::vector<double> &W,
+                             unsigned int M, unsigned int K, unsigned int N) {
+  std::vector<double> y((size_t)M * N, 0.0);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int n = 0; n < N; ++n) {
+      double acc = 0.0;
+      for (unsigned int k = 0; k < K; ++k)
+        acc += (double)x[(size_t)m * K + k] * W[(size_t)n * K + k];
+      y[(size_t)m * N + n] = acc;
+    }
+  return y;
+}
+
+/** @brief Largest |out - ref| relative to each row's peak |ref|. */
+float relErr(const float *out, const std::vector<double> &ref, unsigned int M,
+             unsigned int N) {
+  float worst = 0.0f;
+  for (unsigned int m = 0; m < M; ++m) {
+    double peak = 1e-6;
+    for (unsigned int n = 0; n < N; ++n)
+      peak = std::max(peak, std::fabs(ref[(size_t)m * N + n]));
+    for (unsigned int n = 0; n < N; ++n) {
+      const size_t i = (size_t)m * N + n;
+      worst =
+        std::max(worst, (float)(std::fabs((double)out[i] - ref[i]) / peak));
+    }
+  }
+  return worst;
+}
+
+/**
+ * @brief One asymmetric-weight case: the dispatch without zero points must
+ * equal the symmetric reading of the bytes, and the one with them the
+ * asymmetric weight -- each within the int8 activation quantisation error,
+ * while the symmetric output misses the asymmetric reference by far more.
+ * @return false when no OpenCL device took the dispatch.
+ */
+bool runAsymCase(unsigned int M, unsigned int K, unsigned int N,
+                 const std::string &name, uint32_t seed,
+                 bool via_correction = false) {
+  AsymWeight a = makeAsymWeight(K, N, name, seed);
+  nntrainer::Tensor input(nntrainer::TensorDim(1, 1, M, K), true);
+  fillActivation(input, seed + 3u);
+  const std::vector<double> ref =
+    refDense(input.getData<float>(), a.dense, M, K, N);
+  const std::vector<double> ref_sym =
+    refDense(input.getData<float>(), a.dense_sym, M, K, N);
+
+  nntrainer::Tensor sym(nntrainer::TensorDim(1, 1, M, N), true);
+  sym.setZero();
+  if (!nntrainer::dotCl_v8c(input, a.w, sym))
+    return false;
+  EXPECT_LT(relErr(sym.getData<float>(), ref_sym, M, N), kQuantTolerance)
+    << name << ": symmetric reading";
+  EXPECT_GT(relErr(sym.getData<float>(), ref, M, N), 10 * kQuantTolerance)
+    << name << ": the case must need the correction";
+
+  if (via_correction) {
+    // The loader-side form: c[n] = s[n] * (8 - z[n]).
+    std::vector<float> c(N);
+    const float *sc = a.w.getScale<float>();
+    for (unsigned int n = 0; n < N; ++n)
+      c[n] = sc[n] * (8.0f - a.zp[n]);
+    EXPECT_TRUE(
+      nntrainer::dotCl_v8c_set_zero_point_correction(a.w, c.data(), N));
+  } else {
+    EXPECT_TRUE(
+      nntrainer::dotCl_v8c_set_weight_zero_points(a.w, a.zp.data(), N));
+  }
+  nntrainer::Tensor out(nntrainer::TensorDim(1, 1, M, N), true);
+  out.setZero();
+  EXPECT_TRUE(nntrainer::dotCl_v8c(input, a.w, out));
+  const float err = relErr(out.getData<float>(), ref, M, N);
+  std::cout << name << " M=" << M << " K=" << K << " N=" << N
+            << " corrected rel err " << err << std::endl;
+  EXPECT_LT(err, kQuantTolerance) << name << ": corrected";
+
+  // Removing the zero points restores the symmetric output bit for bit.
+  EXPECT_TRUE(nntrainer::dotCl_v8c_set_weight_zero_points(a.w, nullptr, N));
+  nntrainer::Tensor again(nntrainer::TensorDim(1, 1, M, N), true);
+  again.setZero();
+  EXPECT_TRUE(nntrainer::dotCl_v8c(input, a.w, again));
+  EXPECT_EQ(0, std::memcmp(again.getData<float>(), sym.getData<float>(),
+                           sizeof(float) * (size_t)M * N))
+    << name << ": uncorrected output changed";
+  return true;
+}
+
+} // namespace
+
+/**
+ * @brief Per-channel asymmetric weight through the decode GEMV (M = 1).
+ */
+TEST(v8cGemm, asym_zero_point_gemv_m1_p) {
+  if (!runAsymCase(1, 256, 64, "v8c_asym_m1_w", 0x5A5A0001u))
+    GTEST_SKIP() << "no OpenCL device took the v8c dispatch";
+}
+
+/**
+ * @brief Asymmetric weight through the tiled GEMM with padded rows (M = 3),
+ * registered through the c[n] = s[n] * (8 - z[n]) form.
+ */
+TEST(v8cGemm, asym_zero_point_gemm_m3_p) {
+  if (!runAsymCase(3, 256, 64, "v8c_asym_m3_w", 0x5A5A0002u, true))
+    GTEST_SKIP() << "no OpenCL device took the v8c dispatch";
+}
+
+/**
+ * @brief Asymmetric weight through the prefill GEMM (the matrix-engine kernel
+ * where the device has one, the dp4a kernel otherwise).
+ */
+TEST(v8cGemm, asym_zero_point_gemm_m70_p) {
+  if (!runAsymCase(70, 256, 128, "v8c_asym_m70_w", 0x5A5A0003u))
+    GTEST_SKIP() << "no OpenCL device took the v8c dispatch";
 }
 
 GTEST_API_ int main(int argc, char **argv) {

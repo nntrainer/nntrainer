@@ -58,6 +58,14 @@ class Program {
    */
   std::string GetDefaultCompilerOptions() const;
 
+  /**
+   * @brief The default options for a build with @a compiler_options: the
+   *        relaxed-math defaults, or plain -cl-std=CL3.0 when the options
+   *        define NNTR_STRICT_FP.
+   */
+  std::string
+  GetDefaultCompilerOptions(const std::string &compiler_options) const;
+
 public:
   static const std::string DEFAULT_KERNEL_PATH;
 

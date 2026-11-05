@@ -41,8 +41,8 @@ namespace causallm {
  * @brief Which attention arm this process runs on the Adreno image bundle.
  * @details Two arms, one environment variable:
  *
- *   kFast       (the DEFAULT, no environment)
- *               The throughput arm: the OHWI image path serves every layer the
+ *   kFast       (the default off Android, NNTR_DETERMINISTIC=0 on Android)
+ *               The image arm: the OHWI image path serves every layer the
  *               bundle can host. It is the arm every published number was
  *               taken on and the one that matches the previous release's
  *               speed. Its output was not bit-identical run to run past ~2K
@@ -50,8 +50,9 @@ namespace causallm {
  *               read-write (NNTR_SV_IMG_RW, now the default); the measured
  *               cells reproduce with that binding, but this arm makes no
  *               per-layer guarantee (see imageAttnLayer()).
- *   kPerLayer   (NNTR_DETERMINISTIC=1)
- *               The reproducible arm, opt-in. imageAttnLayer() decides per
+ *   kPerLayer   (the default on the Android gpu engine; NNTR_DETERMINISTIC=1
+ *               elsewhere)
+ *               The reproducible arm. imageAttnLayer() decides per
  *               layer from detImageWindowMax(), which is 0: no layer takes the
  *               image kernels and the buffer/flash kernels serve all of them.
  *               The image bundle stays requested at process level, so a
@@ -64,11 +65,16 @@ namespace causallm {
  *               including the long-context ones the fast arm does not
  *               reproduce.
  *
- * The deterministic arm used to be the default and the fast one the opt-out;
- * the measured cost above is why that was reversed. NNTR_DETERMINISTIC=0 and
- * the pack's nntr_config "allow_nondeterministic" are still accepted and now
- * simply name the default; NNTR_ALLOW_NONDETERMINISTIC is no longer read.
- * An explicit NNTR_DETERMINISTIC outranks the pack key either way.
+ * The unset default is nntr_deterministic_default_on() (env_compat.h), the one
+ * place it is defined. On the Android gpu engine it is kPerLayer: with the
+ * Adreno flash decode and the three-pass GPU prefill attention (both default
+ * on there with it) this arm measured faster than the image arm on the
+ * Gemma4-26B MoE 1K cell (prefill 388 TPS, decode 38.9 ms/tok), so the cost
+ * figures above, taken before those kernels, no longer make the image arm
+ * the faster default on Adreno. Elsewhere the default stays kFast.
+ * NNTR_DETERMINISTIC=0 / =1 picks the arm explicitly on every platform. The
+ * pack's nntr_config "allow_nondeterministic" is still accepted and changes
+ * nothing; NNTR_ALLOW_NONDETERMINISTIC is no longer read.
  *
  * Every consumer -- the mirror prebuild, the Q staging, the decode-RoPE gate,
  * the engage and the ring rule -- resolves the arm through this one function,
@@ -94,7 +100,8 @@ inline bool &packAllowsNondeterministic() {
 /**
  * @brief Resolve the attention arm (see DetArm).
  * @details NNTR_DETERMINISTIC is value-checked: =1 (any non-zero) selects the
- * reproducible per-layer arm, =0 or unset is the fast default. It is the
+ * reproducible per-layer arm, =0 the fast (image) arm, and unset is
+ * nntr_deterministic_default_on() (on on the Android gpu engine). It is the
  * pre-existing cross-lane knob the API sets, so the same variable that pins
  * the cuBLAS FP32 math mode and the OpenCL reduction order also picks the
  * Adreno arm (CUDA async submission does not read it).
@@ -102,10 +109,7 @@ inline bool &packAllowsNondeterministic() {
  * not read here: both name the default, so ignoring them changes nothing.
  */
 inline DetArm detArm() {
-  DetArm arm = DetArm::kFast; // the baseline: no environment needed
-  const char *d = std::getenv("NNTR_DETERMINISTIC");
-  if (d != nullptr && d[0] != '\0')
-    arm = nntr_env_on("NNTR_DETERMINISTIC") ? DetArm::kPerLayer : DetArm::kFast;
+  const DetArm arm = nntr_deterministic() ? DetArm::kPerLayer : DetArm::kFast;
   // packAllowsNondeterministic() (still set from a pack's nntr_config) names
   // the default and changes nothing, so a pack written against the previous
   // contract keeps working. NNTR_ALLOW_NONDETERMINISTIC is not read at all.
@@ -121,11 +125,13 @@ inline DetArm detArm() {
       logged = true;
       std::fprintf(
         stderr,
-        "[DETERMINISM] NNTR_DETERMINISTIC=1: the reproducible attention arm is "
-        "selected. Every layer takes the buffer/flash kernels (the Adreno "
-        "image kernels are off); output is bit-identical run to run at the "
-        "measured cost of +20~22%% end-to-end and 2~4x slower prefill on "
-        "Adreno. Unset it for the fast default.\n");
+        "[DETERMINISM] the reproducible attention arm is selected (%s). "
+        "Every layer takes the buffer/flash kernels (the Adreno image kernels "
+        "are off); output is bit-identical run to run. NNTR_DETERMINISTIC=0 "
+        "selects the image arm.\n",
+        std::getenv("NNTR_DETERMINISTIC") != nullptr
+          ? "NNTR_DETERMINISTIC set"
+          : "the Android gpu-engine default");
     }
   }
   return arm;
@@ -133,9 +139,10 @@ inline DetArm detArm() {
 
 /**
  * @brief Has the caller asked for bit-identical output above everything else?
- * @details True only on the reproducible arm, i.e. with NNTR_DETERMINISTIC=1.
- * The cuBLAS FP32 math mode and the OpenCL reduction order read that same
- * variable themselves (CUDA async submission does not); this is the
+ * @details True only on the reproducible arm (NNTR_DETERMINISTIC=1, or unset on
+ * the Android gpu engine). The OpenCL reduction order reads the same answer
+ * through nntr_deterministic(); the cuBLAS FP32 math mode reads the variable
+ * itself (CUDA async submission does not); this is the
  * one-word spelling of it for the layer side and the unit test.
  */
 inline bool determinismFirst() { return detArm() == DetArm::kPerLayer; }
@@ -382,6 +389,22 @@ inline bool kvRingArmAvailable() {
 }
 
 /**
+ * @brief Whether NNTR_KV_WINDOW_RING explicitly turns the ring OFF (set, and
+ *        not a truthy value).
+ * @details The opt-out is one switch for everything the ring brings with it:
+ * kvRingEnabled() keeps the linear cache, and a model whose ring default also
+ * made it chunk prompts longer than the plane (Transformer::chunkLongPrompts())
+ * goes back to the single-block bound, so the opt-out arm is the pre-ring
+ * behaviour rather than a third configuration (linear cache + chunking).
+ * NNTR_PREFILL_CHUNK still chunks explicitly on top of the opt-out.
+ */
+inline bool kvRingOptedOut() {
+  const char *req = std::getenv("NNTR_KV_WINDOW_RING");
+  return req != nullptr && req[0] != '\0' &&
+         !nntr_env_on("NNTR_KV_WINDOW_RING");
+}
+
+/**
  * @brief Whether the KV ring is enabled.
  * @param model_default what the MODEL asks for when the environment is silent.
  * @details NNTR_KV_WINDOW_RING, when set, is the whole answer to "is the ring
@@ -406,7 +429,7 @@ inline bool kvRingArmAvailable() {
 inline bool kvRingEnabled(bool model_default = false) {
   const char *req = std::getenv("NNTR_KV_WINDOW_RING");
   const bool explicit_req = (req != nullptr && req[0] != '\0');
-  if (explicit_req ? !nntr_env_on("NNTR_KV_WINDOW_RING") : !model_default)
+  if (explicit_req ? kvRingOptedOut() : !model_default)
     return false;
   const bool ok = kvRingEngineEligible() && kvRingArmAvailable();
   if (!ok && explicit_req) {
@@ -469,7 +492,7 @@ inline constexpr unsigned int kPrefillBlockCap = 4096u;
  * @brief Requested prefill chunk size (0 = no chunking / single-block prefill).
  * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
  * tuning); a non-positive or unparseable value is REJECTED (treated as unset)
- * rather than wrapped into a ~4e9 unsigned, which the (W/C + 2) * C ring
+ * rather than wrapped into a ~4e9 unsigned, which the ring-capacity
  * arithmetic would have consumed. Otherwise, chunking follows the ring:
  * chunking is what bounds a launch's live key span, so the ring picks the
  * chunk, 4096 for every backend. The equal-thermal ring-on sweep is monotone in
@@ -637,10 +660,12 @@ inline unsigned int prefillPlaneFor(unsigned int prompt_tokens,
  * shape, KV allocation, cache write, attention kernel dispatch -- computes Wcap
  * from THIS one function so they stay consistent.
  *
- * Wcap is a multiple of C and >= W + C: a multiple of C means a C-aligned chunk
- * write never straddles the wrap seam (it stays one contiguous slice), and
- * >= W + C means the live window [pos-W+1, pos+C) never self-collides mod Wcap.
- * Returning 0 keeps the exact pre-ring behaviour, so ring-off is bit-identical.
+ * Wcap is the smallest multiple of C that is >= W + C (when W and C are
+ * 64-row aligned; otherwise (W / C + 2) * C): a multiple of C means a
+ * C-aligned chunk write never straddles the wrap seam (it stays one contiguous
+ * slice), and >= W + C means the live window [pos-W+1, pos+C) never
+ * self-collides mod Wcap. Returning 0 keeps the exact pre-ring behaviour, so
+ * ring-off is bit-identical.
  *
  * @param local_window W, the layer's sliding window (0 = full attention).
  * @param max_seq the full context window this layer would otherwise allocate.
@@ -661,9 +686,26 @@ inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq,
   const unsigned int C = chunk;
   if (C == 0)
     return 0; // the ring requires chunked prefill to bound the live span
-  // multiple of C, >= W + C (headroom so the window never wraps onto itself).
-  const unsigned int cap = (local_window / C + 2u) * C;
-  return (cap < max_seq) ? cap : 0u; // no benefit if it would not shrink
+  // The smallest multiple of C that is >= W + C: the live span of a chunk
+  // launch is W + C - 1 rows, and a multiple of C keeps a C-aligned chunk
+  // write on one side of the seam. That is ceil(W / C) * C + C.
+  //
+  // Where W and C both sit on the 64-row grid the Adreno image mirror's
+  // 64-floored base still fits this exactly: a launch at [f, f + S) with S <=
+  // C lies inside the C-aligned block starting at floor_C(f), whose window
+  // starts at floor_C(f) - W, a 64-aligned row no later than the floored base,
+  // so (f + S) - base <= W + C = cap. Off that grid the old (W / C + 2) * C
+  // is kept, whose extra C rows of headroom cover the 63-row floor.
+  //
+  // At W == C == 1024 (the Gemma4 MoE pack, plane 1024) this is 2048 rows
+  // against 3072 for (W / C + 2) * C, which did not fit under a 2560-row
+  // max_seq_len -- the ring then returned 0 and saved nothing at that plane.
+  unsigned long cap;
+  if ((local_window % 64u) == 0u && (C % 64u) == 0u)
+    cap = ((unsigned long)local_window + C - 1ul) / C * C + C;
+  else
+    cap = ((unsigned long)local_window / C + 2ul) * C;
+  return (cap < max_seq) ? (unsigned int)cap : 0u; // no benefit -> linear
 }
 
 /**
