@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #ifdef ENABLE_FP16
@@ -41,6 +42,51 @@
 namespace nntrainer {
 
 class Tensor;
+
+/**
+ * @brief The router of a MoE layer, for a backend that routes a decode row on
+ *        the device (see MoeExpertGroup::router).
+ * @details The routing it computes: rms_norm(row, epsilon), times norm (when
+ * given), times scale * hidden^-1/2, the projection by weight, softmax over
+ * the experts, the topk largest (ties: lowest expert id), renormalised over
+ * the topk, times per_expert_scale of each selected expert.
+ */
+struct MoeRouter {
+  const Tensor *input = nullptr;            /**< [1, H] router row */
+  const Tensor *weight = nullptr;           /**< [H, E] fp32 projection */
+  const Tensor *scale = nullptr;            /**< [H] fp32 router scale */
+  const Tensor *norm = nullptr;             /**< [H] fp32, or null */
+  const Tensor *per_expert_scale = nullptr; /**< [E] fp32 */
+  float epsilon = 1.0e-6f;                  /**< rms_norm epsilon */
+  unsigned int topk = 0;                    /**< experts per token */
+};
+
+/**
+ * @brief All selected experts of one MoE forward call, for a backend that
+ *        runs them together (see ComputeOps::moe_experts).
+ */
+struct MoeExpertGroup {
+  const void *layer_key = nullptr;  /**< identity of the calling layer, for
+                                         state a backend keeps per layer */
+  const Tensor *input = nullptr;    /**< [T, H] expert input rows */
+  Tensor *output = nullptr;         /**< [T, H] written (not accumulated) */
+  unsigned int tokens = 0;          /**< T */
+  std::vector<Tensor *> gate;       /**< every expert's gate weight, by id */
+  std::vector<Tensor *> up;         /**< every expert's up weight, by id */
+  std::vector<Tensor *> down;       /**< every expert's down weight, by id */
+  std::vector<unsigned int> active; /**< selected experts, ascending id */
+  /** per expert id: (token row, routing weight), ascending token */
+  const std::vector<std::vector<std::pair<unsigned int, float>>> *assignments =
+    nullptr;
+  bool exact_gelu = false; /**< erf gelu gate instead of the tanh form */
+  /** moe_experts_prebuild only: where each record's bytes are read from,
+   *  [gate_0, up_0, down_0, gate_1, ...] (e.g. the weight file mapping);
+   *  null reads the weight tensors themselves */
+  const std::vector<const void *> *records = nullptr;
+  /** a one-token call may leave active / assignments empty and give the
+   *  router instead: the backend routes on the device (or declines) */
+  const MoeRouter *router = nullptr;
+};
 
 /**
  * @class ComputeOps
@@ -186,6 +232,20 @@ public:
                                     std::vector<float *> matCdata,
                                     unsigned int M, std::vector<unsigned int> N,
                                     unsigned int K);
+
+  /**
+   * @brief One fp32 activation against several TQ2CX (ternary) weights.
+   *
+   * Same argument order as gemm_q4_0_batch_fp32: @a matAdata holds the
+   * TQ2CX records (N_i x K) and @a matBdata the M x K activation, used in
+   * fp32 without quantization. Valid for every M. C_i = A * W_i^T is
+   * written (no accumulation into C).
+   */
+  virtual bool supports_gemm_tq2cx_batch_fp32() const { return false; }
+  virtual void
+  gemm_tq2cx_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                        std::vector<float *> matCdata, unsigned int M,
+                        std::vector<unsigned int> N, unsigned int K);
 
   // ===========================================================================
   // Quantized weight packing / quantization
@@ -418,6 +478,12 @@ public:
    */
   virtual void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                      unsigned int active_rows, unsigned int row_offset);
+  /**
+   * @brief out = gelu(in1) * in2 with the exact (erf) gelu -- the HF "gelu"
+   *        / approximate="none" GeGLU -- over the same row window as geglu().
+   */
+  virtual void geglu_erf(const Tensor &in1, const Tensor &in2, Tensor &out,
+                         unsigned int active_rows, unsigned int row_offset);
 
   /**
    * @brief SwiGLU activation over the `active_rows` rows starting at
@@ -582,6 +648,98 @@ public:
    *        gamma).
    */
   virtual void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon);
+
+  // ===========================================================================
+  // Mixture-of-experts data movement and expert projection
+  //
+  // A MoE layer runs each selected expert over the token rows routed to it:
+  // gather those rows, project them (gate / up / down FCs), and add the result
+  // back into the output rows with the routing weights. The three movement
+  // ops below keep those rows on the accelerator; they RETURN whether they ran
+  // instead of throwing, and enqueue nothing when they decline, so a layer can
+  // keep its host loop for operands an accelerator cannot address. The base
+  // (and the CPU table) decline everything.
+  // ===========================================================================
+
+  /**
+   * @brief out[r, :] = in[src_rows[r], :] for r in [0, rows).
+   * @return true when the accelerator ran it
+   */
+  virtual bool moe_gather_rows(const Tensor &in, Tensor &out,
+                               const unsigned int *src_rows,
+                               unsigned int rows) {
+    (void)in;
+    (void)out;
+    (void)src_rows;
+    (void)rows;
+    return false;
+  }
+
+  /**
+   * @brief out[dst_rows[r], :] += weights[r] * expert_out[r, :] for r in
+   *        [0, rows). The destination rows must be distinct within a call;
+   *        calls are ordered, so a caller that visits the experts in a fixed
+   *        order gets the same sums on every run.
+   * @return true when the accelerator ran it
+   */
+  virtual bool moe_scatter_add_rows(const Tensor &expert_out, Tensor &out,
+                                    const unsigned int *dst_rows,
+                                    const float *weights, unsigned int rows) {
+    (void)expert_out;
+    (void)out;
+    (void)dst_rows;
+    (void)weights;
+    (void)rows;
+    return false;
+  }
+
+  /**
+   * @brief out[0 .. rows, :] = 0.
+   * @return true when the accelerator ran it
+   */
+  virtual bool moe_zero_rows(Tensor &out, unsigned int rows) {
+    (void)out;
+    (void)rows;
+    return false;
+  }
+
+  /**
+   * @brief Run every selected expert of a MoE call at once: GeGLU expert
+   *        FFN of each routed row and the weighted combine into the output.
+   * @details For expert formats whose kernels batch several experts in one
+   * launch (decode: all selected experts' gate / up as one batched GEMV;
+   * prefill: one grouped GEMM over all experts' gathered rows). Returns
+   * false, having enqueued nothing, when the backend does not serve the
+   * expert dtype; the layer then runs its per-expert loop.
+   */
+  virtual bool moe_experts(const MoeExpertGroup &group) {
+    (void)group;
+    return false;
+  }
+
+  /**
+   * @brief Build the backend's own copy of every expert weight of a MoE
+   *        layer now (at load), the copy moe_experts() reads.
+   * @details Only the weights and layer_key of @a group are read (plus
+   * group.records when given). Returns true when the backend holds the
+   * experts from now on, so the caller may release (or never fill) the host
+   * payloads; false, having built nothing, when it does not serve them.
+   */
+  virtual bool moe_experts_prebuild(const MoeExpertGroup &group) {
+    (void)group;
+    return false;
+  }
+
+  /**
+   * @brief One expert projection: output = input x weight.
+   * @details The dispatch point for expert weights. It is fc() unless a
+   * backend serves an expert-only weight format here (see
+   * registerMoeExpertFcCl on the OpenCL table), so such a format plugs in
+   * without touching the MoE layers.
+   */
+  virtual void fc_expert(Tensor &input, Tensor &weight, Tensor &output) {
+    fc(input, weight, output);
+  }
 
 protected:
   /**

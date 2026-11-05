@@ -16,6 +16,7 @@
 
 #include <string>
 #include <tensor.h>
+#include <vector>
 
 namespace nntrainer {
 
@@ -143,6 +144,58 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
  *        still covers those.
  */
 bool dotCl_v8c_prebuild_weight(const Tensor &weight);
+
+/**
+ * @brief Register the per-output-channel zero points of a per-channel
+ *        ASYMMETRIC int4 FC weight on the v8c GPU path.
+ *
+ * @details An asymmetric weight w[n][k] = s[n] * (q - z[n]), q in [0, 15], is
+ * carried in the QS4CX layout unchanged -- nibble q (= signed code q - 8) and
+ * scale s[n] -- plus its integer zero points z[n]. With them registered, every
+ * v8c FC kernel of that weight (decode GEMV, dp4a / XMX GEMM, imageless
+ * lm_head GEMV) runs its -DV8C_ASYM build: the zero point folds into the int32
+ * epilogue exactly,
+ *   sum_k (a - zp_a)(q - z) = acc - z*row_sum_a - zp_a*(row_sum_w + (8-z)*K),
+ * i.e. the constant 8 of the symmetric epilogue becomes z[n] -- no extra
+ * launch, no extra pass over the activation (the quantiser already emits its
+ * row sum), and the result is the exact dequantised GEMM against the int8
+ * activation. This equals adding c[n] * sum_k x[m][k] with c[n] =
+ * s[n]*(8-z[n]).
+ *
+ * Keyed by the weight NAME, so it may be called before or after the weight's
+ * device pack is built (load-time prebuild or first dispatch) and survives a
+ * rebuild; cl_fc_release_caches() drops it with the packs. A weight with no
+ * registered zero points runs the unchanged kernels, bit-identically.
+ *
+ * @param weight the int4 FC weight tensor (must be named)
+ * @param zp     fp32 z[N] holding integer values (|z| <= 255), or nullptr to
+ *               remove registered zero points
+ * @param N      length of @p zp; must equal weight.width()
+ * @return false (nothing registered) on an unnamed weight, a length mismatch,
+ *         a non-integer zero point or a device allocation failure
+ */
+bool dotCl_v8c_set_weight_zero_points(const Tensor &weight, const float *zp,
+                                      unsigned int N);
+
+/**
+ * @brief Same registration from the per-channel correction c[n] =
+ *        s[n] * (8 - z[n]) (the form an asymmetric-weight loader may keep):
+ *        recovers the integer z[n] from c and the weight's own fp32 scales,
+ *        then calls dotCl_v8c_set_weight_zero_points(). Needs the scales to
+ *        be readable (call before the plain payload is released).
+ * @param corr c[N], or nullptr to remove registered zero points
+ * @return false on a length mismatch, unreadable scales or a correction that
+ *         does not correspond to an integer zero point
+ */
+bool dotCl_v8c_set_zero_point_correction(const Tensor &weight,
+                                         const float *corr, unsigned int N);
+
+/**
+ * @brief Recover integer zero points z[n] from c[n] = scale[n] * (8 - z[n]).
+ * @return false when a scale is not positive or a c[n] is not of that form
+ */
+bool zeroPointsFromCorrection(const float *scale, const float *corr,
+                              unsigned int N, std::vector<float> &zp);
 
 /**
  * @brief Eager v8c weight build whose nibbles come from @p src_nibbles rather

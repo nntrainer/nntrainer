@@ -56,7 +56,9 @@ void RMSNormLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 void RMSNormLayerGPU::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
+  // The residual (input 1 of the fused norm + add) has the shape of input 0.
+  for (size_t i = 0; i < context.getNumInputs(); ++i)
+    context.updateInput(i, input_dimensions[0]);
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }
 
@@ -220,6 +222,13 @@ void RMSNormLayerGPU::incremental_forwarding(
     throw std::runtime_error(
       "RMSNormLayerGPU: only FP32/FP16 inputs supported in this build");
   }
+  // The fused residual add exists only on the FP16 arm above. An FP32 graph
+  // that wires the residual has no addition layer to fall back to, so running
+  // the plain norm here would silently drop the residual stream.
+  if (context.getNumInputs() == 2)
+    throw std::runtime_error(
+      "RMSNormLayerGPU: the fused norm+add (two inputs) needs FP16 "
+      "activations");
 
   // Run the FP32 norm on the GPU (rmsnorm_cl, SVM-direct) instead of the host
   // NEON pass whenever the input, the output and gamma all live on the SVM

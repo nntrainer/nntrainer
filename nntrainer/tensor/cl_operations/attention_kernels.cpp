@@ -495,6 +495,14 @@ int kv_img_write_mode() {
   return kv_img_write_latch.load(std::memory_order_relaxed) ? mode : 0;
 }
 
+static const std::string &ropeCopts();
+
+/** build options of the int8-KV snapping variants of the rope kernels */
+static const std::string &ropeSnapCopts() {
+  static const std::string opts = ropeCopts() + " -DKV_SNAP";
+  return opts;
+}
+
 static const std::string &ropeCopts() {
   static const std::string opts = [] {
     const char *e = std::getenv("NNTR_ROPE_TAIL_FIX");
@@ -728,6 +736,24 @@ __kernel void v_gather_ohwi_t_img(__read_only image2d_t src, __global half *dst,
 
 static const std::string rope_inplace_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef KV_SNAP
+// x / s rounded to nearest-even exactly like an IEEE division, built from
+// fma only (Markstein): the reciprocal is refined to the correctly rounded
+// 1/s, the quotient gets one residual correction. The snap kernels use it
+// instead of '/' so they need no -cl-fp32-correctly-rounded-divide-sqrt
+// (rejected by some drivers) and still match the CPU snap kernel bit for bit.
+inline float kv_snap_div(const float x, const float s) {
+  float y = 1.0f / s;
+  float e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  const float q = x * y;
+  const float r = fma(-s, q, x);
+  // an exact quotient keeps its own sign (-0 / s is -0)
+  return r == 0.0f ? q : fma(r, y, q);
+}
+#endif
 // 1 (default) = the fp32/fp16 rotation choice is a property of the SEQUENCE,
 // so a continuation chunk matches the chunks before it; 0 = the old rule,
 // chosen from this chunk's M alone. Set from NNTR_ROPE_TAIL_FIX; see the
@@ -741,7 +767,11 @@ __kernel void rope_inplace_f16(__global const half *in,
                                __global const half *sin_lut,
                                const int M, const int num_heads,
                                const int half_d, const int start_pos,
-                               const int write_off) {
+                               const int write_off
+#ifdef KV_SNAP
+                               , __global const float *snap_scale
+#endif
+                               ) {
   // write_off: when writing the rotated K into a STABLE base
   // (cache_key) instead of an offset-baked slice pointer, out[write_off + ..]
   // addresses the per-token row via a SCALAR (recordable) instead of an SVM
@@ -780,6 +810,21 @@ __kernel void rope_inplace_f16(__global const half *in,
   // unchanged), fp16 for a CONTINUATION chunk whatever its size -- which is
   // what every earlier chunk of that same prefill used. Large prefill chunks
   // are unchanged either way.
+#ifdef KV_SNAP
+  // int8-KV trained model: the rotated key is snapped to its head's int8
+  // grid, q = clamp(rint(x / s), -128, 127), x = q * s, in the same store
+  // (fp32 rotation, true division, round half to even -- the CPU kernel's
+  // rule).
+  {
+    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
+    const float sc = snap_scale[h];
+    out[write_off + row + k] =
+      (half)(clamp(rint(kv_snap_div(lof * cf - hif * sf, sc)), -128.0f, 127.0f) * sc);
+    out[write_off + row + k + half_d] =
+      (half)(clamp(rint(kv_snap_div(hif * cf + lof * sf, sc)), -128.0f, 127.0f) * sc);
+    return;
+  }
+#endif
   if (M == 1 || (M < 32 && (ROPE_TAIL_CONSISTENT == 0 || start_pos == 0))) {
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
     out[write_off + row + k]          = (half)(lof * cf - hif * sf);
@@ -789,10 +834,30 @@ __kernel void rope_inplace_f16(__global const half *in,
     out[write_off + row + k + half_d] = hi * c + lo * s;
   }
 }
+#ifdef KV_SNAP
+// int8-KV trained model: a value row is snapped to its kv head's int8 grid as
+// it is stored, x = clamp(rint(x / s), -128, 127) * s (true division, round
+// half to even), the rule of the CPU snap kernel. Row = row_len values of
+// head_dim each.
+inline half kv_snap_v(half x, const int i, const int row_len,
+                      const int head_dim, __global const float *snap_scale) {
+  const float sc = snap_scale[(i % row_len) / head_dim];
+  return (half)(clamp(rint(kv_snap_div((float)x, sc)), -128.0f, 127.0f) * sc);
+}
+#endif
 __kernel void scatter_copy_f16(__global const half *in, __global half *out,
-                               const int N) {
+                               const int N
+#ifdef KV_SNAP
+                               , const int row_len, const int head_dim,
+                               __global const float *snap_scale
+#endif
+                               ) {
   int i = get_global_id(0);
+#ifdef KV_SNAP
+  if (i < N) out[i] = kv_snap_v(in[i], i, row_len, head_dim, snap_scale);
+#else
   if (i < N) out[i] = in[i];
+#endif
 }
 // Row-offset variant: writes into a STABLE base at out[write_off + i] instead of
 // baking the destination offset into the pointer. write_off (= cache_index *
@@ -801,9 +866,19 @@ __kernel void scatter_copy_f16(__global const half *in, __global half *out,
 // override scalar args but NOT SVM pointers). Same address as the offset-baked
 // pointer form -> byte-identical output.
 __kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
-                                   const int N, const int write_off) {
+                                   const int N, const int write_off
+#ifdef KV_SNAP
+                                   , const int row_len, const int head_dim,
+                                   __global const float *snap_scale
+#endif
+                                   ) {
   int i = get_global_id(0);
+#ifdef KV_SNAP
+  if (i < N)
+    out[write_off + i] = kv_snap_v(in[i], i, row_len, head_dim, snap_scale);
+#else
   if (i < N) out[write_off + i] = in[i];
+#endif
 }
 // Decode-step Q/K/V commit in ONE launch: rope_inplace_f16 over Q (in place),
 // rope_inplace_f16 over K into the key cache at k_write_off, and the flat V
@@ -822,7 +897,12 @@ __kernel void qkv_rope_commit_f16(__global const half *q_in,
                                   __global const half *sin_lut,
                                   const int num_heads_q, const int num_heads_kv,
                                   const int half_d, const int start_pos,
-                                  const int k_write_off, const int v_write_off) {
+                                  const int k_write_off, const int v_write_off
+#ifdef KV_SNAP
+                                  , __global const float *snap_scale,
+                                  __global const float *v_snap_scale
+#endif
+                                  ) {
   const int h = get_global_id(1);
   const int k = get_global_id(2);
   if (k >= half_d) return;
@@ -839,14 +919,31 @@ __kernel void qkv_rope_commit_f16(__global const half *q_in,
     half lo = in[row + k];
     half hi = in[row + k + half_d];
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
-    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
-    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
+    float r0 = lof * cf - hif * sf, r1 = hif * cf + lof * sf;
+#ifdef KV_SNAP
+    if (h >= num_heads_q) { // a key head: snap to its int8 grid (see above)
+      const float sc = snap_scale[hh];
+      r0 = clamp(rint(kv_snap_div(r0, sc)), -128.0f, 127.0f) * sc;
+      r1 = clamp(rint(kv_snap_div(r1, sc)), -128.0f, 127.0f) * sc;
+    }
+#endif
+    out[write_off + row + k]          = (half)r0;
+    out[write_off + row + k + half_d] = (half)r1;
   } else {
     const int hv = h - num_heads_q - num_heads_kv;
     if (hv >= num_heads_kv) return;
     const long row = (long)hv * d;
+#ifdef KV_SNAP
+    // a value head: snapped to its int8 grid as it is stored
+    const float vs = v_snap_scale[hv];
+    v_out[v_write_off + row + k] =
+      (half)(clamp(rint(kv_snap_div((float)v_in[row + k], vs)), -128.0f, 127.0f) * vs);
+    v_out[v_write_off + row + k + half_d] = (half)(
+      clamp(rint(kv_snap_div((float)v_in[row + k + half_d], vs)), -128.0f, 127.0f) * vs);
+#else
     v_out[v_write_off + row + k] = v_in[row + k];
     v_out[v_write_off + row + k + half_d] = v_in[row + k + half_d];
+#endif
   }
 }
 // OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
@@ -957,7 +1054,7 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          unsigned int head_dim, unsigned int start_pos,
                          unsigned int max_positions, bool svm_inputs,
                          void *in_clmem, void *out_clmem, bool drain_svm_out,
-                         unsigned int write_off) {
+                         unsigned int write_off, void *snap_scales) {
   if (M == 0 || num_heads == 0 || head_dim == 0 || (head_dim & 1u))
     return false;
   if (in == nullptr || out == nullptr || cos_lut == nullptr ||
@@ -973,7 +1070,8 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
 
   ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "rope_inplace_f16", ropeCopts());
+    rope_inplace_kernel, "rope_inplace_f16",
+    snap_scales != nullptr ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1070,6 +1168,11 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
       !kp->SetKernelArguments(7, &sp, sizeof(int)) ||
       !kp->SetKernelArguments(8, &woff, sizeof(int)))
     return false;
+  if (snap_scales != nullptr) {
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    if (!kp->SetKernelArguments(9, &sh, sizeof(cl_mem)))
+      return false;
+  }
 
   constexpr size_t LWS_K = 64;
   const size_t kx_pad = (((size_t)half_d + LWS_K - 1) / LWS_K) * LWS_K;
@@ -1164,6 +1267,22 @@ ActStage &act_stage() {
 
 const std::string act_cast_kernel = R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// x / s rounded to nearest-even exactly like an IEEE division, built from
+// fma only (Markstein): the reciprocal is refined to the correctly rounded
+// 1/s, the quotient gets one residual correction. The snap kernels use it
+// instead of '/' so they need no -cl-fp32-correctly-rounded-divide-sqrt
+// (rejected by some drivers) and still match the CPU snap kernel bit for bit.
+inline float kv_snap_div(const float x, const float s) {
+  float y = 1.0f / s;
+  float e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  e = fma(-s, y, 1.0f);
+  y = fma(e, y, y);
+  const float q = x * y;
+  const float r = fma(-s, q, x);
+  // an exact quotient keeps its own sign (-0 / s is -0)
+  return r == 0.0f ? q : fma(r, y, q);
+}
 __kernel void cast_f32_to_f16(__global const float *in, __global half *out,
                               const int N) {
   const int i = get_global_id(0);
@@ -1175,6 +1294,21 @@ __kernel void cast_f16_to_f32(__global const half *in, __global float *out,
   const int i = get_global_id(0);
   if (i < N)
     out[i] = vload_half(i, in);
+}
+// The narrowing of an int8-KV trained model's value rows: each value is
+// snapped to its kv head's int8 grid before the fp16 store,
+// x = clamp(rint(x / s), -128, 127) * s (true division, round half to even,
+// as the CPU kernel). Row = num_heads * head_dim values.
+__kernel void cast_f32_to_f16_snap(__global const float *in,
+                                   __global half *out, const int N,
+                                   const int head_dim, const int num_heads,
+                                   __global const float *snap_scale) {
+  const int i = get_global_id(0);
+  if (i < N) {
+    const int h = (i % (num_heads * head_dim)) / head_dim;
+    const float sc = snap_scale[h];
+    vstore_half_rte(clamp(rint(kv_snap_div(in[i], sc)), -128.0f, 127.0f) * sc, i, out);
+  }
 }
 )CL";
 
@@ -1262,6 +1396,58 @@ bool gpu_cast_f32_to_f16_cl(const float *in, uint16_t *out, unsigned int N) {
                            const_cast<float *>(in), (size_t)N * sizeof(float));
 }
 
+bool gpu_cast_f32_to_f16_snap_cl(const float *in, uint16_t *out, unsigned int N,
+                                 unsigned int head_dim, unsigned int num_heads,
+                                 void *snap_scales) {
+  if (N == 0 || in == nullptr || out == nullptr || snap_scales == nullptr ||
+      head_dim == 0 || num_heads == 0)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return false;
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(act_cast_kernel, "cast_f32_to_f16_snap");
+  if (!kp)
+    return false;
+  int Ni = static_cast<int>(N), hd = static_cast<int>(head_dim),
+      nh = static_cast<int>(num_heads);
+  cl_mem sh = static_cast<cl_mem>(snap_scales);
+  float *act = const_cast<float *>(in);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(act);
+  if (!kp->SetKernelSVMArguments(0, in) || !kp->SetKernelSVMArguments(1, out) ||
+      !kp->SetKernelArguments(2, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(3, &hd, sizeof(int)) ||
+      !kp->SetKernelArguments(4, &nh, sizeof(int)) ||
+      !kp->SetKernelArguments(5, &sh, sizeof(cl_mem)))
+    return false;
+  constexpr size_t LWS = 64;
+  std::array<size_t, 3> gws = {(((size_t)N + LWS - 1) / LWS) * LWS, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  blas_cc->command_queue_inst_.enqueueSVMMap(act, (size_t)N * sizeof(float),
+                                             /*read_only=*/true,
+                                             /*event=*/nullptr,
+                                             /*async=*/true);
+  return true;
+}
+
+void *kv_snap_scales_cl(const std::vector<float> &scales) {
+  if (scales.empty())
+    return nullptr;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc == nullptr)
+    return nullptr;
+  cl_int err = CL_SUCCESS;
+  cl_mem b = opencl::clCreateBufferT(
+    blas_cc->context_inst_.GetContextNoRetain(),
+    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, scales.size() * sizeof(float),
+    const_cast<float *>(scales.data()), &err);
+  return err == CL_SUCCESS ? b : nullptr;
+}
+
 bool gpu_cast_f16_to_f32_cl(const uint16_t *in, float *out, unsigned int N) {
   return act_cast_dispatch("cast_f16_to_f32", in, out, N, out,
                            (size_t)N * sizeof(float));
@@ -1275,16 +1461,18 @@ bool ensure_cl_stage_buf(void **buf, size_t *cap, size_t bytes) {
                     CL_MEM_READ_WRITE);
 }
 
-bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
-                            void *k_clmem, uint16_t *k_dst,
-                            unsigned int k_write_off, const uint16_t *v,
-                            void *v_clmem, uint16_t *v_dst,
-                            unsigned int v_write_off, const uint16_t *cos_lut,
-                            const uint16_t *sin_lut, unsigned int num_heads_q,
-                            unsigned int num_heads_kv, unsigned int head_dim,
-                            unsigned int start_pos, unsigned int max_positions,
-                            bool flush) {
+bool qkv_rope_commit_f16_cl(
+  const uint16_t *q, void *q_clmem, const uint16_t *k, void *k_clmem,
+  uint16_t *k_dst, unsigned int k_write_off, const uint16_t *v, void *v_clmem,
+  uint16_t *v_dst, unsigned int v_write_off, const uint16_t *cos_lut,
+  const uint16_t *sin_lut, unsigned int num_heads_q, unsigned int num_heads_kv,
+  unsigned int head_dim, unsigned int start_pos, unsigned int max_positions,
+  bool flush, void *snap_scales, void *v_snap_scales) {
   if (num_heads_q == 0 || num_heads_kv == 0 || head_dim == 0 || (head_dim & 1u))
+    return false;
+  // The snapping variant snaps both K and V; a model that snaps only one of
+  // them takes the separate launches.
+  if ((snap_scales == nullptr) != (v_snap_scales == nullptr))
     return false;
   if (q == nullptr || k == nullptr || v == nullptr || k_dst == nullptr ||
       v_dst == nullptr || cos_lut == nullptr || sin_lut == nullptr)
@@ -1298,7 +1486,8 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q_ = blas_cc->command_queue_inst_.GetCommandQueue();
   ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "qkv_rope_commit_f16", ropeCopts());
+    rope_inplace_kernel, "qkv_rope_commit_f16",
+    snap_scales != nullptr ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1350,6 +1539,12 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
         kp->SetKernelArguments(11, &sp, sizeof(int)) &&
         kp->SetKernelArguments(12, &kwo, sizeof(int)) &&
         kp->SetKernelArguments(13, &vwo, sizeof(int));
+  if (okb && snap_scales != nullptr) {
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    cl_mem vh = static_cast<cl_mem>(v_snap_scales);
+    okb = kp->SetKernelArguments(14, &sh, sizeof(cl_mem)) &&
+          kp->SetKernelArguments(15, &vh, sizeof(cl_mem));
+  }
   if (!okb)
     return false;
 
@@ -1375,15 +1570,20 @@ bool qkv_rope_commit_f16_cl(const uint16_t *q, void *q_clmem, const uint16_t *k,
 
 bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
                      bool svm_inputs, void *in_clmem, void *out_clmem,
-                     bool drain) {
+                     bool drain, void *snap_scales, unsigned int row_len,
+                     unsigned int head_dim) {
   if (N == 0 || in == nullptr || out == nullptr)
+    return false;
+  const bool snap = snap_scales != nullptr;
+  if (snap && (!svm_inputs || row_len == 0 || head_dim == 0))
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_context ctx = blas_cc->context_inst_.GetContextNoRetain();
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "scatter_copy_f16", ropeCopts());
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16",
+                              snap ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
 
@@ -1430,6 +1630,14 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
   int Ni = (int)N;
   if (!kp->SetKernelArguments(2, &Ni, sizeof(int)))
     return false;
+  if (snap) {
+    const int rl = (int)row_len, hd = (int)head_dim;
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    if (!kp->SetKernelArguments(3, &rl, sizeof(int)) ||
+        !kp->SetKernelArguments(4, &hd, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &sh, sizeof(cl_mem)))
+      return false;
+  }
   constexpr size_t LWS = 64;
   const size_t gws_x = (((size_t)N + LWS - 1) / LWS) * LWS;
   std::array<size_t, 3> gws = {gws_x, 1, 1};
@@ -1473,14 +1681,19 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
 // resident). Returns false for the non-SVM (host-readback) shape.
 bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
                          int write_off, bool svm_inputs, void *in_clmem,
-                         void *out_base_clmem, bool drain) {
+                         void *out_base_clmem, bool drain, void *snap_scales,
+                         unsigned int row_len, unsigned int head_dim) {
   if (N == 0 || in == nullptr || out_base == nullptr || !svm_inputs)
+    return false;
+  const bool snap = snap_scales != nullptr;
+  if (snap && (row_len == 0 || head_dim == 0))
     return false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
-    rope_inplace_kernel, "scatter_copy_f16_row", ropeCopts());
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16_row",
+                              snap ? ropeSnapCopts() : ropeCopts());
   if (!kp)
     return false;
   bool okb = true;
@@ -1499,6 +1712,13 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
   int Ni = (int)N;
   okb = okb && kp->SetKernelArguments(2, &Ni, sizeof(int));
   okb = okb && kp->SetKernelArguments(3, &write_off, sizeof(int));
+  if (okb && snap) {
+    const int rl = (int)row_len, hd = (int)head_dim;
+    cl_mem sh = static_cast<cl_mem>(snap_scales);
+    okb = kp->SetKernelArguments(4, &rl, sizeof(int)) &&
+          kp->SetKernelArguments(5, &hd, sizeof(int)) &&
+          kp->SetKernelArguments(6, &sh, sizeof(cl_mem));
+  }
   if (!okb)
     return false;
   constexpr size_t LWS = 64;
@@ -1554,6 +1774,15 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
     ++gsh;
   if ((rows >> gsh) > max_h)
     return 0;
+  // The kernels carry ONE compile-time KIMG_GSH for the whole process, but
+  // layers of one model can need different shifts (KV heads x rows differ:
+  // e.g. 8 KV heads on the sliding layers, 2 on the full-attention ones).
+  // The published shift therefore only grows -- a larger shift still fits
+  // every smaller need -- and a layer whose mirror was packed with a smaller
+  // shift than the one finally published re-packs it before first use (see
+  // kimg_gsh_published()).
+  if (gsh < g_kimg_gsh)
+    gsh = g_kimg_gsh;
   if (gsh != 0 && g_kimg_gsh != gsh)
     ml_logi("[kimg-pack] K image: %zu rows > device max height %zu; packing "
             "%u rows per image row (KIMG_GSH=%u)",
@@ -1561,6 +1790,8 @@ unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
   g_kimg_gsh = gsh;
   return gsh;
 }
+
+unsigned int kimg_gsh_published() { return g_kimg_gsh; }
 
 // The V mirror image's row pitch is the mirror's row capacity, and
 // image2d_from_buffer wants that pitch to be a multiple of

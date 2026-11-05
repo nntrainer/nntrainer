@@ -28,7 +28,12 @@ namespace nntrainer {
 
 namespace {
 
-enum Kernels { GEGLU_CL, GEGLU_CL_FP16 }; /**< kernels enum */
+enum Kernels {
+  GEGLU_CL,
+  GEGLU_ERF_CL,
+  GEGLU_CL_FP16,
+  GEGLU_ERF_CL_FP16
+}; /**< kernels enum */
 
 /**
  * @brief kernel objects registered for this op
@@ -57,11 +62,26 @@ bool registerGeGLUClKernels(ClContext &cl_context) {
     }
     op_kernel_ptrs.emplace_back(kernel_ptr);
 
+    kernel_ptr = cl_context.registerClKernel(geglu_kernel, "geglu_erf_cl");
+    if (!kernel_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_erf_cl kernel");
+      break;
+    }
+    op_kernel_ptrs.emplace_back(kernel_ptr);
+
 #ifdef ENABLE_FP16
     kernel_ptr =
       cl_context.registerClKernel(geglu_fp16_kernel, "geglu_cl_fp16");
     if (!kernel_ptr) {
       ml_loge("OpenCL Error: Fail to register geglu_cl_fp16 kernel");
+      break;
+    }
+    op_kernel_ptrs.emplace_back(kernel_ptr);
+
+    kernel_ptr =
+      cl_context.registerClKernel(geglu_fp16_kernel, "geglu_erf_cl_fp16");
+    if (!kernel_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_erf_cl_fp16 kernel");
       break;
     }
     op_kernel_ptrs.emplace_back(kernel_ptr);
@@ -76,8 +96,11 @@ bool registerGeGLUClKernels(ClContext &cl_context) {
   return false;
 }
 
-void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
-                 unsigned int active_rows, unsigned int row_offset) {
+namespace {
+
+void geglu_cl_dispatch(const Tensor &in1, const Tensor &in2, Tensor &out,
+                       unsigned int active_rows, unsigned int row_offset,
+                       bool exact) {
   if (active_rows == 0)
     return;
 
@@ -113,13 +136,14 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
   const auto dt = in1.getDataType();
   if (dt == ml::train::TensorDim::DataType::FP32) {
     dispatchGatedClKernel<float>(
-      getOpKernelPtrs()[Kernels::GEGLU_CL], in1.getData<float>() + elem_off,
-      in2.getData<float>() + elem_off, out.getData<float>() + elem_off,
-      num_elems, use_svm, dev);
+      getOpKernelPtrs()[exact ? Kernels::GEGLU_ERF_CL : Kernels::GEGLU_CL],
+      in1.getData<float>() + elem_off, in2.getData<float>() + elem_off,
+      out.getData<float>() + elem_off, num_elems, use_svm, dev);
   } else if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     dispatchGatedClKernel<_FP16>(
-      getOpKernelPtrs()[Kernels::GEGLU_CL_FP16],
+      getOpKernelPtrs()[exact ? Kernels::GEGLU_ERF_CL_FP16
+                              : Kernels::GEGLU_CL_FP16],
       in1.getData<_FP16>() + elem_off, in2.getData<_FP16>() + elem_off,
       out.getData<_FP16>() + elem_off, num_elems, use_svm, dev);
 #else
@@ -128,6 +152,18 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
   } else {
     throw std::invalid_argument("geglu_cl_op: unsupported data type");
   }
+}
+
+} // namespace
+
+void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
+                 unsigned int active_rows, unsigned int row_offset) {
+  geglu_cl_dispatch(in1, in2, out, active_rows, row_offset, false);
+}
+
+void geglu_erf_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset) {
+  geglu_cl_dispatch(in1, in2, out, active_rows, row_offset, true);
 }
 
 } // namespace nntrainer
