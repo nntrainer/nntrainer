@@ -62,7 +62,6 @@ using HtpCpuList = std::vector<int>;
   X(bool, attn_f16_check, false)                                               \
   X(HtpOptionalInt, attn_f32_check, {})                                        \
   X(float, q2_margin, 1.0f)                                                    \
-  X(bool, attn_m1_fast, false)                                                 \
   X(bool, l2_check, false)                                                     \
   X(bool, l2_diff, false)                                                      \
   X(bool, l2_shadow, false)                                                    \
@@ -71,9 +70,6 @@ using HtpCpuList = std::vector<int>;
   X(bool, lfm2_prefill_views, false)                                           \
   X(bool, lfm2_parallel_stage, false)                                          \
   X(bool, lfm2_attn_ion_handoff, false)                                        \
-  X(bool, lfm2_conv_retain_out, false)                                         \
-  X(bool, lfm2_conv_channel_tile, false)                                       \
-  X(bool, lfm2_conv_state_only, false)                                         \
   X(unsigned, lfm2_conv_stripe_rows, 64u)                                      \
   X(bool, lfm2_conv_whole_prefill, false)                                      \
   X(bool, lfm2_parallel_add, false)                                            \
@@ -94,21 +90,15 @@ using HtpCpuList = std::vector<int>;
   X(HtpOptionalUnsigned, prefetch_top, {})                                     \
   X(float, prefetch_residual, 0.5f)                                            \
   X(float, prefetch_confidence, 0.0f)                                          \
-  X(bool, prefetch_join, true)                                                 \
   X(unsigned, miss_readers, 4u)                                                \
-  X(bool, demand_pool, true)                                                   \
-  X(bool, coalesce_read, true)                                                 \
-  X(bool, cancel_stale_read, true)                                             \
   X(bool, server_done, false)                                                  \
   X(unsigned, fadvise, 0u)                                                     \
   X(unsigned, pin, 0u)                                                         \
   X(unsigned, pin_floor_mib, 2048u)                                            \
   X(bool, m1_gemv, true)                                                       \
   X(unsigned, gemv_lead_kb, 192u)                                              \
-  X(bool, gemv_rows1, true)                                                    \
   X(bool, gemv_feed, true)                                                     \
   X(unsigned, dma_queues, 4u)                                                  \
-  X(bool, dma_bypass, true)                                                    \
   X(HtpOptionalString, hadamard, {})                                           \
   X(HtpOptionalString, hadamard_scope, {})                                     \
   X(unsigned, host_mask, 0u)                                                   \
@@ -120,8 +110,6 @@ using HtpCpuList = std::vector<int>;
   X(std::string, predict_log, {})                                              \
   X(bool, router_u8i8, false)                                                  \
   X(std::string, tl2_prepared_file, {})                                        \
-  X(bool, tl2_decode, true)                                                    \
-  X(bool, tl2_direct_read, true)                                               \
   X(bool, tl2_stable_slots, false)                                             \
   X(bool, lfm2_router_arm, false)                                              \
   X(bool, lfm2_prefill_early, false)                                           \

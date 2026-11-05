@@ -71,7 +71,6 @@ static void cooperativeCancellation_p() {
   checkpoint(cancel_ready);
   // The canceled callback still owns the buffer, including its partial data.
   assert(!q.claim(keys));
-  assert(!q.take(keys, [](Buffer &) { assert(false); }));
   assert(!q.submit(keys + 1, 2, [](Buffer &) { assert(false); }));
   assert(q.stats().completed == 0 && q.stats().cancelled == 0);
   assert(down_reads == 0);
@@ -81,13 +80,13 @@ static void cooperativeCancellation_p() {
   q.drain();
   assert(q.stats().cancelled == 1 && q.stats().failed == 0 &&
          q.stats().completed == 0 && q.stats().discarded == 1);
-  assert(!q.take(keys, [](Buffer &) { assert(false); }));
   assert(q.submit(keys + 1, 2, [&](Buffer &b) {
     assert(b.data == data);
     b.value = 2;
   }));
   completed(q, 1);
-  assert(q.take(keys + 1, [](Buffer &b) {
+  assert(q.claim(keys + 1));
+  assert(q.takeClaimed(keys + 1, [](Buffer &b) {
     for (unsigned value : *b.data)
       assert(value == 2);
   }));
@@ -155,7 +154,7 @@ static void lateCompletion_n() {
   q.expireBefore(2);
   release.set_value();
   q.drain();
-  assert(!q.take(&key, [](Buffer &) { assert(false); }));
+  assert(!q.claim(&key));
   assert(q.stats().completed == 1 && q.stats().cancelled == 0 &&
          q.stats().failed == 0 && q.stats().discarded == 1);
 }
@@ -210,7 +209,6 @@ static void queuedDemandHandoff_p() {
   assert(q.claim(keys, true)); // Already Reading: keep the ordinary claim.
   assert(!q.claim(keys + 1, true));
   assert(!q.claim(keys + 1, true)); // No second removal of the queued index.
-  assert(!q.take(keys + 1, [](Buffer &) { assert(false); }));
   assert(!q.takeClaimed(keys + 1, [](Buffer &) { assert(false); }));
   // The tombstone rejects a late predictor until the miss batch expires.
   assert(!q.submit(keys + 1, 1, [](Buffer &) { assert(false); }));
@@ -264,7 +262,8 @@ static void abandonedHandoffDrain_p() {
          q.stats().discarded == 2);
   assert(q.submit(keys + 1, 2, [](Buffer &buffer) { buffer.value = 3; }));
   completed(q, 2);
-  assert(q.take(keys + 1, [](Buffer &) {}));
+  assert(q.claim(keys + 1));
+  assert(q.takeClaimed(keys + 1, [](Buffer &) {}));
 }
 
 /** Exercise every packed nibble position and multiple expert panels against
@@ -400,7 +399,6 @@ int main() {
   });
   assert(q.submit(keys, 1, [](Buffer &b) { b.value = 1; }));
   entered.get_future().wait();
-  assert(!q.take(keys, [](Buffer &) { assert(false); }));
   assert(!q.submit(keys, 1, [](Buffer &) { assert(false); }));
   q.expireBefore(2);
   assert(!q.submit(keys + 3, 1, [](Buffer &) { assert(false); }));
@@ -412,7 +410,8 @@ int main() {
   completed(q, 2);
   Buffer victim{std::make_shared<std::array<unsigned, 1024>>(), 99, 123};
   auto retired = victim.data;
-  assert(q.take(keys + 1, [&](Buffer &ready) {
+  assert(q.claim(keys + 1));
+  assert(q.takeClaimed(keys + 1, [&](Buffer &ready) {
     // Same handle transfer as the HTP miss answer; only buffers exchange.
     ready.handle = victim.handle;
     victim.handle = 0;
@@ -421,16 +420,16 @@ int main() {
   assert(victim.data == data && victim.handle == 123);
   for (auto value : *victim.data)
     assert(value == 2);
-  assert(!q.take(keys + 1, [](Buffer &) { assert(false); }));
+  assert(!q.claim(keys + 1));
   assert(q.submit(keys + 2, 3, [&](Buffer &b) {
     assert(b.data == retired && b.handle == 0);
     b.value = 3;
   }));
   completed(q, 3);
-  assert(!q.take(keys + 2, [](Buffer &) { assert(false); }));
+  assert(!q.claim(keys + 2));
   assert(q.submit(keys + 3, 4, [](Buffer &b) { b.value = 4; }));
   completed(q, 4);
-  assert(q.stats().failed == 2 && q.stats().used == 1 && q.stats().late == 1);
+  assert(q.stats().failed == 2 && q.stats().used == 1 && q.stats().late == 0);
 
   // A canceled queued index must not later execute a replacement job twice.
   std::promise<void> entered2, release2;
@@ -450,7 +449,8 @@ int main() {
   assert(queued.submit(keys + 2, 11, [](Buffer &b) { b.value = 11; }));
   release2.set_value();
   completed(queued, 2);
-  assert(queued.take(keys + 2, [](Buffer &b) {
+  assert(queued.claim(keys + 2));
+  assert(queued.takeClaimed(keys + 2, [](Buffer &b) {
     for (auto value : *b.data)
       assert(value == 11);
   }));
@@ -478,7 +478,6 @@ int main() {
   assert(claimed.submit(keys + 2, 20, [](Buffer &b) { b.value = 3; }));
   assert(claimed.claim(keys) && claimed.claim(keys + 2));
   assert(!claimed.claim(keys));
-  assert(!claimed.take(keys, [](Buffer &) { assert(false); }));
   claimed.expireBefore(21);
   claim_release.set_value();
   assert(claimed.takeClaimed(keys + 2, [](Buffer &b) {
@@ -528,11 +527,13 @@ int main() {
         b.value = static_cast<unsigned>(epoch * 8 + i);
       }));
     completed(stress, epoch * 8);
-    for (unsigned i = 0; i < 4; ++i)
-      assert(stress.take(keys + i, [epoch, i](Buffer &b) {
+    for (unsigned i = 0; i < 4; ++i) {
+      assert(stress.claim(keys + i));
+      assert(stress.takeClaimed(keys + i, [epoch, i](Buffer &b) {
         for (auto value : *b.data)
           assert(value == epoch * 8 + i);
       }));
+    }
     stress.expireBefore(epoch + 1);
   }
   stress.drain();

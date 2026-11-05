@@ -97,24 +97,6 @@ public:
     return false;
   }
 
-  /** Never waits for a guess. consume may swap in a retired demand buffer. */
-  template <typename Consume> bool take(const void *key, Consume consume) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &s : slots_) {
-      if (s.state == Free || s.retired || s.claimed || s.key != key)
-        continue;
-      if (s.state != Ready) {
-        ++stats_.late;
-        return false;
-      }
-      consume(s.buffer);
-      s.state = Free;
-      ++stats_.used;
-      return true;
-    }
-    return false;
-  }
-
   /** Reserve a real miss's speculative read. Queued demand goes first; an
    * in-flight read is joined after unrelated demand I/O instead of duplicated.
    * The sole consumer must finish claims with takeClaimed or drain.

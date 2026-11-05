@@ -281,7 +281,6 @@ static void retiredReadOwnsSlot(Fixture &f) {
   checkpoint(gate.entered_event);
   q.expireBefore(2);
   assert(!q.claim(keys));
-  assert(!q.take(keys, [](Buffer &) { assert(false); }));
   assert(!q.submit(keys + 1, 2, [](Buffer &) { assert(false); }));
   gate.allow_io.set_value();
   checkpoint(gate.read_event);
@@ -290,14 +289,15 @@ static void retiredReadOwnsSlot(Fixture &f) {
   gate.allow_return.set_value();
   completed(q, 1);
   assert(q.stats().discarded == 1 && q.stats().cancelled == 0);
-  assert(!q.take(keys, [](Buffer &) { assert(false); }));
+  assert(!q.claim(keys));
   assert(q.submit(keys + 1, 2, [&](Buffer &b) {
     assert(b.payload == original);
     b.offset = f.offsets[1];
     b.gated = false;
   }));
   completed(q, 2);
-  assert(q.take(keys + 1, [&](Buffer &b) { f.check(b); }));
+  assert(q.claim(keys + 1));
+  assert(q.takeClaimed(keys + 1, [&](Buffer &b) { f.check(b); }));
   assert(q.stats().used == 1 && q.stats().failed == 0);
 }
 
@@ -340,7 +340,8 @@ static void claimedReadSurvivesExpiry(Fixture &f) {
     b.gated = false;
   }));
   completed(q, 2);
-  assert(q.take(&key, [&](Buffer &b) { f.check(b); }));
+  assert(q.claim(&key));
+  assert(q.takeClaimed(&key, [&](Buffer &b) { f.check(b); }));
 }
 
 static void queuedExpiryAndGenerationReuse(Fixture &f) {
@@ -370,8 +371,9 @@ static void queuedExpiryAndGenerationReuse(Fixture &f) {
   gate.allow_return.set_value();
   completed(q, 2);
   assert(f.calls == before + 2);
-  assert(!q.take(keys + 1, [](Buffer &) { assert(false); }));
-  assert(q.take(keys + 2, [&](Buffer &b) { f.check(b); }));
+  assert(!q.claim(keys + 1));
+  assert(q.claim(keys + 2));
+  assert(q.takeClaimed(keys + 2, [&](Buffer &b) { f.check(b); }));
   assert(q.stats().submitted == 3 && q.stats().discarded == 2 &&
          q.stats().cancelled == 0);
 }
@@ -407,7 +409,8 @@ static void eofIsNeverAdopted(Fixture &f) {
     b.gated = false;
   }));
   completed(q, 2);
-  assert(q.take(&key, [&](Buffer &b) { f.check(b); }));
+  assert(q.claim(&key));
+  assert(q.takeClaimed(&key, [&](Buffer &b) { f.check(b); }));
 }
 
 /** Queued demand can finish while the speculative reader is still occupied.
@@ -472,7 +475,8 @@ static void queuedDemandRead(Fixture &f, unsigned failure) {
     b.gated = false;
   }));
   completed(q, 2);
-  assert(q.take(keys + 2, [&](Buffer &b) { f.check(b); }));
+  assert(q.claim(keys + 2));
+  assert(q.takeClaimed(keys + 2, [&](Buffer &b) { f.check(b); }));
   pool.run(1, [&](size_t) {
     Buffer retry{f.payload(), f.offsets[1]};
     assert(f.read(retry) == 0);

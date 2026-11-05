@@ -63,10 +63,9 @@ int main() {
   assert(!defaults.moe.decode_prefetch_readers &&
          defaults.moe.prefetch_slots == 32);
   assert(!defaults.moe.prefetch_top && defaults.moe.prefetch_residual == 0.5f);
-  assert(defaults.moe.miss_readers == 4 && defaults.moe.demand_pool);
+  assert(defaults.moe.miss_readers == 4);
   assert(defaults.moe.dma_queues == 4 && defaults.moe.gemv_lead_kb == 192);
-  assert(defaults.moe.m1_gemv && defaults.moe.gemv_feed &&
-         defaults.moe.gemv_rows1);
+  assert(defaults.moe.m1_gemv && defaults.moe.gemv_feed);
   assert(defaults.moe.hadamard == "off" &&
          defaults.moe.hadamard_scope == "2bit");
 
@@ -91,8 +90,7 @@ int main() {
   assert(lfm.htp.fc_whole_prefill && lfm.htp.lfm2_conv_whole_prefill);
   assert(lfm.htp.lfm2_parallel_norm && lfm.htp.lfm2_parallel_add);
   assert(lfm.htp.lfm2_parallel_stage && lfm.htp.lfm2_prefill_views);
-  assert(lfm.htp.lfm2_conv_retain_out && lfm.htp.lfm2_conv_state_only);
-  assert(lfm.htp.lfm2_conv_channel_tile && lfm.htp.lfm2_attn_ion_handoff);
+  assert(lfm.htp.lfm2_attn_ion_handoff);
   assert(lfm.htp.purge_prefill && lfm.htp.release_prefill_readers);
   assert(lfm.moe.cache_grow == 1 && lfm.moe.preload_experts == 128);
   assert(lfm.moe.prediction == "arm-direct" && lfm.moe.prefetch_slots == 6);
@@ -139,18 +137,23 @@ int main() {
   invalid({{"moe_hadamard", "both"}, {"moe", {{"hadamard", "off"}}}});
 
   for (const auto &value :
-       {json{{"htp", false}}, json{{"moe", "default"}},
+       {json{{"htp", false}},
+        json{{"moe", "default"}},
         json{{"htp", {{"cache_experts", 16}}}},
-        json{{"moe", {{"page_cache", 0}}}}, json{{"htp", {{"unknown", true}}}},
+        json{{"moe", {{"page_cache", 0}}}},
+        json{{"htp", {{"unknown", true}}}},
         json{{"htp", {{"dsp_queue", 1}}}},
         json{{"moe", {{"cache_experts", -1}}}},
         json{{"moe", {{"preload_experts", "128"}}}},
-        json{{"moe", {{"dma_queues", 0}}}}, json{{"moe", {{"dma_queues", 5}}}},
+        json{{"moe", {{"dma_queues", 0}}}},
+        json{{"moe", {{"dma_queues", 5}}}},
         json{{"moe", {{"decode_prefetch_readers", 0}}}},
         json{{"moe", {{"decode_prefetch_readers", 9}}}},
         json{{"moe", {{"worker_cpus", {0, 32}}}}},
         json{{"moe", {{"worker_cpus", {0, 1.5}}}}},
         json{{"moe", {{"prediction", "arm"}}}},
+        json{{"moe", {{"hadamard", "both_scalar"}}}},
+        json{{"moe_hadamard", "both_scalar"}},
         json{{"moe", {{"prefetch_residual", 1.01}}}},
         json{{"htp", {{"page_cache", 0}}},
              {"moe", {{"prediction", "dsp-page"}}}},

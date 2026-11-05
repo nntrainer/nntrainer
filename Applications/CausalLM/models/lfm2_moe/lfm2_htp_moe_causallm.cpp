@@ -198,7 +198,7 @@ std::pair<Tensor, Tensor> Lfm2HtpMoECausalLM::constructModel() {
       conv_props.push_back("short_conv_dtype=DW3_INT4");
 #if defined(__aarch64__) && defined(ENABLE_HEXKL)
       const auto &htp_config = nntrainer::htpRuntimeConfig().htp;
-      if (htp_config.lfm2_prefill_views && htp_config.lfm2_conv_retain_out)
+      if (htp_config.lfm2_prefill_views)
         conv_props.push_back("out_to_host=false");
 #endif
       LayerHandle conv(createLayer("conv_block", conv_props));

@@ -142,9 +142,9 @@ static bool lfmConvPostGatePrefill(const float *gated, const float *weights,
 }
 
 /** Fuse the pre-gate with convolution in independent row stripes. Each stripe
- * reconstructs its two boundary rows from the immutable projection, then reads
- * its own freshly written gated rows. Arithmetic and saved history are
- * unchanged.
+ * reconstructs its two boundary rows from the immutable projection, keeps
+ * preceding gated values in registers, and saves only the final two rows.
+ * Arithmetic and saved history are unchanged.
  */
 static bool lfmConvFusedGatePrefill(const float *projection,
                                     const float *weights, float *gated,
@@ -167,10 +167,8 @@ static bool lfmConvFusedGatePrefill(const float *projection,
       return false;
   if (!disjoint(gated, bytes, output, bytes))
     return false;
-  const auto &htp_config = nntrainer::htpRuntimeConfig().htp;
-  const bool channel_tile = htp_config.lfm2_conv_channel_tile;
-  const bool state_only = htp_config.lfm2_conv_state_only;
-  const unsigned stripe = htp_config.lfm2_conv_stripe_rows;
+  const unsigned stripe =
+    nntrainer::htpRuntimeConfig().htp.lfm2_conv_stripe_rows;
   nntrainer::ThreadManager::Global().parallel_for(
     0, (rows + stripe - 1u) / stripe, [&](size_t job) {
 #if defined(__clang__)
@@ -179,94 +177,60 @@ static bool lfmConvFusedGatePrefill(const float *projection,
       const unsigned first = unsigned(job) * stripe;
       const unsigned last = std::min(rows, first + stripe);
       const float32x4_t zero = vdupq_n_f32(0.0f);
-      if (channel_tile) {
-        constexpr unsigned width = 2048;
-        // One cache line per channel tile. Keep the three filter taps and
-        // two preceding gated vectors live while walking the row stripe.
-        // Only the final two gated rows are live after a helper call. The
-        // optional state-only path keeps those rows for the next chunk and
-        // decode; stripe boundaries are reconstructed from the projection.
-        for (unsigned c = 0; c < width; c += 16) {
-          float32x4_t w0[4], w1[4], w2[4], prev1[4], prev2[4];
+      constexpr unsigned width = 2048;
+      // One cache line per channel tile. Keep the three filter taps and
+      // two preceding gated vectors live while walking the row stripe.
+      // Only the final two gated rows are live after a helper call. Keep
+      // them for the next chunk and decode; stripe boundaries are
+      // reconstructed from the projection.
+      for (unsigned c = 0; c < width; c += 16) {
+        float32x4_t w0[4], w1[4], w2[4], prev1[4], prev2[4];
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (unsigned v = 0; v < 4; ++v) {
+          const unsigned offset = c + 4u * v;
+          w0[v] = vld1q_f32(weights + offset);
+          w1[v] = vld1q_f32(weights + width + offset);
+          w2[v] = vld1q_f32(weights + 2u * width + offset);
+          prev1[v] = zero;
+          prev2[v] = zero;
+          if (first) {
+            const float *q =
+              projection + size_t(first - 1u) * 3u * width + offset;
+            prev1[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
+            q -= 3u * width;
+            prev2[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
+          } else if (history) {
+            prev1[v] = vld1q_f32(history + width + offset);
+            prev2[v] = vld1q_f32(history + offset);
+          }
+        }
+        for (unsigned r = first; r < last; ++r) {
+          const float *p = projection + size_t(r) * 3u * width + c;
+          float *g = gated + size_t(r) * width + c;
+          float *out = output + size_t(r) * width + c;
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
 #pragma GCC unroll 4
 #endif
           for (unsigned v = 0; v < 4; ++v) {
-            const unsigned offset = c + 4u * v;
-            w0[v] = vld1q_f32(weights + offset);
-            w1[v] = vld1q_f32(weights + width + offset);
-            w2[v] = vld1q_f32(weights + 2u * width + offset);
-            prev1[v] = zero;
-            prev2[v] = zero;
-            if (first) {
-              const float *q =
-                projection + size_t(first - 1u) * 3u * width + offset;
-              prev1[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
-              q -= 3u * width;
-              prev2[v] = vmulq_f32(vld1q_f32(q + 2u * width), vld1q_f32(q));
-            } else if (history) {
-              prev1[v] = vld1q_f32(history + width + offset);
-              prev2[v] = vld1q_f32(history + offset);
-            }
+            const unsigned offset = 4u * v;
+            const float32x4_t cur = vmulq_f32(
+              vld1q_f32(p + 2u * width + offset), vld1q_f32(p + offset));
+            if (r + 2u >= rows)
+              vst1q_f32(g + offset, cur);
+            float32x4_t value = vmulq_f32(cur, w0[v]);
+            value = vfmaq_f32(value, prev1[v], w1[v]);
+            value = vfmaq_f32(value, prev2[v], w2[v]);
+            vst1q_f32(out + offset,
+                      vmulq_f32(value, vld1q_f32(p + width + offset)));
+            prev2[v] = prev1[v];
+            prev1[v] = cur;
           }
-          for (unsigned r = first; r < last; ++r) {
-            const float *p = projection + size_t(r) * 3u * width + c;
-            float *g = gated + size_t(r) * width + c;
-            float *out = output + size_t(r) * width + c;
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#elif defined(__GNUC__)
-#pragma GCC unroll 4
-#endif
-            for (unsigned v = 0; v < 4; ++v) {
-              const unsigned offset = 4u * v;
-              const float32x4_t cur = vmulq_f32(
-                vld1q_f32(p + 2u * width + offset), vld1q_f32(p + offset));
-              if (!state_only || r + 2u >= rows)
-                vst1q_f32(g + offset, cur);
-              float32x4_t value = vmulq_f32(cur, w0[v]);
-              value = vfmaq_f32(value, prev1[v], w1[v]);
-              value = vfmaq_f32(value, prev2[v], w2[v]);
-              vst1q_f32(out + offset,
-                        vmulq_f32(value, vld1q_f32(p + width + offset)));
-              prev2[v] = prev1[v];
-              prev1[v] = cur;
-            }
-          }
-        }
-        return;
-      }
-      for (unsigned r = first; r < last; ++r) {
-        const float *p = projection + size_t(r) * 3u * channels;
-        float *g = gated + size_t(r) * channels;
-        float *out = output + size_t(r) * channels;
-        for (unsigned c = 0; c < channels; c += 4) {
-          const float32x4_t cur =
-            vmulq_f32(vld1q_f32(p + 2u * channels + c), vld1q_f32(p + c));
-          vst1q_f32(g + c, cur);
-          float32x4_t prev1 = zero, prev2 = zero;
-          if (r > first)
-            prev1 = vld1q_f32(g - channels + c);
-          else if (r) {
-            const float *q = p - 3u * channels;
-            prev1 =
-              vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
-          } else if (history)
-            prev1 = vld1q_f32(history + channels + c);
-          if (r >= first + 2u)
-            prev2 = vld1q_f32(g - 2u * channels + c);
-          else if (r >= 2u) {
-            const float *q = p - 6u * channels;
-            prev2 =
-              vmulq_f32(vld1q_f32(q + 2u * channels + c), vld1q_f32(q + c));
-          } else if (history)
-            prev2 = vld1q_f32(history + r * channels + c);
-          float32x4_t v = vmulq_f32(cur, vld1q_f32(weights + c));
-          v = vfmaq_f32(v, prev1, vld1q_f32(weights + channels + c));
-          v = vfmaq_f32(v, prev2, vld1q_f32(weights + 2u * channels + c));
-          vst1q_f32(out + c, vmulq_f32(v, vld1q_f32(p + channels + c)));
         }
       }
     });

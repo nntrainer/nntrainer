@@ -54,7 +54,7 @@ cat > "$STAGE/nntr_config.json" <<EOF
   "lmhead_dtype": "FP32",
   "lmhead_untie": true,
   "skip_prefill": true,
-  "lora_rank": 0, "lora_alpha": 0, "lora_target": [], "bad_word_ids": [],
+  "bad_word_ids": [],
   "num_to_generate": 24, "init_seq_len": 512, "max_seq_len": 1024, "batch_size": 1,
   "tokenizer_file": "$STAGE/tokenizer.json",
   "sample_input": "<bos><|turn>user\nWhat is the capital of South Korea?<turn|>\n<|turn>model\n"

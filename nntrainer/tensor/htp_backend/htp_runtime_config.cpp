@@ -121,11 +121,10 @@ void validateHtpRuntimeConfig(const HtpRuntimeConfig &config) {
   require(m.gemv_lead_kb <= 8128, "moe.gemv_lead_kb must be 0..8128");
   require(m.dma_queues >= 1 && m.dma_queues <= 4,
           "moe.dma_queues must be 1..4");
-  require(
-    !m.hadamard ||
-      oneOf(*m.hadamard, {"off", "up", "down", "both", "both_scalar", "up_hmx",
-                          "down_hmx", "both_hmx", "both_paley"}),
-    "Invalid moe.hadamard mode");
+  require(!m.hadamard ||
+            oneOf(*m.hadamard, {"off", "up", "down", "both", "up_hmx",
+                                "down_hmx", "both_hmx", "both_paley"}),
+          "Invalid moe.hadamard mode");
   require(!m.hadamard_scope || oneOf(*m.hadamard_scope, {"2bit", "all"}),
           "moe.hadamard_scope must be 2bit or all");
   require(m.host_mask <= 7, "moe.host_mask must be 0..7");

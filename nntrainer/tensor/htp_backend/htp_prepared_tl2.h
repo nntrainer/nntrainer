@@ -7,7 +7,6 @@
 #ifndef __HTP_PREPARED_TL2_H__
 #define __HTP_PREPARED_TL2_H__
 #include "htp_prepared_qs2.h"
-#include "htp_runtime_config.h"
 #include "htp_tl2_opts.h"
 #include <algorithm>
 #include <atomic>
@@ -43,7 +42,6 @@ class PreparedTl2 {
   std::unique_ptr<PreparedQs2Stamp> stamp_;
   std::unordered_map<uint64_t, std::unique_ptr<Entry>> entries_;
   bool receipt_ = false;
-  const bool direct_read_ = htpRuntimeConfig().moe.tl2_direct_read;
 
   // Native codes and the arena tail are separated by unused QS2 capacity.
   // Scatter the contiguous file record directly into these destinations.
@@ -243,7 +241,7 @@ public:
       e.verified.store(true, std::memory_order_release);
     }
     const size_t bytes = native ? htp_tl2_native_bytes(K, N) : codes;
-    if (receipt_ && direct_read_) {
+    if (receipt_) {
       iovec parts[] = {{arena, bytes},
                        {arena + codes, palette ? tail - 4u : tail},
                        {palette, 4u}};

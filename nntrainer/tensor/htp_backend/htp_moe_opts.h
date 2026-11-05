@@ -26,12 +26,9 @@
  *  lets a call of at most 4 rows take the HVX GEMV path. */
 #define HTP_MOE_FLAG_M1_GEMV 1u
 
-/** @brief hexkl_mm_u8i4_moe.h's two tune bits and their fields, restated
- *  for the ARM side (#113). Bit 7 says the DSP takes the l2fetch lead from
- *  bits [15:8], in units of HTP_MOE_GEMV_LEAD_KB_UNIT KB, instead of from
- *  its build default; bit 6 says the same of the row loop in bit 16. They
- *  are separate so that naming one knob leaves the other at the build's
- *  value rather than silently resetting it to zero. */
+/** @brief DSP wire override bits. Bit 7 selects the explicit l2fetch lead
+ * in bits [15:8]; bit 6 selects the one-row loop through bit 16. The host
+ * always sends both, so the DSP echo verifies the selected kernel settings. */
 #define HTP_MOE_FLAG_GEMV_LEAD_SET 0x80u
 #define HTP_MOE_FLAG_GEMV_ROWS1_SET 0x40u
 #define HTP_MOE_GEMV_LEAD_SHIFT 8u
@@ -46,15 +43,10 @@
 #define HTP_MOE_FLAG_GEMV_FEED_SET 0x20u
 #define HTP_MOE_FLAG_GEMV_FEED 0x20000u
 
-/** @brief Bit 18 sets src_bypass on arena expert weight descriptors for
- *  both GEMV and HMX, matching hexkl_mm_u8i4_moe.h. Enabled by default;
- *  The runtime can explicitly disable it. */
+/** @brief Bit 18 enables src_bypass on clean expert weight descriptors for
+ *  both GEMV and HMX, matching hexkl_mm_u8i4_moe.h. The DSP retains its
+ *  dirty-source check before setting the descriptor bit. */
 #define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
-
-/** @brief Source-cache bypass for expert weight DMA. */
-static inline uint32_t htp_moe_opts_dma_bypass(unsigned enabled) {
-  return enabled ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
-}
 
 /** @brief Bits [23:22] encode N - 1 DMA queues for the M=1 weight feed,
  *  matching hexkl_mm_u8i4_moe.h. */
@@ -85,14 +77,13 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
  * The app defaults to 2-bit experts; the shared FFN stays unchanged. */
 #define HTP_MOE_FLAG_HAD_UP 0x04000000u
 #define HTP_MOE_FLAG_HAD_DOWN 0x08000000u
-#define HTP_MOE_FLAG_HAD_SCALAR 0x10000000u
 #define HTP_MOE_FLAG_HAD_HMX 0x20000000u
 #define HTP_MOE_FLAG_HAD_2BIT_ONLY 0x40000000u
 #define HTP_MOE_FLAG_HAD_PALEY_I 0x80000000u
 #define HTP_MOE_FLAG_HAD_MASK 0xfc000000u
 
-/** moe.hadamard: unset/off, up, down, both, both_scalar,
- * up_hmx, down_hmx, both_hmx, both_paley. HMX uses full-width FP16 on prefill;
+/** moe.hadamard: unset/off, up, down, both, up_hmx, down_hmx,
+ * both_hmx, both_paley. HMX uses full-width FP16 on prefill;
  * calls of at most four tokens and HVX expert tails keep FP32.
  * Invalid values leave the output untouched and fail instead of silently
  * benchmarking the baseline. */
@@ -108,9 +99,6 @@ static inline int htp_moe_opts_hadamard(const char *env, uint32_t *bits) {
   else if (strcmp(env, "both_paley") == 0)
     *bits =
       HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_PALEY_I;
-  else if (strcmp(env, "both_scalar") == 0)
-    *bits =
-      HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_DOWN | HTP_MOE_FLAG_HAD_SCALAR;
   else if (strcmp(env, "up_hmx") == 0)
     *bits = HTP_MOE_FLAG_HAD_UP | HTP_MOE_FLAG_HAD_HMX;
   else if (strcmp(env, "down_hmx") == 0)
@@ -135,18 +123,13 @@ static inline int htp_moe_opts_hadamard_scope(const char *env, uint32_t *bits) {
   return 0;
 }
 
-/** @brief The bits of moe_set_opts' echo that must equal what was sent.
- *  With the GEMV on, all of them. With it off, the tune bits mean nothing
- *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
- *  for, because the HMX loop's weight DMA honours it (#158): a skel that
- *  predates it must fail the run, not measure the default. Likewise the
- *  GeGLU bit: a skel without it would run SwiGLU on a Gemma expert. */
+/** @brief Settings the DSP must echo. GEMV requires the full word; HMX
+ * requires dispatch, clean-source DMA bypass and activation/rotation bits. */
 static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
   if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
     return ~0u;
-  return HTP_MOE_FLAG_M1_GEMV |
-         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU |
-                   HTP_MOE_FLAG_HAD_MASK));
+  return HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS |
+         (flags & (HTP_MOE_FLAG_GEGLU | HTP_MOE_FLAG_HAD_MASK));
 }
 
 /** @brief Round the lead to 64 KiB units, bounded by the DMA field. */
@@ -157,16 +140,16 @@ static inline uint32_t htp_moe_gemv_lead_units(unsigned kb) {
                                              : (uint32_t)units;
 }
 
-/** @brief Encode explicit GEMV settings for the DSP session. */
+/** @brief Encode GEMV settings with the one-row loop and clean-source DMA
+ * bypass always enabled. The DSP still selects multirow loops by shape. */
 static inline uint32_t htp_moe_opts_flags(unsigned enabled, unsigned lead_kb,
-                                          unsigned rows1, unsigned feed) {
+                                          unsigned feed) {
   uint32_t flags = HTP_MOE_FLAG_GEMV_LEAD_SET | HTP_MOE_FLAG_GEMV_ROWS1_SET |
-                   HTP_MOE_FLAG_GEMV_FEED_SET;
+                   HTP_MOE_FLAG_GEMV_FEED_SET | HTP_MOE_FLAG_GEMV_ROWS1 |
+                   HTP_MOE_FLAG_DMA_BYPASS;
   if (enabled)
     flags |= HTP_MOE_FLAG_M1_GEMV;
   flags |= htp_moe_gemv_lead_units(lead_kb) << HTP_MOE_GEMV_LEAD_SHIFT;
-  if (rows1)
-    flags |= HTP_MOE_FLAG_GEMV_ROWS1;
   if (feed)
     flags |= HTP_MOE_FLAG_GEMV_FEED;
   return flags;

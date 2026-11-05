@@ -54,12 +54,12 @@ int main(void) {
            "all-weight scope");
     expect(htp_moe_opts_hadamard_scope("", &scope) == -1 && scope == 0u,
            "invalid scope is rejected without changing output");
-    const char *names[] = {NULL,       "off",         "up",     "down",
-                           "both",     "both_scalar", "up_hmx", "down_hmx",
-                           "both_hmx", "both_paley"};
-    const uint32_t words[] = {
-      0u,          0u,          0x04000000u, 0x08000000u, 0x0c000000u,
-      0x1c000000u, 0x24000000u, 0x28000000u, 0x2c000000u, 0x8c000000u};
+    const char *names[] = {NULL,       "off",      "up",
+                           "down",     "both",     "up_hmx",
+                           "down_hmx", "both_hmx", "both_paley"};
+    const uint32_t words[] = {0u,          0u,          0x04000000u,
+                              0x08000000u, 0x0c000000u, 0x24000000u,
+                              0x28000000u, 0x2c000000u, 0x8c000000u};
     for (size_t i = 0; i < sizeof words / sizeof *words; ++i) {
       uint32_t bits = 0xdeadu;
       expect(htp_moe_opts_hadamard(names[i], &bits) == 0 && bits == words[i],
@@ -67,7 +67,8 @@ int main(void) {
       expect((htp_moe_opts_must_match(bits) & bits) == bits,
              "Hadamard must be echoed even without GEMV");
     }
-    const char *invalid[] = {"", "0", "1", "Both", "both ", "both-scalar"};
+    const char *invalid[] = {"",      "0",           "1",          "Both",
+                             "both ", "both-scalar", "both_scalar"};
     for (size_t i = 0; i < sizeof invalid / sizeof *invalid; ++i) {
       uint32_t bits = 0xdeadu;
       expect(htp_moe_opts_hadamard(invalid[i], &bits) == -1 && bits == 0xdeadu,
@@ -76,17 +77,16 @@ int main(void) {
   }
   // Expected wire words are independent of the option encoder.
   const struct {
-    unsigned enabled, lead_kb, rows1, feed;
+    unsigned enabled, lead_kb, feed;
     uint32_t word;
   } tunes[] = {
-    {1, 192, 1, 1, 0x303e1u}, {0, 192, 1, 1, 0x303e0u},
-    {1, 0, 0, 0, 0x000e1u},   {1, 1536, 1, 1, 0x318e1u},
-    {1, 192, 0, 1, 0x203e1u}, {1, 192, 1, 0, 0x103e1u},
-    {1, 0, 0, 1, 0x200e1u},   {1, 8128, 1, 1, 0x37fe1u},
+    {1, 192, 1, 0x703e1u},  {0, 192, 1, 0x703e0u}, {1, 0, 0, 0x500e1u},
+    {1, 1536, 1, 0x718e1u}, {1, 192, 0, 0x503e1u}, {1, 0, 1, 0x700e1u},
+    {1, 8128, 1, 0x77fe1u},
   };
   for (size_t i = 0; i < sizeof tunes / sizeof *tunes; ++i)
     expect(htp_moe_opts_flags(tunes[i].enabled, tunes[i].lead_kb,
-                              tunes[i].rows1, tunes[i].feed) == tunes[i].word,
+                              tunes[i].feed) == tunes[i].word,
            "GEMV options preserve the DSP wire word");
   expect(htp_moe_gemv_lead_units(0) == 0u, "zero lead");
   expect(htp_moe_gemv_lead_units(31) == 0u, "31 KB rounds down");
@@ -97,21 +97,16 @@ int main(void) {
   expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
            !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
          "feed names match their bits");
-  expect(htp_moe_opts_dma_bypass(1) == 0x40000u &&
-           htp_moe_opts_dma_bypass(0) == 0u,
-         "DMA source bypass bit");
   expect(htp_moe_opts_must_match(0x703e1u) == ~0u,
          "GEMV requires the complete echoed word");
-  expect(htp_moe_opts_must_match(0x303e0u) == HTP_MOE_FLAG_M1_GEMV,
-         "HMX without bypass requires only the dispatch bit");
   expect(htp_moe_opts_must_match(0x703e0u) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS),
          "HMX still requires DMA bypass");
-  expect(htp_moe_opts_must_match(0x803e0u) ==
-           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEGLU),
-         "HMX still requires the activation bit");
-  const uint32_t base =
-    htp_moe_opts_flags(1, 192, 1, 1) | htp_moe_opts_dma_bypass(1);
+  expect(
+    htp_moe_opts_must_match(0xc03e0u) ==
+      (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU),
+    "HMX still requires the activation bit");
+  const uint32_t base = htp_moe_opts_flags(1, 192, 1);
   const uint32_t queue_words[] = {0x703e1u, 0x4703e1u, 0x8703e1u, 0xc703e1u};
   for (unsigned queues = 1; queues <= 4; ++queues) {
     uint32_t bits = 0xdeadu;

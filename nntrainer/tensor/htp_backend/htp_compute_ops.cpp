@@ -3053,19 +3053,13 @@ public:
         // Transfer the retired pair to the prepared buffer. The old buffer
         // becomes a spare with no DSP handles. S1 rebinds that pair in its
         // existing miss answer, after evicting its former graph entry.
-        const bool join = htpRuntimeConfig().moe.prefetch_join;
         const bool handoff = htpRuntimeConfig().moe.lfm2_decode_demand_handoff;
         for (auto &st : p.pending) {
-          if (join)
-            st.prefetch_claimed = pool_prefetch_->claim(
-              st.d.key_gu, handoff && weightPageCachePolicy() == 0 &&
-                             st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
-                             st.d.K == 2048u && st.d.inter == 1536u &&
-                             st.d.N_out == 2048u);
-          else
-            pool_prefetch_->take(st.d.key_gu, [&st](StagedExpert &ready) {
-              adoptPrefetch(st, ready);
-            });
+          st.prefetch_claimed = pool_prefetch_->claim(
+            st.d.key_gu, handoff && weightPageCachePolicy() == 0 &&
+                           st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
+                           st.d.K == 2048u && st.d.inter == 1536u &&
+                           st.d.N_out == 2048u);
         }
         pool_prefetch_->expireBefore((uint64_t(p.tok) << 32) + r.op + 1u);
       }
@@ -3691,17 +3685,12 @@ public:
       // The fixed int8-cache policy uses scales from the prefill seed:
       // 1 selects the first cache shape, 2 selects both shapes.
       constexpr bool q8 = true;
-      // htp.attn_m1_fast=1: the integer forward over the
-      // int8 cache (HVX_ATTN_M1_FAST; not bit-identical to the CPU)
-      const bool fast_knob = htpRuntimeConfig().htp.attn_m1_fast;
-      const bool fast = q8 && fast_knob;
       // lazy: a layer's cache comes at its seed, after the layer
       // before it freed its quantized prefill cache (HVX_ATTN_M1_LAZY)
       const int rc = nntr_hvx_attn_m1_register(
         session, n_attn, rec->n_kv, rec->gqa, rec->head_dim,
         max_seq | (q8 ? 0x80000000u : 0u) |
-          (kvSeedQ() || kvAdopt() ? 0x40000000u : 0u) |
-          (fast ? 0x20000000u : 0u));
+          (kvSeedQ() || kvAdopt() ? 0x40000000u : 0u));
       if (rc != AEE_SUCCESS) {
         throw std::runtime_error("nntr_hvx_attn_m1_register failed: " +
                                  graphErr(rc));
@@ -3714,14 +3703,11 @@ public:
                    (unsigned long long)n_attn * rec->n_kv * rec->head_dim *
                      ((max_seq + 63u) / 64u * 64u) * 2u *
                      (q8 ? 1u : sizeof(uint16_t)) / 1024u,
-                   fast ? " int8 fast" : (q8 ? " int8" : ""));
+                   q8 ? " int8" : "");
     }
   }
 
-  /** Send the configured session options once. Rejected or mismatched options
-   * throw to prevent silent kernel changes; an older skel may continue only
-   * when GEMV is explicitly off and no additional required options are
-   * requested. */
+  /** Send the session options once and reject unsupported kernel settings. */
   void sendMoeOptsOnce(remote_handle64 session) {
     std::call_once(moe_opts_once_, [this, session]() {
       std::lock_guard<std::mutex> lock(moe_opts_mutex_);
@@ -3746,26 +3732,13 @@ public:
         had_bits |= had_scope_bits;
       const uint32_t flags =
         htp_moe_opts_flags(config.m1_gemv, config.gemv_lead_kb,
-                           config.gemv_rows1, config.gemv_feed) |
-        htp_moe_opts_dma_bypass(config.dma_bypass) | queue_bits | had_bits |
-        (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
+                           config.gemv_feed) |
+        queue_bits | had_bits | (moeGeglu().load() ? HTP_MOE_FLAG_GEGLU : 0u);
       const char *source = "config";
       uint32_t applied = 0;
       const int err = nntr_hvx_moe_set_opts(session, flags, &applied);
-      if (htp_moe_opts_must_match(flags) == HTP_MOE_FLAG_M1_GEMV &&
-          err != AEE_SUCCESS) {
-        // The opt-out was asked for, and a skel that predates moe_set_opts
-        // runs the HMX loop, which is what "off" means: say so and go on.
-        std::fprintf(stderr,
-                     "[HTP] moe m1 gemv: off (moe_set_opts err=0x%08x; the "
-                     "skel predates it) source=%s\n",
-                     static_cast<unsigned>(err), source);
-        return;
-      }
-      // Off: only bit 0 (and #158's bypass bit, if asked for) has to be
-      // echoed. The tune bits are always sent (htp_moe_opts_flags) but mean
-      // nothing on the HMX loop, so a skel that predates them must not fail
-      // an opt-out run.
+      // GEMV tuning bits do not affect HMX calls, but clean-source DMA
+      // bypass and the requested activation/rotation must still be echoed.
       const uint32_t must_match = htp_moe_opts_must_match(flags);
       if (err != AEE_SUCCESS || ((applied ^ flags) & must_match) != 0u) {
         char buf[160];
@@ -7077,8 +7050,7 @@ private:
         // A real miss claims its read before expiry, so only a retired guess
         // can skip down. The worker still owns its slot until it returns.
         if (st.d.w_bits == HTP_TL2_WEIGHT_BITS &&
-            weightPageCachePolicy() == 0 && cancelStaleExpertReads() &&
-            cancelled())
+            weightPageCachePolicy() == 0 && cancelled())
           return Prefetch::ReadResult::Cancelled;
         st.rc = readExpertWeight(st, true, false);
         return st.rc == 0 ? Prefetch::ReadResult::Complete
@@ -7454,17 +7426,6 @@ private:
                            st.base, e, use_pool);
   }
 
-  /** Diagnostic opt-outs keep both changes independently measurable. */
-  static bool coalesceExpertReads() {
-    const bool enabled = htpRuntimeConfig().moe.coalesce_read;
-    return enabled;
-  }
-
-  static bool cancelStaleExpertReads() {
-    const bool enabled = htpRuntimeConfig().moe.cancel_stale_read;
-    return enabled;
-  }
-
   static bool validNativeTl2Shape(uint32_t K, uint32_t N) {
     return K && N && K <= 8192u && N <= 8192u && K % 32u == 0 &&
            N % 128u == 0 && htp_tl2_native_bytes(K, N) <= whBytes2(K, N);
@@ -7473,8 +7434,8 @@ private:
   /** Only adjacent native TL2 records that fit one aligned direct read.
    * Invalid shapes fall through to the regular reader's error handling. */
   static bool canReadExpertTogether(const ExpertFileDesc &d) {
-    if (!coalesceExpertReads() || weightPageCachePolicy() != 0 ||
-        d.w_bits != HTP_TL2_WEIGHT_BITS || !d.inter || d.inter > 4096u ||
+    if (weightPageCachePolicy() != 0 || d.w_bits != HTP_TL2_WEIGHT_BITS ||
+        !d.inter || d.inter > 4096u ||
         !validNativeTl2Shape(d.K, 2u * d.inter) ||
         !validNativeTl2Shape(d.inter, d.N_out))
       return false;
@@ -7561,29 +7522,16 @@ private:
                      ? readExpertTogether(st[part / 2])
                      : readExpertWeight(st[part / 2], part % 2 != 0, false);
       };
-      // A small miss batch need not wake every compute worker and leave
-      // them spinning between I/O rounds. Zero restores the compute pool.
-      const bool dedicated = htpRuntimeConfig().moe.demand_pool;
-      if (dedicated) {
-        if (!demand_read_pool_) {
-          const size_t readers = std::min<size_t>(
-            missReaders(), ThreadManager::Global().getComputeThreadCount());
-          auto cpus =
-            HtpWorkerPolicy::backgroundCpus(HtpWorkerPolicy::cpuBit());
-          demand_read_pool_.reset(new HtpExpertReadPool(
-            readers, [cpus] { HtpWorkerPolicy::pinToCpus(cpus); }));
-          std::fprintf(stderr, "[HTP] demand read pool: readers=%zu\n",
-                       readers);
-        }
-        demand_read_pool_->run(n_jobs, read);
-      } else {
-        std::atomic<size_t> next{0};
-        ThreadManager::Global().parallel_for(
-          0, std::min(missReaders(), n_jobs), [&](size_t) {
-            for (size_t j; (j = next.fetch_add(1)) < n_jobs;)
-              read(j);
-          });
+      // Keep I/O waits off the compute workers between miss rounds.
+      if (!demand_read_pool_) {
+        const size_t readers = std::min<size_t>(
+          missReaders(), ThreadManager::Global().getComputeThreadCount());
+        auto cpus = HtpWorkerPolicy::backgroundCpus(HtpWorkerPolicy::cpuBit());
+        demand_read_pool_.reset(new HtpExpertReadPool(
+          readers, [cpus] { HtpWorkerPolicy::pinToCpus(cpus); }));
+        std::fprintf(stderr, "[HTP] demand read pool: readers=%zu\n", readers);
       }
+      demand_read_pool_->run(n_jobs, read);
     }
     for (size_t i = 0; i < st.size(); ++i) {
       auto &expert = st[i];
@@ -9070,10 +9018,6 @@ private:
    * TL2 residents before their HMX use. Prefetch is joined at the boundary.
    * StagedExpert captures each read's format, independently of this flag. */
   void switchTl2Phase(bool native) {
-    // A matched QS2 control reads the same validated artifact and uses the
-    // same host reader, but keeps its prefill representation for decode.
-    if (!htpRuntimeConfig().moe.tl2_decode)
-      native = false;
     if (!prepared_tl2_ || tl2_decode_ == native)
       return;
     if (cpu_predictor_)

@@ -56,14 +56,10 @@ static bool sameOutput(const float *a, const float *b, size_t count) {
   return std::memcmp(a, b, count * sizeof(float)) == 0;
 #endif
 }
-static bool stateOnlyGated() {
-  const auto &config = nntrainer::htpRuntimeConfig().htp;
-  return config.lfm2_conv_channel_tile && config.lfm2_conv_state_only;
-}
+/** Validate scratch only after a successful fused helper; generic fallback
+ * keeps its full gated rows and uses the full-output oracle. */
 static bool sameGated(const float *got, const float *expected, size_t count,
                       unsigned rows, bool chunked = false) {
-  if (!stateOnlyGated())
-    return sameOutput(got, expected, count);
   const bool split =
     chunked && !nntrainer::htpRuntimeConfig().htp.lfm2_conv_whole_prefill;
   for (size_t r = 0; r < count / 2048u; ++r) {
@@ -902,16 +898,14 @@ static void whole_numeric() {
 int main(int argc, char **argv) {
   try {
     const std::string mode = argc > 1 ? argv[1] : "chunk";
-    check(mode == "chunk" || mode == "whole" || mode == "whole-views" ||
-            mode == "whole-state",
+    check(mode == "chunk" || mode == "whole" || mode == "whole-views",
           "invalid mode");
+    const unsigned stripe = argc > 2 ? std::stoul(argv[2]) : 64u;
+    check(stripe == 8u || stripe == 64u, "invalid fixture stripe");
     nntrainer::HtpRuntimeConfig config;
     config.htp.lfm2_conv_whole_prefill = mode != "chunk";
-    config.htp.lfm2_prefill_views =
-      mode == "whole-views" || mode == "whole-state";
-    config.htp.lfm2_conv_retain_out = config.htp.lfm2_prefill_views;
-    config.htp.lfm2_conv_channel_tile = mode == "whole-state";
-    config.htp.lfm2_conv_state_only = mode == "whole-state";
+    config.htp.lfm2_prefill_views = mode == "whole-views";
+    config.htp.lfm2_conv_stripe_rows = stripe;
     nntrainer::configureHtpRuntime(config);
     if (config.htp.lfm2_prefill_views)
       retained_host_views();
@@ -920,7 +914,7 @@ int main(int argc, char **argv) {
       if (config.htp.lfm2_prefill_views)
         retained_output_route();
       fused_gate_stripes();
-      std::printf("CONV_WHOLE %u cases PASS\n", cases);
+      std::printf("CONV_WHOLE stripe=%u %u cases PASS\n", stripe, cases);
       return 0;
     }
     numeric();
@@ -930,7 +924,7 @@ int main(int argc, char **argv) {
     app_guards();
     unchanged_and_ranges();
     fused_gate_stripes();
-    std::printf("CONV_CHUNK %u cases PASS\n", cases);
+    std::printf("CONV_CHUNK stripe=%u %u cases PASS\n", stripe, cases);
     return 0;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "CONV_CHUNK FAIL: %s\n", e.what());

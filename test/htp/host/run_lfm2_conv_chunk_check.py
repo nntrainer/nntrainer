@@ -33,8 +33,14 @@ if full_helper(s)!=full_helper(b):
  raise RuntimeError('Existing full-row helper differs from the baseline')
 start=s.index('// The app enables fast-math,')
 end=s.index('ConvBlockLayer::ConvBlockLayer() :')
-bs=b.index('// The app enables fast-math,');be=b.index('ConvBlockLayer::ConvBlockLayer() :')
-chunks={'candidate_helpers.inc':s[start:end], 'baseline_helpers.inc':b[bs:be]}
+# Only the independent full-row oracle is used from the historical source.
+# Other historical helpers may still name retired runtime configuration keys.
+bs=b.index('// The app enables fast-math,')
+be=b.index('static bool lfmConvPostGatePrefill(')+len(full_helper(b))
+pop=b.index('#if defined(__clang__)\n#pragma float_control(pop)',be)
+pop_end=b.index('#endif',pop)+len('#endif')
+chunks={'candidate_helpers.inc':s[start:end],
+ 'baseline_helpers.inc':b[bs:be]+'\n'+b[pop:pop_end]+'\n'}
 core=(a.repo/'nntrainer/tensor/htp_backend/htp_compute_ops.cpp').read_text()
 hs=core.index('  const void *host_view(');he=core.index('  bool gemm_qs4cx_res_add_fp32(',hs)
 chunks['views.inc']=core[hs:he].replace('staging_.', '')
@@ -60,6 +66,7 @@ manifest={'source_sha256':hashlib.sha256(s.encode()).hexdigest(),'baseline_sha25
  'staging_sha256':hashlib.sha256((a.repo/'nntrainer/tensor/htp_backend/htp_staging.h').read_bytes()).hexdigest(),
  'extracts':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in chunks.items()},
  'compile':cmd,'run':[str((a.output/'check').resolve())],
+ 'cases':[['chunk','64'],['whole','64'],['whole-views','64'],['whole-views','8']],
  'arithmetic':'native ARM NEON' if a.native_arm else 'SIMDe0.8.2 on x86 FMA',
  'standins':['Actual app arithmetic; simulated NEON results require separate native ARM validation.',
  'HTP allocation uses aligned host heap with actual fit/stage/input/alias helpers; fake RPC writes deterministic projection bytes.',
@@ -67,5 +74,6 @@ manifest={'source_sha256':hashlib.sha256(s.encode()).hexdigest(),'baseline_sha25
 (a.output/'commands.json').write_text(json.dumps(manifest,indent=2)+'\n')
 subprocess.run(cmd,check=True)
 if not a.build_only:
- for mode in ('chunk', 'whole', 'whole-views', 'whole-state'):
-  subprocess.run(manifest['run']+[mode],check=True)
+ # API defaults use stripe64; the retained CLI prefill uses stripe8.
+ for case in manifest['cases']:
+  subprocess.run(manifest['run']+case,check=True)

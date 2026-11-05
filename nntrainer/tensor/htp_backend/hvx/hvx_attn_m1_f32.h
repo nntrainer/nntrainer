@@ -121,15 +121,6 @@ typedef struct {
   float *sk_floor;
   float *sv_floor;
   size_t layer_bytes; /**< [#289] kt[l] / v[l] size, for a lazy layer */
-  /** [#4416 F] HVX_ATTN_M1_FAST at create (needs q8, head_dim % 256 == 0):
-   *  the forward is NOT the fp16 spec. q is int16 a head (x K's per-dim
-   *  scale), the scores int32 by vmpyh over the int8 tiles -> f32; the
-   *  softmax f32 with P as 15-bit integers in s; PV int32 by vmpyh over
-   *  the int8 rows, flushed to f32 every 256 positions. Same cache bytes */
-  uint32_t fast;
-  float *sf;     /**< f32 [n_kv * gqa][seq]: the scores */
-  int16_t *q16;  /**< [n_kv * gqa][head_dim]: q quantized */
-  int32_t *psum; /**< [n_kv * gqa][seq / 64]: a tile's P sum */
   /** [C] [n_layers] seeds on the pool's background lane
    *  (hvx_attn_m1_seed_q8_tiles_async); NULL until the first */
   struct hvx_attn_m1_seed_bg *seed_bg;
@@ -151,10 +142,6 @@ typedef struct {
  *  at its first seed or forward, not at create, so a seed can free the
  *  prefill's cache of that layer before the next layer's comes. */
 #define HVX_ATTN_M1_LAZY 0x40000000u
-/** @brief [#4416 F] Or-ed into create's max_seq: the integer forward (not
- *  bit-identical to the spec); refused without HVX_ATTN_M1_Q8, at a
- *  head_dim that is not a multiple of 256, or a gqa not 1, 2, 4 or 8. */
-#define HVX_ATTN_M1_FAST 0x20000000u
 /** @brief [#282 D] Headroom of the int8 scales over the seed's amax. */
 #define HVX_ATTN_M1_Q8_MARGIN 1.0f
 
@@ -165,7 +152,8 @@ typedef struct {
  * @param n_kv      kv heads, >= 1
  * @param gqa       q heads per kv head, 1..8, with n_kv * gqa <= 64
  * @param head_dim  a multiple of 64 up to ATTN_M1_DET_MAX_HD (512)
- * @param max_seq   a multiple of 32; the position bound
+ * @param max_seq   a multiple of 32; the position bound. Q8 and LAZY flags
+ *                  are supported; retired mode bit 0x20000000 is rejected.
  * @param pool      the session's worker pool, borrowed; may be NULL
  * @param err       receives AEE_SUCCESS, AEE_EINVALIDFORMAT (shape, or a
  *                  cache past 2 GiB) or AEE_ENOMEMORY; may be NULL. Every

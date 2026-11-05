@@ -21,9 +21,6 @@
   "dense_ffn_engine": "htp",
   "attention_engine": "htp",
   "lmhead_engine": "cpu",
-  "lora_alpha": 0,
-  "lora_rank": 0,
-  "lora_target": [],
   "gemma4_execution_profile": "htp_fused",
   "gemma4_weight_format": "htp_fused_v1",
   "use_chat_template": true

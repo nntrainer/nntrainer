@@ -57,7 +57,7 @@ STAGE0_CONFIG = {
     "fc_layer_dtype": "Q4_0", "init_seq_len": 2048, "lmhead_dtype": "Q4_0",
     "max_seq_len": 2304, "model_file_name": STAGE0_FILE,
     "model_tensor_type": "Q4_0-FP32", "model_type": "CausalLM",
-    "moe_cache_experts": 16, "moe_decode_prefetch": True, "moe_engine": "htp",
+    "moe_cache_experts": 16, "moe_engine": "htp",
     "moe_layer_dtype": "QS2CX_WH", "num_to_generate": 128,
     "sample_input": "<bos><|turn>user\nHello<turn|>\n<|turn>model\n",
     "skip_prefill": False, "tokenizer_file": "tokenizer.json"}
@@ -432,18 +432,14 @@ def main():
                        moe_hadamard_scope="all", moe_hadamard_signs="rotation_signs.json")
     table = act_scale_table(source)
     if table:
-        # Tail of the binary: float32 scale, int32 offset per site. The loader
-        # reads the weights ahead of it and ignores the tail; the HTP runtime
-        # reads it only with htp_act_quant "static" (default "dynamic").
-        size = (output / MODEL_FILE).stat().st_size
+        # Preserve the scale/offset trailer and its sidecar for artifact
+        # compatibility. The runtime loader reads only the preceding weights.
         with (output / MODEL_FILE).open("ab") as stream:
             for site in table:
                 stream.write(struct.pack("<fi", site["scale"], site["offset"]))
         (output / ACT_TABLE_FILE).write_text(json.dumps(
             {"format": "nntr_act_scales_v1", "source": ACT_ENCODINGS,
              "record": "<float32 scale, int32 offset>", "sites": table}, indent=1) + "\n")
-        nntr_config.update(act_scale_offset=size, act_scale_bytes=8 * len(table),
-                           act_scale_sites=len(table), act_scale_json=ACT_TABLE_FILE)
     (output / "nntr_config.json").write_text(json.dumps(nntr_config, indent=2) + "\n")
     extra = global_attention_keys(config, ckpt)
     if extra.keys() - config.keys():

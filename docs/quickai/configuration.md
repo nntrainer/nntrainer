@@ -118,6 +118,7 @@ checks; **LFM2** = only affects the LFM2 model or its layer shapes.
 | `qkv_to_host` | bool | `false` | | Copies QKV outputs whole to the host (reference path). | diagnostic |
 | `oproj_u16` | bool | `true` | | `false` dequantizes the attention context on the host instead of the DSP's u16 input path (reference). | diagnostic |
 | `kv_seed_q` | bool | `false` | | Registers decode attention lazily and seeds each layer's decode KV from its quantized prefill cache on the DSP. | tuning |
+| `kv_adopt` | bool | `true` | | Seeds decode KV directly from each layer's quantized prefill cache on the DSP. | tuning |
 | `attn_f16` | bool | `true` | | `false` disables the accelerated attention path (CPU attention). | policy |
 | `attn_q2` | bool | `true` | | Allows the int8 KV-cache attention kernel. | policy |
 | `attn_dsp_calib` | bool | `true` | | Runs the int8 scale calibration on the DSP when possible. | tuning |
@@ -126,18 +127,14 @@ checks; **LFM2** = only affects the LFM2 model or its layer shapes.
 | `attn_f16_check` | bool | `false` | | Compares DSP fp16 attention against the CPU on the same rows. | diagnostic |
 | `attn_f32_check` | optional int | `null` | ≥ 0 | FP32 reference check: 1 compares with NEON, 2 reruns the DSP; disables the DSP calibration. | diagnostic |
 | `q2_margin` | float | `1.0` | > 0 | Multiplier on the observed K/V maxima when deriving int8 KV scales. | tuning |
-| `attn_m1_fast` | bool | `false` | | Integer decode attention over the int8 cache; faster, not bit-identical to the CPU reference. | tuning |
 | `l2_check` | bool | `false` | | Checks DSP outputs and row scales for non-finite values. | diagnostic |
 | `l2_diff` | bool | `false` | | Runs both MoE FFN paths and reports their SNR. | diagnostic |
 | `l2_shadow` | bool | `false` | | Runs the accelerated path, then substitutes the reference output. | diagnostic |
 | `lfm2_default_preset` | bool | `true` | | `false` stops the command line from merging the LFM2 SR15 preset (below). | LFM2 |
 | `lfm2_router_input_handoff` | bool | `false` | | Router input hand-off ticket for 64-expert routers. | LFM2 |
-| `lfm2_prefill_views` | bool | `false` | | CPU consumers read prefill outputs directly from staging. | LFM2 |
+| `lfm2_prefill_views` | bool | `false` | | CPU consumers read prefill outputs directly from staging; eligible conv outputs remain staged until a host consumer needs them. | LFM2 |
 | `lfm2_parallel_stage` | bool | `false` | | Parallel staging copy of MoE prefill inputs. | LFM2 |
 | `lfm2_attn_ion_handoff` | bool | `false` | | Attention Q input taken directly from an ION staging buffer. | LFM2 |
-| `lfm2_conv_retain_out` | bool | `false` | | With `lfm2_prefill_views`, conv layers keep their output on the DSP side. | LFM2 |
-| `lfm2_conv_channel_tile` | bool | `false` | | Channel-tiled NEON loop in the CPU conv gate. | LFM2 |
-| `lfm2_conv_state_only` | bool | `false` | | State-only variant of the CPU conv gate. | LFM2 |
 | `lfm2_conv_stripe_rows` | unsigned | `64` | 8, 16, 32, 64, 128, 256 | Row stripe per job in the CPU conv gate. | LFM2 |
 | `lfm2_conv_whole_prefill` | bool | `false` | | Conv in-projection in one call over all rows. | LFM2 |
 | `lfm2_parallel_add` | bool | `false` | | Parallel residual add for prefill rows. | LFM2 |
@@ -149,6 +146,7 @@ checks; **LFM2** = only affects the LFM2 model or its layer shapes.
 |---|---|---|---|---|---|
 | `cache_experts` | unsigned | `16` | ≥ 1 | Resident expert pool capacity per MoE layer. | policy |
 | `preload_experts` | unsigned | `128` | any | Cap on experts preloaded per layer at start. | tuning |
+| `warm_experts` | unsigned | `16` | 0..4096 | Experts per layer queued for the prefill-to-decode transition; 0 disables warming. | tuning |
 | `cache_grow` | optional unsigned | `null` | any | Extra experts per layer the pool grows by after the first token; `null` grows towards 34 as memory allows, `0` disables growth. | policy |
 | `lrfu_half_life` | double | `32.0` | ≥ 0 | Expert eviction: > 0 is LRFU with this half-life in tokens, 0 is plain LRU. | tuning |
 | `prefill_lookahead` | unsigned | `1048576` | ≤ INT_MAX | How many MoE layers ahead prefill reads experts, bounded by free slots. | tuning |
@@ -160,22 +158,16 @@ checks; **LFM2** = only affects the LFM2 model or its layer shapes.
 | `prefetch_top` | optional unsigned | `null` | 0..16 | How many predicted experts are prefetched; `null` is 16 on the DSP-hint path and 8 on the ARM direct path. | tuning |
 | `prefetch_residual` | float | `0.5` | 0..1 | Residual blend of the ARM router predictor. | tuning |
 | `prefetch_confidence` | float | `0.0` | 0..1 | > 0 gates predictions by confidence. | tuning |
-| `prefetch_join` | bool | `true` | | A miss round joins pending prefetches instead of taking their buffers. | tuning |
 | `miss_readers` | unsigned | `4` | ≥ 1 | Readers of a decode miss round. | tuning |
-| `demand_pool` | bool | `true` | | Dedicated demand-read pool instead of the compute pool. | tuning |
-| `coalesce_read` | bool | `true` | | Coalesces expert reads (effective with `page_cache` 0). | tuning |
-| `cancel_stale_read` | bool | `true` | | Cancels stale prefetch reads (effective with `page_cache` 0). | tuning |
 | `server_done` | bool | `false` | | Lets the DSP's completion hint park the pool server before dspqueue reception. | tuning |
 | `fadvise` | unsigned | `0` | 0..2 | With `page_cache` -1 only: 1 drops an expert's pages once in the arena and asks them back on eviction, 2 drops only. | tuning |
 | `pin` | unsigned | `0` | 0..2 | With `page_cache` -1 only: 1 populates and locks each layer's expert range, 2 reads it into anonymous memory. | tuning |
 | `pin_floor_mib` | unsigned | `2048` | any | `MemAvailable` floor kept while pinning. | tuning |
 | `m1_gemv` | bool | `true` | | Single-token expert GEMV kernel instead of the HMX loop. | tuning |
 | `gemv_lead_kb` | unsigned | `192` | 0..8128 | GEMV DMA lead in KiB. | tuning |
-| `gemv_rows1` | bool | `true` | | GEMV tuning bit. | tuning |
 | `gemv_feed` | bool | `true` | | GEMV tuning bit. | tuning |
 | `dma_queues` | unsigned | `4` | 1..4 | Expert kernel DMA queues. | tuning |
-| `dma_bypass` | bool | `true` | | Expert kernel DMA bypass. | tuning |
-| `hadamard` | string | `"off"` | off, up, down, both, both_scalar, up_hmx, down_hmx, both_hmx, both_paley | Online rotation of expert activations. Must match the checkpoint. | policy |
+| `hadamard` | string | `"off"` | off, up, down, both, up_hmx, down_hmx, both_hmx, both_paley | Online rotation of expert activations. Must match the checkpoint. | policy |
 | `hadamard_scope` | string | `"2bit"` | 2bit, all | `2bit` rotates only 2-bit expert containers, `all` rotates every routed expert layer. | policy |
 | `host_mask` | unsigned | `0` | 0..7 | Moves the MoE pre-norm (1), post-norm (2) and epilogue (4) to the host (reference; needs `htp.keep_out` false). | diagnostic |
 | `debug` | bool | `false` | | Compares staged activations against the host bytes on every MoE call. | diagnostic |
@@ -186,8 +178,6 @@ checks; **LFM2** = only affects the LFM2 model or its layer shapes.
 | `predict_log` | string | `""` | path | ARM predictor trace file. | diagnostic |
 | `router_u8i8` | bool | `false` | | Router logits on the HMX (u8 × i8) instead of FP32. | tuning |
 | `tl2_prepared_file` | string | `""` | path; needs `page_cache` -1 | Prepared TL2 artifact for 2-bit experts (resident decode only). Relative to the pack. | policy |
-| `tl2_decode` | bool | `true` | | `false` keeps the prefill representation for decode instead of native TL2. | tuning |
-| `tl2_direct_read` | bool | `true` | | Prepared TL2 reads scatter directly into their destinations. | tuning |
 | `tl2_stable_slots` | bool | `false` | | Stable TL2 slots for the LFM2 expert shape with `page_cache` 0. | LFM2 |
 | `lfm2_router_arm` | bool | `false` | | Router logits on the ARM for TL2 experts; off when `router_u8i8`. | LFM2 |
 | `lfm2_prefill_early` | bool | `false` | | Queues expert prefill reads before the first prefill block. | LFM2 |
@@ -208,8 +198,8 @@ Rejected at load:
 Silently gated at run time:
 
 - `moe.fadvise` and `moe.pin` do nothing unless `htp.page_cache` is `-1`.
-- `moe.coalesce_read`, `moe.cancel_stale_read`, `moe.tl2_stable_slots`,
-  `moe.lfm2_decode_pair_read` and `moe.lfm2_decode_demand_handoff` act only
+- `moe.tl2_stable_slots`, `moe.lfm2_decode_pair_read` and
+  `moe.lfm2_decode_demand_handoff` act only
   with `htp.page_cache` `0`.
 - `htp.profile` 2 or 3 moves the MoE norms and epilogue to the host
   (`moe.host_mask` 7) and copies outputs to the host regardless of
@@ -218,6 +208,34 @@ Silently gated at run time:
 - `htp.dump_dir`, `htp.l2_diff`, `htp.l2_shadow` and `htp.keep_out` `false`
   disable retained prefill views.
 - `moe.router_u8i8` disables `moe.lfm2_router_arm`.
+
+## Removed comparison switches
+
+Remove the following keys from older packs before loading them. Strict
+parsing rejects them as unknown keys. The runtime keeps the following
+behaviour:
+
+| Removed key | Retained behaviour |
+|---|---|
+| `htp.attn_m1_fast` | Exact decode attention; the approximate integer experiment is removed. |
+| `moe.prefetch_join` | Misses claim pending prefetches and wait for their reads. |
+| `moe.demand_pool` | Miss reads use the dedicated reader pool. |
+| `moe.coalesce_read`, `moe.cancel_stale_read` | Eligible direct reads are coalesced and stale prefetch reads are cancelled with `htp.page_cache` 0. |
+| `moe.gemv_rows1`, `moe.dma_bypass` | Single-row GEMV and DMA cache bypass where the kernel's shape and cache-coherence checks permit them. |
+| `moe.tl2_decode`, `moe.tl2_direct_read` | Prepared TL2 is used for decode; a valid preparation receipt enables direct reads. |
+| `htp.lfm2_conv_channel_tile`, `htp.lfm2_conv_state_only` | Eligible conv prefill uses channel-tiled NEON and stores only the final two gated rows needed for history. |
+| `htp.lfm2_conv_retain_out` | Conv output retention follows `htp.lfm2_prefill_views`, subject to the existing materialization guards. |
+
+The conv gate optimization also applies to library/API calls with default
+settings. Unsupported platforms, shapes, layouts and continuation calls
+keep their existing fallback paths. `htp.lfm2_conv_stripe_rows`,
+`htp.lfm2_conv_whole_prefill` and `htp.prefill_rows` remain available to
+control scheduling and buffer sizes.
+
+The `moe.hadamard` value `both_scalar` is also removed. Packs that used it
+can use `both` for the same rotation at both sites. Scalar fallbacks for
+unsupported vector shapes remain, as do read-error, CRC and cache-coherence
+checks. The HMX rotation modes and `moe.router_u8i8` remain available.
 
 ## The LFM2 CLI preset
 
@@ -232,7 +250,7 @@ same behaviour must write these values into the pack:
 
 | Object | Keys the preset sets |
 |---|---|
-| `htp` | `page_cache` 0, `load_prefetch` false, `fc_whole_prefill` true, `lfm2_parallel_norm` true, `lfm2_parallel_add` true, `lfm2_conv_whole_prefill` true, `lfm2_conv_channel_tile` true, `lfm2_prefill_views` true, `lfm2_conv_state_only` true, `lfm2_parallel_stage` true, `lfm2_conv_retain_out` true, `lfm2_conv_stripe_rows` 8, `lfm2_attn_ion_handoff` true, `arena_grain_mib` 4, `purge_prefill` true, `release_prefill_readers` true |
+| `htp` | `page_cache` 0, `load_prefetch` false, `fc_whole_prefill` true, `lfm2_parallel_norm` true, `lfm2_parallel_add` true, `lfm2_conv_whole_prefill` true, `lfm2_prefill_views` true, `lfm2_parallel_stage` true, `lfm2_conv_stripe_rows` 8, `lfm2_attn_ion_handoff` true, `arena_grain_mib` 4, `purge_prefill` true, `release_prefill_readers` true |
 | `moe` | `cache_grow` 1, `preload_experts` 128, `tl2_stable_slots` true, `lfm2_prefill_early` true, `lfm2_decode_pair_read` true, `lfm2_decode_demand_handoff` true, `prediction` "arm-direct", `prefetch_residual` 0.5, `lfm2_prefill_prune` false, `lfm2_compact_recency` true, `prefetch_slots` 6, `lfm2_prefetch_gamma` true, `prefetch_top` 3 |
 | top level | `num_threads` 8 when absent |
 
