@@ -205,146 +205,6 @@ private:
 } // namespace
 #endif // ENABLE_OPENCL
 
-#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||            \
-     defined(_M_IX86)) &&                                                      \
-  defined(ENABLE_FP16)
-#include <climits>
-// libnntrainer builds the all-FP16 CPU attention kernels (compute_kcaches /
-// compute_fp16vcache_transposed / compute_rotary_emb_value with _FP16 I/O, and
-// the softmax_row[_inplace] _FP16 instantiations) only for ARM/NEON
-// (neon_impl_fp16.cpp); the x86 backend has only the FP32/templated variants.
-// This layer's FP16 CPU attention path references the all-FP16 versions, so on
-// x86 they are undefined.
-//
-// nntrainer activations can be FP16 independently of the weight type (the
-// model dtype is Weight-Activation, e.g. QINT4-FP16), so the FP16 CPU path IS
-// reachable on x86 — notably RoPE, which the mha layer applies on the host even
-// when attention runs on the GPU. Provide real x86 implementations (scalar,
-// FP32 accumulation — matching the GPU's FP32-accumulate numerics) so x86+FP16
-// works end to end. This block is x86-only; ARM keeps its NEON kernels.
-namespace nntrainer {
-
-// O[row] scores = scale * (Q · K), per (kv-head n, gqa group g, key row).
-// Mirrors neon_impl_fp16.cpp compute_kcaches (tiling dropped — it is a pure
-// cache-blocking optimization with identical results).
-void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
-                     int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_size,
-                     size_t local_window_size = UINT_MAX, int head_start = 0,
-                     int head_end = -1) {
-  (void)tile_size;
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  const int start_row = ((size_t)num_rows < local_window_size)
-                          ? 0
-                          : num_rows - (int)local_window_size;
-  const int row_cnt =
-    ((size_t)num_rows < local_window_size) ? num_rows : (int)local_window_size;
-  const float inv = 1.0f / std::sqrt((float)head_dim);
-  for (int n = head_start; n < actual_head_end; ++n) {
-    for (int r = 0; r < row_cnt; ++r) {
-      const int row = start_row + r;
-      const _FP16 *k_row =
-        kcache + (size_t)(row * num_cache_head + n) * head_dim;
-      for (int g = 0; g < gqa_size; ++g) {
-        const _FP16 *in_ptr = in + (size_t)(n * gqa_size + g) * head_dim;
-        float sum = 0.0f;
-        for (int i = 0; i < head_dim; ++i)
-          sum += (float)in_ptr[i] * (float)k_row[i];
-        output[(size_t)r * num_cache_head * gqa_size + n * gqa_size + g] =
-          (_FP16)(sum * inv);
-      }
-    }
-  }
-}
-
-// O[head][d] = sum_j scores[j] * V[j, head, d], over the (windowed) key rows up
-// to row_num. Mirrors neon_impl_fp16.cpp compute_fp16vcache_transposed.
-void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
-                                   const _FP16 *vcache, _FP16 *output,
-                                   int num_cache_head, int gqa_size,
-                                   int head_dim,
-                                   size_t local_window_size = UINT_MAX,
-                                   int head_start = 0, int head_end = -1) {
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  const int j_start = ((size_t)row_num < local_window_size)
-                        ? 0
-                        : row_num + 1 - (int)local_window_size;
-  std::vector<float> acc((size_t)gqa_size * head_dim);
-  for (int n = head_start; n < actual_head_end; ++n) {
-    std::fill(acc.begin(), acc.end(), 0.0f);
-    for (int j = j_start; j <= row_num; ++j) {
-      const _FP16 *vptr = vcache + (size_t)(j * num_cache_head + n) * head_dim;
-      const int score_row =
-        ((size_t)row_num < local_window_size) ? j : j - j_start;
-      for (int h = 0; h < gqa_size; ++h) {
-        const float a = (float)
-          in[(size_t)score_row * gqa_size * num_cache_head + n * gqa_size + h];
-        float *acc_h = acc.data() + (size_t)h * head_dim;
-        for (int d = 0; d < head_dim; ++d)
-          acc_h[d] += a * (float)vptr[d];
-      }
-    }
-    for (int h = 0; h < gqa_size; ++h) {
-      _FP16 *out_h = output + (size_t)(n * gqa_size + h) * head_dim;
-      const float *acc_h = acc.data() + (size_t)h * head_dim;
-      for (int d = 0; d < head_dim; ++d)
-        out_h[d] = (_FP16)acc_h[d];
-    }
-  }
-}
-
-// RoPE: rotate (a,b) pairs across the half_ boundary by (cos,sin). Mirrors the
-// all-FP16 neon_impl_fp16.cpp compute_rotary_emb_value.
-void compute_rotary_emb_value(unsigned int width, unsigned int dim,
-                              unsigned int half_, _FP16 *inout, _FP16 *output,
-                              const _FP16 *cos_, const _FP16 *sin_) {
-  for (unsigned int w = 0; w < width; w += dim) {
-    for (unsigned int k = 0; k < half_; ++k) {
-      const unsigned int i0 = w + k, i1 = w + k + half_;
-      const float a = (float)inout[i0], b = (float)inout[i1];
-      const float c = (float)cos_[k], s = (float)sin_[k];
-      const float o0 = a * c - b * s, o1 = a * s + b * c;
-      if (output != nullptr) {
-        output[i0] = (_FP16)o0;
-        output[i1] = (_FP16)o1;
-      } else {
-        inout[i0] = (_FP16)o0;
-        inout[i1] = (_FP16)o1;
-      }
-    }
-  }
-}
-
-// Column-wise softmax: softmax over rows [start_row,end_row) for each of the
-// num_heads columns. Optional attention sink contributes exp(sink-max) to the
-// denominator only. Mirrors neon_impl_fp16.cpp softmax_row_inplace.
-template <>
-void softmax_row_inplace<_FP16>(_FP16 *qk_out, size_t start_row, size_t end_row,
-                                size_t num_heads, _FP16 *sink) {
-  for (size_t c = 0; c < num_heads; ++c) {
-    float mx = sink ? (float)sink[c] : -INFINITY;
-    for (size_t r = start_row; r < end_row; ++r)
-      mx = std::max(mx, (float)qk_out[r * num_heads + c]);
-    float sum = sink ? std::exp((float)sink[c] - mx) : 0.0f;
-    for (size_t r = start_row; r < end_row; ++r) {
-      const float e = std::exp((float)qk_out[r * num_heads + c] - mx);
-      qk_out[r * num_heads + c] = (_FP16)e;
-      sum += e;
-    }
-    const float invsum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-    for (size_t r = start_row; r < end_row; ++r)
-      qk_out[r * num_heads + c] =
-        (_FP16)((float)qk_out[r * num_heads + c] * invsum);
-  }
-}
-template <>
-void softmax_row<_FP16>(_FP16 *qk_out, size_t start_row, size_t end_row,
-                        size_t num_heads, _FP16 *sink) {
-  softmax_row_inplace<_FP16>(qk_out, start_row, end_row, num_heads, sink);
-}
-} // namespace nntrainer
-#endif
-
 inline float convert_scalar(uint16_t h) {
   return nntrainer::compute_fp16_to_fp32(h);
 }
@@ -451,112 +311,6 @@ static inline void gather_k_ohwi_to_concat_fp16(
   }
 }
 
-#ifdef ENABLE_FP16
-// Decode/per-row K-cache dot product with int8-quantized K + per-(row, head)
-// fp16 scale. Mirrors the layout of nntrainer::compute_kcaches<__fp16> but
-// reads the cache as int8 bytes and scales the dot product by the matching
-// scale value before the 1/sqrt(d) inverse. Output layout matches the fp16
-// helper: out[(row-start)*num_cache_head*gqa + n*gqa + g].
-static inline void compute_kcaches_int8_fp16(
-  const _FP16 *in,         // [num_rows? actually only the latest row is used]
-  const int8_t *kcache_i8, // [num_rows, num_cache_head, head_dim]
-  const uint16_t *kscale,  // [num_rows, num_cache_head] fp16 bits
-  _FP16 *output,           // [row_cnt, num_cache_head * gqa_size]
-  int num_rows, int num_cache_head, int head_dim, int gqa_size,
-  size_t local_window_size, int head_start, int head_end) {
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
-    << "head_start (" << head_start << ") must be less than head_end ("
-    << actual_head_end << ")";
-
-  // Note: local_window_size is size_t. Comparing num_rows (int) directly
-  // promotes to size_t so UINT_MAX-as-no-window works correctly. Casting
-  // local_window_size to int first would wrap UINT_MAX to -1 and skip the
-  // entire row loop.
-  const int start_row = (size_t)num_rows < local_window_size
-                          ? 0
-                          : num_rows - (int)local_window_size;
-  const int row_cnt =
-    (size_t)num_rows < local_window_size ? num_rows : (int)local_window_size;
-  const float inv_sqrt_d = 1.0f / std::sqrt((float)head_dim);
-
-  for (int n = head_start; n < actual_head_end; ++n) {
-    for (int g = 0; g < gqa_size; ++g) {
-      const _FP16 *in_ptr = in + (n * gqa_size + g) * head_dim;
-      for (int t = 0; t < row_cnt; ++t) {
-        const int row = start_row + t;
-        const int8_t *k_row =
-          kcache_i8 + ((size_t)row * num_cache_head + n) * head_dim;
-        const float s =
-          nntrainer::compute_fp16_to_fp32(kscale[row * num_cache_head + n]);
-        // Dot in fp32 keeps precision; int8 * fp16-as-fp32 -> fp32 acc.
-        float sum = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-          sum += nntrainer::compute_fp16_to_fp32(
-                   *reinterpret_cast<const uint16_t *>(&in_ptr[d])) *
-                 (float)k_row[d];
-        }
-        const float v = sum * s * inv_sqrt_d;
-        const size_t out_idx =
-          (size_t)(row - start_row) * num_cache_head * gqa_size +
-          (size_t)n * gqa_size + g;
-        output[out_idx] = static_cast<_FP16>(v);
-      }
-    }
-  }
-}
-
-// V cache dequant + transposed accumulation mirroring
-// nntrainer::compute_fp16vcache_transposed but with int8 V + per-(row, head)
-// fp16 scale. Output is fp16 [(num_cache_head*gqa_size), head_dim].
-static inline void compute_fp16vcache_transposed_int8(
-  int row_num, const _FP16 *in, const int8_t *vcache_i8, const uint16_t *vscale,
-  _FP16 *output, int num_cache_head, int gqa_size, int head_dim,
-  size_t local_window_size, int head_start, int head_end) {
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
-    << "head_start (" << head_start << ") must be less than head_end ("
-    << actual_head_end << ")";
-
-  // Promote to size_t to avoid wrapping UINT_MAX (no window) to -1.
-  const int start_j = (size_t)row_num < local_window_size
-                        ? 0
-                        : row_num + 1 - (int)local_window_size;
-  const int in_row_off = (size_t)row_num < local_window_size
-                           ? 0
-                           : row_num + 1 - (int)local_window_size;
-
-  for (int n = head_start; n < actual_head_end; ++n) {
-    for (int h = 0; h < gqa_size; ++h) {
-      float acc[256]; // head_dim <= 256 for our target models (Qwen3/Gemma3)
-      NNTR_THROW_IF(head_dim > 256, std::invalid_argument)
-        << "head_dim (" << head_dim << ") exceeds the int8 V-read scratch size";
-      for (int d = 0; d < head_dim; ++d)
-        acc[d] = 0.0f;
-
-      for (int j = start_j; j <= row_num; ++j) {
-        const int8_t *vptr =
-          vcache_i8 + ((size_t)j * num_cache_head + n) * head_dim;
-        const float vs =
-          nntrainer::compute_fp16_to_fp32(vscale[j * num_cache_head + n]);
-        const int attn_idx =
-          (j - in_row_off) * gqa_size * num_cache_head + n * gqa_size + h;
-        const float a_val = nntrainer::compute_fp16_to_fp32(
-          *reinterpret_cast<const uint16_t *>(&in[attn_idx]));
-        const float a_scaled = a_val * vs;
-        for (int d = 0; d < head_dim; ++d) {
-          acc[d] += a_scaled * (float)vptr[d];
-        }
-      }
-
-      _FP16 *out_row = output + (n * gqa_size + h) * head_dim;
-      for (int d = 0; d < head_dim; ++d)
-        out_row[d] = static_cast<_FP16>(acc[d]);
-    }
-  }
-}
-#endif
-
 namespace causallm {
 
 /**
@@ -632,70 +386,6 @@ rope_lut_device(std::vector<std::vector<_FP16>> *table, int half) {
   return dev;
 }
 #endif
-
-#define tile_size 4
-
-static void compute_kcaches_fp32_reference(
-  const float *in, const float *kcache, float *output, int num_rows,
-  int num_cache_head, int head_dim, int gqa_size, size_t local_window_size,
-  int head_start = 0, int head_end = -1) {
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
-    << "head_start (" << head_start << ") must be less than head_end ("
-    << actual_head_end << ")";
-
-  const int window = static_cast<int>(
-    std::min(static_cast<size_t>(num_rows), local_window_size));
-  const int start_row = num_rows - window;
-  const float inv_sqrt_head_dim =
-    1.0f / std::sqrt(static_cast<float>(head_dim));
-
-  for (int n = head_start; n < actual_head_end; ++n) {
-    for (int g = 0; g < gqa_size; ++g) {
-      const float *query = in + (n * gqa_size + g) * head_dim;
-      for (int row = start_row; row < num_rows; ++row) {
-        const float *key = kcache + (row * num_cache_head + n) * head_dim;
-        float sum = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-          sum += query[d] * key[d];
-        }
-        output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
-               g] = sum * inv_sqrt_head_dim;
-      }
-    }
-  }
-}
-
-static void compute_vcache_fp32_transposed_reference(
-  int row_num, const float *in, const float *vcache, float *output,
-  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size,
-  int head_start = 0, int head_end = -1) {
-  const int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
-  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
-    << "head_start (" << head_start << ") must be less than head_end ("
-    << actual_head_end << ")";
-
-  const int window = static_cast<int>(
-    std::min(static_cast<size_t>(row_num + 1), local_window_size));
-  const int start_row = row_num + 1 - window;
-
-  for (int n = head_start; n < actual_head_end; ++n) {
-    for (int h = 0; h < gqa_size; ++h) {
-      float *out = output + (n * gqa_size + h) * head_dim;
-      std::fill(out, out + head_dim, 0.0f);
-
-      for (int row = start_row; row <= row_num; ++row) {
-        const int attn_row = row - start_row;
-        const float a_val =
-          in[attn_row * (num_cache_head * gqa_size) + n * gqa_size + h];
-        const float *value = vcache + (row * num_cache_head + n) * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-          out[d] += a_val * value[d];
-        }
-      }
-    }
-  }
-}
 
 /************************************************************** */
 
@@ -1250,44 +940,18 @@ unsigned int MHACoreLayer::rope_lut_positions() const {
 }
 
 void MHACoreLayer::ensure_rope_flat_lut() {
-  const unsigned int half_ = head_dim / 2;
-  const unsigned int mp = rope_lut_positions();
-  const RopeFlatKey key{(int)head_dim, theta, mp};
-
-  // The cache is process-wide static and shared by every layer instance; guard
-  // both the lookup and the build under rope_init_mtx (the flatten was already
-  // run single-threaded at finalize, but the GPU-RoPE fallback can re-enter
-  // from the forward path, and a per-slot insert must not race a concurrent
-  // slot's insert -- std::map node stability protects EXISTING entries' data()
-  // pointers across inserts, but the insert itself must be serialized).
-  std::lock_guard<std::mutex> lock(rope_init_mtx);
-
-  auto it = rope_flat_cache.find(key);
-  if (it != rope_flat_cache.end()) {
-    // Existing slot: just repoint the current-slot pointers. Stable across
-    // calls (std::map nodes never move) so the GPU upload stays cached.
-    rope_cos_flat_cur = it->second.first.data();
-    rope_sin_flat_cur = it->second.second.data();
+  if (rope_cos_flat_cur != nullptr)
     return;
-  }
-
-  // New slot: build the flat table (math identical to the previous path).
+  // rope_freq_cache is process-wide and shared by every layer instance; the
+  // lookup and the build run under rope_init_mtx.
+  const std::lock_guard<std::mutex> lock(rope_init_mtx);
+  const unsigned int mp = rope_lut_positions();
   precompute_freqs((int)head_dim, mp, theta, true);
-  RopeFlatVal val;
-  val.first.assign((size_t)mp * half_, 0);
-  val.second.assign((size_t)mp * half_, 0);
-  // Row-wise bulk copy (rows are contiguous _FP16 = 2 bytes, same as the
-  // uint16 bit view): the old per-element memcpy pair was ~12ms for
-  // [2048 x 128].
-  for (unsigned int p = 0; p < mp; ++p) {
-    std::memcpy(&val.first[(size_t)p * half_], (*freqs_cos_fp16)[p].data(),
-                (size_t)half_ * sizeof(uint16_t));
-    std::memcpy(&val.second[(size_t)p * half_], (*freqs_sin_fp16)[p].data(),
-                (size_t)half_ * sizeof(uint16_t));
-  }
-  auto ins = rope_flat_cache.emplace(key, std::move(val));
-  rope_cos_flat_cur = ins.first->second.first.data();
-  rope_sin_flat_cur = ins.first->second.second.data();
+  rope_cos_flat_cur =
+    reinterpret_cast<const uint16_t *>(freqs_cos_fp16_flat->data());
+  rope_sin_flat_cur =
+    reinterpret_cast<const uint16_t *>(freqs_sin_fp16_flat->data());
+  rope_flat_positions = mp;
 }
 #endif
 
@@ -1756,171 +1420,6 @@ bool MHACoreLayer::attention_fp32_on_device(
 }
 #endif
 
-/**
- * @brief Function to compute Attention Scores using Tensor inputs. Wrapper
- * around nntrainer::compute_kcaches with multi-threading support
- *
- * Expected Input Shapes:
- * @param in (Query): [Batch, 1, sequence_len, Num_Heads_Q * Head_Dim]
- * @param cache (Key Cache): [Batch, 1, Max_Timestep, Num_Heads_KV * Head_Dim]
- * @param out (Attention Score): [Batch, 1, 1, Num_Heads_Q * Context_Len]
- *            where Context_Len is usually the current timestep 'to'.
- *
- */
-void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
-                                   nntrainer::Tensor &cache,
-                                   nntrainer::Tensor &out, unsigned int from,
-                                   size_t sequence_len, unsigned int num_head,
-                                   unsigned int group_size,
-                                   unsigned int head_dim) {
-
-  // Dispatch based on data type (FP32 or FP16)
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (sequence_len == 1) {
-      // Single token processing (common during generation)
-      // Parallelize over KV heads for decoding since Q direction is always 1
-      int row_to_compute = is_causal ? from + 1 : from + sequence_len;
-      unsigned int num_cache_head = num_head / group_size;
-
-      // Use ThreadManager for lower overhead parallelization during decoding
-      const float *in_data = in.getData<float>();
-      float *out_data = out.getData<float>();
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      if (cache.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        const float *cache_data = cache.getData<float>();
-        tm.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            compute_kcaches_fp32_reference(
-              in_data, cache_data, out_data, row_to_compute, num_cache_head,
-              head_dim, group_size, local_window_size, head_kv, head_kv + 1);
-          });
-      } else {
-        const uint16_t *cache_data = cache.getData<uint16_t>();
-        tm.parallel_for(0, static_cast<size_t>(num_cache_head),
-                        [=](size_t head_kv) {
-                          nntrainer::compute_kcaches<uint16_t>(
-                            in_data, cache_data, out_data, row_to_compute,
-                            num_cache_head, head_dim, group_size, tile_size,
-                            local_window_size, head_kv, head_kv + 1);
-                        });
-      }
-
-    } else {
-      // Sequence processing (prefill or chunked)
-      // Iterate over ALL query rows so that no row is skipped even when
-      // sequence_len > local_window_size.
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(sequence_len), [=](size_t i) {
-        float *input_addr = in.getData<float>() + num_head * head_dim * i;
-        int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
-        // Windowed cumulative offset so that each row's scores are placed
-        // contiguously after the previous row's scores (respecting the window).
-        size_t out_start_row = is_causal ? calc_windowed_attn_index(from + i) -
-                                             calc_windowed_attn_index(from)
-                                         : i * (from + sequence_len);
-        float *output_addr = out.getData<float>() + out_start_row * num_head;
-
-        if (cache.getDataType() == ml::train::TensorDim::DataType::FP32) {
-          float *cache_addr = cache.getData<float>();
-          compute_kcaches_fp32_reference(
-            input_addr, cache_addr, output_addr, row_to_compute,
-            num_head / group_size, head_dim, group_size, local_window_size);
-        } else {
-          uint16_t *cache_addr = cache.getData<uint16_t>();
-          nntrainer::compute_kcaches<uint16_t>(
-            input_addr, cache_addr, output_addr, row_to_compute,
-            num_head / group_size, head_dim, group_size, tile_size,
-            local_window_size);
-        }
-      });
-    }
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    if (sequence_len == 1) {
-      // Single token processing (common during generation)
-      // Parallelize over KV heads for decoding since Q direction is always 1
-      int num_rows = is_causal ? from + 1 : from + sequence_len;
-      unsigned int num_cache_head = num_head / group_size;
-
-      // Use ThreadManager for lower overhead parallelization during decoding
-      const _FP16 *in_data = in.getData<_FP16>();
-      _FP16 *out_data = out.getData<_FP16>();
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      if (kv_int8) {
-        // int8 K cache + per-(row, head) fp16 scale.
-        const int8_t *cache_i8 =
-          reinterpret_cast<const int8_t *>(cache.getData<uint8_t>());
-        const uint16_t *kscale = cur_kv_int8_key_scale_batch;
-        NNTR_THROW_IF(kscale == nullptr, std::invalid_argument)
-          << "kv_int8 read path missing per-batch K-scale pointer";
-        tm.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            compute_kcaches_int8_fp16(in_data, cache_i8, kscale, out_data,
-                                      num_rows, num_cache_head, head_dim,
-                                      group_size, local_window_size,
-                                      (int)head_kv, (int)head_kv + 1);
-          });
-      } else {
-        const _FP16 *cache_data = cache.getData<_FP16>();
-        tm.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            nntrainer::compute_kcaches(
-              in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
-              group_size, tile_size, local_window_size, head_kv, head_kv + 1);
-          });
-      }
-    } else {
-      // Iterate over ALL query rows so that no row is skipped even when
-      // sequence_len > local_window_size.
-      auto &tm = nntrainer::ThreadManager::Global();
-      if (kv_int8) {
-        const int8_t *cache_i8 =
-          reinterpret_cast<const int8_t *>(cache.getData<uint8_t>());
-        const uint16_t *kscale = cur_kv_int8_key_scale_batch;
-        const unsigned int num_cache_head = num_head / group_size;
-        NNTR_THROW_IF(kscale == nullptr, std::invalid_argument)
-          << "kv_int8 read path (prefill) missing per-batch K-scale pointer";
-        // Iterate over ALL query rows + windowed cumulative offset (PR #3989).
-        tm.parallel_for(0, static_cast<size_t>(sequence_len), [=](size_t i) {
-          _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
-          int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
-          size_t out_start_row = is_causal
-                                   ? calc_windowed_attn_index(from + i) -
-                                       calc_windowed_attn_index(from)
-                                   : i * (from + sequence_len);
-          _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
-          compute_kcaches_int8_fp16(input_addr, cache_i8, kscale, output_addr,
-                                    row_to_compute, num_cache_head, head_dim,
-                                    group_size, local_window_size, 0, -1);
-        });
-        return;
-      }
-      tm.parallel_for(0, static_cast<size_t>(sequence_len), [=](size_t i) {
-        _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
-        _FP16 *cache_addr = cache.getData<_FP16>();
-        int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
-        // Windowed cumulative offset so that each row's scores are placed
-        // contiguously after the previous row's scores (respecting the window).
-        size_t out_start_row = is_causal ? calc_windowed_attn_index(from + i) -
-                                             calc_windowed_attn_index(from)
-                                         : i * (from + sequence_len);
-
-        _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
-
-        nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
-                                   row_to_compute, num_head / group_size,
-                                   head_dim, group_size, tile_size,
-                                   local_window_size);
-      });
-    }
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
-}
-
 // NNTR_KV_STAGE_TPROF=1: host-side wall timing of the V-copy -> k_scatter ->
 // attention-return window (attributes the 39ms/layer GPU idle the CL-event
 // profiler pins between scatter_copy_f16 and k_scatter_ohwi). Prints
@@ -2249,8 +1748,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                      num_heads_KV, head_dim);
 
     // Stash per-batch scale base pointers (row 0 of this batch) for the
-    // read path. compute_kcaches / compute_fp16vcache_transposed /
-    // gemm_attention pick these up through layer members.
+    // read path: gemm_attention reads these members, and the per-row arm
+    // gets them through KVCacheView (attend_rowwise).
     cur_kv_int8_key_scale_batch =
       reinterpret_cast<const uint16_t *>(kv_int8_key_scale->getData<_FP16>()) +
       scale_batch_offset;
@@ -2327,18 +1826,18 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         device_addressable(query_step) && device_addressable(key_step)) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
-      // table. Built once (cached by theta/head_dim/max_pos) so the GPU RoPE
+      // table. Built once (cached by every RoPE parameter) so the GPU RoPE
       // path has no per-call flatten; rope_inplace_f16_cl uploads it once.
       const unsigned int mp = rope_lut_positions();
       if (mp >= cache_index + (to - from)) {
         ensure_rope_flat_lut();
         const double _mha_t_lut = _kvst_on() ? _kvst_now() : 0;
-        // Current-slot stable pointers (per-(head_dim, theta, max_pos) cache):
-        // for Gemma4 the two attention slots each keep their own resident
-        // table, so the sliding<->full transition no longer rebuilds +
-        // re-uploads the shared LUT every layer. The pointers are
-        // std::map-node-stable, which keeps the rope_inplace_f16_cl device-LUT
-        // upload cached per slot.
+        // Current-slot stable pointers (one table per RoPE configuration): for
+        // Gemma4 the two attention slots each keep their own resident table,
+        // so the sliding<->full transition no longer rebuilds + re-uploads the
+        // shared LUT every layer. The pointers are rope_freq_cache-node-stable,
+        // which keeps the rope_inplace_f16_cl device-LUT upload cached per
+        // slot.
         const uint16_t *cos_lut = rope_cos_flat_cur;
         const uint16_t *sin_lut = rope_sin_flat_cur;
         uint16_t *q_p =
@@ -3019,6 +2518,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         is_kv_ohwi_enabled() && !kv_int8 &&
         key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
+      // Whether K still has to be written on the host, after the OHWI scatter
+      // or a device arm below.
+      bool k_on_host = false;
       if (kv_ohwi_active) {
 #ifdef ENABLE_FP16
         apply_rotary_emb_tensor_v2(key_step, key_step, head_dim, cache_index,
@@ -3082,34 +2584,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
 #endif
-        if (!k_rope_gpu) {
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-#if defined(ENABLE_FP16)
-          NNTR_THROW_IF(
-            b_cache_key_step.getMemoryData() &&
-              !b_cache_key_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
-               "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
-               "range miss at cache_index="
-            << cache_index << ")";
-#endif
-#endif
-          apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                     cache_index, true);
-        }
+        k_on_host = !k_rope_gpu;
       }
 
-      // append vcache without rotary embedding
-      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                                   cache_index, false);
-      } else if (query_step.getDataType() ==
-                 ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
+      // V has no RoPE. On the cuda engine an FP16 V may be copied into its
+      // cache slice on the device; otherwise it is written on the host below.
+      bool v_on_host = true;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
         bool v_copy_gpu = false;
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
         {
           static const bool cuda_elt = nntr_env_on("NNTR_CUDA_ROPE");
           // V-copy historically stayed host for the prefill big-step (height>1)
@@ -3156,22 +2639,34 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             }
           }
         }
+        v_on_host = !v_copy_gpu;
+      }
 #endif
-        if (!v_copy_gpu) {
+
+      // The host writes the planes no device arm took: K rotated, V as is.
+      if (k_on_host || v_on_host) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          nntrainer::cuda::drain_if_async();
-          NNTR_THROW_IF(
+        nntrainer::cuda::drain_if_async();
+#if defined(ENABLE_FP16)
+        NNTR_THROW_IF(k_on_host && b_cache_key_step.getMemoryData() &&
+                        !b_cache_key_step.getMemoryData()->isHostAddressable(),
+                      std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
+             "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
+             "range miss at cache_index="
+          << cache_index << ")";
+        NNTR_THROW_IF(
+          v_on_host &&
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
             b_cache_value_step.getMemoryData() &&
-              !b_cache_value_step.getMemoryData()->isHostAddressable(),
-            std::runtime_error)
-            << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
-               "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
+            !b_cache_value_step.getMemoryData()->isHostAddressable(),
+          std::runtime_error)
+          << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
+             "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
-          b_cache_value_step.copyData(value_step);
-        }
-#else
-        NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+        write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                       cache_index, k_on_host, v_on_host, /*rotate_key=*/true);
       }
     }
   } else {
@@ -3192,10 +2687,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       NNTR_THROW_IF(true, std::invalid_argument)
         << "NNTR_KV_OHWI requires ENABLE_FP16";
 #endif
-    } else {
-      b_cache_key_step.copyData(key_step);
     }
-    b_cache_value_step.copyData(value_step);
+    write_kv_cache(batch, key_step, value_step, cache_key, cache_value,
+                   cache_index,
+                   /*write_key=*/!kv_ohwi_active, /*write_value=*/true,
+                   /*rotate_key=*/false);
   }
 
   /// @todo replace step_size into input height
@@ -3570,8 +3066,6 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   }
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
-
-  unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
   // Optional flash GEMM attention path. Handles both non-causal (encoder)
   // and causal-prefill paths, supports GQA and sliding window. Gated on a
@@ -4445,26 +3939,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   if (mha_clmem_mode && cache_to > kv_slab_synced_to)
     kv_slab_synced_to = cache_to;
 
-  // out_ stores the output of Q * K
-  nntrainer::Tensor out_(1, 1,
-                         is_causal ? (calc_windowed_attn_index(cache_to) -
-                                      calc_windowed_attn_index(cache_from))
-                                   : (step_size * cache_to),
-                         num_heads_Q, query_step.getTensorType());
-
-  // Host decode attention reads GPU-produced Q/K on the host: sync first so the
-  // read is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+    // Host decode attention reads GPU-produced Q/K on the host: sync first so
+    // the read is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   nntrainer::cuda::drain_if_async();
 #endif
-  compute_kcaches(query_step, b_cached_key, out_, cache_from,
-                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
-
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
-
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                cache_from, num_heads_KV, gqa_size, head_dim,
-                                cache_to);
+  attend_rowwise(query_step, b_cached_key, b_cached_value,
+                 attention_output_step, cache_from, cache_to, nullptr);
 #if defined(ENABLE_OPENCL)
   if (o_cl != nullptr)
     nntrainer::clmem_raise_cl(attention_output_step, 0);
@@ -4713,6 +4194,10 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
     (num_heads_KV > 0) ? static_cast<unsigned int>(num_heads_Q / num_heads_KV)
                        : 1u;
   const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(d));
+  // Gemma2-style logit softcap, score = cap * tanh(score / cap), as
+  // softmax_triangle applies it on the per-row arm. 0 = off.
+  const float softcap = attn_logit_softcapping;
+  const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
   const unsigned int order =
     static_cast<unsigned int>(query_step.getDim().getStorageOrder());
   const bool causal = is_causal;
@@ -4804,10 +4289,10 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Opt-in GPU attention (engine=cuda, UVM): the interleaved fp16 query +
   // fp16 KV cache feed a flash core on the device, replacing the host O(M^2)
-  // loop below. Matches gemm_attention exactly (scale 1/sqrt(d), causal +
-  // sliding mask, GQA, NO softcap). Gated by NNTR_CUDA_ATTN, which the
-  // CudaContext device profile defaults on (=0 disables); falls through to the
-  // host path when off / not device-resident.
+  // loop below. Matches gemm_attention (scale 1/sqrt(d), causal + sliding
+  // mask, GQA, softcap). Gated by NNTR_CUDA_ATTN, which the CudaContext device
+  // profile defaults on (=0 disables); falls through to the host path when off
+  // / not device-resident.
   {
     static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
@@ -4826,7 +4311,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
-              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap))
+              win, attn_logit_softcapping, /*ring_cap=*/(int)kv_ring_cap))
           return;
       }
     }
@@ -5027,6 +4512,14 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         for (unsigned int i = 0; i < bq; ++i) {
           uint16_t *sp16 = Sp16.data() + (size_t)i * bk;
           const long long q_abs = (long long)cache_from + qb + i;
+          // Softcap before the mask: tanh would turn its -inf into -cap.
+          if (softcap > 0.0f) {
+            for (unsigned int k = 0; k < bk; ++k)
+              sp16[k] = nntrainer::compute_fp32_to_fp16(
+                std::tanh(nntrainer::compute_fp16_to_fp32(sp16[k]) *
+                          inv_softcap) *
+                softcap);
+          }
           if (causal_boundary) {
             long long valid_count_ll = q_abs + 1 - (long long)kb;
             unsigned int valid_count = (valid_count_ll <= 0)
@@ -5135,6 +4628,11 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         for (unsigned int i = 0; i < bq; ++i) {
           float *s = S.data() + (size_t)i * bk;
           const long long q_abs = (long long)cache_from + qb + i;
+          // Softcap before the mask: tanh would turn its -inf into -cap.
+          if (softcap > 0.0f) {
+            for (unsigned int k = 0; k < bk; ++k)
+              s[k] = std::tanh(s[k] * inv_softcap) * softcap;
+          }
           if (causal_boundary) {
             long long valid_count_ll = q_abs + 1 - (long long)kb;
             unsigned int valid_count = (valid_count_ll <= 0)
@@ -5333,30 +4831,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     << "NNTR_KV_INT8 is not supported for the sink_step (gpt-oss) variant of "
        "one_batch_incremental_forwarding";
 
-  /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-   * **/
-  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
-    cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
-  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
-    cache_value_step_dim,
-    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
-    true);
-
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, true);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from, true);
-
-  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               false);
-  } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
+  // K rotated and V into rows [from, to). from is _from: a step past the cache
+  // end (the only case where they differ) is rejected before this.
+  write_kv_cache(batch, key_step, value_step, cache_key, cache_value, _from,
+                 /*write_key=*/true, /*write_value=*/true,
+                 /*rotate_key=*/true);
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
@@ -5380,23 +4861,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   if (skip_prefill && (to - from) > 1)
     return;
 
-  nntrainer::Tensor out_(1, 1,
-                         is_causal ? (((to - from) == 1)
-                                        ? to
-                                        : calc_windowed_attn_index(to) -
-                                            calc_windowed_attn_index(from))
-                                   : ((to - from) * to),
-                         num_heads_Q, query_step.getTensorType());
-
-  unsigned int gqa_size = num_heads_Q / num_heads_KV;
-
-  compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
-                  gqa_size, head_dim);
-
-  softmax_triangle(out_, to - from, num_heads_Q, from, sink_step);
-
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                from, num_heads_KV, gqa_size, head_dim, to);
+  attend_rowwise(query_step, b_cached_key, b_cached_value,
+                 attention_output_step, from, to, &sink_step);
 }
 
 /************************************************************** */
@@ -5411,7 +4877,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
     std::string(is_fp16 ? "fp16:" : "fp32:") + std::to_string(head_dim) + ":" +
     std::to_string(seq_len) + ":" + std::to_string(theta) + ":" +
     rope_scaling_type + ":" + std::to_string(scale) + ":" +
-    std::to_string(original_max_position_embeddings);
+    std::to_string(original_max_position_embeddings) + ":" +
+    std::to_string(rope_partial_rotary_factor);
 
   auto cache_iter = rope_freq_cache.find(cache_key);
   if (cache_iter != rope_freq_cache.end()) {
@@ -5419,6 +4886,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
 #ifdef ENABLE_FP16
       freqs_cos_fp16 = &cache_iter->second.cos_fp16;
       freqs_sin_fp16 = &cache_iter->second.sin_fp16;
+      freqs_cos_fp16_flat = &cache_iter->second.cos_fp16_flat;
+      freqs_sin_fp16_flat = &cache_iter->second.sin_fp16_flat;
 #endif
     } else {
       freqs_cos = &cache_iter->second.cos;
@@ -5457,9 +4926,13 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
   auto &cache = rope_freq_cache[cache_key];
 
   if (!is_fp16) {
-    // cos / sin
-    cache.cos.assign(seq_len, std::vector<float>(head_dim, 0));
-    cache.sin.assign(seq_len, std::vector<float>(head_dim, 0));
+    // cos / sin as [seq_len, half_] rows, the nntrainer::RotaryTable layout.
+    // calc_trigonometric_vals_dup writes a head_dim-wide row whose second half
+    // repeats the first; the rotary kernels read only the first half.
+    cache.cos.assign((size_t)seq_len * half_, 0.0f);
+    cache.sin.assign((size_t)seq_len * half_, 0.0f);
+    std::vector<float> cos_row(head_dim);
+    std::vector<float> sin_row(head_dim);
 
     // update cos / sin frequency
     for (unsigned int i = 0; i < seq_len; ++i) {
@@ -5467,9 +4940,11 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
       // cpu_backend provides calc_trigonometric_vals_dup on every arch (NEON
       // on ARM, scalar fallback elsewhere), so the app-side USE_NEON fork is
       // gone — one code path, one rounding behaviour across backends.
-      nntrainer::calc_trigonometric_vals_dup(
-        half_, thetas.data(), cache.cos[i].data(), cache.sin[i].data(), i,
-        attention_scaling);
+      nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
+                                             cos_row.data(), sin_row.data(), i,
+                                             attention_scaling);
+      std::copy_n(cos_row.data(), half_, &cache.cos[(size_t)i * half_]);
+      std::copy_n(sin_row.data(), half_, &cache.sin[(size_t)i * half_]);
     }
     freqs_cos = &cache.cos;
     freqs_sin = &cache.sin;
@@ -5480,6 +4955,8 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
     // cos / sin for FP16
     cache.cos_fp16.assign(seq_len, std::vector<_FP16>(head_dim, 0));
     cache.sin_fp16.assign(seq_len, std::vector<_FP16>(head_dim, 0));
+    cache.cos_fp16_flat.assign((size_t)seq_len * half_, 0);
+    cache.sin_fp16_flat.assign((size_t)seq_len * half_, 0);
 
     std::vector<float> cos_tmp(head_dim);
     std::vector<float> sin_tmp(head_dim);
@@ -5494,9 +4971,15 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
         cache.cos_fp16[i][j] = (_FP16)cos_tmp[j];
         cache.sin_fp16[i][j] = (_FP16)sin_tmp[j];
       }
+      std::copy_n(cache.cos_fp16[i].data(), half_,
+                  &cache.cos_fp16_flat[(size_t)i * half_]);
+      std::copy_n(cache.sin_fp16[i].data(), half_,
+                  &cache.sin_fp16_flat[(size_t)i * half_]);
     }
     freqs_cos_fp16 = &cache.cos_fp16;
     freqs_sin_fp16 = &cache.sin_fp16;
+    freqs_cos_fp16_flat = &cache.cos_fp16_flat;
+    freqs_sin_fp16_flat = &cache.sin_fp16_flat;
   }
 #endif
 };
@@ -5637,469 +5120,97 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                               unsigned int dim,
                                               unsigned int from,
                                               bool apply_rope) {
-  unsigned int half_ = dim / 2;
-  unsigned int max_timestep =
-    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
-
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, false);
-      cached_freqs_cos = freqs_cos;
-      cached_freqs_sin = freqs_sin;
-    }
-    std::vector<std::vector<float>> *freqs_cos_local = cached_freqs_cos;
-    std::vector<std::vector<float>> *freqs_sin_local = cached_freqs_sin;
-    std::vector<float> *cos_ = nullptr;
-    std::vector<float> *sin_ = nullptr;
-
-    for (unsigned int b = 0; b < in.batch(); b++) {
-      for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_local)[from + h];
-            sin_ = &(*freqs_sin_local)[from + h];
-          }
-          float *in_ptr = in.getData<float>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-
-          if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
-            float *out_ptr = out.getData<float>() +
-                             b * out.channel() * out.height() * out.width() +
-                             c * out.height() * out.width() + h * out.width();
-
-            if (out_ptr != in_ptr) {
-              std::memcpy(out_ptr, in_ptr, sizeof(float) * in.width());
-            }
-            if (apply_rope) {
-              nntrainer::compute_rotary_emb_value(
-                in.width(), dim, half_, out_ptr, nullptr, cos_->data(),
-                sin_->data(), false);
-            }
-          } else if (out.getDataType() ==
-                       ml::train::TensorDim::DataType::UINT16 ||
-                     out.getDataType() ==
-                       ml::train::TensorDim::DataType::FP16) {
-            uint16_t *out_ptr = out.getData<uint16_t>() +
-                                b * out.channel() * out.height() * out.width() +
-                                c * out.height() * out.width() +
-                                h * out.width();
-
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), !apply_rope);
-          }
-        }
-      }
-    }
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    if (cached_freqs_cos_fp16 == nullptr || cached_freqs_sin_fp16 == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      // Cap to the live max sequence length (= the `from < max_timestep` bound
-      // used below), not the model's max_position_embeddings (131072 for
-      // gemma4). The host-RoPE table is indexed [from + h] with from+height <=
-      // max_timestep, so rope_lut_positions() positions suffice. Mirrors the
-      // CUDA/OpenCL GPU-RoPE paths which already cap; avoids a 128K-position
-      // trig build on any platform that falls back to host RoPE.
-      precompute_freqs(head_dim, rope_lut_positions(), theta, true);
-      cached_freqs_cos_fp16 = freqs_cos_fp16;
-      cached_freqs_sin_fp16 = freqs_sin_fp16;
-    }
-    std::vector<std::vector<_FP16>> *freqs_cos_fp16_local =
-      cached_freqs_cos_fp16;
-    std::vector<std::vector<_FP16>> *freqs_sin_fp16_local =
-      cached_freqs_sin_fp16;
-    std::vector<_FP16> *cos_ = nullptr;
-    std::vector<_FP16> *sin_ = nullptr;
-
-    for (unsigned int b = 0; b < in.batch(); b++) {
-      for (unsigned int c = 0; c < in.channel(); c++) {
-        for (unsigned int h = 0; h < in.height(); h++) {
-          if (from < max_timestep) {
-            cos_ = &(*freqs_cos_fp16_local)[from + h];
-            sin_ = &(*freqs_sin_fp16_local)[from + h];
-          }
-          _FP16 *in_ptr = in.getData<_FP16>() +
-                          b * in.channel() * in.height() * in.width() +
-                          c * in.height() * in.width() + h * in.width();
-          _FP16 *out_ptr = out.getData<_FP16>() +
-                           b * out.channel() * out.height() * out.width() +
-                           c * out.height() * out.width() + h * out.width();
-
-          nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                              out_ptr, cos_->data(),
-                                              sin_->data());
-        }
-      }
-    }
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
+  if (in.getDataType() != ml::train::TensorDim::DataType::FP32 &&
+      in.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return;
+  in.getOps()->rotary_embedding(
+    in, out, dim, rotary_table(in.getDataType(), dim), from, apply_rope);
 }
 
-void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
-                                    size_t num_head, unsigned int from) {
-  if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *qk_out_ = qk_out.getData<float>();
-
-    if (attn_logit_softcapping > 0.0f) {
-      size_t len =
-        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
-      float inv_softcapping = 1.0f / attn_logit_softcapping;
-      for (size_t i = 0; i < len; ++i) {
-        qk_out_[i] =
-          std::tanh(qk_out_[i] * inv_softcapping) * attn_logit_softcapping;
-      }
-    }
-
-    if (row == 1) {
-      size_t start_row = 0;
-      size_t end_row = 0;
-      if (is_causal) {
-        end_row = from < local_window_size ? from + 1 : local_window_size;
-      } else {
-        end_row = from + row; // end_row = to
-      }
-      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
-    } else {
-      // Iterate over ALL rows (not just min(row, window)) so that every query
-      // row in a long prefill gets softmaxed over the correct windowed range.
-      size_t total_rows = row;
-      if (!is_causal)
-        total_rows = row;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, total_rows, [=](size_t i) {
-        size_t start_row, end_row;
-        if (is_causal) {
-          start_row =
-            calc_windowed_attn_index(from + i) - calc_windowed_attn_index(from);
-          end_row = calc_windowed_attn_index(from + i + 1) -
-                    calc_windowed_attn_index(from);
-        } else {
-          unsigned int to = from + row;
-          start_row = i * to;
-          end_row = (i + 1) * to;
-        }
-        nntrainer::softmax_row(qk_out_, start_row, end_row, num_head);
-      });
-    }
-  } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+nntrainer::RotaryTable
+MHACoreLayer::rotary_table(ml::train::TensorDim::DataType dt,
+                           unsigned int dim) {
+  nntrainer::RotaryTable table;
+  table.half = dim / 2;
+  if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    _FP16 *qk_out_ = qk_out.getData<_FP16>();
-
-    if (attn_logit_softcapping > 0.0f) {
-      size_t len =
-        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
-      float inv_softcapping = 1.0f / attn_logit_softcapping;
-      for (size_t i = 0; i < len; ++i) {
-        qk_out_[i] = (_FP16)(std::tanh((float)qk_out_[i] * inv_softcapping) *
-                             attn_logit_softcapping);
-      }
-    }
-
-    if (row == 1) {
-      size_t start_row = 0;
-      size_t end_row = 0;
-      if (is_causal) {
-        end_row = from < local_window_size ? from + 1 : local_window_size;
-      } else {
-        end_row = from + row; // end_row = to
-      }
-      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
-    } else {
-      // Iterate over ALL rows (not just min(row, window)) so that every query
-      // row in a long prefill gets softmaxed over the correct windowed range.
-      size_t total_rows = row;
-      if (!is_causal)
-        total_rows = row;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, total_rows, [=](size_t i) {
-        size_t start_row, end_row;
-        if (is_causal) {
-          start_row =
-            calc_windowed_attn_index(from + i) - calc_windowed_attn_index(from);
-          end_row = calc_windowed_attn_index(from + i + 1) -
-                    calc_windowed_attn_index(from);
-        } else {
-          unsigned int to = from + row;
-          start_row = i * to;
-          end_row = (i + 1) * to;
-        }
-        nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head);
-      });
-    }
+    // The same table the OpenCL RoPE uses, capped at rope_lut_positions()
+    // (the live max sequence length, not max_position_embeddings).
+    ensure_rope_flat_lut();
+    table.cos_fp16 = rope_cos_flat_cur;
+    table.sin_fp16 = rope_sin_flat_cur;
+    table.positions = rope_flat_positions;
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
+    return table;
   }
+  if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
+    const std::lock_guard<std::mutex> lock(rope_init_mtx);
+    precompute_freqs(head_dim, max_position_embeddings, theta, false);
+    cached_freqs_cos = freqs_cos;
+    cached_freqs_sin = freqs_sin;
+  }
+  table.cos = cached_freqs_cos->data();
+  table.sin = cached_freqs_sin->data();
+  table.positions = (unsigned int)(cached_freqs_cos->size() / table.half);
+  return table;
 }
 
-void MHACoreLayer::softmax_triangle(nntrainer::Tensor &qk_out, size_t row,
-                                    size_t num_head, unsigned int from,
-                                    nntrainer::Tensor &sink_step) {
-  if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *qk_out_ = qk_out.getData<float>();
-
-    if (attn_logit_softcapping > 0.0f) {
-      size_t len =
-        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
-      float inv_softcapping = 1.0f / attn_logit_softcapping;
-      for (size_t i = 0; i < len; ++i) {
-        qk_out_[i] =
-          std::tanh(qk_out_[i] * inv_softcapping) * attn_logit_softcapping;
-      }
-    }
-
-    if (row == 1) {
-      size_t start_row = 0;
-      size_t end_row = 0;
-      if (is_causal) {
-        end_row = from < local_window_size ? from + 1 : local_window_size;
-      } else {
-        unsigned int to = from + row;
-        end_row = to;
-      }
-      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head,
-                                     sink_step.getData());
-    } else {
-      // Iterate over ALL rows (not just min(row, window)) for correct windowed
-      // prefill when sequence_len > local_window_size.
-      size_t total_rows = row;
-      if (!is_causal)
-        total_rows = row;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, total_rows, [=](size_t i) {
-        size_t start_row, end_row;
-        if (is_causal) {
-          start_row =
-            calc_windowed_attn_index(i + from) - calc_windowed_attn_index(from);
-          end_row = calc_windowed_attn_index(from + i + 1) -
-                    calc_windowed_attn_index(from);
-        } else {
-          unsigned int to = from + row;
-          start_row = i * to;
-          end_row = (i + 1) * to;
-        }
-        nntrainer::softmax_row(qk_out_, start_row, end_row, num_head,
-                               sink_step.getData());
-      });
-    }
-  } else if (qk_out.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    _FP16 *qk_out_ = qk_out.getData<_FP16>();
-    _FP16 *sink_step_ = sink_step.getData<_FP16>();
-
-    if (attn_logit_softcapping > 0.0f) {
-      size_t len =
-        qk_out.batch() * qk_out.height() * qk_out.width() * qk_out.channel();
-      float inv_softcapping = 1.0f / attn_logit_softcapping;
-      for (size_t i = 0; i < len; ++i) {
-        qk_out_[i] = (_FP16)(std::tanh((float)qk_out_[i] * inv_softcapping) *
-                             attn_logit_softcapping);
-      }
-    }
-
-    if (row == 1) {
-      size_t start_row = 0;
-      size_t end_row = 0;
-      if (is_causal) {
-        end_row = from < local_window_size ? from + 1 : local_window_size;
-      } else {
-        end_row = from + row; // end_row = to
-      }
-      nntrainer::softmax_row_inplace(qk_out_, start_row, end_row, num_head,
-                                     sink_step_);
-    } else {
-      // Iterate over ALL rows (not just min(row, window)) for correct windowed
-      // prefill when sequence_len > local_window_size.
-      size_t total_rows = row;
-      if (!is_causal)
-        total_rows = row;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, total_rows, [=](size_t i) {
-        size_t start_row, end_row;
-        if (is_causal) {
-          start_row =
-            calc_windowed_attn_index(i + from) - calc_windowed_attn_index(from);
-          end_row = calc_windowed_attn_index(from + i + 1) -
-                    calc_windowed_attn_index(from);
-        } else {
-          unsigned int to = from + row;
-          start_row = i * to;
-          end_row = (i + 1) * to;
-        }
-        nntrainer::softmax_row(qk_out_, start_row, end_row, num_head,
-                               sink_step_);
-      });
-    }
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
+void MHACoreLayer::write_kv_cache(unsigned int batch,
+                                  nntrainer::Tensor &key_step,
+                                  nntrainer::Tensor &value_step,
+                                  nntrainer::Tensor &cache_key,
+                                  nntrainer::Tensor &cache_value,
+                                  unsigned int pos, bool write_key,
+                                  bool write_value, bool rotate_key) {
+  auto batch_plane = [batch](nntrainer::Tensor &cache) {
+    ml::train::TensorDim dim = cache.getDim();
+    dim.batch(1);
+    return cache.getSharedDataTensor(dim, batch * dim.getFeatureLen(), true);
+  };
+  nntrainer::Tensor key_plane, value_plane;
+  nntrainer::KVCacheView kv;
+  if (write_key) {
+    key_plane = batch_plane(cache_key);
+    kv.key = &key_plane;
   }
+  if (write_value) {
+    value_plane = batch_plane(cache_value);
+    kv.value = &value_plane;
+  }
+  kv.head_dim = head_dim;
+  kv.ring_cap = kv_ring_cap;
+
+  nntrainer::RotaryTable rope;
+  if (rotate_key && write_key)
+    rope = rotary_table(key_step.getDataType(), head_dim);
+  key_step.getOps()->kv_cache_write(key_step, value_step, kv, pos,
+                                    rotate_key && write_key ? &rope : nullptr);
 }
 
-void MHACoreLayer::compute_fp16vcache_transposed(
-  nntrainer::Tensor &in, nntrainer::Tensor &vcache, nntrainer::Tensor &output,
-  int from, int num_cache_head, int gqa_size, int head_dim, int to) {
+void MHACoreLayer::attend_rowwise(nntrainer::Tensor &query_step,
+                                  nntrainer::Tensor &cached_key,
+                                  nntrainer::Tensor &cached_value,
+                                  nntrainer::Tensor &output, unsigned int from,
+                                  unsigned int to, nntrainer::Tensor *sink) {
+  nntrainer::KVCacheView kv;
+  kv.key = &cached_key;
+  kv.value = &cached_value;
+  kv.head_dim = head_dim;
+  kv.ring_cap = kv_ring_cap;
+  kv.key_scale = cur_kv_int8_key_scale_batch;
+  kv.value_scale = cur_kv_int8_value_scale_batch;
 
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if ((to - from) != 1) {
-      // Iterate over ALL output rows so every query row gets an output even
-      // when (to - from) > local_window_size.
-      int total = to - from;
-      if (!is_causal)
-        total = to - from;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(0, static_cast<size_t>(total), [=](size_t i) {
-        size_t start_idx;
-        if (is_causal) {
-          start_idx =
-            calc_windowed_attn_index(from + i) - calc_windowed_attn_index(from);
-        } else {
-          start_idx = i * to; // linear index
-        }
-        const float *input =
-          in.getData<float>() + start_idx * num_cache_head * gqa_size;
-        float *out =
-          output.getData<float>() + i * (num_cache_head * gqa_size * head_dim);
-
-        int row_num = is_causal ? (from + (int)i) : to - 1;
-        if (vcache.getDataType() == ml::train::TensorDim::DataType::FP32) {
-          compute_vcache_fp32_transposed_reference(
-            row_num, input, vcache.getData<float>(), out, num_cache_head,
-            gqa_size, head_dim, local_window_size);
-        } else {
-          nntrainer::compute_fp16vcache_fp32_transposed(
-            row_num, input, vcache.getData<uint16_t>(), out, num_cache_head,
-            gqa_size, head_dim, local_window_size);
-        }
-      });
-    } else {
-      // Single token processing (common during generation)
-      // Parallelize over KV heads for decoding since Q direction is always 1
-      int row_num = to - 1;
-
-      // Use OpenMP for lower overhead parallelization during decoding
-      const float *in_data = in.getData<float>();
-      float *output_data = output.getData<float>();
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      if (vcache.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        const float *vcache_data = vcache.getData<float>();
-        tm.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            compute_vcache_fp32_transposed_reference(
-              row_num, in_data, vcache_data, output_data, num_cache_head,
-              gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
-          });
-      } else {
-        const uint16_t *vcache_data = vcache.getData<uint16_t>();
-        tm.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            nntrainer::compute_fp16vcache_fp32_transposed(
-              row_num, in_data, vcache_data, output_data, num_cache_head,
-              gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
-          });
-      }
-    }
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    if ((to - from) != 1) {
-      // Iterate over ALL output rows so every query row gets an output even
-      // when (to - from) > local_window_size.
-      int total = to - from;
-      if (!is_causal)
-        total = to - from;
-
-      auto &tm = nntrainer::ThreadManager::Global();
-      if (kv_int8) {
-        const int8_t *vcache_i8 =
-          reinterpret_cast<const int8_t *>(vcache.getData<uint8_t>());
-        const uint16_t *vscale = cur_kv_int8_value_scale_batch;
-        NNTR_THROW_IF(vscale == nullptr, std::invalid_argument)
-          << "kv_int8 V read path missing per-batch V-scale pointer";
-        // Iterate over ALL output rows + windowed cumulative offset (PR #3989).
-        tm.parallel_for(0, static_cast<size_t>(total), [=](size_t i) {
-          size_t start_idx;
-          if (is_causal) {
-            start_idx = calc_windowed_attn_index(from + i) -
-                        calc_windowed_attn_index(from);
-          } else {
-            start_idx = i * to;
-          }
-          const _FP16 *input =
-            in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
-          _FP16 *out_p = output.getData<_FP16>() +
-                         i * (num_cache_head * gqa_size * head_dim);
-          int row_num = is_causal ? (from + (int)i) : to - 1;
-          compute_fp16vcache_transposed_int8(
-            row_num, input, vcache_i8, vscale, out_p, num_cache_head, gqa_size,
-            head_dim, local_window_size, 0, -1);
-        });
-      } else {
-        tm.parallel_for(0, static_cast<size_t>(total), [=](size_t i) {
-          size_t start_idx;
-          if (is_causal) {
-            start_idx = calc_windowed_attn_index(from + i) -
-                        calc_windowed_attn_index(from);
-          } else {
-            start_idx = i * to;
-          }
-          const _FP16 *input =
-            in.getData<_FP16>() + start_idx * num_cache_head * gqa_size;
-          _FP16 *out = output.getData<_FP16>() +
-                       i * (num_cache_head * gqa_size * head_dim);
-          int row_num = is_causal ? (from + (int)i) : to - 1;
-          nntrainer::compute_fp16vcache_transposed(
-            row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
-            gqa_size, head_dim, local_window_size);
-        });
-      }
-    } else {
-      // Single token processing (common during generation)
-      // Parallelize over KV heads for decoding since Q direction is always 1
-      int row_num = to - 1;
-
-      // Use OpenMP for lower overhead parallelization during decoding
-      const _FP16 *in_data = in.getData<_FP16>();
-      _FP16 *output_data = output.getData<_FP16>();
-
-      auto &tm_fp16 = nntrainer::ThreadManager::Global();
-      if (kv_int8) {
-        const int8_t *vcache_i8 =
-          reinterpret_cast<const int8_t *>(vcache.getData<uint8_t>());
-        const uint16_t *vscale = cur_kv_int8_value_scale_batch;
-        NNTR_THROW_IF(vscale == nullptr, std::invalid_argument)
-          << "kv_int8 V read path (decode) missing per-batch V-scale pointer";
-        tm_fp16.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            compute_fp16vcache_transposed_int8(
-              row_num, in_data, vcache_i8, vscale, output_data, num_cache_head,
-              gqa_size, head_dim, local_window_size, (int)head_kv,
-              (int)head_kv + 1);
-          });
-      } else {
-        const _FP16 *vcache_data = vcache.getData<_FP16>();
-        tm_fp16.parallel_for(
-          0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-            nntrainer::compute_fp16vcache_transposed(
-              row_num, in_data, vcache_data, output_data, num_cache_head,
-              gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
-          });
-      }
-    }
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
+  nntrainer::AttentionOpParams p;
+  p.num_heads_q = num_heads_Q;
+  p.q_pos = from;
+  p.kv_len = to;
+  p.causal = is_causal;
+  p.window = local_window_size;
+  p.softcap = attn_logit_softcapping;
+  p.sink = sink;
+  query_step.getOps()->attention(query_step, kv, output, p);
 }
 
 void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
@@ -6178,24 +5289,12 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
 #ifdef ENABLE_FP16
   cached_freqs_cos_fp16 = nullptr;
   cached_freqs_sin_fp16 = nullptr;
+  rope_cos_flat_cur = nullptr;
+  rope_sin_flat_cur = nullptr;
 #endif
 }
 
 size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
-
-size_t MHACoreLayer::calc_windowed_attn_index(size_t i) {
-  // S(i) = sum_{k=0}^{i-1} min(k+1, W)
-  // For i <= W:  S(i) = i*(i+1)/2   (same as full-attention triangular index)
-  // For i >  W:  S(i) = W*(W+1)/2 + (i - W)*W
-  // When W == UINT_MAX, i <= W is always true, so we never evaluate
-  // W*(W+1)/2 and there is no overflow.
-  if (i <= local_window_size) {
-    return (i * (i + 1)) / 2;
-  } else {
-    return (local_window_size * (local_window_size + 1)) / 2 +
-           (i - local_window_size) * local_window_size;
-  }
-};
 
 #ifdef PLUGGABLE
 
