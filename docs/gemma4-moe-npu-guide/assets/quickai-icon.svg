@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="18 18 72 72">
+  <!-- SPDX-License-Identifier: Apache-2.0 -->
+  <!-- QuickDotAIAPP launcher artwork from
+       Applications/CausalLM/Android/QuickDotAIAPP/src/main/res/drawable/
+       ic_launcher_background.xml and ic_launcher_foreground.xml.
+       Preserve their paths, transforms and gradients when updating this copy.
+       The rounded square shows the central 72 dp of the adaptive icon layers. -->
+  <defs>
+    <linearGradient id="background" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="108" y2="108">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DBEEFF"/>
+    </linearGradient>
+    <linearGradient id="bolt" gradientUnits="userSpaceOnUse" x1="7" y1="3" x2="17.5" y2="21">
+      <stop stop-color="#4FC3F7"/>
+      <stop offset="1" stop-color="#0369A1"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="72" height="72" rx="18" fill="url(#background)"/>
+  <path transform="translate(25.2 25.2) scale(2.4)" fill="url(#bolt)" d="M11,21h-1l1,-7L7.5,14c-0.58,0 -0.57,-0.32 -0.38,-0.66 0.19,-0.34 0.05,-0.08 0.07,-0.12C8.48,10.94 10.42,7.54 13,3h1l-1,7h3.5c0.49,0 0.56,0.33 0.47,0.51l-0.07,0.15C12.96,17.55 11,21 11,21z"/>
+</svg>

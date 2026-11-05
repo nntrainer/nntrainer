@@ -22,7 +22,9 @@ def main():
         parser.error("Generate the site with tools/render_gemma4_npu_guide.py first")
     routes = {"/" + p.relative_to(site).as_posix(): p
               for p in site.rglob("*")
-              if p.is_file() and p.suffix in (".html", ".css", ".js", ".png")}
+              if p.is_file() and p.suffix in (".html", ".css", ".js", ".png", ".svg")}
+    icon = site / "assets/quickai-icon.svg"
+    routes["/" + icon.relative_to(docs).as_posix()] = icon
     # Markdown and full-page HTML keep paths relative to docs/.
     for directory, suffixes in (("screenshots", (".png",)),
                                 ("benchmarks", (".json", ".csv", ".zip"))):
