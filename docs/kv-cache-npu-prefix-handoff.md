@@ -137,3 +137,28 @@ ARM 엔진·앱과 DSP skeleton을 함께 배포한다.
 재현 bundle: `/tmp/nntr-prefix-flash-20261105` (기기에도 같은 basename).
 `run-final.sh`는 기능/교차 성능/기존 세션 검증, `run-quality.sh`는 실제 CLI RUBY
 재계산과 A→B Flash hit를 실행한다. 로컬 `raw/`에 모든 결과와 로그가 있다.
+
+## 추가 검증: 4K–20K core 기능/효과 표
+
+- 제품 구현은 `286abec4e` 그대로 유지. 측정 도구 커밋 `f258e8629`.
+- `htp_prefix_grid_bench`: 4K/8K/12K/16K/20K 각 DRAM/Flash 2회 paired 비교,
+  20개 case 전체 11개 출력 ID·위치 일치, 모든 답변 RUBY-456.
+- 20K DRAM: 대응 재계산 53.349초 → 2.752초 (19.38×).
+- 20K Flash: 대응 재계산 46.906초 → 5.325초 (8.81×).
+- Flash source는 25,088토큰. 24K까지 진행한 뒤에도 4K..20K의 5개 과거 경계를
+  실제 파일에서 복원했다. 모든 Flash hit 전 clean-file-cache eviction advice를
+  실행했으며 완전한 UFS device-cache cold 보장은 아니다.
+- 20,992-token cold 백업 OFF/ON/ON/OFF: OFF 평균57.819초, ON60.300초
+  (+4.29%). staging 880.7ms, background write/sync8325.1ms, 요청 종료
+  pending=0, skip/failure=0. **저장 비용이 완전히 숨겨졌다는 결론은 금지.**
+- 중간 thermal status2 / HAL SKIN44.6°C, 주파수 미고정. 각 tier의 대응 control을
+  사용했으며 표본·min/max·온도 원문을 기록했다. 새 구현 품질회귀는 관측되지
+  않았지만 전체 속도 무회귀를 보장한 결과가 아니다.
+- 활성 DSP INT8 KV payload: 4K146.875MiB → 20K306.875MiB. 가중치·host
+  prefix slab·staging은 제외. 이 pack의 최신 host-prefix pin 카운터는1560MiB.
+- 후속 최적화 후보: staging payload 복사/중복 저장 축소와 I/O·DDR 경쟁 완화.
+  정적 scale 변경은 다른 작업 범위로 유지한다.
+- [핵심 기능·속도·메모리·저장 비용 표](kv-cache-manager-feature-results.md),
+  [전체 원본과 입력 token pool/출력 ID](validation/gemma4-htp-prefix-grid-20261105.json).
+- 로컬 원본 `/tmp/nntr-prefix-grid-20261105`, 기기에도 같은 basename.
+  benchmark 종료 후 cache backing은 정리됐고 기기 Flash 여유는 약4.1GiB로 복귀.

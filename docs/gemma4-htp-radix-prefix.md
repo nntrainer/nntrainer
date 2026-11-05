@@ -266,3 +266,16 @@ tracer). Frequencies were not locked. These short generation checks are not a
 sustained decode TPS or sustained write-saturation claim.
 
 [Complete inputs, output IDs, timings and binary manifests](validation/gemma4-htp-prefix-flash-20261105.json).
+
+## Extended feature/results report through 20K
+
+[Current core feature matrix and the 4K–20K measurements](kv-cache-manager-feature-results.md)
+record two paired comparisons per tier/length, exact IDs and meaningful RUBY
+answers. At 20K the DRAM pair measured 53.349 → 2.752 s and the Flash pair
+46.906 → 5.325 s. Each uses its own corresponding recomputation control.
+
+The longer 20,992-token cold backup comparison observed +4.29% TTFT
+(57.819 → 60.300 s), despite writes finishing before request end. Keep this
+cost visible alongside the earlier 8704-token +0.39% result: neither establishes
+zero overhead on arbitrary workloads. Thermal state and frequency were not
+fixed. The new benchmark changes no production inference/manager code.
