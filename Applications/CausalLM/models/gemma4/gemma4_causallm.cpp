@@ -672,11 +672,12 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   // sqrt(head_dim) to preserve Gemma4 semantics.
 
   // TODO : fix AVX kernel to not make it divide by 1/sqrt(head_dim) on gemma4
-  LayerHandle q_scale(createLayer(
-    "scalar_multiply",
-    {withKey("name", Q_scaled), withKey("packed", "false"),
-     withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim))))}));
+  std::vector<std::string> q_scale_params = {
+    withKey("name", Q_scaled), withKey("packed", "false"),
+    withKey("multiplier",
+            std::to_string(std::sqrt(static_cast<float>(curr_head_dim))))};
+  appendSkipPrefillIfNeeded(q_scale_params, is_kv_shared_layer);
+  LayerHandle q_scale(createLayer("scalar_multiply", q_scale_params));
   Tensor q_scaled = q_scale(q_normed);
 
   unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
