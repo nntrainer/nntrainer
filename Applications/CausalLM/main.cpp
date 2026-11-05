@@ -439,6 +439,12 @@ int main(int argc, char *argv[]) {
         const bool prefixes = nntr_cfg.contains("htp") &&
                               nntr_cfg["htp"].value("kv_prefix_cache", false);
         causal->enableDeviceKVManager(32, prefixes ? 8 : 0);
+        if (nntr_cfg.contains("kv_prefix_flash")) {
+          const auto &flash = nntr_cfg.at("kv_prefix_flash");
+          causal->enableDeviceKVPrefixFlash(
+            flash.at("directory"), flash.at("budget_bytes").get<size_t>(),
+            flash.at("staging_bytes").get<size_t>());
+        }
         device_session_ids.emplace("default", 0);
       }
       size_t index = 0;
@@ -495,6 +501,23 @@ int main(int argc, char *argv[]) {
             {"radix_nodes", stats.radix_nodes},
             {"hits", stats.hits},
             {"reused_tokens", stats.reused_tokens}};
+        }
+        if (nntr_cfg.contains("kv_prefix_flash")) {
+          const auto flash = causal->deviceKVPrefixFlashStats();
+          result["device_kv_prefix_flash"] = {
+            {"pending_bytes", flash.pending_bytes},
+            {"peak_pending_bytes", flash.peak_pending_bytes},
+            {"reserved_flash_bytes", flash.flash_bytes},
+            {"submitted", flash.submitted},
+            {"written", flash.written},
+            {"skipped", flash.skipped},
+            {"failed", flash.failed},
+            {"evicted", flash.evicted},
+            {"flash_hits", flash.flash_hits},
+            {"staging_hits", flash.staging_hits},
+            {"staging_ms", flash.staging_ms},
+            {"write_ms", flash.write_ms},
+            {"read_ms", flash.read_ms}};
         }
         result["output_ids"] = causal->getLastGeneratedTokenIds();
         result["device_kv_restore_ms"] = restore_ms;

@@ -130,7 +130,13 @@ int main() {
     pinned = borrowed.capturePrefix(159);
     require(pinned->layers[0].pages[0]->key_view ==
             reinterpret_cast<unsigned char *>(k));
+    const auto staged = borrowed.capturePrefix(159, pinned.get(), true);
+    require(borrowed.prefixPayloadBytes(159) == 159u * 8u * 2u * 2u);
+    for (const auto &page : staged->layers[0].pages)
+      require(!page->key_view && !page->value_view && !page->key_owner);
     require(borrowed.compact(159)); // unaligned sliding base is preserved
+    require(reinterpret_cast<const uint16_t *>(
+              staged->layers[0].pages[0]->keyData())[10] == 10);
     require(!pinned->layers[0].pages[0]->key_view);
     const auto live = borrowed.capturePrefix(159);
     require(live->layers[0].base == 95);

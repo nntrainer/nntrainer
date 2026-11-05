@@ -154,10 +154,22 @@ int main(int argc, char **argv) {
     }
     c->setSessionTokenPosition(0);
     c->enableDeviceKVManager(8, 8);
+    const bool flash = fixture.contains("flash");
+    if (flash) {
+      const auto &f = fixture.at("flash");
+      c->enableDeviceKVPrefixFlash(f.at("directory"), f.at("budget_bytes"),
+                                   f.at("staging_bytes"));
+    }
     const auto source_result = run(source, false);
     report["source_cache_miss"] = source_result;
     require(source_result["ids"] == report["source_reference"]["ids"],
             "Source reference changed");
+    if (flash) {
+      c->drainDeviceKVPrefixFlash();
+      const auto stats = c->deviceKVPrefixFlashStats();
+      require(stats.written > 0 && stats.pending_bytes == 0 && !stats.failed,
+              "Source boundary was not saved to Flash");
+    }
     const auto source_fork = c->forkDeviceKVSession();
     const auto repeat_session = c->createDeviceKVSession();
     c->selectDeviceKVSession(repeat_session);
@@ -191,14 +203,25 @@ int main(int argc, char **argv) {
       const unsigned target_end = static_cast<unsigned>(input_tokens - 1);
       const unsigned source_end = static_cast<unsigned>(source_ids.size() - 1);
       const unsigned last_full = source_end / plane * plane;
-      for (unsigned to : {last_full, source_end}) {
+      std::vector<unsigned> boundaries{last_full, source_end};
+      if (flash)
+        for (unsigned to = plane; to < last_full; to += plane)
+          boundaries.push_back(to);
+      for (unsigned to : boundaries) {
         if (to < 64 || to > common || to > target_end)
           continue;
         const unsigned call_from = (to - 1) / plane * plane;
         if (to == std::min(target_end, call_from + plane))
           expected_hit = std::max(expected_hit, to);
       }
+      const auto flash_before = c->deviceKVPrefixFlashStats();
       auto result = run(branches[i], false);
+      const auto flash_after = c->deviceKVPrefixFlashStats();
+      result["flash_hits"] = flash_after.flash_hits - flash_before.flash_hits;
+      result["flash_read_ms"] = flash_after.read_ms - flash_before.read_ms;
+      if (flash && i == 0 && expected_hit && expected_hit < last_full)
+        require(result["flash_hits"].get<unsigned>() == 1,
+                "Earlier sliding boundary did not come from Flash");
       const auto after = c->deviceKVManagerStats();
       result["reused_tokens"] = after.reused_tokens - before.reused_tokens;
       require(after.hits == before.hits + (expected_hit ? 1u : 0u) &&
@@ -251,6 +274,13 @@ int main(int argc, char **argv) {
     report["available_kb_before_prefix_clear"] = availableMemoryKb();
     c->clearDeviceKVPrefixes();
     report["available_kb_after_prefix_clear"] = availableMemoryKb();
+    if (flash) {
+      c->drainDeviceKVPrefixFlash();
+      const auto stats = c->deviceKVPrefixFlashStats();
+      report["flash_after_clear_bytes"] = stats.flash_bytes;
+      require(stats.flash_bytes == 0 && stats.pending_bytes == 0,
+              "Prefix clear retained Flash files");
+    }
     report["prefix_host_after_clear"] = c->getDeviceKVPrefixBytes();
     require(c->getDeviceKVPrefixBytes() == 0 && c->getDeviceKVCacheBytes() > 0,
             "Clearing prefixes must free host pins and preserve active DSP KV");

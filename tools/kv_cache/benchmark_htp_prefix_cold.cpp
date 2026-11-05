@@ -25,7 +25,10 @@ public:
     Transformer(sanitizeConfig(c), sanitizeGenerationConfig(g, c), n,
                 ModelType::CAUSALLM),
     Gemma4HtpMoECausalLM(c, g, n) {}
-  void retainPrefixes(bool enabled) { device_prefill_capture_ = enabled; }
+  void retainPrefixes(bool enabled, bool flash) {
+    device_prefill_capture_ = flash || enabled;
+    device_prefix_flash_capture_ = enabled;
+  }
 };
 } // namespace causallm
 static json read(const std::filesystem::path &p) {
@@ -64,6 +67,12 @@ int main(int argc, char **argv) {
     model->load_weight(nc.at("model_file_name"));
     model->repack_weight();
     model->enableDeviceKVManager(2, 1);
+    const bool flash = fixture.contains("flash");
+    if (flash) {
+      const auto &f = fixture.at("flash");
+      model->enableDeviceKVPrefixFlash(f.at("directory"), f.at("budget_bytes"),
+                                       f.at("staging_bytes"));
+    }
     static const BaseStreamerVTable vt = {Observer::put, Observer::end};
     json report = {{"config", nc},
                    {"fixture", fixture},
@@ -77,10 +86,12 @@ int main(int argc, char **argv) {
       Observer observer;
       observer.base.vtable = &vt;
       model->setStreamer(&observer.base);
+      model->drainDeviceKVPrefixFlash();
+      const auto flash_before = model->deviceKVPrefixFlashStats();
       const auto started = Clock::now();
       model->clearDeviceKVPrefixes();
       model->setSessionTokenPosition(0);
-      model->retainPrefixes(retain);
+      model->retainPrefixes(retain, flash);
       const auto before = model->deviceKVManagerStats();
       model->run(text, false, "", "", false);
       const auto ended = Clock::now();
@@ -89,7 +100,25 @@ int main(int argc, char **argv) {
       if (observer.first == Clock::time_point{} || m.prompt_truncated_tokens ||
           model->deviceKVManagerStats().hits != before.hits)
         throw std::runtime_error("Invalid cold request");
+      const auto after_run = model->deviceKVPrefixFlashStats();
+      const auto drain_started = Clock::now();
+      model->drainDeviceKVPrefixFlash();
+      const auto drain_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - drain_started)
+          .count();
+      const auto after_drain = model->deviceKVPrefixFlashStats();
+      if (flash && retain && fixture.value("require_backup", true) &&
+          after_drain.submitted == flash_before.submitted)
+        throw std::runtime_error("No earlier boundary was backed up");
       return json{
+        {"flash_submitted", after_drain.submitted - flash_before.submitted},
+        {"flash_written", after_drain.written - flash_before.written},
+        {"flash_skipped", after_drain.skipped - flash_before.skipped},
+        {"flash_failed", after_drain.failed - flash_before.failed},
+        {"flash_staging_ms", after_drain.staging_ms - flash_before.staging_ms},
+        {"flash_write_ms", after_drain.write_ms - flash_before.write_ms},
+        {"flash_pending_at_run_end", after_run.pending_bytes},
+        {"post_request_drain_ms", drain_ms},
         {"capture", retain},
         {"ids", model->getLastGeneratedTokenIds()},
         {"position", model->getKvLen()},

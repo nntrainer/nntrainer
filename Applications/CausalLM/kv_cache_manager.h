@@ -214,8 +214,9 @@ public:
     std::vector<Layer> layers;
   };
   std::shared_ptr<const PrefixSnapshot>
-  capturePrefix(unsigned position,
-                const PrefixSnapshot *previous = nullptr) const;
+  capturePrefix(unsigned position, const PrefixSnapshot *previous = nullptr,
+                bool owned = false) const;
+  size_t prefixPayloadBytes(unsigned position) const;
   void restorePrefix(const PrefixSnapshot &snapshot);
   unsigned prefixMinPosition() const {
     unsigned first = 0;

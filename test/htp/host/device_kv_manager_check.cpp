@@ -200,6 +200,23 @@ int main() {
     m.publish(long_source, 3072, 9);
     assert(m.reuse(divergent) == 0); // required rows were actually evicted
   }
+  {
+    unsigned selected = 0;
+    Manager m([](unsigned, unsigned) { return 1u; },
+              [&](uint32_t, unsigned length) {
+                if (length == 128)
+                  throw Manager::PrefixUnavailable("corrupt/evicted Flash");
+                selected = length;
+              },
+              [](uint32_t) {}, [] {}, 1, 1);
+    m.setPrefixLengths([](uint32_t) { return std::vector<unsigned>{64, 128}; });
+    Manager::Tokens source(160, 7);
+    m.publish(source, 160, 0);
+    auto branch = source;
+    branch[150] = 8;
+    assert(m.reuse(branch) == 64 && selected == 64);
+    assert(m.tokens().size() == 64 && m.stats().hits == 1);
+  }
   assert(live.empty());
   std::cout
     << "Device sessions, compressed radix, LRU, failure isolation: PASS\n";

@@ -26,6 +26,10 @@ namespace causallm {
  */
 class DeviceKVManager {
 public:
+  /** Backing was evicted/corrupt; try an earlier candidate or recompute. */
+  struct PrefixUnavailable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+  };
   using Tokens = std::vector<unsigned int>;
   using Capture = std::function<uint32_t(unsigned, unsigned)>;
   using Restore = std::function<void(uint32_t, unsigned)>;
@@ -163,8 +167,7 @@ public:
     ++stats_.lookups;
     const Node *node = &root_;
     size_t offset = 0;
-    uint32_t best = 0;
-    size_t best_count = 0;
+    std::vector<std::pair<uint32_t, size_t>> candidates;
     while (offset < tokens.size()) {
       auto it = node->children.find(tokens[offset]);
       if (it == node->children.end())
@@ -179,20 +182,24 @@ public:
           (!prefix_compatible_ ||
            prefix_compatible_(node->terminal, static_cast<unsigned>(offset),
                               tokens.size()))) {
-        best = node->terminal;
-        best_count = offset;
+        candidates.emplace_back(node->terminal, offset);
       }
     }
-    if (!best)
-      return 0;
-    auto &p = prefixes_.at(best);
-    Tokens adopted(p.tokens.begin(), p.tokens.begin() + best_count);
-    restore_(p.handle, static_cast<unsigned>(best_count));
-    sessions_.at(active_).tokens = std::move(adopted);
-    p.used = ++clock_;
-    ++stats_.hits;
-    stats_.reused_tokens += best_count;
-    return best_count;
+    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
+      auto &p = prefixes_.at(it->first);
+      Tokens adopted(p.tokens.begin(), p.tokens.begin() + it->second);
+      try {
+        restore_(p.handle, static_cast<unsigned>(it->second));
+      } catch (const PrefixUnavailable &) {
+        continue;
+      }
+      sessions_.at(active_).tokens = std::move(adopted);
+      p.used = ++clock_;
+      ++stats_.hits;
+      stats_.reused_tokens += it->second;
+      return it->second;
+    }
+    return 0;
   }
 
   /** Publish the backend's safe prefixes (or full pages plus the endpoint).

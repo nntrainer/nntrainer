@@ -42,6 +42,7 @@
 
 #include <device_kv_manager.h>
 #include <kv_cache_manager.h>
+#include <prefix_flash_store.h>
 #include <token_sampler.h>
 #include <transformer.h>
 
@@ -96,16 +97,19 @@ protected:
   struct DevicePrefillFrame {
     unsigned from = 0, plane = 0, chunk = 0;
     std::shared_ptr<const KVCacheManager::PrefixSnapshot> kv;
+    std::shared_ptr<PrefixFlashStore::Entry> flash;
     std::vector<std::shared_ptr<const nntrainer::HtpPrefixCalibration>>
       calibration;
   };
   using DevicePrefillHistory = std::map<unsigned, DevicePrefillFrame>;
+  std::unique_ptr<PrefixFlashStore> device_prefix_flash_;
   // Declared before the manager: its release callbacks erase these handles.
   std::shared_ptr<DevicePrefillHistory> device_prefill_history_;
   std::map<uint32_t, std::shared_ptr<const DevicePrefillHistory>>
     device_prefill_states_;
   bool device_prefix_mode_ = false;
   bool device_prefill_capture_ = false;
+  bool device_prefix_flash_capture_ = true;
   bool device_prefill_restored_ = false;
   std::unique_ptr<DeviceKVManager> device_kv_manager_;
   bool htp_session_enabled_ = false;
@@ -286,8 +290,9 @@ public:
    * Session 0 is the current conversation when enabled. New runs on an empty
    * session search published prefixes automatically; continuation takes new
    * text only. Prefix caching additionally requires htp.kv_prefix_cache and
-   * q8_row attention. It retains immutable FP16 prefill pages independently
-   * of DSP INT8 session pages, and recomputes only the unmatched suffix.
+   * original q8/Q2 U16 attention. It retains immutable FP16 prefill pages
+   * independently of DSP INT8 session pages, and recomputes only the unmatched
+   * suffix.
    */
   WIN_EXPORT void enableDeviceKVManager(size_t max_sessions = 32,
                                         size_t max_prefixes = 8);
@@ -298,6 +303,14 @@ public:
   WIN_EXPORT uint32_t activeDeviceKVSession() const;
   WIN_EXPORT DeviceKVManager::Stats deviceKVManagerStats() const;
   WIN_EXPORT void clearDeviceKVPrefixes();
+  /** Back up earlier native boundaries without blocking on Flash writes.
+   * Enable before inference. Staging overflow skips a backup, not inference.
+   */
+  WIN_EXPORT void enableDeviceKVPrefixFlash(const std::string &directory,
+                                            size_t flash_bytes,
+                                            size_t staging_bytes);
+  WIN_EXPORT PrefixFlashStore::Stats deviceKVPrefixFlashStats() const;
+  WIN_EXPORT void drainDeviceKVPrefixFlash();
 
   bool hasPendingSessionToken() const { return !htp_pending_tokens_.empty(); }
   const std::vector<unsigned int> &getLastGeneratedTokenIds() const {

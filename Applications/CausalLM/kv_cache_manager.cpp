@@ -732,8 +732,8 @@ void KVCacheManager::validateSaveRange(unsigned int seq_len) const {
 }
 
 std::shared_ptr<const KVCacheManager::PrefixSnapshot>
-KVCacheManager::capturePrefix(unsigned position,
-                              const PrefixSnapshot *previous) const {
+KVCacheManager::capturePrefix(unsigned position, const PrefixSnapshot *previous,
+                              bool owned) const {
   if (!isAllocated() || batch_size_ != 1 || position == 0 ||
       position > max_seq_len_ || position > cache_pos_)
     throw std::invalid_argument(
@@ -757,15 +757,20 @@ KVCacheManager::capturePrefix(unsigned position,
     const auto &src = layer_caches_[l];
     auto *k = src.key_cache.getData<unsigned char>();
     auto *v = src.value_cache.getData<unsigned char>();
-    const auto key_owner = shared_retain_ ? shared_retain_(k) : nullptr;
-    const auto value_owner = shared_retain_ ? shared_retain_(v) : nullptr;
+    const auto key_owner =
+      !owned && shared_retain_ ? shared_retain_(k) : nullptr;
+    const auto value_owner =
+      !owned && shared_retain_ ? shared_retain_(v) : nullptr;
     for (unsigned p = dst.base; p < position; p += 64u) {
       if (previous && l < previous->layers.size() &&
           previous->element_bytes == state->element_bytes &&
           previous->layers[l].width == dst.width &&
           p >= previous->layers[l].base &&
           (p - previous->layers[l].base) % 64u == 0 &&
-          p + 64u <= previous->position) {
+          p + 64u <= previous->position &&
+          (!owned || !previous->layers[l]
+                        .pages.at((p - previous->layers[l].base) / 64u)
+                        ->key_view)) {
         dst.pages.push_back(
           previous->layers[l].pages.at((p - previous->layers[l].base) / 64u));
       } else {
@@ -792,6 +797,19 @@ KVCacheManager::capturePrefix(unsigned position,
     }
   }
   return state;
+}
+
+size_t KVCacheManager::prefixPayloadBytes(unsigned position) const {
+  if (!isAllocated() || position > cache_pos_)
+    throw std::invalid_argument("Unavailable prefix payload");
+  size_t bytes = 0;
+  for (unsigned l = 0; l < layer_caches_.size(); ++l) {
+    if (position < getBase(l))
+      throw std::invalid_argument("Unavailable prefix window");
+    bytes += size_t(position - getBase(l)) * kv_widths_[l] *
+             layer_caches_[l].key_cache.getDim().getDataTypeSize() * 2u;
+  }
+  return bytes;
 }
 
 void KVCacheManager::restorePrefix(const PrefixSnapshot &state) {

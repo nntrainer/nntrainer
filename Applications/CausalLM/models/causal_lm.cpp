@@ -1150,17 +1150,18 @@ size_t CausalLM::getDeviceKVPrefixBytes() const {
     if (!history)
       return;
     for (const auto &frame : *history)
-      for (const auto &layer : frame.second.kv->layers)
-        for (const auto &page : layer.pages)
-          if (pages.insert(page.get()).second) {
-            if (page->key_owner) {
-              for (const auto &owner : {page->key_owner, page->value_owner})
-                if (slabs.insert(owner.get()).second)
-                  bytes += page->slab_bytes;
-            } else {
-              bytes += page->keySize() + page->valueSize();
+      if (frame.second.kv)
+        for (const auto &layer : frame.second.kv->layers)
+          for (const auto &page : layer.pages)
+            if (pages.insert(page.get()).second) {
+              if (page->key_owner) {
+                for (const auto &owner : {page->key_owner, page->value_owner})
+                  if (slabs.insert(owner.get()).second)
+                    bytes += page->slab_bytes;
+              } else {
+                bytes += page->keySize() + page->valueSize();
+              }
             }
-          }
   };
   count(device_prefill_history_.get());
   for (const auto &state : device_prefill_states_)
@@ -1244,6 +1245,8 @@ void CausalLM::enableDeviceKVManager(size_t max_sessions, size_t max_prefixes) {
       if (position > end || (resume && resume[0] == '0'))
         return false;
       const auto &frame = history->at(position);
+      if (!frame.kv && frame.flash && !frame.flash->available())
+        return false;
       const unsigned chunk = prefillDriveChunk();
       if (frame.plane != INIT_SEQ_LEN || frame.chunk != chunk)
         return false;
@@ -1306,6 +1309,24 @@ void CausalLM::clearDeviceKVPrefixes() {
   if (device_kv_manager_)
     device_kv_manager_->clearPrefixes();
   device_prefill_history_.reset();
+}
+
+void CausalLM::enableDeviceKVPrefixFlash(const std::string &directory,
+                                         size_t flash_bytes,
+                                         size_t staging_bytes) {
+  if (!device_kv_manager_ || !device_prefill_capture_ || device_prefix_flash_)
+    throw std::logic_error(
+      "Flash prefixes require an enabled original q8 radix manager");
+  device_prefix_flash_ =
+    std::make_unique<PrefixFlashStore>(directory, flash_bytes, staging_bytes);
+}
+PrefixFlashStore::Stats CausalLM::deviceKVPrefixFlashStats() const {
+  return device_prefix_flash_ ? device_prefix_flash_->stats()
+                              : PrefixFlashStore::Stats{};
+}
+void CausalLM::drainDeviceKVPrefixFlash() {
+  if (device_prefix_flash_)
+    device_prefix_flash_->drain();
 }
 
 void CausalLM::saveDeviceKVCache(const std::string &path, bool park) {
@@ -1712,13 +1733,22 @@ void CausalLM::registerCustomLayers() {
 #ifdef ENABLE_HEXKL
 void CausalLM::captureDevicePrefill(unsigned from, unsigned position,
                                     unsigned earliest) {
-  if (!device_prefill_capture_ || position < std::max(64u, earliest) ||
+  if (!device_prefill_capture_ || position < 64u ||
+      (position < earliest &&
+       (!device_prefix_flash_ || !device_prefix_flash_capture_)) ||
       REPETITION_PENALTY != 1.0f)
+    return;
+  const bool archive = position < earliest;
+  if (device_prefill_history_ && device_prefill_history_->count(position))
+    return;
+  if (archive &&
+      !device_prefix_flash_->canStage(kv_cache.prefixPayloadBytes(position)))
     return;
   if (!device_prefill_history_)
     device_prefill_history_ = std::make_shared<DevicePrefillHistory>();
   kv_cache.setSharedRetain(
     [](void *block) { return nntrainer::get_htp_ops()->retain_shared(block); });
+  const auto capture_start = std::chrono::steady_clock::now();
   DevicePrefillFrame frame;
   frame.from = from;
   frame.plane = INIT_SEQ_LEN;
@@ -1737,7 +1767,17 @@ void CausalLM::captureDevicePrefill(unsigned from, unsigned position,
   const auto *previous = device_prefill_history_->empty()
                            ? nullptr
                            : device_prefill_history_->rbegin()->second.kv.get();
-  frame.kv = kv_cache.capturePrefix(position, previous);
+  auto snapshot = kv_cache.capturePrefix(position, previous, archive);
+  if (archive) {
+    const double staging_ms =
+      std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - capture_start)
+        .count();
+    frame.flash = device_prefix_flash_->submit(std::move(snapshot), staging_ms);
+    if (!frame.flash)
+      return;
+  } else
+    frame.kv = std::move(snapshot);
   device_prefill_history_->emplace(position, std::move(frame));
 }
 
@@ -1745,9 +1785,16 @@ void CausalLM::restoreDevicePrefill(uint32_t handle, unsigned position) {
   const auto &saved = device_prefill_states_.at(handle);
   if (!saved || !saved->count(position))
     throw std::invalid_argument("Unavailable original-call prefix");
+  // Load before modifying any live session state. Failed backing safely misses.
+  auto payload = saved->at(position).kv;
+  if (!payload && saved->at(position).flash)
+    payload = saved->at(position).flash->load();
+  if (!payload)
+    throw DeviceKVManager::PrefixUnavailable("Unavailable Flash boundary");
   // Fork metadata and shared immutable pages. No source state is shortened.
   auto history = std::make_shared<DevicePrefillHistory>(
     saved->begin(), saved->upper_bound(position));
+  history->at(position).kv = std::move(payload);
   device_prefill_history_ = std::move(history);
   global_token_len = position;
   SYS_PROMP_LEN = 0;
