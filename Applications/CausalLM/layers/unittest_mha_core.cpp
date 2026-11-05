@@ -16,23 +16,25 @@
  *   out = softmax(rope(Q) . rope(K)^T / sqrt(head_dim) + mask) . V
  *
  * The reference rounds K and V to fp16 the way the layer's KV cache stores
- * them, so the two agree within 1e-4 on the FP32 path. These tests pin the
- * current host-path behaviour before the backend dispatch inside the layer
- * is moved to ComputeOps (#4451); a refactor of the layer must keep them
+ * them, so the two agree within 1e-4 on the FP32 path (2e-3 where the ARM
+ * flash arm stores the softmax probabilities in fp16, see
+ * flashStoresFp16Probs()). These tests pin the current host-path behaviour
+ * before the backend dispatch inside the layer is moved to ComputeOps
+ * (#4451); a refactor of the layer must keep them
  * passing.
  *
  * Scope:
  *  - The per-row cases run on every architecture. The host flash (gemm) arm
  *    is what x86 picks for every step; elsewhere it needs a 32-row step and
- *    never takes a decode step, so the gemm cases are x86-only.
- *  - Built and run in the enable-fp16=false x86 cell, the only one that
- *    builds CausalLM tests. The cases feed FP32 activations, so they also
- *    pass in an enable-fp16 build on x86 and on Linux aarch64. An Android
- *    fp16 build is different: there the layer narrows FP32 activations to
+ *    never takes a decode step, so there a gemm case runs only if one of its
+ *    steps has 32 rows or more (softcap_gemm_long_prefill).
+ *  - CI builds and runs it in the x86 enable-fp16=false and enable-fp16=true
+ *    cells. The fp16_* cases feed FP16 activations, the type an Android fp16
+ *    build runs, and need enable-fp16; they are held to 1e-2. An Android
+ *    fp16 build itself narrows the FP32 activations of the other cases to
  *    FP16 copies and runs its FP16 kernels (mha_core.cpp, ENABLE_FP16 &&
- *    __ANDROID__), so every case lands at fp16 precision and is held to
- *    1e-2 (8e-4 at most on a Galaxy S26). The FP16 activation type itself
- *    is not fed here.
+ *    __ANDROID__), so there every case is held to 1e-2 (8e-4 at most on a
+ *    Galaxy S26).
  *  - A sliding window is tested on causal cases only. With a non-causal
  *    input the per-row arm ignores the window and the flash arm applies it;
  *    the reference follows the per-row arm.
@@ -86,19 +88,18 @@ struct MhaCase {
   float partial_rotary = 1.0f;     /**< rope_partial_rotary_factor */
   unsigned int rope_orig_max = 64; /**< rope_scaling_max_position_embeddings */
   /**
-   * Whether the layer applies softcap on this path. The host flash arm
-   * (gemm_attention) ignores attn_logit_softcapping today (#4461), while the
-   * per-row arm and the OpenCL arms apply it. Pinned as-is; the #4461 fix
-   * flips softcap_gemm_not_applied to true.
-   */
-  bool softcap_applied = true;
-  /**
    * Flash tile rows / keys (VJEPA_BQ / VJEPA_BK) for the gemm arm, both 0 to
    * keep the layer's tile. A small tile splits these short sequences over
    * several query and key blocks, which the default tile never does.
    */
   unsigned int flash_bq = 0;
   unsigned int flash_bk = 0;
+  /**
+   * Feed Q / K / V and take the output as FP16, the activation type of an
+   * Android fp16 build. The layer then runs its FP16 paths (FP16 RoPE, FP16
+   * attention kernels); enable-fp16 builds only.
+   */
+  bool fp16_activations = false;
 
   MhaCase(std::string name_, unsigned int heads_q_, unsigned int heads_kv_,
           unsigned int head_dim_, std::vector<unsigned int> steps_) :
@@ -124,9 +125,8 @@ struct MhaCase {
     theta = 0;
     return *this;
   }
-  MhaCase &softcapAt(float cap, bool applied = true) {
+  MhaCase &softcapAt(float cap) {
     softcap = cap;
-    softcap_applied = applied;
     return *this;
   }
   MhaCase &attentionSink() {
@@ -142,6 +142,10 @@ struct MhaCase {
   MhaCase &flashTile(unsigned int bq, unsigned int bk) {
     flash_bq = bq;
     flash_bk = bk;
+    return *this;
+  }
+  MhaCase &fp16Activations() {
+    fp16_activations = true;
     return *this;
   }
 };
@@ -310,7 +314,7 @@ std::vector<float> referenceAttention(const MhaCase &c, const RopeTable &rope,
         for (unsigned int i = 0; i < D; ++i)
           s += qh[i] * kj[i];
         s *= inv_sqrt_d;
-        if (c.softcap > 0.0f && c.softcap_applied)
+        if (c.softcap > 0.0f)
           s = std::tanh(s / c.softcap) * c.softcap;
         score.push_back(s);
       }
@@ -348,6 +352,51 @@ nntrainer::TensorDim dim4(unsigned int h, unsigned int w,
   return nntrainer::TensorDim({1, 1, h, w, nntrainer::Tformat::NCHW, dtype});
 }
 
+/**
+ * @brief Write @p values into the first rows of an FP32 or FP16 tensor. For
+ *        FP16 the values are rounded in place, so the reference sees what the
+ *        layer reads.
+ */
+void writeRows(nntrainer::Tensor &t, std::vector<float> &values) {
+  if (t.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+    std::copy(values.begin(), values.end(), t.getData<float>());
+    return;
+  }
+#ifdef ENABLE_FP16
+  for (size_t i = 0; i < values.size(); ++i) {
+    t.getData<_FP16>()[i] = static_cast<_FP16>(values[i]);
+    values[i] = static_cast<float>(t.getData<_FP16>()[i]);
+  }
+#endif
+}
+
+/** @brief Element @p i of an FP32 or FP16 tensor, as float. */
+float readAt(const nntrainer::Tensor &t, size_t i) {
+#ifdef ENABLE_FP16
+  if (t.getDataType() == nntrainer::TensorDim::DataType::FP16)
+    return static_cast<float>(t.getData<_FP16>()[i]);
+#endif
+  return t.getData<float>()[i];
+}
+
+/**
+ * Whether this step runs on the host flash arm with its softmax probabilities
+ * stored in fp16: the ARM NEON form of the flash arm (cpu_attention.cpp),
+ * which takes a step of
+ * 32 rows or more. Such a step is about 5e-4 off the reference with or without
+ * softcap, so it is held to 2e-3 instead of 1e-4.
+ */
+bool flashStoresFp16Probs(const MhaCase &c, unsigned int rows) {
+#if defined(__ARM_NEON) && !(defined(__x86_64__) || defined(__i386__) ||       \
+                             defined(_M_X64) || defined(_M_IX86))
+  return c.gemm && rows >= 32;
+#else
+  (void)c;
+  (void)rows;
+  return false;
+#endif
+}
+
 class MhaCoreHostPath : public ::testing::TestWithParam<MhaCase> {};
 
 /**
@@ -362,14 +411,18 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   }
 #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||           \
       defined(_M_IX86))
-  // min_prefill_thr() and host_decode_prefers_per_row() in mha_core.cpp: off
+  // flash_min_rows() and decode_prefers_per_row() in cpu_attention.cpp: off
   // x86 the host flash arm needs a 32-row step and never takes a decode step,
-  // so with these step sizes a gemm case would re-test the per-row arm.
-  if (c.gemm)
+  // so a gemm case with no such step would re-test the per-row arm.
+  if (c.gemm && *std::max_element(c.steps.begin(), c.steps.end()) < 32)
     GTEST_SKIP() << "the host flash arm is not selected for these step sizes "
                     "on this architecture";
 #endif
-  // gemm_attention reads the flash tile on every call, so the test owns it:
+#ifndef ENABLE_FP16
+  if (c.fp16_activations)
+    GTEST_SKIP() << "FP16 activations need an enable-fp16 build";
+#endif
+  // The flash arm reads the flash tile on every call, so the test owns it:
   // the case's tile, or unset for the layer's default. A 0 size would divide
   // by zero there.
   ASSERT_EQ(c.flash_bq == 0, c.flash_bk == 0)
@@ -412,16 +465,19 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
   // key/value caches. Without enable-fp16 the caches hold fp16 bits as UINT16,
   // as Transformer::createKVCachePlaceholders declares them.
   const auto fp32 = nntrainer::TensorDim::DataType::FP32;
+  const auto act =
+    c.fp16_activations ? nntrainer::TensorDim::DataType::FP16 : fp32;
 #ifdef ENABLE_FP16
   const auto cache_dtype = nntrainer::TensorDim::DataType::FP16;
 #else
   const auto cache_dtype = nntrainer::TensorDim::DataType::UINT16;
 #endif
   nntrainer::InitLayerContext init_context(
-    {dim4(plane, q_width, fp32), dim4(plane, kv_width, fp32),
-     dim4(plane, kv_width, fp32), dim4(max_seq, kv_width, cache_dtype),
+    {dim4(plane, q_width, act), dim4(plane, kv_width, act),
+     dim4(plane, kv_width, act), dim4(max_seq, kv_width, cache_dtype),
      dim4(max_seq, kv_width, cache_dtype)},
-    {true}, false, "mha_core", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    {true}, false, "mha_core", "", 0.0f,
+    {"NCHW", "FP32", c.fp16_activations ? "FP16" : "FP32"}, 1.0f,
     ml::train::ExecutionMode::INFERENCE);
   ASSERT_NO_THROW(layer.finalize(init_context));
 
@@ -482,9 +538,9 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
     for (auto &x : v)
       x = dist(rng);
 
-    std::copy(q.begin(), q.end(), run_context.getInput(0).getData<float>());
-    std::copy(k.begin(), k.end(), run_context.getInput(1).getData<float>());
-    std::copy(v.begin(), v.end(), run_context.getInput(2).getData<float>());
+    writeRows(run_context.getInput(0), q);
+    writeRows(run_context.getInput(1), k);
+    writeRows(run_context.getInput(2), v);
 
     for (unsigned int r = 0; r < rows; ++r) {
       for (unsigned int h = 0; h < c.heads_kv; ++h) {
@@ -502,17 +558,23 @@ TEST_P(MhaCoreHostPath, MatchesReferenceAttention) {
 
     const std::vector<float> expected =
       referenceAttention(c, rope, q, k_hist, v_hist, sink, from, rows);
-    const float *actual = run_context.getOutput(0).getData<float>();
-    // An Android fp16 build runs the FP16 path for these FP32 activations
-    // (see the header), so it is held to fp16 precision; 8e-4 at most on a
-    // Galaxy S26. Every other build computes in FP32 and keeps 1e-4.
+    // FP16 activations round Q, the RoPE products and every attention
+    // intermediate to fp16, so they are held to fp16 precision instead:
+    // 5e-3 passes on aarch64 NEON and 2e-3 on the x86 fallback. An Android
+    // fp16 build takes that path for the FP32 cases too (see the header),
+    // so there every case is held to it; 8e-4 at most on a Galaxy S26.
+    // Elsewhere a flash step that stores its softmax probabilities in fp16
+    // (ARM, 32 rows or more) is held to 2e-3, every other step to 1e-4.
 #if defined(ENABLE_FP16) && defined(__ANDROID__)
     const float tolerance = 1e-2f;
 #else
-    const float tolerance = 1e-4f;
+    const float tolerance = c.fp16_activations ? 1e-2f
+                            : flashStoresFp16Probs(c, rows) ? 2e-3f
+                                                            : 1e-4f;
 #endif
+    const nntrainer::Tensor &out = run_context.getOutput(0);
     for (size_t i = 0; i < expected.size(); ++i) {
-      ASSERT_NEAR(actual[i], expected[i], tolerance)
+      ASSERT_NEAR(readAt(out, i), expected[i], tolerance)
         << "step [" << from << ", " << from + rows << ") element " << i;
     }
     from += rows;
@@ -532,9 +594,15 @@ INSTANTIATE_TEST_SUITE_P(
     MhaCase("window_gemm", 4, 2, 16, {6, 1, 1, 1}).slidingWindow(3).gemmArm(),
     MhaCase("no_rope_rowwise", 2, 2, 16, {5, 1, 1}).noRope(),
     MhaCase("no_rope_gemm", 2, 2, 16, {5, 1, 1}).noRope().gemmArm(),
+    // No RoPE allows an odd head_dim; the KV cache write must still convert
+    // every element (#4466 review).
+    MhaCase("no_rope_odd_head_dim_rowwise", 2, 1, 5, {3, 1, 1}).noRope(),
     MhaCase("softcap_rowwise", 2, 2, 16, {5, 1, 1}).softcapAt(0.5f),
-    MhaCase("softcap_gemm_not_applied", 2, 2, 16, {5, 1, 1})
-      .softcapAt(0.5f, /*applied=*/false)
+    MhaCase("softcap_gemm", 2, 2, 16, {5, 1, 1}).softcapAt(0.5f).gemmArm(),
+    // Gemma2's sliding layers: softcap and the window mask together.
+    MhaCase("softcap_window_gemm", 4, 2, 16, {6, 1, 1, 1})
+      .softcapAt(0.5f)
+      .slidingWindow(3)
       .gemmArm(),
     MhaCase("encoder_rowwise", 4, 2, 16, {6}).encoder(),
     MhaCase("encoder_gemm", 4, 2, 16, {6}).encoder().gemmArm(),
@@ -553,7 +621,34 @@ INSTANTIATE_TEST_SUITE_P(
     MhaCase("window_gemm_multi_tile", 4, 2, 16, {7, 1, 1, 1})
       .slidingWindow(3)
       .gemmArm()
-      .flashTile(2, 2)),
+      .flashTile(2, 2),
+    // Softcap on every flash tile, ahead of the causal mask inside each one.
+    MhaCase("softcap_gemm_multi_tile", 4, 2, 16, {6, 3, 1, 1})
+      .softcapAt(0.5f)
+      .gemmArm()
+      .flashTile(2, 4),
+    // A 40-row prefill takes the flash arm on every architecture (ARM needs
+    // 32 rows); the decode steps after it take the per-row arm there.
+    MhaCase("softcap_gemm_long_prefill", 4, 2, 16, {40, 1, 1})
+      .softcapAt(0.5f)
+      .gemmArm()
+      .flashTile(16, 16),
+    // The FP16 paths an Android fp16 build takes: FP16 RoPE through
+    // ComputeOps::rotary_embedding and the FP16 attention kernels.
+    MhaCase("fp16_rowwise", 4, 2, 16, {4, 4, 1, 1}).fp16Activations(),
+    MhaCase("fp16_window_rowwise", 4, 2, 16, {6, 1, 1, 1})
+      .slidingWindow(3)
+      .fp16Activations(),
+    MhaCase("fp16_gemm", 4, 2, 16, {5, 1, 1, 1}).gemmArm().fp16Activations(),
+    // The FP16 score path of the host flash arm with the softcap, fed FP16
+    // activations: a 40-row prefill takes that arm on ARM too, and the small
+    // cap makes a dropped softcap fail clearly (with 0.5 it missed the 1e-2
+    // tolerance by 0.0108 under qemu).
+    MhaCase("fp16_softcap_gemm_long_prefill", 4, 2, 16, {40, 1, 1})
+      .softcapAt(0.1f)
+      .gemmArm()
+      .flashTile(16, 16)
+      .fp16Activations()),
   [](const ::testing::TestParamInfo<MhaCase> &info) {
     return info.param.name;
   });

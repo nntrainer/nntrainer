@@ -665,32 +665,10 @@ private:
    * @brief NNTR_MHA_CLMEM slab-sync watermark: concat SVM slab rows [0, n)
    *        hold valid K/V. In that mode the prefill window writes ONLY the
    *        OHWI mirrors (no SVM side-fill); host readers (decode NEON,
-   *        gemm_attention, flash fallback) gather the missing rows back
+   *        the flash arm) gather the missing rows back
    *        from the mirrors first (k/v_gather_ohwi, one drained sync).
    */
   unsigned int kv_slab_synced_to = 0;
-
-  /**
-   * @brief GEMM-based flash attention for one batch (covers both encoder
-   *        non-causal and causal-LLM prefill paths).
-   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
-   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
-   *        balanced parallel_for over (h_q, query_block) units with online
-   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
-   *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
-   *        + in-block boundary mask. Sliding window: key-block lower-bound
-   *        skip + in-block lower mask.
-   * @param[in] N_kv      total cache length (= cache_to, keys [0, N_kv))
-   * @param[in] N_q       step length (= step_size, rows of the output)
-   * @param[in] cache_from absolute starting position of queries in the cache
-   *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
-   */
-  void gemm_attention(nntrainer::Tensor &query_step,
-                      nntrainer::Tensor &b_cached_key,
-                      nntrainer::Tensor &b_cached_value,
-                      nntrainer::Tensor &attention_output_step,
-                      unsigned int N_kv, unsigned int N_q,
-                      unsigned int cache_from);
 
   enum INOUT_INDEX {
     /** input index */
@@ -734,7 +712,7 @@ private:
   nntrainer::Tensor *kv_int8_value_scale = nullptr;
   /** Per-batch raw pointers into the scale tensors above, set by
    * one_batch_incremental_forwarding before the read-path call to
-   * compute_kcaches / compute_fp16vcache_transposed / gemm_attention.
+   * the host attention arms (ComputeOps::attention).
    * Single-batch dispatch is sequential, so racing the helpers (which
    * parallelize over heads) against these is safe. */
   const uint16_t *cur_kv_int8_key_scale_batch = nullptr;
@@ -764,55 +742,52 @@ private:
    * @brief Rotary frequency cache for FP32 and optional FP16 lookup tables
    */
   struct RopeFreqCache {
-    std::vector<std::vector<float>> cos;
-    std::vector<std::vector<float>> sin;
+    /** fp32 [positions, head_dim / 2], the nntrainer::RotaryTable layout */
+    std::vector<float> cos;
+    std::vector<float> sin;
 #ifdef ENABLE_FP16
     std::vector<std::vector<_FP16>> cos_fp16;
     std::vector<std::vector<_FP16>> sin_fp16;
+    /**
+     * The same fp16 angles as [positions, head_dim / 2]: the
+     * nntrainer::RotaryTable layout the host RoPE reads and the LUT the
+     * OpenCL RoPE uploads. The row form above stays for the CUDA arm.
+     */
+    std::vector<_FP16> cos_fp16_flat;
+    std::vector<_FP16> sin_fp16_flat;
 #endif
   };
   inline static std::unordered_map<std::string, RopeFreqCache> rope_freq_cache;
-  inline static std::vector<std::vector<float>> *freqs_cos = {};
-  inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<float> *freqs_cos = {};
+  inline static std::vector<float> *freqs_sin = {};
   inline static std::vector<float> thetas;
-  std::vector<std::vector<float>> *cached_freqs_cos = {};
-  std::vector<std::vector<float>> *cached_freqs_sin = {};
+  std::vector<float> *cached_freqs_cos = {};
+  std::vector<float> *cached_freqs_sin = {};
 #ifdef ENABLE_FP16
   inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
   std::vector<std::vector<_FP16>> *cached_freqs_cos_fp16 = {};
   std::vector<std::vector<_FP16>> *cached_freqs_sin_fp16 = {};
-  // Flattened [max_pos * head_dim/2] cos/sin LUT (fp16 bits) for the GPU RoPE
-  // path (rope_inplace_f16_cl). PROCESS-WIDE static (inline static) CACHE keyed
-  // by (head_dim, theta, max_pos): models that alternate RoPE slots per layer
-  // (Gemma4: sliding head_dim=256/theta=1e4, full head_dim=512/theta=1e6) keep
-  // a SEPARATE, STABLE table per slot instead of rebuilding + re-uploading the
-  // single shared table on every sliding<->full transition. std::map is chosen
-  // for NODE STABILITY: the cos/sin vector storage never moves on insert, so
-  // the .data() pointer handed to the GPU wrapper stays valid for the whole run
-  // -- the rope_inplace_f16_cl device-LUT cache is keyed by that host pointer,
-  // so stable pointers keep the upload cached per slot (no per-layer thrash).
-  // Single-head_dim models (Qwen3/Gemma2) populate exactly one entry, matching
-  // the previous "built once" behaviour.
-  using RopeFlatKey = std::tuple<int, float, unsigned int>; // head_dim,theta,mp
-  using RopeFlatVal =
-    std::pair<std::vector<uint16_t>, std::vector<uint16_t>>; // (cos, sin)
-  inline static std::map<RopeFlatKey, RopeFlatVal> rope_flat_cache;
-  // Stable pointers into the cache entry for the CURRENT slot (set by
-  // ensure_rope_flat_lut). Per-instance: each layer instance points at its own
-  // slot's cached table; the underlying storage lives in the shared map so the
-  // pointers stay valid (and identical) across calls for a given slot.
+  inline static std::vector<_FP16> *freqs_cos_fp16_flat = {};
+  inline static std::vector<_FP16> *freqs_sin_fp16_flat = {};
+  // This instance's [max_pos, head_dim / 2] fp16 cos/sin table (fp16 bits),
+  // set by ensure_rope_flat_lut. It points into rope_freq_cache, whose key
+  // holds every RoPE parameter, so Gemma4's sliding and full slots each keep
+  // their own table. The vectors never move once built (unordered_map nodes
+  // are stable), so rope_inplace_f16_cl's device-LUT cache, keyed by this host
+  // pointer, uploads each table once.
   const uint16_t *rope_cos_flat_cur = nullptr;
   const uint16_t *rope_sin_flat_cur = nullptr;
+  unsigned int rope_flat_positions = 0; /**< rows of that table */
 
   /**
-   * @brief Build (or reuse) the process-wide flat RoPE LUT for THIS instance's
-   *        current (head_dim, theta, max_pos) slot. Idempotent: an existing
-   *        cache entry is reused (just repoints rope_cos/sin_flat_cur); a new
-   *        slot is built (precompute_freqs + the flatten fill) and inserted.
-   *        Called from finalize() so the build lands at model load instead of
-   *        inside the first timed prefill (KVST "lutcheck" segment), and from
-   *        the GPU-RoPE hot path as the fallback.
+   * @brief Point rope_cos/sin_flat_cur at this instance's flat fp16 RoPE
+   *        table, building it through precompute_freqs on first use. Once set
+   *        the pointers are returned as they are, until setProperty() clears
+   *        them. Called from finalize() so the build lands at model load
+   *        instead of inside the first timed prefill (KVST "lutcheck"
+   *        segment), and from the GPU-RoPE and host-RoPE paths as the
+   *        fallback.
    */
   void ensure_rope_flat_lut();
   /** @brief positions the RoPE LUT must cover = min(max_position_embeddings,
@@ -861,32 +836,52 @@ private:
                                   unsigned int dim, unsigned int from,
                                   bool apply_rope = true);
 
+  /**
+   * @brief This layer's RoPE table for an input of dtype @p dt (the fp32 or
+   *        the fp16 angles), built on first use.
+   */
+  nntrainer::RotaryTable rotary_table(ml::train::TensorDim::DataType dt,
+                                      unsigned int dim);
+
+  /**
+   * @brief     Write one step's K / V rows into batch @p batch of the KV
+   *            cache through ComputeOps::kv_cache_write.
+   * @param[in] pos absolute position of the first row
+   * @param[in] write_key false when K was written already (a device arm or
+   *            the OHWI scatter)
+   * @param[in] write_value false when V was written already
+   * @param[in] rotate_key true to apply RoPE to K
+   */
+  void write_kv_cache(unsigned int batch, nntrainer::Tensor &key_step,
+                      nntrainer::Tensor &value_step,
+                      nntrainer::Tensor &cache_key,
+                      nntrainer::Tensor &cache_value, unsigned int pos,
+                      bool write_key, bool write_value, bool rotate_key);
+
+  /**
+   * @brief     Attention of query rows [from, to) over the cached keys
+   *            [0, to), through ComputeOps::attention: the backend's host
+   *            per-row or flash arm (the flash-class arms are allowed by
+   *            use_gemm_attention), or its device arm (CUDA). The op table
+   *            is query_step's: the CUDA arm runs only when query_step
+   *            carries the CUDA ContextData (the layer's engine is cuda);
+   *            a query without ContextData takes the CPU table.
+   * @param[in] sink per-head sink logits (the attention-sink overload), or
+   *            nullptr
+   */
+  void attend(nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
+              nntrainer::Tensor &cached_value, nntrainer::Tensor &output,
+              unsigned int from, unsigned int to, nntrainer::Tensor *sink);
+
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
                int N, int chunk_size, int group_size, int tile_size,
                bool process_all);
 
-  void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
-                       nntrainer::Tensor &out, unsigned int from,
-                       size_t sequence_len, unsigned int num_heads,
-                       unsigned int group_size, unsigned int head_dim);
-
-  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from);
-
-  void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, nntrainer::Tensor &sink_step);
-
   void compute_vcaches(nntrainer::Tensor &in, nntrainer::Tensor &vcache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
                        unsigned int group_size, unsigned int head_dim);
-
-  void compute_fp16vcache_transposed(nntrainer::Tensor &in,
-                                     nntrainer::Tensor &vcache,
-                                     nntrainer::Tensor &output, int from,
-                                     int num_cache_head, int gqa_size,
-                                     int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
 
@@ -897,20 +892,6 @@ private:
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
 
   size_t calc_attn_index(size_t i);
-
-  /**
-   * @brief Windowed cumulative attention score index.
-   *
-   * Returns the cumulative number of attention scores before absolute query
-   * row i, respecting a sliding window of size local_window_size (W):
-   *
-   *   S(i) = sum_{k=0}^{i-1} min(k+1, W)
-   *        = (i <= W) ? i*(i+1)/2 : W*(W+1)/2 + (i - W)*W
-   *
-   * When W == UINT_MAX (full attention), this reduces exactly to
-   * i*(i+1)/2 == calc_attn_index(i), preserving byte-identical behaviour.
-   */
-  size_t calc_windowed_attn_index(size_t i);
 
 }; // end of class MHACoreLayer
 } // namespace causallm

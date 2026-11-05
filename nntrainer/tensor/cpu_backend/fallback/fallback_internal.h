@@ -399,6 +399,76 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
                                                _FP16 *out, float *cos_,
                                                float *sin_);
 /**
+ * @brief Rotate-half rotary embedding of fp16 rows by fp16 cos / sin rows
+ * @param[in] width row width (num_heads * dim)
+ * @param[in] dim head dimension
+ * @param[in] half_ dim / 2: element i of a head pairs with i + half_
+ * @param[in/out] inout _FP16* input, also the output when @p output is null
+ * @param[out] output _FP16* output, or nullptr to write @p inout
+ * @param[in] cos_ _FP16* cos of the half_ angles of this row's position
+ * @param[in] sin_ _FP16* sin of the half_ angles of this row's position
+ */
+void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                                         unsigned int half_, _FP16 *inout,
+                                         _FP16 *output, const _FP16 *cos_,
+                                         const _FP16 *sin_);
+/**
+ * @brief Attention scores of fp16 query rows against an fp16 key cache:
+ *        output[r][n * gqa_size + g] = (q[n * gqa_size + g] . k[row r, n]) /
+ *        sqrt(head_dim) over the last min(num_rows, local_window_size) rows
+ * @param[in] in _FP16* query, num_cache_head * gqa_size heads of head_dim
+ * @param[in] kcache _FP16* key cache, [rows, num_cache_head * head_dim]
+ * @param[out] output _FP16* scores, one row of num_cache_head * gqa_size per
+ *             key row
+ * @param[in] num_rows key rows visible to this query (the last row's index + 1)
+ * @param[in] num_cache_head number of KV heads
+ * @param[in] head_dim head dimension
+ * @param[in] gqa_size query heads per KV head
+ * @param[in] tile_size unused (the NEON kernel's cache blocking)
+ * @param[in] local_window_size sliding window, UINT_MAX for none
+ * @param[in] head_start first KV head to compute
+ * @param[in] head_end one past the last KV head, -1 for num_cache_head
+ */
+void __fallback_compute_kcaches(const _FP16 *in, const _FP16 *kcache,
+                                _FP16 *output, int num_rows, int num_cache_head,
+                                int head_dim, int gqa_size, int tile_size,
+                                size_t local_window_size, int head_start,
+                                int head_end);
+/**
+ * @brief Attention output of one query row: output[n * gqa_size + h] =
+ *        sum_j in[j][n * gqa_size + h] * v[row j, n] over the key rows
+ *        visible to row row_num (its last local_window_size rows)
+ * @param[in] row_num the query row's position
+ * @param[in] in _FP16* softmaxed scores, laid out as compute_kcaches writes
+ * @param[in] vcache _FP16* value cache, [rows, num_cache_head * head_dim]
+ * @param[out] output _FP16* num_cache_head * gqa_size heads of head_dim
+ * @param[in] num_cache_head number of KV heads
+ * @param[in] gqa_size query heads per KV head
+ * @param[in] head_dim head dimension
+ * @param[in] local_window_size sliding window, UINT_MAX for none
+ * @param[in] head_start first KV head to compute
+ * @param[in] head_end one past the last KV head, -1 for num_cache_head
+ */
+void __fallback_compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                              const _FP16 *vcache,
+                                              _FP16 *output, int num_cache_head,
+                                              int gqa_size, int head_dim,
+                                              size_t local_window_size,
+                                              int head_start, int head_end);
+/**
+ * @brief Softmax over rows [start_row, end_row) of each of num_heads columns
+ *        of fp16 scores, in place; a sink adds exp(sink[c] - max) to column
+ *        c's denominator only
+ * @param[in/out] qk_out _FP16* scores, [rows, num_heads]
+ * @param[in] start_row first row
+ * @param[in] end_row one past the last row
+ * @param[in] num_heads number of columns
+ * @param[in] sink _FP16* per-column sink logit, or nullptr
+ */
+void __fallback_softmax_row_inplace(_FP16 *qk_out, size_t start_row,
+                                    size_t end_row, size_t num_heads,
+                                    _FP16 *sink);
+/**
  * @brief swiglu function : X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X
