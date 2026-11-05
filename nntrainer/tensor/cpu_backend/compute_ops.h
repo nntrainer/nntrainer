@@ -187,6 +187,20 @@ public:
                                     unsigned int M, std::vector<unsigned int> N,
                                     unsigned int K);
 
+  /**
+   * @brief One fp32 activation against several TQ2CX (ternary) weights.
+   *
+   * Same argument order as gemm_q4_0_batch_fp32: @a matAdata holds the
+   * TQ2CX records (N_i x K) and @a matBdata the M x K activation, used in
+   * fp32 without quantization. Valid for every M. C_i = A * W_i^T is
+   * written (no accumulation into C).
+   */
+  virtual bool supports_gemm_tq2cx_batch_fp32() const { return false; }
+  virtual void
+  gemm_tq2cx_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                        std::vector<float *> matCdata, unsigned int M,
+                        std::vector<unsigned int> N, unsigned int K);
+
   // ===========================================================================
   // Quantized weight packing / quantization
   // ===========================================================================

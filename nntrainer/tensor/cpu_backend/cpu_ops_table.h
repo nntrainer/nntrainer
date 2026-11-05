@@ -199,6 +199,16 @@ public:
     nntrainer::gemm_q4_0(M, N, K, matBdata, K, matAdata, N, matCdata, N);
   }
 
+  // One fp32 activation against several TQ2CX (ternary) weights. Every arch
+  // backend provides it, with the scalar reference tile as the fallback.
+  bool supports_gemm_tq2cx_batch_fp32() const override { return true; }
+  void gemm_tq2cx_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                             std::vector<float *> matCdata, unsigned int M,
+                             std::vector<unsigned int> N,
+                             unsigned int K) override {
+    nntrainer::gemm_tq2cx_batch(M, N, K, matBdata, K, matAdata, matCdata, N);
+  }
+
   // Quantization / Utility
   void unpack_q4_0(const void *in, void *out, size_t ds, unsigned int M,
                    unsigned int N) override {

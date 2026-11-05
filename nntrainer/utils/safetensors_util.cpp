@@ -28,6 +28,8 @@ bool isQuantized(DT dtype) {
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::QS4CX:
+  case DT::TQ2CX:
+  case DT::QS4ACX:
     return true;
   default:
     return false;
@@ -61,6 +63,8 @@ const char *dtypeToString(DT dtype) {
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::QS4CX:
+  case DT::TQ2CX:
+  case DT::QS4ACX:
     return "U8";
   default:
     return "F32";
@@ -95,6 +99,10 @@ const char *nntrDtypeName(DT dtype) {
     return "Q6_K";
   case DT::QS4CX:
     return "QS4CX";
+  case DT::TQ2CX:
+    return "TQ2CX";
+  case DT::QS4ACX:
+    return "QS4ACX";
   default:
     return "FP32";
   }
@@ -130,6 +138,10 @@ DT nntrDtypeFromName(const std::string &name) {
     return DT::Q6_K;
   if (up == "QS4CX")
     return DT::QS4CX;
+  if (up == "TQ2CX")
+    return DT::TQ2CX;
+  if (up == "QS4ACX")
+    return DT::QS4ACX;
   throw std::invalid_argument("safetensors: unknown nntr_dtype name: " + name);
 }
 

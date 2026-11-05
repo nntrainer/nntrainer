@@ -240,6 +240,12 @@ void ComputeOps::gemm_q4_0_batch_fp32(std::vector<void *>, float *,
                                       std::vector<unsigned int>, unsigned int) {
   NI(gemm_q4_0_batch_fp32);
 }
+void ComputeOps::gemm_tq2cx_batch_fp32(std::vector<void *>, float *,
+                                       std::vector<float *>, unsigned int,
+                                       std::vector<unsigned int>,
+                                       unsigned int) {
+  NI(gemm_tq2cx_batch_fp32);
+}
 void ComputeOps::gemm_q4_0_accel_fp32(void *, float *, float *, unsigned int,
                                       unsigned int, unsigned int) {
   NI(gemm_q4_0_accel_fp32);
