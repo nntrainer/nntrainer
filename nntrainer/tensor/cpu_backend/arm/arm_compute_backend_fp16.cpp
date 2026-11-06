@@ -496,8 +496,9 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
   // neither the activation nor the destination is promoted to fp32. The RHS
   // must already be packed for a qsi4cxp4x8 micro-kernel (nr=4, kr=16, sr=2)
   // -- that is what QS4CX_Tensor::packF16Activation() emits. It is NOT the
-  // fp32 facade's pack: that one is qsi4cxp8x8 (nr=8) and reading it here
-  // would silently mis-stride every super-row past the first.
+  // fp32 facade's pack: that one is qsi4cxp8x8 (nr=8) with i8mm and
+  // qsi4cxp4x4 (nr=4, kr=8) without it, and reading either here would
+  // silently mis-stride every super-row past the first.
   //
   // Only the two qsi4cxp4x8 variants are layout-compatible with that pack:
   //   1 = qai8dxp1x8_qsi4cxp4x8_1x4_neon_dotprod   (single-row / decode)
