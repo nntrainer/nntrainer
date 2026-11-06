@@ -326,7 +326,7 @@ protected:
    *
    * @param buf buffer to copy from
    */
-  void copy(const void *buf);
+  virtual void copy(const void *buf);
 
   /**
    * @brief  Get the Data Type String object
