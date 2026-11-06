@@ -94,16 +94,8 @@ public:
   static constexpr const char *type = "positional_encoding";
 
 private:
-  bool isPEcalculated; // bool value to check positional encoding is already
-                       // calculated
   std::tuple<props::MaxTimestep> positional_encoding_props;
-  std::array<unsigned int, 1> weight_idx;
-
-  /**
-   * @brief calculate positional encoding
-   * @param context Context of the layer
-   */
-  void calculatePositionalEncoding(RunLayerContext &context);
+  std::array<unsigned int, 2> tensor_idx;
 };
 
 } // namespace nntrainer
