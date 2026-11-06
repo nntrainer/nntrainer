@@ -58,7 +58,7 @@ for file in `cat $files`; do
       continue
   fi
   # Handle only text files among files in one commit.
-  if [[ `file $file | grep "ASCII text" | wc -l` -gt 0 ]]; then
+  if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
     case $file in
       # Declare source code files to inspect a prohibited word
       *.c | *.h | *.cpp | *.hpp| *.py | *.sh | *.php | *.md )
@@ -88,7 +88,7 @@ if [[ -n "${target_files/[ ]*\n/}" ]]; then
   cat ${bad_words_log_file}
 
   # Step 3: Count prohibited words from variable result_content
-  result_count=$(cat ${bad_word_log_file} | grep -c '^' )
+  result_count=$(wc -l < ${bad_words_log_file})
 
   # Step 4: change a value of the check result
   if [[ $result_count -gt 0 ]]; then
