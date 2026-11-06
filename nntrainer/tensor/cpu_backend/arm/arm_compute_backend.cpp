@@ -674,6 +674,14 @@ void dequantize_row_qs8cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs8cx,
     (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
 }
 
+size_t get_opt_ukernel_idx_qai8dxp_qsi4cxp(bool is_gemv) {
+#ifndef ARMV7
+  return __kai_get_opt_ukernel_idx_qai8dxp_qsi4cxp(is_gemv);
+#else
+  return 0;
+#endif
+}
+
 size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                              size_t idx_variant, bool is_nxk) {
 #ifndef ARMV7

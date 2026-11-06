@@ -50,6 +50,14 @@ std::string __kai_get_num_ukernel_name_qai8dxp_qsi4cxp(size_t idx_variant);
 size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp();
 
 /**
+ * @brief get the index of the ukernel to use for the current target ISA
+ *
+ * @param[in] is_gemv true to select the GEMV (M == 1) ukernel, false for GEMM
+ * @return size_t index of ukernel, always within the ukernel table
+ */
+size_t __kai_get_opt_ukernel_idx_qai8dxp_qsi4cxp(bool is_gemv);
+
+/**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
  * qsi4cxp
  * Note that nxk is the format of quantized rhs, not the shape of rhs
@@ -312,6 +320,19 @@ void __kai_gemm_qai8dxp_qsi8cxp(size_t m, size_t n, size_t k,
  */
 
 /**
+ * @brief get the qsi8d32p_qsi4c32p table index of a ukernel with the
+ * qsi4c32p4x8 rhs layout (nr = 4, kr = 16, sr = 2), the layout the osv32
+ * repack produces: the i8mm GEMM kernel when the table holds it, otherwise the
+ * dotprod GEMV kernel, which shares that layout.
+ *
+ * @note decided from the table itself rather than from a macro here: on Tizen
+ * the forced __ARM_FEATURE_MATMUL_INT8 does not survive the target pragmas of
+ * arm_neon.h, so a header and the table could otherwise disagree.
+ * @return uint32_t index into the qsi8d32p_qsi4c32p table
+ */
+uint32_t nntr_kai_get_qsi4c32p4x8_idx();
+
+/**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
  * qsi4c32p
  *
@@ -404,10 +425,10 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(size_t m, size_t n, size_t k,
  * @param osv32_scales Input scales in FP16 format (indexed per row)
  * @param qsi4c32p_packed Output buffer for packed qsi4c32p weights
  * @param packed_size Output size of the packed buffer
- * @param kernel_idx Kernel variant index (default=3 for GEMM, 1 for GEMV)
+ * @param kernel_idx Kernel variant index (default: the qsi4c32p4x8 kernel)
  * @param transB Whether the matrix is transposed (default=true for NxK)
  */
 void nntr_kai_repack_osv32_to_qsi4c32p(
   size_t n, size_t k, const uint8_t *osv32_weights,
   const uint16_t *osv32_scales, void *qsi4c32p_packed, size_t &packed_size,
-  uint32_t kernel_idx = 3, bool transB = true);
+  uint32_t kernel_idx = nntr_kai_get_qsi4c32p4x8_idx(), bool transB = true);
