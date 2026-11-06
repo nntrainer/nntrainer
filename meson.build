@@ -176,17 +176,23 @@ if arch == 'aarch64' or get_option('platform') == 'android'
   elif arm_arch_opt == 'auto'
     arm_arch_opt = 'armv8.2-a'
   endif
-  # KleidiAI is always built on aarch64 and needs dotprod+i8mm
-  # @todo support dotprod-only by dropping the i8mm kai kernels
-  if not (get_option('enable-dotprod') and get_option('enable-i8mm'))
-    error('aarch64 requires enable-dotprod and enable-i8mm (KleidiAI).')
+  # KleidiAI is always built on aarch64 and needs dotprod: its int4
+  # micro-kernels are hand encoded and issue SDOT whatever -march says.
+  # i8mm is optional: with enable-i8mm=false the i8mm micro-kernels are left
+  # out of the build and of the interface tables, which is how a portable
+  # (distro) package for CPUs without i8mm is made.
+  if not get_option('enable-dotprod')
+    error('aarch64 requires enable-dotprod (KleidiAI).')
   endif
   # Tizen optflags (-march=armv8-a...) come after project args and win, and
-  # MSVC ignores -march, so force the ACLE macros KleidiAI/ggml check.
+  # MSVC ignores -march, so force the ACLE macros KleidiAI/ggml check. They
+  # select the kernel tables, so define each only when its extension is on.
   # @todo drop once sources are selected per extension and Tizen uses arm-arch
   if get_option('platform') != 'android'
     extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
-    extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+    if get_option('enable-i8mm')
+      extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+    endif
   endif
   arm_march_flag = '-march=' + arm_arch_opt
   if get_option('enable-fp16')

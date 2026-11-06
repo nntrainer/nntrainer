@@ -115,7 +115,7 @@ option('enable-neon', type: 'boolean', value: true,
 option('enable-dotprod', type: 'boolean', value: true,
        description: 'Enable the ARM dotprod (+dotprod) ISA extension.')
 option('enable-i8mm', type: 'boolean', value: true,
-       description: 'Enable the ARM Int8 Matrix Multiply (+i8mm) ISA extension.')
+       description: 'Enable the ARM Int8 Matrix Multiply (+i8mm) ISA extension. When false, the i8mm kernels are left out, so the build runs on CPUs without i8mm (e.g. distro packages); with enable-fp16=true one fp16 ggml GEMM still issues i8mm unconditionally (#4335 C18).')
 option('enable-fp16fml', type: 'boolean', value: false,
        description: 'Enable the ARM FP16 multiply-long (+fp16fml) ISA extension.')
 option('enable-sve', type: 'boolean', value: false,
