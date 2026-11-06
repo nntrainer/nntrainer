@@ -37,9 +37,19 @@ jobs:
         restore-keys: |
           gbs-cache-x86_64-
 
+    - name: restore gbs ccache from main branch
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/gbs-ccache
+        key: gbs-ccache-x86_64-${{ steps.get-date.outputs.date }}
+        restore-keys: |
+          gbs-ccache-x86_64-
+
     - name: run GBS
+      # --pkg-ccache seeds the build root's ccache from the restored tar (skipped if absent).
+      # --clean makes build evict the entries this build did not hit, so the cache stays one build's worth.
       run: |
-        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1"
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1" --clean --pkg-ccache "$HOME/gbs-ccache/ccache.tar"
 
     - name: prune gbs RPM cache
       # RPM cache includes packages which are necessary for gbs build.
@@ -59,6 +69,34 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: bash .github/workflows/gbs-cache-evict.sh gbs-cache-x86_64- gbs-cache-x86_64-${{ steps.get-date.outputs.date }}
+
+    - name: collect gbs ccache
+      id: collect-ccache
+      # build packs the ccache into OTHER/_ccache.tar of the build root on exit
+      run: |
+        tar=~/GBS-ROOT/local/BUILD-ROOTS/scratch.x86_64.0/home/abuild/rpmbuild/OTHER/_ccache.tar
+        if ! sudo test -f "$tar"; then
+          echo "::warning::gbs ccache: $tar not found, skipping ccache save"
+          exit 0
+        fi
+        mkdir -p ~/gbs-ccache
+        sudo mv "$tar" ~/gbs-ccache/ccache.tar
+        sudo chown "$(id -u):$(id -g)" ~/gbs-ccache/ccache.tar
+        ls -l ~/gbs-ccache
+        echo "found=true" >> "$GITHUB_OUTPUT"
+
+    - name: save gbs ccache
+      if: steps.collect-ccache.outputs.found == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/gbs-ccache
+        key: gbs-ccache-x86_64-${{ steps.get-date.outputs.date }}
+
+    - name: evict stale gbs ccache
+      if: steps.collect-ccache.outputs.found == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash .github/workflows/gbs-cache-evict.sh gbs-ccache-x86_64- gbs-ccache-x86_64-${{ steps.get-date.outputs.date }}
 
     # Disabled: nnstreamer/api/mlagent tests are unstable on Tizen CI
     # - name: get ML API
