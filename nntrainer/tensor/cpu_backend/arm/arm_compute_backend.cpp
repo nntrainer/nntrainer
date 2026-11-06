@@ -386,6 +386,20 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __ggml_q4_0_4x8_q8_0_GEMM<float>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  // q8_0x4 interleaves 4 weight rows, and the activation is quantized 4 rows
+  // at a time, so the row strides have to be the packed ones.
+  if (K % 32 != 0 || N % 4 != 0)
+    throw std::invalid_argument(
+      "gemm_q8_0: K must be a multiple of 32 and N a multiple of 4");
+  if (lda != K || ldb != K || ldc != N)
+    throw std::invalid_argument("gemm_q8_0: A, B and C must be packed");
+  __ggml_q8_0_4x8_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
@@ -432,6 +446,12 @@ size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
   return __ggml_quantize_q4_K(src, dst, nrow, n_per_row, quant_weights);
 }
 
+template <>
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q8_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
 size_t quantize_q6_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights) {
   return __ggml_quantize_q6_K(src, dst, nrow, n_per_row, quant_weights);
@@ -453,6 +473,10 @@ void dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   __ggml_dequantize_row_q4_0(x_raw, y, k);
+}
+
+template <> void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  __ggml_dequantize_row_q8_0(x_raw, y, k);
 }
 
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -498,6 +522,16 @@ void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
                  const unsigned int M, const unsigned int N) {
   Q4_0Utils::unpackBlocksQ4_0x4((const block_q4_0x4 *)in_q4_0x, data_size, M, N,
                                 (block_q4_0 *)out_q4_0);
+}
+
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
+
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
 }
 
 template <>

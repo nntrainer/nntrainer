@@ -235,6 +235,13 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __fallback_gemm_q4_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  return __fallback_gemm_q8_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
@@ -271,6 +278,11 @@ size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
   return __fallback_quantize_q4_0(src, dst, nrow, n_per_row, quant_weights);
 }
 
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __fallback_quantize_q8_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
 size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights) {
   return __fallback_quantize_q4_K(src, dst, nrow, n_per_row, quant_weights);
@@ -287,6 +299,10 @@ void dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   return __fallback_dequantize_row_q4_0(x_raw, y, k);
+}
+
+void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  return __fallback_dequantize_row_q8_0(x_raw, y, k);
 }
 
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -327,6 +343,16 @@ void repack_q4_K_to_q4_K_8(void *W, void *repacked_W, size_t data_size,
 void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
                  const unsigned int M, const unsigned int N) {
   __fallback_unpack_q4_0_8_to_q4_0(in_q4_0x, out_q4_0, data_size, M, N);
+}
+
+void repack_q8_0(void *dst, const void *src, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_repack_q8_0_to_q8_0_4x8(dst, src, data_size, M, N);
+}
+
+void unpack_q8_0(const void *src, void *dst, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  __fallback_unpack_q8_0_4x8_to_q8_0(src, dst, data_size, M, N);
 }
 
 template <>
