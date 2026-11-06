@@ -1,0 +1,132 @@
+name: "Build Test - Ubuntu aarch64 FP16"
+
+# The only job that EXECUTES the ARM NEON FP16 kernels. Everything else in CI
+# is cross-compiled or x86: the Android NDK jobs build for arm64-v8a on x86 and
+# meson skips subdir('test') for platform == 'android'; the Windows-on-ARM jobs
+# do run tests on a native arm64 runner, but with MSVC/clang-cl and fp16 off;
+# and meson_test (-Denable-fp16=true) runs on x86, where nntrainer::sgemv
+# resolves to the x86/fallback backend and never enters neon::*.
+#
+# Scope is deliberately narrow: a minimal library build plus the one test binary
+# that covers the NEON FP16 GEMV path, filtered to the hgemv tail tests. The
+# point is to make those assertions able to fail CI, not to run the whole suite
+# on a runner class this repository has not used before.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64_fp16_test:
+    runs-on: ubuntu-24.04-arm
+    name: aarch64 Meson build & FP16 NEON test
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Check if rebuild required
+      uses: ./.github/actions/check-rebuild
+    - name: Record the runner's CPU features
+      if: env.rebuild == '1'
+      # The default aarch64 -march appends +i8mm, which not every Neoverse core
+      # implements. The hgemv tests below use no i8mm kernel, but record what
+      # this runner actually has so a future SIGILL is diagnosable.
+      run: |
+        uname -m
+        grep -m1 Features /proc/cpuinfo
+        gcc --version | head -1
+    - name: Install requirements
+      if: env.rebuild == '1'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc g++ pkg-config meson ninja-build \
+          libopenblas-dev libiniparser-dev libgtest-dev libgmock-dev \
+          libjsoncpp-dev libunwind-dev python3-dev python3-numpy python3
+    - name: Install submodules
+      if: env.rebuild == '1'
+      run: git submodule sync && git submodule update --init --recursive
+    - name: Configure
+      if: env.rebuild == '1'
+      # Only what the FP16 cpu_backend test needs. The app, the C/NNStreamer
+      # APIs and the TFLite paths are off so this job does not depend on the
+      # nnstreamer PPA, which is what the x86 meson_test job pulls in.
+      #
+      # werror is off for two pre-existing warnings this job would otherwise
+      # turn into errors, neither of them anything it is meant to police:
+      #   - Ubuntu ships no iniparser.pc here, so meson falls back to the CMake
+      #     subproject, whose include list carries a source-relative
+      #     __CMake_build directory that only ever exists under the build
+      #     directory -- which -Wmissing-include-dirs rejects;
+      #   - neon_impl_fp16.cpp defines a static hsumq_f16() that nothing calls,
+      #     which this gcc reports as -Wunused-function.
+      # So fixing the include path alone would not let werror back on here.
+      # Warning enforcement stays with the x86 meson_test and Static checks
+      # jobs, which keep -Werror.
+      run: |
+        meson setup build \
+          --buildtype=plain \
+          -Dwerror=false \
+          -Denable-fp16=true \
+          -Denable-test=true \
+          -Denable-app=false \
+          -Dinstall-app=false \
+          -Denable-capi=disabled \
+          -Dml-api-support=disabled \
+          -Denable-nnstreamer-tensor-filter=disabled \
+          -Denable-nnstreamer-tensor-trainer=disabled \
+          -Denable-nnstreamer-backbone=false \
+          -Denable-tflite-backbone=false \
+          -Denable-tflite-interpreter=false \
+          -Denable-transformer=false \
+          -Dreduce-tolerance=false
+    - name: Build the FP16 cpu_backend test
+      if: env.rebuild == '1'
+      run: ninja -C build test/unittest/unittest_nntrainer_cpu_backend_fp16
+    - name: Run the hgemv remainder-tail regression tests
+      if: env.rebuild == '1'
+      # Filtered to the tests that cover the NEON FP16 GEMV tail. The rest of
+      # this binary (q4/ggml/KleidiAI paths and benchmarks) has never run on an
+      # aarch64 Linux runner; bringing those in belongs in its own change
+      # rather than riding along with the kernel fix this guards.
+      #
+      # A filtered gtest run has several ways to report success while checking
+      # nothing: a filter that matches no test still exits 0, and so does one
+      # whose tests were all renamed away, DISABLED_-prefixed, or skipped at
+      # runtime -- and these two guard-page tests do GTEST_SKIP() when
+      # mmap/mprotect are unavailable. So assert both ends: exactly the
+      # expected number of tests match the filter, and exactly that many
+      # actually pass. gtest excludes skipped and disabled tests from its
+      # PASSED count, so the second check catches what the first cannot.
+      # Bump `expected` when a hgemv tail test is added.
+      run: |
+        set -o pipefail
+        bin=./build/test/unittest/unittest_nntrainer_cpu_backend_fp16
+        filter='*hgemv_tail*'
+        expected=3
+        if ! list=$("$bin" --gtest_list_tests --gtest_filter="$filter"); then
+          echo "::error::$bin failed to list tests (was it not built?)"
+          exit 1
+        fi
+        matched=$(printf '%s\n' "$list" | grep -c '^  ' || true)
+        echo "tests matching $filter: $matched (expected $expected)"
+        case "$matched" in
+          '' | *[!0-9]*)
+            echo "::error::unparsable test count: '$matched'"
+            exit 1
+            ;;
+        esac
+        if [ "$matched" -ne "$expected" ]; then
+          echo "::error::Expected $expected tests matching $filter, found" \
+               "$matched. Were they renamed, removed or disabled?"
+          exit 1
+        fi
+        "$bin" --gtest_filter="$filter" | tee run.log
+        grep -q "\[  PASSED  \] $expected test" run.log || {
+          echo "::error::$expected tests matched but not all of them ran;" \
+               "were they skipped or disabled?"
+          exit 1
+        }

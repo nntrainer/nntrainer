@@ -59,3 +59,43 @@ jobs:
         ndk-build NDK_PROJECT_PATH=./ APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk
         popd
         echo "::endgroup::"
+    # Compile-only guard for the ARM FP16 cpu_backend unit test. Nothing else in
+    # CI builds test/unittest/unittest_nntrainer_cpu_backend_fp16.cpp: it is
+    # registered only in test/jni/Android.mk, the x86 meson_test job cannot
+    # build it (ARM-only includes) and would not reach neon::* anyway. This
+    # cannot run the test - the runner is x86_64 - but it keeps the file from
+    # rotting unnoticed. Running it for real needs an aarch64 Linux job.
+    - name: Build ARM FP16 cpu_backend unit test (compile only)
+      if: env.rebuild == '1' && matrix.cl_options == '-Denable-opencl=false'
+      run: |
+        echo "::group::unittest_nntrainer_cpu_backend_fp16"
+        # The prebuilt libraries test/jni/Android.mk consumes are already in
+        # builddir/jni/<abi>: the NDK Build step above builds them there, and
+        # android_build_result is the installed copy taken from it.
+        # googletest is not vendored in-tree; the NDK ships it (test/jni/README.md).
+        # Resolve the NDK from ndk-build on PATH, which is the one setup-ndk
+        # installed for this job. Deliberately not ANDROID_NDK_HOME: the runner
+        # image presets that to its own preinstalled NDK of a different version,
+        # which would silently mix that googletest with this job's toolchain.
+        ndk_root="$(dirname "$(readlink -f "$(command -v ndk-build)")")"
+        echo "Using NDK at $ndk_root"
+        gtest_src="$ndk_root/sources/third_party/googletest"
+        if [ ! -d "$gtest_src" ]; then
+          echo "googletest not found under the NDK at $gtest_src"
+          exit 1
+        fi
+        cp -R "$gtest_src" test/jni/
+        pushd test/jni
+        # package_android.sh forwards the architecture flag to meson, where
+        # ndk-build never sees it, so repeat it here. This is the value
+        # package_android.sh uses by default, i.e. the same -march the library
+        # above was built with, so the test module's codegen target matches it.
+        # It is not what makes the module compile: the sources use only the
+        # _FP16 scalar type, which AArch64 has without +fp16, and no FP16 NEON
+        # intrinsics. Naming the module builds just this one, not all of test/jni.
+        ndk-build NDK_PROJECT_PATH=./ APP_BUILD_SCRIPT=./Android.mk \
+          NDK_APPLICATION_MK=./Application.mk \
+          MESON_ARM_MARCH="-march=armv8.2-a+fp16+dotprod+i8mm" \
+          unittest_nntrainer_cpu_backend_fp16
+        popd
+        echo "::endgroup::"
