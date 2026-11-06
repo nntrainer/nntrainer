@@ -179,6 +179,31 @@ outputs = [ 'arm64-v8a' ]
 
 ndk_build = find_program('ndk-build', required : true)
 
+# meson's compiler is the host one here, so check -march with the NDK clang
+ndk_host_tags = {
+  'linux': 'linux-x86_64',
+  'darwin': 'darwin-x86_64',
+  'windows': 'windows-x86_64',
+}
+# ndk-build may be a symlink on PATH, so resolve it to the NDK root
+ndk_build_real = run_command(import('python').find_installation(), '-c',
+  'import os, sys; print(os.path.realpath(sys.argv[1]))',
+  ndk_build.full_path(), check: true).stdout().strip()
+ndk_clang = find_program(fs.parent(ndk_build_real) / 'toolchains' / 'llvm'
+  / 'prebuilt' / ndk_host_tags.get(build_machine.system(), '') / 'bin' / 'clang',
+  required: false)
+if ndk_clang.found()
+  arm_isa_probe = configure_file(output: 'arm_isa_probe.c',
+    configuration: configuration_data())
+  probe = run_command(ndk_clang, '--target=aarch64-linux-android',
+    arm_march_flag, '-fsyntax-only', '-w', arm_isa_probe, check: false)
+  if probe.returncode() != 0
+    error('NDK clang does not support @0@. Check arm-arch and the enable-* ISA options.\n@1@'.format(arm_march_flag, probe.stderr().strip()))
+  endif
+else
+  warning('NDK clang not found next to ndk-build, skipping the @0@ check'.format(arm_march_flag))
+endif
+
 ndk_args = {
   'NDK_LIBS_OUT': meson.current_build_dir(),
 }
