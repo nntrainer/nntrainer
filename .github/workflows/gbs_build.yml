@@ -58,10 +58,20 @@ jobs:
         restore-keys: |
           gbs-cache-${{ matrix.gbs_build_arch }}-
 
+    - name: restore gbs ccache from main branch
+      if: env.rebuild == '1'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/gbs-ccache
+        key: gbs-ccache-${{ matrix.gbs_build_arch }}-${{ steps.get-date.outputs.date }}
+        restore-keys: |
+          gbs-ccache-${{ matrix.gbs_build_arch }}-
+
     - name: run GBS
       if: env.rebuild == '1'
+      # same flags as the daily build so the ccache entries saved there hit here
       run: |
-        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }} --clean --pkg-ccache "$HOME/gbs-ccache/ccache.tar"
 
     # Disabled: nnstreamer/api/mlagent tests are unstable on Tizen CI
     # - name: get ML API

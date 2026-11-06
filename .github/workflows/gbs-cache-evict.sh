@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ##
 # @file  gbs-cache-evict.sh
-# @brief Delete superseded GBS RPM cache snapshots, keeping only the given key.
+# @brief Delete superseded GBS RPM/ccache snapshots, keeping only the given key.
 #
 # The daily build saves a new date-keyed snapshot (gbs-cache-<arch>-<date>)
 # each run, and PRs only restore the newest one. Old snapshots linger until
