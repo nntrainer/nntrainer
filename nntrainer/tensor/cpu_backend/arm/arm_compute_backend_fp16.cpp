@@ -454,6 +454,12 @@ uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
   return 1;
 }
 
+void gemm_qs4cx_fp16(size_t M, size_t N, size_t K, const _FP16 *lhs,
+                     const uint8_t *rhs_qs4cx, const float *rhs_scales,
+                     _FP16 *dst, float beta) {
+  __fallback_gemm_qs4cx_fp16(M, N, K, lhs, rhs_qs4cx, rhs_scales, dst, beta);
+}
+
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                   uint32_t idx_variant,
                                                   bool transB) {

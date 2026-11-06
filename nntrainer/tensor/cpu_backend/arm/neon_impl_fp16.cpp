@@ -11,6 +11,7 @@
  *
  */
 
+#include <algorithm>
 #include <hgemm.h>
 #include <matrix_transpose_neon.h>
 #include <memory>
@@ -72,6 +73,11 @@ void hgemv(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M, uint32_t N,
   float *Y32 = new float[M];
 
   unsigned int idx = 0;
+  // Y may be uninitialized when beta is zero, so it must not be read.
+  if (std::fpclassify(beta) == FP_ZERO) {
+    std::fill(Y32, Y32 + M, 0.F);
+    idx = M;
+  }
 
   for (; M - idx >= 8; idx += 8) {
     float32x4_t y0_3 = vcvt_f32_f16(vld1_f16(&Y[idx]));
@@ -328,6 +334,11 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
                      uint32_t N, float alpha, float beta) {
   float *Y32 = new float[N];
   unsigned int idx = 0;
+  // Y may be uninitialized when beta is zero, so it must not be read.
+  if (std::fpclassify(beta) == FP_ZERO) {
+    std::fill(Y32, Y32 + N, 0.F);
+    idx = N;
+  }
   for (; N - idx >= 8; idx += 8) {
     float32x4_t y0_3_32 = vcvt_f32_f16(vld1_f16(&Y[idx]));
     float32x4_t y4_7_32 = vcvt_f32_f16(vld1_f16(&Y[idx + 4]));
@@ -2244,15 +2255,6 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
       }
     }
   }
-}
-
-static __fp16 hsumq_f16(float16x8_t v) {
-  float16x4_t lo = vget_low_f16(v);
-  float16x4_t hi = vget_high_f16(v);
-  float16x4_t s4 = vadd_f16(lo, hi);
-  float16x4_t s2 = vadd_f16(s4, vext_f16(s4, s4, 2));
-  float16x4_t s1 = vadd_f16(s2, vext_f16(s2, s2, 1));
-  return vget_lane_f16(s1, 0);
 }
 
 // Native FP16-in / FP16-out RMS-norm-over-width.
