@@ -30,9 +30,50 @@
 #include <nntrainer_internal.h>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
+
+static_assert(ml::train::TensorDim::MAXDIM <= ML_TENSOR_RANK_LIMIT,
+              "TensorDim::MAXDIM does not fit in ml_tensor_dimension");
+
+/**
+ * @brief     Publish one nntrainer dimension into an ml-api tensors info
+ * @param[in,out] info tensors info handle to write into
+ * @param[in] index tensor index within @a info
+ * @param[in] dim nntrainer dimension to publish
+ * @return    ML_ERROR_NONE on success, an ml-api error code otherwise
+ * @note      The dimension buffer is built here and nowhere else in this
+ *            file, so that there is one place, not three, where its type
+ *            can be got wrong, and that one place has its type fixed at
+ *            build time. ml_tensors_info_set_tensor_dimension() takes
+ *            ml_tensor_dimension, i.e. unsigned int[ML_TENSOR_RANK_LIMIT],
+ *            and that type lets the callee read every entry, so a shorter
+ *            buffer is an out-of-bounds read for it.
+ */
+static int ml_train_tensors_info_set_dim_util(ml_tensors_info_h info,
+                                              unsigned int index,
+                                              const ml::train::TensorDim &dim) {
+  ml_tensor_dimension u_dim = {0};
+
+  /// @note this is the guard, not decoration: it fails the build if u_dim
+  /// is ever narrowed to a shorter array, to a pointer or to a container,
+  /// which is the defect this function exists to prevent. It fixes the
+  /// type only, so the ranks above getNumDim() are kept well defined
+  /// twice over, by the initializer above and by the loop below: losing
+  /// either one on its own is still not undefined behaviour.
+  static_assert(std::is_same<decltype(u_dim), ml_tensor_dimension>::value,
+                "u_dim must stay a full ml_tensor_dimension");
+
+  /// @note the ?: evaluates only one of its operands on purpose: getDim()
+  /// is only getNumDim() entries long and must not be indexed past that.
+  for (unsigned int j = 0; j < ML_TENSOR_RANK_LIMIT; j++)
+    u_dim[j] =
+      (j < dim.getNumDim()) ? static_cast<unsigned int>(dim.getDim()[j]) : 0u;
+
+  return ml_tensors_info_set_tensor_dimension(info, index, u_dim);
+}
 
 /**
  * @brief   Global lock for nntrainer C-API
@@ -1241,12 +1282,7 @@ int ml_train_model_get_input_tensors_info(ml_train_model_h model,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
-
-    for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
-
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_train_tensors_info_set_dim_util(*info, i, dims[i]);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;
@@ -1305,12 +1341,7 @@ int ml_train_model_get_output_tensors_info(ml_train_model_h model,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
-
-    for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
-
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_train_tensors_info_set_dim_util(*info, i, dims[i]);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;
@@ -1420,12 +1451,7 @@ int ml_train_model_get_weight(ml_train_model_h model, const char *layer_name,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
-
-    for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
-
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_train_tensors_info_set_dim_util(*info, i, dims[i]);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;

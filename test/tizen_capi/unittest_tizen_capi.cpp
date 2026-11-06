@@ -1618,6 +1618,104 @@ TEST(nntrainer_capi_nnmodel, get_input_output_dimension_06_n) {
 }
 
 /**
+ * @brief The tensors info built by the C-API must describe the model
+ *        dimension only: the byte size ml-api derives from it, and nothing
+ *        above TensorDim::MAXDIM.
+ * @note  These assertions do not fail for a short dimension buffer on a
+ *        non-extended handle, because ml-api reads only the first four
+ *        ranks from the caller and zero-fills the ranks above them itself.
+ *        They become a live guard if these handles ever move to
+ *        ml_tensors_info_create_extended(), where ml-api copies
+ *        every rank straight out of the caller's buffer. What keeps a short
+ *        buffer from coming back meanwhile is the static_assert on the one
+ *        buffer left in the C-API, in ml_train_tensors_info_set_dim_util(),
+ *        which fails the build rather than this test.
+ */
+TEST(nntrainer_capi_nnmodel, get_tensors_info_size_01_p) {
+  ml_train_model_h handle = NULL;
+  ml_tensors_info_h input_info = NULL;
+  ml_tensors_info_h output_info = NULL;
+  ml_tensors_info_h weight_info = NULL;
+  ml_tensors_data_h weights = NULL;
+  size_t data_size;
+  ml_tensor_dimension dim = {0};
+
+  int status = ML_ERROR_NONE;
+
+  ScopedIni s("capi_test_get_tensors_info_size_01_p",
+              {model_base, optimizer, dataset, inputlayer, outputlayer});
+  status = ml_train_model_construct_with_conf(s.getIniName().c_str(), &handle);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+  status = ml_train_model_compile(handle, NULL);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+
+  status = ml_train_model_get_input_tensors_info(handle, &input_info);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_get_tensor_size(input_info, 0, &data_size);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  EXPECT_EQ(data_size, 32u * 62720u * sizeof(float));
+
+  status = ml_train_model_get_output_tensors_info(handle, &output_info);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_get_tensor_size(output_info, 0, &data_size);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  EXPECT_EQ(data_size, 32u * 10u * sizeof(float));
+
+  status =
+    ml_train_model_get_weight(handle, "outputlayer", &weights, &weight_info);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_get_tensor_size(weight_info, 0, &data_size);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  EXPECT_EQ(data_size, 62720u * 10u * sizeof(float));
+  status = ml_tensors_info_get_tensor_size(weight_info, 1, &data_size);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  EXPECT_EQ(data_size, 10u * sizeof(float));
+
+  status = ml_tensors_info_get_tensor_dimension(input_info, 0, dim);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  for (size_t i = ml::train::TensorDim::MAXDIM; i < ML_TENSOR_RANK_LIMIT; ++i) {
+    EXPECT_EQ(dim[i], 0u);
+  }
+
+  status = ml_tensors_data_destroy(weights);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_destroy(weight_info);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_destroy(input_info);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+  status = ml_tensors_info_destroy(output_info);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+
+  status = ml_train_model_destroy(handle);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+}
+
+/**
+ * @brief Neural Network Model Get Weight Test with an unknown layer
+ */
+TEST(nntrainer_capi_nnmodel, getWeight_02_n) {
+  ml_train_model_h handle = NULL;
+  ml_tensors_info_h weight_info = NULL;
+  ml_tensors_data_h weights = NULL;
+
+  int status = ML_ERROR_NONE;
+
+  ScopedIni s("capi_test_get_weight_02_n",
+              {model_base, optimizer, dataset, inputlayer, outputlayer});
+  status = ml_train_model_construct_with_conf(s.getIniName().c_str(), &handle);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+  status = ml_train_model_compile(handle, NULL);
+  ASSERT_EQ(status, ML_ERROR_NONE);
+
+  status =
+    ml_train_model_get_weight(handle, "no_such_layer", &weights, &weight_info);
+  EXPECT_NE(status, ML_ERROR_NONE);
+
+  status = ml_train_model_destroy(handle);
+  EXPECT_EQ(status, ML_ERROR_NONE);
+}
+
+/**
  * @brief Main gtest
  */
 int main(int argc, char **argv) {
