@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -449,6 +450,116 @@ INSTANTIATE_TEST_SUITE_P(
     return info.param.name;
   });
 #endif
+
+/** @brief Real two-attention graph with a batch-1, eight-token CPU cache. */
+class QwenCpuKVGraphTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    const auto files = causallm_test::makeTinyCausalLMFiles(
+      "QwenCpuKVGraphTest",
+      ::testing::UnitTest::GetInstance()->current_test_info()->name(), "FP32");
+    config_ = makeTinyQwen3Config();
+    config_["num_hidden_layers"] = 2;
+    generation_ = causallm_test::makeTinyGenerationConfig();
+    nntrainer_ = causallm_test::makeTinyNntrainerConfig(
+      files.tokenizer_path, causallm_test::makeTinyFp32DataType());
+    nntrainer_["init_seq_len"] = 8;
+    model_ =
+      std::make_unique<TinyQwen3CausalLM>(config_, generation_, nntrainer_);
+    ASSERT_NO_THROW(model_->initializeModel());
+    setupQwen3DeterministicWeights(*model_);
+  }
+
+  void rejectForeignPlane(bool key) {
+    model_->prepareKVCache();
+    auto &cache = model_->cacheManager();
+    ASSERT_TRUE(cache.usesCpuStorage());
+    auto &plane = key ? cache.getKeyCache(0) : cache.getValueCache(0);
+    const auto original = plane.getMemoryData();
+    const auto offset = plane.getOffset();
+    nntrainer::Tensor foreign(plane.getDim(), true);
+    std::memset(foreign.getData<char>(), 0x5a, foreign.bytes());
+    plane.setData(foreign.getMemoryData(), foreign.getOffset(), false);
+
+    try {
+      model_->stepLogitsFromIds({1, 4}, 0);
+      FAIL() << "MHA accepted a cache plane outside its active lease";
+    } catch (const std::logic_error &error) {
+      EXPECT_STREQ(error.what(),
+                   "CPU MHA cache does not belong to the active KV step");
+    }
+    EXPECT_EQ(cache.getPosition(), 0u);
+    const char *bytes = foreign.getData<char>();
+    EXPECT_TRUE(std::all_of(bytes, bytes + foreign.bytes(),
+                            [](char value) { return value == 0x5a; }));
+
+    plane.setData(original, offset, false);
+    EXPECT_NO_THROW(model_->stepLogitsFromIds({1, 4}, 0));
+    EXPECT_EQ(cache.getPosition(), 2u);
+  }
+
+  causallm_test::ScopedEnv engine_{"NNTR_ENGINE", "cpu"};
+  causallm_test::ScopedEnv legacy_{"NNTR_CPU_KV_LEGACY", "0"};
+  causallm::json config_, generation_, nntrainer_;
+  std::unique_ptr<TinyQwen3CausalLM> model_;
+};
+
+TEST_F(QwenCpuKVGraphTest, CommitsAtCapacityAndResetsRepeatedly) {
+  for (unsigned int repetition = 0; repetition < 3; ++repetition) {
+    if (repetition)
+      model_->cacheManager().reset();
+    const auto logits = model_->stepLogitsFromIds({1, 4, 4, 4, 4, 4, 4}, 0);
+    ASSERT_EQ(logits.size(), 32u);
+    EXPECT_NEAR(logits[4], makeExpectedQwen3Logits()[4], 1e-4f);
+    EXPECT_EQ(model_->getKvLen(), 7);
+    EXPECT_NO_THROW(model_->stepLogitsFromIds({4}, 7));
+    EXPECT_EQ(model_->getKvLen(), 8);
+    EXPECT_THROW(model_->stepLogitsFromIds({4}, 8), std::out_of_range);
+    EXPECT_EQ(model_->getKvLen(), 8);
+  }
+}
+
+TEST_F(QwenCpuKVGraphTest, RejectsMissingProducerAfterBothAttentionLayersRun) {
+  model_->addUnproducedCacheOwner();
+  model_->prepareKVCache();
+  auto &cache = model_->cacheManager();
+  ASSERT_TRUE(cache.usesCpuStorage());
+  ASSERT_EQ(cache.getNumLayers(), 3u);
+  for (unsigned int layer = 0; layer < 3; ++layer) {
+    auto &value = cache.getValueCache(layer);
+    std::memset(value.getData<char>(), 0x5a, value.bytes());
+  }
+  try {
+    model_->stepLogitsFromIds({1, 4}, 0);
+    FAIL() << "A graph with an unmatched producer published its KV position";
+  } catch (const std::logic_error &error) {
+    EXPECT_STREQ(error.what(), "KV commit before all producers completed");
+  }
+  EXPECT_EQ(cache.getPosition(), 0u);
+  // The real attention producers replaced their sentinels before commit
+  // rejected the third owner. This is graph execution, not a mocked lease.
+  EXPECT_NE(cache.getValueCache(0).getData<char>()[0], 0x5a);
+  EXPECT_NE(cache.getValueCache(1).getData<char>()[0], 0x5a);
+  EXPECT_EQ(cache.getValueCache(2).getData<char>()[0], 0x5a);
+  EXPECT_NO_THROW(cache.reset());
+}
+
+TEST_F(QwenCpuKVGraphTest, RejectsForeignKeyBeforeCacheWrites) {
+  rejectForeignPlane(true);
+}
+
+TEST_F(QwenCpuKVGraphTest, RejectsForeignValueBeforeCacheWrites) {
+  rejectForeignPlane(false);
+}
+
+TEST_F(QwenCpuKVGraphTest, RejectsNonCommittedIntervalAndCanContinue) {
+  ASSERT_NO_THROW(model_->stepLogitsFromIds({1, 4}, 0));
+  ASSERT_EQ(model_->getKvLen(), 2);
+  EXPECT_THROW(model_->stepLogitsFromIds({4}, 1), std::logic_error);
+  EXPECT_EQ(model_->getKvLen(), 2);
+  EXPECT_NO_THROW(model_->stepLogitsFromIds({4}, 2));
+  EXPECT_EQ(model_->getKvLen(), 3);
+}
 
 /**
  * @brief Test that a tiny Qwen3 embedding model can save/load and encode

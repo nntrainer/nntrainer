@@ -364,6 +364,19 @@ public:
            static_cast<unsigned int>(HEAD_DIM);
   }
 
+  /** KV head count for the storage spec; models with variable geometry
+   * override. */
+  virtual unsigned int getKVCacheHeadCount(int layer_id) const {
+    (void)layer_id;
+    return static_cast<unsigned int>(NUM_KEY_VALUE_HEADS);
+  }
+
+  /** Whether this decoder block actually produces an attention KV cache. */
+  virtual bool hasKVCacheProducer(int layer_id) const {
+    (void)layer_id;
+    return true;
+  }
+
   /**
    * @brief The EARLIER layer whose K/V storage this layer reads, or -1 when
    *        the layer owns its K/V (the default, and every model but gemma4).
@@ -755,8 +768,8 @@ protected:
   float EMBEDDING_SCALE = 1.0f;
   int GQA_SIZE;
 
-  unsigned int BATCH_SIZE;              /**< Batch size for the model */
-  unsigned int INIT_SEQ_LEN;            /**< Initial sequence length */
+  unsigned int BATCH_SIZE;   /**< Batch size for the model */
+  unsigned int INIT_SEQ_LEN; /**< Initial sequence length */
   /** The height the PACK shipped, before any per-request growth. The floor of
    *  prefillPlaneFor(): a pack that ships a tall plane keeps it. */
   unsigned int PACK_INIT_SEQ_LEN = 0;

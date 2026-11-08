@@ -110,6 +110,9 @@ protected:
   unsigned int getAttentionHeadDim(int layer_id) const;
   unsigned int getKVHeadCount(int layer_id) const;
   unsigned int getKVCacheWidth(int layer_id) const override;
+  unsigned int getKVCacheHeadCount(int layer_id) const override {
+    return getKVHeadCount(layer_id);
+  }
   /** @copydoc Transformer::getLayerSlidingWindow(int) — the layer_types table
    *  names the sliding layers; with no table every layer slides. */
   unsigned int getLayerSlidingWindow(int layer_id) const override {
