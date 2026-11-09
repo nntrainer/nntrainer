@@ -1408,4 +1408,31 @@ interface nntr_hvx : remote_handle64 {
                                    in float ple_scale,
                                    in sequence<float> ple,
                                    rout sequence<float> out_f32);
+
+   // mm_u8i4_dense_ffn_ple with the activation, the per-layer rows and the
+   // output in attached arenas (arena_attach), each from its arena's byte
+   // 0, the floats counted by the *_len: the call carries no buffer, so
+   // FastRPC neither maps nor maintains one per call, and the DSP keeps its
+   // own cache right (the inputs invalidated, the output flushed). The CPU
+   // side is IO-coherent: the host writes and reads the buffers as they
+   // are. A buffer passed as a call argument also took the DSP's stores at
+   // a fifth of the arena's rate (1.5 MiB memset: 502 against 93 us).
+   AEEResult mm_u8i4_dense_ffn_ple_io(in uint32 M, in uint32 K,
+                                      in uint32 inter, in uint32 act,
+                                      in float eps,
+                                      in sequence<float> pre_gamma,
+                                      in sequence<float> gamma2,
+                                      in sequence<uint32> h_gate_up,
+                                      in sequence<uint32> h_down,
+                                      in sequence<uint32> row_index,
+                                      in sequence<uint32> row_count,
+                                      in sequence<float> row_weight,
+                                      in uint32 act_arena, in uint32 act_len,
+                                      in uint32 h_ple_gate,
+                                      in sequence<uint32> h_ple_proj,
+                                      in sequence<float> ple_gamma,
+                                      in float ple_scale,
+                                      in uint32 ple_arena, in uint32 ple_len,
+                                      in uint32 out_arena,
+                                      in uint32 out_len);
 };

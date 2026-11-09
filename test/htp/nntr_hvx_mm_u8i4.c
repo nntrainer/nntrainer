@@ -18,6 +18,10 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 #include <remote.h>
+#if defined(__hexagon__)
+#include <qurt.h>
+#include <qurt_memory.h>
+#endif
 
 #include "hexkl_conv_block.h"
 #include "hexkl_dma_ring.h"
@@ -2199,6 +2203,64 @@ int nntr_hvx_mm_u8i4_dense_ffn_ple(
                             h_ple_proj, h_ple_projLen, s->ple_mid, NULL, NULL,
                             0u, (int)n, out_f32, out_f32Len, out_f32,
                             out_f32Len);
+}
+
+/** @brief The first @a floats floats of arena @a id, or NULL when the arena
+ *  is not attached or is shorter. */
+static float *io_floats(nntr_hvx_session *s, uint32 id, uint32 floats) {
+  nntr_hvx_arena *a = nntr_hvx_arena_slot(s, id);
+  if (!a || floats == 0u || (uint64_t)floats * sizeof(float) > a->bytes)
+    return NULL;
+  return (float *)a->va;
+}
+
+/** @brief The DSP's view of @a n bytes at @a p: re-read from memory
+ *  (invalidate) or written back to it (flush). The host side needs
+ *  nothing: its accesses are IO-coherent. */
+static void io_cache(const void *p, size_t n, int flush) {
+#if defined(__hexagon__)
+  qurt_mem_cache_clean((qurt_addr_t)p, (qurt_size_t)n,
+                       flush ? QURT_MEM_CACHE_FLUSH : QURT_MEM_CACHE_INVALIDATE,
+                       QURT_MEM_DCACHE);
+#else
+  (void)p, (void)n, (void)flush;
+#endif
+}
+
+int nntr_hvx_mm_u8i4_dense_ffn_ple_io(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 act,
+  float eps, const float *pre_gamma, int pre_gammaLen, const float *gamma2,
+  int gamma2Len, const uint32 *h_gate_up, int h_gate_upLen,
+  const uint32 *h_down, int h_downLen, const uint32 *row_index,
+  int row_indexLen, const uint32 *row_count, int row_countLen,
+  const float *row_weight, int row_weightLen, uint32 act_arena, uint32 act_len,
+  uint32 h_ple_gate, const uint32 *h_ple_proj, int h_ple_projLen,
+  const float *ple_gamma, int ple_gammaLen, float ple_scale, uint32 ple_arena,
+  uint32 ple_len, uint32 out_arena, uint32 out_len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || act_len > 0x7FFFFFFFu || ple_len > 0x7FFFFFFFu ||
+      out_len > 0x7FFFFFFFu)
+    return AEE_EBADPARM;
+  const float *x = io_floats(s, act_arena, act_len);
+  const float *ple = io_floats(s, ple_arena, ple_len);
+  float *out = io_floats(s, out_arena, out_len);
+  if (!x || !ple || !out || out_arena == act_arena || out_arena == ple_arena) {
+    FARF(ERROR, "dense_ffn_ple_io: arenas %u %u %u", (unsigned)act_arena,
+         (unsigned)ple_arena, (unsigned)out_arena);
+    return AEE_EBADPARM;
+  }
+  io_cache(x, (size_t)act_len * sizeof(float), 0);
+  io_cache(ple, (size_t)ple_len * sizeof(float), 0);
+  /* nor a stale line of the output written back over the host's later */
+  io_cache(out, (size_t)out_len * sizeof(float), 0);
+  const int rc = nntr_hvx_mm_u8i4_dense_ffn_ple(
+    handle, M, K, inter, act, eps, pre_gamma, pre_gammaLen, gamma2, gamma2Len,
+    h_gate_up, h_gate_upLen, h_down, h_downLen, row_index, row_indexLen,
+    row_count, row_countLen, row_weight, row_weightLen, x, (int)act_len,
+    h_ple_gate, h_ple_proj, h_ple_projLen, ple_gamma, ple_gammaLen, ple_scale,
+    ple, (int)ple_len, out, (int)out_len);
+  io_cache(out, (size_t)out_len * sizeof(float), 1);
+  return rc;
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_timed(

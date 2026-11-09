@@ -1222,6 +1222,106 @@ TEST_F(HmxMmU8I4Layer, DenseFfnPleMatchesComposition) {
     EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w->handle), AEE_SUCCESS);
 }
 
+/**
+ * @brief mm_u8i4_dense_ffn_ple_io against mm_u8i4_dense_ffn_ple: the same
+ *        floats, every one, with its three buffers cached rpcmem the host
+ *        writes and reads with no cache maintenance of its own, new rows
+ *        every call (a stale line on either side shows as a mismatch).
+ */
+TEST_F(HmxMmU8I4Layer, DenseFfnPleIoMatchesArgs) {
+  auto ralloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  auto fmunmap =
+    (int (*)(int, int, void *, size_t))dlsym(RTLD_DEFAULT, "fastrpc_munmap");
+  if (!ralloc || !rfree || !to_fd || !fmmap || !fmunmap)
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  const uint32_t K = 512, W = 256, P = 64, Mmax = 64;
+  const float eps = 1e-6f, scale = 0.75f;
+  Weight gu, dn, pg, pp;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * W, 0xD1E10001u, gu));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(W, K, 0xD1E10002u, dn));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, P, 0xD1E10003u, pg));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(P, K, 0xD1E10004u, pp));
+  for (const Weight *w : {&gu, &dn, &pg, &pp})
+    ASSERT_EQ(
+      nntr_hvx_weight_set_act16(handle_, w->handle, 64.0f / 65535.0f, 32768.0f),
+      AEE_SUCCESS);
+  std::vector<float> pre_gamma(K), gamma2(K), ple_gamma(K);
+  fill_deterministic(pre_gamma, 0x5EEDD1F1u);
+  fill_deterministic(gamma2, 0x5EEDD1F2u);
+  fill_deterministic(ple_gamma, 0x5EEDD1F3u);
+  /* act, ple, out: each its own cached buffer and arena */
+  const size_t bytes[3] = {sizeof(float) * Mmax * K, sizeof(float) * Mmax * P,
+                           sizeof(float) * Mmax * K};
+  float *buf[3];
+  uint32_t arena[3];
+  for (int b = 0; b < 3; ++b) {
+    buf[b] = static_cast<float *>(ralloc(25, 1u, static_cast<int>(bytes[b])));
+    ASSERT_NE(buf[b], nullptr);
+    ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, to_fd(buf[b]), buf[b], 0, bytes[b],
+                    static_cast<int>(FASTRPC_MAP_FD)),
+              0);
+    ASSERT_EQ(nntr_hvx_arena_attach(handle_, to_fd(buf[b]),
+                                    static_cast<uint32_t>(bytes[b]), &arena[b]),
+              AEE_SUCCESS);
+  }
+  uint32_t call = 0;
+  for (uint32_t M : {64u, 5u, 64u, 1u, 64u}) {
+    SCOPED_TRACE("call " + std::to_string(call) + " M=" + std::to_string(M));
+    std::vector<float> x(size_t(M) * K), ple(size_t(M) * P);
+    fill_deterministic(x, 0x5EEDD1F4u + call);
+    fill_deterministic(ple, 0x5EEDD1F5u + call);
+    std::vector<uint32_t> row_index(M), row_count(1, M);
+    std::vector<float> row_weight(M, 1.0f);
+    for (uint32_t r = 0; r < M; ++r)
+      row_index[r] = r;
+    const int xn = static_cast<int>(x.size());
+    std::vector<float> want(x.size(), -1.0f);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_dense_ffn_ple(
+                handle_, M, K, W, 1u, eps, pre_gamma.data(), K, gamma2.data(),
+                K, &gu.handle, 1, &dn.handle, 1, row_index.data(), M,
+                row_count.data(), 1, row_weight.data(), M, x.data(), xn,
+                pg.handle, &pp.handle, 1, ple_gamma.data(), K, scale,
+                ple.data(), static_cast<int>(ple.size()), want.data(), xn),
+              AEE_SUCCESS);
+    std::memcpy(buf[0], x.data(), sizeof(float) * x.size());
+    std::memcpy(buf[1], ple.data(), sizeof(float) * ple.size());
+    ASSERT_EQ(nntr_hvx_mm_u8i4_dense_ffn_ple_io(
+                handle_, M, K, W, 1u, eps, pre_gamma.data(), K, gamma2.data(),
+                K, &gu.handle, 1, &dn.handle, 1, row_index.data(), M,
+                row_count.data(), 1, row_weight.data(), M, arena[0], M * K,
+                pg.handle, &pp.handle, 1, ple_gamma.data(), K, scale, arena[1],
+                M * P, arena[2], M * K),
+              AEE_SUCCESS);
+    EXPECT_EQ(std::memcmp(buf[2], want.data(), sizeof(float) * want.size()), 0);
+    ++call;
+  }
+  /* an arena too short for the rows, and the output on an input's arena */
+  EXPECT_NE(nntr_hvx_mm_u8i4_dense_ffn_ple_io(
+              handle_, Mmax, K, W, 1u, eps, pre_gamma.data(), K, gamma2.data(),
+              K, &gu.handle, 1, &dn.handle, 1, nullptr, 0, nullptr, 0, nullptr,
+              0, arena[1], Mmax * K, pg.handle, &pp.handle, 1, ple_gamma.data(),
+              K, scale, arena[1], Mmax * P, arena[2], Mmax * K),
+            AEE_SUCCESS);
+  EXPECT_NE(nntr_hvx_mm_u8i4_dense_ffn_ple_io(
+              handle_, Mmax, K, W, 1u, eps, pre_gamma.data(), K, gamma2.data(),
+              K, &gu.handle, 1, &dn.handle, 1, nullptr, 0, nullptr, 0, nullptr,
+              0, arena[0], Mmax * K, pg.handle, &pp.handle, 1, ple_gamma.data(),
+              K, scale, arena[1], Mmax * P, arena[0], Mmax * K),
+            AEE_SUCCESS);
+  for (int b = 0; b < 3; ++b) {
+    EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena[b]), AEE_SUCCESS);
+    fmunmap(CDSP_DOMAIN_ID, to_fd(buf[b]), buf[b], bytes[b]);
+    rfree(buf[b]);
+  }
+  for (const Weight *w : {&gu, &dn, &pg, &pp})
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w->handle), AEE_SUCCESS);
+}
+
 TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   const uint32_t M = 64, K = 1024, N = 1024;
   const int kReps = 20;

@@ -4399,7 +4399,9 @@ private:
     bool kept = false;
   };
   struct StagingPool {
-    std::map<size_t, std::unique_ptr<HtpRpcBuffer>> by_class;
+    /** shared: an attached buffer (ioArena) is also held by the close
+     *  hook that detaches it */
+    std::map<size_t, std::shared_ptr<HtpRpcBuffer>> by_class;
     /** What stageInput last copied into a class's buffer, cleared by any
      *  other stage() of it (doc 57 section 9.31). */
     std::map<size_t, Held> holds;
@@ -4419,7 +4421,7 @@ private:
     pool.copied_out.erase(cls);
     auto &slot = pool.by_class[cls];
     if (!slot)
-      slot = std::make_unique<HtpRpcBuffer>(cls);
+      slot = std::make_shared<HtpRpcBuffer>(cls);
     return *slot;
   }
   /** @brief Whether @a b still holds the copy of @a a: 32 spread 64-byte
@@ -4455,7 +4457,7 @@ private:
     const size_t cls = stageClass(bytes);
     auto &slot = pool.by_class[cls];
     if (!slot)
-      slot = std::make_unique<HtpRpcBuffer>(cls);
+      slot = std::make_shared<HtpRpcBuffer>(cls);
     auto it = pool.holds.find(cls);
     if (it != pool.holds.end() && it->second.first == src &&
         it->second.second == bytes && sampledSame(src, slot->data(), bytes))
@@ -4555,6 +4557,57 @@ private:
       stagedMemcpy(dst, buf, bytes, line);
     pool.copied_out[cls] = {dst, bytes, kept};
   }
+
+  static constexpr uint32_t kNoIoArena = 0xFFFFFFFFu;
+  /** @brief The DSP arena of a staging buffer of act_pool_, out_pool_ or
+   *  x2_pool_ (the _io entries take their buffers by it): mapped and
+   *  attached on first use, then held by a close hook that detaches and
+   *  unmaps it; kNoIoArena when it cannot be (no rpcmem, the DSP's arena
+   *  table full), and the call passes the buffer as an argument instead. */
+  uint32_t ioArena(remote_handle64 session, HtpRpcBuffer &b) {
+    auto it = io_arena_.find(&b);
+    if (it != io_arena_.end())
+      return it->second;
+    std::shared_ptr<HtpRpcBuffer> own;
+    for (StagingPool *pool : {&act_pool_, &out_pool_, &x2_pool_})
+      for (auto &c : pool->by_class)
+        if (c.second.get() == &b)
+          own = c.second;
+    const HtpRpcMemApi &api = HtpRpcMemApi::get();
+    const int fd = b.fd();
+    uint32_t id = kNoIoArena;
+    if (own && fd >= 0 && api.mmap && api.munmap &&
+        api.mmap(CDSP_DOMAIN_ID, fd, b.data(), 0, b.size(), FASTRPC_MAP_FD) ==
+          0) {
+      if (nntr_hvx_arena_attach(session, fd, static_cast<uint32_t>(b.size()),
+                                &id) != AEE_SUCCESS) {
+        api.munmap(CDSP_DOMAIN_ID, fd, b.data(), b.size());
+        id = kNoIoArena;
+      } else {
+        if (!io_held_) {
+          io_held_ = std::make_shared<IoHeld>();
+          std::shared_ptr<IoHeld> held = io_held_;
+          // after s1ArenaTeardown's arenas_release the detach just fails
+          HtpBackend::global().atCloseLast([held, session] {
+            const HtpRpcMemApi &mem = HtpRpcMemApi::get();
+            for (auto &h : *held) {
+              nntr_hvx_arena_detach(session, h.second);
+              mem.munmap(CDSP_DOMAIN_ID, h.first->fd(), h.first->data(),
+                         h.first->size());
+            }
+            held->clear();
+          });
+        }
+        io_held_->push_back({own, id});
+      }
+    }
+    io_arena_[&b] = id;
+    return id;
+  }
+  using IoHeld =
+    std::vector<std::pair<std::shared_ptr<HtpRpcBuffer>, uint32_t>>;
+  std::map<const HtpRpcBuffer *, uint32_t> io_arena_;
+  std::shared_ptr<IoHeld> io_held_;
 
   /** @brief A host range last copied out of a staging buffer, so a later
    *  call can hand the DSP that buffer's bytes in place of a fresh copy:
@@ -6113,12 +6166,18 @@ private:
     }
     // a dense FFN has no x2, so its per-layer input rows take that buffer
     const int ple_len = ple ? static_cast<int>(M * ple->P) : 0;
+    HtpRpcBuffer *ple_stage =
+      ple ? &stageInput(x2_pool_, ple->rows, ple_len * sizeof(float)) : nullptr;
     const float *ple_f32 =
-      ple ? reinterpret_cast<float *>(
-              stageInput(x2_pool_, ple->rows, ple_len * sizeof(float)).data())
-          : nullptr;
+      ple_stage ? reinterpret_cast<float *>(ple_stage->data()) : nullptr;
     HtpRpcBuffer &out_stage =
       via_dspq ? *dspq_->out : stage(out_pool_, out_bytes);
+    // the dense FFN's three buffers by their arenas when all three have one
+    const uint32_t io_act = ple ? ioArena(session, act_stage) : kNoIoArena;
+    const uint32_t io_ple = ple ? ioArena(session, *ple_stage) : kNoIoArena;
+    const uint32_t io_out = ple ? ioArena(session, out_stage) : kNoIoArena;
+    const bool io =
+      io_act != kNoIoArena && io_ple != kNoIoArena && io_out != kNoIoArena;
     float *act_f32 = reinterpret_cast<float *>(act_stage.data());
     float *out_f32 = reinterpret_cast<float *>(out_stage.data());
     // NNTR_HTP_PROFILE>=2 on a call with folded norms: the timed entry
@@ -6167,6 +6226,18 @@ private:
         via_dspq ? dspqCall(M, K, inter, N_out, h_gu, h_dn, row_index,
                             row_count, row_weight, act_bytes, out_bytes, glu,
                             timed ? rep_stage : nullptr)
+        : io     ? nntr_hvx_mm_u8i4_dense_ffn_ple_io(
+                     session, M, K, inter, glu, eps, pre_gamma, static_cast<int>(K),
+                     add_gamma, add_gamma ? static_cast<int>(N_out) : 0,
+                     h_gu.data(), static_cast<int>(h_gu.size()), h_dn.data(),
+                     static_cast<int>(h_dn.size()), row_index.data(),
+                     static_cast<int>(row_index.size()), row_count.data(),
+                     static_cast<int>(row_count.size()), row_weight.data(),
+                     static_cast<int>(row_weight.size()), io_act, act_len,
+                     ple_gate->handles[0], ple_proj->handles.data(),
+                     static_cast<int>(ple_proj->handles.size()), ple->gamma,
+                     static_cast<int>(N_out), ple->scale, io_ple, ple_len, io_out,
+                     out_len)
         : ple
           ? nntr_hvx_mm_u8i4_dense_ffn_ple(
               session, M, K, inter, glu, eps, pre_gamma, static_cast<int>(K),
@@ -6211,13 +6282,13 @@ private:
                     static_cast<int>(row_weight.size()), act_f32, act_len,
                     out_f32, out_len, rep_stage, HTP_MOE_N_STAGES)
                 : nntr_hvx_mm_u8i4_moe_layer(
-                    session, M, K, inter, N_out,
-                    glu, h_gu.data(), static_cast<int>(h_gu.size()),
-                    h_dn.data(), static_cast<int>(h_dn.size()),
-                    row_index.data(), static_cast<int>(row_index.size()),
-                    row_count.data(), static_cast<int>(row_count.size()),
-                    row_weight.data(), static_cast<int>(row_weight.size()),
-                    act_f32, act_len, out_f32, out_len);
+                    session, M, K, inter, N_out, glu, h_gu.data(),
+                    static_cast<int>(h_gu.size()), h_dn.data(),
+                    static_cast<int>(h_dn.size()), row_index.data(),
+                    static_cast<int>(row_index.size()), row_count.data(),
+                    static_cast<int>(row_count.size()), row_weight.data(),
+                    static_cast<int>(row_weight.size()), act_f32, act_len,
+                    out_f32, out_len);
       const uint64_t elapsed = profile.level() ? HtpProfile::nowUs() - t0 : 0;
       // Fastest wins, stages and all, so the breakdown describes one real call
       // rather than a mix of a fast one and a slow one.
