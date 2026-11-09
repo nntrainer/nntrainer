@@ -1151,6 +1151,81 @@ TEST_F(HmxMmU8I4Layer, A16DenseMatchesHostComposition) {
 }
 
 /**
+ * @brief The qkv call (mm_u8i4_layer_norm) on a16 handles with its per-head
+ *        passes: q of two heads and k normed and rotated, v normed, at 64
+ *        and 7 rows -- against the host: the a16 matmul, each head's RMSNorm
+ *        times its gamma, then the CPU table's rotation.
+ */
+TEST_F(HmxMmU8I4Layer, A16QkvNormRopeMatchesHost) {
+  const uint32_t K = 512, HD = 256, half = HD / 2;
+  const float s = 2.0f / 65535.0f, zp = 32768.0f, eps = 1e-6f;
+  const uint32_t Ns[3] = {2 * HD, HD, HD};
+  std::vector<Weight> ws(3);
+  std::vector<uint32_t> hs;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, Ns[i], 0xA16E0000u + i, ws[i]));
+    ASSERT_EQ(nntr_hvx_weight_set_act16(handle_, ws[i].handle, s, zp),
+              AEE_SUCCESS);
+    hs.push_back(ws[i].handle);
+  }
+  std::vector<float> gamma(3 * HD);
+  fill_deterministic(gamma, 0x5EEDA16Eu);
+  const std::vector<uint32_t> chunk = {HD, HD, HD};
+  for (uint32_t M : {64u, 7u}) {
+    SCOPED_TRACE("M=" + std::to_string(M));
+    std::vector<float> x(size_t(M) * K), cs(size_t(M) * 2 * HD);
+    fill_deterministic(x, 0x5EEDA16Fu);
+    for (uint32_t m = 0; m < M; ++m)
+      for (uint32_t j = 0; j < half; ++j) {
+        const float a = float(m + 3) * std::pow(10000.0f, -2.0f * j / HD);
+        cs[size_t(m) * 2 * HD + j] = cs[size_t(m) * 2 * HD + j + half] =
+          std::cos(a);
+        cs[size_t(m) * 2 * HD + HD + j] =
+          cs[size_t(m) * 2 * HD + HD + j + half] = std::sin(a);
+      }
+    std::vector<float> got(size_t(M) * 4 * HD, -1.0f);
+    ASSERT_EQ(nntr_hvx_mm_u8i4_layer_norm(
+                handle_, M, K, eps, nullptr, 0, chunk.data(), 3, gamma.data(),
+                static_cast<int>(gamma.size()), HD, 2u, cs.data(),
+                static_cast<int>(cs.size()), hs.data(), 3, x.data(),
+                static_cast<int>(x.size()), got.data(),
+                static_cast<int>(got.size())),
+              AEE_SUCCESS);
+    size_t off = 0;
+    for (int i = 0; i < 3; ++i) {
+      std::vector<float> want(size_t(M) * Ns[i]);
+      a16_reference(ws[i].q_w, ws[i].d, ws[i].colsum, ws[i].bias, x.data(), M,
+                    K, Ns[i], s, zp, want.data());
+      const float *g = gamma.data() + size_t(i) * HD;
+      for (uint32_t m = 0; m < M; ++m)
+        for (uint32_t h = 0; h < Ns[i] / HD; ++h) {
+          float *y = want.data() + size_t(m) * Ns[i] + size_t(h) * HD;
+          double ss = 0.0;
+          for (uint32_t j = 0; j < HD; ++j)
+            ss += double(y[j]) * y[j];
+          const float r = float(1.0 / std::sqrt(ss / HD + eps));
+          for (uint32_t j = 0; j < HD; ++j)
+            y[j] = y[j] * r * g[j];
+          if (i == 2)
+            continue;
+          const float *c = cs.data() + size_t(m) * 2 * HD;
+          for (uint32_t j = 0; j < half; ++j) {
+            const float a = y[j], b = y[j + half];
+            y[j] = a * c[j] - b * c[HD + j];
+            y[j + half] = a * c[HD + j] + b * c[j];
+          }
+        }
+      EXPECT_EQ(
+        a16_mismatches(got.data() + off, want.data(), want.size(), 1e-3f), 0u)
+        << "handle " << i;
+      off += want.size();
+    }
+  }
+  for (const auto &w : ws)
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
+/**
  * @brief mm_u8i4_dense_ffn_ple against the calls it replaces: the dense
  *        FFN's moe_layer_norm_add, the gate's mm_u8i4_layer, GeGLU with the
  *        per-layer rows on the host, and mm_u8i4_layer_res_add on the
