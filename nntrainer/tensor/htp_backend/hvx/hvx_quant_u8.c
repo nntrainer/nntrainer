@@ -775,6 +775,15 @@ static void quant16_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   float *sc = c->scratch ? c->scratch + (size_t)i * 4u * c->k : NULL;
   for (uint32_t g = lo; g < hi; ++g) {
     const uint32_t m = 4u * g;
+#if defined(__hexagon__)
+    /** Worker 0 is the caller, whose weight DMA (issued just before this
+        quant to hide behind it) advances only while it polls. */
+    if (i == 0u) {
+      unsigned r;
+      asm volatile(" %0 = dmpoll" : "=r"(r) : : "memory");
+      (void)r;
+    }
+#endif
     if (c->x16 && c->x16_hd == c->k && !c->fixed) {
       pack16_rows_u16(c->x16 + (size_t)m * c->k, m, n_kt, c->k, c->out_lo,
                       c->out_hi);

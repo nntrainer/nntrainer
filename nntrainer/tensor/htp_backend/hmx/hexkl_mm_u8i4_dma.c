@@ -845,10 +845,10 @@ static void fc_pack_worker(uint32_t units, uint32_t u, void *ctx) {
 /** @brief Transfer one row band's two AH planes, returning its last DMA. */
 static uint32_t fc_dma_ah_band(uint8_t *dst, const uint8_t *src,
                                uint32_t plane_bytes, uint32_t band_bytes,
-                               uint32_t band) {
+                               uint32_t band, uint32_t planes) {
   const uint32_t row = dma_row_size_dividing(band_bytes);
   uint32_t ready = 0;
-  for (uint32_t p = 0; p < 2u; ++p) {
+  for (uint32_t p = 0; p < planes; ++p) {
     const size_t off = (size_t)p * plane_bytes + (size_t)band * band_bytes;
     ready = hexkl_dma_ring_next_idx();
     hexkl_dma_ring_push2d(dst + off, src + off, row, row, row, band_bytes / row,
@@ -1138,9 +1138,15 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                       vtcm_base + act_hi_off};
   hvx_bg_job pack_job = {0};
   uint8_t *pack_done = out_i32 && !input_ah ? calloc(m_pad / 4u, 1) : NULL;
+  /** A prepacked activation arrives in row-block bands like input_ah's: the
+      first ahead of the weights, the rest behind them, each waited for by
+      the row block that reads it. One drain of all of it (3 MB for the
+      dense down at 256 rows) sat exposed at 85 us a call. */
+  const int act_bands = !input_ah && !out_i32 && o->act_ah_prepacked != NULL;
   uint32_t *input_ready =
-    input_ah ? malloc(n_rblocks * sizeof(uint32_t)) : NULL;
-  if ((out_i32 && !input_ah && !pack_done) || (input_ah && !input_ready)) {
+    input_ah || act_bands ? malloc(n_rblocks * sizeof(uint32_t)) : NULL;
+  if ((out_i32 && !input_ah && !pack_done) ||
+      ((input_ah || act_bands) && !input_ready)) {
     free(pack_done);
     free(input_ready);
     free(loc_scale);
@@ -1155,7 +1161,10 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   uint32_t weight_ready[2][8];
   if (input_ah)
     input_ready[0] =
-      fc_dma_ah_band(vtcm_base + act_off, input_ah, act_bytes, 64u * K, 0);
+      fc_dma_ah_band(vtcm_base + act_off, input_ah, act_bytes, 64u * K, 0, 2u);
+  if (act_bands)
+    input_ready[0] = fc_dma_ah_band(vtcm_base + act_off, o->act_ah_prepacked,
+                                    act_bytes, 64u * K, 0, n_sweeps);
 
   /** Issue handle 0's weight transfer HERE, before the activation is
      quantized, and wait for it after. The quantization needs no weight and
@@ -1177,27 +1186,17 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     // The first activation band precedes the first weights. Later bands
     // arrive while HMX consumes the first band, before later weight panels.
     for (uint32_t rb = 1; rb < n_rblocks; ++rb)
-      input_ready[rb] =
-        fc_dma_ah_band(vtcm_base + act_off, input_ah, act_bytes, 64u * K, rb);
+      input_ready[rb] = fc_dma_ah_band(vtcm_base + act_off, input_ah, act_bytes,
+                                       64u * K, rb, 2u);
   } else if (out_i32) {
     hvx_worker_pool_submit_bg(o->pool, &pack_job);
-  } else if (o->act_ah_prepacked != NULL) {
+  } else if (act_bands) {
     // The caller already quantized and AH-tile-packed the activation (see
-    // hexkl_mm_opts.h's doc on this field) -- DMA the bytes into VTCM the
-    // same way a weight tile lands there, instead of quantizing act_f32
-    // (which may be NULL here; there is nothing left in it to quantize).
-    // act_bytes was sized exactly m_pad*K above for this same region.
-    // Charged to DRAIN, not QUANT: this is a DMA wait, not compute, and
-    // the whole point of this path is that QUANT should read ~0.
-    // a16: both planes, low then high, as they sit in VTCM.
-    const uint32_t all = n_sweeps * act_bytes;
-    const uint32_t rs = dma_row_size_dividing(all);
-    hexkl_dma_ring_push2d(vtcm_base + act_off, o->act_ah_prepacked, rs, rs, rs,
-                          all / rs, /*src_vtcm=*/0,
-                          /*dst_vtcm=*/1);
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+    // hexkl_mm_opts.h's doc on this field): its later bands DMA in behind
+    // the first weights, as input_ah's do. a16: both planes of each band.
+    for (uint32_t rb = 1; rb < n_rblocks; ++rb)
+      input_ready[rb] = fc_dma_ah_band(vtcm_base + act_off, o->act_ah_prepacked,
+                                       act_bytes, 64u * K, rb, n_sweeps);
   } else {
     HEXKL_PROBE_T0(p0);
     if (o->act16) {
@@ -1306,7 +1305,12 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // this is where the wait for it lands. With one handle -- every MoE
   // expert call -- there is no next weight to prefetch it behind, so
   // overlapping it with the quant is the only cover available.
-  if (!out_i32) {
+  if (act_bands) {
+    /* the first band and panel 0's weights, not the later bands */
+    HEXKL_PROBE_T0(p0);
+    hexkl_dma_ring_wait(weight_ready[0][panel_handles - 1u]);
+    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+  } else if (!out_i32) {
     HEXKL_PROBE_T0(p0);
     hexkl_dma_ring_drain();
     HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
@@ -1338,6 +1342,11 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           hvx_worker_pool_wait_bg(o->pool, &pack_job, (rb + 1u) * 16u);
           HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
         }
+      }
+      if (act_bands && first == 0u && rb > 0u) {
+        HEXKL_PROBE_T0(p0);
+        hexkl_dma_ring_wait(input_ready[rb]);
+        HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
       }
       size_t head_out = out_off;
       for (uint32_t ph = 0; ph < heads; ++ph) {
@@ -1426,6 +1435,16 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                   }
                 }
               }
+#if defined(__hexagon__)
+              /** The next panel's weight DMA advances only while this
+                  thread polls: it stops at each page whose translation it
+                  lacks until a dmpoll or dmwait services the miss. Without
+                  this the whole transfer ran in the drain below, after the
+                  compute it was meant to hide behind (a 2.36 MB gate_up
+                  panel: 56 us in the drain, the same with 150 us of idle
+                  spin before it, 0 with dmpoll in that spin). */
+              hexkl_dma_poll();
+#endif
               HEXKL_PROBE_T0(p0);
               const uint32_t slot_off =
                 stage_off + (sw * acc_tiles + (out_i32 ? stage_used : 0u) + j) *

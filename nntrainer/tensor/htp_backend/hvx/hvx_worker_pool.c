@@ -37,6 +37,20 @@ static inline void hvx_worker_pool_pause(void) {
 #endif
 }
 
+/** @brief The calling thread's spin while workers run: the pause above, and
+ *         a dmpoll for its own DMA engine. A transfer the caller queued
+ *         (a weight prefetch) stops at each page it has no translation for
+ *         until its thread polls, so a caller that only paused here left
+ *         it stalled for the whole wait. */
+static inline void hvx_worker_pool_caller_pause(void) {
+#if defined(__hexagon__)
+  unsigned r;
+  asm volatile(" %0 = dmpoll" : "=r"(r) : : "memory");
+  (void)r;
+#endif
+  hvx_worker_pool_pause();
+}
+
 /** @brief Per-worker stack. The tail-block units (hvx_gemm_u8i4_wh.c and
  *         the epilogues they call) keep a dozen HVX vectors live, so 32 KB
  *         rather than the 16 the quant kernels needed. */
@@ -294,7 +308,7 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) {
     return;
   }
   while (atomic_load_explicit(&pool->barrier, memory_order_relaxed) > 0) {
-    hvx_worker_pool_pause();
+    hvx_worker_pool_caller_pause();
   }
   atomic_thread_fence(memory_order_acquire);
   pool->outstanding = 0;
@@ -464,7 +478,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   func(n, 0, ctx); // the calling thread is worker 0
 
   while (atomic_load_explicit(&pool->barrier, memory_order_relaxed) > 0) {
-    hvx_worker_pool_pause();
+    hvx_worker_pool_caller_pause();
   }
   // Pairs with each worker's release store to barrier: makes every
   // worker's writes to ctx visible to the calling thread from here on.
