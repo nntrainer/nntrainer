@@ -125,6 +125,15 @@ int hvx_rmsnorm_rows_ld_f32(const float *x, float *y, uint32_t M, uint32_t n,
   return 0;
 }
 
+/** @brief Asks L2 for one row of @a bytes at @a p: [47:32] stride, [31:16]
+ *         width, [15:0] height. A hint, it moves no bits. The add passes
+ *         below stream rows from DDR, and without it each thread stalls on
+ *         every line it misses. */
+static inline void row_l2fetch(const void *p, uint32_t bytes) {
+  Q6_l2fetch_AP((void *)p,
+                ((uint64_t)bytes << 32) | ((uint64_t)bytes << 16) | 1u);
+}
+
 typedef struct {
   float *out;
   const float *res; /**< the residual, or NULL when it is out itself */
@@ -146,6 +155,12 @@ static void add_worker(uint32_t n_threads, uint32_t i, void *v) {
     HVX_UVector *vo = (HVX_UVector *)(c->out + (size_t)r * c->n);
     const HVX_UVector *vres =
       c->res ? (const HVX_UVector *)(c->res + (size_t)r * c->n) : vo;
+    if (r + 1u < hi) { /* the next row's inputs, while this one computes */
+      row_l2fetch(vx + nvec, c->n * 4u);
+      row_l2fetch(vres + nvec, c->n * 4u);
+      if (vx2)
+        row_l2fetch(vx2 + nvec, c->n * 4u);
+    }
     /* Pass 1: the sum of squares of the summed addend, as norm_chunk. */
     HVX_Vector acc = Q6_V_vzero();
     for (uint32_t k = 0; k < nvec; ++k) {
@@ -205,6 +220,11 @@ static void addb_worker(uint32_t n_threads, uint32_t i, void *v) {
   const uint32_t hi = (uint32_t)(((uint64_t)c->M * (i + 1u)) / n_threads);
   const HVX_Vector vs = hvx_splat_sf(c->scale);
   for (uint32_t r = lo; r < hi; ++r) {
+    if (r + 1u < hi) { /* as add_worker; three queue per thread at most */
+      row_l2fetch(c->res + (size_t)(r + 1u) * c->n, c->n * 4u);
+      for (uint32_t b = 0; b < c->n_blk && b < 2u; ++b)
+        row_l2fetch(c->xb[b] + (size_t)(r + 1u) * c->cols[b], c->cols[b] * 4u);
+    }
     HVX_Vector acc = Q6_V_vzero();
     for (uint32_t b = 0; b < c->n_blk; ++b) {
       const HVX_UVector *vx =
