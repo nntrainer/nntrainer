@@ -34,6 +34,13 @@
  * result -- as it is resident. The score and P' rows of a block stay
  * whole: the softmax is the same two-pass one, nothing is rescaled.
  *
+ * Streamed in pairs (pairs != 0, when an even number of query heads share
+ * each KV head): two items of one block and two query heads of one KV head
+ * share every K^T chunk and V slice, so the K/V traffic halves. The pipeline
+ * then runs a pair a stage: four score slots (the pair on HMX and the pair
+ * in the softmax), one of P', output and Q tiles, four of the per-head
+ * constants (a pair's heads and the next pair's).
+ *
  * Plain arithmetic.
  */
 
@@ -138,11 +145,15 @@ typedef struct {
   uint32_t dt;         /**< head_dim / 32 */
   uint32_t pv_shift;   /**< s: the PV readout is floor(acc / 2^s) as int24,
                             so 127 * 255 * 32 n_blk >> s fits */
+  uint32_t pairs;      /**< streamed: two items share each K/V transfer */
 } hexkl_attn_q2_layout;
 
 /** @brief Bias blocks in the cvt region: 3 QK blocks per head parity and
  *         3 PV blocks, padded to a 2 KiB multiple. */
 #define HEXKL_ATTN_Q2_CVT_BLOCKS 10u
+/** @brief Per-head constant slots (QK bias blocks, zero-point corrections)
+ *         of the layout: by head parity, or by head mod 4 in pairs. */
+#define HEXKL_ATTN_Q2_HEAD_SLOTS(L) ((L)->pairs ? 4u : 2u)
 /** @brief Softmax scratches: one per worker sharing a block's softmax. */
 #define HEXKL_ATTN_Q2_SMX_PARTS 3u
 #define HEXKL_ATTN_Q2_SMX_BYTES                                                \
@@ -218,12 +229,18 @@ static inline uint32_t hexkl_attn_q2_layout_rest(const hexkl_attn_f16_shape *s,
                                                  uint32_t off) {
   const uint32_t TB = HEXKL_ATTN_Q2_TILE;
   const uint32_t dt = L->dt, n_blk = L->n_blk;
+  /** pairs: Q tiles of one pair, scores of two pairs (slot 2 (u % 2) + e),
+     row sums likewise */
+  const uint32_t q_slots = L->pairs ? 2u : HEXKL_ATTN_Q2_Q_SLOTS;
+  const uint32_t s_slots = L->pairs ? 4u : HEXKL_ATTN_Q2_SLOTS;
+  const uint32_t rs_slots = L->pairs ? 4u : HEXKL_ATTN_Q2_Q_SLOTS;
+  const uint32_t h_slots = HEXKL_ATTN_Q2_HEAD_SLOTS(L);
   L->q_u16 = off;
   off += 2u * HEXKL_ATTN_Q2_ROWS * s->head_dim * 2u;
   L->q_ah = off;
-  off += HEXKL_ATTN_Q2_Q_SLOTS * 2u * dt * TB;
+  off += q_slots * 2u * dt * TB;
   L->s16 = off;
-  off += HEXKL_ATTN_Q2_SLOTS * n_blk * HEXKL_ATTN_Q2_TILE16;
+  off += s_slots * n_blk * HEXKL_ATTN_Q2_TILE16;
   L->planes = off;
   off += HEXKL_ATTN_Q2_PLANES * HEXKL_CVT_PLANE_BYTES;
   L->p_ah = off;
@@ -231,11 +248,11 @@ static inline uint32_t hexkl_attn_q2_layout_rest(const hexkl_attn_f16_shape *s,
   L->o32 = off;
   off += HEXKL_ATTN_Q2_SLOTS * dt * HEXKL_ATTN_Q2_TILE32;
   L->rs = off;
-  off += HEXKL_ATTN_Q2_Q_SLOTS * HEXKL_ATTN_Q2_RS_BYTES;
+  off += rs_slots * HEXKL_ATTN_Q2_RS_BYTES;
   L->corr = off;
-  off += 2u * L->corr_bytes;
+  off += h_slots * L->corr_bytes;
   L->cvt = off;
-  off += HEXKL_ATTN_Q2_CVT_BLOCKS * HEXKL_CVT_BLOCK_BYTES;
+  off += hexkl_attn_round_up((3u * h_slots + 3u) * HEXKL_CVT_BLOCK_BYTES, TB);
   L->smx = off;
   off += HEXKL_ATTN_Q2_SMX_PARTS * HEXKL_ATTN_Q2_SMX_BYTES;
   L->total = off;
@@ -249,6 +266,7 @@ hexkl_attn_q2_layout_resident(const hexkl_attn_f16_shape *s,
                               hexkl_attn_q2_layout *L, uint32_t bufs) {
   L->stream = 0;
   L->v_slice = 0;
+  L->pairs = 0;
   L->n_kv_bufs = bufs;
   L->kv_bytes =
     hexkl_attn_round_up(L->n_res * L->dt * 1024u, HEXKL_ATTN_Q2_TILE);
@@ -257,13 +275,15 @@ hexkl_attn_q2_layout_resident(const hexkl_attn_f16_shape *s,
   return hexkl_attn_q2_layout_rest(s, L, 2u * bufs * L->kv_bytes);
 }
 
-/** @brief Streamed layout with K^T chunks of @a kc column tiles (after the
- *         geometry); returns its total bytes. */
+/** @brief Streamed layout with K^T chunks of @a kc column tiles, in pairs
+ *         when @a pairs (after the geometry); returns its total bytes. */
 static inline uint32_t
 hexkl_attn_q2_layout_stream(const hexkl_attn_f16_shape *s,
-                            hexkl_attn_q2_layout *L, uint32_t kc) {
+                            hexkl_attn_q2_layout *L, uint32_t kc,
+                            uint32_t pairs) {
   const uint32_t TB = HEXKL_ATTN_Q2_TILE;
   L->stream = kc;
+  L->pairs = pairs;
   L->n_kv_bufs = 1;
   L->kv_bytes = hexkl_attn_round_up(kc * L->dt * 1024u, TB);
   L->v_slice = hexkl_attn_round_up(L->n_blk * 1024u, TB);
@@ -275,7 +295,9 @@ hexkl_attn_q2_layout_stream(const hexkl_attn_f16_shape *s,
 /**
  * @brief Lays the regions out and checks them against the arena. Tries
  *        two resident K/V buffers first, then one, then streamed K/V with
- *        the largest K^T chunk that fits.
+ *        the largest K^T chunk that fits: in pairs when a KV head has an
+ *        even number of query heads and the call more than one row (a
+ *        decode row folds its heads instead), else one item at a time.
  *
  * @param arena_top  first byte NOT available
  * @param n_parts    softmax parts the kernel will run (>= 1)
@@ -294,12 +316,17 @@ static inline int hexkl_attn_q2_plan(const hexkl_attn_f16_shape *s,
   }
   const uint32_t kc0 =
     L->n_res < HEXKL_ATTN_Q2_KC_MAX ? L->n_res : HEXKL_ATTN_Q2_KC_MAX;
-  for (uint32_t kc = kc0; kc != 0; kc /= 2u) {
-    if (hexkl_attn_q2_layout_stream(s, L, kc) <= arena_top) {
-      return HEXKL_ATTN_OK;
+  const uint32_t G = s->n_head_q / s->n_head_kv;
+  for (uint32_t pairs = s->n_q > 1u && G % 2u == 0u ? 1u : 0u;; --pairs) {
+    for (uint32_t kc = kc0; kc != 0; kc /= 2u) {
+      if (hexkl_attn_q2_layout_stream(s, L, kc, pairs) <= arena_top) {
+        return HEXKL_ATTN_OK;
+      }
+    }
+    if (pairs == 0u) {
+      return HEXKL_ATTN_ENOMEM;
     }
   }
-  return HEXKL_ATTN_ENOMEM;
 }
 
 #ifdef __cplusplus
