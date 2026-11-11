@@ -143,7 +143,7 @@ if get_option('htp-inproc')
   nntrainer_link_whole += nntr_hvx_inproc
   nntrainer_link_args += '-Wl,--no-undefined'
 else
-  nntrainer_sources += nntr_hvx_stub_c
+  nntrainer_sources += meson.current_source_dir() / 'htp_stub_tunnel.c'
 endif
 nntrainer_inc_abs += meson.current_source_dir() / 'generated'
 nntrainer_inc += include_directories('generated')

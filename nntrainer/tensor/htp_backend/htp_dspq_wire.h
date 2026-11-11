@@ -33,6 +33,14 @@
  *  (op 0's width in f32), and with HTP_DSPQ_TOKEN_LOGITS buffer 1, the
  *  logits (vocab f32); S1's carries none. */
 #define HTP_DSPQ_OP_TOKEN 3u
+/** @brief Any FastRPC method of the skel without handles: {op, seq, sc,
+ *  len[in + out]} padded to 8 bytes, then each in buffer padded alike. A
+ *  len with bit 31 set is a reference instead: {arena, offset} in place of
+ *  the bytes, in and out (an out one is written there). The DSP runs it
+ *  through the skel's own dispatcher. Answered {seq, rc} and the inline
+ *  out buffers, padded alike (HTP_DSPQ_MAX_ROUT in all). */
+#define HTP_DSPQ_OP_INVOKE 4u
+#define HTP_DSPQ_MAX_ROUT (16u * 1024u)
 #define HTP_DSPQ_FLAG_TIMED 1u
 /** @brief OP_MOE: the call's act argument (gelu_tanh epilogue) is 1. */
 #define HTP_DSPQ_FLAG_GELU 2u
@@ -48,8 +56,11 @@
 /** @brief mm_u8i4_moe_layer_timed's slot count; both sides check theirs. */
 #define HTP_DSPQ_STAGES 31u
 #define HTP_DSPQ_MAX_MSG 4096u
-#define HTP_DSPQ_REQ_QUEUE_BYTES (16u * 1024u)
-#define HTP_DSPQ_RESP_QUEUE_BYTES (4u * 1024u)
+/** @brief The DSP's read buffer: OP_INVOKE's inline in buffers make it
+ *  the longest message. */
+#define HTP_DSPQ_MAX_INVOKE_MSG (32u * 1024u)
+#define HTP_DSPQ_REQ_QUEUE_BYTES (64u * 1024u)
+#define HTP_DSPQ_RESP_QUEUE_BYTES (40u * 1024u)
 /** @brief Each of the two queue-owned ION buffers (act, out). */
 #define HTP_DSPQ_BUF_BYTES (64u * 1024u)
 

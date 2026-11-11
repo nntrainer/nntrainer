@@ -4559,8 +4559,8 @@ private:
   }
 
   static constexpr uint32_t kNoIoArena = 0xFFFFFFFFu;
-  /** @brief The DSP arena of a staging buffer of act_pool_, out_pool_ or
-   *  x2_pool_ (the _io entries take their buffers by it): mapped and
+  /** @brief The DSP arena of a staging buffer (the _io entries and the
+   *  tunnel's references take their buffers by it): mapped and
    *  attached on first use, then held by a close hook that detaches and
    *  unmaps it; kNoIoArena when it cannot be (no rpcmem, the DSP's arena
    *  table full), and the call passes the buffer as an argument instead. */
@@ -4569,7 +4569,9 @@ private:
     if (it != io_arena_.end())
       return it->second;
     std::shared_ptr<HtpRpcBuffer> own;
-    for (StagingPool *pool : {&act_pool_, &out_pool_, &x2_pool_})
+    for (StagingPool *pool :
+         {&act_pool_, &out_pool_, &x2_pool_, &rope_pool_, &attn_q_pool_,
+          &attn_out_pool_, &tun_pool_[0], &tun_pool_[1]})
       for (auto &c : pool->by_class)
         if (c.second.get() == &b)
           own = c.second;
@@ -5258,6 +5260,9 @@ private:
   static bool dspqStop(DspqMoe &st) {
     if (st.state != DspqMoe::ON)
       return false;
+    std::lock_guard<std::mutex> lk(tunnel_mu_);
+    DspqMoe *self = &st;
+    tunnel_.compare_exchange_strong(self, nullptr);
     st.state = DspqMoe::OFF;
     const uint32_t quit[2] = {HTP_DSPQ_OP_QUIT, 0};
     st.api->write(st.q, 0, 0, nullptr, sizeof(quit),
@@ -5286,7 +5291,8 @@ private:
       std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
       e2e_       ? e2eSpinUs()
       : spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-                 : 1000u);
+      : tunnelEnabled() ? 0u // a spinning thread slows the prefill's calls
+                        : 1000u);
   }
 
   /** [#132 Part B E3] NNTR_HTP_E2E_SPIN_US (default 0): how long the DSP
@@ -5435,6 +5441,7 @@ private:
                size_t out_bytes, uint32_t glu, uint32_t *stage_us) {
     static_assert(HTP_MOE_N_STAGES == HTP_DSPQ_STAGES,
                   "htp_dspq_wire.h's stage count is the timed call's");
+    std::lock_guard<std::mutex> lk(tunnel_mu_); // the tunnel's calls share it
     DspqMoe &st = *dspq_;
     const uint32_t ne = static_cast<uint32_t>(h_gu.size());
     const uint32_t nr = static_cast<uint32_t>(row_index.size());
@@ -5515,6 +5522,187 @@ private:
     return resp.rc;
   }
 
+public:
+  /** @brief NNTR_HTP_DSPQ_TUNNEL=1: every stub call the queue can carry
+   *  rides it (tunnelInvoke), started at the first one; off under
+   *  NNTR_HTP_E2E (its token packets own the queue) and NNTR_HTP_DSPQ=0. */
+  static bool tunnelEnabled() {
+    static const bool on = [] {
+      const char *e = std::getenv("NNTR_HTP_DSPQ_TUNNEL");
+      const char *q = std::getenv("NNTR_HTP_DSPQ");
+      return e != nullptr && std::atoi(e) != 0 &&
+             (q == nullptr || std::atoi(q) != 0) && !HtpBackend::e2eRequested();
+    }();
+    return on;
+  }
+
+  /** @brief The queue on @a session, created now when no MoE call has. */
+  DspqMoe *tunnelStart(remote_handle64 session) {
+    if (!dspq_)
+      dspqCreate(session);
+    if (dspq_->state != DspqMoe::ON || dspq_->session != session)
+      return nullptr;
+    tunnel_.store(dspq_.get(), std::memory_order_release);
+    return dspq_.get();
+  }
+
+  /** @brief Buffers past this ride as an arena reference when they can. */
+  static constexpr size_t kTunnelInline = 2048;
+
+  /** @brief {arena, offset} of [p, p + n): a staging buffer's own arena
+   *  (attached on first use), or, for an in buffer from the heap (the
+   *  attention's K / V rows), a tunnel staging buffer it is copied into,
+   *  as FastRPC copies a non-ION one. Caller holds tunnel_mu_.
+   *  ponytail: two copies a call, 1 MiB each; past that, FastRPC */
+  bool tunnelArena(remote_handle64 session, const void *p, size_t n,
+                   uint32_t *id, uint32_t *off, unsigned *copies) {
+    const uint8_t *q = static_cast<const uint8_t *>(p);
+    for (StagingPool *pool :
+         {&act_pool_, &out_pool_, &x2_pool_, &rope_pool_, &attn_q_pool_,
+          &attn_out_pool_, &tun_pool_[0], &tun_pool_[1]})
+      for (auto &c : pool->by_class) {
+        if (!c.second) // stageInput's lookup of another pool leaves these
+          continue;
+        HtpRpcBuffer &b = *c.second;
+        const uint8_t *base = static_cast<const uint8_t *>(b.data());
+        if (q < base || q + n > base + b.size())
+          continue;
+        *id = ioArena(session, b);
+        *off = static_cast<uint32_t>(q - base);
+        return *id != kNoIoArena;
+      }
+    if (copies == nullptr || *copies >= 2 || n > (1u << 20))
+      return false;
+    HtpRpcBuffer &b = stage(tun_pool_[(*copies)++], n);
+    std::memcpy(b.data(), p, n);
+    *id = ioArena(session, b);
+    *off = 0;
+    return *id != kNoIoArena;
+  }
+
+  /** @brief The stub's remote_handle64_invoke (htp_stub_tunnel.c). A
+   *  method with no handles whose inline in buffers fit one packet
+   *  (HTP_DSPQ_MAX_INVOKE_MSG) and inline out buffers one response
+   *  (HTP_DSPQ_MAX_ROUT) goes as HTP_DSPQ_OP_INVOKE: the DSP runs it
+   *  through the skel's own dispatcher on the queue thread. Any other, the
+   *  lifecycle methods, and every call while the tunnel is off, through
+   *  FastRPC. Transport failures throw, as dspqCall's do. */
+  static int tunnelInvoke(remote_handle64 h, uint32_t sc, remote_arg *pra) {
+    const uint32_t n_in = REMOTE_SCALARS_INBUFS(sc);
+    const uint32_t n_out = REMOTE_SCALARS_OUTBUFS(sc);
+    const uint32_t n = n_in + n_out;
+    uint32_t mid = REMOTE_SCALARS_METHOD(sc);
+    if (mid == 31 && n_in >= 1 && pra[0].buf.nLen >= 4)
+      mid = *static_cast<const uint32_t *>(pra[0].buf.pv);
+    // open, close, arena (un)mapping, the queues' own start / stop, the
+    // mailbox and the token driver: FastRPC (the first ones start this)
+    static const std::set<uint32_t> fastrpc = {0,  1,  6,  7,  62, 63,
+                                               64, 65, 75, 77, 78};
+    HtpComputeOps *ops = static_cast<HtpComputeOps *>(get_htp_ops());
+    DspqMoe *st = tunnel_.load(std::memory_order_acquire);
+    static std::atomic<bool> started{false};
+    if (st == nullptr && tunnelEnabled() && fastrpc.count(mid) == 0 &&
+        !started.exchange(true))
+      st = ops->tunnelStart(h);
+    std::unique_lock<std::mutex> lk(tunnel_mu_, std::defer_lock);
+    bool fits = st != nullptr && st->session == h && n <= 32 &&
+                REMOTE_SCALARS_INHANDLES(sc) == 0 &&
+                REMOTE_SCALARS_OUTHANDLES(sc) == 0 && fastrpc.count(mid) == 0;
+    // a reference: bit 31 of the length word, {arena, offset} in place of
+    // the bytes; an out one comes back in its buffer, not the response
+    uint32_t ref[32][2];
+    uint32_t is_ref = 0;
+    unsigned copies = 0;
+    size_t in_w = 3u + n, out_w = 0;
+    in_w += in_w & 1u;
+    if (fits) {
+      lk.lock();
+      for (uint32_t i = 0; i < n; ++i) {
+        const size_t nb = pra[i].buf.nLen;
+        if (nb > kTunnelInline && nb < 0x80000000u &&
+            ops->tunnelArena(h, pra[i].buf.pv, nb, &ref[i][0], &ref[i][1],
+                             i < n_in ? &copies : nullptr)) {
+          is_ref |= 1u << i;
+          in_w += 2u;
+        } else {
+          (i < n_in ? in_w : out_w) += (nb + 7u) / 8u * 2u;
+        }
+      }
+      fits =
+        4u * in_w <= HTP_DSPQ_MAX_INVOKE_MSG && 4u * out_w <= HTP_DSPQ_MAX_ROUT;
+    }
+    if (!fits) {
+      if (lk.owns_lock())
+        lk.unlock();
+#ifdef NNTR_HTP_INPROC
+      return AEE_EUNSUPPORTED; // the in-process stub never comes here
+#else
+      return remote_handle64_invoke(h, sc, pra);
+#endif
+    }
+    if (st->broken)
+      throw std::runtime_error("dspq: the queue failed on an earlier call");
+    st->msg.assign(in_w, 0u);
+    uint32_t *w = st->msg.data();
+    w[0] = HTP_DSPQ_OP_INVOKE;
+    w[1] = ++st->seq;
+    w[2] = sc;
+    size_t off = 3u + n;
+    off += off & 1u;
+    for (uint32_t i = 0; i < n; ++i) {
+      w[3 + i] = static_cast<uint32_t>(pra[i].buf.nLen) | (is_ref >> i & 1u)
+                                                            << 31;
+      if (is_ref >> i & 1u) {
+        w[off] = ref[i][0];
+        w[off + 1] = ref[i][1];
+        off += 2u;
+      } else if (i < n_in) {
+        if (pra[i].buf.nLen != 0)
+          std::memcpy(w + off, pra[i].buf.pv, pra[i].buf.nLen);
+        off += (pra[i].buf.nLen + 7u) / 8u * 2u;
+      }
+    }
+    const HtpDspqApi &api = *st->api;
+    int err = api.write(st->q, 0, 0, nullptr, static_cast<uint32_t>(in_w * 4),
+                        reinterpret_cast<const uint8_t *>(w), kDspqTimeoutUs);
+    alignas(8) uint32_t resp[2 + HTP_DSPQ_MAX_ROUT / 4];
+    uint32_t flags = 0, rnb = 0, len = 0;
+    if (err == AEE_SUCCESS) {
+      const uint64_t t0 = HtpProfile::nowUs();
+      for (uint32_t spins = 1;; ++spins) {
+        err = api.read_noblock(st->q, &flags, 0, &rnb, nullptr, sizeof(resp),
+                               &len, reinterpret_cast<uint8_t *>(resp));
+        if (err != AEE_EWOULDBLOCK)
+          break;
+        if ((spins & 255u) == 0 &&
+            HtpProfile::nowUs() - t0 >= st->arm_spin_us) {
+          err = api.read(st->q, &flags, 0, &rnb, nullptr, sizeof(resp), &len,
+                         reinterpret_cast<uint8_t *>(resp), kDspqTimeoutUs);
+          break;
+        }
+      }
+    }
+    const int cb = st->cb_err.load();
+    if (err != AEE_SUCCESS || cb != 0 || len != 8u + 4u * out_w ||
+        resp[0] != st->seq || rnb != 0) {
+      st->broken = true;
+      throw std::runtime_error(
+        "dspq: invoke " + std::to_string(mid) + " seq " +
+        std::to_string(st->seq) + " failed: err=" + std::to_string(err) +
+        " cb_err=" + std::to_string(cb) + " len=" + std::to_string(len));
+    }
+    for (uint32_t i = n_in, o = 2; i < n; ++i) {
+      if (is_ref >> i & 1u)
+        continue;
+      if (pra[i].buf.nLen != 0)
+        std::memcpy(pra[i].buf.pv, resp + o, pra[i].buf.nLen);
+      o += (pra[i].buf.nLen + 7u) / 8u * 2u;
+    }
+    ++st->calls;
+    return static_cast<int>(resp[1]);
+  }
+
+private:
   struct E2eState; // [#132 Part B E3] defined with the members below
 
   /** @brief [#132 Part B E3, #211] The one-PD decode's ARM side: the token
@@ -8946,6 +9134,11 @@ private:
   StagingPool x2_pool_;       /**< the MoE call's post-FFN second addend */
   StagingPool attn_q_pool_;   /**< the row-blocked attention's f32 Q */
   StagingPool attn_out_pool_; /**< and its f32 output */
+  StagingPool tun_pool_[2];   /**< heap in buffers the tunnel copies */
+  /** @brief The queue the stub's calls ride, or null: FastRPC. */
+  static inline std::atomic<DspqMoe *> tunnel_{nullptr};
+  /** @brief One request on the queue at a time: the tunnel's and dspqCall's. */
+  static inline std::mutex tunnel_mu_;
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */
@@ -9404,5 +9597,13 @@ ComputeOps *get_htp_ops() {
 }
 
 } // namespace nntrainer
+
+#ifndef NNTR_HTP_INPROC
+extern "C" int nntr_htp_tunnel_remote_handle64_invoke(remote_handle64 h,
+                                                      uint32_t sc,
+                                                      remote_arg *pra) {
+  return nntrainer::HtpComputeOps::tunnelInvoke(h, sc, pra);
+}
+#endif
 
 #endif // ENABLE_HEXKL

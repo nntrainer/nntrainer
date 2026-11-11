@@ -138,6 +138,7 @@ SRCS="$SRCS $BACKEND/hvx/hvx_softmax_q.c $BACKEND/hmx/hexkl_attn_q2.c"
     -isystem "$HEXAGON_SDK_ROOT/ipc/fastrpc/incs" \
     $SRCS \
     "$HEXKL_LIB" \
+    -Wl,--wrap=compute_resource_hmx_lock,--wrap=compute_resource_hmx_unlock \
     -o build/libnntr_hvx_skel.so
 
 READELF="$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-readelf"

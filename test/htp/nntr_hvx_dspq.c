@@ -48,6 +48,7 @@
 #include <string.h>
 
 #include "dspqueue.h"
+#include "hexkl_micro.h"
 #include "htp_dspq_wire.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
@@ -74,8 +75,8 @@ struct nntr_hvx_dspq {
 
 /** @brief The request message, readable as u32 and as f32 (row_weight). */
 typedef union {
-  uint32_t u[HTP_DSPQ_MAX_MSG / 4];
-  float f[HTP_DSPQ_MAX_MSG / 4];
+  uint32_t u[HTP_DSPQ_MAX_INVOKE_MSG / 4];
+  float f[HTP_DSPQ_MAX_INVOKE_MSG / 4];
   htp_dspq_req_hdr h;
 } dspq_msg;
 
@@ -177,9 +178,98 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
                         DSPQUEUE_TIMEOUT_NONE);
 }
 
+/** @brief HMX for this thread, once: open locked it shared (build.sh's
+ *  wrap), so the queue thread can take it beside the FastRPC thread. */
+static int dspq_hmx(void) {
+  static int locked = 0; /* 1 on, -1 refused */
+  if (!locked) {
+    const int r = hexkl_micro_hmx_lock();
+    if (r != 0) {
+      FARF(ERROR, "dspq: hmx_lock 0x%x", (unsigned)r);
+    }
+    locked = r == 0 ? 1 : -1;
+  }
+  return locked > 0;
+}
+
+int nntr_hvx_skel_handle_invoke(remote_handle64 h, uint32_t sc,
+                                remote_arg *pra);
+
+/** @brief Answers one HTP_DSPQ_OP_INVOKE packet through the skel's
+ *  dispatcher, as FastRPC would have. @return dspqueue_write's code */
+static int dspq_invoke(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
+                       uint32_t nb) {
+  static uint32_t resp[2 + HTP_DSPQ_MAX_ROUT / 4] __attribute__((aligned(8)));
+  remote_arg pra[32];
+  resp[0] = len >= 8 ? m->u[1] : 0;
+  resp[1] = AEE_EBADPARM;
+  uint32_t rout = 0;
+  const uint32_t sc = len >= 12 ? m->u[2] : 0;
+  const uint32_t n_in = REMOTE_SCALARS_INBUFS(sc);
+  const uint32_t n_out = REMOTE_SCALARS_OUTBUFS(sc);
+  const uint32_t n = n_in + n_out;
+  uint32_t off = 3u + n; /* words */
+  off += off & 1u;
+  int ok = nb == 0 && len >= 12 && n <= 32 &&
+           REMOTE_SCALARS_INHANDLES(sc) == 0 &&
+           REMOTE_SCALARS_OUTHANDLES(sc) == 0 && 4u * off <= len;
+  uint32_t flush = 0; /* the references among the out buffers */
+  for (uint32_t i = 0; ok && i < n; ++i) {
+    const uint32_t b = m->u[3 + i], w = (b + 7u) / 8u * 2u;
+    if (b >> 31) {
+      /** {arena, offset}: a host staging buffer, read afresh from DDR (an
+       *  out one too: no stale line of it written back over it later) */
+      const uint32_t bytes = b & 0x7FFFFFFFu;
+      ok = 4u * (off + 2u) <= len && m->u[off] < NNTR_HVX_MAX_ARENAS;
+      const nntr_hvx_arena *a = ok ? &d->s->arenas[m->u[off]] : NULL;
+      ok = ok && a->va != NULL && (uint64_t)m->u[off + 1] + bytes <= a->bytes;
+      if (ok) {
+        pra[i].buf.pv = (uint8_t *)a->va + m->u[off + 1];
+        pra[i].buf.nLen = bytes;
+        qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv, bytes,
+                             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        flush |= (uint32_t)(i >= n_in) << i;
+      }
+      off += 2u;
+      continue;
+    }
+    if (i < n_in) {
+      ok = 4u * (off + w) <= len;
+      pra[i].buf.pv = (void *)&m->u[off];
+      off += w;
+    } else {
+      ok = 4u * (rout + w) <= HTP_DSPQ_MAX_ROUT;
+      pra[i].buf.pv = &resp[2 + rout];
+      rout += w;
+    }
+    pra[i].buf.nLen = b;
+  }
+  if (ok && dspq_hmx()) {
+    resp[1] =
+      (uint32_t)nntr_hvx_skel_handle_invoke((remote_handle64)d->s, sc, pra);
+    for (uint32_t i = 0; i < n; ++i) {
+      /** and no line of a reference left cached: the host rewrites these
+       *  bytes before the next call that reads them, by either path */
+      if (m->u[3 + i] >> 31) {
+        qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv, pra[i].buf.nLen,
+                             (flush >> i & 1u) ? QURT_MEM_CACHE_FLUSH_INVALIDATE
+                                               : QURT_MEM_CACHE_INVALIDATE,
+                             QURT_MEM_DCACHE);
+      }
+    }
+  } else {
+    ++d->bad;
+    rout = 0;
+  }
+  return dspqueue_write(d->q, 0, 0, NULL, 8u + 4u * rout, (const uint8_t *)resp,
+                        DSPQUEUE_TIMEOUT_NONE);
+}
+
 static void dspq_thread(void *arg) {
   struct nntr_hvx_dspq *d = (struct nntr_hvx_dspq *)arg;
-  dspq_msg m;
+  /** ponytail: static, so one queue thread per PD (the 32 KiB would crowd
+   *  its 64 KiB stack); a second session's queue needs it in the struct */
+  static dspq_msg m __attribute__((aligned(8)));
   uint64_t spin_until = 0; /* 0: block on the next read */
   while (!d->stop) {
     uint32_t flags = 0, nb = 0, len = 0;
@@ -212,8 +302,10 @@ static void dspq_thread(void *arg) {
     if (len >= 4 && m.u[0] == HTP_DSPQ_OP_QUIT && nb == 0) {
       break;
     }
-    if (len >= 4 && m.u[0] == HTP_DSPQ_OP_TOKEN) {
-      err = dspq_token(d, &m, len, nb, bufs);
+    if (len >= 4 &&
+        (m.u[0] == HTP_DSPQ_OP_TOKEN || m.u[0] == HTP_DSPQ_OP_INVOKE)) {
+      err = m.u[0] == HTP_DSPQ_OP_INVOKE ? dspq_invoke(d, &m, len, nb)
+                                         : dspq_token(d, &m, len, nb, bufs);
       if (err != AEE_SUCCESS) {
         FARF(ERROR, "dspq: write failed: 0x%08x", (unsigned)err);
         ++d->bad;

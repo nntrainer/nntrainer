@@ -47,6 +47,28 @@
 #pragma weak HAP_mem_get_stats
 
 /**
+ * @brief hexkl_micro_hmx_lock / _unlock bind HMX to the calling thread and
+ *        keep the context id to themselves; build.sh wraps their resource
+ *        manager calls into these, which lock it shared, so the dspqueue
+ *        thread can take it beside the FastRPC thread that opened.
+ *        ponytail: the shared lock leaves the timesharing to its users;
+ *        the host waits on each call, so two HMX calls never overlap. A
+ *        caller with two in flight would need a lock here.
+ */
+int __real_compute_resource_hmx_lock(unsigned int ctx);
+int __real_compute_resource_hmx_unlock(unsigned int ctx);
+int __wrap_compute_resource_hmx_lock(unsigned int ctx) {
+  return compute_resource_hmx_lock2
+           ? compute_resource_hmx_lock2(ctx, HAP_COMPUTE_RES_HMX_SHARED)
+           : __real_compute_resource_hmx_lock(ctx);
+}
+int __wrap_compute_resource_hmx_unlock(unsigned int ctx) {
+  return compute_resource_hmx_unlock2
+           ? compute_resource_hmx_unlock2(ctx, HAP_COMPUTE_RES_HMX_SHARED)
+           : __real_compute_resource_hmx_unlock(ctx);
+}
+
+/**
  * @brief [#178] The lite open's VTCM: the largest block the resource manager
  *        has left (HAP_query_avail_VTCM), acquired with no HMX and a 100 ms
  *        timeout; none at all is allowed (vtcm_size 0, feeds that need VTCM
