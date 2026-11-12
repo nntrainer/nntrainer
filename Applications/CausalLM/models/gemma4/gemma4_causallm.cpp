@@ -461,7 +461,13 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id) == "htp" &&
     (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) &&
     MOE_ENGINE == "htp";
-  if (block_on_htp)
+  // ... and with the dense FFN taking the add (out_add, below), that call
+  // is the sum's one reader too
+  const bool ffn_reads_sum =
+    !ENABLE_MOE_BLOCK && HIDDEN_SIZE_PER_LAYER_INPUT > 0 && o_folded &&
+    engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp" &&
+    engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id) == "htp";
+  if (block_on_htp || ffn_reads_sum)
     post_attn_props.push_back(withKey("out_to_host", "false"));
   keep_dense_out_ = block_on_htp;
   // ... and the layer's own output when the next layer's qkv and o-proj
@@ -519,6 +525,13 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     ple_slice = per_layer_input_slice();
   dense_out_add_ = ffn_adds;
   dense_ple_in_ = ple_fused ? &ple_slice : nullptr;
+  // ... and its output stays there when the next layer's qkv and o-proj
+  // calls are its readers (layer 0's goes to the CPU tail)
+  if (ple_fused && layer_id + 1 < NUM_LAYERS &&
+      !isKVSharedLayer(layer_id + 1) &&
+      engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id) == "htp" &&
+      engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id + 1) == "htp")
+    keep_dense_out_ = true;
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
   dense_out_add_ = false;
   dense_ple_in_ = nullptr;
@@ -833,8 +846,15 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   // q, k and v go to the attention core alone: on the same accelerator it
   // reads them where the projection call left them (host_view), so that
   // call keeps them (33.5 MB a 1024-row sliding layer not copied out)
-  // (a KV-shared layer reads another layer's k and v: not with those)
-  if (ATTENTION_ENGINE == "htp" && NUM_KV_SHARED_LAYERS == 0 &&
+  // (a KV-shared layer reads its source layer's k and v -- the last of its
+  // type before the shared ones: not with those)
+  bool kv_source = NUM_KV_SHARED_LAYERS > 0;
+  if (kv_source && !layer_types.empty()) {
+    const int first_shared = NUM_LAYERS - NUM_KV_SHARED_LAYERS;
+    for (int l = layer_id + 1; l < first_shared && kv_source; ++l)
+      kv_source = layer_types[l] != layer_types[layer_id];
+  }
+  if (ATTENTION_ENGINE == "htp" && !kv_source &&
       engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id) == "htp")
     qkv_params.push_back(withKey("out_to_host", "false"));
   appendSkipPrefillIfNeeded(qkv_params, is_kv_shared_layer);
