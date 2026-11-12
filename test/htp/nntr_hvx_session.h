@@ -134,6 +134,9 @@ typedef struct {
   float *ple_mid;       /**< mm_u8i4_dense_ffn_ple's gate rows and GeGLU
                              (M x n_ple, heap), freed in close() */
   uint32_t ple_mid_n;   /**< floats ple_mid holds */
+  const uint32_t *dense_next;   /**< the weight a dense FFN call's down hands
+                                     its first move to (hexkl_mm_opts.next_h),
+                                     set by the caller around it; NULL none */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
                        (nntr_hvx_token.c): the mailbox page and the
                        counters; NULL = none. Stopped in close() after the dspq

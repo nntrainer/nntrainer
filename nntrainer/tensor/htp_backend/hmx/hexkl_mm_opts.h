@@ -134,6 +134,14 @@ typedef struct {
   uint8_t *glu_lo, *glu_hi;
   const float *glu_enc;
   uint32_t glu_k, glu_act;
+
+  /** The handles of the layer call that comes next in the same entry, with
+      nothing but cached-memory work between (n_next 0: none). On the M <= 4
+      GEMV path this call's last run, which only computes, moves next_h[0]
+      into VTCM, and that call starts from it instead of a run that only
+      moves (hexkl_mm_u8i4_gemv_preload_drop). */
+  const uint32_t *next_h;
+  uint32_t n_next;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

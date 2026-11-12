@@ -137,6 +137,37 @@ int main(void) {
   reference(ws, 3, x, 1, K, want, 0.f);
   fail |= (rc != 0) | compare("M=1", got, want, N[0] + N[1] + N[2]);
 
+  /**
+   * M=1 chained (hexkl_mm_opts.next_h): the next call's first weight moved
+   * by this one's last run, into the idle buffer at 0 ({0,1} then {2}) and
+   * past the busy one ({0} then {1,2}, at handle 0's 33 KB buffer); then
+   * both with those 16 KB zeroed between, which must change the result or
+   * the chain never fired.
+   */
+  {
+    const uint32_t a2[1] = {2u}, a12[2] = {1u, 2u}, a01[2] = {0u, 1u};
+    const uint32_t *nx[2] = {a2, a12}, *pv[2] = {a01, handles};
+    const uint32_t n_pv[2] = {2u, 1u}, n_nx[2] = {1u, 2u};
+    for (int c = 0; c < 4; ++c) {
+      const int v = c & 1;
+      hexkl_mm_opts o = {0};
+      o.next_h = nx[v];
+      o.n_next = n_nx[v];
+      rc = hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K,
+                                   pv[v], n_pv[v], x, got, &o);
+      if (c >= 2)
+        memset(vtcm + (v ? 2u * 33u * 512u : 0u), 0, 16384u);
+      rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1,
+                                    K, nx[v], n_nx[v], x + K, got, NULL);
+      hexkl_mm_u8i4_gemv_preload_drop();
+      reference(ws + 3 - n_nx[v], n_nx[v], x + K, 1, K, want, 0.f);
+      const size_t n1 = v ? N[1] + N[2] : N[2];
+      const int bad =
+        compare(c >= 2 ? "M=1 chain, zeroed" : "M=1 chain", got, want, n1);
+      fail |= (rc != 0) | (c >= 2 ? !bad : bad);
+    }
+  }
+
   /* The per-head passes in the epilogue (hexkl_mm_opts.post_done): the
      norm of handles 0 and 2 and the rotation of handle 0 must give the
      bytes of the plain run with those passes made over it afterwards, and

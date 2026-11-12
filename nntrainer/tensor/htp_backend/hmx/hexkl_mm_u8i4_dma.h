@@ -212,6 +212,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             float *out_cat, const hexkl_mm_opts *opts);
 
 /**
+ * @brief Forgets the weight a layer call moved for the next one
+ *        (hexkl_mm_opts.next_h). An entry that passes next_h calls this
+ *        before it returns, so no later entry, whose VTCM may have been
+ *        written in between, starts from those bytes.
+ */
+void hexkl_mm_u8i4_gemv_preload_drop(void);
+
+/**
  * @brief Integer-only FC: asymmetric UINT16 x symmetric INT4 -> INT32.
  * Activation is row-major M x K with one fixed encoding for the tensor;
  * K is a multiple of 64. Output consists of concatenated M x N_i blocks.

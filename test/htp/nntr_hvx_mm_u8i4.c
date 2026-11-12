@@ -1824,10 +1824,18 @@ static int dense_a16_run(nntr_hvx_session *s, uint32 M, uint32 K, uint32 inter,
     gopt.pre_gamma = s->moe_scratch.pre_gamma;
     gopt.pre_eps = s->moe_scratch.pre_eps;
   }
+  /* each gate_up's last run moves the down's first slice, and the last
+     down the caller's next weight (s->dense_next) */
+  gopt.next_h = h_dn;
+  gopt.n_next = n;
   for (uint32_t m0 = 0; m0 < M; m0 += step) {
     const uint32_t m = M - m0 < step ? M - m0 : step;
-    hexkl_mm_opts dopt = {
-      .pool = s->quant_pool, .out_off = dn_off, .out_ld = dn_ld};
+    const int last = m0 + m >= M && s->dense_next != NULL;
+    hexkl_mm_opts dopt = {.pool = s->quant_pool,
+                          .out_off = dn_off,
+                          .out_ld = dn_ld,
+                          .next_h = last ? s->dense_next : NULL,
+                          .n_next = last ? 1u : 0u};
     int rc = AEE_EUNSUPPORTED;
     if (m > DENSE_A16_GEMV_ROWS) {
       /* the gate_up epilogue writes the GLU as the down's two u16 planes at
@@ -1869,13 +1877,13 @@ static int dense_a16_run(nntr_hvx_session *s, uint32 M, uint32 K, uint32 inter,
         }
       }
     }
-    if (rc != AEE_SUCCESS) {
-      return rc;
+    if (rc == AEE_SUCCESS) {
+      rc = hexkl_mm_u8i4_layer_run(
+        &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, ki,
+        h_dn, n, dopt.act16 ? NULL : mid, out_f32 + (size_t)m0 * N_out, &dopt);
     }
-    rc = hexkl_mm_u8i4_layer_run(
-      &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, ki, h_dn,
-      n, dopt.act16 ? NULL : mid, out_f32 + (size_t)m0 * N_out, &dopt);
     if (rc != AEE_SUCCESS) {
+      hexkl_mm_u8i4_gemv_preload_drop();
       return rc;
     }
   }
@@ -2163,15 +2171,6 @@ int nntr_hvx_mm_u8i4_dense_ffn_ple(
          (unsigned)M, (unsigned)P);
     return AEE_EBADPARM;
   }
-  /* y: the dense FFN with its post-FFN norm and add, in out_f32 */
-  int rc = nntr_hvx_mm_u8i4_moe_layer_norm_add(
-    handle, M, K, inter, K, act, eps, 1.0f, pre_gamma, pre_gammaLen, NULL, 0,
-    gamma2, gamma2Len, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
-    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
-    act_f32Len, NULL, 0, out_f32, out_f32Len);
-  if (rc != AEE_SUCCESS) {
-    return rc;
-  }
   if (s->ple_mid_n < n) {
     free(s->ple_mid);
     s->ple_mid = (float *)memalign(128, (size_t)n * sizeof(float));
@@ -2181,28 +2180,42 @@ int nntr_hvx_mm_u8i4_dense_ffn_ple(
       return AEE_ENOMEMORY;
     }
   }
+  /* y: the dense FFN with its post-FFN norm and add, in out_f32; each of
+     its four matmuls moves the next one's first weight in its last run */
+  s->dense_next = &h_ple_gate;
+  int rc = nntr_hvx_mm_u8i4_moe_layer_norm_add(
+    handle, M, K, inter, K, act, eps, 1.0f, pre_gamma, pre_gammaLen, NULL, 0,
+    gamma2, gamma2Len, h_gate_up, h_gate_upLen, h_down, h_downLen, row_index,
+    row_indexLen, row_count, row_countLen, row_weight, row_weightLen, act_f32,
+    act_f32Len, NULL, 0, out_f32, out_f32Len);
+  s->dense_next = NULL;
   /* gelu_tanh(y . gate) * ple, in fc_rows_a_call chunks as the FC calls */
   const uint32_t step = fc_rows_a_call(s, K, &h_ple_gate, 1);
-  for (uint32_t m0 = 0; m0 < M; m0 += step) {
+  for (uint32_t m0 = 0; rc == AEE_SUCCESS && m0 < M; m0 += step) {
     const uint32_t m = M - m0 < step ? M - m0 : step;
+    const int last = m0 + m >= M;
     rc = hexkl_mm_u8i4_layer_run(
       &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, m, K,
       &h_ple_gate, 1u, out_f32 + (size_t)m0 * K, s->ple_mid + (size_t)m0 * P,
-      &(const hexkl_mm_opts){.pool = s->quant_pool});
-    if (rc != AEE_SUCCESS) {
-      return rc;
-    }
+      &(const hexkl_mm_opts){.pool = s->quant_pool,
+                             .next_h = last ? h_ple_proj : NULL,
+                             .n_next = last ? (uint32_t)h_ple_projLen : 0u});
   }
-  if (hvx_glu_rows_sep_f32(s->ple_mid, P, ple, P, s->ple_mid, P, M, P, 1,
+  if (rc == AEE_SUCCESS &&
+      hvx_glu_rows_sep_f32(s->ple_mid, P, ple, P, s->ple_mid, P, M, P, 1,
                            s->quant_pool) != 0) {
-    return AEE_EBADPARM;
+    rc = AEE_EBADPARM;
   }
   /* out = ple_scale * (y + rmsnorm(mid . proj) * ple_gamma), y read in
      place */
-  return layer_res_add_impl(s, M, P, eps, ple_scale, ple_gamma, ple_gammaLen,
-                            h_ple_proj, h_ple_projLen, s->ple_mid, NULL, NULL,
-                            0u, (int)n, out_f32, out_f32Len, out_f32,
-                            out_f32Len);
+  if (rc == AEE_SUCCESS) {
+    rc =
+      layer_res_add_impl(s, M, P, eps, ple_scale, ple_gamma, ple_gammaLen,
+                         h_ple_proj, h_ple_projLen, s->ple_mid, NULL, NULL, 0u,
+                         (int)n, out_f32, out_f32Len, out_f32, out_f32Len);
+  }
+  hexkl_mm_u8i4_gemv_preload_drop();
+  return rc;
 }
 
 /** @brief The first @a floats floats of arena @a id, or NULL when the arena

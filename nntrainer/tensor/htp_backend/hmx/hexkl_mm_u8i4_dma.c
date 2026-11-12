@@ -601,6 +601,17 @@ static void fc_row_post(void *v, float *seg, uint32_t row) {
   }
 }
 
+/** @brief The weight a call's last run moved for the next call
+ *         (hexkl_mm_opts.next_h): handle h at VTCM offset x, that call's
+ *         double buffer {x, y} for its widest weight of wb bytes. The move
+ *         was waited for in the run, so no DMA is in flight. */
+static struct {
+  uint32_t h, wb, x, y;
+  int live;
+} g_gemv_pre;
+
+void hexkl_mm_u8i4_gemv_preload_drop(void) { g_gemv_pre.live = 0; }
+
 #ifndef NNTR_HVX_NO_M1_GEMV
 /** @brief Rows up to which a layer call takes the HVX GEMV instead of a
  *         64-row HMX block: the decode row, and a small batch. */
@@ -698,6 +709,48 @@ static void layer_gemv_run_worker(uint32_t n, uint32_t i, void *v) {
 }
 
 /**
+ * @brief Where the call after this one (@a o next_h) finds its first weight
+ *        when this call's last run, which computes from [@a busy, @a busy +
+ *        @a wb_max), moves it: its double buffer {*x, *y} for its widest
+ *        weight of *wb bytes, *x clear of the busy buffer.
+ * @return 0 when there is no next call, no room, or next_h is not in-use
+ *         4-bit handles of one K
+ */
+static int gemv_pre_plan(const hexkl_weight_u8i4_table *tbl,
+                         const hexkl_mm_opts *o, uint32_t arena, uint32_t busy,
+                         uint32_t wb_max, uint32_t *wb, uint32_t *x,
+                         uint32_t *y) {
+  if (o->next_h == NULL || o->n_next == 0u) {
+    return 0;
+  }
+  uint32_t K = 0, nt = 0;
+  for (uint32_t i = 0; i < o->n_next; ++i) {
+    const uint32_t h = o->next_h[i];
+    if (h >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[h].in_use ||
+        tbl->slots[h].bits == 2u ||
+        (i > 0u && tbl->slots[h].K != tbl->slots[o->next_h[0]].K)) {
+      return 0;
+    }
+    K = tbl->slots[h].K;
+    const uint32_t t = tbl->slots[h].N / HEXKL_HMX_INT8_BLOCK_N_COL;
+    nt = t > nt ? t : nt;
+  }
+  if (K % HEXKL_HMX_INT8_BLOCK_N_INNER != 0u) {
+    return 0;
+  }
+  *wb = K / HEXKL_HMX_INT8_BLOCK_N_INNER * nt * WEIGHT_TILE_BYTES_U8I4;
+  if (busy >= *wb && 2u * *wb <= arena) {
+    *x = 0u; /* [0, wb) is the other buffer, idle in the last run */
+    *y = *wb;
+    return 1;
+  }
+  /* past the busy buffer; y = 0 is written only once this call is done */
+  *x = busy + wb_max;
+  *y = 0u;
+  return *x >= *wb && (uint64_t)*x + *wb <= arena;
+}
+
+/**
  * @brief hexkl_mm_u8i4_layer_run for M <= LAYER_GEMV_MAX_ROWS: the rows on
  *        the HVX GEMV instead of a 64-row HMX block. A decode row otherwise
  *        pays the 63 padding rows three times: zeroing them in the
@@ -730,10 +783,17 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                           const hexkl_mm_opts *o, uint32_t wb_max) {
   const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
   const uint32_t act_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-  const uint32_t wbuf[2] = {0u, wb_max};
-  if (2u * wb_max > arena) {
+  /* handle 0 already in VTCM: the previous call's last run moved it */
+  const int pre =
+    g_gemv_pre.live && g_gemv_pre.h == handles[0] && g_gemv_pre.wb == wb_max;
+  g_gemv_pre.live = 0;
+  const uint32_t wbuf[2] = {pre ? g_gemv_pre.x : 0u,
+                            pre ? g_gemv_pre.y : wb_max};
+  if (!pre && 2u * wb_max > arena) {
     return AEE_ENOMEMORY;
   }
+  uint32_t pre_wb = 0, pre_x = 0, pre_y = 0;
+  int pre_next = 0;
   float loc_scale[LAYER_GEMV_MAX_ROWS];
   int32_t loc_zp[LAYER_GEMV_MAX_ROWS];
   const float *act_scale = o->act_scale ? o->act_scale : loc_scale;
@@ -781,16 +841,25 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   layer_gemv_job job;
   size_t out_off = 0;
   /* Run i moves handle i (into buffer i & 1) and computes handle i - 1:
-     n_handles + 1 runs, the first only a move, the last only a GEMV. */
-  for (uint32_t i = 0; i <= n_handles; ++i) {
+     n_handles + 1 runs, the first only a move (none when the previous call
+     made it), the last only a GEMV (and the next call's first move). */
+  for (uint32_t i = pre ? 1u : 0u; i <= n_handles; ++i) {
     run.dst = NULL;
     run.gemv = NULL;
+    const hexkl_weight_u8i4 *hn = NULL;
     if (i < n_handles) {
-      const hexkl_weight_u8i4 *hn = &tbl->slots[handles[i]];
+      hn = &tbl->slots[handles[i]];
       run.dst = vtcm_base + wbuf[i & 1u];
+    } else if (gemv_pre_plan(tbl, o, arena, wbuf[(n_handles - 1u) & 1u], wb_max,
+                             &pre_wb, &pre_x, &pre_y)) {
+      hn = &tbl->slots[o->next_h[0]];
+      run.dst = vtcm_base + pre_x;
+      pre_next = 1;
+    }
+    if (hn != NULL) {
       run.src = hn->wh_bytes;
       run.row = (hn->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
-      run.nrows = k_tiles;
+      run.nrows = hn->K / HEXKL_HMX_INT8_BLOCK_N_INNER;
       /* the MoE feed's rule (moe_weight_src_bypass): a host arena's bytes,
          or a heap image flushed at registration, have no dirty DSP line */
       run.bypass = hn->borrowed || hn->clean;
@@ -824,6 +893,13 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       rc = AEE_EFAILED;
       break;
     }
+  }
+  if (rc == AEE_SUCCESS && pre_next) {
+    g_gemv_pre.h = o->next_h[0];
+    g_gemv_pre.wb = pre_wb;
+    g_gemv_pre.x = pre_x;
+    g_gemv_pre.y = pre_y;
+    g_gemv_pre.live = 1;
   }
   free(act_own);
   return rc;
@@ -981,6 +1057,7 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     }
   }
 #endif
+  g_gemv_pre.live = 0; /* the HMX path below writes VTCM */
 
   // VTCM layout: activation (all row-bands, shared across every handle) |
   // weight double-buffer (sized for the widest handle) | TWO staging
