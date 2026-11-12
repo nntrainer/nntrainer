@@ -480,16 +480,6 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle post_attention_add(createLayer("residual_add", post_attn_props));
   Tensor post_attention = post_attention_add({input, att_out});
 
-  Tensor pre_ffn = post_attention;
-  if (is_kv_shared_layer) {
-    std::vector<std::string> pre_ffn_norm_props = {
-      withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm"),
-      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-    appendSkipPrefillIfNeeded(pre_ffn_norm_props, is_kv_shared_layer);
-    LayerHandle pre_ffn_norm(createLayer("rms_norm", pre_ffn_norm_props));
-    pre_ffn = pre_ffn_norm(post_attention);
-  }
-
   // post_attention + post_ffn_norm(ffn [+ moe]), then the layer scalar: one
   // residual_add, so the sum, the norm, the add and the scalar are one
   // accelerator call. With a per-layer input the scalar comes after that
@@ -498,8 +488,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   // ... and with neither the MoE block nor the scalar, the dense FFN's call
   // takes the norm and the add itself (out_add), its out_norm's gamma the
   // residual_add's in the file.
-  const bool ffn_adds =
-    !ENABLE_MOE_BLOCK && !fold_scalar && !is_kv_shared_layer;
+  const bool ffn_adds = !ENABLE_MOE_BLOCK && !fold_scalar;
   // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
   // [B, S, num_layers*hidden_size_per_layer_input]
   auto per_layer_input_slice = [&]() {
@@ -532,7 +521,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
       engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id) == "htp" &&
       engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id + 1) == "htp")
     keep_dense_out_ = true;
-  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, post_attention);
   dense_out_add_ = false;
   dense_ple_in_ = nullptr;
   if (ple_fused)
@@ -932,76 +921,25 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   // accelerator takes the block in one call with the GeGLU in its
   // epilogue; the same three weights in the file's order (gate, up, down),
   // so a model file is read identically, and on the CPU the same GEMMs.
-  // ponytail: a KV-shared layer keeps the three layers below, which carry
-  // skip_prefill; dense_ffn carries it too now, so they could be one call.
-  if (!is_kv_shared_layer) {
-    std::vector<std::string> ffn_props = {
-      withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
-      withKey("unit", curr_hidden_dim),
-      withKey("gate_first", "true"),
-      withKey("glu_activation", "tanh_gelu"),
-      withKey("in_norm", "true"),
-      withKey("out_norm",
-              ENABLE_MOE_BLOCK || dense_out_add_ ? "true" : "false"),
-      withKey("out_add", dense_out_add_ ? "true" : "false"),
-      withKey("ple_tail", dense_ple_in_ ? "true" : "false"),
-      withKey("epsilon", std::to_string(NORM_EPS)),
-      withKey("weight_dtype", FC_LAYER_DTYPE),
-      withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
-      withKey("engine", ffn_engine)};
-    appendSkipPrefillIfNeeded(ffn_props, isPrefillKVOnlyLayer(layer_id));
-    LayerHandle ffn(createLayer("dense_ffn", ffn_props));
-    if (dense_ple_in_)
-      return ffn({input, *dense_ple_in_});
-    return ffn(input);
-  }
-
-  std::vector<std::string> ffn_gate_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+  std::vector<std::string> ffn_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn"),
     withKey("unit", curr_hidden_dim),
-    withKey("disable_bias", "true"),
-    withKey("weight_initializer", "ones"),
+    withKey("gate_first", "true"),
+    withKey("glu_activation", "tanh_gelu"),
+    withKey("in_norm", "true"),
+    withKey("out_norm", ENABLE_MOE_BLOCK || dense_out_add_ ? "true" : "false"),
+    withKey("out_add", dense_out_add_ ? "true" : "false"),
+    withKey("ple_tail", dense_ple_in_ ? "true" : "false"),
+    withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("out_to_host", keep_dense_out_ ? "false" : "true"),
     withKey("engine", ffn_engine)};
-  appendSkipPrefillIfNeeded(ffn_gate_props, is_kv_shared_layer);
-  LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
-  Tensor gate = ffn_gate(input);
-
-  std::vector<std::string> ffn_gate_gelu_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate_gelu"),
-    withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(ffn_gate_gelu_props, is_kv_shared_layer);
-  LayerHandle ffn_gate_gelu(createLayer("activation", ffn_gate_gelu_props));
-  Tensor gate_gelu = ffn_gate_gelu(gate);
-
-  std::vector<std::string> ffn_up_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-    withKey("unit", curr_hidden_dim),
-    withKey("disable_bias", "true"),
-    withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE),
-    withKey("engine", ffn_engine)};
-  appendSkipPrefillIfNeeded(ffn_up_props, is_kv_shared_layer);
-  LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
-  Tensor up = ffn_up(input);
-
-  std::vector<std::string> ffn_geglu_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu")};
-  appendSkipPrefillIfNeeded(ffn_geglu_props, is_kv_shared_layer);
-  LayerHandle ffn_geglu(createLayer("multiply", ffn_geglu_props));
-  Tensor geglu = ffn_geglu({gate_gelu, up});
-
-  std::vector<std::string> ffn_down_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-    withKey("unit", dim),
-    withKey("disable_bias", "true"),
-    withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE),
-    withKey("engine", ffn_engine)};
-  appendSkipPrefillIfNeeded(ffn_down_props, is_kv_shared_layer);
-  LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
-
-  return ffn_down(geglu);
+  appendSkipPrefillIfNeeded(ffn_props, is_kv_shared_layer ||
+                                         isPrefillKVOnlyLayer(layer_id));
+  LayerHandle ffn(createLayer("dense_ffn", ffn_props));
+  if (dense_ple_in_)
+    return ffn({input, *dense_ple_in_});
+  return ffn(input);
 }
 
 void Gemma4Transformer::registerCustomLayers() {
