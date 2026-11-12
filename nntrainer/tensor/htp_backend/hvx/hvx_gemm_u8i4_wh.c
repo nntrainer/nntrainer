@@ -54,6 +54,21 @@ void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
 }
 
 /**
+ * @brief k-tiles ahead gemm_row1 dcfetches its activation row, and the
+ *        depth from which it does.
+ *
+ * Each k-tile's row is a new line (the AH tile stride), read with a scalar
+ * load the in-order thread stalls on. A lane with many columns re-hits
+ * those lines in L1; a deep, narrow weight -- the shared FFN's down,
+ * K = 12288 over 192-column slices, one column a lane -- misses on every
+ * one. S25 Ultra, Gemma-4 E2B decode: that down 7.3 -> 5.3 ms a token; at
+ * K = 1536 the fetch of lines already in L1 cost 2 ms, hence the gate (two
+ * planes of 256 lines no longer fit in L1).
+ */
+#define ROW1_ACT_LEAD 8u
+#define ROW1_ACT_PF_MIN_KT 256u
+
+/**
  * @brief Row r0 of one column alone: gemm_rows4's acc0 with the three
  *        other rows left out.
  *
@@ -70,11 +85,17 @@ static inline void gemm_row1(const uint8_t *act_ah, uint32_t r0,
                              uint32_t stride, int32_t *out) {
   const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
   HVX_Vector acc = Q6_V_vzero();
+  const uint32_t pf_end = k_tiles >= ROW1_ACT_PF_MIN_KT ? k_tiles : 0u;
   for (uint32_t kt = 0; kt < k_tiles; ++kt) {
     const uint8_t *tile = col + (size_t)kt * stride;
     const uint32_t *a0 =
       (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES +
                          r0 * AH_ROW_BYTES);
+#if defined(__hexagon__)
+    if (kt + ROW1_ACT_LEAD < pf_end) {
+      Q6_dcfetch_A((void *)(a0 + ROW1_ACT_LEAD * AH_TILE_BYTES / 4u));
+    }
+#endif
     for (uint32_t g = 0; g < 4u; ++g) {
       const HVX_Vector v = *(const HVX_UVector *)(tile + g * 128u);
       const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(v, 4), mask);

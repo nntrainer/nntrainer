@@ -714,8 +714,9 @@ static void layer_gemv_run_worker(uint32_t n, uint32_t i, void *v) {
  *
  * ponytail: on the S25 Ultra (v79) a narrow, deep weight -- the shared
  * down's 160-column slices at K = 12288 -- is ~3x slower on this GEMV than
- * on the HMX (6 x 256 columns: ~900 vs 276 us); the cause is not yet
- * found. Gate on the column tiles, or split K over the pool, there.
+ * on the HMX (6 x 256 columns: ~900 vs 276 us). Part of it was the
+ * activation's L1 misses, one a k-tile with one column a lane (gemm_row1's
+ * dcfetch); what remains, gate on the column tiles or split K over the pool.
  *
  * The int32 sums are the HMX's (hvx_gemm_u8i4_wh.h) and the dequant is the
  * per-tile one in the pipelined epilogue's order, so a row's f32 output is
