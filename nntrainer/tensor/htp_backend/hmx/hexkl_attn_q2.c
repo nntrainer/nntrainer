@@ -477,15 +477,19 @@ static void worker_job(uint32_t n_threads, uint32_t idx, void *arg) {
 
 /** @brief Pushes resident column tiles [c0, c0 + n_tiles) of kv head n's
  *         K^T and V into its buffer. */
+/** @brief K/V tiles are read around the L2: their writer, the append,
+ *         flushes them (hexkl_kv_q.c, kv_tiles_flush). */
+#define KV_SRC_BYPASS 1
+
 static void dma_push_tiles(ctx *c, uint32_t n, uint32_t c0, uint32_t n_tiles) {
   const hexkl_kv_q *kv = c->io->kv;
   const uint32_t row_bytes = c->dt * 1024u;
   const size_t src = hexkl_kv_q_tile_off(kv, n, c->res.lo + c0, 0);
   const size_t dst = (size_t)c0 * row_bytes;
   hexkl_dma_ring_push2d(kt_buf(c, n) + dst, kv->kt + src, row_bytes, row_bytes,
-                        row_bytes, n_tiles, 0, 1);
+                        row_bytes, n_tiles, KV_SRC_BYPASS, 1);
   hexkl_dma_ring_push2d(v_buf(c, n) + dst, kv->v + src, row_bytes, row_bytes,
-                        row_bytes, n_tiles, 0, 1);
+                        row_bytes, n_tiles, KV_SRC_BYPASS, 1);
 }
 
 static void dma_push(ctx *c, uint32_t n) { dma_push_tiles(c, n, 0, c->res.n); }
@@ -782,7 +786,7 @@ static uint32_t kt_chunk_push(ctx *c, uint32_t kvh, uint32_t t0, uint32_t n,
   const uint32_t idx = hexkl_dma_ring_next_idx();
   hexkl_dma_ring_push2d(kt_chunk(c, b),
                         kv->kt + hexkl_kv_q_tile_off(kv, kvh, t0, 0), row_bytes,
-                        row_bytes, row_bytes, n, 0, 1);
+                        row_bytes, row_bytes, n, KV_SRC_BYPASS, 1);
   return idx;
 }
 
@@ -795,7 +799,7 @@ static uint32_t v_slice_push(ctx *c, uint32_t kvh, uint32_t t0, uint32_t n,
   const uint32_t idx = hexkl_dma_ring_next_idx();
   hexkl_dma_ring_push2d(v_slice(c, b),
                         kv->v + hexkl_kv_q_tile_off(kv, kvh, t0, d), 1024u,
-                        c->dt * 1024u, 1024u, n, 0, 1);
+                        c->dt * 1024u, 1024u, n, KV_SRC_BYPASS, 1);
   return idx;
 }
 

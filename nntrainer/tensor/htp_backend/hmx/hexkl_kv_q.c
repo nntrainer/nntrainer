@@ -25,6 +25,9 @@
 #include <HAP_perf.h>
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
+#ifdef __hexagon__
+#include <qurt_memory.h>
+#endif
 static inline uint64_t kvq_now_us(void) { return HAP_perf_get_time_us(); }
 #else
 static inline uint64_t kvq_now_us(void) { return 0; }
@@ -158,6 +161,27 @@ int hexkl_kv_q_set_fixed_scales(hexkl_kv_q_table *tbl, uint32_t handle,
   return AEE_SUCCESS;
 }
 
+/**
+ * @brief Writes column tiles [c_lo, c_hi] of every head's K^T and V back to
+ *        memory. The attention kernels DMA them around the L2 (src bypass),
+ *        which reads memory and not a dirty DSP line; these tiles' only
+ *        writer is the append, so it flushes what it wrote.
+ */
+static void kv_tiles_flush(const hexkl_kv_q *kv, uint32_t c_lo, uint32_t c_hi) {
+#ifdef __hexagon__
+  for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+    const size_t off = hexkl_kv_q_tile_off(kv, n, c_lo, 0);
+    const size_t len = hexkl_kv_q_tile_off(kv, n, c_hi + 1u, 0) - off;
+    qurt_mem_cache_clean((qurt_addr_t)(kv->kt + off), (qurt_size_t)len,
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    qurt_mem_cache_clean((qurt_addr_t)(kv->v + off), (qurt_size_t)len,
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+  }
+#else
+  (void)kv, (void)c_lo, (void)c_hi;
+#endif
+}
+
 static void free_slot(hexkl_kv_q *kv) {
   free(kv->fs_k);
   free(kv->fs_v);
@@ -230,6 +254,7 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   }
   memset(kv->kt4, HEXKL_KV_Q_BIAS, values);
   memset(kv->v4, HEXKL_KV_Q_BIAS, values);
+  kv_tiles_flush(kv, 0, kv->n_col_tiles - 1u); /* calloc's zeros */
   for (size_t i = 0; i < rows; ++i) {
     kv->s_k[i] = 1.0f;
   }
@@ -553,6 +578,7 @@ static int append_fixed_i8(hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
       }
     }
   }
+  kv_tiles_flush(kv, c_lo, c_hi);
   return AEE_SUCCESS;
 }
 #else
@@ -729,11 +755,12 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
   if (st) {
     st->quant_us = (uint32_t)(kvq_now_us() - tq0);
   }
-  if (!vtcm_base || direct) {
-    return AEE_SUCCESS;
-  }
   const uint32_t c_lo = row0 / 32u;
   const uint32_t c_hi = (row0 + n_rows - 1u) / 32u;
+  if (!vtcm_base || direct) {
+    kv_tiles_flush(kv, c_lo, c_hi);
+    return AEE_SUCCESS;
+  }
   for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
     for (uint32_t c = c_lo; c <= c_hi; ++c) {
       const int rc = bake_col_tile(kv, n, c, vtcm_base, st);
@@ -742,6 +769,7 @@ int hexkl_kv_q_append_pool(hexkl_kv_q_table *tbl, uint32_t handle,
       }
     }
   }
+  kv_tiles_flush(kv, c_lo, c_hi);
   return AEE_SUCCESS;
 }
 
