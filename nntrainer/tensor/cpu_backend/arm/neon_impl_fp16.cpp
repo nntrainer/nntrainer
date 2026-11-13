@@ -1405,6 +1405,33 @@ inline static float16x8_t exp_f16x8(float16x8_t x) {
   return vcombine_f16(vcvt_f16_f32(res_low), vcvt_f16_f32(res_high));
 }
 
+inline static float16x8_t exp_f16x8_fast(float16x8_t x) {
+  constexpr __fp16 kLog2e = 1.442695041f; // log2(e)
+  // minimax 2^f on f in [0,1): 2^f ~= 1 + f*(kC1 + f*(kC2 + f*kC3))
+  constexpr __fp16 kC1 = 0.6930712f;
+  constexpr __fp16 kC2 = 0.2416384f;
+  constexpr __fp16 kC3 = 0.0516903f;
+  constexpr __fp16 kOne = 1.0f;
+  constexpr int16_t kExpBias = 15;      // fp16 exponent bias
+  constexpr int16_t kMantBits = 10;     // fp16 mantissa width (exponent shift)
+  constexpr int16_t kMaxBiasedExp = 31; // clamp upper bound (>= -> inf)
+
+  float16x8_t k = vmulq_f16(x, vdupq_n_f16(kLog2e));
+  float16x8_t n = vrndmq_f16(k);   // floor(k)
+  float16x8_t f = vsubq_f16(k, n); // frac [0,1)
+  float16x8_t p = vfmaq_f16(vdupq_n_f16(kC2), f, vdupq_n_f16(kC3));
+  p = vfmaq_f16(vdupq_n_f16(kC1), f, p);
+  p = vfmaq_f16(vdupq_n_f16(kOne), f, p);
+  // 2^n: biased fp16 exponent (n + bias), clamped to [0, 31] BEFORE the shift
+  // so a very negative n cannot wrap the sign bit into a bogus exponent (n <=
+  // -15 underflows to 0, n >= 16 saturates to inf). Clamping the shifted bits
+  // would be too late — the wrap already happened.
+  int16x8_t bias = vaddq_s16(vcvtq_s16_f16(n), vdupq_n_s16(kExpBias));
+  bias = vminq_s16(vmaxq_s16(bias, vdupq_n_s16(0)), vdupq_n_s16(kMaxBiasedExp));
+  float16x8_t pw = vreinterpretq_f16_s16(vshlq_n_s16(bias, kMantBits));
+  return vmulq_f16(p, pw);
+}
+
 // Static helper function for softmax_row_inplace with __fp16 sink
 // Includes handling of a "sink" token (attention sink)
 static void softmax_row_inplace_with_fp16_sink(__fp16 *qk_out, size_t start_row,
@@ -1554,11 +1581,72 @@ static void softmax_row_inplace_no_sink(__fp16 *qk_out, size_t start_row,
   delete[] sum_vals;
 }
 
+static void softmax_row_inplace_no_sink_opt(__fp16 *qk_out, size_t start_row,
+                                            size_t end_row, size_t num_heads) {
+  const size_t vec_end = num_heads & ~((size_t)7);
+
+  // 1. max per head (column) across rows
+  std::vector<__fp16> max_vals(num_heads), sum_vals(num_heads),
+    recip_vals(num_heads);
+  std::memcpy(max_vals.data(), qk_out + start_row * num_heads,
+              num_heads * sizeof(__fp16));
+  for (size_t r = start_row + 1; r < end_row; ++r) {
+    __fp16 *row = qk_out + num_heads * r;
+    for (size_t c = 0; c < vec_end; c += 8)
+      vst1q_f16(max_vals.data() + c,
+                vmaxq_f16(vld1q_f16(row + c), vld1q_f16(max_vals.data() + c)));
+    for (size_t c = vec_end; c < num_heads; ++c)
+      max_vals[c] = std::max(max_vals[c], row[c]);
+  }
+
+  // 2. exp(x - max) (native fp16) and sum per head; sum_vals starts at 0
+  for (size_t r = start_row; r < end_row; ++r) {
+    __fp16 *row = qk_out + num_heads * r;
+    for (size_t c = 0; c < vec_end; c += 8) {
+      float16x8_t s = vld1q_f16(sum_vals.data() + c);
+      float16x8_t e = exp_f16x8_fast(
+        vsubq_f16(vld1q_f16(row + c), vld1q_f16(max_vals.data() + c)));
+      vst1q_f16(row + c, e);
+      vst1q_f16(sum_vals.data() + c, vaddq_f16(s, e));
+    }
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      float e = std::exp((float)row[c] - (float)max_vals[c]);
+      row[c] = e;
+      sum_vals[c] += e;
+    }
+  }
+
+  // 3. reciprocal of the sum once per head (fp32, 2 Newton), then multiply
+  for (size_t c = 0; c < vec_end; c += 8) {
+    float16x8_t s = vld1q_f16(sum_vals.data() + c);
+    float32x4_t s0 = vcvt_f32_f16(vget_low_f16(s));
+    float32x4_t s1 = vcvt_f32_f16(vget_high_f16(s));
+    float32x4_t r0 = vrecpeq_f32(s0), r1 = vrecpeq_f32(s1);
+    r0 = vmulq_f32(vrecpsq_f32(s0, r0), r0);
+    r1 = vmulq_f32(vrecpsq_f32(s1, r1), r1);
+    r0 = vmulq_f32(vrecpsq_f32(s0, r0), r0);
+    r1 = vmulq_f32(vrecpsq_f32(s1, r1), r1);
+    vst1q_f16(recip_vals.data() + c,
+              vcombine_f16(vcvt_f16_f32(r0), vcvt_f16_f32(r1)));
+  }
+  for (size_t c = vec_end; c < num_heads; ++c)
+    recip_vals[c] = (__fp16)(1.0f / (float)sum_vals[c]);
+  for (size_t r = start_row; r < end_row; ++r) {
+    __fp16 *row = qk_out + num_heads * r;
+    for (size_t c = 0; c < vec_end; c += 8)
+      vst1q_f16(row + c, vmulq_f16(vld1q_f16(row + c),
+                                   vld1q_f16(recip_vals.data() + c)));
+    for (size_t c = vec_end; c < num_heads; ++c)
+      row[c] = (__fp16)((float)row[c] * (float)recip_vals[c]);
+  }
+}
+
 template <>
 void softmax_row_inplace(__fp16 *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, __fp16 *sink) {
   if (sink == nullptr) {
-    return softmax_row_inplace_no_sink(qk_out, start_row, end_row, num_heads);
+    return softmax_row_inplace_no_sink_opt(qk_out, start_row, end_row,
+                                           num_heads);
   } else {
     return softmax_row_inplace_with_fp16_sink(qk_out, start_row, end_row,
                                               num_heads, sink);
@@ -1852,6 +1940,119 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
   }
 }
 
+// --- compute_fp16vcache*transposed (P*V attention output) NEON helpers -----
+// Panel micro-kernel: the output panel (G query heads x PANEL cols) is kept in
+// registers while accumulating over the window, and each V chunk is loaded once
+// per (j, panel) and reused across the whole GQA group. The panel widens as G
+// shrinks (Q4/P8 = 16/G) so the accumulators stay ~16 vectors and V is read in
+// full cache lines. Per-output accumulation order matches the baseline kernels,
+// so results are bit-identical.
+template <int G, int Q4>
+static void vcache_f32_panel(int row_num, const float *in, const __fp16 *vcache,
+                             float *output, int num_cache_head, int head_dim,
+                             int start_j, int head_start, int head_end) {
+  const int panel = Q4 * 4;
+  const int dfull = (head_dim / panel) * panel;
+  for (int n = head_start; n < head_end; ++n) {
+    for (int d0 = 0; d0 < dfull; d0 += panel) {
+      float32x4_t acc[G][Q4];
+      for (int h = 0; h < G; ++h)
+        for (int q = 0; q < Q4; ++q)
+          acc[h][q] = vdupq_n_f32(0.0f);
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp =
+          vcache + ((size_t)j * num_cache_head + n) * head_dim + d0;
+        float32x4_t vv[Q4];
+        for (int q = 0; q < Q4; ++q)
+          vv[q] = vcvt_f32_f16(vld1_f16(vp + q * 4));
+        const float *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h) {
+          float32x4_t a = vdupq_n_f32(pb[h]);
+          for (int q = 0; q < Q4; ++q)
+            acc[h][q] = vfmaq_f32(acc[h][q], a, vv[q]);
+        }
+      }
+      for (int h = 0; h < G; ++h)
+        for (int q = 0; q < Q4; ++q)
+          vst1q_f32(&output[(size_t)(n * G + h) * head_dim + d0 + q * 4],
+                    acc[h][q]);
+    }
+    // 4-wide blocks then scalar remainder (fp32 accumulate over the window)
+    int d = dfull;
+    for (; d + 4 <= head_dim; d += 4) {
+      float32x4_t acc[G];
+      for (int h = 0; h < G; ++h)
+        acc[h] = vdupq_n_f32(0.0f);
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp = vcache + ((size_t)j * num_cache_head + n) * head_dim;
+        float32x4_t v = vcvt_f32_f16(vld1_f16(vp + d));
+        const float *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h)
+          acc[h] = vfmaq_f32(acc[h], vdupq_n_f32(pb[h]), v);
+      }
+      for (int h = 0; h < G; ++h)
+        vst1q_f32(&output[(size_t)(n * G + h) * head_dim + d], acc[h]);
+    }
+    if (d < head_dim) {
+      const int rem = head_dim - d;
+      float racc[G][4];
+      for (int h = 0; h < G; ++h)
+        for (int r = 0; r < rem; ++r)
+          racc[h][r] = 0.0f;
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp = vcache + ((size_t)j * num_cache_head + n) * head_dim;
+        const float *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h)
+          for (int r = 0; r < rem; ++r)
+            racc[h][r] += pb[h] * (float)vp[d + r];
+      }
+      for (int h = 0; h < G; ++h)
+        for (int r = 0; r < rem; ++r)
+          output[(size_t)(n * G + h) * head_dim + d + r] = racc[h][r];
+    }
+  }
+}
+
+void compute_fp16vcache_fp32_transposed_opt(int row_num, const float *in,
+                                            const __fp16 *vcache, float *output,
+                                            int num_cache_head, int gqa_size,
+                                            int head_dim,
+                                            size_t local_window_size,
+                                            int head_start, int head_end) {
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+  int start_j =
+    row_num < local_window_size ? 0 : row_num + 1 - local_window_size;
+  switch (gqa_size) {
+  case 1:
+    vcache_f32_panel<1, 16>(row_num, in, vcache, output, num_cache_head,
+                            head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 2:
+    vcache_f32_panel<2, 8>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 4:
+    vcache_f32_panel<4, 4>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 8:
+    vcache_f32_panel<8, 2>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  default: // uncommon gqa_size: fall back to the baseline kernel
+    compute_fp16vcache_fp32_transposed(row_num, in, vcache, output,
+                                       num_cache_head, gqa_size, head_dim,
+                                       local_window_size, head_start, head_end);
+    break;
+  }
+}
+
 // Function to compute the context vector by multiplying Attention Probabilities
 // (in) with Value Cache (vcache) Performs: Output = Attention_Probs *
 // Value_Cache
@@ -1936,6 +2137,194 @@ void compute_fp16vcache_transposed(int row_num, const __fp16 *in,
   }
 }
 
+// Panel micro-kernel for the all-fp16 P*V
+template <int G, int P8>
+static void vcache_f16_panel(int row_num, const __fp16 *in,
+                             const __fp16 *vcache, __fp16 *output,
+                             int num_cache_head, int head_dim, int start_j,
+                             int head_start, int head_end) {
+  const int panel = P8 * 8;
+  const int dfull = (head_dim / panel) * panel;
+  for (int n = head_start; n < head_end; ++n) {
+    for (int d0 = 0; d0 < dfull; d0 += panel) {
+      float16x8_t acc[G][P8];
+      for (int h = 0; h < G; ++h)
+        for (int p = 0; p < P8; ++p)
+          acc[h][p] = vdupq_n_f16(0.0f);
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp =
+          vcache + ((size_t)j * num_cache_head + n) * head_dim + d0;
+        float16x8_t vv[P8];
+        for (int p = 0; p < P8; ++p)
+          vv[p] = vld1q_f16(vp + p * 8);
+        const __fp16 *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h) {
+          float16x8_t a = vdupq_n_f16(pb[h]);
+          for (int p = 0; p < P8; ++p)
+            acc[h][p] = vfmaq_f16(acc[h][p], a, vv[p]);
+        }
+      }
+      for (int h = 0; h < G; ++h)
+        for (int p = 0; p < P8; ++p)
+          vst1q_f16(&output[(size_t)(n * G + h) * head_dim + d0 + p * 8],
+                    acc[h][p]);
+    }
+    // 8-wide blocks then scalar remainder (fp16 accumulate over the window)
+    int d = dfull;
+    for (; d + 8 <= head_dim; d += 8) {
+      float16x8_t acc[G];
+      for (int h = 0; h < G; ++h)
+        acc[h] = vdupq_n_f16(0.0f);
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp = vcache + ((size_t)j * num_cache_head + n) * head_dim;
+        float16x8_t v = vld1q_f16(vp + d);
+        const __fp16 *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h)
+          acc[h] = vfmaq_f16(acc[h], vdupq_n_f16(pb[h]), v);
+      }
+      for (int h = 0; h < G; ++h)
+        vst1q_f16(&output[(size_t)(n * G + h) * head_dim + d], acc[h]);
+    }
+    if (d < head_dim) {
+      const int rem = head_dim - d;
+      __fp16 racc[G][8];
+      for (int h = 0; h < G; ++h)
+        for (int r = 0; r < rem; ++r)
+          racc[h][r] = 0.0f;
+      for (int j = start_j; j <= row_num; ++j) {
+        const __fp16 *vp = vcache + ((size_t)j * num_cache_head + n) * head_dim;
+        const __fp16 *pb =
+          in + (size_t)(j - start_j) * G * num_cache_head + n * G;
+        for (int h = 0; h < G; ++h)
+          for (int r = 0; r < rem; ++r)
+            racc[h][r] += pb[h] * vp[d + r];
+      }
+      for (int h = 0; h < G; ++h)
+        for (int r = 0; r < rem; ++r)
+          output[(size_t)(n * G + h) * head_dim + d + r] = racc[h][r];
+    }
+  }
+}
+
+void compute_fp16vcache_transposed_opt(int row_num, const __fp16 *in,
+                                       const __fp16 *vcache, __fp16 *output,
+                                       int num_cache_head, int gqa_size,
+                                       int head_dim, size_t local_window_size,
+                                       int head_start, int head_end) {
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+  int start_j =
+    row_num < local_window_size ? 0 : row_num + 1 - local_window_size;
+  switch (gqa_size) {
+  case 1:
+    vcache_f16_panel<1, 16>(row_num, in, vcache, output, num_cache_head,
+                            head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 2:
+    vcache_f16_panel<2, 8>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 4:
+    vcache_f16_panel<4, 4>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  case 8:
+    vcache_f16_panel<8, 2>(row_num, in, vcache, output, num_cache_head,
+                           head_dim, start_j, head_start, actual_head_end);
+    break;
+  default: // uncommon gqa_size: fall back to the baseline kernel
+    compute_fp16vcache_transposed(row_num, in, vcache, output, num_cache_head,
+                                  gqa_size, head_dim, local_window_size,
+                                  head_start, head_end);
+    break;
+  }
+}
+
+// --- compute_kcaches (QK^T attention scores) NEON helpers -----------------
+// One KV head range: each fp16 k row is loaded/converted once and reused across
+// all G query heads (gqa_size is a compile-time constant so the accumulators
+// stay in registers). Two fp32 sub-accumulators per head feed both FMA pipes.
+template <int G>
+static void kcaches_f32_head(const float *in, const __fp16 *kcache,
+                             float *output, int num_cache_head, int head_dim,
+                             int start_row, int row_cnt, int head_start,
+                             int head_end, float scale) {
+  const int dfull = head_dim & ~7;
+  for (int n = head_start; n < head_end; ++n) {
+    const float *qb = in + (size_t)n * G * head_dim;
+    for (int r = 0; r < row_cnt; ++r) {
+      const int row = start_row + r;
+      const __fp16 *kp = kcache + ((size_t)row * num_cache_head + n) * head_dim;
+      if (r + 1 < row_cnt) // prefetch next k row
+        __builtin_prefetch(
+          kcache + ((size_t)(row + 1) * num_cache_head + n) * head_dim, 0, 3);
+
+      float32x4_t lo[G], hi[G];
+#pragma GCC unroll 16
+      for (int g = 0; g < G; ++g) {
+        lo[g] = vdupq_n_f32(0.0f);
+        hi[g] = vdupq_n_f32(0.0f);
+      }
+      int d = 0;
+      for (; d < dfull; d += 8) { // convert 8 fp16 k once, reuse across G
+        float16x8_t kh = vld1q_f16(kp + d);
+        float32x4_t k0 = vcvt_f32_f16(vget_low_f16(kh));
+        float32x4_t k1 = vcvt_f32_f16(vget_high_f16(kh));
+#pragma GCC unroll 16
+        for (int g = 0; g < G; ++g) {
+          lo[g] =
+            vfmaq_f32(lo[g], vld1q_f32(qb + (size_t)g * head_dim + d), k0);
+          hi[g] =
+            vfmaq_f32(hi[g], vld1q_f32(qb + (size_t)g * head_dim + d + 4), k1);
+        }
+      }
+      float *op = output + (size_t)r * num_cache_head * G + (size_t)n * G;
+#pragma GCC unroll 16
+      for (int g = 0; g < G; ++g) {
+        float sum = vaddvq_f32(vaddq_f32(lo[g], hi[g]));
+        for (int dd = dfull; dd < head_dim; ++dd)
+          sum += qb[(size_t)g * head_dim + dd] * (float)kp[dd];
+        op[g] = sum * scale;
+      }
+    }
+  }
+}
+
+// Fallback for uncommon gqa_size
+static void kcaches_f32_generic(const float *in, const __fp16 *kcache,
+                                float *output, int num_cache_head, int head_dim,
+                                int G, int start_row, int row_cnt,
+                                int head_start, int head_end, float scale) {
+  const int dfull = head_dim & ~7;
+  for (int n = head_start; n < head_end; ++n) {
+    const float *qb = in + (size_t)n * G * head_dim;
+    for (int r = 0; r < row_cnt; ++r) {
+      const int row = start_row + r;
+      const __fp16 *kp = kcache + ((size_t)row * num_cache_head + n) * head_dim;
+      float *op = output + (size_t)r * num_cache_head * G + (size_t)n * G;
+      for (int g = 0; g < G; ++g) {
+        const float *qp = qb + (size_t)g * head_dim;
+        float32x4_t a = vdupq_n_f32(0.0f), b = vdupq_n_f32(0.0f);
+        int d = 0;
+        for (; d < dfull; d += 8) {
+          float16x8_t kh = vld1q_f16(kp + d);
+          a = vfmaq_f32(a, vld1q_f32(qp + d), vcvt_f32_f16(vget_low_f16(kh)));
+          b = vfmaq_f32(b, vld1q_f32(qp + d + 4),
+                        vcvt_f32_f16(vget_high_f16(kh)));
+        }
+        float sum = vaddvq_f32(vaddq_f32(a, b));
+        for (; d < head_dim; ++d)
+          sum += qp[d] * (float)kp[d];
+        op[g] = sum * scale;
+      }
+    }
+  }
+}
+
 template <>
 void compute_kcaches(const float *in, const __fp16 *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
@@ -1996,6 +2385,123 @@ void compute_kcaches(const float *in, const __fp16 *kcache, float *output,
           output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
                  g] = sum / sqrt((float)head_dim);
         }
+      }
+    }
+  }
+}
+
+void compute_kcaches_opt(const float *in, const __fp16 *kcache, float *output,
+                         int num_rows, int num_cache_head, int head_dim,
+                         int gqa_size, int tile_size, size_t local_window_size,
+                         int head_start, int head_end) {
+  (void)tile_size; // q for a head stays cache-resident, so row tiling is unused
+
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  int start_row =
+    num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
+  const float scale = 1.0f / sqrt((float)head_dim);
+
+  switch (gqa_size) {
+  case 1:
+    kcaches_f32_head<1>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end, scale);
+    break;
+  case 2:
+    kcaches_f32_head<2>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end, scale);
+    break;
+  case 4:
+    kcaches_f32_head<4>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end, scale);
+    break;
+  case 8:
+    kcaches_f32_head<8>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end, scale);
+    break;
+  default:
+    kcaches_f32_generic(in, kcache, output, num_cache_head, head_dim, gqa_size,
+                        start_row, row_cnt, head_start, actual_head_end, scale);
+    break;
+  }
+}
+
+// One KV head range (all-fp16)
+template <int G>
+static void kcaches_f16_head(const __fp16 *in, const __fp16 *kcache,
+                             __fp16 *output, int num_cache_head, int head_dim,
+                             int start_row, int row_cnt, int head_start,
+                             int head_end) {
+  const int dfull = head_dim & ~7;
+  for (int n = head_start; n < head_end; ++n) {
+    const __fp16 *qb = in + (size_t)n * G * head_dim;
+    for (int r = 0; r < row_cnt; ++r) {
+      const int row = start_row + r;
+      const __fp16 *kp = kcache + ((size_t)row * num_cache_head + n) * head_dim;
+      if (r + 1 < row_cnt) // prefetch next k row
+        __builtin_prefetch(
+          kcache + ((size_t)(row + 1) * num_cache_head + n) * head_dim, 0, 3);
+
+      float16x8_t acc[G];
+#pragma GCC unroll 16
+      for (int g = 0; g < G; ++g)
+        acc[g] = vdupq_n_f16(0.0f);
+      for (int d = 0; d < dfull; d += 8) { // load 8 fp16 k once, reuse across G
+        float16x8_t kh = vld1q_f16(kp + d);
+#pragma GCC unroll 16
+        for (int g = 0; g < G; ++g)
+          acc[g] =
+            vfmaq_f16(acc[g], vld1q_f16(qb + (size_t)g * head_dim + d), kh);
+      }
+      __fp16 *op = output + (size_t)r * num_cache_head * G + (size_t)n * G;
+#pragma GCC unroll 16
+      for (int g = 0; g < G; ++g) {
+        float16x8_t a = acc[g];
+        a = vpaddq_f16(a, a);
+        a = vpaddq_f16(a, a);
+        a = vpaddq_f16(a, a);
+        __fp16 sum = vgetq_lane_f16(a, 0);
+        for (int dd = dfull; dd < head_dim; ++dd)
+          sum += qb[(size_t)g * head_dim + dd] * kp[dd];
+        op[g] = sum / sqrt((float)head_dim);
+      }
+    }
+  }
+}
+
+// Fallback for uncommon gqa_size.
+static void kcaches_f16_generic(const __fp16 *in, const __fp16 *kcache,
+                                __fp16 *output, int num_cache_head,
+                                int head_dim, int G, int start_row, int row_cnt,
+                                int head_start, int head_end) {
+  const int dfull = head_dim & ~7;
+  for (int n = head_start; n < head_end; ++n) {
+    const __fp16 *qb = in + (size_t)n * G * head_dim;
+    for (int r = 0; r < row_cnt; ++r) {
+      const int row = start_row + r;
+      const __fp16 *kp = kcache + ((size_t)row * num_cache_head + n) * head_dim;
+      __fp16 *op = output + (size_t)r * num_cache_head * G + (size_t)n * G;
+      for (int g = 0; g < G; ++g) {
+        const __fp16 *qp = qb + (size_t)g * head_dim;
+        float16x8_t a = vdupq_n_f16(0.0f);
+        int d = 0;
+        for (; d < dfull; d += 8)
+          a = vfmaq_f16(a, vld1q_f16(qp + d), vld1q_f16(kp + d));
+        a = vpaddq_f16(a, a);
+        a = vpaddq_f16(a, a);
+        a = vpaddq_f16(a, a);
+        __fp16 sum = vgetq_lane_f16(a, 0);
+        for (; d < head_dim; ++d)
+          sum += qp[d] * kp[d];
+        op[g] = sum / sqrt((float)head_dim);
       }
     }
   }
@@ -2089,6 +2595,50 @@ void compute_kcaches(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
         }
       }
     }
+  }
+}
+
+void compute_kcaches_opt(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
+                         int num_rows, int num_cache_head, int head_dim,
+                         int gqa_size, int tile_size, size_t local_window_size,
+                         int head_start, int head_end) {
+  (void)tile_size; // q for a head stays cache-resident, so row tiling is unused
+
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  // Calculate valid row range considering local window size
+  int start_row =
+    num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
+
+  switch (gqa_size) {
+  case 1:
+    kcaches_f16_head<1>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end);
+    break;
+  case 2:
+    kcaches_f16_head<2>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end);
+    break;
+  case 4:
+    kcaches_f16_head<4>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end);
+    break;
+  case 8:
+    kcaches_f16_head<8>(in, kcache, output, num_cache_head, head_dim, start_row,
+                        row_cnt, head_start, actual_head_end);
+    break;
+  default:
+    kcaches_f16_generic(in, kcache, output, num_cache_head, head_dim, gqa_size,
+                        start_row, row_cnt, head_start, actual_head_end);
+    break;
   }
 }
 
