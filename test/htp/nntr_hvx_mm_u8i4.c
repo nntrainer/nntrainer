@@ -877,10 +877,10 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
   }
   /** No probe reset here: this is the production path, and hexkl_probe_on stays
    * wherever the last timed call left it -- off, unless one ran. */
-  return hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
-                                 s->config_off, M, K, w_handles,
-                                 (uint32_t)w_handlesLen, act_f32, out_cat,
-                                 &(const hexkl_mm_opts){.pool = s->quant_pool});
+  return hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, act_f32, out_cat,
+    &(const hexkl_mm_opts){.pool = s->quant_pool, .entry_first = 1});
 }
 
 static int norm_rows_reserve(nntr_hvx_session *s, size_t n);
@@ -959,7 +959,9 @@ static int layer_res_add_chunk(nntr_hvx_session *s, uint32 M, uint32 K,
          (unsigned)N);
     return AEE_EBADPARM;
   }
-  hexkl_mm_opts opts = {.pool = s->quant_pool};
+  /* entry_first: the res_add entries' first VTCM use; under the dense FFN
+     + PLE call a gate call has always run first, so it finds nothing */
+  hexkl_mm_opts opts = {.pool = s->quant_pool, .entry_first = 1};
   if (act_u16) {
     if (!norm_rows_reserve(s, pre_scratch_floats(s, M, K))) {
       return AEE_ENOMEMORY;
@@ -1818,7 +1820,8 @@ static int dense_a16_run(nntr_hvx_session *s, uint32 M, uint32 K, uint32 inter,
   if (!norm_rows_reserve(s, gsc > dsc ? gsc : dsc)) {
     return AEE_ENOMEMORY;
   }
-  hexkl_mm_opts gopt = {.pool = s->quant_pool};
+  /* the gate_up is every entry's first VTCM use that reaches here */
+  hexkl_mm_opts gopt = {.pool = s->quant_pool, .entry_first = 1};
   if (s->moe_scratch.pre_gamma) {
     gopt.pre_scratch = s->norm_rows;
     gopt.pre_gamma = s->moe_scratch.pre_gamma;

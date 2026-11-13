@@ -299,8 +299,30 @@ static void dspq_thread(void *arg) {
       ++d->bad;
       break;
     }
+    /* the weight move the last response left running ends before anything
+       else runs (hexkl_mm_u8i4_gemv_pf_next) */
+    if (hexkl_mm_u8i4_gemv_pf_settle() != 0) {
+      FARF(ERROR, "dspq: the weight move did not finish");
+      ++d->bad;
+      break;
+    }
+    if (len < 4 || m.u[0] != HTP_DSPQ_OP_INVOKE) {
+      hexkl_mm_u8i4_gemv_pf_drop(); /* only an INVOKE entry takes it */
+    }
     if (len >= 4 && m.u[0] == HTP_DSPQ_OP_QUIT && nb == 0) {
       break;
+    }
+    if (len == 8 && m.u[0] == HTP_DSPQ_OP_SETTLE && nb == 0) {
+      /* dropped above: a FastRPC call writes VTCM next */
+      const uint32_t r[2] = {m.u[1], AEE_SUCCESS};
+      err = dspqueue_write(d->q, 0, 0, NULL, sizeof(r), (const uint8_t *)r,
+                           DSPQUEUE_TIMEOUT_NONE);
+      if (err != AEE_SUCCESS) {
+        FARF(ERROR, "dspq: write failed: 0x%08x", (unsigned)err);
+        ++d->bad;
+        break;
+      }
+      continue;
     }
     if (len >= 4 &&
         (m.u[0] == HTP_DSPQ_OP_TOKEN || m.u[0] == HTP_DSPQ_OP_INVOKE)) {
@@ -312,6 +334,13 @@ static void dspq_thread(void *arg) {
         break;
       }
       ++d->served;
+      if (m.u[0] == HTP_DSPQ_OP_INVOKE) {
+        /* the next entry's first weight moves while the host works */
+        hexkl_mm_u8i4_gemv_pf_next(&d->s->weights_u8i4, d->s->vtcm_base,
+                                   d->s->vtcm_size < d->s->config_off
+                                     ? d->s->vtcm_size
+                                     : d->s->config_off);
+      }
       spin_until = d->spin_us ? dspq_now_us() + d->spin_us : 0;
       continue;
     }
@@ -350,6 +379,7 @@ static void dspq_thread(void *arg) {
     ++d->served;
     spin_until = d->spin_us ? dspq_now_us() + d->spin_us : 0;
   }
+  (void)hexkl_mm_u8i4_gemv_pf_settle(); /* no move outlives the queue */
   qurt_thread_exit(0); /* QURT_EOK; the host stub has no qurt_error.h */
 }
 

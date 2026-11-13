@@ -612,6 +612,99 @@ static struct {
 
 void hexkl_mm_u8i4_gemv_preload_drop(void) { g_gemv_pre.live = 0; }
 
+/** Successor keys: the first handle (+ 1) of the last entry whose first
+    layer call was a GEMV, and the entries since, up to this many. */
+#define GEMV_PF_SINCE 4u
+#define GEMV_PF_TAB 512u
+
+/** @brief The tunnel's move between entries (hexkl_mm_u8i4_gemv_pf_next):
+ *         which GEMV each entry's successor started from, learned from
+ *         decode's repeating entry order, and the move itself, at VTCM 0
+ *         with the successor's double buffer {0, wb}. */
+static struct {
+  struct {
+    uint32_t key, h, wb;
+  } tab[GEMV_PF_TAB];
+  uint32_t last_h, since, key; /**< key: at the last entry's end, 0 none */
+  int entry_fc;                /**< a layer call ran in this entry */
+  int entry_gemv;              /**< and its first was a GEMV */
+  hexkl_dma_desc2d desc __attribute__((aligned(128)));
+  uint32_t h, wb;
+  int moving, landed;
+} g_pf;
+
+static uint32_t gemv_pf_slot(uint32_t key) {
+  return (key * 2654435761u >> 16) % GEMV_PF_TAB;
+}
+
+int hexkl_mm_u8i4_gemv_pf_settle(void) {
+  g_pf.entry_fc = 0;
+  g_pf.entry_gemv = 0;
+  if (g_pf.moving) {
+    if (hexkl_dma_lane_wait(&g_pf.desc) != 0) {
+      return -1; /* still moving: nothing may use VTCM */
+    }
+    g_pf.moving = 0;
+    g_pf.landed = 1;
+  }
+  return 0;
+}
+
+void hexkl_mm_u8i4_gemv_pf_drop(void) {
+  g_pf.landed = 0;
+  g_gemv_pre.live = 0;
+}
+
+void hexkl_mm_u8i4_gemv_pf_next(const hexkl_weight_u8i4_table *tbl,
+                                uint8_t *vtcm_base, uint32_t arena) {
+  hexkl_mm_u8i4_gemv_pf_drop();
+  if (g_pf.moving) {
+    return; /* a settle failed: never two moves at once */
+  }
+  if (g_pf.entry_gemv) {
+    g_pf.since = 0;
+  } else if (g_pf.since < GEMV_PF_SINCE) {
+    ++g_pf.since;
+  }
+  g_pf.key = g_pf.last_h != 0u && g_pf.since < GEMV_PF_SINCE
+               ? g_pf.last_h * GEMV_PF_SINCE + g_pf.since
+               : 0u;
+  if (g_pf.key == 0u) {
+    return;
+  }
+  const uint32_t e = gemv_pf_slot(g_pf.key);
+  const uint32_t h = g_pf.tab[e].h;
+  if (g_pf.tab[e].key != g_pf.key || h >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !tbl->slots[h].in_use || tbl->slots[h].bits == 2u ||
+      2u * (uint64_t)g_pf.tab[e].wb > arena) {
+    return;
+  }
+  const hexkl_weight_u8i4 *w = &tbl->slots[h];
+  const uint32_t row =
+    (w->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+  hexkl_dma_lane_push2d(&g_pf.desc, NULL, vtcm_base, w->wh_bytes, row, row, row,
+                        w->K / HEXKL_HMX_INT8_BLOCK_N_INNER,
+                        w->borrowed || w->clean, /*dst_vtcm=*/1);
+  g_pf.h = h;
+  g_pf.wb = g_pf.tab[e].wb;
+  g_pf.moving = 1;
+}
+
+#ifndef NNTR_HVX_NO_M1_GEMV
+/** @brief An entry's first layer call is a GEMV from handle @a h with a
+ *         double buffer of @a wb: the previous entry's successor. */
+static void gemv_pf_learn(uint32_t h, uint32_t wb) {
+  if (g_pf.key != 0u) {
+    const uint32_t e = gemv_pf_slot(g_pf.key);
+    g_pf.tab[e].key = g_pf.key;
+    g_pf.tab[e].h = h;
+    g_pf.tab[e].wb = wb;
+  }
+  g_pf.last_h = h + 1u;
+  g_pf.entry_gemv = 1;
+}
+#endif
+
 #ifndef NNTR_HVX_NO_M1_GEMV
 /** @brief Rows up to which a layer call takes the HVX GEMV instead of a
  *         64-row HMX block: the decode row, and a small batch. */
@@ -946,6 +1039,13 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                         const hexkl_u16_ah_io *ah) {
   static const hexkl_mm_opts kDefaults = {0};
   const hexkl_mm_opts *o = opts ? opts : &kDefaults;
+  /* the tunnel's move between entries goes to the entry's first layer call
+     alone, and only to one that no other VTCM user ran before */
+  const int pf_first = !g_pf.entry_fc && o->entry_first;
+  const int pf = pf_first && g_pf.landed;
+  g_pf.entry_fc = 1;
+  g_pf.landed = 0;
+  (void)pf;
   /** a16w4 handles (hexkl_weight_u8i4_set_act16): a float call takes its
       activation as u16 at their one static encoding. All or none of the
       handles, at the same encoding: the activation is shared. */
@@ -1051,9 +1151,19 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     }
     if (gemv) {
       const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
+      const uint32_t wb_max = k_tiles * n_tiles_max * WEIGHT_TILE_BYTES_U8I4;
+      if (pf_first) {
+        gemv_pf_learn(handles[0], wb_max);
+      }
+      if (pf) { /* layer_run_gemv takes it if it is handles[0] at wb_max */
+        g_gemv_pre.h = g_pf.h;
+        g_gemv_pre.wb = g_pf.wb;
+        g_gemv_pre.x = 0u;
+        g_gemv_pre.y = g_pf.wb;
+        g_gemv_pre.live = 1;
+      }
       return layer_run_gemv(tbl, vtcm_base, arena, M, K, handles, n_handles,
-                            act_f32, out_cat, o,
-                            k_tiles * n_tiles_max * WEIGHT_TILE_BYTES_U8I4);
+                            act_f32, out_cat, o, wb_max);
     }
   }
 #endif

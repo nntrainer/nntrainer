@@ -220,6 +220,25 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 void hexkl_mm_u8i4_gemv_preload_drop(void);
 
 /**
+ * @brief The tunnel's weight move between two entries. After an entry's
+ *        response, pf_next moves the first weight the entry after it
+ *        started from the last time (decode repeats its entry order), from
+ *        @a tbl into VTCM at @a vtcm_base, while the host works, and returns
+ *        with the move in flight on the calling thread's DMA queue. Before
+ *        anything runs on the DSP -- including a FastRPC call, for which the
+ *        host sends a settle packet first -- the same thread's pf_settle
+ *        waits for it; the entry's first layer call
+ *        takes it if that call has hexkl_mm_opts.entry_first and starts
+ *        from that weight, and pf_drop forgets it.
+ * @return pf_settle: 0, or -1 when the move did not finish within the DMA
+ *         guard: it may still be writing VTCM, so nothing may run.
+ */
+int hexkl_mm_u8i4_gemv_pf_settle(void);
+void hexkl_mm_u8i4_gemv_pf_drop(void);
+void hexkl_mm_u8i4_gemv_pf_next(const hexkl_weight_u8i4_table *tbl,
+                                uint8_t *vtcm_base, uint32_t arena);
+
+/**
  * @brief Integer-only FC: asymmetric UINT16 x symmetric INT4 -> INT32.
  * Activation is row-major M x K with one fixed encoding for the tensor;
  * K is a multiple of 64. Output consists of concatenated M x N_i blocks.

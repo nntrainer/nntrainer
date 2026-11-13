@@ -61,9 +61,9 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
 void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
                            void *dst, const void *src, uint32_t ds, uint32_t ss,
                            uint32_t rs, uint32_t nrows, int sv, int dv) {
-  (void)d;
   (void)prev;
   hexkl_dma_ring_push2d(dst, src, ds, ss, rs, nrows, sv, dv);
+  d->done = 1; /* what a waiter on the done bit alone reads */
 }
 int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
   (void)d;

@@ -142,6 +142,13 @@ typedef struct {
       moves (hexkl_mm_u8i4_gemv_preload_drop). */
   const uint32_t *next_h;
   uint32_t n_next;
+
+  /** Nonzero: no VTCM user but an earlier layer call of the same entry has
+      run, so the weight the tunnel moved before the entry
+      (hexkl_mm_u8i4_gemv_pf_next) may be what the entry's first layer call
+      starts from; a later call finds it dropped. Also marks the call whose
+      first handle that move learns. */
+  int entry_first;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */

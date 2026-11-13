@@ -5221,6 +5221,8 @@ private:
     uint32_t seq = 0;
     uint64_t calls = 0;
     uint32_t arm_spin_us = 0;
+    bool moving = false; /**< an OP_INVOKE answered since the last settle:
+                              the DSP may be moving a weight into VTCM */
     std::atomic<int> cb_err{0}; /**< the queue's error callback */
     std::vector<uint32_t> msg;  /**< the request message, reused */
   };
@@ -5260,7 +5262,7 @@ private:
   static bool dspqStop(DspqMoe &st) {
     if (st.state != DspqMoe::ON)
       return false;
-    std::lock_guard<std::mutex> lk(tunnel_mu_);
+    std::lock_guard<std::recursive_mutex> lk(tunnel_mu_);
     DspqMoe *self = &st;
     tunnel_.compare_exchange_strong(self, nullptr);
     st.state = DspqMoe::OFF;
@@ -5441,7 +5443,8 @@ private:
                size_t out_bytes, uint32_t glu, uint32_t *stage_us) {
     static_assert(HTP_MOE_N_STAGES == HTP_DSPQ_STAGES,
                   "htp_dspq_wire.h's stage count is the timed call's");
-    std::lock_guard<std::mutex> lk(tunnel_mu_); // the tunnel's calls share it
+    std::lock_guard<std::recursive_mutex> lk(
+      tunnel_mu_); // the tunnel's calls share it
     DspqMoe &st = *dspq_;
     const uint32_t ne = static_cast<uint32_t>(h_gu.size());
     const uint32_t nr = static_cast<uint32_t>(row_index.size());
@@ -5604,7 +5607,7 @@ public:
     if (st == nullptr && tunnelEnabled() && fastrpc.count(mid) == 0 &&
         !started.exchange(true))
       st = ops->tunnelStart(h);
-    std::unique_lock<std::mutex> lk(tunnel_mu_, std::defer_lock);
+    std::unique_lock<std::recursive_mutex> lk(tunnel_mu_, std::defer_lock);
     bool fits = st != nullptr && st->session == h && n <= 32 &&
                 REMOTE_SCALARS_INHANDLES(sc) == 0 &&
                 REMOTE_SCALARS_OUTHANDLES(sc) == 0 && fastrpc.count(mid) == 0;
@@ -5637,6 +5640,8 @@ public:
 #ifdef NNTR_HTP_INPROC
       return AEE_EUNSUPPORTED; // the in-process stub never comes here
 #else
+      if (st != nullptr)
+        tunnelSettle(st);
       return remote_handle64_invoke(h, sc, pra);
 #endif
     }
@@ -5699,7 +5704,35 @@ public:
       o += (pra[i].buf.nLen + 7u) / 8u * 2u;
     }
     ++st->calls;
+    st->moving = true;
     return static_cast<int>(resp[1]);
+  }
+
+  /** @brief Before a FastRPC call while the queue is up: the DSP ends and
+   *  forgets the weight move its last OP_INVOKE response left running in
+   *  VTCM (HTP_DSPQ_OP_SETTLE), so the FastRPC call has VTCM to itself.
+   *  Transport failures throw, as tunnelInvoke's do. */
+  static void tunnelSettle(DspqMoe *st) {
+    std::lock_guard<std::recursive_mutex> lk(tunnel_mu_);
+    if (!st->moving || st->broken)
+      return;
+    const uint32_t w[2] = {HTP_DSPQ_OP_SETTLE, ++st->seq};
+    const HtpDspqApi &api = *st->api;
+    int err = api.write(st->q, 0, 0, nullptr, sizeof(w),
+                        reinterpret_cast<const uint8_t *>(w), kDspqTimeoutUs);
+    alignas(8) uint32_t resp[2] = {0, 0};
+    uint32_t flags = 0, rnb = 0, len = 0;
+    if (err == AEE_SUCCESS)
+      err = api.read(st->q, &flags, 0, &rnb, nullptr, sizeof(resp), &len,
+                     reinterpret_cast<uint8_t *>(resp), kDspqTimeoutUs);
+    if (err != AEE_SUCCESS || st->cb_err.load() != 0 || len != sizeof(resp) ||
+        resp[0] != st->seq || rnb != 0) {
+      st->broken = true;
+      throw std::runtime_error("dspq: settle seq " + std::to_string(st->seq) +
+                               " failed: err=" + std::to_string(err) +
+                               " len=" + std::to_string(len));
+    }
+    st->moving = false;
   }
 
 private:
@@ -9137,8 +9170,10 @@ private:
   StagingPool tun_pool_[2];   /**< heap in buffers the tunnel copies */
   /** @brief The queue the stub's calls ride, or null: FastRPC. */
   static inline std::atomic<DspqMoe *> tunnel_{nullptr};
-  /** @brief One request on the queue at a time: the tunnel's and dspqCall's. */
-  static inline std::mutex tunnel_mu_;
+  /** @brief One request on the queue at a time: the tunnel's and dspqCall's.
+   *  Recursive: tunnelArena maps an arena over FastRPC while it is held, and
+   *  that call settles the queue first (tunnelSettle). */
+  static inline std::recursive_mutex tunnel_mu_;
   /** @brief ION copies of the MoE routers' gate weights, by address. */
   std::map<const float *, std::unique_ptr<HtpRpcBuffer>> router_w_;
   std::map<const float *, uint32_t> router_u8i8_; /**< gate -> u8i8 handle */

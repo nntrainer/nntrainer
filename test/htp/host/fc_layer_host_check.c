@@ -168,6 +168,45 @@ int main(void) {
     }
   }
 
+  /**
+   * The tunnel's move between entries (hexkl_mm_u8i4_gemv_pf_*): decode
+   * repeating entry {1,2} then entry {0}, each one's first call
+   * entry_first. From the third entry on each starts from the move the
+   * previous one's end made; with those bytes zeroed in the last round the
+   * result must change, or no entry ever took one. Then an entry whose first
+   * call is HMX (M = 150) must drop it and still be right.
+   */
+  {
+    const uint32_t a12[2] = {1u, 2u}, a0[1] = {0u};
+    hexkl_mm_opts o = {0};
+    o.entry_first = 1;
+    for (int r = 0; r < 4; ++r)
+      for (int e = 0; e < 2; ++e) {
+        rc = hexkl_mm_u8i4_gemv_pf_settle();
+        if (r == 3 && e == 1)
+          memset(vtcm, 0, 16384u);
+        rc |=
+          hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K,
+                                  e ? a0 : a12, e ? 1u : 2u, x + K, got, &o);
+        hexkl_mm_u8i4_gemv_pf_next(&g_tbl, vtcm, sizeof vtcm);
+        reference(e ? ws : ws + 1, e ? 1u : 2u, x + K, 1, K, want, 0.f);
+        const int zero = r == 3 && e == 1;
+        const int bad = compare(zero ? "entry move, zeroed" : "entry move", got,
+                                want, e ? N[0] : N[1] + N[2]);
+        fail |= (rc != 0) | (zero ? !bad : bad);
+      }
+    rc = hexkl_mm_u8i4_gemv_pf_settle();
+    rc |= hexkl_mm_u8i4_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
+                                  a12, 2u, x, got, &o);
+    hexkl_mm_u8i4_gemv_pf_next(&g_tbl, vtcm, sizeof vtcm);
+    reference(ws + 1, 2u, x, M, K, want, 0.f);
+    fail |= (rc != 0) |
+            compare("entry move, HMX", got, want, (size_t)M * (N[1] + N[2]));
+    rc = hexkl_mm_u8i4_gemv_pf_settle();
+    hexkl_mm_u8i4_gemv_pf_drop();
+    fail |= rc != 0;
+  }
+
   /* The per-head passes in the epilogue (hexkl_mm_opts.post_done): the
      norm of handles 0 and 2 and the rotation of handle 0 must give the
      bytes of the plain run with those passes made over it afterwards, and

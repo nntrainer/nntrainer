@@ -40,6 +40,12 @@
  *  through the skel's own dispatcher. Answered {seq, rc} and the inline
  *  out buffers, padded alike (HTP_DSPQ_MAX_ROUT in all). */
 #define HTP_DSPQ_OP_INVOKE 4u
+/** @brief {op, seq}, answered {seq, 0} (an older skel answers {seq,
+ *  AEE_EBADPARM}): sent before a FastRPC call while the queue is up, it
+ *  ends and forgets the weight move an OP_INVOKE response left running in
+ *  VTCM (hexkl_mm_u8i4_gemv_pf_next), so the FastRPC call has VTCM to
+ *  itself. */
+#define HTP_DSPQ_OP_SETTLE 5u
 #define HTP_DSPQ_MAX_ROUT (16u * 1024u)
 #define HTP_DSPQ_FLAG_TIMED 1u
 /** @brief OP_MOE: the call's act argument (gelu_tanh epilogue) is 1. */
