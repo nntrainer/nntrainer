@@ -859,9 +859,16 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
   /// Effectively a translation of sgemv
   else if (M == 1) {
+#ifdef USE_MKL
+    // Keep the inference vector projection on MKL's GEMM path, as for a
+    // multi-row projection; its skinny-matrix kernel can outperform GEMV.
+    o->sgemm_fp32((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
+                  alpha, data, lda, mdata, ldb, beta, rdata, ldc);
+#else
     o->sgemv_fp32((unsigned int)dim.getStorageOrder(), !trans_in,
                   input_first_three_flat, input_last_axis, alpha, mdata, ldb,
                   data, 1, beta, rdata, 1);
+#endif
   }
   /// case others: use gemm
   else {

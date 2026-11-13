@@ -46,6 +46,10 @@ option('capi-ml-common-actual', type: 'string', value: 'capi-ml-common',
 option('tizen-version-major', type: 'integer', min : 4, max : 9999, value: 9999) # 9999 means "not Tizen"
 option('tizen-version-minor', type: 'integer', min : 0, max : 9999, value: 0)
 option('openblas-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
+option('blas-provider', type: 'combo', choices: ['openblas', 'mkl'], value: 'openblas',
+       description: 'CPU BLAS implementation; MKL uses the LP64 runtime interface')
+option('mkl-libdir', type: 'string', value: '',
+       description: 'Directory containing libmkl_rt when blas-provider=mkl')
 #This is for the multi-threading in nntrainer
 # 0 = auto: on x86 the ThreadManager pool uses the usable physical cores at
 # run time (capped at 16); other architectures keep 4. NNTR_NUM_THREADS in
