@@ -222,4 +222,52 @@ INSTANTIATE_TEST_SUITE_P(
     return info.param.name;
   });
 
+/** @brief Run actual attention/conv steps through the CPU lease and logits
+ * pool. */
+class Lfm2CpuKVGraphTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    const auto files = causallm_test::makeTinyCausalLMFiles(
+      "Lfm2CpuKVGraphTest",
+      ::testing::UnitTest::GetInstance()->current_test_info()->name(), "FP32");
+    config_ = makeTinyLfm2Config();
+    generation_ = causallm_test::makeTinyGenerationConfig();
+    nntrainer_ = causallm_test::makeTinyNntrainerConfig(
+      files.tokenizer_path, causallm_test::makeTinyFp32DataType());
+    model_ =
+      std::make_unique<TinyLfm2CausalLM>(config_, generation_, nntrainer_);
+    ASSERT_NO_THROW(model_->initializeModel());
+    setupLfm2DeterministicWeights(*model_);
+  }
+
+  causallm_test::ScopedEnv engine_{"NNTR_ENGINE", "cpu"};
+  causallm_test::ScopedEnv legacy_{"NNTR_CPU_KV_LEGACY", "0"};
+  causallm::json config_, generation_, nntrainer_;
+  std::unique_ptr<TinyLfm2CausalLM> model_;
+};
+
+TEST_F(Lfm2CpuKVGraphTest,
+       HybridDecodePublishesOnlyAttentionAndRecyclesLogits) {
+  ASSERT_TRUE(model_->producesKV(0));
+  ASSERT_FALSE(model_->producesKV(1));
+  const auto ids = model_->greedyGenerateFromIds({1, 4}, 6);
+  EXPECT_EQ(ids, std::vector<unsigned int>(6, 4u));
+  ASSERT_TRUE(model_->cacheManager().usesCpuStorage());
+  EXPECT_EQ(model_->getKvLen(), 7);
+  EXPECT_EQ(model_->logitsPoolAllocations(), 1u);
+  EXPECT_EQ(model_->logitsPoolAvailable(), 1u);
+  EXPECT_NO_THROW(model_->stepLogitsFromIds({4}, 7));
+  EXPECT_EQ(model_->getKvLen(), 8);
+  EXPECT_EQ(model_->logitsPoolAllocations(), 1u);
+  EXPECT_EQ(model_->logitsPoolAvailable(), 1u);
+}
+
+TEST_F(Lfm2CpuKVGraphTest, DecodeOverflowKeepsPositionAndReturnsPriorLogits) {
+  EXPECT_THROW(model_->greedyGenerateFromIds({1, 4}, 8), std::out_of_range);
+  ASSERT_TRUE(model_->cacheManager().usesCpuStorage());
+  EXPECT_EQ(model_->getKvLen(), 8);
+  EXPECT_EQ(model_->logitsPoolAllocations(), 1u);
+  EXPECT_EQ(model_->logitsPoolAvailable(), 1u);
+}
+
 } // namespace

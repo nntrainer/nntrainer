@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include "runtime_config.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -855,7 +856,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
  */
 std::pair<Tensor, Tensor>
 Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
-  const unsigned int cache_rows = getKVCacheRows(layer_id);
+  const unsigned int cache_rows =
+    RuntimeConfig::capture().cpu_kv_paged ? 1u : getKVCacheRows(layer_id);
   const unsigned int kv_width =
     static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
   const std::string cache_shape = std::to_string(BATCH_SIZE) +
