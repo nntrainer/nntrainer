@@ -1,0 +1,1046 @@
+{
+  "date": "2026-11-13",
+  "hardware": {
+    "os": "Ubuntu 22.04.5 LTS",
+    "cpu": "Intel Core i9-14900",
+    "gpu": "NVIDIA GeForce RTX 3050 OEM",
+    "vram_mib": 8192,
+    "driver": "595.99.02",
+    "cuda": "13.2"
+  },
+  "benchmarks": [
+    {
+      "model": "paligemma",
+      "framework": "nntrainer",
+      "engine": "cpu",
+      "repeats": 3,
+      "threads": 8,
+      "precision": "FP32",
+      "median_inference_s": 7.24297,
+      "min_inference_s": 7.16472,
+      "max_inference_s": 7.58013,
+      "median_load_s": 1.77199,
+      "peak_process_rss_gib": 13.247413635253906,
+      "peak_gpu_device_delta_gib": 0.0,
+      "runs": [
+        {
+          "name": "paligemma-cpu-r1",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 9.434369403868914,
+          "peak_rss_mib": 13564.90625,
+          "peak_anon_mib": 13456.80078125,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            ".validation/paligemma-pi05-20261113/models/paligemma-fp32",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference"
+          ],
+          "threads": 8,
+          "load_s": 1.77199,
+          "vision_s": 0.855187,
+          "inference_s": 6.30953,
+          "total_inference_s": 7.16472,
+          "prefill_tokens": 272,
+          "prefill_ms": 4516,
+          "prefill_tps": 60.23029229406554,
+          "decode_tokens": 10,
+          "decode_ms": 1789,
+          "decode_tps": 5.589714924538849,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.00354242 rmse=9.59964e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.00413227 rmse=0.000906329 atol=0.01 rtol=0.001 failed=0"
+          ]
+        },
+        {
+          "name": "paligemma-cpu-r2",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 9.535360211972147,
+          "peak_rss_mib": 13565.2890625,
+          "peak_anon_mib": 13456.79296875,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            "/tmp/nntrainer-port-audit/paligemma-fp32",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference"
+          ],
+          "threads": 8,
+          "load_s": 1.76248,
+          "vision_s": 0.87278,
+          "inference_s": 6.37019,
+          "total_inference_s": 7.24297,
+          "prefill_tokens": 272,
+          "prefill_ms": 4568,
+          "prefill_tps": 59.5446584938704,
+          "decode_tokens": 10,
+          "decode_ms": 1798,
+          "decode_tps": 5.561735261401557,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.00354242 rmse=9.59964e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.00413227 rmse=0.000906329 atol=0.01 rtol=0.001 failed=0"
+          ]
+        },
+        {
+          "name": "paligemma-cpu-r3",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 10.535508665721864,
+          "peak_rss_mib": 13565.3515625,
+          "peak_anon_mib": 13459.84765625,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            "/tmp/nntrainer-port-audit/paligemma-fp32",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference"
+          ],
+          "threads": 8,
+          "load_s": 2.4688,
+          "vision_s": 0.856713,
+          "inference_s": 6.72342,
+          "total_inference_s": 7.58013,
+          "prefill_tokens": 272,
+          "prefill_ms": 4926,
+          "prefill_tps": 55.21721477872513,
+          "decode_tokens": 10,
+          "decode_ms": 1794,
+          "decode_tps": 5.574136008918618,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.00354242 rmse=9.59964e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.00413227 rmse=0.000906329 atol=0.01 rtol=0.001 failed=0"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "paligemma",
+      "framework": "nntrainer",
+      "engine": "cuda",
+      "repeats": 3,
+      "threads": 4,
+      "precision": "FP16 language / FP32 vision and action expert",
+      "median_inference_s": 3.77084,
+      "min_inference_s": 3.72509,
+      "max_inference_s": 3.84648,
+      "median_load_s": 4.68266,
+      "peak_process_rss_gib": 8.611186981201172,
+      "peak_gpu_device_delta_gib": 6.541015625,
+      "runs": [
+        {
+          "name": "paligemma-cuda-r1",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 10.351316726766527,
+          "peak_rss_mib": 8816.85546875,
+          "peak_anon_mib": 2539.0234375,
+          "peak_gpu_process_dedicated_mib": 160,
+          "gpu_idle_baseline_mib": 604,
+          "peak_gpu_device_used_mib": 7302,
+          "peak_gpu_device_delta_mib": 6698,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            ".validation/paligemma-pi05-20261113/models/paligemma-fp16",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 5.91472,
+          "vision_s": 1.72293,
+          "inference_s": 2.12356,
+          "total_inference_s": 3.84648,
+          "prefill_tokens": 272,
+          "prefill_ms": 1628,
+          "prefill_tps": 167.07616707616708,
+          "decode_tokens": 10,
+          "decode_ms": 491,
+          "decode_tps": 20.36659877800407,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.000535011 rmse=1.25994e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.101562 rmse=0.0148926 atol=0.1 rtol=0.001 failed=0"
+          ]
+        },
+        {
+          "name": "paligemma-cuda-r2",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 8.974623820744455,
+          "peak_rss_mib": 8817.85546875,
+          "peak_anon_mib": 2531.18359375,
+          "peak_gpu_process_dedicated_mib": 160,
+          "gpu_idle_baseline_mib": 606,
+          "peak_gpu_device_used_mib": 7301,
+          "peak_gpu_device_delta_mib": 6695,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            ".validation/paligemma-pi05-20261113/models/paligemma-fp16",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 4.68266,
+          "vision_s": 1.67686,
+          "inference_s": 2.09398,
+          "total_inference_s": 3.77084,
+          "prefill_tokens": 272,
+          "prefill_ms": 1595,
+          "prefill_tps": 170.53291536050156,
+          "decode_tokens": 10,
+          "decode_ms": 496,
+          "decode_tps": 20.161290322580644,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.000535011 rmse=1.25994e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.101562 rmse=0.0148926 atol=0.1 rtol=0.001 failed=0"
+          ]
+        },
+        {
+          "name": "paligemma-cuda-r3",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 6.28250430803746,
+          "peak_rss_mib": 8817.85546875,
+          "peak_anon_mib": 2531.1484375,
+          "peak_gpu_process_dedicated_mib": 160,
+          "gpu_idle_baseline_mib": 606,
+          "peak_gpu_device_used_mib": 7301,
+          "peak_gpu_device_delta_mib": 6695,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_paligemma_e2e",
+            ".validation/paligemma-pi05-20261113/models/paligemma-fp16",
+            "/home/seungbaek/paligemma-3b-nntr/vision",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 2.0281,
+          "vision_s": 1.68212,
+          "inference_s": 2.04297,
+          "total_inference_s": 3.72509,
+          "prefill_tokens": 272,
+          "prefill_ms": 1548,
+          "prefill_tps": 175.7105943152455,
+          "decode_tokens": 10,
+          "decode_ms": 492,
+          "decode_tps": 20.32520325203252,
+          "numeric": [
+            "file_preprocessing count=150528 max_abs=0 rmse=0 atol=2e-07 rtol=0 failed=0",
+            "vision count=524288 max_abs=0.000535011 rmse=1.25994e-05 atol=0.03 rtol=0.002 failed=0",
+            "prefill_logits count=257216 max_abs=0.101562 rmse=0.0148926 atol=0.1 rtol=0.001 failed=0"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "paligemma",
+      "framework": "pytorch",
+      "engine": "cpu",
+      "repeats": 3,
+      "threads": 8,
+      "precision": "FP32",
+      "median_inference_s": 3.2434939,
+      "min_inference_s": 3.1812287,
+      "max_inference_s": 3.3518381,
+      "median_load_s": 1.3491328,
+      "peak_process_rss_gib": 11.825145721435547,
+      "peak_gpu_device_delta_gib": 0.0,
+      "runs": [
+        {
+          "name": "pytorch-paligemma-cpu-r1",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 5.7213757135905325,
+          "peak_rss_mib": 12032.1171875,
+          "peak_anon_mib": 525.61328125,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 1.4143115,
+          "total_inference_s": 3.1812287,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        },
+        {
+          "name": "pytorch-paligemma-cpu-r2",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 5.618353756144643,
+          "peak_rss_mib": 12108.94921875,
+          "peak_anon_mib": 602.21484375,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 1.2430949,
+          "total_inference_s": 3.2434939,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        },
+        {
+          "name": "pytorch-paligemma-cpu-r3",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 5.920386542100459,
+          "peak_rss_mib": 11993.17578125,
+          "peak_anon_mib": 577.63671875,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pil-reference",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 1.3491328,
+          "total_inference_s": 3.3518381,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "paligemma",
+      "framework": "pytorch",
+      "engine": "cuda",
+      "repeats": 3,
+      "threads": 4,
+      "precision": "FP16 language / FP32 vision and action expert",
+      "median_inference_s": 0.95202946,
+      "min_inference_s": 0.93758491,
+      "max_inference_s": 0.99941539,
+      "median_load_s": 2.9383376,
+      "peak_process_rss_gib": 12.291698455810547,
+      "peak_gpu_device_delta_gib": 6.390625,
+      "runs": [
+        {
+          "name": "pytorch-paligemma-cuda-r1",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 5.151194969192147,
+          "peak_rss_mib": 12586.66796875,
+          "peak_anon_mib": 5218.3125,
+          "peak_gpu_process_dedicated_mib": 6536,
+          "gpu_idle_baseline_mib": 604,
+          "peak_gpu_device_used_mib": 7148,
+          "peak_gpu_device_delta_mib": 6544,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 2.9383376,
+          "total_inference_s": 0.93758491,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        },
+        {
+          "name": "pytorch-paligemma-cuda-r2",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 4.90310195973143,
+          "peak_rss_mib": 12586.69921875,
+          "peak_anon_mib": 5218.30859375,
+          "peak_gpu_process_dedicated_mib": 6536,
+          "gpu_idle_baseline_mib": 455,
+          "peak_gpu_device_used_mib": 6999,
+          "peak_gpu_device_delta_mib": 6544,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "load_s": 2.8738981,
+          "total_inference_s": 0.95202946,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        },
+        {
+          "name": "pytorch-paligemma-cuda-r3",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 5.2687106230296195,
+          "peak_rss_mib": 12586.3046875,
+          "peak_anon_mib": 5218.37890625,
+          "peak_gpu_process_dedicated_mib": 6536,
+          "gpu_idle_baseline_mib": 598,
+          "peak_gpu_device_used_mib": 7142,
+          "peak_gpu_device_delta_mib": 6544,
+          "command": [
+            "/home/seungbaek/projects/vllm/.venv/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "paligemma",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/Downloads/paligemma",
+            "--reference",
+            "/tmp/nntrainer-port-audit/paligemma-pytorch-cuda-reference",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "load_s": 2.9922704,
+          "total_inference_s": 0.99941539,
+          "numeric": [
+            "greedy_tokens count=11 exact_match=True"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "pi05",
+      "framework": "nntrainer",
+      "engine": "cpu",
+      "repeats": 3,
+      "threads": 8,
+      "precision": "FP32",
+      "median_inference_s": 9.75591,
+      "min_inference_s": 9.38371,
+      "max_inference_s": 10.1812,
+      "median_load_s": 1.81725,
+      "peak_process_rss_gib": 12.946735382080078,
+      "peak_gpu_device_delta_gib": 0.0,
+      "runs": [
+        {
+          "name": "pi05-cpu-r1",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 11.642780035734177,
+          "peak_rss_mib": 13254.25,
+          "peak_anon_mib": 13149.2421875,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            ".validation/paligemma-pi05-20261113/models/pi05-fp32",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 8,
+          "load_s": 1.76845,
+          "vision_s": 0.854547,
+          "inference_s": 8.52917,
+          "total_inference_s": 9.38371,
+          "numeric": [
+            "vision count=524288 max_abs=0.00517273 rmse=5.64176e-05 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=5.10216e-05 rmse=3.19679e-06 atol=0.005 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pi05-cpu-r2",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 13.430481465067714,
+          "peak_rss_mib": 13249.7890625,
+          "peak_anon_mib": 13144.7890625,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            "/tmp/nntrainer-port-audit/pi05-fp32",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 8,
+          "load_s": 3.17648,
+          "vision_s": 0.85509,
+          "inference_s": 8.90082,
+          "total_inference_s": 9.75591,
+          "numeric": [
+            "vision count=524288 max_abs=0.00517273 rmse=5.64176e-05 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=5.10216e-05 rmse=3.19679e-06 atol=0.005 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pi05-cpu-r3",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 12.442114750854671,
+          "peak_rss_mib": 13257.45703125,
+          "peak_anon_mib": 13152.390625,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            "/tmp/nntrainer-port-audit/pi05-fp32",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 8,
+          "load_s": 1.81725,
+          "vision_s": 0.970311,
+          "inference_s": 9.21088,
+          "total_inference_s": 10.1812,
+          "numeric": [
+            "vision count=524288 max_abs=0.00517273 rmse=5.64176e-05 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=5.10216e-05 rmse=3.19679e-06 atol=0.005 rtol=0 failed=0"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "pi05",
+      "framework": "nntrainer",
+      "engine": "cuda",
+      "repeats": 3,
+      "threads": 4,
+      "precision": "FP16 language / FP32 vision and action expert",
+      "median_inference_s": 3.77403,
+      "min_inference_s": 3.7561,
+      "max_inference_s": 3.89822,
+      "median_load_s": 2.31031,
+      "peak_process_rss_gib": 9.298412322998047,
+      "peak_gpu_device_delta_gib": 7.0322265625,
+      "runs": [
+        {
+          "name": "pi05-cuda-r1",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 9.255511309951544,
+          "peak_rss_mib": 9519.28515625,
+          "peak_anon_mib": 4229.12890625,
+          "peak_gpu_process_dedicated_mib": 1808,
+          "gpu_idle_baseline_mib": 606,
+          "peak_gpu_device_used_mib": 7805,
+          "peak_gpu_device_delta_mib": 7199,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            ".validation/paligemma-pi05-20261113/models/pi05-fp16",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 5.00117,
+          "vision_s": 1.60572,
+          "inference_s": 2.15037,
+          "total_inference_s": 3.7561,
+          "numeric": [
+            "vision count=524288 max_abs=0.000259399 rmse=3.05528e-06 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=0.00247788 rmse=9.63785e-05 atol=0.005 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pi05-cuda-r2",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 6.5376505819149315,
+          "peak_rss_mib": 9521.57421875,
+          "peak_anon_mib": 4229.12109375,
+          "peak_gpu_process_dedicated_mib": 1808,
+          "gpu_idle_baseline_mib": 606,
+          "peak_gpu_device_used_mib": 7805,
+          "peak_gpu_device_delta_mib": 7199,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            ".validation/paligemma-pi05-20261113/models/pi05-fp16",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 2.31031,
+          "vision_s": 1.67727,
+          "inference_s": 2.09676,
+          "total_inference_s": 3.77403,
+          "numeric": [
+            "vision count=524288 max_abs=0.000259399 rmse=3.05528e-06 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=0.00247788 rmse=9.63785e-05 atol=0.005 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pi05-cuda-r3",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 6.595719632226974,
+          "peak_rss_mib": 9520.24609375,
+          "peak_anon_mib": 4229.13671875,
+          "peak_gpu_process_dedicated_mib": 1808,
+          "gpu_idle_baseline_mib": 606,
+          "peak_gpu_device_used_mib": 7807,
+          "peak_gpu_device_delta_mib": 7201,
+          "command": [
+            "build_cuda/Applications/CausalLM/nntr_pi05_e2e",
+            ".validation/paligemma-pi05-20261113/models/pi05-fp16",
+            "/home/seungbaek/pi05-nntr/vision",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 2.22447,
+          "vision_s": 1.70772,
+          "inference_s": 2.1905,
+          "total_inference_s": 3.89822,
+          "numeric": [
+            "vision count=524288 max_abs=0.000259399 rmse=3.05528e-06 atol=0.03 rtol=0.002 failed=0",
+            "per_step_velocity count=16000 max_abs=0.00346035 rmse=0.000109571 atol=0.005 rtol=0 failed=0"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "pi05",
+      "framework": "pytorch",
+      "engine": "cpu",
+      "repeats": 3,
+      "threads": 8,
+      "precision": "FP32",
+      "median_inference_s": 2.8154908,
+      "min_inference_s": 2.7344587,
+      "max_inference_s": 2.8450417,
+      "median_load_s": 24.552173,
+      "peak_process_rss_gib": 27.74016571044922,
+      "peak_gpu_device_delta_gib": 0.0,
+      "runs": [
+        {
+          "name": "pytorch-pi05-cpu-r1",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 33.18985845101997,
+          "peak_rss_mib": 28405.54296875,
+          "peak_anon_mib": 15266.9453125,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 28.981661,
+          "total_inference_s": 2.8154908,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=1.989305e-06 rmse=1.9602557e-07 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=3.3527613e-07 rmse=4.3167276e-08 atol=0.01 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pytorch-pi05-cpu-r2",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 27.97694445727393,
+          "peak_rss_mib": 28405.9296875,
+          "peak_anon_mib": 15263.3125,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 23.917293,
+          "total_inference_s": 2.7344587,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=1.989305e-06 rmse=1.9602557e-07 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=3.3527613e-07 rmse=4.3167276e-08 atol=0.01 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pytorch-pi05-cpu-r3",
+          "engine": "cpu",
+          "exit_code": 0,
+          "wall_s": 28.790397386066616,
+          "peak_rss_mib": 28405.28125,
+          "peak_anon_mib": 15263.19921875,
+          "peak_gpu_process_dedicated_mib": 0,
+          "gpu_idle_baseline_mib": 0,
+          "peak_gpu_device_used_mib": 0,
+          "peak_gpu_device_delta_mib": 0,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cpu",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "8",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 8,
+          "load_s": 24.552173,
+          "total_inference_s": 2.8450417,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=1.989305e-06 rmse=1.9602557e-07 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=3.3527613e-07 rmse=4.3167276e-08 atol=0.01 rtol=0 failed=0"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "pi05",
+      "framework": "pytorch",
+      "engine": "cuda",
+      "repeats": 3,
+      "threads": 4,
+      "precision": "FP16 language / FP32 vision and action expert",
+      "median_inference_s": 0.58071102,
+      "min_inference_s": 0.57701383,
+      "max_inference_s": 0.59053951,
+      "median_load_s": 26.353437,
+      "peak_process_rss_gib": 27.740066528320312,
+      "peak_gpu_device_delta_gib": 7.080078125,
+      "runs": [
+        {
+          "name": "pytorch-pi05-cuda-r1",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 26.970291862264276,
+          "peak_rss_mib": 28405.828125,
+          "peak_anon_mib": 15262.91015625,
+          "peak_gpu_process_dedicated_mib": 7178,
+          "gpu_idle_baseline_mib": 455,
+          "peak_gpu_device_used_mib": 7641,
+          "peak_gpu_device_delta_mib": 7186,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "load_s": 25.086868,
+          "total_inference_s": 0.58071102,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=0.0018369853 rmse=0.00010083626 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=0.00056339055 rmse=7.7148086e-05 atol=0.01 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pytorch-pi05-cuda-r2",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 28.251141868997365,
+          "peak_rss_mib": 28404.59765625,
+          "peak_anon_mib": 15262.921875,
+          "peak_gpu_process_dedicated_mib": 7178,
+          "gpu_idle_baseline_mib": 534,
+          "peak_gpu_device_used_mib": 7784,
+          "peak_gpu_device_delta_mib": 7250,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "load_s": 26.353437,
+          "total_inference_s": 0.57701383,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=0.0018369853 rmse=0.00010083626 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=0.00056339055 rmse=7.7148086e-05 atol=0.01 rtol=0 failed=0"
+          ]
+        },
+        {
+          "name": "pytorch-pi05-cuda-r3",
+          "engine": "cuda",
+          "exit_code": 0,
+          "wall_s": 28.517973058857024,
+          "peak_rss_mib": 28405.7265625,
+          "peak_anon_mib": 15263.015625,
+          "peak_gpu_process_dedicated_mib": 7178,
+          "gpu_idle_baseline_mib": 604,
+          "peak_gpu_device_used_mib": 7789,
+          "peak_gpu_device_delta_mib": 7185,
+          "command": [
+            "/home/seungbaek/projects/nntrainer_ref/.validation/paligemma-pi05-20261113/pytorch-cuda-env/bin/python",
+            "tools/benchmark_vla_pytorch.py",
+            "pi05",
+            "cuda",
+            "--weights",
+            "/home/seungbaek/pi05-base-hf/model.safetensors",
+            "--reference",
+            "/tmp/nntrainer-port-audit/pi05-reference-fp32",
+            "--threads",
+            "4",
+            "--attention",
+            "sdpa"
+          ],
+          "threads": 4,
+          "runtime_environment": {
+            "NNTR_ENGINE": "cuda",
+            "NNTR_CUDA_DEV_ACT": "0",
+            "NNTR_CUDA_ASYNC": "0",
+            "NNTR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "LD_LIBRARY_PATH": "/home/seungbaek/cuda-toolkit/lib64",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+          },
+          "load_s": 26.572911,
+          "total_inference_s": 0.59053951,
+          "numeric": [
+            "per_step_velocity count=16000 max_abs=0.0018369853 rmse=0.00010083626 atol=0.005 rtol=0 failed=0",
+            "actions count=1600 max_abs=0.00056339055 rmse=7.7148086e-05 atol=0.01 rtol=0 failed=0"
+          ]
+        }
+      ]
+    }
+  ],
+  "methodology": {
+    "latency": "One request in each fresh process, after weight loading, including vision, all decoder/flow steps and first-use runtime costs; CUDA synchronized; median of 3.",
+    "memory": "Host peak process RSS including loading (VmHWM); sampled whole-GPU used-memory peak minus that run idle baseline; approximately 100 ms sampling plus query overhead. RSS and VRAM overlap for managed memory and must not be added.",
+    "pytorch": "PyTorch 2.13.0+cu132; PaliGemma Transformers 5.14.1 SDPA; pi0.5 Transformers 4.53.2 upstream replacements, vision SDPA and upstream eager language/expert; inference_mode, eval, no torch.compile. CUDA allocator expandable_segments:True.",
+    "pi05": "One active preprocessed camera, trimmed masked language padding, fixed noise, 10 Euler steps, 50x32 actions. GPU FP32 embedding table stays on CPU; prefix language is FP16 and cache converted to FP32 before FP32 expert. Unused vocabulary heads removed.",
+    "paligemma": "224x224 image; 272 prompt rows; exactly 11 generated tokens including EOS. Same inputs and precision in each CPU/GPU framework pair. NNTrainer retains a separate FP32 host embedding lookup table; Hugging Face shares its FP16 CUDA embedding/head weights."
+  },
+  "provenance": {
+    "base_commit": "141871a58ff439e3caeac40c1632ff8ac3543d20",
+    "openpi_commit": "215abfb217dbac7d5f1273282331b9b1866c0479",
+    "weights": [
+      {
+        "path": "/home/seungbaek/Downloads/paligemma/model-00003-of-00003.safetensors",
+        "bytes": 1740714288,
+        "header_sha256": "d6ca7dfb52c8ff0dd2a26194f1c3fd7430f00e1eda4b150cc8414b73086f265c"
+      },
+      {
+        "path": "/home/seungbaek/Downloads/paligemma/model-00002-of-00003.safetensors",
+        "bytes": 4999820608,
+        "header_sha256": "f04a1d58c84b15e9d87009d9330ff97a5c422b30fda33b82643fd563b9345858"
+      },
+      {
+        "path": "/home/seungbaek/Downloads/paligemma/model-00001-of-00003.safetensors",
+        "bytes": 4953412480,
+        "header_sha256": "e245cac0d5f1acfcd1f5b17fa0b59a5648d7be6257bc1e79df2bf73e2df94686"
+      },
+      {
+        "path": "/home/seungbaek/pi05-base-hf/model.safetensors",
+        "bytes": 14467165872,
+        "header_sha256": "c04b846b2d2b043945649a1a36b94a1798fa85c2ac0c1eeb3c63ea9b356b0215"
+      }
+    ]
+  },
+  "validation": {
+    "cpu_models": {
+      "total": 103,
+      "passed": 102,
+      "skipped": 1,
+      "failed": 0,
+      "skip_reason": "Gemma4 QINT4 packing requires ARM NEON; no x86 CPU dequant path."
+    },
+    "cuda_vla": {
+      "total": 3,
+      "passed": 3
+    },
+    "cuda_gelu_layernorm": {
+      "total": 4,
+      "passed": 4
+    },
+    "direct_cuda_pi05": [
+      {
+        "name": "v_t",
+        "count": 16000,
+        "max_abs": 0.0019282996654510498,
+        "rmse": 6.849783321100452e-05,
+        "atol": 0.005,
+        "failed": 0
+      },
+      {
+        "name": "actions",
+        "count": 1600,
+        "max_abs": 0.000426657497882843,
+        "rmse": 5.344265934967494e-05,
+        "atol": 0.01,
+        "failed": 0
+      }
+    ],
+    "known_existing_cuda_failure": "Gemma4DifferentialTest.FP32MatchesHFReference: 2 matched vs minimum 4; reproduces with all 3 modified common CUDA/MHA translation units rebuilt from HEAD."
+  }
+}
