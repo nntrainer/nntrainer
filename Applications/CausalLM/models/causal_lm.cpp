@@ -89,7 +89,7 @@ void clLaunchStatDump(const char *phase);
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_emb_gather.h> // [reload] gather LUT teardown
-#include <cuda_fc_qs4cx.h> // [lmhead-tie-lut] tied-head LUT registration
+#include <cuda_fc_qs4cx.h>   // [lmhead-tie-lut] tied-head LUT registration
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -544,6 +544,18 @@ void CausalLM::releaseLogitsBuf(float *buf) {
     return;
   }
   logits_pool_free_.emplace_back(it->second, buf);
+}
+
+void CausalLM::ensureHostLogits(float *buf) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  if (g_pending_logits.host == buf)
+    materialize_pending_logits();
+#endif
+#if defined(ENABLE_OPENCL)
+  if (g_cl_pending_logits.host == buf)
+    materialize_cl_pending_logits();
+#endif
+  (void)buf;
 }
 
 std::vector<float *> CausalLM::incrementalInference(

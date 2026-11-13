@@ -551,6 +551,14 @@ public:
    */
   virtual void fc(Tensor &input, Tensor &weight, Tensor &output);
 
+  /** Add a width-sized bias to every output row, if supported by the backend.
+   */
+  virtual bool fc_bias(Tensor &output, const Tensor &bias) {
+    (void)output;
+    (void)bias;
+    return false;
+  }
+
   /**
    * @brief Optional one-time weight transform at load time, e.g. an
    *        accelerator repack. Default no-op; called from the layer's read()

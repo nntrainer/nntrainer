@@ -1,0 +1,17 @@
+{
+  "model_tensor_type": "FP32-FP32",
+  "model_file_name": "nntr_paligemma_3b_fp32.bin",
+  "model_type": "CausalLM",
+  "embedding_dtype": "FP32",
+  "fc_layer_dtype": "FP32",
+  "lmhead_dtype": "FP32",
+  "batch_size": 1,
+  "bad_word_ids": [],
+  "init_seq_len": 1024,
+  "max_seq_len": 4096,
+  "num_to_generate": 64,
+  "tokenizer_file": "tokenizer.json",
+  "use_embedding": true,
+  "embedding_bin_path": "nntr_paligemma_3b_emb_fp32.bin",
+  "sample_input": "a wide shot of a large amount of vehicles stuck in a traffic jam"
+}

@@ -100,15 +100,6 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
     }
 #endif
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-    // The host residual path below reads GPU-produced UVM inputs on the CPU
-    // (copy()/add_i()). In async mode the producing kernels have not drained,
-    // so sync first; no-op in sync mode. Without this the residual stream is
-    // read while the producing kernel is still in flight -- fluent, wrong
-    // output that a debug sync makes disappear.
-    nntrainer::cuda::drain_if_async();
-#endif
-
     // The two-input join -- the residual stream's shape in every decoder --
     // can be one dispatch instead of a copy and an accumulate. Ask the op
     // table; a backend that cannot do it declines and the per-operand loop
@@ -129,6 +120,15 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
       if (hidden_step.getOps()->residual_op2(hidden_step, s0, s1))
         continue;
     }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // The host residual path below reads GPU-produced UVM inputs on the CPU
+    // (copy()/add_i()). In async mode the producing kernels have not drained,
+    // so sync first; no-op in sync mode. Without this the residual stream is
+    // read while the producing kernel is still in flight -- fluent, wrong
+    // output that a debug sync makes disappear.
+    nntrainer::cuda::drain_if_async();
+#endif
 
     /** @todo check possibility for in-place of addition layer */
     for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {

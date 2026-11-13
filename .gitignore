@@ -117,3 +117,33 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+# PaliGemma/pi0.5 conversion and reproducible differential drivers.
+!Applications/CausalLM/res/e2e_validation.h
+!Applications/CausalLM/res/paligemma/
+Applications/CausalLM/res/paligemma/*
+!Applications/CausalLM/res/paligemma/*.py
+!Applications/CausalLM/res/paligemma/nntr_config.json
+!Applications/CausalLM/res/paligemma/vision/
+Applications/CausalLM/res/paligemma/vision/*
+!Applications/CausalLM/res/paligemma/vision/*.json
+!Applications/CausalLM/res/paligemma/e2e/
+Applications/CausalLM/res/paligemma/e2e/*
+!Applications/CausalLM/res/paligemma/e2e/*.py
+!Applications/CausalLM/res/paligemma/e2e/*.cpp
+!Applications/CausalLM/res/paligemma/e2e/*.sh
+!Applications/CausalLM/res/paligemma/e2e/*.md
+!Applications/CausalLM/res/pi05/
+Applications/CausalLM/res/pi05/*
+!Applications/CausalLM/res/pi05/*.py
+!Applications/CausalLM/res/pi05/e2e/
+Applications/CausalLM/res/pi05/e2e/*
+!Applications/CausalLM/res/pi05/e2e/*.py
+!Applications/CausalLM/res/pi05/e2e/*.cpp
+!Applications/CausalLM/res/pi05/e2e/*.md
+
+# Locally generated validation models and scratch artifacts.
+/.validation/
+
+# pi0.5 tiny binary records are shipped in the reference fixture archive.
+/test/unittest/models/causallm_reference/pi05_tiny/*
+!/test/unittest/models/causallm_reference/pi05_tiny/*.json

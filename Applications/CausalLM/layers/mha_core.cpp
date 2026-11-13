@@ -1942,6 +1942,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // The FP32 path below prepares host-side views and attention scratch before
+  // RoPE. Its Q/K/V projections may still be queued in asynchronous mode.
+  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32)
+    nntrainer::cuda::drain_if_async();
+#endif
+
   // [kv-window-ring] Fail loud if a step write would straddle the ring seam.
   // A ringed layer takes one contiguous slice per call, so the PRODUCER must
   // never issue a call that crosses an absolute multiple of the prefill chunk
@@ -4778,7 +4785,9 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
-              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap))
+              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap, is_causal,
+              static_cast<int>(
+                std::get<nntrainer::props::MaxTimestep>(mha_core_props).get())))
           return;
       }
     }

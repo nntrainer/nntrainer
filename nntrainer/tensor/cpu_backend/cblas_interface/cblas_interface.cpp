@@ -13,6 +13,13 @@
 
 #include <cblas.h>
 #include <cblas_interface.h>
+#include <cstdint>
+#include <cstdlib>
+
+#ifdef USE_MKL
+extern "C" void MKL_Set_Num_Threads(int);
+extern "C" int MKL_Set_Num_Threads_Local(int);
+#endif
 
 namespace nntrainer {
 
@@ -22,20 +29,30 @@ namespace nntrainer {
  *                         Otherwise, directly call openblas API.
  */
 void __openblas_set_num_threads(int num_threads) {
+#ifdef USE_MKL
   if (num_threads < 0) {
-  #ifdef BLAS_NUM_THREADS
+#ifdef BLAS_NUM_THREADS
+    MKL_Set_Num_Threads(BLAS_NUM_THREADS);
+#endif
+  } else {
+    MKL_Set_Num_Threads(num_threads);
+  }
+#else
+  if (num_threads < 0) {
+#ifdef BLAS_NUM_THREADS
     openblas_set_num_threads(BLAS_NUM_THREADS);
-  #else
+#else
     /// Without openblas_set_num_threads,
     /// it's set std::thread::hardware_concurrency()
     /// It can be too high especially when the given blas function is small
     /// or if there are other threads already created (nntrainer thread pool)
     /// With big-little & threadboost, hardware_concurrency might be not good.
     /// @todo configure this! (4? num of big cores? ...)
-  #endif
+#endif
   } else {
     openblas_set_num_threads(num_threads);
   }
+#endif
 }
 void __cblas_saxpy(const unsigned int N, const float alpha, const float *X,
                    const unsigned int incX, float *Y, const unsigned int incY) {
@@ -82,8 +99,25 @@ void __cblas_sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
   CBLAS_TRANSPOSE transA = TransA ? CblasTrans : CblasNoTrans;
   CBLAS_TRANSPOSE transB = TransB ? CblasTrans : CblasNoTrans;
   CBLAS_ORDER order = TStorageOrder ? CblasColMajor : CblasRowMajor;
+#ifdef USE_MKL
+  // Attention heads are parallelized by the caller. Starting another BLAS
+  // team for each small matrix adds scheduling cost and oversubscribes cores.
+  const bool small = M > 1 && N > 1 &&
+                     static_cast<std::uint64_t>(M) * N * K <= 32u * 1024 * 1024;
+  static const int vector_threads = [] {
+    const char *value = std::getenv("NNTR_MKL_VECTOR_THREADS");
+    const int count = value ? std::atoi(value) : 0;
+    return count > 0 ? count : 0;
+  }();
+  const int requested = small ? 1 : (M == 1 ? vector_threads : 0);
+  const int previous = requested ? MKL_Set_Num_Threads_Local(requested) : 0;
+#endif
   cblas_sgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C,
               ldc);
+#ifdef USE_MKL
+  if (requested)
+    MKL_Set_Num_Threads_Local(previous);
+#endif
 }
 
 unsigned int __cblas_isamax(const unsigned int N, const float *X,

@@ -411,6 +411,7 @@ public:
                    bool accumulate) override;
   // output = input * weight via host Tensor::dot.
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
+  bool fc_bias(Tensor &output, const Tensor &bias) override;
   // In-place whole-tensor activation, expressed via activation() above.
   void apply_activation(Tensor &out, int act_type) override;
   // Host row reductions, expressed in terms of the very Tensor calls their

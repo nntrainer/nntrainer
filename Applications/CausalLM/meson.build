@@ -372,6 +372,33 @@ e_safetensors_info = executable('nntr_safetensors_info',
     dependencies: [nntrainer_dep],
 )
 
+# PaliGemma e2e verification driver: composes SiglipVisionModel (fed the HF
+# processor's pixel_values verbatim) + PaliGemmaCausalLM and checks the
+# generated tokens against the HF greedy reference dumped by
+# res/paligemma/e2e/golden_dump.py.
+paligemma_e2e_src = [
+    meson.current_source_dir() / 'res' / 'paligemma' / 'e2e' / 'mm_driver.cpp',
+]
+
+e_paligemma_e2e = executable('nntr_paligemma_e2e',
+    paligemma_e2e_src,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+# pi0.5 e2e verification driver: SiglipVisionModel + PI05Model (backbone
+# prefix pass + expert Euler loop) checked against the openpi reference
+# dumped by res/pi05/e2e/golden_dump.py.
+pi05_e2e_src = [
+    meson.current_source_dir() / 'res' / 'pi05' / 'e2e' / 'pi05_driver.cpp',
+]
+
+e_pi05_e2e = executable('nntr_pi05_e2e',
+    pi05_e2e_src,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
 
 # ── E4: libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe) ──────────
 # Mirrors QuickAI's api/meson.build: xgrammar is compiled once into
@@ -599,6 +626,9 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_xlm_roberta_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_paligemma.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_paligemma_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_pi05.cpp',
       ],
       dependencies: [
         nntrainer_dep,
@@ -630,6 +660,24 @@ if get_option('enable-test')
       [
         meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+      ],
+      dependencies: [
+        nntrainer_dep,
+        nntrainer_ccapi_dep,
+        gtest_main_dep,
+        causallm_layer_dependencies,
+        causallm_dep
+      ],
+      include_directories: causallm_inc + [causallm_unittest_inc],
+      build_by_default: false,
+      install: false,
+    )
+    unittest_cuda_vla = executable(
+      'unittest_cuda_vla',
+      [
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_pi05.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_paligemma_reference.cpp',
       ],
       dependencies: [
         nntrainer_dep,

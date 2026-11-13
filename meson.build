@@ -538,7 +538,18 @@ endif
 if get_option('enable-blas')
   extra_defines += '-DUSE_BLAS=1'
 
-  if get_option('platform') == 'android'
+  if get_option('blas-provider') == 'mkl'
+    if not (arch == 'x86' or arch == 'x86_64')
+      error('The MKL BLAS provider requires an x86 target')
+    endif
+    mkl_dirs = get_option('mkl-libdir') == '' ? [] : [get_option('mkl-libdir')]
+    mkl_library = cxx.find_library('mkl_rt', dirs: mkl_dirs, required: true)
+    # CBLAS is a standard interface. Reuse its installed declarations without
+    # linking OpenBLAS into a build that selects MKL.
+    cblas_headers = dependency('openblas').partial_dependency(compile_args: true, includes: true)
+    blas_dep = declare_dependency(dependencies: [mkl_library, cblas_headers])
+    extra_defines += '-DUSE_MKL=1'
+  elif get_option('platform') == 'android'
     message('preparing blas')
     run_command([meson.source_root() / 'jni' / 'prepare_openblas.sh', meson.build_root()], check: true)
     blas_root = meson.build_root() / 'openblas'

@@ -55,6 +55,9 @@
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
 #include "lfm2_causallm.h"
+#include "paligemma/paligemma_causallm.h"
+#include "paligemma/siglip_vision.h"
+#include "pi05/pi05_model.h"
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
@@ -212,6 +215,21 @@ void registerAllModels() {
       "Lfm2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
                                                         nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "PaliGemmaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::PaliGemmaCausalLM>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "SiglipVisionModel", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::SiglipVisionModel>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "PI05Model", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::PI05Model>(cfg, generation_cfg,
+                                                     nntr_cfg);
       });
   });
 }

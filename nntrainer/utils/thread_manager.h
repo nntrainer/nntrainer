@@ -172,6 +172,12 @@ public:
       return;
     }
 
+    if (shared_parallel_ && end - begin > 1) {
+      parallelizeShared(begin, end,
+                        std::function<void(size_t)>(std::forward<F>(fn)));
+      return;
+    }
+
     if (end - begin == 1 || compute_workers_.empty()) {
       for (size_t i = begin; i < end; i++)
         fn(i);
@@ -186,7 +192,8 @@ public:
    */
   uint32_t getComputeThreadCount() const {
     // main thread is not in compute_workers
-    return static_cast<uint32_t>(compute_workers_.size()) + 1;
+    return shared_threads_ ? shared_threads_
+                           : static_cast<uint32_t>(compute_workers_.size()) + 1;
   }
 
   /**
@@ -319,6 +326,16 @@ protected:
   void initialize() noexcept override;
 
 private:
+  // Optional MKL/Intel OpenMP team; other builds use the ordinary pool.
+  void parallelizeShared(size_t begin, size_t end,
+                         const std::function<void(size_t)> &task);
+  using SharedParallel = void (*)(void (*)(void *), void *, unsigned int,
+                                  unsigned int);
+  SharedParallel shared_parallel_ = nullptr;
+  int (*shared_thread_num_)() = nullptr;
+  int (*shared_num_threads_)() = nullptr;
+  int (*shared_in_parallel_)() = nullptr;
+  uint32_t shared_threads_ = 0;
   std::vector<std::thread> compute_workers_;
 
   std::unique_ptr<thread_info[]> thread_infos_;
@@ -336,7 +353,7 @@ private:
   std::condition_variable completion_cv_;
 #endif
 
-  const uint32_t SPIN_COUNT = 1000000;
+  uint32_t spin_count_ = 1000000; /**< bounded spin before blocking */
   const uint32_t COMMAND_MASK = 0x7FFFFFFF;
 
   // ─── Config ─────────────────────────────────────────

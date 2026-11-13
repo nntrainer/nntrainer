@@ -11,6 +11,7 @@
  *
  */
 
+#include <cpu_memory_hints.h>
 #include <cstdlib>
 #include <cstring>
 #include <mem_allocator.h>
@@ -58,6 +59,7 @@ void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   NNTR_THROW_IF(*ptr == nullptr, std::runtime_error)
     << "MemAllocator::alloc: aligned_alloc(" << alignment << ", "
     << aligned_size << ") failed";
+  hintCpuHugePages(*ptr, size);
 }
 
 void MemAllocator::free(void *ptr) {

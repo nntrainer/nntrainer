@@ -19,11 +19,13 @@
 #include <cpu_ops_table.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
 #include <acti_func.h>
 #include <tensor.h>
+#include <thread_manager.h>
 
 namespace nntrainer {
 
@@ -118,13 +120,12 @@ void elementwise2_rows(const Tensor &in1, const Tensor &in2, Tensor &out,
  * baseline). An arch-specialized version can follow the existing
  * rms_norm_wrt_width_*_intrinsic pattern (x86/avx2_impl.h, arm/neon_impl.h) --
  * LayerNorm adds mean subtraction and gamma/beta but the row-wise reduction
- * structure is identical; row-level threading applies for prefill windows.
- * Not yet implemented.
+ * structure is identical. Prefill rows already share the operator thread pool.
  */
 template <typename T, typename G>
 void layernorm_rows(const T *x, const G *g, const G *b, T *y, unsigned int rows,
                     unsigned int width, float eps) {
-  for (unsigned int r = 0; r < rows; ++r) {
+  const auto compute_row = [&](size_t r) {
     const T *xr = x + (size_t)r * width;
     T *yr = y + (size_t)r * width;
 
@@ -142,7 +143,12 @@ void layernorm_rows(const T *x, const G *g, const G *b, T *y, unsigned int rows,
 
     for (unsigned int k = 0; k < width; ++k)
       yr[k] = (T)((((float)xr[k] - mean) * inv) * (float)g[k] + (float)b[k]);
-  }
+  };
+  if (rows >= 8)
+    ThreadManager::Global().parallel_for(0, rows, compute_row);
+  else
+    for (unsigned int r = 0; r < rows; ++r)
+      compute_row(r);
 }
 
 /**
@@ -171,6 +177,31 @@ void gelu_elems(const T *x, T *y, size_t n, bool tanh_mode) {
 
 void CpuComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                           unsigned int active_rows, unsigned int row_offset) {
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      in1.getDim() == in2.getDim() && in1.getDim() == out.getDim()) {
+    const size_t offset = static_cast<size_t>(row_offset) * in1.width();
+    const size_t n = static_cast<size_t>(active_rows) * in1.width();
+    const auto compute = [&](size_t start, size_t count) {
+      nntrainer::tanh_gelu_mul(
+        count, out.getData<float>() + offset + start,
+        const_cast<float *>(in1.getData<float>() + offset + start),
+        const_cast<float *>(in2.getData<float>() + offset + start));
+    };
+#if defined(__x86_64__) || defined(_M_X64)
+    // The AVX implementation is serial. Leave decode serial, but split large
+    // prefill planes across the existing operator pool.
+    if (n >= 65536) {
+      constexpr size_t chunk = 16384;
+      ThreadManager::Global().parallel_for(
+        0, (n + chunk - 1) / chunk, [&](size_t part) {
+          const size_t start = part * chunk;
+          compute(start, std::min(chunk, n - start));
+        });
+    } else
+#endif
+      compute(0, n);
+    return;
+  }
   elementwise2_rows(in1, in2, out, active_rows, row_offset, "geglu",
                     [](float a, float b) { return gelu_tanh_f(a) * b; });
 }
@@ -346,6 +377,35 @@ void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
 
 void CpuComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   input.dot(weight, output, false, false);
+}
+
+bool CpuComputeOps::fc_bias(Tensor &out, const Tensor &bias) {
+  // Accelerator tables inherit this class too; leave their broadcast policy
+  // to their own implementation rather than host-writing device tensors.
+  if (this != get_cpu_ops() || out.getDataType() != Tdatatype::FP32 ||
+      bias.getDataType() != Tdatatype::FP32 ||
+      out.getFormat() != Tformat::NCHW || !out.getContiguous() ||
+      !bias.getContiguous() || !out.width() || bias.size() != out.width())
+    return false;
+  auto *data = out.getData<float>();
+  const auto *offset = bias.getData<float>();
+  const auto start = reinterpret_cast<uintptr_t>(data);
+  const auto bias_start = reinterpret_cast<uintptr_t>(offset);
+  if (start < bias_start + bias.size() * sizeof(float) &&
+      bias_start < start + out.size() * sizeof(float))
+    return false;
+  const size_t width = out.width(), rows = out.size() / width;
+  const auto add_row = [&](size_t r) {
+    float *row = data + r * width;
+    for (size_t i = 0; i < width; ++i)
+      row[i] += offset[i];
+  };
+  if (out.size() >= 65536)
+    ThreadManager::Global().parallel_for(0, rows, add_row);
+  else
+    for (size_t r = 0; r < rows; ++r)
+      add_row(r);
+  return true;
 }
 
 void CpuComputeOps::apply_activation(Tensor &out, int act_type) {
