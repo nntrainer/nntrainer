@@ -697,10 +697,9 @@ TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_3072x102x1024_CMP) {
  * 4. Running GEMM with packed weights
  * 5. Comparing against FP32 reference GEMM
  */
-static void run_transform_osv32_to_qsi4c32p_test(const uint32_t K,
-                                                 const uint32_t N,
-                                                 uint32_t kernel_idx = 3,
-                                                 bool print = false) {
+static void run_transform_osv32_to_qsi4c32p_test(
+  const uint32_t K, const uint32_t N,
+  uint32_t kernel_idx = nntr_kai_get_qsi4c32p4x8_idx(), bool print = false) {
   const uint32_t M = 3072;      // Batch size for GEMM test
   const size_t group_size = 32; // Fixed group size
 
@@ -770,7 +769,8 @@ static void run_transform_osv32_to_qsi4c32p_test(const uint32_t K,
 #define DECLARE_transform_osv32_to_qsi4c32p_test(K, N)                         \
   TEST(nntrainer_cpu_backend_standalone,                                       \
        transform_osv32_to_qsi4c32p_K##K##_N##N) {                              \
-    run_transform_osv32_to_qsi4c32p_test(K, N, 3, true);                       \
+    run_transform_osv32_to_qsi4c32p_test(K, N, nntr_kai_get_qsi4c32p4x8_idx(), \
+                                         true);                                \
   }
 
 // Test cases with various K and N dimensions

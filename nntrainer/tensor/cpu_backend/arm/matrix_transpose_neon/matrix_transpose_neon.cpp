@@ -20,6 +20,17 @@ void transpose_neon(unsigned int M, unsigned int N, const float *src,
   float *src_ptr = (float *)(src);
   float *dst_ptr = (float *)(dst);
 
+  /// the remainder handling below re-transposes the last full 4x4 tile, which
+  /// does not exist when either dimension is smaller than 4
+  if (M < 4 || N < 4) {
+    for (unsigned int i = 0; i < M; ++i) {
+      for (unsigned int j = 0; j < N; ++j) {
+        dst_ptr[i + j * ld_dst] = src_ptr[i * ld_src + j];
+      }
+    }
+    return;
+  }
+
   unsigned int M_blocks = M / 4;
   unsigned int N_blocks = N / 4;
   unsigned int M_left = M % 4;
