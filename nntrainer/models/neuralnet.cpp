@@ -57,7 +57,7 @@
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h> // cuda::drain_if_async
-#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#include <cuda_fc_qs4cx.h>        // [wprefetch] cuda_fc_qs4cx_prefetch_weight
 #endif
 
 #include <activation_realizer.h>
@@ -2572,6 +2572,14 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   }
   // auto end_increment = std::chrono::high_resolution_clock::now();
   std::vector<float *> output;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // This overload returns host-owned float arrays. Managed memory is
+  // addressable on the host, but pending device writes must complete first.
+  if (auto *context = getDecodeContext();
+      context && context->getName() == "cuda")
+    cuda::drain_if_async();
+#endif
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
