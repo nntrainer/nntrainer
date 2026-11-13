@@ -5288,12 +5288,16 @@ private:
     const char *spin_env = std::getenv("NNTR_HTP_DSPQ_SPIN_US");
     const size_t logits_bytes =
       e2e_ ? static_cast<size_t>(graph_words_[5]) * 4u : 0u;
+    /** The tunnel's 100 us covers the decode gaps between two entries
+     *  (99% are under 50 us): a call that finds the thread blocked pays
+     *  about 5 us more to wake it. A spin is a DSP thread the prefill's
+     *  calls do not get; at 100 us the 8192-token prefill was no slower. */
     dspq_ = dspqMake(
       session, CDSP_DOMAIN_ID, "dspq",
       std::max<size_t>(HTP_DSPQ_BUF_BYTES, logits_bytes),
       e2e_       ? e2eSpinUs()
       : spin_env ? static_cast<uint32_t>(std::strtoul(spin_env, nullptr, 10))
-      : tunnelEnabled() ? 0u // a spinning thread slows the prefill's calls
+      : tunnelEnabled() ? 100u
                         : 1000u);
   }
 
