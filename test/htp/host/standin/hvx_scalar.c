@@ -106,22 +106,37 @@ static int32_t staged_at(const hvx_dq_tiles_job *c, const uint8_t *tile,
    kernel points it at. rows1 picks between two HVX loops that compute
    the same int32 sums (hvx_gemm_u8i4_wh.c), so it is one function here;
    the l2fetch entry point is a no-op unless a check hooks it. ---- */
-void hvx_scalar_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
-                     const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                     int32_t *out) {
+static void gemv_ats(const uint8_t *act_ah, uint32_t ats, uint32_t m,
+                     uint32_t k_tiles, const uint8_t *wh, uint32_t n_col,
+                     uint32_t nt, int32_t *out) {
   if (m != 0u && k_tiles != 0u)
-    buf(act_ah, (size_t)(k_tiles - 1u) * 2048u + (size_t)m * 32u, 0);
+    buf(act_ah, (size_t)(k_tiles - 1u) * ats + (size_t)m * 32u, 0);
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t c = 0; c < 32; ++c) {
       int32_t s = 0;
       for (uint32_t kt = 0; kt < k_tiles; ++kt) {
         const uint8_t *tile = wh + ((size_t)kt * n_col + nt) * 512u;
-        const uint8_t *arow = act_ah + (size_t)kt * 2048u + r * 32u;
+        const uint8_t *arow = act_ah + (size_t)kt * ats + r * 32u;
         for (uint32_t k = 0; k < 32; ++k)
           s += (int32_t)arow[k] * wh_value(tile, k, c);
       }
       out[r * 32u + c] = s;
     }
+}
+void hvx_scalar_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                     const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                     int32_t *out) {
+  gemv_ats(act_ah, 2048u, m, k_tiles, wh, n_col, nt, out);
+}
+void hvx_gemm_u8i4_rows_pack(uint8_t *dst, const uint8_t *act_ah, uint32_t m,
+                             uint32_t k_tiles) {
+  for (uint32_t kt = 0; kt < k_tiles; ++kt)
+    memcpy(dst + (size_t)kt * m * 32u, act_ah + (size_t)kt * 2048u, m * 32u);
+}
+void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
+                              uint32_t k_tiles, const uint8_t *wh,
+                              uint32_t n_col, uint32_t nt, int32_t *out) {
+  gemv_ats(act, ats, m, k_tiles, wh, n_col, nt, out);
 }
 void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
                                uint32_t n_tiles, uint32_t k_tiles) {

@@ -77,6 +77,28 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
                                int32_t *out);
 
 /**
+ * @brief hvx_gemm_u8i4_wh_col_nopf (rows1 set) over an activation whose
+ *        k-tile row blocks are @a ats bytes apart instead of an AH tile's
+ *        2048, and a 128-byte aligned @a wh (a VTCM buffer): the same sums.
+ *
+ * At the AH stride every k-tile's row sits 2 KiB past the last, on few
+ * enough L1 sets that a column's lines miss again each column; rows packed
+ * at @a ats = 32 m share a line between two k-tiles.
+ */
+void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
+                              uint32_t k_tiles, const uint8_t *wh,
+                              uint32_t n_col, uint32_t nt, int32_t *out);
+
+/**
+ * @brief Rows 0..@a m-1 (m <= 4) of each of @a k_tiles AH tiles packed
+ *        into @a dst, k-tile kt at kt * 32 m: hvx_gemm_u8i4_wh_col_ats's
+ *        @a ats = 32 m activation. One vector a k-tile, each store over the
+ *        last one's tail, so @a dst takes 128 - 32 m bytes past the end.
+ */
+void hvx_gemm_u8i4_rows_pack(uint8_t *dst, const uint8_t *act_ah, uint32_t m,
+                             uint32_t k_tiles);
+
+/**
  * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)
  *        over all @a k_tiles: n_tiles*512 bytes every n_col*512, k_tiles
  *        times. A hint only; it changes no result. The hardware queues
