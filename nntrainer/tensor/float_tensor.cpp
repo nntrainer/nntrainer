@@ -1043,6 +1043,11 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
 Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
                               bool trans_in, float beta,
                               Tdatatype dtype) const {
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+  /// @todo dotprod-only: pack for nr=4/kr=8 and use variants 0 / 4
+  throw std::runtime_error(
+    "FloatTensor::dotQs4cx: QS4CX without i8mm is not yet implemented");
+#else
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
@@ -1088,9 +1093,10 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
    * A virtual (on-demand mapped) weight is the exception: its plain bytes
    * come and go with the mapping, and caching a pack for each one would keep
    * the whole set resident, which is what mapping it on demand avoids. It
-   * keeps packing per call. So does ARMv7, which has no KAI packer.
+   * keeps packing per call. So does a build without dotprod (e.g. ARMv7),
+   * which has no KAI packer.
    */
-#if !defined(ARMV7)
+#if defined(__ARM_FEATURE_DOTPROD)
   if (!input.isPacked() && !input.isVirtual()) {
     static std::mutex qs4cx_pack_mtx;
     std::lock_guard<std::mutex> lk(qs4cx_pack_mtx);
@@ -1121,6 +1127,7 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
 #endif
 
   return output;
+#endif
 }
 
 void FloatTensor::copy(const Tensor &from) {
