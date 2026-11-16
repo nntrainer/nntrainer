@@ -44,7 +44,7 @@ jobs:
       matrix:
         include:
         - language: c-cpp
-          build-mode: manual
+          build-mode: none
         - language: python
           build-mode: none
         # CodeQL supports the following values keywords for 'language': 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'swift'
@@ -66,58 +66,21 @@ jobs:
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
       if: github.event_name != 'pull_request' || env.rebuild == '1'
-      uses: github/codeql-action/init@v3
+      uses: github/codeql-action/init@v4
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
+        # vendored submodules; skip them if ever checked out
+        config: |
+          paths-ignore:
+            - subprojects
         # If you wish to specify custom queries, you can do so here or in a config file.
         # By default, queries listed here will override any specified in a config file.
         # Prefix the list here with "+" to use these queries and those in the config file.
         # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
         # queries: security-extended,security-and-quality
-    # If the analyze step fails for one of the languages you are analyzing with
-    # "We were unable to automatically build your code", modify the matrix above
-    # to set the build mode to "manual" for that language. Then modify this step
-    # to build your code.
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-    - if: (github.event_name != 'pull_request' || env.rebuild == '1') && matrix.build-mode == 'manual'
-      shell: bash
-      run: |
-        sudo rm -f /etc/apt/sources.list.d/azure-cli.sources /etc/apt/sources.list.d/azure-cli.list || true
-        sudo add-apt-repository -y ppa:nnstreamer/ppa && sudo apt-get update
-        sudo apt-get update && sudo apt-get install -y gcc g++ pkg-config libopenblas-dev libiniparser-dev libjsoncpp-dev libcurl3-dev tensorflow2-lite-dev nnstreamer-dev libglib2.0-dev libgstreamer1.0-dev libgtest-dev ml-api-common-dev flatbuffers-compiler ml-inference-api-dev libunwind-dev
-        sudo apt-get install -y python3-dev python3-numpy python3
-        sudo add-apt-repository ppa:ubuntu-toolchain-r/test
-        sudo apt-get update
-        sudo apt-get install build-essential
-        sudo apt-get install -y gcc-13 g++-13 --fix-missing
-        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 1000 
-        sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 1000
-        sudo update-alternatives --set gcc /usr/bin/gcc-13
-        pip install meson ninja
-        git submodule sync && git submodule update --init --recursive
-        meson setup \
-          --buildtype=plain \
-          --prefix=/usr \
-          --sysconfdir=/etc \
-          --libdir=lib/x86_64-linux-gnu \
-          --bindir=lib/nntrainer/bin \
-          --includedir=include \
-          -Dinstall-app=true \
-          -Dreduce-tolerance=false \
-          -Denable-debug=true \
-          -Dml-api-support=enabled \
-          -Denable-nnstreamer-tensor-filter=enabled \
-          -Denable-nnstreamer-tensor-trainer=enabled \
-          -Denable-nnstreamer-backbone=true \
-          -Dcapi-ml-common-actual=capi-ml-common \
-          -Dcapi-ml-inference-actual=capi-ml-inference \
-          -Denable-capi=enabled \
-          build/
-        meson compile -C build/
     - name: Perform CodeQL Analysis
       if: github.event_name != 'pull_request' || env.rebuild == '1'
-      uses: github/codeql-action/analyze@v3
+      uses: github/codeql-action/analyze@v4
       with:
         category: "/language:${{matrix.language}}"
