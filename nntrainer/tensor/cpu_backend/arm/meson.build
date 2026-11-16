@@ -9,7 +9,8 @@ arm_compute_backend_sources = [
     'neon_impl.cpp',
 ]
 
-if arm_target == 'aarch64'
+# Every KleidiAI matmul kernel needs dotprod; without it the fallback is used
+if arm_target == 'aarch64' and 'dotprod' in arm_features
   subdir('kai_interface')
   nntrainer_inc += include_directories('kai_interface')
   nntrainer_inc_abs += meson.current_source_dir() / 'kai_interface'

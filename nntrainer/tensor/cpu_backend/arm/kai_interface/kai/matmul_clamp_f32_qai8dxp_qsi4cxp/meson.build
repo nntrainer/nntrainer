@@ -17,11 +17,17 @@ matmul_clamp_f32_qai8dxp_qsi4cxp_sources = [
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.c',
+]
+
+# i8mm kernels #error without __ARM_FEATURE_MATMUL_INT8
+if 'i8mm' in arm_features
+  matmul_clamp_f32_qai8dxp_qsi4cxp_sources += [
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm.c',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_8x4x32_neon_i8mm.c',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.c',
-    'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.c'
-]
+    'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.c',
+  ]
+endif
 
 
 foreach s : matmul_clamp_f32_qai8dxp_qsi4cxp_sources

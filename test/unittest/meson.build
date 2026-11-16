@@ -139,7 +139,10 @@ if get_option('enable-profile')
 endif
 
 if host_machine.cpu_family() == 'aarch64'
-  test_target += [['unittest_nntrainer_kleidiai', []]]
+  # KleidiAI is built only with dotprod
+  if 'dotprod' in arm_features
+    test_target += [['unittest_nntrainer_kleidiai', []]]
+  endif
   test_target += [['unittest_nntrainer_ggml_arm', []]]
 endif
 

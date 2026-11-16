@@ -237,6 +237,11 @@ void QS4CX_Tensor::pack() {
   // Host reader of the plain nibbles + scales (the KAI rhs pack).
   refuseIfQs4cxPayloadDropped(getData(), "QS4CX_Tensor::pack");
 
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+  /// @todo dotprod-only: pack for nr=4/kr=8 (variants 0 / 4)
+  throw std::runtime_error(
+    "QS4CX_Tensor::pack: QS4CX without i8mm is not yet implemented");
+#else
   size_t opt_kernel_idx = 8;
   /**
    * @note QS4CX tensor assumes that it is per-channel quantized along width()
@@ -262,6 +267,7 @@ void QS4CX_Tensor::pack() {
   // Publish last: a thread that sees this flag through the unlocked check in
   // FloatTensor::dotQs4cx must also see the buffer filled above.
   packed_f32.store(true, std::memory_order_release);
+#endif
 }
 
 void *QS4CX_Tensor::getPackedData() const {
@@ -273,7 +279,12 @@ void *QS4CX_Tensor::getPackedData() const {
 }
 
 void QS4CX_Tensor::packF16Activation() {
-#if defined(__aarch64__) || defined(__arm__)
+#if (defined(__aarch64__) || defined(__arm__)) &&                              \
+  !defined(__ARM_FEATURE_DOTPROD)
+  /// @todo fp16 activation without dotprod: the fp16 GEMM is KleidiAI-only
+  throw std::runtime_error("QS4CX_Tensor::packF16Activation: QS4CX with fp16 "
+                           "activation needs dotprod (KleidiAI)");
+#elif defined(__aarch64__) || defined(__arm__)
   if (packed_f16.load(std::memory_order_acquire) ||
       packed_f32.load(std::memory_order_acquire)) {
     return;
