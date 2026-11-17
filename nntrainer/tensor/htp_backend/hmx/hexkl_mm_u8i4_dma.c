@@ -710,6 +710,16 @@ static void gemv_pf_learn(uint32_t h, uint32_t wb) {
  *         64-row HMX block: the decode row, and a small batch. */
 #define LAYER_GEMV_MAX_ROWS 4u
 
+/**
+ * @brief DMA queues the GEMV path spreads a weight over (#177's lanes).
+ *
+ * One: with the src bypass, M = 1 over six weights took 160 us (up,
+ * 1536 x 6 x 2048) / 182 (down, 12288 x 6 x 256) on the S26 Ultra at one
+ * queue and 160 / 212 at four; the S25 Ultra 172 / 666-943 at one, no
+ * better at two or four. The bypass, not the queue count, was the win.
+ */
+#define LAYER_GEMV_DMA_Q 1u
+
 /** @brief One weight's columns on the HVX GEMV, split over the pool. */
 typedef struct {
   const uint8_t *act_ah; /**< cached memory: the rows, a k-tile ats apart */
@@ -734,6 +744,15 @@ static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
     __attribute__((aligned(128)));
   for (uint32_t nt = lo; nt < hi; ++nt) {
     const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
+#if defined(__hexagon__)
+    /* lane i < LAYER_GEMV_DMA_Q issued the next weight's DMA, which
+       advances only while this thread polls (fc_layer_run's note): without
+       it the move ran in the wait after the compute. gemm_row1_u polls
+       again inside a deep column. */
+    if (i < LAYER_GEMV_DMA_Q) {
+      hexkl_dma_poll();
+    }
+#endif
     hvx_gemm_u8i4_wh_col_ats(j->act_ah, j->ats, j->sum_ah, j->M, j->k_tiles,
                              j->wh, j->nt_n, nt, acc);
     if (j->act_lo != NULL) {
@@ -751,16 +770,6 @@ static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
                                 j->out + c0, j->ld, j->accumulate);
   }
 }
-
-/**
- * @brief DMA queues the GEMV path spreads a weight over (#177's lanes).
- *
- * One: with the src bypass, M = 1 over six weights took 160 us (up,
- * 1536 x 6 x 2048) / 182 (down, 12288 x 6 x 256) on the S26 Ultra at one
- * queue and 160 / 212 at four; the S25 Ultra 172 / 666-943 at one, no
- * better at two or four. The bypass, not the queue count, was the win.
- */
-#define LAYER_GEMV_DMA_Q 1u
 
 /** @brief Per lane, its one descriptor of the current run; a lane waits for
  *         it before its unit returns, so the next run may reuse it. */

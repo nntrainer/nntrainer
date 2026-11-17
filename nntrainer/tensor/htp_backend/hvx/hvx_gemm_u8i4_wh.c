@@ -130,6 +130,14 @@ static inline void gemm_row1_u(const uint8_t *act, uint32_t ats,
     if (kt + ROW1_ACT_LEAD < pf_end) {
       Q6_dcfetch_A((void *)(a0 + ROW1_ACT_LEAD * ats / 4u));
     }
+    /* the GEMV lane that issued the next weight's DMA keeps it moving
+       through a deep column (K = 12288 is 384 k-tiles); a dmpoll on a
+       thread with nothing in flight changes nothing */
+    if ((kt & 15u) == 15u) {
+      unsigned r;
+      asm volatile(" %0 = dmpoll" : "=r"(r) : : "memory");
+      (void)r;
+    }
 #endif
     for (uint32_t g = 0; g < 4u; ++g) {
       const HVX_Vector x =
