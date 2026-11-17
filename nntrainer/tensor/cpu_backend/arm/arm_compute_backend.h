@@ -1368,6 +1368,37 @@ void dequantize_row_q8_0(const void *x_raw, T *y, int64_t k);
 void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon);
+/**
+ * @brief layer normalization w.r.t. width in H*W matrix input,
+ *        Y = (X - mean) / sqrt(var + epsilon) * gamma + beta per row
+ *
+ * @param X input
+ * @param gamma scale, W elements
+ * @param beta shift, W elements
+ * @param Y output, may alias X (in-place)
+ * @param H height of input matrix
+ * @param W width of input matrix
+ * @param epsilon epsilon added to the variance
+ */
+void layernorm_wrt_width_fp32(const float *X, const float *__restrict gamma,
+                              const float *__restrict beta, float *Y, size_t H,
+                              size_t W, float epsilon);
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16 in / out layer normalization w.r.t. width, FP32 accumulation
+ *
+ * @param X input
+ * @param gamma scale, W elements
+ * @param beta shift, W elements
+ * @param Y output, may alias X (in-place)
+ * @param H height of input matrix
+ * @param W width of input matrix
+ * @param epsilon epsilon added to the variance
+ */
+void layernorm_wrt_width_fp16(const _FP16 *X, const _FP16 *__restrict gamma,
+                              const _FP16 *__restrict beta, _FP16 *Y, size_t H,
+                              size_t W, float epsilon);
+#endif
 
 /**
  * @brief Causal depthwise Conv1D prefill for kernel size 3.

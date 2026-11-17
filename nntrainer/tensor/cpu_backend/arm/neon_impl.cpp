@@ -1944,6 +1944,74 @@ void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
   }
 }
 
+void layernorm_wrt_width_fp32(const float *X, const float *__restrict gamma,
+                              const float *__restrict beta, float *Y, size_t H,
+                              size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const float *x = X + h * W;
+    float *y = Y + h * W;
+
+    // pass 1: mean
+    float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+    size_t i = 0;
+    for (; i + 16 <= W; i += 16) {
+      a0 = vaddq_f32(a0, vld1q_f32(x + i));
+      a1 = vaddq_f32(a1, vld1q_f32(x + i + 4));
+      a2 = vaddq_f32(a2, vld1q_f32(x + i + 8));
+      a3 = vaddq_f32(a3, vld1q_f32(x + i + 12));
+    }
+    for (; i + 4 <= W; i += 4)
+      a0 = vaddq_f32(a0, vld1q_f32(x + i));
+    float sum = hsum_f32x4(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < W; ++i)
+      sum += x[i];
+    const float mean = sum / (float)W;
+    const float32x4_t vmean = vdupq_n_f32(mean);
+
+    // pass 2: variance of the centered row
+    a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+    i = 0;
+    for (; i + 16 <= W; i += 16) {
+      float32x4_t d0 = vsubq_f32(vld1q_f32(x + i), vmean);
+      float32x4_t d1 = vsubq_f32(vld1q_f32(x + i + 4), vmean);
+      float32x4_t d2 = vsubq_f32(vld1q_f32(x + i + 8), vmean);
+      float32x4_t d3 = vsubq_f32(vld1q_f32(x + i + 12), vmean);
+      a0 = VFMAQ_F32(a0, d0, d0);
+      a1 = VFMAQ_F32(a1, d1, d1);
+      a2 = VFMAQ_F32(a2, d2, d2);
+      a3 = VFMAQ_F32(a3, d3, d3);
+    }
+    for (; i + 4 <= W; i += 4) {
+      float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
+      a0 = VFMAQ_F32(a0, d, d);
+    }
+    float ssd = hsum_f32x4(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < W; ++i) {
+      const float d = x[i] - mean;
+      ssd += d * d;
+    }
+    const float inv = 1.0f / std::sqrt(ssd / (float)W + epsilon);
+    const float32x4_t vinv = vdupq_n_f32(inv);
+
+    // pass 3: (x - mean) * inv * gamma + beta
+    i = 0;
+    for (; i + 8 <= W; i += 8) {
+      float32x4_t t0 = vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmean), vinv);
+      float32x4_t t1 = vmulq_f32(vsubq_f32(vld1q_f32(x + i + 4), vmean), vinv);
+      vst1q_f32(y + i,
+                VFMAQ_F32(vld1q_f32(beta + i), t0, vld1q_f32(gamma + i)));
+      vst1q_f32(y + i + 4, VFMAQ_F32(vld1q_f32(beta + i + 4), t1,
+                                     vld1q_f32(gamma + i + 4)));
+    }
+    for (; i + 4 <= W; i += 4) {
+      float32x4_t t = vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmean), vinv);
+      vst1q_f32(y + i, VFMAQ_F32(vld1q_f32(beta + i), t, vld1q_f32(gamma + i)));
+    }
+    for (; i < W; ++i)
+      y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
+  }
+}
+
 template <>
 void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {

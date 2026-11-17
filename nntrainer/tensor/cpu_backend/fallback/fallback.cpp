@@ -375,6 +375,12 @@ void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
   __fallback_rms_norm_wrt_width_fp32_intrinsic(X, Y, H, W, epsilon);
 }
 
+void layernorm_wrt_width_fp32(const float *X, const float *__restrict gamma,
+                              const float *__restrict beta, float *Y, size_t H,
+                              size_t W, float epsilon) {
+  __fallback_layernorm_wrt_width_fp32(X, gamma, beta, Y, H, W, epsilon);
+}
+
 template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
