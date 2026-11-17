@@ -109,6 +109,41 @@ static inline void gemm_row1(const uint8_t *act_ah, uint32_t ats, int aligned,
 }
 
 /**
+ * @brief gemm_row1 on unsigned weights: u = nibble ^ 8 in 0..15 is w + 8,
+ *        so sum(a w) = sum(a u) - 8 sum(a), @a act_sum being sum(a) over
+ *        the row. u8 x u8 has vrmpy's vector-by-scalar form, which takes
+ *        the activation word from the scalar register: no vsplat a word.
+ *        Exact in int32 like gemm_row1 (sum(a u) < 255*15*32*k_tiles).
+ *        S25 Ultra, Gemma-4 E2B decode: 26.6 -> 27.3 tok/s.
+ */
+static inline void gemm_row1_u(const uint8_t *act, uint32_t ats,
+                               uint32_t k_tiles, const uint8_t *col,
+                               uint32_t stride, int32_t act_sum, int32_t *out) {
+  const HVX_Vector lo4 = Q6_V_vsplat_R(0x0F0F0F0F);
+  const HVX_Vector x88 = Q6_V_vsplat_R((int)0x88888888u);
+  HVX_Vector acc = Q6_V_vzero();
+  const uint32_t pf_end = k_tiles >= ROW1_ACT_PF_MIN_KT ? k_tiles : 0u;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint32_t *a0 = (const uint32_t *)(act + (size_t)kt * ats);
+#if defined(__hexagon__)
+    if (kt + ROW1_ACT_LEAD < pf_end) {
+      Q6_dcfetch_A((void *)(a0 + ROW1_ACT_LEAD * ats / 4u));
+    }
+#endif
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector x =
+        Q6_V_vxor_VV(*(const HVX_Vector *)(tile + g * 128u), x88);
+      const HVX_Vector ulo = Q6_V_vand_VV(x, lo4);
+      const HVX_Vector uhi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(x, 4), lo4);
+      acc = Q6_Vuw_vrmpyacc_VuwVubRub(acc, ulo, a0[2u * g]);
+      acc = Q6_Vuw_vrmpyacc_VuwVubRub(acc, uhi, a0[2u * g + 1u]);
+    }
+  }
+  *(HVX_UVector *)out = Q6_Vw_vsub_VwVw(acc, Q6_V_vsplat_R(8 * act_sum));
+}
+
+/**
  * @brief The four rows [r0, r0+4) of one column, all k-tiles, accumulators
  *        in registers.
  *
@@ -174,16 +209,20 @@ static inline void gemm_rows4(const uint8_t *act_ah, uint32_t ats, int aligned,
 }
 
 static inline __attribute__((always_inline)) void
-gemm_col(const uint8_t *act_ah, uint32_t ats, int aligned, uint32_t m,
-         uint32_t k_tiles, const uint8_t *wh, uint32_t n_col, uint32_t nt,
-         uint32_t rows1, int32_t *out) {
+gemm_col(const uint8_t *act_ah, uint32_t ats, int aligned,
+         const int32_t *act_sum, uint32_t m, uint32_t k_tiles,
+         const uint8_t *wh, uint32_t n_col, uint32_t nt, uint32_t rows1,
+         int32_t *out) {
   const uint32_t stride = n_col * WH_TILE_BYTES;
   const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
   if (m > HVX_GEMM_U8I4_MAX_ROWS) {
     m = HVX_GEMM_U8I4_MAX_ROWS;
   }
   for (uint32_t r0 = 0; r0 < m; r0 += 4u) {
-    if (rows1 != 0u && m - r0 == 1u) {
+    if (rows1 != 0u && m - r0 == 1u && act_sum != NULL) {
+      gemm_row1_u(act_ah + r0 * AH_ROW_BYTES, ats, k_tiles, col, stride,
+                  act_sum[r0], out + (size_t)r0 * 32u);
+    } else if (rows1 != 0u && m - r0 == 1u) {
       gemm_row1(act_ah, ats, aligned, r0, k_tiles, col, stride, out);
     } else {
       gemm_rows4(act_ah, ats, aligned, r0, m - r0, k_tiles, col, stride, out);
@@ -195,21 +234,36 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
                                uint32_t k_tiles, const uint8_t *wh,
                                uint32_t n_col, uint32_t nt, uint32_t rows1,
                                int32_t *out) {
-  gemm_col(act_ah, AH_TILE_BYTES, 0, m, k_tiles, wh, n_col, nt, rows1, out);
+  gemm_col(act_ah, AH_TILE_BYTES, 0, NULL, m, k_tiles, wh, n_col, nt, rows1,
+           out);
 }
 
 void hvx_gemm_u8i4_rows_pack(uint8_t *dst, const uint8_t *act_ah, uint32_t m,
-                             uint32_t k_tiles) {
+                             uint32_t k_tiles, int32_t *act_sum) {
+  /* word lane j sums bytes 4j..4j+3: row r is lanes 8r..8r+7 */
+  HVX_Vector s = Q6_V_vzero();
   for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-    *(HVX_UVector *)(dst + (size_t)kt * m * AH_ROW_BYTES) =
+    const HVX_Vector v =
       *(const HVX_UVector *)(act_ah + (size_t)kt * AH_TILE_BYTES);
+    *(HVX_UVector *)(dst + (size_t)kt * m * AH_ROW_BYTES) = v;
+    s = Q6_Vuw_vrmpyacc_VuwVubRub(s, v, 0x01010101u);
+  }
+  int32_t lanes[32] __attribute__((aligned(128)));
+  *(HVX_Vector *)lanes = s;
+  for (uint32_t r = 0; r < m; ++r) {
+    int32_t t = 0;
+    for (uint32_t j = 0; j < 8u; ++j) {
+      t += lanes[8u * r + j];
+    }
+    act_sum[r] = t;
   }
 }
 
-void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
+void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats,
+                              const int32_t *act_sum, uint32_t m,
                               uint32_t k_tiles, const uint8_t *wh,
                               uint32_t n_col, uint32_t nt, int32_t *out) {
-  gemm_col(act, ats, 1, m, k_tiles, wh, n_col, nt, 1u, out);
+  gemm_col(act, ats, 1, act_sum, m, k_tiles, wh, n_col, nt, 1u, out);
 }
 
 void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,

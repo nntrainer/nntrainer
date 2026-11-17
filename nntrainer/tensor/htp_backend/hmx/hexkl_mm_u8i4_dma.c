@@ -714,6 +714,7 @@ static void gemv_pf_learn(uint32_t h, uint32_t wb) {
 typedef struct {
   const uint8_t *act_ah; /**< cached memory: the rows, a k-tile ats apart */
   const uint8_t *act_lo; /**< a16: the low-byte plane (act_ah the high) */
+  const int32_t *sum_ah, *sum_lo; /**< the planes' row sums, or NULL */
   const uint8_t *wh;     /**< VTCM: the weight's WH tiles */
   const hexkl_weight_u8i4 *h;
   uint32_t M, k_tiles, nt_n, ld, ats;
@@ -733,11 +734,11 @@ static void layer_gemv_worker(uint32_t n_threads, uint32_t i, void *vjob) {
     __attribute__((aligned(128)));
   for (uint32_t nt = lo; nt < hi; ++nt) {
     const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-    hvx_gemm_u8i4_wh_col_ats(j->act_ah, j->ats, j->M, j->k_tiles, j->wh,
-                             j->nt_n, nt, acc);
+    hvx_gemm_u8i4_wh_col_ats(j->act_ah, j->ats, j->sum_ah, j->M, j->k_tiles,
+                             j->wh, j->nt_n, nt, acc);
     if (j->act_lo != NULL) {
-      hvx_gemm_u8i4_wh_col_ats(j->act_lo, j->ats, j->M, j->k_tiles, j->wh,
-                               j->nt_n, nt, acc_lo);
+      hvx_gemm_u8i4_wh_col_ats(j->act_lo, j->ats, j->sum_lo, j->M, j->k_tiles,
+                               j->wh, j->nt_n, nt, acc_lo);
       hvx_dequant_acc16_tile_to_f32(
         acc, acc_lo, HEXKL_ACC_TILE_COLS, j->M, j->act_scale, j->act_zp,
         j->h->colsum_w + c0, j->h->w_scale + c0, j->h->bias + c0, j->out + c0,
@@ -940,15 +941,20 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   const uint32_t rb = M * HEXKL_HMX_INT8_BLOCK_N_INNER;
   const uint8_t *act = act_ah;
   uint32_t ats = HEXKL_HMX_ACTIVATION_ALIGNMENT, plane = act_bytes;
+  int32_t act_sum[2][LAYER_GEMV_MAX_ROWS];
+  const int32_t *sum0 = NULL, *sum1 = NULL;
   /* + 128: the pack's last vector runs past its plane */
   if ((size_t)planes * k_tiles * rb + 128u <= sizeof(g_gemv_act)) {
     for (uint32_t p = 0; p < planes; ++p) {
       hvx_gemm_u8i4_rows_pack(g_gemv_act + (size_t)p * k_tiles * rb,
-                              act_ah + (size_t)p * act_bytes, M, k_tiles);
+                              act_ah + (size_t)p * act_bytes, M, k_tiles,
+                              act_sum[p]);
     }
     act = g_gemv_act;
     ats = rb;
     plane = k_tiles * rb;
+    sum0 = act_sum[0];
+    sum1 = act_sum[1];
   }
 
   layer_gemv_run run;
@@ -986,6 +992,8 @@ static int layer_run_gemv(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       const hexkl_weight_u8i4 *h = &tbl->slots[handles[c]];
       job.act_ah = o->act16 ? act + plane : act;
       job.act_lo = o->act16 ? act : NULL;
+      job.sum_ah = o->act16 ? sum1 : sum0;
+      job.sum_lo = sum0;
       job.ats = ats;
       job.wh = vtcm_base + wbuf[c & 1u];
       job.h = h;

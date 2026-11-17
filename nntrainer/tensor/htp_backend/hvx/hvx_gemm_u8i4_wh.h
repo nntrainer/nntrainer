@@ -83,9 +83,12 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
  *
  * At the AH stride every k-tile's row sits 2 KiB past the last, on few
  * enough L1 sets that a column's lines miss again each column; rows packed
- * at @a ats = 32 m share a line between two k-tiles.
+ * at @a ats = 32 m share a line between two k-tiles. @a act_sum, when not
+ * NULL, holds each row's activation sum (hvx_gemm_u8i4_rows_pack's) and
+ * lets a lone row run on unsigned weights.
  */
-void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
+void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats,
+                              const int32_t *act_sum, uint32_t m,
                               uint32_t k_tiles, const uint8_t *wh,
                               uint32_t n_col, uint32_t nt, int32_t *out);
 
@@ -94,9 +97,10 @@ void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
  *        into @a dst, k-tile kt at kt * 32 m: hvx_gemm_u8i4_wh_col_ats's
  *        @a ats = 32 m activation. One vector a k-tile, each store over the
  *        last one's tail, so @a dst takes 128 - 32 m bytes past the end.
+ *        Row r's sum over all k-tiles goes to @a act_sum[r].
  */
 void hvx_gemm_u8i4_rows_pack(uint8_t *dst, const uint8_t *act_ah, uint32_t m,
-                             uint32_t k_tiles);
+                             uint32_t k_tiles, int32_t *act_sum);
 
 /**
  * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)

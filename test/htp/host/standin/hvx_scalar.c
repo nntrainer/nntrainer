@@ -129,13 +129,20 @@ void hvx_scalar_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
   gemv_ats(act_ah, 2048u, m, k_tiles, wh, n_col, nt, out);
 }
 void hvx_gemm_u8i4_rows_pack(uint8_t *dst, const uint8_t *act_ah, uint32_t m,
-                             uint32_t k_tiles) {
-  for (uint32_t kt = 0; kt < k_tiles; ++kt)
+                             uint32_t k_tiles, int32_t *act_sum) {
+  for (uint32_t r = 0; r < m; ++r)
+    act_sum[r] = 0;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
     memcpy(dst + (size_t)kt * m * 32u, act_ah + (size_t)kt * 2048u, m * 32u);
+    for (uint32_t i = 0; i < m * 32u; ++i)
+      act_sum[i / 32u] += act_ah[(size_t)kt * 2048u + i];
+  }
 }
-void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats, uint32_t m,
+void hvx_gemm_u8i4_wh_col_ats(const uint8_t *act, uint32_t ats,
+                              const int32_t *act_sum, uint32_t m,
                               uint32_t k_tiles, const uint8_t *wh,
                               uint32_t n_col, uint32_t nt, int32_t *out) {
+  (void)act_sum;
   gemv_ats(act, ats, m, k_tiles, wh, n_col, nt, out);
 }
 void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
