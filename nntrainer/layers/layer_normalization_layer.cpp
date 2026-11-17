@@ -195,57 +195,29 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &gamma = context.getWeight(wt_idx[LNParams::gamma]);
   Tensor &beta = context.getWeight(wt_idx[LNParams::beta]);
 
+  // Live rows of each batch, the window ActivationLayer uses: a step of
+  // `to - from` tokens sits at the batch base, (channel, step) rows packed,
+  // not at rows [from, to); a height == 1 shape keeps its single row.
+  // from == to normalizes nothing (it used to mean the whole plane).
+  const TensorDim in_dim = input.getDim();
+  const unsigned int H = in_dim.height();
+  const unsigned int rows =
+    in_dim.channel() * (H > 1 ? std::min(to - from, H) : 1u);
+  const unsigned int rows_in_batch = in_dim.channel() * H;
+
   // Backend-neutral whole-op dispatch for the width-axis inference case.
-  //
-  // The rows are (batch, channel, height) flattened and the live window is
-  // rows [from, to) INSIDE each (b, c) plane, which is the window the FP32 fast
-  // path below already uses (getAddress<float>(b, c, row_begin, 0), row_count
-  // rows). That window is contiguous only within one plane, hence the (b, c)
-  // loop with a computed row_offset rather than a single call. Whole Tensors
-  // are passed and the window given as numbers, deliberately not as
-  // getSharedDataTensor views, which do not carry residency state.
+  // Whole Tensors are passed and the window given as numbers, deliberately not
+  // as getSharedDataTensor views, which do not carry residency state.
   if (!training && width_axis_only) {
-    const TensorDim in_dim = input.getDim();
-    const unsigned int H = in_dim.height();
-    const unsigned int row_begin = (to > from && to <= H) ? from : 0u;
-    const unsigned int row_end = (to > from && to <= H) ? to : H;
-    const unsigned int rows = row_end - row_begin;
-    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
-      for (unsigned int c = 0; c < in_dim.channel(); ++c) {
-        const unsigned int row_offset =
-          (b * in_dim.channel() + c) * H + row_begin;
-        input.getOps()->layer_norm(input, output, gamma, beta, epsilon, rows,
-                                   row_offset);
-      }
-    }
+    for (unsigned int b = 0; b < in_dim.batch(); ++b)
+      input.getOps()->layer_norm(input, output, gamma, beta, epsilon, rows,
+                                 b * rows_in_batch);
     return;
   }
 
   Tensor &deviation = context.getTensor(wt_idx[LNParams::deviation]);
   Tensor &variance = context.getTensor(wt_idx[LNParams::variance]);
   Tensor &inv_std_dev = context.getTensor(wt_idx[LNParams::inv_std_dev]);
-
-  // @todo: consider NHWC format
-  bool is_height_normalize =
-    std::find(normalize_axes.begin(), normalize_axes.end(), 1) !=
-        normalize_axes.end()
-      ? true
-      : false;
-
-  TensorDim input_dim = input.getDim();
-  TensorDim output_dim = output.getDim();
-  TensorDim normalize_dim = gamma.getDim();
-  TensorDim remain_dim = variance.getDim();
-
-  TensorDim input_step_dim = input_dim;
-  TensorDim output_step_dim = output_dim;
-  TensorDim normalize_step_dim = normalize_dim;
-  TensorDim remain_step_dim = remain_dim;
-
-  input_step_dim.height(to - from);
-  output_step_dim.height(to - from);
-  normalize_step_dim.height(is_height_normalize ? to - from : 1);
-  remain_step_dim.height(is_height_normalize ? 1 : to - from);
 
   Tensor &temp_full_size = output;
   Tensor &temp_norm_size = inv_std_dev;
@@ -262,36 +234,26 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   deviation.multiply(inv_std_dev, output);
 #else
   // Optimized path for FP32 tensors with width-axis-only normalization.
-  // Uses NEON intrinsic (rms_norm_wrt_width_fp16_intrinsic) which:
-  // - Accumulates in FP16 for better performance
+  // Uses rms_norm_wrt_width_fp32_intrinsic (FP32 accumulator) which:
   // - Computes: output = deviation / sqrt(mean(deviation^2) + epsilon)
-  // - Supports incremental decoding with [from, to) row range
+  // - Supports incremental decoding on rows [0, to - from)
   // - Processes all batches and channels
   if (deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
       width_axis_only) {
-    const unsigned int W = input_dim.width();
-    const unsigned int row_dim_v = input_dim.height();
-    const unsigned int row_begin = (to > from && to <= row_dim_v) ? from : 0u;
-    const unsigned int row_end =
-      (to > from && to <= row_dim_v) ? to : row_dim_v;
-    const size_t row_count = row_end - row_begin;
+    const unsigned int W = in_dim.width();
 
-    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
-      for (unsigned int c = 0; c < input_dim.channel(); ++c) {
-        const float *src = deviation.getAddress<float>(b, c, row_begin, 0);
-        float *dst = output.getAddress<float>(b, c, row_begin, 0);
-        // NOTE: rms_norm_wrt_width_fp32_intrinsic is used here for Layer
-        // Normalization. Since 'deviation' is already centered (X - mean),
-        // computing:
-        //   output = deviation / sqrt(mean(deviation^2) + epsilon)
-        // is equivalent to Layer Norm's formula:
-        //   output = (X - mean_X) / sqrt(variance + epsilon)
-        // DO NOT USE rms_norm_wrt_width_fp16_intrinsic here — it accumulates
-        // squared values in FP16, which overflows for typical LayerNorm inputs
-        // (e.g. DeBERTa). Use the FP32-accumulator variant instead.
-        nntrainer::rms_norm_wrt_width_fp32_intrinsic(src, dst, row_count, W,
-                                                     epsilon);
-      }
+    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+      // NOTE: rms_norm_wrt_width_fp32_intrinsic is used here for Layer
+      // Normalization. Since 'deviation' is already centered (X - mean),
+      // computing:
+      //   output = deviation / sqrt(mean(deviation^2) + epsilon)
+      // is equivalent to Layer Norm's formula:
+      //   output = (X - mean_X) / sqrt(variance + epsilon)
+      // DO NOT USE rms_norm_wrt_width_fp16_intrinsic here; its float overload
+      // is a deprecated stub. Use the FP32-accumulator variant instead.
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        deviation.getAddress<float>(b, 0, 0, 0),
+        output.getAddress<float>(b, 0, 0, 0), rows, W, epsilon);
     }
   } else {
     // Fallback: generic tensor operations for all data types.
