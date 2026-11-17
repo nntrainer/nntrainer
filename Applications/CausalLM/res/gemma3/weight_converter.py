@@ -101,6 +101,9 @@ def save_embedding_gemma_for_nntrainer(model, dtype, file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # The --model_type must match the "model_type" in the nntr_config.json
+    # - causal    -> "model_type": "CausalLM",
+    # - embedding -> "model_type": "embedding",
     parser.add_argument("--model_type", choices=["causal", "embedding"], default="causal")
     parser.add_argument("--model_path", type=str, default="./270m")
     parser.add_argument("--output_name", type=str, default="./nntr_gemma3_270m_fp32.bin")

@@ -1,4 +1,5 @@
 {
+    "model_type": "CausalLM",
     "model_tensor_type": "FP32-FP32",
     "model_file_name": "nntr_gemma3_270m_fp32.bin",
     "fc_layer_dtype": "FP32",
