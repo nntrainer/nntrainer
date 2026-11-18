@@ -1,0 +1,159 @@
+name: Yocto build
+
+on:
+  schedule:
+    # 04:30 AM (KST) Mon-Fri, same as daily_build*.yml
+    - cron: "30 19 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  POKY_REF: yocto-5.0.21
+  META_NN_COMMIT: c14458c94ebddc0dc5045da5d9aafd699c2e50dd
+
+jobs:
+  bitbake:
+    name: bitbake nntrainer (${{ matrix.machine }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        # qemuarm64 is left out until nntrainer#4495 is fixed: meson.build
+        # forces -march=armv8.2-a+dotprod+i8mm, which conflicts with the
+        # -mcpu of the Yocto tune.
+        machine: [qemux86-64]
+    env:
+      YOCTO_DIR: ${{ github.workspace }}/../yocto
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo apt-get clean
+          # Workaround for Azure CLI repo 403 error
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.sources /etc/apt/sources.list.d/azure-cli.list || true
+          df -BG --output=used / | tail -1 | tr -d ' G' > "$RUNNER_TEMP/df_before"
+
+      - uses: actions/checkout@v4
+
+      # Only iniparser is built from subprojects/. Leaving subprojects/OpenBLAS
+      # out makes meson.build's host-cmake OpenBLAS fallback fail instead of
+      # silently replacing the openblas recipe.
+      - name: Fetch the iniparser submodule
+        run: git submodule update --init --depth 1 subprojects/iniparser
+
+      - name: Install Yocto host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gawk wget git diffstat unzip texinfo gcc \
+            build-essential chrpath socat cpio python3 python3-pip \
+            python3-pexpect xz-utils debianutils iputils-ping python3-git \
+            python3-jinja2 python3-subunit zstd liblz4-tool file locales libacl1
+          sudo locale-gen en_US.UTF-8
+          # BB_HASHSERVE_UPSTREAM uses a websocket connection
+          python3 -m pip install --user websockets
+
+      - name: Fetch poky and meta-neural-network
+        run: |
+          mkdir -p "$YOCTO_DIR"
+          git clone --depth 1 --branch "$POKY_REF" https://git.yoctoproject.org/poky "$YOCTO_DIR/poky"
+          git init -q "$YOCTO_DIR/meta-neural-network"
+          git -C "$YOCTO_DIR/meta-neural-network" fetch --depth 1 https://github.com/nnstreamer/meta-neural-network.git "$META_NN_COMMIT"
+          git -C "$YOCTO_DIR/meta-neural-network" checkout -q FETCH_HEAD
+
+      - name: Configure build
+        run: |
+          cd "$YOCTO_DIR/poky"
+          source oe-init-build-env "$YOCTO_DIR/build"
+          bitbake-layers add-layer "$YOCTO_DIR/meta-neural-network"
+          bitbake-layers add-layer "$GITHUB_WORKSPACE/yocto/meta-nntrainer"
+          # nntrainer always adds -mavx2 -mfma -mf16c on x86 (meson.build), so
+          # build for x86-64-v3 instead of the qemux86-64 default core2-64.
+          cat >> conf/local.conf <<EOF
+          MACHINE = "${{ matrix.machine }}"
+          DEFAULTTUNE = "x86-64-v3"
+          INHERIT += "externalsrc"
+          EXTERNALSRC:pn-nntrainer = "${GITHUB_WORKSPACE}"
+          EXTERNALSRC_BUILD:pn-nntrainer = "\${WORKDIR}/build"
+          SSTATE_MIRRORS = "file://.* https://sstate.yoctoproject.org/all/PATH;downloadfilename=PATH"
+          BB_HASHSERVE = "auto"
+          BB_HASHSERVE_UPSTREAM = "wss://hashserv.yoctoproject.org/ws"
+          BB_SIGNATURE_HANDLER = "OEEquivHash"
+          EOF
+          bitbake-layers show-layers
+          bitbake -e nntrainer | grep -E '^(FILE|EXTERNALSRC)=' | tee "$RUNNER_TEMP/recipe_env"
+          # Fail early unless our recipe is selected and builds this checkout
+          grep -q '^FILE=".*/yocto/meta-nntrainer/recipes-nntrainer/nntrainer/nntrainer_git.bb"$' "$RUNNER_TEMP/recipe_env"
+          grep -qx "EXTERNALSRC=\"${GITHUB_WORKSPACE}\"" "$RUNNER_TEMP/recipe_env"
+
+      - name: bitbake nntrainer
+        run: |
+          cd "$YOCTO_DIR/poky"
+          source oe-init-build-env "$YOCTO_DIR/build"
+          start=$(date +%s)
+          # GitHub's default shell has no pipefail; take bitbake's status from
+          # PIPESTATUS so the wall time is recorded before failing.
+          bitbake nntrainer 2>&1 | tee "$RUNNER_TEMP/bitbake.log"
+          rc=${PIPESTATUS[0]}
+          echo $(( $(date +%s) - start )) > "$RUNNER_TEMP/bitbake_seconds"
+          exit $rc
+
+      - name: Check openblas came from the recipe
+        run: |
+          # Shell globs do not cross '/', so only the nntrainer recipe's log matches
+          # (YOCTO_DIR itself contains "/nntrainer/" on the runner).
+          log=$(ls "$YOCTO_DIR"/build/tmp/work/*/nntrainer/*/temp/log.do_configure)
+          echo "$log"
+          grep -m1 'Run-time dependency openblas found: YES' "$log" | tee "$RUNNER_TEMP/openblas"
+          test -s "$RUNNER_TEMP/openblas"
+
+      - name: Check C-API library in package
+        run: |
+          find "$YOCTO_DIR/build/tmp/work" -path '*/nntrainer/*/packages-split/nntrainer/*' -name libcapi-nntrainer.so | tee "$RUNNER_TEMP/capi"
+          test -s "$RUNNER_TEMP/capi"
+
+      - name: Report measurements
+        if: always()
+        run: |
+          B="$YOCTO_DIR/build"
+          used_after=$(df -BG --output=used / | tail -1 | tr -d ' G')
+          chain=$(find "$B/sstate-cache" -type f -regextype egrep \
+            -regex '.*/sstate:(nntrainer|ml-api|nnstreamer|openblas|gtest|googletest):.*' -print0 2>/dev/null \
+            | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+          {
+            echo "### Yocto build: ${{ matrix.machine }}"
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| bitbake nntrainer wall time (s) | $(cat "$RUNNER_TEMP/bitbake_seconds" 2>/dev/null) |"
+            echo "| Sstate summary | $(grep -m1 'Sstate summary' "$RUNNER_TEMP/bitbake.log" 2>/dev/null) |"
+            echo "| sstate-cache total | $(du -sh "$B/sstate-cache" 2>/dev/null | cut -f1) |"
+            echo "| sstate selected recipes (lower bound) | ${chain:-0} |"
+            echo "| disk used before / after (GB) | $(cat "$RUNNER_TEMP/df_before") / ${used_after} |"
+            echo "| recipe | $(grep '^FILE=' "$RUNNER_TEMP/recipe_env" 2>/dev/null) |"
+            echo "| source | $(grep '^EXTERNALSRC=' "$RUNNER_TEMP/recipe_env" 2>/dev/null) |"
+            echo "| C-API library | $(cat "$RUNNER_TEMP/capi" 2>/dev/null) |"
+            echo "| openblas | $(cat "$RUNNER_TEMP/openblas" 2>/dev/null) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect task logs
+        if: failure() || cancelled()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          cd "$YOCTO_DIR/build/tmp/work" && find . -path '*/temp/log.do_*' -type f \
+            -newer "$YOCTO_DIR/build/conf/local.conf" -exec cp --parents {} "$RUNNER_TEMP/logs" \; || true
+          cp "$RUNNER_TEMP/bitbake.log" "$RUNNER_TEMP/logs/" || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure() || cancelled()
+        with:
+          name: yocto-logs-${{ matrix.machine }}
+          path: ${{ runner.temp }}/logs
