@@ -362,10 +362,12 @@ static void stage_softmax(ctx *c, item_t *it, job_t *j, uint32_t bar,
   b.col0 = 32u * it->blk.lo;
   b.n_cols = c->s->cache_to - 32u * it->blk.lo;
   b.row0 = it->row0;
-  // folded: every row at the one position, all 64 computed (the rows past
-  // G hold the zero point's flat scores; the epilogue drops them)
+  // folded: every row at the one position, all 64 valid (the rows past G
+  // hold the zero point's flat scores); only the rows the epilogue reads
+  // are computed
   b.n_rows = c->fold ? HEXKL_ATTN_Q2_ROWS : it->n_rows;
   b.same_row = (uint8_t)c->fold;
+  b.live_rows = (uint8_t)it->n_rows;
   b.window = c->s->window;
   b.rho_q15 = hd->rho;
   b.frac_bits = (uint8_t)hd->F;

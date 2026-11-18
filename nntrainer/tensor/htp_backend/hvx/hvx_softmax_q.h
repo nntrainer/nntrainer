@@ -112,6 +112,9 @@ typedef struct {
                              decode block); n_rows must then be 64 -- no row
                              is padding, the caller ignores the ones it does
                              not need. 0: row r is at row0 + r */
+  uint8_t live_rows;    /**< rows [0, live_rows) are read back, 0 = all 64:
+                             the 4-row groups past them are not computed,
+                             their P', maxima and row sums unspecified */
 } hvx_softmax_q_block;
 
 /**

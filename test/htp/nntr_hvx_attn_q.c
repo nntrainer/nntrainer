@@ -692,6 +692,7 @@ int nntr_hvx_probe_softmax_q(remote_handle64 handle, uint32 n_col_tiles,
   b.rho_q15 = (uint16_t)rho_q15;
   b.frac_bits = (uint8_t)frac_bits;
   b.same_row = 0;
+  b.live_rows = 0;
   const uint64_t c0 = HAP_perf_get_pcycles();
   hvx_softmax_q(&b, (const int16_t *)(vb + OFF_SM_S),
                 (const int16_t *)(vb + OFF_SM_CORR), vb + OFF_SM_P,
@@ -738,6 +739,7 @@ int nntr_hvx_probe_softmax_q16(
   b.rho_q15 = (uint16_t)rho_q15;
   b.frac_bits = (uint8_t)frac_bits;
   b.same_row = (uint8_t)(same_row != 0u);
+  b.live_rows = 0;
   const uint64_t c0 = HAP_perf_get_pcycles();
   hvx_softmax_q16(&b, (const int16_t *)(vb + OFF_SM_S),
                   (const int16_t *)(vb + OFF_SM_CORR), vb + OFF_SM_P,

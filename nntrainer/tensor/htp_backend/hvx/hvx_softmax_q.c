@@ -315,6 +315,13 @@ int hvx_softmax_q_tile_class(const hvx_softmax_q_block *b, uint32_t c) {
   return TILE_PARTIAL;
 }
 
+/* The 4-row groups computed: those holding the live rows. */
+static inline uint32_t live_groups(const hvx_softmax_q_block *b) {
+  return b->live_rows != 0u && b->live_rows < HVX_SOFTMAX_Q_ROWS
+           ? (b->live_rows + 3u) / 4u
+           : 16u;
+}
+
 /* Position step from one row to the next: 0 when every row is at row0. */
 static inline int row_step(const hvx_softmax_q_block *b) {
   return b->same_row ? 0 : 1;
@@ -477,7 +484,7 @@ void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
                             Q6_Vh_vasr_VhR(Q6_Vh_vadd_VhVh(q0_, one), 1));     \
   } while (0)
 
-  for (uint32_t w = 0; w < 16u; ++w) {
+  for (uint32_t w = 0; w < live_groups(b); ++w) {
     const uint32_t v0 = 2u * w;
     const HVX_Vector m0 = M[v0], m1 = M[v0 + 1u];
     const HVX_Vector rowv0 =
@@ -551,7 +558,7 @@ void hvx_softmax_q(const hvx_softmax_q_block *b, const int16_t *s_tiles,
 #undef SMX_TILE_FULL
   /* Lane 8k of RS[w] <- sum of lanes 8k..8k+7: row 4w + k. */
   HVX_Vector *out = (HVX_Vector *)rowsum;
-  for (uint32_t w = 0; w < 16u; ++w) {
+  for (uint32_t w = 0; w < live_groups(b); ++w) {
     out[w] = rowsum_reduce(RS[w]);
   }
 }
@@ -682,7 +689,7 @@ void hvx_softmax_q16_part_exp(const hvx_softmax_q_block *b,
     (out_hi) = Q6_Vb_vpacko_VhVh(p1_, p0_);                                    \
   } while (0)
 
-  for (uint32_t w = 0; w < 16u; ++w) {
+  for (uint32_t w = 0; w < live_groups(b); ++w) {
     const uint32_t v0 = 2u * w;
     const HVX_Vector m0 = M[v0], m1 = M[v0 + 1u];
     const HVX_Vector rowv0 =
@@ -782,7 +789,7 @@ void hvx_softmax_q16_part_norm(const hvx_softmax_q_block *b, uint32_t c0,
   uint8_t cls[HVX_SOFTMAX_Q_MAX_TILES];
   part_classes(b, c0, c1, cls);
   /* P16 = round(P' * R / 65536) in place, R per row (row-sum layout). */
-  for (uint32_t w = 0; w < 16u; ++w) {
+  for (uint32_t w = 0; w < live_groups(b); ++w) {
     const uint32_t R0 = R[hvx_softmax_q_rowsum_index(4u * w)];
     const uint32_t R1 = R[hvx_softmax_q_rowsum_index(4u * w + 1u)];
     const uint32_t R2 = R[hvx_softmax_q_rowsum_index(4u * w + 2u)];
@@ -840,7 +847,7 @@ static void pass1_rowmax(const hvx_softmax_q_block *b, const HVX_Vector *S,
                          uint32_t n, HVX_Vector *M, HVX_VectorPred qlow,
                          HVX_Vector vmin, HVX_Vector rowbase,
                          HVX_Vector colbase) {
-  for (uint32_t v = 0; v < 32u; v += 4u) {
+  for (uint32_t v = 0; v < 2u * live_groups(b); v += 4u) {
     HVX_Vector m0 = vmin, m1 = vmin, m2 = vmin, m3 = vmin;
     const HVX_Vector rowv0 =
       Q6_Vh_vadd_VhVh(rowbase, Q6_Vh_vsplat_R(row_step(b) * 2 * (int)v));
