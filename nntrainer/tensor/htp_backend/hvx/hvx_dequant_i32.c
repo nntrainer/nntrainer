@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -19,6 +20,8 @@
 #include "hexkl_acc_tile.h" /* HEXKL_ACC_TILE_COLS, for the width assert */
 #include "hvx_convert.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
 #include "hvx_swiglu_det.h"
 
 /** @brief HVX vector width in bytes (128B mode). */
@@ -261,53 +264,279 @@ static inline void planes_rows4(const uint8_t *tile, uint32_t g,
   out[3] = Q6_V_hi_W(w23);
 }
 
+/** @brief hvx_dq_rows_job's per-head passes on one written row, @a seg its
+ *         first column and @a m its index. */
+static void dq_row_post(const hvx_dq_rows_job *jb, float *seg, uint32_t m) {
+  const uint32_t n = jb->t.n_tiles * HEXKL_ACC_TILE_COLS;
+  if (jb->post_chunk != 0u) {
+    hvx_rmsnorm_row_chunks_f32(seg, seg, jb->post_gamma, n, jb->post_chunk,
+                               jb->post_eps);
+  }
+  if (jb->rope_cs) {
+    hvx_rope_row_f32(seg, n, jb->rope_hd,
+                     jb->rope_cs + (size_t)m * 2u * jb->rope_hd);
+  }
+}
+
+/** @brief dq_rows_planes's rows m0 .. m0 + rows - 1 (fewer than four, the
+ *         job's last group), one row at a time. */
+static void dq_planes_tail(const hvx_dq_rows_job *jb, uint32_t g,
+                           uint32_t rows) {
+  const hvx_dq_tiles_job *c = &jb->t;
+  const uint32_t m0 = 4u * g, c0 = c->nt0 * HEXKL_ACC_TILE_COLS;
+  const HVX_UVector *cs = (const HVX_UVector *)(c->colsum_w + c0);
+  const HVX_UVector *ws = (const HVX_UVector *)(c->w_scale + c0);
+  const HVX_UVector *bs = (const HVX_UVector *)(c->bias + c0);
+  const int al = dq_dst_aligned(c);
+  for (uint32_t j = 0; j < c->n_tiles; ++j) {
+    const uint8_t *tile = c->tiles_base + (size_t)j * c->tile_stride;
+    HVX_Vector a[4], b[4];
+    planes_rows4(tile, g, a);
+    if (c->lo_off) {
+      planes_rows4(tile + c->lo_off, g, b);
+    }
+    for (uint32_t r = 0; r < rows; ++r) {
+      const HVX_Vector vs = hvx_splat_sf(c->act_scale[m0 + r]);
+      const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0 + r]));
+      HVX_Vector af = Q6_Vsf_equals_Vw(a[r]);
+      if (c->lo_off) { /* 256 hi + lo, in f32 */
+        af = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(af, hvx_splat_sf(256.0f)),
+                                Q6_Vsf_equals_Vw(b[r]));
+      }
+      dq_put(c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0 + 32u * j,
+             dq_formula(af, vs, vz, cs[j], ws[j], bs[j]), al, c->accumulate);
+    }
+  }
+  for (uint32_t r = 0; r < rows; ++r) {
+    dq_row_post(jb, c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0, m0 + r);
+  }
+}
+
+/** @brief hvx_rmsnorm_rows_f32 norm_rs's lanes_sum of its qf32 per-lane
+ *         sums @a q: the same conversion, five rotate-and-adds and lane 0. */
+static inline float dq_lanes_sum(HVX_Vector q) {
+  HVX_Vector v = Q6_Vsf_equals_Vqf32(q);
+  for (int rot = 64; rot >= 4; rot >>= 1) {
+    v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, rot));
+  }
+  const int32_t bits = Q6_R_vextract_VR(v, 0);
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+/** @brief norm_rs's 1 / sqrt(ss / chunk + eps), splat. */
+static inline HVX_Vector dq_rs(float ss, uint32_t chunk, float eps) {
+  return hvx_splat_sf(1.0f / sqrtf(ss / (float)chunk + eps));
+}
+
+/** @brief dq_store's load. */
+static inline HVX_Vector dq_load(const float *p, int al) {
+  return al ? *(const HVX_Vector *)p : *(const HVX_UVector *)p;
+}
+
+/** @brief One head of the 4-row group at @a d (rows @a ld apart), as
+ *         dq_row_post leaves it: x rs gamma (norm_chunk's order), then
+ *         (@a cs, row 0's table row) per pair of tiles a half head apart
+ *         a c - b s and a s + b c (hvx_rope_row_f32's). Each step's four
+ *         rows are loaded before any is stored, so they overlap. */
+static inline __attribute__((always_inline)) void
+dq_head_post4(float *restrict d, uint32_t ld, uint32_t ct,
+              const float *restrict gamma, const float *restrict cs,
+              uint32_t hd, HVX_Vector r0, HVX_Vector r1, HVX_Vector r2,
+              HVX_Vector r3, int al) {
+  const HVX_UVector *g = (const HVX_UVector *)gamma;
+  if (!cs) {
+    for (uint32_t k = 0; k < ct; ++k) {
+      float *p = d + 32u * k;
+      const HVX_Vector gk = g[k];
+      const HVX_Vector x0 = dq_load(p, al), x1 = dq_load(p + ld, al);
+      const HVX_Vector x2 = dq_load(p + 2u * ld, al);
+      const HVX_Vector x3 = dq_load(p + 3u * ld, al);
+      dq_store(p, Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(x0, r0), gk), al);
+      dq_store(p + ld, Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(x1, r1), gk), al);
+      dq_store(p + 2u * ld, Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(x2, r2), gk),
+               al);
+      dq_store(p + 3u * ld, Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(x3, r3), gk),
+               al);
+    }
+    return;
+  }
+  const uint32_t half = hd / 2u;
+#define DQ_ROPE_ROW(R)                                                         \
+  const HVX_Vector a##R = Q6_Vsf_vmpy_VsfVsf(                                  \
+    Q6_Vsf_vmpy_VsfVsf(dq_load(pa + R * ld, al), r##R), ga);                   \
+  const HVX_Vector b##R = Q6_Vsf_vmpy_VsfVsf(                                  \
+    Q6_Vsf_vmpy_VsfVsf(dq_load(pa + R * ld + half, al), r##R), gb);            \
+  const HVX_Vector c##R = *(const HVX_UVector *)(cr + R * 2u * hd);            \
+  const HVX_Vector s##R = *(const HVX_UVector *)(cr + R * 2u * hd + hd)
+#define DQ_ROPE_PUT(R)                                                         \
+  dq_store(pa + R * ld,                                                        \
+           Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(a##R, c##R),                  \
+                              Q6_Vsf_vmpy_VsfVsf(b##R, s##R)),                 \
+           al);                                                                \
+  dq_store(pa + R * ld + half,                                                 \
+           Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(a##R, s##R),                  \
+                              Q6_Vsf_vmpy_VsfVsf(b##R, c##R)),                 \
+           al)
+  for (uint32_t k = 0; k < ct / 2u; ++k) {
+    float *pa = d + 32u * k;
+    const float *cr = cs + 32u * k;
+    const HVX_Vector ga = g[k], gb = g[k + ct / 2u];
+    DQ_ROPE_ROW(0);
+    DQ_ROPE_ROW(1);
+    DQ_ROPE_ROW(2);
+    DQ_ROPE_ROW(3);
+    DQ_ROPE_PUT(0);
+    DQ_ROPE_PUT(1);
+    DQ_ROPE_PUT(2);
+    DQ_ROPE_PUT(3);
+  }
+#undef DQ_ROPE_ROW
+#undef DQ_ROPE_PUT
+}
+
+/** @brief dq_rows_planes's groups [g_lo, g_hi), the a16 low sweep
+ *         (@a has_lo), the add (@a acc) and the per-head passes in the
+ *         tile loop (@a fused) fixed per instance. The four rows are named
+ *         values, the pointers restrict and the tile loop has no branch:
+ *         with arrays indexed by the group's row count, the flags read per
+ *         row and a store per row behind a row check, every row was one
+ *         dependent chain, the column factors reloaded per row -- 92 cycles
+ *         a vector on v79, 3x what the stores take. Fused, the tile loop
+ *         runs one head at a time and sums the squares on the way (named
+ *         qf32 sums: in an array hexagon-clang once carried one as sf, doc
+ *         62 section 5.1), then dq_head_post4 rereads the head from the
+ *         cache it was just written to. The floats are dq_row_post's to the
+ *         bit: the squares of the stored values summed in the same order,
+ *         norm_rs's scalar tail, the products in the same order. */
+static inline __attribute__((always_inline)) void
+dq_planes_groups(const hvx_dq_rows_job *jb, uint32_t g_lo, uint32_t g_hi,
+                 const uint32_t has_lo, const uint32_t acc,
+                 const uint32_t fused) {
+  const hvx_dq_tiles_job *c = &jb->t;
+  const uint32_t c0 = c->nt0 * HEXKL_ACC_TILE_COLS, ld = c->dst_stride;
+  const uint32_t n_tiles = c->n_tiles, ts = c->tile_stride, lo = c->lo_off;
+  const uint8_t *restrict tiles = c->tiles_base;
+  const HVX_UVector *restrict cs = (const HVX_UVector *)(c->colsum_w + c0);
+  const HVX_UVector *restrict ws = (const HVX_UVector *)(c->w_scale + c0);
+  const HVX_UVector *restrict bs = (const HVX_UVector *)(c->bias + c0);
+  float *restrict dst = c->dst_a + c0;
+  const int al = dq_dst_aligned(c);
+  const HVX_Vector v256 = hvx_splat_sf(256.0f);
+  const uint32_t pc = jb->post_chunk;
+  const uint32_t ct = fused ? pc / HEXKL_ACC_TILE_COLS : n_tiles;
+  const float eps = jb->post_eps;
+  for (uint32_t g = g_lo; g < g_hi; ++g) {
+    const uint32_t m0 = 4u * g;
+    if (c->m_count - m0 < 4u) {
+      dq_planes_tail(jb, g, c->m_count - m0);
+      continue;
+    }
+    const HVX_Vector vs0 = hvx_splat_sf(c->act_scale[m0]);
+    const HVX_Vector vs1 = hvx_splat_sf(c->act_scale[m0 + 1u]);
+    const HVX_Vector vs2 = hvx_splat_sf(c->act_scale[m0 + 2u]);
+    const HVX_Vector vs3 = hvx_splat_sf(c->act_scale[m0 + 3u]);
+    const HVX_Vector vz0 = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0]));
+    const HVX_Vector vz1 = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0 + 1u]));
+    const HVX_Vector vz2 = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0 + 2u]));
+    const HVX_Vector vz3 = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0 + 3u]));
+    float *row = dst + (size_t)m0 * ld;
+    for (uint32_t h0 = 0; h0 < n_tiles; h0 += ct) {
+      HVX_Vector q0 = Q6_V_vzero(), q1 = Q6_V_vzero();
+      HVX_Vector q2 = Q6_V_vzero(), q3 = Q6_V_vzero();
+      for (uint32_t j = h0; j < h0 + ct; ++j) {
+        const uint8_t *tile = tiles + (size_t)j * ts;
+        float *d = row + 32u * j;
+        HVX_Vector a[4];
+        planes_rows4(tile, g, a);
+        HVX_Vector f0 = Q6_Vsf_equals_Vw(a[0]), f1 = Q6_Vsf_equals_Vw(a[1]);
+        HVX_Vector f2 = Q6_Vsf_equals_Vw(a[2]), f3 = Q6_Vsf_equals_Vw(a[3]);
+        if (has_lo) { /* 256 hi + lo, in f32 */
+          HVX_Vector b[4];
+          planes_rows4(tile + lo, g, b);
+          f0 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f0, v256),
+                                  Q6_Vsf_equals_Vw(b[0]));
+          f1 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f1, v256),
+                                  Q6_Vsf_equals_Vw(b[1]));
+          f2 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f2, v256),
+                                  Q6_Vsf_equals_Vw(b[2]));
+          f3 = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(f3, v256),
+                                  Q6_Vsf_equals_Vw(b[3]));
+        }
+        const HVX_Vector cj = cs[j], wj = ws[j], bj = bs[j];
+        const HVX_Vector y0 = dq_formula(f0, vs0, vz0, cj, wj, bj);
+        const HVX_Vector y1 = dq_formula(f1, vs1, vz1, cj, wj, bj);
+        const HVX_Vector y2 = dq_formula(f2, vs2, vz2, cj, wj, bj);
+        const HVX_Vector y3 = dq_formula(f3, vs3, vz3, cj, wj, bj);
+        if (fused) { /* norm_rs's per-lane sums */
+          q0 = Q6_Vqf32_vadd_Vqf32Vqf32(q0, Q6_Vqf32_vmpy_VsfVsf(y0, y0));
+          q1 = Q6_Vqf32_vadd_Vqf32Vqf32(q1, Q6_Vqf32_vmpy_VsfVsf(y1, y1));
+          q2 = Q6_Vqf32_vadd_Vqf32Vqf32(q2, Q6_Vqf32_vmpy_VsfVsf(y2, y2));
+          q3 = Q6_Vqf32_vadd_Vqf32Vqf32(q3, Q6_Vqf32_vmpy_VsfVsf(y3, y3));
+        }
+        dq_put(d, y0, al, acc);
+        dq_put(d + ld, y1, al, acc);
+        dq_put(d + 2u * ld, y2, al, acc);
+        dq_put(d + 3u * ld, y3, al, acc);
+      }
+      if (fused) {
+        /** All four sums out of the vector registers before the first
+         *  sqrtf call: a qf32 value held across a call came back from its
+         *  spill read as sf, rows 1-3 of every group garbage. */
+        const float s0 = dq_lanes_sum(q0), s1 = dq_lanes_sum(q1);
+        const float s2 = dq_lanes_sum(q2), s3 = dq_lanes_sum(q3);
+        dq_head_post4(row + 32u * h0, ld, ct, jb->post_gamma,
+                      jb->rope_cs ? jb->rope_cs + (size_t)m0 * 2u * jb->rope_hd
+                                  : NULL,
+                      jb->rope_hd, dq_rs(s0, pc, eps), dq_rs(s1, pc, eps),
+                      dq_rs(s2, pc, eps), dq_rs(s3, pc, eps), al);
+      }
+    }
+    if (!fused && (jb->post_chunk != 0u || jb->rope_cs)) {
+      for (uint32_t r = 0; r < 4u; ++r) {
+        dq_row_post(jb, row + (size_t)r * ld, m0 + r);
+      }
+    }
+  }
+}
+
 /** @brief hvx_dq_tiles_rows_worker over byte-plane tiles: the rows in
- *         groups of four, the same floats per row. */
+ *         groups of four, the same floats per row. The per-head passes go
+ *         in the tile loop when they are what the FC call asks for (a norm
+ *         with its gamma, the rotation's head the norm's piece, whole
+ *         pieces, no add); otherwise dq_row_post after each group. */
 static void dq_rows_planes(const hvx_dq_rows_job *jb, uint32_t n_threads,
                            uint32_t i) {
   const hvx_dq_tiles_job *c = &jb->t;
   const uint32_t n_g = (c->m_count + 3u) / 4u;
   const uint32_t g_lo = (uint32_t)((uint64_t)n_g * i / n_threads);
   const uint32_t g_hi = (uint32_t)((uint64_t)n_g * (i + 1) / n_threads);
-  const uint32_t c0 = c->nt0 * HEXKL_ACC_TILE_COLS;
-  const HVX_UVector *cs = (const HVX_UVector *)(c->colsum_w + c0);
-  const HVX_UVector *ws = (const HVX_UVector *)(c->w_scale + c0);
-  const HVX_UVector *bs = (const HVX_UVector *)(c->bias + c0);
-  const HVX_Vector v256 = hvx_splat_sf(256.0f);
-  const int al = dq_dst_aligned(c);
-
-  for (uint32_t g = g_lo; g < g_hi; ++g) {
-    const uint32_t m0 = 4u * g;
-    const uint32_t rows = c->m_count - m0 < 4u ? c->m_count - m0 : 4u;
-    HVX_Vector vs[4], vz[4];
-    for (uint32_t r = 0; r < rows; ++r) {
-      vs[r] = hvx_splat_sf(c->act_scale[m0 + r]);
-      vz[r] = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(c->act_zp[m0 + r]));
+  const uint32_t pc = jb->post_chunk;
+  const int fused = pc != 0u && pc % (2u * HEXKL_ACC_TILE_COLS) == 0u &&
+                    jb->post_gamma && !c->accumulate &&
+                    (c->n_tiles * HEXKL_ACC_TILE_COLS) % pc == 0u &&
+                    (!jb->rope_cs || jb->rope_hd == pc);
+  if (fused) {
+    if (c->lo_off) {
+      dq_planes_groups(jb, g_lo, g_hi, 1u, 0u, 1u);
+    } else {
+      dq_planes_groups(jb, g_lo, g_hi, 0u, 0u, 1u);
     }
-    for (uint32_t j = 0; j < c->n_tiles; ++j) {
-      const uint8_t *tile = c->tiles_base + (size_t)j * c->tile_stride;
-      HVX_Vector a[4], b[4];
-      planes_rows4(tile, g, a);
-      if (c->lo_off) {
-        planes_rows4(tile + c->lo_off, g, b);
-      }
-      for (uint32_t r = 0; r < rows; ++r) {
-        HVX_Vector af = Q6_Vsf_equals_Vw(a[r]);
-        if (c->lo_off) { /* 256 hi + lo, in f32 */
-          af = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(af, v256),
-                                  Q6_Vsf_equals_Vw(b[r]));
-        }
-        dq_put(c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0 + 32u * j,
-               dq_formula(af, vs[r], vz[r], cs[j], ws[j], bs[j]), al,
-               c->accumulate);
-      }
-    }
-    if (jb->row_done) {
-      for (uint32_t r = 0; r < rows; ++r) {
-        jb->row_done(jb->ctx, c->dst_a + (size_t)(m0 + r) * c->dst_stride + c0,
-                     m0 + r);
-      }
-    }
+    return;
+  }
+  switch ((c->lo_off != 0u) * 2u + (c->accumulate != 0u)) {
+  case 0:
+    dq_planes_groups(jb, g_lo, g_hi, 0u, 0u, 0u);
+    break;
+  case 1:
+    dq_planes_groups(jb, g_lo, g_hi, 0u, 1u, 0u);
+    break;
+  case 2:
+    dq_planes_groups(jb, g_lo, g_hi, 1u, 0u, 0u);
+    break;
+  default:
+    dq_planes_groups(jb, g_lo, g_hi, 1u, 1u, 0u);
   }
 }
 
@@ -347,9 +576,7 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
       dq_put(seg + 32u * j, dq_formula(af, vs, vz, cs[j], ws[j], bs[j]), al,
              c->accumulate);
     }
-    if (jb->row_done) {
-      jb->row_done(jb->ctx, seg, m);
-    }
+    dq_row_post(jb, seg, m);
   }
 }
 

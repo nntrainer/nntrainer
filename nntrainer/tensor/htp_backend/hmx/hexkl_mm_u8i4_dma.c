@@ -33,7 +33,6 @@
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
-#include "hvx_rope_rows_f32.h"
 #include "hvx_swiglu_f32.h"
 
 #include "hexkl_probe.h"
@@ -580,25 +579,6 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
   free(h->arrays);
   memset(h, 0, sizeof(*h));
   return AEE_SUCCESS;
-}
-
-/** @brief A staged batch's per-head passes (hexkl_mm_opts.post_done): the
- *         run of columns a row just got, normed and rotated in place. */
-typedef struct {
-  const float *gamma; /**< the handle's chunk gamma */
-  const float *cs;    /**< the table row of the batch's row 0, or NULL */
-  uint32_t n, chunk, hd;
-  float eps;
-} fc_post;
-
-static void fc_row_post(void *v, float *seg, uint32_t row) {
-  const fc_post *p = (const fc_post *)v;
-  if (p->chunk != 0u) {
-    hvx_rmsnorm_row_chunks_f32(seg, seg, p->gamma, p->n, p->chunk, p->eps);
-  }
-  if (p->cs != NULL) {
-    hvx_rope_row_f32(seg, p->n, p->hd, p->cs + (size_t)row * 2u * p->hd);
-  }
 }
 
 /** @brief The weight a call's last run moved for the next call
@@ -1514,7 +1494,6 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   hvx_dq_glu16_job glu_job[2];
   hexkl_i32_batch iq_job[2];
   uint32_t stage_used = 0;
-  fc_post post[2];
   uint32_t sb = 0u;
   /* The per-head passes in the epilogue: only when every staged batch of
      every handle that has one holds whole heads. */
@@ -1753,17 +1732,14 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               hvx_dq_rows_job *rj = &dq_job[sb & 1u];
               hvx_dq_glu16_job *gj = &glu_job[sb & 1u];
               hvx_dq_tiles_job *jb = glu ? &gj->t : &rj->t;
-              fc_post *pp = &post[sb & 1u];
-              pp->chunk = fuse_post && o->post_chunk ? o->post_chunk[i] : 0u;
-              pp->gamma = post_gamma;
-              pp->eps = o->post_eps;
-              pp->hd = o->rope_hd;
-              pp->cs = fuse_post && i < o->rope_handles
-                         ? o->rope_cs + (size_t)m0 * 2u * o->rope_hd
-                         : NULL;
-              pp->n = nb * HEXKL_ACC_TILE_COLS;
-              rj->row_done = (pp->chunk != 0u || pp->cs) ? fc_row_post : NULL;
-              rj->ctx = pp;
+              rj->post_chunk =
+                fuse_post && o->post_chunk ? o->post_chunk[i] : 0u;
+              rj->post_gamma = post_gamma;
+              rj->post_eps = o->post_eps;
+              rj->rope_hd = o->rope_hd;
+              rj->rope_cs = fuse_post && i < o->rope_handles
+                              ? o->rope_cs + (size_t)m0 * 2u * o->rope_hd
+                              : NULL;
               jb->tiles_base =
                 (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
                                   acc_layout->base);

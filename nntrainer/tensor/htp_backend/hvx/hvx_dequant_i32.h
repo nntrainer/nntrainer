@@ -194,16 +194,21 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *job);
 
 /** @brief An hvx_dq_tiles_job taken row-major (dst_a only): a lane takes a
  *         run of rows and writes each row's n_tiles vectors as one
- *         contiguous run, then hands the row to @a row_done while it is
- *         still in the cache (a norm, a rotation: the FC call's per-head
- *         passes). The floats are hvx_dq_tiles_worker's. Units for the
- *         submit: m_count. */
+ *         contiguous run, then the FC call's per-head passes on the row's
+ *         n_tiles * 32 columns: hvx_rmsnorm_row_chunks_f32 and then
+ *         hvx_rope_row_f32 (the post_* and rope_* fields). Before them the
+ *         floats are hvx_dq_tiles_worker's. Units for the submit: m_count. */
 typedef struct {
   hvx_dq_tiles_job t;
-  /** NULL, or called once per row with the row's first written element
-   *  and its index in [0, m_count) */
-  void (*row_done)(void *ctx, float *seg, uint32_t row);
-  void *ctx;
+  /** the norm's gamma, post_chunk floats (NULL: none) */
+  const float *post_gamma;
+  /** NULL, or the rotation's table: row m's cos row then sin row of rope_hd
+   *  each at rope_cs + m * 2 * rope_hd, m in [0, m_count) */
+  const float *rope_cs;
+  /** 0, or each row's RMSNorm per piece of post_chunk columns */
+  uint32_t post_chunk;
+  uint32_t rope_hd;
+  float post_eps;
 } hvx_dq_rows_job;
 
 void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *job);

@@ -617,7 +617,7 @@ void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vjob) {
                                 c->bias + c0, out, c->dst_stride, 0);
   }
 }
-/* The same job row-major: each row's tiles, then the row's hook. */
+/* The same job row-major: each row's tiles, then its norm and rotation. */
 void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const hvx_dq_rows_job *jb = (const hvx_dq_rows_job *)vjob;
   const hvx_dq_tiles_job *c = &jb->t;
@@ -649,9 +649,13 @@ void hvx_dq_tiles_rows_worker(uint32_t n_threads, uint32_t i, void *vjob) {
         c->dst_a + (size_t)m * c->dst_stride + c0, c->dst_stride,
         (int)c->accumulate);
     }
-    if (jb->row_done)
-      jb->row_done(jb->ctx, c->dst_a + (size_t)m * c->dst_stride + c->nt0 * 32u,
-                   m);
+    float *seg = c->dst_a + (size_t)m * c->dst_stride + c->nt0 * 32u;
+    if (jb->post_chunk)
+      hvx_rmsnorm_row_chunks_f32(seg, seg, jb->post_gamma, c->n_tiles * 32u,
+                                 jb->post_chunk, jb->post_eps);
+    if (jb->rope_cs)
+      hvx_rope_row_f32(seg, c->n_tiles * 32u, jb->rope_hd,
+                       jb->rope_cs + (size_t)m * 2u * jb->rope_hd);
   }
 }
 void hvx_rmsnorm_row_chunks_f32(const float *x, float *y, const float *gamma,
