@@ -17,6 +17,7 @@
  */
 
 #include <cpu_ops_table.h>
+#include <fallback_internal.h>
 
 #include <cmath>
 #include <cstring>
@@ -108,44 +109,6 @@ void elementwise2_rows(const Tensor &in1, const Tensor &in2, Tensor &out,
 }
 
 /**
- * @brief (x - mean) * rsqrt(var + eps) * gamma + beta over `rows` rows of
- *        `width` elements. Mean and variance accumulate in FP32 regardless of
- *        the operand dtype.
- * @param T activation dtype
- * @param G weight dtype of gamma/beta, which need not equal T -- the core
- *          LayerNormalizationLayer requests them at the weight dtype.
- * @todo Scalar reference implementation (also the cross-backend correctness
- * baseline). An arch-specialized version can follow the existing
- * rms_norm_wrt_width_*_intrinsic pattern (x86/avx2_impl.h, arm/neon_impl.h) --
- * LayerNorm adds mean subtraction and gamma/beta but the row-wise reduction
- * structure is identical; row-level threading applies for prefill windows.
- * Not yet implemented.
- */
-template <typename T, typename G>
-void layernorm_rows(const T *x, const G *g, const G *b, T *y, unsigned int rows,
-                    unsigned int width, float eps) {
-  for (unsigned int r = 0; r < rows; ++r) {
-    const T *xr = x + (size_t)r * width;
-    T *yr = y + (size_t)r * width;
-
-    float mean = 0.0f;
-    for (unsigned int k = 0; k < width; ++k)
-      mean += (float)xr[k];
-    mean /= (float)width;
-
-    float ssd = 0.0f;
-    for (unsigned int k = 0; k < width; ++k) {
-      const float d = (float)xr[k] - mean;
-      ssd += d * d;
-    }
-    const float inv = 1.0f / std::sqrt(ssd / (float)width + eps);
-
-    for (unsigned int k = 0; k < width; ++k)
-      yr[k] = (T)((((float)xr[k] - mean) * inv) * (float)g[k] + (float)b[k]);
-  }
-}
-
-/**
  * @brief GELU computed in float. The constants match __fallback_gelu_v2 /
  *        __fallback_tanh_gelu so the FP16 path agrees with the FP32 one.
  * @param tanh_mode false = erf-exact GELU, true = tanh approximation
@@ -209,22 +172,26 @@ void CpuComputeOps::layer_norm(const Tensor &in, Tensor &out,
     return;
 
   if (dt == DT::FP32 && gt == DT::FP32) {
-    layernorm_rows(in.getData<float>() + elem_off, gamma.getData<float>(),
-                   beta.getData<float>(), out.getData<float>() + elem_off,
-                   active_rows, width, epsilon);
+    nntrainer::layernorm_wrt_width_fp32(
+      in.getData<float>() + elem_off, gamma.getData<float>(),
+      beta.getData<float>(), out.getData<float>() + elem_off, active_rows,
+      width, epsilon);
 #ifdef ENABLE_FP16
   } else if (dt == DT::FP16 && gt == DT::FP16) {
-    layernorm_rows(in.getData<_FP16>() + elem_off, gamma.getData<_FP16>(),
-                   beta.getData<_FP16>(), out.getData<_FP16>() + elem_off,
-                   active_rows, width, epsilon);
+    nntrainer::layernorm_wrt_width_fp16(
+      in.getData<_FP16>() + elem_off, gamma.getData<_FP16>(),
+      beta.getData<_FP16>(), out.getData<_FP16>() + elem_off, active_rows,
+      width, epsilon);
   } else if (dt == DT::FP16 && gt == DT::FP32) {
-    layernorm_rows(in.getData<_FP16>() + elem_off, gamma.getData<float>(),
-                   beta.getData<float>(), out.getData<_FP16>() + elem_off,
-                   active_rows, width, epsilon);
+    __fallback_layernorm_rows(in.getData<_FP16>() + elem_off,
+                              gamma.getData<float>(), beta.getData<float>(),
+                              out.getData<_FP16>() + elem_off, active_rows,
+                              width, epsilon);
   } else if (dt == DT::FP32 && gt == DT::FP16) {
-    layernorm_rows(in.getData<float>() + elem_off, gamma.getData<_FP16>(),
-                   beta.getData<_FP16>(), out.getData<float>() + elem_off,
-                   active_rows, width, epsilon);
+    __fallback_layernorm_rows(in.getData<float>() + elem_off,
+                              gamma.getData<_FP16>(), beta.getData<_FP16>(),
+                              out.getData<float>() + elem_off, active_rows,
+                              width, epsilon);
 #endif
   } else {
     throw std::invalid_argument(

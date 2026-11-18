@@ -241,6 +241,12 @@ void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
   __fallback_rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
 }
 
+void layernorm_wrt_width_fp16(const _FP16 *X, const _FP16 *__restrict gamma,
+                              const _FP16 *__restrict beta, _FP16 *Y, size_t H,
+                              size_t W, float epsilon) {
+  __fallback_layernorm_wrt_width_fp16(X, gamma, beta, Y, H, W, epsilon);
+}
+
 template <>
 void clamp(const _FP16 *input, _FP16 *output, size_t length, _FP16 lower_bound,
            _FP16 upper_bound) {

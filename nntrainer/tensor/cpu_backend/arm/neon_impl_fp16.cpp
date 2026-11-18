@@ -2307,6 +2307,88 @@ void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
   }
 }
 
+void layernorm_wrt_width_fp16(const _FP16 *X, const _FP16 *__restrict gamma,
+                              const _FP16 *__restrict beta, _FP16 *Y, size_t H,
+                              size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *x = X + h * W;
+    _FP16 *y = Y + h * W;
+
+    // pass 1: mean, FP32 accumulation
+    float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+    size_t i = 0;
+    for (; i + 16 <= W; i += 16) {
+      float16x8_t v0 = vld1q_f16(x + i);
+      float16x8_t v1 = vld1q_f16(x + i + 8);
+      a0 = vaddq_f32(a0, vcvt_f32_f16(vget_low_f16(v0)));
+      a1 = vaddq_f32(a1, vcvt_f32_f16(vget_high_f16(v0)));
+      a2 = vaddq_f32(a2, vcvt_f32_f16(vget_low_f16(v1)));
+      a3 = vaddq_f32(a3, vcvt_f32_f16(vget_high_f16(v1)));
+    }
+    for (; i + 4 <= W; i += 4)
+      a0 = vaddq_f32(a0, vcvt_f32_f16(vld1_f16(x + i)));
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < W; ++i)
+      sum += (float)x[i];
+    const float mean = sum / (float)W;
+    const float32x4_t vmean = vdupq_n_f32(mean);
+
+    // pass 2: variance of the centered row
+    a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+    i = 0;
+    for (; i + 16 <= W; i += 16) {
+      float16x8_t v0 = vld1q_f16(x + i);
+      float16x8_t v1 = vld1q_f16(x + i + 8);
+      float32x4_t d0 = vsubq_f32(vcvt_f32_f16(vget_low_f16(v0)), vmean);
+      float32x4_t d1 = vsubq_f32(vcvt_f32_f16(vget_high_f16(v0)), vmean);
+      float32x4_t d2 = vsubq_f32(vcvt_f32_f16(vget_low_f16(v1)), vmean);
+      float32x4_t d3 = vsubq_f32(vcvt_f32_f16(vget_high_f16(v1)), vmean);
+      a0 = vfmaq_f32(a0, d0, d0);
+      a1 = vfmaq_f32(a1, d1, d1);
+      a2 = vfmaq_f32(a2, d2, d2);
+      a3 = vfmaq_f32(a3, d3, d3);
+    }
+    for (; i + 4 <= W; i += 4) {
+      float32x4_t d = vsubq_f32(vcvt_f32_f16(vld1_f16(x + i)), vmean);
+      a0 = vfmaq_f32(a0, d, d);
+    }
+    float ssd = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < W; ++i) {
+      const float d = (float)x[i] - mean;
+      ssd += d * d;
+    }
+    const float inv = 1.0f / std::sqrt(ssd / (float)W + epsilon);
+    const float32x4_t vinv = vdupq_n_f32(inv);
+
+    // pass 3: FP32 math, one rounding to FP16 on store
+    i = 0;
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t v = vld1q_f16(x + i);
+      float16x8_t g = vld1q_f16(gamma + i);
+      float16x8_t b = vld1q_f16(beta + i);
+      float32x4_t t0 =
+        vmulq_f32(vsubq_f32(vcvt_f32_f16(vget_low_f16(v)), vmean), vinv);
+      float32x4_t t1 =
+        vmulq_f32(vsubq_f32(vcvt_f32_f16(vget_high_f16(v)), vmean), vinv);
+      float32x4_t y0 = vfmaq_f32(vcvt_f32_f16(vget_low_f16(b)), t0,
+                                 vcvt_f32_f16(vget_low_f16(g)));
+      float32x4_t y1 = vfmaq_f32(vcvt_f32_f16(vget_high_f16(b)), t1,
+                                 vcvt_f32_f16(vget_high_f16(g)));
+      vst1q_f16(y + i, vcombine_f16(vcvt_f16_f32(y0), vcvt_f16_f32(y1)));
+    }
+    for (; i + 4 <= W; i += 4) {
+      float32x4_t t =
+        vmulq_f32(vsubq_f32(vcvt_f32_f16(vld1_f16(x + i)), vmean), vinv);
+      float32x4_t r = vfmaq_f32(vcvt_f32_f16(vld1_f16(beta + i)), t,
+                                vcvt_f32_f16(vld1_f16(gamma + i)));
+      vst1_f16(y + i, vcvt_f16_f32(r));
+    }
+    for (; i < W; ++i)
+      y[i] =
+        (_FP16)(((float)x[i] - mean) * inv * (float)gamma[i] + (float)beta[i]);
+  }
+}
+
 template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,

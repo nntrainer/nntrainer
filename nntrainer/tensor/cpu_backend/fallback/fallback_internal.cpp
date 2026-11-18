@@ -629,6 +629,22 @@ void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
   throw std::runtime_error("NYI : __fallback_compute_rotary_emb_value");
 }
 
+void __fallback_layernorm_wrt_width_fp32(const float *X,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, float *Y,
+                                         size_t H, size_t W, float epsilon) {
+  __fallback_layernorm_rows(X, gamma, beta, Y, H, W, epsilon);
+}
+
+#ifdef ENABLE_FP16
+void __fallback_layernorm_wrt_width_fp16(const _FP16 *X,
+                                         const _FP16 *__restrict gamma,
+                                         const _FP16 *__restrict beta, _FP16 *Y,
+                                         size_t H, size_t W, float epsilon) {
+  __fallback_layernorm_rows(X, gamma, beta, Y, H, W, epsilon);
+}
+#endif
+
 void __fallback_rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                                   float *__restrict Y, size_t H,
                                                   size_t W, float epsilon) {

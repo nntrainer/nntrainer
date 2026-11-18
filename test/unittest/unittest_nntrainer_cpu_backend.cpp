@@ -1790,6 +1790,96 @@ TEST(nntrainer_cpu_backend_standalone, qs4cx_fp16_gemm_vs_reference) {
 #endif
 #endif
 
+/**
+ * @brief double reference LayerNorm of one row
+ */
+static std::vector<double> layernorm_row_ref(const std::vector<float> &x,
+                                             const std::vector<float> &g,
+                                             const std::vector<float> &b,
+                                             size_t row, size_t W, float eps) {
+  double mean = 0.0, var = 0.0;
+  for (size_t k = 0; k < W; ++k)
+    mean += x[row * W + k];
+  mean /= W;
+  for (size_t k = 0; k < W; ++k)
+    var += (x[row * W + k] - mean) * (x[row * W + k] - mean);
+  const double inv = 1.0 / std::sqrt(var / W + eps);
+  std::vector<double> y(W);
+  for (size_t k = 0; k < W; ++k)
+    y[k] = (x[row * W + k] - mean) * inv * g[k] + b[k];
+  return y;
+}
+
+/**
+ * @brief widths cover every vector / tail split of the backend kernels
+ */
+static const size_t layernorm_widths[] = {1,  3,  4,  7,  8,  12,  15,
+                                          16, 17, 31, 33, 64, 257, 768};
+
+TEST(nntrainer_cpu_backend_standalone, layernorm_wrt_width_fp32) {
+  const size_t H = 3;
+  const float eps = 1e-6f;
+  std::mt19937 rng(20261117);
+  std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+  for (size_t W : layernorm_widths) {
+    std::vector<float> x(H * W), g(W), b(W), y(H * W);
+    for (auto &v : x)
+      v = dist(rng) + 5.0f; /** offset mean exercises the centering */
+    for (auto &v : g)
+      v = dist(rng);
+    for (auto &v : b)
+      v = dist(rng);
+    nntrainer::layernorm_wrt_width_fp32(x.data(), g.data(), b.data(), y.data(),
+                                        H, W, eps);
+    std::vector<float> xi(x); /** Y == X, as the in-place layer calls it */
+    nntrainer::layernorm_wrt_width_fp32(xi.data(), g.data(), b.data(),
+                                        xi.data(), H, W, eps);
+    for (size_t i = 0; i < H * W; ++i)
+      EXPECT_EQ(xi[i], y[i]) << "in-place W " << W << " at " << i;
+    for (size_t h = 0; h < H; ++h) {
+      auto ref = layernorm_row_ref(x, g, b, h, W, eps);
+      for (size_t k = 0; k < W; ++k)
+        EXPECT_NEAR(y[h * W + k], ref[k], 1e-4 * (1.0 + std::fabs(ref[k])))
+          << "W " << W << " row " << h << " col " << k;
+    }
+  }
+}
+
+#ifdef ENABLE_FP16
+TEST(nntrainer_cpu_backend_standalone, layernorm_wrt_width_fp16) {
+  const size_t H = 3;
+  const float eps = 1e-6f;
+  std::mt19937 rng(20261118);
+  std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+  for (size_t W : layernorm_widths) {
+    std::vector<float> x(H * W), g(W), b(W);
+    std::vector<_FP16> xh(H * W), gh(W), bh(W), yh(H * W);
+    /** reference sees the FP16-rounded operands */
+    for (size_t i = 0; i < H * W; ++i)
+      x[i] = (float)(xh[i] = (_FP16)(dist(rng) + 5.0f));
+    for (size_t k = 0; k < W; ++k) {
+      g[k] = (float)(gh[k] = (_FP16)dist(rng));
+      b[k] = (float)(bh[k] = (_FP16)dist(rng));
+    }
+    nntrainer::layernorm_wrt_width_fp16(xh.data(), gh.data(), bh.data(),
+                                        yh.data(), H, W, eps);
+    std::vector<_FP16> xi(xh); /** Y == X, as the in-place layer calls it */
+    nntrainer::layernorm_wrt_width_fp16(xi.data(), gh.data(), bh.data(),
+                                        xi.data(), H, W, eps);
+    for (size_t i = 0; i < H * W; ++i)
+      EXPECT_EQ((float)xi[i], (float)yh[i])
+        << "in-place W " << W << " at " << i;
+    for (size_t h = 0; h < H; ++h) {
+      auto ref = layernorm_row_ref(x, g, b, h, W, eps);
+      for (size_t k = 0; k < W; ++k) /** one FP16 rounding of the output */
+        EXPECT_NEAR((float)yh[h * W + k], ref[k],
+                    1e-3 * (1.0 + std::fabs(ref[k])))
+          << "W " << W << " row " << h << " col " << k;
+    }
+  }
+}
+#endif
+
 int main(int argc, char **argv) {
   int result = -1;
 

@@ -16,6 +16,7 @@
 #ifdef __cplusplus
 
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -1232,6 +1233,74 @@ void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
 void __fallback_rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                                   float *__restrict Y, size_t H,
                                                   size_t W, float epsilon);
+/**
+ * @brief scalar reference LayerNorm over H rows of W elements:
+ *        (x - mean) * rsqrt(var + eps) * gamma + beta, two-pass FP32 mean and
+ *        variance for any I/O dtype. Shared by the __fallback_ entry points and
+ *        the mixed-dtype CpuComputeOps::layer_norm path.
+ * @tparam T activation dtype
+ * @tparam G gamma / beta dtype, which need not equal T
+ * @param Y output, may alias X (in-place)
+ */
+template <typename T, typename G>
+inline void __fallback_layernorm_rows(const T *X, const G *gamma, const G *beta,
+                                      T *Y, size_t H, size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const T *xr = X + h * W;
+    T *yr = Y + h * W;
+
+    float mean = 0.0f;
+    for (size_t k = 0; k < W; ++k)
+      mean += (float)xr[k];
+    mean /= (float)W;
+
+    float ssd = 0.0f;
+    for (size_t k = 0; k < W; ++k) {
+      const float d = (float)xr[k] - mean;
+      ssd += d * d;
+    }
+    const float inv = 1.0f / std::sqrt(ssd / (float)W + epsilon);
+
+    for (size_t k = 0; k < W; ++k)
+      yr[k] =
+        (T)((((float)xr[k] - mean) * inv) * (float)gamma[k] + (float)beta[k]);
+  }
+}
+
+/**
+ * @brief layer normalization w.r.t. width in H*W matrix input,
+ *        Y = (X - mean) / sqrt(var + epsilon) * gamma + beta per row
+ *
+ * @param X input
+ * @param gamma scale, W elements
+ * @param beta shift, W elements
+ * @param Y output, may alias X (in-place)
+ * @param H height of input matrix
+ * @param W width of input matrix
+ * @param epsilon epsilon added to the variance
+ */
+void __fallback_layernorm_wrt_width_fp32(const float *X,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, float *Y,
+                                         size_t H, size_t W, float epsilon);
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16 in / out layer normalization w.r.t. width, FP32 accumulation
+ *
+ * @param X input
+ * @param gamma scale, W elements
+ * @param beta shift, W elements
+ * @param Y output, may alias X (in-place)
+ * @param H height of input matrix
+ * @param W width of input matrix
+ * @param epsilon epsilon added to the variance
+ */
+void __fallback_layernorm_wrt_width_fp16(const _FP16 *X,
+                                         const _FP16 *__restrict gamma,
+                                         const _FP16 *__restrict beta, _FP16 *Y,
+                                         size_t H, size_t W, float epsilon);
+#endif
+
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
  *
