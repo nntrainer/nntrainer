@@ -57,8 +57,6 @@ exactly:
   **Self evaluation** (Build test / Run test), and a `Signed-off-by:` line.
 - A **Summary** section, also ending with `Signed-off-by:`.
 
-The `pr-desc` workflow manages/validates the PR description.
-
 ## ✅ CI gates — the definition of "done"
 
 A PR is mergeable only when these pass. They run on every pull request:
