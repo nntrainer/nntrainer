@@ -394,6 +394,22 @@ int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
  *  file's scratch: one call at a time). */
 static float g_xn[FC_Q4_MAX_K] __attribute__((aligned(128)));
 
+typedef struct {
+  float *y;
+  uint32_t n;
+  float cap;
+} softcap_ctx;
+
+/** @brief Lane i of n: its share of the row's whole vectors, the last lane
+ *  the tail too, so every element takes the path it takes on one lane. */
+static void softcap_lane(uint32_t n, uint32_t i, void *v) {
+  const softcap_ctx *c = (const softcap_ctx *)v;
+  const uint32_t nv = c->n / 32u;
+  const uint32_t lo = nv * i / n * 32u;
+  const uint32_t hi = i + 1u == n ? c->n : nv * (i + 1u) / n * 32u;
+  hvx_softcap_f32(c->y + lo, hi - lo, c->cap);
+}
+
 int nntr_hvx_lm_head_q4m1_f32(remote_handle64 handle, float eps,
                               const float *gamma, int gammaLen, float softcap,
                               const uint32 *h, int hLen, const float *x,
@@ -448,7 +464,9 @@ int nntr_hvx_lm_head_q4m1_f32(remote_handle64 handle, float eps,
     out += s->q4m1[h[p]].N;
   }
   if (softcap > 0.0f) {
-    hvx_softcap_f32(y, (uint32_t)yLen, softcap);
+    softcap_ctx sc = {y, (uint32_t)yLen, softcap};
+    hvx_worker_pool_run(s->quant_pool, softcap_lane, &sc,
+                        hvx_worker_pool_workers(s->quant_pool) + 1u);
   }
   return AEE_SUCCESS;
 }
