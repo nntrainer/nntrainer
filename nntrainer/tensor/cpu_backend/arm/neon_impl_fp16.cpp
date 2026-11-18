@@ -290,30 +290,31 @@ void hgemv(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M, uint32_t N,
 
   // now, N - idx is under 4 : 0 1 2 3 = N - idx
   if (N != idx) {
-    float32x4_t x0_3 = vcvt_f32_f16(vld1_f16(&X[idx]));
-    for (unsigned int j = N - idx; j < 4; ++j) {
-      x0_3[j] = 0;
+    const unsigned int rem = N - idx;
+
+    __fp16 x_tmp[4] = {0, 0, 0, 0};
+    for (unsigned int n = 0; n < rem; ++n) {
+      x_tmp[n] = X[idx + n];
     }
+
+    float32x4_t x0_3 = vcvt_f32_f16(vld1_f16(x_tmp));
 
     if (std::fpclassify(alpha - 1.F) != FP_ZERO) {
       x0_3 = vmulq_n_f32(x0_3, alpha);
     }
 
-    const __fp16 *__restrict w;
-
-    __fp16 yVal;
+    // only lanes < rem are rewritten below, so the rest stay zero for every j
+    __fp16 w_tmp[4] = {0, 0, 0, 0};
 
     for (unsigned int j = 0; j < M; ++j) {
-      w = &A[j * N + idx];
-      float32x4_t wvec0_3 = vcvt_f32_f16(vld1_f16(&w[0]));
-
-      for (unsigned int n = N - idx; n < 4; ++n) {
-        wvec0_3[n] = 0;
+      const __fp16 *__restrict w = &A[j * N + idx];
+      for (unsigned int n = 0; n < rem; ++n) {
+        w_tmp[n] = w[n];
       }
 
-      float32x4_t y0 = vmulq_f32(wvec0_3, x0_3);
+      float32x4_t y0 = vmulq_f32(vcvt_f32_f16(vld1_f16(w_tmp)), x0_3);
 
-      for (unsigned int n = 0; n < N - idx; ++n) {
+      for (unsigned int n = 0; n < rem; ++n) {
         Y32[j] += y0[n];
       }
     }
