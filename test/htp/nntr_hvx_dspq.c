@@ -217,8 +217,10 @@ static int dspq_invoke(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
   for (uint32_t i = 0; ok && i < n; ++i) {
     const uint32_t b = m->u[3 + i], w = (b + 7u) / 8u * 2u;
     if (b >> 31) {
-      /** {arena, offset}: a host staging buffer, read afresh from DDR (an
-       *  out one too: no stale line of it written back over it later) */
+      /** {arena, offset}: a host staging buffer, read afresh from DDR. An
+       *  out one is written, not read (as FastRPC's copied out buffers):
+       *  only its two end lines, which may hold other bytes, must not go
+       *  back stale over them */
       const uint32_t bytes = b & 0x7FFFFFFFu;
       ok = 4u * (off + 2u) <= len && m->u[off] < NNTR_HVX_MAX_ARENAS;
       const nntr_hvx_arena *a = ok ? &d->s->arenas[m->u[off]] : NULL;
@@ -226,8 +228,13 @@ static int dspq_invoke(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
       if (ok) {
         pra[i].buf.pv = (uint8_t *)a->va + m->u[off + 1];
         pra[i].buf.nLen = bytes;
-        qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv, bytes,
+        const uint32_t e = i < n_in || bytes <= 512u ? bytes : 256u;
+        qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv, e,
                              QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        if (e != bytes) {
+          qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv + bytes - e, e,
+                               QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        }
         flush |= (uint32_t)(i >= n_in) << i;
       }
       off += 2u;
