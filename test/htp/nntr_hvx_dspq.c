@@ -247,14 +247,12 @@ static int dspq_invoke(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
   if (ok && dspq_hmx()) {
     resp[1] =
       (uint32_t)nntr_hvx_skel_handle_invoke((remote_handle64)d->s, sc, pra);
-    for (uint32_t i = 0; i < n; ++i) {
-      /** and no line of a reference left cached: the host rewrites these
-       *  bytes before the next call that reads them, by either path */
-      if (m->u[3 + i] >> 31) {
+    /** the out references back to DDR; an in one may stay cached clean,
+     *  every reader (this, the _io entries, FastRPC) invalidates first */
+    for (uint32_t i = n_in; i < n; ++i) {
+      if (flush >> i & 1u) {
         qurt_mem_cache_clean((qurt_addr_t)pra[i].buf.pv, pra[i].buf.nLen,
-                             (flush >> i & 1u) ? QURT_MEM_CACHE_FLUSH_INVALIDATE
-                                               : QURT_MEM_CACHE_INVALIDATE,
-                             QURT_MEM_DCACHE);
+                             QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
       }
     }
   } else {
