@@ -1,0 +1,102 @@
+name: "Ubuntu pdebuild ccache"
+
+# Builds main with pdebuild on every merge and saves its ccache for PR
+# pdebuild jobs (pdebuild.yml) to restore.
+
+on:
+  push:
+    branches: [ main ]
+    # same skip rule as check-rebuild's debian mode
+    paths-ignore:
+      - '**.md'
+      - '**.png'
+      - '**.webp'
+      - '**.css'
+      - '**.html'
+      - 'packaging/**'
+      - 'jni/**'
+  workflow_dispatch:
+
+# back-to-back merges: only the newest main needs a snapshot, and a stale
+# run must not evict the newer one
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Ubuntu pdebuild on Ubuntu (ubuntu-22.04, amd64)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: write # evict stale ccache snapshots
+    env:
+      CCACHE_HOST_DIR: /var/cache/pbuilder/ccache
+      CCACHE_KEY_PREFIX: pdebuild-ccache-ubuntu-22.04-amd64-
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+        sudo apt-get clean
+        # Workaround for Azure CLI repo 403 error
+        sudo rm -f /etc/apt/sources.list.d/azure-cli.sources /etc/apt/sources.list.d/azure-cli.list || true
+    - uses: actions/setup-python@v1
+
+    - name: make cache dir for pbuilder
+      run: sudo mkdir --mode a=rwx --parents /var/cache/pbuilder
+
+    - name: restore pdebuild ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: /var/cache/pbuilder/ccache
+        key: ${{ env.CCACHE_KEY_PREFIX }}${{ github.sha }}
+        restore-keys: |
+          ${{ env.CCACHE_KEY_PREFIX }}
+
+    - name: prepare pdebuild
+      run: |
+        sudo add-apt-repository -y ppa:nnstreamer/ppa
+        sudo apt-get update && sudo apt-get install -y pbuilder debootstrap curl ubuntu-dev-tools qemu-user-static debian-archive-keyring ubuntu-keyring debhelper ccache
+        echo "DISTRIBUTION=jammy" > ~/.pbuilderrc
+        echo "OTHERMIRROR=\"deb [trusted=yes] http://archive.ubuntu.com/ubuntu jammy-backports universe |deb [trusted=yes] http://ppa.launchpad.net/nnstreamer/ppa/ubuntu jammy main\"" >> ~/.pbuilderrc
+        # pbuilder installs ccache in the chroot and bind-mounts this dir
+        echo "CCACHEDIR=$CCACHE_HOST_DIR" >> ~/.pbuilderrc
+        sudo mkdir -p $CCACHE_HOST_DIR
+        echo "max_size = 2.5G" | sudo tee $CCACHE_HOST_DIR/ccache.conf
+        cat ~/.pbuilderrc
+        sudo mkdir -p /root/
+        sudo ln -s ~/.pbuilderrc /root/
+
+    - name: make pbuilder base.tgz
+      run: |
+        sudo pbuilder create --allow-untrusted
+        sudo pbuilder update --distribution jammy
+        sudo pbuilder update
+
+    - name: run pdebuild
+      run: |
+        pdebuild --architecture amd64 -- --distribution jammy
+
+    - name: drop stale ccache entries
+      # hits refresh entry mtime; keep 2 days so PRs on a slightly older main still hit
+      run: |
+        sudo ccache -d $CCACHE_HOST_DIR --evict-older-than 2d
+        sudo ccache -d $CCACHE_HOST_DIR -s
+        sudo chmod -R a+rX $CCACHE_HOST_DIR
+
+    - name: save pdebuild ccache
+      uses: actions/cache/save@v4
+      with:
+        path: /var/cache/pbuilder/ccache
+        key: ${{ env.CCACHE_KEY_PREFIX }}${{ github.sha }}
+
+    - name: evict stale pdebuild ccache
+      # PRs restore only the newest snapshot, so older ones are dead weight.
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash .github/workflows/gbs-cache-evict.sh ${{ env.CCACHE_KEY_PREFIX }} ${{ env.CCACHE_KEY_PREFIX }}${{ github.sha }}
