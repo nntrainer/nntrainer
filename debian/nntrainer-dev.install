@@ -28,6 +28,9 @@
 /usr/include/nntrainer/cpu_backend.h
 /usr/include/nntrainer/compute_ops.h
 /usr/include/nntrainer/cpu_ops_table.h
+/usr/include/nntrainer/conv_indirect.h
+/usr/include/nntrainer/act_simd.h
+/usr/include/nntrainer/int8_gemm.h
 /usr/include/nntrainer/context_data.h
 /usr/include/nntrainer/var_grad.h
 /usr/include/nntrainer/weight.h
