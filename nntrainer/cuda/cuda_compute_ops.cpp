@@ -53,6 +53,40 @@ namespace nntrainer {
 // un-accelerated ops.
 class CudaComputeOps : public CpuComputeOps {
 public:
+  bool residual_op2(Tensor &out, const Tensor &a, const Tensor &b) override {
+    if (!out.getContiguous() || !a.getContiguous() || !b.getContiguous() ||
+        a.getDim() != out.getDim() || b.getDim() != out.getDim() ||
+        a.getDataType() != out.getDataType() ||
+        b.getDataType() != out.getDataType() ||
+        !cuda::dev_accessible(out.getData()) ||
+        !cuda::dev_accessible(a.getData()) ||
+        !cuda::dev_accessible(b.getData()))
+      return false;
+    if (out.getDataType() == Tdatatype::FP32)
+      return cuda::cuda_add_fp32(a.getData<float>(), b.getData<float>(),
+                                 out.getData<float>(), out.size());
+#ifdef ENABLE_FP16
+    if (out.getDataType() == Tdatatype::FP16)
+      return cuda::cuda_add_fp16(
+        reinterpret_cast<const unsigned short *>(a.getData()),
+        reinterpret_cast<const unsigned short *>(b.getData()),
+        reinterpret_cast<unsigned short *>(out.getData()), out.size());
+#endif
+    return false;
+  }
+
+  bool fc_bias(Tensor &out, const Tensor &bias) override {
+    if (!out.getContiguous() || !bias.getContiguous() ||
+        out.getFormat() != TensorDim::Format::NCHW ||
+        out.getDataType() != Tdatatype::FP32 ||
+        bias.getDataType() != Tdatatype::FP32 || bias.size() != out.width() ||
+        !cuda::dev_accessible(out.getData()) ||
+        !cuda::dev_accessible(bias.getData()))
+      return false;
+    return cuda::cuda_bias_add_fp32(out.getData<float>(), bias.getData<float>(),
+                                    out.size(), out.width());
+  }
+
   // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
   // (no supports_*() guard); correct for host and (host-coherent) managed
   // pointers. Under the device-only pools (NNTR_CUDA_DEV_ACT / KV_DEV) either
@@ -64,7 +98,9 @@ public:
   // fail loudly rather than fault.
   static bool device_copy(const void *X, void *Y, size_t bytes,
                           bool contiguous) {
-    if (!(cuda::dev_only(X) || cuda::dev_only(Y)))
+    const bool x_device = cuda::dev_accessible(X);
+    const bool y_device = cuda::dev_accessible(Y);
+    if (!(cuda::dev_only(X) || cuda::dev_only(Y) || (x_device && y_device)))
       return false;
     if (!contiguous)
       throw std::runtime_error(
@@ -76,15 +112,24 @@ public:
       throw std::runtime_error(
         "CudaComputeOps: device copy (cudaMemcpyAsync) failed");
     }
+    // Host-readable destinations can be consumed by a CPU operation as soon
+    // as Tensor::copy returns (embedding scaling is one such caller). Preserve
+    // that contract for managed memory too. finish() defers during graph
+    // capture, where the certified consumers are stream-ordered GPU nodes.
     if (!cuda::dev_only(Y))
-      sm.finish(); // D2H: the host consumes the destination immediately
+      sm.finish();
+    else
+      sm.maybeFinish();
     return true;
   }
 
   void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
                   float *Y, const unsigned int incY) override {
+    if (X == Y && incX == incY)
+      return;
     if (device_copy(X, Y, (size_t)N * sizeof(float), incX == 1 && incY == 1))
       return;
+    cuda::StreamManager::Global().finishIfAsync();
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = X[i * incX];
   }
@@ -92,8 +137,11 @@ public:
 #ifdef ENABLE_FP16
   void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
                   _FP16 *Y, const unsigned int incY) override {
+    if (X == Y && incX == incY)
+      return;
     if (device_copy(X, Y, (size_t)N * sizeof(_FP16), incX == 1 && incY == 1))
       return;
+    cuda::StreamManager::Global().finishIfAsync();
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = X[i * incX];
   }
@@ -123,6 +171,7 @@ public:
         std::memcpy(Y, ys.data(), (size_t)N * sizeof(_FP16));
       return;
     }
+    cuda::StreamManager::Global().finishIfAsync();
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = static_cast<_FP16>(X[i * incX]);
   }
@@ -150,6 +199,7 @@ public:
         std::memcpy(Y, ys.data(), (size_t)N * sizeof(float));
       return;
     }
+    cuda::StreamManager::Global().finishIfAsync();
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = static_cast<float>(X[i * incX]);
   }
@@ -272,12 +322,8 @@ public:
 
   // LayerNorm: out = (x-mean)*rsqrt(var+eps)*gamma + beta per row over width.
   // Device fp16 kernel for all-FP16 in/gamma/beta/out within the row gate;
-  // everything else (FP32, every mixed activation/weight dtype combo, and
-  // rows > gate) runs the INHERITED host loop CpuComputeOps::layer_norm over
-  // the host-coherent UVM tensors — i.e. UNACCELERATED rather than
-  // "CUDA support". cuda_layernorm_fp32 exists and is
-  // covered by unittest_cuda_kernels_layernorm, but is deliberately not routed
-  // from here yet: it has had no in-graph validation, unlike the fp16 path.
+  // FP32 also uses the device kernel when all operands are device accessible.
+  // Mixed activation/weight dtypes retain the coherent host fallback.
   //
   // The row gate is a CUDA-specific PERFORMANCE POLICY and belongs here, in the
   // op, never in the Layer (a Layer branching on backend behaviour is exactly
@@ -301,6 +347,23 @@ public:
                      active_rows, width);
     }
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    if (active_rows > 0 &&
+        in.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        gamma.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        beta.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const auto *xi = in.getData<float>() + elem_off;
+      const auto *gi = gamma.getData<float>();
+      const auto *bi = beta.getData<float>();
+      auto *yi = out.getData<float>() + elem_off;
+      if (cuda::dev_accessible(xi) && cuda::dev_accessible(gi) &&
+          cuda::dev_accessible(bi) && cuda::dev_accessible(yi) &&
+          cuda::cuda_layernorm_fp32(xi, gi, bi, yi, epsilon, active_rows,
+                                    width))
+        return;
+    }
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     using DT = ml::train::TensorDim::DataType;
     // NNTR_LAYERNORM_CUDA_OFF: unset => 32-row decode-only cap, "a"/"all" =>
@@ -342,9 +405,8 @@ public:
                               row_offset);
   }
 
-  // Element-wise activation. Device fp16 GELU/tanh-GELU kernel; every other
-  // mode and every other dtype runs the INHERITED host ActiFunc over UVM —
-  // UNACCELERATED, so say so rather than claiming CUDA support.
+  // Element-wise activation. FP32 and FP16 GELU/tanh-GELU stay on device;
+  // other modes retain the host ActiFunc fallback over coherent UVM.
   // Note there is NO row gate here and there should not be one: this is a flat
   // 1-D elementwise map with no host-wins crossover (mirrors the ungated
   // swiglu/geglu CUDA fast paths). Replaces the former CudaActivationLayer
@@ -367,6 +429,18 @@ public:
                      act_type);
     }
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    if (is_gelu && n > 0 &&
+        in.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const auto *xi = in.getData<float>() + elem_off;
+      auto *yi = out.getData<float>() + elem_off;
+      const int mode = at == ActivationType::ACT_TANH_GELU ? 1 : 0;
+      if (cuda::dev_accessible(xi) && cuda::dev_accessible(yi) &&
+          cuda::cuda_gelu_fp32(xi, yi, mode, static_cast<unsigned int>(n)))
+        return;
+    }
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     using DT = ml::train::TensorDim::DataType;
     if (is_gelu && n > 0 && in.getDataType() == DT::FP16 &&
@@ -404,6 +478,44 @@ public:
   // w4a8 dp4a / cuBLAS int8 IMMA) with host-weight/host-input staging, an FP32
   // cuBLAS path, and a host Tensor::dot fallback (correct on the host-coherent
   // UVM).
+  void fc_prebuild_weight(Tensor &weight) override {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    using D = ml::train::TensorDim::DataType;
+    const char *enabled = std::getenv("NNTR_CUDA_PREFETCH_WEIGHTS");
+    const auto dtype = weight.getDataType();
+    if (!enabled || enabled[0] != '1' ||
+        (dtype != D::FP32 && dtype != D::FP16) ||
+        cuda::ContextManager::Global().isIntegrated())
+      return;
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, weight.getData()) !=
+        cudaSuccess) {
+      cudaGetLastError();
+      return;
+    }
+    if (attributes.type != cudaMemoryTypeManaged)
+      return;
+    int device = 0;
+    cudaGetDevice(&device);
+    const size_t bytes = weight.size() * (dtype == D::FP32 ? 4 : 2);
+    auto &stream = cuda::StreamManager::Global();
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    cudaMemLocation location{};
+    location.type = cudaMemLocationTypeDevice;
+    location.id = device;
+    const auto result = cudaMemPrefetchAsync(weight.getData(), bytes, location,
+                                             0, stream.GetStream());
+#else
+    const auto result =
+      cudaMemPrefetchAsync(weight.getData(), bytes, device, stream.GetStream());
+#endif
+    if (result == cudaSuccess)
+      stream.finish();
+    else
+      cudaGetLastError(); // Placement is a hint; demand paging stays correct.
+#endif
+  }
+
   void fc(Tensor &input, Tensor &weight, Tensor &output) override {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     using DT = ml::train::TensorDim::DataType;
@@ -654,6 +766,7 @@ public:
     // GPU-path failure) on the host-coherent UVM tensors. NOTE that it is only
     // correct while the tensors ARE host-addressable -- see the FP16 arm above
     // for the case where they are not.
+    cuda::StreamManager::Global().finishIfAsync();
     CpuComputeOps::fc(input, weight, output);
   }
 };

@@ -1,0 +1,97 @@
+{
+  "verdict": "Model topology/numerics validated within tested scope; model execution/integration and shared backend are not optimal; kernel arithmetic is not the only remaining work.",
+  "production_code_changed": false,
+  "settings_ablation": {
+    "paligemma": {
+      "baseline_inference_s": 3.71842,
+      "eltwise_inference_s": 3.06053,
+      "flag": "NNTR_CUDA_ELTWISE=1",
+      "numeric_pass": true
+    },
+    "pi05": {
+      "baseline_inference_s": 3.76113,
+      "eltwise_inference_s": 3.14551,
+      "flag": "NNTR_CUDA_ELTWISE=1",
+      "numeric_pass": true
+    }
+  },
+  "cpu_attention_ablation": {
+    "unpinned_baseline": {
+      "requests": 3,
+      "pass_count": 3,
+      "median_total_s": 9.3361,
+      "median_expert_step_ms": 413.727706
+    },
+    "unpinned_existing_blas": {
+      "requests": 3,
+      "pass_count": 3,
+      "median_total_s": 8.1431,
+      "median_expert_step_ms": 235.43553
+    },
+    "pinned_baseline": {
+      "requests": 3,
+      "pass_count": 3,
+      "median_total_s": 11.9227,
+      "median_expert_step_ms": 486.87919550000004
+    },
+    "pinned_existing_blas": {
+      "requests": 3,
+      "pass_count": 3,
+      "median_total_s": 10.9804,
+      "median_expert_step_ms": 307.72676950000005
+    },
+    "pinned_combined_blas_vector_glu": {
+      "requests": 3,
+      "pass_count": 3,
+      "median_total_s": 9.92203,
+      "median_expert_step_ms": 306.6944215
+    }
+  },
+  "warm_host_rss_gib": {
+    "paligemma-cpu": {
+      "nntrainer": 13.25186538696289,
+      "pytorch": 11.689376831054688
+    },
+    "paligemma-cuda": {
+      "nntrainer": 2.7084503173828125,
+      "pytorch": 1.6103973388671875
+    },
+    "pi05-cpu": {
+      "nntrainer": 12.945003509521484,
+      "pytorch": 13.450187683105469
+    },
+    "pi05-cuda": {
+      "nntrainer": 4.368812561035156,
+      "pytorch": 3.6415252685546875
+    }
+  },
+  "limits": [
+    "CUPTI UVM byte counters unavailable (CUPTI_ERROR_NOT_READY); no total managed-transfer-byte claims.",
+    "GPU activity time overlaps host CUDA API time; do not add them.",
+    "CUPTI traces perturb wall time; diagnostic timings are not replacement performance benchmarks.",
+    "CPU pinned experiments use one thread on each of 8 P cores and must not be mixed with the earlier unpinned table.",
+    "Hybrid ENV-switch experiment invalid: causallm_engine() caches its initial backend; discarded.",
+    "The first AVX prototype had incorrect argument order and failed validation; only corrected, passing runs are used."
+  ],
+  "memory_design": {
+    "paligemma_extra_fp32_host_embedding_gib": 1.96240234375,
+    "pi05_expert_host_weight_bytes": 1720393856
+  },
+  "avx_dispatch": {
+    "baseline": {
+      "prefill_geglu_ms": 1500.768972,
+      "numeric_pass": true,
+      "inference_s": 10.5704
+    },
+    "vector_glu": {
+      "prefill_geglu_ms": 53.517236,
+      "numeric_pass": true,
+      "inference_s": 10.9124
+    }
+  },
+  "production_binaries_unchanged": true,
+  "discarded_experiments": [
+    "ENV-switch hybrid: backend cached at first use; not a valid mixed-backend measurement.",
+    "Initial AVX adapter with wrong argument order, corrected before validated experiments."
+  ]
+}

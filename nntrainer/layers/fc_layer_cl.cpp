@@ -149,7 +149,9 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     // Cast when a package pins its bias to a dtype other than the activation
     // one, matching FullyConnectedLayer's add site.
-    if (bias.getDataType() != hidden_.getDataType()) {
+    if (hidden_.getOps()->fc_bias(hidden_, bias)) {
+      // Whole-output broadcast stays on the selected backend.
+    } else if (bias.getDataType() != hidden_.getDataType()) {
       Tensor bias_cast = bias.clone(hidden_.getDataType());
       hidden_.add_i(bias_cast);
     } else {
@@ -219,7 +221,9 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     // See forwarding(): cast a bias whose dtype differs from the activation.
-    if (bias.getDataType() != hidden_step.getDataType()) {
+    if (hidden_step.getOps()->fc_bias(hidden_step, bias)) {
+      // Whole-output broadcast stays on the selected backend.
+    } else if (bias.getDataType() != hidden_step.getDataType()) {
       Tensor bias_cast = bias.clone(hidden_step.getDataType());
       hidden_step.add_i(bias_cast);
     } else {

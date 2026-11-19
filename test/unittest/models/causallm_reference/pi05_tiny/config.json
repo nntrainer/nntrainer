@@ -1,0 +1,27 @@
+{
+  "architectures": [
+    "PI05Model"
+  ],
+  "model_type": "paligemma",
+  "image_token_index": 1000,
+  "vocab_size": 1024,
+  "hidden_size": 64,
+  "intermediate_size": 128,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 8,
+  "num_key_value_heads": 1,
+  "head_dim": 16,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 10000.0,
+  "tie_word_embeddings": true,
+  "expert_hidden_size": 64,
+  "expert_intermediate_size": 128,
+  "expert_head_dim": 16,
+  "expert_num_attention_heads": 8,
+  "expert_num_key_value_heads": 1,
+  "action_dim": 8,
+  "action_horizon": 4,
+  "num_flow_steps": 10,
+  "time_min_period": 0.004,
+  "time_max_period": 4.0
+}

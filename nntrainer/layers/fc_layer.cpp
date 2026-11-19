@@ -302,7 +302,9 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    if (bias.getDataType() != hidden_.getDataType()) {
+    if (hidden_.getOps()->fc_bias(hidden_, bias)) {
+      // The backend handled the complete broadcast without host access.
+    } else if (bias.getDataType() != hidden_.getDataType()) {
       Tensor bias_cast = bias.clone(hidden_.getDataType());
       hidden_.add_i(bias_cast);
     } else {
@@ -399,7 +401,9 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
         disable_bias.empty() || disable_bias.get() == false) {
       Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-      if (bias.getDataType() != hidden_step.getDataType()) {
+      if (hidden_step.getOps()->fc_bias(hidden_step, bias)) {
+        // The backend handled the complete broadcast without host access.
+      } else if (bias.getDataType() != hidden_step.getDataType()) {
         Tensor bias_cast = bias.clone(hidden_step.getDataType());
         hidden_step.add_i(bias_cast);
       } else {
