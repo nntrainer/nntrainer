@@ -190,6 +190,11 @@ void ComputeOps::gemm_q4_0_fp32(unsigned int, unsigned int, unsigned int,
                                 unsigned int, float *, unsigned int) {
   NI(gemm_q4_0_fp32);
 }
+void ComputeOps::gemm_q8_0_fp32(unsigned int, unsigned int, unsigned int,
+                                const float *, unsigned int, const void *,
+                                unsigned int, float *, unsigned int) {
+  NI(gemm_q8_0_fp32);
+}
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
                                 unsigned int, float *, unsigned int) {
