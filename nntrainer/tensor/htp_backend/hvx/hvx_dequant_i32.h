@@ -248,11 +248,12 @@ void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *job);
  * the down's input codes, by one, against an exact GELU -- a tenth of the
  * tanh / erf GELU gap -- where the 40 ops of hvx_geglu_det_sf were 10% of
  * the prefill. The values, then the slopes T[k + 1] - T[k], each
- * HVX_GELU_TAB_STRIDE floats.
+ * HVX_GELU_TAB_STRIDE floats. A lane's landing holds 16 vectors, the
+ * gathers of eight rows.
  */
 #define HVX_GELU_TAB_NODES 3073u
 #define HVX_GELU_TAB_STRIDE 3104u
-#define HVX_GELU_TAB_LANE_BYTES 1024u
+#define HVX_GELU_TAB_LANE_BYTES 2048u
 #define HVX_GELU_TAB_BYTES(lanes)                                              \
   (2u * 4u * HVX_GELU_TAB_STRIDE + (lanes) * HVX_GELU_TAB_LANE_BYTES)
 

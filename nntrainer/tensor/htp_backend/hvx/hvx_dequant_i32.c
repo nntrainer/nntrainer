@@ -628,16 +628,17 @@ void hvx_gelu_tab_build(float *tab) {
   }
 }
 
-/** @brief gelu(g) * u of four rows by hvx_gelu_tab_build's tables: node
- *         k = rne(x - 1/2) <= x = 256 g + 1536 (clamped to [0, 3072], so
- *         k + f lands on node 3072 with f = 0 at most), T[k] + S[k] f,
- *         both gathered from VTCM, and g past 6. */
-static inline void gelu_tab4(const float *tab, HVX_Vector *land,
-                             const HVX_Vector g[4], const HVX_Vector u[4],
-                             HVX_Vector y[4]) {
+/** @brief gelu(g) * u of @a nr rows (4 or 8) by hvx_gelu_tab_build's
+ *         tables: node k = rne(x - 1/2) <= x = 256 g + 1536 (clamped to
+ *         [0, 3072], so k + f lands on node 3072 with f = 0 at most),
+ *         T[k] + S[k] f, both gathered from VTCM, and g past 6. Every
+ *         gather is issued before the first landing read. */
+static inline __attribute__((always_inline)) void
+gelu_tab_rows(const float *tab, HVX_Vector *land, const HVX_Vector *g,
+              const HVX_Vector *u, HVX_Vector *y, const uint32_t nr) {
   const uint32_t mu = 4u * HVX_GELU_TAB_NODES - 1u;
-  HVX_Vector f[4];
-  for (uint32_t r = 0; r < 4u; ++r) {
+  HVX_Vector f[8];
+  for (uint32_t r = 0; r < nr; ++r) {
     HVX_Vector x = Q6_Vsf_vadd_VsfVsf(
       Q6_Vsf_vmpy_VsfVsf(g[r], hvx_splat_sf(256.0f)), hvx_splat_sf(1536.0f));
     x = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, Q6_V_vzero()),
@@ -650,7 +651,7 @@ static inline void gelu_tab4(const float *tab, HVX_Vector *land,
     Q6_vgather_ARMVw(land + 2u * r + 1u, (uintptr_t)(tab + HVX_GELU_TAB_STRIDE),
                      mu, off);
   }
-  for (uint32_t r = 0; r < 4u; ++r) {
+  for (uint32_t r = 0; r < nr; ++r) {
     const HVX_Vector t = Q6_Vsf_vadd_VsfVsf(
       land[2u * r], Q6_Vsf_vmpy_VsfVsf(land[2u * r + 1u], f[r]));
     /* g > 6 on the bits: 6.0f is positive, so a negative g compares less */
@@ -661,55 +662,96 @@ static inline void gelu_tab4(const float *tab, HVX_Vector *land,
   }
 }
 
+/** @brief Unit (g, j)'s four gate rows into @a gv and up rows into @a uv. */
+static inline __attribute__((always_inline)) void
+glu16_in(const hvx_dq_tiles_job *c, uint32_t inter, uint32_t g, uint32_t j,
+         HVX_Vector *gv, HVX_Vector *uv) {
+  const uint32_t cg = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
+  const uint32_t cu = inter + cg;
+  dq_rows4_f32(c, c->tiles_base + (size_t)j * c->tile_stride, g,
+               *(const HVX_UVector *)(c->colsum_w + cg),
+               *(const HVX_UVector *)(c->w_scale + cg),
+               *(const HVX_UVector *)(c->bias + cg), gv);
+  dq_rows4_f32(c, c->tiles_base + (size_t)(c->n_tiles + j) * c->tile_stride, g,
+               *(const HVX_UVector *)(c->colsum_w + cu),
+               *(const HVX_UVector *)(c->w_scale + cu),
+               *(const HVX_UVector *)(c->bias + cu), uv);
+}
+
+/** @brief Four GLU rows of group @a g quantized and stored at byte @a d of
+ *         both planes. */
+static inline __attribute__((always_inline)) void
+glu16_out(const HVX_Vector *y, uint32_t g, uint32_t m_count, HVX_Vector vinv,
+          HVX_Vector vzp, uint8_t *plo, uint8_t *phi, size_t d) {
+  HVX_Vector q[4];
+  for (uint32_t r = 0; r < 4u; ++r) {
+    q[r] =
+      4u * g + r < m_count
+        ? Q6_Vw_vadd_VwVw(hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(y[r], vinv)), vzp)
+        : Q6_V_vzero();
+  }
+  /* hvx_quant_u8.c's store16_group4: rows 0-1 low half, 2-3 high */
+  const HVX_Vector h01 = Q6_Vuh_vpack_VwVw_sat(q[1], q[0]);
+  const HVX_Vector h23 = Q6_Vuh_vpack_VwVw_sat(q[3], q[2]);
+  *(HVX_UVector *)(plo + d) = Q6_Vb_vpacke_VhVh(h23, h01);
+  *(HVX_UVector *)(phi + d) = Q6_Vb_vpacko_VhVh(h23, h01);
+}
+
 void hvx_dq_glu16_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const hvx_dq_glu16_job *jb = (const hvx_dq_glu16_job *)vjob;
-  const hvx_dq_tiles_job *c = &jb->t;
+  /* a copy: the byte stores below may alias *jb, and through it the
+     compiler reloaded every field a unit */
+  const hvx_dq_tiles_job t = jb->t;
+  const hvx_dq_tiles_job *c = &t;
   const uint32_t np = c->n_tiles;
   const uint32_t n = (c->m_count + 3u) / 4u * np;
   const uint32_t lo = (uint32_t)((uint64_t)n * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)n * (i + 1) / n_threads);
+  if (lo >= hi) {
+    return;
+  }
   /* hvx_quant_u8.c's q16_run: rne(x / s) + zp */
   const HVX_Vector vinv = hvx_splat_sf(1.0f / jb->scale);
   const HVX_Vector vzp = Q6_V_vsplat_R(jb->zp);
-  /* (group, pair) units, a group's pairs in a run: four independent GLU
-     chains a unit, the rows' own pad rows computed and then dropped */
-  for (uint32_t u = lo; u < hi; ++u) {
-    const uint32_t g = u / np, j = u % np;
-    const uint32_t cg = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
-    const uint32_t cu = jb->inter + cg;
-    HVX_Vector gv[4], uv[4], q[4];
-    dq_rows4_f32(c, c->tiles_base + (size_t)j * c->tile_stride, g,
-                 *(const HVX_UVector *)(c->colsum_w + cg),
-                 *(const HVX_UVector *)(c->w_scale + cg),
-                 *(const HVX_UVector *)(c->bias + cg), gv);
-    dq_rows4_f32(c, c->tiles_base + (size_t)(np + j) * c->tile_stride, g,
-                 *(const HVX_UVector *)(c->colsum_w + cu),
-                 *(const HVX_UVector *)(c->w_scale + cu),
-                 *(const HVX_UVector *)(c->bias + cu), uv);
-    HVX_Vector y[4];
-    if (jb->tab) {
-      gelu_tab4(jb->tab,
-                (HVX_Vector *)(jb->land + (size_t)i * HVX_GELU_TAB_LANE_BYTES),
-                gv, uv, y);
+  const uint32_t inter = jb->inter, act = jb->act;
+  const float *const tab = jb->tab;
+  HVX_Vector *const land =
+    tab ? (HVX_Vector *)(jb->land + (size_t)i * HVX_GELU_TAB_LANE_BYTES) : NULL;
+  /* AH tiles of 64 rows x 32 columns, 2 KiB each */
+  uint8_t *const plo = jb->lo + (size_t)(jb->col / 32u) * 2048u;
+  uint8_t *const phi = jb->hi + (size_t)(jb->col / 32u) * 2048u;
+  /** (group, pair) units, a group's pairs in a run, the rows' own pad rows
+      computed and then dropped. With the table, two pairs of a group at a
+      time: eight independent GLU chains and 16 gathers in flight. On the
+      S25, a 16-pair batch of 64 rows on five workers, gates within +-2:
+      14.9 us a pair at a time, 11.2 two, 20.3 four (spilled). */
+  uint32_t g = lo / np, j = lo % np;
+  for (uint32_t u = lo; u < hi;) {
+    const uint32_t two = tab != NULL && j + 1u < np && u + 1u < hi;
+    HVX_Vector gv[8], uv[8], y[8];
+    glu16_in(c, inter, g, j, gv, uv);
+    if (two) {
+      glu16_in(c, inter, g, j + 1u, gv + 4, uv + 4);
+      gelu_tab_rows(tab, land, gv, uv, y, 8u);
+    } else if (tab) {
+      gelu_tab_rows(tab, land, gv, uv, y, 4u);
     } else {
       for (uint32_t r = 0; r < 4u; ++r) {
-        y[r] = jb->act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(gv[r], uv[r])
-                                            : hvx_swiglu_det_sf(gv[r], uv[r]);
+        y[r] = act == HVX_GLU_GELU_TANH ? hvx_geglu_det_sf(gv[r], uv[r])
+                                        : hvx_swiglu_det_sf(gv[r], uv[r]);
       }
     }
-    for (uint32_t r = 0; r < 4u; ++r) {
-      q[r] = 4u * g + r < c->m_count
-               ? Q6_Vw_vadd_VwVw(
-                   hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(y[r], vinv)), vzp)
-               : Q6_V_vzero();
+    const size_t d = (size_t)j * 2048u + (size_t)g * 128u;
+    glu16_out(y, g, c->m_count, vinv, vzp, plo, phi, d);
+    if (two) {
+      glu16_out(y + 4, g, c->m_count, vinv, vzp, plo, phi, d + 2048u);
     }
-    /* hvx_quant_u8.c's store16_group4: rows 0-1 low half, 2-3 high */
-    const HVX_Vector h01 = Q6_Vuh_vpack_VwVw_sat(q[1], q[0]);
-    const HVX_Vector h23 = Q6_Vuh_vpack_VwVw_sat(q[3], q[2]);
-    /* AH tiles of 64 rows x 32 columns, 2 KiB each */
-    const size_t d = (size_t)(jb->col / 32u + j) * 2048u + (size_t)g * 128u;
-    *(HVX_UVector *)(jb->lo + d) = Q6_Vb_vpacke_VhVh(h23, h01);
-    *(HVX_UVector *)(jb->hi + d) = Q6_Vb_vpacko_VhVh(h23, h01);
+    u += 1u + two;
+    j += 1u + two;
+    if (j == np) {
+      j = 0;
+      ++g;
+    }
   }
 }
 
