@@ -179,6 +179,11 @@ unsigned int TensorDim::getDataTypeSize() const {
     return sizeof(uint8_t);
   case TensorDim::DataType::QS4CX:
     return sizeof(uint8_t);
+  case TensorDim::DataType::QS4ACX:
+  case TensorDim::DataType::TQ2CX:
+    /// TernaryTensor::size() is already the record size in bytes, so the
+    /// element size must be 1 for TensorBase::bytes() to be right.
+    return sizeof(uint8_t);
   default:
     return sizeof(float);
   }
@@ -420,6 +425,10 @@ std::ostream &operator<<(std::ostream &out, TensorDim const &d) {
     type_ = "Q4_0";
   } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4CX) {
     type_ = "QS4CX";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::TQ2CX) {
+    type_ = "TQ2CX";
+  } else if (d.getDataType() == ml::train::TensorDim::DataType::QS4ACX) {
+    type_ = "QS4ACX";
   } else {
     type_ = "Unknown";
   }
