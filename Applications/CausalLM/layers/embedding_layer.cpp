@@ -126,6 +126,62 @@ std::mutex quant_lut_cache_mutex;
 std::unordered_map<std::string, std::weak_ptr<QuantLut>> quant_lut_cache;
 
 /**
+ * @brief Manifest "datatype" name of a loaded sidecar LUT (for diagnostics).
+ */
+const char *lutDatatypeName(const QuantLut &lut) {
+  switch (lut.ggml_dtype) {
+  case nntrainer::TensorDim::DataType::Q4_0:
+    return "q4_0";
+  case nntrainer::TensorDim::DataType::Q6_K:
+    return "q6_k";
+  case nntrainer::TensorDim::DataType::QS4CX:
+    return "qs4cx";
+  default:
+    break;
+  }
+  if (lut.is_raw_u16)
+    return "raw-uint16";
+  return lut.is_signed4 ? "sfixed4" : "ufixed8";
+}
+
+#if defined(ENABLE_OPENCL)
+/**
+ * @brief Settle the OpenCL queue before the host writes embedding rows into
+ *        @a out.
+ *
+ * The embedding output is a POOLED activation plane: the memory planner hands
+ * the same address to other tensors whose lifetimes do not overlap IN GRAPH
+ * ORDER -- among them the rotated-Q plane the attention's qk kernel binds as a
+ * shared-memory argument. Graph order is not execution order here: the GPU
+ * queue is asynchronous and the host runs tens of milliseconds ahead of it, so
+ * under a CHUNKED prefill host stores into this plane land while the previous
+ * chunk's qk dispatch is still reading the same pages. Proven on device with
+ * an mprotect canary that fires inside the embedding while the qk event is not
+ * yet CL_COMPLETE, three times per four-chunk prefill and never on a
+ * single-chunk one.
+ *
+ * This is the cheap place to do it: once per forward pass, at the head of the
+ * pass, where the host was going to spend the dequant time anyway -- unlike a
+ * consumer-side drain, which fires once per KV-owning layer and costs 8-11 %
+ * of the prefill. NNTR_EMB_HOST_SYNC=0 is the A/B arm.
+ *
+ * Every host-decode path (in-bin weight, row-block sidecar, packed-4bit /
+ * ufixed8 sidecar) writes the same plane, so every one of them must call this.
+ */
+void settleQueueBeforeHostWrite(const nntrainer::Tensor &out) {
+  static const bool emb_host_sync = []() {
+    const char *e = std::getenv("NNTR_EMB_HOST_SYNC");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  // Only where the plane is device-visible at all: a host-only or CUDA run has
+  // no OpenCL queue to settle and must not be made to create one.
+  const auto md = out.getMemoryData();
+  if (emb_host_sync && md && (md->isSVM() || out.isClMem()))
+    nntrainer::cl_queue_finish();
+}
+#endif
+
+/**
  * @brief Decode one QS4CX sidecar group: n nibbles (uint4 = int4 + 8, low
  *        nibble first) times ONE fp32 scale.
  * @note  Deliberately NOT named dequantize_row_qs4cx: nntrainer exports a
@@ -878,6 +934,32 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
                       nntrainer::TensorDim::DataType::UINT16,
                   std::invalid_argument)
       << "Raw UINT16 LUT requires UINT16 activation/output dtype";
+
+    // The manifest "datatype" decides how the sidecar is decoded; the layer's
+    // weight dtype is not consulted. A quantized weight dtype that names a
+    // different format (e.g. QS4CX in the model config, sfixed4 in the
+    // manifest) is almost always a stale or mismatched sidecar, so say so
+    // instead of silently decoding a different table than the config implies.
+    const auto weight_dtype = context.getWeightDataType();
+    const bool float_weight =
+      weight_dtype == nntrainer::TensorDim::DataType::FP32 ||
+      weight_dtype == nntrainer::TensorDim::DataType::FP16;
+    if (!float_weight && !quant_lut->is_raw_u16 &&
+        weight_dtype != quant_lut->ggml_dtype) {
+      const char *weight_dtype_name = "unknown";
+      size_t k = 0;
+      for (const auto e : nntrainer::TensorDataTypeInfo::EnumList) {
+        if (e == weight_dtype) {
+          weight_dtype_name = nntrainer::TensorDataTypeInfo::EnumStr[k];
+          break;
+        }
+        ++k;
+      }
+      ml_logw("Embedding %s: layer weight dtype %s differs from the sidecar "
+              "LUT manifest datatype '%s' (%s); the manifest datatype is used",
+              context.getName().c_str(), weight_dtype_name,
+              lutDatatypeName(*quant_lut), quantized_lut_path.get().c_str());
+    }
   }
 
   nntrainer::TensorDim output_dim = input_dim;
@@ -1086,6 +1168,13 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
   }
 #endif
 
+#if defined(ENABLE_OPENCL)
+  // Same pooled output plane as the row-block path: settle the queue before
+  // the host stores below, or a chunked prefill overwrites rows the previous
+  // chunk's kernels are still reading.
+  settleQueueBeforeHostWrite(hidden);
+#endif
+
   auto &tm = nntrainer::ThreadManager::Global();
 
   for (unsigned int batch = 0; batch < batch_size; ++batch) {
@@ -1171,6 +1260,18 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
     }
 #endif
   }
+
+#if defined(ENABLE_OPENCL)
+  // Device-plane residency, as at the end of incremental_forwarding: upload
+  // the host-written rows into the planner's device sub-buffer so GPU
+  // consumers read them. No-op when the output is on the shared (SVM) plane.
+  // Batch slices are not contiguous in the written range, so batch > 1
+  // uploads the whole tensor (0 = all bytes).
+  nntrainer::clmem_raise_cl(
+    hidden, batch_size == 1 ? (unsigned int)((size_t)iter * out_dim *
+                                             hidden.getDim().getDataTypeSize())
+                            : 0u);
+#endif
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -1326,35 +1427,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #endif
 
 #if defined(ENABLE_OPENCL)
-    // The loop below writes this layer's OUTPUT with plain host stores from
-    // worker threads. That output is a POOLED activation plane: the memory
-    // planner hands the same address to other tensors whose lifetimes do not
-    // overlap IN GRAPH ORDER -- among them the rotated-Q plane the attention's
-    // qk kernel binds as a shared-memory argument. Graph order is not execution
-    // order here: the GPU queue is asynchronous and the host runs tens of
-    // milliseconds ahead of it, so under a CHUNKED prefill these stores land
-    // while the previous chunk's qk dispatch is still reading the same pages.
-    // Proven on device with an mprotect canary that fires inside this function
-    // while the qk event is not yet CL_COMPLETE, three times per four-chunk
-    // prefill and never on a single-chunk one.
-    //
-    // Settle the queue before the host writes into a plane the device may still
-    // be reading. This is the cheap place to do it: once per forward pass, at
-    // the head of the pass, where the host was going to spend the dequant time
-    // anyway -- unlike a consumer-side drain, which fires once per KV-owning
-    // layer and costs 8-11 % of the prefill. NNTR_EMB_HOST_SYNC=0 is the A/B
-    // arm.
-    {
-      static const bool emb_host_sync = []() {
-        const char *e = std::getenv("NNTR_EMB_HOST_SYNC");
-        return !(e != nullptr && e[0] == '0');
-      }();
-      // Only where the plane is device-visible at all: a host-only or CUDA run
-      // has no OpenCL queue to settle and must not be made to create one.
-      const auto h_md = hidden_.getMemoryData();
-      if (emb_host_sync && h_md && (h_md->isSVM() || hidden_.isClMem()))
-        nntrainer::cl_queue_finish();
-    }
+    // The loop below writes this layer's OUTPUT (a pooled activation plane)
+    // with plain host stores from worker threads.
+    settleQueueBeforeHostWrite(hidden_);
 #endif
 
     auto &tm = nntrainer::ThreadManager::Global();
