@@ -99,6 +99,33 @@ static inline void hexkl_hmx_mm_u8i4(const void *act, const void *wt) {
                        : "memory");
 }
 
+/**
+ * @brief Two adjacent 32x32 int4 n-tiles in one packet: acc += act . wt,
+ *        and the swap accumulator (hexkl_hmx_swap_acc) += act . (wt + 512).
+ *
+ * The :deep weight form QNN's convhnh1x1deep kernel issues, with the 1 KiB
+ * weight descriptor (the int8 tile's; 0x3ff reads the same). Measured on
+ * v79 (S25): 7.1 cycles against 7.0 for one tile, both accumulators'
+ * readout byte-identical to two hexkl_hmx_mm_u8i4 calls, and one mxclracc
+ * clears both.
+ *
+ * @param act 2048-byte aligned, 2 KiB
+ * @param wt  128-byte aligned, 1 KiB: the two tiles back to back
+ */
+static inline void hexkl_hmx_mm_u8i4_pair(const void *act, const void *wt) {
+  __asm__ __volatile__("{ activation.ub = mxmem(%0,%2):cm\n\t"
+                       "  weight.n = mxmem(%1,%3):deep }"
+                       :
+                       : "r"(act), "r"(wt), "r"(HEXKL_HMX_MM_ACT_DESC),
+                         "r"(HEXKL_HMX_MM_WT_DESC_I8)
+                       : "memory");
+}
+
+/** @brief Exchanges the accumulator with the swap accumulator. */
+static inline void hexkl_hmx_swap_acc(void) {
+  __asm__ __volatile__("{ mxswapacc }" : : : "memory");
+}
+
 #else
 
 /** @brief Host build: the library call, which takes base + offsets. */
@@ -110,6 +137,11 @@ static inline void hexkl_hmx_mm_u8i4(const void *act, const void *wt) {
   (void)act;
   (void)wt;
 }
+static inline void hexkl_hmx_mm_u8i4_pair(const void *act, const void *wt) {
+  (void)act;
+  (void)wt;
+}
+static inline void hexkl_hmx_swap_acc(void) {}
 
 #endif /* __hexagon__ */
 

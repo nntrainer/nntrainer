@@ -1478,6 +1478,17 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   const int inline_mm =
     hexkl_hmx_mm_aligned(vtcm_base + act_off, vtcm_base + wbuf[0]) &&
     hexkl_hmx_mm_aligned(vtcm_base + act_hi_off, vtcm_base + wbuf[1]);
+  /** Adjacent n-tiles sit back to back in each k row of the weight panel,
+      so two of them go in one packet (hexkl_hmx_mm_u8i4_pair) and the
+      second comes out of the swap accumulator: half the packets for the
+      same bytes in the planes.
+      ponytail: measured on v79 only; widen the guard after the same
+      byte-for-byte check on v81. */
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ == 79
+  const int pair_mm = inline_mm && !out_i32;
+#else
+  const int pair_mm = 0;
+#endif
   if (planes24 || out_i32) {
     hexkl_cvt_block_set_uniform(vtcm_base + cvt_off,
                                 UINT16_C(0x6000) /* binary16 512 */);
@@ -1603,6 +1614,8 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           /* This staging buffer was last read by the job two batches back,
              retired when the last one was submitted. */
           for (uint32_t j = 0; j < nb; ++j) {
+            const uint32_t pair =
+              pair_mm && j + 1u < nb && nt_w(j + 1u) == nt_w(j) + 1u;
             /** a16: the high-byte sweep into slot j, the low-byte one into
                 slot acc_tiles + j of the same staging buffer */
             for (uint32_t sw = 0; sw < n_sweeps; ++sw) {
@@ -1625,9 +1638,16 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                   const uint8_t *w =
                     vtcm_base + wcur + nt_w(j) * WEIGHT_TILE_BYTES_U8I4;
                   const uint32_t w_step = nt_n * WEIGHT_TILE_BYTES_U8I4;
-                  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-                    hexkl_hmx_mm_u8i4(a + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-                                      w + kt * w_step);
+                  if (pair) {
+                    for (uint32_t kt = 0; kt < k_tiles; ++kt)
+                      hexkl_hmx_mm_u8i4_pair(
+                        a + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                        w + kt * w_step);
+                  } else {
+                    for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+                      hexkl_hmx_mm_u8i4(a + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+                                        w + kt * w_step);
+                    }
                   }
                 } else {
                   for (uint32_t kt = 0; kt < k_tiles; ++kt) {
@@ -1657,20 +1677,28 @@ static int fc_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
               const uint32_t slot_off =
                 stage_off + (sw * acc_tiles + (out_i32 ? stage_used : 0u) + j) *
                               ACC_TILE_BYTES;
-              last_read_off = slot_off;
-              if (planes24) {
-                acc_read_planes24(vtcm_base, cvt_off, slot_off);
-              } else if (out_i32) {
-                acc_read_planes32(vtcm_base, cvt_off, slot_off);
-              } else {
-                rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off,
-                                                    slot_off);
+              /* g = 1: slot j + 1, from the swap accumulator */
+              for (uint32_t g = 0; g <= pair; ++g) {
+                if (g)
+                  hexkl_hmx_swap_acc();
+                last_read_off = slot_off + g * ACC_TILE_BYTES;
+                if (planes24) {
+                  acc_read_planes24(vtcm_base, cvt_off, last_read_off);
+                } else if (out_i32) {
+                  acc_read_planes32(vtcm_base, cvt_off, last_read_off);
+                } else {
+                  rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off,
+                                                      last_read_off);
+                }
+                if (g)
+                  hexkl_hmx_swap_acc();
               }
               HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
               if (rc != AEE_SUCCESS) {
                 goto out;
               }
             }
+            j += pair;
           }
 #undef nt_w
           HEXKL_PROBE_ADD(HEXKL_PROBE_MM, mm_begin);
