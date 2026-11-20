@@ -28,92 +28,7 @@
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 
-namespace {
-
-// Scalar Q4_0 4x8 kernels for builds without the extension the NEON kernels
-// below need (dotprod for GEMV, i8mm for GEMM). T is float or __fp16.
-template <typename T>
-void gemv_q4_0_4x8_q8_0_ref(int n, T *__restrict s, const void *__restrict vx,
-                            const void *__restrict vy, int nc) {
-  const int qk = Q8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
-
-  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
-  for (int x = 0; x < nc / ncols_interleaved; x++) {
-    const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
-    float sumf[4] = {0};
-    for (int l = 0; l < nb; l++) {
-      for (int k = 0; k < (qk / (2 * blocklen)); k++) {
-        for (int j = 0; j < ncols_interleaved; j++) {
-          int sumi = 0;
-          for (int i = 0; i < blocklen; ++i) {
-            const uint8_t q =
-              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
-            const int v0 = (int8_t)(q << 4);
-            const int v1 = (int8_t)(q & 0xF0);
-            sumi += ((v0 * a_ptr[l].qs[k * blocklen + i]) +
-                     (v1 * a_ptr[l].qs[k * blocklen + i + qk / 2])) >>
-                    4;
-          }
-          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
-        }
-      }
-    }
-    for (int j = 0; j < ncols_interleaved; j++)
-      s[x * ncols_interleaved + j] = static_cast<T>(sumf[j]);
-  }
-}
-
-template <typename T>
-void gemm_q4_0_4x8_q8_0_ref(int n, T *__restrict s, size_t bs,
-                            const void *__restrict vx,
-                            const void *__restrict vy, int nr, int nc) {
-  const int qk = Q8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
-
-  for (int y = 0; y < nr / 4; y++) {
-    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
-    for (int x = 0; x < nc / ncols_interleaved; x++) {
-      const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
-      float sumf[4][4] = {{0}};
-      for (int l = 0; l < nb; l++) {
-        for (int k = 0; k < (qk / (2 * blocklen)); k++) {
-          for (int m = 0; m < 4; m++) {
-            for (int j = 0; j < ncols_interleaved; j++) {
-              int sumi = 0;
-              for (int i = 0; i < blocklen; ++i) {
-                const uint8_t q =
-                  b_ptr[l]
-                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
-                const int v0 = (int8_t)(q << 4);
-                const int v1 = (int8_t)(q & 0xF0);
-                sumi +=
-                  ((v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i]) +
-                   (v1 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i +
-                                     qk / 2 * 4])) >>
-                  4;
-              }
-              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
-            }
-          }
-        }
-      }
-      for (int m = 0; m < 4; m++) {
-        for (int j = 0; j < ncols_interleaved; j++)
-          s[(y * 4 + m) * bs + x * ncols_interleaved + j] =
-            static_cast<T>(sumf[m][j]);
-      }
-    }
-  }
-}
-
-} // namespace
+#include "nntr_ggml_impl_ref.h"
 
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
@@ -171,7 +86,7 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 #else
   // the NEON kernel needs dotprod (sdot)
   /// @todo add a NEON kernel without dotprod (vmull_s8) if needed
-  gemv_q4_0_4x8_q8_0_ref(n, s, vx, vy, nc);
+  nntr_gemv_q4_0_4x8_q8_0_ref(n, s, vx, vy, nc);
 #endif
 }
 
@@ -235,7 +150,7 @@ void nntr_gemv_q4_0_4x8_q8_0_fp16(int n, __fp16 *__restrict s, size_t bs,
 #else
   // the NEON kernel needs dotprod (sdot)
   /// @todo add a NEON kernel without dotprod (vmull_s8) if needed
-  gemv_q4_0_4x8_q8_0_ref(n, s, vx, vy, nc);
+  nntr_gemv_q4_0_4x8_q8_0_ref(n, s, vx, vy, nc);
 #endif
 }
 #endif // ENABLE_FP16
@@ -255,7 +170,7 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 #if !defined(__ARM_FEATURE_MATMUL_INT8)
   // the NEON kernel needs i8mm (smmla)
   /// @todo add a NEON kernel without i8mm (sdot / vmull_s8) if needed
-  gemm_q4_0_4x8_q8_0_ref(n, s, bs, vx, vy, nr, nc);
+  nntr_gemm_q4_0_4x8_q8_0_ref(n, s, bs, vx, vy, nr, nc);
 #else
   const void *b_ptr = vx;
   const void *a_ptr = vy;
@@ -681,7 +596,7 @@ void nntr_gemm_q4_0_4x8_q8_0_fp16(int n, _FP16 *__restrict s, size_t bs,
 #if !defined(__ARM_FEATURE_MATMUL_INT8)
   // the NEON kernel needs i8mm (smmla)
   /// @todo add a NEON kernel without i8mm (sdot / vmull_s8) if needed
-  gemm_q4_0_4x8_q8_0_ref(n, s, bs, vx, vy, nr, nc);
+  nntr_gemm_q4_0_4x8_q8_0_ref(n, s, bs, vx, vy, nr, nc);
 #else
   const void *b_ptr = vx;
   const void *a_ptr = vy;
