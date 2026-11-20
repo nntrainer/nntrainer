@@ -33,6 +33,8 @@
 #include <nntr_ggml_impl_common.h>
 #include <nntr_ggml_impl_utils.h>
 
+#include "nntr_ggml_impl_ref.h"
+
 //============================================================================
 // Helper functions for block packing
 //============================================================================
@@ -209,48 +211,7 @@ static block_q4_Kx8 make_block_q4_Kx8(block_q4_K *in,
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
-  const int qk = Q8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
-
-  assert(n % qk == 0);
-  assert(nc % ncols_interleaved == 0);
-
-  float sumf[4];
-  int sumi;
-
-  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
-  for (int x = 0; x < nc / ncols_interleaved; x++) {
-    const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
-
-    for (int j = 0; j < ncols_interleaved; j++)
-      sumf[j] = 0.0;
-    for (int l = 0; l < nb; l++) {
-      for (int k = 0; k < (qk / (2 * blocklen)); k++) {
-        for (int j = 0; j < ncols_interleaved; j++) {
-          sumi = 0;
-          for (int i = 0; i < blocklen; ++i) {
-            const int v0 =
-              (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
-                                   j * blocklen + i]
-                       << 4);
-            const int v1 =
-              (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
-                                   j * blocklen + i] &
-                       0xF0);
-            sumi += ((v0 * a_ptr[l].qs[k * blocklen + i]) +
-                     (v1 * a_ptr[l].qs[k * blocklen + i + qk / 2])) >>
-                    4;
-          }
-          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
-        }
-      }
-    }
-    for (int j = 0; j < ncols_interleaved; j++)
-      s[x * ncols_interleaved + j] = sumf[j];
-  }
+  nntr_gemv_q4_0_4x8_q8_0_ref(n, s, vx, vy, nc);
 }
 
 //============================================================================
@@ -260,58 +221,7 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
-  const int qk = Q8_0;
-  const int nb = n / qk;
-  const int ncols_interleaved = 4;
-  const int blocklen = 8;
-
-  assert(n % qk == 0);
-  assert(nr % 4 == 0);
-  assert(nc % ncols_interleaved == 0);
-
-  float sumf[4][4];
-  int sumi;
-
-  for (int y = 0; y < nr / 4; y++) {
-    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
-    for (int x = 0; x < nc / ncols_interleaved; x++) {
-      const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
-      for (int m = 0; m < 4; m++) {
-        for (int j = 0; j < ncols_interleaved; j++)
-          sumf[m][j] = 0.0;
-      }
-      for (int l = 0; l < nb; l++) {
-        for (int k = 0; k < (qk / (2 * blocklen)); k++) {
-          for (int m = 0; m < 4; m++) {
-            for (int j = 0; j < ncols_interleaved; j++) {
-              sumi = 0;
-              for (int i = 0; i < blocklen; ++i) {
-                const int v0 =
-                  (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
-                                       j * blocklen + i]
-                           << 4);
-                const int v1 =
-                  (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
-                                       j * blocklen + i] &
-                           0xF0);
-                sumi +=
-                  ((v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i]) +
-                   (v1 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i +
-                                     qk / 2 * 4])) >>
-                  4;
-              }
-              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
-                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
-            }
-          }
-        }
-      }
-      for (int m = 0; m < 4; m++) {
-        for (int j = 0; j < ncols_interleaved; j++)
-          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
-      }
-    }
-  }
+  nntr_gemm_q4_0_4x8_q8_0_ref(n, s, bs, vx, vy, nr, nc);
 }
 
 //============================================================================
