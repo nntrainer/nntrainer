@@ -828,6 +828,8 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 include $(BUILD_EXECUTABLE)
 
+# KleidiAI is built only with dotprod (tools/android_test.sh sets this)
+ifneq ($(NNTR_BUILD_KLEIDIAI),0)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := unittest_nntrainer_kleidiai
@@ -844,6 +846,7 @@ LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 include $(BUILD_EXECUTABLE)
+endif
 
 include $(CLEAR_VARS)
 

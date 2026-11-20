@@ -13,9 +13,15 @@ matmul_clamp_f16_qai8dxp_qsi4cxp_sources = [
     'kai_matmul_clamp_f16_qai8dxp1x8_qsi4cxp4x8_1x4_neon_dotprod_asm.S',
     'kai_matmul_clamp_f16_qai8dxp4x4_qsi4cxp4x4_16x4_neon_dotprod.c',
     'kai_matmul_clamp_f16_qai8dxp4x4_qsi4cxp4x4_16x4_neon_dotprod_asm.S',
+]
+
+# i8mm kernels #error without __ARM_FEATURE_MATMUL_INT8
+if 'i8mm' in arm_features
+  matmul_clamp_f16_qai8dxp_qsi4cxp_sources += [
     'kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_16x4_neon_i8mm.c',
     'kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_16x4_neon_i8mm_asm.S',
-]
+  ]
+endif
 
 foreach s : matmul_clamp_f16_qai8dxp_qsi4cxp_sources
   nntrainer_sources += meson.current_source_dir() / s

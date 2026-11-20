@@ -188,28 +188,31 @@ if arm_target == 'aarch64'
   elif arm_arch_opt == 'auto'
     arm_arch_opt = 'armv8.2-a'
   endif
-  # KleidiAI is always built on aarch64 and needs dotprod+i8mm
-  # @todo support dotprod-only by dropping the i8mm kai kernels
-  if not (get_option('enable-dotprod') and get_option('enable-i8mm'))
-    error('aarch64 requires enable-dotprod and enable-i8mm (KleidiAI).')
-  endif
-  # Tizen optflags (-march=armv8-a...) come after project args and win, and
-  # MSVC ignores -march, so force the ACLE macros KleidiAI/ggml check.
-  # @todo drop once sources are selected per extension and Tizen uses arm-arch
-  if get_option('platform') != 'android'
-    extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
-    extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
-  endif
   if get_option('enable-fp16')
     if arm_arch_opt == 'armv8-a'
       error('enable-fp16 requires arm-arch=armv8.2-a or later (FEAT_FP16 is Armv8.2+)')
     endif
+    # The fp16-activation QS4CX GEMM is KleidiAI-only
+    if not get_option('enable-dotprod')
+      warning('enable-fp16 without enable-dotprod: QS4CX weights with fp16 ' +
+              'activations are not supported yet (NYI error)')
+    endif
     arm_features += 'fp16'
   endif
   if get_option('enable-dotprod')
+    # QS4CX packs for the KleidiAI i8mm variants only (@todo nr4/kr8 pack)
+    if not get_option('enable-i8mm')
+      warning('enable-dotprod without enable-i8mm: QS4CX weights are not ' +
+              'supported yet (NYI error when they are packed or run)')
+    endif
     arm_features += 'dotprod'
   endif
   if get_option('enable-i8mm')
+    # Legal ISA (each source checks its own macro), but KleidiAI needs dotprod
+    if not get_option('enable-dotprod')
+      warning('enable-i8mm without enable-dotprod: KleidiAI is not built, ' +
+              'so only the ggml kernels use i8mm')
+    endif
     arm_features += 'i8mm'
   endif
   if get_option('enable-fp16fml')
@@ -237,6 +240,15 @@ if arm_target == 'aarch64'
     arm_march_flag += '+' + feature
   endforeach
   arm_isa_args += arm_march_flag
+  # MSVC cl ignores -march, so define the ACLE macros the sources check
+  if cxx_compiler_id == 'msvc'
+    if 'dotprod' in arm_features
+      extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+    endif
+    if 'i8mm' in arm_features
+      extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+    endif
+  endif
 elif arm_target == 'armv7'
   if arm_arch_opt == 'auto'
     arm_arch_opt = 'armv7-a'

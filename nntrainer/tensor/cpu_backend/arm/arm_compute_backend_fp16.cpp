@@ -14,7 +14,9 @@
 #include <assert.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
+#if defined(__ARM_FEATURE_DOTPROD)
 #include <kleidiai_interface.h>
+#endif
 #include <neon_impl.h>
 #include <nntrainer_error.h>
 #ifdef USE_BLAS
@@ -441,7 +443,7 @@ uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
   // variant-independent, and this path is not hot (canonical weights are
   // pre-packed at load time), so pick a fixed valid variant rather than
   // benchmarking one per call.
-  __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+  gemm_qai8dxp_qsi4cxp_rhs_unpacked(
     m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
     dst_mtx_f32, /*idx_variant=*/0, transB, lower_bound, upper_bound);
   return 1;
@@ -450,7 +452,7 @@ uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                   uint32_t idx_variant,
                                                   bool transB) {
-  return __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, transB);
+  return get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, transB);
 }
 
 void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
@@ -458,9 +460,8 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
                                      void *rhs_native_mtx_qs4cx,
                                      void *rhs_scales_f32, uint32_t idx_variant,
                                      bool transB) {
-  __kai_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
-                                   rhs_native_mtx_qs4cx, rhs_scales_f32,
-                                   idx_variant, transB);
+  rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx, rhs_native_mtx_qs4cx,
+                             rhs_scales_f32, idx_variant, transB);
 }
 
 template <>
@@ -473,9 +474,8 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
   // transB is not used by the packed path: the RHS layout is fixed at pack
   // time. __kai_gemm_qai8dxp_qsi4cxp parallelises internally.
   (void)transB;
-  __kai_gemm_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx,
-                             dst_act_mtx_f32, idx_variant, lower_bound,
-                             upper_bound);
+  gemm_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx,
+                       dst_act_mtx_f32, idx_variant, lower_bound, upper_bound);
 }
 
 template <>
@@ -485,6 +485,11 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
                                       _FP16 *dst_act_mtx_f16,
                                       uint32_t idx_variant, bool transB,
                                       _FP16 lower_bound, _FP16 upper_bound) {
+#if !defined(__ARM_FEATURE_DOTPROD)
+  /// @todo add a fallback for builds without dotprod (no KleidiAI)
+  throw std::runtime_error(std::string(__func__) +
+                           ": needs dotprod (KleidiAI), not yet implemented");
+#else
   // Dispatch straight into the KleidiAI f16 qai8dxp x qsi4cxp interface, so
   // neither the activation nor the destination is promoted to fp32. The RHS
   // must already be packed for a qsi4cxp4x8 micro-kernel (nr=4, kr=16, sr=2)
@@ -511,6 +516,7 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
   __kai_gemm_f16_qai8dxp_qsi4cxp(
     m, n, k, lhs_native_mtx_f16, rhs_packed_mtx_qs4cx, dst_act_mtx_f16, variant,
     static_cast<float>(lower_bound), static_cast<float>(upper_bound));
+#endif
 }
 
 } /* namespace nntrainer */
