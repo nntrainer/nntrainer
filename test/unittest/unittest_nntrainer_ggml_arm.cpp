@@ -28,6 +28,9 @@
 #include <nntrainer_test_util.h>
 #include <thread_manager.h>
 
+// last: its ggml macros (Q4_0, ...) clash with nntrainer enum names
+#include <nntr_ggml_impl_ref.h>
+
 // Convert a float to its fp16 bit pattern the same way the production kernels
 // do. This test only runs on aarch64, where the library's fp32->fp16 helpers
 // reduce to a hardware __fp16 cast, so doing the cast directly keeps the
@@ -682,6 +685,57 @@ TEST(nntrainer_ggml_arm, DISABLED_gemm_q4_0_4x8_benchmark) {
   std::cout << "[INFO]   "
             << 2.0 * M * N * K / st.median_ns // flop/ns == GFLOPS
             << " GFLOPS (median)" << std::endl;
+}
+
+/**
+ * @brief Compare the Q4_0 4x8 NEON kernel with the shared scalar ref.
+ * M == 1 runs the GEMV, otherwise the GEMM (M must be a multiple of 4).
+ * Builds without dotprod / i8mm run the ref as the kernel itself.
+ */
+static void expect_q4_0_4x8_matches_ref(int M, int N, int K) {
+  nntr_ggml_init();
+
+  auto A = generate_activations(K, 55, M);
+  auto W = generate_activations(K, 66, N);
+
+  const size_t q4_size = (size_t)N * K / 32 * sizeof(block_q4_0_testonly);
+  std::vector<char> Q4(q4_size), B(q4_size);
+  nntr_quantize_q4_0(W.data(), Q4.data(), N, K, nullptr);
+  nntr_repack_q4_0_to_q4_0_4_bl(B.data(), 8, Q4.data(), q4_size, N, K);
+
+  std::vector<float> C((size_t)M * N), C_ref((size_t)M * N);
+  if (M == 1) {
+    std::vector<block_q8_0_testonly> Aq(K / 32);
+    nntr_quantize_row_q8_0(A.data(), Aq.data(), K);
+    nntr_gemv_q4_0_4x8_q8_0(K, C.data(), N, B.data(), Aq.data(), 1, N);
+    nntr_gemv_q4_0_4x8_q8_0_ref(K, C_ref.data(), B.data(), Aq.data(), N);
+  } else {
+    std::vector<block_q8_0x4_testonly> Aq((size_t)M / 4 * K / 32);
+    for (int r = 0; r < M; r += 4)
+      nntr_quantize_mat_q8_0_4x8(A.data() + (size_t)r * K,
+                                 Aq.data() + (size_t)r / 4 * K / 32, K);
+    nntr_gemm_q4_0_4x8_q8_0(K, C.data(), N, B.data(), Aq.data(), M, N);
+    nntr_gemm_q4_0_4x8_q8_0_ref(K, C_ref.data(), N, B.data(), Aq.data(), M, N);
+  }
+
+  // same integer dot products; only the fp32 accumulation order differs,
+  // so the error scales with the output range, not with each element
+  float max_abs = 0.0f;
+  for (float v : C_ref)
+    max_abs = std::max(max_abs, std::fabs(v));
+  const float tol = 1e-5f * (1.0f + max_abs);
+  for (size_t i = 0; i < C.size(); ++i)
+    ASSERT_NEAR(C[i], C_ref[i], tol) << "index " << i;
+}
+
+TEST(nntrainer_ggml_arm, gemv_q4_0_4x8_matches_ref) {
+  expect_q4_0_4x8_matches_ref(1, 128, 256);
+  expect_q4_0_4x8_matches_ref(1, 260, 1024);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_0_4x8_matches_ref) {
+  expect_q4_0_4x8_matches_ref(4, 128, 256);
+  expect_q4_0_4x8_matches_ref(12, 260, 1024);
 }
 
 int main(int argc, char **argv) {
