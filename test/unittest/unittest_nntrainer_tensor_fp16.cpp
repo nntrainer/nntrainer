@@ -14,6 +14,7 @@
 #include "nntrainer_test_util.h"
 #include "util_func.h"
 #include <cmath>
+#include <cpu_backend.h>
 #include <cstring>
 #include <fallback_internal.h>
 #include <fstream>
@@ -22,6 +23,7 @@
 #include <quantizer.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#include <vector>
 
 TEST(nntrainer_Tensor, Tensor_01_fp16_p) {
   int status = ML_ERROR_NONE;
@@ -4097,6 +4099,123 @@ TEST(nntrainer_Tensor, dot_transpose_p) {
     nntrainer::Tensor ret = a.dot(b, false, false);
     EXPECT_EQ(ret, answer);
   }
+}
+
+/**
+ * @brief Fill a buffer with small multiples of 1/8. With such operands every
+ * partial sum of a small GEMM stays exactly representable in fp16, so the
+ * result does not depend on the backend or on the accumulation order.
+ */
+static std::vector<_FP16> exact_fp16_pattern(unsigned int size,
+                                             unsigned int mul, unsigned int add,
+                                             unsigned int mod) {
+  std::vector<_FP16> v(size);
+  for (unsigned int i = 0; i < size; ++i)
+    v[i] = static_cast<_FP16>(
+      (static_cast<int>((i * mul + add) % mod) - static_cast<int>(mod / 2)) /
+      8.F);
+  return v;
+}
+
+/**
+ * @brief Run fp16 sgemm on exactly representable inputs and compare with a
+ * scalar reference
+ */
+static void check_small_fp16_gemm(unsigned int M, unsigned int N,
+                                  unsigned int K, bool transA, bool transB,
+                                  float alpha, float beta) {
+  std::vector<_FP16> A = exact_fp16_pattern(M * K, 7, 0, 13);
+  std::vector<_FP16> B = exact_fp16_pattern(K * N, 5, 3, 11);
+  std::vector<_FP16> C = exact_fp16_pattern(M * N, 2, 0, 5);
+  std::vector<float> ref(M * N);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      float sum = 0.F;
+      for (unsigned int k = 0; k < K; ++k) {
+        float a = static_cast<float>(transA ? A[k * M + m] : A[m * K + k]);
+        float b = static_cast<float>(transB ? B[n * K + k] : B[k * N + n]);
+        sum += a * b;
+      }
+      ref[m * N + n] = alpha * sum + beta * static_cast<float>(C[m * N + n]);
+    }
+  }
+
+  nntrainer::sgemm(0, transA, transB, M, N, K, alpha, A.data(), transA ? M : K,
+                   B.data(), transB ? K : N, beta, C.data(), N);
+
+  for (unsigned int i = 0; i < C.size(); ++i) {
+    EXPECT_EQ(static_cast<float>(C[i]), ref[i])
+      << "M=" << M << " N=" << N << " K=" << K << " transA=" << transA
+      << " transB=" << transB << " alpha=" << alpha << " beta=" << beta
+      << " idx=" << i;
+  }
+}
+
+/**
+ * @brief On ARM, hgemm_small routes M < 8, K % 8 == 0 and N % 4 == 0 to the
+ * 1x8 / 1x4 kernels, which pack A in blocks of 1-3 rows. Covers every M that
+ * path can see, both kernels, the neighbouring fallback path (other K, or
+ * alpha != 1) and all transpose modes.
+ */
+TEST(nntrainer_Tensor, sgemm_small_any_M_p) {
+  nntrainer::init_backend();
+  for (bool transA : {false, true})
+    for (bool transB : {false, true})
+      for (float alpha : {1.F, 0.5F})
+        for (float beta : {0.F, 1.F, 0.5F})
+          for (unsigned int M = 1; M < 8; ++M)
+            for (unsigned int N : {4u, 8u, 12u})
+              for (unsigned int K : {4u, 8u, 12u})
+                check_small_fp16_gemm(M, N, K, transA, transB, alpha, beta);
+}
+
+/**
+ * @brief (3x8) x (8x8) fp16 dot, the shape that used to abort in the ARM
+ * packing_A1()
+ */
+TEST(nntrainer_Tensor, dot_gemm_small_3_8_8_p) {
+  const unsigned int M = 3, K = 8, N = 8;
+  nntrainer::TensorDim::TensorType t_type;
+  t_type.format = nntrainer::Tformat::NCHW;
+  t_type.data_type = nntrainer::Tdatatype::FP16;
+
+  std::vector<_FP16> a_data = exact_fp16_pattern(M * K, 7, 0, 13);
+  std::vector<_FP16> b_data = exact_fp16_pattern(K * N, 5, 3, 11);
+  nntrainer::Tensor a(nntrainer::TensorDim(1, 1, M, K, t_type), a_data.data());
+  nntrainer::Tensor b(nntrainer::TensorDim(1, 1, K, N, t_type), b_data.data());
+
+  nntrainer::Tensor ret = a.dot(b);
+
+  ASSERT_EQ(ret.height(), M);
+  ASSERT_EQ(ret.width(), N);
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      float sum = 0.F;
+      for (unsigned int k = 0; k < K; ++k)
+        sum += static_cast<float>(a_data[m * K + k]) *
+               static_cast<float>(b_data[k * N + n]);
+      EXPECT_EQ(static_cast<float>(ret.getValue<_FP16>(0, 0, m, n)), sum)
+        << "m=" << m << " n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief a small fp16 dot with mismatched inner dimensions must be rejected
+ * before it reaches the GEMM backend
+ */
+TEST(nntrainer_Tensor, dot_gemm_small_incompatible_K_n) {
+  nntrainer::TensorDim::TensorType t_type;
+  t_type.format = nntrainer::Tformat::NCHW;
+  t_type.data_type = nntrainer::Tdatatype::FP16;
+
+  nntrainer::Tensor a(1, 1, 3, 8, t_type);
+  nntrainer::Tensor b(1, 1, 4, 8, t_type);
+  a.setValue(1.F);
+  b.setValue(1.F);
+
+  EXPECT_THROW(a.dot(b), std::runtime_error);
 }
 
 TEST(nntrainer_Tensor, dot_shortcuts_p) {
