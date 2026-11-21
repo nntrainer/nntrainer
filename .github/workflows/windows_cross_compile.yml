@@ -46,6 +46,25 @@ jobs:
         with:
           arch: amd64_arm64
 
+      # The runner image also ships a standalone LLVM in C:\Program Files\LLVM
+      # that comes earlier in PATH than the clang-cl bundled with Visual
+      # Studio. Its version is unrelated to the MSVC STL headers, which reject
+      # an older Clang (error STL1000) whenever the image updates the toolset.
+      # Use the clang-cl that ships with the same VS installation as the STL
+      # so the two always move together.
+      - name: Use the clang-cl bundled with Visual Studio
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: |
+          $llvm = Join-Path $env:VCToolsInstallDir '..\..\Llvm\x64\bin' | Resolve-Path
+          $clang = Join-Path $llvm 'clang-cl.exe'
+          if (-not (Test-Path $clang)) {
+            Write-Error "clang-cl.exe not found in $llvm"
+            exit 1
+          }
+          echo "$llvm" >> $env:GITHUB_PATH
+          & $clang --version
+          Write-Output "MSVC toolset: $env:VCToolsVersion"
+
       - name: Prepare Build
         if: steps.rebuild.outputs.rebuild == '1'
         # Using the CI-specific cross file
