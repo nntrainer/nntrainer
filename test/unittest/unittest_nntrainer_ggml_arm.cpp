@@ -16,6 +16,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -682,6 +683,377 @@ TEST(nntrainer_ggml_arm, DISABLED_gemm_q4_0_4x8_benchmark) {
   std::cout << "[INFO]   "
             << 2.0 * M * N * K / st.median_ns // flop/ns == GFLOPS
             << " GFLOPS (median)" << std::endl;
+}
+
+/**
+ * @brief q4_K block
+ */
+typedef struct {
+  uint16_t d[2];      // super-block scale and min (fp16)
+  uint8_t scales[12]; // 6-bit block scales and mins
+  uint8_t qs[128];    // nibbles / quants
+} block_q4_K_testonly;
+
+static_assert(sizeof(block_q4_K_testonly) == 144, "block_q4_K layout mismatch");
+
+/**
+ * @brief Repacked weight layouts whose GEMM wrappers split N across threads
+ */
+enum class split_layout { q4_0_4x8, q4_0_8x8, q4_K_8x8 };
+
+/**
+ * @brief Number of interleaved weight rows (output columns) per tile
+ */
+static unsigned int tile_cols(split_layout layout) {
+  return layout == split_layout::q4_0_4x8 ? 4 : 8;
+}
+
+/**
+ * @brief Quantize N x K fp32 weights and repack them for @a layout
+ */
+static std::vector<char> quantize_and_repack(split_layout layout,
+                                             const std::vector<float> &W,
+                                             unsigned int N, unsigned int K) {
+  const bool is_q4_K = layout == split_layout::q4_K_8x8;
+  const size_t block_bytes =
+    is_q4_K ? sizeof(block_q4_K_testonly) : sizeof(block_q4_0_testonly);
+  const size_t size = (size_t)N * K / (is_q4_K ? 256 : 32) * block_bytes;
+  std::vector<char> Q(size), B(size);
+  if (N == 0)
+    return B;
+
+  if (is_q4_K) {
+    nntr_quantize_q4_K(W.data(), Q.data(), N, K, nullptr);
+    nntr_repack_q4_K_to_q4_K_8_bl(B.data(), 8, Q.data(), size, N, K);
+  } else {
+    nntr_quantize_q4_0(W.data(), Q.data(), N, K, nullptr);
+    if (layout == split_layout::q4_0_4x8)
+      nntr_repack_q4_0_to_q4_0_4_bl(B.data(), 8, Q.data(), size, N, K);
+    else
+      nntr_repack_q4_0_to_q4_0_8_bl(B.data(), 8, Q.data(), size, N, K);
+  }
+  return B;
+}
+
+/**
+ * @brief fp32 reference of A(M, K) * W.T(N, K)
+ */
+static std::vector<float> reference_gemm(const std::vector<float> &A,
+                                         const std::vector<float> &W,
+                                         unsigned int M, unsigned int N,
+                                         unsigned int K) {
+  std::vector<float> C((size_t)M * N, 0.0f);
+  for (unsigned int i = 0; i < M; i++)
+    for (unsigned int j = 0; j < N; j++)
+      for (unsigned int k = 0; k < K; k++)
+        C[(size_t)i * N + j] += A[(size_t)i * K + k] * W[(size_t)j * K + k];
+  return C;
+}
+
+/**
+ * @brief Largest ||out - ref|| / ||ref|| accepted for a whole q4 weight GEMM
+ * output against its fp32 reference. The cases below measure 0.04 to 0.10
+ * from quantization alone; an all-zero output scores exactly 1.
+ */
+static constexpr double q4_gemm_tolerance = 0.2;
+
+/**
+ * @brief The same bound for a single column tile. A tile has few elements, so
+ * its error is noisier (up to 0.19 here), but one that was never computed
+ * still scores about 1 instead of being averaged away in a wide output.
+ */
+static constexpr double q4_tile_tolerance = 0.5;
+
+/**
+ * @brief ||out - ref|| / ||ref|| over columns [col_begin, col_end) of an
+ * output with N columns. Unlike cosine similarity, this is also large for an
+ * all-zero or a uniformly scaled output.
+ */
+static double relative_l2_error(const std::vector<float> &ref, const float *out,
+                                unsigned int N, unsigned int col_begin,
+                                unsigned int col_end) {
+  double err = 0.0, norm = 0.0;
+  for (size_t row = 0; row < ref.size() / N; row++) {
+    for (unsigned int col = col_begin; col < col_end; col++) {
+      const size_t i = row * N + col;
+      const double diff = (double)out[i] - ref[i];
+      err += diff * diff;
+      norm += (double)ref[i] * ref[i];
+    }
+  }
+  return std::sqrt(err / norm);
+}
+
+/**
+ * @brief Expect the whole output, and each column tile of it, to match @a ref
+ */
+static void expect_matches_reference(split_layout layout,
+                                     const std::vector<float> &ref,
+                                     const float *out, unsigned int N) {
+  const unsigned int nb = tile_cols(layout);
+  ASSERT_EQ(N % nb, 0u);
+  EXPECT_LT(relative_l2_error(ref, out, N, 0, N), q4_gemm_tolerance);
+  for (unsigned int col = 0; col < N; col += nb)
+    EXPECT_LT(relative_l2_error(ref, out, N, col, col + nb), q4_tile_tolerance)
+      << "columns " << col << " to " << col + nb - 1;
+}
+
+/**
+ * @brief bstp and mixed implement the multi-weight GEMM for every layout. The
+ * omp wrappers, which the test assumes unless the build says otherwise,
+ * implement it for q4_0_4x8 only and throw for the other layouts.
+ */
+static bool has_multi_weight_gemm(split_layout layout) {
+#ifdef GGML_ARM_TEST_MULTI_WEIGHT_ALL_LAYOUTS
+  (void)layout;
+  return true;
+#else
+  return layout == split_layout::q4_0_4x8;
+#endif
+}
+
+/**
+ * @brief GEMM output buffer with poisoned guard bands on both sides
+ */
+class guarded_output {
+public:
+  /**
+   * @brief Allocate @a n output floats between two guard bands
+   */
+  explicit guarded_output(size_t n) : buf_(n + 2 * guard, poison) {}
+
+  /**
+   * @brief First output element
+   */
+  float *data() { return buf_.data() + guard; }
+
+  /**
+   * @brief True when nothing was stored into either guard band
+   */
+  bool guards_intact() const {
+    auto is_poison = [](float v) { return v == poison; };
+    return std::all_of(buf_.begin(), buf_.begin() + guard, is_poison) &&
+           std::all_of(buf_.end() - guard, buf_.end(), is_poison);
+  }
+
+private:
+  static constexpr size_t guard = 256;
+  static constexpr float poison = -12345.0f;
+  std::vector<float> buf_;
+};
+
+/**
+ * @brief Weight set for one multi-weight GEMM call
+ */
+struct split_gemm_weights {
+  std::vector<std::vector<float>> fp32;
+  std::vector<std::vector<char>> repacked;
+  std::vector<guarded_output> out;
+};
+
+/**
+ * @brief Build one weight per entry of @a Ns, each with its own output
+ */
+static split_gemm_weights make_weights(split_layout layout, unsigned int M,
+                                       const std::vector<unsigned int> &Ns,
+                                       unsigned int K) {
+  split_gemm_weights w;
+  for (size_t i = 0; i < Ns.size(); i++) {
+    w.fp32.push_back(generate_activations(K, 66 + i, Ns[i]));
+    w.repacked.push_back(quantize_and_repack(layout, w.fp32[i], Ns[i], K));
+    w.out.emplace_back((size_t)M * Ns[i]);
+  }
+  return w;
+}
+
+/**
+ * @brief Run the single-weight GEMM wrapper for @a layout
+ */
+static void run_split_gemm(split_layout layout, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, const void *B,
+                           float *C) {
+  switch (layout) {
+  case split_layout::q4_0_4x8:
+    nntrainer::__ggml_q4_0_4x8_q8_0_GEMM<float>(M, N, K, A, K, B, N, C, N);
+    break;
+  case split_layout::q4_0_8x8:
+    nntrainer::__ggml_q4_0_8x8_q8_0_GEMM(M, N, K, A, K, B, N, C, N);
+    break;
+  case split_layout::q4_K_8x8:
+    nntrainer::__ggml_q4_K_8x8_q8_K_GEMM(M, N, K, A, K, B, N, C, N);
+    break;
+  }
+}
+
+/**
+ * @brief Run the multi-weight GEMM wrapper for @a layout
+ */
+static void run_split_gemm(split_layout layout, unsigned int M,
+                           const std::vector<unsigned int> &Ns, unsigned int K,
+                           const float *A, split_gemm_weights &w) {
+  std::vector<void *> Bs;
+  std::vector<float *> Cs;
+  for (size_t i = 0; i < Ns.size(); i++) {
+    Bs.push_back(w.repacked[i].data());
+    Cs.push_back(w.out[i].data());
+  }
+
+  switch (layout) {
+  case split_layout::q4_0_4x8:
+    nntrainer::__ggml_q4_0_4x8_q8_0_GEMM<float>(M, Ns, K, A, K, Bs, Ns, Cs, Ns);
+    break;
+  case split_layout::q4_0_8x8:
+    nntrainer::__ggml_q4_0_8x8_q8_0_GEMM<float>(M, Ns, K, A, K, Bs, Ns, Cs, Ns);
+    break;
+  case split_layout::q4_K_8x8:
+    nntrainer::__ggml_q4_K_8x8_q8_K_GEMM(M, Ns, K, A, K, Bs, Ns, Cs, Ns);
+    break;
+  }
+}
+
+/**
+ * @brief Check a single-weight GEMM against the fp32 reference and verify
+ * that nothing was written outside its output
+ */
+static void expect_split_gemm_correct(split_layout layout, unsigned int M,
+                                      unsigned int N, unsigned int K) {
+  SCOPED_TRACE("M=" + std::to_string(M) + " N=" + std::to_string(N) +
+               " K=" + std::to_string(K));
+  auto A = generate_activations(K, 55, M);
+  auto W = generate_activations(K, 66, N);
+  auto B = quantize_and_repack(layout, W, N, K);
+
+  guarded_output C((size_t)M * N);
+  run_split_gemm(layout, M, N, K, A.data(), B.data(), C.data());
+
+  EXPECT_TRUE(C.guards_intact());
+  if (N == 0)
+    return;
+  auto ref = reference_gemm(A, W, M, N, K);
+  expect_matches_reference(layout, ref, C.data(), N);
+}
+
+/**
+ * @brief Check every output of a multi-weight GEMM against the fp32 reference
+ * and verify that nothing was written outside any output
+ */
+static void expect_split_gemm_correct(split_layout layout, unsigned int M,
+                                      const std::vector<unsigned int> &Ns,
+                                      unsigned int K) {
+  auto A = generate_activations(K, 55, M);
+  auto w = make_weights(layout, M, Ns, K);
+
+  run_split_gemm(layout, M, Ns, K, A.data(), w);
+
+  for (size_t i = 0; i < Ns.size(); i++) {
+    SCOPED_TRACE("M=" + std::to_string(M) + " N=" + std::to_string(Ns[i]) +
+                 " K=" + std::to_string(K));
+    EXPECT_TRUE(w.out[i].guards_intact());
+    if (Ns[i] == 0)
+      continue;
+    auto ref = reference_gemm(A, w.fp32[i], M, Ns[i], K);
+    expect_matches_reference(layout, ref, w.out[i].data(), Ns[i]);
+  }
+}
+
+/**
+ * @brief N of one to three tiles leaves some compute threads with an empty
+ * [start, end) column range once the thread count exceeds N / tile_cols
+ */
+static std::vector<unsigned int> few_tile_ns(split_layout layout) {
+  const unsigned int nb = tile_cols(layout);
+  return {nb, 2 * nb, 3 * nb};
+}
+
+/**
+ * @brief Single-weight GEMM/GEMV for every M path (GEMV, GEMM, GEMM + tail
+ * GEMV) with too few column tiles to give every compute thread one
+ */
+static void test_single_weight_empty_split(split_layout layout,
+                                           unsigned int K) {
+  const unsigned int threads =
+    nntrainer::ThreadManager::Global().getComputeThreadCount();
+  std::cout << "[INFO] compute threads: " << threads << std::endl;
+  if (threads < 2)
+    std::cout << "[INFO] one compute thread: these cases cannot produce an "
+                 "empty split (the *_zero_n_n tests still do)"
+              << std::endl;
+  for (unsigned int M : {1u, 4u, 5u})
+    for (unsigned int N : few_tile_ns(layout))
+      expect_split_gemm_correct(layout, M, N, K);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_0_4x8_empty_thread_split) {
+  nntr_ggml_init();
+  test_single_weight_empty_split(split_layout::q4_0_4x8, 128);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_0_8x8_empty_thread_split) {
+  nntr_ggml_init();
+  test_single_weight_empty_split(split_layout::q4_0_8x8, 128);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_K_8x8_empty_thread_split) {
+  nntr_ggml_init();
+  test_single_weight_empty_split(split_layout::q4_K_8x8, 256);
+}
+
+/**
+ * @brief Multi-weight GEMM/GEMV for every M path with too few column tiles.
+ * M == 1 also runs with one weight wider than 256 columns to take the other
+ * side of the wrappers' N <= 256 checks (the thread-split GEMV in bstp/mixed).
+ * Where the backend lacks the entry point, only check that it still says so.
+ */
+static void test_multi_weight_empty_split(split_layout layout, unsigned int K) {
+  if (!has_multi_weight_gemm(layout)) {
+    try {
+      expect_split_gemm_correct(layout, 4, few_tile_ns(layout), K);
+      ADD_FAILURE() << "implemented now: update has_multi_weight_gemm()";
+    } catch (const std::runtime_error &e) {
+      EXPECT_NE(std::string(e.what()).find("not implemented"),
+                std::string::npos)
+        << e.what();
+    }
+    return;
+  }
+  for (unsigned int M : {1u, 4u, 5u})
+    expect_split_gemm_correct(layout, M, few_tile_ns(layout), K);
+  expect_split_gemm_correct(layout, 1, {tile_cols(layout), 264}, K);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_0_4x8_multi_weight_empty_thread_split) {
+  nntr_ggml_init();
+  test_multi_weight_empty_split(split_layout::q4_0_4x8, 128);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_0_8x8_multi_weight_empty_thread_split) {
+  nntr_ggml_init();
+  test_multi_weight_empty_split(split_layout::q4_0_8x8, 128);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q4_K_8x8_multi_weight_empty_thread_split) {
+  nntr_ggml_init();
+  test_multi_weight_empty_split(split_layout::q4_K_8x8, 256);
+}
+
+TEST(nntrainer_ggml_arm, gemm_empty_thread_split_zero_n_n) {
+  nntr_ggml_init();
+  for (unsigned int M : {1u, 5u}) {
+    expect_split_gemm_correct(split_layout::q4_0_4x8, M, 0, 128);
+    expect_split_gemm_correct(split_layout::q4_0_8x8, M, 0, 128);
+    expect_split_gemm_correct(split_layout::q4_K_8x8, M, 0, 256);
+  }
+}
+
+TEST(nntrainer_ggml_arm, gemm_multi_weight_zero_n_n) {
+  nntr_ggml_init();
+  for (unsigned int M : {1u, 5u}) {
+    expect_split_gemm_correct(split_layout::q4_0_4x8, M, {0, 4, 0}, 128);
+    if (has_multi_weight_gemm(split_layout::q4_0_8x8))
+      expect_split_gemm_correct(split_layout::q4_0_8x8, M, {0, 8, 0}, 128);
+    if (has_multi_weight_gemm(split_layout::q4_K_8x8))
+      expect_split_gemm_correct(split_layout::q4_K_8x8, M, {0, 8, 0}, 256);
+  }
 }
 
 int main(int argc, char **argv) {
