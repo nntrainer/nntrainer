@@ -1051,6 +1051,13 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   // its device repack must be refused here, not multiplied as zeros.
   refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
                               "FloatTensor::dotQs4cx");
+  // The GEMM below overwrites the output, so keep what it must be accumulated
+  // into when beta is not zero.
+  std::vector<float> prev;
+  if (beta != 0.0f) {
+    const float *o = output.getData<float>();
+    prev.assign(o, o + static_cast<size_t>(M) * N);
+  }
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)
@@ -1119,6 +1126,12 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, lhs, rhs, scale, out,
                                     opt_kernel_idx, true);
 #endif
+
+  if (!prev.empty()) {
+    float *o = output.getData<float>();
+    for (size_t i = 0; i < prev.size(); ++i)
+      o[i] += beta * prev[i];
+  }
 
   return output;
 }
