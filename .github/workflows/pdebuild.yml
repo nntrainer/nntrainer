@@ -86,6 +86,16 @@ jobs:
           pbuilder-cache-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('**/debian/control') }}-
           pbuilder-cache-${{ matrix.os }}-${{ matrix.arch }}-
 
+    - name: restore pdebuild ccache from main branch
+      # saved by pdebuild_ccache.yml on every merge; PRs only restore
+      if: env.rebuild == '1'
+      uses: actions/cache/restore@v4
+      with:
+        path: /var/cache/pbuilder/ccache
+        key: pdebuild-ccache-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event.pull_request.base.sha }}
+        restore-keys: |
+          pdebuild-ccache-${{ matrix.os }}-${{ matrix.arch }}-
+
     - name: prepare pdebuild
       if: env.rebuild == '1'
       run: |
@@ -96,6 +106,10 @@ jobs:
         echo "::endgroup::"
         echo "DISTRIBUTION=${{ matrix.distroname }}" > ~/.pbuilderrc
         echo "OTHERMIRROR=\"deb [trusted=yes] http://archive.ubuntu.com/ubuntu ${{ matrix.distroname }}-backports universe |deb [trusted=yes] http://ppa.launchpad.net/nnstreamer/ppa/ubuntu ${{ matrix.distroname }} main\"" >> ~/.pbuilderrc
+        # pbuilder installs ccache in the chroot and bind-mounts this dir
+        echo "CCACHEDIR=/var/cache/pbuilder/ccache" >> ~/.pbuilderrc
+        sudo mkdir -p /var/cache/pbuilder/ccache
+        echo "max_size = 2.5G" | sudo tee /var/cache/pbuilder/ccache/ccache.conf
         cat ~/.pbuilderrc
         sudo mkdir -p /root/
         sudo ln -s ~/.pbuilderrc /root/
