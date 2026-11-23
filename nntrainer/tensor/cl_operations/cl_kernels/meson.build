@@ -1,6 +1,11 @@
 fs = import('fs')
 
 cl_op_kernels = [
+  'act_cast.cl',
+  'gpuhash.cl',
+  'kv_img_write.cl',
+  'rope_inplace.cl',
+  'sv_matmul_f16_ohwi_imgrw_tm2.cl',
   'addition.cl',
   'concat_axis_1.cl',
   'concat_axis_2.cl',
