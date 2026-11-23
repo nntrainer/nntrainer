@@ -162,56 +162,8 @@ void transpose_cl_axis(const _FP16 *in, _FP16 *res,
 // is a named half8 intermediate, so norm * gamma rounds to FP16 once before the
 // residual add rounds again -- exactly the two roundings of the separate pair
 // (the norm kernel stores FP16 and the add kernel re-rounds). That holds when
-// the build does not contract the multiply-add. The kernel source is inline
-// here rather than in a .cl file because it exists only for this dispatch.
-static const std::string rmsnorm_add_fp16_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__attribute__((reqd_work_group_size(64, 1, 1)))
-__kernel void rmsnorm_cl_fp16_coop_add(__global const half *input,
-                                       __global half *output,
-                                       __global const half *alpha,
-                                       float epsilon, int n_rows, int W,
-                                       __global const half *residual) {
-  const int row = get_group_id(0);
-  const int tid = get_local_id(0);   // 0..63
-  if (row >= n_rows)
-    return;
-  const long base = (long)row * (long)W;
-  const int W8 = W >> 3;
-  __global const half8 *in8 = (__global const half8 *)(input + base);
-  float partial = 0.0f;
-  for (int i = tid; i < W8; i += 64) {
-    const float8 v = convert_float8(in8[i]);
-    partial += dot(v.lo, v.lo) + dot(v.hi, v.hi);
-  }
-  __local float lsum[64];
-  lsum[tid] = partial;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int s = 32; s > 0; s >>= 1) {
-    if (tid < s)
-      lsum[tid] += lsum[tid + s];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  const float mean = lsum[0] / (float)W;
-  const float scale = rsqrt(mean + (float)epsilon);
-  __global half8 *out8 = (__global half8 *)(output + base);
-  __global const half8 *r8 = (__global const half8 *)(residual + base);
-  for (int i = tid; i < W8; i += 64) {
-    // Large-gamma FP16 overflow guard (see rmsnorm_fp16.cl): apply gamma in
-    // FP32 and clamp to the FP16-safe range before the residual add. gamma
-    // (alpha) is a model-weight pointer with no 16-byte alignment guarantee,
-    // so it is loaded per element -- a half8 vector load would read garbage.
-    const float8 v = convert_float8(in8[i]) * scale;
-    const int gi = i << 3;
-    const float8 a = (float8)(
-      (float)alpha[gi + 0], (float)alpha[gi + 1], (float)alpha[gi + 2],
-      (float)alpha[gi + 3], (float)alpha[gi + 4], (float)alpha[gi + 5],
-      (float)alpha[gi + 6], (float)alpha[gi + 7]);
-    const float8 nv = clamp(v * a, -60000.0f, 60000.0f);
-    out8[i] = convert_half8(nv) + r8[i];
-  }
-}
-)CL";
+// the build does not contract the multiply-add. The kernel source lives in
+// cl_kernels/rmsnorm_add_fp16.cl.
 
 bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
                          const _FP16 *residual, _FP16 *result, float epsilon,
@@ -573,20 +525,6 @@ void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
 // fs). Gathers one layer's slice (off = layer_index * fs) from a packed
 // per-layer input tensor. Device-resident when both planes are device buffers,
 // else SVM.
-static const std::string per_layer_slice_fp16_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void per_layer_slice_cl_fp16(__global const half *in,
-                                      __global half *out, int fs, int in_width,
-                                      int off, int rows) {
-  int gid = get_global_id(0);
-  int total = rows * fs;
-  if (gid >= total)
-    return;
-  int r = gid / fs;
-  int j = gid - r * fs;
-  out[gid] = in[r * in_width + off + j];
-}
-)CL";
 
 void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
                              unsigned int rows, unsigned int fs,
@@ -637,16 +575,6 @@ void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
     blas_cc->command_queue_inst_.enqueueSVMMap(
       result, (size_t)total * sizeof(_FP16), true);
 }
-
-static const std::string scalar_mul_fp16_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void scalar_mul_cl_fp16(__global const half *in, __global half *out,
-                                 float s, int n, int row_off) {
-  int i = get_global_id(0);
-  if (i < n)
-    out[i + row_off] = convert_half(convert_float(in[i + row_off]) * s);
-}
-)CL";
 
 void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
                         unsigned int n, bool use_svm, void *out_clmem,
