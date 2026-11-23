@@ -1131,15 +1131,6 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
                               size_res, use_svm);
 }
 
-static const std::string residual_f32_kernel = R"CL(
-__kernel void residual_f32(__global const float *in, __global float *out,
-                           const int N, const int accumulate) {
-  const int i = get_global_id(0);
-  if (i < N)
-    out[i] = accumulate ? out[i] + in[i] : in[i];
-}
-)CL";
-
 bool residual_f32_svm_cl(const float *in, float *out, unsigned int N,
                          bool accumulate) {
   if (N == 0 || in == nullptr || out == nullptr)
@@ -3353,72 +3344,6 @@ std::unique_ptr<tv::TensorBacking> make_v8c_int8_weight_backing(
 // unit with direct per-field uchar4 loads. Replicates
 // dequantize_row_q6_K_impl exactly; only the fp32 summation order differs
 
-static const std::string lmhead_q6k_gemv_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 blocks][210 B]
-                              __constant float *x,        // [H] post-norm hidden
-                              __global float *logits,     // [V]
-                              const int V, const int H) {
-  const int row = get_group_id(0);
-  const int t = get_local_id(0); // 0..63
-  const int nb = H >> 8;         // Q6_K blocks per row
-  __global const uchar *rb = W + (size_t)row * (size_t)(nb * 210);
-  const int bl = t >> 4;         // block lane 0..3
-  const int u = t & 15;          // unit within block
-  const int nh = u >> 3;         // n-half: 0 -> elems [0,128), 1 -> [128,256)
-  const int q = u & 7;           // l-quad: l = 4q .. 4q+3
-  float sum = 0.0f;
-  for (int s = 0; s < nb; s += 4) {
-    const int bi = s + bl;
-    if (bi < nb) {
-      __global const uchar *blk = rb + bi * 210;
-      const uchar4 qlo = vload4(0, blk + (nh << 6) + (q << 2));
-      const uchar4 qhi = vload4(0, blk + (nh << 6) + 32 + (q << 2));
-      const uchar4 qh4 = vload4(0, blk + 128 + (nh << 5) + (q << 2));
-      const float d = vload_half(0, (__global const half *)(blk + 208));
-      const int is = q >> 2;     // (4q)/16 == (4q+3)/16 for q in 0..7
-      const int sbase = 192 + (nh << 3);
-      const float s0 = d * (float)((__global const char *)blk)[sbase + is];
-      const float s2 = d * (float)((__global const char *)blk)[sbase + is + 2];
-      const float s4 = d * (float)((__global const char *)blk)[sbase + is + 4];
-      const float s6 = d * (float)((__global const char *)blk)[sbase + is + 6];
-    const int yb = (bi << 8) + (nh << 7) + (q << 2);
-    float4 a1, a2, a3, a4;
-    a1.x = (float)((int)((qlo.x & 0xF) | (((qh4.x >> 0) & 3) << 4)) - 32);
-    a1.y = (float)((int)((qlo.y & 0xF) | (((qh4.y >> 0) & 3) << 4)) - 32);
-    a1.z = (float)((int)((qlo.z & 0xF) | (((qh4.z >> 0) & 3) << 4)) - 32);
-    a1.w = (float)((int)((qlo.w & 0xF) | (((qh4.w >> 0) & 3) << 4)) - 32);
-    a2.x = (float)((int)((qhi.x & 0xF) | (((qh4.x >> 2) & 3) << 4)) - 32);
-    a2.y = (float)((int)((qhi.y & 0xF) | (((qh4.y >> 2) & 3) << 4)) - 32);
-    a2.z = (float)((int)((qhi.z & 0xF) | (((qh4.z >> 2) & 3) << 4)) - 32);
-    a2.w = (float)((int)((qhi.w & 0xF) | (((qh4.w >> 2) & 3) << 4)) - 32);
-    a3.x = (float)((int)((qlo.x >> 4) | (((qh4.x >> 4) & 3) << 4)) - 32);
-    a3.y = (float)((int)((qlo.y >> 4) | (((qh4.y >> 4) & 3) << 4)) - 32);
-    a3.z = (float)((int)((qlo.z >> 4) | (((qh4.z >> 4) & 3) << 4)) - 32);
-    a3.w = (float)((int)((qlo.w >> 4) | (((qh4.w >> 4) & 3) << 4)) - 32);
-    a4.x = (float)((int)((qhi.x >> 4) | (((qh4.x >> 6) & 3) << 4)) - 32);
-    a4.y = (float)((int)((qhi.y >> 4) | (((qh4.y >> 6) & 3) << 4)) - 32);
-    a4.z = (float)((int)((qhi.z >> 4) | (((qh4.z >> 6) & 3) << 4)) - 32);
-    a4.w = (float)((int)((qhi.w >> 4) | (((qh4.w >> 6) & 3) << 4)) - 32);
-    const float4 x1 = (float4)(x[yb], x[yb + 1], x[yb + 2], x[yb + 3]);
-    const float4 x2 = (float4)(x[yb + 32], x[yb + 33], x[yb + 34], x[yb + 35]);
-    const float4 x3 = (float4)(x[yb + 64], x[yb + 65], x[yb + 66], x[yb + 67]);
-    const float4 x4 = (float4)(x[yb + 96], x[yb + 97], x[yb + 98], x[yb + 99]);
-    sum += s0 * dot(a1, x1) + s2 * dot(a2, x2) + s4 * dot(a3, x3) +
-           s6 * dot(a4, x4);
-    }
-  }
-  __local float red[64];
-  red[t] = sum;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = 32; off > 0; off >>= 1) {
-    if (t < off) red[t] += red[t + off];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (t == 0) logits[row] = red[0];
-}
-)CL";
-
 // The same GEMV for a device with Intel subgroups. A 16-lane subgroup owns a
 // row: lane u keeps the (n-half, l-quad) unit of the kernel above, walks every
 // block of the row and the subgroup reduces with sub_group_reduce_add, so a
@@ -3430,55 +3355,6 @@ __kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 block
 // takes 10.9 ms, this kernel on the stored layout 4.9 ms and on the padded
 // copy 1.9 ms. The per-element math is the kernel above's; only the fp32
 // summation order differs.
-static const std::string lmhead_q6k_gemv_sg16_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#pragma OPENCL EXTENSION cl_intel_subgroups : enable
-#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
-__attribute__((intel_reqd_sub_group_size(16)))
-__kernel void q6k_gemv_lmhead_sg16(__global const uchar *W,  // [V][H/256][212 B]
-                                   __global const float *x,   // [H]
-                                   __global float *logits,    // [V]
-                                   const int V, const int H) {
-  const int row =
-    (int)(get_group_id(0) * get_num_sub_groups() + get_sub_group_id());
-  if (row >= V) return;
-  const int u = (int)get_sub_group_local_id(); // 0..15
-  const int nb = H >> 8;
-  // 212-byte blocks: ql[128] qh[64] scales[16] d[2] pad[2], word aligned.
-  __global const uint *rb =
-    (__global const uint *)(W + (size_t)row * (size_t)(nb * 212));
-  const int nh = u >> 3;
-  const int q = u & 7;
-  const int is = q >> 2;
-  float sum = 0.0f;
-  for (int bi = 0; bi < nb; ++bi) {
-    __global const uint *blk = rb + bi * 53;
-    const int4 lo = convert_int4(as_uchar4(blk[(nh << 4) + q]));
-    const int4 hi = convert_int4(as_uchar4(blk[(nh << 4) + 8 + q]));
-    const int4 h = convert_int4(as_uchar4(blk[32 + (nh << 3) + q]));
-    const char8 sc =
-      as_char8((uint2)(blk[48 + (nh << 1)], blk[49 + (nh << 1)]));
-    const float d = vload_half(0, (__global const half *)(blk + 52));
-    const float s0 = d * (float)(is ? sc.s1 : sc.s0);
-    const float s2 = d * (float)(is ? sc.s3 : sc.s2);
-    const float s4 = d * (float)(is ? sc.s5 : sc.s4);
-    const float s6 = d * (float)(is ? sc.s7 : sc.s6);
-    const int yb = (bi << 8) + (nh << 7) + (q << 2);
-    const float4 a1 = convert_float4(((lo & 0xF) | ((h & 3) << 4)) - 32);
-    const float4 a2 = convert_float4(((hi & 0xF) | (((h >> 2) & 3) << 4)) - 32);
-    const float4 a3 = convert_float4(((lo >> 4) | (((h >> 4) & 3) << 4)) - 32);
-    const float4 a4 = convert_float4(((hi >> 4) | (((h >> 6) & 3) << 4)) - 32);
-    const float4 x1 = vload4(0, x + yb);
-    const float4 x2 = vload4(0, x + yb + 32);
-    const float4 x3 = vload4(0, x + yb + 64);
-    const float4 x4 = vload4(0, x + yb + 96);
-    sum += s0 * dot(a1, x1) + s2 * dot(a2, x2) + s4 * dot(a3, x3) +
-           s6 * dot(a4, x4);
-  }
-  sum = sub_group_reduce_add(sum);
-  if (u == 0) logits[row] = sum;
-}
-)CL";
 
 // The same GEMV on the 212-byte copy for a device without Intel subgroups:
 // 16 lanes per row as in q6k_gemv_lmhead_sg16, four rows per 64-WI
@@ -3487,65 +3363,6 @@ __kernel void q6k_gemv_lmhead_sg16(__global const uchar *W,  // [V][H/256][212 B
 // vector casts of the kernel above fail clBuildProgram on Adreno
 // (CL_OUT_OF_HOST_MEMORY). On an Adreno 840, for the 151936 x 1024 table,
 // q6k_gemv_lmhead takes 6.1-6.9 ms and this kernel 2.7-2.8 ms.
-static const std::string lmhead_q6k_gemv_a4_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void q6k_gemv_lmhead_a4(__global const uchar *W,  // [V][H/256][212 B]
-                                 __global const float *x,   // [H]
-                                 __global float *logits,    // [V]
-                                 const int V, const int H) {
-  const int t = get_local_id(0); // 0..63
-  const int rl = t >> 4;         // row within the workgroup
-  const int u = t & 15;
-  const int row = get_group_id(0) * 4 + rl;
-  const int nb = H >> 8;
-  const int nh = u >> 3;
-  const int q = u & 7;
-  const int is = q >> 2;
-  float sum = 0.0f;
-  if (row < V) {
-    __global const uint *rb =
-      (__global const uint *)(W + (size_t)row * (size_t)(nb * 212));
-    for (int bi = 0; bi < nb; ++bi) {
-      __global const uint *blk = rb + bi * 53;
-      const uint wl = blk[(nh << 4) + q];
-      const uint wh = blk[(nh << 4) + 8 + q];
-      const uint wq = blk[32 + (nh << 3) + q];
-      const uint s01 = blk[48 + (nh << 1)] >> (is << 3);
-      const uint s45 = blk[49 + (nh << 1)] >> (is << 3);
-      const float d = vload_half(0, (__global const half *)(blk + 52));
-      const float s0 = d * (float)(((int)(s01 << 24)) >> 24);
-      const float s2 = d * (float)(((int)(s01 << 8)) >> 24);
-      const float s4 = d * (float)(((int)(s45 << 24)) >> 24);
-      const float s6 = d * (float)(((int)(s45 << 8)) >> 24);
-      const int yb = (bi << 8) + (nh << 7) + (q << 2);
-      float acc0 = 0.0f, acc2 = 0.0f, acc4 = 0.0f, acc6 = 0.0f;
-      for (int j = 0; j < 4; ++j) {
-        const int sh = j << 3;
-        const int l = (int)((wl >> sh) & 0xFF);
-        const int hh = (int)((wh >> sh) & 0xFF);
-        const int qq = (int)((wq >> sh) & 0xFF);
-        const int v0 = ((l & 0xF) | ((qq & 3) << 4)) - 32;
-        const int v2 = ((hh & 0xF) | (((qq >> 2) & 3) << 4)) - 32;
-        const int v4 = ((l >> 4) | (((qq >> 4) & 3) << 4)) - 32;
-        const int v6 = ((hh >> 4) | (((qq >> 6) & 3) << 4)) - 32;
-        acc0 += x[yb + j] * (float)v0;
-        acc2 += x[yb + 32 + j] * (float)v2;
-        acc4 += x[yb + 64 + j] * (float)v4;
-        acc6 += x[yb + 96 + j] * (float)v6;
-      }
-      sum += s0 * acc0 + s2 * acc2 + s4 * acc4 + s6 * acc6;
-    }
-  }
-  __local float red[64];
-  red[t] = sum;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = 8; off > 0; off >>= 1) {
-    if (u < off) red[t] += red[t + off];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (u == 0 && row < V) logits[row] = red[t];
-}
-)CL";
 
 bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
                          float *logits_f32_host, unsigned int vocab,
@@ -3910,103 +3727,6 @@ static bool lmhead_read_logits_to_host(cl_mem out_buf, void *logits_host,
 // index among the maxima regardless of how the reduction is ordered, which is
 // std::max_element's answer. A NaN never wins (every comparison against it is
 // false), which is also what the host scan does for any NaN past element 0.
-static const std::string lmhead_argmax_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#define ARGMAX_LS 64
-#define ARGMAX_TAKE(bv, bi, ov, oi)                                            \
-  if ((ov) > (bv) || ((ov) == (bv) && (oi) < (bi))) {                          \
-    bv = (ov);                                                                 \
-    bi = (oi);                                                                 \
-  }
-
-// Final logit softcapping, reproduced STEP FOR STEP as the host layer computes
-// it. Softcapping is strictly monotone, so it cannot move an argmax on its own
-// -- but it collapses near-equal logits into equal fp16 values, and the host
-// tie rule then decides the token, so the rounding is what has to match, not
-// the mathematical value. The host chain is not a tanh() call: it is
-// ActiFunc's logistic form over fp16 tensors, which narrows to half at four
-// separate points (util_func.h exp_util<_Float16>, acti_func.h sigmoid /
-// tanhFloat, half_tensor.cpp multiply(float) -- which multiplies IN half):
-//
-//   h1 = half(x * half(1/cap))     HalfTensor::multiply(1/cap)
-//   y  = 2 * h1                    tanhFloat: half(2)*x, exact
-//   e  = half(exp(-y))             exp_util<_Float16>: exp, then narrow
-//   s  = half(1 / (1 + e))         sigmoid
-//   t  = half(2*s - 1)             tanhFloat
-//   out= half(t * half(cap))       HalfTensor::multiply(cap)
-//
-// Approximating this with a single tanh() instead differs by ~1 half-ULP on
-// most elements -- enough to flip a token within the first 40 of a 223-token
-// generation, which is how this chain came to be written out.
-inline float softcap_h(float x, float inv_cap_h, float cap_h) {
-  const float h1 = (float)(half)(x * inv_cap_h);
-  const float y = 2.0f * h1;
-  const float e = (float)(half)exp(-y);
-  const float s = (float)(half)(1.0f / (1.0f + e));
-  const float t = (float)(half)(2.0f * s - 1.0f);
-  return (float)(half)(t * cap_h);
-}
-
-__kernel void lmhead_argmax_f16_part(__global const half *logits,
-                                     __global float *part_val,
-                                     __global int *part_idx, const int N,
-                                     const float inv_cap_h, const float cap_h) {
-  const int lid = get_local_id(0);
-  float bv = -MAXFLOAT;
-  int bi = 0x7fffffff;
-  for (int i = get_global_id(0); i < N; i += get_global_size(0)) {
-    float v = (float)logits[i];
-    if (cap_h > 0.0f)
-      v = softcap_h(v, inv_cap_h, cap_h);
-    ARGMAX_TAKE(bv, bi, v, i)
-  }
-  __local float lv[ARGMAX_LS];
-  __local int li[ARGMAX_LS];
-  lv[lid] = bv;
-  li[lid] = bi;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = ARGMAX_LS / 2; off > 0; off >>= 1) {
-    if (lid < off) {
-      const float ov = lv[lid + off];
-      const int oi = li[lid + off];
-      ARGMAX_TAKE(lv[lid], li[lid], ov, oi)
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (lid == 0) {
-    part_val[get_group_id(0)] = lv[0];
-    part_idx[get_group_id(0)] = li[0];
-  }
-}
-
-__kernel void lmhead_argmax_f16_final(__global const float *part_val,
-                                      __global const int *part_idx,
-                                      __global int *token, const int G) {
-  const int lid = get_local_id(0);
-  float bv = -MAXFLOAT;
-  int bi = 0x7fffffff;
-  for (int i = lid; i < G; i += ARGMAX_LS) {
-    const float v = part_val[i];
-    const int ix = part_idx[i];
-    ARGMAX_TAKE(bv, bi, v, ix)
-  }
-  __local float lv[ARGMAX_LS];
-  __local int li[ARGMAX_LS];
-  lv[lid] = bv;
-  li[lid] = bi;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = ARGMAX_LS / 2; off > 0; off >>= 1) {
-    if (lid < off) {
-      const float ov = lv[lid + off];
-      const int oi = li[lid + off];
-      ARGMAX_TAKE(lv[lid], li[lid], ov, oi)
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (lid == 0)
-    token[0] = li[0];
-}
-)CL";
 
 // Must match ARGMAX_LS in the kernel source above (the __local arrays and the
 // reduction tree are sized from it).
@@ -4028,43 +3748,6 @@ static constexpr int ARGMAX_GROUPS = 128;
 // q6k/fp32w lm_head). 64-WI workgroup per row, LDS-tree reduce; the coalesced
 // row read (768 B/row) streams ~0.6x the q6k table bytes with a far simpler
 // unpack.
-static const std::string lmhead_int4_v8c_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbles
-                                   __global const half *x,      // [K] fp16 act
-                                   __global const float *scale, // [N] fp32
-                                   __global half *logits,       // [N]
-                                   const int N, const int K) {
-  const int row = get_group_id(0);
-  const int t = get_local_id(0); // 0..63
-  const int kblocks = K >> 5;    // K/32
-  __global const uchar *wr = W + (size_t)row * (size_t)(K >> 1);
-  float sum = 0.0f;
-  for (int kb = t; kb < kblocks; kb += 64) {
-    __global const uchar *blk = wr + (kb << 4); // 16 bytes
-    __global const half *xb = x + (kb << 5);    // K base for this block
-    // Vectorized: each 4-byte group c (uchar4) decodes to 8 nibbles whose K
-    // indices are contiguous -- lo nibbles -> K=[c*8 .. c*8+3], hi nibbles ->
-    // K=[c*8+4 .. c*8+7] -- so the activation is one contiguous half8 and the
-    // whole group is two dot4s.
-    for (int c = 0; c < 4; ++c) {
-      const uchar4 by = vload4(0, blk + (c << 2));
-      const float4 lo = convert_float4(convert_int4(by & (uchar4)0x0F) - 8);
-      const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
-      const float8 a = convert_float8(vload8(0, xb + (c << 3)));
-      sum += dot(a.lo, lo) + dot(a.hi, hi);
-    }
-  }
-  __local float red[64];
-  red[t] = sum;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = 32; off > 0; off >>= 1) {
-    if (t < off) red[t] += red[t + off];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (t == 0) logits[row] = (half)(red[0] * scale[row]);
-}
-)CL";
 
 // N-tiled form of the kernel above: one work-group computes NR consecutive
 // output rows instead of one.
@@ -4090,52 +3773,6 @@ __kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbl
 // it. Only the assignment of rows to work-groups changes. Measured: the two
 // kernels' 262144 fp16 logits are byte-identical at NR = 2, 4, 6, 8, 10, 12, 16
 // and 32, and NR = 8 is the optimum (3.39 ms, -47.7 %).
-static const std::string lmhead_int4_v8c_nr_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#ifndef NR
-#define NR 8
-#endif
-__kernel void lmhead_int4_v8c_gemv_nr(__global const uchar *W,   // [N][K/2]
-                                      __global const half *x,     // [K] fp16
-                                      __global const float *scale,// [N] fp32
-                                      __global half *logits,      // [N]
-                                      const int N, const int K) {
-  const int row0 = (int)get_group_id(0) * NR;
-  const int t = get_local_id(0); // 0..63
-  const int kblocks = K >> 5;
-  const size_t rb = (size_t)(K >> 1);
-  float sum[NR];
-#pragma unroll
-  for (int r = 0; r < NR; ++r) sum[r] = 0.0f;
-  for (int kb = t; kb < kblocks; kb += 64) {
-    __global const half *xb = x + (kb << 5);
-    for (int c = 0; c < 4; ++c) {
-      // The one load that NR rows now share.
-      const float8 a = convert_float8(vload8(0, xb + (c << 3)));
-#pragma unroll
-      for (int r = 0; r < NR; ++r) {
-        __global const uchar *blk = W + (size_t)(row0 + r) * rb + (kb << 4);
-        const uchar4 by = vload4(0, blk + (c << 2));
-        const float4 lo = convert_float4(convert_int4(by & (uchar4)0x0F) - 8);
-        const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
-        sum[r] += dot(a.lo, lo) + dot(a.hi, hi);
-      }
-    }
-  }
-  __local float red[NR][64];
-#pragma unroll
-  for (int r = 0; r < NR; ++r) red[r][t] = sum[r];
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = 32; off > 0; off >>= 1) {
-    if (t < off) {
-#pragma unroll
-      for (int r = 0; r < NR; ++r) red[r][t] += red[r][t + off];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (t < NR) logits[row0 + t] = (half)(red[t][0] * scale[row0 + t]);
-}
-)CL";
 
 // Rows per work-group for the lm_head GEMV. 8 is the measured optimum on
 // Adreno 840; 1 selects the untiled kernel above, which is the control arm.
@@ -4554,46 +4191,6 @@ bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out) {
 // the work is split, and no float compare is involved (the kernels build with
 // -cl-finite-math-only). A zero key means "nothing left in this group".
 // ===========================================================================
-static const std::string lmhead_topk_kernel = R"CL(
-#define TOPK_LS 64
-#define TOPK_EPT 16
-
-inline ulong topk_key(ushort h, uint i) {
-  const uint k = (h & 0x8000u) ? ((~(uint)h) & 0xffffu) : ((uint)h | 0x8000u);
-  return ((ulong)k << 32) | (ulong)(0xffffffffu - i);
-}
-
-__kernel void lmhead_topk_f16_part(__global const ushort *logits,
-                                   __global ulong *part, const int N,
-                                   const int K) {
-  const int lid = get_local_id(0);
-  const int base = get_group_id(0) * (TOPK_LS * TOPK_EPT);
-  ulong c[TOPK_EPT];
-  for (int e = 0; e < TOPK_EPT; ++e) {
-    const int i = base + e * TOPK_LS + lid;
-    c[e] = (i < N) ? topk_key(logits[i], (uint)i) : 0ul;
-  }
-  __local ulong lv[TOPK_LS];
-  ulong prev = 0xfffffffffffffffful;
-  for (int r = 0; r < K; ++r) {
-    ulong b = 0ul;
-    for (int e = 0; e < TOPK_EPT; ++e)
-      if (c[e] < prev && c[e] > b)
-        b = c[e];
-    lv[lid] = b;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int off = TOPK_LS / 2; off > 0; off >>= 1) {
-      if (lid < off && lv[lid + off] > lv[lid])
-        lv[lid] = lv[lid + off];
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    prev = lv[0];
-    if (lid == 0)
-      part[get_group_id(0) * K + r] = prev;
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-}
-)CL";
 
 // Must match TOPK_LS / TOPK_EPT in the source above.
 static constexpr int TOPK_LS = 64;
@@ -4729,28 +4326,6 @@ void cl_lmhead_release_logits() { cl_lmhead_pending = ClLmHeadPending{}; }
 // prefix"). This reads the full-precision FP32 embed weight directly — fp32 W ×
 // fp16 act, fp32 accumulate — matching the HF reference that ranks the correct
 // token at 0. Same 64-WI-per-row + LDS-tree-reduce shape as the Q6_K kernel.
-static const std::string lmhead_fp32w_gemv_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void lmhead_gemv_fp32w(__global const float *W,  // [V*H] row-major
-                                __global const half *x,    // [H] fp16 act
-                                __global float *logits,    // [V]
-                                const int V, const int H) {
-  const int row = get_group_id(0);
-  const int t = get_local_id(0); // 0..63
-  __global const float *rb = W + (size_t)row * (size_t)H;
-  float sum = 0.0f;
-  for (int k = t; k < H; k += 64)
-    sum += rb[k] * (float)x[k];
-  __local float red[64];
-  red[t] = sum;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int off = 32; off > 0; off >>= 1) {
-    if (t < off) red[t] += red[t + off];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  if (t == 0) logits[row] = red[0];
-}
-)CL";
 
 bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
                           float *logits_f32_host, unsigned int vocab,
