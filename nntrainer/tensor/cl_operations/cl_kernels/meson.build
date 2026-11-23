@@ -6,6 +6,7 @@ cl_op_kernels = [
   'kv_img_write.cl',
   'rope_inplace.cl',
   'sv_matmul_f16_ohwi_imgrw_tm2.cl',
+  'v8c_util.cl',
   'addition.cl',
   'concat_axis_1.cl',
   'concat_axis_2.cl',
