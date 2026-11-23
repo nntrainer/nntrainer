@@ -67,7 +67,10 @@ A PR is mergeable only when these pass. They run on every pull request:
 | `Static checkers and verifiers` (static.check) | static analysis / verifiers |
 | `Check Review` (check_count) | review/count checks |
 | `CodeQL Advanced` | security/code scanning |
-| Build matrix | Ubuntu Meson (gcc & clang), Android NDK, CausalLM Android, Tizen/GBS, Ubuntu Pdebuild, Windows (Meson / on-ARM / cross-compile), Yocto |
+| Build matrix | Ubuntu Meson (gcc & clang), Android NDK, CausalLM Android, Tizen/GBS, Ubuntu Pdebuild, Windows (Meson / on-ARM / cross-compile) |
+
+`Yocto build` (`yocto_build.yml`) is not a PR gate: it builds nntrainer with
+Yocto (qemux86-64) nightly on `main` and on manual dispatch.
 
 If you add or remove tests, expect `check_count` to react — update counts
 accordingly.
