@@ -20,6 +20,7 @@ cl_op_kernels = [
   'two_conv_attention.cl',
   'flash_attention.cl',
   'kv_img_write.cl',
+  'sv_matmul_f16_ohwi_imgrw_tm2.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
