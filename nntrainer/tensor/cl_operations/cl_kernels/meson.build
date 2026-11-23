@@ -58,6 +58,9 @@ cl_op_kernels = [
 
 if get_option('enable-fp16')
   cl_op_kernels += [
+    'per_layer_slice_fp16.cl',
+    'rmsnorm_add_fp16.cl',
+    'scalar_mul_fp16.cl',
     'addition_fp16.cl',
     'concat_axis_1_fp16.cl',
     'concat_axis_2_fp16.cl',
