@@ -2741,9 +2741,12 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
 // with the V mirror bound as a __read_write image (CL2.0, own program). On
 // this driver a read-write image cannot be served by the sampler's texture
 // path, which is what avoids the stale read described at the dispatch site.
-static const std::string sv_imgrw_kernel = std::string(R"CL(
+static const std::string &sv_imgrw_kernel_src() {
+  static const std::string src = std::string(R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 )CL") + sv_matmul_f16_ohwi_imgrw_tm2_kernel;
+  return src;
+}
 
 // The qk kernels with the OHWI K mirror bound as a __read_write image2d_t
 // and read with the sampler-less read_imageui (qk_matmul_f16_ohwi_imgrw and
@@ -3551,8 +3554,9 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
         return e != nullptr && e[0] == '1';
       }();
       if (sv_tm2 && sv_img_rw) {
-        kp = blas_cc->registerClKernel(
-          sv_imgrw_kernel, "sv_matmul_f16_ohwi_imgrw_tm2", "-cl-std=CL2.0");
+        kp = blas_cc->registerClKernel(sv_imgrw_kernel_src(),
+                                       "sv_matmul_f16_ohwi_imgrw_tm2",
+                                       "-cl-std=CL2.0");
         if (!kp) {
           static int logged = 0;
           if (!logged++)
