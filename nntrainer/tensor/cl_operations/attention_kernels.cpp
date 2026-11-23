@@ -19,8 +19,13 @@
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h> // v8c_use_buffer_path()
 #include <chrono>
+#include <cl_kernels/act_cast.h>
 #include <cl_kernels/flash_attention.h>
+#include <cl_kernels/gpuhash.h>
+#include <cl_kernels/kv_img_write.h>
+#include <cl_kernels/rope_inplace.h>
 #include <cl_kernels/rotary_emb.h>
+#include <cl_kernels/sv_matmul_f16_ohwi_imgrw_tm2.h>
 #include <cl_kernels/two_conv_attention.h>
 #include <cmath>
 #include <cstdio>
@@ -544,371 +549,6 @@ static std::string kvImgCopts() {
   return "-cl-std=CL2.0 -DKIMG_GSH=" + std::to_string(g_kimg_gsh);
 }
 
-static const std::string kv_img_write_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#ifndef KIMG_GSH
-#define KIMG_GSH 0
-#endif
-__constant sampler_t kimgw_smp =
-  CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
-// K: one work item per (t, h, d-texel). A K texel is 8 halves along d and the
-// scatter writes every channel of every row it touches, so every texel it
-// covers is FULL -- no read-modify-write anywhere on the K side. Same source,
-// same rows, same folded mapping as k_scatter_ohwi.
-__kernel void k_scatter_ohwi_img(__global const half *src,
-                                 __write_only image2d_t dst, const int M,
-                                 const int hKV, const int d, const int max_S,
-                                 const int position, const int src_off) {
-  const int t = get_global_id(0);
-  const int h = get_global_id(1);
-  const int dt = get_global_id(2);
-  const int dtex = d >> 3;
-  if (t >= M || h >= hKV || dt >= dtex) return;
-  const long so =
-    (long)src_off + (long)t * hKV * d + (long)h * d + (long)(dt << 3);
-  half tmp[8];
-  for (int l = 0; l < 8; ++l) tmp[l] = src[so + l];
-  const int lin_row = h * max_S + position + t;
-  const int g = 1 << KIMG_GSH;
-  write_imageui(dst,
-                (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH),
-                as_uint4(vload8(0, tmp)));
-}
-// V: one work item per (sequence texel, h, channel). The texels touched are
-// [position>>3, (position+M+7)>>3); lanes inside [position, position+M) come
-// from src exactly as v_scatter_ohwi_t reads it, every other lane is read back
-// from the image and written unchanged -- so this writes precisely the elements
-// the buffer scatter writes and nothing else.
-__kernel void v_scatter_ohwi_t_img(__global const half *src,
-                                   __read_write image2d_t dst, const int M,
-                                   const int hKV, const int d, const int max_S,
-                                   const int position, const int src_off) {
-  const int j = get_global_id(0);
-  const int h = get_global_id(1);
-  const int x = get_global_id(2);
-  const int tex0 = position >> 3;
-  const int ntex = ((position + M + 7) >> 3) - tex0;
-  if (j >= ntex || h >= hKV || x >= d) return;
-  const int tex = tex0 + j;
-  const int2 c = (int2)(tex, h * d + x);
-  half tmp[8];
-  vstore8(as_half8(read_imageui(dst, c)), 0, tmp);
-  for (int l = 0; l < 8; ++l) {
-    const int p = (tex << 3) + l;
-    if (p >= position && p < position + M)
-      tmp[l] = src[(long)src_off + (long)(p - position) * hKV * d +
-                   (long)h * d + x];
-  }
-  write_imageui(dst, c, as_uint4(vload8(0, tmp)));
-}
-// Decode-step K and V image scatters in ONE launch (M == 1): lanes
-// [0, d/8) of get_global_id(2) are k_scatter_ohwi_img's (head, d-texel) work
-// items, lanes [d/8, d/8 + d) are v_scatter_ohwi_t_img's (head, channel) work
-// items for the single texel a one-row step touches. Same reads, same texel
-// coordinates, same stores as the two kernels above.
-__kernel void kv_scatter_ohwi_img(__global const half *k_src,
-                                  __write_only image2d_t k_dst,
-                                  __global const half *v_src,
-                                  __read_write image2d_t v_dst, const int hKV,
-                                  const int d, const int k_max_S,
-                                  const int v_max_S, const int position,
-                                  const int k_src_off, const int v_src_off) {
-  const int h = get_global_id(1);
-  const int z = get_global_id(2);
-  const int dtex = d >> 3;
-  if (h >= hKV) return;
-  if (z < dtex) {
-    const int dt = z;
-    const long so = (long)k_src_off + (long)h * d + (long)(dt << 3);
-    half tmp[8];
-    for (int l = 0; l < 8; ++l) tmp[l] = k_src[so + l];
-    const int lin_row = h * k_max_S + position;
-    const int g = 1 << KIMG_GSH;
-    write_imageui(k_dst,
-                  (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH),
-                  as_uint4(vload8(0, tmp)));
-  } else if (z < dtex + d) {
-    const int x = z - dtex;
-    const int tex = position >> 3;
-    const int2 c = (int2)(tex, h * d + x);
-    half tmp[8];
-    vstore8(as_half8(read_imageui(v_dst, c)), 0, tmp);
-    for (int l = 0; l < 8; ++l) {
-      const int p = (tex << 3) + l;
-      if (p >= position && p < position + 1)
-        tmp[l] = v_src[(long)v_src_off + (long)(p - position) * hKV * d +
-                       (long)h * d + x];
-    }
-    write_imageui(v_dst, c, as_uint4(vload8(0, tmp)));
-  }
-}
-// V, mode 2: the same rows, with NO image read anywhere in the write path. Mode
-// 1's read-modify-write is itself an image read, and an image read is what
-// pollutes the texture cache on this driver (see the gather), so at long spans
-// mode 1 may be re-introducing the very hazard it closes. Here the partial
-// texels are rebuilt from the concat V cache instead: lane p of texel `tex` is
-// absolute position base_abs + (tex<<3) + p, mapped through the ring exactly as
-// cacheRow() does, and +0.0h at or past the frontier (`to_abs`) -- what the
-// one-time mirror fill left there. This needs the slab to BE complete, which it
-// is with the side-fills on (NNTR_KV_STAGE off, the default) AND with the
-// NNTR_MHA_CLMEM boundary gather skipped: that gather writes the slab at
-// ABSOLUTE rows with no ring mapping, so on a ringed layer whose mirror is live
-// it fills rows past the ring cap with the wrong content (and past the
-// allocation) -- harmless while nothing reads them back, fatal here.
-__kernel void v_scatter_ohwi_t_img_slab(__global const half *vcache,
-                                        __write_only image2d_t dst,
-                                        const int hKV, const int d,
-                                        const int tex0, const int ntex,
-                                        const int base_abs, const int ring_cap,
-                                        const int to_abs) {
-  const int j = get_global_id(0);
-  const int h = get_global_id(1);
-  const int x = get_global_id(2);
-  if (j >= ntex || h >= hKV || x >= d) return;
-  const int tex = tex0 + j;
-  const long hd = (long)hKV * d;
-  half tmp[8];
-  for (int l = 0; l < 8; ++l) {
-    const int a = base_abs + (tex << 3) + l;
-    half v = (half)0.0h;
-    if (a >= 0 && a < to_abs) {
-      const int phys = ring_cap > 0 ? (a % ring_cap) : a;
-      v = vcache[(long)phys * hd + (long)h * d + x];
-    }
-    tmp[l] = v;
-  }
-  write_imageui(dst, (int2)(tex, h * d + x), as_uint4(vload8(0, tmp)));
-}
-// Inverse gathers on the image path: with the writes on the image, a BUFFER
-// read of the mirror is the same aliasing hazard reversed (the boundary sync
-// would hand the host slab a pre-write row), so gather from the image too.
-__kernel void mirror_fill_img(__write_only image2d_t dst, const int w,
-                              const int h, const uint v) {
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-  if (x >= w || y >= h) return;
-  write_imageui(dst, (int2)(x, y), (uint4)(v, v, v, v));
-}
-__kernel void mirror_touch_img(__write_only image2d_t dst, const int x,
-                               const int y) {
-  write_imageui(dst, (int2)(x, y), (uint4)(0u, 0u, 0u, 0u));
-}
-__kernel void k_gather_ohwi_img(__read_only image2d_t src, __global half *dst,
-                                const int M, const int hKV, const int d,
-                                const int max_S, const int position) {
-  const int t = get_global_id(0);
-  const int h = get_global_id(1);
-  const int dt = get_global_id(2);
-  const int dtex = d >> 3;
-  if (t >= M || h >= hKV || dt >= dtex) return;
-  const int lin_row = h * max_S + position + t;
-  const int g = 1 << KIMG_GSH;
-  const uint4 vv = read_imageui(
-    src, kimgw_smp,
-    (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH));
-  half tmp[8];
-  vstore8(as_half8(vv), 0, tmp);
-  const long dof = (long)t * hKV * d + (long)h * d + (long)(dt << 3);
-  for (int l = 0; l < 8; ++l) dst[dof + l] = tmp[l];
-}
-__kernel void v_gather_ohwi_t_img(__read_only image2d_t src, __global half *dst,
-                                  const int M, const int hKV, const int d,
-                                  const int max_S, const int position) {
-  const int t = get_global_id(0);
-  const int h = get_global_id(1);
-  const int x = get_global_id(2);
-  if (t >= M || h >= hKV || x >= d) return;
-  const int p = position + t;
-  const uint4 vv = read_imageui(src, kimgw_smp, (int2)(p >> 3, h * d + x));
-  half tmp[8];
-  vstore8(as_half8(vv), 0, tmp);
-  dst[(long)t * hKV * d + (long)h * d + x] = tmp[p & 7];
-}
-)CL";
-
-static const std::string rope_inplace_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-// 1 (default) = the fp32/fp16 rotation choice is a property of the SEQUENCE,
-// so a continuation chunk matches the chunks before it; 0 = the old rule,
-// chosen from this chunk's M alone. Set from NNTR_ROPE_TAIL_FIX; see the
-// branch below.
-#ifndef ROPE_TAIL_CONSISTENT
-#define ROPE_TAIL_CONSISTENT 1
-#endif
-__kernel void rope_inplace_f16(__global const half *in,
-                               __global       half *out,
-                               __global const half *cos_lut,
-                               __global const half *sin_lut,
-                               const int M, const int num_heads,
-                               const int half_d, const int start_pos,
-                               const int write_off) {
-  // write_off: when writing the rotated K into a STABLE base
-  // (cache_key) instead of an offset-baked slice pointer, out[write_off + ..]
-  // addresses the per-token row via a SCALAR (recordable) instead of an SVM
-  // pointer. Default 0 == in-place / offset-baked-out behaviour (byte-identical).
-  int t = get_global_id(0);
-  int h = get_global_id(1);
-  int k = get_global_id(2);
-  if (t >= M || h >= num_heads || k >= half_d) return;
-  long row = (long)t * num_heads * (2 * half_d) + (long)h * (2 * half_d);
-  long lut = (long)(start_pos + t) * half_d + k;
-  half c = cos_lut[lut];
-  half s = sin_lut[lut];
-  half lo = in[row + k];
-  half hi = in[row + k + half_d];
-  // FP32 rotation for SMALL step size (M < 32): decode (M=1) and short prefill,
-  // where the half cos/sin multiply-add's precision loss distorts the softmax
-  // DISTRIBUTION enough for SAMPLING to degenerate (argmax survives -> greedy
-  // coherent). fp32 there is ~free (few rows) and makes it match the host RoPE.
-  // For a large prefill (M >= 32) the half rotation is kept: it is ~6% faster on
-  // the big RoPE and the model-agnostic threshold avoids a head_dim hack. Store
-  // is always FP16 (the activation dtype). See reference_working_run_combos.
-  //
-  // ...but M is the CHUNK's row count, not the sequence's, and a chunked
-  // prefill is one sequence. Choosing the precision from M alone rotates the
-  // LAST chunk of a long prompt in fp32 while every earlier chunk was rotated
-  // in fp16, whenever that chunk happens to be shorter than 32 rows -- so the
-  // K cache the decode steps then read is internally inconsistent across a
-  // boundary a few rows before the first generated token. Measured
-  // on a 3 595-token prompt, tails of 4, 11 and 18
-  // rows all answer wrongly and tails of 32, 395, 445 and 523 are golden --
-  // the threshold in the data is this 32, exactly.
-  //
-  // rope_tail_consistent (NNTR_ROPE_TAIL_FIX=0 restores the old rule) makes
-  // the choice a property of the SEQUENCE instead: fp32 for decode (M == 1,
-  // unchanged) and for a genuinely short prompt (a first chunk, start_pos == 0,
-  // unchanged), fp16 for a CONTINUATION chunk whatever its size -- which is
-  // what every earlier chunk of that same prefill used. Large prefill chunks
-  // are unchanged either way.
-  if (M == 1 || (M < 32 && (ROPE_TAIL_CONSISTENT == 0 || start_pos == 0))) {
-    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
-    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
-    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
-  } else {
-    out[write_off + row + k]          = lo * c - hi * s;
-    out[write_off + row + k + half_d] = hi * c + lo * s;
-  }
-}
-__kernel void scatter_copy_f16(__global const half *in, __global half *out,
-                               const int N) {
-  int i = get_global_id(0);
-  if (i < N) out[i] = in[i];
-}
-// Row-offset variant: writes into a STABLE base at out[write_off + i] instead of
-// baking the destination offset into the pointer. write_off (= cache_index *
-// num_heads_KV * head_dim) is a scalar arg, so a recorded decode KV-write can be
-// replayed with write_off overridden per token (cl_qcom_recordable_queues can
-// override scalar args but NOT SVM pointers). Same address as the offset-baked
-// pointer form -> byte-identical output.
-__kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
-                                   const int N, const int write_off) {
-  int i = get_global_id(0);
-  if (i < N) out[write_off + i] = in[i];
-}
-// Decode-step Q/K/V commit in ONE launch: rope_inplace_f16 over Q (in place),
-// rope_inplace_f16 over K into the key cache at k_write_off, and the flat V
-// copy into the value cache at v_write_off. One work item per (head lane,
-// half_d), heads laid out along get_global_id(1) as [Q heads | K heads | V
-// heads]; each lane runs the M == 1 (fp32) rotation of rope_inplace_f16 or the
-// scatter_copy_f16_row store verbatim, so the bytes written are the same as
-// the three launches this replaces.
-__kernel void qkv_rope_commit_f16(__global const half *q_in,
-                                  __global       half *q_out,
-                                  __global const half *k_in,
-                                  __global       half *k_out,
-                                  __global const half *v_in,
-                                  __global       half *v_out,
-                                  __global const half *cos_lut,
-                                  __global const half *sin_lut,
-                                  const int num_heads_q, const int num_heads_kv,
-                                  const int half_d, const int start_pos,
-                                  const int k_write_off, const int v_write_off) {
-  const int h = get_global_id(1);
-  const int k = get_global_id(2);
-  if (k >= half_d) return;
-  const int d = 2 * half_d;
-  if (h < num_heads_q + num_heads_kv) {
-    const int hh = h < num_heads_q ? h : h - num_heads_q;
-    __global const half *in = h < num_heads_q ? q_in : k_in;
-    __global half *out = h < num_heads_q ? q_out : k_out;
-    const int write_off = h < num_heads_q ? 0 : k_write_off;
-    long row = (long)hh * d;
-    long lut = (long)start_pos * half_d + k;
-    half c = cos_lut[lut];
-    half s = sin_lut[lut];
-    half lo = in[row + k];
-    half hi = in[row + k + half_d];
-    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
-    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
-    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
-  } else {
-    const int hv = h - num_heads_q - num_heads_kv;
-    if (hv >= num_heads_kv) return;
-    const long row = (long)hv * d;
-    v_out[v_write_off + row + k] = v_in[row + k];
-    v_out[v_write_off + row + k + half_d] = v_in[row + k + half_d];
-  }
-}
-// OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
-// (position+t). Feeds the K image2d view (qk_matmul_f16_ohwi_img). Mirrors
-// the K-side scatter into the OHWI mirror.
-__kernel void k_scatter_ohwi(__global const half *src, __global half *dst,
-                             const int M, const int hKV, const int d,
-                             const int max_S, const int position,
-                             const int src_off) {
-  // src_off: read the current token's rotated K from a STABLE
-  // base (cache_key) at a SCALAR row offset instead of a per-token slice
-  // pointer. Default 0 == src already points at the token (byte-identical).
-  int t = get_global_id(0);
-  int h = get_global_id(1);
-  int x = get_global_id(2);
-  if (t >= M || h >= hKV || x >= d) return;
-  dst[(long)h * max_S * d + (long)(position + t) * d + x] =
-    src[(long)src_off + (long)t * hKV * d + (long)h * d + x];
-}
-// OHWI-transposed V scatter: src concat [t, hKV, d] -> dst reversed-OHWI
-// [hKV, d, max_S] at (position+t). Feeds the V image2d view
-// (sv_matmul_f16_ohwi_img): the transposed V-side scatter.
-__kernel void v_scatter_ohwi_t(__global const half *src, __global half *dst,
-                               const int M, const int hKV, const int d,
-                               const int max_S, const int position,
-                               const int src_off) {
-  // src_off: read the current token's V from a STABLE base
-  // (cache_value) at a SCALAR row offset instead of a per-token slice pointer.
-  // `position` still offsets only the DEST column. Default 0 == byte-identical.
-  int t = get_global_id(0);
-  int h = get_global_id(1);
-  int x = get_global_id(2);
-  if (t >= M || h >= hKV || x >= d) return;
-  dst[(long)h * d * max_S + (long)x * max_S + position + t] =
-    src[(long)src_off + (long)t * hKV * d + (long)h * d + x];
-}
-// Inverse gathers (mirror -> concat SVM cache slice): the NNTR_MHA_CLMEM
-// mode promotes the OHWI mirrors to the PRIMARY prefill store (no SVM
-// side-fill during the prefill window); the host decode/save paths read the
-// concat SVM slab, so the boundary syncs it back with these, once.
-__kernel void k_gather_ohwi(__global const half *src, __global half *dst,
-                            const int M, const int hKV, const int d,
-                            const int max_S, const int position) {
-  int t = get_global_id(0);
-  int h = get_global_id(1);
-  int x = get_global_id(2);
-  if (t >= M || h >= hKV || x >= d) return;
-  dst[(long)t * hKV * d + (long)h * d + x] =
-    src[(long)h * max_S * d + (long)(position + t) * d + x];
-}
-__kernel void v_gather_ohwi_t(__global const half *src, __global half *dst,
-                              const int M, const int hKV, const int d,
-                              const int max_S, const int position) {
-  int t = get_global_id(0);
-  int h = get_global_id(1);
-  int x = get_global_id(2);
-  if (t >= M || h >= hKV || x >= d) return;
-  dst[(long)t * hKV * d + (long)h * d + x] =
-    src[(long)h * d * max_S + (long)x * max_S + position + t];
-}
-)CL";
-
 /**
  * @brief Grow-only RoPE scratch: the I/O staging buffer plus the per-slot
  *        resident cos/sin LUT cache described below.
@@ -1161,22 +801,6 @@ ActStage &act_stage() {
   static ActStage s;
   return s;
 }
-
-const std::string act_cast_kernel = R"CL(
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-__kernel void cast_f32_to_f16(__global const float *in, __global half *out,
-                              const int N) {
-  const int i = get_global_id(0);
-  if (i < N)
-    vstore_half_rte(in[i], i, out);
-}
-__kernel void cast_f16_to_f32(__global const half *in, __global float *out,
-                              const int N) {
-  const int i = get_global_id(0);
-  if (i < N)
-    out[i] = vload_half(i, in);
-}
-)CL";
 
 /**
  * @brief Run one cast kernel. @a act is the FP32 activation operand (the
@@ -1983,32 +1607,6 @@ static ClContext::SharedPtrClKernel kvImgKernel(const char *kname) {
 namespace {
 constexpr unsigned int kGhSlots = 1u << 16;
 constexpr size_t kGhLws = 256;
-const std::string gpuhash_kernel = R"CL(
-__kernel void gpuhash_u16(__global const ushort *src, uint n,
-                          __global uint *out, uint slot, uint off,
-                          uint row_stride, uint rows) {
-  __local uint part[256];
-  const uint lid = get_local_id(0);
-  uint h = 2166136261u;
-  for (uint r = 0; r < rows; ++r) {
-    const uint base = off + r * row_stride;
-    for (uint i = lid; i < n; i += 256u) {
-      h ^= (uint)src[base + i];
-      h *= 16777619u;
-    }
-  }
-  part[lid] = h;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if (lid == 0) {
-    uint acc = 2166136261u;
-    for (uint j = 0; j < 256u; ++j) {
-      acc ^= part[j];
-      acc *= 16777619u;
-    }
-    out[slot] = acc;
-  }
-}
-)CL";
 struct GhLabel {
   const char *tag;
   unsigned int M;
@@ -3143,100 +2741,12 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
 // with the V mirror bound as a __read_write image (CL2.0, own program). On
 // this driver a read-write image cannot be served by the sampler's texture
 // path, which is what avoids the stale read described at the dispatch site.
-static const std::string sv_imgrw_kernel = std::string(R"CL(
+static const std::string &sv_imgrw_kernel_src() {
+  static const std::string src = std::string(R"CL(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
-)CL") + R"CL(
-__kernel void sv_matmul_f16_ohwi_imgrw_tm2(__global const half *scores,
-                                         __read_write image2d_t V_img,
-                                         __global half *O, const int M,
-                                         const int N_kv, const int d,
-                                         const int HD_Q, const int S_max,
-                                         const int gqa, const int causal,
-                                         const int local_window) {
-  const int x0 = get_global_id(0) * 8;
-  const int m0 = get_global_id(1) * 2;
-  const int head_q = get_global_id(2);
-  if (m0 >= M || x0 >= d)
-    return;
-  const int m1 = m0 + 1;
-  const int has1 = (m1 < M);
-  const int head_kv = head_q / gqa;
-  const int v_row0 = head_kv * d + x0;
-  const long sb0 = (long)head_q * (long)M * (long)N_kv + (long)m0 * (long)N_kv;
-  const long sb1 = (long)head_q * (long)M * (long)N_kv + (long)m1 * (long)N_kv;
-  // Causal cap on the query's ABSOLUTE position (q_off=N_kv-M); decode (M=1)
-  // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2
-  // kernel; a non-causal call keeps the full range.
-  int N_kv_tex = (N_kv + 7) >> 3;
-  int n_tex0 = 0;
-  if (causal) {
-    const int q_off = N_kv - M;
-    const int cap_m = has1 ? m1 : m0;
-    const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
-    if (N_kv_tex_causal < N_kv_tex)
-      N_kv_tex = N_kv_tex_causal;
-    // Sliding-window LOWER bound (see sv_matmul_f16_ohwi_img above). This WI
-    // owns rows m0 and m1=m0+1; m0 has the SMALLER absolute query position and
-    // therefore the smaller window floor, so bounding on m0 is the safe (and
-    // for m1 merely conservative) choice — the extra texels m1 does not need
-    // are exactly the +0.0 ones it would have skipped.
-    if (local_window > 0) {
-      const int n_first = q_off + m0 - local_window + 1;
-      if (n_first > 0)
-        n_tex0 = n_first >> 3;
-      if (n_tex0 > N_kv_tex)
-        n_tex0 = N_kv_tex;
-    }
-  }
-
-  float acc0[8], acc1[8];
-#pragma unroll
-  for (int t = 0; t < 8; t++) {
-    acc0[t] = 0.0f;
-    acc1[t] = 0.0f;
-  }
-
-  for (int n_tex = n_tex0; n_tex < N_kv_tex; n_tex++) {
-    const int n0 = n_tex * 8;
-    half8 s0, s1;
-    if (n0 + 8 <= N_kv) {
-      s0 = vload8(0, scores + sb0 + n0);
-      s1 = has1 ? vload8(0, scores + sb1 + n0) : (half8)((half)0.0h);
-    } else {
-      half t0[8], t1[8];
-#pragma unroll
-      for (int k = 0; k < 8; k++) {
-        t0[k] = (n0 + k < N_kv) ? scores[sb0 + n0 + k] : (half)0.0h;
-        t1[k] = (has1 && n0 + k < N_kv) ? scores[sb1 + n0 + k] : (half)0.0h;
-      }
-      s0 = vload8(0, t0);
-      s1 = vload8(0, t1);
-    }
-    const float4 s0lo = convert_float4(s0.s0123);
-    const float4 s0hi = convert_float4(s0.s4567);
-    const float4 s1lo = convert_float4(s1.s0123);
-    const float4 s1hi = convert_float4(s1.s4567);
-#pragma unroll
-    for (int t = 0; t < 8; t++) {
-      const uint4 vv = read_imageui(V_img, (int2)(n_tex, v_row0 + t));
-      const half8 vp = as_half8(vv);
-      const float4 vlo = convert_float4(vp.s0123);
-      const float4 vhi = convert_float4(vp.s4567);
-      acc0[t] += dot(s0lo, vlo) + dot(s0hi, vhi);
-      acc1[t] += dot(s1lo, vlo) + dot(s1hi, vhi);
-    }
-  }
-#pragma unroll
-  for (int t = 0; t < 8; t++) {
-    const int x = x0 + t;
-    if (x < d) {
-      O[(long)m0 * HD_Q + head_q * d + x] = (half)acc0[t];
-      if (has1)
-        O[(long)m1 * HD_Q + head_q * d + x] = (half)acc1[t];
-    }
-  }
+)CL") + sv_matmul_f16_ohwi_imgrw_tm2_kernel;
+  return src;
 }
-)CL";
 
 // The qk kernels with the OHWI K mirror bound as a __read_write image2d_t
 // and read with the sampler-less read_imageui (qk_matmul_f16_ohwi_imgrw and
@@ -4044,8 +3554,9 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
         return e != nullptr && e[0] == '1';
       }();
       if (sv_tm2 && sv_img_rw) {
-        kp = blas_cc->registerClKernel(
-          sv_imgrw_kernel, "sv_matmul_f16_ohwi_imgrw_tm2", "-cl-std=CL2.0");
+        kp = blas_cc->registerClKernel(sv_imgrw_kernel_src(),
+                                       "sv_matmul_f16_ohwi_imgrw_tm2",
+                                       "-cl-std=CL2.0");
         if (!kp) {
           static int logged = 0;
           if (!logged++)
