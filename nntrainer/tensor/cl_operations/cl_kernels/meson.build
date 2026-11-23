@@ -10,6 +10,7 @@ cl_op_kernels = [
   'copy.cl',
   'dot.cl',
   'gpuhash.cl',
+  'v8c_util.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',
   'int4_gemm.cl',
