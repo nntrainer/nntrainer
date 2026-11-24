@@ -1,0 +1,238 @@
+{
+  "name": "ai-compiler-workbench",
+  "displayName": "AI Compiler Workbench -- Agentic Graph Visualiser",
+  "description": "Turns a Hugging Face causal language model into nntrainer C++ with the Claude Code CLI, verifies it against Hugging Face, and runs and profiles it in Docker.",
+  "version": "0.4.15",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The workbench runs Python, the Claude CLI, compilers and Docker for the opened folder, so it only runs in a trusted workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "categories": [
+    "Machine Learning",
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiCompilerWorkbench.openWorkbench",
+        "title": "AI Compiler Workbench: Open Agentic Graph Visualiser"
+      },
+      {
+        "command": "aiCompilerWorkbench.runPipeline",
+        "title": "AI Compiler Workbench: Run Pipeline (Hugging Face id or local model folder)"
+      },
+      {
+        "command": "aiCompilerWorkbench.checkModel",
+        "title": "AI Compiler Workbench: Check Model Only (no download, no model in memory)"
+      },
+      {
+        "command": "aiCompilerWorkbench.generateBuildAndProfile",
+        "title": "AI Compiler Workbench: Build, Run & Profile Generated Model (Docker, this PC)"
+      },
+      {
+        "command": "aiCompilerWorkbench.stopPipeline",
+        "title": "AI Compiler Workbench: Stop Pipeline"
+      },
+      {
+        "command": "aiCompilerWorkbench.checkEnvironment",
+        "title": "AI Compiler Workbench: Set Up / Check Python Environment"
+      },
+      {
+        "command": "aiCompilerWorkbench.runDeviceProfiler",
+        "title": "AI Compiler Workbench: Run On-Device Profiling (builds nntrainer first if needed)"
+      },
+      {
+        "command": "aiCompilerWorkbench.buildNntrainer",
+        "title": "AI Compiler Workbench: Build nntrainer From Source Only (Ubuntu, advanced)"
+      },
+      {
+        "command": "aiCompilerWorkbench.setupBuild",
+        "title": "AI Compiler Workbench: Set Up nntrainer Build (for Verify vs Hugging Face)"
+      },
+      {
+        "command": "aiCompilerWorkbench.setupDockerBuild",
+        "title": "AI Compiler Workbench: Set Up Docker Build (Ubuntu container, for Verify and Run)"
+      },
+      {
+        "command": "aiCompilerWorkbench.checkDockerSetup",
+        "title": "AI Compiler Workbench: Check Docker Setup (is this computer ready for the Docker build?)"
+      },
+      {
+        "command": "aiCompilerWorkbench.runDockerSelfTest",
+        "title": "AI Compiler Workbench: Run Docker Self-Test (full build + upstream's tiny Qwen3 test, no download)"
+      },
+      {
+        "command": "aiCompilerWorkbench.cleanUpDocker",
+        "title": "AI Compiler Workbench: Clean Up Docker (old images, or everything the workbench keeps there)"
+      },
+      {
+        "command": "aiCompilerWorkbench.setAnthropicApiKey",
+        "title": "AI Compiler Workbench: Set Anthropic API Key (optional, kept in VS Code's secret storage)"
+      },
+      {
+        "command": "aiCompilerWorkbench.clearAnthropicApiKey",
+        "title": "AI Compiler Workbench: Clear Anthropic API Key"
+      }
+    ],
+    "configuration": {
+      "title": "AI Compiler Workbench",
+      "properties": {
+        "aiCompilerWorkbench.pythonPath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Python interpreter for the workbench. **Leave empty** (recommended): the workbench creates and uses its own virtual environment (see `venvPath`) from a Python 3.10+ it finds on this machine, and installs torch/transformers into it on first use. Set a path only to use an existing environment (e.g. a conda env)."
+        },
+        "aiCompilerWorkbench.venvPath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where the workbench's own Python environment lives (about 1 GB). Empty = `%LOCALAPPDATA%\\ai-compiler-workbench\\venv` on Windows, `~/.local/share/ai-compiler-workbench/venv` elsewhere. Keep it short on Windows (torch's header paths are long)."
+        },
+        "aiCompilerWorkbench.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDeprecationMessage": "The API key is now kept in VS Code's secret storage: use **AI Compiler Workbench: Set Anthropic API Key**. A key still set here is moved there once and this setting is cleared.",
+          "markdownDescription": "Not used any more: run **AI Compiler Workbench: Set Anthropic API Key** instead."
+        },
+        "aiCompilerWorkbench.claudeCliTimeout": {
+          "type": "integer",
+          "default": 900,
+          "markdownDescription": "Timeout in seconds for one Claude Code CLI call. C++ generation sends a large prompt (the plan, verified code, layer catalogue, Hugging Face reference code), so the default is 900 seconds."
+        },
+        "aiCompilerWorkbench.useClaudeCodegen": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Generate the nntrainer CausalLM C++ with the **Claude Code CLI**, using the local code bank (verified code from `Applications/CausalLM` is copied as is; only new parts are written). Output goes to `tools/agentic-ai-workbench/generated/<model>/`; review new parts in the **Review** tab."
+        },
+        "aiCompilerWorkbench.claudePath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `claude` executable. Leave empty to use `claude` on PATH, the native installer's `~/.local/bin/claude`, or the copy bundled with the Claude Code extension for VS Code. Sign in once by running `claude`."
+        },
+        "aiCompilerWorkbench.claudeModel": {
+          "type": "string",
+          "default": "sonnet",
+          "markdownDescription": "Model the Claude CLI uses for C++ generation (`sonnet`, `opus`, or a full model name)."
+        },
+        "aiCompilerWorkbench.codegenMaxAttempts": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "markdownDescription": "How many times generated code is sent back to Claude with the checker's errors before the result is shown for review anyway."
+        },
+        "aiCompilerWorkbench.cxxCompiler": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "C++ compiler for the **Compile** check of generated code (it compiles the generated sources in syntax-only mode against the nntrainer checkout's headers; with an nntrainer build present it uses that build's `compile_commands.json` flags). Empty = `clang++`, `g++` or `c++` on PATH (LLVM's default folder on Windows), else MSVC (`cl` on PATH, or any Visual Studio / Build Tools install found with vswhere)."
+        },
+        "aiCompilerWorkbench.buildHost": {
+          "scope": "machine",
+          "type": "string",
+          "enum": ["auto", "docker", "native"],
+          "default": "auto",
+          "markdownDescription": "Where generated models are compile-checked and built for **Verify** (**Run** always uses Docker): `docker` = an Ubuntu 24.04 container (gcc-13, like upstream's CI) that builds a private copy of the checkout kept in a Docker volume (the checkout itself is never mounted or changed); `native` = this machine (MSVC on Windows) into `tools/agentic-ai-workbench/nb`; `auto` = Docker when it is running and its build is set up, else the native build. Docker builds are x86-64 only for now."
+        },
+        "aiCompilerWorkbench.runMaxNewTokens": {
+          "type": "number",
+          "default": 64,
+          "markdownDescription": "**Run**: tokens the model generates after the prompt."
+        },
+        "aiCompilerWorkbench.runRepeats": {
+          "type": "number",
+          "default": 3,
+          "markdownDescription": "**Run**: how many times the model is run; the profile shows the average."
+        },
+        "aiCompilerWorkbench.runCpus": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Run**: limit the container to this many CPUs (e.g. `2`) to imitate a smaller device. Empty = all."
+        },
+        "aiCompilerWorkbench.runMemory": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Run**: limit the container's memory (e.g. `4g`) to imitate a smaller device. Empty = no limit."
+        },
+        "aiCompilerWorkbench.autoVerify": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "After a passing compile check, build the generated model and run it against a tiny Hugging Face copy of the architecture (fp32 logits within 0.01 + the greedy tokens). A pass marks the approved code **verified** in the code bank, so other models reuse it. Needs **Set Up nntrainer Build** once."
+        },
+        "aiCompilerWorkbench.autoProfile": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "After **Verify** passes, the pipeline builds, loads and runs the generated model with its **real weights** in Docker and profiles it (tokens/s, peak memory, load time), like **Build, Run & Profile** in the Review tab. Uses **Run** settings `runMaxNewTokens`, `runRepeats`, `runCpus`, `runMemory`. Skipped, with the reason in the log, when Docker is not running, the weights are not on this computer or the model does not fit Docker's memory. The first run of a model takes a few minutes (weight conversion, runner build)."
+        },
+        "aiCompilerWorkbench.autoProfilePerLayer": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "With **autoProfile**: after the measured runs, run the model once more against a second nntrainer build with its profiler on, for the **time of every layer**, the prompt apart from the generated tokens. The Profiler panel shows the slowest layers and opens the full table and the decoder-block map. The speeds still come from the normal build. The first time, Docker sets up the profiling build (about as long as the first build)."
+        },
+        "aiCompilerWorkbench.outputDirectory": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where pipeline output goes. Empty = `tools/agentic-ai-workbench/workbench_output` of the nntrainer checkout (found from `nntrainerRepoPath`, the open folder, or the extension's own location)."
+        },
+        "aiCompilerWorkbench.nntrainerPath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a local nntrainer install **prefix** (a directory containing `include/nntrainer` and `lib/`), built from [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) via `meson --prefix=<this path> build && ninja -C build install`. Required only for **Profile On-Device**; everything else works without it. If left blank, the extension will use the workspace root as the nntrainer repo path."
+        },
+        "aiCompilerWorkbench.nntrainerRepoPath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a local clone (via `git clone`, not a downloaded zip -- submodules require real git metadata) of the [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) source repo. Used by **Build nntrainer From Source**; defaults to workspace root if not set."
+        },
+        "aiCompilerWorkbench.causallmProjectRoot": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to your CausalLM integration project (the one with `transformer.h`, `causal_lm.h`, `<arch>_causallm.h`), used only when **Install Generated Files** is enabled below. Generated CausalLM components (`generated_<arch>_causallm.{h,cpp}`) always get written to `<output>/generated/causallm/<arch>/` regardless of this setting -- this only controls whether they're *also* copied into your real project. Defaults to `<workspace>/Applications/CausalLM` if not set."
+        },
+        "aiCompilerWorkbench.generatedHeaderDirectory": {
+          "type": "string",
+          "default": "include/generated",
+          "description": "Directory (relative to causallmProjectRoot) that generated .h files are copied into, when installGeneratedFiles is enabled."
+        },
+        "aiCompilerWorkbench.generatedSourceDirectory": {
+          "type": "string",
+          "default": "src/generated",
+          "description": "Directory (relative to causallmProjectRoot) that generated .cpp files are copied into, when installGeneratedFiles is enabled."
+        },
+        "aiCompilerWorkbench.installGeneratedFiles": {
+          "scope": "machine",
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When enabled, copies generated CausalLM `.h`/`.cpp` files into `causallmProjectRoot`'s generated-header/source directories after each run. **Off by default** -- this writes into a project outside the extension's own output directory, so it's opt-in rather than something a first run does silently."
+        },
+        "aiCompilerWorkbench.causallmPath": {
+          "scope": "machine",
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the CausalLM repository (`Applications/CausalLM`). Required for generating `.bin` weight files. If left blank, the extension will search in common locations."
+        }
+      }
+    }
+  },
+  "publisher": "local-dev",
+  "devDependencies": {
+    "@vscode/vsce": "^2.15.0"
+  }
+}

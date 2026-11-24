@@ -1,0 +1,2576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-__NONCE__';">
+<title>Agentic Graph Visualiser</title>
+<style>
+  :root {
+    --bg: #0e0e18;
+    --panel-bg: #12121c;
+    --border: #2a2a3d;
+    --fg: #ddd;
+    --muted: #888;
+    --accent: #61afef;
+    --green: #98c379;
+    --red: #e06c75;
+    --amber: #d19a66;
+    --purple: #c678dd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); font-size: 13px;
+    display: flex; flex-direction: column;
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; row-gap: 6px;
+    padding: 8px 12px; background: var(--panel-bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .topbar h1 { font-size: 14px; margin: 0; font-weight: 600; flex-shrink: 0; }
+  .topbar input[type=text] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 8px; width: 220px; font-size: 12px;
+  }
+  .topbar button {
+    background: #2d5a8c; color: #fff;
+    border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 12px;
+  }
+  .topbar button:hover { background: #3a6ea0; }
+  .topbar button { white-space: nowrap; flex-shrink: 0; }
+  .topbar input#nntrainerPathInput { flex: 0 1 320px; min-width: 120px; width: auto; }
+  .topbar button.danger { background: #7a3030; }
+  .topbar .spacer { flex: 1; }
+  .topbar .status { font-size: 11px; color: var(--muted); max-width: 520px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .topbar .status.running { color: var(--green); }
+  .topbar input.invalid { border-color: var(--red); }
+
+  /* Run button: amber while preparing, pulsing green while the model runs */
+  .topbar button#btnRun { min-width: 150px; font-weight: 600; }
+  .topbar button#btnBrowse { padding: 5px 8px; background: rgba(255,255,255,.08); }
+  .topbar button#btnBrowse:hover { background: rgba(255,255,255,.16); }
+  .topbar button#btnCheck { background: #4b3f72; }
+  .topbar button#btnCheck:hover:not(:disabled) { background: #5d4f8c; }
+  .topbar button:disabled { opacity: .55; cursor: default; }
+  .topbar .status.folder-ok { color: var(--green); }
+  .topbar .status.folder-bad { color: var(--red); }
+  .topbar button#btnRun:disabled { cursor: default; }
+  .topbar button#btnRun.preparing { background: #8a6d1f; }
+  .topbar button#btnRun.running { background: #2e7d32; animation: runpulse 1.6s infinite; }
+  .topbar button#btnRun.done { background: #2e7d32; }
+  .topbar button#btnRun.failed { background: #a33a3a; }
+  @keyframes runpulse {
+    0% { box-shadow: 0 0 0 0 rgba(152,195,121,.65); }
+    70% { box-shadow: 0 0 0 9px rgba(152,195,121,0); }
+    100% { box-shadow: 0 0 0 0 rgba(152,195,121,0); }
+  }
+  .run-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #c8f7b4;
+             margin-right: 7px; vertical-align: 1px; animation: pulse 1s infinite; }
+
+  .layout { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .main { flex: 1; display: flex; min-height: 0; gap: 0; overflow: hidden; }
+  .v-splitter { height: 6px; background: var(--border); cursor: row-resize; flex-shrink: 0; }
+  .v-splitter:hover { background: var(--accent); }
+
+  .panel { display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--border); background: var(--panel-bg); min-width: 0; }
+  .panel-hdr { padding: 6px 10px; font-size: 11px; font-weight: 700; letter-spacing: .4px;
+              background: rgba(255,255,255,.04); border-bottom: 1px solid var(--border); flex-shrink: 0;
+              display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .panel-hdr .label { text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .panel-body { flex: 1; overflow: auto; min-height: 0; position: relative; }
+
+  .h-splitter { width: 6px; background: var(--border); cursor: col-resize; flex-shrink: 0; }
+  .h-splitter:hover { background: var(--accent); }
+
+  .agent-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .agent-row .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex-shrink: 0; }
+  .agent-row.done .dot { background: var(--green); }
+  .agent-row.running .dot { background: var(--accent); animation: pulse 1s infinite; }
+  .agent-row.error .dot { background: var(--red); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .agent-row .info { display: flex; flex-direction: column; min-width: 0; }
+  .agent-row .name { font-size: 12px; }
+  .agent-row .detail { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Graph header controls */
+  .graph-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .graph-actions button {
+    background: rgba(255,255,255,.06); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 3px 8px; font-size: 10px; cursor: pointer; text-transform: none;
+  }
+  .graph-actions button:hover { background: rgba(255,255,255,.12); }
+  .graph-actions button.active { background: var(--accent); color: #111; border-color: var(--accent); }
+  .graph-actions button.export-btn { background: rgba(152,195,121,.15); border-color: rgba(152,195,121,.4); color: var(--green); }
+  .graph-actions button.export-btn:hover { background: rgba(152,195,121,.3); }
+  .graph-actions button.img-btn { background: rgba(152,195,121,.15); border-color: rgba(152,195,121,.4); color: var(--green); }
+  .graph-actions button.img-btn:hover { background: rgba(152,195,121,.3); }
+
+  /* Graph focus row */
+  .focus-row {
+    display: flex; gap: 6px; align-items: center; padding: 5px 10px;
+    background: var(--panel-bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .focus-row input.focus-input {
+    flex: 1; min-width: 0; background: rgba(255,255,255,.05); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 11px; color: var(--fg);
+  }
+  .focus-row input.focus-input:focus { outline: none; border-color: var(--accent); }
+  .focus-row button {
+    background: rgba(97,175,239,.15); color: var(--accent); border: 1px solid rgba(97,175,239,.4);
+    border-radius: 4px; padding: 4px 10px; font-size: 10px; cursor: pointer; white-space: nowrap;
+  }
+  .focus-row button:hover:not(:disabled) { background: rgba(97,175,239,.3); }
+  .focus-row button:disabled { opacity: .35; cursor: default; }
+  .focus-row button.focus-reset { background: rgba(255,255,255,.06); color: var(--fg); border-color: var(--border); }
+
+  /* Graph canvas. The graphContainer is the pane's only scroller: it stays
+     the size of the pane and the canvas inside it takes the graph's full
+     size. The pane body itself doesn't scroll, so the inspector and
+     minimap (positioned against the pane body) stay in view. */
+  .panel-body.graph-body { overflow: hidden; }
+  .graphContainer { position: relative; width: 100%; height: 100%; overflow: auto; background: #0a0a12; cursor: grab; }
+  .graphCanvas { position: relative; }
+  .graphContainer.panning { cursor: grabbing; }
+  .graphContainer.nopan { cursor: default; }
+  svg { display: block; background: #0a0a12; }
+  .node {
+    position: absolute; min-width: 145px; max-width: 180px; border-radius: 7px; border: 1.5px solid #444;
+    background: #22222f; font-size: 11px; cursor: pointer; overflow: hidden;
+    box-shadow: 0 2px 6px rgba(0,0,0,.4); user-select: none;
+    transition: opacity .15s ease;
+  }
+  .node .nhdr { padding: 4px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase; border-radius: 6px 6px 0 0; }
+  .node .nname { padding: 5px 8px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node.mapped { border-left: 3px solid var(--green); }
+  .node.unmapped { border-left: 3px solid var(--red); }
+  .node.skipped { border-left: 3px solid var(--amber); opacity: .6; }
+  .node.sel { box-shadow: 0 0 0 2px var(--accent), 0 2px 8px rgba(97,175,239,.3); z-index: 10; }
+  .node.dimmed { opacity: .18; }
+  .node.dimmed.sel { opacity: .5; }
+  path.edge-dimmed { opacity: .12; }
+  .node .nhdr.mapped { color: var(--green); background: rgba(152,195,121,.15); }
+  .node .nhdr.unmapped { color: var(--red); background: rgba(224,108,117,.15); }
+  .node .nhdr.skipped { color: var(--amber); background: rgba(209,154,102,.15); }
+
+  /* Inspector (reference-tool pattern: docked overlay, Properties/Weights tabs) */
+  .inspector {
+    position: absolute; top: 8px; right: 8px; width: 230px; max-height: calc(100% - 16px);
+    background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 11px; display: none; z-index: 30; box-shadow: 0 4px 12px rgba(0,0,0,.5); overflow: hidden;
+    display: none; flex-direction: column;
+  }
+  .inspector.vis { display: flex; }
+  .inspector h4 { margin: 0; padding: 8px 10px 4px; font-size: 12px; color: var(--accent); }
+  .inspector .insp-hdr { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+  .inspector .insp-hdr h4 { min-width: 0; overflow-wrap: anywhere; }
+  .inspector .insp-close {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 14px; line-height: 1; padding: 6px 8px 0 0; flex-shrink: 0;
+  }
+  .inspector .insp-close:hover { color: var(--fg); }
+  .inspector .insp-note { color: var(--muted); font-style: italic; padding: 3px 0; }
+  .itabs { display: flex; gap: 3px; padding: 0 8px 6px; border-bottom: 1px solid var(--border); }
+  .itab { padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; color: var(--muted); }
+  .itab.active { background: var(--accent); color: #111; font-weight: 600; }
+  .ibody { padding: 8px 10px; overflow-y: auto; flex: 1; min-height: 0; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; color: var(--muted); }
+  .kv b { color: var(--fg); font-weight: 500; max-width: 140px; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+  .no-weight { color: var(--muted); font-style: italic; padding: 6px 0; }
+  .weight-preview { 
+    background: rgba(0,0,0,.2); 
+    border-radius: 4px; 
+    padding: 6px 8px; 
+    font-family: "Monaco", "Courier New", monospace; 
+    font-size: 10px; 
+    color: var(--accent);
+    word-break: break-all;
+  }
+
+  /* Minimap */
+  /* Bottom-left of its own pane, clear of the inspector (top-right). */
+  .minimap {
+    position: absolute; bottom: 8px; left: 8px; width: 150px; height: 115px;
+    background: rgba(18,18,28,.95); border: 1px solid var(--border); border-radius: 6px;
+    z-index: 20; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.5); cursor: pointer;
+    display: none;
+  }
+  .minimap.visible { display: block; }
+  .minimap .mm-hdr { font-size: 8px; text-transform: uppercase; color: var(--muted); padding: 3px 6px; letter-spacing: .3px; }
+  .minimapSvg { display: block; width: 100%; height: 100%; }
+  .minimapViewport { position: absolute; border: 1.5px solid var(--accent); background: rgba(97,175,239,.12); pointer-events: none; }
+
+  /* Code viewer */
+  #codeViewer { margin: 0; padding: 10px; font-family: "Monaco", "Courier New", monospace;
+                font-size: 12px; white-space: pre; line-height: 1.5; }
+  .tok-kw { color: #c678dd; } .tok-com { color: #6a7c93; font-style: italic; }
+  .tok-str { color: #98c379; } .tok-pre { color: #e5c07b; }
+
+  /* Tabs (chat/agent-msgs) */
+  .tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; background: rgba(255,255,255,.02); }
+  .tab { padding: 6px 12px; font-size: 11px; cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+  .tab.active { color: var(--fg); border-bottom: 2px solid var(--accent); }
+  .tabpage { display: none; flex: 1; min-height: 0; overflow: auto; }
+  .tabpage.active { display: block; }
+
+  /* Chat */
+  .chat-msgs { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 8px 10px; border-radius: 6px; font-size: 12px; max-width: 96%; word-wrap: break-word; }
+  .msg.user { background: #2d3f52; align-self: flex-end; }
+  .msg.assistant { background: #23232f; align-self: flex-start; }
+  .msg .role { font-size: 9px; color: var(--muted); text-transform: uppercase; margin-bottom: 2px; font-weight: 700; }
+  .chat-input { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  .chat-input input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
+  .chat-input button { background: var(--accent); border: none; border-radius: 4px; padding: 6px 12px; cursor: pointer; color: #111; font-weight: 600; }
+
+  /* Logs */
+  .log-line { padding: 3px 10px; font-family: "Monaco", "Courier New", monospace; font-size: 11px; white-space: pre-wrap; word-wrap: break-word; }
+  .log-line.warn { color: var(--amber); }
+  .log-line.error { color: var(--red); }
+
+  /* Profiler */
+  #profilerBody { padding: 10px; }
+  .prof-stats { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .prof-stat { background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
+  .prof-stat .v { font-size: 16px; font-weight: 700; }
+  .prof-stat .l { font-size: 10px; color: var(--muted); }
+  .prof-note { font-size: 10px; color: var(--muted); margin-top: 8px; }
+  .bottleneck-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .bottleneck-row .bn-name { flex: 1; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bottleneck-row .bn-bar-wrap { flex: 0 0 90px; height: 8px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; }
+  .bottleneck-row .bn-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--red)); }
+  .bottleneck-row .bn-pct { flex: 0 0 42px; text-align: right; font-size: 10px; color: var(--muted); }
+
+  /* Artifacts */
+  .artifact-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 11px;
+                  border-bottom: 1px solid rgba(255,255,255,.04); cursor: pointer; }
+  .artifact-row:hover { background: rgba(255,255,255,.04); }
+  .artifact-row .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .artifact-row .size { color: var(--muted); flex-shrink: 0; }
+
+  .bottom-panels { display: flex; gap: 0; height: 220px; flex-shrink: 0; }
+
+  .empty-msg { padding: 20px; color: #888; font-size: 12px; }
+
+  /* Review tab (Claude CLI code generation) */
+  .badge { display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 4px; border-radius: 8px;
+           background: var(--amber); color: #111; font-size: 10px; font-weight: 700; text-transform: none; text-align: center; }
+  .badge:empty { display: none; }
+  #reviewBody { padding: 8px 10px; font-size: 12px; }
+  .rv-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
+  .rv-title { font-weight: 600; word-break: break-all; }
+  .rv-sub { color: var(--muted); font-size: 10px; word-break: break-all; }
+  .rv-sec { margin: 10px 0 4px; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 700; }
+  .rv-item { display: flex; gap: 6px; align-items: baseline; padding: 2px 0; font-size: 11px; }
+  .rv-item > span:not(.mk):not(.src) { min-width: 0; overflow-wrap: anywhere; }
+  .rv-item .mk { flex: 0 0 auto; font-family: "Monaco", "Courier New", monospace; }
+  .rv-item .src { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; padding-left: 6px; }
+  .rv-item.new .mk, .rv-item.rv-err, .rv-item.rv-warn .mk { color: var(--amber); }
+  .rv-item.rv-err { color: var(--red); }
+  .rv-ok { color: var(--green); }
+  .rv-part { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin: 4px 0; cursor: pointer;
+             background: rgba(255,255,255,.02); }
+  .rv-part:hover { border-color: var(--accent); }
+  .rv-part .row1 { display: flex; justify-content: space-between; gap: 6px; align-items: center; }
+  .rv-part .hook { font-weight: 600; font-size: 12px; }
+  .rv-part .why { color: var(--muted); font-size: 10px; margin-top: 3px; word-break: break-word; }
+  .chip { font-size: 10px; padding: 1px 7px; border-radius: 8px; white-space: nowrap; }
+  .chip.verified { background: rgba(152,195,121,.18); color: var(--green); }
+  .chip.generated, .chip.needs_verification { background: rgba(209,154,102,.2); color: var(--amber); }
+  .chip.approved, .chip.accepted { background: rgba(97,175,239,.18); color: var(--accent); }
+  .chip.rejected, .chip.failed_checks, .chip.failed_verification { background: rgba(224,108,117,.18); color: var(--red); }
+  .rv-btn { background: rgba(97,175,239,.15); color: var(--accent); border: 1px solid rgba(97,175,239,.4);
+            border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
+  .rv-btn:disabled { opacity: .4; cursor: default; }
+  .rv-busy { color: var(--accent); font-size: 11px; }
+
+  /* Code viewer file tabs (.h / .cpp / new layers) + compile button */
+  .code-bar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+              padding: 5px 8px; background: var(--panel-bg); border-bottom: 1px solid var(--border); }
+  .code-bar:empty { display: none; }
+  .code-file { background: rgba(255,255,255,.05); color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+               padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: "Monaco", "Courier New", monospace; }
+  .code-file.active { color: var(--fg); border-color: var(--accent); background: rgba(97,175,239,.15); }
+  .code-bar .grow { flex: 1; }
+  .rv-compile { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin: 4px 0; font-size: 11px; }
+  .rv-compile .row1 { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .rv-compile .msg-line { flex: 1 1 140px; }
+  .rv-compile.ok { border-color: rgba(152,195,121,.5); }
+  .rv-compile.failed { border-color: rgba(224,108,117,.5); }
+  .rv-compile.waiting { border-color: rgba(209,154,102,.5); }
+  .rv-item .fix { color: var(--muted); }
+  .run-form { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 6px; }
+  .run-form label { display: flex; flex-direction: column; gap: 2px; font-size: 10px; color: var(--muted); }
+  .run-form label.wide { flex: 1 1 100%; }
+  .run-form label.chk { justify-content: flex-end; }
+  .run-form label.chk input { width: auto; margin: 0 4px 0 0; vertical-align: middle; }
+  .run-form input, .run-form select, .run-form textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 3px 5px; font-size: 11px; font-family: inherit; }
+  .run-form input { width: 64px; }
+  .run-form textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+  .run-lbl { font-size: 10px; text-transform: uppercase; color: var(--muted); margin: 8px 0 3px; }
+  .run-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 6px; max-height: 160px; overflow: auto; }
+  .run-tbl { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 10.5px; }
+  .run-tbl th, .run-tbl td { text-align: right; padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  .run-tbl th:first-child, .run-tbl td:first-child { text-align: left; }
+  .rv-btn.ok { background: rgba(152,195,121,.18); color: var(--green); border-color: rgba(152,195,121,.5); }
+  .msg { white-space: pre-wrap; }
+  .msg.thinking { color: var(--muted); font-style: italic; }
+
+  /* Per-layer timing: the Profiler summary and the per-layer overlay */
+  .phase-tog { display: inline-flex; gap: 2px; margin-left: 8px; text-transform: none; }
+  .phase-tog button { background: rgba(255,255,255,.06); color: var(--muted); border: 1px solid var(--border);
+                      border-radius: 3px; font-size: 10px; padding: 1px 6px; cursor: pointer; }
+  .phase-tog button.on { color: var(--fg); border-color: var(--accent); background: rgba(97,175,239,.15); }
+  .lp-sum-hdr { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 10px; text-transform: uppercase;
+                color: var(--muted); margin: 10px 0 2px; }
+  .lp-sub { font-size: 10px; color: var(--muted); margin: 6px 0 2px; }
+  .lp-open { margin-top: 6px; }
+  .lp-box { width: min(1500px, 96vw); }
+  .lp-body { flex: 1 1 0; display: flex; min-height: 0; }
+  .lp-map-wrap { flex: 0 0 auto; max-width: 48%; overflow: auto; border-right: 1px solid var(--border); padding: 0 12px 12px; }
+  .lp-map { display: grid; gap: 2px; font-size: 10px; margin-top: 6px; }
+  .lp-map .hd { writing-mode: vertical-rl; transform: rotate(180deg); color: var(--muted); height: 96px; white-space: nowrap;
+                overflow: hidden; text-overflow: ellipsis; justify-self: center; }
+  .lp-map .bl { color: var(--muted); text-align: right; padding-right: 4px; line-height: 16px; }
+  .lp-map .c { width: 24px; height: 16px; border-radius: 2px; cursor: pointer; }
+  .lp-map .c.out { outline: 2px solid var(--amber); outline-offset: -2px; }
+  .lp-map .c.sel { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .lp-legend { font-size: 10px; color: var(--muted); margin-top: 8px; max-width: 360px; }
+  .lp-legend .out-key { display: inline-block; width: 10px; height: 8px; border: 2px solid var(--amber); vertical-align: middle; }
+  .lp-legend a { color: var(--accent); }
+  .lp-tbl-wrap { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; }
+  .lp-filters { display: flex; gap: 12px; align-items: center; padding: 6px 12px; font-size: 11px; flex-wrap: wrap;
+                border-bottom: 1px solid var(--border); }
+  .lp-filters select, .lp-filters input[type=text] { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                border-radius: 3px; font-size: 11px; padding: 2px 4px; }
+  .lp-filters .muted { color: var(--muted); }
+  .lp-scroll { flex: 1 1 0; overflow: auto; min-height: 0; }
+  .lp-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .lp-tbl th { position: sticky; top: 0; background: var(--panel-bg); text-align: right; font-weight: 600; color: var(--muted);
+               padding: 4px 8px; cursor: pointer; border-bottom: 1px solid var(--border); white-space: nowrap; user-select: none; }
+  .lp-tbl th.on { color: var(--accent); }
+  .lp-tbl td { padding: 3px 8px; text-align: right; border-bottom: 1px solid rgba(255,255,255,.04); white-space: nowrap;
+               font-variant-numeric: tabular-nums; cursor: pointer; }
+  .lp-tbl th.l, .lp-tbl td.l { text-align: left; }
+  .lp-tbl td.name { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  .lp-tbl tr:hover td { background: rgba(255,255,255,.03); }
+  .lp-tbl tr.sel td { background: rgba(97,175,239,.15); }
+  .lp-tbl .bar { display: inline-block; height: 6px; background: linear-gradient(90deg, var(--accent), var(--red));
+                 border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .lp-tbl .hot { color: var(--red); }
+  @media (max-width: 800px) {
+    .lp-body { flex-direction: column; }
+    .lp-map-wrap { max-width: none; max-height: 40%; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+
+  /* Review overlay: one part, side by side with the Hugging Face code */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex;
+             align-items: center; justify-content: center; }
+  .overlay[hidden] { display: none; }
+  .ov-box { width: min(1500px, 96vw); height: 92vh; background: var(--panel-bg); border: 1px solid var(--border);
+            border-radius: 8px; display: flex; flex-direction: column; min-height: 0; }
+  .ov-hdr { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 600; }
+  .ov-hdr .ov-close { margin-left: auto; background: none; border: none; color: var(--fg); font-size: 16px; cursor: pointer; }
+  .ov-meta { padding: 6px 12px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border);
+             max-height: 120px; overflow: auto; line-height: 1.5; }
+  .ov-meta b { color: var(--fg); font-weight: 600; }
+  .ov-cols { flex: 1 1 0; display: flex; min-height: 0; }
+  .ov-col { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
+  .ov-col:last-child { border-right: none; }
+  .ov-col-hdr { padding: 4px 10px; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted);
+                background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); white-space: nowrap;
+                overflow: hidden; text-overflow: ellipsis; }
+  .ov-col pre, .ov-diff pre { margin: 0; padding: 8px 10px; flex: 1; overflow: auto; min-height: 0;
+                              font-family: "Monaco", "Courier New", monospace; font-size: 11.5px; line-height: 1.45; white-space: pre; }
+  .ov-diff { flex: 0 0 28%; display: flex; flex-direction: column; min-height: 0; border-top: 1px solid var(--border); }
+  .ov-diff[hidden] { display: none; }
+  .d-add { background: rgba(152,195,121,.14); color: #b5e08e; display: block; }
+  .d-del { background: rgba(224,108,117,.14); color: #f0a0a8; display: block; }
+  .d-gap { color: var(--muted); display: block; font-style: italic; }
+  .ov-actions { display: flex; gap: 10px; padding: 8px 12px; border-top: 1px solid var(--border); align-items: stretch; }
+  .ov-actions textarea { flex: 1; min-height: 44px; resize: vertical; background: var(--bg); color: var(--fg);
+                         border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 12px; font-family: inherit; }
+  .ov-btns { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .ov-btns button { background: rgba(255,255,255,.06); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+                    padding: 6px 12px; font-size: 12px; cursor: pointer; }
+  .ov-btns button:hover:not(:disabled) { border-color: var(--accent); }
+  .ov-btns button.ok { background: rgba(152,195,121,.2); border-color: rgba(152,195,121,.5); color: var(--green); }
+  .ov-btns button.danger { background: rgba(224,108,117,.15); border-color: rgba(224,108,117,.5); color: var(--red); }
+  .ov-btns button:disabled { opacity: .35; cursor: default; }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <h1>⚙️ Agentic Graph Visualiser</h1>
+    <input id="modelInput" type="text" placeholder="Hugging Face id or model folder, e.g. Qwen/Qwen3-0.6B" value="" />
+    <button id="btnBrowse" title="Use a model folder on this computer (config.json + *.safetensors) -- nothing is downloaded">📁</button>
+    <button id="btnRun" title="Full run: graphs, weight conversion, generated code">▶ Run Pipeline</button>
+    <button id="btnCheck" title="Check only: checklist, plan and generated code from config.json and the tensor headers -- no download, the model is not loaded into memory (fine for big models)">⚡ Check only</button>
+    <button id="btnStop" class="danger">⏹ Stop</button>
+    <button id="btnEnv">Check Env</button>
+    <button id="btnExport">⬇ Export All</button>
+    <button id="btnGraphImages" title="Save both graphs (Model Graph and nntrainer Graph) as images into a folder">🖼 Graph Images</button>
+    <input id="nntrainerPathInput" type="text" placeholder="nntrainer install prefix or git-clone repo path" />
+    <button id="btnProfileDevice">🔧 Run On-Device Profiling</button>
+    <div class="spacer"></div>
+    <div class="status" id="statusLine">Idle</div>
+  </div>
+
+  <div class="layout">
+    <div class="main" id="mainRow">
+      <!-- Agent Pipeline -->
+      <div class="panel" id="panel-pipeline" style="flex: 0 0 210px;">
+        <div class="panel-hdr"><span class="label">Agent Pipeline</span></div>
+        <div class="panel-body" id="agentList"></div>
+      </div>
+      <div class="h-splitter" data-before="panel-pipeline" data-after="panel-graph-ini"></div>
+
+      <!-- Model Graph -->
+      <div class="panel" id="panel-graph-ini" style="flex: 1 1 0;">
+        <div class="panel-hdr">
+          <span class="label">Model Graph</span>
+          <div class="graph-actions">
+            <button class="pan-toggle active" data-graph="ini">✋ Pan</button>
+            <button class="zoom-fit" data-graph="ini">⤢ Fit</button>
+            <button class="export-btn" data-graph="ini">⬇ Export .ini</button>
+            <button class="img-btn" data-graph="ini" title="Save the whole Model Graph as a PNG or SVG image">🖼 Image</button>
+          </div>
+        </div>
+        <div class="focus-row">
+          <input class="focus-input" data-graph="ini" type="text" placeholder="Focus: e.g. 'self attention' or 'bottleneck'" />
+          <button class="focus-go" data-graph="ini">Focus</button>
+          <button class="focus-reset" data-graph="ini" disabled>Show Full Graph</button>
+        </div>
+        <div class="panel-body graph-body">
+          <div class="graphContainer" id="graphContainer-ini"><div class="empty-msg">Run the pipeline to see the model graph.</div></div>
+          <div class="inspector" id="inspector-ini"></div>
+          <div class="minimap" id="minimap-ini">
+            <div class="mm-hdr">Minimap</div>
+            <svg class="minimapSvg"></svg>
+            <div class="minimapViewport"></div>
+          </div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-graph-ini" data-after="panel-graph-cpp"></div>
+
+      <!-- nntrainer Graph -->
+      <div class="panel" id="panel-graph-cpp" style="flex: 1 1 0;">
+        <div class="panel-hdr">
+          <span class="label">nntrainer Graph</span>
+          <div class="graph-actions">
+            <button class="pan-toggle active" data-graph="cpp">✋ Pan</button>
+            <button class="zoom-fit" data-graph="cpp">⤢ Fit</button>
+            <button class="export-btn" data-graph="cpp">⬇ Export .cpp</button>
+            <button class="img-btn" data-graph="cpp" title="Save the whole nntrainer Graph as a PNG or SVG image">🖼 Image</button>
+          </div>
+        </div>
+        <div class="focus-row">
+          <input class="focus-input" data-graph="cpp" type="text" placeholder="Focus: e.g. 'self attention' or 'bottleneck'" />
+          <button class="focus-go" data-graph="cpp">Focus</button>
+          <button class="focus-reset" data-graph="cpp" disabled>Show Full Graph</button>
+        </div>
+        <div class="panel-body graph-body">
+          <div class="graphContainer" id="graphContainer-cpp"><div class="empty-msg">Run the pipeline to see the lowered nntrainer graph.</div></div>
+          <div class="inspector" id="inspector-cpp"></div>
+          <div class="minimap" id="minimap-cpp">
+            <div class="mm-hdr">Minimap</div>
+            <svg class="minimapSvg"></svg>
+            <div class="minimapViewport"></div>
+          </div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-graph-cpp" data-after="panel-code"></div>
+
+      <!-- C++ Code Viewer | Review of generated code -->
+      <div class="panel" id="panel-code" style="flex: 0 0 320px;">
+        <div class="tabs">
+          <div class="tab active" data-tab="code">C++ Code</div>
+          <div class="tab" data-tab="review" id="reviewTab">Review<span class="badge" id="reviewBadge"></span></div>
+        </div>
+        <div class="tabpage active" data-tab="code">
+          <div class="code-bar" id="codeBar"></div>
+          <pre id="codeViewer">// Run the pipeline to generate nntrainer C++ code.</pre>
+        </div>
+        <div class="tabpage" data-tab="review" id="reviewBody">
+          <div class="empty-msg">Run the pipeline. The Claude CLI writes the C++; parts that are new (not covered by verified code) show up here for you to review.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="v-splitter" id="vSplitter"></div>
+
+    <!-- Bottom row: Chat | Logs | Profiler | Artifacts -->
+    <div class="bottom-panels" id="bottomRow">
+      <div class="panel" id="panel-chat" style="flex: 1 1 0;">
+        <div class="tabs">
+          <div class="tab active" data-tab="chat">Chat</div>
+          <div class="tab" data-tab="agentmsgs">Agent Msgs</div>
+        </div>
+        <div class="tabpage active" data-tab="chat" id="chatMsgsWrap">
+          <div class="chat-msgs" id="chatMsgs"></div>
+        </div>
+        <div class="tabpage" data-tab="agentmsgs" id="agentMsgsWrap"><div class="chat-msgs" id="agentMsgs"></div></div>
+        <div class="chat-input">
+          <input id="chatInput" type="text" placeholder="Ask Claude about this run…" />
+          <button id="btnSend">⮕</button>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-chat" data-after="panel-logs"></div>
+
+      <div class="panel" id="panel-logs" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Logs</span></div>
+        <div class="panel-body" id="logsBody"></div>
+      </div>
+      <div class="h-splitter" data-before="panel-logs" data-after="panel-profiler"></div>
+
+      <div class="panel" id="panel-profiler" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Profiler Dashboard</span></div>
+        <div class="panel-body" id="profilerBody">
+          <div class="prof-stats">
+            <div class="prof-stat"><div class="v" id="profTotal">—</div><div class="l">Avg Latency</div></div>
+            <div class="prof-stat"><div class="v" id="profLayers">—</div><div class="l">Layers</div></div>
+            <div class="prof-stat"><div class="v" id="profArch">—</div><div class="l">Target</div></div>
+            <div class="prof-stat"><div class="v" id="profWeights">—</div><div class="l">Weights</div></div>
+          </div>
+          <div id="bottleneckList"></div>
+          <div class="prof-note" id="profNote">Run the pipeline, then click "Profile On-Device" for real hardware measurements.</div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-profiler" data-after="panel-artifacts"></div>
+
+      <div class="panel" id="panel-artifacts" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Artifacts</span></div>
+        <div class="panel-body" id="artifactsBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- One generated part, next to the Hugging Face code it implements -->
+  <div class="overlay" id="reviewOverlay" hidden>
+    <div class="ov-box">
+      <div class="ov-hdr"><span id="ovTitle"></span><span class="chip" id="ovStatus"></span><span class="rv-busy" id="ovBusy"></span>
+        <button class="ov-close" id="ovClose" title="Close (Esc)">✕</button></div>
+      <div class="ov-meta" id="ovMeta"></div>
+      <div class="ov-cols">
+        <div class="ov-col"><div class="ov-col-hdr" id="ovLeftHdr">Hugging Face reference</div><pre id="ovLeft"></pre></div>
+        <div class="ov-col"><div class="ov-col-hdr" id="ovRightHdr">Generated C++</div><pre id="ovRight"></pre></div>
+      </div>
+      <div class="ov-diff" id="ovDiffWrap"><div class="ov-col-hdr" id="ovDiffHdr">Changes</div><pre id="ovDiff"></pre></div>
+      <div class="ov-actions">
+        <textarea id="ovComment" placeholder="For Regenerate: what should change. For Approve / Reject: an optional note."></textarea>
+        <div class="ov-btns">
+          <button class="ok" id="ovApprove">✔ Approve</button>
+          <button id="ovEdit">✎ Edit in editor</button>
+          <button id="ovRecheck">↻ Re-check edits</button>
+          <button id="ovRegen">⟳ Regenerate</button>
+          <button class="danger" id="ovReject">✖ Reject</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-layer timing: every layer of the last profiled run, and the decoder-block map -->
+  <div class="overlay" id="layerOverlay" hidden>
+    <div class="ov-box lp-box">
+      <div class="ov-hdr"><span id="lpTitle">Per-layer timing</span><span id="lpPhase"></span>
+        <button class="ov-close" id="lpClose" title="Close (Esc)">✕</button></div>
+      <div class="ov-meta" id="lpMeta"></div>
+      <div class="lp-body">
+        <div class="lp-map-wrap"><div class="ov-col-hdr">Decoder blocks × layers (click a square)</div><div id="lpMap"></div></div>
+        <div class="lp-tbl-wrap">
+          <div class="lp-filters" id="lpFilters"></div>
+          <div class="lp-scroll" id="lpScroll"><table class="lp-tbl" id="lpTable"></table></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script nonce="__NONCE__">
+const vscode = acquireVsCodeApi();
+
+const AGENTS = [
+  ["model_discovery", "Model Discovery"],
+  ["weight_download", "Weight Download (background)"],
+  ["weight_converter", "Weight Converter (background)"],
+  ["compatibility", "Compatibility (from config, no download)"],
+  ["nntrainer_lowering", "nntrainer Lowering"],
+  ["ini_generator", "INI Generator"],
+  ["graph_builder", "Graph Builder"],
+  ["cpp_generator", "C++ Template Generator"],
+  ["causallm_codegen", "C++ Generator (Claude CLI)"],
+  ["dual_graph", "Dual Graph"],
+  ["compiler", "Compiler"],
+  ["auto_fix", "Auto-Fix"],
+  ["nntrainer_builder", "NNTrainer Build (if needed)"],
+  ["profiler", "Profiler"],
+  ["weight_preview", "Weight Preview"],
+  ["artifact_manager", "Artifact Manager"],
+];
+
+const agentList = document.getElementById("agentList");
+const agentRows = {};
+for (const [id, label] of AGENTS) {
+  const row = document.createElement("div");
+  row.className = "agent-row";
+  row.innerHTML = `<div class="dot"></div><div class="info"><div class="name">${escapeHtml(label)}</div><div class="detail">pending</div></div>`;
+  agentList.appendChild(row);
+  agentRows[id] = row;
+}
+
+function setAgentStatus(agent, status, detail) {
+  const row = agentRows[agent];
+  if (!row) return;
+  row.className = "agent-row " + status;
+  row.querySelector(".detail").textContent = detail || status;
+}
+
+function addLog(message, level) {
+  const el = document.createElement("div");
+  el.className = "log-line " + (level || "info");
+  el.textContent = message;
+  const body = document.getElementById("logsBody");
+  body.appendChild(el);
+  body.scrollTop = body.scrollHeight;
+}
+
+function addChat(role, content, agent) {
+  const wrap = agent && agent !== "orchestrator" ? "agentMsgs" : "chatMsgs";
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = `<div class="role">${escapeHtml(agent || role)}</div><div>${escapeHtml(content)}</div>`;
+  const container = document.getElementById(wrap);
+  container.appendChild(el);
+  container.parentElement.scrollTop = container.parentElement.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Backend event targets -> pane keys. "model"/"nntrainer" are what the
+// engine sends today; "ini"/"cpp" are accepted for older runs.
+const PANE_FOR_TARGET = { model: "ini", nntrainer: "cpp", ini: "ini", cpp: "cpp" };
+
+// Files behind each pane's Export button: [{ filename, content }].
+const fileContents = { ini: [], cpp: [] };
+
+// Click-to-highlight table. Both sides hold the ids the panes render:
+// sourceIds = Model Graph ("ini" pane), targetIds = nntrainer Graph ("cpp").
+let nodeMappings = [];
+
+function crossHighlightFrom(paneKey, nodeId) {
+  const otherPane = graphPanes[paneKey === "ini" ? "cpp" : "ini"];
+  if (!otherPane) return;
+  const fromSide = paneKey === "ini" ? "sourceIds" : "targetIds";
+  const toSide = paneKey === "ini" ? "targetIds" : "sourceIds";
+  const ids = new Set();
+  for (const m of nodeMappings) {
+    if ((m[fromSide] || []).includes(nodeId)) (m[toSide] || []).forEach((id) => ids.add(id));
+  }
+  if (ids.size) {
+    otherPane.applyFocus([...ids], "cross");
+    otherPane.focusResetBtn.disabled = false;
+    otherPane.revealNodes([...ids]);
+  } else if (otherPane.focusSource() === "cross") {
+    // Don't leave the other pane highlighting the previous click's match.
+    otherPane.resetFocus();
+    otherPane.focusResetBtn.disabled = true;
+  }
+}
+
+// ---- graph image export (begin) ----
+// A pane is HTML boxes over an SVG of edges, so an image is redrawn from the
+// pane's data with the geometry draw() uses: a box at (x, y), an edge from
+// (x + 80, y + 52) of the source to (x + 80, y - 2) of the target. One scene
+// (paths + texts) feeds both outputs: an SVG string and a PNG drawn on a
+// canvas. Neither loads an image, so the page's CSP needs no img-src.
+const IMG_NODE_W = 160, IMG_NODE_H = 50, IMG_HDR_H = 19, IMG_PAD = 24, IMG_TITLE_H = 30;
+const IMG_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+const IMG_THEMES = {
+  dark: { bg: "#0a0a12", node: "#22222f", border: "#444444", text: "#dddddd", muted: "#888888", edge: "#4a4a5e",
+          status: { mapped: "#98c379", unmapped: "#e06c75", skipped: "#d19a66" }, hdrAlpha: 0.15 },
+  light: { bg: "#ffffff", node: "#f6f7f9", border: "#c3c8d0", text: "#1f2328", muted: "#5f6672", edge: "#8a90a0",
+           status: { mapped: "#2e7d32", unmapped: "#c62828", skipped: "#b25e00" }, hdrAlpha: 0.12 },
+};
+// PNG: twice the screen size, within what a browser canvas can hold.
+const IMG_PNG_SCALE = 2, IMG_PNG_MAX_SIDE = 16384, IMG_PNG_MAX_PIXELS = 32e6;
+
+function imgNum(v) { return Math.round(v * 10) / 10; }
+
+function imgRoundedRect(x, y, w, h, r, topOnly) {
+  const n = imgNum;
+  if (topOnly) {
+    return `M ${n(x)} ${n(y + h)} V ${n(y + r)} A ${r} ${r} 0 0 1 ${n(x + r)} ${n(y)} H ${n(x + w - r)} ` +
+           `A ${r} ${r} 0 0 1 ${n(x + w)} ${n(y + r)} V ${n(y + h)} Z`;
+  }
+  return `M ${n(x + r)} ${n(y)} H ${n(x + w - r)} A ${r} ${r} 0 0 1 ${n(x + w)} ${n(y + r)} V ${n(y + h - r)} ` +
+         `A ${r} ${r} 0 0 1 ${n(x + w - r)} ${n(y + h)} H ${n(x + r)} A ${r} ${r} 0 0 1 ${n(x)} ${n(y + h - r)} ` +
+         `V ${n(y + r)} A ${r} ${r} 0 0 1 ${n(x + r)} ${n(y)} Z`;
+}
+
+// Cut `text` with an ellipsis so it fits `maxW` (the CSS does this on screen).
+function imgFit(text, size, weight, maxW, measure) {
+  const s = String(text == null ? "" : text);
+  if (measure(s, size, weight) <= maxW) return s;
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (measure(s.slice(0, mid) + "…", size, weight) <= maxW) lo = mid; else hi = mid - 1;
+  }
+  return s.slice(0, lo) + "…";
+}
+
+// measure(text, size, weight) -> width in px. Returns { width, height, items }.
+function graphScene(data, focusedIds, themeName, title, measure) {
+  const t = IMG_THEMES[themeName] || IMG_THEMES.dark;
+  const nodes = (data && data.nodes) || [];
+  const edges = (data && data.edges) || [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + IMG_NODE_W); maxY = Math.max(maxY, n.y + IMG_NODE_H);
+  }
+  if (!nodes.length) { minX = minY = 0; maxX = maxY = 0; }
+  const ox = IMG_PAD - minX, oy = IMG_PAD + IMG_TITLE_H - minY;
+  const counts = `${nodes.length} nodes · ${edges.length} edges`;
+  const titleW = measure(title, 14, 600), countsW = measure(counts, 11, 400);
+  const width = Math.ceil(Math.max(maxX - minX, titleW + 14 + countsW) + 2 * IMG_PAD);
+  const height = Math.ceil(maxY - minY + 2 * IMG_PAD + IMG_TITLE_H);
+  const dim = (on) => (focusedIds && !on ? 1 : 0);
+  const items = [
+    { k: "path", d: `M 0 0 H ${width} V ${height} H 0 Z`, fill: t.bg },
+    { k: "text", x: IMG_PAD, y: IMG_PAD + 12, text: title, size: 14, weight: 600, fill: t.text },
+    { k: "text", x: IMG_PAD + titleW + 14, y: IMG_PAD + 12, text: counts, size: 11, weight: 400, fill: t.muted },
+  ];
+
+  const byId = {};
+  nodes.forEach((n) => (byId[n.id] = n));
+  for (const e of edges) {
+    const s = byId[e.source], d = byId[e.target];
+    if (!s || !d) continue;
+    const x1 = s.x + 80 + ox, y1 = s.y + 52 + oy, x2 = d.x + 80 + ox, y2 = d.y - 2 + oy;
+    const my = (y1 + y2) / 2, n = imgNum;
+    const opacity = dim(focusedIds && focusedIds.has(e.source) && focusedIds.has(e.target)) ? 0.12 : 1;
+    items.push({ k: "path", d: `M ${n(x1)} ${n(y1)} C ${n(x1)} ${n(my)}, ${n(x2)} ${n(my)}, ${n(x2)} ${n(y2)}`,
+                 stroke: t.edge, sw: 1.5, opacity });
+    const dir = y2 >= my ? 1 : -1;                       // the curve ends vertically
+    items.push({ k: "path", d: `M ${n(x2 - 5)} ${n(y2 - 8 * dir)} L ${n(x2 + 5)} ${n(y2 - 8 * dir)} ` +
+                 `L ${n(x2)} ${n(y2 + dir)} Z`, fill: t.edge, opacity });
+  }
+
+  for (const n of nodes) {
+    const x = n.x + ox, y = n.y + oy;
+    // Only mapped / unmapped / skipped have a colour on screen (accent bar +
+    // tinted header); other statuses (the nntrainer graph's supported, fused,
+    // host_managed) are plain boxes there, and so they are here.
+    const color = t.status[n.status];
+    const opacity = (n.status === "skipped" ? 0.6 : 1) * (dim(focusedIds && focusedIds.has(n.id)) ? 0.18 : 1);
+    const innerX = color ? x + 3 : x, innerW = color ? IMG_NODE_W - 3 : IMG_NODE_W;
+    if (color) items.push({ k: "path", d: imgRoundedRect(x, y, IMG_NODE_W, IMG_NODE_H, 7), fill: color, opacity });
+    items.push({ k: "path", d: imgRoundedRect(innerX, y, innerW, IMG_NODE_H, color ? 6 : 7), fill: t.node, opacity });
+    if (color) {
+      items.push({ k: "path", d: imgRoundedRect(innerX, y, innerW, IMG_HDR_H, 6, true), fill: color,
+                   fillOpacity: t.hdrAlpha, opacity });
+    }
+    items.push({ k: "path", d: imgRoundedRect(x, y, IMG_NODE_W, IMG_NODE_H, 7), stroke: t.border, sw: 1.5, opacity });
+    const maxText = innerW - 16;
+    items.push({ k: "text", x: innerX + 8, y: y + 13, size: 9, weight: 700, fill: color || t.text, opacity,
+                 text: imgFit(String(n.type == null ? "" : n.type).toUpperCase(), 9, 700, maxText, measure) });
+    items.push({ k: "text", x: innerX + 8, y: y + IMG_HDR_H + 18, size: 11, weight: 600, fill: t.text, opacity,
+                 text: imgFit(n.label, 11, 600, maxText, measure) });
+  }
+  return { width, height, items };
+}
+
+function sceneToSvg(scene) {
+  const out = [`<?xml version="1.0" encoding="UTF-8"?>`,
+               `<svg xmlns="http://www.w3.org/2000/svg" width="${scene.width}" height="${scene.height}" ` +
+               `viewBox="0 0 ${scene.width} ${scene.height}" font-family="${escapeHtml(IMG_FONT)}">`];
+  for (const it of scene.items) {
+    const op = it.opacity != null && it.opacity < 1 ? ` opacity="${imgNum(it.opacity * 100) / 100}"` : "";
+    if (it.k === "path") {
+      out.push(`<path d="${it.d}" fill="${it.fill || "none"}"` +
+               (it.fillOpacity != null ? ` fill-opacity="${it.fillOpacity}"` : "") +
+               (it.stroke ? ` stroke="${it.stroke}" stroke-width="${it.sw || 1}"` : "") + `${op}/>`);
+    } else {
+      out.push(`<text x="${imgNum(it.x)}" y="${imgNum(it.y)}" font-size="${it.size}" font-weight="${it.weight}" ` +
+               `fill="${it.fill}"${op}>${escapeHtml(it.text)}</text>`);
+    }
+  }
+  out.push("</svg>");
+  return out.join("\n");
+}
+
+// { dataUrl, scale, width, height } or null when the canvas cannot be made.
+function sceneToPng(scene) {
+  const scale = Math.min(IMG_PNG_SCALE, IMG_PNG_MAX_SIDE / Math.max(scene.width, scene.height),
+                         Math.sqrt(IMG_PNG_MAX_PIXELS / (scene.width * scene.height)));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.floor(scene.width * scale));
+  canvas.height = Math.max(1, Math.floor(scene.height * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(scale, scale);
+  for (const it of scene.items) {
+    const op = it.opacity != null ? it.opacity : 1;
+    if (it.k === "path") {
+      const p = new Path2D(it.d);
+      if (it.fill) {
+        ctx.globalAlpha = op * (it.fillOpacity != null ? it.fillOpacity : 1);
+        ctx.fillStyle = it.fill;
+        ctx.fill(p);
+      }
+      if (it.stroke) {
+        ctx.globalAlpha = op;
+        ctx.strokeStyle = it.stroke;
+        ctx.lineWidth = it.sw || 1;
+        ctx.stroke(p);
+      }
+    } else {
+      ctx.globalAlpha = op;
+      ctx.fillStyle = it.fill;
+      ctx.font = `${it.weight} ${it.size}px ${IMG_FONT}`;
+      ctx.textBaseline = "alphabetic";
+      ctx.fillText(it.text, it.x, it.y);
+    }
+  }
+  const dataUrl = canvas.toDataURL("image/png");
+  if (!dataUrl.startsWith("data:image/png")) return null;
+  return { dataUrl, scale, width: canvas.width, height: canvas.height };
+}
+
+let imgMeasureCtx = null;
+function imgMeasure(text, size, weight) {
+  if (!imgMeasureCtx) imgMeasureCtx = document.createElement("canvas").getContext("2d");
+  imgMeasureCtx.font = `${weight} ${size}px ${IMG_FONT}`;
+  return imgMeasureCtx.measureText(String(text)).width;
+}
+// ---- graph image export (end) ----
+
+const GRAPH_TITLES = { ini: "Model Graph", cpp: "nntrainer Graph" };
+const GRAPH_FILE_SUFFIX = { ini: "model_graph", cpp: "nntrainer_graph" };
+
+// "Qwen/Qwen3-0.6B" -> "Qwen3-0.6B"; a local folder -> its name.
+function modelShortName() {
+  const m = String(runState.model || "").trim().replace(/[\\/]+$/, "");
+  return m.split(/[\\/]/).pop() || "";
+}
+
+// One pane's image: { key, base, svg?, png? (base64), scale?, width, height } or null.
+function buildGraphImage(key, theme, format) {
+  const snap = graphPanes[key] && graphPanes[key].snapshot();
+  if (!snap) return null;
+  const local = /[\\]|^\/|^[A-Za-z]:/.test(String(runState.model || ""));
+  const shown = (local ? modelShortName() : String(runState.model || "").trim()) || "Model";
+  const scene = graphScene(snap.data, snap.focusedIds, theme, `${shown} · ${GRAPH_TITLES[key]}`, imgMeasure);
+  const stem = (modelShortName() || "model").replace(/[^A-Za-z0-9._-]+/g, "_");
+  const img = { key, base: `${stem}_${GRAPH_FILE_SUFFIX[key]}${theme === "light" ? "_light" : ""}`,
+                width: scene.width, height: scene.height };
+  if (format !== "png") img.svg = sceneToSvg(scene);
+  if (format !== "svg") {
+    const png = sceneToPng(scene);
+    if (png) {
+      img.png = png.dataUrl.slice(png.dataUrl.indexOf(",") + 1);
+      img.scale = png.scale;
+    } else {
+      addLog(`The ${GRAPH_TITLES[key]} is too large for a PNG here; export it as SVG instead.`, "warn");
+    }
+  }
+  return img.svg || img.png ? img : null;
+}
+
+function requestGraphImages(keys) {
+  const ready = keys.filter((k) => graphPanes[k] && graphPanes[k].snapshot());
+  if (!ready.length) {
+    addLog("No graph to save as an image yet -- run the pipeline first.", "warn");
+    return;
+  }
+  vscode.postMessage({ type: "graphImageRequest", keys: ready });
+}
+
+function makeGraphPane(key) {
+  const container = document.getElementById(`graphContainer-${key}`);
+  const inspector = document.getElementById(`inspector-${key}`);
+  const minimap = document.getElementById(`minimap-${key}`);
+  const minimapSvg = minimap.querySelector(".minimapSvg");
+  const minimapViewport = minimap.querySelector(".minimapViewport");
+  const panToggleBtn = document.querySelector(`.pan-toggle[data-graph="${key}"]`);
+  const fitBtn = document.querySelector(`.zoom-fit[data-graph="${key}"]`);
+  const exportBtn = document.querySelector(`.export-btn[data-graph="${key}"]`);
+
+  const state = {
+    data: null, panEnabled: true, mmScale: null, inspTab: "props",
+    focusedIds: null,
+    focusSource: null,  // "query" (focus box) or "cross" (click in the other pane)
+    selectedId: null,   // node shown in the inspector; survives a re-render
+  };
+
+  function render(data) {
+    state.data = data;
+    draw();
+  }
+
+  function reset() {
+    state.selectedId = null;
+    state.focusedIds = null;
+    state.focusSource = null;
+    focusResetBtn.disabled = true;
+    container.scrollLeft = 0;
+    container.scrollTop = 0;
+    refreshExportLabel();
+    render(null);
+  }
+
+  function draw() {
+    const data = state.data;
+    // A re-render (e.g. when weight statistics arrive) keeps the scroll position.
+    const scrollLeft = container.scrollLeft, scrollTop = container.scrollTop;
+    container.innerHTML = "";
+
+    if (!data || !data.nodes || data.nodes.length === 0) {
+      hideInspector();
+      // No data = nothing ran yet; an empty graph from a run needs a reason.
+      const why = !data ? "No graph yet. Run the pipeline."
+        : data.message || (key === "cpp"
+          ? "No nntrainer graph for this model. It is built only for architectures the workbench can lower " +
+            "(Llama, Qwen2, Qwen3, Gemma3, …); the Logs panel says why this one was not."
+          : "The model graph is empty for this run — see the Logs panel.");
+      container.innerHTML = `<div class="empty-msg">${escapeHtml(why)}</div>`;
+      minimap.classList.remove("visible");
+      return;
+    }
+
+    const nodes = data.nodes || [];
+    const edges = data.edges || [];
+
+    let maxX = 100, maxY = 100;
+    nodes.forEach(n => {
+      maxX = Math.max(maxX, n.x + 220);
+      maxY = Math.max(maxY, n.y + 100);
+    });
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", maxX);
+    svg.setAttribute("height", maxY);
+    svg.style.position = "absolute";
+    svg.style.top = "0";
+    svg.style.left = "0";
+    svg.style.pointerEvents = "none";
+    svg.style.zIndex = "0";
+
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", `arrowhead-${key}`);
+    marker.setAttribute("markerWidth", "10");
+    marker.setAttribute("markerHeight", "10");
+    marker.setAttribute("refX", "5");
+    marker.setAttribute("refY", "8");
+    marker.setAttribute("orient", "auto");
+    const poly = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    poly.setAttribute("points", "0 0, 10 0, 5 9");
+    poly.setAttribute("fill", "#4a4a5e");
+    marker.appendChild(poly);
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+
+    const byId = {};
+    nodes.forEach(n => (byId[n.id] = n));
+    edges.forEach(e => {
+      const s = byId[e.source], t = byId[e.target];
+      if (!s || !t) return;
+      const x1 = s.x + 80, y1 = s.y + 52;
+      const x2 = t.x + 80, y2 = t.y - 2;
+      const my = (y1 + y2) / 2;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`);
+      path.setAttribute("stroke", "#4a4a5e");
+      path.setAttribute("stroke-width", "1.5");
+      path.setAttribute("fill", "none");
+      path.setAttribute("marker-end", `url(#arrowhead-${key})`);
+      path.dataset.source = e.source;
+      path.dataset.target = e.target;
+      svg.appendChild(path);
+    });
+
+    // Size the canvas, not the container: the container must stay the size
+    // of the pane so that it is the element that scrolls.
+    const canvas = document.createElement("div");
+    canvas.className = "graphCanvas";
+    canvas.style.width = maxX + "px";
+    canvas.style.height = maxY + "px";
+    canvas.appendChild(svg);
+
+    let selected = null;
+    nodes.forEach(n => {
+      const div = document.createElement("div");
+      div.className = "node " + n.status;
+      div.dataset.id = n.id;
+      div.style.left = n.x + "px";
+      div.style.top = n.y + "px";
+      div.style.position = "absolute";
+      div.style.zIndex = "1";
+      div.innerHTML = `<div class="nhdr ${escapeHtml(n.status)}">${escapeHtml(n.type)}</div><div class="nname">${escapeHtml(n.label)}</div>`;
+      div.addEventListener("mousedown", (e) => e.stopPropagation());
+      div.onclick = (e) => { e.stopPropagation(); selectNode(n, div); };
+      canvas.appendChild(div);
+      if (n.id === state.selectedId) selected = { n, div };
+    });
+
+    container.appendChild(canvas);
+    container.scrollLeft = scrollLeft;
+    container.scrollTop = scrollTop;
+
+    if (selected) {
+      selected.div.classList.add("sel");
+      renderInspector(selected.n);
+    } else {
+      state.selectedId = null;
+      hideInspector();
+    }
+
+    renderMinimap(data, maxX, maxY);
+    applyFocusStyles();
+  }
+
+  function applyFocusStyles() {
+    const ids = state.focusedIds;
+    container.querySelectorAll(".node").forEach((el) => {
+      el.classList.toggle("dimmed", !!ids && !ids.has(el.dataset.id));
+    });
+    container.querySelectorAll("path[data-source]").forEach((el) => {
+      const bothIn = !ids || (ids.has(el.dataset.source) && ids.has(el.dataset.target));
+      el.classList.toggle("edge-dimmed", !bothIn);
+    });
+  }
+
+  function applyFocus(matchedIds, source = "query") {
+    state.focusedIds = new Set(matchedIds);
+    state.focusSource = source;
+    applyFocusStyles();
+  }
+
+  function resetFocus() {
+    state.focusedIds = null;
+    state.focusSource = null;
+    applyFocusStyles();
+  }
+
+  // Scroll so the given nodes are on screen (no-op if they already are).
+  function revealNodes(ids) {
+    const want = new Set(ids);
+    const hits = ((state.data && state.data.nodes) || []).filter((n) => want.has(n.id));
+    if (!hits.length) return;
+    const left = Math.min(...hits.map((n) => n.x)), right = Math.max(...hits.map((n) => n.x + 180));
+    const top = Math.min(...hits.map((n) => n.y)), bottom = Math.max(...hits.map((n) => n.y + 60));
+    const viewW = container.clientWidth, viewH = container.clientHeight;
+    const inView = left >= container.scrollLeft && right <= container.scrollLeft + viewW &&
+                   top >= container.scrollTop && bottom <= container.scrollTop + viewH;
+    if (inView) return;
+    container.scrollLeft = Math.max(0, (left + right) / 2 - viewW / 2);
+    container.scrollTop = Math.max(0, top - 40);
+  }
+
+  function selectNode(n, div) {
+    container.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+    div.classList.add("sel");
+    state.selectedId = n.id;
+    // Clicking here starts a new cross-highlight, so drop the dimming this
+    // pane got from a click in the other pane. A focus-box query stays.
+    if (state.focusSource === "cross") {
+      resetFocus();
+      focusResetBtn.disabled = true;
+    }
+    renderInspector(n);
+    crossHighlightFrom(key, n.id);
+  }
+
+  function hideInspector() {
+    inspector.classList.remove("vis");
+  }
+
+  function closeInspector() {
+    hideInspector();
+    state.selectedId = null;
+    container.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+  }
+
+  const fmtShape = (s) => Array.isArray(s)
+    ? "[" + s.map((v) => (v === null || v === undefined ? "?" : v)).join(", ") + "]"
+    : String(s);
+  const fmtStat = (v) => (typeof v === "number" && isFinite(v) ? v.toFixed(6) : "—");
+  const fmtCount = (v) => (typeof v === "number" ? v.toLocaleString() : "—");
+  // Attribute values are shown verbatim -- in the nntrainer pane they are the
+  // literal layer properties -- except the derived parameter count.
+  const fmtValue = (k, v) => (k === "parameters" && typeof v === "number" ? v.toLocaleString() : String(v));
+  const kv = (label, value, title) =>
+    `<div class="kv"><span>${escapeHtml(label)}</span><b title="${escapeHtml(title || value)}">${escapeHtml(value)}</b></div>`;
+
+  function renderInspector(n) {
+    inspector.classList.add("vis");
+    const w = n.weightInfo;
+
+    const propsBody = [
+      kv("Type", n.type),
+      kv("Status", n.status),
+      n.semanticType ? kv("Role", n.semanticType) : "",
+      n.inputShape ? kv("Input", fmtShape(n.inputShape)) : "",
+      n.outputShape ? kv("Output", fmtShape(n.outputShape)) : "",
+      ...Object.entries(n.attributes || {}).map(([k, v]) => kv(k, fmtValue(k, v))),
+      n.reason ? kv("Note", n.reason) : "",
+    ].join("");
+
+    const weightsBody = !w ? `<div class="no-weight">No weight data for this node.</div>` : [
+      kv("Name", w.name),
+      kv("Shape", fmtShape(w.shape)),
+      kv("Dtype", w.dtype || "—"),
+      kv("Params", fmtCount(w.params)),
+      w.note ? `<div class="insp-note">${escapeHtml(w.note)}</div>` : "",
+      Array.isArray(w.preview)
+        ? `<h4>Statistics</h4>${kv("Min", fmtStat(w.min))}${kv("Max", fmtStat(w.max))}` +
+          `${kv("Mean", fmtStat(w.mean))}${kv("Std Dev", fmtStat(w.std))}` +
+          `<h4>Preview (first ${w.preview.length} values)</h4>` +
+          `<div class="weight-preview">${escapeHtml(w.preview.map(fmtStat).join(", "))}</div>`
+        : `<div class="insp-note">No statistics yet -- they are read once the weights have downloaded (see the Weight Preview step).</div>`,
+    ].join("");
+
+    inspector.innerHTML = `
+      <div class="insp-hdr">
+        <h4>${escapeHtml(n.label)}</h4>
+        <button class="insp-close" title="Close">&times;</button>
+      </div>
+      <div class="itabs">
+        <div class="itab ${state.inspTab === 'props' ? 'active' : ''}" data-itab="props">Properties</div>
+        <div class="itab ${state.inspTab === 'weights' ? 'active' : ''}" data-itab="weights">Weights</div>
+      </div>
+      <div class="ibody">${state.inspTab === 'props' ? propsBody : weightsBody}</div>
+    `;
+    inspector.querySelector(".insp-close").onclick = closeInspector;
+    inspector.querySelectorAll(".itab").forEach(tab => {
+      tab.onclick = () => { state.inspTab = tab.dataset.itab; renderInspector(n); };
+    });
+  }
+
+  function renderMinimap(data, graphW, graphH) {
+    minimap.classList.add("visible");
+    const mmW = minimap.clientWidth, mmH = minimap.clientHeight - 16;
+    const scale = Math.min(mmW / graphW, mmH / graphH) * 0.92;
+
+    minimapSvg.innerHTML = "";
+    minimapSvg.setAttribute("viewBox", `0 0 ${mmW} ${mmH}`);
+
+    const colors = { mapped: "#98c379", unmapped: "#e06c75", skipped: "#d19a66" };
+    data.nodes.forEach(n => {
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", n.x * scale + 4);
+      rect.setAttribute("y", n.y * scale + 4);
+      rect.setAttribute("width", Math.max(3, 160 * scale));
+      rect.setAttribute("height", Math.max(2, 40 * scale));
+      rect.setAttribute("fill", colors[n.status] || "#666");
+      rect.setAttribute("rx", "1");
+      minimapSvg.appendChild(rect);
+    });
+
+    state.mmScale = scale;
+    updateMinimapViewport();
+  }
+
+  function updateMinimapViewport() {
+    const scale = state.mmScale;
+    if (!scale || !state.data) { minimapViewport.style.display = "none"; return; }
+    minimapViewport.style.display = "block";
+    minimapViewport.style.left = (container.scrollLeft * scale + 4) + "px";
+    minimapViewport.style.top = (container.scrollTop * scale + 4 + 16) + "px";
+    minimapViewport.style.width = (container.clientWidth * scale) + "px";
+    minimapViewport.style.height = (container.clientHeight * scale) + "px";
+  }
+
+  container.addEventListener("scroll", updateMinimapViewport);
+
+  minimap.addEventListener("mousedown", (e) => {
+    jumpToMinimapPoint(e);
+    const onMove = (ev) => jumpToMinimapPoint(ev);
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
+  function jumpToMinimapPoint(e) {
+    const rect = minimap.getBoundingClientRect();
+    const scale = state.mmScale;
+    if (!scale) return;
+    const localX = e.clientX - rect.left - 4;
+    const localY = e.clientY - rect.top - 4 - 16;
+    container.scrollLeft = Math.max(0, localX / scale - container.clientWidth / 2);
+    container.scrollTop = Math.max(0, localY / scale - container.clientHeight / 2);
+  }
+
+  let panDrag = null;
+  container.addEventListener("mousedown", (e) => {
+    if (!state.panEnabled) return;
+    if (e.target.closest(".node") || e.target.closest(".inspector")) return;
+    panDrag = { startX: e.clientX, startY: e.clientY, scrollLeft: container.scrollLeft, scrollTop: container.scrollTop };
+    container.classList.add("panning");
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!panDrag) return;
+    container.scrollLeft = panDrag.scrollLeft - (e.clientX - panDrag.startX);
+    container.scrollTop = panDrag.scrollTop - (e.clientY - panDrag.startY);
+  });
+  document.addEventListener("mouseup", () => {
+    if (panDrag) { panDrag = null; container.classList.remove("panning"); }
+  });
+
+  panToggleBtn.onclick = () => {
+    state.panEnabled = !state.panEnabled;
+    panToggleBtn.classList.toggle("active", state.panEnabled);
+    container.classList.toggle("nopan", !state.panEnabled);
+  };
+  fitBtn.onclick = () => { container.scrollLeft = 0; container.scrollTop = 0; };
+
+  const exportDefaultLabel = exportBtn.textContent;
+
+  // Label the button with the file types it will actually export.
+  function refreshExportLabel() {
+    const exts = [...new Set(fileContents[key].map((f) => {
+      const dot = f.filename.lastIndexOf(".");
+      return dot >= 0 ? f.filename.slice(dot) : f.filename;
+    }))];
+    exportBtn.textContent = exts.length ? `⬇ Export ${exts.join(" + ")}` : exportDefaultLabel;
+  }
+
+  exportBtn.onclick = () => {
+    const files = fileContents[key];
+    if (!files.length) {
+      let msg = "Nothing to export yet -- run the pipeline first.";
+      if (state.data && key === "ini") {
+        msg = "This model's Model Graph is built from its architecture, not from a file, so there's no model.ini to export.";
+      } else if (state.data) {
+        msg = "This run produced no C++ file to export.";
+      }
+      addLog(msg, "warn");
+      return;
+    }
+    if (files.length === 1) {
+      vscode.postMessage({ type: "exportFile", filename: files[0].filename, content: files[0].content });
+    } else {
+      vscode.postMessage({ type: "exportFiles", files });
+    }
+  };
+
+  const imageBtn = document.querySelector(`.img-btn[data-graph="${key}"]`);
+  imageBtn.onclick = () => requestGraphImages([key]);
+
+  const focusInput = document.querySelector(`.focus-input[data-graph="${key}"]`);
+  const focusGoBtn = document.querySelector(`.focus-go[data-graph="${key}"]`);
+  const focusResetBtn = document.querySelector(`.focus-reset[data-graph="${key}"]`);
+
+  const RESET_WORDS = new Set(["reset", "clear", "show all", "full graph", "show everything"]);
+
+  function submitFocusQuery() {
+    const query = focusInput.value.trim();
+    if (!query) return;
+    if (RESET_WORDS.has(query.toLowerCase())) {
+      resetFocus();
+      focusResetBtn.disabled = true;
+      focusInput.value = "";
+      return;
+    }
+    vscode.postMessage({ type: "graphFocusQuery", graph: key, query });
+  }
+
+  focusGoBtn.onclick = submitFocusQuery;
+  focusInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitFocusQuery();
+  });
+  focusResetBtn.onclick = () => {
+    resetFocus();
+    focusResetBtn.disabled = true;
+    focusInput.value = "";
+  };
+
+  return {
+    render, reset, applyFocus, resetFocus, revealNodes, refreshExportLabel, focusResetBtn,
+    focusSource: () => state.focusSource,
+    // What an exported image draws: the graph and the current Focus dimming.
+    snapshot: () => (state.data && state.data.nodes && state.data.nodes.length
+      ? { data: state.data, focusedIds: state.focusedIds } : null),
+  };
+}
+
+const graphPanes = { ini: makeGraphPane("ini"), cpp: makeGraphPane("cpp") };
+
+// ---- C++ code viewer: one tab per generated file (.h first, then .cpp) ----
+const codeFiles = new Map();
+let codeSelected = null;
+let codeAutoSelect = true;      // show the header first until the user picks a tab
+
+function codeRank(n) { return n.endsWith(".h") ? 0 : n.endsWith(".cpp") ? 1 : 2; }
+
+function renderCodeBar() {
+  const bar = document.getElementById("codeBar");
+  const names = [...codeFiles.keys()].sort((a, b) => codeRank(a) - codeRank(b) || a.localeCompare(b));
+  if (!names.length) { bar.innerHTML = ""; return; }
+  const filePath = currentReview && currentReview.files && currentReview.files[codeSelected];
+  bar.innerHTML = names.map((n) =>
+      `<button class="code-file${n === codeSelected ? " active" : ""}" data-file="${escapeHtml(n)}">${escapeHtml(n)}</button>`).join("") +
+    '<span class="grow"></span>' +
+    (filePath ? '<button class="rv-btn" id="codeOpen" title="Open this file in the editor">✎ Open</button>' : "") +
+    compileButtonHtml("codeCompile");
+  bar.querySelectorAll(".code-file").forEach((b) => {
+    b.onclick = () => { codeAutoSelect = false; selectCode(b.dataset.file); };
+  });
+  const open = document.getElementById("codeOpen");
+  if (open) open.onclick = () => vscode.postMessage({ type: "openPath", path: filePath });
+  wireCompileButton("codeCompile");
+}
+
+function selectCode(name) {
+  codeSelected = name;
+  renderCode(codeFiles.get(name) || "");
+  renderCodeBar();
+}
+
+function addCodeFile(name, content) {
+  codeFiles.set(name, content);
+  if (codeAutoSelect || !codeSelected || !codeFiles.has(codeSelected)) {
+    codeSelected = [...codeFiles.keys()].sort((a, b) => codeRank(a) - codeRank(b) || a.localeCompare(b))[0];
+  }
+  selectCode(codeSelected);
+}
+
+// Claude's generated files replace the template generator's in the viewer.
+function keepReviewFiles(review) {
+  const names = new Set(Object.keys(review.files || {}).filter((n) => /\.(h|cpp)$/.test(n) && !n.startsWith("register_")));
+  if (!names.size) return;
+  for (const n of [...codeFiles.keys()]) if (!names.has(n)) codeFiles.delete(n);
+  if (!codeFiles.has(codeSelected)) {
+    codeSelected = null;
+    codeAutoSelect = true;
+  }
+  renderCodeBar();
+}
+
+function resetCodeViewer(text) {
+  codeFiles.clear();
+  codeSelected = null;
+  codeAutoSelect = true;
+  renderCodeBar();
+  document.getElementById("codeViewer").textContent = text;
+}
+
+// ---- Compile button (Review tab + code viewer) ----
+function compileButtonHtml(id) {
+  if (!currentReview) return "";
+  const c = currentReview.compile || { status: "not_run" };
+  const ready = currentReview.compile_ready || { ok: false, why: "" };
+  const label = c.status === "not_run" ? "⚙ Compile" : "↻ Recompile";
+  const title = ready.ok ? "Compile-check the generated code against the nntrainer headers" : `Not yet: ${ready.why}`;
+  return `<button class="rv-btn ok" id="${id}" title="${escapeHtml(title)}"${ready.ok && !reviewBusy ? "" : " disabled"}>${label}</button>`;
+}
+
+function wireCompileButton(id) {
+  const b = document.getElementById(id);
+  if (b) b.onclick = () => codegenAction("compile", "");
+}
+
+function compileSectionHtml(review) {
+  const c = review.compile || { status: "not_run" };
+  const ready = review.compile_ready || { ok: false, why: "" };
+  const base = (p) => String(p || "").split(/[\\/]/).pop();
+  let cls = "", line = "", extra = "";
+  if (!ready.ok) {
+    cls = "waiting";
+    line = `⏸ Not compiled — ${ready.why}. You will be asked to compile once nothing is waiting.`;
+  } else if (c.status === "ok") {
+    cls = "ok";
+    line = `✓ Compiles (header check with ${base(c.compiler)}, flags from ${c.mode})`;
+  } else if (c.status === "failed") {
+    cls = "failed";
+    line = `✖ ${(c.errors || []).length} compile error(s)`;
+    extra = (c.errors || []).slice(0, 10).map((e) =>
+      `<div class="rv-item rv-err"><span class="mk">✖</span><span>${escapeHtml(`${e.file}:${e.line}: ${e.message}`)}</span></div>`).join("");
+  } else if (c.status === "no_compiler" || c.status === "no_checkout") {
+    cls = "failed";
+    line = `⚠ ${c.log || "compile check could not run"}`;
+  } else {
+    line = "Ready to compile.";
+  }
+  const fix = c.status === "failed" && ready.ok
+    ? '<button class="rv-btn" id="rvFixCompile" title="Send the compiler errors to Claude and regenerate">✎ Fix with Claude</button>' : "";
+  return `<div class="rv-sec">Compile</div><div class="rv-compile ${cls}">
+    <div class="row1"><span class="msg-line">${escapeHtml(line)}</span>${compileButtonHtml("rvCompile")}${fix}</div>${extra}</div>`;
+}
+
+// ---- Build, run & profile on a device (Docker on this PC; phone later) ----
+const runPrefs = { target: "pc", prompt: "What is the capital of France?", tokens: 64, repeat: 3, cpus: "", memory: "",
+                   perLayer: true };
+let runLive = "";
+let runLayers = null;           // { lp, model } of the review shown, for its "Per-layer view" button
+
+function runSectionHtml(review) {
+  const v = review.verify || {};
+  const verified = v.status === "passed";
+  const r = review.run;
+  const dockerDown = buildState && buildState.docker === false;
+  const mb = (kb) => (kb ? `${Math.round(kb / 1024)} MB` : "?");
+  const tps = (x) => (x === null || x === undefined ? "?" : `${x} tok/s`);
+  let cls = "", line = "", extra = "";
+  if (!verified) {
+    cls = "waiting";
+    line = "⏸ Runs once the model has passed Verify (real weights only run on verified code).";
+  } else if (dockerDown) {
+    cls = "failed";
+    line = "⚠ Docker was not running at the last check: start Docker Desktop, then run (Docker is checked again first).";
+  } else if (r && r.ok) {
+    const s = r.summary || {};
+    cls = "ok";
+    line = `✓ Ran on ${r.device}: generation ${tps(s.generation_tps)}, prefill ${tps(s.prefill_tps)}, peak memory ${mb(r.peak_memory_kb)} (average of ${(r.runs || []).length} run(s))`;
+  } else if (r && !r.ok) {
+    cls = "failed";
+    line = `✖ Run failed: ${String(r.error || "see the Output panel").slice(0, 300)}`;
+  } else {
+    line = "Builds the model in Docker, loads it on this PC as an image, runs it with the real weights and profiles it.";
+  }
+  if (r && r.ok && r.text) {
+    extra += `<div class="run-out"><div class="run-lbl">Output</div><div class="run-text">${escapeHtml(r.text)}</div></div>`;
+  }
+  const lp = r && r.layer_profile;
+  runLayers = lp && (lp.layers || []).length ? { lp, model: review.model } : null;
+  if (runLayers) {
+    const pct = (x) => `${Number(x.pct || 0).toFixed(1)}%`;
+    const slowest = [...lp.layers].sort((a, b) => b.total_us - a.total_us).slice(0, 3);
+    extra += `<div class="run-lbl">Where the time goes (per-layer timing, whole run)</div>` +
+      (lp.types || []).slice(0, 3).map((x) => `<div class="rv-item"><span class="mk">·</span><span>${escapeHtml(x.key)}</span>` +
+        `<span class="src">${pct(x)} · prompt ${Number(x.prompt_pct || 0).toFixed(0)}% · generating ${Number(x.generation_pct || 0).toFixed(0)}%</span></div>`).join("") +
+      slowest.map((x) => `<div class="rv-item"><span class="mk">·</span><span>${escapeHtml(x.name)} (${escapeHtml(x.type)})</span>` +
+        `<span class="src">${pct(x)} · ${fmtMs(x.generation_avg_us)} ms per token</span></div>`).join("") +
+      `<div class="rv-item"><button class="rv-btn" id="rvLayers" title="Every layer in a table you can sort and filter, next to a map of the decoder blocks">⤢ All ${lp.layers.length} layers + block map</button></div>`;
+  } else if (lp && lp.error) {
+    extra += `<div class="rv-item rv-warn"><span class="mk">!</span><span>Per-layer timing did not run: ${escapeHtml(lp.error)}</span></div>`;
+  }
+  if (r && (r.runs || []).length) {
+    const rows = r.runs.map((x, i) => `<tr><td>${i + 1}</td><td>${x.error ? "✖" : tps(x.prefill_tps)}</td>
+      <td>${x.error ? escapeHtml(String(x.error).slice(0, 60)) : tps(x.generation_tps)}</td>
+      <td>${x.total_ms ?? "?"}</td><td>${mb(x.peak_memory_kb)}</td><td>${x.load_ms ? Math.round(x.load_ms) : "?"}</td></tr>`).join("");
+    extra += `<table class="run-tbl"><tr><th>#</th><th>prefill</th><th>generation</th><th>total ms</th><th>peak mem</th><th>load ms</th></tr>${rows}</table>`;
+  }
+  const hist = (review.runs || []).slice(1, 6).map((h) => {
+    const s = h.summary || {};
+    const lim = [h.cpus ? `${h.cpus} CPU` : "", h.memory ? h.memory : ""].filter(Boolean).join(", ") || "no limits";
+    return `<div class="rv-item"><span class="mk">·</span><span>${escapeHtml(String(h.at || "").replace("T", " ").slice(0, 16))} · ${escapeHtml(lim)} · gen ${tps(s.generation_tps)} · prefill ${tps(s.prefill_tps)}</span></div>`;
+  }).join("");
+  if (hist) extra += `<div class="run-lbl">Earlier runs</div>${hist}`;
+  if (runLive && reviewBusy) extra = `<div class="rv-item"><span class="mk">⏳</span><span id="runLive">${escapeHtml(runLive)}</span></div>` + extra;
+  // Not blocked on a remembered "Docker is down": the run checks Docker itself first.
+  const can = verified && !reviewBusy;
+  const form = `<div class="run-form">
+      <label>Device <select id="runTarget"><option value="pc">This PC (Docker)</option>
+        <option value="phone" disabled>Android phone (connect one with USB debugging)</option></select></label>
+      <label class="wide">Prompt <textarea id="runPrompt" rows="2">${escapeHtml(runPrefs.prompt)}</textarea></label>
+      <label>Tokens <input id="runTokens" type="number" min="1" max="2048" value="${runPrefs.tokens}"></label>
+      <label>Runs <input id="runRepeat" type="number" min="1" max="20" value="${runPrefs.repeat}"></label>
+      <label title="Imitate a smaller device: limit the CPUs (e.g. 2)">CPUs <input id="runCpus" placeholder="all" value="${escapeHtml(runPrefs.cpus)}"></label>
+      <label title="Imitate a smaller device: limit the memory (e.g. 4g)">Memory <input id="runMemory" placeholder="no limit" value="${escapeHtml(runPrefs.memory)}"></label>
+      <label class="chk" title="After the measured runs, run once more with nntrainer's own profiler for the time of every layer (the prompt apart from the generated tokens). The first time, Docker builds a second copy of nntrainer with the profiler on (about as long as the first build). The speeds still come from the normal runs.">
+        <span><input id="runPerLayer" type="checkbox"${runPrefs.perLayer ? " checked" : ""}> Per-layer timing</span></label>
+    </div>`;
+  const btn = `<button class="rv-btn ok" id="rvRun"${can ? "" : " disabled"} title="${escapeHtml(verified ? "Build in Docker, load on this PC, run and profile" : "Verify first")}">▶ Build, run &amp; profile</button>`;
+  return `<div class="rv-sec">Build, Run &amp; Profile on a device</div><div class="rv-compile ${cls}">
+    <div class="row1"><span class="msg-line">${escapeHtml(line)}</span>${btn}</div>${form}${extra}</div>`;
+}
+
+function wireRunSection() {
+  const ids = { runTarget: "target", runPrompt: "prompt", runTokens: "tokens", runRepeat: "repeat", runCpus: "cpus", runMemory: "memory" };
+  for (const [id, key] of Object.entries(ids)) {
+    const el = document.getElementById(id);
+    if (el) el.oninput = el.onchange = () => { runPrefs[key] = el.value; };
+  }
+  const perLayer = document.getElementById("runPerLayer");
+  if (perLayer) perLayer.onchange = () => { runPrefs.perLayer = perLayer.checked; };
+  const layersBtn = document.getElementById("rvLayers");
+  if (layersBtn) layersBtn.onclick = () => runLayers && openLayerView(runLayers.lp, runLayers.model);
+  const b = document.getElementById("rvRun");
+  if (b) b.onclick = () => {
+    runLive = "Starting...";
+    codegenAction("run", "", { ...runPrefs });
+  };
+}
+
+// ---- Docker setup check (engine/knowledge/preflight.py) ----
+// Runs on request and by itself before Docker setup, Verify and Run; the
+// last result is shown here, problems first, each with its fix.
+let preflightState = null;      // last preflight event
+
+function preflightSectionHtml() {
+  const p = preflightState;
+  const btn = `<button class="rv-btn" id="rvPreflight" title="Check Docker (running, x86-64, memory, disk), the git submodules, the Python environment, the Claude CLI and the network"${reviewBusy ? " disabled" : ""}>${p ? "↻ Check again" : "▶ Check Docker setup"}</button>`;
+  if (!p) {
+    return `<div class="rv-sec">Docker setup</div><div class="rv-compile"><div class="row1"><span class="msg-line">Not checked yet. The check also runs by itself before Docker setup, Verify and Run.</span>${btn}</div></div>`;
+  }
+  const cls = !p.ok ? "failed" : (p.counts && p.counts.warn ? "waiting" : "ok");
+  const mark = { fail: "✖", warn: "!" };
+  const problems = (p.checks || []).filter((c) => c.status === "fail" || c.status === "warn").map((c) =>
+    `<div class="rv-item ${c.status === "fail" ? "rv-err" : "rv-warn"}"><span class="mk">${mark[c.status]}</span>` +
+    `<span>${escapeHtml(c.label)}: ${escapeHtml(c.detail)}${c.fix ? `<br><span class="fix">Fix: ${escapeHtml(c.fix)}</span>` : ""}</span></div>`).join("");
+  const passed = (p.checks || []).filter((c) => c.status === "pass").map((c) => c.label);
+  const okRow = passed.length ? `<div class="rv-item"><span class="mk rv-ok">✓</span><span>${escapeHtml(passed.join(" · "))}</span></div>` : "";
+  return `<div class="rv-sec">Docker setup</div><div class="rv-compile ${cls}"><div class="row1"><span class="msg-line">${escapeHtml(p.summary)}</span>${btn}</div>${problems}${okRow}</div>`;
+}
+
+// ---- Verify (build + run vs a tiny Hugging Face copy of the architecture) ----
+let buildState = null;          // last build_status event from engine/agents/build_setup.py
+let buildStatusAsked = false;
+
+function verifySectionHtml(review) {
+  const v = review.verify || { status: "not_run" };
+  const ready = (review.compile_ready || {}).ok;
+  const buildReady = !!(buildState && buildState.ok && !(buildState.missing || []).length);
+  const num = (x) => (x === null || x === undefined ? "?" : Number(x).toPrecision(3));
+  const item = (text, err) => `<div class="rv-item${err ? " rv-err" : ""}"><span class="mk">${err ? "✖" : "·"}</span><span>${escapeHtml(text)}</span></div>`;
+  let cls = "", line = "", extra = "";
+  if (v.status === "passed") {
+    cls = "ok";
+    line = `✓ Matches Hugging Face: max |logit diff| ${num(v.max_abs_diff)} (atol ${v.atol}), greedy tokens ${JSON.stringify(v.tokens_got)} match`;
+    const n = (v.marked_verified || []).length;
+    extra = item(n ? `${n} approved part(s) are now verified in the code bank and will be reused for other models.`
+      : "Every part was already verified.");
+  } else if (v.status === "mismatch") {
+    cls = "failed";
+    line = `✖ Does not match Hugging Face: max |logit diff| ${num(v.max_abs_diff)} (atol ${v.atol}); tokens ${JSON.stringify(v.tokens_got)} vs ${JSON.stringify(v.tokens_ref)}`;
+    const more = (v.failed_checks || 0) > 4 ? item(`... ${v.failed_checks - 4} more failed check(s) (Output panel / review.json)`, true) : "";
+    extra = (v.failures || []).slice(0, 4).map((f) => item(f.replace(/\s+/g, " ").slice(0, 240), true)).join("") + more
+      + ((v.marked_failed || []).length ? item(`${v.marked_failed.length} part(s) marked "failed verification" in the bank -- fix them, then approve again.`, true) : "");
+  } else if (v.status === "build_failed") {
+    cls = "failed";
+    line = `✖ ${(v.errors || []).length} build error(s)`;
+    extra = (v.errors || []).slice(0, 8).map((e) => item(`${e.file}:${e.line}: ${e.message}`, true)).join("");
+  } else if (["crashed", "fixture_failed", "error"].includes(v.status)) {
+    cls = "failed";
+    const label = { crashed: "The model threw or crashed", fixture_failed: "The Hugging Face fixture could not be made", error: "Verify could not run" }[v.status];
+    line = `⚠ ${label}`;
+    extra = item(String(v.error || (v.failures || [])[0] || v.log || "").replace(/\s+/g, " ").slice(-400), true);
+  } else if (v.status === "no_build" || (buildState && !buildReady)) {
+    cls = "waiting";
+    line = "Set up the nntrainer build once (MSVC / meson, in the workbench folder) to verify against Hugging Face.";
+  } else if (!ready) {
+    cls = "waiting";
+    line = "⏸ Verify runs once nothing is waiting for review.";
+  } else {
+    line = "Builds the model and runs it on a tiny random-weight copy of the architecture next to Hugging Face (fp32 logits within 0.01 + greedy tokens).";
+  }
+  const verifyBtn = `<button class="rv-btn ok" id="rvVerify" title="${escapeHtml(ready ? "Build and compare with Hugging Face" : "Not yet: " + ((review.compile_ready || {}).why || ""))}"${ready && !reviewBusy ? "" : " disabled"}>${v.status === "not_run" ? "▶ Verify" : "↻ Verify again"}</button>`;
+  const fixable = ["mismatch", "build_failed", "crashed", "fixture_failed"].includes(v.status);
+  const fix = fixable ? '<button class="rv-btn" id="rvFixVerify" title="Send the failure to Claude and regenerate (then review again)">✎ Fix with Claude</button>' : "";
+  const setup = buildState && !buildReady ? '<button class="rv-btn" id="rvSetupBuild" title="Configure + build nntrainer in tools/agentic-ai-workbench/nb">⚙ Set up build</button>' : "";
+  return `<div class="rv-sec">Verify vs Hugging Face</div><div class="rv-compile ${cls}">
+    <div class="row1"><span class="msg-line">${escapeHtml(line)}</span>${setup}${verifyBtn}${fix}</div>${extra}</div>`;
+}
+
+function renderCode(content) {
+  const escaped = escapeHtml(content);
+  const highlighted = escaped
+    .replace(/(\/\/.*)/g, '<span class="tok-com">$1</span>')
+    .replace(/(&quot;.*?&quot;)/g, '<span class="tok-str">$1</span>')
+    .replace(/\b(auto|using|namespace|return|std|void|int|const|include|shared_ptr|make_shared|model|addLayer)\b/g, '<span class="tok-kw">$1</span>')
+    .replace(/^(#.*)/gm, '<span class="tok-pre">$1</span>');
+  document.getElementById("codeViewer").innerHTML = highlighted;
+}
+
+const PROF_LABELS = ["Avg Latency", "Layers", "Target", "Weights"];
+
+function setProfTile(id, value, label) {
+  const v = document.getElementById(id);
+  v.textContent = value;
+  if (label && v.nextElementSibling) v.nextElementSibling.textContent = label;
+}
+
+// A generated model run with its real weights (knowledge/run_model.py).
+function renderLlmRun(p) {
+  const s = p.summary || {};
+  const list = document.getElementById("bottleneckList");
+  list.innerHTML = "";
+  const lim = [p.cpus ? `${p.cpus} CPUs` : "", p.memory ? `${p.memory} memory` : ""].filter(Boolean).join(", ");
+  document.getElementById("profNote").textContent = p.ran
+    ? `${p.for} on ${p.device}${lim ? " (limited to " + lim + ")" : ""}`
+    : "Run failed: " + (p.reason || "unknown");
+  setProfTile("profTotal", s.generation_tps != null ? `${s.generation_tps}` : "—", "Generation tok/s");
+  setProfTile("profLayers", s.prefill_tps != null ? `${s.prefill_tps}` : "—", "Prefill tok/s");
+  setProfTile("profArch", p.peak_memory_kb ? `${Math.round(p.peak_memory_kb / 1024)} MB` : "—", "Peak memory");
+  setProfTile("profWeights", s.total_ms != null ? `${Math.round(s.total_ms)} ms` : "—", "Total per run");
+  lastLlmProfile = p;
+  const lp = p.layer_profile;
+  if (lp && (lp.layers || []).length) {
+    renderLayerSummary(list, lp, p.for);
+  } else if (lp && lp.error) {
+    const note = document.createElement("div");
+    note.className = "prof-note";
+    note.textContent = "Per-layer timing did not run: " + lp.error;
+    list.appendChild(note);
+  }
+  if (!(p.runs || []).length) return;
+  const hdr = document.createElement("div");
+  hdr.style.cssText = "font-size:10px; text-transform:uppercase; color:var(--muted); margin: 8px 0 4px;";
+  hdr.textContent = "Generation speed per run";
+  list.appendChild(hdr);
+  const max = Math.max(...p.runs.map((r) => r.generation_tps || 0), 1);
+  p.runs.forEach((r, i) => {
+    const row = document.createElement("div");
+    row.className = "bottleneck-row";
+    const pct = r.generation_tps ? (100 * r.generation_tps) / max : 0;
+    row.innerHTML = `
+      <span class="bn-name">run ${i + 1}</span>
+      <span class="bn-bar-wrap"><span class="bn-bar" style="width:${pct}%"></span></span>
+      <span class="bn-pct">${r.error ? "failed" : (r.generation_tps ?? "?") + " t/s"}</span>`;
+    list.appendChild(row);
+  });
+}
+
+// ---- Per-layer timing (knowledge/run_model.profile_layers) ----
+// A run reads the whole prompt in one inference call, then makes one call per
+// generated token. Every view shows the whole run, the prompt or the
+// generated tokens (layerPhase).
+let layerPhase = "all";
+let lastLlmProfile = null;      // the last llm_run profile event (Profiler panel)
+let layerView = null;           // { lp, model } in the per-layer overlay
+const lpState = { sort: "share", desc: true, type: "", q: "", all: false, sel: null };
+const PHASE_LABEL = { all: "Whole run", prompt: "Prompt", generation: "Generating" };
+const PHASE_TITLE = { all: "Every call of the run: the prompt and all generated tokens",
+                      prompt: "The one call that reads the whole prompt",
+                      generation: "The calls that generate the tokens, one per token" };
+const LP_SHOWN = 40;
+
+function fmtMs(us) {
+  if (us === null || us === undefined) return "—";
+  const ms = us / 1000;
+  return ms >= 100 ? ms.toFixed(0) : ms >= 1 ? ms.toFixed(1) : ms.toFixed(2);
+}
+function phaseShare(x, ph) { return (ph === "prompt" ? x.prompt_pct : ph === "generation" ? x.generation_pct : x.pct) || 0; }
+function phaseTotal(x, ph) { return (ph === "prompt" ? x.prompt_us : ph === "generation" ? x.generation_us : x.total_us) || 0; }
+function perCall(x, ph) {      // as run_model.per_call_us
+  if (ph === "prompt") return x.prompt_us || 0;
+  if (ph === "generation") return x.generation_avg_us || 0;
+  return (x.total_us || 0) / Math.max(1, (x.prompt_calls || 0) + (x.generation_calls || 0));
+}
+function phaseToggleHtml() {
+  return `<span class="phase-tog">${Object.entries(PHASE_LABEL).map(([k, v]) =>
+    `<button data-phase="${k}" class="${k === layerPhase ? "on" : ""}" title="${escapeHtml(PHASE_TITLE[k])}">${v}</button>`).join("")}</span>`;
+}
+function wirePhaseToggles(root) {
+  root.querySelectorAll(".phase-tog button").forEach((b) => { b.onclick = () => setLayerPhase(b.dataset.phase); });
+}
+function setLayerPhase(ph) {
+  layerPhase = ph;
+  lpState.sort = "share";
+  lpState.desc = true;
+  if (lastLlmProfile) renderLlmRun(lastLlmProfile);
+  if (layerView && !document.getElementById("layerOverlay").hidden) renderLayerView();
+}
+function barRow(label, share, top, title) {
+  const row = document.createElement("div");
+  row.className = "bottleneck-row";
+  row.title = title || "";
+  row.innerHTML = `
+    <span class="bn-name">${escapeHtml(label)}</span>
+    <span class="bn-bar-wrap"><span class="bn-bar" style="width:${(100 * share) / top}%"></span></span>
+    <span class="bn-pct">${share.toFixed(1)}%</span>`;
+  return row;
+}
+
+// The Profiler panel: layer types and the slowest layers of the chosen phase.
+function renderLayerSummary(list, lp, model) {
+  const ph = layerPhase;
+  const hd = document.createElement("div");
+  hd.className = "lp-sum-hdr";
+  hd.innerHTML = `<span>Where the time goes</span>${phaseToggleHtml()}`;
+  list.appendChild(hd);
+  wirePhaseToggles(hd);
+  const sub = (t) => {
+    const d = document.createElement("div");
+    d.className = "lp-sub";
+    d.textContent = t;
+    list.appendChild(d);
+  };
+  const byPhase = (rows) => [...rows].sort((a, b) => phaseTotal(b, ph) - phaseTotal(a, ph));
+  sub("Per layer type");
+  const types = byPhase(lp.types || []).slice(0, 6);
+  const topT = Math.max(...types.map((x) => phaseShare(x, ph)), 1);
+  types.forEach((x) => list.appendChild(barRow(x.key, phaseShare(x, ph), topT,
+    `${x.key}: ${fmtMs(phaseTotal(x, ph))} ms (${PHASE_LABEL[ph].toLowerCase()})`)));
+  sub("Slowest layers");
+  const layers = byPhase(lp.layers).slice(0, 8);
+  const topL = Math.max(...layers.map((x) => phaseShare(x, ph)), 1);
+  layers.forEach((x) => list.appendChild(barRow(`${x.name} (${x.type})`, phaseShare(x, ph), topL,
+    `${fmtMs(perCall(x, ph))} ms per call${x.gbps ? ` · ${x.gbps} GB/s while generating` : ""}`)));
+  const btn = document.createElement("button");
+  btn.className = "rv-btn lp-open";
+  btn.textContent = `⤢ All ${lp.layers.length} layers + block map`;
+  btn.title = "Every layer of the profiled run in a table you can sort and filter, next to a map of the decoder blocks";
+  btn.onclick = () => openLayerView(lp, model);
+  list.appendChild(btn);
+}
+
+function openLayerView(lp, model) {
+  if (!lp || !(lp.layers || []).length) return;
+  layerView = { lp, model };
+  Object.assign(lpState, { sort: "share", desc: true, type: "", q: "", all: false, sel: null });
+  document.getElementById("layerOverlay").hidden = false;
+  renderLayerFilters();
+  renderLayerView();
+}
+function closeLayerView() { document.getElementById("layerOverlay").hidden = true; }
+
+function renderLayerView() {
+  const { lp, model } = layerView;
+  document.getElementById("lpTitle").textContent = `Per-layer timing${model ? " · " + model : ""}`;
+  const phaseEl = document.getElementById("lpPhase");
+  phaseEl.innerHTML = phaseToggleHtml();
+  wirePhaseToggles(phaseEl);
+  const r = lp.run || {}, t = lp.totals || {};
+  document.getElementById("lpMeta").innerHTML =
+    `<b>${lp.layers.length}</b> layers · prompt: <b>1</b> call (${escapeHtml(String(r.prefill_tokens ?? "?"))} tokens), ` +
+    `<b>${fmtMs(t.prompt_us)}</b> ms in layers · generating: <b>${lp.generation_calls}</b> calls (one per token), ` +
+    `<b>${fmtMs(t.generation_us)}</b> ms · ${escapeHtml(lp.note || "")}`;
+  renderLayerMap();
+  renderLayerTable();
+}
+
+function renderLayerMap() {
+  const { lp } = layerView, ph = layerPhase, m = lp.map || {};
+  const el = document.getElementById("lpMap");
+  // The layers outside the decoder blocks (the output head, ...) that matter in this phase.
+  const outside = lp.layers.map((x, i) => ({ x, i }))
+    .filter((o) => (o.x.block === null || o.x.block === undefined) && phaseShare(o.x, ph) >= 0.5)
+    .sort((a, b) => phaseTotal(b.x, ph) - phaseTotal(a.x, ph)).slice(0, 4);
+  const outsideHtml = outside.length ? `<div class="lp-legend">Outside the blocks: ${outside.map((o) =>
+    `<a href="#" class="lp-outside" data-i="${o.i}">${escapeHtml(o.x.name)}</a> (${escapeHtml(o.x.type)}) ` +
+    `${phaseShare(o.x, ph).toFixed(1)}%, ${fmtMs(perCall(o.x, ph))} ms per call`).join("; ")}</div>` : "";
+  const wireOutside = () => el.querySelectorAll(".lp-outside").forEach((a) => {
+    a.onclick = (e) => { e.preventDefault(); selectLayer(Number(a.dataset.i)); };
+  });
+  if (!(m.roles || []).length) {
+    el.innerHTML = '<div class="prof-note">No decoder blocks in this model\'s layer names (layer&lt;N&gt;_…).</div>' + outsideHtml;
+    wireOutside();
+    return;
+  }
+  const vals = [];
+  m.grid.forEach((row) => row.forEach((i) => { if (i !== null) vals.push(perCall(lp.layers[i], ph)); }));
+  const max = Math.max(...vals, 1);
+  const out = new Set((m.outliers || {})[ph] || []);
+  let html = `<div class="lp-map" style="grid-template-columns: 30px repeat(${m.roles.length}, 24px)"><div></div>` +
+    m.roles.map((role) => `<div class="hd" title="${escapeHtml(role)}">${escapeHtml(role)}</div>`).join("");
+  m.grid.forEach((row, bi) => {
+    html += `<div class="bl">${m.blocks[bi]}</div>`;
+    row.forEach((i) => {
+      if (i === null) {
+        html += "<div></div>";
+        return;
+      }
+      const x = lp.layers[i], v = perCall(x, ph), a = 0.08 + 0.92 * (v / max);
+      html += `<div class="c${out.has(i) ? " out" : ""}${lpState.sel === i ? " sel" : ""}" data-i="${i}" ` +
+        `style="background: rgba(224,108,117,${a.toFixed(3)})" title="${escapeHtml(x.name)} · ${fmtMs(v)} ms per call` +
+        `${out.has(i) ? " · much slower than this layer in the other blocks" : ""}"></div>`;
+    });
+  });
+  el.innerHTML = html + `</div><div class="lp-legend">Colour: time per call (${PHASE_LABEL[ph].toLowerCase()}); the darkest is ` +
+    `${fmtMs(max)} ms. <span class="out-key"></span> more than 1.5× the same layer's median over the blocks, ` +
+    `by at least 1% of the ${ph === "prompt" ? "prompt's" : "average"} call.</div>` + outsideHtml;
+  el.querySelectorAll(".c[data-i]").forEach((c) => { c.onclick = () => selectLayer(Number(c.dataset.i)); });
+  wireOutside();
+}
+
+const LP_COLS = [
+  { k: "order", t: "#", title: "The order the layers ran in" },
+  { k: "name", t: "Layer", l: true },
+  { k: "type", t: "Type", l: true },
+  { k: "block", t: "Block" },
+  { k: "prompt_us", t: "Prompt ms", title: "The prompt's one call" },
+  { k: "generation_avg_us", t: "ms / token", title: "Average per generated token" },
+  { k: "total_us", t: "Total ms", title: "The whole run" },
+  { k: "share", t: "Share", title: "Of all layers' time in the chosen phase" },
+  { k: "gbps", t: "GB/s", title: "The layer's weights (read once per generated token) / its time per token; layers with at least 1 MB of weights" },
+];
+
+function renderLayerFilters() {
+  const { lp } = layerView;
+  const types = [...new Set(lp.layers.map((x) => x.type))].sort();
+  const f = document.getElementById("lpFilters");
+  f.innerHTML = `<label>Type <select id="lpType"><option value="">all</option>${types.map((t) =>
+      `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("")}</select></label>
+    <label>Find <input id="lpQ" type="text" placeholder="layer name"></label>
+    <label><input id="lpAll" type="checkbox"> Show all</label><span id="lpCount" class="muted"></span>`;
+  const sel = document.getElementById("lpType"), q = document.getElementById("lpQ"), all = document.getElementById("lpAll");
+  sel.value = lpState.type;
+  q.value = lpState.q;
+  all.checked = lpState.all;
+  sel.onchange = () => { lpState.type = sel.value; renderLayerTable(); };
+  q.oninput = () => { lpState.q = q.value; renderLayerTable(); };
+  all.onchange = () => { lpState.all = all.checked; renderLayerTable(); };
+}
+
+function layerRows() {
+  const { lp } = layerView, ph = layerPhase, k = lpState.sort;
+  let rows = lp.layers.map((x, i) => ({ x, i }));
+  if (lpState.type) rows = rows.filter((r) => r.x.type === lpState.type);
+  if (lpState.q) {
+    const q = lpState.q.toLowerCase();
+    rows = rows.filter((r) => r.x.name.toLowerCase().includes(q));
+  }
+  const val = (r) => (k === "order" ? r.i : k === "share" ? phaseShare(r.x, ph) : r.x[k] ?? -1);
+  rows.sort((a, b) => {
+    const va = val(a), vb = val(b);
+    const c = typeof va === "string" || typeof vb === "string" ? String(va).localeCompare(String(vb)) : va - vb;
+    return lpState.desc ? -c : c;
+  });
+  return rows;
+}
+
+function renderLayerTable() {
+  const { lp } = layerView, ph = layerPhase;
+  const rows = layerRows();
+  const shown = lpState.all ? rows : rows.slice(0, LP_SHOWN);
+  const topShare = Math.max(...rows.map((r) => phaseShare(r.x, ph)), 1);
+  const hottest = new Set(lp.layers.map((x, i) => ({ v: phaseTotal(x, ph), i }))
+    .sort((a, b) => b.v - a.v).slice(0, 5).map((o) => o.i));
+  const head = LP_COLS.map((c) => `<th class="${c.l ? "l" : ""}${c.k === lpState.sort ? " on" : ""}" data-k="${c.k}"` +
+    ` title="${escapeHtml(c.title || "Sort")}">${c.t}${c.k === lpState.sort ? (lpState.desc ? " ▾" : " ▴") : ""}</th>`).join("");
+  const body = shown.map(({ x, i }) => `<tr data-i="${i}" class="${lpState.sel === i ? "sel" : ""}">
+      <td>${hottest.has(i) ? '<span class="hot" title="One of the 5 slowest layers in this phase">●</span> ' : ""}${i + 1}</td>
+      <td class="l name" title="${escapeHtml(x.name + " · " + x.op)}">${escapeHtml(x.name)}</td>
+      <td class="l">${escapeHtml(x.type)}</td>
+      <td>${x.block ?? ""}</td>
+      <td>${fmtMs(x.prompt_us)}</td>
+      <td>${x.generation_calls ? fmtMs(x.generation_avg_us) : "—"}</td>
+      <td>${fmtMs(x.total_us)}</td>
+      <td><span class="bar" style="width:${(40 * phaseShare(x, ph)) / topShare}px"></span>${phaseShare(x, ph).toFixed(1)}%</td>
+      <td title="${x.weight_mb ? escapeHtml(x.weight_mb + " MB of weights") : ""}">${x.gbps ?? ""}</td></tr>`).join("");
+  const tbl = document.getElementById("lpTable");
+  tbl.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
+  document.getElementById("lpCount").textContent = `${shown.length} of ${rows.length} layer(s)`;
+  tbl.querySelectorAll("th[data-k]").forEach((th) => {
+    th.onclick = () => {
+      const k = th.dataset.k;
+      if (lpState.sort === k) lpState.desc = !lpState.desc;
+      else {
+        lpState.sort = k;
+        lpState.desc = !["order", "name", "type", "block"].includes(k);   // numbers: biggest first
+      }
+      renderLayerTable();
+    };
+  });
+  tbl.querySelectorAll("tbody tr[data-i]").forEach((tr) => { tr.onclick = () => selectLayer(Number(tr.dataset.i)); });
+}
+
+function selectLayer(i) {
+  lpState.sel = i;
+  renderLayerMap();
+  renderLayerTable();
+  let tr = document.querySelector(`#lpTable tr[data-i="${i}"]`);
+  if (!tr) {                     // hidden by a filter or the top-40 limit: show every layer
+    Object.assign(lpState, { type: "", q: "", all: true });
+    renderLayerFilters();
+    renderLayerTable();
+    tr = document.querySelector(`#lpTable tr[data-i="${i}"]`);
+  }
+  if (tr) tr.scrollIntoView({ block: "center" });
+}
+
+document.getElementById("lpClose").onclick = closeLayerView;
+document.getElementById("layerOverlay").addEventListener("click", (e) => { if (e.target.id === "layerOverlay") closeLayerView(); });
+
+function renderProfile(p) {
+  if (p && p.kind === "llm_run") return renderLlmRun(p);
+  ["profTotal", "profLayers", "profArch", "profWeights"].forEach((id, i) => setProfTile(id, "—", PROF_LABELS[i]));
+  document.getElementById("profNote").textContent = p.note || (p.ran ? "" : "Not run: " + (p.reason || "unknown"));
+  document.getElementById("bottleneckList").innerHTML = "";
+
+  if (!p.ran) {
+    document.getElementById("profTotal").textContent = "—";
+    document.getElementById("profLayers").textContent = "—";
+    document.getElementById("profArch").textContent = "—";
+    document.getElementById("profWeights").textContent = "—";
+    return;
+  }
+
+  const avgMs = p.avg_ms !== undefined ? p.avg_ms : p.total_latency_ms;
+  document.getElementById("profTotal").textContent = avgMs.toFixed(2) + " ms";
+  document.getElementById("profLayers").textContent = p.layers.length;
+  document.getElementById("profArch").textContent = p.arch || "smoke-test";
+  document.getElementById("profWeights").textContent =
+    p.weights_loaded === undefined ? "—" : (p.weights_loaded ? "Real" : "Random init");
+
+  // Bottleneck ranking -- only present on real device-profiler runs
+  // (params/share_pct fields), not the basic post-compile smoke test.
+  const withShare = p.layers.filter(l => l.share_pct !== undefined);
+  if (withShare.length) {
+    const top = [...withShare].sort((a, b) => b.estimated_ms - a.estimated_ms).slice(0, 8);
+    const list = document.getElementById("bottleneckList");
+    const hdr = document.createElement("div");
+    hdr.style.cssText = "font-size:10px; text-transform:uppercase; color:var(--muted); margin: 8px 0 4px;";
+    hdr.textContent = "Likely Bottleneck Layers";
+    list.appendChild(hdr);
+    top.forEach(l => {
+      const row = document.createElement("div");
+      row.className = "bottleneck-row";
+      row.innerHTML = `
+        <span class="bn-name" title="${escapeHtml(l.name)}">${escapeHtml(l.name)}</span>
+        <span class="bn-bar-wrap"><span class="bn-bar" style="width:${l.share_pct}%"></span></span>
+        <span class="bn-pct">${l.share_pct.toFixed(1)}%</span>`;
+      list.appendChild(row);
+    });
+  }
+}
+
+function renderArtifacts(items) {
+  const body = document.getElementById("artifactsBody");
+  body.innerHTML = "";
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "artifact-row";
+    const kb = (item.size_bytes / 1024).toFixed(1);
+    row.innerHTML = `<span class="path">${escapeHtml(item.path)}</span><span class="size">${kb} KB</span>`;
+    row.onclick = () => vscode.postMessage({ type: "openGeneratedFile", filename: item.path.split("/").pop() });
+    body.appendChild(row);
+  }
+}
+
+// =========================================================================
+// Review tab: the Claude CLI's generated code (engine knowledge/codegen.py).
+// Verified code is inherited or copied unchanged; only new parts need review.
+// =========================================================================
+let currentReview = null;
+let openPartId = null;
+let reviewBusy = false;
+
+const STATUS_LABEL = {
+  verified: "verified", generated: "needs review", needs_verification: "needs review",
+  approved: "approved", accepted: "accepted", rejected: "rejected", failed_checks: "failed checks",
+  failed_verification: "failed verify",
+};
+const FINAL_STATUS = ["approved", "accepted", "rejected"];
+
+function partAction(p) {
+  if (p.kind === "converter") return p.action === "copy"
+    ? (p.status === "needs_verification" ? "reuses an upstream converter (not verified)" : "reuses a verified converter")
+    : "new weight converter (Claude)";
+  if (p.kind === "layer") return "new custom layer (Claude)";
+  if (p.action === "write") return "new code (Claude)";
+  const verb = p.action === "inherit" ? "inherits" : "copies";
+  return p.status === "needs_verification" || p.source_status === "approved"
+    ? `${verb} upstream code (not covered by a reference test)` : `${verb} verified code`;
+}
+
+function setReviewBusy(busy, what) {
+  reviewBusy = busy;
+  document.getElementById("ovBusy").textContent = busy ? `${what || "working"}…` : "";
+  if (busy) {
+    document.querySelectorAll("#reviewBody .rv-btn, #codeBar .rv-btn, .ov-btns button").forEach((b) => { b.disabled = true; });
+    return;
+  }
+  if (currentReview) renderReview(currentReview);     // restores every button's real state
+  else if (openPartId) openPart(openPartId, true);
+  renderCodeBar();
+}
+
+function codegenAction(action, partId, run) {
+  if (reviewBusy) return;
+  const comment = document.getElementById("ovComment").value.trim();
+  if (action === "regenerate" && !comment) {
+    document.getElementById("ovComment").focus();
+    addLog("Regenerate: write what should change in the comment box first.", "warn");
+    return;
+  }
+  setReviewBusy(true, action);
+  vscode.postMessage({ type: "codegenAction", action, partId, run,
+                       comment: ["recheck", "compile", "fixcompile", "verify", "fixverify", "run"].includes(action) ? "" : comment });
+}
+
+function renderReview(review) {
+  currentReview = review;
+  const v = review.validation || {};
+  const toReview = (review.summary && review.summary.to_review) || 0;
+  document.getElementById("reviewBadge").textContent = toReview ? String(toReview) : "";
+  const parts = review.parts.map((p) => {
+    const why = p.evidence && p.evidence.length ? p.evidence.join("; ")
+      : (p.source_entry ? "from " + p.source_entry : "");
+    return `<div class="rv-part" data-part="${escapeHtml(p.id)}">
+      <div class="row1"><span class="hook">${escapeHtml(p.hook)}</span>
+        <span class="chip ${escapeHtml(p.status)}">${escapeHtml(STATUS_LABEL[p.status] || p.status)}</span></div>
+      <div class="why">${escapeHtml(partAction(p))}</div>
+      ${why ? `<div class="why">${escapeHtml(why)}</div>` : ""}</div>`;
+  }).join("");
+  const checks = v.ok
+    ? `<div class="rv-item"><span class="mk rv-ok">✓</span><span>Every check passed${review.attempts ? ` (attempt ${review.attempts})` : ""}.</span></div>`
+    : (v.errors || []).map((e) => `<div class="rv-item rv-err"><span class="mk">✖</span><span>${escapeHtml(e)}</span></div>`).join("");
+  const warns = (v.warnings || []).map((w) => `<div class="rv-item rv-warn"><span class="mk">!</span><span>${escapeHtml(w)}</span></div>`).join("");
+  const ticked = review.checklist.ticked.map((f) => `<div class="rv-item"><span class="mk">${f.uncertain ? "[?]" : "[x]"}</span>
+      <span>${escapeHtml(f.label)}</span><span class="src">${escapeHtml(f.source === "learned" ? "learned" : (f.from || []).join(", "))}</span></div>`).join("");
+  const news = (review.checklist.new_parts || []).map((n) => `<div class="rv-item new"><span class="mk">[!]</span>
+      <span>${escapeHtml(n.what)}</span><span class="src">${escapeHtml(n.hook)}</span></div>`).join("")
+    || `<div class="rv-item"><span class="mk rv-ok">✓</span><span>Every tensor and config key is explained by a box.</span></div>`;
+  const other = Object.entries(review.other_config || {}).map(([k, val]) => `<div class="rv-item new"><span class="mk">[!]</span>
+      <span>config ${escapeHtml(k)} = ${escapeHtml(JSON.stringify(val))} — check whether it changes the computation</span></div>`).join("");
+  document.getElementById("reviewBody").innerHTML = `
+    <div class="rv-head"><div class="rv-title">${escapeHtml(review.model)}</div>
+      <div class="rv-sub">${escapeHtml(review.generator)} · ${escapeHtml(review.out_dir)}</div>
+      <div><button class="rv-btn" id="rvRecheck" title="Re-validate the files after editing them">↻ Re-check edits</button></div></div>
+    <div class="rv-sec">Parts (click one to review it)</div>${parts}
+    ${compileSectionHtml(review)}
+    ${preflightSectionHtml()}
+    ${verifySectionHtml(review)}
+    ${runSectionHtml(review)}
+    <div class="rv-sec">Checks</div>${checks}${warns}
+    <div class="rv-sec">Checklist</div>${ticked}${news}${other}`;
+  document.querySelectorAll("#reviewBody .rv-part").forEach((el) => { el.onclick = () => openPart(el.dataset.part); });
+  document.getElementById("rvRecheck").onclick = () => codegenAction("recheck", "");
+  wireCompileButton("rvCompile");
+  const fixBtn = document.getElementById("rvFixCompile");
+  if (fixBtn) fixBtn.onclick = () => codegenAction("fixcompile", "");
+  const verifyBtn = document.getElementById("rvVerify");
+  if (verifyBtn) verifyBtn.onclick = () => codegenAction("verify", "");
+  const fixVerifyBtn = document.getElementById("rvFixVerify");
+  if (fixVerifyBtn) fixVerifyBtn.onclick = () => codegenAction("fixverify", "");
+  wireRunSection();
+  const setupBtn = document.getElementById("rvSetupBuild");
+  if (setupBtn) setupBtn.onclick = () => { setupBtn.disabled = true; vscode.postMessage({ type: "setupBuild" }); };
+  const preflightBtn = document.getElementById("rvPreflight");
+  if (preflightBtn) preflightBtn.onclick = () => {
+    preflightBtn.disabled = true;
+    preflightBtn.textContent = "Checking…";
+    vscode.postMessage({ type: "preflightCheck" });
+  };
+  if (!buildStatusAsked) {
+    buildStatusAsked = true;
+    vscode.postMessage({ type: "buildStatus" });
+  }
+  renderCodeBar();
+  if (reviewBusy) setReviewBusy(true);
+  if (openPartId) openPart(openPartId, true);
+}
+
+// Line diff (LCS) with unchanged runs collapsed to a few lines of context.
+function lineDiff(a, b) {
+  const A = a.split("\n"), B = b.split("\n");
+  const n = A.length, m = B.length;
+  if (n * m > 600000) return null;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = A[i].trim() === B[j].trim() ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i].trim() === B[j].trim()) { out.push([" ", B[j]]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(["-", A[i]]); i++; }
+    else { out.push(["+", B[j]]); j++; }
+  }
+  while (i < n) out.push(["-", A[i++]]);
+  while (j < m) out.push(["+", B[j++]]);
+  return out;
+}
+
+function renderDiff(rows) {
+  const keep = new Set();
+  rows.forEach((r, k) => { if (r[0] !== " ") for (let d = -3; d <= 3; d++) keep.add(k + d); });
+  const html = [];
+  let skipped = 0;
+  rows.forEach((r, k) => {
+    if (r[0] === " " && !keep.has(k)) { skipped++; return; }
+    if (skipped) { html.push(`<span class="d-gap">… ${skipped} unchanged line(s)</span>`); skipped = 0; }
+    const cls = r[0] === "+" ? "d-add" : r[0] === "-" ? "d-del" : "";
+    const line = escapeHtml(r[0] + " " + r[1]);
+    html.push(cls ? `<span class="${cls}">${line}</span>` : line + "\n");
+  });
+  if (skipped) html.push(`<span class="d-gap">… ${skipped} unchanged line(s)</span>`);
+  return html.join("");
+}
+
+function openPart(id, refresh) {
+  const p = currentReview && currentReview.parts.find((x) => x.id === id);
+  const overlay = document.getElementById("reviewOverlay");
+  if (!p) { overlay.hidden = true; openPartId = null; return; }
+  if (refresh && overlay.hidden) return;
+  const same = openPartId === id && !overlay.hidden;
+  openPartId = id;
+  document.getElementById("ovTitle").textContent = `${p.hook} — ${partAction(p)}`;
+  const st = document.getElementById("ovStatus");
+  st.className = "chip " + p.status;
+  st.textContent = STATUS_LABEL[p.status] || p.status;
+
+  const meta = [];
+  const label = Object.fromEntries((currentReview.checklist.ticked || []).map((f) => [f.id, f.label]));
+  if (p.features && p.features.length) meta.push(`<b>Implements:</b> ${escapeHtml(p.features.map((f) => label[f] || f).join("; "))}`);
+  if (p.evidence && p.evidence.length) meta.push(`<b>Why it is new:</b> ${escapeHtml(p.evidence.join("; "))}`);
+  if (p.source_entry) meta.push(`<b>Code from:</b> ${escapeHtml(p.source_entry)} (${escapeHtml(p.source_status || "")})`);
+  if (p.start_from && p.start_from.length && p.action === "write") meta.push(`<b>Started from:</b> ${escapeHtml(p.start_from.join(", "))}`);
+  if (p.learned_feature) {
+    const c = p.learned_feature.claims || {};
+    meta.push(`<b>Approving also teaches the checklist</b> to recognise: ${escapeHtml([...(c.tensors || []), ...(c.config || [])].join(", "))}`);
+  }
+  if (p.action === "write") meta.push("Approved code is reused for other models only after it is verified (build + logits match Hugging Face).");
+  if (!currentReview.validation.ok) meta.push(`<b style="color:var(--red)">Checks failed:</b> ${escapeHtml(currentReview.validation.errors.join("; "))}`);
+  document.getElementById("ovMeta").innerHTML = meta.join("<br>");
+
+  const isConv = p.kind === "converter";
+  document.getElementById("ovLeftHdr").textContent = isConv ? "Checkpoint tensors it must convert" : "Hugging Face reference";
+  document.getElementById("ovLeft").textContent = isConv
+    ? (currentReview.checklist.ticked.length ? "See the Checklist in the Review tab; the checker confirms every tensor is handled." : "")
+    : (p.hf_reference || "(The Hugging Face modelling code was not available in this Python environment.)");
+  document.getElementById("ovRightHdr").textContent = p.action === "inherit"
+    ? `Inherited from ${p.source_entry} — not repeated in the generated file`
+    : `${p.file || ""}${p.class ? " · " + p.class : ""}`;
+  document.getElementById("ovRight").textContent = p.code || "(no code: the hook is inherited from the base class)";
+
+  const diffWrap = document.getElementById("ovDiffWrap");
+  const rows = p.action === "write" && p.base_code && p.code ? lineDiff(p.base_code, p.code) : null;
+  diffWrap.hidden = !rows;
+  if (rows) {
+    document.getElementById("ovDiffHdr").textContent = `Changes vs. the code it started from (${(p.start_from || [])[0] || "closest bank entry"})`;
+    document.getElementById("ovDiff").innerHTML = renderDiff(rows);
+  }
+
+  const reviewable = p.needs_review && !FINAL_STATUS.includes(p.status);
+  const approve = document.getElementById("ovApprove");
+  approve.textContent = p.action === "write" ? "✔ Approve" : "✔ Accept for this model";
+  approve.disabled = reviewBusy || !reviewable || !currentReview.validation.ok;
+  document.getElementById("ovReject").disabled = reviewBusy || !p.needs_review || p.status === "rejected";
+  document.getElementById("ovRegen").disabled = reviewBusy || p.action !== "write"
+    || String(currentReview.generator || "").startsWith("copied");
+  document.getElementById("ovEdit").disabled = reviewBusy || !(p.file && currentReview.files[p.file]);
+  document.getElementById("ovRecheck").disabled = reviewBusy;
+  if (!same) document.getElementById("ovComment").value = "";
+  overlay.hidden = false;
+}
+
+function closeOverlay() {
+  document.getElementById("reviewOverlay").hidden = true;
+  openPartId = null;
+}
+
+document.getElementById("ovClose").onclick = closeOverlay;
+document.getElementById("reviewOverlay").addEventListener("click", (e) => { if (e.target.id === "reviewOverlay") closeOverlay(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!document.getElementById("layerOverlay").hidden) closeLayerView();     // the top one first
+  else closeOverlay();
+});
+document.getElementById("ovApprove").onclick = () => codegenAction("approve", openPartId);
+document.getElementById("ovReject").onclick = () => codegenAction("reject", openPartId);
+document.getElementById("ovRegen").onclick = () => codegenAction("regenerate", openPartId);
+document.getElementById("ovRecheck").onclick = () => codegenAction("recheck", "");
+document.getElementById("ovEdit").onclick = () => {
+  const p = currentReview && currentReview.parts.find((x) => x.id === openPartId);
+  if (p && currentReview.files[p.file]) vscode.postMessage({ type: "openPath", path: currentReview.files[p.file] });
+};
+
+function resetReview() {
+  currentReview = null;
+  closeOverlay();
+  document.getElementById("reviewBadge").textContent = "";
+  document.getElementById("reviewBody").innerHTML =
+    '<div class="empty-msg">Generating… parts that need your review show up here.</div>';
+}
+
+// =========================================================================
+// Run state: the Run button turns amber while the environment is checked,
+// pulses green with the elapsed time and current step while the model runs,
+// then shows Done / Failed. It is disabled while a run is starting or running.
+// =========================================================================
+const runBtn = document.getElementById("btnRun");
+const checkBtn = document.getElementById("btnCheck");
+const CHECK_ONLY_AGENTS = ["model_discovery", "causallm_codegen", "compiler"];
+const modelInput = document.getElementById("modelInput");
+const statusLine = document.getElementById("statusLine");
+const AGENT_LABEL = Object.fromEntries(AGENTS);
+const runState = { phase: "idle", model: "", startedAt: 0, step: "", summary: "", timer: null };
+
+function fmtElapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function setRunPhase(phase, info) {
+  Object.assign(runState, info || {}, { phase });
+  clearInterval(runState.timer);
+  runState.timer = null;
+  runBtn.classList.remove("preparing", "running", "done", "failed");
+  statusLine.classList.remove("folder-ok", "folder-bad");
+  statusLine.classList.toggle("running", phase === "running" || phase === "preparing");
+  runBtn.disabled = phase === "preparing" || phase === "running";
+  checkBtn.disabled = runBtn.disabled;
+  const verb = runState.checkOnly ? "Checking" : "Running";
+  if (phase === "preparing") {
+    runBtn.classList.add("preparing");
+    runBtn.textContent = "⏳ Preparing…";
+    statusLine.textContent = `Checking the Python environment for ${runState.model}…`;
+  } else if (phase === "running") {
+    runBtn.classList.add("running");
+    const tick = () => {
+      runBtn.innerHTML = `<span class="run-dot"></span>${verb} · ${fmtElapsed(Date.now() - runState.startedAt)}`;
+      statusLine.textContent = `${verb} ${runState.model}${runState.step ? " — " + runState.step : ""}`;
+    };
+    tick();
+    runState.timer = setInterval(tick, 1000);
+  } else if (phase === "done") {
+    runBtn.classList.add("done");
+    runBtn.textContent = "✓ Done — Run again";
+    statusLine.textContent = `${runState.checkOnly ? "Checked" : "Finished"} ${runState.model} in ${fmtElapsed((runState.seconds || 0) * 1000)}` +
+      (runState.summary ? ` — ${runState.summary}` : "");
+  } else if (phase === "failed") {
+    runBtn.classList.add("failed");
+    runBtn.textContent = "▶ Run again";
+    statusLine.textContent = runState.reason || `Failed: ${runState.model} — see the Logs panel`;
+  } else {
+    runBtn.textContent = "▶ Run Pipeline";
+    if (runState.reason) statusLine.textContent = runState.reason;
+  }
+}
+
+// Remember the model id between sessions (per-viewer convenience only).
+try {
+  const saved = (vscode.getState && vscode.getState()) || {};
+  if (saved.model) modelInput.value = saved.model;
+} catch { /* no saved state */ }
+modelInput.addEventListener("input", () => {
+  modelInput.classList.remove("invalid");
+  try {
+    if (vscode.setState) vscode.setState({ ...((vscode.getState && vscode.getState()) || {}), model: modelInput.value });
+  } catch { /* not persisted */ }
+});
+
+// ---- Event dispatch from extension ----
+window.addEventListener("message", (e) => {
+  const msg = e.data;
+  if (msg.type === "modelFolderInfo") {
+    // A picked (or checked) model folder: fill the box and say what is in it.
+    if (msg.path) {
+      modelInput.value = msg.path;
+      try {
+        if (vscode.setState) vscode.setState({ ...((vscode.getState && vscode.getState()) || {}), model: msg.path });
+      } catch { /* not persisted */ }
+    }
+    modelInput.classList.toggle("invalid", !msg.ok);
+    if (runState.phase !== "running" && runState.phase !== "preparing") {
+      statusLine.classList.remove("running", "folder-ok", "folder-bad");
+      statusLine.classList.add(msg.ok ? "folder-ok" : "folder-bad");
+      statusLine.textContent = msg.ok
+        ? `📁 ${msg.summary}${msg.warnings && msg.warnings.length ? " — ⚠ " + msg.warnings[0] : ""}`
+        : `📁 ${(msg.problems || []).join(" ")}`;
+    }
+    statusLine.title = [msg.path, msg.summary, ...(msg.problems || []), ...(msg.warnings || [])].filter(Boolean).join("\n");
+    return;
+  }
+  if (msg.type === "pipelinePreparing") {
+    setRunPhase("preparing", { model: msg.model, reason: "" });
+    return;
+  }
+  if (msg.type === "pipelineNotStarted") {
+    setRunPhase("idle", { reason: msg.reason || "The run did not start." });
+    return;
+  }
+  if (msg.type === "pipelineFinished") {
+    setRunPhase(msg.ok ? "done" : "failed", {
+      seconds: msg.seconds,
+      reason: msg.ok ? "" : `${runState.model} stopped with an error after ${fmtElapsed((msg.seconds || 0) * 1000)} — see the Logs panel`,
+    });
+    return;
+  }
+  if (msg.type === "pipelineStarted") {
+    for (const [id] of AGENTS) {
+      if (msg.checkOnly && !CHECK_ONLY_AGENTS.includes(id)) setAgentStatus(id, "", "not run (check only)");
+      else setAgentStatus(id, "pending", "pending");
+    }
+    setRunPhase("running", { model: msg.model, startedAt: msg.startedAt || Date.now(), step: "", summary: "",
+                             reason: "", checkOnly: !!msg.checkOnly });
+    fileContents.ini = []; fileContents.cpp = [];
+    nodeMappings = [];
+    graphPanes.ini.reset();
+    graphPanes.cpp.reset();
+    resetReview();
+    resetCodeViewer("// Generating nntrainer C++ code…");
+    return;
+  }
+  if (msg.type === "chatBusy") {
+    const box = document.getElementById("chatMsgs");
+    if (!document.getElementById("chatThinking")) {
+      const el = document.createElement("div");
+      el.className = "msg assistant thinking";
+      el.id = "chatThinking";
+      el.textContent = "Claude is thinking…";
+      box.appendChild(el);
+      box.parentElement.scrollTop = box.parentElement.scrollHeight;
+    }
+    document.getElementById("btnSend").disabled = true;
+    return;
+  }
+  if (msg.type === "chatIdle") {
+    const t = document.getElementById("chatThinking");
+    if (t) t.remove();
+    document.getElementById("btnSend").disabled = false;
+    return;
+  }
+  if (msg.type === "codegenBusy") {
+    setReviewBusy(true, msg.action);
+    return;
+  }
+  if (msg.type === "codegenIdle") {
+    setReviewBusy(false);
+    return;
+  }
+  if (msg.type === "pipelineStopped") {
+    setRunPhase("idle", { reason: `Stopped ${runState.model}` });
+    return;
+  }
+  if (msg.type === "deviceProfilerStarted") {
+    document.getElementById("statusLine").textContent = "Profiling on-device...";
+    return;
+  }
+  if (msg.type === "renderGraphImages") {
+    // The extension picked the background (and, for both graphs, the format);
+    // draw the images here, where the graph data lives, and send them back.
+    const images = [], empty = [];
+    for (const key of msg.keys || []) {
+      if (!graphPanes[key]) continue;
+      try {
+        const img = buildGraphImage(key, msg.theme, msg.format);
+        if (img) images.push(img); else empty.push(GRAPH_TITLES[key]);
+      } catch (err) {
+        addLog(`Could not draw the ${GRAPH_TITLES[key]} image: ${err && err.message ? err.message : err}`, "error");
+      }
+    }
+    if (empty.length && images.length) addLog(`${empty.join(" and ")}: nothing to draw yet, skipped.`, "warn");
+    if (!images.length) {
+      if (!empty.length) return;                       // the error is in the log already
+      addLog("No graph to save as an image yet -- run the pipeline first.", "warn");
+      return;
+    }
+    vscode.postMessage({ type: "graphImages", images, theme: msg.theme, format: msg.format });
+    return;
+  }
+  if (msg.type === "settingsInfo") {
+    const input = document.getElementById("nntrainerPathInput");
+    if (input && !input.value && msg.nntrainerPath) input.value = msg.nntrainerPath;
+    return;
+  }
+  if (msg.type !== "engineEvent") return;
+
+  const ev = msg.event;
+  switch (ev.event) {
+    case "agent_status":
+      setAgentStatus(ev.agent, ev.status, ev.detail);
+      if (ev.status === "running" && runState.phase === "running") runState.step = AGENT_LABEL[ev.agent] || ev.agent;
+      break;
+    case "log":
+      addLog(ev.message, ev.level);
+      if (reviewBusy && runLive && ev.message && ev.message.trim()) {
+        runLive = ev.message.trim().slice(0, 200);
+        const live = document.getElementById("runLive");
+        if (live) live.textContent = runLive;
+      }
+      break;
+    case "run_status":
+      if (ev.status === "running") runLive = "Building in Docker...";
+      if (["done", "error", "no_weights", "weights_ready"].includes(ev.status)) runLive = "";
+      if (ev.status === "no_weights") addLog(`Run: ${ev.message} -- you will be asked to download them.`, "warn");
+      break;
+    case "chat":
+      addChat(ev.role, ev.content, ev.agent);
+      break;
+    case "graph": {
+      // Both backend target names map onto the same two panes.
+      const target = PANE_FOR_TARGET[ev.target] || "ini";
+      if (graphPanes[target]) graphPanes[target].render(ev.data);
+      break;
+    }
+    case "node_mappings":
+      nodeMappings = ev.mappings || [];
+      break;
+    case "code":
+      addCodeFile(ev.filename || "generated.cpp", ev.content || "");
+      break;
+    case "file_content": {
+      // Same target translation as "graph" -- the Export buttons look
+      // files up by pane key. A pane can have several files (a CausalLM
+      // component is a .h plus a .cpp); a resend replaces by filename.
+      const target = PANE_FOR_TARGET[ev.target];
+      if (!target) break;
+      fileContents[target] = fileContents[target]
+        .filter((f) => f.filename !== ev.filename)
+        .concat([{ filename: ev.filename, content: ev.content }]);
+      graphPanes[target].refreshExportLabel();
+      break;
+    }
+    case "profile":
+      renderProfile(ev.data);
+      break;
+    case "graph_focus": {
+      const pane = graphPanes[ev.graph];
+      if (!pane) break;
+      if (ev.ok && ev.matched_ids.length) {
+        pane.applyFocus(ev.matched_ids, "query");
+        pane.focusResetBtn.disabled = false;
+        pane.revealNodes(ev.matched_ids);
+        addLog(`Graph focus (${ev.graph}): ${ev.explanation}`, "info");
+      } else if (ev.ok) {
+        // "reset" command came back through the agent path
+        pane.resetFocus();
+        pane.focusResetBtn.disabled = true;
+      } else {
+        addLog(`Graph focus (${ev.graph}): ${ev.explanation}`, "warn");
+      }
+      break;
+    }
+    case "artifacts":
+      renderArtifacts(ev.items);
+      break;
+    case "codegen":
+      renderReview(ev.data);
+      keepReviewFiles(ev.data);
+      break;
+    case "build_status":
+      buildState = ev;
+      if (currentReview && !reviewBusy) renderReview(currentReview);
+      break;
+    case "preflight": {
+      preflightState = ev;
+      // Every Docker check also tells whether Docker runs: keep the Run section in step.
+      const running = (ev.checks || []).find((c) => c.id === "docker_running");
+      if (buildState && running && running.status !== "skip") {
+        buildState = { ...buildState, docker: running.status === "pass" };
+      }
+      if (currentReview && !reviewBusy) renderReview(currentReview);
+      break;
+    }
+    case "pipeline_complete": {
+      const c = (ev.summary && ev.summary.compatibility) || {};
+      runState.summary = (c.compatibility != null ? `${c.compatibility}% compatible` : "") +
+        (ev.summary && ev.summary.errors && ev.summary.errors.length ? `, ${ev.summary.errors.length} error(s)` : "");
+      break;
+    }
+    case "error":
+      addLog("[" + ev.stage + "] " + ev.message, "error");
+      break;
+  }
+});
+
+// ---- UI wiring ----
+function startRun(checkOnly) {
+  const model = modelInput.value.trim();
+  if (!model) {
+    modelInput.classList.add("invalid");
+    modelInput.focus();
+    statusLine.textContent = "Enter a Hugging Face model id or pick a model folder (📁) first";
+    return;
+  }
+  setRunPhase("preparing", { model, reason: "", checkOnly });   // immediate feedback; the extension confirms
+  vscode.postMessage({ type: "runPipeline", model, checkOnly });
+}
+runBtn.onclick = () => startRun(false);
+checkBtn.onclick = () => startRun(true);
+document.getElementById("btnBrowse").onclick = () => vscode.postMessage({ type: "browseModelFolder" });
+modelInput.addEventListener("keydown", (e) => { if (e.key === "Enter" && !runBtn.disabled) runBtn.click(); });
+document.getElementById("btnStop").onclick = () => vscode.postMessage({ type: "stopPipeline" });
+document.getElementById("btnEnv").onclick = () => vscode.postMessage({ type: "checkEnvironment" });
+document.getElementById("btnExport").onclick = () => vscode.postMessage({ type: "exportArtifacts" });
+document.getElementById("btnGraphImages").onclick = () => requestGraphImages(["ini", "cpp"]);
+document.getElementById("btnProfileDevice").onclick = () =>
+  vscode.postMessage({ type: "runNntrainerPipeline", nntrainerPath: document.getElementById("nntrainerPathInput").value });
+document.getElementById("btnSend").onclick = sendChat;
+document.getElementById("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
+function sendChat() {
+  const input = document.getElementById("chatInput");
+  const val = input.value.trim();
+  if (!val) return;
+  vscode.postMessage({ type: "sendChat", message: val });
+  input.value = "";
+}
+
+// ---- Chat/Agent-msgs tabs ----
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.onclick = () => {
+    const group = tab.parentElement;
+    group.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    const wrap = tab.closest(".panel");
+    wrap.querySelectorAll(".tabpage").forEach((p) => p.classList.remove("active"));
+    wrap.querySelector(`.tabpage[data-tab="${tab.dataset.tab}"]`).classList.add("active");
+    // Opening the Review tab refreshes the build / Docker status (Docker may
+    // have been started or stopped since the panel opened).
+    if (tab.dataset.tab === "review" && currentReview && !reviewBusy) vscode.postMessage({ type: "buildStatus" });
+  };
+});
+
+// =========================================================================
+// Generic resizable splitters -- every panel in both the main row and the
+// bottom row can be resized by dragging the splitter next to it. Adjacent
+// pair only changes flex-basis on the two panels touching that splitter,
+// so the rest of the layout doesn't jump around.
+// =========================================================================
+function makeHSplitter(splitterEl) {
+  const beforeEl = document.getElementById(splitterEl.dataset.before);
+  const afterEl = document.getElementById(splitterEl.dataset.after);
+  const MIN = 120;
+
+  splitterEl.addEventListener("mousedown", (e) => {
+    const startX = e.clientX;
+    const beforeWidth = beforeEl.getBoundingClientRect().width;
+    const afterWidth = afterEl.getBoundingClientRect().width;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    function onMove(ev) {
+      const dx = ev.clientX - startX;
+      const newBefore = Math.max(MIN, beforeWidth + dx);
+      const newAfter = Math.max(MIN, afterWidth - dx);
+      beforeEl.style.flex = `0 0 ${newBefore}px`;
+      afterEl.style.flex = `0 0 ${newAfter}px`;
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+document.querySelectorAll(".h-splitter").forEach(makeHSplitter);
+
+// Vertical splitter: resize bottom-panels height, main row auto-fills via flex:1
+const vSplitter = document.getElementById("vSplitter");
+const bottomRow = document.getElementById("bottomRow");
+vSplitter.addEventListener("mousedown", (e) => {
+  const startY = e.clientY;
+  const startHeight = bottomRow.getBoundingClientRect().height;
+  document.body.style.cursor = "row-resize";
+  document.body.style.userSelect = "none";
+
+  function onMove(ev) {
+    const dy = ev.clientY - startY;
+    const newHeight = Math.max(100, Math.min(window.innerHeight - 200, startHeight - dy));
+    bottomRow.style.height = newHeight + "px";
+  }
+  function onUp() {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+});
+</script>
+</body>
+</html>
