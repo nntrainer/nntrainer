@@ -1,0 +1,6 @@
+# Required by the pipeline. "Check Env" installs these into the workbench's
+# own Python environment (torch is installed first, as a CPU build on Linux).
+torch>=2.1
+transformers>=4.38
+huggingface_hub>=0.23
+safetensors>=0.4

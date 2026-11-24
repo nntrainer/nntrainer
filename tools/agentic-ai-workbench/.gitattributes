@@ -1,0 +1,6 @@
+# The workbench's text files are stored and checked out with LF line endings
+# on every platform (the Docker build runs its scripts on Linux).
+* text=auto eol=lf
+*.png binary
+*.vsix binary
+*.db binary
