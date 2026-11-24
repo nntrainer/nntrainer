@@ -1,6 +1,7 @@
 fs = import('fs')
 
 cl_op_kernels = [
+  'act_cast.cl',
   'addition.cl',
   'concat_axis_1.cl',
   'concat_axis_2.cl',
@@ -8,6 +9,7 @@ cl_op_kernels = [
   'convert_block_q4_0.cl',
   'copy.cl',
   'dot.cl',
+  'gpuhash.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',
   'int4_gemm.cl',
@@ -15,11 +17,13 @@ cl_op_kernels = [
   'int8_int8_gemm_xmx.cl',
   'two_conv_attention.cl',
   'flash_attention.cl',
+  'kv_img_write.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
   'rmsnorm.cl',
   'layernorm.cl',
+  'rope_inplace.cl',
   'rotary_emb.cl',
   'sgemm_no_trans.cl',
   'sgemm_trans_a.cl',
