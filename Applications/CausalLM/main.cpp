@@ -191,6 +191,15 @@ std::string resolve_architecture(std::string model_type,
     return "Gemma4ForCausalLM";
   }
 
+  // PaliGemma ships one config with two sub-models; the factory keys are the
+  // text decoder and the vision tower, driven from their own nntr packages.
+  if (architecture == "PaliGemmaForConditionalGeneration") {
+    return "PaliGemmaForCausalLM";
+  }
+  if (architecture == "PaliGemmaForVision") {
+    return "SiglipVisionModel";
+  }
+
   return architecture;
 }
 
@@ -244,6 +253,7 @@ int main(int argc, char *argv[]) {
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
+    resolveNntrConfigPath(nntr_cfg, "embedding_bin_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "model_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);

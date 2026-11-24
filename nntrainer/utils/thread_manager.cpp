@@ -12,6 +12,9 @@
  */
 
 #include <filesystem>
+#if defined(USE_MKL) && defined(__linux__) && defined(__x86_64__)
+#include <dlfcn.h>
+#endif
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -76,6 +79,23 @@ ThreadManager::~ThreadManager() {
 
 void ThreadManager::initialize() noexcept {
   auto config = config_;
+#ifdef USE_MKL
+  // BLAS has its own worker team. Long idle spins here compete with that
+  // team on every matrix multiply following an elementwise parallel_for.
+  spin_count_ = 1000;
+  config.enable_affinity = false;
+#endif
+  if (const char *spin = std::getenv("NNTR_CPU_SPIN_COUNT")) {
+    char *end = nullptr;
+    const auto count = std::strtoul(spin, &end, 10);
+    if (end != spin && *end == '\0' && count <= 1000000)
+      spin_count_ = static_cast<uint32_t>(count);
+  }
+  // Host BLAS libraries may create their worker pool lazily. Pinning the
+  // calling thread first would make that entire pool inherit one CPU.
+  // Allow applications combining the pools to leave scheduling to the OS.
+  if (const char *affinity = std::getenv("NNTR_CPU_AFFINITY"))
+    config.enable_affinity = affinity[0] != '0';
 
   // Don't initialize for 1 thread(0 worker)
   if (config.compute_threads <= 1u)
@@ -95,6 +115,36 @@ void ThreadManager::initialize() noexcept {
 
     config.compute_threads = hw_threads;
   }
+
+#if defined(USE_MKL) && defined(__linux__) && defined(__x86_64__)
+  const char *shared = std::getenv("NNTR_CPU_SHARED_OMP");
+  const char *layer = std::getenv("MKL_THREADING_LAYER");
+  if (shared && shared[0] == '1' && (!layer || std::string(layer) == "INTEL")) {
+    // Intel OpenMP supplies the GNU parallel-region ABI as well. Use the
+    // same runtime as MKL so an elementwise op and GEMM reuse one worker team.
+    // Keep the module alive for the singleton's lifetime, as MKL does.
+    void *runtime = dlopen("libiomp5.so", RTLD_NOW | RTLD_LOCAL);
+    if (runtime) {
+      auto parallel =
+        reinterpret_cast<SharedParallel>(dlsym(runtime, "GOMP_parallel"));
+      auto tid =
+        reinterpret_cast<int (*)()>(dlsym(runtime, "omp_get_thread_num"));
+      auto count =
+        reinterpret_cast<int (*)()>(dlsym(runtime, "omp_get_num_threads"));
+      auto nested =
+        reinterpret_cast<int (*)()>(dlsym(runtime, "omp_in_parallel"));
+      if (parallel && tid && count && nested) {
+        shared_parallel_ = parallel;
+        shared_thread_num_ = tid;
+        shared_num_threads_ = count;
+        shared_in_parallel_ = nested;
+        shared_threads_ = config.compute_threads;
+        return;
+      }
+      dlclose(runtime);
+    }
+  }
+#endif
 
   // compute core assignment map (sorted by performance for big.LITTLE)
   std::vector<uint32_t> core_map;
@@ -131,6 +181,31 @@ void ThreadManager::initialize() noexcept {
   wait_worker_threads();
 }
 
+void ThreadManager::parallelizeShared(size_t begin, size_t end,
+                                      const std::function<void(size_t)> &task) {
+  if (shared_in_parallel_()) {
+    for (size_t i = begin; i < end; ++i)
+      task(i);
+    return;
+  }
+  struct Work {
+    const std::function<void(size_t)> *task;
+    size_t begin, end;
+    int (*thread_num)();
+    int (*num_threads)();
+  } work{&task, begin, end, shared_thread_num_, shared_num_threads_};
+  const auto run = [](void *opaque) {
+    auto &w = *static_cast<Work *>(opaque);
+    const size_t tid = w.thread_num(), count = w.num_threads();
+    const size_t jobs = w.end - w.begin;
+    const size_t first = w.begin + jobs * tid / count;
+    const size_t last = w.begin + jobs * (tid + 1) / count;
+    for (size_t i = first; i < last; ++i)
+      (*w.task)(i);
+  };
+  shared_parallel_(run, &work, shared_threads_, 0);
+}
+
 void ThreadManager::checkin() {
 #if defined(__linux__) || defined(__ANDROID__)
   size_t t = active_threads_.fetch_sub(1, std::memory_order_acq_rel) - 1;
@@ -155,7 +230,7 @@ uint32_t ThreadManager::wait_for_new_command(uint32_t last_command) {
     return command;
 
   // spin wait
-  for (uint32_t i = SPIN_COUNT; i != 0; i--) {
+  for (uint32_t i = spin_count_; i != 0; i--) {
     yield();
 
     command = command_.load(std::memory_order_acquire);
@@ -193,7 +268,7 @@ void ThreadManager::wait_worker_threads() {
     return;
 #endif
 
-  for (uint32_t i = SPIN_COUNT; i != 0; i--) {
+  for (uint32_t i = spin_count_; i != 0; i--) {
     yield();
 
 #if defined(__linux__) || defined(__ANDROID__)

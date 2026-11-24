@@ -389,6 +389,10 @@ protected:
    */
   void releaseLogitsBuf(float *buf);
 
+  /** Complete a deferred device-to-host row before a caller reads its values.
+   */
+  void ensureHostLogits(float *buf);
+
   std::vector<int> pending_ids_;
 
   ::BaseStreamer *streamer_ = nullptr;

@@ -30,6 +30,14 @@ namespace nntrainer::cuda {
 
 static const char *ELTWISE_SRC = R"CU(
 extern "C" {
+__global__ void add_fp32(const float *a, const float *b, float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = a[i] + b[i];
+}
+__global__ void bias_add_fp32(float *out, const float *bias, int n, int width) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] += bias[i % width];
+}
 __device__ __forceinline__ float ew_h2f(unsigned short h) {
   unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
   unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
@@ -65,6 +73,15 @@ __global__ void geglu_fp16(const unsigned short *gate, const unsigned short *up,
 }
 // SwiGLU: out[i] = silu(gate[i]) * up[i], silu(x) = x / (1 + exp(-x)) (qwen3/
 // llama FFN). Same shape as geglu_fp16, SiLU gate instead of gelu_tanh.
+__global__ void geglu_interleaved_fp16(const unsigned short *input,
+    unsigned short *out, int n, int width) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=n)return;
+  int p=(i/width)*(2*width)+i%width;
+  float x=ew_h2f(input[p]);
+  float g=.5f*x*(1+tanhf(.7978845608028654f*(x+.044715f*x*x*x)));
+  out[i]=ew_f2h(g*ew_h2f(input[p+width]));
+}
 __global__ void swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                             unsigned short *out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -784,6 +801,53 @@ template <typename K> static bool dispatch1d(K &kernel, unsigned int n) {
     return false;
   StreamManager::Global().maybeFinish();
   return true;
+}
+
+bool cuda_geglu_interleaved_fp16(const unsigned short *input,
+                                 unsigned short *output, unsigned int count,
+                                 unsigned int width) {
+  auto kernel = CudaContext::Global().registerCudaKernel(
+    ELTWISE_SRC, "geglu_interleaved_fp16");
+  if (!kernel)
+    return false;
+  const int n = count, w = width;
+  kernel->SetKernelArguments(0, &input, sizeof(input));
+  kernel->SetKernelArguments(1, &output, sizeof(output));
+  kernel->SetKernelArguments(2, &n, sizeof(n));
+  kernel->SetKernelArguments(3, &w, sizeof(w));
+  return dispatch1d(kernel, count);
+}
+
+bool cuda_add_fp32(const float *a, const float *b, float *out, unsigned int n) {
+  if (!n)
+    return true;
+  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "add_fp32");
+  if (!k)
+    return false;
+  const int count = n;
+  k->SetKernelArguments(0, &a, sizeof(a));
+  k->SetKernelArguments(1, &b, sizeof(b));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &count, sizeof(count));
+  return dispatch1d(k, n);
+}
+
+bool cuda_bias_add_fp32(float *out, const float *bias, unsigned int n,
+                        unsigned int width) {
+  if (!n)
+    return true;
+  if (!width)
+    return false;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "bias_add_fp32");
+  if (!k)
+    return false;
+  const int count = n, columns = width;
+  k->SetKernelArguments(0, &out, sizeof(out));
+  k->SetKernelArguments(1, &bias, sizeof(bias));
+  k->SetKernelArguments(2, &count, sizeof(count));
+  k->SetKernelArguments(3, &columns, sizeof(columns));
+  return dispatch1d(k, n);
 }
 
 bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,

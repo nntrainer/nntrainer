@@ -17,6 +17,18 @@
 
 namespace nntrainer::cuda {
 
+/** FP32 residual add, including in-place accumulation. */
+/** GeGLU on rows containing concatenated gate and up projections. */
+bool cuda_geglu_interleaved_fp16(const unsigned short *input,
+                                 unsigned short *output, unsigned int count,
+                                 unsigned int width);
+
+bool cuda_add_fp32(const float *a, const float *b, float *out, unsigned int n);
+
+/** Broadcast a width-sized bias over all rows of an FP32 output. */
+bool cuda_bias_add_fp32(float *out, const float *bias, unsigned int n,
+                        unsigned int width);
+
 /** @brief out[i] = gelu_tanh(gate[i]) * up[i], gelu_tanh = pytorch-tanh approx
  */
 bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,

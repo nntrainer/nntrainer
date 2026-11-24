@@ -87,6 +87,8 @@
 #endif
 #include "gptoss_causallm.h"
 #include "lfm2_causallm.h"
+#include "paligemma/paligemma_causallm.h"
+#include "paligemma/siglip_vision.h"
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "multilingual_tinybert_16mb.h"
 #endif
@@ -292,6 +294,9 @@ std::string resolve_architecture(std::string model_type,
   if (architecture == "Gemma4ForConditionalGeneration") {
     return "Gemma4ForCausalLM";
   }
+  if (architecture == "PaliGemmaForConditionalGeneration") {
+    return "PaliGemmaForCausalLM";
+  }
 
   return architecture;
 }
@@ -402,6 +407,16 @@ void registerAllModels() {
   factory.registerModel("Lfm2ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Lfm2CausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("PaliGemmaForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::PaliGemmaCausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("SiglipVisionModel",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::SiglipVisionModel>(
                             cfg, generation_cfg, nntr_cfg);
                         });
   factory.registerModel("DebertaV2", [](json cfg, json generation_cfg,

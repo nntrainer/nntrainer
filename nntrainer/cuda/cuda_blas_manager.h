@@ -44,7 +44,7 @@ public:
    * @return true on CUBLAS_STATUS_SUCCESS
    */
   bool sgemmRowMajor(int M, int N, int K, const float *X, const float *W,
-                     float *Y);
+                     float *Y, bool transposed_weight = false);
 
   /**
    * @brief Row-major fp16 Y[M,N] = X[M,K] * W[K,N], fp32 accumulate.
@@ -63,7 +63,8 @@ public:
    * @return true on CUBLAS_STATUS_SUCCESS
    */
   bool hgemmRowMajor(int M, int N, int K, const unsigned short *X,
-                     const unsigned short *W, unsigned short *Y);
+                     const unsigned short *W, unsigned short *Y,
+                     bool transposed_weight = false);
 
   /**
    * @brief Row-major INT8 IMMA GEMM: C[M,N] = A[M,K] * B[K,N], int8 in /

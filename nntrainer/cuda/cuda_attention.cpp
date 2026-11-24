@@ -1079,11 +1079,10 @@ __device__ __forceinline__ unsigned short sm_f2h(float f) {
   return (unsigned short)(s|hh);
 }
 __global__ void attn_softmax_fp16(unsigned short *scores, int N_q, int N_kv,
-                                  int cache_from, int window, float softcap) {
-  int i = blockIdx.x;
-  if (i >= N_q) return;
-  unsigned short *row = scores + (long)i * N_kv;
-  int i_abs = cache_from + i;
+                                  int cache_from, int window, float softcap, const int *d_pos) {
+  int i = blockIdx.x % N_q;
+  unsigned short *row = scores + (long)blockIdx.x * N_kv;
+  int i_abs = (d_pos ? d_pos[0] : cache_from) + i;
   int j_hi = i_abs < N_kv - 1 ? i_abs : N_kv - 1;
   int j_lo = (window > 0) ? i_abs - window + 1 : 0;
   if (j_lo < 0) j_lo = 0;
@@ -1400,12 +1399,10 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
 float *g_scores = nullptr;
 size_t g_scores_cap = 0;
 std::mutex g_ga_mtx;
-bool attention_gemm_prefill_fp16(const unsigned short *q,
-                                 const unsigned short *k,
-                                 const unsigned short *v, unsigned short *o,
-                                 int HQ, int HKV, int N_q, int N_kv,
-                                 int cache_from, int d, int window,
-                                 float softcap) {
+bool attention_gemm_prefill_fp16(
+  const unsigned short *q, const unsigned short *k, const unsigned short *v,
+  unsigned short *o, int HQ, int HKV, int N_q, int N_kv, int cache_from, int d,
+  int window, float softcap, bool is_causal, const int *d_pos = nullptr) {
   std::lock_guard<std::mutex> lk(g_ga_mtx);
   cublasHandle_t bh = BlasManager::Global().handle();
   if (!bh)
@@ -1415,7 +1412,7 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   if (!sm)
     return false;
   // scratch scores [N_q, N_kv] fp16 reused across heads (heads run serially).
-  const size_t need = (size_t)N_q * N_kv;
+  const size_t need = (size_t)(is_causal ? 1 : HQ) * N_q * N_kv;
   if (need > g_scores_cap) {
     if (g_scores)
       cudaFree(g_scores);
@@ -1434,6 +1431,40 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   const int win = (window <= 0 || window >= N_kv) ? 0 : window;
   const int B = 256;
   const size_t shmem = (size_t)B * sizeof(float);
+  if (!is_causal) {
+    const long long score_stride = static_cast<long long>(N_q) * N_kv;
+    for (int kh = 0; kh < HKV; ++kh) {
+      if (cublasGemmStridedBatchedEx(
+            bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale,
+            k + static_cast<long>(kh) * d, CUDA_R_16F, HD_KV, 0,
+            q + static_cast<long>(kh * gqa) * d, CUDA_R_16F, HD_Q, d, &zero,
+            scores + static_cast<long>(kh * gqa) * score_stride, CUDA_R_16F,
+            N_kv, score_stride, gqa, CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        return false;
+    }
+    sm->SetKernelArguments(0, &scores, sizeof(scores));
+    sm->SetKernelArguments(1, &N_q, sizeof(N_q));
+    sm->SetKernelArguments(2, &N_kv, sizeof(N_kv));
+    sm->SetKernelArguments(3, &cache_from, sizeof(cache_from));
+    sm->SetKernelArguments(4, &win, sizeof(win));
+    sm->SetKernelArguments(5, &softcap, sizeof(softcap));
+    sm->SetKernelArguments(6, &d_pos, sizeof(d_pos));
+    const int grid[3] = {HQ * N_q, 1, 1}, block[3] = {B, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*sm, grid, block, shmem))
+      return false;
+    for (int kh = 0; kh < HKV; ++kh) {
+      if (cublasGemmStridedBatchedEx(
+            bh, CUBLAS_OP_N, CUBLAS_OP_N, d, N_q, N_kv, &one,
+            v + static_cast<long>(kh) * d, CUDA_R_16F, HD_KV, 0,
+            scores + static_cast<long>(kh * gqa) * score_stride, CUDA_R_16F,
+            N_kv, score_stride, &zero, o + static_cast<long>(kh * gqa) * d,
+            CUDA_R_16F, HD_Q, d, gqa, CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        return false;
+    }
+    return true;
+  }
   for (int h = 0; h < HQ; ++h) {
     const int hkv = h / gqa;
     const unsigned short *Qh = q + (long)h * d;   // [N_q,d] ld=HD_Q
@@ -1454,6 +1485,7 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
     sm->SetKernelArguments(3, &cache_from, sizeof(cache_from));
     sm->SetKernelArguments(4, &win, sizeof(win));
     sm->SetKernelArguments(5, &softcap, sizeof(softcap));
+    sm->SetKernelArguments(6, &d_pos, sizeof(d_pos));
     const int sg[3] = {N_q, 1, 1};
     const int sb[3] = {B, 1, 1};
     if (!StreamManager::Global().DispatchCommand(*sm, sg, sb, shmem))
@@ -1655,13 +1687,11 @@ bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
   return true;
 }
 
-bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
-                                     const unsigned short *k_fp16,
-                                     const unsigned short *v_fp16,
-                                     unsigned short *o_fp16, int num_heads_Q,
-                                     int num_heads_KV, int N_q, int N_kv,
-                                     int cache_from, int head_dim, int window,
-                                     float softcap, int ring_cap) {
+bool cuda_attention_interleaved_fp16(
+  const unsigned short *q_fp16, const unsigned short *k_fp16,
+  const unsigned short *v_fp16, unsigned short *o_fp16, int num_heads_Q,
+  int num_heads_KV, int N_q, int N_kv, int cache_from, int head_dim, int window,
+  float softcap, int ring_cap, bool is_causal, int kv_capacity) {
   if (num_heads_Q == 0 || N_q == 0 || N_kv == 0 || head_dim == 0)
     return true;
 
@@ -1701,7 +1731,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // the bottom of this function, and the two reduce in different orders. A
   // short-prompt capture lands on the dense side and a replay never re-asks --
   // see kv_regime_gt() for the measurement.
-  if (sk_chunk > 0 && N_q == 1 && kv_regime_gt(N_kv, sk_chunk)) {
+  if (is_causal && sk_chunk > 0 && N_q == 1 && kv_regime_gt(N_kv, sk_chunk)) {
     if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                  num_heads_KV, N_kv, cache_from, head_dim,
                                  window, softcap, sk_chunk, ring_cap)) {
@@ -1775,10 +1805,22 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // correct and the fastest arm available -- keep the wrap test, not the ring
   // test.
   const bool ring_linear = (ring_cap <= 0) || (N_kv <= ring_cap);
-  if (gemm_attn_on && N_q > 1 && ring_linear) {
+  // Noncausal prefix-LM decode uses the same materialized FP16 probability
+  // path as prefill. Online FP32 probability accumulation changes half
+  // rounding relative to PyTorch's eager attention even for one query.
+  // A prefix-LM decode still rounds materialized probabilities to FP16.
+  // Capture that same computation at a fixed cache capacity, masking unused
+  // rows with the device position. cuBLAS dimensions then stay valid on replay.
+  const bool fixed_decode = !is_causal && N_q == 1 && ring_cap == 0 &&
+                            kv_capacity >= N_kv && decodeGraphEnabled() &&
+                            k_fp16 == k_src && v_fp16 == v_src;
+  const int gemm_keys = fixed_decode ? kv_capacity : N_kv;
+  const int *gemm_pos = fixed_decode ? cuda_pos_buffer() : nullptr;
+  if ((gemm_attn_on || !is_causal) && (N_q > 1 || !is_causal) && ring_linear) {
     if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
-                                    num_heads_KV, N_q, N_kv, cache_from,
-                                    head_dim, window, softcap)) {
+                                    num_heads_KV, N_q, gemm_keys,
+                                    is_causal ? cache_from : N_kv - 1, head_dim,
+                                    window, softcap, is_causal, gemm_pos)) {
       StreamManager::Global().maybeFinish();
       return true;
     }
@@ -1790,7 +1832,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // NNTR_CUDA_BLOCKQ=1, =0 disables); only the multi-row (prefill) path with
   // head_dim in {128, 256, 512} -- decode (N_q==1) keeps split-KV above.
   static const bool blockq_on = nntr_env_on("NNTR_CUDA_BLOCKQ");
-  if (blockq_on && N_q > 1 &&
+  if (is_causal && blockq_on && N_q > 1 &&
       (head_dim == 128 || head_dim == 256 || head_dim == 512)) {
     // [splitkv-prefill] NNTR_CUDA_SPLITKV_PREFILL: unset/=0 -> OFF (the serial
     // blockq streams, byte-for-byte); =1 -> ON with the default 4096-key split
@@ -1874,7 +1916,10 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   kernel->SetKernelArguments(5, &num_heads_KV, sizeof(num_heads_KV));
   kernel->SetKernelArguments(6, &N_q, sizeof(N_q));
   kernel->SetKernelArguments(7, &N_kv, sizeof(N_kv));
-  kernel->SetKernelArguments(8, &cache_from, sizeof(cache_from));
+  // Noncausal rows see the entire cache. RoPE was already applied upstream;
+  // this position is used only as the causal upper bound in the core kernel.
+  const int mask_from = is_causal ? cache_from : N_kv - 1;
+  kernel->SetKernelArguments(8, &mask_from, sizeof(mask_from));
   kernel->SetKernelArguments(9, &head_dim, sizeof(head_dim));
   kernel->SetKernelArguments(10, &window, sizeof(window));
   kernel->SetKernelArguments(11, &softcap, sizeof(softcap));
@@ -1882,7 +1927,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // the live cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph)
   // path.
   static const bool decode_graph_attn = decodeGraphEnabled();
-  const int *attn_dpos = decode_graph_attn ? cuda_pos_buffer() : nullptr;
+  const int *attn_dpos =
+    (is_causal && decode_graph_attn) ? cuda_pos_buffer() : nullptr;
   kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
   // [kv-window-ring]
   kernel->SetKernelArguments(13, &ring_cap, sizeof(ring_cap));
