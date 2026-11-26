@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_argmax.cl
+ * @brief  FP16 LM head partial and final argmax kernels.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #define ARGMAX_LS 64

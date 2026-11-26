@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_q6k_gemv_sg16.cl
+ * @brief  LM head Q6_K matrix-vector product using 16-lane subgroups.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable

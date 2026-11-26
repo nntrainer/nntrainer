@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
+ *
+ * @file   sv_matmul_f16_ohwi_imgrw_tm2.cl
+ * @brief  FP16 attention score/value product using a read-write image.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from attention_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 

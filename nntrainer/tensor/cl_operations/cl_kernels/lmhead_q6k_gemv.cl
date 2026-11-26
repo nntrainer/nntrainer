@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_q6k_gemv.cl
+ * @brief  LM head matrix-vector product with Q6_K weights.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 blocks][210 B]

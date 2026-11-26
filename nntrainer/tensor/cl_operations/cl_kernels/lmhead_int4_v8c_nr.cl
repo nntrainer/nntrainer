@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_int4_v8c_nr.cl
+ * @brief  Multi-row LM head matrix-vector product with INT4 weights.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #ifndef NR

@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_topk.cl
+ * @brief  Partial top-k selection over FP16 LM head logits.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #define TOPK_LS 64
 #define TOPK_EPT 16
