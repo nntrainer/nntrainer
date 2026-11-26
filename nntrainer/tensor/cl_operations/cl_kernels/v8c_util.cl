@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   v8c_util.cl
+ * @brief  FP16/FP32 conversion, copy and addition utility kernels.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernel_interface.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __kernel void v8c_cvt_h2f(__global const half *in, __global float *out,

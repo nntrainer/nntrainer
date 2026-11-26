@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   rmsnorm_add_fp16.cl
+ * @brief  Cooperative FP16 RMS normalization with residual addition.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels_fp16.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __attribute__((reqd_work_group_size(64, 1, 1)))

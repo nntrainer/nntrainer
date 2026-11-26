@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
+ *
+ * @file   gpuhash.cl
+ * @brief  GPU hash of 16-bit tensor data for diagnostics.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from attention_kernels.cpp.
+ */
 
 __kernel void gpuhash_u16(__global const ushort *src, uint n,
                           __global uint *out, uint slot, uint off,

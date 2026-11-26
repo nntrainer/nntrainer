@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
+ *
+ * @file   lmhead_int4_v8c.cl
+ * @brief  LM head matrix-vector product with packed INT4 weights.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from blas_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbles

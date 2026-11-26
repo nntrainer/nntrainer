@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
+ *
+ * @file   kv_img_write.cl
+ * @brief  Key/value cache scatter kernels for OpenCL images.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from attention_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #ifndef KIMG_GSH

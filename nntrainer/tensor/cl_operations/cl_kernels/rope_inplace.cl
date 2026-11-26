@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Yash Singh <yash.singh@samsung.com>
+ *
+ * @file   rope_inplace.cl
+ * @brief  FP16 rotary position embedding with cache write offsets.
+ * @see    https://github.com/nntrainer/nntrainer
+ *
+ * @details Extracted from attention_kernels.cpp.
+ */
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 // 1 (default) = the fp32/fp16 rotation choice is a property of the SEQUENCE,
