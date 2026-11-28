@@ -9,6 +9,8 @@
  * @bug     No known bugs except for NYI items
  * @brief   This file contains app context data related functions and classes
  * that manages the global configuration of the current QNN environment.
+ * @note    Also compiled on Linux by test/unittest/qnn against stub SDK
+ * headers; extend those stubs when this file starts using a new symbol.
  */
 
 #ifndef __QNN_CONTEXT_VAR_H__
@@ -30,6 +32,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -56,14 +59,14 @@ enum class StatusCode {
 };
 
 struct Qnn_Context_Graph_t {
-  Qnn_ContextHandle_t m_context;
-  qnn_wrapper_api::GraphInfo_t **m_graphsInfo;
+  Qnn_ContextHandle_t m_context = nullptr;
+  qnn_wrapper_api::GraphInfo_t **m_graphsInfo = nullptr;
   std::map<std::string, qnn_wrapper_api::GraphInfo_t *>
     graph_map; /** graph name in Context - graph map **/
   std::map<std::string, uint32_t>
     graph_idx; /** graph name in Context - graph map **/
 
-  uint32_t m_graphsCount;
+  uint32_t m_graphsCount = 0;
 
   QnnContext_Config_t **m_contextConfig = nullptr;
 
@@ -173,7 +176,8 @@ struct QNNVar {
             ctx.m_graphsInfo[i]->numOutputTensors);
         }
       }
-      free(*ctx.m_graphsInfo);
+      if (ctx.m_graphsCount > 0)
+        free(*ctx.m_graphsInfo);
       free(ctx.m_graphsInfo);
       ctx.m_graphsInfo = nullptr;
     }
@@ -329,6 +333,37 @@ struct QNNVar {
     if (sample_app::ProfilingLevel::OFF != m_profilingLevel) {
       extractBackendProfilingInfo();
     }
+
+    if (StatusCode::SUCCESS != returnStatus) {
+      if (context_i.m_context != nullptr &&
+          m_qnnFunctionPointers.qnnInterface.contextFree != nullptr &&
+          QNN_CONTEXT_NO_ERROR !=
+            m_qnnFunctionPointers.qnnInterface.contextFree(context_i.m_context,
+                                                           nullptr)) {
+        ml_loge("Failed to free QNN context for: %s", bin.get().c_str());
+      }
+      if (context_i.m_graphsInfo != nullptr) {
+        for (uint32_t i = 0; i < context_i.m_graphsCount; i++) {
+          if (context_i.m_graphsInfo[i] != nullptr) {
+            free(context_i.m_graphsInfo[i]->graphName);
+            qnn_wrapper_api::freeQnnTensors(
+              context_i.m_graphsInfo[i]->inputTensors,
+              context_i.m_graphsInfo[i]->numInputTensors);
+            qnn_wrapper_api::freeQnnTensors(
+              context_i.m_graphsInfo[i]->outputTensors,
+              context_i.m_graphsInfo[i]->numOutputTensors);
+          }
+        }
+        if (context_i.m_graphsCount > 0)
+          free(*context_i.m_graphsInfo);
+        free(context_i.m_graphsInfo);
+      }
+      // Entries [1..customConfigCount] belong to m_backendExtensions.
+      free(context_i.m_contextConfig[0]);
+      free(context_i.m_contextConfig);
+      return returnStatus;
+    }
+
     context_i.setGraphInfoMap();
 
     ct_map.insert(std::make_pair(bin.get(), context_i));
@@ -374,6 +409,33 @@ struct QNNVar {
     }
 
     return graphInfo;
+  }
+
+  /**
+   * @brief Retrieve a graph, creating its context first if it is not cached
+   * @param[in] bin_path context binary path
+   * @param[in] graphName graph name
+   * @param[out] graphInfo the retrieved graph
+   * @return the cached context that owns the graph
+   * @throws std::runtime_error if the context cannot be created
+   * @throws std::invalid_argument if the graph cannot be retrieved
+   */
+  Qnn_Context_Graph_t &
+  graphRetrieveLazy(const std::string &bin_path, const std::string &graphName,
+                    qnn_wrapper_api::GraphInfo_t *&graphInfo) {
+    if (!findContext(bin_path)) {
+      ml_logw("Context is not created. Create Now");
+
+      if (makeContext(bin_path) != StatusCode::SUCCESS)
+        throw std::runtime_error("cannot create QNN context from " + bin_path);
+    }
+
+    graphInfo = graphRetrieve(bin_path, graphName);
+    if (graphInfo == nullptr)
+      throw std::invalid_argument("cannot retrieve graph " + graphName +
+                                  " from " + bin_path);
+
+    return findContext(bin_path)->get();
   }
 
   StatusCode extractBackendProfilingInfo() {
