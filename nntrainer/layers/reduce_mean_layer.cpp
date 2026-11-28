@@ -33,10 +33,13 @@ void ReduceMeanLayer::finalize(InitLayerContext &context) {
    */
   auto &reduce_axis = std::get<props::ReduceDimension>(reduce_mean_props);
   if (reduce_axis.empty()) {
-    out_dim = TensorDim({1, 1, 1, 1});
+    out_dim.channel(1);
+    out_dim.height(1);
+    out_dim.width(1);
+  } else {
+    out_dim.setTensorDim(reduce_axis.get(), 1);
   }
 
-  out_dim.setTensorDim(reduce_axis.get(), 1);
   context.setOutputDimensions({out_dim});
 }
 
