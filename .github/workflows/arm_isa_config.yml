@@ -1,0 +1,71 @@
+name: ARM ISA configure check
+
+# Configure-only (no compile) check of the ARM ISA meson options: for each
+# option combination the generated -march, source selection, warnings and
+# configure errors must match tools/pyutils/check_arm_isa_config.py.
+on:
+  pull_request:
+    paths:
+      - 'meson_options.txt'
+      - 'jni/**'
+      - '**/meson.build'
+      - 'tools/pyutils/check_arm_isa_config.py'
+      - '.github/workflows/arm_isa_config.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  configure:
+    name: ARM ISA configure (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gcc 11 knows sve2 but not sme, so it also covers the
+          # compiler-rejects-extension error
+          - name: aarch64 gcc
+            packages: g++-aarch64-linux-gnu
+            args: --cross-prefix aarch64-linux-gnu-
+            suites: aarch64 aarch64-nosme
+          - name: armhf gcc
+            packages: g++-arm-linux-gnueabihf
+            args: --cross-prefix arm-linux-gnueabihf-
+            suites: armhf
+          - name: x86_64
+            packages: ''
+            args: ''
+            suites: x86
+          # NDK r26d clang knows sme2
+          - name: android
+            packages: ''
+            args: ''
+            suites: android
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install submodules needed by configure
+        run: |
+          git submodule sync
+          git submodule update --init --depth 1 subprojects/iniparser \
+            subprojects/ruy subprojects/googletest subprojects/benchmark
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build pkg-config \
+            flatbuffers-compiler ${{ matrix.packages }}
+      - name: Set up NDK
+        if: matrix.suites == 'android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+      - name: Check ARM ISA configure results
+        run: |
+          for suite in ${{ matrix.suites }}; do
+            python3 tools/pyutils/check_arm_isa_config.py --suite $suite \
+              ${{ matrix.args }}
+          done
