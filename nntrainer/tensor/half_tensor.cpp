@@ -763,7 +763,8 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
       << "[HalfTensor::dot] a QS4CX weight cannot be transposed: trans and "
          "trans_in must both be false";
     // Both arms read the plain nibbles (the x86 kernel directly, the Arm arm
-    // through packF16Activation). Refuse a payload a GPU backend released.
+    // through packF16Activation, or directly when beta is not zero). Refuse a
+    // payload a GPU backend released.
     refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
                                 "HalfTensor::dot QS4CX");
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
@@ -783,6 +784,21 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     // int4 + 8. Decoding it any other way and decoding it here must not
     // disagree, so the kernel mirrors the producer term for term.
     if (!input.isPackedF16Activation()) {
+      gemm_qs4cx_fp16(M, N, K, (const _FP16 *)getData(),
+                      input.getData<uint8_t>(), input.getScale<float>(),
+                      output.getData<_FP16>(), beta);
+      break;
+    }
+#endif
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64)
+    // The KAI kernel below overwrites its destination with a product already
+    // rounded and saturated to FP16, so nothing can be accumulated into it
+    // exactly. A non-zero beta takes the scalar reference instead, which adds
+    // beta * output in fp32 before its single clamp, as the x86 kernel does.
+    // That reference is scalar and single-threaded.
+    if (beta != 0.0f) {
       gemm_qs4cx_fp16(M, N, K, (const _FP16 *)getData(),
                       input.getData<uint8_t>(), input.getScale<float>(),
                       output.getData<_FP16>(), beta);
