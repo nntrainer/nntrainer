@@ -9,17 +9,21 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <vector>
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
 #include <fp16.h>
 #include <half_tensor.h>
+#include <qs4acx_tensor.h>
 #include <qs4cx_tensor.h> // refuseIfQs4cxPayloadDropped
 #include <tensor.h>
+#include <ternary_tensor.h>
 #include <thread_manager.h>
 #include <util_func.h>
 
@@ -821,9 +825,56 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
                                             /*transB=*/true, lb, ub);
     break;
   }
+  case Tdatatype::TQ2CX:
+  case Tdatatype::QS4ACX:
+    dotWidenedReference(input, output, trans, trans_in, beta);
+    break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
+  return output;
+}
+
+Tensor &HalfTensor::dotWidenedReference(Tensor const &input, Tensor &output,
+                                        bool trans, bool trans_in,
+                                        float beta) const {
+  // Host fallback for a weight format that has no fp16-activation kernel
+  // here (TQ2CX, QS4ACX): the rows are widened to fp32, the format's fp32
+  // reference GEMM accumulates in fp32, and the result is narrowed with a
+  // clamp to the half range. Correctness path only.
+  NNTR_THROW_IF(trans || trans_in, std::invalid_argument)
+    << "[HalfTensor::dot] a " << (int)input.getDataType()
+    << " weight cannot be transposed";
+  NNTR_THROW_IF(beta != 0.0f, std::invalid_argument)
+    << "[HalfTensor::dot] accumulation (beta) is not supported for this "
+       "weight format";
+  NNTR_THROW_IF(output.getDataType() != Tdatatype::FP16, std::invalid_argument)
+    << "[HalfTensor::dot] FP16 activations write an FP16 output";
+  const size_t K = getDim().width();
+  const size_t M = getDim().getDataLen() / K;
+  const size_t N = input.getDim().width();
+  NNTR_THROW_IF(input.getDim().height() != K ||
+                  output.getDim().getDataLen() != M * N,
+                std::invalid_argument)
+    << "[HalfTensor::dot] shape mismatch for the widened reference";
+  if (input.getDataType() == Tdatatype::TQ2CX)
+    refuseIfTq2cxPayloadReleased(input.getData(), "HalfTensor::dot TQ2CX");
+  else
+    refuseIfQs4cxPayloadDropped(input.getData<uint8_t>(),
+                                "HalfTensor::dot QS4ACX");
+  std::vector<float> x(M * K), y(M * N);
+  const _FP16 *src = (const _FP16 *)getData();
+  for (size_t i = 0; i < x.size(); ++i)
+    x[i] = static_cast<float>(src[i]);
+  if (input.getDataType() == Tdatatype::TQ2CX)
+    tq2cx_gemm_ref_fp32(M, N, K, x.data(), K, input.getData(), y.data(), N,
+                        0.0f);
+  else
+    qs4acx_gemm_ref_fp32(M, N, K, x.data(), K, input.getData<uint8_t>(),
+                         nullptr, y.data(), N);
+  _FP16 *dst = output.getData<_FP16>();
+  for (size_t i = 0; i < y.size(); ++i)
+    dst[i] = static_cast<_FP16>(std::min(65504.0f, std::max(-65504.0f, y[i])));
   return output;
 }
 

@@ -17,6 +17,7 @@
 #include <fallback.h>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
+#include <tq2cx_kernels.h>
 
 namespace nntrainer {
 
@@ -244,6 +245,14 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                                 ldcs[i]);
 }
 
+void gemm_tq2cx_batch(const unsigned int M, const std::vector<unsigned int> &Ns,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const std::vector<void *> &Bs,
+                      const std::vector<float *> &Cs,
+                      const std::vector<unsigned int> &ldcs) {
+  tq2cx_gemm_batch(M, Ns, K, A, lda, Bs, Cs, ldcs, tq2cx_tile_ref);
+}
+
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
@@ -359,6 +368,15 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
   __fallback_compute_kcaches<uint16_t>(
     in, kcache, output, num_rows, num_cache_head, head_dim, gqa_size, tile_size,
     local_window_size, head_start, head_end);
+}
+
+void compute_rotary_emb_value_snap(unsigned int width, unsigned int dim,
+                                   unsigned int half_, const float *input,
+                                   uint16_t *output, const float *cos_,
+                                   const float *sin_,
+                                   const float *head_scales) {
+  __fallback_compute_rotary_emb_value_snap(width, dim, half_, input, output,
+                                           cos_, sin_, head_scales);
 }
 
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,

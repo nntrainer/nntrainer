@@ -522,6 +522,13 @@ private:
                   bool trans_in, float beta) const;
 
   /**
+   * @brief dot for a TQ2CX / QS4ACX weight: fp32 reference over the widened
+   *        rows, narrowed to FP16 with a clamp
+   */
+  Tensor &dotWidenedReference(Tensor const &input, Tensor &output, bool trans,
+                              bool trans_in, float beta) const;
+
+  /**
    * @brief dotQnK
    */
   Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans, bool trans_in,
