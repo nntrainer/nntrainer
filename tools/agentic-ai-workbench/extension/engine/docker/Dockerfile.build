@@ -1,0 +1,42 @@
+# Build environment for the Agentic AI Workbench (knowledge/docker_host.py).
+# Ubuntu 24.04 with gcc-13, like upstream's Ubuntu CI
+# (.github/workflows/ubuntu_clean_meson_build.yml). x86-64 hosts only for now.
+#
+# How it is used: one long-running container per nntrainer checkout. The
+# checkout is COPIED, file by file, into a Docker volume (/work/src) and built
+# there (/work/src/build-wb); it is never mounted, so a build cannot change
+# it (and compiling through a Windows mount is ~50x slower). The workbench
+# folder is bind-mounted at /wb for generated code and results. Nothing from
+# the checkout is copied into the image itself.
+#
+# The base image is pinned by digest (ubuntu:24.04 as of 2026-11-10) so every
+# user starts from the same image; the image tag is the hash of this file, so
+# changing the digest rebuilds the image once. Proxy settings arrive as the
+# predefined build args HTTP_PROXY / HTTPS_PROXY / NO_PROXY (passed by name by
+# docker_host.build_image, never written into the image).
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc-13 g++-13 meson ninja-build pkg-config cmake git \
+        libopenblas-dev libiniparser-dev libjsoncpp-dev libcurl4-openssl-dev libgtest-dev libgmock-dev \
+        python3 ca-certificates curl wget tar file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upstream's example apps copy their resources with `cp -lr` (hard links).
+# Hard links fail across the volume / bind-mount boundary, so `cp` here
+# copies instead: the -l flag is dropped.
+RUN dpkg-divert --local --rename --divert /usr/bin/cp.distrib --add /usr/bin/cp \
+    && printf '%s\n' '#!/bin/bash' \
+        '# nntrainer workbench image: copy instead of hard-linking (cp -l) across mounts' \
+        'args=()' \
+        'for a in "$@"; do' \
+        '  if [[ "$a" == -* && "$a" != --* ]]; then a="${a//l/}"; [[ "$a" == "-" ]] && continue; fi' \
+        '  args+=("$a")' \
+        'done' \
+        'exec /usr/bin/cp.distrib "${args[@]}"' > /usr/bin/cp \
+    && chmod 755 /usr/bin/cp
+
+WORKDIR /src
+CMD ["sleep", "infinity"]

@@ -1,0 +1,19 @@
+# Built packages (npx @vscode/vsce package) are not kept in the repo.
+*.vsix
+# Written by the workbench at run time -- local, not part of the repo.
+# Pipeline output (state.json, graphs, artifacts):
+workbench_output/
+# Hugging Face weight cache (can be gigabytes); .w/ is the short-path variant used
+# on Windows when long paths are disabled:
+.ai_compiler_cache/
+.w/
+# Generated model code and its review.json (commit a model's folder deliberately if you want it in git):
+generated/
+# The workbench's own nntrainer build (meson/ninja, MSVC on Windows) and the venv
+# holding meson + ninja for it:
+nb/
+.buildenv/
+# Host-side copies of the Docker build's build.ninja / compile_commands.json and
+# the manifest of the checkout copy in its volume (anchored, so the source folder
+# extension/engine/docker with the build's Dockerfile stays tracked):
+/docker/

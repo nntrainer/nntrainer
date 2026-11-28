@@ -1,0 +1,4 @@
+# The code bank is a local SQLite database (see extension/docs/code_bank_README.md).
+# Keep it out of git; only this file is tracked so the folder exists.
+*
+!.gitignore

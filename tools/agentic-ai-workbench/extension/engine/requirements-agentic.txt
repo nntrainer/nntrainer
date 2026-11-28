@@ -1,0 +1,5 @@
+# Optional: LangGraph orchestration, and the API-key extras (chat without the
+# Claude CLI, Auto-Fix, suggestions for unsupported ops, the graph Focus fallback).
+# If these fail to install, the pipeline still runs (its steps run in order).
+langchain-anthropic>=0.1.20
+langgraph>=0.1.5
