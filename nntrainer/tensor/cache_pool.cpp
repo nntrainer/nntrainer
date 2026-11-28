@@ -175,17 +175,18 @@ void CachePool::deallocate() {
   swap_device->finish();
 }
 
+// ids of a cleared layout throw only until getMemory() registers them again
 void CachePool::validate(unsigned int id) {
-  if (!elems[id]->isActive()) {
-    elems[id]->swapIn();
+  if (!elems.at(id)->isActive()) {
+    elems.at(id)->swapIn();
     std::lock_guard<std::mutex> lock(mutex);
     actives.insert(id);
   }
 }
 
 void CachePool::invalidate(unsigned int id) {
-  if (elems[id]->isActive()) {
-    elems[id]->swapOut();
+  if (elems.at(id)->isActive()) {
+    elems.at(id)->swapOut();
     std::lock_guard<std::mutex> lock(mutex);
     actives.erase(id);
   }
@@ -308,6 +309,8 @@ void CachePool::flushExcept(std::vector<unsigned int> order) {
 void CachePool::clear() {
   flush();
   deallocate();
+  elems.clear();
+  exec_ids.clear();
   policies.clear();
   MemoryPool::clear();
 }
