@@ -116,7 +116,8 @@ void CentroidKNN::forwarding(nntrainer::RunLayerContext &context,
       auto current_feature = input_.getBatchSlice(b, 1);
 
       if (num_sample == 0) {
-        hidden_.setValue(b, 0, 0, i, std::numeric_limits<float>::min());
+        // Unobserved classes must rank below the negative distance scores.
+        hidden_.setValue(b, 0, 0, i, std::numeric_limits<float>::lowest());
       } else {
         hidden_.setValue(b, 0, 0, i,
                          get_distance(current_feature, saved_feature));
