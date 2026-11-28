@@ -22,6 +22,7 @@
 #include <env_compat.h>
 #include <layer.h>
 #include <model.h>
+#include <runtime_config.h>
 #include <token_sampler.h>
 /***************** ALAIS *******************/
 using LayerHandle = std::shared_ptr<ml::train::Layer>;
@@ -84,42 +85,12 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
 }
 
 /**
- * @brief Compute engine for CausalLM model layers.
- * @return "cpu" when NNTR_ENGINE=cpu, "cuda" when NNTR_ENGINE=cuda (both
- *         compared lowercased), otherwise "gpu" (the OpenCL inference path)
- *         in an ENABLE_OPENCL build and "cpu" in a build without OpenCL.
- *         engine=cpu runs the model on the
- *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
- *         CPU-only deployment), instead of the engine=gpu Cl layers whose
- *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
- *         already defaults to CPU in LayerNode; this keeps the explicit GPU
- *         default for backward compatibility while making CPU one env away.
+ * @brief Resolve a model builder's backend from the live context registry.
+ *        Unset selects registered GPU, then CUDA, then CPU. An unavailable
+ *        explicit backend follows Engine::parseComputeEngine's CPU fallback.
+ *        The owning layer/facade snapshots this decision before execution.
  */
-// inline (not static): several sibling TUs include this header without ever
-// calling causallm_engine(), which trips -Werror=unused-function on the
-// static-with-internal-linkage form; inline exempts it from that warning and
-// (correctly, since it's a pure function of the environment) gives the whole
-// binary a single cached instance instead of one per TU.
-inline std::string causallm_engine() {
-  static const std::string eng = []() -> std::string {
-    // Lowercased, like every other reader: an exact compare turned
-    // NNTR_ENGINE=CUDA into "gpu" here while the Engine brought CUDA up.
-    const std::string s = nntr_engine_env();
-    if (s == "cpu")
-      return "cpu";
-    if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
-      return "cuda";
-#if defined(ENABLE_OPENCL)
-    return "gpu";
-#else
-    // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
-    // reference / unittest build), so default to cpu instead of throwing
-    // "[Engine] gpu Context is not registered" at model build.
-    return "cpu";
-#endif
-  }();
-  return eng;
-}
+inline std::string causallm_engine() { return causallm::runtimeEngine(); }
 
 /**
  * @brief Whether a model builder should set mha_core's use_gemm_attention.
